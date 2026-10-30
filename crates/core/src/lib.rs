@@ -77,6 +77,8 @@ pub mod resolved_schema;
 pub mod shard;
 pub mod stats;
 pub mod sutherland_hodgman;
+#[cfg(test)]
+pub(crate) mod test_log;
 pub mod tile;
 pub mod wkb;
 pub(crate) mod wkb_column;

@@ -871,4 +871,21 @@ mod tests {
             8
         );
     }
+
+    /// #716: with footer bytes, a window batch is priced as its input rows
+    /// plus `fanout` output rows per input row, each a whole input row.
+    #[test]
+    fn a_footer_priced_window_charges_input_and_fanout_rows() {
+        let budget = MemoryBudget::with_available(Some(1 << 30));
+        // 10 input rows fanning out to 1.5 output rows each: 25 rows of 100 B.
+        assert_eq!(
+            budget.window_price(10, Some(100), 1.5, 3, None),
+            Price::new(2_500, PriceBasis::Footer)
+        );
+        // A negative fanout counts as none: the input batch alone.
+        assert_eq!(
+            budget.window_price(10, Some(100), -2.0, 3, None),
+            Price::new(1_000, PriceBasis::Footer)
+        );
+    }
 }

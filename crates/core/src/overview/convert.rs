@@ -12176,6 +12176,19 @@ mod tests {
         }
     }
 
+    /// Pass 1's auto reader count is half the cores, at least two where two
+    /// cores exist, within [`READ_WORKERS_MAX`].
+    #[test]
+    fn pass1_auto_readers_are_half_the_cores() {
+        use super::super::read::ReadPass;
+        let auto =
+            |cores| resolve_read_workers_with_cores(ReadPass::Scan, READ_WORKERS_AUTO, cores);
+        assert_eq!(
+            [1, 2, 3, 4, 6, 64].map(auto),
+            [1, 2, 2, 2, 3, READ_WORKERS_MAX]
+        );
+    }
+
     /// The `--read-workers` resolution contract (#494): auto stays inside the
     /// conservative cap, explicit values are honoured, and an explicit value
     /// above the ceiling is clamped rather than spawning it (or, as the
