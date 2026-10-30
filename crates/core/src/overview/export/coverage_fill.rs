@@ -56,6 +56,89 @@ pub(super) const FILL_EXTENT: f64 = 4096.0;
 /// default `--gsd-base`, the tolerance the level geometry is drawn at.
 pub(super) const FILL_SIMPLIFY_PX: f64 = 4.0;
 
+// Phase-1 cost observations only: these do not change the fill or its order.
+// Capacity bytes count owned Vec buffers, including unused slots, but exclude
+// allocator metadata and the map nodes. dhat measures those separately.
+fn shape_capacity_bytes(shapes: &Vec<Shape>) -> usize {
+    shapes.capacity() * std::mem::size_of::<Shape>()
+        + shapes
+            .iter()
+            .map(|s| {
+                s.capacity() * std::mem::size_of::<Ring>()
+                    + s.iter()
+                        .map(|r| r.capacity() * std::mem::size_of::<[f64; 2]>())
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+}
+
+type SeedBuckets = std::collections::BTreeMap<u64, (Vec<Shape>, Vec<Collapsed>)>;
+
+fn note_capacity(stage: &str, buckets: &SeedBuckets, fills: &[(u64, Vec<Shape>)], map: &FillMap) {
+    if !cfg!(test) && !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let buckets_bytes: usize = buckets
+        .values()
+        .map(|(s, c)| shape_capacity_bytes(s) + c.capacity() * std::mem::size_of::<Collapsed>())
+        .sum();
+    let fills_bytes: usize = fills.iter().map(|(_, s)| shape_capacity_bytes(s)).sum();
+    let map_bytes: usize = map
+        .tiles
+        .values()
+        .map(|polys| {
+            polys.capacity() * std::mem::size_of::<FillPolygon>()
+                + polys
+                    .iter()
+                    .map(|p| {
+                        p.capacity() * std::mem::size_of::<TileRing>()
+                            + p.iter()
+                                .map(|r| r.capacity() * std::mem::size_of::<(i32, i32)>())
+                                .sum::<usize>()
+                    })
+                    .sum::<usize>()
+        })
+        .sum();
+    let live_bytes = buckets_bytes + fills_bytes + map_bytes;
+    log::debug!("[fill-capacity] stage={stage} buckets={buckets_bytes} fills={fills_bytes} map={map_bytes} live={live_bytes}");
+    #[cfg(test)]
+    cost_probe::update(|c| {
+        c.bucket_peak = c.bucket_peak.max(buckets_bytes);
+        c.map_peak = c.map_peak.max(map_bytes);
+        c.live_peak = c.live_peak.max(live_bytes);
+    });
+}
+
+#[cfg(test)]
+pub(super) mod cost_probe {
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) struct Counts {
+        pub(crate) bucket_peak: usize,
+        pub(crate) map_peak: usize,
+        pub(crate) live_peak: usize,
+        pub(crate) box_comparisons: usize,
+        pub(crate) host_entries: usize,
+        pub(crate) host_occupied: usize,
+        pub(crate) fill_polygons_encoded: usize,
+        pub(crate) fill_passes: usize,
+        pub(crate) fill_gzip_calls: usize,
+        pub(crate) cached_gzip_rechecks: usize,
+    }
+    thread_local! {
+        static COUNTS: std::cell::Cell<Counts> = std::cell::Cell::new(Counts::default());
+    }
+    pub(crate) fn update(f: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|cell| {
+            let mut c = cell.get();
+            f(&mut c);
+            cell.set(c);
+        });
+    }
+    pub(crate) fn take() -> Counts {
+        COUNTS.with(|cell| cell.replace(Counts::default()))
+    }
+}
+
 struct FillSeed<'a> {
     geometry: Option<&'a str>,
     crs: super::Crs,
@@ -385,9 +468,11 @@ pub(super) fn union_touching(shapes: Vec<Shape>) -> Vec<Shape> {
     }
     // Sweep on min x; boxes that meet (touching counts) join one group.
     let mut active: Vec<usize> = Vec::new();
+    let mut box_comparisons = 0usize;
     for &i in &order {
         let b = boxes[i];
         active.retain(|&j| boxes[j][2] >= b[0]);
+        box_comparisons += active.len();
         for &j in &active {
             let c = boxes[j];
             if c[1] <= b[3] && b[1] <= c[3] {
@@ -399,6 +484,9 @@ pub(super) fn union_touching(shapes: Vec<Shape>) -> Vec<Shape> {
         }
         active.push(i);
     }
+    log::debug!("[fill-union-work] shapes={n} box_comparisons={box_comparisons}");
+    #[cfg(test)]
+    cost_probe::update(|c| c.box_comparisons += box_comparisons);
     // Groups in order of their lowest member, so the output is deterministic.
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n];
     for i in 0..n {
@@ -704,6 +792,16 @@ pub(super) fn assign_hosts(polys: &[FillPolygon], hosts: &[[f64; 4]]) -> Vec<usi
             }
         }
     }
+    if cfg!(test) || log::log_enabled!(log::Level::Debug) {
+        let entries: usize = grid.iter().map(Vec::len).sum();
+        let occupied = grid.iter().filter(|c| !c.is_empty()).count();
+        log::debug!("[fill-host-work] hosts={} polygons={} entries={entries} occupied={occupied} allocated={}", hosts.len(), polys.len(), grid.len());
+        #[cfg(test)]
+        cost_probe::update(|c| {
+            c.host_entries += entries;
+            c.host_occupied += occupied;
+        });
+    }
     let dist2 = |b: &[f64; 4], x: f64, y: f64| {
         let dx = (b[0] - x).max(0.0).max(x - b[2]);
         let dy = (b[1] - y).max(0.0).max(y - b[3]);
@@ -766,6 +864,9 @@ pub(super) struct FillMap {
     tiles: std::collections::HashMap<u64, Vec<FillPolygon>>,
     used: std::sync::atomic::AtomicUsize,
     shed: std::sync::atomic::AtomicUsize,
+    // A local copy of the repo sampler distinguishes the coverage pre-pass
+    // from the tile loop without changing the export profile's phase schema.
+    cost_rss: Option<super::RssSampler>,
 }
 
 impl FillMap {
@@ -786,6 +887,15 @@ impl Drop for FillMap {
     /// Fills built, and how many the export drew. A fill is drawn only into
     /// a tile that has features of its own; the rest are not emitted yet.
     fn drop(&mut self) {
+        if let Some(sampler) = self.cost_rss.take() {
+            let report = sampler.finish();
+            log::debug!(
+                "[fill-rss] peak_mib={} phases={:?} anon_phases={:?}",
+                report.true_peak_mib,
+                report.phase_peaks_mib,
+                report.phase_anon_peaks_mib
+            );
+        }
         if self.tiles.is_empty() {
             return;
         }
@@ -911,6 +1021,10 @@ pub(super) fn build_fill_map(
         tiles: Default::default(),
         used: Default::default(),
         shed: Default::default(),
+        cost_rss: super::RssSampler::start_if(
+            super::profile_json_target().is_some(),
+            "coverage seed",
+        ),
     };
     if finest_zoom == 0 || min_zoom >= finest_zoom {
         return Ok(map);
@@ -975,7 +1089,11 @@ pub(super) fn build_fill_map(
             Ok(())
         },
     )?;
+    note_capacity("seed", &buckets, &[], &map);
     let seed_secs = t_seed.elapsed().as_secs_f64();
+    if let Some(sampler) = &map.cost_rss {
+        sampler.mark_phase("coverage pyramid");
+    }
 
     // Pyramid: each zoom's fills, then lifted into the zoom above.
     let t_pyramid = std::time::Instant::now();
@@ -998,6 +1116,7 @@ pub(super) fn build_fill_map(
                 (key, fill)
             })
             .collect();
+        note_capacity("unioned", &buckets, &fills, &map);
         let snapped: Vec<(u64, Vec<FillPolygon>)> = fills
             .par_iter()
             .filter(|(_, fill)| !fill.is_empty())
@@ -1008,6 +1127,7 @@ pub(super) fn build_fill_map(
                 map.tiles.insert(key, polys);
             }
         }
+        note_capacity("snapped", &buckets, &fills, &map);
         if log::log_enabled!(log::Level::Debug) {
             // Fill area in seed-zoom pixels, so zooms compare: it should hold
             // steady up the zooms.
@@ -1034,6 +1154,7 @@ pub(super) fn build_fill_map(
             let b = buckets.entry(parent).or_default();
             lift_into_parent(fill, x & 1, y & 1, &mut b.0);
         }
+        note_capacity("lifted", &buckets, &fills, &map);
         zoom -= 1;
     }
     log::info!(
@@ -1043,12 +1164,98 @@ pub(super) fn build_fill_map(
         t_pyramid.elapsed().as_secs_f64(),
         map.tiles.len(),
     );
+    if let Some(sampler) = &map.cost_rss {
+        sampler.mark_phase("tile loop");
+    }
     Ok(map)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #788 phase 1: the proposed 32 MiB fill-workspace budget on the fixed
+    /// 10,931-field fixture. Phase 2 must enforce this at the fill owner.
+    /// These capacity observations are a lower bound on peak live heap:
+    /// exceeding them proves the budget is exceeded without an RSS threshold.
+    #[test]
+    fn phase1_fill_prepass_respects_live_byte_budget() {
+        use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+        let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/realdata/ftw-moldova-z10.parquet");
+        let dir = tempfile::tempdir().expect("fixture workspace");
+        let overview = dir.path().join("overview.parquet");
+        convert_to_overviews(
+            input,
+            &overview,
+            &ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 12,
+                },
+                ..Default::default()
+            },
+        )
+        .expect("convert the fixed Moldova fixture");
+        cost_probe::take();
+        super::super::export_pmtiles(
+            overview,
+            dir.path().join("out.pmtiles"),
+            &super::super::ExportOptions {
+                coverage_fill: true,
+                ..Default::default()
+            },
+        )
+        .expect("export with fill");
+        let counts = cost_probe::take();
+        eprintln!("prepass retained capacity: {counts:?}");
+        assert!(counts.bucket_peak > 0 && counts.map_peak > 0);
+        assert!(
+            counts.live_peak <= 32 * 1024 * 1024,
+            "32 MiB workspace exceeded (map nodes and union scratch excluded): {counts:?}"
+        );
+    }
+
+    /// #767: east-west strips share x but have disjoint y ranges. Pin the
+    /// work, rather than time, so a broad-phase index can replace the sweep
+    /// while preserving every polygon and its order.
+    #[test]
+    fn phase1_wide_strip_union_comparisons_stay_linear() {
+        let n = 1024usize;
+        let strips: Vec<Shape> = (0..n)
+            .map(|i| {
+                let y = (i * 3) as f64;
+                vec![vec![
+                    [0.0, y],
+                    [FILL_EXTENT, y],
+                    [FILL_EXTENT, y + 1.0],
+                    [0.0, y + 1.0],
+                ]]
+            })
+            .collect();
+        cost_probe::take();
+        let result = union_touching(strips.clone());
+        let counts = cost_probe::take();
+        assert_eq!(result, strips, "disjoint strips retain their exact order");
+        assert!(
+            counts.box_comparisons <= n * 32,
+            "wide-strip broad phase exceeded 32 comparisons per shape: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn phase1_tile_spanning_hosts_have_bounded_grid_entries() {
+        let hosts = vec![[0.0, 0.0, FILL_EXTENT, FILL_EXTENT]; 128];
+        let polys = vec![vec![vec![(50, 50), (60, 50), (60, 60)]]];
+        cost_probe::take();
+        assert_eq!(assign_hosts(&polys, &hosts), vec![0]);
+        let counts = cost_probe::take();
+        assert_eq!(counts.host_occupied, 4096);
+        assert!(
+            counts.host_entries <= hosts.len() * 64,
+            "spanning hosts must not replicate across all 4096 cells: {counts:?}"
+        );
+    }
 
     fn square(x: f64, y: f64, side: f64) -> Shape {
         vec![vec![

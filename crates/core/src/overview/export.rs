@@ -6344,6 +6344,9 @@ impl FillFeature {
         polys: &[coverage_fill::FillPolygon],
         diagnostics: &crate::diagnostics::Diagnostics,
     ) -> Self {
+        log::debug!("[fill-geometry-work] polygons={}", polys.len());
+        #[cfg(test)]
+        coverage_fill::cost_probe::update(|c| c.fill_polygons_encoded += polys.len());
         Self {
             id,
             source_row,
@@ -6425,6 +6428,13 @@ fn fill_features(
         })
         .filter(|f| !f.cmds.is_empty())
         .collect();
+    log::debug!(
+        "[fill-tile-work] input={} kept={} polygon_clones={} rebuilt={} reused=0",
+        polys.len() + shed,
+        polys.len(),
+        polys.len() * 2,
+        polys.len()
+    );
     (feats, tally)
 }
 
@@ -6539,9 +6549,29 @@ fn with_fill(
     tally: &mut FillTally,
     mut encode: impl FnMut(&[&FillFeature]) -> TileMvt,
 ) -> TileMvt {
+    // Observe successful gzip-buffer replacement, rather than assuming a
+    // fit check compressed. This guard can pass when the fit owner reuses
+    // cached bytes, without changing the observer to predict that fix.
+    #[cfg(test)]
+    fn note_gzip(before: Option<*const u8>, mvt: &TileMvt) {
+        let after = mvt.gzip.as_ref().map(|g| g.as_ptr());
+        if after.is_some() && after != before {
+            coverage_fill::cost_probe::update(|c| {
+                c.fill_gzip_calls += 1;
+                c.cached_gzip_rechecks += usize::from(before.is_some());
+            });
+        }
+    }
     if fill.is_empty() {
         return fitted;
     }
+    #[cfg(test)]
+    let base_gzip_before = fitted.gzip.as_ref().map(|g| g.as_ptr());
+    let gzip_check = usize::from(opts.compressed_tile_size_limit.is_some_and(|l| l > 0));
+    log::debug!(
+        "[fill-base-check] gzip_calls={gzip_check} cached={}",
+        fitted.gzip.is_some()
+    );
     // Drawn and shed, from the fill features themselves.
     let total: usize = fill.iter().map(|f| f.polygons).sum();
     let no_fill = |tally: &mut FillTally, fitted: TileMvt| {
@@ -6551,8 +6581,12 @@ fn with_fill(
         fitted
     };
     if tile_fit(&mut fitted, opts).unwrap_or(f64::INFINITY) < 1.0 {
+        #[cfg(test)]
+        note_gzip(base_gzip_before, &fitted);
         return no_fill(tally, fitted);
     }
+    #[cfg(test)]
+    note_gzip(base_gzip_before, &fitted);
     // Largest first; drawn in their own order.
     let mut by_area: Vec<usize> = (0..fill.len()).collect();
     by_area.sort_by(|&a, &b| fill[b].area.total_cmp(&fill[a].area).then(a.cmp(&b)));
@@ -6564,7 +6598,20 @@ fn with_fill(
         kept.sort_unstable();
         let subset: Vec<&FillFeature> = kept.iter().map(|&i| &fill[i]).collect();
         let mut mvt = encode(&subset);
+        log::debug!(
+            "[fill-pass] pass={pass} gzip_calls={gzip_check} features={} polygons={}",
+            subset.len(),
+            subset.iter().map(|f| f.polygons).sum::<usize>()
+        );
+        #[cfg(test)]
+        coverage_fill::cost_probe::update(|c| {
+            c.fill_passes += 1;
+        });
+        #[cfg(test)]
+        let gzip_before = mvt.gzip.as_ref().map(|g| g.as_ptr());
         let fit = tile_fit(&mut mvt, opts).unwrap_or(f64::INFINITY);
+        #[cfg(test)]
+        note_gzip(gzip_before, &mvt);
         if fit >= 1.0 {
             let (polygons, vertices) = subset
                 .iter()
@@ -10434,6 +10481,56 @@ mod tests {
             .map(|i| fill_square(i as u64, 50 * (i % 40) + 2000, 100 * (i / 40) + 2000, 40))
             .collect();
         (tb, members, fill)
+    }
+
+    /// #788 phase 1: this guard is already green on main. Fill geometry is
+    /// encoded once; the repeated work is the tile builder and fit checks.
+    #[test]
+    fn phase1_first_fit_encodes_fill_polygons_once() {
+        coverage_fill::cost_probe::take();
+        let (tb, members, fill) = crowded_tile();
+        let polygons: usize = fill.iter().map(|f| f.polygons).sum();
+        let mut tally = FillTally::default();
+        let mvt = encode_tile(
+            &members,
+            &tb,
+            &ExportOptions::default(),
+            &fill,
+            &mut tally,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let counts = coverage_fill::cost_probe::take();
+        assert_eq!(tally.polygons, polygons);
+        assert_eq!(mvt.valve.passes, 2, "one base encode plus one fill pass");
+        assert_eq!(counts.fill_polygons_encoded, polygons, "{counts:?}");
+        assert_eq!(counts.fill_passes, 1, "{counts:?}");
+    }
+
+    /// #767: the base tile already has gzip bytes after its valve fit check.
+    /// `with_fill` must reuse that answer before attempting its first fill.
+    #[test]
+    fn phase1_fill_does_not_recompress_the_cached_base_tile() {
+        coverage_fill::cost_probe::take();
+        let (tb, members, fill) = crowded_tile();
+        let mut tally = FillTally::default();
+        let mvt = encode_tile(
+            &members,
+            &tb,
+            &ExportOptions {
+                compressed_tile_size_limit: Some(500_000),
+                ..Default::default()
+            },
+            &fill,
+            &mut tally,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let counts = coverage_fill::cost_probe::take();
+        assert!(mvt.gzip.is_some());
+        assert_eq!(counts.fill_passes, 1);
+        assert_eq!(
+            counts.cached_gzip_rechecks, 0,
+            "a cached base tile was sent through gzip again: {counts:?}"
+        );
     }
 
     /// #750: the fill takes only the room the tile's own features leave. A
