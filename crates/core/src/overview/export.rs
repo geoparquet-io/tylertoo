@@ -129,6 +129,7 @@ use crate::TilesetMetadata;
 use super::coalesce::COALESCED_COUNT_COLUMN;
 use super::convert::{human_bytes, skip_memory_preflight_from_env, SKIP_MEMORY_PREFLIGHT_ENV};
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
+use super::memory::{MemoryBudget, MemoryPhase, Price, PriceBasis};
 use super::pipe::scoped_pipe;
 use super::pipeline::{
     auto_backing, available_memory_bytes, probe_oom_memory_limit, MemoryLimit, MemoryLimitSource,
@@ -152,7 +153,7 @@ struct PartitionBudget {
     ceiling_wave: usize,
     auto_wave: bool,
     member_bytes: Option<u64>,
-    available_ram: Option<u64>,
+    budget: MemoryBudget,
     fit_limit: Option<MemoryLimit>,
 }
 
@@ -1241,15 +1242,23 @@ pub const PARTITION_WAVE_MIN: usize = 6;
 /// widens past it on `auto`. Explicit values are never clamped by it.
 pub const PARTITION_WAVE_FALLBACK_MAX: usize = 16;
 
-/// Fraction of *available* system RAM the resident wave transient may claim
-/// in the auto preflight (#303).
-///
-/// Deliberately lower than the convert-side `AUTO_RAM_FRACTION` (0.6): the
-/// wave transient sits *on top of* export baseline state the estimate does
-/// not model (scan accumulators, decode buffers, PMTiles writer directory),
-/// so the budget leaves headroom for that baseline. Bias is toward not
-/// `OOMing` — a too-narrow wave only costs wall clock.
-const EXPORT_WAVE_RAM_FRACTION: f64 = 0.5;
+/// The run's memory budget, as export probes it (#788): the cached
+/// container-aware figure every `auto` decision shares. Export's waves and
+/// encodes are granted [`MemoryPhase::ExportCollect`]'s and
+/// [`MemoryPhase::ExportEncode`]'s share of it, half of the probed figure,
+/// below the allowance because the waves sit on top of export state no
+/// estimate models (scan accumulators, decode buffers, the writer's
+/// directory). Bias is toward not `OOMing`: a too-narrow wave only costs
+/// wall clock.
+fn export_budget() -> MemoryBudget {
+    MemoryBudget::with_available(available_memory_bytes())
+}
+
+/// The bytes [`MemoryPhase::ExportCollect`] may hold under `budget`, for
+/// the decision logs.
+fn export_collect_bytes(budget: &MemoryBudget) -> u64 {
+    budget.affordable(MemoryPhase::ExportCollect, Price::model(1)) as u64
+}
 
 /// Flat fallback estimate of one wave slot's transient memory cost, used **only
 /// by the upfront ceiling** [`memory_safe_wave`] and when the data-aware
@@ -1319,18 +1328,18 @@ fn member_resident_bytes(mean_stored_bytes: u64, properties: usize) -> u64 {
 }
 
 /// The widest wave the memory budget allows: how many
-/// [`PARTITION_SLOT_TRANSIENT_BYTES`] slots fit in
-/// [`EXPORT_WAVE_RAM_FRACTION`] of available RAM, or
+/// [`PARTITION_SLOT_TRANSIENT_BYTES`] slots [`MemoryPhase::ExportCollect`]
+/// can afford (a model price: a flat calibration), or
 /// [`PARTITION_WAVE_FALLBACK_MAX`] when RAM is unknown (the portable,
 /// deterministic #293 behaviour where no probe exists).
-fn memory_safe_wave(available_ram_bytes: Option<u64>) -> usize {
-    match available_ram_bytes {
-        Some(ram) => {
-            let budget = ((ram as f64) * EXPORT_WAVE_RAM_FRACTION) as u64;
-            (budget / PARTITION_SLOT_TRANSIENT_BYTES) as usize
-        }
-        None => PARTITION_WAVE_FALLBACK_MAX,
+fn memory_safe_wave(budget: &MemoryBudget) -> usize {
+    if budget.limit.is_none() {
+        return PARTITION_WAVE_FALLBACK_MAX;
     }
+    budget.affordable(
+        MemoryPhase::ExportCollect,
+        Price::model(PARTITION_SLOT_TRANSIENT_BYTES),
+    )
 }
 
 /// The auto partition-wave decision (#303): pure so it is unit-testable
@@ -1341,10 +1350,8 @@ fn memory_safe_wave(available_ram_bytes: Option<u64>) -> usize {
 /// memory-safe wave keeps the transient inside the RAM budget, and the floor
 /// preserves the historical width-6 baseline (its worst-case transient is
 /// small and known-safe, and narrower waves only lose throughput).
-fn auto_partition_wave(cores: usize, available_ram_bytes: Option<u64>) -> usize {
-    cores
-        .min(memory_safe_wave(available_ram_bytes))
-        .max(PARTITION_WAVE_MIN)
+fn auto_partition_wave(cores: usize, budget: &MemoryBudget) -> usize {
+    cores.min(memory_safe_wave(budget)).max(PARTITION_WAVE_MIN)
 }
 
 /// The memory-safe wave width for a **single level** (#311), the fix for the
@@ -1372,10 +1379,9 @@ fn memory_safe_level_wave(
     ceiling: usize,
     partitions: &[Partition],
     member_bytes: Option<u64>,
-    available_ram_bytes: Option<u64>,
+    budget: &MemoryBudget,
 ) -> usize {
-    let (Some(per_member), Some(ram)) = (member_bytes.filter(|&b| b > 0), available_ram_bytes)
-    else {
+    let (Some(per_member), Some(_)) = (member_bytes.filter(|&b| b > 0), budget.limit) else {
         return ceiling;
     };
     let max_members = partitions.iter().map(|p| p.members).max().unwrap_or(0);
@@ -1384,10 +1390,13 @@ fn memory_safe_level_wave(
     }
     // Saturating throughout: an absurd member count or byte size clamps the
     // per-slot estimate to "definitely serial" (wave 1) rather than overflowing.
+    // A footer price: `per_member` is the finest level's mean stored row
+    // bytes from the footer, inflated by [`member_resident_bytes`].
     let per_slot = (max_members as u64).saturating_mul(per_member).max(1);
-    let budget = ((ram as f64) * EXPORT_WAVE_RAM_FRACTION) as u64;
-    let safe = (budget / per_slot).max(1) as usize;
-    ceiling.min(safe)
+    ceiling.min(budget.affordable(
+        MemoryPhase::ExportCollect,
+        Price::new(per_slot, PriceBasis::Footer),
+    ))
 }
 
 /// The most members one concurrent level group (#647) may hold at once.
@@ -1396,8 +1405,8 @@ fn memory_safe_level_wave(
 /// the ceiling width, each partition at the planned target, is
 /// `ceiling × partition_target` members, so a group's collected members
 /// stay within what the serial loop already budgets for. When the member
-/// size and RAM are both known, the cap also narrows to the members that fit
-/// in the [`EXPORT_WAVE_RAM_FRACTION`] budget at `member_bytes` each (see
+/// size and RAM are both known, the cap also narrows to the members
+/// [`MemoryPhase::ExportCollect`] can afford at `member_bytes` each (see
 /// [`member_resident_bytes`]), the same estimate [`memory_safe_level_wave`]
 /// uses.
 ///
@@ -1411,15 +1420,19 @@ fn level_group_member_cap(
     ceiling_wave: usize,
     partition_target: usize,
     member_bytes: Option<u64>,
-    available_ram_bytes: Option<u64>,
+    budget: Option<&MemoryBudget>,
 ) -> usize {
     let wave_cap = ceiling_wave.saturating_mul(partition_target);
-    let (Some(per_member), Some(ram)) = (member_bytes.filter(|&b| b > 0), available_ram_bytes)
-    else {
+    let (Some(per_member), Some(budget)) = (
+        member_bytes.filter(|&b| b > 0),
+        budget.filter(|b| b.limit.is_some()),
+    ) else {
         return wave_cap;
     };
-    let budget = ((ram as f64) * EXPORT_WAVE_RAM_FRACTION) as u64;
-    wave_cap.min(usize::try_from(budget / per_member).unwrap_or(usize::MAX))
+    wave_cap.min(budget.affordable(
+        MemoryPhase::ExportCollect,
+        Price::new(per_member, PriceBasis::Footer),
+    ))
 }
 
 /// The error for a level whose densest tile cannot fit in `limit` even when
@@ -1439,7 +1452,7 @@ fn level_group_member_cap(
 /// of large polygons, each far smaller than its row. Such a partition is left
 /// to the wave guard, as before #665.
 ///
-/// The threshold is the whole figure, not the [`EXPORT_WAVE_RAM_FRACTION`]
+/// The threshold is the whole figure, not [`MemoryPhase::ExportCollect`]'s
 /// the wave budget uses: this refuses only what cannot fit serially. First of
 /// equally dense tiles, so the message is deterministic.
 fn densest_tile_over_limit(
@@ -1571,7 +1584,7 @@ fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Ra
 /// width is the machine's [`std::thread::available_parallelism`], capped by
 /// how many per-partition transients (estimated
 /// `PARTITION_SLOT_TRANSIENT_BYTES` each) fit in
-/// `EXPORT_WAVE_RAM_FRACTION` of available RAM (probe shared with the
+/// [`MemoryPhase::ExportCollect`]'s share of available RAM (probe shared with the
 /// convert-side `--profile auto`: `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override,
 /// then the container-aware `min(cgroup headroom, /proc/meminfo
 /// MemAvailable)` — see `available_memory_bytes`), floored at
@@ -1587,11 +1600,16 @@ fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Ra
 /// byte-identical archive (pinned by `export_wave_width_is_byte_invariant` and
 /// the partition-invariance / frozen-hash tests).
 pub fn resolve_partition_wave(requested: usize) -> usize {
+    resolve_partition_wave_under(requested, &export_budget())
+}
+
+/// [`resolve_partition_wave`] under the run's `budget`.
+fn resolve_partition_wave_under(requested: usize, budget: &MemoryBudget) -> usize {
     if requested == PARTITION_WAVE_AUTO {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(PARTITION_WAVE_MIN);
-        auto_partition_wave(cores, available_memory_bytes())
+        auto_partition_wave(cores, budget)
     } else {
         requested
     }
@@ -1603,21 +1621,20 @@ pub fn resolve_partition_wave(requested: usize) -> usize {
 /// available RAM) once at export start, so both export core utilization
 /// (#293) and the preflight decision (#303) are observable — mirrors the
 /// `[convert] pass2 auto` decision log line.
-fn resolve_and_log_partition_wave(requested: usize) -> usize {
-    let wave = resolve_partition_wave(requested);
+fn resolve_and_log_partition_wave(requested: usize, budget: &MemoryBudget) -> usize {
+    let wave = resolve_partition_wave_under(requested, budget);
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(0);
     if requested == PARTITION_WAVE_AUTO {
-        let available = available_memory_bytes();
-        let avail_str = available.map_or_else(
+        let avail_str = budget.available().map_or_else(
             || "unknown".to_string(),
             |b| format!("{} MiB", b / (1024 * 1024)),
         );
         log::info!(
             "[export] partition wave: {wave} partition(s) per band read \
              (auto: {cores} core(s), memory-safe cap {}, avail {avail_str})",
-            memory_safe_wave(available),
+            memory_safe_wave(budget),
         );
     } else {
         log::info!(
@@ -1812,7 +1829,7 @@ fn plan_levels(
         ceiling_wave,
         auto_wave,
         member_bytes,
-        available_ram,
+        budget,
         fit_limit,
     } = inputs;
     let plans = scans
@@ -1830,13 +1847,10 @@ fn plan_levels(
             // THIS level's densest planned partition so a dense finest zoom
             // does not OOM the whole run. Explicit waves are honoured verbatim.
             let wave = if auto_wave {
-                let w =
-                    memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, available_ram);
+                let w = memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, &budget);
                 if w < ceiling_wave {
                     let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
-                    let budget_mib = available_ram
-                        .map(|r| ((r as f64 * EXPORT_WAVE_RAM_FRACTION) as u64) / (1024 * 1024))
-                        .unwrap_or(0);
+                    let budget_mib = export_collect_bytes(&budget) / (1024 * 1024);
                     log::info!(
                         "[export] level {}/{num_levels} z{zoom}: wave {ceiling_wave} → {w} \
                          (densest partition {densest} members × ~{} B/member resident, \
@@ -1970,7 +1984,15 @@ fn export_pmtiles_run(
     knobs: &Pass2Knobs,
 ) -> Result<Pass2Run, ExportError> {
     let validated = options.validate()?;
-    export_pmtiles_validated(input_path, output_path, &validated, partition_target, knobs)
+    let mut budget = export_budget();
+    export_pmtiles_validated(
+        input_path,
+        output_path,
+        &validated,
+        partition_target,
+        knobs,
+        &mut budget,
+    )
 }
 
 #[expect(
@@ -1983,6 +2005,7 @@ fn export_pmtiles_validated(
     config: &super::config::ValidatedConfig<'_, ExportOptions>,
     partition_target: usize,
     knobs: &Pass2Knobs,
+    budget: &mut MemoryBudget,
 ) -> Result<Pass2Run, ExportError> {
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     super::pipeline::memory_diagnostic(diagnostics);
@@ -2076,13 +2099,12 @@ fn export_pmtiles_validated(
     // own densest partition (#311) — see the per-level `memory_safe_level_wave`
     // below. An explicit `--partition-wave N` is honoured verbatim and never
     // narrowed (the caller opted into the memory cost).
-    let ceiling_wave = resolve_and_log_partition_wave(options.partition_wave);
+    let ceiling_wave = resolve_and_log_partition_wave(options.partition_wave, budget);
     let auto_wave = options.partition_wave == PARTITION_WAVE_AUTO;
     // Data-aware per-member size signal for the #311 guard: the finest level's
-    // mean uncompressed row bytes, read once from the Parquet metadata. Probe
-    // RAM once too so every level sizes against the same budget.
+    // mean uncompressed row bytes, read once from the Parquet metadata. Every
+    // level sizes against the run's one `budget`.
     let mean_member_bytes = reader.finest_level_mean_row_bytes();
-    let available_ram = available_memory_bytes();
 
     let ResolvedColumns {
         published,
@@ -2191,7 +2213,7 @@ fn export_pmtiles_validated(
             ceiling_wave,
             auto_wave,
             member_bytes,
-            available_ram,
+            budget: *budget,
             fit_limit: knobs.memory_limit.or_else(probe_oom_memory_limit),
         },
     )?;
@@ -2207,10 +2229,35 @@ fn export_pmtiles_validated(
     // sinks. Duplicating bands are self-contained — the per-level wave read
     // already touches each row group for exactly one level — so the legacy
     // path is kept there (and as the tests' byte-identity oracle).
+    // #647: consecutive small levels run as one concurrent group. On `auto`
+    // the cap sizes from the same RAM budget as the #311 per-level guard.
+    // An explicit wave sizes the cap from its width alone, as #311 does.
+    // `concurrent_levels: false` (cap 0) is the serial test oracle. Sized
+    // before the store's grant below, like every other plan decision.
+    let group_cap = level_group_member_cap(
+        ceiling_wave,
+        partition_target,
+        member_bytes.filter(|_| auto_wave),
+        auto_wave.then_some(&*budget),
+    );
+    let group_cap = if knobs.concurrent_levels {
+        group_cap
+    } else {
+        0
+    };
     let single_read = matches!(reader.mode(), Mode::Partitioning) && !knobs.force_legacy_pass2;
+    // The not-yet-flushed buffer of whichever member store runs: the
+    // export-wide one (#235), or one multi-wave level's at a time (#740).
+    let store_grant = budget.fit(
+        MemoryPhase::ExportCollect,
+        Price::model(MEMBER_STORE_RAM_BUDGET as u64),
+        1,
+        1,
+    );
+    let store_ram = usize::try_from(store_grant.bytes()).unwrap_or(usize::MAX);
     let mut store = if single_read {
         let backing = knobs.backing_override.unwrap_or_else(|| {
-            auto_fill_backing(&scans, num_levels, available_ram, mean_member_bytes)
+            auto_fill_backing(&scans, num_levels, budget.available(), mean_member_bytes)
         });
         // #571: entered only when the fill runs, so a duplicating-mode export
         // (no fill) has no `fill` entry in `phase_peaks_mib`.
@@ -2226,7 +2273,10 @@ fn export_pmtiles_validated(
                 feature_id: feature_id.as_ref(),
                 timers: &progress.profile.timers,
             },
-            backing,
+            StoreBacking {
+                backing,
+                ram_budget: store_ram,
+            },
             diagnostics,
         )?;
         progress.end_fill(t_fill);
@@ -2240,29 +2290,17 @@ fn export_pmtiles_validated(
     progress.enter_phase("levels");
 
     let t_levels = Instant::now();
-    // #647: consecutive small levels run as one concurrent group. On `auto`
-    // the cap sizes from the same RAM budget as the #311 per-level guard.
-    // An explicit wave sizes the cap from its width alone, as #311 does.
-    // `concurrent_levels: false` (cap 0) is the serial test oracle.
-    let group_cap = level_group_member_cap(
-        ceiling_wave,
-        partition_target,
-        member_bytes.filter(|_| auto_wave),
-        available_ram.filter(|_| auto_wave),
-    );
-    let group_cap = if knobs.concurrent_levels {
-        group_cap
-    } else {
-        0
-    };
     // #740: without the export-wide store, a level split into several waves
     // reads its band once into a one-level store instead of once per wave.
-    // Spill by default: the level was split because its members do not fit
-    // in one wave, so the store keeps only its bounded in-RAM buffer during
-    // the read and the drain holds one wave, as the per-wave reads did. The
-    // forced legacy read keeps the per-wave reads (the tests' oracle).
-    let level_read = (store.is_none() && !knobs.force_legacy_pass2)
-        .then(|| knobs.backing_override.unwrap_or(SinkBacking::Spill));
+    // Spill by default: in RAM the read would hold every wave of the level
+    // (up to 5.7 waves' members on NZ z14) where the wave sizing budgets for
+    // one, so the store keeps only its granted buffer during the read and
+    // the drain holds one wave, as the per-wave reads did. The forced legacy
+    // read keeps the per-wave reads (the tests' oracle).
+    let level_read = (store.is_none() && !knobs.force_legacy_pass2).then(|| StoreBacking {
+        backing: knobs.backing_override.unwrap_or(SinkBacking::Spill),
+        ram_budget: store_ram,
+    });
     #[cfg(test)]
     let work = Mutex::new(ExportWorkTally::default());
     let levels: Vec<ExportLevelCtx<'_>> = plans
@@ -2299,6 +2337,7 @@ fn export_pmtiles_validated(
         diagnostics,
     )?);
 
+    budget.release(store_grant);
     progress.profile.walls.levels = t_levels.elapsed().as_secs_f64();
     progress.enter_phase("finalize");
 
@@ -2771,7 +2810,7 @@ struct ExportLevelCtx<'a> {
     /// How a level of several waves reads its band when no export-wide
     /// member store is filled: once, into a one-level [`MemberStore`] with
     /// this backing (#740), or, `None`, once per wave.
-    level_read: Option<SinkBacking>,
+    level_read: Option<StoreBacking>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -3555,6 +3594,14 @@ struct LevelPlan {
 /// file's segments chunky.
 const MEMBER_STORE_RAM_BUDGET: usize = 128 * 1024 * 1024;
 
+/// How a [`MemberStore`] holds its members: in RAM, or spilled with
+/// `ram_budget` bytes of not-yet-flushed buckets.
+#[derive(Debug, Clone, Copy)]
+struct StoreBacking {
+    backing: SinkBacking,
+    ram_budget: usize,
+}
+
 /// Bounded-channel depth between the band reader thread and the clip/route
 /// consumer of the single-read fill — the read/compute overlap and
 /// backpressure knob, mirroring `overview/pipeline.rs`.
@@ -4017,6 +4064,10 @@ struct MemberStore {
     buffered_bytes: usize,
     /// Present under spill backing only.
     spill: Option<MemberSpill>,
+    /// The in-RAM ceiling for not-yet-flushed buckets under spill backing:
+    /// the bytes of the run's [`MemoryPhase::ExportCollect`] grant priced at
+    /// [`MEMBER_STORE_RAM_BUDGET`].
+    ram_budget: usize,
     /// Profiling only (#535): cumulative time spent in [`Self::flush_bucket`]
     /// (serialize + write of spill segments). Read by the fill to charge it
     /// to `spill_write` rather than to the routing that triggered it.
@@ -4029,6 +4080,7 @@ impl MemberStore {
     fn new(
         plans: &[LevelPlan],
         backing: SinkBacking,
+        ram_budget: usize,
         spill_dir: Option<&Path>,
     ) -> Result<Self, ExportError> {
         let shape: Vec<usize> = plans
@@ -4063,6 +4115,7 @@ impl MemberStore {
             bucket_bytes,
             buffered_bytes: 0,
             spill,
+            ram_budget,
             flush_time: Duration::ZERO,
         })
     }
@@ -4072,8 +4125,8 @@ impl MemberStore {
         self.buckets[level][wave].push(m);
         self.bucket_bytes[level][wave] += est;
         self.buffered_bytes += est;
-        if self.spill.is_some() && self.buffered_bytes > MEMBER_STORE_RAM_BUDGET {
-            self.flush_largest_until(MEMBER_STORE_RAM_BUDGET / 2)?;
+        if self.spill.is_some() && self.buffered_bytes > self.ram_budget {
+            self.flush_largest_until(self.ram_budget / 2)?;
         }
         Ok(())
     }
@@ -4230,13 +4283,18 @@ impl MemberStore {
 fn fill_member_store(
     reader: &OverviewReader,
     ctx: &FanoutCtx<'_>,
-    backing: SinkBacking,
+    backing: StoreBacking,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<MemberStore, ExportError> {
     let timers = ctx.timers;
     let plans = ctx.plans;
     let num_levels = plans.len();
-    let mut store = MemberStore::new(plans, backing, ctx.opts.spill_dir.as_deref())?;
+    let mut store = MemberStore::new(
+        plans,
+        backing.backing,
+        backing.ram_budget,
+        ctx.opts.spill_dir.as_deref(),
+    )?;
     let t_fill = Instant::now();
     let mut seq = 0u64;
     // #745: every band is read whole and in order, so the rows arrive in
@@ -5118,13 +5176,14 @@ fn collect_wave(
 fn fill_level_store(
     ctx: &LevelCtx<'_>,
     plan: &LevelPlan,
-    backing: SinkBacking,
+    backing: StoreBacking,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<MemberStore, ExportError> {
     let t_collect = Instant::now();
     let mut store = MemberStore::new(
         std::slice::from_ref(plan),
-        backing,
+        backing.backing,
+        backing.ram_budget,
         ctx.opts.spill_dir.as_deref(),
     )?;
     let rows_read = collect_into(
@@ -5140,11 +5199,12 @@ fn fill_level_store(
     super::stream::add_nanos(&ctx.timers.spill_write, store.flush_time);
     log::debug!(
         "[profile]     z{} level read ({} partitions, {} waves): rows_read={rows_read} \
-         collect={:.2}s ({backing:?})",
+         collect={:.2}s ({:?})",
         ctx.zoom,
         plan.partitions.len(),
         plan.partitions.len().div_ceil(plan.wave.max(1)),
         t_collect.elapsed().as_secs_f64(),
+        backing.backing,
     );
     Ok(store)
 }
@@ -9303,28 +9363,56 @@ mod tests {
         const GIB: u64 = 1024 * MIB;
         // Plenty of RAM: cores drive the width — including past the old fixed
         // 16 cap (the whole point of #303).
-        assert_eq!(auto_partition_wave(64, Some(256 * GIB)), 64);
-        assert_eq!(auto_partition_wave(24, Some(256 * GIB)), 24);
+        assert_eq!(
+            auto_partition_wave(64, &MemoryBudget::with_available(Some(256 * GIB))),
+            64
+        );
+        assert_eq!(
+            auto_partition_wave(24, &MemoryBudget::with_available(Some(256 * GIB))),
+            24
+        );
         // The #293 target box (16 cores / 54 GiB) resolves exactly as before.
-        assert_eq!(auto_partition_wave(16, Some(54 * GIB)), 16);
+        assert_eq!(
+            auto_partition_wave(16, &MemoryBudget::with_available(Some(54 * GIB))),
+            16
+        );
         // Tight RAM caps below the core count:
         // 4 GiB avail → 2 GiB wave budget → 32 slots of 64 MiB.
-        assert_eq!(auto_partition_wave(64, Some(4 * GIB)), 32);
+        let avail = |bytes: u64| MemoryBudget::with_available(Some(bytes));
+        assert_eq!(auto_partition_wave(64, &avail(4 * GIB)), 32);
         // 2 GiB avail → 1 GiB budget → 16 slots.
-        assert_eq!(auto_partition_wave(64, Some(2 * GIB)), 16);
+        assert_eq!(auto_partition_wave(64, &avail(2 * GIB)), 16);
         // 1 GiB avail → 512 MiB budget → 8 slots.
-        assert_eq!(auto_partition_wave(64, Some(GIB)), 8);
+        assert_eq!(auto_partition_wave(64, &avail(GIB)), 8);
         // Very tight RAM floors at MIN, never below (historical width; its
         // worst-case transient is small and known-safe).
-        assert_eq!(auto_partition_wave(16, Some(256 * MIB)), PARTITION_WAVE_MIN);
-        assert_eq!(auto_partition_wave(16, Some(0)), PARTITION_WAVE_MIN);
+        assert_eq!(
+            auto_partition_wave(16, &MemoryBudget::with_available(Some(256 * MIB))),
+            PARTITION_WAVE_MIN
+        );
+        assert_eq!(
+            auto_partition_wave(16, &MemoryBudget::with_available(Some(0))),
+            PARTITION_WAVE_MIN
+        );
         // Small boxes keep the floor regardless of RAM.
-        assert_eq!(auto_partition_wave(2, Some(256 * GIB)), PARTITION_WAVE_MIN);
+        assert_eq!(
+            auto_partition_wave(2, &MemoryBudget::with_available(Some(256 * GIB))),
+            PARTITION_WAVE_MIN
+        );
         // RAM unknown (non-Linux, unreadable /proc/meminfo): fall back to the
         // #293 fixed cap — portable and deterministic where no probe exists.
-        assert_eq!(auto_partition_wave(64, None), PARTITION_WAVE_FALLBACK_MAX);
-        assert_eq!(auto_partition_wave(8, None), 8);
-        assert_eq!(auto_partition_wave(2, None), PARTITION_WAVE_MIN);
+        assert_eq!(
+            auto_partition_wave(64, &MemoryBudget::with_available(None)),
+            PARTITION_WAVE_FALLBACK_MAX
+        );
+        assert_eq!(
+            auto_partition_wave(8, &MemoryBudget::with_available(None)),
+            8
+        );
+        assert_eq!(
+            auto_partition_wave(2, &MemoryBudget::with_available(None)),
+            PARTITION_WAVE_MIN
+        );
     }
 
     /// Build a partition list from raw member counts (bbox/keys are irrelevant
@@ -9356,7 +9444,12 @@ mod tests {
         let sparse_bytes = Some(member_resident_bytes(512, 0));
         let dense_bytes = Some(member_resident_bytes(600, 0));
         assert_eq!(
-            memory_safe_level_wave(16, &sparse, sparse_bytes, Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &sparse,
+                sparse_bytes,
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             16,
             "a sparse level must not narrow below the ceiling"
         );
@@ -9367,7 +9460,12 @@ mod tests {
         // Brazil case that OOM'd at wave 16, now capped to a safe 3.
         let dense = partitions_with_members(&[6_500_000, 100, 200]);
         assert_eq!(
-            memory_safe_level_wave(16, &dense, dense_bytes, Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &dense,
+                dense_bytes,
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             3,
         );
 
@@ -9377,14 +9475,24 @@ mod tests {
         // guard bypasses the throughput floor rather than OOM.
         let extreme = partitions_with_members(&[60_000_000, 100]);
         assert_eq!(
-            memory_safe_level_wave(16, &extreme, dense_bytes, Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &extreme,
+                dense_bytes,
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             1,
         );
 
         // The clamp is one-directional: a roomy budget never widens past the
         // ceiling the caller already chose.
         assert_eq!(
-            memory_safe_level_wave(4, &sparse, sparse_bytes, Some(256 * GIB)),
+            memory_safe_level_wave(
+                4,
+                &sparse,
+                sparse_bytes,
+                &MemoryBudget::with_available(Some(256 * GIB))
+            ),
             4,
         );
 
@@ -9392,24 +9500,42 @@ mod tests {
         // level), unmeasurable RAM, or an empty partition list all return the
         // ceiling verbatim.
         assert_eq!(
-            memory_safe_level_wave(16, &dense, None, Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &dense,
+                None,
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             16,
             "unknown member size falls back to the ceiling"
         );
         assert_eq!(
-            memory_safe_level_wave(16, &dense, Some(0), Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &dense,
+                Some(0),
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             16,
             "a degenerate zero member size falls back to the ceiling"
         );
         // Even when RAM is tiny: zero is unknown, not one byte per member.
-        assert_eq!(memory_safe_level_wave(16, &dense, Some(0), Some(8)), 16);
         assert_eq!(
-            memory_safe_level_wave(16, &dense, dense_bytes, None),
+            memory_safe_level_wave(16, &dense, Some(0), &MemoryBudget::with_available(Some(8))),
+            16
+        );
+        assert_eq!(
+            memory_safe_level_wave(16, &dense, dense_bytes, &MemoryBudget::with_available(None)),
             16,
             "unprobeable RAM falls back to the ceiling"
         );
         assert_eq!(
-            memory_safe_level_wave(16, &[], dense_bytes, Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &[],
+                dense_bytes,
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             16,
             "an empty level falls back to the ceiling"
         );
@@ -9711,7 +9837,7 @@ mod tests {
             .unwrap_or(PARTITION_WAVE_MIN);
         assert_eq!(
             auto,
-            auto_partition_wave(cores, available_memory_bytes()),
+            auto_partition_wave(cores, &export_budget()),
             "auto must equal the preflight decision on this box's cores + RAM"
         );
         // Explicit values pass through verbatim, including above any auto cap.
@@ -9812,7 +9938,12 @@ mod tests {
         const GIB: u64 = 1024 * MIB;
         // Unknown member size or RAM: the wave-shaped cap alone.
         assert_eq!(
-            level_group_member_cap(6, 32_768, None, Some(GIB)),
+            level_group_member_cap(
+                6,
+                32_768,
+                None,
+                Some(&MemoryBudget::with_available(Some(GIB)))
+            ),
             6 * 32_768
         );
         assert_eq!(
@@ -9821,17 +9952,32 @@ mod tests {
         );
         // A member size of 0 is unknown too, not a free member.
         assert_eq!(
-            level_group_member_cap(6, 32_768, Some(0), Some(0)),
+            level_group_member_cap(
+                6,
+                32_768,
+                Some(0),
+                Some(&MemoryBudget::with_available(Some(0)))
+            ),
             6 * 32_768
         );
         // Roomy RAM never widens past the wave-shaped cap.
         assert_eq!(
-            level_group_member_cap(6, 32_768, Some(100), Some(256 * GIB)),
+            level_group_member_cap(
+                6,
+                32_768,
+                Some(100),
+                Some(&MemoryBudget::with_available(Some(256 * GIB)))
+            ),
             6 * 32_768
         );
         // Tight RAM narrows it: 1 GiB × 0.5 / 2000 B resident = 268_435.
         assert_eq!(
-            level_group_member_cap(16, 32_768, Some(2000), Some(GIB)),
+            level_group_member_cap(
+                16,
+                32_768,
+                Some(2000),
+                Some(&MemoryBudget::with_available(Some(GIB)))
+            ),
             (GIB / 2 / 2000) as usize
         );
     }
@@ -14698,7 +14844,13 @@ mod tests {
             partitions: partitions_with_members(&[10]),
             wave: 1,
         }];
-        let store = MemberStore::new(&plans, SinkBacking::Spill, Some(dir.path())).unwrap();
+        let store = MemberStore::new(
+            &plans,
+            SinkBacking::Spill,
+            MEMBER_STORE_RAM_BUDGET,
+            Some(dir.path()),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),
             1,
@@ -14723,7 +14875,8 @@ mod tests {
             partitions: partitions_with_members(&[10, 10]),
             wave: 1,
         }];
-        let mut store = MemberStore::new(&plans, SinkBacking::Spill, None).unwrap();
+        let mut store =
+            MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
         let mk = |key: u64, seq: u64| Member {
             key,
             seq,
@@ -14786,7 +14939,8 @@ mod tests {
             partitions: partitions_with_members(&[10]),
             wave: 1,
         }];
-        let mut store = MemberStore::new(&plans, SinkBacking::Spill, None).unwrap();
+        let mut store =
+            MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
         let mk = |seq: u64, props: Vec<(Arc<str>, PropertyValue)>| Member {
             key: 0,
             seq,
@@ -14835,7 +14989,8 @@ mod tests {
             partitions: partitions_with_members(&[10]),
             wave: 1,
         }];
-        let mut store = MemberStore::new(&plans, SinkBacking::Spill, None).unwrap();
+        let mut store =
+            MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
         let n = 2 * SPILL_SEGMENT_MEMBERS + 5;
         for seq in 0..n as u64 {
             let name: Arc<str> = format!("p{}", seq % 3).into();

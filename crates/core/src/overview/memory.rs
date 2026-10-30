@@ -33,6 +33,16 @@ const READ_SHARE: f64 = 0.10;
 /// Share of the allowance the pass-2 compute window may hold (#716).
 const COMPUTE_SHARE: f64 = 0.10;
 
+/// Fraction of the probed memory export's waves and encodes may hold
+/// (#303, #311, #788 E1), as export's own budget always was
+/// (`EXPORT_WAVE_RAM_FRACTION`): below the allowance, because the waves sit
+/// on top of export state no estimate models (scan accumulators, decode
+/// buffers, the writer's directory). Taken from the probed figure itself,
+/// not as a share of the allowance, so a round figure (a
+/// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` of 2 GiB) still affords exactly the
+/// slots it did.
+const EXPORT_FRACTION: f64 = 0.5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MemoryPhase {
     EagerInput,
@@ -52,7 +62,6 @@ pub(super) enum MemoryPhase {
     #[expect(dead_code, reason = "#788: track C1 grants the spill queues under it")]
     Spill,
     /// Export's tile collection (track E1).
-    #[expect(dead_code, reason = "#788: track E1 grants export collection under it")]
     ExportCollect,
     /// Export's concurrent tile encodes (track E1).
     #[expect(dead_code, reason = "#788: track E1 grants export encodes under it")]
@@ -112,10 +121,6 @@ pub(super) enum PriceBasis {
     )]
     Measured,
     /// Read from the parquet footers before any page is decoded.
-    #[expect(
-        dead_code,
-        reason = "#788 C2 step 2 prices the read-ahead from the footers"
-    )]
     Footer,
     /// A per-row model ([`MemoryBudget::estimate`]), not a measurement.
     Model,
@@ -263,7 +268,13 @@ impl MemoryBudget {
     /// Units of `price` that `phase`'s share of the current allowance can
     /// hold, at least 1. A query: it charges nothing.
     pub(super) fn affordable(&self, phase: MemoryPhase, price: Price) -> usize {
-        let ceiling = (self.remaining() as f64 * phase.share()) as u64;
+        let ceiling = match (phase, self.limit) {
+            (MemoryPhase::ExportCollect | MemoryPhase::ExportEncode, Some(l)) => {
+                ((l.bytes.saturating_sub(sum(&self.reserved)) as f64 * EXPORT_FRACTION) as u64)
+                    .saturating_sub(sum(&self.granted))
+            }
+            _ => (self.remaining() as f64 * phase.share()) as u64,
+        };
         usize::try_from(ceiling / price.bytes.max(1))
             .unwrap_or(usize::MAX)
             .max(1)
@@ -289,7 +300,6 @@ impl MemoryBudget {
         grant
     }
     /// Return a grant once what it priced is no longer resident.
-    #[expect(dead_code, reason = "#788 C2 step 2 releases the pass-2 grants")]
     pub(super) fn release(&mut self, grant: Grant) {
         let slot = &mut self.granted[grant.phase as usize];
         *slot = slot.saturating_sub(grant.bytes());
