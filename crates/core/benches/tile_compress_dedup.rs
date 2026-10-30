@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{Coord, Geometry, LineString, Point};
 use prost::Message;
 use tylertoo_core::compression::{compress, Compression};
@@ -139,17 +139,4 @@ fn bench_dedup(c: &mut Criterion) {
 }
 
 criterion_group!(benches, bench_gzip, bench_dedup);
-
-#[path = "support/dense_points.rs"]
-mod dense_points;
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).is_some_and(|a| a == "--generate-dense") {
-        let rows = args[3].parse().expect("row count");
-        dense_points::write(std::path::Path::new(&args[2]), rows);
-    } else {
-        benches();
-        Criterion::default().configure_from_args().final_summary();
-    }
-}
+criterion_main!(benches);
