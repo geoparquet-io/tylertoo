@@ -4036,7 +4036,7 @@ fn write_profile_json(
 /// probe it — the backing is an instruction there, not an estimate.
 fn sink_json(m: pipeline::SinkMeasurement) -> serde_json::Value {
     serde_json::json!({
-        "spill_codec": m.codec.as_str(),
+        "spill_codec": pipeline::spill_codec_name(m.codec),
         "bytes_per_row": m.bytes_per_row,
         "sampled_rows": m.sampled_rows,
         "projected_bytes": m.projected_bytes,
