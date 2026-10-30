@@ -441,13 +441,83 @@ impl InputSource {
     /// Returns an [`InputError`] if fetching a remote row group or writing it
     /// to the spill fails.
     pub fn stage_row_groups(&self, selected: Option<&[usize]>) -> Result<(), InputError> {
+        let plan = self.plan_staging(selected, None)?;
+        self.stage_planned(&plan)
+    }
+
+    /// This part's share of a pass-0 staging plan (#788): the column chunks
+    /// of the `selected` row groups (`None` = all) whose root column is in
+    /// `roots` (`None` = every column), as range requests. Built from the
+    /// footer alone; empty for a local part, which never stages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a remote footer cannot be read or
+    /// declares a column chunk outside the object (#430).
+    #[cfg_attr(
+        not(feature = "remote"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "only a remote part can fail to plan"
+        )
+    )]
+    pub(crate) fn plan_staging(
+        &self,
+        selected: Option<&[usize]>,
+        roots: Option<&[usize]>,
+    ) -> Result<PartStaging, InputError> {
         #[cfg(not(feature = "remote"))]
-        let _ = selected;
+        let _ = (selected, roots);
+        match self {
+            InputSource::Local(_) => Ok(PartStaging::default()),
+            #[cfg(feature = "remote")]
+            InputSource::Remote(r) => {
+                let remote = r.plan_staging(selected, roots)?;
+                Ok(PartStaging {
+                    bytes_to_stage: remote.bytes_to_stage(),
+                    remote,
+                })
+            }
+        }
+    }
+
+    /// Fetch `plan`'s requests into the disk spill (see
+    /// [`Self::stage_row_groups`]). No-op for a local part.
+    #[cfg_attr(
+        not(feature = "remote"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "only a remote part can fail to stage"
+        )
+    )]
+    pub(crate) fn stage_planned(&self, plan: &PartStaging) -> Result<(), InputError> {
+        #[cfg(not(feature = "remote"))]
+        let _ = plan;
         match self {
             InputSource::Local(_) => Ok(()),
             #[cfg(feature = "remote")]
-            InputSource::Remote(r) => r.stage_row_groups(selected),
+            InputSource::Remote(r) => r.stage_plan(&plan.remote),
         }
+    }
+}
+
+/// One part's share of a pass-0 staging plan (#788, see
+/// [`InputSource::plan_staging`]). Empty for a local part.
+#[derive(Debug, Default)]
+pub(crate) struct PartStaging {
+    bytes_to_stage: u64,
+    #[cfg(feature = "remote")]
+    remote: remote::PartPlan,
+}
+
+impl PartStaging {
+    /// Compressed bytes of the column chunks this part stages: the selected
+    /// row groups' projected chunks, whether or not an earlier staging
+    /// already spilled some of them. It is the part's spill footprint, and
+    /// with no earlier staging also the bytes the plan fetches (an excluded
+    /// chunk or a pruned row group is never fetched, whatever the window).
+    pub(crate) fn bytes_to_stage(&self) -> u64 {
+        self.bytes_to_stage
     }
 }
 
@@ -1001,9 +1071,9 @@ pub(crate) mod remote {
         }
 
         /// Pass 0 (#286/#287): stage the selected row groups to the disk spill
-        /// up front — ONE coalesced range request per row group, several in
-        /// flight at once — so both later passes read entirely from local
-        /// disk.
+        /// up front, several range requests in flight at once, so both later
+        /// passes read entirely from local disk. Every column, no projection:
+        /// the [`super::InputSource::stage_row_groups`] entry point.
         ///
         /// A row group's column chunks form a contiguous byte span, so each
         /// row group is fetched as a single large GET and sliced back into the
@@ -1024,44 +1094,73 @@ pub(crate) mod remote {
         /// space, #272) simply falls back to the reader's network path on
         /// first touch, so a spill write is never fatal — only an actual fetch
         /// error, which the passes would hit anyway, is surfaced.
-        pub(crate) fn stage_row_groups(
-            &self,
-            selected: Option<&[usize]>,
-        ) -> Result<(), InputError> {
-            self.stage_row_groups_with(selected, staging_tunables::effective())
-        }
-
-        /// [`Self::stage_row_groups`] with explicit tunables: the test seam,
-        /// so a test can pin the window or concurrency without touching the
-        /// process environment that [`staging_tunables::effective`] reads.
+        #[cfg(test)]
         fn stage_row_groups_with(
             &self,
             selected: Option<&[usize]>,
             tunables: &staging_tunables::StagingTunables,
         ) -> Result<(), InputError> {
-            let metadata = self.load_footer()?;
-            let row_groups = metadata.metadata().row_groups();
+            let plan = self.plan_staging_with(selected, None, tunables)?;
+            self.stage_plan_with(&plan, tunables)
+        }
 
+        /// This part's staging requests (#788): see
+        /// [`super::InputSource::plan_staging`].
+        pub(crate) fn plan_staging(
+            &self,
+            selected: Option<&[usize]>,
+            roots: Option<&[usize]>,
+        ) -> Result<PartPlan, InputError> {
+            self.plan_staging_with(selected, roots, staging_tunables::effective())
+        }
+
+        /// [`Self::plan_staging`] with explicit tunables (the test seam).
+        ///
+        /// Each selected row group contributes one span per run of kept
+        /// chunks: a chunk of an excluded column (outside `roots`) ends the
+        /// run and, like a pruned row group, blocks every merge across it.
+        /// A chunk already in the spill (an earlier staging, or a lazy read)
+        /// is not fetched again and blocks merges too. The coalescing window
+        /// then merges neighbouring spans whose gap holds no blocked byte, so
+        /// with a window `c` of one row group joins `a` of the next while an
+        /// excluded `b` between them is never fetched.
+        fn plan_staging_with(
+            &self,
+            selected: Option<&[usize]>,
+            roots: Option<&[usize]>,
+            tunables: &staging_tunables::StagingTunables,
+        ) -> Result<PartPlan, InputError> {
+            let metadata = self.load_footer()?;
+            let md = metadata.metadata();
+            let mask = roots.map(|r| {
+                tylertoo_io::ProjectionMask::roots(
+                    md.file_metadata().schema_descr(),
+                    r.iter().copied(),
+                )
+            });
+            let row_groups = md.row_groups();
             let mut is_selected = vec![selected.is_none(); row_groups.len()];
             for &i in selected.unwrap_or_default() {
                 if let Some(s) = is_selected.get_mut(i) {
                     *s = true;
                 }
             }
-            let mut plan: Vec<StagedSpan> = Vec::new();
-            // Spans of the unselected row groups: a coalesced request must
-            // never reach into one (#219/#210 — pruned bytes stay unfetched).
+            let spill = self
+                .spill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut units: Vec<StagedSpan> = Vec::new();
             let mut blocked: Vec<Range<u64>> = Vec::new();
+            let mut bytes_to_stage = 0u64;
             for (rg, &keep) in row_groups.iter().zip(&is_selected) {
-                let mut start = u64::MAX;
-                let mut end = 0u64;
+                // (start, end, len, kept) per chunk, in file order.
                 let mut chunks = Vec::with_capacity(rg.columns().len());
-                for col in rg.columns() {
+                for (leaf, col) in rg.columns().iter().enumerate() {
                     let (s, len) = col.byte_range();
                     // Checked (#430): `load_footer` validated these for every
                     // row group, pruned or not, but a wrapped span here would
                     // fetch the wrong bytes.
-                    let chunk_end = s
+                    let (end, len) = s
                         .checked_add(len)
                         .filter(|e| *e <= self.object_meta.size)
                         .zip(usize::try_from(len).ok())
@@ -1073,31 +1172,65 @@ pub(crate) mod remote {
                                 self.location
                             ))
                         })?;
-                    start = start.min(s);
-                    end = end.max(chunk_end.0);
-                    chunks.push((s, chunk_end.1));
+                    let kept = mask.as_ref().is_none_or(|m| m.leaf_included(leaf));
+                    chunks.push((s, end, len, kept));
                 }
-                if end <= start {
+                chunks.sort_by_key(|c| c.0);
+                if !keep {
+                    if let (Some(first), Some(end)) =
+                        (chunks.first(), chunks.iter().map(|c| c.1).max())
+                    {
+                        blocked.push(first.0..end);
+                    }
                     continue;
                 }
-                if keep {
-                    plan.push(StagedSpan {
+                let mut run: Option<StagedSpan> = None;
+                for (start, end, len, kept) in chunks {
+                    if end <= start {
+                        continue;
+                    }
+                    if kept {
+                        bytes_to_stage = bytes_to_stage.saturating_add(len as u64);
+                    }
+                    if !kept || spill.holds(start) {
+                        blocked.push(start..end);
+                        units.extend(run.take());
+                        continue;
+                    }
+                    let unit = run.get_or_insert_with(|| StagedSpan {
                         span: start..end,
-                        chunks,
+                        chunks: Vec::new(),
                     });
-                } else {
-                    blocked.push(start..end);
+                    unit.span.end = unit.span.end.max(end);
+                    unit.chunks.push((start, len));
                 }
+                units.extend(run);
             }
-            if plan.is_empty() {
+            drop(spill);
+            Ok(PartPlan {
+                requests: coalesce_spans(units, &blocked, tunables.coalesce_window),
+                bytes_to_stage,
+            })
+        }
+
+        /// Fetch `plan`'s requests into the spill (pass 0).
+        pub(crate) fn stage_plan(&self, plan: &PartPlan) -> Result<(), InputError> {
+            self.stage_plan_with(plan, staging_tunables::effective())
+        }
+
+        fn stage_plan_with(
+            &self,
+            plan: &PartPlan,
+            tunables: &staging_tunables::StagingTunables,
+        ) -> Result<(), InputError> {
+            if plan.requests.is_empty() {
                 return Ok(());
             }
-            let plan = coalesce_spans(plan, &blocked, tunables.coalesce_window);
-
             // Bound in-flight (resident) spans by the memory budget: holding
             // one row group transiently matches the L1 cache ceiling, so never
             // hold more than the budget's worth at once.
             let max_span = plan
+                .requests
                 .iter()
                 .map(|r| r.span.end - r.span.start)
                 .max()
@@ -1110,7 +1243,7 @@ pub(crate) mod remote {
             log::debug!(
                 "[stage] fetching {} span(s), {concurrency} in flight \
                  (largest span {max_span} B)",
-                plan.len()
+                plan.requests.len()
             );
 
             let store = Arc::clone(&self.store);
@@ -1121,7 +1254,7 @@ pub(crate) mod remote {
 
             runtime().block_on(async move {
                 use futures_util::stream::StreamExt;
-                let mut inflight = futures_util::stream::iter(plan.into_iter().map(|rg| {
+                let mut inflight = futures_util::stream::iter(plan.requests.iter().map(|rg| {
                     let store = Arc::clone(&store);
                     let location = location.clone();
                     let object_meta = object_meta.clone();
@@ -1130,7 +1263,7 @@ pub(crate) mod remote {
                             .get_range(store.as_ref(), &location, rg.span.clone())
                             .await
                             .map_err(|e| ParquetError::External(Box::new(e)))?;
-                        Ok::<(StagedSpan, Bytes), ParquetError>((rg, bytes))
+                        Ok::<(&StagedSpan, Bytes), ParquetError>((rg, bytes))
                     }
                 }))
                 .buffer_unordered(concurrency);
@@ -1155,7 +1288,7 @@ pub(crate) mod remote {
                     let mut spill = spill
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for (chunk_start, len) in rg.chunks {
+                    for &(chunk_start, len) in &rg.chunks {
                         // Checked (#430): a wrapped `off + len` would pass the
                         // bound and panic inside `slice`.
                         let slice = chunk_start
@@ -1743,9 +1876,25 @@ pub(crate) mod remote {
     /// plus the `(chunk_start, len)` of every column chunk inside it — keyed
     /// exactly how the L2 spill and [`RemoteReader::chunk_data`] look chunks
     /// up (`chunk.start`), so a staged slice is a drop-in L2 hit.
+    #[derive(Debug)]
     struct StagedSpan {
         span: Range<u64>,
         chunks: Vec<(u64, usize)>,
+    }
+
+    /// One remote part's staging plan (#788): its requests, and the bytes of
+    /// every projected chunk of its selected row groups.
+    #[derive(Debug, Default)]
+    pub(crate) struct PartPlan {
+        requests: Vec<StagedSpan>,
+        bytes_to_stage: u64,
+    }
+
+    impl PartPlan {
+        /// See [`super::PartStaging::bytes_to_stage`].
+        pub(crate) fn bytes_to_stage(&self) -> u64 {
+            self.bytes_to_stage
+        }
     }
 
     /// Merge adjacent row-group spans into fewer, larger requests (#290
@@ -1850,6 +1999,12 @@ pub(crate) mod remote {
     }
 
     impl DiskSpill {
+        /// Whether the chunk starting at `chunk_start` is already spilled
+        /// (and the spill still serves reads).
+        fn holds(&self, chunk_start: u64) -> bool {
+            !self.disabled && self.index.contains_key(&chunk_start)
+        }
+
         /// Serve a previously spilled chunk, if present. `None` means "not
         /// spilled — fetch it over the network"; a read error disables the
         /// spill and also returns `None` so the caller falls back to fetch.

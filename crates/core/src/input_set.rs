@@ -144,6 +144,23 @@ pub struct MultiSource {
     projection: std::sync::OnceLock<Vec<usize>>,
 }
 
+/// A pass-0 staging plan (#788, [`ConvertSource::staging_plan`]): one
+/// [`PartStaging`] per part, in part order (empty for a local part).
+#[derive(Debug)]
+pub(crate) struct StagingPlan {
+    parts: Vec<crate::input::PartStaging>,
+}
+
+impl StagingPlan {
+    /// See [`ConvertSource::bytes_to_stage`].
+    pub(crate) fn bytes_to_stage(&self) -> u64 {
+        self.parts
+            .iter()
+            .map(crate::input::PartStaging::bytes_to_stage)
+            .fold(0, u64::saturating_add)
+    }
+}
+
 /// Per-part row-group selection.
 ///
 /// This is the multi-file analogue of the single-file
@@ -607,8 +624,8 @@ impl ConvertSource {
     /// columns of the file schema, sorted ascending (#386). Applied once,
     /// before anything derives column indices from the schema, so every
     /// downstream index is already relative to the projected layout and the
-    /// excluded columns are never decoded (a remote input still stages every
-    /// chunk of a row group; only the decode is skipped). A second call is a
+    /// excluded columns are never decoded, and a remote input never stages
+    /// their chunks (#400, [`Self::staging_plan`]). A second call is a
     /// programming error.
     ///
     /// # Errors
@@ -983,24 +1000,31 @@ impl ConvertSource {
         total
     }
 
-    /// Stage every part's selected row groups to local disk up front (pass 0,
-    /// #286/#287) so the streaming passes read from disk, not the network.
-    ///
-    /// Each remote part coalesces its selected row groups into one parallel
-    /// range request per row group (a row group is a contiguous byte span);
-    /// local parts are no-ops. Parts are staged in order so resident memory
-    /// stays bounded by one part's in-flight spans. `selection` (`None` = all
-    /// row groups) is the per-part bbox pruning the passes will honor, so
-    /// pruned groups are never fetched and total network traffic stays ≈1×
-    /// the input (#219). Errors are the caller's to handle; the streaming
-    /// pipeline treats staging as best-effort (a network error here is one the
-    /// passes would hit anyway).
+    /// The pass-0 staging plan (#788) for `selection` (`None` = every row
+    /// group of every part): per remote part, range requests for the
+    /// selected row groups' chunks of the columns this source reads
+    /// ([`Self::column_projection`], every column when unset). Built from
+    /// the footers alone. Pruned row groups and excluded columns are never
+    /// part of a request, whatever the coalescing window.
     ///
     /// # Errors
     ///
-    /// Returns an [`InputError`] if fetching a remote part's row groups or
-    /// writing them to the spill fails.
-    pub fn stage_selected(&self, selection: Option<&RowGroupSelection>) -> Result<(), InputError> {
+    /// Returns an [`InputError`] if a part's footer cannot be read or
+    /// declares a column chunk outside its object.
+    pub(crate) fn staging_plan(
+        &self,
+        selection: Option<&RowGroupSelection>,
+    ) -> Result<StagingPlan, InputError> {
+        self.staging_plan_for(selection, self.column_projection())
+    }
+
+    /// [`Self::staging_plan`] for an explicit set of file-root columns
+    /// (`None` = all), for a read narrower than the source's projection.
+    pub(crate) fn staging_plan_for(
+        &self,
+        selection: Option<&RowGroupSelection>,
+        roots: Option<&[usize]>,
+    ) -> Result<StagingPlan, InputError> {
         let parts = self.parts();
         if let Some(sel) = selection {
             debug_assert_eq!(
@@ -1009,10 +1033,59 @@ impl ConvertSource {
                 "row-group selection must cover every part"
             );
         }
-        for (i, part) in parts.iter().enumerate() {
-            part.stage_row_groups(selection.map(|s| s.0[i].as_slice()))?;
+        let parts = parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| part.plan_staging(selection.map(|s| s.0[i].as_slice()), roots))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(StagingPlan { parts })
+    }
+
+    /// Bytes pass 0 stages to the local disk spill for `selection` (`None` =
+    /// every row group of every part): the compressed size of every column
+    /// chunk the conversion reads from a remote part, i.e. the selected row
+    /// groups' chunks of the projected columns ([`Self::restrict_columns`]).
+    /// Local parts contribute 0. This is the spill footprint the #272
+    /// free-space preflight compares against, and (staging never fetches
+    /// an excluded chunk or a pruned row group) the bytes staging fetches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read or
+    /// declares a column chunk outside its object.
+    pub fn bytes_to_stage(&self, selection: Option<&RowGroupSelection>) -> Result<u64, InputError> {
+        Ok(self.staging_plan(selection)?.bytes_to_stage())
+    }
+
+    /// Fetch `plan` into each remote part's disk spill (pass 0).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a fetch fails.
+    pub(crate) fn stage(&self, plan: &StagingPlan) -> Result<(), InputError> {
+        for (part, staging) in self.parts().iter().zip(&plan.parts) {
+            part.stage_planned(staging)?;
         }
         Ok(())
+    }
+
+    /// Stage every part's selected row groups to local disk up front (pass 0,
+    /// #286/#287) so the streaming passes read from disk, not the network:
+    /// [`Self::staging_plan`] then [`Self::stage`]. `selection` (`None` = all
+    /// row groups) is the per-part bbox pruning the passes will honor, so
+    /// pruned groups are never fetched and total network traffic stays ≈1×
+    /// the bytes read (#219); only the projected columns are fetched (#400).
+    /// Errors are the caller's to handle; the streaming pipeline treats
+    /// staging as best-effort (a network error here is one the passes would
+    /// hit anyway).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if fetching a remote part's row groups or
+    /// writing them to the spill fails.
+    pub fn stage_selected(&self, selection: Option<&RowGroupSelection>) -> Result<(), InputError> {
+        let plan = self.staging_plan(selection)?;
+        self.stage(&plan)
     }
 
     /// Open a sequential batch stream over all parts (see [`SourceStream`]).
@@ -3127,6 +3200,46 @@ mod staging_counter_tests {
         // And the staged chunks serve the whole projected read.
         let (after, _, _) = counted(&src, || assert_eq!(read_all(&src), 5000));
         assert_eq!(after, 0, "the projected read must come from the spill");
+    }
+
+    /// #400 / C1's interface: `bytes_to_stage` is the projected footprint of
+    /// the selected row groups of the remote parts. Without a projection it
+    /// equals the selected compressed bytes; a local source stages nothing.
+    #[test]
+    fn bytes_to_stage_is_the_projected_remote_footprint() {
+        let bytes = three_column_parquet(1000, 5);
+        let chunks = chunk_ranges(&bytes);
+        let len = |r: &Range<u64>| r.end - r.start;
+        let kept: u64 = chunks.iter().flat_map(|rg| [&rg[0], &rg[2]]).map(len).sum();
+        let kept_rg1: u64 = len(&chunks[1][0]) + len(&chunks[1][2]);
+
+        let full =
+            ConvertSource::single(crate::input::test_memory_source(bytes.clone(), "f.parquet"));
+        assert_eq!(
+            full.bytes_to_stage(None).unwrap(),
+            full.selected_input_bytes(None).unwrap()
+        );
+        let src =
+            ConvertSource::single(crate::input::test_memory_source(bytes.clone(), "b.parquet"));
+        src.restrict_columns(vec![0, 2]).unwrap();
+        assert_eq!(src.bytes_to_stage(None).unwrap(), kept);
+        let sel = RowGroupSelection::from_parts(vec![vec![1]]);
+        assert_eq!(src.bytes_to_stage(Some(&sel)).unwrap(), kept_rg1);
+        // Planning is footer-only: nothing was fetched past the footer.
+        let (requests, _, _) = counted(&src, || {
+            src.bytes_to_stage(None).unwrap();
+        });
+        assert_eq!(requests, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.parquet");
+        std::fs::write(&path, &bytes).unwrap();
+        let local = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            local.bytes_to_stage(None).unwrap(),
+            0,
+            "local parts never stage"
+        );
     }
 
     /// #400 + #290: a coalescing window merges byte-adjacent kept chunks
