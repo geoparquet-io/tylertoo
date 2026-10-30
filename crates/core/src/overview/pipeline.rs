@@ -1169,7 +1169,7 @@ pub(super) fn run_pass2_buffered(
     // consumer's compute window, so the resident input stays about what one
     // channel of depth `in_flight` held before the window existed.
     let (read_depth, window) = split_in_flight(in_flight);
-    let window = read_tuning.budget.compute_window(
+    let window = { read_tuning.budget }.compute_window(
         profile,
         window,
         read_tuning.batch_size,

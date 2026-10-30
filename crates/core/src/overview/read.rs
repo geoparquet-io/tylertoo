@@ -14,7 +14,7 @@ use crossbeam_channel::Sender;
 
 use super::convert::ConvertError;
 use super::level::MemoryProfile;
-use super::memory::{MemoryBudget, MemoryPhase};
+use super::memory::{MemoryBudget, MemoryPhase, Price};
 use crate::input_set::{ConvertSource, ReadPlan, ReadSegment, RowGroupSelection};
 
 /// What the caller wants from [`read_in_order`], and what it knows about the
@@ -37,6 +37,17 @@ pub(super) struct ReadTuning {
     pub(super) profile: MemoryProfile,
 }
 
+/// Which pass is reading. Both read through [`read_in_order`], but they feed
+/// consumers with different CPU demand, so the reader count is resolved per
+/// pass (#723, `convert::resolve_pass_read_workers`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReadPass {
+    /// Pass 1's scan: a light per-batch decode and key extraction.
+    Scan,
+    /// Pass 2's level build: per-batch simplification across every level.
+    Build,
+}
+
 /// Whether [`read_in_order`]'s consumer wants more batches.
 pub(super) enum ReadFlow {
     Continue,
@@ -44,18 +55,6 @@ pub(super) enum ReadFlow {
     /// real one is reported by whoever owns the downstream.
     Stop,
 }
-
-/// Share of the memory budget the pass-2 read-ahead may hold. Small on
-/// purpose: the read-ahead competes with the pass-2 output sink, which is what
-/// the budget is really for (#294), and a read that is `workers` × deeper than
-/// before must not be what pushes a bounded run into swap.
-///
-/// This is a *model* bound, not a measured guarantee: it bounds
-/// `workers × depth × batch_size × per_row`, where `per_row` is the estimate
-/// in [`resolve_read_shape`]. A schema whose non-geometry columns cost far
-/// more per row than the model assumes is priced too cheaply and the read-ahead
-/// will exceed 10% of the budget. See the per-row note there.
-const READ_BUDGET_FRACTION: f64 = 0.10;
 
 /// Ceiling on a worker's read-ahead under an explicit `bounded` profile: the
 /// caller asked for memory over speed, so a rich machine does not get to build
@@ -127,9 +126,13 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
         // entire decoded batch even when geometries and row counts are tiny.
         .max(tylertoo_io::decoded_batch_limit())
         .max(1);
-    let budget =
-        (tuning.budget.allowance(MemoryProfile::Auto) as f64 * READ_BUDGET_FRACTION) as u64;
-    let affordable = (budget / per_batch).max(1) as usize;
+    // The read-ahead's share of the allowance (`memory::READ_SHARE`). A model
+    // bound, not a measured guarantee: it bounds `workers × depth ×
+    // per_batch`, so a schema whose columns cost more per row than the model
+    // assumes is priced too cheaply. See the per-row note above.
+    let affordable = tuning
+        .budget
+        .affordable(MemoryPhase::Read, Price::model(per_batch));
     let max_depth = match tuning.profile {
         MemoryProfile::Bounded => READ_AHEAD_BOUNDED_MAX_BATCHES,
         MemoryProfile::Auto | MemoryProfile::Speed => READ_AHEAD_MAX_BATCHES,
