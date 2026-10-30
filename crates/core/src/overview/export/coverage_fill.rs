@@ -35,8 +35,9 @@
 //!
 //! Memory: seed and parent runs spill under the shared fill-workspace
 //! grant. Each active tile preserves its f64 geometry and credit order.
-//! Snapped fills still remain in the map until export completes; a fallible
-//! owned lookup and level/wave release need the export owner's cooperation.
+//! Snapped payloads spill per zoom; only bounded indices remain resident.
+//! A level group owns its zoom's run and drops it after writing. Each tile
+//! lookup reads its own frame by position, without sharing a seek cursor.
 //!
 //! DIVERGENCE FROM TIPPECANOE: tippecanoe coalesces the raw geometry of the
 //! dropped features themselves, in every tile that is over its size limit
@@ -59,20 +60,19 @@ pub(super) const FILL_SIMPLIFY_PX: f64 = 4.0;
 
 // Resident buffer pricing, including unused Vec slots. The test probes
 // exclude allocator metadata and overlay internals; dhat measures those.
-fn shape_capacity_bytes(shapes: &Vec<Shape>) -> usize {
-    shapes.capacity() * std::mem::size_of::<Shape>()
-        + shapes
+fn shape_payload_bytes(shape: &Shape) -> usize {
+    shape.capacity() * std::mem::size_of::<Ring>()
+        + shape
             .iter()
-            .map(|s| {
-                s.capacity() * std::mem::size_of::<Ring>()
-                    + s.iter()
-                        .map(|r| r.capacity() * std::mem::size_of::<[f64; 2]>())
-                        .sum::<usize>()
-            })
+            .map(|r| r.capacity() * std::mem::size_of::<[f64; 2]>())
             .sum::<usize>()
 }
 
-#[cfg(test)]
+fn shape_capacity_bytes(shapes: &Vec<Shape>) -> usize {
+    shapes.capacity() * std::mem::size_of::<Shape>()
+        + shapes.iter().map(shape_payload_bytes).sum::<usize>()
+}
+
 fn polygon_capacity_bytes(polys: &Vec<FillPolygon>) -> usize {
     polys.capacity() * std::mem::size_of::<FillPolygon>()
         + polys
@@ -89,13 +89,17 @@ fn polygon_capacity_bytes(polys: &Vec<FillPolygon>) -> usize {
 type SeedBuckets = std::collections::BTreeMap<u64, (Vec<Shape>, Vec<Collapsed>)>;
 
 #[cfg(test)]
-fn note_capacity(_stage: &str, buckets: &SeedBuckets, fills: &[(u64, Vec<Shape>)], map: &FillMap) {
+fn note_capacity(
+    _stage: &str,
+    buckets: &SeedBuckets,
+    fills: &[(u64, Vec<Shape>)],
+    map_bytes: usize,
+) {
     let buckets_bytes: usize = buckets
         .values()
         .map(|(s, c)| shape_capacity_bytes(s) + c.capacity() * std::mem::size_of::<Collapsed>())
         .sum();
     let fills_bytes: usize = fills.iter().map(|(_, s)| shape_capacity_bytes(s)).sum();
-    let map_bytes = map.retained_bytes;
     let live_bytes = buckets_bytes + fills_bytes + map_bytes;
 
     #[cfg(test)]
@@ -450,8 +454,27 @@ fn union_clip(shapes: &[Shape]) -> Vec<Shape> {
 
 /// Union shapes whose bounding boxes meet and clip them to the tile; a lone
 /// shape inside the tile passes through untouched.
-pub(super) fn union_touching(shapes: Vec<Shape>) -> Vec<Shape> {
+#[cfg(test)]
+fn union_touching(shapes: Vec<Shape>) -> Vec<Shape> {
+    union_within_workspace(shapes, usize::MAX).expect("unbounded test union")
+}
+
+/// Price retained geometry and the sweep index, then reserve overlay scratch
+/// only for the component being overlaid. Components are consumed in the
+/// original order; a single oversized component returns a typed budget error.
+fn union_within_workspace(
+    shapes: Vec<Shape>,
+    budget: usize,
+) -> Result<Vec<Shape>, super::ExportError> {
     let n = shapes.len();
+    // Bounds Vec capacities for boxes, order, roots, active set, groups,
+    // slots and component members, including unused slots during growth.
+    let fixed = shapes
+        .capacity()
+        .saturating_mul(std::mem::size_of::<Shape>())
+        .saturating_add(n.saturating_mul(256));
+    let mut remaining = shapes.iter().map(shape_payload_bytes).sum::<usize>();
+    require_fill_bytes(fixed.saturating_add(remaining), budget)?;
     let mut boxes: Vec<[f64; 4]> = shapes.iter().map(bbox).collect();
     // If all x intervals overlap, the x sweep compares every pair. A y
     // sweep can only reduce that work. Otherwise keep the original axis;
@@ -516,17 +539,43 @@ pub(super) fn union_touching(shapes: Vec<Shape>) -> Vec<Shape> {
         |b: [f64; 4]| b[0] >= 0.0 && b[1] >= 0.0 && b[2] <= FILL_EXTENT && b[3] <= FILL_EXTENT;
     let mut slots: Vec<Option<Shape>> = shapes.into_iter().map(Some).collect();
     let mut out = Vec::new();
+    let mut output_bytes = 0usize;
     for group in groups.into_iter().filter(|g| !g.is_empty()) {
         if let [only] = group[..] {
             if inside(boxes[only]) {
-                out.extend(slots[only].take());
+                let shape = slots[only].take().expect("one component member");
+                let bytes = shape_payload_bytes(&shape);
+                remaining -= bytes;
+                output_bytes += bytes;
+                out.push(shape);
                 continue;
             }
         }
         let members: Vec<Shape> = group.iter().filter_map(|&i| slots[i].take()).collect();
-        out.extend(union_clip(&members));
+        let vertices = members.iter().flatten().map(Vec::len).sum::<usize>();
+        require_fill_bytes(
+            fixed
+                .saturating_add(remaining)
+                .saturating_add(output_bytes)
+                .saturating_add(vertices.saturating_mul(128)),
+            budget,
+        )?;
+        let united = union_clip(&members);
+        remaining =
+            remaining.saturating_sub(members.iter().map(shape_payload_bytes).sum::<usize>());
+        drop(members);
+        output_bytes += united.iter().map(shape_payload_bytes).sum::<usize>();
+        require_fill_bytes(
+            fixed
+                .saturating_add(remaining)
+                .saturating_add(output_bytes)
+                .saturating_add(out.capacity() * std::mem::size_of::<Shape>()),
+            budget,
+        )?;
+        out.extend(united);
     }
-    out
+    require_fill_bytes(shape_capacity_bytes(&out), budget)?;
+    Ok(out)
 }
 
 /// How far, in cells, a remainder under one square carries to the next cell
@@ -799,7 +848,7 @@ fn fill_from_cells_timed(
 ) -> Result<Vec<Shape>, super::ExportError> {
     use super::ExportTimers as T;
     let united = T::time(&timers.fill_union, || {
-        union_within_workspace(shapes, budget)
+        union_within_workspace(shapes, budget.saturating_sub(cells.capacity_bytes()))
     })?;
     let (mut fill, more) = T::time(&timers.fill_simplify, || {
         simplify_coverage(united, FILL_SIMPLIFY_PX)
@@ -834,20 +883,6 @@ fn fill_from_cells_timed(
     // squares beside the shapes, and the larger fill sent the size valve to
     // 15 passes per tile.
     T::time(&timers.fill_union, || union_within_workspace(fill, budget))
-}
-
-/// Refuse an oversized union input, including the post-square pass,
-/// before giving it to the overlay. Never shed coverage to fit memory.
-fn union_within_workspace(
-    shapes: Vec<Shape>,
-    budget: usize,
-) -> Result<Vec<Shape>, super::ExportError> {
-    let vertices: usize = shapes.iter().flatten().map(Vec::len).sum();
-    require_fill_bytes(
-        shape_capacity_bytes(&shapes).saturating_add(vertices.saturating_mul(128)),
-        budget,
-    )?;
-    Ok(union_touching(shapes))
 }
 
 /// An open ring in integer tile units at the export extent.
@@ -1092,80 +1127,259 @@ pub(super) const WORKSPACE_WANT_BYTES: usize = 256 << 20;
 /// See [`WORKSPACE_WANT_BYTES`].
 pub(super) const WORKSPACE_FLOOR_BYTES: usize = 32 << 20;
 
-/// Every coarse tile's fill, in integer tile units keyed by PMTiles tile id.
-/// Built before the export writes anything, so the export keeps its
-/// coarse→fine order. The export takes each zoom's fill out
-/// ([`take_zoom`](Self::take_zoom)) as its level starts and drops it when
-/// the level is written (#788).
+/// Every zoom owns its index and spill run. A group moves its zoom out and
+/// drops both when written; the map never caches snapped polygon payloads.
 pub(super) struct FillMap {
-    tiles: std::collections::HashMap<u64, Vec<FillPolygon>>,
-    #[cfg(test)]
-    retained_bytes: usize,
+    zooms: std::collections::BTreeMap<u8, ZoomFill>,
     counts: std::sync::Arc<FillCounts>,
-    /// Fill tiles built: set on the map [`build_fill_map`] returns, which
-    /// logs the export's totals when it drops; 0 on a zoom taken out of it.
     built: usize,
 }
 
-/// How many fills the export drew and shed, shared by a map and the zooms
-/// taken out of it.
 #[derive(Default)]
 #[expect(
     clippy::disallowed_types,
-    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+    reason = "#779: per-export fill accounting shared by level groups"
 )]
 struct FillCounts {
     used: std::sync::atomic::AtomicUsize,
     shed: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    reads: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    resident: [std::sync::atomic::AtomicUsize; 32],
+}
+
+/// Fixed charge covers the file, path, vector and map node. Payloads live
+/// on disk. The active writer additionally owns its 8 KiB buffered output.
+const ZOOM_INDEX_FIXED_BYTES: usize = 1024;
+const ZOOM_WRITER_FIXED_BYTES: usize = ZOOM_INDEX_FIXED_BYTES + 8192;
+
+struct FillEntry {
+    key: u64,
+    offset: usize,
+    len: usize,
+}
+
+struct ZoomFill {
+    data: crate::archive_index::FileBytes,
+    _path: tempfile::TempPath,
+    index: Vec<FillEntry>,
+    #[cfg(test)]
+    zoom: u8,
+    #[cfg(test)]
+    counts: std::sync::Arc<FillCounts>,
+}
+
+impl ZoomFill {
+    fn resident_bytes(&self) -> usize {
+        ZOOM_INDEX_FIXED_BYTES + self.index.capacity() * std::mem::size_of::<FillEntry>()
+    }
+}
+
+#[cfg(test)]
+impl Drop for ZoomFill {
+    fn drop(&mut self) {
+        self.counts.resident[usize::from(self.zoom)]
+            .fetch_sub(self.resident_bytes(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+struct ZoomBuilder {
+    writer: std::io::BufWriter<tempfile::NamedTempFile>,
+    index: Vec<FillEntry>,
+    offset: usize,
+}
+
+impl ZoomBuilder {
+    fn new(opts: &super::ExportOptions) -> Result<Self, super::ExportError> {
+        Ok(Self {
+            writer: std::io::BufWriter::new(super::super::pipeline::spill_temp_file(
+                opts.spill_dir.as_deref(),
+            )?),
+            index: Vec::new(),
+            offset: 0,
+        })
+    }
+    fn resident_bytes(&self) -> usize {
+        ZOOM_WRITER_FIXED_BYTES + self.index.capacity() * std::mem::size_of::<FillEntry>()
+    }
+    fn append(
+        &mut self,
+        key: u64,
+        polys: &Vec<FillPolygon>,
+        reserved: usize,
+        budget: usize,
+    ) -> Result<(), super::ExportError> {
+        use std::io::Write;
+        let cap = if self.index.len() == self.index.capacity() {
+            self.index.capacity().max(2).saturating_mul(2)
+        } else {
+            self.index.capacity()
+        };
+        require_fill_bytes(
+            reserved
+                .saturating_add(ZOOM_WRITER_FIXED_BYTES)
+                .saturating_add(cap.saturating_mul(std::mem::size_of::<FillEntry>()))
+                .saturating_add(polygon_capacity_bytes(polys)),
+            budget,
+        )?;
+        debug_assert!(self.index.last().is_none_or(|e| e.key < key));
+        let len = 8 + polys
+            .iter()
+            .map(|p| 8 + p.iter().map(|r| 8 + r.len() * 8).sum::<usize>())
+            .sum::<usize>();
+        self.writer.write_all(&(polys.len() as u64).to_le_bytes())?;
+        let mut buffer = [0u8; 8192];
+        for poly in polys {
+            self.writer.write_all(&(poly.len() as u64).to_le_bytes())?;
+            for ring in poly {
+                self.writer.write_all(&(ring.len() as u64).to_le_bytes())?;
+                for chunk in ring.chunks(1024) {
+                    for (&(x, y), bytes) in chunk.iter().zip(buffer.as_chunks_mut::<8>().0) {
+                        bytes[..4].copy_from_slice(&x.to_le_bytes());
+                        bytes[4..].copy_from_slice(&y.to_le_bytes());
+                    }
+                    self.writer.write_all(&buffer[..chunk.len() * 8])?;
+                }
+            }
+        }
+        self.index.push(FillEntry {
+            key,
+            offset: self.offset,
+            len,
+        });
+        self.offset += len;
+        Ok(())
+    }
+    fn finish(
+        self,
+        zoom: u8,
+        counts: &std::sync::Arc<FillCounts>,
+    ) -> Result<Option<ZoomFill>, super::ExportError> {
+        if self.index.is_empty() {
+            return Ok(None);
+        }
+        let path = self
+            .writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .into_temp_path();
+        let data = crate::archive_index::FileBytes::open(&path)?;
+        let run = ZoomFill {
+            data,
+            _path: path,
+            index: self.index,
+            #[cfg(test)]
+            zoom,
+            #[cfg(test)]
+            counts: std::sync::Arc::clone(counts),
+        };
+        #[cfg(test)]
+        counts.resident[usize::from(zoom)]
+            .fetch_add(run.resident_bytes(), std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = (zoom, counts);
+        Ok(Some(run))
+    }
+}
+
+/// Decode one complete positional-read frame; framing errors are never a
+/// missing tile. Coordinates and ring/polygon order are copied verbatim.
+fn decode_fill(mut data: &[u8]) -> Result<Vec<FillPolygon>, std::io::Error> {
+    fn invalid() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid snapped fill spill frame",
+        )
+    }
+    fn count(data: &mut &[u8]) -> Result<usize, std::io::Error> {
+        let head = data.get(..8).ok_or_else(invalid)?;
+        let n = usize::try_from(u64::from_le_bytes(
+            head.try_into().expect("eight-byte count"),
+        ))
+        .map_err(|_| invalid())?;
+        *data = &data[8..];
+        if n > data.len() / 8 {
+            return Err(invalid());
+        }
+        Ok(n)
+    }
+    let n = count(&mut data)?;
+    let mut polys = Vec::with_capacity(n);
+    for _ in 0..n {
+        let n = count(&mut data)?;
+        let mut poly = Vec::with_capacity(n);
+        for _ in 0..n {
+            let n = count(&mut data)?;
+            let (points, rest) = data.split_at(n * 8);
+            let ring = points
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|p| {
+                    (
+                        i32::from_le_bytes(p[..4].try_into().expect("four-byte x")),
+                        i32::from_le_bytes(p[4..].try_into().expect("four-byte y")),
+                    )
+                })
+                .collect();
+            poly.push(ring);
+            data = rest;
+        }
+        polys.push(poly);
+    }
+    if !data.is_empty() {
+        return Err(invalid());
+    }
+    Ok(polys)
 }
 
 impl FillMap {
-    /// Take zoom `zoom`'s fill out of the map, or `None` when it has none.
-    /// The returned map owns that zoom's tiles; dropping it frees them.
-    // #788: F replaces this in-RAM split with its per-zoom store.
+    fn resident_bytes(&self) -> usize {
+        self.zooms.values().map(ZoomFill::resident_bytes).sum()
+    }
+    fn tile_count(&self) -> usize {
+        self.zooms.values().map(|r| r.index.len()).sum()
+    }
+    /// Move exactly one zoom's index and spill run to its level group.
     pub(super) fn take_zoom(&mut self, zoom: u8) -> Option<FillMap> {
-        let lo = crate::pmtiles_writer::tile_id(zoom, 0, 0);
-        let hi = zoom
-            .checked_add(1)
-            .map_or(u64::MAX, |z| crate::pmtiles_writer::tile_id(z, 0, 0));
-        let mut tiles = std::collections::HashMap::new();
-        self.tiles.retain(|&key, polys| {
-            let ours = (lo..hi).contains(&key);
-            if ours {
-                tiles.insert(key, std::mem::take(polys));
-            }
-            !ours
-        });
-        (!tiles.is_empty()).then(|| FillMap {
-            #[cfg(test)]
-            retained_bytes: tiles.values().map(polygon_capacity_bytes).sum(),
-            tiles,
+        let run = self.zooms.remove(&zoom)?;
+        Some(Self {
+            zooms: std::collections::BTreeMap::from([(zoom, run)]),
             counts: std::sync::Arc::clone(&self.counts),
             built: 0,
         })
     }
-
-    /// The fill for tile `key`, if it has one, owned by the caller, who
-    /// drops it once the tile's fill commands are built.
-    ///
-    /// # Errors
-    /// None while the fill is held in RAM; a read of a spilled fill can fail.
-    // #788: F replaces this with its spill read.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "#788: the spilled fill F stores reads fallibly behind this signature"
-    )]
+    /// One positional read for a present tile, using the shared file reader
+    /// owner. No seek cursor or decoded payload is shared across workers.
     pub(super) fn get(&self, key: u64) -> Result<Option<Vec<FillPolygon>>, super::ExportError> {
-        let Some(polys) = self.tiles.get(&key) else {
+        use crate::pmtiles_writer::ArchiveBytes;
+        let Some((run, entry)) = self.zooms.values().find_map(|r| {
+            r.index
+                .binary_search_by_key(&key, |e| e.key)
+                .ok()
+                .map(|i| (r, &r.index[i]))
+        }) else {
             return Ok(None);
         };
+        #[cfg(any(unix, windows))]
+        let bytes = run.data.read_range(entry.offset, entry.len)?;
+        // FileBytes' portable fallback uses a cursor. Open an independent
+        // reader on those targets so workers never share that cursor.
+        #[cfg(not(any(unix, windows)))]
+        let reader = crate::archive_index::FileBytes::open(&run._path)?;
+        #[cfg(not(any(unix, windows)))]
+        let bytes = reader.read_range(entry.offset, entry.len)?;
+        #[cfg(test)]
+        self.counts
+            .reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let polys = decode_fill(&bytes)?;
         self.counts
             .used
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Some(polys.clone()))
+        Ok(Some(polys))
     }
-
-    /// Count fill polygons a tile shed to stay within its budget.
     pub(super) fn note_shed(&self, n: usize) {
         self.counts
             .shed
@@ -1174,24 +1388,16 @@ impl FillMap {
 }
 
 impl Drop for FillMap {
-    /// Fills built, and how many the export drew. A fill is drawn only into
-    /// a tile that has features of its own; the rest are not emitted yet.
     fn drop(&mut self) {
         if self.built == 0 {
             return;
         }
         let used = self.counts.used.load(std::sync::atomic::Ordering::Relaxed);
         let shed = self.counts.shed.load(std::sync::atomic::Ordering::Relaxed);
-        log::info!(
-            "[export] coverage fill: {} fill tiles built, {used} drawn into tiles with \
-             features, {shed} fill polygons shed to fit tile size limits",
-            self.built,
-        );
+        log::info!("[export] coverage fill: {} fill tiles built, {used} drawn into tiles with features, {shed} fill polygons shed to fit tile size limits",self.built);
     }
 }
 
-/// A geo polygon in lon/lat as a [`Shape`] in tile pixels, closing vertex
-/// dropped.
 fn project_polygon(p: &geo::Polygon<f64>, proj: &crate::mvt::TileProjector) -> Shape {
     let ring = |ls: &geo::LineString<f64>| -> Ring {
         let n = ls.0.len().saturating_sub(usize::from(ls.is_closed()));
@@ -1337,14 +1543,14 @@ impl SpillBuckets {
             count[1..].copy_from_slice(&rest);
             for _ in 0..u64::from_le_bytes(count) {
                 let rings = word(&mut r)? as usize;
-                price = price.saturating_add(24 + rings.saturating_mul(24));
+                price = price.saturating_add(48 + rings.saturating_mul(24));
                 require_fill_bytes(price.saturating_add(cells.capacity_bytes()), self.budget)?;
                 let mut shape = Vec::with_capacity(rings);
                 for _ in 0..rings {
                     let points = word(&mut r)? as usize;
-                    // 16 bytes of retained coordinates plus a conservative
-                    // 128-byte per-vertex overlay working allowance.
-                    price = price.saturating_add(points.saturating_mul(144));
+                    // Retain this tile's input; union_within_workspace grants
+                    // overlay scratch one component at a time, not per tile.
+                    price = price.saturating_add(points.saturating_mul(16));
                     require_fill_bytes(price.saturating_add(cells.capacity_bytes()), self.budget)?;
                     let mut ring = Vec::with_capacity(points);
                     let mut buffer = [0u8; 8192];
@@ -1529,11 +1735,7 @@ pub(super) fn build_fill_map(
     let finest_zoom = level.plan.zoom;
     let opts = level.options;
     let mut map = FillMap {
-        tiles: Default::default(),
-
-        #[cfg(test)]
-        retained_bytes: 0,
-
+        zooms: Default::default(),
         counts: Default::default(),
         built: 0,
     };
@@ -1611,7 +1813,7 @@ pub(super) fn build_fill_map(
         },
     )?;
     #[cfg(test)]
-    note_capacity("seed", &SeedBuckets::new(), &[], &map);
+    note_capacity("seed", &SeedBuckets::new(), &[], map.resident_bytes());
     let seed_secs = t_seed.elapsed().as_secs_f64();
 
     // Pyramid: each zoom's fills, then lifted into the zoom above.
@@ -1622,40 +1824,65 @@ pub(super) fn build_fill_map(
     loop {
         let t_zoom = std::time::Instant::now();
         let mut parents = SpillBuckets::new(opts, workspace);
+        let mut snapped = ZoomBuilder::new(opts)?;
         let mut tile_count = 0usize;
         let mut area = 0.0;
-        while let Some((key, shapes, cells)) =
-            buckets.pop_first(parents.tiles.len().saturating_mul(512))?
-        {
+        while let Some((key, shapes, cells)) = buckets.pop_first(
+            parents
+                .tiles
+                .len()
+                .saturating_mul(512)
+                .saturating_add(map.resident_bytes())
+                .saturating_add(snapped.resident_bytes()),
+        )? {
             #[cfg(test)]
             let input_bytes = shape_capacity_bytes(&shapes) + cells.capacity_bytes();
             #[cfg(test)]
             cost_probe::update(|c| {
                 c.bucket_peak = c.bucket_peak.max(input_bytes);
-                c.live_peak = c.live_peak.max(input_bytes + map.retained_bytes);
+                c.live_peak = c
+                    .live_peak
+                    .max(input_bytes + map.resident_bytes() + snapped.resident_bytes());
             });
+            let reserved = map.resident_bytes()
+                + snapped.resident_bytes()
+                + (buckets.tiles.len() + parents.tiles.len()) * 512;
+            let tile_workspace = workspace.saturating_sub(reserved);
             let fill = if zoom == seed_zoom {
-                fill_from_cells_timed(shapes, cells, timers, workspace)?
+                fill_from_cells_timed(shapes, cells, timers, tile_workspace)?
             } else {
                 debug_assert!(cells.is_empty());
-                fill_for_tile_timed(shapes, timers, workspace)?
+                fill_for_tile_timed(shapes, timers, tile_workspace)?
             };
             let fills = [(key, fill)];
             let fill = &fills[0].1;
             #[cfg(test)]
-            note_capacity("unioned", &SeedBuckets::new(), &fills, &map);
+            note_capacity(
+                "unioned",
+                &SeedBuckets::new(),
+                &fills,
+                map.resident_bytes() + snapped.resident_bytes(),
+            );
             if !fill.is_empty() {
                 let polys = to_tile_polygons(fill, scale);
                 if !polys.is_empty() {
-                    #[cfg(test)]
-                    {
-                        map.retained_bytes += polygon_capacity_bytes(&polys);
-                    }
-                    map.tiles.insert(key, polys);
+                    snapped.append(
+                        key,
+                        &polys,
+                        map.resident_bytes()
+                            + (buckets.tiles.len() + parents.tiles.len()) * 512
+                            + shape_capacity_bytes(fill),
+                        workspace,
+                    )?;
                 }
             }
             #[cfg(test)]
-            note_capacity("snapped", &SeedBuckets::new(), &fills, &map);
+            note_capacity(
+                "snapped",
+                &SeedBuckets::new(),
+                &fills,
+                map.resident_bytes() + snapped.resident_bytes(),
+            );
             tile_count += 1;
             area += fill.iter().map(|s| net_area(s)).sum::<f64>();
             if zoom > min_zoom {
@@ -1673,7 +1900,9 @@ pub(super) fn build_fill_map(
                         .len()
                         .saturating_mul(512)
                         .saturating_add(shape_capacity_bytes(&fills[0].1))
-                        .saturating_add(shape_capacity_bytes(&lifted)),
+                        .saturating_add(shape_capacity_bytes(&lifted))
+                        .saturating_add(map.resident_bytes())
+                        .saturating_add(snapped.resident_bytes()),
                 )?;
             }
         }
@@ -1682,6 +1911,9 @@ pub(super) fn build_fill_map(
             area * 4f64.powi(i32::from(seed_zoom - zoom)),
             t_zoom.elapsed().as_secs_f64()
         );
+        if let Some(run) = snapped.finish(zoom, &map.counts)? {
+            map.zooms.insert(zoom, run);
+        }
         if zoom == min_zoom {
             break;
         }
@@ -1693,10 +1925,10 @@ pub(super) fn build_fill_map(
          in {seed_secs:.2}s; z{min_zoom}..=z{seed_zoom} built in {:.2}s; {} fill tiles, \
          {vertices} vertices lifted",
         t_pyramid.elapsed().as_secs_f64(),
-        map.tiles.len(),
+        map.tile_count(),
     );
 
-    map.built = map.tiles.len();
+    map.built = map.tile_count();
 
     Ok(map)
 }
@@ -1704,6 +1936,77 @@ pub(super) fn build_fill_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_fill_map(tiles: impl IntoIterator<Item = (u8, u64, Vec<FillPolygon>)>) -> FillMap {
+        let opts = super::super::ExportOptions::default();
+        let mut map = FillMap {
+            zooms: Default::default(),
+            counts: Default::default(),
+            built: 0,
+        };
+        let mut active = None;
+        for (zoom, key, polys) in tiles {
+            if active.as_ref().is_some_and(|(z, _)| *z != zoom) {
+                let (z, writer): (u8, ZoomBuilder) = active.take().unwrap();
+                map.zooms
+                    .insert(z, writer.finish(z, &map.counts).unwrap().unwrap());
+            }
+            let (_, writer) =
+                active.get_or_insert_with(|| (zoom, ZoomBuilder::new(&opts).unwrap()));
+            writer
+                .append(key, &polys, map.resident_bytes(), WORKSPACE_FLOOR_BYTES)
+                .unwrap();
+        }
+        if let Some((z, writer)) = active {
+            map.zooms
+                .insert(z, writer.finish(z, &map.counts).unwrap().unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn phase3_retained_map_fits_workspace_floor() {
+        let first = crate::pmtiles_writer::tile_id(5, 0, 0);
+        let map = test_fill_map((0..80).map(|i| {
+            (
+                5,
+                first + i,
+                vec![vec![(0..65536).map(|n| (n, -n)).collect()]],
+            )
+        }));
+        assert!(
+            map.resident_bytes() <= WORKSPACE_FLOOR_BYTES,
+            "retained map uses {} bytes",
+            map.resident_bytes()
+        );
+    }
+
+    #[test]
+    fn phase3_one_positioned_read_per_present_tile() {
+        use rayon::prelude::*;
+        let first = crate::pmtiles_writer::tile_id(5, 0, 0);
+        let map = test_fill_map((0..80).map(|i| {
+            (
+                5,
+                first + i,
+                vec![vec![vec![(i as i32, i32::MIN), (i32::MAX, 1), (0, 2)]]],
+            )
+        }));
+        (0..80u64).into_par_iter().for_each(|i| {
+            assert_eq!(
+                map.get(first + i).unwrap(),
+                Some(vec![vec![vec![
+                    (i as i32, i32::MIN),
+                    (i32::MAX, 1),
+                    (0, 2)
+                ]]])
+            )
+        });
+        assert!(map.get(first + 80).unwrap().is_none());
+        assert_eq!(
+            map.counts.reads.load(std::sync::atomic::Ordering::Relaxed),
+            80
+        );
+    }
 
     /// #788: the fixed fixture fits within the 32 MiB workspace floor.
     /// The production grant may be larger; 32 MiB is not its cap.
@@ -1734,6 +2037,7 @@ mod tests {
             dir.path().join("out.pmtiles"),
             &super::super::ExportOptions {
                 coverage_fill: true,
+                profile: crate::overview::level::MemoryProfile::Bounded,
                 ..Default::default()
             },
         )
@@ -1876,34 +2180,121 @@ mod tests {
     fn take_zoom_moves_only_that_zooms_tiles() {
         let poly = |v: i32| -> FillPolygon { vec![vec![(v, 0), (v, 1), (v + 1, 1)]] };
         let key = |z: u8, x: u32| crate::pmtiles_writer::tile_id(z, x, 0);
-        let mut map = FillMap {
-            tiles: [
-                (key(2, 1), vec![poly(1)]),
-                (key(2, 3), vec![poly(2)]),
-                (key(3, 5), vec![poly(3)]),
-            ]
-            .into_iter()
-            .collect(),
-            #[cfg(test)]
-            retained_bytes: 0,
-            counts: Default::default(),
-            built: 3,
-        };
+        let mut tiles = vec![
+            (2, key(2, 1), vec![poly(1)]),
+            (2, key(2, 3), vec![poly(2)]),
+            (3, key(3, 5), vec![poly(3)]),
+        ];
+        tiles.sort_by_key(|(_, key, _)| *key);
+        let mut map = test_fill_map(tiles);
+        let counts = std::sync::Arc::clone(&map.counts);
+        assert!(counts.resident[2].load(std::sync::atomic::Ordering::Relaxed) > 0);
         assert!(map.take_zoom(1).is_none(), "no z1 fill");
         let z2 = map.take_zoom(2).expect("z2 fill");
-        assert_eq!(z2.tiles.len(), 2);
+        assert_eq!(z2.tile_count(), 2);
         assert_eq!(z2.get(key(2, 3)).unwrap(), Some(vec![poly(2)]));
         assert_eq!(z2.get(key(3, 5)).unwrap(), None, "z3 stays in the map");
-        assert_eq!(map.tiles.len(), 1);
+        assert_eq!(map.tile_count(), 1);
         assert!(map.take_zoom(2).is_none(), "taken once");
+        let paths: Vec<_> = z2
+            .zooms
+            .values()
+            .map(|run| run._path.to_path_buf())
+            .collect();
+        assert!(
+            !map.zooms.contains_key(&2),
+            "ownership moved, with no retained zoom index"
+        );
+        drop(z2); // E1 drops the group when its level has been written.
+        assert_eq!(
+            counts.resident[2].load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(counts.resident[3].load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "completed zoom runs removed"
+        );
         let z3 = map.take_zoom(3).expect("z3 fill");
         assert_eq!(z3.get(key(3, 5)).unwrap(), Some(vec![poly(3)]));
-        assert!(map.tiles.is_empty());
+        assert!(map.zooms.is_empty());
         assert_eq!(
             map.counts.used.load(std::sync::atomic::Ordering::Relaxed),
             2,
             "the zooms count into the map's totals"
         );
+    }
+
+    #[test]
+    fn phase3_truncated_spill_is_an_error_not_missing_coverage() {
+        let key = crate::pmtiles_writer::tile_id(2, 0, 0);
+        let map = test_fill_map([(2, key, vec![vec![vec![(0, 0), (1, 0), (0, 1)]]])]);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&map.zooms[&2]._path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert!(map.get(key).is_err());
+        for bytes in [vec![], vec![255; 8], vec![0; 9]] {
+            assert!(decode_fill(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn phase3_disjoint_components_do_not_reserve_combined_overlay_scratch() {
+        let shapes: Vec<_> = (0..1024)
+            .map(|i| square((i % 32) as f64 * 16.0, (i / 32) as f64 * 16.0, 8.0))
+            .collect();
+        let expected = shapes.clone();
+        assert_eq!(
+            union_within_workspace(shapes, 512 << 10).expect("individual components fit"),
+            expected
+        );
+    }
+
+    #[test]
+    fn phase3_fill_grant_uses_the_shared_profile_policy() {
+        use crate::overview::{
+            level::MemoryProfile,
+            memory::{MemoryBudget, MemoryPhase, Price, PriceBasis},
+        };
+        let mut budget = MemoryBudget::with_available(Some(4 << 30));
+        for (profile, expected) in [
+            (MemoryProfile::Bounded, WORKSPACE_FLOOR_BYTES),
+            (MemoryProfile::Auto, WORKSPACE_WANT_BYTES),
+            (MemoryProfile::Speed, WORKSPACE_WANT_BYTES),
+        ] {
+            let grant = budget.fit(
+                profile,
+                MemoryPhase::Fill,
+                Price::new(1, PriceBasis::Measured),
+                WORKSPACE_WANT_BYTES,
+                WORKSPACE_FLOOR_BYTES,
+            );
+            assert_eq!(grant.bytes(), expected as u64);
+            budget.release(grant);
+        }
+    }
+
+    #[test]
+    fn phase3_snapped_workspace_overflow_is_typed() {
+        let opts = super::super::ExportOptions::default();
+        let mut writer = ZoomBuilder::new(&opts).unwrap();
+        let error = writer
+            .append(1, &vec![vec![vec![(0, 0), (1, 0), (0, 1)]]], 0, 32)
+            .unwrap_err();
+        let super::super::ExportError::Io(error) = error else {
+            panic!("typed budget carrier")
+        };
+        assert!(matches!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<super::super::super::convert::ConvertError>(),
+            Some(super::super::super::convert::ConvertError::BudgetExceeded { available: 32, .. })
+        ));
+        assert!(writer.index.is_empty());
     }
 
     fn square(x: f64, y: f64, side: f64) -> Shape {
