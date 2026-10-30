@@ -91,10 +91,6 @@ pub(super) enum MemoryPhase {
     /// Export's concurrent tile encodes (track E1).
     ExportEncode,
     /// Coverage fill (track F).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#788: track F grants coverage fill under it")
-    )]
     Fill,
 }
 

@@ -755,30 +755,88 @@ pub(super) fn assign_hosts(polys: &[FillPolygon], hosts: &[[f64; 4]]) -> Vec<usi
         .collect()
 }
 
+/// The fill builder's workspace grant (#788): what
+/// [`build_fill_map`] asks of the export's memory budget under
+/// [`MemoryPhase::Fill`](crate::overview::memory::MemoryPhase), and the
+/// least it can run on.
+pub(super) const WORKSPACE_WANT_BYTES: usize = 256 << 20;
+/// See [`WORKSPACE_WANT_BYTES`].
+pub(super) const WORKSPACE_FLOOR_BYTES: usize = 32 << 20;
+
 /// Every coarse tile's fill, in integer tile units keyed by PMTiles tile id.
 /// Built before the export writes anything, so the export keeps its
-/// coarse→fine order.
+/// coarse→fine order. The export takes each zoom's fill out
+/// ([`take_zoom`](Self::take_zoom)) as its level starts and drops it when
+/// the level is written (#788).
+pub(super) struct FillMap {
+    tiles: std::collections::HashMap<u64, Vec<FillPolygon>>,
+    counts: std::sync::Arc<FillCounts>,
+    /// Fill tiles built: set on the map [`build_fill_map`] returns, which
+    /// logs the export's totals when it drops; 0 on a zoom taken out of it.
+    built: usize,
+}
+
+/// How many fills the export drew and shed, shared by a map and the zooms
+/// taken out of it.
+#[derive(Default)]
 #[expect(
     clippy::disallowed_types,
     reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
 )]
-pub(super) struct FillMap {
-    tiles: std::collections::HashMap<u64, Vec<FillPolygon>>,
+struct FillCounts {
     used: std::sync::atomic::AtomicUsize,
     shed: std::sync::atomic::AtomicUsize,
 }
 
 impl FillMap {
-    /// The fill for tile `key`, if it has one.
-    pub(super) fn get(&self, key: u64) -> Option<&[FillPolygon]> {
-        let polys = self.tiles.get(&key)?;
-        self.used.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(polys)
+    /// Take zoom `zoom`'s fill out of the map, or `None` when it has none.
+    /// The returned map owns that zoom's tiles; dropping it frees them.
+    // #788: F replaces this in-RAM split with its per-zoom store.
+    pub(super) fn take_zoom(&mut self, zoom: u8) -> Option<FillMap> {
+        let lo = crate::pmtiles_writer::tile_id(zoom, 0, 0);
+        let hi = zoom
+            .checked_add(1)
+            .map_or(u64::MAX, |z| crate::pmtiles_writer::tile_id(z, 0, 0));
+        let mut tiles = std::collections::HashMap::new();
+        self.tiles.retain(|&key, polys| {
+            let ours = (lo..hi).contains(&key);
+            if ours {
+                tiles.insert(key, std::mem::take(polys));
+            }
+            !ours
+        });
+        (!tiles.is_empty()).then(|| FillMap {
+            tiles,
+            counts: std::sync::Arc::clone(&self.counts),
+            built: 0,
+        })
+    }
+
+    /// The fill for tile `key`, if it has one, owned by the caller, who
+    /// drops it once the tile's fill commands are built.
+    ///
+    /// # Errors
+    /// None while the fill is held in RAM; a read of a spilled fill can fail.
+    // #788: F replaces this with its spill read.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "#788: the spilled fill F stores reads fallibly behind this signature"
+    )]
+    pub(super) fn get(&self, key: u64) -> Result<Option<Vec<FillPolygon>>, super::ExportError> {
+        let Some(polys) = self.tiles.get(&key) else {
+            return Ok(None);
+        };
+        self.counts
+            .used
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(polys.clone()))
     }
 
     /// Count fill polygons a tile shed to stay within its budget.
     pub(super) fn note_shed(&self, n: usize) {
-        self.shed.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.counts
+            .shed
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -786,15 +844,15 @@ impl Drop for FillMap {
     /// Fills built, and how many the export drew. A fill is drawn only into
     /// a tile that has features of its own; the rest are not emitted yet.
     fn drop(&mut self) {
-        if self.tiles.is_empty() {
+        if self.built == 0 {
             return;
         }
-        let used = self.used.load(std::sync::atomic::Ordering::Relaxed);
-        let shed = self.shed.load(std::sync::atomic::Ordering::Relaxed);
+        let used = self.counts.used.load(std::sync::atomic::Ordering::Relaxed);
+        let shed = self.counts.shed.load(std::sync::atomic::Ordering::Relaxed);
         log::info!(
             "[export] coverage fill: {} fill tiles built, {used} drawn into tiles with \
              features, {shed} fill polygons shed to fit tile size limits",
-            self.tiles.len(),
+            self.built,
         );
     }
 }
@@ -895,6 +953,7 @@ fn seed_batch(
 pub(super) fn build_fill_map(
     level: &super::ExportLevelCtx<'_>,
     min_zoom: u8,
+    workspace_bytes: u64,
     timers: &super::ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<FillMap, super::ExportError> {
@@ -909,9 +968,15 @@ pub(super) fn build_fill_map(
 
     let mut map = FillMap {
         tiles: Default::default(),
-        used: Default::default(),
-        shed: Default::default(),
+        counts: Default::default(),
+        built: 0,
     };
+    // #788: the workspace the export's budget granted; F's spilling
+    // builder holds its seed and pyramid within it.
+    log::debug!(
+        "[profile] coverage fill workspace grant: {} MiB",
+        workspace_bytes >> 20
+    );
     if finest_zoom == 0 || min_zoom >= finest_zoom {
         return Ok(map);
     }
@@ -1043,12 +1108,48 @@ pub(super) fn build_fill_map(
         t_pyramid.elapsed().as_secs_f64(),
         map.tiles.len(),
     );
+    map.built = map.tiles.len();
     Ok(map)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #788: a level takes only its own zoom's fill out of the map, the
+    /// rest stays for the finer levels, and a lookup hands the caller its
+    /// own copy.
+    #[test]
+    fn take_zoom_moves_only_that_zooms_tiles() {
+        let poly = |v: i32| -> FillPolygon { vec![vec![(v, 0), (v, 1), (v + 1, 1)]] };
+        let key = |z: u8, x: u32| crate::pmtiles_writer::tile_id(z, x, 0);
+        let mut map = FillMap {
+            tiles: [
+                (key(2, 1), vec![poly(1)]),
+                (key(2, 3), vec![poly(2)]),
+                (key(3, 5), vec![poly(3)]),
+            ]
+            .into_iter()
+            .collect(),
+            counts: Default::default(),
+            built: 3,
+        };
+        assert!(map.take_zoom(1).is_none(), "no z1 fill");
+        let z2 = map.take_zoom(2).expect("z2 fill");
+        assert_eq!(z2.tiles.len(), 2);
+        assert_eq!(z2.get(key(2, 3)).unwrap(), Some(vec![poly(2)]));
+        assert_eq!(z2.get(key(3, 5)).unwrap(), None, "z3 stays in the map");
+        assert_eq!(map.tiles.len(), 1);
+        assert!(map.take_zoom(2).is_none(), "taken once");
+        let z3 = map.take_zoom(3).expect("z3 fill");
+        assert_eq!(z3.get(key(3, 5)).unwrap(), Some(vec![poly(3)]));
+        assert!(map.tiles.is_empty());
+        assert_eq!(
+            map.counts.used.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the zooms count into the map's totals"
+        );
+    }
 
     fn square(x: f64, y: f64, side: f64) -> Shape {
         vec![vec![

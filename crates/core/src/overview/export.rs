@@ -2304,7 +2304,8 @@ fn export_pmtiles_validated(
             PriceBasis::Measured,
         ),
         crate::compression::tile_gzip::PAYLOAD_SLICES,
-        1,
+        // Main's cache under every profile: bounded keeps main's caps.
+        crate::compression::tile_gzip::PAYLOAD_SLICES,
     );
     crate::compression::tile_gzip::configure_payload_cap(
         usize::try_from(gzip_grant.bytes()).unwrap_or(usize::MAX),
@@ -2983,6 +2984,7 @@ fn export_level(
 /// reads but does not emit (#771 option 1).
 fn build_fills_if_asked(
     levels: &[ExportLevelCtx<'_>],
+    budget: &mut MemoryBudget,
     timers: &ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<coverage_fill::FillMap>, ExportError> {
@@ -3008,7 +3010,19 @@ fn build_fills_if_asked(
         );
         return Ok(None);
     }
-    coverage_fill::build_fill_map(last, first.plan.zoom, timers, diagnostics).map(Some)
+    // #788: the builder's workspace, from the export-wide ledger, returned
+    // once the map is built; the map itself is held per zoom from then on.
+    let grant = budget.fit(
+        options.profile,
+        MemoryPhase::Fill,
+        Price::new(1, PriceBasis::Measured),
+        coverage_fill::WORKSPACE_WANT_BYTES,
+        coverage_fill::WORKSPACE_FLOOR_BYTES,
+    );
+    let built =
+        coverage_fill::build_fill_map(last, first.plan.zoom, grant.bytes(), timers, diagnostics);
+    budget.release(grant);
+    built.map(Some)
 }
 
 /// The memory the levels draw on: the export-wide member store (#235), when
@@ -3031,24 +3045,31 @@ fn export_level_groups(
     progress: &mut ExportProgress,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<ZoomReport>, ExportError> {
-    let fills = build_fills_if_asked(levels, &progress.profile.timers, diagnostics)?;
-    let levels: Vec<ExportLevelCtx<'_>> = levels
-        .iter()
-        .map(|l| ExportLevelCtx {
-            fills: fills.as_ref(),
-            ..*l
-        })
-        .collect();
     let LevelMemory { mut store, budget } = mem;
+    let mut fills = build_fills_if_asked(levels, budget, &progress.profile.timers, diagnostics)?;
     let mut zooms = Vec::with_capacity(levels.len());
     for group in groups {
+        // #788: each level owns its zoom's fill, taken out of the map as
+        // its group starts and dropped when the group is written.
+        let group_fills: Vec<Option<coverage_fill::FillMap>> = levels[group.clone()]
+            .iter()
+            .map(|l| fills.as_mut().and_then(|f| f.take_zoom(l.plan.zoom)))
+            .collect();
+        let group_levels: Vec<ExportLevelCtx<'_>> = levels[group.clone()]
+            .iter()
+            .zip(&group_fills)
+            .map(|(l, fill)| ExportLevelCtx {
+                fills: fill.as_ref(),
+                ..*l
+            })
+            .collect();
         zooms.extend(export_level_group(
             writer,
             LevelMemory {
                 store: store.as_deref_mut(),
                 budget: &mut *budget,
             },
-            &levels[group.clone()],
+            &group_levels,
             ckpt,
             progress.fail_level,
             progress,
@@ -3817,15 +3838,22 @@ fn level_read_backing(
         level_members,
         0,
     );
+    let affordable = if affordable == usize::MAX {
+        "unlimited".to_string()
+    } else {
+        format!(
+            "{} MiB",
+            (affordable as u64).saturating_mul(per_member) >> 20
+        )
+    };
     log::debug!(
         "[profile]     z{} level store grants: wave {} MiB ({wave_members} members), \
          level {} of {} MiB wanted ({level_members} members at {per_member} B), \
-         {} MiB was affordable",
+         {affordable} was affordable",
         plan.zoom,
         wave.bytes() >> 20,
         level.bytes() >> 20,
         (level_members as u64).saturating_mul(per_member) >> 20,
-        (affordable as u64).saturating_mul(per_member) >> 20,
     );
     let backing = if level.units >= level_members {
         StoreBacking {
@@ -6946,14 +6974,19 @@ fn encode_members(
             let _encode = ExportTimers::scope(&timers.encode);
             let (x, y) = key_to_xy(g[0].key, zoom);
             let tb = TileCoord::new(x, y, zoom).bounds();
-            let (fill, mut fill_tally) = fills
-                .and_then(|f| {
-                    let polys = f.get(g[0].key)?;
-                    Some(ExportTimers::time(&timers.fill_encode, || {
-                        fill_features(polys, g, &tb, opts, diagnostics)
-                    }))
+            // #788: the tile's fill is owned for the encode and dropped once
+            // its fill commands are built; a spilled fill's read can fail.
+            let fill = fills.map(|f| {
+                ExportTimers::time(&timers.fill_encode, || {
+                    f.get(g[0].key).map(|polys| {
+                        polys.map(|polys| fill_features(&polys, g, &tb, opts, diagnostics))
+                    })
                 })
-                .unwrap_or_default();
+            });
+            let (fill, mut fill_tally) = match fill.transpose() {
+                Ok(fill) => fill.flatten().unwrap_or_default(),
+                Err(error) => return Some(Err(error)),
+            };
             let mvt = encode_tile(g, &tb, opts, &fill, &mut fill_tally, diagnostics);
             if opts.feature_id.is_some() {
                 use crate::diagnostics::SourceLossCause;
