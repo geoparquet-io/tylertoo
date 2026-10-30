@@ -700,11 +700,26 @@ pub(crate) fn estimate_with(
             .expect("the sampled bbox column is projected");
         let proj = |c: usize| cols.binary_search(&c).expect("filter column is projected");
 
-        let stream = source.open_stream(&ReadPlan {
+        let plan = ReadPlan {
             batch_size: AUTO_ZOOM_BATCH_ROWS,
             projection: Some(&cols),
             row_groups: selection.as_ref(),
-        })?;
+        };
+        // A remote sample would otherwise fetch each sampled column chunk
+        // on its own, one at a time (#788: 52 serial requests for moldova's
+        // covering). Stage them first, concurrently; best-effort, since the
+        // read below fetches whatever staging missed.
+        if source.is_remote() {
+            match source.stage_read(&plan) {
+                Ok(r) => log::debug!(
+                    "[auto-zoom] staged the sample columns: {} request(s), {} B",
+                    r.requests,
+                    r.bytes_fetched
+                ),
+                Err(e) => log::debug!("[auto-zoom] staging the sample columns failed ({e})"),
+            }
+        }
+        let stream = source.open_stream(&plan)?;
 
         let mut diags_m: Vec<f64> = Vec::new();
         let mut centers: Vec<(f64, f64)> = Vec::new();
@@ -1004,6 +1019,67 @@ mod tests {
         let mut normalized = covered;
         normalized.sampled_from_covering = false;
         assert_eq!(normalized, plain);
+    }
+
+    /// #788: a remote sample stages its columns before reading them. The
+    /// four covering leaves of a row group are contiguous, so staging fetches
+    /// each row group's covering as one request, where the lazy read fetched
+    /// each leaf on its own (four requests per row group, one at a time).
+    #[cfg(feature = "remote")]
+    #[test]
+    fn a_remote_sample_stages_the_covering_one_request_per_row_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = point_grid(10, 0.01);
+        let covered = write_covered(&dir, "covered.parquet", &geoms);
+        // The same file, cut into row groups of 10 rows.
+        let path = dir.path().join("groups.parquet");
+        {
+            use tylertoo_io::test_support::{ArrowWriter, WriterProperties};
+            let builder = covered.parts()[0].open().unwrap();
+            let kv = builder
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .cloned();
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(10))
+                .set_key_value_metadata(kv)
+                .build();
+            let schema = builder.schema().clone();
+            let mut writer =
+                ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, Some(props))
+                    .unwrap();
+            for batch in builder.build().unwrap() {
+                writer.write(&batch.unwrap()).unwrap();
+            }
+            writer.close().unwrap();
+        }
+        let local = ConvertSource::resolve_path(&path).unwrap();
+        assert!(
+            crate::resolved_schema::ResolvedSchema::auto_zoom_covering(
+                local.resolved_schemas().unwrap(),
+                &Diagnostics::default(),
+            )
+            .is_some(),
+            "fixture declares a usable covering"
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let row_groups = tylertoo_io::read_parquet_metadata(&bytes::Bytes::from(bytes.clone()))
+            .unwrap()
+            .num_row_groups();
+        assert!(row_groups >= 5, "fixture has {row_groups} row group(s)");
+        let remote =
+            ConvertSource::single(crate::input::test_memory_source(bytes, "groups.parquet"));
+        let part = &remote.parts()[0];
+        let _ = part.open().unwrap();
+        let before = part.fetch_stats().unwrap().requests;
+        let got = estimate(&remote, 0).unwrap();
+        let requests = part.fetch_stats().unwrap().requests - before;
+        assert_eq!(got, estimate(&local, 0).unwrap());
+        assert_eq!(
+            requests, row_groups as u64,
+            "one staged request per row group's covering"
+        );
     }
 
     fn rewrite_covering(source: &ConvertSource, path: &Path, declare: bool) {

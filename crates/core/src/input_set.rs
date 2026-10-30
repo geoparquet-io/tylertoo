@@ -1015,16 +1015,20 @@ impl ConvertSource {
         &self,
         selection: Option<&RowGroupSelection>,
     ) -> Result<StagingPlan, InputError> {
-        self.staging_plan_for(selection, self.column_projection())
+        self.staging_plan_for(selection, None)
     }
 
-    /// [`Self::staging_plan`] for an explicit set of file-root columns
-    /// (`None` = all), for a read narrower than the source's projection.
+    /// [`Self::staging_plan`] for a read narrower than the source's
+    /// projection: `projection` indexes this source's (possibly restricted)
+    /// schema, exactly as a [`ReadPlan`]'s does (`None` = every column the
+    /// source exposes).
     pub(crate) fn staging_plan_for(
         &self,
         selection: Option<&RowGroupSelection>,
-        roots: Option<&[usize]>,
+        projection: Option<&[usize]>,
     ) -> Result<StagingPlan, InputError> {
+        let roots = self.file_roots(projection);
+        let roots = roots.as_deref();
         let parts = self.parts();
         if let Some(sel) = selection {
             debug_assert_eq!(
@@ -1070,6 +1074,35 @@ impl ConvertSource {
         crate::input::stage_parts(&parts)
     }
 
+    /// Stage the chunks one read plan will read (its row groups, its
+    /// columns) before the read opens, so a remote read fetches them as
+    /// concurrent, coalescable requests instead of one chunk at a time on
+    /// the reader's lazy path. A no-op for local input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a footer cannot be read or a fetch fails
+    /// in a way a retry cannot fix.
+    pub(crate) fn stage_read(
+        &self,
+        plan: &ReadPlan<'_>,
+    ) -> Result<crate::input::StagingReport, InputError> {
+        let staging = self.staging_plan_for(plan.row_groups, plan.projection)?;
+        self.stage(&staging)
+    }
+
+    /// Compose a projection over this source's (possibly restricted) schema
+    /// with the source's own column projection into the file-root indices a
+    /// reader and the staging plan take (`None` = every column).
+    fn file_roots(&self, projection: Option<&[usize]>) -> Option<Vec<usize>> {
+        match (self.column_projection(), projection) {
+            (None, None) => None,
+            (None, Some(cols)) => Some(cols.to_vec()),
+            (Some(base), None) => Some(base.to_vec()),
+            (Some(base), Some(cols)) => Some(cols.iter().map(|&c| base[c]).collect()),
+        }
+    }
+
     /// Stage every part's selected row groups to local disk up front (pass 0,
     /// #286/#287) so the streaming passes read from disk, not the network:
     /// [`Self::staging_plan`] then [`Self::stage`]. `selection` (`None` = all
@@ -1105,13 +1138,8 @@ impl ConvertSource {
             );
         }
         // A plan's projection indexes the (possibly restricted) schema this
-        // source exposes; the reader wants file-root indices. Compose the two.
-        let projection = match (self.column_projection(), plan.projection) {
-            (None, None) => None,
-            (None, Some(cols)) => Some(cols.to_vec()),
-            (Some(base), None) => Some(base.to_vec()),
-            (Some(base), Some(cols)) => Some(cols.iter().map(|&c| base[c]).collect()),
-        };
+        // source exposes; the reader wants file-root indices.
+        let projection = self.file_roots(plan.projection);
         // Footers are parsed once per source (lazily for `Single`, at
         // construction for `Multi`); every reader this stream opens reuses
         // them rather than re-decoding O(row_groups × columns) of thrift.
