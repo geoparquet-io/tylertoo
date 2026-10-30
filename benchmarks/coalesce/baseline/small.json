@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "profile": "small",
-  "created": "2026-10-23 18:02 UTC",
-  "config_sha256": "73a5ad6ffd11848b44f9e662afc130fbd9be7fd34a604ed6531859cb002190e1",
+  "created": "2026-10-30 19:34 UTC",
+  "config_sha256": "f2b4025d25f6f5919fa2ed7f7bbdbdd00db74f78f771556bb62d777248f7699d",
   "noise": {
     "coverage_pp": 3.0,
     "time_ratio": 0.1
@@ -17,10 +17,10 @@
     "python": "3.12.3"
   },
   "binary": {
-    "sha256": "50faf46fe90dc40844b7627250024aa28a22be91af0ca9d8d52d6e7987d99ed0",
-    "git": "635322c",
+    "sha256": "9a924cfdb6c7c7ad0238eee9fe532df956d4adfca09960d53fd936de79f0e3b1",
+    "git": "fb9ed97",
     "version": "tylertoo 0.8.0",
-    "file": "ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, BuildID[sha1]=10d14cdc15e1fa13dd7615a978208dbfe778e487, for GNU/Linux 3.7.0, stripped",
+    "file": "ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, BuildID[sha1]=a4791ef4185ace20767777c79dbdee6acd74010b, for GNU/Linux 3.7.0, stripped",
     "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)"
   },
   "datasets": {
@@ -90,6 +90,14 @@
         "0"
       ],
       "valve": "merge"
+    },
+    "fill": {
+      "label": "--coverage-fill",
+      "convert": [],
+      "valve": "merge",
+      "export": [
+        "--coverage-fill"
+      ]
     }
   },
   "cells": {
@@ -97,30 +105,30 @@
       "status": "ok",
       "convert": {
         "wall_s": [
-          0.69,
-          0.66,
-          0.66
+          0.52,
+          0.52,
+          0.52
         ],
-        "median_s": 0.66,
-        "cpu_s": 3.07,
-        "peak_rss_kib": 313840,
-        "load_before_max": 0.85
+        "median_s": 0.52,
+        "cpu_s": 2.48,
+        "peak_rss_kib": 631312,
+        "load_before_max": 4.79
       },
       "export": {
         "wall_s": [
-          0.5,
-          0.52,
-          0.5
+          0.26,
+          0.27,
+          0.25
         ],
-        "median_s": 0.5,
-        "cpu_s": 4.17,
-        "peak_rss_kib": 256844,
-        "load_before_max": 0.86
+        "median_s": 0.26,
+        "cpu_s": 4.27,
+        "peak_rss_kib": 940544,
+        "load_before_max": 4.4
       },
-      "total_s": 1.16,
-      "overview_bytes": 30221929,
-      "pmtiles_bytes": 18717927,
-      "pmtiles_sha256": "e176ab3345cb3c3dba65cfe2b08a103161ee348603c064660fa0d00938fc2bb5",
+      "total_s": 0.78,
+      "overview_bytes": 30223559,
+      "pmtiles_bytes": 18718000,
+      "pmtiles_sha256": "309feb916422a43ddedc8ee0d586b25b5fbed1abc00464a6e8afcac34c451636",
       "merged_features": 0,
       "valve_dropped_features": 0,
       "oversized_tiles": 0,
@@ -132,7 +140,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 2,
@@ -141,7 +153,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 3,
@@ -150,7 +166,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 2,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 4,
@@ -159,7 +179,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 4,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 5,
@@ -168,7 +192,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 4,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 6,
@@ -177,7 +205,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 7,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 7,
@@ -186,7 +218,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 16,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 8,
@@ -195,7 +231,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 44,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 9,
@@ -204,7 +244,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 147,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 10,
@@ -213,7 +257,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 515,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 11,
@@ -222,7 +270,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1933,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 12,
@@ -231,46 +283,50 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 7440,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         }
       ],
       "repeats_identical": true,
-      "key": "00799cfa3ccdd37c",
+      "key": "fe453e82cc084d25",
       "dataset": "madagascar",
       "setting": "before-745",
       "repeats": 3,
       "pmtiles": "madagascar.before-745.drop.pmtiles",
-      "pmtiles_mtime_ns": 1792774780345077902
+      "pmtiles_mtime_ns": 1793387748848062836
     },
     "madagascar/raw500k": {
       "status": "ok",
       "convert": {
         "wall_s": [
-          0.85,
-          0.88,
-          0.88
+          0.71,
+          0.7,
+          0.7
         ],
-        "median_s": 0.88,
-        "cpu_s": 2.79,
-        "peak_rss_kib": 451816,
-        "load_before_max": 0.86
+        "median_s": 0.7,
+        "cpu_s": 2.43,
+        "peak_rss_kib": 935912,
+        "load_before_max": 4.4
       },
       "export": {
         "wall_s": [
-          1.92,
-          2.05,
-          1.98
+          0.47,
+          0.46,
+          0.47
         ],
-        "median_s": 1.98,
-        "cpu_s": 12.28,
-        "peak_rss_kib": 437984,
-        "load_before_max": 1.51
+        "median_s": 0.47,
+        "cpu_s": 10.93,
+        "peak_rss_kib": 1290256,
+        "load_before_max": 4.4
       },
-      "total_s": 2.86,
-      "overview_bytes": 47756458,
-      "pmtiles_bytes": 25469272,
-      "pmtiles_sha256": "b21cf97ad9887e1333c9a9dce6221f03dc0909735c7377eb0c52169ce2963fc2",
-      "merged_features": 47441,
+      "total_s": 1.17,
+      "overview_bytes": 47820239,
+      "pmtiles_bytes": 25471055,
+      "pmtiles_sha256": "84ba3a316263ea2bdb77444a4e8bbc2bb47270206bca5b00c0b8e8ad5fe4b68a",
+      "merged_features": 48326,
       "valve_dropped_features": 0,
       "oversized_tiles": 12,
       "zooms": [
@@ -281,79 +337,115 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 1,
           "tile_count": 1,
-          "tile_feature_count": 1537,
+          "tile_feature_count": 1558,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 2,
           "tile_count": 1,
-          "tile_feature_count": 2073,
+          "tile_feature_count": 2077,
           "oversized_tiles": 1,
-          "merged_features": 2484,
+          "merged_features": 2610,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 2,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 3,
           "tile_count": 2,
-          "tile_feature_count": 4306,
+          "tile_feature_count": 4311,
           "oversized_tiles": 2,
-          "merged_features": 8531,
+          "merged_features": 8891,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 4,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 4,
           "tile_count": 4,
-          "tile_feature_count": 7632,
+          "tile_feature_count": 7674,
           "oversized_tiles": 2,
-          "merged_features": 11372,
+          "merged_features": 11669,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 6,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 5,
           "tile_count": 4,
-          "tile_feature_count": 6583,
+          "tile_feature_count": 6591,
           "oversized_tiles": 2,
-          "merged_features": 12396,
+          "merged_features": 12461,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 7,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 6,
           "tile_count": 7,
-          "tile_feature_count": 8828,
+          "tile_feature_count": 8840,
           "oversized_tiles": 3,
-          "merged_features": 10004,
+          "merged_features": 10038,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 10,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 7,
           "tile_count": 16,
-          "tile_feature_count": 18072,
+          "tile_feature_count": 18077,
           "oversized_tiles": 2,
-          "merged_features": 2654,
+          "merged_features": 2657,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 18,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 8,
           "tile_count": 44,
-          "tile_feature_count": 21185,
+          "tile_feature_count": 21191,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 44,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 9,
@@ -362,7 +454,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 149,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 10,
@@ -371,7 +467,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 524,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 11,
@@ -380,7 +480,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1944,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 12,
@@ -389,46 +493,50 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 7440,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         }
       ],
       "repeats_identical": true,
-      "key": "0f71dbf69b7d5507",
+      "key": "20ba88a00f518928",
       "dataset": "madagascar",
       "setting": "raw500k",
       "repeats": 3,
       "pmtiles": "madagascar.raw500k.merge.pmtiles",
-      "pmtiles_mtime_ns": 1792774789277011825
+      "pmtiles_mtime_ns": 1793387752768071374
     },
     "madagascar/default": {
       "status": "ok",
       "convert": {
         "wall_s": [
-          0.87,
-          0.87,
-          0.87
+          0.7,
+          0.7,
+          0.71
         ],
-        "median_s": 0.87,
-        "cpu_s": 2.79,
-        "peak_rss_kib": 447508,
-        "load_before_max": 1.55
+        "median_s": 0.7,
+        "cpu_s": 2.41,
+        "peak_rss_kib": 963100,
+        "load_before_max": 4.4
       },
       "export": {
         "wall_s": [
-          1.97,
-          1.93,
-          1.95
+          0.47,
+          0.48,
+          0.47
         ],
-        "median_s": 1.95,
-        "cpu_s": 11.0,
-        "peak_rss_kib": 431792,
-        "load_before_max": 1.59
+        "median_s": 0.47,
+        "cpu_s": 10.21,
+        "peak_rss_kib": 1250424,
+        "load_before_max": 4.13
       },
-      "total_s": 2.82,
-      "overview_bytes": 47756458,
-      "pmtiles_bytes": 26895135,
-      "pmtiles_sha256": "70349b8a63f8d635a5dfa2b61fb53014809e4f963ab3cb4638832ca53e838b95",
-      "merged_features": 6058,
+      "total_s": 1.17,
+      "overview_bytes": 47820239,
+      "pmtiles_bytes": 26916392,
+      "pmtiles_sha256": "d457b1af0f74c0c3af892f2ccdb650942d5486403f82fad15d0c3d2578ed3cc8",
+      "merged_features": 6302,
       "valve_dropped_features": 0,
       "oversized_tiles": 2,
       "zooms": [
@@ -439,79 +547,115 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 1,
           "tile_count": 1,
-          "tile_feature_count": 1537,
+          "tile_feature_count": 1558,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 2,
           "tile_count": 1,
-          "tile_feature_count": 4557,
+          "tile_feature_count": 4687,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 3,
           "tile_count": 2,
-          "tile_feature_count": 12829,
+          "tile_feature_count": 13192,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 2,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 4,
           "tile_count": 4,
-          "tile_feature_count": 16454,
+          "tile_feature_count": 16597,
           "oversized_tiles": 1,
-          "merged_features": 2545,
+          "merged_features": 2740,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 5,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 5,
           "tile_count": 4,
-          "tile_feature_count": 15456,
+          "tile_feature_count": 15480,
           "oversized_tiles": 1,
-          "merged_features": 3513,
+          "merged_features": 3562,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 5,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 6,
           "tile_count": 7,
-          "tile_feature_count": 18830,
+          "tile_feature_count": 18876,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 7,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 7,
           "tile_count": 16,
-          "tile_feature_count": 20724,
+          "tile_feature_count": 20732,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 16,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 8,
           "tile_count": 44,
-          "tile_feature_count": 21185,
+          "tile_feature_count": 21191,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 44,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 9,
@@ -520,7 +664,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 149,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 10,
@@ -529,7 +677,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 524,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 11,
@@ -538,7 +690,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1944,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 12,
@@ -547,46 +703,50 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 7440,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         }
       ],
       "repeats_identical": true,
-      "key": "5c172b106138c5d7",
+      "key": "eba0ca5c7d199f94",
       "dataset": "madagascar",
       "setting": "default",
       "repeats": 3,
       "pmtiles": "madagascar.default.merge.pmtiles",
-      "pmtiles_mtime_ns": 1792774798157946141
+      "pmtiles_mtime_ns": 1793387756615079753
     },
     "madagascar/sf0.25": {
       "status": "ok",
       "convert": {
         "wall_s": [
-          1.0,
-          1.02,
-          1.03
+          0.85,
+          0.85,
+          0.84
         ],
-        "median_s": 1.02,
-        "cpu_s": 4.27,
-        "peak_rss_kib": 481136,
-        "load_before_max": 1.59
+        "median_s": 0.85,
+        "cpu_s": 3.73,
+        "peak_rss_kib": 1003276,
+        "load_before_max": 4.13
       },
       "export": {
         "wall_s": [
-          2.05,
-          2.1,
-          2.08
+          0.49,
+          0.5,
+          0.49
         ],
-        "median_s": 2.08,
-        "cpu_s": 11.95,
-        "peak_rss_kib": 490868,
-        "load_before_max": 1.66
+        "median_s": 0.49,
+        "cpu_s": 10.94,
+        "peak_rss_kib": 1221092,
+        "load_before_max": 3.88
       },
-      "total_s": 3.1,
-      "overview_bytes": 61003226,
-      "pmtiles_bytes": 29323524,
-      "pmtiles_sha256": "1d8e2d350eba0d69b14f70de89445113b29ad08e40559b88b6a73d4c40f002a4",
-      "merged_features": 9382,
+      "total_s": 1.34,
+      "overview_bytes": 61007335,
+      "pmtiles_bytes": 29322990,
+      "pmtiles_sha256": "4b60b2a7aaa00a7876443b7d774c3d056888a2612371d77ed71df5147717e4dc",
+      "merged_features": 9379,
       "valve_dropped_features": 0,
       "oversized_tiles": 3,
       "zooms": [
@@ -597,7 +757,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 1,
@@ -606,7 +770,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 2,
@@ -615,7 +783,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 3,
@@ -624,7 +796,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 2,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 4,
@@ -633,25 +809,37 @@
           "oversized_tiles": 1,
           "merged_features": 3088,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 5,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 5,
           "tile_count": 4,
-          "tile_feature_count": 14747,
+          "tile_feature_count": 14749,
           "oversized_tiles": 1,
-          "merged_features": 4344,
+          "merged_features": 4342,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 5,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 6,
           "tile_count": 7,
-          "tile_feature_count": 16933,
+          "tile_feature_count": 16934,
           "oversized_tiles": 1,
-          "merged_features": 1950,
+          "merged_features": 1949,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 8,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 7,
@@ -660,7 +848,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 16,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 8,
@@ -669,7 +861,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 44,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 9,
@@ -678,7 +874,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 149,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 10,
@@ -687,7 +887,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 524,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 11,
@@ -696,7 +900,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1944,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 12,
@@ -705,46 +913,50 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 7440,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         }
       ],
       "repeats_identical": true,
-      "key": "ef697fd922e33b62",
+      "key": "87f3201906100ff9",
       "dataset": "madagascar",
       "setting": "sf0.25",
       "repeats": 3,
       "pmtiles": "madagascar.sf0.25.merge.pmtiles",
-      "pmtiles_mtime_ns": 1792774807996873389
+      "pmtiles_mtime_ns": 1793387761135089598
     },
     "madagascar/sf0": {
       "status": "ok",
       "convert": {
         "wall_s": [
-          1.71,
-          1.71,
-          1.7
+          1.5,
+          1.51,
+          1.49
         ],
-        "median_s": 1.71,
-        "cpu_s": 3.3,
-        "peak_rss_kib": 801400,
-        "load_before_max": 1.68
+        "median_s": 1.5,
+        "cpu_s": 3.04,
+        "peak_rss_kib": 1253672,
+        "load_before_max": 4.37
       },
       "export": {
         "wall_s": [
-          2.32,
-          2.46,
-          2.42
+          0.76,
+          0.8,
+          0.76
         ],
-        "median_s": 2.42,
-        "cpu_s": 17.18,
-        "peak_rss_kib": 744800,
-        "load_before_max": 1.71
+        "median_s": 0.76,
+        "cpu_s": 16.31,
+        "peak_rss_kib": 1688640,
+        "load_before_max": 4.37
       },
-      "total_s": 4.13,
-      "overview_bytes": 187051542,
-      "pmtiles_bytes": 33554729,
-      "pmtiles_sha256": "7f2790b39e4f7a1f8578a04cc4186c5da9d6e40e3780cf2cac75f579f5c12bb2",
-      "merged_features": 19650,
+      "total_s": 2.26,
+      "overview_bytes": 187053210,
+      "pmtiles_bytes": 33512470,
+      "pmtiles_sha256": "83236ac0bc57f8ec1d12379f28706b01fbba2f3540cbcda958503a412953801d",
+      "merged_features": 19374,
       "valve_dropped_features": 0,
       "oversized_tiles": 4,
       "zooms": [
@@ -755,7 +967,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 1,
@@ -764,7 +980,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 2,
@@ -773,43 +993,63 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 3,
           "tile_count": 2,
-          "tile_feature_count": 10833,
+          "tile_feature_count": 10996,
           "oversized_tiles": 1,
-          "merged_features": 2525,
+          "merged_features": 2362,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 3,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 4,
           "tile_count": 4,
-          "tile_feature_count": 14981,
+          "tile_feature_count": 15034,
           "oversized_tiles": 1,
-          "merged_features": 4487,
+          "merged_features": 4434,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 5,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 5,
           "tile_count": 4,
-          "tile_feature_count": 11476,
+          "tile_feature_count": 11520,
           "oversized_tiles": 1,
-          "merged_features": 7616,
+          "merged_features": 7572,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 6,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 6,
           "tile_count": 7,
-          "tile_feature_count": 13862,
+          "tile_feature_count": 13878,
           "oversized_tiles": 1,
-          "merged_features": 5022,
+          "merged_features": 5006,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 9,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 7,
@@ -818,7 +1058,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 16,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 8,
@@ -827,7 +1071,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 44,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 9,
@@ -836,7 +1084,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 149,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 10,
@@ -845,7 +1097,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 524,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 11,
@@ -854,7 +1110,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1944,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 12,
@@ -863,47 +1123,261 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 7440,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         }
       ],
       "repeats_identical": true,
-      "key": "4b675a7a4206476d",
+      "key": "f409e6be076b80a0",
       "dataset": "madagascar",
       "setting": "sf0",
       "repeats": 3,
       "pmtiles": "madagascar.sf0.merge.pmtiles",
-      "pmtiles_mtime_ns": 1792774821109776392
+      "pmtiles_mtime_ns": 1793387768687106048
+    },
+    "madagascar/fill": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          0.7,
+          0.7,
+          0.7
+        ],
+        "median_s": 0.7,
+        "cpu_s": 2.39,
+        "peak_rss_kib": 988900,
+        "load_before_max": 4.1
+      },
+      "export": {
+        "wall_s": [
+          1.99,
+          1.97,
+          1.98
+        ],
+        "median_s": 1.98,
+        "cpu_s": 17.28,
+        "peak_rss_kib": 1401872,
+        "load_before_max": 5.44
+      },
+      "total_s": 2.68,
+      "overview_bytes": 47820239,
+      "pmtiles_bytes": 27388725,
+      "pmtiles_sha256": "f0c20878d31acce297162c05dedc6e2d6aa08f4c4865a6223149fa0d6e05a37a",
+      "merged_features": 6302,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 2,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 410,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 2,
+          "fill_polygons": 1,
+          "fill_vertices": 45,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 1,
+          "tile_count": 1,
+          "tile_feature_count": 1558,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 2,
+          "fill_polygons": 3,
+          "fill_vertices": 68,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 2,
+          "tile_count": 1,
+          "tile_feature_count": 4687,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 2,
+          "fill_polygons": 12,
+          "fill_vertices": 181,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 3,
+          "tile_count": 2,
+          "tile_feature_count": 13192,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 4,
+          "fill_polygons": 33,
+          "fill_vertices": 589,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 4,
+          "tile_count": 4,
+          "tile_feature_count": 16597,
+          "oversized_tiles": 1,
+          "merged_features": 2740,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3,
+          "valve_passes": 9,
+          "fill_polygons": 54,
+          "fill_vertices": 1029,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 5,
+          "tile_count": 4,
+          "tile_feature_count": 15480,
+          "oversized_tiles": 1,
+          "merged_features": 3562,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3,
+          "valve_passes": 9,
+          "fill_polygons": 109,
+          "fill_vertices": 2809,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 6,
+          "tile_count": 7,
+          "tile_feature_count": 18876,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 13,
+          "fill_polygons": 233,
+          "fill_vertices": 5125,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 7,
+          "tile_count": 16,
+          "tile_feature_count": 20732,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 32,
+          "fill_polygons": 460,
+          "fill_vertices": 8304,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 8,
+          "tile_count": 44,
+          "tile_feature_count": 21191,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 87,
+          "fill_polygons": 921,
+          "fill_vertices": 19274,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 9,
+          "tile_count": 149,
+          "tile_feature_count": 23270,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 297,
+          "fill_polygons": 1848,
+          "fill_vertices": 33791,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 10,
+          "tile_count": 524,
+          "tile_feature_count": 26830,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 1042,
+          "fill_polygons": 3832,
+          "fill_vertices": 72677,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 11,
+          "tile_count": 1944,
+          "tile_feature_count": 34896,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 3876,
+          "fill_polygons": 10170,
+          "fill_vertices": 209005,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 12,
+          "tile_count": 7440,
+          "tile_feature_count": 53782,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1,
+          "valve_passes": 7440,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
+        }
+      ],
+      "repeats_identical": true,
+      "key": "a2817b29cbbab22e",
+      "dataset": "madagascar",
+      "setting": "fill",
+      "repeats": 3,
+      "pmtiles": "madagascar.fill.merge.pmtiles",
+      "pmtiles_mtime_ns": 1793387807138190251
     },
     "moldova/before-745": {
       "status": "ok",
       "convert": {
         "wall_s": [
-          1.7,
-          1.71,
-          1.72
+          1.12,
+          1.11,
+          1.12
         ],
-        "median_s": 1.71,
-        "cpu_s": 21.33,
-        "peak_rss_kib": 2538128,
-        "load_before_max": 2.72
+        "median_s": 1.12,
+        "cpu_s": 19.06,
+        "peak_rss_kib": 3594144,
+        "load_before_max": 5.96
       },
       "export": {
         "wall_s": [
-          4.73,
-          4.49,
-          4.59
+          2.0,
+          2.09,
+          2.24
         ],
-        "median_s": 4.59,
-        "cpu_s": 59.14,
-        "peak_rss_kib": 1672564,
-        "load_before_max": 2.72
+        "median_s": 2.09,
+        "cpu_s": 58.05,
+        "peak_rss_kib": 2695160,
+        "load_before_max": 5.96
       },
-      "total_s": 6.3,
-      "overview_bytes": 172763950,
-      "pmtiles_bytes": 77502275,
-      "pmtiles_sha256": "928da72db329410a318240c35c0eb8b25c06af50ce4682aa18620c19faa22de5",
+      "total_s": 3.21,
+      "overview_bytes": 172764991,
+      "pmtiles_bytes": 77364736,
+      "pmtiles_sha256": "a51d41b9f42878b9780a5d2a9b481eb13c6d904ec779ab939d8dbf13282d1311",
       "merged_features": 0,
-      "valve_dropped_features": 157515,
+      "valve_dropped_features": 157278,
       "oversized_tiles": 49,
       "zooms": [
         {
@@ -913,7 +1387,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 4,
@@ -922,7 +1400,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 5,
@@ -931,111 +1413,143 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 6,
           "tile_count": 2,
-          "tile_feature_count": 13752,
+          "tile_feature_count": 13762,
           "oversized_tiles": 1,
           "merged_features": 0,
-          "valve_dropped_features": 4154,
-          "max_valve_passes": 4
+          "valve_dropped_features": 4144,
+          "max_valve_passes": 4,
+          "valve_passes": 5,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 7,
           "tile_count": 4,
-          "tile_feature_count": 22465,
+          "tile_feature_count": 22490,
           "oversized_tiles": 3,
           "merged_features": 0,
-          "valve_dropped_features": 16916,
-          "max_valve_passes": 6
+          "valve_dropped_features": 16891,
+          "max_valve_passes": 5,
+          "valve_passes": 16,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 8,
           "tile_count": 11,
-          "tile_feature_count": 38533,
+          "tile_feature_count": 38585,
           "oversized_tiles": 4,
           "merged_features": 0,
-          "valve_dropped_features": 32408,
-          "max_valve_passes": 6
+          "valve_dropped_features": 32356,
+          "max_valve_passes": 6,
+          "valve_passes": 29,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 9,
           "tile_count": 28,
-          "tile_feature_count": 92204,
+          "tile_feature_count": 92320,
           "oversized_tiles": 9,
           "merged_features": 0,
-          "valve_dropped_features": 32075,
-          "max_valve_passes": 6
+          "valve_dropped_features": 31959,
+          "max_valve_passes": 7,
+          "valve_passes": 65,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 10,
           "tile_count": 78,
-          "tile_feature_count": 201481,
+          "tile_feature_count": 201502,
           "oversized_tiles": 7,
           "merged_features": 0,
-          "valve_dropped_features": 28149,
-          "max_valve_passes": 6
+          "valve_dropped_features": 28128,
+          "max_valve_passes": 6,
+          "valve_passes": 101,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 11,
           "tile_count": 255,
-          "tile_feature_count": 409709,
+          "tile_feature_count": 409724,
           "oversized_tiles": 10,
           "merged_features": 0,
-          "valve_dropped_features": 15311,
-          "max_valve_passes": 6
+          "valve_dropped_features": 15296,
+          "max_valve_passes": 6,
+          "valve_passes": 292,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 12,
           "tile_count": 905,
-          "tile_feature_count": 736246,
+          "tile_feature_count": 736244,
           "oversized_tiles": 15,
           "merged_features": 0,
-          "valve_dropped_features": 28502,
-          "max_valve_passes": 8
+          "valve_dropped_features": 28504,
+          "max_valve_passes": 8,
+          "valve_passes": 999,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         }
       ],
       "repeats_identical": true,
-      "key": "162865fd617048a0",
+      "key": "9be7859444a66c3e",
       "dataset": "moldova",
       "setting": "before-745",
       "repeats": 3,
       "pmtiles": "moldova.before-745.drop.pmtiles",
-      "pmtiles_mtime_ns": 1792774840687631537
+      "pmtiles_mtime_ns": 1793387817506215354
     },
     "moldova/raw500k": {
       "status": "ok",
       "convert": {
         "wall_s": [
-          2.09,
-          2.09,
-          2.05
+          1.42,
+          1.41,
+          1.41
         ],
-        "median_s": 2.09,
-        "cpu_s": 24.48,
-        "peak_rss_kib": 2622428,
-        "load_before_max": 4.69
+        "median_s": 1.41,
+        "cpu_s": 21.67,
+        "peak_rss_kib": 3874248,
+        "load_before_max": 5.57
       },
       "export": {
         "wall_s": [
-          6.72,
-          6.92,
-          6.72
+          4.0,
+          3.57,
+          3.68
         ],
-        "median_s": 6.72,
-        "cpu_s": 100.86,
-        "peak_rss_kib": 1950320,
-        "load_before_max": 6.19
+        "median_s": 3.68,
+        "cpu_s": 107.71,
+        "peak_rss_kib": 2754440,
+        "load_before_max": 6.15
       },
-      "total_s": 8.81,
-      "overview_bytes": 228467685,
-      "pmtiles_bytes": 85365218,
-      "pmtiles_sha256": "56b06984adcf54670a7d131c7e2c1c8cba5fdf284a6119df589cfc5406d9701b",
-      "merged_features": 901431,
+      "total_s": 5.09,
+      "overview_bytes": 230532526,
+      "pmtiles_bytes": 85308823,
+      "pmtiles_sha256": "bd4f24a81928280ee36913de24211502c78abb2b284dd150cedff6feafa6709c",
+      "merged_features": 927675,
       "valve_dropped_features": 0,
-      "oversized_tiles": 83,
+      "oversized_tiles": 84,
       "zooms": [
         {
           "zoom": 0,
@@ -1044,7 +1558,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 1,
@@ -1053,7 +1571,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 2,
@@ -1062,88 +1584,128 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 3,
           "tile_count": 1,
-          "tile_feature_count": 2554,
+          "tile_feature_count": 2565,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 4,
           "tile_count": 1,
-          "tile_feature_count": 6221,
+          "tile_feature_count": 6227,
           "oversized_tiles": 1,
-          "merged_features": 3082,
+          "merged_features": 3307,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 2,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 5,
           "tile_count": 1,
-          "tile_feature_count": 4812,
+          "tile_feature_count": 4800,
           "oversized_tiles": 1,
-          "merged_features": 22087,
+          "merged_features": 23266,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 3,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 6,
           "tile_count": 2,
-          "tile_feature_count": 9107,
+          "tile_feature_count": 9098,
           "oversized_tiles": 2,
-          "merged_features": 53865,
+          "merged_features": 56005,
           "valve_dropped_features": 0,
-          "max_valve_passes": 4
+          "max_valve_passes": 4,
+          "valve_passes": 6,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 7,
           "tile_count": 4,
-          "tile_feature_count": 14679,
+          "tile_feature_count": 14771,
           "oversized_tiles": 3,
-          "merged_features": 93774,
+          "merged_features": 96560,
           "valve_dropped_features": 0,
-          "max_valve_passes": 4
+          "max_valve_passes": 4,
+          "valve_passes": 11,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 8,
           "tile_count": 11,
-          "tile_feature_count": 30818,
+          "tile_feature_count": 31102,
           "oversized_tiles": 5,
-          "merged_features": 146444,
+          "merged_features": 150384,
           "valve_dropped_features": 0,
-          "max_valve_passes": 9
+          "max_valve_passes": 9,
+          "valve_passes": 30,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 9,
           "tile_count": 28,
-          "tile_feature_count": 79910,
-          "oversized_tiles": 11,
-          "merged_features": 215750,
+          "tile_feature_count": 79143,
+          "oversized_tiles": 12,
+          "merged_features": 224230,
           "valve_dropped_features": 0,
-          "max_valve_passes": 9
+          "max_valve_passes": 8,
+          "valve_passes": 57,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 10,
           "tile_count": 78,
-          "tile_feature_count": 257731,
+          "tile_feature_count": 259712,
           "oversized_tiles": 27,
-          "merged_features": 209853,
+          "merged_features": 218583,
           "valve_dropped_features": 0,
-          "max_valve_passes": 5
+          "max_valve_passes": 5,
+          "valve_passes": 116,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 11,
           "tile_count": 255,
-          "tile_feature_count": 527335,
+          "tile_feature_count": 528570,
           "oversized_tiles": 18,
-          "merged_features": 117915,
+          "merged_features": 116679,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 277,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 12,
@@ -1152,46 +1714,50 @@
           "oversized_tiles": 15,
           "merged_features": 38661,
           "valve_dropped_features": 0,
-          "max_valve_passes": 4
+          "max_valve_passes": 4,
+          "valve_passes": 926,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         }
       ],
       "repeats_identical": true,
-      "key": "c31cedabc530e351",
+      "key": "41e1a02c3c0ab9a4",
       "dataset": "moldova",
       "setting": "raw500k",
       "repeats": 3,
       "pmtiles": "moldova.raw500k.merge.pmtiles",
-      "pmtiles_mtime_ns": 1792774868567424887
+      "pmtiles_mtime_ns": 1793387864132320327
     },
     "moldova/default": {
       "status": "ok",
       "convert": {
         "wall_s": [
-          2.09,
-          2.07,
-          2.01
+          1.4,
+          1.4,
+          1.4
         ],
-        "median_s": 2.07,
-        "cpu_s": 24.61,
-        "peak_rss_kib": 2659968,
-        "load_before_max": 6.04
+        "median_s": 1.4,
+        "cpu_s": 21.67,
+        "peak_rss_kib": 3905764,
+        "load_before_max": 6.06
       },
       "export": {
         "wall_s": [
-          6.55,
-          6.65,
-          6.69
+          3.42,
+          3.43,
+          3.17
         ],
-        "median_s": 6.65,
-        "cpu_s": 90.66,
-        "peak_rss_kib": 1974444,
-        "load_before_max": 6.25
+        "median_s": 3.42,
+        "cpu_s": 94.81,
+        "peak_rss_kib": 2753720,
+        "load_before_max": 5.66
       },
-      "total_s": 8.72,
-      "overview_bytes": 228467685,
-      "pmtiles_bytes": 96038328,
-      "pmtiles_sha256": "482ab6e467d451ef89d16445d452096cf506ca5dba83640c59234285edcced9a",
-      "merged_features": 489695,
+      "total_s": 4.82,
+      "overview_bytes": 230532526,
+      "pmtiles_bytes": 96105923,
+      "pmtiles_sha256": "3ce187a64493167a148fd3e3ce384e6a994af2a1f71649f63bc5d959162618b4",
+      "merged_features": 510899,
       "valve_dropped_features": 0,
       "oversized_tiles": 27,
       "zooms": [
@@ -1202,7 +1768,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 1,
@@ -1211,7 +1781,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 2,
@@ -1220,88 +1794,128 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 3,
           "tile_count": 1,
-          "tile_feature_count": 2554,
+          "tile_feature_count": 2565,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 4,
           "tile_count": 1,
-          "tile_feature_count": 9303,
+          "tile_feature_count": 9534,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 5,
           "tile_count": 1,
-          "tile_feature_count": 15083,
+          "tile_feature_count": 15162,
           "oversized_tiles": 1,
-          "merged_features": 11816,
+          "merged_features": 12904,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 2,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 6,
           "tile_count": 2,
-          "tile_feature_count": 23826,
+          "tile_feature_count": 23893,
           "oversized_tiles": 2,
-          "merged_features": 39136,
+          "merged_features": 41201,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 5,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 7,
           "tile_count": 4,
-          "tile_feature_count": 32531,
+          "tile_feature_count": 32656,
           "oversized_tiles": 3,
-          "merged_features": 75920,
+          "merged_features": 78673,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 10,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 8,
           "tile_count": 11,
-          "tile_feature_count": 59500,
+          "tile_feature_count": 60089,
           "oversized_tiles": 4,
-          "merged_features": 117755,
+          "merged_features": 121390,
           "valve_dropped_features": 0,
-          "max_valve_passes": 4
+          "max_valve_passes": 4,
+          "valve_passes": 20,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 9,
           "tile_count": 28,
-          "tile_feature_count": 156112,
+          "tile_feature_count": 157582,
           "oversized_tiles": 9,
-          "merged_features": 139517,
+          "merged_features": 145757,
           "valve_dropped_features": 0,
-          "max_valve_passes": 4
+          "max_valve_passes": 4,
+          "valve_passes": 42,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 10,
           "tile_count": 78,
-          "tile_feature_count": 366540,
+          "tile_feature_count": 371820,
           "oversized_tiles": 7,
-          "merged_features": 100991,
+          "merged_features": 106421,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 89,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 11,
           "tile_count": 255,
-          "tile_feature_count": 640628,
+          "tile_feature_count": 640635,
           "oversized_tiles": 1,
-          "merged_features": 4560,
+          "merged_features": 4553,
           "valve_dropped_features": 0,
-          "max_valve_passes": 2
+          "max_valve_passes": 2,
+          "valve_passes": 256,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 12,
@@ -1310,46 +1924,50 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 905,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         }
       ],
       "repeats_identical": true,
-      "key": "2dc8ea0a49153ebc",
+      "key": "0e51080f916fe668",
       "dataset": "moldova",
       "setting": "default",
       "repeats": 3,
       "pmtiles": "moldova.default.merge.pmtiles",
-      "pmtiles_mtime_ns": 1792774955988776203
+      "pmtiles_mtime_ns": 1793387939704483107
     },
     "moldova/sf0.25": {
       "status": "ok",
       "convert": {
         "wall_s": [
-          3.43,
-          3.37,
-          3.36
+          2.62,
+          2.69,
+          2.61
         ],
-        "median_s": 3.37,
-        "cpu_s": 86.38,
-        "peak_rss_kib": 3349032,
-        "load_before_max": 5.24
+        "median_s": 2.62,
+        "cpu_s": 81.5,
+        "peak_rss_kib": 4228208,
+        "load_before_max": 6.1
       },
       "export": {
         "wall_s": [
-          7.68,
-          7.78,
-          7.91
+          4.79,
+          4.38,
+          4.87
         ],
-        "median_s": 7.78,
-        "cpu_s": 122.57,
-        "peak_rss_kib": 2125704,
-        "load_before_max": 6.26
+        "median_s": 4.79,
+        "cpu_s": 127.78,
+        "peak_rss_kib": 2757484,
+        "load_before_max": 5.45
       },
-      "total_s": 11.15,
-      "overview_bytes": 315033588,
-      "pmtiles_bytes": 116050628,
-      "pmtiles_sha256": "3bd381dfd83e449dc21f20c0f94181adf65109810dfbf8bc1dab2565aa037df9",
-      "merged_features": 714737,
+      "total_s": 7.41,
+      "overview_bytes": 315035275,
+      "pmtiles_bytes": 115882752,
+      "pmtiles_sha256": "34bf1f6009fc6e2a953a7aa2f390f58241117b1fbb99d265d8a16c8ae660a488",
+      "merged_features": 713194,
       "valve_dropped_features": 0,
       "oversized_tiles": 43,
       "zooms": [
@@ -1360,7 +1978,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 1,
@@ -1369,7 +1991,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 2,
@@ -1378,7 +2004,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 3,
@@ -1387,79 +2017,115 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 4,
           "tile_count": 1,
-          "tile_feature_count": 9743,
+          "tile_feature_count": 9742,
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 5,
           "tile_count": 1,
-          "tile_feature_count": 10300,
+          "tile_feature_count": 10378,
           "oversized_tiles": 1,
-          "merged_features": 18510,
+          "merged_features": 18433,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 3,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 6,
           "tile_count": 2,
-          "tile_feature_count": 19872,
+          "tile_feature_count": 19951,
           "oversized_tiles": 2,
-          "merged_features": 46662,
+          "merged_features": 46587,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 5,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 7,
           "tile_count": 4,
-          "tile_feature_count": 24614,
+          "tile_feature_count": 24797,
           "oversized_tiles": 3,
-          "merged_features": 88576,
+          "merged_features": 88396,
           "valve_dropped_features": 0,
-          "max_valve_passes": 4
+          "max_valve_passes": 4,
+          "valve_passes": 11,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 8,
           "tile_count": 11,
-          "tile_feature_count": 44882,
+          "tile_feature_count": 45131,
           "oversized_tiles": 4,
-          "merged_features": 139368,
+          "merged_features": 139116,
           "valve_dropped_features": 0,
-          "max_valve_passes": 6
+          "max_valve_passes": 6,
+          "valve_passes": 25,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 9,
           "tile_count": 28,
-          "tile_feature_count": 98515,
+          "tile_feature_count": 99055,
           "oversized_tiles": 11,
-          "merged_features": 208006,
+          "merged_features": 207466,
           "valve_dropped_features": 0,
-          "max_valve_passes": 6
+          "max_valve_passes": 6,
+          "valve_passes": 57,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 10,
           "tile_count": 78,
-          "tile_feature_count": 312881,
+          "tile_feature_count": 313277,
           "oversized_tiles": 12,
-          "merged_features": 167071,
+          "merged_features": 166675,
           "valve_dropped_features": 0,
-          "max_valve_passes": 5
+          "max_valve_passes": 5,
+          "valve_passes": 106,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 11,
           "tile_count": 255,
-          "tile_feature_count": 598824,
+          "tile_feature_count": 598847,
           "oversized_tiles": 10,
-          "merged_features": 46544,
+          "merged_features": 46521,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 267,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 12,
@@ -1468,48 +2134,52 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 905,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         }
       ],
       "repeats_identical": true,
-      "key": "01e52de14021806e",
+      "key": "dd1296daf9e5fe24",
       "dataset": "moldova",
       "setting": "sf0.25",
       "repeats": 3,
       "pmtiles": "moldova.sf0.25.merge.pmtiles",
-      "pmtiles_mtime_ns": 1792775051590066811
+      "pmtiles_mtime_ns": 1793388023668660884
     },
     "moldova/sf0": {
       "status": "ok",
       "convert": {
         "wall_s": [
-          3.63,
-          3.62,
-          3.63
+          2.77,
+          2.78,
+          2.76
         ],
-        "median_s": 3.63,
-        "cpu_s": 32.42,
-        "peak_rss_kib": 5243620,
-        "load_before_max": 6.12
+        "median_s": 2.77,
+        "cpu_s": 30.29,
+        "peak_rss_kib": 6301700,
+        "load_before_max": 5.81
       },
       "export": {
         "wall_s": [
-          15.16,
           15.89,
-          14.88
+          19.95,
+          17.5
         ],
-        "median_s": 15.16,
-        "cpu_s": 284.84,
-        "peak_rss_kib": 5738088,
-        "load_before_max": 6.29
+        "median_s": 17.5,
+        "cpu_s": 312.13,
+        "peak_rss_kib": 6081268,
+        "load_before_max": 5.96
       },
-      "total_s": 18.79,
-      "overview_bytes": 629706810,
-      "pmtiles_bytes": 119548646,
-      "pmtiles_sha256": "32a03d8a66d350c6b3881c3755622142816bf9763fff22c1bbe57d07400bb906",
-      "merged_features": 901305,
+      "total_s": 20.27,
+      "overview_bytes": 629707836,
+      "pmtiles_bytes": 119153537,
+      "pmtiles_sha256": "80f68611b14aa2414931506204f02f99dede14255d12852462c955e67bdd9f84",
+      "merged_features": 890931,
       "valve_dropped_features": 0,
-      "oversized_tiles": 68,
+      "oversized_tiles": 67,
       "zooms": [
         {
           "zoom": 0,
@@ -1518,7 +2188,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 1,
@@ -1527,7 +2201,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 2,
@@ -1536,7 +2214,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 3,
@@ -1545,7 +2227,11 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 4,
@@ -1554,70 +2240,102 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 1,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 5,
           "tile_count": 1,
-          "tile_feature_count": 9004,
+          "tile_feature_count": 9441,
           "oversized_tiles": 1,
-          "merged_features": 19811,
+          "merged_features": 19374,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 3,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 6,
           "tile_count": 2,
-          "tile_feature_count": 11943,
+          "tile_feature_count": 12815,
           "oversized_tiles": 2,
-          "merged_features": 54617,
+          "merged_features": 53745,
           "valve_dropped_features": 0,
-          "max_valve_passes": 4
+          "max_valve_passes": 4,
+          "valve_passes": 7,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 7,
           "tile_count": 4,
-          "tile_feature_count": 12548,
+          "tile_feature_count": 14019,
           "oversized_tiles": 3,
-          "merged_features": 100665,
+          "merged_features": 99194,
           "valve_dropped_features": 0,
-          "max_valve_passes": 6
+          "max_valve_passes": 5,
+          "valve_passes": 14,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 8,
           "tile_count": 11,
-          "tile_feature_count": 22414,
+          "tile_feature_count": 23597,
           "oversized_tiles": 5,
-          "merged_features": 161860,
+          "merged_features": 160677,
           "valve_dropped_features": 0,
-          "max_valve_passes": 8
+          "max_valve_passes": 8,
+          "valve_passes": 35,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 9,
           "tile_count": 28,
-          "tile_feature_count": 36040,
-          "oversized_tiles": 15,
-          "merged_features": 270516,
+          "tile_feature_count": 42197,
+          "oversized_tiles": 14,
+          "merged_features": 264355,
           "valve_dropped_features": 0,
-          "max_valve_passes": 11
+          "max_valve_passes": 16,
+          "valve_passes": 114,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 10,
           "tile_count": 78,
-          "tile_feature_count": 232411,
+          "tile_feature_count": 232634,
           "oversized_tiles": 32,
-          "merged_features": 247581,
+          "merged_features": 247358,
           "valve_dropped_features": 0,
-          "max_valve_passes": 6
+          "max_valve_passes": 6,
+          "valve_passes": 149,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 11,
           "tile_count": 255,
-          "tile_feature_count": 599115,
+          "tile_feature_count": 599142,
           "oversized_tiles": 10,
-          "merged_features": 46255,
+          "merged_features": 46228,
           "valve_dropped_features": 0,
-          "max_valve_passes": 3
+          "max_valve_passes": 3,
+          "valve_passes": 267,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         },
         {
           "zoom": 12,
@@ -1626,16 +2344,230 @@
           "oversized_tiles": 0,
           "merged_features": 0,
           "valve_dropped_features": 0,
-          "max_valve_passes": 1
+          "max_valve_passes": 1,
+          "valve_passes": 905,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
         }
       ],
       "repeats_identical": true,
-      "key": "dcc783016cfac2c5",
+      "key": "c1ef8e2dc7447eea",
       "dataset": "moldova",
       "setting": "sf0",
       "repeats": 3,
       "pmtiles": "moldova.sf0.merge.pmtiles",
-      "pmtiles_mtime_ns": 1792775172404172671
+      "pmtiles_mtime_ns": 1793388169860971356
+    },
+    "moldova/fill": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          1.42,
+          1.42,
+          1.42
+        ],
+        "median_s": 1.42,
+        "cpu_s": 21.69,
+        "peak_rss_kib": 3913748,
+        "load_before_max": 5.4
+      },
+      "export": {
+        "wall_s": [
+          28.12,
+          28.35,
+          28.21
+        ],
+        "median_s": 28.21,
+        "cpu_s": 249.79,
+        "peak_rss_kib": 2759912,
+        "load_before_max": 6.34
+      },
+      "total_s": 29.63,
+      "overview_bytes": 230532526,
+      "pmtiles_bytes": 110061853,
+      "pmtiles_sha256": "f65f055b42939d04d4ebfd6a565aef91a304ca9df8199a764fbfde3714d6b815",
+      "merged_features": 510899,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 27,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 40,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 2,
+          "fill_polygons": 5,
+          "fill_vertices": 52,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 1,
+          "tile_count": 1,
+          "tile_feature_count": 161,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 2,
+          "fill_polygons": 7,
+          "fill_vertices": 144,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 2,
+          "tile_count": 1,
+          "tile_feature_count": 647,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 2,
+          "fill_polygons": 30,
+          "fill_vertices": 555,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 3,
+          "tile_count": 1,
+          "tile_feature_count": 2565,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 2,
+          "fill_polygons": 101,
+          "fill_vertices": 2057,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 4,
+          "tile_count": 1,
+          "tile_feature_count": 9534,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2,
+          "valve_passes": 2,
+          "fill_polygons": 372,
+          "fill_vertices": 7634,
+          "fill_shed": 0
+        },
+        {
+          "zoom": 5,
+          "tile_count": 1,
+          "tile_feature_count": 15162,
+          "oversized_tiles": 1,
+          "merged_features": 12904,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3,
+          "valve_passes": 3,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 1264
+        },
+        {
+          "zoom": 6,
+          "tile_count": 2,
+          "tile_feature_count": 23893,
+          "oversized_tiles": 2,
+          "merged_features": 41201,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 5,
+          "valve_passes": 9,
+          "fill_polygons": 9,
+          "fill_vertices": 31798,
+          "fill_shed": 4079
+        },
+        {
+          "zoom": 7,
+          "tile_count": 4,
+          "tile_feature_count": 32656,
+          "oversized_tiles": 3,
+          "merged_features": 78673,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 5,
+          "valve_passes": 17,
+          "fill_polygons": 113,
+          "fill_vertices": 53961,
+          "fill_shed": 11463
+        },
+        {
+          "zoom": 8,
+          "tile_count": 11,
+          "tile_feature_count": 60089,
+          "oversized_tiles": 4,
+          "merged_features": 121390,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 6,
+          "valve_passes": 34,
+          "fill_polygons": 3612,
+          "fill_vertices": 103649,
+          "fill_shed": 25483
+        },
+        {
+          "zoom": 9,
+          "tile_count": 28,
+          "tile_feature_count": 157582,
+          "oversized_tiles": 9,
+          "merged_features": 145757,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 6,
+          "valve_passes": 76,
+          "fill_polygons": 9874,
+          "fill_vertices": 219772,
+          "fill_shed": 64190
+        },
+        {
+          "zoom": 10,
+          "tile_count": 78,
+          "tile_feature_count": 371820,
+          "oversized_tiles": 7,
+          "merged_features": 106421,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 5,
+          "valve_passes": 174,
+          "fill_polygons": 115906,
+          "fill_vertices": 1526919,
+          "fill_shed": 72139
+        },
+        {
+          "zoom": 11,
+          "tile_count": 255,
+          "tile_feature_count": 640635,
+          "oversized_tiles": 1,
+          "merged_features": 4553,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4,
+          "valve_passes": 518,
+          "fill_polygons": 319111,
+          "fill_vertices": 5549619,
+          "fill_shed": 74243
+        },
+        {
+          "zoom": 12,
+          "tile_count": 905,
+          "tile_feature_count": 764734,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1,
+          "valve_passes": 905,
+          "fill_polygons": 0,
+          "fill_vertices": 0,
+          "fill_shed": 0
+        }
+      ],
+      "repeats_identical": true,
+      "key": "b601d98daaa1784e",
+      "dataset": "moldova",
+      "setting": "fill",
+      "repeats": 3,
+      "pmtiles": "moldova.fill.merge.pmtiles",
+      "pmtiles_mtime_ns": 1793388290304228791
     }
   },
   "tippecanoe": {},
@@ -1655,108 +2587,128 @@
             "added": 0.0004095185390149419
           },
           "raw500k": {
-            "missing": 0.15753182069728833,
-            "added": 0.5143552850027671
+            "missing": 0.1562589928057554,
+            "added": 0.5145877144438296
           },
           "default": {
-            "missing": 0.15753182069728833,
-            "added": 0.5143552850027671
+            "missing": 0.1562589928057554,
+            "added": 0.5145877144438296
           },
           "sf0.25": {
-            "missing": 0.15572772551189817,
+            "missing": 0.15577199778638628,
             "added": 0.5136801328168235
           },
           "sf0": {
             "missing": 0.15413392363032652,
             "added": 0.5134587714443829
+          },
+          "fill": {
+            "missing": 0.07040398450470393,
+            "added": 0.5981405644714998
           }
         },
         "4": {
           "before-745": {
-            "missing": 0.9455893746541228,
+            "missing": 0.9456779192030991,
             "added": 0.0076037631433314885
           },
           "raw500k": {
-            "missing": 0.17053680132816823,
-            "added": 0.40318760376314333
+            "missing": 0.16420586607636967,
+            "added": 0.4041837299391256
           },
           "default": {
-            "missing": 0.17051466519092418,
-            "added": 0.40319867183176533
+            "missing": 0.16423907028223575,
+            "added": 0.4041173215273935
           },
           "sf0.25": {
-            "missing": 0.14838959601549528,
-            "added": 0.397830658550083
+            "missing": 0.14848920863309353,
+            "added": 0.3977421140011068
           },
           "sf0": {
             "missing": 0.14162700608743775,
             "added": 0.3976092971776425
+          },
+          "fill": {
+            "missing": 0.06675152185943553,
+            "added": 0.49112340896513557
           }
         },
         "5": {
           "before-745": {
-            "missing": 0.7164028776978417,
-            "added": 0.02935251798561151
+            "missing": 0.7164250138350857,
+            "added": 0.029319313779745435
           },
           "raw500k": {
-            "missing": 0.22272274488101826,
-            "added": 0.25028223574986164
+            "missing": 0.213469839513005,
+            "added": 0.25306032097399006
           },
           "default": {
-            "missing": 0.2227780852241284,
-            "added": 0.250016602102933
+            "missing": 0.21350304371887105,
+            "added": 0.25281682346430545
           },
           "sf0.25": {
-            "missing": 0.13415605976757056,
-            "added": 0.23715550636413946
+            "missing": 0.13438848920863308,
+            "added": 0.23735473159933593
           },
           "sf0": {
             "missing": 0.12345323741007194,
             "added": 0.23598229109020477
+          },
+          "fill": {
+            "missing": 0.21350304371887105,
+            "added": 0.25281682346430545
           }
         },
         "6": {
           "before-745": {
-            "missing": 0.4452573325954621,
+            "missing": 0.44527946873270613,
             "added": 0.042888765910348646
           },
           "raw500k": {
-            "missing": 0.19771997786386275,
-            "added": 0.1440398450470393
+            "missing": 0.1929164360819037,
+            "added": 0.14575539568345325
           },
           "default": {
-            "missing": 0.19775318206972883,
-            "added": 0.1439513004980631
+            "missing": 0.1927282789153293,
+            "added": 0.14567791920309905
           },
           "sf0.25": {
-            "missing": 0.09168788046485889,
-            "added": 0.12812396236856669
+            "missing": 0.09172108467072496,
+            "added": 0.12804648588821252
           },
           "sf0": {
             "missing": 0.08656336469286109,
             "added": 0.12537908135030437
+          },
+          "fill": {
+            "missing": 0.1391698948533481,
+            "added": 0.17312672938572218
           }
         },
         "7": {
           "before-745": {
-            "missing": 0.2978028555835285,
-            "added": 0.042305593211387126
+            "missing": 0.29751236774000456,
+            "added": 0.04235840918293692
           },
           "raw500k": {
-            "missing": 0.12446963961902079,
-            "added": 0.09278885935106776
+            "missing": 0.12295558176792662,
+            "added": 0.09346666431929015
           },
           "default": {
-            "missing": 0.12439041566169609,
-            "added": 0.09268322740796817
+            "missing": 0.12288516047252689,
+            "added": 0.09347546698121512
           },
           "sf0.25": {
-            "missing": 0.059312336050421646,
-            "added": 0.07561486593545888
+            "missing": 0.05926832274079682,
+            "added": 0.0759229591028327
           },
           "sf0": {
             "missing": 0.0616626467843876,
             "added": 0.07502508758648616
+          },
+          "fill": {
+            "missing": 0.09973415960986602,
+            "added": 0.10659143324941463
           }
         }
       }
@@ -1776,42 +2728,50 @@
             "added": 0.02063602831223208
           },
           "raw500k": {
-            "missing": 0.311708703020636,
-            "added": 0.31755723922506895
+            "missing": 0.3072059947496095,
+            "added": 0.3207971953610474
           },
           "default": {
-            "missing": 0.31175024091981524,
-            "added": 0.317607084704084
+            "missing": 0.3072309174891171,
+            "added": 0.32078888778121156
           },
           "sf0.25": {
-            "missing": 0.220881932675373,
-            "added": 0.30213006346990995
+            "missing": 0.22093177815438805,
+            "added": 0.30321004884856945
           },
           "sf0": {
             "missing": 0.2122005117469179,
             "added": 0.3045309540424683
+          },
+          "fill": {
+            "missing": 0.3072309174891171,
+            "added": 0.32078888778121156
           }
         },
         "10": {
           "before-745": {
-            "missing": 0.31462466354301666,
+            "missing": 0.31465789386236004,
             "added": 0.044836008374040476
           },
           "raw500k": {
-            "missing": 0.16883494500382148,
-            "added": 0.09984049446715183
+            "missing": 0.16504668859867744,
+            "added": 0.10232446083806865
           },
           "default": {
-            "missing": 0.168859867743329,
-            "added": 0.09979895656797262
+            "missing": 0.16510484165752834,
+            "added": 0.10215830924135182
           },
           "sf0.25": {
-            "missing": 0.07549097796829828,
-            "added": 0.09145814641278703
+            "missing": 0.0754162097497757,
+            "added": 0.09209783006014688
           },
           "sf0": {
             "missing": 0.0692187551922374,
             "added": 0.07389592263981656
+          },
+          "fill": {
+            "missing": 0.15505267005615925,
+            "added": 0.11155418203568937
           }
         },
         "12": {
@@ -1834,6 +2794,10 @@
           "sf0": {
             "missing": 0.024560812234064963,
             "added": 0.02557189198298016
+          },
+          "fill": {
+            "missing": 0.024560812234064963,
+            "added": 0.02557189198298016
           }
         }
       }
@@ -1853,20 +2817,24 @@
             "added": 0.00025130047998391674
           },
           "raw500k": {
-            "missing": 0.2349408187369638,
-            "added": 0.004850099263689594
+            "missing": 0.22805518558540447,
+            "added": 0.002563264895835951
           },
           "default": {
-            "missing": 0.23448847787299273,
-            "added": 0.004850099263689594
+            "missing": 0.22737667428944788,
+            "added": 0.002563264895835951
           },
           "sf0.25": {
-            "missing": 0.07978790239489357,
-            "added": 0.0023622245118488177
+            "missing": 0.07988842258688714,
+            "added": 0.002110924031864901
           },
           "sf0": {
-            "missing": 0.05242128012464504,
+            "missing": 0.05244641017264343,
             "added": 0.0021360540798632927
+          },
+          "fill": {
+            "missing": 0.0028648254718166514,
+            "added": 0.007614404543512678
           }
         },
         "4": {
@@ -1875,20 +2843,24 @@
             "added": 0.00027643052798230846
           },
           "raw500k": {
-            "missing": 0.14412082527077627,
-            "added": 0.002563264895835951
+            "missing": 0.14228633176689368,
+            "added": 0.0016585831678938507
           },
           "default": {
-            "missing": 0.14409569522277788,
-            "added": 0.002563264895835951
+            "missing": 0.14173347071092907,
+            "added": 0.0016585831678938507
           },
           "sf0.25": {
-            "missing": 0.027919483326213152,
-            "added": 0.0011057221119292338
+            "missing": 0.027818963134219585,
+            "added": 0.001005201919935667
           },
           "sf0": {
-            "missing": 0.00851908627145478,
+            "missing": 0.00854421631945317,
             "added": 0.0008292915839469253
+          },
+          "fill": {
+            "missing": 0.0015078028799035007,
+            "added": 0.00404593772774106
           }
         },
         "5": {
@@ -1897,20 +2869,24 @@
             "added": 0.00022618037885213457
           },
           "raw500k": {
-            "missing": 0.05969748374328527,
-            "added": 0.0013853548204693243
+            "missing": 0.05995193666949392,
+            "added": 0.0010884930732258976
           },
           "default": {
-            "missing": 0.05938648572236359,
-            "added": 0.0013853548204693243
+            "missing": 0.05927339553293752,
+            "added": 0.0010884930732258976
           },
           "sf0.25": {
-            "missing": 0.009301668080294034,
-            "added": 0.0007492225049476958
+            "missing": 0.009245122985581,
+            "added": 0.0007633587786259542
           },
           "sf0": {
-            "missing": 0.0015691263782866836,
+            "missing": 0.001583262651964942,
             "added": 0.0006219960418433701
+          },
+          "fill": {
+            "missing": 0.0007350862312694373,
+            "added": 0.0022476675148430875
           }
         },
         "6": {
@@ -1919,20 +2895,24 @@
             "added": 0.00015903757527778564
           },
           "raw500k": {
-            "missing": 0.02083392236138992,
-            "added": 0.0008729395798580678
+            "missing": 0.020915208233198562,
+            "added": 0.0007775170346913964
           },
           "default": {
             "missing": 0.02073496564788374,
-            "added": 0.0008729395798580678
+            "added": 0.0007775170346913964
           },
           "sf0.25": {
-            "missing": 0.002919223048432243,
-            "added": 0.0003958268540247109
+            "missing": 0.002933359721790268,
+            "added": 0.000417031864061749
           },
           "sf0": {
-            "missing": 0.0004311685374197744,
+            "missing": 0.00043470270575928074,
             "added": 0.00027919929882100147
+          },
+          "fill": {
+            "missing": 0.0003958268540247109,
+            "added": 0.0014419406825185897
           }
         }
       }
@@ -1977,6 +2957,11 @@
           "missing": 1.4139496739962284e-05,
           "added": 0.0,
           "features": 7783
+        },
+        "fill": {
+          "missing": 1.0604622554971711e-05,
+          "added": 5.1255675682363274e-05,
+          "features": 7796
         }
       }
     },
@@ -2000,24 +2985,29 @@
           "features": 1045
         },
         "raw500k": {
-          "missing": 0.01941210580311343,
-          "added": 0.0008028904054596548,
-          "features": 8828
+          "missing": 0.019536999866184932,
+          "added": 0.0007136803604085821,
+          "features": 8840
         },
         "default": {
-          "missing": 0.019376421785093002,
-          "added": 0.0008028904054596548,
-          "features": 18830
+          "missing": 0.019367500780587896,
+          "added": 0.0007136803604085821,
+          "features": 18876
         },
         "sf0.25": {
-          "missing": 0.002890405459654757,
-          "added": 0.0003122351576787546,
-          "features": 16933
+          "missing": 0.0028993264641598644,
+          "added": 0.0003033141531736473,
+          "features": 16934
         },
         "sf0": {
           "missing": 0.0004103662072349347,
           "added": 0.0004282082162451492,
-          "features": 13862
+          "features": 13878
+        },
+        "fill": {
+          "missing": 0.00033899817119407646,
+          "added": 0.0014095187118069495,
+          "features": 19020
         }
       }
     }
@@ -2043,14 +3033,14 @@
               "excess_change": null
             },
             "8": {
-              "median": 0.8960741396741783,
-              "min": 0.6999732477260567,
-              "edge_gap": 0.18059450364554122,
-              "excess_change": 0.0035714285714285587
+              "median": 0.8961987968668983,
+              "min": 0.7001070090957732,
+              "edge_gap": 0.18003365114974762,
+              "excess_change": 0.0050000000000000044
             },
             "10": {
               "median": 0.9722267337989281,
-              "min": 0.6964929531301213,
+              "min": 0.6968207145198295,
               "edge_gap": 0.034220532319391636,
               "excess_change": 0.009285355643078863
             },
@@ -2064,8 +3054,8 @@
           "named": {},
           "sizes": {
             "tiles": 1286,
-            "max_raw": 519098,
-            "max_gz": 315009,
+            "max_raw": 519097,
+            "max_gz": 314808,
             "over_raw": 10,
             "over_gz": 0
           }
@@ -2073,22 +3063,22 @@
         "raw500k": {
           "zooms": {
             "6": {
-              "median": 0.7891276899429074,
-              "min": 0.7859848484848485,
-              "edge_gap": 0.2,
+              "median": 0.7968223905723906,
+              "min": 0.7962962962962963,
+              "edge_gap": 0.17037037037037037,
               "excess_change": null
             },
             "8": {
-              "median": 0.935761834543943,
-              "min": 0.9202782236490101,
+              "median": 0.934945005529273,
+              "min": 0.9221472737492974,
               "edge_gap": 0.06561974200785194,
-              "excess_change": 0.3866666666666667
+              "excess_change": 0.3876333671555515
             },
             "10": {
-              "median": 0.9773081201334817,
-              "min": 0.8321861684693543,
-              "edge_gap": 0.02586268742377502,
-              "excess_change": -0.004946885337225204
+              "median": 0.9774855548914126,
+              "min": 0.8354637823664373,
+              "edge_gap": 0.025755075686921588,
+              "excess_change": -0.005344017755902319
             },
             "12": {
               "median": 0.9945573003791681,
@@ -2100,8 +3090,8 @@
           "named": {},
           "sizes": {
             "tiles": 1289,
-            "max_raw": 534017,
-            "max_gz": 305209,
+            "max_raw": 550172,
+            "max_gz": 305533,
             "over_raw": 1,
             "over_gz": 0
           }
@@ -2109,22 +3099,22 @@
         "default": {
           "zooms": {
             "6": {
-              "median": 0.7858842043624652,
-              "min": 0.7803030303030303,
-              "edge_gap": 0.2,
+              "median": 0.7930345117845118,
+              "min": 0.7897727272727273,
+              "edge_gap": 0.17037037037037037,
               "excess_change": null
             },
             "8": {
-              "median": 0.9358428432240786,
-              "min": 0.9196094168004281,
+              "median": 0.9354436343001531,
+              "min": 0.9213483146067416,
               "edge_gap": 0.06505888951205833,
-              "excess_change": 0.003786945812807918
+              "excess_change": -0.0007748093968883429
             },
             "10": {
-              "median": 0.9773081201334817,
-              "min": 0.8325139298590626,
-              "edge_gap": 0.025790946265872732,
-              "excess_change": -0.009462171528744678
+              "median": 0.9774390243902439,
+              "min": 0.8364470665355621,
+              "edge_gap": 0.02561159337111701,
+              "excess_change": -0.009414728448038479
             },
             "12": {
               "median": 0.9945573003791681,
@@ -2136,8 +3126,8 @@
           "named": {},
           "sizes": {
             "tiles": 1289,
-            "max_raw": 1068495,
-            "max_gz": 505018,
+            "max_raw": 1076292,
+            "max_gz": 509726,
             "over_raw": 0,
             "over_gz": 0
           }
@@ -2145,22 +3135,22 @@
         "sf0.25": {
           "zooms": {
             "6": {
-              "median": 0.8939485434050651,
-              "min": 0.8901515151515151,
+              "median": 0.8973109720392329,
+              "min": 0.8920454545454546,
               "edge_gap": 0.14814814814814814,
               "excess_change": null
             },
             "8": {
-              "median": 0.9703774742158451,
-              "min": 0.9600899381675099,
-              "edge_gap": 0.03309029725182277,
-              "excess_change": 0.18866200199914318
+              "median": 0.970252817023125,
+              "min": 0.9602304665542439,
+              "edge_gap": 0.03365114974761638,
+              "excess_change": 0.17976783708269717
             },
             "10": {
               "median": 0.9893617021276596,
               "min": 0.922648312028843,
               "edge_gap": 0.012195996843389052,
-              "excess_change": -0.0034200288358531283
+              "excess_change": -0.0035286267300655982
             },
             "12": {
               "median": 0.9945573003791681,
@@ -2172,8 +3162,8 @@
           "named": {},
           "sizes": {
             "tiles": 1289,
-            "max_raw": 1177608,
-            "max_gz": 511576,
+            "max_raw": 1177839,
+            "max_gz": 507224,
             "over_raw": 0,
             "over_gz": 0
           }
@@ -2187,16 +3177,16 @@
               "excess_change": null
             },
             "8": {
-              "median": 0.9615487308320134,
+              "median": 0.9614250908715782,
               "min": 0.9546247818499127,
               "edge_gap": 0.04262478968031408,
-              "excess_change": 0.7522501311735662
+              "excess_change": 0.7470973644203474
             },
             "10": {
               "median": 0.9861320470304492,
               "min": 0.909210095050803,
               "edge_gap": 0.016930913264940096,
-              "excess_change": 0.0031697067308014137
+              "excess_change": 0.002814719155366574
             },
             "12": {
               "median": 0.9945573003791681,
@@ -2208,14 +3198,50 @@
           "named": {},
           "sizes": {
             "tiles": 1289,
-            "max_raw": 2707584,
-            "max_gz": 671193,
+            "max_raw": 2703307,
+            "max_gz": 662540,
             "over_raw": 4,
             "over_gz": 4
+          }
+        },
+        "fill": {
+          "zooms": {
+            "6": {
+              "median": 0.8510192504757722,
+              "min": 0.8421900161030595,
+              "edge_gap": 0.13333333333333333,
+              "excess_change": null
+            },
+            "8": {
+              "median": 0.960759862372795,
+              "min": 0.9261637239165329,
+              "edge_gap": 0.0532809871003926,
+              "excess_change": 0.003559757236227923
+            },
+            "10": {
+              "median": 0.9891590358909589,
+              "min": 0.8443133398885612,
+              "edge_gap": 0.014635196212066862,
+              "excess_change": -0.0047480274845511095
+            },
+            "12": {
+              "median": 0.9945573003791681,
+              "min": 0.9626474442988204,
+              "edge_gap": 0.006943360898736152,
+              "excess_change": -0.017528193304406317
+            }
+          },
+          "named": {},
+          "sizes": {
+            "tiles": 1289,
+            "max_raw": 1076292,
+            "max_gz": 509888,
+            "over_raw": 0,
+            "over_gz": 0
           }
         }
       }
     }
   },
-  "elapsed_s": 0.1
+  "elapsed_s": 581.1
 }
