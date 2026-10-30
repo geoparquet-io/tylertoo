@@ -48,6 +48,46 @@ Consequences: #102 (row-group bbox filtering for the tiles pipeline) lost
 its remaining scope; the legacy pipeline's architecture notes were moved to
 [`context/archive/LEGACY_TILES_ARCHITECTURE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/context/archive/LEGACY_TILES_ARCHITECTURE.md).
 
+## Decision Record: Memory Profiles and the Run Budget (#788, 2026-10-30)
+
+One `MemoryBudget` (`overview/memory.rs`) per conversion probes memory once
+(MemAvailable, `TYLERTOO_AUTO_MEM_LIMIT_BYTES`, or the cgroup limit) and sets
+one allowance: 60% of the probed figure less hard reservations (the eager
+input, and under a cgroup limit the spill's page cache when it fits). Every
+elastic phase asks `MemoryBudget::fit(profile, phase, price, want, floor)`
+for units of a price read from the Parquet footers, and each grant is
+charged, so a phase sized later sees only what earlier ones left. Before
+this, the read-ahead, the compute window and the encodes each took their own
+slice of the same allowance and nothing summed them (#716).
+
+The profile decides the grant the same way for every phase. The user
+confirmed this decision:
+
+| Profile | Grant | Meaning |
+| --- | --- | --- |
+| `speed` | `want` | No limit: everything in RAM, every knob at its maximum |
+| `bounded` | `auto`'s grant, cut to main's cap for the phase | Smallest footprint: always spill, and keep main's caps per phase, which the allowance can only shrink. That means at most 4 readers 16 deep, the requested window, 4 encodes, and export and fill at their floors (main held no store there). Never above main's peak |
+| `auto` (default) | what the phase's share affords, within `[floor, want]` | Sized to the machine: every decision fits the allowance, spilling when the output does not, re-checked at runtime (#626) |
+
+In one sentence: **`bounded` keeps main's caps per phase; the allowance can
+only shrink them** (`MemoryPhase::bounded_cap`, plus the read shape's worker
+and depth caps in `read.rs`). A cut that granted `bounded` only each phase's
+floor (one reader, 4 deep) was reverted the same day. It went below main's
+shape, and cost `bounded` wall time for no memory main had not already
+accepted.
+
+`auto` is a third shape, not a router between the other two. Before #788 it
+copied `speed` for the read-ahead depth cap and the encode count. A first
+cut of #788 also sized `bounded` from the allowance, which on a 123 GiB box
+doubled Moldova's pass-2 peak (2.0 to 3.9 GiB). That was reverted: `bounded`
+promises the smallest footprint, and `auto` is the profile that uses the
+machine.
+
+DIVERGENCE FROM TIPPECANOE: tippecanoe has no memory profile. It always
+writes its features to temporary files and sizes its in-memory sort from the
+machine's physical memory. Its behavior is closest to `bounded` with an
+`auto`-sized sort.
+
 ## Design Principles
 
 1. **Overview-first**: the product is the `geo:overviews` GeoParquet format;
@@ -267,8 +307,10 @@ verbatim (spec §2.4).
    sink side each level's `bounded`-profile spill is written by its own
    spill-writer thread behind a `bounded(2)` queue, so the consumer hands the
    batch over instead of encoding it. Output is byte-identical for every worker
-   count; remote inputs read sequentially regardless (their parts share one
-   chunk cache that concurrent readers would evict).
+   count. A remote input reads sequentially (its parts share one chunk cache
+   that concurrent fetching readers would evict) unless pass 0 staged every
+   chunk the read touches to the disk spill. Then it fetches nothing and
+   reads in parallel like a local file (#544, `ConvertSource::reads_locally`).
 
    Under `--profile auto` the sink backing is chosen up front from a
    geometry-only estimate (`auto_backing`), then **checked for the whole

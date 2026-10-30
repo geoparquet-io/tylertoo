@@ -6,11 +6,6 @@
 
 use std::io;
 use std::sync::Mutex;
-#[expect(
-    clippy::disallowed_types,
-    reason = "#733: bounded gzip cache owns process-wide memoization"
-)]
-use std::sync::OnceLock;
 
 use crate::dedup::TileHasher;
 
@@ -20,18 +15,20 @@ use crate::dedup::TileHasher;
 const MAX_RAW_BYTES: usize = 1536;
 const SHARDS: usize = 32;
 const ENTRIES_PER_SHARD: usize = 128;
-/// Process-wide cache payload budget. Charge two allocator headers/padding
-/// conservatively as 64 B per entry. In addition, at most
-/// `SHARDS * ENTRIES_PER_SHARD * size_of::<Entry>()` bytes back the fixed-capacity slot
-/// vectors, plus the static mutexes. With the current Entry this is < 8.25 MiB
-/// total. The cache is lazy, lasts across waves/exports, and will move onto
-/// `MemoryBudget` when the export context owns this resource.
-fn payload_budget() -> usize {
-    // #788 E2: export has no shared mutable MemoryBudget yet. Keep the
-    // fallback in one place until E1 provides its once-per-export grant;
-    // then the cache will accept that configured cap instead of policy.
-    8 * 1024 * 1024
+/// The measured per-shard payload unit an export's budget grants.
+pub(crate) const PAYLOAD_SLICE_BYTES: usize = 256 * 1024;
+/// Shards in the measured 8 MiB working set.
+pub(crate) const PAYLOAD_SLICES: usize = SHARDS;
+
+/// One export's immutable granted cap and byte-verified compression memo.
+/// Payload charges include 64 B per entry for allocation headers/padding;
+/// fixed-capacity entry slots add less than 0.25 MiB at the measured cap.
+/// No configuration or entries are shared with another export.
+pub(crate) struct TileGzipCache {
+    payload_cap: usize,
+    shards: [Mutex<Shard>; SHARDS],
 }
+
 const ALLOCATION_CHARGE: usize = 64;
 
 struct Entry {
@@ -56,7 +53,7 @@ struct Shard {
 }
 
 impl Shard {
-    fn compress(&mut self, hash: u64, raw: &[u8]) -> io::Result<Vec<u8>> {
+    fn compress(&mut self, hash: u64, raw: &[u8], cap: usize) -> io::Result<Vec<u8>> {
         self.clock = self.clock.wrapping_add(1);
         // The hash is only an index hint. Even deliberate collisions must
         // compare raw bytes before sharing the gzip result.
@@ -73,12 +70,11 @@ impl Shard {
         // of one payload do the work once; unrelated shards remain parallel.
         let gzip = super::compress(raw, super::Compression::Gzip)?;
         let charge = raw.len() + gzip.len() + ALLOCATION_CHARGE;
-        if charge > payload_budget() / SHARDS {
+        if charge > cap {
             return Ok(gzip);
         }
         while !self.entries.is_empty()
-            && (self.used + charge > payload_budget() / SHARDS
-                || self.entries.len() == ENTRIES_PER_SHARD)
+            && (self.used + charge > cap || self.entries.len() == ENTRIES_PER_SHARD)
         {
             // Keep frequent uniform tiles through the stream of one-off
             // boundary tiles. Oldest wins ties, deterministically per shard.
@@ -106,35 +102,72 @@ impl Shard {
     }
 }
 
-pub(crate) fn compress(raw: &[u8]) -> io::Result<Vec<u8>> {
-    if raw.len() > MAX_RAW_BYTES {
-        return super::compress(raw, super::Compression::Gzip);
+impl TileGzipCache {
+    pub(crate) fn new(payload_cap: usize) -> Self {
+        Self {
+            payload_cap,
+            shards: std::array::from_fn(|_| Mutex::new(Shard::default())),
+        }
     }
-    #[expect(
-        clippy::disallowed_types,
-        reason = "#733: this bounded content cache is the memoization owner"
-    )]
-    static CACHE: OnceLock<[Mutex<Shard>; SHARDS]> = OnceLock::new();
-    let shards = CACHE.get_or_init(|| std::array::from_fn(|_| Mutex::new(Shard::default())));
-    let hash = TileHasher::hash(raw);
-    shards[hash as usize % SHARDS]
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .compress(hash, raw)
+
+    pub(crate) fn compress(&self, raw: &[u8]) -> io::Result<Vec<u8>> {
+        if raw.len() > MAX_RAW_BYTES {
+            return super::compress(raw, super::Compression::Gzip);
+        }
+        let hash = TileHasher::hash(raw);
+        self.shards[hash as usize % SHARDS]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .compress(hash, raw, self.payload_cap / SHARDS)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Two live exports must keep the caps their respective ledgers granted.
+    #[test]
+    fn export_caches_keep_independent_granted_caps() {
+        let a = TileGzipCache::new(8 * 1024 * 1024);
+        let b = TileGzipCache::new(0);
+        let (bodies, calls) = crate::compression::gzip_counter::measure(|| {
+            [
+                a.compress(b"independent export caps").unwrap(),
+                b.compress(b"independent export caps").unwrap(),
+                a.compress(b"independent export caps").unwrap(),
+                b.compress(b"independent export caps").unwrap(),
+            ]
+        });
+        assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            calls, 3,
+            "cached export: one gzip; zero-cap export: two gzips"
+        );
+    }
+
     #[test]
     fn hash_collisions_compare_raw_bytes() {
         let mut cache = Shard::default();
-        let a = cache.compress(7, b"first tile").unwrap();
-        let b = cache.compress(7, b"other tile").unwrap();
+        let a = cache
+            .compress(7, b"first tile", PAYLOAD_SLICE_BYTES)
+            .unwrap();
+        let b = cache
+            .compress(7, b"other tile", PAYLOAD_SLICE_BYTES)
+            .unwrap();
         assert_ne!(a, b);
-        assert_eq!(cache.compress(7, b"first tile").unwrap(), a);
-        assert_eq!(cache.compress(7, b"other tile").unwrap(), b);
+        assert_eq!(
+            cache
+                .compress(7, b"first tile", PAYLOAD_SLICE_BYTES)
+                .unwrap(),
+            a
+        );
+        assert_eq!(
+            cache
+                .compress(7, b"other tile", PAYLOAD_SLICE_BYTES)
+                .unwrap(),
+            b
+        );
     }
 
     #[test]
@@ -142,17 +175,18 @@ mod tests {
         let mut cache = Shard::default();
         for i in 0..1000u64 {
             let raw = i.to_le_bytes().repeat(MAX_RAW_BYTES / 8);
-            cache.compress(i, &raw).unwrap();
+            cache.compress(i, &raw, PAYLOAD_SLICE_BYTES).unwrap();
             assert_eq!(
                 cache.used,
                 cache.entries.iter().map(Entry::charge).sum::<usize>()
             );
-            assert!(cache.used <= payload_budget() / SHARDS);
+            assert!(cache.used <= PAYLOAD_SLICE_BYTES);
             assert!(cache.entries.len() <= ENTRIES_PER_SHARD);
             assert_eq!(cache.entries.capacity(), ENTRIES_PER_SHARD);
         }
         assert!(
-            payload_budget() + SHARDS * ENTRIES_PER_SHARD * std::mem::size_of::<Entry>()
+            PAYLOAD_SLICE_BYTES * SHARDS
+                + SHARDS * ENTRIES_PER_SHARD * std::mem::size_of::<Entry>()
                 < 33 * 1024 * 1024 / 4
         );
     }

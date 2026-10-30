@@ -1100,13 +1100,6 @@ impl ConvertSource {
     /// no request latency, so it can run on parallel readers like a local
     /// one (#544). `false` when a footer cannot be read, or when the spill
     /// is disabled (it then holds nothing).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the #544 parallel-read gate in overview/read.rs (track C2) calls it"
-        )
-    )]
     pub(crate) fn reads_locally(
         &self,
         row_groups: Option<&RowGroupSelection>,

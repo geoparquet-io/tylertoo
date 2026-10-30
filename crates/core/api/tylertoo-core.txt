@@ -2441,6 +2441,7 @@ pub tylertoo_core::overview::export::ExportOptions::layer_name: alloc::string::S
 pub tylertoo_core::overview::export::ExportOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::overview::export::ExportOptions::min_zoom: core::option::Option<u8>
 pub tylertoo_core::overview::export::ExportOptions::partition_wave: usize
+pub tylertoo_core::overview::export::ExportOptions::profile: tylertoo_core::overview::level::MemoryProfile
 pub tylertoo_core::overview::export::ExportOptions::properties: tylertoo_core::overview::properties::PropertySelection
 pub tylertoo_core::overview::export::ExportOptions::simple_clip_fastpath: bool
 pub tylertoo_core::overview::export::ExportOptions::size_valve: tylertoo_core::overview::export::SizeValve

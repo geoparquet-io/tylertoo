@@ -297,7 +297,7 @@ impl Default for TilesOptions {
 
 /// Export fields the facade derives itself, for
 /// [`check_ignored_export_fields`], with what to set instead. Kept beside [`TilesOptions`]'s docs, which list the same five.
-const FACADE_OWNED_EXPORT_FIELDS: [(ExportField, &str); 5] = [
+const FACADE_OWNED_EXPORT_FIELDS: [(ExportField, &str); 6] = [
     (
         ExportField::LayerName,
         "the facade names the layer; set TilesOptions::layer_name",
@@ -317,6 +317,10 @@ const FACADE_OWNED_EXPORT_FIELDS: [(ExportField, &str); 5] = [
     (
         ExportField::SpillDir,
         "the one scratch directory is convert.spill_dir",
+    ),
+    (
+        ExportField::Profile,
+        "the one memory profile is convert.profile",
     ),
 ];
 
@@ -1059,6 +1063,8 @@ fn convert_to_pmtiles_validated(
         // #427: one scratch knob — the export's member spill goes where the
         // convert's spill (and the intermediate overview) go.
         spill_dir: options.convert.spill_dir.clone(),
+        // #788: one memory profile governs both halves of the run.
+        profile: options.convert.profile,
         ..options.export.clone()
     };
     let export_report =

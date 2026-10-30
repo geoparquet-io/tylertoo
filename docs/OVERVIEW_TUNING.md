@@ -1800,20 +1800,60 @@ The Scaling guide covers [memory profiles](guides/scaling.md#memory-profiles),
 memory limits and `--spill-dir`.
 
 Pass 2 reads Parquet once and pipelines reads, decoding, and simplification
-across all cores. The profile decides where output rows wait before writing.
+across all cores. The profile decides how much memory every phase may hold:
+where output rows wait before writing, how many batches are read ahead and
+processed at once, and how many row groups the writer encodes at once.
 
 | Option | Default | Effect |
 |--------|---------|--------|
-| `--profile speed\|bounded\|auto` | `auto` | Choose RAM buffering or disk spilling |
+| `--profile speed\|bounded\|auto` | `auto` | How much memory the run may hold |
+| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export |
 | `--in-flight-batches N\|auto` | cores, clamped to 4–16 | More batches = more overlap and memory |
-| `--read-workers N\|auto` | cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
+| `--read-workers N\|auto` | pass 1 cores/2, pass 2 cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
 
-- **`speed`** buffers each level's rows in RAM. It runs in the least wall
-  time, with no temp I/O, but peak RAM grows with total *output* size.
-- **`bounded`** spills each level's rows to temporary Arrow IPC files and
-  streams them back at write time, capping peak RAM whatever the output size.
-- **`auto`** spills when the estimated buffered output exceeds 0.6 of
-  available RAM and keeps rows in RAM otherwise.
+- **`speed`** sets no limit. Each level's rows stay in RAM, and every knob
+  runs at its maximum: every requested reader at the full read-ahead depth,
+  the whole compute window, and one row-group encode per thread. It runs in
+  the least wall time with no temp I/O, but peak RAM grows with total
+  *output* size.
+- **`bounded`** holds the least. Each level's rows spill to temporary Arrow
+  IPC files and stream back at write time. Every other phase keeps the caps
+  `bounded` always had, and the allowance can only shrink them: at most 4
+  readers, each at most 16 batches deep, and at most 4 concurrent row-group
+  encodes. The compute window takes what `--in-flight-batches` asks for,
+  within the allowance. Its peak never exceeds what `bounded` used before
+  the run budget existed (#788), whatever the machine.
+- **`auto`**, the default, sizes the run to the machine. Every phase fits
+  inside one allowance: 60% of available memory, or of
+  `TYLERTOO_AUTO_MEM_LIMIT_BYTES` or the cgroup limit when set. The
+  read-ahead, the compute window and the writer's encodes each get a share of
+  it, priced from the Parquet footers and charged in turn, so each phase sees
+  only what the earlier ones left (#716, #545). Output rows stay in RAM when
+  their estimate fits and spill when it does not, and a run that starts in
+  RAM keeps measuring and switches to spilling mid-pass if it outgrows the
+  allowance.
+
+`auto` is a third shape, not a switch between the other two: on a large
+machine it holds more than `bounded` and less than `speed`. On a machine
+with about 90 GB available, Moldova (632k polygons, z0-14) under `auto`
+encodes 64 row groups at once where `bounded` encodes 4. Under a 2 GiB limit
+the same grants shrink: NZ parcels (4.3M polygons) gets 5 encodes and a
+window of 1 batch. To hold `auto` down, set a smaller limit with
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES` or a cgroup memory limit, or use `bounded`.
+
+Under `auto` and `bounded`, each read worker is also charged for the row
+group its reader decodes (the largest selected row group at the footers' decoded row size),
+so inputs with large row groups get fewer readers under a tight limit. Under
+a cgroup limit the kernel charges the spill's page cache to the same limit.
+When the spill's footer-priced size fits the allowance, pass 2 reserves it
+before any grant. When it does not fit, nothing is reserved, because the
+cache cannot hold it and reserving it would only starve the grants.
+`TYLERTOO_PROFILE_JSON` records the decision under `pass2.spill_reservation`.
+
+Release binaries use the mimalloc allocator, which is faster than the
+system allocator but can keep freed memory mapped, so a run's RSS can sit
+above its live heap. That gap is allocator retention, not a leak. `--profile bounded`
+remains the setting for memory-constrained machines.
 
 `bounded` uses LZ4 framing for its private IPC spill streams; `auto` and
 `speed` keep raw IPC, including an `auto` downgrade to disk. The IO facade
