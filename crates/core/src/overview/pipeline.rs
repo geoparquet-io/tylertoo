@@ -2067,6 +2067,8 @@ struct SpillState {
     /// `Pass2Timers::spill_write` at join time, since the thread cannot borrow
     /// the driver's timers).
     handle: Option<std::thread::JoinHandle<Result<SpillWriterDone, ConvertError>>>,
+    #[cfg(test)]
+    materialized_rows: u64,
 }
 
 /// What a finished spill-writer thread hands back.
@@ -2119,6 +2121,8 @@ impl SpillState {
         Ok(SpillState {
             tx: Some(tx),
             handle: Some(handle),
+            #[cfg(test)]
+            materialized_rows: 0,
         })
     }
 
@@ -2133,6 +2137,10 @@ impl SpillState {
     /// never the symptom).
     fn push(&mut self, batch: RecordBatch) -> Result<u64, ConvertError> {
         let bytes = batch.get_array_memory_size() as u64;
+        #[cfg(test)]
+        let rows = batch.column_by_name("geometry").map_or(0, |geometry| {
+            (geometry.len() - geometry.null_count()) as u64
+        });
         let Some(tx) = &self.tx else {
             return Err(internal("spill sink pushed after it was closed"));
         };
@@ -2143,6 +2151,10 @@ impl SpillState {
                             // stream still open, which it cannot do.
             self.join()?;
             return Err(internal("spill writer stopped without reporting an error"));
+        }
+        #[cfg(test)]
+        {
+            self.materialized_rows += rows;
         }
         Ok(bytes)
     }
@@ -2173,6 +2185,8 @@ impl SpillState {
         let done = self
             .join()?
             .ok_or_else(|| internal("spill writer joined twice"))?;
+        #[cfg(test)]
+        spill_tests::record_spill(&done.temp, self.materialized_rows);
         Pass2Timers::add_dur(timers.spill_write_cell(), done.write_time);
         let read_handle = done.temp.reopen()?;
         let reader = StreamReader::try_new(BufReader::new(read_handle), None)?;
@@ -2506,6 +2520,132 @@ mod spill_tests {
     use arrow_schema::{DataType, Field};
     use std::sync::Arc;
 
+    // Observe completed files at the spill owner, rather than treating
+    // get_array_memory_size (the existing profile counter) as disk bytes.
+    // Unique directories isolate simultaneous nextest/plain-cargo tests.
+    type SpillObservations = std::collections::BTreeMap<std::path::PathBuf, Vec<(u64, u64)>>;
+    static OBSERVED: std::sync::Mutex<SpillObservations> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    pub(super) fn record_spill(temp: &NamedTempFile, rows: u64) {
+        if let Some(observations) = OBSERVED
+            .lock()
+            .unwrap()
+            .get_mut(temp.path().parent().unwrap())
+        {
+            observations.push((rows, temp.as_file().metadata().unwrap().len()));
+        }
+    }
+
+    fn measure_verbatim_spill(dir: &Path) -> Vec<(u64, u64)> {
+        use super::super::convert::{
+            convert_to_overviews, ConvertOptions, GeneralizationOverrides, LevelPlan,
+        };
+        use geo::{Geometry, LineString, Polygon};
+
+        const ROWS: usize = 128;
+        let input = dir.join("input.parquet");
+        let output = dir.join("output.parquet");
+        let geoms: Vec<_> = (0..ROWS)
+            .map(|i| {
+                let x = (i % 16) as f64 * 0.1;
+                let y = (i / 16) as f64 * 0.1;
+                Some(Geometry::Polygon(Polygon::new(
+                    LineString::from(vec![
+                        (x, y),
+                        (x + 0.01, y),
+                        (x + 0.01, y + 0.01),
+                        (x, y + 0.01),
+                        (x, y),
+                    ]),
+                    vec![],
+                )))
+            })
+            .collect();
+        super::super::testutil::write_input(&input, &geoms, false, None);
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 9,
+                max_zoom: 13,
+            },
+            profile: MemoryProfile::Bounded,
+            spill_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        }
+        .with_generalization(&GeneralizationOverrides::default(), true)
+        .unwrap();
+        OBSERVED
+            .lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), Vec::new());
+        let report = convert_to_overviews(&input, &output, &options).unwrap();
+        assert_eq!(report.levels.len(), 5);
+        assert!(report
+            .levels
+            .iter()
+            .all(|level| level.feature_count == ROWS));
+        let observations = OBSERVED.lock().unwrap().remove(dir).unwrap();
+        assert!(
+            !observations.is_empty(),
+            "bounded workload must exercise spill"
+        );
+        assert!(observations.iter().all(|&(_, bytes)| bytes > 0));
+        eprintln!(
+            "phase1 verbatim: rows/files={observations:?}, output_bytes={}",
+            std::fs::metadata(output).unwrap().len()
+        );
+        observations
+    }
+
+    /// #715: a fixed compressible batch must not consume its full raw payload
+    /// on disk. The bound leaves room for IPC framing and either candidate
+    /// encoding; it is independent of elapsed time and allocator capacity.
+    #[test]
+    fn phase1_spill_bytes_per_level_are_below_raw_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = schema("id");
+        let mut sink = SpillState::new(&s, Some(dir.path())).unwrap();
+        const ROWS: usize = 65536;
+        sink.push(batch(&s, vec![0; ROWS])).unwrap();
+        let (reader, temp) = sink.into_reader(&Pass2Timers::default()).unwrap();
+        let disk_bytes = temp.as_file().metadata().unwrap().len();
+        assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), ROWS);
+        assert!(
+            disk_bytes <= (ROWS * size_of::<i64>() / 2) as u64,
+            "#715: one level wrote {disk_bytes} disk bytes for {} raw bytes",
+            ROWS * size_of::<i64>()
+        );
+    }
+
+    /// #499: count non-null geometry payloads handed to completed spill files on the real
+    /// convert path. Every polygon is unchanged at all five verbatim levels;
+    /// a canonical payload plus references should materialize it only once
+    /// across the four buffered levels. Final public overview rows stay 5N.
+    #[test]
+    fn phase1_unchanged_geometry_spills_once_across_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let observations = measure_verbatim_spill(dir.path());
+        let materializations: u64 = observations.iter().map(|&(rows, _)| rows).sum();
+        assert!(materializations <= 128,
+            "#499: 128 unchanged features materialized {materializations} geometry rows across four buffered levels");
+    }
+
+    /// The current preflight ignores even a measured pass-2 footprint for a
+    /// local source. The injected free-space probe avoids filling a volume.
+    #[test]
+    fn phase1_local_preflight_covers_actual_pass2_spill() {
+        let dir = tempfile::tempdir().unwrap();
+        let observations = measure_verbatim_spill(dir.path());
+        let actual_bytes: u64 = observations.iter().map(|&(_, bytes)| bytes).sum();
+        let available = actual_bytes / 2;
+        let warning =
+            super::super::convert::spill_space_check(false, actual_bytes, dir.path(), |_| {
+                Some(available)
+            });
+        assert!(warning.is_some(),
+            "local preflight returned no warning for {actual_bytes} measured spill bytes with only {available} bytes available");
+    }
+
     fn schema(name: &str) -> Schema {
         Schema::new(vec![Field::new(name, DataType::Int64, false)])
     }
@@ -2581,6 +2721,37 @@ mod spill_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// #709's error path, using the real OS error instead of a string stand-in.
+    /// The Python regression separately checks that the warning was already
+    /// raised before this cause crosses the frontend error mapping.
+    #[cfg(unix)]
+    #[test]
+    fn phase1_spill_enospc_preserves_the_os_error() {
+        struct FullVolume(FailsAfter);
+        impl std::io::Write for FullVolume {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .write(buf)
+                    .map_err(|_| std::io::Error::from_raw_os_error(28))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let s = schema("id");
+        let writer = StreamWriter::try_new(FullVolume(FailsAfter { remaining: 512 }), &s).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink =
+            SpillState::spawn(writer, spill_temp_file(Some(dir.path())).unwrap()).unwrap();
+        sink.push(batch(&s, vec![0; 4096])).unwrap();
+        let error = sink.into_reader(&Pass2Timers::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("No space left on device"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     /// A writer that fails mid-stream must surface ITS error, not a derived
