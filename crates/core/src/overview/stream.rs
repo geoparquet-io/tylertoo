@@ -198,10 +198,7 @@ pub(crate) enum Pass2Strategy {
 /// so staging never regresses correctness.
 ///
 /// The requests in flight hold their bytes in memory until they land, so
-/// they are granted from the run's `budget` (#788, [`MemoryPhase::Stage`]):
-/// up to the concurrency ceiling (or what `TYLERTOO_STAGING_MEM_BUDGET_BYTES`
-/// fits) of the plan's largest request, never fewer than one, and released
-/// when staging ends.
+/// they are granted from the run's `budget` ([`stage_granted`]).
 ///
 /// Returns the `pass0` record of the profile dump: `None` for local input,
 /// or when staging stopped on an error (the warning says which).
@@ -212,28 +209,13 @@ fn stage_input_pass0(
     budget: &mut MemoryBudget,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Option<Pass0Record> {
-    use super::memory::{Price, PriceBasis};
     if !source.is_remote() {
         return None;
     }
     let t_stage = Instant::now();
     let staged = source.staging_plan(selected_row_groups).and_then(|plan| {
-        let largest = plan.largest_request().max(1);
-        let (ceiling, budget_override) = crate::input::staging_want();
-        let want = budget_override.map_or(ceiling, |bytes| {
-            usize::try_from(bytes / largest)
-                .unwrap_or(usize::MAX)
-                .clamp(1, ceiling.max(1))
-        });
-        let grant = budget.fit(
-            MemoryPhase::Stage,
-            Price::new(largest, PriceBasis::Footer),
-            want,
-            1,
-        );
-        let report = source.stage_within(&plan, Some(grant.bytes()));
-        budget.release(grant);
-        Ok((plan.bytes_to_stage(), report?))
+        let report = stage_granted(source, &plan, budget)?;
+        Ok((plan.bytes_to_stage(), report))
     });
     match staged {
         Ok((bytes_to_stage, report)) => {
@@ -268,6 +250,36 @@ fn stage_input_pass0(
             None
         }
     }
+}
+
+/// Fetch `plan` with its requests in flight granted from `budget` (#788,
+/// [`MemoryPhase::Stage`]): units of the plan's largest request (a footer
+/// price), up to the concurrency ceiling, or what
+/// `TYLERTOO_STAGING_MEM_BUDGET_BYTES` fits when that is set, never fewer
+/// than one. The grant is released when staging ends. Pass 0 and the
+/// `--max-zoom auto` sample both stage through it.
+pub(super) fn stage_granted(
+    source: &ConvertSource,
+    plan: &crate::input_set::StagingPlan,
+    budget: &mut MemoryBudget,
+) -> Result<crate::input::StagingReport, crate::input::InputError> {
+    use super::memory::{Price, PriceBasis};
+    let largest = plan.largest_request().max(1);
+    let (ceiling, budget_override) = crate::input::staging_want();
+    let want = budget_override.map_or(ceiling, |bytes| {
+        usize::try_from(bytes / largest)
+            .unwrap_or(usize::MAX)
+            .clamp(1, ceiling.max(1))
+    });
+    let grant = budget.fit(
+        MemoryPhase::Stage,
+        Price::new(largest, PriceBasis::Footer),
+        want,
+        1,
+    );
+    let report = source.stage_within(plan, grant.bytes());
+    budget.release(grant);
+    report
 }
 
 /// What pass 0 did (#788): the `pass0` record of the `TYLERTOO_PROFILE_JSON`

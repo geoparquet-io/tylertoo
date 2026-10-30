@@ -1076,45 +1076,21 @@ impl ConvertSource {
         Ok(self.staging_plan(selection)?.bytes_to_stage())
     }
 
-    /// Fetch `plan` into each remote part's disk spill (pass 0).
+    /// Fetch `plan` into each remote part's disk spill, holding at most
+    /// `budget` bytes of requests in flight (the caller's memory-budget
+    /// grant, #788).
     ///
     /// # Errors
     ///
-    /// Returns an [`InputError`] if a fetch fails.
-    pub(crate) fn stage(
-        &self,
-        plan: &StagingPlan,
-    ) -> Result<crate::input::StagingReport, InputError> {
-        self.stage_within(plan, None)
-    }
-
-    /// [`Self::stage`] with the admission's byte budget set by the caller
-    /// (the run's memory-budget grant, #788) instead of the staging
-    /// tunables'.
+    /// Returns an [`InputError`] if a fetch fails in a way a retry cannot
+    /// fix.
     pub(crate) fn stage_within(
         &self,
         plan: &StagingPlan,
-        budget: Option<u64>,
+        budget: u64,
     ) -> Result<crate::input::StagingReport, InputError> {
         let parts: Vec<_> = self.parts().iter().zip(&plan.parts).collect();
         crate::input::stage_parts(&parts, budget)
-    }
-
-    /// Stage the chunks one read plan will read (its row groups, its
-    /// columns) before the read opens, so a remote read fetches them as
-    /// concurrent, coalescable requests instead of one chunk at a time on
-    /// the reader's lazy path. A no-op for local input.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`InputError`] if a footer cannot be read or a fetch fails
-    /// in a way a retry cannot fix.
-    pub(crate) fn stage_read(
-        &self,
-        plan: &ReadPlan<'_>,
-    ) -> Result<crate::input::StagingReport, InputError> {
-        let staging = self.staging_plan_for(plan.row_groups, plan.projection)?;
-        self.stage(&staging)
     }
 
     /// Whether a read of `row_groups` (`None` = all) and `projection` (as in
@@ -1170,7 +1146,8 @@ impl ConvertSource {
     /// writing them to the spill fails.
     pub fn stage_selected(&self, selection: Option<&RowGroupSelection>) -> Result<(), InputError> {
         let plan = self.staging_plan(selection)?;
-        self.stage(&plan).map(|_| ())
+        self.stage_within(&plan, crate::input::unbudgeted_stage_admission())
+            .map(|_| ())
     }
 
     /// Open a sequential batch stream over all parts (see [`SourceStream`]).
@@ -3334,12 +3311,9 @@ mod staging_counter_tests {
         let rg1 = RowGroupSelection::from_parts(vec![vec![1]]);
         assert!(!src.reads_locally(None, None), "nothing staged yet");
 
-        src.stage_read(&ReadPlan {
-            batch_size: 1024,
-            projection: Some(&[0, 2]),
-            row_groups: None,
-        })
-        .unwrap();
+        let plan = src.staging_plan_for(None, Some(&[0, 2])).unwrap();
+        src.stage_within(&plan, crate::input::unbudgeted_stage_admission())
+            .unwrap();
         assert!(src.reads_locally(None, Some(&[0, 2])));
         assert!(src.reads_locally(None, Some(&[2])));
         assert!(src.reads_locally(Some(&rg1), Some(&[0])));

@@ -442,7 +442,7 @@ impl InputSource {
     /// to the spill fails.
     pub fn stage_row_groups(&self, selected: Option<&[usize]>) -> Result<(), InputError> {
         let plan = self.plan_staging(selected, None)?;
-        stage_parts(&[(self, &plan)], None).map(|_| ())
+        stage_parts(&[(self, &plan)], unbudgeted_stage_admission()).map(|_| ())
     }
 
     /// This part's share of a pass-0 staging plan (#788): the column chunks
@@ -500,7 +500,7 @@ impl InputSource {
 )]
 pub(crate) fn stage_parts(
     parts: &[(&InputSource, &PartStaging)],
-    budget: Option<u64>,
+    budget: u64,
 ) -> Result<StagingReport, InputError> {
     #[cfg(not(feature = "remote"))]
     {
@@ -571,6 +571,21 @@ impl PartStaging {
     pub(crate) fn largest_request(&self) -> u64 {
         self.largest_request
     }
+}
+
+/// The staging admission's byte budget for a caller that holds no run
+/// memory budget: `TYLERTOO_STAGING_MEM_BUDGET_BYTES`, else the fixed
+/// default. The ONLY remaining un-budgeted admission (#788): the public
+/// [`crate::input_set::ConvertSource::stage_selected`] and
+/// [`InputSource::stage_row_groups`] stage through it. A conversion's pass 0
+/// and the `--max-zoom auto` sample are granted from the run's
+/// `MemoryBudget` instead. Replacing this with a grant is a one-line change
+/// here once those entry points have a budget to ask.
+pub(crate) fn unbudgeted_stage_admission() -> u64 {
+    #[cfg(feature = "remote")]
+    return remote::unbudgeted_stage_admission();
+    #[cfg(not(feature = "remote"))]
+    0
 }
 
 /// How many staging requests a run wants in flight, and the byte budget
@@ -2096,23 +2111,24 @@ pub(crate) mod remote {
     /// in flight (so a request larger than the budget still runs, alone).
     /// This replaces the per-part `budget / largest span` concurrency, under
     /// which one large span throttled every other span of its part.
-    /// `budget` (granted by the run's memory budget, #788) replaces the
-    /// tunables' byte budget for the admission; `None` keeps it.
+    /// `budget` (a memory-budget grant, #788, or
+    /// [`super::unbudgeted_stage_admission`]) is the admission's byte budget.
     pub(crate) fn stage_parts(
         parts: &[(&RemoteSource, &PartPlan)],
-        budget: Option<u64>,
+        budget: u64,
     ) -> Result<super::StagingReport, InputError> {
-        let tunables = staging_tunables::effective();
-        match budget {
-            Some(mem_budget) => stage_parts_with(
-                parts,
-                &staging_tunables::StagingTunables {
-                    mem_budget,
-                    ..*tunables
-                },
-            ),
-            None => stage_parts_with(parts, tunables),
-        }
+        stage_parts_with(
+            parts,
+            &staging_tunables::StagingTunables {
+                mem_budget: budget,
+                ..*staging_tunables::effective()
+            },
+        )
+    }
+
+    /// See [`super::unbudgeted_stage_admission`].
+    pub(crate) fn unbudgeted_stage_admission() -> u64 {
+        staging_tunables::effective().mem_budget
     }
 
     /// See [`super::staging_want`].
