@@ -2317,9 +2317,38 @@ pub(crate) mod remote {
         /// at file creation, i.e. on the first spilled chunk.
         dir: Option<PathBuf>,
         /// Chunks staged as sub-range pieces (#727 §1) that are still
-        /// missing bytes: `chunk.start` → (reserved offset, bytes missing).
-        /// A chunk joins `index` only once all of its pieces have landed.
-        pending: std::collections::HashMap<u64, (u64, usize)>,
+        /// missing bytes. A chunk joins `index` only once all of its pieces
+        /// have landed.
+        pending: std::collections::HashMap<u64, PendingChunk>,
+    }
+
+    /// A chunk whose pieces are still landing (#727 §1): its reserved slot
+    /// and the byte ranges (within the chunk) written so far, sorted and
+    /// disjoint. Ranges, not a byte count: a second staging of a partly
+    /// staged chunk fetches every piece again, and a piece that lands twice
+    /// must not count as the bytes of one that never did.
+    #[derive(Debug)]
+    struct PendingChunk {
+        offset: u64,
+        len: usize,
+        landed: Vec<Range<usize>>,
+    }
+
+    impl PendingChunk {
+        /// Record `piece` as written; `true` once every byte is in.
+        fn land(&mut self, piece: Range<usize>) -> bool {
+            let mut merged = piece;
+            self.landed.retain(|r| {
+                let touches = r.start <= merged.end && merged.start <= r.end;
+                if touches {
+                    merged = merged.start.min(r.start)..merged.end.max(r.end);
+                }
+                !touches
+            });
+            let at = self.landed.partition_point(|r| r.start < merged.start);
+            self.landed.insert(at, merged);
+            self.landed.iter().map(|r| r.len()).sum::<usize>() >= self.len
+        }
     }
 
     /// #273: the warning to emit when `dir` (the resolved spill directory)
@@ -2390,12 +2419,18 @@ pub(crate) mod remote {
                 return;
             }
             let offset = match self.pending.get(&piece.chunk_start) {
-                Some(&(offset, _)) => offset,
+                Some(p) => p.offset,
                 None => {
                     let offset = self.write_offset;
                     self.write_offset += piece.chunk_len as u64;
-                    self.pending
-                        .insert(piece.chunk_start, (offset, piece.chunk_len));
+                    self.pending.insert(
+                        piece.chunk_start,
+                        PendingChunk {
+                            offset,
+                            len: piece.chunk_len,
+                            landed: Vec::new(),
+                        },
+                    );
                     offset
                 }
             };
@@ -2408,11 +2443,10 @@ pub(crate) mod remote {
                 self.disabled = true;
                 return;
             }
-            let Some(missing) = self.pending.get_mut(&piece.chunk_start) else {
+            let Some(pending) = self.pending.get_mut(&piece.chunk_start) else {
                 return;
             };
-            missing.1 = missing.1.saturating_sub(piece.len);
-            if missing.1 == 0 {
+            if pending.land(piece.at..piece.at + piece.len) {
                 self.pending.remove(&piece.chunk_start);
                 self.index
                     .insert(piece.chunk_start, (offset, piece.chunk_len));
@@ -3209,16 +3243,13 @@ pub(crate) mod remote {
             assert_eq!(requests, 5);
         }
 
-        /// #727 §1: a chunk larger than the request cap (here the 1 MiB
-        /// budget floor) is fetched as sub-range requests whose pieces
-        /// reassemble into one spill slot, and the read is served from it.
-        #[test]
-        fn an_oversized_chunk_is_fetched_in_pieces_and_reassembled() {
+        /// One row group holding one uncompressed, non-dictionary 2.4 MB
+        /// chunk: `(file, values, chunk start, chunk length)`.
+        fn one_big_chunk_parquet() -> (Vec<u8>, Vec<i64>, u64, u64) {
             use arrow_array::{Int64Array, RecordBatch};
             use std::sync::Arc;
             use tylertoo_io::test_support::WriterProperties;
 
-            // One row group, one uncompressed, non-dictionary 2.4 MB chunk.
             let n = 300_000i64;
             let values: Vec<i64> = (0..n)
                 .map(|i| i.wrapping_mul(0x5851_F42D_4C95_7F2D))
@@ -3243,7 +3274,32 @@ pub(crate) mod remote {
             w.close().unwrap();
             let md =
                 tylertoo_io::read_parquet_metadata(&bytes::Bytes::from(bytes.clone())).unwrap();
-            let chunk_len = md.row_group(0).column(0).byte_range().1;
+            let (chunk_start, chunk_len) = md.row_group(0).column(0).byte_range();
+            (bytes, values, chunk_start, chunk_len)
+        }
+
+        /// Every value of column 0, read through `source`.
+        fn read_values(source: &InputSource) -> Vec<i64> {
+            let reader = source.open().unwrap().build().unwrap();
+            let mut got = Vec::new();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap();
+                got.extend(col.values().iter().copied());
+            }
+            got
+        }
+
+        /// #727 §1: a chunk larger than the request cap (here the 1 MiB
+        /// budget floor) is fetched as sub-range requests whose pieces
+        /// reassemble into one spill slot, and the read is served from it.
+        #[test]
+        fn an_oversized_chunk_is_fetched_in_pieces_and_reassembled() {
+            let (bytes, values, _, chunk_len) = one_big_chunk_parquet();
             let budget = 1024 * 1024u64;
             assert!(
                 chunk_len > 2 * budget,
@@ -3269,22 +3325,68 @@ pub(crate) mod remote {
             );
 
             let before = source.fetch_stats().unwrap().requests;
-            let reader = source.open().unwrap().build().unwrap();
-            let mut got = Vec::new();
-            for batch in reader {
-                let batch = batch.unwrap();
-                let col = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()
-                    .unwrap();
-                got.extend(col.values().iter().copied());
-            }
-            assert_eq!(got, values, "pieces reassemble into the exact chunk");
+            assert_eq!(
+                read_values(&source),
+                values,
+                "pieces reassemble into the exact chunk"
+            );
             assert_eq!(
                 source.fetch_stats().unwrap().requests,
                 before,
                 "the reassembled chunk is served from the spill"
+            );
+        }
+
+        /// A second staging of a partly staged chunk fetches all of its
+        /// pieces again; a piece that already landed must not count as the
+        /// one still missing. Here the first piece fails (twice, so the retry
+        /// fails too) in two stagings in a row: the chunk must stay out of
+        /// the spill, so the read fetches it rather than serving a hole, and
+        /// a third staging that lands every piece completes it.
+        #[test]
+        fn restaging_a_partial_chunk_never_publishes_it_incomplete() {
+            use crate::input::probe_store::ProbeStore;
+
+            let (bytes, values, chunk_start, chunk_len) = one_big_chunk_parquet();
+            let budget = 1024 * 1024u64;
+            assert!(chunk_len > 2 * budget, "need at least three pieces");
+            let store = ProbeStore::new(&[("p.parquet", bytes)], std::time::Duration::ZERO);
+            let source = store.source("p.parquet");
+            let InputSource::Remote(r) = &source else {
+                unreachable!()
+            };
+            let _ = source.open().unwrap();
+            let tunables = StagingTunables {
+                mem_budget: budget,
+                ..StagingTunables::default()
+            };
+            for _ in 0..2 {
+                store.fail_next_gets_at("p.parquet", chunk_start, 2);
+                r.stage_row_groups_with(None, &tunables).unwrap();
+            }
+            assert_eq!(store.failed(), 4, "the first piece failed in both stagings");
+            assert_eq!(
+                read_values(&source),
+                values,
+                "a chunk missing its first piece is fetched, not served from the spill"
+            );
+
+            let fresh = store.source("p.parquet");
+            let InputSource::Remote(r) = &fresh else {
+                unreachable!()
+            };
+            let _ = fresh.open().unwrap();
+            for _ in 0..2 {
+                store.fail_next_gets_at("p.parquet", chunk_start, 2);
+                r.stage_row_groups_with(None, &tunables).unwrap();
+            }
+            r.stage_row_groups_with(None, &tunables).unwrap();
+            let before = fresh.fetch_stats().unwrap().requests;
+            assert_eq!(read_values(&fresh), values);
+            assert_eq!(
+                fresh.fetch_stats().unwrap().requests,
+                before,
+                "once every piece has landed the chunk is served from the spill"
             );
         }
 
@@ -3735,8 +3837,10 @@ pub(crate) mod probe_store {
     struct Counters {
         in_flight: usize,
         max_in_flight: usize,
-        /// `(object, remaining)`: fail this many more GETs of `object`.
-        fail: Vec<(Path, usize)>,
+        /// `(object, range start, remaining)`: fail this many more GETs of
+        /// `object` (only those of a range starting at `range start`, when
+        /// set).
+        fail: Vec<(Path, Option<u64>, usize)>,
         failed: usize,
     }
 
@@ -3793,7 +3897,15 @@ pub(crate) mod probe_store {
 
         /// Fail the next `n` GETs of object `name`.
         pub(crate) fn fail_next_gets(&self, name: &str, n: usize) {
-            self.counters().fail.push((Path::from(name), n));
+            self.counters().fail.push((Path::from(name), None, n));
+        }
+
+        /// Fail the next `n` GETs of object `name` whose range starts at
+        /// `start`: one chosen request, whatever order the rest land in.
+        pub(crate) fn fail_next_gets_at(&self, name: &str, start: u64, n: usize) {
+            self.counters()
+                .fail
+                .push((Path::from(name), Some(start), n));
         }
 
         /// The most GETs ever in flight at once, then reset it to zero.
@@ -3827,13 +3939,19 @@ pub(crate) mod probe_store {
         }
 
         async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            let start = match &options.range {
+                Some(object_store::GetRange::Bounded(r)) => Some(r.start),
+                _ => None,
+            };
             let fail = {
                 let mut c = self.counters();
                 let hit = c
                     .fail
                     .iter_mut()
-                    .find(|(p, n)| p == location && *n > 0)
-                    .map(|(_, n)| *n -= 1)
+                    .find(|(p, at, n)| {
+                        p == location && *n > 0 && at.is_none_or(|a| Some(a) == start)
+                    })
+                    .map(|(_, _, n)| *n -= 1)
                     .is_some();
                 c.failed += usize::from(hit);
                 c.in_flight += 1;
