@@ -66,8 +66,15 @@ confirmed this decision:
 | Profile | Grant | Meaning |
 | --- | --- | --- |
 | `speed` | `want` | No limit: everything in RAM, every knob at its maximum |
-| `bounded` | `floor` | Smallest footprint: always spill, one reader at the minimum depth, a window of one batch, at most 4 encodes, and export and fill at their floors. Never above main's peak |
+| `bounded` | `auto`'s grant, cut to main's cap for the phase | Smallest footprint: always spill, and keep main's caps per phase, which the allowance can only shrink. That means at most 4 readers 16 deep, the requested window, 4 encodes, and export and fill at their floors (main held no store there). Never above main's peak |
 | `auto` (default) | what the phase's share affords, within `[floor, want]` | Sized to the machine: every decision fits the allowance, spilling when the output does not, re-checked at runtime (#626) |
+
+In one sentence: **`bounded` keeps main's caps per phase; the allowance can
+only shrink them** (`MemoryPhase::bounded_cap`, plus the read shape's worker
+and depth caps in `read.rs`). A cut that granted `bounded` only each phase's
+floor (one reader, 4 deep) was reverted the same day. It went below main's
+shape, and cost `bounded` wall time for no memory main had not already
+accepted.
 
 `auto` is a third shape, not a router between the other two. Before #788 it
 copied `speed` for the read-ahead depth cap and the encode count. A first

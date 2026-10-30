@@ -13,11 +13,13 @@
 //! The [`MemoryProfile`] decides what `fit` grants, the same way for every
 //! phase:
 //!
-//! - `bounded` takes the phase's floor: the smallest footprint, never more
-//!   than main's (#788).
+//! - `bounded` keeps main's caps per phase; the allowance can only shrink
+//!   them ([`MemoryPhase::bounded_cap`], #788).
 //! - `auto` takes what the phase's share of the allowance affords, clamped
 //!   to the phase's floor and what it wants.
 //! - `speed` takes what it wants.
+//!
+//! Every profile gets at least the phase's floor.
 
 use super::assign::FeatureTable;
 use super::convert::ConvertError;
@@ -109,6 +111,28 @@ impl MemoryPhase {
             Self::ExportCollect => "export collect",
             Self::ExportEncode => "export encode",
             Self::Fill => "coverage fill",
+        }
+    }
+
+    /// Main's `bounded` cap for this phase, out of `want` units with `floor`
+    /// at the least: what a `bounded` grant may never exceed (#788). The
+    /// read-ahead and the compute window wanted what the caller asked for
+    /// and were cut by the allowance, as now, so their cap is `want` (the
+    /// read shape applies main's per-worker caps itself, `read.rs`). The
+    /// writer encoded at most [`ENCODE_FLOOR`] row groups, which is the
+    /// encode floor. Export and fill held no store under `bounded`: their
+    /// floor is main's shape.
+    fn bounded_cap(self, want: usize, floor: usize) -> usize {
+        match self {
+            Self::Encode | Self::ExportCollect | Self::ExportEncode | Self::Fill => floor,
+            Self::EagerInput
+            | Self::Scan
+            | Self::Assign
+            | Self::Stage
+            | Self::Read
+            | Self::Compute
+            | Self::Write
+            | Self::Spill => want,
         }
     }
 
@@ -286,10 +310,10 @@ impl MemoryBudget {
         }
     }
     /// Units of `price` that `phase` may hold under `profile`, at least 1. A
-    /// query: it charges nothing. `bounded` affords 1, so a caller that
-    /// sizes itself from this lands on its own floor; `speed` affords
-    /// everything; `auto` affords what `phase`'s share of the current
-    /// allowance holds.
+    /// query: it charges nothing. `speed` affords everything; `auto` and
+    /// `bounded` what `phase`'s share of the current allowance holds
+    /// (`bounded` then applies main's caps on top, in [`fit`](Self::fit) and
+    /// the read shape).
     pub(super) fn affordable(
         &self,
         profile: MemoryProfile,
@@ -297,9 +321,8 @@ impl MemoryBudget {
         price: Price,
     ) -> usize {
         match profile {
-            MemoryProfile::Bounded => 1,
             MemoryProfile::Speed => usize::MAX,
-            MemoryProfile::Auto => {
+            MemoryProfile::Auto | MemoryProfile::Bounded => {
                 let ceiling = (self.remaining() as f64 * phase.share()) as u64;
                 usize::try_from(ceiling / price.bytes.max(1))
                     .unwrap_or(usize::MAX)
@@ -308,9 +331,10 @@ impl MemoryBudget {
         }
     }
     /// Grant `phase` units of `price` under `profile`, never fewer than
-    /// `floor` (a phase that cannot run below it): `bounded` gets `floor`,
-    /// `auto` what its share of the allowance affords within `[floor, want]`,
-    /// `speed` `want`. The grant is charged to this budget whatever the
+    /// `floor` (a phase that cannot run below it): `auto` what its share of
+    /// the allowance affords within `[floor, want]`; `bounded` the same, cut
+    /// to main's cap for the phase ([`MemoryPhase::bounded_cap`]); `speed`
+    /// `want`. The grant is charged to this budget whatever the
     /// profile, so every later phase sees it.
     pub(super) fn fit(
         &mut self,
@@ -321,7 +345,11 @@ impl MemoryBudget {
         floor: usize,
     ) -> Grant {
         let units = match profile {
-            MemoryProfile::Bounded => floor,
+            MemoryProfile::Bounded => self
+                .affordable(profile, phase, price)
+                .min(want)
+                .min(phase.bounded_cap(want, floor))
+                .max(floor),
             MemoryProfile::Speed => want.max(floor),
             MemoryProfile::Auto => self.affordable(profile, phase, price).min(want).max(floor),
         };
@@ -662,10 +690,11 @@ mod tests {
         budget.require(MemoryPhase::Scan, estimate).unwrap();
     }
 
-    /// #788: one rule for every phase. `bounded` grants the floor (main's
-    /// shape, the smallest footprint), `auto` never more than the phase's
-    /// share of the allowance unless its floor needs it, `speed` what it
-    /// wants; each charges the budget.
+    /// #788: one rule for every phase. `auto` never grants more than the
+    /// phase's share of the allowance unless its floor needs it; `bounded`
+    /// the same, never above main's cap for the phase (the floor for the
+    /// encodes, export and fill); `speed` what it wants. Each charges the
+    /// budget.
     #[test]
     fn every_profile_grants_by_one_rule() {
         let phases = [
@@ -690,12 +719,30 @@ mod tests {
                     let fresh = MemoryBudget::with_available(Some(available));
                     let mut budget = fresh;
                     let bounded = budget.fit(MemoryProfile::Bounded, phase, price, want, floor);
-                    assert_eq!(bounded.units, floor, "{phase:?} bounded");
+                    let share = (fresh.remaining() as f64 * phase.share()) as u64;
+                    assert!(bounded.units >= floor, "{phase:?} bounded");
+                    assert!(
+                        bounded.units <= phase.bounded_cap(want, floor).max(floor),
+                        "{phase:?} bounded above main's cap"
+                    );
+                    assert!(
+                        bounded.units == floor || bounded.bytes() <= share,
+                        "{phase:?} bounded over its share"
+                    );
+                    if matches!(
+                        phase,
+                        MemoryPhase::Encode
+                            | MemoryPhase::ExportCollect
+                            | MemoryPhase::ExportEncode
+                            | MemoryPhase::Fill
+                    ) {
+                        assert_eq!(bounded.units, floor, "{phase:?}: main's shape is its floor");
+                    }
                     assert_eq!(budget.remaining(), fresh.remaining() - bounded.bytes());
 
                     let mut budget = fresh;
                     let auto = budget.fit(MemoryProfile::Auto, phase, price, want, floor);
-                    let share = (fresh.remaining() as f64 * phase.share()) as u64;
+                    assert!(bounded.units <= auto.units, "{phase:?}: bounded above auto");
                     assert!(auto.units >= floor && auto.units <= want, "{phase:?} auto");
                     assert!(
                         auto.units == floor || auto.bytes() <= share,
@@ -729,11 +776,19 @@ mod tests {
                 .units,
             64
         );
+        // Main's bounded window: what was asked, cut by the allowance.
         assert_eq!(
             budget
                 .compute_window(MemoryProfile::Bounded, 8, encode)
                 .units,
-            1
+            8
+        );
+        let mut tight = MemoryBudget::with_available(Some(40 << 20));
+        assert_eq!(
+            tight
+                .compute_window(MemoryProfile::Bounded, 8, encode)
+                .units,
+            2
         );
         assert_eq!(
             budget.compute_window(MemoryProfile::Speed, 8, encode).units,

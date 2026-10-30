@@ -167,9 +167,9 @@ pub enum MemoryProfile {
     /// total buffered output.
     Speed,
     /// The smallest footprint: spill each output level's rows to a temporary
-    /// Arrow IPC file and stream them back at write time, and run every other
-    /// phase at its floor (one reader, a window of one batch, at most 4
-    /// encodes).
+    /// Arrow IPC file and stream them back at write time. Every other phase
+    /// keeps `bounded`'s fixed caps (at most 4 readers 16 batches deep, at
+    /// most 4 encodes), which the memory allowance can only shrink.
     Bounded,
 }
 

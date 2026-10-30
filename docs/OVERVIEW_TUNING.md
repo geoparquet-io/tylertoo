@@ -1812,11 +1812,12 @@ processed at once, and how many row groups the writer encodes at once.
   the least wall time with no temp I/O, but peak RAM grows with total
   *output* size.
 - **`bounded`** holds the least. Each level's rows spill to temporary Arrow
-  IPC files and stream back at write time, and every other phase runs at its
-  floor: one reader at the minimum read-ahead depth, a compute window of one
-  batch, and at most 4 concurrent row-group encodes. Its peak never exceeds
-  what `bounded` used before the run budget existed (#788), whatever the
-  machine.
+  IPC files and stream back at write time. Every other phase keeps the caps
+  `bounded` always had, and the allowance can only shrink them: at most 4
+  readers, each at most 16 batches deep, and at most 4 concurrent row-group
+  encodes. The compute window takes what `--in-flight-batches` asks for,
+  within the allowance. Its peak never exceeds what `bounded` used before
+  the run budget existed (#788), whatever the machine.
 - **`auto`**, the default, sizes the run to the machine. Every phase fits
   inside one allowance: 60% of available memory, or of
   `TYLERTOO_AUTO_MEM_LIMIT_BYTES` or the cgroup limit when set. The
@@ -1835,8 +1836,8 @@ the same grants shrink: NZ parcels (4.3M polygons) gets 5 encodes and a
 window of 1 batch. To hold `auto` down, set a smaller limit with
 `TYLERTOO_AUTO_MEM_LIMIT_BYTES` or a cgroup memory limit, or use `bounded`.
 
-Under `auto`, each read worker is also charged for the row group its reader
-decodes (the largest selected row group at the footers' decoded row size),
+Under `auto` and `bounded`, each read worker is also charged for the row
+group its reader decodes (the largest selected row group at the footers' decoded row size),
 so inputs with large row groups get fewer readers under a tight limit. Under
 a cgroup limit the kernel charges the spill's page cache to the same limit.
 When the spill's footer-priced size fits the allowance, pass 2 reserves it
