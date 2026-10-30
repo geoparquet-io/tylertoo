@@ -622,13 +622,32 @@ fn read_proc_mem_available() -> Option<u64> {
     None
 }
 
+/// The [`SinkBacking`] `profile` gives the pass-2 sinks, without logging:
+/// `speed` keeps them in RAM, `bounded` spills, and `auto` decides with
+/// [`auto_backing`]. The one owner of that rule: [`resolve_backing`] logs
+/// it, and the spill page-cache reservation (`stream::reserve_spill_cache`)
+/// asks it ahead of the decision.
+pub(super) fn sink_backing(
+    memory: &MemoryBudget,
+    profile: MemoryProfile,
+    mode: Mode,
+    buffered_rows: usize,
+    avg_geom_bytes: Option<u64>,
+) -> SinkBacking {
+    match profile {
+        MemoryProfile::Speed => SinkBacking::Ram,
+        MemoryProfile::Bounded => SinkBacking::Spill,
+        MemoryProfile::Auto => auto_backing(memory, mode, buffered_rows, avg_geom_bytes),
+    }
+}
+
 /// Resolve the [`MemoryProfile`] (including [`MemoryProfile::Auto`]) to a
-/// concrete [`SinkBacking`], logging the decision.
+/// concrete [`SinkBacking`] with [`sink_backing`], logging the decision.
 ///
 /// `buffered_rows` is the total winner count of the levels the engine buffers
 /// (all but the streamed finest level). For `Auto` the choice is workload-based
 /// (#294): the estimated buffered output (`f(buffered_rows, mode)`) is compared
-/// against a fraction of *available* RAM, so large duplicating runs prefer the
+/// against the run budget's allowance, so large duplicating runs prefer the
 /// bounded spill path instead of the old unconditional RAM buffering. An
 /// explicit profile always wins.
 pub(super) fn resolve_backing(
@@ -638,43 +657,32 @@ pub(super) fn resolve_backing(
     buffered_rows: usize,
     avg_geom_bytes: Option<u64>,
 ) -> SinkBacking {
-    match profile {
-        MemoryProfile::Speed => {
-            log::debug!(
-                "pass2 memory profile Speed + {mode:?} (buffered ~{buffered_rows} rows) → Ram"
-            );
-            SinkBacking::Ram
-        }
-        MemoryProfile::Bounded => {
-            log::debug!(
-                "pass2 memory profile Bounded + {mode:?} (buffered ~{buffered_rows} rows) → Spill"
-            );
-            SinkBacking::Spill
-        }
-        MemoryProfile::Auto => {
-            let available = memory.available();
-            let backing = auto_backing(&memory, mode, buffered_rows, avg_geom_bytes);
-            let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes);
-            let budget = memory.allowance(MemoryProfile::Auto);
-            let avail_mib = available.map_or_else(
-                || "unknown".to_string(),
-                |b| format!("{} MiB", b / (1024 * 1024)),
-            );
-            let geom = avg_geom_bytes.filter(|&b| b > 0).map_or_else(
-                || "unmeasured (calibrated constants)".to_string(),
-                |b| format!("measured avg geom {b} B/row"),
-            );
-            // Info-level: the auto decision drives peak RAM and is the primary
-            // diagnostic for #294 / #295 (paired with the [rss] phase logs).
-            log::info!(
-                "[convert] pass2 auto + {mode:?}: buffered ~{buffered_rows} rows, \
-                 {geom}, est {} MiB vs budget {} MiB (avail {avail_mib}) → {backing:?}",
-                estimate / (1024 * 1024),
-                budget / (1024 * 1024),
-            );
-            backing
-        }
+    let backing = sink_backing(&memory, profile, mode, buffered_rows, avg_geom_bytes);
+    if !matches!(profile, MemoryProfile::Auto) {
+        log::debug!(
+            "pass2 memory profile {profile:?} + {mode:?} (buffered ~{buffered_rows} rows) → {backing:?}"
+        );
+        return backing;
     }
+    let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes);
+    let budget = memory.allowance(MemoryProfile::Auto);
+    let avail_mib = memory.available().map_or_else(
+        || "unknown".to_string(),
+        |b| format!("{} MiB", b / (1024 * 1024)),
+    );
+    let geom = avg_geom_bytes.filter(|&b| b > 0).map_or_else(
+        || "unmeasured (calibrated constants)".to_string(),
+        |b| format!("measured avg geom {b} B/row"),
+    );
+    // Info-level: the auto decision drives peak RAM and is the primary
+    // diagnostic for #294 / #295 (paired with the [rss] phase logs).
+    log::info!(
+        "[convert] pass2 auto + {mode:?}: buffered ~{buffered_rows} rows, \
+         {geom}, est {} MiB vs budget {} MiB (avail {avail_mib}) → {backing:?}",
+        estimate / (1024 * 1024),
+        budget / (1024 * 1024),
+    );
+    backing
 }
 
 // ============================================================================
