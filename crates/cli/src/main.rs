@@ -753,11 +753,14 @@ fn resolve_convert_source(spec: &InputSpec) -> Result<tylertoo_core::input_set::
 }
 
 /// The sharded-fleet half of a `tiles` configuration (#498): load the shard
-/// plan, check it against the build without reading the input, and hand the
-/// job to the facade, which binds it to the input it opens and resolves
-/// `--max-zoom auto` there (#444, #788). Core's validation runs before and
-/// after.
-fn resolve_tiles_job(args: &TilesArgs, options: &mut TilesOptions) -> Result<Option<ShardJob>> {
+/// plan, bind it to the input, and hand the job to the facade, which
+/// re-checks the binding on the input it converts and resolves `--max-zoom
+/// auto` there (#444, #788). Core's validation runs before and after.
+fn resolve_tiles_job(
+    args: &TilesArgs,
+    spec: &InputSpec,
+    options: &mut TilesOptions,
+) -> Result<Option<ShardJob>> {
     let validate = |options: &TilesOptions| {
         if args.plan_only {
             options.validate_plan_only()
@@ -769,6 +772,12 @@ fn resolve_tiles_job(args: &TilesArgs, options: &mut TilesOptions) -> Result<Opt
     let max_zoom = args.max_zoom.plan_zoom();
     let shard = resolve_shard_job(args.shard.as_deref(), args.shard_plan.as_deref(), max_zoom)?;
     if let Some(job) = &shard {
+        // A plan cut for a different (or since-rewritten) input is refused
+        // first, before the fleet rules the validation below adds (`--shard
+        // requires --plan`): the mismatch is the error that names the fix.
+        // Main's order; it reads the footers, so only a sharded job pays it.
+        job.plan
+            .verify_source(&resolve_convert_source(spec)?, &job.plan_path)?;
         // The fleet-wide selection now, so `--max-zoom auto` estimates over
         // the rows this job reads; the facade applies the rest (#439).
         let tiles_shard = job.as_tiles_shard();
@@ -833,7 +842,7 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
     // #600: export flags are ignored here, but not unchecked: core validates
     // the same `TilesOptions` the full coarse job runs with.
     let mut options = tiles_options(&args)?;
-    let shard = resolve_tiles_job(&args, &mut options)?;
+    let shard = resolve_tiles_job(&args, &spec, &mut options)?;
     // #600: the fleet recipe is the coarse job's line plus this flag, and that
     // line carries export-only flags. They cannot move the plan, so they are
     // tolerated, and said so once, now that every refusal has run. Core names
@@ -1018,7 +1027,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // which on a large input runs for minutes before the export would
     // otherwise refuse a knob; core re-checks inside the facade.
     let mut tiles_options = tiles_options(&args)?;
-    resolve_tiles_job(&args, &mut tiles_options)?;
+    resolve_tiles_job(&args, &spec, &mut tiles_options)?;
     let squares = makes_placeholder_squares(&tiles_options.convert);
     let input = tiles_input(&spec);
 
