@@ -123,6 +123,7 @@ pub(super) mod cost_probe {
         pub(crate) host_entries: usize,
         pub(crate) host_occupied: usize,
         pub(crate) large_host_visits: usize,
+        pub(crate) holding_checks: usize,
         pub(crate) fill_polygons_encoded: usize,
         pub(crate) fill_passes: usize,
         pub(crate) fill_gzip_calls: usize,
@@ -1072,6 +1073,10 @@ pub(super) fn assign_hosts<'a>(
                     let [x0, y0, x1, y1] = cells[h].map(usize::from);
                     x0 <= cx && cx <= x1 && y0 <= cy && cy <= y1
                 }))
+                .inspect(|_| {
+                    #[cfg(test)]
+                    cost_probe::update(|c| c.holding_checks += 1);
+                })
                 .filter(|&h| dist2(&hosts[h], x, y) == 0.0)
                 .min_by(|&a, &b| area(&hosts[a]).total_cmp(&area(&hosts[b])).then(a.cmp(&b)));
             if let Some(h) = holding {
@@ -2526,6 +2531,63 @@ mod tests {
     }
 
     #[test]
+    fn of_several_large_boxes_holding_a_polygon_the_smallest_wins() {
+        let polys = vec![vec![vec![(2000, 2000), (2010, 2000), (2010, 2010)]]];
+        let hosts = [
+            [0.0, 0.0, FILL_EXTENT, FILL_EXTENT],
+            [1000.0, 1000.0, 3000.0, 3000.0],
+        ];
+        assert_eq!(assign_hosts(&polys, &hosts), vec![1]);
+    }
+
+    /// Containment tests only the large boxes whose cells hold the
+    /// polygon's cell: a strip beside it is not measured.
+    #[test]
+    fn phase1_containment_measures_only_boxes_over_the_cell() {
+        let polys = vec![vec![vec![(2000, 2000), (2010, 2000), (2010, 2010)]]];
+        let hosts = [
+            [0.0, 0.0, FILL_EXTENT, FILL_EXTENT],
+            [0.0, 0.0, 640.0, FILL_EXTENT],
+        ];
+        cost_probe::take();
+        assert_eq!(assign_hosts(&polys, &hosts), vec![0]);
+        assert_eq!(cost_probe::take().holding_checks, 1);
+    }
+
+    #[test]
+    fn a_nearer_box_keeps_a_polygon_from_a_lower_numbered_farther_one() {
+        // The small box 1 is 14 px away, the large box 0 is 15 px away and
+        // seen in the same ring after it.
+        let polys = vec![vec![vec![(2000, 2000), (2010, 2000), (2010, 2010)]]];
+        let hosts = [
+            [0.0, 0.0, 1985.0, FILL_EXTENT],
+            [2010.0, 2010.0, 2020.0, 2020.0],
+        ];
+        assert_eq!(assign_hosts(&polys, &hosts), vec![1]);
+    }
+
+    /// The ring search visits a large box only from the ring that first
+    /// reaches it while one of the ring's edges crosses it.
+    #[test]
+    fn phase1_large_box_visits_follow_the_ring_edges() {
+        let polys = vec![vec![vec![(2000, 2000), (2010, 2000), (2010, 2010)]]];
+        // Bars 4 cells thick, left, right, below and above the polygon's
+        // cell (31, 31), each 6 to 25 cells away, and one corner block.
+        let hosts = [
+            [320.0, 1920.0, 1663.0, 2175.0],
+            [2432.0, 1920.0, 3775.0, 2175.0],
+            [1920.0, 320.0, 2175.0, 1663.0],
+            [1920.0, 2432.0, 2175.0, 3775.0],
+            [2700.0, 2700.0, 3500.0, 3500.0],
+        ];
+        cost_probe::take();
+        // The left and lower bars tie at 337 px, both first reached at
+        // ring 5; the lower index wins and the search stops there.
+        assert_eq!(assign_hosts(&polys, &hosts), vec![0]);
+        assert_eq!(cost_probe::take().large_host_visits, 2);
+    }
+
+    #[test]
     fn a_zoom_writer_reserves_its_index_growth_before_appending() {
         let opts = super::super::ExportOptions::default();
         let polys = vec![vec![vec![(0, 0), (1, 0), (0, 1)]]];
@@ -2547,35 +2609,35 @@ mod tests {
         require_fill_bytes(32, 32).unwrap();
     }
 
-    /// The seed charges a feature's collapsed credits as well as its shapes:
-    /// a 400 px sliver that collapses whole is a hundred credits.
-    #[test]
-    fn the_seed_charges_a_collapsed_slivers_credits() {
+    /// One geometry-column batch of `geoms`, as the level read hands it.
+    fn geometry_batch(geoms: &[geo::Geometry<f64>]) -> super::super::RecordBatch {
         use geoarrow::array::GeometryBuilder;
         use geoarrow::datatypes::GeometryType;
         use geoarrow_array::GeoArrowArray;
-        let sliver = geo::Geometry::Polygon(geo::Polygon::new(
-            geo::LineString::from(vec![(1.0, 1.0), (3.2, 1.0), (3.2, 1.005), (1.0, 1.005)]),
-            vec![],
-        ));
         let mut builder =
             GeometryBuilder::new(GeometryType::new(Default::default())).with_prefer_multi(false);
-        builder.extend_from_iter(std::iter::once(Some(&sliver)));
+        builder.extend_from_iter(geoms.iter().map(Some));
         let array = builder.finish();
         let field = array.data_type().to_field("geometry", true);
-        let batch = super::super::RecordBatch::try_new(
+        super::super::RecordBatch::try_new(
             std::sync::Arc::new(arrow_schema::Schema::new(vec![field])),
             vec![array.to_array_ref()],
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// Seed `batch` at z4 into `buckets`; `Err(needed)` on a budget error.
+    fn seed_z4(
+        batch: &super::super::RecordBatch,
+        buckets: &mut SpillBuckets,
+        features: &mut usize,
+    ) -> Result<(), u64> {
         let opts = super::super::ExportOptions {
             tile_buffer: 0,
             ..Default::default()
         };
-        let mut buckets = SpillBuckets::new(&opts, 0);
-        let mut features = 0;
-        let error = seed_batch(
-            &batch,
+        match seed_batch(
+            batch,
             FillSeed {
                 geometry: Some("geometry"),
                 crs: super::super::Crs::Epsg4326,
@@ -2584,18 +2646,83 @@ mod tests {
                 timers: &super::super::ExportTimers::default(),
                 diagnostics: &crate::diagnostics::Diagnostics::default(),
             },
-            &mut buckets,
-            &mut features,
+            buckets,
+            features,
+        ) {
+            Ok(()) => Ok(()),
+            Err(super::super::ExportError::BudgetExceeded { needed, .. }) => Err(needed),
+            Err(error) => panic!("expected a budget error, got {error:?}"),
+        }
+    }
+
+    /// A 1° square in the z4 tile at (8, 7), far above the tolerance.
+    fn degree_square(lon: f64, lat: f64) -> geo::Geometry<f64> {
+        geo::Geometry::Polygon(
+            geo::Rect::new(
+                geo::coord! { x: lon, y: lat },
+                geo::coord! { x: lon + 1.0, y: lat + 1.0 },
+            )
+            .to_polygon(),
         )
-        .unwrap_err();
-        let super::super::ExportError::BudgetExceeded { needed, .. } = error else {
-            panic!("expected a budget error, got {error:?}");
-        };
+    }
+
+    /// The seed charges a feature's collapsed credits as well as its shapes:
+    /// a 400 px sliver that collapses whole is a hundred credits.
+    #[test]
+    fn the_seed_charges_a_collapsed_slivers_credits() {
+        let sliver = geo::Geometry::Polygon(geo::Polygon::new(
+            geo::LineString::from(vec![(1.0, 1.0), (3.2, 1.0), (3.2, 1.005), (1.0, 1.005)]),
+            vec![],
+        ));
+        let opts = super::super::ExportOptions::default();
+        let mut buckets = SpillBuckets::new(&opts, 0);
+        let mut features = 0;
+        let needed = seed_z4(&geometry_batch(&[sliver]), &mut buckets, &mut features)
+            .expect_err("nothing fits a zero budget");
         assert!(
             needed >= 100 * std::mem::size_of::<Collapsed>() as u64,
             "needed {needed}"
         );
         assert_eq!(features, 1);
+    }
+
+    /// Each tile run the seed already holds is charged 512 bytes.
+    #[test]
+    fn the_seed_charges_each_held_tile_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = super::super::ExportOptions {
+            spill_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let batch = geometry_batch(&[degree_square(1.0, 1.0)]);
+        let mut features = 0;
+        let alone = seed_z4(&batch, &mut SpillBuckets::new(&opts, 0), &mut features)
+            .expect_err("nothing fits a zero budget");
+        let mut buckets = SpillBuckets::new(&opts, WORKSPACE_FLOOR_BYTES);
+        seed_z4(&batch, &mut buckets, &mut features).unwrap();
+        assert_eq!(buckets.tiles.len(), 1);
+        buckets.budget = 0;
+        let held = seed_z4(&batch, &mut buckets, &mut features).expect_err("zero budget");
+        assert_eq!(held, alone + 512);
+    }
+
+    /// Two features of one tile are merged into one pending bucket before
+    /// they are written, and that bucket is charged too: its shape vector
+    /// grows to four slots where each feature held one.
+    #[test]
+    fn the_seed_charges_the_merged_tile_bucket() {
+        let opts = super::super::ExportOptions::default();
+        let batch = geometry_batch(&[degree_square(1.0, 1.0), degree_square(5.0, 5.0)]);
+        let mut features = 0;
+        let pieces = seed_z4(&batch, &mut SpillBuckets::new(&opts, 0), &mut features)
+            .expect_err("nothing fits a zero budget");
+        let pending = seed_z4(
+            &batch,
+            &mut SpillBuckets::new(&opts, usize::try_from(pieces).unwrap()),
+            &mut features,
+        )
+        .expect_err("the merged bucket outgrows its pieces");
+        assert_eq!(pending, pieces + 2 * std::mem::size_of::<Shape>() as u64);
     }
 
     fn square(x: f64, y: f64, side: f64) -> Shape {

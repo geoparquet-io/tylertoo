@@ -7844,6 +7844,57 @@ mod tests {
             .all(|&(_, mib)| mib <= true_anon));
     }
 
+    /// #715: a `bounded` run spills pass 2 as LZ4, and the profile dump's
+    /// sink record names that codec. `TYLERTOO_PROFILE_JSON` is process
+    /// environment, so the run happens in a child with it set.
+    #[test]
+    fn a_bounded_run_reports_its_lz4_spill_codec() {
+        const CHILD: &str = "TYLERTOO_CODEC_TEST_JSON";
+        let Some(json) = std::env::var_os(CHILD) else {
+            let dir = tempfile::tempdir().unwrap();
+            let json = dir.path().join("profile.jsonl");
+            let (_, module) = module_path!().split_once("::").expect("crate::module path");
+            let name = format!("{module}::a_bounded_run_reports_its_lz4_spill_codec");
+            let out =
+                std::process::Command::new(std::env::current_exe().expect("test binary path"))
+                    .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                    .env(CHILD, &json)
+                    .env("TYLERTOO_PROFILE_JSON", &json)
+                    .output()
+                    .expect("re-run the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{name} failed in its own process:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        let geoms: Vec<Option<geo::Geometry<f64>>> = (0..40)
+            .map(|i| Some(geo::Geometry::Point(geo::Point::new(f64::from(i), 1.0))))
+            .collect();
+        crate::overview::testutil::write_input(&input, &geoms, true, None);
+        crate::overview::convert::convert_to_overviews(
+            &input,
+            dir.path().join("out.parquet"),
+            &crate::overview::convert::ConvertOptions {
+                levels: crate::overview::convert::LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 4,
+                },
+                profile: MemoryProfile::Bounded,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(json).expect("the profile dump");
+        let line: serde_json::Value =
+            serde_json::from_str(contents.lines().next().expect("a convert line")).unwrap();
+        assert_eq!(line["pass2"]["sink"]["spill_codec"], "lz4", "{line}");
+    }
+
     /// Runs the named test of this module alone in a child process. Returns
     /// `true` inside that child, where the caller runs its body, and `false`
     /// in the parent once the child has passed.

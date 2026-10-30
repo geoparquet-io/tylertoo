@@ -17928,7 +17928,21 @@ mod tests {
                 .iter()
                 .find(|l| l.contains("coverage fill z2:"))
                 .expect("the pyramid logs z2");
-            assert!(!z2.contains("area 0 "), "{z2}");
+            assert!(
+                z2.contains("z2: 1 tiles") && !z2.contains("area 0 "),
+                "{z2}"
+            );
+            let summary = lines
+                .iter()
+                .find(|l| l.contains("vertices lifted"))
+                .expect("the fill logs its summary");
+            let vertices: usize = summary
+                .split(" vertices lifted")
+                .next()
+                .and_then(|head| head.rsplit(' ').next())
+                .and_then(|n| n.parse().ok())
+                .expect("a vertex count");
+            assert!(vertices > 0, "{summary}");
         }
     }
 
