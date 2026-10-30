@@ -1,5 +1,14 @@
-//! Deterministic #711 fixture: four properties, all points inside z14/8192/8192.
-//! `tile_compress_dedup --generate-dense .bench-out/dense.parquet 500000`
+//! Deterministic #711 fixture generator: four properties, all points inside
+//! z14/8192/8192, written as WKB GeoParquet with a bbox covering.
+//!
+//! An example rather than part of a bench so it builds with the crate's
+//! dev-dependencies but stays out of `cargo codspeed build`, which only
+//! accepts `criterion_main!` benches (#614):
+//!
+//! ```text
+//! cargo run --release -p tylertoo-core --example dense_points -- \
+//!     .bench-out/dense.parquet 500000
+//! ```
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,7 +28,7 @@ use tylertoo_io::test_support::ArrowWriter;
     clippy::disallowed_methods,
     reason = "benchmark fixture output, not a published archive"
 )]
-pub(super) fn write(path: &Path, rows: usize) {
+pub(crate) fn write(path: &Path, rows: usize) {
     let mut builder = GeometryBuilder::new(GeometryType::new(Default::default()));
     let geoms: Vec<_> = (0..rows)
         .map(|i| {
@@ -69,4 +78,14 @@ pub(super) fn write(path: &Path, rows: usize) {
         .unwrap();
     writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
     writer.close().unwrap();
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let [_, path, rows] = args.as_slice() else {
+        eprintln!("usage: dense_points <output.parquet> <rows>");
+        std::process::exit(2);
+    };
+    let rows = rows.parse().expect("row count");
+    write(Path::new(path), rows);
 }
