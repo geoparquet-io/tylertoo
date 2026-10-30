@@ -58,6 +58,7 @@ Never bypass it with `--no-verify`.
 cargo check             # fast compile check
 cargo build             # debug build
 cargo build --release   # release build
+cargo build --release -p tylertoo --no-default-features  # CLI on glibc malloc, not mimalloc
 cargo fmt --all         # format before you commit
 ```
 

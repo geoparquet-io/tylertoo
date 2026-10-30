@@ -1811,6 +1811,11 @@ across all cores. The profile decides where output rows wait before writing.
 - **`auto`** spills when the estimated buffered output exceeds 0.6 of
   available RAM and keeps rows in RAM otherwise.
 
+Release binaries use the mimalloc allocator, which is faster than the
+system allocator but can keep freed memory mapped, so a run's RSS can sit
+above its live heap. That gap is allocator retention, not a leak. `--profile bounded`
+remains the setting for memory-constrained machines.
+
 ### Automatic memory estimate
 
 `auto` estimates `buffered rows × per-row cost` from the average
