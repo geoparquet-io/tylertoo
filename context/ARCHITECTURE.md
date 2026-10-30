@@ -70,8 +70,10 @@ confirmed this decision:
 | `auto` (default) | what the phase's share affords, within `[floor, want]` | Sized to the machine: every decision fits the allowance, spilling when the output does not, re-checked at runtime (#626) |
 
 In one sentence: **`bounded` keeps main's caps per phase; the allowance can
-only shrink them** (`MemoryPhase::bounded_cap`, plus the read shape's worker
-and depth caps in `read.rs`). A cut that granted `bounded` only each phase's
+only shrink them** (`MemoryPhase::bounded_cap`, which also holds remote
+staging to main's 256 MiB in-flight budget through
+`MemoryBudget::stage_requests`, plus the read shape's worker and depth caps
+in `read.rs`). A cut that granted `bounded` only each phase's
 floor (one reader, 4 deep) was reverted the same day. It went below main's
 shape, and cost `bounded` wall time for no memory main had not already
 accepted.

@@ -1125,7 +1125,8 @@ impl ConvertSource {
 
     /// Stage every part's selected row groups to local disk up front (pass 0,
     /// #286/#287) so the streaming passes read from disk, not the network:
-    /// [`Self::staging_plan`] then [`Self::stage`]. `selection` (`None` = all
+    /// [`Self::staging_plan`] then [`Self::stage_within`] at the un-budgeted
+    /// admission ([`crate::input::unbudgeted_stage_admission`]). `selection` (`None` = all
     /// row groups) is the per-part bbox pruning the passes will honor, so
     /// pruned groups are never fetched and total network traffic stays ≈1×
     /// the bytes read (#219); only the projected columns are fetched (#400).

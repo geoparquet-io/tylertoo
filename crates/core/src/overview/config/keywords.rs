@@ -207,6 +207,15 @@ pub fn convert(
         .unwrap_or(min);
     // `"auto"` builds the plan with the placeholder zoom and leaves the
     // estimate to the conversion, over its own source (#444, #788).
+    //
+    // LOCKSTEP: `max_zoom` lands in two fields that must agree, the plan's
+    // `ZoomRange { max_zoom }` (`MaxZoom::plan_zoom`, a placeholder for
+    // `auto`) and `ConvertOptions::auto_max_zoom`. The flag is `serde(skip)`,
+    // so every serde round trip drops it and four sites set it by hand: here
+    // and in `tiles` below (keywords), and `overview_options`/`tiles_options`
+    // in `config/cli.rs` (flags). `max_zoom_auto_survives_the_keyword_round_trips`
+    // pins the keyword side, and the CLI's
+    // `max_zoom_sets_the_plan_and_the_auto_flag_without_reading` the flags.
     let max_zoom = values
         .remove("max_zoom")
         .map(max_zoom_value)
@@ -439,7 +448,7 @@ pub fn tiles(
         TilesOptions::export_defaults(verbatim),
     )?;
     // The auto flag is not a keyword, so the serde round trip below drops
-    // it; carried across by hand.
+    // it; carried across by hand (see LOCKSTEP in `convert`).
     let auto_max_zoom = convert.auto_max_zoom;
     values.insert(
         "convert".into(),
