@@ -1281,14 +1281,16 @@ fn reserve_spill_cache(
         emitted.len()
     };
     let buffered_rows: usize = emitted[..buffered].iter().map(|e| e.hint).sum();
-    let spills = match options.profile {
-        super::level::MemoryProfile::Speed => false,
-        super::level::MemoryProfile::Bounded => true,
-        super::level::MemoryProfile::Auto => matches!(
-            pipeline::auto_backing(budget, options.mode, buffered_rows, avg_geom_bytes),
-            pipeline::SinkBacking::Spill
+    let spills = matches!(
+        pipeline::sink_backing(
+            budget,
+            options.profile,
+            options.mode,
+            buffered_rows,
+            avg_geom_bytes
         ),
-    };
+        pipeline::SinkBacking::Spill
+    );
     if !spills || buffered_rows == 0 {
         return skip("nothing spills");
     }

@@ -50,7 +50,7 @@ its remaining scope; the legacy pipeline's architecture notes were moved to
 
 ## Decision Record: Memory Profiles and the Run Budget (#788, 2026-10-30)
 
-One `MemoryBudget` (`overview/memory.rs`) per conversion probes memory once
+One `MemoryBudget` (`overview/memory.rs`) per operation probes memory once
 (MemAvailable, `TYLERTOO_AUTO_MEM_LIMIT_BYTES`, or the cgroup limit) and sets
 one allowance: 60% of the probed figure less hard reservations (the eager
 input, and under a cgroup limit the spill's page cache when it fits). Every
@@ -58,7 +58,32 @@ elastic phase asks `MemoryBudget::fit(profile, phase, price, want, floor)`
 for units of a price read from the Parquet footers, and each grant is
 charged, so a phase sized later sees only what earlier ones left. Before
 this, the read-ahead, the compute window and the encodes each took their own
-slice of the same allowance and nothing summed them (#716).
+slice of the same allowance and nothing summed them (#716). Every decision
+reads the one budget's own figures: `auto`'s RAM-or-spill choice for the
+pass-2 sinks and export's fill store compares its estimate with
+`budget.allowance(Auto)` after the grants already charged, the same figure
+the runtime downgrade (#626) checks (`pipeline::auto_backing`).
+
+"Once per operation", not once per process. A `tiles` run probes four
+times, through three probes in `pipeline.rs`, each for a reason:
+
+- **convert:** `MemoryBudget::probe()` in `preflight()`, uncached, before
+  pass 1 reads anything;
+- **export:** `export_budget()`, from `available_memory_bytes()`. That
+  figure is cached process-wide on its first call after convert's pass 1,
+  so it is the cgroup's headroom with pass 1's usage already charged
+  (#485). The widths of export's waves have used it since #303;
+- **export's dense-tile refusal** (`check_levels_fit`, #665): it uses
+  `probe_oom_memory_limit()`, fresh and without `memory.high`, because that
+  check measures what would kill the process, not what the run may hold;
+- **export's diagnostics:** the cap on the Python loss list comes from its
+  own `MemoryBudget::probe()`. It sizes a report, never the archive.
+
+`--max-zoom auto` also stages its sample through a throwaway
+`MemoryBudget::probe()` (`auto_zoom.rs`), before `preflight()` builds the
+conversion's budget. That grant is released before the conversion starts.
+Only the order of the calls ties them: `auto_max_zoom` resolves the zoom
+that `preflight()` prices.
 
 The profile decides the grant the same way for every phase. The user
 confirmed this decision:
