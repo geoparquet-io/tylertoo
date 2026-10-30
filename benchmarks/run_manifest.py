@@ -23,7 +23,8 @@ Standard library only. What one `run` does, cell by cell:
             cell's scratch under .bench-out/, deleted when the cell ends.
   rounds    `pairs` rounds (manifest, at least 3 unless --dry-run); each
             round runs every binary once, and the order flips every round
-            (A B, B A, A B...) so drift on the host cancels.
+            (A B, B A, A B...) so drift on the host cancels. One --bin is a
+            baseline: the same rounds, one binary.
   each run  waits for a quiet host (load gate below), runs the command under
             `/usr/bin/time -v` with a fresh TYLERTOO_PROFILE_JSON, records
             wall, CPU, peak RSS, the profile lines, output size and sha256,
@@ -590,8 +591,6 @@ class Runner:
         labels = [b["label"] for b in self.bins]
         if len(set(labels)) != len(labels):
             raise ManifestError("--bin labels must be distinct")
-        if len(self.bins) < 2 and not args.dry_run:  # noqa: PLR2004
-            raise ManifestError("a timing run compares at least two --bin (or pass --dry-run)")
         defaults = manifest.get("defaults", {})
         self.gate = Gate(args.load_max or defaults.get("load_max", 3.0),
                          defaults.get("load_wait_s", 3600), self.results / "gate.log",
@@ -860,7 +859,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--cells", help="comma-separated cells (default: every cell not marked heavy)")
     run.add_argument("--set", help="a [sets] entry of the manifest")
     run.add_argument("--pairs", type=int, help=f"rounds per cell (at least {MIN_PAIRS})")
-    run.add_argument("--dry-run", action="store_true", help="one round, one binary allowed; not a baseline")
+    run.add_argument("--dry-run", action="store_true", help="one round per cell; not a baseline")
     run.add_argument("--force", action="store_true", help="rerun cells that already have results")
     run.add_argument("--load-max", type=float, help="load gate threshold (manifest default)")
     run.add_argument("--no-gate", action="store_true",
