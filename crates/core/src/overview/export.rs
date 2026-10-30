@@ -131,7 +131,7 @@ use crate::TilesetMetadata;
 
 use super::coalesce::COALESCED_COUNT_COLUMN;
 use super::convert::{human_bytes, skip_memory_preflight_from_env, SKIP_MEMORY_PREFLIGHT_ENV};
-use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
+use super::level::{zoom_for_gsd, Crs, MemoryProfile, Mode, OverviewsMeta};
 use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
 use super::pipe::scoped_pipe;
 use super::pipeline::{
@@ -542,6 +542,23 @@ pub struct ExportOptions {
     #[cfg_attr(feature = "cli", arg(help = "Directory for the export's spill file, used when buffered tiles exceed the memory budget. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>", long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub spill_dir: Option<PathBuf>,
+    /// Memory profile for the export (#788), the same values as
+    /// [`ConvertOptions::profile`](super::convert::ConvertOptions::profile):
+    /// `bounded` keeps export within its historical footprint, `auto` sizes
+    /// to the machine's free memory, `speed` sets no limit. `tiles` passes
+    /// its own `--profile` through. Changes speed and peak memory only;
+    /// output is byte-identical across profiles. Default
+    /// [`MemoryProfile::Auto`].
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        default_value = ExportOptions::default().profile.as_str(),
+        value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile for writing levels: `speed` buffers in RAM, `bounded` spills to disk, and `auto` picks per run. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "export_only"))]
+    pub profile: MemoryProfile,
     /// Top-level `name`, `description` and `attribution` written to the
     /// archive metadata (tippecanoe's `-n` / `-N` / `-A`).
     ///
@@ -571,6 +588,7 @@ impl Default for ExportOptions {
             zoom_ceiling: None,
             feature_id: None,
             spill_dir: None,
+            profile: MemoryProfile::Auto,
             metadata: TilesetMetadata::default(),
         }
     }

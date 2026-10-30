@@ -198,6 +198,7 @@ export_pmtiles(
     exclude_all_properties: bool = False,
     feature_id: str | None = None,
     spill_dir: str | os.PathLike[str] | None = None,
+    profile: Literal['auto', 'speed', 'bounded'] = "auto",
     name: str | None = None,
     description: str | None = None,
     attribution: str | None = None,
@@ -228,6 +229,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `exclude_all_properties`: Drop every property, writing geometry-only tiles. `include_properties` overrides it.
 * `feature_id`: Integer column to use as the MVT feature ID.
 * `spill_dir`: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) used when memory runs short.
+* `profile`: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles): `"auto"`, `"speed"` or `"bounded"`. Output is identical across profiles.
 * `name`: Human-readable tileset name, stored in the metadata.
 * `description`: Description of the tileset, stored in the metadata.
 * `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.

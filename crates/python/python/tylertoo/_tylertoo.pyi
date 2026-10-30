@@ -110,6 +110,7 @@ def export_pmtiles(
     min_zoom: int | None = None,
     name: str | None = None,
     partition_wave: int = 0,
+    profile: Literal["auto", "speed", "bounded"] = "auto",
     simple_clip_fastpath: bool = True,
     size_valve: Literal["merge", "drop"] = "merge",
     spill_dir: str | os.PathLike[str] | None = None,

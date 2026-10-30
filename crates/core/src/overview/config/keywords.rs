@@ -357,6 +357,7 @@ pub fn command_defaults(command: &str) -> Map<String, Value> {
                 "tile_range",
                 "zoom_ceiling",
                 "spill_dir",
+                "profile",
             ] {
                 out.remove(key);
             }

@@ -187,6 +187,7 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 | Option | Description |
 | --- | --- |
 | `--spill-dir <PATH>` | Directory for the export's spill file, used when buffered tiles exceed the memory budget. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>. |
+| `--profile <PROFILE>` | Memory profile for writing levels: `speed` buffers in RAM, `bounded` spills to disk, and `auto` picks per run. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>. Default: `auto`. Possible values: `auto`, `speed`, `bounded`. |
 
 ## `tylertoo decode`
 

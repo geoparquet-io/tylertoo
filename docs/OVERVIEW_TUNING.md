@@ -1801,6 +1801,7 @@ across all cores. The profile decides where output rows wait before writing.
 | Option | Default | Effect |
 |--------|---------|--------|
 | `--profile speed\|bounded\|auto` | `auto` | Choose RAM buffering or disk spilling |
+| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export |
 | `--in-flight-batches N\|auto` | cores, clamped to 4–16 | More batches = more overlap and memory |
 | `--read-workers N\|auto` | cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
 
