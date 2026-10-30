@@ -139,7 +139,7 @@ pub(super) fn auto_backing(
 ///    non-reclaimable part of the cgroup's current usage is subtracted — the
 ///    same sense as the machine term's `MemAvailable` (#485);
 /// 3. `None` (callers fall back to a fixed conservative budget — see
-///    [`AUTO_FALLBACK_BUDGET_BYTES`] and
+///    [`MemoryBudget::remaining`]'s fallback allowance and
 ///    [`super::export::PARTITION_WAVE_FALLBACK_MAX`]).
 ///
 /// The result is computed once per process and cached: the probe is called ~5×

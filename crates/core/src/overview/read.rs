@@ -29,7 +29,8 @@ pub(super) struct ReadTuning {
     pub(super) workers: usize,
     /// Average encoded-geometry bytes per input row (#305), from the footers
     /// (#717), used only to size the read-ahead against the memory budget.
-    /// `None` falls back to [`READ_ROW_BYTES_FALLBACK`].
+    /// `None` falls back to the per-row model
+    /// ([`MemoryBudget::estimate`]).
     pub(super) avg_geom_bytes: Option<u64>,
     /// What the footers say this read decodes ([`footer_price`]): what
     /// prices a read batch and a reader's own row group. `None` falls back to
@@ -100,8 +101,8 @@ struct ReadShape {
 
 /// What one resident read batch costs (#716).
 ///
-/// From the footers when [`ReadTuning::row_bytes`] is known
-/// ([`footer_row_bytes`]), and never past [`tylertoo_io::decoded_batch_limit`],
+/// From the footers when [`ReadTuning::footer`] is known
+/// ([`footer_price`]), and never past [`tylertoo_io::decoded_batch_limit`],
 /// the most the reader builds into one batch. Measured
 /// (`.788/PROFILE-LOG.md`, dhat): Moldova's 8,192-row batches hold 7.6 MiB
 /// live, priced at 17 MiB this way where the model below charged 64 MiB.
@@ -181,6 +182,10 @@ pub(super) fn grant_read_ahead(
 /// byte-array chunks without the statistic) 1.9×. Priced at the worse one.
 const DECODED_PER_FOOTER_BYTE: u64 = 2;
 
+/// Bytes a decoded column adds to each row beyond its footer bytes: its
+/// offsets and validity (#716).
+const DECODED_BYTES_PER_COLUMN: u64 = 8;
+
 /// What the footers say a read decodes (#716).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FooterPrice {
@@ -194,7 +199,7 @@ pub(super) struct FooterPrice {
 /// Decoded bytes per row over `columns` of the selected row groups, from the
 /// footers: each column's uncompressed size, or its unencoded byte-array
 /// size when larger ([`ConvertSource::selected_column_bytes`]), times
-/// [`DECODED_PER_FOOTER_BYTE`], plus 8 bytes per column for the offsets and
+/// [`DECODED_PER_FOOTER_BYTE`], plus [`DECODED_BYTES_PER_COLUMN`] for the offsets and
 /// validity a decoded column adds; and the largest selected row group's
 /// rows. `None` without rows.
 pub(super) fn footer_price(
@@ -229,7 +234,7 @@ pub(super) fn footer_price(
         row_bytes: bytes
             .div_ceil(rows)
             .saturating_mul(DECODED_PER_FOOTER_BYTE)
-            .saturating_add(count.saturating_mul(8))
+            .saturating_add(count.saturating_mul(DECODED_BYTES_PER_COLUMN))
             .max(1),
         group_rows,
     }))

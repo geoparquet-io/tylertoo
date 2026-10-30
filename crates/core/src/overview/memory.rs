@@ -49,6 +49,10 @@ const COMPUTE_SHARE: f64 = 0.10;
 /// quarter and leave the rest to it.
 const ENCODE_SHARE: f64 = 0.25;
 
+/// Share of the available memory the Python-facing loss list may hold
+/// before exact reports stream from spill instead.
+const PYTHON_LOSS_SHARE: f64 = 0.10;
+
 /// Fewest row groups a non-`speed` writer encodes at once, pool permitting:
 /// #545's A/B kept 4 as the point below which the drain serializes.
 const ENCODE_FLOOR: usize = 4;
@@ -248,7 +252,8 @@ impl MemoryBudget {
     /// Python list allowance; exact Rust reports always stream from spill.
     pub(super) fn python_loss_allowance(&self) -> usize {
         let cap = crate::diagnostics::MAX_PYTHON_LOSS_BYTES as u64;
-        self.available().map_or(cap, |b| (b / 10).min(cap)) as usize
+        self.available()
+            .map_or(cap, |b| ((b as f64 * PYTHON_LOSS_SHARE) as u64).min(cap)) as usize
     }
     /// What a run under `profile` may still hold resident: unbounded for
     /// `speed`, otherwise [`ALLOWANCE_FRACTION`] of what the reservations
