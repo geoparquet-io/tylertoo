@@ -1807,6 +1807,7 @@ processed at once, and how many row groups the writer encodes at once.
 | Option | Default | Effect |
 |--------|---------|--------|
 | `--profile speed\|bounded\|auto` | `auto` | How much memory the run may hold |
+| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export |
 | `--in-flight-batches N\|auto` | cores, clamped to 4–16 | More batches = more overlap and memory |
 | `--read-workers N\|auto` | pass 1 cores/2, pass 2 cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
 
@@ -1848,6 +1849,11 @@ When the spill's footer-priced size fits the allowance, pass 2 reserves it
 before any grant. When it does not fit, nothing is reserved, because the
 cache cannot hold it and reserving it would only starve the grants.
 `TYLERTOO_PROFILE_JSON` records the decision under `pass2.spill_reservation`.
+
+Release binaries use the mimalloc allocator, which is faster than the
+system allocator but can keep freed memory mapped, so a run's RSS can sit
+above its live heap. That gap is allocator retention, not a leak. `--profile bounded`
+remains the setting for memory-constrained machines.
 
 ### Automatic memory estimate
 

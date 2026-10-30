@@ -756,6 +756,10 @@ Key metrics:
 
 - **Total bytes** — total heap allocation across the run
 - **Peak bytes** — high-water mark (compare against `time -v` RSS)
+
+The CLI uses mimalloc by default (#739); dhat replaces it while profiling.
+RSS above dhat's peak in a mimalloc run, bounded runs included, is allocator
+retention, and `--profile bounded` remains the memory escape hatch.
 - **At end bytes** — still allocated at exit (potential leaks)
 - **Allocation sites** — sorted by total bytes; expand call stacks
 
