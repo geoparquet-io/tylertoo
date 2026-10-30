@@ -156,6 +156,9 @@ fn dense_capped_tile_encode_peak_live_bytes_is_bounded() {
         drop(profiler);
         measured
     });
+    eprintln!(
+        "dense capped tile encode peak: {peak} bytes; output {bytes} bytes; features {features}"
+    );
     assert!(features > 0 && features < ROWS);
     assert!(bytes <= RAW_CAP);
     assert!(
