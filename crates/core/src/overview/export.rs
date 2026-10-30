@@ -2315,9 +2315,9 @@ fn export_pmtiles_validated(
         usize::try_from(gzip_grant.bytes()).unwrap_or(usize::MAX),
     ));
     let mut store = if single_read {
-        let backing = knobs.backing_override.unwrap_or_else(|| {
-            auto_fill_backing(&scans, num_levels, budget.available(), mean_member_bytes)
-        });
+        let backing = knobs
+            .backing_override
+            .unwrap_or_else(|| auto_fill_backing(&scans, num_levels, budget, mean_member_bytes));
         // #571: entered only when the fill runs, so a duplicating-mode export
         // (no fill) has no `fill` entry in `phase_peaks_mib`.
         progress.enter_phase("fill");
@@ -2605,16 +2605,11 @@ struct CheckpointCtx<'a> {
 fn auto_fill_backing(
     scans: &[LevelScan],
     num_levels: usize,
-    available_ram: Option<u64>,
+    budget: &MemoryBudget,
     mean_member_bytes: Option<u64>,
 ) -> SinkBacking {
     let buffered_rows: usize = scans.iter().map(|s| s.feature_count).sum();
-    let b = auto_backing(
-        Mode::Partitioning,
-        buffered_rows,
-        available_ram,
-        mean_member_bytes,
-    );
+    let b = auto_backing(budget, Mode::Partitioning, buffered_rows, mean_member_bytes);
     log::info!(
         "[export] pass2 single-read fan-out (#235): ~{buffered_rows} buffered \
          member row(s) across {num_levels} level(s) → {b:?}"
