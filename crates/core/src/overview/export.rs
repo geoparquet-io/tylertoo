@@ -7362,26 +7362,6 @@ fn encode_tile(
 /// before it writes the tile without one.
 const MAX_FILL_PASSES: u32 = 4;
 
-/// Temporary adapter until E2's fit owner accepts cached gzip bytes.
-/// `fitted` is the unchanged output already checked by the base size valve.
-/// A missing cache still uses the fit owner's normal error/compression path.
-fn base_fit_for_fill(fitted: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError> {
-    let Some((limit, gzip)) = opts
-        .compressed_tile_size_limit
-        .filter(|&l| l > 0)
-        .zip(fitted.gzip.as_ref())
-    else {
-        return tile_fit(fitted, opts);
-    };
-    let raw_fit = opts
-        .tile_size_limit
-        .filter(|&l| l > 0)
-        .map_or(f64::INFINITY, |limit| {
-            limit as f64 / fitted.data.len() as f64
-        });
-    Ok(raw_fit.min(limit as f64 / gzip.len() as f64))
-}
-
 /// The tile the size valve fitted (`fitted`) with as much of its #750 fill
 /// as fits in the room left, re-encoding the same features with a subset of
 /// the fill through `encode` (the merge valve's cached encode, so a heavily
@@ -7423,7 +7403,7 @@ fn with_fill(
         tally.vertices = 0;
         fitted
     };
-    if base_fit_for_fill(&mut fitted, opts).unwrap_or(f64::INFINITY) < 1.0 {
+    if tile_fit(&mut fitted, opts).unwrap_or(f64::INFINITY) < 1.0 {
         #[cfg(test)]
         note_gzip(base_gzip_before, &fitted);
         return no_fill(tally, fitted);
@@ -11733,6 +11713,7 @@ mod tests {
         let polygons: usize = fill.iter().map(|f| f.polygons).sum();
         let mut tally = FillTally::default();
         let mvt = encode_tile(
+            &test_gzip_cache(),
             &members,
             &tb,
             &ExportOptions::default(),
@@ -11755,6 +11736,7 @@ mod tests {
         let (tb, members, fill) = crowded_tile();
         let mut tally = FillTally::default();
         let mvt = encode_tile(
+            &test_gzip_cache(),
             &members,
             &tb,
             &ExportOptions {
