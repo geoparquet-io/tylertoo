@@ -257,36 +257,58 @@ fn stage_input_pass0(
 }
 
 /// Fetch `plan` with its requests in flight granted from `budget` (#788,
-/// [`MemoryPhase::Stage`]): units of the plan's largest request (a footer
-/// price), up to the concurrency ceiling, or what
-/// `TYLERTOO_STAGING_MEM_BUDGET_BYTES` fits when that is set, never fewer
-/// than one, granted under `profile` as every phase is
-/// ([`MemoryBudget::fit`]). The grant is released when staging ends. Pass 0 and the
-/// `--max-zoom auto` sample both stage through it.
+/// [`MemoryPhase::Stage`], [`staging_grant`]). The grant is released when
+/// staging ends. Pass 0 and the `--max-zoom auto` sample both stage through
+/// it.
 pub(super) fn stage_granted(
     source: &ConvertSource,
     plan: &crate::input_set::StagingPlan,
     budget: &mut MemoryBudget,
     profile: super::level::MemoryProfile,
 ) -> Result<crate::input::StagingReport, crate::input::InputError> {
+    let grant = staging_grant(
+        budget,
+        profile,
+        plan.largest_request(),
+        crate::input::staging_want(),
+        crate::input::unbudgeted_stage_admission(),
+    );
+    let report = source.stage_within(plan, grant.bytes());
+    budget.release(grant);
+    report
+}
+
+/// The staging admission's grant (#788): units of the largest request (a
+/// footer price), up to the concurrency ceiling, or what
+/// `TYLERTOO_STAGING_MEM_BUDGET_BYTES` fits when that is set, never fewer
+/// than one, under `profile` ([`MemoryBudget::fit`]). `bounded` also keeps
+/// main's byte budget (`main_bytes`, the env override or the fixed default):
+/// no more requests in flight than it holds.
+fn staging_grant(
+    budget: &mut MemoryBudget,
+    profile: super::level::MemoryProfile,
+    largest_request: u64,
+    (ceiling, budget_override): (usize, Option<u64>),
+    main_bytes: u64,
+) -> super::memory::Grant {
     use super::memory::{Price, PriceBasis};
-    let largest = plan.largest_request().max(1);
-    let (ceiling, budget_override) = crate::input::staging_want();
-    let want = budget_override.map_or(ceiling, |bytes| {
+    let largest = largest_request.max(1);
+    let fits = |bytes: u64| {
         usize::try_from(bytes / largest)
             .unwrap_or(usize::MAX)
             .clamp(1, ceiling.max(1))
-    });
-    let grant = budget.fit(
+    };
+    let mut want = budget_override.map_or(ceiling, fits);
+    if profile == super::level::MemoryProfile::Bounded {
+        want = want.min(fits(main_bytes));
+    }
+    budget.fit(
         profile,
         MemoryPhase::Stage,
         Price::new(largest, PriceBasis::Footer),
         want,
         1,
-    );
-    let report = source.stage_within(plan, grant.bytes());
-    budget.release(grant);
-    report
+    )
 }
 
 /// What pass 0 did (#788): the `pass0` record of the `TYLERTOO_PROFILE_JSON`
@@ -6893,6 +6915,43 @@ mod tests {
             in_flight, 1,
             "a budget that fits one request stages one at a time"
         );
+    }
+
+    /// #788: the staging grant per profile, for 64 MiB requests against
+    /// main's 256 MiB staging budget and a concurrency ceiling of 8.
+    /// `bounded` keeps main's budget (4 in flight, not 8); `auto` is decided
+    /// by the allowance; `speed` takes the ceiling; an env override sets the
+    /// count for every profile alike.
+    #[test]
+    fn bounded_staging_keeps_main_byte_budget() {
+        const MIB: u64 = 1 << 20;
+        let largest = 64 * MIB;
+        let main = 256 * MIB;
+        let units = |profile, available: u64, override_bytes: Option<u64>| {
+            let mut budget = MemoryBudget::with_available(Some(available));
+            let main = override_bytes.unwrap_or(main);
+            let grant = staging_grant(&mut budget, profile, largest, (8, override_bytes), main);
+            let n = grant.bytes() / largest;
+            budget.release(grant);
+            n
+        };
+        let roomy = 1 << 40;
+        assert_eq!(units(MemoryProfile::Bounded, roomy, None), 4);
+        assert_eq!(units(MemoryProfile::Auto, roomy, None), 8);
+        assert_eq!(units(MemoryProfile::Speed, roomy, None), 8);
+        // A tight machine: the allowance (60% of 400 MiB) holds 3.
+        assert_eq!(units(MemoryProfile::Auto, 400 * MIB, None), 3);
+        assert_eq!(units(MemoryProfile::Bounded, 400 * MIB, None), 3);
+        // Never below one request, whatever the budget.
+        assert_eq!(units(MemoryProfile::Bounded, MIB, None), 1);
+        // TYLERTOO_STAGING_MEM_BUDGET_BYTES=128 MiB: two for every profile.
+        for profile in [
+            MemoryProfile::Bounded,
+            MemoryProfile::Auto,
+            MemoryProfile::Speed,
+        ] {
+            assert_eq!(units(profile, roomy, Some(128 * MIB)), 2);
+        }
     }
 
     use geo::{LineString, Point, Polygon};

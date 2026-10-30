@@ -1820,7 +1820,8 @@ processed at once, and how many row groups the writer encodes at once.
   IPC files and stream back at write time. Every other phase keeps the caps
   `bounded` always had, and the allowance can only shrink them: at most 4
   readers, each at most 16 batches deep, and at most 4 concurrent row-group
-  encodes. The compute window takes what `--in-flight-batches` asks for,
+  encodes. Remote staging holds at most 256 MiB of requests in flight, or
+  `TYLERTOO_STAGING_MEM_BUDGET_BYTES` when set. The compute window takes what `--in-flight-batches` asks for,
   within the allowance. Its peak never exceeds what `bounded` used before
   the run budget existed (#788), whatever the machine.
 - **`auto`**, the default, sizes the run to the machine. Every phase fits
