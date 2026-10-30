@@ -2311,6 +2311,39 @@ mod sink_sample_tests {
         assert!(50_000_000u64 * 4_096 > budget);
     }
 
+    /// #788: grants can use the whole allowance before pass 2 starts. In
+    /// `sink_downgrade.rs`'s skewed fixture under a 180 MB limit, the
+    /// writer's encode floor alone is 4 x 250.6 MB. A saturated allowance
+    /// never leaves a RAM sink unguarded: `auto` spills up front, and a
+    /// RAM sink armed against a zero allowance downgrades on its first
+    /// sample.
+    #[test]
+    fn a_saturated_allowance_spills_and_never_disarms() {
+        use crate::overview::memory::{MemoryPhase, Price, PriceBasis};
+        let mut memory = MemoryBudget::with_available(Some(180_000_000));
+        let _encodes = memory.fit(
+            MemoryProfile::Auto,
+            MemoryPhase::Encode,
+            Price::new(250_600_000, PriceBasis::Footer),
+            64,
+            4,
+        );
+        assert_eq!(memory.allowance(MemoryProfile::Auto), 0);
+        assert!(matches!(
+            resolve_backing(
+                memory,
+                MemoryProfile::Auto,
+                Mode::Duplicating,
+                59_689,
+                Some(26)
+            ),
+            SinkBacking::Spill
+        ));
+        let mut tuner = SinkAutoTuner::new(MemoryProfile::Auto, SinkBacking::Ram, ROWS, memory);
+        tuner.observe(&sample_batch(0));
+        assert!(tuner.should_downgrade(), "a zero allowance must downgrade");
+    }
+
     /// `bounded` and `speed` are instructions, not estimates: the tuner still
     /// measures (the profile dump wants the number) but can never act.
     #[test]

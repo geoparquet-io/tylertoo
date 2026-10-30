@@ -1832,7 +1832,9 @@ processed at once, and how many row groups the writer encodes at once.
   only what the earlier ones left (#716, #545). Output rows stay in RAM when
   their estimate fits and spill when it does not, and a run that starts in
   RAM keeps measuring and switches to spilling mid-pass if it outgrows the
-  allowance.
+  allowance. Both checks use what the earlier grants left. When those grants
+  take the whole allowance, as the writer's encodes can for wide rows under a
+  small limit, output rows spill from the start.
 
 Export applies the same rule. `speed` keeps every level's tile members in
 RAM and sizes the partition wave from the cores alone; `bounded` spills them
