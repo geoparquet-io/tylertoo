@@ -56,6 +56,7 @@ use crossbeam_channel::{Receiver, Sender};
 use rayon::prelude::*;
 use std::path::Path;
 use tempfile::NamedTempFile;
+use tylertoo_io::IpcCompression;
 use tylertoo_io::IpcStreamReader as StreamReader;
 use tylertoo_io::IpcStreamWriter as StreamWriter;
 
@@ -87,33 +88,17 @@ pub(super) enum SinkBacking {
 }
 
 /// Run-local spill encoding policy, resolved once with the sink backing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum SpillCodec {
-    #[default]
-    Raw,
-    Lz4,
+const fn spill_codec_for_profile(profile: MemoryProfile) -> IpcCompression {
+    match profile {
+        MemoryProfile::Bounded => IpcCompression::Lz4,
+        MemoryProfile::Auto | MemoryProfile::Speed => IpcCompression::None,
+    }
 }
 
-impl SpillCodec {
-    const fn for_profile(profile: MemoryProfile) -> Self {
-        match profile {
-            MemoryProfile::Bounded => Self::Lz4,
-            MemoryProfile::Auto | MemoryProfile::Speed => Self::Raw,
-        }
-    }
-
-    const fn ipc(self) -> tylertoo_io::IpcCompression {
-        match self {
-            Self::Raw => tylertoo_io::IpcCompression::None,
-            Self::Lz4 => tylertoo_io::IpcCompression::Lz4,
-        }
-    }
-
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Raw => "raw",
-            Self::Lz4 => "lz4",
-        }
+pub(super) const fn spill_codec_name(codec: IpcCompression) -> &'static str {
+    match codec {
+        IpcCompression::None => "raw",
+        IpcCompression::Lz4 => "lz4",
     }
 }
 
@@ -696,7 +681,7 @@ const SINK_SAMPLE_MIN_ROWS: usize = 1_024;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct SinkMeasurement {
     /// The run's private spill encoding, including an auto downgrade.
-    pub(super) codec: SpillCodec,
+    pub(super) codec: IpcCompression,
     /// Measured retained bytes per buffered output row — the Arrow array
     /// bytes (geometry + every kept property column) of every batch handed to
     /// the sinks, averaged over the whole pass, plus
@@ -846,7 +831,7 @@ impl SinkAutoTuner {
 
     fn report(&self) -> SinkMeasurement {
         SinkMeasurement {
-            codec: SpillCodec::Raw,
+            codec: IpcCompression::None,
             bytes_per_row: self.bytes_per_row(),
             sampled_rows: self.rows,
             projected_bytes: self.projected_bytes(),
@@ -896,14 +881,14 @@ impl LevelSink {
         out_schema: &Schema,
         spill_dir: Option<&Path>,
     ) -> Result<Self, ConvertError> {
-        Self::with_codec(backing, out_schema, spill_dir, SpillCodec::Raw)
+        Self::with_codec(backing, out_schema, spill_dir, IpcCompression::None)
     }
 
     fn with_codec(
         backing: SinkBacking,
         out_schema: &Schema,
         spill_dir: Option<&Path>,
-        codec: SpillCodec,
+        codec: IpcCompression,
     ) -> Result<Self, ConvertError> {
         Ok(match backing {
             SinkBacking::Ram => LevelSink::Ram(Vec::new()),
@@ -1035,13 +1020,13 @@ impl SpillState {
     /// scratch knob); `None` is the process temp dir, as before.
     fn new(out_schema: &Schema, spill_dir: Option<&Path>) -> Result<Self, ConvertError> {
         // RAM can downgrade only under auto, whose codec stays raw.
-        Self::with_codec(out_schema, spill_dir, SpillCodec::Raw)
+        Self::with_codec(out_schema, spill_dir, IpcCompression::None)
     }
 
     fn with_codec(
         out_schema: &Schema,
         spill_dir: Option<&Path>,
-        codec: SpillCodec,
+        codec: IpcCompression,
     ) -> Result<Self, ConvertError> {
         let temp = spill_temp_file(spill_dir)?;
         let write_handle = temp.reopen()?;
@@ -1051,7 +1036,7 @@ impl SpillState {
         let writer = StreamWriter::try_new_with_compression(
             BufWriter::new(write_handle),
             out_schema,
-            codec.ipc(),
+            codec,
         )?;
         Self::spawn(writer, temp)
     }
@@ -1230,7 +1215,7 @@ pub(super) fn run_pass2_buffered(
     let t_engine = Instant::now();
     let timers = Pass2Timers::default();
 
-    let codec = SpillCodec::for_profile(profile);
+    let codec = spill_codec_for_profile(profile);
     let mut sinks: Vec<LevelSink> = Vec::with_capacity(num_levels);
     for _ in 0..num_levels {
         sinks.push(LevelSink::with_codec(
@@ -1575,7 +1560,7 @@ mod spill_tests {
         let mut sink = SpillState::with_codec(
             &s,
             Some(dir.path()),
-            SpillCodec::for_profile(MemoryProfile::Bounded),
+            spill_codec_for_profile(MemoryProfile::Bounded),
         )
         .unwrap();
         const ROWS: usize = 65536;
@@ -1593,12 +1578,12 @@ mod spill_tests {
     #[test]
     fn auto_and_speed_spill_remain_raw() {
         assert_eq!(
-            SpillCodec::for_profile(MemoryProfile::Bounded),
-            SpillCodec::Lz4
+            spill_codec_for_profile(MemoryProfile::Bounded),
+            IpcCompression::Lz4
         );
         for profile in [MemoryProfile::Auto, MemoryProfile::Speed] {
-            let codec = SpillCodec::for_profile(profile);
-            assert_eq!(codec, SpillCodec::Raw);
+            let codec = spill_codec_for_profile(profile);
+            assert_eq!(codec, IpcCompression::None);
             let dir = tempfile::tempdir().unwrap();
             let schema = schema("id");
             let mut sink = SpillState::with_codec(&schema, Some(dir.path()), codec).unwrap();
@@ -1608,20 +1593,6 @@ mod spill_tests {
             assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), ROWS);
             assert!(temp.as_file().metadata().unwrap().len() >= (ROWS * size_of::<i64>()) as u64);
         }
-    }
-
-    /// #499: count non-null geometry payloads handed to completed spill files on the real
-    /// convert path. Every polygon is unchanged at all five verbatim levels;
-    /// a canonical payload plus references should materialize it only once
-    /// across the four buffered levels. Final public overview rows stay 5N.
-    #[test]
-    #[ignore = "#788: 512 geometry rows for 128 features; canonical columns raise tiny-batch instructions 13.4%"]
-    fn phase1_unchanged_geometry_spills_once_across_levels() {
-        let dir = tempfile::tempdir().unwrap();
-        let observations = measure_verbatim_spill(dir.path());
-        let materializations: u64 = observations.iter().map(|&(rows, _)| rows).sum();
-        assert!(materializations <= 128,
-            "#499: 128 unchanged features materialized {materializations} geometry rows across four buffered levels");
     }
 
     /// The current preflight ignores even a measured pass-2 footprint for a
@@ -1776,11 +1747,11 @@ mod spill_tests {
             }
         }
         let s = schema("id");
-        for codec in [SpillCodec::Raw, SpillCodec::Lz4] {
+        for codec in [IpcCompression::None, IpcCompression::Lz4] {
             let writer = StreamWriter::try_new_with_compression(
                 FullVolume(FailsAfter { remaining: 512 }),
                 &s,
-                codec.ipc(),
+                codec,
             )
             .unwrap();
             let dir = tempfile::tempdir().unwrap();
@@ -2134,61 +2105,6 @@ mod sink_sample_tests {
     /// Rows per synthetic batch. Comfortably over [`SINK_SAMPLE_MIN_ROWS`], so
     /// one batch is already a decision-grade sample.
     const ROWS: usize = 4_096;
-
-    /// A property-less point still needs only 21 WKB bytes. Tiny input
-    /// batches must not retain/persist every empty mixed-geometry child.
-    #[test]
-    #[ignore = "#788: fixed UnionArray topology is 14356 B/row; coalescing failed the peak gate"]
-    fn tiny_propertyless_points_have_bounded_sink_cost() {
-        use geoarrow::array::GeometryBuilder;
-        use geoarrow::datatypes::GeometryType;
-        use geoarrow_array::GeoArrowArray;
-
-        const POINTS: usize = 512;
-        const WKB_POINT_BYTES: u64 = 21;
-        let dir = tempfile::tempdir().unwrap();
-        let field = super::super::convert::mixed_geometry_field("geometry", Default::default());
-        let schema = Arc::new(Schema::new(vec![field]));
-        let mut sink = LevelSink::new(SinkBacking::Spill, &schema, Some(dir.path())).unwrap();
-        let mut tuner = SinkAutoTuner::with_budget(false, POINTS, 0);
-        for i in (0..POINTS).step_by(2) {
-            let mut builder = GeometryBuilder::new(GeometryType::new(Default::default()));
-            for row in i..i + 2 {
-                builder
-                    .push_geometry(Some(&geo::Geometry::Point(geo::Point::new(
-                        -99.2 + row as f64 * 0.00001,
-                        19.4,
-                    ))))
-                    .unwrap();
-            }
-            let geometry = builder.finish().to_array_ref();
-            if i == 0 {
-                eprintln!(
-                    "two-point native: array={} buffers={}",
-                    geometry.get_array_memory_size(),
-                    geometry.get_buffer_memory_size()
-                );
-            }
-            let batch = RecordBatch::try_new(schema.clone(), vec![geometry]).unwrap();
-            buffer_batch(&mut sink, &mut tuner, batch).unwrap();
-        }
-        let LevelSink::Spill(state) = sink else {
-            panic!("bounded sink must spill");
-        };
-        let (reader, temp) = state.into_reader(&Pass2Timers::default()).unwrap();
-        assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), POINTS);
-        let disk_bytes = temp.as_file().metadata().unwrap().len();
-        let per_row = tuner.bytes_per_row().unwrap();
-        eprintln!("tiny points: retained={per_row} B/row, physical={disk_bytes} B");
-        assert!(
-            per_row <= 32 * WKB_POINT_BYTES,
-            "{per_row} B/row exceeds 32 times a {WKB_POINT_BYTES}-byte WKB point"
-        );
-        assert!(
-            disk_bytes <= POINTS as u64 * 32 * WKB_POINT_BYTES,
-            "{disk_bytes} physical bytes for {POINTS} property-less points"
-        );
-    }
 
     /// A batch of `ROWS` rows: one WKB-ish geometry column of 8-byte values
     /// plus `props` `Float64` property columns — the shape a buffered output

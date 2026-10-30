@@ -1856,23 +1856,8 @@ above its live heap. That gap is allocator retention, not a leak. `--profile bou
 remains the setting for memory-constrained machines.
 
 `bounded` uses LZ4 framing for its private IPC spill streams; `auto` and
-`speed` keep raw IPC, including an `auto` downgrade to disk. The IO facade
-caps LZ4 blocks at 64 KiB and releases codec scratch between writes. This
-bounds active scratch independently of input size and avoids a per-level
-idle workspace floor, while preserving the original
-Arrow batch boundaries on drain. Saved-plan files keep their existing format.
-
-The benchmark lane measured the earlier Arrow-buffer LZ4 variant on Moldova
-verbatim forced spill at 0.25× disk bytes and 0.81× peak RSS, with 1.052× total
-wall time when uncapped. For Mato Grosso bounded under a 4 GiB memory cap,
-pass 2 fell from 91 to 52 seconds median (0.58×), total wall time was 0.83×,
-and RSS and output were unchanged. That capped result uses two noisy rounds;
-these wall figures describe the earlier body codec, not the fixed-block
-stream framing. With transient framing, live heap is neutral and measured
-RSS is within run-to-run noise, not proven at-or-below raw; the isolated
-benchmark lane checks the bounded RSS envelope before merge.
-Disk preflight sums conservative raw components and assumes
-no compression savings. `pass2.sink.spill_codec` records the selected codec.
+`speed` keep raw IPC, including an `auto` downgrade to disk.
+`pass2.sink.spill_codec` records the selected codec.
 
 ### Automatic memory estimate
 
