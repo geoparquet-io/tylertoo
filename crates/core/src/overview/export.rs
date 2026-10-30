@@ -1957,6 +1957,9 @@ struct Pass2Run {
     /// Whether the levels read from the single-read member store (#235).
     #[cfg(test)]
     single_read: bool,
+    /// The export's work counts (#788).
+    #[cfg(test)]
+    work: ExportWorkTally,
 }
 
 fn export_pmtiles_run(
@@ -2252,6 +2255,8 @@ fn export_pmtiles_validated(
     } else {
         0
     };
+    #[cfg(test)]
+    let work = Mutex::new(ExportWorkTally::default());
     let levels: Vec<ExportLevelCtx<'_>> = plans
         .iter()
         .enumerate()
@@ -2267,6 +2272,8 @@ fn export_pmtiles_validated(
             options,
             start,
             fills: None,
+            #[cfg(test)]
+            work: &work,
         })
         .collect();
     let level_groups = plan_level_groups(&plans, group_cap);
@@ -2310,6 +2317,8 @@ fn export_pmtiles_validated(
         diagnostics,
     );
 
+    #[cfg(test)]
+    let work = work.lock().unwrap_or_else(PoisonError::into_inner).clone();
     Ok(Pass2Run {
         report: ExportReport::from_zooms(
             mode,
@@ -2325,6 +2334,8 @@ fn export_pmtiles_validated(
         checkpoint_zooms: progress.checkpoint_zooms,
         #[cfg(test)]
         single_read,
+        #[cfg(test)]
+        work,
     })
 }
 
@@ -2748,6 +2759,9 @@ struct ExportLevelCtx<'a> {
     start: Instant,
     /// The #750 coverage fill, when asked for.
     fills: Option<&'a coverage_fill::FillMap>,
+    /// The export's test-only work counts (#788).
+    #[cfg(test)]
+    work: &'a Mutex<ExportWorkTally>,
 }
 
 impl<'a> ExportLevelCtx<'a> {
@@ -2763,6 +2777,8 @@ impl<'a> ExportLevelCtx<'a> {
             feature_id: self.feature_id,
             timers,
             fills: self.fills,
+            #[cfg(test)]
+            work: self.work,
         }
     }
 }
@@ -3414,6 +3430,23 @@ struct Partition {
 }
 
 /// Shared per-level context for partition processing.
+/// Deterministic work counts the #788 export tests pin (test builds only):
+/// what the duplicating-mode wave collect does, independent of timing.
+#[cfg(test)]
+#[derive(Debug, Default, Clone)]
+struct ExportWorkTally {
+    /// Rows the wave reads delivered, per level index, summed over every
+    /// wave of the level (#740). A level whose band is read once has exactly
+    /// its band's row count here; each wave that re-reads row groups another
+    /// wave already read adds them again.
+    band_rows_read: BTreeMap<usize, u64>,
+    /// Rows whose per-row collect work (geometry decode, property
+    /// materialization and member routing in [`collect_wave_members`]) ran
+    /// on the wave's consumer thread, outside the Rayon pool, so that no
+    /// other core could share it (#740).
+    serial_collect_rows: u64,
+}
+
 struct LevelCtx<'a> {
     reader: &'a OverviewReader,
     level_idx: usize,
@@ -3429,6 +3462,9 @@ struct LevelCtx<'a> {
     timers: &'a ExportTimers,
     /// The #750 coverage fill, when asked for.
     fills: Option<&'a coverage_fill::FillMap>,
+    /// The export's test-only work counts (#788).
+    #[cfg(test)]
+    work: &'a Mutex<ExportWorkTally>,
 }
 
 /// The per-export constants the single-read fan-out reads for every batch:
@@ -5005,6 +5041,11 @@ fn collect_wave(
             Ok(())
         },
     )?;
+    #[cfg(test)]
+    {
+        let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
+        *work.band_rows_read.entry(ctx.level_idx).or_default() += rows.read;
+    }
     Ok(CollectedWave {
         buckets,
         rows_read: rows.read,
@@ -5106,6 +5147,13 @@ fn collect_wave_members(
 
     // Extract property columns once per batch; materialize per-feature props
     // only for rows that produced members.
+    #[cfg(test)]
+    if rayon::current_thread_index().is_none() {
+        ctx.work
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .serial_collect_rows += batch.num_rows() as u64;
+    }
     let mut attrs =
         AttrColumns::new(&schema, geom_idx, ctx.published, ctx.feature_id).extract(batch);
     for (row, items) in row_members.into_iter().enumerate() {
@@ -9420,6 +9468,73 @@ mod tests {
             fail_level: None,
             memory_limit: None,
         }
+    }
+
+    /// Run the duplicating-mode wave path of [`equivalence_fixture`] with one
+    /// tile per partition and one partition per wave, so each multi-tile
+    /// level takes several waves (#740's shape: more partitions than the wave
+    /// is wide). Returns the run and the per-level band row counts.
+    fn multi_wave_duplicating_run() -> (Pass2Run, BTreeMap<usize, u64>) {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(input.path());
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            partition_wave: 1,
+            ..Default::default()
+        };
+        let run = export_pmtiles_run(
+            input.path(),
+            out.path(),
+            &opts,
+            1,
+            &knobs(true, None, false),
+        )
+        .unwrap();
+        let band_rows = run
+            .report
+            .zooms
+            .iter()
+            .map(|z| (z.level, z.level_feature_count as u64))
+            .collect();
+        (run, band_rows)
+    }
+
+    /// #740 (read amplification): a duplicating-mode level split into several
+    /// waves must read its band's rows once, not once per wave. On
+    /// `origin/main` every wave re-reads each row group its bbox touches, so
+    /// a level of `W` waves over one row group reads its band `W` times
+    /// (measured 1.2-2.5x per finest level on NZ parcels and FTW Moldova).
+    #[test]
+    fn multi_wave_level_reads_each_band_row_once() {
+        let (run, band_rows) = multi_wave_duplicating_run();
+        // One tile per partition and one partition per wave: a level of
+        // several tiles takes several waves.
+        assert!(
+            run.report.zooms.iter().any(|z| z.tile_count > 1),
+            "the fixture must give some level several waves"
+        );
+        assert_eq!(
+            run.work.band_rows_read, band_rows,
+            "rows read per level (left) vs the level's band rows (right)"
+        );
+    }
+
+    /// #740 (parallelism): the per-row collect work (geometry decode,
+    /// property materialization, member routing) must not run serially on
+    /// the wave's consumer thread, outside the Rayon pool. On `origin/main`
+    /// all of it does: only the clip is parallel, and the profiled collect
+    /// keeps about 8 of 64 cores busy (moldova z0-14, 8.5 busy cores while
+    /// the consumer is in `collect_wave`, the consumer itself busy 70% of
+    /// that wall).
+    #[test]
+    fn wave_collect_does_no_per_row_work_on_the_consumer_thread() {
+        let (run, band_rows) = multi_wave_duplicating_run();
+        assert!(band_rows.values().sum::<u64>() > 0);
+        assert_eq!(
+            run.work.serial_collect_rows, 0,
+            "rows whose collect work ran serially on the consumer thread"
+        );
     }
 
     /// #647: running a group of levels concurrently is scheduling only. Every
