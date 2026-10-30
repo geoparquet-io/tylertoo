@@ -122,14 +122,18 @@ impl MemoryPhase {
     /// read shape applies main's per-worker caps itself, `read.rs`). The
     /// writer encoded at most [`ENCODE_FLOOR`] row groups, which is the
     /// encode floor. Export and fill held no store under `bounded`: their
-    /// floor is main's shape.
-    fn bounded_cap(self, want: usize, floor: usize) -> usize {
+    /// floor is main's shape. Remote staging held at most main's staging
+    /// byte budget in flight ([`StageAdmission::mem_budget`], 256 MiB or
+    /// the env override): `stage_units` is how many units that holds.
+    ///
+    /// [`StageAdmission::mem_budget`]: crate::input::StageAdmission::mem_budget
+    fn bounded_cap(self, want: usize, floor: usize, stage_units: usize) -> usize {
         match self {
             Self::Encode | Self::ExportCollect | Self::ExportEncode | Self::Fill => floor,
+            Self::Stage => stage_units.min(want),
             Self::EagerInput
             | Self::Scan
             | Self::Assign
-            | Self::Stage
             | Self::Read
             | Self::Compute
             | Self::Write
@@ -216,6 +220,9 @@ pub(super) struct MemoryBudget {
     reserved: [u64; MemoryPhase::COUNT],
     /// Elastic grants per phase, out of the allowance.
     granted: [u64; MemoryPhase::COUNT],
+    /// The staging knobs [`stage_requests`](Self::stage_requests) and
+    /// `bounded`'s staging cap read (#788).
+    stage: crate::input::StageAdmission,
 }
 
 fn sum(ledger: &[u64; MemoryPhase::COUNT]) -> u64 {
@@ -231,6 +238,7 @@ impl MemoryBudget {
             limit,
             reserved: [0; MemoryPhase::COUNT],
             granted: [0; MemoryPhase::COUNT],
+            stage: crate::input::stage_admission(),
         }
     }
     pub(super) fn with_available(available: Option<u64>) -> Self {
@@ -348,7 +356,7 @@ impl MemoryBudget {
             MemoryProfile::Bounded => self
                 .affordable(profile, phase, price)
                 .min(want)
-                .min(phase.bounded_cap(want, floor))
+                .min(phase.bounded_cap(want, floor, self.stage_units(price)))
                 .max(floor),
             MemoryProfile::Speed => want.max(floor),
             MemoryProfile::Auto => self.affordable(profile, phase, price).min(want).max(floor),
@@ -361,6 +369,12 @@ impl MemoryBudget {
         let slot = &mut self.granted[phase as usize];
         *slot = slot.saturating_add(grant.bytes());
         grant
+    }
+    /// Units of `price` main's staging byte budget holds, at least 1.
+    fn stage_units(&self, price: Price) -> usize {
+        usize::try_from(self.stage.mem_budget / price.bytes.max(1))
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
     /// Return a grant once what it priced is no longer resident.
     pub(super) fn release(&mut self, grant: Grant) {
@@ -403,6 +417,22 @@ impl MemoryBudget {
         price: Price,
     ) -> Grant {
         self.fit(profile, MemoryPhase::Compute, price, requested.max(1), 1)
+    }
+    /// Remote staging requests in flight at once (#727, #788), per
+    /// [`fit`](Self::fit): the concurrency ceiling wanted, or what
+    /// `TYLERTOO_STAGING_MEM_BUDGET_BYTES` holds when it is set, one at the
+    /// floor (a request larger than the grant is still admitted alone),
+    /// priced at the plan's largest request. `bounded` keeps main's staging
+    /// byte budget ([`MemoryPhase::bounded_cap`]).
+    pub(super) fn stage_requests(&mut self, profile: MemoryProfile, largest_request: u64) -> Grant {
+        let price = Price::new(largest_request.max(1), PriceBasis::Footer);
+        let ceiling = self.stage.max_concurrency.max(1);
+        let want = if self.stage.mem_budget_set {
+            self.stage_units(price).min(ceiling)
+        } else {
+            ceiling
+        };
+        self.fit(profile, MemoryPhase::Stage, price, want, 1)
     }
     /// Row groups the writer may encode at once (#296, #545), per
     /// [`fit`](Self::fit): the pool's threads wanted, [`ENCODE_FLOOR`]
@@ -690,6 +720,49 @@ mod tests {
         budget.require(MemoryPhase::Scan, estimate).unwrap();
     }
 
+    /// #788: remote staging requests in flight per profile, for 64 MiB
+    /// requests against main's 256 MiB staging budget and a ceiling of 8.
+    /// `bounded` keeps main's budget (4 in flight, not 8); `auto` is decided
+    /// by the allowance; `speed` takes the ceiling; an env-set budget sizes
+    /// every profile alike.
+    #[test]
+    fn bounded_staging_keeps_main_byte_budget() {
+        use crate::input::StageAdmission;
+        const MIB: u64 = 1 << 20;
+        let largest = 64 * MIB;
+        let units = |profile, available: u64, set_budget: Option<u64>| {
+            let mut budget = MemoryBudget::with_available(Some(available));
+            budget.stage = StageAdmission {
+                max_concurrency: 8,
+                mem_budget: set_budget.unwrap_or(256 * MIB),
+                mem_budget_set: set_budget.is_some(),
+            };
+            let before = budget.remaining();
+            let grant = budget.stage_requests(profile, largest);
+            let n = grant.bytes() / largest;
+            budget.release(grant);
+            assert_eq!(budget.remaining(), before, "released");
+            n
+        };
+        let roomy = 1 << 40;
+        assert_eq!(units(MemoryProfile::Bounded, roomy, None), 4);
+        assert_eq!(units(MemoryProfile::Auto, roomy, None), 8);
+        assert_eq!(units(MemoryProfile::Speed, roomy, None), 8);
+        // A tight machine: the allowance (60% of 400 MiB) holds 3.
+        assert_eq!(units(MemoryProfile::Auto, 400 * MIB, None), 3);
+        assert_eq!(units(MemoryProfile::Bounded, 400 * MIB, None), 3);
+        // Never below one request, whatever the budget.
+        assert_eq!(units(MemoryProfile::Bounded, MIB, None), 1);
+        // TYLERTOO_STAGING_MEM_BUDGET_BYTES=128 MiB: two for every profile.
+        for profile in [
+            MemoryProfile::Bounded,
+            MemoryProfile::Auto,
+            MemoryProfile::Speed,
+        ] {
+            assert_eq!(units(profile, roomy, Some(128 * MIB)), 2);
+        }
+    }
+
     /// #788: one rule for every phase. `auto` never grants more than the
     /// phase's share of the allowance unless its floor needs it; `bounded`
     /// the same, never above main's cap for the phase (the floor for the
@@ -722,7 +795,10 @@ mod tests {
                     let share = (fresh.remaining() as f64 * phase.share()) as u64;
                     assert!(bounded.units >= floor, "{phase:?} bounded");
                     assert!(
-                        bounded.units <= phase.bounded_cap(want, floor).max(floor),
+                        bounded.units
+                            <= phase
+                                .bounded_cap(want, floor, fresh.stage_units(price))
+                                .max(floor),
                         "{phase:?} bounded above main's cap"
                     );
                     assert!(

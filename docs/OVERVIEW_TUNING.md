@@ -1807,7 +1807,7 @@ processed at once, and how many row groups the writer encodes at once.
 | Option | Default | Effect |
 |--------|---------|--------|
 | `--profile speed\|bounded\|auto` | `auto` | How much memory the run may hold |
-| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export |
+| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export. Export's member store, level stores and wave width follow it as below |
 | `--in-flight-batches N\|auto` | cores, clamped to 4–16 | More batches = more overlap and memory |
 | `--read-workers N\|auto` | pass 1 cores/2, pass 2 cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
 
@@ -1821,8 +1821,8 @@ processed at once, and how many row groups the writer encodes at once.
   `bounded` always had, and the allowance can only shrink them: at most 4
   readers, each at most 16 batches deep, and at most 4 concurrent row-group
   encodes. Remote staging holds at most 256 MiB of requests in flight, or
-  `TYLERTOO_STAGING_MEM_BUDGET_BYTES` when set. The compute window takes what `--in-flight-batches` asks for,
-  within the allowance. Its peak never exceeds what `bounded` used before
+  `TYLERTOO_STAGING_MEM_BUDGET_BYTES` when set. The compute window takes
+  what `--in-flight-batches` asks for, within the allowance. Its peak never exceeds what `bounded` used before
   the run budget existed (#788), whatever the machine.
 - **`auto`**, the default, sizes the run to the machine. Every phase fits
   inside one allowance: 60% of available memory, or of
@@ -1833,6 +1833,13 @@ processed at once, and how many row groups the writer encodes at once.
   their estimate fits and spill when it does not, and a run that starts in
   RAM keeps measuring and switches to spilling mid-pass if it outgrows the
   allowance.
+
+Export applies the same rule. `speed` keeps every level's tile members in
+RAM and sizes the partition wave from the cores alone; `bounded` spills them
+and keeps the wave caps export always had; `auto` keeps them in RAM when they
+fit the allowance and narrows the wave to fit it. Under every profile, export
+still refuses a tile that alone needs more than the machine's memory
+([Export waves](guides/scaling.md#export-waves)).
 
 `auto` is a third shape, not a switch between the other two: on a large
 machine it holds more than `bounded` and less than `speed`. On a machine
@@ -1946,7 +1953,7 @@ chose to keep the defaults, is in `benchmarks/staging/RESULTS.md`.
 | Variable | Default | Bounds | Effect |
 |----------|---------|--------|--------|
 | `TYLERTOO_STAGING_CONCURRENCY` | 8 | 1–128 | Ceiling on range requests in flight per part |
-| `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | Transient budget for in-flight spans; live concurrency is `min(ceiling, budget ÷ largest span)` |
+| `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | When set, caps the requests in flight for every profile. Unset, `auto` and `speed` are sized by the run budget, and `bounded` by the 256 MiB default |
 | `TYLERTOO_STAGING_COALESCE_BYTES` | 0 (off) | 0–1 GiB, and ≤ the budget | Merge adjacent selected row groups into one request while the merged span fits the window. A pruned row group always splits a merge, so pruned bytes are never fetched |
 | `TYLERTOO_HTTP_<KEY>` | unset | see below | Sets `object_store` client option `<key>` on every remote store |
 

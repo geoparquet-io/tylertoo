@@ -2562,7 +2562,6 @@ pub const tylertoo_core::overview::export::DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: u
 pub const tylertoo_core::overview::export::DEFAULT_TILE_SIZE_LIMIT: usize
 pub const tylertoo_core::overview::export::MAX_TILE_BUFFER_PX: u32
 pub const tylertoo_core::overview::export::PARTITION_WAVE_AUTO: usize
-pub const tylertoo_core::overview::export::PARTITION_WAVE_FALLBACK_MAX: usize
 pub const tylertoo_core::overview::export::PARTITION_WAVE_MIN: usize
 pub fn tylertoo_core::overview::export::export_pmtiles(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::overview::export::ExportOptions) -> core::result::Result<tylertoo_core::overview::export::ExportReport, tylertoo_core::overview::export::ExportError>
 pub fn tylertoo_core::overview::export::resolve_partition_wave(usize) -> usize
