@@ -3426,8 +3426,30 @@ mod staging_counter_tests {
             .map(|p| p.fetch_stats().unwrap().requests)
             .collect();
 
-        let _ = src.stage_selected(None); // best-effort: the verdict is the counters
+        let plan = src.staging_plan(None).unwrap();
+        let report = src
+            .stage_within(&plan, crate::input::unbudgeted_stage_admission())
+            .expect("a part that fails is left to the network, not an error");
         assert!(store.failed() > 0, "the injected failure must have fired");
+        // Part 0's two row groups fail, are retried, and fail again; the
+        // report counts them and splits the plan's bytes between what
+        // landed and what was left to the network.
+        assert_eq!(
+            (report.requests, report.failed_requests),
+            (4, 2),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.unstaged_bytes,
+            plan.bytes_to_stage() / 3,
+            "{report:?}"
+        );
+        assert_eq!(
+            report.bytes_fetched + report.unstaged_bytes,
+            plan.bytes_to_stage(),
+            "{report:?}"
+        );
+        assert!(report.first_error.is_some());
         for (i, part) in src.parts().iter().enumerate().skip(1) {
             assert_eq!(
                 part.fetch_stats().unwrap().requests - before[i],
