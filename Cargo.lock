@@ -240,6 +240,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
+ "lz4_flex",
 ]
 
 [[package]]
@@ -4511,6 +4512,7 @@ dependencies = [
  "arrow-select",
  "bytes",
  "log",
+ "lz4_flex",
  "object_store",
  "parquet",
  "tempfile",
@@ -4522,6 +4524,7 @@ name = "tylertoo-python"
 version = "0.8.0"
 dependencies = [
  "clap",
+ "mimalloc",
  "pyo3",
  "pyo3-log",
  "pythonize",

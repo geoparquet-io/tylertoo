@@ -144,26 +144,39 @@ impl std::str::FromStr for Mode {
 ///
 /// The engine reads the input **once** and pipelines Parquet read/decode with
 /// parallel per-feature simplification, buffering each output level until it is
-/// written (levels are written coarse→fine). This profile selects how that
-/// per-level output is buffered — it changes **speed and peak memory only**;
+/// written (levels are written coarse→fine). This profile decides how much
+/// memory every phase may hold: how that per-level output is buffered, and how
+/// wide the read-ahead, the compute window and the writer's encodes run
+/// (`MemoryBudget::fit`, #788). It changes **speed and peak memory only**;
 /// output bytes are identical across all profiles and thread counts.
+///
+/// `bounded` keeps main's footprint *for the same allocator*. The CLI's
+/// default mimalloc build adds a fixed floor of about 600 MiB (transparent
+/// huge pages on its eagerly committed arenas, and a 1 s purge delay
+/// before freed pages return to the OS) that shows on small inputs: 685 →
+/// 1,254 MiB peak RSS on Madagascar under `bounded`. A
+/// `--no-default-features` build uses the system allocator (#739, #788).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryProfile {
-    /// Resolve the backing from the *workload* at convert entry (#294): the
-    /// estimated buffered output (`f(buffered_rows, mode)`) is compared against
-    /// a fraction of available system RAM. Small runs stay in RAM (like
-    /// [`Speed`](Self::Speed)); runs whose estimate exceeds the budget spill
-    /// (like [`Bounded`](Self::Bounded)), so large duplicating converts prefer
-    /// the bounded path instead of risking OOM. Partitioning additionally keeps
-    /// a fixed row ceiling. The resolved choice is logged. This is the default.
+    /// Size every phase to the machine (#788): the read-ahead, the compute
+    /// window and the writer's encodes each take a share of one allowance
+    /// (60% of available memory, the env override or the cgroup limit),
+    /// priced from the Parquet footers. The output buffers stay in RAM when
+    /// the estimated buffered output (`f(buffered_rows, mode)`, #294) fits it
+    /// and spill otherwise, re-checked mid-pass (#626); partitioning also
+    /// keeps a fixed row ceiling. A third shape, not a switch between the
+    /// other two. The resolved choices are logged. This is the default.
     #[default]
     Auto,
-    /// Buffer each output level's rows in RAM before writing. Fastest; peak RAM
-    /// grows with total buffered output.
+    /// No limit: buffer each output level's rows in RAM before writing, and
+    /// run every other phase at its maximum. Fastest; peak RAM grows with
+    /// total buffered output.
     Speed,
-    /// Spill each output level's rows to a temporary Arrow IPC file and stream
-    /// them back at write time, capping peak RAM.
+    /// The smallest footprint: spill each output level's rows to a temporary
+    /// Arrow IPC file and stream them back at write time. Every other phase
+    /// keeps `bounded`'s fixed caps (at most 4 readers 16 batches deep, at
+    /// most 4 encodes), which the memory allowance can only shrink.
     Bounded,
 }
 

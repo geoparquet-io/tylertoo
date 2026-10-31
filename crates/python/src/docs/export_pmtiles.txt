@@ -27,6 +27,13 @@ Args:
     feature_id: Integer column to use as the MVT feature ID.
     spill_dir: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
         used when memory runs short.
+    profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles):
+        `"speed"` holds everything in RAM, `"bounded"` uses disk and
+        holds the least, and `"auto"` sizes to the machine's memory.
+        Footprints compare for one allocator: the musl (Alpine) wheel uses
+        mimalloc, which adds a fixed floor of about 600 MiB on small
+        inputs; other wheels use the system allocator. Output is
+        identical across profiles.
     name: Human-readable tileset name, stored in the metadata.
     description: Description of the tileset, stored in the metadata.
     attribution: Attribution text or HTML stored in the archive

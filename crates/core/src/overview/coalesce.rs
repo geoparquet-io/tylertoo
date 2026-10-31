@@ -561,6 +561,13 @@ fn build_chains<'a>(
     chains
 }
 
+#[cfg(test)]
+thread_local! {
+    // Pairs examined and qualifying candidates materialized.
+    static JUNCTION_WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    static BASELINE_JUNCTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// One round of endpoint joining over `pieces`, with node keys produced by
 /// `key(group, endpoint)`.
 ///
@@ -635,28 +642,8 @@ fn join_pieces<'a>(
                     piece_direction(&pieces[pi], e)
                 })
                 .collect();
-            let mut cands: Vec<(f64, usize, usize)> = Vec::new();
-            for i in 0..d {
-                for j in (i + 1)..d {
-                    if inc(i).0 == inc(j).0 {
-                        continue; // self-loops never join
-                    }
-                    if let (Some(a), Some(b)) = (dirs[i], dirs[j]) {
-                        let dev = continuation_deviation_deg(a, b);
-                        if dev <= junction_angle_deg {
-                            cands.push((dev, i, j));
-                        }
-                    }
-                }
-            }
-            cands.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-            let mut used = vec![false; d];
-            for (_, i, j) in cands {
-                if used[i] || used[j] {
-                    continue;
-                }
-                used[i] = true;
-                used[j] = true;
+            let piece_ids: Vec<_> = (0..d).map(|k| inc(k).0).collect();
+            for (i, j) in junction_pairs(&dirs, &piece_ids, junction_angle_deg) {
                 let (a, a_end) = inc(i);
                 let (b, b_end) = inc(j);
                 joins[a][a_end as usize] = Some((b, b_end));
@@ -743,6 +730,387 @@ fn join_pieces<'a>(
         });
     }
     out
+}
+
+/// Candidate keys reproduce the old lexicographic (deviation, i, j) sort.
+/// `owner` only distinguishes duplicate heap entries for the same pair.
+#[derive(Clone, Copy, Debug)]
+struct JunctionCandidate {
+    deviation: f64,
+    i: usize,
+    j: usize,
+    owner: usize,
+}
+
+impl PartialEq for JunctionCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for JunctionCandidate {}
+impl PartialOrd for JunctionCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for JunctionCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.deviation
+            .partial_cmp(&other.deviation)
+            .expect("qualifying deviations are finite")
+            .then(self.i.cmp(&other.i))
+            .then(self.j.cmp(&other.j))
+            .then(self.owner.cmp(&other.owner))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DirectionBounds {
+    lo: (f64, f64),
+    hi: (f64, f64),
+    first: usize,
+}
+
+impl DirectionBounds {
+    const EMPTY: Self = Self {
+        lo: (f64::INFINITY, f64::INFINITY),
+        hi: (f64::NEG_INFINITY, f64::NEG_INFINITY),
+        first: usize::MAX,
+    };
+
+    fn union(a: Self, b: Self) -> Self {
+        Self {
+            lo: (a.lo.0.min(b.lo.0), a.lo.1.min(b.lo.1)),
+            hi: (a.hi.0.max(b.hi.0), a.hi.1.max(b.hi.1)),
+            first: a.first.min(b.first),
+        }
+    }
+
+    // For fixed a, multiplication and addition are monotone in each b
+    // component (with the sign selecting its endpoint). Using exactly the
+    // production dot/clamp/acos calculation therefore bounds every stored
+    // direction, without relying on atan2's ordering or an angular epsilon.
+    fn lower_deviation(self, a: (f64, f64)) -> f64 {
+        continuation_deviation_deg(
+            a,
+            (
+                if a.0 < 0.0 { self.hi.0 } else { self.lo.0 },
+                if a.1 < 0.0 { self.hi.1 } else { self.lo.1 },
+            ),
+        )
+    }
+}
+
+/// An angularly ordered tree of live directions. Bounding boxes are updated
+/// after matching, so partner queries never materialize the quadratic edge
+/// set. Angles affect locality only; exact dot bounds decide pruning.
+struct JunctionIndex<'a> {
+    dirs: &'a [Option<(f64, f64)>],
+    order: Vec<usize>,
+    positions: Vec<usize>,
+    nodes: Vec<DirectionBounds>,
+    base: usize,
+}
+
+struct PartnerQuery<'a> {
+    origin: usize,
+    direction: (f64, f64),
+    pieces: &'a [usize],
+    angle: f64,
+    best: Option<(f64, usize)>,
+}
+
+impl<'a> JunctionIndex<'a> {
+    fn new(dirs: &'a [Option<(f64, f64)>]) -> Self {
+        let mut angles: Vec<_> = dirs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| d.map(|(x, y)| (y.atan2(x), i)))
+            .collect();
+        angles.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let order: Vec<_> = angles.into_iter().map(|(_, i)| i).collect();
+        let base = order.len().max(1).next_power_of_two();
+        let mut nodes = vec![DirectionBounds::EMPTY; base * 2];
+        let mut positions = vec![usize::MAX; dirs.len()];
+        for (pos, &i) in order.iter().enumerate() {
+            let d = dirs[i].expect("indexed direction");
+            nodes[base + pos] = DirectionBounds {
+                lo: d,
+                hi: d,
+                first: i,
+            };
+            positions[i] = base + pos;
+        }
+        for n in (1..base).rev() {
+            nodes[n] = DirectionBounds::union(nodes[n * 2], nodes[n * 2 + 1]);
+        }
+        Self {
+            dirs,
+            order,
+            positions,
+            nodes,
+            base,
+        }
+    }
+
+    fn remove(&mut self, i: usize) {
+        let mut pos = self.positions[i];
+        self.nodes[pos] = DirectionBounds::EMPTY;
+        pos /= 2;
+        while pos != 0 {
+            self.nodes[pos] = DirectionBounds::union(self.nodes[pos * 2], self.nodes[pos * 2 + 1]);
+            pos /= 2;
+        }
+    }
+
+    fn best(&self, origin: usize, pieces: &[usize], angle: f64) -> Option<JunctionCandidate> {
+        let mut query = PartnerQuery {
+            origin,
+            direction: self.dirs[origin]?,
+            pieces,
+            angle,
+            best: None,
+        };
+        self.search(1, &mut query);
+        query.best.map(|(deviation, other)| JunctionCandidate {
+            deviation,
+            i: origin.min(other),
+            j: origin.max(other),
+            owner: origin,
+        })
+    }
+
+    fn search(&self, n: usize, query: &mut PartnerQuery<'_>) {
+        let bounds = self.nodes[n];
+        if bounds.first == usize::MAX {
+            return;
+        }
+        let lower = bounds.lower_deviation(query.direction);
+        if lower > query.angle {
+            return;
+        }
+        if let Some((deviation, partner)) = query.best {
+            // Equality is not discarded unless every incident in this run
+            // also loses the original index tie-break. Rounded acos ties
+            // consequently receive exactly the old (i,j) order.
+            if lower > deviation || (lower == deviation && bounds.first >= partner) {
+                return;
+            }
+        }
+        if n >= self.base {
+            let other = self.order[n - self.base];
+            if query.pieces[other] == query.pieces[query.origin] {
+                return;
+            }
+            #[cfg(test)]
+            JUNCTION_WORK.with(|w| {
+                let (pairs, candidates) = w.get();
+                w.set((pairs + 1, candidates));
+            });
+            let deviation = continuation_deviation_deg(
+                query.direction,
+                self.dirs[other].expect("live direction"),
+            );
+            if deviation <= query.angle
+                && query
+                    .best
+                    .is_none_or(|(d, i)| deviation < d || (deviation == d && other < i))
+            {
+                query.best = Some((deviation, other));
+            }
+            return;
+        }
+        let left = self.nodes[n * 2];
+        let right = self.nodes[n * 2 + 1];
+        let left_key = (left.lower_deviation(query.direction), left.first);
+        let right_key = (right.lower_deviation(query.direction), right.first);
+        if left_key
+            .partial_cmp(&right_key)
+            .is_some_and(std::cmp::Ordering::is_le)
+        {
+            self.search(n * 2, query);
+            self.search(n * 2 + 1, query);
+        } else {
+            self.search(n * 2 + 1, query);
+            self.search(n * 2, query);
+        }
+    }
+}
+
+fn sorted_junction_pairs(
+    dirs: &[Option<(f64, f64)>],
+    pieces: &[usize],
+    angle: f64,
+) -> Vec<(usize, usize)> {
+    let mut candidates = Vec::new();
+    for i in 0..dirs.len() {
+        for j in i + 1..dirs.len() {
+            #[cfg(test)]
+            JUNCTION_WORK.with(|w| {
+                let (pairs, candidates) = w.get();
+                w.set((pairs + 1, candidates));
+            });
+            if pieces[i] == pieces[j] {
+                continue;
+            }
+            if let (Some(a), Some(b)) = (dirs[i], dirs[j]) {
+                let dev = continuation_deviation_deg(a, b);
+                if dev <= angle {
+                    #[cfg(test)]
+                    JUNCTION_WORK.with(|w| {
+                        let (pairs, candidates) = w.get();
+                        w.set((pairs, candidates + 1));
+                    });
+                    candidates.push((dev, i, j));
+                }
+            }
+        }
+    }
+    candidates.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let mut used = vec![false; dirs.len()];
+    let mut pairs = Vec::new();
+    for (_, i, j) in candidates {
+        if !used[i] && !used[j] {
+            used[i] = true;
+            used[j] = true;
+            pairs.push((i, j));
+        }
+    }
+    pairs
+}
+
+/// Only the first three live owners of an identical direction need heap
+/// entries. Any later owner's edge loses to an earlier identical-direction
+/// owner: at most two earlier incidences can belong to its partner's piece.
+/// This prevents quadratic stale-entry refreshes on duplicate directions
+/// while preserving every rounded deviation and the original index order.
+struct JunctionOwners {
+    groups: Vec<Vec<usize>>,
+    group_of: Vec<usize>,
+    next: Vec<usize>,
+    active: Vec<bool>,
+}
+impl JunctionOwners {
+    fn new(dirs: &[Option<(f64, f64)>]) -> Self {
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut group_of = vec![usize::MAX; dirs.len()];
+        let mut by_direction = HashMap::new();
+        for (i, direction) in dirs.iter().enumerate() {
+            if let Some((x, y)) = direction {
+                let group = *by_direction
+                    .entry((x.to_bits(), y.to_bits()))
+                    .or_insert_with(|| {
+                        groups.push(Vec::new());
+                        groups.len() - 1
+                    });
+                groups[group].push(i);
+                group_of[i] = group;
+            }
+        }
+        let next = vec![0; groups.len()];
+        Self {
+            groups,
+            group_of,
+            next,
+            active: vec![false; dirs.len()],
+        }
+    }
+    fn activate(&mut self, group: usize) -> Option<usize> {
+        let i = *self.groups[group].get(self.next[group])?;
+        self.next[group] += 1;
+        self.active[i] = true;
+        Some(i)
+    }
+}
+
+fn queue_junction_partner(
+    heap: &mut std::collections::BinaryHeap<std::cmp::Reverse<JunctionCandidate>>,
+    index: &JunctionIndex<'_>,
+    owner: usize,
+    pieces: &[usize],
+    angle: f64,
+) {
+    if let Some(candidate) = index.best(owner, pieces, angle) {
+        #[cfg(test)]
+        JUNCTION_WORK.with(|w| {
+            let (pairs, candidates) = w.get();
+            w.set((pairs, candidates + 1));
+        });
+        heap.push(std::cmp::Reverse(candidate));
+    }
+}
+
+fn lazy_junction_pairs(
+    dirs: &[Option<(f64, f64)>],
+    pieces: &[usize],
+    angle: f64,
+) -> Vec<(usize, usize)> {
+    // Small junctions avoid the index's fixed cost. Unorderable directions
+    // retain the original path; they cannot affect finite-data pruning.
+    if dirs.len() < 32
+        || dirs
+            .iter()
+            .flatten()
+            .any(|(x, y)| !x.is_finite() || !y.is_finite())
+    {
+        return sorted_junction_pairs(dirs, pieces, angle);
+    }
+    let mut index = JunctionIndex::new(dirs);
+    let mut owners = JunctionOwners::new(dirs);
+    let mut heap = std::collections::BinaryHeap::new();
+    for group in 0..owners.groups.len() {
+        for _ in 0..3 {
+            if let Some(i) = owners.activate(group) {
+                queue_junction_partner(&mut heap, &index, i, pieces, angle);
+            }
+        }
+    }
+    let mut used = vec![false; dirs.len()];
+    let mut pairs = Vec::new();
+    while let Some(std::cmp::Reverse(candidate)) = heap.pop() {
+        if used[candidate.owner] {
+            continue;
+        }
+        if used[candidate.i] || used[candidate.j] {
+            queue_junction_partner(&mut heap, &index, candidate.owner, pieces, angle);
+            continue;
+        }
+        // Removing endpoints can only make each owner's minimum worse.
+        // Stale minima are lower bounds and are refreshed before selection;
+        // a live heap minimum is thus the exact next sorted greedy edge.
+        used[candidate.i] = true;
+        used[candidate.j] = true;
+        index.remove(candidate.i);
+        index.remove(candidate.j);
+        pairs.push((candidate.i, candidate.j));
+        for matched in [candidate.i, candidate.j] {
+            if owners.active[matched] {
+                owners.active[matched] = false;
+                let group = owners.group_of[matched];
+                while let Some(next) = owners.activate(group) {
+                    if used[next] {
+                        owners.active[next] = false;
+                        continue;
+                    }
+                    queue_junction_partner(&mut heap, &index, next, pieces, angle);
+                    break;
+                }
+            }
+        }
+    }
+    pairs
+}
+
+fn junction_pairs(
+    dirs: &[Option<(f64, f64)>],
+    pieces: &[usize],
+    angle: f64,
+) -> Vec<(usize, usize)> {
+    #[cfg(test)]
+    if BASELINE_JUNCTION.with(std::cell::Cell::get) {
+        return sorted_junction_pairs(dirs, pieces, angle);
+    }
+    lazy_junction_pairs(dirs, pieces, angle)
 }
 
 /// Append `src` (reversed when `flip`) to `out`, dropping a vertex that
@@ -874,6 +1242,38 @@ mod tests {
         let out = run(&lines, TINY_GSD);
         assert_eq!(out.len(), 3, "junction must terminate chains: {out:?}");
         assert!(out.iter().all(|l| l.count == 1));
+    }
+
+    /// The index's best partner is the leaf's own direction, wherever that
+    /// leaf sits in the angular order: here the straight continuation of
+    /// east is west, the last of four directions by angle.
+    #[test]
+    fn junction_index_finds_the_straight_continuation_partner() {
+        let dirs = [
+            Some((1.0, 0.0)),
+            Some((0.0, 1.0)),
+            Some((-1.0, 0.0)),
+            Some((0.0, -1.0)),
+        ];
+        let best = JunctionIndex::new(&dirs)
+            .best(0, &[0, 1, 2, 3], 30.0)
+            .expect("west continues east");
+        assert_eq!((best.i, best.j, best.owner), (0, 2, 0));
+        assert_eq!(best.deviation, 0.0);
+    }
+
+    /// Equality agrees with the ordering the heap pops candidates in.
+    #[test]
+    fn junction_candidates_equal_exactly_when_they_order_equal() {
+        let at = |deviation, owner| JunctionCandidate {
+            deviation,
+            i: 1,
+            j: 2,
+            owner,
+        };
+        assert_eq!(at(5.0, 1), at(5.0, 1));
+        assert_ne!(at(5.0, 1), at(5.0, 2));
+        assert_ne!(at(5.0, 1), at(6.0, 1));
     }
 
     // --- junction continuation (stroke building) ------------------------------
@@ -1477,5 +1877,256 @@ mod golden_digest {
             h, 0x98cb_5976_7524_9af4,
             "chain builder output changed against the pre-#570 golden digest"
         );
+    }
+}
+
+#[cfg(test)]
+mod phase1_cost_tests {
+    use super::*;
+
+    fn junction(d: usize) -> Vec<Geometry<f64>> {
+        (0..d)
+            .map(|i| {
+                let theta = std::f64::consts::TAU * i as f64 / d as f64;
+                Geometry::LineString(LineString::from(vec![(0., 0.), (theta.cos(), theta.sin())]))
+            })
+            .collect()
+    }
+
+    fn measure_junction(d: usize) -> u64 {
+        let geoms = junction(d);
+        let lines: Vec<_> = geoms
+            .iter()
+            .enumerate()
+            .map(|(index, geom)| CoalesceInput {
+                index,
+                geom,
+                sort_key: None,
+                group: 0,
+            })
+            .collect();
+        JUNCTION_WORK.with(|w| w.set((0, 0)));
+        let chains = build_chains(&lines, 0., 30.);
+        let (pairs, candidates) = JUNCTION_WORK.with(std::cell::Cell::get);
+        eprintln!(
+            "JUNCTION degree={d} pairs={pairs} candidates={candidates} chains={}",
+            chains.len()
+        );
+        pairs
+    }
+
+    #[test]
+    fn phase1_junction_candidate_growth_bound() {
+        for d in [100usize, 1_000, 10_000] {
+            let work = measure_junction(d);
+            let bound = 8 * d as u64 * u64::from(d.ilog2() + 1);
+            assert!(work <= bound, "#608 d={d}: {work} pairs exceed {bound}");
+        }
+    }
+}
+#[cfg(test)]
+mod lazy_pairing_tests {
+    use super::*;
+    use geo::CoordsIter;
+
+    #[test]
+    fn indexed_pairs_match_sorted_pairs_including_rounded_ties() {
+        let mut state = 9u64;
+        for n in [32, 33, 64, 127] {
+            for seed in 0..100 {
+                let dirs: Vec<_> = (0..n)
+                    .map(|i| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        let angle = if seed % 4 == 0 {
+                            (i % 4) as f64 * std::f64::consts::FRAC_PI_2
+                        } else if seed % 4 == 1 {
+                            (i % 2) as f64 * std::f64::consts::PI + (state % 5) as f64 * 1e-10
+                        } else {
+                            (state >> 11) as f64 / (1u64 << 53) as f64 * std::f64::consts::TAU
+                        };
+                        if i % 19 == 0 {
+                            None
+                        } else {
+                            Some((angle.cos(), angle.sin()))
+                        }
+                    })
+                    .collect();
+                let pieces: Vec<_> = (0..n)
+                    .map(|i| if seed % 3 == 0 { i / 2 } else { i })
+                    .collect();
+                for angle in [1e-9, 10., 30., 90., 180.] {
+                    assert_eq!(
+                        lazy_junction_pairs(&dirs, &pieces, angle),
+                        sorted_junction_pairs(&dirs, &pieces, angle),
+                        "n={n} seed={seed} angle={angle}"
+                    );
+                }
+            }
+        }
+        for direction in [(0., 0.), (-0., 1.), (f64::NAN, 1.), (f64::INFINITY, 0.)] {
+            let dirs = vec![Some(direction); 64];
+            let pieces: Vec<_> = (0..64).collect();
+            for angle in [30., 90., 180.] {
+                assert_eq!(
+                    lazy_junction_pairs(&dirs, &pieces, angle),
+                    sorted_junction_pairs(&dirs, &pieces, angle)
+                );
+            }
+        }
+    }
+
+    /// The reference pairing measures each unordered pair of incidences once.
+    #[test]
+    fn sorted_junction_pairs_measures_each_pair_once() {
+        let dirs = [
+            Some((1., 0.)),
+            Some((0., 1.)),
+            Some((-1., 0.)),
+            Some((0., -1.)),
+        ];
+        JUNCTION_WORK.with(|w| w.set((0, 0)));
+        let pairs = sorted_junction_pairs(&dirs, &[0, 1, 2, 3], 30.);
+        assert_eq!(pairs, vec![(0, 2), (1, 3)]);
+        assert_eq!(JUNCTION_WORK.with(std::cell::Cell::get), (6, 2));
+    }
+
+    #[test]
+    fn duplicate_directions_use_linear_heap_work() {
+        for n in [100usize, 1000, 10000] {
+            let dirs: Vec<_> = (0..n)
+                .map(|i| Some((if i < n / 2 { 1. } else { -1. }, 0.)))
+                .collect();
+            let pieces: Vec<_> = (0..n).collect();
+            JUNCTION_WORK.with(|w| w.set((0, 0)));
+            let actual = lazy_junction_pairs(&dirs, &pieces, 30.);
+            let (pairs, candidates) = JUNCTION_WORK.with(std::cell::Cell::get);
+            assert!(
+                pairs <= 4 * n as u64 && candidates <= 4 * n as u64,
+                "duplicate n={n}: {pairs} / {candidates}"
+            );
+            assert_eq!(
+                actual,
+                (0..n / 2).map(|i| (i, i + n / 2)).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    type ChainBits = (Vec<usize>, Vec<(u64, u64)>);
+
+    fn bits(chains: &[RawChain]) -> Vec<ChainBits> {
+        chains
+            .iter()
+            .map(|c| {
+                (
+                    c.members.clone(),
+                    c.geom
+                        .coords_iter()
+                        .map(|p| (p.x.to_bits(), p.y.to_bits()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn check_chains(geoms: &[Geometry<f64>], groups: bool) {
+        let inputs: Vec<_> = geoms
+            .iter()
+            .enumerate()
+            .map(|(i, g)| CoalesceInput {
+                index: i,
+                geom: g,
+                sort_key: None,
+                group: if groups { (i % 3) as u32 } else { 0 },
+            })
+            .collect();
+        for snap in [0., 0.2, 10.] {
+            for angle in [0., 30.] {
+                let actual = build_chains(&inputs, snap, angle);
+                BASELINE_JUNCTION.with(|v| v.set(true));
+                let expected = build_chains(&inputs, snap, angle);
+                BASELINE_JUNCTION.with(|v| v.set(false));
+                assert_eq!(
+                    bits(&actual),
+                    bits(&expected),
+                    "groups={groups} snap={snap} angle={angle}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_chains_match_baseline_on_network_fixtures() {
+        let mut star = Vec::new();
+        for i in 0..1000 {
+            let a = i as f64 / 1000. * std::f64::consts::TAU;
+            star.push(Geometry::LineString(LineString::from(vec![
+                (0., 0.),
+                (a.cos(), a.sin()),
+            ])));
+        }
+        check_chains(&star, false);
+        check_chains(&star, true);
+        let mut grid = Vec::new();
+        for x in 0..16 {
+            for y in 0..16 {
+                if x < 15 {
+                    grid.push(Geometry::LineString(LineString::from(vec![
+                        (x as f64, y as f64),
+                        ((x + 1) as f64, y as f64),
+                    ])));
+                }
+                if y < 15 {
+                    grid.push(Geometry::LineString(LineString::from(vec![
+                        (x as f64, y as f64),
+                        (x as f64, (y + 1) as f64),
+                    ])));
+                }
+            }
+        }
+        check_chains(&grid, false);
+        check_chains(&grid, true);
+        let mut ties = Vec::new();
+        for i in 0..128 {
+            let p = match i % 4 {
+                0 => (1., 0.),
+                1 => (-1., -0.),
+                2 => (0., 1.),
+                _ => (-0., -1.),
+            };
+            ties.push(Geometry::LineString(LineString::from(vec![(0., 0.), p])));
+        }
+        ties.push(Geometry::LineString(LineString::from(vec![
+            (0., 0.),
+            (0., 0.),
+        ])));
+        ties.push(Geometry::LineString(LineString::from(vec![
+            (0., 0.),
+            (1., 0.),
+            (0., 0.),
+        ])));
+        check_chains(&ties, false);
+        check_chains(&ties, true);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/realdata/road-detections.parquet");
+        let builder = tylertoo_io::open_parquet(std::fs::File::open(path).unwrap()).unwrap();
+        let schema = builder.schema().clone();
+        let idx = schema.index_of("geometry").unwrap();
+        let mut roads = Vec::new();
+        for batch in builder.build().unwrap() {
+            let batch = batch.unwrap();
+            let array =
+                geoarrow::array::from_arrow_array(batch.column(idx).as_ref(), schema.field(idx))
+                    .unwrap();
+            crate::batch_processor::extract_geometries_from_array(
+                array.as_ref(),
+                &mut roads,
+                &crate::diagnostics::Diagnostics::default(),
+            )
+            .unwrap();
+        }
+        check_chains(&roads, false);
+        check_chains(&roads, true);
     }
 }

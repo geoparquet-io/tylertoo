@@ -40,13 +40,38 @@ tens of GiB at a billion rows. See [sizing the coarse job's memory](#sizing-the-
 
 ### Memory profiles
 
-Pass 2 buffers each output level before writing it:
+Pass 2 buffers each output level before writing it. The profile sets where
+those rows wait and how much every other phase may hold: the read-ahead, the
+batches processed at once, and the row groups the writer encodes at once.
 
-| `--profile` | Buffer storage |
-| --- | --- |
-| `speed` | RAM |
-| `bounded` | Temporary Arrow Inter-Process Communication (IPC) files |
-| `auto` (default) | Estimates memory from feature and level counts and spills above a fraction of available RAM. Measures buffered rows and switches to spilling mid-pass if they outgrow it |
+| `--profile` | Output buffers | Everything else |
+| --- | --- | --- |
+| `speed` | RAM | No limit: every knob at its maximum |
+| `bounded` | Temporary Arrow Inter-Process Communication (IPC) files | Fixed caps that the allowance can only shrink: at most 4 readers, 16 batches each, 4 encodes. The smallest footprint |
+| `auto` (default) | RAM when the estimate fits 60% of available RAM, otherwise spill. Measures buffered rows and switches to spilling mid-pass if they outgrow it | Sized to fit the same 60%, priced from the Parquet footers |
+
+`auto` is its own shape, not a switch between the other two: on a large
+machine it holds more than `bounded` and less than `speed`.
+
+Export follows the same profile. `tiles` passes its `--profile` to the export,
+and a two-step build sets it with `export-pmtiles --profile speed|bounded|auto`.
+Under `speed`, export keeps every level's tile members in RAM and sizes its
+[waves](#export-waves) from the core count alone. Under `bounded`, it spills
+them and keeps the wave caps it always had. Under `auto`, it keeps them in RAM
+when they fit the allowance and narrows the waves to fit it. One check holds
+under every profile: export refuses a tile that alone needs more than the
+machine's memory, because no profile can make one tile smaller.
+
+`bounded` keeps main's footprint for the same allocator. The release CLI
+uses mimalloc by default, which adds a fixed floor of about 600 MiB that
+shows on small inputs: under `bounded`, Madagascar (z0-12) peaks at 1,254 MiB
+against 685 MiB with the system allocator, and Moldova at 2,792 against
+2,509 MiB, while running faster (Madagascar 1.4 s against 3.0 s). The floor comes from transparent huge pages on
+mimalloc's eagerly committed arenas and its 1 s delay before freed pages go
+back to the OS. `MIMALLOC_ALLOW_THP=0 MIMALLOC_PURGE_DELAY=10` in the
+environment removes it (Madagascar 566 MiB, Moldova 1,665 MiB) but gives back
+most of the speed (Madagascar 2.0 s, Moldova 12.4 s against 9.3 s). A build
+with `--no-default-features` uses the system allocator.
 
 tylertoo reads cgroup v2 `memory.max` and `memory.high` or the cgroup v1 limit,
 subtracting memory the cgroup cannot reclaim. Slurm, Docker, and Kubernetes
@@ -65,19 +90,26 @@ is tmpfs and uses RAM charged to the same cgroup. Point `TMPDIR` or
   Each pass logs its choice. Pass 2 processes up to half of them at the same
   time. More batches keep more cores busy and consume more memory. The passes
   do not overlap.
-- **`--read-workers N|auto`** sets each pass's reader threads. `auto` uses a
-  quarter of the cores, at most 4. tylertoo honors an explicit value up to
-  twice the core count. Remote inputs always use one reader, even when staged
-  to disk: concurrent readers would evict each other's shared chunk cache.
+- **`--read-workers N|auto`** sets each pass's reader threads. `auto` uses
+  half the cores in pass 1, whose per-batch work is light, and a quarter in
+  pass 2, whose readers share the cores with simplification, at most 4 in
+  each. tylertoo honors an explicit value up to
+  twice the core count, as far as the profile's memory allows; `bounded`
+  reads with at most 4. A remote input uses one reader while any chunk the
+  pass reads is still on the network, because concurrent readers would evict
+  each other's shared chunk cache. Once staging has copied every chunk the
+  pass reads to disk, it reads like a local file. The log says
+  "remote input not fully staged" when it reads sequentially.
 
 Resident batches include those in flight, each worker's read-ahead queue,
-and, under `bounded`, up to three per level in spill writers. Read-ahead gets
-10% of available RAM, so smaller machines get fewer workers. `bounded`
-halves each queue. The estimate allows about 4 KiB per row plus twice its
-geometry bytes, which both passes take from the Parquet footer. Unlike the
-pass-2 buffers, tylertoo sizes the read-ahead before a pass reads a row, so
-it cannot correct itself. Wide schemas with
-large strings can exceed it.
+and, when spilling, up to three per level in spill writers. Under `auto` and
+`bounded`, read-ahead gets 10% of the allowance, so smaller machines get
+fewer workers; `bounded` also caps each queue at 16 batches, half of
+`auto`'s. `speed` reads with every requested worker at the full depth. A decoded row is priced at twice its
+uncompressed bytes in the Parquet footer plus 8 bytes per column, and each
+worker is also charged for the largest row group its reader decodes. Unlike
+the pass-2 buffers, tylertoo sizes the read-ahead before a pass reads a row,
+so it cannot correct itself. Wide schemas with large strings can exceed it.
 Measure memory use if headroom is tight, or use `--read-workers 1`.
 
 ### Spill files
@@ -103,8 +135,10 @@ Every archive is at least 16 KiB, the prefix every PMTiles client fetches first.
 
 `--partition-wave N|auto` sets how many partitions export holds at once.
 `auto` uses the core count, capped by how many estimated per-partition working
-sets fit in a fraction of available RAM, with a floor of 6, or a cap of 16
-when tylertoo cannot probe RAM. Export logs its choice at start. Pass a smaller
+sets fit in a fraction of available RAM, with a floor of 6. When tylertoo
+cannot probe RAM, it assumes the same 4 GiB allowance every other phase does.
+Under `--profile speed` the core count alone decides. Export logs its choice
+at start. Pass a smaller
 number on a shared machine, or a larger one to keep more cores busy.
 
 Coarse zooms are too small to fill the cores one at a time, so export runs

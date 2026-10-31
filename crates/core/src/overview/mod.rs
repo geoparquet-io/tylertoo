@@ -19,6 +19,7 @@ pub mod cluster;
 pub mod coalesce;
 pub mod config;
 pub mod convert;
+mod disk;
 pub mod export;
 pub mod filter;
 #[cfg(test)]
@@ -29,6 +30,7 @@ mod memory;
 mod pipe;
 mod pipeline;
 mod plan_state;
+mod read;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use plan_state::fuzz_convert_plan;

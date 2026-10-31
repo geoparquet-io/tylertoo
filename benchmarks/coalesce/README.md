@@ -92,9 +92,10 @@ crates.io. The `full` profile also clones tippecanoe from GitHub.
 of these medians. The ratio compares this sum with the before-#745 settings
 on the same host.
 Seconds depend on the host. Compare ratios across hosts, and seconds only
-within one host. A local `cargo build` uses glibc's allocator. The released
-musl binaries use mimalloc and export faster in absolute terms, so compare
-ratios against them too.
+within one host. A `cargo build` with default features uses mimalloc, like
+the released musl binaries (#739). A `--no-default-features` build uses
+glibc's allocator and exports slower in absolute terms, so compare ratios
+against it.
 
 **Rendered coverage (MapLibre)**: MapLibre GL JS draws each archive in
 headless Chromium over a fixed window. The benchmark compares the rendering
@@ -132,10 +133,13 @@ Two marks flag cells to treat with care:
 ## Baselines
 
 `baseline/` contains a report for each profile and identifies the host:
-c7g.16xlarge, 64 Arm cores, a glibc build. The binary was built at `635322c`
-(PR #770: the merge valve's caches and stall rule, #758, and the default
-caps, #761). Every run started with the load average below the gate, so no
-cell carries a † mark. The NZ tippecanoe time is seeded from the #745 run.
+c7g.16xlarge, 64 Arm cores. The `small` report is from a release build at
+`fb9ed97` (#788) with default features, so it uses mimalloc (#739). The
+`full` report is still from a glibc build at `635322c` (PR #770: the merge
+valve's caches and stall rule, #758, and the default caps, #761). Compare
+seconds only with the report from the same build. Every run started with the
+load average below the gate, so no cell carries a † mark. The NZ tippecanoe
+time is seeded from the #745 run.
 To compare your change with the baseline, run:
 
 ```bash

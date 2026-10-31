@@ -7,20 +7,26 @@
 /// musl's `mallocng` deterministically fails *small* allocations once a large
 /// live heap has been fragmented by many threads: a 38.7M-polygon `tiles` run
 /// aborted with `memory allocation of 148448 bytes failed` at the identical
-/// input row across two runs, at 28.6 GB RSS on a node with 240 GB granted —
-/// >200 GB of headroom. mimalloc's segment/page allocator does not degrade
+/// input row across two runs, at 28.6 GB RSS on a node with 240 GB granted,
+/// over 200 GB of headroom. mimalloc's segment/page allocator does not degrade
 /// that way, so the musl release binary uses it instead.
 ///
-/// Scoped to `target_env = "musl"` on purpose: glibc, macOS and Windows builds
-/// keep the platform allocator (nothing to fix there), and the Python
-/// extension module never routes through this crate — a pyo3 `cdylib` must
-/// leave the host interpreter's allocator arrangements alone.
+/// On musl it is unconditional. On every other target it is the `mimalloc`
+/// Cargo feature, on by default (#739): against glibc malloc, export took
+/// 0.68-0.79x the wall time and total CPU 0.83x on the #788 benchmark lane,
+/// with peak RSS from +30% to -23% by dataset. `--no-default-features` builds
+/// on the platform allocator instead.
+/// The Python extension module never routes through this crate — a pyo3
+/// `cdylib` must leave the host interpreter's allocator arrangements alone.
 ///
 /// Excluded under `dhat-heap`: dhat installs its own `#[global_allocator]`
 /// in tylertoo-core (it must own the allocator to count anything), and rustc
 /// allows only one in the crate graph. Heap-profiling a musl binary therefore
 /// runs on dhat's allocator and loses this fix for the duration.
-#[cfg(all(target_env = "musl", not(feature = "dhat-heap")))]
+#[cfg(all(
+    any(target_env = "musl", feature = "mimalloc"),
+    not(feature = "dhat-heap")
+))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -626,33 +632,20 @@ fn tiles_input(spec: &InputSpec) -> tylertoo_core::overview::tiles::TilesInput {
 
 /// One line naming which half of the tile space this job owns (#498), logged
 /// before any work so a fleet's logs say what each task was for.
-fn log_shard_job(job: &ShardJob, min_zoom: u8, max_zoom: u8) {
+fn log_shard_job(job: &ShardJob, min_zoom: u8, max_zoom: MaxZoom) {
+    // `auto` is resolved inside the facade, which logs the pick (#444).
+    let finest = match max_zoom {
+        MaxZoom::Fixed(z) => format!("z{z}"),
+        MaxZoom::Auto => "the auto max zoom".to_string(),
+    };
     log::info!(
         "[tiles] shard job {}: {}",
         job.role,
         match job.range {
-            Some(r) => format!("zooms z{}..=z{max_zoom} of tile range {r}", job.pivot),
+            Some(r) => format!("zooms z{}..={finest} of tile range {r}", job.pivot),
             None => format!("zooms z{min_zoom}..=z{}", job.pivot.saturating_sub(1)),
         }
     );
-}
-
-/// Resolve `--max-zoom auto` (#444) for a run whose `options` were built with
-/// [`MaxZoom::plan_zoom`] and whose cheap checks have all passed. Core owns
-/// the whole rule ([`MaxZoom::resolve`]); a `Fixed` zoom returns verbatim
-/// without opening the input. For `auto` a dedicated source is resolved, so
-/// the conversion's own source (and any column selection on it) is untouched.
-fn resolve_max_zoom(
-    max_zoom: MaxZoom,
-    spec: &InputSpec,
-    options: &mut tylertoo_core::overview::convert::ConvertOptions,
-) -> Result<u8> {
-    if !max_zoom.is_auto() {
-        return Ok(max_zoom.plan_zoom());
-    }
-    let source = resolve_convert_source(spec)?;
-    // `None`: the caller ran `config::check_output` on the output first.
-    Ok(max_zoom.resolve(&source, options, None)?)
 }
 
 /// Which job of a sharded fleet this `tiles` run is, and the slice of the
@@ -666,9 +659,11 @@ struct ShardJob {
     pivot: u8,
     /// `ShardPlan::cut_digest_hex` — the fleet-wide identity of the cut.
     cut_digest: String,
-    /// The bound plan, kept so a `--max-zoom auto` run can re-check the
-    /// pivot once the real zoom is known (#444).
+    /// The loaded plan and its path: the facade verifies it against the
+    /// input it opens and re-checks the pivot once `--max-zoom auto` is
+    /// resolved (#444), on that same source.
     plan: tylertoo_core::shard::ShardPlan,
+    plan_path: PathBuf,
 }
 
 impl ShardJob {
@@ -681,6 +676,10 @@ impl ShardJob {
             range: self.range,
             pivot_zoom: self.pivot,
             cut_digest: self.cut_digest.clone(),
+            binding: Some(tylertoo_core::overview::tiles::ShardBinding {
+                plan: self.plan.clone(),
+                path: self.plan_path.clone(),
+            }),
         }
     }
 }
@@ -692,7 +691,6 @@ impl ShardJob {
 /// for a different (or since-rewritten) file is an error in milliseconds
 /// rather than a fleet of jobs that each tile something slightly different.
 fn resolve_shard_job(
-    spec: &InputSpec,
     shard: Option<&str>,
     shard_plan: Option<&Path>,
     max_zoom: u8,
@@ -714,11 +712,10 @@ fn resolve_shard_job(
     let plan_path = shard_plan.expect("clap requires --shard-plan alongside --shard");
     let role = ShardRole::parse(shard)?;
 
-    // Bind the plan to the input, the same way the convert plan binds itself:
-    // a plan cut for a different (or since-rewritten) file is an error here
-    // rather than a fleet that each tiles something slightly different.
-    let source = resolve_convert_source(spec)?;
-    let (plan, range) = tylertoo_core::shard::resolve_range(plan_path, role, Some(&source))?;
+    // The plan is bound to the input by the facade, on the source it
+    // converts (#788: one source per run): a plan cut for a different (or
+    // since-rewritten) file is refused there before any row is read.
+    let (plan, range) = tylertoo_core::shard::resolve_range(plan_path, role, None)?;
 
     // Core owns the pivot-vs-finest-zoom rule (inclusive: pivot == max_zoom
     // leaves every shard exactly one zoom, which is legal), so the Rust API
@@ -738,6 +735,7 @@ fn resolve_shard_job(
         // every data shard (which must present the same cut).
         cut_digest: plan.cut_digest_hex(),
         plan,
+        plan_path: plan_path.to_path_buf(),
     }))
 }
 
@@ -754,10 +752,10 @@ fn resolve_convert_source(spec: &InputSpec) -> Result<tylertoo_core::input_set::
     })
 }
 
-/// The run-time half of a `tiles` configuration, which reads the input:
-/// the sharded-fleet job (#498) and `--max-zoom auto` (#444). Each step
-/// re-runs core's validation first, so everything that can fail without
-/// reading fails before the next read.
+/// The sharded-fleet half of a `tiles` configuration (#498): load the shard
+/// plan, bind it to the input, and hand the job to the facade, which
+/// re-checks the binding on the input it converts and resolves `--max-zoom
+/// auto` there (#444, #788). Core's validation runs before and after.
 fn resolve_tiles_job(
     args: &TilesArgs,
     spec: &InputSpec,
@@ -772,13 +770,14 @@ fn resolve_tiles_job(
     };
     validate(options)?;
     let max_zoom = args.max_zoom.plan_zoom();
-    let shard = resolve_shard_job(
-        spec,
-        args.shard.as_deref(),
-        args.shard_plan.as_deref(),
-        max_zoom,
-    )?;
+    let shard = resolve_shard_job(args.shard.as_deref(), args.shard_plan.as_deref(), max_zoom)?;
     if let Some(job) = &shard {
+        // A plan cut for a different (or since-rewritten) input is refused
+        // first, before the fleet rules the validation below adds (`--shard
+        // requires --plan`): the mismatch is the error that names the fix.
+        // Main's order; it reads the footers, so only a sharded job pays it.
+        job.plan
+            .verify_source(&resolve_convert_source(spec)?, &job.plan_path)?;
         // The fleet-wide selection now, so `--max-zoom auto` estimates over
         // the rows this job reads; the facade applies the rest (#439).
         let tiles_shard = job.as_tiles_shard();
@@ -786,13 +785,9 @@ fn resolve_tiles_job(
         options.shard = Some(tiles_shard);
         validate(options)?;
     }
-    // #444: every cheap check has passed; now estimate `auto` (a fixed zoom
-    // comes back verbatim, no I/O). A shard plan was bound against the
-    // placeholder, so its pivot is re-checked against the real value.
-    let max_zoom = resolve_max_zoom(args.max_zoom, spec, &mut options.convert)?;
-    if let (Some(job), Some(plan_path)) = (&shard, args.shard_plan.as_deref()) {
-        job.plan.check_max_zoom(max_zoom, plan_path)?;
-    }
+    // #444/#788: `--max-zoom auto` is estimated by the facade over the
+    // source it converts (the shard plan is verified, and its pivot
+    // re-checked against the resolved zoom, on that same source).
     if let Some(job) = &shard {
         if args.plan_only {
             // The coarse job's usual line names the zooms it builds; this one
@@ -804,7 +799,7 @@ fn resolve_tiles_job(
                 job.pivot
             );
         } else {
-            log_shard_job(job, args.min_zoom, max_zoom);
+            log_shard_job(job, args.min_zoom, args.max_zoom);
         }
     }
     Ok(shard)
@@ -1220,11 +1215,10 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         .collect();
     preflight_report(args.report.as_deref(), &named)?;
 
-    let mut options = overview_options(&args)?;
-    // #444/#779: every rule that needs no input, then the estimate (which
-    // reads the input) last.
+    let options = overview_options(&args)?;
+    // #779: every rule that needs no input. `--max-zoom auto` is estimated
+    // by the conversion over its own source (#444, #788).
     options.validate()?;
-    resolve_max_zoom(args.max_zoom, &spec, &mut options)?;
 
     let report = run_convert(&spec, &output, &options)?;
 
@@ -1874,6 +1868,28 @@ fn format_number(n: u64) -> String {
     HumanCount(n).to_string()
 }
 
+/// #739: the gnu CLI links mimalloc by default. Checked at build time
+/// against the manifest's default feature list, and, in any build with the
+/// feature on and dhat off, against the type of the installed allocator.
+#[cfg(test)]
+mod allocator_default {
+    #[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
+    const _: &mimalloc::MiMalloc = &super::GLOBAL;
+
+    #[test]
+    fn mimalloc_is_a_default_feature() {
+        let manifest = include_str!("../Cargo.toml");
+        let default = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("default ="))
+            .expect("crates/cli/Cargo.toml declares default features");
+        assert!(
+            default.contains("\"mimalloc\""),
+            "mimalloc must stay a default feature of the CLI: {default}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1887,6 +1903,52 @@ mod tests {
     use tylertoo_core::overview::export::ExportOptions;
     use tylertoo_core::overview::export::FeatureOrder;
     use tylertoo_core::overview::level::MemoryProfile;
+
+    /// #498: a sharded `tiles` job names the slice of the tile space it
+    /// owns before any work, so a fleet's logs say what each task was for.
+    #[test]
+    fn a_shard_job_logs_the_zooms_it_owns() {
+        use std::sync::Mutex;
+        static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        struct Capture;
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                LINES.lock().unwrap().push(record.args().to_string());
+            }
+            fn flush(&self) {}
+        }
+        // Process-global: under a shared `cargo test` process another test
+        // may own the logger, and only nextest's own process can check.
+        if log::set_logger(&Capture).is_err() {
+            return;
+        }
+        log::set_max_level(log::LevelFilter::Info);
+        let plan = tylertoo_core::shard::ShardPlan {
+            format: "tylertoo-shard-plan".to_string(),
+            version: 1,
+            pivot_zoom: 6,
+            ranges: Vec::new(),
+            inputs: Vec::new(),
+            estimated_rows_total: 0,
+            unplaced_rows: 0,
+        };
+        let job = ShardJob {
+            role: tylertoo_core::shard::ShardRole::Coarse,
+            range: None,
+            pivot: 6,
+            cut_digest: plan.cut_digest_hex(),
+            plan,
+            plan_path: PathBuf::from("shards.json"),
+        };
+        log_shard_job(&job, 2, MaxZoom::Fixed(10));
+        assert_eq!(
+            *LINES.lock().unwrap(),
+            ["[tiles] shard job coarse: zooms z2..=z5"]
+        );
+    }
 
     #[cfg(feature = "gen-docs")]
     #[test]
@@ -1953,9 +2015,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shards.json");
         plan.save(&path).unwrap();
-        let spec = InputSpec::Path(input);
-        assert!(resolve_shard_job(&spec, None, None, 6).unwrap().is_none());
-        assert!(resolve_shard_job(&spec, None, Some(&path), 6).is_err());
+        assert!(resolve_shard_job(None, None, 6).unwrap().is_none());
+        assert!(resolve_shard_job(None, Some(&path), 6).is_err());
         for (selector, role, range) in [
             ("coarse", ShardRole::Coarse, None),
             (
@@ -1967,7 +2028,7 @@ mod tests {
                 Some((plan.ranges[0].lo, plan.ranges[0].hi)),
             ),
         ] {
-            let job = resolve_shard_job(&spec, Some(selector), Some(&path), 6)
+            let job = resolve_shard_job(Some(selector), Some(&path), 6)
                 .unwrap()
                 .expect("a requested shard must not become an unsharded run");
             assert_eq!(job.role, role);
@@ -1976,7 +2037,7 @@ mod tests {
             assert_eq!(job.cut_digest, plan.cut_digest_hex());
             assert_eq!(job.plan.cut_digest_hex(), plan.cut_digest_hex());
         }
-        assert!(resolve_shard_job(&spec, Some("0/2"), Some(&path), 2).is_err());
+        assert!(resolve_shard_job(Some("0/2"), Some(&path), 2).is_err());
     }
 
     /// Every subcommand clap knows is left alone by the bare-form rewrite,
@@ -3179,21 +3240,24 @@ mod tests {
         assert_eq!(parse_tiles(&[]).max_zoom, MaxZoom::Fixed(14));
     }
 
-    /// #444: a `Fixed` `--max-zoom` resolves to the exact same number with
-    /// **zero I/O** — the input does not even exist — and leaves the options
-    /// untouched: the numeric path hands core the same `u8` it always did.
+    /// #444/#788: `--max-zoom` becomes the options' level plan and auto flag
+    /// with zero I/O; the conversion resolves `auto` over its own source.
     #[test]
-    fn resolve_max_zoom_fixed_is_pure_and_does_not_touch_the_input() {
-        let spec = InputSpec::Path(PathBuf::from("/nonexistent/definitely-not-a-file.parquet"));
-        for z in [0u8, 6, 14, 30] {
-            let mut options = tylertoo_core::overview::convert::ConvertOptions::default();
-            let before = format!("{:?}", options.levels);
-            assert_eq!(
-                resolve_max_zoom(MaxZoom::Fixed(z), &spec, &mut options).unwrap(),
-                z
-            );
-            assert_eq!(format!("{:?}", options.levels), before);
-        }
+    fn max_zoom_sets_the_plan_and_the_auto_flag_without_reading() {
+        use tylertoo_core::overview::convert::LevelPlan;
+        let fixed = tiles_options(&parse_tiles(&["--max-zoom", "9"])).unwrap();
+        assert!(!fixed.convert.auto_max_zoom);
+        assert!(matches!(
+            fixed.convert.levels,
+            LevelPlan::ZoomRange { max_zoom: 9, .. }
+        ));
+        let auto = tiles_options(&parse_tiles(&["--max-zoom", "auto"])).unwrap();
+        assert!(auto.convert.auto_max_zoom);
+        assert!(matches!(
+            auto.convert.levels,
+            LevelPlan::ZoomRange { max_zoom, .. }
+                if max_zoom == MaxZoom::Auto.plan_zoom()
+        ));
     }
 
     #[test]

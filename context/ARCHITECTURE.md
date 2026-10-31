@@ -48,6 +48,98 @@ Consequences: #102 (row-group bbox filtering for the tiles pipeline) lost
 its remaining scope; the legacy pipeline's architecture notes were moved to
 [`context/archive/LEGACY_TILES_ARCHITECTURE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/context/archive/LEGACY_TILES_ARCHITECTURE.md).
 
+## Decision Record: Memory Profiles and the Run Budget (#788, 2026-10-30)
+
+One `MemoryBudget` (`overview/memory.rs`) per operation probes memory once
+(MemAvailable, `TYLERTOO_AUTO_MEM_LIMIT_BYTES`, or the cgroup limit) and sets
+one allowance: 60% of the probed figure less hard reservations (the eager
+input, and under a cgroup limit the spill's page cache when it fits). Every
+elastic phase asks `MemoryBudget::fit(profile, phase, price, want, floor)`
+for units of a price read from the Parquet footers, and each grant is
+charged, so a phase sized later sees only what earlier ones left. Before
+this, the read-ahead, the compute window and the encodes each took their own
+slice of the same allowance and nothing summed them (#716). Every decision
+reads the one budget's own figures: `auto`'s RAM-or-spill choice for the
+pass-2 sinks and export's fill store compares its estimate with
+`budget.allowance(Auto)` after the grants already charged, the same figure
+the runtime downgrade (#626) checks (`pipeline::auto_backing`).
+
+"Once per operation", not once per process. A `tiles` run probes four
+times, through three probes in `pipeline.rs`, each for a reason:
+
+- **convert:** `MemoryBudget::probe()` in `preflight()`, uncached, before
+  pass 1 reads anything;
+- **export:** `export_budget()`, from `available_memory_bytes()`. That
+  figure is cached process-wide on its first call after convert's pass 1,
+  so it is the cgroup's headroom with pass 1's usage already charged
+  (#485). The widths of export's waves have used it since #303;
+- **export's dense-tile refusal** (`check_levels_fit`, #665): it uses
+  `probe_oom_memory_limit()`, fresh and without `memory.high`, because that
+  check measures what would kill the process, not what the run may hold;
+- **export's diagnostics:** the cap on the Python loss list comes from its
+  own `MemoryBudget::probe()`. It sizes a report, never the archive.
+
+`--max-zoom auto` also stages its sample through a throwaway
+`MemoryBudget::probe()` (`auto_zoom.rs`), before `preflight()` builds the
+conversion's budget. That grant is released before the conversion starts.
+Only the order of the calls ties them: `auto_max_zoom` resolves the zoom
+that `preflight()` prices.
+
+The profile decides the grant the same way for every phase. The user
+confirmed this decision:
+
+| Profile | Grant | Meaning |
+| --- | --- | --- |
+| `speed` | `want` | No limit: everything in RAM, every knob at its maximum |
+| `bounded` | `auto`'s grant, cut to main's cap for the phase | Smallest footprint: always spill, and keep main's caps per phase, which the allowance can only shrink. That means at most 4 readers 16 deep, the requested window, 4 encodes, and export and fill at their floors (main held no store there). Never above main's peak |
+| `auto` (default) | what the phase's share affords, within `[floor, want]` | Sized to the machine: every decision fits the allowance, spilling when the output does not, re-checked at runtime (#626) |
+
+In one sentence: **`bounded` keeps main's caps per phase; the allowance can
+only shrink them** (`MemoryPhase::bounded_cap`, which also holds remote
+staging to main's 256 MiB in-flight budget through
+`MemoryBudget::stage_requests`, plus the read shape's worker and depth caps
+in `read.rs`). A cut that granted `bounded` only each phase's
+floor (one reader, 4 deep) was reverted the same day. It went below main's
+shape, and cost `bounded` wall time for no memory main had not already
+accepted.
+
+Export takes the same profile (`ExportOptions::profile`; `tiles` passes
+convert's). Its #235 member store's backing goes through convert's
+`resolve_backing` (`speed` RAM, `bounded` spill, `auto` the estimate), and the
+partition wave, the #311 per-level density guard and the #647 level-group cap
+ask `affordable(profile, ExportCollect, ..)`: unlimited under `speed`, main's
+memory-safe cap under `bounded` and `auto`. With RAM unknown they price
+against the budget's 4 GiB fallback allowance like every other phase; the
+fixed 16-partition fallback (`PARTITION_WAVE_FALLBACK_MAX`) is gone. The one
+check every profile keeps is #665's refusal of a tile that alone exceeds the
+machine's memory: a refusal, not a cap, since no profile makes a tile smaller.
+
+The release CLI links mimalloc as its global allocator on gnu targets by
+default (the `mimalloc` feature; `--no-default-features` opts out), and on
+musl unconditionally; the `dhat-heap` build excludes it. The Python wheel
+keeps the system allocator on glibc (an opt-in `mimalloc` feature until a
+wheel benchmark decides) and uses mimalloc on musllinux (#739, #480).
+Profile footprints therefore compare for one allocator: `bounded` keeps
+main's shape for the same allocator, and mimalloc adds a fixed floor of
+about 600 MiB that shows on small inputs (Madagascar `bounded` 685 → 1,254
+MiB peak RSS; Moldova 2,509 → 2,792). It is transparent huge pages on
+mimalloc v3's eagerly committed arenas plus its 1 s purge delay;
+`MIMALLOC_ALLOW_THP=0 MIMALLOC_PURGE_DELAY=10` removes it at a wall-time
+cost, so the default keeps mimalloc's settings and the docs name the
+opt-outs.
+
+`auto` is a third shape, not a router between the other two. Before #788 it
+copied `speed` for the read-ahead depth cap and the encode count. A first
+cut of #788 also sized `bounded` from the allowance, which on a 123 GiB box
+doubled Moldova's pass-2 peak (2.0 to 3.9 GiB). That was reverted: `bounded`
+promises the smallest footprint, and `auto` is the profile that uses the
+machine.
+
+DIVERGENCE FROM TIPPECANOE: tippecanoe has no memory profile. It always
+writes its features to temporary files and sizes its in-memory sort from the
+machine's physical memory. Its behavior is closest to `bounded` with an
+`auto`-sized sort.
+
 ## Design Principles
 
 1. **Overview-first**: the product is the `geo:overviews` GeoParquet format;
@@ -259,15 +351,18 @@ verbatim (spec §2.4).
    `min(cores / 4, 4)`) round-robin, each with its own bounded read-ahead
    channel sized against a modelled slice of the memory budget. The producer
    thread **merges** the workers' output in segment order and re-chunks it
-   (`Regrouper`) into exactly the batch sequence one sequential reader would
-   have produced — batch boundaries are load-bearing, because the writer issues
+   (`Regrouper`, in `overview/read.rs` since #538) into exactly the batch
+   sequence one sequential reader would have produced — batch boundaries are
+   load-bearing, because the writer issues
    one column-writer call per slice and parquet checks its page limits per
    call — then pushes it through the same bounded pipe to the consumer. On the
    sink side each level's `bounded`-profile spill is written by its own
    spill-writer thread behind a `bounded(2)` queue, so the consumer hands the
    batch over instead of encoding it. Output is byte-identical for every worker
-   count; remote inputs read sequentially regardless (their parts share one
-   chunk cache that concurrent readers would evict).
+   count. A remote input reads sequentially (its parts share one chunk cache
+   that concurrent fetching readers would evict) unless pass 0 staged every
+   chunk the read touches to the disk spill. Then it fetches nothing and
+   reads in parallel like a local file (#544, `ConvertSource::reads_locally`).
 
    Under `--profile auto` the sink backing is chosen up front from a
    geometry-only estimate (`auto_backing`), then **checked for the whole
@@ -841,7 +936,7 @@ therefore its band, in the same PR, with the new measurement in the comment.
 | Untileable input (#429) | Pass 1 tallies, in ONE traversal of the feature bboxes, the #188 antimeridian suspects plus two losses: features outside the declared CRS's coordinate range (`bbox_out_of_crs_range`) and features with valid lon/lat wholly outside the Web Mercator tiling domain (latitude beyond ±85.05°, `bbox_unprojectable`). Both land on `ConvertReport` (`out_of_range_features`, `unprojectable_features`), each warns once, and when together they account for **≥99%** of the input the convert FAILS with `ConvertError::AllFeaturesOutOfRange` instead of writing an empty archive | No CRS gate: GeoJSON is lon/lat by contract, so out-of-range coordinates are clamped or dropped at projection time and a wrong-CRS input yields an empty tileset with exit 0 | The counts are taken at the END OF PASS 1 rather than at the end of convert: pass 1 already holds every feature bbox, so failing there costs no second pass and leaves no half-written overview behind. The gate is a share, not exactly 100%, because a million-row wrong-CRS file with a dozen `POINT(0 0)` placeholder rows would otherwise sail through. The two losses are counted (and worded) separately because their fixes differ: a reprojection for the first, nothing at all for the second — Mercator does not reach the poles. The projected-CRS diagnosis and its `gpio convert reproject` hint are gated on coordinate MAGNITUDE (any offending coordinate above 1000 in absolute value), so one stray longitude just past the wrap gets neutral wording rather than an accusation about the whole file. Longitude counts as out of range only past ±540°: export wraps anything closer (#342), so a 0–360°-convention file converts and tiles. Features past ±180° but within the wrap are counted separately as `wrapped_features` (#644), with one `log::info!` naming the first rows, and never join the gate: wrapped data is valid input, but a projected file labeled lon/lat with `|x| ≤ 540` looks the same, so it is reported rather than hidden |
 | Polygon validity after tile quantization (export, #383, #748) | One owner, `mvt::tile_polygon::finalize_polygons`, called by `encode_tile_polygons`, the only producer of polygon commands (plain encode, merge valve, coverage fill, placeholder squares, `--verbatim`). It checks the whole feature as one OGC MultiPolygon with exact integer tests (GEOS's `IsValidOp` rules: ring simplicity, rings or parts crossing or sharing an edge stretch, crossing at a shared vertex, hole outside its shell, nested holes, nested shells, disconnected interior); a valid feature goes out exactly as snapped. Invalid original rings go to an `i_overlay` i32 union under `FillRule::Positive` with OGC extraction and holes re-bound to the smallest containing shell. A half-unit working grid preserves small lobes until rounding; a still-invalid result goes through the same kernel on the final grid. Zero-shoelace rings first resolve their `NonZero` fill, then take their exterior/hole role in the positive-fill union. Multipolygon parts that interact (by the same check, pairwise) are unioned the same way first, cached across valve passes. A feature still invalid after repair is counted through per-run diagnostics | wagyu `fill_type_positive` union on every polygon after snapping (`clip.cpp` `clean_or_clip_poly`), unconditionally | Positive fill only runs on features the check rejects, so the common case is one check. DIVERGENCE FROM TIPPECANOE: zero-shoelace crossing rings have no net winding to normalize; retain both lobes under nonzero fill before applying their role, making repair independent of ring direction and starting vertex. Nonzero-area rings retain the positive-fill semantics. The strict invariant matrix (`run_e2e.py --invariants`) holds 0 invalid polygons on every fixture and setting |
 | PMTiles header zoom range (export, #529/#522/#554) | Header `min_zoom`/`max_zoom` = the zooms that actually hold tiles; a wider requested range (`--min-zoom 0` over levels that generalized to nothing, a pyramid band's declared range, a shard set's union) lives only in `vector_layers[].minzoom`/`maxzoom` | Stamps the requested `-Z`/`-z` range in the header even when the coarse zooms are empty (golden `tests/fixtures/golden/open-buildings.pmtiles`: header z0..z10) | `go-pmtiles verify` rejects a header wider than the directory ("header MinZoom does not match min tile z"). Renderers that build TileJSON from the header (the pmtiles JS `getTileJson`) therefore see the narrower range; `vector_layers` zooms are informational to them. Acceptable: the empty zooms render identically (nothing either way), and an honest `maxzoom` lets MapLibre overzoom from the deepest real tile instead of requesting empty ones. `merge` and the pyramid band check read the declared range as header ∪ `vector_layers` so tylertoo's own archives keep round-tripping |
-| `--max-zoom auto` (#444) — inspired by `-zg`, not a port | `overview::auto_zoom` (`MaxZoom::resolve`): a deterministic systematic sample of at most 200k rows (`AUTO_ZOOM_SAMPLE_CAP`) from the row groups `--bbox`/`--filter` select, each sampled row's bbox read from the file's f64 bbox covering struct when one is declared (#693 — only that column is projected; no geometry bytes touched) or else from the GeoArrow scalar (no `geo::Geometry` conversion; non-sampled rows are never converted), then the per-feature bbox/filter tests. Signals, in Web Mercator meters (EPSG:4326 latitude deltas scaled by `1/cos φ`): the **median bbox diagonal** over features with a positive extent, and the **10th percentile** of Morton-order gaps between distinct centers (× `sqrt(sample fraction)` for subsample thinning). `resolvable = min(...)`; the zoom is the finest whose **256 px** tile pixel is ≤ `resolvable / 2`, clamped to `[min_zoom, 16]`. No signal → `ConvertError::AutoZoomNoSignal`; `min_zoom > 16` → `AutoZoomMinAboveCeiling` | `-zg` (`main.cpp`, the `guess_maxzoom` block, ~L2278–2440): sorts features by a 32-bit quadkey index and takes the log of consecutive **index deltas** (Welford mean/σ), `nearby = exp(mean − 1.5σ)` converted to "feet" empirically (`sqrt(nearby) / 33`), halved ("one zoom level beyond"); lines/polygons add the **geometric mean of intra-feature vertex spacing / 8** (`want2 = exp(dist_sum / dist_count) / 8`), which only raises the zoom. Both resolve at the full **4096-unit** tile extent: `ceil(log2(360 / want_deg) − full_detail)`, `full_detail = 12`; capped at `32 − full_detail` (z20). With no distinct locations and no vertex spacing it exits: "Can't guess maxzoom (-zg) without at least two distinct feature locations" (unless `--smallest-maximum-zoom-guess`) | Every measurement differs, deliberately. (1) Resolution: tippecanoe resolves `want` at 4096 units/tile, which lands 4 zooms finer than resolving the same distance at 256 px; that is what makes `-zg` archives famously deep. We resolve "half the typical detail" at 256 px — an archive a feature is legible in, not one that preserves vertex spacing — and cap at z16 rather than z20. (2) Extent vs vertex spacing: a median bbox diagonal is one scalar per feature from the sampled bbox, while vertex spacing needs every coordinate of every feature; median + positive-only keeps points from zeroing it (mixed inputs). (3) Spacing: a percentile of real Morton-ordered center gaps in meters instead of log index deltas and an empirical feet conversion. (4) Footer-only statistics (whole-file bbox + row count) were measured and rejected: on `open-buildings` they imply ~566 m spacing vs a ~28 m median building, a >20× error from how populated the bbox is. (5) Estimated before the conversion rather than from pass 1's own bbox scan, so `LevelPlan`/`check_zoom_ceiling` (#371) keep a concrete zoom; the cost is one extra read of ONE column of the selected row groups (bounded conversion, not bounded I/O): on covered input (#693) the bbox covering struct — a few percent of the geometry column's bytes, so a remote estimate no longer pre-reads the dominant column — else the geometry column. An f32 covering (spec-legal, Overture-style) is NOT used: its rounded bounds are not bit-identical to the geometry-derived f64 bboxes and could move a marginal zoom, so the covering fast path requires all four fields `f64` (what gpio writes) and anything else keeps the geometry path; null covering values skip the row exactly as null geometries do (the spec ties the two), and an INVERTED envelope (`xmin > xmax`, the spec's antimeridian wraparound form) is SWAPPED rather than skipped: the geometry path has no inverted case, since `BboxAcc` is a min/max over the coordinates and so yields exactly that planar envelope, and skipping would drop the row from one path only — a Fiji- or Chukotka-only extract where every feature crosses would then sample nothing and fail on a file the geometry path reads fine. A declared covering that turns out to be unusable in the DATA (every sampled value null — a struct column built from a schema template and never populated — or a child whose physical type is not `f64`) warns and re-samples the geometry column instead of failing, so a broken sidecar cannot turn a working `auto` into an `AutoZoomNoSignal` whose message blames distinct locations; the retry is bounded by the same 200k-row cap. Both paths are pure functions of the same f64 bboxes and resolve identical zooms, pinned by `covering_path_matches_the_geometry_path_bit_for_bit`. Measured picks: madagascar-adm4 z8, road-detections z13, open-buildings z14 (pinned in `real_fixtures_choose_pinned_zooms`) |
+| `--max-zoom auto` (#444) — inspired by `-zg`, not a port | `overview::auto_zoom` (`MaxZoom::resolve`): a deterministic systematic sample of at most 200k rows (`AUTO_ZOOM_SAMPLE_CAP`) from the row groups `--bbox`/`--filter` select, each sampled row's bbox read from the file's f64 bbox covering struct when one is declared (#693 — only that column is projected; no geometry bytes touched) or else from the GeoArrow scalar (no `geo::Geometry` conversion; non-sampled rows are never converted), then the per-feature bbox/filter tests. Signals, in Web Mercator meters (EPSG:4326 latitude deltas scaled by `1/cos φ`): the **median bbox diagonal** over features with a positive extent, and the **10th percentile** of Morton-order gaps between distinct centers (× `sqrt(sample fraction)` for subsample thinning). `resolvable = min(...)`; the zoom is the finest whose **256 px** tile pixel is ≤ `resolvable / 2`, clamped to `[min_zoom, 16]`. No signal → `ConvertError::AutoZoomNoSignal`; `min_zoom > 16` → `AutoZoomMinAboveCeiling` | `-zg` (`main.cpp`, the `guess_maxzoom` block, ~L2278–2440): sorts features by a 32-bit quadkey index and takes the log of consecutive **index deltas** (Welford mean/σ), `nearby = exp(mean − 1.5σ)` converted to "feet" empirically (`sqrt(nearby) / 33`), halved ("one zoom level beyond"); lines/polygons add the **geometric mean of intra-feature vertex spacing / 8** (`want2 = exp(dist_sum / dist_count) / 8`), which only raises the zoom. Both resolve at the full **4096-unit** tile extent: `ceil(log2(360 / want_deg) − full_detail)`, `full_detail = 12`; capped at `32 − full_detail` (z20). With no distinct locations and no vertex spacing it exits: "Can't guess maxzoom (-zg) without at least two distinct feature locations" (unless `--smallest-maximum-zoom-guess`) | Every measurement differs, deliberately. (1) Resolution: tippecanoe resolves `want` at 4096 units/tile, which lands 4 zooms finer than resolving the same distance at 256 px; that is what makes `-zg` archives famously deep. We resolve "half the typical detail" at 256 px — an archive a feature is legible in, not one that preserves vertex spacing — and cap at z16 rather than z20. (2) Extent vs vertex spacing: a median bbox diagonal is one scalar per feature from the sampled bbox, while vertex spacing needs every coordinate of every feature; median + positive-only keeps points from zeroing it (mixed inputs). (3) Spacing: a percentile of real Morton-ordered center gaps in meters instead of log index deltas and an empirical feet conversion. (4) Footer-only statistics (whole-file bbox + row count) were measured and rejected: on `open-buildings` they imply ~566 m spacing vs a ~28 m median building, a >20× error from how populated the bbox is. (5) Estimated before the conversion rather than from pass 1's own bbox scan, so `LevelPlan`/`check_zoom_ceiling` (#371) keep a concrete zoom. The conversion (or the tiles facade) estimates over the source it then converts (`ConvertOptions::auto_max_zoom`, #788), and a remote sample is staged before it is read, so the passes reuse the staged chunks; the cost is one extra read of ONE column of the selected row groups (bounded conversion, not bounded I/O): on covered input (#693) the bbox covering struct — a few percent of the geometry column's bytes, so a remote estimate no longer pre-reads the dominant column — else the geometry column. An f32 covering (spec-legal, Overture-style) is NOT used: its rounded bounds are not bit-identical to the geometry-derived f64 bboxes and could move a marginal zoom, so the covering fast path requires all four fields `f64` (what gpio writes) and anything else keeps the geometry path; null covering values skip the row exactly as null geometries do (the spec ties the two), and an INVERTED envelope (`xmin > xmax`, the spec's antimeridian wraparound form) is SWAPPED rather than skipped: the geometry path has no inverted case, since `BboxAcc` is a min/max over the coordinates and so yields exactly that planar envelope, and skipping would drop the row from one path only — a Fiji- or Chukotka-only extract where every feature crosses would then sample nothing and fail on a file the geometry path reads fine. A declared covering that turns out to be unusable in the DATA (every sampled value null — a struct column built from a schema template and never populated — or a child whose physical type is not `f64`) warns and re-samples the geometry column instead of failing, so a broken sidecar cannot turn a working `auto` into an `AutoZoomNoSignal` whose message blames distinct locations; the retry is bounded by the same 200k-row cap. Both paths are pure functions of the same f64 bboxes and resolve identical zooms, pinned by `covering_path_matches_the_geometry_path_bit_for_bit`. Measured picks: madagascar-adm4 z8, road-detections z13, open-buildings z14 (pinned in `real_fixtures_choose_pinned_zooms`) |
 | GeometryCollections (export, #431) | Split at MVT encode (`LayerBuilder::add_feature`) into at most three single-type features per tile — one `MultiPolygon`, one `MultiLineString`, one `MultiPoint` — with the collection's id and tags; nested collections flatten; `Line`/`Rect`/`Triangle` encode as line/polygon. Whatever still encodes to nothing is counted — `encode_dropped_features` (nothing to encode: empty geometry or collection; warned about) and `encode_quantized_features` (collapsed at the tile extent; expected, informational) | Splits a GeoJSON `GeometryCollection` at **read** time into one feature **per member** with the same id and properties (`read_json.cpp`, `serialize_geojson_feature`; cited from memory — the tippecanoe source is not vendored here) | Grouping by kind emits fewer features and shares a `--feature-id` across at most three of them instead of one per member; the rendered content is the same. Splitting at encode rather than at read keeps the overview file's `GeometryCollection` rows intact (the convert already carries them through, `hostile.rs::geometry_collection_passes_through`) |
 | Stable MVT feature ids (export, `--feature-id`, #443) | Only integer (`Int8`..`Int64`, `UInt8`..`UInt64`) and `DECIMAL(p,0)` columns are accepted; strings, floats, scaled decimals and dictionary-encoded columns are rejected at resolution. Every row of the overview file (all levels) is checked **up front, before the output is created**, in one column-projected read that skips row groups whose Parquet statistics prove validity (zero nulls, non-negative min); a null, negative or >`u64::MAX` value is `ExportError::InvalidFeatureId` naming the overview-file row (not the source row: the convert reorders) and its level. Also rejected: the `--feature-order` column and any `--accumulate-attribute` column (from the file's clustering provenance at export; from the flags on `tiles` before the convert). Aggregates: a cluster carries its representative's id, a coalesced chain its highest-priority member's, a #384 carrier its own; duplicates are not checked | `--use-attribute-for-id` accepts any numeric attribute, parsing numeric strings and integral doubles; it only *warns* on a non-numeric or fractional id, and a numeric string with a leading `-` goes through `strtoull`, whose two's-complement reinterpretation is accepted whenever printing it back reproduces the input (`serial.cpp`), so `"-5"` silently becomes id `18446744073709551611` | Issue #443 asks for hard errors instead of that silent reinterpretation. Strings are not parsed because the common string id (Overture GERS) has no lossless `u64` form, and a float column's integrality is a per-value accident: cast or hash to an integer with `gpio`/DuckDB first. Matched: the column is moved to the feature id and never *also* published as a property (mapbox/tippecanoe#738), independent of `--include-property`/`--exclude-property` naming it. The no-flag default (tile-local `i as u64` in `build_mvt`) is unchanged pending #443's open question (omit the id entirely?). `tiles`, `export-pmtiles`, `pyramid` and the matching Python functions all take it (#779) |
 | Nested and unsupported property columns (export, #434) | `Struct`/`List`/`LargeList`/`FixedSizeList`/`Map` columns are exported as one JSON string per row (`extract_property_column` → `json_property_column`), advertised as `String` in `vector_layers.fields`; leaves use the scalar rules (temporal → ISO 8601 string, decimal → number, non-finite float → `null`), a leaf with no rule renders as JSON `null`, a null row carries no property, a `Map` with non-string keys becomes `[[k, v], ...]`. `Dictionary<_, T>` is unwrapped to `T` with one `arrow_cast` pass. `Binary`/`LargeBinary`/`FixedSizeBinary` (and a named-zone `Timestamp`) are dropped: one `log::warn!` per column per export from `resolve_export_columns`, the column listed in `ExportReport::skipped_property_columns`, and `--include-property` naming it is `ExportError::UnsupportedProperty` rather than "unknown". The writer's own bbox covering struct is neither exported nor warned about. `property_columns`, `field_metadata` and the extraction arms gate on the single `is_exportable` predicate | `stringify_value` (`read_json.cpp`, v2.80.0) turns any JSON object or array attribute into an `mvt_string` holding its `json_stringify` text, unconditionally; GeoJSON has no binary or temporal type, so tippecanoe has no dropped-column path and no warning | Matched on the convention (nested → JSON string, the Overture `names`/`sources` case). Divergences: (1) tippecanoe re-serializes the input's JSON text, so member order and number spelling are the parser's; ours are Arrow's field order and serde_json's rendering (`1.5`, not `1.50`), and a nested `NaN` is `null` since JSON has no NaN. (2) Binary is dropped rather than base64-encoded: the issue asks for a warning, not an encoding, and a base64 string a client cannot tell from text is a worse default than a loud omission (`gpio`/DuckDB can hex or base64 it explicitly). (3) The warning and the report entry are ours; tippecanoe cannot lose a column this way. Not JSON-stringified: `Union`, `RunEndEncoded`, `Utf8View`/`BinaryView`, `Float16`, `Interval`/`Duration`, which parquet does not produce on the overview path; they fall into the dropped-and-warned bucket |
@@ -1335,11 +1430,15 @@ crates/core/src/
 │   ├── config/keywords.rs # Shared keyword syntax and core-derived runtime defaults
 │   ├── convert.rs      #   convert_to_overviews() orchestration
 │   ├── export.rs       #   Overview GeoParquet → PMTiles export
+│   ├── export/tile_data.rs #   A tile's MVT bytes and the gzip cached for exactly them
+│   ├── disk.rs         #   One conservative disk footprint per conversion, per volume
 │   ├── hostile.rs      #   Hostile-input hardening tests
 │   ├── level.rs        #   Footer metadata model, SPEC_VERSION
 │   ├── reader.rs       #   Overview file reader (level-banded row groups)
 │   ├── simplify.rs     #   World-space RDP simplification (GSD tolerance)
 │   ├── pipeline.rs     #   Single-read pass-2 engine (#213): fans each batch to all levels
+│   ├── read.rs         #   Ordered input reading (#494, #538): sequential, or reader
+│   │                   #   workers over row-group segments merged back in order
 │   ├── plan_state.rs   #   Convert plan artifact (--save-plan/--plan): the persisted
 │   │                   #   pass-1 + assignment result, Arrow IPC + fingerprint
 │   ├── stream.rs       #   Two-pass streaming orchestration (pass-1 scan; pass-2 → pipeline.rs)
@@ -1402,6 +1501,8 @@ crates/core/src/
 │                       # several archives both share (one look-ahead each)
 ├── pmtiles_writer.rs   # PMTiles v3 writer (StreamingPmtilesWriter)
 ├── compression.rs      # gzip/brotli/zstd compression
+├── compression/tile_gzip.rs # Bounded memo of tile gzip (#733): equal raw bytes
+│                       # share one compression; the cap is export's grant
 ├── dedup.rs            # Tile deduplication (XXH3)
 ├── quality.rs          # CRS extraction + WGS84 validation
 └── wkb.rs              # WKB round-trip helpers

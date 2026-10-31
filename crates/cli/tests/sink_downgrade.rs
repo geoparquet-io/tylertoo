@@ -3,8 +3,9 @@
 //! The input is built so the up-front estimate keeps the pass-2 sinks in RAM
 //! and only the rows that arrive late make them too big: point geometry
 //! (which is all the up-front estimate can see) with an empty `name` on the
-//! first rows and a 4 KiB `name` on the rest. Under a small
-//! `TYLERTOO_AUTO_MEM_LIMIT_BYTES` the run must start in RAM, notice the
+//! first rows and a 4 KiB `name` on the rest. Under a
+//! `TYLERTOO_AUTO_MEM_LIMIT_BYTES` that leaves the sinks a small allowance,
+//! the run must start in RAM, notice the
 //! heavy tail while it is being buffered, and downgrade to spill — and the
 //! output must still be byte-identical to a `--profile bounded` run, because
 //! the backing choice never touches output bytes.
@@ -32,16 +33,22 @@ use tylertoo_io::test_support::WriterProperties;
 const ROWS: usize = 40_000;
 /// Leading rows with an empty `name`: light enough that the rate measured
 /// over them projects the whole buffered set under the budget (an all-light
-/// input measures ~50 MB against the 108 MB budget).
+/// input measures ~50 MB against the skewed run's ~108 MB budget).
 const LIGHT_HEAD_ROWS: usize = 16_000;
 /// Bytes of `name` on every row after the head: the whole skewed pass
 /// buffers ~195 MB, well past the budget.
 const HEAVY_NAME_BYTES: usize = 4_096;
 /// Pass-2 read batch size, in rows.
 const READ_BATCH_ROWS: &str = "256";
-/// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` for the `auto` run; `auto` budgets 60% of
-/// it for the sinks.
-const MEM_LIMIT_BYTES: &str = "180000000";
+/// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` for the `auto` run. The sinks get what
+/// the run's allowance (60% of it) has left after the grants charged before
+/// pass 2 (#716, #788). For the skewed input that is the writer's encode
+/// floor: 4 row groups priced from the footers at ~250 MB each, ~1.0 GB. That
+/// leaves the sinks ~108 MB, between what the light head projects and the
+/// ~195 MB the heavy tail buffers. At the 180 MB this test used before #788,
+/// the encode floor alone exceeds the allowance, so `auto` spills before
+/// pass 2 starts and there is nothing left to downgrade.
+const MEM_LIMIT_BYTES: &str = "1850000000";
 
 fn tylertoo_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tylertoo")
@@ -181,10 +188,14 @@ fn auto_downgrades_to_spill_on_a_heavy_tail_and_matches_bounded() {
     let (auto_bytes, auto) = run_overview(dir.path(), &input, "auto", Some(MEM_LIMIT_BYTES));
     let sink = &auto["pass2"]["sink"];
     let budget = sink["budget_bytes"].as_u64().expect("budget_bytes");
-    assert_eq!(
-        budget,
-        (MEM_LIMIT_BYTES.parse::<f64>().unwrap() * 0.6) as u64,
-        "the budget must come from TYLERTOO_AUTO_MEM_LIMIT_BYTES: {auto}"
+    // The sinks' budget is the run's allowance after the grants charged
+    // before pass 2 (#788): set by TYLERTOO_AUTO_MEM_LIMIT_BYTES, and below
+    // 60% of it, since the writer's encodes are charged first.
+    let allowance = (MEM_LIMIT_BYTES.parse::<f64>().unwrap() * 0.6) as u64;
+    assert!(
+        budget > 0 && budget < allowance,
+        "the budget must be the allowance from TYLERTOO_AUTO_MEM_LIMIT_BYTES \
+         ({allowance} B) less the grants charged before pass 2: {auto}"
     );
     assert_eq!(
         sink["downgraded_to_spill"].as_bool(),

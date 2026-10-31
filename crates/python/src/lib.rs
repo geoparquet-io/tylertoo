@@ -7,6 +7,22 @@
 //! `build.rs` generates runtime signatures from core defaults, and stubtest
 //! checks the full typed signatures against that runtime surface.
 
+/// Global allocator for the extension's own Rust allocations (#739, #788).
+///
+/// Unconditional on musl (musllinux wheels), for #480's reason: musl's
+/// `mallocng` fails small allocations under heavy multi-threaded
+/// fragmentation. Elsewhere it is the `mimalloc` Cargo feature, off by
+/// default. Python's allocator is untouched: a Rust `#[global_allocator]`
+/// serves only this module's Rust code, and nothing allocated here is freed
+/// by the interpreter (results cross into Python as copies). Excluded under
+/// `dhat-heap`, whose allocator tylertoo-core installs.
+#[cfg(all(
+    any(target_env = "musl", feature = "mimalloc"),
+    not(feature = "dhat-heap")
+))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
@@ -19,7 +35,6 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
 use tylertoo_core::input_set::ConvertSource;
-use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::check::validate_file;
 use tylertoo_core::overview::config::keywords as config_keywords;
 use tylertoo_core::overview::convert::{
@@ -236,30 +251,16 @@ fn check_keywords(
     Ok(())
 }
 
-fn overview_config(
-    values: serde_json::Map<String, serde_json::Value>,
-) -> PyResult<(MaxZoom, ConvertOptions)> {
-    config_with_max_zoom("overview", values, |values| {
-        config_keywords::convert(values, ConvertOptions::default()).map_err(convert_error_to_py)
-    })
+/// `max_zoom="auto"` (#444) parses into the options' auto flag; the
+/// conversion estimates it over its own source (#788).
+fn overview_config(values: serde_json::Map<String, serde_json::Value>) -> PyResult<ConvertOptions> {
+    check_keywords("overview", &values)?;
+    config_keywords::convert(values, ConvertOptions::default()).map_err(convert_error_to_py)
 }
 
-fn tiles_config(
-    values: serde_json::Map<String, serde_json::Value>,
-) -> PyResult<(MaxZoom, TilesOptions)> {
-    config_with_max_zoom("convert", values, |values| {
-        config_keywords::tiles(values).map_err(tiles_error_to_py)
-    })
-}
-
-fn config_with_max_zoom<T>(
-    command: &str,
-    mut values: serde_json::Map<String, serde_json::Value>,
-    parse: impl FnOnce(serde_json::Map<String, serde_json::Value>) -> PyResult<T>,
-) -> PyResult<(MaxZoom, T)> {
-    check_keywords(command, &values)?;
-    let max_zoom = config_keywords::max_zoom(&mut values, command).map_err(config_err)?;
-    Ok((max_zoom, parse(values)?))
+fn tiles_config(values: serde_json::Map<String, serde_json::Value>) -> PyResult<TilesOptions> {
+    check_keywords("convert", &values)?;
+    config_keywords::tiles(values).map_err(tiles_error_to_py)
 }
 
 fn export_config(values: serde_json::Map<String, serde_json::Value>) -> PyResult<ExportOptions> {
@@ -272,37 +273,6 @@ fn pyramid_config(
 ) -> PyResult<tylertoo_core::pyramid::PyramidOptions> {
     check_keywords("pyramid", &values)?;
     config_keywords::pyramid(values).map_err(config_err)
-}
-
-// --- max_zoom --------------------------------------------------------------------
-
-/// Extract the `max_zoom` kwarg (#444): an `int` zoom, or the string
-/// `"auto"` (any case). Parsing and resolution belong to core
-/// ([`MaxZoom`]); this only maps Python types onto it with precise errors —
-/// an out-of-range int is a `ValueError`, not pyo3's generic extraction
-/// failure.
-/// Resolve `max_zoom="auto"` (#444) once `options` is built and every cheap
-/// check has passed ([`MaxZoom::resolve`] validates the options before
-/// reading anything). A fixed zoom returns without opening the input; for
-/// `auto` a dedicated source is opened with `open_source`, so the
-/// conversion's own source is untouched. Core checks `output` before the
-/// estimate reads the input (#452). The GIL is released while the estimate
-/// reads.
-fn resolve_max_zoom_py(
-    py: Python<'_>,
-    max_zoom: MaxZoom,
-    options: &mut ConvertOptions,
-    output: &Path,
-    open_source: impl FnOnce() -> Result<ConvertSource, ConvertError> + Send,
-) -> PyResult<u8> {
-    if !max_zoom.is_auto() {
-        return Ok(max_zoom.plan_zoom());
-    }
-    py.detach(|| {
-        let source = open_source()?;
-        max_zoom.resolve(&source, options, Some(output))
-    })
-    .map_err(convert_error_to_py)
 }
 
 // --- functions -------------------------------------------------------------------
@@ -336,15 +306,11 @@ fn convert(
     }
 
     values.extend(keywords(Some(&positional))?);
-    let (max_zoom, mut options) = tiles_config(values)?;
-    // #709/#779: core's whole preflight, before `max_zoom="auto"` reads the
-    // input; the facade runs it again.
+    let options = tiles_config(values)?;
+    // #709/#779: core's whole preflight, before anything is read; the
+    // facade runs it again, then resolves `max_zoom="auto"` over the source
+    // it converts (#444, #788).
     options.validate().map_err(tiles_error_to_py)?;
-    // Resolves `auto` and writes the chosen zoom back into `levels`, which
-    // is where the facade reads the declared range from.
-    resolve_max_zoom_py(py, max_zoom, &mut options.convert, &output_path, || {
-        ConvertSource::resolve_path(&input_path).map_err(ConvertError::from)
-    })?;
 
     // #314/#709: core's free-space preflight, raised before the run starts
     // (so it is heard on the failure it predicts) and naming the kwargs.
@@ -387,7 +353,7 @@ fn overview(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
-    let (max_zoom, mut options) = overview_config(keywords(kwargs)?)?;
+    let options = overview_config(keywords(kwargs)?)?;
     // #779: every rule that needs no input, before anything is read.
     options.validate().map_err(convert_error_to_py)?;
 
@@ -410,15 +376,6 @@ fn overview(
         ));
     };
     let output_path = PathBuf::from(output);
-
-    // #444: every cheap check has passed; now estimate `auto` over a
-    // dedicated source (skipped for an explicit `gsds` ladder).
-    resolve_max_zoom_py(py, max_zoom, &mut options, &output_path, || match &parsed {
-        OverviewInput::Path(p) => ConvertSource::resolve_path(p).map_err(ConvertError::from),
-        OverviewInput::List(inputs) => {
-            ConvertSource::from_input_list(inputs).map_err(ConvertError::from)
-        }
-    })?;
 
     // Release the GIL while the Rust pipeline runs.
     let mut report = py
@@ -602,7 +559,7 @@ mod config_parity {
     fn overview_cli_python_core_configs_are_equal() {
         let defaults = cli::OverviewArgs::parse_from(["overview", "in", "out"]);
         let cli_defaults = cli::overview_options(&defaults).unwrap();
-        let (_, python) = overview_config(native_keywords(json!({}))).unwrap();
+        let python = overview_config(native_keywords(json!({}))).unwrap();
         let core = ConvertOptions::default()
             .with_generalization(&Default::default(), false)
             .unwrap();
@@ -633,7 +590,7 @@ mod config_parity {
             "id",
         ]);
         let cli = cli::overview_options(&args).unwrap();
-        let (_, python) = overview_config(native_keywords(json!({"min_zoom": 1, "max_zoom": 3, "row_group_size": 1234, "cascade": false, "drop_lines": true, "sort_direction": "asc", "include_properties": ["id"]}))).unwrap();
+        let python = overview_config(native_keywords(json!({"min_zoom": 1, "max_zoom": 3, "row_group_size": 1234, "cascade": false, "drop_lines": true, "sort_direction": "asc", "include_properties": ["id"]}))).unwrap();
         let mut core = ConvertOptions {
             levels: LevelPlan::ZoomRange {
                 min_zoom: 1,
@@ -661,7 +618,7 @@ mod config_parity {
     fn tiles_cli_python_core_configs_are_equal() {
         let defaults = cli::TilesArgs::parse_from(["tiles", "in", "out"]);
         let cli_defaults = cli::tiles_options(&defaults).unwrap();
-        let (_, python) = tiles_config(native_keywords(json!({}))).unwrap();
+        let python = tiles_config(native_keywords(json!({}))).unwrap();
         let core = {
             let mut options = TilesOptions::default();
             options.convert = options
@@ -694,7 +651,7 @@ mod config_parity {
             "places",
         ]);
         let cli = cli::tiles_options(&args).unwrap();
-        let (_, python) = tiles_config(native_keywords(json!({"verbatim": true, "point_thinning": 2.0, "extent": 8192, "max_compressed_tile_size": 1048576, "layer_name": "places"}))).unwrap();
+        let python = tiles_config(native_keywords(json!({"verbatim": true, "point_thinning": 2.0, "extent": 8192, "max_compressed_tile_size": 1048576, "layer_name": "places"}))).unwrap();
         let mut core = TilesOptions::default();
         core.convert = core.convert.verbatim();
         core.convert.assign.point_thinning = 2.0;

@@ -470,6 +470,7 @@ fn tiles_shard_coarse_draws_the_unsharded_fill() {
             range: None,
             pivot_zoom: pivot,
             cut_digest: "771".to_string(),
+            binding: None,
         }),
     );
     let drawn: usize = coarse.zooms.iter().map(|z| z.fill_polygons).sum();

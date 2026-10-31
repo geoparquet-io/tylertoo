@@ -13,8 +13,9 @@
 //! - the read side streams the input in order over a bounded channel, tagging
 //!   each batch with its cumulative `row_offset`. It is one reader thread, or
 //!   since #494 several reader workers (auto-sized up to
-//!   [`super::convert::READ_WORKERS_MAX`]) whose segments [`read_in_order`]
-//!   merges back into the identical batch sequence;
+//!   [`super::convert::READ_WORKERS_MAX`]) whose segments
+//!   [`super::read::read_in_order`] merges back into the identical batch
+//!   sequence;
 //! - the consumer takes a **window** of up to half of `in_flight` batches at a
 //!   time ([`super::pipe::for_each_window`], #494; the channel gets the other
 //!   half, see [`super::pipe::split_in_flight`]), processes them concurrently,
@@ -55,15 +56,16 @@ use crossbeam_channel::{Receiver, Sender};
 use rayon::prelude::*;
 use std::path::Path;
 use tempfile::NamedTempFile;
+use tylertoo_io::IpcCompression;
 use tylertoo_io::IpcStreamReader as StreamReader;
 use tylertoo_io::IpcStreamWriter as StreamWriter;
 
-use super::memory::{MemoryBudget, MemoryPhase, SINK_ROW_ALLOC_OVERHEAD_BYTES};
-use crate::input_set::{ConvertSource, ReadPlan, ReadSegment, RowGroupSelection};
+use super::memory::{MemoryBudget, SINK_ROW_ALLOC_OVERHEAD_BYTES};
 
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
 use super::pipe::{for_each_window, scoped_pipe, split_in_flight};
+use super::read::{internal, ReadFlow};
 use super::stream::{
     process_batch_cascade, process_level_batch, LevelStreamCtx, Pass2Timers, StreamRead,
 };
@@ -85,6 +87,21 @@ pub(super) enum SinkBacking {
     Spill,
 }
 
+/// Run-local spill encoding policy, resolved once with the sink backing.
+const fn spill_codec_for_profile(profile: MemoryProfile) -> IpcCompression {
+    match profile {
+        MemoryProfile::Bounded => IpcCompression::Lz4,
+        MemoryProfile::Auto | MemoryProfile::Speed => IpcCompression::None,
+    }
+}
+
+pub(super) const fn spill_codec_name(codec: IpcCompression) -> &'static str {
+    match codec {
+        IpcCompression::None => "raw",
+        IpcCompression::Lz4 => "lz4",
+    }
+}
+
 /// Buffered-row count above which `Auto` always spills partitioning's
 /// full-resolution geometry, regardless of the RAM estimate. Preserves the
 /// pre-#294 partitioning safety floor as a strict lower bound (partitioning
@@ -94,24 +111,20 @@ const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
 
 /// Workload-driven backing choice for [`MemoryProfile::Auto`] (#294).
 ///
-/// Chooses [`SinkBacking::Spill`] when the estimated buffered output exceeds a
-/// fraction of available RAM — a function of `feature_count × level_count ×
+/// Chooses [`SinkBacking::Spill`] when the estimated buffered output exceeds
+/// `memory`'s own [`MemoryProfile::Auto`] allowance, after every reservation
+/// and grant already charged to it — a function of `feature_count × level_count ×
 /// mode` (captured by `buffered_rows` and the per-mode byte estimate), NOT a
 /// mode-only rule. Partitioning additionally keeps its historical absolute
 /// row ceiling, so it spills at least as often as before.
 pub(super) fn auto_backing(
+    memory: &MemoryBudget,
     mode: Mode,
     buffered_rows: usize,
-    available_ram_bytes: Option<u64>,
     avg_geom_bytes: Option<u64>,
 ) -> SinkBacking {
-    let estimate = MemoryBudget::with_available(available_ram_bytes).sink_estimate(
-        mode,
-        buffered_rows,
-        avg_geom_bytes,
-    );
-    let budget = MemoryBudget::with_available(available_ram_bytes).allowance(MemoryProfile::Auto);
-    let ram_gate_spill = estimate > budget;
+    let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes);
+    let ram_gate_spill = estimate > memory.allowance(MemoryProfile::Auto);
     let abs_gate_spill =
         matches!(mode, Mode::Partitioning) && buffered_rows > PARTITIONING_SPILL_ROWS;
     if ram_gate_spill || abs_gate_spill {
@@ -138,8 +151,8 @@ pub(super) fn auto_backing(
 ///    non-reclaimable part of the cgroup's current usage is subtracted — the
 ///    same sense as the machine term's `MemAvailable` (#485);
 /// 3. `None` (callers fall back to a fixed conservative budget — see
-///    [`AUTO_FALLBACK_BUDGET_BYTES`] and
-///    [`super::export::PARTITION_WAVE_FALLBACK_MAX`]).
+///    [`MemoryBudget::remaining`]'s fallback allowance, which export's
+///    wave sizing shares).
 ///
 /// The result is computed once per process and cached: the probe is called ~5×
 /// per run (convert's pass-1 grid budget and pass-2 backing decision, export's
@@ -594,13 +607,32 @@ fn read_proc_mem_available() -> Option<u64> {
     None
 }
 
+/// The [`SinkBacking`] `profile` gives the pass-2 sinks, without logging:
+/// `speed` keeps them in RAM, `bounded` spills, and `auto` decides with
+/// [`auto_backing`]. The one owner of that rule: [`resolve_backing`] logs
+/// it, and the spill page-cache reservation (`stream::reserve_spill_cache`)
+/// asks it ahead of the decision.
+pub(super) fn sink_backing(
+    memory: &MemoryBudget,
+    profile: MemoryProfile,
+    mode: Mode,
+    buffered_rows: usize,
+    avg_geom_bytes: Option<u64>,
+) -> SinkBacking {
+    match profile {
+        MemoryProfile::Speed => SinkBacking::Ram,
+        MemoryProfile::Bounded => SinkBacking::Spill,
+        MemoryProfile::Auto => auto_backing(memory, mode, buffered_rows, avg_geom_bytes),
+    }
+}
+
 /// Resolve the [`MemoryProfile`] (including [`MemoryProfile::Auto`]) to a
-/// concrete [`SinkBacking`], logging the decision.
+/// concrete [`SinkBacking`] with [`sink_backing`], logging the decision.
 ///
 /// `buffered_rows` is the total winner count of the levels the engine buffers
 /// (all but the streamed finest level). For `Auto` the choice is workload-based
 /// (#294): the estimated buffered output (`f(buffered_rows, mode)`) is compared
-/// against a fraction of *available* RAM, so large duplicating runs prefer the
+/// against the run budget's allowance, so large duplicating runs prefer the
 /// bounded spill path instead of the old unconditional RAM buffering. An
 /// explicit profile always wins.
 pub(super) fn resolve_backing(
@@ -610,43 +642,32 @@ pub(super) fn resolve_backing(
     buffered_rows: usize,
     avg_geom_bytes: Option<u64>,
 ) -> SinkBacking {
-    match profile {
-        MemoryProfile::Speed => {
-            log::debug!(
-                "pass2 memory profile Speed + {mode:?} (buffered ~{buffered_rows} rows) → Ram"
-            );
-            SinkBacking::Ram
-        }
-        MemoryProfile::Bounded => {
-            log::debug!(
-                "pass2 memory profile Bounded + {mode:?} (buffered ~{buffered_rows} rows) → Spill"
-            );
-            SinkBacking::Spill
-        }
-        MemoryProfile::Auto => {
-            let available = memory.available();
-            let backing = auto_backing(mode, buffered_rows, available, avg_geom_bytes);
-            let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes);
-            let budget = memory.allowance(MemoryProfile::Auto);
-            let avail_mib = available.map_or_else(
-                || "unknown".to_string(),
-                |b| format!("{} MiB", b / (1024 * 1024)),
-            );
-            let geom = avg_geom_bytes.filter(|&b| b > 0).map_or_else(
-                || "unmeasured (calibrated constants)".to_string(),
-                |b| format!("measured avg geom {b} B/row"),
-            );
-            // Info-level: the auto decision drives peak RAM and is the primary
-            // diagnostic for #294 / #295 (paired with the [rss] phase logs).
-            log::info!(
-                "[convert] pass2 auto + {mode:?}: buffered ~{buffered_rows} rows, \
-                 {geom}, est {} MiB vs budget {} MiB (avail {avail_mib}) → {backing:?}",
-                estimate / (1024 * 1024),
-                budget / (1024 * 1024),
-            );
-            backing
-        }
+    let backing = sink_backing(&memory, profile, mode, buffered_rows, avg_geom_bytes);
+    if !matches!(profile, MemoryProfile::Auto) {
+        log::debug!(
+            "pass2 memory profile {profile:?} + {mode:?} (buffered ~{buffered_rows} rows) → {backing:?}"
+        );
+        return backing;
     }
+    let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes);
+    let budget = memory.allowance(MemoryProfile::Auto);
+    let avail_mib = memory.available().map_or_else(
+        || "unknown".to_string(),
+        |b| format!("{} MiB", b / (1024 * 1024)),
+    );
+    let geom = avg_geom_bytes.filter(|&b| b > 0).map_or_else(
+        || "unmeasured (calibrated constants)".to_string(),
+        |b| format!("measured avg geom {b} B/row"),
+    );
+    // Info-level: the auto decision drives peak RAM and is the primary
+    // diagnostic for #294 / #295 (paired with the [rss] phase logs).
+    log::info!(
+        "[convert] pass2 auto + {mode:?}: buffered ~{buffered_rows} rows, \
+         {geom}, est {} MiB vs budget {} MiB (avail {avail_mib}) → {backing:?}",
+        estimate / (1024 * 1024),
+        budget / (1024 * 1024),
+    );
+    backing
 }
 
 // ============================================================================
@@ -663,6 +684,8 @@ const SINK_SAMPLE_MIN_ROWS: usize = 1_024;
 /// regression is visible without an RSS trace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct SinkMeasurement {
+    /// The run's private spill encoding, including an auto downgrade.
+    pub(super) codec: IpcCompression,
     /// Measured retained bytes per buffered output row — the Arrow array
     /// bytes (geometry + every kept property column) of every batch handed to
     /// the sinks, averaged over the whole pass, plus
@@ -812,6 +835,7 @@ impl SinkAutoTuner {
 
     fn report(&self) -> SinkMeasurement {
         SinkMeasurement {
+            codec: IpcCompression::None,
             bytes_per_row: self.bytes_per_row(),
             sampled_rows: self.rows,
             projected_bytes: self.projected_bytes(),
@@ -836,1105 +860,6 @@ fn downgrade_sinks_to_spill(
     Ok(())
 }
 
-// ============================================================================
-// Ordered input reading: one sequential reader, or several merged in order
-// ============================================================================
-
-/// What the caller wants from [`read_in_order`], and what it knows about the
-/// rows it is about to read.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct ReadTuning {
-    pub(super) budget: MemoryBudget,
-    /// Rows per delivered batch. The merge reproduces this chunking exactly,
-    /// however many workers actually read.
-    pub(super) batch_size: usize,
-    /// Reader threads asked for (already resolved; `1` = sequential).
-    pub(super) workers: usize,
-    /// Average encoded-geometry bytes per input row (#305), from the footers
-    /// (#717), used only to size the read-ahead against the memory budget.
-    /// `None` falls back to [`READ_ROW_BYTES_FALLBACK`].
-    pub(super) avg_geom_bytes: Option<u64>,
-    /// The run's requested memory profile. `Bounded` means the caller asked
-    /// for memory over speed, so a worker's read-ahead queue is capped lower
-    /// (see [`READ_AHEAD_BOUNDED_MAX_BATCHES`]).
-    pub(super) profile: MemoryProfile,
-}
-
-/// Whether [`read_in_order`]'s consumer wants more batches.
-pub(super) enum ReadFlow {
-    Continue,
-    /// The consumer hung up (its own downstream is gone). Not an error: the
-    /// real one is reported by whoever owns the downstream.
-    Stop,
-}
-
-/// Share of the memory budget the pass-2 read-ahead may hold. Small on
-/// purpose: the read-ahead competes with the pass-2 output sink, which is what
-/// the budget is really for (#294), and a read that is `workers` × deeper than
-/// before must not be what pushes a bounded run into swap.
-///
-/// This is a *model* bound, not a measured guarantee: it bounds
-/// `workers × depth × batch_size × per_row`, where `per_row` is the estimate
-/// in [`resolve_read_shape`]. A schema whose non-geometry columns cost far
-/// more per row than the model assumes is priced too cheaply and the read-ahead
-/// will exceed 10% of the budget. See the per-row note there.
-const READ_BUDGET_FRACTION: f64 = 0.10;
-
-/// Ceiling on a worker's read-ahead under an explicit `bounded` profile: the
-/// caller asked for memory over speed, so a rich machine does not get to build
-/// the full [`READ_AHEAD_MAX_BATCHES`] queue per worker.
-///
-/// This caps the *generous* end and nothing else. Halving the budget slice
-/// instead — the other obvious way to make the read-ahead profile-aware — was
-/// measured and rejected: with the calibrated per-row cost below, halving took
-/// a 58-column fixture from 3 reader threads to none under `bounded`, and
-/// `bounded` is the profile this whole parallel read exists to speed up (#494's
-/// Brazil measurement is a `--profile bounded` run). A ceiling on depth never
-/// costs a worker, and it only binds when `affordable / workers` was already
-/// above it.
-const READ_AHEAD_BOUNDED_MAX_BATCHES: usize = READ_AHEAD_MAX_BATCHES / 2;
-
-/// Floor on a worker's read-ahead, in batches. Below this a worker cannot hold
-/// even a small segment, so it stalls mid-segment and its read does not
-/// overlap anything — at which point a worker is worse than no worker.
-const READ_AHEAD_MIN_BATCHES: usize = 4;
-
-/// Ceiling on a worker's read-ahead, in batches. A deeper queue only buys
-/// tolerance for longer consumer stalls, and the cost is resident Arrow data.
-const READ_AHEAD_MAX_BATCHES: usize = 32;
-
-/// A resolved parallel-read shape: how many workers, how deep each one's
-/// queue is, and how large a segment may be.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReadShape {
-    workers: usize,
-    depth: usize,
-    segment_target_rows: usize,
-}
-
-/// Size the parallel read against the memory budget.
-///
-/// The load-bearing relationship is `segment_target_rows <= (depth - 1) *
-/// batch_size`: **a segment must fit in its worker's queue**. Workers own
-/// disjoint segments but the merge consumes them strictly in order, so a
-/// worker whose queue fills before its segment ends simply parks until the
-/// merge reaches it — every worker takes its turn and the read is sequential
-/// again, with extra threads. Sized this way a worker finishes its segment
-/// into the queue and starts the next one, which is what makes the reads
-/// actually concurrent.
-///
-/// Everything else falls out of that: the budget fixes how many batches may
-/// be resident at once, workers are dropped (never below 1) until each one
-/// can hold [`READ_AHEAD_MIN_BATCHES`], and the depth is what is left over.
-fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
-    let batch_size = tuning.batch_size.max(1);
-    // Per-row cost of a RESIDENT decoded batch, priced exactly like the sink's
-    // measured-path model (`MemoryBudget::estimate`): a fixed non-geometry
-    // term plus the measured encoded geometry, doubled.
-    //
-    // the non-geometry row allowance is not decoration. The weight covers ONLY the
-    // geometry column, and a read batch carries every projected column — a
-    // 58-column schema's properties, offsets, dictionaries and validity
-    // buffers dwarf a small geometry. Pricing a row at `2 × avg_geom` alone
-    // under-charged wide schemas by 17-232× against
-    // `get_array_memory_size()`, which is how a bounded run at DEFAULTS could
-    // model 21 MiB of read-ahead and resident +370 MiB.
-    //
-    // #626 note: the sink's own non-geometry term is now MEASURED, so the two
-    // models no longer share a constant. That is deliberate — the read-ahead
-    // is sized before a single batch exists, so this one stays a proxy.
-    let per_batch = tuning
-        .budget
-        .estimate(MemoryPhase::Read, batch_size as u64, tuning.avg_geom_bytes)
-        // Property widths and dictionary repetition can fill the owner's
-        // entire decoded batch even when geometries and row counts are tiny.
-        .max(tylertoo_io::decoded_batch_limit())
-        .max(1);
-    let budget =
-        (tuning.budget.allowance(MemoryProfile::Auto) as f64 * READ_BUDGET_FRACTION) as u64;
-    let affordable = (budget / per_batch).max(1) as usize;
-    let max_depth = match tuning.profile {
-        MemoryProfile::Bounded => READ_AHEAD_BOUNDED_MAX_BATCHES,
-        MemoryProfile::Auto | MemoryProfile::Speed => READ_AHEAD_MAX_BATCHES,
-    };
-
-    // Closed form of "drop workers until each one can hold the floor":
-    // `affordable / w >= READ_AHEAD_MIN_BATCHES` ⟺ `w <= affordable /
-    // READ_AHEAD_MIN_BATCHES` (integer division, both sides). Written as a
-    // decrementing loop this was O(workers) — unbounded, since an explicit
-    // `--read-workers` is the caller's number, and `--read-workers
-    // 18446744073709551615` hung the process before it read a byte.
-    let workers = tuning
-        .workers
-        .max(1)
-        .min((affordable / READ_AHEAD_MIN_BATCHES).max(1));
-    let depth = (affordable / workers).clamp(READ_AHEAD_MIN_BATCHES, max_depth);
-    ReadShape {
-        workers,
-        depth,
-        segment_target_rows: depth.saturating_sub(1).max(1).saturating_mul(batch_size),
-    }
-}
-
-/// One worker's report on one segment.
-enum SegMsg {
-    /// A batch as the worker's own reader produced it, with the time that
-    /// read cost (core-seconds for the [profile] split).
-    Batch(RecordBatch, Duration),
-    /// The segment is complete; the merge moves on to the next one.
-    End,
-    Err(ConvertError),
-}
-
-/// Deliver every selected input row to `on_batch`, in exact read order, in
-/// batches of at most `tuning.batch_size` rows, preserving the I/O owner's
-/// memory and offset bounds with either sequential or concurrent readers.
-///
-/// **Why this exists (#494).** Pass 2 read the input from a single thread
-/// iterating one `ParquetRecordBatchReader`: 110.6 of the 403 wall seconds of
-/// a bounded Brazil-55M pass 2, and the largest single stage in the profile.
-/// Parquet row groups are independently readable, so the work parallelizes —
-/// the hard part is putting it back together.
-///
-/// **Why the merge re-chunks.** The sequential reader chains all of a part's
-/// selected row groups into one continuous decode, so its batches are exactly
-/// `batch_size` rows regardless of where the row-group boundaries fall.
-/// Workers reading disjoint runs necessarily produce a short batch at each
-/// run's end, and those boundaries are NOT free: the overview writer slices
-/// its row groups out of the batches it is handed, one `write` call per slice,
-/// and parquet checks its data-page limits per call — so a differently-chunked
-/// stream of the same rows can produce different page boundaries and therefore
-/// different bytes. The merge therefore re-assembles the exact chunking a
-/// single reader would have produced. Batches that already line up are passed
-/// through untouched; only the batch straddling a worker seam is copied.
-///
-/// **Gating.** Remote inputs read sequentially regardless of `workers`:
-/// `SourceStream` releases a part's in-memory read cache when it finishes that
-/// part, so concurrent readers over one remote source would evict each other's
-/// fetched chunks. This holds even after pass-0 staging: staging fills the
-/// remote source's own chunk cache and disk spill, it does not turn the
-/// `InputSource` into a `Local` one, so `is_remote()` stays true and a remote
-/// convert's pass-2 read is ALWAYS sequential. Only inputs that were local to
-/// begin with take the parallel path.
-///
-/// `projection` is a [`ReadPlan::projection`]: root columns of the schema the
-/// source exposes, `None` for all of them. Every worker reads the same one.
-/// Pass 2 reads every column; pass 1 reads the geometry plus the columns its
-/// flags name (#717).
-pub(super) fn read_in_order<F>(
-    source: &ConvertSource,
-    row_groups: Option<&RowGroupSelection>,
-    projection: Option<&[usize]>,
-    tuning: ReadTuning,
-    mut on_batch: F,
-) -> Result<(), ConvertError>
-where
-    F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
-{
-    let batch_size = tuning.batch_size.max(1);
-    let shape = resolve_read_shape(tuning);
-    let parallel = shape.workers > 1 && !source.is_remote();
-    if tuning.workers > 1 && source.is_remote() {
-        log::info!(
-            "[convert] reading sequentially — parallel reads are local-only \
-             (a remote source's parts share one chunk cache)"
-        );
-    }
-    if !parallel {
-        return read_sequentially(source, row_groups, projection, batch_size, &mut on_batch);
-    }
-    let segments = plan_segments(source, row_groups, shape)?;
-    if segments.len() < 2 {
-        return read_sequentially(source, row_groups, projection, batch_size, &mut on_batch);
-    }
-    let workers = shape.workers.min(segments.len());
-    log::info!(
-        "[convert] read: {workers} reader thread(s) over {} segment(s) \
-         (~{} row(s) each, {} read-ahead batch(es) per reader)",
-        segments.len(),
-        segments.iter().map(|s| s.rows).sum::<usize>() / segments.len(),
-        shape.depth,
-    );
-    // A row group larger than a worker's whole queue cannot be buffered ahead,
-    // so that worker parks mid-segment until the merge reaches it and the
-    // reads serialize again. Worth saying out loud: it is a property of the
-    // INPUT's row-group sizing, and `gpio` can fix it at the source.
-    let queue_rows = shape.depth.saturating_mul(batch_size);
-    if let Some(biggest) = segments.iter().map(|s| s.rows).max() {
-        if biggest > queue_rows {
-            log::debug!(
-                "[convert] read: largest segment is {biggest} row(s) but a \
-                 reader can buffer only {queue_rows} — reads will only partly \
-                 overlap (the input's row groups are large relative to the \
-                 read-ahead budget)"
-            );
-        }
-    }
-    read_in_parallel(
-        source,
-        &segments,
-        projection,
-        batch_size,
-        workers,
-        shape.depth,
-        &mut on_batch,
-    )
-}
-
-/// Segments each reader worker should get, at least, when the row groups
-/// allow it (#717).
-///
-/// [`ReadShape::segment_target_rows`] is a ceiling set by what a worker can
-/// buffer. On a machine with memory to spare it is large, and on its own it
-/// cut a 20-row-group input into 3 segments for 4 workers: the merge then
-/// drained worker 0's long first segment at one reader's speed while the
-/// others sat on full queues. Smaller segments keep every worker reading
-/// for the whole pass. Each one costs a reader open (the footer is reused)
-/// and, at its seam, one spliced batch. On the 20× Madagascar input, going
-/// from 1 to 4 segments per worker took pass 1 from 0.46 s to 0.26 s and pass
-/// 2 from 2.2 s to 1.55 s.
-const SEGMENTS_PER_WORKER: usize = 4;
-
-/// The segments [`read_in_order`] hands its workers: at most the shape's
-/// ceiling each, and small enough that every worker gets
-/// [`SEGMENTS_PER_WORKER`] of them when the row groups allow. Row groups are
-/// never split, so a run of large ones still gives fewer segments.
-fn plan_segments(
-    source: &ConvertSource,
-    row_groups: Option<&RowGroupSelection>,
-    shape: ReadShape,
-) -> Result<Vec<ReadSegment>, ConvertError> {
-    let rows = usize::try_from(source.selected_row_count(row_groups)?).unwrap_or(0);
-    let even = rows
-        .div_ceil(shape.workers.saturating_mul(SEGMENTS_PER_WORKER).max(1))
-        .max(1);
-    Ok(source.read_segments(row_groups, shape.segment_target_rows.min(even))?)
-}
-
-/// How many segments [`read_in_order`] would read concurrently for this
-/// source, selection and tuning; `0` when it would read sequentially.
-///
-/// Test seam: an equivalence test between worker counts compares the
-/// sequential reader with itself unless the fixture actually splits, and this
-/// is the same gating `read_in_order` applies.
-#[cfg(test)]
-pub(super) fn parallel_read_segments(
-    source: &ConvertSource,
-    row_groups: Option<&RowGroupSelection>,
-    tuning: ReadTuning,
-) -> usize {
-    let shape = resolve_read_shape(tuning);
-    if shape.workers < 2 || source.is_remote() {
-        return 0;
-    }
-    match plan_segments(source, row_groups, shape) {
-        Ok(segments) if segments.len() >= 2 => segments.len(),
-        _ => 0,
-    }
-}
-
-/// The pre-#494 path, unchanged and still the reference: one reader, one
-/// thread, batches straight through.
-fn read_sequentially<F>(
-    source: &ConvertSource,
-    row_groups: Option<&RowGroupSelection>,
-    projection: Option<&[usize]>,
-    batch_size: usize,
-    on_batch: &mut F,
-) -> Result<(), ConvertError>
-where
-    F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
-{
-    let mut reader = source.open_stream(&ReadPlan {
-        batch_size,
-        projection,
-        row_groups,
-    })?;
-    let mut row_offset = 0usize;
-    loop {
-        let t_read = Instant::now();
-        match reader.next() {
-            None => return Ok(()),
-            Some(Err(e)) => return Err(e.into()),
-            Some(Ok(batch)) => {
-                // An empty batch carries no rows and no offset advance, so
-                // delivering one is a no-op the parallel merge does not make
-                // either ([`Regrouper::push`] drops it). Skipping keeps the
-                // two paths' delivered batch sequences identical even if a
-                // reader ever hands one back.
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let read_dur = t_read.elapsed();
-                let offset = row_offset;
-                row_offset += batch.num_rows();
-                if matches!(on_batch(batch, offset, read_dur)?, ReadFlow::Stop) {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-/// `workers` readers over disjoint segments, merged back into read order on
-/// this thread.
-///
-/// Segment `i` is read by worker `i % workers`, so while the merge drains
-/// worker 0's segment the other workers are filling their queues with the
-/// segments that come next. Each worker has its own channel: a single shared
-/// queue would let a worker several segments ahead consume the whole budget
-/// and starve the worker the merge is actually waiting for.
-///
-/// **The assignment is static round-robin — there is no work stealing.** A
-/// worker that draws an unusually expensive segment (a badly compressed row
-/// group, a vertex-heavy run) stalls the merge behind it even while the other
-/// workers sit on full queues with nothing to do. Read-ahead absorbs most of
-/// it: the merge keeps draining the queues of the segments that follow, which
-/// is `depth` batches per worker of slack. Segments are also size-capped, not
-/// count-capped ([`ConvertSource::read_segments`]), so the variance is in
-/// decode cost rather than row count. Worth revisiting only if a profile shows
-/// the merge waiting — the fix (a shared work queue plus a reorder buffer)
-/// costs exactly the in-order simplicity this merge is built on.
-fn read_in_parallel<F>(
-    source: &ConvertSource,
-    segments: &[ReadSegment],
-    projection: Option<&[usize]>,
-    batch_size: usize,
-    workers: usize,
-    depth: usize,
-    on_batch: &mut F,
-) -> Result<(), ConvertError>
-where
-    F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
-{
-    std::thread::scope(|scope| -> Result<(), ConvertError> {
-        // Receivers live in THIS frame, so returning by any path — including
-        // an unwind — drops them before the scope joins, releasing any worker
-        // parked in `send` (the `super::pipe` liveness contract, #362).
-        let mut rxs = Vec::with_capacity(workers);
-        for w in 0..workers {
-            let (tx, rx) = crossbeam_channel::bounded::<SegMsg>(depth);
-            rxs.push(rx);
-            // Named so a stack dump, `perf`, or an OS thread listing tells a
-            // reader worker apart from the rayon pool and the spill writers.
-            std::thread::Builder::new()
-                .name(format!("tylertoo-read-{w}"))
-                .spawn_scoped(scope, move || {
-                    read_segments_for_worker(
-                        source, segments, projection, batch_size, workers, w, &tx,
-                    )
-                })?;
-        }
-
-        let mut regroup = Regrouper::default();
-        let mut row_offset = 0usize;
-        let mut pending_read = Duration::ZERO;
-        let mut current_part: Option<usize> = None;
-
-        let mut prev_rg: Option<usize> = None;
-        for (seq, segment) in segments.iter().enumerate() {
-            // The merge's correctness rests entirely on `read_segments`
-            // emitting parts in order and, within a part, ascending disjoint
-            // row-group runs — a cross-module contract that is otherwise only
-            // stated in prose. Enforce it here so a change on either side
-            // fails a debug build instead of silently reordering rows.
-            if let Some(prev) = current_part {
-                debug_assert!(
-                    segment.part >= prev,
-                    "read_segments must emit parts in order: part {} after part {prev}",
-                    segment.part
-                );
-                debug_assert!(
-                    segment.part > prev
-                        || prev_rg.is_none()
-                        || segment.row_groups.first().copied() > prev_rg,
-                    "read_segments must emit ascending, disjoint row-group runs \
-                     within a part: {:?} after row group {prev_rg:?}",
-                    segment.row_groups.first()
-                );
-            }
-            prev_rg = segment.row_groups.last().copied();
-            // A part boundary is a batch boundary: the sequential reader opens
-            // a fresh reader per part, so a part's last batch is short.
-            if current_part != Some(segment.part) {
-                while let Some(tail) = regroup.take_all()? {
-                    if matches!(
-                        deliver(tail, &mut row_offset, &mut pending_read, on_batch)?,
-                        ReadFlow::Stop
-                    ) {
-                        return Ok(());
-                    }
-                }
-                current_part = Some(segment.part);
-            }
-            loop {
-                match rxs[seq % workers].recv() {
-                    // A disconnected channel means the worker returned without
-                    // sending `End`, which it does only by panicking: the
-                    // typed error below is returned, unwinds out of the scope,
-                    // and `thread::scope`'s join then re-raises the worker's
-                    // panic, superseding it. That precedence is intended — the
-                    // panic is the cause and this is the symptom — so the
-                    // message only has to be right for the impossible case
-                    // where the worker somehow returned cleanly.
-                    Err(_) => {
-                        return Err(internal(
-                            "a pass-2 reader worker ended without closing its segment",
-                        ))
-                    }
-                    Ok(SegMsg::Err(e)) => return Err(e),
-                    Ok(SegMsg::End) => break,
-                    Ok(SegMsg::Batch(batch, read_dur)) => {
-                        pending_read += read_dur;
-                        regroup.push(batch);
-                        while regroup.rows >= batch_size || regroup.bounded_rows() < regroup.rows {
-                            let out = regroup.take(batch_size.min(regroup.rows))?;
-                            if matches!(
-                                deliver(out, &mut row_offset, &mut pending_read, on_batch)?,
-                                ReadFlow::Stop
-                            ) {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        while let Some(tail) = regroup.take_all()? {
-            if matches!(
-                deliver(tail, &mut row_offset, &mut pending_read, on_batch)?,
-                ReadFlow::Stop
-            ) {
-                break;
-            }
-        }
-        Ok(())
-    })
-}
-
-/// Worker `w`: read segments `w, w + workers, …` in order, streaming each
-/// one's batches over `tx` and closing it with [`SegMsg::End`].
-///
-/// A send failure means the merge hung up (it errored, or the consumer
-/// stopped), so the worker returns quietly — the real error belongs to
-/// whoever hung up, exactly as in [`super::pipe`].
-fn read_segments_for_worker(
-    source: &ConvertSource,
-    segments: &[ReadSegment],
-    projection: Option<&[usize]>,
-    batch_size: usize,
-    workers: usize,
-    w: usize,
-    tx: &Sender<SegMsg>,
-) {
-    let mut seq = w;
-    while seq < segments.len() {
-        let mut stream = match source.open_segment(&segments[seq], projection, batch_size) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.send(SegMsg::Err(e.into()));
-                return;
-            }
-        };
-        loop {
-            let t_read = Instant::now();
-            match stream.next() {
-                None => break,
-                Some(Err(e)) => {
-                    let _ = tx.send(SegMsg::Err(e.into()));
-                    return;
-                }
-                Some(Ok(batch)) => {
-                    if tx.send(SegMsg::Batch(batch, t_read.elapsed())).is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-        if tx.send(SegMsg::End).is_err() {
-            return;
-        }
-        seq += workers;
-    }
-}
-
-/// Hand one re-assembled batch to the consumer, advancing the global row
-/// offset and attributing the read time accumulated since the previous one.
-/// The per-batch attribution is arbitrary; the SUM is what the [profile]
-/// stage split reports, and it is exact.
-fn deliver<F>(
-    batch: RecordBatch,
-    row_offset: &mut usize,
-    pending_read: &mut Duration,
-    on_batch: &mut F,
-) -> Result<ReadFlow, ConvertError>
-where
-    F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
-{
-    let offset = *row_offset;
-    *row_offset += batch.num_rows();
-    on_batch(batch, offset, std::mem::take(pending_read))
-}
-
-/// The in-order merge's re-chunker: a FIFO of batch slices that hands back
-/// runs up to a requested row count within the I/O owner's bounds.
-///
-/// Batches that already line up cost nothing — [`Regrouper::take`] returns the
-/// queued batch itself when it holds exactly the requested rows — so in the
-/// common case (row groups an exact multiple of the batch size, or a seam that
-/// happens to land on one) nothing is copied at all. Only a run spanning a
-/// worker seam is concatenated.
-struct Regrouper {
-    queue: std::collections::VecDeque<RecordBatch>,
-    rows: usize,
-    limit: u64,
-}
-
-impl Default for Regrouper {
-    fn default() -> Self {
-        Self {
-            queue: Default::default(),
-            rows: 0,
-            limit: tylertoo_io::byte_array_limit(),
-        }
-    }
-}
-
-impl Regrouper {
-    fn bounded_rows(&self) -> usize {
-        tylertoo_io::concat_prefix_rows(&self.queue, self.limit)
-    }
-    fn push(&mut self, batch: RecordBatch) {
-        if batch.num_rows() > 0 {
-            self.rows += batch.num_rows();
-            self.queue.push_back(batch);
-        }
-    }
-
-    /// Remove at most `n` rows, without joining past the reader's bound.
-    /// `n` must be positive and `<= self.rows`.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "#779: I/O owner bounds the prefix before a segment seam is concatenated"
-    )] // #779: seam joins (#494)
-    fn take(&mut self, n: usize) -> Result<RecordBatch, ConvertError> {
-        debug_assert!(n > 0 && n <= self.rows);
-        let n = n.min(self.bounded_rows());
-        let front = self
-            .queue
-            .front()
-            .ok_or_else(|| internal("regrouper asked for rows it does not hold"))?;
-        if front.num_rows() == n {
-            self.rows -= n;
-            return self
-                .queue
-                .pop_front()
-                .ok_or_else(|| internal("regrouper queue vanished"));
-        }
-        let schema = front.schema();
-        let mut parts: Vec<RecordBatch> = Vec::new();
-        let mut need = n;
-        while need > 0 {
-            let batch = self
-                .queue
-                .pop_front()
-                .ok_or_else(|| internal("regrouper ran out of rows mid-take"))?;
-            if batch.num_rows() <= need {
-                need -= batch.num_rows();
-                parts.push(batch);
-            } else {
-                parts.push(batch.slice(0, need));
-                let rest = batch.slice(need, batch.num_rows() - need);
-                self.queue.push_front(rest);
-                need = 0;
-            }
-        }
-        self.rows -= n;
-        Ok(arrow_select::concat::concat_batches(&schema, &parts)?)
-    }
-
-    /// Remove a bounded prefix of the remainder, or `None` when empty.
-    fn take_all(&mut self) -> Result<Option<RecordBatch>, ConvertError> {
-        if self.rows == 0 {
-            return Ok(None);
-        }
-        self.take(self.rows).map(Some)
-    }
-}
-
-/// The ordered parallel reader (#494): that `--read-workers N` delivers
-/// exactly what one reader delivers, whatever N is and however unevenly the
-/// workers are paced.
-#[cfg(test)]
-mod read_tests {
-    use super::*;
-    use arrow_array::{ArrayRef, Int64Array};
-    use arrow_schema::{DataType, Field};
-    use std::sync::Arc;
-    use tylertoo_io::test_support::ArrowWriter;
-    use tylertoo_io::test_support::WriterProperties;
-
-    #[test]
-    fn regrouping_preserves_byte_safe_reader_splits() {
-        use arrow_array::StringArray;
-        let mut regroup = Regrouper {
-            limit: 1000,
-            ..Default::default()
-        };
-        for value in ["x".repeat(600), "y".repeat(600)] {
-            let mut values = vec![String::new(); 50];
-            values[0] = value;
-            regroup.push(
-                RecordBatch::try_from_iter(vec![(
-                    "name",
-                    Arc::new(StringArray::from(values)) as ArrayRef,
-                )])
-                .unwrap(),
-            );
-        }
-        let batch = regroup.take(100).unwrap();
-        let array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert!(
-            *array.value_offsets().last().unwrap() <= 1000,
-            "parallel regrouping reconstructed an oversized column"
-        );
-        assert_eq!(batch.num_rows(), 50);
-        let tail = regroup.take_all().unwrap().unwrap();
-        assert_eq!(tail.num_rows(), 50);
-        assert_eq!(
-            tail.column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(0),
-            "y".repeat(600)
-        );
-        assert!(regroup.take_all().unwrap().is_none());
-    }
-
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
-    }
-
-    /// Write `rows` sequentially-numbered rows into `path`, `rg_rows` per row
-    /// group — the shape that decides how the input can be split.
-    fn write_input(path: &std::path::Path, rows: i64, rg_rows: usize) {
-        let s = schema();
-        let batch = RecordBatch::try_new(
-            s.clone(),
-            vec![Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())) as ArrayRef],
-        )
-        .unwrap();
-        let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(rg_rows))
-            .build();
-        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), s, Some(props)).unwrap();
-        w.write(&batch).unwrap();
-        w.close().unwrap();
-    }
-
-    /// `(row counts per delivered batch, the ids in delivery order, the
-    /// row offsets each batch was announced at)`.
-    type Delivered = (Vec<usize>, Vec<i64>, Vec<usize>);
-
-    /// Read `source` through [`read_in_order`] with a forced shape, optionally
-    /// pausing in the consumer to pace the workers unevenly.
-    fn read_all(
-        source: &ConvertSource,
-        batch_size: usize,
-        workers: usize,
-        stall: Option<Duration>,
-    ) -> Delivered {
-        let (mut counts, mut ids, mut offsets) = (Vec::new(), Vec::new(), Vec::new());
-        read_in_order(
-            source,
-            None,
-            None,
-            ReadTuning {
-                budget: MemoryBudget::with_available(Some(256 << 30)),
-                batch_size,
-                workers,
-                // Tiny rows: the read-ahead sizing must not silently collapse
-                // the worker count in these fixtures.
-                avg_geom_bytes: Some(8),
-                profile: MemoryProfile::Auto,
-            },
-            |batch, offset, _dur| {
-                if let Some(d) = stall {
-                    std::thread::sleep(d);
-                }
-                counts.push(batch.num_rows());
-                offsets.push(offset);
-                ids.extend(
-                    batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap()
-                        .values()
-                        .iter()
-                        .copied(),
-                );
-                Ok(ReadFlow::Continue)
-            },
-        )
-        .unwrap();
-        (counts, ids, offsets)
-    }
-
-    /// The whole contract in one assertion: for a batch size that does NOT
-    /// divide the row-group size — so every worker seam falls mid-batch and
-    /// the merge has to splice — 2, 3 and 4 workers must deliver byte-for-byte
-    /// what 1 worker delivers, batch boundaries included. Batch boundaries are
-    /// not cosmetic: the overview writer issues one column-writer call per
-    /// slice it is handed, and parquet checks its data-page limits per call.
-    #[test]
-    fn parallel_reads_reproduce_the_sequential_batch_sequence() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("in.parquet");
-        // 9 row groups of 700 rows; batch 128 divides neither 700 nor 6300.
-        write_input(&path, 6300, 700);
-        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
-        // Guard the guard: if the read-ahead sizing ever leaves this fixture
-        // with a single segment, the comparison below is vacuous.
-        let shape = resolve_read_shape(ReadTuning {
-            budget: MemoryBudget::with_available(Some(256 << 30)),
-            batch_size: 128,
-            workers: 4,
-            avg_geom_bytes: Some(8),
-            profile: MemoryProfile::Auto,
-        });
-        let segments = plan_segments(&source, None, shape).unwrap();
-        assert!(
-            segments.len() > 1 && shape.workers > 1,
-            "fixture must actually split: {} segment(s), {} worker(s)",
-            segments.len(),
-            shape.workers
-        );
-        let seam: usize = segments[0].rows;
-        assert_ne!(
-            seam % 128,
-            0,
-            "the seam must fall mid-batch, or the merge's splice path is never taken"
-        );
-        let reference = read_all(&source, 128, 1, None);
-        assert_eq!(
-            reference.0.iter().sum::<usize>(),
-            6300,
-            "the reference read must cover every row"
-        );
-        assert_eq!(
-            *reference.0.last().unwrap(),
-            6300 % 128,
-            "only the final batch may be short"
-        );
-        for workers in [2usize, 3, 4] {
-            let got = read_all(&source, 128, workers, None);
-            assert_eq!(
-                got, reference,
-                "--read-workers {workers} must deliver the same batches, ids and \
-                 row offsets as a single reader"
-            );
-        }
-    }
-
-    /// #717: the queue bound alone let a roomy machine cut 4 workers' worth
-    /// of input into 2–3 segments, and the merge then waited on worker 0's
-    /// long first segment while the rest sat idle. With room to spare, each
-    /// worker gets several segments, as far as the row groups allow.
-    #[test]
-    fn parallel_reads_give_each_worker_several_segments() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("in.parquet");
-        // 9 row groups of 700 rows: the queue bound alone allows 3968-row
-        // segments, i.e. two segments for four workers.
-        write_input(&path, 6300, 700);
-        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
-        let tuning = ReadTuning {
-            budget: MemoryBudget::with_available(Some(256 << 30)),
-            batch_size: 128,
-            workers: 4,
-            avg_geom_bytes: Some(8),
-            profile: MemoryProfile::Auto,
-        };
-        let shape = resolve_read_shape(tuning);
-        assert_eq!(shape.workers, 4);
-        assert!(
-            source
-                .read_segments(None, shape.segment_target_rows)
-                .unwrap()
-                .len()
-                < 4,
-            "the queue bound alone must under-split this fixture, or the test is vacuous"
-        );
-        let segments = plan_segments(&source, None, shape).unwrap();
-        assert_eq!(
-            segments
-                .iter()
-                .map(|s| s.row_groups.clone())
-                .collect::<Vec<_>>(),
-            (0..9).map(|g| vec![g]).collect::<Vec<_>>(),
-            "one row group per segment: 6300 rows / (4 workers × 4) is under a row group"
-        );
-        assert_eq!(parallel_read_segments(&source, None, tuning), 9);
-    }
-
-    /// Pass 1 reads a projection — the geometry plus the columns its flags
-    /// name — and #717 moved it onto this reader. Every worker must read the
-    /// projected columns only, and the merge must still reproduce the
-    /// sequential reader's batches exactly.
-    #[test]
-    fn parallel_reads_honour_a_projection() {
-        use arrow_array::Float64Array;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("in.parquet");
-        let s = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("half", DataType::Float64, false),
-        ]));
-        let ids: Vec<i64> = (0..3000).collect();
-        let batch = RecordBatch::try_new(
-            s.clone(),
-            vec![
-                Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
-                Arc::new(Float64Array::from(
-                    ids.iter().map(|&i| i as f64 / 2.0).collect::<Vec<_>>(),
-                )) as ArrayRef,
-            ],
-        )
-        .unwrap();
-        let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(250))
-            .build();
-        let mut w = ArrowWriter::try_new(File::create(&path).unwrap(), s, Some(props)).unwrap();
-        w.write(&batch).unwrap();
-        w.close().unwrap();
-        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
-        let tuning = ReadTuning {
-            budget: MemoryBudget::with_available(Some(256 << 30)),
-            batch_size: 96,
-            workers: 4,
-            avg_geom_bytes: Some(8),
-            profile: MemoryProfile::Auto,
-        };
-        assert!(
-            parallel_read_segments(&source, None, tuning) > 1,
-            "fixture must split, or the parallel path is never taken"
-        );
-
-        let read = |workers: usize| {
-            let mut out: Vec<(usize, Vec<f64>)> = Vec::new();
-            read_in_order(
-                &source,
-                None,
-                Some(&[1]),
-                ReadTuning {
-                    budget: MemoryBudget::with_available(Some(256 << 30)),
-                    batch_size: 96,
-                    workers,
-                    avg_geom_bytes: Some(8),
-                    profile: MemoryProfile::Auto,
-                },
-                |batch, offset, _dur| {
-                    assert_eq!(batch.num_columns(), 1, "only the projected column");
-                    assert_eq!(batch.schema().field(0).name(), "half");
-                    let col = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .unwrap();
-                    out.push((offset, col.values().to_vec()));
-                    Ok(ReadFlow::Continue)
-                },
-            )
-            .unwrap();
-            out
-        };
-        let reference = read(1);
-        let values: Vec<f64> = reference.iter().flat_map(|(_, v)| v.clone()).collect();
-        assert_eq!(
-            values,
-            ids.iter().map(|&i| i as f64 / 2.0).collect::<Vec<_>>()
-        );
-        for workers in [2usize, 4] {
-            assert_eq!(
-                read(workers),
-                reference,
-                "--read-workers {workers} must read the same projected batches"
-            );
-        }
-    }
-
-    /// Uneven pacing is the interesting case for an in-order merge: a
-    /// consumer that stalls lets the fast workers run far ahead and fill their
-    /// queues, so the merge sees segments arrive wildly out of completion
-    /// order. Delivery order must not notice.
-    #[test]
-    fn in_order_merge_survives_uneven_worker_pacing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("in.parquet");
-        write_input(&path, 4000, 333);
-        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
-        let reference = read_all(&source, 64, 1, None);
-        let paced = read_all(&source, 64, 4, Some(Duration::from_micros(200)));
-        assert_eq!(
-            paced, reference,
-            "a stalling consumer must not reorder or re-chunk the stream"
-        );
-    }
-
-    /// Parts are read sequentially and a part's last batch is short, so a part
-    /// boundary is a batch boundary — a merge that let rows flow across one
-    /// would produce a different (and wrong) chunking.
-    #[test]
-    fn part_boundaries_stay_batch_boundaries() {
-        let dir = tempfile::tempdir().unwrap();
-        // Three parts, none a multiple of the batch size.
-        for (i, rows) in [(0, 500i64), (1, 301), (2, 777)] {
-            write_input(&dir.path().join(format!("p{i}.parquet")), rows, 120);
-        }
-        let source = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
-        assert_eq!(source.parts().len(), 3, "fixture must resolve to 3 parts");
-        let reference = read_all(&source, 64, 1, None);
-        // Per part: full 64-row batches then a short tail.
-        let expected: Vec<usize> = [500usize, 301, 777]
-            .iter()
-            .flat_map(|&n| {
-                let mut v = vec![64; n / 64];
-                if n % 64 != 0 {
-                    v.push(n % 64);
-                }
-                v
-            })
-            .collect();
-        assert_eq!(
-            reference.0, expected,
-            "the sequential reader must end each part on a short batch"
-        );
-        for workers in [2usize, 4] {
-            assert_eq!(
-                read_all(&source, 64, workers, None),
-                reference,
-                "--read-workers {workers} must not carry rows across a part boundary"
-            );
-        }
-    }
-
-    /// `--read-workers 1` is the reference path, not a one-worker instance of
-    /// the parallel one: it must open a single stream and hand its batches
-    /// straight through.
-    #[test]
-    fn one_worker_is_the_sequential_reader() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("in.parquet");
-        write_input(&path, 1000, 250);
-        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
-        let (counts, ids, offsets) = read_all(&source, 300, 1, None);
-        assert_eq!(counts, vec![300, 300, 300, 100]);
-        assert_eq!(offsets, vec![0, 300, 600, 900]);
-        assert_eq!(ids, (0..1000i64).collect::<Vec<_>>());
-    }
-
-    /// A consumer that stops mid-stream must not hang: the workers are parked
-    /// on full queues, and dropping the receivers is what releases them.
-    #[test]
-    fn a_stopping_consumer_releases_the_workers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("in.parquet");
-        write_input(&path, 20_000, 500);
-        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
-        let (done_tx, done_rx) = crossbeam_channel::bounded::<usize>(1);
-        std::thread::spawn(move || {
-            let mut seen = 0usize;
-            read_in_order(
-                &source,
-                None,
-                None,
-                ReadTuning {
-                    budget: MemoryBudget::with_available(Some(256 << 30)),
-                    batch_size: 64,
-                    workers: 4,
-                    avg_geom_bytes: Some(8),
-                    profile: MemoryProfile::Auto,
-                },
-                |_batch, _offset, _dur| {
-                    seen += 1;
-                    Ok(if seen >= 3 {
-                        ReadFlow::Stop
-                    } else {
-                        ReadFlow::Continue
-                    })
-                },
-            )
-            .unwrap();
-            let _ = done_tx.send(seen);
-        });
-        let seen = done_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("a stopping consumer must not deadlock its reader workers");
-        assert_eq!(seen, 3);
-    }
-
-    /// The read-ahead sizing is what makes the parallelism real: a segment
-    /// must fit in its worker's queue, and the worker count must fall rather
-    /// than the per-worker queue going below the useful floor.
-    #[test]
-    fn read_shape_keeps_segments_inside_the_queue() {
-        let shape = resolve_read_shape(ReadTuning {
-            budget: MemoryBudget::with_available(Some(256 << 30)),
-            batch_size: 8192,
-            workers: 4,
-            avg_geom_bytes: Some(64),
-            profile: MemoryProfile::Auto,
-        });
-        assert!(shape.workers >= 1 && shape.workers <= 4);
-        assert!(shape.depth >= READ_AHEAD_MIN_BATCHES);
-        assert!(shape.depth <= READ_AHEAD_MAX_BATCHES);
-        assert!(
-            shape.segment_target_rows <= (shape.depth - 1) * 8192,
-            "a segment that cannot fit in its worker's queue makes the worker \
-             park mid-segment, which serializes the reads again"
-        );
-    }
-
-    /// A per-row estimate large enough that even one worker's floor queue
-    /// exceeds the budget still yields a usable (single-worker) shape rather
-    /// than zero workers or a zero-length segment.
-    #[test]
-    fn read_shape_degrades_to_one_worker_under_memory_pressure() {
-        let shape = resolve_read_shape(ReadTuning {
-            budget: MemoryBudget::with_available(Some(256 << 30)),
-            batch_size: 8192,
-            // 512 MiB per row: nothing is affordable.
-            workers: 4,
-            avg_geom_bytes: Some(512 * 1024 * 1024),
-            profile: MemoryProfile::Auto,
-        });
-        assert_eq!(shape.workers, 1, "an unaffordable read-ahead drops workers");
-        assert!(shape.segment_target_rows >= 1);
-    }
-
-    #[test]
-    fn read_ahead_prices_the_decoders_maximum_batch_allocation() {
-        let shape = resolve_read_shape(ReadTuning {
-            budget: MemoryBudget::with_available(Some(512 << 20)),
-            batch_size: 100,
-            workers: 8,
-            avg_geom_bytes: Some(8),
-            profile: MemoryProfile::Bounded,
-        });
-        assert_eq!(
-            shape.workers, 1,
-            "tiny geometries do not price wide or dictionary-expanded properties"
-        );
-    }
-}
-
 /// A message from the reader thread: one raw input batch, its cumulative row
 /// offset, and how long the read+decode took (for [profile] accounting).
 struct ReadMsg {
@@ -1954,14 +879,26 @@ enum LevelSink {
 }
 
 impl LevelSink {
+    #[cfg(test)]
     fn new(
         backing: SinkBacking,
         out_schema: &Schema,
         spill_dir: Option<&Path>,
     ) -> Result<Self, ConvertError> {
+        Self::with_codec(backing, out_schema, spill_dir, IpcCompression::None)
+    }
+
+    fn with_codec(
+        backing: SinkBacking,
+        out_schema: &Schema,
+        spill_dir: Option<&Path>,
+        codec: IpcCompression,
+    ) -> Result<Self, ConvertError> {
         Ok(match backing {
             SinkBacking::Ram => LevelSink::Ram(Vec::new()),
-            SinkBacking::Spill => LevelSink::Spill(SpillState::new(out_schema, spill_dir)?),
+            SinkBacking::Spill => {
+                LevelSink::Spill(SpillState::with_codec(out_schema, spill_dir, codec)?)
+            }
         })
     }
 
@@ -2011,10 +948,14 @@ impl LevelSink {
     }
 }
 
-/// An invariant this module owns was broken — never reachable from user input,
-/// so it carries no advice, only the broken invariant.
-fn internal(what: &str) -> ConvertError {
-    ConvertError::Io(std::io::Error::other(format!("internal: {what}")))
+/// Keep the retention measurement at the same boundary as the sink's payload.
+fn buffer_batch(
+    sink: &mut LevelSink,
+    tuner: &mut SinkAutoTuner,
+    batch: RecordBatch,
+) -> Result<u64, ConvertError> {
+    tuner.observe(&batch);
+    sink.push(batch)
 }
 
 /// A pass-2 spill file under `spill_dir`, or the process temp dir when none
@@ -2067,6 +1008,8 @@ struct SpillState {
     /// `Pass2Timers::spill_write` at join time, since the thread cannot borrow
     /// the driver's timers).
     handle: Option<std::thread::JoinHandle<Result<SpillWriterDone, ConvertError>>>,
+    #[cfg(test)]
+    materialized_rows: u64,
 }
 
 /// What a finished spill-writer thread hands back.
@@ -2080,12 +1023,25 @@ impl SpillState {
     /// `spill_dir` is where the spill file goes (#427: `--spill-dir`, the one
     /// scratch knob); `None` is the process temp dir, as before.
     fn new(out_schema: &Schema, spill_dir: Option<&Path>) -> Result<Self, ConvertError> {
+        // RAM can downgrade only under auto, whose codec stays raw.
+        Self::with_codec(out_schema, spill_dir, IpcCompression::None)
+    }
+
+    fn with_codec(
+        out_schema: &Schema,
+        spill_dir: Option<&Path>,
+        codec: IpcCompression,
+    ) -> Result<Self, ConvertError> {
         let temp = spill_temp_file(spill_dir)?;
         let write_handle = temp.reopen()?;
         // Constructed on the caller's thread so a broken spill directory or an
         // unwritable temp file fails the conversion here, with the caller's
         // error handling, rather than inside a thread nobody has joined yet.
-        let writer = StreamWriter::try_new(BufWriter::new(write_handle), out_schema)?;
+        let writer = StreamWriter::try_new_with_compression(
+            BufWriter::new(write_handle),
+            out_schema,
+            codec,
+        )?;
         Self::spawn(writer, temp)
     }
 
@@ -2119,6 +1075,8 @@ impl SpillState {
         Ok(SpillState {
             tx: Some(tx),
             handle: Some(handle),
+            #[cfg(test)]
+            materialized_rows: 0,
         })
     }
 
@@ -2133,6 +1091,10 @@ impl SpillState {
     /// never the symptom).
     fn push(&mut self, batch: RecordBatch) -> Result<u64, ConvertError> {
         let bytes = batch.get_array_memory_size() as u64;
+        #[cfg(test)]
+        let rows = batch.column_by_name("geometry").map_or(0, |geometry| {
+            (geometry.len() - geometry.null_count()) as u64
+        });
         let Some(tx) = &self.tx else {
             return Err(internal("spill sink pushed after it was closed"));
         };
@@ -2143,6 +1105,10 @@ impl SpillState {
                             // stream still open, which it cannot do.
             self.join()?;
             return Err(internal("spill writer stopped without reporting an error"));
+        }
+        #[cfg(test)]
+        {
+            self.materialized_rows += rows;
         }
         Ok(bytes)
     }
@@ -2173,6 +1139,8 @@ impl SpillState {
         let done = self
             .join()?
             .ok_or_else(|| internal("spill writer joined twice"))?;
+        #[cfg(test)]
+        spill_tests::record_spill(&done.temp, self.materialized_rows);
         Pass2Timers::add_dur(timers.spill_write_cell(), done.write_time);
         let read_handle = done.temp.reopen()?;
         let reader = StreamReader::try_new(BufReader::new(read_handle), None)?;
@@ -2237,6 +1205,7 @@ pub(super) fn run_pass2_buffered(
         read_tuning,
         row_groups: selected_row_groups,
         in_flight,
+        window,
     } = read;
     let BufferOptions {
         profile,
@@ -2250,9 +1219,12 @@ pub(super) fn run_pass2_buffered(
     let t_engine = Instant::now();
     let timers = Pass2Timers::default();
 
+    let codec = spill_codec_for_profile(profile);
     let mut sinks: Vec<LevelSink> = Vec::with_capacity(num_levels);
     for _ in 0..num_levels {
-        sinks.push(LevelSink::new(backing, out_schema, spill_dir)?);
+        sinks.push(LevelSink::with_codec(
+            backing, out_schema, spill_dir, codec,
+        )?);
     }
     let mut rows = vec![0usize; num_levels];
     let mut verts = vec![0usize; num_levels];
@@ -2272,14 +1244,9 @@ pub(super) fn run_pass2_buffered(
     // #494: `in_flight` is shared between the read-ahead channel and the
     // consumer's compute window, so the resident input stays about what one
     // channel of depth `in_flight` held before the window existed.
-    let (read_depth, window) = split_in_flight(in_flight);
-    let window = read_tuning.budget.compute_window(
-        profile,
-        window,
-        read_tuning.batch_size,
-        num_levels,
-        read_tuning.avg_geom_bytes,
-    );
+    // The window was granted from the run's budget after the read-ahead
+    // (`stream::grant_pass2_read`, #716).
+    let (read_depth, _) = split_in_flight(in_flight);
     scoped_pipe(
         read_depth,
         // Producer: the input, in read order, over the per-part bbox-selected
@@ -2355,8 +1322,8 @@ pub(super) fn run_pass2_buffered(
                         if let Some((out, v)) = out {
                             rows_ref[li] += out.num_rows();
                             verts_ref[li] += v;
-                            tuner_ref.observe(&out);
-                            spill_bytes_ref[li] += sinks_ref[li].push(out)?;
+                            spill_bytes_ref[li] +=
+                                buffer_batch(&mut sinks_ref[li], tuner_ref, out)?;
                         }
                     }
                     if tuner_ref.should_downgrade() {
@@ -2440,7 +1407,10 @@ pub(super) fn run_pass2_buffered(
     Ok(Pass2EngineResult {
         levels,
         timers,
-        sink: tuner.report(),
+        sink: SinkMeasurement {
+            codec,
+            ..tuner.report()
+        },
     })
 }
 
@@ -2502,9 +1472,190 @@ fn drain_sink(
 #[cfg(test)]
 mod spill_tests {
     use super::*;
+    use crate::input_set::ConvertSource;
     use arrow_array::{ArrayRef, Int64Array};
     use arrow_schema::{DataType, Field};
     use std::sync::Arc;
+
+    // Observe completed files at the spill owner, rather than treating
+    // get_array_memory_size (the existing profile counter) as disk bytes.
+    // Unique directories isolate simultaneous nextest/plain-cargo tests.
+    type SpillObservations = std::collections::BTreeMap<std::path::PathBuf, Vec<(u64, u64)>>;
+    static OBSERVED: std::sync::Mutex<SpillObservations> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    pub(super) fn record_spill(temp: &NamedTempFile, rows: u64) {
+        if let Some(observations) = OBSERVED
+            .lock()
+            .unwrap()
+            .get_mut(temp.path().parent().unwrap())
+        {
+            observations.push((rows, temp.as_file().metadata().unwrap().len()));
+        }
+    }
+
+    fn measure_verbatim_spill(dir: &Path) -> Vec<(u64, u64)> {
+        use super::super::convert::{
+            convert_to_overviews, ConvertOptions, GeneralizationOverrides, LevelPlan,
+        };
+        use geo::{Geometry, LineString, Polygon};
+
+        const ROWS: usize = 128;
+        let input = dir.join("input.parquet");
+        let output = dir.join("output.parquet");
+        let geoms: Vec<_> = (0..ROWS)
+            .map(|i| {
+                let x = (i % 16) as f64 * 0.1;
+                let y = (i / 16) as f64 * 0.1;
+                Some(Geometry::Polygon(Polygon::new(
+                    LineString::from(vec![
+                        (x, y),
+                        (x + 0.01, y),
+                        (x + 0.01, y + 0.01),
+                        (x, y + 0.01),
+                        (x, y),
+                    ]),
+                    vec![],
+                )))
+            })
+            .collect();
+        super::super::testutil::write_input(&input, &geoms, false, None);
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 9,
+                max_zoom: 13,
+            },
+            profile: MemoryProfile::Bounded,
+            spill_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        }
+        .with_generalization(&GeneralizationOverrides::default(), true)
+        .unwrap();
+        OBSERVED
+            .lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), Vec::new());
+        let report = convert_to_overviews(&input, &output, &options).unwrap();
+        assert_eq!(report.levels.len(), 5);
+        assert!(report
+            .levels
+            .iter()
+            .all(|level| level.feature_count == ROWS));
+        let observations = OBSERVED.lock().unwrap().remove(dir).unwrap();
+        assert!(
+            !observations.is_empty(),
+            "bounded workload must exercise spill"
+        );
+        assert!(observations.iter().all(|&(_, bytes)| bytes > 0));
+        eprintln!(
+            "phase1 verbatim: rows/files={observations:?}, output_bytes={}",
+            std::fs::metadata(output).unwrap().len()
+        );
+        observations
+    }
+
+    /// #715: a fixed compressible batch must not consume its full raw payload
+    /// on disk. The bound leaves room for IPC framing and either candidate
+    /// encoding; it is independent of elapsed time and allocator capacity.
+    #[test]
+    fn phase1_spill_bytes_per_level_are_below_raw_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = schema("id");
+        let mut sink = SpillState::with_codec(
+            &s,
+            Some(dir.path()),
+            spill_codec_for_profile(MemoryProfile::Bounded),
+        )
+        .unwrap();
+        const ROWS: usize = 65536;
+        sink.push(batch(&s, vec![0; ROWS])).unwrap();
+        let (reader, temp) = sink.into_reader(&Pass2Timers::default()).unwrap();
+        let disk_bytes = temp.as_file().metadata().unwrap().len();
+        assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), ROWS);
+        assert!(
+            disk_bytes <= (ROWS * size_of::<i64>() / 2) as u64,
+            "#715: one level wrote {disk_bytes} disk bytes for {} raw bytes",
+            ROWS * size_of::<i64>()
+        );
+    }
+
+    #[test]
+    fn auto_and_speed_spill_remain_raw() {
+        assert_eq!(
+            spill_codec_for_profile(MemoryProfile::Bounded),
+            IpcCompression::Lz4
+        );
+        for profile in [MemoryProfile::Auto, MemoryProfile::Speed] {
+            let codec = spill_codec_for_profile(profile);
+            assert_eq!(codec, IpcCompression::None);
+            let dir = tempfile::tempdir().unwrap();
+            let schema = schema("id");
+            let mut sink = SpillState::with_codec(&schema, Some(dir.path()), codec).unwrap();
+            const ROWS: usize = 65536;
+            sink.push(batch(&schema, vec![0; ROWS])).unwrap();
+            let (reader, temp) = sink.into_reader(&Pass2Timers::default()).unwrap();
+            assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), ROWS);
+            assert!(temp.as_file().metadata().unwrap().len() >= (ROWS * size_of::<i64>()) as u64);
+        }
+    }
+
+    /// The current preflight ignores even a measured pass-2 footprint for a
+    /// local source. The injected free-space probe avoids filling a volume.
+    #[test]
+    fn phase1_local_preflight_covers_actual_pass2_spill() {
+        let dir = tempfile::tempdir().unwrap();
+        let observations = measure_verbatim_spill(dir.path());
+        let actual_bytes: u64 = observations.iter().map(|&(_, bytes)| bytes).sum();
+        let available = actual_bytes / 2;
+        let disk = measured_disk_footprint(dir.path());
+        assert!(
+            disk.spill_bytes() >= actual_bytes,
+            "the pass-2 component must cover the measured spill"
+        );
+        let warning = disk.warning_with(super::super::tiles::CLI_REMEDIES, |_| {
+            Some(("one volume".into(), available))
+        });
+        assert!(warning.is_some(),
+            "local preflight returned no warning for {actual_bytes} measured spill bytes with only {available} bytes available");
+    }
+
+    fn measured_disk_footprint(dir: &Path) -> super::super::disk::DiskFootprint {
+        use super::super::convert::{ConvertOptions, LevelPlan};
+        let source = ConvertSource::resolve_path(&dir.join("input.parquet")).unwrap();
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 9,
+                max_zoom: 13,
+            },
+            profile: MemoryProfile::Bounded,
+            spill_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        };
+        super::super::disk::DiskFootprint::conversion(
+            &source,
+            None,
+            &options,
+            Some(&dir.join("output.parquet")),
+        )
+        .unwrap()
+    }
+
+    /// Bound pessimism on the fixed workload even after encoding changes.
+    /// The estimate uses raw sizing and must cover actual bytes without a
+    /// compression assumption. Its permitted overestimate is at most 32x.
+    #[test]
+    fn disk_estimate_covers_fixed_spill_within_factor_32() {
+        let dir = tempfile::tempdir().unwrap();
+        let observations = measure_verbatim_spill(dir.path());
+        let actual: u64 = observations.iter().map(|&(_, bytes)| bytes).sum();
+        let estimate = measured_disk_footprint(dir.path()).spill_bytes();
+        eprintln!("raw disk estimate={estimate}, actual spill={actual}");
+        assert!(estimate >= actual, "estimate {estimate} < actual {actual}");
+        assert!(
+            estimate <= actual.saturating_mul(32),
+            "estimate {estimate} > 32 × actual {actual}"
+        );
+    }
 
     fn schema(name: &str) -> Schema {
         Schema::new(vec![Field::new(name, DataType::Int64, false)])
@@ -2580,6 +1731,47 @@ mod spill_tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// #709's error path, using the real OS error instead of a string stand-in.
+    /// Both private encodings preserve the OS cause and remove the temp file.
+    #[cfg(unix)]
+    #[test]
+    fn phase1_spill_enospc_preserves_the_os_error() {
+        struct FullVolume(FailsAfter);
+        impl std::io::Write for FullVolume {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .write(buf)
+                    .map_err(|_| std::io::Error::from_raw_os_error(28))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let s = schema("id");
+        for codec in [IpcCompression::None, IpcCompression::Lz4] {
+            let writer = StreamWriter::try_new_with_compression(
+                FullVolume(FailsAfter { remaining: 512 }),
+                &s,
+                codec,
+            )
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let mut sink =
+                SpillState::spawn(writer, spill_temp_file(Some(dir.path())).unwrap()).unwrap();
+            // A compressible zero batch might fit on the simulated full volume.
+            let ids = (0..4096u64)
+                .map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15) as i64)
+                .collect();
+            sink.push(batch(&s, ids)).unwrap();
+            let error = sink.into_reader(&Pass2Timers::default()).unwrap_err();
+            assert!(
+                error.to_string().contains("No space left on device"),
+                "{codec:?}: {error}"
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         }
     }
 
@@ -2691,6 +1883,47 @@ mod backing_tests {
         assert_ne!(limit.source, MemoryLimitSource::CgroupHigh);
     }
 
+    /// ARCH-REVIEW §1: `auto` decides on the run budget's own allowance,
+    /// `0.6 × (limit − reserved) − grants`, once pass 2's read-ahead and
+    /// window are granted. Re-wrapping `available()` in a fresh budget gave
+    /// `0.6 × (limit − reserved − grants)`, 0.4 × grants more, so a sink
+    /// sized between the two stayed in RAM past the allowance the grants
+    /// were fitted to.
+    #[test]
+    fn auto_decides_on_the_charged_budgets_allowance() {
+        use crate::overview::memory::{MemoryPhase, Price, PriceBasis};
+        let mut memory = MemoryBudget::with_available(Some(10 * GIB));
+        let _grant = memory.fit(
+            MemoryProfile::Speed,
+            MemoryPhase::Compute,
+            Price::new(GIB, PriceBasis::Model),
+            2,
+            2,
+        );
+        let allowance = memory.allowance(MemoryProfile::Auto);
+        assert_eq!(allowance, (0.6 * (10 * GIB) as f64) as u64 - 2 * GIB);
+        let rewrapped = (0.6 * memory.available().unwrap() as f64) as u64;
+        // A duplicating sink of unmeasured rows (8 KiB each) between the two.
+        let between = ((allowance + rewrapped) / 2 / 8192) as usize;
+        let estimate = memory.sink_estimate(Mode::Duplicating, between, None);
+        assert!(allowance < estimate && estimate < rewrapped);
+        assert!(matches!(
+            resolve_backing(
+                memory,
+                MemoryProfile::Auto,
+                Mode::Duplicating,
+                between,
+                None
+            ),
+            SinkBacking::Spill
+        ));
+        let under = (allowance / 8192) as usize - 1;
+        assert!(matches!(
+            resolve_backing(memory, MemoryProfile::Auto, Mode::Duplicating, under, None),
+            SinkBacking::Ram
+        ));
+    }
+
     #[test]
     fn explicit_profiles_ignore_workload() {
         // Speed is always RAM, Bounded always Spill — regardless of size/mode.
@@ -2720,7 +1953,12 @@ mod backing_tests {
     fn auto_duplicating_small_stays_in_ram() {
         // A tiny buffered set is safe in RAM on a normal box.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 10_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                10_000,
+                None
+            ),
             SinkBacking::Ram
         ));
     }
@@ -2730,7 +1968,12 @@ mod backing_tests {
         // The #294 fix: a large duplicating buffered set flips to Spill instead
         // of the old unconditional RAM. 10M rows * 8 KiB = 80 GiB > 0.6*54.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 10_000_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                10_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
     }
@@ -2741,14 +1984,24 @@ mod backing_tests {
         let rows = 5_000_000; // 5M * 8 KiB = 40 GiB estimate
         assert!(
             matches!(
-                auto_backing(Mode::Duplicating, rows, Some(4 * GIB), None),
+                auto_backing(
+                    &MemoryBudget::with_available(Some(4 * GIB)),
+                    Mode::Duplicating,
+                    rows,
+                    None
+                ),
                 SinkBacking::Spill
             ),
             "small box must spill"
         );
         assert!(
             matches!(
-                auto_backing(Mode::Duplicating, rows, Some(256 * GIB), None),
+                auto_backing(
+                    &MemoryBudget::with_available(Some(256 * GIB)),
+                    Mode::Duplicating,
+                    rows,
+                    None
+                ),
                 SinkBacking::Ram
             ),
             "huge box may keep it in RAM"
@@ -2760,11 +2013,21 @@ mod backing_tests {
         // Even with effectively unlimited RAM, partitioning still spills above
         // the historical 2M-row floor (strict superset of pre-#294 behavior).
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 3_000_000, Some(10_000 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(10_000 * GIB)),
+                Mode::Partitioning,
+                3_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 100_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Partitioning,
+                100_000,
+                None
+            ),
             SinkBacking::Ram
         ));
     }
@@ -2773,11 +2036,21 @@ mod backing_tests {
     fn auto_uses_fallback_budget_when_ram_unknown() {
         // Unknown RAM → conservative fixed budget, still spilling huge sets.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 100_000_000, None, None),
+            auto_backing(
+                &MemoryBudget::with_available(None),
+                Mode::Duplicating,
+                100_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 1_000, None, None),
+            auto_backing(
+                &MemoryBudget::with_available(None),
+                Mode::Duplicating,
+                1_000,
+                None
+            ),
             SinkBacking::Ram
         ));
     }
@@ -2850,11 +2123,21 @@ mod backing_tests {
         // measured tiny-geometry corpus (points/small lines, ~100 B/row →
         // ~4.3 KiB/row → 20 GiB) fits and stays in RAM.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 5_000_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                5_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 5_000_000, Some(54 * GIB), Some(100)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                5_000_000,
+                Some(100)
+            ),
             SinkBacking::Ram
         ));
     }
@@ -2865,11 +2148,21 @@ mod backing_tests {
         // (8 KiB/row → 7.6 GiB) keeps RAM, but an adm4-like measured average
         // (11 534 B/row → ~27 KiB/row → 25 GiB) correctly flips to Spill.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 1_000_000, Some(25 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(25 * GIB)),
+                Mode::Duplicating,
+                1_000_000,
+                None
+            ),
             SinkBacking::Ram
         ));
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 1_000_000, Some(25 * GIB), Some(11_534)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(25 * GIB)),
+                Mode::Duplicating,
+                1_000_000,
+                Some(11_534)
+            ),
             SinkBacking::Spill
         ));
     }
@@ -2881,11 +2174,21 @@ mod backing_tests {
         // (983 B/row → ~8 KiB/row → 7.5 GiB) fits and stays in RAM. Below the
         // 2M-row ceiling, so only the RAM gate is in play.
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 1_000_000, Some(20 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(20 * GIB)),
+                Mode::Partitioning,
+                1_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 1_000_000, Some(20 * GIB), Some(983)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(20 * GIB)),
+                Mode::Partitioning,
+                1_000_000,
+                Some(983)
+            ),
             SinkBacking::Ram
         ));
     }
@@ -2895,7 +2198,12 @@ mod backing_tests {
         // The historical 2M-row partitioning floor holds even when measurement
         // says the geometries are tiny.
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 3_000_000, Some(10_000 * GIB), Some(8)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(10_000 * GIB)),
+                Mode::Partitioning,
+                3_000_000,
+                Some(8)
+            ),
             SinkBacking::Spill
         ));
     }
@@ -3001,6 +2309,39 @@ mod sink_sample_tests {
         // And the old constant-based model is what it is being contrasted
         // with: 4 KiB/row would have blown the same budget.
         assert!(50_000_000u64 * 4_096 > budget);
+    }
+
+    /// #788: grants can use the whole allowance before pass 2 starts. In
+    /// `sink_downgrade.rs`'s skewed fixture under a 180 MB limit, the
+    /// writer's encode floor alone is 4 x 250.6 MB. A saturated allowance
+    /// never leaves a RAM sink unguarded: `auto` spills up front, and a
+    /// RAM sink armed against a zero allowance downgrades on its first
+    /// sample.
+    #[test]
+    fn a_saturated_allowance_spills_and_never_disarms() {
+        use crate::overview::memory::{MemoryPhase, Price, PriceBasis};
+        let mut memory = MemoryBudget::with_available(Some(180_000_000));
+        let _encodes = memory.fit(
+            MemoryProfile::Auto,
+            MemoryPhase::Encode,
+            Price::new(250_600_000, PriceBasis::Footer),
+            64,
+            4,
+        );
+        assert_eq!(memory.allowance(MemoryProfile::Auto), 0);
+        assert!(matches!(
+            resolve_backing(
+                memory,
+                MemoryProfile::Auto,
+                Mode::Duplicating,
+                59_689,
+                Some(26)
+            ),
+            SinkBacking::Spill
+        ));
+        let mut tuner = SinkAutoTuner::new(MemoryProfile::Auto, SinkBacking::Ram, ROWS, memory);
+        tuner.observe(&sample_batch(0));
+        assert!(tuner.should_downgrade(), "a zero allowance must downgrade");
     }
 
     /// `bounded` and `speed` are instructions, not estimates: the tuner still
