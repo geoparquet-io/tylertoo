@@ -61,7 +61,8 @@ set that the pre-H3 pipeline lost 3.6× on**. The points row measured 21.6×,
 but tippecanoe built two zoom levels there that tylertoo did not, so it is
 quoted separately rather than as the top of the range (caveat 4) — with the
 rest of the caveats in §1b, starting with the one that the recording machine
-was not idle.
+was not idle — and with the 2026-10-16 re-recording that reproduced every
+ratio within about ±20%.
 
 ## 1. Headline (both tools at their own defaults)
 
@@ -102,8 +103,31 @@ verbatim. Reproduce with one command: `./benchmarks/e2e/run_corpus.sh`.
    points run (17%). The GeoParquet→FlatGeobuf conversion stages, which are
    included in tippecanoe's end-to-end sum, were noisier: up to 9.4% on
    `polygons-portland-medium`. All computed from `wall_all_s` in
-   `corpus_results.json`. Treat every ratio as provisional until
-   re-recorded on an idle machine.
+   `corpus_results.json`.
+
+   **Re-recorded 2026-10-16** on the same machine under much lower load
+   (load average ~4–5, most of it the benchmark's own 12 threads, against
+   ~460 during the first recording), with three timed repeats instead of
+   two, the same pinned tippecanoe 2.79.0 and the same corpus. The
+   end-to-end ratios:
+
+   | dataset | first recording | re-recording |
+   |---|--:|--:|
+   | `points-nyc-medium` | 21.61× | 23.27× |
+   | `lines-portland-medium` | 20.23× | 16.50× |
+   | `polygons-portland-medium` | 21.29× | 22.26× |
+   | `polygons-ftw-moldova-large` | 8.60× | 9.16× |
+
+   So the **ratios reproduce within about ±20%** — three of the four moved
+   up — and the headline the README quotes still brackets them. What did
+   *not* reproduce is the absolute seconds: both tools came out roughly a
+   third slower in the second recording (tylertoo 1.39 s → 1.77 s and
+   tippecanoe 30.03 s → 41.10 s on the points set), which is what a
+   uniformly slower machine looks like — a laptop's thermal state after a
+   release build, not one tool regressing. Treat the ratio as the stable,
+   quotable quantity and the wall-clock seconds as machine-specific. A
+   dedicated, thermally-settled host is still the right place to pin
+   absolute numbers; nothing here is a reason to re-quote the ratios.
 2. **The Overture inputs are not byte-pinned.** The manifest's pinned release
    (`2026-06-17.0`) had expired from the Overture bucket, so this run fetched
    `GPQ_OVERTURE_RELEASE=2026-09-23.0`. Feature counts therefore exceed the
