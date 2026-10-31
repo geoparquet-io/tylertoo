@@ -2603,6 +2603,90 @@ mod tests {
     }
 
     #[test]
+    fn fill_polygons_price_every_vector_slot() {
+        let polys: Vec<FillPolygon> = vec![vec![vec![(0, 0); 3], vec![(0, 0); 5]]];
+        assert_eq!(
+            polygon_capacity_bytes(&polys),
+            std::mem::size_of::<FillPolygon>()
+                + 2 * std::mem::size_of::<TileRing>()
+                + 8 * std::mem::size_of::<(i32, i32)>()
+        );
+    }
+
+    /// Before its first credit a cell grid reserves its whole page index,
+    /// one page and four key slots; after it, only a page.
+    #[test]
+    fn credit_cells_reserve_their_next_growth() {
+        let mut cells = CreditCells::with_side(4.0);
+        assert_eq!(
+            cells.next_growth_bound(),
+            64 * 64 * std::mem::size_of::<Option<Box<CreditPage>>>()
+                + std::mem::size_of::<CreditPage>()
+                + 4 * std::mem::size_of::<usize>()
+        );
+        cells.add(0, 0, 1.0);
+        assert_eq!(cells.next_growth_bound(), std::mem::size_of::<CreditPage>());
+    }
+
+    #[test]
+    fn of_several_small_boxes_holding_a_polygon_the_smallest_wins() {
+        let polys = vec![vec![vec![(2000, 2000), (2010, 2000), (2010, 2010)]]];
+        let hosts = [
+            [1950.0, 1950.0, 2100.0, 2100.0],
+            [1990.0, 1990.0, 2050.0, 2050.0],
+        ];
+        assert_eq!(assign_hosts(&polys, &hosts), vec![1]);
+    }
+
+    /// A large box the ring reaches only through its top row is visited
+    /// there: it is the nearest host, nine rings up.
+    #[test]
+    fn phase1_a_box_above_the_polygon_is_reached_by_the_rings_top_row() {
+        let polys = vec![vec![vec![(2000, 2000), (2010, 2000), (2010, 2010)]]];
+        // Box 1 covers cells 29..=33 by 40..=55, 560 px above the polygon's
+        // cell (31, 31); box 0 is a small box far away in the corner.
+        let hosts = [
+            [100.0, 100.0, 110.0, 110.0],
+            [1856.0, 2560.0, 2175.0, 3583.0],
+        ];
+        cost_probe::take();
+        assert_eq!(assign_hosts(&polys, &hosts), vec![1]);
+        assert_eq!(cost_probe::take().large_host_visits, 1);
+    }
+
+    /// A tile run reads back what was appended, and promptly: every read
+    /// loop ends at its count.
+    #[test]
+    fn a_spilled_tile_run_reads_back_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = super::super::ExportOptions {
+            spill_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let mut buckets = SpillBuckets::new(&opts, usize::MAX);
+        let shape = square(1.0, 2.0, 3.0);
+        let credit = Collapsed {
+            area: 2.0,
+            at: [5.0, 6.0],
+        };
+        buckets
+            .append(7, std::slice::from_ref(&shape), &[credit], 0)
+            .unwrap();
+        let path = buckets.tiles[&7].to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = SpillBuckets::read_run(&path, 0, usize::MAX)
+                .map(|(shapes, cells)| (shapes, cells.keys.len()));
+            let _ = tx.send(read.map_err(|e| e.to_string()));
+        });
+        let (shapes, credited) = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the run must read back within 20 s")
+            .unwrap();
+        assert_eq!((shapes, credited), (vec![shape], 1));
+    }
+
+    #[test]
     fn a_zoom_writer_reserves_its_index_growth_before_appending() {
         let opts = super::super::ExportOptions::default();
         let polys = vec![vec![vec![(0, 0), (1, 0), (0, 1)]]];

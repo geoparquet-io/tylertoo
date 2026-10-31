@@ -1977,6 +1977,21 @@ mod lazy_pairing_tests {
         }
     }
 
+    /// The reference pairing measures each unordered pair of incidences once.
+    #[test]
+    fn sorted_junction_pairs_measures_each_pair_once() {
+        let dirs = [
+            Some((1., 0.)),
+            Some((0., 1.)),
+            Some((-1., 0.)),
+            Some((0., -1.)),
+        ];
+        JUNCTION_WORK.with(|w| w.set((0, 0)));
+        let pairs = sorted_junction_pairs(&dirs, &[0, 1, 2, 3], 30.);
+        assert_eq!(pairs, vec![(0, 2), (1, 3)]);
+        assert_eq!(JUNCTION_WORK.with(std::cell::Cell::get), (6, 2));
+    }
+
     #[test]
     fn duplicate_directions_use_linear_heap_work() {
         for n in [100usize, 1000, 10000] {

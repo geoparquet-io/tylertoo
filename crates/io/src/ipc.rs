@@ -351,7 +351,14 @@ mod tests {
             let mut writer =
                 IpcStreamWriter::try_new_with_compression(&mut data, &schema, encoding).unwrap();
             writer.write(&input).unwrap();
+            let before = writer.bytes_written();
             writer.finish().unwrap();
+            // Raw: the 8-byte end-of-stream marker. LZ4: that marker in a
+            // frame of its own, closed by the frame's end mark.
+            assert!(writer.bytes_written() >= before + 8, "{encoding:?}");
+            if encoding == IpcCompression::None {
+                assert_eq!(writer.bytes_written(), before + 8);
+            }
             let bytes = writer.bytes_written();
             drop(writer);
             assert_eq!(bytes, data.len() as u64);

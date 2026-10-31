@@ -296,6 +296,22 @@ mod tests {
     }
 
     #[test]
+    fn the_warning_states_its_sizes_in_gib() {
+        const GIB: u64 = 1 << 30;
+        let mut disk = DiskFootprint::default();
+        disk.add(Path::new("/scratch"), "pass-2 spill", 10 * GIB);
+        let warning = disk
+            .warning_with(REMEDIES, |_| Some(("one".into(), 4 * GIB)))
+            .unwrap();
+        assert!(
+            warning.contains(
+                "need approximately 10.0 GiB; their volume has 4.0 GiB free (6.5 GiB short"
+            ),
+            "{warning}"
+        );
+    }
+
+    #[test]
     fn separate_volumes_are_not_summed_and_unknown_probe_is_quiet() {
         let mut disk = DiskFootprint::default();
         disk.add(Path::new("/scratch"), "pass-2 spill", 200);

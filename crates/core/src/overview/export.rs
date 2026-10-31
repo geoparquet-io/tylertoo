@@ -18004,6 +18004,81 @@ mod tests {
         assert_eq!(grants[1].bytes(), 66_600);
     }
 
+    /// A level whose footer prices its members at zero bytes has no member
+    /// size to grant from: it spills whole and holds no grant.
+    #[test]
+    fn a_level_with_zero_byte_members_spills_whole() {
+        let plan = LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[1000, 1000]),
+            wave: 1,
+        };
+        let read = LevelRead {
+            forced: None,
+            ram_budget: 7,
+            member_bytes: Some(0),
+            profile: MemoryProfile::Auto,
+        };
+        let mut budget = MemoryBudget::with_available(Some(300_000));
+        let (backing, grants) = level_read_backing(read, &plan, &mut budget);
+        assert!(matches!(
+            backing,
+            StoreBacking {
+                backing: SinkBacking::Spill,
+                ram_budget: 7,
+                resident: 0
+            }
+        ));
+        assert!(grants.is_empty());
+    }
+
+    /// A batch's collect work is cut into one chunk per pool thread.
+    #[test]
+    fn collect_chunks_are_one_per_pool_thread() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let rows = pool.install(|| [1, 2, 9, 400].map(collect_chunk_rows));
+        assert_eq!(rows, [1, 1, 3, 100]);
+    }
+
+    /// The consumer-thread guard counts every row a chunk collects outside
+    /// the pool, so a regression to the serial loop would show.
+    #[test]
+    fn a_chunk_collected_off_the_pool_is_counted() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("rank", DataType::Int64, true),
+            Field::new("geometry", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
+                Arc::new(arrow_array::BinaryArray::from(vec![None::<&[u8]>; 3])),
+            ],
+        )
+        .unwrap();
+        let published = PublishedNames::identity();
+        let attrs = AttrColumns::new(&schema, 1, &published, None);
+        let work = Mutex::new(ExportWorkTally::default());
+        let locator = crate::input_set::StreamRowLocator::new(&[vec![3]], None);
+        let input = ChunkInput {
+            work: &work,
+            wave: &[],
+            batch: &batch,
+            attrs: &attrs,
+            row_gaps: &[(0, 0); 3],
+            locator: &locator,
+            first_read: 0,
+        };
+        let mut items: Vec<Vec<(u64, Geometry<f64>)>> = vec![Vec::new(); 3];
+        assert!(rayon::current_thread_index().is_none());
+        collect_member_chunk(&input, 0, &mut items).unwrap();
+        collect_member_chunk(&input, 1, &mut items[1..]).unwrap();
+        assert_eq!(work.lock().unwrap().serial_collect_rows, 5);
+    }
+
     /// A flushed bucket is written as whole [`SPILL_SEGMENT_MEMBERS`]-member
     /// segments, whatever the pool's thread count.
     #[test]
