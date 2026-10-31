@@ -2587,6 +2587,21 @@ mod tests {
         assert_eq!(cost_probe::take().large_host_visits, 2);
     }
 
+    /// The ring search stops visiting a large box once the ring has grown
+    /// past it on every side: only rings whose edges cross it see it.
+    #[test]
+    fn phase1_a_box_the_ring_has_passed_is_not_revisited() {
+        // The polygon sits in cell (2, 2); the box covers cells 27..=35 by
+        // 27..=34, diagonal from it, so the search reaches it at ring 25,
+        // the ring's right edge leaves it after ring 33 and its top after
+        // ring 32, and the search runs on to ring 35 (2218 px away).
+        let polys = vec![vec![vec![(160, 160), (170, 160), (170, 170)]]];
+        let hosts = [[1728.0, 1728.0, 2303.0, 2239.0]];
+        cost_probe::take();
+        assert_eq!(assign_hosts(&polys, &hosts), vec![0]);
+        assert_eq!(cost_probe::take().large_host_visits, 9);
+    }
+
     #[test]
     fn a_zoom_writer_reserves_its_index_growth_before_appending() {
         let opts = super::super::ExportOptions::default();
