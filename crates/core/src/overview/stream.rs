@@ -7844,6 +7844,61 @@ mod tests {
             .all(|&(_, mib)| mib <= true_anon));
     }
 
+    /// Pass 2 prices a window batch by its fan-out: the output rows per
+    /// input row over the levels it feeds. Every row here wins every level,
+    /// so the buffered levels fan out once per level and the streamed finest
+    /// level once.
+    #[test]
+    fn pass2_windows_are_priced_by_their_levels_fanout() {
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        let geoms: Vec<Option<geo::Geometry<f64>>> = (0..8)
+            .map(|i| {
+                Some(geo::Geometry::Point(geo::Point::new(
+                    f64::from(i) * 40.0 - 150.0,
+                    0.0,
+                )))
+            })
+            .collect();
+        crate::overview::testutil::write_input(&input, &geoms, true, None);
+        crate::test_log::take_thread_lines();
+        crate::overview::convert::convert_to_overviews(
+            &input,
+            dir.path().join("out.parquet"),
+            &crate::overview::convert::ConvertOptions {
+                levels: crate::overview::convert::LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 3,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        if !logging {
+            return;
+        }
+        let lines = crate::test_log::take_thread_lines();
+        // (read-ahead batch bytes, window batch bytes) of each grant: the
+        // buffered levels z0..=z2 first, then the streamed z3.
+        let grants: Vec<(u64, u64)> = lines
+            .iter()
+            .filter(|l| l.starts_with("[convert] pass 2 grants"))
+            .map(|l| {
+                let bytes = |after: &str| -> u64 {
+                    let tail = &l[l.find(after).expect(after) + after.len()..];
+                    let tail = tail.split_once(" x ").expect("a count").1;
+                    tail.split(' ').next().unwrap().parse().unwrap()
+                };
+                (bytes("read-ahead "), bytes("window "))
+            })
+            .collect();
+        let [(batch, buffered), (_, finest)] = grants[..] else {
+            panic!("{lines:#?}");
+        };
+        assert_eq!((buffered, finest), (4 * batch, 2 * batch), "{lines:#?}");
+    }
+
     /// #715: a `bounded` run spills pass 2 as LZ4, and the profile dump's
     /// sink record names that codec. `TYLERTOO_PROFILE_JSON` is process
     /// environment, so the run happens in a child with it set.
