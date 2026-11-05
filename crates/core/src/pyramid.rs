@@ -2667,6 +2667,17 @@ mod tests {
             "the merged archive must span every band's range"
         );
 
+        // #791: each band's intermediate overview and archive are published
+        // onto a missing path, not over a placeholder file (ext4 flushes the
+        // whole file inside a rename over an existing one).
+        let (published, over_existing) =
+            crate::atomic_output::renames_over_existing(dir.path(), "tylertoo-pyramid-");
+        assert_eq!(published, 4, "two bands publish an overview and an archive");
+        assert!(
+            over_existing.is_empty(),
+            "renamed over an existing file: {over_existing:?}"
+        );
+
         // Intermediates are cleaned up: only the output remains.
         let leftovers: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()

@@ -127,6 +127,44 @@ pub(crate) fn create(target: &Path) -> io::Result<(File, PendingOutput)> {
     ))
 }
 
+/// Test-only record of every publish-by-rename: the destination and whether
+/// something already sat there when the rename ran (#791). A rename over an
+/// existing file makes ext4 flush the new file inside the rename.
+#[cfg(test)]
+pub(crate) static RENAME_LOG: std::sync::Mutex<Vec<(PathBuf, bool)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record a rename onto `target` in [`RENAME_LOG`] (test builds only).
+#[cfg(test)]
+pub(crate) fn observe_rename_target(target: &Path) {
+    RENAME_LOG
+        .lock()
+        .unwrap()
+        .push((target.to_path_buf(), target.exists()));
+}
+
+/// Destinations under `dir` whose name starts with `prefix` that a rename
+/// replaced an existing file at, since the process started.
+#[cfg(test)]
+pub(crate) fn renames_over_existing(dir: &Path, prefix: &str) -> (usize, Vec<PathBuf>) {
+    let log = RENAME_LOG.lock().unwrap();
+    let ours: Vec<_> = log
+        .iter()
+        .filter(|(p, _)| {
+            p.parent() == Some(dir)
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+        })
+        .collect();
+    (
+        ours.len(),
+        ours.iter()
+            .filter(|(_, e)| *e)
+            .map(|(p, _)| p.clone())
+            .collect(),
+    )
+}
+
 /// Reserve a unique path for a file some other writer will create by renaming
 /// over it, as a [`TempPath`] that removes whatever is there when dropped
 /// (success or failure alike).
@@ -328,6 +366,8 @@ impl PendingOutput {
         let Some(temp) = self.temp else {
             return Ok(()); // written directly, nothing to publish
         };
+        #[cfg(test)]
+        observe_rename_target(&self.target);
         // `TempPath::persist` is a rename that keeps the guard's cleanup
         // semantics on failure (the sibling is deleted when the error is
         // dropped) and on Windows replaces an existing destination the way

@@ -1652,6 +1652,32 @@ mod tests {
         assert_eq!(keys, ["convert", "export"]);
     }
 
+    /// #791: the intermediate overview is published by renaming over its
+    /// reserved path, which must not exist then: a rename over an existing
+    /// file makes ext4 flush the whole overview inside the rename (0.76 s on
+    /// Moldova, 13.8 s on Mato Grosso). Deterministic: no timing.
+    #[test]
+    fn tiles_publishes_the_intermediate_onto_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let input = dir.path().join("in.parquet");
+        points_input(&input);
+        let output = dir.path().join("out.pmtiles");
+        let mut options = zoomed_options(0, 2);
+        options.convert.spill_dir = Some(scratch.clone());
+
+        convert_to_pmtiles(&TilesInput::Path(input), &output, &options).expect("must convert");
+
+        let (published, over_existing) =
+            crate::atomic_output::renames_over_existing(&scratch, ".tylertoo-overview-");
+        assert_eq!(published, 1, "the intermediate is published exactly once");
+        assert!(
+            over_existing.is_empty(),
+            "renamed over an existing file: {over_existing:?}"
+        );
+    }
+
     /// #314: `keep_overview` retains the intermediate at the named path.
     #[test]
     fn keep_overview_retains_the_intermediate() {

@@ -2324,6 +2324,8 @@ impl StreamingPmtilesWriter {
                 // mention of the path is a `log::info!` in `Drop`, which is a
                 // no-op for Python callers and embedders with no log backend
                 // installed (#528 review, F3).
+                #[cfg(test)]
+                crate::atomic_output::observe_rename_target(output_path);
                 std::fs::rename(&self.temp_path, output_path).map_err(|e| {
                     Error::PMTilesWrite(format!(
                         "Failed to publish archive: {}; the complete archive was written to {} \
@@ -2724,6 +2726,8 @@ impl StreamingPmtilesWriter {
         drop(writer);
 
         // Atomically publish the assembled archive.
+        #[cfg(test)]
+        crate::atomic_output::observe_rename_target(output_path);
         std::fs::rename(&partial_path, output_path).map_err(|e| {
             Error::PMTilesWrite(format!(
                 "Failed to publish archive {} over {}: {e}",
