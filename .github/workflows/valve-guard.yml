@@ -1,0 +1,177 @@
+# Size-valve wall and RSS guard (#792, #772) — nightly, not a required check.
+#
+# benchmarks/valve_guard.py times the cells the size valve regressed on and
+# fails when merge:drop on #792 passes 1.7x wall or 1.5x peak RSS. Those
+# ratios hold on any machine, which is why they can gate on a shared runner.
+# The cell-by-cell comparison with benchmarks/baseline/valve_guard.json
+# (15% slower, 20% heavier) applies only when the runner matches the host the
+# baseline was recorded on (the script compares CPU model and count), so on
+# GitHub's runners this job enforces the ratios, and a developer box with
+# `record` enforces both.
+#
+# The #792 input is 238 MB of shapefile, too large to commit. It is rebuilt
+# from the public download (Bayern's Hausumringe, Niederbayern) with the
+# duckdb step in benchmarks/prepare_792.py, and cached between runs under a
+# key that names the source URL and the script, so a night spends minutes on
+# the guard, not on the download. Moldova comes from the bench-coalesce-v1
+# release, checked against the manifest's sha256.
+#
+# A failing night opens or updates one issue, as fuzz.yml does.
+
+name: Valve guard
+
+on:
+  schedule:
+    # 05:30 UTC: after the 03:00 fuzz run and the Monday 04:00 criterion run.
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SRC_792_URL: https://geodaten.bayern.de/odd/m/3/daten/hausumringe/bezirk/data/092_Niederbayern_Hausumringe.zip
+  SRC_792_SHA256: 6007be46c1a0cda43604a71139a735c0fa8920048cba85dc19182dc13d835d4c
+  MOLDOVA_URL: https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1/moldova-hilbert.parquet
+  MOLDOVA_SHA256: 06bddb7a42283812c1032d85a6b138daf198b1b46592ba96ad84cbe09a12e5f5
+  DUCKDB: duckdb==1.5.4
+  DATA: ${{ github.workspace }}/bench-data
+
+jobs:
+  guard:
+    name: Valve guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-valve-guard-${{ hashFiles('Cargo.lock') }}
+
+      - name: Cache the #792 input
+        id: cache-792
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.DATA }}/792
+          key: valve-guard-792-${{ env.SRC_792_SHA256 }}-${{ hashFiles('benchmarks/prepare_792.py') }}-${{ env.DUCKDB }}
+
+      - name: Cache the Moldova input
+        id: cache-moldova
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.DATA }}/coalesce/inputs
+          key: valve-guard-moldova-${{ env.MOLDOVA_SHA256 }}
+
+      - name: Rebuild the #792 input from the public download
+        if: steps.cache-792.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$DATA/792/dl"
+          curl --fail --location --retry 3 -o "$DATA/792/dl/src.zip" "$SRC_792_URL"
+          echo "$SRC_792_SHA256  $DATA/792/dl/src.zip" | sha256sum -c -
+          unzip -q -o "$DATA/792/dl/src.zip" -d "$DATA/792/shp"
+          uv run --with "$DUCKDB" python -I benchmarks/prepare_792.py \
+            "$DATA/792/shp/hausumringe.shp" "$DATA/792/buildings.parquet"
+          rm -rf "$DATA/792/dl" "$DATA/792/shp"
+
+      - name: Fetch Moldova
+        if: steps.cache-moldova.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$DATA/coalesce/inputs"
+          curl --fail --location --retry 3 -o "$DATA/coalesce/inputs/moldova-hilbert.parquet" "$MOLDOVA_URL"
+          echo "$MOLDOVA_SHA256  $DATA/coalesce/inputs/moldova-hilbert.parquet" | sha256sum -c -
+
+      - name: Build the CLI on mimalloc and on glibc
+        run: |
+          cargo build --release --locked -p tylertoo
+          cp target/release/tylertoo "$RUNNER_TEMP/tylertoo-mim"
+          cargo build --release --locked -p tylertoo --no-default-features --target-dir target/glibc
+          cp target/glibc/release/tylertoo "$RUNNER_TEMP/tylertoo-glibc"
+
+      - name: Check the valve
+        id: guard
+        run: |
+          uv run python -I benchmarks/valve_guard.py check \
+            --mim "$RUNNER_TEMP/tylertoo-mim" --glibc "$RUNNER_TEMP/tylertoo-glibc" \
+            --data "$DATA" --json-out "$RUNNER_TEMP/valve-guard.json" \
+            | tee "$RUNNER_TEMP/valve-guard.txt"
+
+      - name: Upload the measurements
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: valve-guard
+          path: |
+            ${{ runner.temp }}/valve-guard.json
+            ${{ runner.temp }}/valve-guard.txt
+          if-no-files-found: warn
+
+  notify:
+    name: Open or update the valve-guard issue
+    runs-on: ubuntu-latest
+    needs: guard
+    if: always() && needs.guard.result == 'failure'
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create benchmark \
+            --description "Benchmark lane" \
+            --color 0E8A16 2>/dev/null || true
+
+          TITLE="Nightly valve guard is failing"
+          BODY="The scheduled valve guard (benchmarks/valve_guard.py) failed:
+          merge:drop on the #792 export passed 1.7x wall or 1.5x peak RSS, a
+          cell regressed against its baseline, or the run itself broke.
+
+          Run: $RUN_URL
+
+          The \`valve-guard\` artifact has the measurements and the guard's
+          output. To reproduce on a quiet machine:
+
+          \`\`\`
+          cargo build --release -p tylertoo
+          cargo build --release -p tylertoo --no-default-features --target-dir target/glibc
+          uv run python -I benchmarks/valve_guard.py check \\\\
+            --mim target/release/tylertoo --glibc target/glibc/release/tylertoo
+          \`\`\`
+
+          ---
+          _Managed by .github/workflows/valve-guard.yml. Updated, not
+          duplicated, on every failing night. Close it after a green night._"
+
+          EXISTING=$(gh issue list --label benchmark --state open \
+            --json number,title \
+            --jq "map(select(.title == \"$TITLE\")) | .[0].number // empty")
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --body "$BODY"
+            gh issue comment "$EXISTING" --body "Still failing as of $RUN_URL"
+          else
+            gh issue create --title "$TITLE" --label benchmark --body "$BODY"
+          fi

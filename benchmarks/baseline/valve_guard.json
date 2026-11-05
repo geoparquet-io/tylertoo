@@ -1,0 +1,65 @@
+{
+  "host": {
+    "machine": "aarch64",
+    "cpu_model": "0xd40",
+    "cpus": 64
+  },
+  "hostname": "ip-10-0-8-10",
+  "measured": "2026-11-05",
+  "cells": {
+    "792-def": {
+      "wall_s": 9.71,
+      "peak_rss_kib": 1849396,
+      "peak_rss_min_kib": 1811092,
+      "rounds": 3
+    },
+    "792-nocap": {
+      "wall_s": 8.99,
+      "peak_rss_kib": 1693936,
+      "peak_rss_min_kib": 1693320,
+      "rounds": 3
+    },
+    "792-drop": {
+      "wall_s": 6.04,
+      "peak_rss_kib": 1693148,
+      "peak_rss_min_kib": 1641180,
+      "rounds": 3
+    },
+    "792-dropnocap": {
+      "wall_s": 5.08,
+      "peak_rss_kib": 1633580,
+      "peak_rss_min_kib": 1615904,
+      "rounds": 3
+    },
+    "792-def-glibc": {
+      "wall_s": 10.91,
+      "peak_rss_kib": 1811788,
+      "peak_rss_min_kib": 1791192,
+      "rounds": 3
+    },
+    "792-drop-glibc": {
+      "wall_s": 7.36,
+      "peak_rss_kib": 1472396,
+      "peak_rss_min_kib": 1443512,
+      "rounds": 3
+    },
+    "moldova-f0": {
+      "wall_s": 14.02,
+      "peak_rss_kib": 4769312,
+      "peak_rss_min_kib": 4754636,
+      "rounds": 3
+    },
+    "moldova-tiles": {
+      "wall_s": 4.46,
+      "peak_rss_kib": 3896264,
+      "peak_rss_min_kib": 3826504,
+      "rounds": 3
+    }
+  },
+  "limits": {
+    "ratio_wall": 1.7,
+    "ratio_rss": 1.5,
+    "wall": 1.15,
+    "rss": 1.2
+  }
+}
