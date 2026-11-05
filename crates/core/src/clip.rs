@@ -390,18 +390,22 @@ fn intersects_bounds(rect: &Rect<f64>, bounds: &TileBounds) -> bool {
 /// take the fully-inside fast path and never reach the `i_overlay` guard
 /// (#707). The callers refuse a non-finite polygon, counted, instead.
 fn polygon_rect_all_rings(poly: &Polygon<f64>) -> Option<(Rect<f64>, bool)> {
-    let rings = std::iter::once(poly.exterior()).chain(poly.interiors());
-    let first = rings.clone().find_map(|ring| ring.0.first())?;
-    let (mut min, mut max) = (*first, *first);
+    // The exterior is read as a slice with no iterator chain: most polygons
+    // have no holes, and a per-polygon chain/clone/find setup dominated the
+    // bounds pass over a MultiPolygon with thousands of small parts.
+    let exterior = poly.exterior().0.as_slice();
+    let first = match exterior.first() {
+        Some(c) => *c,
+        None => *poly.interiors().iter().find_map(|ring| ring.0.first())?,
+    };
+    let (mut min, mut max) = (first, first);
     let mut finite = true;
-    // Keep the hot loop on a coordinate slice rather than advancing a
-    // flattened ring iterator per vertex. Finiteness and bounds share this
-    // pass, including singleton rings and holes outside their exterior.
-    for ring in rings {
-        for c in &ring.0 {
+    // Finiteness and bounds share this pass, including singleton rings and
+    // holes outside their exterior. Ordered comparisons avoid NaN-aware
+    // min/max work: only finite bounds are used by callers.
+    let mut fold = |ring: &[Coord<f64>]| {
+        for c in ring {
             finite &= c.x.is_finite() & c.y.is_finite();
-            // Only finite bounds are used by callers. Ordered comparisons
-            // avoid NaN-aware min/max work for each accepted coordinate.
             if c.x < min.x {
                 min.x = c.x;
             }
@@ -415,29 +419,48 @@ fn polygon_rect_all_rings(poly: &Polygon<f64>) -> Option<(Rect<f64>, bool)> {
                 max.y = c.y;
             }
         }
+    };
+    fold(exterior);
+    for hole in poly.interiors() {
+        fold(hole.0.as_slice());
     }
     Some((Rect::new(min, max), finite))
 }
 
+/// A MultiPolygon's overall rect, whether every coordinate is finite, and each
+/// part's own rect (`None` for a part with no coordinates).
+type MultiPolygonRects = (Rect<f64>, bool, Vec<Option<Rect<f64>>>);
+
 /// [`polygon_rect_all_rings`] over every part of a MultiPolygon.
-fn multipolygon_rect_all_rings(mp: &MultiPolygon<f64>) -> Option<(Rect<f64>, bool)> {
-    let mut rects = mp.0.iter().filter_map(polygon_rect_all_rings);
-    let first = rects.next()?;
-    Some(rects.fold(first, |(acc, acc_finite), (r, finite)| {
-        (
-            Rect::new(
-                Coord {
-                    x: acc.min().x.min(r.min().x),
-                    y: acc.min().y.min(r.min().y),
-                },
-                Coord {
-                    x: acc.max().x.max(r.max().x),
-                    y: acc.max().y.max(r.max().y),
-                },
-            ),
-            acc_finite && finite,
-        )
-    }))
+fn multipolygon_rect_all_rings(mp: &MultiPolygon<f64>) -> Option<MultiPolygonRects> {
+    // Each part's rect is kept so the per-part filter in `clip_multipolygon`
+    // does not walk every vertex a second time.
+    let mut part_rects = Vec::with_capacity(mp.0.len());
+    let mut all: Option<Rect<f64>> = None;
+    let mut all_finite = true;
+    for poly in &mp.0 {
+        match polygon_rect_all_rings(poly) {
+            Some((r, finite)) => {
+                all_finite &= finite;
+                all = Some(match all {
+                    None => r,
+                    Some(acc) => Rect::new(
+                        Coord {
+                            x: acc.min().x.min(r.min().x),
+                            y: acc.min().y.min(r.min().y),
+                        },
+                        Coord {
+                            x: acc.max().x.max(r.max().x),
+                            y: acc.max().y.max(r.max().y),
+                        },
+                    ),
+                });
+                part_rects.push(Some(r));
+            }
+            None => part_rects.push(None),
+        }
+    }
+    Some((all?, all_finite, part_rects))
 }
 
 /// Check if a rectangle is fully contained within the given bounds
@@ -615,7 +638,7 @@ fn clip_multipolygon(
 ) -> Option<MultiPolygon<f64>> {
     // Level 1: Quick rejection using overall MultiPolygon bbox (every ring,
     // see `polygon_rect_all_rings`).
-    let (mp_rect, finite) = multipolygon_rect_all_rings(mp)?;
+    let (mp_rect, finite, part_rects) = multipolygon_rect_all_rings(mp)?;
     if !finite {
         // One hostile vertex poisons the whole input, as in the i_overlay
         // guard: dropped, and counted (#707).
@@ -636,12 +659,11 @@ fn clip_multipolygon(
     // any clipping is attempted. This avoids expensive operations for
     // sub-polygons that are far from the tile.
     let mut clipped_polys = Vec::new();
-    for poly in &mp.0 {
-        // Per-polygon bbox filter: compute each polygon's bbox and check
-        // intersection before calling into the clip pipeline
-        // Every part is finite: the whole MultiPolygon was checked above.
-        let poly_rect = match polygon_rect_all_rings(poly) {
-            Some((r, _)) => r,
+    for (poly, poly_rect) in mp.0.iter().zip(part_rects) {
+        // Per-polygon bbox filter: each part's rect came from the pass above,
+        // which also proved every part finite.
+        let poly_rect = match poly_rect {
+            Some(r) => r,
             None => continue, // Degenerate polygon, skip
         };
 
