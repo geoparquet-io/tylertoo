@@ -9,6 +9,11 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The Python wheel uses mimalloc as its global allocator on every platform,
+  as the CLI does (#739, #792). On the 792 buildings input, export wall
+  falls about 8% and peak RSS rises about 19% against the system allocator;
+  archives are byte-identical. Source builds can opt out with
+  `--no-default-features`.
 - Rust callers pass a `TileCoord` to
   `StreamingPmtilesWriter::add_tile_precompressed` instead of separate
   zoom, x and y arguments. `Compression::from_str` is now

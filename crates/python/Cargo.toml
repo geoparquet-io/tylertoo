@@ -17,10 +17,11 @@ name = "tylertoo"
 crate-type = ["cdylib"]
 
 [features]
-default = []
-# mimalloc as the extension's global allocator on non-musl targets (#739,
-# #788). Off by default on glibc (manylinux) until a wheel benchmark decides;
-# musl targets (musllinux) always get it, below. Only the extension's own
+default = ["mimalloc"]
+# mimalloc as the extension's global allocator on every target, as for the
+# CLI (#739, #788, #792); `--no-default-features` builds with the system
+# allocator. musl targets (musllinux) always get it, below, whatever this
+# feature says. Only the extension's own
 # Rust allocations go through it: the interpreter's allocator is untouched,
 # and every Rust allocation is freed by Rust (data reaches Python as copies).
 mimalloc = ["dep:mimalloc"]
