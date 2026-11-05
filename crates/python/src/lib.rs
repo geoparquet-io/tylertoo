@@ -11,8 +11,8 @@
 ///
 /// Unconditional on musl (musllinux wheels), for #480's reason: musl's
 /// `mallocng` fails small allocations under heavy multi-threaded
-/// fragmentation. Elsewhere it is the `mimalloc` Cargo feature, off by
-/// default. Python's allocator is untouched: a Rust `#[global_allocator]`
+/// fragmentation. Elsewhere it is the `mimalloc` Cargo feature, on by
+/// default (#792), as in the CLI. Python's allocator is untouched: a Rust `#[global_allocator]`
 /// serves only this module's Rust code, and nothing allocated here is freed
 /// by the interpreter (results cross into Python as copies). Excluded under
 /// `dhat-heap`, whose allocator tylertoo-core installs.
