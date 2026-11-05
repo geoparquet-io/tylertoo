@@ -4,9 +4,142 @@ use crate::valve_counter::{self, Counts};
 use geo::{LineString, Polygon};
 use std::time::Instant;
 
+/// Inputs and worker threads belong to the collector, outside this encode
+/// ledger. Like `encode_cost_tests`, dhat requires nextest process isolation.
+#[cfg(feature = "dhat-heap")]
+#[test]
+fn valve_encode_peak_live_bytes_matches_price() {
+    if std::env::var_os("NEXTEST_EXECUTION_MODE").as_deref()
+        != Some(std::ffi::OsStr::new("process-per-test"))
+    {
+        eprintln!("skipped: the dhat peak requires nextest process-per-test mode");
+        return;
+    }
+    const ROWS: usize = 100_000;
+    let members = square_members(ROWS, true);
+    let opts = ExportOptions {
+        tile_size_limit: Some(ROWS * 2),
+        compressed_tile_size_limit: Some(ROWS / 2),
+        ..Default::default()
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let (peak, passes, dropped, fingerprints) = pool.install(|| {
+        let profiler = dhat::Profiler::builder().testing().build();
+        let mvt = encode_tile(
+            &test_gzip_cache(),
+            &members,
+            &TileCoord::new(0, 0, 0).bounds(),
+            &opts,
+            &[],
+            &mut FillTally::default(),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let measured = (
+            dhat::HeapStats::get().max_bytes,
+            mvt.valve.passes,
+            mvt.valve.dropped,
+            byte_fingerprints(&mvt),
+        );
+        drop(mvt);
+        drop(profiler);
+        measured
+    });
+    let gzip_charge = crate::compression::tile_gzip::PAYLOAD_SLICE_BYTES
+        * crate::compression::tile_gzip::PAYLOAD_SLICES;
+    let estimate = ROWS as u64 * VALVE_TRANSIENT_BYTES_PER_MEMBER + gzip_charge as u64;
+    eprintln!(
+        "valve ledger: members={ROWS} peak={peak} estimate={estimate} \
+         valve_price={VALVE_TRANSIENT_BYTES_PER_MEMBER} gzip_charge={gzip_charge} \
+         passes={passes} fingerprints={fingerprints:?}"
+    );
+    assert!(passes >= 2, "fixture must exercise merging");
+    assert_eq!(dropped, 0);
+    // Captured on 6f4f25e before the memory changes: raw and gzip stay exact.
+    assert_eq!(
+        fingerprints,
+        (5_960_687_766_429_934_319, Some(14_479_824_291_116_707_907))
+    );
+    assert!(
+        (estimate / 2..=estimate * 5 / 4).contains(&(peak as u64)),
+        "valve encode peak={peak} estimate={estimate}: expected 0.5–1.25 × estimate"
+    );
+}
+
+#[test]
+fn valve_price_narrows_only_when_the_wave_or_group_does_not_fit() {
+    let opts = ExportOptions::default();
+    assert!(valve_merges(&opts));
+    let base = member_resident_bytes(100, 2);
+    let merged = export_member_resident_bytes(100, 2, &opts);
+    assert_eq!(merged, base + VALVE_TRANSIENT_BYTES_PER_MEMBER);
+    assert_eq!(
+        export_member_resident_bytes(u64::MAX, usize::MAX, &opts),
+        u64::MAX
+    );
+    for disabled in [
+        ExportOptions {
+            size_valve: SizeValve::Drop,
+            ..opts.clone()
+        },
+        ExportOptions {
+            tile_size_limit: None,
+            compressed_tile_size_limit: None,
+            ..opts.clone()
+        },
+        ExportOptions {
+            tile_size_limit: Some(0),
+            compressed_tile_size_limit: Some(0),
+            ..opts.clone()
+        },
+    ] {
+        assert_eq!(export_member_resident_bytes(100, 2, &disabled), base);
+    }
+    let partitions = [Partition {
+        key_lo: 0,
+        key_hi: 0,
+        bbox: PruneRegion::of(TileBounds::new(0.0, 0.0, 0.0, 0.0)),
+        members: 100_000,
+    }];
+    let cap = |bytes, budget: &MemoryBudget| {
+        level_group_member_cap(8, 100_000, Some(bytes), MemoryProfile::Auto, Some(budget))
+    };
+    let wave = |bytes, budget: &MemoryBudget| {
+        memory_safe_level_wave(8, &partitions, Some(bytes), MemoryProfile::Auto, budget)
+    };
+    let tight = MemoryBudget::with_available(Some(1024 * 1024 * 1024));
+    assert!(cap(merged, &tight) < cap(base, &tight));
+    assert!(wave(merged, &tight) < wave(base, &tight));
+    let roomy = MemoryBudget::with_available(Some(123 * 1024 * 1024 * 1024));
+    assert_eq!(cap(merged, &roomy), cap(base, &roomy));
+    assert_eq!(wave(merged, &roomy), wave(base, &roomy));
+    assert_eq!(cap(merged, &roomy), 800_000);
+    assert_eq!(wave(merged, &roomy), 8);
+}
+
 fn byte_fingerprints(mvt: &TileMvt) -> (u64, Option<u64>) {
     use xxhash_rust::xxh3::xxh3_64;
     (xxh3_64(&mvt.data), mvt.gzip.as_ref().map(|g| xxh3_64(g)))
+}
+
+#[test]
+fn valve_coalescing_defers_polygon_clones_until_plain_geometry_is_needed() {
+    let members = square_members(3, true);
+    let ordered: Vec<_> = members.iter().collect();
+    let (merged, counts) =
+        valve_counter::measure(|| coalesce_valve::coalesce_members(&ordered, u64::MAX));
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        counts.polygon_clones, 0,
+        "cached encoding needs only indices"
+    );
+    let (coords, counts) = valve_counter::measure(|| merged[0].geometry().coords_count());
+    assert_eq!(coords, 15, "plain fallback still carries every polygon");
+    assert_eq!(counts.polygon_clones, 3);
+    let (_, counts) = valve_counter::measure(|| merged[0].geometry());
+    assert_eq!(counts.polygon_clones, 0, "materialize at most once");
 }
 
 /// Fixed-seed, jittered parcels in one z0 tile. Coordinates are chosen in tile

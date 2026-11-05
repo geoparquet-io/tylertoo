@@ -761,52 +761,66 @@ impl QuantizedPolygons {
         let (geometries, feature_keys): (Vec<&Geometry>, Vec<u64>) = features.into_iter().unzip();
         // Per feature: its quantized parts, `multi` and `has_coords`.
         type Quantized = (Vec<Vec<TileRing>>, bool, bool);
-        let quantized: Vec<Option<Quantized>> = geometries
-            .par_iter()
-            .map(|g| {
-                #[cfg(test)]
-                let _count_rings = crate::valve_counter::quantizing();
-                let (parts, multi) = match g {
-                    Geometry::Polygon(p) => (quantized_polygons(p, &proj), false),
-                    Geometry::MultiPolygon(mp) => (
-                        mp.0.iter()
-                            .flat_map(|p| quantized_polygons(p, &proj))
-                            .collect(),
-                        true,
-                    ),
-                    Geometry::Rect(r) => (quantized_polygons(&r.to_polygon(), &proj), false),
-                    Geometry::Triangle(t) => (quantized_polygons(&t.to_polygon(), &proj), false),
-                    _ => return None,
-                };
-                Some((parts, multi, g.coords_count() > 0))
-            })
-            .collect();
-        let mut features = Vec::with_capacity(quantized.len());
+        let mut features = Vec::with_capacity(geometries.len());
         let mut parts = Vec::new();
         let mut keys = Vec::new();
-        for (q, &key) in quantized.into_iter().zip(&feature_keys) {
-            features.push(q.map(|(p, multi, has_coords)| {
-                let start = parts.len();
-                keys.extend(std::iter::repeat_n(key, p.len()));
-                parts.extend(p);
-                QuantizedFeature {
-                    parts: start..parts.len(),
-                    multi,
-                    has_coords,
-                }
-            }));
+        // Keep projection parallel without staging every feature's outer
+        // polygon Vec beside the flattened parts of the whole tile.
+        for (geometries, feature_keys) in geometries.chunks(4096).zip(feature_keys.chunks(4096)) {
+            let quantized: Vec<Option<Quantized>> = geometries
+                .par_iter()
+                .map(|g| {
+                    #[cfg(test)]
+                    let _count_rings = crate::valve_counter::quantizing();
+                    let (parts, multi) = match g {
+                        Geometry::Polygon(p) => (quantized_polygons(p, &proj), false),
+                        Geometry::MultiPolygon(mp) => (
+                            mp.0.iter()
+                                .flat_map(|p| quantized_polygons(p, &proj))
+                                .collect(),
+                            true,
+                        ),
+                        Geometry::Rect(r) => (quantized_polygons(&r.to_polygon(), &proj), false),
+                        Geometry::Triangle(t) => {
+                            (quantized_polygons(&t.to_polygon(), &proj), false)
+                        }
+                        _ => return None,
+                    };
+                    Some((parts, multi, g.coords_count() > 0))
+                })
+                .collect();
+            let count = quantized.iter().flatten().map(|(p, _, _)| p.len()).sum();
+            parts.reserve(count);
+            keys.reserve(count);
+            for (q, &key) in quantized.into_iter().zip(feature_keys) {
+                features.push(q.map(|(p, multi, has_coords)| {
+                    let start = parts.len();
+                    keys.extend(std::iter::repeat_n(key, p.len()));
+                    parts.extend(p);
+                    QuantizedFeature {
+                        parts: start..parts.len(),
+                        multi,
+                        has_coords,
+                    }
+                }));
+            }
         }
+        drop(geometries);
+        drop(feature_keys);
         // The box-meeting pairs that share a key; the exact test waits until
         // a pass puts both parts in one feature.
         let n = u32::try_from(parts.len()).ok()?;
         let max_slots = MAX_CANDIDATES_PER_PART.saturating_mul(n.max(64));
         let boxes: Vec<_> = parts.iter().map(|p| ring_box(&p[0])).collect();
-        let mut candidates = vec![Vec::new(); parts.len()];
         let mut slots = 0u32;
+        // Count first: dense tiles use on-demand sweeps and must never
+        // allocate millions of pairs only to discard them at the cap.
+        // Per-part degrees also give exact capacities on the stored path.
+        let mut degrees = vec![0usize; parts.len()];
         let too_many = any_box_pair(&boxes, |i, j| {
             if keys[i] == keys[j] {
-                candidates[i].push((j as u32, slots));
-                candidates[j].push((i as u32, slots));
+                degrees[i] += 1;
+                degrees[j] += 1;
                 slots += 1;
             }
             slots > max_slots
@@ -817,6 +831,16 @@ impl QuantizedPolygons {
             slots = 0;
             None
         } else {
+            let mut candidates: Vec<_> = degrees.into_iter().map(Vec::with_capacity).collect();
+            slots = 0;
+            any_box_pair(&boxes, |i, j| {
+                if keys[i] == keys[j] {
+                    candidates[i].push((j as u32, slots));
+                    candidates[j].push((i as u32, slots));
+                    slots += 1;
+                }
+                false
+            });
             Some(candidates)
         };
         #[cfg(test)]

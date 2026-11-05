@@ -1345,6 +1345,27 @@ const MEMBER_BASE_BYTES: u64 = 224;
 /// [`MEMBER_BASE_BYTES`] for the fit.
 const MEMBER_PROPERTY_BYTES: u64 = 208;
 
+/// Extra transient bytes per member when the size valve can merge: grouping,
+/// quantized polygons, interactions and union work alongside collected members.
+///
+/// Measured (2026-11, dhat, debug build, two workers, 100k overlapping squares,
+/// inputs allocated before profiling): 148,621,720 B before counting candidate
+/// pairs first and deferring unused geometry clones, 25,231,304 B after.
+/// With the separately charged 8 MiB gzip cache, 192 B/member estimates
+/// 27,588,608 B (9% above measured). Refit with the process-isolated
+/// `valve_encode_peak_live_bytes_matches_price` ledger; its 0.5–1.25× bound
+/// guards both underpricing and waste returning. Drop/unlimited add nothing.
+const VALVE_TRANSIENT_BYTES_PER_MEMBER: u64 = 192;
+
+/// The shared wave/group/store fit price, including merge-valve workspace.
+fn export_member_resident_bytes(mean: u64, properties: usize, opts: &ExportOptions) -> u64 {
+    member_resident_bytes(mean, properties).saturating_add(if valve_merges(opts) {
+        VALVE_TRANSIENT_BYTES_PER_MEMBER
+    } else {
+        0
+    })
+}
+
 /// Estimated resident bytes of one clipped member (#311, #665): the finest
 /// level's mean stored bytes per row times [`MEMBER_MEMORY_INFLATION`], plus
 /// [`MEMBER_BASE_BYTES`] and [`MEMBER_PROPERTY_BYTES`] per published
@@ -1389,7 +1410,7 @@ fn auto_partition_wave(cores: usize, profile: MemoryProfile, budget: &MemoryBudg
 ///
 /// Where the upfront [`memory_safe_wave`] sizes from a flat per-slot constant,
 /// this uses the level's *actual* densest planned partition:
-/// `max(partition.members) × member_bytes` (see [`member_resident_bytes`])
+/// `max(partition.members) × member_bytes` (see [`export_member_resident_bytes`])
 /// directly estimates the largest partition's resident volume. This
 /// captures the real driver — a single dense tile that overshoots
 /// [`DEFAULT_PARTITION_TARGET`] is one partition, wholly unbounded by the target
@@ -1422,7 +1443,8 @@ fn memory_safe_level_wave(
     // Saturating throughout: an absurd member count or byte size clamps the
     // per-slot estimate to "definitely serial" (wave 1) rather than overflowing.
     // A footer price: `per_member` is the finest level's mean stored row
-    // bytes from the footer, inflated by [`member_resident_bytes`].
+    // bytes from the footer, inflated with the optional valve workspace by
+    // [`export_member_resident_bytes`].
     let per_slot = (max_members as u64).saturating_mul(per_member).max(1);
     ceiling.min(budget.affordable(
         profile,
@@ -1439,7 +1461,7 @@ fn memory_safe_level_wave(
 /// stay within what the serial loop already budgets for. When the member
 /// size is known, the cap also narrows to the members
 /// [`MemoryPhase::ExportCollect`] can afford under `profile` at
-/// `member_bytes` each (see [`member_resident_bytes`]), the same estimate
+/// `member_bytes` each (see [`export_member_resident_bytes`]), the same estimate
 /// [`memory_safe_level_wave`] uses; under `speed` it does not narrow.
 ///
 /// The cap counts members only. A group can also hold the encoded tiles of
@@ -2173,7 +2195,7 @@ fn export_pmtiles_validated(
         feature_id,
         skipped: skipped_property_columns,
     } = resolve_export_columns(&reader, options, &level_zooms)?;
-    let member_bytes = export_member_bytes(&reader, &published, mean_member_bytes);
+    let member_bytes = export_member_bytes(&reader, &published, mean_member_bytes, options);
 
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
@@ -2563,21 +2585,23 @@ impl ExportReport {
     }
 }
 
-/// One member's estimated resident size (#665): [`member_resident_bytes`]
+/// One member's estimated resident size (#665): [`export_member_resident_bytes`]
 /// over the finest level's mean stored row size and the properties every
-/// member carries. Steers the wave and the [`check_levels_fit`] refusal
-/// only, never output bytes. Pulled out of `export_pmtiles_run` to keep it
+/// member carries, plus workspace when the valve can merge. Steers the wave,
+/// group and store fits and the [`check_levels_fit`] refusal, never output
+/// bytes. Pulled out of `export_pmtiles_run` to keep it
 /// under clippy's function-length ceiling.
 fn export_member_bytes(
     reader: &OverviewReader,
     published: &PublishedNames,
     mean_stored_bytes: Option<u64>,
+    opts: &ExportOptions,
 ) -> Option<u64> {
     let properties = reader
         .resolved_schema()
         .geometry_index()
         .map_or(0, |g| property_columns(reader.schema(), g, published).len());
-    mean_stored_bytes.map(|mean| member_resident_bytes(mean, properties))
+    mean_stored_bytes.map(|mean| export_member_resident_bytes(mean, properties, opts))
 }
 
 /// Every level's zoom, in level order, required to strictly ascend (#371 /
@@ -7351,6 +7375,9 @@ fn fill_tile_bytes(opts: &ExportOptions) -> usize {
 /// with others merged into it (#745).
 trait TileFeature: Sync {
     fn geometry(&self) -> &Geometry<f64>;
+    fn coords_count(&self) -> usize {
+        self.geometry().coords_count()
+    }
     fn properties(&self) -> &SharedProps;
     fn feature_id(&self) -> Option<u64>;
     fn source_row(&self) -> u64;
@@ -7373,7 +7400,10 @@ impl TileFeature for Member {
 
 impl TileFeature for coalesce_valve::Merged<'_> {
     fn geometry(&self) -> &Geometry<f64> {
-        &self.geom
+        self.geometry()
+    }
+    fn coords_count(&self) -> usize {
+        self.coords_count()
     }
     fn properties(&self) -> &SharedProps {
         self.props()
@@ -7389,6 +7419,9 @@ impl TileFeature for coalesce_valve::Merged<'_> {
 impl<T: TileFeature + ?Sized> TileFeature for &T {
     fn geometry(&self) -> &Geometry<f64> {
         (**self).geometry()
+    }
+    fn coords_count(&self) -> usize {
+        (**self).coords_count()
     }
     fn properties(&self) -> &SharedProps {
         (**self).properties()
@@ -7605,6 +7638,9 @@ fn drop_to_fit(
             build_mvt(gzip_cache, members, tb, opts, f, diagnostics)
         });
     }
+    // Later passes need only the original size for the warning.
+    let full_bytes = full.data.len();
+    drop(full);
     let mut keep = members.len();
     let mut passes = 1u32;
     loop {
@@ -7616,7 +7652,7 @@ fn drop_to_fit(
         if fit >= 1.0 || keep <= 1 || passes >= MAX_DROP_PASSES {
             log::warn!(
                 "oversized tile ({} bytes): dropped {} of {} features ({passes} encodes){}",
-                full.data.len(),
+                full_bytes,
                 members.len() - keep,
                 members.len(),
                 if fit < 1.0 {
@@ -7823,6 +7859,9 @@ fn merge_to_fit(
                 kept.extend(select_kept_members(&single, keep));
                 draw_order(&mut kept);
                 passes += 1;
+                // The previous bytes cannot be returned after dropping more
+                // features. Release them before building their replacement.
+                drop(out);
                 out = build(&kept, passes, &[]);
                 fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
                 if fit >= 1.0 || keep == 0 {
@@ -7929,7 +7968,7 @@ fn encode_in_parallel<M: TileFeature>(members: &[M]) -> bool {
     }
     let mut coords = 0usize;
     for m in members {
-        coords += m.geometry().coords_count();
+        coords += m.coords_count();
         if coords >= PARALLEL_ENCODE_MIN_COORDS {
             return true;
         }
