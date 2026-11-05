@@ -7030,110 +7030,120 @@ fn encode_members(
     // match the writer's `tile_compression` (Gzip) so `add_tile_precompressed`
     // stays byte-identical to the old serial `add_tile_with_count` path.
     // #535: `encode` is timed per tile, inside this closure (core-seconds).
-    groups
-        .into_par_iter()
-        .filter_map(|g| {
-            let _encode = ExportTimers::scope(&timers.encode);
-            let (x, y) = key_to_xy(g[0].key, zoom);
-            let tb = TileCoord::new(x, y, zoom).bounds();
-            // #788: the tile's fill is owned for the encode and dropped once
-            // its fill commands are built; a spilled fill's read can fail.
-            let fill = fills.map(|f| {
-                ExportTimers::time(&timers.fill_encode, || {
-                    f.get(g[0].key).map(|polys| {
-                        polys.map(|polys| fill_features(&polys, g, &tb, opts, diagnostics))
-                    })
+    let encode_group = |g: &[Member]| -> Option<Result<EncodedTile, ExportError>> {
+        let _encode = ExportTimers::scope(&timers.encode);
+        let (x, y) = key_to_xy(g[0].key, zoom);
+        let tb = TileCoord::new(x, y, zoom).bounds();
+        // #788: the tile's fill is owned for the encode and dropped once
+        // its fill commands are built; a spilled fill's read can fail.
+        let fill = fills.map(|f| {
+            ExportTimers::time(&timers.fill_encode, || {
+                f.get(g[0].key).map(|polys| {
+                    polys.map(|polys| fill_features(&polys, g, &tb, opts, diagnostics))
                 })
-            });
-            let (fill, mut fill_tally) = match fill.transpose() {
-                Ok(fill) => fill.flatten().unwrap_or_default(),
-                Err(error) => return Some(Err(error)),
+            })
+        });
+        let (fill, mut fill_tally) = match fill.transpose() {
+            Ok(fill) => fill.flatten().unwrap_or_default(),
+            Err(error) => return Some(Err(error)),
+        };
+        let mvt = encode_tile(
+            gzip_cache,
+            g,
+            &tb,
+            opts,
+            &fill,
+            &mut fill_tally,
+            diagnostics,
+        );
+        if opts.feature_id.is_some() {
+            use crate::diagnostics::SourceLossCause;
+            let cause = if mvt.valve.dropped > 0 {
+                SourceLossCause::ValveDropped
+            } else if mvt.valve.merged > 0 {
+                SourceLossCause::Merged
+            } else {
+                SourceLossCause::EncodeDropped
             };
-            let mvt = encode_tile(
-                gzip_cache,
-                g,
-                &tb,
-                opts,
-                &fill,
-                &mut fill_tally,
-                diagnostics,
-            );
-            if opts.feature_id.is_some() {
-                use crate::diagnostics::SourceLossCause;
-                let cause = if mvt.valve.dropped > 0 {
-                    SourceLossCause::ValveDropped
-                } else if mvt.valve.merged > 0 {
-                    SourceLossCause::Merged
-                } else {
-                    SourceLossCause::EncodeDropped
-                };
-                let surviving: std::collections::BTreeSet<u64> =
-                    mvt.source_ids.iter().copied().collect();
-                let losses: std::collections::BTreeMap<u64, _> =
-                    mvt.source_losses.iter().copied().collect();
-                for member in g {
-                    if let Some(id) = member.id {
-                        let cause = losses.get(&member.seq).copied().unwrap_or(cause);
-                        if !surviving.contains(&member.seq) {
-                            if let Err(error) =
-                                diagnostics.source_member_loss(member.seq, id, zoom, cause)
-                            {
-                                return Some(Err(error.into()));
-                            }
-                        }
-                    }
-                }
-                if mvt.features > 0 {
-                    for &id in &mvt.source_ids {
-                        if let Err(error) = diagnostics.source_emitted(id, zoom) {
+            let surviving: std::collections::BTreeSet<u64> =
+                mvt.source_ids.iter().copied().collect();
+            let losses: std::collections::BTreeMap<u64, _> =
+                mvt.source_losses.iter().copied().collect();
+            for member in g {
+                if let Some(id) = member.id {
+                    let cause = losses.get(&member.seq).copied().unwrap_or(cause);
+                    if !surviving.contains(&member.seq) {
+                        if let Err(error) =
+                            diagnostics.source_member_loss(member.seq, id, zoom, cause)
+                        {
                             return Some(Err(error.into()));
                         }
                     }
                 }
             }
-            if let Some(f) = fills {
-                f.note_shed(fill_tally.shed);
+            if mvt.features > 0 {
+                for &id in &mvt.source_ids {
+                    if let Err(error) = diagnostics.source_emitted(id, zoom) {
+                        return Some(Err(error.into()));
+                    }
+                }
             }
-            if mvt.features == 0 {
-                // Every member encoded to nothing (#431). There is no tile
-                // to write, but the drops must still reach the report, so
-                // hand back an empty carrier the writer loop skips.
-                return Some(Ok(EncodedTile {
-                    x,
-                    y,
-                    data: Vec::new(),
-                    hash: 0,
-                    raw_len: 0,
-                    feature_count: 0,
-                    encode_dropped: mvt.unencodable,
-                    encode_quantized: mvt.quantized,
-                    oversized: mvt.oversized,
-                    valve: mvt.valve,
-                    // The tile is not written, so neither is its fill.
-                    fill: FillTally::default(),
-                }));
-            }
-            let hash = TileHasher::hash(&mvt.data);
-            let raw_len = mvt.data.len();
-            let compressed = match mvt.data.into_gzip(&mvt.gzip_cache) {
-                Ok(gzip) => gzip,
-                Err(e) => return Some(Err(ExportError::from(e))),
-            };
-            Some(Ok(EncodedTile {
+        }
+        if let Some(f) = fills {
+            f.note_shed(fill_tally.shed);
+        }
+        if mvt.features == 0 {
+            // Every member encoded to nothing (#431). There is no tile
+            // to write, but the drops must still reach the report, so
+            // hand back an empty carrier the writer loop skips.
+            return Some(Ok(EncodedTile {
                 x,
                 y,
-                data: compressed,
-                hash,
-                raw_len,
-                feature_count: mvt.features,
+                data: Vec::new(),
+                hash: 0,
+                raw_len: 0,
+                feature_count: 0,
                 encode_dropped: mvt.unencodable,
                 encode_quantized: mvt.quantized,
                 oversized: mvt.oversized,
                 valve: mvt.valve,
-                fill: fill_tally,
-            }))
-        })
-        .collect()
+                // The tile is not written, so neither is its fill.
+                fill: FillTally::default(),
+            }));
+        }
+        let hash = TileHasher::hash(&mvt.data);
+        let raw_len = mvt.data.len();
+        let compressed = match mvt.data.into_gzip(&mvt.gzip_cache) {
+            Ok(gzip) => gzip,
+            Err(e) => return Some(Err(ExportError::from(e))),
+        };
+        Some(Ok(EncodedTile {
+            x,
+            y,
+            data: compressed,
+            hash,
+            raw_len,
+            feature_count: mvt.features,
+            encode_dropped: mvt.unencodable,
+            encode_quantized: mvt.quantized,
+            oversized: mvt.oversized,
+            valve: mvt.valve,
+            fill: fill_tally,
+        }))
+    };
+    // Longest tile first, one tile per task: a tile's valve passes are a
+    // serial chain, so a dense tile that starts late sets the wall of its
+    // level group. The results are put back in key order, so the output is
+    // unchanged.
+    let mut order: Vec<usize> = (0..groups.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(groups[i].len()));
+    let mut done: Vec<(usize, Option<Result<EncodedTile, ExportError>>)> = order
+        .into_par_iter()
+        .with_max_len(1)
+        .map(|i| (i, encode_group(groups[i])))
+        .collect();
+    done.sort_unstable_by_key(|(i, _)| *i);
+    done.into_iter().filter_map(|(_, r)| r).collect()
 }
 
 #[cfg(test)]
