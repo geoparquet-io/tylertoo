@@ -166,6 +166,8 @@ impl RowGapCursor {
         if !self.measure {
             return geoms.iter().map(|_| self.next_row(None)).collect();
         }
+        #[cfg(test)]
+        crate::valve_counter::note(|c| c.gap_rows += geoms.len());
         let rects: Vec<Option<Rect<f64>>> = geoms.par_iter().map(|g| g.bounding_rect()).collect();
         rects.into_iter().map(|r| self.next_row(r)).collect()
     }
@@ -218,6 +220,8 @@ impl Merged<'_> {
 /// keeps that order. A member with nothing of its kind and band before it is
 /// kept. With `mingap == 0` nothing merges.
 pub(super) fn coalesce_members<'a>(ordered: &[&'a Member], mingap: u64) -> Vec<Merged<'a>> {
+    #[cfg(test)]
+    crate::valve_counter::note(|c| c.coalesce_calls += 1);
     // (kept member, members merged into it), as indices into `ordered`
     let mut kept: Vec<(usize, Vec<usize>)> = Vec::with_capacity(ordered.len());
     // The index in `kept` of the last kept member per (band, kind). Bands
@@ -291,6 +295,8 @@ fn concat_geometry(target: &Geometry<f64>, absorbed: &[&Member]) -> Geometry<f64
 }
 
 fn push_polygons(g: &Geometry<f64>, out: &mut Vec<Polygon<f64>>) {
+    #[cfg(test)]
+    crate::valve_counter::clone_polygons(g);
     match g {
         Geometry::Polygon(p) => out.push(p.clone()),
         Geometry::MultiPolygon(mp) => out.extend(mp.0.iter().cloned()),

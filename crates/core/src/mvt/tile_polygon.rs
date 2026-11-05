@@ -247,6 +247,8 @@ enum Loc {
 /// rules: every hole inside its exterior, no hole in another hole, no part
 /// inside another part's fill.
 pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
+    #[cfg(test)]
+    crate::valve_counter::check_polygons();
     // The usual feature, one polygon without holes: only the ring's own
     // rules apply, and the sweep runs on the ring itself, without the
     // ring/part bookkeeping the general case needs.

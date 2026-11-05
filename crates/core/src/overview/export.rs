@@ -7140,6 +7140,10 @@ fn encode_members(
 #[path = "export/encode_cost_tests.rs"]
 mod encode_cost_tests;
 
+#[cfg(test)]
+#[path = "export/valve_cost_tests.rs"]
+mod valve_cost_tests;
+
 /// `true` when `bbox` lies entirely within `tb` expanded by `buffer` on every
 /// side. Clipping such a feature to the buffered tile is a geometric no-op, so
 /// the clip can be skipped (and `BooleanOps` ring normalization avoided).
@@ -7670,27 +7674,49 @@ fn merge_to_fit(
     if !matches!(opts.feature_order, FeatureOrder::Input) {
         ordered.sort_unstable_by_key(|m| m.seq);
     }
+    // Every pass keeps targets from `ordered`. Restricting this global
+    // stable order to those targets gives the same two stable sorts, without
+    // repeating the comparisons after each merge or drop.
+    let mut draw_indices: Vec<usize> = (0..ordered.len()).collect();
+    #[cfg(test)]
+    crate::valve_counter::draw_sort(draw_indices.len());
+    draw_indices.sort_by_key(|&i| ordered[i].seq);
+    if let FeatureOrder::Column { name, descending } = &opts.feature_order {
+        #[cfg(test)]
+        crate::valve_counter::draw_sort(draw_indices.len());
+        draw_indices
+            .sort_by(|&a, &b| compare_by_feature_order(ordered[a], ordered[b], name, *descending));
+    }
+    let mut draw_rank = vec![0; ordered.len()];
+    for (rank, i) in draw_indices.into_iter().enumerate() {
+        draw_rank[i] = rank;
+    }
     let draw_order = |feats: &mut Vec<&coalesce_valve::Merged<'_>>| {
-        feats.sort_by_key(|m| m.target.seq);
-        if let FeatureOrder::Column { name, descending } = &opts.feature_order {
-            feats.sort_by(|a, b| compare_by_feature_order(a.target, b.target, name, *descending));
+        let mut ranked = vec![None; ordered.len()];
+        for &m in feats.iter() {
+            ranked[draw_rank[m.members[0]]] = Some(m);
         }
+        feats.clear();
+        feats.extend(ranked.into_iter().flatten());
     };
     // #758: from the second pass on, every member's polygons are projected,
     // quantized and cleaned once, so a pass only unions, and only the
     // components that changed since the pass before. A tile that fits at
-    // once never builds this. Whether two parts interact is tested only when
+    // once never builds this. Below the pair cap, interactions are cached;
+    // above it, candidates are swept on demand. Parts are tested only when
     // a pass puts both in one feature: on NZ Parcels under a 2 MB gzip cap,
     // where most oversized tiles fit on their second pass, testing every
     // touching pair up front cost 15% of the export.
-    // Built once, on the first pass that merges; `Some(None)` when the tile
-    // has too many touching parts to cache, and is encoded plainly.
+    // Built once, on the first pass that merges; `Some(None)` only when the
+    // part count cannot fit the cache's u32 indices.
     let mut quantized: Option<Option<crate::mvt::QuantizedPolygons>> = None;
     let mut build = |feats: &[&coalesce_valve::Merged<'_>], pass: u32, fill: &[&FillFeature]| {
         // Pass 1 merges nothing, and a pass that still merges nothing (a
         // tile with no mergeable gaps, on its way to the drop fallback) has
         // nothing to reuse.
         if pass == 1 || feats.iter().all(|m| m.members.len() < 2) {
+            #[cfg(test)]
+            let _count_path = crate::valve_counter::plain_build(pass);
             return build_mvt(gzip_cache, feats, tb, opts, fill, diagnostics);
         }
         let cached = quantized.get_or_insert_with(|| {
@@ -7701,12 +7727,19 @@ fn merge_to_fit(
             )
         });
         let Some(q) = cached.as_mut() else {
+            #[cfg(test)]
+            let _count_path =
+                crate::valve_counter::build(crate::valve_counter::Path::CacheRejected);
             return build_mvt(gzip_cache, feats, tb, opts, fill, diagnostics);
         };
+        #[cfg(test)]
+        let _count_path = crate::valve_counter::build(crate::valve_counter::Path::Cache);
         q.next_pass();
         let q = &*q;
         build_mvt_with(gzip_cache, feats, opts, fill, |m| {
             q.encode(&m.members, diagnostics).unwrap_or_else(|| {
+                #[cfg(test)]
+                let _count_path = crate::valve_counter::fallback();
                 EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent, diagnostics)
             })
         })
@@ -7924,6 +7957,8 @@ fn build_mvt_with<M: TileFeature>(
     fill: &[&FillFeature],
     encode: impl Fn(&M) -> EncodedFeatureGeometry + Sync,
 ) -> TileMvt {
+    #[cfg(test)]
+    let encode = crate::valve_counter::propagate_path(encode);
     // #443: a resolved `--feature-id` always wins; the no-flag default
     // (`m.id` is `None`) keeps the pre-#443 tile-local member index.
     let id_of = |i: usize, m: &M| Some(m.feature_id().unwrap_or(i as u64));
