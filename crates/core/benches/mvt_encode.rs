@@ -66,6 +66,9 @@ fn generate_circle_polygon(n: usize, center: (f64, f64), radius: f64) -> Polygon
 
 fn bench_encode_polygon(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_polygon");
+    // Hoisted: building the sink inside the timed closure charged its
+    // allocation to every iteration (#773).
+    let diag = tylertoo_core::diagnostics::Diagnostics::default();
     group.measurement_time(Duration::from_secs(4));
     group.sample_size(30);
 
@@ -84,7 +87,7 @@ fn bench_encode_polygon(c: &mut Criterion) {
                     black_box(poly),
                     black_box(&bounds),
                     4096,
-                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                    &diag,
                 ))
             });
         });
@@ -104,7 +107,7 @@ fn bench_encode_polygon(c: &mut Criterion) {
                     black_box(&poly),
                     black_box(&bounds),
                     4096,
-                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                    &diag,
                 ))
             });
         });
@@ -149,6 +152,9 @@ fn synthetic_properties(feature_idx: usize) -> Props {
 
 fn bench_value_dedup(c: &mut Criterion) {
     let mut group = c.benchmark_group("layer_value_dedup");
+    // Hoisted: building the sink inside the timed closure charged its
+    // allocation to every iteration (#773).
+    let diag = tylertoo_core::diagnostics::Diagnostics::default();
     group.measurement_time(Duration::from_secs(4));
     group.sample_size(30);
 
@@ -172,13 +178,7 @@ fn bench_value_dedup(c: &mut Criterion) {
             b.iter(|| {
                 let mut builder = LayerBuilder::new("bench").with_extent(4096);
                 for (i, (geom, props)) in features.iter().enumerate() {
-                    builder.add_feature(
-                        Some(i as u64),
-                        geom,
-                        props,
-                        &bounds,
-                        &tylertoo_core::diagnostics::Diagnostics::default(),
-                    );
+                    builder.add_feature(Some(i as u64), geom, props, &bounds, &diag);
                 }
                 black_box(builder.build())
             });

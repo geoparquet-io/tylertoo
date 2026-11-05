@@ -64,16 +64,14 @@ fn load_batches(path: &Path) -> Option<(SchemaRef, Field, usize, Vec<RecordBatch
 /// Decode every batch's geometry column once: `from_arrow_array` +
 /// `extract_geometries_from_array`.
 fn decode_all(gfield: &Field, gidx: usize, batches: &[RecordBatch]) -> usize {
+    // Hoisted: building the sink inside the timed closure charged its
+    // allocation to every iteration (#773).
+    let diag = tylertoo_core::diagnostics::Diagnostics::default();
     let mut total = 0usize;
     for batch in batches {
         let garr = from_arrow_array(batch.column(gidx).as_ref(), gfield).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_from_array(
-            garr.as_ref(),
-            &mut geoms,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
-        )
-        .unwrap();
+        extract_geometries_from_array(garr.as_ref(), &mut geoms, &diag).unwrap();
         total += geoms.len();
     }
     total

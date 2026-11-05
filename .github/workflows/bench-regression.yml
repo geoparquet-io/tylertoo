@@ -209,6 +209,13 @@ jobs:
       # are the finer signal there.
       # Replayed on #432 (overflow checks in release, 36328559030), this
       # fails clip_geometry/100000 at +12.9%; the old +25% passed it.
+      # #773: the 2026-11-02 Monday run failed 14 benches (a49932b -> 6c3cec4).
+      # Local interleaved re-runs (3 rounds each side) reproduced 12 and not
+      # the two below: bbox_containment_large_features_z4/10_boundaries_* and
+      # /100_boundaries_* read -4% and -3% there against +20% and +22% on the
+      # runner, so they are listed as noisy. Of the 12, eight were the benches
+      # building a Diagnostics sink inside the timed closure (fixed in
+      # benches/); the three multipolygon clip benches (+9%) and pass1_decode (+11%) are real.
       # Re-measure with A/A dispatches (a branch whose only change is outside
       # BENCHED) before tightening further.
       - name: Check for regressions
@@ -216,6 +223,8 @@ jobs:
           python3 scripts/criterion_gate.py --check
           --criterion-dir "$CRITERION_HOME" --baseline base --warn 10 --fail 10
           --noisy 'sutherland_hodgman/*' --noisy 'wide_polygon_clip/sutherland_hodgman/*'
+          --noisy 'bbox_containment_large_features_z4/10_boundaries_*'
+          --noisy 'bbox_containment_large_features_z4/100_boundaries_*'
           --noisy-fail 50 --markdown "$CRITERION_HOME/report.md"
 
       - name: Job summary
