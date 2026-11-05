@@ -900,15 +900,15 @@ pub(super) fn convert_to_pmtiles_validated(
             Some(path) => (path.clone(), None),
             None => {
                 let dir = intermediate_dir(options, output);
-                let tmp = tempfile::Builder::new()
-                    .prefix(".tylertoo-overview-")
-                    .suffix(".parquet")
-                    .tempfile_in(&dir)
-                    .map_err(|source| TilesError::IntermediateCreate {
-                        dir: dir.clone(),
-                        source,
-                    })?
-                    .into_temp_path();
+                let mut builder = tempfile::Builder::new();
+                builder.prefix(".tylertoo-overview-").suffix(".parquet");
+                let tmp =
+                    crate::atomic_output::reserve_path(&builder, Some(&dir)).map_err(|source| {
+                        TilesError::IntermediateCreate {
+                            dir: dir.clone(),
+                            source,
+                        }
+                    })?;
                 (tmp.to_path_buf(), Some(tmp))
             }
         };

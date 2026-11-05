@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use tempfile::{NamedTempFile, TempPath};
+use tempfile::TempPath;
 
 use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
@@ -1801,12 +1801,8 @@ fn build_pyramid_validated(
         let named = |suffix: &str| -> Result<TempPath, Error> {
             let mut b = tempfile::Builder::new();
             b.prefix("tylertoo-pyramid-").suffix(suffix);
-            match &opts.work_dir {
-                Some(dir) => b.tempfile_in(dir),
-                None => b.tempfile(),
-            }
-            .map(NamedTempFile::into_temp_path)
-            .map_err(|e| Error::PMTilesWrite(format!("band {:?}: {e}", band.layer)))
+            crate::atomic_output::reserve_path(&b, opts.work_dir.as_deref())
+                .map_err(|e| Error::PMTilesWrite(format!("band {:?}: {e}", band.layer)))
         };
 
         let overview = named(".parquet")?;
@@ -2426,7 +2422,7 @@ fn finish_merge(
 #[doc(hidden)]
 pub fn fuzz_band_archive(bytes: &[u8]) -> Result<u64, Error> {
     use std::io::Write as _;
-    let mut file = NamedTempFile::new().map_err(Error::Io)?;
+    let mut file = tempfile::NamedTempFile::new().map_err(Error::Io)?;
     file.write_all(bytes).map_err(Error::Io)?;
     file.flush().map_err(Error::Io)?;
 

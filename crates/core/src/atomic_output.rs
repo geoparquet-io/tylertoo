@@ -127,6 +127,34 @@ pub(crate) fn create(target: &Path) -> io::Result<(File, PendingOutput)> {
     ))
 }
 
+/// Reserve a unique path for a file some other writer will create by renaming
+/// over it, as a [`TempPath`] that removes whatever is there when dropped
+/// (success or failure alike).
+///
+/// `tempfile` creates a placeholder file to claim the name; it is removed
+/// again at once. A rename over an *existing* file makes ext4
+/// (`auto_da_alloc`) flush the whole new file synchronously before the
+/// rename returns: on Moldova that one `renameat` was 0.76 s, all of
+/// convert's `writer_finish` phase. Onto a missing path it takes
+/// microseconds and the pages stay in the cache for the next reader. The
+/// name keeps its random component, so nothing else is handed it. `dir` is
+/// `None` for the system temp directory.
+pub(crate) fn reserve_path(
+    builder: &tempfile::Builder<'_, '_>,
+    dir: Option<&Path>,
+) -> io::Result<TempPath> {
+    let named = match dir {
+        Some(dir) => builder.tempfile_in(dir)?,
+        None => builder.tempfile()?,
+    };
+    let path = named.into_temp_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(path),
+        Err(e) => Err(e),
+    }
+}
+
 /// An output path that [`check_writable`] found could not be written.
 #[derive(Debug, thiserror::Error)]
 #[error("cannot write {}: {reason}", .path.display())]
@@ -320,6 +348,31 @@ impl PendingOutput {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression (#791): a publish by rename must land on a path that does
+    /// not exist, or ext4 flushes the whole file inside the rename. The
+    /// reservation still owns the name and cleans up after itself.
+    #[test]
+    fn reserved_path_is_absent_unique_and_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".x-").suffix(".parquet");
+        let a = reserve_path(&builder, Some(dir.path())).unwrap();
+        let b = reserve_path(&builder, Some(dir.path())).unwrap();
+        assert!(!a.exists() && !b.exists(), "placeholder must be gone");
+        assert_ne!(a.to_path_buf(), b.to_path_buf());
+        assert_eq!(a.parent().unwrap(), dir.path());
+        // Published over by a rename, then removed when the guard drops.
+        let (mut file, pending) = create(&dir.path().join("sib.parquet")).unwrap();
+        file.write_all(b"data").unwrap();
+        drop(file);
+        pending.publish().unwrap();
+        std::fs::rename(dir.path().join("sib.parquet"), &a).unwrap();
+        assert!(a.exists());
+        drop(a);
+        drop(b);
+        assert_eq!(listing(dir.path()), Vec::<String>::new());
+    }
     use super::*;
     use std::io::Write;
 
