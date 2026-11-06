@@ -74,4 +74,4 @@ Overture-derived parcels)
    opengeospatial/geoparquet?
 
 *Spec: `context/OVERVIEWS_SPEC.md` · Benchmarks + method:
-`benchmarks/overview/RESULTS.md` · Tuning: `docs/OVERVIEW_TUNING.md`*
+[`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (git history) · Tuning: `docs/OVERVIEW_TUNING.md`*

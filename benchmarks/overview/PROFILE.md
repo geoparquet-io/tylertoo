@@ -1,6 +1,6 @@
 # Performance profile — methodology + history
 
-Companion to [`RESULTS.md`](./RESULTS.md) (storage/access numbers).
+Companion to [`RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (storage/access numbers; in git history since #810).
 This page records **how** the pipeline's performance was measured and
 the sequence of changes that produced the current numbers. The full
 point-in-time engineering notes are archived in
