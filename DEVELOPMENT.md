@@ -220,16 +220,33 @@ is missing prints a message and skips. With
 `TYLERTOO_BENCH_REQUIRE_FIXTURES=1`, which the regression gate sets, it
 panics instead, so a gated run can't compare nothing.
 
-| Bench | Covers |
-|-------|--------|
-| `pass1_decode` | Arrow columnar decode: `from_arrow_array` and `extract_geometries_from_array` |
-| `assign` | `assign_levels_bounded` and `apply_density_budget` at a fixed, CI-sized feature count |
-| `simplify_cascade` | `simplify_cascade` over real polygons through a 10-level chain with a zoom-band `Point` tail |
-| `mvt_encode` | `encode_polygon`, its over-cap early exit (`antarctica_316k_over_cap`), and `LayerBuilder::add_feature`/`build` |
-| `clipping` | Sutherland-Hodgman against `i_overlay`, plus `export_clip_mix`, the point, line, and polygon mix that export clips per tile |
-| `bbox_containment` | Bounding-box containment fast paths |
-| `tile_compress_dedup` | Per-tile gzip and the XXH3 tile-content dedup cache |
-| `pipeline` | `convert_to_overviews` then `export_pmtiles` on two small real fixtures, single-threaded: the production path end to end |
+`crates/core/benches/benches.toml` is the one bench list: the weekly
+gate, CodSpeed and this table read it, and `ci/exemptions.toml` holds
+each bench a system skips, with the reason. The table below is generated;
+after editing either file, run `scripts/bench_list.py docs`. The Gate
+scripts CI job fails when a `[[bench]]` in `crates/core/Cargo.toml` is
+missing from the list, or when this table is stale.
+
+<!-- generated:bench-list -->
+| Bench | Kind | Weekly gate | CodSpeed | Covers |
+|---|---|---|---|---|
+| `pass1_decode` | `cpu` | yes | yes | Arrow columnar decode: `from_arrow_array` and `extract_geometries_from_array` |
+| `assign` | `syscall` | yes | no | `assign_levels_bounded` and `apply_density_budget` at a fixed, CI-sized feature count |
+| `simplify_cascade` | `cpu` | yes | yes | `simplify_cascade` over real polygons through a 10-level chain with a zoom-band `Point` tail |
+| `algorithmic` | `cpu` | yes | yes | Junction matching in `coalesce_level_lines`, adversarial RDP on sawtooth rings, and (with `PHASE1_INPUT`) unchanged-geometry costs (#788) |
+| `mvt_encode` | `cpu` | yes | yes | `encode_polygon`, its over-cap early exit (`antarctica_316k_over_cap`), and `LayerBuilder::add_feature`/`build` |
+| `clipping` | `cpu` | yes | yes | Sutherland-Hodgman against `i_overlay`, plus `export_clip_mix`, the point, line, and polygon mix that export clips per tile |
+| `bbox_containment` | `cpu` | yes | yes | Bounding-box containment fast paths |
+| `hostile_geometry` | `cpu` | no | no | Production clip, raw Sutherland-Hodgman and raw `i_overlay` on clean, invalid and pathological polygons (#205) |
+| `tile_compress_dedup` | `cpu` | yes | yes | Per-tile gzip and the XXH3 tile-content dedup cache |
+| `pipeline` | `syscall` | yes | no | `convert_to_overviews` then `export_pmtiles` on two small real fixtures, single-threaded: the production path end to end |
+| `coverage_fill` | `syscall` | yes | no | `export_pmtiles` with coverage fill off and on, over a 1,500-field Moldova prefix |
+| `assign_scaling` | `syscall` | no | no | Thread-count scaling of level assignment at dataset scale: a plain wall-clock harness, not Criterion |
+<!-- /generated -->
+
+A `syscall` bench writes files or wakes threads in its timed closure.
+CodSpeed's simulation leaves system calls out of its count, so those
+benches run only in the wall-clock gate.
 
 Run one:
 
@@ -238,7 +255,7 @@ cargo bench --package tylertoo-core --bench clipping
 open target/criterion/report/index.html
 ```
 
-`scripts/criterion_compare.sh --list` prints the gated set. Run the
+`scripts/criterion_compare.sh --list` prints the weekly gate's set. Run the
 whole set:
 
 ```bash
@@ -248,8 +265,8 @@ done
 ```
 
 `assign_scaling` measures thread-count scaling at dataset scale. It is a
-plain wall-clock harness, outside Criterion and outside the regression
-gate, because the run is too large and too noisy for repeated sampling:
+plain wall-clock harness, outside Criterion and both gates, because the
+run is too large and too noisy for repeated sampling:
 
 ```bash
 cargo bench --package tylertoo-core \
@@ -262,7 +279,7 @@ the `profiling` Cargo profile and sampling profilers such as samply.
 
 #### CodSpeed
 
-`.github/workflows/codspeed.yml` runs the gated benches under
+`.github/workflows/codspeed.yml` runs the `cpu` benches under
 [CodSpeed](https://codspeed.io). CodSpeed's simulation mode counts
 instructions, weighted by estimated cache cost, rather than timing
 wall-clock. The count does not depend on how busy the shared runner is,
@@ -275,25 +292,26 @@ only what it can move:
 
 - A PR that touches neither `crates/core/` nor the build doesn't start
   the workflow.
-- Otherwise `scripts/codspeed_benches.sh` maps the PR's changed files to
-  the benches whose code they touch, and only those build and run.
-  CodSpeed reports the rest as "skipped", with their baseline numbers.
-  A PR that touches only code no bench covers passes without building.
-- A change to a manifest, the bench harness, or the workflow runs every
-  bench. A `Cargo.lock`-only PR doesn't start the workflow.
-- A push to `main` that touches the same paths, or `Cargo.lock`, runs
-  every bench. Those runs are the baselines; CodSpeed compares a PR
-  against the newest `main` commit that has one.
+- Otherwise `scripts/bench_list.py codspeed` maps the PR's changed files
+  to the benches whose code they touch, through each bench's `paths` in
+  `benches.toml`, and only those build and run. CodSpeed reports the rest
+  as "skipped", with their baseline numbers. A PR that touches only code
+  no bench covers passes without building.
+- A change to a manifest, the bench support code, the bench list, the
+  exemptions or the workflow runs every bench. A `Cargo.lock`-only PR
+  doesn't start the workflow.
+- Every push to `main` runs every CodSpeed bench, whatever it touches.
+  Those runs are the baselines, so a PR always compares against its
+  base commit rather than an older one.
 
-The map in `scripts/codspeed_benches.sh` is kept by hand: each bench's
-entry modules and their direct dependencies. A change that moves a bench
-only through a more distant module shows up in the next run on `main`
-rather than on the PR. When you add a bench, add its entry there; until
-you do, it runs on every `crates/core/` change. To see what a branch
-would run:
+The `paths` are kept by hand: each bench's entry modules and their
+direct dependencies. A change that moves a bench only through a more
+distant module shows up in the next run on `main` rather than on the PR.
+A bench with no `paths` runs on every `crates/core/` change. To see what
+a branch would run:
 
 ```bash
-git diff --name-only origin/main...HEAD | scripts/codspeed_benches.sh
+git diff --name-only origin/main...HEAD | scripts/bench_list.py codspeed
 ```
 
 The benches build against `codspeed-criterion-compat`, renamed to
@@ -353,9 +371,8 @@ bench's mean, with its 95% confidence interval, and applies these rules:
   four runs that compared the same code with itself, no lower bound
   reached +10% outside the Sutherland–Hodgman benches.
 - **Fail at +50% instead** for a bench that matches a `--noisy` glob.
-  The `sutherland_hodgman` benches moved by up to 27% between two runs
-  of the same code, with tight intervals, so +10% would fail them on
-  noise. The workflow step lists the measurements.
+  The globs and the measurements behind each are the `[noisy]` entries
+  in `ci/exemptions.toml`; `scripts/bench_list.py noisy` prints them.
 - **Warn** when the point estimate is +10% or more.
 - Report a bench with no base result as "new (no baseline)", and one with
   no head result as "not run at head". Neither counts toward the gate.
@@ -366,11 +383,11 @@ To run the same check locally:
 
 ```bash
 scripts/criterion_compare.sh origin/main
+mapfile -t globs < <(scripts/bench_list.py noisy)
 uv run python scripts/criterion_gate.py --check \
   --criterion-dir target/criterion-compare \
   --baseline base --warn 10 --fail 10 \
-  --noisy 'sutherland_hodgman/*' \
-  --noisy 'wide_polygon_clip/sutherland_hodgman/*' --noisy-fail 50
+  "${globs[@]/#/--noisy=}" --noisy-fail 50
 ```
 
 ### Hotspots

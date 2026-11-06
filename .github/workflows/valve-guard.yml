@@ -8,9 +8,17 @@
 # re-measure if the runner changes shape.
 # The cell-by-cell comparison with benchmarks/baseline/valve_guard.json
 # (15% slower, 20% heavier) applies only when the runner matches the host the
-# baseline was recorded on (the script compares CPU model and count), so on
-# GitHub's runners this job enforces the ratios, and a developer box with
-# `record` enforces both.
+# baseline was recorded on (the script compares CPU model and count).
+#
+# Two hosts (#810), one matrix leg each:
+#   github  ubuntu-latest (x86, 4 cores): the merge:drop ratio half only.
+#   pinned  the maintainer's 64-core VM, a self-hosted runner labelled
+#           `tylertoo-bench`, where the baseline was recorded: both halves.
+#           The leg exists only while the repository variable
+#           TYLERTOO_BENCH_RUNNER is "true", so nothing queues for a runner
+#           that is not registered. This workflow triggers only on schedule
+#           and workflow_dispatch, never on pull_request, so the self-hosted
+#           runner never runs code from a fork.
 #
 # The #792 input is 238 MB of shapefile, too large to commit. It is rebuilt
 # from the public download (Bayern's Hausumringe, Niederbayern) with the
@@ -19,7 +27,8 @@
 # the guard, not on the download. Moldova comes from the bench-coalesce-v1
 # release, checked against the manifest's sha256.
 #
-# Input failures and guard failures open or update separate issues.
+# Input failures and guard failures open or update separate issues, one set
+# per host.
 
 name: Valve guard
 
@@ -43,13 +52,17 @@ env:
 
 jobs:
   guard:
-    name: Valve guard
-    runs-on: ubuntu-latest
+    name: Valve guard (${{ matrix.host }})
+    strategy:
+      fail-fast: false
+      matrix:
+        host: ${{ fromJSON(vars.TYLERTOO_BENCH_RUNNER == 'true' && '["github","pinned"]' || '["github"]') }}
+    runs-on: ${{ matrix.host == 'pinned' && fromJSON('["self-hosted","tylertoo-bench"]') || 'ubuntu-latest' }}
     timeout-minutes: 90
-    outputs:
-      input_ok: ${{ steps.inputs.outputs.input_ok }}
-      input_error: ${{ steps.inputs.outputs.input_error }}
-      guard_outcome: ${{ steps.guard.outcome }}
+    # issues: the last step opens or updates this host's failure issue.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,10 +73,13 @@ jobs:
         with:
           toolchain: stable
 
+      # The pinned host provides its own; sudo there may need a password.
       - name: Install protoc
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          command -v protoc >/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y protobuf-compiler
+          }
 
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -182,29 +198,22 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: valve-guard
+          name: valve-guard-${{ matrix.host }}
           path: |
             ${{ runner.temp }}/valve-guard.json
             ${{ runner.temp }}/valve-guard.txt
           if-no-files-found: warn
 
-  notify:
-    name: Open or update the input or valve-guard issue
-    runs-on: ubuntu-latest
-    needs: guard
-    if: always() && (needs.guard.outputs.input_ok == 'false' || needs.guard.outputs.guard_outcome == 'failure')
-    permissions:
-      contents: read
-      issues: write
-    steps:
       - name: Open or update the issue
+        if: always() && (steps.inputs.outputs.input_ok == 'false' || steps.guard.outcome == 'failure')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          INPUT_OK: ${{ needs.guard.outputs.input_ok }}
-          INPUT_ERROR: ${{ needs.guard.outputs.input_error }}
-          GUARD_OUTCOME: ${{ needs.guard.outputs.guard_outcome }}
+          INPUT_OK: ${{ steps.inputs.outputs.input_ok }}
+          INPUT_ERROR: ${{ steps.inputs.outputs.input_error }}
+          GUARD_OUTCOME: ${{ steps.guard.outcome }}
+          HOST: ${{ matrix.host == 'pinned' && ' (pinned host)' || '' }}
         run: |
           gh label create benchmark \
             --description "Benchmark lane" \
@@ -239,7 +248,7 @@ jobs:
           and rerun Valve guard; changing the SHA-256 selects a new cache key.
 
           _Managed by .github/workflows/valve-guard.yml. Close after inputs recover._"
-            create_or_update "Valve guard input is unavailable" "$BODY" bug
+            create_or_update "Valve guard input is unavailable$HOST" "$BODY" bug
           fi
 
           if [ "$GUARD_OUTCOME" = failure ]; then
@@ -255,7 +264,7 @@ jobs:
 
           Run: $RUN_URL
 
-          The \`valve-guard\` artifact has the measurements and the guard's
+          The \`valve-guard-<host>\` artifact has the measurements and the guard's
           output. To reproduce on a quiet machine:
 
           \`\`\`
@@ -268,5 +277,5 @@ jobs:
           ---
           _Managed by .github/workflows/valve-guard.yml. Updated, not
           duplicated, on every failing night. Close it after a green night._"
-            create_or_update "Nightly valve guard is failing" "$BODY" optimization
+            create_or_update "Nightly valve guard is failing$HOST" "$BODY" optimization
           fi

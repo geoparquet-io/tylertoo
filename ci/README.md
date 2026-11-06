@@ -38,8 +38,47 @@ Jscpd supplies cross-file token comparison and includes the I/O crate.
 
 Check runs clippy, jscpd and similarity-rs on Python-only code changes.
 Lint runs cargo-deny independently of Rust build classification. Python Quality
-runs vulture. The Gate scripts job contains the single `scripts/ci` pytest
-step, covering the independent archive verifier.
+runs vulture. The Gate scripts job runs the `scripts/ci/tests` pytest step
+(the independent archive verifier, the bench list, the exemptions count, the
+docs generator, and a check that `CI passed` needs every job in `ci.yml`), the
+benchmark harness tests (`benchmarks/test_run_manifest.py`,
+`benchmarks/test_valve_guard.py`, `benchmarks/coalesce/test_run.py`,
+`benchmarks/e2e/test_run_e2e.py`), and `scripts/gen_bench_docs.py --check`,
+which fails when a published benchmark number differs from
+`benchmarks/results/`.
+
+Every job that fetches the `fixtures-v1` release, from the cache or the
+download, then runs `scripts/ci/verify_fixtures.sh`, which fails on any file
+that does not match `benchmarks/fixtures.sha256`.
+
+## Benchmarks and exemptions
+
+`crates/core/benches/benches.toml` is the one bench list.
+`scripts/bench_list.py` reads it for the weekly wall-clock gate
+(`bench-regression.yml` through `scripts/criterion_compare.sh`), for
+CodSpeed's per-PR selection (`codspeed.yml`), and for the generated table in
+`DEVELOPMENT.md`. CodSpeed runs only the CPU-bound benches; it runs on every
+push to `main` so that each PR has a baseline at its base commit.
+
+`ci/exemptions.toml` holds every exemption from every check, each with its
+reason: benches CodSpeed or the weekly gate skip, and the noisy globs the
+weekly gate fails at +50% instead of +10%. `scripts/ci/tests/test_exemptions.py`
+pins the entry count, so a new exemption also changes that test.
+
+| Check | Local command |
+|---|---|
+| Bench list, exemptions, `DEVELOPMENT.md` table | `scripts/bench_list.py check` (`scripts/bench_list.py docs` rewrites the table) |
+| Gate scripts tests | `uv run --no-project --with pytest==8.4.2 --with pmtiles==3.8.1 --with mapbox-vector-tile==2.2.0 --with shapely==2.2.0 --with pyarrow==26.0.0 --with pyyaml==6.0.3 pytest -q scripts/ci/tests` |
+| Harness tests | `uv run --no-project --python 3.12 --with pytest==8.4.2 pytest -q benchmarks/test_run_manifest.py benchmarks/test_valve_guard.py benchmarks/coalesce/test_run.py benchmarks/e2e/test_run_e2e.py` (needs GNU `time`) |
+| Generated docs | `uv run --no-project python scripts/gen_bench_docs.py --check` |
+| Fixtures | `scripts/ci/verify_fixtures.sh tests/fixtures/realdata` |
+
+`valve-guard.yml` runs nightly on `ubuntu-latest`, where only its merge:drop
+ratio half applies. When the repository variable `TYLERTOO_BENCH_RUNNER` is
+`true`, a second leg runs on the maintainer's self-hosted runner (labels
+`self-hosted`, `tylertoo-bench`), where the baseline half applies too. The
+workflow triggers only on `schedule` and `workflow_dispatch`, never on pull
+requests.
 
 The archive e2e workflow still runs its strict invariant matrix and independent
 readers (`pmtiles verify` and `scripts/verify_archive.py`). Feature accounting
