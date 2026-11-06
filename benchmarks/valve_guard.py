@@ -28,15 +28,20 @@ Two kinds of failure, both exit status 1:
             On mimalloc the RSS ratio is about 1.0-1.3x for both sides, so
             only the glibc pair gates on RSS.
   baseline  a cell more than 15% slower or 20% heavier than its entry in
-            benchmarks/baseline/valve_guard.json. Only compared when the
-            baseline's host matches this one (CPU model and count): wall and
-            RSS from another machine mean nothing, so a different host gets
-            the ratio check only, and says so.
+            benchmarks/baseline/valve_guard.json, which holds one baseline
+            per host class (architecture, CPU model, CPU count). Wall and RSS
+            from another class mean nothing, so on a host with no baseline
+            of its class (ubuntu-latest, say) this half reports
+            "baseline: NOT APPLICABLE", never a pass.
+
+Every check ends with two lines, one per half: `ratio: PASS|FAIL` and
+`baseline: PASS|FAIL|NOT APPLICABLE (<why>)`; --json-out records both.
 
     uv run python -I benchmarks/valve_guard.py check \\
         --mim target/release/tylertoo --glibc target/glibc/release/tylertoo \\
         --data ~/bench-data
-    ... record   (same flags) rewrites the baseline for this host
+    ... record   (same flags) rewrites this host class's baseline, keeping
+                 the other classes'
 
 Inputs under --data: 792/buildings.parquet (benchmarks/prepare_792.py makes
 it from the public download) and coalesce/inputs/moldova-hilbert.parquet.
@@ -45,7 +50,6 @@ Standard library only.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import platform
@@ -57,6 +61,9 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import run_manifest as rm  # noqa: E402
 BASELINE = HERE / "baseline" / "valve_guard.json"
 
 RATIO_WALL_MAX = 1.8
@@ -82,24 +89,9 @@ CELLS = {
 RATIO_PAIRS = [("792-def", "792-drop"), ("792-def-glibc", "792-drop-glibc")]
 
 
-def load_run_manifest():
-    spec = importlib.util.spec_from_file_location("run_manifest", HERE / "run_manifest.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["run_manifest"] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def host_key() -> dict:
-    model = ""
-    try:
-        for line in Path("/proc/cpuinfo").read_text().splitlines():
-            if line.startswith(("model name", "Model name", "CPU part")):
-                model = line.split(":", 1)[1].strip()
-                break
-    except OSError:
-        pass
-    return {"machine": platform.machine(), "cpu_model": model, "cpus": os.cpu_count()}
+def host_class_key(host: dict) -> str:
+    """The baseline file's key for a host class (run_manifest.host_class)."""
+    return f"{host['machine']}/{host['cpu_model']}/{host['cpus']}"
 
 
 def command(cell: str, bins: dict, work: Path, prepared: dict) -> list[str]:
@@ -131,7 +123,7 @@ def prepare(bins: dict, data: Path, work: Path) -> dict:
     return {"ov792": str(ov792), "movf0": str(movf0), "moldova": str(moldova)}
 
 
-def measure(rm, cells: list[str], bins: dict, data: Path, rounds: int, gate) -> dict:
+def measure(cells: list[str], bins: dict, data: Path, rounds: int, gate) -> dict:
     caps = {"wall_s": 1800, "rss_gib": 32, "scratch_gib": 30}
     results: dict[str, list[dict]] = {c: [] for c in cells}
     with tempfile.TemporaryDirectory(prefix="valve-guard-", dir=os.environ.get("VALVE_GUARD_TMP")) as tmp:
@@ -158,10 +150,11 @@ def measure(rm, cells: list[str], bins: dict, data: Path, rounds: int, gate) -> 
     return {c: {"wall_s": round(statistics.median(r["wall_s"] for r in rs), 3),
                 "peak_rss_kib": int(statistics.median(r["peak_rss_kib"] for r in rs)),
                 "peak_rss_min_kib": min(r["peak_rss_kib"] for r in rs),
+                "effective_cores": statistics.median(r["effective_cores"] or 0 for r in rs),
                 "rounds": len(rs)} for c, rs in results.items()}
 
 
-def ratio_failures(cells: dict) -> list[str]:
+def ratio_failures(cells: dict) -> list[str]:  # noqa: D103
     bad = []
     for merge, drop in RATIO_PAIRS:
         if merge not in cells or drop not in cells:
@@ -178,10 +171,7 @@ def ratio_failures(cells: dict) -> list[str]:
 
 
 def baseline_failures(cells: dict, baseline: dict) -> list[str]:
-    if baseline.get("host") != host_key():
-        print(f"  baseline recorded on {baseline.get('host')}, this host is {host_key()}: "
-              "cell-by-cell comparison skipped, ratios only")
-        return []
+    """Cells over their limits against one host class's baseline record."""
     bad = []
     for cell, now in cells.items():
         base = baseline["cells"].get(cell)
@@ -201,6 +191,44 @@ def baseline_failures(cells: dict, baseline: dict) -> list[str]:
     return bad
 
 
+def verdict(cells: dict, baseline_doc: dict | None, host: dict) -> dict:
+    """Both halves: the ratio half always, the baseline half only against a
+    baseline recorded on this host class, else `not applicable` and why."""
+    ratio = ratio_failures(cells)
+    out = {"host_class": host_class_key(host),
+           "ratio": {"status": "fail" if ratio else "pass", "failures": ratio}}
+    have = sorted((baseline_doc or {}).get("hosts", {}))
+    base = (baseline_doc or {}).get("hosts", {}).get(host_class_key(host))
+    if base is None:
+        reason = (f"no baseline for host class {host_class_key(host)}; recorded classes: "
+                  f"{', '.join(have) or 'none'}")
+        out["baseline"] = {"status": "not applicable", "reason": reason, "failures": []}
+    else:
+        bad = baseline_failures(cells, base)
+        out["baseline"] = {"status": "fail" if bad else "pass", "failures": bad,
+                           "measured": base.get("measured")}
+    return out
+
+
+def summary_lines(v: dict) -> list[str]:
+    """`ratio: ...` and `baseline: ...`, the two lines a check ends with."""
+    b = v["baseline"]
+    why = f" ({b['reason']})" if b["status"] == "not applicable" else ""
+    return [f"ratio: {v['ratio']['status'].upper()}", f"baseline: {b['status'].upper()}{why}"]
+
+
+def exit_status(v: dict) -> int:
+    """1 when either half failed; `not applicable` is not a failure."""
+    return 1 if v["ratio"]["failures"] or v["baseline"]["failures"] else 0
+
+
+def with_record(baseline_doc: dict | None, record: dict) -> dict:
+    """The baseline file with this host class's entry replaced."""
+    hosts = dict((baseline_doc or {}).get("hosts", {}))
+    hosts[host_class_key(record["host"])] = record
+    return {"hosts": hosts}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["check", "record"])
@@ -214,31 +242,29 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json-out", type=Path, help="also write the measured cells here")
     args = ap.parse_args(argv)
 
-    rm = load_run_manifest()
     bins = {"mim": args.mim.resolve(), "glibc": args.glibc.resolve()}
     for b in bins.values():
         if not b.exists():
             raise SystemExit(f"missing binary {b}")
     gate = rm.Gate(args.load_max, 3600, Path(tempfile.gettempdir()) / "valve-guard-gate.log")
-    cells = measure(rm, args.cells, bins, args.data, args.rounds, gate)
-    record = {"host": host_key(), "hostname": platform.node(), "measured": time.strftime("%F"), "cells": cells,
+    cells = measure(args.cells, bins, args.data, args.rounds, gate)
+    record = {"host": rm.host_class(), "hostname": platform.node(), "measured": time.strftime("%F"), "cells": cells,
               "limits": {"ratio_wall": RATIO_WALL_MAX, "ratio_rss": RATIO_RSS_MAX,
                          "wall": WALL_REGRESSION_MAX, "rss": RSS_REGRESSION_MAX}}
-    if args.json_out:
-        args.json_out.write_text(json.dumps(record, indent=2) + "\n")
+    doc = json.loads(args.baseline.read_text()) if args.baseline.exists() else None
     if args.mode == "record":
         args.baseline.parent.mkdir(parents=True, exist_ok=True)
-        args.baseline.write_text(json.dumps(record, indent=2) + "\n")
-        print(f"wrote {args.baseline}")
-        return 1 if ratio_failures(cells) else 0
-    failures = ratio_failures(cells)
-    if args.baseline.exists():
-        failures += baseline_failures(cells, json.loads(args.baseline.read_text()))
-    else:
-        print(f"  no baseline at {args.baseline}: ratios only")
-    for f in failures:
+        args.baseline.write_text(json.dumps(with_record(doc, record), indent=2) + "\n")
+        print(f"wrote {args.baseline} [{host_class_key(record['host'])}]")
+        doc = with_record(doc, record)
+    v = verdict(cells, doc, record["host"])
+    if args.json_out:
+        args.json_out.write_text(json.dumps({**record, "verdict": v}, indent=2) + "\n")
+    for f in v["ratio"]["failures"] + v["baseline"]["failures"]:
         print(f"FAIL {f}")
-    return 1 if failures else 0
+    for line in summary_lines(v):
+        print(line)
+    return exit_status(v)
 
 
 if __name__ == "__main__":
