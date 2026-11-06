@@ -90,6 +90,26 @@ still helps where polygons stay drawable (Moldova at z5: 22% of the field
 area missing at the default, 13% at 0.25, 12% at 0), but in dense blocks the
 squares themselves overlap and leave gaps regardless of the factor (#750).
 
+Madagascar admin-4 (17,465 polygons, a gap-free coverage) at the coarse
+zooms, where slivers compete with placeholder squares. Missing share of
+the source area, mean over the sampled tiles (`tile_metrics.py`, 128 px per
+tile; 4, 4, 5, 15, and 42 tiles at z4–z8):
+
+| Settings | z4 | z5 | z6 | z7 | z8 |
+|---|---|---|---|---|---|
+| default | 11.78% | 4.46% | 1.73% | 0.64% | 0.29% |
+| `--simplify-factor 0.25` | 2.17% | 0.85% | 0.29% | 0.11% | 0.07% |
+| `--simplify-factor 0` | 0.44% | 0.07% | 0.07% | 0.04% | 0.02% |
+| default + `--coverage-fill` | 0.05% | 0.03% | 0.04% | 0.03% | 0.04% |
+| `--simplify-factor 0` + `--coverage-fill` | 0.02% | 0.01% | 0.02% | 0.01% | 0.01% |
+
+Once `--coverage-fill` closes the placeholder-square gaps, the sliver floor
+at the defaults is 0.03–0.05% of the area at z4–z8, about 40 times less than
+on dense NZ parcels at z12. The 0.3–11.8% missing without the fill is
+mostly the simplification fringe of small admin units and the gaps between
+squares (#750), not slivers between neighbors. The archive grows from
+26.9 MB (default) to 29.3 MB (`0.25`) and 33.5 MB (`0`).
+
 ### What merging does to attributes
 
 Merging follows tippecanoe's `--coalesce-densest-as-needed`. The merged

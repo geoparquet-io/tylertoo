@@ -288,3 +288,33 @@ z10 missed 50.4% at 0.25 and 57.3% at 0, Moldova at z5 31.4% and 41.4%.
 
 With the defaults, dense sub-pixel polygons still appear as overlapping
 squares that can extend into gaps between fields. Issue #750 tracks this behavior.
+
+## Shared-border slivers at z4–z8, Madagascar admin-4 (#450 phase 0)
+
+Release build of `v09/data-checks` (base 9fca046), input
+`madagascar-adm4-hilbert.parquet` (sha256 6f666e18...), `tylertoo tiles
+--min-zoom 0 --max-zoom 12`, scored with `tile_metrics.py --zooms 4,5,6,7,8
+--max-tiles 150`. Missing share of source area, mean over the sampled tiles
+(4, 4, 5, 15, 42 tiles at z4–z8):
+
+| Settings | z4 | z5 | z6 | z7 | z8 | Archive |
+|---|---|---|---|---|---|---|
+| default | 11.78% | 4.46% | 1.73% | 0.64% | 0.29% | 26.9 MB |
+| `--coverage-fill` | 0.05% | 0.03% | 0.04% | 0.03% | 0.04% | 27.3 MB |
+| `--simplify-factor 0.25` | 2.17% | 0.85% | 0.29% | 0.11% | 0.07% | 29.3 MB |
+| `0.25` + `--coverage-fill` | 0.02% | 0.01% | 0.02% | 0.01% | 0.02% | 29.8 MB |
+| `--simplify-factor 0` | 0.44% | 0.07% | 0.07% | 0.04% | 0.02% | 33.5 MB |
+| `0` + `--coverage-fill` | 0.02% | 0.01% | 0.02% | 0.01% | 0.01% | 34.0 MB |
+
+The fill draws the child tiles' area under each tile, so its rows bound the
+slivers: 0.03–0.05% at the defaults. The rest of the loss without the fill
+is placeholder squares and the simplification fringe of small units (#750).
+
+## #748 re-run, FTW Moldova (631,910 polygons)
+
+Same repro as the issue (gpio 1.7.0 Hilbert sort, `overview --min-zoom 0
+--max-zoom 12`, `export-pmtiles`, defaults) on 9fca046: `check_validity.py`
+finds 0 invalid polygon features at every zoom (z0–z12, 2,079,518 features
+checked in total; the issue had 480 at z4–z11). The export reports 10,002
+RingsCross, 1,141 PartsOverlap, 2,668 CollapsedRing, 36 DisconnectedInterior
+and 58,525 RingSelfTouch tile-space repairs.
