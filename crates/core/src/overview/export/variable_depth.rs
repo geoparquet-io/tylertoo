@@ -1624,7 +1624,7 @@ mod tests {
 
     // --- the probe -----------------------------------------------------------
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
 
     use prost::Message;
 
@@ -1974,6 +1974,114 @@ mod tests {
         assert_eq!(export_events(&on), export_events(&off));
         assert_eq!(on.source_losses, off.source_losses);
         assert_eq!(tiles, read_tiles(&off_path));
+    }
+
+    /// A tile's features' integer `id`s.
+    fn ids(tile: &Tile) -> Vec<i64> {
+        let layer = &tile.layers[0];
+        let key = layer.keys.iter().position(|k| k == "id").unwrap() as u32;
+        layer
+            .features
+            .iter()
+            .filter_map(|f| {
+                let kv = f.tags.chunks(2).find(|kv| kv[0] == key)?;
+                let v = &layer.values[kv[1] as usize];
+                v.int_value
+                    .or(v.sint_value)
+                    .or(v.uint_value.map(|u| i64::try_from(u).unwrap()))
+            })
+            .collect()
+    }
+
+    /// Parity with tippecanoe 2.79.0 on `tests/fixtures/variable-depth`, in
+    /// its configuration (`-r1`: every point at every zoom, so thinning and
+    /// the density budget off here). The stop sets need not match: the caps
+    /// differ (tippecanoe's `-O 1000` features against our byte caps) and
+    /// so does the precision (world 30 against world 26). What must hold is
+    /// the contract, and that every point the finest tiles draw is drawn
+    /// where its branch ends, under the default caps and under a raw cap
+    /// near 1,000 of these points (29 bytes each at the canonical extent).
+    ///
+    /// Measured: tippecanoe stops 115 tiles at z10-z13 (header z14). With
+    /// the default caps all 9,598 points (278 KB raw) fit one z3 tile, so
+    /// that is the only stop and the header is z3. Under the 29,000-byte
+    /// raw cap 25 tiles stop, 6 of them in tippecanoe's set, header z14:
+    /// ours stop coarser, one of our stops covering several of theirs.
+    #[test]
+    fn tippecanoe_parity_fixture_keeps_the_contract() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/variable-depth");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture.join("manifest.json")).unwrap())
+                .unwrap();
+        let max_zoom = u8::try_from(manifest["canonical_maxzoom"].as_u64().unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ov = dir.path().join("ov.parquet");
+        let mut convert = ConvertOptions::default();
+        convert.density.enabled = false;
+        convert.assign.point_thinning = 0.0;
+        convert_to_overviews(
+            fixture.join("points.parquet"),
+            &ov,
+            &ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom,
+                },
+                ..convert
+            },
+        )
+        .unwrap();
+        let theirs: HashSet<(u8, u32, u32)> = manifest["runs"]["tippecanoe"]["stopped_tiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let n = |i: usize| u32::try_from(t[i].as_u64().unwrap()).unwrap();
+                (u8::try_from(n(0)).unwrap(), n(1), n(2))
+            })
+            .collect();
+        assert_eq!(theirs.len(), 115);
+        let rows = usize::try_from(manifest["input"]["rows"].as_u64().unwrap()).unwrap();
+
+        for (opts, expect) in [(ExportOptions::default(), 3), (raw_cap(29_000), max_zoom)] {
+            // The finest tiles of the export without variable depth, under
+            // the same caps (so with the same valve at the finest zoom).
+            let off = dir.path().join("off.pmtiles");
+            export_pmtiles(&ov, &off, &opts).unwrap();
+            let all: HashSet<i64> = read_tiles(&off)
+                .iter()
+                .filter(|(&(z, ..), _)| z == max_zoom)
+                .flat_map(|(_, t)| ids(t))
+                .collect();
+            let (report, tiles) = export_vd(&ov, opts);
+            assert_contract(&tiles, max_zoom);
+            let deepest = tiles.keys().map(|&(z, ..)| z).max().unwrap();
+            let out = ov.with_extension("vd.pmtiles");
+            assert_eq!(ArchiveIndex::open(&out).unwrap().header().max_zoom, deepest);
+            assert_eq!(
+                report.variable_depth.as_ref().unwrap().stored_max_zoom,
+                Some(deepest)
+            );
+            // Every point is drawn in the tile its branch ends at.
+            let stops = stopped(&tiles, max_zoom);
+            let drawn: HashSet<i64> = tiles
+                .iter()
+                .filter(|(&(z, x, y), _)| z == max_zoom || stops.contains(&(z, x, y)))
+                .flat_map(|(_, t)| ids(t))
+                .collect();
+            // A stopped tile can also hold buffer points that a valved
+            // neighbor at the finest zoom dropped.
+            assert!(all.is_subset(&drawn));
+            assert!(drawn.len() <= rows);
+            assert!(!stops.is_empty());
+            assert_eq!(deepest, expect);
+            log::info!(
+                "parity: {} stopped, {} in tippecanoe's set",
+                stops.len(),
+                stops.iter().filter(|t| theirs.contains(t)).count()
+            );
+        }
     }
 
     /// A candidate's extent, buffer included, stays inside the MVT
