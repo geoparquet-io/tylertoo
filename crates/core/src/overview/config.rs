@@ -178,6 +178,16 @@ pub enum ConfigError {
         /// What is wrong with the spec.
         message: String,
     },
+    /// #803: a variable-depth export combined with something its stop rule
+    /// cannot honour. Refused before any output is written.
+    #[error(
+        "--generate-variable-depth-tile-pyramid / variable_depth does not support {conflict}; \
+         omit one of them"
+    )]
+    VariableDepthConflict {
+        /// What conflicts, as the caller spelled it or the file records it.
+        conflict: String,
+    },
     /// More than one of `--collapse`, `--collapse-square` and
     /// `--no-collapse` (#279, #745).
     #[error("--collapse, --collapse-square and --no-collapse are mutually exclusive")]

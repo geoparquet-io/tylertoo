@@ -1684,6 +1684,8 @@ pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide
 pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide::buffer: u32
 pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide::max: u32
 pub tylertoo_core::overview::config::ConfigError::TileRangeWithShard
+pub tylertoo_core::overview::config::ConfigError::VariableDepthConflict
+pub tylertoo_core::overview::config::ConfigError::VariableDepthConflict::conflict: alloc::string::String
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::config::ConfigError
 pub fn tylertoo_core::overview::config::ConfigError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::Error
@@ -2453,6 +2455,7 @@ pub tylertoo_core::overview::export::ExportOptions::spill_dir: core::option::Opt
 pub tylertoo_core::overview::export::ExportOptions::tile_buffer: u32
 pub tylertoo_core::overview::export::ExportOptions::tile_range: core::option::Option<tylertoo_core::shard::TileRange>
 pub tylertoo_core::overview::export::ExportOptions::tile_size_limit: core::option::Option<usize>
+pub tylertoo_core::overview::export::ExportOptions::variable_depth: bool
 pub tylertoo_core::overview::export::ExportOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::export::ExportOptions::validate(&self) -> core::result::Result<tylertoo_core::overview::config::ValidatedConfig<'_, Self>, tylertoo_core::overview::config::ConfigError>

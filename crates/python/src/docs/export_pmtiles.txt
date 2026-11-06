@@ -54,6 +54,12 @@ Args:
         the area its child tiles cover, so a polygon coverage shows
         no holes at coarse zooms. Holds the finest level's geometry
         in memory. See `docs/OVERVIEW_TUNING.md`.
+    variable_depth: End each branch of the tile pyramid at the
+        coarsest zoom whose tile holds all of that area's finest-level
+        features within both size caps, like tippecanoe's
+        `--generate-variable-depth-tile-pyramid`. The server must serve
+        the nearest ancestor for a missing tile. See
+        `docs/OVERVIEW_TUNING.md`.
     tile_range: Export only the tiles in this tile-id range,
         `"LO..HI"`: one shard of a sharded build.
     zoom_ceiling: Export only the tiles at or below this zoom: the

@@ -205,6 +205,7 @@ export_pmtiles(
     size_valve: Literal['merge', 'drop'] = "merge",
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     coverage_fill: bool = False,
+    variable_depth: bool = False,
     tile_range: str | None = None,
     zoom_ceiling: int | None = None,
 ) -> ExportReport
@@ -236,6 +237,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and `0` or `None` is no limit.
 * `coverage_fill`: Experimental: under each tile's features, draw the area its child tiles cover, so a polygon coverage shows no holes at coarse zooms. Holds the finest level's geometry in memory. See `docs/OVERVIEW_TUNING.md`.
+* `variable_depth`: End each branch of the tile pyramid at the coarsest zoom whose tile holds all of that area's finest-level features within both size caps, like tippecanoe's `--generate-variable-depth-tile-pyramid`. The server must serve the nearest ancestor for a missing tile. See `docs/OVERVIEW_TUNING.md`.
 * `tile_range`: Export only the tiles in this tile-id range, `"LO..HI"`: one shard of a sharded build.
 * `zoom_ceiling`: Export only the tiles at or below this zoom: the coarse job of a sharded build.
 
@@ -438,6 +440,7 @@ convert(
     size_valve: Literal['merge', 'drop'] = "merge",
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     coverage_fill: bool = False,
+    variable_depth: bool = False,
     gsds: Sequence[float] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     name: str | None = None,
@@ -517,6 +520,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `size_valve`: See `export_pmtiles()`.
 * `max_compressed_tile_size`: See `export_pmtiles()`. `"auto"` is no limit with `verbatim`.
 * `coverage_fill`: See `export_pmtiles()`.
+* `variable_depth`: See `export_pmtiles()`.
 * `gsds`: See `overview()`.
 * `bbox`: See `overview()`.
 * `name`: See `export_pmtiles()`.

@@ -470,6 +470,8 @@ impl<T: Args + Default> FromArgMatches for FacadeArgs<T> {
 }
 
 #[derive(Parser, Debug)]
+// #803: a pyramid refuses variable depth (bands), so it does not offer it.
+#[command(mut_arg("variable_depth", |arg| arg.hide(true)))]
 pub struct PyramidArgs {
     /// Output PMTiles archive.
     pub output: PathBuf,

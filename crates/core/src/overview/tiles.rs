@@ -404,6 +404,10 @@ impl TilesOptions {
             ("--size-valve", e.size_valve != defaults.size_valve),
             ("--coverage-fill", e.coverage_fill != defaults.coverage_fill),
             (
+                "--generate-variable-depth-tile-pyramid",
+                e.variable_depth != defaults.variable_depth,
+            ),
+            (
                 "--no-simple-clip-fastpath",
                 e.simple_clip_fastpath != defaults.simple_clip_fastpath,
             ),
@@ -459,6 +463,9 @@ impl TilesOptions {
         }
         self.convert.validate().map_err(TilesError::Convert)?;
         self.export.validate()?;
+        if self.export.variable_depth {
+            super::export::variable_depth::check_convert(&self.convert, self.shard.is_some())?;
+        }
         check_ignored_export_fields(&self.export, "tiles", &FACADE_OWNED_EXPORT_FIELDS)?;
         check_keep_overview(self.keep_overview.as_deref())?;
         // #386/#443: the property selection is applied at convert, so an

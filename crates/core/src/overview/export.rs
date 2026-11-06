@@ -154,6 +154,7 @@ mod tile_data;
 use tile_data::TileData;
 
 mod coverage_fill;
+pub(crate) mod variable_depth;
 use coalesce_valve::RowGapCursor;
 struct PartitionBudget {
     partition_target: usize,
@@ -389,6 +390,16 @@ pub struct ExportOptions {
     #[cfg_attr(feature = "cli", arg(long))]
     #[cfg_attr(feature = "cli", arg(help = "Fill the holes that dense small polygons (parcels, fields, small admin units) leave at coarse zooms: under each tile's features, also draw the area its child tiles cover, with the attributes of one feature it sits under, in the room the tile's own features leave. Adds 10–17% to build time on dense coverages, about 1.5x on scattered sub-pixel fields (which it may also over-draw), and holds the finest level's geometry in memory. A sharded build's coarse job draws it; data shards (`--tile-range`) do not", long_help = None))]
     pub coverage_fill: bool,
+    /// #803: end each branch of the pyramid at the coarsest zoom whose tile
+    /// can carry every canonical feature under it within both size caps,
+    /// tippecanoe's `--generate-variable-depth-tile-pyramid`. The archive's
+    /// header max zoom is then the deepest tile written, and a server must
+    /// fall back to the nearest ancestor tile for a missing one. Default
+    /// `false`; see `export/variable_depth.rs` for the stop rule and the
+    /// options it refuses.
+    #[cfg_attr(feature = "cli", arg(long = "generate-variable-depth-tile-pyramid"))]
+    #[cfg_attr(feature = "cli", arg(help = "Stop each branch of the tile pyramid at the coarsest zoom whose tile holds all of that area's finest-level features within both size caps, like tippecanoe's flag of the same name. Fewer, larger tiles; the server must serve the nearest ancestor for a missing tile. Off by default", long_help = None))]
+    pub variable_depth: bool,
     /// Skip the `i_overlay` boundary-bridge fallback for features whose rings are
     /// already proven simple (issue #239). On a simple ring, Sutherland–Hodgman's
     /// boundary-following clip is a self-touching polygon that is area- and
@@ -593,6 +604,7 @@ impl Default for ExportOptions {
             compressed_tile_size_limit: Some(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT),
             size_valve: SizeValve::Merge,
             coverage_fill: false,
+            variable_depth: false,
             simple_clip_fastpath: true,
             partition_wave: PARTITION_WAVE_AUTO,
             feature_order: FeatureOrder::default(),
@@ -680,6 +692,7 @@ impl ExportOptions {
         }
         // #427: fail fast on a bad spill dir, the convert side's rule.
         super::config::check_spill_dir(self.spill_dir.as_deref())?;
+        variable_depth::check_options(self)?;
         // Publication strings that cannot fit an archive's metadata would
         // otherwise fail only when the first checkpoint is assembled.
         check_metadata_size(&self.metadata)
@@ -2120,6 +2133,9 @@ fn export_pmtiles_validated(
 
     let reader = OverviewReader::open(input_path)?;
     let meta = reader.meta().clone();
+    if options.variable_depth {
+        variable_depth::check_file(&meta, reader.mode())?;
+    }
     let crs = crs_from_descriptor(reader.resolved_schema(), input_path, diagnostics)?;
 
     let num_levels = reader.num_levels();

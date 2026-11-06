@@ -1648,6 +1648,14 @@ impl PyramidOptions {
             .map_err(|e| Error::InvalidConfig(format!("band convert options: {e}")))?;
         self.export.validate()?;
         check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
+        if self.export.variable_depth {
+            return Err(
+                crate::overview::config::ConfigError::VariableDepthConflict {
+                    conflict: "pyramid bands".to_string(),
+                }
+                .into(),
+            );
+        }
         Ok(())
     }
 }
