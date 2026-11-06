@@ -530,10 +530,6 @@ Similarity-rs scans every production Rust source directory and fails on
 functions above its configured similarity threshold. Version 0.5.0 compares
 functions within files; jscpd supplies cross-file token-clone detection.
 
-The blocking mutation check runs cargo-mutants directly with `--in-diff`
-for core and CLI. A missed mutant or a failed baseline fails the check.
-Run it locally with `scripts/mutants-diff.sh origin/main`.
-
 ### Python (`crates/python`)
 
 Run everything through **uv**, never bare `python` or `pip`:
@@ -803,113 +799,7 @@ The Version Consistency job checks all five. Move versions only with
 
 ## Scheduled and advisory jobs
 
-These jobs don't block a merge, with one exception: the Mutation gate
-blocks every code PR.
-
-### Mutation testing
-
-The CI plan calls `.github/workflows/mutation-diff.yml` for code PRs.
-Its "Mutants (workspace diff, shard N)" jobs run
-`scripts/mutants-diff.sh HEAD^1`: the diff is against the first parent
-of the checked-out PR merge commit. The script selects the whole
-workspace, including the I/O owner and Python bindings, with all features
-and locked dependencies. It uses `.cargo/mutants-cli.toml`, whose build
-arguments have no package-specific test targets, and passes `--workspace`
-to Cargo so the baseline and each mutant build and run every consumer's
-Rust tests.
-Only mutation sites on changed lines are selected by `--in-diff`.
-CI adds `--cap-lints true` so a mutation that leaves an unused variable
-reaches the tests instead of failing on the repository's strict lints.
-The ordinary clippy gate still denies warnings.
-
-The plan job lists that set with `scripts/mutants-diff.sh HEAD^1 --list --json`
-and the gate's flags, without compiling. It cuts a nonempty set into
-`N = ceil(mutants / 40)` round-robin slices (`--sharding round-robin
---shard k/N`, zero-based) and runs at most four of them, two workers
-each: the organization runs 20 jobs at once across every PR, and a core
-PR's CI already holds about 13. Up to 160 mutants, that is the whole
-diff. Past 160, slices 0–3 run: a fixed sample spread across the whole
-diff by the round-robin split, identical on every run, which the plan
-job's summary reports as "running slices [0,1,2,3] of N". The weekly
-`mutation-tests.yml` sweep covers the rest. `cargo-mutants` is pinned to
-27.1.0 in both planning and testing so every shard enumerates the same
-set. Each job has a 90-minute limit, including setup and the baseline.
-Fail-fast is disabled so one failed shard does not cancel the others.
-
-The direct cargo-mutants exit status gates every code PR through
-"CI passed", regardless of title. Missed mutants, timeouts, baseline
-failures and cancelled jobs cannot produce a passing gate. The script and
-workflow do not interpret issue-linked equivalent-mutant comments. Each shard uploads its
-`mutants.out/` directory as `mutation-diff-N`, even after failure when
-results are available. The workflow adds no score summary or PR comment.
-An empty mutation selection starts no shard runners. The final "Mutation gate"
-job reports "No mutants in this diff" and succeeds only after successful
-planning; failed or cancelled planning or mutation jobs fail the gate.
-
-`scripts/mutants-diff.sh` also runs locally. It defaults to `origin/main`
-and uses `git diff --no-ext-diff --no-renames BASE`, including tracked
-uncommitted changes. The diff omits untracked files; stage
-them or use `git add -N` first. Extra arguments go directly to
-cargo-mutants, whose exit status is preserved (2 for missed mutants,
-3 for timeouts):
-
-```bash
-scripts/mutants-diff.sh              # vs origin/main
-scripts/mutants-diff.sh main -j 2    # base, extra cargo-mutants args
-scripts/mutants-diff.sh main --cap-lints true --sharding round-robin --shard 0/64 -j 2
-```
-
-The weekly job (`.github/workflows/mutation-tests.yml`, Sundays) runs
-`cargo mutants` over the whole `tylertoo-core` crate, in shards.
-`.cargo/mutants.toml` points it at the `mutants` nextest profile, which
-inherits `quick`'s filter, so marking a test slow also drops it from
-every mutant's test run. Missed mutants and timeouts show up as the
-score in the job summary, not as a red run. If a failed baseline or a
-timed-out shard leaves part of the run unmeasured, the job opens or
-updates a pinned `mutation-tests` issue. Close that issue only after a
-full green scheduled run, never after a subset (#677). To test a
-workflow fix without a full sweep, dispatch a subset of shards:
-
-```bash
-gh workflow run mutation-tests.yml -f shard_list=0,1
-```
-
-`.cargo/mutants.toml` also lists the test binaries to build. After you
-add an integration test binary under `crates/core/tests/` or mark one
-slow, run `scripts/mutants-test-binaries.sh` and paste its output there.
-Its `--check` flag reports whether you need to, and the Test job runs
-that check.
-
-To reproduce locally, with the submodule and fixtures in place:
-
-```bash
-cargo install cargo-mutants cargo-nextest --locked
-# What would mutate
-cargo mutants --package tylertoo-core --list
-# Narrow mutations to one file
-cargo mutants --package tylertoo-core \
-  -f crates/core/src/overview/simplify.rs
-# One function's mutants
-cargo mutants --package tylertoo-core -F 'fn_name'
-# Only code this branch touched
-cargo mutants --package tylertoo-core \
-  --in-diff <(git diff main...HEAD)
-# The full core sweep
-cargo mutants --package tylertoo-core
-```
-
-cargo-mutants copies the tree into a scratch directory without
-`target/`, so each run above starts with a clean build of the
-dependencies at `opt-level = 3`. For a short local run, add
-`--in-place`. cargo-mutants then mutates your working tree, reuses its
-`target/`, and restores each file at the end, so leave the tree alone
-while it runs.
-
-cargo-mutants does not automatically select tests by mutated file. Narrowing them
-by hand loses catches. In a 30-mutant sample, 11 of 28 catches came from
-a test in *another* module or an integration binary. Run the whole
-`mutants` set, and narrow the *mutants* with `-f`, `-F`, or `--in-diff`
-instead.
+These jobs don't block a merge.
 
 ### Fuzzing
 
