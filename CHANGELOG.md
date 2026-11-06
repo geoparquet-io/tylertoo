@@ -35,7 +35,8 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are gone; archive, write and pyramid failures are `ArchiveError`,
   `WriteError` and `PyramidError`. `GeoParquetRead` and `InvalidConfig`
   carry typed reasons instead of strings, and a hostile page header has its
-  own variant. One classifier, `ErrorKind`, maps every error to a CLI exit
+  own variant; its CLI message now reads "arrow error: External error:
+  unexpected end of file" (was "Parquet argument error: External: …"). One classifier, `ErrorKind`, maps every error to a CLI exit
   code and a Python exception.
   - Pyramid errors take the class of their cause: a band archive mismatch
     raises `ValueError` (was `RuntimeError`); a band whose input or memory

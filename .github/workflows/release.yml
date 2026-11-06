@@ -540,5 +540,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           print-hash: true
+          # A rerun after a partial release must not fail on wheels already uploaded.
+          skip-existing: true
           # Uses trusted publishing (OIDC) by default
           # Falls back to PYPI_API_TOKEN if trusted publishing not configured
