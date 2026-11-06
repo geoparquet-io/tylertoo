@@ -77,7 +77,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3", "std"] }
 fast_hilbert = "2.1"
 # Orphan-cell nearest lookup (overview/cluster.rs); 0.12 is the version geo
 # already pulls in.
-rstar = "0.12"
+rstar = "0.14"
 serde = { workspace = true }
 serde_path_to_error = "0.1"
 # 1.0.129: Value::sort_all_objects (overview/writer.rs).
