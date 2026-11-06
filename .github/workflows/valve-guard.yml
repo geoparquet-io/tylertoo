@@ -1,8 +1,11 @@
 # Size-valve wall and RSS guard (#792, #772) — nightly, not a required check.
 #
 # benchmarks/valve_guard.py times the cells the size valve regressed on and
-# fails when merge:drop on #792 passes 1.7x wall or 1.5x peak RSS. Those
-# ratios hold on any machine, which is why they can gate on a shared runner.
+# fails when merge:drop on #792 passes 1.8x wall or 1.5x peak RSS. The limits
+# were measured at 64 cores and at 4 cores (taskset -c 0-3, as on ubuntu-latest):
+# 6c3cec4 reads 2.0-2.1x wall at both, the fixed code 1.45-1.64x at both. The
+# ratio does move with core count, so these are not machine independent;
+# re-measure if the runner changes shape.
 # The cell-by-cell comparison with benchmarks/baseline/valve_guard.json
 # (15% slower, 20% heavier) applies only when the runner matches the host the
 # baseline was recorded on (the script compares CPU model and count), so on
@@ -16,7 +19,7 @@
 # the guard, not on the download. Moldova comes from the bench-coalesce-v1
 # release, checked against the manifest's sha256.
 #
-# A failing night opens or updates one issue, as fuzz.yml does.
+# Input failures and guard failures open or update separate issues.
 
 name: Valve guard
 
@@ -43,6 +46,10 @@ jobs:
     name: Valve guard
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    outputs:
+      input_ok: ${{ steps.inputs.outputs.input_ok }}
+      input_error: ${{ steps.inputs.outputs.input_error }}
+      guard_outcome: ${{ steps.guard.outcome }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -69,39 +76,92 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-valve-guard-${{ hashFiles('Cargo.lock') }}
 
-      - name: Cache the #792 input
+      - name: Restore the #792 input
         id: cache-792
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0, restore sub-path
         with:
           path: ${{ env.DATA }}/792
           key: valve-guard-792-${{ env.SRC_792_SHA256 }}-${{ hashFiles('benchmarks/prepare_792.py') }}-${{ env.DUCKDB }}
 
-      - name: Cache the Moldova input
-        id: cache-moldova
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.DATA }}/coalesce/inputs
-          key: valve-guard-moldova-${{ env.MOLDOVA_SHA256 }}
-
       - name: Rebuild the #792 input from the public download
+        id: prepare-792
         if: steps.cache-792.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
         run: |
+          failure="$SRC_792_URL: download failed (expected SHA-256 $SRC_792_SHA256)"
+          trap 'echo "::error title=Valve guard input unavailable::$failure"; echo "error=$failure" >> "$GITHUB_OUTPUT"' ERR
           mkdir -p "$DATA/792/dl"
           curl --fail --location --retry 3 -o "$DATA/792/dl/src.zip" "$SRC_792_URL"
-          echo "$SRC_792_SHA256  $DATA/792/dl/src.zip" | sha256sum -c -
+          got=$(sha256sum "$DATA/792/dl/src.zip")
+          got=${got%% *}
+          failure="$SRC_792_URL: SHA-256 mismatch (expected $SRC_792_SHA256, got $got)"
+          test "$got" = "$SRC_792_SHA256"
+          failure="$SRC_792_URL: unpack/prepare failed (verified SHA-256 $got); see the prepare step log"
           unzip -q -o "$DATA/792/dl/src.zip" -d "$DATA/792/shp"
           uv run --with "$DUCKDB" python -I benchmarks/prepare_792.py \
             "$DATA/792/shp/hausumringe.shp" "$DATA/792/buildings.parquet"
           rm -rf "$DATA/792/dl" "$DATA/792/shp"
 
+      - name: Save the #792 input
+        if: steps.cache-792.outputs.cache-hit != 'true' && steps.prepare-792.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0, save sub-path
+        with:
+          path: ${{ env.DATA }}/792
+          key: ${{ steps.cache-792.outputs.cache-primary-key }}
+
+      - name: Restore the Moldova input
+        id: cache-moldova
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0, restore sub-path
+        with:
+          path: ${{ env.DATA }}/coalesce/inputs
+          key: valve-guard-moldova-${{ env.MOLDOVA_SHA256 }}
+
       - name: Fetch Moldova
+        id: prepare-moldova
         if: steps.cache-moldova.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
         run: |
+          failure="$MOLDOVA_URL: download failed (expected SHA-256 $MOLDOVA_SHA256)"
+          trap 'echo "::error title=Valve guard input unavailable::$failure"; echo "error=$failure" >> "$GITHUB_OUTPUT"' ERR
           mkdir -p "$DATA/coalesce/inputs"
           curl --fail --location --retry 3 -o "$DATA/coalesce/inputs/moldova-hilbert.parquet" "$MOLDOVA_URL"
-          echo "$MOLDOVA_SHA256  $DATA/coalesce/inputs/moldova-hilbert.parquet" | sha256sum -c -
+          got=$(sha256sum "$DATA/coalesce/inputs/moldova-hilbert.parquet")
+          got=${got%% *}
+          failure="$MOLDOVA_URL: SHA-256 mismatch (expected $MOLDOVA_SHA256, got $got)"
+          test "$got" = "$MOLDOVA_SHA256"
+
+      - name: Save the Moldova input
+        if: steps.cache-moldova.outputs.cache-hit != 'true' && steps.prepare-moldova.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0, save sub-path
+        with:
+          path: ${{ env.DATA }}/coalesce/inputs
+          key: ${{ steps.cache-moldova.outputs.cache-primary-key }}
+
+      - name: Check input readiness
+        id: inputs
+        env:
+          INPUT_792_OK: ${{ steps.cache-792.outputs.cache-hit == 'true' || steps.prepare-792.outcome == 'success' }}
+          INPUT_MOLDOVA_OK: ${{ steps.cache-moldova.outputs.cache-hit == 'true' || steps.prepare-moldova.outcome == 'success' }}
+          INPUT_792_ERROR: ${{ steps.prepare-792.outputs.error }}
+          INPUT_MOLDOVA_ERROR: ${{ steps.prepare-moldova.outputs.error }}
+        run: |
+          if [ "$INPUT_792_OK" = true ] && [ "$INPUT_MOLDOVA_OK" = true ]; then
+            echo "input_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "input_ok=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "input_error<<INPUT_ERRORS"
+              echo "$INPUT_792_ERROR"
+              echo "$INPUT_MOLDOVA_ERROR"
+              echo "INPUT_ERRORS"
+            } >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
 
       - name: Build the CLI on mimalloc and on glibc
+        if: steps.inputs.outputs.input_ok == 'true'
         run: |
           cargo build --release --locked -p tylertoo
           cp target/release/tylertoo "$RUNNER_TEMP/tylertoo-mim"
@@ -110,6 +170,8 @@ jobs:
 
       - name: Check the valve
         id: guard
+        if: steps.inputs.outputs.input_ok == 'true'
+        shell: bash
         run: |
           uv run python -I benchmarks/valve_guard.py check \
             --mim "$RUNNER_TEMP/tylertoo-mim" --glibc "$RUNNER_TEMP/tylertoo-glibc" \
@@ -127,10 +189,10 @@ jobs:
           if-no-files-found: warn
 
   notify:
-    name: Open or update the valve-guard issue
+    name: Open or update the input or valve-guard issue
     runs-on: ubuntu-latest
     needs: guard
-    if: always() && needs.guard.result == 'failure'
+    if: always() && (needs.guard.outputs.input_ok == 'false' || needs.guard.outputs.guard_outcome == 'failure')
     permissions:
       contents: read
       issues: write
@@ -140,15 +202,56 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          INPUT_OK: ${{ needs.guard.outputs.input_ok }}
+          INPUT_ERROR: ${{ needs.guard.outputs.input_error }}
+          GUARD_OUTCOME: ${{ needs.guard.outputs.guard_outcome }}
         run: |
           gh label create benchmark \
             --description "Benchmark lane" \
             --color 0E8A16 2>/dev/null || true
 
-          TITLE="Nightly valve guard is failing"
-          BODY="The scheduled valve guard (benchmarks/valve_guard.py) failed:
-          merge:drop on the #792 export passed 1.7x wall or 1.5x peak RSS, a
-          cell regressed against its baseline, or the run itself broke.
+          create_or_update() {
+            local title="$1" body="$2" kind="$3" existing
+            existing=$(gh issue list --label benchmark --state open \
+              --json number,title \
+              --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --body "$body" --add-label "P2,$kind"
+              gh issue comment "$existing" --body "Still failing as of $RUN_URL"
+            else
+              gh issue create --title "$title" --label "benchmark,P2,$kind" --body "$body"
+            fi
+          }
+
+          if [ "$INPUT_OK" = false ]; then
+            BODY="Impact: P2. The nightly valve guard cannot check performance when
+          a benchmark input cannot be downloaded, verified, or prepared.
+          Workaround: repoint the input URL and SHA-256 in this workflow.
+
+          This is not a valve regression. Input preparation failed:
+          $INPUT_ERROR
+
+          Run: $RUN_URL
+
+          For #792, repoint SRC_792_URL to an accessible copy of the source zip
+          and set SRC_792_SHA256 to that copy's verified SHA-256. For Moldova,
+          update MOLDOVA_URL and MOLDOVA_SHA256. Commit the workflow change
+          and rerun Valve guard; changing the SHA-256 selects a new cache key.
+
+          _Managed by .github/workflows/valve-guard.yml. Close after inputs recover._"
+            create_or_update "Valve guard input is unavailable" "$BODY" bug
+          fi
+
+          if [ "$GUARD_OUTCOME" = failure ]; then
+            BODY="Impact: P2. The nightly performance check failed; users exporting
+          the benchmark workloads may see higher wall time or peak RSS.
+          Workaround: inspect the measurements and reproduce as shown below.
+
+          The scheduled valve guard (benchmarks/valve_guard.py) failed.
+          Inspect its output for the failing check or command:
+          merge:drop on the #792 export passed 1.8x wall or 1.5x peak RSS, a
+          cell regressed against its baseline, or the guard could not complete
+          its measurements.
 
           Run: $RUN_URL
 
@@ -158,20 +261,12 @@ jobs:
           \`\`\`
           cargo build --release -p tylertoo
           cargo build --release -p tylertoo --no-default-features --target-dir target/glibc
-          uv run python -I benchmarks/valve_guard.py check \\\\
+          uv run python -I benchmarks/valve_guard.py check \\
             --mim target/release/tylertoo --glibc target/glibc/release/tylertoo
           \`\`\`
 
           ---
           _Managed by .github/workflows/valve-guard.yml. Updated, not
           duplicated, on every failing night. Close it after a green night._"
-
-          EXISTING=$(gh issue list --label benchmark --state open \
-            --json number,title \
-            --jq "map(select(.title == \"$TITLE\")) | .[0].number // empty")
-          if [ -n "$EXISTING" ]; then
-            gh issue edit "$EXISTING" --body "$BODY"
-            gh issue comment "$EXISTING" --body "Still failing as of $RUN_URL"
-          else
-            gh issue create --title "$TITLE" --label benchmark --body "$BODY"
+            create_or_update "Nightly valve guard is failing" "$BODY" optimization
           fi

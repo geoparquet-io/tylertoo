@@ -17,10 +17,16 @@ gate measures:
 Two kinds of failure, both exit status 1:
 
   ratio     merge:drop on #792 (792-def over 792-drop, and the glibc pair)
-            above RATIO_WALL_MAX (1.7x) wall or RATIO_RSS_MAX (1.5x) peak RSS.
-            Needs no baseline and does not depend on the machine. On 6c3cec4
-            it read 2.0x wall and 3.1x glibc RSS; with the valve fixes about
-            1.6x and under 1.2x.
+            above RATIO_WALL_MAX (1.8x) wall or RATIO_RSS_MAX (1.5x) peak RSS.
+            Needs no baseline. The limits were set from measurements at 64
+            cores and at 4 cores (`taskset -c 0-3`, like ubuntu-latest), not
+            assumed machine independent: the ratio moves with core count.
+            Wall, merge:drop (mimalloc / glibc): 6c3cec4 2.04x / 2.02x at 64
+            cores and 2.13x / 2.10x at 4; this head 1.64x / 1.55x at 64 and
+            1.47x / 1.45x at 4. glibc peak RSS: 6c3cec4 2.85x (64) and 2.58x
+            (4); head 1.26x and 0.99x. The wall limit sits between the two.
+            On mimalloc the RSS ratio is about 1.0-1.3x for both sides, so
+            only the glibc pair gates on RSS.
   baseline  a cell more than 15% slower or 20% heavier than its entry in
             benchmarks/baseline/valve_guard.json. Only compared when the
             baseline's host matches this one (CPU model and count): wall and
@@ -53,7 +59,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 BASELINE = HERE / "baseline" / "valve_guard.json"
 
-RATIO_WALL_MAX = 1.7
+RATIO_WALL_MAX = 1.8
 RATIO_RSS_MAX = 1.5
 WALL_REGRESSION_MAX = 1.15
 RSS_REGRESSION_MAX = 1.20
