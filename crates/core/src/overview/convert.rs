@@ -1716,6 +1716,10 @@ pub struct ConvertReport {
     /// `log::warn!` naming the input was also emitted; this field keeps the
     /// assumption visible after the log has scrolled by.
     pub crs_assumed_wgs84: bool,
+    /// The input's GeoParquet version verdict across all its parts (#708);
+    /// see [`crate::resolved_schema::GeoVersion`] for the serialized shape.
+    /// Anything but `known` also logged a warning.
+    pub geo_version: crate::resolved_schema::GeoVersion,
     /// Wall-clock conversion duration in seconds.
     pub duration_secs: f64,
     /// Remote-input fetch counters (#210): range requests issued and bytes
@@ -3859,10 +3863,14 @@ pub(crate) fn crs_from_resolved(
 /// per-run warnings in [`crate::quality`] describe the exact
 /// metadata quirk; this one names the file and the consequence, once per
 /// conversion, from both pipelines.
-pub(super) fn warn_assumed_wgs84(input_name: &str, diagnostics: &crate::diagnostics::Diagnostics) {
+pub(super) fn warn_assumed_wgs84(
+    source: &ConvertSource,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
     diagnostics.once(crate::diagnostics::Diagnostic::CrsAssumed {
         count: 1,
-        input: input_name.to_owned(),
+        input: source.display_name(),
+        root: source.root_path(),
     });
 }
 
@@ -8606,6 +8614,30 @@ mod tests {
                 "streaming={streaming}: the WGS84 assumption must surface on the report"
             );
         }
+    }
+
+    /// #708: the report carries the input's GeoParquet version verdict.
+    #[test]
+    fn report_carries_the_geo_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("bare.parquet");
+        let coords: Vec<(f64, f64)> = (0..8).map(|i| (i as f64 * 4.0, i as f64 * 2.0)).collect();
+        write_input_without_geo_metadata(&bare, &coords);
+        let declared = dir.path().join("declared.parquet");
+        write_input(&declared, &synthetic_geometries(), false, None);
+        let run = |input: &Path, name: &str| {
+            convert_to_overviews(input, dir.path().join(name), &ConvertOptions::default()).unwrap()
+        };
+        use crate::resolved_schema::GeoVersion;
+        assert_eq!(run(&bare, "o1.parquet").geo_version, GeoVersion::Missing);
+        let r = run(&declared, "o2.parquet");
+        assert!(
+            matches!(r.geo_version, GeoVersion::Known(_)),
+            "{:?}",
+            r.geo_version
+        );
+        let json = serde_json::to_value(&r.geo_version).unwrap();
+        assert_eq!(json["status"], "known");
     }
 
     /// #451 counterpart: a file that *declares* its CRS — explicitly or via

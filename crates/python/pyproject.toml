@@ -51,6 +51,7 @@ dev = [
     "vulture>=2.13",
     "xenon>=0.9",
     "pip-audit>=2.7",
+    "pyarrow>=21.0.0",
     "hypothesis>=6.141.1",
 ]
 # Tools the tutorials call and the site builder (tests/docs, docs.yml).
@@ -162,6 +163,9 @@ ignore_names = [
     "pytest_collection_modifyitems",
     "whitespace_split",
     "commenters",
+    # TypedDict fields and class, used only through string annotations.
+    "GeoVersion",
+    "status",
 ]
 
 # Note: Commitizen config is in root .cz.toml - run `cz bump` from repo root

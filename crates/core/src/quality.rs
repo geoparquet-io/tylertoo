@@ -127,6 +127,20 @@ pub(crate) fn classify_crs_identifier(id: &str) -> CrsKind {
     if is_web_mercator_marker(&up) {
         return CrsKind::WebMercator;
     }
+    // A WKT projected CRS embeds its WGS 84 base (`ID["EPSG",4326]`): metres,
+    // not degrees (#708).
+    if [
+        "PROJCRS",
+        "PROJECTEDCRS",
+        "PROJCS",
+        "BASEGEOGCRS",
+        "BASEGEODCRS",
+    ]
+    .iter()
+    .any(|k| up.contains(k))
+    {
+        return CrsKind::Unknown;
+    }
     // 2. Explicit lon/lat identifiers, including the URN/URL spellings
     //    ("urn:ogc:def:crs:EPSG::4326", "http://.../EPSG/0/4326").
     if up.contains("4326") || up.contains("CRS84") || up == "SRID:4326" {
@@ -834,6 +848,83 @@ mod tests {
     /// #451: every fallback branch that assumes WGS84 because the file
     /// declared nothing usable must say so on the returned `CrsInfo`, so the
     /// convert path can surface the assumption (warning + report field).
+    /// #708 item 4: a WKT2 projected CRS embeds its WGS 84 base (`ID["EPSG",4326]`)
+    /// and must not read as degrees.
+    #[test]
+    fn wkt_projected_crs_embedding_4326_is_not_wgs84() {
+        let utm = r#"PROJCRS["WGS 84 / UTM zone 33N",BASEGEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],ID["EPSG",4326]],CONVERSION["UTM zone 33N",METHOD["Transverse Mercator"]],ID["EPSG",32633]]"#;
+        assert_eq!(classify_crs_identifier(utm), CrsKind::Unknown);
+        let long = r#"PROJECTEDCRS["WGS 84 / UTM zone 33N",BASEGEODCRS["WGS 84",ID["EPSG",4326]],ID["EPSG",32633]]"#;
+        assert_eq!(classify_crs_identifier(long), CrsKind::Unknown);
+        let geog = r#"GEOGCRS["WGS 84",DATUM["World Geodetic System 1984"],ID["EPSG",4326]]"#;
+        assert_eq!(classify_crs_identifier(geog), CrsKind::Wgs84);
+    }
+
+    fn version_warnings(geo: &str) -> Vec<String> {
+        let d = crate::diagnostics::Diagnostics::default();
+        let kv = vec![tylertoo_io::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        )];
+        crs_info_from_kv_metadata(Some(&kv), &d).unwrap();
+        d.snapshot().iter().map(ToString::to_string).collect()
+    }
+
+    /// #708 item 5: the version warnings are actually emitted, and name what
+    /// the file declared; a non-string `version` is "unknown", not "missing".
+    #[test]
+    fn version_warnings_are_emitted_and_name_the_declared_value() {
+        let cols = r#""primary_column":"geometry","columns":{"geometry":{"crs":"EPSG:4326"}}"#;
+        let w = version_warnings(&format!(r#"{{"version":"3.0.0",{cols}}}"#));
+        assert!(w.iter().any(|m| m.contains("\"3.0.0\"")), "{w:?}");
+        let w = version_warnings(&format!(r#"{{{cols}}}"#));
+        assert!(w.iter().any(|m| m.contains("no 'version' field")), "{w:?}");
+        for raw in ["1.1", "true", r#"{"a":1}"#] {
+            let w = version_warnings(&format!(r#"{{"version":{raw},{cols}}}"#));
+            assert!(
+                w.iter().any(|m| m.contains("does not know"))
+                    && !w.iter().any(|m| m.contains("no 'version'")),
+                "{raw}: {w:?}"
+            );
+        }
+        assert!(version_warnings(&format!(r#"{{"version":"1.1.0",{cols}}}"#)).is_empty());
+    }
+
+    /// #708 item 5: valid JSON that is not an object is a hard error, like
+    /// invalid JSON, not two warnings and an assumed CRS.
+    #[test]
+    fn non_object_geo_json_is_a_hard_error() {
+        for geo in ["[]", "null", "42", "not json"] {
+            let kv = vec![tylertoo_io::KeyValue::new(
+                "geo".to_string(),
+                geo.to_string(),
+            )];
+            let err =
+                crs_info_from_kv_metadata(Some(&kv), &crate::diagnostics::Diagnostics::default());
+            assert!(
+                matches!(err, Err(Error::GeoParquetRead(_))),
+                "{geo}: {err:?}"
+            );
+        }
+    }
+
+    /// #708 item 5: a declared but unsupported CRS (EPSG:27700) is neither
+    /// "assumed" nor WGS84.
+    #[test]
+    fn declared_unsupported_crs_is_not_assumed() {
+        let geo = serde_json::json!({
+            "version": "1.1.0", "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:27700"}}
+        });
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
+        assert!(!info.assumed_wgs84);
+        assert_eq!(classify_crs_info(&info), CrsKind::Unknown);
+    }
+
     #[test]
     fn missing_metadata_fallbacks_set_assumed_wgs84() {
         // (1) No key-value metadata at all.

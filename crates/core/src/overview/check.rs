@@ -1306,6 +1306,35 @@ mod tests {
         assert_eq!(report.check_passed("level_column"), Some(false));
     }
 
+    /// #708: a non-string `geo.version` is not a version; the geo-metadata
+    /// check must keep failing it rather than accept a made-up string.
+    #[test]
+    fn numeric_geo_version_fails_the_geo_metadata_check() {
+        use tylertoo_io::test_support::ArrowWriter;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "geometry",
+            DataType::Binary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::BinaryArray::from_iter_values([b"x"]))],
+        )
+        .unwrap();
+        let file = File::create(tmp.path()).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.append_key_value_metadata(tylertoo_io::KeyValue::new(
+            "geo".to_string(),
+            r#"{"version":1.1,"primary_column":"geometry","columns":{"geometry":{"encoding":"WKB"}}}"#
+                .to_string(),
+        ));
+        w.close().unwrap();
+        let report = validate_file(tmp.path()).unwrap();
+        assert_eq!(report.check_passed("geoparquet_geo_metadata"), Some(false));
+    }
+
     // --- Q4 clustering checks -------------------------------------------------
 
     /// Write a 2-level duplicating fixture whose footer carries clustering

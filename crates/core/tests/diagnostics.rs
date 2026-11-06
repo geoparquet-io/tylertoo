@@ -217,10 +217,12 @@ fn child_contexts_are_preserved_independently_of_arrival_order() {
         Diagnostic::CrsAssumed {
             count: 1,
             input: "a.parquet".into(),
+            root: "a.parquet".into(),
         },
         Diagnostic::CrsAssumed {
             count: 1,
             input: "b.parquet".into(),
+            root: "b.parquet".into(),
         },
         Diagnostic::EmptyLevels {
             count: 1,

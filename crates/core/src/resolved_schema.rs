@@ -114,13 +114,7 @@ impl ResolvedSchema {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
             .map(|(_, v)| v.clone());
-        let geo = geo_json
-            .as_deref()
-            .map(serde_json::from_str::<Value>)
-            .transpose()
-            .map_err(|e| {
-                Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {e}"))
-            })?;
+        let geo = geo_json.as_deref().map(parse_geo_json).transpose()?;
         if let Some(geo) = &geo {
             warn_geo_version(geo, diagnostics);
         }
@@ -281,9 +275,24 @@ impl ResolvedSchema {
             crate::quality::CrsKind::Unknown => None,
         }
     }
-    /// GeoParquet version, including native 2.0 without a geo key.
+    /// GeoParquet version, including native 2.0 without a geo key. `None`
+    /// when the `geo` metadata declares none or declares a non-string.
     pub fn version(&self) -> Option<&str> {
         self.facts.version.as_deref()
+    }
+
+    /// The version the report classifies: [`Self::version`], except that a
+    /// non-string `geo.version` is kept (as `"non-string <json>"`, which
+    /// classifies unknown) instead of vanishing (#708).
+    pub(crate) fn declared_version(&self) -> Option<String> {
+        let geo = self
+            .facts
+            .geo_json
+            .as_deref()
+            .and_then(|j| parse_geo_json(j).ok());
+        geo.as_ref()
+            .and_then(declared_version)
+            .or_else(|| self.facts.version.clone())
     }
     /// Schema indices of data properties, excluding all geometry and covering fields.
     pub fn properties(&self) -> &[usize] {
@@ -800,6 +809,60 @@ pub(crate) fn geo_version_disposition(version: Option<&str>) -> GeoVersionDispos
     }
 }
 
+/// The GeoParquet version verdict of a whole input (#708).
+///
+/// Carried by the report and serialized as `{"status": "missing" | "known" | "unknown" |
+/// "mixed", "version": ...}`: `version` is the version string for `known`
+/// and `unknown`, the sorted distinct versions (`null` for a part with
+/// none) for `mixed`, and absent for `missing`. `known` means every part
+/// declares the same version, and its major is one this reader knows (1, 2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+#[serde(tag = "status", content = "version", rename_all = "snake_case")]
+pub enum GeoVersion {
+    /// No part declares a version.
+    Missing,
+    /// All parts declare this one version, of a known major.
+    Known(String),
+    /// All parts declare this one version, of a major this reader does not know.
+    Unknown(String),
+    /// The parts disagree (including some declaring none).
+    Mixed(Vec<Option<String>>),
+}
+
+impl GeoVersion {
+    /// Fold the per-part versions (one item per part, in any order).
+    pub(crate) fn of_parts<S: AsRef<str>>(parts: impl IntoIterator<Item = Option<S>>) -> Self {
+        let owned: Vec<Option<String>> = parts
+            .into_iter()
+            .map(|v| v.map(|s| s.as_ref().to_owned()))
+            .collect();
+        let distinct: std::collections::BTreeSet<Option<&str>> =
+            owned.iter().map(Option::as_deref).collect();
+        match distinct.iter().next().copied() {
+            Some(first) if distinct.len() == 1 => match first {
+                None => Self::Missing,
+                Some(v) if geo_version_disposition(Some(v)) == GeoVersionDisposition::Known => {
+                    Self::Known(v.to_owned())
+                }
+                Some(v) => Self::Unknown(v.to_owned()),
+            },
+            _ => Self::Mixed(distinct.iter().map(|v| v.map(str::to_owned)).collect()),
+        }
+    }
+}
+
+/// The `geo` metadata's declared `version`, the one source for both the
+/// warning and the report. A non-string value (`1.1`, `true`, `null`) is
+/// present but not a version string: it is kept as `"non-string <json>"`,
+/// which classifies as unknown, never as missing (#708).
+fn declared_version(geo_json: &Value) -> Option<String> {
+    match geo_json.get("version")? {
+        Value::String(s) => Some(s.clone()),
+        other => Some(format!("non-string {other}")),
+    }
+}
+
 /// Warn (once per run) when a `geo` metadata `version` is missing or
 /// names a spec this reader does not know (#451). A warning, never an error:
 /// the fields read from the metadata (`primary_column`, `crs`, `bbox`,
@@ -807,8 +870,10 @@ pub(crate) fn geo_version_disposition(version: Option<&str>) -> GeoVersionDispos
 /// carries them, so rejecting the file outright would refuse inputs that
 /// parse fine — matching the issue's "hard-warn on unknown majors" ask.
 fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnostics) {
-    let version = geo_json.get("version").and_then(Value::as_str);
-    match geo_version_disposition(version) {
+    // A non-string `version` (`1.1`, `true`, an object) is present but not a
+    // version: unknown, not "missing" (#708).
+    let version = declared_version(geo_json);
+    match geo_version_disposition(version.as_deref()) {
         GeoVersionDisposition::Known => {}
         GeoVersionDisposition::Missing => {
             diagnostics.once(crate::diagnostics::Diagnostic::CrsMetadata {
@@ -817,16 +882,30 @@ fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnost
             });
         }
         GeoVersionDisposition::Unknown => {
-            // The version string is untrusted input headed for a log line;
+            // The version is untrusted input headed for a log line;
             // {:?} escapes it and the cap keeps a pathological value short.
-            let version = version.unwrap_or_default();
-            let shown: String = version.chars().take(64).collect();
+            let shown: String = version.unwrap_or_default().chars().take(64).collect();
             diagnostics.once(crate::diagnostics::Diagnostic::CrsMetadata {
                 count: 1,
                 reason: crate::diagnostics::CrsWarning::UnknownVersion(shown),
             });
         }
     }
+}
+
+/// Parse a `geo` key's JSON. Invalid JSON and valid JSON that is not an
+/// object (`[]`, `null`, `42`) are the same hard error (#708).
+pub(crate) fn parse_geo_json(json: &str) -> Result<Value> {
+    let v: Value = serde_json::from_str(json)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {e}")))?;
+    if !v.is_object() {
+        return Err(Error::GeoParquetRead(
+            "the 'geo' metadata is valid JSON but not an object; rewrite the file's \
+             GeoParquet metadata (e.g. re-save it with `gpio convert`)"
+                .to_string(),
+        ));
+    }
+    Ok(v)
 }
 
 /// Extract CRS information from already-parsed parquet key-value metadata.
@@ -868,8 +947,7 @@ pub(crate) fn crs_info_from_kv_metadata(
     };
 
     // Parse the geo metadata JSON
-    let geo_json: Value = serde_json::from_str(geo_json_str)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {}", e)))?;
+    let geo_json = parse_geo_json(geo_json_str)?;
 
     // #451: flag a `geo.version` from a spec this reader does not know
     // before interpreting any of its fields.
