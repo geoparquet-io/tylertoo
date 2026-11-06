@@ -198,7 +198,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install cargo-shear
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cargo-shear
 
@@ -210,12 +210,12 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
 
       - name: Install similarity-rs
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: similarity-rs@0.5.0
 
       - name: Install Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -357,7 +357,7 @@ jobs:
         run: brew install protobuf
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cargo-nextest
 
@@ -523,7 +523,7 @@ jobs:
         run: brew install protobuf
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cargo-nextest
 
@@ -600,7 +600,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-python-
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
@@ -735,7 +735,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-python-
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
@@ -822,7 +822,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-docs-
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
@@ -950,7 +950,7 @@ jobs:
       - name: Install cargo-llvm-cov and cargo-nextest
         # Prebuilt binaries via install-action; compiling them from source
         # costs minutes on every run.
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -1080,7 +1080,7 @@ jobs:
 
       - name: Install uv
         if: ${{ !cancelled() }}
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       # CI Lint: zizmor (GitHub Actions security linter) on these workflows.
       - name: zizmor
@@ -1187,7 +1187,7 @@ jobs:
       # catches new advisories between PRs.
       - name: Install cargo-audit and cargo-deny
         if: ${{ !cancelled() }}
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cargo-audit,cargo-deny
 
@@ -1289,7 +1289,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Test the archive verifier
         run: >-
           uv run --no-project --with pytest==8.4.2 --with pmtiles==3.8.1

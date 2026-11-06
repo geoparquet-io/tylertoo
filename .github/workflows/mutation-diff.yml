@@ -30,7 +30,7 @@ jobs:
         with:
           toolchain: stable
       - name: Install mutation tools
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: ${{ env.MUTATION_TOOL }}
       - name: Size shards from the PR diff
@@ -94,7 +94,7 @@ jobs:
         with:
           toolchain: stable
       - name: Install mutation tools
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           # All shards must enumerate with the same mutator version.
           tool: ${{ env.MUTATION_TOOL }},cargo-nextest
@@ -123,7 +123,7 @@ jobs:
         run: scripts/mutants-diff.sh HEAD^1 --cap-lints true --sharding round-robin --shard "$SHARD/$SHARD_COUNT" -j 2
       - name: Upload mutation results
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mutation-diff-${{ matrix.shard }}
           path: mutants.out/
