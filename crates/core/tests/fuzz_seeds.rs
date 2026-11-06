@@ -81,7 +81,7 @@ fn utf8(bytes: &[u8]) -> &str {
 fn geo_metadata_seeds() {
     // EPSG:32633 is a real CRS tylertoo refuses (UTM), on purpose.
     replay("geo_metadata", &["seed-utm.json"], |b| {
-        tylertoo_core::overview::convert::fuzz_geo_metadata(utf8(b))
+        tylertoo_core::internal::overview::convert::fuzz_geo_metadata(utf8(b))
     });
 }
 
@@ -96,19 +96,19 @@ fn plan_file_seeds() {
             "seed-issue-684-ipc-buffer.arrow",
             "seed-ipc-block-length.arrow",
         ],
-        tylertoo_core::overview::fuzz_convert_plan,
+        tylertoo_core::internal::overview::fuzz_convert_plan,
     );
 }
 
 /// `decode_pmtiles` on `archive`, written to a temp file.
-fn decode_report(archive: &[u8]) -> tylertoo_core::decode::DecodeReport {
+fn decode_report(archive: &[u8]) -> tylertoo_core::internal::decode::DecodeReport {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("seed.pmtiles");
     std::fs::write(&input, archive).unwrap();
-    tylertoo_core::decode::decode_pmtiles(
+    tylertoo_core::internal::decode::decode_pmtiles(
         &input,
         dir.path().join("seed.parquet"),
-        &tylertoo_core::decode::DecodeOptions::default(),
+        &tylertoo_core::internal::decode::DecodeOptions::default(),
     )
     .unwrap()
 }
@@ -118,12 +118,13 @@ fn decode_archive_seeds() {
     replay(
         "decode_archive",
         &[],
-        tylertoo_core::decode::fuzz_decode_archive,
+        tylertoo_core::internal::decode::fuzz_decode_archive,
     );
     // The hook must walk the archive `decode` walks: a hook that returned
     // early would still come back `Ok` and fuzz nothing.
     for (name, bytes) in seeds("decode_archive") {
-        let (tiles, features) = tylertoo_core::decode::fuzz_decode_archive(&bytes).unwrap();
+        let (tiles, features) =
+            tylertoo_core::internal::decode::fuzz_decode_archive(&bytes).unwrap();
         let report = decode_report(&bytes);
         assert!(tiles > 0, "{name}");
         assert_eq!(tiles as u64, report.tiles_read, "{name}");
@@ -140,13 +141,17 @@ fn archive_index_seeds() {
     replay(
         "archive_index",
         &[],
-        tylertoo_core::fuzz::fuzz_archive_index,
+        tylertoo_core::internal::fuzz::fuzz_archive_index,
     );
 }
 
 #[test]
 fn layer_zooms_seeds() {
-    replay("layer_zooms", &[], tylertoo_core::pyramid::fuzz_layer_zooms);
+    replay(
+        "layer_zooms",
+        &[],
+        tylertoo_core::internal::pyramid::fuzz_layer_zooms,
+    );
 }
 
 #[test]
@@ -159,7 +164,7 @@ fn parquet_footer_seeds() {
             "seed-issue-690-num-children.thrift",
             "seed-issue-789-oom.thrift",
         ],
-        tylertoo_core::overview::check::fuzz_parquet_footer,
+        tylertoo_core::internal::overview::check::fuzz_parquet_footer,
     );
     // #789: a 14-byte `num_children` varint. parquet-rs wraps it into a
     // 4.6 GB reservation; the pre-check must refuse it, not call it "confused".
@@ -178,7 +183,7 @@ fn parquet_footer_seeds() {
         .into_iter()
         .find(|(n, _)| n == "seed-issue-690-num-children.thrift")
         .unwrap();
-    let err = tylertoo_core::overview::check::fuzz_parquet_footer(&bytes).unwrap_err();
+    let err = tylertoo_core::internal::overview::check::fuzz_parquet_footer(&bytes).unwrap_err();
     assert!(
         matches!(
             tylertoo_io::input_error(&err),
@@ -194,7 +199,7 @@ fn overview_file_seeds() {
     replay(
         "overview_file",
         &["seed-issue-683-arrow-schema.parquet"],
-        tylertoo_core::overview::reader::fuzz_overview_file,
+        tylertoo_core::internal::overview::reader::fuzz_overview_file,
     );
 }
 
@@ -210,7 +215,7 @@ fn remote_footer_seeds() {
             "seed-issue-687-def-levels.parquet",
         ],
         "seed-issue-789-",
-        tylertoo_core::input::fuzz_remote_footer,
+        tylertoo_core::internal::input::fuzz_remote_footer,
     );
     // #789: nested sets of `uuid`s in a page header cost parquet-rs minutes
     // of CPU (it skips them for free at end of input). These seeds run only
@@ -222,7 +227,7 @@ fn remote_footer_seeds() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(
-                tylertoo_core::input::fuzz_remote_footer(&bytes)
+                tylertoo_core::internal::input::fuzz_remote_footer(&bytes)
                     .map(|_| ())
                     .map_err(|e| format!("{e:?}")),
             );
@@ -237,12 +242,20 @@ fn remote_footer_seeds() {
 
 #[test]
 fn shard_plan_seeds() {
-    replay("shard_plan", &[], tylertoo_core::fuzz::fuzz_shard_plan);
+    replay(
+        "shard_plan",
+        &[],
+        tylertoo_core::internal::fuzz::fuzz_shard_plan,
+    );
 }
 
 #[test]
 fn decompress_seeds() {
-    replay("decompress", &[], tylertoo_core::fuzz::fuzz_decompress);
+    replay(
+        "decompress",
+        &[],
+        tylertoo_core::internal::fuzz::fuzz_decompress,
+    );
 }
 
 #[test]
@@ -250,7 +263,7 @@ fn cli_args_seeds() {
     // No `Result` to check: each parser either accepts the string or not.
     // Panicking is the failure, as #681's input did before its fix.
     replay("cli_args", &[], |b| {
-        tylertoo_core::fuzz::fuzz_cli_args(utf8(b));
+        tylertoo_core::internal::fuzz::fuzz_cli_args(utf8(b));
         Ok::<(), ()>(())
     });
 }
@@ -260,7 +273,7 @@ fn band_archive_seeds() {
     replay(
         "band_archive",
         &[],
-        tylertoo_core::pyramid::fuzz_band_archive,
+        tylertoo_core::internal::pyramid::fuzz_band_archive,
     );
 }
 
@@ -270,7 +283,8 @@ fn mutation_regression_band_archive_exact_tile_count() {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("band.pmtiles");
         let mut writer =
-            tylertoo_core::StreamingPmtilesWriter::new(tylertoo_core::Compression::Gzip).unwrap();
+            tylertoo_core::internal::StreamingPmtilesWriter::new(tylertoo_core::Compression::Gzip)
+                .unwrap();
         for x in 0..count {
             // Identical bodies also exercise the directory's deduplicated
             // tile addressing: count tiles, rather than distinct contents.
@@ -278,7 +292,8 @@ fn mutation_regression_band_archive_exact_tile_count() {
         }
         writer.finalize(&archive).unwrap();
         assert_eq!(
-            tylertoo_core::pyramid::fuzz_band_archive(&std::fs::read(archive).unwrap()).unwrap(),
+            tylertoo_core::internal::pyramid::fuzz_band_archive(&std::fs::read(archive).unwrap())
+                .unwrap(),
             u64::from(count)
         );
     }
@@ -297,17 +312,18 @@ fn mvt_seed(b: &[u8]) -> (u8, u32, &[u8]) {
 fn mvt_decode_seeds() {
     replay("mvt_decode", &[], |b| {
         let (z, max, tile) = mvt_seed(b);
-        tylertoo_core::decode::fuzz_decode_tile(z, max, max, tile)
+        tylertoo_core::internal::decode::fuzz_decode_tile(z, max, max, tile)
     });
     // The hook's counts are `decode`'s for the same tile in an archive.
     for (name, bytes) in seeds("mvt_decode") {
         let (z, max, tile) = mvt_seed(&bytes);
         let (features, with_geometry) =
-            tylertoo_core::decode::fuzz_decode_tile(z, max, max, tile).unwrap();
+            tylertoo_core::internal::decode::fuzz_decode_tile(z, max, max, tile).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("tile.pmtiles");
         let mut writer =
-            tylertoo_core::StreamingPmtilesWriter::new(tylertoo_core::Compression::None).unwrap();
+            tylertoo_core::internal::StreamingPmtilesWriter::new(tylertoo_core::Compression::None)
+                .unwrap();
         writer.add_tile(z, max, max, tile).unwrap();
         writer.finalize(&archive).unwrap();
         let report = decode_report(&std::fs::read(&archive).unwrap());
@@ -331,6 +347,6 @@ fn geoparquet_wkb_seeds() {
             "seed-issue-632-multipolygon-count",
             "seed-multipoint-srid-member",
         ],
-        tylertoo_core::batch_processor::fuzz_geoparquet_wkb,
+        tylertoo_core::internal::batch_processor::fuzz_geoparquet_wkb,
     );
 }

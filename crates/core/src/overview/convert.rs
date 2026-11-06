@@ -1779,10 +1779,14 @@ pub enum ConvertError {
     Properties(#[from] PropertySelectionError),
     /// Underlying parquet error (reading the input).
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] tylertoo_io::ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] tylertoo_io::ParquetError),
     /// Arrow error (concat / take / batch build).
     #[error("arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Arrow(#[source] arrow_schema::ArrowError),
     /// A core-library error (geometry decode, CRS extraction).
     #[error("{0}")]
     Core(#[from] crate::Error),
@@ -2036,6 +2040,20 @@ pub enum ConvertError {
         /// Available bytes at conversion start.
         available: u64,
     },
+}
+
+#[doc(hidden)]
+impl From<arrow_schema::ArrowError> for ConvertError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        ConvertError::Arrow(e)
+    }
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::ParquetError> for ConvertError {
+    fn from(e: tylertoo_io::ParquetError) -> Self {
+        ConvertError::Parquet(e)
+    }
 }
 
 impl crate::error::Classify for ConvertError {

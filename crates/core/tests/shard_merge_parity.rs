@@ -39,15 +39,15 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use tylertoo_core::archive_index::ArchiveIndex;
-use tylertoo_core::merge::{merge_shards, MergeOptions};
-use tylertoo_core::overview::cluster::{AccumulateOp, AccumulateSpec};
-use tylertoo_core::overview::convert::{
+use tylertoo_core::internal::archive_index::ArchiveIndex;
+use tylertoo_core::internal::merge::{merge_shards, MergeOptions};
+use tylertoo_core::internal::overview::cluster::{AccumulateOp, AccumulateSpec};
+use tylertoo_core::internal::overview::convert::{
     convert_to_overviews, write_convert_plan, ConvertOptions, LevelPlan,
 };
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
-use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
-use tylertoo_core::shard::{ShardPlan, TileRange};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_core::internal::overview::simplify::{CollapseMode, SimplifyOptions};
+use tylertoo_core::internal::shard::{ShardPlan, TileRange};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;
@@ -135,7 +135,7 @@ fn read_workers() -> usize {
     std::env::var("TYLERTOO_TEST_READ_WORKERS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(tylertoo_core::overview::convert::READ_WORKERS_AUTO)
+        .unwrap_or(tylertoo_core::internal::overview::convert::READ_WORKERS_AUTO)
 }
 
 fn convert_options(build: Build) -> ConvertOptions {
@@ -355,7 +355,8 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
     let dir = dir.path();
 
     // --- Step 0: cut the shard plan (footer only). ---------------------
-    let source = tylertoo_core::input_set::ConvertSource::resolve_path(input).expect("source");
+    let source =
+        tylertoo_core::internal::input_set::ConvertSource::resolve_path(input).expect("source");
     let shard_plan = ShardPlan::compute(&source, pivot, shards).expect("cut the shard plan");
     assert_eq!(shard_plan.shards(), shards);
     let shard_plan_path = dir.join("shards.json");
@@ -1046,7 +1047,7 @@ fn write_line_chains(path: &Path) {
 /// differed from the monolithic one.
 #[test]
 fn level_capped_coarse_job_matches_monolithic_on_coalesced_line_chains() {
-    use tylertoo_core::overview::reader::OverviewReader;
+    use tylertoo_core::internal::overview::reader::OverviewReader;
 
     const PIVOT: u8 = 7;
     let dir = tempfile::tempdir().expect("tempdir");

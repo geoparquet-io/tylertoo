@@ -9,5 +9,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = tylertoo_core::input::fuzz_remote_footer(data);
+    let _ = tylertoo_core::internal::input::fuzz_remote_footer(data);
 });

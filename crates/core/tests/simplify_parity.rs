@@ -1,5 +1,5 @@
 //! Quality-matched simplification must retain the main-branch parity floor.
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;

@@ -69,6 +69,7 @@ impl TilesInput {
         crate::input_set::derive_layer_name(&p.to_string_lossy())
     }
 
+    #[doc(hidden)]
     /// Resolve this input to the core's [`ConvertSource`], the one way: a
     /// path through [`ConvertSource::resolve_path`], a manifest through
     /// [`ConvertSource::from_manifest`].
@@ -83,6 +84,7 @@ impl TilesInput {
         }
     }
 
+    #[doc(hidden)]
     /// Run the convert half against this input, dispatching on the input
     /// shape and keeping the typed [`ConvertError`] — the facade's
     /// empty-shard handling (and any caller that routes both shapes) has to
@@ -178,6 +180,7 @@ impl TilesShard {
 }
 
 impl TilesShard {
+    #[doc(hidden)]
     /// What *every* job of a fleet applies to its convert, whether or not it
     /// goes on to build tiles (#498): the data shard's row-pruning range and
     /// the fleet's cut digest. The digest is fingerprinted and the range is
@@ -375,6 +378,7 @@ impl TilesOptions {
         self.validate_for(Run::PlanOnly)
     }
 
+    #[doc(hidden)]
     /// The export options a plan-only run (#560) ignores: every field of
     /// [`TilesOptions::export`] that differs from `defaults` (the
     /// [`TilesOptions::export_defaults`] the caller started from, which a

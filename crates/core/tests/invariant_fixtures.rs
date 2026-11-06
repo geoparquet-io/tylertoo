@@ -15,10 +15,10 @@
 
 use std::path::{Path, PathBuf};
 
-use tylertoo_core::overview::convert::{
+use tylertoo_core::internal::overview::convert::{
     convert_to_overviews, ConvertOptions, ConvertReport, LevelPlan,
 };
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions, ExportReport};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions, ExportReport};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;

@@ -233,13 +233,31 @@ pub enum DecodeError {
     ReservedColumn(String),
 
     #[error("Arrow error")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Arrow(#[source] arrow_schema::ArrowError),
 
     #[error("Parquet error")]
-    Parquet(#[from] tylertoo_io::ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] tylertoo_io::ParquetError),
 
     #[error("GeoParquet write failed: {0}")]
     Write(String),
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::ParquetError> for DecodeError {
+    fn from(e: tylertoo_io::ParquetError) -> Self {
+        DecodeError::Parquet(e)
+    }
+}
+
+#[doc(hidden)]
+impl From<arrow_schema::ArrowError> for DecodeError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        DecodeError::Arrow(e)
+    }
 }
 
 impl crate::error::Classify for DecodeError {

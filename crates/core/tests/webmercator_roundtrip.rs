@@ -134,10 +134,12 @@ fn overview_declared_crs(path: &Path) -> Option<String> {
 
 #[test]
 fn webmercator_input_round_trips_through_convert_and_export() {
-    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
-    use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
-    use tylertoo_core::pmtiles_writer::Header;
+    use tylertoo_core::internal::decode::{decode_pmtiles, DecodeOptions};
+    use tylertoo_core::internal::overview::convert::{
+        convert_to_overviews, ConvertOptions, LevelPlan,
+    };
+    use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
+    use tylertoo_core::internal::pmtiles_writer::Header;
 
     let geoms: Vec<Geometry<f64>> = (0..8)
         .map(|i| {
@@ -215,7 +217,7 @@ fn webmercator_input_round_trips_through_convert_and_export() {
 fn decoded_bounds(path: &Path) -> (f64, f64, f64, f64) {
     use geo::BoundingRect;
     use geoarrow::array::from_arrow_array;
-    use tylertoo_core::batch_processor::extract_geometries_from_array;
+    use tylertoo_core::internal::batch_processor::extract_geometries_from_array;
     use tylertoo_io::open_parquet;
 
     let file = std::fs::File::open(path).unwrap();
@@ -231,7 +233,7 @@ fn decoded_bounds(path: &Path) -> (f64, f64, f64, f64) {
         extract_geometries_from_array(
             arr.as_ref(),
             &mut geoms,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
         )
         .unwrap();
         for g in &geoms {

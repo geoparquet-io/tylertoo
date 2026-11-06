@@ -37,14 +37,14 @@ use tylertoo_io::open_parquet;
 use tylertoo_io::test_support::ArrowWriter;
 use tylertoo_io::KeyValue;
 
-use tylertoo_core::overview::check::validate_file;
-use tylertoo_core::overview::convert::{
+use tylertoo_core::internal::overview::check::validate_file;
+use tylertoo_core::internal::overview::convert::{
     convert_to_overviews, ConvertError, ConvertOptions, LevelPlan,
 };
-use tylertoo_core::overview::export::{export_pmtiles, ExportError, ExportOptions};
-use tylertoo_core::overview::level::Mode;
-use tylertoo_core::overview::reader::{OverviewReader, ReaderError};
-use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportError, ExportOptions};
+use tylertoo_core::internal::overview::level::Mode;
+use tylertoo_core::internal::overview::reader::{OverviewReader, ReaderError};
+use tylertoo_core::internal::overview::simplify::{CollapseMode, SimplifyOptions};
 
 // Shared fixture writers, compiled straight from the crate's in-tree test
 // module rather than copied: `overview::testutil` is `pub(crate)` (invisible
@@ -91,7 +91,7 @@ fn opts() -> ConvertOptions {
 fn read_level_ids_geoms(path: &Path, level: usize) -> Vec<(i64, Geometry<f64>)> {
     use arrow_array::cast::AsArray;
     use geoarrow::array::from_arrow_array;
-    use tylertoo_core::batch_processor::extract_geometries_from_array;
+    use tylertoo_core::internal::batch_processor::extract_geometries_from_array;
 
     let reader = OverviewReader::open(path).unwrap();
     let rdr = reader.read_level(level, None).unwrap();
@@ -109,7 +109,7 @@ fn read_level_ids_geoms(path: &Path, level: usize) -> Vec<(i64, Geometry<f64>)> 
         extract_geometries_from_array(
             garr.as_ref(),
             &mut geoms,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
         )
         .unwrap();
         assert_eq!(
@@ -330,7 +330,7 @@ fn export_counts_a_non_finite_overview_vertex() {
     )
     .unwrap();
     assert!(
-        report.diagnostics.iter().any(|d| matches!(d, tylertoo_core::diagnostics::Diagnostic::NonFiniteGeometry { count } if *count > 0)),
+        report.diagnostics.iter().any(|d| matches!(d, tylertoo_core::internal::diagnostics::Diagnostic::NonFiniteGeometry { count } if *count > 0)),
         "the non-finite feature is counted"
     );
 }
@@ -665,7 +665,7 @@ fn geometry_collection_passes_through() {
 /// report counts nothing as dropped at encode.
 #[test]
 fn geometry_collection_parts_reach_the_tiles() {
-    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
+    use tylertoo_core::internal::decode::{decode_pmtiles, DecodeOptions};
 
     let gc = GeometryCollection::from(vec![
         Geometry::Point(Point::new(10.0, 10.0)),
@@ -786,7 +786,7 @@ fn read_decoded_rows(path: &Path) -> Vec<(u8, Option<i64>, Geometry<f64>)> {
     use arrow_array::cast::AsArray;
     use arrow_array::Array;
     use geoarrow::array::from_arrow_array;
-    use tylertoo_core::batch_processor::extract_geometries_from_array;
+    use tylertoo_core::internal::batch_processor::extract_geometries_from_array;
 
     let file = std::fs::File::open(path).unwrap();
     let builder = open_parquet(file).unwrap();
@@ -808,7 +808,7 @@ fn read_decoded_rows(path: &Path) -> Vec<(u8, Option<i64>, Geometry<f64>)> {
         extract_geometries_from_array(
             garr.as_ref(),
             &mut geoms,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
         )
         .unwrap();
         assert_eq!(geoms.len(), batch.num_rows(), "decoded rows have geometry");
@@ -992,7 +992,7 @@ fn points_at_the_max_zoom_ceiling_convert() {
     let o = ConvertOptions {
         levels: LevelPlan::ZoomRange {
             min_zoom: 28,
-            max_zoom: tylertoo_core::tile::MAX_ZOOM,
+            max_zoom: tylertoo_core::internal::tile::MAX_ZOOM,
         },
         ..Default::default()
     };
@@ -1263,10 +1263,10 @@ fn archive_layer_fields(path: &Path) -> Vec<String> {
     // PMTiles v3 header: the JSON metadata offset/length live at bytes 24..40.
     let off = u64::from_le_bytes(buf[24..32].try_into().unwrap()) as usize;
     let len = u64::from_le_bytes(buf[32..40].try_into().unwrap()) as usize;
-    let json = tylertoo_core::compression::decompress_capped(
+    let json = tylertoo_core::internal::compression::decompress_capped(
         &buf[off..off + len],
-        tylertoo_core::compression::Compression::Gzip,
-        tylertoo_core::compression::MAX_INTERNAL_BYTES,
+        tylertoo_core::internal::compression::Compression::Gzip,
+        tylertoo_core::internal::compression::MAX_INTERNAL_BYTES,
     )
     .expect("archive metadata is gzip");
     let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
@@ -1508,7 +1508,7 @@ fn level_strong_counts(path: &Path, min_mag: f64) -> Vec<usize> {
 /// An entry-zoom ladder must admit them regardless of size.
 #[test]
 fn entry_zoom_ladder_admits_strong_features_the_gate_drops() {
-    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+    use tylertoo_core::internal::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
     // Control: ranking only. The gate still removes the tiny cores.
     let tin = tempfile::NamedTempFile::new().unwrap();
@@ -1563,7 +1563,7 @@ fn entry_zoom_ladder_admits_strong_features_the_gate_drops() {
 /// eager reader differential lives in `overview::convert`'s unit tests, #440.)
 #[test]
 fn entry_zoom_ladder_places_bands() {
-    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+    use tylertoo_core::internal::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
@@ -1605,7 +1605,7 @@ fn footer_entry_zoom(
     options: &ConvertOptions,
     input: &Path,
     output: &Path,
-) -> Option<tylertoo_core::overview::level::EntryZoomProvenance> {
+) -> Option<tylertoo_core::internal::overview::level::EntryZoomProvenance> {
     convert_to_overviews(input, output, options).unwrap();
     let reader = OverviewReader::open(output).unwrap();
     reader
@@ -1629,8 +1629,8 @@ fn footer_entry_zoom(
 #[test]
 fn entry_zoom_ladder_is_recorded_in_the_footer() {
     use std::collections::BTreeMap;
-    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
-    use tylertoo_core::overview::level::EntryZoomProvenance;
+    use tylertoo_core::internal::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+    use tylertoo_core::internal::overview::level::EntryZoomProvenance;
 
     let dense = EntryZoomSpec {
         column: "magnitude".to_string(),
@@ -1707,7 +1707,7 @@ fn entry_zoom_ladder_is_recorded_in_the_footer() {
 /// rungs are derived or written by hand.
 #[test]
 fn entry_zoom_provenance_is_absent_when_no_ladder_applies() {
-    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+    use tylertoo_core::internal::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
     let ladder = |kind| {
         Some(EntryZoomSpec {
@@ -1759,7 +1759,7 @@ fn entry_zoom_provenance_is_absent_when_no_ladder_applies() {
 /// block names the column as it appears in the file.
 #[test]
 fn entry_zoom_provenance_names_the_renamed_column() {
-    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+    use tylertoo_core::internal::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
@@ -1790,7 +1790,7 @@ fn entry_zoom_provenance_names_the_renamed_column() {
 /// not the footer's truncated one, so the dense rank stays reproducible.
 #[test]
 fn entry_zoom_provenance_survives_a_saved_plan_and_a_zoom_ceiling() {
-    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+    use tylertoo_core::internal::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.parquet");
@@ -1840,7 +1840,7 @@ fn entry_zoom_provenance_survives_a_saved_plan_and_a_zoom_ceiling() {
 /// weaker feature by a whole `step`. This puts a row in exactly that gap.
 #[test]
 fn entry_zoom_ladder_ignores_rejected_rows() {
-    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+    use tylertoo_core::internal::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
@@ -1945,7 +1945,7 @@ fn nan_sort_key_rows_are_keyless_not_dropped() {
 /// before any conversion work rather than silently ignored.
 #[test]
 fn entry_zoom_missing_column_is_rejected() {
-    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+    use tylertoo_core::internal::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
@@ -1969,7 +1969,7 @@ fn entry_zoom_missing_column_is_rejected() {
 /// sends the reader looking at a spec that did name values.
 #[test]
 fn entry_zoom_rungs_matching_no_value_are_rejected_by_name() {
-    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+    use tylertoo_core::internal::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
@@ -2317,7 +2317,7 @@ fn lnglat_rect(lng_min: f64, lat_min: f64, lng_max: f64, lat_max: f64) -> Geomet
 /// The convert must not count the cell as lost either, since nothing is.
 #[test]
 fn overhanging_cell_is_drawn_on_both_sides_of_the_antimeridian() {
-    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
+    use tylertoo_core::internal::decode::{decode_pmtiles, DecodeOptions};
 
     let geoms: Vec<Option<Geometry<f64>>> = vec![
         Some(lnglat_rect(178.0, -1.0, 181.0, 1.0)), // id 0: overhangs
@@ -2369,7 +2369,7 @@ fn overhanging_cell_is_drawn_on_both_sides_of_the_antimeridian() {
         );
     }
     // The archive advertises a valid bbox, not lng 181.
-    let archive = tylertoo_core::archive_index::ArchiveIndex::open(tout.path()).unwrap();
+    let archive = tylertoo_core::internal::archive_index::ArchiveIndex::open(tout.path()).unwrap();
     let header = archive.header();
     assert!(
         header.max_lon <= 180.0 && header.min_lon >= -180.0,
@@ -2406,7 +2406,7 @@ fn bbox_on_the_far_side_of_the_antimeridian_selects_the_overhang() {
 /// out of range and the convert failed with nothing left to tile.
 #[test]
 fn zero_to_360_dataset_converts_and_tiles_at_wrapped_longitudes() {
-    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
+    use tylertoo_core::internal::decode::{decode_pmtiles, DecodeOptions};
 
     let geoms: Vec<Option<Geometry<f64>>> = [200.0, 250.0, 300.0, 350.0]
         .iter()
@@ -2453,7 +2453,7 @@ fn zero_to_360_dataset_converts_and_tiles_at_wrapped_longitudes() {
 /// both pipelines agree.
 #[test]
 fn property_selection_narrows_the_overview_columns() {
-    use tylertoo_core::overview::properties::PropertySelection;
+    use tylertoo_core::internal::overview::properties::PropertySelection;
 
     let tin = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &spread_points(4), true, Some("extra"));
@@ -2515,7 +2515,7 @@ fn property_selection_narrows_the_overview_columns() {
 /// column the caller asked for would be worse than stopping.
 #[test]
 fn property_selection_rejects_knob_columns_and_typos() {
-    use tylertoo_core::overview::properties::PropertySelection;
+    use tylertoo_core::internal::overview::properties::PropertySelection;
 
     let tin = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &spread_points(4), true, Some("extra"));
@@ -2607,7 +2607,7 @@ fn property_selection_rejects_knob_columns_and_typos() {
 #[test]
 fn property_selection_honours_the_declared_covering() {
     use arrow_array::{Array, ArrayRef, Int32Array, StructArray};
-    use tylertoo_core::overview::properties::PropertySelection;
+    use tylertoo_core::internal::overview::properties::PropertySelection;
 
     let wkb_point = |x: f64, y: f64| {
         let mut b = vec![1u8];
@@ -2680,9 +2680,9 @@ fn property_selection_honours_the_declared_covering() {
 /// silently narrowed to the first call's columns.
 #[test]
 fn property_selection_makes_the_source_single_use() {
-    use tylertoo_core::input_set::ConvertSource;
-    use tylertoo_core::overview::convert::convert_to_overviews_sources;
-    use tylertoo_core::overview::properties::PropertySelection;
+    use tylertoo_core::internal::input_set::ConvertSource;
+    use tylertoo_core::internal::overview::convert::convert_to_overviews_sources;
+    use tylertoo_core::internal::overview::properties::PropertySelection;
 
     let tin = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &spread_points(4), true, Some("extra"));
@@ -2864,7 +2864,7 @@ fn scattered_fields(n: usize) -> Vec<Option<Geometry<f64>>> {
 #[test]
 fn small_factor_placeholders_reach_the_tiles() {
     use std::collections::HashSet;
-    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
+    use tylertoo_core::internal::decode::{decode_pmtiles, DecodeOptions};
 
     let tin = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &scattered_fields(6_000), true, None);
@@ -2934,8 +2934,8 @@ fn small_factor_placeholders_reach_the_tiles() {
 /// points only, so the accumulator stays off there.
 #[test]
 fn tiny_polygon_accumulator_stays_out_of_point_bands() {
-    use tylertoo_core::overview::convert::RepresentationBand;
-    use tylertoo_core::overview::simplify::Representation;
+    use tylertoo_core::internal::overview::convert::RepresentationBand;
+    use tylertoo_core::internal::overview::simplify::Representation;
 
     let tin = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &field_block(), true, None);

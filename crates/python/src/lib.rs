@@ -33,22 +33,22 @@ use std::path::{Path, PathBuf};
     reason = "#445: process-wide Python logging bridge reset handle"
 )]
 use std::sync::OnceLock;
-use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
-use tylertoo_core::error::{Classify, ErrorKind};
-use tylertoo_core::input_set::ConvertSource;
-use tylertoo_core::overview::check::validate_file;
-use tylertoo_core::overview::config::keywords as config_keywords;
-use tylertoo_core::overview::convert::{
+use tylertoo_core::internal::decode::{decode_pmtiles, DecodeError, DecodeOptions};
+use tylertoo_core::internal::error::{Classify, ErrorKind};
+use tylertoo_core::internal::input_set::ConvertSource;
+use tylertoo_core::internal::overview::check::validate_file;
+use tylertoo_core::internal::overview::config::keywords as config_keywords;
+use tylertoo_core::internal::overview::convert::{
     convert_to_overviews, convert_to_overviews_sources, ConvertError, ConvertOptions,
 };
-use tylertoo_core::overview::export::{
+use tylertoo_core::internal::overview::export::{
     export_pmtiles as export_pmtiles_core, ExportError, ExportOptions,
 };
-use tylertoo_core::overview::tiles::{
+use tylertoo_core::internal::overview::tiles::{
     convert_to_pmtiles, intermediate_space_preflight, SpaceRemedies, TilesError, TilesInput,
     TilesOptions, TilesOutcome,
 };
-use tylertoo_core::pyramid::{build_pyramid, parse_bands, PyramidError};
+use tylertoo_core::internal::pyramid::{build_pyramid, parse_bands, PyramidError};
 
 pyo3::create_exception!(
     _tylertoo,
@@ -172,7 +172,7 @@ fn decode_error_to_py(e: DecodeError) -> PyErr {
 }
 
 /// A source-loss spill that could not be handed to Python.
-fn accounting_error_to_py(e: tylertoo_core::diagnostics::AccountingError) -> PyErr {
+fn accounting_error_to_py(e: tylertoo_core::internal::diagnostics::AccountingError) -> PyErr {
     let e = tylertoo_core::Error::from(e);
     to_py(e.kind(), e.to_string(), None)
 }
@@ -191,7 +191,10 @@ fn report_dict<T: serde::Serialize>(py: Python<'_>, report: &T) -> PyResult<Py<P
 fn report_dict_with_losses(
     py: Python<'_>,
     report: &impl serde::Serialize,
-    losses: &[(&tylertoo_core::diagnostics::SourceLosses, Option<&str>)],
+    losses: &[(
+        &tylertoo_core::internal::diagnostics::SourceLosses,
+        Option<&str>,
+    )],
 ) -> PyResult<Py<PyDict>> {
     let dict = report_dict(py, report)?;
     for (losses, section) in losses {
@@ -244,7 +247,7 @@ fn export_config(values: serde_json::Map<String, serde_json::Value>) -> PyResult
 
 fn pyramid_config(
     values: serde_json::Map<String, serde_json::Value>,
-) -> PyResult<tylertoo_core::pyramid::PyramidOptions> {
+) -> PyResult<tylertoo_core::internal::pyramid::PyramidOptions> {
     check_keywords("pyramid", &values)?;
     config_keywords::pyramid(values).map_err(config_err)
 }
@@ -399,7 +402,7 @@ fn validate(py: Python<'_>, file: &str) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
     let path = Path::new(file).to_path_buf();
     let report = py.detach(|| validate_file(&path)).map_err(|e| {
-        let kind = tylertoo_core::error::kind_of(&e).unwrap_or(ErrorKind::Runtime);
+        let kind = tylertoo_core::internal::error::kind_of(&e).unwrap_or(ErrorKind::Runtime);
         to_py(kind, format!("could not open '{file}': {e}"), None)
     })?;
 
@@ -520,8 +523,8 @@ mod config_parity {
     use super::*;
     use clap::Parser;
     use serde_json::{json, Value};
-    use tylertoo_core::overview::config::cli;
-    use tylertoo_core::overview::convert::LevelPlan;
+    use tylertoo_core::internal::overview::config::cli;
+    use tylertoo_core::internal::overview::convert::LevelPlan;
 
     fn native_keywords(value: Value) -> serde_json::Map<String, Value> {
         Python::attach(|py| {
@@ -576,7 +579,7 @@ mod config_parity {
         };
         core.simplify.cascade = false;
         core.density.kinds.lines = true;
-        core.assign.sort_direction = tylertoo_core::overview::assign::SortDirection::Asc;
+        core.assign.sort_direction = tylertoo_core::internal::overview::assign::SortDirection::Asc;
         core.properties.include = Some(vec!["id".into()]);
         let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
         assert_eq!(
@@ -704,7 +707,7 @@ mod config_parity {
             cli::PyramidArgs::parse_from(["pyramid", "out", "--band", "0-3:never-read.parquet"]);
         let cli_defaults = cli::pyramid_options(&defaults);
         let python = pyramid_config(native_keywords(json!({}))).unwrap();
-        let core = tylertoo_core::pyramid::PyramidOptions::default();
+        let core = tylertoo_core::internal::pyramid::PyramidOptions::default();
         let expected = serde_json::to_value(core.validate().unwrap().options()).unwrap();
         assert_eq!(
             serde_json::to_value(cli_defaults.validate().unwrap().options()).unwrap(),
@@ -730,7 +733,7 @@ mod config_parity {
         ]);
         let cli = cli::pyramid_options(&args);
         let python = pyramid_config(native_keywords(json!({"generalize": true, "tile_size_limit": 1048576, "extent": 8192, "name": "Bands", "allow_missing_zooms": true}))).unwrap();
-        let mut core = tylertoo_core::pyramid::PyramidOptions::new(true);
+        let mut core = tylertoo_core::internal::pyramid::PyramidOptions::new(true);
         core.export.tile_size_limit = Some(1048576);
         core.export.extent = 8192;
         core.metadata.name = Some("Bands".into());

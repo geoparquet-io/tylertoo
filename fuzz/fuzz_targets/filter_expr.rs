@@ -6,7 +6,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use tylertoo_core::overview::filter::parse_filter;
+use tylertoo_core::internal::overview::filter::parse_filter;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(src) = std::str::from_utf8(data) {

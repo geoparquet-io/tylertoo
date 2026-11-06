@@ -24,10 +24,12 @@ use std::path::Path;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{Coord, Geometry, LineString, Polygon};
-use tylertoo_core::diagnostics::Diagnostics;
-use tylertoo_core::overview::assign::AssignConfig;
-use tylertoo_core::overview::coalesce::{coalesce_level_lines, CoalesceInput, CoalesceParams};
-use tylertoo_core::overview::simplify::{
+use tylertoo_core::internal::diagnostics::Diagnostics;
+use tylertoo_core::internal::overview::assign::AssignConfig;
+use tylertoo_core::internal::overview::coalesce::{
+    coalesce_level_lines, CoalesceInput, CoalesceParams,
+};
+use tylertoo_core::internal::overview::simplify::{
     simplify_cascade, simplify_for_level, CascadeStep, Crs, Simplified, SimplifyOptions,
 };
 
@@ -146,7 +148,7 @@ fn real_geometries(path: &Path) -> Vec<Geometry<f64>> {
     for batch in builder.build().unwrap() {
         let batch = batch.unwrap();
         let array = geoarrow::array::from_arrow_array(batch.column(idx).as_ref(), field).unwrap();
-        tylertoo_core::batch_processor::extract_geometries_from_array(
+        tylertoo_core::internal::batch_processor::extract_geometries_from_array(
             array.as_ref(),
             &mut geoms,
             &Diagnostics::default(),

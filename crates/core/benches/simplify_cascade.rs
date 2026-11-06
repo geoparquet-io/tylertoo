@@ -21,8 +21,8 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::Geometry;
 use geoarrow::array::from_arrow_array;
-use tylertoo_core::batch_processor::extract_geometries_from_array;
-use tylertoo_core::overview::simplify::{
+use tylertoo_core::internal::batch_processor::extract_geometries_from_array;
+use tylertoo_core::internal::overview::simplify::{
     simplify_cascade, CascadeStep, CollapseMode, Crs, SimplifyOptions,
 };
 use tylertoo_io::open_parquet;
@@ -64,7 +64,7 @@ fn load_largest_boundary() -> Option<Geometry<f64>> {
         extract_geometries_from_array(
             garr.as_ref(),
             &mut geoms,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
         )
         .ok()?;
         for g in geoms {
@@ -137,7 +137,7 @@ fn bench_simplify_cascade(c: &mut Criterion) {
                         black_box(&steps),
                         Crs::Epsg4326,
                         black_box(opts),
-                        &tylertoo_core::diagnostics::Diagnostics::default(),
+                        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
                     ))
                 });
             });

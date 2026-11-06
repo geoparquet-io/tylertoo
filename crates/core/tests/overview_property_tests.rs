@@ -47,12 +47,16 @@ use std::collections::HashMap;
 use geo::{Geometry, LineString, MultiLineString, Point};
 use proptest::prelude::*;
 
-use tylertoo_core::overview::assign::{
+use tylertoo_core::internal::overview::assign::{
     apply_density_budget, assign_levels, AssignConfig, AssignFeature, Assignment, BudgetKinds, Crs,
     DensityBudgetConfig, FeatureKind, FeatureTable, SortDirection, MIN_DENSITY_LEVEL_FEATURES,
 };
-use tylertoo_core::overview::cluster::{build_cluster_tables, verify_sum_invariant, AccumulateOp};
-use tylertoo_core::overview::coalesce::{coalesce_level_lines, CoalesceInput, CoalesceParams};
+use tylertoo_core::internal::overview::cluster::{
+    build_cluster_tables, verify_sum_invariant, AccumulateOp,
+};
+use tylertoo_core::internal::overview::coalesce::{
+    coalesce_level_lines, CoalesceInput, CoalesceParams,
+};
 
 /// Array-of-structs fixture → the column-major table the engine takes (#543).
 fn table(feats: &[AssignFeature]) -> FeatureTable {

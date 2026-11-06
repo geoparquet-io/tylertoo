@@ -40,7 +40,9 @@ pub enum ReaderError {
     Io(#[from] std::io::Error),
     /// Underlying parquet error (footer parse, row-group read).
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] tylertoo_io::ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] tylertoo_io::ParquetError),
     /// The overview file could not be opened (#452: the bare [`Self::Io`]
     /// named no file). Not a `#[source]`, so `Caused by:` chains do not
     /// repeat the reason.
@@ -60,6 +62,7 @@ pub enum ReaderError {
         /// The file as given.
         path: String,
         /// The underlying Parquet error.
+        #[doc(hidden)]
         error: tylertoo_io::ParquetError,
     },
     /// The `geo:overviews` footer key is absent — not an overview file.
@@ -92,6 +95,13 @@ pub enum ReaderError {
         /// The number of levels in the file.
         num_levels: usize,
     },
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::ParquetError> for ReaderError {
+    fn from(e: tylertoo_io::ParquetError) -> Self {
+        ReaderError::Parquet(e)
+    }
 }
 
 /// A reader over a local GeoParquet overview file.

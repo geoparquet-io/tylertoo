@@ -1,17 +1,17 @@
-use tylertoo_core::error::{Classify, ErrorKind};
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions};
+use tylertoo_core::internal::error::{Classify, ErrorKind};
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions};
 
 #[test]
 fn plan_sources_validates_before_opening_input() {
-    use tylertoo_core::input_set::ConvertSource;
-    use tylertoo_core::overview::convert::write_convert_plan_sources;
+    use tylertoo_core::internal::input_set::ConvertSource;
+    use tylertoo_core::internal::overview::convert::write_convert_plan_sources;
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("corrupt.parquet");
     std::fs::write(&input, b"corrupt").unwrap();
     let source = ConvertSource::resolve_path(&input).unwrap();
     let opts = ConvertOptions {
-        levels: tylertoo_core::overview::convert::LevelPlan::Gsds(vec![]),
-        properties: tylertoo_core::overview::properties::PropertySelection {
+        levels: tylertoo_core::internal::overview::convert::LevelPlan::Gsds(vec![]),
+        properties: tylertoo_core::internal::overview::properties::PropertySelection {
             exclude_all: true,
             ..Default::default()
         },
@@ -62,7 +62,7 @@ fn core_owns_read_bounds() {
         .unwrap();
     }
     let opts = ConvertOptions {
-        read_workers: tylertoo_core::overview::convert::read_workers_ceiling() + 1,
+        read_workers: tylertoo_core::internal::overview::convert::read_workers_ceiling() + 1,
         ..Default::default()
     };
     assert!(opts.validate().is_err(), "accepted excess read_workers");
@@ -70,7 +70,7 @@ fn core_owns_read_bounds() {
 
 #[test]
 fn shard_plan_existing_output_explains_fleet_identity() {
-    use tylertoo_core::overview::config::{check_output, OutputKind};
+    use tylertoo_core::internal::overview::config::{check_output, OutputKind};
     let file = tempfile::NamedTempFile::new().unwrap();
     let err = check_output(file.path(), OutputKind::ShardPlan, false).unwrap_err();
     let message = err.to_string();

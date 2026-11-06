@@ -20,9 +20,11 @@ mod fixture;
 
 #[test]
 fn madagascar_adm4_keeps_every_polygon_at_z8_by_default() {
-    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
-    use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+    use tylertoo_core::internal::decode::{decode_pmtiles, DecodeOptions};
+    use tylertoo_core::internal::overview::convert::{
+        convert_to_overviews, ConvertOptions, LevelPlan,
+    };
+    use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
 
     let Some(fixture_path) = fixture::realdata("fieldmaps-madagascar-adm4.parquet") else {
         return;

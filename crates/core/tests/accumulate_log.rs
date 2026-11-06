@@ -6,8 +6,8 @@
 use std::sync::Mutex;
 
 use geo::{Geometry, LineString, Polygon};
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::simplify::{CollapseMode, SimplifyOptions};
 
 #[expect(
     dead_code,

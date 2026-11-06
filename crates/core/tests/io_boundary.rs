@@ -11,7 +11,7 @@ fn corpus(target: &str, name: &str) -> PathBuf {
 /// Every row of every column of the input at `path`, read the way a
 /// convert reads it.
 fn read_all(path: &Path) -> Result<usize, String> {
-    let source = tylertoo_core::input::InputSource::Local(path.to_path_buf());
+    let source = tylertoo_core::internal::input::InputSource::Local(path.to_path_buf());
     let reader = source
         .open()
         .map_err(|e| e.to_string())?
@@ -31,13 +31,13 @@ fn issue_683_crafted_arrow_schema_is_an_error_on_every_open() {
     let path = corpus("overview_file", "seed-issue-683-arrow-schema.parquet");
     let err = read_all(&path).unwrap_err();
     assert!(err.contains("panicked"), "input open: {err}");
-    let err = tylertoo_core::overview::reader::OverviewReader::open(&path)
+    let err = tylertoo_core::internal::overview::reader::OverviewReader::open(&path)
         .unwrap_err()
         .to_string();
     assert!(err.contains("panicked"), "overview reader: {err}");
     // `validate` must not pass a file export refuses: the schema decode
     // is one of its checks.
-    let report = tylertoo_core::overview::check::validate_file(&path).unwrap();
+    let report = tylertoo_core::internal::overview::check::validate_file(&path).unwrap();
     let failed = report
         .checks
         .iter()
@@ -72,7 +72,7 @@ fn issue_690_huge_num_children_is_refused_before_the_decode() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("oom.parquet");
     std::fs::write(&path, &file).unwrap();
-    let err = tylertoo_core::overview::check::validate_file(&path)
+    let err = tylertoo_core::internal::overview::check::validate_file(&path)
         .unwrap_err()
         .to_string();
     assert!(err.contains("children"), "{err}");

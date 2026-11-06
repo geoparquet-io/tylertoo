@@ -4,15 +4,15 @@
 //! file stays in the quick tier.
 use geo::{Coord, LineString, MultiLineString};
 use proptest::prelude::*;
-use tylertoo_core::mvt::{
+use tylertoo_core::internal::mvt::{
     command_decode, command_encode, encode_linestring, encode_multi_linestring, geo_to_tile_coords,
     zigzag_decode, zigzag_encode,
 };
-use tylertoo_core::pmtiles_writer::{
+use tylertoo_core::internal::pmtiles_writer::{
     decode_directory, decode_varint, encode_directory, encode_varint, tile_id, tile_id_to_zxy,
     DirEntry, Header,
 };
-use tylertoo_core::tile::{tile_bounds, tiles_per_axis};
+use tylertoo_core::internal::tile::{tile_bounds, tiles_per_axis};
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]

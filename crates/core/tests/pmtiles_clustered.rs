@@ -21,16 +21,18 @@
 //! go-pmtiles-style verifier can never disagree about one archive, in either
 //! direction.
 
-use tylertoo_core::pmtiles_writer::verify_clustered;
+use tylertoo_core::internal::pmtiles_writer::verify_clustered;
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;
 
 #[test]
 fn header_clustered_flag_matches_the_actual_entry_layout() {
-    use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
-    use tylertoo_core::pmtiles_writer::Header;
+    use tylertoo_core::internal::overview::convert::{
+        convert_to_overviews, ConvertOptions, LevelPlan,
+    };
+    use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
+    use tylertoo_core::internal::pmtiles_writer::Header;
 
     let Some(fixture_path) = fixture::realdata("fieldmaps-madagascar-adm4.parquet") else {
         return;

@@ -268,10 +268,14 @@ impl OverviewWriterOptions {
 pub enum WriterError {
     /// Underlying parquet error.
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] tylertoo_io::ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] tylertoo_io::ParquetError),
     /// Arrow error (e.g. building a record batch).
     #[error("arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Arrow(#[source] arrow_schema::ArrowError),
     /// I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -319,6 +323,20 @@ pub enum WriterError {
         /// Levels declared in the options.
         expected: usize,
     },
+}
+
+#[doc(hidden)]
+impl From<arrow_schema::ArrowError> for WriterError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        WriterError::Arrow(e)
+    }
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::ParquetError> for WriterError {
+    fn from(e: tylertoo_io::ParquetError) -> Self {
+        WriterError::Parquet(e)
+    }
 }
 
 /// Outcome of one [`OverviewWriter::write_level`] call.

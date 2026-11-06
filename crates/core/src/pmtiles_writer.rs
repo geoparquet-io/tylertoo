@@ -517,7 +517,7 @@ fn hilbert_d2xy(z: u8, d: u64) -> (u32, u32) {
 ///
 /// **The number this picks is a peak-memory target, not an address count.**
 /// Each expanded entry costs tens of bytes of reader state — 32 bytes for a
-/// `TileRef` in [`crate::decode`], more for a `BTreeMap` node in the pyramid
+/// `TileRef` in `crate::decode`, more for a `BTreeMap` node in the pyramid
 /// merge — and both are held for the whole walk. 2^26 entries is therefore
 /// about 2.1 GB of `TileRef` (more in the merge): heavy, but a bound a real
 /// machine survives, chosen so that no header value can turn a kilobyte of
@@ -1512,8 +1512,8 @@ impl StreamingWriteStats {
 /// # Example
 ///
 /// ```no_run
-/// use tylertoo_core::pmtiles_writer::StreamingPmtilesWriter;
-/// use tylertoo_core::compression::Compression;
+/// use tylertoo_core::internal::pmtiles_writer::StreamingPmtilesWriter;
+/// use tylertoo_core::internal::compression::Compression;
 /// use std::path::Path;
 ///
 /// let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();

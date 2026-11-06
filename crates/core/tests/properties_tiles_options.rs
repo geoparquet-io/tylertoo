@@ -6,7 +6,7 @@
 //! help, `core_owns_read_bounds`), not core's code, so loosening a bound
 //! fails. `None` means the range is undocumented and only the name is checked.
 use proptest::prelude::*;
-use tylertoo_core::overview::tiles::TilesOptions;
+use tylertoo_core::internal::overview::tiles::TilesOptions;
 
 /// The flag each refusal must name.
 const KNOBS: [&str; 5] = [

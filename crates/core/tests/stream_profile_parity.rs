@@ -16,10 +16,10 @@
 
 use std::path::{Path, PathBuf};
 
-use tylertoo_core::overview::convert::{
+use tylertoo_core::internal::overview::convert::{
     convert_to_overviews, ConvertOptions, LevelPlan, IN_FLIGHT_BATCHES_AUTO, IN_FLIGHT_BATCHES_MAX,
 };
-use tylertoo_core::overview::level::{MemoryProfile, Mode};
+use tylertoo_core::internal::overview::level::{MemoryProfile, Mode};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;

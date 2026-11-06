@@ -82,7 +82,9 @@ pub enum InputError {
     Io(#[from] std::io::Error),
     /// Parquet error (footer parse, reader construction).
     #[error("parquet error: {}", parquet_error_detail(.0))]
-    Parquet(#[from] ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] ParquetError),
     /// An input file could not be opened (#452: the bare [`Self::Io`] named
     /// no file). Not a `#[source]`: the message already carries the reason,
     /// and a source would repeat it in every `Caused by:` chain.
@@ -100,6 +102,7 @@ pub enum InputError {
         /// Display name of the input (path or URL).
         input: String,
         /// The underlying Parquet error.
+        #[doc(hidden)]
         error: ParquetError,
     },
     /// The input looks like a URL but uses a scheme we do not support.
@@ -126,7 +129,9 @@ pub enum InputError {
     Remote {
         /// The input URL.
         url: String,
-        /// The underlying object-store error.
+        /// The underlying object-store error (#437: hidden, so the
+        /// `object_store` type is not stable API).
+        #[doc(hidden)]
         #[source]
         source: object_store::Error,
     },
@@ -136,7 +141,9 @@ pub enum InputError {
     RemoteConfig(String),
     /// Arrow error surfaced while decoding record batches from a stream.
     #[error("arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Arrow(#[source] arrow_schema::ArrowError),
     /// A partition of a multi-file input does not match the first partition
     /// (schema shape, geometry extension metadata, or CRS).
     #[error("incompatible input partition {offender:?}: {detail} (first partition: {first:?})")]
@@ -195,6 +202,20 @@ pub enum InputError {
         /// The glob crate's error message.
         message: String,
     },
+}
+
+#[doc(hidden)]
+impl From<arrow_schema::ArrowError> for InputError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        InputError::Arrow(e)
+    }
+}
+
+#[doc(hidden)]
+impl From<ParquetError> for InputError {
+    fn from(e: ParquetError) -> Self {
+        InputError::Parquet(e)
+    }
 }
 
 /// A [`ParquetError`]'s message without the `Parquet error: ` prefix its

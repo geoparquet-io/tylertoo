@@ -99,10 +99,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use tylertoo_core::archive_index::ArchiveIndex;
-use tylertoo_core::compression;
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_core::internal::archive_index::ArchiveIndex;
+use tylertoo_core::internal::compression;
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;

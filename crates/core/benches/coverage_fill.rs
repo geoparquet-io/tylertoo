@@ -27,8 +27,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
 use tylertoo_io::open_parquet;
 use tylertoo_io::test_support::ArrowWriter;
 

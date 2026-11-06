@@ -12,8 +12,8 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;

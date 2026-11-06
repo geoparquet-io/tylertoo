@@ -9,13 +9,13 @@
 
 use std::path::PathBuf;
 
-use tylertoo_core::archive_index::ArchiveIndex;
-use tylertoo_core::compression::{compress, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
-use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
-use tylertoo_core::pmtiles_writer::{
+use tylertoo_core::internal::archive_index::ArchiveIndex;
+use tylertoo_core::internal::compression::{compress, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
+use tylertoo_core::internal::decode::{decode_pmtiles, DecodeError, DecodeOptions};
+use tylertoo_core::internal::pmtiles_writer::{
     encode_directory, tile_id, DirEntry, Header, MAX_LEAF_DIRECTORIES,
 };
-use tylertoo_core::{Compression, StreamingPmtilesWriter};
+use tylertoo_core::{internal::StreamingPmtilesWriter, Compression};
 
 /// A minimal MVT tile: one layer `t` with one point feature at (1, 1).
 const POINT_TILE: &[u8] = &[

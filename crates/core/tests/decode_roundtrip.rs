@@ -34,11 +34,11 @@ use geoparquet::writer::{
 use tylertoo_io::open_parquet;
 use tylertoo_io::test_support::ArrowWriter;
 
-use tylertoo_core::batch_processor::extract_geometries_from_array;
-use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
-use tylertoo_core::overview::level::Mode;
+use tylertoo_core::internal::batch_processor::extract_geometries_from_array;
+use tylertoo_core::internal::decode::{decode_pmtiles, DecodeError, DecodeOptions};
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_core::internal::overview::level::Mode;
 
 const MIN_ZOOM: u8 = 4;
 const MAX_ZOOM: u8 = 14;
@@ -184,7 +184,7 @@ fn read_rows(path: &Path) -> Vec<Row> {
         extract_geometries_from_array(
             garr.as_ref(),
             &mut geoms,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
         )
         .unwrap();
         assert_eq!(geoms.len(), batch.num_rows(), "no null geometry rows");
@@ -712,7 +712,7 @@ fn mvt_point_tile(x: u32, y: u32) -> Vec<u8> {
 /// write a root: every offset after the first is the contiguous marker 0.
 /// Independent of `encode_directory` on purpose — this pins the on-disk
 /// shape that other writers produce, whatever our encoder does.
-fn tippecanoe_style_root(entries: &[tylertoo_core::pmtiles_writer::DirEntry]) -> Vec<u8> {
+fn tippecanoe_style_root(entries: &[tylertoo_core::internal::pmtiles_writer::DirEntry]) -> Vec<u8> {
     let mut buf = Vec::new();
     varint(entries.len() as u64, &mut buf);
     let mut last_id = 0;
@@ -749,9 +749,9 @@ fn tippecanoe_style_root(entries: &[tylertoo_core::pmtiles_writer::DirEntry]) ->
 /// the leaves and tile data, and the root is rewritten by hand.
 #[test]
 fn decode_reads_foreign_root_with_contiguous_leaf_offsets() {
-    use tylertoo_core::compression::{compress, decompress_capped, MAX_INTERNAL_BYTES};
-    use tylertoo_core::pmtiles_writer::{decode_directory, Header};
-    use tylertoo_core::{Compression, StreamingPmtilesWriter};
+    use tylertoo_core::internal::compression::{compress, decompress_capped, MAX_INTERNAL_BYTES};
+    use tylertoo_core::internal::pmtiles_writer::{decode_directory, Header};
+    use tylertoo_core::{internal::StreamingPmtilesWriter, Compression};
 
     let dir = tempfile::tempdir().unwrap();
     let ours = dir.path().join("ours.pmtiles");
@@ -807,7 +807,7 @@ fn decode_reads_foreign_root_with_contiguous_leaf_offsets() {
     // Our encoder now writes exactly this shape; pin that parity explicitly,
     // since the splice below is otherwise a no-op against our own archive.
     assert_eq!(
-        tylertoo_core::pmtiles_writer::encode_directory(&root),
+        tylertoo_core::internal::pmtiles_writer::encode_directory(&root),
         plain_root,
         "encode_directory must write leaf pointers with contiguous offsets"
     );

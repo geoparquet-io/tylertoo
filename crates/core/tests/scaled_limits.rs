@@ -27,11 +27,11 @@
 
 use std::path::Path;
 
-use tylertoo_core::overview::check::validate_file;
-use tylertoo_core::overview::convert::{
+use tylertoo_core::internal::overview::check::validate_file;
+use tylertoo_core::internal::overview::convert::{
     convert_to_overviews, ConvertOptions, ConvertReport, LevelPlan,
 };
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions, ExportReport};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions, ExportReport};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;
@@ -357,7 +357,8 @@ fn loss_reports_exceeding_the_memory_allowance(dir: &Path) {
         ..Default::default()
     };
     assert!(
-        (ROWS - 1) * std::mem::size_of::<tylertoo_core::diagnostics::SourceLoss>() > (1 << 20) / 10
+        (ROWS - 1) * std::mem::size_of::<tylertoo_core::internal::diagnostics::SourceLoss>()
+            > (1 << 20) / 10
     );
     for report_requested in [false, true] {
         let report = convert_to_overviews(
@@ -395,10 +396,10 @@ fn loss_reports_exceeding_the_memory_allowance(dir: &Path) {
         replay.source_losses.iter().last().unwrap().unwrap().id,
         (ROWS - 1) as u64
     );
-    let tiles = tylertoo_core::overview::tiles::convert_to_pmtiles(
-        &tylertoo_core::overview::tiles::TilesInput::Path(input.clone()),
+    let tiles = tylertoo_core::internal::overview::tiles::convert_to_pmtiles(
+        &tylertoo_core::internal::overview::tiles::TilesInput::Path(input.clone()),
         &dir.join("losses.pmtiles"),
-        &tylertoo_core::overview::tiles::TilesOptions {
+        &tylertoo_core::internal::overview::tiles::TilesOptions {
             convert: ConvertOptions {
                 save_plan: None,
                 ..options.clone()
@@ -407,11 +408,12 @@ fn loss_reports_exceeding_the_memory_allowance(dir: &Path) {
         },
     )
     .unwrap();
-    let tylertoo_core::overview::tiles::TilesOutcome::Converted(tiles) = tiles else {
+    let tylertoo_core::internal::overview::tiles::TilesOutcome::Converted(tiles) = tiles else {
         panic!("{tiles:?}");
     };
     assert_eq!(tiles.convert.source_losses.len(), ROWS - 1);
-    tylertoo_core::diagnostics::write_report(&dir.join("tiles-losses.json"), &tiles).unwrap();
+    tylertoo_core::internal::diagnostics::write_report(&dir.join("tiles-losses.json"), &tiles)
+        .unwrap();
     // Export losses: tiny polygons collapse at z0 while row zero survives.
     let mut polygon = vec![1, 3, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0];
     for coord in [0f64, 0., 0.000001, 0., 0.000001, 0.000001, 0., 0.] {
@@ -451,19 +453,18 @@ fn loss_reports_exceeding_the_memory_allowance(dir: &Path) {
         },
     )
     .unwrap();
-    let exported = tylertoo_core::overview::export::export_pmtiles(
+    let exported = tylertoo_core::internal::overview::export::export_pmtiles(
         &overview,
         dir.join("quantized.pmtiles"),
-        &tylertoo_core::overview::export::ExportOptions {
+        &tylertoo_core::internal::overview::export::ExportOptions {
             feature_id: Some("id".into()),
             ..Default::default()
         },
     )
     .unwrap();
     assert_eq!(exported.source_losses.len(), ROWS - 1);
-    assert!(exported
-        .source_losses
-        .iter()
-        .all(|loss| loss.unwrap().cause == tylertoo_core::diagnostics::SourceLossCause::Quantized));
-    tylertoo_core::diagnostics::write_report(&dir.join("export-losses.json"), &exported).unwrap();
+    assert!(exported.source_losses.iter().all(|loss| loss.unwrap().cause
+        == tylertoo_core::internal::diagnostics::SourceLossCause::Quantized));
+    tylertoo_core::internal::diagnostics::write_report(&dir.join("export-losses.json"), &exported)
+        .unwrap();
 }

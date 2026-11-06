@@ -568,6 +568,7 @@ impl TileRange {
         Some(start..=end)
     }
 
+    #[doc(hidden)]
     /// The exact geographic extent of the run's pivot tiles.
     ///
     /// This is what a shard archive advertises as its bounds (intersected with
@@ -590,6 +591,7 @@ impl TileRange {
         out.unwrap_or_else(|| TileBounds::new(-180.0, -90.0, 180.0, 90.0))
     }
 
+    #[doc(hidden)]
     /// [`TileRange::tile_bounds`] widened by `SHARD_READ_MARGIN_TILES` pivot
     /// tiles on every side — the bbox a shard prunes its **input row groups**
     /// against.
@@ -796,6 +798,7 @@ impl ShardPlan {
         }
     }
 
+    #[doc(hidden)]
     /// Cut a plan for `source`, balancing on footer statistics alone.
     ///
     /// # Errors
@@ -947,6 +950,7 @@ impl ShardPlan {
         Ok(())
     }
 
+    #[doc(hidden)]
     /// Check the plan was cut for the input this run is about to read.
     ///
     /// # Errors

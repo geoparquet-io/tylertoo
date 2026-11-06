@@ -142,6 +142,7 @@ impl PropertySelection {
         !self.exclude.iter().any(|n| n == name)
     }
 
+    #[doc(hidden)]
     /// Resolve the selection against `schema` into the sorted root-column
     /// indices to keep: the geometry column plus every kept property.
     ///

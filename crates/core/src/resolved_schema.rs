@@ -45,12 +45,12 @@ struct SchemaFacts {
 /// including through serde deserialization.
 ///
 /// ```compile_fail
-/// use tylertoo_core::resolved_schema::ResolvedSchema;
+/// use tylertoo_core::internal::resolved_schema::ResolvedSchema;
 /// fn replace_facts(schema: &mut ResolvedSchema) { schema.facts = unreachable!(); }
 /// ```
 ///
 /// ```compile_fail
-/// use tylertoo_core::resolved_schema::ResolvedSchema;
+/// use tylertoo_core::internal::resolved_schema::ResolvedSchema;
 /// let _: ResolvedSchema = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Debug, Clone)]

@@ -925,13 +925,13 @@ pub(crate) mod spelled {
 /// deliberately no public constructor or mutable accessor.
 ///
 /// ```compile_fail
-/// use tylertoo_core::overview::{config::ValidatedConfig, convert::ConvertOptions};
+/// use tylertoo_core::{ConvertOptions, ValidatedConfig};
 /// let options = ConvertOptions::default();
 /// let _config = ValidatedConfig { options: &options };
 /// ```
 ///
 /// ```compile_fail
-/// use tylertoo_core::overview::convert::ConvertOptions;
+/// use tylertoo_core::ConvertOptions;
 /// let mut options = ConvertOptions::default();
 /// let config = options.validate().unwrap();
 /// options.read_batch_size = 0;

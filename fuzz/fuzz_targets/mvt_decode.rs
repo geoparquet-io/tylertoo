@@ -16,5 +16,5 @@ fuzz_target!(|data: &[u8]| {
     // A tile at the far corner of its zoom, so the coordinate lift sees the
     // largest world offsets the zoom allows.
     let max = if z == 0 { 0 } else { (1u32 << z) - 1 };
-    let _ = tylertoo_core::decode::fuzz_decode_tile(z, max, max, tile);
+    let _ = tylertoo_core::internal::decode::fuzz_decode_tile(z, max, max, tile);
 });

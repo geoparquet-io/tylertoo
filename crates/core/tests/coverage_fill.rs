@@ -12,8 +12,8 @@ use std::path::Path;
 
 use geo::{Area, BooleanOps, Coord, LineString, Polygon, Rect};
 use prost::Message;
-use tylertoo_core::archive_index::ArchiveIndex;
-use tylertoo_core::vector_tile::Tile;
+use tylertoo_core::internal::archive_index::ArchiveIndex;
+use tylertoo_core::internal::vector_tile::Tile;
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;
@@ -172,8 +172,10 @@ fn drawn_area(archive: &Path, zoom: u8) -> f64 {
 
 #[test]
 fn coverage_fill_closes_coarse_holes_without_overdrawing() {
-    use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+    use tylertoo_core::internal::overview::convert::{
+        convert_to_overviews, ConvertOptions, LevelPlan,
+    };
+    use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
 
     let Some(fixture_path) = fixture::realdata("fieldmaps-madagascar-adm4.parquet") else {
         return;
@@ -253,8 +255,10 @@ fn coverage_fill_closes_coarse_holes_without_overdrawing() {
 /// lowers the counts for good, lower the bounds with it.
 #[test]
 fn coverage_fill_work_stays_bounded_on_scattered_fields() {
-    use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions, ExportReport};
+    use tylertoo_core::internal::overview::convert::{
+        convert_to_overviews, ConvertOptions, LevelPlan,
+    };
+    use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions, ExportReport};
 
     let Some(fixture_path) = fixture::realdata("ftw-moldova-z10.parquet") else {
         return;
@@ -282,7 +286,8 @@ fn coverage_fill_work_stays_bounded_on_scattered_fields() {
         };
         export_pmtiles(&overview, dir.path().join("out.pmtiles"), &opts).expect("export")
     };
-    let sum = |r: &ExportReport, f: fn(&tylertoo_core::overview::export::ZoomReport) -> u64| {
+    let sum = |r: &ExportReport,
+               f: fn(&tylertoo_core::internal::overview::export::ZoomReport) -> u64| {
         r.zooms.iter().map(f).sum::<u64>()
     };
 
@@ -344,9 +349,11 @@ fn coverage_fill_work_stays_bounded_on_scattered_fields() {
 /// data shard (a tile range) still builds none.
 #[test]
 fn a_coarse_job_draws_the_unsharded_fill_below_its_ceiling() {
-    use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions, ExportReport};
-    use tylertoo_core::shard::TileRange;
+    use tylertoo_core::internal::overview::convert::{
+        convert_to_overviews, ConvertOptions, LevelPlan,
+    };
+    use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions, ExportReport};
+    use tylertoo_core::internal::shard::TileRange;
 
     let Some(fixture_path) = fixture::realdata("ftw-moldova-z10.parquet") else {
         return;
@@ -421,12 +428,12 @@ fn a_coarse_job_draws_the_unsharded_fill_below_its_ceiling() {
 /// z8: 594 fill polygons to 0) while every export-level test still passes.
 #[test]
 fn tiles_shard_coarse_draws_the_unsharded_fill() {
-    use tylertoo_core::overview::convert::{ConvertOptions, LevelPlan};
-    use tylertoo_core::overview::export::{ExportOptions, ExportReport};
-    use tylertoo_core::overview::tiles::{
+    use tylertoo_core::internal::overview::convert::{ConvertOptions, LevelPlan};
+    use tylertoo_core::internal::overview::export::{ExportOptions, ExportReport};
+    use tylertoo_core::internal::overview::tiles::{
         convert_to_pmtiles, TilesInput, TilesOptions, TilesOutcome, TilesShard,
     };
-    use tylertoo_core::shard::ShardRole;
+    use tylertoo_core::internal::shard::ShardRole;
 
     let Some(fixture_path) = fixture::realdata("ftw-moldova-z10.parquet") else {
         return;

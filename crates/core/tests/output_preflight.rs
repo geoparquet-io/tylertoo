@@ -6,12 +6,12 @@
 
 use std::path::{Path, PathBuf};
 
-use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
-use tylertoo_core::merge::{merge_shards, MergeOptions};
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions};
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
-use tylertoo_core::overview::tiles::{convert_to_pmtiles, TilesInput, TilesOptions};
-use tylertoo_core::pyramid::{
+use tylertoo_core::internal::decode::{decode_pmtiles, DecodeOptions};
+use tylertoo_core::internal::merge::{merge_shards, MergeOptions};
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_core::internal::overview::tiles::{convert_to_pmtiles, TilesInput, TilesOptions};
+use tylertoo_core::internal::pyramid::{
     build_pyramid, merge_bands_with_options, Band, BandMergeOptions, PyramidOptions,
 };
 

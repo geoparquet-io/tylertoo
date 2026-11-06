@@ -27,7 +27,7 @@
 //!    partition (see `process_wave`). Sharing one read+decode across a wave
 //!    replaces the old per-partition re-read (issue #228): a level now costs
 //!    `ceil(P / PARTITION_WAVE)` band reads, not `P`. The per-tile clips reuse
-//!    the [`clip_geometry_simple`] entry point, MVT-encode via [`crate::mvt`],
+//!    the [`clip_geometry_simple`] entry point, MVT-encode via `crate::mvt`,
 //!    and each finished partition's tiles stream immediately to
 //!    [`StreamingPmtilesWriter`]. Tiles are written in ascending PMTiles
 //!    tile-id order per zoom, and levels export in ascending zoom, so the
@@ -833,7 +833,9 @@ pub enum ExportError {
     Io(#[from] std::io::Error),
     /// Arrow error decoding a level batch.
     #[error("arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Arrow(#[source] arrow_schema::ArrowError),
     /// A core-library error (geometry decode, PMTiles write).
     #[error("{0}")]
     Core(#[from] crate::Error),
@@ -1127,6 +1129,13 @@ pub enum ExportError {
         /// Where that figure came from, as messages name it.
         limit_source: &'static str,
     },
+}
+
+#[doc(hidden)]
+impl From<arrow_schema::ArrowError> for ExportError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        ExportError::Arrow(e)
+    }
 }
 
 impl crate::error::Classify for ExportError {

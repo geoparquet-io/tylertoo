@@ -99,7 +99,16 @@ pub enum CheckError {
         "cannot read the Parquet footer: {}",
         crate::input::parquet_error_detail(.0)
     )]
-    Parquet(#[from] tylertoo_io::ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] tylertoo_io::ParquetError),
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::ParquetError> for CheckError {
+    fn from(e: tylertoo_io::ParquetError) -> Self {
+        CheckError::Parquet(e)
+    }
 }
 
 /// Validate an overview file at `path` against the §6.2 conformance checklist.

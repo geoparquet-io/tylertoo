@@ -85,8 +85,10 @@ fn verify_with_pmtiles_cli(path: &Path) -> bool {
 /// sibling property test below already assumes.
 #[test]
 fn test_real_data_conversion_keeps_the_root_directory_small() {
-    use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+    use tylertoo_core::internal::overview::convert::{
+        convert_to_overviews, ConvertOptions, LevelPlan,
+    };
+    use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
 
     let Some(fixture_path) = fixture::realdata("fieldmaps-madagascar-adm4.parquet") else {
         return;
@@ -148,9 +150,9 @@ fn test_real_data_conversion_keeps_the_root_directory_small() {
 #[test]
 fn test_root_directory_always_fits_in_16kb() {
     // Property test: generate archives of various sizes and verify root always fits
-    use tylertoo_core::compression::Compression;
-    use tylertoo_core::pmtiles_writer::StreamingPmtilesWriter;
-    use tylertoo_core::tile::TileBounds;
+    use tylertoo_core::internal::compression::Compression;
+    use tylertoo_core::internal::pmtiles_writer::StreamingPmtilesWriter;
+    use tylertoo_core::internal::tile::TileBounds;
 
     let test_cases = [
         ("tiny", 10),

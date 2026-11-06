@@ -16,10 +16,10 @@ use geo::{Coord, Geometry, LineString, Point, Polygon};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use tylertoo_core::clip::clip_geometry;
-use tylertoo_core::ioverlay_clip::clip_polygon_ioverlay;
-use tylertoo_core::sutherland_hodgman::clip_polygon_sh;
-use tylertoo_core::tile::TileBounds;
+use tylertoo_core::internal::clip::clip_geometry;
+use tylertoo_core::internal::ioverlay_clip::clip_polygon_ioverlay;
+use tylertoo_core::internal::sutherland_hodgman::clip_polygon_sh;
+use tylertoo_core::internal::tile::TileBounds;
 
 /// Path to the Antarctica polygon fixture (316k coords, real-world case)
 const ANTARCTICA_FIXTURE: &str = "../../tests/fixtures/realdata/antarctica-polygon.wkb";
@@ -127,7 +127,7 @@ fn bench_ioverlay(c: &mut Criterion) {
                 clip_polygon_ioverlay(
                     black_box(poly),
                     black_box(&bounds),
-                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                    &tylertoo_core::internal::diagnostics::Diagnostics::default(),
                 )
             });
         });
@@ -163,7 +163,7 @@ fn bench_wide_polygon(c: &mut Criterion) {
             clip_polygon_ioverlay(
                 black_box(&small_wide),
                 black_box(&bounds),
-                &tylertoo_core::diagnostics::Diagnostics::default(),
+                &tylertoo_core::internal::diagnostics::Diagnostics::default(),
             )
         });
     });
@@ -189,7 +189,7 @@ fn bench_clip_geometry(c: &mut Criterion) {
                     black_box(geom),
                     black_box(&bounds),
                     black_box(buffer),
-                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                    &tylertoo_core::internal::diagnostics::Diagnostics::default(),
                 )
             });
         });
@@ -229,7 +229,7 @@ fn bench_antarctica_polygon(c: &mut Criterion) {
                 black_box(&geom),
                 black_box(&bounds),
                 0.0,
-                &tylertoo_core::diagnostics::Diagnostics::default(),
+                &tylertoo_core::internal::diagnostics::Diagnostics::default(),
             )
         });
     });
@@ -240,7 +240,7 @@ fn bench_antarctica_polygon(c: &mut Criterion) {
             clip_polygon_ioverlay(
                 black_box(&poly),
                 black_box(&bounds),
-                &tylertoo_core::diagnostics::Diagnostics::default(),
+                &tylertoo_core::internal::diagnostics::Diagnostics::default(),
             )
         });
     });
@@ -302,7 +302,7 @@ fn bench_export_clip_mix(c: &mut Criterion) {
                         black_box(geom),
                         black_box(&bounds),
                         buffer,
-                        &tylertoo_core::diagnostics::Diagnostics::default(),
+                        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
                     ));
                 }
             });
