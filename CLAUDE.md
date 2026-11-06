@@ -20,6 +20,8 @@ records the ownership refactors that landed in #787.
 | Warnings, drop counters, and report lines | the typed `Diagnostic` channel in `diagnostics.rs`; one `Display` each |
 | Geometry column, CRS, version, renames, property columns of an input | `ResolvedSchema` (`resolved_schema.rs`), computed once per input part |
 | Pass-1 scan, assign, carriers, writer options, report, memory budget | the shared pipeline stages (`Pass1Ctx` in `overview/stream.rs`, `MemoryBudget` in `overview/memory.rs`) both engines call |
+| Error class: CLI exit code and Python exception | `ErrorKind` and `Classify` in `error.rs`; frontends map the kind, never match variants or message text |
+| What is stable Rust API | the crate root of `tylertoo-core`; everything else lives under the `#[doc(hidden)]` `internal` module. `crates/core/tests/public_api_gate.rs` checks the baseline |
 
 Clippy's `disallowed-methods` checks reader and output calls, cargo-deny
 checks dependency policy, jscpd checks Rust and Python token clones, and
