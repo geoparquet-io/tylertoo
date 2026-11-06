@@ -104,6 +104,7 @@ pub(crate) fn check_file(meta: &OverviewsMeta, mode: Mode) -> Result<(), ConfigE
     let unlisted_rungs = g
         .and_then(|g| g.entry_zoom.as_ref())
         .filter(|e| e.rungs.is_none());
+    let density = g.and_then(|g| g.density_drop.as_ref());
     let conflict = if mode == Mode::Partitioning {
         Some("a partitioning-mode overview".to_string())
     } else if let Some(z) = g.and_then(|g| g.zoom_ceiling) {
@@ -112,6 +113,12 @@ pub(crate) fn check_file(meta: &OverviewsMeta, mode: Mode) -> Result<(), ConfigE
         ))
     } else if g.is_some_and(|g| g.levels.iter().any(|l| l.thinning_factor > 0.0)) {
         Some("an overview built with --polygon-thinning above 0".to_string())
+    } else if g.is_some_and(|g| g.line_thinning.is_some()) {
+        Some("an overview built with a non-default --line-thinning".to_string())
+    } else if density.is_some_and(|d| d.drop_lines) {
+        Some("an overview built with --drop-lines".to_string())
+    } else if density.is_some_and(|d| d.drop_polygons) {
+        Some("an overview built with --drop-polygons".to_string())
     } else {
         unlisted_rungs.map(|e| {
             format!(
@@ -1329,6 +1336,32 @@ mod tests {
                     ..ConvertOptions::default()
                 },
                 "partial overview",
+            ),
+            // What `tiles` refuses in its convert options, the standalone
+            // export refuses from the footer.
+            (
+                {
+                    let mut c = ConvertOptions::default();
+                    c.assign.line_thinning = 2.0;
+                    c
+                },
+                "--line-thinning",
+            ),
+            (
+                {
+                    let mut c = ConvertOptions::default();
+                    c.density.kinds.lines = true;
+                    c
+                },
+                "--drop-lines",
+            ),
+            (
+                {
+                    let mut c = ConvertOptions::default();
+                    c.density.kinds.polygons = true;
+                    c
+                },
+                "--drop-polygons",
             ),
         ] {
             let ov = overview(dir.path(), 64, convert);

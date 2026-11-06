@@ -3019,6 +3019,8 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::level::CoalescingPro
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::level::CoalescingProvenance
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::level::CoalescingProvenance
 pub struct tylertoo_core::overview::level::DensityProvenance
+pub tylertoo_core::overview::level::DensityProvenance::drop_lines: bool
+pub tylertoo_core::overview::level::DensityProvenance::drop_polygons: bool
 pub tylertoo_core::overview::level::DensityProvenance::drop_rate: f64
 pub tylertoo_core::overview::level::DensityProvenance::gamma: f64
 pub tylertoo_core::overview::level::DensityProvenance::supercell_gsd_factor: f64
@@ -3076,6 +3078,7 @@ pub tylertoo_core::overview::level::Generalization::engine: alloc::string::Strin
 pub tylertoo_core::overview::level::Generalization::entry_zoom: core::option::Option<tylertoo_core::overview::level::EntryZoomProvenance>
 pub tylertoo_core::overview::level::Generalization::gsd_base: core::option::Option<f64>
 pub tylertoo_core::overview::level::Generalization::levels: alloc::vec::Vec<tylertoo_core::overview::level::GeneralizationLevel>
+pub tylertoo_core::overview::level::Generalization::line_thinning: core::option::Option<f64>
 pub tylertoo_core::overview::level::Generalization::ranking: core::option::Option<tylertoo_core::overview::level::RankingProvenance>
 pub tylertoo_core::overview::level::Generalization::renamed_columns: core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
 pub tylertoo_core::overview::level::Generalization::representation: core::option::Option<alloc::vec::Vec<tylertoo_core::overview::level::RepresentationBandProvenance>>

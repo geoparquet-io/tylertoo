@@ -16690,6 +16690,7 @@ mod tests {
     fn coalescing_generalization(renames: Option<BTreeMap<String, String>>) -> Generalization {
         Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,

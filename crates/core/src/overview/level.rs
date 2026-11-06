@@ -285,6 +285,13 @@ pub struct Generalization {
     /// this field existed; readers MUST tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub density_drop: Option<DensityProvenance>,
+    /// OPTIONAL line-thinning provenance (§3.5, additive; informative;
+    /// #803): the `--line-thinning` grid cell, as a multiple of the level
+    /// GSD, when it was not the default. Absent on a default run, so its
+    /// footer is byte-identical to before this field existed, and on files
+    /// written before it; readers MUST tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_thinning: Option<f64>,
     /// OPTIONAL point-clustering provenance (§3.5, additive; spec §12 draft).
     ///
     /// Records that clustering was enabled (Q4): the name of the cluster-size
@@ -424,6 +431,14 @@ pub struct DensityProvenance {
     pub gamma: f64,
     /// Super-cell edge length used for fairness, as a multiple of the level GSD.
     pub supercell_gsd_factor: f64,
+    /// Whether the budget also dropped lines (`--drop-lines`, #803).
+    /// Written only when true; absent on files written before it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drop_lines: bool,
+    /// Whether the budget also dropped polygons (`--drop-polygons`, #803).
+    /// Written only when true; absent on files written before it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drop_polygons: bool,
 }
 
 /// How the cell-winner priority (sort) key was chosen for a conversion (Q1).
@@ -1202,6 +1217,7 @@ mod tests {
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
@@ -1245,6 +1261,7 @@ mod tests {
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
@@ -1288,6 +1305,7 @@ mod tests {
         let mut meta = duplicating_example();
         let mut g = Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
@@ -1386,6 +1404,7 @@ mod tests {
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
@@ -1395,6 +1414,8 @@ mod tests {
             entry_zoom: None,
             density_drop: Some(DensityProvenance {
                 drop_rate: 1.8,
+                drop_lines: false,
+                drop_polygons: false,
                 gamma: 1.5,
                 supercell_gsd_factor: 128.0,
             }),
@@ -1430,6 +1451,7 @@ mod tests {
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
@@ -1513,6 +1535,7 @@ mod tests {
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
