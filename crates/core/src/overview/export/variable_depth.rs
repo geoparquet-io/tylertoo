@@ -206,7 +206,51 @@ pub(crate) trait RowRelease: Sync + Send {
     /// Each row's release zoom, row-aligned with `batch`: `0` for a row
     /// present at every zoom. `bboxes` is row-aligned too; a row without one
     /// is never drawn.
-    fn release_zooms(&self, batch: &RecordBatch, bboxes: &[Option<TileBounds>]) -> Vec<u8>;
+    ///
+    /// # Errors
+    ///
+    /// When a column is missing or its values do not read as the rule
+    /// needs: a rule that cannot read its rows would let tiles stop early.
+    fn release_zooms(
+        &self,
+        batch: &RecordBatch,
+        bboxes: &[Option<TileBounds>],
+    ) -> Result<Vec<u8>, ExportError>;
+}
+
+/// The index of a column rule A′ reads, refused when the file lacks it.
+pub(super) fn column_index(
+    schema: &arrow_schema::Schema,
+    name: &str,
+) -> Result<usize, ExportError> {
+    schema.index_of(name).map_err(|_| missing_column(name))
+}
+
+fn missing_column(name: &str) -> ExportError {
+    ExportError::Config(ConfigError::VariableDepthConflict {
+        conflict: format!("an overview whose footer names a column {name:?} it does not hold"),
+    })
+}
+
+/// Column `name` of `batch` cast to `to`, strictly: a value that does not
+/// convert is an error, not a null.
+fn read_column(
+    batch: &RecordBatch,
+    name: &str,
+    to: &arrow_schema::DataType,
+) -> Result<arrow_array::ArrayRef, ExportError> {
+    let column = batch
+        .column_by_name(name)
+        .ok_or_else(|| missing_column(name))?;
+    let strict = arrow_cast::CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    arrow_cast::cast_with_options(column, to, &strict).map_err(|e| {
+        ExportError::Config(ConfigError::VariableDepthConflict {
+            conflict: format!("a column {name:?} whose values do not read as {to} ({e})"),
+        })
+    })
 }
 
 /// The first [`RowRelease`]: an entry-zoom ladder (#364, #446) releases a
@@ -258,24 +302,25 @@ impl RowRelease for EntryRungs {
         &self.column
     }
 
-    fn release_zooms(&self, batch: &RecordBatch, bboxes: &[Option<TileBounds>]) -> Vec<u8> {
-        let values = batch
-            .column_by_name(&self.column[0])
-            .and_then(|c| arrow_cast::cast(c, &arrow_schema::DataType::Float64).ok());
-        let values = values.as_ref().map(|c| {
-            c.as_any()
-                .downcast_ref::<arrow_array::Float64Array>()
-                .expect("cast to Float64")
-        });
-        (0..batch.num_rows())
+    fn release_zooms(
+        &self,
+        batch: &RecordBatch,
+        bboxes: &[Option<TileBounds>],
+    ) -> Result<Vec<u8>, ExportError> {
+        let values = read_column(batch, &self.column[0], &arrow_schema::DataType::Float64)?;
+        let values = values
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .expect("cast to Float64");
+        Ok((0..batch.num_rows())
             .map(|i| {
-                let v = values.and_then(|c| c.is_valid(i).then(|| c.value(i)));
+                let v = values.is_valid(i).then(|| values.value(i));
                 match bboxes.get(i) {
                     Some(Some(_)) => self.ladder.entry_zoom(v).unwrap_or(0),
                     _ => 0,
                 }
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -645,7 +690,7 @@ impl VdScan {
                 // ancestors: a coarser buffer reaches farther. Only level
                 // zooms are sized, so a rung past the finest level releases
                 // the row there, as convert clamps it.
-                let released = release.release_zooms(batch, aligned);
+                let released = release.release_zooms(batch, aligned)?;
                 for &zoom in coarser {
                     let early: Vec<Option<TileBounds>> = released
                         .iter()
@@ -669,18 +714,15 @@ impl VdScan {
             );
         }
         if let Some(column) = &self.cluster_column {
-            let counts = batch
-                .column_by_name(column)
-                .and_then(|c| arrow_cast::cast(c, &arrow_schema::DataType::Int64).ok());
-            let counts = counts.as_ref().map(|c| {
-                c.as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()
-                    .expect("cast to Int64")
-            });
+            let counts = read_column(batch, column, &arrow_schema::DataType::Int64)?;
+            let counts = counts
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .expect("cast to Int64");
             let clustered: Vec<Option<TileBounds>> = aligned
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| counts.is_some_and(|c| c.is_valid(*i) && c.value(*i) > 1))
+                .filter(|(i, _)| counts.is_valid(*i) && counts.value(*i) > 1)
                 .map(|(_, b)| *b)
                 .collect();
             if !clustered.is_empty() {
@@ -1702,6 +1744,45 @@ mod tests {
                 "unladdered z{z}"
             );
         }
+    }
+
+    /// A column rule A′ reads that is missing, or whose values do not read
+    /// as numbers, is refused: reading it as empty would let tiles stop.
+    /// (The reader already refuses a cluster column that is absent or not
+    /// INT64; the entry column has no such guard.)
+    #[test]
+    fn unreadable_rule_columns_fail_closed() {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use arrow_schema::DataType;
+
+        let rungs = super::EntryRungs {
+            column: ["v".to_string()],
+            ladder: super::EntryZoomLadder::explicit(vec![(5.0, 4)]).unwrap(),
+        };
+        let bboxes = [Some(crate::tile::TileBounds::new(0.0, 0.0, 1.0, 1.0))];
+        let missing =
+            RecordBatch::try_from_iter([("w", Arc::new(Int64Array::from(vec![5])) as ArrayRef)])
+                .unwrap();
+        let text = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(StringArray::from(vec!["five"])) as ArrayRef,
+        )])
+        .unwrap();
+        for (batch, needle) in [(&missing, "does not hold"), (&text, "do not read as")] {
+            let err = super::RowRelease::release_zooms(&rungs, batch, &bboxes).unwrap_err();
+            assert!(err.to_string().contains(needle), "{err}");
+        }
+        assert!(super::read_column(&text, "v", &DataType::Int64).is_err());
+        assert!(super::column_index(&missing.schema(), "v").is_err());
+        let numbers =
+            RecordBatch::try_from_iter([("v", Arc::new(Int64Array::from(vec![5])) as ArrayRef)])
+                .unwrap();
+        assert_eq!(
+            super::RowRelease::release_zooms(&rungs, &numbers, &bboxes).unwrap(),
+            vec![4]
+        );
     }
 
     /// With polygons collapsing to points, a coarse level's point count

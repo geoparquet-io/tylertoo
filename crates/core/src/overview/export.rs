@@ -5340,22 +5340,22 @@ fn scan_all_levels_from(
     };
     // #803: rule A′ also reads the cluster and release columns, and a mixed
     // band's geometry for its rows' kinds.
-    let roots: Option<Vec<usize>> = root.map(|r| {
-        let mut roots = vec![r];
-        if let Some(vd) = vd.as_deref() {
-            roots.extend(
-                vd.columns()
-                    .into_iter()
-                    .filter_map(|name| reader.schema().index_of(name).ok()),
-            );
-            if vd.needs_geometry() {
-                roots.extend(reader.resolved_schema().geometry_index());
+    let roots: Option<Vec<usize>> = root
+        .map(|r| -> Result<Vec<usize>, ExportError> {
+            let mut roots = vec![r];
+            if let Some(vd) = vd.as_deref() {
+                for name in vd.columns() {
+                    roots.push(variable_depth::column_index(reader.schema(), name)?);
+                }
+                if vd.needs_geometry() {
+                    roots.extend(reader.resolved_schema().geometry_index());
+                }
             }
-        }
-        roots.sort_unstable();
-        roots.dedup();
-        roots
-    });
+            roots.sort_unstable();
+            roots.dedup();
+            Ok(roots)
+        })
+        .transpose()?;
     let scans_ref = &mut scans;
     let zooms_ref = &zooms;
     let mut abandoned = false;
