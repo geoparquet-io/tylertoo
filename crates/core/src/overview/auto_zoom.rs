@@ -1953,6 +1953,20 @@ mod tests {
         assert_eq!(value.to_string().parse::<MaxZoom>().unwrap(), value);
         assert!(value.is_auto());
         assert_eq!(value.plan_zoom(), 14);
+        for bad in [
+            "auto:",
+            "auto:x",
+            "auto:-1",
+            "auto:300",
+            "auto: 14",
+            "auto:14:1",
+        ] {
+            let err = bad.parse::<MaxZoom>().unwrap_err();
+            assert!(
+                err.contains("max zoom") && err.contains("auto:<zoom>"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]
