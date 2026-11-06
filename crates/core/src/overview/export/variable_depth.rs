@@ -1113,52 +1113,78 @@ pub(super) fn export_levels(
             progress,
             diagnostics,
         )?;
-        // The rest wait for the whole probe, so they can run as groups.
+        // The rest are drawn as the probe releases them: a level once it
+        // and every coarser one are probed, the canonical level last, each
+        // time with every level released so far as one run of groups.
         let mut frontier = Frontier::new(zooms.len());
         let mut terminals: Vec<Vec<EncodedTile>> = (0..zooms.len()).map(|_| Vec::new()).collect();
-        for _ in 0..canonical {
-            let Ok(level) = rx.recv() else {
-                // The probe failed, or ended early.
-                return Err(prober_error(prober));
+        let (mut received, mut next, mut rest) = (0, first, rest);
+        while next <= canonical {
+            let ready = |received: usize| {
+                if next < canonical {
+                    received > next
+                } else {
+                    received == canonical
+                }
             };
-            frontier.add(&level);
-            debug_assert!(level.terminals.is_empty() || level.level >= first);
-            terminals[level.level] = level.terminals;
+            while received < canonical {
+                let level = if ready(received) {
+                    match rx.try_recv() {
+                        Ok(level) => level,
+                        Err(_) => break,
+                    }
+                } else {
+                    match rx.recv() {
+                        Ok(level) => level,
+                        // The probe failed, or ended early.
+                        Err(_) => return Err(prober_error(prober)),
+                    }
+                };
+                frontier.add(&level);
+                debug_assert!(level.terminals.is_empty() || level.level >= first);
+                terminals[level.level] = level.terminals;
+                received += 1;
+            }
+            let end = if received == canonical {
+                canonical + 1
+            } else {
+                received
+            };
+            let (now, later) = std::mem::take(&mut rest).split_at_mut(end - next);
+            rest = later;
+            for (k, scan) in (next..).zip(now.iter_mut()) {
+                frontier.restrict(k, scan, zooms);
+            }
+            let now: &[LevelScan] = now;
+            let plans = plan_levels(now, &zooms[next..end], partition_budget)?;
+            let now_levels: Vec<ExportLevelCtx<'_>> = plans
+                .iter()
+                .zip(now)
+                .enumerate()
+                .map(|(i, (plan, scan))| ExportLevelCtx {
+                    scan,
+                    plan,
+                    level_idx: next + i,
+                    terminals: &terminals[next + i],
+                    ..template
+                })
+                .collect();
+            let now_groups = plan_level_groups(&plans, group_cap);
+            reports.extend(export_level_groups(
+                writer,
+                LevelMemory {
+                    store: store.as_deref_mut(),
+                    budget: &mut *budget,
+                },
+                &now_levels,
+                &now_groups,
+                ckpt,
+                progress,
+                diagnostics,
+            )?);
+            groups.extend(now_groups.into_iter().map(|g| g.start + next..g.end + next));
+            next = end;
         }
-        for (k, scan) in (first..).zip(rest.iter_mut()) {
-            frontier.restrict(k, scan, zooms);
-        }
-        let plans = plan_levels(rest, &zooms[first..], partition_budget)?;
-        let rest_levels: Vec<ExportLevelCtx<'_>> = plans
-            .iter()
-            .zip(rest.iter())
-            .enumerate()
-            .map(|(i, (plan, scan))| ExportLevelCtx {
-                scan,
-                plan,
-                level_idx: first + i,
-                terminals: &terminals[first + i],
-                ..template
-            })
-            .collect();
-        let rest_groups = plan_level_groups(&plans, group_cap);
-        reports.extend(export_level_groups(
-            writer,
-            LevelMemory {
-                store,
-                budget: &mut *budget,
-            },
-            &rest_levels,
-            &rest_groups,
-            ckpt,
-            progress,
-            diagnostics,
-        )?);
-        groups.extend(
-            rest_groups
-                .into_iter()
-                .map(|g| g.start + first..g.end + first),
-        );
         drop(rx);
         let (probed, secs) = prober
             .join()
