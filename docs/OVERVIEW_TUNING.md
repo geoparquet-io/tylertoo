@@ -1393,7 +1393,7 @@ fits. `--size-valve` chooses how:
 
 What `merge` costs, measured on #792 (1.36M Bavarian building footprints, one
 z0-z14 overview, export with the default caps; median of 3 on a 64-core box):
-`merge` took 1.6 times `drop`'s wall time (9.7 s against 6.2 s on the CLI)
+`merge` took 1.6 times `drop`'s wall time (9.71 s against 6.04 s on the CLI)
 and 1.1 times its peak memory on mimalloc; on the system allocator, 1.5 times
 the wall time and 1.2 times the memory. Before #792 it took 2.0 times the wall
 time and, on the system allocator, 3.1 times the memory. The extra time comes
@@ -1406,7 +1406,7 @@ Choose `drop` when the build time or memory matters more than a hole-free
 coverage and no feature may take on the geometry or attributes of a neighbor.
 Choose `merge`, the default, when a polygon coverage must stay filled at
 coarse and middle zooms. `benchmarks/valve_guard.py` fails the nightly run if
-`merge` passes 1.7 times `drop`'s wall time or 1.5 times its memory on this
+`merge` passes 1.8 times `drop`'s wall time or 1.5 times its memory on this
 input.
 
 For point tiles, the size valve retains points at uniform spatial intervals.

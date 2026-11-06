@@ -160,6 +160,8 @@ struct PartitionBudget {
     ceiling_wave: usize,
     auto_wave: bool,
     member_bytes: Option<u64>,
+    /// The historical member price for the hard refusal, without valve workspace.
+    fit_member_bytes: Option<u64>,
     /// The run's profile: the per-level #311 guard sizes under it.
     profile: MemoryProfile,
     budget: MemoryBudget,
@@ -1348,18 +1350,25 @@ const MEMBER_PROPERTY_BYTES: u64 = 208;
 /// Extra transient bytes per member when the size valve can merge: grouping,
 /// quantized polygons, interactions and union work alongside collected members.
 ///
-/// Measured (2026-11, dhat, debug build, two workers, 100k overlapping squares,
-/// inputs allocated before profiling): 148,621,720 B before counting candidate
-/// pairs first and deferring unused geometry clones, 25,231,304 B after.
-/// With the separately charged 8 MiB gzip cache, 192 B/member estimates
-/// 27,588,608 B (9% above measured). Refit with the process-isolated
-/// `valve_encode_peak_live_bytes_matches_price` ledger; its 0.5–1.25× bound
-/// guards both underpricing and waste returning. Drop/unlimited add nothing.
-const VALVE_TRANSIENT_BYTES_PER_MEMBER: u64 = 192;
+/// Fitted (2026-11, dhat, debug build, two workers, 100k overlapping members
+/// per fixture, inputs allocated before profiling) on both 5-vertex squares
+/// and 40-vertex jittered-radius rings, including each ring's closing vertex:
+///
+/// | fixture | peak live bytes | bytes/member |
+/// |---|---|---|
+/// | squares | 26,829,000 | 268.29 |
+/// | vertex-heavy | 56,103,693 | 561.03693 |
+///
+/// With the separately charged 8 MiB gzip cache, 384 B/member estimates
+/// 46,788,608 B: measured/estimated is 0.57× and 1.20× respectively. Refit
+/// with the process-isolated `valve_encode_peak_live_bytes_matches_price`
+/// ledgers; their 0.5–1.25× bound guards both underpricing and waste
+/// returning. Drop/unlimited add nothing.
+const VALVE_TRANSIENT_BYTES_PER_MEMBER: u64 = 384;
 
 /// The shared wave/group/store fit price, including merge-valve workspace.
-fn export_member_resident_bytes(mean: u64, properties: usize, opts: &ExportOptions) -> u64 {
-    member_resident_bytes(mean, properties).saturating_add(if valve_merges(opts) {
+fn export_member_resident_bytes(resident: u64, opts: &ExportOptions) -> u64 {
+    resident.saturating_add(if valve_merges(opts) {
         VALVE_TRANSIENT_BYTES_PER_MEMBER
     } else {
         0
@@ -1877,9 +1886,10 @@ pub fn write_empty_archive(
 ///
 /// `ceiling_wave` is the resolved `--partition-wave` upper bound. On `auto`
 /// each level narrows it further from its own densest partition (#311); an
-/// explicit wave is honoured verbatim. `member_bytes` is the estimated
-/// resident size of one member ([`member_resident_bytes`]). Under any wave, a
-/// level whose densest tile cannot fit in `fit_limit` on its own is refused
+/// explicit wave is honoured verbatim. `member_bytes` includes merge-valve
+/// workspace; `fit_member_bytes` keeps the historical refusal price from
+/// [`member_resident_bytes`]. Under any wave, a level whose densest tile
+/// cannot fit in `fit_limit` on its own is refused
 /// ([`check_levels_fit`], #665). `fit_limit` is probed fresh rather than
 /// taken from the cached `available_ram`: in a `tiles` run that figure was
 /// fixed during convert's pass 1.
@@ -1894,6 +1904,7 @@ fn plan_levels(
         ceiling_wave,
         auto_wave,
         member_bytes,
+        fit_member_bytes,
         profile,
         budget,
         fit_limit,
@@ -1945,7 +1956,7 @@ fn plan_levels(
     check_levels_fit(
         &plans,
         scans,
-        member_bytes,
+        fit_member_bytes,
         fit_limit,
         skip_memory_preflight_from_env(),
     )?;
@@ -2195,7 +2206,8 @@ fn export_pmtiles_validated(
         feature_id,
         skipped: skipped_property_columns,
     } = resolve_export_columns(&reader, options, &level_zooms)?;
-    let member_bytes = export_member_bytes(&reader, &published, mean_member_bytes, options);
+    let fit_member_bytes = export_member_bytes(&reader, &published, mean_member_bytes);
+    let member_bytes = fit_member_bytes.map(|bytes| export_member_resident_bytes(bytes, options));
 
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
@@ -2297,6 +2309,7 @@ fn export_pmtiles_validated(
             ceiling_wave,
             auto_wave,
             member_bytes,
+            fit_member_bytes,
             profile: options.profile,
             budget: *budget,
             fit_limit: knobs.memory_limit.or_else(probe_oom_memory_limit),
@@ -2585,23 +2598,23 @@ impl ExportReport {
     }
 }
 
-/// One member's estimated resident size (#665): [`export_member_resident_bytes`]
+/// One member's estimated resident size (#665): [`member_resident_bytes`]
 /// over the finest level's mean stored row size and the properties every
-/// member carries, plus workspace when the valve can merge. Steers the wave,
-/// group and store fits and the [`check_levels_fit`] refusal, never output
-/// bytes. Pulled out of `export_pmtiles_run` to keep it
+/// member carries. The [`check_levels_fit`] refusal uses this price; wave,
+/// group and store fits add merge-valve workspace through
+/// [`export_member_resident_bytes`]. Neither affects output bytes.
+/// Pulled out of `export_pmtiles_run` to keep it
 /// under clippy's function-length ceiling.
 fn export_member_bytes(
     reader: &OverviewReader,
     published: &PublishedNames,
     mean_stored_bytes: Option<u64>,
-    opts: &ExportOptions,
 ) -> Option<u64> {
     let properties = reader
         .resolved_schema()
         .geometry_index()
         .map_or(0, |g| property_columns(reader.schema(), g, published).len());
-    mean_stored_bytes.map(|mean| export_member_resident_bytes(mean, properties, opts))
+    mean_stored_bytes.map(|mean| member_resident_bytes(mean, properties))
 }
 
 /// Every level's zoom, in level order, required to strictly ascend (#371 /
@@ -7737,13 +7750,25 @@ fn merge_to_fit(
     for (rank, i) in draw_indices.into_iter().enumerate() {
         draw_rank[i] = rank;
     }
-    let draw_order = |feats: &mut Vec<&coalesce_valve::Merged<'_>>| {
-        let mut ranked = vec![None; ordered.len()];
-        for &m in feats.iter() {
-            ranked[draw_rank[m.members[0]]] = Some(m);
+    // Store positions rather than references: each pass owns new merged
+    // features, but the tile-sized scratch buffer survives every pass.
+    let mut ranked = vec![None; ordered.len()];
+    let mut draw_order = |feats: &mut Vec<&coalesce_valve::Merged<'_>>| {
+        for (i, m) in feats.iter().enumerate() {
+            ranked[draw_rank[m.members[0]]] = Some(i);
         }
-        feats.clear();
-        feats.extend(ranked.into_iter().flatten());
+        let mut dest = 0;
+        for rank in 0..ranked.len() {
+            let Some(src) = ranked[rank].take() else {
+                continue;
+            };
+            if src != dest {
+                // The feature displaced from `dest` now lives at `src`.
+                ranked[draw_rank[feats[dest].members[0]]] = Some(src);
+                feats.swap(dest, src);
+            }
+            dest += 1;
+        }
     };
     // #758: from the second pass on, every member's polygons are projected,
     // quantized and cleaned once, so a pass only unions, and only the
@@ -7761,8 +7786,6 @@ fn merge_to_fit(
         // tile with no mergeable gaps, on its way to the drop fallback) has
         // nothing to reuse.
         if pass == 1 || feats.iter().all(|m| m.members.len() < 2) {
-            #[cfg(test)]
-            let _count_path = crate::valve_counter::plain_build(pass);
             return build_mvt(gzip_cache, feats, tb, opts, fill, diagnostics);
         }
         let cached = quantized.get_or_insert_with(|| {
@@ -7773,19 +7796,12 @@ fn merge_to_fit(
             )
         });
         let Some(q) = cached.as_mut() else {
-            #[cfg(test)]
-            let _count_path =
-                crate::valve_counter::build(crate::valve_counter::Path::CacheRejected);
             return build_mvt(gzip_cache, feats, tb, opts, fill, diagnostics);
         };
-        #[cfg(test)]
-        let _count_path = crate::valve_counter::build(crate::valve_counter::Path::Cache);
         q.next_pass();
         let q = &*q;
         build_mvt_with(gzip_cache, feats, opts, fill, |m| {
             q.encode(&m.members, diagnostics).unwrap_or_else(|| {
-                #[cfg(test)]
-                let _count_path = crate::valve_counter::fallback();
                 EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent, diagnostics)
             })
         })
@@ -8006,8 +8022,6 @@ fn build_mvt_with<M: TileFeature>(
     fill: &[&FillFeature],
     encode: impl Fn(&M) -> EncodedFeatureGeometry + Sync,
 ) -> TileMvt {
-    #[cfg(test)]
-    let encode = crate::valve_counter::propagate_path(encode);
     // #443: a resolved `--feature-id` always wins; the no-flag default
     // (`m.id` is `None`) keeps the pre-#443 tile-local member index.
     let id_of = |i: usize, m: &M| Some(m.feature_id().unwrap_or(i as u64));

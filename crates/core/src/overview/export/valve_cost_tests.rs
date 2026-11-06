@@ -9,17 +9,35 @@ use std::time::Instant;
 #[cfg(feature = "dhat-heap")]
 #[test]
 fn valve_encode_peak_live_bytes_matches_price() {
+    valve_encode_ledger(
+        "squares",
+        square_members(100_000, true),
+        (5_960_687_766_429_934_319, Some(14_479_824_291_116_707_907)),
+    );
+}
+
+#[cfg(feature = "dhat-heap")]
+#[test]
+fn valve_encode_peak_live_bytes_matches_price_vertex_heavy() {
+    valve_encode_ledger(
+        "vertex-heavy",
+        vertex_heavy_members(100_000),
+        (12_545_578_015_038_857_891, Some(5_218_640_095_989_453_000)),
+    );
+}
+
+#[cfg(feature = "dhat-heap")]
+fn valve_encode_ledger(fixture: &str, members: Vec<Member>, expected: (u64, Option<u64>)) {
     if std::env::var_os("NEXTEST_EXECUTION_MODE").as_deref()
         != Some(std::ffi::OsStr::new("process-per-test"))
     {
         eprintln!("skipped: the dhat peak requires nextest process-per-test mode");
         return;
     }
-    const ROWS: usize = 100_000;
-    let members = square_members(ROWS, true);
+    let rows = members.len();
     let opts = ExportOptions {
-        tile_size_limit: Some(ROWS * 2),
-        compressed_tile_size_limit: Some(ROWS / 2),
+        tile_size_limit: Some(rows * 2),
+        compressed_tile_size_limit: Some(rows / 2),
         ..Default::default()
     };
     let pool = rayon::ThreadPoolBuilder::new()
@@ -49,23 +67,53 @@ fn valve_encode_peak_live_bytes_matches_price() {
     });
     let gzip_charge = crate::compression::tile_gzip::PAYLOAD_SLICE_BYTES
         * crate::compression::tile_gzip::PAYLOAD_SLICES;
-    let estimate = ROWS as u64 * VALVE_TRANSIENT_BYTES_PER_MEMBER + gzip_charge as u64;
+    let estimate = rows as u64 * VALVE_TRANSIENT_BYTES_PER_MEMBER + gzip_charge as u64;
     eprintln!(
-        "valve ledger: members={ROWS} peak={peak} estimate={estimate} \
+        "valve ledger: fixture={fixture} members={rows} peak={peak} \
+         peak_per_member={} estimate={estimate} \
          valve_price={VALVE_TRANSIENT_BYTES_PER_MEMBER} gzip_charge={gzip_charge} \
-         passes={passes} fingerprints={fingerprints:?}"
+         passes={passes} fingerprints={fingerprints:?}",
+        peak as f64 / rows as f64,
     );
     assert!(passes >= 2, "fixture must exercise merging");
     assert_eq!(dropped, 0);
-    // Captured on 6f4f25e before the memory changes: raw and gzip stay exact.
-    assert_eq!(
-        fingerprints,
-        (5_960_687_766_429_934_319, Some(14_479_824_291_116_707_907))
-    );
+    // Captured before changing the memory price and draw-order scratch:
+    // both the raw and gzip bytes must stay exact.
+    assert_eq!(fingerprints, expected);
     assert!(
         (estimate / 2..=estimate * 5 / 4).contains(&(peak as u64)),
         "valve encode peak={peak} estimate={estimate}: expected 0.5–1.25 × estimate"
     );
+}
+
+/// Deterministic overlapping, jittered-radius rings with 39 distinct vertices
+/// plus closure. The 24-unit diameter retains detail after z0 quantization.
+#[cfg(feature = "dhat-heap")]
+fn vertex_heavy_members(rows: usize) -> Vec<Member> {
+    let side = (rows as f64).sqrt().ceil() as usize;
+    let mut members = square_members(rows, true);
+    for (i, m) in members.iter_mut().enumerate() {
+        let x = 128.0 + (i % side) as f64 * 0.4;
+        let y = 128.0 + (i / side) as f64 * 0.4;
+        let mut ring: Vec<_> = (0..39)
+            .map(|j| {
+                let angle = std::f64::consts::TAU * j as f64 / 39.0;
+                let radius = 10.0 + 2.0 * (7.0 * angle + i as f64 * 0.01).sin();
+                let x = x + radius * angle.cos();
+                let y = y + radius * angle.sin();
+                (
+                    x / 4096.0 * 360.0 - 180.0,
+                    (std::f64::consts::PI * (1.0 - 2.0 * y / 4096.0))
+                        .sinh()
+                        .atan()
+                        .to_degrees(),
+                )
+            })
+            .collect();
+        ring.push(ring[0]);
+        m.geom = Geometry::Polygon(Polygon::new(LineString::from(ring), Vec::new()));
+    }
+    members
 }
 
 #[test]
@@ -73,12 +121,9 @@ fn valve_price_narrows_only_when_the_wave_or_group_does_not_fit() {
     let opts = ExportOptions::default();
     assert!(valve_merges(&opts));
     let base = member_resident_bytes(100, 2);
-    let merged = export_member_resident_bytes(100, 2, &opts);
+    let merged = export_member_resident_bytes(base, &opts);
     assert_eq!(merged, base + VALVE_TRANSIENT_BYTES_PER_MEMBER);
-    assert_eq!(
-        export_member_resident_bytes(u64::MAX, usize::MAX, &opts),
-        u64::MAX
-    );
+    assert_eq!(export_member_resident_bytes(u64::MAX, &opts), u64::MAX);
     for disabled in [
         ExportOptions {
             size_valve: SizeValve::Drop,
@@ -95,7 +140,7 @@ fn valve_price_narrows_only_when_the_wave_or_group_does_not_fit() {
             ..opts.clone()
         },
     ] {
-        assert_eq!(export_member_resident_bytes(100, 2, &disabled), base);
+        assert_eq!(export_member_resident_bytes(base, &disabled), base);
     }
     let partitions = [Partition {
         key_lo: 0,
@@ -117,6 +162,74 @@ fn valve_price_narrows_only_when_the_wave_or_group_does_not_fit() {
     assert_eq!(wave(merged, &roomy), wave(base, &roomy));
     assert_eq!(cap(merged, &roomy), 800_000);
     assert_eq!(wave(merged, &roomy), 8);
+}
+
+#[test]
+fn valve_price_keeps_preflight_threshold_and_prices_the_wave() {
+    let opts = ExportOptions::default();
+    assert!(valve_merges(&opts));
+    let base = member_resident_bytes(100, 2);
+    let merged = export_member_resident_bytes(base, &opts);
+    let scans = [LevelScan {
+        feature_count: 100_000,
+        bounds: None,
+        tile_counts: BTreeMap::from([(tile_key(0, 0, 0), 100_000)]),
+    }];
+    let meta = OverviewsMeta {
+        version: "0.1.0".to_string(),
+        mode: Some(Mode::Duplicating),
+        canonical_level: Some(0),
+        levels: vec![super::super::level::Level {
+            row_group_end: 0,
+            gsd: 1.0,
+            zoom: Some(0),
+        }],
+        generalization: None,
+    };
+    let budget = MemoryBudget::with_available(Some(1024 * 1024 * 1024));
+    let plan = |limit_bytes| {
+        plan_levels(
+            &scans,
+            &meta,
+            1,
+            PartitionBudget {
+                partition_target: 100_000,
+                ceiling_wave: 8,
+                auto_wave: true,
+                member_bytes: Some(merged),
+                fit_member_bytes: Some(base),
+                profile: MemoryProfile::Auto,
+                budget,
+                fit_limit: Some(MemoryLimit {
+                    bytes: limit_bytes,
+                    source: MemoryLimitSource::CgroupMax,
+                }),
+            },
+        )
+    };
+    let plans = plan(base * 100_000).expect("the pre-valve refusal price must still fit");
+    let expected = memory_safe_level_wave(
+        8,
+        &plans[0].partitions,
+        Some(merged),
+        MemoryProfile::Auto,
+        &budget,
+    );
+    assert_eq!(plans[0].wave, expected);
+    assert!(
+        expected
+            < memory_safe_level_wave(
+                8,
+                &plans[0].partitions,
+                Some(base),
+                MemoryProfile::Auto,
+                &budget,
+            )
+    );
+    assert!(matches!(
+        plan(base * 100_000 - 1),
+        Err(ExportError::TileExceedsMemory { .. })
+    ));
 }
 
 fn byte_fingerprints(mvt: &TileMvt) -> (u64, Option<u64>) {
@@ -248,7 +361,7 @@ fn check_work(rows: usize) {
         )
     });
     eprintln!(
-        "valve_work rows={rows} passes={} merged={} dropped={} features={} raw={} gzip={:?} elapsed={:?}\n{counts:#?}\npath order: other, first-pass plain, no-merge plain, cache-rejected plain, feature fallback, cache",
+        "valve_work rows={rows} passes={} merged={} dropped={} features={} raw={} gzip={:?} elapsed={:?}\n{counts:#?}",
         mvt.valve.passes, mvt.valve.merged, mvt.valve.dropped, mvt.features,
         mvt.data.len(), mvt.gzip.as_ref().map(|g| g.len()), start.elapsed(),
     );

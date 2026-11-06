@@ -55,7 +55,8 @@
 # `valve_work_per_pass_is_bounded_slow_1m` is an ignored, manual million-
 # parcel valve diagnostic. Keep it in both slow filters even when explicitly
 # enabling ignored tests, so quick runs do not pick it up.
-# `valve_encode_peak_live_bytes_matches_price` is a dhat-only ledger (~27s).
+# `valve_encode_peak_live_bytes_matches_price` and its vertex-heavy variant
+# are dhat-only ledgers (~27s and ~110s).
 # Run explicitly with --ignore-default-filter and --features dhat-heap.
 #
 # Plain `cargo test` (not nextest) ignores this file entirely: it runs
