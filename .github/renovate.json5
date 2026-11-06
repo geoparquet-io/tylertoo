@@ -1,0 +1,74 @@
+// Renovate — dependency updates for Cargo, Python (uv) and GitHub Actions.
+//
+// One run a month. Every non-major update across all three ecosystems lands
+// as a single PR that auto-merges (GitHub native auto-merge, so only once
+// every required check is green). Majors and geometry-engine bumps wait for a
+// human. Held items show on the Dependency Dashboard issue.
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["config:recommended", "schedule:monthly"],
+  labels: ["dependencies"],
+  packageRules: [
+    {
+      description: "One monthly PR for every non-major update, auto-merged on green CI.",
+      matchUpdateTypes: ["minor", "patch", "pin", "digest"],
+      groupName: "all non-major dependencies",
+      groupSlug: "all-non-major",
+      automerge: true,
+    },
+    {
+      description: "Majors wait for a human.",
+      matchUpdateTypes: ["major"],
+      reviewers: ["nlebovits"],
+    },
+    {
+      // geo, geo-types, i_overlay, i_float, i_shape and earcut can change
+      // rendered tile geometry at any semver level, so green CI never approves
+      // one. See "Policy: geometry-engine bumps are not green-CI merges" in
+      // context/ARCHITECTURE.md.
+      description: "Geometry-engine bumps never auto-merge.",
+      matchPackageNames: ["geo", "geo-types", "i_overlay", "i_float", "i_shape", "earcut"],
+      groupName: "geometry engine",
+      automerge: false,
+      reviewers: ["nlebovits"],
+    },
+    {
+      description: "arrow-rs and the geoarrow stack version together; a partial major bump never compiles.",
+      matchPackageNames: ["arrow-*", "parquet", "geoparquet", "geoarrow*"],
+      matchUpdateTypes: ["major"],
+      groupName: "arrow-rs and geoarrow",
+    },
+    {
+      // arrow-rs majors are held at 59 until the geoarrow-rs stack catches up.
+      // geoarrow 0.9 / geoparquet 0.9 declare `arrow-* = "^59"` and
+      // `parquet = "^59"`; moving our workspace to 60 alone links both majors
+      // into one binary and every RecordBatch/Schema/Field crossing the
+      // geoparquet boundary stops matching (#476: 119 errors, none of them
+      // arrow-60 API changes). Lift this once geoarrow-rs ships an arrow-60
+      // release, then land arrow-rs and geoarrow together.
+      description: "Hold arrow-rs majors until geoarrow-rs supports them (#476).",
+      matchPackageNames: ["arrow-*", "parquet"],
+      matchUpdateTypes: ["major"],
+      enabled: false,
+    },
+    {
+      // brotli and zstd track the majors parquet depends on (8 and 0.13 for
+      // parquet 59), so each codec, and zstd-sys's C build, compiles once
+      // (#435, #649). Raise these ceilings together with parquet.
+      description: "Keep codecs on parquet's majors.",
+      matchPackageNames: ["brotli"],
+      allowedVersions: "<9",
+    },
+    {
+      matchPackageNames: ["zstd"],
+      allowedVersions: "<0.14",
+    },
+    {
+      // geo 0.33 depends on rstar 0.12; a newer rstar links two copies and
+      // fails cargo-deny's multiple-versions ban. Raise it together with geo.
+      description: "Keep rstar on geo's version.",
+      matchPackageNames: ["rstar"],
+      allowedVersions: "<0.13",
+    },
+  ],
+}

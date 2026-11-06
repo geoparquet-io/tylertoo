@@ -995,10 +995,9 @@ to every tile we write, not build details, and there are two routes in: our
 direct `i_overlay` (the clip fallback and the #383 repair) and the copy `geo`
 vendors for its own `BooleanOps`/triangulation — so a `geo` bump can move
 clipping without `i_overlay` appearing in the diff at all. Such a bump must not
-be merged on green CI alone, nor auto-merged. `dependabot-automerge.yml`
-already leaves majors for a human; that is not the safeguard, because a patch
-release of the same crate would be auto-merged and can move coordinates just as
-easily.
+be merged on green CI alone, nor auto-merged. `.github/renovate.json5` puts
+these crates in their own group with auto-merge off at every semver level,
+because a patch release can move coordinates as easily as a major.
 
 The mechanical enforcement is the golden tile guard
 (`crates/core/tests/convert_guard_golden.rs`): it pins per-tile digests of a
