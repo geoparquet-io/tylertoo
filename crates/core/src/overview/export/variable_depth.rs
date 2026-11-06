@@ -1201,6 +1201,9 @@ pub(super) fn export_levels(
     let first = levels.len();
     let partition_budget = probe.budget;
     std::thread::scope(|scope| {
+        // shortcut: levels the probe finished but the writer has not drawn
+        // yet wait here in RAM (each tile under the size cap); spool them to
+        // the spill store if stopped output ever outgrows memory.
         let (tx, rx) = std::sync::mpsc::channel();
         let prober = scope.spawn(move || {
             let t = std::time::Instant::now();
@@ -1289,6 +1292,11 @@ pub(super) fn export_levels(
                 diagnostics,
             )?);
             groups.extend(now_groups.into_iter().map(|g| g.start + next..g.end + next));
+            // Written: free these levels' stopped tiles now, not at the end.
+            drop(now_levels);
+            terminals[next..end]
+                .iter_mut()
+                .for_each(|t| *t = Vec::new());
             next = end;
         }
         drop(rx);
