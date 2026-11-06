@@ -579,7 +579,7 @@ fn ring_box(ring: &TileRing) -> (i32, i32, i32, i32) {
 /// between them (Madagascar adm4 feature 7844 at 4/10/8).
 fn parts_interact(a: &[TileRing], b: &[TileRing]) -> bool {
     #[cfg(test)]
-    let _count_parts = crate::valve_counter::parts();
+    crate::valve_counter::note(|c| c.parts_interact += 1);
     tile_polygon::check_polygons(&[a, b]).is_err()
 }
 
@@ -867,8 +867,6 @@ impl QuantizedPolygons {
             1 => false,
             2 => true,
             _ => {
-                #[cfg(test)]
-                let _count_path = crate::valve_counter::path(crate::valve_counter::Path::Cache);
                 let hit = parts_interact(&self.parts[a], &self.parts[b]);
                 state.store(if hit { 2 } else { 1 }, Relaxed);
                 hit
