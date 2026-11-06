@@ -370,16 +370,18 @@ The measurements showed the following:
   convert 19 GiB under the default memory profile, 4.9 GiB with
   `--profile bounded`). tippecanoe took 31.7 min on NZ Parcels; tylertoo
   about 2 min.
-- Shared-border slivers at z4–z8 (#450 phase 0, fieldmaps Madagascar adm4,
-  17,465 polygons, mean over the evaluated tiles (nearly every tile at each zoom), `tile_metrics.py`):
-  missing area at the default is 11.78 / 4.46 / 1.73 / 0.64 / 0.29% at
-  z4–z8, 0.25: 2.17 / 0.85 / 0.29 / 0.11 / 0.07%, factor 0: 0.44 / 0.07 /
-  0.07 / 0.04 / 0.02%. With `--coverage-fill` it is 0.03–0.05% at the
-  default and 0.01–0.02% at factor 0, so the residual missing coverage with
-  `--coverage-fill` on adm4 is 0.01–0.05%. Without the fill the loss includes
-  placeholder-square gaps (#750). Archive 26.9 MB default, 29.3 MB
-  at 0.25, 33.5 MB at 0. Table: `docs/OVERVIEW_TUNING.md` § Coverage and
-  simplification.
+- Missing coverage at z4–z8 (#450 phase 0). Input: fieldmaps Madagascar
+  adm4, 17,465 polygons. Metric: `tile_metrics.py`, mean over the tiles with
+  at least 1% source cover (nearly every tile at each zoom). Missing area
+  at the default is 11.78 / 4.46 / 1.73 / 0.64 / 0.29% at z4–z8; at factor
+  0.25 it is 2.17 / 0.85 / 0.29 / 0.11 / 0.07%; at factor 0 it is
+  0.44 / 0.07 / 0.07 / 0.04 / 0.02%. With `--coverage-fill` it is
+  0.03–0.05% at the default and 0.01–0.02% at factor 0, so residual
+  missing coverage with the fill on adm4 is 0.01–0.05%. Without the fill
+  the loss includes placeholder-square gaps (#750). Archive 26.9 MB default,
+  29.3 MB at factor 0.25, 33.5 MB at factor 0. Table:
+  `docs/OVERVIEW_TUNING.md` § Coverage and simplification; commands in
+  `benchmarks/coalesce/RESULTS.md`.
 - `--polygon-visibility 0` with placeholder squares has a pre-existing bug
   (#749): under the cascade, squares survive every coarse level, so small
   features appear as very large squares at low zooms. The `C2` recipe was dropped
