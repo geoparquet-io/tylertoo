@@ -2148,6 +2148,54 @@ mod tests {
         assert_eq!(stops, vec![(1, 0, 1)]);
     }
 
+    /// `--max-zoom auto:N` through the tiles facade: the canonical zoom is
+    /// the one the estimate resolved, the same as flag-off, and the
+    /// contract holds at it.
+    #[test]
+    fn auto_max_zoom_stops_at_the_resolved_zoom() {
+        use super::super::super::tiles::{
+            convert_to_pmtiles, TilesInput, TilesOptions, TilesOutcome,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dense_and_sparse();
+        let src = dir.path().join("src.parquet");
+        let geoms: Vec<_> = input.iter().map(|&(x, y, _)| Some(pt(x, y))).collect();
+        let v: Vec<f64> = input.iter().map(|&(.., v)| v).collect();
+        testutil::write_input_with_f64(&src, &geoms, "v", &v);
+        let mut convert = ConvertOptions::default()
+            .with_levels(LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 9,
+            })
+            .with_auto_max_zoom(true);
+        convert.density.enabled = false;
+        convert.assign.point_thinning = 0.0;
+        let run = |variable_depth: bool, name: &str| {
+            let out = dir.path().join(name);
+            let options = TilesOptions {
+                convert: convert.clone(),
+                export: raw_cap(20_000).with_variable_depth(variable_depth),
+                ..TilesOptions::default()
+            };
+            let TilesOutcome::Converted(report) =
+                convert_to_pmtiles(&TilesInput::Path(src.clone()), &out, &options).unwrap()
+            else {
+                panic!("converted")
+            };
+            (report, read_tiles(&out))
+        };
+        let (off, _) = run(false, "off.pmtiles");
+        let (on, tiles) = run(true, "on.pmtiles");
+        let m = off.export.max_zoom;
+        assert!(m <= 9);
+        let vd = on.export.variable_depth.as_ref().unwrap();
+        assert_eq!(vd.canonical_max_zoom, m);
+        assert_eq!(on.export.max_zoom, m);
+        assert_contract(&tiles, m);
+        assert!(!stopped(&tiles, m).is_empty());
+    }
+
     /// Nothing is stored below a stopped tile, wherever the stops fall.
     #[test]
     fn stopped_subtree_has_no_descendants() {
