@@ -2388,8 +2388,12 @@ impl StreamingPmtilesWriter {
     /// Returns an error if assembling or writing the archive fails, or if
     /// `output_path` differs from the one a tail-layout writer was created for.
     pub fn checkpoint(&mut self, output_path: &Path) -> Result<()> {
-        self.write_archive(output_path)?;
-        Ok(())
+        // A checkpoint is salvage that may lack deeper branches, so it never
+        // claims variable depth (#803).
+        let variable_depth = self.variable_depth.take();
+        let written = self.write_archive(output_path);
+        self.variable_depth = variable_depth;
+        written.map(drop)
     }
 
     /// Shared archive assembler backing both [`checkpoint`](Self::checkpoint)
@@ -6165,6 +6169,37 @@ mod tests {
             "packed checkpoints change nothing"
         );
         assert_eq!(finals[2].1, finals[3].1, "tail checkpoints change nothing");
+    }
+
+    /// #803: a checkpoint is salvage, not a finished variable-depth archive
+    /// (its deeper branches may be missing), so only `finalize` writes the
+    /// marker, in both layouts.
+    #[test]
+    fn only_finalize_marks_variable_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        for tail in [false, true] {
+            let out = dir.path().join(format!("vd-{tail}.pmtiles"));
+            let mut w = if tail {
+                StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap()
+            } else {
+                StreamingPmtilesWriter::new(Compression::Gzip).unwrap()
+            };
+            w.set_variable_depth(3);
+            let (z, x, y) = tail_coord(0);
+            w.add_tile(z, x, y, &tail_payload(0)).unwrap();
+            w.checkpoint(&out).unwrap();
+            let ckpt = fs::read(w.salvage_path().unwrap_or(&out)).unwrap();
+            assert!(
+                metadata_object(&ckpt).get(VARIABLE_DEPTH_KEY).is_none(),
+                "tail {tail}: a checkpoint carries the marker"
+            );
+            w.finalize(&out).unwrap();
+            let done = fs::read(&out).unwrap();
+            assert!(
+                metadata_object(&done).get(VARIABLE_DEPTH_KEY).is_some(),
+                "tail {tail}"
+            );
+        }
     }
 
     #[test]
