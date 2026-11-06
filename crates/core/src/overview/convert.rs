@@ -6695,6 +6695,11 @@ pub(super) fn build_generalization(
         .collect();
     Generalization {
         engine: format!("tylertoo {}", env!("CARGO_PKG_VERSION")),
+        // Only when it differs from the default, as `gsd_base`: a default
+        // footer stays byte-identical (#803 refuses a non-default one).
+        line_thinning: (options.assign.line_thinning
+            != super::assign::AssignConfig::default().line_thinning)
+            .then_some(options.assign.line_thinning),
         // Only record the base when it deviates from the default: a default run
         // then produces a byte-identical footer to before this knob existed
         // (the levels[].gsd already imply the default base, §5.2 / Q6).
@@ -6754,6 +6759,8 @@ pub(super) fn build_generalization(
         density_drop: if options.density.enabled {
             Some(DensityProvenance {
                 drop_rate: options.density.drop_rate,
+                drop_lines: options.density.kinds.lines,
+                drop_polygons: options.density.kinds.polygons,
                 gamma: options.density.gamma,
                 supercell_gsd_factor: SUPERCELL_GSD_FACTOR,
             })

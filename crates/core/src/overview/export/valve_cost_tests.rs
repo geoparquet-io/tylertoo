@@ -175,24 +175,12 @@ fn valve_price_keeps_preflight_threshold_and_prices_the_wave() {
         bounds: None,
         tile_counts: BTreeMap::from([(tile_key(0, 0, 0), 100_000)]),
     }];
-    let meta = OverviewsMeta {
-        version: "0.1.0".to_string(),
-        mode: Some(Mode::Duplicating),
-        canonical_level: Some(0),
-        levels: vec![super::super::level::Level {
-            row_group_end: 0,
-            gsd: 1.0,
-            zoom: Some(0),
-        }],
-        generalization: None,
-    };
     let budget = MemoryBudget::with_available(Some(1024 * 1024 * 1024));
     let plan = |limit_bytes| {
         plan_levels(
             &scans,
-            &meta,
-            1,
-            PartitionBudget {
+            &[0],
+            &PartitionBudget {
                 partition_target: 100_000,
                 ceiling_wave: 8,
                 auto_wave: true,

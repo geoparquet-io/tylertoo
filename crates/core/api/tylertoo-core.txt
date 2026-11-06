@@ -292,6 +292,8 @@ pub tylertoo_core::ConfigError::SpillDirNotWritable::reason: alloc::string::Stri
 pub tylertoo_core::ConfigError::TileBufferTooWide::buffer: u32
 pub tylertoo_core::ConfigError::TileBufferTooWide::max: u32
 pub tylertoo_core::ConfigError::TileRangeWithShard
+#[non_exhaustive] pub tylertoo_core::ConfigError::VariableDepthConflict
+pub tylertoo_core::ConfigError::VariableDepthConflict::conflict: alloc::string::String
 impl core::convert::From<tylertoo_core::ConfigError> for tylertoo_core::ConvertError
 pub fn tylertoo_core::ConvertError::from(tylertoo_core::ConfigError) -> Self
 impl core::convert::From<tylertoo_core::ConfigError> for tylertoo_core::ExportError
@@ -829,6 +831,9 @@ pub tylertoo_core::ExportError::UnsupportedCrs::path: alloc::string::String
 #[non_exhaustive] pub tylertoo_core::ExportError::UnsupportedProperty
 pub tylertoo_core::ExportError::UnsupportedProperty::data_type: alloc::string::String
 pub tylertoo_core::ExportError::UnsupportedProperty::name: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::ExportError::VariableDepthColumn
+pub tylertoo_core::ExportError::VariableDepthColumn::column: alloc::string::String
+pub tylertoo_core::ExportError::VariableDepthColumn::reason: alloc::string::String
 impl core::convert::From<core::io::error::Error> for tylertoo_core::ExportError
 pub fn tylertoo_core::ExportError::from(core::io::error::Error) -> Self
 impl core::convert::From<tylertoo_core::AccountingError> for tylertoo_core::ExportError
@@ -1134,6 +1139,9 @@ pub tylertoo_core::InvalidConfigError::TileOutOfRange::zoom: u8
 #[non_exhaustive] pub tylertoo_core::InvalidConfigError::TileZoomTooHigh
 pub tylertoo_core::InvalidConfigError::TileZoomTooHigh::input: alloc::string::String
 pub tylertoo_core::InvalidConfigError::TileZoomTooHigh::zoom: u8
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::VariableDepthArchive
+pub tylertoo_core::InvalidConfigError::VariableDepthArchive::operation: &'static str
+pub tylertoo_core::InvalidConfigError::VariableDepthArchive::path: std::path::PathBuf
 impl core::convert::From<tylertoo_core::InvalidConfigError> for tylertoo_core::Error
 pub fn tylertoo_core::Error::from(tylertoo_core::InvalidConfigError) -> Self
 impl core::error::Error for tylertoo_core::InvalidConfigError
@@ -2377,6 +2385,7 @@ pub tylertoo_core::ExportOptions::spill_dir: core::option::Option<std::path::Pat
 pub tylertoo_core::ExportOptions::tile_buffer: u32
 pub tylertoo_core::ExportOptions::tile_range: core::option::Option<tylertoo_core::TileRange>
 pub tylertoo_core::ExportOptions::tile_size_limit: core::option::Option<usize>
+pub tylertoo_core::ExportOptions::variable_depth: bool
 pub tylertoo_core::ExportOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::ExportOptions
 pub fn tylertoo_core::ExportOptions::verbatim(self) -> Self
@@ -2398,6 +2407,7 @@ pub fn tylertoo_core::ExportOptions::with_spill_dir(self, core::option::Option<s
 pub fn tylertoo_core::ExportOptions::with_tile_buffer(self, u32) -> Self
 pub fn tylertoo_core::ExportOptions::with_tile_range(self, core::option::Option<tylertoo_core::TileRange>) -> Self
 pub fn tylertoo_core::ExportOptions::with_tile_size_limit(self, core::option::Option<usize>) -> Self
+pub fn tylertoo_core::ExportOptions::with_variable_depth(self, bool) -> Self
 pub fn tylertoo_core::ExportOptions::with_zoom_ceiling(self, core::option::Option<u8>) -> Self
 impl core::clone::Clone for tylertoo_core::ExportOptions
 pub fn tylertoo_core::ExportOptions::clone(&self) -> tylertoo_core::ExportOptions
@@ -2431,6 +2441,7 @@ pub tylertoo_core::ExportReport::source_losses: tylertoo_core::SourceLosses
 pub tylertoo_core::ExportReport::total_tile_features: usize
 pub tylertoo_core::ExportReport::total_tiles: usize
 pub tylertoo_core::ExportReport::valve_dropped_features: usize
+pub tylertoo_core::ExportReport::variable_depth: core::option::Option<tylertoo_core::VariableDepthReport>
 pub tylertoo_core::ExportReport::zooms: alloc::vec::Vec<tylertoo_core::ZoomReport>
 impl core::clone::Clone for tylertoo_core::ExportReport
 pub fn tylertoo_core::ExportReport::clone(&self) -> tylertoo_core::ExportReport
@@ -3181,6 +3192,27 @@ impl core::marker::Unpin for tylertoo_core::ValidationReport
 impl core::marker::UnsafeUnpin for tylertoo_core::ValidationReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ValidationReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ValidationReport
+#[non_exhaustive] pub struct tylertoo_core::VariableDepthReport
+pub tylertoo_core::VariableDepthReport::canonical_max_zoom: u8
+pub tylertoo_core::VariableDepthReport::probed_tiles: usize
+pub tylertoo_core::VariableDepthReport::stopped_tiles: usize
+pub tylertoo_core::VariableDepthReport::stored_max_zoom: core::option::Option<u8>
+impl core::clone::Clone for tylertoo_core::VariableDepthReport
+pub fn tylertoo_core::VariableDepthReport::clone(&self) -> tylertoo_core::VariableDepthReport
+impl core::cmp::PartialEq for tylertoo_core::VariableDepthReport
+pub fn tylertoo_core::VariableDepthReport::eq(&self, &tylertoo_core::VariableDepthReport) -> bool
+impl core::fmt::Debug for tylertoo_core::VariableDepthReport
+pub fn tylertoo_core::VariableDepthReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::VariableDepthReport
+impl serde_core::ser::Serialize for tylertoo_core::VariableDepthReport
+pub fn tylertoo_core::VariableDepthReport::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for tylertoo_core::VariableDepthReport
+impl core::marker::Send for tylertoo_core::VariableDepthReport
+impl core::marker::Sync for tylertoo_core::VariableDepthReport
+impl core::marker::Unpin for tylertoo_core::VariableDepthReport
+impl core::marker::UnsafeUnpin for tylertoo_core::VariableDepthReport
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::VariableDepthReport
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::VariableDepthReport
 #[non_exhaustive] pub struct tylertoo_core::ZoomReport
 pub tylertoo_core::ZoomReport::encode_dropped_features: usize
 pub tylertoo_core::ZoomReport::encode_quantized_features: usize
@@ -3192,6 +3224,7 @@ pub tylertoo_core::ZoomReport::level_feature_count: usize
 pub tylertoo_core::ZoomReport::max_valve_passes: u32
 pub tylertoo_core::ZoomReport::merged_features: usize
 pub tylertoo_core::ZoomReport::oversized_tiles: usize
+pub tylertoo_core::ZoomReport::stopped_tiles: usize
 pub tylertoo_core::ZoomReport::tile_count: usize
 pub tylertoo_core::ZoomReport::tile_feature_count: usize
 pub tylertoo_core::ZoomReport::valve_dropped_features: usize

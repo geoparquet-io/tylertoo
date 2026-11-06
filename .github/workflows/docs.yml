@@ -4,10 +4,9 @@
 # requests are covered by the `docs` job in ci.yml, which runs the same
 # strict build plus every documented example.
 #
-# KNOWN FLAKE: the Pages deploy step occasionally fails with a transient
-# "try again later" from GitHub. Policy: manual rerun (Actions -> re-run
-# failed jobs). Not worth a retry loop — the failure is rare and a rerun
-# always succeeds.
+# Pages can fail transiently or remain in updating_pages until the deploy
+# action's hard ten-minute timeout. Retry once with the same artifact;
+# if both attempts fail, rerun failed jobs or dispatch this workflow on main.
 
 name: Deploy Documentation
 
@@ -54,15 +53,23 @@ jobs:
 
   deploy:
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Allow two ten-minute attempts plus runner/API overhead.
+    timeout-minutes: 25
     permissions:
       pages: write
       id-token: write
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment_retry.outputs.page_url || steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      - name: Retry GitHub Pages deployment
+        id: deployment_retry
+        if: steps.deployment.outcome == 'failure'
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

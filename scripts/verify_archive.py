@@ -57,6 +57,14 @@ properties that must hold across the whole archive, not just its framing:
                        `skipped_property_columns`, and no tile carries a key
                        the metadata does not declare (#434)
 
+  variable_depth       (#803) only when the metadata carries
+                       `tylertoo:variable_depth` {enabled, canonical_maxzoom
+                       M}: stopped tiles (extent > 4096) are 4096 << (M - z)
+                       wide with no stored descendant and nothing is stored
+                       below M. feature_accounting then counts the stopped
+                       tiles plus zoom M, and monotone compares only
+                       continuing tiles toward coarse zooms.
+
 A failing invariant can be exempted, one row per {fixture, settings, zoom,
 invariant, issue}, in benchmarks/e2e/invariant_exemptions.toml (pass
 --exemptions with --fixture/--settings). Exemptions are strict: an exempted
@@ -128,6 +136,8 @@ VALID_GEOMETRY_TYPES = frozenset(
 POLYGON_TYPES = frozenset({"Polygon", "MultiPolygon"})
 HEADER_LEN = 127
 SPEC_VERSION = 3
+NORMAL_EXTENT = 4096
+VARIABLE_DEPTH_KEY = "tylertoo:variable_depth"  # metadata note (#803)
 E7 = 1e7
 LON_MAX = 180.0
 LAT_MAX = 90.0
@@ -143,6 +153,7 @@ INVARIANTS = (
     "polygon_valid",
     "feature_accounting",
     "monotone",
+    "variable_depth",
     "decay",
     "property_accounting",
 )
@@ -276,7 +287,13 @@ def check_feature(z: int, x: int, y: int, i: int, feature: dict) -> None:
 
 
 def decode_features(
-    z: int, x: int, y: int, raw: bytes, layer: str, empty_polygons_ok: bool = False
+    z: int,
+    x: int,
+    y: int,
+    raw: bytes,
+    layer: str,
+    empty_polygons_ok: bool = False,
+    info: dict | None = None,
 ) -> list[dict]:
     """Decode one tile with mapbox-vector-tile (y-down tile coordinates, as a
     client draws it, and as #748 measured); return `layer`'s features. Raises
@@ -294,6 +311,8 @@ def decode_features(
             f"z{z}/{x}/{y}: layer {layer!r} missing (found {sorted(decoded)})"
         )
     features = decoded[layer].get("features", [])
+    if info is not None:
+        info["extent"] = decoded[layer].get("extent", NORMAL_EXTENT)
     for i, feature in enumerate(features):
         geom = feature.get("geometry")
         if (
@@ -366,6 +385,11 @@ class ZoomScan:
     max_compressed: int = 0
     max_raw: int = 0
     keys: set = field(default_factory=set)
+    # Variable-depth pyramids (#803): (x, y) -> MVT extent for every tile, and
+    # the ids split by whether the tile is stopped (extent > NORMAL_EXTENT).
+    extents: dict = field(default_factory=dict)
+    stopped_ids: set = field(default_factory=set)
+    normal_ids: set = field(default_factory=set)
 
     def merge(self, other: ZoomScan) -> None:
         self.tiles += other.tiles
@@ -383,6 +407,9 @@ class ZoomScan:
         self.max_compressed = max(self.max_compressed, other.max_compressed)
         self.max_raw = max(self.max_raw, other.max_raw)
         self.keys |= other.keys
+        self.extents.update(other.extents)
+        self.stopped_ids |= other.stopped_ids
+        self.normal_ids |= other.normal_ids
 
 
 def is_placeholder_square(gtype: str, coords) -> bool:
@@ -423,7 +450,10 @@ def scan_chunk(args) -> dict[int, ZoomScan]:
             s.over_compressed.append((f"{z}/{x}/{y}", stored))
         if raw_cap and len(raw) > raw_cap:
             s.over_raw.append((f"{z}/{x}/{y}", len(raw)))
-        features = decode_features(z, x, y, raw, layer, empty_polygons_ok=True)
+        info: dict = {}
+        features = decode_features(z, x, y, raw, layer, empty_polygons_ok=True, info=info)
+        s.extents[(x, y)] = info["extent"]
+        stopped = info["extent"] > NORMAL_EXTENT
         s.features += len(features)
         for i, feat in enumerate(features):
             s.keys.update((feat.get("properties") or {}).keys())
@@ -433,6 +463,7 @@ def scan_chunk(args) -> dict[int, ZoomScan]:
                     s.no_id += 1
                 else:
                     s.ids.add(fid)
+                    (s.stopped_ids if stopped else s.normal_ids).add(fid)
             geom = feat["geometry"]
             if geom["type"] not in POLYGON_TYPES:
                 continue
@@ -588,6 +619,33 @@ def add_feature_ids(src: Path, dst: Path, column: str) -> int:
     return start
 
 
+def check_variable_depth(scans: dict[int, ZoomScan], m: int) -> Outcome:
+    """Stopped tiles (extent > 4096) must be 4096 << (M - z) wide, have no
+    stored descendant, and nothing may be stored deeper than M. (Header max ==
+    deepest stored tile is already enforced by walk_tiles.)"""
+    problems = []
+    stopped = {
+        (z, x, y): e
+        for z, s in scans.items()
+        for (x, y), e in s.extents.items()
+        if e > NORMAL_EXTENT
+    }
+    for z in scans:
+        if z > m:
+            problems.append(f"z{z} tiles stored below canonical_maxzoom {m}")
+    for (z, x, y), e in sorted(stopped.items()):
+        if z <= m and e != NORMAL_EXTENT << (m - z):
+            problems.append(f"stopped tile {z}/{x}/{y} extent {e}, want {NORMAL_EXTENT << (m - z)}")
+    for z, s in scans.items():
+        for (x, y) in s.extents:
+            for az in range(z):
+                anc = (az, x >> (z - az), y >> (z - az))
+                if anc in stopped:
+                    problems.append(f"{z}/{x}/{y} stored below stopped tile {anc[0]}/{anc[1]}/{anc[2]}")
+    detail = "; ".join(problems[:5]) or f"{len(stopped)} stopped tile(s), canonical_maxzoom {m}"
+    return Outcome("variable_depth", None, not problems, detail)
+
+
 def evaluate(
     scans: dict[int, ZoomScan],
     meta: dict,
@@ -634,10 +692,23 @@ def evaluate(
     exp = (report or {}).get("export") or {}
     conv = (report or {}).get("convert") or {}
 
+    # Variable-depth pyramid (#803): only when the metadata says so.
+    vd = meta.get(VARIABLE_DEPTH_KEY)
+    vd = vd.get("canonical_maxzoom") if isinstance(vd, dict) and vd.get("enabled") else None
+    if vd is not None:
+        out.append(check_variable_depth(scans, vd))
+
     if ids:
-        # (c) feature accounting at the finest zoom
-        finest = max(zooms)
-        written = len(scans[finest].ids)
+        # (c) feature accounting at the finest zoom. Variable depth: the
+        # canonical-bearing tiles are the stopped ones plus those at M.
+        finest = max(zooms) if vd is None else vd
+        if vd is None:
+            seen = scans[finest].ids
+        else:
+            seen = set(scans[vd].ids if vd in scans else ()).union(
+                *(scans[z].stopped_ids for z in zooms)
+            )
+        written = len(seen)
         if input_info is not None:
             n_in, src = input_info[0], "input rows"
         else:
@@ -660,7 +731,6 @@ def evaluate(
             for section, loss in losses
         ]
         lost = set(lost_ids)
-        seen = scans[finest].ids
         if n_in is None:
             out.append(Outcome("feature_accounting", None, False, "no input count"))
         else:
@@ -704,9 +774,12 @@ def evaluate(
 
         # (d) monotone: distinct features never rise toward coarser zooms.
         # A zoom inside the archive's range with no tile counts as 0.
+        # Variable depth: a stopped tile holds every feature below it, so only
+        # the continuing (normal-extent) tiles of z-1 are compared with z.
         counts = {z: len(scans[z].ids) for z in zooms}
+        coarse_counts = counts if vd is None else {z: len(scans[z].normal_ids) for z in zooms}
         for z in range(min(zooms) + 1, max(zooms) + 1):
-            coarse, fine = counts.get(z - 1, 0), counts.get(z, 0)
+            coarse, fine = coarse_counts.get(z - 1, 0), counts.get(z, 0)
             ok = coarse <= fine
             detail = f"z{z - 1} {coarse} <= z{z} {fine}" if ok else (
                 f"z{z - 1} holds {coarse} distinct features, more than z{z}'s {fine}"

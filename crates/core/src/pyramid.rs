@@ -1473,6 +1473,14 @@ impl BandArchive {
                 header.tile_type
             )));
         }
+        if index.is_variable_depth() {
+            return Err(PyramidError::InvalidConfig(
+                crate::InvalidConfigError::VariableDepthArchive {
+                    path: path.to_path_buf(),
+                    operation: "pyramid",
+                },
+            ));
+        }
 
         let internal = header.internal_compression;
         let header_zooms = (header.min_zoom, header.max_zoom);
@@ -1929,6 +1937,16 @@ impl PyramidOptions {
         self.convert.validate().map_err(|e| {
             PyramidError::InvalidConfig(crate::InvalidConfigError::BandConvertOptions(Box::new(e)))
         })?;
+        // Before the export's own checks, which would name an export option
+        // the bands' verbatim defaults turn off.
+        if self.export.variable_depth {
+            return Err(
+                crate::overview::config::ConfigError::VariableDepthConflict {
+                    conflict: "pyramid bands".to_string(),
+                }
+                .into(),
+            );
+        }
         self.export.validate()?;
         check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
         Ok(())

@@ -203,6 +203,7 @@ export_pmtiles(
     size_valve: Literal['merge', 'drop'] = "merge",
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     coverage_fill: bool = False,
+    variable_depth: bool = False,
     tile_range: str | None = None,
     zoom_ceiling: int | None = None,
 ) -> ExportReport
@@ -234,6 +235,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and `0` or `None` is no limit.
 * `coverage_fill`: Experimental: under each tile's features, draw the area its child tiles cover, so a polygon coverage shows no holes at coarse zooms. Holds the finest level's geometry in memory. See `docs/OVERVIEW_TUNING.md`.
+* `variable_depth`: End each branch of the tile pyramid at the coarsest zoom whose tile holds all of that area's finest-level features within both size caps, like tippecanoe's `--generate-variable-depth-tile-pyramid`. The server must serve the nearest ancestor for a missing tile. See `docs/OVERVIEW_TUNING.md`.
 * `tile_range`: Export only the tiles in this tile-id range, `"LO..HI"`: one shard of a sharded build.
 * `zoom_ceiling`: Export only the tiles at or below this zoom: the coarse job of a sharded build.
 
@@ -437,6 +439,7 @@ convert(
     size_valve: Literal['merge', 'drop'] = "merge",
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     coverage_fill: bool = False,
+    variable_depth: bool = False,
     gsds: Sequence[float] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     name: str | None = None,
@@ -515,6 +518,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `size_valve`: See `export_pmtiles()`.
 * `max_compressed_tile_size`: See `export_pmtiles()`. `"auto"` is no limit with `verbatim`.
 * `coverage_fill`: See `export_pmtiles()`.
+* `variable_depth`: See `export_pmtiles()`.
 * `gsds`: See `overview()`.
 * `bbox`: See `overview()`.
 * `name`: See `export_pmtiles()`.
@@ -759,6 +763,7 @@ class ExportReport(TypedDict):
     encode_quantized_features: int
     skipped_property_columns: list[SkippedPropertyColumn]
     duration_secs: float
+    variable_depth: VariableDepthReport | None
 ```
 
 * `oversized_tiles`: Tiles that exceeded a size limit and triggered size reduction.
@@ -767,6 +772,7 @@ class ExportReport(TypedDict):
 * `encode_dropped_features`: Features removed by clipping. A nonzero count logs a warning for lost content.
 * `encode_quantized_features`: Features that collapsed at the tile extent, usually harmless edge slivers.
 * `skipped_property_columns`: Columns MVT cannot encode, such as binary. Struct, list, and map columns become JSON strings.
+* `variable_depth`: The `variable_depth=True` summary; None otherwise.
 
 ### `ZoomReport`
 
@@ -789,7 +795,10 @@ class ZoomReport(TypedDict):
     fill_polygons: int
     fill_vertices: int
     fill_shed: int
+    stopped_tiles: int
 ```
+
+* `stopped_tiles`: Tiles at this zoom that end their branch, with nothing stored below (`variable_depth=True`); 0 otherwise.
 
 ### `SkippedPropertyColumn`
 
@@ -800,6 +809,23 @@ class SkippedPropertyColumn(TypedDict):
     name: str
     data_type: str
 ```
+
+### `VariableDepthReport`
+
+How a `variable_depth=True` export stopped branches.
+
+```python
+class VariableDepthReport(TypedDict):
+    canonical_max_zoom: int
+    stored_max_zoom: int | None
+    probed_tiles: int
+    stopped_tiles: int
+```
+
+* `canonical_max_zoom`: The finest level's zoom, which every stopped tile keeps the precision of.
+* `stored_max_zoom`: The deepest zoom holding a tile, the PMTiles header's max zoom.
+* `probed_tiles`: Tiles tested against both size caps.
+* `stopped_tiles`: Probed tiles that fit, and end their branch.
 
 ### `PyramidReport`
 

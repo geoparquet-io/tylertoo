@@ -549,13 +549,6 @@ fn check_rss_sampler(line: &serde_json::Value, holder: &serde_json::Value, phase
     check_saturation(line, holder, phases);
 }
 
-/// #810: the stage timers may not explain more CPU than the phase used. A
-/// stage window is wall time on its thread, so one descheduled on a busy
-/// host overstates a little: this much slack, and no more.
-fn stage_slack(cpu: f64) -> f64 {
-    0.1 * cpu + 0.05
-}
-
 /// #810: `rss_sampler.phases`, one saturation record per phase, named in
 /// run order by `rss_sampler.phase_order`, and the per-tick timeline.
 fn check_saturation(line: &serde_json::Value, holder: &serde_json::Value, phases: &[&str]) {
@@ -610,11 +603,9 @@ fn check_saturation(line: &serde_json::Value, holder: &serde_json::Value, phases
             (unattributed - (cpu - stage)).abs() < 1e-6,
             "{phase}: {line}"
         );
-        assert!(
-            stage <= cpu + stage_slack(cpu),
-            "{phase}: the stage timers ({stage:.3}s) explain more than the phase's \
-             CPU ({cpu:.3}s): a stage is double-counted: {line}"
-        );
+        // No `stage <= cpu` bound here: stage windows are wall time, so a
+        // descheduled thread overstates them under load. The deterministic
+        // double-count guard is `stage_core_secs_count_each_stage_once`.
     }
     if cfg!(unix) {
         assert!(

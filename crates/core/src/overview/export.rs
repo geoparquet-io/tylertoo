@@ -154,6 +154,7 @@ mod tile_data;
 use tile_data::TileData;
 
 mod coverage_fill;
+pub(crate) mod variable_depth;
 use coalesce_valve::RowGapCursor;
 struct PartitionBudget {
     partition_target: usize,
@@ -391,6 +392,16 @@ pub struct ExportOptions {
     #[cfg_attr(feature = "cli", arg(long))]
     #[cfg_attr(feature = "cli", arg(help = "Fill the holes that dense small polygons (parcels, fields, small admin units) leave at coarse zooms: under each tile's features, also draw the area its child tiles cover, with the attributes of one feature it sits under, in the room the tile's own features leave. Adds 10–17% to build time on dense coverages, about 1.5x on scattered sub-pixel fields (which it may also over-draw), and holds the finest level's geometry in memory. A sharded build's coarse job draws it; data shards (`--tile-range`) do not", long_help = None))]
     pub coverage_fill: bool,
+    /// #803: end each branch of the pyramid at the coarsest zoom whose tile
+    /// can carry every canonical feature under it within both size caps,
+    /// tippecanoe's `--generate-variable-depth-tile-pyramid`. The archive's
+    /// header max zoom is then the deepest tile written, and a server must
+    /// fall back to the nearest ancestor tile for a missing one. Default
+    /// `false`; see `export/variable_depth.rs` for the stop rule and the
+    /// options it refuses.
+    #[cfg_attr(feature = "cli", arg(long = "generate-variable-depth-tile-pyramid"))]
+    #[cfg_attr(feature = "cli", arg(help = "Stop each branch of the tile pyramid at the coarsest zoom whose tile holds all of that area's finest-level features within both size caps, like tippecanoe's flag of the same name. Fewer, larger tiles; the server must serve the nearest ancestor for a missing tile. Off by default", long_help = None))]
+    pub variable_depth: bool,
     /// Skip the `i_overlay` boundary-bridge fallback for features whose rings are
     /// already proven simple (issue #239). On a simple ring, Sutherland–Hodgman's
     /// boundary-following clip is a self-touching polygon that is area- and
@@ -601,6 +612,7 @@ with_setters!(ExportOptions {
     with_spill_dir => spill_dir: Option<PathBuf>,
     with_profile => profile: MemoryProfile,
     with_metadata => metadata: TilesetMetadata,
+    with_variable_depth => variable_depth: bool,
 });
 
 impl Default for ExportOptions {
@@ -613,6 +625,7 @@ impl Default for ExportOptions {
             compressed_tile_size_limit: Some(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT),
             size_valve: SizeValve::Merge,
             coverage_fill: false,
+            variable_depth: false,
             simple_clip_fastpath: true,
             partition_wave: PARTITION_WAVE_AUTO,
             feature_order: FeatureOrder::default(),
@@ -701,6 +714,7 @@ impl ExportOptions {
         }
         // #427: fail fast on a bad spill dir, the convert side's rule.
         super::config::check_spill_dir(self.spill_dir.as_deref())?;
+        variable_depth::check_options(self)?;
         // Publication strings that cannot fit an archive's metadata would
         // otherwise fail only when the first checkpoint is assembled.
         check_metadata_size(&self.metadata)
@@ -762,6 +776,10 @@ pub struct ZoomReport {
     /// Fill polygons left out to stay within the fill's share of a tile's
     /// size limit, smallest first.
     pub fill_shed: usize,
+    /// #803 stopped tiles at this zoom, counted in `tile_count`: tiles that
+    /// hold every finest-level feature under them, with nothing stored
+    /// below. 0 without [`ExportOptions::variable_depth`].
+    pub stopped_tiles: usize,
 }
 
 /// Result of an export, `Serialize` for the `--report` JSON.
@@ -812,6 +830,27 @@ pub struct ExportReport {
     pub valve_dropped_features: usize,
     /// Wall-clock export duration in seconds.
     pub duration_secs: f64,
+    /// The #803 variable-depth summary; `None` without
+    /// [`ExportOptions::variable_depth`].
+    pub variable_depth: Option<VariableDepthReport>,
+}
+
+/// How a variable-depth export (#803) stopped its branches. Per-zoom stop
+/// counts are [`ZoomReport::stopped_tiles`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct VariableDepthReport {
+    /// The finest level's zoom: what [`ExportReport::max_zoom`] declares, and
+    /// the precision every stopped tile keeps.
+    pub canonical_max_zoom: u8,
+    /// The deepest zoom holding a tile: the PMTiles header's `max_zoom`.
+    /// Shallower than the canonical one when every branch stopped above it.
+    pub stored_max_zoom: Option<u8>,
+    /// Tiles probed: drawn from the finest level's features to see whether
+    /// they fit both size caps.
+    pub probed_tiles: usize,
+    /// Probed tiles that fit, and stopped their branch.
+    pub stopped_tiles: usize,
 }
 
 /// A property column the export dropped because its Arrow type has no MVT
@@ -1060,6 +1099,14 @@ pub enum ExportError {
         gsd: f64,
     },
 
+    /// #803: a column the variable-depth stop rule reads (a footer's
+    /// entry-zoom or cluster count column) is missing, or its values do not
+    /// read as numbers. Refused rather than read as empty, which would let
+    /// tiles stop.
+    #[error("--generate-variable-depth-tile-pyramid reads column {column:?}, which {reason}")]
+    #[non_exhaustive]
+    VariableDepthColumn { column: String, reason: String },
+
     #[error(
         "included property {name:?} is not a property this overview file exports \
          (exportable: {available})"
@@ -1197,7 +1244,8 @@ impl crate::error::Classify for ExportError {
             ExportError::UnknownProperty { .. }
             | ExportError::UnsupportedProperty { .. }
             | ExportError::CoveringProperty { .. }
-            | ExportError::PropertyRequiredByKnob { .. } => ErrorKind::Input,
+            | ExportError::PropertyRequiredByKnob { .. }
+            | ExportError::VariableDepthColumn { .. } => ErrorKind::Input,
             _ => crate::error::fallback_kind(self),
         }
     }
@@ -1927,17 +1975,35 @@ pub fn write_empty_archive(
     metadata: &TilesetMetadata,
 ) -> Result<(), ExportError> {
     check_metadata_size(metadata)?;
-    // Gzip and the tail layout, matching `export_pmtiles` exactly —
-    // `merge_shards` refuses inputs whose tile compression disagrees, so an
-    // empty shard written any other way would break the very merge it exists
-    // to keep working.
+    let mut writer = open_writer(output, layer_name, metadata, min_zoom)?;
+    writer.set_declared_max_zoom(max_zoom);
+    writer.finalize(output)?;
+    Ok(())
+}
+
+/// The writer every export archive starts from, empty or not: gzip tiles in
+/// the tail layout, with the layer name, metadata and declared min zoom set
+/// before the first tile, so every checkpoint carries them too.
+///
+/// #459: the tail layout appends tile bytes straight into
+/// `<output>.partial` after a reserved 16 KiB prefix and never copies them
+/// again, so a per-level checkpoint rewrites only the header, root
+/// directory, metadata and leaves — O(directory), not O(tile data). The
+/// spool lives beside the output rather than in `TMPDIR`. Gzip because
+/// `merge_shards` refuses inputs whose tile compression disagrees, so an
+/// empty shard written any other way would break the very merge it exists
+/// to keep working.
+fn open_writer(
+    output: &Path,
+    layer_name: &str,
+    metadata: &TilesetMetadata,
+    min_zoom: u8,
+) -> Result<StreamingPmtilesWriter, ExportError> {
     let mut writer = StreamingPmtilesWriter::with_tail_layout(output, Compression::Gzip)?;
     writer.set_layer_name(layer_name);
     writer.set_metadata(metadata.clone());
     writer.set_declared_min_zoom(min_zoom);
-    writer.set_declared_max_zoom(max_zoom);
-    writer.finalize(output)?;
-    Ok(())
+    Ok(writer)
 }
 
 /// Plan every level's partitions and wave width.
@@ -1953,72 +2019,74 @@ pub fn write_empty_archive(
 /// fixed during convert's pass 1.
 fn plan_levels(
     scans: &[LevelScan],
-    meta: &OverviewsMeta,
-    num_levels: usize,
-    inputs: PartitionBudget,
+    level_zooms: &[u8],
+    inputs: &PartitionBudget,
 ) -> Result<Vec<LevelPlan>, ExportError> {
+    let num_levels = scans.len();
+    let plans: Vec<LevelPlan> = scans
+        .iter()
+        .zip(level_zooms)
+        .enumerate()
+        .map(|(level_idx, (scan, &zoom))| {
+            plan_level(&scan.tile_counts, zoom, inputs, || {
+                format!("level {}/{num_levels} z{zoom}", level_idx + 1)
+            })
+        })
+        .collect();
+    check_levels_fit(
+        &plans,
+        scans,
+        inputs.fit_member_bytes,
+        inputs.fit_limit,
+        skip_memory_preflight_from_env(),
+    )?;
+    Ok(plans)
+}
+
+/// One zoom's partitions and wave width: its tiles split into contiguous
+/// ascending PMTiles tile-id ranges (#506) of about `partition_target`
+/// members each, and on `auto` the wave narrowed from the densest of them
+/// (#311). `label` names the zoom in the guard's log line.
+fn plan_level(
+    tile_counts: &BTreeMap<u64, usize>,
+    zoom: u8,
+    inputs: &PartitionBudget,
+    label: impl Fn() -> String,
+) -> LevelPlan {
     let PartitionBudget {
         partition_target,
         ceiling_wave,
         auto_wave,
         member_bytes,
-        fit_member_bytes,
         profile,
-        budget,
-        fit_limit,
-    } = inputs;
-    let plans = scans
-        .iter()
-        .enumerate()
-        .map(|(level_idx, scan)| {
-            let zoom = zoom_for_level(meta, level_idx)?;
-
-            // Split the zoom's tiles into contiguous ascending PMTiles
-            // tile-id ranges (#506) of roughly `partition_target` members
-            // each.
-            let partitions = plan_partitions(&scan.tile_counts, zoom, partition_target);
-
-            // Per-level memory guard (#311): on `auto`, narrow the wave from
-            // THIS level's densest planned partition so a dense finest zoom
-            // does not OOM the whole run. Explicit waves are honoured verbatim.
-            let wave = if auto_wave {
-                let w = memory_safe_level_wave(
-                    ceiling_wave,
-                    &partitions,
-                    member_bytes,
-                    profile,
-                    &budget,
-                );
-                if w < ceiling_wave {
-                    let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
-                    log::info!(
-                        "[export] level {}/{num_levels} z{zoom}: wave {ceiling_wave} → {w} \
-                         (densest partition {densest} members × ~{} B/member resident, \
-                         {} MiB budget) — #311 density guard",
-                        level_idx + 1,
-                        member_bytes.unwrap_or(0),
-                        export_collect_bytes(profile, &budget) / (1024 * 1024),
-                    );
-                }
-                w
-            } else {
-                ceiling_wave
-            };
-            Ok(LevelPlan {
-                zoom,
-                partitions,
-                wave,
-            })
-        })
-        .collect::<Result<Vec<_>, ExportError>>()?;
-    check_levels_fit(
-        &plans,
-        scans,
-        fit_member_bytes,
-        fit_limit,
-        skip_memory_preflight_from_env(),
-    )?;
-    Ok(plans)
+        ref budget,
+        ..
+    } = *inputs;
+    let partitions = plan_partitions(tile_counts, zoom, partition_target);
+    // Per-level memory guard (#311): on `auto`, narrow the wave from THIS
+    // level's densest planned partition so a dense finest zoom does not OOM
+    // the whole run. Explicit waves are honoured verbatim.
+    let wave = if auto_wave {
+        let w = memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, profile, budget);
+        if w < ceiling_wave {
+            let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
+            log::info!(
+                "[export] {}: wave {ceiling_wave} → {w} (densest partition {densest} \
+                 members × ~{} B/member resident, {} MiB budget) — #311 density guard",
+                label(),
+                member_bytes.unwrap_or(0),
+                export_collect_bytes(profile, budget) / (1024 * 1024),
+            );
+        }
+        w
+    } else {
+        ceiling_wave
+    };
+    LevelPlan {
+        zoom,
+        partitions,
+        wave,
+    }
 }
 
 /// #541 review: a partial overview (written under a convert-side zoom
@@ -2181,6 +2249,9 @@ fn export_pmtiles_validated(
 
     let reader = OverviewReader::open(input_path)?;
     let meta = reader.meta().clone();
+    if options.variable_depth {
+        variable_depth::check_file(&meta, reader.mode())?;
+    }
     let crs = crs_from_descriptor(reader.resolved_schema(), input_path, diagnostics)?;
 
     let num_levels = reader.num_levels();
@@ -2272,26 +2343,21 @@ fn export_pmtiles_validated(
 
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
-    // #459: the tail-directory layout. Tile bytes append straight into
-    // `<output>.partial` after a reserved 16 KiB prefix and are never copied
-    // again, so a per-level checkpoint rewrites only the header, root
-    // directory, metadata and leaves — O(directory), not O(tile data). Under
-    // the old spooled layout each checkpoint re-copied the entire spool, so a
-    // planet-scale run with a dozen checkpoints spent hundreds of gigabytes of
-    // write I/O on salvage alone. Side effect worth knowing: the spool now
-    // lives beside the output rather than in `TMPDIR`.
-    let mut writer =
-        StreamingPmtilesWriter::with_tail_layout(output_path.as_ref(), Compression::Gzip)?;
+    let mut writer = open_writer(
+        output_path.as_ref(),
+        &options.layer_name,
+        &options.metadata,
+        min_zoom,
+    )?;
+    if let Some(&canonical) = level_zooms.last().filter(|_| options.variable_depth) {
+        writer.set_variable_depth(canonical);
+    }
     // #506: export now adds every tile in ascending PMTiles tile-id (Hilbert)
     // order — per zoom via `tile_key`, and zooms ascend across levels — so
     // the archive is genuinely clustered. Debug-only: catches an ordering
     // regression here rather than downstream as a quietly `clustered: false`
     // archive.
     writer.set_expect_clustered(true);
-    writer.set_layer_name(&options.layer_name);
-    // Before the first level, so every checkpoint carries it too.
-    writer.set_metadata(options.metadata.clone());
-    writer.set_declared_min_zoom(min_zoom);
     // #361: a `--feature-order` column that names nothing is a no-op, and an
     // indistinguishable one — every member's key is `Missing`, so they all
     // compare equal and the stable sort leaves input order. A typo therefore
@@ -2322,7 +2388,21 @@ fn export_pmtiles_validated(
     let rss_sampler = RssSampler::start_if(profile_json_target().is_some(), "scan");
     let t_scan = Instant::now();
     let timers = Arc::<ExportTimers>::default();
-    let mut scans = scan_all_levels(&reader, crs, &meta, options, &timers, diagnostics)?;
+    // #803: rule A′ is gathered in the same read.
+    let mut vd_scan = options
+        .variable_depth
+        .then(|| {
+            variable_depth::VdScan::new(&meta, reader.geo_metadata_json(), level_zooms.clone())
+        })
+        .transpose()?;
+    let mut scans = scan_all_levels(
+        &reader,
+        crs,
+        options,
+        &timers,
+        vd_scan.as_mut(),
+        diagnostics,
+    )?;
 
     // #498: a sharded build's export owns a slice of the tile space, not all
     // of it. Restricting the SCAN — the per-zoom tile-count map every
@@ -2331,7 +2411,8 @@ fn export_pmtiles_validated(
     // out-of-range tile is never planned, so it is never clipped, encoded,
     // hashed or read for.
     restrict_scans_to_range(&mut scans, &level_zooms, options);
-    let scans = scans;
+    // #803: rule A′'s blocked tiles, once every band is counted.
+    let vd_plan = vd_scan.map(|vd| vd.finish(&scans, options));
 
     let mut overall_bounds: Option<TileBounds> = None;
     for scan in &scans {
@@ -2361,20 +2442,28 @@ fn export_pmtiles_validated(
     // single-read fill (#235) routes members by (level, partition, wave), so
     // the drain loop below must consume the exact same plan it was filled
     // against; hoisting the planning out of the level loop guarantees that.
+    let partition_budget = PartitionBudget {
+        partition_target,
+        ceiling_wave,
+        auto_wave,
+        member_bytes,
+        fit_member_bytes,
+        profile: options.profile,
+        budget: *budget,
+        fit_limit: knobs.memory_limit.or_else(probe_oom_memory_limit),
+    };
+    // #803: the levels coarser than every candidate tile cannot change, so
+    // they are planned now and drawn while the probe runs; the rest are
+    // planned one by one as the probe releases them.
+    let vd = vd_plan.map(|plan| {
+        let first = plan.first_probed_level(options);
+        (plan, first)
+    });
+    let planned = vd.as_ref().map_or(num_levels, |(_, first)| *first);
     let plans = plan_levels(
-        &scans,
-        &meta,
-        num_levels,
-        PartitionBudget {
-            partition_target,
-            ceiling_wave,
-            auto_wave,
-            member_bytes,
-            fit_member_bytes,
-            profile: options.profile,
-            budget: *budget,
-            fit_limit: knobs.memory_limit.or_else(probe_oom_memory_limit),
-        },
+        &scans[..planned],
+        &level_zooms[..planned],
+        &partition_budget,
     )?;
     progress.end_scan(t_scan);
 
@@ -2502,43 +2591,101 @@ fn export_pmtiles_validated(
     });
     #[cfg(test)]
     let work = Mutex::new(ExportWorkTally::default());
+    let (head, rest) = scans.split_at_mut(planned);
+    let unplanned = (
+        LevelScan {
+            feature_count: 0,
+            bounds: None,
+            tile_counts: BTreeMap::new(),
+        },
+        LevelPlan {
+            zoom: 0,
+            partitions: Vec::new(),
+            wave: 1,
+        },
+    );
+    let template = ExportLevelCtx {
+        reader: &reader,
+        scan: &unplanned.0,
+        plan: &unplanned.1,
+        level_idx: 0,
+        num_levels,
+        crs,
+        published: &published,
+        feature_id: feature_id.as_ref(),
+        options,
+        gzip_cache: &gzip_cache,
+        start,
+        fills: None,
+        terminals: &[],
+        level_read,
+        #[cfg(test)]
+        work: &work,
+    };
     let levels: Vec<ExportLevelCtx<'_>> = plans
         .iter()
+        .zip(head.iter())
         .enumerate()
-        .map(|(level_idx, plan)| ExportLevelCtx {
-            reader: &reader,
-            scan: &scans[level_idx],
+        .map(|(level_idx, (plan, scan))| ExportLevelCtx {
+            scan,
             plan,
             level_idx,
-            num_levels,
-            crs,
-            published: &published,
-            feature_id: feature_id.as_ref(),
-            options,
-            gzip_cache: &gzip_cache,
-            start,
-            fills: None,
-            level_read,
-            #[cfg(test)]
-            work: &work,
+            ..template
         })
         .collect();
     let level_groups = plan_level_groups(&plans, group_cap);
-    zooms.extend(export_level_groups(
-        &mut writer,
-        LevelMemory {
-            store: store.as_mut(),
-            budget: &mut *budget,
-        },
-        &levels,
-        &level_groups,
-        &CheckpointCtx {
-            output_path: output_path.as_ref(),
-            coarsest_zoom,
-        },
-        &mut progress,
-        diagnostics,
-    )?);
+    let mem = LevelMemory {
+        store: store.as_mut(),
+        budget: &mut *budget,
+    };
+    let ckpt = CheckpointCtx {
+        output_path: output_path.as_ref(),
+        coarsest_zoom,
+    };
+    let probe_timers = Arc::clone(&progress.profile.timers);
+    #[cfg_attr(not(test), expect(unused_variables, reason = "the tests' schedule"))]
+    let (reports, level_groups, probed) = match vd {
+        None => {
+            let reports = export_level_groups(
+                &mut writer,
+                mem,
+                &levels,
+                &level_groups,
+                &ckpt,
+                &mut progress,
+                diagnostics,
+            )?;
+            (reports, level_groups, None)
+        }
+        Some((plan, _)) => {
+            let (reports, groups, probed) = variable_depth::export_levels(
+                &mut writer,
+                mem,
+                &ckpt,
+                &mut progress,
+                diagnostics,
+                variable_depth::VdLevels {
+                    plan,
+                    probe: variable_depth::Probe {
+                        reader: &reader,
+                        crs,
+                        published: &published,
+                        feature_id: feature_id.as_ref(),
+                        options,
+                        budget: &partition_budget,
+                        timers: &probe_timers,
+                    },
+                    planned: (&levels, level_groups),
+                    rest,
+                    zooms: &level_zooms,
+                    template,
+                    group_cap,
+                },
+            )?;
+            (reports, groups, Some(probed))
+        }
+    };
+    zooms.extend(reports);
 
     budget.release(store_grant);
     budget.release(gzip_grant);
@@ -2579,6 +2726,7 @@ fn export_pmtiles_validated(
             skipped_property_columns,
             start,
         )
+        .with_variable_depth(probed)
         .with_diagnostics(diagnostics)?,
         #[cfg(test)]
         level_groups,
@@ -2657,7 +2805,25 @@ impl ExportReport {
             valve_dropped_features: zooms.iter().map(|z| z.valve_dropped_features).sum(),
             zooms,
             duration_secs: start.elapsed().as_secs_f64(),
+            variable_depth: None,
         }
+    }
+
+    /// Add the #803 summary when `probed` (the probe's tile count) says the
+    /// export had variable depth.
+    fn with_variable_depth(mut self, probed: Option<usize>) -> Self {
+        self.variable_depth = probed.map(|probed_tiles| VariableDepthReport {
+            canonical_max_zoom: self.max_zoom,
+            stored_max_zoom: self
+                .zooms
+                .iter()
+                .rev()
+                .find(|z| z.tile_count > 0)
+                .map(|z| z.zoom),
+            probed_tiles,
+            stopped_tiles: self.zooms.iter().map(|z| z.stopped_tiles).sum(),
+        });
+        self
     }
 }
 
@@ -3048,6 +3214,8 @@ struct ExportLevelCtx<'a> {
     start: Instant,
     /// The #750 coverage fill, when asked for.
     fills: Option<&'a coverage_fill::FillMap>,
+    /// #803: the level's stopped tiles, in key order, written among its own.
+    terminals: &'a [EncodedTile],
     /// How a level of several waves reads its band when no export-wide
     /// member store is filled: once, into a one-level [`MemberStore`]
     /// (#740), or, `None`, once per wave.
@@ -3071,6 +3239,10 @@ impl<'a> ExportLevelCtx<'a> {
             feature_id: self.feature_id,
             timers,
             fills: self.fills,
+            tiles: self
+                .options
+                .variable_depth
+                .then_some(&self.scan.tile_counts),
             #[cfg(test)]
             work: self.work,
         }
@@ -3135,7 +3307,7 @@ fn export_level(
             }
             (None, None) => process_wave(&ctx, wave, diagnostics)?,
         };
-        write_encoded_tiles(writer, zoom, &results, &mut tally, timers)?;
+        write_encoded_tiles(writer, zoom, &results, level.terminals, &mut tally, timers)?;
 
         if last_wave_log.elapsed() >= WAVE_LOG_INTERVAL {
             log::info!(
@@ -3149,6 +3321,7 @@ fn export_level(
             last_wave_log = Instant::now();
         }
     }
+    write_terminals(writer, zoom, level.terminals, None, &mut tally, timers)?;
     for grant in level_grants {
         budget.release(grant);
     }
@@ -3486,13 +3659,17 @@ impl GroupCommit<'_> {
             spill_bytes: encoded.spill_bytes,
             ..LevelTally::default()
         };
+        let timers = &self.progress.profile.timers;
+        let zoom = level.plan.zoom;
         write_encoded_tiles(
             self.writer,
-            level.plan.zoom,
+            zoom,
             &encoded.tiles,
+            level.terminals,
             &mut tally,
-            &self.progress.profile.timers,
+            timers,
         )?;
+        write_terminals(self.writer, zoom, level.terminals, None, &mut tally, timers)?;
         drop(encoded.tiles);
         let report = finish_level(
             level,
@@ -3572,33 +3749,76 @@ struct LevelTally {
     fill: FillTally,
     /// #810: the level's spilled member bytes, for its profile entry.
     spill_bytes: u64,
+    /// #803: the level's stopped tiles written so far.
+    terminals: usize,
 }
 
 /// Append one wave's encoded tiles to the writer in order, and add them to
-/// `tally`.
+/// `tally`. The level's #803 stopped tiles that sort before each are
+/// written first, so the archive stays in tile-id order.
 fn write_encoded_tiles(
     writer: &mut StreamingPmtilesWriter,
     zoom: u8,
     results: &[Vec<EncodedTile>],
+    terminals: &[EncodedTile],
+    tally: &mut LevelTally,
+    timers: &ExportTimers,
+) -> Result<(), ExportError> {
+    for t in results.iter().flatten() {
+        write_terminals(
+            writer,
+            zoom,
+            terminals,
+            Some(tile_key(t.x, t.y, zoom)),
+            tally,
+            timers,
+        )?;
+        write_tile(writer, zoom, t, tally, timers)?;
+    }
+    Ok(())
+}
+
+/// Write the level's #803 stopped tiles not yet written whose key is below
+/// `before` (all of them for `None`).
+fn write_terminals(
+    writer: &mut StreamingPmtilesWriter,
+    zoom: u8,
+    terminals: &[EncodedTile],
+    before: Option<u64>,
+    tally: &mut LevelTally,
+    timers: &ExportTimers,
+) -> Result<(), ExportError> {
+    while let Some(t) = terminals.get(tally.terminals) {
+        if before.is_some_and(|key| tile_key(t.x, t.y, zoom) >= key) {
+            break;
+        }
+        write_tile(writer, zoom, t, tally, timers)?;
+        tally.terminals += 1;
+    }
+    Ok(())
+}
+
+/// Append one encoded tile to the writer, and add it to `tally`.
+fn write_tile(
+    writer: &mut StreamingPmtilesWriter,
+    zoom: u8,
+    t: &EncodedTile,
     tally: &mut LevelTally,
     timers: &ExportTimers,
 ) -> Result<(), ExportError> {
     let t_write = Instant::now();
-    for t in results.iter().flatten() {
-        tally.encode_dropped += t.encode_dropped;
-        tally.encode_quantized += t.encode_quantized;
-        tally.valve.merged += t.valve.merged;
-        tally.valve.dropped += t.valve.dropped;
-        tally.valve.passes = tally.valve.passes.max(t.valve.passes);
-        tally.valve_passes += u64::from(t.valve.passes);
-        tally.fill.polygons += t.fill.polygons;
-        tally.fill.vertices += t.fill.vertices;
-        tally.fill.shed += t.fill.shed;
-        tally.valve.mingap = tally.valve.mingap.max(t.valve.mingap);
-        if t.feature_count == 0 {
-            // #431: an all-dropped tile is a tally carrier, not a tile.
-            continue;
-        }
+    tally.encode_dropped += t.encode_dropped;
+    tally.encode_quantized += t.encode_quantized;
+    tally.valve.merged += t.valve.merged;
+    tally.valve.dropped += t.valve.dropped;
+    tally.valve.passes = tally.valve.passes.max(t.valve.passes);
+    tally.valve_passes += u64::from(t.valve.passes);
+    tally.fill.polygons += t.fill.polygons;
+    tally.fill.vertices += t.fill.vertices;
+    tally.fill.shed += t.fill.shed;
+    tally.valve.mingap = tally.valve.mingap.max(t.valve.mingap);
+    if t.feature_count > 0 {
+        // #431: an all-dropped tile is a tally carrier, not a tile.
         tally.tile_feature_count += t.feature_count;
         tally.bytes_written += t.data.len() as u64;
         if t.oversized {
@@ -3619,9 +3839,9 @@ fn write_encoded_tiles(
     }
     let write_dur = t_write.elapsed();
     tally.write_secs += write_dur.as_secs_f64();
-    // #535: `spool_write` is exactly this per-wave window — the serial
-    // per-tile `writer.add_tile_precompressed` calls above, same span
-    // `write_secs` already measures for the `[profile]` log.
+    // #535: `spool_write` is exactly the serial per-tile
+    // `writer.add_tile_precompressed` window, the span `write_secs` measures
+    // for the `[profile]` log.
     add_nanos(&timers.spool_write, write_dur);
     Ok(())
 }
@@ -3694,6 +3914,7 @@ fn finish_level(
         fill_polygons: tally.fill.polygons,
         fill_vertices: tally.fill.vertices,
         fill_shed: tally.fill.shed,
+        stopped_tiles: tally.terminals,
     }
 }
 
@@ -3887,6 +4108,10 @@ struct LevelCtx<'a> {
     timers: &'a ExportTimers,
     /// The #750 coverage fill, when asked for.
     fills: Option<&'a coverage_fill::FillMap>,
+    /// #803: the only tiles to clip into. A partition's key range can span
+    /// a stopped tile, whose members must not be drawn again. `None` draws
+    /// every tile in the range, which then holds only planned tiles.
+    tiles: Option<&'a BTreeMap<u64, usize>>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -5109,9 +5334,9 @@ fn encode_buckets(
 fn scan_all_levels(
     reader: &OverviewReader,
     crs: Crs,
-    meta: &OverviewsMeta,
     opts: &ExportOptions,
     timers: &ExportTimers,
+    mut vd: Option<&mut variable_depth::VdScan>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<LevelScan>, ExportError> {
     let t_scan = Instant::now();
@@ -5125,23 +5350,32 @@ fn scan_all_levels(
     };
     let source = ScanBboxSource::for_reader(reader);
     if matches!(source, ScanBboxSource::Covering { .. }) {
-        if let Some(scans) =
-            scan_all_levels_from(reader, crs, meta, opts, timers, &source, diagnostics)?
-        {
+        if let Some(scans) = scan_all_levels_from(
+            reader,
+            crs,
+            opts,
+            timers,
+            &source,
+            vd.as_deref_mut(),
+            diagnostics,
+        )? {
             return Ok(done(scans, "bbox covering"));
         }
         log::info!(
             "[export] the bbox covering has an empty or non-finite row; \
              rescanning from the geometry"
         );
+        if let Some(vd) = vd.as_deref_mut() {
+            vd.reset();
+        }
     }
     let scans = scan_all_levels_from(
         reader,
         crs,
-        meta,
         opts,
         timers,
         &ScanBboxSource::Geometry,
+        vd,
         diagnostics,
     )?
     .expect("a geometry scan never abandons its pass");
@@ -5189,16 +5423,16 @@ impl ScanBboxSource {
 fn scan_all_levels_from(
     reader: &OverviewReader,
     crs: Crs,
-    meta: &OverviewsMeta,
     opts: &ExportOptions,
     timers: &ExportTimers,
     source: &ScanBboxSource,
+    mut vd: Option<&mut variable_depth::VdScan>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<Vec<LevelScan>>, ExportError> {
     let num_levels = reader.num_levels();
     let partitioning = matches!(reader.mode(), Mode::Partitioning);
     let zooms: Vec<u8> = (0..num_levels)
-        .map(|k| zoom_for_level(meta, k))
+        .map(|k| zoom_for_level(reader.meta(), k))
         .collect::<Result<_, _>>()?;
     let mut scans: Vec<LevelScan> = (0..num_levels)
         .map(|_| LevelScan {
@@ -5231,6 +5465,24 @@ fn scan_all_levels_from(
         ScanBboxSource::Covering { column, .. } => reader.schema().index_of(column).ok(),
         ScanBboxSource::Geometry => reader.resolved_schema().geometry_index(),
     };
+    // #803: rule A′ also reads the cluster and release columns, and a mixed
+    // band's geometry for its rows' kinds.
+    let roots: Option<Vec<usize>> = root
+        .map(|r| -> Result<Vec<usize>, ExportError> {
+            let mut roots = vec![r];
+            if let Some(vd) = vd.as_deref() {
+                for name in vd.columns() {
+                    roots.push(variable_depth::column_index(reader.schema(), name)?);
+                }
+                if vd.needs_geometry() {
+                    roots.extend(reader.resolved_schema().geometry_index());
+                }
+            }
+            roots.sort_unstable();
+            roots.dedup();
+            Ok(roots)
+        })
+        .transpose()?;
     let scans_ref = &mut scans;
     let zooms_ref = &zooms;
     let mut abandoned = false;
@@ -5239,8 +5491,8 @@ fn scan_all_levels_from(
         WAVE_READ_IN_FLIGHT,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
             for j in 0..num_levels {
-                let mut band_reader = ExportTimers::time(&timers.scan_read, || match root {
-                    Some(r) => reader.read_band_projected(j, EXPORT_BATCH_SIZE, &[r]),
+                let mut band_reader = ExportTimers::time(&timers.scan_read, || match &roots {
+                    Some(r) => reader.read_band_projected(j, EXPORT_BATCH_SIZE, r),
                     None => reader.read_band_batched(j, EXPORT_BATCH_SIZE),
                 })?;
                 while let Some(batch) = ExportTimers::time(&timers.scan_read, || band_reader.next())
@@ -5275,6 +5527,49 @@ fn scan_all_levels_from(
                     *abandoned_ref = true;
                     return Ok(());
                 };
+                if let Some(vd) = vd.as_deref_mut() {
+                    let geometries = || -> Result<Vec<Option<Geometry<f64>>>, ExportError> {
+                        let geom_idx = batch_geometry_index(&batch, geometry)?;
+                        let field = batch.schema().field(geom_idx).clone();
+                        let garr = from_arrow_array(batch.column(geom_idx).as_ref(), &field)
+                            .map_err(|e| {
+                                crate::GeoParquetReadError::decode("geometry decode", e)
+                            })?;
+                        let mut out = Vec::with_capacity(batch.num_rows());
+                        // Quiet: without variable depth the scan counts these
+                        // rows' decode warnings only in its own bbox decode.
+                        crate::batch_processor::extract_geometries_opt_from_array(
+                            garr.as_ref(),
+                            &mut out,
+                            &crate::diagnostics::Diagnostics::silent(),
+                        )?;
+                        Ok(out)
+                    };
+                    let aligned = || -> Result<Vec<Option<TileBounds>>, ExportError> {
+                        match source {
+                            ScanBboxSource::Covering { column, names } => {
+                                covering_row_bboxes(&batch, column, names, crs)
+                            }
+                            ScanBboxSource::Geometry => Ok(geometries()?
+                                .iter()
+                                .map(|g| g.as_ref().and_then(|g| geometry_lnglat_bbox(g, crs)))
+                                .collect()),
+                        }
+                    };
+                    ExportTimers::time(&timers.scan_size, || {
+                        vd.fold(
+                            j,
+                            &batch,
+                            &bboxes,
+                            &variable_depth::RowSource {
+                                bboxes: &aligned,
+                                geometries: &geometries,
+                            },
+                            crs,
+                            opts,
+                        )
+                    })?;
+                }
                 for k in j..=last {
                     let scan = &mut scans_ref[k];
                     scan.feature_count += bboxes.len();
@@ -5318,6 +5613,39 @@ fn covering_batch_bboxes(
     names: &[String; 4],
     crs: Crs,
 ) -> Result<Option<Vec<Option<TileBounds>>>, ExportError> {
+    Ok(covering_rows(batch, column, names, crs)?
+        .filter(|row| !matches!(row, Some(None)))
+        .collect())
+}
+
+/// [`covering_batch_bboxes`] row-aligned: `None` for a null row. Only called
+/// on a batch whose covering rows all passed that function's checks; a row
+/// that does not is an error.
+fn covering_row_bboxes(
+    batch: &RecordBatch,
+    column: &str,
+    names: &[String; 4],
+    crs: Crs,
+) -> Result<Vec<Option<TileBounds>>, ExportError> {
+    covering_rows(batch, column, names, crs)?
+        .collect::<Option<_>>()
+        .ok_or_else(|| {
+            crate::GeoParquetReadError::decode(
+                "bbox covering",
+                format!("{column:?} has a malformed row"),
+            )
+            .into()
+        })
+}
+
+/// Each row of a bbox covering: `Some(None)` for a null row, `Some(bbox)`
+/// for a finite, ordered box, `None` for anything else.
+fn covering_rows<'a>(
+    batch: &'a RecordBatch,
+    column: &str,
+    names: &[String; 4],
+    crs: Crs,
+) -> Result<impl Iterator<Item = Option<Option<TileBounds>>> + 'a, ExportError> {
     let not_covering = || {
         crate::Error::from(crate::GeoParquetReadError::CoveringNotF64Struct {
             column: column.to_string(),
@@ -5339,29 +5667,24 @@ fn covering_batch_bboxes(
         child(&names[2])?,
         child(&names[3])?,
     ];
-    let mut bboxes = Vec::with_capacity(strukt.len() - strukt.null_count());
-    for i in 0..strukt.len() {
+    Ok((0..strukt.len()).map(move |i| {
         if strukt.is_null(i) {
-            continue;
+            return Some(None);
         }
         if [xmin, ymin, xmax, ymax].iter().any(|c| c.is_null(i)) {
-            return Ok(None);
+            return None;
         }
         let (x0, y0, x1, y1) = (xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i));
         // Finite and ordered: `<=` is false for NaN, and an ordered pair with
         // one infinite end cannot pass the finiteness check.
-        if !(x0 <= x1
+        (x0 <= x1
             && y0 <= y1
             && x0.is_finite()
             && x1.is_finite()
             && y0.is_finite()
             && y1.is_finite())
-        {
-            return Ok(None);
-        }
-        bboxes.push(Some(lnglat_bbox(x0, y0, x1, y1, crs)));
-    }
-    Ok(Some(bboxes))
+        .then(|| Some(lnglat_bbox(x0, y0, x1, y1, crs)))
+    }))
 }
 
 /// A bbox in the file's CRS as lon/lat [`TileBounds`]: the two corners go
@@ -5376,6 +5699,13 @@ fn lnglat_bbox(x0: f64, y0: f64, x1: f64, y1: f64, crs: Crs) -> TileBounds {
     } else {
         TileBounds::new(x0, y0, x1, y1)
     }
+}
+
+/// A geometry's bounding box as lon/lat [`TileBounds`] (see
+/// [`lnglat_bbox`]); `None` when it has none (empty).
+pub(super) fn geometry_lnglat_bbox(geom: &Geometry<f64>, crs: Crs) -> Option<TileBounds> {
+    geom.bounding_rect()
+        .map(|r| lnglat_bbox(r.min().x, r.min().y, r.max().x, r.max().y, crs))
 }
 
 /// Decode one record batch's geometries into per-feature bounding boxes,
@@ -5399,13 +5729,36 @@ fn decode_batch_bboxes(
     extract_geometries_from_array(garr.as_ref(), &mut geoms, diagnostics)?;
     let bboxes = geoms
         .par_iter()
-        .map(|geom| {
-            geom.bounding_rect().map(|rect| {
-                lnglat_bbox(rect.min().x, rect.min().y, rect.max().x, rect.max().y, crs)
-            })
-        })
+        .map(|geom| geometry_lnglat_bbox(geom, crs))
         .collect();
     Ok(bboxes)
+}
+
+/// Every tile key one feature with `bbox` is a member of at `zoom`, once each.
+/// Counts must match what `feature_tile_members` will emit, so both go
+/// through `wrap_shifts` and `member_ranges`.
+#[inline]
+fn for_each_member_key(bbox: &TileBounds, zoom: u8, opts: &ExportOptions, mut f: impl FnMut(u64)) {
+    let buffer = buffer_deg_at_zoom(zoom, opts);
+    if !near_world_edge(bbox, buffer) {
+        let ranges = member_ranges(bbox, zoom, opts);
+        for tc in tiles_in_ranges(&ranges, zoom) {
+            f(tile_key(tc.x, tc.y, zoom));
+        }
+        return;
+    }
+    let copies: Vec<BboxTileRanges> = wrap_shifts(bbox, buffer)
+        .map(|shift| member_ranges(&shift_bbox(bbox, shift), zoom, opts))
+        .collect();
+    for (i, ranges) in copies.iter().enumerate() {
+        for tc in tiles_in_ranges(ranges, zoom) {
+            // A tile two copies share is one member (#342).
+            if copies[..i].iter().any(|r| ranges_contain(r, tc)) {
+                continue;
+            }
+            f(tile_key(tc.x, tc.y, zoom));
+        }
+    }
 }
 
 /// Size a batch of (already-reprojected) feature bboxes at `zoom`: union their
@@ -5431,30 +5784,11 @@ fn size_bboxes(
                             None => bounds = Some(extent),
                         }
                     }
-                    // Counts must match what `feature_tile_members` will emit,
-                    // so both go through `wrap_shifts` and `member_ranges`; the
-                    // accumulated `bounds` above stay the true (wrapped)
+                    // The accumulated `bounds` above stay the true (wrapped)
                     // extent, since they become the archive's advertised bbox.
-                    let buffer = buffer_deg_at_zoom(zoom, opts);
-                    if !near_world_edge(bbox, buffer) {
-                        let ranges = member_ranges(bbox, zoom, opts);
-                        for tc in tiles_in_ranges(&ranges, zoom) {
-                            *counts.entry(tile_key(tc.x, tc.y, zoom)).or_insert(0) += 1;
-                        }
-                        return (bounds, counts);
-                    }
-                    let copies: Vec<BboxTileRanges> = wrap_shifts(bbox, buffer)
-                        .map(|shift| member_ranges(&shift_bbox(bbox, shift), zoom, opts))
-                        .collect();
-                    for (i, ranges) in copies.iter().enumerate() {
-                        for tc in tiles_in_ranges(ranges, zoom) {
-                            // A tile two copies share is one member (#342).
-                            if copies[..i].iter().any(|r| ranges_contain(r, tc)) {
-                                continue;
-                            }
-                            *counts.entry(tile_key(tc.x, tc.y, zoom)).or_insert(0) += 1;
-                        }
-                    }
+                    for_each_member_key(bbox, zoom, opts, |key| {
+                        *counts.entry(key).or_insert(0) += 1;
+                    });
                 }
                 (bounds, counts)
             },
@@ -5766,9 +6100,27 @@ fn collect_into(
             for p in &wave[1..] {
                 region.expand(&p.bbox);
             }
+            // #803: with variable depth the wave's tiles can be few and far
+            // apart (the rest stopped), so prune to each tile, not their union.
+            let regions: Vec<PruneRegion> = match ctx.tiles {
+                Some(tiles) => {
+                    let margin = 360.0 / 2f64.powi(i32::from(ctx.zoom));
+                    tiles
+                        .range(wave[0].key_lo..=wave[wave.len() - 1].key_hi)
+                        .map(|(&key, _)| {
+                            let (x, y) = key_to_xy(key, ctx.zoom);
+                            let mut r = PruneRegion::of(TileCoord::new(x, y, ctx.zoom).bounds());
+                            r.grow(margin);
+                            r
+                        })
+                        .collect()
+                }
+                None => vec![region],
+            };
             Some(
-                region
-                    .rects()
+                regions
+                    .iter()
+                    .flat_map(PruneRegion::rects)
                     .flat_map(|b| {
                         [0.0, -360.0, 360.0].map(|shift| {
                             [b.lng_min + shift, b.lat_min, b.lng_max + shift, b.lat_max]
@@ -5982,7 +6334,12 @@ fn collect_wave_members(
         .into_par_iter()
         .map(|g| {
             ExportTimers::time(&timers.clip, || {
-                feature_tile_members(&g, ctx.zoom, ctx.opts, key_lo, key_hi, diagnostics)
+                let mut members =
+                    feature_tile_members(&g, ctx.zoom, ctx.opts, key_lo, key_hi, diagnostics);
+                if let Some(tiles) = ctx.tiles {
+                    members.retain(|(key, _)| tiles.contains_key(key));
+                }
+                members
             })
         })
         .collect();
@@ -7164,6 +7521,92 @@ fn sort_members_for_encode(members: &mut [Member], order: &FeatureOrder) {
     }
 }
 
+/// One tile's members, already in `(key, seq)` order, into feature order:
+/// [`sort_members_for_encode`]'s per-tile step.
+fn sort_tile_for_encode(tile: &mut [Member], order: &FeatureOrder) {
+    if let FeatureOrder::Column { name, descending } = order {
+        tile.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
+    }
+}
+
+/// Record which of a tile's members reached it and which were lost, by
+/// source row, when a `--feature-id` is set (#443): a source drawn in any
+/// tile at any zoom is never lost.
+fn account_sources(
+    members: &[Member],
+    mvt: &TileMvt,
+    zoom: u8,
+    opts: &ExportOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<(), ExportError> {
+    use crate::diagnostics::SourceLossCause;
+    if opts.feature_id.is_none() {
+        return Ok(());
+    }
+    let cause = if mvt.valve.dropped > 0 {
+        SourceLossCause::ValveDropped
+    } else if mvt.valve.merged > 0 {
+        SourceLossCause::Merged
+    } else {
+        SourceLossCause::EncodeDropped
+    };
+    let surviving: std::collections::BTreeSet<u64> = mvt.source_ids.iter().copied().collect();
+    let losses: std::collections::BTreeMap<u64, _> = mvt.source_losses.iter().copied().collect();
+    for member in members {
+        if let Some(id) = member.id {
+            let cause = losses.get(&member.seq).copied().unwrap_or(cause);
+            if !surviving.contains(&member.seq) {
+                diagnostics.source_member_loss(member.seq, id, zoom, cause)?;
+            }
+        }
+    }
+    if mvt.features > 0 {
+        for &id in &mvt.source_ids {
+            diagnostics.source_emitted(id, zoom)?;
+        }
+    }
+    Ok(())
+}
+
+/// The writer's [`EncodedTile`] for tile `x`/`y`: gzip-compressed here, in
+/// the parallel encode section (#227). A tile whose every member encoded to
+/// nothing (#431) is an empty carrier the writer loop skips: there is no
+/// tile to write, but the drops must still reach the report.
+fn encoded_tile(x: u32, y: u32, mvt: TileMvt, fill: FillTally) -> Result<EncodedTile, ExportError> {
+    if mvt.features == 0 {
+        return Ok(EncodedTile {
+            x,
+            y,
+            data: Vec::new(),
+            hash: 0,
+            raw_len: 0,
+            feature_count: 0,
+            encode_dropped: mvt.unencodable,
+            encode_quantized: mvt.quantized,
+            oversized: mvt.oversized,
+            valve: mvt.valve,
+            // The tile is not written, so neither is its fill.
+            fill: FillTally::default(),
+        });
+    }
+    let hash = TileHasher::hash(&mvt.data);
+    let raw_len = mvt.data.len();
+    let data = mvt.data.into_gzip(&mvt.gzip_cache)?;
+    Ok(EncodedTile {
+        x,
+        y,
+        data,
+        hash,
+        raw_len,
+        feature_count: mvt.features,
+        encode_dropped: mvt.unencodable,
+        encode_quantized: mvt.quantized,
+        oversized: mvt.oversized,
+        valve: mvt.valve,
+        fill,
+    })
+}
+
 fn encode_members(
     gzip_cache: &Arc<TileGzipCache>,
     mut members: Vec<Member>,
@@ -7210,80 +7653,13 @@ fn encode_members(
             &mut fill_tally,
             diagnostics,
         );
-        if opts.feature_id.is_some() {
-            use crate::diagnostics::SourceLossCause;
-            let cause = if mvt.valve.dropped > 0 {
-                SourceLossCause::ValveDropped
-            } else if mvt.valve.merged > 0 {
-                SourceLossCause::Merged
-            } else {
-                SourceLossCause::EncodeDropped
-            };
-            let surviving: std::collections::BTreeSet<u64> =
-                mvt.source_ids.iter().copied().collect();
-            let losses: std::collections::BTreeMap<u64, _> =
-                mvt.source_losses.iter().copied().collect();
-            for member in g {
-                if let Some(id) = member.id {
-                    let cause = losses.get(&member.seq).copied().unwrap_or(cause);
-                    if !surviving.contains(&member.seq) {
-                        if let Err(error) =
-                            diagnostics.source_member_loss(member.seq, id, zoom, cause)
-                        {
-                            return Some(Err(error.into()));
-                        }
-                    }
-                }
-            }
-            if mvt.features > 0 {
-                for &id in &mvt.source_ids {
-                    if let Err(error) = diagnostics.source_emitted(id, zoom) {
-                        return Some(Err(error.into()));
-                    }
-                }
-            }
+        if let Err(error) = account_sources(g, &mvt, zoom, opts, diagnostics) {
+            return Some(Err(error));
         }
         if let Some(f) = fills {
             f.note_shed(fill_tally.shed);
         }
-        if mvt.features == 0 {
-            // Every member encoded to nothing (#431). There is no tile
-            // to write, but the drops must still reach the report, so
-            // hand back an empty carrier the writer loop skips.
-            return Some(Ok(EncodedTile {
-                x,
-                y,
-                data: Vec::new(),
-                hash: 0,
-                raw_len: 0,
-                feature_count: 0,
-                encode_dropped: mvt.unencodable,
-                encode_quantized: mvt.quantized,
-                oversized: mvt.oversized,
-                valve: mvt.valve,
-                // The tile is not written, so neither is its fill.
-                fill: FillTally::default(),
-            }));
-        }
-        let hash = TileHasher::hash(&mvt.data);
-        let raw_len = mvt.data.len();
-        let compressed = match mvt.data.into_gzip(&mvt.gzip_cache) {
-            Ok(gzip) => gzip,
-            Err(e) => return Some(Err(ExportError::from(e))),
-        };
-        Some(Ok(EncodedTile {
-            x,
-            y,
-            data: compressed,
-            hash,
-            raw_len,
-            feature_count: mvt.features,
-            encode_dropped: mvt.unencodable,
-            encode_quantized: mvt.quantized,
-            oversized: mvt.oversized,
-            valve: mvt.valve,
-            fill: fill_tally,
-        }))
+        Some(encoded_tile(x, y, mvt, fill_tally))
     };
     // Longest tile first, one tile per task: a tile's valve passes are a
     // serial chain, so a dense tile that starts late sets the wall of its
@@ -8139,6 +8515,21 @@ fn build_mvt_with<M: TileFeature>(
     fill: &[&FillFeature],
     encode: impl Fn(&M) -> EncodedFeatureGeometry + Sync,
 ) -> TileMvt {
+    build_mvt_within(gzip_cache, members, opts, fill, encode, usize::MAX)
+        .expect("no limit to exceed")
+}
+
+/// [`build_mvt_with`], given up (`None`) as soon as the layer's encoded
+/// features and tables pass `raw_limit` bytes: the tile can only grow, so
+/// it is already over a raw cap of that size (#803's probe).
+fn build_mvt_within<M: TileFeature>(
+    gzip_cache: &Arc<TileGzipCache>,
+    members: &[M],
+    opts: &ExportOptions,
+    fill: &[&FillFeature],
+    encode: impl Fn(&M) -> EncodedFeatureGeometry + Sync,
+    raw_limit: usize,
+) -> Option<TileMvt> {
     let mut source_ids = Vec::new();
     let mut source_losses = Vec::new();
     let mut track = |id: Option<u64>, geom: &EncodedFeatureGeometry| {
@@ -8174,12 +8565,18 @@ fn build_mvt_with<M: TileFeature>(
                 track(m.feature_id().map(|_| m.source_row()), &geom);
                 layer.add_encoded_feature(m.feature_id(), geom, m.properties());
             }
+            if layer.encoded_len() > raw_limit {
+                return None;
+            }
         }
     } else {
         for m in members {
             let geom = encode(m);
             track(m.feature_id().map(|_| m.source_row()), &geom);
             layer.add_encoded_feature(m.feature_id(), geom, m.properties());
+            if layer.encoded_len() > raw_limit {
+                return None;
+            }
         }
     }
     // The fill is drawn but is not the data's own features: the report,
@@ -8187,7 +8584,7 @@ fn build_mvt_with<M: TileFeature>(
     let features = layer.feature_count() - fill.len();
     let unencodable = layer.dropped_features();
     let quantized = layer.quantized_features();
-    TileMvt {
+    Some(TileMvt {
         gzip_cache: Arc::clone(gzip_cache),
         source_ids,
         source_losses,
@@ -8197,7 +8594,7 @@ fn build_mvt_with<M: TileFeature>(
         quantized,
         oversized: false,
         valve: ValveTally::default(),
-    }
+    })
 }
 
 // ============================================================================
@@ -8778,8 +9175,8 @@ fn candidate_columns<'a>(
 /// The columns pass 2 attaches to each member: the exportable properties
 /// ([`property_columns`]) and the resolved `--feature-id` column (#443).
 struct AttrColumns<'a> {
-    /// `(column index, published name)`; the names are interned once here
-    /// and shared by every row's [`SharedProps`] (#461).
+    /// `(column index, published name)`; each [`Self::extract`] copies the
+    /// names once, for every row of its batch to share (#461).
     props: Vec<(usize, Arc<str>)>,
     feature_id: Option<&'a ResolvedFeatureId>,
 }
@@ -8801,6 +9198,11 @@ impl<'a> AttrColumns<'a> {
     }
 
     /// Extract every column of one batch once, for per-row materialization.
+    ///
+    /// PERF (#803): each call gets its own copy of every name, shared by its
+    /// rows only. Cloning the schema table's handles made every pool thread
+    /// bump the same refcounts once per row and column (and drop them once
+    /// per member), about 10% of an export's cycles in contended atomics.
     fn extract(&self, batch: &RecordBatch) -> BatchAttributes<'a> {
         BatchAttributes {
             props: self
@@ -8808,7 +9210,7 @@ impl<'a> AttrColumns<'a> {
                 .iter()
                 .map(|(idx, name)| {
                     (
-                        Arc::clone(name),
+                        Arc::from(&**name),
                         extract_property_column(batch.column(*idx)),
                     )
                 })
@@ -9554,14 +9956,14 @@ mod tests {
 
     // --- fixture builders ----------------------------------------------------
 
-    fn build_geometry_array(geoms: &[Geometry<f64>]) -> geoarrow::array::GeometryArray {
+    pub(super) fn build_geometry_array(geoms: &[Geometry<f64>]) -> geoarrow::array::GeometryArray {
         let typ = GeometryType::new(Default::default());
         let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
         b.extend_from_iter(geoms.iter().map(Some));
         b.finish()
     }
 
-    fn geometry_field() -> Field {
+    pub(super) fn geometry_field() -> Field {
         build_geometry_array(&[Geometry::Point(Point::new(0.0, 0.0))])
             .data_type()
             .to_field("geometry", true)
@@ -11759,11 +12161,7 @@ mod tests {
     }
 
     /// Both sources' scans of one file, for every level: (covering, geometry).
-    fn scans_by_source(
-        path: &Path,
-        crs: Crs,
-        meta: &OverviewsMeta,
-    ) -> (Option<Vec<LevelScan>>, Vec<LevelScan>) {
+    fn scans_by_source(path: &Path, crs: Crs) -> (Option<Vec<LevelScan>>, Vec<LevelScan>) {
         let reader = OverviewReader::open(path).unwrap();
         let source = ScanBboxSource::for_reader(&reader);
         assert!(
@@ -11775,20 +12173,20 @@ mod tests {
         let covering = scan_all_levels_from(
             &reader,
             crs,
-            meta,
             &opts,
             &timers,
             &source,
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
         let geometry = scan_all_levels_from(
             &reader,
             crs,
-            meta,
             &opts,
             &timers,
             &ScanBboxSource::Geometry,
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap()
@@ -11817,8 +12215,8 @@ mod tests {
                 // A null geometry: no covering row, no feature on either path.
                 levels[1].push(None);
                 let tmp = tempfile::NamedTempFile::new().unwrap();
-                let meta = write_mode_fixture_opt(tmp.path(), &levels, mode);
-                let (covering, geometry) = scans_by_source(tmp.path(), crs, &meta);
+                write_mode_fixture_opt(tmp.path(), &levels, mode);
+                let (covering, geometry) = scans_by_source(tmp.path(), crs);
                 assert_eq!(
                     covering.as_ref(),
                     Some(&geometry),
@@ -11851,8 +12249,8 @@ mod tests {
         let mut levels = covering_corpus(1.0);
         levels[0].push(Some(Geometry::MultiPolygon(geo::MultiPolygon::new(vec![]))));
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let meta = write_mode_fixture_opt(tmp.path(), &levels, Mode::Partitioning);
-        let (covering, geometry) = scans_by_source(tmp.path(), Crs::Epsg4326, &meta);
+        write_mode_fixture_opt(tmp.path(), &levels, Mode::Partitioning);
+        let (covering, geometry) = scans_by_source(tmp.path(), Crs::Epsg4326);
         assert_eq!(
             covering, None,
             "an empty geometry's covering row must abandon the pass"
@@ -11861,9 +12259,9 @@ mod tests {
         let scans = scan_all_levels(
             &reader,
             Crs::Epsg4326,
-            &meta,
             &ExportOptions::default(),
             &ExportTimers::default(),
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
@@ -11959,8 +12357,8 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let with = dir.path().join("with.parquet");
-        let meta = write_mode_fixture_opt(&with, &levels, Mode::Partitioning);
-        let (covering, geometry) = scans_by_source(&with, Crs::Epsg4326, &meta);
+        write_mode_fixture_opt(&with, &levels, Mode::Partitioning);
+        let (covering, geometry) = scans_by_source(&with, Crs::Epsg4326);
         let covering = covering.expect("an escaping hole is finite: no fallback");
         let finest = levels.len() - 1;
         let (c, g) = (&covering[finest], &geometry[finest]);
@@ -13448,9 +13846,9 @@ mod tests {
         let scans = scan_all_levels(
             &reader,
             Crs::Epsg4326,
-            &meta,
             &opts,
             &ExportTimers::default(),
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
@@ -13743,8 +14141,8 @@ mod tests {
             ]
         );
 
-        // The names are refcounted handles to the schema table, not copies.
-        let (name_key, rank_key) = (&cols.props[0].1, &cols.props[1].1);
+        // The names are refcounted handles to the batch's table, not copies.
+        let (name_key, rank_key) = (&attrs.props[0].0, &attrs.props[1].0);
         assert!(Arc::ptr_eq(&rows[0][0].0, name_key));
         assert!(Arc::ptr_eq(&rows[2][0].0, name_key));
         for row in &rows {
@@ -16425,6 +16823,7 @@ mod tests {
     fn coalescing_generalization(renames: Option<BTreeMap<String, String>>) -> Generalization {
         Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,

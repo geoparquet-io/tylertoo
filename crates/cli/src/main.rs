@@ -1373,13 +1373,28 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         report.min_zoom,
         report.max_zoom
     );
+    if let Some(vd) = &report.variable_depth {
+        say!(
+            "  variable depth: canonical z{}, deepest stored z{}, {} of {} probed tile(s) stopped",
+            vd.canonical_max_zoom,
+            vd.stored_max_zoom
+                .map_or_else(|| "-".to_string(), |z| z.to_string()),
+            vd.stopped_tiles,
+            vd.probed_tiles,
+        );
+    }
     for z in &report.zooms {
         say!(
-            "  z{:<2} (level {}): {:>7} tiles, {:>9} features{}{}{}",
+            "  z{:<2} (level {}): {:>7} tiles, {:>9} features{}{}{}{}",
             z.zoom,
             z.level,
             z.tile_count,
             z.tile_feature_count,
+            if z.stopped_tiles > 0 {
+                format!(" ({} stopped)", z.stopped_tiles)
+            } else {
+                String::new()
+            },
             if z.oversized_tiles > 0 {
                 format!(", {} oversized", z.oversized_tiles)
             } else {
@@ -1650,8 +1665,8 @@ fn run_merge(args: MergeArgs) -> Result<()> {
         work_dir: args.work_dir.clone(),
         metadata: args.publication.clone(),
     };
-    let report = merge_shards(&args.inputs, &args.output, &opts)
-        .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
+    let report =
+        merge_shards(&args.inputs, &args.output, &opts).map_err(|e| step_failed("merge", e))?;
 
     for (zoom, count) in &report.per_zoom_tile_counts {
         say!("  z{:<2} {:>10} tiles", zoom, format_number(*count));

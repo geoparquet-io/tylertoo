@@ -374,6 +374,7 @@ pub fn command_defaults(command: &str) -> Map<String, Value> {
                 "zoom_ceiling",
                 "spill_dir",
                 "profile",
+                "variable_depth",
             ] {
                 out.remove(key);
             }
