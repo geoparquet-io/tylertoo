@@ -2029,6 +2029,119 @@ mod tests {
         assert_eq!(report.max_zoom, 10);
     }
 
+    /// A tile's features' `v` values, by bits.
+    fn vs(tile: &Tile) -> HashSet<u64> {
+        let layer = &tile.layers[0];
+        let Some(key) = layer.keys.iter().position(|k| k == "v") else {
+            return HashSet::new();
+        };
+        layer
+            .features
+            .iter()
+            .filter_map(|f| {
+                let kv = f.tags.chunks(2).find(|kv| kv[0] == key as u32)?;
+                layer.values[kv[1] as usize].double_value.map(f64::to_bits)
+            })
+            .collect()
+    }
+
+    /// Export `ov` with and without variable depth under `opts`: the
+    /// contract holds, some tile stops, and every stopped tile draws every
+    /// feature the flag-off finest tiles under it draw. The stops.
+    fn assert_stops_draw_the_finest(
+        ov: &Path,
+        opts: ExportOptions,
+        max_zoom: u8,
+    ) -> Vec<(u8, u32, u32)> {
+        let off = ov.with_extension("off.pmtiles");
+        export_pmtiles(ov, &off, &opts).unwrap();
+        let off = read_tiles(&off);
+        let (_, tiles) = export_vd(ov, opts);
+        assert_contract(&tiles, max_zoom);
+        let stops = stopped(&tiles, max_zoom);
+        assert!(!stops.is_empty());
+        for &(z, x, y) in &stops {
+            let shift = max_zoom - z;
+            let finest: HashSet<u64> = off
+                .iter()
+                .filter(|(&(fz, fx, fy), _)| fz == max_zoom && (fx >> shift, fy >> shift) == (x, y))
+                .flat_map(|(_, t)| vs(t))
+                .collect();
+            let drawn = vs(&tiles[&(z, x, y)]);
+            assert!(!finest.is_empty(), "z{z}/{x}/{y}");
+            assert!(finest.is_subset(&drawn), "z{z}/{x}/{y}");
+        }
+        stops
+    }
+
+    /// The dense block, plus `sparse` far from it; each feature's `v` is
+    /// its index.
+    fn dense_plus(dir: &Path, sparse: Vec<Geometry<f64>>, max_zoom: u8) -> std::path::PathBuf {
+        let mut geoms: Vec<_> = dense_and_sparse()[..2500]
+            .iter()
+            .map(|&(x, y, _)| pt(x, y))
+            .collect();
+        geoms.extend(sparse);
+        let v: Vec<f64> = (0..geoms.len()).map(|i| i as f64).collect();
+        let mut convert = ConvertOptions::default();
+        convert.density.enabled = false;
+        convert.assign.point_thinning = 0.0;
+        overview_v(dir, &geoms, &v, max_zoom, convert)
+    }
+
+    /// Points on both sides of the antimeridian stop, each side's tile
+    /// drawing what its finest tiles draw, the other side's buffer points
+    /// included.
+    #[test]
+    fn antimeridian_branches_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let ov = dense_plus(
+            dir.path(),
+            vec![pt(179.99, -30.0), pt(179.9, -31.0), pt(-179.99, -30.0)],
+            8,
+        );
+        let stops = assert_stops_draw_the_finest(&ov, raw_cap(20_000), 8);
+        let west = crate::tile::lng_lat_to_tile(-179.99, -30.0, 1);
+        let east = crate::tile::lng_lat_to_tile(179.99, -30.0, 1);
+        assert!(stops.contains(&(1, west.x, west.y)), "{stops:?}");
+        assert!(stops.contains(&(1, east.x, east.y)), "{stops:?}");
+    }
+
+    /// A MultiPoint is a point to rule A′: a sparse one stops.
+    #[test]
+    fn multipoint_branch_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let multi = Geometry::MultiPoint(geo::MultiPoint::from(vec![
+            (-70.0, -30.0),
+            (-70.01, -30.0),
+            (-70.02, -30.01),
+        ]));
+        let ov = dense_plus(dir.path(), vec![multi], 8);
+        let stops = assert_stops_draw_the_finest(&ov, raw_cap(20_000), 8);
+        assert_eq!(stops, vec![(1, 0, 1)]);
+    }
+
+    /// A file with points, lines and polygons: the sparse branch stops,
+    /// drawing every kind its finest tiles draw.
+    #[test]
+    fn mixed_kind_branch_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let line =
+            Geometry::LineString(geo::LineString::from(vec![(-70.0, -30.0), (-69.9, -30.1)]));
+        let ov = dense_plus(
+            dir.path(),
+            vec![line, square(-70.2, -30.2, 0.1), pt(-70.05, -30.05)],
+            8,
+        );
+        let reader = OverviewReader::open(&ov).unwrap();
+        assert_eq!(
+            super::file_kinds(reader.geo_metadata_json()),
+            super::Kinds::Mixed
+        );
+        let stops = assert_stops_draw_the_finest(&ov, raw_cap(20_000), 8);
+        assert_eq!(stops, vec![(1, 0, 1)]);
+    }
+
     /// Nothing is stored below a stopped tile, wherever the stops fall.
     #[test]
     fn stopped_subtree_has_no_descendants() {
