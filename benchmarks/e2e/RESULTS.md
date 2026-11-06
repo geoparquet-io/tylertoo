@@ -3,32 +3,34 @@
 Method, settings-parity mapping and the full asymmetry list are in
 [README.md](README.md). **Read that before quoting anything here.**
 
-Every timing, memory, size and tile-count table below is printed by
-`format_results.py` from [`results.json`](results.json) (fixtures) or
-[`corpus_results.json`](corpus_results.json) (the corpus tier, §1b) and pasted
-verbatim — no number is retyped. The two exceptions are labelled where they appear: the
-per-zoom *feature* counts in §2 come from `render_parity.py` (PMTiles decoding,
-which `tylertoo stats` does not do), and the variance table in §7 is derived
-from the `wall_all_s` arrays in the same `results.json`. Figures from an
-earlier run that is **not** in `results.json` appear only in §4 and §7, and
-are labelled there as such.
+Every timing, memory, size and tile-count table below sits in a
+generated region (marked `bench:NAME` in an HTML comment) that `scripts/gen_bench_docs.py` rewrites from
+[`../results/e2e-fixtures.json`](../results/e2e-fixtures.json) (fixtures) or
+[`../results/e2e-corpus.json`](../results/e2e-corpus.json) (the corpus tier,
+§1b); each ends with its commit, versions, host and date. CI fails if a region
+differs from what the generator writes. The per-zoom *feature* counts in §2
+come from `render_parity.py` (PMTiles decoding, which `tylertoo stats` does
+not do). Figures from an earlier run that is **not** in the results files
+appear only in §4 and §7, and are labelled there as such. Prose around the
+tables quotes numbers by hand; they match the tables as of the recorded run.
 
-Regenerate the tables from the committed record with
-`python3 format_results.py` (defaults to `results.json`). A fresh
-`run_e2e.py` run writes `results-<UTC timestamp>.json` and never touches the
-committed file; to replace the record, run with `--out results.json`, then
-re-run `format_results.py results.json` and paste its output here.
+To update: rerun the harness, copy its JSON into `benchmarks/results/` with a
+`provenance` block, then run `uv run python scripts/gen_bench_docs.py`.
+`benchmarks/e2e/format_results.py` still prints the same tables for an ad-hoc
+results file.
 
 Issue: [#447](https://github.com/geoparquet-io/tylertoo/issues/447).
 
 ## Provenance
 
+<!-- bench:e2e-fixtures/provenance -->
 - **Machine** — Apple M3 Pro, 12 cores, 18 GB RAM, macOS-15.6-arm64-arm-64bit
 - **tylertoo** — tylertoo 0.11.0 @ `044360d` (release build)
 - **tippecanoe** — tippecanoe v2.79.0, tag `2.79.0`, commit `68ab8dcc229f95b8b25877697d5e8d66783af503`, built from source by `setup_tippecanoe.sh`
 - **Settings** — z0–z14, tile buffer 8, per-tile cap 500,000 bytes
-- **Method** — median of 3 timed runs after one discarded warm-up; warm page cache; no other load on the machine
-- **Recorded** — 2026-09-26T20:41:10Z → `results.json`
+- **Method** — median of 3 timed runs after one discarded warm-up; warm page cache
+- **Recorded** — 2026-09-26T20:41:10Z → `e2e-fixtures.json`
+<!-- /bench -->
 
 `044360d` includes #559 (export speed-up) and predates #564 (parallel level
 assignment); later tylertoo builds are not reflected here.
@@ -65,11 +67,15 @@ was not idle.
 
 ## 1. Headline (both tools at their own defaults)
 
+<!-- bench:e2e-fixtures/headline -->
 | dataset | features | tylertoo (parquet→pmtiles) | tippecanoe e2e (convert+tile) | tippecanoe tile-only (fgb in) | e2e | tile-only |
 |---|---|---|---|---|---|---|
 | `madagascar-adm4` | 17,465 | 1.61 s | 20.24 s | 20.05 s | **12.5×** | **12.4×** |
 | `open-buildings` | 1,000 | 0.03 s | 0.28 s | 0.22 s | **9.3×** | **7.2×** |
 | `road-detections` | 1,000 | 0.04 s | 0.28 s | 0.21 s | **6.8×** | **5.3×** |
+
+_Run: commit 044360d, tylertoo 0.11.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-09-26._
+<!-- /bench -->
 
 **`madagascar-adm4` is the only row that measures tiling.** The other two are
 1,000-feature fixtures where both tools spend most of their wall time on
@@ -84,17 +90,18 @@ Everything above and below this section is the committed fixture run
 (`results.json`). This section is the committed **corpus** run
 (`corpus_results.json`): the `corpus/manifest.json` datasets at 300k–813k
 features, where tiling throughput, not process start-up, is what is measured.
-Tables are printed by `format_results.py corpus_results.json` and pasted
-verbatim. Reproduce with one command: `./benchmarks/e2e/run_corpus.sh`.
+Tables are generated from `e2e-corpus.json`. Reproduce with one command: `./benchmarks/e2e/run_corpus.sh`.
 
 ### Provenance and caveats — read these before quoting
 
+<!-- bench:e2e-corpus/provenance -->
 - **Machine** — Apple M3 Pro, 12 cores, 18 GB RAM, macOS-15.6-arm64-arm-64bit
 - **tylertoo** — tylertoo 0.8.0 @ `5885c17` (release build)
 - **tippecanoe** — tippecanoe v2.79.0, tag `2.79.0`, commit `68ab8dcc229f95b8b25877697d5e8d66783af503`, built from source by `setup_tippecanoe.sh`
-- **Settings** — z0–z14 (plus per-dataset flags below), tile buffer 8, per-tile cap 500,000 bytes
+- **Settings** — z0–z14, tile buffer 8, per-tile cap 500,000 bytes
 - **Method** — median of 2 timed runs after one discarded warm-up; warm page cache
-- **Recorded** — 2026-10-15T22:32:09Z → `corpus_results.json`
+- **Recorded** — 2026-10-15T22:32:09Z → `e2e-corpus.json`
+<!-- /bench -->
 
 1. **The machine was not idle.** Another build job shared it during the
    recording. The per-repeat spread stayed small on the tiling
@@ -122,12 +129,16 @@ verbatim. Reproduce with one command: `./benchmarks/e2e/run_corpus.sh`.
 
 ### Headline (tylertoo defaults vs tippecanoe with its recorded flags)
 
+<!-- bench:e2e-corpus/headline -->
 | dataset | features | tylertoo (parquet→pmtiles) | tippecanoe e2e (convert+tile) | tippecanoe tile-only (fgb in) | e2e | tile-only |
 |---|---|---|---|---|---|---|
 | `points-nyc-medium` | 597,782 | 1.39 s | 30.03 s | 29.56 s | **21.6×** | **21.3×** |
 | `lines-portland-medium` | 301,609 | 1.40 s | 28.30 s | 27.88 s | **20.2×** | **19.9×** |
 | `polygons-portland-medium` | 813,456 | 2.69 s | 57.22 s | 56.05 s | **21.3×** | **20.9×** |
 | `polygons-ftw-moldova-large` | 631,910 | 13.87 s | 119.28 s | 117.37 s | **8.6×** | **8.5×** |
+
+_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+<!-- /bench -->
 
 The Moldova row is the one the stale table in
 [`../overview/RESULTS.md`](../overview/RESULTS.md) recorded at **3.6×
@@ -137,12 +148,16 @@ pipeline is 8.6× faster than tippecanoe end-to-end on the same file at
 
 ### Quality-matched (thinning ladder off)
 
+<!-- bench:e2e-corpus/quality-matched -->
 | dataset | tylertoo default | tylertoo quality-matched | tippecanoe tile-only | tile-only speedup, matched | tylertoo tiles (default → matched) | tippecanoe tiles | archive, matched | archive ratio |
 |---|---|---|---|---|---|---|---|---|
 | `points-nyc-medium` | 1.39 s | 12.21 s | 29.56 s | **2.4×** | 849 → 849 | 10,486 | 62.8 MB | 0.72× |
 | `lines-portland-medium` | 1.40 s | 1.71 s | 27.88 s | **16.3×** | 1,329 → 1,331 | 1,331 | 44.7 MB | 1.02× |
 | `polygons-portland-medium` | 2.69 s | 3.45 s | 56.05 s | **16.3×** | 1,208 → 1,208 | 1,213 | 84.5 MB | 1.20× |
 | `polygons-ftw-moldova-large` | 13.87 s | 20.03 s | 117.37 s | **5.9×** | 17,489 → 17,489 | 17,461 | 167.1 MB | 0.96× |
+
+_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+<!-- /bench -->
 
 Peak RSS on the matched runs, which the table above leaves out
 (`tylertoo_quality_matched.peak_rss_bytes` vs `tippecanoe_fgb` in
@@ -178,12 +193,16 @@ lines and polygons even at defaults.
 
 ### Memory, CPU, archive size
 
+<!-- bench:e2e-corpus/memory -->
 | dataset | tylertoo peak RSS | tippecanoe peak RSS | converter peak RSS | tylertoo CPU | tippecanoe CPU | tylertoo archive | tippecanoe archive | archive ratio |
 |---|---|---|---|---|---|---|---|---|
 | `points-nyc-medium` | 600 MB | 519 MB | 327 MB | 648% | 229% | 51.9 MB | 87.6 MB | 0.59× † |
 | `lines-portland-medium` | 1611 MB | 652 MB | 314 MB | 670% | 165% | 34.5 MB | 43.8 MB | 0.79× |
 | `polygons-portland-medium` | 999 MB | 967 MB | 374 MB | 626% | 204% | 78.2 MB | 70.2 MB | 1.11× |
 | `polygons-ftw-moldova-large` | 1848 MB | 926 MB | 700 MB | 714% | 260% | 132.2 MB | 174.8 MB | 0.76× |
+
+_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+<!-- /bench -->
 
 † Zoom-mismatched: tippecanoe's archive covers z0–16, tylertoo's z0–14
 (caveat 4). At z0–14 on both sides the ratio is 1.87×, not 0.59×.
@@ -203,6 +222,7 @@ every corpus dataset (0.42–1.91 s; fastest converter per dataset, `ogr2ogr`
 except `gpio` on `polygons-portland-medium`) — at this scale the ratio is
 tiler vs tiler, not input format. tylertoo's own split:
 
+<!-- bench:e2e-corpus/phases -->
 | dataset | convert (parquet read + ladder) | export (MVT + archive) | row groups read/total | tiles | tile features | oversized tiles |
 |---|---|---|---|---|---|---|
 | `points-nyc-medium` | 0.34 s | 1.04 s | 13/13 | 849 | 1,049,891 | 53 |
@@ -210,18 +230,25 @@ tiler vs tiler, not input format. tylertoo's own split:
 | `polygons-portland-medium` | 0.78 s | 1.94 s | 17/17 | 1,208 | 1,828,186 | 33 |
 | `polygons-ftw-moldova-large` | 6.76 s | 7.08 s | 13/13 | 17,489 | 2,071,586 | 4 |
 
+_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+<!-- /bench -->
+
 (The defaults runs hit tylertoo's per-tile size valve on 4–53 tiles per
 dataset — the `oversized tiles` column; tippecanoe's flagged runs handle the
 same pressure with `--drop-densest-as-needed`.)
 
 ### The recorded tippecanoe flags
 
+<!-- bench:e2e-corpus/flags -->
 | dataset | zooms | tippecanoe flags beyond the parity set |
 |---|---|---|
 | `points-nyc-medium` | z0–z14 | `--drop-densest-as-needed --extend-zooms-if-still-dropping` |
 | `lines-portland-medium` | z0–z14 | `--simplification=10 --drop-densest-as-needed` |
 | `polygons-portland-medium` | z0–z14 | `--simplification=10 --drop-densest-as-needed --coalesce-densest-as-needed` |
 | `polygons-ftw-moldova-large` | z0–z14 | `--simplification=10 --drop-densest-as-needed --coalesce-densest-as-needed` |
+
+_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+<!-- /bench -->
 
 ### Per-zoom tile counts (defaults run; the tile-parity record)
 
@@ -234,6 +261,7 @@ extension on points (caveat 4).
 
 #### `points-nyc-medium`
 
+<!-- bench:e2e-corpus/per-zoom/points-nyc-medium -->
 | zoom | tylertoo tiles | tippecanoe tiles | tylertoo bytes | tippecanoe bytes |
 |---|---|---|---|---|
 | z0 | 1 | 1 | 0.00 MB | 0.00 MB |
@@ -255,8 +283,12 @@ extension on points (caveat 4).
 | z16 | 0 | 7,507 | — | 34.95 MB |
 | **total** | **849** | **10,486** | | |
 
+_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+<!-- /bench -->
+
 #### `lines-portland-medium`
 
+<!-- bench:e2e-corpus/per-zoom/lines-portland-medium -->
 | zoom | tylertoo tiles | tippecanoe tiles | tylertoo bytes | tippecanoe bytes |
 |---|---|---|---|---|
 | z0 | 0 | 1 | — | 0.14 MB |
@@ -276,8 +308,12 @@ extension on points (caveat 4).
 | z14 | 942 | 942 | 16.92 MB | 14.27 MB |
 | **total** | **1,329** | **1,331** | | |
 
+_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+<!-- /bench -->
+
 #### `polygons-portland-medium`
 
+<!-- bench:e2e-corpus/per-zoom/polygons-portland-medium -->
 | zoom | tylertoo tiles | tippecanoe tiles | tylertoo bytes | tippecanoe bytes |
 |---|---|---|---|---|
 | z1 | 0 | 1 | — | 0.00 MB |
@@ -296,8 +332,12 @@ extension on points (caveat 4).
 | z14 | 874 | 872 | 43.25 MB | 37.93 MB |
 | **total** | **1,208** | **1,213** | | |
 
+_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+<!-- /bench -->
+
 #### `polygons-ftw-moldova-large`
 
+<!-- bench:e2e-corpus/per-zoom/polygons-ftw-moldova-large -->
 | zoom | tylertoo tiles | tippecanoe tiles | tylertoo bytes | tippecanoe bytes |
 |---|---|---|---|---|
 | z0 | 0 | 1 | — | 0.01 MB |
@@ -316,6 +356,9 @@ extension on points (caveat 4).
 | z13 | 3,385 | 3,380 | 37.00 MB | 43.02 MB |
 | z14 | 12,818 | 12,795 | 52.48 MB | 59.02 MB |
 | **total** | **17,489** | **17,461** | | |
+
+_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+<!-- /bench -->
 
 ## 2. Output parity — the number to quote to a skeptic
 
@@ -349,11 +392,15 @@ feature count at z8 (17,406 vs 17,465) and about 5% at z4 (5,786 vs 6,102),
 and 10 of its tiles hit tylertoo's per-tile size valve (`oversized_tiles` in
 `results.json`):
 
+<!-- bench:e2e-fixtures/quality-matched -->
 | dataset | tylertoo default | tylertoo quality-matched | tippecanoe tile-only | tile-only speedup, matched | tylertoo tiles (default → matched) | tippecanoe tiles | archive, matched | archive ratio |
 |---|---|---|---|---|---|---|---|---|
 | `madagascar-adm4` | 1.61 s | 2.67 s | 20.05 s | **7.5×** | 146,924 → 153,052 | 153,047 | 118.0 MB | 0.78× |
 | `open-buildings` | 0.03 s | 0.03 s | 0.22 s | **7.1×** | 82 → 82 | 90 | 0.1 MB | 0.70× |
 | `road-detections` | 0.04 s | 0.04 s | 0.21 s | **5.6×** | 78 → 79 | 82 | 0.2 MB | 0.80× |
+
+_Run: commit 044360d, tylertoo 0.11.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-09-26._
+<!-- /bench -->
 
 **≈7.5× at output parity on the one dataset large enough to mean anything**,
 with a 22% smaller archive. Turning the ladder off costs tylertoo 66% more
@@ -379,11 +426,15 @@ smaller archive and is the remaining, unclosable simplification asymmetry.
 
 ## 3. Where tippecanoe's end-to-end time actually goes
 
+<!-- bench:e2e-fixtures/input -->
 | dataset | parquet in | fgb out | conversion (fastest tool) | tool | conversion share of tippecanoe e2e | ldGeoJSON out | ldGeoJSON convert | tippecanoe -P on ldGeoJSON |
 |---|---|---|---|---|---|---|---|---|
 | `madagascar-adm4` | 27.1 MB | 43.2 MB | 0.19 s | `ogr2ogr` | 1% | 75.0 MB | 2.07 s | 23.59 s |
 | `open-buildings` | 0.1 MB | 0.3 MB | 0.06 s | `ogr2ogr` | 22% | 0.4 MB | 0.07 s | 0.21 s |
 | `road-detections` | 0.1 MB | 0.2 MB | 0.06 s | `ogr2ogr` | 23% | 0.3 MB | 0.07 s | 0.21 s |
+
+_Run: commit 044360d, tylertoo 0.11.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-09-26._
+<!-- /bench -->
 
 **The input-format advantage is small on this dataset, and saying so matters.**
 On `madagascar-adm4` the GeoParquet→FlatGeobuf conversion is 1% of
@@ -412,11 +463,15 @@ recommendation change.
 
 ## 4. Memory and archive size
 
+<!-- bench:e2e-fixtures/memory -->
 | dataset | tylertoo peak RSS | tippecanoe peak RSS | converter peak RSS | tylertoo archive | tippecanoe archive | archive ratio |
 |---|---|---|---|---|---|---|
 | `madagascar-adm4` | 760 MB | 413 MB | 199 MB | 99.6 MB | 151.0 MB | 0.66× |
 | `open-buildings` | 28 MB | 139 MB | 54 MB | 0.1 MB | 0.2 MB | 0.61× |
 | `road-detections` | 32 MB | 141 MB | 53 MB | 0.1 MB | 0.2 MB | 0.57× |
+
+_Run: commit 044360d, tylertoo 0.11.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-09-26._
+<!-- /bench -->
 
 This table is the defaults run. **tylertoo loses the memory column on the
 only dataset that matters** — 760 MB against tippecanoe's 413 MB on
@@ -436,11 +491,15 @@ Archive sizes are tylertoo's, consistently: 0.57–0.66× tippecanoe at defaults
 
 ## 5. Where tylertoo's own time goes
 
+<!-- bench:e2e-fixtures/phases -->
 | dataset | convert (parquet read + ladder) | export (MVT + archive) | row groups read/total | tiles | tile features | oversized tiles |
 |---|---|---|---|---|---|---|
 | `madagascar-adm4` | 0.37 s | 1.23 s | 1/1 | 146,924 | 353,062 | 0 |
 | `open-buildings` | 0.01 s | 0.02 s | 1/1 | 82 | 2,339 | 0 |
 | `road-detections` | 0.01 s | 0.02 s | 1/1 | 78 | 3,787 | 0 |
+
+_Run: commit 044360d, tylertoo 0.11.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-09-26._
+<!-- /bench -->
 
 The parquet read and the whole generalization ladder are 23% of tylertoo's
 wall on `madagascar-adm4`; MVT encoding and the archive write are the rest.
@@ -452,6 +511,7 @@ corpus rather than overstated.
 
 ### `madagascar-adm4`
 
+<!-- bench:e2e-fixtures/per-zoom/madagascar-adm4 -->
 | zoom | tylertoo tiles | tippecanoe tiles | tylertoo bytes | tippecanoe bytes |
 |---|---|---|---|---|
 | z0 | 0 | 1 | — | 0.14 MB |
@@ -471,6 +531,9 @@ corpus rather than overstated.
 | z14 | 113,993 | 113,991 | 93.19 MB | 110.20 MB |
 | **total** | **146,924** | **153,047** | | |
 
+_Run: commit 044360d, tylertoo 0.11.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-09-26._
+<!-- /bench -->
+
 Read the byte columns, not just the tile columns: at z2–z8 tylertoo's stored
 bytes are 14–25× smaller than tippecanoe's (z1: ~87×) for nearly the same
 tile count.
@@ -484,6 +547,7 @@ tile. tippecanoe writes one.
 
 ### `open-buildings`
 
+<!-- bench:e2e-fixtures/per-zoom/open-buildings -->
 | zoom | tylertoo tiles | tippecanoe tiles | tylertoo bytes | tippecanoe bytes |
 |---|---|---|---|---|
 | z5 | 0 | 1 | — | 0.00 MB |
@@ -498,8 +562,12 @@ tile. tippecanoe writes one.
 | z14 | 52 | 52 | 0.05 MB | 0.05 MB |
 | **total** | **82** | **90** | | |
 
+_Run: commit 044360d, tylertoo 0.11.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-09-26._
+<!-- /bench -->
+
 ### `road-detections`
 
+<!-- bench:e2e-fixtures/per-zoom/road-detections -->
 | zoom | tylertoo tiles | tippecanoe tiles | tylertoo bytes | tippecanoe bytes |
 |---|---|---|---|---|
 | z0 | 0 | 1 | — | 0.00 MB |
@@ -519,10 +587,14 @@ tile. tippecanoe writes one.
 | z14 | 41 | 40 | 0.04 MB | 0.04 MB |
 | **total** | **78** | **82** | | |
 
+_Run: commit 044360d, tylertoo 0.11.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-09-26._
+<!-- /bench -->
+
 ## 7. Run-to-run variance
 
 Within a single run (3 timed repeats after a warm-up), on `madagascar-adm4`:
 
+<!-- bench:e2e-fixtures/variance/madagascar-adm4 -->
 | measurement | median | min | max | spread, (max − min) / min |
 |---|---|---|---|---|
 | tylertoo, defaults | 1.61 s | 1.60 s | 1.80 s | 13% |
@@ -530,6 +602,9 @@ Within a single run (3 timed repeats after a warm-up), on `madagascar-adm4`:
 | tippecanoe, fgb in | 20.05 s | 19.70 s | 22.81 s | 16% |
 | tippecanoe -P, ldGeoJSON in | 23.59 s | 22.41 s | 31.73 s | 42% |
 | ogr2ogr parquet→fgb | 0.19 s | 0.17 s | 0.19 s | 8% |
+
+_Run: commit 044360d, tylertoo 0.11.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-09-26._
+<!-- /bench -->
 
 Between runs, from an earlier, uncommitted run that is **not** in
 `results.json` (so these figures cannot be regenerated from this record):
