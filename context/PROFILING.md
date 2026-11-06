@@ -420,13 +420,83 @@ a run that wrote no line.
 
 ### What the dump does not contain
 
-The `[profile]` debug log carries a few numbers the JSON does not. Most
-notably, the **writer-thread busy time** of the finest (streamed) level —
-`total - recv_wait` from `write_level_streaming` — is logged per level but
-has no field in the dump, whose `pass2.stage_secs` covers producer-side
-stages only. Where the log and the dump disagree in shape like this, the log
-is the finer-grained view and the JSON is the stable, parseable one; only
-the JSON is covered by tests.
+The `[profile]` debug log carries a few per-level numbers the JSON only
+has as totals (for example each streamed level's `writer_busy`). Where the
+log and the dump disagree in shape like this, the log is the finer-grained
+view and the JSON is the stable, parseable one; only the JSON is covered by
+tests.
+
+### Saturation: CPU, cores and I/O per phase (#810)
+
+Both lines' `rss_sampler` objects (convert's, and `export.rss_sampler`)
+also say how busy the machine was in each phase. The sampler reads
+`getrusage(RUSAGE_SELF)` and, on Linux, `/proc/self/io` at every phase
+boundary, so the deltas are exact even for a phase shorter than the 250 ms
+tick:
+
+```jsonc
+"rss_sampler": {
+  "phase_order": ["preflight", "pass1 scan", ...],  // run order: `phases` is key-sorted
+  "phases": {
+    "pass2 (output sink)": {
+      "wall_secs": 5.15,              // this sampler phase's own wall window
+      "cpu_user_secs": 70.1,          // all threads; null off Unix
+      "cpu_sys_secs": 4.6,
+      "effective_cores": 14.5,        // (user + sys) / wall
+      "utilization": 0.23,            // effective_cores / `threads`
+      "stage_secs": 5.2,              // the stage timers credited to this phase
+      "unattributed_core_secs": 69.5, // cpu - stage_secs
+      "read_bytes": 0,                // block-layer bytes; null off Linux
+      "write_bytes": 8024064
+    }
+  },
+  // one row per 250 ms tick:
+  // [t_secs, cpu_secs, rss_bytes, read_bytes, write_bytes, rchar]
+  "timeline": [[0.0, 0.01, 23855104, 0, 0, 1048576], ...]
+}
+```
+
+How to read them:
+
+- **`effective_cores`** is the number of cores the phase kept busy. Compare
+  it with `threads`: `utilization` near 1 means the phase is CPU-bound and
+  parallel; a phase at ~1 core on a 64-thread run is serial, whatever its
+  stage timers say. This is the number the effective-cores gate watches;
+  serializing work (a 1-thread pool) drops it
+  (`effective_cores_drop_when_work_is_serialized`).
+- **`stage_secs`** is credited only where stage timers exist: `pass1 scan`
+  gets the sum of `pass1.stage_secs`, `pass2 (output sink)` the sum of
+  `pass2.stage_secs` plus `writer_busy_secs`, and each export phase the
+  export stages that ran during it (`fill_encode` is inside `encode` and
+  `group_commit_wait` is waiting, so neither counts). Other phases have 0.
+- **`unattributed_core_secs`** is CPU the stage timers do not explain:
+  untimed work, rayon workers spinning before they sleep, allocator and
+  scheduler cost. A large share (93% of pass 2 on a debug Moldova run) says
+  the stage split is not where the cores go; profile it with samply. It can
+  go slightly negative on a loaded host, because a stage window is wall time
+  on its thread and counts time the thread was descheduled.
+- **`read_bytes`/`write_bytes`** are what hit the block layer; a warm page
+  cache reads show only in the timeline's `rchar`.
+- **`timeline`** is for plotting cores over time (`Δcpu / Δt` between rows)
+  next to RSS. It keeps at most 8192 rows: when full it drops every other
+  row and samples half as often, so a long run costs bounded memory.
+
+Serial-path attribution:
+
+- **`pass2.writer_busy_secs`**: the streamed finest level's writer thread,
+  busy rather than waiting on the producer (`total - recv_wait`).
+- **`export.serial_secs`** `{spool_write, finalize, group_commit_wait}`:
+  the single-threaded tile append, `writer.finalize`, and the time threads
+  waited to lock a concurrent level group's ordered write (#647).
+  **`export.serial_share`** is `(spool_write + finalize) / total`, the
+  critical-path share the showcase gate bounds at 10%.
+- **`export.per_zoom[].wave_width`** is the level's actual partitions per
+  wave after the #311 memory narrowing (not `partition_wave_width`, the
+  ceiling), and **`spill_bytes`** the level's members the member store
+  wrote to disk (0 in RAM).
+
+All of this is collected only while `TYLERTOO_PROFILE_JSON` is set, and it
+never changes output bytes.
 
 ### Export phase (#535)
 

@@ -2125,6 +2125,9 @@ struct Pass2Run {
     /// The export's work counts (#788).
     #[cfg(test)]
     work: ExportWorkTally,
+    /// The per-zoom profile entries (#810).
+    #[cfg(test)]
+    per_zoom: Vec<ExportZoomProfile>,
 }
 
 fn export_pmtiles_run(
@@ -2589,6 +2592,8 @@ fn export_pmtiles_validated(
         ceiling_wave,
         #[cfg(test)]
         work,
+        #[cfg(test)]
+        per_zoom: progress.profile.per_zoom.clone(),
     })
 }
 
@@ -2792,6 +2797,12 @@ struct ExportProgress {
     /// `end_*` boundary samples below cannot see, the same gap #571 fixed on
     /// the convert side. `None`, no thread, when profiling is off.
     rss_sampler: Option<RssSampler>,
+    /// #810: the sampler's current phase and the stage core-seconds
+    /// ([`ExportStageSecs::core_secs`]) at its start.
+    stage_mark: (&'static str, f64),
+    /// #810: stage core-seconds per sampler phase, credited to the
+    /// sampler's report when it finishes.
+    phase_stage_secs: Vec<(&'static str, f64)>,
 }
 
 impl ExportProgress {
@@ -2819,15 +2830,27 @@ impl ExportProgress {
                 rss_sampler_report: None,
             },
             rss_sampler,
+            stage_mark: ("scan", 0.0),
+            phase_stage_secs: Vec::new(),
         }
     }
 
     /// Attribute every sample the background sampler takes from now on to
     /// `phase`, until the next call. A no-op when profiling is off.
-    fn enter_phase(&self, phase: &str) {
+    fn enter_phase(&mut self, phase: &'static str) {
         if let Some(sampler) = &self.rss_sampler {
             sampler.mark_phase(phase);
+            self.close_stage_phase();
+            self.stage_mark.0 = phase;
         }
+    }
+
+    /// #810: charge the stage core-seconds since the current phase began to it.
+    fn close_stage_phase(&mut self) {
+        let total = self.profile.timers.stage_secs().core_secs();
+        let (phase, start) = self.stage_mark;
+        self.phase_stage_secs.push((phase, total - start));
+        self.stage_mark.1 = total;
     }
 
     /// Take a boundary RSS sample into `peak_rss_mib`, and hand it to the
@@ -2861,7 +2884,14 @@ impl ExportProgress {
     /// Stop the sampler (a no-op if profiling was off) and fold its report
     /// into the profile that `emit` writes.
     fn finish_rss_sampler(&mut self) {
-        self.profile.rss_sampler_report = self.rss_sampler.take().map(RssSampler::finish);
+        self.close_stage_phase();
+        self.profile.rss_sampler_report = self.rss_sampler.take().map(|sampler| {
+            let mut report = sampler.finish();
+            for &(phase, secs) in &self.phase_stage_secs {
+                report.credit_stage_secs(phase, secs);
+            }
+            report
+        });
     }
 }
 
@@ -3092,6 +3122,11 @@ fn export_level(
         }
         _ => (None, Vec::new()),
     };
+    tally.spill_bytes = match (&level_store, &store) {
+        (Some(s), _) => s.level_spilled_bytes(0),
+        (None, Some(s)) => s.level_spilled_bytes(level_idx),
+        (None, None) => 0,
+    };
     for (wave_idx, wave) in partitions.chunks(partition_wave).enumerate() {
         let results: Vec<Vec<EncodedTile>> = match (level_store.as_mut(), store.as_deref_mut()) {
             (Some(s), _) => encode_wave_from_store(s, 0, &ctx, wave_idx, wave, diagnostics)?,
@@ -3300,11 +3335,14 @@ fn export_level_group(
     });
     let collected = rayon::in_place_scope(|scope| -> Result<(), (usize, ExportError)> {
         for (i, level) in levels.iter().enumerate() {
-            if lock_commit(&commit).error.is_some() {
+            if lock_commit(&commit, &timers).error.is_some() {
                 // A coarser level already failed. Its error is returned.
                 break;
             }
             let start = Instant::now();
+            let spill_bytes = store
+                .as_deref()
+                .map_or(0, |s| s.level_spilled_bytes(level.level_idx));
             let buckets = injected_fault(level, fail_level)
                 .and_then(|()| collect_level(store.as_deref_mut(), level, &timers, diagnostics))
                 .map_err(|e| (i, e))?;
@@ -3326,8 +3364,9 @@ fn export_level_group(
                     start,
                     collect_secs,
                     encode_secs: t_encode.elapsed().as_secs_f64(),
+                    spill_bytes,
                 });
-                lock_commit(commit).finish(i, encoded);
+                lock_commit(commit, timers).finish(i, encoded);
             });
         }
         Ok(())
@@ -3341,11 +3380,14 @@ fn export_level_group(
 
 /// Lock the group's [`GroupCommit`]. A poisoned lock means an encode task
 /// panicked, and Rayon re-raises that panic when the group's scope ends, so
-/// the state is used as is.
+/// the state is used as is. The wait is charged to `group_commit_wait`.
 fn lock_commit<'g, 'a>(
     commit: &'g Mutex<GroupCommit<'a>>,
+    timers: &ExportTimers,
 ) -> std::sync::MutexGuard<'g, GroupCommit<'a>> {
-    commit.lock().unwrap_or_else(PoisonError::into_inner)
+    ExportTimers::time(&timers.group_commit_wait, || {
+        commit.lock().unwrap_or_else(PoisonError::into_inner)
+    })
 }
 
 /// Collect one single-wave level's members, bucketed per partition: the
@@ -3381,6 +3423,8 @@ struct EncodedLevel {
     collect_secs: f64,
     /// The level's encode time, in its Rayon task.
     encode_secs: f64,
+    /// #810: the level's spilled member bytes, for its profile entry.
+    spill_bytes: u64,
 }
 
 /// The ordered write side of a concurrent level group (#647). Encode tasks
@@ -3438,7 +3482,10 @@ impl GroupCommit<'_> {
     /// Write one level's tiles, report it, and take a checkpoint when due.
     fn write_level(&mut self, i: usize, encoded: EncodedLevel) -> Result<ZoomReport, ExportError> {
         let level = &self.levels[i];
-        let mut tally = LevelTally::default();
+        let mut tally = LevelTally {
+            spill_bytes: encoded.spill_bytes,
+            ..LevelTally::default()
+        };
         write_encoded_tiles(
             self.writer,
             level.plan.zoom,
@@ -3523,6 +3570,8 @@ struct LevelTally {
     valve_passes: u64,
     /// Every tile's coverage fill, summed (#750).
     fill: FillTally,
+    /// #810: the level's spilled member bytes, for its profile entry.
+    spill_bytes: u64,
 }
 
 /// Append one wave's encoded tiles to the writer in order, and add them to
@@ -3624,6 +3673,8 @@ fn finish_level(
         tiles: tile_count,
         features: tally.tile_feature_count,
         bytes: tally.bytes_written,
+        wave_width: plan.wave,
+        spill_bytes: tally.spill_bytes,
     });
     profile.waves_total += total_waves;
     progress.sample_boundary_rss();
@@ -4563,6 +4614,14 @@ impl MemberStore {
     /// Bytes written to the spill file so far.
     fn spilled_bytes(&self) -> u64 {
         self.spill.as_ref().map_or(0, |s| s.offset)
+    }
+
+    /// #810: bytes of `level`'s members still on disk (all of them before
+    /// its first wave is taken).
+    fn level_spilled_bytes(&self, level: usize) -> u64 {
+        self.spill.as_ref().map_or(0, |s| {
+            s.segments[level].iter().flatten().map(|seg| seg.len).sum()
+        })
     }
 
     fn push(&mut self, level: usize, wave: usize, m: Member) -> Result<(), ExportError> {
@@ -10849,6 +10908,23 @@ mod tests {
             "a level the budget cannot hold must spill: {:?}",
             tight.work.level_spill_bytes
         );
+
+        // #810: the profile's per-zoom spill_bytes and wave_width are the
+        // level store's own figures.
+        for run in [&roomy, &tight] {
+            let profiled: Vec<u64> = run.per_zoom.iter().map(|z| z.spill_bytes).collect();
+            let spilled: Vec<u64> = (0..run.per_zoom.len())
+                .map(|l| run.work.level_spill_bytes.get(&l).copied().unwrap_or(0))
+                .collect();
+            assert_eq!(
+                profiled, spilled,
+                "per_zoom spill_bytes vs the level stores"
+            );
+            assert!(
+                run.per_zoom.iter().all(|z| z.wave_width == 1),
+                "partition_wave: 1"
+            );
+        }
     }
 
     /// The export-wide #235 store and the wave width follow the run's
