@@ -89,7 +89,6 @@ def overview(
     sort_direction: Literal["desc", "asc"] = "desc",
     sort_key: str | None = None,
     spill_dir: str | os.PathLike[str] | None = None,
-    streaming: bool = True,
     verbatim: bool = False,
 ) -> OverviewReport: ...
 def export_pmtiles(
@@ -221,7 +220,6 @@ def convert(
     size_valve: Literal["merge", "drop"] = "merge",
     sort_direction: Literal["desc", "asc"] = "desc",
     sort_key: str | None = None,
-    streaming: bool = True,
     tile_buffer: int = 8,
     tile_range: str | None = None,
     verbatim: bool = False,

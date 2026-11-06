@@ -5,10 +5,9 @@
 //! - arrow's i32 byte-array ceiling (2 GiB per decoded batch, #563):
 //!   `TYLERTOO_BYTE_ARRAY_LIMIT_BYTES` scales it. The ceiling has one owner,
 //!   `untrusted::byte_array_limit`: every path that sizes a batch reads the
-//!   scaled value from it, and the owner's reader (plus the in-memory
-//!   engine's concatenated table) fails a batch past it the way arrow fails
-//!   past the real one (`untrusted::check_byte_array_ceiling`). The fix for #563 reached
-//!   two of four reader paths (#606 `--no-streaming`, #607 `validate`) because
+//!   scaled value from it, and the owner's reader fails a batch past it the
+//!   way arrow fails past the real one (`untrusted::check_byte_array_ceiling`).
+//!   The fix for #563 reached two of four reader paths (#606, #607 `validate`) because
 //!   only a >2 GiB file could show the other two. This replaces the
 //!   `#[ignore]`d test that wrote such a file (`input_set.rs`,
 //!   `open_stream_reads_a_real_oversized_row_group`).
@@ -30,7 +29,7 @@ use std::path::Path;
 
 use tylertoo_core::overview::check::validate_file;
 use tylertoo_core::overview::convert::{
-    convert_to_overviews, ConvertError, ConvertOptions, ConvertReport, LevelPlan,
+    convert_to_overviews, ConvertOptions, ConvertReport, LevelPlan,
 };
 use tylertoo_core::overview::export::{export_pmtiles, ExportOptions, ExportReport};
 
@@ -46,13 +45,12 @@ const SCALED_LIMIT: u64 = 16 * 1024;
 /// Below one row's bytes: no batch size can decode the column.
 const BELOW_ONE_ROW: u64 = 64;
 
-fn options(streaming: bool) -> ConvertOptions {
+fn options() -> ConvertOptions {
     ConvertOptions {
         levels: LevelPlan::ZoomRange {
             min_zoom: 0,
             max_zoom: 14,
         },
-        streaming,
         ..Default::default()
     }
 }
@@ -78,7 +76,7 @@ fn signature(conv: &ConvertReport, exp: &ExportReport) -> Signature {
 fn run(input: &Path, dir: &Path, tag: &str) -> Signature {
     let overview = dir.join(format!("{tag}.parquet"));
     let archive = dir.join(format!("{tag}.pmtiles"));
-    let conv = convert_to_overviews(input, &overview, &options(true))
+    let conv = convert_to_overviews(input, &overview, &options())
         .unwrap_or_else(|e| panic!("{tag}: streaming convert: {e}"));
     let exp = export_pmtiles(&overview, &archive, &ExportOptions::default())
         .unwrap_or_else(|e| panic!("{tag}: export: {e}"));
@@ -120,21 +118,10 @@ fn every_reader_path_honours_the_scaled_ceilings() {
         "a {SCALED_LIMIT}-byte byte-array ceiling changed the output"
     );
 
-    // C: `--no-streaming` holds the whole column in one batch, which the
-    // scaled ceiling cannot: the typed #606 error, from footer statistics.
-    let err = convert_to_overviews(&input, dir.path().join("mem.parquet"), &options(false))
-        .expect_err("--no-streaming cannot hold the column in one batch");
-    match err {
-        ConvertError::InMemoryByteArrayTooLarge { limit_bytes, .. } => {
-            assert_eq!(limit_bytes, SCALED_LIMIT);
-        }
-        other => panic!("--no-streaming: expected InMemoryByteArrayTooLarge, got {other}"),
-    }
-
-    // D: a ceiling below one row: the owner refuses with the typed #563
+    // C: a ceiling below one row: the owner refuses with the typed #563
     // input error, naming the actual oversized row.
     std::env::set_var(BYTE_ARRAY_ENV, BELOW_ONE_ROW.to_string());
-    let err = convert_to_overviews(&input, dir.path().join("row.parquet"), &options(true))
+    let err = convert_to_overviews(&input, dir.path().join("row.parquet"), &options())
         .expect_err("no batch can hold one row");
     assert!(err.to_string().contains("one row"), "{err}");
 
@@ -425,20 +412,6 @@ fn loss_reports_exceeding_the_memory_allowance(dir: &Path) {
     };
     assert_eq!(tiles.convert.source_losses.len(), ROWS - 1);
     tylertoo_core::diagnostics::write_report(&dir.join("tiles-losses.json"), &tiles).unwrap();
-    // The eager engine consumes the same bounded loss owner.
-    std::env::set_var(MEMORY_ENV, (4u64 << 20).to_string());
-    let eager = convert_to_overviews(
-        &input,
-        dir.join("loss-eager.parquet"),
-        &ConvertOptions {
-            streaming: false,
-            save_plan: None,
-            ..options.clone()
-        },
-    )
-    .unwrap();
-    assert_eq!(eager.source_losses.len(), ROWS - 1);
-    std::env::set_var(MEMORY_ENV, (1u64 << 20).to_string());
     // Export losses: tiny polygons collapse at z0 while row zero survives.
     let mut polygon = vec![1, 3, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0];
     for coord in [0f64, 0., 0.000001, 0., 0.000001, 0.000001, 0., 0.] {

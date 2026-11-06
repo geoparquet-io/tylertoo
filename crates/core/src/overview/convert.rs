@@ -1,9 +1,10 @@
 //! Public conversion options, reports and entry points.
 //!
-//! Both storage modes run the same stages in `super::stream`: preflight,
-//! pass-1 scan, assignment, carriers, writer setup, and write/report. The
-//! `super::source::MemorySource` adapter retains input batches in memory;
-//! the streaming source reads Parquet batches on demand. Both preserve
+//! Production streams: every run goes through the stages in `super::stream`
+//! (preflight, pass-1 scan, assignment, carriers, writer setup, and
+//! write/report), reading Parquet batches on demand. Tests can swap in the
+//! test-only `super::source::MemorySource`, which retains input batches in
+//! memory, via `super::source::with_eager_input`. Both readers preserve
 //! input order and use the same row addresses throughout the pipeline.
 //!
 //! Canonical duplicating levels and all partitioning levels retain original
@@ -526,21 +527,10 @@ pub struct ConvertOptions {
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Output layout"))]
     #[cfg_attr(feature = "cli", arg(help = "Keep Parquet min/max stats on every column, even large string and geometry columns. Use it when remote clients filter on property columns", long_help = None))]
     pub full_column_stats: bool,
-    /// Use the two-pass bounded-memory streaming pipeline (H3). Default `true`.
-    ///
-    /// Pass 1 streams the input once to build the per-feature winner tables
-    /// (level assignment + Q2 density budget); pass 2 streams the input again
-    /// per level, simplifying and writing batch-by-batch. Peak memory is
-    /// `O(read batch + winner tables)` instead of `O(dataset)`. Set `false`
-    /// to cache the input batches in memory and run the same stages over them.
-    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().streaming, action = clap::ArgAction::SetFalse, long = "no-streaming", help_heading = "Memory & performance"))]
-    #[cfg_attr(feature = "cli", arg(help = "Load the whole dataset into memory instead of streaming it in two passes. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>", long_help = None))]
-    pub streaming: bool,
     /// Rows per Arrow read batch in the streaming pipeline (both passes).
     /// Default [`DEFAULT_READ_BATCH_SIZE`]. Larger batches amortize per-batch
     /// overhead at the cost of proportionally more peak memory; smaller
-    /// batches bound memory tighter. Also sets cached batch sizes when
-    /// `streaming` is `false`.
+    /// batches bound memory tighter.
     #[cfg_attr(feature = "cli", arg(
         long,
         value_name = "ROWS",
@@ -552,7 +542,7 @@ pub struct ConvertOptions {
     /// Memory/throughput profile for the streaming pass-2 engine (#213/#212).
     /// Default [`MemoryProfile::Auto`], resolved per mode + estimated output
     /// size at convert entry. Changes speed and peak memory only — output is
-    /// byte-identical across profiles. No effect when `streaming` is `false`.
+    /// byte-identical across profiles.
     #[serde(with = "super::config::spelled")]
     #[cfg_attr(feature = "cli", arg(
         long,
@@ -573,8 +563,7 @@ pub struct ConvertOptions {
     /// Higher improves core utilization at proportionally more peak memory
     /// (`in_flight_batches × read_batch_size` input rows resident, plus the
     /// window's output batches). 1 or 2 processes one batch at a time. Output
-    /// is byte-identical for every value. No effect when `streaming` is
-    /// `false`.
+    /// is byte-identical for every value.
     #[cfg_attr(feature = "cli", arg(
         long,
         value_name = "N|auto",
@@ -592,8 +581,7 @@ pub struct ConvertOptions {
     /// in-order merge re-chunks their output into exactly the batch sequence
     /// one reader would have produced. Explicit values are honoured up to
     /// [`read_workers_ceiling`] and clamped (with a warning) above it. Ignored
-    /// for remote inputs (see `super::pipeline`) and when `streaming` is
-    /// `false`.
+    /// for remote inputs (see `super::pipeline`).
     #[cfg_attr(feature = "cli", arg(
         long,
         value_name = "N|auto",
@@ -1429,7 +1417,6 @@ impl Default for ConvertOptions {
             max_row_group_size: super::writer::DEFAULT_MAX_ROW_GROUP_SIZE,
             row_group_size_policy: RowGroupSizePolicy::default(),
             full_column_stats: false,
-            streaming: true,
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
             profile: MemoryProfile::Auto,
             in_flight_batches: IN_FLIGHT_BATCHES_AUTO,
@@ -1926,13 +1913,6 @@ pub enum ConvertError {
     /// `--accumulate-attribute` was supplied without `--cluster`.
     #[error("--accumulate-attribute requires --cluster")]
     AccumulateWithoutCluster,
-    /// Multi-partition input (directory / glob) reached the in-memory
-    /// reference pipeline, which reads through a single parquet builder.
-    #[error(
-        "multi-partition input requires the streaming pipeline; \
-         remove --no-streaming"
-    )]
-    MultiPartitionRequiresStreaming,
     /// An `--accumulate-attribute` column is not present in the input schema.
     #[error("accumulate-attribute column {name:?} not found in input schema")]
     AccumulateColumnMissing {
@@ -2052,33 +2032,6 @@ pub enum ConvertError {
         /// Available bytes at conversion start.
         available: u64,
     },
-    /// A selected byte-array column exceeds the non-streaming aggregate
-    /// ceiling (#606). The cached source retains this preflight contract;
-    /// the I/O reader separately checks whether any individual row fits.
-    #[error("{}", in_memory_byte_array_too_large_message(.largest, .limit_bytes))]
-    InMemoryByteArrayTooLarge {
-        /// The column whose total is too large.
-        largest: tylertoo_io::LargestByteArrayColumn,
-        /// The aggregate column ceiling checked against.
-        limit_bytes: u64,
-    },
-}
-
-/// The message body of [`ConvertError::InMemoryByteArrayTooLarge`] (#606).
-fn in_memory_byte_array_too_large_message(
-    largest: &tylertoo_io::LargestByteArrayColumn,
-    limit_bytes: &u64,
-) -> String {
-    const GIB: f64 = (1u64 << 30) as f64;
-    format!(
-        "--no-streaming caches the whole input, and column '{}' \
-         holds {:.2} GiB in the row groups to read, beyond the {:.2} GiB aggregate \
-         column limit. Drop --no-streaming: the streaming source reads \
-         this input in bounded batches.",
-        largest.column,
-        largest.total_bytes as f64 / GIB,
-        *limit_bytes as f64 / GIB,
-    )
 }
 
 impl ConvertError {
@@ -2133,14 +2086,6 @@ fn validate_zoom_ceiling(options: &ConvertOptions) -> Result<(), ConvertError> {
             "a convert-side zoom ceiling requires duplicating mode: in partitioning \
              mode each feature lives only at its coarsest level, so capping the levels \
              would drop features rather than levels"
-                .to_string(),
-        ));
-    }
-    if !options.streaming {
-        return Err(ConvertError::InvalidConfig(
-            "a convert-side zoom ceiling requires the streaming pipeline \
-             (the in-memory reference path builds every planned level); \
-             drop --no-streaming"
                 .to_string(),
         ));
     }
@@ -2239,17 +2184,9 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
         super::filter::parse_filter(f)?;
     }
     // Convert plan artifact: writing one and replaying one are opposite ends
-    // of the same run, and both need the streaming pipeline (the in-memory
-    // reference path has no separable pass 1 to skip).
+    // of the same run.
     if options.save_plan.is_some() && options.plan.is_some() {
         return Err(super::config::ConfigError::SavePlanWithPlan.into());
-    }
-    if !options.streaming && (options.save_plan.is_some() || options.plan.is_some()) {
-        return Err(ConvertError::InvalidConfig(
-            "--save-plan / --plan require the streaming pipeline (they persist \
-             and replay its pass-1 + assignment stage); drop --no-streaming"
-                .to_string(),
-        ));
     }
     validate_zoom_ceiling(options)?;
     // #513, in the spirit of the #272 spill-dir block below: both plan paths
@@ -2763,7 +2700,7 @@ pub(super) fn level_representations(
 /// cap. Everything `--save-plan` already refuses is refused here too: a
 /// [`ConvertOptions::plan`] to replay, a data-shard
 /// [`ConvertOptions::shard`] range (whose plan would cover only that shard's
-/// rows), and `streaming: false`.
+/// rows).
 ///
 /// # Errors
 ///
@@ -2836,8 +2773,6 @@ pub fn write_convert_plan_sources(
                 .to_owned(),
         );
     }
-    // `--save-plan` already requires the streaming pipeline (validated above),
-    // which is where the separable pass-1 + assignment stage lives.
     super::stream::write_plan_streaming(source, &options.validate()?, diagnostics)
 }
 
@@ -3614,42 +3549,6 @@ mod property_selection_tests {
         assert_eq!(find_confidence_column(&s, &[]), None);
         let no_conf = schema(&[("score", DataType::Float64)]);
         assert_eq!(find_confidence_column(&no_conf, &[pt()]), None);
-    }
-}
-
-/// Preserve the eager source's existing aggregate byte-column ceiling (#606).
-/// It differs from the reader's single-row ceiling and keeps previously
-/// rejected whole-input loads from silently becoming unbounded caches.
-/// Unprojected columns and columns using i64 offsets or views are excluded,
-/// matching the pre-refactor contract.
-pub(super) fn check_in_memory_byte_array_total(
-    source: &ConvertSource,
-    builder: &tylertoo_io::ParquetSource<crate::input::InputReader>,
-    row_groups: Option<&[usize]>,
-    limit_bytes: u64,
-) -> Result<(), ConvertError> {
-    let keep = source.column_projection();
-    let fields = builder.schema().fields();
-    let counts = |root: usize| {
-        keep.is_none_or(|k| k.contains(&root))
-            && fields.get(root).is_none_or(|f| {
-                !matches!(
-                    f.data_type(),
-                    DataType::LargeBinary
-                        | DataType::LargeUtf8
-                        | DataType::BinaryView
-                        | DataType::Utf8View
-                )
-            })
-    };
-    match tylertoo_io::largest_byte_array_column(builder.metadata(), row_groups, counts) {
-        Some(largest) if largest.total_bytes > limit_bytes => {
-            Err(ConvertError::InMemoryByteArrayTooLarge {
-                largest,
-                limit_bytes,
-            })
-        }
-        _ => Ok(()),
     }
 }
 
@@ -8350,15 +8249,16 @@ mod tests {
             (false, PropertySelection::default()),
             (true, exclude_all),
         ] {
-            let err = convert_to_overviews(
-                &input,
-                dir.path().join("out.parquet"),
-                &ConvertOptions {
-                    streaming,
-                    properties: properties.clone(),
-                    ..Default::default()
-                },
-            )
+            let err = super::super::source::with_eager_input(!streaming, || {
+                convert_to_overviews(
+                    &input,
+                    dir.path().join("out.parquet"),
+                    &ConvertOptions {
+                        properties: properties.clone(),
+                        ..Default::default()
+                    },
+                )
+            })
             .expect_err("no geometry column");
             assert!(
                 matches!(err, ConvertError::NoGeometryColumn { .. }),
@@ -8592,14 +8492,9 @@ mod tests {
 
         for streaming in [true, false] {
             let out = dir.path().join(format!("out-{streaming}.parquet"));
-            let report = convert_to_overviews(
-                &input,
-                &out,
-                &ConvertOptions {
-                    streaming,
-                    ..Default::default()
-                },
-            )
+            let report = super::super::source::with_eager_input(!streaming, || {
+                convert_to_overviews(&input, &out, &ConvertOptions::default())
+            })
             .unwrap();
             assert!(
                 report.crs_assumed_wgs84,
@@ -8618,14 +8513,9 @@ mod tests {
 
         for streaming in [true, false] {
             let out = dir.path().join(format!("out-{streaming}.parquet"));
-            let report = convert_to_overviews(
-                &input,
-                &out,
-                &ConvertOptions {
-                    streaming,
-                    ..Default::default()
-                },
-            )
+            let report = super::super::source::with_eager_input(!streaming, || {
+                convert_to_overviews(&input, &out, &ConvertOptions::default())
+            })
             .unwrap();
             assert!(!report.crs_assumed_wgs84, "streaming={streaming}");
         }
@@ -8871,159 +8761,6 @@ mod tests {
             pm_single == pm_multi,
             "per-part bbox selection must keep offsets aligned"
         );
-    }
-
-    /// The in-memory reference path (`--no-streaming`) does not support
-    /// multi-partition input; it must fail with a clear error.
-    #[test]
-    fn multi_partition_requires_streaming_pipeline() {
-        let geoms = synthetic_geometries();
-        let dir = tempfile::tempdir().unwrap();
-        let parts = dir.path().join("parts");
-        std::fs::create_dir(&parts).unwrap();
-        write_input_partition(&parts.join("part-000.parquet"), &geoms, 0..5, None);
-        write_input_partition(
-            &parts.join("part-001.parquet"),
-            &geoms,
-            5..geoms.len(),
-            None,
-        );
-
-        let opts = ConvertOptions {
-            streaming: false,
-            ..multi_test_options()
-        };
-        let err = convert_to_overviews(&parts, dir.path().join("out.parquet"), &opts).unwrap_err();
-        assert!(
-            matches!(err, ConvertError::MultiPartitionRequiresStreaming),
-            "expected MultiPartitionRequiresStreaming, got {err:?}"
-        );
-    }
-
-    /// #606: preserve the non-streaming aggregate limit: a byte-array
-    /// column whose total over the read row groups passes
-    /// the ceiling fails from footer statistics, naming the column and the
-    /// way out. A bbox that prunes the input under the ceiling reads it.
-    #[test]
-    fn in_memory_path_rejects_a_byte_array_column_past_the_batch_ceiling() {
-        let geoms = synthetic_geometries();
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("in.parquet");
-        // 1302 bytes of WKB in three row groups of six rows: the points, then
-        // the lines and the first two polygons, then the last two polygons
-        // (186 bytes).
-        write_input_partition(&input, &geoms, 0..geoms.len(), Some(6));
-        let source = ConvertSource::resolve_path(&input).unwrap();
-        let limit = 1000;
-        let opts = ConvertOptions {
-            streaming: false,
-            ..multi_test_options()
-        };
-
-        let Err(err) = super::super::stream::memory_source_for_test(&source, &opts, limit) else {
-            panic!("the whole table passes the ceiling");
-        };
-        let ConvertError::InMemoryByteArrayTooLarge {
-            largest,
-            limit_bytes,
-        } = &err
-        else {
-            panic!("expected InMemoryByteArrayTooLarge, got {err:?}");
-        };
-        assert_eq!(largest.column, "geometry");
-        assert!(largest.total_bytes > limit, "{largest:?}");
-        assert_eq!(*limit_bytes, limit);
-        let msg = err.to_string();
-        assert!(msg.contains("'geometry'"), "names the column: {msg}");
-        assert!(
-            msg.contains("Drop --no-streaming"),
-            "names the way out: {msg}"
-        );
-
-        // Only the last row group's extent intersects this bbox.
-        let pruned = ConvertOptions {
-            bbox: Some([-30.0, -60.0, -20.0, -50.0]),
-            ..opts.clone()
-        };
-        let loaded = super::super::stream::memory_source_for_test(&source, &pruned, limit)
-            .expect("the pruned row groups fit the ceiling");
-        assert_eq!(loaded.1, 1);
-
-        let unlimited = super::super::stream::memory_source_for_test(&source, &opts, u64::MAX)
-            .expect("the real ceiling reads a small input");
-        assert_eq!(unlimited.0.num_rows(), geoms.len());
-
-        // The aggregate ceiling is inclusive.
-        let at_limit =
-            super::super::stream::memory_source_for_test(&source, &opts, largest.total_bytes)
-                .expect("a total equal to the ceiling fits");
-        assert_eq!(at_limit.0.num_rows(), geoms.len());
-    }
-
-    /// #606: the message reports both sizes in GiB.
-    #[test]
-    fn in_memory_byte_array_message_reports_sizes_in_gib() {
-        let largest = tylertoo_io::LargestByteArrayColumn {
-            column: "geometry".into(),
-            total_bytes: 5 << 29,
-        };
-        let msg =
-            in_memory_byte_array_too_large_message(&largest, &tylertoo_io::BYTE_ARRAY_BATCH_LIMIT);
-        assert!(msg.contains("'geometry' holds 2.50 GiB"), "{msg}");
-        assert!(msg.contains("beyond the 2.00 GiB"), "{msg}");
-    }
-
-    /// #606: the in-memory total counts only the columns the reader decodes
-    /// with i32 offsets. A `LargeUtf8` column, and a column the source's
-    /// projection leaves out, cannot overflow the concat.
-    #[test]
-    fn in_memory_byte_array_check_skips_large_and_unprojected_columns() {
-        use tylertoo_io::test_support::ArrowWriter;
-
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("in.parquet");
-        let n = 4;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("geometry", DataType::Binary, false),
-            Field::new("label", DataType::Utf8, false),
-            Field::new("notes", DataType::LargeUtf8, false),
-        ]));
-        let geometry = arrow_array::BinaryArray::from_vec(vec![&[0u8; 10][..]; n]);
-        let label = StringArray::from(vec!["l".repeat(500); n]);
-        let notes = arrow_array::LargeStringArray::from(vec!["n".repeat(2000); n]);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(geometry), Arc::new(label), Arc::new(notes)],
-        )
-        .unwrap();
-        let mut writer =
-            ArrowWriter::try_new(std::fs::File::create(&input).unwrap(), schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        let limit = 1000;
-
-        // `label` (2000 bytes) passes the ceiling; `notes` (8000) is larger
-        // but decodes with i64 offsets.
-        let all = ConvertSource::resolve_path(&input).unwrap();
-        let ConvertSource::Single(single) = &all else {
-            panic!("one file resolves to a single source");
-        };
-        let builder = single.input().open().unwrap();
-        let err = check_in_memory_byte_array_total(&all, &builder, None, limit).unwrap_err();
-        let ConvertError::InMemoryByteArrayTooLarge { largest, .. } = &err else {
-            panic!("expected InMemoryByteArrayTooLarge, got {err:?}");
-        };
-        assert_eq!(largest.column, "label");
-
-        // Without `label`, nothing counted passes the ceiling.
-        let projected = ConvertSource::resolve_path(&input).unwrap();
-        projected.restrict_columns(vec![0, 2]).unwrap();
-        let ConvertSource::Single(single) = &projected else {
-            panic!("one file resolves to a single source");
-        };
-        let builder = single.input().open().unwrap();
-        check_in_memory_byte_array_total(&projected, &builder, None, limit)
-            .expect("an unprojected column and a LargeUtf8 column are not counted");
     }
 
     /// Partitions disagreeing on CRS are rejected at resolve time with an
@@ -9894,17 +9631,6 @@ mod tests {
             "unexpected: {data_shard}"
         );
 
-        // The separable pass-1 + assignment stage is the streaming pipeline's.
-        let in_memory = refused(ConvertOptions {
-            save_plan: Some(plan.clone()),
-            streaming: false,
-            ..Default::default()
-        });
-        assert!(
-            in_memory.contains("streaming pipeline"),
-            "unexpected: {in_memory}"
-        );
-
         // Every refusal above is a config check, so none of them left a plan
         // behind.
         assert!(!plan.exists(), "a refused plan-only run wrote a plan");
@@ -10079,11 +9805,9 @@ mod tests {
         let t_stream = tempfile::NamedTempFile::new().unwrap();
         let t_mem = tempfile::NamedTempFile::new().unwrap();
         let r1 = convert_to_overviews(tin.path(), t_stream.path(), &base).unwrap();
-        let mem = ConvertOptions {
-            streaming: false,
-            ..base
-        };
-        let r2 = convert_to_overviews(tin.path(), t_mem.path(), &mem).unwrap();
+        let r2 = super::super::source::with_eager_input(true, || {
+            convert_to_overviews(tin.path(), t_mem.path(), &base).unwrap()
+        });
         assert_eq!(r1.levels.len(), r2.levels.len());
 
         let rd1 = OverviewReader::open(t_stream.path()).unwrap();
@@ -10647,13 +10371,11 @@ mod tests {
         write_input(tin.path(), &geoms, false, Some(md));
 
         // #452: both pipelines, and auto-zoom's own read, name the file.
-        let streaming = ConvertOptions::default();
-        let in_memory = ConvertOptions {
-            streaming: false,
-            ..Default::default()
-        };
-        for opts in [streaming, in_memory] {
-            let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
+        for eager in [false, true] {
+            let err = super::super::source::with_eager_input(eager, || {
+                convert_to_overviews(tin.path(), tout.path(), &ConvertOptions::default())
+            })
+            .unwrap_err();
             assert!(
                 matches!(err, ConvertError::UnsupportedCrs { .. }),
                 "expected UnsupportedCrs, got {err:?}"
@@ -11742,16 +11464,10 @@ mod tests {
         let mem_out = tempfile::NamedTempFile::new().unwrap();
         let stream_out = tempfile::NamedTempFile::new().unwrap();
 
-        let mem_opts = ConvertOptions {
-            streaming: false,
-            ..base.clone()
-        };
-        let stream_opts = ConvertOptions {
-            streaming: true,
-            ..base.clone()
-        };
-        let mem = convert_to_overviews(input, mem_out.path(), &mem_opts).unwrap();
-        let strm = convert_to_overviews(input, stream_out.path(), &stream_opts).unwrap();
+        let mem = super::super::source::with_eager_input(true, || {
+            convert_to_overviews(input, mem_out.path(), base).unwrap()
+        });
+        let strm = convert_to_overviews(input, stream_out.path(), base).unwrap();
 
         // Reports agree on everything but duration.
         assert_eq!(mem.mode, strm.mode);
@@ -12441,15 +12157,7 @@ mod tests {
         // Guard against a vacuous pass: the coarse levels must actually show
         // at least one coalesced (merged) line, not just N singletons.
         let tout = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(
-            tin.path(),
-            tout.path(),
-            &ConvertOptions {
-                streaming: true,
-                ..base.clone()
-            },
-        )
-        .unwrap();
+        convert_to_overviews(tin.path(), tout.path(), &base).unwrap();
         let reader = OverviewReader::open(tout.path()).unwrap();
         let coarse_counts = read_coalesced_counts(&reader, 0);
         assert!(
@@ -12479,14 +12187,9 @@ mod tests {
         };
         let mem_out = tempfile::NamedTempFile::new().unwrap();
         let stream_out = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(
-            tin.path(),
-            mem_out.path(),
-            &ConvertOptions {
-                streaming: false,
-                ..base.clone()
-            },
-        )
+        super::super::source::with_eager_input(true, || {
+            convert_to_overviews(tin.path(), mem_out.path(), &base)
+        })
         .unwrap();
         convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
 
@@ -12609,59 +12312,60 @@ mod tests {
         write_input(tin.path(), &geoms, false, None);
 
         for streaming in [true, false] {
-            for density in [true, false] {
-                for thinning in [2.0, 8.0] {
-                    let tout = tempfile::NamedTempFile::new().unwrap();
-                    let mut opts = ConvertOptions {
-                        levels: LevelPlan::ZoomRange {
-                            min_zoom: 0,
-                            max_zoom: 6,
-                        },
-                        cluster: true,
-                        streaming,
-                        ..Default::default()
-                    };
-                    opts.density.enabled = density;
-                    opts.assign.point_thinning = thinning;
-                    let label =
-                        format!("streaming={streaming} density={density} thinning={thinning}");
-                    convert_to_overviews(tin.path(), tout.path(), &opts)
-                        .unwrap_or_else(|e| panic!("{label}: {e}"));
+            super::super::source::with_eager_input(!streaming, || {
+                for density in [true, false] {
+                    for thinning in [2.0, 8.0] {
+                        let tout = tempfile::NamedTempFile::new().unwrap();
+                        let mut opts = ConvertOptions {
+                            levels: LevelPlan::ZoomRange {
+                                min_zoom: 0,
+                                max_zoom: 6,
+                            },
+                            cluster: true,
+                            ..Default::default()
+                        };
+                        opts.density.enabled = density;
+                        opts.assign.point_thinning = thinning;
+                        let label =
+                            format!("streaming={streaming} density={density} thinning={thinning}");
+                        convert_to_overviews(tin.path(), tout.path(), &opts)
+                            .unwrap_or_else(|e| panic!("{label}: {e}"));
 
-                    let vr = validate_file(tout.path()).unwrap();
-                    assert!(
-                        vr.is_valid(),
-                        "{label}: failures: {:?}",
-                        vr.failures().collect::<Vec<_>>()
-                    );
-                    assert_eq!(
-                        vr.check_passed("cluster_sum_invariant"),
-                        Some(true),
-                        "{label}"
-                    );
-
-                    let reader = OverviewReader::open(tout.path()).unwrap();
-                    let canonical = reader.num_levels() - 1;
-                    for level in 0..reader.num_levels() {
-                        let counts = read_point_counts(&reader, level);
+                        let vr = validate_file(tout.path()).unwrap();
                         assert!(
-                            !counts.is_empty(),
-                            "{label}: level {level} thinned points to zero"
+                            vr.is_valid(),
+                            "{label}: failures: {:?}",
+                            vr.failures().collect::<Vec<_>>()
                         );
                         assert_eq!(
-                            counts.iter().sum::<i64>(),
-                            geoms.len() as i64,
-                            "{label}: level {level} must partition the source set"
+                            vr.check_passed("cluster_sum_invariant"),
+                            Some(true),
+                            "{label}"
+                        );
+
+                        let reader = OverviewReader::open(tout.path()).unwrap();
+                        let canonical = reader.num_levels() - 1;
+                        for level in 0..reader.num_levels() {
+                            let counts = read_point_counts(&reader, level);
+                            assert!(
+                                !counts.is_empty(),
+                                "{label}: level {level} thinned points to zero"
+                            );
+                            assert_eq!(
+                                counts.iter().sum::<i64>(),
+                                geoms.len() as i64,
+                                "{label}: level {level} must partition the source set"
+                            );
+                        }
+                        assert!(
+                            read_point_counts(&reader, canonical)
+                                .iter()
+                                .all(|&c| c == 1),
+                            "{label}: canonical band must be singleton-only"
                         );
                     }
-                    assert!(
-                        read_point_counts(&reader, canonical)
-                            .iter()
-                            .all(|&c| c == 1),
-                        "{label}: canonical band must be singleton-only"
-                    );
                 }
-            }
+            });
         }
     }
 
@@ -12816,24 +12520,25 @@ mod tests {
 
         // Missing accumulate column is rejected (both pipelines).
         for streaming in [true, false] {
-            let err = convert_to_overviews(
-                tin.path(),
-                tout.path(),
-                &ConvertOptions {
-                    cluster: true,
-                    streaming,
-                    accumulate: vec![AccumulateSpec {
-                        column: "nonexistent".to_string(),
-                        op: super::super::cluster::AccumulateOp::Sum,
-                    }],
-                    ..Default::default()
-                },
-            )
-            .unwrap_err();
-            assert!(
-                matches!(err, ConvertError::AccumulateColumnMissing { .. }),
-                "streaming={streaming}: got {err:?}"
-            );
+            super::super::source::with_eager_input(!streaming, || {
+                let err = convert_to_overviews(
+                    tin.path(),
+                    tout.path(),
+                    &ConvertOptions {
+                        cluster: true,
+                        accumulate: vec![AccumulateSpec {
+                            column: "nonexistent".to_string(),
+                            op: super::super::cluster::AccumulateOp::Sum,
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(err, ConvertError::AccumulateColumnMissing { .. }),
+                    "streaming={streaming}: got {err:?}"
+                );
+            });
         }
 
         // Non-numeric accumulate column is rejected.
@@ -12963,14 +12668,9 @@ mod tests {
         // the shared helper does not include it).
         let mem_out = tempfile::NamedTempFile::new().unwrap();
         let stream_out = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(
-            tin.path(),
-            mem_out.path(),
-            &ConvertOptions {
-                streaming: false,
-                ..base.clone()
-            },
-        )
+        super::super::source::with_eager_input(true, || {
+            convert_to_overviews(tin.path(), mem_out.path(), &base)
+        })
         .unwrap();
         convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
         let mr = OverviewReader::open(mem_out.path()).unwrap();
@@ -13134,37 +12834,38 @@ mod tests {
         write_input(tin.path(), &geoms, false, None);
 
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let report = convert_to_overviews(
-                tin.path(),
-                tout.path(),
-                &ConvertOptions {
-                    mode: Mode::Partitioning,
-                    coalesce_lines: true, // the default; explicit for clarity
-                    streaming,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            // Feature-once: total rows == input rows, no merging happened.
-            assert_eq!(report.total_rows, geoms.len(), "streaming={streaming}");
-            let reader = OverviewReader::open(tout.path()).unwrap();
-            assert!(
-                reader
-                    .meta()
-                    .generalization
-                    .as_ref()
-                    .unwrap()
-                    .coalescing
-                    .is_none(),
-                "no coalescing provenance in partitioning mode"
-            );
-            let batch_schema = reader.read_level(0, None).unwrap().next().unwrap().unwrap();
-            assert!(
-                batch_schema.schema().index_of("coalesced_count").is_err(),
-                "no coalesced_count column in partitioning mode"
-            );
-            assert!(validate_file(tout.path()).unwrap().is_valid());
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let report = convert_to_overviews(
+                    tin.path(),
+                    tout.path(),
+                    &ConvertOptions {
+                        mode: Mode::Partitioning,
+                        coalesce_lines: true, // the default; explicit for clarity
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                // Feature-once: total rows == input rows, no merging happened.
+                assert_eq!(report.total_rows, geoms.len(), "streaming={streaming}");
+                let reader = OverviewReader::open(tout.path()).unwrap();
+                assert!(
+                    reader
+                        .meta()
+                        .generalization
+                        .as_ref()
+                        .unwrap()
+                        .coalescing
+                        .is_none(),
+                    "no coalescing provenance in partitioning mode"
+                );
+                let batch_schema = reader.read_level(0, None).unwrap().next().unwrap().unwrap();
+                assert!(
+                    batch_schema.schema().index_of("coalesced_count").is_err(),
+                    "no coalesced_count column in partitioning mode"
+                );
+                assert!(validate_file(tout.path()).unwrap().is_valid());
+            });
         }
     }
 
@@ -13207,23 +12908,24 @@ mod tests {
 
         let tout = tempfile::NamedTempFile::new().unwrap();
         for streaming in [true, false] {
-            convert_to_overviews(
-                tin.path(),
-                tout.path(),
-                &ConvertOptions {
-                    coalesce_lines: true,
-                    streaming,
-                    ..Default::default()
-                },
-            )
-            .unwrap_or_else(|e| {
-                panic!("streaming={streaming}: `Coalesced_Count` must be auto-renamed, got {e}")
+            super::super::source::with_eager_input(!streaming, || {
+                convert_to_overviews(
+                    tin.path(),
+                    tout.path(),
+                    &ConvertOptions {
+                        coalesce_lines: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|e| {
+                    panic!("streaming={streaming}: `Coalesced_Count` must be auto-renamed, got {e}")
+                });
+                let names = output_column_names(tout.path());
+                assert!(
+                    names.iter().any(|n| n == "Coalesced_Count_"),
+                    "streaming={streaming}: renamed source column present, names={names:?}"
+                );
             });
-            let names = output_column_names(tout.path());
-            assert!(
-                names.iter().any(|n| n == "Coalesced_Count_"),
-                "streaming={streaming}: renamed source column present, names={names:?}"
-            );
         }
         // With coalescing disabled the column is an ordinary passthrough
         // property (kept verbatim).
@@ -13466,14 +13168,9 @@ mod tests {
         // Explicitly compare coalesced_count per level too.
         let mem_out = tempfile::NamedTempFile::new().unwrap();
         let stream_out = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(
-            tin.path(),
-            mem_out.path(),
-            &ConvertOptions {
-                streaming: false,
-                ..base.clone()
-            },
-        )
+        super::super::source::with_eager_input(true, || {
+            convert_to_overviews(tin.path(), mem_out.path(), &base)
+        })
         .unwrap();
         convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
         let mr = OverviewReader::open(mem_out.path()).unwrap();
@@ -13521,14 +13218,9 @@ mod tests {
         };
         let mem_out = tempfile::NamedTempFile::new().unwrap();
         let stream_out = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(
-            tin.path(),
-            mem_out.path(),
-            &ConvertOptions {
-                streaming: false,
-                ..base.clone()
-            },
-        )
+        super::super::source::with_eager_input(true, || {
+            convert_to_overviews(tin.path(), mem_out.path(), &base)
+        })
         .unwrap();
         convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
         assert_eq!(
@@ -13863,21 +13555,22 @@ mod tests {
         write_multi_rg_attr_input(tin.path(), &attr_rows());
 
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                filter: Some("confidence > 0.8".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            assert_eq!(report.row_groups_total, 4, "streaming={streaming}");
-            // RG0 (0.1) and RG3 (all-null) are provably non-matching by stats.
-            assert_eq!(
-                report.row_groups_read, 2,
-                "stats pushdown did not fire (streaming={streaming})"
-            );
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![1, 2], "streaming={streaming}");
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    filter: Some("confidence > 0.8".to_string()),
+                    ..attr_opts()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                assert_eq!(report.row_groups_total, 4, "streaming={streaming}");
+                // RG0 (0.1) and RG3 (all-null) are provably non-matching by stats.
+                assert_eq!(
+                    report.row_groups_read, 2,
+                    "stats pushdown did not fire (streaming={streaming})"
+                );
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![1, 2], "streaming={streaming}");
+            });
         }
     }
 
@@ -13889,22 +13582,23 @@ mod tests {
         write_multi_rg_attr_input(tin.path(), &attr_rows());
 
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                // bbox keeps (10,10) and (20,20); filter keeps 0.9 and 0.85;
-                // combined with bbox tightened to exclude (20,20): only id=1.
-                bbox: Some([9.0, 9.0, 11.0, 11.0]),
-                filter: Some("confidence > 0.8".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            assert_eq!(
-                report.row_groups_read, 1,
-                "bbox+filter selection must intersect (streaming={streaming})"
-            );
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![1], "streaming={streaming}");
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    // bbox keeps (10,10) and (20,20); filter keeps 0.9 and 0.85;
+                    // combined with bbox tightened to exclude (20,20): only id=1.
+                    bbox: Some([9.0, 9.0, 11.0, 11.0]),
+                    filter: Some("confidence > 0.8".to_string()),
+                    ..attr_opts()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                assert_eq!(
+                    report.row_groups_read, 1,
+                    "bbox+filter selection must intersect (streaming={streaming})"
+                );
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![1], "streaming={streaming}");
+            });
         }
     }
 
@@ -13919,33 +13613,35 @@ mod tests {
         let bbox = [-165.0, 15.0, -155.0, 25.0];
 
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                mode: Mode::Duplicating,
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 6,
-                    max_zoom: 6,
-                },
-                bbox: Some(bbox),
-                streaming,
-                ..Default::default()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
-                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
-            assert_eq!(
-                report.row_groups_read, 1,
-                "streaming={streaming}: the prune must keep exactly the wrapped group"
-            );
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            // Post-hoc: the feature shifted -360° lies in the bbox.
-            let posthoc: Vec<i64> = (0..coords.len() as i64)
-                .filter(|&id| {
-                    let (x, y) = coords[id as usize];
-                    (bbox[0]..=bbox[2]).contains(&(x - 360.0)) && (bbox[1]..=bbox[3]).contains(&y)
-                })
-                .collect();
-            assert_eq!(posthoc, vec![1]);
-            assert_eq!(ids, posthoc, "streaming={streaming}");
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 6,
+                        max_zoom: 6,
+                    },
+                    bbox: Some(bbox),
+                    ..Default::default()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                    .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+                assert_eq!(
+                    report.row_groups_read, 1,
+                    "streaming={streaming}: the prune must keep exactly the wrapped group"
+                );
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                // Post-hoc: the feature shifted -360° lies in the bbox.
+                let posthoc: Vec<i64> = (0..coords.len() as i64)
+                    .filter(|&id| {
+                        let (x, y) = coords[id as usize];
+                        (bbox[0]..=bbox[2]).contains(&(x - 360.0))
+                            && (bbox[1]..=bbox[3]).contains(&y)
+                    })
+                    .collect();
+                assert_eq!(posthoc, vec![1]);
+                assert_eq!(ids, posthoc, "streaming={streaming}");
+            });
         }
     }
 
@@ -13957,22 +13653,23 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_multi_rg_input(tin.path(), &coords, true);
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                mode: Mode::Duplicating,
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 6,
-                    max_zoom: 6,
-                },
-                bbox: Some([170.0, -1.0, 190.0, 1.0]),
-                streaming,
-                ..Default::default()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
-                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
-            assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![0], "streaming={streaming}");
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 6,
+                        max_zoom: 6,
+                    },
+                    bbox: Some([170.0, -1.0, 190.0, 1.0]),
+                    ..Default::default()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                    .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+                assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![0], "streaming={streaming}");
+            });
         }
     }
 
@@ -13996,23 +13693,24 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_multi_rg_input_with_crs(tin.path(), &metres, true, Some(md));
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                mode: Mode::Duplicating,
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 6,
-                    max_zoom: 6,
-                },
-                // Around lng -160 = 200 - 360.
-                bbox: Some([-161.0, 9.0, -159.0, 11.0]),
-                streaming,
-                ..Default::default()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
-                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
-            assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![0], "streaming={streaming}");
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 6,
+                        max_zoom: 6,
+                    },
+                    // Around lng -160 = 200 - 360.
+                    bbox: Some([-161.0, 9.0, -159.0, 11.0]),
+                    ..Default::default()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                    .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+                assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![0], "streaming={streaming}");
+            });
         }
     }
 
@@ -14063,29 +13761,30 @@ mod tests {
         write_multi_rg_attr_input(tin.path(), &rows);
 
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                filter: Some("confidence > 0.8".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            assert_eq!(
-                report.row_groups_read, 2,
-                "pushdown must prune (streaming={streaming})"
-            );
-            assert_eq!(report.out_of_range_features, 1, "streaming={streaming}");
-            assert_eq!(
-                report.out_of_range_exemplars,
-                vec![OutOfRangeExemplar {
-                    part: None,
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    filter: Some("confidence > 0.8".to_string()),
+                    ..attr_opts()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                assert_eq!(
+                    report.row_groups_read, 2,
+                    "pushdown must prune (streaming={streaming})"
+                );
+                assert_eq!(report.out_of_range_features, 1, "streaming={streaming}");
+                assert_eq!(
+                    report.out_of_range_exemplars,
+                    vec![OutOfRangeExemplar {
+                        part: None,
 
-                    row: 2,
-                    axis: "lon",
-                    value: 590.0,
-                }],
-                "streaming={streaming}"
-            );
+                        row: 2,
+                        axis: "lon",
+                        value: 590.0,
+                    }],
+                    "streaming={streaming}"
+                );
+            });
         }
     }
 
@@ -14131,38 +13830,37 @@ mod tests {
         write_multi_rg_attr_input(tin.path(), &attr_rows());
 
         for streaming in [true, false] {
-            // IN over strings.
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                filter: Some("crop IN ('corn', 'rice')".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![1, 3], "IN (streaming={streaming})");
+            super::super::source::with_eager_input(!streaming, || {
+                // IN over strings.
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    filter: Some("crop IN ('corn', 'rice')".to_string()),
+                    ..attr_opts()
+                };
+                convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![1, 3], "IN (streaming={streaming})");
 
-            // IS NULL keeps exactly the null-confidence row.
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                filter: Some("confidence IS NULL".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![3], "IS NULL (streaming={streaming})");
+                // IS NULL keeps exactly the null-confidence row.
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    filter: Some("confidence IS NULL".to_string()),
+                    ..attr_opts()
+                };
+                convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![3], "IS NULL (streaming={streaming})");
 
-            // Three-valued OR: null confidence is rescued by the crop arm.
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                filter: Some("confidence > 0.8 OR crop = 'rice'".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![1, 2, 3], "OR (streaming={streaming})");
+                // Three-valued OR: null confidence is rescued by the crop arm.
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    filter: Some("confidence > 0.8 OR crop = 'rice'".to_string()),
+                    ..attr_opts()
+                };
+                convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![1, 2, 3], "OR (streaming={streaming})");
+            });
         }
     }
 
@@ -14240,64 +13938,65 @@ mod tests {
         /// must fetch byte ranges ONLY from the bbox-selected row groups (plus
         /// the footer) — pruned row groups are never downloaded at all.
         fn assert_bbox_extract_fetches_only_selected(streaming: bool) {
-            // 4 single-point row groups at (0,0), (10,10), (20,20), (30,30)
-            // with covering stats; a bbox around (10,10) selects only rg 1.
-            let coords = vec![(0.0, 0.0), (10.0, 10.0), (20.0, 20.0), (30.0, 30.0)];
-            let tin = tempfile::NamedTempFile::new().unwrap();
-            write_multi_rg_input(tin.path(), &coords, true);
-            let bytes = std::fs::read(tin.path()).unwrap();
-            let spans = row_group_spans(&bytes);
-            assert_eq!(spans.len(), 4);
+            crate::overview::source::with_eager_input(!streaming, || {
+                // 4 single-point row groups at (0,0), (10,10), (20,20), (30,30)
+                // with covering stats; a bbox around (10,10) selects only rg 1.
+                let coords = vec![(0.0, 0.0), (10.0, 10.0), (20.0, 20.0), (30.0, 30.0)];
+                let tin = tempfile::NamedTempFile::new().unwrap();
+                write_multi_rg_input(tin.path(), &coords, true);
+                let bytes = std::fs::read(tin.path()).unwrap();
+                let spans = row_group_spans(&bytes);
+                assert_eq!(spans.len(), 4);
 
-            let source = test_memory_source(bytes, "multi.parquet");
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                mode: Mode::Duplicating,
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 6,
-                    max_zoom: 6,
-                },
-                bbox: Some([9.0, 9.0, 11.0, 11.0]),
-                streaming,
-                ..Default::default()
-            };
-            let report = convert_to_overviews_source(&source, tout.path(), &opts).unwrap();
+                let source = test_memory_source(bytes, "multi.parquet");
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 6,
+                        max_zoom: 6,
+                    },
+                    bbox: Some([9.0, 9.0, 11.0, 11.0]),
+                    ..Default::default()
+                };
+                let report = convert_to_overviews_source(&source, tout.path(), &opts).unwrap();
 
-            assert_eq!(report.row_groups_total, 4);
-            assert_eq!(report.row_groups_read, 1, "bbox pruning must fire");
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![1], "only the (10,10) feature survives");
+                assert_eq!(report.row_groups_total, 4);
+                assert_eq!(report.row_groups_read, 1, "bbox pruning must fire");
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![1], "only the (10,10) feature survives");
 
-            // No fetched range may touch a pruned row group's data pages.
-            let fetched = source.fetched_ranges().unwrap();
-            assert!(!fetched.is_empty());
-            for (i, span) in spans.iter().enumerate() {
-                if i == 1 {
-                    continue;
+                // No fetched range may touch a pruned row group's data pages.
+                let fetched = source.fetched_ranges().unwrap();
+                assert!(!fetched.is_empty());
+                for (i, span) in spans.iter().enumerate() {
+                    if i == 1 {
+                        continue;
+                    }
+                    for r in &fetched {
+                        assert!(
+                            r.end <= span.start || r.start >= span.end,
+                            "fetched range {r:?} overlaps PRUNED row group {i} ({span:?})"
+                        );
+                    }
                 }
-                for r in &fetched {
-                    assert!(
-                        r.end <= span.start || r.start >= span.end,
-                        "fetched range {r:?} overlaps PRUNED row group {i} ({span:?})"
-                    );
-                }
-            }
-            // ... while the selected row group's data pages WERE fetched.
-            assert!(
-                fetched
-                    .iter()
-                    .any(|r| r.start >= spans[1].start && r.end <= spans[1].end),
-                "selected row group 1 ({:?}) never fetched: {fetched:?}",
-                spans[1]
-            );
+                // ... while the selected row group's data pages WERE fetched.
+                assert!(
+                    fetched
+                        .iter()
+                        .any(|r| r.start >= spans[1].start && r.end <= spans[1].end),
+                    "selected row group 1 ({:?}) never fetched: {fetched:?}",
+                    spans[1]
+                );
 
-            // And the report carries the savings.
-            let stats = report.remote_fetch.expect("remote stats in report");
-            assert!(stats.requests as usize >= fetched.len());
-            assert!(
-                stats.bytes_fetched < stats.object_size,
-                "bbox extract must move fewer bytes than the object: {stats:?}"
-            );
+                // And the report carries the savings.
+                let stats = report.remote_fetch.expect("remote stats in report");
+                assert!(stats.requests as usize >= fetched.len());
+                assert!(
+                    stats.bytes_fetched < stats.object_size,
+                    "bbox extract must move fewer bytes than the object: {stats:?}"
+                );
+            });
         }
 
         #[test]
@@ -14876,61 +14575,62 @@ mod tests {
     /// Convert `tiny_polygons` over z0..z4 and assert the pyramid is clamped
     /// to the canonical level, with the skipped planned levels recorded.
     fn assert_clamped_pyramid(mode: Mode, streaming: bool) {
-        let geoms = tiny_polygons(20);
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &geoms, false, None);
+        super::super::source::with_eager_input(!streaming, || {
+            let geoms = tiny_polygons(20);
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            write_input(tin.path(), &geoms, false, None);
 
-        let opts = ConvertOptions {
-            mode,
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 0,
-                max_zoom: 4,
-            },
-            streaming,
-            ..Default::default()
-        };
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+            let opts = ConvertOptions {
+                mode,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 4,
+                },
+                ..Default::default()
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
 
-        // Only the canonical level survives; the pyramid clamps to it.
-        assert_eq!(report.levels.len(), 1, "expected a single written level");
-        assert_eq!(report.levels[0].level, 0);
-        assert_eq!(report.levels[0].zoom, Some(4));
-        assert_eq!(report.levels[0].feature_count, geoms.len());
-        assert_eq!(report.total_rows, geoms.len());
+            // Only the canonical level survives; the pyramid clamps to it.
+            assert_eq!(report.levels.len(), 1, "expected a single written level");
+            assert_eq!(report.levels[0].level, 0);
+            assert_eq!(report.levels[0].zoom, Some(4));
+            assert_eq!(report.levels[0].feature_count, geoms.len());
+            assert_eq!(report.total_rows, geoms.len());
 
-        // The skipped planned levels are recorded coarse→fine with their
-        // planned zoom and a positive GSD.
-        let skipped: Vec<(usize, Option<u8>)> = report
-            .skipped_empty_levels
-            .iter()
-            .map(|s| (s.planned_level, s.zoom))
-            .collect();
-        assert_eq!(
-            skipped,
-            vec![(0, Some(0)), (1, Some(1)), (2, Some(2)), (3, Some(3))]
-        );
-        assert!(report.skipped_empty_levels.iter().all(|s| s.gsd > 0.0));
+            // The skipped planned levels are recorded coarse→fine with their
+            // planned zoom and a positive GSD.
+            let skipped: Vec<(usize, Option<u8>)> = report
+                .skipped_empty_levels
+                .iter()
+                .map(|s| (s.planned_level, s.zoom))
+                .collect();
+            assert_eq!(
+                skipped,
+                vec![(0, Some(0)), (1, Some(1)), (2, Some(2)), (3, Some(3))]
+            );
+            assert!(report.skipped_empty_levels.iter().all(|s| s.gsd > 0.0));
 
-        // The clamped file is valid, readable, and exportable: the PMTiles
-        // header starts at the clamped (canonical) zoom.
-        let vr = validate_file(tout.path()).unwrap();
-        assert!(
-            vr.is_valid(),
-            "failures: {:?}",
-            vr.failures().collect::<Vec<_>>()
-        );
-        let reader = OverviewReader::open(tout.path()).unwrap();
-        assert_eq!(reader.num_levels(), 1);
-        let tpm = tempfile::NamedTempFile::new().unwrap();
-        let export = crate::overview::export::export_pmtiles(
-            tout.path(),
-            tpm.path(),
-            &crate::overview::export::ExportOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(export.min_zoom, 4);
-        assert_eq!(export.max_zoom, 4);
+            // The clamped file is valid, readable, and exportable: the PMTiles
+            // header starts at the clamped (canonical) zoom.
+            let vr = validate_file(tout.path()).unwrap();
+            assert!(
+                vr.is_valid(),
+                "failures: {:?}",
+                vr.failures().collect::<Vec<_>>()
+            );
+            let reader = OverviewReader::open(tout.path()).unwrap();
+            assert_eq!(reader.num_levels(), 1);
+            let tpm = tempfile::NamedTempFile::new().unwrap();
+            let export = crate::overview::export::export_pmtiles(
+                tout.path(),
+                tpm.path(),
+                &crate::overview::export::ExportOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(export.min_zoom, 4);
+            assert_eq!(export.max_zoom, 4);
+        });
     }
 
     #[test]
@@ -14958,23 +14658,24 @@ mod tests {
     #[test]
     fn all_levels_empty_is_hard_error() {
         for streaming in [false, true] {
-            let tin = tempfile::NamedTempFile::new().unwrap();
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            write_input(tin.path(), &[], false, None);
-            let opts = ConvertOptions {
-                mode: Mode::Duplicating,
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 0,
-                    max_zoom: 3,
-                },
-                streaming,
-                ..Default::default()
-            };
-            let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
-            assert!(
-                matches!(err, ConvertError::NoData),
-                "streaming={streaming}: expected NoData, got {err:?}"
-            );
+            super::super::source::with_eager_input(!streaming, || {
+                let tin = tempfile::NamedTempFile::new().unwrap();
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                write_input(tin.path(), &[], false, None);
+                let opts = ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 0,
+                        max_zoom: 3,
+                    },
+                    ..Default::default()
+                };
+                let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
+                assert!(
+                    matches!(err, ConvertError::NoData),
+                    "streaming={streaming}: expected NoData, got {err:?}"
+                );
+            });
         }
     }
 
@@ -15018,7 +14719,6 @@ mod tests {
                 min_zoom: 0,
                 max_zoom: 3,
             },
-            streaming: true,
             ..Default::default()
         };
         let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();

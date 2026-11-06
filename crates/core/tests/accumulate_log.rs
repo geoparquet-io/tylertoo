@@ -55,7 +55,7 @@ fn fields() -> Vec<Option<Geometry<f64>>> {
     out
 }
 
-fn convert_at(factor: f64, streaming: bool, gsd_base: f64) {
+fn convert_at(factor: f64, gsd_base: f64) {
     let tin = tempfile::NamedTempFile::new().unwrap();
     testutil::write_input(tin.path(), &fields(), true, None);
     let tout = tempfile::NamedTempFile::new().unwrap();
@@ -69,7 +69,6 @@ fn convert_at(factor: f64, streaming: bool, gsd_base: f64) {
             collapse: CollapseMode::Square,
             ..SimplifyOptions::default()
         },
-        streaming,
         gsd_base,
         ..Default::default()
     };
@@ -86,33 +85,27 @@ fn accumulator_logs_only_the_floored_zooms() {
     log::set_logger(&Capture).expect("the only logger in this binary");
     log::set_max_level(log::LevelFilter::Info);
 
-    for streaming in [true, false] {
-        for factor in [0.0, 0.1, 1.0] {
-            LINES.lock().unwrap().clear();
-            convert_at(factor, streaming, 512.0);
-            let lines = LINES.lock().unwrap().clone();
-            assert!(
-                !lines
-                    .iter()
-                    .any(|l| l.contains("accumulator off")
-                        || l.contains("narrower than one tile unit")),
-                "streaming={streaming} factor={factor}: {lines:#?}"
-            );
-        }
-
+    for factor in [0.0, 0.1, 1.0] {
         LINES.lock().unwrap().clear();
-        convert_at(1.0, streaming, 8192.0);
+        convert_at(factor, 512.0);
         let lines = LINES.lock().unwrap().clone();
-        let floored: Vec<&String> = lines
-            .iter()
-            .filter(|l| l.contains("narrower than one tile unit"))
-            .collect();
-        assert_eq!(floored.len(), 1, "streaming={streaming}: {lines:#?}");
-        // Levels z8..z11 accumulate (z12 is canonical) and all are floored.
         assert!(
-            floored[0].contains("z8, z9, z10, z11"),
-            "streaming={streaming}: {}",
-            floored[0]
+            !lines
+                .iter()
+                .any(|l| l.contains("accumulator off")
+                    || l.contains("narrower than one tile unit")),
+            "factor={factor}: {lines:#?}"
         );
     }
+
+    LINES.lock().unwrap().clear();
+    convert_at(1.0, 8192.0);
+    let lines = LINES.lock().unwrap().clone();
+    let floored: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("narrower than one tile unit"))
+        .collect();
+    assert_eq!(floored.len(), 1, "{lines:#?}");
+    // Levels z8..z11 accumulate (z12 is canonical) and all are floored.
+    assert!(floored[0].contains("z8, z9, z10, z11"), "{}", floored[0]);
 }

@@ -194,10 +194,9 @@ impl TilesShard {
 
     /// Every convert-side consequence of a tile-building job (#498/#541):
     /// [`TilesShard::apply_selection`] plus, for the coarse job of a
-    /// streaming zoom-plan run, the build ceiling just below the pivot
-    /// (#541: pass 1 and the level assignment stay full-range, so any saved
-    /// plan is byte-identical to a full run's; `--no-streaming` builds every
-    /// level and the export ceiling alone bounds the tiles).
+    /// zoom-plan run, the build ceiling just below the pivot (#541: pass 1
+    /// and the level assignment stay full-range, so any saved plan is
+    /// byte-identical to a full run's).
     ///
     /// `keep_finest_level` skips that ceiling: the coverage fill (#771)
     /// draws each coarse tile from the finest level, so a coarse job that
@@ -211,7 +210,6 @@ impl TilesShard {
         if self.range.is_none()
             && !keep_finest_level
             && matches!(convert.levels, LevelPlan::ZoomRange { .. })
-            && convert.streaming
         {
             convert.zoom_ceiling = Some(self.pivot_zoom.saturating_sub(1));
         }
@@ -1533,7 +1531,6 @@ mod tests {
             },
             ..ConvertOptions::default()
         };
-        assert!(convert.streaming, "the ceiling is streaming-only");
 
         let coarse = TilesShard {
             role: ShardRole::Coarse,

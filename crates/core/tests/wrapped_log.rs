@@ -33,7 +33,7 @@ impl log::Log for Capture {
 }
 
 /// The info lines a conversion of `input` logs about wrapped features.
-fn wrapped_lines(input: &Path, streaming: bool) -> Vec<String> {
+fn wrapped_lines(input: &Path) -> Vec<String> {
     LINES.lock().unwrap().clear();
     let tout = tempfile::NamedTempFile::new().unwrap();
     let o = ConvertOptions {
@@ -41,11 +41,9 @@ fn wrapped_lines(input: &Path, streaming: bool) -> Vec<String> {
             min_zoom: 2,
             max_zoom: 6,
         },
-        streaming,
         ..Default::default()
     };
-    convert_to_overviews(input, tout.path(), &o)
-        .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+    convert_to_overviews(input, tout.path(), &o).unwrap_or_else(|e| panic!("{e}"));
     LINES
         .lock()
         .unwrap()
@@ -69,16 +67,14 @@ fn wrapped_features_get_one_info_line_naming_the_row() {
         .collect();
     testutil::write_input(in_range.path(), &points, true, None);
 
-    for streaming in [true, false] {
-        let lines = wrapped_lines(&dateline, streaming);
-        assert_eq!(lines.len(), 1, "streaming={streaming}: {lines:#?}");
-        assert!(
-            lines[0].contains("1 of 10 feature(s)") && lines[0].contains("lon 190.250 (row 7)"),
-            "streaming={streaming}: {}",
-            lines[0]
-        );
+    let lines = wrapped_lines(&dateline);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(
+        lines[0].contains("1 of 10 feature(s)") && lines[0].contains("lon 190.250 (row 7)"),
+        "{}",
+        lines[0]
+    );
 
-        let lines = wrapped_lines(in_range.path(), streaming);
-        assert!(lines.is_empty(), "streaming={streaming}: {lines:#?}");
-    }
+    let lines = wrapped_lines(in_range.path());
+    assert!(lines.is_empty(), "{lines:#?}");
 }

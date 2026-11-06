@@ -7,9 +7,8 @@
 //!
 //! Moved here from `crates/core/src/overview/hostile.rs` (#457): the suite
 //! only ever drove the pipeline through its public API (`convert_to_overviews`,
-//! `export_pmtiles`, `OverviewReader`, ...) with real parquet I/O, each case
-//! run through both the in-memory and streaming engines -- exactly the kind
-//! of full-pipeline test that used to make `cargo test --lib` a trap. As a
+//! `export_pmtiles`, `OverviewReader`, ...) with real parquet I/O -- exactly
+//! the kind of full-pipeline test that used to make `cargo test --lib` a trap. As a
 //! `tests/*.rs` integration binary it no longer runs under `--lib`. It is
 //! fast (tiny synthetic fixtures), so it runs in nextest's `quick` profile
 //! and therefore also `full` (see `.config/nextest.toml`), and under plain
@@ -77,15 +76,13 @@ fn spread_points(n: usize) -> Vec<Option<Geometry<f64>>> {
         .collect()
 }
 
-/// Default duplicating conversion options over a modest zoom range, with the
-/// given streaming flag.
-fn opts(streaming: bool) -> ConvertOptions {
+/// Default duplicating conversion options over a modest zoom range.
+fn opts() -> ConvertOptions {
     ConvertOptions {
         levels: LevelPlan::ZoomRange {
             min_zoom: 2,
             max_zoom: 6,
         },
-        streaming,
         ..Default::default()
     }
 }
@@ -170,7 +167,7 @@ fn rewrite_with_tampered_footer(src: &Path, dst: &Path, edit: impl FnOnce(&mut s
 fn make_valid_overview(out: &Path) {
     let tin = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &spread_points(6), true, None);
-    convert_to_overviews(tin.path(), out, &opts(true)).unwrap();
+    convert_to_overviews(tin.path(), out, &opts()).unwrap();
 }
 
 // ============================================================================
@@ -179,79 +176,72 @@ fn make_valid_overview(out: &Path) {
 
 #[test]
 fn empty_input_zero_rows_errors_nodata() {
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &[], true, None);
-        let err = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap_err();
-        assert!(
-            matches!(err, ConvertError::NoData),
-            "streaming={streaming}: expected NoData, got: {err}"
-        );
-    }
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &[], true, None);
+    let err = convert_to_overviews(tin.path(), tout.path(), &opts()).unwrap_err();
+    assert!(
+        matches!(err, ConvertError::NoData),
+        "expected NoData, got: {err}"
+    );
 }
 
 #[test]
 fn all_null_geometry_errors_nodata() {
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &[None, None, None], true, None);
-        let err = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap_err();
-        assert!(
-            matches!(err, ConvertError::NoData),
-            "streaming={streaming}: expected NoData, got: {err}"
-        );
-    }
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &[None, None, None], true, None);
+    let err = convert_to_overviews(tin.path(), tout.path(), &opts()).unwrap_err();
+    assert!(
+        matches!(err, ConvertError::NoData),
+        "expected NoData, got: {err}"
+    );
 }
 
 #[test]
 fn partial_null_geometry_rows_skipped_with_aligned_attributes() {
     // Null geometry rows interleaved with valid ones must be skipped WITHOUT
     // shifting the attribute<->geometry pairing of the surviving rows.
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let mut geoms = spread_points(5);
-        geoms.insert(1, None); // id 1 null
-        geoms.insert(4, None); // id 4 null
-        write_input(tin.path(), &geoms, true, None);
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let mut geoms = spread_points(5);
+    geoms.insert(1, None); // id 1 null
+    geoms.insert(4, None); // id 4 null
+    write_input(tin.path(), &geoms, true, None);
 
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
-            .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
-        assert_eq!(report.input_features, 5, "streaming={streaming}");
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts())
+        .unwrap_or_else(|e| panic!("conversion failed: {e}"));
+    assert_eq!(report.input_features, 5);
 
-        let vr = validate_file(tout.path()).unwrap();
-        assert!(vr.is_valid(), "streaming={streaming}");
+    let vr = validate_file(tout.path()).unwrap();
+    assert!(vr.is_valid());
 
-        // Canonical level: exactly the 5 non-null rows, each id paired with
-        // ITS OWN geometry (regression: misalignment pairs id with the next
-        // non-null row's geometry).
-        let reader = OverviewReader::open(tout.path()).unwrap();
-        let canonical = reader.num_levels() - 1;
-        let rows = read_level_ids_geoms(tout.path(), canonical);
-        let expected_ids: Vec<i64> = vec![0, 2, 3, 5, 6];
-        assert_eq!(
-            rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            expected_ids,
-            "streaming={streaming}"
-        );
-        for (id, g) in &rows {
-            let Geometry::Point(p) = g else {
-                panic!("expected point");
-            };
-            // Original spread_points index for this id (nulls at 1 and 4).
-            let orig = match id {
-                0 => 0,
-                2 => 1,
-                3 => 2,
-                5 => 3,
-                6 => 4,
-                _ => unreachable!(),
-            };
-            let expected = Point::new(-60.0 + orig as f64 * 20.0, -30.0 + orig as f64 * 12.0);
-            assert_eq!(p, &expected, "streaming={streaming}: id {id}");
-        }
+    // Canonical level: exactly the 5 non-null rows, each id paired with
+    // ITS OWN geometry (regression: misalignment pairs id with the next
+    // non-null row's geometry).
+    let reader = OverviewReader::open(tout.path()).unwrap();
+    let canonical = reader.num_levels() - 1;
+    let rows = read_level_ids_geoms(tout.path(), canonical);
+    let expected_ids: Vec<i64> = vec![0, 2, 3, 5, 6];
+    assert_eq!(
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        expected_ids
+    );
+    for (id, g) in &rows {
+        let Geometry::Point(p) = g else {
+            panic!("expected point");
+        };
+        // Original spread_points index for this id (nulls at 1 and 4).
+        let orig = match id {
+            0 => 0,
+            2 => 1,
+            3 => 2,
+            5 => 3,
+            6 => 4,
+            _ => unreachable!(),
+        };
+        let expected = Point::new(-60.0 + orig as f64 * 20.0, -30.0 + orig as f64 * 12.0);
+        assert_eq!(p, &expected, "id {id}");
     }
 }
 
@@ -349,45 +339,42 @@ fn export_counts_a_non_finite_overview_vertex() {
 fn nonfinite_coordinate_rows_skipped() {
     // NaN / infinite coordinates cannot be placed on any grid: those rows are
     // skipped like nulls instead of silently landing in cell (0, 0).
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let mut geoms = spread_points(4);
-        geoms.push(Some(Geometry::Point(Point::new(f64::NAN, 1.0))));
-        geoms.push(Some(Geometry::Point(Point::new(2.0, f64::INFINITY))));
-        // WITH bbox covering (#428): the non-finite rows poison the generated
-        // bbox columns — the `+inf` y reaches the ymax statistic verbatim.
-        // Paired with a `--bbox` below so the row-group selector actually
-        // runs over those statistics: an infinite bound must be compared, not
-        // treated as a reason to prune, or the four good rows vanish with it.
-        write_input(tin.path(), &geoms, true, None);
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let mut geoms = spread_points(4);
+    geoms.push(Some(Geometry::Point(Point::new(f64::NAN, 1.0))));
+    geoms.push(Some(Geometry::Point(Point::new(2.0, f64::INFINITY))));
+    // WITH bbox covering (#428): the non-finite rows poison the generated
+    // bbox columns — the `+inf` y reaches the ymax statistic verbatim.
+    // Paired with a `--bbox` below so the row-group selector actually
+    // runs over those statistics: an infinite bound must be compared, not
+    // treated as a reason to prune, or the four good rows vanish with it.
+    write_input(tin.path(), &geoms, true, None);
 
-        // Comfortably around the four good points at (-60,-30)..(0,6).
-        let o = ConvertOptions {
-            bbox: Some([-70.0, -40.0, 10.0, 20.0]),
-            ..opts(streaming)
+    // Comfortably around the four good points at (-60,-30)..(0,6).
+    let o = ConvertOptions {
+        bbox: Some([-70.0, -40.0, 10.0, 20.0]),
+        ..opts()
+    };
+    let report = convert_to_overviews(tin.path(), tout.path(), &o)
+        .unwrap_or_else(|e| panic!("conversion failed: {e}"));
+    assert_eq!(report.input_features, 4);
+
+    let reader = OverviewReader::open(tout.path()).unwrap();
+    let canonical = reader.num_levels() - 1;
+    let rows = read_level_ids_geoms(tout.path(), canonical);
+    assert_eq!(
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    for (_, g) in &rows {
+        let Geometry::Point(p) = g else {
+            panic!("expected point")
         };
-        let report = convert_to_overviews(tin.path(), tout.path(), &o)
-            .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
-        assert_eq!(report.input_features, 4, "streaming={streaming}");
-
-        let reader = OverviewReader::open(tout.path()).unwrap();
-        let canonical = reader.num_levels() - 1;
-        let rows = read_level_ids_geoms(tout.path(), canonical);
-        assert_eq!(
-            rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            vec![0, 1, 2, 3],
-            "streaming={streaming}"
+        assert!(
+            p.x().is_finite() && p.y().is_finite(),
+            "non-finite geometry leaked into output"
         );
-        for (_, g) in &rows {
-            let Geometry::Point(p) = g else {
-                panic!("expected point")
-            };
-            assert!(
-                p.x().is_finite() && p.y().is_finite(),
-                "streaming={streaming}: non-finite geometry leaked into output"
-            );
-        }
     }
 }
 
@@ -395,25 +382,22 @@ fn nonfinite_coordinate_rows_skipped() {
 fn empty_coordinate_geometries_skipped() {
     // A LineString with zero coordinates has no spatial content; it is
     // skipped like a null rather than parked at a fabricated [0,0,0,0] bbox.
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let mut geoms = spread_points(3);
-        geoms.push(Some(Geometry::LineString(LineString::new(vec![]))));
-        write_input(tin.path(), &geoms, false, None);
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let mut geoms = spread_points(3);
+    geoms.push(Some(Geometry::LineString(LineString::new(vec![]))));
+    write_input(tin.path(), &geoms, false, None);
 
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
-            .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
-        assert_eq!(report.input_features, 3, "streaming={streaming}");
-        let reader = OverviewReader::open(tout.path()).unwrap();
-        let canonical = reader.num_levels() - 1;
-        let rows = read_level_ids_geoms(tout.path(), canonical);
-        assert_eq!(
-            rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            vec![0, 1, 2],
-            "streaming={streaming}"
-        );
-    }
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts())
+        .unwrap_or_else(|e| panic!("conversion failed: {e}"));
+    assert_eq!(report.input_features, 3);
+    let reader = OverviewReader::open(tout.path()).unwrap();
+    let canonical = reader.num_levels() - 1;
+    let rows = read_level_ids_geoms(tout.path(), canonical);
+    assert_eq!(
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
 }
 
 /// Hand-built GeoParquet whose WKB geometry column holds `values` verbatim,
@@ -468,13 +452,8 @@ fn empty_wkb_value_errors_typed() {
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_wkb_input(tin.path(), &[b""]);
 
-    for streaming in [true, false] {
-        let result = convert_to_overviews(tin.path(), tout.path(), &opts(streaming));
-        assert!(
-            result.is_err(),
-            "streaming={streaming}: empty WKB must error"
-        );
-    }
+    let result = convert_to_overviews(tin.path(), tout.path(), &opts());
+    assert!(result.is_err(), "empty WKB must error");
 }
 
 /// Little-endian WKB point.
@@ -523,22 +502,20 @@ fn hostile_wkb_values_error_instead_of_aborting() {
         let tin = tempfile::NamedTempFile::new().unwrap();
         let tout = tempfile::NamedTempFile::new().unwrap();
         write_wkb_input(tin.path(), &[&good, &bad, &good]);
-        for streaming in [true, false] {
-            let err = match convert_to_overviews(tin.path(), tout.path(), &opts(streaming)) {
-                Err(e) => e.to_string(),
-                Ok(_) => panic!("{name}, streaming={streaming}: must fail"),
-            };
-            assert!(
-                err.contains(expect) && err.contains("Invalid geometry at index 1"),
-                "{name}, streaming={streaming}: {err}"
-            );
-        }
+        let err = match convert_to_overviews(tin.path(), tout.path(), &opts()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("{name}: must fail"),
+        };
+        assert!(
+            err.contains(expect) && err.contains("Invalid geometry at index 1"),
+            "{name}: {err}"
+        );
     }
 }
 
 /// #632: a second WKB geometry column is passed through to the output, where
 /// the geoparquet encoder reads it with the `wkb` crate. A hostile value there
-/// must fail the conversion with an error naming the column, in both engines
+/// must fail the conversion with an error naming the column
 /// and on both the parallel and the single-threaded encode paths.
 #[test]
 fn hostile_wkb_in_a_second_geometry_column_errors() {
@@ -555,26 +532,23 @@ fn hostile_wkb_in_a_second_geometry_column_errors() {
                 .num_threads(threads)
                 .build()
                 .unwrap();
-            for streaming in [true, false] {
-                let tout = tempfile::NamedTempFile::new().unwrap();
-                let result = pool
-                    .install(|| convert_to_overviews(tin.path(), tout.path(), &opts(streaming)));
-                let err = match result {
-                    Err(e) => e.to_string(),
-                    Ok(_) => panic!("{name}, threads={threads}, streaming={streaming}: must fail"),
-                };
-                assert!(
-                    err.contains(expect) && err.contains(r#"column "centroid""#),
-                    "{name}, threads={threads}, streaming={streaming}: {err}"
-                );
-            }
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let result = pool.install(|| convert_to_overviews(tin.path(), tout.path(), &opts()));
+            let err = match result {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{name}, threads={threads}: must fail"),
+            };
+            assert!(
+                err.contains(expect) && err.contains(r#"column "centroid""#),
+                "{name}, threads={threads}: {err}"
+            );
         }
     }
 }
 
 /// A collection nested inside a collection with more than one member cannot
 /// be stored in a GeoArrow mixed-geometry array as is; it is flattened into
-/// its parent, so it converts and exports in both engines rather than
+/// its parent, so it converts and exports rather than
 /// panicking the array builder.
 #[test]
 fn nested_multi_member_collection_converts() {
@@ -602,15 +576,12 @@ fn nested_multi_member_collection_converts() {
     let good = wkb_point(10.0, 10.0);
     let tin = tempfile::NamedTempFile::new().unwrap();
     write_wkb_input(tin.path(), &[&good, &nested, &good]);
-    for streaming in [true, false] {
-        let tov = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(tin.path(), tov.path(), &opts(streaming))
-            .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
-        let report = export_pmtiles(tov.path(), tout.path(), &ExportOptions::default())
-            .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
-        assert!(report.total_tiles > 0, "streaming={streaming}");
-    }
+    let tov = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    convert_to_overviews(tin.path(), tov.path(), &opts()).unwrap_or_else(|e| panic!("{e}"));
+    let report = export_pmtiles(tov.path(), tout.path(), &ExportOptions::default())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(report.total_tiles > 0);
 }
 
 /// #632's nesting cap is 100 levels: a point inside exactly 100 nested
@@ -625,15 +596,12 @@ fn wkb_at_the_nesting_cap_converts() {
     let good = wkb_point(10.0, 10.0);
     let tin = tempfile::NamedTempFile::new().unwrap();
     write_wkb_input(tin.path(), &[&good, &nested, &good]);
-    for streaming in [true, false] {
-        let tov = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(tin.path(), tov.path(), &opts(streaming))
-            .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
-        let report = export_pmtiles(tov.path(), tout.path(), &ExportOptions::default())
-            .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
-        assert!(report.total_tiles > 0, "streaming={streaming}");
-    }
+    let tov = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    convert_to_overviews(tin.path(), tov.path(), &opts()).unwrap_or_else(|e| panic!("{e}"));
+    let report = export_pmtiles(tov.path(), tout.path(), &ExportOptions::default())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(report.total_tiles > 0);
 }
 
 #[test]
@@ -656,7 +624,7 @@ fn self_intersecting_polygon_converts() {
     geoms.push(Some(Geometry::Polygon(bowtie)));
     write_input(tin.path(), &geoms, true, None);
 
-    let report = convert_to_overviews(tin.path(), tout.path(), &opts(true)).unwrap();
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts()).unwrap();
     assert_eq!(report.input_features, 4);
     let vr = validate_file(tout.path()).unwrap();
     assert!(vr.is_valid());
@@ -678,19 +646,17 @@ fn geometry_collection_passes_through() {
     geoms.push(Some(Geometry::GeometryCollection(gc)));
     write_input(tin.path(), &geoms, true, None);
 
-    for streaming in [true, false] {
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
-            .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
-        assert_eq!(report.input_features, 4, "streaming={streaming}");
-        let reader = OverviewReader::open(tout.path()).unwrap();
-        let canonical = reader.num_levels() - 1;
-        let rows = read_level_ids_geoms(tout.path(), canonical);
-        assert!(
-            rows.iter()
-                .any(|(_, g)| matches!(g, Geometry::GeometryCollection(_))),
-            "streaming={streaming}: GeometryCollection lost from canonical level"
-        );
-    }
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts())
+        .unwrap_or_else(|e| panic!("conversion failed: {e}"));
+    assert_eq!(report.input_features, 4);
+    let reader = OverviewReader::open(tout.path()).unwrap();
+    let canonical = reader.num_levels() - 1;
+    let rows = read_level_ids_geoms(tout.path(), canonical);
+    assert!(
+        rows.iter()
+            .any(|(_, g)| matches!(g, Geometry::GeometryCollection(_))),
+        "GeometryCollection lost from canonical level"
+    );
 }
 
 /// #431: a GeometryCollection must not vanish at MVT encode. It survives
@@ -719,67 +685,64 @@ fn geometry_collection_parts_reach_the_tiles() {
     geoms.push(Some(Geometry::GeometryCollection(gc)));
     let gc_id = 3i64;
 
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tov = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &geoms, true, None);
-        convert_to_overviews(tin.path(), tov.path(), &opts(streaming)).unwrap();
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tov = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &geoms, true, None);
+    convert_to_overviews(tin.path(), tov.path(), &opts()).unwrap();
 
-        let report = export_pmtiles(tov.path(), tout.path(), &ExportOptions::default())
-            .unwrap_or_else(|e| panic!("streaming={streaming}: export failed: {e}"));
-        assert_eq!(
-            report.encode_dropped_features, 0,
-            "streaming={streaming}: nothing may be dropped at encode: {report:?}"
-        );
-        assert!(report.zooms.iter().all(|z| z.encode_dropped_features == 0));
+    let report = export_pmtiles(tov.path(), tout.path(), &ExportOptions::default())
+        .unwrap_or_else(|e| panic!("export failed: {e}"));
+    assert_eq!(
+        report.encode_dropped_features, 0,
+        "nothing may be dropped at encode: {report:?}"
+    );
+    assert!(report.zooms.iter().all(|z| z.encode_dropped_features == 0));
 
-        // Decode the archive and look for every part of the collection at
-        // the canonical zoom under the collection's own id.
-        let dec = tempfile::NamedTempFile::new().unwrap();
-        decode_pmtiles(tout.path(), dec.path(), &DecodeOptions::default()).unwrap();
-        let rows = read_decoded_rows(dec.path());
-        let canonical = report.max_zoom;
-        let parts: Vec<&Geometry<f64>> = rows
-            .iter()
-            .filter(|(z, id, _)| *z == canonical && *id == Some(gc_id))
-            .map(|(_, _, g)| g)
-            .collect();
-        let kinds = [
-            (
-                "point",
-                parts
-                    .iter()
-                    .any(|g| matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_))),
-            ),
-            (
-                "line",
-                parts
-                    .iter()
-                    .any(|g| matches!(g, Geometry::LineString(_) | Geometry::MultiLineString(_))),
-            ),
-            (
-                "polygon",
-                parts
-                    .iter()
-                    .any(|g| matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_))),
-            ),
-        ];
-        for (kind, present) in kinds {
-            assert!(
-                present,
-                "streaming={streaming}: the collection's {kind} part is missing from z{canonical} \
-                 tiles; decoded parts for id {gc_id}: {parts:?}"
-            );
-        }
-        // The plain points are untouched by the split.
+    // Decode the archive and look for every part of the collection at
+    // the canonical zoom under the collection's own id.
+    let dec = tempfile::NamedTempFile::new().unwrap();
+    decode_pmtiles(tout.path(), dec.path(), &DecodeOptions::default()).unwrap();
+    let rows = read_decoded_rows(dec.path());
+    let canonical = report.max_zoom;
+    let parts: Vec<&Geometry<f64>> = rows
+        .iter()
+        .filter(|(z, id, _)| *z == canonical && *id == Some(gc_id))
+        .map(|(_, _, g)| g)
+        .collect();
+    let kinds = [
+        (
+            "point",
+            parts
+                .iter()
+                .any(|g| matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_))),
+        ),
+        (
+            "line",
+            parts
+                .iter()
+                .any(|g| matches!(g, Geometry::LineString(_) | Geometry::MultiLineString(_))),
+        ),
+        (
+            "polygon",
+            parts
+                .iter()
+                .any(|g| matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_))),
+        ),
+    ];
+    for (kind, present) in kinds {
         assert!(
-            rows.iter().any(|(z, id, g)| *z == canonical
-                && *id == Some(0)
-                && matches!(g, Geometry::Point(_))),
-            "streaming={streaming}: plain point feature 0 must still be tiled"
+            present,
+            "the collection's {kind} part is missing from z{canonical} \
+             tiles; decoded parts for id {gc_id}: {parts:?}"
         );
     }
+    // The plain points are untouched by the split.
+    assert!(
+        rows.iter()
+            .any(|(z, id, g)| *z == canonical && *id == Some(0) && matches!(g, Geometry::Point(_))),
+        "plain point feature 0 must still be tiled"
+    );
 }
 
 /// #431 review: a routine polygon export must not warn. Buildings clipped to
@@ -878,7 +841,7 @@ fn antimeridian_and_pole_features_convert() {
     ];
     write_input(tin.path(), &geoms, true, None);
 
-    let report = convert_to_overviews(tin.path(), tout.path(), &opts(true)).unwrap();
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts()).unwrap();
     assert_eq!(report.input_features, 5);
     let vr = validate_file(tout.path()).unwrap();
     assert!(
@@ -901,21 +864,15 @@ fn single_point_dataset_converts() {
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &spread_points(1), true, None);
 
-    for streaming in [true, false] {
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
-            .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
-        assert_eq!(report.input_features, 1, "streaming={streaming}");
-        let vr = validate_file(tout.path()).unwrap();
-        assert!(vr.is_valid(), "streaming={streaming}");
-        // The single point survives at every emitted level.
-        let reader = OverviewReader::open(tout.path()).unwrap();
-        for l in 0..reader.num_levels() {
-            assert_eq!(
-                read_level_ids_geoms(tout.path(), l).len(),
-                1,
-                "streaming={streaming} level={l}"
-            );
-        }
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts())
+        .unwrap_or_else(|e| panic!("conversion failed: {e}"));
+    assert_eq!(report.input_features, 1);
+    let vr = validate_file(tout.path()).unwrap();
+    assert!(vr.is_valid());
+    // The single point survives at every emitted level.
+    let reader = OverviewReader::open(tout.path()).unwrap();
+    for l in 0..reader.num_levels() {
+        assert_eq!(read_level_ids_geoms(tout.path(), l).len(), 1, "level={l}");
     }
 }
 
@@ -928,7 +885,7 @@ fn all_identical_geometries_convert() {
         .collect();
     write_input(tin.path(), &geoms, true, None);
 
-    let report = convert_to_overviews(tin.path(), tout.path(), &opts(true)).unwrap();
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts()).unwrap();
     assert_eq!(report.input_features, 10);
     let vr = validate_file(tout.path()).unwrap();
     assert!(vr.is_valid());
@@ -1069,7 +1026,7 @@ fn gsd_base_extremes_rejected() {
     for bad in [0.0, -1024.0, f64::NAN, f64::INFINITY] {
         let o = ConvertOptions {
             gsd_base: bad,
-            ..opts(true)
+            ..opts()
         };
         let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
         assert!(
@@ -1094,7 +1051,7 @@ fn thinning_negative_nan_rejected() {
     write_input(tin.path(), &spread_points(3), true, None);
     for bad in [-4.0, f64::NAN, f64::INFINITY] {
         for knob in 0..3 {
-            let mut o = opts(true);
+            let mut o = opts();
             match knob {
                 0 => o.assign.point_thinning = bad,
                 1 => o.assign.line_thinning = bad,
@@ -1110,7 +1067,7 @@ fn thinning_negative_nan_rejected() {
 
     // Every kind's factor accepts 0 individually, not just via --verbatim.
     for knob in 0..3 {
-        let mut o = opts(true);
+        let mut o = opts();
         match knob {
             0 => o.assign.point_thinning = 0.0,
             1 => o.assign.line_thinning = 0.0,
@@ -1128,7 +1085,7 @@ fn visibility_negative_nan_rejected() {
     write_input(tin.path(), &spread_points(3), true, None);
     for bad in [-2.0, f64::NAN, f64::INFINITY] {
         for knob in 0..2 {
-            let mut o = opts(true);
+            let mut o = opts();
             match knob {
                 0 => o.assign.line_visibility = bad,
                 _ => o.assign.polygon_visibility = bad,
@@ -1149,14 +1106,14 @@ fn coalesce_nan_knobs_rejected() {
     write_input(tin.path(), &spread_points(3), true, None);
     let o = ConvertOptions {
         coalesce_snap: f64::NAN,
-        ..opts(true)
+        ..opts()
     };
     let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
     assert!(matches!(err, ConvertError::InvalidConfig(_)), "got: {err}");
 
     let o = ConvertOptions {
         coalesce_junction_angle: f64::NAN,
-        ..opts(true)
+        ..opts()
     };
     let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
     assert!(matches!(err, ConvertError::InvalidConfig(_)), "got: {err}");
@@ -1187,26 +1144,24 @@ fn reserved_columns_auto_renamed_case_insensitive() {
     // three reserved columns, across both pipelines.
 
     // `LEVEL` (any casing) is always reserved.
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &spread_points(3), true, Some("LEVEL"));
-        convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
-            .unwrap_or_else(|e| panic!("streaming={streaming}: expected auto-rename, got {e}"));
-        let names = output_column_names(tout.path());
-        assert_eq!(
-            names
-                .iter()
-                .filter(|n| n.eq_ignore_ascii_case("level"))
-                .count(),
-            1,
-            "streaming={streaming}: one authoritative `level`, names={names:?}"
-        );
-        assert!(
-            names.iter().any(|n| n == "LEVEL_"),
-            "streaming={streaming}: renamed source column present, names={names:?}"
-        );
-    }
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &spread_points(3), true, Some("LEVEL"));
+    convert_to_overviews(tin.path(), tout.path(), &opts())
+        .unwrap_or_else(|e| panic!("expected auto-rename, got {e}"));
+    let names = output_column_names(tout.path());
+    assert_eq!(
+        names
+            .iter()
+            .filter(|n| n.eq_ignore_ascii_case("level"))
+            .count(),
+        1,
+        "one authoritative `level`, names={names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "LEVEL_"),
+        "renamed source column present, names={names:?}"
+    );
 
     // `Point_Count` is renamed when clustering is enabled.
     let tin = tempfile::NamedTempFile::new().unwrap();
@@ -1214,7 +1169,7 @@ fn reserved_columns_auto_renamed_case_insensitive() {
     write_input(tin.path(), &spread_points(3), true, Some("Point_Count"));
     let o = ConvertOptions {
         cluster: true,
-        ..opts(true)
+        ..opts()
     };
     convert_to_overviews(tin.path(), tout.path(), &o).expect("Point_Count auto-renamed");
     let names = output_column_names(tout.path());
@@ -1235,8 +1190,7 @@ fn reserved_columns_auto_renamed_case_insensitive() {
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &spread_points(3), true, Some("COALESCED_COUNT"));
-    convert_to_overviews(tin.path(), tout.path(), &opts(true))
-        .expect("COALESCED_COUNT auto-renamed");
+    convert_to_overviews(tin.path(), tout.path(), &opts()).expect("COALESCED_COUNT auto-renamed");
     let names = output_column_names(tout.path());
     assert!(
         names.iter().any(|n| n == "COALESCED_COUNT_"),
@@ -1255,48 +1209,46 @@ fn reserved_columns_auto_renamed_case_insensitive() {
 /// rendering bug rather than a tiler one.
 #[test]
 fn renamed_source_column_is_restored_in_the_exported_archive() {
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tov = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &spread_points(6), true, Some("level"));
-        convert_to_overviews(tin.path(), tov.path(), &opts(streaming)).unwrap();
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tov = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &spread_points(6), true, Some("level"));
+    convert_to_overviews(tin.path(), tov.path(), &opts()).unwrap();
 
-        // The intermediate file keeps the rename — the collision is real here.
-        let names = output_column_names(tov.path());
-        assert!(
-            names.iter().any(|n| n == "level_") && names.iter().any(|n| n == "level"),
-            "streaming={streaming}: both columns must coexist in the overview \
-             file, names={names:?}"
-        );
+    // The intermediate file keeps the rename — the collision is real here.
+    let names = output_column_names(tov.path());
+    assert!(
+        names.iter().any(|n| n == "level_") && names.iter().any(|n| n == "level"),
+        "both columns must coexist in the overview \
+         file, names={names:?}"
+    );
 
-        // ...and records why, so a later standalone `export-pmtiles` on this
-        // file can restore the name without the converting process's state.
-        let renames = OverviewReader::open(tov.path())
-            .unwrap()
-            .meta()
-            .generalization
-            .as_ref()
-            .and_then(|g| g.renamed_columns.clone())
-            .unwrap_or_else(|| panic!("streaming={streaming}: no rename provenance"));
-        assert_eq!(
-            renames.get("level_").map(String::as_str),
-            Some("level"),
-            "streaming={streaming}: provenance must map output -> source"
-        );
+    // ...and records why, so a later standalone `export-pmtiles` on this
+    // file can restore the name without the converting process's state.
+    let renames = OverviewReader::open(tov.path())
+        .unwrap()
+        .meta()
+        .generalization
+        .as_ref()
+        .and_then(|g| g.renamed_columns.clone())
+        .unwrap_or_else(|| panic!("no rename provenance"));
+    assert_eq!(
+        renames.get("level_").map(String::as_str),
+        Some("level"),
+        "provenance must map output -> source"
+    );
 
-        // The archive advertises the source name, not the internal one.
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        export_pmtiles(tov.path(), tout.path(), &ExportOptions::default()).unwrap();
-        let fields = archive_layer_fields(tout.path());
-        assert!(
-            fields.contains(&"level".to_string()),
-            "streaming={streaming}: the source name must be published, got {fields:?}"
-        );
-        assert!(
-            !fields.contains(&"level_".to_string()),
-            "streaming={streaming}: the internal name must not leak, got {fields:?}"
-        );
-    }
+    // The archive advertises the source name, not the internal one.
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    export_pmtiles(tov.path(), tout.path(), &ExportOptions::default()).unwrap();
+    let fields = archive_layer_fields(tout.path());
+    assert!(
+        fields.contains(&"level".to_string()),
+        "the source name must be published, got {fields:?}"
+    );
+    assert!(
+        !fields.contains(&"level_".to_string()),
+        "the internal name must not leak, got {fields:?}"
+    );
 }
 
 /// The `vector_layers[].fields` keys of a PMTiles archive's JSON metadata.
@@ -1376,39 +1328,36 @@ fn verbatim_keeps_every_feature_at_every_level() {
     const N: usize = 400;
     let cells = cell_aggregate(N);
 
-    for streaming in [true, false] {
-        // Baseline: the default ladder thins the aggregate away at coarse
-        // levels. This is correct for roads and wrong here — it is the
-        // behaviour the flag exists to switch off.
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &cells, true, None);
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap();
-        let laddered: Vec<usize> = report.levels.iter().map(|l| l.feature_count).collect();
-        assert!(
-            laddered.iter().any(|&c| c < N),
-            "streaming={streaming}: the default ladder should thin this \
-             aggregate (that is the bug being fixed), got {laddered:?}"
-        );
+    // Baseline: the default ladder thins the aggregate away at coarse
+    // levels. This is correct for roads and wrong here — it is the
+    // behaviour the flag exists to switch off.
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &cells, true, None);
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts()).unwrap();
+    let laddered: Vec<usize> = report.levels.iter().map(|l| l.feature_count).collect();
+    assert!(
+        laddered.iter().any(|&c| c < N),
+        "the default ladder should thin this \
+         aggregate (that is the bug being fixed), got {laddered:?}"
+    );
 
-        // Verbatim: every level is the whole input.
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &cells, true, None);
-        let report =
-            convert_to_overviews(tin.path(), tout.path(), &opts(streaming).verbatim()).unwrap();
-        let counts: Vec<usize> = report.levels.iter().map(|l| l.feature_count).collect();
-        assert_eq!(
-            counts,
-            vec![N; counts.len()],
-            "streaming={streaming}: every level must carry every cell"
-        );
-        assert!(
-            counts.len() >= 2,
-            "streaming={streaming}: no level may be omitted as empty, got {counts:?}"
-        );
-        validate_file(tout.path()).unwrap();
-    }
+    // Verbatim: every level is the whole input.
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &cells, true, None);
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts().verbatim()).unwrap();
+    let counts: Vec<usize> = report.levels.iter().map(|l| l.feature_count).collect();
+    assert_eq!(
+        counts,
+        vec![N; counts.len()],
+        "every level must carry every cell"
+    );
+    assert!(
+        counts.len() >= 2,
+        "no level may be omitted as empty, got {counts:?}"
+    );
+    validate_file(tout.path()).unwrap();
 }
 
 /// Verbatim must also leave geometry alone: a level that kept every feature
@@ -1419,7 +1368,7 @@ fn verbatim_preserves_vertex_counts_at_every_level() {
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &cells, true, None);
-    let report = convert_to_overviews(tin.path(), tout.path(), &opts(true).verbatim()).unwrap();
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts().verbatim()).unwrap();
 
     let vertices: Vec<usize> = report.levels.iter().map(|l| l.vertex_count).collect();
     assert!(
@@ -1439,7 +1388,7 @@ fn zero_thinning_is_the_off_switch_not_an_error() {
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &cells, true, None);
 
-    let mut o = opts(true);
+    let mut o = opts();
     o.assign.polygon_thinning = 0.0;
     o.assign.polygon_visibility = 0.0;
     o.density.enabled = false;
@@ -1458,10 +1407,10 @@ fn zero_thinning_is_the_off_switch_not_an_error() {
     );
 
     // Still nonsense, still rejected.
-    let mut bad = opts(true);
+    let mut bad = opts();
     bad.assign.polygon_thinning = -1.0;
     assert!(convert_to_overviews(tin.path(), tout.path(), &bad).is_err());
-    let mut nan = opts(true);
+    let mut nan = opts();
     nan.assign.polygon_thinning = f64::NAN;
     assert!(convert_to_overviews(tin.path(), tout.path(), &nan).is_err());
 }
@@ -1474,7 +1423,7 @@ fn verbatim_is_recognizable_and_leaves_other_options_alone() {
         mode: Mode::Duplicating,
         max_row_group_size: 1234,
         cluster: true,
-        ..opts(true)
+        ..opts()
     };
     assert!(!base.clone().is_verbatim());
 
@@ -1561,92 +1510,80 @@ fn level_strong_counts(path: &Path, min_mag: f64) -> Vec<usize> {
 fn entry_zoom_ladder_admits_strong_features_the_gate_drops() {
     use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
-    for streaming in [true, false] {
-        // Control: ranking only. The gate still removes the tiny cores.
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_banded_input(tin.path(), 8);
-        let control = ConvertOptions {
-            sort_key: Some("magnitude".to_string()),
-            ..opts(streaming)
-        };
-        convert_to_overviews(tin.path(), tout.path(), &control).unwrap();
-        let before = level_strong_counts(tout.path(), 5000.0);
+    // Control: ranking only. The gate still removes the tiny cores.
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_banded_input(tin.path(), 8);
+    let control = ConvertOptions {
+        sort_key: Some("magnitude".to_string()),
+        ..opts()
+    };
+    convert_to_overviews(tin.path(), tout.path(), &control).unwrap();
+    let before = level_strong_counts(tout.path(), 5000.0);
 
-        // Ladder: the highest value enters at the coarsest level.
-        let tin2 = tempfile::NamedTempFile::new().unwrap();
-        let tout2 = tempfile::NamedTempFile::new().unwrap();
-        write_banded_input(tin2.path(), 8);
-        let laddered = ConvertOptions {
-            entry_zoom: Some(EntryZoomSpec {
-                column: "magnitude".to_string(),
-                kind: EntryZoomKind::DenseRank { step: 1 },
-            }),
-            // A ladder admits the feature; the collapse disposition decides
-            // what its geometry becomes there. Without one, a 6-metre core
-            // admitted to a ~10 km-tolerance level is simplified away again —
-            // which is why the CLI turns this on alongside a ladder.
-            simplify: SimplifyOptions {
-                collapse: CollapseMode::Point,
-                ..Default::default()
-            },
-            ..opts(streaming)
-        };
-        convert_to_overviews(tin2.path(), tout2.path(), &laddered).unwrap();
-        let after = level_strong_counts(tout2.path(), 5000.0);
+    // Ladder: the highest value enters at the coarsest level.
+    let tin2 = tempfile::NamedTempFile::new().unwrap();
+    let tout2 = tempfile::NamedTempFile::new().unwrap();
+    write_banded_input(tin2.path(), 8);
+    let laddered = ConvertOptions {
+        entry_zoom: Some(EntryZoomSpec {
+            column: "magnitude".to_string(),
+            kind: EntryZoomKind::DenseRank { step: 1 },
+        }),
+        // A ladder admits the feature; the collapse disposition decides
+        // what its geometry becomes there. Without one, a 6-metre core
+        // admitted to a ~10 km-tolerance level is simplified away again —
+        // which is why the CLI turns this on alongside a ladder.
+        simplify: SimplifyOptions {
+            collapse: CollapseMode::Point,
+            ..Default::default()
+        },
+        ..opts()
+    };
+    convert_to_overviews(tin2.path(), tout2.path(), &laddered).unwrap();
+    let after = level_strong_counts(tout2.path(), 5000.0);
 
-        assert_eq!(
-            before[0], 0,
-            "streaming={streaming}: precondition — the gate drops every top-value \
-             core at the coarsest level without a ladder (got {before:?})"
-        );
-        // Deterministic: 8 sites, so all 8 cores. `> 0` would pass with seven
-        // of them lost, which is most of what the ladder exists to prevent.
-        assert_eq!(
-            after,
-            vec![8; after.len()],
-            "streaming={streaming}: the ladder must admit EVERY top-value shape at \
-             every level (before={before:?})"
-        );
-        validate_file(tout2.path()).unwrap();
-    }
+    assert_eq!(
+        before[0], 0,
+        "precondition — the gate drops every top-value \
+         core at the coarsest level without a ladder (got {before:?})"
+    );
+    // Deterministic: 8 sites, so all 8 cores. `> 0` would pass with seven
+    // of them lost, which is most of what the ladder exists to prevent.
+    assert_eq!(
+        after,
+        vec![8; after.len()],
+        "the ladder must admit EVERY top-value shape at \
+         every level (before={before:?})"
+    );
+    validate_file(tout2.path()).unwrap();
 }
 
-/// Both engines must place a laddered feature identically — the ladder is
-/// resolved from the same column and the same level plan in each.
+/// A laddered feature enters at the rung its value earns. (The streamed vs
+/// eager reader differential lives in `overview::convert`'s unit tests, #440.)
 #[test]
-fn entry_zoom_ladder_is_identical_across_pipelines() {
+fn entry_zoom_ladder_places_bands() {
     use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
-    let mut per_engine = Vec::new();
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_banded_input(tin.path(), 6);
-        let o = ConvertOptions {
-            entry_zoom: Some(EntryZoomSpec {
-                column: "magnitude".to_string(),
-                kind: EntryZoomKind::DenseRank { step: 1 },
-            }),
-            ..opts(streaming)
-        };
-        convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
-        per_engine.push((
-            level_strong_counts(tout.path(), 5000.0),
-            level_strong_counts(tout.path(), 100.0),
-        ));
-    }
-    assert_eq!(
-        per_engine[0], per_engine[1],
-        "streamed and buffered engines must agree on ladder placement"
-    );
-    // Absolute, not just A == B: a pure differential passes with the ladder
-    // switched off entirely, since both engines then agree on the unladdered
-    // answer. 6 sites, strongest band present at every level from the
-    // coarsest; the weakest joins only at the finest.
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_banded_input(tin.path(), 6);
+    let o = ConvertOptions {
+        entry_zoom: Some(EntryZoomSpec {
+            column: "magnitude".to_string(),
+            kind: EntryZoomKind::DenseRank { step: 1 },
+        }),
+        ..opts()
+    };
+    convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+    // 6 sites, strongest band present at every level from the coarsest; the
+    // weakest joins only at the finest.
     // `level_strong_counts` is cumulative (`>= min_mag`), so `all` is every
     // feature and `strong` is just the top band.
-    let (strong, all) = &per_engine[0];
+    let (strong, all) = &(
+        level_strong_counts(tout.path(), 5000.0),
+        level_strong_counts(tout.path(), 100.0),
+    );
     assert_eq!(
         *strong,
         vec![6; strong.len()],
@@ -1736,38 +1673,31 @@ fn entry_zoom_ladder_is_recorded_in_the_footer() {
             },
         ),
     ];
-    for streaming in [true, false] {
-        for (spec, want) in &cases {
-            let tin = tempfile::NamedTempFile::new().unwrap();
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            write_banded_input(tin.path(), 4);
-            let o = ConvertOptions {
-                entry_zoom: Some(spec.clone()),
-                ..opts(streaming)
-            };
-            let got = footer_entry_zoom(&o, tin.path(), tout.path());
-            assert_eq!(
-                got.as_ref(),
-                Some(want),
-                "streaming={streaming}: the footer must record the resolved ladder"
-            );
+    for (spec, want) in &cases {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_banded_input(tin.path(), 4);
+        let o = ConvertOptions {
+            entry_zoom: Some(spec.clone()),
+            ..opts()
+        };
+        let got = footer_entry_zoom(&o, tin.path(), tout.path());
+        assert_eq!(
+            got.as_ref(),
+            Some(want),
+            "the footer must record the resolved ladder"
+        );
 
-            let reader = OverviewReader::open(tout.path()).unwrap();
-            let g = reader.meta().generalization.as_ref().unwrap();
-            // The ranking block keeps its meaning: the cell-winner tier for
-            // the features the ladder leaves to ordinary thinning.
-            assert_eq!(
-                g.ranking.as_ref().map(|r| r.mode.as_str()),
-                Some("size-fallback"),
-                "streaming={streaming}"
-            );
-            let vr = validate_file(tout.path()).unwrap();
-            assert!(
-                vr.is_valid(),
-                "streaming={streaming}: {:?}",
-                vr.failures().collect::<Vec<_>>()
-            );
-        }
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let g = reader.meta().generalization.as_ref().unwrap();
+        // The ranking block keeps its meaning: the cell-winner tier for
+        // the features the ladder leaves to ordinary thinning.
+        assert_eq!(
+            g.ranking.as_ref().map(|r| r.mode.as_str()),
+            Some("size-fallback")
+        );
+        let vr = validate_file(tout.path()).unwrap();
+        assert!(vr.is_valid(), "{:?}", vr.failures().collect::<Vec<_>>());
     }
 }
 
@@ -1788,41 +1718,39 @@ fn entry_zoom_provenance_is_absent_when_no_ladder_applies() {
     let laddered_gsd_plan = ConvertOptions {
         entry_zoom: ladder(EntryZoomKind::DenseRank { step: 1 }),
         levels: LevelPlan::Gsds(vec![20_000.0, 5_000.0, 1_000.0]),
-        ..opts(true)
+        ..opts()
     };
-    for streaming in [true, false] {
-        // On the banded input.
-        for o in [opts(streaming), laddered_gsd_plan.clone()] {
-            let tin = tempfile::NamedTempFile::new().unwrap();
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            write_banded_input(tin.path(), 4);
-            assert_eq!(
-                footer_entry_zoom(&o, tin.path(), tout.path()),
-                None,
-                "streaming={streaming} levels={:?}",
-                o.levels
-            );
-        }
-        // On a ladder column with no finite value.
-        for kind in [
-            EntryZoomKind::DenseRank { step: 1 },
-            EntryZoomKind::Explicit(vec![(5000.0, 2)]),
-        ] {
-            let tin = tempfile::NamedTempFile::new().unwrap();
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let (geoms, values) = nested_bands(4);
-            let nan = vec![f64::NAN; values.len()];
-            write_input_with_f64(tin.path(), &geoms, "magnitude", &nan);
-            let o = ConvertOptions {
-                entry_zoom: ladder(kind.clone()),
-                ..opts(streaming)
-            };
-            assert_eq!(
-                footer_entry_zoom(&o, tin.path(), tout.path()),
-                None,
-                "streaming={streaming} kind={kind:?}: an inert ladder records nothing"
-            );
-        }
+    // On the banded input.
+    for o in [opts(), laddered_gsd_plan.clone()] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_banded_input(tin.path(), 4);
+        assert_eq!(
+            footer_entry_zoom(&o, tin.path(), tout.path()),
+            None,
+            "levels={:?}",
+            o.levels
+        );
+    }
+    // On a ladder column with no finite value.
+    for kind in [
+        EntryZoomKind::DenseRank { step: 1 },
+        EntryZoomKind::Explicit(vec![(5000.0, 2)]),
+    ] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let (geoms, values) = nested_bands(4);
+        let nan = vec![f64::NAN; values.len()];
+        write_input_with_f64(tin.path(), &geoms, "magnitude", &nan);
+        let o = ConvertOptions {
+            entry_zoom: ladder(kind.clone()),
+            ..opts()
+        };
+        assert_eq!(
+            footer_entry_zoom(&o, tin.path(), tout.path()),
+            None,
+            "kind={kind:?}: an inert ladder records nothing"
+        );
     }
 }
 
@@ -1833,30 +1761,28 @@ fn entry_zoom_provenance_is_absent_when_no_ladder_applies() {
 fn entry_zoom_provenance_names_the_renamed_column() {
     use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let (geoms, values) = nested_bands(4);
-        write_input_with_f64(tin.path(), &geoms, "level", &values);
-        let o = ConvertOptions {
-            entry_zoom: Some(EntryZoomSpec {
-                column: "level".to_string(),
-                kind: EntryZoomKind::DenseRank { step: 1 },
-            }),
-            ..opts(streaming)
-        };
-        let got = footer_entry_zoom(&o, tin.path(), tout.path()).expect("ladder recorded");
-        assert_eq!(got.column, "level_", "streaming={streaming}");
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let (geoms, values) = nested_bands(4);
+    write_input_with_f64(tin.path(), &geoms, "level", &values);
+    let o = ConvertOptions {
+        entry_zoom: Some(EntryZoomSpec {
+            column: "level".to_string(),
+            kind: EntryZoomKind::DenseRank { step: 1 },
+        }),
+        ..opts()
+    };
+    let got = footer_entry_zoom(&o, tin.path(), tout.path()).expect("ladder recorded");
+    assert_eq!(got.column, "level_");
 
-        let reader = OverviewReader::open(tout.path()).unwrap();
-        let g = reader.meta().generalization.as_ref().unwrap();
-        let renamed = g.renamed_columns.as_ref().expect("rename recorded");
-        assert_eq!(
-            renamed.get("level_").map(String::as_str),
-            Some("level"),
-            "streaming={streaming}: renamed_columns maps the block's column back"
-        );
-    }
+    let reader = OverviewReader::open(tout.path()).unwrap();
+    let g = reader.meta().generalization.as_ref().unwrap();
+    let renamed = g.renamed_columns.as_ref().expect("rename recorded");
+    assert_eq!(
+        renamed.get("level_").map(String::as_str),
+        Some("level"),
+        "renamed_columns maps the block's column back"
+    );
 }
 
 /// A `--plan` run never sees the ladder column, so the saved plan carries the
@@ -1879,7 +1805,7 @@ fn entry_zoom_provenance_survives_a_saved_plan_and_a_zoom_ceiling() {
         entry_zoom: ladder.clone(),
         save_plan: Some(plan.clone()),
         zoom_ceiling: Some(4),
-        ..opts(true)
+        ..opts()
     };
     let capped_out = dir.path().join("capped.parquet");
     let from_scan = footer_entry_zoom(&capped, &input, &capped_out).expect("ladder recorded");
@@ -1898,7 +1824,7 @@ fn entry_zoom_provenance_survives_a_saved_plan_and_a_zoom_ceiling() {
     let replay = ConvertOptions {
         entry_zoom: ladder,
         plan: Some(plan),
-        ..opts(true)
+        ..opts()
     };
     let from_plan = footer_entry_zoom(&replay, &input, &dir.path().join("replay.parquet"));
     assert_eq!(
@@ -1908,53 +1834,35 @@ fn entry_zoom_provenance_survives_a_saved_plan_and_a_zoom_ceiling() {
     );
 }
 
-/// #364: the two engines must rank the same rows, not just agree on a fixture
-/// where every row survives.
-///
-/// The ladder ranks DISTINCT values, so one extra value seen by only one
-/// engine shifts every weaker feature by a whole `step`. The buffered engine
-/// reads the column off the table *after* rejection; the streaming engine
-/// reads it off the raw batch during pass 1. Any row that one keeps and the
-/// other drops — a false `--filter` predicate, a null or unusable geometry, a
-/// `--bbox` miss — therefore split the two ladders.
-///
-/// `entry_zoom_ladder_is_identical_across_pipelines` cannot catch this: its
-/// fixture has no rejected rows at all, so the two multisets coincide by
-/// construction. This one puts a row in exactly that gap.
+/// #364: the ladder ranks the DISTINCT values of the rows that become
+/// features, so one extra value seen from a rejected row (a false `--filter`
+/// predicate, a null or unusable geometry, a `--bbox` miss) shifts every
+/// weaker feature by a whole `step`. This puts a row in exactly that gap.
 #[test]
-fn entry_zoom_ladder_agrees_across_pipelines_when_rows_are_rejected() {
+fn entry_zoom_ladder_ignores_rejected_rows() {
     use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
-    let mut per_engine = Vec::new();
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_banded_input(tin.path(), 6);
-        let o = ConvertOptions {
-            entry_zoom: Some(EntryZoomSpec {
-                column: "magnitude".to_string(),
-                kind: EntryZoomKind::DenseRank { step: 1 },
-            }),
-            // Excludes the strongest band, so the rows carrying the top
-            // distinct value never become features. If the ladder still sees
-            // that value, it spends rung 0 on a value that is not in the
-            // output and every surviving band enters one zoom too late.
-            filter: Some("magnitude < 2000".to_string()),
-            ..opts(streaming)
-        };
-        convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
-        per_engine.push((
-            level_strong_counts(tout.path(), 1500.0),
-            level_strong_counts(tout.path(), 100.0),
-        ));
-    }
-    assert_eq!(
-        per_engine[0], per_engine[1],
-        "a filtered-out row must not create a ladder rung in one engine only"
-    );
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_banded_input(tin.path(), 6);
+    let o = ConvertOptions {
+        entry_zoom: Some(EntryZoomSpec {
+            column: "magnitude".to_string(),
+            kind: EntryZoomKind::DenseRank { step: 1 },
+        }),
+        // Excludes the strongest band, so the rows carrying the top
+        // distinct value never become features. If the ladder still sees
+        // that value, it spends rung 0 on a value that is not in the
+        // output and every surviving band enters one zoom too late.
+        filter: Some("magnitude < 2000".to_string()),
+        ..opts()
+    };
+    convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+    let strong = level_strong_counts(tout.path(), 1500.0);
     assert!(
-        per_engine[0].0.iter().any(|&c| c > 0),
-        "precondition: the surviving strongest band must reach some level"
+        strong[0] > 0,
+        "a filtered-out row must not take rung 0: the surviving strongest band \
+         enters at the coarsest level ({strong:?})"
     );
 }
 
@@ -1964,7 +1872,7 @@ fn entry_zoom_ladder_agrees_across_pipelines_when_rows_are_rejected() {
 /// holds a cell then keeps it whatever its key says (so the documented
 /// "larger key wins" rule inverts wherever a NaN row comes first), and the
 /// `sort_by`s built on the same comparator are free to permute, which breaks
-/// the byte-identity contract between the two engines.
+/// byte-identity between runs.
 ///
 /// A NaN-keyed feature must be treated as KEYLESS — ranked with the rows that
 /// have no key at all — and never dropped: it is a feature with an unrankable
@@ -1984,51 +1892,42 @@ fn nan_sort_key_rows_are_keyless_not_dropped() {
         values.push(100.0 + k as f64);
     }
 
-    let mut per_engine = Vec::new();
-    for streaming in [true, false] {
-        // Twice per engine: same input, same options, same answer — a
-        // comparator that is not a total order is free to differ here.
-        let mut per_run = Vec::new();
-        for _ in 0..2 {
-            let tin = tempfile::NamedTempFile::new().unwrap();
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            write_input_with_f64(tin.path(), &geoms, "rank", &values);
-            let o = ConvertOptions {
-                sort_key: Some("rank".to_string()),
-                ..opts(streaming)
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &o)
-                .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
-            assert_eq!(
-                report.input_features, 6,
-                "streaming={streaming}: a NaN sort key must not drop the feature"
-            );
-            validate_file(tout.path()).unwrap();
-
-            let reader = OverviewReader::open(tout.path()).unwrap();
-            let levels = reader.num_levels();
-            let ids: Vec<Vec<i64>> = (0..levels)
-                .map(|l| {
-                    read_level_ids_geoms(tout.path(), l)
-                        .into_iter()
-                        .map(|(id, _)| id)
-                        .collect()
-                })
-                .collect();
-            per_run.push(ids);
-        }
+    // Twice: same input, same options, same answer — a
+    // comparator that is not a total order is free to differ here.
+    let mut per_run = Vec::new();
+    for _ in 0..2 {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64(tin.path(), &geoms, "rank", &values);
+        let o = ConvertOptions {
+            sort_key: Some("rank".to_string()),
+            ..opts()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &o)
+            .unwrap_or_else(|e| panic!("conversion failed: {e}"));
         assert_eq!(
-            per_run[0], per_run[1],
-            "streaming={streaming}: two runs over the same input must agree"
+            report.input_features, 6,
+            "a NaN sort key must not drop the feature"
         );
-        per_engine.push(per_run.pop().unwrap());
-    }
+        validate_file(tout.path()).unwrap();
 
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let levels = reader.num_levels();
+        let ids: Vec<Vec<i64>> = (0..levels)
+            .map(|l| {
+                read_level_ids_geoms(tout.path(), l)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
+            })
+            .collect();
+        per_run.push(ids);
+    }
     assert_eq!(
-        per_engine[0], per_engine[1],
-        "streamed and buffered engines must place NaN-keyed rows identically"
+        per_run[0], per_run[1],
+        "two runs over the same input must agree"
     );
-    let ids = &per_engine[0];
+    let ids = &per_run[0];
     assert_eq!(
         ids.last().unwrap(),
         &vec![0, 1, 2, 3, 4, 5],
@@ -2048,23 +1947,21 @@ fn nan_sort_key_rows_are_keyless_not_dropped() {
 fn entry_zoom_missing_column_is_rejected() {
     use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_banded_input(tin.path(), 2);
-        let o = ConvertOptions {
-            entry_zoom: Some(EntryZoomSpec {
-                column: "nope".to_string(),
-                kind: EntryZoomKind::DenseRank { step: 1 },
-            }),
-            ..opts(streaming)
-        };
-        let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
-        assert!(
-            matches!(err, ConvertError::InvalidConfig(ref m) if m.contains("nope")),
-            "streaming={streaming}: got {err}"
-        );
-    }
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_banded_input(tin.path(), 2);
+    let o = ConvertOptions {
+        entry_zoom: Some(EntryZoomSpec {
+            column: "nope".to_string(),
+            kind: EntryZoomKind::DenseRank { step: 1 },
+        }),
+        ..opts()
+    };
+    let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
+    assert!(
+        matches!(err, ConvertError::InvalidConfig(ref m) if m.contains("nope")),
+        "got {err}"
+    );
 }
 
 /// An explicit spec whose rungs all miss the column's values is reported as
@@ -2074,28 +1971,23 @@ fn entry_zoom_missing_column_is_rejected() {
 fn entry_zoom_rungs_matching_no_value_are_rejected_by_name() {
     use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_banded_input(tin.path(), 2);
-        let o = ConvertOptions {
-            entry_zoom: Some(EntryZoomSpec {
-                column: "magnitude".to_string(),
-                kind: EntryZoomKind::Explicit(vec![(999.0, 2), (42.5, 4)]),
-            }),
-            ..opts(streaming)
-        };
-        let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
-        let ConvertError::InvalidConfig(m) = &err else {
-            panic!("streaming={streaming}: got {err}");
-        };
-        assert!(!m.contains("named no values"), "streaming={streaming}: {m}");
-        for want in ["magnitude", "999", "42.5"] {
-            assert!(
-                m.contains(want),
-                "streaming={streaming}: {want} missing from {m}"
-            );
-        }
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_banded_input(tin.path(), 2);
+    let o = ConvertOptions {
+        entry_zoom: Some(EntryZoomSpec {
+            column: "magnitude".to_string(),
+            kind: EntryZoomKind::Explicit(vec![(999.0, 2), (42.5, 4)]),
+        }),
+        ..opts()
+    };
+    let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
+    let ConvertError::InvalidConfig(m) = &err else {
+        panic!("got {err}");
+    };
+    assert!(!m.contains("named no values"), "{m}");
+    for want in ["magnitude", "999", "42.5"] {
+        assert!(m.contains(want), "{want} missing from {m}");
     }
 }
 
@@ -2119,34 +2011,30 @@ fn empty_coarse_levels_omitted_across_pipelines() {
         })
         .collect();
 
-    for streaming in [true, false] {
-        for coalesce in [false, true] {
-            let tin = tempfile::NamedTempFile::new().unwrap();
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            write_input(tin.path(), &tiny_lines, true, None);
-            let o = ConvertOptions {
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 0,
-                    max_zoom: 10,
-                },
-                coalesce_lines: coalesce,
-                streaming,
-                ..Default::default()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_or_else(|e| {
-                panic!("streaming={streaming} coalesce={coalesce}: failed: {e}")
-            });
-            assert!(
-                !report.levels.is_empty() && report.levels.len() <= 11,
-                "streaming={streaming} coalesce={coalesce}"
-            );
-            let vr = validate_file(tout.path()).unwrap();
-            assert!(
-                vr.is_valid(),
-                "streaming={streaming} coalesce={coalesce}: {:?}",
-                vr.failures().collect::<Vec<_>>()
-            );
-        }
+    for coalesce in [false, true] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &tiny_lines, true, None);
+        let o = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 10,
+            },
+            coalesce_lines: coalesce,
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &o)
+            .unwrap_or_else(|e| panic!("coalesce={coalesce}: failed: {e}"));
+        assert!(
+            !report.levels.is_empty() && report.levels.len() <= 11,
+            "coalesce={coalesce}"
+        );
+        let vr = validate_file(tout.path()).unwrap();
+        assert!(
+            vr.is_valid(),
+            "coalesce={coalesce}: {:?}",
+            vr.failures().collect::<Vec<_>>()
+        );
     }
 }
 
@@ -2302,7 +2190,7 @@ fn export_partitioning_mode_file_works() {
     write_input(tin.path(), &spread_points(6), true, None);
     let o = ConvertOptions {
         mode: Mode::Partitioning,
-        ..opts(true)
+        ..opts()
     };
     convert_to_overviews(tin.path(), tovr.path(), &o).unwrap();
     let report = export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
@@ -2341,16 +2229,14 @@ fn antimeridian_suspect_features_warned_normal_inputs_clean() {
         Some(Geometry::Point(Point::new(10.0, 10.0))),
         Some(Geometry::Point(Point::new(-170.0, 5.0))),
     ];
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &geoms, true, None);
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap();
-        assert_eq!(
-            report.antimeridian_suspect_features, 1,
-            "streaming={streaming}: exactly the wide polygon is flagged"
-        );
-    }
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &geoms, true, None);
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts()).unwrap();
+    assert_eq!(
+        report.antimeridian_suspect_features, 1,
+        "exactly the wide polygon is flagged"
+    );
 
     // A normal (wide but < 180°) dataset triggers nothing.
     let normal: Vec<Option<Geometry<f64>>> = vec![
@@ -2360,20 +2246,15 @@ fn antimeridian_suspect_features_warned_normal_inputs_clean() {
         ]))),
         Some(Geometry::Point(Point::new(0.0, 0.0))),
     ];
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &normal, true, None);
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap();
-        assert_eq!(
-            report.antimeridian_suspect_features, 0,
-            "streaming={streaming}: sub-180° extents are not flagged"
-        );
-        assert_eq!(
-            report.wrapped_features, 0,
-            "streaming={streaming}: nothing reaches past ±180°"
-        );
-    }
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &normal, true, None);
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts()).unwrap();
+    assert_eq!(
+        report.antimeridian_suspect_features, 0,
+        "sub-180° extents are not flagged"
+    );
+    assert_eq!(report.wrapped_features, 0, "nothing reaches past ±180°");
 }
 
 #[test]
@@ -2396,7 +2277,7 @@ fn antimeridian_polygon_export_smears_world_row() {
         vec![],
     )))];
     write_input(tin.path(), &geoms, true, None);
-    convert_to_overviews(tin.path(), tovr.path(), &opts(true)).unwrap();
+    convert_to_overviews(tin.path(), tovr.path(), &opts()).unwrap();
     let report = export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
 
     for z in &report.zooms {
@@ -2442,90 +2323,82 @@ fn overhanging_cell_is_drawn_on_both_sides_of_the_antimeridian() {
         Some(lnglat_rect(178.0, -1.0, 181.0, 1.0)), // id 0: overhangs
         Some(lnglat_rect(10.0, -1.0, 12.0, 1.0)),   // id 1: control
     ];
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tovr = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &geoms, true, None);
-        let convert = convert_to_overviews(tin.path(), tovr.path(), &opts(streaming)).unwrap();
-        assert_eq!(
-            convert.out_of_range_features, 0,
-            "streaming={streaming}: a wrapped overhang is not lost"
-        );
-        assert_eq!(
-            convert.wrapped_features, 1,
-            "streaming={streaming}: the overhang is reported as wrapped (#644)"
-        );
-        export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tovr = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &geoms, true, None);
+    let convert = convert_to_overviews(tin.path(), tovr.path(), &opts()).unwrap();
+    assert_eq!(
+        convert.out_of_range_features, 0,
+        "a wrapped overhang is not lost"
+    );
+    assert_eq!(
+        convert.wrapped_features, 1,
+        "the overhang is reported as wrapped (#644)"
+    );
+    export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
 
-        let dec = tempfile::NamedTempFile::new().unwrap();
-        decode_pmtiles(tout.path(), dec.path(), &DecodeOptions::default()).unwrap();
-        let rows = read_decoded_rows(dec.path());
-        let lng_range = |g: &Geometry<f64>| {
-            use geo::BoundingRect;
-            let r = g.bounding_rect().unwrap();
-            (r.min().x, r.max().x)
-        };
-        let zooms: std::collections::BTreeSet<u8> = rows
+    let dec = tempfile::NamedTempFile::new().unwrap();
+    decode_pmtiles(tout.path(), dec.path(), &DecodeOptions::default()).unwrap();
+    let rows = read_decoded_rows(dec.path());
+    let lng_range = |g: &Geometry<f64>| {
+        use geo::BoundingRect;
+        let r = g.bounding_rect().unwrap();
+        (r.min().x, r.max().x)
+    };
+    let zooms: std::collections::BTreeSet<u8> = rows
+        .iter()
+        .filter(|(_, id, _)| *id == Some(0))
+        .map(|(z, _, _)| *z)
+        .collect();
+    assert!(!zooms.is_empty(), "the cell is tiled");
+    for z in zooms {
+        let cell: Vec<(f64, f64)> = rows
             .iter()
-            .filter(|(_, id, _)| *id == Some(0))
-            .map(|(z, _, _)| *z)
+            .filter(|(rz, id, _)| *rz == z && *id == Some(0))
+            .map(|(_, _, g)| lng_range(g))
             .collect();
         assert!(
-            !zooms.is_empty(),
-            "streaming={streaming}: the cell is tiled"
+            cell.iter().any(|&(lo, _)| lo < -179.5),
+            "z{z}: the 180°–181° part must be drawn at the west \
+             edge; decoded extents {cell:?}"
         );
-        for z in zooms {
-            let cell: Vec<(f64, f64)> = rows
-                .iter()
-                .filter(|(rz, id, _)| *rz == z && *id == Some(0))
-                .map(|(_, _, g)| lng_range(g))
-                .collect();
-            assert!(
-                cell.iter().any(|&(lo, _)| lo < -179.5),
-                "streaming={streaming} z{z}: the 180°–181° part must be drawn at the west \
-                 edge; decoded extents {cell:?}"
-            );
-            assert!(
-                cell.iter().any(|&(_, hi)| hi > 178.5),
-                "streaming={streaming} z{z}: the in-range part stays east; {cell:?}"
-            );
-        }
-        // The archive advertises a valid bbox, not lng 181.
-        let archive = tylertoo_core::archive_index::ArchiveIndex::open(tout.path()).unwrap();
-        let header = archive.header();
         assert!(
-            header.max_lon <= 180.0 && header.min_lon >= -180.0,
-            "streaming={streaming}: header bounds {header:?}"
+            cell.iter().any(|&(_, hi)| hi > 178.5),
+            "z{z}: the in-range part stays east; {cell:?}"
         );
     }
+    // The archive advertises a valid bbox, not lng 181.
+    let archive = tylertoo_core::archive_index::ArchiveIndex::open(tout.path()).unwrap();
+    let header = archive.header();
+    assert!(
+        header.max_lon <= 180.0 && header.min_lon >= -180.0,
+        "header bounds {header:?}"
+    );
 }
 
 /// #643: export draws the overhang's 180°–181° part at the west edge, so a
-/// `--bbox` around lng -179.5 must select the cell, in both engines.
+/// `--bbox` around lng -179.5 must select the cell .
 #[test]
 fn bbox_on_the_far_side_of_the_antimeridian_selects_the_overhang() {
     let geoms: Vec<Option<Geometry<f64>>> = vec![
         Some(lnglat_rect(178.0, -1.0, 181.0, 1.0)), // id 0: overhangs
         Some(lnglat_rect(10.0, -1.0, 12.0, 1.0)),   // id 1: control
     ];
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &geoms, true, None);
-        let options = ConvertOptions {
-            bbox: Some([-180.0, -1.0, -179.0, 1.0]),
-            ..opts(streaming)
-        };
-        convert_to_overviews(tin.path(), tout.path(), &options)
-            .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
-        let canonical = OverviewReader::open(tout.path()).unwrap().num_levels() - 1;
-        let ids: Vec<i64> = read_level_ids_geoms(tout.path(), canonical)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        assert_eq!(ids, vec![0], "streaming={streaming}");
-    }
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &geoms, true, None);
+    let options = ConvertOptions {
+        bbox: Some([-180.0, -1.0, -179.0, 1.0]),
+        ..opts()
+    };
+    convert_to_overviews(tin.path(), tout.path(), &options).unwrap_or_else(|e| panic!("{e}"));
+    let canonical = OverviewReader::open(tout.path()).unwrap().num_levels() - 1;
+    let ids: Vec<i64> = read_level_ids_geoms(tout.path(), canonical)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ids, vec![0]);
 }
 
 /// A dataset on the 0..360 longitude convention tiles at its wrapped
@@ -2539,40 +2412,35 @@ fn zero_to_360_dataset_converts_and_tiles_at_wrapped_longitudes() {
         .iter()
         .map(|&lng| Some(Geometry::Point(Point::new(lng, 10.0))))
         .collect();
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tovr = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &geoms, true, None);
-        let convert = convert_to_overviews(tin.path(), tovr.path(), &opts(streaming))
-            .unwrap_or_else(|e| panic!("streaming={streaming}: 0..360 input must convert: {e}"));
-        assert_eq!(convert.out_of_range_features, 0, "streaming={streaming}");
-        assert_eq!(
-            convert.wrapped_features, 4,
-            "streaming={streaming}: every 0..360 feature is reported as wrapped (#644)"
-        );
-        export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tovr = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &geoms, true, None);
+    let convert = convert_to_overviews(tin.path(), tovr.path(), &opts())
+        .unwrap_or_else(|e| panic!("0..360 input must convert: {e}"));
+    assert_eq!(convert.out_of_range_features, 0);
+    assert_eq!(
+        convert.wrapped_features, 4,
+        "every 0..360 feature is reported as wrapped (#644)"
+    );
+    export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
 
-        let dec = tempfile::NamedTempFile::new().unwrap();
-        decode_pmtiles(tout.path(), dec.path(), &DecodeOptions::default()).unwrap();
-        let rows = read_decoded_rows(dec.path());
-        for (id, lng) in [(0, -160.0), (1, -110.0), (2, -60.0), (3, -10.0)] {
-            let drawn: Vec<&Geometry<f64>> = rows
+    let dec = tempfile::NamedTempFile::new().unwrap();
+    decode_pmtiles(tout.path(), dec.path(), &DecodeOptions::default()).unwrap();
+    let rows = read_decoded_rows(dec.path());
+    for (id, lng) in [(0, -160.0), (1, -110.0), (2, -60.0), (3, -10.0)] {
+        let drawn: Vec<&Geometry<f64>> = rows
+            .iter()
+            .filter(|(_, rid, _)| *rid == Some(id))
+            .map(|(_, _, g)| g)
+            .collect();
+        assert!(!drawn.is_empty(), "feature {id} must be tiled");
+        assert!(
+            drawn
                 .iter()
-                .filter(|(_, rid, _)| *rid == Some(id))
-                .map(|(_, _, g)| g)
-                .collect();
-            assert!(
-                !drawn.is_empty(),
-                "streaming={streaming}: feature {id} must be tiled"
-            );
-            assert!(
-                drawn
-                    .iter()
-                    .all(|g| matches!(g, Geometry::Point(p) if (p.x() - lng).abs() < 0.01)),
-                "streaming={streaming}: feature {id} must be drawn at lng {lng}: {drawn:?}"
-            );
-        }
+                .all(|g| matches!(g, Geometry::Point(p) if (p.x() - lng).abs() < 0.01)),
+            "feature {id} must be drawn at lng {lng}: {drawn:?}"
+        );
     }
 }
 
@@ -2587,89 +2455,59 @@ fn zero_to_360_dataset_converts_and_tiles_at_wrapped_longitudes() {
 fn property_selection_narrows_the_overview_columns() {
     use tylertoo_core::overview::properties::PropertySelection;
 
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &spread_points(4), true, Some("extra"));
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &spread_points(4), true, Some("extra"));
 
-        // include: only `name`.
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let o = ConvertOptions {
-            properties: PropertySelection {
-                include: Some(vec!["name".to_string()]),
-                ..Default::default()
-            },
-            ..opts(streaming)
-        };
-        convert_to_overviews(tin.path(), tout.path(), &o).expect("include converts");
-        let names = output_column_names(tout.path());
-        assert!(
-            names.contains(&"name".to_string()),
-            "streaming={streaming} {names:?}"
-        );
-        assert!(
-            names.contains(&"geometry".to_string()),
-            "streaming={streaming} {names:?}"
-        );
-        // #401: the selection does not read the input covering, and the
-        // writer still emits its own.
-        assert!(
-            names.contains(&"bbox".to_string()),
-            "streaming={streaming} {names:?}"
-        );
-        assert!(
-            !names.contains(&"id".to_string()),
-            "streaming={streaming} {names:?}"
-        );
-        assert!(
-            !names.contains(&"extra".to_string()),
-            "streaming={streaming} {names:?}"
-        );
+    // include: only `name`.
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let o = ConvertOptions {
+        properties: PropertySelection {
+            include: Some(vec!["name".to_string()]),
+            ..Default::default()
+        },
+        ..opts()
+    };
+    convert_to_overviews(tin.path(), tout.path(), &o).expect("include converts");
+    let names = output_column_names(tout.path());
+    assert!(names.contains(&"name".to_string()), "{names:?}");
+    assert!(names.contains(&"geometry".to_string()), "{names:?}");
+    // #401: the selection does not read the input covering, and the
+    // writer still emits its own.
+    assert!(names.contains(&"bbox".to_string()), "{names:?}");
+    assert!(!names.contains(&"id".to_string()), "{names:?}");
+    assert!(!names.contains(&"extra".to_string()), "{names:?}");
 
-        // exclude: drop `extra` only.
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let o = ConvertOptions {
-            properties: PropertySelection {
-                exclude: vec!["extra".to_string()],
-                ..Default::default()
-            },
-            ..opts(streaming)
-        };
-        convert_to_overviews(tin.path(), tout.path(), &o).expect("exclude converts");
-        let names = output_column_names(tout.path());
-        assert!(
-            names.contains(&"id".to_string()),
-            "streaming={streaming} {names:?}"
-        );
-        assert!(
-            names.contains(&"name".to_string()),
-            "streaming={streaming} {names:?}"
-        );
-        assert!(
-            !names.contains(&"extra".to_string()),
-            "streaming={streaming} {names:?}"
-        );
+    // exclude: drop `extra` only.
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let o = ConvertOptions {
+        properties: PropertySelection {
+            exclude: vec!["extra".to_string()],
+            ..Default::default()
+        },
+        ..opts()
+    };
+    convert_to_overviews(tin.path(), tout.path(), &o).expect("exclude converts");
+    let names = output_column_names(tout.path());
+    assert!(names.contains(&"id".to_string()), "{names:?}");
+    assert!(names.contains(&"name".to_string()), "{names:?}");
+    assert!(!names.contains(&"extra".to_string()), "{names:?}");
 
-        // exclude_all: geometry only — the rows still convert.
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let o = ConvertOptions {
-            properties: PropertySelection {
-                exclude_all: true,
-                ..Default::default()
-            },
-            ..opts(streaming)
-        };
-        let report =
-            convert_to_overviews(tin.path(), tout.path(), &o).expect("exclude_all converts");
-        assert_eq!(report.input_features, 4);
-        let names = output_column_names(tout.path());
-        for dropped in ["id", "name", "extra"] {
-            assert!(
-                !names.contains(&dropped.to_string()),
-                "streaming={streaming} {names:?}"
-            );
-        }
-        assert!(names.contains(&"geometry".to_string()));
+    // exclude_all: geometry only — the rows still convert.
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let o = ConvertOptions {
+        properties: PropertySelection {
+            exclude_all: true,
+            ..Default::default()
+        },
+        ..opts()
+    };
+    let report = convert_to_overviews(tin.path(), tout.path(), &o).expect("exclude_all converts");
+    assert_eq!(report.input_features, 4);
+    let names = output_column_names(tout.path());
+    for dropped in ["id", "name", "extra"] {
+        assert!(!names.contains(&dropped.to_string()), "{names:?}");
     }
+    assert!(names.contains(&"geometry".to_string()));
 }
 
 /// A knob that reads an excluded column is an error naming the knob, and a
@@ -2689,7 +2527,7 @@ fn property_selection_rejects_knob_columns_and_typos() {
             exclude: vec!["extra".to_string()],
             ..Default::default()
         },
-        ..opts(true)
+        ..opts()
     };
     let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
     let msg = err.to_string();
@@ -2706,7 +2544,7 @@ fn property_selection_rejects_knob_columns_and_typos() {
             exclude: vec!["extra".to_string()],
             ..Default::default()
         },
-        ..opts(true)
+        ..opts()
     };
     let msg = convert_to_overviews(tin.path(), tout.path(), &o)
         .unwrap_err()
@@ -2723,7 +2561,7 @@ fn property_selection_rejects_knob_columns_and_typos() {
             include: Some(vec!["name".to_string(), "bbox".to_string()]),
             ..Default::default()
         },
-        ..opts(true)
+        ..opts()
     };
     let msg = convert_to_overviews(tin.path(), tout.path(), &o)
         .unwrap_err()
@@ -2739,7 +2577,7 @@ fn property_selection_rejects_knob_columns_and_typos() {
             include: Some(vec!["name".to_string()]),
             ..Default::default()
         },
-        ..opts(true)
+        ..opts()
     };
     let msg = convert_to_overviews(tin.path(), tout.path(), &o)
         .unwrap_err()
@@ -2751,7 +2589,7 @@ fn property_selection_rejects_knob_columns_and_typos() {
             include: Some(vec!["nmae".to_string()]),
             ..Default::default()
         },
-        ..opts(true)
+        ..opts()
     };
     let msg = convert_to_overviews(tin.path(), tout.path(), &o)
         .unwrap_err()
@@ -2820,22 +2658,20 @@ fn property_selection_honours_the_declared_covering() {
     writer.close().unwrap();
 
     let tout = tempfile::NamedTempFile::new().unwrap();
-    for streaming in [false, true] {
-        let o = ConvertOptions {
-            properties: PropertySelection {
-                include: Some(vec!["id".to_string(), "extent".to_string()]),
-                ..Default::default()
-            },
-            ..opts(streaming)
-        };
-        let msg = convert_to_overviews(tin.path(), tout.path(), &o)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            msg.contains("\"extent\"") && msg.contains("regenerates"),
-            "streaming={streaming} {msg}"
-        );
-    }
+    let o = ConvertOptions {
+        properties: PropertySelection {
+            include: Some(vec!["id".to_string(), "extent".to_string()]),
+            ..Default::default()
+        },
+        ..opts()
+    };
+    let msg = convert_to_overviews(tin.path(), tout.path(), &o)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("\"extent\"") && msg.contains("regenerates"),
+        "{msg}"
+    );
 }
 
 /// A `ConvertSource` is single-use once a selection has been applied: the
@@ -2858,13 +2694,13 @@ fn property_selection_makes_the_source_single_use() {
             include: Some(vec!["name".to_string()]),
             ..Default::default()
         },
-        ..opts(true)
+        ..opts()
     };
     convert_to_overviews_sources(&source, tout.path(), &o).expect("first convert");
 
     // Default selection on the same source: an error, not a narrowed file.
     let tout2 = tempfile::NamedTempFile::new().unwrap();
-    let err = convert_to_overviews_sources(&source, tout2.path(), &opts(true))
+    let err = convert_to_overviews_sources(&source, tout2.path(), &opts())
         .expect_err("a projected source must not be reused");
     assert!(
         err.to_string().contains("already applied"),
@@ -2930,7 +2766,7 @@ fn tiny_polygon_accumulator_preserves_dropped_area_at_coarse_levels() {
 
     // Drop (the default before #745): nothing survives at z2..z5.
     let tout = tempfile::NamedTempFile::new().unwrap();
-    let mut drop = opts(true);
+    let mut drop = opts();
     drop.simplify.collapse = CollapseMode::Drop;
     let report = convert_to_overviews(tin.path(), tout.path(), &drop).unwrap();
     assert!(
@@ -2940,74 +2776,60 @@ fn tiny_polygon_accumulator_preserves_dropped_area_at_coarse_levels() {
     );
 
     // Square: the accumulator stands in for the dropped fields.
-    let mut per_pipeline: Vec<Vec<(u8, usize)>> = Vec::new();
-    for streaming in [true, false] {
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let o = ConvertOptions {
-            simplify: SimplifyOptions {
-                collapse: CollapseMode::Square,
-                ..SimplifyOptions::default()
-            },
-            ..opts(streaming)
-        };
-        let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
-        // A level whose placeholder is bigger than the whole block cannot
-        // hold one; every other level must.
-        for sk in &report.skipped_empty_levels {
-            let gsd_deg = sk.gsd / 111_320.0;
-            assert!(
-                gsd_deg * gsd_deg > input_area,
-                "streaming={streaming}: z{:?} skipped although {:.1} placeholders of area exist",
-                sk.zoom,
-                input_area / (gsd_deg * gsd_deg)
-            );
-        }
-        let counts: Vec<(u8, usize)> = report
-            .levels
-            .iter()
-            .map(|l| (l.zoom.unwrap(), l.feature_count))
-            .collect();
-        per_pipeline.push(counts.clone());
-
-        // At every coarse level the placeholder area is within one
-        // threshold per cell of the input area (each cell keeps < 1
-        // threshold unemitted); here the block spans a handful of cells.
-        for (li, l) in report.levels.iter().enumerate() {
-            if li + 1 == report.levels.len() {
-                continue; // canonical: the fields themselves
-            }
-            let rows = read_level_ids_geoms(tout.path(), li);
-            let area: f64 = rows
-                .iter()
-                .map(|(_, g)| match g {
-                    Geometry::Polygon(p) => p.unsigned_area(),
-                    Geometry::MultiPolygon(mp) => mp.unsigned_area(),
-                    _ => 0.0,
-                })
-                .sum();
-            let gsd_deg = l.gsd / 111_320.0;
-            let threshold = gsd_deg * gsd_deg; // factor 1.0
-            let cells = 4.0; // patches are 32×gsd; the block is ~3.8 km wide
-            assert!(
-                area <= input_area + 1e-12 && area >= input_area - cells * threshold,
-                "streaming={streaming} z{}: placeholder area {area:e} vs input {input_area:e} \
-                 (threshold {threshold:e}, {} rows)",
-                l.zoom.unwrap(),
-                rows.len()
-            );
-            assert!(
-                rows.len() >= ((input_area / threshold) as usize).saturating_sub(cells as usize),
-                "streaming={streaming} z{}: {} squares for {:.1} thresholds of area",
-                l.zoom.unwrap(),
-                rows.len(),
-                input_area / threshold
-            );
-        }
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let o = ConvertOptions {
+        simplify: SimplifyOptions {
+            collapse: CollapseMode::Square,
+            ..SimplifyOptions::default()
+        },
+        ..opts()
+    };
+    let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+    // A level whose placeholder is bigger than the whole block cannot
+    // hold one; every other level must.
+    for sk in &report.skipped_empty_levels {
+        let gsd_deg = sk.gsd / 111_320.0;
+        assert!(
+            gsd_deg * gsd_deg > input_area,
+            "z{:?} skipped although {:.1} placeholders of area exist",
+            sk.zoom,
+            input_area / (gsd_deg * gsd_deg)
+        );
     }
-    assert_eq!(
-        per_pipeline[0], per_pipeline[1],
-        "streaming and in-memory pipelines must agree on carriers"
-    );
+    // At every coarse level the placeholder area is within one
+    // threshold per cell of the input area (each cell keeps < 1
+    // threshold unemitted); here the block spans a handful of cells.
+    for (li, l) in report.levels.iter().enumerate() {
+        if li + 1 == report.levels.len() {
+            continue; // canonical: the fields themselves
+        }
+        let rows = read_level_ids_geoms(tout.path(), li);
+        let area: f64 = rows
+            .iter()
+            .map(|(_, g)| match g {
+                Geometry::Polygon(p) => p.unsigned_area(),
+                Geometry::MultiPolygon(mp) => mp.unsigned_area(),
+                _ => 0.0,
+            })
+            .sum();
+        let gsd_deg = l.gsd / 111_320.0;
+        let threshold = gsd_deg * gsd_deg; // factor 1.0
+        let cells = 4.0; // patches are 32×gsd; the block is ~3.8 km wide
+        assert!(
+            area <= input_area + 1e-12 && area >= input_area - cells * threshold,
+            "z{}: placeholder area {area:e} vs input {input_area:e} \
+             (threshold {threshold:e}, {} rows)",
+            l.zoom.unwrap(),
+            rows.len()
+        );
+        assert!(
+            rows.len() >= ((input_area / threshold) as usize).saturating_sub(cells as usize),
+            "z{}: {} squares for {:.1} thresholds of area",
+            l.zoom.unwrap(),
+            rows.len(),
+            input_area / threshold
+        );
+    }
 }
 
 /// Small scattered fields (60-200 m, EPSG:4326) over a 1°×1° block near
@@ -3109,8 +2931,7 @@ fn small_factor_placeholders_reach_the_tiles() {
 
 /// A global `--collapse-square` must not leak polygon carrier squares into
 /// a `point` representation band: at a point-band level the contract is
-/// points only, so the accumulator stays off there (streaming AND
-/// in-memory).
+/// points only, so the accumulator stays off there.
 #[test]
 fn tiny_polygon_accumulator_stays_out_of_point_bands() {
     use tylertoo_core::overview::convert::RepresentationBand;
@@ -3119,42 +2940,40 @@ fn tiny_polygon_accumulator_stays_out_of_point_bands() {
     let tin = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &field_block(), true, None);
 
-    for streaming in [true, false] {
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let o = ConvertOptions {
-            simplify: SimplifyOptions {
-                collapse: CollapseMode::Square,
-                ..SimplifyOptions::default()
-            },
-            representation: vec![RepresentationBand {
-                min_zoom: 2,
-                max_zoom: 5,
-                repr: Representation::Point,
-            }],
-            ..opts(streaming)
-        };
-        let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
-        for (li, l) in report.levels.iter().enumerate() {
-            let zoom = l.zoom.unwrap();
-            if zoom > 5 {
-                continue; // canonical: the fields themselves
-            }
-            let rows = read_level_ids_geoms(tout.path(), li);
-            let polygons = rows
-                .iter()
-                .filter(|(_, g)| matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_)))
-                .count();
-            assert_eq!(
-                polygons,
-                0,
-                "streaming={streaming} z{zoom}: {polygons} polygon(s) in a point band ({} rows)",
-                rows.len()
-            );
-            assert!(
-                rows.iter().any(|(_, g)| matches!(g, Geometry::Point(_))),
-                "streaming={streaming} z{zoom}: point band carries no points"
-            );
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let o = ConvertOptions {
+        simplify: SimplifyOptions {
+            collapse: CollapseMode::Square,
+            ..SimplifyOptions::default()
+        },
+        representation: vec![RepresentationBand {
+            min_zoom: 2,
+            max_zoom: 5,
+            repr: Representation::Point,
+        }],
+        ..opts()
+    };
+    let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+    for (li, l) in report.levels.iter().enumerate() {
+        let zoom = l.zoom.unwrap();
+        if zoom > 5 {
+            continue; // canonical: the fields themselves
         }
+        let rows = read_level_ids_geoms(tout.path(), li);
+        let polygons = rows
+            .iter()
+            .filter(|(_, g)| matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_)))
+            .count();
+        assert_eq!(
+            polygons,
+            0,
+            "z{zoom}: {polygons} polygon(s) in a point band ({} rows)",
+            rows.len()
+        );
+        assert!(
+            rows.iter().any(|(_, g)| matches!(g, Geometry::Point(_))),
+            "z{zoom}: point band carries no points"
+        );
     }
 }
 
@@ -3174,34 +2993,32 @@ fn tiny_polygon_accumulator_is_inert_in_partitioning_mode() {
         _ => unreachable!(),
     };
 
-    for streaming in [true, false] {
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let o = ConvertOptions {
-            mode: Mode::Partitioning,
-            simplify: SimplifyOptions {
-                collapse: CollapseMode::Square,
-                ..SimplifyOptions::default()
-            },
-            ..opts(streaming)
-        };
-        let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
-        let total: usize = report.levels.iter().map(|l| l.feature_count).sum();
-        assert_eq!(
-            total,
-            fields.len(),
-            "streaming={streaming}: feature-once broken (a carrier square appeared)"
-        );
-        for li in 0..report.levels.len() {
-            for (id, g) in read_level_ids_geoms(tout.path(), li) {
-                let area = match &g {
-                    Geometry::Polygon(p) => p.unsigned_area(),
-                    _ => panic!("streaming={streaming}: row {id} is not a polygon"),
-                };
-                assert!(
-                    (area - field_area).abs() < field_area * 1e-6,
-                    "streaming={streaming}: row {id} has area {area:e}, not a verbatim field ({field_area:e})"
-                );
-            }
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let o = ConvertOptions {
+        mode: Mode::Partitioning,
+        simplify: SimplifyOptions {
+            collapse: CollapseMode::Square,
+            ..SimplifyOptions::default()
+        },
+        ..opts()
+    };
+    let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+    let total: usize = report.levels.iter().map(|l| l.feature_count).sum();
+    assert_eq!(
+        total,
+        fields.len(),
+        "feature-once broken (a carrier square appeared)"
+    );
+    for li in 0..report.levels.len() {
+        for (id, g) in read_level_ids_geoms(tout.path(), li) {
+            let area = match &g {
+                Geometry::Polygon(p) => p.unsigned_area(),
+                _ => panic!("row {id} is not a polygon"),
+            };
+            assert!(
+                (area - field_area).abs() < field_area * 1e-6,
+                "row {id} has area {area:e}, not a verbatim field ({field_area:e})"
+            );
         }
     }
 }
@@ -3262,28 +3079,26 @@ fn polar_polygons(n: usize) -> Vec<Option<Geometry<f64>>> {
 
 #[test]
 fn all_features_out_of_crs_range_errors_rather_than_producing_nothing() {
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &webmerc_meter_polygons(3), true, None);
-        let err = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap_err();
-        let ConvertError::AllFeaturesOutOfRange {
-            out_of_range,
-            unprojectable,
-            total,
-            ..
-        } = &err
-        else {
-            panic!("streaming={streaming}: expected AllFeaturesOutOfRange, got: {err}");
-        };
-        assert_eq!((*out_of_range, *unprojectable, *total), (3, 0, 3));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("3 of 3 feature(s) (100.0%) cannot be tiled")
-                && msg.contains("gpio convert reproject"),
-            "streaming={streaming}: message must name the loss and the gpio fix: {msg}"
-        );
-    }
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &webmerc_meter_polygons(3), true, None);
+    let err = convert_to_overviews(tin.path(), tout.path(), &opts()).unwrap_err();
+    let ConvertError::AllFeaturesOutOfRange {
+        out_of_range,
+        unprojectable,
+        total,
+        ..
+    } = &err
+    else {
+        panic!("expected AllFeaturesOutOfRange, got: {err}");
+    };
+    assert_eq!((*out_of_range, *unprojectable, *total), (3, 0, 3));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("3 of 3 feature(s) (100.0%) cannot be tiled")
+            && msg.contains("gpio convert reproject"),
+        "message must name the loss and the gpio fix: {msg}"
+    );
 }
 
 /// The #429 symptom with legal CRS84 coordinates: everything sits north of
@@ -3291,35 +3106,33 @@ fn all_features_out_of_crs_range_errors_rather_than_producing_nothing() {
 /// "0 tiles, exit 0" here was the review's S1-3 finding.
 #[test]
 fn all_features_beyond_the_mercator_limit_error_rather_than_producing_nothing() {
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &polar_polygons(3), true, None);
-        let err = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap_err();
-        let ConvertError::AllFeaturesOutOfRange {
-            out_of_range,
-            unprojectable,
-            total,
-            ..
-        } = &err
-        else {
-            panic!("streaming={streaming}: expected AllFeaturesOutOfRange, got: {err}");
-        };
-        assert_eq!(
-            (*out_of_range, *unprojectable, *total),
-            (0, 3, 3),
-            "streaming={streaming}: lat 86–88 is valid lon/lat, just untileable"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("outside the Web Mercator tiling domain (|lat| > 85.05°)"),
-            "streaming={streaming}: the message must name the real cause: {msg}"
-        );
-        assert!(
-            !msg.contains("gpio convert reproject"),
-            "streaming={streaming}: reprojecting to 4326 fixes nothing here: {msg}"
-        );
-    }
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &polar_polygons(3), true, None);
+    let err = convert_to_overviews(tin.path(), tout.path(), &opts()).unwrap_err();
+    let ConvertError::AllFeaturesOutOfRange {
+        out_of_range,
+        unprojectable,
+        total,
+        ..
+    } = &err
+    else {
+        panic!("expected AllFeaturesOutOfRange, got: {err}");
+    };
+    assert_eq!(
+        (*out_of_range, *unprojectable, *total),
+        (0, 3, 3),
+        "lat 86–88 is valid lon/lat, just untileable"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("outside the Web Mercator tiling domain (|lat| > 85.05°)"),
+        "the message must name the real cause: {msg}"
+    );
+    assert!(
+        !msg.contains("gpio convert reproject"),
+        "reprojecting to 4326 fixes nothing here: {msg}"
+    );
 }
 
 #[test]
@@ -3327,57 +3140,50 @@ fn partial_out_of_range_features_are_counted_and_conversion_succeeds() {
     // 1 of 3 features carries meter-scale coordinates: the conversion still
     // succeeds (the two lon/lat features tile fine) but the report counts the
     // stray one so the CLI can say so.
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let mut geoms = spread_points(2);
-        geoms.extend(webmerc_meter_polygons(1));
-        write_input(tin.path(), &geoms, true, None);
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let mut geoms = spread_points(2);
+    geoms.extend(webmerc_meter_polygons(1));
+    write_input(tin.path(), &geoms, true, None);
 
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
-            .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
-        assert_eq!(
-            (report.out_of_range_features, report.unprojectable_features),
-            (1, 0),
-            "streaming={streaming}: exactly the meter-scale feature is out of range"
-        );
-        assert_eq!(report.input_features, 3, "streaming={streaming}");
-    }
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts())
+        .unwrap_or_else(|e| panic!("conversion failed: {e}"));
+    assert_eq!(
+        (report.out_of_range_features, report.unprojectable_features),
+        (1, 0),
+        "exactly the meter-scale feature is out of range"
+    );
+    assert_eq!(report.input_features, 3);
 }
 
 /// The partial polar case: a mostly-temperate file with one Arctic feature
 /// converts fine, and the untileable one is counted rather than swallowed.
 #[test]
 fn partial_beyond_mercator_features_are_counted_and_conversion_succeeds() {
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let mut geoms = spread_points(2);
-        geoms.extend(polar_polygons(1));
-        write_input(tin.path(), &geoms, true, None);
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let mut geoms = spread_points(2);
+    geoms.extend(polar_polygons(1));
+    write_input(tin.path(), &geoms, true, None);
 
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
-            .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
-        assert_eq!(
-            (report.out_of_range_features, report.unprojectable_features),
-            (0, 1),
-            "streaming={streaming}: the Arctic polygon is untileable, not out of range"
-        );
-        assert_eq!(report.input_features, 3, "streaming={streaming}");
-    }
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts())
+        .unwrap_or_else(|e| panic!("conversion failed: {e}"));
+    assert_eq!(
+        (report.out_of_range_features, report.unprojectable_features),
+        (0, 1),
+        "the Arctic polygon is untileable, not out of range"
+    );
+    assert_eq!(report.input_features, 3);
 }
 
 #[test]
 fn in_range_input_reports_zero_untileable_features() {
-    for streaming in [true, false] {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &spread_points(4), true, None);
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap();
-        assert_eq!(
-            (report.out_of_range_features, report.unprojectable_features),
-            (0, 0),
-            "streaming={streaming}"
-        );
-    }
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &spread_points(4), true, None);
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts()).unwrap();
+    assert_eq!(
+        (report.out_of_range_features, report.unprojectable_features),
+        (0, 0)
+    );
 }
