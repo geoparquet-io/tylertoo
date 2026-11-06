@@ -327,7 +327,8 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 
 * `ConfigError`: An option out of range or refused.
 * `ValueError`: A malformed band spec, overlapping bands of one layer, or a missing band input.
-* `RuntimeError`: A band failed to convert, export, or merge.
+* `MemoryError`: A band's conversion or export ran out of its memory budget.
+* `RuntimeError`: A band failed to convert, export, or merge for any other reason. A band's error takes the class of its cause, so a band with bad input raises ValueError, as convert() would.
 
 ### Example
 

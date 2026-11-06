@@ -22,7 +22,7 @@
 //! rows are identified from their decoded values rather than chunk averages.
 //!
 //! One `#[test]` on purpose: the overrides are process environment, and the
-//! pass-2 memory probe caches its first answer for the process, so the
+//! pass-2 memory probe caches its machine figure for the process, so the
 //! scenarios run in a fixed order in one test binary of their own.
 
 use std::path::Path;
