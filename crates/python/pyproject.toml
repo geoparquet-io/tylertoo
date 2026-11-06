@@ -45,7 +45,7 @@ dev = [
     "mypy>=1.14",
     # Type checker for the package and its extension stub (CI: Python
     # Quality). Exact pin: ty is pre-1.0 and its rules still move.
-    "ty==0.0.91",
+    "ty==0.0.96",
     "vulture>=2.13",
     "xenon>=0.9",
     "pip-audit>=2.7",
@@ -56,9 +56,9 @@ dev = [
 # Exact pins: tutorial output is compared line by line, and zensical is
 # alpha. Run `uv sync --group docs`.
 docs = [
-    "zensical==0.0.68; python_version >= '3.11'",
+    "zensical==0.0.74; python_version >= '3.11'",
     "geoparquet-io==1.7.0; python_version >= '3.11'",
-    "duckdb==1.5.6; python_version >= '3.11'",
+    "duckdb==2.0.0; python_version >= '3.11'",
     "duckdb-cli==1.5.6; python_version >= '3.11'",
 ]
 
