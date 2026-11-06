@@ -25,12 +25,16 @@ rigged one. The "thinning off" column re-runs tylertoo with `--verbatim
 Pro, median of 2 warm runs; one recorded run on a non-idle machine, so treat
 ratios as approximate.
 
+<!-- bench:e2e-corpus/tippecanoe-table -->
 | dataset (class) | features | tylertoo | tippecanoe e2e | speedup | speedup, thinning off | peak RSS (tylertoo / tippecanoe) |
 |---|---|---|---|---|---|---|
 | NYC places (point) † | 597,782 | 1.39 s | 30.03 s | **21.6×** | 2.4×* | 600 / 519 MB |
 | Portland roads (line) | 301,609 | 1.40 s | 28.30 s | **20.2×** | 16.3× | 1,611 / 652 MB |
 | Portland buildings (polygon) | 813,456 | 2.69 s | 57.22 s | **21.3×** | 16.3× | 999 / 967 MB |
 | Moldova parcels (polygon, dense) | 631,910 | 13.87 s | 119.28 s | **8.6×** | 5.9× | 1,848 / 926 MB |
+
+_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+<!-- /bench -->
 
 The honest footnotes, which are the point of this table:
 
@@ -44,7 +48,7 @@ The honest footnotes, which are the point of this table:
   peak RSS, 4.07× tippecanoe's. Both tools drop points by design at
   production settings, so neither point ratio describes how anyone would
   actually run them. Read the line and polygon rows for parity numbers.
-- tylertoo's peak memory is **higher on three of four datasets** — up to 2.5×
+- tylertoo's peak memory is **higher on three of four datasets** — up to <!-- bench:e2e-corpus/max-memory-ratio -->2.5×<!-- /bench -->
   on lines. The speed is parallelism (6–7 cores busy vs tippecanoe's ~2) plus
   the native GeoParquet read, paid for in working set.
 - Archive sizes are smaller or equal except Portland buildings (1.11× at
