@@ -8626,7 +8626,7 @@ mod tests {
         let declared = dir.path().join("declared.parquet");
         write_input(&declared, &synthetic_geometries(), false, None);
         let run = |input: &Path, name: &str| {
-            convert_to_overviews(input, &dir.path().join(name), &ConvertOptions::default()).unwrap()
+            convert_to_overviews(input, dir.path().join(name), &ConvertOptions::default()).unwrap()
         };
         let r = run(&bare, "o1.parquet");
         assert_eq!(
