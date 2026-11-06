@@ -44,6 +44,17 @@ fn replay<T: Debug, E: Debug>(
     hostile: &[&str],
     hook: impl Fn(&[u8]) -> Result<T, E>,
 ) {
+    replay_except(target, hostile, "", hook);
+}
+
+/// [`replay`], leaving out seeds whose name starts with `skip` (a non-empty
+/// prefix): the caller runs those under a timeout.
+fn replay_except<T: Debug, E: Debug>(
+    target: &str,
+    hostile: &[&str],
+    skip: &str,
+    hook: impl Fn(&[u8]) -> Result<T, E>,
+) {
     let all = seeds(target);
     for name in hostile {
         assert!(
@@ -52,6 +63,9 @@ fn replay<T: Debug, E: Debug>(
         );
     }
     for (name, bytes) in all {
+        if !skip.is_empty() && name.starts_with(skip) {
+            continue;
+        }
         let result = hook(&bytes);
         if !hostile.contains(&name.as_str()) {
             assert!(result.is_ok(), "{target}/{name}: {result:?}");
@@ -189,29 +203,35 @@ fn overview_file_seeds() {
 fn remote_footer_seeds() {
     // #683's and #687's crash inputs: a crafted ARROW:schema key and a
     // crafted page's definition levels, refused (#779).
-    replay(
+    replay_except(
         "remote_footer",
         &[
             "seed-issue-683-arrow-schema.parquet",
             "seed-issue-687-def-levels.parquet",
-            "seed-issue-789-slow.parquet",
-            "seed-issue-789-timeout.parquet",
         ],
+        "seed-issue-789-",
         tylertoo_core::input::fuzz_remote_footer,
     );
     // #789: nested sets of `uuid`s in a page header cost parquet-rs minutes
-    // of CPU (it skips them for free at end of input). Fail the test, not the
-    // run, if one is ever skipped slowly again.
+    // of CPU (it skips them for free at end of input). These seeds run only
+    // here, on a thread, so a regression fails at 30 s instead of hanging.
     for (name, bytes) in seeds("remote_footer")
         .into_iter()
         .filter(|(n, _)| n.starts_with("seed-issue-789-"))
     {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(tylertoo_core::input::fuzz_remote_footer(&bytes).is_err());
+            let _ = tx.send(
+                tylertoo_core::input::fuzz_remote_footer(&bytes)
+                    .map(|_| ())
+                    .map_err(|e| format!("{e:?}")),
+            );
         });
-        let refused = rx.recv_timeout(std::time::Duration::from_secs(30));
-        assert_eq!(refused, Ok(true), "{name} must be refused quickly");
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("{name} did not finish in 30 s"))
+            .expect_err("a hostile page header must be refused");
+        assert!(err.contains("unexpected end of file"), "{name}: {err}");
     }
 }
 
