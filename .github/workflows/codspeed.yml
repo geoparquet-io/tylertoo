@@ -6,24 +6,27 @@
 # load, so unlike bench-regression.yml this needs no opt-in label, and
 # CodSpeed comments per-bench deltas against the base branch.
 #
+# Bench set (#810): the `cpu` benches of crates/core/benches/benches.toml,
+# minus the [codspeed] exemptions in ci/exemptions.toml, printed by
+# scripts/bench_list.py. Syscall-dominated benches (pipeline, coverage_fill,
+# assign: file I/O and thread wake-ups, which simulation leaves out of its
+# count) run only in bench-regression.yml's wall-clock gate.
+#
 # What runs when (simulation is slow: every bench runs under Valgrind):
 #   pull_request  only PRs touching crates/core or the build (`paths`), and
-#                 only the benches whose code the PR touches, as chosen by
-#                 scripts/codspeed_benches.sh. CodSpeed reports the others
-#                 as "skipped" with their baseline numbers (partial runs).
+#                 only the benches whose code the PR touches: each bench's
+#                 `paths` in benches.toml (`bench_list.py codspeed`). CodSpeed
+#                 reports the others as "skipped" with their baseline numbers.
 #                 A PR touching no benched code skips every step and passes.
-#   push (main)   every bench, on pushes that touch the same paths plus
-#                 Cargo.lock: these runs are the baselines. A push that
-#                 touches none of them can't move a bench, and CodSpeed
-#                 compares PRs against the newest main commit with a run.
+#   push (main)   every CodSpeed bench on every push, unfiltered: these runs
+#                 are the baselines, so a PR always has a run at its base
+#                 commit (no "no successful run was found on main" fallback
+#                 to an older commit, #810).
 #
 # The benches build against `codspeed-criterion-compat` (renamed to
 # `criterion` in crates/core/Cargo.toml), so their code is unchanged and plain
 # `cargo bench` still runs ordinary criterion locally and in
 # bench-regression.yml.
-#
-# Bench set: scripts/criterion_compare.sh --list, the same gated set as the
-# regression job (`assign_scaling` is a wall-clock harness, not criterion).
 #
 # bench-regression.yml is the wall-clock cross-check, behind the `benchmark`
 # label and weekly on main: instruction counts miss effects such as
@@ -36,28 +39,19 @@ name: CodSpeed
 
 on:
   pull_request:
-    # Keep in step with GLOBAL and the bench map in scripts/codspeed_benches.sh.
+    # Keep in step with global_paths in crates/core/benches/benches.toml.
     # No Cargo.lock: a lockfile-only PR (Renovate, an advisory bump) is
     # measured by the run on main after it merges (#759).
     paths:
       - "crates/core/**"
       - "Cargo.toml"
+      - "ci/exemptions.toml"
       - ".github/workflows/codspeed.yml"
-      - "scripts/criterion_compare.sh"
-      - "scripts/codspeed_benches.sh"
-  # Main runs every bench, but only when benched code changed: CodSpeed
-  # compares a PR against the newest base commit that has a run, so a push
-  # that touches none of this needs no new baseline. Cargo.lock is here,
-  # unlike on PRs, so a dependency bump still gets measured.
+      - "scripts/bench_list.py"
+  # Every push to main, unfiltered (#810): each one is the base some PR
+  # compares against.
   push:
     branches: [main]
-    paths:
-      - "crates/core/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/codspeed.yml"
-      - "scripts/criterion_compare.sh"
-      - "scripts/codspeed_benches.sh"
   workflow_dispatch:
 
 permissions:
@@ -91,17 +85,21 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
       - name: Select benches
         id: select
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ]; then
             echo "Changed files:"
             git diff --name-only HEAD^1 HEAD | sed 's/^/  /'
-            benches=$(git diff --name-only HEAD^1 HEAD | scripts/codspeed_benches.sh)
+            benches=$(git diff --name-only HEAD^1 HEAD | scripts/bench_list.py codspeed)
           else
-            benches=$(scripts/codspeed_benches.sh --all)
+            benches=$(scripts/bench_list.py codspeed --all)
           fi
           echo "Selected benches: ${benches:-none (no benched code changed)}"
           echo "benches=$benches" >> "$GITHUB_OUTPUT"
@@ -120,6 +118,11 @@ jobs:
           gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+
+      # Cached or downloaded, the fixtures must match benchmarks/fixtures.sha256.
+      - name: Verify test fixtures
+        if: steps.select.outputs.benches != ''
+        run: scripts/ci/verify_fixtures.sh tests/fixtures/realdata
 
       - name: Install Rust
         if: steps.select.outputs.benches != ''

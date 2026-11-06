@@ -1,0 +1,70 @@
+# Every exemption from every check (#810), each with its reason.
+#
+#   [<check>.<name>]
+#   reason = "why, with the evidence or issue"
+#
+# scripts/ci/tests/test_exemptions.py pins the entry count: add or remove one
+# there too. Checks that read this file:
+#
+#   codspeed  a bench in crates/core/benches/benches.toml that codspeed.yml
+#             does not run (scripts/bench_list.py)
+#   weekly    a bench the wall-clock gate (bench-regression.yml,
+#             scripts/criterion_compare.sh) does not run
+#   noisy     a criterion bench-name glob that criterion_gate.py fails at
+#             --noisy-fail (+50%) instead of --fail (+10%)
+
+# --- CodSpeed: syscall-dominated benches ------------------------------------
+# CodSpeed's comments on #799 and #805: "8 benchmarks are dominated by system
+# calls ... the reported value understates the real cost" (the comments link
+# the list, not name it). Exactly 8 benchmarks write files or wake threads in
+# their timed closure: pipeline_convert/2 + pipeline_export/2 and
+# coverage_fill/export/{off,fill} (file I/O), assign/{50000,200000} (rayon
+# wake-ups). The weekly wall-clock gate measures them.
+
+[codspeed.pipeline]
+reason = "Writes the overview and archive to disk in the timed closure: syscall-dominated in simulation (#799, #805)."
+
+[codspeed.coverage_fill]
+reason = "export_pmtiles writes the archive to disk in the timed closure: syscall-dominated in simulation (#799, #805)."
+
+[codspeed.assign]
+reason = "assign_levels_bounded wakes rayon workers in the timed closure: syscall-dominated in simulation (#799, #805; see benches/pipeline.rs)."
+
+[codspeed.assign_scaling]
+reason = "A plain wall-clock thread-scaling harness (harness = false, no Criterion groups); nothing for CodSpeed to measure."
+
+[codspeed.hostile_geometry]
+reason = "The engine scorecard for #205 (production vs raw SH vs i_overlay), not a regression signal; its corpus case needs the geometry-test-data submodule, which the bench jobs do not check out, and TYLERTOO_BENCH_REQUIRE_FIXTURES=1 turns that into a panic. clipping covers the same engines on the production path."
+
+# --- Weekly wall-clock gate --------------------------------------------------
+
+[weekly.assign_scaling]
+reason = "A wall-clock thread-scaling harness at dataset scale, too large and too noisy for repeated sampling; run by hand (DEVELOPMENT.md)."
+
+[weekly.hostile_geometry]
+reason = "Same as [codspeed.hostile_geometry]: a #205 scorecard that needs the geometry-test-data submodule."
+
+# --- Noisy benches (gate at +50%, not +10%) ---------------------------------
+# Four A/A runs (#678: 38776884521, 38776888984, 38777309254, 38784871499)
+# moved these by 12-26% between runs of the same code with intervals under 3
+# points wide. Root cause for the large sizes (#810): with glibc's default
+# mmap/trim thresholds, each clip_polygon_sh call at 100k and 316k vertices
+# took ~590 and ~1,930 minor page faults, all fresh kernel-zeroed pages, so
+# those benches timed the VM's fault path. benches/clipping.rs now keeps freed
+# memory in the heap (0 faults per call), as mimalloc does in the shipped CLI.
+# That leaves sutherland_hodgman/1000 (+14%, no faults) unexplained, and no
+# quiet-machine A/A run has confirmed the fix. Re-run A/A dispatches (a
+# branch whose only change is outside the benches) and drop these entries
+# when the SH benches stay inside +10%.
+
+[noisy."sutherland_hodgman/*"]
+reason = "Moved up to +14.9% in A/A runs (#678); page-fault noise fixed in #810, sutherland_hodgman/1000 unexplained, pending A/A re-measure."
+
+[noisy."wide_polygon_clip/sutherland_hodgman/*"]
+reason = "Moved up to +26.2% in A/A runs (#678); page-fault noise fixed in #810, pending A/A re-measure."
+
+[noisy."bbox_containment_large_features_z4/10_boundaries_*"]
+reason = "+20% on the 2026-11-02 runner (#773) against -4% in local interleaved re-runs of the same pair."
+
+[noisy."bbox_containment_large_features_z4/100_boundaries_*"]
+reason = "+22% on the 2026-11-02 runner (#773) against -3% in local interleaved re-runs of the same pair."

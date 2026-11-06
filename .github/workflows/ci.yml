@@ -30,7 +30,10 @@
 #                   the --help flag check, and the strict site build
 #   Coverage        cargo-llvm-cov -> lcov; Codecov native project targets
 #                   cover workspace, core and CLI
-#   Gate scripts    pytest for the independent archive verifier
+#   Gate scripts    pytest for scripts/ci/tests (archive verifier, the
+#                   bench list and exemptions, the docs generator, and this
+#                   file's CI passed wiring) and the benchmark harness, plus
+#                   the generated-docs check (scripts/gen_bench_docs.py)
 #   CI passed       fails if any job above failed or was cancelled; the only
 #                   CI context branch protection requires
 #
@@ -189,6 +192,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # Cached or downloaded, the fixtures must match benchmarks/fixtures.sha256 (#810).
+      - name: Verify test fixtures
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: scripts/ci/verify_fixtures.sh tests/fixtures/realdata
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
@@ -317,6 +326,12 @@ jobs:
           gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+
+      # Cached or downloaded, the fixtures must match benchmarks/fixtures.sha256 (#810).
+      - name: Verify test fixtures
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: scripts/ci/verify_fixtures.sh tests/fixtures/realdata
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
@@ -466,6 +481,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # Cached or downloaded, the fixtures must match benchmarks/fixtures.sha256 (#810).
+      - name: Verify test fixtures
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: scripts/ci/verify_fixtures.sh tests/fixtures/realdata
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
@@ -610,6 +631,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # Cached or downloaded, the fixtures must match benchmarks/fixtures.sha256 (#810).
+      - name: Verify test fixtures
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: scripts/ci/verify_fixtures.sh tests/fixtures/realdata
+
       - name: Sync environment (builds the extension module)
         run: uv sync --locked
 
@@ -738,6 +765,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # Cached or downloaded, the fixtures must match benchmarks/fixtures.sha256 (#810).
+      - name: Verify test fixtures
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: scripts/ci/verify_fixtures.sh tests/fixtures/realdata
+
       - name: Sync environment (builds the extension module)
         run: uv sync --locked
 
@@ -824,6 +857,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # Cached or downloaded, the fixtures must match benchmarks/fixtures.sha256 (#810).
+      - name: Verify test fixtures
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: scripts/ci/verify_fixtures.sh tests/fixtures/realdata
+
       - name: Regenerate CLI reference
         run: |
           cargo run --locked -p tylertoo --features gen-docs -- gen-reference-docs \
@@ -894,6 +933,12 @@ jobs:
           gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+
+      # Cached or downloaded, the fixtures must match benchmarks/fixtures.sha256 (#810).
+      - name: Verify test fixtures
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: scripts/ci/verify_fixtures.sh tests/fixtures/realdata
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
@@ -1266,7 +1311,9 @@ jobs:
             ) || exit 1
           done
 
-  # Independent archive-verifier regression tests; one scripts/ci pytest step.
+  # The repo's own scripts (#810): the independent archive verifier, the one
+  # bench list (scripts/bench_list.py) and exemptions file, the docs
+  # generator, the benchmark harness, and the published numbers.
   gate-scripts:
     name: Gate scripts
     runs-on: ubuntu-latest
@@ -1277,11 +1324,24 @@ jobs:
           persist-credentials: false
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      - name: Test the archive verifier
+      - name: Test the scripts/ci gate scripts
         run: >-
           uv run --no-project --with pytest==8.4.2 --with pmtiles==3.8.1
           --with mapbox-vector-tile==2.2.0 --with shapely==2.2.0 --with pyarrow==26.0.0
+          --with pyyaml==6.0.3
           pytest -q scripts/ci/tests
+      # run_manifest's tests drive GNU time (/usr/bin/time), not in the image.
+      - name: Test the benchmark harness
+        if: ${{ !cancelled() }}
+        run: >-
+          sudo apt-get install -y time &&
+          uv run --no-project --python 3.12 --with pytest==8.4.2
+          pytest -q benchmarks/test_run_manifest.py benchmarks/test_valve_guard.py
+          benchmarks/coalesce/test_run.py benchmarks/e2e/test_run_e2e.py
+      # Every published benchmark number is generated from benchmarks/results/.
+      - name: Generated docs match benchmarks/results
+        if: ${{ !cancelled() }}
+        run: uv run --no-project python scripts/gen_bench_docs.py --check
 
   # The one CI context branch protection requires. Every job above is
   # blocking through it: it fails when any of them failed or was cancelled.

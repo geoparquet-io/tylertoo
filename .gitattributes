@@ -4,3 +4,6 @@ tests/fixtures/realdata/*.parquet filter=lfs diff=lfs merge=lfs -text
 tests/fixtures/realdata/adm2_polygons.parquet !filter !diff !merge text=auto
 # Fuzz seed corpora are raw bytes (PMTiles headers, directories, tiles)
 fuzz/corpus/** binary
+# Bash scripts and the sha256 pins must stay LF on Windows checkouts (autocrlf).
+*.sh text eol=lf
+benchmarks/fixtures.sha256 text eol=lf
