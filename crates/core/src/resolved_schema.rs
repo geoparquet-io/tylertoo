@@ -115,9 +115,6 @@ impl ResolvedSchema {
             .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
             .map(|(_, v)| v.clone());
         let geo = geo_json.as_deref().map(parse_geo_json).transpose()?;
-        if let Some(geo) = &geo {
-            warn_geo_version(geo, diagnostics);
-        }
         let fields: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         let primary_column = geo.as_ref().and_then(primary_name).map(str::to_owned);
         let geometry_columns = geometry_columns(schema, geo.as_ref(), metadata);
@@ -126,6 +123,9 @@ impl ResolvedSchema {
         let geometry_index = selected.and_then(|n| fields.iter().position(|f| f == n));
         let geometry_name = selected.map(str::to_owned);
         let native = metadata.and_then(|md| find_native_geometry_leaf_column(md, selected?));
+        if let Some(geo) = &geo {
+            warn_geo_version(geo, native.is_some(), diagnostics);
+        }
         let crs = resolve_crs(
             geo.as_ref(),
             selected.or(primary_column.as_deref()),
@@ -815,7 +815,9 @@ pub(crate) fn geo_version_disposition(version: Option<&str>) -> GeoVersionDispos
 /// "mixed", "version": ...}`: `version` is the version string for `known`
 /// and `unknown`, the sorted distinct versions (`null` for a part with
 /// none) for `mixed`, and absent for `missing`. `known` means every part
-/// declares the same version, and its major is one this reader knows (1, 2).
+/// resolves to the same version, and its major is one this reader knows
+/// (1, 2). A part resolves to its `geo.version`, or to "2.0.0" when it has no
+/// such field but a native Parquet geometry column (native input implies 2.0).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 #[serde(tag = "status", content = "version", rename_all = "snake_case")]
@@ -869,12 +871,20 @@ fn declared_version(geo_json: &Value) -> Option<String> {
 /// `covering`) are read best-effort and a future spec most likely still
 /// carries them, so rejecting the file outright would refuse inputs that
 /// parse fine — matching the issue's "hard-warn on unknown majors" ask.
-fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnostics) {
+///
+/// A native geometry column implies GeoParquet 2.0, so a `geo` key without a
+/// `version` is not worth a warning there (the report says "2.0.0" too).
+fn warn_geo_version(
+    geo_json: &Value,
+    native_implies_2: bool,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
     // A non-string `version` (`1.1`, `true`, an object) is present but not a
     // version: unknown, not "missing" (#708).
     let version = declared_version(geo_json);
     match geo_version_disposition(version.as_deref()) {
         GeoVersionDisposition::Known => {}
+        GeoVersionDisposition::Missing if native_implies_2 => {}
         GeoVersionDisposition::Missing => {
             diagnostics.once(crate::diagnostics::Diagnostic::CrsMetadata {
                 count: 1,
@@ -951,7 +961,7 @@ pub(crate) fn crs_info_from_kv_metadata(
 
     // #451: flag a `geo.version` from a spec this reader does not know
     // before interpreting any of its fields.
-    warn_geo_version(&geo_json, diagnostics);
+    warn_geo_version(&geo_json, false, diagnostics);
 
     let primary_column = primary_name(&geo_json).unwrap_or(DEFAULT_GEOMETRY_COLUMN);
 
