@@ -1282,8 +1282,7 @@ one stable sort per tile over features already in memory.
 
 ## Stable feature ids: `--feature-id`
 
-Every MVT feature carries an `id`, defaulting to its position in one tile
-at one zoom. This tile-local id can change across tiles and zooms.
+By default MVT features have no `id`.
 
 `--feature-id COLUMN` writes the column's value as the feature id instead, on
 every tile and zoom the feature appears in. It matches tippecanoe's
@@ -1332,9 +1331,8 @@ map.setFeatureState({ source, sourceLayer, id }, { hover: true });
   give features that share an id, and feature state then applies to all
   of them at once.
 
-`pyramid` does not take `--feature-id`, and neither do the Python
-`pyramid()` and `convert()` one-shot. Use `overview()` and then
-`export_pmtiles(..., feature_id=...)` instead.
+`pyramid` also accepts `--feature-id`. The Python `convert()`, `pyramid()`,
+and `export_pmtiles()` functions accept `feature_id`.
 
 ---
 

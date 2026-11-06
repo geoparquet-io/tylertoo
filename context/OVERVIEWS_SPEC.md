@@ -507,6 +507,9 @@ subset of the above.
 
 ### 3.8 Versioning
 
+The format remains at version 0.x, independently of the tylertoo release
+version. Readers accept newer MINOR versions within the supported MAJOR.
+
 `version` is semver. Minor bumps MAY add optional fields but MUST NOT alter
 existing semantics; major bumps MAY break. Readers MUST ignore unrecognized
 fields and MUST NOT treat an unsupported MAJOR version as conforming.

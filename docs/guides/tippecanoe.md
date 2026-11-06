@@ -85,7 +85,7 @@ Reproduce with `./benchmarks/e2e/run_corpus.sh`.
 | `--drop-densest-as-needed`, `--drop-fraction-as-needed` | `--size-valve drop` | Drops features until the tile fits, keeping the largest polygons and lines and a uniform stride of points |
 | cluster centroid | `--cluster` | Winner keeps its own geometry and absorbs losers into `point_count` |
 | `--coalesce` family | coalescing (on by default) | Chains same-class segments before gates and thinning |
-| `--use-attribute-for-id` | `--feature-id` | Accepts integer or `DECIMAL(p,0)` columns. Rejects string, float, null, and negative ids. Without this flag, ids are tile-local. See [stable feature ids](../OVERVIEW_TUNING.md#stable-feature-ids-feature-id) |
+| `--use-attribute-for-id` | `--feature-id` | Accepts integer or `DECIMAL(p,0)` columns. Rejects string, float, null, and negative ids. Without this flag, features carry no id, as in tippecanoe. See [stable feature ids](../OVERVIEW_TUNING.md#stable-feature-ids-feature-id) |
 | `tile-join` to merge tilesets | `merge`, or `pyramid` bands sharing a zoom range | `merge` takes archives with disjoint tiles |
 | `tippecanoe-decode` | `decode` | Writes GeoParquet with one row per feature per tile, `zoom`, `layer`, and `mvt_id` columns, and simplified, clipped tile geometry |
 
