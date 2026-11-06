@@ -7,6 +7,85 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Breaking
+
+- **Tile output: no default MVT feature id (#443).** Without `--feature-id`
+  (Python `feature_id=`), tiles carry no MVT id; they used to carry a
+  tile-local one. Archives are 1–9% smaller on the test fixtures, so the
+  tile-size valve drops fewer features: the Madagascar admin fixture keeps
+  155 and 149 more features at z4 and z5 (+0.05% overall), with tile counts
+  unchanged. Pass `--feature-id <column>` for stable ids.
+- **Rust API freeze (#437, #436).** The stable API is the crate root: the
+  convert, export, check, tiles, pyramid and decode entry points, their
+  options, reports and errors, `ErrorKind`/`Classify` and `Compression`.
+  Every module is private; the CLI and Python bindings reach internals through
+  `tylertoo_core::internal`, which is `#[doc(hidden)]` and has no stability
+  guarantee.
+  - Options, reports, errors, kinds and their struct variants are
+    `#[non_exhaustive]`. Build options from `Default` with the `with_*`
+    setters, and build value records (`Band`, `PropertySelection`,
+    `AccumulateSpec`, `ClassRanking`, `TilesShard`, …) with their `new`.
+  - No arrow, parquet, geo-types, geoarrow, object_store, prost or
+    tylertoo-io type appears in a stable signature. A CI gate allows only
+    `tylertoo_core`, `core`, `alloc`, `std`, `serde_core` and `serde_json`
+    paths in the public-API baseline.
+  - `tylertoo-io` is published to crates.io as an internal crate of
+    tylertoo-core, with no stability guarantee.
+- **Typed errors (#438).** `Error::PMTilesWrite` and `Error::PMTilesRead`
+  are gone; archive, write and pyramid failures are `ArchiveError`,
+  `WriteError` and `PyramidError`. `GeoParquetRead` and `InvalidConfig`
+  carry typed reasons instead of strings, and a hostile page header has its
+  own variant. One classifier, `ErrorKind`, maps every error to a CLI exit
+  code and a Python exception.
+  - Pyramid errors take the class of their cause: a band archive mismatch
+    raises `ValueError` (was `RuntimeError`); a band whose input or memory
+    budget fails raises `ValueError` or `MemoryError`; a refused band option
+    exits 2 / raises `ConfigError`.
+  - Archive read errors say "Failed to read PMTiles" (was "Failed to write
+    PMTiles"), and the doubled prefixes on merge, pyramid-finalize and
+    archive-read errors are gone.
+- **Streaming option removed (#440).** `--no-streaming`, Python
+  `streaming=` and `ConvertOptions::streaming` no longer exist; streaming is
+  the only mode.
+- **Input rejected that was accepted before:**
+  - A multi-file input that mixes parts with a declared CRS and parts with
+    an assumed WGS84 (#708).
+  - A `geo` metadata value that is not a JSON object; the error names the
+    file and suggests `gpio convert` (#708).
+  - `--drop-gamma` below 1 (it was silently treated as 1) and a negative
+    `--simplify-factor` (it behaved like 0). `--drop-gamma` is not checked
+    under `--no-density-drop`.
+- **Python 3.11 or later.** Wheels are `cp311-abi3`; Python 3.9 and 3.10
+  are no longer supported.
+
+### Added
+
+- `--max-zoom auto:N` and Python `max_zoom="auto:N"` cap the automatic zoom
+  pick at N (#793). Plain `auto` keeps its z16 ceiling. Rust callers that
+  match `MaxZoom` exhaustively need the new `AutoCapped` arm.
+- The convert report gains `geo_version`:
+  `{"status": "known" | "unknown" | "missing" | "mixed", "version": ...}`,
+  covering every input part (#708).
+
+### Fixed
+
+- A crafted Parquet footer with an overlong varint, or a page header that
+  skips past the end of the file, is refused instead of allocating gigabytes
+  or spinning for minutes (#789).
+- A WKT projected CRS (`PROJCRS`, `PROJCS`, …) that embeds EPSG:4326 as its
+  base is no longer read as WGS84 (#708).
+- `TYLERTOO_AUTO_MEM_LIMIT_BYTES` set or changed after the first conversion
+  in a process is honoured; only the machine probe is cached.
+- No "geo metadata has no version" warning when a native GEOMETRY column
+  implies GeoParquet 2.0.
+- The overviews format version is independent of the tool version; the spec
+  stays 0.x and readers refuse a foreign MAJOR (#441).
+
+### Removed
+
+- Mutation testing (cargo-mutants) in CI, replaced by targeted proptest and
+  Hypothesis property suites (#677).
+
 ### Changed
 
 - The Python wheel uses mimalloc as its global allocator on every platform,
