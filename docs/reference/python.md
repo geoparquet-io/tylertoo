@@ -812,7 +812,7 @@ class SkippedPropertyColumn(TypedDict):
 
 ### `VariableDepthReport`
 
-How a `variable_depth=True` export stopped its branches.
+How a `variable_depth=True` export stopped branches.
 
 ```python
 class VariableDepthReport(TypedDict):
