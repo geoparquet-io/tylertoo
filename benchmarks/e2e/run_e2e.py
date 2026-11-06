@@ -51,9 +51,15 @@ FAIRNESS RULES THIS SCRIPT FOLLOWS
   built (null otherwise). Never "whatever is on PATH".
 * Both tools get the same zoom range, the same layer name, the same tile
   buffer and the same per-tile byte cap. The exact argv of both is recorded.
-* A discarded warm-up run precedes the timed repeats, so every measurement is
-  warm-cache for both tools. Median of N (default 3) is reported, with min/max.
-* Peak RSS comes from /usr/bin/time (Darwin `-l` / GNU `-v`), not sampling.
+* A discarded warm-up run of every leg precedes the timed rounds, so every
+  measurement is warm-cache for both tools. Each round runs every leg once,
+  and the order flips every round (tylertoo .. tippecanoe, then tippecanoe ..
+  tylertoo), so drift on the host lands on both tools, not on one. Median of
+  N rounds (default 3) is reported, with min/max.
+* Every run is timed by benchmarks/run_manifest.py (`timed`), the one owner of
+  timed runs: wall, user+sys CPU, effective cores and peak RSS from GNU
+  `/usr/bin/time -v`, not sampling. Linux only (GNU time); the macOS path
+  went with the move (#810).
 * Asymmetries that cannot be closed by flags are listed in README.md and are
   NOT quietly tuned away in either direction.
 
@@ -62,8 +68,9 @@ USAGE
     ./setup_tippecanoe.sh
     cargo build --release -p tylertoo
     python3 run_e2e.py --repeat 3 --geojson --quality-matched   # the full run
-        # -> results-<UTC timestamp>.json (gitignored); pass --out results.json
-        #    only when deliberately replacing the committed record
+        # -> results-<UTC timestamp>.json (gitignored); pass
+        #    --out ../results/e2e-fixtures.json only when deliberately
+        #    replacing the committed record, then run scripts/gen_bench_docs.py
     python3 run_e2e.py --only madagascar-adm4 --repeat 5
     python3 run_e2e.py --dataset big=/data/planet-buildings.parquet \
                        --only big --max-zoom 12         # cluster-scale run
@@ -88,6 +95,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+sys.path.insert(0, str(HERE.parent))
+
+import run_manifest as rm  # noqa: E402
 
 # --------------------------------------------------------------------------
 # Datasets
@@ -237,95 +247,136 @@ EXPECTED_TIPPECANOE_VERSION = "tippecanoe v2.79.0"
 # measurement
 # --------------------------------------------------------------------------
 
-def _time_flag() -> str:
-    return "-l" if platform.system() == "Darwin" else "-v"
-
-
-def _parse_peak_rss(text: str) -> int | None:
-    """Peak RSS in bytes from /usr/bin/time output (GNU or BSD/Darwin)."""
-    m = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", text)
-    if m:
-        return int(m.group(1)) * 1024
-    # Darwin: "  123456789  maximum resident set size" (already bytes)
-    m = re.search(r"^\s*(\d+)\s+maximum resident set size", text, re.M)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def _parse_cpu_pct(text: str) -> float | None:
-    """CPU utilisation (%) from /usr/bin/time output (GNU or BSD/Darwin).
-
-    GNU time prints it directly; Darwin prints real/user/sys on one line and
-    the percentage is (user + sys) / real. >100% means multi-core."""
-    m = re.search(r"Percent of CPU this job got:\s*(\d+)\s*%", text)
-    if m:
-        return float(m.group(1))
-    m = re.search(r"^\s*([\d.]+)\s+real\s+([\d.]+)\s+user\s+([\d.]+)\s+sys",
-                  text, re.M)
-    if m:
-        real, user, sys_ = (float(g) for g in m.groups())
-        if real > 0:
-            return round(100.0 * (user + sys_) / real, 1)
-    return None
-
-
 class CommandFailed(RuntimeError):
     def __init__(self, argv, rc, tail):
         super().__init__(f"exit {rc}: {' '.join(argv)}")
         self.argv, self.rc, self.tail = argv, rc, tail
 
 
-def measure(argv: list[str], *, unlink_first: Path | None = None) -> dict:
-    """Run argv once under /usr/bin/time; return wall seconds + peak RSS.
+class MissingInput(RuntimeError):
+    """A leg's input (the converted FlatGeobuf, say) was never produced."""
 
-    Wall comes from perf_counter (identical semantics on every platform);
-    peak RSS comes from the kernel via /usr/bin/time, which is exact rather
-    than sampled. The command's own stderr is interleaved with time's report
-    in the capture buffer; the regexes tolerate that.
+
+# No cap a real run should hit: cluster-scale --dataset runs take hours.
+CAPS = {"wall_s": 7 * 86400, "rss_gib": 1 << 20}
+
+
+def measure(argv: list[str], log: Path, *, unlink_first: Path | None = None) -> dict:
+    """Run argv once through run_manifest.timed (GNU time): wall, user+sys
+    CPU, effective cores and peak RSS from the kernel, exact rather than
+    sampled, and the TYLERTOO_PROFILE_JSON phases when tylertoo writes them.
     """
     # ogr2ogr's FlatGeobuf driver cannot DeleteLayer(), so `-overwrite` fails
     # on the second run. Removing the target first is also what makes every
     # repeat measure the same work rather than an overwrite fast path.
     if unlink_first is not None:
         unlink_first.unlink(missing_ok=True)
-    wrapped = ["/usr/bin/time", _time_flag(), *argv]
-    with tempfile.TemporaryFile("w+") as err:
-        t0 = time.perf_counter()
-        rc = subprocess.call(wrapped, stdout=subprocess.DEVNULL, stderr=err)
-        wall = time.perf_counter() - t0
-        err.seek(0)
-        errtext = err.read()
-    if rc != 0:
-        raise CommandFailed(argv, rc, errtext[-2000:])
+    res = rm.timed(argv, log, caps=CAPS)
+    if res["status"] != "ok":
+        raise CommandFailed(argv, res["returncode"], res["stderr_tail"] or "")
+    cores = res["effective_cores"]
     return {
-        "wall_s": wall,
-        "peak_rss_bytes": _parse_peak_rss(errtext),
-        "cpu_pct": _parse_cpu_pct(errtext),
-        "argv": argv,
+        "wall_s": res["wall_s"],
+        "cpu_s": res["cpu_s"],
+        "effective_cores": cores,
+        "peak_rss_bytes": res["peak_rss_kib"] * 1024 if res["peak_rss_kib"] else None,
+        # >100% means multi-core; kept for the published tables.
+        "cpu_pct": round(100 * cores, 1) if cores is not None else None,
+        "profile": res["profile"],
     }
 
 
-def repeat(argv: list[str], n: int, *, warmup: bool = True,
-           unlink_first: Path | None = None) -> dict:
-    """Warm-up run (discarded) then n timed runs; median reported."""
-    if warmup:
-        measure(argv, unlink_first=unlink_first)
-    runs = [measure(argv, unlink_first=unlink_first) for _ in range(n)]
+def summarize_leg(argv: list[str], runs: list[dict]) -> dict:
+    """Median of a leg's timed runs, with min/max and every wall."""
     walls = [r["wall_s"] for r in runs]
     rss = [r["peak_rss_bytes"] for r in runs if r["peak_rss_bytes"]]
-    cpu = [r["cpu_pct"] for r in runs if r["cpu_pct"] is not None]
+
+    def med(key):
+        vals = [r[key] for r in runs if r[key] is not None]
+        return round(statistics.median(vals), 2) if vals else None
+
     return {
         "argv": argv,
-        "runs": n,
+        "runs": len(runs),
         "wall_median_s": statistics.median(walls),
         "wall_min_s": min(walls),
         "wall_max_s": max(walls),
         "peak_rss_bytes": max(rss) if rss else None,
-        # Median utilisation across the repeats; >100% means multi-core.
-        "cpu_pct": round(statistics.median(cpu), 1) if cpu else None,
+        "cpu_pct": med("cpu_pct"),
+        "cpu_s": med("cpu_s"),
+        "effective_cores": med("effective_cores"),
+        "profile": runs[-1]["profile"],
         "wall_all_s": walls,
     }
+
+
+def converter_legs(converters: dict, tip_in: Path) -> tuple[dict, dict]:
+    """One leg per parquet -> fgb converter, and `chosen`: the converter
+    with the fastest warm-up, picked once. Its output is copied to `tip_in`,
+    tippecanoe's input, so the converter whose time the end-to-end sum
+    reports is the one whose output tippecanoe tiles."""
+    chosen: dict = {"tool": None, "wall_s": None}
+    tip_in.unlink(missing_ok=True)
+
+    def pick(tool: str, dst: Path, m: dict) -> None:
+        if chosen["wall_s"] is None or m["wall_s"] < chosen["wall_s"]:
+            shutil.copyfile(dst, tip_in)
+            chosen.update(tool=tool, wall_s=m["wall_s"])
+
+    legs = {f"convert:{tool}": {"argv": argv, "unlink_first": dst, "optional": f"convert:{tool}",
+                                "after_warmup": lambda m, t=tool, d=dst: pick(t, d, m)}
+            for tool, (argv, dst) in converters.items()}
+    return legs, chosen
+
+
+def run_rounds(legs: dict[str, dict], n: int, logdir: Path) -> tuple[dict, dict]:
+    """Time every leg n times, the tools alternating within each round.
+
+    `legs` maps a name to {argv, unlink_first?, needs?, after_warmup?,
+    optional?}, in dependency order. One discarded warm-up run of each leg,
+    in that order, makes every measurement warm-cache and produces the
+    inputs later legs read (`after_warmup(measurement)` copies an output to a stable
+    path; `needs` names the file a leg cannot start without). Then n
+    rounds, each running every leg once, in run_manifest.round_order: the
+    order flips every round, so drift on the host lands on both tools.
+
+    A failing leg with `optional` = a group name drops every leg of that
+    group and is returned in `failures` (name -> CommandFailed); any other
+    failure raises. Returns ({name: summarize_leg}, failures).
+    """
+    live = dict(legs)
+    failures: dict[str, CommandFailed] = {}
+    runs: dict[str, list[dict]] = {name: [] for name in legs}
+
+    def one(name: str, tag: str) -> None:
+        leg = live[name]
+        if leg.get("needs") is not None and not Path(leg["needs"]).exists():
+            raise MissingInput(f"{name}: {leg['needs']} was not produced")
+        try:
+            m = measure(leg["argv"], logdir / f"{name.replace(':', '-')}.{tag}.log",
+                        unlink_first=leg.get("unlink_first"))
+        except CommandFailed as exc:
+            if not leg.get("optional"):
+                raise
+            failures[name] = exc
+            group = leg["optional"]
+            for other in [k for k, v in live.items() if v.get("optional") == group]:
+                live.pop(other)
+            return
+        if tag == "warmup":
+            if leg.get("after_warmup"):
+                leg["after_warmup"](m)
+        else:
+            runs[name].append(m)
+
+    for name in list(legs):
+        if name in live:
+            one(name, "warmup")
+    for r in range(n):
+        for name in rm.round_order(list(live), r):
+            if name in live:
+                one(name, f"r{r}")
+    return {name: summarize_leg(live[name]["argv"], runs[name]) for name in live}, failures
 
 
 # --------------------------------------------------------------------------
@@ -373,8 +424,9 @@ def fgb_converters(src: Path, dstdir: Path, stem: str) -> dict[str, tuple[list[s
     On a 1,000-feature fixture that start-up IS the conversion time, and using
     gpio alone would hand tylertoo a free win that has nothing to do with
     tiling. ogr2ogr is a C binary with negligible start-up. The harness times
-    both when both exist and the e2e number uses the FASTER one — the
-    opposite of cherry-picking.
+    both when both exist and the e2e number uses the FASTER one (the fastest
+    warm-up, picked once, whose output tippecanoe then reads) — the opposite
+    of cherry-picking.
     """
     out = {}
     if shutil.which("ogr2ogr"):
@@ -717,7 +769,8 @@ def main() -> int:
     ap.add_argument("--out", default=None,
                     help="results file (default: results-<UTC timestamp>.json "
                          "next to this script, gitignored). The committed "
-                         "record results.json is only ever written when named "
+                         "records benchmarks/results/e2e-fixtures.json and "
+                         "e2e-corpus.json are only ever written when named "
                          "here explicitly")
     ap.add_argument("--markdown", default=None,
                     help="also write a markdown table here")
@@ -796,10 +849,29 @@ def main() -> int:
     # The work dir is removed on every exit path (success, a failed stage,
     # Ctrl-C) unless the caller asked to keep it or supplied it.
     try:
+        machine = machine_info()
         results = {
+            # The results-file contract of scripts/gen_bench_docs.py (#810).
+            "provenance": {
+                "commit": git_sha(),
+                "tylertoo_version": tyler_version,
+                "host": f"{machine.get('cpu')}, {machine.get('ram_gb')} GB RAM, "
+                        f"{machine.get('platform')}",
+                "nproc": os.cpu_count(),
+                "kernel": platform.release(),
+                "allocator": rm.detect_allocator(Path(tylertoo)),
+                "tool_versions": {
+                    "tippecanoe": tip_version.removeprefix("tippecanoe ").strip(),
+                    "tippecanoe_commit": tip_sha,
+                    **{t: rm._out([t, "--version"]) for t in ("ogr2ogr", "gpio")
+                       if shutil.which(t)},
+                },
+                "inputs": [],  # filled per dataset as it runs
+                "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
             "schema_version": 1,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "machine": machine_info(),
+            "machine": machine,
             "tylertoo": {"binary": tylertoo, "version": tyler_version,
                          "git_sha": git_sha()},
             "tippecanoe": {"binary": tippecanoe, "version": tip_version,
@@ -833,6 +905,8 @@ def main() -> int:
             ds_tip_flags = ds.get("tippecanoe_flags") or []
             tip_all = tip_extra + ds_tip_flags
             print(f"\n=== {did} ===", flush=True)
+            results["provenance"]["inputs"].append(
+                {"name": did, "sha256": rm.sha256_file(src)})
             entry = {
                 "input": str(src),
                 "input_bytes": src.stat().st_size,
@@ -843,78 +917,97 @@ def main() -> int:
                 "tippecanoe_dataset_flags": ds_tip_flags,
             }
 
-            # --- A. tylertoo: parquet -> pmtiles -----------------------------
+            # Every leg of this dataset, in dependency order. run_rounds
+            # times them through run_manifest, alternating the tools within
+            # each round (A'.. C, then C .. A', ...), after one warm-up each.
+            #   A.  tylertoo: parquet -> pmtiles
+            #   A'. tylertoo, thinning ladder off (output parity)
+            #   convert: parquet -> fgb, every available converter
+            #   C.  tippecanoe: fgb -> pmtiles
+            #   ldGeoJSON + -P (optional, --geojson)
             tt_out = workdir / f"{did}.tylertoo.pmtiles"
             tt_report = workdir / f"{did}.tylertoo.report.json"
-            print("  tylertoo tiles (parquet -> pmtiles) ...", flush=True)
-            entry["tylertoo"] = repeat(
-                tylertoo_argv(tylertoo, src, tt_out, ds["layer"],
-                              zmin, zmax, tt_report),
-                args.repeat)
-            entry["tylertoo"]["output_bytes"] = tt_out.stat().st_size
-            entry["tylertoo"]["per_zoom"] = per_zoom_counts(tylertoo, tt_out)
-            if tt_report.exists():
-                entry["tylertoo"]["phases"] = phase_split(tt_report)
-
-            # --- A'. tylertoo with the thinning ladder off (output parity) ----
+            legs = {"tylertoo": {"argv": tylertoo_argv(tylertoo, src, tt_out, ds["layer"],
+                                                       zmin, zmax, tt_report)}}
+            qm_out = workdir / f"{did}.tylertoo-qm.pmtiles"
+            qm_report = workdir / f"{did}.tylertoo-qm.report.json"
             if args.quality_matched:
-                qm_out = workdir / f"{did}.tylertoo-qm.pmtiles"
-                qm_report = workdir / f"{did}.tylertoo-qm.report.json"
-                print("  tylertoo tiles, quality-matched "
-                      f"({' '.join(QUALITY_MATCHED_FLAGS)}) ...", flush=True)
-                entry["tylertoo_quality_matched"] = repeat(
-                    tylertoo_argv(tylertoo, src, qm_out, ds["layer"],
-                                  zmin, zmax, qm_report,
-                                  QUALITY_MATCHED_FLAGS),
-                    args.repeat)
-                entry["tylertoo_quality_matched"]["output_bytes"] = \
-                    qm_out.stat().st_size
-                entry["tylertoo_quality_matched"]["per_zoom"] = \
-                    per_zoom_counts(tylertoo, qm_out)
-                if qm_report.exists():
-                    entry["tylertoo_quality_matched"]["phases"] = \
-                        phase_split(qm_report)
-
-            # --- input conversion: parquet -> fgb ----------------------------
+                legs["tylertoo_quality_matched"] = {"argv": tylertoo_argv(
+                    tylertoo, src, qm_out, ds["layer"], zmin, zmax, qm_report,
+                    QUALITY_MATCHED_FLAGS)}
             converters = fgb_converters(src, workdir, did)
             if not converters:
                 return fail("neither ogr2ogr nor gpio found; cannot build "
                             "tippecanoe's input. Install GDAL or gpio.")
+            # tippecanoe reads a stable copy of the output of the converter with
+            # the fastest warm-up (each converter deletes its own output before
+            # every timed run), and the e2e sum reports that converter's time.
+            tip_fgb = workdir / f"{did}.tippecanoe-input.fgb"
+            conv_legs, chosen = converter_legs(converters, tip_fgb)
+            legs.update(conv_legs)
+            tp_out = workdir / f"{did}.tippecanoe-fgb.pmtiles"
+            legs["tippecanoe_fgb"] = {"needs": tip_fgb, "argv": tippecanoe_argv(
+                tippecanoe, tip_fgb, tp_out, ds["layer"], zmin, zmax, False, tip_all)}
+            gj = workdir / f"{did}.geojsonseq"
+            gj_in = workdir / f"{did}.tippecanoe-input.geojsonseq"
+            gj_out = workdir / f"{did}.tippecanoe-geojson.pmtiles"
+            gconv = geojsonseq_argv(src, gj) if args.geojson else None
+            if args.geojson and gconv is None:
+                print("  (skipping ldGeoJSON: ogr2ogr not found)", file=sys.stderr)
+            if gconv:
+                legs["convert_geojsonseq"] = {
+                    "argv": gconv, "unlink_first": gj, "optional": "geojson",
+                    "after_warmup": lambda _m: shutil.copyfile(gj, gj_in)}
+                legs["tippecanoe_geojsonseq"] = {"optional": "geojson", "argv": tippecanoe_argv(
+                    tippecanoe, gj_in, gj_out, ds["layer"], zmin, zmax, True, tip_all)}
+            print(f"  {len(legs)} legs, {args.repeat} alternating rounds: "
+                  f"{', '.join(legs)} ...", flush=True)
+            try:
+                summ, failed = run_rounds(legs, args.repeat, workdir)
+            except MissingInput:
+                return fail(f"no parquet->fgb converter succeeded for {did}")
+            for name, exc in failed.items():
+                # A converter that cannot handle this dataset, or the ldGeoJSON
+                # leg (supporting evidence, not the headline), is a fact about
+                # the dataset, recorded rather than fatal.
+                print(f"    {name} failed (recorded, not fatal): "
+                      f"{first_error_line(exc.tail)}", file=sys.stderr)
+
+            entry["tylertoo"] = summ["tylertoo"]
+            entry["tylertoo"]["output_bytes"] = tt_out.stat().st_size
+            entry["tylertoo"]["per_zoom"] = per_zoom_counts(tylertoo, tt_out)
+            if tt_report.exists():
+                entry["tylertoo"]["phases"] = phase_split(tt_report)
+            if args.quality_matched:
+                qm = entry["tylertoo_quality_matched"] = summ["tylertoo_quality_matched"]
+                qm["output_bytes"] = qm_out.stat().st_size
+                qm["per_zoom"] = per_zoom_counts(tylertoo, qm_out)
+                if qm_report.exists():
+                    qm["phases"] = phase_split(qm_report)
+
             entry["convert_fgb_candidates"] = {}
             for tool, (argv, dst) in converters.items():
-                print(f"  {tool}: parquet -> fgb ...", flush=True)
-                try:
-                    m = repeat(argv, args.repeat, unlink_first=dst)
-                except CommandFailed as exc:
-                    # A converter that cannot handle this dataset is a fact about
-                    # the dataset, recorded rather than fatal — as long as one
-                    # converter works, tippecanoe still gets its input.
-                    print(f"    {tool} failed (recorded, not fatal): "
-                          f"{first_error_line(exc.tail)}", file=sys.stderr)
+                name = f"convert:{tool}"
+                if name in failed:
                     entry["convert_fgb_candidates"][tool] = {
                         "tool": tool, "failed": True, "argv": argv,
-                        "stderr_tail": exc.tail[-600:]}
-                    continue
-                m["output_bytes"] = dst.stat().st_size
-                m["tool"] = tool
-                m["path"] = str(dst)
-                entry["convert_fgb_candidates"][tool] = m
+                        "stderr_tail": failed[name].tail[-600:]}
+                elif name in summ:
+                    m = summ[name]
+                    m.update(output_bytes=dst.stat().st_size, tool=tool, path=str(dst))
+                    entry["convert_fgb_candidates"][tool] = m
             ok = [m for m in entry["convert_fgb_candidates"].values()
                   if not m.get("failed")]
             if not ok:
                 return fail(f"no parquet->fgb converter succeeded for {did}; "
                             "see the converter errors printed above")
-            best = min(ok, key=lambda m: m["wall_median_s"])
-            entry["convert_fgb"] = best
-            fgb = Path(best["path"])
-
-            # --- C. tippecanoe: fgb -> pmtiles -------------------------------
-            tp_out = workdir / f"{did}.tippecanoe-fgb.pmtiles"
-            print("  tippecanoe (fgb -> pmtiles) ...", flush=True)
-            entry["tippecanoe_fgb"] = repeat(
-                tippecanoe_argv(tippecanoe, fgb, tp_out, ds["layer"],
-                                zmin, zmax, False, tip_all),
-                args.repeat)
+            # The converter picked at warm-up: tippecanoe read its output, so
+            # its time is the one the end-to-end sum carries.
+            entry["convert_fgb"] = entry["convert_fgb_candidates"].get(chosen["tool"])
+            if not entry["convert_fgb"] or entry["convert_fgb"].get("failed"):
+                return fail(f"{did}: the converter tippecanoe read ({chosen['tool']}) "
+                            "failed in a timed round")
+            entry["tippecanoe_fgb"] = summ["tippecanoe_fgb"]
             entry["tippecanoe_fgb"]["output_bytes"] = tp_out.stat().st_size
             entry["tippecanoe_fgb"]["per_zoom"] = per_zoom_counts(tylertoo, tp_out)
 
@@ -925,41 +1018,20 @@ def main() -> int:
                 "peak_rss_bytes": max_opt(entry["convert_fgb"]["peak_rss_bytes"],
                                           entry["tippecanoe_fgb"]["peak_rss_bytes"]),
                 "converter": entry["convert_fgb"]["tool"],
-                "note": "parquet->fgb (fastest available converter) then "
+                "note": "parquet->fgb (the converter with the fastest warm-up) then "
                         "fgb->pmtiles, run as two processes; peak RSS is the "
                         "larger of the two stages, not their sum",
             }
 
-            # --- optional: ldGeoJSON + -P ------------------------------------
-            if args.geojson:
-                gj = workdir / f"{did}.geojsonseq"
-                gconv = geojsonseq_argv(src, gj)
-                if gconv is None:
-                    print("  (skipping ldGeoJSON: ogr2ogr not found)", file=sys.stderr)
-                else:
-                    try:
-                        print("  ogr2ogr: parquet -> ldGeoJSON ...", flush=True)
-                        entry["convert_geojsonseq"] = repeat(gconv, args.repeat,
-                                                             unlink_first=gj)
-                        entry["convert_geojsonseq"]["output_bytes"] = gj.stat().st_size
-                        gj_out = workdir / f"{did}.tippecanoe-geojson.pmtiles"
-                        print("  tippecanoe -P (ldGeoJSON -> pmtiles) ...", flush=True)
-                        entry["tippecanoe_geojsonseq"] = repeat(
-                            tippecanoe_argv(tippecanoe, gj, gj_out, ds["layer"],
-                                            zmin, zmax, True, tip_all),
-                            args.repeat)
-                        entry["tippecanoe_geojsonseq"]["output_bytes"] = \
-                            gj_out.stat().st_size
-                        entry["tippecanoe_geojsonseq"]["per_zoom"] = \
-                            per_zoom_counts(tylertoo, gj_out)
-                    except CommandFailed as exc:
-                        # The ldGeoJSON leg is supporting evidence, not the
-                        # headline; losing it must not lose the whole run.
-                        print(f"    ldGeoJSON leg failed (recorded): {exc}",
-                              file=sys.stderr)
-                        entry["geojsonseq_error"] = exc.tail[-600:]
-                        entry.pop("convert_geojsonseq", None)
-                        entry.pop("tippecanoe_geojsonseq", None)
+            if "convert_geojsonseq" in failed or "tippecanoe_geojsonseq" in failed:
+                exc = failed.get("convert_geojsonseq") or failed["tippecanoe_geojsonseq"]
+                entry["geojsonseq_error"] = exc.tail[-600:]
+            elif "convert_geojsonseq" in summ:
+                entry["convert_geojsonseq"] = summ["convert_geojsonseq"]
+                entry["convert_geojsonseq"]["output_bytes"] = gj.stat().st_size
+                entry["tippecanoe_geojsonseq"] = summ["tippecanoe_geojsonseq"]
+                entry["tippecanoe_geojsonseq"]["output_bytes"] = gj_out.stat().st_size
+                entry["tippecanoe_geojsonseq"]["per_zoom"] = per_zoom_counts(tylertoo, gj_out)
 
             # --- ratios (computed here so nobody recomputes them by hand) ----
             a = entry["tylertoo"]["wall_median_s"]

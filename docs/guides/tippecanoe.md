@@ -61,8 +61,8 @@ The honest footnotes, which are the point of this table:
   parity-matched ratio is **≈7.5×**, not 16–20×.
 
 Every number above is from a committed record
-([`benchmarks/e2e/corpus_results.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/corpus_results.json),
-[`results.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/results.json))
+([`benchmarks/results/e2e-corpus.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/results/e2e-corpus.json),
+[`e2e-fixtures.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/results/e2e-fixtures.json))
 with full provenance, per-zoom tile counts, and the asymmetry list in
 [`benchmarks/e2e/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md).
 Reproduce with `./benchmarks/e2e/run_corpus.sh`.

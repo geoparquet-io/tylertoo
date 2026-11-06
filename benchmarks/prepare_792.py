@@ -1,3 +1,14 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["duckdb"]
+# ///
+"""prepare_792.py <shapefile> <out.parquet>: the #792 input of valve_guard.py
+(1.36M Bavarian buildings), reprojected to EPSG:4326, Hilbert-sorted, with
+`_size` (area) for --sort-key. Not byte-stable across DuckDB versions, so
+valve_guard.py records the output's sha256 with its results.
+
+    uv run benchmarks/prepare_792.py buildings.shp ~/bench-data/792/buildings.parquet
+"""
 import duckdb, sys
 shp, out = sys.argv[1], sys.argv[2]
 con = duckdb.connect()
