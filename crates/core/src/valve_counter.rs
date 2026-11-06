@@ -14,6 +14,10 @@ pub(crate) struct Counts {
     pub draw_sorts: usize,
     pub draw_elements: usize,
     pub gap_rows: usize,
+    /// `to_finite_geometry` copies made by a specialized arm.
+    pub finite_fast: usize,
+    /// `to_finite_geometry` conversions that took the upstream fallback.
+    pub finite_fallback: usize,
 }
 
 thread_local! {
@@ -99,6 +103,8 @@ pub(crate) fn measure<T: Send>(f: impl FnOnce() -> T + Send) -> (T, Counts) {
         total.draw_sorts += c.draw_sorts;
         total.draw_elements += c.draw_elements;
         total.gap_rows += c.gap_rows;
+        total.finite_fast += c.finite_fast;
+        total.finite_fallback += c.finite_fallback;
     }
     (value, total)
 }

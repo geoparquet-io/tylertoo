@@ -319,11 +319,15 @@ fn to_finite_geometry(
                 .collect(),
         )),
         _ => {
+            #[cfg(test)]
+            crate::valve_counter::note(|c| c.finite_fallback += 1);
             return geometry
                 .try_to_geometry()
                 .map(|g| finite_or_empty(g, diagnostics));
         }
     };
+    #[cfg(test)]
+    crate::valve_counter::note(|c| c.finite_fast += 1);
     if finite {
         Some(converted)
     } else {
@@ -404,6 +408,38 @@ impl GeoArrowVisitor for ExtractGeometries<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deleting a specialized arm of `to_finite_geometry` still yields equal
+    /// geometry through the fallback, so the result cannot show it: count the
+    /// conversions that take the copy-while-checking path.
+    #[test]
+    fn mutation_regression_hot_geometry_types_take_the_fused_path() {
+        let line = || geo::LineString::from(vec![(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)]);
+        let poly = || geo::Rect::new((0.0, 0.0), (1.0, 1.0)).to_polygon();
+        let hot = [
+            Geometry::LineString(line()),
+            Geometry::Polygon(poly()),
+            Geometry::MultiLineString(geo::MultiLineString(vec![line(), line()])),
+            Geometry::MultiPolygon(geo::MultiPolygon(vec![poly(), poly()])),
+        ];
+        for geometry in hot {
+            let diagnostics = crate::diagnostics::Diagnostics::default();
+            let (converted, counts) = crate::valve_counter::measure(|| {
+                to_finite_geometry(&geometry, &diagnostics).unwrap()
+            });
+            assert_eq!(converted, geometry);
+            assert_eq!(
+                (counts.finite_fast, counts.finite_fallback),
+                (1, 0),
+                "{geometry:?} must not take the upstream fallback"
+            );
+        }
+        let point = Geometry::Point(geo::Point::new(1.0, 2.0));
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let (_, counts) =
+            crate::valve_counter::measure(|| to_finite_geometry(&point, &diagnostics).unwrap());
+        assert_eq!((counts.finite_fast, counts.finite_fallback), (0, 1));
+    }
 
     #[test]
     fn mutation_regression_finite_line_and_multi_geometries() {

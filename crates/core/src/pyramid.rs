@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use tempfile::TempPath;
+use crate::atomic_output::Reserved;
 
 use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
@@ -1769,7 +1769,7 @@ fn build_pyramid_validated(
     // including the early-return paths below. TempPaths, not open
     // NamedTempFiles: convert and export publish by renaming a sibling over
     // the path, which Windows refuses while a handle to it is open (#678).
-    let mut scratch: Vec<TempPath> = Vec::new();
+    let mut scratch: Vec<Reserved> = Vec::new();
     let mut tiled: Vec<Band> = Vec::with_capacity(bands.len());
 
     for (band, kind) in bands.iter().zip(&kinds) {
@@ -1798,11 +1798,13 @@ fn build_pyramid_validated(
             },
         );
 
-        let named = |suffix: &str| -> Result<TempPath, Error> {
-            let mut b = tempfile::Builder::new();
-            b.prefix("tylertoo-pyramid-").suffix(suffix);
-            crate::atomic_output::reserve_path(&b, opts.work_dir.as_deref())
-                .map_err(|e| Error::PMTilesWrite(format!("band {:?}: {e}", band.layer)))
+        let named = |suffix: &str| -> Result<Reserved, Error> {
+            crate::atomic_output::reserve_path(
+                "tylertoo-pyramid-",
+                suffix,
+                opts.work_dir.as_deref(),
+            )
+            .map_err(|e| Error::PMTilesWrite(format!("band {:?}: {e}", band.layer)))
         };
 
         let overview = named(".parquet")?;

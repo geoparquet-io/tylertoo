@@ -894,21 +894,21 @@ pub(super) fn convert_to_pmtiles_validated(
     // directory, removed on drop — success or failure alike. A TempPath, not
     // an open NamedTempFile: convert publishes by renaming a sibling over
     // this path, which Windows refuses while a handle to it is open (#678).
-    let (overview_path, overview_tmp): (PathBuf, Option<tempfile::TempPath>) =
+    let (overview_path, overview_tmp): (PathBuf, Option<crate::atomic_output::Reserved>) =
         match &options.keep_overview {
             // Its directory was checked above.
             Some(path) => (path.clone(), None),
             None => {
                 let dir = intermediate_dir(options, output);
-                let mut builder = tempfile::Builder::new();
-                builder.prefix(".tylertoo-overview-").suffix(".parquet");
-                let tmp =
-                    crate::atomic_output::reserve_path(&builder, Some(&dir)).map_err(|source| {
-                        TilesError::IntermediateCreate {
-                            dir: dir.clone(),
-                            source,
-                        }
-                    })?;
+                let tmp = crate::atomic_output::reserve_path(
+                    ".tylertoo-overview-",
+                    ".parquet",
+                    Some(&dir),
+                )
+                .map_err(|source| TilesError::IntermediateCreate {
+                    dir: dir.clone(),
+                    source,
+                })?;
                 (tmp.to_path_buf(), Some(tmp))
             }
         };

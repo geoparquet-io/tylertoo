@@ -18439,6 +18439,71 @@ mod diagnostic_row_alignment {
         );
     }
 
+    /// A tile whose own features all quantize away is not written, so a
+    /// #750 fill drawn for it must not count its host as emitted: an
+    /// emission cancels the host's recorded loss. `features` excludes the fill, while
+    /// `source_ids` includes it, which is what the `features > 0` guard in
+    /// `encode_members` separates.
+    #[test]
+    fn mutation_regression_fill_of_an_empty_tile_does_not_emit_its_host() {
+        use crate::diagnostics::{Diagnostics, SourceLossCause};
+
+        let triangle = Geometry::Polygon(geo::Polygon::new(
+            geo::LineString::from(vec![
+                (0.0, 0.0),
+                (0.000001, 0.0),
+                (0.000001, 0.000001),
+                (0.0, 0.0),
+            ]),
+            vec![],
+        ));
+        let members = vec![Member {
+            key: 0,
+            seq: 0,
+            geom: triangle,
+            props: Arc::new(vec![]),
+            id: Some(7),
+            gap: GAP_NONE,
+            band: 0,
+        }];
+        let fills = coverage_fill::tests::test_fill_map([(
+            0,
+            0,
+            vec![vec![vec![
+                (0, 0),
+                (1000, 0),
+                (1000, 1000),
+                (0, 1000),
+                (0, 0),
+            ]]],
+        )]);
+        let opts = ExportOptions {
+            feature_id: Some("id".into()),
+            tile_size_limit: None,
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let diagnostics = Diagnostics::default();
+        // The host was already lost upstream; an emission would cancel that.
+        diagnostics
+            .source_member_loss(0, 7, 0, SourceLossCause::ClipDropped)
+            .unwrap();
+        let tiles = encode_members(
+            &test_gzip_cache(),
+            members,
+            0,
+            &opts,
+            Some(&fills),
+            &ExportTimers::default(),
+            &diagnostics,
+        )
+        .unwrap();
+        assert!(tiles.iter().all(|t| t.feature_count == 0), "no own feature");
+        let losses = diagnostics.source_losses().unwrap();
+        let causes: Vec<_> = losses.iter().map(|l| l.unwrap().cause).collect();
+        assert_eq!(causes, vec![SourceLossCause::ClipDropped]);
+    }
+
     #[test]
     fn export_decode_keeps_null_geometry_rows_aligned_with_feature_ids() {
         let input = tempfile::NamedTempFile::new().unwrap();

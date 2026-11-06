@@ -151,7 +151,7 @@ pub(crate) fn renames_over_existing(dir: &Path, prefix: &str) -> (usize, Vec<Pat
     let ours: Vec<_> = log
         .iter()
         .filter(|(p, _)| {
-            p.parent() == Some(dir)
+            p.parent().and_then(Path::parent) == Some(dir)
                 && p.file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
         })
@@ -165,42 +165,63 @@ pub(crate) fn renames_over_existing(dir: &Path, prefix: &str) -> (usize, Vec<Pat
     )
 }
 
-/// Reserve a unique path for a file some other writer will create by renaming
-/// over it, as a [`TempPath`] that removes whatever is there when dropped
-/// (success or failure alike).
-///
-/// `tempfile` creates a placeholder file to claim the name; it is removed
-/// again at once. A rename over an *existing* file makes ext4
-/// (`auto_da_alloc`) flush the whole new file synchronously before the
-/// rename returns: on Moldova that one `renameat` was 0.76 s, all of
-/// convert's `writer_finish` phase. Onto a missing path it takes
-/// microseconds and the pages stay in the cache for the next reader. The
-/// name keeps its random component, so nothing else is handed it. `dir` is
-/// `None` for the system temp directory.
-pub(crate) fn reserve_path(
-    builder: &tempfile::Builder<'_, '_>,
-    dir: Option<&Path>,
-) -> io::Result<TempPath> {
-    reserve_path_with(builder, dir, |path: &Path| std::fs::remove_file(path))
+/// A path reserved inside a private directory, for a file some other writer
+/// will create by renaming over it. Dereferences to the (missing) path;
+/// dropping it removes the directory and everything in it, on success and
+/// failure alike.
+#[derive(Debug)]
+pub(crate) struct Reserved {
+    path: PathBuf,
+    // Held for its Drop.
+    _dir: tempfile::TempDir,
 }
 
-/// [`reserve_path`] with the placeholder removal injected, so a test can
-/// make it fail without racing another process.
-fn reserve_path_with(
-    builder: &tempfile::Builder<'_, '_>,
-    dir: Option<&Path>,
-    remove: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<TempPath> {
-    let named = match dir {
-        Some(dir) => builder.tempfile_in(dir)?,
-        None => builder.tempfile()?,
-    };
-    let path = named.into_temp_path();
-    match remove(&path) {
-        Ok(()) => Ok(path),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(path),
-        Err(e) => Err(e),
+impl std::ops::Deref for Reserved {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
     }
+}
+
+impl AsRef<Path> for Reserved {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Reserve a unique, missing path `<dir>/<prefix><random>/<prefix>out<suffix>`
+/// for a file some other writer will publish by renaming over it.
+///
+/// A rename over an *existing* file makes ext4 (`auto_da_alloc`) flush the
+/// whole new file synchronously before the rename returns: on Moldova that
+/// one `renameat` was 0.76 s, all of convert's `writer_finish` phase. Onto a
+/// missing path it takes microseconds and the pages stay in the cache for
+/// the next reader (#791).
+///
+/// The path is missing, yet nobody else can claim it: it sits in a fresh
+/// directory this call creates (`mkdir`, which refuses any existing entry
+/// including a symlink, mode 0700 on Unix) beside `dir`, so the rename stays
+/// on one filesystem and no other user can plant an entry at the name in
+/// the window before the writer creates the file. `dir` is `None` for the
+/// system temp directory.
+pub(crate) fn reserve_path(prefix: &str, suffix: &str, dir: Option<&Path>) -> io::Result<Reserved> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    // `tempdir` creates 0777 minus the umask; ask for owner-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let private = match dir {
+        Some(dir) => builder.tempdir_in(dir)?,
+        None => builder.tempdir()?,
+    };
+    let path = private.path().join(format!("{prefix}out{suffix}"));
+    Ok(Reserved {
+        path,
+        _dir: private,
+    })
 }
 
 /// An output path that [`check_writable`] found could not be written.
@@ -404,122 +425,64 @@ mod tests {
     /// Regression (#791): a publish by rename must land on a path that does
     /// not exist, or ext4 flushes the whole file inside the rename. The
     /// reservation still owns the name and cleans up after itself.
-    ///
-    /// The `NotFound` arm is tested through `reserve_path_with`; other removal
-    /// errors are also tested with Landlock.
     #[test]
     fn reserved_path_is_absent_unique_and_cleaned_up() {
         let dir = tempfile::tempdir().unwrap();
-        let mut builder = tempfile::Builder::new();
-        builder.prefix(".x-").suffix(".parquet");
-        let a = reserve_path(&builder, Some(dir.path())).unwrap();
-        let b = reserve_path(&builder, Some(dir.path())).unwrap();
-        assert!(!a.exists() && !b.exists(), "placeholder must be gone");
+        let a = reserve_path(".x-", ".parquet", Some(dir.path())).unwrap();
+        let b = reserve_path(".x-", ".parquet", Some(dir.path())).unwrap();
+        assert!(!a.exists() && !b.exists(), "path must be missing");
         assert_ne!(a.to_path_buf(), b.to_path_buf());
-        assert_eq!(a.parent().unwrap(), dir.path());
+        assert_eq!(a.parent().unwrap().parent().unwrap(), dir.path());
         // Published over by a rename, then removed when the guard drops.
         let (mut file, pending) = create(&dir.path().join("sib.parquet")).unwrap();
         file.write_all(b"data").unwrap();
         drop(file);
         pending.publish().unwrap();
-        std::fs::rename(dir.path().join("sib.parquet"), &a).unwrap();
+        std::fs::rename(dir.path().join("sib.parquet"), &*a).unwrap();
         assert!(a.exists());
         drop(a);
         drop(b);
         assert_eq!(listing(dir.path()), Vec::<String>::new());
     }
 
+    /// The reserved directory is owner-only, and cleanup after a failed
+    /// writer (a half-written file left inside) removes all of it.
+    #[cfg(unix)]
     #[test]
-    fn mutation_regression_reservation_directory_collision_is_an_error() {
+    fn reserved_directory_is_private_and_cleaned_up_after_failure() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let placeholder = dir.path().join("reserved");
-        std::fs::create_dir(&placeholder).unwrap();
+        let r = reserve_path(".p-", ".bin", Some(dir.path())).unwrap();
+        let mode = std::fs::metadata(r.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "reserved directory must be 0700");
+        std::fs::write(&*r, b"half written").unwrap();
+        std::fs::write(r.with_extension("partial"), b"leftover").unwrap();
+        drop(r);
+        assert_eq!(listing(dir.path()), Vec::<String>::new());
+    }
+
+    /// An entry already at the reserved name (here a symlink planted at the
+    /// directory name) makes the reservation fail rather than follow it.
+    #[cfg(unix)]
+    #[test]
+    fn reservation_refuses_a_pre_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let planted = dir.path().join("reserved");
+        std::os::unix::fs::symlink(elsewhere.path(), &planted).unwrap();
         let mut builder = tempfile::Builder::new();
         builder.prefix("reserved").rand_bytes(0);
-        // This fails at tempfile creation, rather than exercising the later
-        // remove_file error arm: no regular placeholder was created.
-        let error = reserve_path(&builder, Some(dir.path())).unwrap_err();
+        // The same call `reserve_path` makes, with the random part pinned.
+        let error = builder.tempdir_in(dir.path()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert!(placeholder.is_dir());
-    }
-
-    #[test]
-    fn mutation_regression_reservation_tolerates_a_vanished_placeholder() {
-        let dir = tempfile::tempdir().unwrap();
-        let builder = tempfile::Builder::new();
-        // Another actor unlinked the placeholder first: still a usable path.
-        let path = reserve_path_with(&builder, Some(dir.path()), |p| {
-            std::fs::remove_file(p)?;
-            Err(io::ErrorKind::NotFound.into())
-        })
-        .unwrap();
-        assert!(!path.exists());
-        // Any other removal error is surfaced.
-        let error = reserve_path_with(&builder, Some(dir.path()), |_| {
-            Err(io::ErrorKind::PermissionDenied.into())
-        })
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn mutation_regression_reservation_propagates_removal_error() {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-        let dir = tempfile::tempdir().unwrap();
-        let parent = dir.path().to_path_buf();
-        // Landlock v1 can deny unlink without denying file creation. Apply
-        // it only to a fresh thread: restrictions cannot be undone, and the
-        // parent thread must still be able to clean up the placeholder.
-        std::thread::spawn(move || {
-            #[repr(C)]
-            struct RulesetAttr {
-                handled_access_fs: u64,
-            }
-            let attr = RulesetAttr {
-                handled_access_fs: 1 << 5, // LANDLOCK_ACCESS_FS_REMOVE_FILE
-            };
-            // SAFETY: attr is the initialized v1 kernel ABI structure, and
-            // its pointer is valid for the supplied size during the call.
-            let fd = unsafe {
-                libc::syscall(
-                    libc::SYS_landlock_create_ruleset,
-                    &attr as *const RulesetAttr,
-                    std::mem::size_of_val(&attr),
-                    0,
-                )
-            };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) {
-                    eprintln!("Landlock unavailable; cannot test unlink denial: {error}");
-                    return;
-                }
-                panic!("cannot create Landlock ruleset: {error}");
-            }
-            // SAFETY: the successful syscall returned a new owned fd.
-            let ruleset = unsafe { OwnedFd::from_raw_fd(fd as i32) };
-            // SAFETY: PR_SET_NO_NEW_PRIVS takes these integer arguments and
-            // changes only this thread and its future children.
-            let result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-            assert_eq!(result, 0, "{}", io::Error::last_os_error());
-            // SAFETY: ruleset is live; flags=0 restricts only this thread.
-            let result =
-                unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0) };
-            assert_eq!(result, 0, "{}", io::Error::last_os_error());
-
-            let mut builder = tempfile::Builder::new();
-            builder.prefix("reserved").rand_bytes(0);
-            let error = reserve_path(&builder, Some(&parent)).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-            assert!(
-                parent.join("reserved").is_file(),
-                "creation must have succeeded"
-            );
-        })
-        .join()
-        .unwrap();
+        assert_eq!(listing(elsewhere.path()), Vec::<String>::new());
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     fn listing(dir: &Path) -> Vec<String> {

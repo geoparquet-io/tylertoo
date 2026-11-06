@@ -2046,9 +2046,11 @@ pub(super) fn build_fill_map(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    fn test_fill_map(tiles: impl IntoIterator<Item = (u8, u64, Vec<FillPolygon>)>) -> FillMap {
+    pub(in crate::overview::export) fn test_fill_map(
+        tiles: impl IntoIterator<Item = (u8, u64, Vec<FillPolygon>)>,
+    ) -> FillMap {
         let opts = super::super::ExportOptions::default();
         let mut map = FillMap {
             zooms: Default::default(),

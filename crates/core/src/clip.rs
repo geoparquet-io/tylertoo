@@ -719,6 +719,27 @@ mod tests {
     /// `geo`'s bounding rect skips a NaN that is not a ring's first
     /// coordinate, so this rode the fully-inside fast path and came back
     /// unclipped, never reaching the `i_overlay` guard.
+    /// Boundary of the ordered comparisons in `polygon_rect_all_rings`: a
+    /// coordinate equal to the running bound must leave it alone. Only the
+    /// sign of zero tells equal values apart (`-0.0 == 0.0`), so a `<=` or
+    /// `>=` would replace the earlier zero with the later one. (`Polygon::new`
+    /// closes the ring with the first vertex, so the zeros sit in the middle.)
+    #[test]
+    fn rect_bounds_keep_the_first_of_equal_coordinates() {
+        let rect_of = |ring: Vec<(f64, f64)>| {
+            let (rect, finite) =
+                polygon_rect_all_rings(&Polygon::new(LineString::from(ring), vec![])).unwrap();
+            assert!(finite);
+            rect
+        };
+        let rect = rect_of(vec![(1.0, 1.0), (0.0, 0.0), (-0.0, -0.0), (2.0, 2.0)]);
+        assert_eq!(rect.min().x.to_bits(), 0.0f64.to_bits(), "min.x");
+        assert_eq!(rect.min().y.to_bits(), 0.0f64.to_bits(), "min.y");
+        let rect = rect_of(vec![(-1.0, -1.0), (-0.0, -0.0), (0.0, 0.0), (-2.0, -2.0)]);
+        assert_eq!(rect.max().x.to_bits(), (-0.0f64).to_bits(), "max.x");
+        assert_eq!(rect.max().y.to_bits(), (-0.0f64).to_bits(), "max.y");
+    }
+
     #[test]
     fn a_nan_vertex_cannot_take_the_fully_inside_fast_path() {
         let diagnostics = crate::diagnostics::Diagnostics::default();
