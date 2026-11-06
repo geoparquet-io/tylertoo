@@ -314,7 +314,7 @@ pub(crate) fn is_wgs84_projjson(projjson: &Value) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`Error::GeoParquetRead`] if `path` resolves to no Parquet file, if
+/// Returns [`Error::GeoParquetRead`](crate::Error::GeoParquetRead) if `path` resolves to no Parquet file, if
 /// the file cannot be opened or its footer read, or if its geo metadata JSON is
 /// malformed.
 pub fn extract_crs(path: &Path, diagnostics: &crate::diagnostics::Diagnostics) -> Result<CrsInfo> {

@@ -31,7 +31,7 @@ use crate::{GeoParquetReadError, Result};
 ///
 /// # Errors
 ///
-/// Returns [`Error::GeoParquetRead`] if `path` does not exist, if a directory
+/// Returns [`Error::GeoParquetRead`](crate::Error::GeoParquetRead) if `path` does not exist, if a directory
 /// cannot be listed, or if a directory holds no `.parquet` files.
 pub fn resolve_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
     if path.is_file() {
@@ -69,7 +69,7 @@ pub fn resolve_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::GeoParquetRead`] if a geometry payload is structurally
+/// Returns [`Error::GeoParquetRead`](crate::Error::GeoParquetRead) if a geometry payload is structurally
 /// invalid.
 pub fn extract_geometries_from_array(
     array: &dyn GeoArrowArray,
@@ -88,12 +88,12 @@ pub fn extract_geometries_from_array(
 /// (and for the rare slot that decodes but has no `geo::Geometry` conversion).
 ///
 /// Structurally invalid geometry payloads (e.g. an empty or corrupt WKB
-/// value) still return a hard [`Error::GeoParquetRead`]; only *absent*
+/// value) still return a hard [`Error::GeoParquetRead`](crate::Error::GeoParquetRead); only *absent*
 /// geometry maps to `None`.
 ///
 /// # Errors
 ///
-/// Returns [`Error::GeoParquetRead`] if a geometry payload is structurally
+/// Returns [`Error::GeoParquetRead`](crate::Error::GeoParquetRead) if a geometry payload is structurally
 /// invalid, such as an empty or corrupt WKB value.
 pub fn extract_geometries_opt_from_array(
     array: &dyn GeoArrowArray,
@@ -129,7 +129,7 @@ pub(crate) trait GeoArrowVisitor {
 }
 
 /// Resolve `array`'s concrete GeoArrow type and hand its typed accessor to
-/// `visitor`. Unsupported types are a [`Error::GeoParquetRead`].
+/// `visitor`. Unsupported types are a [`Error::GeoParquetRead`](crate::Error::GeoParquetRead).
 pub(crate) fn visit_geoarrow_array<V: GeoArrowVisitor>(
     array: &dyn GeoArrowArray,
     visitor: V,
