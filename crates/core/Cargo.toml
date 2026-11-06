@@ -38,7 +38,6 @@ remote = [
     "dep:tokio",
     "dep:aws-config",
     "dep:aws-credential-types",
-    "dep:aws-smithy-types",
     "dep:async-trait",
     "dep:futures-util",
     "dep:url",
@@ -89,16 +88,6 @@ object_store = { version = "0.14", features = ["aws", "gcp", "http"], optional =
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread"], optional = true }
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
-# Pinned below 1.7.0: aws-smithy-types 1.7.0 added a variant to its
-# non_exhaustive `Document` enum, which aws-smithy-json 0.63.0 -- the version
-# aws-config 1.12 still requires -- does not handle, so a fresh resolution of
-# the `remote` feature fails to compile upstream (E0004/E0308 inside
-# aws-smithy-json). Not our code.
-# Cargo.lock is now committed (#412), so CI no longer re-resolves on every
-# run and the pin is no longer load-bearing for that reason -- the lock holds
-# 1.6.3 on its own. Keep it only until the upstream fix lands.
-# TODO: drop this pin once aws-config requires aws-smithy-json >= 0.64.
-aws-smithy-types = { version = "=1.9.0", optional = true }
 async-trait = { version = "0.1", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 url = { version = "2", optional = true }
@@ -185,11 +174,6 @@ harness = false
 
 [lints]
 workspace = true
-
-# aws-smithy-types is a version-pin only (see the comment beside it); no code
-# in this crate references it directly.
-[package.metadata.cargo-shear]
-ignored = ["aws-smithy-types"]
 
 [[test]]
 name = "scaled_limits"
