@@ -377,6 +377,9 @@ pub(super) struct RowSource<'a> {
 pub(super) struct VdScan {
     zooms: Vec<u8>,
     canonical: usize,
+    /// The first level the probe can stop a tile at: coarser ones would
+    /// clamp ([`candidate_extent`]), so they are neither sized nor checked.
+    first_probed: usize,
     kinds: Vec<Kinds>,
     cluster_column: Option<String>,
     release: Option<Box<dyn RowRelease>>,
@@ -421,6 +424,10 @@ impl VdScan {
             .collect();
         Ok(Self {
             canonical: n - 1,
+            first_probed: zooms[..n - 1]
+                .iter()
+                .rposition(|&z| candidate_extent(z, zooms[n - 1]).is_none())
+                .map_or(0, |i| i + 1),
             kinds,
             cluster_column: g
                 .and_then(|g| g.clustering.as_ref())
@@ -470,6 +477,9 @@ impl VdScan {
         crs: Crs,
         opts: &ExportOptions,
     ) -> Result<(), ExportError> {
+        if j < self.first_probed {
+            return Ok(()); // Its tiles never stop, so nothing it shows blocks.
+        }
         let canonical = j == self.canonical;
         let mixed = self.kinds[j] == Kinds::Mixed;
         let per_row = mixed
@@ -511,14 +521,15 @@ impl VdScan {
                 .collect()
         };
         if canonical {
-            let coarser = &self.zooms[..self.canonical];
+            let first = self.first_probed;
+            let coarser = &self.zooms[first..self.canonical];
             add_runs(
-                &mut self.canonical_counts,
+                &mut self.canonical_counts[first..],
                 member_runs(bboxes, coarser, opts),
             );
             if let Some((_, flags)) = decoded.as_ref().filter(|_| mixed) {
                 add_runs(
-                    &mut self.canonical_points,
+                    &mut self.canonical_points[first..],
                     member_runs(&points(flags), coarser, opts),
                 );
             }
@@ -578,7 +589,12 @@ impl VdScan {
             policy.block(zoom, key);
         }
         let canonical_kinds = self.kinds[self.canonical];
-        for (k, scan) in scans.iter().enumerate().take(self.canonical) {
+        for (k, scan) in scans
+            .iter()
+            .enumerate()
+            .take(self.canonical)
+            .skip(self.first_probed)
+        {
             let level_kinds = self.kinds[k];
             if !level_kinds.may_have_points() && !canonical_kinds.may_have_points() {
                 continue;
