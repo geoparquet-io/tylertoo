@@ -29,5 +29,3 @@ Local CI gates (see [ci/README.md](https://github.com/geoparquet-io/tylertoo/blo
       repo root, per CONTRIBUTING.md), if applicable
 - [ ] Rust/Python duplication checks pass (`npx --yes jscpd@4.0.5` and
       similarity-rs; see DEVELOPMENT.md)
-- [ ] Diff-scoped cargo-mutants passes for core and CLI
-      (`scripts/mutants-diff.sh origin/main`)

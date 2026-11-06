@@ -184,7 +184,7 @@ nightly run keeps covering it.
 UTC) and on `workflow_dispatch` (with a `max_total_time` input). One
 matrix job per target, run in parallel, the fuzz build cached across runs;
 a failing target uploads its `fuzz/artifacts/` and the `notify` job opens or
-updates a pinned `fuzz` issue, the same way `mutation-tests.yml` does. A new
+updates a pinned `fuzz` issue, the same way the other scheduled workflows do. A new
 target goes in the matrix; one that needs a fuzz-crate feature goes under
 `include:` with `features:` (the workflow has `remote_footer`'s entry
 commented out, ready for when #683 closes). A crash a new target
