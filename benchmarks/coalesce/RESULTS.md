@@ -294,8 +294,9 @@ squares that can extend into gaps between fields. Issue #750 tracks this behavio
 Release build of `v09/data-checks` (base 9fca046), input
 `madagascar-adm4-hilbert.parquet` (sha256 6f666e18...), `tylertoo tiles
 --min-zoom 0 --max-zoom 12`, scored with `tile_metrics.py --zooms 4,5,6,7,8
---max-tiles 150`. Missing share of source area, mean over the sampled tiles
-(4, 4, 5, 15, 42 tiles at z4–z8):
+--max-tiles 150`. Missing share of source area, mean over the evaluated tiles
+(4, 4, 5, 15, 42 tiles at z4–z8, of 4, 4, 7, 16, 44 in the archive; n is small
+because Madagascar is small and this is one country):
 
 | Settings | z4 | z5 | z6 | z7 | z8 | Archive |
 |---|---|---|---|---|---|---|
@@ -306,9 +307,21 @@ Release build of `v09/data-checks` (base 9fca046), input
 | `--simplify-factor 0` | 0.44% | 0.07% | 0.07% | 0.04% | 0.02% | 33.5 MB |
 | `0` + `--coverage-fill` | 0.02% | 0.01% | 0.02% | 0.01% | 0.01% | 34.0 MB |
 
-The fill draws the child tiles' area under each tile, so its rows bound the
-slivers: 0.03–0.05% at the defaults. The rest of the loss without the fill
-is placeholder squares and the simplification fringe of small units (#750).
+With `--coverage-fill` on, residual missing coverage is 0.03–0.05% at the
+defaults. The fill hides slivers rather than isolating them.
+
+Commands (`$B` is `target/release/tylertoo`; `f` is each factor; add
+`--coverage-fill` for the fill rows):
+
+```bash
+$B tiles madagascar-adm4-hilbert.parquet sf$f.pmtiles --min-zoom 0 --max-zoom 12 \
+    --simplify-factor $f [--coverage-fill] --force
+uv run benchmarks/coalesce/tile_metrics.py sf$f.pmtiles \
+    --source madagascar-adm4-hilbert.parquet --zooms 4,5,6,7,8 --max-tiles 150 \
+    --raw-limit 0 --gz-limit 0 --json sf$f.json
+```
+
+The table reports `1 - drawn_share.mean` per zoom.
 
 ## #748 re-run, FTW Moldova (631,910 polygons)
 

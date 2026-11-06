@@ -371,13 +371,13 @@ The measurements showed the following:
   `--profile bounded`). tippecanoe took 31.7 min on NZ Parcels; tylertoo
   about 2 min.
 - Shared-border slivers at z4–z8 (#450 phase 0, fieldmaps Madagascar adm4,
-  17,465 polygons, mean over the sampled tiles, `tile_metrics.py`):
+  17,465 polygons, mean over the evaluated tiles (nearly every tile at each zoom), `tile_metrics.py`):
   missing area at the default is 11.78 / 4.46 / 1.73 / 0.64 / 0.29% at
   z4–z8, 0.25: 2.17 / 0.85 / 0.29 / 0.11 / 0.07%, factor 0: 0.44 / 0.07 /
   0.07 / 0.04 / 0.02%. With `--coverage-fill` it is 0.03–0.05% at the
-  default and 0.01–0.02% at factor 0, so the sliver floor on adm4 is far
-  below NZ parcels at z12 (about 2%); the coarse-zoom loss is placeholder
-  squares and small-unit fringe (#750). Archive 26.9 MB default, 29.3 MB
+  default and 0.01–0.02% at factor 0, so the residual missing coverage with
+  `--coverage-fill` on adm4 is 0.01–0.05%. Without the fill the loss includes
+  placeholder-square gaps (#750). Archive 26.9 MB default, 29.3 MB
   at 0.25, 33.5 MB at 0. Table: `docs/OVERVIEW_TUNING.md` § Coverage and
   simplification.
 - `--polygon-visibility 0` with placeholder squares has a pre-existing bug
