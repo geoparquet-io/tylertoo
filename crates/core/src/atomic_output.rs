@@ -181,12 +181,22 @@ pub(crate) fn reserve_path(
     builder: &tempfile::Builder<'_, '_>,
     dir: Option<&Path>,
 ) -> io::Result<TempPath> {
+    reserve_path_with(builder, dir, |path: &Path| std::fs::remove_file(path))
+}
+
+/// [`reserve_path`] with the placeholder removal injected, so a test can
+/// make it fail without racing another process.
+fn reserve_path_with(
+    builder: &tempfile::Builder<'_, '_>,
+    dir: Option<&Path>,
+    remove: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<TempPath> {
     let named = match dir {
         Some(dir) => builder.tempfile_in(dir)?,
         None => builder.tempfile()?,
     };
     let path = named.into_temp_path();
-    match std::fs::remove_file(&path) {
+    match remove(&path) {
         Ok(()) => Ok(path),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(path),
         Err(e) => Err(e),
@@ -395,10 +405,8 @@ mod tests {
     /// not exist, or ext4 flushes the whole file inside the rename. The
     /// reservation still owns the name and cleans up after itself.
     ///
-    /// Reaching the `NotFound` arm requires another actor to unlink the file
-    /// between `tempfile_in` and `remove_file`: Builder creates a regular
-    /// file and exposes no callback in that interval. Racing a remover would
-    /// make this test flaky. Other removal errors are tested with Landlock.
+    /// The `NotFound` arm is tested through `reserve_path_with`; other removal
+    /// errors are also tested with Landlock.
     #[test]
     fn reserved_path_is_absent_unique_and_cleaned_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -433,6 +441,25 @@ mod tests {
         let error = reserve_path(&builder, Some(dir.path())).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert!(placeholder.is_dir());
+    }
+
+    #[test]
+    fn mutation_regression_reservation_tolerates_a_vanished_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let builder = tempfile::Builder::new();
+        // Another actor unlinked the placeholder first: still a usable path.
+        let path = reserve_path_with(&builder, Some(dir.path()), |p| {
+            std::fs::remove_file(p)?;
+            Err(io::ErrorKind::NotFound.into())
+        })
+        .unwrap();
+        assert!(!path.exists());
+        // Any other removal error is surfaced.
+        let error = reserve_path_with(&builder, Some(dir.path()), |_| {
+            Err(io::ErrorKind::PermissionDenied.into())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[cfg(target_os = "linux")]
