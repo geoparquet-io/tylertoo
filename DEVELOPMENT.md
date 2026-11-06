@@ -875,8 +875,7 @@ with the change. The security audit in the CI Lint job fails when the lock falls
 of step with the manifests.
 
 Renovate (`.github/renovate.json5`) runs once a month and opens one PR
-holding every patch and minor update across Cargo, Python, and GitHub
-Actions. That PR merges on its own once all gates pass. Majors and
+holding every patch and minor update in every ecosystem the repo uses. That PR merges on its own once all gates pass. Majors and
 geometry-engine bumps wait for a human; the Dependency Dashboard issue
 lists what is held. The weekly security job runs
 cargo-audit, cargo-deny, and pip-audit. It first re-resolves
