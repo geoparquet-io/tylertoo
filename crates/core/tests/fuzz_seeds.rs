@@ -141,9 +141,22 @@ fn parquet_footer_seeds() {
     // refuses before parquet-rs reserves memory for it (#779).
     replay(
         "parquet_footer",
-        &["seed-issue-690-num-children.thrift"],
+        &[
+            "seed-issue-690-num-children.thrift",
+            "seed-issue-789-oom.thrift",
+        ],
         tylertoo_core::overview::check::fuzz_parquet_footer,
     );
+    // #789: a 14-byte `num_children` varint. parquet-rs wraps it into a
+    // 4.6 GB reservation; the pre-check must refuse it, not call it "confused".
+    let (_, bytes) = seeds("parquet_footer")
+        .into_iter()
+        .find(|(n, _)| n == "seed-issue-789-oom.thrift")
+        .unwrap();
+    assert!(matches!(
+        tylertoo_io::precheck_footer(&bytes),
+        Err(tylertoo_io::Error::HostileFooter(_))
+    ));
     // Not just "no crash": with overcommit, parquet-rs's 12 GB reservation
     // succeeds and the decode fails later on its own, so only the error's
     // kind proves the pre-check refused the footer first.
@@ -181,9 +194,25 @@ fn remote_footer_seeds() {
         &[
             "seed-issue-683-arrow-schema.parquet",
             "seed-issue-687-def-levels.parquet",
+            "seed-issue-789-slow.parquet",
+            "seed-issue-789-timeout.parquet",
         ],
         tylertoo_core::input::fuzz_remote_footer,
     );
+    // #789: nested sets of `uuid`s in a page header cost parquet-rs minutes
+    // of CPU (it skips them for free at end of input). Fail the test, not the
+    // run, if one is ever skipped slowly again.
+    for (name, bytes) in seeds("remote_footer")
+        .into_iter()
+        .filter(|(n, _)| n.starts_with("seed-issue-789-"))
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(tylertoo_core::input::fuzz_remote_footer(&bytes).is_err());
+        });
+        let refused = rx.recv_timeout(std::time::Duration::from_secs(30));
+        assert_eq!(refused, Ok(true), "{name} must be refused quickly");
+    }
 }
 
 #[test]
