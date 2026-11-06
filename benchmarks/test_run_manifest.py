@@ -51,7 +51,8 @@ def test_light_cells_run_at_least_three_pairs(manifest):
 def test_the_final_window_covers_every_light_cell(manifest):
     light = {n for n, c in manifest["cells"].items() if not c["heavy"]}
     sets = manifest["sets"]
-    final = set(sets["window1"]) | set(sets["final-gate"]) | set(sets["final-held"])
+    final = (set(sets["window1"]) | set(sets["final-gate"]) | set(sets["final-held"])
+             | set(sets["results-table"]))
     assert final >= light
     assert not set(sets["window1"]) & set(sets["final-gate"])
 

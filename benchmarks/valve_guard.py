@@ -111,6 +111,10 @@ def prepare(bins: dict, data: Path, work: Path) -> dict:
     for p in (b792, moldova):
         if not p.exists():
             raise SystemExit(f"missing input {p}")
+    # Moldova is pinned in manifest.toml; the #792 file is made locally
+    # (prepare_792.py), so its sha256 is recorded with the results instead.
+    if not rm.verified(moldova, rm.load_manifest()["inputs"]["moldova"]["sha256"]):
+        raise SystemExit(f"{moldova} does not match manifest.toml's moldova sha256")
     ov792, movf0 = work / "ov792.parquet", work / "moldova-f0.parquet"
     mim = str(bins["mim"])
     if not ov792.exists():
@@ -248,7 +252,10 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"missing binary {b}")
     gate = rm.Gate(args.load_max, 3600, Path(tempfile.gettempdir()) / "valve-guard-gate.log")
     cells = measure(args.cells, bins, args.data, args.rounds, gate)
-    record = {"host": rm.host_class(), "hostname": platform.node(), "measured": time.strftime("%F"), "cells": cells,
+    record = {"host": rm.host_class(),
+              "inputs": {"792": rm.sha256_file(args.data / "792" / "buildings.parquet"),
+                         "moldova": rm.load_manifest()["inputs"]["moldova"]["sha256"]},
+              "hostname": platform.node(), "measured": time.strftime("%F"), "cells": cells,
               "limits": {"ratio_wall": RATIO_WALL_MAX, "ratio_rss": RATIO_RSS_MAX,
                          "wall": WALL_REGRESSION_MAX, "rss": RSS_REGRESSION_MAX}}
     doc = json.loads(args.baseline.read_text()) if args.baseline.exists() else None
