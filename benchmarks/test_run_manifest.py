@@ -448,3 +448,21 @@ output = "o"
 keep_output = true
 """)
     assert rm.load_manifest(p)["cells"]["c"]["keep_output"] is True
+
+
+def test_a_resume_keeps_the_recorded_provenance(tmp_path, monkeypatch):
+    """Sol review of #810: a resume rewrote provenance.json from the current
+    checkout and date, relabelling runs it did not repeat."""
+    from types import SimpleNamespace
+    (tmp_path / "provenance.json").write_text(json.dumps(
+        {"commit": "A", "date": "then", "inputs": [{"name": "x"}]}))
+    monkeypatch.setattr(rm, "provenance", lambda bins, inputs: {
+        "commit": "B", "date": "now", "inputs": [{"name": n} for n in inputs]})
+    monkeypatch.setattr(rm, "write_report", lambda results: None)
+    fake = SimpleNamespace(results=tmp_path, bins=[], m={"inputs": {"x": {}, "y": {}},
+                           "cells": {"c": {"input": "x"}, "d": {"input": "y"}}},
+                           cells=lambda: ["c", "d"], run_cell=lambda name: None)
+    rm.Runner.run_all(fake)
+    saved = json.loads((tmp_path / "provenance.json").read_text())
+    assert (saved["commit"], saved["date"]) == ("A", "then")
+    assert [i["name"] for i in saved["inputs"]] == ["x", "y"]

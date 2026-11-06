@@ -55,15 +55,14 @@ That is one recorded run of three warm repeats on a laptop. Treat the ratios
 as approximate, not as two-significant-figure facts; §7 has the per-repeat
 spread.
 
-At engine scale (the corpus tier, §1b: 300k–813k features per dataset,
-both tools in their production configuration), the measured end-to-end
-ratios are **8.6×–21.3×** across the three datasets where both tools built
-the same zoom range, including **8.6× on the 632k-polygon Moldova parcels
-set that the pre-H3 pipeline lost 3.6× on**. The points row measured 21.6×,
-but tippecanoe built two zoom levels there that tylertoo did not, so it is
-quoted separately rather than as the top of the range (caveat 4) — with the
-rest of the caveats in §1b, starting with the one that the recording machine
-was not idle.
+At engine scale (the corpus tier, §1b: 631k–1.2M features per dataset,
+both tools in their production configuration, recorded on an idle 64-core
+arm64 host), the measured end-to-end ratios are **17.0×–23.0×** across the
+three datasets where both tools built the same zoom range, including
+**21.5× on the 632k-polygon Moldova parcels set that the pre-H3 pipeline
+lost 3.6× on**. The points row measured 27.2×, but tippecanoe built two zoom
+levels there that tylertoo did not, so it is quoted separately rather than
+as the top of the range (caveat 4); the rest of the caveats are in §1b.
 
 ## 1. Headline (both tools at their own defaults)
 
@@ -103,18 +102,14 @@ Tables are generated from `e2e-corpus.json`. Reproduce with one command: `./benc
 - **Recorded** — 2026-11-06T19:06:34Z → `e2e-corpus.json`
 <!-- /bench -->
 
-1. **The machine was not idle.** Another build job shared it during the
-   recording. The per-repeat spread stayed small on the tiling
-   measurements — ≤6.3% on every one except tylertoo's quality-matched
-   points run (17%). The GeoParquet→FlatGeobuf conversion stages, which are
-   included in tippecanoe's end-to-end sum, were noisier: up to 9.4% on
-   `polygons-portland-medium`. All computed from `wall_all_s` in
-   `../results/e2e-corpus.json`. Treat every ratio as provisional until
-   re-recorded on an idle machine.
-2. **The Overture inputs are not byte-pinned.** The manifest's pinned release
-   (`2026-06-17.0`) had expired from the Overture bucket, so this run fetched
-   `GPQ_OVERTURE_RELEASE=2026-09-23.0`. Feature counts therefore exceed the
-   manifest's estimates (NYC points: 597,782 against ~458k). The Moldova
+1. **Per-repeat spread.** The machine was idle (the harness's load gate
+   checked it before each run). Spread (max − min over min, from
+   `wall_all_s` in `../results/e2e-corpus.json`) is ≤5.3% on every
+   measurement except two tylertoo runs: Oregon roads at defaults (16.8%)
+   and Moldova quality-matched (13.7%). tippecanoe and the FlatGeobuf
+   conversions stay under 1%.
+2. **The Overture inputs are pinned** to release `2026-10-21.0`, with each
+   extract's ids hashed in `corpus/manifest.json` (#696). The Moldova
    parcels file is a stable direct download.
 3. **tippecanoe runs the manifest's recorded flags** (the `flags` table
    below — density dropping, `--simplification=10`) on top of the parity
@@ -123,7 +118,7 @@ Tables are generated from `e2e-corpus.json`. Reproduce with one command: `./benc
    "Datasets". Exact tile parity is neither expected nor claimed; the
    per-zoom counts below are the record of the difference.
 4. **The points row's tippecanoe archive extends past z14**: its recorded
-   `--extend-zooms-if-still-dropping` added z15–z16 (9,639 of its 10,486
+   `--extend-zooms-if-still-dropping` added z15–z16 (9,694 of its 10,543
    tiles). Its wall time includes that extra work; tylertoo stops at the
    requested z14. Read that row accordingly.
 
@@ -143,8 +138,8 @@ _Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, ve
 The Moldova row is the one the stale table in
 [`../overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (in git history) recorded at **3.6×
 slower** (pre-H3, in-memory pipeline, 5.4 GB peak RSS). The streaming
-pipeline is 8.6× faster than tippecanoe end-to-end on the same file at
-1.8 GB peak RSS.
+pipeline is 21.5× faster than tippecanoe end-to-end on the same file at
+4.5 GB peak RSS (64-core host; peak RSS grows with core count).
 
 ### Quality-matched (thinning ladder off)
 
@@ -161,28 +156,27 @@ _Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, ve
 
 Peak RSS on the matched runs, which the table above leaves out
 (`tylertoo_quality_matched.peak_rss_bytes` vs `tippecanoe_fgb` in
-`../results/e2e-corpus.json`): 786 MB vs 652 MB on lines (1.20×), 927 MB vs
-967 MB on Portland buildings (0.96×), 1916 MB vs 926 MB on Moldova
-(2.07×), and 2110 MB vs 519 MB on points (4.07× — the highest memory
-ratio anywhere in this harness, on the same zoom-mismatched run as
-caveat 4). Turning the thinning ladder off costs memory as well as time.
+`../results/e2e-corpus.json`): 4109 MB vs 2553 MB on lines (1.61×), 3775 MB
+vs 2230 MB on Portland buildings (1.69×), 4928 MB vs 2549 MB on Moldova
+(1.93×), and 3553 MB vs 1418 MB on points (2.51×, on the same
+zoom-mismatched run as caveat 4). Turning the thinning ladder off costs
+memory as well as time.
 
 Two honest readings this table forces:
 
-- **The points quality-matched row is 2.4×, the weakest ratio measured
-  anywhere in this harness** — `--verbatim` makes tylertoo carry all 598k
-  points at every zoom (1.39 s → 12.21 s), while tippecanoe's side is also
+- **The points quality-matched row is 2.2×, the weakest ratio measured
+  anywhere in this harness** — `--verbatim` makes tylertoo carry all 630k
+  points at every zoom (1.57 s → 18.38 s), while tippecanoe's side is also
   doing non-comparable extra work (z15–z16, caveat 4). Treat it as a bound,
   not a parity measurement; for points the defaults row is the realistic one,
   since both tools' production configs drop points by design.
-- **`polygons-portland-medium` quality-matched is the one archive tylertoo
-  writes bigger at a matched zoom range** (1.20×; 1.11× even at defaults).
-  On lines and Moldova tylertoo's archives are 0.76–0.79×. The points row's
-  0.59× is **not** a like-for-like figure: it divides tylertoo's z0–14
-  archive by tippecanoe's z0–16 one. Compared at z0–14 only — 29.1 MB of
-  tippecanoe's 87.6 MB — tylertoo's points archive is **1.87× bigger**,
-  making it the largest relative archive in the set rather than the
-  smallest.
+- **tylertoo's archives are bigger at a matched zoom range on lines and
+  Portland buildings** (1.23× and 1.47× matched; 1.12× and 1.41× at
+  defaults), and equal on Moldova (1.01×; 1.00×). The points row's 0.65× at
+  defaults is **not** a like-for-like figure: it divides tylertoo's z0–14
+  archive by tippecanoe's z0–16 one. Compared at z0–14 only — 28.0 MB of
+  tippecanoe's 90.6 MB — tylertoo's points archive is **2.1× bigger**,
+  the largest relative archive in the set.
 
 Unlike the fixture set (contiguous admin coverage, where tippecanoe's
 defaults keep nearly everything and tylertoo's thin visibly), here
@@ -205,7 +199,7 @@ _Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, ve
 <!-- /bench -->
 
 † Zoom-mismatched: tippecanoe's archive covers z0–16, tylertoo's z0–14
-(caveat 4). At z0–14 on both sides the ratio is 1.87×, not 0.59×.
+(caveat 4). At z0–14 on both sides the ratio is 2.1×, not 0.65×.
 
 **tylertoo loses the memory column on all four rows** — up to 3.7× on
 lines (9.1 GB vs 2.4 GB) and 1.9× on Moldova (4.5 GB vs 2.4 GB). The CPU
@@ -617,12 +611,12 @@ row here should be quoted to two significant figures.
 
 ## 8. What this does not measure
 
-- **Anything above 813k features.** §1b's corpus tier covers 300k–813k
-  features (and settles the Moldova question the archived table in
-  [`../overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (in git history) left open); a
-  multi-million-feature run via `--dataset` (e.g. `lines-oregon-large`,
-  `corpus/fetch.sh --large`) is still unmeasured.
-- **Points at fixture scale.** The corpus tier measures a 598k-point dataset
+- **Anything above 1.2M features here.** §1b's corpus tier covers
+  631k–1.2M features (and settles the Moldova question the archived table in
+  [`../overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (in git history) left open). The 21.6M-building
+  Overture run is in [`docs/guides/tippecanoe.md`](../../docs/guides/tippecanoe.md)
+  and `../results/overture-buildings-netherlands.json`.
+- **Points at fixture scale.** The corpus tier measures a 630k-point dataset
   (§1b); the fixture set below has none, so §§1–7's numbers are
   polygon/line only.
 - **Cold cache.** macOS cannot drop caches without root; everything is warm

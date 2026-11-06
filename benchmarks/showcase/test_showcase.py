@@ -234,3 +234,19 @@ def test_kept_archive_attaches_only_to_the_row_that_produced_it():
     assert sc.tool_row("x", [run], archive=kept)["archive"] == kept
     other = {**run, "output": {"bytes": 6, "sha256": "bb"}}
     assert sc.tool_row("x", [other], archive=kept)["archive"] is None
+
+
+def test_row_peak_is_the_higher_of_sampler_and_gnu_time():
+    """Sol review of #810: a sampled peak hid GNU time's higher exact one."""
+    run = {"wall_s": 1.0, "cpu_s": 1.0, "peak_rss_kib": 200 * 1024, "scratch_peak_mib": 0,
+           "output": {"bytes": 1, "sha256": "aa"},
+           "profile": {"convert": {"true_peak_mib": 100}}}
+    assert sc.tool_row("x", [run])["peak_rss_bytes"] == 200 << 20
+
+
+def test_collect_takes_provenance_from_the_timed_runs(tmp_path):
+    (tmp_path / "provenance.json").write_text(json.dumps(
+        {"commit": "abc", "host": "the bench host", "nproc": 64, "date": "then"}))
+    p = sc.run_provenance(tmp_path, sys.executable)  # any real binary
+    assert (p["commit"], p["host"], p["nproc"], p["date"]) == ("abc", "the bench host", 64, "then")
+    assert "tippecanoe_commit" in p["tool_versions"]

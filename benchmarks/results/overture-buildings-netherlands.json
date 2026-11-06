@@ -1,8 +1,8 @@
 {
   "provenance": {
-    "commit": "875b1bdc9478e323668d48c366888c4ecb36d6f4",
+    "commit": "875b1bd",
     "tylertoo_version": "tylertoo 0.8.0",
-    "host": "aarch64, 0xd40",
+    "host": "aarch64 0xd40 x64",
     "nproc": 64,
     "kernel": "7.0.0-1014-aws",
     "allocator": "mimalloc",
@@ -74,7 +74,7 @@
         "recipe": "uvx --from geoparquet-io==1.7.0 gpio extract geoparquet s3://overturemaps-us-west-2/release/2026-10-21.0/theme=buildings/type=building/*.parquet /home/ubuntu/bench-data/showcase/inputs/overture-2026-10-21.0-buildings-netherlands.parquet --bbox 3.31,50.75,7.23,53.56 --include-cols class,subtype,height"
       }
     ],
-    "date": "2026-11-06T20:28:04Z"
+    "date": "2026-11-06T19:55:01Z"
   },
   "dataset": "Overture buildings 2026-10-21.0, netherlands (bbox 3.31,50.75,7.23,53.56)",
   "features": 21557082,
@@ -99,7 +99,7 @@
         107.36
       ],
       "conversion_wall_s": null,
-      "peak_rss_bytes": 15347986432,
+      "peak_rss_bytes": 15437791232,
       "effective_cores": 16.0,
       "archive_bytes": 912301748,
       "archive_sha256": [
@@ -6266,7 +6266,7 @@
         74.38
       ],
       "conversion_wall_s": 246.39,
-      "peak_rss_bytes": 13057908736,
+      "peak_rss_bytes": 13295329280,
       "effective_cores": 22.7,
       "archive_bytes": 912304735,
       "archive_sha256": [

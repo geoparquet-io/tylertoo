@@ -904,8 +904,16 @@ class Runner:
     def run_all(self) -> None:
         """Every selected cell in manifest order, then the report."""
         names = sorted({i for c in self.cells() for i in cell_input_names(self.m["cells"][c])})
-        (self.results / "provenance.json").write_text(json.dumps(
-            provenance(self.bins, {n: self.m["inputs"][n] for n in names}), indent=2))
+        prov_path = self.results / "provenance.json"
+        prov = provenance(self.bins, {n: self.m["inputs"][n] for n in names})
+        if prov_path.exists():
+            # A resume keeps the provenance of the runs already recorded
+            # (check_resume has matched the binaries); it only adds new inputs.
+            old = json.loads(prov_path.read_text())
+            have = {i["name"] for i in old["inputs"]}
+            old["inputs"] += [i for i in prov["inputs"] if i["name"] not in have]
+            prov = old
+        prov_path.write_text(json.dumps(prov, indent=2))
         for name in self.cells():
             self.run_cell(name)
         write_report(self.results)

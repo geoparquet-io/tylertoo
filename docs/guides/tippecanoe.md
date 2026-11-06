@@ -74,11 +74,11 @@ Overture buildings 2026-10-21.0, netherlands (bbox 3.31,50.75,7.23,53.56): 21,55
 
 | tool | end-to-end wall | peak RSS | effective cores | archive | note |
 |---|---|---|---|---|---|
-| tylertoo, s3:// in place | 107 s | 15.3 GB | 16.0 | 0.9 GB | reads the parts in place; no extract |
-| tylertoo, local extract | 321 s | 13.1 GB | 22.7 | 0.9 GB | end to end includes the gpio extract |
+| tylertoo, s3:// in place | 107 s | 15.4 GB | 16.0 | 0.9 GB | reads the parts in place; no extract |
+| tylertoo, local extract | 321 s | 13.3 GB | 22.7 | 0.9 GB | end to end includes the gpio extract |
 | tippecanoe v2.79.0 | 1,417 s | 6.1 GB | 3.1 | 0.8 GB | extract + FlatGeobuf + tile |
 
-_Run: commit 875b1bdc9478e323668d48c366888c4ecb36d6f4, tylertoo 0.8.0, tippecanoe v2.79.0, gpio 1.7.0, aarch64, 0xd40, 2026-11-06._
+_Run: commit 875b1bd, tylertoo 0.8.0, tippecanoe v2.79.0, gpio 1.7.0, aarch64 0xd40 x64, 2026-11-06._
 <!-- /bench -->
 
 Every number above is from a committed record

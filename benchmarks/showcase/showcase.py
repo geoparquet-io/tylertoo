@@ -480,7 +480,9 @@ def median(xs: list[float]) -> float | None:
 def tool_row(label: str, runs: list[dict], conversion_s: float | None = None,
              note: str | None = None, steps: dict | None = None, archive: dict | None = None) -> dict:
     """One row of gen_bench_docs.py's head-to-head schema, plus detail."""
-    peak = [(rm.true_peak(r) or r["peak_rss_kib"] / 1024) * (1 << 20) for r in runs]
+    # The higher of the sampler's peak and GNU time's exact high-water mark:
+    # the sampler can miss a spike between ticks.
+    peak = [max(rm.true_peak(r) or 0, r["peak_rss_kib"] / 1024) * (1 << 20) for r in runs]
     cores = [r["cpu_s"] / r["wall_s"] for r in runs if r.get("cpu_s") and r["wall_s"]]
     fetched = [r["bytes_fetched"] for r in runs if r.get("bytes_fetched")]
     sizes = sorted({r["output"]["bytes"] for r in runs if r["output"]["bytes"]})
@@ -569,6 +571,17 @@ def provenance(tylertoo: str) -> dict:
             "inputs": [], "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
+def run_provenance(run_dir: Path, tylertoo: str) -> dict:
+    """Provenance of the timed runs, not of the machine running collect: the
+    run's saved provenance.json overrides this host's facts. The tool pins
+    (tippecanoe commit, gpio version) stay the showcase's own."""
+    prov = provenance(tylertoo)
+    saved = json.loads((run_dir / "provenance.json").read_text())
+    prov.update({k: saved[k] for k in ("commit", "tylertoo_version", "host", "nproc",
+                                       "kernel", "allocator", "date") if k in saved})
+    return prov
+
+
 def collect(opts) -> None:
     """benchmarks/results/overture-buildings-<region>.json from the runs."""
     data = Path(opts.data).expanduser().resolve()
@@ -581,7 +594,7 @@ def collect(opts) -> None:
     doc = build_doc(opts.region, reg["bbox"], ext, pin, ok_runs(res("s3"), "ovt-s3", "tylertoo"),
                     ok_runs(res("local"), "ovt-local", "tylertoo"),
                     ok_runs(res("tc"), "ovt-local", "tippecanoe"), read_parts(),
-                    provenance(opts.tylertoo), archives)
+                    run_provenance(res("s3"), opts.tylertoo), archives)
     out = Path(opts.out or RESULTS / f"overture-buildings-{opts.region}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(doc, indent=2) + "\n")
