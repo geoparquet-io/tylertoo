@@ -214,6 +214,34 @@ class TestConvertIntegration:
                     max_zoom="not-a-zoom",  # type: ignore[arg-type]
                 )
 
+    def test_convert_max_zoom_auto_n_caps_the_output(self):
+        """#793: "auto:N" is accepted and caps the estimated max zoom."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+            tylertoo.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom="auto:10",  # type: ignore[arg-type]
+            )
+            # Uncapped, this input estimates z14 (see the test above).
+            assert output.read_bytes()[101] == 10
+
+    def test_convert_max_zoom_auto_n_invalid_raises_value_error(self):
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+            for bad in ("auto:", "auto:x", "auto:-1", "auto:99"):
+                with pytest.raises(ValueError, match="max.zoom"):
+                    tylertoo.convert(
+                        input=str(input_file),
+                        output=str(output),
+                        max_zoom=bad,  # type: ignore[arg-type]
+                    )
+
     def test_convert_with_layer_name_override(self):
         """Test conversion with a custom layer name."""
         input_file = REALDATA_DIR / "open-buildings.parquet"

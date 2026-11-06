@@ -68,7 +68,7 @@ Reproduce with `./benchmarks/e2e/run_corpus.sh`.
 | tippecanoe | tylertoo | Note |
 |---|---|---|
 | `-z` / `-Z` maximum/minimum zoom | `--max-zoom` / `--min-zoom` | Same zoom range |
-| `-zg` guess the maximum zoom | `--max-zoom auto` | Uses a bounded sample of feature extents and spacing at 256 px per tile, capped at z16. Inspired by `-zg`; the algorithm differs. Both reject input with nothing to measure |
+| `-zg` guess the maximum zoom | `--max-zoom auto` | Uses a bounded sample of feature extents and spacing at 256 px per tile, capped at z16 (`auto:N` lowers the cap to zN). Inspired by `-zg`; the algorithm differs. Both reject input with nothing to measure |
 | `-l` layer name | `--layer-name` | Set at export |
 | `-L` one layer per input | `pyramid --band LO-HI:INPUT:LAYER …` with bands sharing a zoom range | Each band has its own ladder; tiles at shared zooms contain every layer |
 | `-n` name / `-N` description / `-A` attribution | `--name` / `--description` / `--attribution` | An unset field is left out of the archive. tippecanoe names the tileset after the output file and copies the name into `description`. `merge` and `pyramid` keep every inherited credit; see [attribution](attribution.md) |
