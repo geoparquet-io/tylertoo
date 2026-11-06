@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 
 use geo::Geometry;
 use geo_traits::to_geo::ToGeoGeometry;
+use geo_traits::{
+    CoordTrait, GeometryTrait, GeometryType, LineStringTrait, MultiLineStringTrait,
+    MultiPolygonTrait, PolygonTrait,
+};
 use geoarrow::datatypes::GeoArrowType;
 use geoarrow_array::cast::AsGeoArrowArray;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
@@ -237,7 +241,7 @@ pub fn fuzz_geoparquet_wkb(bytes: &[u8]) -> Result<Option<Geometry<f64>>> {
 /// `geometry`, or an empty geometry collection when any coordinate is NaN or
 /// infinite (#707): counted, and warned about once per run.
 ///
-/// This is the ingest boundary every decoded geometry crosses (the
+/// Together with [`to_finite_geometry`], this guards the ingest boundary (the
 /// in-memory convert, pass 2, the export's reads of an overview file), so a
 /// hostile coordinate is caught once per feature here instead of once per
 /// feature per tile per zoom at the clipper, and cannot take a fast path
@@ -254,6 +258,84 @@ fn finite_or_empty(
     }
     diagnostics.record(crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 1 });
     Geometry::GeometryCollection(geo::GeometryCollection::default())
+}
+
+/// Copy hot geometry types while checking their XY coordinates, avoiding a
+/// second full walk of the owned geometry. Match `geo_traits::to_geo`'s
+/// constructors, including polygon ring closing and empty rings; other types
+/// retain the upstream conversion and the #707 guard.
+fn to_finite_geometry(
+    geometry: &impl GeometryTrait<T = f64>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Option<Geometry<f64>> {
+    fn line_string(
+        line: &impl LineStringTrait<T = f64>,
+        finite: &mut bool,
+    ) -> geo::LineString<f64> {
+        // The flag lives in a local for the whole ring: through the closure of
+        // a `map` it was a load and a store of the caller's flag per vertex.
+        let mut coords = Vec::with_capacity(line.num_coords());
+        let mut ring_finite = true;
+        for coord in line.coords() {
+            let coord = geo::Coord {
+                x: coord.x(),
+                y: coord.y(),
+            };
+            ring_finite &= coord_is_finite(coord);
+            coords.push(coord);
+        }
+        *finite &= ring_finite;
+        geo::LineString::new(coords)
+    }
+
+    fn polygon(polygon: &impl PolygonTrait<T = f64>, finite: &mut bool) -> geo::Polygon<f64> {
+        let exterior = polygon
+            .exterior()
+            .map(|ring| line_string(&ring, finite))
+            .unwrap_or_else(|| geo::LineString::new(vec![]));
+        let interiors = polygon
+            .interiors()
+            .map(|ring| line_string(&ring, finite))
+            .collect();
+        geo::Polygon::new(exterior, interiors)
+    }
+
+    let mut finite = true;
+    let converted = match geometry.as_type() {
+        GeometryType::LineString(line) => Geometry::LineString(line_string(line, &mut finite)),
+        GeometryType::Polygon(poly) => Geometry::Polygon(polygon(poly, &mut finite)),
+        GeometryType::MultiLineString(lines) => {
+            Geometry::MultiLineString(geo::MultiLineString::new(
+                lines
+                    .line_strings()
+                    .map(|line| line_string(&line, &mut finite))
+                    .collect(),
+            ))
+        }
+        GeometryType::MultiPolygon(polygons) => Geometry::MultiPolygon(geo::MultiPolygon::new(
+            polygons
+                .polygons()
+                .map(|poly| polygon(&poly, &mut finite))
+                .collect(),
+        )),
+        _ => {
+            #[cfg(test)]
+            crate::valve_counter::note(|c| c.finite_fallback += 1);
+            return geometry
+                .try_to_geometry()
+                .map(|g| finite_or_empty(g, diagnostics));
+        }
+    };
+    #[cfg(test)]
+    crate::valve_counter::note(|c| c.finite_fast += 1);
+    if finite {
+        Some(converted)
+    } else {
+        diagnostics.record(crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 1 });
+        Some(Geometry::GeometryCollection(
+            geo::GeometryCollection::default(),
+        ))
+    }
 }
 
 fn coord_is_finite(coord: geo::Coord<f64>) -> bool {
@@ -313,11 +395,8 @@ impl GeoArrowVisitor for ExtractGeometries<'_> {
                     let geom_trait = geom_result.map_err(|e| {
                         Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e))
                     })?;
-                    self.output.push(
-                        geom_trait
-                            .try_to_geometry()
-                            .map(|g| finite_or_empty(g, self.diagnostics)),
-                    );
+                    self.output
+                        .push(to_finite_geometry(&geom_trait, self.diagnostics));
                 }
                 None => self.output.push(None),
             }
@@ -329,6 +408,198 @@ impl GeoArrowVisitor for ExtractGeometries<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deleting a specialized arm of `to_finite_geometry` still yields equal
+    /// geometry through the fallback, so the result cannot show it: count the
+    /// conversions that take the copy-while-checking path.
+    #[test]
+    fn mutation_regression_hot_geometry_types_take_the_fused_path() {
+        let line = || geo::LineString::from(vec![(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)]);
+        let poly = || geo::Rect::new((0.0, 0.0), (1.0, 1.0)).to_polygon();
+        let hot = [
+            Geometry::LineString(line()),
+            Geometry::Polygon(poly()),
+            Geometry::MultiLineString(geo::MultiLineString(vec![line(), line()])),
+            Geometry::MultiPolygon(geo::MultiPolygon(vec![poly(), poly()])),
+        ];
+        for geometry in hot {
+            let diagnostics = crate::diagnostics::Diagnostics::default();
+            let (converted, counts) = crate::valve_counter::measure(|| {
+                to_finite_geometry(&geometry, &diagnostics).unwrap()
+            });
+            assert_eq!(converted, geometry);
+            assert_eq!(
+                (counts.finite_fast, counts.finite_fallback),
+                (1, 0),
+                "{geometry:?} must not take the upstream fallback"
+            );
+        }
+        let point = Geometry::Point(geo::Point::new(1.0, 2.0));
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let (_, counts) =
+            crate::valve_counter::measure(|| to_finite_geometry(&point, &diagnostics).unwrap());
+        assert_eq!((counts.finite_fast, counts.finite_fallback), (0, 1));
+    }
+
+    #[test]
+    fn mutation_regression_finite_line_and_multi_geometries() {
+        use crate::diagnostics::{Diagnostic, Diagnostics};
+
+        // Deleting a specialized match arm also passes these assertions:
+        // try_to_geometry + finite_or_empty is the equivalent fallback.
+        for value in [2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let line = geo::LineString::from(vec![(0.0, 0.0), (value, 1.0), (3.0, 0.0)]);
+            let polygon = geo::Polygon::new(line.clone(), vec![]);
+            for geometry in [
+                Geometry::LineString(line.clone()),
+                Geometry::MultiLineString(geo::MultiLineString(vec![
+                    geo::LineString::from(vec![(0.0, 0.0), (1.0, 1.0)]),
+                    line,
+                ])),
+                Geometry::MultiPolygon(geo::MultiPolygon(vec![
+                    geo::Rect::new((10.0, 10.0), (11.0, 11.0)).to_polygon(),
+                    polygon,
+                ])),
+            ] {
+                let diagnostics = Diagnostics::default();
+                let converted = to_finite_geometry(&geometry, &diagnostics).unwrap();
+                if value.is_finite() {
+                    assert_eq!(converted, geometry);
+                } else {
+                    assert_eq!(
+                        converted,
+                        Geometry::GeometryCollection(geo::GeometryCollection::default()),
+                        "{geometry:?}"
+                    );
+                }
+                assert_eq!(
+                    diagnostics.count(&Diagnostic::NonFiniteGeometry { count: 0 }),
+                    usize::from(!value.is_finite())
+                );
+            }
+        }
+    }
+
+    /// The fused copy must match upstream's XY conversion, ring closing and
+    /// empty handling, and count non-finite rows exactly as the old guard did.
+    #[test]
+    fn fused_conversion_matches_old_wkb_conversion() {
+        use arrow_array::BinaryArray;
+        use geoarrow::array::WkbArray;
+        use geoarrow::datatypes::WkbType;
+
+        fn header(code: u32, count: usize) -> Vec<u8> {
+            let mut bytes = vec![1];
+            bytes.extend_from_slice(&code.to_le_bytes());
+            bytes.extend_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
+            bytes
+        }
+
+        fn coords(bytes: &mut Vec<u8>, ring: &[[f64; 4]], dimensions: usize) {
+            bytes.extend_from_slice(&u32::try_from(ring.len()).unwrap().to_le_bytes());
+            for coord in ring {
+                for value in &coord[..dimensions] {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+
+        fn rows(rings: &[Vec<[f64; 4]>], offset: u32, dimensions: usize) -> Vec<Vec<u8>> {
+            let mut polygon = header(offset + 3, rings.len());
+            for ring in rings {
+                coords(&mut polygon, ring, dimensions);
+            }
+            let mut line = vec![1];
+            line.extend_from_slice(&(offset + 2).to_le_bytes());
+            coords(&mut line, &rings[0], dimensions);
+            let mut multi_polygon = header(offset + 6, 2);
+            multi_polygon.extend_from_slice(&header(offset + 3, 0));
+            multi_polygon.extend_from_slice(&polygon);
+            let mut multi_line = header(offset + 5, rings.len() + 1);
+            multi_line.extend_from_slice(&header(offset + 2, 0));
+            for ring in rings {
+                multi_line.push(1);
+                multi_line.extend_from_slice(&(offset + 2).to_le_bytes());
+                coords(&mut multi_line, ring, dimensions);
+            }
+            vec![polygon, multi_polygon, line, multi_line]
+        }
+
+        let mut cases = Vec::new();
+        for (offset, dimensions) in [(0, 2), (1000, 3), (2000, 3), (3000, 4)] {
+            // Non-finite Z/M must be ignored, and signed zero must survive.
+            let exterior = vec![
+                [-0., 0., f64::NAN, f64::INFINITY],
+                [4., 0., f64::NAN, f64::INFINITY],
+                [4., 4., f64::NAN, f64::INFINITY],
+            ];
+            let hole: Vec<_> = (0..65)
+                .map(|i| [f64::from(i), 1., f64::NAN, f64::INFINITY])
+                .collect();
+            let rings = vec![exterior, hole];
+            cases.extend(rows(&rings, offset, dimensions));
+            let mut closed = rings.clone();
+            for ring in &mut closed {
+                ring.push(ring[0]);
+            }
+            cases.extend(rows(&closed, offset, dimensions));
+            for ring_index in 0..rings.len() {
+                for coord_index in [0, rings[ring_index].len() - 1] {
+                    for axis in 0..2 {
+                        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                            let mut changed = rings.clone();
+                            changed[ring_index][coord_index][axis] = value;
+                            cases.extend(rows(&changed, offset, dimensions));
+                        }
+                    }
+                }
+            }
+            cases.extend(rows(&[vec![], rings[1].clone()], offset, dimensions));
+            cases.extend(rows(&[vec![]], offset, dimensions));
+            for code in [2, 3, 5, 6] {
+                cases.push(header(offset + code, 0));
+            }
+        }
+
+        let array = WkbArray::from((
+            BinaryArray::from_vec(cases.iter().map(Vec::as_slice).collect()),
+            WkbType::default(),
+        ));
+        let old_diagnostics = crate::diagnostics::Diagnostics::default();
+        let fused_diagnostics = crate::diagnostics::Diagnostics::default();
+        let mut expected = Vec::new();
+        for i in 0..array.len() {
+            let item = array.value(i).unwrap();
+            let old = item
+                .try_to_geometry()
+                .map(|g| finite_or_empty(g, &old_diagnostics));
+            let fused = to_finite_geometry(&item, &fused_diagnostics);
+            assert_eq!(fused, old, "geometry row {i}");
+            // WKB equality also checks coordinate bits (including signed zero)
+            // and the exact number/order of rings and members. Polygons with
+            // holes but no exterior must retain the same encoding error.
+            assert_eq!(
+                fused
+                    .as_ref()
+                    .map(|g| crate::wkb::geometry_to_wkb(g).map_err(|e| e.to_string())),
+                old.as_ref()
+                    .map(|g| crate::wkb::geometry_to_wkb(g).map_err(|e| e.to_string())),
+                "WKB row {i}"
+            );
+            expected.push(old);
+        }
+        let mut actual = Vec::new();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        extract_geometries_opt_from_array(&array, &mut actual, &diagnostics).unwrap();
+        assert_eq!(actual, expected);
+        let counter = crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 0 };
+        assert!(old_diagnostics.count(&counter) > 0);
+        assert_eq!(
+            fused_diagnostics.count(&counter),
+            old_diagnostics.count(&counter)
+        );
+        assert_eq!(diagnostics.count(&counter), old_diagnostics.count(&counter));
+    }
 
     #[test]
     fn coordinate_finiteness_matches_every_ieee_exponent() {

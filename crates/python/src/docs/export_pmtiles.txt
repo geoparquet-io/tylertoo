@@ -30,9 +30,12 @@ Args:
     profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles):
         `"speed"` holds everything in RAM, `"bounded"` uses disk and
         holds the least, and `"auto"` sizes to the machine's memory.
-        Footprints compare for one allocator: the musl (Alpine) wheel uses
-        mimalloc, which adds a fixed floor of about 600 MiB on small
-        inputs; other wheels use the system allocator. Output is
+        Footprints compare for one allocator: wheels use mimalloc, which
+        adds a fixed floor of about 600 MiB on small inputs. On a 1.4M
+        polygon export it ran 8% faster and held 18% more peak memory
+        than the system allocator; a non-musl source build can opt out
+        with `maturin build --no-default-features` (musl always uses
+        mimalloc). Output is
         identical across profiles.
     name: Human-readable tileset name, stored in the metadata.
     description: Description of the tileset, stored in the metadata.

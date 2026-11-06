@@ -894,21 +894,21 @@ pub(super) fn convert_to_pmtiles_validated(
     // directory, removed on drop — success or failure alike. A TempPath, not
     // an open NamedTempFile: convert publishes by renaming a sibling over
     // this path, which Windows refuses while a handle to it is open (#678).
-    let (overview_path, overview_tmp): (PathBuf, Option<tempfile::TempPath>) =
+    let (overview_path, overview_tmp): (PathBuf, Option<crate::atomic_output::Reserved>) =
         match &options.keep_overview {
             // Its directory was checked above.
             Some(path) => (path.clone(), None),
             None => {
                 let dir = intermediate_dir(options, output);
-                let tmp = tempfile::Builder::new()
-                    .prefix(".tylertoo-overview-")
-                    .suffix(".parquet")
-                    .tempfile_in(&dir)
-                    .map_err(|source| TilesError::IntermediateCreate {
-                        dir: dir.clone(),
-                        source,
-                    })?
-                    .into_temp_path();
+                let tmp = crate::atomic_output::reserve_path(
+                    ".tylertoo-overview-",
+                    ".parquet",
+                    Some(&dir),
+                )
+                .map_err(|source| TilesError::IntermediateCreate {
+                    dir: dir.clone(),
+                    source,
+                })?;
                 (tmp.to_path_buf(), Some(tmp))
             }
         };
@@ -1650,6 +1650,32 @@ mod tests {
             .map(|s| s.as_str())
             .collect();
         assert_eq!(keys, ["convert", "export"]);
+    }
+
+    /// #791: the intermediate overview is published by renaming over its
+    /// reserved path, which must not exist then: a rename over an existing
+    /// file makes ext4 flush the whole overview inside the rename (0.76 s on
+    /// Moldova, 13.8 s on Mato Grosso). Deterministic: no timing.
+    #[test]
+    fn tiles_publishes_the_intermediate_onto_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let input = dir.path().join("in.parquet");
+        points_input(&input);
+        let output = dir.path().join("out.pmtiles");
+        let mut options = zoomed_options(0, 2);
+        options.convert.spill_dir = Some(scratch.clone());
+
+        convert_to_pmtiles(&TilesInput::Path(input), &output, &options).expect("must convert");
+
+        let (published, over_existing) =
+            crate::atomic_output::renames_over_existing(&scratch, ".tylertoo-overview-");
+        assert_eq!(published, 1, "the intermediate is published exactly once");
+        assert!(
+            over_existing.is_empty(),
+            "renamed over an existing file: {over_existing:?}"
+        );
     }
 
     /// #314: `keep_overview` retains the intermediate at the named path.

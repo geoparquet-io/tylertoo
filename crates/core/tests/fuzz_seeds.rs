@@ -215,6 +215,26 @@ fn band_archive_seeds() {
     );
 }
 
+#[test]
+fn mutation_regression_band_archive_exact_tile_count() {
+    for count in [0, 3] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("band.pmtiles");
+        let mut writer =
+            tylertoo_core::StreamingPmtilesWriter::new(tylertoo_core::Compression::Gzip).unwrap();
+        for x in 0..count {
+            // Identical bodies also exercise the directory's deduplicated
+            // tile addressing: count tiles, rather than distinct contents.
+            writer.add_tile(2, x, 0, b"tile body").unwrap();
+        }
+        writer.finalize(&archive).unwrap();
+        assert_eq!(
+            tylertoo_core::pyramid::fuzz_band_archive(&std::fs::read(archive).unwrap()).unwrap(),
+            u64::from(count)
+        );
+    }
+}
+
 /// The tile coordinates `mvt_decode` gives a seed: its first byte picks
 /// the zoom, and the tile is that zoom's south-east corner.
 fn mvt_seed(b: &[u8]) -> (u8, u32, &[u8]) {

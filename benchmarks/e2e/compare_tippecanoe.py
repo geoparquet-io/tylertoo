@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.11,<3.14"
 # dependencies = [
 #   "pmtiles==3.8.1",
 #   "mapbox-vector-tile==2.2.0",

@@ -80,6 +80,8 @@ pub mod sutherland_hodgman;
 #[cfg(test)]
 pub(crate) mod test_log;
 pub mod tile;
+#[cfg(test)]
+mod valve_counter;
 pub mod wkb;
 pub(crate) mod wkb_column;
 

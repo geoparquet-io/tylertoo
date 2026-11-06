@@ -119,6 +119,9 @@ fn count_fully_inside(geometries: &[Polygon<f64>], bounds: &TileBounds) -> usize
 /// Benchmark small buildings at high zoom (z14) - should show significant speedup
 fn bench_small_features_high_zoom(c: &mut Criterion) {
     let mut group = c.benchmark_group("bbox_containment/small_features_z14");
+    // Hoisted: building the sink inside the timed closure charged its
+    // allocation to every iteration (#773).
+    let diag = tylertoo_core::diagnostics::Diagnostics::default();
 
     // Tile at z14 (typical for building-level detail)
     // Example: San Francisco area
@@ -143,7 +146,7 @@ fn bench_small_features_high_zoom(c: &mut Criterion) {
                             black_box(&geom),
                             black_box(&tile_bounds),
                             black_box(buffer),
-                            &tylertoo_core::diagnostics::Diagnostics::default(),
+                            &diag,
                         )
                         .is_some()
                         {
@@ -162,6 +165,9 @@ fn bench_small_features_high_zoom(c: &mut Criterion) {
 /// Benchmark small buildings that cross tile boundaries (lower skip rate)
 fn bench_small_features_boundary_crossing(c: &mut Criterion) {
     let mut group = c.benchmark_group("bbox_containment/boundary_crossing");
+    // Hoisted: building the sink inside the timed closure charged its
+    // allocation to every iteration (#773).
+    let diag = tylertoo_core::diagnostics::Diagnostics::default();
 
     let tile_bounds = TileBounds::new(-122.5, 37.7, -122.4, 37.8);
     let buffer = 0.0001;
@@ -213,7 +219,7 @@ fn bench_small_features_boundary_crossing(c: &mut Criterion) {
                     black_box(&geom),
                     black_box(&tile_bounds),
                     black_box(buffer),
-                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                    &diag,
                 )
                 .is_some()
                 {
@@ -230,6 +236,9 @@ fn bench_small_features_boundary_crossing(c: &mut Criterion) {
 /// Benchmark large features at low zoom (z4) - should show NO benefit
 fn bench_large_features_low_zoom(c: &mut Criterion) {
     let mut group = c.benchmark_group("bbox_containment/large_features_z4");
+    // Hoisted: building the sink inside the timed closure charged its
+    // allocation to every iteration (#773).
+    let diag = tylertoo_core::diagnostics::Diagnostics::default();
 
     // Tile at z4 (continental scale)
     let tile_bounds = TileBounds::new(-112.5, 22.5, -67.5, 45.0);
@@ -253,7 +262,7 @@ fn bench_large_features_low_zoom(c: &mut Criterion) {
                             black_box(&geom),
                             black_box(&tile_bounds),
                             black_box(buffer),
-                            &tylertoo_core::diagnostics::Diagnostics::default(),
+                            &diag,
                         )
                         .is_some()
                         {
@@ -272,6 +281,9 @@ fn bench_large_features_low_zoom(c: &mut Criterion) {
 /// Benchmark MultiPolygon bbox filtering (like Antarctica with 7453 sub-polygons)
 fn bench_multipolygon_bbox_filter(c: &mut Criterion) {
     let mut group = c.benchmark_group("bbox_containment/multipolygon");
+    // Hoisted: building the sink inside the timed closure charged its
+    // allocation to every iteration (#773).
+    let diag = tylertoo_core::diagnostics::Diagnostics::default();
 
     // Small tile that should only intersect a few sub-polygons
     let tile_bounds = TileBounds::new(-67.5, -66.51, -56.25, -61.61);
@@ -343,7 +355,7 @@ fn bench_multipolygon_bbox_filter(c: &mut Criterion) {
                         black_box(geom),
                         black_box(&tile_bounds),
                         black_box(buffer),
-                        &tylertoo_core::diagnostics::Diagnostics::default(),
+                        &diag,
                     )
                 });
             },
@@ -359,6 +371,9 @@ fn bench_multipolygon_bbox_filter(c: &mut Criterion) {
 /// to show the performance difference
 fn bench_optimization_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("bbox_containment/comparison");
+    // Hoisted: building the sink inside the timed closure charged its
+    // allocation to every iteration (#773).
+    let diag = tylertoo_core::diagnostics::Diagnostics::default();
 
     let tile_bounds = TileBounds::new(-122.5, 37.7, -122.4, 37.8);
     let buffer = 0.0001;
@@ -374,7 +389,7 @@ fn bench_optimization_comparison(c: &mut Criterion) {
                     black_box(&geom),
                     black_box(&tile_bounds),
                     black_box(buffer),
-                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                    &diag,
                 )
                 .is_some()
                 {

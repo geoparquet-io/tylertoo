@@ -127,6 +127,103 @@ pub(crate) fn create(target: &Path) -> io::Result<(File, PendingOutput)> {
     ))
 }
 
+/// Test-only record of every publish-by-rename: the destination and whether
+/// something already sat there when the rename ran (#791). A rename over an
+/// existing file makes ext4 flush the new file inside the rename.
+#[cfg(test)]
+pub(crate) static RENAME_LOG: std::sync::Mutex<Vec<(PathBuf, bool)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record a rename onto `target` in [`RENAME_LOG`] (test builds only).
+#[cfg(test)]
+pub(crate) fn observe_rename_target(target: &Path) {
+    RENAME_LOG
+        .lock()
+        .unwrap()
+        .push((target.to_path_buf(), target.exists()));
+}
+
+/// Destinations under `dir` whose name starts with `prefix` that a rename
+/// replaced an existing file at, since the process started.
+#[cfg(test)]
+pub(crate) fn renames_over_existing(dir: &Path, prefix: &str) -> (usize, Vec<PathBuf>) {
+    let log = RENAME_LOG.lock().unwrap();
+    let ours: Vec<_> = log
+        .iter()
+        .filter(|(p, _)| {
+            p.parent().and_then(Path::parent) == Some(dir)
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+        })
+        .collect();
+    (
+        ours.len(),
+        ours.iter()
+            .filter(|(_, e)| *e)
+            .map(|(p, _)| p.clone())
+            .collect(),
+    )
+}
+
+/// A path reserved inside a private directory, for a file some other writer
+/// will create by renaming over it. Dereferences to the (missing) path;
+/// dropping it removes the directory and everything in it, on success and
+/// failure alike.
+#[derive(Debug)]
+pub(crate) struct Reserved {
+    path: PathBuf,
+    // Held for its Drop.
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for Reserved {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for Reserved {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Reserve a unique, missing path `<dir>/<prefix><random>/<prefix>out<suffix>`
+/// for a file some other writer will publish by renaming over it.
+///
+/// A rename over an *existing* file makes ext4 (`auto_da_alloc`) flush the
+/// whole new file synchronously before the rename returns: on Moldova that
+/// one `renameat` was 0.76 s, all of convert's `writer_finish` phase. Onto a
+/// missing path it takes microseconds and the pages stay in the cache for
+/// the next reader (#791).
+///
+/// The path is missing, yet nobody else can claim it: it sits in a fresh
+/// directory this call creates (`mkdir`, which refuses any existing entry
+/// including a symlink, mode 0700 on Unix) beside `dir`, so the rename stays
+/// on one filesystem and no other user can plant an entry at the name in
+/// the window before the writer creates the file. `dir` is `None` for the
+/// system temp directory.
+pub(crate) fn reserve_path(prefix: &str, suffix: &str, dir: Option<&Path>) -> io::Result<Reserved> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    // `tempdir` creates 0777 minus the umask; ask for owner-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let private = match dir {
+        Some(dir) => builder.tempdir_in(dir)?,
+        None => builder.tempdir()?,
+    };
+    let path = private.path().join(format!("{prefix}out{suffix}"));
+    Ok(Reserved {
+        path,
+        _dir: private,
+    })
+}
+
 /// An output path that [`check_writable`] found could not be written.
 #[derive(Debug, thiserror::Error)]
 #[error("cannot write {}: {reason}", .path.display())]
@@ -300,6 +397,8 @@ impl PendingOutput {
         let Some(temp) = self.temp else {
             return Ok(()); // written directly, nothing to publish
         };
+        #[cfg(test)]
+        observe_rename_target(&self.target);
         // `TempPath::persist` is a rename that keeps the guard's cleanup
         // semantics on failure (the sibling is deleted when the error is
         // dropped) and on Windows replaces an existing destination the way
@@ -322,6 +421,69 @@ impl PendingOutput {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Regression (#791): a publish by rename must land on a path that does
+    /// not exist, or ext4 flushes the whole file inside the rename. The
+    /// reservation still owns the name and cleans up after itself.
+    #[test]
+    fn reserved_path_is_absent_unique_and_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = reserve_path(".x-", ".parquet", Some(dir.path())).unwrap();
+        let b = reserve_path(".x-", ".parquet", Some(dir.path())).unwrap();
+        assert!(!a.exists() && !b.exists(), "path must be missing");
+        assert_ne!(a.to_path_buf(), b.to_path_buf());
+        assert_eq!(a.parent().unwrap().parent().unwrap(), dir.path());
+        // Published over by a rename, then removed when the guard drops.
+        let (mut file, pending) = create(&dir.path().join("sib.parquet")).unwrap();
+        file.write_all(b"data").unwrap();
+        drop(file);
+        pending.publish().unwrap();
+        std::fs::rename(dir.path().join("sib.parquet"), &*a).unwrap();
+        assert!(a.exists());
+        drop(a);
+        drop(b);
+        assert_eq!(listing(dir.path()), Vec::<String>::new());
+    }
+
+    /// The reserved directory is owner-only, and cleanup after a failed
+    /// writer (a half-written file left inside) removes all of it.
+    #[cfg(unix)]
+    #[test]
+    fn reserved_directory_is_private_and_cleaned_up_after_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let r = reserve_path(".p-", ".bin", Some(dir.path())).unwrap();
+        let mode = std::fs::metadata(r.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "reserved directory must be 0700");
+        std::fs::write(&*r, b"half written").unwrap();
+        std::fs::write(r.with_extension("partial"), b"leftover").unwrap();
+        drop(r);
+        assert_eq!(listing(dir.path()), Vec::<String>::new());
+    }
+
+    /// An entry already at the reserved name (here a symlink planted at the
+    /// directory name) makes the reservation fail rather than follow it.
+    #[cfg(unix)]
+    #[test]
+    fn reservation_refuses_a_pre_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let planted = dir.path().join("reserved");
+        std::os::unix::fs::symlink(elsewhere.path(), &planted).unwrap();
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("reserved").rand_bytes(0);
+        // The same call `reserve_path` makes, with the random part pinned.
+        let error = builder.tempdir_in(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(listing(elsewhere.path()), Vec::<String>::new());
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 
     fn listing(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)

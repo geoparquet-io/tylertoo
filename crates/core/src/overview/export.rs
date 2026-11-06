@@ -160,6 +160,8 @@ struct PartitionBudget {
     ceiling_wave: usize,
     auto_wave: bool,
     member_bytes: Option<u64>,
+    /// The historical member price for the hard refusal, without valve workspace.
+    fit_member_bytes: Option<u64>,
     /// The run's profile: the per-level #311 guard sizes under it.
     profile: MemoryProfile,
     budget: MemoryBudget,
@@ -1345,6 +1347,34 @@ const MEMBER_BASE_BYTES: u64 = 224;
 /// [`MEMBER_BASE_BYTES`] for the fit.
 const MEMBER_PROPERTY_BYTES: u64 = 208;
 
+/// Extra transient bytes per member when the size valve can merge: grouping,
+/// quantized polygons, interactions and union work alongside collected members.
+///
+/// Fitted (2026-11, dhat, debug build, two workers, 100k overlapping members
+/// per fixture, inputs allocated before profiling) on both 5-vertex squares
+/// and 40-vertex jittered-radius rings, including each ring's closing vertex:
+///
+/// | fixture | peak live bytes | bytes/member |
+/// |---|---|---|
+/// | squares | 26,829,000 | 268.29 |
+/// | vertex-heavy | 56,103,693 | 561.03693 |
+///
+/// With the separately charged 8 MiB gzip cache, 384 B/member estimates
+/// 46,788,608 B: measured/estimated is 0.57× and 1.20× respectively. Refit
+/// with the process-isolated `valve_encode_peak_live_bytes_matches_price`
+/// ledgers; their 0.5–1.25× bound guards both underpricing and waste
+/// returning. Drop/unlimited add nothing.
+const VALVE_TRANSIENT_BYTES_PER_MEMBER: u64 = 384;
+
+/// The shared wave/group/store fit price, including merge-valve workspace.
+fn export_member_resident_bytes(resident: u64, opts: &ExportOptions) -> u64 {
+    resident.saturating_add(if valve_merges(opts) {
+        VALVE_TRANSIENT_BYTES_PER_MEMBER
+    } else {
+        0
+    })
+}
+
 /// Estimated resident bytes of one clipped member (#311, #665): the finest
 /// level's mean stored bytes per row times [`MEMBER_MEMORY_INFLATION`], plus
 /// [`MEMBER_BASE_BYTES`] and [`MEMBER_PROPERTY_BYTES`] per published
@@ -1389,7 +1419,7 @@ fn auto_partition_wave(cores: usize, profile: MemoryProfile, budget: &MemoryBudg
 ///
 /// Where the upfront [`memory_safe_wave`] sizes from a flat per-slot constant,
 /// this uses the level's *actual* densest planned partition:
-/// `max(partition.members) × member_bytes` (see [`member_resident_bytes`])
+/// `max(partition.members) × member_bytes` (see [`export_member_resident_bytes`])
 /// directly estimates the largest partition's resident volume. This
 /// captures the real driver — a single dense tile that overshoots
 /// [`DEFAULT_PARTITION_TARGET`] is one partition, wholly unbounded by the target
@@ -1422,7 +1452,8 @@ fn memory_safe_level_wave(
     // Saturating throughout: an absurd member count or byte size clamps the
     // per-slot estimate to "definitely serial" (wave 1) rather than overflowing.
     // A footer price: `per_member` is the finest level's mean stored row
-    // bytes from the footer, inflated by [`member_resident_bytes`].
+    // bytes from the footer, inflated with the optional valve workspace by
+    // [`export_member_resident_bytes`].
     let per_slot = (max_members as u64).saturating_mul(per_member).max(1);
     ceiling.min(budget.affordable(
         profile,
@@ -1439,7 +1470,7 @@ fn memory_safe_level_wave(
 /// stay within what the serial loop already budgets for. When the member
 /// size is known, the cap also narrows to the members
 /// [`MemoryPhase::ExportCollect`] can afford under `profile` at
-/// `member_bytes` each (see [`member_resident_bytes`]), the same estimate
+/// `member_bytes` each (see [`export_member_resident_bytes`]), the same estimate
 /// [`memory_safe_level_wave`] uses; under `speed` it does not narrow.
 ///
 /// The cap counts members only. A group can also hold the encoded tiles of
@@ -1855,9 +1886,10 @@ pub fn write_empty_archive(
 ///
 /// `ceiling_wave` is the resolved `--partition-wave` upper bound. On `auto`
 /// each level narrows it further from its own densest partition (#311); an
-/// explicit wave is honoured verbatim. `member_bytes` is the estimated
-/// resident size of one member ([`member_resident_bytes`]). Under any wave, a
-/// level whose densest tile cannot fit in `fit_limit` on its own is refused
+/// explicit wave is honoured verbatim. `member_bytes` includes merge-valve
+/// workspace; `fit_member_bytes` keeps the historical refusal price from
+/// [`member_resident_bytes`]. Under any wave, a level whose densest tile
+/// cannot fit in `fit_limit` on its own is refused
 /// ([`check_levels_fit`], #665). `fit_limit` is probed fresh rather than
 /// taken from the cached `available_ram`: in a `tiles` run that figure was
 /// fixed during convert's pass 1.
@@ -1872,6 +1904,7 @@ fn plan_levels(
         ceiling_wave,
         auto_wave,
         member_bytes,
+        fit_member_bytes,
         profile,
         budget,
         fit_limit,
@@ -1923,7 +1956,7 @@ fn plan_levels(
     check_levels_fit(
         &plans,
         scans,
-        member_bytes,
+        fit_member_bytes,
         fit_limit,
         skip_memory_preflight_from_env(),
     )?;
@@ -2173,7 +2206,8 @@ fn export_pmtiles_validated(
         feature_id,
         skipped: skipped_property_columns,
     } = resolve_export_columns(&reader, options, &level_zooms)?;
-    let member_bytes = export_member_bytes(&reader, &published, mean_member_bytes);
+    let fit_member_bytes = export_member_bytes(&reader, &published, mean_member_bytes);
+    let member_bytes = fit_member_bytes.map(|bytes| export_member_resident_bytes(bytes, options));
 
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
@@ -2275,6 +2309,7 @@ fn export_pmtiles_validated(
             ceiling_wave,
             auto_wave,
             member_bytes,
+            fit_member_bytes,
             profile: options.profile,
             budget: *budget,
             fit_limit: knobs.memory_limit.or_else(probe_oom_memory_limit),
@@ -2565,8 +2600,10 @@ impl ExportReport {
 
 /// One member's estimated resident size (#665): [`member_resident_bytes`]
 /// over the finest level's mean stored row size and the properties every
-/// member carries. Steers the wave and the [`check_levels_fit`] refusal
-/// only, never output bytes. Pulled out of `export_pmtiles_run` to keep it
+/// member carries. The [`check_levels_fit`] refusal uses this price; wave,
+/// group and store fits add merge-valve workspace through
+/// [`export_member_resident_bytes`]. Neither affects output bytes.
+/// Pulled out of `export_pmtiles_run` to keep it
 /// under clippy's function-length ceiling.
 fn export_member_bytes(
     reader: &OverviewReader,
@@ -7030,115 +7067,129 @@ fn encode_members(
     // match the writer's `tile_compression` (Gzip) so `add_tile_precompressed`
     // stays byte-identical to the old serial `add_tile_with_count` path.
     // #535: `encode` is timed per tile, inside this closure (core-seconds).
-    groups
-        .into_par_iter()
-        .filter_map(|g| {
-            let _encode = ExportTimers::scope(&timers.encode);
-            let (x, y) = key_to_xy(g[0].key, zoom);
-            let tb = TileCoord::new(x, y, zoom).bounds();
-            // #788: the tile's fill is owned for the encode and dropped once
-            // its fill commands are built; a spilled fill's read can fail.
-            let fill = fills.map(|f| {
-                ExportTimers::time(&timers.fill_encode, || {
-                    f.get(g[0].key).map(|polys| {
-                        polys.map(|polys| fill_features(&polys, g, &tb, opts, diagnostics))
-                    })
+    let encode_group = |g: &[Member]| -> Option<Result<EncodedTile, ExportError>> {
+        let _encode = ExportTimers::scope(&timers.encode);
+        let (x, y) = key_to_xy(g[0].key, zoom);
+        let tb = TileCoord::new(x, y, zoom).bounds();
+        // #788: the tile's fill is owned for the encode and dropped once
+        // its fill commands are built; a spilled fill's read can fail.
+        let fill = fills.map(|f| {
+            ExportTimers::time(&timers.fill_encode, || {
+                f.get(g[0].key).map(|polys| {
+                    polys.map(|polys| fill_features(&polys, g, &tb, opts, diagnostics))
                 })
-            });
-            let (fill, mut fill_tally) = match fill.transpose() {
-                Ok(fill) => fill.flatten().unwrap_or_default(),
-                Err(error) => return Some(Err(error)),
+            })
+        });
+        let (fill, mut fill_tally) = match fill.transpose() {
+            Ok(fill) => fill.flatten().unwrap_or_default(),
+            Err(error) => return Some(Err(error)),
+        };
+        let mvt = encode_tile(
+            gzip_cache,
+            g,
+            &tb,
+            opts,
+            &fill,
+            &mut fill_tally,
+            diagnostics,
+        );
+        if opts.feature_id.is_some() {
+            use crate::diagnostics::SourceLossCause;
+            let cause = if mvt.valve.dropped > 0 {
+                SourceLossCause::ValveDropped
+            } else if mvt.valve.merged > 0 {
+                SourceLossCause::Merged
+            } else {
+                SourceLossCause::EncodeDropped
             };
-            let mvt = encode_tile(
-                gzip_cache,
-                g,
-                &tb,
-                opts,
-                &fill,
-                &mut fill_tally,
-                diagnostics,
-            );
-            if opts.feature_id.is_some() {
-                use crate::diagnostics::SourceLossCause;
-                let cause = if mvt.valve.dropped > 0 {
-                    SourceLossCause::ValveDropped
-                } else if mvt.valve.merged > 0 {
-                    SourceLossCause::Merged
-                } else {
-                    SourceLossCause::EncodeDropped
-                };
-                let surviving: std::collections::BTreeSet<u64> =
-                    mvt.source_ids.iter().copied().collect();
-                let losses: std::collections::BTreeMap<u64, _> =
-                    mvt.source_losses.iter().copied().collect();
-                for member in g {
-                    if let Some(id) = member.id {
-                        let cause = losses.get(&member.seq).copied().unwrap_or(cause);
-                        if !surviving.contains(&member.seq) {
-                            if let Err(error) =
-                                diagnostics.source_member_loss(member.seq, id, zoom, cause)
-                            {
-                                return Some(Err(error.into()));
-                            }
-                        }
-                    }
-                }
-                if mvt.features > 0 {
-                    for &id in &mvt.source_ids {
-                        if let Err(error) = diagnostics.source_emitted(id, zoom) {
+            let surviving: std::collections::BTreeSet<u64> =
+                mvt.source_ids.iter().copied().collect();
+            let losses: std::collections::BTreeMap<u64, _> =
+                mvt.source_losses.iter().copied().collect();
+            for member in g {
+                if let Some(id) = member.id {
+                    let cause = losses.get(&member.seq).copied().unwrap_or(cause);
+                    if !surviving.contains(&member.seq) {
+                        if let Err(error) =
+                            diagnostics.source_member_loss(member.seq, id, zoom, cause)
+                        {
                             return Some(Err(error.into()));
                         }
                     }
                 }
             }
-            if let Some(f) = fills {
-                f.note_shed(fill_tally.shed);
+            if mvt.features > 0 {
+                for &id in &mvt.source_ids {
+                    if let Err(error) = diagnostics.source_emitted(id, zoom) {
+                        return Some(Err(error.into()));
+                    }
+                }
             }
-            if mvt.features == 0 {
-                // Every member encoded to nothing (#431). There is no tile
-                // to write, but the drops must still reach the report, so
-                // hand back an empty carrier the writer loop skips.
-                return Some(Ok(EncodedTile {
-                    x,
-                    y,
-                    data: Vec::new(),
-                    hash: 0,
-                    raw_len: 0,
-                    feature_count: 0,
-                    encode_dropped: mvt.unencodable,
-                    encode_quantized: mvt.quantized,
-                    oversized: mvt.oversized,
-                    valve: mvt.valve,
-                    // The tile is not written, so neither is its fill.
-                    fill: FillTally::default(),
-                }));
-            }
-            let hash = TileHasher::hash(&mvt.data);
-            let raw_len = mvt.data.len();
-            let compressed = match mvt.data.into_gzip(&mvt.gzip_cache) {
-                Ok(gzip) => gzip,
-                Err(e) => return Some(Err(ExportError::from(e))),
-            };
-            Some(Ok(EncodedTile {
+        }
+        if let Some(f) = fills {
+            f.note_shed(fill_tally.shed);
+        }
+        if mvt.features == 0 {
+            // Every member encoded to nothing (#431). There is no tile
+            // to write, but the drops must still reach the report, so
+            // hand back an empty carrier the writer loop skips.
+            return Some(Ok(EncodedTile {
                 x,
                 y,
-                data: compressed,
-                hash,
-                raw_len,
-                feature_count: mvt.features,
+                data: Vec::new(),
+                hash: 0,
+                raw_len: 0,
+                feature_count: 0,
                 encode_dropped: mvt.unencodable,
                 encode_quantized: mvt.quantized,
                 oversized: mvt.oversized,
                 valve: mvt.valve,
-                fill: fill_tally,
-            }))
-        })
-        .collect()
+                // The tile is not written, so neither is its fill.
+                fill: FillTally::default(),
+            }));
+        }
+        let hash = TileHasher::hash(&mvt.data);
+        let raw_len = mvt.data.len();
+        let compressed = match mvt.data.into_gzip(&mvt.gzip_cache) {
+            Ok(gzip) => gzip,
+            Err(e) => return Some(Err(ExportError::from(e))),
+        };
+        Some(Ok(EncodedTile {
+            x,
+            y,
+            data: compressed,
+            hash,
+            raw_len,
+            feature_count: mvt.features,
+            encode_dropped: mvt.unencodable,
+            encode_quantized: mvt.quantized,
+            oversized: mvt.oversized,
+            valve: mvt.valve,
+            fill: fill_tally,
+        }))
+    };
+    // Longest tile first, one tile per task: a tile's valve passes are a
+    // serial chain, so a dense tile that starts late sets the wall of its
+    // level group. The results are put back in key order, so the output is
+    // unchanged.
+    let mut order: Vec<usize> = (0..groups.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(groups[i].len()));
+    let mut done: Vec<(usize, Option<Result<EncodedTile, ExportError>>)> = order
+        .into_par_iter()
+        .with_max_len(1)
+        .map(|i| (i, encode_group(groups[i])))
+        .collect();
+    done.sort_unstable_by_key(|(i, _)| *i);
+    done.into_iter().filter_map(|(_, r)| r).collect()
 }
 
 #[cfg(test)]
 #[path = "export/encode_cost_tests.rs"]
 mod encode_cost_tests;
+
+#[cfg(test)]
+#[path = "export/valve_cost_tests.rs"]
+mod valve_cost_tests;
 
 /// `true` when `bbox` lies entirely within `tb` expanded by `buffer` on every
 /// side. Clipping such a feature to the buffered tile is a geometric no-op, so
@@ -7337,6 +7388,9 @@ fn fill_tile_bytes(opts: &ExportOptions) -> usize {
 /// with others merged into it (#745).
 trait TileFeature: Sync {
     fn geometry(&self) -> &Geometry<f64>;
+    fn coords_count(&self) -> usize {
+        self.geometry().coords_count()
+    }
     fn properties(&self) -> &SharedProps;
     fn feature_id(&self) -> Option<u64>;
     fn source_row(&self) -> u64;
@@ -7359,7 +7413,10 @@ impl TileFeature for Member {
 
 impl TileFeature for coalesce_valve::Merged<'_> {
     fn geometry(&self) -> &Geometry<f64> {
-        &self.geom
+        self.geometry()
+    }
+    fn coords_count(&self) -> usize {
+        self.coords_count()
     }
     fn properties(&self) -> &SharedProps {
         self.props()
@@ -7375,6 +7432,9 @@ impl TileFeature for coalesce_valve::Merged<'_> {
 impl<T: TileFeature + ?Sized> TileFeature for &T {
     fn geometry(&self) -> &Geometry<f64> {
         (**self).geometry()
+    }
+    fn coords_count(&self) -> usize {
+        (**self).coords_count()
     }
     fn properties(&self) -> &SharedProps {
         (**self).properties()
@@ -7591,6 +7651,9 @@ fn drop_to_fit(
             build_mvt(gzip_cache, members, tb, opts, f, diagnostics)
         });
     }
+    // Later passes need only the original size for the warning.
+    let full_bytes = full.data.len();
+    drop(full);
     let mut keep = members.len();
     let mut passes = 1u32;
     loop {
@@ -7602,7 +7665,7 @@ fn drop_to_fit(
         if fit >= 1.0 || keep <= 1 || passes >= MAX_DROP_PASSES {
             log::warn!(
                 "oversized tile ({} bytes): dropped {} of {} features ({passes} encodes){}",
-                full.data.len(),
+                full_bytes,
                 members.len() - keep,
                 members.len(),
                 if fit < 1.0 {
@@ -7670,21 +7733,53 @@ fn merge_to_fit(
     if !matches!(opts.feature_order, FeatureOrder::Input) {
         ordered.sort_unstable_by_key(|m| m.seq);
     }
-    let draw_order = |feats: &mut Vec<&coalesce_valve::Merged<'_>>| {
-        feats.sort_by_key(|m| m.target.seq);
-        if let FeatureOrder::Column { name, descending } = &opts.feature_order {
-            feats.sort_by(|a, b| compare_by_feature_order(a.target, b.target, name, *descending));
+    // Every pass keeps targets from `ordered`. Restricting this global
+    // stable order to those targets gives the same two stable sorts, without
+    // repeating the comparisons after each merge or drop.
+    let mut draw_indices: Vec<usize> = (0..ordered.len()).collect();
+    #[cfg(test)]
+    crate::valve_counter::draw_sort(draw_indices.len());
+    draw_indices.sort_by_key(|&i| ordered[i].seq);
+    if let FeatureOrder::Column { name, descending } = &opts.feature_order {
+        #[cfg(test)]
+        crate::valve_counter::draw_sort(draw_indices.len());
+        draw_indices
+            .sort_by(|&a, &b| compare_by_feature_order(ordered[a], ordered[b], name, *descending));
+    }
+    let mut draw_rank = vec![0; ordered.len()];
+    for (rank, i) in draw_indices.into_iter().enumerate() {
+        draw_rank[i] = rank;
+    }
+    // Store positions rather than references: each pass owns new merged
+    // features, but the tile-sized scratch buffer survives every pass.
+    let mut ranked = vec![None; ordered.len()];
+    let mut draw_order = |feats: &mut Vec<&coalesce_valve::Merged<'_>>| {
+        for (i, m) in feats.iter().enumerate() {
+            ranked[draw_rank[m.members[0]]] = Some(i);
+        }
+        let mut dest = 0;
+        for rank in 0..ranked.len() {
+            let Some(src) = ranked[rank].take() else {
+                continue;
+            };
+            if src != dest {
+                // The feature displaced from `dest` now lives at `src`.
+                ranked[draw_rank[feats[dest].members[0]]] = Some(src);
+                feats.swap(dest, src);
+            }
+            dest += 1;
         }
     };
     // #758: from the second pass on, every member's polygons are projected,
     // quantized and cleaned once, so a pass only unions, and only the
     // components that changed since the pass before. A tile that fits at
-    // once never builds this. Whether two parts interact is tested only when
+    // once never builds this. Below the pair cap, interactions are cached;
+    // above it, candidates are swept on demand. Parts are tested only when
     // a pass puts both in one feature: on NZ Parcels under a 2 MB gzip cap,
     // where most oversized tiles fit on their second pass, testing every
     // touching pair up front cost 15% of the export.
-    // Built once, on the first pass that merges; `Some(None)` when the tile
-    // has too many touching parts to cache, and is encoded plainly.
+    // Built once, on the first pass that merges; `Some(None)` only when the
+    // part count cannot fit the cache's u32 indices.
     let mut quantized: Option<Option<crate::mvt::QuantizedPolygons>> = None;
     let mut build = |feats: &[&coalesce_valve::Merged<'_>], pass: u32, fill: &[&FillFeature]| {
         // Pass 1 merges nothing, and a pass that still merges nothing (a
@@ -7780,6 +7875,9 @@ fn merge_to_fit(
                 kept.extend(select_kept_members(&single, keep));
                 draw_order(&mut kept);
                 passes += 1;
+                // The previous bytes cannot be returned after dropping more
+                // features. Release them before building their replacement.
+                drop(out);
                 out = build(&kept, passes, &[]);
                 fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
                 if fit >= 1.0 || keep == 0 {
@@ -7886,7 +7984,7 @@ fn encode_in_parallel<M: TileFeature>(members: &[M]) -> bool {
     }
     let mut coords = 0usize;
     for m in members {
-        coords += m.geometry().coords_count();
+        coords += m.coords_count();
         if coords >= PARALLEL_ENCODE_MIN_COORDS {
             return true;
         }
@@ -18164,6 +18262,118 @@ mod diagnostic_row_alignment {
     use super::*;
 
     #[test]
+    fn mutation_regression_source_loss_valve_causes() {
+        use crate::diagnostics::{Diagnostics, SourceLossCause};
+
+        let line = || Geometry::LineString(geo::LineString::from(vec![(-10., 0.), (10., 0.)]));
+        let point = || Geometry::Point(geo::Point::new(0., 0.));
+        let empty = || Geometry::GeometryCollection(geo::GeometryCollection::default());
+        // With no valve loss, every lost row has an explicit encode cause.
+        // That overrides the tile fallback, making `merged >= 0` equivalent
+        // to `merged > 0` for the recorded losses in the zero/zero case.
+        for (geoms, valve, limit, dropped, merged, expected) in [
+            (
+                vec![point(), empty()],
+                SizeValve::Drop,
+                None,
+                0,
+                0,
+                vec![(1, SourceLossCause::EncodeDropped)],
+            ),
+            (
+                vec![line(), line()],
+                SizeValve::Merge,
+                Some(1),
+                0,
+                1,
+                vec![(1, SourceLossCause::Merged)],
+            ),
+            (
+                vec![point(), point()],
+                SizeValve::Drop,
+                Some(1),
+                1,
+                0,
+                vec![(1, SourceLossCause::ValveDropped)],
+            ),
+            (
+                vec![line(), line(), point(), point()],
+                SizeValve::Merge,
+                Some(1),
+                1,
+                1,
+                vec![
+                    (1, SourceLossCause::ValveDropped),
+                    (3, SourceLossCause::ValveDropped),
+                ],
+            ),
+        ] {
+            let members: Vec<_> = geoms
+                .into_iter()
+                .enumerate()
+                .map(|(row, geom)| Member {
+                    key: 0,
+                    seq: row as u64,
+                    geom,
+                    props: Arc::new(vec![]),
+                    id: Some(100 + row as u64),
+                    gap: if row == 0 { GAP_NONE } else { 1 },
+                    band: 0,
+                })
+                .collect();
+            let opts = ExportOptions {
+                feature_id: Some("id".into()),
+                size_valve: valve,
+                tile_size_limit: limit,
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            };
+            let expected_features = members.len() - expected.len();
+            let cache = test_gzip_cache();
+            let mvt = encode_tile(
+                &cache,
+                &members,
+                &TileCoord::new(0, 0, 0).bounds(),
+                &opts,
+                &[],
+                &mut FillTally::default(),
+                &Diagnostics::default(),
+            );
+            assert_eq!(
+                (mvt.valve.dropped, mvt.valve.merged),
+                (dropped, merged),
+                "valve={:?}, features={}, bytes={}",
+                mvt.valve,
+                mvt.features,
+                mvt.data.len()
+            );
+            let diagnostics = Diagnostics::default();
+            let tiles = encode_members(
+                &cache,
+                members,
+                0,
+                &opts,
+                None,
+                &ExportTimers::default(),
+                &diagnostics,
+            )
+            .unwrap();
+            assert_eq!(tiles.len(), 1);
+            assert_eq!(tiles[0].feature_count, expected_features);
+            let losses = diagnostics.source_losses().unwrap();
+            let actual: Vec<_> = losses
+                .iter()
+                .map(|loss| {
+                    let loss = loss.unwrap();
+                    assert_eq!(loss.feature_id, Some(100 + loss.id));
+                    (loss.id, loss.cause)
+                })
+                .collect();
+            assert_eq!(actual, expected, "dropped={dropped}, merged={merged}");
+        }
+    }
+
+    #[test]
     fn duplicate_feature_ids_do_not_cancel_another_source_rows_loss() {
         let diagnostics = crate::diagnostics::Diagnostics::default();
         let geoms = vec![
@@ -18227,6 +18437,71 @@ mod diagnostic_row_alignment {
             losses.iter().next().unwrap().unwrap().cause,
             crate::diagnostics::SourceLossCause::Quantized
         );
+    }
+
+    /// A tile whose own features all quantize away is not written, so a
+    /// #750 fill drawn for it must not count its host as emitted: an
+    /// emission cancels the host's recorded loss. `features` excludes the fill, while
+    /// `source_ids` includes it, which is what the `features > 0` guard in
+    /// `encode_members` separates.
+    #[test]
+    fn mutation_regression_fill_of_an_empty_tile_does_not_emit_its_host() {
+        use crate::diagnostics::{Diagnostics, SourceLossCause};
+
+        let triangle = Geometry::Polygon(geo::Polygon::new(
+            geo::LineString::from(vec![
+                (0.0, 0.0),
+                (0.000001, 0.0),
+                (0.000001, 0.000001),
+                (0.0, 0.0),
+            ]),
+            vec![],
+        ));
+        let members = vec![Member {
+            key: 0,
+            seq: 0,
+            geom: triangle,
+            props: Arc::new(vec![]),
+            id: Some(7),
+            gap: GAP_NONE,
+            band: 0,
+        }];
+        let fills = coverage_fill::tests::test_fill_map([(
+            0,
+            0,
+            vec![vec![vec![
+                (0, 0),
+                (1000, 0),
+                (1000, 1000),
+                (0, 1000),
+                (0, 0),
+            ]]],
+        )]);
+        let opts = ExportOptions {
+            feature_id: Some("id".into()),
+            tile_size_limit: None,
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let diagnostics = Diagnostics::default();
+        // The host was already lost upstream; an emission would cancel that.
+        diagnostics
+            .source_member_loss(0, 7, 0, SourceLossCause::ClipDropped)
+            .unwrap();
+        let tiles = encode_members(
+            &test_gzip_cache(),
+            members,
+            0,
+            &opts,
+            Some(&fills),
+            &ExportTimers::default(),
+            &diagnostics,
+        )
+        .unwrap();
+        assert!(tiles.iter().all(|t| t.feature_count == 0), "no own feature");
+        let losses = diagnostics.source_losses().unwrap();
+        let causes: Vec<_> = losses.iter().map(|l| l.unwrap().cause).collect();
+        assert_eq!(causes, vec![SourceLossCause::ClipDropped]);
     }
 
     #[test]

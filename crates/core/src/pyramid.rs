@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use tempfile::{NamedTempFile, TempPath};
+use crate::atomic_output::Reserved;
 
 use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
@@ -1769,7 +1769,7 @@ fn build_pyramid_validated(
     // including the early-return paths below. TempPaths, not open
     // NamedTempFiles: convert and export publish by renaming a sibling over
     // the path, which Windows refuses while a handle to it is open (#678).
-    let mut scratch: Vec<TempPath> = Vec::new();
+    let mut scratch: Vec<Reserved> = Vec::new();
     let mut tiled: Vec<Band> = Vec::with_capacity(bands.len());
 
     for (band, kind) in bands.iter().zip(&kinds) {
@@ -1798,14 +1798,12 @@ fn build_pyramid_validated(
             },
         );
 
-        let named = |suffix: &str| -> Result<TempPath, Error> {
-            let mut b = tempfile::Builder::new();
-            b.prefix("tylertoo-pyramid-").suffix(suffix);
-            match &opts.work_dir {
-                Some(dir) => b.tempfile_in(dir),
-                None => b.tempfile(),
-            }
-            .map(NamedTempFile::into_temp_path)
+        let named = |suffix: &str| -> Result<Reserved, Error> {
+            crate::atomic_output::reserve_path(
+                "tylertoo-pyramid-",
+                suffix,
+                opts.work_dir.as_deref(),
+            )
             .map_err(|e| Error::PMTilesWrite(format!("band {:?}: {e}", band.layer)))
         };
 
@@ -2426,7 +2424,7 @@ fn finish_merge(
 #[doc(hidden)]
 pub fn fuzz_band_archive(bytes: &[u8]) -> Result<u64, Error> {
     use std::io::Write as _;
-    let mut file = NamedTempFile::new().map_err(Error::Io)?;
+    let mut file = tempfile::NamedTempFile::new().map_err(Error::Io)?;
     file.write_all(bytes).map_err(Error::Io)?;
     file.flush().map_err(Error::Io)?;
 
@@ -2669,6 +2667,17 @@ mod tests {
             zooms,
             vec![0, 1, 2, 3, 4],
             "the merged archive must span every band's range"
+        );
+
+        // #791: each band's intermediate overview and archive are published
+        // onto a missing path, not over a placeholder file (ext4 flushes the
+        // whole file inside a rename over an existing one).
+        let (published, over_existing) =
+            crate::atomic_output::renames_over_existing(dir.path(), "tylertoo-pyramid-");
+        assert_eq!(published, 4, "two bands publish an overview and an archive");
+        assert!(
+            over_existing.is_empty(),
+            "renamed over an existing file: {over_existing:?}"
         );
 
         // Intermediates are cleaned up: only the output remains.

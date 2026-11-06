@@ -39,9 +39,9 @@
 //!   regular grid, where every gap is equal, that never merges anything,
 //!   because the test is `gap < mingap`.
 
-use std::borrow::Cow;
-
-use geo::{BoundingRect, Geometry, LineString, MultiLineString, MultiPolygon, Polygon, Rect};
+use geo::{
+    BoundingRect, CoordsIter, Geometry, LineString, MultiLineString, MultiPolygon, Polygon, Rect,
+};
 use rayon::prelude::*;
 
 use super::{Member, SharedProps};
@@ -166,6 +166,8 @@ impl RowGapCursor {
         if !self.measure {
             return geoms.iter().map(|_| self.next_row(None)).collect();
         }
+        #[cfg(test)]
+        crate::valve_counter::note(|c| c.gap_rows += geoms.len());
         let rects: Vec<Option<Rect<f64>>> = geoms.par_iter().map(|g| g.bounding_rect()).collect();
         rects.into_iter().map(|r| self.next_row(r)).collect()
     }
@@ -196,7 +198,14 @@ fn merge_kind(g: &Geometry<f64>) -> Option<MergeKind> {
 /// carries (its own, plus the parts of every member merged into it).
 pub(super) struct Merged<'a> {
     pub(super) target: &'a Member,
-    pub(super) geom: Cow<'a, Geometry<f64>>,
+    ordered: &'a [&'a Member],
+    /// Cached polygon encoding uses only member indices. Materialize the
+    /// concatenated geometry only for plain encoding (lines or fallback).
+    #[expect(
+        clippy::disallowed_types,
+        reason = "per-feature lazy geometry shared by parallel encoders; no diagnostic globals"
+    )]
+    geom: std::sync::OnceLock<Geometry<f64>>,
     /// How many members were merged into this one.
     pub(super) absorbed: usize,
     /// The members `geom` is made of, as indices into the `ordered` slice
@@ -206,6 +215,35 @@ pub(super) struct Merged<'a> {
 }
 
 impl Merged<'_> {
+    pub(super) fn geometry(&self) -> &Geometry<f64> {
+        if self.absorbed == 0 {
+            &self.target.geom
+        } else {
+            self.geom.get_or_init(|| {
+                concat_geometry(
+                    &self.target.geom,
+                    self.members[1..].iter().map(|&i| self.ordered[i]),
+                )
+            })
+        }
+    }
+
+    /// Same count as the concatenated geometry, without deep copies just
+    /// to decide whether encoding is large enough to parallelize.
+    pub(super) fn coords_count(&self) -> usize {
+        if self.absorbed == 0 {
+            return self.target.geom.coords_count();
+        }
+        self.members
+            .iter()
+            .map(|&i| match &self.ordered[i].geom {
+                Geometry::Rect(_) => 5,
+                Geometry::Triangle(_) => 4,
+                g => g.coords_count(),
+            })
+            .sum()
+    }
+
     pub(super) fn props(&self) -> &SharedProps {
         &self.target.props
     }
@@ -217,7 +255,9 @@ impl Merged<'_> {
 /// `ordered` must be in `seq` order (the file's spatial order); the result
 /// keeps that order. A member with nothing of its kind and band before it is
 /// kept. With `mingap == 0` nothing merges.
-pub(super) fn coalesce_members<'a>(ordered: &[&'a Member], mingap: u64) -> Vec<Merged<'a>> {
+pub(super) fn coalesce_members<'a>(ordered: &'a [&'a Member], mingap: u64) -> Vec<Merged<'a>> {
+    #[cfg(test)]
+    crate::valve_counter::note(|c| c.coalesce_calls += 1);
     // (kept member, members merged into it), as indices into `ordered`
     let mut kept: Vec<(usize, Vec<usize>)> = Vec::with_capacity(ordered.len());
     // The index in `kept` of the last kept member per (band, kind). Bands
@@ -246,18 +286,13 @@ pub(super) fn coalesce_members<'a>(ordered: &[&'a Member], mingap: u64) -> Vec<M
         .map(|(t, absorbed)| {
             let target = ordered[t];
             let n = absorbed.len();
-            let geom = if absorbed.is_empty() {
-                Cow::Borrowed(&target.geom)
-            } else {
-                let parts: Vec<&Member> = absorbed.iter().map(|&i| ordered[i]).collect();
-                Cow::Owned(concat_geometry(&target.geom, &parts))
-            };
             let mut members = Vec::with_capacity(n + 1);
             members.push(t);
             members.extend(absorbed);
             Merged {
                 target,
-                geom,
+                ordered,
+                geom: Default::default(),
                 absorbed: n,
                 members,
             }
@@ -267,7 +302,10 @@ pub(super) fn coalesce_members<'a>(ordered: &[&'a Member], mingap: u64) -> Vec<M
 
 /// The target's geometry with every absorbed member's parts appended, as one
 /// multi-geometry of the target's kind.
-fn concat_geometry(target: &Geometry<f64>, absorbed: &[&Member]) -> Geometry<f64> {
+fn concat_geometry<'a>(
+    target: &Geometry<f64>,
+    absorbed: impl Iterator<Item = &'a Member>,
+) -> Geometry<f64> {
     match merge_kind(target) {
         Some(MergeKind::Polygon) => {
             let mut polys: Vec<Polygon<f64>> = Vec::new();
@@ -291,6 +329,8 @@ fn concat_geometry(target: &Geometry<f64>, absorbed: &[&Member]) -> Geometry<f64
 }
 
 fn push_polygons(g: &Geometry<f64>, out: &mut Vec<Polygon<f64>>) {
+    #[cfg(test)]
+    crate::valve_counter::clone_polygons(g);
     match g {
         Geometry::Polygon(p) => out.push(p.clone()),
         Geometry::MultiPolygon(mp) => out.extend(mp.0.iter().cloned()),
@@ -387,6 +427,62 @@ mod tests {
             Geometry::Polygon(_) => 1,
             Geometry::MultiPolygon(mp) => mp.0.len(),
             _ => 0,
+        }
+    }
+
+    #[test]
+    fn mutation_regression_merged_coords_count() {
+        // An unabsorbed Rect has four coordinates; once concatenated it is
+        // represented by a closed five-coordinate polygon ring.
+        let ms = [
+            member(
+                0,
+                Geometry::Rect(geo::Rect::new((0., 0.), (1., 1.))),
+                GAP_NONE,
+                0,
+            ),
+            member(
+                1,
+                Geometry::Triangle(geo::Triangle::new(
+                    coord! { x: 2., y: 0. },
+                    coord! { x: 3., y: 0. },
+                    coord! { x: 2., y: 1. },
+                )),
+                1,
+                0,
+            ),
+            member(2, square(4.), 1, 0),
+        ];
+        let ordered: Vec<_> = ms.iter().collect();
+        let separate = coalesce_members(&ordered, 0);
+        assert_eq!(
+            separate
+                .iter()
+                .map(Merged::coords_count)
+                .collect::<Vec<_>>(),
+            [4, 3, 5]
+        );
+        let merged = coalesce_members(&ordered, 2);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].absorbed, 2);
+        assert_eq!(merged[0].coords_count(), 14);
+        assert_eq!(merged[0].geometry().coords_count(), 14);
+    }
+
+    #[test]
+    fn mutation_regression_tile_feature_coords_count_forwards() {
+        use super::super::TileFeature;
+
+        fn count<T: TileFeature>(feature: T) -> usize {
+            feature.coords_count()
+        }
+
+        let ms = [member(0, line(0.), GAP_NONE, 0), member(1, line(2.), 1, 0)];
+        let ordered: Vec<_> = ms.iter().collect();
+        for (threshold, expected) in [(0, 2), (2, 4)] {
+            let merged = coalesce_members(&ordered, threshold);
+            assert_eq!(TileFeature::coords_count(&merged[0]), expected);
+            assert_eq!(count(&merged[0]), expected);
         }
     }
 
@@ -503,7 +599,7 @@ mod tests {
             "gaps below 10 merge into the kept polygon before them"
         );
         assert_eq!(out[0].absorbed, 1);
-        assert_eq!(polygon_count(&out[0].geom), 2);
+        assert_eq!(polygon_count(out[0].geometry()), 2);
         assert_eq!(out[1].absorbed, 1);
         // The kept member's id and attributes win.
         assert_eq!(out[0].target.id, Some(0));
@@ -519,7 +615,9 @@ mod tests {
         let ordered: Vec<&Member> = ms.iter().collect();
         let out = coalesce_members(&ordered, 0);
         assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|m| matches!(m.geom, Cow::Borrowed(_))));
+        assert!(out
+            .iter()
+            .all(|m| std::ptr::eq(m.geometry(), &m.target.geom)));
     }
 
     #[test]
@@ -551,7 +649,7 @@ mod tests {
         let out = coalesce_members(&ordered, 10);
         let seqs: Vec<(u64, usize)> = out.iter().map(|m| (m.target.seq, m.absorbed)).collect();
         assert_eq!(seqs, [(0, 1), (1, 1), (2, 0)]);
-        assert!(matches!(&*out[1].geom, Geometry::MultiLineString(ml) if ml.0.len() == 2));
+        assert!(matches!(out[1].geometry(), Geometry::MultiLineString(ml) if ml.0.len() == 2));
         // Each feature names its members by their index in `ordered`, kept
         // member first, in the order their parts are appended (#758).
         let members: Vec<&[usize]> = out.iter().map(|m| m.members.as_slice()).collect();
