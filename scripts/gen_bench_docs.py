@@ -33,7 +33,18 @@ Showcase schemas (rendered by `vida-head-to-head` and `overture-scaling`):
               note?: str}]}
       Wall shown is median(runs_wall_s) + conversion_wall_s (the end-to-end
       time of that workflow).
-    overture-scaling: {provenance, dataset, features, dataset_bytes,
+      The one-machine Overture showcase (benchmarks/showcase/showcase.py,
+      overture-buildings-<region>.json) writes this shape. Its rows are
+      tylertoo from s3://, tylertoo on the local extract, and tippecanoe
+      (extract + FlatGeobuf + tile). It adds region, bbox, parts_bytes and
+      extract {wall_s, peak_rss_bytes, peak_disk_bytes}; per row
+      archive_sha256 [..], peak_disk_bytes, fetched_bytes (pass0, s3://
+      only), steps {extract_s, fgb_convert_s, tile_s} (tippecanoe only) and
+      archive {bytes, sha256, tiles, max_tile_bytes, stats: `tylertoo stats
+      --json`}. provenance.inputs lists the bbox and every touched part's
+      url, ETag and bytes.
+    overture-scaling (multi-machine; no showcase writes it now):
+      {provenance, dataset, features, dataset_bytes,
       runs: [{machines, wall_s, peak_rss_bytes_per_machine, fetched_bytes,
               local_disk_bytes, merge_s, cost_usd}],
       tippecanoe: {attempted: false, needs: [str, ...]}}
