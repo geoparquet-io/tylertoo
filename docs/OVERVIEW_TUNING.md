@@ -920,7 +920,7 @@ limits counts.
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
 | `--drop-rate F` | `1.65` | ratio (>1) | **bigger = sparser mid zooms** |
-| `--drop-gamma F` | `1.5` | exponent (≥1) | **bigger = more sparse-area protection** |
+| `--drop-gamma F` | `1.5` | exponent (≥1; smaller is rejected) | **bigger = more sparse-area protection** |
 | `--no-density-drop` | off | flag | disables the budget |
 | `--drop-lines` | off | flag | applies the budget to lines too |
 | `--drop-polygons` | off | flag | applies the budget to polygons too |

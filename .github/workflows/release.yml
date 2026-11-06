@@ -329,8 +329,8 @@ jobs:
             dist/*
 
   # One wheel per platform, not one per platform x interpreter: the binding
-  # builds against CPython's stable ABI (`abi3-py39` in crates/python/Cargo.toml),
-  # so each wheel is tagged `cp39-abi3` and installs on every CPython >= 3.9.
+  # builds against CPython's stable ABI (`abi3-py311` in crates/python/Cargo.toml),
+  # so each wheel is tagged `cp311-abi3` and installs on every CPython >= 3.11.
   # That also kills the old cp38 anomaly -- the tag no longer depends on
   # whichever interpreter happens to be default inside the build container.
   build-wheels:
@@ -453,8 +453,8 @@ jobs:
           fi
           wheel=$(find dist -name '*.whl')
           case "$(basename "$wheel")" in
-            *-cp39-abi3-*) echo "OK: $(basename "$wheel")" ;;
-            *) echo "::error::wheel is not cp39-abi3: $(basename "$wheel")"; exit 1 ;;
+            *-cp311-abi3-*) echo "OK: $(basename "$wheel")" ;;
+            *) echo "::error::wheel is not cp311-abi3: $(basename "$wheel")"; exit 1 ;;
           esac
 
       - name: Smoke test wheel import (native builds only)
