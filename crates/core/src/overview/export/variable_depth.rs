@@ -479,6 +479,11 @@ pub(super) struct VdScan {
     kinds: Vec<Kinds>,
     cluster_column: Option<String>,
     release: Option<Box<dyn RowRelease>>,
+    /// Whether a coarse level may draw a polygon as a point: `--collapse`,
+    /// a `point` representation band, or an entry ladder (whose default
+    /// collapse is to points; the footer cannot tell it from
+    /// `--collapse-square`).
+    collapsed_points: bool,
     /// The canonical band sized at each level's zoom, every row.
     canonical_counts: Vec<HashMap<u64, usize>>,
     /// The canonical band's point rows at each level's zoom, when the band
@@ -530,6 +535,11 @@ impl VdScan {
                 .filter(|c| c.enabled)
                 .map(|c| c.point_count_column.clone()),
             release: EntryRungs::from_meta(meta)?.map(|r| Box::new(r) as Box<dyn RowRelease>),
+            collapsed_points: g.is_some_and(|g| {
+                g.collapse.as_deref() == Some("point")
+                    || g.entry_zoom.is_some()
+                    || g.representation.iter().flatten().any(|b| b.repr == "point")
+            }),
             canonical_counts: vec![HashMap::new(); n],
             canonical_points: vec![HashMap::new(); n],
             level_points: vec![HashMap::new(); n],
@@ -715,8 +725,15 @@ impl VdScan {
                 Kinds::NoPoints => &empty,
             };
             let zoom = self.zooms[k];
+            // With both kinds in the canonical band and polygons that may
+            // stand as points, an equal count proves nothing: a collapsed
+            // polygon can replace a thinned point. Every tile with a point
+            // is blocked instead.
+            let unprovable = self.collapsed_points && canonical_kinds == Kinds::Mixed;
             for key in level.keys().chain(canon.keys()) {
-                if level.get(key).copied().unwrap_or(0) != canon.get(key).copied().unwrap_or(0) {
+                if unprovable
+                    || level.get(key).copied().unwrap_or(0) != canon.get(key).copied().unwrap_or(0)
+                {
                     policy.block(zoom, *key);
                 }
             }
@@ -1684,6 +1701,35 @@ mod tests {
                 plan.policy.may_stop(z, key_at(-69.8, -29.8, z)),
                 "unladdered z{z}"
             );
+        }
+    }
+
+    /// With polygons collapsing to points, a coarse level's point count
+    /// can match the canonical one while the sets differ: here a thinned
+    /// real point and a collapsed polygon cancel out. Such a tile may not
+    /// stop.
+    #[test]
+    fn collapsed_points_never_stand_in_for_thinned_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = [
+            pt(10.0, 45.0),
+            pt(10.01, 45.0),
+            // Same tile down to z3, another thinning cell there.
+            square(12.0, 46.0, 0.05),
+            square(-70.0, -30.0, 5.0),
+        ];
+        let v = [1.0; 4];
+        let mut convert = ConvertOptions::default();
+        convert.density.enabled = false;
+        convert.simplify.collapse = crate::overview::simplify::CollapseMode::Point;
+        // Past the gate, so simplification collapses the small square.
+        convert.assign.polygon_visibility = 0.0;
+        let ov = overview_v(dir.path(), &geoms, &v, 4, convert);
+        let reader = OverviewReader::open(&ov).unwrap();
+        assert!(reader.meta().levels.len() > 1);
+        let plan = plan(&ov);
+        for z in 0..4 {
+            assert!(!plan.policy.may_stop(z, key_at(10.0, 45.0, z)), "z{z}");
         }
     }
 
