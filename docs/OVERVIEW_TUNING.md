@@ -212,7 +212,10 @@ smaller of two measures, in Web Mercator meters:
 - the median size of the features that have an extent
 - the tenth-percentile spacing between nearby features
 
-The result is clamped to `[--min-zoom, 16]` and logged with its measurements
+The result is clamped to `[--min-zoom, 16]`. Use `--max-zoom auto:14`
+(Python: `max_zoom="auto:14"`) to cap it further at z14. The cap must be
+between the minimum zoom and 30; values above 16 leave the auto ceiling at 16.
+The chosen zoom is logged with its measurements
 at `info`. Treat it as a starting point. From Python, the line reaches
 `logging` at `INFO` under the `tylertoo_core` logger, and the finest `zoom`
 in the report's `levels` gives the chosen zoom.

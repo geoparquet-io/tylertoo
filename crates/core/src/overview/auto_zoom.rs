@@ -97,7 +97,7 @@ const AUTO_ZOOM_BATCH_ROWS: usize = 8192;
 
 /// A `--max-zoom` value: an explicit zoom, or `auto` (#444).
 ///
-/// Parse with [`FromStr`] (`"14"`, `"auto"` in any case), build the level plan
+/// Parse with [`FromStr`] (`"14"`, `"auto"`, or `"auto:14"`), build the level plan
 /// with [`MaxZoom::plan_zoom`], and turn `auto` into a zoom with
 /// [`MaxZoom::resolve`] once the cheap validation has run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +106,8 @@ pub enum MaxZoom {
     Fixed(u8),
     /// Estimate the zoom from the input (module docs).
     Auto,
+    /// Estimate the zoom, capped at this value.
+    AutoCapped(u8),
 }
 
 impl From<u8> for MaxZoom {
@@ -121,6 +123,14 @@ impl FromStr for MaxZoom {
         if s.trim().eq_ignore_ascii_case("auto") {
             return Ok(MaxZoom::Auto);
         }
+        if let Some((prefix, cap)) = s.trim().split_once(':') {
+            if prefix.eq_ignore_ascii_case("auto") {
+                return cap
+                    .parse::<u8>()
+                    .map(MaxZoom::AutoCapped)
+                    .map_err(|_| format!("invalid max zoom {s:?}: expected auto:<zoom>"));
+            }
+        }
         s.trim()
             .parse::<u8>()
             .map(MaxZoom::Fixed)
@@ -133,6 +143,7 @@ impl fmt::Display for MaxZoom {
         match self {
             MaxZoom::Fixed(z) => write!(f, "{z}"),
             MaxZoom::Auto => f.write_str("auto"),
+            MaxZoom::AutoCapped(z) => write!(f, "auto:{z}"),
         }
     }
 }
@@ -140,18 +151,17 @@ impl fmt::Display for MaxZoom {
 impl MaxZoom {
     /// Whether this is `auto`.
     pub fn is_auto(self) -> bool {
-        matches!(self, MaxZoom::Auto)
+        matches!(self, MaxZoom::Auto | MaxZoom::AutoCapped(_))
     }
 
     /// The zoom to build the level plan (and run cheap validation) with
     /// before `auto` is resolved: the fixed value, or
-    /// [`AUTO_MAX_ZOOM_CEILING`] for `auto` — the most permissive value it can
-    /// resolve to, so the placeholder never rejects anything the real value
-    /// would accept.
+    /// [`AUTO_MAX_ZOOM_CEILING`] for `auto`, or the cap for capped auto.
     pub fn plan_zoom(self) -> u8 {
         match self {
             MaxZoom::Fixed(z) => z,
             MaxZoom::Auto => AUTO_MAX_ZOOM_CEILING,
+            MaxZoom::AutoCapped(z) => z,
         }
     }
 
@@ -185,10 +195,10 @@ impl MaxZoom {
         options: &mut ConvertOptions,
         output: Option<&std::path::Path>,
     ) -> Result<u8, ConvertError> {
-        let MaxZoom::Auto = self else {
+        if !self.is_auto() {
             return Ok(self.plan_zoom());
-        };
-        let LevelPlan::ZoomRange { min_zoom, .. } = options.levels else {
+        }
+        let LevelPlan::ZoomRange { min_zoom, max_zoom } = options.levels else {
             log::info!("--max-zoom auto: ignored, the explicit GSD list sets the levels");
             return Ok(self.plan_zoom());
         };
@@ -197,7 +207,9 @@ impl MaxZoom {
         if let Some(output) = output {
             crate::atomic_output::check_writable(output)?;
         }
-        let evidence = estimate_max_zoom(source, options)?;
+        let mut evidence = estimate_max_zoom(source, options)?;
+        evidence.ceiling = evidence.ceiling.min(max_zoom);
+        evidence.chosen_zoom = evidence.chosen_zoom.min(evidence.ceiling);
         evidence.log();
         options.levels = LevelPlan::ZoomRange {
             min_zoom,
@@ -1932,6 +1944,37 @@ mod tests {
         assert!("300".parse::<MaxZoom>().is_err());
         assert_eq!(MaxZoom::Auto.to_string(), "auto");
         assert_eq!(MaxZoom::Fixed(9).to_string(), "9");
+    }
+
+    #[test]
+    fn capped_auto_round_trip() {
+        let value: MaxZoom = "AUTO:14".parse().unwrap();
+        assert_eq!(value.to_string(), "auto:14");
+        assert_eq!(value.to_string().parse::<MaxZoom>().unwrap(), value);
+        assert!(value.is_auto());
+        assert_eq!(value.plan_zoom(), 14);
+    }
+
+    #[test]
+    fn capped_auto_conversion_uses_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = write_covered(&dir, "covered.parquet", &point_grid(10, 0.01));
+        assert!(estimate(&source, 0).unwrap().chosen_zoom > 1);
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 1,
+            },
+            auto_max_zoom: true,
+            ..Default::default()
+        };
+        let report = super::super::convert::convert_to_overviews_sources(
+            &source,
+            &dir.path().join("out.parquet"),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(report.levels.iter().filter_map(|l| l.zoom).max(), Some(1));
     }
 
     /// `Fixed` resolves with no I/O at all: the source is never read (a

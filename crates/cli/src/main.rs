@@ -636,7 +636,7 @@ fn log_shard_job(job: &ShardJob, min_zoom: u8, max_zoom: MaxZoom) {
     // `auto` is resolved inside the facade, which logs the pick (#444).
     let finest = match max_zoom {
         MaxZoom::Fixed(z) => format!("z{z}"),
-        MaxZoom::Auto => "the auto max zoom".to_string(),
+        MaxZoom::Auto | MaxZoom::AutoCapped(_) => "the auto max zoom".to_string(),
     };
     log::info!(
         "[tiles] shard job {}: {}",
