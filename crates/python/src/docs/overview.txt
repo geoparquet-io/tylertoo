@@ -101,8 +101,9 @@ Args:
         Footprints compare for one allocator: wheels use mimalloc, which
         adds a fixed floor of about 600 MiB on small inputs. On a 1.4M
         polygon export it ran 8% faster and held 18% more peak memory
-        than the system allocator; a source build can opt out with
-        `maturin build --no-default-features`.
+        than the system allocator; a non-musl source build can opt out
+        with `maturin build --no-default-features` (musl always uses
+        mimalloc).
     in_flight_batches: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),
         or `0` to size from the CPU count.
     read_workers: [Reader threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),

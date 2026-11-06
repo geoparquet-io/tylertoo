@@ -13,8 +13,8 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as the CLI does (#739, #792). On the 792 buildings input (median of 3),
   export takes 10.0 s against 10.9 s and peak RSS is 3.36 GB against 2.84 GB
   with the system allocator: about 8% faster for 18% more memory. Archives
-  are byte-identical. A source build opts out with
-  `maturin build --no-default-features`.
+  are byte-identical. A non-musl source build opts out
+  with `maturin build --no-default-features`; musl always uses mimalloc.
 - Rust callers pass a `TileCoord` to
   `StreamingPmtilesWriter::add_tile_precompressed` instead of separate
   zoom, x and y arguments. `Compression::from_str` is now

@@ -142,7 +142,9 @@ def measure(rm, cells: list[str], bins: dict, data: Path, rounds: int, gate) -> 
             order = cells if rnd % 2 == 0 else cells[::-1]  # drift cancels
             for cell in order:
                 rm.require_disk(work, 10)
-                gate.wait()
+                if gate.wait().get("gate") == "TIMED_OUT":
+                    raise SystemExit(f"{cell} round {rnd}: host stayed busy past the gate; "
+                                     "nothing recorded")
                 argv = ["/usr/bin/time", "-v", *command(cell, bins, work, prepared)]
                 run = rm.run_capped(argv, caps, dict(os.environ), work / "log.txt", work)
                 gate.last_own_end = time.monotonic()  # our own load average is not a busy host

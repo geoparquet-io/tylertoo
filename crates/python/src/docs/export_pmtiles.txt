@@ -33,8 +33,9 @@ Args:
         Footprints compare for one allocator: wheels use mimalloc, which
         adds a fixed floor of about 600 MiB on small inputs. On a 1.4M
         polygon export it ran 8% faster and held 18% more peak memory
-        than the system allocator; a source build can opt out with
-        `maturin build --no-default-features`. Output is
+        than the system allocator; a non-musl source build can opt out
+        with `maturin build --no-default-features` (musl always uses
+        mimalloc). Output is
         identical across profiles.
     name: Human-readable tileset name, stored in the metadata.
     description: Description of the tileset, stored in the metadata.
