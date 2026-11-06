@@ -443,13 +443,13 @@ fn tiles_shard_coarse_draws_the_unsharded_fill() {
     let whole = run("whole.pmtiles", None);
     let coarse = run(
         "coarse.pmtiles",
-        Some(TilesShard {
-            role: ShardRole::Coarse,
-            range: None,
-            pivot_zoom: pivot,
-            cut_digest: "771".to_string(),
-            binding: None,
-        }),
+        Some(TilesShard::new(
+            ShardRole::Coarse,
+            None,
+            pivot,
+            "771".to_string(),
+            None,
+        )),
     );
     let drawn: usize = coarse.zooms.iter().map(|z| z.fill_polygons).sum();
     assert!(drawn > 0, "the coarse job drew no fill");

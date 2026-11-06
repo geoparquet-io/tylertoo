@@ -664,16 +664,16 @@ impl ShardJob {
     /// the bound plan the CLI keeps for its own `--max-zoom auto` re-check.
     /// Core owns every consequence of it (#439).
     fn as_tiles_shard(&self) -> tylertoo_core::internal::overview::tiles::TilesShard {
-        tylertoo_core::internal::overview::tiles::TilesShard {
-            role: self.role,
-            range: self.range,
-            pivot_zoom: self.pivot,
-            cut_digest: self.cut_digest.clone(),
-            binding: Some(tylertoo_core::internal::overview::tiles::ShardBinding {
-                plan: self.plan.clone(),
-                path: self.plan_path.clone(),
-            }),
-        }
+        tylertoo_core::internal::overview::tiles::TilesShard::new(
+            self.role,
+            self.range,
+            self.pivot,
+            self.cut_digest.clone(),
+            Some(tylertoo_core::internal::overview::tiles::ShardBinding::new(
+                self.plan.clone(),
+                self.plan_path.clone(),
+            )),
+        )
     }
 }
 
@@ -1918,15 +1918,17 @@ mod tests {
             return;
         }
         log::set_max_level(log::LevelFilter::Info);
-        let plan = tylertoo_core::internal::shard::ShardPlan {
-            format: "tylertoo-shard-plan".to_string(),
-            version: 1,
-            pivot_zoom: 6,
-            ranges: Vec::new(),
-            inputs: Vec::new(),
-            estimated_rows_total: 0,
-            unplaced_rows: 0,
-        };
+        let plan: tylertoo_core::internal::shard::ShardPlan =
+            serde_json::from_value(serde_json::json!({
+                "format": "tylertoo-shard-plan",
+                "version": 1,
+                "pivot_zoom": 6,
+                "ranges": [],
+                "inputs": [],
+                "estimated_rows_total": 0,
+                "unplaced_rows": 0,
+            }))
+            .unwrap();
         let job = ShardJob {
             role: tylertoo_core::internal::shard::ShardRole::Coarse,
             range: None,
@@ -2707,16 +2709,8 @@ mod tests {
         assert_eq!(
             opts.representation,
             vec![
-                RepresentationBand {
-                    min_zoom: 0,
-                    max_zoom: 7,
-                    repr: Representation::Point
-                },
-                RepresentationBand {
-                    min_zoom: 8,
-                    max_zoom: 13,
-                    repr: Representation::Geometry
-                },
+                RepresentationBand::new(0, 7, Representation::Point),
+                RepresentationBand::new(8, 13, Representation::Geometry),
             ]
         );
         // #745: no flag is the auto disposition (squares, points under a

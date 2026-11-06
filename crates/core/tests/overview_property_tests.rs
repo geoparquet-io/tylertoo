@@ -180,11 +180,10 @@ fn crs() -> impl Strategy<Value = Crs> {
 /// included.
 fn budget_kinds() -> impl Strategy<Value = BudgetKinds> {
     (any::<bool>(), any::<bool>(), any::<bool>()).prop_map(|(points, lines, polygons)| {
-        BudgetKinds {
-            points,
-            lines,
-            polygons,
-        }
+        BudgetKinds::default()
+            .with_points(points)
+            .with_lines(lines)
+            .with_polygons(polygons)
     })
 }
 

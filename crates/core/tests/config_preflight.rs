@@ -14,10 +14,8 @@ fn plan_sources_validates_before_opening_input() {
             vec![],
         ))
         .with_properties(
-            tylertoo_core::internal::overview::properties::PropertySelection {
-                exclude_all: true,
-                ..Default::default()
-            },
+            tylertoo_core::internal::overview::properties::PropertySelection::default()
+                .with_exclude_all(true),
         )
         .with_save_plan(Some(dir.path().join("plan.arrow")));
     let err = write_convert_plan_sources(&source, &opts).unwrap_err();

@@ -30,6 +30,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PropertySelection {
     /// When `Some`, only these properties are kept (`-y`), and `exclude` /
     /// `exclude_all` are ignored, as in tippecanoe. An empty list keeps
@@ -64,6 +65,12 @@ pub struct PropertySelection {
     #[cfg_attr(feature = "cli", arg(help = "Drop every property, writing geometry-only tiles. `--include-property` overrides it", long_help = None))]
     pub exclude_all: bool,
 }
+
+with_setters!(PropertySelection {
+    with_include => include: Option<Vec<String>>,
+    with_exclude => exclude: Vec<String>,
+    with_exclude_all => exclude_all: bool,
+});
 
 /// Why a selection could not be applied to a schema.
 #[derive(Debug, Error, PartialEq, Eq)]

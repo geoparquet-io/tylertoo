@@ -256,18 +256,34 @@ impl LevelPlan {
 /// null/missing value** (nulls encode as `None`, which loses to any `Some` in
 /// the priority order).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct ClassRanking {
     /// Name of the (Utf8/LargeUtf8) column whose values are ranked.
-    pub column: String,
+    pub(crate) column: String,
     /// `(value, priority)` pairs; higher priority wins the cell. Order is
     /// irrelevant (looked up by value).
-    pub ranks: Vec<(String, f64)>,
+    pub(crate) ranks: Vec<(String, f64)>,
     /// Priority for a present-but-unranked value. Set below every named rank so
     /// unknown classes lose to known ones but beat nulls.
-    pub unknown_rank: f64,
+    pub(crate) unknown_rank: f64,
 }
 
 impl ClassRanking {
+    /// Name of the (Utf8/LargeUtf8) column whose values are ranked.
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    /// `(value, priority)` pairs; higher priority wins the cell.
+    pub fn ranks(&self) -> &[(String, f64)] {
+        &self.ranks
+    }
+
+    /// Priority for a present-but-unranked value.
+    pub fn unknown_rank(&self) -> f64 {
+        self.unknown_rank
+    }
+
     /// Build a ranking from `(value, priority)` pairs, enforcing the rules
     /// every spelling of a class ranking shares (#445: the `--class-rank`
     /// string via [`parse_class_rank`], and the Python `class_ranks` dict):
@@ -2549,6 +2565,7 @@ fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
 /// One zoom band of the representation selector (#317 / #279): levels whose
 /// zoom lies in `min_zoom..=max_zoom` (inclusive) take `repr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct RepresentationBand {
     /// Coarsest zoom of the band (inclusive).
     pub min_zoom: u8,
@@ -2556,6 +2573,17 @@ pub struct RepresentationBand {
     pub max_zoom: u8,
     /// Representation applied at the band's levels.
     pub repr: Representation,
+}
+
+impl RepresentationBand {
+    /// `repr` at the levels whose zoom lies in `min_zoom..=max_zoom`.
+    pub fn new(min_zoom: u8, max_zoom: u8, repr: Representation) -> Self {
+        Self {
+            min_zoom,
+            max_zoom,
+            repr,
+        }
+    }
 }
 
 /// The [`Representation`] for a zoom under a set of bands (unclaimed zooms
@@ -4343,6 +4371,7 @@ pub(crate) fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
 /// front. (#553's own case, a5 grid cells 0.6° past ±180°, is no longer out
 /// of range: the export wraps it, #342.)
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct OutOfRangeExemplar {
     /// Index of the input part (file) holding the feature, in the source's
     /// read order; `None` when the input is a single file.

@@ -122,6 +122,7 @@ impl TilesInput {
 /// ([`convert_to_pmtiles`] applies them to its own copy of
 /// [`TilesOptions::convert`], so callers never hand-sync the two).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TilesShard {
     /// Coarse job or data shard.
     pub role: ShardRole,
@@ -146,6 +147,7 @@ pub struct TilesShard {
 /// A loaded shard plan and the path it was read from, for
 /// [`TilesShard::binding`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ShardBinding {
     /// The plan ([`crate::shard::ShardPlan::load`]).
     pub plan: crate::shard::ShardPlan,
@@ -153,7 +155,34 @@ pub struct ShardBinding {
     pub path: PathBuf,
 }
 
+impl ShardBinding {
+    /// `plan`, read from `path`.
+    pub fn new(plan: crate::shard::ShardPlan, path: impl Into<PathBuf>) -> Self {
+        Self {
+            plan,
+            path: path.into(),
+        }
+    }
+}
+
 impl TilesShard {
+    /// A job of a sharded fleet; see the fields.
+    pub fn new(
+        role: ShardRole,
+        range: Option<TileRange>,
+        pivot_zoom: u8,
+        cut_digest: impl Into<String>,
+        binding: Option<ShardBinding>,
+    ) -> Self {
+        Self {
+            role,
+            range,
+            pivot_zoom,
+            cut_digest: cut_digest.into(),
+            binding,
+        }
+    }
+
     /// Verify the job's shard plan against `source`, the input the facade
     /// opened (#498): a plan cut for different parts is refused before any
     /// row is read.

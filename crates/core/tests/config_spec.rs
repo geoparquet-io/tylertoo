@@ -155,7 +155,7 @@ fn convert_syntax_preserves_explicit_overrides() {
     options.validate().unwrap();
     assert_eq!(options.assign.point_thinning, 3.0);
     assert_eq!(options.assign.line_thinning, 0.0);
-    assert_eq!(options.class_ranking.unwrap().column, "kind");
+    assert_eq!(options.class_ranking.unwrap().column(), "kind");
     assert_eq!(options.accumulate.len(), 1);
     assert!(options.density.kinds.lines);
 }

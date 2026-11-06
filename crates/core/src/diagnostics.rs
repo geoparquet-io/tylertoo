@@ -32,6 +32,7 @@ pub enum PolygonRepairKind {
 
 /// Coordinate-system facts needed to explain a scan diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RangeContext {
     /// Usable source rows scanned.
     pub total: usize,

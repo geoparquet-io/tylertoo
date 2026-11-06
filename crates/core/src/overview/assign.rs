@@ -2082,6 +2082,7 @@ with_setters!(DensityBudgetConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct BudgetKinds {
     #[serde(skip)]
     #[cfg_attr(feature = "cli", arg(skip = Self::default().points))]
@@ -2109,6 +2110,12 @@ pub struct BudgetKinds {
     #[cfg_attr(feature = "cli", arg(help = "Apply the density budget to polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the budget excludes polygons by default (tippecanoe's `--drop-polygons`)", long_help = None))]
     pub polygons: bool,
 }
+
+with_setters!(BudgetKinds {
+    with_points => points: bool,
+    with_lines => lines: bool,
+    with_polygons => polygons: bool,
+});
 
 impl BudgetKinds {
     /// Every kind: the budget before #745.

@@ -1485,10 +1485,10 @@ fn entry_zoom_ladder_admits_strong_features_the_gate_drops() {
     let tout2 = tempfile::NamedTempFile::new().unwrap();
     write_banded_input(tin2.path(), 8);
     let laddered = opts()
-        .with_entry_zoom(Some(EntryZoomSpec {
-            column: "magnitude".to_string(),
-            kind: EntryZoomKind::DenseRank { step: 1 },
-        }))
+        .with_entry_zoom(Some(EntryZoomSpec::new(
+            "magnitude".to_string(),
+            EntryZoomKind::DenseRank { step: 1 },
+        )))
         // A ladder admits the feature; the collapse disposition decides
         // what its geometry becomes there. Without one, a 6-metre core
         // admitted to a ~10 km-tolerance level is simplified away again —
@@ -1522,10 +1522,10 @@ fn entry_zoom_ladder_places_bands() {
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_banded_input(tin.path(), 6);
-    let o = opts().with_entry_zoom(Some(EntryZoomSpec {
-        column: "magnitude".to_string(),
-        kind: EntryZoomKind::DenseRank { step: 1 },
-    }));
+    let o = opts().with_entry_zoom(Some(EntryZoomSpec::new(
+        "magnitude".to_string(),
+        EntryZoomKind::DenseRank { step: 1 },
+    )));
     convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
     // 6 sites, strongest band present at every level from the coarsest; the
     // weakest joins only at the finest.
@@ -1583,14 +1583,14 @@ fn entry_zoom_ladder_is_recorded_in_the_footer() {
     use tylertoo_core::internal::overview::ladder::{EntryZoomKind, EntryZoomSpec};
     use tylertoo_core::internal::overview::level::EntryZoomProvenance;
 
-    let dense = EntryZoomSpec {
-        column: "magnitude".to_string(),
-        kind: EntryZoomKind::DenseRank { step: 2 },
-    };
-    let explicit = EntryZoomSpec {
-        column: "magnitude".to_string(),
-        kind: EntryZoomKind::Explicit(vec![(5000.0, 2), (250.0, 5), (999.0, 4)]),
-    };
+    let dense = EntryZoomSpec::new(
+        "magnitude".to_string(),
+        EntryZoomKind::DenseRank { step: 2 },
+    );
+    let explicit = EntryZoomSpec::new(
+        "magnitude".to_string(),
+        EntryZoomKind::Explicit(vec![(5000.0, 2), (250.0, 5), (999.0, 4)]),
+    );
     let cases = [
         (
             dense,
@@ -1657,12 +1657,7 @@ fn entry_zoom_ladder_is_recorded_in_the_footer() {
 fn entry_zoom_provenance_is_absent_when_no_ladder_applies() {
     use tylertoo_core::internal::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
-    let ladder = |kind| {
-        Some(EntryZoomSpec {
-            column: "magnitude".to_string(),
-            kind,
-        })
-    };
+    let ladder = |kind| Some(EntryZoomSpec::new("magnitude".to_string(), kind));
     let laddered_gsd_plan = opts()
         .with_entry_zoom(ladder(EntryZoomKind::DenseRank { step: 1 }))
         .with_levels(LevelPlan::Gsds(vec![20_000.0, 5_000.0, 1_000.0]));
@@ -1708,10 +1703,10 @@ fn entry_zoom_provenance_names_the_renamed_column() {
     let tout = tempfile::NamedTempFile::new().unwrap();
     let (geoms, values) = nested_bands(4);
     write_input_with_f64(tin.path(), &geoms, "level", &values);
-    let o = opts().with_entry_zoom(Some(EntryZoomSpec {
-        column: "level".to_string(),
-        kind: EntryZoomKind::DenseRank { step: 1 },
-    }));
+    let o = opts().with_entry_zoom(Some(EntryZoomSpec::new(
+        "level".to_string(),
+        EntryZoomKind::DenseRank { step: 1 },
+    )));
     let got = footer_entry_zoom(&o, tin.path(), tout.path()).expect("ladder recorded");
     assert_eq!(got.column, "level_");
 
@@ -1736,10 +1731,10 @@ fn entry_zoom_provenance_survives_a_saved_plan_and_a_zoom_ceiling() {
     let input = dir.path().join("in.parquet");
     write_banded_input(&input, 4);
     let plan = dir.path().join("convert.plan");
-    let ladder = Some(EntryZoomSpec {
-        column: "magnitude".to_string(),
-        kind: EntryZoomKind::DenseRank { step: 2 },
-    });
+    let ladder = Some(EntryZoomSpec::new(
+        "magnitude".to_string(),
+        EntryZoomKind::DenseRank { step: 2 },
+    ));
 
     let capped = opts()
         .with_entry_zoom(ladder.clone())
@@ -1780,10 +1775,10 @@ fn entry_zoom_ladder_ignores_rejected_rows() {
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_banded_input(tin.path(), 6);
     let o = opts()
-        .with_entry_zoom(Some(EntryZoomSpec {
-            column: "magnitude".to_string(),
-            kind: EntryZoomKind::DenseRank { step: 1 },
-        }))
+        .with_entry_zoom(Some(EntryZoomSpec::new(
+            "magnitude".to_string(),
+            EntryZoomKind::DenseRank { step: 1 },
+        )))
         // Excludes the strongest band, so the rows carrying the top
         // distinct value never become features. If the ladder still sees
         // that value, it spends rung 0 on a value that is not in the
@@ -1879,10 +1874,10 @@ fn entry_zoom_missing_column_is_rejected() {
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_banded_input(tin.path(), 2);
-    let o = opts().with_entry_zoom(Some(EntryZoomSpec {
-        column: "nope".to_string(),
-        kind: EntryZoomKind::DenseRank { step: 1 },
-    }));
+    let o = opts().with_entry_zoom(Some(EntryZoomSpec::new(
+        "nope".to_string(),
+        EntryZoomKind::DenseRank { step: 1 },
+    )));
     let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
     assert!(
         matches!(err, ConvertError::InvalidConfig(ref m) if m.contains("nope")),
@@ -1900,10 +1895,10 @@ fn entry_zoom_rungs_matching_no_value_are_rejected_by_name() {
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_banded_input(tin.path(), 2);
-    let o = opts().with_entry_zoom(Some(EntryZoomSpec {
-        column: "magnitude".to_string(),
-        kind: EntryZoomKind::Explicit(vec![(999.0, 2), (42.5, 4)]),
-    }));
+    let o = opts().with_entry_zoom(Some(EntryZoomSpec::new(
+        "magnitude".to_string(),
+        EntryZoomKind::Explicit(vec![(999.0, 2), (42.5, 4)]),
+    )));
     let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
     let ConvertError::InvalidConfig(m) = &err else {
         panic!("got {err}");
@@ -2373,10 +2368,8 @@ fn property_selection_narrows_the_overview_columns() {
 
     // include: only `name`.
     let tout = tempfile::NamedTempFile::new().unwrap();
-    let o = opts().with_properties(PropertySelection {
-        include: Some(vec!["name".to_string()]),
-        ..Default::default()
-    });
+    let o = opts()
+        .with_properties(PropertySelection::default().with_include(Some(vec!["name".to_string()])));
     convert_to_overviews(tin.path(), tout.path(), &o).expect("include converts");
     let names = output_column_names(tout.path());
     assert!(names.contains(&"name".to_string()), "{names:?}");
@@ -2389,10 +2382,8 @@ fn property_selection_narrows_the_overview_columns() {
 
     // exclude: drop `extra` only.
     let tout = tempfile::NamedTempFile::new().unwrap();
-    let o = opts().with_properties(PropertySelection {
-        exclude: vec!["extra".to_string()],
-        ..Default::default()
-    });
+    let o = opts()
+        .with_properties(PropertySelection::default().with_exclude(vec!["extra".to_string()]));
     convert_to_overviews(tin.path(), tout.path(), &o).expect("exclude converts");
     let names = output_column_names(tout.path());
     assert!(names.contains(&"id".to_string()), "{names:?}");
@@ -2401,10 +2392,7 @@ fn property_selection_narrows_the_overview_columns() {
 
     // exclude_all: geometry only — the rows still convert.
     let tout = tempfile::NamedTempFile::new().unwrap();
-    let o = opts().with_properties(PropertySelection {
-        exclude_all: true,
-        ..Default::default()
-    });
+    let o = opts().with_properties(PropertySelection::default().with_exclude_all(true));
     let report = convert_to_overviews(tin.path(), tout.path(), &o).expect("exclude_all converts");
     assert_eq!(report.input_features, 4);
     let names = output_column_names(tout.path());
@@ -2427,10 +2415,7 @@ fn property_selection_rejects_knob_columns_and_typos() {
 
     let o = opts()
         .with_filter(Some("extra > 0".to_string()))
-        .with_properties(PropertySelection {
-            exclude: vec!["extra".to_string()],
-            ..Default::default()
-        });
+        .with_properties(PropertySelection::default().with_exclude(vec!["extra".to_string()]));
     let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -2442,10 +2427,7 @@ fn property_selection_rejects_knob_columns_and_typos() {
     // knob check must too: the same friendly error, not a bind failure.
     let o = opts()
         .with_filter(Some("EXTRA > 0".to_string()))
-        .with_properties(PropertySelection {
-            exclude: vec!["extra".to_string()],
-            ..Default::default()
-        });
+        .with_properties(PropertySelection::default().with_exclude(vec!["extra".to_string()]));
     let msg = convert_to_overviews(tin.path(), tout.path(), &o)
         .unwrap_err()
         .to_string();
@@ -2456,10 +2438,10 @@ fn property_selection_rejects_knob_columns_and_typos() {
 
     // #401: the `bbox` covering is regenerated by the writer, so naming it
     // in an include list is an error rather than a silent no-op.
-    let o = opts().with_properties(PropertySelection {
-        include: Some(vec!["name".to_string(), "bbox".to_string()]),
-        ..Default::default()
-    });
+    let o = opts().with_properties(
+        PropertySelection::default()
+            .with_include(Some(vec!["name".to_string(), "bbox".to_string()])),
+    );
     let msg = convert_to_overviews(tin.path(), tout.path(), &o)
         .unwrap_err()
         .to_string();
@@ -2470,19 +2452,14 @@ fn property_selection_rejects_knob_columns_and_typos() {
 
     let o = opts()
         .with_sort_key(Some("extra".to_string()))
-        .with_properties(PropertySelection {
-            include: Some(vec!["name".to_string()]),
-            ..Default::default()
-        });
+        .with_properties(PropertySelection::default().with_include(Some(vec!["name".to_string()])));
     let msg = convert_to_overviews(tin.path(), tout.path(), &o)
         .unwrap_err()
         .to_string();
     assert!(msg.contains("--sort-key"), "{msg}");
 
-    let o = opts().with_properties(PropertySelection {
-        include: Some(vec!["nmae".to_string()]),
-        ..Default::default()
-    });
+    let o = opts()
+        .with_properties(PropertySelection::default().with_include(Some(vec!["nmae".to_string()])));
     let msg = convert_to_overviews(tin.path(), tout.path(), &o)
         .unwrap_err()
         .to_string();
@@ -2550,10 +2527,10 @@ fn property_selection_honours_the_declared_covering() {
     writer.close().unwrap();
 
     let tout = tempfile::NamedTempFile::new().unwrap();
-    let o = opts().with_properties(PropertySelection {
-        include: Some(vec!["id".to_string(), "extent".to_string()]),
-        ..Default::default()
-    });
+    let o = opts().with_properties(
+        PropertySelection::default()
+            .with_include(Some(vec!["id".to_string(), "extent".to_string()])),
+    );
     let msg = convert_to_overviews(tin.path(), tout.path(), &o)
         .unwrap_err()
         .to_string();
@@ -2578,10 +2555,8 @@ fn property_selection_makes_the_source_single_use() {
     let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
     let tout = tempfile::NamedTempFile::new().unwrap();
-    let o = opts().with_properties(PropertySelection {
-        include: Some(vec!["name".to_string()]),
-        ..Default::default()
-    });
+    let o = opts()
+        .with_properties(PropertySelection::default().with_include(Some(vec!["name".to_string()])));
     convert_to_overviews_sources(&source, tout.path(), &o).expect("first convert");
 
     // Default selection on the same source: an error, not a narrowed file.
@@ -2821,11 +2796,7 @@ fn tiny_polygon_accumulator_stays_out_of_point_bands() {
     let tout = tempfile::NamedTempFile::new().unwrap();
     let o = opts()
         .with_simplify(SimplifyOptions::default().with_collapse(CollapseMode::Square))
-        .with_representation(vec![RepresentationBand {
-            min_zoom: 2,
-            max_zoom: 5,
-            repr: Representation::Point,
-        }]);
+        .with_representation(vec![RepresentationBand::new(2, 5, Representation::Point)]);
     let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
     for (li, l) in report.levels.iter().enumerate() {
         let zoom = l.zoom.unwrap();

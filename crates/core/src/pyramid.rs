@@ -186,6 +186,7 @@ impl From<crate::archive_index::ArchiveError> for PyramidError {
 
 /// One band: an input tiled verbatim across `min_zoom..=max_zoom` into `layer`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Band {
     pub input: PathBuf,
     pub layer: String,
@@ -194,6 +195,22 @@ pub struct Band {
 }
 
 impl Band {
+    /// `input` tiled verbatim across `min_zoom..=max_zoom` into `layer`.
+    /// [`build_pyramid`] validates the band set.
+    pub fn new(
+        input: impl Into<PathBuf>,
+        layer: impl Into<String>,
+        min_zoom: u8,
+        max_zoom: u8,
+    ) -> Self {
+        Self {
+            input: input.into(),
+            layer: layer.into(),
+            min_zoom,
+            max_zoom,
+        }
+    }
+
     /// Web Mercator zoom ceiling: the shared [`crate::tile::MAX_ZOOM`] (#371),
     /// which every write path now enforces at options validation.
     const MAX_ZOOM: u8 = crate::tile::MAX_ZOOM;

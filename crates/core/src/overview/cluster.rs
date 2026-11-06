@@ -103,11 +103,22 @@ impl AccumulateOp {
 
 /// One `--accumulate-attribute col:op` request.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AccumulateSpec {
     /// Numeric source column whose values are aggregated across a cluster.
     pub column: String,
     /// Aggregation operator.
     pub op: AccumulateOp,
+}
+
+impl AccumulateSpec {
+    /// Aggregate `column` with `op`.
+    pub fn new(column: impl Into<String>, op: AccumulateOp) -> Self {
+        Self {
+            column: column.into(),
+            op,
+        }
+    }
 }
 
 /// A non-singleton cluster at one level: the winner's `point_count` and its

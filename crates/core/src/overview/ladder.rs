@@ -219,11 +219,22 @@ pub enum EntryZoomKind {
 
 /// A `--magnitude-ladder` / `--entry-zoom` request: which column, and how.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct EntryZoomSpec {
     /// Column whose values the rungs are drawn from.
     pub column: String,
     /// How the rungs are placed.
     pub kind: EntryZoomKind,
+}
+
+impl EntryZoomSpec {
+    /// Rungs drawn from `column`, placed as `kind` says.
+    pub fn new(column: impl Into<String>, kind: EntryZoomKind) -> Self {
+        Self {
+            column: column.into(),
+            kind,
+        }
+    }
 }
 
 /// Build the ladder a spec asks for, given the column's values and the level

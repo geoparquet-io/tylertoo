@@ -649,6 +649,7 @@ impl fmt::Display for TileRange {
 
 /// One shard's slice of a [`ShardPlan`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ShardRange {
     /// First pivot-zoom tile id, inclusive.
     pub lo: u64,
@@ -666,6 +667,7 @@ pub struct ShardRange {
 /// already pins the input hard (down to mtime), and this only has to catch
 /// "this shard plan was cut for a different file".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ShardInput {
     /// The part's display name (local path, or remote URL).
     pub path: String,
@@ -682,6 +684,7 @@ pub struct ShardInput {
 /// construction rather than by each recomputing an estimate that a differing
 /// library version or a re-statted file could perturb.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ShardPlan {
     /// Always `SHARD_PLAN_FORMAT`; refused otherwise.
     pub format: String,

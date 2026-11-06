@@ -167,10 +167,10 @@ fn convert_options(build: Build) -> ConvertOptions {
             .with_read_workers(read_workers)
             .with_coalesce_lines(false)
             .with_cluster(true)
-            .with_accumulate(vec![AccumulateSpec {
-                column: "weight".to_string(),
-                op: AccumulateOp::Sum,
-            }]),
+            .with_accumulate(vec![AccumulateSpec::new(
+                "weight".to_string(),
+                AccumulateOp::Sum,
+            )]),
     }
 }
 

@@ -51,12 +51,7 @@ impl Case {
 }
 
 fn band(input: &Path) -> Band {
-    Band {
-        input: input.to_path_buf(),
-        layer: "l".to_string(),
-        min_zoom: 0,
-        max_zoom: 2,
-    }
+    Band::new(input.to_path_buf(), "l".to_string(), 0, 2)
 }
 
 #[test]
