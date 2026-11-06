@@ -67,6 +67,7 @@ use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
 use super::procmem::{
     cgroup_json, proc_status_json, read_cgroup_mem, read_proc_status, CgroupMem, ProcStatusMem,
 };
+use super::procstat::{cpu_times, read_proc_io, ProcIo};
 #[cfg(test)]
 use super::read::read_in_order;
 use super::read::{footer_price, grant_read_ahead, FooterPrice, ReadFlow, ReadPass, ReadTuning};
@@ -428,6 +429,125 @@ struct RssSamplerState {
     /// statistics, which is cheap once per phase but not worth paying every
     /// tick.
     phase_cgroup: Vec<(String, CgroupMem)>,
+    /// #810: the CPU and I/O counters when the current phase began.
+    phase_start: ProcSnapshot,
+    /// #810: what each phase used, between its boundaries, in run order.
+    phase_usage: Vec<(String, PhaseUsage)>,
+    /// #810: the per-tick CPU / RSS / I/O series.
+    timeline: Timeline,
+}
+
+/// #810: the process counters at one instant.
+#[derive(Debug, Clone, Copy)]
+struct ProcSnapshot {
+    at: Instant,
+    /// `(user, system)` CPU seconds, all threads; `None` off Unix.
+    cpu: Option<(f64, f64)>,
+    /// `None` off Linux.
+    io: Option<ProcIo>,
+}
+
+impl ProcSnapshot {
+    fn now() -> Self {
+        Self {
+            at: Instant::now(),
+            cpu: cpu_times(),
+            io: read_proc_io(),
+        }
+    }
+}
+
+/// #810: what one phase used between its boundaries. Summed when a phase
+/// is entered more than once.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct PhaseUsage {
+    pub(super) wall_secs: f64,
+    /// `(user, system)` CPU seconds; `None` off Unix.
+    pub(super) cpu: Option<(f64, f64)>,
+    /// Bytes read and written through the block layer; `None` off Linux.
+    pub(super) io: Option<ProcIo>,
+    /// Core-seconds the phase's stage timers account for, credited by the
+    /// owner of those timers ([`RssSamplerReport::credit_stage_secs`]).
+    pub(super) stage_secs: f64,
+}
+
+impl PhaseUsage {
+    fn add(&mut self, from: &ProcSnapshot, to: &ProcSnapshot) {
+        self.wall_secs += to.at.duration_since(from.at).as_secs_f64();
+        self.cpu = match (self.cpu, from.cpu, to.cpu) {
+            (acc, Some((u0, s0)), Some((u1, s1))) => {
+                let (u, s) = acc.unwrap_or_default();
+                Some((u + (u1 - u0).max(0.0), s + (s1 - s0).max(0.0)))
+            }
+            _ => None,
+        };
+        self.io = match (self.io, from.io, to.io) {
+            (acc, Some(a), Some(b)) => {
+                let acc = acc.unwrap_or_default();
+                Some(ProcIo {
+                    rchar: acc.rchar + b.rchar.saturating_sub(a.rchar),
+                    read_bytes: acc.read_bytes + b.read_bytes.saturating_sub(a.read_bytes),
+                    write_bytes: acc.write_bytes + b.write_bytes.saturating_sub(a.write_bytes),
+                })
+            }
+            _ => None,
+        };
+    }
+
+    pub(super) fn cpu_secs(&self) -> Option<f64> {
+        self.cpu.map(|(u, s)| u + s)
+    }
+
+    /// CPU seconds per wall second: how many cores the phase kept busy.
+    pub(super) fn effective_cores(&self) -> Option<f64> {
+        Some(self.cpu_secs()? / self.wall_secs.max(1e-9))
+    }
+}
+
+/// #810: one tick of the timeline.
+#[derive(Debug, Clone, Copy)]
+struct TimelineSample {
+    /// Seconds since the sampler started.
+    t_secs: f64,
+    cpu_secs: Option<f64>,
+    rss_bytes: Option<u64>,
+    io: Option<ProcIo>,
+}
+
+/// Samples a timeline keeps before it halves itself.
+const TIMELINE_CAP: usize = 8192;
+
+/// #810: the per-tick series, bounded at [`TIMELINE_CAP`] samples: when it
+/// fills, every other sample is dropped and only every `stride`-th tick is
+/// kept from then on, so a 10-hour run costs the same memory as a
+/// 30-minute one at half the resolution.
+#[derive(Debug, Default)]
+struct Timeline {
+    samples: Vec<TimelineSample>,
+    stride: usize,
+    ticks: usize,
+}
+
+impl Timeline {
+    fn push(&mut self, sample: TimelineSample) {
+        let stride = self.stride.max(1);
+        self.ticks += 1;
+        if !(self.ticks - 1).is_multiple_of(stride) {
+            return;
+        }
+        if self.samples.len() == TIMELINE_CAP {
+            let mut i = 0;
+            self.samples.retain(|_| {
+                i += 1;
+                i % 2 == 1
+            });
+            self.stride = stride * 2;
+            if !(self.ticks - 1).is_multiple_of(self.stride) {
+                return;
+            }
+        }
+        self.samples.push(sample);
+    }
 }
 
 /// Replace `current`'s entry in a per-phase list, or append one — a phase
@@ -488,6 +608,25 @@ impl RssSamplerState {
             upsert_phase(&mut self.phase_cgroup, &self.current_phase, cgroup);
         }
     }
+
+    /// #810: credit the current phase with the counters' movement since it
+    /// began, and start the next phase's window at `now`.
+    fn close_usage(&mut self, now: ProcSnapshot) {
+        let start = self.phase_start;
+        match self
+            .phase_usage
+            .iter_mut()
+            .find(|(p, _)| *p == self.current_phase)
+        {
+            Some((_, u)) => u.add(&start, &now),
+            None => {
+                let mut u = PhaseUsage::default();
+                u.add(&start, &now);
+                self.phase_usage.push((self.current_phase.clone(), u));
+            }
+        }
+        self.phase_start = now;
+    }
 }
 
 /// What [`RssSampler::finish`] reports: the whole-run true peak plus the max
@@ -506,6 +645,21 @@ pub(super) struct RssSamplerReport {
     /// #627: per-phase-boundary cgroup v2 accounting. Empty off Linux, on
     /// cgroup v1, or where the cgroup's memory files are not visible.
     pub(super) phase_cgroup: Vec<(String, CgroupMem)>,
+    /// #810: CPU, wall and I/O per phase, in run order.
+    pub(super) phase_usage: Vec<(String, PhaseUsage)>,
+    /// #810: the per-tick series (see [`Timeline`]).
+    timeline: Vec<TimelineSample>,
+}
+
+impl RssSamplerReport {
+    /// #810: add stage-timer core-seconds to `phase`'s account, so its
+    /// `unattributed_core_secs` is its CPU minus what the stages explain.
+    /// A phase the run never entered is ignored.
+    pub(super) fn credit_stage_secs(&mut self, phase: &str, secs: f64) {
+        if let Some((_, u)) = self.phase_usage.iter_mut().find(|(p, _)| p == phase) {
+            u.stage_secs += secs;
+        }
+    }
 }
 
 impl RssSampler {
@@ -539,11 +693,16 @@ impl RssSampler {
             phase_anon_peaks_mib: Vec::new(),
             phase_rss_breakdown: Vec::new(),
             phase_cgroup: Vec::new(),
+            phase_start: ProcSnapshot::now(),
+            phase_usage: Vec::new(),
+            timeline: Timeline::default(),
         }));
         let state_bg = Arc::clone(&state);
+        let t0 = Instant::now();
         let handle = std::thread::spawn(move || loop {
             let mib = current_rss_mib();
             let anon = anon_mib(read_proc_status().as_ref());
+            let tick = ProcSnapshot::now();
             if let Ok(mut s) = state_bg.lock() {
                 if let Some(mib) = mib {
                     s.record(mib);
@@ -551,6 +710,12 @@ impl RssSampler {
                 if let Some(anon) = anon {
                     s.record_anon(anon);
                 }
+                s.timeline.push(TimelineSample {
+                    t_secs: tick.at.duration_since(t0).as_secs_f64(),
+                    cpu_secs: tick.cpu.map(|(u, s)| u + s),
+                    rss_bytes: mib.map(|m| (m * 1024.0 * 1024.0) as u64),
+                    io: tick.io,
+                });
             }
             // A timeout is the next tick; a message or a dropped sender
             // (`stop_thread`, or `Drop` on an early return) is the stop.
@@ -590,11 +755,13 @@ impl RssSampler {
         let mib = current_rss_mib();
         let status = read_proc_status();
         let cgroup = read_cgroup_mem();
+        let now = ProcSnapshot::now();
         if let Ok(mut s) = self.state.lock() {
             if let Some(mib) = mib {
                 s.record(mib);
             }
             s.record_boundary(status, cgroup);
+            s.close_usage(now);
             if s.current_phase != phase {
                 s.current_phase = phase.to_string();
             }
@@ -621,11 +788,13 @@ impl RssSampler {
         // phase with no breakdown.
         let status = read_proc_status();
         let cgroup = read_cgroup_mem();
+        let now = ProcSnapshot::now();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.record_boundary(status, cgroup);
+        state.close_usage(now);
         RssSamplerReport {
             interval_ms: self.interval.as_millis() as u64,
             true_peak_mib: state.true_peak_mib,
@@ -634,6 +803,8 @@ impl RssSampler {
             phase_anon_peaks_mib: state.phase_anon_peaks_mib.clone(),
             phase_rss_breakdown: state.phase_rss_breakdown.clone(),
             phase_cgroup: state.phase_cgroup.clone(),
+            phase_usage: state.phase_usage.clone(),
+            timeline: std::mem::take(&mut state.timeline.samples),
         }
     }
 }
@@ -3730,7 +3901,15 @@ fn emit_profile_json(ctx: ProfileJsonContext<'_>, diagnostics: &crate::diagnosti
                 .map(|(l, &spill_bytes)| (l.feature_count, spill_bytes))
                 .collect(),
             peak_rss_mib: ctx.peak_rss_mib,
-            rss_sampler_report: ctx.rss_sampler_report,
+            rss_sampler_report: ctx.rss_sampler_report.map(|mut r| {
+                // #810: the phases whose CPU the stage timers explain.
+                r.credit_stage_secs("pass1 scan", ctx.pass1_stage_secs.core_secs());
+                r.credit_stage_secs(
+                    "pass2 (output sink)",
+                    ctx.pass2_engine_timers.stage_secs().core_secs(),
+                );
+                r
+            }),
             in_flight_batches: ctx.in_flight_batches,
             sink_measurement: ctx.sink_measurement,
             spill_reservation: ctx.spill_reservation,
@@ -3930,6 +4109,9 @@ fn write_profile_json(
                 "drain": inputs.pass2_stage_secs.drain,
                 "spill_write": inputs.pass2_stage_secs.spill_write,
             },
+            // #810: the streamed finest level's writer, busy (not waiting on
+            // the producer). It runs serially, beside the stages above.
+            "writer_busy_secs": inputs.pass2_stage_secs.writer_busy,
             // Cascade-fold Arc-sharing (#499, compute side): how many of the
             // fold's `Keep` steps reused the previous step's geometry
             // (`Arc::clone`) instead of retaining a fresh allocation, because
@@ -4052,10 +4234,51 @@ fn rss_sampler_json(report: &Option<RssSamplerReport>) -> serde_json::Value {
                 "phase_anon_peaks_mib": phase_anon_peaks_mib,
                 "phase_rss_breakdown": phase_rss_breakdown,
                 "phase_cgroup": phase_cgroup,
+                "phase_order": r.phase_usage.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+                "phases": phase_usage_json(&r.phase_usage),
+                "timeline": r.timeline.iter().map(timeline_row).collect::<Vec<_>>(),
             })
         }
         None => serde_json::Value::Null,
     }
+}
+
+/// #810: `rss_sampler.phases`, one saturation record per phase. A JSON
+/// object is key-sorted, so `rss_sampler.phase_order` carries run order.
+fn phase_usage_json(usage: &[(String, PhaseUsage)]) -> serde_json::Value {
+    let threads = rayon::current_num_threads() as f64;
+    usage
+        .iter()
+        .map(|(phase, u)| {
+            let cores = u.effective_cores();
+            let v = serde_json::json!({
+                "wall_secs": u.wall_secs,
+                "cpu_user_secs": u.cpu.map(|c| c.0),
+                "cpu_sys_secs": u.cpu.map(|c| c.1),
+                "effective_cores": cores,
+                "utilization": cores.map(|c| c / threads),
+                "stage_secs": u.stage_secs,
+                "unattributed_core_secs": u.cpu_secs().map(|c| c - u.stage_secs),
+                "read_bytes": u.io.map(|io| io.read_bytes),
+                "write_bytes": u.io.map(|io| io.write_bytes),
+            });
+            (phase.clone(), v)
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
+/// #810: one `rss_sampler.timeline` row,
+/// `[t_secs, cpu_secs, rss_bytes, read_bytes, write_bytes, rchar]`.
+fn timeline_row(s: &TimelineSample) -> serde_json::Value {
+    serde_json::json!([
+        s.t_secs,
+        s.cpu_secs,
+        s.rss_bytes,
+        s.io.map(|io| io.read_bytes),
+        s.io.map(|io| io.write_bytes),
+        s.io.map(|io| io.rchar),
+    ])
 }
 
 fn profile_timestamp() -> f64 {
@@ -4245,6 +4468,10 @@ pub(super) struct ExportTimers {
     /// #750 coverage fill, encode: a tile's host assignment, budget and
     /// fill-feature encoding, summed per tile (part of `encode`'s window).
     pub(super) fill_encode: AtomicU64,
+    /// #810: time spent waiting to lock a concurrent level group's
+    /// `GroupCommit` (#647), summed over the collecting thread and every
+    /// encode task. Waiting, not work: not a stage.
+    pub(super) group_commit_wait: AtomicU64,
 }
 
 /// [`ExportTimers`] snapshotted in seconds for [`write_export_profile_json`].
@@ -4266,6 +4493,30 @@ pub(super) struct ExportStageSecs {
     pub(super) fill_union: f64,
     pub(super) fill_squares: f64,
     pub(super) fill_encode: f64,
+    pub(super) group_commit_wait: f64,
+}
+
+impl ExportStageSecs {
+    /// #810: the stages' core-seconds, the share of the export's CPU they
+    /// explain. `fill_encode` is inside `encode`'s window and
+    /// `group_commit_wait` is waiting, so neither adds.
+    pub(super) fn core_secs(&self) -> f64 {
+        self.band_read
+            + self.decode
+            + self.clip
+            + self.encode
+            + self.spill_write
+            + self.spill_read
+            + self.spool_write
+            + self.checkpoint
+            + self.scan_read
+            + self.scan_decode
+            + self.scan_size
+            + self.fill_seed
+            + self.fill_simplify
+            + self.fill_union
+            + self.fill_squares
+    }
 }
 
 #[expect(
@@ -4310,6 +4561,7 @@ impl ExportTimers {
             fill_union: nanos_secs(&self.fill_union),
             fill_squares: nanos_secs(&self.fill_squares),
             fill_encode: nanos_secs(&self.fill_encode),
+            group_commit_wait: nanos_secs(&self.group_commit_wait),
         }
     }
 }
@@ -4377,6 +4629,12 @@ pub(super) struct ExportZoomProfile {
     /// tile) counts here but is stored once, so this can exceed the zoom's
     /// share of the archive. Not the raw (pre-gzip) MVT size.
     pub(super) bytes: u64,
+    /// #810: the partitions this zoom ran per wave: the plan's width after
+    /// the #311 memory narrowing, not the export-wide ceiling.
+    pub(super) wave_width: usize,
+    /// #810: bytes of this zoom's members the member store spilled to disk
+    /// (the export-wide store, or the level's own #740 store). 0 in RAM.
+    pub(super) spill_bytes: u64,
 }
 
 /// Inputs to [`write_export_profile_json`] — the export-phase analogue of
@@ -4438,6 +4696,8 @@ pub(super) fn write_export_profile_json(
                 "tiles": z.tiles,
                 "features": z.features,
                 "bytes": z.bytes,
+                "wave_width": z.wave_width,
+                "spill_bytes": z.spill_bytes,
             })
         })
         .collect();
@@ -4475,6 +4735,16 @@ pub(super) fn write_export_profile_json(
                 "fill_squares": stage.fill_squares,
                 "fill_encode": stage.fill_encode,
             },
+            // #810: the serial path. `spool_write` and `finalize` run on
+            // one thread; `group_commit_wait` is threads waiting on the
+            // level group's ordered write (#647).
+            "serial_secs": {
+                "spool_write": stage.spool_write,
+                "finalize": walls.finalize,
+                "group_commit_wait": stage.group_commit_wait,
+            },
+            // #810: the single-threaded share of the export's wall.
+            "serial_share": (stage.spool_write + walls.finalize) / inputs.total_secs.max(1e-9),
             "per_zoom": per_zoom_json,
             "waves_total": inputs.waves_total,
             "partition_wave_width": inputs.partition_wave_width,
@@ -4762,6 +5032,13 @@ pub(super) struct Pass1StageSecs {
     pub(super) scan: f64,
     pub(super) keys: f64,
     pub(super) assemble: f64,
+}
+
+impl Pass1StageSecs {
+    /// #810: the stages' core-seconds, the share of pass 1's CPU they explain.
+    fn core_secs(&self) -> f64 {
+        self.read + self.decode + self.scan + self.keys + self.assemble
+    }
 }
 
 #[expect(
@@ -5923,6 +6200,10 @@ pub(super) struct Pass2Timers {
     /// core-seconds off the consumer's critical path — it no longer runs in
     /// `SpillState::push` and no longer runs on the consumer thread.
     spill_write: AtomicU64,
+    /// #810: the streamed finest level's writer thread, busy rather than
+    /// waiting on the producer: its wall minus its `recv` waits. Emitted as
+    /// `pass2.writer_busy_secs`.
+    writer_busy: AtomicU64,
     /// Cascade-fold steps ([`process_batch_cascade`], #499) that reused
     /// (`Arc::clone`) the previous step's geometry because simplification
     /// removed nothing, instead of retaining a fresh allocation. Wired into
@@ -5955,6 +6236,21 @@ pub(super) struct Pass2StageSecs {
     pub(super) build: f64,
     pub(super) drain: f64,
     pub(super) spill_write: f64,
+    pub(super) writer_busy: f64,
+}
+
+impl Pass2StageSecs {
+    /// #810: the stages' core-seconds, the share of pass 2's CPU they
+    /// explain. The writer runs on its own thread, so it adds.
+    fn core_secs(&self) -> f64 {
+        self.read
+            + self.decode
+            + self.simplify
+            + self.build
+            + self.drain
+            + self.spill_write
+            + self.writer_busy
+    }
 }
 
 #[expect(
@@ -6043,6 +6339,9 @@ impl Pass2Timers {
         other
             .spill_write
             .fetch_add(self.spill_write.load(Ordering::Relaxed), Ordering::Relaxed);
+        other
+            .writer_busy
+            .fetch_add(self.writer_busy.load(Ordering::Relaxed), Ordering::Relaxed);
         other.cascade_steps_shared.fetch_add(
             self.cascade_steps_shared.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -6061,6 +6360,7 @@ impl Pass2Timers {
             build: Self::secs(&self.build),
             drain: Self::secs(&self.drain),
             spill_write: Self::secs(&self.spill_write),
+            writer_busy: Self::secs(&self.writer_busy),
         }
     }
     /// Emit the aggregated per-stage breakdown ([profile] logging) for the
@@ -6355,6 +6655,10 @@ fn write_level_streaming(
     // `total` wall time — the writer's own cost is roughly
     // `total - max(producer stages)`, not `total - sum`.
     let writer_busy = total - Duration::from_nanos(recv_wait_ns.get()).as_secs_f64();
+    Pass2Timers::add_dur(
+        &timers.writer_busy,
+        Duration::from_secs_f64(writer_busy.max(0.0)),
+    );
     log::debug!(
         "[profile] level {} ({}, {} rows): total={:.2}s read={:.2}s decode={:.2}s \
          simplify={:.2}s build={:.2}s writer_busy={:.2}s (read/decode/simplify/build \
@@ -8105,6 +8409,216 @@ mod tests {
         } else {
             assert!(v["phase_cgroup"].as_object().unwrap().is_empty());
         }
+    }
+
+    /// Fixed CPU work (not a timed spin), so a descheduled thread does the
+    /// same work later instead of less of it.
+    fn spin(units: u64) -> u64 {
+        let mut x = 0u64;
+        for i in 0..units * 1_000_000 {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i);
+        }
+        std::hint::black_box(x)
+    }
+
+    fn usage<'r>(report: &'r RssSamplerReport, phase: &str) -> &'r PhaseUsage {
+        &report
+            .phase_usage
+            .iter()
+            .find(|(p, _)| p == phase)
+            .unwrap_or_else(|| panic!("no usage entry for {phase}"))
+            .1
+    }
+
+    /// #810: every phase gets its CPU and wall deltas from the boundaries,
+    /// in run order, and the tick records a timeline.
+    #[test]
+    fn rss_sampler_reports_per_phase_cpu_and_a_timeline() {
+        let sampler = RssSampler::start_if_with_interval(true, "spin", Duration::from_millis(10))
+            .expect("profiling_on=true always starts a sampler");
+        spin(100);
+        sampler.mark_phase("sleep");
+        std::thread::sleep(Duration::from_millis(150));
+        let report = sampler.finish();
+
+        let names: Vec<&str> = report.phase_usage.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(names, ["spin", "sleep"]);
+        let (spun, slept) = (usage(&report, "spin"), usage(&report, "sleep"));
+        assert!(spun.wall_secs > 0.0 && slept.wall_secs >= 0.15);
+        if cfg!(unix) {
+            assert!(spun.cpu_secs().unwrap() > 0.0);
+            assert!(
+                spun.effective_cores().unwrap() > 0.5,
+                "a spinning thread is ~1 core busy: {spun:?}"
+            );
+            assert!(
+                slept.effective_cores().unwrap() < 0.5,
+                "a sleeping thread is ~0 cores busy: {slept:?}"
+            );
+        }
+        assert_eq!(spun.io.is_some(), read_proc_io().is_some());
+
+        assert!(report.timeline.len() >= 2, "{:?}", report.timeline.len());
+        for w in report.timeline.windows(2) {
+            assert!(w[1].t_secs >= w[0].t_secs, "timeline t must not go back");
+            if let (Some(a), Some(b)) = (w[0].cpu_secs, w[1].cpu_secs) {
+                assert!(b >= a, "timeline CPU must not go back");
+            }
+        }
+    }
+
+    /// #810 injected regression: the same CPU work run on a 1-thread pool
+    /// instead of a wide one shows up as a drop in the phase's
+    /// `effective_cores`. This is the signal the effective-cores gate reads.
+    #[test]
+    fn effective_cores_drop_when_work_is_serialized() {
+        let width = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
+        if width < 2 || !cfg!(unix) {
+            eprintln!("Skipping: needs 2+ cores and getrusage");
+            return;
+        }
+        let work = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool");
+            pool.install(|| {
+                (0..width * 4)
+                    .into_par_iter()
+                    .map(|_| spin(25))
+                    .reduce(|| 0, u64::wrapping_add)
+            });
+        };
+        let sampler = RssSampler::start_if_with_interval(true, "wide", Duration::from_secs(30))
+            .expect("profiling_on=true always starts a sampler");
+        work(width);
+        sampler.mark_phase("serial");
+        work(1);
+        let report = sampler.finish();
+        let wide = usage(&report, "wide").effective_cores().unwrap();
+        let serial = usage(&report, "serial").effective_cores().unwrap();
+        assert!(
+            serial < 1.3 && wide > 1.5 && wide > 1.3 * serial,
+            "serializing the work must lower effective_cores: wide {wide:.2}, serial {serial:.2}"
+        );
+    }
+
+    /// #810: the JSON carries the per-phase saturation fields in run order,
+    /// with stage core-seconds credited to their phase.
+    #[test]
+    fn rss_sampler_json_carries_the_810_keys() {
+        let sampler =
+            RssSampler::start_if_with_interval(true, "pass1 scan", Duration::from_millis(5))
+                .expect("profiling_on=true always starts a sampler");
+        spin(30);
+        sampler.mark_phase("pass2 (output sink)");
+        spin(10);
+        let mut report = sampler.finish();
+        let cpu = usage(&report, "pass1 scan").cpu_secs();
+        report.credit_stage_secs("pass1 scan", 0.001);
+        report.credit_stage_secs("no such phase", 5.0);
+        let v = rss_sampler_json(&Some(report));
+
+        assert_eq!(
+            v["phase_order"],
+            serde_json::json!(["pass1 scan", "pass2 (output sink)"])
+        );
+        let p = &v["phases"]["pass1 scan"];
+        for key in [
+            "wall_secs",
+            "cpu_user_secs",
+            "cpu_sys_secs",
+            "effective_cores",
+            "utilization",
+            "stage_secs",
+            "unattributed_core_secs",
+            "read_bytes",
+            "write_bytes",
+        ] {
+            assert!(p.as_object().unwrap().contains_key(key), "{key}: {v}");
+        }
+        assert_eq!(p["stage_secs"], 0.001);
+        assert_eq!(v["phases"]["pass2 (output sink)"]["stage_secs"], 0.0);
+        if let Some(cpu) = cpu {
+            let un = p["unattributed_core_secs"].as_f64().unwrap();
+            assert!((un - (cpu - 0.001)).abs() < 1e-9, "{v}");
+            let eff = p["effective_cores"].as_f64().unwrap();
+            let threads = rayon::current_num_threads() as f64;
+            assert!((p["utilization"].as_f64().unwrap() - eff / threads).abs() < 1e-9);
+        }
+        let row = &v["timeline"][0];
+        assert_eq!(row.as_array().map(Vec::len), Some(6), "{v}");
+    }
+
+    /// #810: each stage sum counts every disjoint stage exactly once. Each
+    /// stage gets its own power of two, so a stage counted twice, or one
+    /// left out, changes the sum. `fill_encode` (inside `encode`'s window)
+    /// and `group_commit_wait` (waiting, not work) must not count at all.
+    #[test]
+    fn stage_core_secs_count_each_stage_once() {
+        let p = |i: i32| 2f64.powi(i);
+        let pass1 = Pass1StageSecs {
+            read: p(0),
+            decode: p(1),
+            scan: p(2),
+            keys: p(3),
+            assemble: p(4),
+        };
+        assert_eq!(pass1.core_secs(), p(5) - 1.0);
+        let pass2 = Pass2StageSecs {
+            read: p(0),
+            decode: p(1),
+            simplify: p(2),
+            build: p(3),
+            drain: p(4),
+            spill_write: p(5),
+            writer_busy: p(6),
+        };
+        assert_eq!(pass2.core_secs(), p(7) - 1.0);
+        let export = ExportStageSecs {
+            band_read: p(0),
+            decode: p(1),
+            clip: p(2),
+            encode: p(3),
+            spill_write: p(4),
+            spill_read: p(5),
+            spool_write: p(6),
+            checkpoint: p(7),
+            scan_read: p(8),
+            scan_decode: p(9),
+            scan_size: p(10),
+            fill_seed: p(11),
+            fill_simplify: p(12),
+            fill_union: p(13),
+            fill_squares: p(14),
+            fill_encode: p(15),
+            group_commit_wait: p(16),
+        };
+        assert_eq!(export.core_secs(), p(15) - 1.0);
+    }
+
+    /// #810: a long run's timeline stays bounded: past the cap, every other
+    /// sample is dropped and the stride doubles.
+    #[test]
+    fn timeline_decimates_past_its_cap() {
+        let mut tl = Timeline::default();
+        let sample = |t| TimelineSample {
+            t_secs: t,
+            cpu_secs: None,
+            rss_bytes: None,
+            io: None,
+        };
+        for i in 0..TIMELINE_CAP * 3 {
+            tl.push(sample(i as f64));
+        }
+        assert!(tl.samples.len() <= TIMELINE_CAP);
+        assert!(tl.samples.len() >= TIMELINE_CAP / 2);
+        assert_eq!(tl.samples[0].t_secs, 0.0);
+        let step = tl.samples[1].t_secs - tl.samples[0].t_secs;
+        assert!(tl
+            .samples
+            .windows(2)
+            .all(|w| w[1].t_secs - w[0].t_secs == step));
     }
 
     /// #571 review: stopping the sampler must not wait out a full poll
