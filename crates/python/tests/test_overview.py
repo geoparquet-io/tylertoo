@@ -549,9 +549,11 @@ class TestOverviewIntegration:
 
     def test_overview_streaming_keyword_is_gone(self):
         # #440: the in-memory engine switch was removed.
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(tylertoo.ConfigError, match="streaming"):
-                self._overview(tmpdir, max_zoom=4, streaming=False)
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(tylertoo.ConfigError, match="streaming"),
+        ):
+            self._overview(tmpdir, max_zoom=4, streaming=False)
 
     def test_overview_read_batch_size(self):
         with tempfile.TemporaryDirectory() as tmpdir:
