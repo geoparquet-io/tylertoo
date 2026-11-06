@@ -49,7 +49,7 @@ dev = [
     "vulture>=2.13",
     "xenon>=0.9",
     "pip-audit>=2.7",
-    "pyarrow>=21.0.0",
+    "pyarrow>=26.0.0",
     "hypothesis>=6.141.1",
 ]
 # Tools the tutorials call and the site builder (tests/docs, docs.yml).
