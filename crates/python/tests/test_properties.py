@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
@@ -42,6 +43,7 @@ _KNOBS = {
 
 
 def _outcome(keyword: str, value: object) -> BaseException | None:
+    kwargs: dict[str, Any] = {keyword: value}
     with tempfile.TemporaryDirectory() as tmp:
         try:
             # `max_zoom="auto"` reads the input to pick a zoom, so a rule
@@ -50,7 +52,7 @@ def _outcome(keyword: str, value: object) -> BaseException | None:
                 MISSING,
                 str(Path(tmp) / "out.pmtiles"),
                 max_zoom="auto",
-                **{keyword: value},
+                **kwargs,
             )
         except Exception as exc:
             return exc
@@ -66,6 +68,8 @@ def test_refused_values_name_the_argument_and_accepted_ones_pass_validation(
     value = data.draw(strategy)
     exc = _outcome(keyword, value)
     assert exc is not None  # the input is missing, so something must fail
+    if surely_ok(value):  # the converse: a clearly valid value is never refused
+        assert not isinstance(exc, tylertoo.ConfigError), f"{keyword}={value!r}: {exc}"
     if isinstance(exc, tylertoo.ConfigError):
         assert isinstance(exc, ValueError)
         assert not surely_ok(value), f"{keyword}={value!r} refused: {exc}"
@@ -81,3 +85,22 @@ def test_refused_values_name_the_argument_and_accepted_ones_pass_validation(
             assert math.isfinite(value)
         if keyword == "read_batch_size":
             assert 1 <= value <= 1_048_576
+
+
+BUILDINGS = (
+    Path(__file__).parents[3] / "tests" / "fixtures" / "realdata" / "open-buildings.parquet"
+)
+
+
+@settings(max_examples=6, deadline=None)
+@given(extent=st.integers(min_value=256, max_value=8192))
+def test_accepted_extent_builds_an_archive(extent: int) -> None:
+    """An accepted extent is not just unrefused: a real export honors it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ovr, pm = Path(tmp) / "o.parquet", Path(tmp) / "o.pmtiles"
+        tylertoo.overview(
+            str(BUILDINGS), str(ovr), min_zoom=13, max_zoom=14, polygon_visibility=0.0
+        )
+        report = tylertoo.export_pmtiles(str(ovr), str(pm), extent=extent)
+        assert report["total_tiles"] > 0
+        assert pm.read_bytes()[:8] == b"PMTiles\x03"

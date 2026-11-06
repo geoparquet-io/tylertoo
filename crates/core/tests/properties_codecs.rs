@@ -97,14 +97,14 @@ proptest! {
     }
 
     #[test]
-    fn tile_id_round_trips(z in 0u8..=20, fx in 0.0f64..1.0, fy in 0.0f64..1.0) {
+    fn tile_id_round_trips(z in 0u8..=31, fx in 0.0f64..1.0, fy in 0.0f64..1.0) {
         let n = tiles_per_axis(z);
         let (x, y) = (((n as f64 * fx) as u64).min(n - 1) as u32, ((n as f64 * fy) as u64).min(n - 1) as u32);
         prop_assert_eq!(tile_id_to_zxy(tile_id(z, x, y)).unwrap(), (z, x, y));
     }
 
     #[test]
-    fn tile_bounds_are_ordered_and_tile_the_world(z in 0u8..=20, fx in 0.0f64..1.0, fy in 0.0f64..1.0) {
+    fn tile_bounds_are_ordered_and_tile_the_world(z in 0u8..=30, fx in 0.0f64..1.0, fy in 0.0f64..1.0) {
         let n = tiles_per_axis(z);
         prop_assert_eq!(n, 1u64 << z);
         let x = ((n as f64 * fx) as u64).min(n - 1) as u32;
