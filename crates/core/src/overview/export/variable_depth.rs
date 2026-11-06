@@ -53,6 +53,10 @@ pub(crate) fn check_options(options: &ExportOptions) -> Result<(), ConfigError> 
         Some("--tile-range (a sharded build)".to_string())
     } else if options.zoom_ceiling.is_some() {
         Some("--zoom-ceiling (a sharded build)".to_string())
+    } else if options.tile_size_limit.is_none_or(|l| l == 0) {
+        // Without it, one candidate holds the whole canonical band, encoded
+        // in full before the gzip cap can reject it. tippecanoe always caps.
+        Some("--max-tile-size 0 (the probe needs the raw tile size cap)".to_string())
     } else {
         None
     };
@@ -1311,6 +1315,22 @@ mod tests {
                 },
                 "--zoom-ceiling",
             ),
+            // Without a raw cap one candidate is the whole canonical band.
+            (
+                ExportOptions {
+                    tile_size_limit: None,
+                    ..vd()
+                },
+                "--max-tile-size 0",
+            ),
+            (
+                ExportOptions {
+                    tile_size_limit: Some(0),
+                    compressed_tile_size_limit: None,
+                    ..vd()
+                },
+                "--max-tile-size 0",
+            ),
         ];
         for (options, needle) in cases {
             let out = dir.path().join("out.pmtiles");
@@ -1943,7 +1963,7 @@ mod tests {
         let (_, tiles) = export_vd(&ov, raw_cap(40));
         assert!(stopped(&tiles, 6).is_empty());
         let gzip = ExportOptions {
-            tile_size_limit: None,
+            tile_size_limit: Some(usize::MAX),
             compressed_tile_size_limit: Some(40),
             ..ExportOptions::default()
         };
@@ -2030,7 +2050,7 @@ mod tests {
         let v: Vec<f64> = (0..20).map(f64::from).collect();
         let ov = overview_v(dir.path(), &geoms, &v, 6, ConvertOptions::default());
         let gzip = ExportOptions {
-            tile_size_limit: None,
+            tile_size_limit: Some(usize::MAX),
             compressed_tile_size_limit: Some(40),
             ..ExportOptions::default()
         };

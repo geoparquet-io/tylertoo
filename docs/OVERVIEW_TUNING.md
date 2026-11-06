@@ -193,9 +193,10 @@ stored max zoom, tiles probed and stopped) and `stopped_tiles` per zoom.
 
 **Refused combinations**, before any output is written: shards and
 `--tile-range`, `--zoom-ceiling` and partial overview files, partitioning
-mode, `--coverage-fill`, extents other than 4096, `--polygon-thinning` above
-0, a non-default `--line-thinning`, `--drop-lines`, `--drop-polygons`, and
-an entry-zoom ladder whose rungs the overview omits. `pyramid` does not take
+mode, `--coverage-fill`, extents other than 4096, `--max-tile-size 0` (the
+raw cap bounds each probe), `--polygon-thinning` above 0, a non-default
+`--line-thinning`, `--drop-lines`, `--drop-polygons`, and an entry-zoom
+ladder whose rungs the overview omits. `pyramid` does not take
 the flag, and `merge` and `pyramid` refuse an archive that carries the
 marker: their tiles would hide its stopped ones.
 

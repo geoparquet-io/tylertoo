@@ -1651,8 +1651,8 @@ impl PyramidOptions {
         self.convert
             .validate()
             .map_err(|e| Error::InvalidConfig(format!("band convert options: {e}")))?;
-        self.export.validate()?;
-        check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
+        // Before the export's own checks, which would name an export option
+        // the bands' verbatim defaults turn off.
         if self.export.variable_depth {
             return Err(
                 crate::overview::config::ConfigError::VariableDepthConflict {
@@ -1661,6 +1661,8 @@ impl PyramidOptions {
                 .into(),
             );
         }
+        self.export.validate()?;
+        check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
         Ok(())
     }
 }
