@@ -172,7 +172,23 @@ pub(super) fn available_memory_bytes() -> Option<u64> {
         reason = "#455: cache the memory probe; fresh hard-limit preflights remain separate"
     )]
     static CACHED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(probe_available_memory_bytes)
+    available_memory_bytes_in(&CACHED, auto_mem_limit_override())
+}
+
+/// [`available_memory_bytes`] over an explicit cache and override. The
+/// override is never cached: it is read on every call, so a long-lived
+/// process (Python) that sets or clears `TYLERTOO_AUTO_MEM_LIMIT_BYTES`
+/// after its first conversion is honoured, and a cached machine figure never
+/// outlives the override that was in force when it was probed (#708 follow-up).
+#[expect(
+    clippy::disallowed_types,
+    reason = "#455: the memory probe cache, injectable so the override can be tested"
+)]
+fn available_memory_bytes_in(
+    cache: &std::sync::OnceLock<Option<u64>>,
+    over: Option<u64>,
+) -> Option<u64> {
+    over.or_else(|| *cache.get_or_init(probe_machine_memory_bytes))
 }
 
 #[cfg(test)]
@@ -199,13 +215,9 @@ fn auto_mem_limit_override() -> Option<u64> {
         .ok()
 }
 
-/// The uncached probe behind [`available_memory_bytes`]. Split out so the unit
-/// tests — which drive the readers against fixture trees — never depend on
-/// (or poison) the process-wide cache.
-fn probe_available_memory_bytes() -> Option<u64> {
-    if let Some(n) = auto_mem_limit_override() {
-        return Some(n);
-    }
+/// The uncached machine/cgroup probe, without the override: what the
+/// process-wide cache holds.
+fn probe_machine_memory_bytes() -> Option<u64> {
     let machine = read_proc_mem_available();
     let cgroup = cgroup_memory_limit_bytes();
     effective_available(machine, cgroup)
@@ -2542,6 +2554,27 @@ mod cgroup_tests {
     use tempfile::TempDir;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The env override is not frozen by the cache: set after the cache is
+    /// populated it wins, and cleared again the cached figure returns. This
+    /// is what made Python's later `TYLERTOO_AUTO_MEM_LIMIT_BYTES` a no-op.
+    #[test]
+    #[expect(clippy::disallowed_types, reason = "#455: exercises the probe cache")]
+    fn override_is_honoured_after_the_cache_is_populated() {
+        let cache = std::sync::OnceLock::new();
+        assert_eq!(available_memory_bytes_in(&cache, None), cache_value(&cache));
+        let machine = *cache.get().unwrap();
+        assert_eq!(
+            available_memory_bytes_in(&cache, Some(1 << 20)),
+            Some(1 << 20)
+        );
+        assert_eq!(available_memory_bytes_in(&cache, None), machine);
+    }
+
+    #[expect(clippy::disallowed_types, reason = "#455: exercises the probe cache")]
+    fn cache_value(cache: &std::sync::OnceLock<Option<u64>>) -> Option<u64> {
+        *cache.get().unwrap()
+    }
 
     /// Write `contents` to `root/rel`, creating parent directories.
     fn write_file(root: &Path, rel: &str, contents: &str) -> PathBuf {
