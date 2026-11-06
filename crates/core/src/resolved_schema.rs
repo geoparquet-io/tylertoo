@@ -134,9 +134,7 @@ impl ResolvedSchema {
         );
         let version = geo
             .as_ref()
-            .and_then(|g| g.get("version"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
+            .and_then(declared_version)
             .or_else(|| native.as_ref().map(|_| "2.0.0".to_owned()));
         let covering = geo_json
             .as_deref()
@@ -798,10 +796,11 @@ pub(crate) fn geo_version_disposition(version: Option<&str>) -> GeoVersionDispos
 ///
 /// Carried by the report and serialized as `{"status": "missing" | "known" | "unknown" |
 /// "mixed", "version": ...}`: `version` is the version string for `known`
-/// and `unknown`, the sorted distinct versions (`"missing"` for a part with
+/// and `unknown`, the sorted distinct versions (`null` for a part with
 /// none) for `mixed`, and absent for `missing`. `known` means every part
 /// declares the same version, and its major is one this reader knows (1, 2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 #[serde(tag = "status", content = "version", rename_all = "snake_case")]
 pub enum GeoVersion {
     /// No part declares a version.
@@ -811,7 +810,7 @@ pub enum GeoVersion {
     /// All parts declare this one version, of a major this reader does not know.
     Unknown(String),
     /// The parts disagree (including some declaring none).
-    Mixed(Vec<String>),
+    Mixed(Vec<Option<String>>),
 }
 
 impl GeoVersion {
@@ -826,13 +825,19 @@ impl GeoVersion {
                 }
                 Some(v) => Self::Unknown(v.to_owned()),
             },
-            _ => Self::Mixed(
-                distinct
-                    .iter()
-                    .map(|v| v.unwrap_or("missing").to_owned())
-                    .collect(),
-            ),
+            _ => Self::Mixed(distinct.iter().map(|v| v.map(str::to_owned)).collect()),
         }
+    }
+}
+
+/// The `geo` metadata's declared `version`, the one source for both the
+/// warning and the report. A non-string value (`1.1`, `true`, `null`) is
+/// present but not a version string: it is kept as `"non-string <json>"`,
+/// which classifies as unknown, never as missing (#708).
+fn declared_version(geo_json: &Value) -> Option<String> {
+    match geo_json.get("version")? {
+        Value::String(s) => Some(s.clone()),
+        other => Some(format!("non-string {other}")),
     }
 }
 
@@ -845,13 +850,8 @@ impl GeoVersion {
 fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnostics) {
     // A non-string `version` (`1.1`, `true`, an object) is present but not a
     // version: unknown, not "missing" (#708).
-    let raw = geo_json.get("version");
-    let version = raw.and_then(Value::as_str);
-    let disposition = match raw {
-        Some(v) if !v.is_string() => GeoVersionDisposition::Unknown,
-        _ => geo_version_disposition(version),
-    };
-    match disposition {
+    let version = declared_version(geo_json);
+    match geo_version_disposition(version.as_deref()) {
         GeoVersionDisposition::Known => {}
         GeoVersionDisposition::Missing => {
             diagnostics.once(crate::diagnostics::Diagnostic::CrsMetadata {
@@ -862,11 +862,7 @@ fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnost
         GeoVersionDisposition::Unknown => {
             // The version is untrusted input headed for a log line;
             // {:?} escapes it and the cap keeps a pathological value short.
-            let version = version.map_or_else(
-                || raw.map_or_else(String::new, Value::to_string),
-                str::to_owned,
-            );
-            let shown: String = version.chars().take(64).collect();
+            let shown: String = version.unwrap_or_default().chars().take(64).collect();
             diagnostics.once(crate::diagnostics::Diagnostic::CrsMetadata {
                 count: 1,
                 reason: crate::diagnostics::CrsWarning::UnknownVersion(shown),

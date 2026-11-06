@@ -496,11 +496,11 @@ fn geo_version_folds_parts() {
     assert_eq!(f(&[Some("3.0.0")]), Unknown("3.0.0".into()));
     assert_eq!(
         f(&[Some("3.0.0"), Some("1.1.0")]),
-        Mixed(vec!["1.1.0".into(), "3.0.0".into()])
+        Mixed(vec![Some("1.1.0".into()), Some("3.0.0".into())])
     );
     assert_eq!(
         f(&[Some("1.1.0"), None]),
-        Mixed(vec!["missing".into(), "1.1.0".into()])
+        Mixed(vec![None, Some("1.1.0".into())])
     );
     let json = serde_json::to_value(Known("2.0.0".to_string())).unwrap();
     assert_eq!(
@@ -510,5 +510,34 @@ fn geo_version_folds_parts() {
     assert_eq!(
         serde_json::to_value(Missing).unwrap(),
         serde_json::json!({"status": "missing"})
+    );
+}
+
+/// #708: a non-string `version` is "unknown" in the warning AND the report
+/// (one classifier), and a declared "missing" is not a missing version.
+#[test]
+fn numeric_geo_version_is_unknown_in_the_warning_and_the_report() {
+    use super::GeoVersion;
+    let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "id",
+        arrow_schema::DataType::Int64,
+        false,
+    )])
+    .with_metadata(
+        [(
+            "geo".to_string(),
+            r#"{"version":1.1,"primary_column":"geometry","columns":{"geometry":{"crs":"EPSG:4326"}}}"#
+                .to_string(),
+        )]
+        .into(),
+    );
+    let resolved = super::ResolvedSchema::resolve(&schema).unwrap();
+    assert_eq!(
+        GeoVersion::of_parts([resolved.version()]),
+        GeoVersion::Unknown("non-string 1.1".into())
+    );
+    assert_eq!(
+        serde_json::to_value(GeoVersion::Mixed(vec![None, Some("missing".into())])).unwrap(),
+        serde_json::json!({"status": "mixed", "version": [null, "missing"]})
     );
 }

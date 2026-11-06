@@ -2277,7 +2277,7 @@ mod tests {
         );
         assert_eq!(
             verdict,
-            GeoVersion::Mixed(vec!["1.1.0".into(), "3.0.0".into()])
+            GeoVersion::Mixed(vec![Some("1.1.0".into()), Some("3.0.0".into())])
         );
     }
 

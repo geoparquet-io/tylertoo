@@ -129,7 +129,16 @@ pub(crate) fn classify_crs_identifier(id: &str) -> CrsKind {
     }
     // A WKT projected CRS embeds its WGS 84 base (`ID["EPSG",4326]`): metres,
     // not degrees (#708).
-    if up.contains("PROJCRS") || up.contains("PROJCS") || up.contains("BASEGEOGCRS") {
+    if [
+        "PROJCRS",
+        "PROJECTEDCRS",
+        "PROJCS",
+        "BASEGEOGCRS",
+        "BASEGEODCRS",
+    ]
+    .iter()
+    .any(|k| up.contains(k))
+    {
         return CrsKind::Unknown;
     }
     // 2. Explicit lon/lat identifiers, including the URN/URL spellings
@@ -845,6 +854,8 @@ mod tests {
     fn wkt_projected_crs_embedding_4326_is_not_wgs84() {
         let utm = r#"PROJCRS["WGS 84 / UTM zone 33N",BASEGEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],ID["EPSG",4326]],CONVERSION["UTM zone 33N",METHOD["Transverse Mercator"]],ID["EPSG",32633]]"#;
         assert_eq!(classify_crs_identifier(utm), CrsKind::Unknown);
+        let long = r#"PROJECTEDCRS["WGS 84 / UTM zone 33N",BASEGEODCRS["WGS 84",ID["EPSG",4326]],ID["EPSG",32633]]"#;
+        assert_eq!(classify_crs_identifier(long), CrsKind::Unknown);
         let geog = r#"GEOGCRS["WGS 84",DATUM["World Geodetic System 1984"],ID["EPSG",4326]]"#;
         assert_eq!(classify_crs_identifier(geog), CrsKind::Wgs84);
     }
