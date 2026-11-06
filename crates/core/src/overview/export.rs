@@ -2277,7 +2277,21 @@ fn export_pmtiles_validated(
     let rss_sampler = RssSampler::start_if(profile_json_target().is_some(), "scan");
     let t_scan = Instant::now();
     let timers = Arc::<ExportTimers>::default();
-    let mut scans = scan_all_levels(&reader, crs, &meta, options, &timers, diagnostics)?;
+    // #803: rule A′ is gathered in the same read.
+    let mut vd_scan = options
+        .variable_depth
+        .then(|| {
+            variable_depth::VdScan::new(&meta, reader.geo_metadata_json(), level_zooms.clone())
+        })
+        .transpose()?;
+    let mut scans = scan_all_levels(
+        &reader,
+        crs,
+        options,
+        &timers,
+        vd_scan.as_mut(),
+        diagnostics,
+    )?;
 
     // #498: a sharded build's export owns a slice of the tile space, not all
     // of it. Restricting the SCAN — the per-zoom tile-count map every
@@ -2286,6 +2300,8 @@ fn export_pmtiles_validated(
     // out-of-range tile is never planned, so it is never clipped, encoded,
     // hashed or read for.
     restrict_scans_to_range(&mut scans, &level_zooms, options);
+    // #803: rule A′'s blocked tiles, once every band is counted.
+    let _vd_plan = vd_scan.map(|vd| vd.finish(&scans));
     let scans = scans;
 
     let mut overall_bounds: Option<TileBounds> = None;
@@ -5009,9 +5025,9 @@ fn encode_buckets(
 fn scan_all_levels(
     reader: &OverviewReader,
     crs: Crs,
-    meta: &OverviewsMeta,
     opts: &ExportOptions,
     timers: &ExportTimers,
+    mut vd: Option<&mut variable_depth::VdScan>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<LevelScan>, ExportError> {
     let t_scan = Instant::now();
@@ -5025,23 +5041,32 @@ fn scan_all_levels(
     };
     let source = ScanBboxSource::for_reader(reader);
     if matches!(source, ScanBboxSource::Covering { .. }) {
-        if let Some(scans) =
-            scan_all_levels_from(reader, crs, meta, opts, timers, &source, diagnostics)?
-        {
+        if let Some(scans) = scan_all_levels_from(
+            reader,
+            crs,
+            opts,
+            timers,
+            &source,
+            vd.as_deref_mut(),
+            diagnostics,
+        )? {
             return Ok(done(scans, "bbox covering"));
         }
         log::info!(
             "[export] the bbox covering has an empty or non-finite row; \
              rescanning from the geometry"
         );
+        if let Some(vd) = vd.as_deref_mut() {
+            vd.reset();
+        }
     }
     let scans = scan_all_levels_from(
         reader,
         crs,
-        meta,
         opts,
         timers,
         &ScanBboxSource::Geometry,
+        vd,
         diagnostics,
     )?
     .expect("a geometry scan never abandons its pass");
@@ -5089,16 +5114,16 @@ impl ScanBboxSource {
 fn scan_all_levels_from(
     reader: &OverviewReader,
     crs: Crs,
-    meta: &OverviewsMeta,
     opts: &ExportOptions,
     timers: &ExportTimers,
     source: &ScanBboxSource,
+    mut vd: Option<&mut variable_depth::VdScan>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<Vec<LevelScan>>, ExportError> {
     let num_levels = reader.num_levels();
     let partitioning = matches!(reader.mode(), Mode::Partitioning);
     let zooms: Vec<u8> = (0..num_levels)
-        .map(|k| zoom_for_level(meta, k))
+        .map(|k| zoom_for_level(reader.meta(), k))
         .collect::<Result<_, _>>()?;
     let mut scans: Vec<LevelScan> = (0..num_levels)
         .map(|_| LevelScan {
@@ -5131,6 +5156,24 @@ fn scan_all_levels_from(
         ScanBboxSource::Covering { column, .. } => reader.schema().index_of(column).ok(),
         ScanBboxSource::Geometry => reader.resolved_schema().geometry_index(),
     };
+    // #803: rule A′ also reads the cluster and release columns, and a mixed
+    // band's geometry for its rows' kinds.
+    let roots: Option<Vec<usize>> = root.map(|r| {
+        let mut roots = vec![r];
+        if let Some(vd) = vd.as_deref() {
+            roots.extend(
+                vd.columns()
+                    .into_iter()
+                    .filter_map(|name| reader.schema().index_of(name).ok()),
+            );
+            if vd.needs_geometry() {
+                roots.extend(reader.resolved_schema().geometry_index());
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        roots
+    });
     let scans_ref = &mut scans;
     let zooms_ref = &zooms;
     let mut abandoned = false;
@@ -5139,8 +5182,8 @@ fn scan_all_levels_from(
         WAVE_READ_IN_FLIGHT,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
             for j in 0..num_levels {
-                let mut band_reader = ExportTimers::time(&timers.scan_read, || match root {
-                    Some(r) => reader.read_band_projected(j, EXPORT_BATCH_SIZE, &[r]),
+                let mut band_reader = ExportTimers::time(&timers.scan_read, || match &roots {
+                    Some(r) => reader.read_band_projected(j, EXPORT_BATCH_SIZE, r),
                     None => reader.read_band_batched(j, EXPORT_BATCH_SIZE),
                 })?;
                 while let Some(batch) = ExportTimers::time(&timers.scan_read, || band_reader.next())
@@ -5175,6 +5218,51 @@ fn scan_all_levels_from(
                     *abandoned_ref = true;
                     return Ok(());
                 };
+                if let Some(vd) = vd.as_deref_mut() {
+                    let geometries = || -> Result<Vec<Option<Geometry<f64>>>, ExportError> {
+                        let geom_idx = batch_geometry_index(&batch, geometry)?;
+                        let field = batch.schema().field(geom_idx).clone();
+                        let garr = from_arrow_array(batch.column(geom_idx).as_ref(), &field)
+                            .map_err(|e| {
+                                crate::Error::GeoParquetRead(format!("geometry decode: {e}"))
+                            })?;
+                        let mut out = Vec::with_capacity(batch.num_rows());
+                        crate::batch_processor::extract_geometries_opt_from_array(
+                            garr.as_ref(),
+                            &mut out,
+                            diagnostics,
+                        )?;
+                        Ok(out)
+                    };
+                    let aligned = || -> Result<Vec<Option<TileBounds>>, ExportError> {
+                        match source {
+                            ScanBboxSource::Covering { column, names } => {
+                                covering_row_bboxes(&batch, column, names, crs)
+                            }
+                            ScanBboxSource::Geometry => Ok(geometries()?
+                                .iter()
+                                .map(|g| {
+                                    g.as_ref().and_then(BoundingRect::bounding_rect).map(|r| {
+                                        lnglat_bbox(r.min().x, r.min().y, r.max().x, r.max().y, crs)
+                                    })
+                                })
+                                .collect()),
+                        }
+                    };
+                    ExportTimers::time(&timers.scan_size, || {
+                        vd.fold(
+                            j,
+                            &batch,
+                            &bboxes,
+                            &variable_depth::RowSource {
+                                bboxes: &aligned,
+                                geometries: &geometries,
+                            },
+                            crs,
+                            opts,
+                        )
+                    })?;
+                }
                 for k in j..=last {
                     let scan = &mut scans_ref[k];
                     scan.feature_count += bboxes.len();
@@ -5259,6 +5347,47 @@ fn covering_batch_bboxes(
         bboxes.push(Some(lnglat_bbox(x0, y0, x1, y1, crs)));
     }
     Ok(Some(bboxes))
+}
+
+/// [`covering_batch_bboxes`] row-aligned: `None` for a null row. Only called
+/// on a batch whose covering rows all passed that function's checks.
+fn covering_row_bboxes(
+    batch: &RecordBatch,
+    column: &str,
+    names: &[String; 4],
+    crs: Crs,
+) -> Result<Vec<Option<TileBounds>>, ExportError> {
+    let not_covering =
+        || crate::Error::GeoParquetRead(format!("bbox covering {column:?} is not an f64 struct"));
+    let strukt = batch
+        .column_by_name(column)
+        .and_then(|c| c.as_struct_opt())
+        .ok_or_else(not_covering)?;
+    let child = |name: &String| {
+        strukt
+            .column_by_name(name)
+            .and_then(|c| c.as_primitive_opt::<Float64Type>())
+            .ok_or_else(not_covering)
+    };
+    let [xmin, ymin, xmax, ymax] = [
+        child(&names[0])?,
+        child(&names[1])?,
+        child(&names[2])?,
+        child(&names[3])?,
+    ];
+    Ok((0..strukt.len())
+        .map(|i| {
+            (!strukt.is_null(i)).then(|| {
+                lnglat_bbox(
+                    xmin.value(i),
+                    ymin.value(i),
+                    xmax.value(i),
+                    ymax.value(i),
+                    crs,
+                )
+            })
+        })
+        .collect())
 }
 
 /// A bbox in the file's CRS as lon/lat [`TileBounds`]: the two corners go
@@ -11641,11 +11770,7 @@ mod tests {
     }
 
     /// Both sources' scans of one file, for every level: (covering, geometry).
-    fn scans_by_source(
-        path: &Path,
-        crs: Crs,
-        meta: &OverviewsMeta,
-    ) -> (Option<Vec<LevelScan>>, Vec<LevelScan>) {
+    fn scans_by_source(path: &Path, crs: Crs) -> (Option<Vec<LevelScan>>, Vec<LevelScan>) {
         let reader = OverviewReader::open(path).unwrap();
         let source = ScanBboxSource::for_reader(&reader);
         assert!(
@@ -11657,20 +11782,20 @@ mod tests {
         let covering = scan_all_levels_from(
             &reader,
             crs,
-            meta,
             &opts,
             &timers,
             &source,
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
         let geometry = scan_all_levels_from(
             &reader,
             crs,
-            meta,
             &opts,
             &timers,
             &ScanBboxSource::Geometry,
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap()
@@ -11699,8 +11824,8 @@ mod tests {
                 // A null geometry: no covering row, no feature on either path.
                 levels[1].push(None);
                 let tmp = tempfile::NamedTempFile::new().unwrap();
-                let meta = write_mode_fixture_opt(tmp.path(), &levels, mode);
-                let (covering, geometry) = scans_by_source(tmp.path(), crs, &meta);
+                write_mode_fixture_opt(tmp.path(), &levels, mode);
+                let (covering, geometry) = scans_by_source(tmp.path(), crs);
                 assert_eq!(
                     covering.as_ref(),
                     Some(&geometry),
@@ -11733,8 +11858,8 @@ mod tests {
         let mut levels = covering_corpus(1.0);
         levels[0].push(Some(Geometry::MultiPolygon(geo::MultiPolygon::new(vec![]))));
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let meta = write_mode_fixture_opt(tmp.path(), &levels, Mode::Partitioning);
-        let (covering, geometry) = scans_by_source(tmp.path(), Crs::Epsg4326, &meta);
+        write_mode_fixture_opt(tmp.path(), &levels, Mode::Partitioning);
+        let (covering, geometry) = scans_by_source(tmp.path(), Crs::Epsg4326);
         assert_eq!(
             covering, None,
             "an empty geometry's covering row must abandon the pass"
@@ -11743,9 +11868,9 @@ mod tests {
         let scans = scan_all_levels(
             &reader,
             Crs::Epsg4326,
-            &meta,
             &ExportOptions::default(),
             &ExportTimers::default(),
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
@@ -11841,8 +11966,8 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let with = dir.path().join("with.parquet");
-        let meta = write_mode_fixture_opt(&with, &levels, Mode::Partitioning);
-        let (covering, geometry) = scans_by_source(&with, Crs::Epsg4326, &meta);
+        write_mode_fixture_opt(&with, &levels, Mode::Partitioning);
+        let (covering, geometry) = scans_by_source(&with, Crs::Epsg4326);
         let covering = covering.expect("an escaping hole is finite: no fallback");
         let finest = levels.len() - 1;
         let (c, g) = (&covering[finest], &geometry[finest]);
@@ -13330,9 +13455,9 @@ mod tests {
         let scans = scan_all_levels(
             &reader,
             Crs::Epsg4326,
-            &meta,
             &opts,
             &ExportTimers::default(),
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
