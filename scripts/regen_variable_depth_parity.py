@@ -48,6 +48,11 @@ def sha256(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def sql_str(p: Path) -> str:
+    """`p` as a SQL string literal (COPY's target can't be a bound parameter)."""
+    return "'" + str(p).replace("'", "''") + "'"
+
+
 def make_inputs(buildings: Path, tmp: Path) -> Path:
     if sha256(buildings) != BUILDINGS_SHA256:
         sys.exit(f"{buildings}: sha256 is not the pinned {BUILDINGS_SHA256}")
@@ -59,12 +64,12 @@ def make_inputs(buildings: Path, tmp: Path) -> Path:
         for x0, y0, x1, y1, n in WINDOWS
     )
     sel = f"""SELECT file_row_number AS id, {cen} AS geometry
-        FROM read_parquet('{buildings}', file_row_number = true) WHERE {where}
+        FROM read_parquet({sql_str(buildings)}, file_row_number = true) WHERE {where}
         ORDER BY file_row_number"""
     FIX.mkdir(parents=True, exist_ok=True)
     pq = tmp / "points.parquet"
-    con.execute(f"COPY ({sel}) TO '{pq}' (FORMAT parquet, COMPRESSION zstd)")
-    con.execute(f"COPY (SELECT * FROM '{pq}') TO '{tmp / 'points.geojsonl'}' WITH (FORMAT gdal, DRIVER 'GeoJSONSeq')")
+    con.execute(f"COPY ({sel}) TO {sql_str(pq)} (FORMAT parquet, COMPRESSION zstd)")
+    con.execute(f"COPY (SELECT * FROM {sql_str(pq)}) TO {sql_str(tmp / 'points.geojsonl')} WITH (FORMAT gdal, DRIVER 'GeoJSONSeq')")
     return pq
 
 
@@ -123,7 +128,7 @@ def build(args, tmp: Path) -> dict:
             "file": "points.parquet",
             "sha256": sha256(pq),
             "geojsonl_sha256": sha256(tmp / "points.geojsonl"),
-            "rows": duckdb.sql(f"select count(*) from '{pq}'").fetchone()[0],
+            "rows": duckdb.sql(f"select count(*) from {sql_str(pq)}").fetchone()[0],
             "source_buildings_sha256": BUILDINGS_SHA256,
             "slice": "centroids of buildings rows (id = row number) in WINDOWS: [xmin, ymin, xmax, ymax, keep row%N==0]",
             "windows": [list(w) for w in WINDOWS],
