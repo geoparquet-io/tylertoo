@@ -888,10 +888,9 @@ mod tests {
             let result = OverviewReader::open(tmp.path());
             if accepted {
                 assert!(meta.validate(1).is_ok());
-                assert!(
-                    matches!(result, Err(ReaderError::Conformance(_))),
-                    "{version}: {result:?}"
-                );
+                // Fails later (fixture has no levels), but never on the version.
+                let message = result.unwrap_err().to_string();
+                assert!(!message.contains("MAJOR"), "{version}: {message}");
             } else {
                 let message = result.unwrap_err().to_string();
                 assert!(

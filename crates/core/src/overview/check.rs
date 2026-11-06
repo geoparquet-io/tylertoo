@@ -193,6 +193,7 @@ pub(crate) fn validate_resolved_metadata(
 
     // --- geo:overviews key present / parses / version / MAJOR (§6.2). --------
     let ov_json = footer_value(metadata, OVERVIEWS_KEY);
+    let mut validated = None;
     let meta: Option<OverviewsMeta> = match ov_json {
         None => {
             report.fail("overviews_key_present", "'geo:overviews' footer key absent");
@@ -213,7 +214,8 @@ pub(crate) fn validate_resolved_metadata(
                         "'geo:overviews' present and parses",
                     );
                     // Validation checks the version before structural invariants.
-                    match meta.validate(num_row_groups as i64) {
+                    let result = meta.validate(num_row_groups as i64);
+                    match &result {
                         Err(OverviewValidationError::InvalidVersion(v)) => report.fail(
                             "overviews_version",
                             format!("version {v:?} is not valid semver"),
@@ -232,6 +234,7 @@ pub(crate) fn validate_resolved_metadata(
                             ),
                         ),
                     }
+                    validated = Some(result);
                     Some(meta)
                 }
             }
@@ -239,8 +242,8 @@ pub(crate) fn validate_resolved_metadata(
     };
 
     // --- structural invariants via level::validate (§3.3, §3.4). ------------
-    if let Some(meta) = &meta {
-        match meta.validate(num_row_groups as i64) {
+    if let (Some(meta), Some(validated)) = (&meta, validated) {
+        match validated {
             Ok(()) => report.pass(
                 "overviews_structure",
                 "levels/gsd/zoom/canonical invariants satisfied",

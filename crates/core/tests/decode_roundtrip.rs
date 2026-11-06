@@ -232,8 +232,9 @@ fn decode_roundtrip_full_archive() {
     assert!(zooms.contains(&MAX_ZOOM), "max-zoom rows present");
     assert!(*zooms.iter().min().unwrap() >= MIN_ZOOM);
     assert!(rows.iter().all(|r| r.layer == "overview"));
-    // Our export writes per-tile sequential MVT feature ids.
-    assert!(rows.iter().all(|r| r.mvt_id.is_some()));
+    // No `--feature-id`: no MVT id (#443, tippecanoe's default). The explicit
+    // path is covered by `assert_feature_id_roundtrip`.
+    assert!(rows.iter().all(|r| r.mvt_id.is_none()));
 
     // Properties survive: id and name paired as in the source.
     for row in &rows {
