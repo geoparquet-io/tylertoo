@@ -89,7 +89,10 @@ fn pyramid_builds_two_bands() {
     let result = success(&["pyramid", s(&out), "--band", &b0, "--band", &b1]);
     assert!(String::from_utf8_lossy(&result.stdout).contains("Built 2 band(s)"));
     let index = tylertoo_core::archive_index::ArchiveIndex::open(&out).unwrap();
-    assert!(index.tiles().count() >= 2);
+    // Bands are z0 and z1: the header and the zooms that really hold tiles
+    // must both span exactly 0..=1, so a dropped band fails.
+    assert_eq!((index.header().min_zoom, index.header().max_zoom), (0, 1));
+    assert_eq!(index.actual_zoom_range().unwrap(), Some((0, 1)));
 }
 
 #[test]
@@ -107,14 +110,19 @@ fn pyramid_has_parity_with_export_flags() {
     }
     let export = longs(ExportPmtilesArgs::command());
     let pyramid = longs(PyramidArgs::command());
-    // Band specifications own layer names and zoom bounds. The other three
-    // export-only flags are not exposed by pyramid's shared option scope.
+    // Band specifications own layer names and zoom bounds. The rest are
+    // exempt for the reasons next to each flag.
     let exemptions: BTreeSet<_> = [
         "layer-name",
         "min-zoom",
         "zoom-ceiling",
+        // Shard option: build_pyramid_validated clones the export options per
+        // band, so one range would hit every band's intermediate archive.
         "tile-range",
+        // Redundant with pyramid's --work-dir, which band export spill falls
+        // back to (pyramid.rs, #427).
         "spill-dir",
+        // Real gap, not an intent: follow-up issue: pyramid --profile
         "profile",
     ]
     .into_iter()
