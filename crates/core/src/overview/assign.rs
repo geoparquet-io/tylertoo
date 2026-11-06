@@ -2460,7 +2460,9 @@ pub(super) fn select_budget_survivors(
         .for_each(|run| run.sort_unstable_by(|a, b| priority_order(features, dir, a.1, b.1)));
     drop(runs);
 
-    let alpha = 1.0 / gamma;
+    // validate_options refuses gamma < 1; the clamp keeps direct library callers
+    // (apply_density_budget, CoalesceParams::budget) on their previous behavior.
+    let alpha = 1.0 / gamma.max(1.0);
     let allocs = water_fill(&pops, available, alpha);
 
     let mut chosen = Vec::with_capacity(available);
@@ -4581,7 +4583,7 @@ mod tests {
         }
         assert!(cells.len() > 1, "the replay must span several super-cells");
         let pops: Vec<usize> = cells.values().map(Vec::len).collect();
-        let allocs = water_fill(&pops, available, 1.0 / gamma);
+        let allocs = water_fill(&pops, available, 1.0 / gamma.max(1.0));
         let mut expected: Vec<usize> = Vec::new();
         for ((_, members), alloc) in cells.iter_mut().zip(allocs) {
             members.sort_unstable_by(|&a, &b| table_order(&prio, a, b));

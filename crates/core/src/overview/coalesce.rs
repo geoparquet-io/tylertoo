@@ -1813,7 +1813,7 @@ mod golden_digest {
         let snap = [0.0, 0.5, 1.0, 3.0][r.below(4) as usize];
         let junction = [0.0, 0.0, 20.0, 45.0, 90.0, 180.0][r.below(6) as usize];
         let budget = if r.below(3) == 0 {
-            Some((1 + r.below(20) as usize, (0.5 + r.f()).max(1.0)))
+            Some((1 + r.below(20) as usize, 0.5 + r.f()))
         } else {
             None
         };

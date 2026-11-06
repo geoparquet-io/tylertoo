@@ -118,3 +118,12 @@ fn drop_gamma_below_one_is_refused() {
         );
     }
 }
+
+#[test]
+fn drop_gamma_is_not_checked_when_the_density_budget_is_off() {
+    let mut o = TilesOptions::default();
+    o.convert.density.enabled = false;
+    o.convert.density.gamma = 0.5;
+    o.validate()
+        .expect("--no-density-drop makes --drop-gamma unused, so it must not be refused");
+}
