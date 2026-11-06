@@ -417,6 +417,17 @@ fi
     assert log.read_text().split() == ["missing", "missing", "missing"]
     assert [r["status"] for r in recs[0]["convert_runs"]] == ["ok"] * 3
     assert recs[1]["export_run"]["status"] == "ok"
+    # Timed by run_manifest's one run path (#810): CPU and effective cores too.
+    assert recs[1]["export_run"]["effective_cores"] is not None
+    assert recs[0]["convert_run"]["cpu_s"] is not None
+
+
+def test_coalesce_times_runs_through_run_manifest():
+    """One owner of timed runs (#810): no second GNU-time parser here."""
+    import run_manifest
+    assert not hasattr(run_matrix, "gnu_elapsed_s")
+    assert not hasattr(run_matrix, "tree_rss_kib")
+    assert run_matrix.rm is run_manifest
 
 
 def test_load_gate_scales_with_cores():

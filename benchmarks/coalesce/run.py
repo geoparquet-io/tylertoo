@@ -64,7 +64,7 @@ SETUP_TIPPECANOE = REPO / "benchmarks" / "e2e" / "setup_tippecanoe.sh"
 CAPPED = ("TIMEOUT", "RSS_CAP")
 # Bump when what run_cell measures or summarize_cell records changes, so
 # cached cells are measured again.
-CELL_VERSION = 2
+CELL_VERSION = 3
 
 
 class ConfigError(ValueError):
@@ -280,6 +280,7 @@ def stage_summary(runs: list[dict]) -> dict:
     return {"wall_s": [r["wall_s"] for r in runs],
             "median_s": median([r["wall_s"] for r in ok]),
             "cpu_s": median([r.get("cpu_s") for r in ok]),
+            "effective_cores": median([r.get("effective_cores") for r in ok]),
             "peak_rss_kib": median([r["peak_rss_kib"] for r in ok]),
             "load_before_max": max(loads) if loads else None}
 
@@ -851,6 +852,7 @@ def tippecanoe_refs(cfg, plan, steps, inputs: Path, work: Path) -> dict:
         lock_rec = {k: v for k, v in lock.items() if k != "binary"}
         rec = {"key": key, "tippecanoe": lock_rec, "args": targs, "gpio": tcfg["gpio"],
                "wall_s": run["wall_s"], "cpu_s": run["cpu_s"],
+               "effective_cores": run.get("effective_cores"),
                "peak_rss_kib": run["peak_rss_kib"], "load_before": load_before,
                "load_wait_s": waited, "load_after": run_matrix.loadavg()}
         if run["status"] != "ok":

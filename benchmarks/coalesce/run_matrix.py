@@ -39,16 +39,17 @@ Results append to <out>/results.jsonl, one JSON object per run.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
-import re
-import signal
 import subprocess
 import sys
-import threading
+import tempfile
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import run_manifest as rm  # noqa: E402
 
 # Spelled for the #745 defaults (density budget on points only, placeholder
 # squares, merge valve). The G0-G2 results in RESULTS.md were taken with the
@@ -116,8 +117,8 @@ LOAD_MAX = default_load_max(os.cpu_count())
 LOAD_WAIT_S = 1800
 
 
-def loadavg() -> float:
-    return float(Path("/proc/loadavg").read_text().split()[0])
+loadavg = rm.loadavg1
+sha256 = rm.sha256_file
 
 
 def wait_for_quiet() -> tuple[float, float]:
@@ -127,87 +128,14 @@ def wait_for_quiet() -> tuple[float, float]:
     return loadavg(), round(time.monotonic() - t0, 1)
 
 
-def tree_rss_kib(pid: int) -> int:
-    """Resident KiB of pid and every descendant, walking /proc/<pid>/task/*/
-    children so the cost is the tree's size, not the whole process table."""
-    total, stack = 0, [pid]
-    while stack:
-        p = stack.pop()
-        try:
-            for line in Path(f"/proc/{p}/status").read_text().splitlines():
-                if line.startswith("VmRSS:"):
-                    total += int(line.split()[1])
-                    break
-            for task in Path(f"/proc/{p}/task").iterdir():
-                stack.extend(int(c) for c in (task / "children").read_text().split())
-        except (OSError, ValueError):
-            pass
-    return total
-
-
-def gnu_elapsed_s(stderr: str) -> float | None:
-    """GNU time's wall clock, `h:mm:ss` or `m:ss.ss`."""
-    m = re.search(r"Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*([\d:.]+)", stderr)
-    if not m:
-        return None
-    secs = 0.0
-    for part in m.group(1).split(":"):
-        secs = secs * 60 + float(part)
-    return secs
-
-
 def run_capped(argv: list[str], wall_s: float, rss_gib: float, env: dict | None = None) -> dict:
-    """Run argv under GNU time with a wall and an RSS cap. A cap kills the
-    whole process group and is reported, not raised."""
-    cap_kib = int(rss_gib * 1024 * 1024)
-    t0 = time.monotonic()
-    proc = subprocess.Popen(
-        ["/usr/bin/time", "-v", *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env=env, start_new_session=True,
-    )
-    outcome = {"status": None, "peak_poll_kib": 0}
-
-    def watch():
-        while proc.poll() is None:
-            rss = tree_rss_kib(proc.pid)
-            outcome["peak_poll_kib"] = max(outcome["peak_poll_kib"], rss)
-            elapsed = time.monotonic() - t0
-            reason = "RSS_CAP" if rss > cap_kib else "TIMEOUT" if elapsed > wall_s else None
-            if reason:
-                outcome["status"] = reason
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                return
-            time.sleep(0.1)
-
-    watcher = threading.Thread(target=watch, daemon=True)
-    watcher.start()
-    stdout, stderr = proc.communicate()
-    wall_poll = time.monotonic() - t0
-    watcher.join()
-    m = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", stderr)
-    user = re.search(r"User time \(seconds\):\s*([\d.]+)", stderr)
-    sys_t = re.search(r"System time \(seconds\):\s*([\d.]+)", stderr)
-    status = outcome["status"] or ("ok" if proc.returncode == 0 else "FAILED")
-    wall = gnu_elapsed_s(stderr) if status == "ok" else None
-    return {
-        "argv": argv,
-        "status": status,
-        "wall_s": round(wall if wall is not None else wall_poll, 3),
-        "cpu_s": round(float(user.group(1)) + float(sys_t.group(1)), 2) if user and sys_t else None,
-        "peak_rss_kib": int(m.group(1)) if m and status == "ok" else outcome["peak_poll_kib"],
-        "stderr_tail": stderr[-3000:] if status != "ok" else None,
-    }
-
-
-def sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    """Run argv with a wall and an RSS cap through run_manifest's one timed-run
+    path (#810): GNU time's wall, user+sys CPU, effective cores and peak RSS.
+    A cap kills the whole process group and is reported, not raised."""
+    with tempfile.TemporaryDirectory(prefix="run-matrix-") as d:
+        caps = {"wall_s": wall_s, "rss_gib": rss_gib, "scratch_gib": 0}
+        res = rm.run_capped(["/usr/bin/time", "-v", *argv], caps, env, Path(d) / "log.txt", None)
+    return {"argv": argv, **res}
 
 
 def last_json_line(path: Path) -> dict | None:
