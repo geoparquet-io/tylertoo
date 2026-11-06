@@ -2340,7 +2340,7 @@ fn export_pmtiles_validated(
     // hashed or read for.
     restrict_scans_to_range(&mut scans, &level_zooms, options);
     // #803: rule A′'s blocked tiles, once every band is counted.
-    let vd_plan = vd_scan.map(|vd| vd.finish(&scans));
+    let vd_plan = vd_scan.map(|vd| vd.finish(&scans, options));
 
     let mut overall_bounds: Option<TileBounds> = None;
     for scan in &scans {

@@ -324,16 +324,15 @@ fn add_counts(into: &mut HashMap<u64, usize>, from: HashMap<u64, usize>) {
     }
 }
 
-/// Rows per task in [`member_runs`]: a batch's rows, sized at every zoom,
-/// in a few dozen tasks rather than one `par_iter` per zoom.
-const RUN_ROWS: usize = 256;
+/// Rows per task in [`member_runs`], each sized at every zoom.
+const RUN_ROWS: usize = 4096;
 
 /// Sizes rows at every zoom in `zooms` in one parallel pass, with the same
 /// members as [`tile_keys`]: per task, per zoom, `(key, members)` runs.
 /// Rows come in spatial order, so most consecutive members share a tile at
 /// a coarse zoom and fold into one run instead of one hash update each.
 fn member_runs(
-    bboxes: &[Option<TileBounds>],
+    bboxes: &[TileBounds],
     zooms: &[u8],
     opts: &ExportOptions,
 ) -> Vec<Vec<Vec<(u64, usize)>>> {
@@ -344,11 +343,8 @@ fn member_runs(
     bboxes
         .par_chunks(RUN_ROWS)
         .map(|chunk| {
-            let rows: Vec<(TileBounds, RowY)> = chunk
-                .iter()
-                .flatten()
-                .map(|b| (*b, RowY::new(b, widest)))
-                .collect();
+            let rows: Vec<(TileBounds, RowY)> =
+                chunk.iter().map(|b| (*b, RowY::new(b, widest))).collect();
             zooms
                 .iter()
                 .map(|&zoom| {
@@ -473,6 +469,10 @@ pub(super) struct VdScan {
     /// The canonical band's point rows at each level's zoom, when the band
     /// is mixed.
     canonical_points: Vec<HashMap<u64, usize>>,
+    /// The canonical band's bboxes, and its point rows' when it is mixed,
+    /// until `finish` sizes them.
+    canonical_rows: Vec<TileBounds>,
+    canonical_point_rows: Vec<TileBounds>,
     /// Each mixed band's point rows at its own zoom.
     level_points: Vec<HashMap<u64, usize>>,
     /// Bad tiles found while reading: clusters and early releases.
@@ -521,6 +521,8 @@ impl VdScan {
             release: EntryRungs::from_meta(meta)?.map(|r| Box::new(r) as Box<dyn RowRelease>),
             canonical_counts: vec![HashMap::new(); n],
             canonical_points: vec![HashMap::new(); n],
+            canonical_rows: Vec::new(),
+            canonical_point_rows: Vec::new(),
             level_points: vec![HashMap::new(); n],
             bad: Vec::new(),
             zooms,
@@ -533,6 +535,8 @@ impl VdScan {
         let n = self.zooms.len();
         self.canonical_counts = vec![HashMap::new(); n];
         self.canonical_points = vec![HashMap::new(); n];
+        self.canonical_rows = Vec::new();
+        self.canonical_point_rows = Vec::new();
         self.level_points = vec![HashMap::new(); n];
         self.bad.clear();
     }
@@ -606,17 +610,12 @@ impl VdScan {
                 .collect()
         };
         if canonical {
-            let first = self.first_probed;
-            let coarser = &self.zooms[first..self.canonical];
-            add_runs(
-                &mut self.canonical_counts[first..],
-                member_runs(bboxes, coarser, opts),
-            );
+            // Sized at every coarser zoom in `finish`, in one pass: per
+            // batch, the fork-join costs more than the sizing.
+            self.canonical_rows.extend(bboxes.iter().flatten());
             if let Some((_, flags)) = decoded.as_ref().filter(|_| mixed) {
-                add_runs(
-                    &mut self.canonical_points[first..],
-                    member_runs(&points(flags), coarser, opts),
-                );
+                self.canonical_point_rows
+                    .extend(points(flags).into_iter().flatten());
             }
             if let Some(release) = &self.release {
                 let zooms = release.release_zooms(batch, aligned);
@@ -668,7 +667,21 @@ impl VdScan {
 
     /// Compare every band's point counts with the canonical band's, and
     /// build the policy. `scans` are the scan's own per-level results.
-    pub(super) fn finish(mut self, scans: &[LevelScan]) -> VdPlan {
+    pub(super) fn finish(mut self, scans: &[LevelScan], opts: &ExportOptions) -> VdPlan {
+        let first = self.first_probed;
+        let coarser = &self.zooms[first..self.canonical];
+        add_runs(
+            &mut self.canonical_counts[first..],
+            member_runs(&std::mem::take(&mut self.canonical_rows), coarser, opts),
+        );
+        add_runs(
+            &mut self.canonical_points[first..],
+            member_runs(
+                &std::mem::take(&mut self.canonical_point_rows),
+                coarser,
+                opts,
+            ),
+        );
         let mut policy = StopPolicy::default();
         for (zoom, key) in std::mem::take(&mut self.bad) {
             policy.block(zoom, key);
@@ -1205,7 +1218,8 @@ mod tests {
             let opts = ExportOptions::default();
             let zooms: Vec<u8> = zooms.collect();
             let mut fused = vec![std::collections::HashMap::new(); zooms.len()];
-            super::add_runs(&mut fused, super::member_runs(&bboxes, &zooms, &opts));
+            let rows: Vec<TileBounds> = bboxes.iter().flatten().copied().collect();
+            super::add_runs(&mut fused, super::member_runs(&rows, &zooms, &opts));
             for (k, &z) in zooms.iter().enumerate() {
                 assert_eq!(fused[k], super::tile_keys(&bboxes, z, &opts), "z{z}");
             }
@@ -1456,7 +1470,7 @@ mod tests {
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
-        scan.finish(&scans)
+        scan.finish(&scans, &vd())
     }
 
     /// The key of the tile holding `(lng, lat)` at `zoom`.
