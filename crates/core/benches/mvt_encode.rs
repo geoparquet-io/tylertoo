@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{Coord, Geometry, LineString, Point, Polygon};
-use tylertoo_core::mvt::{encode_polygon, LayerBuilder, PropertyValue};
-use tylertoo_core::tile::TileBounds;
+use tylertoo_core::internal::mvt::{encode_polygon, LayerBuilder, PropertyValue};
+use tylertoo_core::internal::tile::TileBounds;
 
 /// Path to the Antarctica polygon fixture (316k coords). Encoded unclipped,
 /// its quantized ring stays far above `NODE_MAX_EDGES` (4096), so it times
@@ -68,7 +68,7 @@ fn bench_encode_polygon(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_polygon");
     // Hoisted: building the sink inside the timed closure charged its
     // allocation to every iteration (#773).
-    let diag = tylertoo_core::diagnostics::Diagnostics::default();
+    let diag = tylertoo_core::internal::diagnostics::Diagnostics::default();
     group.measurement_time(Duration::from_secs(4));
     group.sample_size(30);
 
@@ -154,7 +154,7 @@ fn bench_value_dedup(c: &mut Criterion) {
     let mut group = c.benchmark_group("layer_value_dedup");
     // Hoisted: building the sink inside the timed closure charged its
     // allocation to every iteration (#773).
-    let diag = tylertoo_core::diagnostics::Diagnostics::default();
+    let diag = tylertoo_core::internal::diagnostics::Diagnostics::default();
     group.measurement_time(Duration::from_secs(4));
     group.sample_size(30);
 

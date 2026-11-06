@@ -36,7 +36,7 @@ use geoparquet::writer::{
 use tylertoo_io::open_parquet;
 use tylertoo_io::test_support::ArrowWriter;
 
-use tylertoo_core::batch_processor::extract_geometries_from_array;
+use tylertoo_core::internal::batch_processor::extract_geometries_from_array;
 
 const LON: f64 = 10.0;
 const LAT: f64 = 50.0;
@@ -137,7 +137,7 @@ fn read_decoded(path: &Path) -> Vec<(u8, i64, Geometry<f64>)> {
         extract_geometries_from_array(
             garr.as_ref(),
             &mut geoms,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
         )
         .unwrap();
         for (i, g) in geoms.into_iter().enumerate() {
@@ -148,9 +148,11 @@ fn read_decoded(path: &Path) -> Vec<(u8, i64, Geometry<f64>)> {
 }
 
 fn round_trip(geom_name: &str, centroid: Option<&str>) {
-    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
-    use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+    use tylertoo_core::internal::decode::{decode_pmtiles, DecodeOptions};
+    use tylertoo_core::internal::overview::convert::{
+        convert_to_overviews, ConvertOptions, LevelPlan,
+    };
+    use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
 
     let case = format!("geometry column {geom_name:?}, centroid column {centroid:?}");
     let geoms = squares();
@@ -163,13 +165,10 @@ fn round_trip(geom_name: &str, centroid: Option<&str>) {
     convert_to_overviews(
         &input,
         &overview,
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 4,
-                max_zoom: MAX_ZOOM,
-            },
-            ..Default::default()
-        },
+        &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+            min_zoom: 4,
+            max_zoom: MAX_ZOOM,
+        }),
     )
     .unwrap_or_else(|e| panic!("convert with {case}: {e}"));
 

@@ -21,7 +21,7 @@ overview(
     *,
     mode: Literal['duplicating', 'partitioning'] = "duplicating",
     min_zoom: int = 0,
-    max_zoom: int | Literal['auto'] = 6,
+    max_zoom: int | str = 6,
     gsds: Sequence[float] | None = None,
     gsd_base: float = 1024.0,
     sort_key: str | None = None,
@@ -63,7 +63,6 @@ overview(
     row_group_size: int = 10_000,
     row_group_size_policy: Literal['constant', 'zoom-scaled'] = "constant",
     full_column_stats: bool = False,
-    streaming: bool = True,
     read_batch_size: int = 8192,
     bbox: tuple[float, float, float, float] | None = None,
     filter: str | None = None,
@@ -86,7 +85,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `output`: Overview file to write.
 * `mode`: `"duplicating"` makes each level a complete map; `"partitioning"` stores each feature once.
 * `min_zoom`: Coarsest zoom.
-* `max_zoom`: Finest zoom, or `"auto"` to estimate it (at most 16).
+* `max_zoom`: Finest zoom, `"auto"` to estimate it (at most 16), or `"auto:14"` to cap the estimate at z14.
 * `gsds`: Per-level GSDs in meters, coarse to fine, instead of zooms.
 * `gsd_base`: Pixels per tile edge when mapping zooms to GSDs. A larger base keeps more detail.
 
@@ -146,7 +145,6 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `row_group_size`: Maximum rows per output row group.
 * `row_group_size_policy`: `"constant"`, or `"zoom-scaled"` to double the row-group cap per zoom coarser than the finest.
 * `full_column_stats`: Keep Parquet statistics for every column.
-* `streaming`: Read the input in [batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
 * `read_batch_size`: Rows per [read batch](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
 * `bbox`: Keep features that intersect this lon/lat box, also one ±360° wrap away, as for 0..360 data.
 * `filter`: SQL-style predicate, such as `"confidence > 0.8"`.
@@ -227,7 +225,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `include_properties`: Keep only these properties in the tiles. The overview file keeps every column, and the `feature_order` column must stay. `[]` keeps none.
 * `exclude_properties`: Drop these properties from the tiles. `include_properties` overrides it.
 * `exclude_all_properties`: Drop every property, writing geometry-only tiles. `include_properties` overrides it.
-* `feature_id`: Integer column to use as the MVT feature ID.
+* `feature_id`: Integer column to use as the MVT feature ID. By default, features have no ID.
 * `spill_dir`: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) used when memory runs short.
 * `profile`: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles): `"speed"` holds everything in RAM, `"bounded"` uses disk and holds the least, and `"auto"` sizes to the machine's memory. Footprints compare for one allocator: wheels use mimalloc, which adds a fixed floor of about 600 MiB on small inputs. On a 1.4M polygon export it ran 8% faster and held 18% more peak memory than the system allocator; a non-musl source build can opt out with `maturin build --no-default-features` (musl always uses mimalloc). Output is identical across profiles.
 * `name`: Human-readable tileset name, stored in the metadata.
@@ -329,7 +327,8 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 
 * `ConfigError`: An option out of range or refused.
 * `ValueError`: A malformed band spec, overlapping bands of one layer, or a missing band input.
-* `RuntimeError`: A band failed to convert, export, or merge.
+* `MemoryError`: A band's conversion or export ran out of its memory budget.
+* `RuntimeError`: A band failed to convert, export, or merge for any other reason. A band's error takes the class of its cause, so a band with bad input raises ValueError, as convert() would.
 
 ### Example
 
@@ -425,7 +424,7 @@ convert(
     input: str,
     output: str,
     min_zoom: int = 0,
-    max_zoom: int | Literal['auto'] = 14,
+    max_zoom: int | str = 14,
     layer_name: str | None = None,
     tile_size_limit: int | Literal['auto'] | None = "auto",
     simple_clip_fastpath: bool = True,
@@ -485,7 +484,6 @@ convert(
     row_group_size: int = 10_000,
     row_group_size_policy: Literal['constant', 'zoom-scaled'] = "constant",
     full_column_stats: bool = False,
-    streaming: bool = True,
     read_batch_size: int = 8192,
     filter: str | None = None,
     profile: Literal['auto', 'speed', 'bounded'] = "auto",
@@ -564,7 +562,6 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `row_group_size`: See `overview()`.
 * `row_group_size_policy`: See `overview()`.
 * `full_column_stats`: See `overview()`.
-* `streaming`: See `overview()`.
 * `read_batch_size`: See `overview()`.
 * `filter`: See `overview()`.
 * `profile`: See `overview()`.
@@ -619,6 +616,7 @@ class OverviewReport(TypedDict):
     out_of_range_features: int
     unprojectable_features: int
     crs_assumed_wgs84: bool
+    geo_version: GeoVersion
     out_of_range_exemplars: list[OutOfRangeExemplar]
     wrapped_features: int
     duration_secs: float
@@ -633,6 +631,7 @@ class OverviewReport(TypedDict):
 * `unprojectable_features`: Features beyond ±85.05° latitude, which Web Mercator cannot tile.
 * `wrapped_features`: Features past ±180° longitude but within ±540°, drawn wrapped across the antimeridian. Expected for 0..360 data; otherwise the declared CRS may be wrong. Not a loss.
 * `crs_assumed_wgs84`: True when the input declared no CRS and lon/lat WGS84 was assumed. If the coordinates are not lon/lat degrees, the output is misplaced.
+* `geo_version`: The input's GeoParquet version across all its files: `{"status": "known", "version": "1.1.0"}` (every file declares it, a major tylertoo reads: 1.x, 2.x); `"unknown"` (same shape, an unreadable major, so metadata may be misread); `"missing"` (no `version` key); or `"mixed"` with `version` a list of the distinct versions (`None` for a file with none). Anything but "known" also logged a warning.
 * `effective_max_row_group_size`: The row-group cap actually used, when it had to be raised above `row_group_size` to keep the file under Parquet's row-group limit. None otherwise.
 
 ### `Diagnostic`

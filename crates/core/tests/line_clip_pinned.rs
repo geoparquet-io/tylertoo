@@ -38,9 +38,9 @@ use geo::{CoordsIter, Geometry, LineString, MultiLineString};
 use geoarrow::array::from_arrow_array;
 use tylertoo_io::open_parquet;
 
-use tylertoo_core::batch_processor::extract_geometries_from_array;
-use tylertoo_core::clip::{buffer_pixels_to_degrees, clip_geometry};
-use tylertoo_core::tile::{TileBounds, TileCoord};
+use tylertoo_core::internal::batch_processor::extract_geometries_from_array;
+use tylertoo_core::internal::clip::{buffer_pixels_to_degrees, clip_geometry};
+use tylertoo_core::internal::tile::{TileBounds, TileCoord};
 
 // ============================================================================
 // Helpers
@@ -81,7 +81,7 @@ fn check(name: &str, input: Geometry<f64>, expected: Option<Vec<Vec<(f64, f64)>>
         &input,
         &unit(),
         0.0,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     );
     let got_parts = parts(&got);
     eprintln!("{name}: {got_parts:?}");
@@ -300,7 +300,7 @@ fn buffered_bounds_are_applied_to_lines() {
         &ls(&[(-5.0, 5.0), (15.0, 5.0)]),
         &unit(),
         1.0,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     );
     assert_eq!(
         parts(&got),
@@ -330,7 +330,7 @@ fn read_geometries(path: &PathBuf) -> Vec<Geometry<f64>> {
         extract_geometries_from_array(
             garr.as_ref(),
             &mut geoms,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
         )
         .unwrap();
     }
@@ -386,7 +386,7 @@ fn sweep(zoom: u8) -> Sweep {
                     geom,
                     &bounds,
                     buffer,
-                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                    &tylertoo_core::internal::diagnostics::Diagnostics::default(),
                 ) else {
                     continue;
                 };

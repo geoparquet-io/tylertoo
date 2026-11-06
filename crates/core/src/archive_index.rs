@@ -41,6 +41,122 @@ use crate::pmtiles_writer::{
 use crate::tile::TileBounds;
 use crate::{Error, Result};
 
+/// Why a PMTiles archive could not be read (#438). Reaches callers as
+/// [`Error::Archive`], which prefixes "Failed to read PMTiles: ".
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ArchiveError {
+    /// The archive file could not be opened.
+    #[error("failed to open {}: {error}", path.display())]
+    #[non_exhaustive]
+    Open {
+        /// The archive.
+        path: PathBuf,
+        /// The I/O error.
+        error: std::io::Error,
+    },
+    /// The archive file could not be read.
+    #[error("failed to read {}: {error}", path.display())]
+    #[non_exhaustive]
+    Read {
+        /// The archive.
+        path: PathBuf,
+        /// The I/O error.
+        error: std::io::Error,
+    },
+    /// The 127-byte header is short, not PMTiles v3, or out of spec.
+    #[error("{0}")]
+    Header(String),
+    /// The root or a leaf directory is malformed.
+    #[error("{0}")]
+    Directory(String),
+    /// A directory section did not decompress.
+    #[error("failed to decompress {what} at byte offset {offset} ({length} bytes): {error}")]
+    #[non_exhaustive]
+    DirectoryDecompress {
+        /// `root directory` or `leaf directory`.
+        what: &'static str,
+        /// The section's absolute byte offset.
+        offset: u64,
+        /// The section's stored length.
+        length: u64,
+        /// The decompressor's error.
+        error: std::io::Error,
+    },
+    /// The header claims more metadata than the internal-section ceiling.
+    #[error(
+        "{}: metadata claims {claimed} bytes, which exceeds the {ceiling}-byte \
+         ceiling on an archive's internal sections",
+        path.display()
+    )]
+    #[non_exhaustive]
+    MetadataTooLarge {
+        /// The archive.
+        path: PathBuf,
+        /// The metadata length the header claims.
+        claimed: u64,
+        /// The ceiling.
+        ceiling: u64,
+    },
+    /// The header's metadata section runs past the end of the file.
+    #[error("metadata past end of {}", path.display())]
+    #[non_exhaustive]
+    MetadataPastEnd {
+        /// The archive.
+        path: PathBuf,
+    },
+    /// The metadata section did not decompress within the ceiling.
+    #[error("{}: metadata: {error}", path.display())]
+    #[non_exhaustive]
+    Metadata {
+        /// The archive.
+        path: PathBuf,
+        /// The decompressor's error.
+        error: std::io::Error,
+    },
+    /// A directory entry addresses bytes outside the tile-data section, or
+    /// a range outside the file.
+    #[error("tile data past end of {}", path.as_deref().map_or_else(|| "archive".to_owned(), |p| p.display().to_string()))]
+    #[non_exhaustive]
+    TileDataPastEnd {
+        /// The archive, when the reader knows it.
+        path: Option<PathBuf>,
+    },
+    /// A directory entry's run of tile ids overflows the id space.
+    #[error("tile id past end of range")]
+    TileIdOverflow,
+    /// A tile id beyond the zoom-31 address space.
+    #[error("tile id {id} exceeds the zoom 31 address space")]
+    #[non_exhaustive]
+    TileIdOutOfRange {
+        /// The tile id.
+        id: u64,
+    },
+    /// A directory entry's run length exceeds what the archive could address
+    /// (#417).
+    #[error(
+        "directory entry for tile id {tile_id} claims a run of {run} tiles, past this \
+         archive's run-length expansion limit of {limit} tiles"
+    )]
+    #[non_exhaustive]
+    RunTooLong {
+        /// The entry's first tile id.
+        tile_id: u64,
+        /// The run length it claims.
+        run: u64,
+        /// The archive's expansion limit.
+        limit: u64,
+    },
+}
+
+impl crate::error::Classify for ArchiveError {
+    /// A file that cannot be read as an archive is a failed run, as decode
+    /// has always reported a damaged archive.
+    fn kind(&self) -> crate::error::ErrorKind {
+        crate::error::ErrorKind::Runtime
+    }
+}
+
 /// The bounds an archive actually claims, or `None`.
 ///
 /// A writer that was never given bounds stores `TileBounds::empty()`, whose
@@ -201,24 +317,26 @@ fn read_metadata_raw(src: &FileBytes, header: &Header, path: &Path) -> Result<Ve
     // lifetime. `metadata_json` decompresses it under the same ceiling, so
     // a larger compressed block cannot be legitimate metadata.
     if header.json_metadata_length > MAX_INTERNAL_BYTES {
-        return Err(Error::PMTilesWrite(format!(
-            "{}: metadata claims {} bytes, which exceeds the {MAX_INTERNAL_BYTES}-byte \
-             ceiling on an archive's internal sections",
-            path.display(),
-            header.json_metadata_length
-        )));
+        return Err(ArchiveError::MetadataTooLarge {
+            path: path.to_path_buf(),
+            claimed: header.json_metadata_length,
+            ceiling: MAX_INTERNAL_BYTES,
+        }
+        .into());
     }
     let meta_end = header
         .json_metadata_offset
         .checked_add(header.json_metadata_length)
         .filter(|&e| e <= src.len)
-        .ok_or_else(|| Error::PMTilesWrite(format!("metadata past end of {}", path.display())))?;
+        .ok_or_else(|| ArchiveError::MetadataPastEnd {
+            path: path.to_path_buf(),
+        })?;
     Ok(src
         .read_range(
             header.json_metadata_offset as usize,
             (meta_end - header.json_metadata_offset) as usize,
         )
-        .map_err(|e| Error::PMTilesWrite(format!("{}: {e}", path.display())))?
+        .map_err(|e| Error::at(path, e))?
         .into_owned())
 }
 
@@ -234,9 +352,11 @@ impl ArchiveIndex {
     /// fails validation, if a directory cannot be read, or if the header claims
     /// more metadata than the internal-section ceiling allows.
     pub fn open(path: &Path) -> Result<Self> {
-        let at = |e: Error| Error::PMTilesWrite(format!("{}: {e}", path.display()));
-        let src = FileBytes::open(path)
-            .map_err(|e| Error::PMTilesRead(format!("failed to open {}: {e}", path.display())))?;
+        let at = |e: Error| Error::at(path, e);
+        let src = FileBytes::open(path).map_err(|error| ArchiveError::Open {
+            path: path.to_path_buf(),
+            error,
+        })?;
         // The header is a fixed 127 bytes at offset 0; `Header::from_bytes`
         // validates magic, version and the fields #417 made load-bearing.
         let head = src
@@ -324,16 +444,24 @@ impl ArchiveIndex {
     /// As [`Self::open`], less the directory reads, and if the metadata does
     /// not decompress within the internal-section ceiling.
     pub fn read_metadata_only(path: &Path) -> Result<Vec<u8>> {
-        let at = |e: Error| Error::PMTilesWrite(format!("{}: {e}", path.display()));
-        let src = FileBytes::open(path)
-            .map_err(|e| Error::PMTilesRead(format!("failed to open {}: {e}", path.display())))?;
+        let at = |e: Error| Error::at(path, e);
+        let src = FileBytes::open(path).map_err(|error| ArchiveError::Open {
+            path: path.to_path_buf(),
+            error,
+        })?;
         let head = src
             .read_range(0, HEADER_BYTES.min(src.len as usize))
             .map_err(at)?;
         let header = Header::from_bytes(&head).map_err(at)?;
         let raw = read_metadata_raw(&src, &header, path)?;
         compression::decompress_capped(&raw, header.internal_compression, MAX_INTERNAL_BYTES)
-            .map_err(|e| Error::PMTilesWrite(format!("{}: metadata: {e}", path.display())))
+            .map_err(|error| {
+                ArchiveError::Metadata {
+                    path: path.to_path_buf(),
+                    error,
+                }
+                .into()
+            })
     }
 
     /// Bytes at an absolute file range — a [`TileRef::range`], typically.
@@ -344,10 +472,10 @@ impl ArchiveIndex {
     /// reversed, or if the read fails.
     pub fn read_range(&self, range: Range<usize>) -> Result<Vec<u8>> {
         if range.end > self.src.len as usize || range.start > range.end {
-            return Err(Error::PMTilesWrite(format!(
-                "tile data past end of {}",
-                self.path.display()
-            )));
+            return Err(ArchiveError::TileDataPastEnd {
+                path: Some(self.path.clone()),
+            }
+            .into());
         }
         Ok(self
             .src
@@ -398,17 +526,18 @@ impl ArchiveIndex {
             match budget.checked_sub(run) {
                 Some(b) => budget = b,
                 None => {
-                    return Err(Error::PMTilesWrite(format!(
-                        "directory entry for tile id {} claims a run of {run} tiles, past this \
-                         archive's run-length expansion limit of {limit} tiles",
-                        e.tile_id
-                    )))
+                    return Err(ArchiveError::RunTooLong {
+                        tile_id: e.tile_id,
+                        run,
+                        limit,
+                    }
+                    .into())
                 }
             }
             let last = e
                 .tile_id
                 .checked_add(run - 1)
-                .ok_or_else(|| Error::PMTilesWrite("tile id past end of range".to_string()))?;
+                .ok_or(ArchiveError::TileIdOverflow)?;
             range = Some(match range {
                 None => (e.tile_id, last),
                 Some((lo, hi)) => (lo.min(e.tile_id), hi.max(last)),
@@ -480,7 +609,7 @@ impl Iterator for TileIter<'_> {
         }
         // Offsets, lengths and ids are archive-supplied: every add is checked
         // so a corrupt directory reports rather than wraps.
-        let past_end = || Error::PMTilesWrite("tile data past end of archive".to_string());
+        let past_end = || Error::from(ArchiveError::TileDataPastEnd { path: None });
         let header = &self.archive.header;
 
         while self.run >= self.run_len {
@@ -530,11 +659,12 @@ impl Iterator for TileIter<'_> {
                 Some(b) => self.budget = b,
                 None => {
                     self.done = true;
-                    return Some(Err(Error::PMTilesWrite(format!(
-                        "directory entry for tile id {} claims a run of {run} tiles, past this \
-                         archive's run-length expansion limit of {limit} tiles",
-                        e.tile_id
-                    ))));
+                    return Some(Err(ArchiveError::RunTooLong {
+                        tile_id: e.tile_id,
+                        run,
+                        limit,
+                    }
+                    .into()));
                 }
             }
             self.run = 0;
@@ -551,9 +681,7 @@ impl Iterator for TileIter<'_> {
             Some(id) => id,
             None => {
                 self.done = true;
-                return Some(Err(Error::PMTilesWrite(
-                    "tile id past end of range".to_string(),
-                )));
+                return Some(Err(ArchiveError::TileIdOverflow.into()));
             }
         };
         match tile_id_to_zxy(id) {
@@ -566,7 +694,7 @@ impl Iterator for TileIter<'_> {
             })),
             Err(err) => {
                 self.done = true;
-                Some(Err(Error::PMTilesWrite(format!("bad tile id: {err}"))))
+                Some(Err(err))
             }
         }
     }
@@ -707,6 +835,30 @@ mod tests {
             w.add_tile(*z, *x, *y, &payload).unwrap();
         }
         w.finalize(path).unwrap();
+    }
+
+    /// #438: a file that is not an archive is a read failure, named as one
+    /// and attributed to its path once, not a "Failed to write PMTiles".
+    #[test]
+    fn a_non_archive_is_a_typed_read_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not.pmtiles");
+        std::fs::write(&path, [0u8; 200]).unwrap();
+        let err = ArchiveIndex::open(&path).map(|_| ()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}: Failed to read PMTiles: bad magic: not a PMTiles archive",
+                path.display()
+            )
+        );
+        let Error::At { error, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            matches!(**error, Error::Archive(ArchiveError::Header(_))),
+            "{err:?}"
+        );
     }
 
     /// The whole point of the type: opening an archive reads its header,
@@ -905,7 +1057,7 @@ mod tests {
     fn merged_tiles_report_an_error_with_its_source() {
         let bad = vec![
             Ok(tref(3, 1)),
-            Err(Error::PMTilesWrite("corrupt".to_string())),
+            Err(ArchiveError::TileIdOverflow.into()),
             Ok(tref(8, 1)),
         ];
         let m = MergedTiles::new(vec![stream(&[1, 7], 0), bad.into_iter()]);
@@ -916,7 +1068,7 @@ mod tests {
         assert_eq!(out[0], (0, Ok(1)));
         assert_eq!(out[1], (1, Ok(3)));
         assert_eq!(out[2].0, 1);
-        assert!(out[2].1.as_ref().unwrap_err().contains("corrupt"));
+        assert!(out[2].1.as_ref().unwrap_err().contains("past end of range"));
     }
 
     /// #403's memory claim, as a checked fact rather than a comment: the

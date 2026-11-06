@@ -137,6 +137,7 @@ const _: () = assert!(
 
 /// Everything that can go wrong cutting, reading or applying a shard plan.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ShardError {
     /// `--pivot` outside `1..=``MAX_SHARD_PIVOT_ZOOM`.
     #[error(
@@ -144,6 +145,7 @@ pub enum ShardError {
          {MAX_SHARD_PIVOT_ZOOM}. A pivot wants to sit where the dataset has a few tiles per \
          shard, which is z4-z8 for any realistic fleet size."
     )]
+    #[non_exhaustive]
     PivotOutOfRange {
         /// The rejected pivot zoom.
         pivot: u8,
@@ -161,6 +163,7 @@ pub enum ShardError {
          between 1 and {MAX_SHARD_PIVOT_ZOOM}. (z0 is the single world tile — a range there is \
          the whole build, not a shard of it.)"
     )]
+    #[non_exhaustive]
     TileRangePivotOutOfRange {
         /// The pivot zoom the ids implied.
         pivot: u8,
@@ -177,6 +180,7 @@ pub enum ShardError {
          {max_zoom}: the shards would own no zoom at all. Re-cut the plan with a coarser \
          --pivot, or raise --max-zoom."
     )]
+    #[non_exhaustive]
     PivotNotCoarser {
         /// The rejected pivot zoom.
         pivot: u8,
@@ -191,6 +195,7 @@ pub enum ShardError {
         "--shards {shards} is out of range for pivot z{pivot}: it must be between 1 and {max} \
          (the number of tiles at that zoom). Use a deeper --shard-pivot for a larger fleet."
     )]
+    #[non_exhaustive]
     ShardCountOutOfRange {
         /// The rejected shard count.
         shards: usize,
@@ -206,6 +211,7 @@ pub enum ShardError {
          valid indices are 0..={}",
         shards.saturating_sub(1)
     )]
+    #[non_exhaustive]
     ShardIndexOutOfRange {
         /// The rejected index.
         index: usize,
@@ -219,6 +225,7 @@ pub enum ShardError {
          Every job in a fleet must be given the same shard plan, and its N must be the N the \
          plan was cut for."
     )]
+    #[non_exhaustive]
     ShardCountMismatch {
         /// The index the caller asked for.
         index: usize,
@@ -237,6 +244,7 @@ pub enum ShardError {
          pivot and \
          writes the convert plan."
     )]
+    #[non_exhaustive]
     BadShardSelector {
         /// The rejected text.
         value: String,
@@ -248,6 +256,7 @@ pub enum ShardError {
          at the SAME zoom (that zoom becomes the pivot, and the range then names every \
          descendant of those tiles at every deeper zoom)."
     )]
+    #[non_exhaustive]
     BadTileRange {
         /// The rejected text.
         value: String,
@@ -259,6 +268,7 @@ pub enum ShardError {
          z{lo_zoom} and {hi} is at z{hi_zoom}. A range is a run of tiles at one pivot zoom; \
          its descendants at deeper zooms follow from that."
     )]
+    #[non_exhaustive]
     TileRangeZoomMismatch {
         /// The low id.
         lo: u64,
@@ -272,6 +282,7 @@ pub enum ShardError {
 
     /// A tile-id range whose low id is past its high id.
     #[error("tile-id range {lo}..{hi} is empty: LO must not exceed HI.")]
+    #[non_exhaustive]
     EmptyTileRange {
         /// The low id.
         lo: u64,
@@ -281,6 +292,7 @@ pub enum ShardError {
 
     /// A tile id that is not addressable at all.
     #[error("tile id {id} is not a valid PMTiles tile id: {reason}")]
+    #[non_exhaustive]
     BadTileId {
         /// The rejected id.
         id: u64,
@@ -290,6 +302,7 @@ pub enum ShardError {
 
     /// The plan file could not be read or written.
     #[error("--shard-plan {path}: {source}")]
+    #[non_exhaustive]
     Io {
         /// The plan's path.
         path: String,
@@ -300,6 +313,7 @@ pub enum ShardError {
     /// The plan file is not a shard plan, or is a shard plan this build
     /// cannot read.
     #[error("--shard-plan {path}: {what}")]
+    #[non_exhaustive]
     Malformed {
         /// The plan's path.
         path: String,
@@ -312,6 +326,7 @@ pub enum ShardError {
         "--shard-plan {path}: saved plan does not match this run: {field} was {saved:?} when \
          the plan was cut but is {now:?} now. Re-cut it with `tylertoo shard-plan`."
     )]
+    #[non_exhaustive]
     SourceMismatch {
         /// The plan's path.
         path: String,
@@ -331,6 +346,7 @@ pub enum ShardError {
 /// Which job of a sharded fleet this run is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ShardRole {
     /// The run that owns zooms `[0, pivot - 1]` over the whole input and
     /// writes the convert plan the data shards consume.
@@ -533,6 +549,7 @@ impl TileRange {
     }
 
     /// How many pivot tiles the run holds.
+    #[doc(hidden)]
     pub fn pivot_tiles(&self) -> u64 {
         self.hi - self.lo + 1
     }
@@ -545,6 +562,7 @@ impl TileRange {
     /// descendants occupy `base(z) + h * 4^Δ ..= base(z) + (h+1) * 4^Δ - 1`
     /// (see `crate::tile::node_id_range`), and a contiguous run of `h`
     /// concatenates those blocks into one contiguous interval.
+    #[doc(hidden)]
     pub fn ids_at(&self, zoom: u8) -> Option<RangeInclusive<u64>> {
         if zoom < self.pivot_zoom || zoom > crate::tile::MAX_ZOOM {
             return None;
@@ -568,6 +586,7 @@ impl TileRange {
         Some(start..=end)
     }
 
+    #[doc(hidden)]
     /// The exact geographic extent of the run's pivot tiles.
     ///
     /// This is what a shard archive advertises as its bounds (intersected with
@@ -590,6 +609,7 @@ impl TileRange {
         out.unwrap_or_else(|| TileBounds::new(-180.0, -90.0, 180.0, 90.0))
     }
 
+    #[doc(hidden)]
     /// [`TileRange::tile_bounds`] widened by `SHARD_READ_MARGIN_TILES` pivot
     /// tiles on every side — the bbox a shard prunes its **input row groups**
     /// against.
@@ -631,6 +651,7 @@ impl fmt::Display for TileRange {
 
 /// One shard's slice of a [`ShardPlan`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ShardRange {
     /// First pivot-zoom tile id, inclusive.
     pub lo: u64,
@@ -648,6 +669,7 @@ pub struct ShardRange {
 /// already pins the input hard (down to mtime), and this only has to catch
 /// "this shard plan was cut for a different file".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ShardInput {
     /// The part's display name (local path, or remote URL).
     pub path: String,
@@ -664,6 +686,7 @@ pub struct ShardInput {
 /// construction rather than by each recomputing an estimate that a differing
 /// library version or a re-statted file could perturb.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ShardPlan {
     /// Always `SHARD_PLAN_FORMAT`; refused otherwise.
     pub format: String,
@@ -692,6 +715,7 @@ pub struct ShardPlan {
 
 impl ShardPlan {
     /// How many shards the plan cuts.
+    #[doc(hidden)]
     pub fn shards(&self) -> usize {
         self.ranges.len()
     }
@@ -711,6 +735,7 @@ impl ShardPlan {
     /// input fingerprint are advisory, and a plan re-cut to identical ranges
     /// with a different estimate is the same cut. What must match is which
     /// tiles each job owns.
+    #[doc(hidden)]
     pub fn cut_digest(&self) -> u64 {
         let mut h = xxhash_rust::xxh3::Xxh3::new();
         // Domain-separated and length-prefixed, so no two different cuts can
@@ -727,6 +752,7 @@ impl ShardPlan {
 
     /// [`ShardPlan::cut_digest`] as the fixed-width hex string the convert
     /// plan's fingerprint records.
+    #[doc(hidden)]
     pub fn cut_digest_hex(&self) -> String {
         format!("{:016x}", self.cut_digest())
     }
@@ -744,6 +770,7 @@ impl ShardPlan {
     ///
     /// Returns [`ShardError::PivotNotCoarser`] if the plan's pivot is finer
     /// than `max_zoom`.
+    #[doc(hidden)]
     pub fn check_max_zoom(&self, max_zoom: u8, path: &Path) -> Result<(), ShardError> {
         if self.pivot_zoom > max_zoom {
             return Err(ShardError::PivotNotCoarser {
@@ -761,6 +788,7 @@ impl ShardPlan {
     ///
     /// Returns [`ShardError::ShardIndexOutOfRange`] if the plan has no shard
     /// `index`.
+    #[doc(hidden)]
     pub fn range(&self, index: usize) -> Result<TileRange, ShardError> {
         let r = self
             .ranges
@@ -779,6 +807,7 @@ impl ShardPlan {
     ///
     /// Returns [`ShardError::ShardCountMismatch`] if the role's `N` differs
     /// from the plan's shard count, or an error if its index is out of range.
+    #[doc(hidden)]
     pub fn range_for(&self, role: ShardRole, path: &Path) -> Result<Option<TileRange>, ShardError> {
         match role {
             ShardRole::Coarse => Ok(None),
@@ -796,6 +825,7 @@ impl ShardPlan {
         }
     }
 
+    #[doc(hidden)]
     /// Cut a plan for `source`, balancing on footer statistics alone.
     ///
     /// # Errors
@@ -947,6 +977,7 @@ impl ShardPlan {
         Ok(())
     }
 
+    #[doc(hidden)]
     /// Check the plan was cut for the input this run is about to read.
     ///
     /// # Errors

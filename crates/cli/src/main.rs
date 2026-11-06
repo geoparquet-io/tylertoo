@@ -39,14 +39,15 @@ use std::path::{Path, PathBuf};
     reason = "#452: immutable CLI quiet setting shared by status output"
 )]
 use std::sync::atomic::{AtomicBool, Ordering};
-use tylertoo_core::overview::auto_zoom::MaxZoom;
-use tylertoo_core::overview::config::cli::{
+use tylertoo_core::internal::error::{Classify, ErrorKind};
+use tylertoo_core::internal::overview::auto_zoom::MaxZoom;
+use tylertoo_core::internal::overview::config::cli::{
     export_options, overview_options, pyramid_options, tiles_options, ExportPmtilesArgs,
     OverviewArgs, PyramidArgs, TilesArgs,
 };
 
-use tylertoo_core::overview::config::{self, OutputKind};
-use tylertoo_core::overview::tiles::TilesOptions;
+use tylertoo_core::internal::overview::config::{self, OutputKind};
+use tylertoo_core::internal::overview::tiles::TilesOptions;
 use tylertoo_core::TilesetMetadata as TilesetMetadataArgs;
 
 /// `-q/--quiet` (#452), set once in `main` before dispatch.
@@ -70,7 +71,7 @@ macro_rules! say {
 /// Exit-status contract (#452), shown under `tylertoo --help` and in the
 /// generated CLI reference. Exit 1 is `main` returning `Err` (anyhow
 /// prints it); exit 2 is clap's for a parse error, which core's option refusals
-/// (`is_usage_error`) and `--quiet` with `tiles --verbose` reuse.
+/// (`exit_status`) and `--quiet` with `tiles --verbose` reuse.
 const EXIT_STATUS_HELP: &str = "\
 Exit status:
 
@@ -389,7 +390,7 @@ fn main() -> Result<std::process::ExitCode> {
         Ok(()) => Ok(std::process::ExitCode::SUCCESS),
         // #779: an option core refused before any work is a usage error,
         // like clap's: exit 2, the message alone (it names no failed step).
-        Err(e) if is_usage_error(&e) => {
+        Err(e) if exit_status(error_kind(&e)) == 2 => {
             eprintln!("Error: {e:#}");
             Ok(std::process::ExitCode::from(2))
         }
@@ -397,34 +398,30 @@ fn main() -> Result<std::process::ExitCode> {
     }
 }
 
-/// Whether `e` is one of core's option refusals (#779), wherever it sits in
-/// the chain: a [`config::ConfigError`], or an error its type classes as
-/// config (`is_config`). These exit 2, the code clap gives its own usage
-/// errors, so a script can tell "fix the command" from "the run failed".
-fn is_usage_error(e: &anyhow::Error) -> bool {
-    use tylertoo_core::overview::convert::ConvertError;
-    use tylertoo_core::overview::export::ExportError;
-    use tylertoo_core::overview::tiles::TilesError;
-    e.chain().any(|c| {
-        c.is::<config::ConfigError>()
-            || c.downcast_ref::<ConvertError>()
-                .is_some_and(ConvertError::is_config)
-            || c.downcast_ref::<ExportError>()
-                .is_some_and(ExportError::is_config)
-            || c.downcast_ref::<TilesError>()
-                .is_some_and(TilesError::is_config)
-            || c.downcast_ref::<tylertoo_core::Error>()
-                .is_some_and(tylertoo_core::Error::is_config)
-    })
+/// The kind core gives the first of its errors in `e`'s chain (#438), or
+/// `None` when no link is one of core's (an untyped `anyhow!` message). Core's
+/// wrapping errors classify as what they wrap, so the first one decides.
+fn error_kind(e: &anyhow::Error) -> Option<ErrorKind> {
+    e.chain().find_map(tylertoo_core::internal::error::kind_of)
 }
 
-/// `what failed: e`, or `e` alone (keeping its type, for
-/// [`is_usage_error`]) when `e` is an option refused before any work.
-fn step_failed<E>(what: &str, e: E, is_config: fn(&E) -> bool) -> anyhow::Error
+/// The exit status for a failure of `kind`: 2 for an option refused before
+/// any work, the code clap gives its own usage errors, so a script can tell
+/// "fix the command" from "the run failed" (1).
+fn exit_status(kind: Option<ErrorKind>) -> u8 {
+    match kind {
+        Some(ErrorKind::Usage) => 2,
+        _ => 1,
+    }
+}
+
+/// `what failed: e`, or `e` alone (keeping its type, for [`error_kind`])
+/// when `e` is an option refused before any work.
+fn step_failed<E>(what: &str, e: E) -> anyhow::Error
 where
-    E: std::error::Error + Send + Sync + 'static,
+    E: Classify + std::error::Error + Send + Sync + 'static,
 {
-    if is_config(&e) {
+    if e.kind() == ErrorKind::Usage {
         anyhow::Error::new(e)
     } else {
         anyhow::anyhow!("{what} failed: {e}")
@@ -606,24 +603,20 @@ fn resolve_io_for_planning(
 /// `tiles` facade routes both shapes the same way, and two copies of that
 /// would drift. This only adds `overview`'s `anyhow` context.
 ///
-/// [`TilesInput::convert`]: tylertoo_core::overview::tiles::TilesInput::convert
+/// [`TilesInput::convert`]: tylertoo_core::internal::overview::tiles::TilesInput::convert
 fn run_convert(
     spec: &InputSpec,
     output: &std::path::Path,
-    options: &tylertoo_core::overview::convert::ConvertOptions,
-) -> Result<tylertoo_core::overview::convert::ConvertReport> {
-    tiles_input(spec).convert(output, options).map_err(|e| {
-        step_failed(
-            "overview conversion",
-            e,
-            tylertoo_core::overview::convert::ConvertError::is_config,
-        )
-    })
+    options: &tylertoo_core::internal::overview::convert::ConvertOptions,
+) -> Result<tylertoo_core::internal::overview::convert::ConvertReport> {
+    tiles_input(spec)
+        .convert(output, options)
+        .map_err(|e| step_failed("overview conversion", e))
 }
 
 /// The core-side view of a resolved input shape.
-fn tiles_input(spec: &InputSpec) -> tylertoo_core::overview::tiles::TilesInput {
-    use tylertoo_core::overview::tiles::TilesInput;
+fn tiles_input(spec: &InputSpec) -> tylertoo_core::internal::overview::tiles::TilesInput {
+    use tylertoo_core::internal::overview::tiles::TilesInput;
     match spec {
         InputSpec::Path(p) => TilesInput::Path(p.clone()),
         InputSpec::Manifest(m) => TilesInput::Manifest(m.clone()),
@@ -636,7 +629,7 @@ fn log_shard_job(job: &ShardJob, min_zoom: u8, max_zoom: MaxZoom) {
     // `auto` is resolved inside the facade, which logs the pick (#444).
     let finest = match max_zoom {
         MaxZoom::Fixed(z) => format!("z{z}"),
-        MaxZoom::Auto => "the auto max zoom".to_string(),
+        MaxZoom::Auto | MaxZoom::AutoCapped(_) => "the auto max zoom".to_string(),
     };
     log::info!(
         "[tiles] shard job {}: {}",
@@ -652,17 +645,17 @@ fn log_shard_job(job: &ShardJob, min_zoom: u8, max_zoom: MaxZoom) {
 /// tile space it owns (#498).
 #[derive(Debug, Clone)]
 struct ShardJob {
-    role: tylertoo_core::shard::ShardRole,
+    role: tylertoo_core::internal::shard::ShardRole,
     /// The data shard's range, or `None` for the coarse job — which owns the
     /// zooms below the pivot instead, and expresses that as an export ceiling.
-    range: Option<tylertoo_core::shard::TileRange>,
+    range: Option<tylertoo_core::internal::shard::TileRange>,
     pivot: u8,
     /// `ShardPlan::cut_digest_hex` — the fleet-wide identity of the cut.
     cut_digest: String,
     /// The loaded plan and its path: the facade verifies it against the
     /// input it opens and re-checks the pivot once `--max-zoom auto` is
     /// resolved (#444), on that same source.
-    plan: tylertoo_core::shard::ShardPlan,
+    plan: tylertoo_core::internal::shard::ShardPlan,
     plan_path: PathBuf,
 }
 
@@ -670,17 +663,17 @@ impl ShardJob {
     /// The core-side view of this job: everything the facade needs, without
     /// the bound plan the CLI keeps for its own `--max-zoom auto` re-check.
     /// Core owns every consequence of it (#439).
-    fn as_tiles_shard(&self) -> tylertoo_core::overview::tiles::TilesShard {
-        tylertoo_core::overview::tiles::TilesShard {
-            role: self.role,
-            range: self.range,
-            pivot_zoom: self.pivot,
-            cut_digest: self.cut_digest.clone(),
-            binding: Some(tylertoo_core::overview::tiles::ShardBinding {
-                plan: self.plan.clone(),
-                path: self.plan_path.clone(),
-            }),
-        }
+    fn as_tiles_shard(&self) -> tylertoo_core::internal::overview::tiles::TilesShard {
+        tylertoo_core::internal::overview::tiles::TilesShard::new(
+            self.role,
+            self.range,
+            self.pivot,
+            self.cut_digest.clone(),
+            Some(tylertoo_core::internal::overview::tiles::ShardBinding::new(
+                self.plan.clone(),
+                self.plan_path.clone(),
+            )),
+        )
     }
 }
 
@@ -695,7 +688,7 @@ fn resolve_shard_job(
     shard_plan: Option<&Path>,
     max_zoom: u8,
 ) -> Result<Option<ShardJob>> {
-    use tylertoo_core::shard::ShardRole;
+    use tylertoo_core::internal::shard::ShardRole;
 
     let Some(shard) = shard else {
         // clap's `requires` makes the reverse pairing impossible, but a plan
@@ -715,7 +708,7 @@ fn resolve_shard_job(
     // The plan is bound to the input by the facade, on the source it
     // converts (#788: one source per run): a plan cut for a different (or
     // since-rewritten) file is refused there before any row is read.
-    let (plan, range) = tylertoo_core::shard::resolve_range(plan_path, role, None)?;
+    let (plan, range) = tylertoo_core::internal::shard::resolve_range(plan_path, role, None)?;
 
     // Core owns the pivot-vs-finest-zoom rule (inclusive: pivot == max_zoom
     // leaves every shard exactly one zoom, which is legal), so the Rust API
@@ -739,13 +732,15 @@ fn resolve_shard_job(
     }))
 }
 
-/// Resolve an [`InputSpec`] to the core's [`ConvertSource`](tylertoo_core::input_set::ConvertSource), the one way.
+/// Resolve an [`InputSpec`] to the core's [`ConvertSource`](tylertoo_core::internal::input_set::ConvertSource), the one way.
 ///
 /// Shared by `tiles --shard` and `shard-plan` so the two can never disagree
 /// about what an input *is* — a shard plan cut over a manifest has to bind to
 /// the same part list the shard jobs will read.
-fn resolve_convert_source(spec: &InputSpec) -> Result<tylertoo_core::input_set::ConvertSource> {
-    use tylertoo_core::input_set::ConvertSource;
+fn resolve_convert_source(
+    spec: &InputSpec,
+) -> Result<tylertoo_core::internal::input_set::ConvertSource> {
+    use tylertoo_core::internal::input_set::ConvertSource;
     Ok(match spec {
         InputSpec::Path(p) => ConvertSource::resolve_path(p)?,
         InputSpec::Manifest(p) => ConvertSource::from_manifest(p)?,
@@ -862,13 +857,14 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
         .expect("clap requires --save-plan alongside --plan-only");
 
     let start = std::time::Instant::now();
-    let report = tylertoo_core::overview::tiles::write_plan(&tiles_input(&spec), &options)
-        .map_err(|e| match e {
-            tylertoo_core::overview::tiles::TilesError::Convert(e) => {
-                anyhow::Error::new(e).context("writing the convert plan failed")
-            }
-            other => other.into(),
-        })?;
+    let report =
+        tylertoo_core::internal::overview::tiles::write_plan(&tiles_input(&spec), &options)
+            .map_err(|e| match e {
+                tylertoo_core::internal::overview::tiles::TilesError::Convert(e) => {
+                    anyhow::Error::new(e).context("writing the convert plan failed")
+                }
+                other => other.into(),
+            })?;
 
     say!("✓ Wrote the convert plan (no tiles: --plan-only)");
     say!("  input:  {}", spec.display());
@@ -958,22 +954,24 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
 ///
 /// The policy — intermediate-overview lifecycle and preflights, the #380
 /// declaration rule, empty shard/coarse outcomes, the combined report —
-/// lives in core ([`tylertoo_core::overview::tiles`], #439). This maps the
+/// lives in core ([`tylertoo_core::internal::overview::tiles`], #439). This maps the
 /// parsed arguments onto [`TilesOptions`] and prints.
 ///
-/// [`TilesOptions`]: tylertoo_core::overview::tiles::TilesOptions
+/// [`TilesOptions`]: tylertoo_core::internal::overview::tiles::TilesOptions
 /// Whether a convert with `options` stands in for dropped polygons with
 /// placeholder squares (#745), for the empty-zoom hint: duplicating mode,
 /// with the square disposition globally (the default, unless an entry-zoom
 /// ladder turns it into points) or in a `--representation` square band.
-fn makes_placeholder_squares(options: &tylertoo_core::overview::convert::ConvertOptions) -> bool {
-    use tylertoo_core::overview::level::Mode;
-    use tylertoo_core::overview::simplify::{CollapseMode, Representation};
+fn makes_placeholder_squares(
+    options: &tylertoo_core::internal::overview::convert::ConvertOptions,
+) -> bool {
+    use tylertoo_core::internal::overview::level::Mode;
+    use tylertoo_core::internal::overview::simplify::{CollapseMode, Representation};
 
     let global = match options.simplify.collapse {
         CollapseMode::Square => true,
         CollapseMode::Auto => options.entry_zoom.is_none(),
-        CollapseMode::Point | CollapseMode::Drop => false,
+        _ => false,
     };
     let banded = options
         .representation
@@ -983,8 +981,10 @@ fn makes_placeholder_squares(options: &tylertoo_core::overview::convert::Convert
 }
 
 fn run_tiles(args: TilesArgs) -> Result<()> {
-    use tylertoo_core::overview::convert::ConvertReport;
-    use tylertoo_core::overview::tiles::{self, IntermediateOverview, TilesObserver, TilesOutcome};
+    use tylertoo_core::internal::overview::convert::ConvertReport;
+    use tylertoo_core::internal::overview::tiles::{
+        self, IntermediateOverview, TilesObserver, TilesOutcome,
+    };
 
     // Checked here, not with clap's `conflicts_with`: `quiet` is a global
     // arg that only `tiles` has a `verbose` to conflict with, and clap's
@@ -1105,6 +1105,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
                 return Ok(());
             }
             TilesOutcome::Converted(report) => report,
+            other => anyhow::bail!("unhandled tiles outcome: {other:?}"),
         };
     let (convert_report, export_report) = (&report.convert, &report.export);
 
@@ -1182,7 +1183,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 }
 
 fn write_report(path: &Path, report: &impl serde::Serialize) -> Result<()> {
-    tylertoo_core::diagnostics::write_report(path, report)
+    tylertoo_core::internal::diagnostics::write_report(path, report)
         .with_context(|| format!("failed to write report to {}", path.display()))?;
     say!("  report written to {}", path.display());
     Ok(())
@@ -1190,7 +1191,7 @@ fn write_report(path: &Path, report: &impl serde::Serialize) -> Result<()> {
 
 /// Print the core diagnostic channel for any completed command.
 fn print_diagnostics<'a>(
-    events: impl IntoIterator<Item = &'a tylertoo_core::diagnostics::Diagnostic>,
+    events: impl IntoIterator<Item = &'a tylertoo_core::internal::diagnostics::Diagnostic>,
 ) {
     for diagnostic in events {
         say!("  {diagnostic}");
@@ -1266,7 +1267,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
 
 /// Run `tylertoo validate`: check a GeoParquet overview file (spec §6.2).
 fn run_validate(args: ValidateArgs) -> Result<()> {
-    use tylertoo_core::overview::check::validate_file;
+    use tylertoo_core::internal::overview::check::validate_file;
 
     reject_files_from(args.files_from.as_ref(), "validate")?;
     require_single_local_file(&args.file, "validate")?;
@@ -1347,7 +1348,7 @@ fn reject_files_from(files_from: Option<&PathBuf>, subcommand: &str) -> Result<(
 }
 
 fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
-    use tylertoo_core::overview::export::export_pmtiles;
+    use tylertoo_core::internal::overview::export::export_pmtiles;
 
     // #427: refuse an existing output (without --force) and a bad option
     // before the input is even looked at. The option rules are core's.
@@ -1363,13 +1364,8 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         args.input.display(),
         args.output.display()
     );
-    let report = export_pmtiles(&args.input, &args.output, &opts).map_err(|e| {
-        step_failed(
-            "export",
-            e,
-            tylertoo_core::overview::export::ExportError::is_config,
-        )
-    })?;
+    let report =
+        export_pmtiles(&args.input, &args.output, &opts).map_err(|e| step_failed("export", e))?;
 
     say!(
         "  mode={} zooms z{}..z{}",
@@ -1426,9 +1422,9 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
 }
 
 /// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
-/// facade over `tylertoo_core::pyramid::merge_bands`).
+/// facade over `tylertoo_core::internal::pyramid::merge_bands`).
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
-    use tylertoo_core::pyramid::{build_pyramid, parse_bands};
+    use tylertoo_core::internal::pyramid::{build_pyramid, parse_bands};
 
     // #452: the archive is created only after every band is tiled.
     config::check_output(&args.output, OutputKind::Pmtiles, args.force)?;
@@ -1440,13 +1436,11 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
 
     // Spec parsing, band-set validation and the band-input existence check
     // (with its stripped-`=LAYER` hint) all live in core (#445).
-    let bands = parse_bands(&args.bands).map_err(|message| config::ConfigError::InvalidSpec {
-        option: "--band",
-        message,
-    })?;
+    let bands = parse_bands(&args.bands)
+        .map_err(|message| config::ConfigError::invalid_spec("--band", message))?;
 
-    let report = build_pyramid(&bands, &args.output, &opts)
-        .map_err(|e| step_failed("pyramid build", e, tylertoo_core::Error::is_config))?;
+    let report =
+        build_pyramid(&bands, &args.output, &opts).map_err(|e| step_failed("pyramid build", e))?;
 
     for (layer, lo, hi, n) in &report.per_band_tiles {
         say!(
@@ -1520,15 +1514,15 @@ fn preflight_report(report: Option<&Path>, others: &[&Path]) -> Result<()> {
             other.display()
         );
     }
-    tylertoo_core::atomic_output::check_writable_in_place(path)
+    tylertoo_core::internal::atomic_output::check_writable_in_place(path)
         .map_err(|e| anyhow::anyhow!("--report: {e}"))
 }
 
 /// Run `tylertoo merge`: several disjoint PMTiles archives → one (thin facade
-/// over `tylertoo_core::merge::merge_shards`).
+/// over `tylertoo_core::internal::merge::merge_shards`).
 /// `tylertoo shard-plan` — step 0 of a sharded build (#498).
 fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
-    use tylertoo_core::shard::ShardPlan;
+    use tylertoo_core::internal::shard::ShardPlan;
 
     // No `exists()` precheck: a shard plan is cut for whatever a fleet will
     // read, which may be a directory, a glob, an s3:// prefix or a manifest.
@@ -1601,7 +1595,7 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
 }
 
 fn run_merge(args: MergeArgs) -> Result<()> {
-    use tylertoo_core::merge::{merge_shards, MergeOptions};
+    use tylertoo_core::internal::merge::{merge_shards, MergeOptions};
 
     // Preflight the paths the run will write, before it reads gigabytes: an
     // existing output without --force, a `--report` in a directory that does
@@ -1697,9 +1691,9 @@ fn run_merge(args: MergeArgs) -> Result<()> {
 }
 
 /// Run `tylertoo decode`: PMTiles → GeoParquet (thin facade over
-/// `tylertoo_core::decode::decode_pmtiles`).
+/// `tylertoo_core::internal::decode::decode_pmtiles`).
 fn run_decode(args: DecodeArgs) -> Result<()> {
-    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
+    use tylertoo_core::internal::decode::{decode_pmtiles, DecodeOptions};
 
     // #427: refuse an existing output (without --force) before any work.
     config::check_output(&args.output, OutputKind::GeoParquet, args.force)?;
@@ -1713,11 +1707,10 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
         Some(z) => (Some(z), Some(z)),
         None => (args.min_zoom, args.max_zoom),
     };
-    let options = DecodeOptions {
-        min_zoom,
-        max_zoom,
-        layer: args.layer,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(min_zoom)
+        .with_max_zoom(max_zoom)
+        .with_layer(args.layer);
     // Before the "Decoding" line, so an inverted range prints nothing else.
     options.validate()?;
 
@@ -1752,16 +1745,15 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
 }
 
 /// Run `tylertoo stats`: per-zoom tile-weight report over a PMTiles archive
-/// (issue #552). Thin facade over `tylertoo_core::stats::compute_stats`,
+/// (issue #552). Thin facade over `tylertoo_core::internal::stats::compute_stats`,
 /// which does all the work off `ArchiveIndex` (header + directories only).
 fn run_stats(args: StatsArgs) -> Result<()> {
-    use tylertoo_core::archive_index::ArchiveIndex;
-    use tylertoo_core::stats::compute_stats;
+    use tylertoo_core::internal::archive_index::ArchiveIndex;
+    use tylertoo_core::internal::stats::compute_stats;
 
     let archive = ArchiveIndex::open(&args.archive).map_err(|e| {
-        // `ArchiveIndex` reports read failures under the shared PMTiles
-        // error variant ("Failed to write PMTiles: ..."); for a file that
-        // is not an archive at all, say so plainly.
+        // `ArchiveIndex` reports read failures as "Failed to read PMTiles:
+        // ..."; for a file that is not an archive at all, say so plainly.
         let not_pmtiles = std::fs::File::open(&args.archive)
             .and_then(|mut f| {
                 let mut magic = [0u8; 7];
@@ -1814,10 +1806,10 @@ fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     lines.join("\n")
 }
 
-/// The human-readable form of a [`tylertoo_core::stats::StatsReport`]: the
+/// The human-readable form of a [`tylertoo_core::internal::stats::StatsReport`]: the
 /// per-zoom table the issue asked for, followed by the largest tiles (when
 /// any were requested).
-fn print_stats_table(report: &tylertoo_core::stats::StatsReport) {
+fn print_stats_table(report: &tylertoo_core::internal::stats::StatsReport) {
     if report.per_zoom.is_empty() {
         println!("(archive holds no tiles)");
         return;
@@ -1893,16 +1885,16 @@ mod allocator_default {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tylertoo_core::overview::config::cli::resolve_level_plan;
-    use tylertoo_core::overview::config::cli::{
+    use tylertoo_core::internal::overview::config::cli::resolve_level_plan;
+    use tylertoo_core::internal::overview::config::cli::{
         parse_in_flight_batches, parse_partition_wave, parse_read_workers, parse_size_bytes,
         parse_size_cap,
     };
-    use tylertoo_core::overview::config::cli::{parse_suffixed_size, SizeParseError};
-    use tylertoo_core::overview::config::SizeCap;
-    use tylertoo_core::overview::export::ExportOptions;
-    use tylertoo_core::overview::export::FeatureOrder;
-    use tylertoo_core::overview::level::MemoryProfile;
+    use tylertoo_core::internal::overview::config::cli::{parse_suffixed_size, SizeParseError};
+    use tylertoo_core::internal::overview::config::SizeCap;
+    use tylertoo_core::internal::overview::export::ExportOptions;
+    use tylertoo_core::internal::overview::export::FeatureOrder;
+    use tylertoo_core::internal::overview::level::MemoryProfile;
 
     /// #498: a sharded `tiles` job names the slice of the tile space it
     /// owns before any work, so a fleet's logs say what each task was for.
@@ -1926,17 +1918,19 @@ mod tests {
             return;
         }
         log::set_max_level(log::LevelFilter::Info);
-        let plan = tylertoo_core::shard::ShardPlan {
-            format: "tylertoo-shard-plan".to_string(),
-            version: 1,
-            pivot_zoom: 6,
-            ranges: Vec::new(),
-            inputs: Vec::new(),
-            estimated_rows_total: 0,
-            unplaced_rows: 0,
-        };
+        let plan: tylertoo_core::internal::shard::ShardPlan =
+            serde_json::from_value(serde_json::json!({
+                "format": "tylertoo-shard-plan",
+                "version": 1,
+                "pivot_zoom": 6,
+                "ranges": [],
+                "inputs": [],
+                "estimated_rows_total": 0,
+                "unplaced_rows": 0,
+            }))
+            .unwrap();
         let job = ShardJob {
-            role: tylertoo_core::shard::ShardRole::Coarse,
+            role: tylertoo_core::internal::shard::ShardRole::Coarse,
             range: None,
             pivot: 6,
             cut_digest: plan.cut_digest_hex(),
@@ -1961,52 +1955,88 @@ mod tests {
 
     #[test]
     fn usage_errors_retain_their_classification_through_context() {
-        use tylertoo_core::overview::convert::ConvertError;
-        use tylertoo_core::overview::export::ExportError;
-        use tylertoo_core::overview::tiles::TilesError;
+        use tylertoo_core::internal::overview::convert::ConvertError;
+        use tylertoo_core::internal::overview::export::ExportError;
+        use tylertoo_core::internal::overview::tiles::TilesError;
+        use tylertoo_core::internal::pyramid::PyramidError;
 
-        let config_error = || config::ConfigError::InvalidExtent { extent: 0 };
+        let config_error = || config::ConfigError::CollapseConflict;
         for error in [
             anyhow::Error::new(config_error()),
             step_failed(
                 "overview conversion",
                 ConvertError::VerbatimPartitioningUnsupported,
-                ConvertError::is_config,
             ),
-            step_failed(
-                "export",
-                ExportError::Config(config_error()),
-                ExportError::is_config,
-            ),
+            step_failed("export", ExportError::Config(config_error())),
             anyhow::Error::new(TilesError::Convert(
                 ConvertError::VerbatimPartitioningUnsupported,
             )),
             anyhow::Error::new(TilesError::Export(ExportError::Config(config_error()))),
             step_failed(
                 "pyramid build",
-                tylertoo_core::Error::InvalidConfig("invalid band".into()),
-                tylertoo_core::Error::is_config,
+                PyramidError::InvalidConfig(tylertoo_core::InvalidConfigError::BandConvertOptions(
+                    Box::new(ConvertError::VerbatimPartitioningUnsupported),
+                )),
             ),
         ] {
-            assert!(is_usage_error(&error), "{error:#}");
+            assert_eq!(exit_status(error_kind(&error)), 2, "{error:#}");
             assert!(!error.to_string().contains("failed:"), "{error}");
-            assert!(is_usage_error(
-                &error.context("outer context").context("caller")
-            ));
+            let error = error.context("outer context").context("caller");
+            assert_eq!(exit_status(error_kind(&error)), 2, "{error:#}");
         }
+        // #438: a refused option inside a band's convert is still one; the
+        // message names the band.
+        let band = step_failed(
+            "pyramid build",
+            PyramidError::band_convert("a", ConvertError::VerbatimPartitioningUnsupported),
+        );
+        assert_eq!(exit_status(error_kind(&band)), 2, "{band:#}");
+        assert!(!band.to_string().contains("pyramid build failed"), "{band}");
         for error in [
             anyhow::anyhow!("untyped run failure"),
             anyhow::Error::new(ExportError::Io(std::io::Error::other("disk full"))),
             anyhow::Error::new(tylertoo_core::Error::Io(std::io::Error::other("disk full"))),
         ] {
-            assert!(!is_usage_error(&error.context("caller")));
+            assert_eq!(exit_status(error_kind(&error.context("caller"))), 1);
+        }
+    }
+
+    /// #438: every kind core gives an error maps to one exit status.
+    #[test]
+    fn exit_status_follows_the_error_kind() {
+        use tylertoo_core::internal::pyramid::PyramidError;
+
+        // Core classifies its own errors (e.g. `BudgetExceeded` is Resource);
+        // this table checks the CLI's kind -> status map.
+        assert_eq!(exit_status(Some(ErrorKind::Resource)), 1);
+        let table: [(anyhow::Error, Option<ErrorKind>, u8); 4] = [
+            (
+                anyhow::Error::new(config::ConfigError::CollapseConflict),
+                Some(ErrorKind::Usage),
+                2,
+            ),
+            (
+                anyhow::Error::new(PyramidError::BandMismatch("empty band".into())),
+                Some(ErrorKind::Input),
+                1,
+            ),
+            (
+                anyhow::Error::new(tylertoo_core::Error::Io(std::io::Error::other("disk"))),
+                Some(ErrorKind::Runtime),
+                1,
+            ),
+            (anyhow::anyhow!("untyped"), None, 1),
+        ];
+        for (error, kind, status) in table {
+            assert_eq!(error_kind(&error), kind, "{error:#}");
+            assert_eq!(exit_status(kind), status, "{error:#}");
         }
     }
 
     #[test]
     fn shard_jobs_retain_the_bound_plan_and_role() {
-        use tylertoo_core::input_set::ConvertSource;
-        use tylertoo_core::shard::{ShardPlan, ShardRole};
+        use tylertoo_core::internal::input_set::ConvertSource;
+        use tylertoo_core::internal::shard::{ShardPlan, ShardRole};
 
         let input = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/streaming/sharding-grid.parquet");
@@ -2359,7 +2389,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                tylertoo_core::overview::tiles::TilesError::Config(
+                tylertoo_core::internal::overview::tiles::TilesError::Config(
                     config::ConfigError::PlanOnlyWithoutSavePlan
                 )
             ),
@@ -2559,7 +2589,7 @@ mod tests {
         // `auto` maps to the core-sized sentinel; case-insensitive.
         assert_eq!(
             parse_in_flight_batches("auto").unwrap(),
-            tylertoo_core::overview::convert::IN_FLIGHT_BATCHES_AUTO
+            tylertoo_core::internal::overview::convert::IN_FLIGHT_BATCHES_AUTO
         );
         assert_eq!(parse_in_flight_batches("AUTO").unwrap(), 0);
         // Explicit positive integers pass through.
@@ -2614,9 +2644,11 @@ mod tests {
     /// they build the right core options.
     #[test]
     fn representation_and_collapse_square_flags() {
-        use tylertoo_core::overview::convert::{ConvertError, LevelPlan, RepresentationBand};
-        use tylertoo_core::overview::level::Mode;
-        use tylertoo_core::overview::simplify::{CollapseMode, Representation};
+        use tylertoo_core::internal::overview::convert::{
+            ConvertError, LevelPlan, RepresentationBand,
+        };
+        use tylertoo_core::internal::overview::level::Mode;
+        use tylertoo_core::internal::overview::simplify::{CollapseMode, Representation};
 
         let a = parse_tiles(&["--representation", "0-7:point,8-13:geom"]);
         assert_eq!(
@@ -2679,16 +2711,8 @@ mod tests {
         assert_eq!(
             opts.representation,
             vec![
-                RepresentationBand {
-                    min_zoom: 0,
-                    max_zoom: 7,
-                    repr: Representation::Point
-                },
-                RepresentationBand {
-                    min_zoom: 8,
-                    max_zoom: 13,
-                    repr: Representation::Geometry
-                },
+                RepresentationBand::new(0, 7, Representation::Point),
+                RepresentationBand::new(8, 13, Representation::Geometry),
             ]
         );
         // #745: no flag is the auto disposition (squares, points under a
@@ -2741,7 +2765,7 @@ mod tests {
         // `auto` maps to the core-sized sentinel; case-insensitive.
         assert_eq!(
             parse_partition_wave("auto").unwrap(),
-            tylertoo_core::overview::export::PARTITION_WAVE_AUTO
+            tylertoo_core::internal::overview::export::PARTITION_WAVE_AUTO
         );
         assert_eq!(parse_partition_wave("AUTO").unwrap(), 0);
         // Explicit positive integers pass through (6 keeps the old behavior).
@@ -2758,7 +2782,7 @@ mod tests {
         let default = parse_tiles(&[]);
         assert_eq!(
             default.export.partition_wave,
-            tylertoo_core::overview::export::PARTITION_WAVE_AUTO
+            tylertoo_core::internal::overview::export::PARTITION_WAVE_AUTO
         );
         // Explicit override is honoured verbatim.
         let overridden = parse_tiles(&["--partition-wave", "6"]);
@@ -2769,7 +2793,7 @@ mod tests {
     fn export_pmtiles_partition_wave_defaults_auto_and_overrides() {
         assert_eq!(
             parse_export(&[]).export.partition_wave,
-            tylertoo_core::overview::export::PARTITION_WAVE_AUTO
+            tylertoo_core::internal::overview::export::PARTITION_WAVE_AUTO
         );
         assert_eq!(
             parse_export(&["--partition-wave", "12"])
@@ -2849,8 +2873,8 @@ mod tests {
         let opts = tiles
             .tuning
             .build_convert_options(
-                tylertoo_core::overview::level::Mode::Duplicating,
-                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                tylertoo_core::internal::overview::level::Mode::Duplicating,
+                tylertoo_core::internal::overview::convert::LevelPlan::ZoomRange {
                     min_zoom: 0,
                     max_zoom: 6,
                 },
@@ -2866,8 +2890,8 @@ mod tests {
         let opts = plain
             .tuning
             .build_convert_options(
-                tylertoo_core::overview::level::Mode::Duplicating,
-                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                tylertoo_core::internal::overview::level::Mode::Duplicating,
+                tylertoo_core::internal::overview::convert::LevelPlan::ZoomRange {
                     min_zoom: 0,
                     max_zoom: 6,
                 },
@@ -2880,12 +2904,12 @@ mod tests {
 
     /// Build convert options for `tiles` with the given flags, on a plain
     /// duplicating z0-6 plan.
-    fn verbatim_opts(flags: &[&str]) -> tylertoo_core::overview::convert::ConvertOptions {
+    fn verbatim_opts(flags: &[&str]) -> tylertoo_core::internal::overview::convert::ConvertOptions {
         parse_tiles(flags)
             .tuning
             .build_convert_options(
-                tylertoo_core::overview::level::Mode::Duplicating,
-                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                tylertoo_core::internal::overview::level::Mode::Duplicating,
+                tylertoo_core::internal::overview::convert::LevelPlan::ZoomRange {
                     min_zoom: 0,
                     max_zoom: 6,
                 },
@@ -2932,10 +2956,8 @@ mod tests {
             "--representation",
             "0-3:point,4-6:geom"
         ])));
-        let partitioning = tylertoo_core::overview::convert::ConvertOptions {
-            mode: tylertoo_core::overview::level::Mode::Partitioning,
-            ..verbatim_opts(&[])
-        };
+        let partitioning = verbatim_opts(&[])
+            .with_mode(tylertoo_core::internal::overview::level::Mode::Partitioning);
         assert!(!makes_placeholder_squares(&partitioning));
     }
 
@@ -2945,7 +2967,7 @@ mod tests {
     /// default. `--collapse-square` still wins.
     #[test]
     fn a_ladder_implies_collapse_to_point_for_every_caller() {
-        use tylertoo_core::overview::simplify::CollapseMode;
+        use tylertoo_core::internal::overview::simplify::CollapseMode;
 
         // The CLI itself leaves the mode alone...
         let cli = verbatim_opts(&["--magnitude-ladder", "level"]);
@@ -3006,8 +3028,8 @@ mod tests {
         let err = parse_tiles(&["--verbatim"])
             .tuning
             .build_convert_options(
-                tylertoo_core::overview::level::Mode::Partitioning,
-                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                tylertoo_core::internal::overview::level::Mode::Partitioning,
+                tylertoo_core::internal::overview::convert::LevelPlan::ZoomRange {
                     min_zoom: 0,
                     max_zoom: 6,
                 },
@@ -3022,8 +3044,8 @@ mod tests {
         assert!(parse_tiles(&["--verbatim"])
             .tuning
             .build_convert_options(
-                tylertoo_core::overview::level::Mode::Duplicating,
-                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                tylertoo_core::internal::overview::level::Mode::Duplicating,
+                tylertoo_core::internal::overview::convert::LevelPlan::ZoomRange {
                     min_zoom: 0,
                     max_zoom: 6,
                 },
@@ -3034,8 +3056,8 @@ mod tests {
         assert!(parse_tiles(&[])
             .tuning
             .build_convert_options(
-                tylertoo_core::overview::level::Mode::Partitioning,
-                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                tylertoo_core::internal::overview::level::Mode::Partitioning,
+                tylertoo_core::internal::overview::convert::LevelPlan::ZoomRange {
                     min_zoom: 0,
                     max_zoom: 6,
                 },
@@ -3097,8 +3119,8 @@ mod tests {
 
     #[test]
     fn tiles_build_convert_options_threads_tuning() {
-        use tylertoo_core::overview::convert::LevelPlan;
-        use tylertoo_core::overview::level::{MemoryProfile, Mode};
+        use tylertoo_core::internal::overview::convert::LevelPlan;
+        use tylertoo_core::internal::overview::level::{MemoryProfile, Mode};
 
         let a = parse_tiles(&[
             "--polygon-visibility",
@@ -3125,7 +3147,7 @@ mod tests {
         assert_eq!(opts.assign.polygon_visibility, 2.0);
         assert_eq!(
             opts.simplify.collapse,
-            tylertoo_core::overview::simplify::CollapseMode::Point
+            tylertoo_core::internal::overview::simplify::CollapseMode::Point
         );
         assert_eq!(opts.density.drop_rate, 1.3);
         assert!(matches!(opts.profile, MemoryProfile::Bounded));
@@ -3133,8 +3155,8 @@ mod tests {
 
     #[test]
     fn build_convert_options_leaves_the_shared_rules_to_core() {
-        use tylertoo_core::overview::convert::{ConvertError, LevelPlan};
-        use tylertoo_core::overview::level::Mode;
+        use tylertoo_core::internal::overview::convert::{ConvertError, LevelPlan};
+        use tylertoo_core::internal::overview::level::Mode;
 
         let levels = || LevelPlan::ZoomRange {
             min_zoom: 0,
@@ -3244,7 +3266,7 @@ mod tests {
     /// with zero I/O; the conversion resolves `auto` over its own source.
     #[test]
     fn max_zoom_sets_the_plan_and_the_auto_flag_without_reading() {
-        use tylertoo_core::overview::convert::LevelPlan;
+        use tylertoo_core::internal::overview::convert::LevelPlan;
         let fixed = tiles_options(&parse_tiles(&["--max-zoom", "9"])).unwrap();
         assert!(!fixed.convert.auto_max_zoom);
         assert!(matches!(
@@ -3262,7 +3284,7 @@ mod tests {
 
     #[test]
     fn resolve_level_plan_gsd_overrides_zoom_range() {
-        use tylertoo_core::overview::convert::LevelPlan;
+        use tylertoo_core::internal::overview::convert::LevelPlan;
 
         // No --gsd → the zoom range is used verbatim.
         match resolve_level_plan(None, 2, 11).unwrap() {
@@ -3285,7 +3307,7 @@ mod tests {
 
     #[test]
     fn tiles_gsd_and_report_flags_thread_through() {
-        use tylertoo_core::overview::convert::LevelPlan;
+        use tylertoo_core::internal::overview::convert::LevelPlan;
 
         // --gsd on `tiles` reaches the same absolute-GSD ladder as `overview`.
         let a = parse_tiles(&["--gsd", "800,400,200"]);
@@ -3311,7 +3333,7 @@ mod tests {
     /// out-of-range value, unclamped.
     #[test]
     fn tiles_passes_an_out_of_range_zoom_through_to_core_unclamped() {
-        use tylertoo_core::overview::convert::LevelPlan;
+        use tylertoo_core::internal::overview::convert::LevelPlan;
 
         let a = parse_tiles(&["--min-zoom", "30", "--max-zoom", "33"]);
         assert_eq!(
@@ -3588,7 +3610,8 @@ mod tests {
     /// full run and on `--plan-only` alike, before anything is converted.
     #[test]
     fn oversized_publication_values_fail_the_export_preflight() {
-        let huge = "\"".repeat(tylertoo_core::compression::MAX_INTERNAL_BYTES as usize / 2);
+        let huge =
+            "\"".repeat(tylertoo_core::internal::compression::MAX_INTERNAL_BYTES as usize / 2);
         let err = tiles_options(&parse_tiles(&["--attribution", &huge]))
             .unwrap()
             .validate()

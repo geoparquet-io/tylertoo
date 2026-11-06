@@ -12,8 +12,8 @@
 use geo::{Coord, Geometry, LineString, Polygon};
 use std::fs;
 use std::path::PathBuf;
-use tylertoo_core::clip::clip_geometry;
-use tylertoo_core::tile::TileBounds;
+use tylertoo_core::internal::clip::clip_geometry;
+use tylertoo_core::internal::tile::TileBounds;
 
 /// Helper to load a GeoJSON polygon from the test fixtures
 fn load_geojson_polygon(fixture_path: &str) -> Polygon<f64> {
@@ -148,7 +148,7 @@ fn test_self_intersecting_polygon_produces_valid_output() {
         &Geometry::Polygon(poly),
         &bounds,
         0.0,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     );
 
     // The result should exist (polygon intersects bounds)
@@ -196,7 +196,7 @@ fn test_hole_intersecting_exterior_produces_valid_output() {
         &Geometry::Polygon(poly),
         &bounds,
         0.0,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     );
 
     assert!(result.is_some(), "Clipping should produce a result");
@@ -259,7 +259,7 @@ fn test_u_shape_split_produces_multipolygon() {
         &Geometry::Polygon(u_shape),
         &bounds,
         0.0,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     );
 
     assert!(result.is_some(), "Clipping should produce a result");
@@ -323,7 +323,7 @@ fn test_valid_polygon_clips_correctly() {
         &Geometry::Polygon(square),
         &bounds,
         0.0,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     );
 
     assert!(result.is_some(), "Clipping should produce a result");
@@ -375,7 +375,7 @@ fn test_valid_polygon_with_hole_clips_correctly() {
         &Geometry::Polygon(poly_with_hole),
         &bounds,
         0.0,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     );
 
     assert!(result.is_some(), "Clipping should produce a result");

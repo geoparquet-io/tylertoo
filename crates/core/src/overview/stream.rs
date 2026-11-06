@@ -76,7 +76,9 @@ use super::simplify::{
     carrier_square, simplify_cascade, simplify_step_at, CascadeFold, CascadeStep, FoldStep,
     Representation, Simplified, SimplifyOptions,
 };
-use super::source::{BatchSource, MemorySource};
+use super::source::BatchSource;
+#[cfg(test)]
+use super::source::MemorySource;
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 use crate::resolved_schema::ResolvedSchema;
 
@@ -2451,6 +2453,8 @@ struct Preflight {
     /// The input declared no CRS and WGS84 was assumed (#451); carried to
     /// the report.
     crs_assumed_wgs84: bool,
+    /// The input's GeoParquet `version` (#708).
+    geo_version: crate::resolved_schema::GeoVersion,
     /// The #543 pass-1 memory verdict this preflight reached, carried to the
     /// `TYLERTOO_PROFILE_JSON` dump (#626 item 4).
     pass1_memory: super::convert::Pass1MemoryReport,
@@ -2499,8 +2503,14 @@ fn preflight_with_memory_limit(
     let (crs, crs_assumed_wgs84) =
         super::convert::crs_from_resolved(&descriptor, &source.display_name(), diagnostics)?;
     if crs_assumed_wgs84 {
-        super::convert::warn_assumed_wgs84(&source.display_name(), diagnostics);
+        super::convert::warn_assumed_wgs84(source, diagnostics);
     }
+    let geo_version = crate::resolved_schema::GeoVersion::of_parts(
+        source
+            .resolved_schemas()?
+            .iter()
+            .map(|r| r.declared_version()),
+    );
 
     // Reserved-column collisions (#288) are resolved BEFORE row-group
     // selection so the attribute filter (#315) can bind against the final
@@ -2641,26 +2651,10 @@ fn preflight_with_memory_limit(
         row_groups_total,
         row_groups_read,
         crs_assumed_wgs84,
+        geo_version,
         pass1_memory,
         pass0: None,
     })
-}
-
-#[cfg(test)]
-pub(super) fn memory_source_for_test(
-    source: &ConvertSource,
-    options: &ConvertOptions,
-    limit: u64,
-) -> Result<(MemorySource, usize), ConvertError> {
-    let diagnostics = crate::diagnostics::Diagnostics::silent();
-    let pre = preflight(source, options, &diagnostics, None)?;
-    let memory = MemorySource::load(
-        source,
-        pre.selected_row_groups.as_ref(),
-        pass1_read_tuning(pre.budget, &pre.options, 0, 0),
-        limit,
-    )?;
-    Ok((memory, pre.row_groups_read))
 }
 
 /// How pass 1 reads its input (#717): pass 2's batch size, reader count and
@@ -2744,6 +2738,8 @@ struct PlanState {
 /// The front half of a streaming convert: the preflight, and pass 1 + the
 /// level assignment (or the `--plan` artifact that replaces them).
 struct FrontHalf {
+    /// The test-only eager input ([`super::source::with_eager_input`]).
+    #[cfg(test)]
     memory: Option<MemorySource>,
     preflight: Preflight,
     plan: PlanState,
@@ -2794,22 +2790,20 @@ fn run_front_half(
     // fingerprint all see.
     let options = &preflight.options;
     let config = options.validate()?;
-    let memory = if options.streaming {
-        None
-    } else {
-        Some(MemorySource::load(
-            source,
-            preflight.selected_row_groups.as_ref(),
-            pass1_read_tuning(preflight.budget, options, 0, 0),
-            tylertoo_io::byte_array_limit(),
-        )?)
-    };
-    if let Some(memory) = &memory {
-        preflight
-            .budget
-            .reserve(MemoryPhase::EagerInput, memory.resident_bytes())?;
-    }
+    #[cfg(test)]
+    let memory = super::source::eager_input()
+        .then(|| {
+            MemorySource::load(
+                source,
+                preflight.selected_row_groups.as_ref(),
+                pass1_read_tuning(preflight.budget, options, 0, 0),
+            )
+        })
+        .transpose()?;
+    #[cfg(test)]
     let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
+    #[cfg(not(test))]
+    let reader: &dyn BatchSource = source;
     let plan = resolve_plan_state(
         &Pass1Ctx {
             descriptor: &preflight.descriptor,
@@ -2830,6 +2824,7 @@ fn run_front_half(
     Ok(FrontHalf {
         preflight,
         plan,
+        #[cfg(test)]
         memory,
     })
 }
@@ -2851,9 +2846,7 @@ pub(crate) fn write_plan_streaming(
     // so the #571 background sampler would have no reader.
     let mut rss = RssTracker::new(false, "preflight");
     let FrontHalf {
-        preflight,
-        plan,
-        memory: _,
+        preflight, plan, ..
     } = run_front_half(source, options, false, &mut rss, diagnostics, None)?;
     let options = &preflight.options;
     let path = options
@@ -3161,17 +3154,11 @@ fn load_plan_state(
     // compacted table must be exactly as long as what the shard will read.
     if options.shard.is_some() {
         if plan.coalesce.as_ref().is_some_and(|c| !c.rows.is_empty()) {
-            return Err(ConvertError::InvalidConfig(format!(
-                "--shard is not supported with line coalescing: {} carries {} coalesced line \
-                 chain(s). A chain is a NEW geometry spanning every row it merged, so no \
-                 single input row group's bbox bounds it — the shard that holds the chain's \
-                 row would emit tiles outside its own range while the neighbouring shard, \
-                 which never reads that row, would emit none, leaving a gap at the seam. \
-                 Re-run the whole fleet (including the coarse job, so the plan matches) with \
-                 --no-coalesce-lines.",
-                path.display(),
-                plan.coalesce.as_ref().map_or(0, |c| c.rows.len()),
-            )));
+            return Err(super::convert::InvalidOption::ShardWithCoalescedLines {
+                plan: path.to_path_buf(),
+                chains: plan.coalesce.as_ref().map_or(0, |c| c.rows.len()),
+            }
+            .into());
         }
         super::plan_state::rebase_plan_for_shard(&mut plan, source, selected_row_groups, path)?;
     }
@@ -3183,7 +3170,7 @@ fn load_plan_state(
     }
     let will_stream = source.selected_row_count(selected_row_groups)?;
     if will_stream != plan.min_levels.len() as i64 {
-        return Err(ConvertError::InvalidConfig(format!(
+        return Err(super::convert::InvalidOption::plan(format!(
             "--plan: {} does not match this run's input: the plan holds {} winner-table \
              row(s) but the row group(s) this run will read hold {will_stream} row(s). \
              Re-run without --plan (add --save-plan to write a fresh one).",
@@ -3205,7 +3192,7 @@ fn load_plan_state(
             .map(|e| e.aggregates.len())
             .find(|&n| n != want)
         {
-            return Err(ConvertError::InvalidConfig(format!(
+            return Err(super::convert::InvalidOption::plan(format!(
                 "--plan: {} has cluster entries carrying {got} aggregate(s) but this run \
                  declares {want} --accumulate spec(s)",
                 path.display(),
@@ -3213,7 +3200,7 @@ fn load_plan_state(
         }
     }
     if plan.counts.len() != plan.level_specs.len() || plan.finest >= plan.level_specs.len() {
-        return Err(ConvertError::InvalidConfig(format!(
+        return Err(super::convert::InvalidOption::plan(format!(
             "--plan: {} has an inconsistent level plan ({} spec(s), {} count(s), finest {})",
             path.display(),
             plan.level_specs.len(),
@@ -3337,6 +3324,7 @@ pub(crate) fn run_stages(
     let FrontHalf {
         preflight,
         plan,
+        #[cfg(test)]
         memory,
     } = run_front_half(
         source,
@@ -3346,7 +3334,10 @@ pub(crate) fn run_stages(
         diagnostics,
         Some(output_path),
     )?;
+    #[cfg(test)]
     let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
+    #[cfg(not(test))]
+    let reader: &dyn BatchSource = source;
     let Preflight {
         descriptor,
         budget,
@@ -3362,6 +3353,7 @@ pub(crate) fn run_stages(
         row_groups_total,
         row_groups_read,
         crs_assumed_wgs84,
+        geo_version,
         pass1_memory: preflight_report,
         pass0,
     } = preflight;
@@ -3619,6 +3611,7 @@ pub(crate) fn run_stages(
         start,
         effective_max_row_group_size,
         crs_assumed_wgs84,
+        geo_version,
     })
     .with_diagnostics(diagnostics)
 }
@@ -3643,6 +3636,7 @@ struct ConvertReportInputs<'a> {
     effective_max_row_group_size: Option<usize>,
     /// The input declared no CRS and WGS84 was assumed (#451).
     crs_assumed_wgs84: bool,
+    geo_version: crate::resolved_schema::GeoVersion,
 }
 
 fn build_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
@@ -3666,6 +3660,7 @@ fn build_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
         out_of_range_exemplars: inputs.tallies.out_of_range_exemplars,
         wrapped_features: inputs.tallies.wrapped,
         crs_assumed_wgs84: inputs.crs_assumed_wgs84,
+        geo_version: inputs.geo_version,
         duration_secs: inputs.start.elapsed().as_secs_f64(),
         remote_fetch: super::convert::log_remote_fetch(inputs.source),
         effective_max_row_group_size: inputs.effective_max_row_group_size,
@@ -5015,14 +5010,12 @@ fn decode_error_at_rows(diag_row_base: usize, chunk_len: usize, e: crate::Error)
     if matches!(&e, crate::Error::Accounting(_)) {
         return e;
     }
-    let inner = match &e {
-        crate::Error::GeoParquetRead(msg) => msg.clone(),
-        other => other.to_string(),
-    };
-    crate::Error::GeoParquetRead(format!(
-        "rows {diag_row_base}..{}: {inner}",
-        diag_row_base + chunk_len
-    ))
+    crate::GeoParquetReadError::AtRows {
+        start: diag_row_base,
+        end: diag_row_base + chunk_len,
+        error: Box::new(e),
+    }
+    .into()
 }
 
 /// One usable pass-1 row as [`ScanRows`] found it: kind and bbox from
@@ -5068,9 +5061,12 @@ impl GeoArrowVisitor for ScanRows<'_> {
     {
         let mut out = Vec::with_capacity(accessor.len());
         for (i, item) in accessor.iter().enumerate() {
-            let item = item.transpose().map_err(|e| {
-                crate::Error::GeoParquetRead(format!("Invalid geometry at index {i}: {e}"))
-            })?;
+            let item =
+                item.transpose()
+                    .map_err(|e| crate::GeoParquetReadError::InvalidGeometry {
+                        index: i,
+                        message: e.to_string(),
+                    })?;
             if self.filter_mask.is_some_and(|m| m[i] != Some(true)) {
                 self.diagnostics.source_loss(
                     (self.row_base + i) as u64,
@@ -5158,7 +5154,11 @@ fn scan_chunk(
         decode_error_at_rows(
             diag_row_base,
             chunk_len,
-            crate::Error::GeoParquetRead(format!("geometry decode: {e}")),
+            crate::GeoParquetReadError::Decode {
+                stage: "geometry decode",
+                message: e.to_string(),
+            }
+            .into(),
         )
     })?;
     let rows = visit_geoarrow_array(
@@ -5613,10 +5613,9 @@ fn run_pass1_with_chunk_rows(
         .as_ref()
         .map(|spec| {
             input_schema.index_of(&spec.column).map_err(|_| {
-                ConvertError::InvalidConfig(format!(
-                    "entry-zoom column {:?} not found in the input schema",
-                    spec.column
-                ))
+                ConvertError::from(super::convert::InvalidOption::EntryZoomColumnMissing {
+                    column: spec.column.clone(),
+                })
             })
         })
         .transpose()?;
@@ -6385,7 +6384,7 @@ fn decode_selected_geometries(
         let geom_taken = take(batch.column(ctx.geom_idx).as_ref(), &take_idx, None)?;
         let schema = batch.schema();
         let garr = from_arrow_array(geom_taken.as_ref(), schema.field(ctx.geom_idx))
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+            .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
         extract_geometries_from_array(garr.as_ref(), &mut geoms, ctx.diagnostics)?;
     }
     Ok(geoms)
@@ -7144,11 +7143,12 @@ mod tests {
         write_input_with_f64(file.path(), &geoms, "rank", &[1.0, 2.0]);
         for streaming in [false, true] {
             let options = ConvertOptions {
-                streaming,
                 bbox: Some([-1.0, -1.0, 1.0, 1.0]),
                 ..Default::default()
             };
-            let scan = run_pass1_for_test(file.path(), &options, 1);
+            let scan = super::super::source::with_eager_input(!streaming, || {
+                run_pass1_for_test(file.path(), &options, 1)
+            });
             assert_eq!(
                 scan.num_rows, 2,
                 "both rows in the retained row group are scanned"
@@ -7165,16 +7165,15 @@ mod tests {
         diagnostics: &crate::diagnostics::Diagnostics,
     ) -> Result<Pass1Output, ConvertError> {
         let config = pre.options.validate()?;
-        let memory = if pre.options.streaming {
-            None
-        } else {
-            Some(MemorySource::load(
-                source,
-                pre.selected_row_groups.as_ref(),
-                pass1_read_tuning(pre.budget, &pre.options, 0, 0),
-                tylertoo_io::byte_array_limit(),
-            )?)
-        };
+        let memory = super::super::source::eager_input()
+            .then(|| {
+                MemorySource::load(
+                    source,
+                    pre.selected_row_groups.as_ref(),
+                    pass1_read_tuning(pre.budget, &pre.options, 0, 0),
+                )
+            })
+            .transpose()?;
         run_pass1_with_chunk_rows(
             &Pass1Ctx {
                 source,

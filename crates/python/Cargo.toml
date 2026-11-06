@@ -31,12 +31,12 @@ dhat-heap = ["tylertoo-core/dhat-heap"]
 
 [dependencies]
 tylertoo-core = { workspace = true, features = ["remote"] }
-# abi3-py39: build against CPython's stable ABI so a single wheel per
-# platform covers every CPython >= 3.9 (matching `requires-python`).
+# abi3-py311: build against CPython's stable ABI so a single wheel per
+# platform covers every CPython >= 3.11 (matching `requires-python`).
 # This binding is a thin facade over tylertoo-core -- it only uses the
 # pyo3 safe API, no version-specific C API -- so the stable ABI costs
 # nothing here.
-pyo3 = { workspace = true, features = ["abi3-py39"] }
+pyo3 = { workspace = true, features = ["abi3-py311"] }
 pyo3-log = { workspace = true }
 # Report structs (already serde::Serialize in core) to Python dicts.
 pythonize = "0.29"

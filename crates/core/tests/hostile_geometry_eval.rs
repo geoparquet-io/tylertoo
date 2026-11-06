@@ -85,12 +85,12 @@ use geo::{
     MultiPolygon, Polygon, Validation, Winding,
 };
 
-use tylertoo_core::clip::{clip_geometry, clip_geometry_simple, geometry_is_simple};
-use tylertoo_core::ioverlay_clip::{
+use tylertoo_core::internal::clip::{clip_geometry, clip_geometry_simple, geometry_is_simple};
+use tylertoo_core::internal::ioverlay_clip::{
     clip_multilinestring_ioverlay, clip_multipolygon_ioverlay, clip_polygon_ioverlay,
 };
-use tylertoo_core::sutherland_hodgman::{clip_multipolygon_sh, clip_polygon_sh};
-use tylertoo_core::tile::{tiles_for_bbox, TileBounds, TileCoord};
+use tylertoo_core::internal::sutherland_hodgman::{clip_multipolygon_sh, clip_polygon_sh};
+use tylertoo_core::internal::tile::{tiles_for_bbox, TileBounds, TileCoord};
 
 // ============================================================================
 // Peak-heap counting allocator
@@ -933,7 +933,7 @@ fn engine_production(g: &Geometry<f64>, c: &Case, simple: bool) -> Option<Geomet
         buf,
         simple,
         true,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     )
 }
 
@@ -943,7 +943,7 @@ fn engine_production_strict(g: &Geometry<f64>, c: &Case, _simple: bool) -> Optio
         g,
         &c.tile,
         buf,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     )
 }
 
@@ -962,18 +962,18 @@ fn engine_ioverlay(g: &Geometry<f64>, c: &Case, _simple: bool) -> Option<Geometr
         Geometry::Polygon(p) => clip_polygon_ioverlay(
             p,
             &c.bounds,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
         ),
         Geometry::MultiPolygon(mp) => clip_multipolygon_ioverlay(
             mp,
             &c.bounds,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
         ),
         Geometry::LineString(l) => {
             let out = clip_multilinestring_ioverlay(
                 &MultiLineString::new(vec![l.clone()]),
                 &c.bounds,
-                &tylertoo_core::diagnostics::Diagnostics::default(),
+                &tylertoo_core::internal::diagnostics::Diagnostics::default(),
             );
             (!out.0.is_empty()).then_some(Geometry::MultiLineString(out))
         }
@@ -981,7 +981,7 @@ fn engine_ioverlay(g: &Geometry<f64>, c: &Case, _simple: bool) -> Option<Geometr
             let out = clip_multilinestring_ioverlay(
                 ml,
                 &c.bounds,
-                &tylertoo_core::diagnostics::Diagnostics::default(),
+                &tylertoo_core::internal::diagnostics::Diagnostics::default(),
             );
             (!out.0.is_empty()).then_some(Geometry::MultiLineString(out))
         }

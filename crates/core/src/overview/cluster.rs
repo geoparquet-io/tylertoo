@@ -65,6 +65,7 @@ pub const POINT_COUNT_COLUMN: &str = "point_count";
 
 /// Numeric aggregation operators for `--accumulate-attribute` (Q6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AccumulateOp {
     /// Sum of the non-null values.
     Sum,
@@ -102,11 +103,22 @@ impl AccumulateOp {
 
 /// One `--accumulate-attribute col:op` request.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AccumulateSpec {
     /// Numeric source column whose values are aggregated across a cluster.
     pub column: String,
     /// Aggregation operator.
     pub op: AccumulateOp,
+}
+
+impl AccumulateSpec {
+    /// Aggregate `column` with `op`.
+    pub fn new(column: impl Into<String>, op: AccumulateOp) -> Self {
+        Self {
+            column: column.into(),
+            op,
+        }
+    }
 }
 
 /// A non-singleton cluster at one level: the winner's `point_count` and its

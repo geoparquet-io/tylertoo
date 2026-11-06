@@ -27,7 +27,7 @@
 //!    partition (see `process_wave`). Sharing one read+decode across a wave
 //!    replaces the old per-partition re-read (issue #228): a level now costs
 //!    `ceil(P / PARTITION_WAVE)` band reads, not `P`. The per-tile clips reuse
-//!    the [`clip_geometry_simple`] entry point, MVT-encode via [`crate::mvt`],
+//!    the [`clip_geometry_simple`] entry point, MVT-encode via `crate::mvt`,
 //!    and each finished partition's tiles stream immediately to
 //!    [`StreamingPmtilesWriter`]. Tiles are written in ascending PMTiles
 //!    tile-id order per zoom, and levels export in ascending zoom, so the
@@ -270,6 +270,7 @@ pub const DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize = 500 * 1024;
 /// points always takes the stride of [`SizeValve::Drop`]. See
 /// `overview::export::coalesce_valve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum SizeValve {
     /// Merge the densest lines and polygons, re-measure, and repeat until
     /// the tile fits (the default).
@@ -320,6 +321,7 @@ use crate::tile::WEBMERC_HALF_M;
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(feature = "cli", command(group(clap::ArgGroup::new("export_only").multiple(true))))]
+#[non_exhaustive]
 pub struct ExportOptions {
     /// MVT layer name written into every tile and the archive metadata.
     #[cfg_attr(feature = "cli", arg(long, default_value_t = Self::default().layer_name))]
@@ -526,12 +528,9 @@ pub struct ExportOptions {
     /// tiny-polygon carrier its own. Uniqueness across source rows is not
     /// checked.
     ///
-    /// Default `None`: every feature keeps the tile-local member index it has
-    /// always had (unique only within a single tile/zoom pair -- see
-    /// `build_mvt`). Whether that no-flag default should instead omit the
-    /// id entirely is an open question (#443) this option does not decide.
+    /// Default `None`: features have no MVT id.
     #[cfg_attr(feature = "cli", arg(long, value_name = "COLUMN"))]
-    #[cfg_attr(feature = "cli", arg(help = "Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. Defaults to tile-local ids", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. By default features have no id", long_help = None))]
     pub feature_id: Option<String>,
     /// Directory for the export's member spill file (#427) -- the on-disk
     /// backing the partitioning single-read pass 2 (#235) falls back to when
@@ -582,6 +581,27 @@ pub struct ExportOptions {
     #[cfg_attr(feature = "cli", arg(skip = Self::default().metadata))]
     pub metadata: TilesetMetadata,
 }
+
+with_setters!(ExportOptions {
+    with_layer_name => layer_name: String,
+    with_tile_buffer => tile_buffer: u32,
+    with_extent => extent: u32,
+    with_tile_size_limit => tile_size_limit: Option<usize>,
+    with_compressed_tile_size_limit => compressed_tile_size_limit: Option<usize>,
+    with_size_valve => size_valve: SizeValve,
+    with_coverage_fill => coverage_fill: bool,
+    with_simple_clip_fastpath => simple_clip_fastpath: bool,
+    with_partition_wave => partition_wave: usize,
+    with_feature_order => feature_order: FeatureOrder,
+    with_min_zoom => min_zoom: Option<u8>,
+    with_properties => properties: PropertySelection,
+    with_tile_range => tile_range: Option<crate::shard::TileRange>,
+    with_zoom_ceiling => zoom_ceiling: Option<u8>,
+    with_feature_id => feature_id: Option<String>,
+    with_spill_dir => spill_dir: Option<PathBuf>,
+    with_profile => profile: MemoryProfile,
+    with_metadata => metadata: TilesetMetadata,
+});
 
 impl Default for ExportOptions {
     fn default() -> Self {
@@ -643,6 +663,7 @@ impl ExportOptions {
     /// missing spill directory, or [`ConfigError::MetadataTooLarge`] if
     /// `metadata` is too large for an archive's metadata.
     /// Validate these options and return the immutable engine configuration.
+    #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConfigError> {
         super::config::validate_export(self)
     }
@@ -693,6 +714,7 @@ fn check_metadata_size(metadata: &TilesetMetadata) -> Result<(), ConfigError> {
 
 /// Per-zoom statistics in an [`ExportReport`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct ZoomReport {
     /// Web Mercator zoom this level was exported at.
     pub zoom: u8,
@@ -744,6 +766,7 @@ pub struct ZoomReport {
 
 /// Result of an export, `Serialize` for the `--report` JSON.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct ExportReport {
     /// Exact source losses, disjoint from any source emitted at that zoom.
     pub source_losses: crate::diagnostics::SourceLosses,
@@ -794,6 +817,7 @@ pub struct ExportReport {
 /// A property column the export dropped because its Arrow type has no MVT
 /// encoding (#434). See [`ExportReport::skipped_property_columns`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct SkippedPropertyColumn {
     /// The column's name as the tile would have published it.
     pub name: String,
@@ -823,6 +847,7 @@ pub enum ExportError {
     /// the preflight escape hatch: `TYLERTOO_SKIP_MEMORY_PREFLIGHT` covers
     /// the up-front checks only, never this one.
     #[error("io error: {phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter.")]
+    #[non_exhaustive]
     BudgetExceeded {
         /// Export phase that cannot fit.
         phase: &'static str,
@@ -836,12 +861,15 @@ pub enum ExportError {
     Io(#[from] std::io::Error),
     /// Arrow error decoding a level batch.
     #[error("arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Arrow(#[source] arrow_schema::ArrowError),
     /// A core-library error (geometry decode, PMTiles write).
     #[error("{0}")]
     Core(#[from] crate::Error),
     /// The input CRS is neither EPSG:4326 nor EPSG:3857.
     #[error("unsupported CRS {crs:?} in {path}: export requires EPSG:4326 or EPSG:3857")]
+    #[non_exhaustive]
     UnsupportedCrs {
         /// The rejected CRS identifier.
         crs: String,
@@ -853,6 +881,7 @@ pub enum ExportError {
         "{} has no geometry column",
         path.as_deref().unwrap_or("an overview batch")
     )]
+    #[non_exhaustive]
     NoGeometryColumn {
         /// The overview file (#452). `None` only from per-batch decoding,
         /// which runs after the file's own check has passed, so it means a
@@ -865,6 +894,7 @@ pub enum ExportError {
          {coarsest}): the declared zoom range can widen over empty zooms, not narrow \
          over real tiles (#380)"
     )]
+    #[non_exhaustive]
     DeclaredMinZoomTooFine { declared: u8, coarsest: u8 },
 
     /// A level resolves to a zoom above [`crate::tile::MAX_ZOOM`] (#371).
@@ -880,6 +910,7 @@ pub enum ExportError {
          maximum supported zoom {ceiling}; beyond z{ceiling} the tile grid overflows \
          32-bit tile coordinates and the PMTiles Hilbert tile-id arithmetic (#371)"
     )]
+    #[non_exhaustive]
     LevelZoomAboveCeiling {
         /// Index of the offending level.
         level: usize,
@@ -903,6 +934,7 @@ pub enum ExportError {
         "overview level {level} has gsd {gsd}, which is not a finite positive ground \
          sample distance in meters (#371)"
     )]
+    #[non_exhaustive]
     LevelGsdNotFinitePositive {
         /// Index of the offending level.
         level: usize,
@@ -929,6 +961,7 @@ pub enum ExportError {
          geometry into a tile from a row group the shard never read. Lower --tile-buffer to \
          {max} or less (the default is 8), or build without --tile-range."
     )]
+    #[non_exhaustive]
     TileBufferTooWideForShard {
         /// The requested buffer, in tile pixels.
         buffer: u32,
@@ -948,6 +981,7 @@ pub enum ExportError {
          stops at z{finest}. A --tile-range's pivot must be no finer than the overview's \
          finest level, and a coarse job's zoom ceiling no coarser than its coarsest."
     )]
+    #[non_exhaustive]
     RestrictionEmitsNoZoom {
         /// The coarsest zoom the restriction would emit.
         coarsest: u8,
@@ -970,6 +1004,7 @@ pub enum ExportError {
             None => " and cannot be exported as a whole pyramid".to_string(),
         }
     )]
+    #[non_exhaustive]
     PartialOverview {
         /// The ceiling recorded in the file's footer.
         recorded: u8,
@@ -979,6 +1014,7 @@ pub enum ExportError {
 
     /// `--min-zoom` is above [`crate::tile::MAX_ZOOM`] (#371).
     #[error("--min-zoom {declared} is above the maximum supported zoom {ceiling} (#371)")]
+    #[non_exhaustive]
     DeclaredMinZoomAboveCeiling {
         /// The requested minimum zoom.
         declared: u8,
@@ -1008,6 +1044,7 @@ pub enum ExportError {
          both resolve to zoom {zoom}; every level must resolve to a distinct, strictly \
          increasing zoom"
     )]
+    #[non_exhaustive]
     LevelZoomsNotAscending {
         /// Index of the earlier, colliding level.
         previous_level: usize,
@@ -1027,6 +1064,7 @@ pub enum ExportError {
         "included property {name:?} is not a property this overview file exports \
          (exportable: {available})"
     )]
+    #[non_exhaustive]
     UnknownProperty { name: String, available: String },
 
     /// `--include-property` names a column the file has but the export
@@ -1040,6 +1078,7 @@ pub enum ExportError {
          timestamps, decimals, and struct/list/map columns as JSON strings); cast or \
          encode it as text first, e.g. with gpio or DuckDB"
     )]
+    #[non_exhaustive]
     UnsupportedProperty { name: String, data_type: String },
 
     /// `--include-property` names the geometry's bbox covering struct
@@ -1051,12 +1090,14 @@ pub enum ExportError {
         "included property {name:?} is the geometry's bbox covering, not a property; \
          the writer regenerates it, so it cannot be selected"
     )]
+    #[non_exhaustive]
     CoveringProperty { name: String },
 
     #[error(
         "property {name:?} is excluded but {knob} reads it; keep it in the selection or \
          drop the knob"
     )]
+    #[non_exhaustive]
     PropertyRequiredByKnob { name: String, knob: String },
 
     /// `--feature-id` (#443) names a column that cannot supply MVT feature
@@ -1064,6 +1105,7 @@ pub enum ExportError {
     /// column, or aggregated by `--accumulate-attribute`. Raised before any
     /// row is read.
     #[error("--feature-id column {column:?} {reason}")]
+    #[non_exhaustive]
     FeatureIdColumn {
         /// The `--feature-id` column, as the caller named it.
         column: String,
@@ -1080,6 +1122,7 @@ pub enum ExportError {
          {level}, z{zoom}; the overview file's own row order, not the source file's): every \
          exported feature needs a non-negative integer id"
     )]
+    #[non_exhaustive]
     InvalidFeatureId {
         /// The `--feature-id` column, as the caller named it.
         column: String,
@@ -1112,6 +1155,7 @@ pub enum ExportError {
         human_bytes(*.estimate_bytes),
         human_bytes(*.available_bytes)
     )]
+    #[non_exhaustive]
     TileExceedsMemory {
         /// 0-based overview level.
         level: usize,
@@ -1132,16 +1176,30 @@ pub enum ExportError {
     },
 }
 
-impl ExportError {
-    /// Whether this is an option the caller must fix, refused before the
-    /// overview file is read ([`ExportOptions::validate`], #779), as opposed
-    /// to a problem with the file or the run. The Python bindings raise these
-    /// as `tylertoo.ConfigError`.
-    pub fn is_config(&self) -> bool {
-        matches!(
-            self,
-            ExportError::Config(_) | ExportError::DeclaredMinZoomAboveCeiling { .. }
-        )
+#[doc(hidden)]
+impl From<arrow_schema::ArrowError> for ExportError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        ExportError::Arrow(e)
+    }
+}
+
+impl crate::error::Classify for ExportError {
+    /// [`ErrorKind::Usage`](crate::error::ErrorKind::Usage) is an option
+    /// refused before the overview file is read ([`ExportOptions::validate`],
+    /// #779); a property selection the file cannot satisfy is
+    /// [`ErrorKind::Input`](crate::error::ErrorKind::Input).
+    fn kind(&self) -> crate::error::ErrorKind {
+        use crate::error::ErrorKind;
+        match self {
+            ExportError::Config(_) | ExportError::DeclaredMinZoomAboveCeiling { .. } => {
+                ErrorKind::Usage
+            }
+            ExportError::UnknownProperty { .. }
+            | ExportError::UnsupportedProperty { .. }
+            | ExportError::CoveringProperty { .. }
+            | ExportError::PropertyRequiredByKnob { .. } => ErrorKind::Input,
+            _ => crate::error::fallback_kind(self),
+        }
     }
 }
 
@@ -3646,8 +3704,7 @@ struct Member {
     props: SharedProps,
     /// `Some` on every member when [`ExportOptions::feature_id`] is set
     /// (every row of the file validated up front, #443); `None` when it is
-    /// not, in which case [`build_mvt`] falls back to the tile-local member
-    /// index.
+    /// not, in which case the MVT id is omitted.
     id: Option<u64>,
     /// The feature's density gap (#745): how far it lies from the row before
     /// it, in squared Web Mercator world units. The size valve merges the
@@ -5202,8 +5259,11 @@ fn covering_batch_bboxes(
     names: &[String; 4],
     crs: Crs,
 ) -> Result<Option<Vec<Option<TileBounds>>>, ExportError> {
-    let not_covering =
-        || crate::Error::GeoParquetRead(format!("bbox covering {column:?} is not an f64 struct"));
+    let not_covering = || {
+        crate::Error::from(crate::GeoParquetReadError::CoveringNotF64Struct {
+            column: column.to_string(),
+        })
+    };
     let strukt = batch
         .column_by_name(column)
         .and_then(|c| c.as_struct_opt())
@@ -5275,7 +5335,7 @@ fn decode_batch_bboxes(
     let geom_field = schema.field(geom_idx).clone();
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+            .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
     let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
     extract_geometries_from_array(garr.as_ref(), &mut geoms, diagnostics)?;
     let bboxes = geoms
@@ -5787,7 +5847,7 @@ fn decode_batch_geometries(
     let geom_field = schema.field(geom_idx).clone();
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+            .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
     let chunks: Vec<Vec<Geometry<f64>>> = collect_chunks(batch.num_rows())
         .map(|range| {
             ExportTimers::time(&timers.decode, || {
@@ -6007,12 +6067,9 @@ fn collect_member_chunk(
     };
     for (i, items) in items.iter_mut().enumerate() {
         let row = first + i;
-        let source_row = input
-            .locator
-            .global_row(input.first_read + row)
-            .ok_or_else(|| {
-                crate::Error::GeoParquetRead("export read exceeded its selected row domain".into())
-            })?;
+        let source_row = input.locator.global_row(input.first_read + row).ok_or(
+            crate::Error::GeoParquetRead(crate::GeoParquetReadError::RowDomainExceeded),
+        )?;
         let (props, id) = attrs.row(i)?;
         if let Some(id) = id {
             out.losses.push((source_row, id));
@@ -6824,6 +6881,7 @@ fn members_recursive_vec(
 /// tippecanoe specified one before, which made a tiler swap a silent visual
 /// change; naming it makes it something a caller can depend on.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum FeatureOrder {
     /// Input row order — the overview file's row order, which is the source
     /// file's row order restricted to the rows the level kept. This is what
@@ -8022,9 +8080,6 @@ fn build_mvt_with<M: TileFeature>(
     fill: &[&FillFeature],
     encode: impl Fn(&M) -> EncodedFeatureGeometry + Sync,
 ) -> TileMvt {
-    // #443: a resolved `--feature-id` always wins; the no-flag default
-    // (`m.id` is `None`) keeps the pre-#443 tile-local member index.
-    let id_of = |i: usize, m: &M| Some(m.feature_id().unwrap_or(i as u64));
     let mut source_ids = Vec::new();
     let mut source_losses = Vec::new();
     let mut track = |id: Option<u64>, geom: &EncodedFeatureGeometry| {
@@ -8054,19 +8109,18 @@ fn build_mvt_with<M: TileFeature>(
         // Intern and emit each chunk in original member order; only geometry
         // projection runs in parallel, exactly as before.
         const GEOMETRY_CHUNK_MEMBERS: usize = 4096;
-        for (chunk_index, chunk) in members.chunks(GEOMETRY_CHUNK_MEMBERS).enumerate() {
+        for chunk in members.chunks(GEOMETRY_CHUNK_MEMBERS) {
             let encoded: Vec<EncodedFeatureGeometry> = chunk.par_iter().map(&encode).collect();
-            for (offset, (m, geom)) in chunk.iter().zip(encoded).enumerate() {
-                let i = chunk_index * GEOMETRY_CHUNK_MEMBERS + offset;
+            for (m, geom) in chunk.iter().zip(encoded) {
                 track(m.feature_id().map(|_| m.source_row()), &geom);
-                layer.add_encoded_feature(id_of(i, m), geom, m.properties());
+                layer.add_encoded_feature(m.feature_id(), geom, m.properties());
             }
         }
     } else {
-        for (i, m) in members.iter().enumerate() {
+        for m in members {
             let geom = encode(m);
             track(m.feature_id().map(|_| m.source_row()), &geom);
-            layer.add_encoded_feature(id_of(i, m), geom, m.properties());
+            layer.add_encoded_feature(m.feature_id(), geom, m.properties());
         }
     }
     // The fill is drawn but is not the data's own features: the report,
@@ -8222,7 +8276,7 @@ fn decode_batch(
     // Decode geometries.
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+            .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
     let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
     extract_geometries_from_array(
         garr.as_ref(),
@@ -9369,8 +9423,11 @@ fn detect_crs(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Crs, ExportError> {
     let file = File::open(path).map_err(crate::Error::Io)?;
-    let metadata = tylertoo_io::read_parquet_metadata(&file)
-        .map_err(|e| crate::Error::GeoParquetRead(e.to_string()))?;
+    let metadata = tylertoo_io::read_parquet_metadata(&file).map_err(|e| {
+        crate::Error::from(crate::GeoParquetReadError::Schema {
+            message: e.to_string(),
+        })
+    })?;
     let descriptor = crate::resolved_schema::ResolvedSchema::from_metadata(&metadata)?;
     crs_from_descriptor(&descriptor, path, diagnostics)
 }
@@ -9682,7 +9739,8 @@ mod tests {
             // its contents did not -- the tile-data section, root directory
             // and metadata all hash the same as before. See the REPIN note
             // above this test for the full before/after evidence.
-            "16b372437283d228",
+            // #443: default features no longer carry tile-local ids.
+            "caf04e1922c86b7b",
             "archive bytes diverged from the pre-refactor reference"
         );
 
@@ -11339,7 +11397,7 @@ mod tests {
 
         for tile_members in [&members[..], &members[..40]] {
             let mut serial = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
-            for (i, m) in tile_members.iter().enumerate() {
+            for m in tile_members {
                 // Through the public `String`-keyed entry point, so this
                 // also pins that the export's interned `Arc<str>` keys
                 // (#461) encode the same bytes.
@@ -11349,7 +11407,7 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v.clone()))
                     .collect();
                 serial.add_feature(
-                    Some(i as u64),
+                    m.feature_id(),
                     &m.geom,
                     &props,
                     &tb,
@@ -16796,7 +16854,11 @@ mod tests {
             ..ExportOptions::default()
         };
         let err = export_pmtiles(tin.path(), tout.path(), &opts).unwrap_err();
-        assert!(err.is_config(), "got: {err}");
+        assert_eq!(
+            crate::error::Classify::kind(&err),
+            crate::error::ErrorKind::Usage,
+            "got: {err}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("33"), "error names the value: {msg}");
         assert!(msg.contains("--min-zoom"), "error names the flag: {msg}");
@@ -18219,10 +18281,9 @@ mod tests {
         }
     }
 
-    /// With no `--feature-id`, a feature's id is its member index, in the
-    /// parallel encode's later chunks too.
+    /// With no `--feature-id`, even later parallel chunks omit feature ids.
     #[test]
-    fn build_mvt_numbers_members_past_the_first_parallel_chunk() {
+    fn build_mvt_omits_ids_past_the_first_parallel_chunk() {
         let tb = TileCoord::new(0, 0, 1).bounds();
         let n = 4096 + 3;
         let members: Vec<Member> = (0..n)
@@ -18253,7 +18314,7 @@ mod tests {
             .iter()
             .map(|f| f.id)
             .collect();
-        assert_eq!(ids, (0..n as u64).map(Some).collect::<Vec<_>>());
+        assert_eq!(ids, vec![None; n]);
     }
 }
 

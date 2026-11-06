@@ -288,3 +288,74 @@ z10 missed 50.4% at 0.25 and 57.3% at 0, Moldova at z5 31.4% and 41.4%.
 
 With the defaults, dense sub-pixel polygons still appear as overlapping
 squares that can extend into gaps between fields. Issue #750 tracks this behavior.
+
+## Missing coverage at z4–z8, Madagascar admin-4 (#450 phase 0)
+
+Release build of `v09/data-checks` (base 9fca046), input
+`madagascar-adm4-hilbert.parquet` (sha256 6f666e18...), `tylertoo tiles
+--min-zoom 0 --max-zoom 12`, scored with `tile_metrics.py --zooms 4,5,6,7,8
+--max-tiles 150`. Missing share of source area, mean over the tiles with at least 1% source cover
+(4, 4, 5, 15, 42 tiles at z4–z8, of 4, 4, 7, 16, 44 in the archive; n is small
+because Madagascar is small and this is one country):
+
+| Settings | z4 | z5 | z6 | z7 | z8 | Archive |
+|---|---|---|---|---|---|---|
+| default | 11.78% | 4.46% | 1.73% | 0.64% | 0.29% | 26.9 MB |
+| `--coverage-fill` | 0.05% | 0.03% | 0.04% | 0.03% | 0.04% | 27.3 MB |
+| `--simplify-factor 0.25` | 2.17% | 0.85% | 0.29% | 0.11% | 0.07% | 29.3 MB |
+| `0.25` + `--coverage-fill` | 0.02% | 0.01% | 0.02% | 0.01% | 0.02% | 29.8 MB |
+| `--simplify-factor 0` | 0.44% | 0.07% | 0.07% | 0.04% | 0.02% | 33.5 MB |
+| `0` + `--coverage-fill` | 0.02% | 0.01% | 0.02% | 0.01% | 0.01% | 34.0 MB |
+
+With `--coverage-fill` on, residual missing coverage is 0.03–0.05% at the
+defaults. The fill closes the gaps, so it cannot show how much of the loss is slivers.
+
+Commands, from the repo root. Factor 1 is the default. The layer name
+defaults to the file stem, and the archive sizes above come from a layer
+named `mad`, hence `--layer-name mad`:
+
+```bash
+cargo build --release --bin tylertoo
+B=$PWD/target/release/tylertoo
+R=$PWD
+W=$(mktemp -d); cd $W
+curl -LO https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1/madagascar-adm4-hilbert.parquet
+for f in 1 0.25 0; do
+  for fill in off on; do
+    extra=""; [ $fill = on ] && extra="--coverage-fill"
+    n=sf$f-fill$fill
+    $B tiles madagascar-adm4-hilbert.parquet $n.pmtiles --min-zoom 0 --max-zoom 12 \
+        --simplify-factor $f $extra --layer-name mad --force
+    uv run $R/benchmarks/coalesce/tile_metrics.py $n.pmtiles \
+        --source madagascar-adm4-hilbert.parquet --zooms 4,5,6,7,8 --max-tiles 150 \
+        --raw-limit 0 --gz-limit 0 --json $n.json
+  done
+done
+```
+
+The table reports `1 - drawn_share.mean` per zoom.
+
+## #748 re-run, FTW Moldova (631,910 polygons)
+
+Same repro as the issue (gpio 1.7.0 Hilbert sort, `overview --min-zoom 0
+--max-zoom 12`, `export-pmtiles`, defaults) on 9fca046: `check_validity.py`
+finds 0 invalid polygon features at every zoom (z0–z12, 2,079,518 features
+checked in total; the issue had 480 at z4–z11). The export reports 10,002
+RingsCross, 1,141 PartsOverlap, 2,668 CollapsedRing, 36 DisconnectedInterior
+and 58,525 RingSelfTouch tile-space repairs.
+
+Commands (the raw input is the `bench-coalesce-v1` asset
+`moldova.parquet`, sha256 f5343419...):
+
+```bash
+cargo build --release --bin tylertoo
+B=$PWD/target/release/tylertoo
+R=$PWD
+W=$(mktemp -d); cd $W
+curl -LO https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1/moldova.parquet
+uvx --from geoparquet-io==1.7.0 gpio sort hilbert --add-bbox --row-group-size 49152 \
+    moldova.parquet hilbert.parquet
+$B overview hilbert.parquet ov.parquet --min-zoom 0 --max-zoom 12
+$B export-pmtiles ov.parquet out.pmtiles
+uv run $R/benchmarks/coalesce/check_validity.py out.pmtiles
+```

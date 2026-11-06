@@ -26,10 +26,10 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use crate::archive_index::ArchiveIndex;
+use crate::archive_index::{ArchiveError, ArchiveIndex};
 use crate::pmtiles_writer::tile_id_to_zxy;
 use crate::tile::hilbert_zoom_base;
-use crate::{Error, Result};
+use crate::Result;
 
 /// One zoom level's tile-size distribution, in STORED (compressed) bytes per
 /// addressed tile.
@@ -148,21 +148,16 @@ pub fn compute_stats(archive: &ArchiveIndex, largest_n: usize) -> Result<StatsRe
         // outside the tile-data section is a corrupt directory (#417).
         match e.offset.checked_add(u64::from(e.length)) {
             Some(end) if end <= tile_data_length => {}
-            _ => {
-                return Err(Error::PMTilesWrite(
-                    "tile data past end of archive".to_string(),
-                ))
-            }
+            _ => return Err(ArchiveError::TileDataPastEnd { path: None }.into()),
         }
         let bytes = u64::from(e.length);
         let run = u64::from(e.run_length.max(1));
         let first = e.tile_id;
         let last = first
             .checked_add(run - 1)
-            .ok_or_else(|| Error::PMTilesWrite("tile id past end of range".to_string()))?;
-        let bad = |err: Error| Error::PMTilesWrite(format!("bad tile id: {err}"));
-        let (z_first, _, _) = tile_id_to_zxy(first).map_err(bad)?;
-        let (z_last, _, _) = tile_id_to_zxy(last).map_err(bad)?;
+            .ok_or(ArchiveError::TileIdOverflow)?;
+        let (z_first, _, _) = tile_id_to_zxy(first)?;
+        let (z_last, _, _) = tile_id_to_zxy(last)?;
 
         // Tile ids are contiguous per zoom, so a run that crosses a zoom
         // boundary splits into one contiguous segment per zoom it touches.

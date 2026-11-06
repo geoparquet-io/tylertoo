@@ -300,6 +300,8 @@ class TestOverviewIntegration:
             # #451: this fixture declares its CRS, so the assume-WGS84
             # fallback must not be flagged (the field is always present).
             assert report["crs_assumed_wgs84"] is False
+            # #708: the version verdict is on the report too.
+            assert report["geo_version"] == {"status": "known", "version": "1.0.0"}
             # #644: in-range input, but the key is always present.
             assert report["wrapped_features"] == 0
             # z0..z6 requested; coarse levels where every (tiny) building falls
@@ -547,15 +549,13 @@ class TestOverviewIntegration:
             out, _ = self._overview(tmpdir, max_zoom=4, coalesce_lines=False)
             assert tylertoo.validate(str(out))["valid"] is True
 
-    def test_overview_streaming_off_matches_streaming_on(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _, on = self._overview(tmpdir, max_zoom=4, streaming=True)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _, off = self._overview(tmpdir, max_zoom=4, streaming=False)
-        assert on["total_rows"] == off["total_rows"]
-        assert [lvl["feature_count"] for lvl in on["levels"]] == [
-            lvl["feature_count"] for lvl in off["levels"]
-        ]
+    def test_overview_streaming_keyword_is_gone(self):
+        # #440: the in-memory engine switch was removed.
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(tylertoo.ConfigError, match="streaming"),
+        ):
+            self._overview(tmpdir, max_zoom=4, streaming=False)
 
     def test_overview_read_batch_size(self):
         with tempfile.TemporaryDirectory() as tmpdir:

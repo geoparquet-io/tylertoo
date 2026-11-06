@@ -7,5 +7,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = tylertoo_core::decode::fuzz_decode_archive(data);
+    let _ = tylertoo_core::internal::decode::fuzz_decode_archive(data);
 });

@@ -1,9 +1,10 @@
 //! Public conversion options, reports and entry points.
 //!
-//! Both storage modes run the same stages in `super::stream`: preflight,
-//! pass-1 scan, assignment, carriers, writer setup, and write/report. The
-//! `super::source::MemorySource` adapter retains input batches in memory;
-//! the streaming source reads Parquet batches on demand. Both preserve
+//! Production streams: every run goes through the stages in `super::stream`
+//! (preflight, pass-1 scan, assignment, carriers, writer setup, and
+//! write/report), reading Parquet batches on demand. Tests can swap in the
+//! test-only `super::source::MemorySource`, which retains input batches in
+//! memory, via `super::source::with_eager_input`. Both readers preserve
 //! input order and use the same row addresses throughout the pipeline.
 //!
 //! Canonical duplicating levels and all partitioning levels retain original
@@ -74,6 +75,7 @@ use super::writer::{LevelWriteOutcome, RowGroupSizePolicy, WriterError, LEVEL_CO
 
 /// How the caller specifies the overview levels.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum LevelPlan {
     /// A Web Mercator zoom range, mapped through `gsd_for_zoom`. `min_zoom`
     /// is the coarsest (level 0), `max_zoom` the finest. Both inclusive.
@@ -254,18 +256,34 @@ impl LevelPlan {
 /// null/missing value** (nulls encode as `None`, which loses to any `Some` in
 /// the priority order).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct ClassRanking {
     /// Name of the (Utf8/LargeUtf8) column whose values are ranked.
-    pub column: String,
+    pub(crate) column: String,
     /// `(value, priority)` pairs; higher priority wins the cell. Order is
     /// irrelevant (looked up by value).
-    pub ranks: Vec<(String, f64)>,
+    pub(crate) ranks: Vec<(String, f64)>,
     /// Priority for a present-but-unranked value. Set below every named rank so
     /// unknown classes lose to known ones but beat nulls.
-    pub unknown_rank: f64,
+    pub(crate) unknown_rank: f64,
 }
 
 impl ClassRanking {
+    /// Name of the (Utf8/LargeUtf8) column whose values are ranked.
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    /// `(value, priority)` pairs; higher priority wins the cell.
+    pub fn ranks(&self) -> &[(String, f64)] {
+        &self.ranks
+    }
+
+    /// Priority for a present-but-unranked value.
+    pub fn unknown_rank(&self) -> f64 {
+        self.unknown_rank
+    }
+
     /// Build a ranking from `(value, priority)` pairs, enforcing the rules
     /// every spelling of a class ranking shares (#445: the `--class-rank`
     /// string via [`parse_class_rank`], and the Python `class_ranks` dict):
@@ -281,24 +299,54 @@ impl ClassRanking {
     ///
     /// # Errors
     ///
-    /// A description of the first rule broken.
+    /// The first rule broken, as a [`ClassRankingError`].
     pub fn new(
         column: impl Into<String>,
         ranks: Vec<(String, f64)>,
         unknown_rank: Option<f64>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ClassRankingError> {
         if ranks.is_empty() {
-            return Err("at least one class rank is required".to_string());
+            return Err(ClassRankingError::Empty);
         }
         // The one finiteness rule and message (#428), shared with a
         // struct-literal ranking's check in `validate_options`.
-        super::config::check_ranks_finite(&ranks, unknown_rank).map_err(|e| e.to_string())?;
+        if let Some((class, rank)) = super::config::first_non_finite_rank(&ranks, unknown_rank) {
+            return Err(ClassRankingError::NotFinite { class, rank });
+        }
         let min_rank = ranks.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
         Ok(Self {
             column: column.into(),
             ranks,
             unknown_rank: unknown_rank.unwrap_or(min_rank - 1.0),
         })
+    }
+}
+
+/// Why [`ClassRanking::new`] refused a ranking.
+///
+/// `#[non_exhaustive]`: new rules are added without a breaking change; match
+/// with a wildcard arm. Every variant is a usage error
+/// ([`ErrorKind::Usage`](crate::ErrorKind::Usage)).
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ClassRankingError {
+    /// No `(value, priority)` pair.
+    #[error("at least one class rank is required")]
+    Empty,
+    /// A priority, or the explicit unknown-class rank, is not finite (#428).
+    #[error("{}", super::config::rank_not_finite_message(class.as_deref(), *rank))]
+    #[non_exhaustive]
+    NotFinite {
+        /// The class, or `None` for the unknown-class rank.
+        class: Option<String>,
+        /// The rank.
+        rank: f64,
+    },
+}
+
+impl crate::error::Classify for ClassRankingError {
+    fn kind(&self) -> crate::error::ErrorKind {
+        crate::error::ErrorKind::Usage
     }
 }
 
@@ -392,6 +440,7 @@ pub(super) const ROAD_VOCAB_MIN_DISTINCT: usize = 3;
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(feature = "cli", command(group(clap::ArgGroup::new("overview_only").multiple(true))))]
+#[non_exhaustive]
 pub struct ConvertOptions {
     /// Level materialization mode. Default [`Mode::Duplicating`].
     #[cfg_attr(feature = "cli", arg(long, default_value = Self::default().mode.as_str(), value_parser = super::config::cli::spelled::<Mode>(&["duplicating", "partitioning"])))]
@@ -403,10 +452,14 @@ pub struct ConvertOptions {
     pub levels: LevelPlan,
     /// `--max-zoom auto` (#444): the conversion estimates the finest zoom
     /// from its own input and writes it into a [`LevelPlan::ZoomRange`]'s
-    /// `max_zoom` before anything else reads the plan
-    /// ([`super::auto_zoom::MaxZoom::resolve`]). Build the plan with
-    /// [`super::auto_zoom::MaxZoom::plan_zoom`] as the placeholder. Ignored
-    /// (with a log line) for an explicit GSD list.
+    /// `max_zoom` before anything else reads the plan. Ignored (with a log
+    /// line) for an explicit GSD list.
+    ///
+    /// The pick is capped at the plan's `max_zoom` (`--max-zoom auto:N`,
+    /// #793): set it to 16, the auto ceiling, for an uncapped estimate, or
+    /// lower to cap it. Before 0.9 the plan's `max_zoom` was ignored here, so
+    /// a caller that set `auto_max_zoom` with any other `max_zoom` now gets a
+    /// capped pick.
     ///
     /// The estimate reads the same source the conversion then reads, so a
     /// remote input's sampled chunks are fetched once (#788). Not a keyword
@@ -526,21 +579,10 @@ pub struct ConvertOptions {
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Output layout"))]
     #[cfg_attr(feature = "cli", arg(help = "Keep Parquet min/max stats on every column, even large string and geometry columns. Use it when remote clients filter on property columns", long_help = None))]
     pub full_column_stats: bool,
-    /// Use the two-pass bounded-memory streaming pipeline (H3). Default `true`.
-    ///
-    /// Pass 1 streams the input once to build the per-feature winner tables
-    /// (level assignment + Q2 density budget); pass 2 streams the input again
-    /// per level, simplifying and writing batch-by-batch. Peak memory is
-    /// `O(read batch + winner tables)` instead of `O(dataset)`. Set `false`
-    /// to cache the input batches in memory and run the same stages over them.
-    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().streaming, action = clap::ArgAction::SetFalse, long = "no-streaming", help_heading = "Memory & performance"))]
-    #[cfg_attr(feature = "cli", arg(help = "Load the whole dataset into memory instead of streaming it in two passes. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>", long_help = None))]
-    pub streaming: bool,
     /// Rows per Arrow read batch in the streaming pipeline (both passes).
     /// Default [`DEFAULT_READ_BATCH_SIZE`]. Larger batches amortize per-batch
     /// overhead at the cost of proportionally more peak memory; smaller
-    /// batches bound memory tighter. Also sets cached batch sizes when
-    /// `streaming` is `false`.
+    /// batches bound memory tighter.
     #[cfg_attr(feature = "cli", arg(
         long,
         value_name = "ROWS",
@@ -552,7 +594,7 @@ pub struct ConvertOptions {
     /// Memory/throughput profile for the streaming pass-2 engine (#213/#212).
     /// Default [`MemoryProfile::Auto`], resolved per mode + estimated output
     /// size at convert entry. Changes speed and peak memory only — output is
-    /// byte-identical across profiles. No effect when `streaming` is `false`.
+    /// byte-identical across profiles.
     #[serde(with = "super::config::spelled")]
     #[cfg_attr(feature = "cli", arg(
         long,
@@ -573,8 +615,7 @@ pub struct ConvertOptions {
     /// Higher improves core utilization at proportionally more peak memory
     /// (`in_flight_batches × read_batch_size` input rows resident, plus the
     /// window's output batches). 1 or 2 processes one batch at a time. Output
-    /// is byte-identical for every value. No effect when `streaming` is
-    /// `false`.
+    /// is byte-identical for every value.
     #[cfg_attr(feature = "cli", arg(
         long,
         value_name = "N|auto",
@@ -592,8 +633,7 @@ pub struct ConvertOptions {
     /// in-order merge re-chunks their output into exactly the batch sequence
     /// one reader would have produced. Explicit values are honoured up to
     /// [`read_workers_ceiling`] and clamped (with a warning) above it. Ignored
-    /// for remote inputs (see `super::pipeline`) and when `streaming` is
-    /// `false`.
+    /// for remote inputs (see `super::pipeline`).
     #[cfg_attr(feature = "cli", arg(
         long,
         value_name = "N|auto",
@@ -882,6 +922,44 @@ pub struct ConvertOptions {
     pub zoom_ceiling: Option<u8>,
 }
 
+with_setters!(ConvertOptions {
+    with_mode => mode: Mode,
+    with_levels => levels: LevelPlan,
+    with_auto_max_zoom => auto_max_zoom: bool,
+    with_assign => assign: AssignConfig,
+    with_entry_zoom => entry_zoom: Option<EntryZoomSpec>,
+    with_sort_key => sort_key: Option<String>,
+    with_class_ranking => class_ranking: Option<ClassRanking>,
+    with_no_auto_rank => no_auto_rank: bool,
+    with_simplify => simplify: SimplifyOptions,
+    with_representation => representation: Vec<RepresentationBand>,
+    with_density => density: DensityBudgetConfig,
+    with_gsd_base => gsd_base: f64,
+    with_cogp_compat_key => cogp_compat_key: bool,
+    with_max_row_group_size => max_row_group_size: usize,
+    with_row_group_size_policy => row_group_size_policy: RowGroupSizePolicy,
+    with_full_column_stats => full_column_stats: bool,
+    with_read_batch_size => read_batch_size: usize,
+    with_profile => profile: MemoryProfile,
+    with_in_flight_batches => in_flight_batches: usize,
+    with_read_workers => read_workers: usize,
+    with_cluster => cluster: bool,
+    with_accumulate => accumulate: Vec<AccumulateSpec>,
+    with_coalesce_lines => coalesce_lines: bool,
+    with_coalesce_snap => coalesce_snap: f64,
+    with_coalesce_max_level_rows => coalesce_max_level_rows: usize,
+    with_coalesce_junction_angle => coalesce_junction_angle: f64,
+    with_bbox => bbox: Option<[f64; 4]>,
+    with_filter => filter: Option<String>,
+    with_properties => properties: PropertySelection,
+    with_spill_dir => spill_dir: Option<PathBuf>,
+    with_save_plan => save_plan: Option<PathBuf>,
+    with_plan => plan: Option<PathBuf>,
+    with_shard => shard: Option<TileRange>,
+    with_shard_plan_digest => shard_plan_digest: Option<String>,
+    with_zoom_ceiling => zoom_ceiling: Option<u8>,
+});
+
 /// Default rows per read batch for the streaming pipeline (H3).
 pub const DEFAULT_READ_BATCH_SIZE: usize = 8192;
 
@@ -1039,9 +1117,10 @@ impl ConvertOptions {
     ///
     /// # Errors
     ///
-    /// The first rule broken. [`ConvertError::is_config`] is true for every
-    /// error this returns.
+    /// The first rule broken; every error this returns is
+    /// [`ErrorKind::Usage`](crate::error::ErrorKind::Usage).
     /// Validate these options and return the immutable engine configuration.
+    #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
         super::config::validate_convert(self)
     }
@@ -1060,7 +1139,7 @@ impl ConvertOptions {
             ("coalesce-snap", self.coalesce_snap),
             ("coalesce-junction-angle", self.coalesce_junction_angle),
         ] {
-            super::config::finite_number(name, value).map_err(ConvertError::InvalidConfig)?;
+            super::config::finite_number(name, value)?;
         }
         Ok(())
     }
@@ -1243,6 +1322,7 @@ impl ConvertOptions {
 /// `--no-coalesce-lines`) and per Python keyword argument.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct GeneralizationOverrides {
     /// Point grid cell size in GSDs.
     pub point_thinning: Option<f64>,
@@ -1261,6 +1341,17 @@ pub struct GeneralizationOverrides {
     /// Whether touching same-class lines are joined at coarse levels.
     pub coalesce_lines: Option<bool>,
 }
+
+with_setters!(GeneralizationOverrides {
+    with_point_thinning => point_thinning: Option<f64>,
+    with_line_thinning => line_thinning: Option<f64>,
+    with_polygon_thinning => polygon_thinning: Option<f64>,
+    with_line_visibility => line_visibility: Option<f64>,
+    with_polygon_visibility => polygon_visibility: Option<f64>,
+    with_simplify_factor => simplify_factor: Option<f64>,
+    with_density_drop => density_drop: Option<bool>,
+    with_coalesce_lines => coalesce_lines: Option<bool>,
+});
 
 #[cfg(test)]
 mod generalization_override_tests {
@@ -1429,7 +1520,6 @@ impl Default for ConvertOptions {
             max_row_group_size: super::writer::DEFAULT_MAX_ROW_GROUP_SIZE,
             row_group_size_policy: RowGroupSizePolicy::default(),
             full_column_stats: false,
-            streaming: true,
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
             profile: MemoryProfile::Auto,
             in_flight_batches: IN_FLIGHT_BATCHES_AUTO,
@@ -1455,6 +1545,7 @@ impl Default for ConvertOptions {
 
 /// Per-level statistics in a [`ConvertReport`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct LevelReport {
     /// Level index in the output file (0 = coarsest).
     pub level: usize,
@@ -1480,6 +1571,7 @@ pub struct LevelReport {
 /// where every feature is culled by the visibility gates at world zooms, so
 /// the written pyramid starts at the first zoom with visible features.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct SkippedLevelReport {
     /// Index of the level in the *planned* (requested) level range
     /// (0 = requested coarsest). NOT an index into the written file.
@@ -1631,6 +1723,7 @@ pub struct PlanReport {
 
 /// Result of a conversion, `Serialize` for JSON output (benchmark tasks).
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct ConvertReport {
     /// Input rows read before filtering unusable geometries.
     pub input_rows: usize,
@@ -1716,6 +1809,10 @@ pub struct ConvertReport {
     /// `log::warn!` naming the input was also emitted; this field keeps the
     /// assumption visible after the log has scrolled by.
     pub crs_assumed_wgs84: bool,
+    /// The input's GeoParquet version verdict across all its parts (#708);
+    /// see [`crate::resolved_schema::GeoVersion`] for the serialized shape.
+    /// Anything but `known` also logged a warning.
+    pub geo_version: crate::resolved_schema::GeoVersion,
     /// Wall-clock conversion duration in seconds.
     pub duration_secs: f64,
     /// Remote-input fetch counters (#210): range requests issued and bytes
@@ -1788,10 +1885,14 @@ pub enum ConvertError {
     Properties(#[from] PropertySelectionError),
     /// Underlying parquet error (reading the input).
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] tylertoo_io::ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] tylertoo_io::ParquetError),
     /// Arrow error (concat / take / batch build).
     #[error("arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Arrow(#[source] arrow_schema::ArrowError),
     /// A core-library error (geometry decode, CRS extraction).
     #[error("{0}")]
     Core(#[from] crate::Error),
@@ -1800,6 +1901,7 @@ pub enum ConvertError {
     Writer(#[from] WriterError),
     /// The input CRS is neither EPSG:4326 nor EPSG:3857 (spec Q3).
     #[error("unsupported CRS {crs:?} in {input}: overviews require EPSG:4326 or EPSG:3857")]
+    #[non_exhaustive]
     UnsupportedCrs {
         /// The rejected CRS identifier.
         crs: String,
@@ -1813,6 +1915,7 @@ pub enum ConvertError {
     /// archive. The threshold is a share rather than 100% so a wrong-CRS file
     /// carrying a handful of `POINT(0 0)` placeholder rows still fails.
     #[error("{}", all_lost_message(.crs, .out_of_range, .unprojectable, .total, .max_abs))]
+    #[non_exhaustive]
     AllFeaturesOutOfRange {
         /// The CRS the input's metadata declares.
         crs: Crs,
@@ -1833,12 +1936,14 @@ pub enum ConvertError {
     /// The input has no geometry column: neither the GeoParquet `geo`
     /// metadata's `primary_column` nor a recognized geometry column name.
     #[error("{input} has no geometry column")]
+    #[non_exhaustive]
     NoGeometryColumn {
         /// Display name of the input (path, URL, or partition set).
         input: String,
     },
     /// The `--sort-key` column is not present in the input schema.
     #[error("sort-key column {name:?} not found in input schema")]
+    #[non_exhaustive]
     SortKeyColumnMissing {
         /// The requested column name.
         name: String,
@@ -1848,12 +1953,14 @@ pub enum ConvertError {
     RankingConflict,
     /// The `--class-rank` column is not present in the input schema.
     #[error("class-rank column {name:?} not found in input schema")]
+    #[non_exhaustive]
     ClassRankColumnMissing {
         /// The requested column name.
         name: String,
     },
     /// The `--class-rank` column is not a string (Utf8/LargeUtf8) column.
     #[error("class-rank column {name:?} is {data_type} but must be a string column")]
+    #[non_exhaustive]
     ClassRankColumnNotString {
         /// The requested column name.
         name: String,
@@ -1874,6 +1981,7 @@ pub enum ConvertError {
          tile grid overflows 32-bit tile coordinates and the PMTiles Hilbert tile-id \
          arithmetic"
     )]
+    #[non_exhaustive]
     ZoomAboveCeiling {
         /// The knob that asked for it, already naming the zoom: `--max-zoom 33`,
         /// or `--gsd 5e-6 (…), which implies z33`. The zoom is not repeated by
@@ -1884,10 +1992,10 @@ pub enum ConvertError {
         /// [`crate::tile::MAX_ZOOM`].
         ceiling: u8,
     },
-    /// A conversion knob carries a nonsensical value (non-finite or
-    /// non-positive where a positive finite value is required).
+    /// An option, or a combination of options, the convert refuses; the
+    /// payload says which.
     #[error("invalid option: {0}")]
-    InvalidConfig(String),
+    InvalidConfig(InvalidOption),
     /// An option rule shared with the other frontends' options (#779),
     /// refused before any input is read.
     #[error(transparent)]
@@ -1926,15 +2034,9 @@ pub enum ConvertError {
     /// `--accumulate-attribute` was supplied without `--cluster`.
     #[error("--accumulate-attribute requires --cluster")]
     AccumulateWithoutCluster,
-    /// Multi-partition input (directory / glob) reached the in-memory
-    /// reference pipeline, which reads through a single parquet builder.
-    #[error(
-        "multi-partition input requires the streaming pipeline; \
-         remove --no-streaming"
-    )]
-    MultiPartitionRequiresStreaming,
     /// An `--accumulate-attribute` column is not present in the input schema.
     #[error("accumulate-attribute column {name:?} not found in input schema")]
+    #[non_exhaustive]
     AccumulateColumnMissing {
         /// The requested column name.
         name: String,
@@ -1944,6 +2046,7 @@ pub enum ConvertError {
         "accumulate-attribute column {name:?} is {data_type} but must be numeric \
          (int/uint/float)"
     )]
+    #[non_exhaustive]
     AccumulateColumnNotNumeric {
         /// The requested column name.
         name: String,
@@ -1972,6 +2075,7 @@ pub enum ConvertError {
         "--max-zoom auto cannot honor --min-zoom {min_zoom}: auto never picks a zoom \
          above z{ceiling}. Lower --min-zoom, or pass an explicit --max-zoom"
     )]
+    #[non_exhaustive]
     AutoZoomMinAboveCeiling {
         /// The requested minimum zoom.
         min_zoom: u8,
@@ -1987,6 +2091,7 @@ pub enum ConvertError {
          have fewer than two distinct locations and no measurable extent. Pass an \
          explicit --max-zoom"
     )]
+    #[non_exhaustive]
     AutoZoomNoSignal {
         /// Input rows the estimate read (after `--bbox`/`--filter` row-group
         /// pruning).
@@ -2006,6 +2111,7 @@ pub enum ConvertError {
         "no output rows at or coarser than the zoom ceiling z{ceiling}: every feature first \
          appears at a finer zoom"
     )]
+    #[non_exhaustive]
     NothingAtOrBelowCeiling {
         /// The ceiling that was applied.
         ceiling: u8,
@@ -2031,6 +2137,7 @@ pub enum ConvertError {
          preflight safety ceiling (parquet's hard limit is 32,768 row groups per file) \
          even after auto-scaling --row-group-size; reduce the number of overview levels"
     )]
+    #[non_exhaustive]
     RowGroupCeilingUnreachable {
         /// Levels the preflight expects to hold rows. Counted from pass 1's
         /// pre-simplification winner hints, so a level that ends up empty
@@ -2044,6 +2151,7 @@ pub enum ConvertError {
     /// Only the pass-1 scan's is the preflight that
     /// `TYLERTOO_SKIP_MEMORY_PREFLIGHT` downgrades, so only it names that.
     #[error("{phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter.{}", skip_preflight_hint(phase))]
+    #[non_exhaustive]
     BudgetExceeded {
         /// Pipeline stage that cannot fit.
         phase: &'static str,
@@ -2052,54 +2160,316 @@ pub enum ConvertError {
         /// Available bytes at conversion start.
         available: u64,
     },
-    /// A selected byte-array column exceeds the non-streaming aggregate
-    /// ceiling (#606). The cached source retains this preflight contract;
-    /// the I/O reader separately checks whether any individual row fits.
-    #[error("{}", in_memory_byte_array_too_large_message(.largest, .limit_bytes))]
-    InMemoryByteArrayTooLarge {
-        /// The column whose total is too large.
-        largest: tylertoo_io::LargestByteArrayColumn,
-        /// The aggregate column ceiling checked against.
-        limit_bytes: u64,
+}
+
+/// Why [`ConvertError::InvalidConfig`] refused the options.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum InvalidOption {
+    /// A numeric knob is NaN or infinite.
+    #[error("{option} = {value} must be a finite value")]
+    #[non_exhaustive]
+    NotFinite {
+        /// The knob.
+        option: &'static str,
+        /// Its value.
+        value: f64,
+    },
+    /// A knob that must be positive is not.
+    #[error("{option} = {value} must be a finite value > 0")]
+    #[non_exhaustive]
+    NotPositive {
+        /// The knob.
+        option: &'static str,
+        /// Its value.
+        value: f64,
+    },
+    /// A knob that must not be negative is.
+    #[error("{option} = {value} must be a finite value >= 0")]
+    #[non_exhaustive]
+    Negative {
+        /// The knob.
+        option: &'static str,
+        /// Its value.
+        value: f64,
+    },
+    /// `read_batch_size` is outside `1..=1048576`.
+    #[error("read-batch-size must be in 1..=1048576 (a batch is fully resident)")]
+    ReadBatchSize,
+    /// `read_workers` is past twice this machine's cores.
+    #[error("read-workers must be auto or 1..={ceiling} (2× this machine's cores)")]
+    #[non_exhaustive]
+    ReadWorkers {
+        /// The largest accepted value.
+        ceiling: usize,
+    },
+    /// The density budget's gamma is below 1.
+    #[error(
+        "--drop-gamma must be at least 1 (got {gamma}). Use 1 for a proportional cut, or \
+         --no-density-drop to turn the density budget off."
+    )]
+    #[non_exhaustive]
+    DropGamma {
+        /// The refused gamma.
+        gamma: f64,
+    },
+    /// A zoom ceiling together with a data shard range.
+    #[error(
+        "a convert-side zoom ceiling cannot be combined with a data shard range: \
+         the shard owns the zooms at and past the pivot, the ceiling keeps only \
+         those coarser than it"
+    )]
+    CeilingWithShardRange,
+    /// A zoom ceiling in partitioning mode.
+    #[error(
+        "a convert-side zoom ceiling requires duplicating mode: in partitioning \
+         mode each feature lives only at its coarsest level, so capping the levels \
+         would drop features rather than levels"
+    )]
+    CeilingNeedsDuplicating,
+    /// A zoom ceiling with an explicit GSD ladder.
+    #[error(
+        "a convert-side zoom ceiling needs a zoom-range level plan: an \
+         explicit GSD ladder has no zoom to compare the ceiling against"
+    )]
+    CeilingNeedsZoomRange,
+    /// A zoom ceiling coarser than the level plan's minimum zoom.
+    #[error(
+        "zoom ceiling z{ceiling} is coarser than the level plan's minimum \
+         z{min_zoom}: nothing would be built"
+    )]
+    #[non_exhaustive]
+    CeilingBelowMinZoom {
+        /// The ceiling.
+        ceiling: u8,
+        /// The plan's minimum zoom.
+        min_zoom: u8,
+    },
+    /// A zoom ceiling on a plan-only run.
+    #[error(
+        "a convert-side zoom ceiling has no meaning for a plan-only run: the \
+         ceiling bounds the levels pass 2 materializes, and a plan-only run \
+         materializes none. Drop it — the plan is full-range either way"
+    )]
+    CeilingInPlanOnly,
+    /// A plan-only run without a plan path.
+    #[error(
+        "writing a convert plan requires --save-plan PATH: a plan-only run \
+         produces no archive and no overview, so the plan is its only output"
+    )]
+    PlanOnlyWithoutSavePlan,
+    /// A shard that would write a plan.
+    #[error(
+        "--shard and --save-plan are mutually exclusive: a shard reads a subset of the \
+         input, so the plan it would write covers only that subset and is useless to the \
+         rest of the fleet. The coarse job, which reads everything, is the run that writes \
+         the plan."
+    )]
+    ShardWithSavePlan,
+    /// A shard without a plan to consume.
+    #[error(
+        "--shard requires --plan: the level assignment is dataset-global (the density \
+         budget water-fills a super-cell over every candidate of a level, the level walk \
+         carries a running kept count, --magnitude-ladder dense-ranks the whole column), \
+         so every shard of a fleet must consume ONE plan rather than recompute the \
+         assignment over its own subset. Run the coarse job first with --save-plan, then \
+         give every shard that plan with --plan."
+    )]
+    ShardWithoutPlan,
+    /// A shard whose plan carries coalesced line chains.
+    #[error(
+        "--shard is not supported with line coalescing: {} carries {chains} coalesced line \
+         chain(s). A chain is a NEW geometry spanning every row it merged, so no \
+         single input row group's bbox bounds it — the shard that holds the chain's \
+         row would emit tiles outside its own range while the neighbouring shard, \
+         which never reads that row, would emit none, leaving a gap at the seam. \
+         Re-run the whole fleet (including the coarse job, so the plan matches) with \
+         --no-coalesce-lines.",
+        plan.display()
+    )]
+    #[non_exhaustive]
+    ShardWithCoalescedLines {
+        /// The plan file.
+        plan: PathBuf,
+        /// Coalesced chains it carries.
+        chains: usize,
+    },
+    /// `--max-zoom auto` with an explicit GSD ladder.
+    #[error("--max-zoom auto needs a zoom-range level plan, not an explicit GSD list")]
+    AutoMaxZoomNeedsZoomRange,
+    /// Representation bands in partitioning mode.
+    #[error(
+        "representation bands require duplicating mode: partitioning places \
+         each feature exactly once with geometry verbatim (spec §2.3), which \
+         a point or square representation cannot satisfy"
+    )]
+    BandsNeedDuplicating,
+    /// Representation bands with an explicit GSD ladder.
+    #[error(
+        "representation bands require a zoom-range level plan \
+         (--min-zoom/--max-zoom); an explicit --gsd plan carries no \
+         per-level zooms to band on"
+    )]
+    BandsNeedZoomRange,
+    /// A representation band whose low zoom is past its high zoom.
+    #[error("representation band {} must satisfy LO <= HI", band_spec(band))]
+    #[non_exhaustive]
+    BandInverted {
+        /// The band.
+        band: RepresentationBand,
+    },
+    /// A representation band outside the level plan.
+    #[error(
+        "representation band {} lies outside the level plan \
+         ({plan_min}-{plan_max})",
+        band_spec(band)
+    )]
+    #[non_exhaustive]
+    BandOutsidePlan {
+        /// The band.
+        band: RepresentationBand,
+        /// The plan's minimum zoom.
+        plan_min: u8,
+        /// The plan's maximum zoom.
+        plan_max: u8,
+    },
+    /// A non-geometry representation band reaching the canonical level.
+    #[error(
+        "representation band {} must end before the plan's \
+         max zoom ({plan_max}): the canonical (finest) level reproduces \
+         source geometry verbatim (spec §2.4)",
+        band_spec(band)
+    )]
+    #[non_exhaustive]
+    BandCoversCanonical {
+        /// The band.
+        band: RepresentationBand,
+        /// The plan's maximum zoom.
+        plan_max: u8,
+    },
+    /// Two representation bands claim one zoom.
+    #[error("representation bands overlap at zoom {zoom}")]
+    #[non_exhaustive]
+    BandsOverlap {
+        /// The zoom.
+        zoom: u8,
+    },
+    /// Point bands that do not start at the coarsest level.
+    #[error(
+        "point bands must start at the plan's min zoom and be \
+         contiguous from the coarsest level: a coarser non-point \
+         level would still receive the cascaded point"
+    )]
+    PointBandsNotPrefix,
+    /// The entry-zoom column is not in the input.
+    #[error("entry-zoom column {column:?} not found in the input schema")]
+    #[non_exhaustive]
+    EntryZoomColumnMissing {
+        /// The column.
+        column: String,
+    },
+    /// The entry-zoom ladder could not be built from the column.
+    #[error("entry-zoom: {message}")]
+    #[non_exhaustive]
+    EntryZoomLadder {
+        /// What is wrong.
+        message: String,
+    },
+    /// The `--plan` file cannot be used for this run: unreadable, corrupt,
+    /// from another format version, or saved for different input or options.
+    #[error("{message}")]
+    #[non_exhaustive]
+    Plan {
+        /// What is wrong, naming `--plan`.
+        message: String,
+    },
+    /// The `--save-plan` target cannot be written.
+    #[error("{message}")]
+    #[non_exhaustive]
+    SavePlan {
+        /// What is wrong, naming `--save-plan`.
+        message: String,
     },
 }
 
-/// The message body of [`ConvertError::InMemoryByteArrayTooLarge`] (#606).
-fn in_memory_byte_array_too_large_message(
-    largest: &tylertoo_io::LargestByteArrayColumn,
-    limit_bytes: &u64,
-) -> String {
-    const GIB: f64 = (1u64 << 30) as f64;
-    format!(
-        "--no-streaming caches the whole input, and column '{}' \
-         holds {:.2} GiB in the row groups to read, beyond the {:.2} GiB aggregate \
-         column limit. Drop --no-streaming: the streaming source reads \
-         this input in bounded batches.",
-        largest.column,
-        largest.total_bytes as f64 / GIB,
-        *limit_bytes as f64 / GIB,
-    )
+impl InvalidOption {
+    /// A [`Self::Plan`] refusal.
+    pub(crate) fn plan(message: impl Into<String>) -> ConvertError {
+        InvalidOption::Plan {
+            message: message.into(),
+        }
+        .into()
+    }
+
+    /// A [`Self::SavePlan`] refusal.
+    pub(crate) fn save_plan(message: impl Into<String>) -> ConvertError {
+        InvalidOption::SavePlan {
+            message: message.into(),
+        }
+        .into()
+    }
 }
 
-impl ConvertError {
-    /// Whether this is an option the caller must fix, refused before any
-    /// input was read ([`ConvertOptions::validate`]'s errors), as opposed to
-    /// a problem with the data or the run. The Python bindings raise these
-    /// as `tylertoo.ConfigError`.
-    pub fn is_config(&self) -> bool {
-        matches!(
-            self,
+/// A representation band as its spec spells it: `LO-HI:KIND`.
+fn band_spec(band: &RepresentationBand) -> String {
+    format!("{}-{}:{}", band.min_zoom, band.max_zoom, band.repr.as_str())
+}
+
+// Not `#[from]`: the reason's message is already this error's, so it is not
+// also a `source()` the CLI would print a second time.
+impl From<InvalidOption> for ConvertError {
+    fn from(reason: InvalidOption) -> Self {
+        ConvertError::InvalidConfig(reason)
+    }
+}
+
+#[doc(hidden)]
+impl From<arrow_schema::ArrowError> for ConvertError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        ConvertError::Arrow(e)
+    }
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::ParquetError> for ConvertError {
+    fn from(e: tylertoo_io::ParquetError) -> Self {
+        ConvertError::Parquet(e)
+    }
+}
+
+impl crate::error::Classify for ConvertError {
+    /// [`ErrorKind::Usage`](crate::error::ErrorKind::Usage) is an option
+    /// refused before any input was read ([`ConvertOptions::validate`]'s
+    /// errors); [`ErrorKind::Input`](crate::error::ErrorKind::Input) a
+    /// column or an input the tiler cannot work with; the #543 memory
+    /// preflight is [`ErrorKind::Resource`](crate::error::ErrorKind::Resource).
+    fn kind(&self) -> crate::error::ErrorKind {
+        use crate::error::ErrorKind;
+        match self {
             ConvertError::Config(_)
-                | ConvertError::InvalidConfig(_)
-                | ConvertError::InvalidLevels(_)
-                | ConvertError::ZoomAboveCeiling { .. }
-                | ConvertError::RankingConflict
-                | ConvertError::ClusterPartitioningUnsupported
-                | ConvertError::VerbatimPartitioningUnsupported
-                | ConvertError::AccumulateWithoutCluster
-                | ConvertError::AutoZoomMinAboveCeiling { .. }
-                | ConvertError::Filter(super::filter::FilterError::Parse(_))
-        )
+            | ConvertError::InvalidConfig(_)
+            | ConvertError::InvalidLevels(_)
+            | ConvertError::ZoomAboveCeiling { .. }
+            | ConvertError::RankingConflict
+            | ConvertError::ClusterPartitioningUnsupported
+            | ConvertError::VerbatimPartitioningUnsupported
+            | ConvertError::AccumulateWithoutCluster
+            | ConvertError::AutoZoomMinAboveCeiling { .. }
+            | ConvertError::Filter(super::filter::FilterError::Parse(_)) => ErrorKind::Usage,
+            // The box is too small for this input (#543).
+            ConvertError::BudgetExceeded { .. } => ErrorKind::Resource,
+            // The input itself is the problem, not the run (#429).
+            ConvertError::AllFeaturesOutOfRange { .. }
+            | ConvertError::UnsupportedCrs { .. }
+            | ConvertError::SortKeyColumnMissing { .. }
+            | ConvertError::ClassRankColumnMissing { .. }
+            | ConvertError::ClassRankColumnNotString { .. }
+            | ConvertError::AccumulateColumnMissing { .. }
+            | ConvertError::AccumulateColumnNotNumeric { .. }
+            | ConvertError::AutoZoomNoSignal { .. }
+            | ConvertError::Properties(_) => ErrorKind::Input,
+            _ => crate::error::fallback_kind(self),
+        }
     }
 }
 
@@ -2117,45 +2487,20 @@ fn validate_zoom_ceiling(options: &ConvertOptions) -> Result<(), ConvertError> {
     // only zooms at or finer than the pivot, so a ceiling on top of a
     // shard range keeps nothing either half would write.
     if options.shard.is_some() {
-        return Err(ConvertError::InvalidConfig(
-            "a convert-side zoom ceiling cannot be combined with a data shard range: \
-             the shard owns the zooms at and past the pivot, the ceiling keeps only \
-             those coarser than it"
-                .to_string(),
-        ));
+        return Err(InvalidOption::CeilingWithShardRange.into());
     }
     // Partitioning writes each feature once, at its coarsest level, so
     // truncating the ladder would silently drop every feature whose
     // coarsest level is finer than the ceiling — not a partial pyramid
     // but a lossy one. The CLI never pairs the two.
     if matches!(options.mode, Mode::Partitioning) {
-        return Err(ConvertError::InvalidConfig(
-            "a convert-side zoom ceiling requires duplicating mode: in partitioning \
-             mode each feature lives only at its coarsest level, so capping the levels \
-             would drop features rather than levels"
-                .to_string(),
-        ));
-    }
-    if !options.streaming {
-        return Err(ConvertError::InvalidConfig(
-            "a convert-side zoom ceiling requires the streaming pipeline \
-             (the in-memory reference path builds every planned level); \
-             drop --no-streaming"
-                .to_string(),
-        ));
+        return Err(InvalidOption::CeilingNeedsDuplicating.into());
     }
     let LevelPlan::ZoomRange { min_zoom, .. } = options.levels else {
-        return Err(ConvertError::InvalidConfig(
-            "a convert-side zoom ceiling needs a zoom-range level plan: an \
-             explicit GSD ladder has no zoom to compare the ceiling against"
-                .to_string(),
-        ));
+        return Err(InvalidOption::CeilingNeedsZoomRange.into());
     };
     if ceiling < min_zoom {
-        return Err(ConvertError::InvalidConfig(format!(
-            "zoom ceiling z{ceiling} is coarser than the level plan's minimum \
-             z{min_zoom}: nothing would be built"
-        )));
+        return Err(InvalidOption::CeilingBelowMinZoom { ceiling, min_zoom }.into());
     }
     Ok(())
 }
@@ -2172,32 +2517,30 @@ fn validate_zoom_ceiling(options: &ConvertOptions) -> Result<(), ConvertError> {
 /// instead of producing an "everything at the canonical level" file.
 pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
     options.check_finite_numbers()?;
-    let positive = |name: &str, v: f64| {
-        if v <= 0.0 {
-            return Err(ConvertError::InvalidConfig(format!(
-                "{name} = {v} must be a finite value > 0"
-            )));
+    let positive = |option: &'static str, value: f64| {
+        if value <= 0.0 {
+            return Err(ConvertError::from(InvalidOption::NotPositive {
+                option,
+                value,
+            }));
         }
         Ok(())
     };
-    let non_negative = |name: &str, v: f64| {
-        if v < 0.0 {
-            return Err(ConvertError::InvalidConfig(format!(
-                "{name} = {v} must be a finite value >= 0"
-            )));
+    let non_negative = |option: &'static str, value: f64| {
+        if value < 0.0 {
+            return Err(ConvertError::from(InvalidOption::Negative {
+                option,
+                value,
+            }));
         }
         Ok(())
     };
     if !(1..=1_048_576).contains(&options.read_batch_size) {
-        return Err(ConvertError::InvalidConfig(
-            "read-batch-size must be in 1..=1048576 (a batch is fully resident)".into(),
-        ));
+        return Err(InvalidOption::ReadBatchSize.into());
     }
     let ceiling = read_workers_ceiling();
     if options.read_workers > ceiling {
-        return Err(ConvertError::InvalidConfig(format!(
-            "read-workers must be auto or 1..={ceiling} (2× this machine's cores)"
-        )));
+        return Err(InvalidOption::ReadWorkers { ceiling }.into());
     }
     // #371: the zoom ceiling is checked FIRST, before the input is opened or
     // any pass runs — `--max-zoom 33` used to be accepted and spin forever.
@@ -2227,6 +2570,14 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     non_negative("polygon-thinning", options.assign.polygon_thinning)?;
     non_negative("line-visibility", options.assign.line_visibility)?;
     non_negative("polygon-visibility", options.assign.polygon_visibility)?;
+    non_negative("simplify-factor", options.simplify.factor)?;
+    // Below 1 the budget used to clamp silently to 1; refuse it instead.
+    if options.density.enabled && options.density.gamma < 1.0 {
+        return Err(InvalidOption::DropGamma {
+            gamma: options.density.gamma,
+        }
+        .into());
+    }
     if let Some(bb) = options.bbox {
         if bb.iter().any(|v| !v.is_finite()) || bb[0] > bb[2] || bb[1] > bb[3] {
             return Err(super::config::ConfigError::InvalidBbox { bbox: bb }.into());
@@ -2239,17 +2590,9 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
         super::filter::parse_filter(f)?;
     }
     // Convert plan artifact: writing one and replaying one are opposite ends
-    // of the same run, and both need the streaming pipeline (the in-memory
-    // reference path has no separable pass 1 to skip).
+    // of the same run.
     if options.save_plan.is_some() && options.plan.is_some() {
         return Err(super::config::ConfigError::SavePlanWithPlan.into());
-    }
-    if !options.streaming && (options.save_plan.is_some() || options.plan.is_some()) {
-        return Err(ConvertError::InvalidConfig(
-            "--save-plan / --plan require the streaming pipeline (they persist \
-             and replay its pass-1 + assignment stage); drop --no-streaming"
-                .to_string(),
-        ));
     }
     validate_zoom_ceiling(options)?;
     // #513, in the spirit of the #272 spill-dir block below: both plan paths
@@ -2272,24 +2615,10 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     // disagree with its siblings' at the seams. Refused here rather than
     // producing a plausible-looking archive that is quietly wrong.
     if options.shard.is_some() && options.save_plan.is_some() {
-        return Err(ConvertError::InvalidConfig(
-            "--shard and --save-plan are mutually exclusive: a shard reads a subset of the \
-             input, so the plan it would write covers only that subset and is useless to the \
-             rest of the fleet. The coarse job, which reads everything, is the run that writes \
-             the plan."
-                .to_string(),
-        ));
+        return Err(InvalidOption::ShardWithSavePlan.into());
     }
     if options.shard.is_some() && options.plan.is_none() {
-        return Err(ConvertError::InvalidConfig(
-            "--shard requires --plan: the level assignment is dataset-global (the density \
-             budget water-fills a super-cell over every candidate of a level, the level walk \
-             carries a running kept count, --magnitude-ladder dense-ranks the whole column), \
-             so every shard of a fleet must consume ONE plan rather than recompute the \
-             assignment over its own subset. Run the coarse job first with --save-plan, then \
-             give every shard that plan with --plan."
-                .to_string(),
-        ));
+        return Err(InvalidOption::ShardWithoutPlan.into());
     }
 
     // #517 S2: the `TYLERTOO_PROFILE_JSON` dump is appended once, at the very
@@ -2304,44 +2633,33 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
                 .iter()
                 .any(|b| b.repr != Representation::Geometry)
         {
-            return Err(ConvertError::InvalidConfig(
-                "representation bands require duplicating mode: partitioning places \
-                 each feature exactly once with geometry verbatim (spec §2.3), which \
-                 a point or square representation cannot satisfy"
-                    .to_string(),
-            ));
+            return Err(InvalidOption::BandsNeedDuplicating.into());
         }
         let (plan_min, plan_max) = match &options.levels {
             LevelPlan::ZoomRange { min_zoom, max_zoom } => (*min_zoom, *max_zoom),
             LevelPlan::Gsds(_) => {
-                return Err(ConvertError::InvalidConfig(
-                    "representation bands require a zoom-range level plan \
-                     (--min-zoom/--max-zoom); an explicit --gsd plan carries no \
-                     per-level zooms to band on"
-                        .to_string(),
-                ));
+                return Err(InvalidOption::BandsNeedZoomRange.into());
             }
         };
         for band in &options.representation {
             let (lo, hi, repr) = (band.min_zoom, band.max_zoom, band.repr);
-            let kw = repr.as_str();
             if lo > hi {
-                return Err(ConvertError::InvalidConfig(format!(
-                    "representation band {lo}-{hi}:{kw} must satisfy LO <= HI"
-                )));
+                return Err(InvalidOption::BandInverted { band: *band }.into());
             }
             if lo < plan_min || hi > plan_max {
-                return Err(ConvertError::InvalidConfig(format!(
-                    "representation band {lo}-{hi}:{kw} lies outside the level plan \
-                     ({plan_min}-{plan_max})"
-                )));
+                return Err(InvalidOption::BandOutsidePlan {
+                    band: *band,
+                    plan_min,
+                    plan_max,
+                }
+                .into());
             }
             if repr != Representation::Geometry && hi >= plan_max {
-                return Err(ConvertError::InvalidConfig(format!(
-                    "representation band {lo}-{hi}:{kw} must end before the plan's \
-                     max zoom ({plan_max}): the canonical (finest) level reproduces \
-                     source geometry verbatim (spec §2.4)"
-                )));
+                return Err(InvalidOption::BandCoversCanonical {
+                    band: *band,
+                    plan_max,
+                }
+                .into());
             }
         }
         // Overlap: each zoom may be claimed by at most one band.
@@ -2351,9 +2669,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
             for z in band.min_zoom..=band.max_zoom {
                 let slot = &mut claimed[(z - plan_min) as usize];
                 if slot.is_some() {
-                    return Err(ConvertError::InvalidConfig(format!(
-                        "representation bands overlap at zoom {z}"
-                    )));
+                    return Err(InvalidOption::BandsOverlap { zoom: z }.into());
                 }
                 *slot = Some(band.repr);
             }
@@ -2367,12 +2683,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
             match slot {
                 Some(Representation::Point) => {
                     if seen_non_point_coarser {
-                        return Err(ConvertError::InvalidConfig(
-                            "point bands must start at the plan's min zoom and be \
-                             contiguous from the coarsest level: a coarser non-point \
-                             level would still receive the cascaded point"
-                                .to_string(),
-                        ));
+                        return Err(InvalidOption::PointBandsNotPrefix.into());
                     }
                 }
                 _ => seen_non_point_coarser = true,
@@ -2393,13 +2704,13 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
 /// for a remote input, after pass-0 staging) has already run.
 fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
     if path.is_dir() {
-        return Err(ConvertError::InvalidConfig(format!(
+        return Err(InvalidOption::plan(format!(
             "--plan {} is a directory, not a convert plan file",
             path.display()
         )));
     }
     let mut file = std::fs::File::open(path).map_err(|e| {
-        ConvertError::InvalidConfig(format!("--plan {} cannot be read: {e}", path.display()))
+        InvalidOption::plan(format!("--plan {} cannot be read: {e}", path.display()))
     })?;
     // The 8 magic bytes alone are enough to say "that is not a plan" before
     // anything expensive happens; the checksum in the other 8 header bytes,
@@ -2409,7 +2720,7 @@ fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
     if std::io::Read::read_exact(&mut file, &mut magic).is_err()
         || !magic.starts_with(super::plan_state::PLAN_MAGIC_PREFIX)
     {
-        return Err(ConvertError::InvalidConfig(format!(
+        return Err(InvalidOption::plan(format!(
             "--plan {} is not a tylertoo convert plan (bad magic bytes). Plans written \
              by an older tylertoo must be re-created with --save-plan.",
             path.display()
@@ -2422,7 +2733,7 @@ fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
     // problem entirely.
     let version = magic[super::plan_state::PLAN_MAGIC_PREFIX.len()];
     if version != super::plan_state::PLAN_FORMAT_VERSION_BYTE {
-        return Err(ConvertError::InvalidConfig(format!(
+        return Err(InvalidOption::plan(format!(
             "--plan {} is a tylertoo convert plan in format v{version}, but this tylertoo \
              reads v{}. Re-create it with --save-plan.",
             path.display(),
@@ -2444,7 +2755,7 @@ fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
 /// `pyramid`, which merges several archives, gates overwrites behind
 /// `-f/--force`.
 fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
-    let bad = |what: String| Err(ConvertError::InvalidConfig(what));
+    let bad = |what: String| Err(InvalidOption::save_plan(what));
     if path.is_dir() {
         return bad(format!(
             "--save-plan {} is a directory; give the plan a file path",
@@ -2494,6 +2805,7 @@ fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
 /// One zoom band of the representation selector (#317 / #279): levels whose
 /// zoom lies in `min_zoom..=max_zoom` (inclusive) take `repr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct RepresentationBand {
     /// Coarsest zoom of the band (inclusive).
     pub min_zoom: u8,
@@ -2501,6 +2813,17 @@ pub struct RepresentationBand {
     pub max_zoom: u8,
     /// Representation applied at the band's levels.
     pub repr: Representation,
+}
+
+impl RepresentationBand {
+    /// `repr` at the levels whose zoom lies in `min_zoom..=max_zoom`.
+    pub fn new(min_zoom: u8, max_zoom: u8, repr: Representation) -> Self {
+        Self {
+            min_zoom,
+            max_zoom,
+            repr,
+        }
+    }
 }
 
 /// The [`Representation`] for a zoom under a set of bands (unclaimed zooms
@@ -2685,7 +3008,7 @@ pub fn parse_class_rank(spec: &str) -> Result<ClassRanking, String> {
 
     // The shared rules: finite ranks (#428), and unknown values losing to
     // every named class but beating nulls.
-    ClassRanking::new(column, ranks, None)
+    ClassRanking::new(column, ranks, None).map_err(|e| e.to_string())
 }
 
 /// Parse an `--accumulate-attribute` spec: `COL:OP` with OP one of
@@ -2763,7 +3086,7 @@ pub(super) fn level_representations(
 /// cap. Everything `--save-plan` already refuses is refused here too: a
 /// [`ConvertOptions::plan`] to replay, a data-shard
 /// [`ConvertOptions::shard`] range (whose plan would cover only that shard's
-/// rows), and `streaming: false`.
+/// rows).
 ///
 /// # Errors
 ///
@@ -2800,22 +3123,13 @@ pub fn write_convert_plan_sources(
     // to produce, and silently doing the whole scan for nothing is the one
     // outcome worth refusing outright.
     if options.save_plan.is_none() {
-        return Err(ConvertError::InvalidConfig(
-            "writing a convert plan requires --save-plan PATH: a plan-only run \
-             produces no archive and no overview, so the plan is its only output"
-                .to_string(),
-        ));
+        return Err(InvalidOption::PlanOnlyWithoutSavePlan.into());
     }
     // #541's ceiling truncates what PASS 2 materializes, and pass 2 does not
     // run here. Refused rather than ignored: an operator who caps a plan-only
     // run has misunderstood which half they skipped.
     if options.zoom_ceiling.is_some() {
-        return Err(ConvertError::InvalidConfig(
-            "a convert-side zoom ceiling has no meaning for a plan-only run: the \
-             ceiling bounds the levels pass 2 materializes, and a plan-only run \
-             materializes none. Drop it — the plan is full-range either way"
-                .to_string(),
-        ));
+        return Err(InvalidOption::CeilingInPlanOnly.into());
     }
     let inert_options: ConvertOptions;
     let options: &ConvertOptions =
@@ -2836,8 +3150,6 @@ pub fn write_convert_plan_sources(
                 .to_owned(),
         );
     }
-    // `--save-plan` already requires the streaming pipeline (validated above),
-    // which is where the separable pass-1 + assignment stage lives.
     super::stream::write_plan_streaming(source, &options.validate()?, diagnostics)
 }
 
@@ -3617,42 +3929,6 @@ mod property_selection_tests {
     }
 }
 
-/// Preserve the eager source's existing aggregate byte-column ceiling (#606).
-/// It differs from the reader's single-row ceiling and keeps previously
-/// rejected whole-input loads from silently becoming unbounded caches.
-/// Unprojected columns and columns using i64 offsets or views are excluded,
-/// matching the pre-refactor contract.
-pub(super) fn check_in_memory_byte_array_total(
-    source: &ConvertSource,
-    builder: &tylertoo_io::ParquetSource<crate::input::InputReader>,
-    row_groups: Option<&[usize]>,
-    limit_bytes: u64,
-) -> Result<(), ConvertError> {
-    let keep = source.column_projection();
-    let fields = builder.schema().fields();
-    let counts = |root: usize| {
-        keep.is_none_or(|k| k.contains(&root))
-            && fields.get(root).is_none_or(|f| {
-                !matches!(
-                    f.data_type(),
-                    DataType::LargeBinary
-                        | DataType::LargeUtf8
-                        | DataType::BinaryView
-                        | DataType::Utf8View
-                )
-            })
-    };
-    match tylertoo_io::largest_byte_array_column(builder.metadata(), row_groups, counts) {
-        Some(largest) if largest.total_bytes > limit_bytes => {
-            Err(ConvertError::InMemoryByteArrayTooLarge {
-                largest,
-                limit_bytes,
-            })
-        }
-        _ => Ok(()),
-    }
-}
-
 /// Build the cluster tables (Q4) and check the §12.1 sum invariant.
 ///
 /// `acc_values` holds one vector per accumulate spec, indexed by position in
@@ -3859,10 +4135,14 @@ pub(crate) fn crs_from_resolved(
 /// per-run warnings in [`crate::quality`] describe the exact
 /// metadata quirk; this one names the file and the consequence, once per
 /// conversion, from both pipelines.
-pub(super) fn warn_assumed_wgs84(input_name: &str, diagnostics: &crate::diagnostics::Diagnostics) {
+pub(super) fn warn_assumed_wgs84(
+    source: &ConvertSource,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
     diagnostics.once(crate::diagnostics::Diagnostic::CrsAssumed {
         count: 1,
-        input: input_name.to_owned(),
+        input: source.display_name(),
+        root: source.root_path(),
     });
 }
 
@@ -4322,6 +4602,7 @@ pub(crate) fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
 /// front. (#553's own case, a5 grid cells 0.6° past ±180°, is no longer out
 /// of range: the export wraps it, #342.)
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct OutOfRangeExemplar {
     /// Index of the input part (file) holding the feature, in the source's
     /// read order; `None` when the input is a single file.
@@ -6310,8 +6591,11 @@ pub(super) fn resolve_entry_levels(
         return Ok(None);
     };
     let level_zooms: Vec<Option<u8>> = level_specs.iter().map(|(_, z)| *z).collect();
-    let ladder = build_ladder(spec, column_values, &level_zooms)
-        .map_err(|e| ConvertError::InvalidConfig(format!("entry-zoom: {e}")))?;
+    let ladder = build_ladder(spec, column_values, &level_zooms).map_err(|e| {
+        InvalidOption::EntryZoomLadder {
+            message: e.to_string(),
+        }
+    })?;
     let levels = entry_levels(&ladder, column_values, &level_zooms);
     let placed = levels.iter().filter(|l| l.is_some()).count();
     log::info!(
@@ -7119,7 +7403,10 @@ mod tests {
             {
                 let mut out = Vec::new();
                 for item in accessor.iter().flatten() {
-                    let g = item.map_err(|e| crate::Error::GeoParquetRead(e.to_string()))?;
+                    let g = item.map_err(|e| crate::GeoParquetReadError::Decode {
+                        stage: "geometry decode",
+                        message: e.to_string(),
+                    })?;
                     let old = g.try_to_geometry().and_then(|g| scan_feature(&g));
                     out.push((bits(old), bits(scan_feature_traits(&g))));
                 }
@@ -8350,15 +8637,16 @@ mod tests {
             (false, PropertySelection::default()),
             (true, exclude_all),
         ] {
-            let err = convert_to_overviews(
-                &input,
-                dir.path().join("out.parquet"),
-                &ConvertOptions {
-                    streaming,
-                    properties: properties.clone(),
-                    ..Default::default()
-                },
-            )
+            let err = super::super::source::with_eager_input(!streaming, || {
+                convert_to_overviews(
+                    &input,
+                    dir.path().join("out.parquet"),
+                    &ConvertOptions {
+                        properties: properties.clone(),
+                        ..Default::default()
+                    },
+                )
+            })
             .expect_err("no geometry column");
             assert!(
                 matches!(err, ConvertError::NoGeometryColumn { .. }),
@@ -8592,20 +8880,39 @@ mod tests {
 
         for streaming in [true, false] {
             let out = dir.path().join(format!("out-{streaming}.parquet"));
-            let report = convert_to_overviews(
-                &input,
-                &out,
-                &ConvertOptions {
-                    streaming,
-                    ..Default::default()
-                },
-            )
+            let report = super::super::source::with_eager_input(!streaming, || {
+                convert_to_overviews(&input, &out, &ConvertOptions::default())
+            })
             .unwrap();
             assert!(
                 report.crs_assumed_wgs84,
                 "streaming={streaming}: the WGS84 assumption must surface on the report"
             );
         }
+    }
+
+    /// #708: the report carries the input's GeoParquet version verdict.
+    #[test]
+    fn report_carries_the_geo_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("bare.parquet");
+        let coords: Vec<(f64, f64)> = (0..8).map(|i| (i as f64 * 4.0, i as f64 * 2.0)).collect();
+        write_input_without_geo_metadata(&bare, &coords);
+        let declared = dir.path().join("declared.parquet");
+        write_input(&declared, &synthetic_geometries(), false, None);
+        let run = |input: &Path, name: &str| {
+            convert_to_overviews(input, dir.path().join(name), &ConvertOptions::default()).unwrap()
+        };
+        use crate::resolved_schema::GeoVersion;
+        assert_eq!(run(&bare, "o1.parquet").geo_version, GeoVersion::Missing);
+        let r = run(&declared, "o2.parquet");
+        assert!(
+            matches!(r.geo_version, GeoVersion::Known(_)),
+            "{:?}",
+            r.geo_version
+        );
+        let json = serde_json::to_value(&r.geo_version).unwrap();
+        assert_eq!(json["status"], "known");
     }
 
     /// #451 counterpart: a file that *declares* its CRS — explicitly or via
@@ -8618,14 +8925,9 @@ mod tests {
 
         for streaming in [true, false] {
             let out = dir.path().join(format!("out-{streaming}.parquet"));
-            let report = convert_to_overviews(
-                &input,
-                &out,
-                &ConvertOptions {
-                    streaming,
-                    ..Default::default()
-                },
-            )
+            let report = super::super::source::with_eager_input(!streaming, || {
+                convert_to_overviews(&input, &out, &ConvertOptions::default())
+            })
             .unwrap();
             assert!(!report.crs_assumed_wgs84, "streaming={streaming}");
         }
@@ -8871,159 +9173,6 @@ mod tests {
             pm_single == pm_multi,
             "per-part bbox selection must keep offsets aligned"
         );
-    }
-
-    /// The in-memory reference path (`--no-streaming`) does not support
-    /// multi-partition input; it must fail with a clear error.
-    #[test]
-    fn multi_partition_requires_streaming_pipeline() {
-        let geoms = synthetic_geometries();
-        let dir = tempfile::tempdir().unwrap();
-        let parts = dir.path().join("parts");
-        std::fs::create_dir(&parts).unwrap();
-        write_input_partition(&parts.join("part-000.parquet"), &geoms, 0..5, None);
-        write_input_partition(
-            &parts.join("part-001.parquet"),
-            &geoms,
-            5..geoms.len(),
-            None,
-        );
-
-        let opts = ConvertOptions {
-            streaming: false,
-            ..multi_test_options()
-        };
-        let err = convert_to_overviews(&parts, dir.path().join("out.parquet"), &opts).unwrap_err();
-        assert!(
-            matches!(err, ConvertError::MultiPartitionRequiresStreaming),
-            "expected MultiPartitionRequiresStreaming, got {err:?}"
-        );
-    }
-
-    /// #606: preserve the non-streaming aggregate limit: a byte-array
-    /// column whose total over the read row groups passes
-    /// the ceiling fails from footer statistics, naming the column and the
-    /// way out. A bbox that prunes the input under the ceiling reads it.
-    #[test]
-    fn in_memory_path_rejects_a_byte_array_column_past_the_batch_ceiling() {
-        let geoms = synthetic_geometries();
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("in.parquet");
-        // 1302 bytes of WKB in three row groups of six rows: the points, then
-        // the lines and the first two polygons, then the last two polygons
-        // (186 bytes).
-        write_input_partition(&input, &geoms, 0..geoms.len(), Some(6));
-        let source = ConvertSource::resolve_path(&input).unwrap();
-        let limit = 1000;
-        let opts = ConvertOptions {
-            streaming: false,
-            ..multi_test_options()
-        };
-
-        let Err(err) = super::super::stream::memory_source_for_test(&source, &opts, limit) else {
-            panic!("the whole table passes the ceiling");
-        };
-        let ConvertError::InMemoryByteArrayTooLarge {
-            largest,
-            limit_bytes,
-        } = &err
-        else {
-            panic!("expected InMemoryByteArrayTooLarge, got {err:?}");
-        };
-        assert_eq!(largest.column, "geometry");
-        assert!(largest.total_bytes > limit, "{largest:?}");
-        assert_eq!(*limit_bytes, limit);
-        let msg = err.to_string();
-        assert!(msg.contains("'geometry'"), "names the column: {msg}");
-        assert!(
-            msg.contains("Drop --no-streaming"),
-            "names the way out: {msg}"
-        );
-
-        // Only the last row group's extent intersects this bbox.
-        let pruned = ConvertOptions {
-            bbox: Some([-30.0, -60.0, -20.0, -50.0]),
-            ..opts.clone()
-        };
-        let loaded = super::super::stream::memory_source_for_test(&source, &pruned, limit)
-            .expect("the pruned row groups fit the ceiling");
-        assert_eq!(loaded.1, 1);
-
-        let unlimited = super::super::stream::memory_source_for_test(&source, &opts, u64::MAX)
-            .expect("the real ceiling reads a small input");
-        assert_eq!(unlimited.0.num_rows(), geoms.len());
-
-        // The aggregate ceiling is inclusive.
-        let at_limit =
-            super::super::stream::memory_source_for_test(&source, &opts, largest.total_bytes)
-                .expect("a total equal to the ceiling fits");
-        assert_eq!(at_limit.0.num_rows(), geoms.len());
-    }
-
-    /// #606: the message reports both sizes in GiB.
-    #[test]
-    fn in_memory_byte_array_message_reports_sizes_in_gib() {
-        let largest = tylertoo_io::LargestByteArrayColumn {
-            column: "geometry".into(),
-            total_bytes: 5 << 29,
-        };
-        let msg =
-            in_memory_byte_array_too_large_message(&largest, &tylertoo_io::BYTE_ARRAY_BATCH_LIMIT);
-        assert!(msg.contains("'geometry' holds 2.50 GiB"), "{msg}");
-        assert!(msg.contains("beyond the 2.00 GiB"), "{msg}");
-    }
-
-    /// #606: the in-memory total counts only the columns the reader decodes
-    /// with i32 offsets. A `LargeUtf8` column, and a column the source's
-    /// projection leaves out, cannot overflow the concat.
-    #[test]
-    fn in_memory_byte_array_check_skips_large_and_unprojected_columns() {
-        use tylertoo_io::test_support::ArrowWriter;
-
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("in.parquet");
-        let n = 4;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("geometry", DataType::Binary, false),
-            Field::new("label", DataType::Utf8, false),
-            Field::new("notes", DataType::LargeUtf8, false),
-        ]));
-        let geometry = arrow_array::BinaryArray::from_vec(vec![&[0u8; 10][..]; n]);
-        let label = StringArray::from(vec!["l".repeat(500); n]);
-        let notes = arrow_array::LargeStringArray::from(vec!["n".repeat(2000); n]);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(geometry), Arc::new(label), Arc::new(notes)],
-        )
-        .unwrap();
-        let mut writer =
-            ArrowWriter::try_new(std::fs::File::create(&input).unwrap(), schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        let limit = 1000;
-
-        // `label` (2000 bytes) passes the ceiling; `notes` (8000) is larger
-        // but decodes with i64 offsets.
-        let all = ConvertSource::resolve_path(&input).unwrap();
-        let ConvertSource::Single(single) = &all else {
-            panic!("one file resolves to a single source");
-        };
-        let builder = single.input().open().unwrap();
-        let err = check_in_memory_byte_array_total(&all, &builder, None, limit).unwrap_err();
-        let ConvertError::InMemoryByteArrayTooLarge { largest, .. } = &err else {
-            panic!("expected InMemoryByteArrayTooLarge, got {err:?}");
-        };
-        assert_eq!(largest.column, "label");
-
-        // Without `label`, nothing counted passes the ceiling.
-        let projected = ConvertSource::resolve_path(&input).unwrap();
-        projected.restrict_columns(vec![0, 2]).unwrap();
-        let ConvertSource::Single(single) = &projected else {
-            panic!("one file resolves to a single source");
-        };
-        let builder = single.input().open().unwrap();
-        check_in_memory_byte_array_total(&projected, &builder, None, limit)
-            .expect("an unprojected column and a LargeUtf8 column are not counted");
     }
 
     /// Partitions disagreeing on CRS are rejected at resolve time with an
@@ -9894,17 +10043,6 @@ mod tests {
             "unexpected: {data_shard}"
         );
 
-        // The separable pass-1 + assignment stage is the streaming pipeline's.
-        let in_memory = refused(ConvertOptions {
-            save_plan: Some(plan.clone()),
-            streaming: false,
-            ..Default::default()
-        });
-        assert!(
-            in_memory.contains("streaming pipeline"),
-            "unexpected: {in_memory}"
-        );
-
         // Every refusal above is a config check, so none of them left a plan
         // behind.
         assert!(!plan.exists(), "a refused plan-only run wrote a plan");
@@ -10079,11 +10217,9 @@ mod tests {
         let t_stream = tempfile::NamedTempFile::new().unwrap();
         let t_mem = tempfile::NamedTempFile::new().unwrap();
         let r1 = convert_to_overviews(tin.path(), t_stream.path(), &base).unwrap();
-        let mem = ConvertOptions {
-            streaming: false,
-            ..base
-        };
-        let r2 = convert_to_overviews(tin.path(), t_mem.path(), &mem).unwrap();
+        let r2 = super::super::source::with_eager_input(true, || {
+            convert_to_overviews(tin.path(), t_mem.path(), &base).unwrap()
+        });
         assert_eq!(r1.levels.len(), r2.levels.len());
 
         let rd1 = OverviewReader::open(t_stream.path()).unwrap();
@@ -10420,14 +10556,36 @@ mod tests {
 
     #[test]
     fn class_ranking_new_rejects_empty_and_non_finite() {
-        assert!(ClassRanking::new("c", vec![], None)
-            .unwrap_err()
-            .contains("at least one"));
+        use crate::error::{Classify, ErrorKind};
+        let err = ClassRanking::new("c", vec![], None).unwrap_err();
+        assert_eq!(err, ClassRankingError::Empty);
+        assert_eq!(err.kind(), ErrorKind::Usage);
+        // The pre-typed (String) messages, byte for byte.
+        assert_eq!(err.to_string(), "at least one class rank is required");
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let err = ClassRanking::new("c", vec![("a".into(), bad)], None).unwrap_err();
-            assert!(err.contains("finite") && err.contains("\"a\""), "{err}");
+            assert!(
+                matches!(err, ClassRankingError::NotFinite { class: Some(ref c), .. } if c == "a")
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "rank {bad} for class \"a\" must be a finite number (NaN and infinity \
+                     cannot be ordered against other classes)"
+                )
+            );
             let err = ClassRanking::new("c", vec![("a".into(), 1.0)], Some(bad)).unwrap_err();
-            assert!(err.contains("finite") && err.contains("unknown"), "{err}");
+            assert!(matches!(
+                err,
+                ClassRankingError::NotFinite { class: None, .. }
+            ));
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "rank {bad} for unknown (unlisted) classes must be a finite number (NaN \
+                     and infinity cannot be ordered against other classes)"
+                )
+            );
         }
     }
 
@@ -10647,13 +10805,11 @@ mod tests {
         write_input(tin.path(), &geoms, false, Some(md));
 
         // #452: both pipelines, and auto-zoom's own read, name the file.
-        let streaming = ConvertOptions::default();
-        let in_memory = ConvertOptions {
-            streaming: false,
-            ..Default::default()
-        };
-        for opts in [streaming, in_memory] {
-            let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
+        for eager in [false, true] {
+            let err = super::super::source::with_eager_input(eager, || {
+                convert_to_overviews(tin.path(), tout.path(), &ConvertOptions::default())
+            })
+            .unwrap_err();
             assert!(
                 matches!(err, ConvertError::UnsupportedCrs { .. }),
                 "expected UnsupportedCrs, got {err:?}"
@@ -11742,16 +11898,10 @@ mod tests {
         let mem_out = tempfile::NamedTempFile::new().unwrap();
         let stream_out = tempfile::NamedTempFile::new().unwrap();
 
-        let mem_opts = ConvertOptions {
-            streaming: false,
-            ..base.clone()
-        };
-        let stream_opts = ConvertOptions {
-            streaming: true,
-            ..base.clone()
-        };
-        let mem = convert_to_overviews(input, mem_out.path(), &mem_opts).unwrap();
-        let strm = convert_to_overviews(input, stream_out.path(), &stream_opts).unwrap();
+        let mem = super::super::source::with_eager_input(true, || {
+            convert_to_overviews(input, mem_out.path(), base).unwrap()
+        });
+        let strm = convert_to_overviews(input, stream_out.path(), base).unwrap();
 
         // Reports agree on everything but duration.
         assert_eq!(mem.mode, strm.mode);
@@ -12441,15 +12591,7 @@ mod tests {
         // Guard against a vacuous pass: the coarse levels must actually show
         // at least one coalesced (merged) line, not just N singletons.
         let tout = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(
-            tin.path(),
-            tout.path(),
-            &ConvertOptions {
-                streaming: true,
-                ..base.clone()
-            },
-        )
-        .unwrap();
+        convert_to_overviews(tin.path(), tout.path(), &base).unwrap();
         let reader = OverviewReader::open(tout.path()).unwrap();
         let coarse_counts = read_coalesced_counts(&reader, 0);
         assert!(
@@ -12479,14 +12621,9 @@ mod tests {
         };
         let mem_out = tempfile::NamedTempFile::new().unwrap();
         let stream_out = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(
-            tin.path(),
-            mem_out.path(),
-            &ConvertOptions {
-                streaming: false,
-                ..base.clone()
-            },
-        )
+        super::super::source::with_eager_input(true, || {
+            convert_to_overviews(tin.path(), mem_out.path(), &base)
+        })
         .unwrap();
         convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
 
@@ -12609,59 +12746,60 @@ mod tests {
         write_input(tin.path(), &geoms, false, None);
 
         for streaming in [true, false] {
-            for density in [true, false] {
-                for thinning in [2.0, 8.0] {
-                    let tout = tempfile::NamedTempFile::new().unwrap();
-                    let mut opts = ConvertOptions {
-                        levels: LevelPlan::ZoomRange {
-                            min_zoom: 0,
-                            max_zoom: 6,
-                        },
-                        cluster: true,
-                        streaming,
-                        ..Default::default()
-                    };
-                    opts.density.enabled = density;
-                    opts.assign.point_thinning = thinning;
-                    let label =
-                        format!("streaming={streaming} density={density} thinning={thinning}");
-                    convert_to_overviews(tin.path(), tout.path(), &opts)
-                        .unwrap_or_else(|e| panic!("{label}: {e}"));
+            super::super::source::with_eager_input(!streaming, || {
+                for density in [true, false] {
+                    for thinning in [2.0, 8.0] {
+                        let tout = tempfile::NamedTempFile::new().unwrap();
+                        let mut opts = ConvertOptions {
+                            levels: LevelPlan::ZoomRange {
+                                min_zoom: 0,
+                                max_zoom: 6,
+                            },
+                            cluster: true,
+                            ..Default::default()
+                        };
+                        opts.density.enabled = density;
+                        opts.assign.point_thinning = thinning;
+                        let label =
+                            format!("streaming={streaming} density={density} thinning={thinning}");
+                        convert_to_overviews(tin.path(), tout.path(), &opts)
+                            .unwrap_or_else(|e| panic!("{label}: {e}"));
 
-                    let vr = validate_file(tout.path()).unwrap();
-                    assert!(
-                        vr.is_valid(),
-                        "{label}: failures: {:?}",
-                        vr.failures().collect::<Vec<_>>()
-                    );
-                    assert_eq!(
-                        vr.check_passed("cluster_sum_invariant"),
-                        Some(true),
-                        "{label}"
-                    );
-
-                    let reader = OverviewReader::open(tout.path()).unwrap();
-                    let canonical = reader.num_levels() - 1;
-                    for level in 0..reader.num_levels() {
-                        let counts = read_point_counts(&reader, level);
+                        let vr = validate_file(tout.path()).unwrap();
                         assert!(
-                            !counts.is_empty(),
-                            "{label}: level {level} thinned points to zero"
+                            vr.is_valid(),
+                            "{label}: failures: {:?}",
+                            vr.failures().collect::<Vec<_>>()
                         );
                         assert_eq!(
-                            counts.iter().sum::<i64>(),
-                            geoms.len() as i64,
-                            "{label}: level {level} must partition the source set"
+                            vr.check_passed("cluster_sum_invariant"),
+                            Some(true),
+                            "{label}"
+                        );
+
+                        let reader = OverviewReader::open(tout.path()).unwrap();
+                        let canonical = reader.num_levels() - 1;
+                        for level in 0..reader.num_levels() {
+                            let counts = read_point_counts(&reader, level);
+                            assert!(
+                                !counts.is_empty(),
+                                "{label}: level {level} thinned points to zero"
+                            );
+                            assert_eq!(
+                                counts.iter().sum::<i64>(),
+                                geoms.len() as i64,
+                                "{label}: level {level} must partition the source set"
+                            );
+                        }
+                        assert!(
+                            read_point_counts(&reader, canonical)
+                                .iter()
+                                .all(|&c| c == 1),
+                            "{label}: canonical band must be singleton-only"
                         );
                     }
-                    assert!(
-                        read_point_counts(&reader, canonical)
-                            .iter()
-                            .all(|&c| c == 1),
-                        "{label}: canonical band must be singleton-only"
-                    );
                 }
-            }
+            });
         }
     }
 
@@ -12816,24 +12954,25 @@ mod tests {
 
         // Missing accumulate column is rejected (both pipelines).
         for streaming in [true, false] {
-            let err = convert_to_overviews(
-                tin.path(),
-                tout.path(),
-                &ConvertOptions {
-                    cluster: true,
-                    streaming,
-                    accumulate: vec![AccumulateSpec {
-                        column: "nonexistent".to_string(),
-                        op: super::super::cluster::AccumulateOp::Sum,
-                    }],
-                    ..Default::default()
-                },
-            )
-            .unwrap_err();
-            assert!(
-                matches!(err, ConvertError::AccumulateColumnMissing { .. }),
-                "streaming={streaming}: got {err:?}"
-            );
+            super::super::source::with_eager_input(!streaming, || {
+                let err = convert_to_overviews(
+                    tin.path(),
+                    tout.path(),
+                    &ConvertOptions {
+                        cluster: true,
+                        accumulate: vec![AccumulateSpec {
+                            column: "nonexistent".to_string(),
+                            op: super::super::cluster::AccumulateOp::Sum,
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(err, ConvertError::AccumulateColumnMissing { .. }),
+                    "streaming={streaming}: got {err:?}"
+                );
+            });
         }
 
         // Non-numeric accumulate column is rejected.
@@ -12963,14 +13102,9 @@ mod tests {
         // the shared helper does not include it).
         let mem_out = tempfile::NamedTempFile::new().unwrap();
         let stream_out = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(
-            tin.path(),
-            mem_out.path(),
-            &ConvertOptions {
-                streaming: false,
-                ..base.clone()
-            },
-        )
+        super::super::source::with_eager_input(true, || {
+            convert_to_overviews(tin.path(), mem_out.path(), &base)
+        })
         .unwrap();
         convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
         let mr = OverviewReader::open(mem_out.path()).unwrap();
@@ -13134,37 +13268,38 @@ mod tests {
         write_input(tin.path(), &geoms, false, None);
 
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let report = convert_to_overviews(
-                tin.path(),
-                tout.path(),
-                &ConvertOptions {
-                    mode: Mode::Partitioning,
-                    coalesce_lines: true, // the default; explicit for clarity
-                    streaming,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            // Feature-once: total rows == input rows, no merging happened.
-            assert_eq!(report.total_rows, geoms.len(), "streaming={streaming}");
-            let reader = OverviewReader::open(tout.path()).unwrap();
-            assert!(
-                reader
-                    .meta()
-                    .generalization
-                    .as_ref()
-                    .unwrap()
-                    .coalescing
-                    .is_none(),
-                "no coalescing provenance in partitioning mode"
-            );
-            let batch_schema = reader.read_level(0, None).unwrap().next().unwrap().unwrap();
-            assert!(
-                batch_schema.schema().index_of("coalesced_count").is_err(),
-                "no coalesced_count column in partitioning mode"
-            );
-            assert!(validate_file(tout.path()).unwrap().is_valid());
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let report = convert_to_overviews(
+                    tin.path(),
+                    tout.path(),
+                    &ConvertOptions {
+                        mode: Mode::Partitioning,
+                        coalesce_lines: true, // the default; explicit for clarity
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                // Feature-once: total rows == input rows, no merging happened.
+                assert_eq!(report.total_rows, geoms.len(), "streaming={streaming}");
+                let reader = OverviewReader::open(tout.path()).unwrap();
+                assert!(
+                    reader
+                        .meta()
+                        .generalization
+                        .as_ref()
+                        .unwrap()
+                        .coalescing
+                        .is_none(),
+                    "no coalescing provenance in partitioning mode"
+                );
+                let batch_schema = reader.read_level(0, None).unwrap().next().unwrap().unwrap();
+                assert!(
+                    batch_schema.schema().index_of("coalesced_count").is_err(),
+                    "no coalesced_count column in partitioning mode"
+                );
+                assert!(validate_file(tout.path()).unwrap().is_valid());
+            });
         }
     }
 
@@ -13207,23 +13342,24 @@ mod tests {
 
         let tout = tempfile::NamedTempFile::new().unwrap();
         for streaming in [true, false] {
-            convert_to_overviews(
-                tin.path(),
-                tout.path(),
-                &ConvertOptions {
-                    coalesce_lines: true,
-                    streaming,
-                    ..Default::default()
-                },
-            )
-            .unwrap_or_else(|e| {
-                panic!("streaming={streaming}: `Coalesced_Count` must be auto-renamed, got {e}")
+            super::super::source::with_eager_input(!streaming, || {
+                convert_to_overviews(
+                    tin.path(),
+                    tout.path(),
+                    &ConvertOptions {
+                        coalesce_lines: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|e| {
+                    panic!("streaming={streaming}: `Coalesced_Count` must be auto-renamed, got {e}")
+                });
+                let names = output_column_names(tout.path());
+                assert!(
+                    names.iter().any(|n| n == "Coalesced_Count_"),
+                    "streaming={streaming}: renamed source column present, names={names:?}"
+                );
             });
-            let names = output_column_names(tout.path());
-            assert!(
-                names.iter().any(|n| n == "Coalesced_Count_"),
-                "streaming={streaming}: renamed source column present, names={names:?}"
-            );
         }
         // With coalescing disabled the column is an ordinary passthrough
         // property (kept verbatim).
@@ -13466,14 +13602,9 @@ mod tests {
         // Explicitly compare coalesced_count per level too.
         let mem_out = tempfile::NamedTempFile::new().unwrap();
         let stream_out = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(
-            tin.path(),
-            mem_out.path(),
-            &ConvertOptions {
-                streaming: false,
-                ..base.clone()
-            },
-        )
+        super::super::source::with_eager_input(true, || {
+            convert_to_overviews(tin.path(), mem_out.path(), &base)
+        })
         .unwrap();
         convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
         let mr = OverviewReader::open(mem_out.path()).unwrap();
@@ -13521,14 +13652,9 @@ mod tests {
         };
         let mem_out = tempfile::NamedTempFile::new().unwrap();
         let stream_out = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(
-            tin.path(),
-            mem_out.path(),
-            &ConvertOptions {
-                streaming: false,
-                ..base.clone()
-            },
-        )
+        super::super::source::with_eager_input(true, || {
+            convert_to_overviews(tin.path(), mem_out.path(), &base)
+        })
         .unwrap();
         convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
         assert_eq!(
@@ -13863,21 +13989,22 @@ mod tests {
         write_multi_rg_attr_input(tin.path(), &attr_rows());
 
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                filter: Some("confidence > 0.8".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            assert_eq!(report.row_groups_total, 4, "streaming={streaming}");
-            // RG0 (0.1) and RG3 (all-null) are provably non-matching by stats.
-            assert_eq!(
-                report.row_groups_read, 2,
-                "stats pushdown did not fire (streaming={streaming})"
-            );
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![1, 2], "streaming={streaming}");
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    filter: Some("confidence > 0.8".to_string()),
+                    ..attr_opts()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                assert_eq!(report.row_groups_total, 4, "streaming={streaming}");
+                // RG0 (0.1) and RG3 (all-null) are provably non-matching by stats.
+                assert_eq!(
+                    report.row_groups_read, 2,
+                    "stats pushdown did not fire (streaming={streaming})"
+                );
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![1, 2], "streaming={streaming}");
+            });
         }
     }
 
@@ -13889,22 +14016,23 @@ mod tests {
         write_multi_rg_attr_input(tin.path(), &attr_rows());
 
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                // bbox keeps (10,10) and (20,20); filter keeps 0.9 and 0.85;
-                // combined with bbox tightened to exclude (20,20): only id=1.
-                bbox: Some([9.0, 9.0, 11.0, 11.0]),
-                filter: Some("confidence > 0.8".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            assert_eq!(
-                report.row_groups_read, 1,
-                "bbox+filter selection must intersect (streaming={streaming})"
-            );
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![1], "streaming={streaming}");
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    // bbox keeps (10,10) and (20,20); filter keeps 0.9 and 0.85;
+                    // combined with bbox tightened to exclude (20,20): only id=1.
+                    bbox: Some([9.0, 9.0, 11.0, 11.0]),
+                    filter: Some("confidence > 0.8".to_string()),
+                    ..attr_opts()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                assert_eq!(
+                    report.row_groups_read, 1,
+                    "bbox+filter selection must intersect (streaming={streaming})"
+                );
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![1], "streaming={streaming}");
+            });
         }
     }
 
@@ -13919,33 +14047,35 @@ mod tests {
         let bbox = [-165.0, 15.0, -155.0, 25.0];
 
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                mode: Mode::Duplicating,
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 6,
-                    max_zoom: 6,
-                },
-                bbox: Some(bbox),
-                streaming,
-                ..Default::default()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
-                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
-            assert_eq!(
-                report.row_groups_read, 1,
-                "streaming={streaming}: the prune must keep exactly the wrapped group"
-            );
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            // Post-hoc: the feature shifted -360° lies in the bbox.
-            let posthoc: Vec<i64> = (0..coords.len() as i64)
-                .filter(|&id| {
-                    let (x, y) = coords[id as usize];
-                    (bbox[0]..=bbox[2]).contains(&(x - 360.0)) && (bbox[1]..=bbox[3]).contains(&y)
-                })
-                .collect();
-            assert_eq!(posthoc, vec![1]);
-            assert_eq!(ids, posthoc, "streaming={streaming}");
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 6,
+                        max_zoom: 6,
+                    },
+                    bbox: Some(bbox),
+                    ..Default::default()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                    .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+                assert_eq!(
+                    report.row_groups_read, 1,
+                    "streaming={streaming}: the prune must keep exactly the wrapped group"
+                );
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                // Post-hoc: the feature shifted -360° lies in the bbox.
+                let posthoc: Vec<i64> = (0..coords.len() as i64)
+                    .filter(|&id| {
+                        let (x, y) = coords[id as usize];
+                        (bbox[0]..=bbox[2]).contains(&(x - 360.0))
+                            && (bbox[1]..=bbox[3]).contains(&y)
+                    })
+                    .collect();
+                assert_eq!(posthoc, vec![1]);
+                assert_eq!(ids, posthoc, "streaming={streaming}");
+            });
         }
     }
 
@@ -13957,22 +14087,23 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_multi_rg_input(tin.path(), &coords, true);
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                mode: Mode::Duplicating,
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 6,
-                    max_zoom: 6,
-                },
-                bbox: Some([170.0, -1.0, 190.0, 1.0]),
-                streaming,
-                ..Default::default()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
-                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
-            assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![0], "streaming={streaming}");
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 6,
+                        max_zoom: 6,
+                    },
+                    bbox: Some([170.0, -1.0, 190.0, 1.0]),
+                    ..Default::default()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                    .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+                assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![0], "streaming={streaming}");
+            });
         }
     }
 
@@ -13996,23 +14127,24 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_multi_rg_input_with_crs(tin.path(), &metres, true, Some(md));
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                mode: Mode::Duplicating,
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 6,
-                    max_zoom: 6,
-                },
-                // Around lng -160 = 200 - 360.
-                bbox: Some([-161.0, 9.0, -159.0, 11.0]),
-                streaming,
-                ..Default::default()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
-                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
-            assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![0], "streaming={streaming}");
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 6,
+                        max_zoom: 6,
+                    },
+                    // Around lng -160 = 200 - 360.
+                    bbox: Some([-161.0, 9.0, -159.0, 11.0]),
+                    ..Default::default()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                    .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+                assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![0], "streaming={streaming}");
+            });
         }
     }
 
@@ -14063,29 +14195,30 @@ mod tests {
         write_multi_rg_attr_input(tin.path(), &rows);
 
         for streaming in [true, false] {
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                filter: Some("confidence > 0.8".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            assert_eq!(
-                report.row_groups_read, 2,
-                "pushdown must prune (streaming={streaming})"
-            );
-            assert_eq!(report.out_of_range_features, 1, "streaming={streaming}");
-            assert_eq!(
-                report.out_of_range_exemplars,
-                vec![OutOfRangeExemplar {
-                    part: None,
+            super::super::source::with_eager_input(!streaming, || {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    filter: Some("confidence > 0.8".to_string()),
+                    ..attr_opts()
+                };
+                let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                assert_eq!(
+                    report.row_groups_read, 2,
+                    "pushdown must prune (streaming={streaming})"
+                );
+                assert_eq!(report.out_of_range_features, 1, "streaming={streaming}");
+                assert_eq!(
+                    report.out_of_range_exemplars,
+                    vec![OutOfRangeExemplar {
+                        part: None,
 
-                    row: 2,
-                    axis: "lon",
-                    value: 590.0,
-                }],
-                "streaming={streaming}"
-            );
+                        row: 2,
+                        axis: "lon",
+                        value: 590.0,
+                    }],
+                    "streaming={streaming}"
+                );
+            });
         }
     }
 
@@ -14131,38 +14264,37 @@ mod tests {
         write_multi_rg_attr_input(tin.path(), &attr_rows());
 
         for streaming in [true, false] {
-            // IN over strings.
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                filter: Some("crop IN ('corn', 'rice')".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![1, 3], "IN (streaming={streaming})");
+            super::super::source::with_eager_input(!streaming, || {
+                // IN over strings.
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    filter: Some("crop IN ('corn', 'rice')".to_string()),
+                    ..attr_opts()
+                };
+                convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![1, 3], "IN (streaming={streaming})");
 
-            // IS NULL keeps exactly the null-confidence row.
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                filter: Some("confidence IS NULL".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![3], "IS NULL (streaming={streaming})");
+                // IS NULL keeps exactly the null-confidence row.
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    filter: Some("confidence IS NULL".to_string()),
+                    ..attr_opts()
+                };
+                convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![3], "IS NULL (streaming={streaming})");
 
-            // Three-valued OR: null confidence is rescued by the crop arm.
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                filter: Some("confidence > 0.8 OR crop = 'rice'".to_string()),
-                streaming,
-                ..attr_opts()
-            };
-            convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![1, 2, 3], "OR (streaming={streaming})");
+                // Three-valued OR: null confidence is rescued by the crop arm.
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    filter: Some("confidence > 0.8 OR crop = 'rice'".to_string()),
+                    ..attr_opts()
+                };
+                convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![1, 2, 3], "OR (streaming={streaming})");
+            });
         }
     }
 
@@ -14240,64 +14372,65 @@ mod tests {
         /// must fetch byte ranges ONLY from the bbox-selected row groups (plus
         /// the footer) — pruned row groups are never downloaded at all.
         fn assert_bbox_extract_fetches_only_selected(streaming: bool) {
-            // 4 single-point row groups at (0,0), (10,10), (20,20), (30,30)
-            // with covering stats; a bbox around (10,10) selects only rg 1.
-            let coords = vec![(0.0, 0.0), (10.0, 10.0), (20.0, 20.0), (30.0, 30.0)];
-            let tin = tempfile::NamedTempFile::new().unwrap();
-            write_multi_rg_input(tin.path(), &coords, true);
-            let bytes = std::fs::read(tin.path()).unwrap();
-            let spans = row_group_spans(&bytes);
-            assert_eq!(spans.len(), 4);
+            crate::overview::source::with_eager_input(!streaming, || {
+                // 4 single-point row groups at (0,0), (10,10), (20,20), (30,30)
+                // with covering stats; a bbox around (10,10) selects only rg 1.
+                let coords = vec![(0.0, 0.0), (10.0, 10.0), (20.0, 20.0), (30.0, 30.0)];
+                let tin = tempfile::NamedTempFile::new().unwrap();
+                write_multi_rg_input(tin.path(), &coords, true);
+                let bytes = std::fs::read(tin.path()).unwrap();
+                let spans = row_group_spans(&bytes);
+                assert_eq!(spans.len(), 4);
 
-            let source = test_memory_source(bytes, "multi.parquet");
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            let opts = ConvertOptions {
-                mode: Mode::Duplicating,
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 6,
-                    max_zoom: 6,
-                },
-                bbox: Some([9.0, 9.0, 11.0, 11.0]),
-                streaming,
-                ..Default::default()
-            };
-            let report = convert_to_overviews_source(&source, tout.path(), &opts).unwrap();
+                let source = test_memory_source(bytes, "multi.parquet");
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 6,
+                        max_zoom: 6,
+                    },
+                    bbox: Some([9.0, 9.0, 11.0, 11.0]),
+                    ..Default::default()
+                };
+                let report = convert_to_overviews_source(&source, tout.path(), &opts).unwrap();
 
-            assert_eq!(report.row_groups_total, 4);
-            assert_eq!(report.row_groups_read, 1, "bbox pruning must fire");
-            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
-            assert_eq!(ids, vec![1], "only the (10,10) feature survives");
+                assert_eq!(report.row_groups_total, 4);
+                assert_eq!(report.row_groups_read, 1, "bbox pruning must fire");
+                let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                assert_eq!(ids, vec![1], "only the (10,10) feature survives");
 
-            // No fetched range may touch a pruned row group's data pages.
-            let fetched = source.fetched_ranges().unwrap();
-            assert!(!fetched.is_empty());
-            for (i, span) in spans.iter().enumerate() {
-                if i == 1 {
-                    continue;
+                // No fetched range may touch a pruned row group's data pages.
+                let fetched = source.fetched_ranges().unwrap();
+                assert!(!fetched.is_empty());
+                for (i, span) in spans.iter().enumerate() {
+                    if i == 1 {
+                        continue;
+                    }
+                    for r in &fetched {
+                        assert!(
+                            r.end <= span.start || r.start >= span.end,
+                            "fetched range {r:?} overlaps PRUNED row group {i} ({span:?})"
+                        );
+                    }
                 }
-                for r in &fetched {
-                    assert!(
-                        r.end <= span.start || r.start >= span.end,
-                        "fetched range {r:?} overlaps PRUNED row group {i} ({span:?})"
-                    );
-                }
-            }
-            // ... while the selected row group's data pages WERE fetched.
-            assert!(
-                fetched
-                    .iter()
-                    .any(|r| r.start >= spans[1].start && r.end <= spans[1].end),
-                "selected row group 1 ({:?}) never fetched: {fetched:?}",
-                spans[1]
-            );
+                // ... while the selected row group's data pages WERE fetched.
+                assert!(
+                    fetched
+                        .iter()
+                        .any(|r| r.start >= spans[1].start && r.end <= spans[1].end),
+                    "selected row group 1 ({:?}) never fetched: {fetched:?}",
+                    spans[1]
+                );
 
-            // And the report carries the savings.
-            let stats = report.remote_fetch.expect("remote stats in report");
-            assert!(stats.requests as usize >= fetched.len());
-            assert!(
-                stats.bytes_fetched < stats.object_size,
-                "bbox extract must move fewer bytes than the object: {stats:?}"
-            );
+                // And the report carries the savings.
+                let stats = report.remote_fetch.expect("remote stats in report");
+                assert!(stats.requests as usize >= fetched.len());
+                assert!(
+                    stats.bytes_fetched < stats.object_size,
+                    "bbox extract must move fewer bytes than the object: {stats:?}"
+                );
+            });
         }
 
         #[test]
@@ -14876,61 +15009,62 @@ mod tests {
     /// Convert `tiny_polygons` over z0..z4 and assert the pyramid is clamped
     /// to the canonical level, with the skipped planned levels recorded.
     fn assert_clamped_pyramid(mode: Mode, streaming: bool) {
-        let geoms = tiny_polygons(20);
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &geoms, false, None);
+        super::super::source::with_eager_input(!streaming, || {
+            let geoms = tiny_polygons(20);
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            write_input(tin.path(), &geoms, false, None);
 
-        let opts = ConvertOptions {
-            mode,
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 0,
-                max_zoom: 4,
-            },
-            streaming,
-            ..Default::default()
-        };
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+            let opts = ConvertOptions {
+                mode,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 4,
+                },
+                ..Default::default()
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
 
-        // Only the canonical level survives; the pyramid clamps to it.
-        assert_eq!(report.levels.len(), 1, "expected a single written level");
-        assert_eq!(report.levels[0].level, 0);
-        assert_eq!(report.levels[0].zoom, Some(4));
-        assert_eq!(report.levels[0].feature_count, geoms.len());
-        assert_eq!(report.total_rows, geoms.len());
+            // Only the canonical level survives; the pyramid clamps to it.
+            assert_eq!(report.levels.len(), 1, "expected a single written level");
+            assert_eq!(report.levels[0].level, 0);
+            assert_eq!(report.levels[0].zoom, Some(4));
+            assert_eq!(report.levels[0].feature_count, geoms.len());
+            assert_eq!(report.total_rows, geoms.len());
 
-        // The skipped planned levels are recorded coarse→fine with their
-        // planned zoom and a positive GSD.
-        let skipped: Vec<(usize, Option<u8>)> = report
-            .skipped_empty_levels
-            .iter()
-            .map(|s| (s.planned_level, s.zoom))
-            .collect();
-        assert_eq!(
-            skipped,
-            vec![(0, Some(0)), (1, Some(1)), (2, Some(2)), (3, Some(3))]
-        );
-        assert!(report.skipped_empty_levels.iter().all(|s| s.gsd > 0.0));
+            // The skipped planned levels are recorded coarse→fine with their
+            // planned zoom and a positive GSD.
+            let skipped: Vec<(usize, Option<u8>)> = report
+                .skipped_empty_levels
+                .iter()
+                .map(|s| (s.planned_level, s.zoom))
+                .collect();
+            assert_eq!(
+                skipped,
+                vec![(0, Some(0)), (1, Some(1)), (2, Some(2)), (3, Some(3))]
+            );
+            assert!(report.skipped_empty_levels.iter().all(|s| s.gsd > 0.0));
 
-        // The clamped file is valid, readable, and exportable: the PMTiles
-        // header starts at the clamped (canonical) zoom.
-        let vr = validate_file(tout.path()).unwrap();
-        assert!(
-            vr.is_valid(),
-            "failures: {:?}",
-            vr.failures().collect::<Vec<_>>()
-        );
-        let reader = OverviewReader::open(tout.path()).unwrap();
-        assert_eq!(reader.num_levels(), 1);
-        let tpm = tempfile::NamedTempFile::new().unwrap();
-        let export = crate::overview::export::export_pmtiles(
-            tout.path(),
-            tpm.path(),
-            &crate::overview::export::ExportOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(export.min_zoom, 4);
-        assert_eq!(export.max_zoom, 4);
+            // The clamped file is valid, readable, and exportable: the PMTiles
+            // header starts at the clamped (canonical) zoom.
+            let vr = validate_file(tout.path()).unwrap();
+            assert!(
+                vr.is_valid(),
+                "failures: {:?}",
+                vr.failures().collect::<Vec<_>>()
+            );
+            let reader = OverviewReader::open(tout.path()).unwrap();
+            assert_eq!(reader.num_levels(), 1);
+            let tpm = tempfile::NamedTempFile::new().unwrap();
+            let export = crate::overview::export::export_pmtiles(
+                tout.path(),
+                tpm.path(),
+                &crate::overview::export::ExportOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(export.min_zoom, 4);
+            assert_eq!(export.max_zoom, 4);
+        });
     }
 
     #[test]
@@ -14958,23 +15092,24 @@ mod tests {
     #[test]
     fn all_levels_empty_is_hard_error() {
         for streaming in [false, true] {
-            let tin = tempfile::NamedTempFile::new().unwrap();
-            let tout = tempfile::NamedTempFile::new().unwrap();
-            write_input(tin.path(), &[], false, None);
-            let opts = ConvertOptions {
-                mode: Mode::Duplicating,
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 0,
-                    max_zoom: 3,
-                },
-                streaming,
-                ..Default::default()
-            };
-            let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
-            assert!(
-                matches!(err, ConvertError::NoData),
-                "streaming={streaming}: expected NoData, got {err:?}"
-            );
+            super::super::source::with_eager_input(!streaming, || {
+                let tin = tempfile::NamedTempFile::new().unwrap();
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                write_input(tin.path(), &[], false, None);
+                let opts = ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 0,
+                        max_zoom: 3,
+                    },
+                    ..Default::default()
+                };
+                let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
+                assert!(
+                    matches!(err, ConvertError::NoData),
+                    "streaming={streaming}: expected NoData, got {err:?}"
+                );
+            });
         }
     }
 
@@ -15018,7 +15153,6 @@ mod tests {
                 min_zoom: 0,
                 max_zoom: 3,
             },
-            streaming: true,
             ..Default::default()
         };
         let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();

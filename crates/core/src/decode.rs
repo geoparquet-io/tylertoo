@@ -116,6 +116,7 @@ const RESERVED_COLUMNS: [&str; 4] = [
 
 /// Options for [`decode_pmtiles`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DecodeOptions {
     /// Only decode tiles with `zoom >= min_zoom`.
     pub min_zoom: Option<u8>,
@@ -124,6 +125,12 @@ pub struct DecodeOptions {
     /// Only decode features from this MVT layer.
     pub layer: Option<String>,
 }
+
+with_setters!(DecodeOptions {
+    with_min_zoom => min_zoom: Option<u8>,
+    with_max_zoom => max_zoom: Option<u8>,
+    with_layer => layer: Option<String>,
+});
 
 impl DecodeOptions {
     /// Reject an inverted zoom range (`min_zoom > max_zoom`), which would
@@ -135,6 +142,7 @@ impl DecodeOptions {
     ///
     /// [`DecodeError::InvalidZoomRange`] when both bounds are set and
     /// `min_zoom > max_zoom`.
+    #[doc(hidden)]
     pub fn validate(&self) -> Result<(), DecodeError> {
         match (self.min_zoom, self.max_zoom) {
             (Some(min_zoom), Some(max_zoom)) if min_zoom > max_zoom => {
@@ -147,6 +155,7 @@ impl DecodeOptions {
 
 /// Summary of a completed decode.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct DecodeReport {
     /// Tiles read (after zoom filtering).
     pub tiles_read: u64,
@@ -171,8 +180,10 @@ pub struct DecodeReport {
 /// cause twice (#396). Callers that want one line use `{:#}` on an
 /// `anyhow::Error`, or walk `source()`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DecodeError {
     #[error("minimum zoom {min_zoom} exceeds maximum zoom {max_zoom}")]
+    #[non_exhaustive]
     InvalidZoomRange { min_zoom: u8, max_zoom: u8 },
 
     #[error("I/O error")]
@@ -193,6 +204,7 @@ pub enum DecodeError {
     NotVectorTiles(TileType),
 
     #[error("failed to decompress {what} at byte offset {offset} ({length} bytes)")]
+    #[non_exhaustive]
     Decompress {
         what: &'static str,
         offset: u64,
@@ -201,6 +213,7 @@ pub enum DecodeError {
     },
 
     #[error("failed to decompress tile z{z}/{x}/{y} at byte offset {offset} ({length} bytes)")]
+    #[non_exhaustive]
     TileDecompress {
         z: u8,
         x: u32,
@@ -211,14 +224,18 @@ pub enum DecodeError {
     },
 
     #[error("MVT protobuf decode failed for tile z{z}/{x}/{y}")]
+    #[non_exhaustive]
     Mvt {
         z: u8,
         x: u32,
         y: u32,
+        // #437: hidden, so the pre-1.0 `prost` type is not stable API.
+        #[doc(hidden)]
         source: prost::DecodeError,
     },
 
     #[error("invalid MVT geometry in tile z{z}/{x}/{y}: {reason}")]
+    #[non_exhaustive]
     Geometry {
         z: u8,
         x: u32,
@@ -233,13 +250,47 @@ pub enum DecodeError {
     ReservedColumn(String),
 
     #[error("Arrow error")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Arrow(#[source] arrow_schema::ArrowError),
 
     #[error("Parquet error")]
-    Parquet(#[from] tylertoo_io::ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] tylertoo_io::ParquetError),
 
     #[error("GeoParquet write failed: {0}")]
     Write(String),
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::ParquetError> for DecodeError {
+    fn from(e: tylertoo_io::ParquetError) -> Self {
+        DecodeError::Parquet(e)
+    }
+}
+
+#[doc(hidden)]
+impl From<arrow_schema::ArrowError> for DecodeError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        DecodeError::Arrow(e)
+    }
+}
+
+impl crate::error::Classify for DecodeError {
+    /// An inverted zoom range, a raster archive, or a property that collides
+    /// with a provenance column is the caller's input problem; a damaged or
+    /// unreadable archive, or a failed write, is a failed run.
+    fn kind(&self) -> crate::error::ErrorKind {
+        use crate::error::ErrorKind;
+        match self {
+            DecodeError::InvalidZoomRange { .. }
+            | DecodeError::NotVectorTiles(_)
+            | DecodeError::ReservedColumn(_) => ErrorKind::Input,
+            DecodeError::Archive(e) => e.kind(),
+            _ => ErrorKind::Runtime,
+        }
+    }
 }
 
 /// Decode a PMTiles archive into a GeoParquet file.

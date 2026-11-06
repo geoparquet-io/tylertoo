@@ -54,12 +54,6 @@ no CLI-doc churn, and it is best-effort: an unset/blank var is a no-op, and
 a write failure only logs — it never fails the conversion (see
 **Early warning** below).
 
-`--no-streaming` (the in-memory reference path) writes **no dump at all**:
-it has none of the per-stage timers or phase walls the schema below is made
-of. Setting the var with `--no-streaming` logs a warning saying so and
-leaves the file untouched — so a missing line there means "wrong pipeline",
-not "the run was not profiled".
-
 ### Schema
 
 ```jsonc

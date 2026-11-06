@@ -80,7 +80,6 @@ Args:
     row_group_size: See `overview()`.
     row_group_size_policy: See `overview()`.
     full_column_stats: See `overview()`.
-    streaming: See `overview()`.
     read_batch_size: See `overview()`.
     filter: See `overview()`.
     profile: See `overview()`.

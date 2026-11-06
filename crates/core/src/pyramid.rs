@@ -30,15 +30,163 @@ use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::dedup::TileHasher;
 use crate::input::url_scheme;
 use crate::overview::config::{check_ignored_export_fields, ExportField};
-use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-use crate::overview::export::{export_pmtiles, ExportOptions};
+use crate::overview::convert::{convert_to_overviews, ConvertError, ConvertOptions, LevelPlan};
+use crate::overview::export::{export_pmtiles, ExportError, ExportOptions};
 use crate::pmtiles_metadata::{MetadataCollector, Resolved};
 use crate::pmtiles_writer::{Header, StreamingPmtilesWriter, TileType, MAX_TILE_ID_ZOOM};
 use crate::tile::TileBounds;
 use crate::{Error, TilesetMetadata};
 
+/// Why a pyramid build or band merge failed (#438).
+///
+/// `#[non_exhaustive]`: new failure modes are added without a breaking
+/// change; match with a wildcard arm. [`Classify::kind`](crate::error::Classify::kind)
+/// says what a failure means to the caller.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PyramidError {
+    /// The band set is unusable: no band, a remote `.pmtiles` archive, or two
+    /// bands of one layer sharing a zoom ([`validate_bands`]).
+    #[error("{0}")]
+    Bands(String),
+    /// A band's archive does not hold what its `--band` declares: a zoom
+    /// range it cannot fill, a layer other than its label, a tile
+    /// compression or type the merge cannot copy, or a tile two bands of
+    /// one layer both write.
+    #[error("{0}")]
+    BandMismatch(String),
+    /// A band archive's directory lists a tile id at or below one before it.
+    #[error(
+        "{}: directory lists tile id {id} after {prev}; a PMTiles directory \
+         must address tiles in ascending id order",
+        path.display()
+    )]
+    #[non_exhaustive]
+    OutOfOrder {
+        /// The band archive.
+        path: PathBuf,
+        /// The tile id listed late.
+        id: u64,
+        /// The id listed before it.
+        prev: u64,
+    },
+    /// A tile two bands share did not decompress.
+    #[error("tile {z}/{x}/{y} of band {layer:?} failed to decompress: {error}")]
+    #[non_exhaustive]
+    TileDecompress {
+        /// Tile zoom.
+        z: u8,
+        /// Tile column.
+        x: u32,
+        /// Tile row.
+        y: u32,
+        /// The band's layer.
+        layer: String,
+        /// The decompressor's error.
+        error: std::io::Error,
+    },
+    /// A combined shared-zoom tile did not compress.
+    #[error("tile {z}/{x}/{y} failed to compress: {error}")]
+    #[non_exhaustive]
+    TileCompress {
+        /// Tile zoom.
+        z: u8,
+        /// Tile column.
+        x: u32,
+        /// Tile row.
+        y: u32,
+        /// The compressor's error.
+        error: std::io::Error,
+    },
+    /// A band's intermediate file could not be reserved.
+    #[error("band {layer:?}: {error}")]
+    #[non_exhaustive]
+    BandWorkFile {
+        /// The band's layer.
+        layer: String,
+        /// The I/O error.
+        error: std::io::Error,
+    },
+    /// Tiling a GeoParquet band failed in its convert half.
+    #[error("band {layer:?}: convert failed: {error}")]
+    #[non_exhaustive]
+    BandConvert {
+        /// The band's layer.
+        layer: String,
+        /// The convert error.
+        error: ConvertError,
+    },
+    /// Tiling a GeoParquet band failed in its export half.
+    #[error("band {layer:?}: export failed: {error}")]
+    #[non_exhaustive]
+    BandExport {
+        /// The band's layer.
+        layer: String,
+        /// The export error.
+        error: ExportError,
+    },
+    /// An option refused before any work ([`PyramidOptions::validate`]).
+    #[error(transparent)]
+    Config(#[from] crate::overview::config::ConfigError),
+    /// A band convert option, or the publication metadata, refused.
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(crate::InvalidConfigError),
+    /// The output cannot be written (#452: checked before any work).
+    #[error(transparent)]
+    Output(#[from] crate::atomic_output::OutputNotWritable),
+    /// Reading a band archive or writing the merged one failed.
+    #[error(transparent)]
+    Archive(#[from] Error),
+    /// An I/O error outside the archive readers and writer.
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl crate::error::Classify for PyramidError {
+    fn kind(&self) -> crate::error::ErrorKind {
+        use crate::error::ErrorKind;
+        match self {
+            PyramidError::Bands(_) | PyramidError::Config(_) | PyramidError::InvalidConfig(_) => {
+                ErrorKind::Usage
+            }
+            PyramidError::BandMismatch(_) => ErrorKind::Input,
+            PyramidError::BandConvert { error, .. } => error.kind(),
+            PyramidError::BandExport { error, .. } => error.kind(),
+            PyramidError::Archive(error) => error.kind(),
+            _ => crate::error::fallback_kind(self),
+        }
+    }
+}
+
+// Not `#[from]` on the variant: the inner error's message is already in this
+// one's, so it is not also a `source()` the CLI would print a second time.
+impl PyramidError {
+    /// [`Self::BandConvert`] for the frontends' classification tests, which
+    /// cannot build the `#[non_exhaustive]` variant.
+    #[doc(hidden)]
+    pub fn band_convert(layer: impl Into<String>, error: ConvertError) -> Self {
+        PyramidError::BandConvert {
+            layer: layer.into(),
+            error,
+        }
+    }
+}
+
+impl From<crate::pmtiles_writer::WriteError> for PyramidError {
+    fn from(e: crate::pmtiles_writer::WriteError) -> Self {
+        PyramidError::Archive(e.into())
+    }
+}
+
+impl From<crate::archive_index::ArchiveError> for PyramidError {
+    fn from(e: crate::archive_index::ArchiveError) -> Self {
+        PyramidError::Archive(e.into())
+    }
+}
+
 /// One band: an input tiled verbatim across `min_zoom..=max_zoom` into `layer`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Band {
     pub input: PathBuf,
     pub layer: String,
@@ -47,6 +195,22 @@ pub struct Band {
 }
 
 impl Band {
+    /// `input` tiled verbatim across `min_zoom..=max_zoom` into `layer`.
+    /// [`build_pyramid`] validates the band set.
+    pub fn new(
+        input: impl Into<PathBuf>,
+        layer: impl Into<String>,
+        min_zoom: u8,
+        max_zoom: u8,
+    ) -> Self {
+        Self {
+            input: input.into(),
+            layer: layer.into(),
+            min_zoom,
+            max_zoom,
+        }
+    }
+
     /// Web Mercator zoom ceiling: the shared [`crate::tile::MAX_ZOOM`] (#371),
     /// which every write path now enforces at options validation.
     const MAX_ZOOM: u8 = crate::tile::MAX_ZOOM;
@@ -84,59 +248,56 @@ impl Band {
     ///
     /// # Errors
     ///
-    /// Returns a description of the problem if the spec has no zoom range, a
-    /// zoom that does not parse, a minimum above the maximum, a maximum above
+    /// A [`BandSpecError`] if the spec has no zoom range, a zoom that does
+    /// not parse, a minimum above the maximum, a maximum above
     /// [`crate::tile::MAX_ZOOM`], an empty input or layer, or no layer when
     /// none can be derived from the input.
-    pub fn parse(spec: &str) -> Result<Self, String> {
-        let (sep, at) =
-            band_separator(spec).ok_or_else(|| format!("band {spec:?}: {BAND_FORMS}"))?;
+    pub fn parse(spec: &str) -> Result<Self, BandSpecError> {
+        use BandSpecError as E;
+        let owned = || spec.to_string();
+        let (sep, at) = band_separator(spec).ok_or_else(|| E::NoZoomRange { spec: owned() })?;
         let (range, rest) = spec.split_at(at);
         let rest = &rest[sep.len_utf8()..];
-        let (lo, hi) = range.split_once('-').ok_or_else(|| {
-            format!(
-                "band {spec:?}: zoom range must be LO-HI; every band spec must \
-                 start with a LO-HI: (or LO-HI=) zoom range, e.g. \"0-5:{spec}\""
-            )
+        let (lo, hi) = range
+            .split_once('-')
+            .ok_or_else(|| E::RangeNotLoHi { spec: owned() })?;
+        let min_zoom: u8 = lo.trim().parse().map_err(|_| E::BadMinZoom {
+            spec: owned(),
+            zoom: lo.to_string(),
         })?;
-        let min_zoom: u8 = lo
-            .trim()
-            .parse()
-            .map_err(|_| format!("band {spec:?}: bad min zoom {lo:?}"))?;
-        let max_zoom: u8 = hi
-            .trim()
-            .parse()
-            .map_err(|_| format!("band {spec:?}: bad max zoom {hi:?}"))?;
+        let max_zoom: u8 = hi.trim().parse().map_err(|_| E::BadMaxZoom {
+            spec: owned(),
+            zoom: hi.to_string(),
+        })?;
         if min_zoom > max_zoom {
-            return Err(format!("band {spec:?}: min zoom above max zoom"));
+            return Err(E::MinAboveMax { spec: owned() });
         }
         if max_zoom > Self::MAX_ZOOM {
-            return Err(format!(
-                "band {spec:?}: max zoom {max_zoom} is above the supported ceiling {}",
-                Self::MAX_ZOOM
-            ));
+            return Err(E::MaxAboveCeiling {
+                spec: owned(),
+                max_zoom,
+            });
         }
 
         // A trailing separator is an empty layer name, not part of the path.
         // Falling through would silently keep it in the path.
         if rest.trim_end().ends_with(sep) {
-            return Err(format!("band {spec:?}: empty layer name"));
+            return Err(E::EmptyLayer { spec: owned() });
         }
         let (path, layer) = match sep {
             ':' => split_colon_form(rest),
             _ => split_equals_form(rest),
         };
         if path.is_empty() {
-            return Err(format!("band {spec:?}: empty input path"));
+            return Err(E::EmptyInput { spec: owned() });
         }
         let layer = match layer {
-            Some("") => return Err(format!("band {spec:?}: empty layer name")),
+            Some("") => return Err(E::EmptyLayer { spec: owned() }),
             Some(l) => l.to_string(),
-            None => default_layer_for(path).ok_or_else(|| {
-                format!(
-                    "band {spec:?}: cannot derive a layer name from {path:?}; \
-                     append {sep}LAYER"
-                )
+            None => default_layer_for(path).ok_or_else(|| E::NoLayer {
+                spec: owned(),
+                path: path.to_string(),
+                sep,
             })?,
         };
 
@@ -146,6 +307,102 @@ impl Band {
             min_zoom,
             max_zoom,
         })
+    }
+}
+
+/// Why [`Band::parse`] refused a band spec. Each variant carries the spec
+/// as given, and every one is a usage error
+/// ([`ErrorKind::Usage`](crate::ErrorKind::Usage)).
+///
+/// `#[non_exhaustive]`: new rules are added without a breaking change; match
+/// with a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum BandSpecError {
+    /// Neither `:` nor `=` closes a zoom range.
+    #[error("band {spec:?}: {BAND_FORMS}")]
+    #[non_exhaustive]
+    NoZoomRange {
+        /// The spec.
+        spec: String,
+    },
+    /// The zoom range has no `-`.
+    #[error(
+        "band {spec:?}: zoom range must be LO-HI; every band spec must \
+         start with a LO-HI: (or LO-HI=) zoom range, e.g. \"0-5:{spec}\""
+    )]
+    #[non_exhaustive]
+    RangeNotLoHi {
+        /// The spec.
+        spec: String,
+    },
+    /// The minimum zoom, as spelled, is not a `u8`.
+    #[error("band {spec:?}: bad min zoom {zoom:?}")]
+    #[non_exhaustive]
+    BadMinZoom {
+        /// The spec.
+        spec: String,
+        /// The minimum zoom as spelled.
+        zoom: String,
+    },
+    /// The maximum zoom, as spelled, is not a `u8`.
+    #[error("band {spec:?}: bad max zoom {zoom:?}")]
+    #[non_exhaustive]
+    BadMaxZoom {
+        /// The spec.
+        spec: String,
+        /// The maximum zoom as spelled.
+        zoom: String,
+    },
+    /// The minimum zoom is above the maximum.
+    #[error("band {spec:?}: min zoom above max zoom")]
+    #[non_exhaustive]
+    MinAboveMax {
+        /// The spec.
+        spec: String,
+    },
+    /// The maximum zoom is above [`crate::tile::MAX_ZOOM`].
+    #[error(
+        "band {spec:?}: max zoom {max_zoom} is above the supported ceiling {}",
+        crate::tile::MAX_ZOOM
+    )]
+    #[non_exhaustive]
+    MaxAboveCeiling {
+        /// The spec.
+        spec: String,
+        /// The maximum zoom.
+        max_zoom: u8,
+    },
+    /// The layer after the last separator is empty.
+    #[error("band {spec:?}: empty layer name")]
+    #[non_exhaustive]
+    EmptyLayer {
+        /// The spec.
+        spec: String,
+    },
+    /// The input path is empty.
+    #[error("band {spec:?}: empty input path")]
+    #[non_exhaustive]
+    EmptyInput {
+        /// The spec.
+        spec: String,
+    },
+    /// No layer was given and none can be derived from the input path.
+    #[error("band {spec:?}: cannot derive a layer name from {path:?}; append {sep}LAYER")]
+    #[non_exhaustive]
+    NoLayer {
+        /// The spec.
+        spec: String,
+        /// The input path.
+        path: String,
+        /// The separator the spec uses (`:` or `=`).
+        sep: char,
+    },
+}
+
+impl crate::error::Classify for BandSpecError {
+    fn kind(&self) -> crate::error::ErrorKind {
+        crate::error::ErrorKind::Usage
     }
 }
 
@@ -385,20 +642,22 @@ fn classify_band_input_with_diagnostics(
 ///
 /// Returns a description of the problem if `bands` is empty, if two bands of
 /// one layer share a zoom, or if a band names a remote `.pmtiles` archive.
-pub fn validate_bands(bands: &[Band]) -> Result<(), String> {
+pub fn validate_bands(bands: &[Band]) -> Result<(), PyramidError> {
     validate_bands_with_diagnostics(bands, &crate::diagnostics::Diagnostics::default())
 }
 
 fn validate_bands_with_diagnostics(
     bands: &[Band],
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<(), String> {
+) -> Result<(), PyramidError> {
     if bands.is_empty() {
-        return Err("a pyramid needs at least one band".to_string());
+        return Err(PyramidError::Bands(
+            "a pyramid needs at least one band".to_string(),
+        ));
     }
     for band in bands {
         if let Some(msg) = remote_archive_rejection(&band.input) {
-            return Err(msg);
+            return Err(PyramidError::Bands(msg));
         }
     }
     let mut sorted: Vec<&Band> = bands.iter().collect();
@@ -406,7 +665,7 @@ fn validate_bands_with_diagnostics(
     for (i, a) in sorted.iter().enumerate() {
         for b in &sorted[i + 1..] {
             if b.min_zoom <= a.max_zoom && a.layer == b.layer {
-                return Err(format!(
+                return Err(PyramidError::Bands(format!(
                     "bands overlap at zoom {} in layer {:?}: {}-{} and {}-{}",
                     b.min_zoom.max(a.min_zoom),
                     a.layer,
@@ -414,7 +673,7 @@ fn validate_bands_with_diagnostics(
                     a.max_zoom,
                     b.min_zoom,
                     b.max_zoom
-                ));
+                )));
             }
         }
     }
@@ -465,8 +724,9 @@ pub fn parse_bands<S: AsRef<str>>(specs: &[S]) -> Result<Vec<Band>, String> {
     let bands = specs
         .iter()
         .map(|s| Band::parse(s.as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
-    validate_bands(&bands)?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    validate_bands(&bands).map_err(|e| e.to_string())?;
     for (spec, band) in specs.iter().zip(&bands) {
         check_band_input_exists(spec.as_ref(), band)?;
     }
@@ -801,7 +1061,7 @@ fn check_band_zoom_range(
     archive: &BandArchive,
     allow_missing_zooms: bool,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<RangeFit, Error> {
+) -> Result<RangeFit, PyramidError> {
     let actual = archive.actual_zoom_range()?;
     // Header widened by the archive's own `vector_layers`: since #529/#522 a
     // tylertoo archive's header is its actual tiles, so its declaration
@@ -812,7 +1072,7 @@ fn check_band_zoom_range(
     let fit = band_archive_range_fit(band, declared, actual);
     match fit {
         RangeFit::Subrange => Ok(fit),
-        RangeFit::Disjoint => Err(Error::PMTilesWrite(format!(
+        RangeFit::Disjoint => Err(PyramidError::BandMismatch(format!(
             "band {:?} ({}) declares {} but that archive declares {} (header and \
              vector_layers), entirely outside the band's range; there is no zoom this band \
              could write",
@@ -832,7 +1092,7 @@ fn check_band_zoom_range(
                 ));
                 Ok(fit)
             } else {
-                Err(Error::PMTilesWrite(format!(
+                Err(PyramidError::BandMismatch(format!(
                     "band {:?} declares {} but {} holds no tiles at all; pass \
                      --allow-missing-zooms (or set PyramidOptions::allow_missing_zooms) for \
                      a deliberately sparse pyramid",
@@ -869,7 +1129,7 @@ fn check_band_zoom_range(
                 ));
                 Ok(fit)
             } else {
-                Err(Error::PMTilesWrite(format!(
+                Err(PyramidError::BandMismatch(format!(
                     "band {:?} declares {} but {} holds {}; zooms {dropped} would be \
                      silently dropped; pass --allow-missing-zooms (or set \
                      PyramidOptions::allow_missing_zooms) for a deliberately sparse pyramid",
@@ -943,10 +1203,13 @@ fn log_band_skip(band: &Band, skipped: usize, fit: RangeFit) {
 /// layer name inside its tiles is whatever the archive was exported with.
 /// An archive whose metadata declares no layers cannot be checked -- that
 /// case has already been warned about.
-fn check_shared_zoom_layer_labels(bands: &[Band], archives: &[BandArchive]) -> Result<(), Error> {
+fn check_shared_zoom_layer_labels(
+    bands: &[Band],
+    archives: &[BandArchive],
+) -> Result<(), PyramidError> {
     for (band, archive) in bands.iter().zip(archives) {
         if !archive.layer_ids.is_empty() && archive.layer_ids != [band.layer.as_str()] {
-            return Err(Error::PMTilesWrite(format!(
+            return Err(PyramidError::BandMismatch(format!(
                 "band `{}` ({}) carries layer(s) {:?} but is labelled `{}`; when bands \
                  share zooms the archive's layer must match its label so tiles do not \
                  carry two layers of one name",
@@ -967,7 +1230,7 @@ fn check_shared_zoom_layer_labels(bands: &[Band], archives: &[BandArchive]) -> R
 /// into #506's clustered check, whose `debug_assert!` a descending add trips.
 /// Strictly ascending also rules out a repeat — a run overlapping the next
 /// entry, say — which is why neither path keeps a per-tile map.
-fn ensure_ascending(last: &mut Option<u64>, id: u64, band: &Band) -> Result<(), Error> {
+fn ensure_ascending(last: &mut Option<u64>, id: u64, band: &Band) -> Result<(), PyramidError> {
     if let Some(prev) = last.filter(|&prev| id <= prev) {
         return Err(out_of_order(band, id, prev));
     }
@@ -976,23 +1239,19 @@ fn ensure_ascending(last: &mut Option<u64>, id: u64, band: &Band) -> Result<(), 
 }
 
 /// The error for a band directory that lists `id` after `prev` (`id <= prev`).
-fn out_of_order(band: &Band, id: u64, prev: u64) -> Error {
-    Error::PMTilesWrite(format!(
-        "{}: directory lists tile id {id} after {prev}; a PMTiles directory \
-         must address tiles in ascending id order",
-        band.input.display()
-    ))
+fn out_of_order(band: &Band, id: u64, prev: u64) -> PyramidError {
+    PyramidError::OutOfOrder {
+        path: band.input.clone(),
+        id,
+        prev,
+    }
 }
 
 /// Prefix an error from walking `path`'s directory with that path. The
 /// shared-zoom merge interleaves every band's directory, so an unattributed
 /// "tile data past end of archive" names none of the `--band` archives.
-fn in_band(path: &Path, e: Error) -> Error {
-    let msg = match e {
-        Error::PMTilesWrite(m) => m,
-        other => other.to_string(),
-    };
-    Error::PMTilesWrite(format!("{}: {msg}", path.display()))
+fn in_band(path: &Path, e: Error) -> PyramidError {
+    Error::at(path, e).into()
 }
 
 /// A band's tile bytes, served from a one-slot cache keyed on the byte range.
@@ -1005,7 +1264,7 @@ fn read_cached(
     archive: &BandArchive,
     slot: &mut Option<(std::ops::Range<usize>, Vec<u8>)>,
     range: std::ops::Range<usize>,
-) -> Result<Vec<u8>, Error> {
+) -> Result<Vec<u8>, PyramidError> {
     if let Some((cached, bytes)) = slot {
         if *cached == range {
             return Ok(bytes.clone());
@@ -1187,7 +1446,7 @@ impl BandArchive {
         path: &Path,
         label: &str,
         diagnostics: &crate::diagnostics::Diagnostics,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, PyramidError> {
         // Header, directories and metadata — never the tile data. #417's
         // ceilings on the directory walk live inside [`ArchiveIndex::open`],
         // so a hostile band archive is refused there, with the same messages
@@ -1198,7 +1457,7 @@ impl BandArchive {
         // The merged archive declares gzip tile compression. Copying bytes out
         // of an archive that used anything else would mislabel every tile.
         if header.tile_compression != Compression::Gzip {
-            return Err(Error::PMTilesWrite(format!(
+            return Err(PyramidError::BandMismatch(format!(
                 "{}: tile compression is {:?}, but a merged pyramid is written as gzip; \
                  re-tile this band with gzip tiles",
                 path.display(),
@@ -1208,7 +1467,7 @@ impl BandArchive {
         // The merge concatenates tile bodies at shared zooms, which is only
         // meaningful for MVT: two PNGs glued together are not a PNG.
         if header.tile_type != TileType::Mvt {
-            return Err(Error::PMTilesWrite(format!(
+            return Err(PyramidError::BandMismatch(format!(
                 "{}: tile type is {:?}, but a pyramid band must hold MVT tiles",
                 path.display(),
                 header.tile_type
@@ -1246,7 +1505,7 @@ impl BandArchive {
 
     /// The archive's actual zoom range -- see
     /// [`ArchiveIndex::actual_zoom_range`].
-    fn actual_zoom_range(&self) -> Result<Option<(u8, u8)>, Error> {
+    fn actual_zoom_range(&self) -> Result<Option<(u8, u8)>, PyramidError> {
         self.index
             .actual_zoom_range()
             .map_err(|e| in_band(self.index.path(), e))
@@ -1273,9 +1532,9 @@ impl BandArchive {
     /// whole run from one read: before it, an N-id run cost N `pread`s of the
     /// identical bytes. (The merged writer's dedup cache collapses the run
     /// again on the far side.)
-    fn for_each_tile<F>(&self, mut f: F) -> Result<(), Error>
+    fn for_each_tile<F>(&self, mut f: F) -> Result<(), PyramidError>
     where
-        F: FnMut(u8, u32, u32, &[u8]) -> Result<(), Error>,
+        F: FnMut(u8, u32, u32, &[u8]) -> Result<(), PyramidError>,
     {
         let mut cached: Option<(std::ops::Range<usize>, Vec<u8>)> = None;
         self.for_each_tile_range(|_, z, x, y, range| {
@@ -1291,9 +1550,9 @@ impl BandArchive {
     /// `(z, x, y)` and the tile's byte range in the archive instead of the
     /// bytes, so a caller can index tiles across several archives first and
     /// read them later in id order (#385).
-    fn for_each_tile_range<F>(&self, mut f: F) -> Result<(), Error>
+    fn for_each_tile_range<F>(&self, mut f: F) -> Result<(), PyramidError>
     where
-        F: FnMut(u64, u8, u32, u32, std::ops::Range<usize>) -> Result<(), Error>,
+        F: FnMut(u64, u8, u32, u32, std::ops::Range<usize>) -> Result<(), PyramidError>,
     {
         for tile in self.index.tiles() {
             let t = tile.map_err(|e| in_band(self.index.path(), e))?;
@@ -1304,8 +1563,8 @@ impl BandArchive {
 
     /// A tile's still-compressed bytes by range (from
     /// [`Self::for_each_tile_range`]).
-    fn tile(&self, range: std::ops::Range<usize>) -> Result<Vec<u8>, Error> {
-        self.index.read_range(range)
+    fn tile(&self, range: std::ops::Range<usize>) -> Result<Vec<u8>, PyramidError> {
+        Ok(self.index.read_range(range)?)
     }
 }
 
@@ -1349,9 +1608,14 @@ fn parse_layers(
     path: &Path,
     label: &str,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<ParsedLayers, Error> {
-    let plain = compression::decompress_capped(raw, internal, MAX_INTERNAL_BYTES)
-        .map_err(|e| Error::PMTilesWrite(format!("{}: metadata: {e}", path.display())))?;
+) -> Result<ParsedLayers, PyramidError> {
+    let plain =
+        compression::decompress_capped(raw, internal, MAX_INTERNAL_BYTES).map_err(|error| {
+            crate::archive_index::ArchiveError::Metadata {
+                path: path.to_path_buf(),
+                error,
+            }
+        })?;
     // Unparseable metadata is not fatal: the band's tiles are still usable,
     // they just end up declaring no field types.
     let parsed: Value = match serde_json::from_slice(&plain) {
@@ -1417,6 +1681,7 @@ fn parse_layers(
 
 /// What a pyramid build produced.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PyramidReport {
     /// Aggregated diagnostics for this pyramid only.
     pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
@@ -1503,6 +1768,7 @@ impl serde::Serialize for PyramidReport {
 
 /// Knobs for [`merge_bands_with_options`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct BandMergeOptions {
     /// Let a pre-tiled band's declared zoom range overshoot what its archive
     /// actually holds (#495) instead of failing. Off matches
@@ -1520,10 +1786,16 @@ pub struct BandMergeOptions {
     pub metadata: TilesetMetadata,
 }
 
+with_setters!(BandMergeOptions {
+    with_allow_missing_zooms => allow_missing_zooms: bool,
+    with_metadata => metadata: TilesetMetadata,
+});
+
 /// How the one-shot pyramid tiles each GeoParquet band.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
+#[non_exhaustive]
 pub struct PyramidOptions {
     /// Convert knobs applied to every source band, with the band's own zoom
     /// range substituted for [`ConvertOptions::levels`].
@@ -1569,6 +1841,14 @@ pub struct PyramidOptions {
     #[cfg_attr(feature = "cli", arg(skip = Self::default().metadata))]
     pub metadata: TilesetMetadata,
 }
+
+with_setters!(PyramidOptions {
+    with_convert => convert: ConvertOptions,
+    with_export => export: ExportOptions,
+    with_work_dir => work_dir: Option<PathBuf>,
+    with_allow_missing_zooms => allow_missing_zooms: bool,
+    with_metadata => metadata: TilesetMetadata,
+});
 
 impl Default for PyramidOptions {
     fn default() -> Self {
@@ -1632,20 +1912,23 @@ impl PyramidOptions {
     ///
     /// # Errors
     ///
-    /// [`Error::Config`], or [`Error::InvalidConfig`] for a convert knob.
+    /// [`PyramidError::Config`], or [`PyramidError::InvalidConfig`] for a convert knob.
     /// Validate these options and return the immutable engine configuration.
-    pub fn validate(&self) -> Result<crate::overview::config::ValidatedConfig<'_, Self>, Error> {
+    #[doc(hidden)]
+    pub fn validate(
+        &self,
+    ) -> Result<crate::overview::config::ValidatedConfig<'_, Self>, PyramidError> {
         crate::overview::config::validate_pyramid(self)
     }
 
-    pub(crate) fn check(&self) -> Result<(), Error> {
+    pub(crate) fn check(&self) -> Result<(), PyramidError> {
         crate::overview::config::check_work_dir(self.work_dir.as_deref())?;
         self.metadata
             .check_size()
             .map_err(crate::overview::config::ConfigError::MetadataTooLarge)?;
-        self.convert
-            .validate()
-            .map_err(|e| Error::InvalidConfig(format!("band convert options: {e}")))?;
+        self.convert.validate().map_err(|e| {
+            PyramidError::InvalidConfig(crate::InvalidConfigError::BandConvertOptions(Box::new(e)))
+        })?;
         self.export.validate()?;
         check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
         Ok(())
@@ -1678,7 +1961,7 @@ pub fn build_pyramid(
     bands: &[Band],
     output: &Path,
     opts: &PyramidOptions,
-) -> Result<PyramidReport, Error> {
+) -> Result<PyramidReport, PyramidError> {
     let config = opts.validate()?;
     build_pyramid_validated(bands, output, &config)
 }
@@ -1687,7 +1970,7 @@ fn build_pyramid_validated(
     bands: &[Band],
     output: &Path,
     config: &crate::overview::config::ValidatedConfig<'_, PyramidOptions>,
-) -> Result<PyramidReport, Error> {
+) -> Result<PyramidReport, PyramidError> {
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     let opts = config.options();
     // Validates every band up front, including (#482) that none names a
@@ -1695,7 +1978,7 @@ fn build_pyramid_validated(
     // every band before any band is tiled, rather than interleaved with
     // tiling below where a late band's bad input would only surface after
     // every earlier band had already converted.
-    validate_bands_with_diagnostics(bands, diagnostics).map_err(Error::PMTilesWrite)?;
+    validate_bands_with_diagnostics(bands, diagnostics)?;
     // #452: the archive is created only after every band is tiled and
     // merged; an unwritable output must not cost all of that first.
     crate::atomic_output::check_writable(output)?;
@@ -1763,7 +2046,9 @@ fn build_pyramid_validated(
             collect_band_metadata(&mut collector, band)?;
         }
     }
-    collector.resolve().map_err(Error::InvalidConfig)?;
+    collector.resolve().map_err(|message| {
+        PyramidError::InvalidConfig(crate::InvalidConfigError::MetadataTooLarge { message })
+    })?;
 
     // Keeps every intermediate alive for the merge and unlinks them on drop —
     // including the early-return paths below. TempPaths, not open
@@ -1798,13 +2083,16 @@ fn build_pyramid_validated(
             },
         );
 
-        let named = |suffix: &str| -> Result<Reserved, Error> {
+        let named = |suffix: &str| -> Result<Reserved, PyramidError> {
             crate::atomic_output::reserve_path(
                 "tylertoo-pyramid-",
                 suffix,
                 opts.work_dir.as_deref(),
             )
-            .map_err(|e| Error::PMTilesWrite(format!("band {:?}: {e}", band.layer)))
+            .map_err(|error| PyramidError::BandWorkFile {
+                layer: band.layer.clone(),
+                error,
+            })
         };
 
         let overview = named(".parquet")?;
@@ -1817,8 +2105,11 @@ fn build_pyramid_validated(
             },
             ..opts.convert.clone()
         };
-        let report = convert_to_overviews(&band.input, &overview, &convert).map_err(|e| {
-            Error::PMTilesWrite(format!("band {:?}: convert failed: {e}", band.layer))
+        let report = convert_to_overviews(&band.input, &overview, &convert).map_err(|error| {
+            PyramidError::BandConvert {
+                layer: band.layer.clone(),
+                error,
+            }
         })?;
         diagnostics.extend(report.diagnostics);
 
@@ -1840,8 +2131,11 @@ fn build_pyramid_validated(
             metadata: TilesetMetadata::default(),
             ..opts.export.clone()
         };
-        let report = export_pmtiles(&overview, &archive, &export).map_err(|e| {
-            Error::PMTilesWrite(format!("band {:?}: export failed: {e}", band.layer))
+        let report = export_pmtiles(&overview, &archive, &export).map_err(|error| {
+            PyramidError::BandExport {
+                layer: band.layer.clone(),
+                error,
+            }
         })?;
         diagnostics.extend(report.diagnostics);
 
@@ -1880,14 +2174,19 @@ fn build_pyramid_validated(
 /// Returns `false` for metadata that is not valid JSON, which contributes
 /// nothing ([`parse_layers`] warns about it when the band is opened for its
 /// tiles).
-fn collect_band_metadata(collector: &mut MetadataCollector, band: &Band) -> Result<bool, Error> {
+fn collect_band_metadata(
+    collector: &mut MetadataCollector,
+    band: &Band,
+) -> Result<bool, PyramidError> {
     let plain = ArchiveIndex::read_metadata_only(&band.input)?;
     let Ok(root) = serde_json::from_slice::<Value>(&plain) else {
         return Ok(false);
     };
     collector
         .add_json(&band_label(band), &root)
-        .map_err(Error::InvalidConfig)?;
+        .map_err(|message| {
+            PyramidError::InvalidConfig(crate::InvalidConfigError::MetadataTooLarge { message })
+        })?;
     Ok(true)
 }
 
@@ -1910,7 +2209,7 @@ fn band_label(band: &Band) -> String {
 ///
 /// Returns an error in the cases [`merge_bands_with_options`] does with
 /// default options.
-pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error> {
+pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, PyramidError> {
     merge_bands_with_options(bands, output, &BandMergeOptions::default())
 }
 
@@ -1918,7 +2217,7 @@ fn open_merge_archives(
     bands: &[Band],
     allow_missing_zooms: bool,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<(Vec<BandArchive>, Vec<RangeFit>), Error> {
+) -> Result<(Vec<BandArchive>, Vec<RangeFit>), PyramidError> {
     let archives: Vec<BandArchive> = bands
         .iter()
         .map(|b| BandArchive::open(&b.input, &b.layer, diagnostics))
@@ -1942,10 +2241,10 @@ fn append_compressed_tile(
     tile: crate::tile::TileCoord,
     data: &[u8],
     raw_len: usize,
-) -> Result<(), Error> {
+) -> Result<(), PyramidError> {
     writer
         .add_tile_precompressed(tile, TileHasher::hash(data), data, raw_len, 0)
-        .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))
+        .map_err(|e| crate::pmtiles_writer::WriteError::io("add tile", e).into())
 }
 
 /// [`merge_bands`] with [`BandMergeOptions`]: a band's declared zoom range
@@ -1967,9 +2266,9 @@ pub fn merge_bands_with_options(
     bands: &[Band],
     output: &Path,
     options: &BandMergeOptions,
-) -> Result<PyramidReport, Error> {
+) -> Result<PyramidReport, PyramidError> {
     let diagnostics = &crate::diagnostics::Diagnostics::default();
-    validate_bands_with_diagnostics(bands, diagnostics).map_err(Error::PMTilesWrite)?;
+    validate_bands_with_diagnostics(bands, diagnostics)?;
     crate::atomic_output::check_writable(output)?;
     merge_prepared_bands(bands, output, options, diagnostics)
 }
@@ -1979,7 +2278,7 @@ fn merge_prepared_bands(
     output: &Path,
     options: &BandMergeOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<PyramidReport, Error> {
+) -> Result<PyramidReport, PyramidError> {
     let allow_missing_zooms = options.allow_missing_zooms;
     // The single call site for this warning: a direct library caller of this
     // `pub fn` gets it here. `build_pyramid` calls this too, but has already
@@ -1999,7 +2298,9 @@ fn merge_prepared_bands(
             bands_without_metadata.push(band_label(band));
         }
     }
-    let publication = collector.resolve().map_err(Error::InvalidConfig)?;
+    let publication = collector.resolve().map_err(|message| {
+        PyramidError::InvalidConfig(crate::InvalidConfigError::MetadataTooLarge { message })
+    })?;
     collector.log_resolution();
 
     // StreamingPmtilesWriter, not PmtilesWriter: it spools tile bytes to a temp
@@ -2008,7 +2309,7 @@ fn merge_prepared_bands(
     // identical tiles, and re-expanding its runs without dedup turned a
     // 300-byte band archive into 164 KiB.
     let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)
-        .map_err(|e| Error::PMTilesWrite(format!("Failed to create streaming writer: {e}")))?;
+        .map_err(|e| crate::pmtiles_writer::WriteError::io("create streaming writer", e))?;
     // The writer appends tile data in add order and stamps the header
     // `clustered`, which promises offsets monotonic in tile id. Both paths
     // below add in ascending id order — the shared-zoom path by k-way merge,
@@ -2103,7 +2404,7 @@ fn merge_prepared_bands(
                     if let Some((prev, _)) =
                         group.iter().find(|(p, _)| bands[*p].layer == band.layer)
                     {
-                        return Err(Error::PMTilesWrite(format!(
+                        return Err(PyramidError::BandMismatch(format!(
                             "tile {z}/{x}/{y} claimed twice for layer {:?} (bands {} and {})",
                             band.layer,
                             bands[*prev].input.display(),
@@ -2136,11 +2437,12 @@ fn merge_prepared_bands(
                             archives[*bi].header().tile_compression,
                             MAX_TILE_BYTES,
                         )
-                        .map_err(|e| {
-                            Error::PMTilesWrite(format!(
-                                "tile {z}/{x}/{y} of band {:?} failed to decompress: {e}",
-                                bands[*bi].layer
-                            ))
+                        .map_err(|error| PyramidError::TileDecompress {
+                            z,
+                            x,
+                            y,
+                            layer: bands[*bi].layer.clone(),
+                            error,
                         })?;
                         buf.extend_from_slice(&plain);
                     }
@@ -2149,9 +2451,8 @@ fn merge_prepared_bands(
                     // (which keys on the uncompressed bytes): one writer, one
                     // dedup keyspace (#403). Compression is deterministic, so
                     // equal combined tiles still collapse to one body.
-                    let gz = compression::compress(&buf, Compression::Gzip).map_err(|e| {
-                        Error::PMTilesWrite(format!("tile {z}/{x}/{y} failed to compress: {e}"))
-                    })?;
+                    let gz = compression::compress(&buf, Compression::Gzip)
+                        .map_err(|error| PyramidError::TileCompress { z, x, y, error })?;
                     append_compressed_tile(&mut writer, coord, &gz, buf.len())?;
                     combined += 1;
                 }
@@ -2358,7 +2659,7 @@ fn finish_merge(
     tally: MergeTally,
     output: &Path,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<PyramidReport, Error> {
+) -> Result<PyramidReport, PyramidError> {
     match union {
         Some(b) => writer.set_bounds(&b),
         // Leaving the header bounds unset is no worse than the degenerate box
@@ -2373,9 +2674,7 @@ fn finish_merge(
     // them into one entry spanning their combined zooms, or a client sees the
     // same layer declared twice with conflicting ranges.
     writer.set_vector_layers_json(vector_layers_json(layers, diagnostics).to_string());
-    writer
-        .finalize(output)
-        .map_err(|e| Error::PMTilesWrite(format!("Failed to write {}: {e}", output.display())))?;
+    writer.finalize(output).map_err(|e| Error::at(output, e))?;
 
     let sink = diagnostics;
     use crate::diagnostics::Diagnostic;
@@ -2422,11 +2721,11 @@ fn finish_merge(
 /// build.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
-pub fn fuzz_band_archive(bytes: &[u8]) -> Result<u64, Error> {
+pub fn fuzz_band_archive(bytes: &[u8]) -> Result<u64, PyramidError> {
     use std::io::Write as _;
-    let mut file = tempfile::NamedTempFile::new().map_err(Error::Io)?;
-    file.write_all(bytes).map_err(Error::Io)?;
-    file.flush().map_err(Error::Io)?;
+    let mut file = tempfile::NamedTempFile::new().map_err(PyramidError::Io)?;
+    file.write_all(bytes).map_err(PyramidError::Io)?;
+    file.flush().map_err(PyramidError::Io)?;
 
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     let band = BandArchive::open(file.path(), "", diagnostics)?;
@@ -2455,7 +2754,7 @@ pub fn fuzz_band_archive(bytes: &[u8]) -> Result<u64, Error> {
 /// `fuzzing` feature is never on in a normal build.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
-pub fn fuzz_layer_zooms(bytes: &[u8]) -> Result<Value, Error> {
+pub fn fuzz_layer_zooms(bytes: &[u8]) -> Result<Value, PyramidError> {
     let check = |(lo, hi): (u8, u8)| {
         assert!(
             lo <= hi && hi <= MAX_TILE_ID_ZOOM,
@@ -2463,7 +2762,7 @@ pub fn fuzz_layer_zooms(bytes: &[u8]) -> Result<Value, Error> {
         );
     };
     let [a, b, json @ ..] = bytes else {
-        return Err(Error::PMTilesWrite("short input".into()));
+        return Err(PyramidError::Bands("short input".into()));
     };
     let (a, b) = (a % (MAX_TILE_ID_ZOOM + 1), b % (MAX_TILE_ID_ZOOM + 1));
     let header = (a.min(b), a.max(b));
@@ -2520,6 +2819,7 @@ pub fn fuzz_layer_zooms(bytes: &[u8]) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive_index::ArchiveError;
     use crate::overview::config::ConfigError;
     use crate::pmtiles_writer::{
         decode_directory, offsets_are_clustered, tile_id_to_zxy, DirEntry, MAX_LEAF_DIRECTORIES,
@@ -3010,7 +3310,7 @@ mod tests {
             Band::parse("0-5:a.parquet:agg").unwrap(),
             Band::parse("5-8:b.parquet:agg").unwrap(),
         ];
-        let err = validate_bands(&bands).unwrap_err();
+        let err = validate_bands(&bands).unwrap_err().to_string();
         assert!(err.contains("overlap at zoom 5"), "{err}");
     }
 
@@ -3030,7 +3330,7 @@ mod tests {
             Band::parse("0-13:b.parquet:2025").unwrap(),
             Band::parse("10-13:c.parquet:2024").unwrap(),
         ];
-        let err = validate_bands(&bands).unwrap_err();
+        let err = validate_bands(&bands).unwrap_err().to_string();
         assert!(
             err.contains("overlap at zoom 10") && err.contains("\"2024\""),
             "{err}"
@@ -5140,9 +5440,71 @@ mod tests {
     /// escape hatch from the error rather than the manual.
     #[test]
     fn band_spec_error_shows_both_forms() {
-        let err = Band::parse("0-5").unwrap_err();
+        let err = Band::parse("0-5").unwrap_err().to_string();
         assert!(err.contains("LO-HI:INPUT[:LAYER]"), "{err}");
         assert!(err.contains("LO-HI=INPUT[=LAYER]"), "{err}");
+    }
+
+    /// Each refusal's variant, kind and message; the messages are the
+    /// pre-typed (`String`) ones byte for byte.
+    #[test]
+    fn band_spec_errors_are_typed_usage_errors_with_the_old_messages() {
+        use crate::error::{Classify, ErrorKind};
+        type IsVariant = fn(&BandSpecError) -> bool;
+        let cases: [(&str, IsVariant, &str); 9] = [
+            (
+                "0-5",
+                |e| matches!(e, BandSpecError::NoZoomRange { .. }),
+                "band \"0-5\": expected LO-HI:INPUT[:LAYER] or LO-HI=INPUT[=LAYER]",
+            ),
+            (
+                "5:a.parquet",
+                |e| matches!(e, BandSpecError::RangeNotLoHi { .. }),
+                "band \"5:a.parquet\": zoom range must be LO-HI; every band spec must \
+                 start with a LO-HI: (or LO-HI=) zoom range, e.g. \"0-5:5:a.parquet\"",
+            ),
+            (
+                "x-5:a.parquet",
+                |e| matches!(e, BandSpecError::BadMinZoom { zoom, .. } if zoom == "x"),
+                "band \"x-5:a.parquet\": bad min zoom \"x\"",
+            ),
+            (
+                "0-y:a.parquet",
+                |e| matches!(e, BandSpecError::BadMaxZoom { zoom, .. } if zoom == "y"),
+                "band \"0-y:a.parquet\": bad max zoom \"y\"",
+            ),
+            (
+                "5-0:a.parquet",
+                |e| matches!(e, BandSpecError::MinAboveMax { .. }),
+                "band \"5-0:a.parquet\": min zoom above max zoom",
+            ),
+            (
+                "0-40:a.parquet",
+                |e| matches!(e, BandSpecError::MaxAboveCeiling { max_zoom: 40, .. }),
+                "band \"0-40:a.parquet\": max zoom 40 is above the supported ceiling 30",
+            ),
+            (
+                "0-5:a.parquet:",
+                |e| matches!(e, BandSpecError::EmptyLayer { .. }),
+                "band \"0-5:a.parquet:\": empty layer name",
+            ),
+            (
+                "0-5:",
+                |e| matches!(e, BandSpecError::EmptyInput { .. }),
+                "band \"0-5:\": empty input path",
+            ),
+            (
+                "0-5=/",
+                |e| matches!(e, BandSpecError::NoLayer { sep: '=', .. }),
+                "band \"0-5=/\": cannot derive a layer name from \"/\"; append =LAYER",
+            ),
+        ];
+        for (spec, is_variant, message) in cases {
+            let err = Band::parse(spec).expect_err(spec);
+            assert!(is_variant(&err), "{spec:?}: {err:?}");
+            assert_eq!(err.kind(), ErrorKind::Usage, "{spec:?}");
+            assert_eq!(err.to_string(), message, "{spec:?}");
+        }
     }
 
     /// #482: a remote input is a GeoParquet source, decided from the URL
@@ -5255,7 +5617,13 @@ mod tests {
         for output in [&existing, &absent] {
             let err = merge_bands(&[band(&input, "parks", 3, 3)], output).unwrap_err();
             let msg = err.to_string();
-            assert!(matches!(err, Error::PMTilesWrite(_)), "{msg}");
+            assert!(
+                matches!(
+                    err,
+                    PyramidError::Archive(Error::Archive(ArchiveError::MetadataTooLarge { .. }))
+                ),
+                "{msg}"
+            );
             assert!(msg.contains("oversized.pmtiles"), "{msg}");
             assert!(
                 msg.contains(&format!("metadata claims {} bytes", MAX_INTERNAL_BYTES + 1)),
@@ -5516,7 +5884,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                Error::Config(ConfigError::OptionIgnored {
+                PyramidError::Config(ConfigError::OptionIgnored {
                     option: "export.metadata",
                     ..
                 })

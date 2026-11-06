@@ -41,6 +41,7 @@ pub const DEFAULT_LADDER_STEP: u8 = 1;
 
 /// What an output file is, for [`ConfigError::OutputIsDirectory`]'s message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OutputKind {
     /// A PMTiles archive (`tiles`, `export-pmtiles`, `pyramid`, `merge`).
     Pmtiles,
@@ -75,6 +76,7 @@ pub enum ConfigError {
     /// The output path is an existing directory (#427, #551). The final
     /// rename can never replace one, `--force` or not.
     #[error("{} is a directory; the output must be a {kind} file path", path.display())]
+    #[non_exhaustive]
     OutputIsDirectory {
         /// The output path.
         path: PathBuf,
@@ -83,6 +85,7 @@ pub enum ConfigError {
     },
     /// The output exists and overwriting it was not asked for (#427, #551).
     #[error("{} exists (use --force to overwrite){}", path.display(), if matches!(kind, OutputKind::ShardPlan) { ". Every job of a fleet must be given the SAME shard plan, so replacing one mid-build silently re-cuts the tile space." } else { "" })]
+    #[non_exhaustive]
     OutputExists {
         /// What the existing output represents.
         kind: OutputKind,
@@ -100,6 +103,7 @@ pub enum ConfigError {
     /// `--spill-dir` exists but does not accept new files (a read-only
     /// directory): found by creating and removing a probe file.
     #[error("spill-dir {} is not writable: {reason}", dir.display())]
+    #[non_exhaustive]
     SpillDirNotWritable {
         /// The spill directory.
         dir: PathBuf,
@@ -114,6 +118,7 @@ pub enum ConfigError {
          coordinate resolution and must be positive (the default is {})",
         super::export::DEFAULT_EXTENT
     )]
+    #[non_exhaustive]
     InvalidExtent {
         /// The rejected extent.
         extent: u32,
@@ -126,6 +131,7 @@ pub enum ConfigError {
          belongs to O(buffer²) tiles. Lower --tile-buffer to {max} or less (the default is {}).",
         super::export::DEFAULT_TILE_BUFFER_PX
     )]
+    #[non_exhaustive]
     TileBufferTooWide {
         /// The requested buffer, in tile pixels.
         buffer: u32,
@@ -139,6 +145,7 @@ pub enum ConfigError {
         "bbox {bbox:?} must hold finite values with xmin <= xmax and ymin <= ymax \
          (xmin,ymin,xmax,ymax)"
     )]
+    #[non_exhaustive]
     InvalidBbox {
         /// The rejected bbox.
         bbox: [f64; 4],
@@ -149,11 +156,8 @@ pub enum ConfigError {
     /// A class ranking built without [`ClassRanking::new`] carries a rank
     /// that is not finite (#428, b8fa58a). A NaN is not ordered, so the
     /// incumbent of a contested cell would silently keep it.
-    #[error(
-        "rank {rank} for {} must be a finite number (NaN and infinity cannot be ordered \
-         against other classes)",
-        class.as_deref().map_or_else(|| "unknown (unlisted) classes".to_string(), |c| format!("class {c:?}"))
-    )]
+    #[error("{}", rank_not_finite_message(class.as_deref(), *rank))]
+    #[non_exhaustive]
     ClassRankNotFinite {
         /// The class, or `None` for the unknown-class rank.
         class: Option<String>,
@@ -172,6 +176,7 @@ pub enum ConfigError {
     /// `--accumulate-attribute`) did not parse. The message names the flag
     /// and the offending part.
     #[error("{message}")]
+    #[non_exhaustive]
     InvalidSpec {
         /// The flag, as the CLI spells it.
         option: &'static str,
@@ -219,6 +224,7 @@ pub enum ConfigError {
          --pivot.",
         pivot.saturating_sub(1)
     )]
+    #[non_exhaustive]
     CoarseShardHasNoZoom {
         /// The plan's pivot zoom.
         pivot: u8,
@@ -231,6 +237,7 @@ pub enum ConfigError {
         "the shard's tile range is cut at z{range_pivot}, but the job's pivot is z{pivot}: \
          both come from one shard plan"
     )]
+    #[non_exhaustive]
     ShardPivotMismatch {
         /// [`TilesShard::pivot_zoom`](super::tiles::TilesShard::pivot_zoom).
         pivot: u8,
@@ -253,6 +260,7 @@ pub enum ConfigError {
     PlanOnlyWithoutSavePlan,
     /// `--keep-overview` names a directory that does not exist (#433).
     #[error("--keep-overview directory {} does not exist", dir.display())]
+    #[non_exhaustive]
     KeepOverviewDirMissing {
         /// The missing parent directory.
         dir: PathBuf,
@@ -264,6 +272,7 @@ pub enum ConfigError {
         "property {name:?} is excluded but --feature-order reads it; keep it in the \
          selection or drop the knob"
     )]
+    #[non_exhaustive]
     FeatureOrderColumnExcluded {
         /// The excluded property.
         name: String,
@@ -274,6 +283,7 @@ pub enum ConfigError {
         "property {name:?} is excluded but --feature-id reads it; keep it in the \
          selection or drop the flag"
     )]
+    #[non_exhaustive]
     FeatureIdColumnExcluded {
         /// The excluded property.
         name: String,
@@ -285,6 +295,7 @@ pub enum ConfigError {
          cluster's aggregated value identifies no single feature, so accumulate a \
          different column"
     )]
+    #[non_exhaustive]
     FeatureIdAccumulated {
         /// The offending column.
         name: String,
@@ -294,6 +305,7 @@ pub enum ConfigError {
     /// An option set on a command that would ignore it (#600, #443): the
     /// command derives the value itself, or has no use for it.
     #[error("{option} has no effect on {command}: {reason}")]
+    #[non_exhaustive]
     OptionIgnored {
         /// The option, as a Rust field path.
         option: &'static str,
@@ -302,6 +314,22 @@ pub enum ConfigError {
         /// Why, and what to set instead.
         reason: &'static str,
     },
+}
+
+impl ConfigError {
+    /// [`Self::InvalidSpec`] for the CLI, which cannot build the
+    /// `#[non_exhaustive]` variant.
+    #[doc(hidden)]
+    pub fn invalid_spec(option: &'static str, message: String) -> Self {
+        ConfigError::InvalidSpec { option, message }
+    }
+}
+
+impl crate::error::Classify for ConfigError {
+    /// Every rule here refuses an option before any work.
+    fn kind(&self) -> crate::error::ErrorKind {
+        crate::error::ErrorKind::Usage
+    }
 }
 
 /// An [`ExportOptions`](super::export::ExportOptions) field a command that
@@ -525,7 +553,7 @@ pub fn class_ranking(
         (None, Some(column), Some(ranks)) => {
             ClassRanking::new(column, ranks.into_iter().collect(), unknown_rank)
                 .map(Some)
-                .map_err(invalid)
+                .map_err(|e| invalid(e.to_string()))
         }
     }
 }
@@ -545,22 +573,33 @@ pub fn representation(spec: Option<&str>) -> Result<Vec<RepresentationBand>, Con
     })
 }
 
-/// Every rank, and an explicit unknown-class rank, is finite (#428): the
-/// one rule and message behind [`ClassRanking::new`] (so `--class-rank` and
-/// Python's `class_ranks` read the same) and [`check_class_ranking`].
-pub(crate) fn check_ranks_finite(
+/// The one message for a non-finite class rank (#428), shared by
+/// [`ConfigError::ClassRankNotFinite`] and
+/// [`ClassRankingError::NotFinite`](super::convert::ClassRankingError::NotFinite).
+pub(crate) fn rank_not_finite_message(class: Option<&str>, rank: f64) -> String {
+    let who = class.map_or_else(
+        || "unknown (unlisted) classes".to_string(),
+        |c| format!("class {c:?}"),
+    );
+    format!(
+        "rank {rank} for {who} must be a finite number (NaN and infinity cannot be ordered \
+         against other classes)"
+    )
+}
+
+/// The first non-finite rank (#428), as `(class, rank)` with `None` for the
+/// unknown-class rank: the one rule behind [`ClassRanking::new`] (so
+/// `--class-rank` and Python's `class_ranks` read the same) and
+/// [`check_class_ranking`].
+pub(crate) fn first_non_finite_rank(
     ranks: &[(String, f64)],
     unknown_rank: Option<f64>,
-) -> Result<(), ConfigError> {
-    if let Some((class, rank)) = ranks.iter().find(|(_, r)| !r.is_finite()) {
-        return Err(ConfigError::ClassRankNotFinite {
-            class: Some(class.clone()),
-            rank: *rank,
-        });
-    }
-    match unknown_rank.filter(|u| !u.is_finite()) {
-        Some(rank) => Err(ConfigError::ClassRankNotFinite { class: None, rank }),
-        None => Ok(()),
+) -> Option<(Option<String>, f64)> {
+    match ranks.iter().find(|(_, r)| !r.is_finite()) {
+        Some((class, rank)) => Some((Some(class.clone()), *rank)),
+        None => unknown_rank
+            .filter(|u| !u.is_finite())
+            .map(|rank| (None, rank)),
     }
 }
 
@@ -569,6 +608,17 @@ pub(crate) fn check_ranks_finite(
 /// are public.
 pub(crate) fn check_class_ranking(ranking: &ClassRanking) -> Result<(), ConfigError> {
     check_ranks_finite(&ranking.ranks, Some(ranking.unknown_rank))
+}
+
+/// [`first_non_finite_rank`] as a [`ConfigError`].
+pub(crate) fn check_ranks_finite(
+    ranks: &[(String, f64)],
+    unknown_rank: Option<f64>,
+) -> Result<(), ConfigError> {
+    match first_non_finite_rank(ranks, unknown_rank) {
+        Some((class, rank)) => Err(ConfigError::ClassRankNotFinite { class, rank }),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -767,7 +817,10 @@ mod tests {
                 matches!(err, ConvertError::Config(ConfigError::InvalidBbox { .. })),
                 "{bbox:?}: {err:?}"
             );
-            assert!(err.is_config());
+            assert_eq!(
+                crate::error::Classify::kind(&err),
+                crate::error::ErrorKind::Usage
+            );
         }
         with([0.0, 0.0, 1.0, 1.0]).validate().unwrap();
     }
@@ -829,7 +882,10 @@ mod tests {
             ),
             "{err:?}"
         );
-        assert!(err.is_config());
+        assert_eq!(
+            crate::error::Classify::kind(&err),
+            crate::error::ErrorKind::Usage
+        );
         partitioning()
             .with_generalization(&GeneralizationOverrides::default(), false)
             .expect("the default is inert, not an error");
@@ -912,13 +968,13 @@ pub(crate) mod spelled {
 /// deliberately no public constructor or mutable accessor.
 ///
 /// ```compile_fail
-/// use tylertoo_core::overview::{config::ValidatedConfig, convert::ConvertOptions};
+/// use tylertoo_core::{ConvertOptions, ValidatedConfig};
 /// let options = ConvertOptions::default();
 /// let _config = ValidatedConfig { options: &options };
 /// ```
 ///
 /// ```compile_fail
-/// use tylertoo_core::overview::convert::ConvertOptions;
+/// use tylertoo_core::ConvertOptions;
 /// let mut options = ConvertOptions::default();
 /// let config = options.validate().unwrap();
 /// options.read_batch_size = 0;
@@ -1034,7 +1090,7 @@ pub(super) fn validate_tiles(
 /// Validate a complete pyramid before reading any band.
 pub(crate) fn validate_pyramid(
     options: &crate::pyramid::PyramidOptions,
-) -> Result<ValidatedConfig<'_, crate::pyramid::PyramidOptions>, crate::Error> {
+) -> Result<ValidatedConfig<'_, crate::pyramid::PyramidOptions>, crate::pyramid::PyramidError> {
     options.check()?;
     Ok(ValidatedConfig::new(options))
 }
@@ -1112,10 +1168,16 @@ pub mod cli;
 pub mod keywords;
 mod values;
 
-pub(super) fn finite_number(name: &str, value: f64) -> Result<(), String> {
+pub(super) fn finite_number(
+    name: &'static str,
+    value: f64,
+) -> Result<(), super::convert::InvalidOption> {
     if value.is_finite() {
         Ok(())
     } else {
-        Err(format!("{name} = {value} must be a finite value"))
+        Err(super::convert::InvalidOption::NotFinite {
+            option: name,
+            value,
+        })
     }
 }

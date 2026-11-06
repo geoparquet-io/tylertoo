@@ -13,9 +13,8 @@ Python Quality and Python Tests; they may skip the Rust integration matrix.
 | cargo-shear | Unused dependencies | `cargo shear` |
 | jscpd 4.0.5 | Rust/Python token clones across and within files; `.jscpd.json` | `npx --yes jscpd@4.0.5 --config .jscpd.json` |
 | similarity-rs 0.5.0 | Rust functions in all production source directories; native within-file comparison | `similarity-rs --threshold 0.938 --min-lines 10 --skip-test --fail-on-duplicates crates/io/src crates/core/src crates/cli/src crates/python/src` |
-| cargo-mutants | Direct exit status for mutants on PR diff lines in core and CLI; blocking through `CI passed` | `scripts/mutants-diff.sh origin/main` |
 | Codecov | Native project targets: workspace 94%, core 94%, CLI 81.9%; `codecov.yml` | `cargo llvm-cov nextest --all-features --workspace --exclude tylertoo-python --lcov --output-path lcov.info` |
-| cargo-public-api | Exported core API against `crates/core/api/tylertoo-core.txt` | `cd crates/core && cargo +nightly-2026-09-15 public-api --simplified \| diff -u api/tylertoo-core.txt -` |
+| cargo-public-api | Exported core API against `crates/core/api/tylertoo-core.txt`; `crates/core/tests/public_api_gate.rs` fails if that baseline is missing or truncated, names a path outside its allowlist of roots (`tylertoo_core`, `core`, `alloc`, `std`, `serde_core`, `serde_json`), or names a non-stable core item | `cd crates/core && cargo +nightly-2026-09-15 public-api --simplified \| diff -u api/tylertoo-core.txt -` |
 | vulture | Package and tests, confidence 60; `[tool.vulture]` in `crates/python/pyproject.toml` | `cd crates/python && uv run vulture` |
 | stubtest | Python extension and type stub agreement | `cd crates/python && uv run python -m mypy.stubtest tylertoo` |
 | nextest | Quick/full tiers and timeouts in `.config/nextest.toml` | `cargo nextest run --profile quick` |
@@ -50,7 +49,11 @@ pair counters can overlap. Exemptions validate issue references, reject duplicat
 and fail on XPASS. Their open-issue check remains in the e2e workflow.
 
 The tippecanoe comparison, golden archives and tile digests remain behavior
-tests. Weekly mutation, security, fuzzing and benchmark workflows remain.
+tests. Weekly security, fuzzing and benchmark workflows remain.
+
+Mutation testing is gone; targeted property suites replace it: proptest in
+`crates/core/tests/properties_*.rs`, Hypothesis in
+`crates/python/tests/test_properties.py`, and the `fuzz/` targets.
 
 `.github/CODEOWNERS` assigns architecture policy and exemption files to
 `@nlebovits`. Code-owner review and the native Codecov statuses must be enabled

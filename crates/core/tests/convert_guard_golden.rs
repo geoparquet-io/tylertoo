@@ -99,10 +99,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use tylertoo_core::archive_index::ArchiveIndex;
-use tylertoo_core::compression;
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_core::internal::archive_index::ArchiveIndex;
+use tylertoo_core::internal::compression;
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;
@@ -153,21 +153,16 @@ const CASES: &[Case] = &[
 /// The conversion knobs, fixed. Everything not named here is a default, and
 /// a default that moves is an output change this guard should catch.
 fn convert_options() -> ConvertOptions {
-    ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: MIN_ZOOM,
-            max_zoom: MAX_ZOOM,
-        },
-        ..Default::default()
-    }
+    ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: MIN_ZOOM,
+        max_zoom: MAX_ZOOM,
+    })
 }
 
 fn export_options(case: &Case) -> ExportOptions {
-    ExportOptions {
-        layer_name: LAYER.to_string(),
-        simple_clip_fastpath: case.simple_clip_fastpath,
-        ..Default::default()
-    }
+    ExportOptions::default()
+        .with_layer_name(LAYER.to_string())
+        .with_simple_clip_fastpath(case.simple_clip_fastpath)
 }
 
 /// Run one case end to end and return its golden lines.

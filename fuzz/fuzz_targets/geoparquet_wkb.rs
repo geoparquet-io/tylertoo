@@ -11,5 +11,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = tylertoo_core::batch_processor::fuzz_geoparquet_wkb(data);
+    let _ = tylertoo_core::internal::batch_processor::fuzz_geoparquet_wkb(data);
 });

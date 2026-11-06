@@ -61,9 +61,11 @@ const REMOTE_SCHEMES: &[&str] = &["s3", "s3a", "http", "https", "gs"];
 
 /// Errors from opening or reading an [`InputSource`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum InputError {
     /// A saved convert plan belongs to a different version of an input.
     #[error("--plan: saved plan does not match this run: input {input:?} {field} was {saved:?} when the plan was saved but is {current:?} now. Re-run without --plan (add --save-plan to write a fresh one).")]
+    #[non_exhaustive]
     PlanInputChanged {
         /// Input path or URL.
         input: String,
@@ -76,17 +78,22 @@ pub enum InputError {
     },
     /// A checked-I/O boundary refused the input.
     #[error(transparent)]
-    Decode(#[from] tylertoo_io::Error),
+    // #437: hidden, so the internal `tylertoo_io` type is not stable API.
+    #[doc(hidden)]
+    Decode(tylertoo_io::Error),
     /// Local I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     /// Parquet error (footer parse, reader construction).
     #[error("parquet error: {}", parquet_error_detail(.0))]
-    Parquet(#[from] ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] ParquetError),
     /// An input file could not be opened (#452: the bare [`Self::Io`] named
     /// no file). Not a `#[source]`: the message already carries the reason,
     /// and a source would repeat it in every `Caused by:` chain.
     #[error("cannot open {input}: {error}")]
+    #[non_exhaustive]
     Open {
         /// Display name of the input (path or URL).
         input: String,
@@ -96,10 +103,12 @@ pub enum InputError {
     /// An input's Parquet footer could not be read or fetched (#452: the
     /// bare [`Self::Parquet`] named no file).
     #[error("cannot read the Parquet footer of {input}: {}", parquet_error_detail(.error))]
+    #[non_exhaustive]
     Footer {
         /// Display name of the input (path or URL).
         input: String,
         /// The underlying Parquet error.
+        #[doc(hidden)]
         error: ParquetError,
     },
     /// The input looks like a URL but uses a scheme we do not support.
@@ -107,6 +116,7 @@ pub enum InputError {
         "unsupported input URL scheme `{scheme}://` in {url:?}: supported inputs are \
          local paths and s3://, https://, http://, gs:// URLs"
     )]
+    #[non_exhaustive]
     UnsupportedScheme {
         /// The unrecognized scheme.
         scheme: String,
@@ -123,10 +133,13 @@ pub enum InputError {
     /// The remote object store rejected a request.
     #[cfg(feature = "remote")]
     #[error("remote input error for {url}: {source}")]
+    #[non_exhaustive]
     Remote {
         /// The input URL.
         url: String,
-        /// The underlying object-store error.
+        /// The underlying object-store error (#437: hidden, so the
+        /// `object_store` type is not stable API).
+        #[doc(hidden)]
         #[source]
         source: object_store::Error,
     },
@@ -136,10 +149,13 @@ pub enum InputError {
     RemoteConfig(String),
     /// Arrow error surfaced while decoding record batches from a stream.
     #[error("arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Arrow(#[source] arrow_schema::ArrowError),
     /// A partition of a multi-file input does not match the first partition
     /// (schema shape, geometry extension metadata, or CRS).
     #[error("incompatible input partition {offender:?}: {detail} (first partition: {first:?})")]
+    #[non_exhaustive]
     IncompatiblePartition {
         /// Display name of the reference (first) partition.
         first: String,
@@ -150,6 +166,7 @@ pub enum InputError {
     },
     /// A directory or glob input matched no `.parquet` files.
     #[error("no .parquet files found for input {input:?}")]
+    #[non_exhaustive]
     NoParquetInputs {
         /// The original input string (directory path or glob pattern).
         input: String,
@@ -163,12 +180,14 @@ pub enum InputError {
          <manifest> (one per line); s3:// and gs:// prefixes are listed \
          natively"
     )]
+    #[non_exhaustive]
     RemotePrefixUnsupported {
         /// The rejected URL.
         url: String,
     },
     /// The `--files-from` manifest itself could not be read.
     #[error("cannot read --files-from manifest {path:?}: {source}")]
+    #[non_exhaustive]
     ManifestRead {
         /// The manifest path as supplied.
         path: String,
@@ -181,6 +200,7 @@ pub enum InputError {
     /// entries are single files/objects only — no directory, glob, or
     /// prefix expansion.
     #[error("{context}: input {input:?} does not exist or is not a file")]
+    #[non_exhaustive]
     MissingListedInput {
         /// Where the entry came from (manifest line / list position).
         context: String,
@@ -189,12 +209,43 @@ pub enum InputError {
     },
     /// A glob input string is not a valid glob pattern.
     #[error("invalid glob pattern {pattern:?}: {message}")]
+    #[non_exhaustive]
     GlobPattern {
         /// The pattern as supplied.
         pattern: String,
         /// The glob crate's error message.
         message: String,
     },
+}
+
+#[doc(hidden)]
+impl From<arrow_schema::ArrowError> for InputError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        InputError::Arrow(e)
+    }
+}
+
+impl crate::error::Classify for InputError {
+    /// An input the read boundary refused as hostile is
+    /// [`ErrorKind::Input`](crate::error::ErrorKind::Input); any other read
+    /// failure is a failed run.
+    fn kind(&self) -> crate::error::ErrorKind {
+        crate::error::fallback_kind(self)
+    }
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::Error> for InputError {
+    fn from(e: tylertoo_io::Error) -> Self {
+        InputError::Decode(e)
+    }
+}
+
+#[doc(hidden)]
+impl From<ParquetError> for InputError {
+    fn from(e: ParquetError) -> Self {
+        InputError::Parquet(e)
+    }
 }
 
 /// A [`ParquetError`]'s message without the `Parquet error: ` prefix its
@@ -213,6 +264,7 @@ pub(crate) fn parquet_error_detail(error: &ParquetError) -> String {
 /// Byte/request counters for a remote input. `Serialize` so conversion
 /// reports can carry it (benchmark tasks).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Default)]
+#[non_exhaustive]
 pub struct FetchStats {
     /// Number of range GET requests issued (HEAD not included).
     pub requests: u64,

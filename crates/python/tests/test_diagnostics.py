@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 
 import tylertoo
@@ -60,8 +62,6 @@ def spill(request, tmp_path, monkeypatch):
 
 def _write_source(path: Path, slivers: bool = False) -> Path:
     """ROWS rows: one point (id 0), then points or slivers."""
-    pa = pytest.importorskip("pyarrow")
-    pq = pytest.importorskip("pyarrow.parquet")
     types = ["Point", "Polygon"] if slivers else ["Point"]
     metadata: dict[str, Any] = {
         "version": "1.1.0",
@@ -145,3 +145,34 @@ def test_failed_conversion_leaves_no_spilled_files(tmp_path, spill):
             spill_dir=spill_dir,
         )
     assert list(spill_path.iterdir()) == []
+
+
+def test_report_carries_the_crs_assumption_and_geo_version(tmp_path):
+    """#708: the CRS assumption and the geo.version verdict reach the report."""
+    field = pa.field(
+        "geometry", pa.binary(), metadata={"ARROW:extension:name": "geoarrow.wkb"}
+    )
+    cases = {
+        "none": (None, True, {"status": "missing"}),
+        "future": ("3.0.0", False, {"status": "unknown", "version": "3.0.0"}),
+        "known": ("1.1.0", False, {"status": "known", "version": "1.1.0"}),
+    }
+    for name, (version, assumed, expected) in cases.items():
+        schema = pa.schema([field, pa.field("id", pa.int64())])
+        if version:
+            geo = {
+                "version": version,
+                "primary_column": "geometry",
+                "columns": {
+                    "geometry": {"encoding": "WKB", "geometry_types": ["Point"]}
+                },
+            }
+            schema = schema.with_metadata({b"geo": json.dumps(geo).encode()})
+        table = pa.table({"geometry": [POINT] * 8, "id": range(8)}, schema=schema)
+        source = tmp_path / f"{name}.parquet"
+        pq.write_table(table, source)
+        report = tylertoo.overview(
+            str(source), str(tmp_path / f"{name}-out.parquet"), max_zoom=2
+        )
+        assert report["crs_assumed_wgs84"] is assumed, name
+        assert report["geo_version"] == expected, name

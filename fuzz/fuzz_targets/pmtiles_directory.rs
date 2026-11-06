@@ -7,7 +7,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use tylertoo_core::pmtiles_writer::{decode_directory, encode_directory};
+use tylertoo_core::internal::pmtiles_writer::{decode_directory, encode_directory};
 
 fuzz_target!(|data: &[u8]| {
     if let Some(entries) = decode_directory(data) {

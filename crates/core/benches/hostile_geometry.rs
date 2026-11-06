@@ -17,10 +17,10 @@ use std::path::PathBuf;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{Coord, CoordsIter, Geometry, LineString, Polygon};
-use tylertoo_core::clip::{clip_geometry_simple, geometry_is_simple};
-use tylertoo_core::ioverlay_clip::clip_polygon_ioverlay;
-use tylertoo_core::sutherland_hodgman::clip_polygon_sh;
-use tylertoo_core::tile::{lng_lat_to_tile, TileBounds};
+use tylertoo_core::internal::clip::{clip_geometry_simple, geometry_is_simple};
+use tylertoo_core::internal::ioverlay_clip::clip_polygon_ioverlay;
+use tylertoo_core::internal::sutherland_hodgman::clip_polygon_sh;
+use tylertoo_core::internal::tile::{lng_lat_to_tile, TileBounds};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -150,7 +150,7 @@ fn bench_tier(c: &mut Criterion, tier: &str, cases: &[(&str, Polygon<f64>)]) {
                     black_box(buf),
                     simple,
                     true,
-                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                    &tylertoo_core::internal::diagnostics::Diagnostics::default(),
                 )
             });
         });
@@ -162,7 +162,7 @@ fn bench_tier(c: &mut Criterion, tier: &str, cases: &[(&str, Polygon<f64>)]) {
                 clip_polygon_ioverlay(
                     black_box(p),
                     black_box(&buffered),
-                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                    &tylertoo_core::internal::diagnostics::Diagnostics::default(),
                 )
             });
         });

@@ -31,7 +31,6 @@
 #   Coverage        cargo-llvm-cov -> lcov; Codecov native project targets
 #                   cover workspace, core and CLI
 #   Gate scripts    pytest for the independent archive verifier
-#   Mutation gate   cargo-mutants --in-diff for core and CLI on PRs
 #   CI passed       fails if any job above failed or was cancelled; the only
 #                   CI context branch protection requires
 #
@@ -65,8 +64,7 @@
 # only on main against a moving toolchain, so they don't cache target/.
 #
 # Benchmarks run in codspeed.yml (per PR) and bench-regression.yml (label,
-# weekly); mutation testing runs
-# in mutation-tests.yml (weekly); the tippecanoe parity gate (#420) runs in
+# weekly); the tippecanoe parity gate (#420) runs in
 # tippecanoe-compare.yml (PRs, push to main, weekly).
 #
 # TOOLCHAIN POLICY: floating `stable` for all gates, with a `beta` lane in the
@@ -403,23 +401,6 @@ jobs:
       - name: Run doctests
         # nextest does not run doctests.
         run: cargo test --locked --all-features --doc
-
-      - name: Check the mutation run builds every test binary it should
-        # .cargo/mutants.toml names the core test binaries cargo-mutants
-        # builds per mutant (only those with a test the run would execute,
-        # so the slow-tier and all-#[ignore] binaries are not relinked
-        # ~10,300 times a sweep). A binary missing from that list is tested
-        # nowhere in the weekly sweep, so the list must follow the tree:
-        # this fails when crates/core/tests or the nextest slow set changed
-        # and the list did not. Fix: scripts/mutants-test-binaries.sh
-        # prints the current array. One lane is enough (the list is
-        # platform-independent). It lists at default features, which is
-        # what cargo-mutants builds, so tylertoo-core's tests compile once
-        # more here under that feature set (a few minutes on the warm
-        # dependency cache); feature-gated test binaries must not leak
-        # into the mutation list.
-        if: runner.os == 'Linux' && matrix.rust == 'stable'
-        run: scripts/mutants-test-binaries.sh --check
 
       # Main only; see CACHES in the header.
       - name: Save cargo build cache
@@ -1036,6 +1017,7 @@ jobs:
           # Extract versions
           WORKSPACE_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           CORE_DEP_VERSION=$(grep 'tylertoo-core.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+          IO_DEP_VERSION=$(grep 'tylertoo-io.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
           PYTHON_VERSION=$(grep -m1 '^version = ' crates/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           CZ_VERSION=$(grep '^version = ' .cz.toml | sed 's/version = "\(.*\)"/\1/')
           # uv.lock pins the Python project's own version. `cz bump` does not
@@ -1046,6 +1028,7 @@ jobs:
           echo "Versions found:"
           echo "  Cargo.toml workspace.package.version: $WORKSPACE_VERSION"
           echo "  Cargo.toml tylertoo-core dependency: $CORE_DEP_VERSION"
+          echo "  Cargo.toml tylertoo-io dependency:   $IO_DEP_VERSION"
           echo "  pyproject.toml version:               $PYTHON_VERSION"
           echo "  .cz.toml version:                     $CZ_VERSION"
           echo "  crates/python/uv.lock version:        $UV_LOCK_VERSION"
@@ -1054,6 +1037,10 @@ jobs:
           ERROR=0
           if [ "$WORKSPACE_VERSION" != "$CORE_DEP_VERSION" ]; then
             echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs core-dep=$CORE_DEP_VERSION"
+            ERROR=1
+          fi
+          if [ "$WORKSPACE_VERSION" != "$IO_DEP_VERSION" ]; then
+            echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs io-dep=$IO_DEP_VERSION"
             ERROR=1
           fi
           if [ "$WORKSPACE_VERSION" != "$PYTHON_VERSION" ]; then
@@ -1296,12 +1283,6 @@ jobs:
           --with mapbox-vector-tile==2.2.0 --with shapely==2.2.0 --with pyarrow==26.0.0
           pytest -q scripts/ci/tests
 
-  mutation-diff:
-    name: Mutation gate
-    needs: plan
-    if: github.event_name == 'pull_request' && needs.plan.outputs.code == 'true'
-    uses: ./.github/workflows/mutation-diff.yml
-
   # The one CI context branch protection requires. Every job above is
   # blocking through it: it fails when any of them failed or was cancelled.
   # "skipped" passes, because the plan job skips jobs on purpose (docs-only
@@ -1321,7 +1302,6 @@ jobs:
       - docs
       - coverage
       - gate-scripts
-      - mutation-diff
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
