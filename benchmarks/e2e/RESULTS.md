@@ -95,12 +95,12 @@ Tables are generated from `e2e-corpus.json`. Reproduce with one command: `./benc
 ### Provenance and caveats — read these before quoting
 
 <!-- bench:e2e-corpus/provenance -->
-- **Machine** — Apple M3 Pro, 12 cores, 18 GB RAM, macOS-15.6-arm64-arm-64bit
-- **tylertoo** — tylertoo 0.8.0 @ `5885c17` (release build)
+- **Machine** — Neoverse-V1, 64 cores, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39
+- **tylertoo** — tylertoo 0.8.0 @ `ae0363f` (release build)
 - **tippecanoe** — tippecanoe v2.79.0, tag `2.79.0`, commit `68ab8dcc229f95b8b25877697d5e8d66783af503`, built from source by `setup_tippecanoe.sh`
 - **Settings** — z0–z14, tile buffer 8, per-tile cap 500,000 bytes
-- **Method** — median of 2 timed runs after one discarded warm-up; warm page cache
-- **Recorded** — 2026-10-15T22:32:09Z → `e2e-corpus.json`
+- **Method** — median of 3 timed runs after one discarded warm-up; warm page cache
+- **Recorded** — 2026-11-06T19:06:34Z → `e2e-corpus.json`
 <!-- /bench -->
 
 1. **The machine was not idle.** Another build job shared it during the
@@ -132,12 +132,12 @@ Tables are generated from `e2e-corpus.json`. Reproduce with one command: `./benc
 <!-- bench:e2e-corpus/headline -->
 | dataset | features | tylertoo (parquet→pmtiles) | tippecanoe e2e (convert+tile) | tippecanoe tile-only (fgb in) | e2e | tile-only |
 |---|---|---|---|---|---|---|
-| `points-nyc-medium` | 597,782 | 1.39 s | 30.03 s | 29.56 s | **21.6×** | **21.3×** |
-| `lines-portland-medium` | 301,609 | 1.40 s | 28.30 s | 27.88 s | **20.2×** | **19.9×** |
-| `polygons-portland-medium` | 813,456 | 2.69 s | 57.22 s | 56.05 s | **21.3×** | **20.9×** |
-| `polygons-ftw-moldova-large` | 631,910 | 13.87 s | 119.28 s | 117.37 s | **8.6×** | **8.5×** |
+| `points-nyc-medium` | 630,065 | 1.57 s | 42.66 s | 40.91 s | **27.2×** | **26.1×** |
+| `polygons-portland-medium` | 813,456 | 3.68 s | 84.81 s | 82.47 s | **23.0×** | **22.4×** |
+| `lines-oregon-large` | 1,203,997 | 10.65 s | 180.69 s | 176.98 s | **17.0×** | **16.6×** |
+| `polygons-ftw-moldova-large` | 631,910 | 7.78 s | 167.27 s | 163.57 s | **21.5×** | **21.0×** |
 
-_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+_Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
 The Moldova row is the one the stale table in
@@ -151,12 +151,12 @@ pipeline is 8.6× faster than tippecanoe end-to-end on the same file at
 <!-- bench:e2e-corpus/quality-matched -->
 | dataset | tylertoo default | tylertoo quality-matched | tippecanoe tile-only | tile-only speedup, matched | tylertoo tiles (default → matched) | tippecanoe tiles | archive, matched | archive ratio |
 |---|---|---|---|---|---|---|---|---|
-| `points-nyc-medium` | 1.39 s | 12.21 s | 29.56 s | **2.4×** | 849 → 849 | 10,486 | 62.8 MB | 0.72× |
-| `lines-portland-medium` | 1.40 s | 1.71 s | 27.88 s | **16.3×** | 1,329 → 1,331 | 1,331 | 44.7 MB | 1.02× |
-| `polygons-portland-medium` | 2.69 s | 3.45 s | 56.05 s | **16.3×** | 1,208 → 1,208 | 1,213 | 84.5 MB | 1.20× |
-| `polygons-ftw-moldova-large` | 13.87 s | 20.03 s | 117.37 s | **5.9×** | 17,489 → 17,489 | 17,461 | 167.1 MB | 0.96× |
+| `points-nyc-medium` | 1.57 s | 18.38 s | 40.91 s | **2.2×** | 851 → 851 | 10,543 | 79.9 MB | 0.88× |
+| `polygons-portland-medium` | 3.68 s | 6.17 s | 82.47 s | **13.4×** | 1,214 → 1,216 | 1,213 | 103.2 MB | 1.47× |
+| `lines-oregon-large` | 10.65 s | 10.47 s | 176.98 s | **16.9×** | 121,259 → 121,259 | 120,984 | 341.8 MB | 1.23× |
+| `polygons-ftw-moldova-large` | 7.78 s | 9.35 s | 163.57 s | **17.5×** | 17,492 → 17,492 | 17,461 | 175.9 MB | 1.01× |
 
-_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+_Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
 Peak RSS on the matched runs, which the table above leaves out
@@ -196,21 +196,21 @@ lines and polygons even at defaults.
 <!-- bench:e2e-corpus/memory -->
 | dataset | tylertoo peak RSS | tippecanoe peak RSS | converter peak RSS | tylertoo CPU | tippecanoe CPU | tylertoo archive | tippecanoe archive | archive ratio |
 |---|---|---|---|---|---|---|---|---|
-| `points-nyc-medium` | 600 MB | 519 MB | 327 MB | 648% | 229% | 51.9 MB | 87.6 MB | 0.59× † |
-| `lines-portland-medium` | 1611 MB | 652 MB | 314 MB | 670% | 165% | 34.5 MB | 43.8 MB | 0.79× |
-| `polygons-portland-medium` | 999 MB | 967 MB | 374 MB | 626% | 204% | 78.2 MB | 70.2 MB | 1.11× |
-| `polygons-ftw-moldova-large` | 1848 MB | 926 MB | 700 MB | 714% | 260% | 132.2 MB | 174.8 MB | 0.76× |
+| `points-nyc-medium` | 2210 MB | 1352 MB | 332 MB | 2522% | 240% | 58.8 MB | 90.6 MB | 0.65× † |
+| `polygons-portland-medium` | 3132 MB | 2127 MB | 356 MB | 2639% | 219% | 99.1 MB | 70.2 MB | 1.41× |
+| `lines-oregon-large` | 9051 MB | 2435 MB | 397 MB | 1861% | 242% | 311.5 MB | 278.7 MB | 1.12× |
+| `polygons-ftw-moldova-large` | 4520 MB | 2431 MB | 353 MB | 2904% | 297% | 174.2 MB | 174.8 MB | 1.00× |
 
-_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+_Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
 † Zoom-mismatched: tippecanoe's archive covers z0–16, tylertoo's z0–14
 (caveat 4). At z0–14 on both sides the ratio is 1.87×, not 0.59×.
 
-**tylertoo loses the memory column on three of four rows** — up to 2.5× on
-lines (1.6 GB vs 652 MB) and 2.0× on Moldova (1.8 GB vs 926 MB) — and wins
-it nowhere decisively. The CPU column says where the speed comes from:
-tylertoo keeps 6–7 of the 12 cores busy, tippecanoe 1.6–2.6. The speed is
+**tylertoo loses the memory column on all four rows** — up to 3.7× on
+lines (9.1 GB vs 2.4 GB) and 1.9× on Moldova (4.5 GB vs 2.4 GB). The CPU
+column says where the speed comes from: tylertoo keeps 19–29 of the 64
+cores busy, tippecanoe 2.2–3.0. The speed is
 parallelism plus the native columnar read, bought with a larger working set
 (`--partition-wave auto` sizes itself against available RAM; pin
 `--partition-wave N` before drawing memory conclusions).
@@ -225,12 +225,12 @@ tiler vs tiler, not input format. tylertoo's own split:
 <!-- bench:e2e-corpus/phases -->
 | dataset | convert (parquet read + ladder) | export (MVT + archive) | row groups read/total | tiles | tile features | oversized tiles |
 |---|---|---|---|---|---|---|
-| `points-nyc-medium` | 0.34 s | 1.04 s | 13/13 | 849 | 1,049,891 | 53 |
-| `lines-portland-medium` | 0.73 s | 0.61 s | 7/7 | 1,329 | 858,441 | 10 |
-| `polygons-portland-medium` | 0.78 s | 1.94 s | 17/17 | 1,208 | 1,828,186 | 33 |
-| `polygons-ftw-moldova-large` | 6.76 s | 7.08 s | 13/13 | 17,489 | 2,071,586 | 4 |
+| `points-nyc-medium` | 0.40 s | 1.05 s | 13/13 | 851 | 1,256,277 | 25 |
+| `polygons-portland-medium` | 0.88 s | 2.71 s | 17/17 | 1,214 | 2,456,008 | 44 |
+| `lines-oregon-large` | 2.73 s | 8.91 s | 25/25 | 121,259 | 6,482,919 | 27 |
+| `polygons-ftw-moldova-large` | 2.66 s | 4.98 s | 13/13 | 17,492 | 3,769,912 | 26 |
 
-_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+_Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
 (The defaults runs hit tylertoo's per-tile size valve on 4–53 tiles per
@@ -243,11 +243,11 @@ same pressure with `--drop-densest-as-needed`.)
 | dataset | zooms | tippecanoe flags beyond the parity set |
 |---|---|---|
 | `points-nyc-medium` | z0–z14 | `--drop-densest-as-needed --extend-zooms-if-still-dropping` |
-| `lines-portland-medium` | z0–z14 | `--simplification=10 --drop-densest-as-needed` |
 | `polygons-portland-medium` | z0–z14 | `--simplification=10 --drop-densest-as-needed --coalesce-densest-as-needed` |
+| `lines-oregon-large` | z0–z14 | `--simplification=10 --drop-densest-as-needed` |
 | `polygons-ftw-moldova-large` | z0–z14 | `--simplification=10 --drop-densest-as-needed --coalesce-densest-as-needed` |
 
-_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+_Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
 ### Per-zoom tile counts (defaults run; the tile-parity record)
@@ -269,46 +269,46 @@ extension on points (caveat 4).
 | z2 | 1 | 1 | 0.00 MB | 0.00 MB |
 | z3 | 2 | 2 | 0.00 MB | 0.00 MB |
 | z4 | 2 | 2 | 0.00 MB | 0.01 MB |
-| z5 | 2 | 2 | 0.01 MB | 0.01 MB |
+| z5 | 2 | 2 | 0.01 MB | 0.02 MB |
 | z6 | 2 | 2 | 0.03 MB | 0.02 MB |
-| z7 | 2 | 1 | 0.08 MB | 0.05 MB |
+| z7 | 2 | 1 | 0.07 MB | 0.05 MB |
 | z8 | 1 | 1 | 0.27 MB | 0.12 MB |
-| z9 | 2 | 2 | 0.44 MB | 0.29 MB |
-| z10 | 6 | 6 | 1.47 MB | 0.81 MB |
-| z11 | 16 | 16 | 3.07 MB | 1.22 MB |
-| z12 | 50 | 49 | 7.15 MB | 2.46 MB |
-| z13 | 160 | 160 | 13.56 MB | 6.42 MB |
-| z14 | 601 | 601 | 25.80 MB | 16.30 MB |
-| z15 | 0 | 2,132 | — | 24.92 MB |
-| z16 | 0 | 7,507 | — | 34.95 MB |
-| **total** | **849** | **10,486** | | |
+| z9 | 2 | 2 | 0.65 MB | 0.31 MB |
+| z10 | 6 | 6 | 1.90 MB | 0.66 MB |
+| z11 | 16 | 16 | 4.25 MB | 1.21 MB |
+| z12 | 50 | 49 | 8.78 MB | 2.46 MB |
+| z13 | 160 | 160 | 14.94 MB | 6.49 MB |
+| z14 | 603 | 603 | 27.88 MB | 16.64 MB |
+| z15 | 0 | 2,146 | — | 25.81 MB |
+| z16 | 0 | 7,548 | — | 36.80 MB |
+| **total** | **851** | **10,543** | | |
 
-_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+_Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
-#### `lines-portland-medium`
+#### `lines-oregon-large`
 
-<!-- bench:e2e-corpus/per-zoom/lines-portland-medium -->
+<!-- bench:e2e-corpus/per-zoom/lines-oregon-large -->
 | zoom | tylertoo tiles | tippecanoe tiles | tylertoo bytes | tippecanoe bytes |
 |---|---|---|---|---|
-| z0 | 0 | 1 | — | 0.14 MB |
-| z1 | 0 | 1 | — | 0.26 MB |
-| z2 | 1 | 1 | 0.00 MB | 0.46 MB |
-| z3 | 1 | 1 | 0.00 MB | 0.43 MB |
-| z4 | 1 | 1 | 0.01 MB | 0.41 MB |
-| z5 | 1 | 1 | 0.02 MB | 0.39 MB |
-| z6 | 1 | 1 | 0.06 MB | 0.39 MB |
-| z7 | 1 | 1 | 0.19 MB | 0.44 MB |
-| z8 | 2 | 2 | 0.29 MB | 0.47 MB |
-| z9 | 4 | 4 | 0.54 MB | 0.65 MB |
-| z10 | 9 | 9 | 1.05 MB | 1.30 MB |
-| z11 | 25 | 25 | 2.39 MB | 3.18 MB |
-| z12 | 77 | 77 | 4.65 MB | 8.41 MB |
-| z13 | 264 | 264 | 8.38 MB | 12.66 MB |
-| z14 | 942 | 942 | 16.92 MB | 14.27 MB |
-| **total** | **1,329** | **1,331** | | |
+| z0 | 1 | 1 | 0.00 MB | 0.42 MB |
+| z1 | 1 | 1 | 0.01 MB | 0.41 MB |
+| z2 | 1 | 1 | 0.03 MB | 0.45 MB |
+| z3 | 2 | 2 | 0.12 MB | 0.38 MB |
+| z4 | 1 | 1 | 0.40 MB | 0.38 MB |
+| z5 | 2 | 2 | 0.57 MB | 0.52 MB |
+| z6 | 6 | 6 | 1.67 MB | 0.77 MB |
+| z7 | 12 | 12 | 3.46 MB | 2.16 MB |
+| z8 | 42 | 42 | 7.59 MB | 5.54 MB |
+| z9 | 124 | 124 | 14.11 MB | 10.20 MB |
+| z10 | 450 | 450 | 23.18 MB | 17.13 MB |
+| z11 | 1,684 | 1,683 | 35.10 MB | 27.38 MB |
+| z12 | 6,413 | 6,407 | 48.88 MB | 48.46 MB |
+| z13 | 24,533 | 24,507 | 64.69 MB | 70.06 MB |
+| z14 | 87,987 | 87,745 | 111.51 MB | 94.22 MB |
+| **total** | **121,259** | **120,984** | | |
 
-_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+_Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
 #### `polygons-portland-medium`
@@ -317,22 +317,22 @@ _Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RA
 | zoom | tylertoo tiles | tippecanoe tiles | tylertoo bytes | tippecanoe bytes |
 |---|---|---|---|---|
 | z1 | 0 | 1 | — | 0.00 MB |
-| z2 | 0 | 1 | — | 0.00 MB |
-| z3 | 0 | 1 | — | 0.00 MB |
-| z4 | 0 | 1 | — | 0.01 MB |
-| z5 | 0 | 1 | — | 0.03 MB |
-| z6 | 0 | 1 | — | 0.13 MB |
-| z7 | 1 | 1 | 0.00 MB | 0.45 MB |
-| z8 | 1 | 2 | 0.00 MB | 0.24 MB |
-| z9 | 4 | 4 | 0.05 MB | 0.17 MB |
-| z10 | 9 | 9 | 0.32 MB | 0.21 MB |
-| z11 | 20 | 20 | 1.69 MB | 1.28 MB |
-| z12 | 63 | 63 | 9.88 MB | 5.06 MB |
-| z13 | 236 | 236 | 22.96 MB | 24.72 MB |
-| z14 | 874 | 872 | 43.25 MB | 37.93 MB |
-| **total** | **1,208** | **1,213** | | |
+| z2 | 1 | 1 | 0.00 MB | 0.00 MB |
+| z3 | 1 | 1 | 0.00 MB | 0.00 MB |
+| z4 | 1 | 1 | 0.00 MB | 0.01 MB |
+| z5 | 1 | 1 | 0.01 MB | 0.03 MB |
+| z6 | 1 | 1 | 0.02 MB | 0.13 MB |
+| z7 | 1 | 1 | 0.09 MB | 0.45 MB |
+| z8 | 2 | 2 | 0.35 MB | 0.24 MB |
+| z9 | 4 | 4 | 0.88 MB | 0.17 MB |
+| z10 | 9 | 9 | 1.95 MB | 0.21 MB |
+| z11 | 20 | 20 | 5.77 MB | 1.28 MB |
+| z12 | 63 | 63 | 16.84 MB | 5.06 MB |
+| z13 | 236 | 236 | 32.33 MB | 24.72 MB |
+| z14 | 874 | 872 | 40.80 MB | 37.93 MB |
+| **total** | **1,214** | **1,213** | | |
 
-_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+_Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
 #### `polygons-ftw-moldova-large`
@@ -340,24 +340,24 @@ _Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RA
 <!-- bench:e2e-corpus/per-zoom/polygons-ftw-moldova-large -->
 | zoom | tylertoo tiles | tippecanoe tiles | tylertoo bytes | tippecanoe bytes |
 |---|---|---|---|---|
-| z0 | 0 | 1 | — | 0.01 MB |
-| z1 | 0 | 1 | — | 0.03 MB |
-| z2 | 0 | 1 | — | 0.10 MB |
-| z3 | 1 | 1 | 0.00 MB | 0.34 MB |
-| z4 | 1 | 1 | 0.01 MB | 0.40 MB |
-| z5 | 1 | 1 | 0.10 MB | 0.41 MB |
-| z6 | 2 | 2 | 0.41 MB | 0.60 MB |
-| z7 | 4 | 4 | 0.78 MB | 1.02 MB |
-| z8 | 11 | 11 | 1.38 MB | 1.77 MB |
-| z9 | 28 | 28 | 2.95 MB | 4.88 MB |
-| z10 | 78 | 76 | 5.44 MB | 9.90 MB |
-| z11 | 255 | 254 | 10.29 MB | 21.37 MB |
-| z12 | 905 | 905 | 21.28 MB | 31.92 MB |
-| z13 | 3,385 | 3,380 | 37.00 MB | 43.02 MB |
-| z14 | 12,818 | 12,795 | 52.48 MB | 59.02 MB |
-| **total** | **17,489** | **17,461** | | |
+| z0 | 1 | 1 | 0.00 MB | 0.01 MB |
+| z1 | 1 | 1 | 0.00 MB | 0.03 MB |
+| z2 | 1 | 1 | 0.02 MB | 0.10 MB |
+| z3 | 1 | 1 | 0.06 MB | 0.34 MB |
+| z4 | 1 | 1 | 0.22 MB | 0.40 MB |
+| z5 | 1 | 1 | 0.46 MB | 0.41 MB |
+| z6 | 2 | 2 | 0.87 MB | 0.60 MB |
+| z7 | 4 | 4 | 1.40 MB | 1.02 MB |
+| z8 | 11 | 11 | 2.59 MB | 1.77 MB |
+| z9 | 28 | 28 | 6.21 MB | 4.88 MB |
+| z10 | 78 | 76 | 13.13 MB | 9.90 MB |
+| z11 | 255 | 254 | 22.35 MB | 21.37 MB |
+| z12 | 905 | 905 | 33.19 MB | 31.92 MB |
+| z13 | 3,385 | 3,380 | 43.36 MB | 43.02 MB |
+| z14 | 12,818 | 12,795 | 50.27 MB | 59.02 MB |
+| **total** | **17,492** | **17,461** | | |
 
-_Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit, 2026-10-15._
+_Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
 ## 2. Output parity — the number to quote to a skeptic

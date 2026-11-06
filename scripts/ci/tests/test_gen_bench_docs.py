@@ -29,7 +29,11 @@ def test_check_catches_one_hand_edited_number(tmp_path):
     doc.parent.mkdir(parents=True)
     shutil.copy(REPO / "docs/guides/tippecanoe.md", doc)
     assert g.run(root=tmp_path, check=True, files=["docs/guides/tippecanoe.md"]) == []
-    doc.write_text(doc.read_text().replace("1,611 / 652 MB", "1,311 / 652 MB"))
+    # Bump the last digit before the first " MB |" in the generated table,
+    # whatever the current numbers are.
+    text = doc.read_text()
+    k = text.index(" MB |", text.index("<!-- bench:e2e-corpus/tippecanoe-table -->")) - 1
+    doc.write_text(text[:k] + str((int(text[k]) + 1) % 10) + text[k + 1 :])
     assert g.run(root=tmp_path, check=True, files=["docs/guides/tippecanoe.md"]) == [
         "docs/guides/tippecanoe.md"
     ]
@@ -38,10 +42,12 @@ def test_check_catches_one_hand_edited_number(tmp_path):
 
 
 def test_readme_and_docs_agree_on_memory_ratio():
-    """README said 2.1x while the docs said 2.5x; both now derive from 1,611/652 MB."""
+    """README once said 2.1x while the docs said 2.5x; both now derive from the
+    same results file, so they cannot disagree."""
     r = g.load_results()["e2e-corpus"]
-    assert g.max_memory_ratio(r) == "2.5×"
-    assert "up to 2.5× peak memory" in g.readme_claim(r)
+    ratio = g.max_memory_ratio(r)
+    assert f"up to {ratio} peak memory" in g.readme_claim(r)
+    assert f"-->{ratio}<!-- /bench -->" in (REPO / "docs/guides/tippecanoe.md").read_text()
 
 
 def test_unknown_region_is_an_error():

@@ -79,6 +79,7 @@ DASH = "\u2014"
 DISPLAY = {
     "points-nyc-medium": "NYC places (point)",
     "lines-portland-medium": "Portland roads (line)",
+    "lines-oregon-large": "Oregon roads (line)",
     "polygons-portland-medium": "Portland buildings (polygon)",
     "polygons-ftw-moldova-large": "Moldova parcels (polygon, dense)",
 }
@@ -424,7 +425,7 @@ def footer(r) -> str:
     tools = ", ".join(f"{k} {v}" for k, v in p["tool_versions"].items()
                       if k != "tippecanoe_commit") or "no tool versions recorded"
     return (f"_Run: commit {p['commit'] or 'unknown'}, tylertoo "
-            f"{p['tylertoo_version']}, {tools}, {p['host']}, "
+            f"{p['tylertoo_version'].removeprefix('tylertoo ')}, {tools}, {p['host']}, "
             f"{(p['date'] or 'undated')[:10]}._")
 
 

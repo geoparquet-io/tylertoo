@@ -1,52 +1,49 @@
 {
   "provenance": {
-    "commit": "5885c17",
-    "tylertoo_version": "0.8.0",
-    "host": "Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit",
-    "nproc": 12,
-    "kernel": null,
-    "allocator": null,
+    "commit": "ae0363f",
+    "tylertoo_version": "tylertoo 0.8.0",
+    "host": "Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39",
+    "nproc": 64,
+    "kernel": "7.0.0-1014-aws",
+    "allocator": "mimalloc",
     "tool_versions": {
       "tippecanoe": "v2.79.0",
-      "tippecanoe_commit": "68ab8dcc229f95b8b25877697d5e8d66783af503"
+      "tippecanoe_commit": "68ab8dcc229f95b8b25877697d5e8d66783af503",
+      "gpio": "geoparquet-io, version 1.7.0"
     },
     "inputs": [
       {
         "name": "points-nyc-medium",
-        "sha256": null
-      },
-      {
-        "name": "lines-portland-medium",
-        "sha256": null
+        "sha256": "1b5cc786cbc11d377183a9b262e4ad8dac9824943b54ea48b7a0c303172f3364"
       },
       {
         "name": "polygons-portland-medium",
-        "sha256": null
+        "sha256": "2a788d4e9b0df2d093d0845aa7602ce799a07df9e5cc51aa7fcb862456b5914e"
+      },
+      {
+        "name": "lines-oregon-large",
+        "sha256": "37ac1cda29845bb73fd17a124885a93de44a2813ca522be64bd3dc5c86a6ed4e"
       },
       {
         "name": "polygons-ftw-moldova-large",
-        "sha256": null
+        "sha256": "5dea21ffb1092c6cff6269f96614b38d1ed9a0cf2a17963488862cce35dd54bf"
       }
     ],
-    "date": "2026-10-15T22:32:09Z",
-    "notes": [
-      "Copy of benchmarks/e2e/corpus_results.json; input sha256 was not recorded (corpus/manifest.json had none).",
-      "Machine was not idle during the run (RESULTS.md caveat 1). Overture inputs were release 2026-09-23.0, not the manifest pin."
-    ]
+    "date": "2026-11-06T19:06:34Z"
   },
   "schema_version": 1,
-  "generated_at": "2026-10-15T22:32:09Z",
+  "generated_at": "2026-11-06T19:06:34Z",
   "machine": {
-    "platform": "macOS-15.6-arm64-arm-64bit",
-    "python": "3.11.11",
-    "cpu_count": 12,
-    "cpu": "Apple M3 Pro",
-    "ram_gb": 18
+    "platform": "Linux-7.0.0-1014-aws-aarch64-with-glibc2.39",
+    "python": "3.12.3",
+    "cpu_count": 64,
+    "cpu": "Neoverse-V1",
+    "ram_gb": 124
   },
   "tylertoo": {
     "binary": "<repo>/target/release/tylertoo",
     "version": "tylertoo 0.8.0",
-    "git_sha": "5885c17"
+    "git_sha": "ae0363f"
   },
   "tippecanoe": {
     "binary": "<repo>/.tools/tippecanoe-2.79.0/bin/tippecanoe",
@@ -61,15 +58,15 @@
     "max_zoom": 14,
     "tile_buffer": 8,
     "max_tile_bytes": 500000,
-    "repeat": 2,
+    "repeat": 3,
     "warm_cache": true,
     "tippecanoe_extra": []
   },
   "datasets": {
     "points-nyc-medium": {
       "input": "<repo>/corpus/data/gpio/points-nyc-medium.parquet",
-      "input_bytes": 36628137,
-      "note": "corpus point/medium: New York City (5 boroughs) (~458,000 features)",
+      "input_bytes": 38737605,
+      "note": "corpus point/medium: New York City (5 boroughs) (~630,065 features)",
       "layer": "points-nyc-medium",
       "min_zoom": 0,
       "max_zoom": 14,
@@ -91,112 +88,335 @@
           "points-nyc-medium",
           "--tile-buffer",
           "8",
-          "--max-tile-size",
+          "--max-compressed-tile-size",
           "500000",
+          "--max-tile-size",
+          "0",
           "--report",
           "<work>/points-nyc-medium.tylertoo.report.json",
           "--force"
         ],
-        "runs": 2,
-        "wall_median_s": 1.3896264790091664,
-        "wall_min_s": 1.3770762081258,
-        "wall_max_s": 1.4021767498925328,
-        "peak_rss_bytes": 629309440,
-        "cpu_pct": 647.5,
+        "runs": 3,
+        "wall_median_s": 1.57,
+        "wall_min_s": 1.5,
+        "wall_max_s": 1.58,
+        "peak_rss_bytes": 2316931072,
+        "cpu_pct": 2522.0,
+        "cpu_s": 39.41,
+        "effective_cores": 25.22,
+        "profile": {
+          "convert": {
+            "phase_walls": {
+              "assign": 0.10002462,
+              "pass1": 0.051206598,
+              "pass2": 0.232202268,
+              "total": 0.404520476,
+              "writer_finish": 0.001593273
+            },
+            "pass1_rows": 630065,
+            "pass2_rows": 1302749,
+            "true_peak_mib": 2107.32421875,
+            "true_anon_peak_mib": 2093.6015625,
+            "memory_profile": "auto",
+            "threads": 64,
+            "phases": {
+              "assignment+budget (winner tables)": {
+                "cpu_user_secs": 2.115119,
+                "cpu_sys_secs": 0.23184899999999997,
+                "effective_cores": 23.10753273895656,
+                "utilization": 0.36105519904619626,
+                "unattributed_core_secs": 2.346968,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass1 scan": {
+                "cpu_user_secs": 1.437553,
+                "cpu_sys_secs": 0.29078800000000005,
+                "effective_cores": 31.73685656050524,
+                "utilization": 0.4958883837578944,
+                "unattributed_core_secs": 1.5792761620000002,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass2 (output sink)": {
+                "cpu_user_secs": 3.6671669999999996,
+                "cpu_sys_secs": 0.563599,
+                "effective_cores": 17.79219448119944,
+                "utilization": 0.2780030387687413,
+                "unattributed_core_secs": 3.479118168999999,
+                "read_bytes": 0,
+                "write_bytes": 92966912
+              },
+              "pre-pass2 (winner tables freed)": {
+                "cpu_user_secs": 0.0011779999999999013,
+                "cpu_sys_secs": 0.0019940000000000513,
+                "effective_cores": 0.9996539659348538,
+                "utilization": 0.01561959321773209,
+                "unattributed_core_secs": 0.0031719999999999526,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "preflight": {
+                "cpu_user_secs": 0.00035800000000000003,
+                "cpu_sys_secs": 0.0007160000000000001,
+                "effective_cores": 1.7370349105200593,
+                "utilization": 0.027141170476875927,
+                "unattributed_core_secs": 0.001074,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "writer.finish": {
+                "cpu_user_secs": 0.0019260000000000943,
+                "cpu_sys_secs": 0.004115000000000091,
+                "effective_cores": 0.9998045407776075,
+                "utilization": 0.015621945949650117,
+                "unattributed_core_secs": 0.006041000000000185,
+                "read_bytes": 0,
+                "write_bytes": 204800
+              }
+            },
+            "writer_busy_secs": 0.027921903
+          },
+          "export": {
+            "mode": "duplicating",
+            "phase_walls": {
+              "fill": 0.0,
+              "finalize": 0.075777353,
+              "levels": 0.8356351,
+              "probe": 0.0,
+              "scan": 0.11853016,
+              "total": 1.050040687
+            },
+            "stage_secs": {
+              "band_read": 0.324902459,
+              "checkpoint": 0.0,
+              "clip": 0.468966579,
+              "decode": 0.871695174,
+              "encode": 5.991503217,
+              "fill_encode": 0.0,
+              "fill_seed": 0.0,
+              "fill_simplify": 0.0,
+              "fill_squares": 0.0,
+              "fill_union": 0.0,
+              "scan_decode": 0.018741846,
+              "scan_read": 0.070565068,
+              "scan_size": 0.096948759,
+              "spill_read": 0.0,
+              "spill_write": 0.0,
+              "spool_write": 0.01831622
+            },
+            "true_peak_mib": 2169.15625,
+            "true_anon_peak_mib": 2150.62109375,
+            "tiles": 851,
+            "threads": 64,
+            "phases": {
+              "finalize": {
+                "cpu_user_secs": 0.0013210000000043465,
+                "cpu_sys_secs": 0.02152700000000074,
+                "effective_cores": 0.2705803550704576,
+                "utilization": 0.0042278180479759,
+                "unattributed_core_secs": 0.022848000000005086,
+                "read_bytes": 0,
+                "write_bytes": 57344
+              },
+              "levels": {
+                "cpu_user_secs": 21.531872,
+                "cpu_sys_secs": 3.471202,
+                "effective_cores": 29.75027979613302,
+                "utilization": 0.46484812181457846,
+                "unattributed_core_secs": 17.327690350999998,
+                "read_bytes": 0,
+                "write_bytes": 61599744
+              },
+              "scan": {
+                "cpu_user_secs": 4.520826,
+                "cpu_sys_secs": 1.0770229999999998,
+                "effective_cores": 45.15648612657395,
+                "utilization": 0.705570095727718,
+                "unattributed_core_secs": 5.411593326999999,
+                "read_bytes": 0,
+                "write_bytes": 0
+              }
+            },
+            "serial_secs": {
+              "finalize": 0.075777353,
+              "group_commit_wait": 0.015884021,
+              "spool_write": 0.01831622
+            },
+            "levels": [
+              {
+                "zoom": 0,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 1,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 2,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 3,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 4,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 5,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 6,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 7,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 8,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 9,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 10,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 11,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 12,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 13,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 14,
+                "wave_width": 64,
+                "spill_bytes": 0
+              }
+            ]
+          }
+        },
         "wall_all_s": [
-          1.3770762081258,
-          1.4021767498925328
+          1.58,
+          1.57,
+          1.5
         ],
-        "output_bytes": 54408143,
+        "output_bytes": 61654743,
         "per_zoom": {
           "by_zoom": {
             "0": {
               "tiles": 1,
-              "total_bytes": 207,
-              "max_bytes": 207
+              "total_bytes": 220,
+              "max_bytes": 220
             },
             "1": {
               "tiles": 1,
-              "total_bytes": 297,
-              "max_bytes": 297
+              "total_bytes": 286,
+              "max_bytes": 286
             },
             "2": {
               "tiles": 1,
-              "total_bytes": 406,
-              "max_bytes": 406
+              "total_bytes": 369,
+              "max_bytes": 369
             },
             "3": {
               "tiles": 2,
-              "total_bytes": 1319,
-              "max_bytes": 661
+              "total_bytes": 1154,
+              "max_bytes": 582
             },
             "4": {
               "tiles": 2,
-              "total_bytes": 3637,
-              "max_bytes": 1825
+              "total_bytes": 3097,
+              "max_bytes": 1555
             },
             "5": {
               "tiles": 2,
-              "total_bytes": 9160,
-              "max_bytes": 5277
+              "total_bytes": 8068,
+              "max_bytes": 4715
             },
             "6": {
               "tiles": 2,
-              "total_bytes": 28288,
-              "max_bytes": 21407
+              "total_bytes": 26358,
+              "max_bytes": 20026
             },
             "7": {
               "tiles": 2,
-              "total_bytes": 81523,
-              "max_bytes": 79389
+              "total_bytes": 78020,
+              "max_bytes": 75826
             },
             "8": {
               "tiles": 1,
-              "total_bytes": 279816,
-              "max_bytes": 279816
+              "total_bytes": 282467,
+              "max_bytes": 282467
             },
             "9": {
               "tiles": 2,
-              "total_bytes": 461899,
-              "max_bytes": 277417
+              "total_bytes": 676870,
+              "max_bytes": 499527
             },
             "10": {
               "tiles": 6,
-              "total_bytes": 1537353,
-              "max_bytes": 277262
+              "total_bytes": 1996519,
+              "max_bytes": 499132
             },
             "11": {
               "tiles": 16,
-              "total_bytes": 3220667,
-              "max_bytes": 279369
+              "total_bytes": 4455670,
+              "max_bytes": 499970
             },
             "12": {
               "tiles": 50,
-              "total_bytes": 7498321,
-              "max_bytes": 280462
+              "total_bytes": 9209729,
+              "max_bytes": 499961
             },
             "13": {
               "tiles": 160,
-              "total_bytes": 14215071,
-              "max_bytes": 283898
+              "total_bytes": 15662154,
+              "max_bytes": 499912
             },
             "14": {
-              "tiles": 601,
-              "total_bytes": 27053600,
-              "max_bytes": 282806
+              "tiles": 603,
+              "total_bytes": 29237182,
+              "max_bytes": 499976
             }
           },
-          "tiles_total": 849
+          "tiles_total": 851
         },
         "phases": {
-          "convert_wall_s": 0.339197416,
-          "export_wall_s": 1.044629917,
-          "input_features": 597782,
+          "convert_wall_s": 0.40466383,
+          "export_wall_s": 1.050138113,
+          "input_features": 630065,
           "row_groups_read": 13,
           "row_groups_total": 13,
-          "total_tiles": 849,
-          "total_tile_features": 1049891,
-          "oversized_tiles": 53
+          "total_tiles": 851,
+          "total_tile_features": 1256277,
+          "oversized_tiles": 25
         }
       },
       "tylertoo_quality_matched": {
@@ -213,8 +433,10 @@
           "points-nyc-medium",
           "--tile-buffer",
           "8",
-          "--max-tile-size",
+          "--max-compressed-tile-size",
           "500000",
+          "--max-tile-size",
+          "0",
           "--report",
           "<work>/points-nyc-medium.tylertoo-qm.report.json",
           "--force",
@@ -222,131 +444,330 @@
           "--simplify-factor",
           "1.0"
         ],
-        "runs": 2,
-        "wall_median_s": 12.209418145939708,
-        "wall_min_s": 11.248256624909118,
-        "wall_max_s": 13.170579666970298,
-        "peak_rss_bytes": 2212478976,
-        "cpu_pct": 337.4,
+        "runs": 3,
+        "wall_median_s": 18.38,
+        "wall_min_s": 18.3,
+        "wall_max_s": 18.59,
+        "peak_rss_bytes": 3553353728,
+        "cpu_pct": 1509.0,
+        "cpu_s": 276.66,
+        "effective_cores": 15.09,
+        "profile": {
+          "convert": {
+            "phase_walls": {
+              "assign": 0.024846773,
+              "pass1": 0.050236957,
+              "pass2": 0.591493916,
+              "total": 0.699733718,
+              "writer_finish": 0.008353597
+            },
+            "pass1_rows": 630065,
+            "pass2_rows": 9450975,
+            "true_peak_mib": 3383.578125,
+            "true_anon_peak_mib": 3370.04296875,
+            "memory_profile": "auto",
+            "threads": 64,
+            "phases": {
+              "assignment+budget (winner tables)": {
+                "cpu_user_secs": 0.33662400000000003,
+                "cpu_sys_secs": 0.19704099999999997,
+                "effective_cores": 20.09842736533086,
+                "utilization": 0.3140379275832947,
+                "unattributed_core_secs": 0.5336650000000001,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass1 scan": {
+                "cpu_user_secs": 1.44319,
+                "cpu_sys_secs": 0.27131700000000003,
+                "effective_cores": 32.00149485287594,
+                "utilization": 0.5000233570761866,
+                "unattributed_core_secs": 1.578787331,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass2 (output sink)": {
+                "cpu_user_secs": 16.029377,
+                "cpu_sys_secs": 1.2757370000000001,
+                "effective_cores": 28.95983275066244,
+                "utilization": 0.4524973867291006,
+                "unattributed_core_secs": 15.989182397,
+                "read_bytes": 0,
+                "write_bytes": 618934272
+              },
+              "pre-pass2 (winner tables freed)": {
+                "cpu_user_secs": 0.000276000000000165,
+                "cpu_sys_secs": 0.0030060000000000087,
+                "effective_cores": 0.9983109017558572,
+                "utilization": 0.01559860783993527,
+                "unattributed_core_secs": 0.0032820000000001737,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "preflight": {
+                "cpu_user_secs": 0.0002769999999999999,
+                "cpu_sys_secs": 0.0008189999999999998,
+                "effective_cores": 1.6800024525583244,
+                "utilization": 0.026250038321223818,
+                "unattributed_core_secs": 0.0010959999999999998,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "writer.finish": {
+                "cpu_user_secs": 0.0063370000000020354,
+                "cpu_sys_secs": 0.006974999999999731,
+                "effective_cores": 1.000204819586836,
+                "utilization": 0.015628200306044313,
+                "unattributed_core_secs": 0.013312000000001767,
+                "read_bytes": 0,
+                "write_bytes": 1261568
+              }
+            },
+            "writer_busy_secs": 0.027571431
+          },
+          "export": {
+            "mode": "duplicating",
+            "phase_walls": {
+              "fill": 0.0,
+              "finalize": 0.126948797,
+              "levels": 16.478338655,
+              "probe": 0.0,
+              "scan": 0.883357763,
+              "total": 17.524509783
+            },
+            "stage_secs": {
+              "band_read": 2.314105126,
+              "checkpoint": 0.0,
+              "clip": 3.426067222,
+              "decode": 7.106625589,
+              "encode": 41.825484637,
+              "fill_encode": 0.0,
+              "fill_seed": 0.0,
+              "fill_simplify": 0.0,
+              "fill_squares": 0.0,
+              "fill_union": 0.0,
+              "scan_decode": 0.144019471,
+              "scan_read": 0.566613058,
+              "scan_size": 0.6879629,
+              "spill_read": 0.0,
+              "spill_write": 0.0,
+              "spool_write": 0.02711482
+            },
+            "true_peak_mib": 3384.4140625,
+            "true_anon_peak_mib": 3370.50390625,
+            "tiles": 851,
+            "threads": 64,
+            "phases": {
+              "finalize": {
+                "cpu_user_secs": 0.0,
+                "cpu_sys_secs": 0.03514300000000503,
+                "effective_cores": 0.24748945006063208,
+                "utilization": 0.0038670226571973763,
+                "unattributed_core_secs": 0.03514300000000503,
+                "read_bytes": 0,
+                "write_bytes": 57344
+              },
+              "levels": {
+                "cpu_user_secs": 179.98760199999998,
+                "cpu_sys_secs": 34.926347,
+                "effective_cores": 13.035595524160705,
+                "utilization": 0.203681180065011,
+                "unattributed_core_secs": 160.21455160599996,
+                "read_bytes": 0,
+                "write_bytes": 83693568
+              },
+              "scan": {
+                "cpu_user_secs": 31.057902999999996,
+                "cpu_sys_secs": 7.848555,
+                "effective_cores": 43.679220268387176,
+                "utilization": 0.6824878166935496,
+                "unattributed_core_secs": 37.507862571,
+                "read_bytes": 0,
+                "write_bytes": 0
+              }
+            },
+            "serial_secs": {
+              "finalize": 0.126948797,
+              "group_commit_wait": 4.589e-06,
+              "spool_write": 0.02711482
+            },
+            "levels": [
+              {
+                "zoom": 0,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 1,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 2,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 3,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 4,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 5,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 6,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 7,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 8,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 9,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 10,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 11,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 12,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 13,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 14,
+                "wave_width": 64,
+                "spill_bytes": 0
+              }
+            ]
+          }
+        },
         "wall_all_s": [
-          11.248256624909118,
-          13.170579666970298
+          18.59,
+          18.3,
+          18.38
         ],
-        "output_bytes": 65841263,
+        "output_bytes": 83748337,
         "per_zoom": {
           "by_zoom": {
             "0": {
               "tiles": 1,
-              "total_bytes": 257856,
-              "max_bytes": 257856
+              "total_bytes": 497667,
+              "max_bytes": 497667
             },
             "1": {
               "tiles": 1,
-              "total_bytes": 259113,
-              "max_bytes": 259113
+              "total_bytes": 498131,
+              "max_bytes": 498131
             },
             "2": {
               "tiles": 1,
-              "total_bytes": 260667,
-              "max_bytes": 260667
+              "total_bytes": 498435,
+              "max_bytes": 498435
             },
             "3": {
               "tiles": 2,
-              "total_bytes": 526863,
-              "max_bytes": 264361
+              "total_bytes": 996745,
+              "max_bytes": 498526
             },
             "4": {
               "tiles": 2,
-              "total_bytes": 532511,
-              "max_bytes": 267410
+              "total_bytes": 998342,
+              "max_bytes": 499831
             },
             "5": {
               "tiles": 2,
-              "total_bytes": 536639,
-              "max_bytes": 269076
+              "total_bytes": 998127,
+              "max_bytes": 499454
             },
             "6": {
               "tiles": 2,
-              "total_bytes": 537987,
-              "max_bytes": 271185
+              "total_bytes": 999209,
+              "max_bytes": 499758
             },
             "7": {
               "tiles": 2,
-              "total_bytes": 533276,
-              "max_bytes": 273589
+              "total_bytes": 786307,
+              "max_bytes": 499640
             },
             "8": {
               "tiles": 1,
-              "total_bytes": 275228,
-              "max_bytes": 275228
+              "total_bytes": 497595,
+              "max_bytes": 497595
             },
             "9": {
               "tiles": 2,
-              "total_bytes": 546523,
-              "max_bytes": 276643
+              "total_bytes": 998681,
+              "max_bytes": 499988
             },
             "10": {
               "tiles": 6,
-              "total_bytes": 1639188,
-              "max_bytes": 277702
+              "total_bytes": 2995925,
+              "max_bytes": 499994
             },
             "11": {
               "tiles": 16,
-              "total_bytes": 3877034,
-              "max_bytes": 276929
+              "total_bytes": 6228282,
+              "max_bytes": 499841
             },
             "12": {
               "tiles": 50,
-              "total_bytes": 9654519,
-              "max_bytes": 276843
+              "total_bytes": 14248647,
+              "max_bytes": 499952
             },
             "13": {
               "tiles": 160,
-              "total_bytes": 19333679,
-              "max_bytes": 281075
+              "total_bytes": 23252482,
+              "max_bytes": 499902
             },
             "14": {
-              "tiles": 601,
-              "total_bytes": 27053600,
-              "max_bytes": 282806
+              "tiles": 603,
+              "total_bytes": 29237182,
+              "max_bytes": 499976
             }
           },
-          "tiles_total": 849
+          "tiles_total": 851
         },
         "phases": {
-          "convert_wall_s": 1.3688959170000001,
-          "export_wall_s": 11.762463083,
-          "input_features": 597782,
+          "convert_wall_s": 0.699899985,
+          "export_wall_s": 17.524648159,
+          "input_features": 630065,
           "row_groups_read": 13,
           "row_groups_total": 13,
-          "total_tiles": 849,
-          "total_tile_features": 1289350,
-          "oversized_tiles": 97
+          "total_tiles": 851,
+          "total_tile_features": 1739122,
+          "oversized_tiles": 68
         }
       },
       "convert_fgb_candidates": {
-        "ogr2ogr": {
-          "argv": [
-            "ogr2ogr",
-            "-f",
-            "FlatGeobuf",
-            "<work>/points-nyc-medium.ogr.fgb",
-            "<repo>/corpus/data/gpio/points-nyc-medium.parquet"
-          ],
-          "runs": 2,
-          "wall_median_s": 0.4682245618896559,
-          "wall_min_s": 0.4654595828615129,
-          "wall_max_s": 0.4709895409177989,
-          "peak_rss_bytes": 342867968,
-          "cpu_pct": 112.0,
-          "wall_all_s": [
-            0.4654595828615129,
-            0.4709895409177989
-          ],
-          "output_bytes": 115257168,
-          "tool": "ogr2ogr",
-          "path": "<work>/points-nyc-medium.ogr.fgb"
-        },
         "gpio": {
           "argv": [
             "gpio",
@@ -356,42 +777,51 @@
             "<work>/points-nyc-medium.gpio.fgb",
             "--overwrite"
           ],
-          "runs": 2,
-          "wall_median_s": 0.7832923125242814,
-          "wall_min_s": 0.7651785409543663,
-          "wall_max_s": 0.8014060840941966,
-          "peak_rss_bytes": 334266368,
-          "cpu_pct": 138.8,
+          "runs": 3,
+          "wall_median_s": 1.75,
+          "wall_min_s": 1.75,
+          "wall_max_s": 1.75,
+          "peak_rss_bytes": 347717632,
+          "cpu_pct": 427.0,
+          "cpu_s": 7.48,
+          "effective_cores": 4.27,
+          "profile": {},
           "wall_all_s": [
-            0.8014060840941966,
-            0.7651785409543663
+            1.75,
+            1.75,
+            1.75
           ],
-          "output_bytes": 123618272,
+          "output_bytes": 130318432,
           "tool": "gpio",
           "path": "<work>/points-nyc-medium.gpio.fgb"
         }
       },
       "convert_fgb": {
         "argv": [
-          "ogr2ogr",
-          "-f",
-          "FlatGeobuf",
-          "<work>/points-nyc-medium.ogr.fgb",
-          "<repo>/corpus/data/gpio/points-nyc-medium.parquet"
+          "gpio",
+          "convert",
+          "flatgeobuf",
+          "<repo>/corpus/data/gpio/points-nyc-medium.parquet",
+          "<work>/points-nyc-medium.gpio.fgb",
+          "--overwrite"
         ],
-        "runs": 2,
-        "wall_median_s": 0.4682245618896559,
-        "wall_min_s": 0.4654595828615129,
-        "wall_max_s": 0.4709895409177989,
-        "peak_rss_bytes": 342867968,
-        "cpu_pct": 112.0,
+        "runs": 3,
+        "wall_median_s": 1.75,
+        "wall_min_s": 1.75,
+        "wall_max_s": 1.75,
+        "peak_rss_bytes": 347717632,
+        "cpu_pct": 427.0,
+        "cpu_s": 7.48,
+        "effective_cores": 4.27,
+        "profile": {},
         "wall_all_s": [
-          0.4654595828615129,
-          0.4709895409177989
+          1.75,
+          1.75,
+          1.75
         ],
-        "output_bytes": 115257168,
-        "tool": "ogr2ogr",
-        "path": "<work>/points-nyc-medium.ogr.fgb"
+        "output_bytes": 130318432,
+        "tool": "gpio",
+        "path": "<work>/points-nyc-medium.gpio.fgb"
       },
       "tippecanoe_fgb": {
         "argv": [
@@ -413,572 +843,134 @@
           "--quiet",
           "--drop-densest-as-needed",
           "--extend-zooms-if-still-dropping",
-          "<work>/points-nyc-medium.ogr.fgb"
+          "<work>/points-nyc-medium.tippecanoe-input.fgb"
         ],
-        "runs": 2,
-        "wall_median_s": 29.563803270924836,
-        "wall_min_s": 28.942129666917026,
-        "wall_max_s": 30.185476874932647,
-        "peak_rss_bytes": 543899648,
-        "cpu_pct": 228.9,
+        "runs": 3,
+        "wall_median_s": 40.91,
+        "wall_min_s": 40.9,
+        "wall_max_s": 41.03,
+        "peak_rss_bytes": 1417887744,
+        "cpu_pct": 240.0,
+        "cpu_s": 98.29,
+        "effective_cores": 2.4,
+        "profile": {},
         "wall_all_s": [
-          28.942129666917026,
-          30.185476874932647
+          41.03,
+          40.9,
+          40.91
         ],
-        "output_bytes": 91875121,
+        "output_bytes": 95043771,
         "per_zoom": {
           "by_zoom": {
             "0": {
               "tiles": 1,
-              "total_bytes": 245,
-              "max_bytes": 245
+              "total_bytes": 243,
+              "max_bytes": 243
             },
             "1": {
               "tiles": 1,
-              "total_bytes": 360,
-              "max_bytes": 360
+              "total_bytes": 482,
+              "max_bytes": 482
             },
             "2": {
               "tiles": 1,
-              "total_bytes": 755,
-              "max_bytes": 755
+              "total_bytes": 881,
+              "max_bytes": 881
             },
             "3": {
               "tiles": 2,
-              "total_bytes": 3336,
-              "max_bytes": 1675
+              "total_bytes": 3677,
+              "max_bytes": 1844
             },
             "4": {
               "tiles": 2,
-              "total_bytes": 7816,
-              "max_bytes": 3909
+              "total_bytes": 8132,
+              "max_bytes": 4068
             },
             "5": {
               "tiles": 2,
-              "total_bytes": 15626,
-              "max_bytes": 9182
+              "total_bytes": 16306,
+              "max_bytes": 9623
             },
             "6": {
               "tiles": 2,
-              "total_bytes": 24001,
-              "max_bytes": 21775
+              "total_bytes": 25764,
+              "max_bytes": 23217
             },
             "7": {
               "tiles": 1,
-              "total_bytes": 51891,
-              "max_bytes": 51891
+              "total_bytes": 54706,
+              "max_bytes": 54706
             },
             "8": {
               "tiles": 1,
-              "total_bytes": 120908,
-              "max_bytes": 120908
+              "total_bytes": 128627,
+              "max_bytes": 128627
             },
             "9": {
               "tiles": 2,
-              "total_bytes": 308839,
-              "max_bytes": 276959
+              "total_bytes": 327258,
+              "max_bytes": 294355
             },
             "10": {
               "tiles": 6,
-              "total_bytes": 848839,
-              "max_bytes": 472968
+              "total_bytes": 691109,
+              "max_bytes": 369835
             },
             "11": {
               "tiles": 16,
-              "total_bytes": 1281654,
-              "max_bytes": 414893
+              "total_bytes": 1266657,
+              "max_bytes": 414290
             },
             "12": {
               "tiles": 49,
-              "total_bytes": 2578621,
-              "max_bytes": 421631
+              "total_bytes": 2581603,
+              "max_bytes": 422386
             },
             "13": {
               "tiles": 160,
-              "total_bytes": 6731654,
-              "max_bytes": 431374
+              "total_bytes": 6807888,
+              "max_bytes": 431971
             },
             "14": {
-              "tiles": 601,
-              "total_bytes": 17092042,
-              "max_bytes": 416864
+              "tiles": 603,
+              "total_bytes": 17450326,
+              "max_bytes": 417008
             },
             "15": {
-              "tiles": 2132,
-              "total_bytes": 26131059,
-              "max_bytes": 436863
+              "tiles": 2146,
+              "total_bytes": 27062847,
+              "max_bytes": 437649
             },
             "16": {
-              "tiles": 7507,
-              "total_bytes": 36649483,
-              "max_bytes": 334101
+              "tiles": 7548,
+              "total_bytes": 38589950,
+              "max_bytes": 347135
             }
           },
-          "tiles_total": 10486
+          "tiles_total": 10543
         }
       },
       "tippecanoe_e2e": {
-        "wall_median_s": 30.032027832814492,
-        "peak_rss_bytes": 543899648,
-        "converter": "ogr2ogr",
-        "note": "parquet->fgb (fastest available converter) then fgb->pmtiles, run as two processes; peak RSS is the larger of the two stages, not their sum"
+        "wall_median_s": 42.66,
+        "peak_rss_bytes": 1417887744,
+        "converter": "gpio",
+        "note": "parquet->fgb (the converter with the fastest warm-up) then fgb->pmtiles, run as two processes; peak RSS is the larger of the two stages, not their sum"
       },
       "ratios": {
-        "e2e_speedup": 21.61158288681141,
-        "tiles_only_speedup": 21.274640140712105,
-        "input_conversion_share_of_tippecanoe_e2e": 0.015590840701674177,
-        "archive_size_ratio_tylertoo_over_tippecanoe": 0.5921966949028562,
-        "e2e_speedup_quality_matched": 2.459742755456513,
-        "tiles_only_speedup_quality_matched": 2.421393297989094,
-        "archive_size_ratio_quality_matched": 0.7166386534609298
-      }
-    },
-    "lines-portland-medium": {
-      "input": "<repo>/corpus/data/gpio/lines-portland-medium.parquet",
-      "input_bytes": 37572728,
-      "note": "corpus line/medium: Portland, OR metro (~280,000 features)",
-      "layer": "lines-portland-medium",
-      "min_zoom": 0,
-      "max_zoom": 14,
-      "tippecanoe_dataset_flags": [
-        "--simplification=10",
-        "--drop-densest-as-needed"
-      ],
-      "tylertoo": {
-        "argv": [
-          "<repo>/target/release/tylertoo",
-          "tiles",
-          "<repo>/corpus/data/gpio/lines-portland-medium.parquet",
-          "<work>/lines-portland-medium.tylertoo.pmtiles",
-          "--min-zoom",
-          "0",
-          "--max-zoom",
-          "14",
-          "--layer-name",
-          "lines-portland-medium",
-          "--tile-buffer",
-          "8",
-          "--max-tile-size",
-          "500000",
-          "--report",
-          "<work>/lines-portland-medium.tylertoo.report.json",
-          "--force"
-        ],
-        "runs": 2,
-        "wall_median_s": 1.3992231249576434,
-        "wall_min_s": 1.376112625002861,
-        "wall_max_s": 1.4223336249124259,
-        "peak_rss_bytes": 1689387008,
-        "cpu_pct": 669.7,
-        "wall_all_s": [
-          1.4223336249124259,
-          1.376112625002861
-        ],
-        "output_bytes": 36197609,
-        "per_zoom": {
-          "by_zoom": {
-            "2": {
-              "tiles": 1,
-              "total_bytes": 416,
-              "max_bytes": 416
-            },
-            "3": {
-              "tiles": 1,
-              "total_bytes": 1253,
-              "max_bytes": 1253
-            },
-            "4": {
-              "tiles": 1,
-              "total_bytes": 5752,
-              "max_bytes": 5752
-            },
-            "5": {
-              "tiles": 1,
-              "total_bytes": 20767,
-              "max_bytes": 20767
-            },
-            "6": {
-              "tiles": 1,
-              "total_bytes": 63656,
-              "max_bytes": 63656
-            },
-            "7": {
-              "tiles": 1,
-              "total_bytes": 200758,
-              "max_bytes": 200758
-            },
-            "8": {
-              "tiles": 2,
-              "total_bytes": 302889,
-              "max_bytes": 256477
-            },
-            "9": {
-              "tiles": 4,
-              "total_bytes": 565577,
-              "max_bytes": 257078
-            },
-            "10": {
-              "tiles": 9,
-              "total_bytes": 1098519,
-              "max_bytes": 257334
-            },
-            "11": {
-              "tiles": 25,
-              "total_bytes": 2510043,
-              "max_bytes": 251943
-            },
-            "12": {
-              "tiles": 77,
-              "total_bytes": 4878903,
-              "max_bytes": 189274
-            },
-            "13": {
-              "tiles": 264,
-              "total_bytes": 8789107,
-              "max_bytes": 121837
-            },
-            "14": {
-              "tiles": 942,
-              "total_bytes": 17743375,
-              "max_bytes": 134003
-            }
-          },
-          "tiles_total": 1329
-        },
-        "phases": {
-          "convert_wall_s": 0.731401,
-          "export_wall_s": 0.6064,
-          "input_features": 301609,
-          "row_groups_read": 7,
-          "row_groups_total": 7,
-          "total_tiles": 1329,
-          "total_tile_features": 858441,
-          "oversized_tiles": 10
-        }
-      },
-      "tylertoo_quality_matched": {
-        "argv": [
-          "<repo>/target/release/tylertoo",
-          "tiles",
-          "<repo>/corpus/data/gpio/lines-portland-medium.parquet",
-          "<work>/lines-portland-medium.tylertoo-qm.pmtiles",
-          "--min-zoom",
-          "0",
-          "--max-zoom",
-          "14",
-          "--layer-name",
-          "lines-portland-medium",
-          "--tile-buffer",
-          "8",
-          "--max-tile-size",
-          "500000",
-          "--report",
-          "<work>/lines-portland-medium.tylertoo-qm.report.json",
-          "--force",
-          "--verbatim",
-          "--simplify-factor",
-          "1.0"
-        ],
-        "runs": 2,
-        "wall_median_s": 1.7083085420308635,
-        "wall_min_s": 1.6563460000324994,
-        "wall_max_s": 1.7602710840292275,
-        "peak_rss_bytes": 823705600,
-        "cpu_pct": 550.9,
-        "wall_all_s": [
-          1.6563460000324994,
-          1.7602710840292275
-        ],
-        "output_bytes": 46899663,
-        "per_zoom": {
-          "by_zoom": {
-            "1": {
-              "tiles": 1,
-              "total_bytes": 293,
-              "max_bytes": 293
-            },
-            "2": {
-              "tiles": 1,
-              "total_bytes": 988,
-              "max_bytes": 988
-            },
-            "3": {
-              "tiles": 1,
-              "total_bytes": 2773,
-              "max_bytes": 2773
-            },
-            "4": {
-              "tiles": 1,
-              "total_bytes": 10270,
-              "max_bytes": 10270
-            },
-            "5": {
-              "tiles": 1,
-              "total_bytes": 42642,
-              "max_bytes": 42642
-            },
-            "6": {
-              "tiles": 1,
-              "total_bytes": 169125,
-              "max_bytes": 169125
-            },
-            "7": {
-              "tiles": 1,
-              "total_bytes": 238316,
-              "max_bytes": 238316
-            },
-            "8": {
-              "tiles": 2,
-              "total_bytes": 366303,
-              "max_bytes": 251591
-            },
-            "9": {
-              "tiles": 4,
-              "total_bytes": 704950,
-              "max_bytes": 263794
-            },
-            "10": {
-              "tiles": 9,
-              "total_bytes": 1745479,
-              "max_bytes": 275404
-            },
-            "11": {
-              "tiles": 25,
-              "total_bytes": 3681956,
-              "max_bytes": 275772
-            },
-            "12": {
-              "tiles": 77,
-              "total_bytes": 9036836,
-              "max_bytes": 269972
-            },
-            "13": {
-              "tiles": 265,
-              "total_bytes": 13173676,
-              "max_bytes": 255698
-            },
-            "14": {
-              "tiles": 942,
-              "total_bytes": 17709477,
-              "max_bytes": 133698
-            }
-          },
-          "tiles_total": 1331
-        },
-        "phases": {
-          "convert_wall_s": 0.441660583,
-          "export_wall_s": 1.302816625,
-          "input_features": 301609,
-          "row_groups_read": 7,
-          "row_groups_total": 7,
-          "total_tiles": 1331,
-          "total_tile_features": 1173550,
-          "oversized_tiles": 41
-        }
-      },
-      "convert_fgb_candidates": {
-        "ogr2ogr": {
-          "argv": [
-            "ogr2ogr",
-            "-f",
-            "FlatGeobuf",
-            "<work>/lines-portland-medium.ogr.fgb",
-            "<repo>/corpus/data/gpio/lines-portland-medium.parquet"
-          ],
-          "runs": 2,
-          "wall_median_s": 0.42185970849823207,
-          "wall_min_s": 0.4060219170060009,
-          "wall_max_s": 0.43769749999046326,
-          "peak_rss_bytes": 328876032,
-          "cpu_pct": 91.5,
-          "wall_all_s": [
-            0.4060219170060009,
-            0.43769749999046326
-          ],
-          "output_bytes": 84889456,
-          "tool": "ogr2ogr",
-          "path": "<work>/lines-portland-medium.ogr.fgb"
-        },
-        "gpio": {
-          "argv": [
-            "gpio",
-            "convert",
-            "flatgeobuf",
-            "<repo>/corpus/data/gpio/lines-portland-medium.parquet",
-            "<work>/lines-portland-medium.gpio.fgb",
-            "--overwrite"
-          ],
-          "runs": 2,
-          "wall_median_s": 0.6619203538866714,
-          "wall_min_s": 0.659289457835257,
-          "wall_max_s": 0.6645512499380857,
-          "peak_rss_bytes": 300548096,
-          "cpu_pct": 138.2,
-          "wall_all_s": [
-            0.6645512499380857,
-            0.659289457835257
-          ],
-          "output_bytes": 89062456,
-          "tool": "gpio",
-          "path": "<work>/lines-portland-medium.gpio.fgb"
-        }
-      },
-      "convert_fgb": {
-        "argv": [
-          "ogr2ogr",
-          "-f",
-          "FlatGeobuf",
-          "<work>/lines-portland-medium.ogr.fgb",
-          "<repo>/corpus/data/gpio/lines-portland-medium.parquet"
-        ],
-        "runs": 2,
-        "wall_median_s": 0.42185970849823207,
-        "wall_min_s": 0.4060219170060009,
-        "wall_max_s": 0.43769749999046326,
-        "peak_rss_bytes": 328876032,
-        "cpu_pct": 91.5,
-        "wall_all_s": [
-          0.4060219170060009,
-          0.43769749999046326
-        ],
-        "output_bytes": 84889456,
-        "tool": "ogr2ogr",
-        "path": "<work>/lines-portland-medium.ogr.fgb"
-      },
-      "tippecanoe_fgb": {
-        "argv": [
-          "<repo>/.tools/tippecanoe-2.79.0/bin/tippecanoe",
-          "-o",
-          "<work>/lines-portland-medium.tippecanoe-fgb.pmtiles",
-          "-f",
-          "-Z",
-          "0",
-          "-z",
-          "14",
-          "-l",
-          "lines-portland-medium",
-          "-b",
-          "8",
-          "--maximum-tile-bytes",
-          "500000",
-          "--drop-fraction-as-needed",
-          "--quiet",
-          "--simplification=10",
-          "--drop-densest-as-needed",
-          "<work>/lines-portland-medium.ogr.fgb"
-        ],
-        "runs": 2,
-        "wall_median_s": 27.878066291566938,
-        "wall_min_s": 27.59163666702807,
-        "wall_max_s": 28.164495916105807,
-        "peak_rss_bytes": 684130304,
-        "cpu_pct": 164.8,
-        "wall_all_s": [
-          28.164495916105807,
-          27.59163666702807
-        ],
-        "output_bytes": 45979234,
-        "per_zoom": {
-          "by_zoom": {
-            "0": {
-              "tiles": 1,
-              "total_bytes": 144404,
-              "max_bytes": 144404
-            },
-            "1": {
-              "tiles": 1,
-              "total_bytes": 269754,
-              "max_bytes": 269754
-            },
-            "2": {
-              "tiles": 1,
-              "total_bytes": 478888,
-              "max_bytes": 478888
-            },
-            "3": {
-              "tiles": 1,
-              "total_bytes": 450263,
-              "max_bytes": 450263
-            },
-            "4": {
-              "tiles": 1,
-              "total_bytes": 431193,
-              "max_bytes": 431193
-            },
-            "5": {
-              "tiles": 1,
-              "total_bytes": 407325,
-              "max_bytes": 407325
-            },
-            "6": {
-              "tiles": 1,
-              "total_bytes": 405902,
-              "max_bytes": 405902
-            },
-            "7": {
-              "tiles": 1,
-              "total_bytes": 462087,
-              "max_bytes": 462087
-            },
-            "8": {
-              "tiles": 2,
-              "total_bytes": 489746,
-              "max_bytes": 438960
-            },
-            "9": {
-              "tiles": 4,
-              "total_bytes": 684185,
-              "max_bytes": 445124
-            },
-            "10": {
-              "tiles": 9,
-              "total_bytes": 1360618,
-              "max_bytes": 446105
-            },
-            "11": {
-              "tiles": 25,
-              "total_bytes": 3329372,
-              "max_bytes": 428686
-            },
-            "12": {
-              "tiles": 77,
-              "total_bytes": 8814808,
-              "max_bytes": 409047
-            },
-            "13": {
-              "tiles": 264,
-              "total_bytes": 13277607,
-              "max_bytes": 272300
-            },
-            "14": {
-              "tiles": 942,
-              "total_bytes": 14966531,
-              "max_bytes": 115912
-            }
-          },
-          "tiles_total": 1331
-        }
-      },
-      "tippecanoe_e2e": {
-        "wall_median_s": 28.29992600006517,
-        "peak_rss_bytes": 684130304,
-        "converter": "ogr2ogr",
-        "note": "parquet->fgb (fastest available converter) then fgb->pmtiles, run as two processes; peak RSS is the larger of the two stages, not their sum"
-      },
-      "ratios": {
-        "e2e_speedup": 20.225456180136995,
-        "tiles_only_speedup": 19.923960513739257,
-        "input_conversion_share_of_tippecanoe_e2e": 0.014906742459229773,
-        "archive_size_ratio_tylertoo_over_tippecanoe": 0.7872599399981305,
-        "e2e_speedup_quality_matched": 16.566050747730724,
-        "tiles_only_speedup_quality_matched": 16.31910489566777,
-        "archive_size_ratio_quality_matched": 1.0200183630723383
+        "e2e_speedup": 27.17197452229299,
+        "tiles_only_speedup": 26.057324840764327,
+        "input_conversion_share_of_tippecanoe_e2e": 0.041022034692920775,
+        "archive_size_ratio_tylertoo_over_tippecanoe": 0.6486984086521567,
+        "e2e_speedup_quality_matched": 2.321001088139282,
+        "tiles_only_speedup_quality_matched": 2.2257889009793255,
+        "archive_size_ratio_quality_matched": 0.8811554520495615
       }
     },
     "polygons-portland-medium": {
       "input": "<repo>/corpus/data/gpio/polygons-portland-medium.parquet",
-      "input_bytes": 115000074,
-      "note": "corpus polygon/medium: Portland, OR metro (~650,000 features)",
+      "input_bytes": 115000084,
+      "note": "corpus polygon/medium: Portland, OR metro (~813,456 features)",
       "layer": "polygons-portland-medium",
       "min_zoom": 0,
       "max_zoom": 14,
@@ -1001,77 +993,315 @@
           "polygons-portland-medium",
           "--tile-buffer",
           "8",
-          "--max-tile-size",
+          "--max-compressed-tile-size",
           "500000",
+          "--max-tile-size",
+          "0",
           "--report",
           "<work>/polygons-portland-medium.tylertoo.report.json",
           "--force"
         ],
-        "runs": 2,
-        "wall_median_s": 2.6875744379358366,
-        "wall_min_s": 2.6312629589810967,
-        "wall_max_s": 2.7438859168905765,
-        "peak_rss_bytes": 1047773184,
-        "cpu_pct": 625.8,
+        "runs": 3,
+        "wall_median_s": 3.68,
+        "wall_min_s": 3.66,
+        "wall_max_s": 3.77,
+        "peak_rss_bytes": 3284123648,
+        "cpu_pct": 2639.0,
+        "cpu_s": 98.07,
+        "effective_cores": 26.39,
+        "profile": {
+          "convert": {
+            "phase_walls": {
+              "assign": 0.301386265,
+              "pass1": 0.072348772,
+              "pass2": 0.481694921,
+              "total": 0.879322444,
+              "writer_finish": 0.003423056
+            },
+            "pass1_rows": 813456,
+            "pass2_rows": 3032121,
+            "true_peak_mib": 2984.64453125,
+            "true_anon_peak_mib": 2970.609375,
+            "memory_profile": "auto",
+            "threads": 64,
+            "phases": {
+              "assignment+budget (winner tables)": {
+                "cpu_user_secs": 0.6403809999999996,
+                "cpu_sys_secs": 0.080407,
+                "effective_cores": 2.379148719550415,
+                "utilization": 0.037174198742975235,
+                "unattributed_core_secs": 0.7207879999999997,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass1 scan": {
+                "cpu_user_secs": 2.212632,
+                "cpu_sys_secs": 0.38726499999999997,
+                "effective_cores": 34.35031468777234,
+                "utilization": 0.5367236669964428,
+                "unattributed_core_secs": 2.0838124580000006,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass2 (output sink)": {
+                "cpu_user_secs": 10.311506000000001,
+                "cpu_sys_secs": 0.802324,
+                "effective_cores": 22.819806363158264,
+                "utilization": 0.3565594744243479,
+                "unattributed_core_secs": 9.322951622000001,
+                "read_bytes": 0,
+                "write_bytes": 333623296
+              },
+              "pre-pass2 (winner tables freed)": {
+                "cpu_user_secs": 0.00011399999999994748,
+                "cpu_sys_secs": 0.0031100000000000017,
+                "effective_cores": 0.9971844386027754,
+                "utilization": 0.015581006853168365,
+                "unattributed_core_secs": 0.003223999999999949,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "preflight": {
+                "cpu_user_secs": 0.0,
+                "cpu_sys_secs": 0.0010760000000000001,
+                "effective_cores": 1.7173026219189103,
+                "utilization": 0.026832853467482973,
+                "unattributed_core_secs": 0.0010760000000000001,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "writer.finish": {
+                "cpu_user_secs": 0.003957999999999018,
+                "cpu_sys_secs": 0.0040079999999997895,
+                "effective_cores": 1.0004641872501738,
+                "utilization": 0.015632252925783966,
+                "unattributed_core_secs": 0.007965999999998807,
+                "read_bytes": 0,
+                "write_bytes": 462848
+              }
+            },
+            "writer_busy_secs": 0.052366026
+          },
+          "export": {
+            "mode": "duplicating",
+            "phase_walls": {
+              "fill": 0.0,
+              "finalize": 0.123699304,
+              "levels": 2.251419174,
+              "probe": 0.0,
+              "scan": 0.283897825,
+              "total": 2.710687869
+            },
+            "stage_secs": {
+              "band_read": 1.030400269,
+              "checkpoint": 0.0,
+              "clip": 2.595284797,
+              "decode": 2.651091434,
+              "encode": 17.604279544,
+              "fill_encode": 0.0,
+              "fill_seed": 0.0,
+              "fill_simplify": 0.0,
+              "fill_squares": 0.0,
+              "fill_union": 0.0,
+              "scan_decode": 0.044728643,
+              "scan_read": 0.175354559,
+              "scan_size": 0.217691569,
+              "spill_read": 0.0,
+              "spill_write": 0.0,
+              "spool_write": 0.031432943
+            },
+            "true_peak_mib": 2984.93359375,
+            "true_anon_peak_mib": 2970.8828125,
+            "tiles": 1214,
+            "threads": 64,
+            "phases": {
+              "finalize": {
+                "cpu_user_secs": 0.0006910000000033278,
+                "cpu_sys_secs": 0.07329099999999755,
+                "effective_cores": 0.47781376519055924,
+                "utilization": 0.007465840081102488,
+                "unattributed_core_secs": 0.07398200000000088,
+                "read_bytes": 0,
+                "write_bytes": 81920
+              },
+              "levels": {
+                "cpu_user_secs": 57.14334100000001,
+                "cpu_sys_secs": 13.552510000000002,
+                "effective_cores": 31.25837712599003,
+                "utilization": 0.4884121425935942,
+                "unattributed_core_secs": 46.78336201300001,
+                "read_bytes": 0,
+                "write_bytes": 103792640
+              },
+              "scan": {
+                "cpu_user_secs": 10.254076,
+                "cpu_sys_secs": 2.508906,
+                "effective_cores": 43.70239681122099,
+                "utilization": 0.682849950175328,
+                "unattributed_core_secs": 12.325207229,
+                "read_bytes": 0,
+                "write_bytes": 0
+              }
+            },
+            "serial_secs": {
+              "finalize": 0.123699304,
+              "group_commit_wait": 0.010483273,
+              "spool_write": 0.031432943
+            },
+            "levels": [
+              {
+                "zoom": 2,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 3,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 4,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 5,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 6,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 7,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 8,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 9,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 10,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 11,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 12,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 13,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 14,
+                "wave_width": 64,
+                "spill_bytes": 0
+              }
+            ]
+          }
+        },
         "wall_all_s": [
-          2.6312629589810967,
-          2.7438859168905765
+          3.66,
+          3.77,
+          3.68
         ],
-        "output_bytes": 81981844,
+        "output_bytes": 103871333,
         "per_zoom": {
           "by_zoom": {
+            "2": {
+              "tiles": 1,
+              "total_bytes": 193,
+              "max_bytes": 193
+            },
+            "3": {
+              "tiles": 1,
+              "total_bytes": 563,
+              "max_bytes": 563
+            },
+            "4": {
+              "tiles": 1,
+              "total_bytes": 1823,
+              "max_bytes": 1823
+            },
+            "5": {
+              "tiles": 1,
+              "total_bytes": 6652,
+              "max_bytes": 6652
+            },
+            "6": {
+              "tiles": 1,
+              "total_bytes": 24856,
+              "max_bytes": 24856
+            },
             "7": {
               "tiles": 1,
-              "total_bytes": 154,
-              "max_bytes": 154
+              "total_bytes": 92557,
+              "max_bytes": 92557
             },
             "8": {
-              "tiles": 1,
-              "total_bytes": 4070,
-              "max_bytes": 4070
+              "tiles": 2,
+              "total_bytes": 370968,
+              "max_bytes": 355684
             },
             "9": {
               "tiles": 4,
-              "total_bytes": 57514,
-              "max_bytes": 39259
+              "total_bytes": 918275,
+              "max_bytes": 499570
             },
             "10": {
               "tiles": 9,
-              "total_bytes": 334508,
-              "max_bytes": 125092
+              "total_bytes": 2047129,
+              "max_bytes": 490655
             },
             "11": {
               "tiles": 20,
-              "total_bytes": 1776826,
-              "max_bytes": 278825
+              "total_bytes": 6054268,
+              "max_bytes": 497365
             },
             "12": {
               "tiles": 63,
-              "total_bytes": 10363160,
-              "max_bytes": 285322
+              "total_bytes": 17655501,
+              "max_bytes": 494004
             },
             "13": {
               "tiles": 236,
-              "total_bytes": 24076545,
-              "max_bytes": 276684
+              "total_bytes": 33901175,
+              "max_bytes": 498016
             },
             "14": {
               "tiles": 874,
-              "total_bytes": 45352476,
-              "max_bytes": 274330
+              "total_bytes": 42780781,
+              "max_bytes": 271218
             }
           },
-          "tiles_total": 1208
+          "tiles_total": 1214
         },
         "phases": {
-          "convert_wall_s": 0.783446875,
-          "export_wall_s": 1.942248542,
+          "convert_wall_s": 0.879475739,
+          "export_wall_s": 2.710794804,
           "input_features": 813456,
           "row_groups_read": 17,
           "row_groups_total": 17,
-          "total_tiles": 1208,
-          "total_tile_features": 1828186,
-          "oversized_tiles": 33
+          "total_tiles": 1214,
+          "total_tile_features": 2456008,
+          "oversized_tiles": 44
         }
       },
       "tylertoo_quality_matched": {
@@ -1088,8 +1318,10 @@
           "polygons-portland-medium",
           "--tile-buffer",
           "8",
-          "--max-tile-size",
+          "--max-compressed-tile-size",
           "500000",
+          "--max-tile-size",
+          "0",
           "--report",
           "<work>/polygons-portland-medium.tylertoo-qm.report.json",
           "--force",
@@ -1097,86 +1329,330 @@
           "--simplify-factor",
           "1.0"
         ],
-        "runs": 2,
-        "wall_median_s": 3.447796249995008,
-        "wall_min_s": 3.370910958154127,
-        "wall_max_s": 3.524681541835889,
-        "peak_rss_bytes": 971603968,
-        "cpu_pct": 613.2,
+        "runs": 3,
+        "wall_median_s": 6.17,
+        "wall_min_s": 6.12,
+        "wall_max_s": 6.24,
+        "peak_rss_bytes": 3774746624,
+        "cpu_pct": 2785.0,
+        "cpu_s": 173.72,
+        "effective_cores": 27.85,
+        "profile": {
+          "convert": {
+            "phase_walls": {
+              "assign": 0.028457866,
+              "pass1": 0.072356468,
+              "pass2": 0.691439965,
+              "total": 0.819011082,
+              "writer_finish": 0.004846163
+            },
+            "pass1_rows": 813456,
+            "pass2_rows": 4887922,
+            "true_peak_mib": 3593.0078125,
+            "true_anon_peak_mib": 3586.73828125,
+            "memory_profile": "auto",
+            "threads": 64,
+            "phases": {
+              "assignment+budget (winner tables)": {
+                "cpu_user_secs": 0.4050119999999997,
+                "cpu_sys_secs": 0.10111600000000004,
+                "effective_cores": 16.770718229481236,
+                "utilization": 0.2620424723356443,
+                "unattributed_core_secs": 0.5061279999999997,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass1 scan": {
+                "cpu_user_secs": 2.255971,
+                "cpu_sys_secs": 0.37491399999999997,
+                "effective_cores": 34.74301681717394,
+                "utilization": 0.5428596377683428,
+                "unattributed_core_secs": 2.112286177,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass2 (output sink)": {
+                "cpu_user_secs": 14.985433,
+                "cpu_sys_secs": 1.0259390000000002,
+                "effective_cores": 22.972203537763697,
+                "utilization": 0.35894068027755777,
+                "unattributed_core_secs": 13.884051976000002,
+                "read_bytes": 0,
+                "write_bytes": 490565632
+              },
+              "pre-pass2 (winner tables freed)": {
+                "cpu_user_secs": 0.0012540000000003104,
+                "cpu_sys_secs": 0.001988999999999963,
+                "effective_cores": 0.9984793433621363,
+                "utilization": 0.01560123974003338,
+                "unattributed_core_secs": 0.0032430000000002734,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "preflight": {
+                "cpu_user_secs": 0.0,
+                "cpu_sys_secs": 0.0011539999999999996,
+                "effective_cores": 1.7049895321916497,
+                "utilization": 0.026640461440494527,
+                "unattributed_core_secs": 0.0011539999999999996,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "writer.finish": {
+                "cpu_user_secs": 0.0036759999999986803,
+                "cpu_sys_secs": 0.005991999999999997,
+                "effective_cores": 1.0006849951692913,
+                "utilization": 0.015635703049520177,
+                "unattributed_core_secs": 0.009667999999998678,
+                "read_bytes": 0,
+                "write_bytes": 659456
+              }
+            },
+            "writer_busy_secs": 0.052373019
+          },
+          "export": {
+            "mode": "duplicating",
+            "phase_walls": {
+              "fill": 0.0,
+              "finalize": 0.116840658,
+              "levels": 4.580920933,
+              "probe": 0.0,
+              "scan": 0.474824241,
+              "total": 5.215447013
+            },
+            "stage_secs": {
+              "band_read": 1.576891032,
+              "checkpoint": 0.0,
+              "clip": 3.777667438,
+              "decode": 4.362143051,
+              "encode": 24.192414749,
+              "fill_encode": 0.0,
+              "fill_seed": 0.0,
+              "fill_simplify": 0.0,
+              "fill_squares": 0.0,
+              "fill_union": 0.0,
+              "scan_decode": 0.068490352,
+              "scan_read": 0.294553618,
+              "scan_size": 0.35769182,
+              "spill_read": 0.0,
+              "spill_write": 0.0,
+              "spool_write": 0.033753481
+            },
+            "true_peak_mib": 3556.13671875,
+            "true_anon_peak_mib": 3542.32421875,
+            "tiles": 1216,
+            "threads": 64,
+            "phases": {
+              "finalize": {
+                "cpu_user_secs": 0.0,
+                "cpu_sys_secs": 0.03322000000000003,
+                "effective_cores": 0.24648298935341162,
+                "utilization": 0.0038512967086470565,
+                "unattributed_core_secs": 0.03322000000000003,
+                "read_bytes": 0,
+                "write_bytes": 81920
+              },
+              "levels": {
+                "cpu_user_secs": 107.579276,
+                "cpu_sys_secs": 26.023315,
+                "effective_cores": 29.10501373522942,
+                "utilization": 0.4547658396129597,
+                "unattributed_core_secs": 99.659721249,
+                "read_bytes": 0,
+                "write_bytes": 108175360
+              },
+              "scan": {
+                "cpu_user_secs": 16.882639,
+                "cpu_sys_secs": 3.8928259999999995,
+                "effective_cores": 42.6405656501252,
+                "utilization": 0.6662588382832062,
+                "unattributed_core_secs": 20.05472921,
+                "read_bytes": 0,
+                "write_bytes": 0
+              }
+            },
+            "serial_secs": {
+              "finalize": 0.116840658,
+              "group_commit_wait": 0.005007333,
+              "spool_write": 0.033753481
+            },
+            "levels": [
+              {
+                "zoom": 0,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 1,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 2,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 3,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 4,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 5,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 6,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 7,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 8,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 9,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 10,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 11,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 12,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 13,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 14,
+                "wave_width": 64,
+                "spill_bytes": 0
+              }
+            ]
+          }
+        },
         "wall_all_s": [
-          3.370910958154127,
-          3.524681541835889
+          6.24,
+          6.12,
+          6.17
         ],
-        "output_bytes": 88597747,
+        "output_bytes": 108254303,
         "per_zoom": {
           "by_zoom": {
+            "0": {
+              "tiles": 1,
+              "total_bytes": 428764,
+              "max_bytes": 428764
+            },
+            "1": {
+              "tiles": 1,
+              "total_bytes": 429345,
+              "max_bytes": 429345
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 432770,
+              "max_bytes": 432770
+            },
+            "3": {
+              "tiles": 1,
+              "total_bytes": 440499,
+              "max_bytes": 440499
+            },
+            "4": {
+              "tiles": 1,
+              "total_bytes": 452157,
+              "max_bytes": 452157
+            },
+            "5": {
+              "tiles": 1,
+              "total_bytes": 470551,
+              "max_bytes": 470551
+            },
+            "6": {
+              "tiles": 1,
+              "total_bytes": 492606,
+              "max_bytes": 492606
+            },
             "7": {
               "tiles": 1,
-              "total_bytes": 154,
-              "max_bytes": 154
+              "total_bytes": 411927,
+              "max_bytes": 411927
             },
             "8": {
-              "tiles": 1,
-              "total_bytes": 4070,
-              "max_bytes": 4070
+              "tiles": 2,
+              "total_bytes": 702092,
+              "max_bytes": 442279
             },
             "9": {
               "tiles": 4,
-              "total_bytes": 57701,
-              "max_bytes": 39355
+              "total_bytes": 1129490,
+              "max_bytes": 476011
             },
             "10": {
               "tiles": 9,
-              "total_bytes": 335954,
-              "max_bytes": 125581
+              "total_bytes": 2294480,
+              "max_bytes": 483600
             },
             "11": {
               "tiles": 20,
-              "total_bytes": 1795421,
-              "max_bytes": 278933
+              "total_bytes": 5866858,
+              "max_bytes": 499616
             },
             "12": {
               "tiles": 63,
-              "total_bytes": 11525971,
-              "max_bytes": 281973
+              "total_bytes": 17748884,
+              "max_bytes": 495370
             },
             "13": {
               "tiles": 236,
-              "total_bytes": 29509408,
-              "max_bytes": 283810
+              "total_bytes": 34156507,
+              "max_bytes": 487568
             },
             "14": {
               "tiles": 874,
-              "total_bytes": 45352476,
-              "max_bytes": 274330
+              "total_bytes": 42780781,
+              "max_bytes": 271218
             }
           },
-          "tiles_total": 1208
+          "tiles_total": 1216
         },
         "phases": {
-          "convert_wall_s": 0.949994875,
-          "export_wall_s": 2.550830166,
+          "convert_wall_s": 0.819175005,
+          "export_wall_s": 5.215554275,
           "input_features": 813456,
           "row_groups_read": 17,
           "row_groups_total": 17,
-          "total_tiles": 1208,
-          "total_tile_features": 2005589,
-          "oversized_tiles": 84
+          "total_tiles": 1216,
+          "total_tile_features": 2578008,
+          "oversized_tiles": 55
         }
       },
       "convert_fgb_candidates": {
-        "ogr2ogr": {
-          "tool": "ogr2ogr",
-          "failed": true,
-          "argv": [
-            "ogr2ogr",
-            "-f",
-            "FlatGeobuf",
-            "<work>/polygons-portland-medium.ogr.fgb",
-            "<repo>/corpus/data/gpio/polygons-portland-medium.parquet"
-          ],
-          "stderr_tail": "ge unshared data size\n                   0  average unshared stack size\n                9754  page reclaims\n                2397  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                  52  voluntary context switches\n                1209  involuntary context switches\n          1311106958  instructions retired\n           467574922  cycles elapsed\n           141871744  peak memory footprint\n"
-        },
         "gpio": {
           "argv": [
             "gpio",
@@ -1186,15 +1662,19 @@
             "<work>/polygons-portland-medium.gpio.fgb",
             "--overwrite"
           ],
-          "runs": 2,
-          "wall_median_s": 1.1693047499284148,
-          "wall_min_s": 1.1143557918258011,
-          "wall_max_s": 1.2242537080310285,
-          "peak_rss_bytes": 392658944,
-          "cpu_pct": 128.6,
+          "runs": 3,
+          "wall_median_s": 2.34,
+          "wall_min_s": 2.34,
+          "wall_max_s": 2.35,
+          "peak_rss_bytes": 373669888,
+          "cpu_pct": 327.0,
+          "cpu_s": 7.68,
+          "effective_cores": 3.27,
+          "profile": {},
           "wall_all_s": [
-            1.1143557918258011,
-            1.2242537080310285
+            2.35,
+            2.34,
+            2.34
           ],
           "output_bytes": 244232920,
           "tool": "gpio",
@@ -1210,15 +1690,19 @@
           "<work>/polygons-portland-medium.gpio.fgb",
           "--overwrite"
         ],
-        "runs": 2,
-        "wall_median_s": 1.1693047499284148,
-        "wall_min_s": 1.1143557918258011,
-        "wall_max_s": 1.2242537080310285,
-        "peak_rss_bytes": 392658944,
-        "cpu_pct": 128.6,
+        "runs": 3,
+        "wall_median_s": 2.34,
+        "wall_min_s": 2.34,
+        "wall_max_s": 2.35,
+        "peak_rss_bytes": 373669888,
+        "cpu_pct": 327.0,
+        "cpu_s": 7.68,
+        "effective_cores": 3.27,
+        "profile": {},
         "wall_all_s": [
-          1.1143557918258011,
-          1.2242537080310285
+          2.35,
+          2.34,
+          2.34
         ],
         "output_bytes": 244232920,
         "tool": "gpio",
@@ -1245,19 +1729,23 @@
           "--simplification=10",
           "--drop-densest-as-needed",
           "--coalesce-densest-as-needed",
-          "<work>/polygons-portland-medium.gpio.fgb"
+          "<work>/polygons-portland-medium.tippecanoe-input.fgb"
         ],
-        "runs": 2,
-        "wall_median_s": 56.05460008350201,
-        "wall_min_s": 55.776992625091225,
-        "wall_max_s": 56.332207541912794,
-        "peak_rss_bytes": 1013710848,
-        "cpu_pct": 204.1,
+        "runs": 3,
+        "wall_median_s": 82.47,
+        "wall_min_s": 82.3,
+        "wall_max_s": 82.9,
+        "peak_rss_bytes": 2230173696,
+        "cpu_pct": 219.0,
+        "cpu_s": 180.96,
+        "effective_cores": 2.19,
+        "profile": {},
         "wall_all_s": [
-          55.776992625091225,
-          56.332207541912794
+          82.3,
+          82.9,
+          82.47
         ],
-        "output_bytes": 73657057,
+        "output_bytes": 73656977,
         "per_zoom": {
           "by_zoom": {
             "1": {
@@ -1292,8 +1780,8 @@
             },
             "7": {
               "tiles": 1,
-              "total_bytes": 468439,
-              "max_bytes": 468439
+              "total_bytes": 468440,
+              "max_bytes": 468440
             },
             "8": {
               "tiles": 2,
@@ -1312,22 +1800,22 @@
             },
             "11": {
               "tiles": 20,
-              "total_bytes": 1339578,
-              "max_bytes": 358556
+              "total_bytes": 1339599,
+              "max_bytes": 358577
             },
             "12": {
               "tiles": 63,
-              "total_bytes": 5308395,
+              "total_bytes": 5308393,
               "max_bytes": 405482
             },
             "13": {
               "tiles": 236,
-              "total_bytes": 25925948,
+              "total_bytes": 25925913,
               "max_bytes": 408165
             },
             "14": {
               "tiles": 872,
-              "total_bytes": 39769254,
+              "total_bytes": 39769252,
               "max_bytes": 266924
             }
           },
@@ -1335,24 +1823,918 @@
         }
       },
       "tippecanoe_e2e": {
-        "wall_median_s": 57.223904833430424,
-        "peak_rss_bytes": 1013710848,
+        "wall_median_s": 84.81,
+        "peak_rss_bytes": 2230173696,
         "converter": "gpio",
-        "note": "parquet->fgb (fastest available converter) then fgb->pmtiles, run as two processes; peak RSS is the larger of the two stages, not their sum"
+        "note": "parquet->fgb (the converter with the fastest warm-up) then fgb->pmtiles, run as two processes; peak RSS is the larger of the two stages, not their sum"
       },
       "ratios": {
-        "e2e_speedup": 21.292026008917038,
-        "tiles_only_speedup": 20.856947920130597,
-        "input_conversion_share_of_tippecanoe_e2e": 0.020433851086046517,
-        "archive_size_ratio_tylertoo_over_tippecanoe": 1.1130209017175368,
-        "e2e_speedup_quality_matched": 16.59724087045842,
-        "tiles_only_speedup_quality_matched": 16.258095322072226,
-        "archive_size_ratio_quality_matched": 1.2028412566089899
+        "e2e_speedup": 23.046195652173914,
+        "tiles_only_speedup": 22.41032608695652,
+        "input_conversion_share_of_tippecanoe_e2e": 0.02759108595684471,
+        "archive_size_ratio_tylertoo_over_tippecanoe": 1.410203584651594,
+        "e2e_speedup_quality_matched": 13.745542949756889,
+        "tiles_only_speedup_quality_matched": 13.366288492706644,
+        "archive_size_ratio_quality_matched": 1.469708741915922
+      }
+    },
+    "lines-oregon-large": {
+      "input": "<repo>/corpus/data/gpio/lines-oregon-large.parquet",
+      "input_bytes": 250561747,
+      "note": "corpus line/large: State of Oregon, USA (~1,203,997 features)",
+      "layer": "lines-oregon-large",
+      "min_zoom": 0,
+      "max_zoom": 14,
+      "tippecanoe_dataset_flags": [
+        "--simplification=10",
+        "--drop-densest-as-needed"
+      ],
+      "tylertoo": {
+        "argv": [
+          "<repo>/target/release/tylertoo",
+          "tiles",
+          "<repo>/corpus/data/gpio/lines-oregon-large.parquet",
+          "<work>/lines-oregon-large.tylertoo.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "lines-oregon-large",
+          "--tile-buffer",
+          "8",
+          "--max-compressed-tile-size",
+          "500000",
+          "--max-tile-size",
+          "0",
+          "--report",
+          "<work>/lines-oregon-large.tylertoo.report.json",
+          "--force"
+        ],
+        "runs": 3,
+        "wall_median_s": 10.65,
+        "wall_min_s": 10.64,
+        "wall_max_s": 12.43,
+        "peak_rss_bytes": 9490481152,
+        "cpu_pct": 1861.0,
+        "cpu_s": 199.02,
+        "effective_cores": 18.61,
+        "profile": {
+          "convert": {
+            "phase_walls": {
+              "assign": 1.210368146,
+              "pass1": 0.212616389,
+              "pass2": 1.130146212,
+              "total": 2.728704004,
+              "writer_finish": 0.006146591
+            },
+            "pass1_rows": 1203997,
+            "pass2_rows": 5476556,
+            "true_peak_mib": 8761.9453125,
+            "true_anon_peak_mib": 8756.4765625,
+            "memory_profile": "auto",
+            "threads": 64,
+            "phases": {
+              "assignment+budget (winner tables)": {
+                "cpu_user_secs": 18.328055000000003,
+                "cpu_sys_secs": 0.747047,
+                "effective_cores": 15.6698778383349,
+                "utilization": 0.2448418412239828,
+                "unattributed_core_secs": 19.075102,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass1 scan": {
+                "cpu_user_secs": 3.426128,
+                "cpu_sys_secs": 0.607525,
+                "effective_cores": 18.672767529987507,
+                "utilization": 0.2917619926560548,
+                "unattributed_core_secs": 3.0405115800000004,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass2 (output sink)": {
+                "cpu_user_secs": 18.329822,
+                "cpu_sys_secs": 2.113836,
+                "effective_cores": 16.692309394465347,
+                "utilization": 0.26081733428852105,
+                "unattributed_core_secs": 16.883260067,
+                "read_bytes": 0,
+                "write_bytes": 734978048
+              },
+              "pre-pass2 (winner tables freed)": {
+                "cpu_user_secs": 0.0016439999999988686,
+                "cpu_sys_secs": 0.011854999999999949,
+                "effective_cores": 0.9998894855090331,
+                "utilization": 0.015623273211078642,
+                "unattributed_core_secs": 0.013498999999998818,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "preflight": {
+                "cpu_user_secs": 0.0001299999999999999,
+                "cpu_sys_secs": 0.0009330000000000002,
+                "effective_cores": 1.6770423472913323,
+                "utilization": 0.026203786676427067,
+                "unattributed_core_secs": 0.0010630000000000001,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "writer.finish": {
+                "cpu_user_secs": 0.004674000000001399,
+                "cpu_sys_secs": 0.04868899999999954,
+                "effective_cores": 1.0001773078225165,
+                "utilization": 0.01562777043472682,
+                "unattributed_core_secs": 0.05336300000000094,
+                "read_bytes": 0,
+                "write_bytes": 770048
+              }
+            },
+            "writer_busy_secs": 0.171469172
+          },
+          "export": {
+            "mode": "duplicating",
+            "phase_walls": {
+              "fill": 0.0,
+              "finalize": 3.197893522,
+              "levels": 4.96909374,
+              "probe": 0.0,
+              "scan": 0.571454993,
+              "total": 8.907831494
+            },
+            "stage_secs": {
+              "band_read": 2.181482049,
+              "checkpoint": 0.0,
+              "clip": 16.33029495,
+              "decode": 4.778013344,
+              "encode": 30.491632882,
+              "fill_encode": 0.0,
+              "fill_seed": 0.0,
+              "fill_simplify": 0.0,
+              "fill_squares": 0.0,
+              "fill_union": 0.0,
+              "scan_decode": 0.077047706,
+              "scan_read": 0.361175329,
+              "scan_size": 0.417914284,
+              "spill_read": 0.0,
+              "spill_write": 0.0,
+              "spool_write": 0.1519489
+            },
+            "true_peak_mib": 3863.67578125,
+            "true_anon_peak_mib": 3768.45703125,
+            "tiles": 121259,
+            "threads": 64,
+            "phases": {
+              "finalize": {
+                "cpu_user_secs": 0.018301000000008116,
+                "cpu_sys_secs": 0.371729000000002,
+                "effective_cores": 0.1177179412331834,
+                "utilization": 0.0018393428317684906,
+                "unattributed_core_secs": 0.3900300000000101,
+                "read_bytes": 0,
+                "write_bytes": 258048
+              },
+              "levels": {
+                "cpu_user_secs": 111.28015400000001,
+                "cpu_sys_secs": 19.548886,
+                "effective_cores": 26.235656273854055,
+                "utilization": 0.4099321292789696,
+                "unattributed_core_secs": 76.89566787500002,
+                "read_bytes": 0,
+                "write_bytes": 326410240
+              },
+              "scan": {
+                "cpu_user_secs": 18.709043,
+                "cpu_sys_secs": 4.675680999999999,
+                "effective_cores": 38.71257439633542,
+                "utilization": 0.6048839749427409,
+                "unattributed_core_secs": 22.528586681,
+                "read_bytes": 0,
+                "write_bytes": 0
+              }
+            },
+            "serial_secs": {
+              "finalize": 3.197893522,
+              "group_commit_wait": 0.064439746,
+              "spool_write": 0.1519489
+            },
+            "levels": [
+              {
+                "zoom": 0,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 1,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 2,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 3,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 4,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 5,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 6,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 7,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 8,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 9,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 10,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 11,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 12,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 13,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 14,
+                "wave_width": 64,
+                "spill_bytes": 0
+              }
+            ]
+          }
+        },
+        "wall_all_s": [
+          10.65,
+          10.64,
+          12.43
+        ],
+        "output_bytes": 326666293,
+        "per_zoom": {
+          "by_zoom": {
+            "0": {
+              "tiles": 1,
+              "total_bytes": 1999,
+              "max_bytes": 1999
+            },
+            "1": {
+              "tiles": 1,
+              "total_bytes": 7015,
+              "max_bytes": 7015
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 30452,
+              "max_bytes": 30452
+            },
+            "3": {
+              "tiles": 2,
+              "total_bytes": 129820,
+              "max_bytes": 116168
+            },
+            "4": {
+              "tiles": 1,
+              "total_bytes": 420129,
+              "max_bytes": 420129
+            },
+            "5": {
+              "tiles": 2,
+              "total_bytes": 594551,
+              "max_bytes": 448301
+            },
+            "6": {
+              "tiles": 6,
+              "total_bytes": 1749002,
+              "max_bytes": 487332
+            },
+            "7": {
+              "tiles": 12,
+              "total_bytes": 3628142,
+              "max_bytes": 484048
+            },
+            "8": {
+              "tiles": 42,
+              "total_bytes": 7954113,
+              "max_bytes": 496293
+            },
+            "9": {
+              "tiles": 124,
+              "total_bytes": 14792843,
+              "max_bytes": 486579
+            },
+            "10": {
+              "tiles": 450,
+              "total_bytes": 24302895,
+              "max_bytes": 488681
+            },
+            "11": {
+              "tiles": 1684,
+              "total_bytes": 36809759,
+              "max_bytes": 491161
+            },
+            "12": {
+              "tiles": 6413,
+              "total_bytes": 51253511,
+              "max_bytes": 428590
+            },
+            "13": {
+              "tiles": 24533,
+              "total_bytes": 67832574,
+              "max_bytes": 202486
+            },
+            "14": {
+              "tiles": 87987,
+              "total_bytes": 116921855,
+              "max_bytes": 132386
+            }
+          },
+          "tiles_total": 121259
+        },
+        "phases": {
+          "convert_wall_s": 2.7288936550000003,
+          "export_wall_s": 8.907994645,
+          "input_features": 1203997,
+          "row_groups_read": 25,
+          "row_groups_total": 25,
+          "total_tiles": 121259,
+          "total_tile_features": 6482919,
+          "oversized_tiles": 27
+        }
+      },
+      "tylertoo_quality_matched": {
+        "argv": [
+          "<repo>/target/release/tylertoo",
+          "tiles",
+          "<repo>/corpus/data/gpio/lines-oregon-large.parquet",
+          "<work>/lines-oregon-large.tylertoo-qm.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "lines-oregon-large",
+          "--tile-buffer",
+          "8",
+          "--max-compressed-tile-size",
+          "500000",
+          "--max-tile-size",
+          "0",
+          "--report",
+          "<work>/lines-oregon-large.tylertoo-qm.report.json",
+          "--force",
+          "--verbatim",
+          "--simplify-factor",
+          "1.0"
+        ],
+        "runs": 3,
+        "wall_median_s": 10.47,
+        "wall_min_s": 10.4,
+        "wall_max_s": 10.51,
+        "peak_rss_bytes": 4109144064,
+        "cpu_pct": 2201.0,
+        "cpu_s": 228.89,
+        "effective_cores": 22.01,
+        "profile": {
+          "convert": {
+            "phase_walls": {
+              "assign": 0.037524971,
+              "pass1": 0.161282949,
+              "pass2": 1.081985339,
+              "total": 1.348695084,
+              "writer_finish": 0.007109744
+            },
+            "pass1_rows": 1203997,
+            "pass2_rows": 7409644,
+            "true_peak_mib": 3738.11328125,
+            "true_anon_peak_mib": 3725.0625,
+            "memory_profile": "auto",
+            "threads": 64,
+            "phases": {
+              "assignment+budget (winner tables)": {
+                "cpu_user_secs": 0.5327660000000001,
+                "cpu_sys_secs": 0.12806099999999998,
+                "effective_cores": 16.805860794309474,
+                "utilization": 0.26259157491108553,
+                "unattributed_core_secs": 0.660827,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass1 scan": {
+                "cpu_user_secs": 3.342826,
+                "cpu_sys_secs": 0.60888,
+                "effective_cores": 24.006480725435054,
+                "utilization": 0.3751012613349227,
+                "unattributed_core_secs": 3.0337150900000003,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass2 (output sink)": {
+                "cpu_user_secs": 23.187851000000002,
+                "cpu_sys_secs": 1.364277,
+                "effective_cores": 22.404254420901342,
+                "utilization": 0.35006647532658347,
+                "unattributed_core_secs": 21.150063941000003,
+                "read_bytes": 0,
+                "write_bytes": 848416768
+              },
+              "pre-pass2 (winner tables freed)": {
+                "cpu_user_secs": 0.001286999999999594,
+                "cpu_sys_secs": 0.0020680000000000698,
+                "effective_cores": 0.999425963090548,
+                "utilization": 0.015616030673289812,
+                "unattributed_core_secs": 0.003354999999999664,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "preflight": {
+                "cpu_user_secs": 0.0,
+                "cpu_sys_secs": 0.0011489999999999994,
+                "effective_cores": 1.665137754281316,
+                "utilization": 0.02601777741064556,
+                "unattributed_core_secs": 0.0011489999999999994,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "writer.finish": {
+                "cpu_user_secs": 0.006968000000000529,
+                "cpu_sys_secs": 0.034135000000000026,
+                "effective_cores": 1.0002598052132694,
+                "utilization": 0.015629059456457334,
+                "unattributed_core_secs": 0.041103000000000556,
+                "read_bytes": 0,
+                "write_bytes": 921600
+              }
+            },
+            "writer_busy_secs": 0.121380016
+          },
+          "export": {
+            "mode": "duplicating",
+            "phase_walls": {
+              "fill": 0.0,
+              "finalize": 1.803069708,
+              "levels": 6.406638312,
+              "probe": 0.0,
+              "scan": 0.740035858,
+              "total": 9.001519802
+            },
+            "stage_secs": {
+              "band_read": 2.5154067209999997,
+              "checkpoint": 0.0,
+              "clip": 16.137649701,
+              "decode": 6.009461984,
+              "encode": 36.9828085,
+              "fill_encode": 0.0,
+              "fill_seed": 0.0,
+              "fill_simplify": 0.0,
+              "fill_squares": 0.0,
+              "fill_union": 0.0,
+              "scan_decode": 0.103712768,
+              "scan_read": 0.449489732,
+              "scan_size": 0.560254797,
+              "spill_read": 0.0,
+              "spill_write": 0.0,
+              "spool_write": 0.171454947
+            },
+            "true_peak_mib": 3216.71875,
+            "true_anon_peak_mib": 3204.36328125,
+            "tiles": 121259,
+            "threads": 64,
+            "phases": {
+              "finalize": {
+                "cpu_user_secs": 0.015245999999990545,
+                "cpu_sys_secs": 0.2193080000000016,
+                "effective_cores": 0.1286966732446539,
+                "utilization": 0.002010885519447717,
+                "unattributed_core_secs": 0.23455399999999216,
+                "read_bytes": 0,
+                "write_bytes": 258048
+              },
+              "levels": {
+                "cpu_user_secs": 146.60572200000001,
+                "cpu_sys_secs": 23.069015999999998,
+                "effective_cores": 26.431170383770887,
+                "utilization": 0.4129870372464201,
+                "unattributed_core_secs": 107.85795614700002,
+                "read_bytes": 0,
+                "write_bytes": 358154240
+              },
+              "scan": {
+                "cpu_user_secs": 26.186127000000003,
+                "cpu_sys_secs": 6.004187000000001,
+                "effective_cores": 42.60804178506999,
+                "utilization": 0.6657506528917186,
+                "unattributed_core_secs": 31.076856703,
+                "read_bytes": 0,
+                "write_bytes": 0
+              }
+            },
+            "serial_secs": {
+              "finalize": 1.803069708,
+              "group_commit_wait": 0.015011307,
+              "spool_write": 0.171454947
+            },
+            "levels": [
+              {
+                "zoom": 0,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 1,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 2,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 3,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 4,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 5,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 6,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 7,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 8,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 9,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 10,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 11,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 12,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 13,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 14,
+                "wave_width": 64,
+                "spill_bytes": 0
+              }
+            ]
+          }
+        },
+        "wall_all_s": [
+          10.4,
+          10.51,
+          10.47
+        ],
+        "output_bytes": 358409285,
+        "per_zoom": {
+          "by_zoom": {
+            "0": {
+              "tiles": 1,
+              "total_bytes": 1808,
+              "max_bytes": 1808
+            },
+            "1": {
+              "tiles": 1,
+              "total_bytes": 13221,
+              "max_bytes": 13221
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 80296,
+              "max_bytes": 80296
+            },
+            "3": {
+              "tiles": 2,
+              "total_bytes": 390097,
+              "max_bytes": 353040
+            },
+            "4": {
+              "tiles": 1,
+              "total_bytes": 433873,
+              "max_bytes": 433873
+            },
+            "5": {
+              "tiles": 2,
+              "total_bytes": 809324,
+              "max_bytes": 479306
+            },
+            "6": {
+              "tiles": 6,
+              "total_bytes": 2214615,
+              "max_bytes": 485103
+            },
+            "7": {
+              "tiles": 12,
+              "total_bytes": 4255630,
+              "max_bytes": 480783
+            },
+            "8": {
+              "tiles": 42,
+              "total_bytes": 10081546,
+              "max_bytes": 496407
+            },
+            "9": {
+              "tiles": 124,
+              "total_bytes": 19294946,
+              "max_bytes": 516920
+            },
+            "10": {
+              "tiles": 450,
+              "total_bytes": 30343421,
+              "max_bytes": 482261
+            },
+            "11": {
+              "tiles": 1684,
+              "total_bytes": 42841302,
+              "max_bytes": 498001
+            },
+            "12": {
+              "tiles": 6413,
+              "total_bytes": 58487928,
+              "max_bytes": 462485
+            },
+            "13": {
+              "tiles": 24533,
+              "total_bytes": 73917864,
+              "max_bytes": 256236
+            },
+            "14": {
+              "tiles": 87987,
+              "total_bytes": 115005842,
+              "max_bytes": 132121
+            }
+          },
+          "tiles_total": 121259
+        },
+        "phases": {
+          "convert_wall_s": 1.34885777,
+          "export_wall_s": 9.002217165,
+          "input_features": 1203997,
+          "row_groups_read": 25,
+          "row_groups_total": 25,
+          "total_tiles": 121259,
+          "total_tile_features": 7538952,
+          "oversized_tiles": 67
+        }
+      },
+      "convert_fgb_candidates": {
+        "gpio": {
+          "argv": [
+            "gpio",
+            "convert",
+            "flatgeobuf",
+            "<repo>/corpus/data/gpio/lines-oregon-large.parquet",
+            "<work>/lines-oregon-large.gpio.fgb",
+            "--overwrite"
+          ],
+          "runs": 3,
+          "wall_median_s": 3.71,
+          "wall_min_s": 3.68,
+          "wall_max_s": 3.71,
+          "peak_rss_bytes": 415817728,
+          "cpu_pct": 261.0,
+          "cpu_s": 9.68,
+          "effective_cores": 2.61,
+          "profile": {},
+          "wall_all_s": [
+            3.68,
+            3.71,
+            3.71
+          ],
+          "output_bytes": 472251448,
+          "tool": "gpio",
+          "path": "<work>/lines-oregon-large.gpio.fgb"
+        }
+      },
+      "convert_fgb": {
+        "argv": [
+          "gpio",
+          "convert",
+          "flatgeobuf",
+          "<repo>/corpus/data/gpio/lines-oregon-large.parquet",
+          "<work>/lines-oregon-large.gpio.fgb",
+          "--overwrite"
+        ],
+        "runs": 3,
+        "wall_median_s": 3.71,
+        "wall_min_s": 3.68,
+        "wall_max_s": 3.71,
+        "peak_rss_bytes": 415817728,
+        "cpu_pct": 261.0,
+        "cpu_s": 9.68,
+        "effective_cores": 2.61,
+        "profile": {},
+        "wall_all_s": [
+          3.68,
+          3.71,
+          3.71
+        ],
+        "output_bytes": 472251448,
+        "tool": "gpio",
+        "path": "<work>/lines-oregon-large.gpio.fgb"
+      },
+      "tippecanoe_fgb": {
+        "argv": [
+          "<repo>/.tools/tippecanoe-2.79.0/bin/tippecanoe",
+          "-o",
+          "<work>/lines-oregon-large.tippecanoe-fgb.pmtiles",
+          "-f",
+          "-Z",
+          "0",
+          "-z",
+          "14",
+          "-l",
+          "lines-oregon-large",
+          "-b",
+          "8",
+          "--maximum-tile-bytes",
+          "500000",
+          "--drop-fraction-as-needed",
+          "--quiet",
+          "--simplification=10",
+          "--drop-densest-as-needed",
+          "<work>/lines-oregon-large.tippecanoe-input.fgb"
+        ],
+        "runs": 3,
+        "wall_median_s": 176.98,
+        "wall_min_s": 176.54,
+        "wall_max_s": 177.05,
+        "peak_rss_bytes": 2553282560,
+        "cpu_pct": 242.0,
+        "cpu_s": 427.48,
+        "effective_cores": 2.42,
+        "profile": {},
+        "wall_all_s": [
+          176.54,
+          176.98,
+          177.05
+        ],
+        "output_bytes": 292222927,
+        "per_zoom": {
+          "by_zoom": {
+            "0": {
+              "tiles": 1,
+              "total_bytes": 437301,
+              "max_bytes": 437301
+            },
+            "1": {
+              "tiles": 1,
+              "total_bytes": 424807,
+              "max_bytes": 424807
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 473369,
+              "max_bytes": 473369
+            },
+            "3": {
+              "tiles": 2,
+              "total_bytes": 395942,
+              "max_bytes": 384450
+            },
+            "4": {
+              "tiles": 1,
+              "total_bytes": 394949,
+              "max_bytes": 394949
+            },
+            "5": {
+              "tiles": 2,
+              "total_bytes": 546906,
+              "max_bytes": 497282
+            },
+            "6": {
+              "tiles": 6,
+              "total_bytes": 806850,
+              "max_bytes": 410271
+            },
+            "7": {
+              "tiles": 12,
+              "total_bytes": 2268038,
+              "max_bytes": 478793
+            },
+            "8": {
+              "tiles": 42,
+              "total_bytes": 5809630,
+              "max_bytes": 454637
+            },
+            "9": {
+              "tiles": 124,
+              "total_bytes": 10699245,
+              "max_bytes": 436086
+            },
+            "10": {
+              "tiles": 450,
+              "total_bytes": 17958158,
+              "max_bytes": 446060
+            },
+            "11": {
+              "tiles": 1683,
+              "total_bytes": 28714537,
+              "max_bytes": 428779
+            },
+            "12": {
+              "tiles": 6407,
+              "total_bytes": 50816673,
+              "max_bytes": 409910
+            },
+            "13": {
+              "tiles": 24507,
+              "total_bytes": 73461685,
+              "max_bytes": 272552
+            },
+            "14": {
+              "tiles": 87745,
+              "total_bytes": 98792789,
+              "max_bytes": 120374
+            }
+          },
+          "tiles_total": 120984
+        }
+      },
+      "tippecanoe_e2e": {
+        "wall_median_s": 180.69,
+        "peak_rss_bytes": 2553282560,
+        "converter": "gpio",
+        "note": "parquet->fgb (the converter with the fastest warm-up) then fgb->pmtiles, run as two processes; peak RSS is the larger of the two stages, not their sum"
+      },
+      "ratios": {
+        "e2e_speedup": 16.96619718309859,
+        "tiles_only_speedup": 16.61784037558685,
+        "input_conversion_share_of_tippecanoe_e2e": 0.020532403564115335,
+        "archive_size_ratio_tylertoo_over_tippecanoe": 1.1178667476696653,
+        "e2e_speedup_quality_matched": 17.25787965616046,
+        "tiles_only_speedup_quality_matched": 16.903533906399232,
+        "archive_size_ratio_quality_matched": 1.226492694052031
       }
     },
     "polygons-ftw-moldova-large": {
       "input": "<repo>/corpus/data/gpio/polygons-ftw-moldova-large.parquet",
-      "input_bytes": 105080680,
+      "input_bytes": 105052005,
       "note": "corpus polygon/large: Moldova agricultural field boundaries (Fields of the World, alpha predictions) (~631,910 features)",
       "layer": "polygons-ftw-moldova-large",
       "min_zoom": 0,
@@ -1376,97 +2758,335 @@
           "polygons-ftw-moldova-large",
           "--tile-buffer",
           "8",
-          "--max-tile-size",
+          "--max-compressed-tile-size",
           "500000",
+          "--max-tile-size",
+          "0",
           "--report",
           "<work>/polygons-ftw-moldova-large.tylertoo.report.json",
           "--force"
         ],
-        "runs": 2,
-        "wall_median_s": 13.86754568759352,
-        "wall_min_s": 13.866058042040095,
-        "wall_max_s": 13.869033333146945,
-        "peak_rss_bytes": 1937342464,
-        "cpu_pct": 714.5,
+        "runs": 3,
+        "wall_median_s": 7.78,
+        "wall_min_s": 7.7,
+        "wall_max_s": 7.86,
+        "peak_rss_bytes": 4739145728,
+        "cpu_pct": 2904.0,
+        "cpu_s": 225.91,
+        "effective_cores": 29.04,
+        "profile": {
+          "convert": {
+            "phase_walls": {
+              "assign": 0.217361061,
+              "pass1": 0.204891446,
+              "pass2": 2.174767801,
+              "total": 2.657037861,
+              "writer_finish": 0.005343254
+            },
+            "pass1_rows": 631910,
+            "pass2_rows": 3458238,
+            "true_peak_mib": 4500.59375,
+            "true_anon_peak_mib": 4477.78125,
+            "memory_profile": "auto",
+            "threads": 64,
+            "phases": {
+              "assignment+budget (winner tables)": {
+                "cpu_user_secs": 0.5828530000000001,
+                "cpu_sys_secs": 0.05979899999999999,
+                "effective_cores": 2.9341864462056155,
+                "utilization": 0.04584666322196274,
+                "unattributed_core_secs": 0.642652,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass1 scan": {
+                "cpu_user_secs": 2.308971,
+                "cpu_sys_secs": 0.381675,
+                "effective_cores": 12.911742197619557,
+                "utilization": 0.20174597183780557,
+                "unattributed_core_secs": 1.354971119,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass2 (output sink)": {
+                "cpu_user_secs": 79.978692,
+                "cpu_sys_secs": 1.204952,
+                "effective_cores": 36.941982735745015,
+                "utilization": 0.5772184802460159,
+                "unattributed_core_secs": 68.87884198500001,
+                "read_bytes": 0,
+                "write_bytes": 375431168
+              },
+              "pre-pass2 (winner tables freed)": {
+                "cpu_user_secs": 0.0013160000000000949,
+                "cpu_sys_secs": 0.0019990000000000285,
+                "effective_cores": 0.9992367820416271,
+                "utilization": 0.015613074719400424,
+                "unattributed_core_secs": 0.0033150000000001234,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "preflight": {
+                "cpu_user_secs": 0.000595,
+                "cpu_sys_secs": 0.000595,
+                "effective_cores": 1.6733836379641531,
+                "utilization": 0.026146619343189893,
+                "unattributed_core_secs": 0.00119,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "writer.finish": {
+                "cpu_user_secs": 0.006033999999999651,
+                "cpu_sys_secs": 0.019008000000000136,
+                "effective_cores": 1.0003954522235183,
+                "utilization": 0.015631178940992474,
+                "unattributed_core_secs": 0.025041999999999787,
+                "read_bytes": 0,
+                "write_bytes": 737280
+              }
+            },
+            "writer_busy_secs": 0.113811598
+          },
+          "export": {
+            "mode": "duplicating",
+            "phase_walls": {
+              "fill": 0.0,
+              "finalize": 0.418452197,
+              "levels": 4.090959011,
+              "probe": 0.0,
+              "scan": 0.378848116,
+              "total": 4.981043188
+            },
+            "stage_secs": {
+              "band_read": 2.566518918,
+              "checkpoint": 0.0,
+              "clip": 12.217312675,
+              "decode": 4.771166111,
+              "encode": 53.574204614,
+              "fill_encode": 0.0,
+              "fill_seed": 0.0,
+              "fill_simplify": 0.0,
+              "fill_squares": 0.0,
+              "fill_union": 0.0,
+              "scan_decode": 0.049750715,
+              "scan_read": 0.256567306,
+              "scan_size": 0.264553827,
+              "spill_read": 0.0,
+              "spill_write": 0.0,
+              "spool_write": 0.071172691
+            },
+            "true_peak_mib": 4269.70703125,
+            "true_anon_peak_mib": 4255.72265625,
+            "tiles": 17492,
+            "threads": 64,
+            "phases": {
+              "finalize": {
+                "cpu_user_secs": 0.002904999999998381,
+                "cpu_sys_secs": 0.11449299999999951,
+                "effective_cores": 0.24838329709473803,
+                "utilization": 0.0038809890171052817,
+                "unattributed_core_secs": 0.11739799999999789,
+                "read_bytes": 0,
+                "write_bytes": 73728
+              },
+              "levels": {
+                "cpu_user_secs": 106.685438,
+                "cpu_sys_secs": 19.302732,
+                "effective_cores": 30.694316493634492,
+                "utilization": 0.47959869521303894,
+                "unattributed_core_secs": 52.787794990999984,
+                "read_bytes": 0,
+                "write_bytes": 182579200
+              },
+              "scan": {
+                "cpu_user_secs": 12.289990000000003,
+                "cpu_sys_secs": 2.8076750000000006,
+                "effective_cores": 37.69965325262949,
+                "utilization": 0.5890570820723358,
+                "unattributed_core_secs": 14.526793152000003,
+                "read_bytes": 0,
+                "write_bytes": 0
+              }
+            },
+            "serial_secs": {
+              "finalize": 0.418452197,
+              "group_commit_wait": 0.036065062,
+              "spool_write": 0.071172691
+            },
+            "levels": [
+              {
+                "zoom": 0,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 1,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 2,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 3,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 4,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 5,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 6,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 7,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 8,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 9,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 10,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 11,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 12,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 13,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 14,
+                "wave_width": 64,
+                "spill_bytes": 0
+              }
+            ]
+          }
+        },
         "wall_all_s": [
-          13.866058042040095,
-          13.869033333146945
+          7.7,
+          7.86,
+          7.78
         ],
-        "output_bytes": 138596857,
+        "output_bytes": 182651118,
         "per_zoom": {
           "by_zoom": {
+            "0": {
+              "tiles": 1,
+              "total_bytes": 1504,
+              "max_bytes": 1504
+            },
+            "1": {
+              "tiles": 1,
+              "total_bytes": 4839,
+              "max_bytes": 4839
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 17519,
+              "max_bytes": 17519
+            },
             "3": {
               "tiles": 1,
-              "total_bytes": 364,
-              "max_bytes": 364
+              "total_bytes": 63355,
+              "max_bytes": 63355
             },
             "4": {
               "tiles": 1,
-              "total_bytes": 7359,
-              "max_bytes": 7359
+              "total_bytes": 225510,
+              "max_bytes": 225510
             },
             "5": {
               "tiles": 1,
-              "total_bytes": 109748,
-              "max_bytes": 109748
+              "total_bytes": 477549,
+              "max_bytes": 477549
             },
             "6": {
               "tiles": 2,
-              "total_bytes": 431145,
-              "max_bytes": 270428
+              "total_bytes": 914245,
+              "max_bytes": 460770
             },
             "7": {
               "tiles": 4,
-              "total_bytes": 822030,
-              "max_bytes": 288061
+              "total_bytes": 1469958,
+              "max_bytes": 466500
             },
             "8": {
               "tiles": 11,
-              "total_bytes": 1450648,
-              "max_bytes": 323158
+              "total_bytes": 2720957,
+              "max_bytes": 490461
             },
             "9": {
               "tiles": 28,
-              "total_bytes": 3088069,
-              "max_bytes": 272660
+              "total_bytes": 6510418,
+              "max_bytes": 494138
             },
             "10": {
               "tiles": 78,
-              "total_bytes": 5709382,
-              "max_bytes": 205687
+              "total_bytes": 13772130,
+              "max_bytes": 490943
             },
             "11": {
               "tiles": 255,
-              "total_bytes": 10785135,
-              "max_bytes": 132596
+              "total_bytes": 23430857,
+              "max_bytes": 463544
             },
             "12": {
               "tiles": 905,
-              "total_bytes": 22311791,
-              "max_bytes": 116940
+              "total_bytes": 34802770,
+              "max_bytes": 282397
             },
             "13": {
               "tiles": 3385,
-              "total_bytes": 38800260,
-              "max_bytes": 75209
+              "total_bytes": 45470716,
+              "max_bytes": 116866
             },
             "14": {
               "tiles": 12818,
-              "total_bytes": 55027544,
-              "max_bytes": 47789
+              "total_bytes": 52715268,
+              "max_bytes": 44566
             }
           },
-          "tiles_total": 17489
+          "tiles_total": 17492
         },
         "phases": {
-          "convert_wall_s": 6.763858167,
-          "export_wall_s": 7.076035,
+          "convert_wall_s": 2.657212131,
+          "export_wall_s": 4.981163108,
           "input_features": 631910,
           "row_groups_read": 13,
           "row_groups_total": 13,
-          "total_tiles": 17489,
-          "total_tile_features": 2071586,
-          "oversized_tiles": 4
+          "total_tiles": 17492,
+          "total_tile_features": 3769912,
+          "oversized_tiles": 26
         }
       },
       "tylertoo_quality_matched": {
@@ -1483,8 +3103,10 @@
           "polygons-ftw-moldova-large",
           "--tile-buffer",
           "8",
-          "--max-tile-size",
+          "--max-compressed-tile-size",
           "500000",
+          "--max-tile-size",
+          "0",
           "--report",
           "<work>/polygons-ftw-moldova-large.tylertoo-qm.report.json",
           "--force",
@@ -1492,116 +3114,330 @@
           "--simplify-factor",
           "1.0"
         ],
-        "runs": 2,
-        "wall_median_s": 20.033293354441412,
-        "wall_min_s": 19.83363608387299,
-        "wall_max_s": 20.232950625009835,
-        "peak_rss_bytes": 2009137152,
-        "cpu_pct": 650.0,
+        "runs": 3,
+        "wall_median_s": 9.35,
+        "wall_min_s": 9.28,
+        "wall_max_s": 10.55,
+        "peak_rss_bytes": 4928462848,
+        "cpu_pct": 2909.0,
+        "cpu_s": 271.96,
+        "effective_cores": 29.09,
+        "profile": {
+          "convert": {
+            "phase_walls": {
+              "assign": 0.022557675,
+              "pass1": 0.204025401,
+              "pass2": 2.240582516,
+              "total": 2.533169621,
+              "writer_finish": 0.006404869
+            },
+            "pass1_rows": 631910,
+            "pass2_rows": 4611953,
+            "true_peak_mib": 4679.5625,
+            "true_anon_peak_mib": 4665.46484375,
+            "memory_profile": "auto",
+            "threads": 64,
+            "phases": {
+              "assignment+budget (winner tables)": {
+                "cpu_user_secs": 0.33431999999999995,
+                "cpu_sys_secs": 0.030724999999999947,
+                "effective_cores": 15.010421499477966,
+                "utilization": 0.2345378359293432,
+                "unattributed_core_secs": 0.3650449999999999,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass1 scan": {
+                "cpu_user_secs": 2.316208,
+                "cpu_sys_secs": 0.370651,
+                "effective_cores": 12.94947825346798,
+                "utilization": 0.2023355977104372,
+                "unattributed_core_secs": 1.365886653,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "pass2 (output sink)": {
+                "cpu_user_secs": 82.125513,
+                "cpu_sys_secs": 1.150297,
+                "effective_cores": 36.75977828158217,
+                "utilization": 0.5743715356497214,
+                "unattributed_core_secs": 70.96916882299999,
+                "read_bytes": 0,
+                "write_bytes": 454397952
+              },
+              "pre-pass2 (winner tables freed)": {
+                "cpu_user_secs": 0.00030200000000002447,
+                "cpu_sys_secs": 0.003060000000000007,
+                "effective_cores": 0.9985025431818288,
+                "utilization": 0.015601602237216076,
+                "unattributed_core_secs": 0.0033620000000000316,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "preflight": {
+                "cpu_user_secs": 0.001134,
+                "cpu_sys_secs": 3.4999999999999875e-05,
+                "effective_cores": 1.6582171824776515,
+                "utilization": 0.025909643476213304,
+                "unattributed_core_secs": 0.001169,
+                "read_bytes": 0,
+                "write_bytes": 0
+              },
+              "writer.finish": {
+                "cpu_user_secs": 0.006214999999997417,
+                "cpu_sys_secs": 0.022006000000000192,
+                "effective_cores": 1.0001973742665,
+                "utilization": 0.015628083972914063,
+                "unattributed_core_secs": 0.02822099999999761,
+                "read_bytes": 0,
+                "write_bytes": 905216
+              }
+            },
+            "writer_busy_secs": 0.10810688
+          },
+          "export": {
+            "mode": "duplicating",
+            "phase_walls": {
+              "fill": 0.0,
+              "finalize": 1.992259405,
+              "levels": 5.242673719,
+              "probe": 0.0,
+              "scan": 0.43709693,
+              "total": 7.902736286
+            },
+            "stage_secs": {
+              "band_read": 2.945185316,
+              "checkpoint": 0.0,
+              "clip": 13.123836257,
+              "decode": 6.124140089,
+              "encode": 62.735738059,
+              "fill_encode": 0.0,
+              "fill_seed": 0.0,
+              "fill_simplify": 0.0,
+              "fill_squares": 0.0,
+              "fill_union": 0.0,
+              "scan_decode": 0.065596569,
+              "scan_read": 0.292286833,
+              "scan_size": 0.33159326,
+              "spill_read": 0.0,
+              "spill_write": 0.0,
+              "spool_write": 0.072024924
+            },
+            "true_peak_mib": 4679.97265625,
+            "true_anon_peak_mib": 4665.90234375,
+            "tiles": 17492,
+            "threads": 64,
+            "phases": {
+              "finalize": {
+                "cpu_user_secs": 0.010383999999987736,
+                "cpu_sys_secs": 0.34918799999999806,
+                "effective_cores": 0.16562119427779198,
+                "utilization": 0.0025878311605904997,
+                "unattributed_core_secs": 0.3595719999999858,
+                "read_bytes": 0,
+                "write_bytes": 73728
+              },
+              "levels": {
+                "cpu_user_secs": 139.04470300000003,
+                "cpu_sys_secs": 23.376482000000003,
+                "effective_cores": 30.85444346979178,
+                "utilization": 0.48210067921549654,
+                "unattributed_core_secs": 77.42026035500004,
+                "read_bytes": 0,
+                "write_bytes": 184360960
+              },
+              "scan": {
+                "cpu_user_secs": 15.101985999999997,
+                "cpu_sys_secs": 4.101635999999999,
+                "effective_cores": 41.4068214751517,
+                "utilization": 0.6469815855492453,
+                "unattributed_core_secs": 18.514145337999995,
+                "read_bytes": 0,
+                "write_bytes": 0
+              }
+            },
+            "serial_secs": {
+              "finalize": 1.992259405,
+              "group_commit_wait": 0.016157727,
+              "spool_write": 0.072024924
+            },
+            "levels": [
+              {
+                "zoom": 0,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 1,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 2,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 3,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 4,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 5,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 6,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 7,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 8,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 9,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 10,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 11,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 12,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 13,
+                "wave_width": 64,
+                "spill_bytes": 0
+              },
+              {
+                "zoom": 14,
+                "wave_width": 64,
+                "spill_bytes": 0
+              }
+            ]
+          }
+        },
         "wall_all_s": [
-          20.232950625009835,
-          19.83363608387299
+          9.28,
+          9.35,
+          10.55
         ],
-        "output_bytes": 175221897,
+        "output_bytes": 184431639,
         "per_zoom": {
           "by_zoom": {
+            "0": {
+              "tiles": 1,
+              "total_bytes": 452236,
+              "max_bytes": 452236
+            },
+            "1": {
+              "tiles": 1,
+              "total_bytes": 465523,
+              "max_bytes": 465523
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 481902,
+              "max_bytes": 481902
+            },
             "3": {
               "tiles": 1,
-              "total_bytes": 383,
-              "max_bytes": 383
+              "total_bytes": 410072,
+              "max_bytes": 410072
             },
             "4": {
               "tiles": 1,
-              "total_bytes": 9931,
-              "max_bytes": 9931
+              "total_bytes": 416406,
+              "max_bytes": 416406
             },
             "5": {
               "tiles": 1,
-              "total_bytes": 153662,
-              "max_bytes": 153662
+              "total_bytes": 438779,
+              "max_bytes": 438779
             },
             "6": {
               "tiles": 2,
-              "total_bytes": 493160,
-              "max_bytes": 254057
+              "total_bytes": 913248,
+              "max_bytes": 478130
             },
             "7": {
               "tiles": 4,
-              "total_bytes": 879225,
-              "max_bytes": 286817
+              "total_bytes": 1655820,
+              "max_bytes": 490550
             },
             "8": {
               "tiles": 11,
-              "total_bytes": 1851108,
-              "max_bytes": 335428
+              "total_bytes": 2970259,
+              "max_bytes": 493197
             },
             "9": {
               "tiles": 28,
-              "total_bytes": 4312355,
-              "max_bytes": 314477
+              "total_bytes": 6669809,
+              "max_bytes": 498052
             },
             "10": {
               "tiles": 78,
-              "total_bytes": 10093221,
-              "max_bytes": 303264
+              "total_bytes": 13496378,
+              "max_bytes": 496510
             },
             "11": {
               "tiles": 255,
-              "total_bytes": 19893549,
-              "max_bytes": 274514
+              "total_bytes": 23018931,
+              "max_bytes": 492948
             },
             "12": {
               "tiles": 905,
-              "total_bytes": 34747673,
-              "max_bytes": 247864
+              "total_bytes": 34802770,
+              "max_bytes": 282397
             },
             "13": {
               "tiles": 3385,
-              "total_bytes": 47706473,
-              "max_bytes": 126559
+              "total_bytes": 45470716,
+              "max_bytes": 116866
             },
             "14": {
               "tiles": 12818,
-              "total_bytes": 55027544,
-              "max_bytes": 47789
+              "total_bytes": 52715268,
+              "max_bytes": 44566
             }
           },
-          "tiles_total": 17489
+          "tiles_total": 17492
         },
         "phases": {
-          "convert_wall_s": 10.687054959,
-          "export_wall_s": 9.110104083,
+          "convert_wall_s": 2.533340799,
+          "export_wall_s": 7.902868578,
           "input_features": 631910,
           "row_groups_read": 13,
           "row_groups_total": 13,
-          "total_tiles": 17489,
-          "total_tile_features": 3227220,
-          "oversized_tiles": 44
+          "total_tiles": 17492,
+          "total_tile_features": 3835718,
+          "oversized_tiles": 30
         }
       },
       "convert_fgb_candidates": {
-        "ogr2ogr": {
-          "argv": [
-            "ogr2ogr",
-            "-f",
-            "FlatGeobuf",
-            "<work>/polygons-ftw-moldova-large.ogr.fgb",
-            "<repo>/corpus/data/gpio/polygons-ftw-moldova-large.parquet"
-          ],
-          "runs": 2,
-          "wall_median_s": 1.9061421250225976,
-          "wall_min_s": 1.839800083078444,
-          "wall_max_s": 1.9724841669667512,
-          "peak_rss_bytes": 733970432,
-          "cpu_pct": 96.7,
-          "wall_all_s": [
-            1.9724841669667512,
-            1.839800083078444
-          ],
-          "output_bytes": 723894688,
-          "tool": "ogr2ogr",
-          "path": "<work>/polygons-ftw-moldova-large.ogr.fgb"
-        },
         "gpio": {
           "argv": [
             "gpio",
@@ -1611,42 +3447,51 @@
             "<work>/polygons-ftw-moldova-large.gpio.fgb",
             "--overwrite"
           ],
-          "runs": 2,
-          "wall_median_s": 2.3360100835561752,
-          "wall_min_s": 2.1005065001081675,
-          "wall_max_s": 2.571513667004183,
-          "peak_rss_bytes": 435929088,
-          "cpu_pct": 119.0,
+          "runs": 3,
+          "wall_median_s": 3.7,
+          "wall_min_s": 3.7,
+          "wall_max_s": 3.73,
+          "peak_rss_bytes": 370372608,
+          "cpu_pct": 252.0,
+          "cpu_s": 9.33,
+          "effective_cores": 2.52,
+          "profile": {},
           "wall_all_s": [
-            2.571513667004183,
-            2.1005065001081675
+            3.7,
+            3.7,
+            3.73
           ],
-          "output_bytes": 734439824,
+          "output_bytes": 734508720,
           "tool": "gpio",
           "path": "<work>/polygons-ftw-moldova-large.gpio.fgb"
         }
       },
       "convert_fgb": {
         "argv": [
-          "ogr2ogr",
-          "-f",
-          "FlatGeobuf",
-          "<work>/polygons-ftw-moldova-large.ogr.fgb",
-          "<repo>/corpus/data/gpio/polygons-ftw-moldova-large.parquet"
+          "gpio",
+          "convert",
+          "flatgeobuf",
+          "<repo>/corpus/data/gpio/polygons-ftw-moldova-large.parquet",
+          "<work>/polygons-ftw-moldova-large.gpio.fgb",
+          "--overwrite"
         ],
-        "runs": 2,
-        "wall_median_s": 1.9061421250225976,
-        "wall_min_s": 1.839800083078444,
-        "wall_max_s": 1.9724841669667512,
-        "peak_rss_bytes": 733970432,
-        "cpu_pct": 96.7,
+        "runs": 3,
+        "wall_median_s": 3.7,
+        "wall_min_s": 3.7,
+        "wall_max_s": 3.73,
+        "peak_rss_bytes": 370372608,
+        "cpu_pct": 252.0,
+        "cpu_s": 9.33,
+        "effective_cores": 2.52,
+        "profile": {},
         "wall_all_s": [
-          1.9724841669667512,
-          1.839800083078444
+          3.7,
+          3.7,
+          3.73
         ],
-        "output_bytes": 723894688,
-        "tool": "ogr2ogr",
-        "path": "<work>/polygons-ftw-moldova-large.ogr.fgb"
+        "output_bytes": 734508720,
+        "tool": "gpio",
+        "path": "<work>/polygons-ftw-moldova-large.gpio.fgb"
       },
       "tippecanoe_fgb": {
         "argv": [
@@ -1669,114 +3514,118 @@
           "--simplification=10",
           "--drop-densest-as-needed",
           "--coalesce-densest-as-needed",
-          "<work>/polygons-ftw-moldova-large.ogr.fgb"
+          "<work>/polygons-ftw-moldova-large.tippecanoe-input.fgb"
         ],
-        "runs": 2,
-        "wall_median_s": 117.37214445800055,
-        "wall_min_s": 116.03008641581982,
-        "wall_max_s": 118.71420250018127,
-        "peak_rss_bytes": 970915840,
-        "cpu_pct": 259.8,
+        "runs": 3,
+        "wall_median_s": 163.57,
+        "wall_min_s": 163.43,
+        "wall_max_s": 163.72,
+        "peak_rss_bytes": 2548998144,
+        "cpu_pct": 297.0,
+        "cpu_s": 486.39,
+        "effective_cores": 2.97,
+        "profile": {},
         "wall_all_s": [
-          118.71420250018127,
-          116.03008641581982
+          163.72,
+          163.43,
+          163.57
         ],
-        "output_bytes": 183305369,
+        "output_bytes": 183306299,
         "per_zoom": {
           "by_zoom": {
             "0": {
               "tiles": 1,
-              "total_bytes": 8373,
-              "max_bytes": 8373
+              "total_bytes": 8372,
+              "max_bytes": 8372
             },
             "1": {
               "tiles": 1,
-              "total_bytes": 29645,
-              "max_bytes": 29645
+              "total_bytes": 29637,
+              "max_bytes": 29637
             },
             "2": {
               "tiles": 1,
-              "total_bytes": 102217,
-              "max_bytes": 102217
+              "total_bytes": 102221,
+              "max_bytes": 102221
             },
             "3": {
               "tiles": 1,
-              "total_bytes": 351413,
-              "max_bytes": 351413
+              "total_bytes": 351387,
+              "max_bytes": 351387
             },
             "4": {
               "tiles": 1,
-              "total_bytes": 423988,
-              "max_bytes": 423988
+              "total_bytes": 424014,
+              "max_bytes": 424014
             },
             "5": {
               "tiles": 1,
-              "total_bytes": 427781,
-              "max_bytes": 427781
+              "total_bytes": 427941,
+              "max_bytes": 427941
             },
             "6": {
               "tiles": 2,
-              "total_bytes": 632760,
-              "max_bytes": 413261
+              "total_bytes": 632814,
+              "max_bytes": 413307
             },
             "7": {
               "tiles": 4,
-              "total_bytes": 1073721,
-              "max_bytes": 408299
+              "total_bytes": 1073772,
+              "max_bytes": 408296
             },
             "8": {
               "tiles": 11,
-              "total_bytes": 1859262,
-              "max_bytes": 482705
+              "total_bytes": 1859317,
+              "max_bytes": 482703
             },
             "9": {
               "tiles": 28,
-              "total_bytes": 5114346,
-              "max_bytes": 444611
+              "total_bytes": 5114497,
+              "max_bytes": 444618
             },
             "10": {
               "tiles": 76,
-              "total_bytes": 10376791,
-              "max_bytes": 427009
+              "total_bytes": 10376877,
+              "max_bytes": 427018
             },
             "11": {
               "tiles": 254,
-              "total_bytes": 22402830,
-              "max_bytes": 453497
+              "total_bytes": 22403068,
+              "max_bytes": 453495
             },
             "12": {
               "tiles": 905,
-              "total_bytes": 33465469,
-              "max_bytes": 301662
+              "total_bytes": 33465479,
+              "max_bytes": 301658
             },
             "13": {
               "tiles": 3380,
-              "total_bytes": 45110501,
-              "max_bytes": 128824
+              "total_bytes": 45110610,
+              "max_bytes": 128825
             },
             "14": {
               "tiles": 12795,
-              "total_bytes": 61886219,
-              "max_bytes": 53138
+              "total_bytes": 61886308,
+              "max_bytes": 53137
             }
           },
           "tiles_total": 17461
         }
       },
       "tippecanoe_e2e": {
-        "wall_median_s": 119.27828658302315,
-        "peak_rss_bytes": 970915840,
-        "converter": "ogr2ogr",
-        "note": "parquet->fgb (fastest available converter) then fgb->pmtiles, run as two processes; peak RSS is the larger of the two stages, not their sum"
+        "wall_median_s": 167.26999999999998,
+        "peak_rss_bytes": 2548998144,
+        "converter": "gpio",
+        "note": "parquet->fgb (the converter with the fastest warm-up) then fgb->pmtiles, run as two processes; peak RSS is the larger of the two stages, not their sum"
       },
       "ratios": {
-        "e2e_speedup": 8.601254271672198,
-        "tiles_only_speedup": 8.463800812497523,
-        "input_conversion_share_of_tippecanoe_e2e": 0.015980629665532927,
-        "archive_size_ratio_tylertoo_over_tippecanoe": 0.7560981860820454,
-        "e2e_speedup_quality_matched": 5.954002892718534,
-        "tiles_only_speedup_quality_matched": 5.858854177462487,
-        "archive_size_ratio_quality_matched": 0.9559016080974693
+        "e2e_speedup": 21.499999999999996,
+        "tiles_only_speedup": 21.024421593830333,
+        "input_conversion_share_of_tippecanoe_e2e": 0.022119925868356552,
+        "archive_size_ratio_tylertoo_over_tippecanoe": 0.9964257583968786,
+        "e2e_speedup_quality_matched": 17.88983957219251,
+        "tiles_only_speedup_quality_matched": 17.49411764705882,
+        "archive_size_ratio_quality_matched": 1.0061391234569632
       }
     }
   }

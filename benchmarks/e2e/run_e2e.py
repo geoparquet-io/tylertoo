@@ -523,7 +523,9 @@ def machine_info() -> dict:
         mem = sh("sysctl -n hw.memsize")
         info["ram_gb"] = round(int(mem) / 1024**3) if mem else None
     else:
-        info["cpu"] = sh("grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-")
+        # arm64 /proc/cpuinfo has no "model name"; lscpu names the core.
+        info["cpu"] = (sh("grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-")
+                       or sh("lscpu | awk -F: '/^Model name/{print $2; exit}'"))
         mem = sh("grep MemTotal /proc/meminfo | awk '{print $2}'")
         info["ram_gb"] = round(int(mem) / 1024**2) if mem else None
     return info
