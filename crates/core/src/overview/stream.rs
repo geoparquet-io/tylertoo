@@ -8469,14 +8469,23 @@ mod tests {
 
     /// #810 injected regression: the same CPU work run on a 1-thread pool
     /// instead of a wide one shows up as a drop in the phase's
-    /// `effective_cores`. This is the signal the effective-cores gate reads.
+    /// `effective_cores`, the signal the effective-cores gate reads.
+    ///
+    /// Load-independent where it can be: a 1-thread pool never keeps more
+    /// than one core busy, and it does keep some busy, whatever else runs.
+    /// The pool's CPU time must match the same work done on this thread
+    /// (CPU time, unlike wall, does not depend on load), which catches a
+    /// counter that misses the pool's threads. Only the wide-vs-serial
+    /// comparison needs spare cores, so it runs only with 4+ of them, and
+    /// only asks that wide beat serial.
     #[test]
     fn effective_cores_drop_when_work_is_serialized() {
-        let width = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
-        if width < 2 || !cfg!(unix) {
-            eprintln!("Skipping: needs 2+ cores and getrusage");
+        if !cfg!(unix) {
+            eprintln!("Skipping: needs getrusage");
             return;
         }
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let width = cores.clamp(2, 4);
         let work = |threads: usize| {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -8489,18 +8498,36 @@ mod tests {
                     .reduce(|| 0, u64::wrapping_add)
             });
         };
-        let sampler = RssSampler::start_if_with_interval(true, "wide", Duration::from_secs(30))
+        let sampler = RssSampler::start_if_with_interval(true, "here", Duration::from_secs(30))
             .expect("profiling_on=true always starts a sampler");
+        (0..width * 4).for_each(|_| {
+            spin(25);
+        });
+        sampler.mark_phase("wide");
         work(width);
         sampler.mark_phase("serial");
         work(1);
         let report = sampler.finish();
+        let here_cpu = usage(&report, "here").cpu_secs().unwrap();
+        let serial_cpu = usage(&report, "serial").cpu_secs().unwrap();
+        assert!(
+            serial_cpu > 0.5 * here_cpu,
+            "the pool's CPU ({serial_cpu:.2}s) must count like the same work on this \
+             thread ({here_cpu:.2}s)"
+        );
         let wide = usage(&report, "wide").effective_cores().unwrap();
         let serial = usage(&report, "serial").effective_cores().unwrap();
         assert!(
-            serial < 1.3 && wide > 1.5 && wide > 1.3 * serial,
-            "serializing the work must lower effective_cores: wide {wide:.2}, serial {serial:.2}"
+            serial > 0.0 && serial <= 1.2,
+            "a 1-thread pool keeps between 0 and 1 core busy: serial {serial:.2}"
         );
+        if cores >= 4 {
+            assert!(
+                wide > serial,
+                "serializing the work must lower effective_cores: wide {wide:.2}, \
+                 serial {serial:.2}"
+            );
+        }
     }
 
     /// #810: the JSON carries the per-phase saturation fields in run order,

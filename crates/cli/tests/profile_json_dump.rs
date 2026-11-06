@@ -148,6 +148,25 @@ fn profile_json_written_and_parses() {
     check_export_line(&report, &export);
 }
 
+/// #810: the saturation fields on a committed fixture (a plain git blob,
+/// not LFS), so this runs on every host, unlike the real-data tests above
+/// that skip without the fixture release.
+#[test]
+fn profile_json_saturation_fields_on_a_committed_fixture() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+    let (_dir, _report, convert, export) = run_tiles_with_profile(&fixture, "0", "6");
+    check_saturation(&convert, &convert, &CONVERT_PHASES);
+    assert!(
+        convert["pass2"]["writer_busy_secs"]
+            .as_f64()
+            .is_some_and(|s| s >= 0.0),
+        "pass2.writer_busy_secs: {convert}"
+    );
+    check_saturation(&export, &export["export"], &["scan", "levels", "finalize"]);
+    check_export_serial_path(&export);
+}
+
 /// The convert line of [`profile_json_written_and_parses`]'s `tiles` run.
 fn check_convert_line(
     dir: &std::path::Path,
@@ -563,10 +582,12 @@ fn check_saturation(line: &serde_json::Value, holder: &serde_json::Value, phases
         wall_sum += wall;
         let (user, sys) = (num(p, "cpu_user_secs"), num(p, "cpu_sys_secs"));
         let io = (num(p, "read_bytes"), num(p, "write_bytes"));
+        // Null off Linux, and where the host hides `/proc/self/io`.
+        let have_io = cfg!(target_os = "linux") && std::fs::read("/proc/self/io").is_ok();
         assert_eq!(
             io.0.is_some() && io.1.is_some(),
-            cfg!(target_os = "linux"),
-            "{phase}: read/write bytes are Linux-only: {line}"
+            have_io,
+            "{phase}: read/write bytes are numbers exactly when /proc/self/io is readable: {line}"
         );
         let (Some(user), Some(sys)) = (user, sys) else {
             assert!(
