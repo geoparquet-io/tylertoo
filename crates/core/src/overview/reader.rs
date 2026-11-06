@@ -854,6 +854,55 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_foreign_major_and_accepts_newer_minor() {
+        use tylertoo_io::test_support::{ArrowWriter, WriterProperties};
+        use tylertoo_io::KeyValue;
+
+        let donor = tempfile::NamedTempFile::new().unwrap();
+        let mut meta = write_int_column_fixture(
+            donor.path(),
+            Field::new("n", DataType::Int64, false),
+            Arc::new(Int64Array::from(vec![1])),
+        );
+        for (version, accepted) in [("5.0.0", false), ("0.999.0", true)] {
+            meta.version = version.to_string();
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
+                    .unwrap();
+            let props = WriterProperties::builder()
+                .set_key_value_metadata(Some(vec![KeyValue::new(
+                    OVERVIEWS_KEY.to_string(),
+                    meta.to_json().unwrap(),
+                )]))
+                .build();
+            let mut writer = ArrowWriter::try_new(
+                File::create(tmp.path()).unwrap(),
+                schema.clone(),
+                Some(props),
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let result = OverviewReader::open(tmp.path());
+            if accepted {
+                assert!(meta.validate(1).is_ok());
+                assert!(
+                    matches!(result, Err(ReaderError::Conformance(_))),
+                    "{version}: {result:?}"
+                );
+            } else {
+                let message = result.unwrap_err().to_string();
+                assert!(
+                    message.contains("unsupported overview MAJOR") && message.contains(version),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn open_missing_key_errors() {
         // A plain (non-overview) parquet file: write with parquet directly.
         use tylertoo_io::test_support::ArrowWriter;

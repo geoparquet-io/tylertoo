@@ -526,12 +526,9 @@ pub struct ExportOptions {
     /// tiny-polygon carrier its own. Uniqueness across source rows is not
     /// checked.
     ///
-    /// Default `None`: every feature keeps the tile-local member index it has
-    /// always had (unique only within a single tile/zoom pair -- see
-    /// `build_mvt`). Whether that no-flag default should instead omit the
-    /// id entirely is an open question (#443) this option does not decide.
+    /// Default `None`: features have no MVT id.
     #[cfg_attr(feature = "cli", arg(long, value_name = "COLUMN"))]
-    #[cfg_attr(feature = "cli", arg(help = "Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. Defaults to tile-local ids", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. By default features have no id", long_help = None))]
     pub feature_id: Option<String>,
     /// Directory for the export's member spill file (#427) -- the on-disk
     /// backing the partitioning single-read pass 2 (#235) falls back to when
@@ -3646,8 +3643,7 @@ struct Member {
     props: SharedProps,
     /// `Some` on every member when [`ExportOptions::feature_id`] is set
     /// (every row of the file validated up front, #443); `None` when it is
-    /// not, in which case [`build_mvt`] falls back to the tile-local member
-    /// index.
+    /// not, in which case the MVT id is omitted.
     id: Option<u64>,
     /// The feature's density gap (#745): how far it lies from the row before
     /// it, in squared Web Mercator world units. The size valve merges the
@@ -8022,9 +8018,6 @@ fn build_mvt_with<M: TileFeature>(
     fill: &[&FillFeature],
     encode: impl Fn(&M) -> EncodedFeatureGeometry + Sync,
 ) -> TileMvt {
-    // #443: a resolved `--feature-id` always wins; the no-flag default
-    // (`m.id` is `None`) keeps the pre-#443 tile-local member index.
-    let id_of = |i: usize, m: &M| Some(m.feature_id().unwrap_or(i as u64));
     let mut source_ids = Vec::new();
     let mut source_losses = Vec::new();
     let mut track = |id: Option<u64>, geom: &EncodedFeatureGeometry| {
@@ -8054,19 +8047,18 @@ fn build_mvt_with<M: TileFeature>(
         // Intern and emit each chunk in original member order; only geometry
         // projection runs in parallel, exactly as before.
         const GEOMETRY_CHUNK_MEMBERS: usize = 4096;
-        for (chunk_index, chunk) in members.chunks(GEOMETRY_CHUNK_MEMBERS).enumerate() {
+        for chunk in members.chunks(GEOMETRY_CHUNK_MEMBERS) {
             let encoded: Vec<EncodedFeatureGeometry> = chunk.par_iter().map(&encode).collect();
-            for (offset, (m, geom)) in chunk.iter().zip(encoded).enumerate() {
-                let i = chunk_index * GEOMETRY_CHUNK_MEMBERS + offset;
+            for (m, geom) in chunk.iter().zip(encoded) {
                 track(m.feature_id().map(|_| m.source_row()), &geom);
-                layer.add_encoded_feature(id_of(i, m), geom, m.properties());
+                layer.add_encoded_feature(m.feature_id(), geom, m.properties());
             }
         }
     } else {
-        for (i, m) in members.iter().enumerate() {
+        for m in members {
             let geom = encode(m);
             track(m.feature_id().map(|_| m.source_row()), &geom);
-            layer.add_encoded_feature(id_of(i, m), geom, m.properties());
+            layer.add_encoded_feature(m.feature_id(), geom, m.properties());
         }
     }
     // The fill is drawn but is not the data's own features: the report,
@@ -9682,7 +9674,8 @@ mod tests {
             // its contents did not -- the tile-data section, root directory
             // and metadata all hash the same as before. See the REPIN note
             // above this test for the full before/after evidence.
-            "16b372437283d228",
+            // #443: default features no longer carry tile-local ids.
+            "caf04e1922c86b7b",
             "archive bytes diverged from the pre-refactor reference"
         );
 
@@ -11339,7 +11332,7 @@ mod tests {
 
         for tile_members in [&members[..], &members[..40]] {
             let mut serial = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
-            for (i, m) in tile_members.iter().enumerate() {
+            for m in tile_members {
                 // Through the public `String`-keyed entry point, so this
                 // also pins that the export's interned `Arc<str>` keys
                 // (#461) encode the same bytes.
@@ -11349,7 +11342,7 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v.clone()))
                     .collect();
                 serial.add_feature(
-                    Some(i as u64),
+                    m.feature_id(),
                     &m.geom,
                     &props,
                     &tb,
@@ -18219,10 +18212,9 @@ mod tests {
         }
     }
 
-    /// With no `--feature-id`, a feature's id is its member index, in the
-    /// parallel encode's later chunks too.
+    /// With no `--feature-id`, even later parallel chunks omit feature ids.
     #[test]
-    fn build_mvt_numbers_members_past_the_first_parallel_chunk() {
+    fn build_mvt_omits_ids_past_the_first_parallel_chunk() {
         let tb = TileCoord::new(0, 0, 1).bounds();
         let n = 4096 + 3;
         let members: Vec<Member> = (0..n)
@@ -18253,7 +18245,7 @@ mod tests {
             .iter()
             .map(|f| f.id)
             .collect();
-        assert_eq!(ids, (0..n as u64).map(Some).collect::<Vec<_>>());
+        assert_eq!(ids, vec![None; n]);
     }
 }
 
