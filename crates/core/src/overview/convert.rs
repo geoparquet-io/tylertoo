@@ -299,24 +299,54 @@ impl ClassRanking {
     ///
     /// # Errors
     ///
-    /// A description of the first rule broken.
+    /// The first rule broken, as a [`ClassRankingError`].
     pub fn new(
         column: impl Into<String>,
         ranks: Vec<(String, f64)>,
         unknown_rank: Option<f64>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ClassRankingError> {
         if ranks.is_empty() {
-            return Err("at least one class rank is required".to_string());
+            return Err(ClassRankingError::Empty);
         }
         // The one finiteness rule and message (#428), shared with a
         // struct-literal ranking's check in `validate_options`.
-        super::config::check_ranks_finite(&ranks, unknown_rank).map_err(|e| e.to_string())?;
+        if let Some((class, rank)) = super::config::first_non_finite_rank(&ranks, unknown_rank) {
+            return Err(ClassRankingError::NotFinite { class, rank });
+        }
         let min_rank = ranks.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
         Ok(Self {
             column: column.into(),
             ranks,
             unknown_rank: unknown_rank.unwrap_or(min_rank - 1.0),
         })
+    }
+}
+
+/// Why [`ClassRanking::new`] refused a ranking.
+///
+/// `#[non_exhaustive]`: new rules are added without a breaking change; match
+/// with a wildcard arm. Every variant is a usage error
+/// ([`ErrorKind::Usage`](crate::ErrorKind::Usage)).
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ClassRankingError {
+    /// No `(value, priority)` pair.
+    #[error("at least one class rank is required")]
+    Empty,
+    /// A priority, or the explicit unknown-class rank, is not finite (#428).
+    #[error("{}", super::config::rank_not_finite_message(class.as_deref(), *rank))]
+    #[non_exhaustive]
+    NotFinite {
+        /// The class, or `None` for the unknown-class rank.
+        class: Option<String>,
+        /// The rank.
+        rank: f64,
+    },
+}
+
+impl crate::error::Classify for ClassRankingError {
+    fn kind(&self) -> crate::error::ErrorKind {
+        crate::error::ErrorKind::Usage
     }
 }
 
@@ -2978,7 +3008,7 @@ pub fn parse_class_rank(spec: &str) -> Result<ClassRanking, String> {
 
     // The shared rules: finite ranks (#428), and unknown values losing to
     // every named class but beating nulls.
-    ClassRanking::new(column, ranks, None)
+    ClassRanking::new(column, ranks, None).map_err(|e| e.to_string())
 }
 
 /// Parse an `--accumulate-attribute` spec: `COL:OP` with OP one of
@@ -10526,14 +10556,36 @@ mod tests {
 
     #[test]
     fn class_ranking_new_rejects_empty_and_non_finite() {
-        assert!(ClassRanking::new("c", vec![], None)
-            .unwrap_err()
-            .contains("at least one"));
+        use crate::error::{Classify, ErrorKind};
+        let err = ClassRanking::new("c", vec![], None).unwrap_err();
+        assert_eq!(err, ClassRankingError::Empty);
+        assert_eq!(err.kind(), ErrorKind::Usage);
+        // The pre-typed (String) messages, byte for byte.
+        assert_eq!(err.to_string(), "at least one class rank is required");
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let err = ClassRanking::new("c", vec![("a".into(), bad)], None).unwrap_err();
-            assert!(err.contains("finite") && err.contains("\"a\""), "{err}");
+            assert!(
+                matches!(err, ClassRankingError::NotFinite { class: Some(ref c), .. } if c == "a")
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "rank {bad} for class \"a\" must be a finite number (NaN and infinity \
+                     cannot be ordered against other classes)"
+                )
+            );
             let err = ClassRanking::new("c", vec![("a".into(), 1.0)], Some(bad)).unwrap_err();
-            assert!(err.contains("finite") && err.contains("unknown"), "{err}");
+            assert!(matches!(
+                err,
+                ClassRankingError::NotFinite { class: None, .. }
+            ));
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "rank {bad} for unknown (unlisted) classes must be a finite number (NaN \
+                     and infinity cannot be ordered against other classes)"
+                )
+            );
         }
     }
 
