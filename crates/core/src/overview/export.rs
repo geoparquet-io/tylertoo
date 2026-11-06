@@ -5409,10 +5409,12 @@ fn scan_all_levels_from(
                                 crate::Error::GeoParquetRead(format!("geometry decode: {e}"))
                             })?;
                         let mut out = Vec::with_capacity(batch.num_rows());
+                        // Quiet: without variable depth the scan counts these
+                        // rows' decode warnings only in its own bbox decode.
                         crate::batch_processor::extract_geometries_opt_from_array(
                             garr.as_ref(),
                             &mut out,
-                            diagnostics,
+                            &crate::diagnostics::Diagnostics::silent(),
                         )?;
                         Ok(out)
                     };
@@ -9841,14 +9843,14 @@ mod tests {
 
     // --- fixture builders ----------------------------------------------------
 
-    fn build_geometry_array(geoms: &[Geometry<f64>]) -> geoarrow::array::GeometryArray {
+    pub(super) fn build_geometry_array(geoms: &[Geometry<f64>]) -> geoarrow::array::GeometryArray {
         let typ = GeometryType::new(Default::default());
         let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
         b.extend_from_iter(geoms.iter().map(Some));
         b.finish()
     }
 
-    fn geometry_field() -> Field {
+    pub(super) fn geometry_field() -> Field {
         build_geometry_array(&[Geometry::Point(Point::new(0.0, 0.0))])
             .data_type()
             .to_field("geometry", true)

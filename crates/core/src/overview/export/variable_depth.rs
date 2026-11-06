@@ -826,8 +826,13 @@ impl VdPlan {
         mut each: impl FnMut(Probed) -> bool,
     ) -> Result<usize, ExportError> {
         let mut frontier = Frontier::new(self.zooms.len());
-        // Rows the probe reads are read again by the export proper, so
-        // their decode and clip warnings are counted there, not here.
+        // The probe's reads are quiet. A canonical row's decode warnings are
+        // the export's wherever its tiles are drawn: by the scan, and by the
+        // canonical level's read for the rows of tiles that do not stop. The
+        // rows under a stopped tile are never read again, and their clip
+        // warnings, which belong to canonical tiles that are not written,
+        // are not reported. A stopped tile's encode events are staged per
+        // tile and kept only when it stops.
         let quiet = crate::diagnostics::Diagnostics::silent();
         let gzip_cache = Arc::new(TileGzipCache::new(
             crate::compression::tile_gzip::PAYLOAD_SLICE_BYTES,
@@ -2021,6 +2026,89 @@ mod tests {
         assert_eq!(report.variable_depth, None);
         assert!(report.zooms.iter().all(|z| z.stopped_tiles == 0));
         assert!(!ArchiveIndex::open(&off).unwrap().is_variable_depth());
+    }
+
+    /// The export's diagnostics are the same with and without variable
+    /// depth, on a mixed file (so the scan decodes its geometry for rule
+    /// A′) with a non-finite row, a self-crossing polygon in a dense block
+    /// that never stops, and a sparse branch that does. Written directly:
+    /// convert would empty the non-finite row.
+    #[test]
+    fn diagnostics_match_flag_off() {
+        use std::sync::Arc;
+
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use super::super::super::level::gsd;
+        use super::super::super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions};
+        use super::super::tests::{build_geometry_array, geometry_field};
+        use geoarrow_array::GeoArrowArray;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut geoms: Vec<Geometry> = dense_and_sparse()
+            .into_iter()
+            .map(|(x, y, _)| pt(x, y))
+            .collect();
+        geoms.push(pt(f64::NAN, 1.0));
+        geoms.push(Geometry::Polygon(geo::Polygon::new(
+            geo::LineString::from(vec![
+                (10.0, 45.0),
+                (10.2, 45.2),
+                (10.2, 45.0),
+                (10.0, 45.05),
+                (10.0, 45.0),
+            ]),
+            vec![],
+        )));
+        let ov = dir.path().join("ov.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            geometry_field(),
+        ]));
+        let specs = (0..=10).map(|z| LevelSpec::new(gsd(z), Some(z))).collect();
+        let mut writer = OverviewWriter::create(
+            &ov,
+            &schema,
+            OverviewWriterOptions::new(Mode::Duplicating, specs),
+        )
+        .unwrap();
+        for k in 0..=10 {
+            let n = geoms.len();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                    Arc::new(build_geometry_array(&geoms).to_array_ref()),
+                ],
+            )
+            .unwrap();
+            let _written = writer
+                .write_level(k, Some(n), std::iter::once(batch))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let off = export_pmtiles(&ov, dir.path().join("off.pmtiles"), &raw_cap(20_000)).unwrap();
+        let (on, tiles) = export_vd(&ov, raw_cap(20_000));
+        assert!(!stopped(&tiles, 10).is_empty());
+        let events = |r: &ExportReport| -> Vec<_> {
+            r.diagnostics
+                .iter()
+                .filter(|d| !matches!(d, crate::diagnostics::Diagnostic::MemoryBudget { .. }))
+                .cloned()
+                .collect()
+        };
+        let off_events = events(&off);
+        for kind in ["NonFiniteGeometry", "PolygonRepaired"] {
+            assert!(
+                off_events
+                    .iter()
+                    .any(|d| format!("{d:?}").starts_with(kind)),
+                "{kind} in {off_events:?}"
+            );
+        }
+        assert_eq!(events(&on), off_events);
     }
 
     /// A rejected probe's repairs are not the export's: with every probe
