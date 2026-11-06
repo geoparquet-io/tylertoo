@@ -1767,7 +1767,7 @@ impl PyramidOptions {
     ///
     /// # Errors
     ///
-    /// [`Error::Config`], or [`Error::InvalidConfig`] for a convert knob.
+    /// [`PyramidError::Config`], or [`PyramidError::InvalidConfig`] for a convert knob.
     /// Validate these options and return the immutable engine configuration.
     pub fn validate(
         &self,
