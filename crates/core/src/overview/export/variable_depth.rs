@@ -829,6 +829,13 @@ impl VdPlan {
         ));
         #[cfg(test)]
         let work = std::sync::Mutex::default();
+        // The probe's members are held beside the levels' own waves, which
+        // the budget already sizes: a quarter of their width keeps the peak
+        // where the levels alone put it.
+        let budget = PartitionBudget {
+            ceiling_wave: (p.budget.ceiling_wave / PROBE_WAVE_SHARE).max(1),
+            ..*p.budget
+        };
         let (mut probed, mut stops) = (0usize, 0usize);
         for k in 0..self.canonical {
             let zoom = self.zooms[k];
@@ -839,7 +846,7 @@ impl VdPlan {
             };
             if let Some((opts, candidates)) = self.candidates(k, p.options, &frontier) {
                 probed += candidates.len();
-                let plan = plan_level(&candidates, zoom, p.budget, || {
+                let plan = plan_level(&candidates, zoom, &budget, || {
                     format!("variable-depth probe z{zoom}")
                 });
                 let ctx = LevelCtx {
@@ -886,6 +893,9 @@ impl VdPlan {
         Ok(probed)
     }
 }
+
+/// The probe's share of the partition wave: it gets `1 / PROBE_WAVE_SHARE`.
+const PROBE_WAVE_SHARE: usize = 4;
 
 /// One level's probe result: its stopped tiles' keys, and the tiles
 /// themselves in key order.
