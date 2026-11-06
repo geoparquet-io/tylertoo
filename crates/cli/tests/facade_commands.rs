@@ -124,11 +124,14 @@ fn pyramid_has_parity_with_export_flags() {
         "spill-dir",
         // Real gap, not an intent: follow-up issue #801 (pyramid --profile)
         "profile",
+        // #803: refused; a variable-depth band's missing tiles mean "draw
+        // the stored ancestor", which the band merge cannot keep.
+        "generate-variable-depth-tile-pyramid",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect();
-    assert_eq!(exemptions.len(), 6);
+    assert_eq!(exemptions.len(), 7);
     let missing: BTreeSet<_> = export.difference(&pyramid).cloned().collect();
     assert_eq!(missing, exemptions);
 }

@@ -61,6 +61,7 @@ TYPE_ORDER = [
     "ExportReport",
     "ZoomReport",
     "SkippedPropertyColumn",
+    "VariableDepthReport",
     "PyramidReport",
     "PyramidBandReport",
     "PublicationMetadata",

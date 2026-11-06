@@ -373,6 +373,15 @@ fn at(idx: &ArchiveIndex, e: Error) -> Error {
 /// them. Mirrors the pyramid's up-front checks; the mismatch names both
 /// archives, because "these disagree" is unactionable without knowing which.
 fn check_inputs_agree(indexes: &[ArchiveIndex]) -> Result<Compression> {
+    // #803: a variable-depth archive's missing tiles mean "draw the stored
+    // ancestor"; merged with another archive's tiles there, they would not.
+    if let Some(idx) = indexes.iter().find(|idx| idx.is_variable_depth()) {
+        return Err(InvalidConfigError::VariableDepthArchive {
+            path: idx.path().to_path_buf(),
+            operation: "merge",
+        }
+        .into());
+    }
     let first = &indexes[0];
     let (tile_type, compression) = (first.header().tile_type, first.header().tile_compression);
     for idx in &indexes[1..] {

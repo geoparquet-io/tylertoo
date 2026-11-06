@@ -1390,6 +1390,7 @@ mod tests {
         opts.source_is_subset = source_is_subset;
         opts.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
@@ -1688,6 +1689,7 @@ mod tests {
         let mut opts = OverviewWriterOptions::new(Mode::Duplicating, specs);
         opts.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,

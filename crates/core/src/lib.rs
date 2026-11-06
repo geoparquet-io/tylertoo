@@ -165,7 +165,7 @@ pub use overview::{
 // Export: overview GeoParquet -> PMTiles.
 pub use overview::export::{
     export_pmtiles, ExportError, ExportOptions, ExportReport, FeatureIdColumnProblem, FeatureOrder,
-    InvalidFeatureIdReason, SizeValve, SkippedPropertyColumn, ZoomReport,
+    InvalidFeatureIdReason, SizeValve, SkippedPropertyColumn, VariableDepthReport, ZoomReport,
 };
 // Check: validate an overview file against the spec.
 pub use overview::check::{validate_file, CheckError, CheckResult, ValidationReport};
@@ -670,6 +670,23 @@ pub enum InvalidConfigError {
     /// A pyramid's band convert options are refused.
     #[error("band convert options: {0}")]
     BandConvertOptions(Box<overview::convert::ConvertError>),
+    /// `operation` (merge, pyramid) was given a variable-depth archive
+    /// (#803), whose missing tiles mean "draw the stored ancestor", which
+    /// another archive's tiles there would contradict.
+    #[error(
+        "{}: is a variable-depth archive ({}), whose missing tiles are drawn by a stored \
+         ancestor; {operation} cannot combine it with other tiles. Re-tile it without \
+         --generate-variable-depth-tile-pyramid",
+        path.display(),
+        crate::pmtiles_writer::VARIABLE_DEPTH_KEY
+    )]
+    #[non_exhaustive]
+    VariableDepthArchive {
+        /// The variable-depth archive.
+        path: std::path::PathBuf,
+        /// `merge` or `pyramid`.
+        operation: &'static str,
+    },
 }
 
 impl From<InvalidConfigError> for Error {

@@ -212,3 +212,16 @@ def test_batch_bounds_are_accepted_before_missing_input(
     with pytest.raises(RuntimeError) as raised:
         _convert(tmp_path, read_batch_size=size)
     assert not isinstance(raised.value, tylertoo.ConfigError)
+
+
+def test_variable_depth_refusals_are_config_errors(tmp_path: Path) -> None:
+    # #803: what the stop rule cannot see, and a probe with no raw cap.
+    with pytest.raises(tylertoo.ConfigError, match="polygon-thinning"):
+        _convert(tmp_path, variable_depth=True, polygon_thinning=0.5)
+    with pytest.raises(tylertoo.ConfigError, match="max-tile-size 0"):
+        tylertoo.export_pmtiles(
+            MISSING,
+            str(tmp_path / "out.pmtiles"),
+            variable_depth=True,
+            tile_size_limit=0,
+        )

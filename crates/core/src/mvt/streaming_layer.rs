@@ -70,6 +70,12 @@ impl<'a> StreamingLayerBuilder<'a> {
         }
     }
 
+    /// The serialized features and tables so far: a lower bound on the
+    /// built layer's size.
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.features.len() + self.keys.len() + self.values.len()
+    }
+
     pub(crate) fn feature_count(&self) -> usize {
         self.count
     }

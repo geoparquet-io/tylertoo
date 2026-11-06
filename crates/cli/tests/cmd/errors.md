@@ -69,9 +69,9 @@ the usual cause.
 
 ```console
 $ tylertoo merge out.pmtiles shard.pmtiles shard.pmtiles
-? 1
+? 2
 Merging 2 archive(s) → out.pmtiles
-Error: merge failed: Invalid configuration: shard.pmtiles and shard.pmtiles claim overlapping tile ids: both address tile id 1210 (z5/16/11). merge concatenates disjoint shards — it will not reconcile a tile two inputs both claim, so check how the shards were cut (a shard listed twice, or one left over from an earlier run, is the usual cause). The same archive named twice means its own directory addresses that id more than once, which no valid PMTiles archive does
+Error: Invalid configuration: shard.pmtiles and shard.pmtiles claim overlapping tile ids: both address tile id 1210 (z5/16/11). merge concatenates disjoint shards — it will not reconcile a tile two inputs both claim, so check how the shards were cut (a shard listed twice, or one left over from an earlier run, is the usual cause). The same archive named twice means its own directory addresses that id more than once, which no valid PMTiles archive does
 
 ```
 

@@ -31,6 +31,7 @@ Args:
     max_compressed_tile_size: See `export_pmtiles()`. `"auto"` is no
         limit with `verbatim`.
     coverage_fill: See `export_pmtiles()`.
+    variable_depth: See `export_pmtiles()`.
     gsds: See `overview()`.
     bbox: See `overview()`.
     name: See `export_pmtiles()`.
