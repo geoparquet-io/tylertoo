@@ -276,19 +276,24 @@ impl Skim<'_> {
         Ok(())
     }
 
+    /// A varint. parquet-rs reads past 10 bytes by wrapping the shift, so an
+    /// overlong one decodes to a value this walk would not see (#789): refuse
+    /// it rather than leave it to the decoder.
     fn varint(&mut self) -> Result<u64, SkimStop> {
+        let overlong =
+            || SkimStop::Hostile("a varint in the footer is longer than 10 bytes".into());
         let mut value = 0u64;
         for shift in (0..70).step_by(7) {
             let b = self.byte()?;
             if shift == 63 && b > 1 {
-                return Err(SkimStop::Confused);
+                return Err(overlong());
             }
             value |= u64::from(b & 0x7f) << shift;
             if b & 0x80 == 0 {
                 return Ok(value);
             }
         }
-        Err(SkimStop::Confused)
+        Err(overlong())
     }
 
     fn zigzag(&mut self) -> Result<i64, SkimStop> {
@@ -468,6 +473,47 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
     match walked {
         Err(SkimStop::Hostile(reason)) => Err(InputError::HostileFooter(reason)),
         Ok(()) | Err(SkimStop::Confused) => Ok(()),
+    }
+}
+
+/// A [`ChunkReader`] whose streams fail at end of input instead of
+/// returning 0 bytes (#789).
+///
+/// parquet-rs reads a page header off `get_read`'s stream, and skips an
+/// unknown field's `uuid` or `double` with `io::copy(take(n))`, which
+/// succeeds at end of input having consumed nothing. A 4 KB page header of
+/// nested sets of those leaves then costs minutes of CPU: once the bytes
+/// run out every remaining leaf is free, and the tree is exponential. An
+/// honest header never reads past the file, so end of input is an error.
+struct PageGuard<R>(R);
+
+/// [`PageGuard::get_read`]'s stream.
+struct NoEof<T>(T);
+
+impl<T: Read> Read for NoEof<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.read(buf)? {
+            0 if !buf.is_empty() => Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n => Ok(n),
+        }
+    }
+}
+
+impl<R: ChunkReader> Length for PageGuard<R> {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+}
+
+impl<R: ChunkReader> ChunkReader for PageGuard<R> {
+    type T = NoEof<R::T>;
+
+    fn get_read(&self, start: u64) -> Result<Self::T, ParquetError> {
+        self.0.get_read(start).map(NoEof)
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes, ParquetError> {
+        self.0.get_bytes(start, length)
     }
 }
 
@@ -1366,8 +1412,9 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
             clippy::disallowed_methods,
             reason = "#779: reader owner reuses checked metadata and applies batch limits"
         )]
-        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(self.reader, metadata)
-            .with_batch_size(rows);
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(PageGuard(self.reader), metadata)
+                .with_batch_size(rows);
         if let Some(projection) = self.projection {
             builder = builder.with_projection(projection);
         }
