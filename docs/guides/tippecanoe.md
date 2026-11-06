@@ -22,16 +22,17 @@ tippecanoe running its recorded flags for each (`--drop-densest-as-needed`,
 `--simplification=10`, …) — both tools in a production configuration, not a
 rigged one. The "thinning off" column re-runs tylertoo with `--verbatim
 --simplify-factor 1.0` so it cannot win by emitting fewer features. Median
-of 3 warm runs per tool, alternating the tools within each round, on an idle
-64-core arm64 host (the run line under the table names it).
+of 3 warm runs per tool, alternating the tools within each round, on a 64-core
+arm64 host with no other jobs running (the run line under the table names
+it). Both speedup columns are end to end.
 
 <!-- bench:e2e-corpus/tippecanoe-table -->
 | dataset (class) | features | tylertoo | tippecanoe e2e | speedup | speedup, thinning off | peak RSS (tylertoo / tippecanoe) |
 |---|---|---|---|---|---|---|
-| NYC places (point) † | 630,065 | 1.57 s | 42.66 s | **27.2×** | 2.2×* | 2,210 / 1,352 MB |
-| Portland buildings (polygon) | 813,456 | 3.68 s | 84.81 s | **23.0×** | 13.4× | 3,132 / 2,127 MB |
-| Oregon roads (line) | 1,203,997 | 10.65 s | 180.69 s | **17.0×** | 16.9× | 9,051 / 2,435 MB |
-| Moldova parcels (polygon, dense) | 631,910 | 7.78 s | 167.27 s | **21.5×** | 17.5× | 4,520 / 2,431 MB |
+| NYC places (point) † | 630,065 | 1.57 s | 42.66 s | **27.2×** | 2.3×* | 2,210 / 1,352 MB |
+| Portland buildings (polygon) | 813,456 | 3.68 s | 84.81 s | **23.0×** | 13.7× | 3,132 / 2,127 MB |
+| Oregon roads (line) | 1,203,997 | 10.65 s | 180.69 s | **17.0×** | 17.3× | 9,051 / 2,435 MB |
+| Moldova parcels (polygon, dense) | 631,910 | 7.78 s | 167.27 s | **21.5×** | 17.9× | 4,520 / 2,431 MB |
 
 _Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
@@ -42,7 +43,7 @@ The honest footnotes, which are the point of this table:
   flags (`--extend-zooms-if-still-dropping`) had it building z15–z16 — 9,694
   of its 10,543 tiles and 69% of its output bytes — while tylertoo stopped at
   the requested z14. Both of that row's ratios include that extra work.
-- *The point row's "thinning off" 2.2× is the weakest number this harness has
+- *The point row's "thinning off" 2.3× is the weakest number this harness has
   produced, and it carries a second mismatch on top of †:* `--verbatim` makes
   tylertoo carry all 630k points at every zoom (1.57 s → 18.38 s). The two
   tools also thin points by different rules, so they keep different points
@@ -58,8 +59,9 @@ The honest footnotes, which are the point of this table:
   tippecanoe's z0–16; at z0–14 on both sides tylertoo's is 2.1× bigger.
 - Converting GeoParquet for tippecanoe is only 2–4% of its end-to-end wall at
   this scale — the gap is tiler vs tiler, not a format-conversion tax.
-- On a small contiguous admin coverage (the 17k-polygon fixture set), the
-  parity-matched ratio is **≈7.5×**, not 16–20×.
+- On a small contiguous admin coverage (the 17k-polygon fixture set, an
+  older 12-core laptop run in `benchmarks/e2e/RESULTS.md`), the
+  parity-matched ratio was **≈7.5×**, well below the corpus rows.
 
 ## At scale: 21.6M Overture buildings
 
@@ -68,6 +70,9 @@ part pinned by ETag. tylertoo reads the GeoParquet parts straight from
 `s3://` with `--bbox`, fetching only the row groups the bbox touches.
 tippecanoe can't read GeoParquet or S3, so its time includes extracting the
 same bbox to local GeoParquet with gpio and converting it to FlatGeobuf.
+The `s3://` row is a single run (the local rows are medians of 3). Its
+archive differs from the local extract's by 3 KB of 912 MB; that
+difference has not been traced.
 
 <!-- bench:overture-buildings-netherlands/vida-head-to-head -->
 Overture buildings 2026-10-21.0, netherlands (bbox 3.31,50.75,7.23,53.56): 21,557,082 features, 1.9 GB.

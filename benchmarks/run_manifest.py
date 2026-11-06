@@ -452,7 +452,7 @@ def provenance(bins: list[dict], inputs: dict) -> dict:
     return {
         "commit": _out(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"]),
         "tylertoo_version": _out([head["path"], "--version"]),
-        "host": f"{h['machine']} {h['cpu_model']} x{h['cpus']}".strip(),
+        "host": f"{h['machine']}, CPU {h['cpu_model'] or 'unknown'}, {h['cpus']} CPUs",
         "nproc": os.cpu_count(),
         "kernel": platform.release(),
         "allocator": head["allocator"],

@@ -48,7 +48,7 @@ covers = "`assign_levels_bounded` and `apply_density_budget` at a fixed, CI-size
 kind = "cpu"
 paths = [
     'crates/core/src/overview/(simplify|level)\.rs',
-    'crates/core/src/(mvt|tile|world_coord)\.rs',
+    'crates/core/src/(mvt|tile)(\.rs|/.+)',
     'crates/core/src/(batch_processor|wkb|wkb_column)\.rs',
 ]
 covers = "`simplify_cascade` over real polygons through a 10-level chain with a zoom-band `Point` tail"
@@ -60,17 +60,17 @@ covers = "Junction matching in `coalesce_level_lines`, adversarial RDP on sawtoo
 
 [bench.mvt_encode]
 kind = "cpu"
-paths = ['crates/core/src/(mvt|tile|world_coord)\.rs']
+paths = ['crates/core/src/(mvt|tile)(\.rs|/.+)']
 covers = "`encode_polygon`, its over-cap early exit (`antarctica_316k_over_cap`), and `LayerBuilder::add_feature`/`build`"
 
 [bench.clipping]
 kind = "cpu"
-paths = ['crates/core/src/(clip|ioverlay_clip|sutherland_hodgman|tile|world_coord)\.rs']
+paths = ['crates/core/src/(clip|ioverlay_clip|sutherland_hodgman|tile)\.rs']
 covers = "Sutherland-Hodgman against `i_overlay`, plus `export_clip_mix`, the point, line, and polygon mix that export clips per tile"
 
 [bench.bbox_containment]
 kind = "cpu"
-paths = ['crates/core/src/(clip|ioverlay_clip|sutherland_hodgman|tile|world_coord)\.rs']
+paths = ['crates/core/src/(clip|ioverlay_clip|sutherland_hodgman|tile)\.rs']
 covers = "Bounding-box containment fast paths"
 
 [bench.hostile_geometry]
@@ -81,8 +81,8 @@ covers = "Production clip, raw Sutherland-Hodgman and raw `i_overlay` on clean, 
 [bench.tile_compress_dedup]
 kind = "cpu"
 paths = [
-    'crates/core/src/(compression|dedup)\.rs',
-    'crates/core/src/(mvt|tile|world_coord)\.rs',
+    'crates/core/src/(compression|dedup)(\.rs|/.+)',
+    'crates/core/src/(mvt|tile)(\.rs|/.+)',
 ]
 covers = "Per-tile gzip and the XXH3 tile-content dedup cache"
 
@@ -96,7 +96,7 @@ covers = "`convert_to_overviews` then `export_pmtiles` on two small real fixture
 kind = "syscall"
 paths = [
     'crates/core/src/overview/(export|export/.*|stream)\.rs',
-    'crates/core/src/(mvt|tile|world_coord)\.rs',
+    'crates/core/src/(mvt|tile)(\.rs|/.+)',
 ]
 covers = "`export_pmtiles` with coverage fill off and on, over a 1,500-field Moldova prefix"
 

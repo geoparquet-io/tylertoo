@@ -303,7 +303,7 @@ def tippecanoe_table(r) -> str:
             f"| {s(e['tylertoo']['wall_median_s'])} "
             f"| {s(e['tippecanoe_e2e']['wall_median_s'])} "
             f"| **{e['ratios']['e2e_speedup']:.1f}×** "
-            f"| {e['ratios']['tiles_only_speedup_quality_matched']:.1f}×"
+            f"| {e['ratios']['e2e_speedup_quality_matched']:.1f}×"
             f"{'*' if zoom_mismatch(e) else ''} "
             f"| {e['tylertoo']['peak_rss_bytes'] / 1024**2:,.0f} / "
             f"{e['tippecanoe_fgb']['peak_rss_bytes'] / 1024**2:,.0f} MB |")
@@ -330,7 +330,7 @@ def max_memory_ratio(r) -> str:
 def readme_claim(r) -> str:
     ds = _line_poly(r)
     e2e = [e["ratios"]["e2e_speedup"] for e in ds]
-    qm = [e["ratios"]["tiles_only_speedup_quality_matched"] for e in ds]
+    qm = [e["ratios"]["e2e_speedup_quality_matched"] for e in ds]
     feats = [e["tylertoo"]["phases"]["input_features"] for e in ds]
     p = r["provenance"]
     return (
@@ -339,7 +339,7 @@ def readme_claim(r) -> str:
         f"line and polygon datasets at each tool's production settings "
         f"— {min(qm):.1f}–{max(qm):.1f}× with tylertoo's feature "
         f"thinning switched off, and at up to {max_memory_ratio(r)} peak memory "
-        f"({p['host'].split(',')[0]}, tylertoo {p['tylertoo_version']} @ "
+        f"({p['host'].split(',')[0]}, tylertoo {p['tylertoo_version'].removeprefix('tylertoo ')} @ "
         f"`{p['commit']}`, tippecanoe {p['tool_versions'].get('tippecanoe')}, "
         f"{(p['date'] or 'undated')[:10]})")
 

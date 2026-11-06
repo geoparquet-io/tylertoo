@@ -87,7 +87,7 @@ test (Polygon, LineString) and nothing more. Do not average these rows.
 
 Everything above and below this section is the committed fixture run
 (`../results/e2e-fixtures.json`). This section is the committed **corpus** run
-(`../results/e2e-corpus.json`): the `corpus/manifest.json` datasets at 300k–813k
+(`../results/e2e-corpus.json`): the `corpus/manifest.json` datasets at 631k–1.2M
 features, where tiling throughput, not process start-up, is what is measured.
 Tables are generated from `e2e-corpus.json`. Reproduce with one command: `./benchmarks/e2e/run_corpus.sh`.
 
@@ -102,8 +102,9 @@ Tables are generated from `e2e-corpus.json`. Reproduce with one command: `./benc
 - **Recorded** — 2026-11-06T19:06:34Z → `e2e-corpus.json`
 <!-- /bench -->
 
-1. **Per-repeat spread.** The machine was idle (the harness's load gate
-   checked it before each run). Spread (max − min over min, from
+1. **Per-repeat spread.** No other job ran during the recording (checked
+   by hand before it started; `run_e2e.py` has no load gate and records no
+   load figure). Spread (max − min over min, from
    `wall_all_s` in `../results/e2e-corpus.json`) is ≤5.3% on every
    measurement except two tylertoo runs: Oregon roads at defaults (16.8%)
    and Moldova quality-matched (13.7%). tippecanoe and the FlatGeobuf
@@ -211,9 +212,9 @@ parallelism plus the native columnar read, bought with a larger working set
 
 ### Where tippecanoe's e2e time goes, and tylertoo's
 
-GeoParquet→FlatGeobuf conversion is 1–2% of tippecanoe's end-to-end wall on
-every corpus dataset (0.42–1.91 s; fastest converter per dataset, `ogr2ogr`
-except `gpio` on `polygons-portland-medium`) — at this scale the ratio is
+GeoParquet→FlatGeobuf conversion is 2–4% of tippecanoe's end-to-end wall on
+every corpus dataset (1.75–3.71 s; `gpio` was the fastest converter on all
+four) — at this scale the ratio is
 tiler vs tiler, not input format. tylertoo's own split:
 
 <!-- bench:e2e-corpus/phases -->
@@ -227,7 +228,7 @@ tiler vs tiler, not input format. tylertoo's own split:
 _Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
-(The defaults runs hit tylertoo's per-tile size valve on 4–53 tiles per
+(The defaults runs hit tylertoo's per-tile size valve on 25–44 tiles per
 dataset — the `oversized tiles` column; tippecanoe's flagged runs handle the
 same pressure with `--drop-densest-as-needed`.)
 
