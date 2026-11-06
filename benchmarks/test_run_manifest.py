@@ -405,6 +405,7 @@ def test_report_json_out_writes_a_results_file(tmp_path):
     assert doc["cells"]["cell"]["a"]["effective_cores"]["median"] == 3.0  # noqa: PLR2004
 
 
+@pytest.mark.skipif(not Path("/usr/bin/time").exists(), reason="needs GNU time")
 def test_timed_records_cpu_and_effective_cores(tmp_path):
     res = rm.timed(["sh", "-c", "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done"],
                    tmp_path / "log.txt")
