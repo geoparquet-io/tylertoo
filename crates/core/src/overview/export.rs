@@ -1129,16 +1129,23 @@ pub enum ExportError {
     },
 }
 
-impl ExportError {
-    /// Whether this is an option the caller must fix, refused before the
-    /// overview file is read ([`ExportOptions::validate`], #779), as opposed
-    /// to a problem with the file or the run. The Python bindings raise these
-    /// as `tylertoo.ConfigError`.
-    pub fn is_config(&self) -> bool {
-        matches!(
-            self,
-            ExportError::Config(_) | ExportError::DeclaredMinZoomAboveCeiling { .. }
-        )
+impl crate::error::Classify for ExportError {
+    /// [`ErrorKind::Usage`](crate::error::ErrorKind::Usage) is an option
+    /// refused before the overview file is read ([`ExportOptions::validate`],
+    /// #779); a property selection the file cannot satisfy is
+    /// [`ErrorKind::Input`](crate::error::ErrorKind::Input).
+    fn kind(&self) -> crate::error::ErrorKind {
+        use crate::error::ErrorKind;
+        match self {
+            ExportError::Config(_) | ExportError::DeclaredMinZoomAboveCeiling { .. } => {
+                ErrorKind::Usage
+            }
+            ExportError::UnknownProperty { .. }
+            | ExportError::UnsupportedProperty { .. }
+            | ExportError::CoveringProperty { .. }
+            | ExportError::PropertyRequiredByKnob { .. } => ErrorKind::Input,
+            _ => ErrorKind::Runtime,
+        }
     }
 }
 
@@ -16789,7 +16796,11 @@ mod tests {
             ..ExportOptions::default()
         };
         let err = export_pmtiles(tin.path(), tout.path(), &opts).unwrap_err();
-        assert!(err.is_config(), "got: {err}");
+        assert_eq!(
+            crate::error::Classify::kind(&err),
+            crate::error::ErrorKind::Usage,
+            "got: {err}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("33"), "error names the value: {msg}");
         assert!(msg.contains("--min-zoom"), "error names the flag: {msg}");

@@ -60,7 +60,7 @@ use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::Compression;
 use crate::dedup::TileHasher;
 use crate::pmtiles_metadata::{MetadataCollector, Resolved};
-use crate::pmtiles_writer::{tile_id_to_zxy, StreamingPmtilesWriter, TileType};
+use crate::pmtiles_writer::{tile_id_to_zxy, StreamingPmtilesWriter, TileType, WriteError};
 use crate::pyramid::{declared_zoom_range, layer_zoom_range, vector_layers_json, LayerMeta};
 use crate::tile::TileBounds;
 use crate::{Error, Result, TilesetMetadata};
@@ -225,7 +225,7 @@ pub fn merge_shards(
         Some(dir) => StreamingPmtilesWriter::with_temp_dir(tile_compression, dir.clone()),
         None => StreamingPmtilesWriter::new(tile_compression),
     }
-    .map_err(|e| Error::PMTilesWrite(format!("failed to create streaming writer: {e}")))?;
+    .map_err(|e| WriteError::io("create streaming writer", e))?;
     writer.set_metadata(publication.metadata.clone());
     // The k-way heap emits ids in ascending order, so the merge is clustered
     // by construction; #506's hook turns that doc claim into a checked
@@ -336,14 +336,12 @@ pub fn merge_shards(
                 data.len(),
                 0,
             )
-            .map_err(|e| Error::PMTilesWrite(format!("failed to add tile: {e}")))?;
+            .map_err(|e| WriteError::io("add tile", e))?;
         *per_zoom_tile_counts.entry(t.z).or_insert(0) += 1;
         tiles_total += 1;
     }
 
-    let stats = writer
-        .finalize(output)
-        .map_err(|e| Error::PMTilesWrite(format!("failed to write {}: {e}", output.display())))?;
+    let stats = writer.finalize(output).map_err(|e| Error::at(output, e))?;
 
     log::info!(
         "[merge] {} input(s) → {}: {tiles_total} tile(s), z{min_zoom}-z{max_zoom}",
@@ -369,7 +367,7 @@ pub fn merge_shards(
 
 /// Prefix an error with the archive it came from.
 fn at(idx: &ArchiveIndex, e: Error) -> Error {
-    Error::PMTilesWrite(format!("{}: {e}", idx.path().display()))
+    Error::at(idx.path(), e)
 }
 
 /// Every input must agree on tile type and tile compression, since the merge

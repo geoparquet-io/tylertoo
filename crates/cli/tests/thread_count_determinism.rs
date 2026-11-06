@@ -13,12 +13,6 @@
 //! rayon global pool per process, so no cross-run pool contamination) and
 //! asserts the PMTiles archive is byte-identical across all three.
 //!
-//! Both the streaming and `--no-streaming` engines are exercised: the
-//! per-level parallel winner-grid pass this ticket touches
-//! (`overview::assign::assign_levels`) is shared code, run by both, and on
-//! this fixture every run completes in well under a second, so covering
-//! both costs nothing.
-//!
 //! The intermediate overview Parquet (`--keep-overview`) IS now byte-compared
 //! too (tightened once #508 landed). It used to be excluded: the GeoParquet
 //! footer's `geometry_types` field serialized a `HashSet<String>` (see
@@ -69,7 +63,6 @@ fn run_tiles(
     out: &Path,
     overview_out: &Path,
     threads: u32,
-    no_streaming: bool,
     max_zoom: u8,
     extra: &[&str],
 ) -> (Vec<u8>, Vec<u8>) {
@@ -81,16 +74,13 @@ fn run_tiles(
         "0".to_string(),
         "--max-zoom".to_string(),
         max_zoom.to_string(),
-        // Fixed so the streaming and non-streaming runs (and every thread
-        // count) share one layer name and are directly comparable.
+        // Fixed so every thread count shares one layer name and the runs
+        // are directly comparable.
         "--layer-name".to_string(),
         "det423".to_string(),
         "--keep-overview".to_string(),
         overview_out.to_str().unwrap().to_string(),
     ];
-    if no_streaming {
-        args.push("--no-streaming".to_string());
-    }
     args.extend(extra.iter().map(|a| (*a).to_string()));
 
     let output = Command::new(tylertoo_bin())
@@ -105,7 +95,7 @@ fn run_tiles(
         .unwrap_or_else(|e| panic!("run tylertoo tiles (threads={threads}): {e}"));
     assert!(
         output.status.success(),
-        "RAYON_NUM_THREADS={threads} no_streaming={no_streaming} exited with {}: {}",
+        "RAYON_NUM_THREADS={threads} exited with {}: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
@@ -113,33 +103,28 @@ fn run_tiles(
     let bytes = std::fs::read(out).expect("read pmtiles output");
     assert!(
         bytes.starts_with(PMTILES_MAGIC),
-        "RAYON_NUM_THREADS={threads} no_streaming={no_streaming}: output does not start with \
+        "RAYON_NUM_THREADS={threads}: output does not start with \
          the PMTiles v3 magic"
     );
     let overview_bytes = std::fs::read(overview_out).expect("read kept overview output");
     assert!(
         overview_bytes.starts_with(b"PAR1"),
-        "RAYON_NUM_THREADS={threads} no_streaming={no_streaming}: kept overview does not start \
+        "RAYON_NUM_THREADS={threads}: kept overview does not start \
          with the parquet magic"
     );
     (bytes, overview_bytes)
 }
 
-/// #423 for one engine: the PMTiles archive and the kept overview must be
-/// byte-identical at `RAYON_NUM_THREADS` 1, 2 and 8. Both engines share the
-/// `assign_levels` code path #423 fixed; each engine is its own test so
-/// nextest runs them side by side.
-fn assert_pmtiles_thread_count_invariant(no_streaming: bool) {
+/// #423: the PMTiles archive and the kept overview must be byte-identical
+/// at `RAYON_NUM_THREADS` 1, 2 and 8.
+#[test]
+fn pmtiles_output_is_byte_identical_across_thread_counts_streaming() {
     let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
         return;
     };
     let dir = tempfile::tempdir().expect("tempdir");
 
-    let engine = if no_streaming {
-        "no-streaming"
-    } else {
-        "streaming"
-    };
+    let engine = "streaming";
     let mut baseline: Option<(u32, Vec<u8>, Vec<u8>)> = None;
 
     for threads in [1u32, 2, 8] {
@@ -147,15 +132,7 @@ fn assert_pmtiles_thread_count_invariant(no_streaming: bool) {
         let overview_out = dir
             .path()
             .join(format!("{engine}-t{threads}-overview.parquet"));
-        let (bytes, overview_bytes) = run_tiles(
-            &fixture,
-            &out,
-            &overview_out,
-            threads,
-            no_streaming,
-            14,
-            &[],
-        );
+        let (bytes, overview_bytes) = run_tiles(&fixture, &out, &overview_out, threads, 14, &[]);
 
         match &baseline {
             None => baseline = Some((threads, bytes, overview_bytes)),
@@ -194,16 +171,6 @@ fn assert_pmtiles_thread_count_invariant(no_streaming: bool) {
     }
 }
 
-#[test]
-fn pmtiles_output_is_byte_identical_across_thread_counts_streaming() {
-    assert_pmtiles_thread_count_invariant(false);
-}
-
-#[test]
-fn pmtiles_output_is_byte_identical_across_thread_counts_no_streaming() {
-    assert_pmtiles_thread_count_invariant(true);
-}
-
 /// #460 review (S2-X1 / S3-b): the `pmtiles_output_*` arms above are **vacuous for the parallel
 /// pass-1 scan**. `open-buildings.parquet` holds 1000 rows — fewer than one
 /// pass-1 scan chunk — so every batch is a single chunk at every thread
@@ -214,9 +181,7 @@ fn pmtiles_output_is_byte_identical_across_thread_counts_no_streaming() {
 /// `fieldmaps-madagascar-adm4.parquet` (17,465 rows) splits into real chunks,
 /// so the chunked merge, the interner/ladder serial seam, and the
 /// `stable_hash(index)` tie-break all actually vary with the thread count
-/// here. Streaming only: `--no-streaming` runs the in-memory pipeline, which
-/// has no pass-1 chunking to guard (the arm above already covers that engine
-/// for `assign_levels`).
+/// here.
 #[test]
 fn parallel_pass1_output_is_byte_identical_across_thread_counts() {
     let Some(fixture) = fixture::realdata("fieldmaps-madagascar-adm4.parquet") else {
@@ -243,7 +208,7 @@ fn parallel_pass1_output_is_byte_identical_across_thread_counts() {
                     let out = dir.join(format!("mada-t{threads}.pmtiles"));
                     let overview_out = dir.join(format!("mada-t{threads}-overview.parquet"));
                     let (bytes, overview_bytes) =
-                        run_tiles(fixture, &out, &overview_out, threads, false, MAX_ZOOM, &[]);
+                        run_tiles(fixture, &out, &overview_out, threads, MAX_ZOOM, &[]);
                     (threads, bytes, overview_bytes)
                 })
             })
@@ -362,8 +327,7 @@ fn pmtiles_output_is_byte_identical_across_read_worker_counts() {
             "--read-batch-size",
             "13",
         ];
-        let (bytes, overview_bytes) =
-            run_tiles(&multi, &out, &overview_out, 4, false, 8, &read_args);
+        let (bytes, overview_bytes) = run_tiles(&multi, &out, &overview_out, 4, 8, &read_args);
         let plan = dir.path().join(format!("rw{workers}.plan"));
         let plan_bytes = run_plan_only(&multi, &plan, 4, 8, &read_args);
         match &base_plan {
@@ -432,7 +396,6 @@ fn pmtiles_output_is_byte_identical_across_in_flight_batches() {
             &out,
             &overview_out,
             threads,
-            false,
             12,
             &[
                 "--in-flight-batches",
@@ -490,7 +453,6 @@ fn multi_part_output_is_byte_identical_across_read_worker_counts() {
             &out,
             &overview_out,
             4,
-            false,
             8,
             &[
                 "--read-workers",
@@ -570,15 +532,7 @@ fn assert_plan_thread_count_invariant(name: &str, max_zoom: u8, (arm, extra): (&
                     let plan = dir.join(format!("{tag}.plan"));
                     let mut args: Vec<&str> = vec!["--save-plan", plan.to_str().unwrap()];
                     args.extend_from_slice(extra);
-                    run_tiles(
-                        fixture,
-                        &out,
-                        &overview_out,
-                        threads,
-                        false,
-                        max_zoom,
-                        &args,
-                    );
+                    run_tiles(fixture, &out, &overview_out, threads, max_zoom, &args);
                     let plan_bytes = std::fs::read(&plan).expect("read saved convert plan");
                     // #560: the same plan, from the run that skips the export.
                     let only = dir.join(format!("{tag}-plan-only.plan"));

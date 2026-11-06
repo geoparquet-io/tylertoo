@@ -1,3 +1,4 @@
+use tylertoo_core::error::{Classify, ErrorKind};
 use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions};
 
 #[test]
@@ -18,7 +19,11 @@ fn plan_sources_validates_before_opening_input() {
         ..Default::default()
     };
     let err = write_convert_plan_sources(&source, &opts).unwrap_err();
-    assert!(err.is_config(), "expected config error before input: {err}");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::Usage,
+        "expected config error before input: {err}"
+    );
     assert!(!opts.save_plan.unwrap().exists());
 }
 
@@ -32,8 +37,9 @@ fn path_validates_before_resolving_partitions() {
         ..Default::default()
     };
     let err = convert_to_overviews(dir.path(), dir.path().join("out.parquet"), &opts).unwrap_err();
-    assert!(
-        err.is_config(),
+    assert_eq!(
+        err.kind(),
+        ErrorKind::Usage,
         "expected config error before opening input: {err}"
     );
 }

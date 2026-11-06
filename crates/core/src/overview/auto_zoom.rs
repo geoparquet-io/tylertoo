@@ -1333,7 +1333,6 @@ mod tests {
         );
         for streaming in [true, false] {
             let opts = ConvertOptions {
-                streaming,
                 bbox,
                 levels: LevelPlan::ZoomRange {
                     min_zoom: 10,
@@ -1342,7 +1341,10 @@ mod tests {
                 ..Default::default()
             };
             let output = dir.path().join(format!("out-{streaming}.parquet"));
-            let report = convert_to_overviews_sources(&stale, &output, &opts).unwrap();
+            let report = super::super::source::with_eager_input(!streaming, || {
+                convert_to_overviews_sources(&stale, &output, &opts)
+            })
+            .unwrap();
             assert_eq!(report.input_features, 20, "streaming={streaming}");
         }
         #[cfg(feature = "remote")]

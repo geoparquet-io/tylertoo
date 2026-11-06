@@ -484,8 +484,9 @@ must be recreated with `--save-plan`.
 Peak memory is `O(read batch + winner tables)` — Moldova (632k polygons,
 38M vertices) converts to a z0–14 pyramid in ~45 s / ~1.4 GB peak RSS on a 16-core machine
 (a default z0–6 pyramid is ~7 s / ~0.4 GB).
-`--no-streaming` keeps the in-memory pipeline as the equivalence-tested
-reference implementation.
+The in-memory reader (`overview::source::MemorySource`) is test-only since
+#440: unit tests run conversions through it to pin that the stages see the
+same rows whichever way the input is stored.
 
 Simplification (`overview/simplify.rs`) is Ramer–Douglas–Peucker in world
 space with tolerance = `simplify_factor × gsd(level)`. By default it

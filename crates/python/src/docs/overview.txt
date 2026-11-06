@@ -89,8 +89,6 @@ Args:
     row_group_size_policy: `"constant"`, or `"zoom-scaled"` to
         double the row-group cap per zoom coarser than the finest.
     full_column_stats: Keep Parquet statistics for every column.
-    streaming: Read the input in
-        [batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
     read_batch_size: Rows per
         [read batch](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
     bbox: Keep features that intersect this lon/lat box, also one

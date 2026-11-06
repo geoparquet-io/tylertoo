@@ -549,15 +549,13 @@ class TestOverviewIntegration:
             out, _ = self._overview(tmpdir, max_zoom=4, coalesce_lines=False)
             assert tylertoo.validate(str(out))["valid"] is True
 
-    def test_overview_streaming_off_matches_streaming_on(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _, on = self._overview(tmpdir, max_zoom=4, streaming=True)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _, off = self._overview(tmpdir, max_zoom=4, streaming=False)
-        assert on["total_rows"] == off["total_rows"]
-        assert [lvl["feature_count"] for lvl in on["levels"]] == [
-            lvl["feature_count"] for lvl in off["levels"]
-        ]
+    def test_overview_streaming_keyword_is_gone(self):
+        # #440: the in-memory engine switch was removed.
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(tylertoo.ConfigError, match="streaming"),
+        ):
+            self._overview(tmpdir, max_zoom=4, streaming=False)
 
     def test_overview_read_batch_size(self):
         with tempfile.TemporaryDirectory() as tmpdir:

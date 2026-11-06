@@ -8,6 +8,7 @@
 //! - Configurable compression (gzip, brotli, zstd) for both directories and tiles
 //! - Clustered mode for efficient sequential reads
 
+use crate::archive_index::ArchiveError;
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES};
 use crate::pmtiles_metadata::TilesetMetadata;
 use crate::tile::TileBounds;
@@ -17,6 +18,86 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+
+/// Why writing a PMTiles archive failed (#438). Reaches callers as
+/// [`Error::Write`], which prefixes "Failed to write PMTiles: ".
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WriteError {
+    /// An I/O step of the write failed.
+    #[error("Failed to {step}: {error}")]
+    Io {
+        /// The step, as "flush temp file" or "create output file PATH".
+        step: String,
+        /// The I/O error.
+        error: std::io::Error,
+    },
+    /// The metadata JSON is over the limit this crate's readers accept.
+    #[error(
+        "metadata JSON is {bytes} bytes, over the {cap}-byte limit readers accept; \
+         shorten the name, description or attribution"
+    )]
+    MetadataTooLarge {
+        /// The JSON's length.
+        bytes: u64,
+        /// The limit.
+        cap: u64,
+    },
+    /// The compressed metadata section is over the readers' limit.
+    #[error("metadata section is {bytes} bytes stored, over the {cap}-byte limit readers accept")]
+    StoredMetadataTooLarge {
+        /// The stored section's length.
+        bytes: u64,
+        /// The limit.
+        cap: u64,
+    },
+    /// Renaming the finished tail-layout archive over the output failed; the
+    /// complete archive is left at `kept`.
+    #[error(
+        "Failed to publish archive: {error}; the complete archive was written to {} \
+         -- rename it manually",
+        kept.display()
+    )]
+    Publish {
+        /// The rename's error.
+        error: std::io::Error,
+        /// Where the complete archive is.
+        kept: std::path::PathBuf,
+    },
+    /// A tail-layout writer was asked to publish an output other than the
+    /// one it reserved its prefix in.
+    #[error(
+        "tail-layout writer reserved its prefix in {} but was asked to write {}; \
+         a tail-layout writer can only publish the output it was created for",
+        reserved.display(),
+        requested.display()
+    )]
+    WrongOutput {
+        /// The `.partial` file the writer reserved.
+        reserved: std::path::PathBuf,
+        /// The output it was asked to write.
+        requested: std::path::PathBuf,
+    },
+    /// The writer was used after `finalize`.
+    #[error("Writer already finalized")]
+    Finalized,
+}
+
+impl WriteError {
+    /// [`WriteError::Io`] for `step`.
+    pub(crate) fn io(step: impl Into<String>, error: std::io::Error) -> Self {
+        WriteError::Io {
+            step: step.into(),
+            error,
+        }
+    }
+}
+
+impl crate::error::Classify for WriteError {
+    fn kind(&self) -> crate::error::ErrorKind {
+        crate::error::ErrorKind::Runtime
+    }
+}
 
 /// PMTiles v3 magic number
 const PMTILES_MAGIC: &[u8; 7] = b"PMTiles";
@@ -196,14 +277,14 @@ impl Header {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::PMTilesRead`] in each of the cases above.
+    /// Returns [`ArchiveError::Header`] in each of the cases above.
     ///
     /// # Panics
     ///
     /// Does not panic: every fixed-width field is read only after the length
     /// check has confirmed all 127 header bytes are present.
     pub fn from_bytes(bytes: &[u8]) -> Result<Header> {
-        let err = |msg: String| Error::PMTilesRead(msg);
+        let err = |msg: String| Error::from(ArchiveError::Header(msg));
         if bytes.len() < 127 {
             return Err(err(format!(
                 "file too short for PMTiles header: {} bytes (need 127)",
@@ -503,7 +584,7 @@ pub fn max_expanded_entries(header: &Header) -> u64 {
 ///
 /// # Errors
 ///
-/// Returns [`Error::PMTilesRead`] if `id` lies beyond the zoom 31 address
+/// Returns [`ArchiveError::TileIdOutOfRange`] if `id` lies beyond the zoom 31 address
 /// space.
 pub fn tile_id_to_zxy(id: u64) -> Result<(u8, u32, u32)> {
     let mut acc: u64 = 0;
@@ -515,9 +596,7 @@ pub fn tile_id_to_zxy(id: u64) -> Result<(u8, u32, u32)> {
         }
         acc += num;
     }
-    Err(Error::PMTilesRead(format!(
-        "tile id {id} exceeds the zoom 31 address space"
-    )))
+    Err(ArchiveError::TileIdOutOfRange { id }.into())
 }
 
 // ============================================================================
@@ -818,7 +897,19 @@ pub(crate) fn read_all_entries_from<S: ArchiveBytes + ?Sized>(
 ) -> Result<Vec<DirEntry>> {
     walk_directories(src, header).map_err(|e| match e {
         DirWalkError::Read(e) => e,
-        other => Error::PMTilesWrite(other.to_string()),
+        DirWalkError::Decompress {
+            what,
+            offset,
+            length,
+            source,
+        } => ArchiveError::DirectoryDecompress {
+            what,
+            offset,
+            length,
+            error: source,
+        }
+        .into(),
+        DirWalkError::Invalid(m) => ArchiveError::Directory(m).into(),
     })
 }
 
@@ -1046,8 +1137,10 @@ pub(crate) fn offsets_are_clustered(entries: impl IntoIterator<Item = (u64, u64)
 /// Returns an error if the file cannot be read, its header does not parse, or
 /// its directories cannot be read.
 pub fn verify_clustered(path: &Path) -> Result<bool> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| Error::PMTilesRead(format!("failed to read {}: {e}", path.display())))?;
+    let bytes = std::fs::read(path).map_err(|error| ArchiveError::Read {
+        path: path.to_path_buf(),
+        error,
+    })?;
     let header = Header::from_bytes(&bytes)?;
     let entries = read_all_entries(&bytes, &header)?;
 
@@ -1329,7 +1422,7 @@ fn metadata_json(
 ///
 /// # Errors
 ///
-/// Returns [`Error::PMTilesWrite`] if compression fails, or if the raw JSON or
+/// Returns [`WriteError`] if compression fails, or if the raw JSON or
 /// the stored section exceeds [`MAX_INTERNAL_BYTES`], the ceiling this
 /// project's own readers apply to both.
 fn encode_metadata(json: &str, compression: Compression) -> Result<Vec<u8>> {
@@ -1342,20 +1435,21 @@ fn encode_metadata_capped(json: &str, compression: Compression, cap: u64) -> Res
     // Checked before compressing: the reader would refuse to decompress it,
     // so there is no point spending the time.
     if json.len() as u64 > cap {
-        return Err(Error::PMTilesWrite(format!(
-            "metadata JSON is {} bytes, over the {cap}-byte limit readers accept; \
-             shorten the name, description or attribution",
-            json.len()
-        )));
+        return Err(WriteError::MetadataTooLarge {
+            bytes: json.len() as u64,
+            cap,
+        }
+        .into());
     }
     let encoded = compression::compress(json.as_bytes(), compression)
-        .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
+        .map_err(|e| WriteError::io("compress metadata", e))?;
     // Compression can add framing; the reader caps the stored bytes too.
     if encoded.len() as u64 > cap {
-        return Err(Error::PMTilesWrite(format!(
-            "metadata section is {} bytes stored, over the {cap}-byte limit readers accept",
-            encoded.len()
-        )));
+        return Err(WriteError::StoredMetadataTooLarge {
+            bytes: encoded.len() as u64,
+            cap,
+        }
+        .into());
     }
     Ok(encoded)
 }
@@ -2326,13 +2420,11 @@ impl StreamingPmtilesWriter {
                 // installed (#528 review, F3).
                 #[cfg(test)]
                 crate::atomic_output::observe_rename_target(output_path);
-                std::fs::rename(&self.temp_path, output_path).map_err(|e| {
-                    Error::PMTilesWrite(format!(
-                        "Failed to publish archive: {}; the complete archive was written to {} \
-                         -- rename it manually",
-                        e,
-                        self.temp_path.display()
-                    ))
+                std::fs::rename(&self.temp_path, output_path).map_err(|error| {
+                    WriteError::Publish {
+                        error,
+                        kept: self.temp_path.clone(),
+                    }
                 })?;
                 // The output is now complete, so a previous run's salvage
                 // copy of the same output is dead weight (#528 review, F2).
@@ -2400,12 +2492,11 @@ impl StreamingPmtilesWriter {
                 output_path: reserved,
             } => {
                 if reserved != output_path {
-                    return Err(Error::PMTilesWrite(format!(
-                        "tail-layout writer reserved its prefix in {} but was asked to write {}; \
-                         a tail-layout writer can only publish the output it was created for",
-                        partial_path_for(reserved).display(),
-                        output_path.display()
-                    )));
+                    return Err(WriteError::WrongOutput {
+                        reserved: partial_path_for(reserved),
+                        requested: output_path.to_path_buf(),
+                    }
+                    .into());
                 }
                 if !root_fits {
                     log::error!(
@@ -2439,8 +2530,8 @@ impl StreamingPmtilesWriter {
         match self.temp_file.as_mut() {
             Some(tf) => tf
                 .flush()
-                .map_err(|e| Error::PMTilesWrite(format!("Failed to flush temp file: {}", e)))?,
-            None => return Err(Error::PMTilesWrite("Writer already finalized".to_string())),
+                .map_err(|e| WriteError::io("flush temp file", e))?,
+            None => return Err(WriteError::Finalized.into()),
         }
 
         // Sort entries by tile_id for clustered mode. Tile ids are unique, so
@@ -2499,7 +2590,7 @@ impl StreamingPmtilesWriter {
         // Build directory structure with leaf directories if needed (Issue #88)
         // This ensures root directory fits in the initial 16KB HTTP range request
         let dir_layout = make_root_leaves(&dir_entries, self.internal_compression)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to build directory: {}", e)))?;
+            .map_err(|e| WriteError::io("build directory", e))?;
 
         // Build metadata JSON
         let metadata = self.build_metadata_json();
@@ -2607,21 +2698,21 @@ impl StreamingPmtilesWriter {
         let mut file = File::options()
             .write(true)
             .open(&self.temp_path)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to reopen partial: {}", e)))?;
+            .map_err(|e| WriteError::io("reopen partial", e))?;
 
         // Drop the previous checkpoint's tail before appending this one, so the
         // file length is always exactly `16384 + tile + metadata + leaves` —
         // go-pmtiles' padded-length rule admits no other slack.
         file.set_len(data_end)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to truncate tail: {}", e)))?;
+            .map_err(|e| WriteError::io("truncate tail", e))?;
         file.seek(SeekFrom::Start(data_end))
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to seek to tail: {}", e)))?;
+            .map_err(|e| WriteError::io("seek to tail", e))?;
         file.write_all(&sections.metadata)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write metadata: {}", e)))?;
+            .map_err(|e| WriteError::io("write metadata", e))?;
         file.write_all(&sections.leaves_bytes)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write leaf directories: {}", e)))?;
+            .map_err(|e| WriteError::io("write leaf directories", e))?;
         file.sync_data()
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to sync tail: {}", e)))?;
+            .map_err(|e| WriteError::io("sync tail", e))?;
 
         // Publish by overwriting the prefix last, in one write: until the
         // header lands, the archive still describes the previous checkpoint.
@@ -2630,11 +2721,11 @@ impl StreamingPmtilesWriter {
         prefix[HEADER_BYTES..HEADER_BYTES + sections.root_bytes.len()]
             .copy_from_slice(&sections.root_bytes);
         file.seek(SeekFrom::Start(0))
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to seek to prefix: {}", e)))?;
+            .map_err(|e| WriteError::io("seek to prefix", e))?;
         file.write_all(&prefix)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write prefix: {}", e)))?;
+            .map_err(|e| WriteError::io("write prefix", e))?;
         file.sync_all()
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to sync archive: {}", e)))?;
+            .map_err(|e| WriteError::io("sync archive", e))?;
 
         // The prefix on disk now describes this file exactly, so the file is
         // a valid archive again until the next append lands on the tail.
@@ -2684,44 +2775,41 @@ impl StreamingPmtilesWriter {
             reason = "#427: checkpoint writer owns the partial file, renamed only after finalization"
         )] // #779: .partial, renamed at finish
         let output_file = File::create(&partial_path).map_err(|e| {
-            Error::PMTilesWrite(format!(
-                "Failed to create output file {}: {e}",
-                partial_path.display()
-            ))
+            WriteError::io(format!("create output file {}", partial_path.display()), e)
         })?;
         let mut writer = BufWriter::new(output_file);
 
         writer
             .write_all(&header.to_bytes())
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write header: {}", e)))?;
+            .map_err(|e| WriteError::io("write header", e))?;
         writer
             .write_all(&sections.root_bytes)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write root directory: {}", e)))?;
+            .map_err(|e| WriteError::io("write root directory", e))?;
         writer
             .write_all(&sections.metadata)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write metadata: {}", e)))?;
+            .map_err(|e| WriteError::io("write metadata", e))?;
         if !sections.leaves_bytes.is_empty() {
-            writer.write_all(&sections.leaves_bytes).map_err(|e| {
-                Error::PMTilesWrite(format!("Failed to write leaf directories: {}", e))
-            })?;
+            writer
+                .write_all(&sections.leaves_bytes)
+                .map_err(|e| WriteError::io("write leaf directories", e))?;
         }
 
         // Copy tile data from the spool. Under the tail layout the tile bytes
         // start after the reserved prefix rather than at byte 0.
-        let mut temp_reader = File::open(&self.temp_path)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to reopen temp file: {}", e)))?;
+        let mut temp_reader =
+            File::open(&self.temp_path).map_err(|e| WriteError::io("reopen temp file", e))?;
         let data_start = self.spool_data_start();
         if data_start > 0 {
             temp_reader
                 .seek(SeekFrom::Start(data_start))
-                .map_err(|e| Error::PMTilesWrite(format!("Failed to seek temp file: {}", e)))?;
+                .map_err(|e| WriteError::io("seek temp file", e))?;
         }
         std::io::copy(&mut temp_reader.take(self.current_offset), &mut writer)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to copy tile data: {}", e)))?;
+            .map_err(|e| WriteError::io("copy tile data", e))?;
 
         writer
             .flush()
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to flush output: {}", e)))?;
+            .map_err(|e| WriteError::io("flush output", e))?;
         // Close the output handle before renaming so the bytes are fully on disk.
         drop(writer);
 
@@ -2729,11 +2817,14 @@ impl StreamingPmtilesWriter {
         #[cfg(test)]
         crate::atomic_output::observe_rename_target(output_path);
         std::fs::rename(&partial_path, output_path).map_err(|e| {
-            Error::PMTilesWrite(format!(
-                "Failed to publish archive {} over {}: {e}",
-                partial_path.display(),
-                output_path.display()
-            ))
+            WriteError::io(
+                format!(
+                    "publish archive {} over {}",
+                    partial_path.display(),
+                    output_path.display()
+                ),
+                e,
+            )
         })?;
 
         self.stats.checkpoint_bytes_written += tile_data_offset + self.current_offset;

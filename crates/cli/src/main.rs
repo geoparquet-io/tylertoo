@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
     reason = "#452: immutable CLI quiet setting shared by status output"
 )]
 use std::sync::atomic::{AtomicBool, Ordering};
+use tylertoo_core::error::{Classify, ErrorKind};
 use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::config::cli::{
     export_options, overview_options, pyramid_options, tiles_options, ExportPmtilesArgs,
@@ -70,7 +71,7 @@ macro_rules! say {
 /// Exit-status contract (#452), shown under `tylertoo --help` and in the
 /// generated CLI reference. Exit 1 is `main` returning `Err` (anyhow
 /// prints it); exit 2 is clap's for a parse error, which core's option refusals
-/// (`is_usage_error`) and `--quiet` with `tiles --verbose` reuse.
+/// (`exit_status`) and `--quiet` with `tiles --verbose` reuse.
 const EXIT_STATUS_HELP: &str = "\
 Exit status:
 
@@ -389,7 +390,7 @@ fn main() -> Result<std::process::ExitCode> {
         Ok(()) => Ok(std::process::ExitCode::SUCCESS),
         // #779: an option core refused before any work is a usage error,
         // like clap's: exit 2, the message alone (it names no failed step).
-        Err(e) if is_usage_error(&e) => {
+        Err(e) if exit_status(error_kind(&e)) == 2 => {
             eprintln!("Error: {e:#}");
             Ok(std::process::ExitCode::from(2))
         }
@@ -397,34 +398,30 @@ fn main() -> Result<std::process::ExitCode> {
     }
 }
 
-/// Whether `e` is one of core's option refusals (#779), wherever it sits in
-/// the chain: a [`config::ConfigError`], or an error its type classes as
-/// config (`is_config`). These exit 2, the code clap gives its own usage
-/// errors, so a script can tell "fix the command" from "the run failed".
-fn is_usage_error(e: &anyhow::Error) -> bool {
-    use tylertoo_core::overview::convert::ConvertError;
-    use tylertoo_core::overview::export::ExportError;
-    use tylertoo_core::overview::tiles::TilesError;
-    e.chain().any(|c| {
-        c.is::<config::ConfigError>()
-            || c.downcast_ref::<ConvertError>()
-                .is_some_and(ConvertError::is_config)
-            || c.downcast_ref::<ExportError>()
-                .is_some_and(ExportError::is_config)
-            || c.downcast_ref::<TilesError>()
-                .is_some_and(TilesError::is_config)
-            || c.downcast_ref::<tylertoo_core::Error>()
-                .is_some_and(tylertoo_core::Error::is_config)
-    })
+/// The kind core gives the first of its errors in `e`'s chain (#438), or
+/// `None` when no link is one of core's (an untyped `anyhow!` message). Core's
+/// wrapping errors classify as what they wrap, so the first one decides.
+fn error_kind(e: &anyhow::Error) -> Option<ErrorKind> {
+    e.chain().find_map(tylertoo_core::error::kind_of)
 }
 
-/// `what failed: e`, or `e` alone (keeping its type, for
-/// [`is_usage_error`]) when `e` is an option refused before any work.
-fn step_failed<E>(what: &str, e: E, is_config: fn(&E) -> bool) -> anyhow::Error
+/// The exit status for a failure of `kind`: 2 for an option refused before
+/// any work, the code clap gives its own usage errors, so a script can tell
+/// "fix the command" from "the run failed" (1).
+fn exit_status(kind: Option<ErrorKind>) -> u8 {
+    match kind {
+        Some(ErrorKind::Usage) => 2,
+        _ => 1,
+    }
+}
+
+/// `what failed: e`, or `e` alone (keeping its type, for [`error_kind`])
+/// when `e` is an option refused before any work.
+fn step_failed<E>(what: &str, e: E) -> anyhow::Error
 where
-    E: std::error::Error + Send + Sync + 'static,
+    E: Classify + std::error::Error + Send + Sync + 'static,
 {
-    if is_config(&e) {
+    if e.kind() == ErrorKind::Usage {
         anyhow::Error::new(e)
     } else {
         anyhow::anyhow!("{what} failed: {e}")
@@ -612,13 +609,9 @@ fn run_convert(
     output: &std::path::Path,
     options: &tylertoo_core::overview::convert::ConvertOptions,
 ) -> Result<tylertoo_core::overview::convert::ConvertReport> {
-    tiles_input(spec).convert(output, options).map_err(|e| {
-        step_failed(
-            "overview conversion",
-            e,
-            tylertoo_core::overview::convert::ConvertError::is_config,
-        )
-    })
+    tiles_input(spec)
+        .convert(output, options)
+        .map_err(|e| step_failed("overview conversion", e))
 }
 
 /// The core-side view of a resolved input shape.
@@ -1363,13 +1356,8 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         args.input.display(),
         args.output.display()
     );
-    let report = export_pmtiles(&args.input, &args.output, &opts).map_err(|e| {
-        step_failed(
-            "export",
-            e,
-            tylertoo_core::overview::export::ExportError::is_config,
-        )
-    })?;
+    let report =
+        export_pmtiles(&args.input, &args.output, &opts).map_err(|e| step_failed("export", e))?;
 
     say!(
         "  mode={} zooms z{}..z{}",
@@ -1445,8 +1433,8 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         message,
     })?;
 
-    let report = build_pyramid(&bands, &args.output, &opts)
-        .map_err(|e| step_failed("pyramid build", e, tylertoo_core::Error::is_config))?;
+    let report =
+        build_pyramid(&bands, &args.output, &opts).map_err(|e| step_failed("pyramid build", e))?;
 
     for (layer, lo, hi, n) in &report.per_band_tiles {
         say!(
@@ -1759,9 +1747,8 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     use tylertoo_core::stats::compute_stats;
 
     let archive = ArchiveIndex::open(&args.archive).map_err(|e| {
-        // `ArchiveIndex` reports read failures under the shared PMTiles
-        // error variant ("Failed to write PMTiles: ..."); for a file that
-        // is not an archive at all, say so plainly.
+        // `ArchiveIndex` reports read failures as "Failed to read PMTiles:
+        // ..."; for a file that is not an archive at all, say so plainly.
         let not_pmtiles = std::fs::File::open(&args.archive)
             .and_then(|mut f| {
                 let mut magic = [0u8; 7];
@@ -1964,6 +1951,7 @@ mod tests {
         use tylertoo_core::overview::convert::ConvertError;
         use tylertoo_core::overview::export::ExportError;
         use tylertoo_core::overview::tiles::TilesError;
+        use tylertoo_core::pyramid::PyramidError;
 
         let config_error = || config::ConfigError::InvalidExtent { extent: 0 };
         for error in [
@@ -1971,35 +1959,87 @@ mod tests {
             step_failed(
                 "overview conversion",
                 ConvertError::VerbatimPartitioningUnsupported,
-                ConvertError::is_config,
             ),
-            step_failed(
-                "export",
-                ExportError::Config(config_error()),
-                ExportError::is_config,
-            ),
+            step_failed("export", ExportError::Config(config_error())),
             anyhow::Error::new(TilesError::Convert(
                 ConvertError::VerbatimPartitioningUnsupported,
             )),
             anyhow::Error::new(TilesError::Export(ExportError::Config(config_error()))),
             step_failed(
                 "pyramid build",
-                tylertoo_core::Error::InvalidConfig("invalid band".into()),
-                tylertoo_core::Error::is_config,
+                PyramidError::InvalidConfig("invalid band".into()),
             ),
         ] {
-            assert!(is_usage_error(&error), "{error:#}");
+            assert_eq!(exit_status(error_kind(&error)), 2, "{error:#}");
             assert!(!error.to_string().contains("failed:"), "{error}");
-            assert!(is_usage_error(
-                &error.context("outer context").context("caller")
-            ));
+            let error = error.context("outer context").context("caller");
+            assert_eq!(exit_status(error_kind(&error)), 2, "{error:#}");
         }
+        // #438: a refused option inside a band's convert is still one; the
+        // message names the band.
+        let band = step_failed(
+            "pyramid build",
+            PyramidError::BandConvert {
+                layer: "a".into(),
+                error: ConvertError::VerbatimPartitioningUnsupported,
+            },
+        );
+        assert_eq!(exit_status(error_kind(&band)), 2, "{band:#}");
+        assert!(!band.to_string().contains("pyramid build failed"), "{band}");
         for error in [
             anyhow::anyhow!("untyped run failure"),
             anyhow::Error::new(ExportError::Io(std::io::Error::other("disk full"))),
             anyhow::Error::new(tylertoo_core::Error::Io(std::io::Error::other("disk full"))),
         ] {
-            assert!(!is_usage_error(&error.context("caller")));
+            assert_eq!(exit_status(error_kind(&error.context("caller"))), 1);
+        }
+    }
+
+    /// #438: every kind core gives an error maps to one exit status.
+    #[test]
+    fn exit_status_follows_the_error_kind() {
+        use tylertoo_core::overview::convert::ConvertError;
+        use tylertoo_core::overview::export::ExportError;
+        use tylertoo_core::pyramid::PyramidError;
+
+        let table: [(anyhow::Error, Option<ErrorKind>, u8); 6] = [
+            (
+                anyhow::Error::new(config::ConfigError::InvalidExtent { extent: 0 }),
+                Some(ErrorKind::Usage),
+                2,
+            ),
+            (
+                anyhow::Error::new(ExportError::UnknownProperty {
+                    name: "x".into(),
+                    available: String::new(),
+                }),
+                Some(ErrorKind::Input),
+                1,
+            ),
+            (
+                anyhow::Error::new(ConvertError::BudgetExceeded {
+                    phase: "pass-1 scan",
+                    needed: 2,
+                    available: 1,
+                }),
+                Some(ErrorKind::Resource),
+                1,
+            ),
+            (
+                anyhow::Error::new(PyramidError::BandMismatch("empty band".into())),
+                Some(ErrorKind::Input),
+                1,
+            ),
+            (
+                anyhow::Error::new(tylertoo_core::Error::Io(std::io::Error::other("disk"))),
+                Some(ErrorKind::Runtime),
+                1,
+            ),
+            (anyhow::anyhow!("untyped"), None, 1),
+        ];
+        for (error, kind, status) in table {
+            assert_eq!(error_kind(&error), kind, "{error:#}");
+            assert_eq!(exit_status(kind), status, "{error:#}");
         }
     }
 

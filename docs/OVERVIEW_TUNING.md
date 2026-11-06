@@ -1133,8 +1133,7 @@ Raise `--coalesce-max-level-rows` to scale both limits: 4,000,000 permits
 geometry, plus the larger chain-stage peak below, or disable coalescing.
 
 Both limbs are pure functions of the input, so the verdict and the output are
-identical across machines, engines (`--no-streaming` or not), and
-`--read-batch-size` values. Pass 1 enforces the limbs *while it collects*:
+identical across machines and `--read-batch-size` values. Pass 1 enforces the limbs *while it collects*:
 the moment the running totals cross, it frees what it has buffered and falls
 back to counting. On a 6M-line synthetic input, that cut the macOS peak
 memory footprint from 4890 to 1157 MiB with byte-identical output.
@@ -1597,7 +1596,7 @@ a bigger footer for that pushdown.
 
 ---
 
-## Memory / streaming knobs: `--no-streaming`, `--read-batch-size`
+## Memory / streaming knobs: `--read-batch-size`
 
 These settings control conversion memory without changing output content.
 [How streaming bounds memory](guides/scaling.md#how-streaming-bounds-memory)
@@ -1607,7 +1606,6 @@ See also the [file layout knobs](#file-layout-knobs-row-group-size-full-column-s
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
 | `--read-batch-size N` | `8192` | rows per read batch (max 1048576) | **bigger = slightly faster, more memory** |
-| `--no-streaming` | off | flag | use the one-pass in-memory pipeline |
 
 ### Read batch size
 
@@ -1619,21 +1617,6 @@ when profiling shows batch overhead and RAM is available.
 Pass 1 divides each batch across rayon threads in chunks of
 `read_batch_size / threads`, clamped to 256–1024 rows. Smaller batches
 reduce parallelism but never disable it.
-
-### In-memory conversion
-
-`--no-streaming` holds the whole table and all decoded geometry,
-using `O(dataset)` memory. It decodes geometry once rather than re-decoding
-winners in pass 2, so small inputs may run slightly faster. Large inputs
-run slower and need far more RAM. This is the equivalence-tested reference
-implementation and a fallback, with no output-quality advantage.
-
-The whole table lives in one Arrow batch, and Arrow's `i32` offsets cap one
-byte-array column at 2 GiB per batch. When a byte-array column (WKB geometry
-or a string) sums past that over the row groups to read, `--no-streaming`
-fails before reading any data and names the column. The figure comes from
-footer statistics. A `--bbox` or `--filter` that prunes row groups lowers it.
-The streaming pipeline has no such limit.
 
 During pass 2, the winner table holds 1 byte per feature, about 0.6 MB for a
 632k-feature file.
@@ -1834,7 +1817,7 @@ full type table is in [preparing input](tutorials/madagascar.md#1-prepare-the-in
 
 These settings control speed and memory. Output is byte-identical across
 profiles, batch concurrency, read-worker counts, and thread counts, as with
-the [memory and streaming knobs](#memory-streaming-knobs-no-streaming-read-batch-size).
+the [memory and streaming knobs](#memory-streaming-knobs-read-batch-size).
 
 The Scaling guide covers [memory profiles](guides/scaling.md#memory-profiles),
 [read concurrency](guides/scaling.md#read-concurrency), and

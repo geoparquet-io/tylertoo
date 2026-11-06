@@ -304,6 +304,13 @@ pub enum ConfigError {
     },
 }
 
+impl crate::error::Classify for ConfigError {
+    /// Every rule here refuses an option before any work.
+    fn kind(&self) -> crate::error::ErrorKind {
+        crate::error::ErrorKind::Usage
+    }
+}
+
 /// An [`ExportOptions`](super::export::ExportOptions) field a command that
 /// wraps the export sets itself, for [`check_ignored_export_fields`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -767,7 +774,10 @@ mod tests {
                 matches!(err, ConvertError::Config(ConfigError::InvalidBbox { .. })),
                 "{bbox:?}: {err:?}"
             );
-            assert!(err.is_config());
+            assert_eq!(
+                crate::error::Classify::kind(&err),
+                crate::error::ErrorKind::Usage
+            );
         }
         with([0.0, 0.0, 1.0, 1.0]).validate().unwrap();
     }
@@ -829,7 +839,10 @@ mod tests {
             ),
             "{err:?}"
         );
-        assert!(err.is_config());
+        assert_eq!(
+            crate::error::Classify::kind(&err),
+            crate::error::ErrorKind::Usage
+        );
         partitioning()
             .with_generalization(&GeneralizationOverrides::default(), false)
             .expect("the default is inert, not an error");
@@ -1034,7 +1047,7 @@ pub(super) fn validate_tiles(
 /// Validate a complete pyramid before reading any band.
 pub(crate) fn validate_pyramid(
     options: &crate::pyramid::PyramidOptions,
-) -> Result<ValidatedConfig<'_, crate::pyramid::PyramidOptions>, crate::Error> {
+) -> Result<ValidatedConfig<'_, crate::pyramid::PyramidOptions>, crate::pyramid::PyramidError> {
     options.check()?;
     Ok(ValidatedConfig::new(options))
 }

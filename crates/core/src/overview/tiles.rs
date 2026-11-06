@@ -36,6 +36,7 @@ use super::export::{
     export_pmtiles, write_empty_archive, ExportError, ExportOptions, ExportReport, FeatureOrder,
 };
 use super::writer::WriterError;
+use crate::error::Classify;
 use crate::input_set::ConvertSource;
 use crate::shard::{ShardRole, TileRange};
 
@@ -194,10 +195,9 @@ impl TilesShard {
 
     /// Every convert-side consequence of a tile-building job (#498/#541):
     /// [`TilesShard::apply_selection`] plus, for the coarse job of a
-    /// streaming zoom-plan run, the build ceiling just below the pivot
-    /// (#541: pass 1 and the level assignment stay full-range, so any saved
-    /// plan is byte-identical to a full run's; `--no-streaming` builds every
-    /// level and the export ceiling alone bounds the tiles).
+    /// zoom-plan run, the build ceiling just below the pivot (#541: pass 1
+    /// and the level assignment stay full-range, so any saved plan is
+    /// byte-identical to a full run's).
     ///
     /// `keep_finest_level` skips that ceiling: the coverage fill (#771)
     /// draws each coarse tile from the finest level, so a coarse job that
@@ -211,7 +211,6 @@ impl TilesShard {
         if self.range.is_none()
             && !keep_finest_level
             && matches!(convert.levels, LevelPlan::ZoomRange { .. })
-            && convert.streaming
         {
             convert.zoom_ceiling = Some(self.pivot_zoom.saturating_sub(1));
         }
@@ -354,7 +353,7 @@ impl TilesOptions {
     ///
     /// # Errors
     ///
-    /// The first rule broken; [`TilesError::is_config`] is true for each.
+    /// The first rule broken; each is [`ErrorKind::Usage`](crate::error::ErrorKind::Usage).
     /// Validate these options and return the immutable engine configuration.
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, TilesError> {
         super::config::validate_tiles(self)
@@ -622,12 +621,12 @@ impl TilesObserver for () {}
 pub enum TilesError {
     /// The convert half failed. Not a `#[source]` chain: the message *is*
     /// the convert error's, prefixed, the way the CLI has always printed it.
-    /// A refused option ([`ConvertError::is_config`]) is not prefixed: it is
-    /// refused before any conversion starts (#779).
-    #[error("{prefix}{0}", prefix = failed_prefix(.0.is_config(), "overview conversion failed: "))]
+    /// A refused option ([`ErrorKind::Usage`](crate::error::ErrorKind::Usage))
+    /// is not prefixed: it is refused before any conversion starts (#779).
+    #[error("{prefix}{0}", prefix = failed_prefix(.0.kind(), "overview conversion failed: "))]
     Convert(ConvertError),
     /// The export half failed; prefixed like [`TilesError::Convert`].
-    #[error("{prefix}{0}", prefix = failed_prefix(.0.is_config(), "export failed: "))]
+    #[error("{prefix}{0}", prefix = failed_prefix(.0.kind(), "export failed: "))]
     Export(ExportError),
     /// An option refused before any work ([`TilesOptions::validate`], #779).
     #[error(transparent)]
@@ -661,24 +660,22 @@ pub enum TilesError {
 }
 
 /// `prefix`, unless the error is a refused option, which names no step.
-fn failed_prefix(is_config: bool, prefix: &'static str) -> &'static str {
-    if is_config {
+fn failed_prefix(kind: crate::error::ErrorKind, prefix: &'static str) -> &'static str {
+    if kind == crate::error::ErrorKind::Usage {
         ""
     } else {
         prefix
     }
 }
 
-impl TilesError {
-    /// Whether this is an option the caller must fix, refused before any
-    /// input was read, as opposed to a problem with the data or the run.
-    /// The Python bindings raise these as `tylertoo.ConfigError`.
-    pub fn is_config(&self) -> bool {
+impl crate::error::Classify for TilesError {
+    /// Each half classifies as its own error does.
+    fn kind(&self) -> crate::error::ErrorKind {
         match self {
-            TilesError::Config(_) => true,
-            TilesError::Convert(e) => e.is_config(),
-            TilesError::Export(e) => e.is_config(),
-            _ => false,
+            TilesError::Config(_) => crate::error::ErrorKind::Usage,
+            TilesError::Convert(e) => e.kind(),
+            TilesError::Export(e) => e.kind(),
+            _ => crate::error::ErrorKind::Runtime,
         }
     }
 }
@@ -1533,7 +1530,6 @@ mod tests {
             },
             ..ConvertOptions::default()
         };
-        assert!(convert.streaming, "the ceiling is streaming-only");
 
         let coarse = TilesShard {
             role: ShardRole::Coarse,
@@ -1754,7 +1750,10 @@ mod tests {
             ),
             "{err:?}"
         );
-        assert!(err.is_config());
+        assert_eq!(
+            crate::error::Classify::kind(&err),
+            crate::error::ErrorKind::Usage
+        );
     }
 
     /// #386/#443: the knob-column guard fires before any work, with the
@@ -2003,7 +2002,7 @@ mod tests {
             let late =
                 convert_to_pmtiles(&input, &output, &options).expect_err("the facade must refuse");
             assert_eq!(early.to_string(), late.to_string());
-            assert!(early.is_config(), "{early:?}");
+            assert_eq!(early.kind(), crate::error::ErrorKind::Usage, "{early:?}");
             assert!(!output.exists());
             early
         };

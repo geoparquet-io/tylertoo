@@ -76,7 +76,9 @@ use super::simplify::{
     carrier_square, simplify_cascade, simplify_step_at, CascadeFold, CascadeStep, FoldStep,
     Representation, Simplified, SimplifyOptions,
 };
-use super::source::{BatchSource, MemorySource};
+use super::source::BatchSource;
+#[cfg(test)]
+use super::source::MemorySource;
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 use crate::resolved_schema::ResolvedSchema;
 
@@ -2655,23 +2657,6 @@ fn preflight_with_memory_limit(
     })
 }
 
-#[cfg(test)]
-pub(super) fn memory_source_for_test(
-    source: &ConvertSource,
-    options: &ConvertOptions,
-    limit: u64,
-) -> Result<(MemorySource, usize), ConvertError> {
-    let diagnostics = crate::diagnostics::Diagnostics::silent();
-    let pre = preflight(source, options, &diagnostics, None)?;
-    let memory = MemorySource::load(
-        source,
-        pre.selected_row_groups.as_ref(),
-        pass1_read_tuning(pre.budget, &pre.options, 0, 0),
-        limit,
-    )?;
-    Ok((memory, pre.row_groups_read))
-}
-
 /// How pass 1 reads its input (#717): pass 2's batch size, reader count and
 /// memory profile, with the read-ahead priced at `geom_bytes / rows`, the
 /// footers' geometry weight over the selected rows. Unlike pass 2's, this
@@ -2753,6 +2738,8 @@ struct PlanState {
 /// The front half of a streaming convert: the preflight, and pass 1 + the
 /// level assignment (or the `--plan` artifact that replaces them).
 struct FrontHalf {
+    /// The test-only eager input ([`super::source::with_eager_input`]).
+    #[cfg(test)]
     memory: Option<MemorySource>,
     preflight: Preflight,
     plan: PlanState,
@@ -2803,22 +2790,20 @@ fn run_front_half(
     // fingerprint all see.
     let options = &preflight.options;
     let config = options.validate()?;
-    let memory = if options.streaming {
-        None
-    } else {
-        Some(MemorySource::load(
-            source,
-            preflight.selected_row_groups.as_ref(),
-            pass1_read_tuning(preflight.budget, options, 0, 0),
-            tylertoo_io::byte_array_limit(),
-        )?)
-    };
-    if let Some(memory) = &memory {
-        preflight
-            .budget
-            .reserve(MemoryPhase::EagerInput, memory.resident_bytes())?;
-    }
+    #[cfg(test)]
+    let memory = super::source::eager_input()
+        .then(|| {
+            MemorySource::load(
+                source,
+                preflight.selected_row_groups.as_ref(),
+                pass1_read_tuning(preflight.budget, options, 0, 0),
+            )
+        })
+        .transpose()?;
+    #[cfg(test)]
     let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
+    #[cfg(not(test))]
+    let reader: &dyn BatchSource = source;
     let plan = resolve_plan_state(
         &Pass1Ctx {
             descriptor: &preflight.descriptor,
@@ -2839,6 +2824,7 @@ fn run_front_half(
     Ok(FrontHalf {
         preflight,
         plan,
+        #[cfg(test)]
         memory,
     })
 }
@@ -2860,9 +2846,7 @@ pub(crate) fn write_plan_streaming(
     // so the #571 background sampler would have no reader.
     let mut rss = RssTracker::new(false, "preflight");
     let FrontHalf {
-        preflight,
-        plan,
-        memory: _,
+        preflight, plan, ..
     } = run_front_half(source, options, false, &mut rss, diagnostics, None)?;
     let options = &preflight.options;
     let path = options
@@ -3346,6 +3330,7 @@ pub(crate) fn run_stages(
     let FrontHalf {
         preflight,
         plan,
+        #[cfg(test)]
         memory,
     } = run_front_half(
         source,
@@ -3355,7 +3340,10 @@ pub(crate) fn run_stages(
         diagnostics,
         Some(output_path),
     )?;
+    #[cfg(test)]
     let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
+    #[cfg(not(test))]
+    let reader: &dyn BatchSource = source;
     let Preflight {
         descriptor,
         budget,
@@ -7157,11 +7145,12 @@ mod tests {
         write_input_with_f64(file.path(), &geoms, "rank", &[1.0, 2.0]);
         for streaming in [false, true] {
             let options = ConvertOptions {
-                streaming,
                 bbox: Some([-1.0, -1.0, 1.0, 1.0]),
                 ..Default::default()
             };
-            let scan = run_pass1_for_test(file.path(), &options, 1);
+            let scan = super::super::source::with_eager_input(!streaming, || {
+                run_pass1_for_test(file.path(), &options, 1)
+            });
             assert_eq!(
                 scan.num_rows, 2,
                 "both rows in the retained row group are scanned"
@@ -7178,16 +7167,15 @@ mod tests {
         diagnostics: &crate::diagnostics::Diagnostics,
     ) -> Result<Pass1Output, ConvertError> {
         let config = pre.options.validate()?;
-        let memory = if pre.options.streaming {
-            None
-        } else {
-            Some(MemorySource::load(
-                source,
-                pre.selected_row_groups.as_ref(),
-                pass1_read_tuning(pre.budget, &pre.options, 0, 0),
-                tylertoo_io::byte_array_limit(),
-            )?)
-        };
+        let memory = super::super::source::eager_input()
+            .then(|| {
+                MemorySource::load(
+                    source,
+                    pre.selected_row_groups.as_ref(),
+                    pass1_read_tuning(pre.budget, &pre.options, 0, 0),
+                )
+            })
+            .transpose()?;
         run_pass1_with_chunk_rows(
             &Pass1Ctx {
                 source,
