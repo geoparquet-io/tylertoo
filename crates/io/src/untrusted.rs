@@ -1156,13 +1156,14 @@ pub fn read_batch_plan(
         })
         .max()
         .unwrap_or(0);
-    let fixed = metadata
+    // Per picked group: (bytes every row pays, bytes of all repeated values).
+    let groups: Vec<(u64, u64, i64)> = metadata
         .row_groups()
         .iter()
         .enumerate()
         .filter(|(i, _)| row_groups.is_none_or(|picked| picked.contains(i)))
         .map(|(_, group)| {
-            group
+            let (row, repeated) = group
                 .columns()
                 .iter()
                 .enumerate()
@@ -1179,22 +1180,38 @@ pub fn read_batch_plan(
                             column.column_descr().type_length().max(0) as u64
                         }
                     };
-                    let values = if column.column_descr().max_rep_level() > 0 {
+                    let value = width.saturating_add(1);
+                    let repeated = if column.column_descr().max_rep_level() > 0 {
                         // A repeated leaf can put all its values in a single row.
-                        column.num_values().max(0) as u64
+                        value.saturating_mul(column.num_values().max(0) as u64)
                     } else {
-                        1
+                        0
                     };
-                    width.saturating_add(1).saturating_mul(values)
+                    (value, repeated)
                 })
-                .fold(0u64, u64::saturating_add)
+                .fold((0u64, 0u64), |(r, v), (a, b)| {
+                    (r.saturating_add(a), v.saturating_add(b))
+                });
+            (row, repeated, group.num_rows())
         })
-        .max()
-        .unwrap_or(1)
-        .max(1);
+        .collect();
+    let fixed = groups.iter().map(|g| g.0).max().unwrap_or(1).max(1);
+    // A batch of `requested` rows touches at most ceil(requested / smallest
+    // group) + 1 groups, so it holds at most the largest that many groups'
+    // repeated values, however they are spread over its rows.
+    let min_rows = groups.iter().map(|g| g.2.max(1) as u64).min().unwrap_or(1);
+    let spanned = (requested.max(1) as u64)
+        .div_ceil(min_rows)
+        .saturating_add(1);
+    let mut repeated: Vec<u64> = groups.iter().map(|g| g.1).collect();
+    repeated.sort_unstable_by(|a, b| b.cmp(a));
+    let repeated = repeated
+        .iter()
+        .take(usize::try_from(spanned).unwrap_or(usize::MAX))
+        .fold(0u64, |n, v| n.saturating_add(*v));
     requested
         .max(1)
-        .min((decoded_limit(limit) / fixed).max(1) as usize)
+        .min((decoded_limit(limit).saturating_sub(repeated) / fixed).max(1) as usize)
         .min(
             usize::try_from((limit / 2) / avg.max(1))
                 .unwrap_or(usize::MAX)
@@ -1824,7 +1841,8 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         let source = open_parquet(file).unwrap();
-        let limit = byte_array_limit();
+        // A limit the 20,000 list values (340 KB) press against.
+        let limit = 200_000;
         let md = source.metadata().clone();
         assert!(read_batch_plan(&md, None, None, 8192, limit) < 8192);
         let id_only = ProjectionMask::roots(source.parquet_schema(), [0]);
@@ -1841,6 +1859,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.num_rows(), 8192);
+    }
+
+    /// Overture buildings read with every column: list leaves holding a few
+    /// values per row must not be priced as if each row held the whole row
+    /// group's values (17,928 batches of 4 KB, a 19 GB pass-2 spill).
+    #[test]
+    fn read_plan_prices_repeated_values_per_batch_not_per_row() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use arrow_array::{ArrayRef, BinaryArray, Float64Array, Int64Array};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        let write = |n: i64, group_rows: usize| {
+            let mut sources = ListBuilder::new(StringBuilder::new());
+            let mut names = ListBuilder::new(StringBuilder::new());
+            for _ in 0..n {
+                for v in ["OpenStreetMap", "Microsoft ML Buildings", "w123"] {
+                    sources.values().append_value(v);
+                }
+                sources.append(true);
+                names.values().append_value("primary");
+                names.values().append_value("common");
+                names.append(true);
+            }
+            let batch = RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(Int64Array::from_iter_values(0..n)) as ArrayRef,
+                ),
+                (
+                    "height",
+                    Arc::new(Float64Array::from(vec![3.0; n as usize])) as ArrayRef,
+                ),
+                (
+                    "geometry",
+                    Arc::new(BinaryArray::from_iter_values((0..n).map(|_| [7u8; 93]))) as ArrayRef,
+                ),
+                ("sources", Arc::new(sources.finish()) as ArrayRef),
+                ("names", Arc::new(names.finish()) as ArrayRef),
+            ])
+            .unwrap();
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(group_rows))
+                .build();
+            let mut file = tempfile::tempfile().unwrap();
+            let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            open_parquet(file).unwrap().metadata().clone()
+        };
+        let limit = byte_array_limit();
+        let md = write(100_000, 100_000);
+        assert_eq!(read_batch_plan(&md, None, None, 8192, limit), 8192);
+        // Small groups: a batch spans many of them, and still fits.
+        let small = write(100_000, 1_000);
+        assert_eq!(read_batch_plan(&small, None, None, 8192, limit), 8192);
+        // Crafted: the repeated values alone exceed the decode limit.
+        assert_eq!(read_batch_plan(&md, None, None, 8192, 100_000), 1);
     }
 
     #[test]
