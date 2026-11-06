@@ -9,19 +9,25 @@
 //! This module owns the refusals and the stop rule. The options it cannot
 //! honour are refused before any output is written.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch};
+use rayon::prelude::*;
 
 use super::super::config::ConfigError;
 use super::super::convert::ConvertOptions;
 use super::super::ladder::EntryZoomLadder;
 use super::super::level::{Mode, OverviewsMeta};
+use super::super::reader::OverviewReader;
 use super::{
-    key_to_xy, lnglat_bbox, size_bboxes, tile_key, ExportError, ExportOptions, LevelScan,
-    DEFAULT_EXTENT,
+    account_sources, buffer_deg_at_zoom, build_mvt, collect_wave, encoded_tile, key_to_xy,
+    lnglat_bbox, plan_level, size_bboxes, sort_members_for_encode, tile_fit, tile_key, Crs,
+    EncodedTile, ExportError, ExportOptions, ExportTimers, FillTally, LevelCtx, LevelScan, Member,
+    PartitionBudget, PublishedNames, ResolvedFeatureId, TileMvt, DEFAULT_EXTENT,
 };
-use crate::tile::TileBounds;
+use crate::compression::TileGzipCache;
+use crate::tile::{TileBounds, TileCoord};
 
 /// The refusals that need no file: the export options alone.
 ///
@@ -295,7 +301,6 @@ impl StopPolicy {
 
     /// Whether the rule lets tile `key` at `zoom` stop. The probe's own
     /// conditions (content, coordinate range, both caps) come on top.
-    #[cfg_attr(not(test), expect(dead_code, reason = "#803: the probe reads it"))]
     pub(super) fn may_stop(&self, zoom: u8, key: u64) -> bool {
         self.blocked
             .get(usize::from(zoom))
@@ -345,11 +350,13 @@ pub(super) struct VdScan {
 
 /// What [`VdScan::finish`] hands the probe: the policy, and the canonical
 /// tiles at each level's zoom.
-#[cfg_attr(not(test), expect(dead_code, reason = "#803: the probe reads it"))]
 pub(super) struct VdPlan {
     pub(super) policy: StopPolicy,
     /// Canonical members per tile, per level index.
     pub(super) canonical_counts: Vec<HashMap<u64, usize>>,
+    /// Each level's zoom, and the canonical (finest) level's index.
+    zooms: Vec<u8>,
+    canonical: usize,
 }
 
 impl VdScan {
@@ -417,7 +424,7 @@ impl VdScan {
         batch: &RecordBatch,
         bboxes: &[Option<TileBounds>],
         rows: &RowSource<'_>,
-        crs: super::Crs,
+        crs: Crs,
         opts: &ExportOptions,
     ) -> Result<(), ExportError> {
         let canonical = j == self.canonical;
@@ -562,7 +569,232 @@ impl VdScan {
         VdPlan {
             policy,
             canonical_counts,
+            zooms: self.zooms,
+            canonical: self.canonical,
         }
+    }
+}
+
+// ============================================================================
+// The probe: which tiles do stop
+// ============================================================================
+
+/// What the probe reads with: the export's own inputs.
+pub(super) struct Probe<'a> {
+    pub(super) reader: &'a OverviewReader,
+    pub(super) crs: Crs,
+    pub(super) published: &'a PublishedNames,
+    pub(super) feature_id: Option<&'a ResolvedFeatureId>,
+    pub(super) options: &'a ExportOptions,
+    pub(super) budget: &'a PartitionBudget,
+    pub(super) timers: &'a ExportTimers,
+}
+
+/// The stopped tiles: per level, their keys and their encoded tiles in key
+/// order.
+pub(super) struct Frontier {
+    stopped: Vec<HashSet<u64>>,
+    terminals: Vec<Vec<EncodedTile>>,
+}
+
+/// The fewest bytes one member can add to a tile: a point feature with an
+/// id and no tags (field keys and lengths, type, a move-to of one point).
+/// A member that encodes to nothing adds none, so a tile rejected on this
+/// bound could rarely have fit; rejecting is always safe, the tile is then
+/// drawn at the usual depth.
+const MIN_FEATURE_BYTES: usize = 11;
+
+impl VdPlan {
+    /// Probe every candidate tile, coarse to fine: a tile stops when the
+    /// canonical band's members under it, encoded at the canonical level's
+    /// precision (extent `4096 << (M - z)`), fit both size caps without the
+    /// valve. A stopped tile's descendants are not probed.
+    ///
+    /// DIVERGENCE FROM TIPPECANOE: tippecanoe probes on its fixed world-30
+    /// grid; this uses the canonical level's grid (world `M + 12` bits), so
+    /// a stopped tile draws exactly what the canonical tiles would.
+    pub(super) fn probe(
+        self,
+        p: &Probe<'_>,
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) -> Result<Frontier, ExportError> {
+        let levels = self.zooms.len();
+        let max_zoom = self.zooms[self.canonical];
+        let mut frontier = Frontier {
+            stopped: vec![HashSet::new(); levels],
+            terminals: (0..levels).map(|_| Vec::new()).collect(),
+        };
+        // Rows the probe reads are read again by the export proper, so
+        // their decode and clip warnings are counted there, not here.
+        let quiet = crate::diagnostics::Diagnostics::silent();
+        let gzip_cache = Arc::new(TileGzipCache::new(
+            crate::compression::tile_gzip::PAYLOAD_SLICE_BYTES,
+        ));
+        #[cfg(test)]
+        let work = std::sync::Mutex::default();
+        let mut probed = 0usize;
+        for k in 0..self.canonical {
+            let zoom = self.zooms[k];
+            let Some(extent) = candidate_extent(zoom, max_zoom) else {
+                continue;
+            };
+            let opts = ExportOptions {
+                extent,
+                ..p.options.clone()
+            };
+            let raw_cap = opts.tile_size_limit.filter(|&l| l > 0);
+            let candidates: BTreeMap<u64, usize> = self.canonical_counts[k]
+                .iter()
+                .filter(|&(&key, &n)| {
+                    self.policy.may_stop(zoom, key)
+                        && !frontier.covers(&self.zooms, zoom, key)
+                        && raw_cap.is_none_or(|cap| n.saturating_mul(MIN_FEATURE_BYTES) <= cap)
+                        && within_clamp(key, zoom, &opts)
+                })
+                .map(|(&key, &n)| (key, n))
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            probed += candidates.len();
+            let plan = plan_level(&candidates, zoom, p.budget, || {
+                format!("variable-depth probe z{zoom}")
+            });
+            let ctx = LevelCtx {
+                reader: p.reader,
+                level_idx: self.canonical,
+                crs: p.crs,
+                zoom,
+                opts: &opts,
+                gzip_cache: &gzip_cache,
+                published: p.published,
+                feature_id: p.feature_id,
+                timers: p.timers,
+                fills: None,
+                tiles: Some(&candidates),
+                #[cfg(test)]
+                work: &work,
+            };
+            for wave in plan.partitions.chunks(plan.wave) {
+                let mut members: Vec<Member> = collect_wave(&ctx, wave, &quiet)?
+                    .buckets
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                sort_members_for_encode(&mut members, &opts.feature_order);
+                let tiles: Vec<&[Member]> = members.chunk_by(|a, b| a.key == b.key).collect();
+                // Largest first, one tile per task, as `encode_members` does.
+                let mut order: Vec<usize> = (0..tiles.len()).collect();
+                order.sort_by_key(|&i| std::cmp::Reverse(tiles[i].len()));
+                let mut stops: Vec<(usize, TileMvt, Vec<crate::diagnostics::Diagnostic>)> = order
+                    .into_par_iter()
+                    .with_max_len(1)
+                    .map(|i| {
+                        let _encode = ExportTimers::scope(&p.timers.encode);
+                        Ok(probe_tile(&gzip_cache, tiles[i], zoom, &opts)?
+                            .map(|(mvt, events)| (i, mvt, events)))
+                    })
+                    .filter_map(Result::transpose)
+                    .collect::<Result<_, ExportError>>()?;
+                stops.sort_unstable_by_key(|(i, ..)| *i);
+                for (i, mvt, events) in stops {
+                    // Only the chosen tile's events and sources count.
+                    account_sources(tiles[i], &mvt, zoom, p.options, diagnostics)?;
+                    diagnostics.extend(events);
+                    let key = tiles[i][0].key;
+                    let (x, y) = key_to_xy(key, zoom);
+                    frontier.stopped[k].insert(key);
+                    frontier.terminals[k].push(encoded_tile(x, y, mvt, FillTally::default())?);
+                }
+            }
+            frontier.terminals[k].sort_unstable_by_key(|t| tile_key(t.x, t.y, zoom));
+        }
+        log::info!(
+            "[export] variable depth: probed {probed} tile(s), stopped {}",
+            frontier.stopped.iter().map(HashSet::len).sum::<usize>()
+        );
+        Ok(frontier)
+    }
+}
+
+/// The extent a stopped tile at `zoom` carries the canonical level's
+/// precision at, or `None` when even the tile's own corner would reach the
+/// MVT coordinate clamp.
+fn candidate_extent(zoom: u8, max_zoom: u8) -> Option<u32> {
+    let extent = u64::from(DEFAULT_EXTENT) << (max_zoom - zoom).min(32);
+    u32::try_from(extent)
+        .ok()
+        .filter(|&e| i64::from(e) < i64::from(crate::mvt::TILE_COORD_CLAMP))
+}
+
+/// Whether every coordinate a member of tile `key` can carry (the tile plus
+/// its clip buffer) projects strictly inside the MVT coordinate clamp at
+/// `opts.extent`, so nothing the tile draws is clamped.
+fn within_clamp(key: u64, zoom: u8, opts: &ExportOptions) -> bool {
+    let (x, y) = key_to_xy(key, zoom);
+    let tb = TileCoord::new(x, y, zoom).bounds();
+    let buf = buffer_deg_at_zoom(zoom, opts);
+    let proj = crate::mvt::TileProjector::new(&tb, opts.extent);
+    let limit = f64::from(crate::mvt::TILE_COORD_CLAMP);
+    [
+        (tb.lng_min - buf, tb.lat_min - buf),
+        (tb.lng_max + buf, tb.lat_max + buf),
+    ]
+    .into_iter()
+    .all(|(lng, lat)| {
+        let (px, py) = proj.project(lng, lat);
+        px.is_finite() && py.is_finite() && px.round().abs() < limit && py.round().abs() < limit
+    })
+}
+
+/// A stopped tile's encode: `None` unless every member of `tile` encodes,
+/// at `opts.extent`, into a tile within both caps. Never the valve: a tile
+/// that needs it is not a stop. Its encode events are returned for the
+/// caller to keep only if the tile is chosen.
+fn probe_tile(
+    gzip_cache: &Arc<TileGzipCache>,
+    tile: &[Member],
+    zoom: u8,
+    opts: &ExportOptions,
+) -> Result<Option<(TileMvt, Vec<crate::diagnostics::Diagnostic>)>, ExportError> {
+    let (x, y) = key_to_xy(tile[0].key, zoom);
+    let tb = TileCoord::new(x, y, zoom).bounds();
+    let staged = crate::diagnostics::Diagnostics::silent();
+    let mut mvt = build_mvt(gzip_cache, tile, &tb, opts, &[], &staged);
+    if mvt.features == 0 || tile_fit(&mut mvt, opts)? < 1.0 {
+        return Ok(None);
+    }
+    Ok(Some((mvt, staged.snapshot())))
+}
+
+impl Frontier {
+    /// Whether a stopped tile at a zoom coarser than `zoom` covers `key`.
+    fn covers(&self, zooms: &[u8], zoom: u8, key: u64) -> bool {
+        let (x, y) = key_to_xy(key, zoom);
+        zooms
+            .iter()
+            .zip(&self.stopped)
+            .take_while(|(&z, _)| z < zoom)
+            .any(|(&z, stopped)| {
+                let shift = zoom - z;
+                !stopped.is_empty() && stopped.contains(&tile_key(x >> shift, y >> shift, z))
+            })
+    }
+
+    /// Drop every stopped tile, and every tile under one, from the scans,
+    /// so the export plans and draws only what remains.
+    pub(super) fn restrict(&self, scans: &mut [LevelScan], zooms: &[u8]) {
+        for (k, scan) in scans.iter_mut().enumerate() {
+            let zoom = zooms[k];
+            scan.tile_counts.retain(|&key, _| {
+                !self.stopped[k].contains(&key) && !self.covers(zooms, zoom, key)
+            });
+        }
+    }
+
+    /// Each level's stopped tiles, in key order.
+    pub(super) fn into_terminals(self) -> Vec<Vec<EncodedTile>> {
+        self.terminals
     }
 }
 
@@ -986,5 +1218,343 @@ mod tests {
                 "unladdered z{z}"
             );
         }
+    }
+
+    // --- the probe -----------------------------------------------------------
+
+    use std::collections::BTreeMap;
+
+    use prost::Message;
+
+    use super::super::{buffer_deg_at_zoom, export_pmtiles_with_partition_target, ExportReport};
+    use super::{candidate_extent, within_clamp};
+    use crate::archive_index::ArchiveIndex;
+    use crate::tile::TileCoord;
+    use crate::vector_tile::Tile;
+
+    type Tiles = BTreeMap<(u8, u32, u32), Tile>;
+
+    fn read_tiles(path: &Path) -> Tiles {
+        let index = ArchiveIndex::open(path).unwrap();
+        index
+            .tiles()
+            .map(|tile| {
+                let tile = tile.unwrap();
+                let gz = index.read_range(tile.range).unwrap();
+                let raw = crate::compression::decompress_capped(
+                    &gz,
+                    crate::compression::Compression::Gzip,
+                    crate::compression::MAX_TILE_BYTES,
+                )
+                .unwrap();
+                (
+                    (tile.z, tile.x, tile.y),
+                    Tile::decode(raw.as_slice()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// Export `ov` with variable depth and `opts`; the report and every tile.
+    fn export_vd(ov: &Path, opts: ExportOptions) -> (ExportReport, Tiles) {
+        let out = ov.with_extension("vd.pmtiles");
+        let report = export_pmtiles(
+            ov,
+            &out,
+            &ExportOptions {
+                variable_depth: true,
+                ..opts
+            },
+        )
+        .unwrap();
+        (report, read_tiles(&out))
+    }
+
+    fn extent(tile: &Tile) -> u32 {
+        tile.layers[0].extent.unwrap_or(4096)
+    }
+
+    /// The stopped tiles: coarser than `max_zoom` and wider than 4096.
+    fn stopped(tiles: &Tiles, max_zoom: u8) -> Vec<(u8, u32, u32)> {
+        tiles
+            .iter()
+            .filter(|(&(z, ..), t)| z < max_zoom && extent(t) != 4096)
+            .map(|(&k, _)| k)
+            .collect()
+    }
+
+    /// The archive contract: a stopped tile's extent is `4096 << (M - z)`,
+    /// and nothing is stored below it or deeper than `M`.
+    fn assert_contract(tiles: &Tiles, max_zoom: u8) {
+        let stops = stopped(tiles, max_zoom);
+        for &(z, x, y) in &stops {
+            assert_eq!(
+                extent(&tiles[&(z, x, y)]),
+                4096 << (max_zoom - z),
+                "z{z}/{x}/{y}"
+            );
+        }
+        for &(z, x, y) in tiles.keys() {
+            assert!(z <= max_zoom);
+            for &(sz, sx, sy) in &stops {
+                let under = z > sz && (x >> (z - sz), y >> (z - sz)) == (sx, sy);
+                assert!(!under, "z{z}/{x}/{y} is under the stop z{sz}/{sx}/{sy}");
+            }
+        }
+    }
+
+    /// The input points, and their `v`, inside tile `t`'s buffered bounds.
+    fn canonical_under(t: (u8, u32, u32), input: &[(f64, f64, f64)]) -> (usize, f64) {
+        let tb = TileCoord::new(t.1, t.2, t.0).bounds();
+        let buf = buffer_deg_at_zoom(t.0, &ExportOptions::default());
+        let inside: Vec<f64> = input
+            .iter()
+            .filter(|(x, y, _)| {
+                (tb.lng_min - buf..=tb.lng_max + buf).contains(x)
+                    && (tb.lat_min - buf..=tb.lat_max + buf).contains(y)
+            })
+            .map(|&(.., v)| v)
+            .collect();
+        (inside.len(), inside.iter().sum())
+    }
+
+    /// A tile's features' sum of the double property `name`.
+    fn sum_of(tile: &Tile, name: &str) -> f64 {
+        let layer = &tile.layers[0];
+        let key = layer.keys.iter().position(|k| k == name).unwrap() as u32;
+        layer
+            .features
+            .iter()
+            .filter_map(|f| {
+                f.tags
+                    .chunks(2)
+                    .find(|kv| kv[0] == key)
+                    .map(|kv| layer.values[kv[1] as usize].double_value.unwrap())
+            })
+            .sum()
+    }
+
+    fn features(tile: &Tile) -> usize {
+        tile.layers[0].features.len()
+    }
+
+    /// A dense block of 2,500 points and five sparse points far away, every
+    /// level holding all of them (no thinning, no density drop).
+    fn dense_and_sparse() -> Vec<(f64, f64, f64)> {
+        let mut input: Vec<(f64, f64, f64)> = (0..2500)
+            .map(|i| {
+                (
+                    10.0 + (i % 50) as f64 * 1e-4,
+                    45.0 + (i / 50) as f64 * 1e-4,
+                    i as f64,
+                )
+            })
+            .collect();
+        input.extend((0..5).map(|i| (-70.0 + i as f64 * 0.01, -30.0, 1.0)));
+        input
+    }
+
+    fn unthinned(dir: &Path, input: &[(f64, f64, f64)], max_zoom: u8) -> std::path::PathBuf {
+        let geoms: Vec<_> = input.iter().map(|&(x, y, _)| pt(x, y)).collect();
+        let v: Vec<f64> = input.iter().map(|&(.., v)| v).collect();
+        let mut convert = ConvertOptions::default();
+        convert.density.enabled = false;
+        convert.assign.point_thinning = 0.0;
+        overview_v(dir, &geoms, &v, max_zoom, convert)
+    }
+
+    fn raw_cap(bytes: usize) -> ExportOptions {
+        ExportOptions {
+            tile_size_limit: Some(bytes),
+            compressed_tile_size_limit: None,
+            ..ExportOptions::default()
+        }
+    }
+
+    /// The sparse branch stops as soon as its tile leaves the dense block;
+    /// the dense branch never fits and is drawn to the finest zoom.
+    #[test]
+    fn sparse_branch_stops_dense_descends() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dense_and_sparse();
+        let ov = unthinned(dir.path(), &input, 10);
+        let (report, tiles) = export_vd(&ov, raw_cap(20_000));
+        assert_contract(&tiles, 10);
+        let sparse = (1, 0, 1);
+        assert_eq!(stopped(&tiles, 10), vec![sparse]);
+        assert_eq!(extent(&tiles[&sparse]), 4096 << 9);
+        assert_eq!(features(&tiles[&sparse]), 5);
+        let dense = crate::tile::lng_lat_to_tile(10.0, 45.0, 10);
+        assert_eq!(extent(&tiles[&(10, dense.x, dense.y)]), 4096);
+        assert_eq!(report.max_zoom, 10);
+    }
+
+    /// Nothing is stored below a stopped tile, wherever the stops fall.
+    #[test]
+    fn stopped_subtree_has_no_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        // Scattered points: several branches stop, at different zooms.
+        let input: Vec<(f64, f64, f64)> = (0..400)
+            .map(|i| {
+                let f = f64::from(i);
+                ((f * 37.0) % 340.0 - 170.0, (f * 13.0) % 160.0 - 80.0, f)
+            })
+            .collect();
+        let ov = unthinned(dir.path(), &input, 8);
+        let (_, tiles) = export_vd(&ov, raw_cap(400));
+        let stops = stopped(&tiles, 8);
+        assert!(stops.len() > 3, "{stops:?}");
+        assert!(
+            stops
+                .iter()
+                .map(|s| s.0)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1
+        );
+        assert_contract(&tiles, 8);
+    }
+
+    /// A tile over its cap is not a stop, though the valve could make it
+    /// fit: every stopped tile holds every canonical point under it.
+    #[test]
+    fn probe_never_valves() {
+        let dir = tempfile::tempdir().unwrap();
+        // 300 points with distinct values: about 8 KB at z0.
+        let input: Vec<(f64, f64, f64)> = (0..300)
+            .map(|i| (-150.0 + f64::from(i), 10.0 + f64::from(i % 7), f64::from(i)))
+            .collect();
+        let ov = unthinned(dir.path(), &input, 6);
+        let cap = 5_000;
+        let (report, tiles) = export_vd(&ov, raw_cap(cap));
+        assert_eq!(
+            extent(&tiles[&(0, 0, 0)]),
+            4096,
+            "z0 is drawn with the valve"
+        );
+        assert!(report.valve_dropped_features > 0);
+        let stops = stopped(&tiles, 6);
+        assert!(!stops.is_empty());
+        for s in stops {
+            assert_eq!(features(&tiles[&s]), canonical_under(s, &input).0, "{s:?}");
+            assert!(tiles[&s].encode_to_vec().len() <= cap);
+        }
+        assert_contract(&tiles, 6);
+    }
+
+    /// The raw cap and the gzip cap each stop a tile from stopping.
+    #[test]
+    fn both_caps_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let input: Vec<(f64, f64, f64)> =
+            (0..5).map(|i| (10.0 + f64::from(i), 45.0, 1.0)).collect();
+        let ov = unthinned(dir.path(), &input, 6);
+        let (_, tiles) = export_vd(&ov, raw_cap(1_000_000));
+        assert_eq!(tiles.keys().copied().collect::<Vec<_>>(), vec![(0, 0, 0)]);
+        assert_eq!(extent(&tiles[&(0, 0, 0)]), 4096 << 6);
+        let (_, tiles) = export_vd(&ov, raw_cap(40));
+        assert!(stopped(&tiles, 6).is_empty());
+        let gzip = ExportOptions {
+            tile_size_limit: None,
+            compressed_tile_size_limit: Some(40),
+            ..ExportOptions::default()
+        };
+        let (_, tiles) = export_vd(&ov, gzip);
+        assert!(stopped(&tiles, 6).is_empty());
+    }
+
+    /// A candidate's extent, buffer included, stays inside the MVT
+    /// coordinate clamp, so a stopped tile never clamps a coordinate.
+    #[test]
+    fn candidate_extent_never_clamps() {
+        assert_eq!(candidate_extent(2, 14), None);
+        assert_eq!(candidate_extent(3, 14), Some(1 << 23));
+        assert_eq!(candidate_extent(0, 11), Some(1 << 23));
+        assert_eq!(candidate_extent(14, 14), Some(4096));
+        let opts = |extent| ExportOptions {
+            extent,
+            ..ExportOptions::default()
+        };
+        let key = super::tile_key(4, 3, 3);
+        assert!(within_clamp(key, 3, &opts(1 << 23)));
+        // Inside the clamp itself, but not with the buffer.
+        assert!(!within_clamp(key, 3, &opts((1 << 24) - 4096)));
+        // At M = 14 nothing coarser than z3 is probed, so z0-z2 are drawn.
+        let dir = tempfile::tempdir().unwrap();
+        let input: Vec<(f64, f64, f64)> = vec![(10.0, 45.0, 1.0)];
+        let ov = unthinned(dir.path(), &input, 14);
+        let (_, tiles) = export_vd(&ov, ExportOptions::default());
+        assert_eq!(stopped(&tiles, 14), vec![(3, 4, 2)]);
+        assert_contract(&tiles, 14);
+    }
+
+    /// With clustering, a stopped tile draws the canonical points one by
+    /// one: its feature count and its sum are those of the points under it.
+    #[test]
+    fn clustered_terminal_counts_and_sums_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input: Vec<(f64, f64, f64)> = (0..10)
+            .map(|i| (10.0 + f64::from(i) * 0.05, 45.0, f64::from(i + 1)))
+            .collect();
+        input.push((-70.0, -30.0, 7.0));
+        let geoms: Vec<_> = input.iter().map(|&(x, y, _)| pt(x, y)).collect();
+        let v: Vec<f64> = input.iter().map(|&(.., v)| v).collect();
+        let mut convert = ConvertOptions {
+            cluster: true,
+            accumulate: vec![AccumulateSpec {
+                column: "v".into(),
+                op: AccumulateOp::Sum,
+            }],
+            ..ConvertOptions::default()
+        };
+        convert.density.enabled = false;
+        let ov = overview_v(dir.path(), &geoms, &v, 10, convert);
+        let (_, tiles) = export_vd(&ov, ExportOptions::default());
+        assert_contract(&tiles, 10);
+        let stops = stopped(&tiles, 10);
+        assert!(stops.contains(&(1, 0, 1)), "{stops:?}");
+        assert!(
+            stops.iter().any(|s| canonical_under(*s, &input).0 > 1),
+            "{stops:?}"
+        );
+        for s in stops {
+            let (n, sum) = canonical_under(s, &input);
+            assert_eq!(features(&tiles[&s]), n, "{s:?}");
+            assert_eq!(sum_of(&tiles[&s], "v"), sum, "{s:?}");
+        }
+    }
+
+    /// The probe's output depends on neither the thread count nor how the
+    /// tiles are cut into partitions and waves.
+    #[test]
+    fn output_is_identical_across_threads_and_waves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = dense_and_sparse();
+        input.extend((0..200).map(|i| (100.0 + f64::from(i) * 0.3, -10.0, f64::from(i))));
+        let ov = unthinned(dir.path(), &input, 10);
+        let run = |threads: usize, wave: usize, target: usize| {
+            let out = dir
+                .path()
+                .join(format!("{threads}-{wave}-{target}.pmtiles"));
+            let opts = ExportOptions {
+                variable_depth: true,
+                partition_wave: wave,
+                ..raw_cap(20_000)
+            };
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| export_pmtiles_with_partition_target(&ov, &out, &opts, target))
+                .unwrap();
+            std::fs::read(out).unwrap()
+        };
+        let reference = run(1, 1, 1);
+        assert!(!stopped(&read_tiles(&dir.path().join("1-1-1.pmtiles")), 10).is_empty());
+        assert_eq!(run(8, 4, 64), reference);
+        assert_eq!(
+            run(4, ExportOptions::default().partition_wave, 100_000),
+            reference
+        );
     }
 }

@@ -1908,72 +1908,74 @@ pub fn write_empty_archive(
 /// fixed during convert's pass 1.
 fn plan_levels(
     scans: &[LevelScan],
-    meta: &OverviewsMeta,
-    num_levels: usize,
-    inputs: PartitionBudget,
+    level_zooms: &[u8],
+    inputs: &PartitionBudget,
 ) -> Result<Vec<LevelPlan>, ExportError> {
+    let num_levels = scans.len();
+    let plans: Vec<LevelPlan> = scans
+        .iter()
+        .zip(level_zooms)
+        .enumerate()
+        .map(|(level_idx, (scan, &zoom))| {
+            plan_level(&scan.tile_counts, zoom, inputs, || {
+                format!("level {}/{num_levels} z{zoom}", level_idx + 1)
+            })
+        })
+        .collect();
+    check_levels_fit(
+        &plans,
+        scans,
+        inputs.fit_member_bytes,
+        inputs.fit_limit,
+        skip_memory_preflight_from_env(),
+    )?;
+    Ok(plans)
+}
+
+/// One zoom's partitions and wave width: its tiles split into contiguous
+/// ascending PMTiles tile-id ranges (#506) of about `partition_target`
+/// members each, and on `auto` the wave narrowed from the densest of them
+/// (#311). `label` names the zoom in the guard's log line.
+fn plan_level(
+    tile_counts: &BTreeMap<u64, usize>,
+    zoom: u8,
+    inputs: &PartitionBudget,
+    label: impl Fn() -> String,
+) -> LevelPlan {
     let PartitionBudget {
         partition_target,
         ceiling_wave,
         auto_wave,
         member_bytes,
-        fit_member_bytes,
         profile,
-        budget,
-        fit_limit,
-    } = inputs;
-    let plans = scans
-        .iter()
-        .enumerate()
-        .map(|(level_idx, scan)| {
-            let zoom = zoom_for_level(meta, level_idx)?;
-
-            // Split the zoom's tiles into contiguous ascending PMTiles
-            // tile-id ranges (#506) of roughly `partition_target` members
-            // each.
-            let partitions = plan_partitions(&scan.tile_counts, zoom, partition_target);
-
-            // Per-level memory guard (#311): on `auto`, narrow the wave from
-            // THIS level's densest planned partition so a dense finest zoom
-            // does not OOM the whole run. Explicit waves are honoured verbatim.
-            let wave = if auto_wave {
-                let w = memory_safe_level_wave(
-                    ceiling_wave,
-                    &partitions,
-                    member_bytes,
-                    profile,
-                    &budget,
-                );
-                if w < ceiling_wave {
-                    let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
-                    log::info!(
-                        "[export] level {}/{num_levels} z{zoom}: wave {ceiling_wave} → {w} \
-                         (densest partition {densest} members × ~{} B/member resident, \
-                         {} MiB budget) — #311 density guard",
-                        level_idx + 1,
-                        member_bytes.unwrap_or(0),
-                        export_collect_bytes(profile, &budget) / (1024 * 1024),
-                    );
-                }
-                w
-            } else {
-                ceiling_wave
-            };
-            Ok(LevelPlan {
-                zoom,
-                partitions,
-                wave,
-            })
-        })
-        .collect::<Result<Vec<_>, ExportError>>()?;
-    check_levels_fit(
-        &plans,
-        scans,
-        fit_member_bytes,
-        fit_limit,
-        skip_memory_preflight_from_env(),
-    )?;
-    Ok(plans)
+        ref budget,
+        ..
+    } = *inputs;
+    let partitions = plan_partitions(tile_counts, zoom, partition_target);
+    // Per-level memory guard (#311): on `auto`, narrow the wave from THIS
+    // level's densest planned partition so a dense finest zoom does not OOM
+    // the whole run. Explicit waves are honoured verbatim.
+    let wave = if auto_wave {
+        let w = memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, profile, budget);
+        if w < ceiling_wave {
+            let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
+            log::info!(
+                "[export] {}: wave {ceiling_wave} → {w} (densest partition {densest} \
+                 members × ~{} B/member resident, {} MiB budget) — #311 density guard",
+                label(),
+                member_bytes.unwrap_or(0),
+                export_collect_bytes(profile, budget) / (1024 * 1024),
+            );
+        }
+        w
+    } else {
+        ceiling_wave
+    };
+    LevelPlan {
+        zoom,
+        partitions,
+        wave,
+    }
 }
 
 /// #541 review: a partial overview (written under a convert-side zoom
@@ -2301,8 +2303,7 @@ fn export_pmtiles_validated(
     // hashed or read for.
     restrict_scans_to_range(&mut scans, &level_zooms, options);
     // #803: rule A′'s blocked tiles, once every band is counted.
-    let _vd_plan = vd_scan.map(|vd| vd.finish(&scans));
-    let scans = scans;
+    let vd_plan = vd_scan.map(|vd| vd.finish(&scans));
 
     let mut overall_bounds: Option<TileBounds> = None;
     for scan in &scans {
@@ -2332,21 +2333,42 @@ fn export_pmtiles_validated(
     // single-read fill (#235) routes members by (level, partition, wave), so
     // the drain loop below must consume the exact same plan it was filled
     // against; hoisting the planning out of the level loop guarantees that.
-    let plans = plan_levels(
-        &scans,
-        &meta,
-        num_levels,
-        PartitionBudget {
-            partition_target,
-            ceiling_wave,
-            auto_wave,
-            member_bytes,
-            fit_member_bytes,
-            profile: options.profile,
-            budget: *budget,
-            fit_limit: knobs.memory_limit.or_else(probe_oom_memory_limit),
-        },
-    )?;
+    let partition_budget = PartitionBudget {
+        partition_target,
+        ceiling_wave,
+        auto_wave,
+        member_bytes,
+        fit_member_bytes,
+        profile: options.profile,
+        budget: *budget,
+        fit_limit: knobs.memory_limit.or_else(probe_oom_memory_limit),
+    };
+    // #803: stop each branch where the canonical tile fits, and plan only
+    // the tiles that remain.
+    let terminals = match vd_plan {
+        Some(plan) => {
+            progress.enter_phase("probe");
+            let t_probe = Instant::now();
+            let frontier = plan.probe(
+                &variable_depth::Probe {
+                    reader: &reader,
+                    crs,
+                    published: &published,
+                    feature_id: feature_id.as_ref(),
+                    options,
+                    budget: &partition_budget,
+                    timers: &progress.profile.timers,
+                },
+                diagnostics,
+            )?;
+            frontier.restrict(&mut scans, &level_zooms);
+            progress.end_probe(t_probe);
+            frontier.into_terminals()
+        }
+        None => (0..num_levels).map(|_| Vec::new()).collect(),
+    };
+    let scans = scans;
+    let plans = plan_levels(&scans, &level_zooms, &partition_budget)?;
     progress.end_scan(t_scan);
 
     // Pass 2 read strategy (#235): in partitioning mode a level's render set
@@ -2489,6 +2511,7 @@ fn export_pmtiles_validated(
             gzip_cache: &gzip_cache,
             start,
             fills: None,
+            terminals: &terminals[level_idx],
             level_read,
             #[cfg(test)]
             work: &work,
@@ -2814,9 +2837,16 @@ impl ExportProgress {
         }
     }
 
-    /// Close the scan (+ plan) phase wall and sample RSS.
+    /// Close the scan (+ plan) phase wall, less the #803 probe inside it,
+    /// and sample RSS.
     fn end_scan(&mut self, t_scan: Instant) {
-        self.profile.walls.scan = t_scan.elapsed().as_secs_f64();
+        self.profile.walls.scan = t_scan.elapsed().as_secs_f64() - self.profile.walls.probe;
+        self.sample_boundary_rss();
+    }
+
+    /// Close the #803 variable-depth probe's phase wall and sample RSS.
+    fn end_probe(&mut self, t_probe: Instant) {
+        self.profile.walls.probe = t_probe.elapsed().as_secs_f64();
         self.sample_boundary_rss();
     }
 
@@ -2992,6 +3022,8 @@ struct ExportLevelCtx<'a> {
     start: Instant,
     /// The #750 coverage fill, when asked for.
     fills: Option<&'a coverage_fill::FillMap>,
+    /// #803: the level's stopped tiles, in key order, written among its own.
+    terminals: &'a [EncodedTile],
     /// How a level of several waves reads its band when no export-wide
     /// member store is filled: once, into a one-level [`MemberStore`]
     /// (#740), or, `None`, once per wave.
@@ -3015,6 +3047,10 @@ impl<'a> ExportLevelCtx<'a> {
             feature_id: self.feature_id,
             timers,
             fills: self.fills,
+            tiles: self
+                .options
+                .variable_depth
+                .then_some(&self.scan.tile_counts),
             #[cfg(test)]
             work: self.work,
         }
@@ -3074,7 +3110,7 @@ fn export_level(
             }
             (None, None) => process_wave(&ctx, wave, diagnostics)?,
         };
-        write_encoded_tiles(writer, zoom, &results, &mut tally, timers)?;
+        write_encoded_tiles(writer, zoom, &results, level.terminals, &mut tally, timers)?;
 
         if last_wave_log.elapsed() >= WAVE_LOG_INTERVAL {
             log::info!(
@@ -3088,6 +3124,7 @@ fn export_level(
             last_wave_log = Instant::now();
         }
     }
+    write_terminals(writer, zoom, level.terminals, None, &mut tally, timers)?;
     for grant in level_grants {
         budget.release(grant);
     }
@@ -3413,13 +3450,17 @@ impl GroupCommit<'_> {
     fn write_level(&mut self, i: usize, encoded: EncodedLevel) -> Result<ZoomReport, ExportError> {
         let level = &self.levels[i];
         let mut tally = LevelTally::default();
+        let timers = &self.progress.profile.timers;
+        let zoom = level.plan.zoom;
         write_encoded_tiles(
             self.writer,
-            level.plan.zoom,
+            zoom,
             &encoded.tiles,
+            level.terminals,
             &mut tally,
-            &self.progress.profile.timers,
+            timers,
         )?;
+        write_terminals(self.writer, zoom, level.terminals, None, &mut tally, timers)?;
         drop(encoded.tiles);
         let report = finish_level(
             level,
@@ -3497,33 +3538,76 @@ struct LevelTally {
     valve_passes: u64,
     /// Every tile's coverage fill, summed (#750).
     fill: FillTally,
+    /// #803: the level's stopped tiles written so far.
+    terminals: usize,
 }
 
 /// Append one wave's encoded tiles to the writer in order, and add them to
-/// `tally`.
+/// `tally`. The level's #803 stopped tiles that sort before each are
+/// written first, so the archive stays in tile-id order.
 fn write_encoded_tiles(
     writer: &mut StreamingPmtilesWriter,
     zoom: u8,
     results: &[Vec<EncodedTile>],
+    terminals: &[EncodedTile],
+    tally: &mut LevelTally,
+    timers: &ExportTimers,
+) -> Result<(), ExportError> {
+    for t in results.iter().flatten() {
+        write_terminals(
+            writer,
+            zoom,
+            terminals,
+            Some(tile_key(t.x, t.y, zoom)),
+            tally,
+            timers,
+        )?;
+        write_tile(writer, zoom, t, tally, timers)?;
+    }
+    Ok(())
+}
+
+/// Write the level's #803 stopped tiles not yet written whose key is below
+/// `before` (all of them for `None`).
+fn write_terminals(
+    writer: &mut StreamingPmtilesWriter,
+    zoom: u8,
+    terminals: &[EncodedTile],
+    before: Option<u64>,
+    tally: &mut LevelTally,
+    timers: &ExportTimers,
+) -> Result<(), ExportError> {
+    while let Some(t) = terminals.get(tally.terminals) {
+        if before.is_some_and(|key| tile_key(t.x, t.y, zoom) >= key) {
+            break;
+        }
+        write_tile(writer, zoom, t, tally, timers)?;
+        tally.terminals += 1;
+    }
+    Ok(())
+}
+
+/// Append one encoded tile to the writer, and add it to `tally`.
+fn write_tile(
+    writer: &mut StreamingPmtilesWriter,
+    zoom: u8,
+    t: &EncodedTile,
     tally: &mut LevelTally,
     timers: &ExportTimers,
 ) -> Result<(), ExportError> {
     let t_write = Instant::now();
-    for t in results.iter().flatten() {
-        tally.encode_dropped += t.encode_dropped;
-        tally.encode_quantized += t.encode_quantized;
-        tally.valve.merged += t.valve.merged;
-        tally.valve.dropped += t.valve.dropped;
-        tally.valve.passes = tally.valve.passes.max(t.valve.passes);
-        tally.valve_passes += u64::from(t.valve.passes);
-        tally.fill.polygons += t.fill.polygons;
-        tally.fill.vertices += t.fill.vertices;
-        tally.fill.shed += t.fill.shed;
-        tally.valve.mingap = tally.valve.mingap.max(t.valve.mingap);
-        if t.feature_count == 0 {
-            // #431: an all-dropped tile is a tally carrier, not a tile.
-            continue;
-        }
+    tally.encode_dropped += t.encode_dropped;
+    tally.encode_quantized += t.encode_quantized;
+    tally.valve.merged += t.valve.merged;
+    tally.valve.dropped += t.valve.dropped;
+    tally.valve.passes = tally.valve.passes.max(t.valve.passes);
+    tally.valve_passes += u64::from(t.valve.passes);
+    tally.fill.polygons += t.fill.polygons;
+    tally.fill.vertices += t.fill.vertices;
+    tally.fill.shed += t.fill.shed;
+    tally.valve.mingap = tally.valve.mingap.max(t.valve.mingap);
+    if t.feature_count > 0 {
+        // #431: an all-dropped tile is a tally carrier, not a tile.
         tally.tile_feature_count += t.feature_count;
         tally.bytes_written += t.data.len() as u64;
         if t.oversized {
@@ -3544,9 +3628,9 @@ fn write_encoded_tiles(
     }
     let write_dur = t_write.elapsed();
     tally.write_secs += write_dur.as_secs_f64();
-    // #535: `spool_write` is exactly this per-wave window — the serial
-    // per-tile `writer.add_tile_precompressed` calls above, same span
-    // `write_secs` already measures for the `[profile]` log.
+    // #535: `spool_write` is exactly the serial per-tile
+    // `writer.add_tile_precompressed` window, the span `write_secs` measures
+    // for the `[profile]` log.
     add_nanos(&timers.spool_write, write_dur);
     Ok(())
 }
@@ -3811,6 +3895,10 @@ struct LevelCtx<'a> {
     timers: &'a ExportTimers,
     /// The #750 coverage fill, when asked for.
     fills: Option<&'a coverage_fill::FillMap>,
+    /// #803: the only tiles to clip into. A partition's key range can span
+    /// a stopped tile, whose members must not be drawn again. `None` draws
+    /// every tile in the range, which then holds only planned tiles.
+    tiles: Option<&'a BTreeMap<u64, usize>>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -6008,7 +6096,12 @@ fn collect_wave_members(
         .into_par_iter()
         .map(|g| {
             ExportTimers::time(&timers.clip, || {
-                feature_tile_members(&g, ctx.zoom, ctx.opts, key_lo, key_hi, diagnostics)
+                let mut members =
+                    feature_tile_members(&g, ctx.zoom, ctx.opts, key_lo, key_hi, diagnostics);
+                if let Some(tiles) = ctx.tiles {
+                    members.retain(|(key, _)| tiles.contains_key(key));
+                }
+                members
             })
         })
         .collect();
@@ -7192,6 +7285,84 @@ fn sort_members_for_encode(members: &mut [Member], order: &FeatureOrder) {
     }
 }
 
+/// Record which of a tile's members reached it and which were lost, by
+/// source row, when a `--feature-id` is set (#443): a source drawn in any
+/// tile at any zoom is never lost.
+fn account_sources(
+    members: &[Member],
+    mvt: &TileMvt,
+    zoom: u8,
+    opts: &ExportOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<(), ExportError> {
+    use crate::diagnostics::SourceLossCause;
+    if opts.feature_id.is_none() {
+        return Ok(());
+    }
+    let cause = if mvt.valve.dropped > 0 {
+        SourceLossCause::ValveDropped
+    } else if mvt.valve.merged > 0 {
+        SourceLossCause::Merged
+    } else {
+        SourceLossCause::EncodeDropped
+    };
+    let surviving: std::collections::BTreeSet<u64> = mvt.source_ids.iter().copied().collect();
+    let losses: std::collections::BTreeMap<u64, _> = mvt.source_losses.iter().copied().collect();
+    for member in members {
+        if let Some(id) = member.id {
+            let cause = losses.get(&member.seq).copied().unwrap_or(cause);
+            if !surviving.contains(&member.seq) {
+                diagnostics.source_member_loss(member.seq, id, zoom, cause)?;
+            }
+        }
+    }
+    if mvt.features > 0 {
+        for &id in &mvt.source_ids {
+            diagnostics.source_emitted(id, zoom)?;
+        }
+    }
+    Ok(())
+}
+
+/// The writer's [`EncodedTile`] for tile `x`/`y`: gzip-compressed here, in
+/// the parallel encode section (#227). A tile whose every member encoded to
+/// nothing (#431) is an empty carrier the writer loop skips: there is no
+/// tile to write, but the drops must still reach the report.
+fn encoded_tile(x: u32, y: u32, mvt: TileMvt, fill: FillTally) -> Result<EncodedTile, ExportError> {
+    if mvt.features == 0 {
+        return Ok(EncodedTile {
+            x,
+            y,
+            data: Vec::new(),
+            hash: 0,
+            raw_len: 0,
+            feature_count: 0,
+            encode_dropped: mvt.unencodable,
+            encode_quantized: mvt.quantized,
+            oversized: mvt.oversized,
+            valve: mvt.valve,
+            // The tile is not written, so neither is its fill.
+            fill: FillTally::default(),
+        });
+    }
+    let hash = TileHasher::hash(&mvt.data);
+    let raw_len = mvt.data.len();
+    let data = mvt.data.into_gzip(&mvt.gzip_cache)?;
+    Ok(EncodedTile {
+        x,
+        y,
+        data,
+        hash,
+        raw_len,
+        feature_count: mvt.features,
+        encode_dropped: mvt.unencodable,
+        encode_quantized: mvt.quantized,
+        oversized: mvt.oversized,
+        valve: mvt.valve,
+        fill,
+    })
+}
+
 fn encode_members(
     gzip_cache: &Arc<TileGzipCache>,
     mut members: Vec<Member>,
@@ -7238,80 +7409,13 @@ fn encode_members(
             &mut fill_tally,
             diagnostics,
         );
-        if opts.feature_id.is_some() {
-            use crate::diagnostics::SourceLossCause;
-            let cause = if mvt.valve.dropped > 0 {
-                SourceLossCause::ValveDropped
-            } else if mvt.valve.merged > 0 {
-                SourceLossCause::Merged
-            } else {
-                SourceLossCause::EncodeDropped
-            };
-            let surviving: std::collections::BTreeSet<u64> =
-                mvt.source_ids.iter().copied().collect();
-            let losses: std::collections::BTreeMap<u64, _> =
-                mvt.source_losses.iter().copied().collect();
-            for member in g {
-                if let Some(id) = member.id {
-                    let cause = losses.get(&member.seq).copied().unwrap_or(cause);
-                    if !surviving.contains(&member.seq) {
-                        if let Err(error) =
-                            diagnostics.source_member_loss(member.seq, id, zoom, cause)
-                        {
-                            return Some(Err(error.into()));
-                        }
-                    }
-                }
-            }
-            if mvt.features > 0 {
-                for &id in &mvt.source_ids {
-                    if let Err(error) = diagnostics.source_emitted(id, zoom) {
-                        return Some(Err(error.into()));
-                    }
-                }
-            }
+        if let Err(error) = account_sources(g, &mvt, zoom, opts, diagnostics) {
+            return Some(Err(error));
         }
         if let Some(f) = fills {
             f.note_shed(fill_tally.shed);
         }
-        if mvt.features == 0 {
-            // Every member encoded to nothing (#431). There is no tile
-            // to write, but the drops must still reach the report, so
-            // hand back an empty carrier the writer loop skips.
-            return Some(Ok(EncodedTile {
-                x,
-                y,
-                data: Vec::new(),
-                hash: 0,
-                raw_len: 0,
-                feature_count: 0,
-                encode_dropped: mvt.unencodable,
-                encode_quantized: mvt.quantized,
-                oversized: mvt.oversized,
-                valve: mvt.valve,
-                // The tile is not written, so neither is its fill.
-                fill: FillTally::default(),
-            }));
-        }
-        let hash = TileHasher::hash(&mvt.data);
-        let raw_len = mvt.data.len();
-        let compressed = match mvt.data.into_gzip(&mvt.gzip_cache) {
-            Ok(gzip) => gzip,
-            Err(e) => return Some(Err(ExportError::from(e))),
-        };
-        Some(Ok(EncodedTile {
-            x,
-            y,
-            data: compressed,
-            hash,
-            raw_len,
-            feature_count: mvt.features,
-            encode_dropped: mvt.unencodable,
-            encode_quantized: mvt.quantized,
-            oversized: mvt.oversized,
-            valve: mvt.valve,
-            fill: fill_tally,
-        }))
+        Some(encoded_tile(x, y, mvt, fill_tally))
     };
     // Longest tile first, one tile per task: a tile's valve passes are a
     // serial chain, so a dense tile that starts late sets the wall of its

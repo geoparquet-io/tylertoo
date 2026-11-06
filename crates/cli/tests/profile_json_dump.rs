@@ -795,7 +795,7 @@ fn check_export_phase_walls(export_value: &serde_json::Value) -> &serde_json::Va
         total > 0.0,
         "export.phase_walls.total must be > 0: {export_value}"
     );
-    let sum = wall("scan") + wall("fill") + wall("levels") + wall("finalize");
+    let sum = wall("scan") + wall("probe") + wall("fill") + wall("levels") + wall("finalize");
     assert!(
         sum <= total * 1.01,
         "export.phase_walls must be disjoint windows: scan+fill+levels+finalize \
