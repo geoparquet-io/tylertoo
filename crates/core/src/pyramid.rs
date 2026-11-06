@@ -61,6 +61,7 @@ pub enum PyramidError {
          must address tiles in ascending id order",
         path.display()
     )]
+    #[non_exhaustive]
     OutOfOrder {
         /// The band archive.
         path: PathBuf,
@@ -71,6 +72,7 @@ pub enum PyramidError {
     },
     /// A tile two bands share did not decompress.
     #[error("tile {z}/{x}/{y} of band {layer:?} failed to decompress: {error}")]
+    #[non_exhaustive]
     TileDecompress {
         /// Tile zoom.
         z: u8,
@@ -85,6 +87,7 @@ pub enum PyramidError {
     },
     /// A combined shared-zoom tile did not compress.
     #[error("tile {z}/{x}/{y} failed to compress: {error}")]
+    #[non_exhaustive]
     TileCompress {
         /// Tile zoom.
         z: u8,
@@ -97,6 +100,7 @@ pub enum PyramidError {
     },
     /// A band's intermediate file could not be reserved.
     #[error("band {layer:?}: {error}")]
+    #[non_exhaustive]
     BandWorkFile {
         /// The band's layer.
         layer: String,
@@ -105,6 +109,7 @@ pub enum PyramidError {
     },
     /// Tiling a GeoParquet band failed in its convert half.
     #[error("band {layer:?}: convert failed: {error}")]
+    #[non_exhaustive]
     BandConvert {
         /// The band's layer.
         layer: String,
@@ -113,6 +118,7 @@ pub enum PyramidError {
     },
     /// Tiling a GeoParquet band failed in its export half.
     #[error("band {layer:?}: export failed: {error}")]
+    #[non_exhaustive]
     BandExport {
         /// The band's layer.
         layer: String,
@@ -124,7 +130,7 @@ pub enum PyramidError {
     Config(#[from] crate::overview::config::ConfigError),
     /// A band convert option, or the publication metadata, refused.
     #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
+    InvalidConfig(crate::InvalidConfigError),
     /// The output cannot be written (#452: checked before any work).
     #[error(transparent)]
     Output(#[from] crate::atomic_output::OutputNotWritable),
@@ -147,13 +153,25 @@ impl crate::error::Classify for PyramidError {
             PyramidError::BandConvert { error, .. } => error.kind(),
             PyramidError::BandExport { error, .. } => error.kind(),
             PyramidError::Archive(error) => error.kind(),
-            _ => ErrorKind::Runtime,
+            _ => crate::error::fallback_kind(self),
         }
     }
 }
 
 // Not `#[from]` on the variant: the inner error's message is already in this
 // one's, so it is not also a `source()` the CLI would print a second time.
+impl PyramidError {
+    /// [`Self::BandConvert`] for the frontends' classification tests, which
+    /// cannot build the `#[non_exhaustive]` variant.
+    #[doc(hidden)]
+    pub fn band_convert(layer: impl Into<String>, error: ConvertError) -> Self {
+        PyramidError::BandConvert {
+            layer: layer.into(),
+            error,
+        }
+    }
+}
+
 impl From<crate::pmtiles_writer::WriteError> for PyramidError {
     fn from(e: crate::pmtiles_writer::WriteError) -> Self {
         PyramidError::Archive(e.into())
@@ -168,6 +186,7 @@ impl From<crate::archive_index::ArchiveError> for PyramidError {
 
 /// One band: an input tiled verbatim across `min_zoom..=max_zoom` into `layer`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Band {
     pub input: PathBuf,
     pub layer: String,
@@ -176,6 +195,22 @@ pub struct Band {
 }
 
 impl Band {
+    /// `input` tiled verbatim across `min_zoom..=max_zoom` into `layer`.
+    /// [`build_pyramid`] validates the band set.
+    pub fn new(
+        input: impl Into<PathBuf>,
+        layer: impl Into<String>,
+        min_zoom: u8,
+        max_zoom: u8,
+    ) -> Self {
+        Self {
+            input: input.into(),
+            layer: layer.into(),
+            min_zoom,
+            max_zoom,
+        }
+    }
+
     /// Web Mercator zoom ceiling: the shared [`crate::tile::MAX_ZOOM`] (#371),
     /// which every write path now enforces at options validation.
     const MAX_ZOOM: u8 = crate::tile::MAX_ZOOM;
@@ -1552,6 +1587,7 @@ fn parse_layers(
 
 /// What a pyramid build produced.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PyramidReport {
     /// Aggregated diagnostics for this pyramid only.
     pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
@@ -1638,6 +1674,7 @@ impl serde::Serialize for PyramidReport {
 
 /// Knobs for [`merge_bands_with_options`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct BandMergeOptions {
     /// Let a pre-tiled band's declared zoom range overshoot what its archive
     /// actually holds (#495) instead of failing. Off matches
@@ -1655,10 +1692,16 @@ pub struct BandMergeOptions {
     pub metadata: TilesetMetadata,
 }
 
+with_setters!(BandMergeOptions {
+    with_allow_missing_zooms => allow_missing_zooms: bool,
+    with_metadata => metadata: TilesetMetadata,
+});
+
 /// How the one-shot pyramid tiles each GeoParquet band.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
+#[non_exhaustive]
 pub struct PyramidOptions {
     /// Convert knobs applied to every source band, with the band's own zoom
     /// range substituted for [`ConvertOptions::levels`].
@@ -1704,6 +1747,14 @@ pub struct PyramidOptions {
     #[cfg_attr(feature = "cli", arg(skip = Self::default().metadata))]
     pub metadata: TilesetMetadata,
 }
+
+with_setters!(PyramidOptions {
+    with_convert => convert: ConvertOptions,
+    with_export => export: ExportOptions,
+    with_work_dir => work_dir: Option<PathBuf>,
+    with_allow_missing_zooms => allow_missing_zooms: bool,
+    with_metadata => metadata: TilesetMetadata,
+});
 
 impl Default for PyramidOptions {
     fn default() -> Self {
@@ -1769,6 +1820,7 @@ impl PyramidOptions {
     ///
     /// [`PyramidError::Config`], or [`PyramidError::InvalidConfig`] for a convert knob.
     /// Validate these options and return the immutable engine configuration.
+    #[doc(hidden)]
     pub fn validate(
         &self,
     ) -> Result<crate::overview::config::ValidatedConfig<'_, Self>, PyramidError> {
@@ -1780,9 +1832,9 @@ impl PyramidOptions {
         self.metadata
             .check_size()
             .map_err(crate::overview::config::ConfigError::MetadataTooLarge)?;
-        self.convert
-            .validate()
-            .map_err(|e| PyramidError::InvalidConfig(format!("band convert options: {e}")))?;
+        self.convert.validate().map_err(|e| {
+            PyramidError::InvalidConfig(crate::InvalidConfigError::BandConvertOptions(Box::new(e)))
+        })?;
         self.export.validate()?;
         check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
         Ok(())
@@ -1900,7 +1952,9 @@ fn build_pyramid_validated(
             collect_band_metadata(&mut collector, band)?;
         }
     }
-    collector.resolve().map_err(PyramidError::InvalidConfig)?;
+    collector.resolve().map_err(|message| {
+        PyramidError::InvalidConfig(crate::InvalidConfigError::MetadataTooLarge { message })
+    })?;
 
     // Keeps every intermediate alive for the merge and unlinks them on drop —
     // including the early-return paths below. TempPaths, not open
@@ -2036,7 +2090,9 @@ fn collect_band_metadata(
     };
     collector
         .add_json(&band_label(band), &root)
-        .map_err(PyramidError::InvalidConfig)?;
+        .map_err(|message| {
+            PyramidError::InvalidConfig(crate::InvalidConfigError::MetadataTooLarge { message })
+        })?;
     Ok(true)
 }
 
@@ -2148,7 +2204,9 @@ fn merge_prepared_bands(
             bands_without_metadata.push(band_label(band));
         }
     }
-    let publication = collector.resolve().map_err(PyramidError::InvalidConfig)?;
+    let publication = collector.resolve().map_err(|message| {
+        PyramidError::InvalidConfig(crate::InvalidConfigError::MetadataTooLarge { message })
+    })?;
     collector.log_resolution();
 
     // StreamingPmtilesWriter, not PmtilesWriter: it spools tile bytes to a temp

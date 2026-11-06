@@ -14,7 +14,7 @@
 //!
 //! ```
 //! use geo::{Geometry, Point, point};
-//! use tylertoo_core::wkb::{geometry_to_wkb, wkb_to_geometry};
+//! use tylertoo_core::internal::wkb::{geometry_to_wkb, wkb_to_geometry};
 //!
 //! let point = Geometry::Point(point!(x: 1.5, y: 2.5));
 //! let wkb_bytes = geometry_to_wkb(&point).unwrap();
@@ -59,7 +59,7 @@ pub type Result<T> = std::result::Result<T, WkbError>;
 /// # Example
 /// ```
 /// use geo::{Geometry, LineString, line_string};
-/// use tylertoo_core::wkb::geometry_to_wkb;
+/// use tylertoo_core::internal::wkb::geometry_to_wkb;
 ///
 /// let line = Geometry::LineString(line_string![(x: 0.0, y: 0.0), (x: 1.0, y: 1.0)]);
 /// let wkb = geometry_to_wkb(&line).unwrap();
@@ -113,7 +113,7 @@ fn has_holes_without_exterior(geom: &Geometry) -> bool {
 /// # Example
 /// ```
 /// use geo::{Geometry, Point, point};
-/// use tylertoo_core::wkb::{geometry_to_wkb, wkb_to_geometry};
+/// use tylertoo_core::internal::wkb::{geometry_to_wkb, wkb_to_geometry};
 ///
 /// let original = Geometry::Point(point!(x: 42.0, y: -73.5));
 /// let wkb = geometry_to_wkb(&original).unwrap();

@@ -204,7 +204,7 @@ fn mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
-use tylertoo_core::overview::assign::{
+use tylertoo_core::internal::overview::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, Crs,
     DensityBudgetConfig, FeatureKind, FeatureTable,
 };

@@ -3154,17 +3154,11 @@ fn load_plan_state(
     // compacted table must be exactly as long as what the shard will read.
     if options.shard.is_some() {
         if plan.coalesce.as_ref().is_some_and(|c| !c.rows.is_empty()) {
-            return Err(ConvertError::InvalidConfig(format!(
-                "--shard is not supported with line coalescing: {} carries {} coalesced line \
-                 chain(s). A chain is a NEW geometry spanning every row it merged, so no \
-                 single input row group's bbox bounds it — the shard that holds the chain's \
-                 row would emit tiles outside its own range while the neighbouring shard, \
-                 which never reads that row, would emit none, leaving a gap at the seam. \
-                 Re-run the whole fleet (including the coarse job, so the plan matches) with \
-                 --no-coalesce-lines.",
-                path.display(),
-                plan.coalesce.as_ref().map_or(0, |c| c.rows.len()),
-            )));
+            return Err(super::convert::InvalidOption::ShardWithCoalescedLines {
+                plan: path.to_path_buf(),
+                chains: plan.coalesce.as_ref().map_or(0, |c| c.rows.len()),
+            }
+            .into());
         }
         super::plan_state::rebase_plan_for_shard(&mut plan, source, selected_row_groups, path)?;
     }
@@ -3176,7 +3170,7 @@ fn load_plan_state(
     }
     let will_stream = source.selected_row_count(selected_row_groups)?;
     if will_stream != plan.min_levels.len() as i64 {
-        return Err(ConvertError::InvalidConfig(format!(
+        return Err(super::convert::InvalidOption::plan(format!(
             "--plan: {} does not match this run's input: the plan holds {} winner-table \
              row(s) but the row group(s) this run will read hold {will_stream} row(s). \
              Re-run without --plan (add --save-plan to write a fresh one).",
@@ -3198,7 +3192,7 @@ fn load_plan_state(
             .map(|e| e.aggregates.len())
             .find(|&n| n != want)
         {
-            return Err(ConvertError::InvalidConfig(format!(
+            return Err(super::convert::InvalidOption::plan(format!(
                 "--plan: {} has cluster entries carrying {got} aggregate(s) but this run \
                  declares {want} --accumulate spec(s)",
                 path.display(),
@@ -3206,7 +3200,7 @@ fn load_plan_state(
         }
     }
     if plan.counts.len() != plan.level_specs.len() || plan.finest >= plan.level_specs.len() {
-        return Err(ConvertError::InvalidConfig(format!(
+        return Err(super::convert::InvalidOption::plan(format!(
             "--plan: {} has an inconsistent level plan ({} spec(s), {} count(s), finest {})",
             path.display(),
             plan.level_specs.len(),
@@ -5016,14 +5010,12 @@ fn decode_error_at_rows(diag_row_base: usize, chunk_len: usize, e: crate::Error)
     if matches!(&e, crate::Error::Accounting(_)) {
         return e;
     }
-    let inner = match &e {
-        crate::Error::GeoParquetRead(msg) => msg.clone(),
-        other => other.to_string(),
-    };
-    crate::Error::GeoParquetRead(format!(
-        "rows {diag_row_base}..{}: {inner}",
-        diag_row_base + chunk_len
-    ))
+    crate::GeoParquetReadError::AtRows {
+        start: diag_row_base,
+        end: diag_row_base + chunk_len,
+        error: Box::new(e),
+    }
+    .into()
 }
 
 /// One usable pass-1 row as [`ScanRows`] found it: kind and bbox from
@@ -5069,9 +5061,12 @@ impl GeoArrowVisitor for ScanRows<'_> {
     {
         let mut out = Vec::with_capacity(accessor.len());
         for (i, item) in accessor.iter().enumerate() {
-            let item = item.transpose().map_err(|e| {
-                crate::Error::GeoParquetRead(format!("Invalid geometry at index {i}: {e}"))
-            })?;
+            let item =
+                item.transpose()
+                    .map_err(|e| crate::GeoParquetReadError::InvalidGeometry {
+                        index: i,
+                        message: e.to_string(),
+                    })?;
             if self.filter_mask.is_some_and(|m| m[i] != Some(true)) {
                 self.diagnostics.source_loss(
                     (self.row_base + i) as u64,
@@ -5159,7 +5154,11 @@ fn scan_chunk(
         decode_error_at_rows(
             diag_row_base,
             chunk_len,
-            crate::Error::GeoParquetRead(format!("geometry decode: {e}")),
+            crate::GeoParquetReadError::Decode {
+                stage: "geometry decode",
+                message: e.to_string(),
+            }
+            .into(),
         )
     })?;
     let rows = visit_geoarrow_array(
@@ -5614,10 +5613,9 @@ fn run_pass1_with_chunk_rows(
         .as_ref()
         .map(|spec| {
             input_schema.index_of(&spec.column).map_err(|_| {
-                ConvertError::InvalidConfig(format!(
-                    "entry-zoom column {:?} not found in the input schema",
-                    spec.column
-                ))
+                ConvertError::from(super::convert::InvalidOption::EntryZoomColumnMissing {
+                    column: spec.column.clone(),
+                })
             })
         })
         .transpose()?;
@@ -6386,7 +6384,7 @@ fn decode_selected_geometries(
         let geom_taken = take(batch.column(ctx.geom_idx).as_ref(), &take_idx, None)?;
         let schema = batch.schema();
         let garr = from_arrow_array(geom_taken.as_ref(), schema.field(ctx.geom_idx))
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+            .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
         extract_geometries_from_array(garr.as_ref(), &mut geoms, ctx.diagnostics)?;
     }
     Ok(geoms)

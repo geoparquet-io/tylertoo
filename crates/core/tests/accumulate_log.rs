@@ -6,8 +6,8 @@
 use std::sync::Mutex;
 
 use geo::{Geometry, LineString, Polygon};
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::simplify::{CollapseMode, SimplifyOptions};
 
 #[expect(
     dead_code,
@@ -59,19 +59,17 @@ fn convert_at(factor: f64, gsd_base: f64) {
     let tin = tempfile::NamedTempFile::new().unwrap();
     testutil::write_input(tin.path(), &fields(), true, None);
     let tout = tempfile::NamedTempFile::new().unwrap();
-    let o = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
+    let o = ConvertOptions::default()
+        .with_levels(LevelPlan::ZoomRange {
             min_zoom: 8,
             max_zoom: 12,
-        },
-        simplify: SimplifyOptions {
-            factor,
-            collapse: CollapseMode::Square,
-            ..SimplifyOptions::default()
-        },
-        gsd_base,
-        ..Default::default()
-    };
+        })
+        .with_simplify(
+            SimplifyOptions::default()
+                .with_factor(factor)
+                .with_collapse(CollapseMode::Square),
+        )
+        .with_gsd_base(gsd_base);
     let _ = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
 }
 

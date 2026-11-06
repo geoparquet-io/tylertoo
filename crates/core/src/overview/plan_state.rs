@@ -209,12 +209,12 @@ fn ipc_view(file: File, offset: u64) -> Offset<BufReader<File>> {
 /// plan to a worker must abort with a message naming the flag and the file,
 /// not an arrow-internal index panic.
 fn plan_err(path: &Path, what: &str) -> ConvertError {
-    ConvertError::InvalidConfig(format!("--plan {}: {what}", path.display()))
+    super::convert::InvalidOption::plan(format!("--plan {}: {what}", path.display()))
 }
 
 /// The `--save-plan` counterpart of [`plan_err`].
 fn save_plan_err(path: &Path, what: &str) -> ConvertError {
-    ConvertError::InvalidConfig(format!("--save-plan {}: {what}", path.display()))
+    super::convert::InvalidOption::save_plan(format!("--save-plan {}: {what}", path.display()))
 }
 
 /// Identity of one input part, as of the run that produced the plan.
@@ -477,7 +477,7 @@ fn verify_input(
                 now.row_groups.as_deref(),
                 saved.row_groups_total,
             ) {
-                return Err(ConvertError::InvalidConfig(format!(
+                return Err(super::convert::InvalidOption::plan(format!(
                     "--plan: this shard would read row group {extra} of input {:?}, which the \
                      plan was not saved over (the plan covers {}). A shard may only narrow the \
                      plan's row-group selection, never widen it — the winner table has no row \
@@ -571,7 +571,7 @@ pub(super) fn rebase_plan_for_shard(
                 None => (0..part_rows.len()).collect(),
             },
             None => {
-                return Err(ConvertError::InvalidConfig(format!(
+                return Err(super::convert::InvalidOption::plan(format!(
                     "--plan: {} names {} input part(s) but this run has at least {}",
                     named(),
                     plan.fingerprint.inputs.len(),
@@ -588,7 +588,7 @@ pub(super) fn rebase_plan_for_shard(
         if plan_groups.windows(2).any(|w| w[0] >= w[1])
             || plan_groups.last().is_some_and(|&g| g >= part_rows.len())
         {
-            return Err(ConvertError::InvalidConfig(format!(
+            return Err(super::convert::InvalidOption::plan(format!(
                 "--plan: {} records part {part_idx}'s selected row groups as {plan_groups:?}, \
                  which is not a strictly ascending list of that part's {} group(s). Row \
                  positions in the plan's tables are derived from this order, so it cannot be \
@@ -626,7 +626,7 @@ pub(super) fn rebase_plan_for_shard(
     }
 
     if plan_cursor != plan.min_levels.len() {
-        return Err(ConvertError::InvalidConfig(format!(
+        return Err(super::convert::InvalidOption::plan(format!(
             "--plan: {} holds {} winner-table row(s) but the row group(s) it was saved over \
              hold {plan_cursor} row(s). Re-run without --plan (add --save-plan to write a \
              fresh one).",
@@ -657,7 +657,7 @@ pub(super) fn rebase_plan_for_shard(
         for r in runs {
             let end = r.plan_base + r.len;
             if end > src.len() {
-                return Err(ConvertError::InvalidConfig(format!(
+                return Err(super::convert::InvalidOption::plan(format!(
                     "--plan: {named}'s {what} table holds {} entr(y/ies) but the row groups it \
                      was saved over reach row {end}. The plan is truncated or inconsistent; \
                      re-run without --plan (add --save-plan to write a fresh one).",
@@ -697,7 +697,7 @@ pub(super) fn rebase_plan_for_shard(
             }),
         plan.totals.source_losses.spill_dir(),
     )
-    .map_err(|e| ConvertError::InvalidConfig(format!("--plan: source accounting: {e}")))?;
+    .map_err(|e| super::convert::InvalidOption::plan(format!("--plan: source accounting: {e}")))?;
     // Side tables are keyed by the same row index, so they move with it.
     // A key outside the shard's runs belongs to a row the shard does not
     // read and is dropped.
@@ -881,7 +881,7 @@ fn option_mismatch(key: &str, saved: &str, now: &str) -> ConvertError {
         }
         _ => format!("the convert plan records cut {saved}, but --shard-plan cuts {now}"),
     };
-    ConvertError::InvalidConfig(format!(
+    super::convert::InvalidOption::plan(format!(
         "--plan: this run's shard plan is not the one the convert plan was saved with: {what}. \
          Every job of a fleet must be given the SAME shards.json — a re-cut plan moves the \
          range boundaries, so the jobs would overlap at some seams and leave holes at others. \
@@ -891,7 +891,7 @@ fn option_mismatch(key: &str, saved: &str, now: &str) -> ConvertError {
 }
 
 fn mismatch(field: &str, saved: &str, now: &str) -> ConvertError {
-    ConvertError::InvalidConfig(format!(
+    super::convert::InvalidOption::plan(format!(
         "--plan: saved plan does not match this run: {field} was {saved:?} when the plan was \
          saved but is {now:?} now. Re-run without --plan (add --save-plan to write a fresh one)."
     ))
@@ -1105,7 +1105,7 @@ impl ConvertPlan {
                     .map(crate::wkb::geometry_to_wkb)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| {
-                        ConvertError::InvalidConfig(format!(
+                        super::convert::InvalidOption::save_plan(format!(
                             "--save-plan: encoding a coalesce line failed: {e}"
                         ))
                     })?;
@@ -1151,7 +1151,7 @@ impl ConvertPlan {
                     .map(|w| crate::wkb::wkb_to_geometry(w))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| {
-                        ConvertError::InvalidConfig(format!(
+                        super::convert::InvalidOption::plan(format!(
                             "--plan: decoding a coalesce line failed: {e}"
                         ))
                     })?;
@@ -1270,7 +1270,7 @@ impl ConvertPlan {
             totals: self.totals.clone(),
         };
         let meta_json = serde_json::to_string(&meta)
-            .map_err(|e| ConvertError::InvalidConfig(format!("--save-plan: {e}")))?;
+            .map_err(|e| super::convert::InvalidOption::save_plan(format!("--save-plan: {e}")))?;
         let schema = Arc::new(plan_schema(meta_json));
 
         // Cluster tables flattened and sorted by (level, row) so the artifact

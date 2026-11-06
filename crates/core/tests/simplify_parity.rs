@@ -1,5 +1,5 @@
 //! Quality-matched simplification must retain the main-branch parity floor.
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;
@@ -10,13 +10,10 @@ fn madagascar_verbatim_simplification_retains_level_zero() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let mut options = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: 0,
-            max_zoom: 2,
-        },
-        ..ConvertOptions::default().verbatim()
-    };
+    let mut options = (ConvertOptions::default().verbatim()).with_levels(LevelPlan::ZoomRange {
+        min_zoom: 0,
+        max_zoom: 2,
+    });
     options.simplify.factor = 1.0;
     let report =
         convert_to_overviews(&input, dir.path().join("overview.parquet"), &options).unwrap();

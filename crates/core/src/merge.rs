@@ -63,7 +63,7 @@ use crate::pmtiles_metadata::{MetadataCollector, Resolved};
 use crate::pmtiles_writer::{tile_id_to_zxy, StreamingPmtilesWriter, TileType, WriteError};
 use crate::pyramid::{declared_zoom_range, layer_zoom_range, vector_layers_json, LayerMeta};
 use crate::tile::TileBounds;
-use crate::{Error, Result, TilesetMetadata};
+use crate::{Error, InvalidConfigError, Result, TilesetMetadata};
 
 /// Knobs for [`merge_shards`].
 #[derive(Debug, Clone, Default)]
@@ -164,9 +164,7 @@ pub fn merge_shards(
 ) -> Result<MergeReport> {
     let started = Instant::now();
     if inputs.is_empty() {
-        return Err(Error::InvalidConfig(
-            "merge needs at least one input archive".to_string(),
-        ));
+        return Err(InvalidConfigError::MergeNoInputs.into());
     }
     // #452: the archive is created only at finalize, after every tile.
     crate::atomic_output::check_writable(output)?;
@@ -379,32 +377,32 @@ fn check_inputs_agree(indexes: &[ArchiveIndex]) -> Result<Compression> {
     let (tile_type, compression) = (first.header().tile_type, first.header().tile_compression);
     for idx in &indexes[1..] {
         if idx.header().tile_type != tile_type {
-            return Err(Error::InvalidConfig(format!(
-                "inputs disagree on tile type: {} holds {tile_type:?} but {} holds {:?}; \
-                 merge copies tile bodies verbatim under one header and cannot describe both",
-                first.path().display(),
-                idx.path().display(),
-                idx.header().tile_type,
-            )));
+            return Err(InvalidConfigError::MergeTileTypeMismatch {
+                first: first.path().to_path_buf(),
+                first_type: tile_type,
+                other: idx.path().to_path_buf(),
+                other_type: idx.header().tile_type,
+            }
+            .into());
         }
         if idx.header().tile_compression != compression {
-            return Err(Error::InvalidConfig(format!(
-                "inputs disagree on tile compression: {} is {compression:?} but {} is {:?}; \
-                 merge copies tile bodies verbatim, so a mixed set would mislabel every tile \
-                 of one of them — re-tile the odd one out",
-                first.path().display(),
-                idx.path().display(),
-                idx.header().tile_compression,
-            )));
+            return Err(InvalidConfigError::MergeCompressionMismatch {
+                first: first.path().to_path_buf(),
+                first_compression: compression,
+                other: idx.path().to_path_buf(),
+                other_compression: idx.header().tile_compression,
+            }
+            .into());
         }
     }
     // The writer stamps `TileType::Mvt` into the header it assembles, so an
     // agreed-on non-MVT set would still come out mislabelled.
     if tile_type != TileType::Mvt {
-        return Err(Error::InvalidConfig(format!(
-            "{}: tile type is {tile_type:?}, but merge writes MVT archives",
-            first.path().display()
-        )));
+        return Err(InvalidConfigError::MergeNotMvt {
+            path: first.path().to_path_buf(),
+            tile_type,
+        }
+        .into());
     }
     Ok(compression)
 }
@@ -419,15 +417,13 @@ fn duplicate_tile_id(first: &ArchiveIndex, second: &ArchiveIndex, id: u64) -> Er
     let zxy = tile_id_to_zxy(id)
         .map(|(z, x, y)| format!("z{z}/{x}/{y}"))
         .unwrap_or_else(|_| "?".to_string());
-    Error::InvalidConfig(format!(
-        "{} and {} claim overlapping tile ids: both address tile id {id} ({zxy}). merge \
-         concatenates disjoint shards — it will not reconcile a tile two inputs both claim, \
-         so check how the shards were cut (a shard listed twice, or one left over from an \
-         earlier run, is the usual cause). The same archive named twice means its own \
-         directory addresses that id more than once, which no valid PMTiles archive does",
-        first.path().display(),
-        second.path().display(),
-    ))
+    InvalidConfigError::MergeOverlap {
+        first: first.path().to_path_buf(),
+        second: second.path().to_path_buf(),
+        tile_id: id,
+        zxy,
+    }
+    .into()
 }
 
 /// What [`read_input_metadata`] folds out of the inputs' metadata.
@@ -479,7 +475,7 @@ fn read_input_metadata(
         match &meta {
             Some(root) => collector
                 .add_json(&label, root)
-                .map_err(Error::InvalidConfig)?,
+                .map_err(|message| InvalidConfigError::MetadataTooLarge { message })?,
             None => {
                 // `input_layers` warns about a tile-holding one.
                 if !tiles {
@@ -500,7 +496,9 @@ fn read_input_metadata(
             });
         }
     }
-    let publication = collector.resolve().map_err(Error::InvalidConfig)?;
+    let publication = collector
+        .resolve()
+        .map_err(|message| InvalidConfigError::MetadataTooLarge { message })?;
     collector.log_resolution();
     Ok(InputMetadata {
         layers,

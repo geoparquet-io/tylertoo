@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use clap::CommandFactory;
-use tylertoo_core::overview::config::cli::{ExportPmtilesArgs, PyramidArgs};
+use tylertoo_core::internal::overview::config::cli::{ExportPmtilesArgs, PyramidArgs};
 
 fn grid() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -88,7 +88,7 @@ fn pyramid_builds_two_bands() {
     let b1 = format!("1-1:{}:grid", grid().display());
     let result = success(&["pyramid", s(&out), "--band", &b0, "--band", &b1]);
     assert!(String::from_utf8_lossy(&result.stdout).contains("Built 2 band(s)"));
-    let index = tylertoo_core::archive_index::ArchiveIndex::open(&out).unwrap();
+    let index = tylertoo_core::internal::archive_index::ArchiveIndex::open(&out).unwrap();
     // Bands are z0 and z1: the header and the zooms that really hold tiles
     // must both span exactly 0..=1, so a dropped band fails.
     assert_eq!((index.header().min_zoom, index.header().max_zoom), (0, 1));

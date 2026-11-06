@@ -15,10 +15,10 @@
 
 use std::path::{Path, PathBuf};
 
-use tylertoo_core::overview::convert::{
+use tylertoo_core::internal::overview::convert::{
     convert_to_overviews, ConvertOptions, ConvertReport, LevelPlan,
 };
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions, ExportReport};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions, ExportReport};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;
@@ -51,10 +51,7 @@ fn tiles(
     let conv = convert_to_overviews(
         input,
         &overview,
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange { min_zoom, max_zoom },
-            ..convert
-        },
+        &convert.with_levels(LevelPlan::ZoomRange { min_zoom, max_zoom }),
     )
     .unwrap_or_else(|e| panic!("convert {}: {e}", input.display()));
     let exp = export_pmtiles(&overview, &archive, &export)
@@ -157,10 +154,7 @@ fn bbox_on_0_360_data_selects_the_wrapped_draw_count() {
         &invariant_fixture("lon-0-360.parquet"),
         0,
         8,
-        ConvertOptions {
-            bbox: Some(bbox),
-            ..Default::default()
-        },
+        ConvertOptions::default().with_bbox(Some(bbox)),
         ExportOptions::default(),
     );
     assert_eq!(
@@ -189,10 +183,7 @@ fn banded_vs_sorted() -> Vec<(u8, usize, usize)> {
             4,
             14,
             ConvertOptions::default(),
-            ExportOptions {
-                compressed_tile_size_limit: Some(BANDED_CAP),
-                ..ExportOptions::default()
-            },
+            ExportOptions::default().with_compressed_tile_size_limit(Some(BANDED_CAP)),
         )
         .1
     };

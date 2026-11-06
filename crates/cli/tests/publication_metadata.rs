@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
-use tylertoo_core::archive_index::ArchiveIndex;
+use tylertoo_core::internal::archive_index::ArchiveIndex;
 
 /// HTML, Unicode, quotes, a backslash and a newline in one value.
 const HOSTILE: &str =

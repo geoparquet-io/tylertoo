@@ -34,11 +34,11 @@ use geoparquet::writer::{
 use tylertoo_io::open_parquet;
 use tylertoo_io::test_support::ArrowWriter;
 
-use tylertoo_core::batch_processor::extract_geometries_from_array;
-use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
-use tylertoo_core::overview::level::Mode;
+use tylertoo_core::internal::batch_processor::extract_geometries_from_array;
+use tylertoo_core::internal::decode::{decode_pmtiles, DecodeError, DecodeOptions};
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_core::internal::overview::level::Mode;
 
 const MIN_ZOOM: u8 = 4;
 const MAX_ZOOM: u8 = 14;
@@ -128,13 +128,10 @@ fn build_archive(dir: &tempfile::TempDir, extra_col: Option<&str>) -> PathBuf {
     let pmtiles = dir.path().join("fixture.pmtiles");
 
     write_fixture(&input, &fixture_geometries(), extra_col);
-    let convert_opts = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: MIN_ZOOM,
-            max_zoom: MAX_ZOOM,
-        },
-        ..Default::default()
-    };
+    let convert_opts = ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: MIN_ZOOM,
+        max_zoom: MAX_ZOOM,
+    });
     convert_to_overviews(&input, &overviews, &convert_opts).unwrap();
     export_pmtiles(&overviews, &pmtiles, &ExportOptions::default()).unwrap();
     pmtiles
@@ -184,7 +181,7 @@ fn read_rows(path: &Path) -> Vec<Row> {
         extract_geometries_from_array(
             garr.as_ref(),
             &mut geoms,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
         )
         .unwrap();
         assert_eq!(geoms.len(), batch.num_rows(), "no null geometry rows");
@@ -318,19 +315,14 @@ fn assert_feature_id_roundtrip(mode: Mode) {
     let output = dir.path().join("decoded.parquet");
 
     write_fixture(&input, &fixture_geometries(), None);
-    let convert_opts = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
+    let convert_opts = ConvertOptions::default()
+        .with_levels(LevelPlan::ZoomRange {
             min_zoom: MIN_ZOOM,
             max_zoom: MAX_ZOOM,
-        },
-        mode,
-        ..Default::default()
-    };
+        })
+        .with_mode(mode);
     convert_to_overviews(&input, &overviews, &convert_opts).unwrap();
-    let export_opts = ExportOptions {
-        feature_id: Some("id".to_string()),
-        ..Default::default()
-    };
+    let export_opts = ExportOptions::default().with_feature_id(Some("id".to_string()));
     export_pmtiles(&overviews, &pmtiles, &export_opts).unwrap();
 
     let report = decode_pmtiles(&pmtiles, &output, &DecodeOptions::default()).unwrap();
@@ -398,11 +390,10 @@ fn decode_single_zoom_filter() {
     let pmtiles = build_archive(&dir, None);
     let output = dir.path().join("decoded-z8.parquet");
 
-    let options = DecodeOptions {
-        min_zoom: Some(8),
-        max_zoom: Some(8),
-        layer: None,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(Some(8))
+        .with_max_zoom(Some(8))
+        .with_layer(None);
     let report = decode_pmtiles(&pmtiles, &output, &options).unwrap();
     let rows = read_rows(&output);
 
@@ -418,11 +409,10 @@ fn decode_zoom_range_filter() {
     let pmtiles = build_archive(&dir, None);
     let output = dir.path().join("decoded-z10-12.parquet");
 
-    let options = DecodeOptions {
-        min_zoom: Some(10),
-        max_zoom: Some(12),
-        layer: None,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(Some(10))
+        .with_max_zoom(Some(12))
+        .with_layer(None);
     decode_pmtiles(&pmtiles, &output, &options).unwrap();
     let rows = read_rows(&output);
     assert!(!rows.is_empty());
@@ -439,10 +429,7 @@ fn decode_layer_filter_matching_and_not() {
     let report = decode_pmtiles(
         &pmtiles,
         &out_match,
-        &DecodeOptions {
-            layer: Some("overview".to_string()),
-            ..Default::default()
-        },
+        &DecodeOptions::default().with_layer(Some("overview".to_string())),
     )
     .unwrap();
     assert!(report.features_written > 0);
@@ -452,10 +439,7 @@ fn decode_layer_filter_matching_and_not() {
     let report = decode_pmtiles(
         &pmtiles,
         &out_none,
-        &DecodeOptions {
-            layer: Some("does-not-exist".to_string()),
-            ..Default::default()
-        },
+        &DecodeOptions::default().with_layer(Some("does-not-exist".to_string())),
     )
     .unwrap();
     assert_eq!(report.features_written, 0);
@@ -608,11 +592,10 @@ fn decode_golden_against_tippecanoe_decode() {
     let output = dir.path().join("decoded.parquet");
 
     // Ours, max zoom only.
-    let options = DecodeOptions {
-        min_zoom: Some(MAX_ZOOM),
-        max_zoom: Some(MAX_ZOOM),
-        layer: None,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(Some(MAX_ZOOM))
+        .with_max_zoom(Some(MAX_ZOOM))
+        .with_layer(None);
     decode_pmtiles(&pmtiles, &output, &options).unwrap();
     let ours = read_rows(&output);
 
@@ -712,7 +695,7 @@ fn mvt_point_tile(x: u32, y: u32) -> Vec<u8> {
 /// write a root: every offset after the first is the contiguous marker 0.
 /// Independent of `encode_directory` on purpose — this pins the on-disk
 /// shape that other writers produce, whatever our encoder does.
-fn tippecanoe_style_root(entries: &[tylertoo_core::pmtiles_writer::DirEntry]) -> Vec<u8> {
+fn tippecanoe_style_root(entries: &[tylertoo_core::internal::pmtiles_writer::DirEntry]) -> Vec<u8> {
     let mut buf = Vec::new();
     varint(entries.len() as u64, &mut buf);
     let mut last_id = 0;
@@ -749,9 +732,9 @@ fn tippecanoe_style_root(entries: &[tylertoo_core::pmtiles_writer::DirEntry]) ->
 /// the leaves and tile data, and the root is rewritten by hand.
 #[test]
 fn decode_reads_foreign_root_with_contiguous_leaf_offsets() {
-    use tylertoo_core::compression::{compress, decompress_capped, MAX_INTERNAL_BYTES};
-    use tylertoo_core::pmtiles_writer::{decode_directory, Header};
-    use tylertoo_core::{Compression, StreamingPmtilesWriter};
+    use tylertoo_core::internal::compression::{compress, decompress_capped, MAX_INTERNAL_BYTES};
+    use tylertoo_core::internal::pmtiles_writer::{decode_directory, Header};
+    use tylertoo_core::{internal::StreamingPmtilesWriter, Compression};
 
     let dir = tempfile::tempdir().unwrap();
     let ours = dir.path().join("ours.pmtiles");
@@ -807,7 +790,7 @@ fn decode_reads_foreign_root_with_contiguous_leaf_offsets() {
     // Our encoder now writes exactly this shape; pin that parity explicitly,
     // since the splice below is otherwise a no-op against our own archive.
     assert_eq!(
-        tylertoo_core::pmtiles_writer::encode_directory(&root),
+        tylertoo_core::internal::pmtiles_writer::encode_directory(&root),
         plain_root,
         "encode_directory must write leaf pointers with contiguous offsets"
     );

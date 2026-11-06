@@ -42,6 +42,11 @@
 use std::cell::{Cell, RefCell};
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{self, AssertUnwindSafe};
+#[expect(
+    clippy::disallowed_types,
+    reason = "#789: a per-reader flag, not process-global diagnostic state"
+)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
@@ -485,15 +490,36 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
 /// nested sets of those leaves then costs minutes of CPU: once the bytes
 /// run out every remaining leaf is free, and the tree is exponential. An
 /// honest header never reads past the file, so end of input is an error.
-struct PageGuard<R>(R);
+///
+/// parquet-rs turns the read error into a string on its way out, so the
+/// guard also raises `hit`, which [`UntrustedBatchReader`] turns back into
+/// [`InputError::HostilePageHeader`].
+#[expect(
+    clippy::disallowed_types,
+    reason = "#789: a per-reader flag, not process-global diagnostic state"
+)]
+struct PageGuard<R> {
+    reader: R,
+    hit: Arc<AtomicBool>,
+}
 
 /// [`PageGuard::get_read`]'s stream.
-struct NoEof<T>(T);
+#[expect(
+    clippy::disallowed_types,
+    reason = "#789: a per-reader flag, not process-global diagnostic state"
+)]
+struct NoEof<T> {
+    inner: T,
+    hit: Arc<AtomicBool>,
+}
 
 impl<T: Read> Read for NoEof<T> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self.0.read(buf)? {
-            0 if !buf.is_empty() => Err(std::io::ErrorKind::UnexpectedEof.into()),
+        match self.inner.read(buf)? {
+            0 if !buf.is_empty() => {
+                self.hit.store(true, Ordering::Relaxed);
+                Err(std::io::ErrorKind::UnexpectedEof.into())
+            }
             n => Ok(n),
         }
     }
@@ -501,7 +527,7 @@ impl<T: Read> Read for NoEof<T> {
 
 impl<R: ChunkReader> Length for PageGuard<R> {
     fn len(&self) -> u64 {
-        self.0.len()
+        self.reader.len()
     }
 }
 
@@ -509,11 +535,14 @@ impl<R: ChunkReader> ChunkReader for PageGuard<R> {
     type T = NoEof<R::T>;
 
     fn get_read(&self, start: u64) -> Result<Self::T, ParquetError> {
-        self.0.get_read(start).map(NoEof)
+        self.reader.get_read(start).map(|inner| NoEof {
+            inner,
+            hit: self.hit.clone(),
+        })
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes, ParquetError> {
-        self.0.get_bytes(start, length)
+        self.reader.get_bytes(start, length)
     }
 }
 
@@ -1409,12 +1438,20 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
             )
         })?;
         #[expect(
+            clippy::disallowed_types,
+            reason = "#789: a per-reader flag, not process-global diagnostic state"
+        )]
+        let page_eof = Arc::new(AtomicBool::new(false));
+        let guard = PageGuard {
+            reader: self.reader,
+            hit: page_eof.clone(),
+        };
+        #[expect(
             clippy::disallowed_methods,
             reason = "#779: reader owner reuses checked metadata and applies batch limits"
         )]
-        let mut builder =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(PageGuard(self.reader), metadata)
-                .with_batch_size(rows);
+        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(guard, metadata)
+            .with_batch_size(rows);
         if let Some(projection) = self.projection {
             builder = builder.with_projection(projection);
         }
@@ -1440,6 +1477,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
         ));
         Ok(UntrustedBatchReader {
             inner,
+            page_eof,
             schema,
             done: false,
             pending: None,
@@ -1454,8 +1492,14 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
 /// Batches are split before narrowing byte-array offsets, recursively
 /// through nested columns. After an error it yields nothing more.
 #[derive(Debug)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "#789: a per-reader flag, not process-global diagnostic state"
+)]
 pub struct UntrustedBatchReader {
     inner: ParquetRecordBatchReader,
+    /// Raised when a page read ran past the end of the file ([`PageGuard`]).
+    page_eof: Arc<AtomicBool>,
     done: bool,
     schema: SchemaRef,
     pending: Option<RecordBatch>,
@@ -1493,6 +1537,11 @@ impl Iterator for UntrustedBatchReader {
                 Some(batch) => batch,
                 None => match self.inner.next()? {
                     Ok(batch) => batch,
+                    Err(_) if self.page_eof.load(Ordering::Relaxed) => {
+                        return Some(Err(ArrowError::ExternalError(Box::new(
+                            InputError::HostilePageHeader,
+                        ))));
+                    }
                     Err(e) => return Some(Err(e)),
                 },
             };

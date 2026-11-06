@@ -7,7 +7,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use tylertoo_core::pmtiles_writer::Header;
+use tylertoo_core::internal::pmtiles_writer::Header;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(header) = Header::from_bytes(data) {

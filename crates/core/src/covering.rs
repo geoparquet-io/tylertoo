@@ -41,7 +41,7 @@
 #[cfg(any(test, feature = "fuzzing"))]
 use crate::overview::level::Crs;
 use crate::tile::{TileBounds, TileCoord};
-use crate::Error;
+use crate::{Error, GeoParquetReadError, InvalidConfigError};
 use std::fs::File;
 use std::path::Path;
 #[cfg(test)]
@@ -320,11 +320,16 @@ pub(crate) fn extract_stat_value(
 /// Returns [`Error::GeoParquetRead`] if the file cannot be opened, its Parquet
 /// footer cannot be read, or its geo metadata JSON is malformed.
 pub fn extract_row_group_bounds(path: &Path) -> Result<Vec<Option<RowGroupBounds>>, Error> {
-    let file = File::open(path)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to open {}: {}", path.display(), e)))?;
+    let file = File::open(path).map_err(|error| GeoParquetReadError::Open {
+        path: path.to_path_buf(),
+        error,
+    })?;
 
-    let metadata = tylertoo_io::read_parquet_metadata(&file)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to read {}: {}", path.display(), e)))?;
+    let metadata =
+        tylertoo_io::read_parquet_metadata(&file).map_err(|e| GeoParquetReadError::Footer {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
 
     extract_row_group_bounds_from_metadata(&metadata)
 }
@@ -569,15 +574,20 @@ fn parse_tile_coords(input: &str) -> Option<Result<TileBounds, Error>> {
     let y: u32 = parts[2].parse().ok()?;
 
     if z > 31 {
-        return Some(Err(Error::InvalidConfig(format!(
-            "Invalid tile '{input}': zoom {z} is past the maximum of 31"
-        ))));
+        return Some(Err(InvalidConfigError::TileZoomTooHigh {
+            input: input.to_string(),
+            zoom: z,
+        }
+        .into()));
     }
     let tiles = 1u64 << z;
     if u64::from(x) >= tiles || u64::from(y) >= tiles {
-        return Some(Err(Error::InvalidConfig(format!(
-            "Invalid tile '{input}': x and y must be below {tiles} at zoom {z}"
-        ))));
+        return Some(Err(InvalidConfigError::TileOutOfRange {
+            input: input.to_string(),
+            zoom: z,
+            tiles,
+        }
+        .into()));
     }
 
     Some(Ok(TileCoord::new(x, y, z).bounds()))
@@ -587,43 +597,64 @@ fn parse_tile_coords(input: &str) -> Option<Result<TileBounds, Error>> {
 fn parse_bbox(input: &str) -> Result<TileBounds, Error> {
     let parts: Vec<&str> = input.split(',').collect();
     if parts.len() != 4 {
-        return Err(Error::InvalidConfig(format!(
-            "Invalid bounds format '{}'. Expected 'z/x/y' or 'xmin,ymin,xmax,ymax'",
-            input
-        )));
+        return Err(InvalidConfigError::BoundsFormat {
+            input: input.to_string(),
+        }
+        .into());
     }
 
-    let xmin: f64 = parts[0].trim().parse().map_err(|_| {
-        Error::InvalidConfig(format!("Invalid xmin value '{}' in bounds", parts[0]))
-    })?;
-    let ymin: f64 = parts[1].trim().parse().map_err(|_| {
-        Error::InvalidConfig(format!("Invalid ymin value '{}' in bounds", parts[1]))
-    })?;
-    let xmax: f64 = parts[2].trim().parse().map_err(|_| {
-        Error::InvalidConfig(format!("Invalid xmax value '{}' in bounds", parts[2]))
-    })?;
-    let ymax: f64 = parts[3].trim().parse().map_err(|_| {
-        Error::InvalidConfig(format!("Invalid ymax value '{}' in bounds", parts[3]))
-    })?;
+    let xmin: f64 = parts[0]
+        .trim()
+        .parse()
+        .map_err(|_| InvalidConfigError::BoundsValue {
+            name: "xmin",
+            value: parts[0].to_string(),
+        })?;
+    let ymin: f64 = parts[1]
+        .trim()
+        .parse()
+        .map_err(|_| InvalidConfigError::BoundsValue {
+            name: "ymin",
+            value: parts[1].to_string(),
+        })?;
+    let xmax: f64 = parts[2]
+        .trim()
+        .parse()
+        .map_err(|_| InvalidConfigError::BoundsValue {
+            name: "xmax",
+            value: parts[2].to_string(),
+        })?;
+    let ymax: f64 = parts[3]
+        .trim()
+        .parse()
+        .map_err(|_| InvalidConfigError::BoundsValue {
+            name: "ymax",
+            value: parts[3].to_string(),
+        })?;
 
     // Validate bounds. NaN fails every comparison below, so reject
     // non-finite values first (#681).
     if ![xmin, ymin, xmax, ymax].iter().all(|v| v.is_finite()) {
-        return Err(Error::InvalidConfig(format!(
-            "Invalid bounds '{input}': every value must be a finite number"
-        )));
+        return Err(InvalidConfigError::BoundsNotFinite {
+            input: input.to_string(),
+        }
+        .into());
     }
     if xmin >= xmax {
-        return Err(Error::InvalidConfig(format!(
-            "xmin ({}) must be less than xmax ({})",
-            xmin, xmax
-        )));
+        return Err(InvalidConfigError::BoundsInverted {
+            axis: "x",
+            min: xmin,
+            max: xmax,
+        }
+        .into());
     }
     if ymin >= ymax {
-        return Err(Error::InvalidConfig(format!(
-            "ymin ({}) must be less than ymax ({})",
-            ymin, ymax
-        )));
+        return Err(InvalidConfigError::BoundsInverted {
+            axis: "y",
+            min: ymin,
+            max: ymax,
+        }
+        .into());
     }
 
     Ok(TileBounds {

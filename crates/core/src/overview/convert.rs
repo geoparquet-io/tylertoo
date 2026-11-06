@@ -75,6 +75,7 @@ use super::writer::{LevelWriteOutcome, RowGroupSizePolicy, WriterError, LEVEL_CO
 
 /// How the caller specifies the overview levels.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum LevelPlan {
     /// A Web Mercator zoom range, mapped through `gsd_for_zoom`. `min_zoom`
     /// is the coarsest (level 0), `max_zoom` the finest. Both inclusive.
@@ -255,18 +256,34 @@ impl LevelPlan {
 /// null/missing value** (nulls encode as `None`, which loses to any `Some` in
 /// the priority order).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct ClassRanking {
     /// Name of the (Utf8/LargeUtf8) column whose values are ranked.
-    pub column: String,
+    pub(crate) column: String,
     /// `(value, priority)` pairs; higher priority wins the cell. Order is
     /// irrelevant (looked up by value).
-    pub ranks: Vec<(String, f64)>,
+    pub(crate) ranks: Vec<(String, f64)>,
     /// Priority for a present-but-unranked value. Set below every named rank so
     /// unknown classes lose to known ones but beat nulls.
-    pub unknown_rank: f64,
+    pub(crate) unknown_rank: f64,
 }
 
 impl ClassRanking {
+    /// Name of the (Utf8/LargeUtf8) column whose values are ranked.
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    /// `(value, priority)` pairs; higher priority wins the cell.
+    pub fn ranks(&self) -> &[(String, f64)] {
+        &self.ranks
+    }
+
+    /// Priority for a present-but-unranked value.
+    pub fn unknown_rank(&self) -> f64 {
+        self.unknown_rank
+    }
+
     /// Build a ranking from `(value, priority)` pairs, enforcing the rules
     /// every spelling of a class ranking shares (#445: the `--class-rank`
     /// string via [`parse_class_rank`], and the Python `class_ranks` dict):
@@ -393,6 +410,7 @@ pub(super) const ROAD_VOCAB_MIN_DISTINCT: usize = 3;
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(feature = "cli", command(group(clap::ArgGroup::new("overview_only").multiple(true))))]
+#[non_exhaustive]
 pub struct ConvertOptions {
     /// Level materialization mode. Default [`Mode::Duplicating`].
     #[cfg_attr(feature = "cli", arg(long, default_value = Self::default().mode.as_str(), value_parser = super::config::cli::spelled::<Mode>(&["duplicating", "partitioning"])))]
@@ -404,10 +422,14 @@ pub struct ConvertOptions {
     pub levels: LevelPlan,
     /// `--max-zoom auto` (#444): the conversion estimates the finest zoom
     /// from its own input and writes it into a [`LevelPlan::ZoomRange`]'s
-    /// `max_zoom` before anything else reads the plan
-    /// ([`super::auto_zoom::MaxZoom::resolve`]). Build the plan with
-    /// [`super::auto_zoom::MaxZoom::plan_zoom`] as the placeholder. Ignored
-    /// (with a log line) for an explicit GSD list.
+    /// `max_zoom` before anything else reads the plan. Ignored (with a log
+    /// line) for an explicit GSD list.
+    ///
+    /// The pick is capped at the plan's `max_zoom` (`--max-zoom auto:N`,
+    /// #793): set it to 16, the auto ceiling, for an uncapped estimate, or
+    /// lower to cap it. Before 0.9 the plan's `max_zoom` was ignored here, so
+    /// a caller that set `auto_max_zoom` with any other `max_zoom` now gets a
+    /// capped pick.
     ///
     /// The estimate reads the same source the conversion then reads, so a
     /// remote input's sampled chunks are fetched once (#788). Not a keyword
@@ -870,6 +892,44 @@ pub struct ConvertOptions {
     pub zoom_ceiling: Option<u8>,
 }
 
+with_setters!(ConvertOptions {
+    with_mode => mode: Mode,
+    with_levels => levels: LevelPlan,
+    with_auto_max_zoom => auto_max_zoom: bool,
+    with_assign => assign: AssignConfig,
+    with_entry_zoom => entry_zoom: Option<EntryZoomSpec>,
+    with_sort_key => sort_key: Option<String>,
+    with_class_ranking => class_ranking: Option<ClassRanking>,
+    with_no_auto_rank => no_auto_rank: bool,
+    with_simplify => simplify: SimplifyOptions,
+    with_representation => representation: Vec<RepresentationBand>,
+    with_density => density: DensityBudgetConfig,
+    with_gsd_base => gsd_base: f64,
+    with_cogp_compat_key => cogp_compat_key: bool,
+    with_max_row_group_size => max_row_group_size: usize,
+    with_row_group_size_policy => row_group_size_policy: RowGroupSizePolicy,
+    with_full_column_stats => full_column_stats: bool,
+    with_read_batch_size => read_batch_size: usize,
+    with_profile => profile: MemoryProfile,
+    with_in_flight_batches => in_flight_batches: usize,
+    with_read_workers => read_workers: usize,
+    with_cluster => cluster: bool,
+    with_accumulate => accumulate: Vec<AccumulateSpec>,
+    with_coalesce_lines => coalesce_lines: bool,
+    with_coalesce_snap => coalesce_snap: f64,
+    with_coalesce_max_level_rows => coalesce_max_level_rows: usize,
+    with_coalesce_junction_angle => coalesce_junction_angle: f64,
+    with_bbox => bbox: Option<[f64; 4]>,
+    with_filter => filter: Option<String>,
+    with_properties => properties: PropertySelection,
+    with_spill_dir => spill_dir: Option<PathBuf>,
+    with_save_plan => save_plan: Option<PathBuf>,
+    with_plan => plan: Option<PathBuf>,
+    with_shard => shard: Option<TileRange>,
+    with_shard_plan_digest => shard_plan_digest: Option<String>,
+    with_zoom_ceiling => zoom_ceiling: Option<u8>,
+});
+
 /// Default rows per read batch for the streaming pipeline (H3).
 pub const DEFAULT_READ_BATCH_SIZE: usize = 8192;
 
@@ -1030,6 +1090,7 @@ impl ConvertOptions {
     /// The first rule broken; every error this returns is
     /// [`ErrorKind::Usage`](crate::error::ErrorKind::Usage).
     /// Validate these options and return the immutable engine configuration.
+    #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
         super::config::validate_convert(self)
     }
@@ -1048,7 +1109,7 @@ impl ConvertOptions {
             ("coalesce-snap", self.coalesce_snap),
             ("coalesce-junction-angle", self.coalesce_junction_angle),
         ] {
-            super::config::finite_number(name, value).map_err(ConvertError::InvalidConfig)?;
+            super::config::finite_number(name, value)?;
         }
         Ok(())
     }
@@ -1231,6 +1292,7 @@ impl ConvertOptions {
 /// `--no-coalesce-lines`) and per Python keyword argument.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct GeneralizationOverrides {
     /// Point grid cell size in GSDs.
     pub point_thinning: Option<f64>,
@@ -1249,6 +1311,17 @@ pub struct GeneralizationOverrides {
     /// Whether touching same-class lines are joined at coarse levels.
     pub coalesce_lines: Option<bool>,
 }
+
+with_setters!(GeneralizationOverrides {
+    with_point_thinning => point_thinning: Option<f64>,
+    with_line_thinning => line_thinning: Option<f64>,
+    with_polygon_thinning => polygon_thinning: Option<f64>,
+    with_line_visibility => line_visibility: Option<f64>,
+    with_polygon_visibility => polygon_visibility: Option<f64>,
+    with_simplify_factor => simplify_factor: Option<f64>,
+    with_density_drop => density_drop: Option<bool>,
+    with_coalesce_lines => coalesce_lines: Option<bool>,
+});
 
 #[cfg(test)]
 mod generalization_override_tests {
@@ -1442,6 +1515,7 @@ impl Default for ConvertOptions {
 
 /// Per-level statistics in a [`ConvertReport`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct LevelReport {
     /// Level index in the output file (0 = coarsest).
     pub level: usize,
@@ -1467,6 +1541,7 @@ pub struct LevelReport {
 /// where every feature is culled by the visibility gates at world zooms, so
 /// the written pyramid starts at the first zoom with visible features.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct SkippedLevelReport {
     /// Index of the level in the *planned* (requested) level range
     /// (0 = requested coarsest). NOT an index into the written file.
@@ -1618,6 +1693,7 @@ pub struct PlanReport {
 
 /// Result of a conversion, `Serialize` for JSON output (benchmark tasks).
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct ConvertReport {
     /// Input rows read before filtering unusable geometries.
     pub input_rows: usize,
@@ -1779,10 +1855,14 @@ pub enum ConvertError {
     Properties(#[from] PropertySelectionError),
     /// Underlying parquet error (reading the input).
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] tylertoo_io::ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] tylertoo_io::ParquetError),
     /// Arrow error (concat / take / batch build).
     #[error("arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Arrow(#[source] arrow_schema::ArrowError),
     /// A core-library error (geometry decode, CRS extraction).
     #[error("{0}")]
     Core(#[from] crate::Error),
@@ -1791,6 +1871,7 @@ pub enum ConvertError {
     Writer(#[from] WriterError),
     /// The input CRS is neither EPSG:4326 nor EPSG:3857 (spec Q3).
     #[error("unsupported CRS {crs:?} in {input}: overviews require EPSG:4326 or EPSG:3857")]
+    #[non_exhaustive]
     UnsupportedCrs {
         /// The rejected CRS identifier.
         crs: String,
@@ -1804,6 +1885,7 @@ pub enum ConvertError {
     /// archive. The threshold is a share rather than 100% so a wrong-CRS file
     /// carrying a handful of `POINT(0 0)` placeholder rows still fails.
     #[error("{}", all_lost_message(.crs, .out_of_range, .unprojectable, .total, .max_abs))]
+    #[non_exhaustive]
     AllFeaturesOutOfRange {
         /// The CRS the input's metadata declares.
         crs: Crs,
@@ -1824,12 +1906,14 @@ pub enum ConvertError {
     /// The input has no geometry column: neither the GeoParquet `geo`
     /// metadata's `primary_column` nor a recognized geometry column name.
     #[error("{input} has no geometry column")]
+    #[non_exhaustive]
     NoGeometryColumn {
         /// Display name of the input (path, URL, or partition set).
         input: String,
     },
     /// The `--sort-key` column is not present in the input schema.
     #[error("sort-key column {name:?} not found in input schema")]
+    #[non_exhaustive]
     SortKeyColumnMissing {
         /// The requested column name.
         name: String,
@@ -1839,12 +1923,14 @@ pub enum ConvertError {
     RankingConflict,
     /// The `--class-rank` column is not present in the input schema.
     #[error("class-rank column {name:?} not found in input schema")]
+    #[non_exhaustive]
     ClassRankColumnMissing {
         /// The requested column name.
         name: String,
     },
     /// The `--class-rank` column is not a string (Utf8/LargeUtf8) column.
     #[error("class-rank column {name:?} is {data_type} but must be a string column")]
+    #[non_exhaustive]
     ClassRankColumnNotString {
         /// The requested column name.
         name: String,
@@ -1865,6 +1951,7 @@ pub enum ConvertError {
          tile grid overflows 32-bit tile coordinates and the PMTiles Hilbert tile-id \
          arithmetic"
     )]
+    #[non_exhaustive]
     ZoomAboveCeiling {
         /// The knob that asked for it, already naming the zoom: `--max-zoom 33`,
         /// or `--gsd 5e-6 (…), which implies z33`. The zoom is not repeated by
@@ -1875,10 +1962,10 @@ pub enum ConvertError {
         /// [`crate::tile::MAX_ZOOM`].
         ceiling: u8,
     },
-    /// A conversion knob carries a nonsensical value (non-finite or
-    /// non-positive where a positive finite value is required).
+    /// An option, or a combination of options, the convert refuses; the
+    /// payload says which.
     #[error("invalid option: {0}")]
-    InvalidConfig(String),
+    InvalidConfig(InvalidOption),
     /// An option rule shared with the other frontends' options (#779),
     /// refused before any input is read.
     #[error(transparent)]
@@ -1919,6 +2006,7 @@ pub enum ConvertError {
     AccumulateWithoutCluster,
     /// An `--accumulate-attribute` column is not present in the input schema.
     #[error("accumulate-attribute column {name:?} not found in input schema")]
+    #[non_exhaustive]
     AccumulateColumnMissing {
         /// The requested column name.
         name: String,
@@ -1928,6 +2016,7 @@ pub enum ConvertError {
         "accumulate-attribute column {name:?} is {data_type} but must be numeric \
          (int/uint/float)"
     )]
+    #[non_exhaustive]
     AccumulateColumnNotNumeric {
         /// The requested column name.
         name: String,
@@ -1956,6 +2045,7 @@ pub enum ConvertError {
         "--max-zoom auto cannot honor --min-zoom {min_zoom}: auto never picks a zoom \
          above z{ceiling}. Lower --min-zoom, or pass an explicit --max-zoom"
     )]
+    #[non_exhaustive]
     AutoZoomMinAboveCeiling {
         /// The requested minimum zoom.
         min_zoom: u8,
@@ -1971,6 +2061,7 @@ pub enum ConvertError {
          have fewer than two distinct locations and no measurable extent. Pass an \
          explicit --max-zoom"
     )]
+    #[non_exhaustive]
     AutoZoomNoSignal {
         /// Input rows the estimate read (after `--bbox`/`--filter` row-group
         /// pruning).
@@ -1990,6 +2081,7 @@ pub enum ConvertError {
         "no output rows at or coarser than the zoom ceiling z{ceiling}: every feature first \
          appears at a finer zoom"
     )]
+    #[non_exhaustive]
     NothingAtOrBelowCeiling {
         /// The ceiling that was applied.
         ceiling: u8,
@@ -2015,6 +2107,7 @@ pub enum ConvertError {
          preflight safety ceiling (parquet's hard limit is 32,768 row groups per file) \
          even after auto-scaling --row-group-size; reduce the number of overview levels"
     )]
+    #[non_exhaustive]
     RowGroupCeilingUnreachable {
         /// Levels the preflight expects to hold rows. Counted from pass 1's
         /// pre-simplification winner hints, so a level that ends up empty
@@ -2028,6 +2121,7 @@ pub enum ConvertError {
     /// Only the pass-1 scan's is the preflight that
     /// `TYLERTOO_SKIP_MEMORY_PREFLIGHT` downgrades, so only it names that.
     #[error("{phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter.{}", skip_preflight_hint(phase))]
+    #[non_exhaustive]
     BudgetExceeded {
         /// Pipeline stage that cannot fit.
         phase: &'static str,
@@ -2036,6 +2130,281 @@ pub enum ConvertError {
         /// Available bytes at conversion start.
         available: u64,
     },
+}
+
+/// Why [`ConvertError::InvalidConfig`] refused the options.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum InvalidOption {
+    /// A numeric knob is NaN or infinite.
+    #[error("{option} = {value} must be a finite value")]
+    #[non_exhaustive]
+    NotFinite {
+        /// The knob.
+        option: &'static str,
+        /// Its value.
+        value: f64,
+    },
+    /// A knob that must be positive is not.
+    #[error("{option} = {value} must be a finite value > 0")]
+    #[non_exhaustive]
+    NotPositive {
+        /// The knob.
+        option: &'static str,
+        /// Its value.
+        value: f64,
+    },
+    /// A knob that must not be negative is.
+    #[error("{option} = {value} must be a finite value >= 0")]
+    #[non_exhaustive]
+    Negative {
+        /// The knob.
+        option: &'static str,
+        /// Its value.
+        value: f64,
+    },
+    /// `read_batch_size` is outside `1..=1048576`.
+    #[error("read-batch-size must be in 1..=1048576 (a batch is fully resident)")]
+    ReadBatchSize,
+    /// `read_workers` is past twice this machine's cores.
+    #[error("read-workers must be auto or 1..={ceiling} (2× this machine's cores)")]
+    #[non_exhaustive]
+    ReadWorkers {
+        /// The largest accepted value.
+        ceiling: usize,
+    },
+    /// The density budget's gamma is below 1.
+    #[error(
+        "--drop-gamma must be at least 1 (got {gamma}). Use 1 for a proportional cut, or \
+         --no-density-drop to turn the density budget off."
+    )]
+    #[non_exhaustive]
+    DropGamma {
+        /// The refused gamma.
+        gamma: f64,
+    },
+    /// A zoom ceiling together with a data shard range.
+    #[error(
+        "a convert-side zoom ceiling cannot be combined with a data shard range: \
+         the shard owns the zooms at and past the pivot, the ceiling keeps only \
+         those coarser than it"
+    )]
+    CeilingWithShardRange,
+    /// A zoom ceiling in partitioning mode.
+    #[error(
+        "a convert-side zoom ceiling requires duplicating mode: in partitioning \
+         mode each feature lives only at its coarsest level, so capping the levels \
+         would drop features rather than levels"
+    )]
+    CeilingNeedsDuplicating,
+    /// A zoom ceiling with an explicit GSD ladder.
+    #[error(
+        "a convert-side zoom ceiling needs a zoom-range level plan: an \
+         explicit GSD ladder has no zoom to compare the ceiling against"
+    )]
+    CeilingNeedsZoomRange,
+    /// A zoom ceiling coarser than the level plan's minimum zoom.
+    #[error(
+        "zoom ceiling z{ceiling} is coarser than the level plan's minimum \
+         z{min_zoom}: nothing would be built"
+    )]
+    #[non_exhaustive]
+    CeilingBelowMinZoom {
+        /// The ceiling.
+        ceiling: u8,
+        /// The plan's minimum zoom.
+        min_zoom: u8,
+    },
+    /// A zoom ceiling on a plan-only run.
+    #[error(
+        "a convert-side zoom ceiling has no meaning for a plan-only run: the \
+         ceiling bounds the levels pass 2 materializes, and a plan-only run \
+         materializes none. Drop it — the plan is full-range either way"
+    )]
+    CeilingInPlanOnly,
+    /// A plan-only run without a plan path.
+    #[error(
+        "writing a convert plan requires --save-plan PATH: a plan-only run \
+         produces no archive and no overview, so the plan is its only output"
+    )]
+    PlanOnlyWithoutSavePlan,
+    /// A shard that would write a plan.
+    #[error(
+        "--shard and --save-plan are mutually exclusive: a shard reads a subset of the \
+         input, so the plan it would write covers only that subset and is useless to the \
+         rest of the fleet. The coarse job, which reads everything, is the run that writes \
+         the plan."
+    )]
+    ShardWithSavePlan,
+    /// A shard without a plan to consume.
+    #[error(
+        "--shard requires --plan: the level assignment is dataset-global (the density \
+         budget water-fills a super-cell over every candidate of a level, the level walk \
+         carries a running kept count, --magnitude-ladder dense-ranks the whole column), \
+         so every shard of a fleet must consume ONE plan rather than recompute the \
+         assignment over its own subset. Run the coarse job first with --save-plan, then \
+         give every shard that plan with --plan."
+    )]
+    ShardWithoutPlan,
+    /// A shard whose plan carries coalesced line chains.
+    #[error(
+        "--shard is not supported with line coalescing: {} carries {chains} coalesced line \
+         chain(s). A chain is a NEW geometry spanning every row it merged, so no \
+         single input row group's bbox bounds it — the shard that holds the chain's \
+         row would emit tiles outside its own range while the neighbouring shard, \
+         which never reads that row, would emit none, leaving a gap at the seam. \
+         Re-run the whole fleet (including the coarse job, so the plan matches) with \
+         --no-coalesce-lines.",
+        plan.display()
+    )]
+    #[non_exhaustive]
+    ShardWithCoalescedLines {
+        /// The plan file.
+        plan: PathBuf,
+        /// Coalesced chains it carries.
+        chains: usize,
+    },
+    /// `--max-zoom auto` with an explicit GSD ladder.
+    #[error("--max-zoom auto needs a zoom-range level plan, not an explicit GSD list")]
+    AutoMaxZoomNeedsZoomRange,
+    /// Representation bands in partitioning mode.
+    #[error(
+        "representation bands require duplicating mode: partitioning places \
+         each feature exactly once with geometry verbatim (spec §2.3), which \
+         a point or square representation cannot satisfy"
+    )]
+    BandsNeedDuplicating,
+    /// Representation bands with an explicit GSD ladder.
+    #[error(
+        "representation bands require a zoom-range level plan \
+         (--min-zoom/--max-zoom); an explicit --gsd plan carries no \
+         per-level zooms to band on"
+    )]
+    BandsNeedZoomRange,
+    /// A representation band whose low zoom is past its high zoom.
+    #[error("representation band {} must satisfy LO <= HI", band_spec(band))]
+    #[non_exhaustive]
+    BandInverted {
+        /// The band.
+        band: RepresentationBand,
+    },
+    /// A representation band outside the level plan.
+    #[error(
+        "representation band {} lies outside the level plan \
+         ({plan_min}-{plan_max})",
+        band_spec(band)
+    )]
+    #[non_exhaustive]
+    BandOutsidePlan {
+        /// The band.
+        band: RepresentationBand,
+        /// The plan's minimum zoom.
+        plan_min: u8,
+        /// The plan's maximum zoom.
+        plan_max: u8,
+    },
+    /// A non-geometry representation band reaching the canonical level.
+    #[error(
+        "representation band {} must end before the plan's \
+         max zoom ({plan_max}): the canonical (finest) level reproduces \
+         source geometry verbatim (spec §2.4)",
+        band_spec(band)
+    )]
+    #[non_exhaustive]
+    BandCoversCanonical {
+        /// The band.
+        band: RepresentationBand,
+        /// The plan's maximum zoom.
+        plan_max: u8,
+    },
+    /// Two representation bands claim one zoom.
+    #[error("representation bands overlap at zoom {zoom}")]
+    #[non_exhaustive]
+    BandsOverlap {
+        /// The zoom.
+        zoom: u8,
+    },
+    /// Point bands that do not start at the coarsest level.
+    #[error(
+        "point bands must start at the plan's min zoom and be \
+         contiguous from the coarsest level: a coarser non-point \
+         level would still receive the cascaded point"
+    )]
+    PointBandsNotPrefix,
+    /// The entry-zoom column is not in the input.
+    #[error("entry-zoom column {column:?} not found in the input schema")]
+    #[non_exhaustive]
+    EntryZoomColumnMissing {
+        /// The column.
+        column: String,
+    },
+    /// The entry-zoom ladder could not be built from the column.
+    #[error("entry-zoom: {message}")]
+    #[non_exhaustive]
+    EntryZoomLadder {
+        /// What is wrong.
+        message: String,
+    },
+    /// The `--plan` file cannot be used for this run: unreadable, corrupt,
+    /// from another format version, or saved for different input or options.
+    #[error("{message}")]
+    #[non_exhaustive]
+    Plan {
+        /// What is wrong, naming `--plan`.
+        message: String,
+    },
+    /// The `--save-plan` target cannot be written.
+    #[error("{message}")]
+    #[non_exhaustive]
+    SavePlan {
+        /// What is wrong, naming `--save-plan`.
+        message: String,
+    },
+}
+
+impl InvalidOption {
+    /// A [`Self::Plan`] refusal.
+    pub(crate) fn plan(message: impl Into<String>) -> ConvertError {
+        InvalidOption::Plan {
+            message: message.into(),
+        }
+        .into()
+    }
+
+    /// A [`Self::SavePlan`] refusal.
+    pub(crate) fn save_plan(message: impl Into<String>) -> ConvertError {
+        InvalidOption::SavePlan {
+            message: message.into(),
+        }
+        .into()
+    }
+}
+
+/// A representation band as its spec spells it: `LO-HI:KIND`.
+fn band_spec(band: &RepresentationBand) -> String {
+    format!("{}-{}:{}", band.min_zoom, band.max_zoom, band.repr.as_str())
+}
+
+// Not `#[from]`: the reason's message is already this error's, so it is not
+// also a `source()` the CLI would print a second time.
+impl From<InvalidOption> for ConvertError {
+    fn from(reason: InvalidOption) -> Self {
+        ConvertError::InvalidConfig(reason)
+    }
+}
+
+#[doc(hidden)]
+impl From<arrow_schema::ArrowError> for ConvertError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        ConvertError::Arrow(e)
+    }
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::ParquetError> for ConvertError {
+    fn from(e: tylertoo_io::ParquetError) -> Self {
+        ConvertError::Parquet(e)
+    }
 }
 
 impl crate::error::Classify for ConvertError {
@@ -2069,7 +2438,7 @@ impl crate::error::Classify for ConvertError {
             | ConvertError::AccumulateColumnNotNumeric { .. }
             | ConvertError::AutoZoomNoSignal { .. }
             | ConvertError::Properties(_) => ErrorKind::Input,
-            _ => ErrorKind::Runtime,
+            _ => crate::error::fallback_kind(self),
         }
     }
 }
@@ -2088,37 +2457,20 @@ fn validate_zoom_ceiling(options: &ConvertOptions) -> Result<(), ConvertError> {
     // only zooms at or finer than the pivot, so a ceiling on top of a
     // shard range keeps nothing either half would write.
     if options.shard.is_some() {
-        return Err(ConvertError::InvalidConfig(
-            "a convert-side zoom ceiling cannot be combined with a data shard range: \
-             the shard owns the zooms at and past the pivot, the ceiling keeps only \
-             those coarser than it"
-                .to_string(),
-        ));
+        return Err(InvalidOption::CeilingWithShardRange.into());
     }
     // Partitioning writes each feature once, at its coarsest level, so
     // truncating the ladder would silently drop every feature whose
     // coarsest level is finer than the ceiling — not a partial pyramid
     // but a lossy one. The CLI never pairs the two.
     if matches!(options.mode, Mode::Partitioning) {
-        return Err(ConvertError::InvalidConfig(
-            "a convert-side zoom ceiling requires duplicating mode: in partitioning \
-             mode each feature lives only at its coarsest level, so capping the levels \
-             would drop features rather than levels"
-                .to_string(),
-        ));
+        return Err(InvalidOption::CeilingNeedsDuplicating.into());
     }
     let LevelPlan::ZoomRange { min_zoom, .. } = options.levels else {
-        return Err(ConvertError::InvalidConfig(
-            "a convert-side zoom ceiling needs a zoom-range level plan: an \
-             explicit GSD ladder has no zoom to compare the ceiling against"
-                .to_string(),
-        ));
+        return Err(InvalidOption::CeilingNeedsZoomRange.into());
     };
     if ceiling < min_zoom {
-        return Err(ConvertError::InvalidConfig(format!(
-            "zoom ceiling z{ceiling} is coarser than the level plan's minimum \
-             z{min_zoom}: nothing would be built"
-        )));
+        return Err(InvalidOption::CeilingBelowMinZoom { ceiling, min_zoom }.into());
     }
     Ok(())
 }
@@ -2135,32 +2487,30 @@ fn validate_zoom_ceiling(options: &ConvertOptions) -> Result<(), ConvertError> {
 /// instead of producing an "everything at the canonical level" file.
 pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
     options.check_finite_numbers()?;
-    let positive = |name: &str, v: f64| {
-        if v <= 0.0 {
-            return Err(ConvertError::InvalidConfig(format!(
-                "{name} = {v} must be a finite value > 0"
-            )));
+    let positive = |option: &'static str, value: f64| {
+        if value <= 0.0 {
+            return Err(ConvertError::from(InvalidOption::NotPositive {
+                option,
+                value,
+            }));
         }
         Ok(())
     };
-    let non_negative = |name: &str, v: f64| {
-        if v < 0.0 {
-            return Err(ConvertError::InvalidConfig(format!(
-                "{name} = {v} must be a finite value >= 0"
-            )));
+    let non_negative = |option: &'static str, value: f64| {
+        if value < 0.0 {
+            return Err(ConvertError::from(InvalidOption::Negative {
+                option,
+                value,
+            }));
         }
         Ok(())
     };
     if !(1..=1_048_576).contains(&options.read_batch_size) {
-        return Err(ConvertError::InvalidConfig(
-            "read-batch-size must be in 1..=1048576 (a batch is fully resident)".into(),
-        ));
+        return Err(InvalidOption::ReadBatchSize.into());
     }
     let ceiling = read_workers_ceiling();
     if options.read_workers > ceiling {
-        return Err(ConvertError::InvalidConfig(format!(
-            "read-workers must be auto or 1..={ceiling} (2× this machine's cores)"
-        )));
+        return Err(InvalidOption::ReadWorkers { ceiling }.into());
     }
     // #371: the zoom ceiling is checked FIRST, before the input is opened or
     // any pass runs — `--max-zoom 33` used to be accepted and spin forever.
@@ -2193,11 +2543,10 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     non_negative("simplify-factor", options.simplify.factor)?;
     // Below 1 the budget used to clamp silently to 1; refuse it instead.
     if options.density.enabled && options.density.gamma < 1.0 {
-        return Err(ConvertError::InvalidConfig(format!(
-            "--drop-gamma must be at least 1 (got {}). Use 1 for a proportional cut, or \
-             --no-density-drop to turn the density budget off.",
-            options.density.gamma
-        )));
+        return Err(InvalidOption::DropGamma {
+            gamma: options.density.gamma,
+        }
+        .into());
     }
     if let Some(bb) = options.bbox {
         if bb.iter().any(|v| !v.is_finite()) || bb[0] > bb[2] || bb[1] > bb[3] {
@@ -2236,24 +2585,10 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     // disagree with its siblings' at the seams. Refused here rather than
     // producing a plausible-looking archive that is quietly wrong.
     if options.shard.is_some() && options.save_plan.is_some() {
-        return Err(ConvertError::InvalidConfig(
-            "--shard and --save-plan are mutually exclusive: a shard reads a subset of the \
-             input, so the plan it would write covers only that subset and is useless to the \
-             rest of the fleet. The coarse job, which reads everything, is the run that writes \
-             the plan."
-                .to_string(),
-        ));
+        return Err(InvalidOption::ShardWithSavePlan.into());
     }
     if options.shard.is_some() && options.plan.is_none() {
-        return Err(ConvertError::InvalidConfig(
-            "--shard requires --plan: the level assignment is dataset-global (the density \
-             budget water-fills a super-cell over every candidate of a level, the level walk \
-             carries a running kept count, --magnitude-ladder dense-ranks the whole column), \
-             so every shard of a fleet must consume ONE plan rather than recompute the \
-             assignment over its own subset. Run the coarse job first with --save-plan, then \
-             give every shard that plan with --plan."
-                .to_string(),
-        ));
+        return Err(InvalidOption::ShardWithoutPlan.into());
     }
 
     // #517 S2: the `TYLERTOO_PROFILE_JSON` dump is appended once, at the very
@@ -2268,44 +2603,33 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
                 .iter()
                 .any(|b| b.repr != Representation::Geometry)
         {
-            return Err(ConvertError::InvalidConfig(
-                "representation bands require duplicating mode: partitioning places \
-                 each feature exactly once with geometry verbatim (spec §2.3), which \
-                 a point or square representation cannot satisfy"
-                    .to_string(),
-            ));
+            return Err(InvalidOption::BandsNeedDuplicating.into());
         }
         let (plan_min, plan_max) = match &options.levels {
             LevelPlan::ZoomRange { min_zoom, max_zoom } => (*min_zoom, *max_zoom),
             LevelPlan::Gsds(_) => {
-                return Err(ConvertError::InvalidConfig(
-                    "representation bands require a zoom-range level plan \
-                     (--min-zoom/--max-zoom); an explicit --gsd plan carries no \
-                     per-level zooms to band on"
-                        .to_string(),
-                ));
+                return Err(InvalidOption::BandsNeedZoomRange.into());
             }
         };
         for band in &options.representation {
             let (lo, hi, repr) = (band.min_zoom, band.max_zoom, band.repr);
-            let kw = repr.as_str();
             if lo > hi {
-                return Err(ConvertError::InvalidConfig(format!(
-                    "representation band {lo}-{hi}:{kw} must satisfy LO <= HI"
-                )));
+                return Err(InvalidOption::BandInverted { band: *band }.into());
             }
             if lo < plan_min || hi > plan_max {
-                return Err(ConvertError::InvalidConfig(format!(
-                    "representation band {lo}-{hi}:{kw} lies outside the level plan \
-                     ({plan_min}-{plan_max})"
-                )));
+                return Err(InvalidOption::BandOutsidePlan {
+                    band: *band,
+                    plan_min,
+                    plan_max,
+                }
+                .into());
             }
             if repr != Representation::Geometry && hi >= plan_max {
-                return Err(ConvertError::InvalidConfig(format!(
-                    "representation band {lo}-{hi}:{kw} must end before the plan's \
-                     max zoom ({plan_max}): the canonical (finest) level reproduces \
-                     source geometry verbatim (spec §2.4)"
-                )));
+                return Err(InvalidOption::BandCoversCanonical {
+                    band: *band,
+                    plan_max,
+                }
+                .into());
             }
         }
         // Overlap: each zoom may be claimed by at most one band.
@@ -2315,9 +2639,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
             for z in band.min_zoom..=band.max_zoom {
                 let slot = &mut claimed[(z - plan_min) as usize];
                 if slot.is_some() {
-                    return Err(ConvertError::InvalidConfig(format!(
-                        "representation bands overlap at zoom {z}"
-                    )));
+                    return Err(InvalidOption::BandsOverlap { zoom: z }.into());
                 }
                 *slot = Some(band.repr);
             }
@@ -2331,12 +2653,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
             match slot {
                 Some(Representation::Point) => {
                     if seen_non_point_coarser {
-                        return Err(ConvertError::InvalidConfig(
-                            "point bands must start at the plan's min zoom and be \
-                             contiguous from the coarsest level: a coarser non-point \
-                             level would still receive the cascaded point"
-                                .to_string(),
-                        ));
+                        return Err(InvalidOption::PointBandsNotPrefix.into());
                     }
                 }
                 _ => seen_non_point_coarser = true,
@@ -2357,13 +2674,13 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
 /// for a remote input, after pass-0 staging) has already run.
 fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
     if path.is_dir() {
-        return Err(ConvertError::InvalidConfig(format!(
+        return Err(InvalidOption::plan(format!(
             "--plan {} is a directory, not a convert plan file",
             path.display()
         )));
     }
     let mut file = std::fs::File::open(path).map_err(|e| {
-        ConvertError::InvalidConfig(format!("--plan {} cannot be read: {e}", path.display()))
+        InvalidOption::plan(format!("--plan {} cannot be read: {e}", path.display()))
     })?;
     // The 8 magic bytes alone are enough to say "that is not a plan" before
     // anything expensive happens; the checksum in the other 8 header bytes,
@@ -2373,7 +2690,7 @@ fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
     if std::io::Read::read_exact(&mut file, &mut magic).is_err()
         || !magic.starts_with(super::plan_state::PLAN_MAGIC_PREFIX)
     {
-        return Err(ConvertError::InvalidConfig(format!(
+        return Err(InvalidOption::plan(format!(
             "--plan {} is not a tylertoo convert plan (bad magic bytes). Plans written \
              by an older tylertoo must be re-created with --save-plan.",
             path.display()
@@ -2386,7 +2703,7 @@ fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
     // problem entirely.
     let version = magic[super::plan_state::PLAN_MAGIC_PREFIX.len()];
     if version != super::plan_state::PLAN_FORMAT_VERSION_BYTE {
-        return Err(ConvertError::InvalidConfig(format!(
+        return Err(InvalidOption::plan(format!(
             "--plan {} is a tylertoo convert plan in format v{version}, but this tylertoo \
              reads v{}. Re-create it with --save-plan.",
             path.display(),
@@ -2408,7 +2725,7 @@ fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
 /// `pyramid`, which merges several archives, gates overwrites behind
 /// `-f/--force`.
 fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
-    let bad = |what: String| Err(ConvertError::InvalidConfig(what));
+    let bad = |what: String| Err(InvalidOption::save_plan(what));
     if path.is_dir() {
         return bad(format!(
             "--save-plan {} is a directory; give the plan a file path",
@@ -2458,6 +2775,7 @@ fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
 /// One zoom band of the representation selector (#317 / #279): levels whose
 /// zoom lies in `min_zoom..=max_zoom` (inclusive) take `repr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct RepresentationBand {
     /// Coarsest zoom of the band (inclusive).
     pub min_zoom: u8,
@@ -2465,6 +2783,17 @@ pub struct RepresentationBand {
     pub max_zoom: u8,
     /// Representation applied at the band's levels.
     pub repr: Representation,
+}
+
+impl RepresentationBand {
+    /// `repr` at the levels whose zoom lies in `min_zoom..=max_zoom`.
+    pub fn new(min_zoom: u8, max_zoom: u8, repr: Representation) -> Self {
+        Self {
+            min_zoom,
+            max_zoom,
+            repr,
+        }
+    }
 }
 
 /// The [`Representation`] for a zoom under a set of bands (unclaimed zooms
@@ -2764,22 +3093,13 @@ pub fn write_convert_plan_sources(
     // to produce, and silently doing the whole scan for nothing is the one
     // outcome worth refusing outright.
     if options.save_plan.is_none() {
-        return Err(ConvertError::InvalidConfig(
-            "writing a convert plan requires --save-plan PATH: a plan-only run \
-             produces no archive and no overview, so the plan is its only output"
-                .to_string(),
-        ));
+        return Err(InvalidOption::PlanOnlyWithoutSavePlan.into());
     }
     // #541's ceiling truncates what PASS 2 materializes, and pass 2 does not
     // run here. Refused rather than ignored: an operator who caps a plan-only
     // run has misunderstood which half they skipped.
     if options.zoom_ceiling.is_some() {
-        return Err(ConvertError::InvalidConfig(
-            "a convert-side zoom ceiling has no meaning for a plan-only run: the \
-             ceiling bounds the levels pass 2 materializes, and a plan-only run \
-             materializes none. Drop it — the plan is full-range either way"
-                .to_string(),
-        ));
+        return Err(InvalidOption::CeilingInPlanOnly.into());
     }
     let inert_options: ConvertOptions;
     let options: &ConvertOptions =
@@ -4252,6 +4572,7 @@ pub(crate) fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
 /// front. (#553's own case, a5 grid cells 0.6° past ±180°, is no longer out
 /// of range: the export wraps it, #342.)
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct OutOfRangeExemplar {
     /// Index of the input part (file) holding the feature, in the source's
     /// read order; `None` when the input is a single file.
@@ -6240,8 +6561,11 @@ pub(super) fn resolve_entry_levels(
         return Ok(None);
     };
     let level_zooms: Vec<Option<u8>> = level_specs.iter().map(|(_, z)| *z).collect();
-    let ladder = build_ladder(spec, column_values, &level_zooms)
-        .map_err(|e| ConvertError::InvalidConfig(format!("entry-zoom: {e}")))?;
+    let ladder = build_ladder(spec, column_values, &level_zooms).map_err(|e| {
+        InvalidOption::EntryZoomLadder {
+            message: e.to_string(),
+        }
+    })?;
     let levels = entry_levels(&ladder, column_values, &level_zooms);
     let placed = levels.iter().filter(|l| l.is_some()).count();
     log::info!(
@@ -7049,7 +7373,10 @@ mod tests {
             {
                 let mut out = Vec::new();
                 for item in accessor.iter().flatten() {
-                    let g = item.map_err(|e| crate::Error::GeoParquetRead(e.to_string()))?;
+                    let g = item.map_err(|e| crate::GeoParquetReadError::Decode {
+                        stage: "geometry decode",
+                        message: e.to_string(),
+                    })?;
                     let old = g.try_to_geometry().and_then(|g| scan_feature(&g));
                     out.push((bits(old), bits(scan_feature_traits(&g))));
                 }

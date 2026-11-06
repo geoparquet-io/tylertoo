@@ -8,9 +8,9 @@ use geo::Polygon;
 use std::fs::File;
 use std::io::Read;
 use std::time::Instant;
-use tylertoo_core::clip;
-use tylertoo_core::ioverlay_clip::clip_polygon_ioverlay;
-use tylertoo_core::tile::TileBounds;
+use tylertoo_core::internal::clip;
+use tylertoo_core::internal::ioverlay_clip::clip_polygon_ioverlay;
+use tylertoo_core::internal::tile::TileBounds;
 
 fn load_huge_polygon() -> Option<Polygon<f64>> {
     let path = "/tmp/huge_antarctica_poly.wkb";
@@ -54,7 +54,7 @@ fn clip_huge_polygon_with_ioverlay() {
     let result = clip_polygon_ioverlay(
         &poly,
         &tile_bounds,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     );
     let elapsed = start.elapsed();
 
@@ -96,7 +96,7 @@ fn clip_huge_polygon_with_sutherland_hodgman() {
         &geo::Geometry::Polygon(poly),
         &tile_bounds,
         buffer,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     );
     let elapsed = start.elapsed();
 

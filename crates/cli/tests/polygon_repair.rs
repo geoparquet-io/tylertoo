@@ -55,7 +55,8 @@ fn madagascar_adm4_small_features_survive_verbatim_at_z2() {
                 String::from_utf8_lossy(&result.stderr)
             );
             let decoded = dir.path().join(format!("{id}-decoded.parquet"));
-            tylertoo_core::decode::decode_pmtiles(&output, &decoded, &Default::default()).unwrap();
+            tylertoo_core::internal::decode::decode_pmtiles(&output, &decoded, &Default::default())
+                .unwrap();
             let rows: usize = open_parquet(std::fs::File::open(decoded).unwrap())
                 .unwrap()
                 .build()

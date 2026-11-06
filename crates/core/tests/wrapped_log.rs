@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use geo::{Geometry, Point};
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 
 #[expect(
     dead_code,
@@ -36,13 +36,10 @@ impl log::Log for Capture {
 fn wrapped_lines(input: &Path) -> Vec<String> {
     LINES.lock().unwrap().clear();
     let tout = tempfile::NamedTempFile::new().unwrap();
-    let o = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: 2,
-            max_zoom: 6,
-        },
-        ..Default::default()
-    };
+    let o = ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: 2,
+        max_zoom: 6,
+    });
     convert_to_overviews(input, tout.path(), &o).unwrap_or_else(|e| panic!("{e}"));
     LINES
         .lock()

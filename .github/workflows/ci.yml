@@ -1017,6 +1017,7 @@ jobs:
           # Extract versions
           WORKSPACE_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           CORE_DEP_VERSION=$(grep 'tylertoo-core.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+          IO_DEP_VERSION=$(grep 'tylertoo-io.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
           PYTHON_VERSION=$(grep -m1 '^version = ' crates/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           CZ_VERSION=$(grep '^version = ' .cz.toml | sed 's/version = "\(.*\)"/\1/')
           # uv.lock pins the Python project's own version. `cz bump` does not
@@ -1027,6 +1028,7 @@ jobs:
           echo "Versions found:"
           echo "  Cargo.toml workspace.package.version: $WORKSPACE_VERSION"
           echo "  Cargo.toml tylertoo-core dependency: $CORE_DEP_VERSION"
+          echo "  Cargo.toml tylertoo-io dependency:   $IO_DEP_VERSION"
           echo "  pyproject.toml version:               $PYTHON_VERSION"
           echo "  .cz.toml version:                     $CZ_VERSION"
           echo "  crates/python/uv.lock version:        $UV_LOCK_VERSION"
@@ -1035,6 +1037,10 @@ jobs:
           ERROR=0
           if [ "$WORKSPACE_VERSION" != "$CORE_DEP_VERSION" ]; then
             echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs core-dep=$CORE_DEP_VERSION"
+            ERROR=1
+          fi
+          if [ "$WORKSPACE_VERSION" != "$IO_DEP_VERSION" ]; then
+            echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs io-dep=$IO_DEP_VERSION"
             ERROR=1
           fi
           if [ "$WORKSPACE_VERSION" != "$PYTHON_VERSION" ]; then

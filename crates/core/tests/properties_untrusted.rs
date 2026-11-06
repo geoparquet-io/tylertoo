@@ -88,7 +88,7 @@ proptest! {
         bytes in prop::collection::vec(any::<u8>(), 0..1024),
         z in 0u8..=22,
     ) {
-        let _ = tylertoo_core::decode::fuzz_decode_tile(z, 0, 0, &bytes);
-        let _ = tylertoo_core::decode::fuzz_decode_archive(&bytes);
+        let _ = tylertoo_core::internal::decode::fuzz_decode_tile(z, 0, 0, &bytes);
+        let _ = tylertoo_core::internal::decode::fuzz_decode_archive(&bytes);
     }
 }

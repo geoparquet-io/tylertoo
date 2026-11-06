@@ -506,7 +506,8 @@ fn a_coarse_job_with_nothing_below_the_pivot_writes_an_empty_archive() {
         convert_plan.exists(),
         "the plan must still be written: {out}"
     );
-    let idx = tylertoo_core::archive_index::ArchiveIndex::open(&coarse).expect("valid archive");
+    let idx =
+        tylertoo_core::internal::archive_index::ArchiveIndex::open(&coarse).expect("valid archive");
     assert_eq!(
         idx.tiles().count(),
         0,

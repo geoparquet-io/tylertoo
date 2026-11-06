@@ -1,12 +1,14 @@
 [package]
 name = "tylertoo-io"
-description = "Checked Parquet and Arrow IPC I/O for tylertoo"
+description = "Checked Parquet and Arrow IPC I/O for tylertoo-core: an implementation detail with no stability guarantee"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [features]
 default = []

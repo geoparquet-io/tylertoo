@@ -15,8 +15,10 @@ cargo +nightly-2026-09-15 public-api \
 ```
 
 `cargo-public-api` reads rustdoc JSON, which only nightly emits. The
-`--simplified` flag drops auto-derived trait impls, which otherwise dominate
-the diff for any new type.
+`--simplified` flag drops blanket impls (`impl<T> From<T> for T` and the
+like), which otherwise dominate the diff for any new type. It keeps the
+auto-trait impls (`Send`, `Sync`, `Unpin`, `UnwindSafe`, …): those are
+semver-relevant, so a change to them should show up in review.
 
 The nightly is pinned, and the pin is the `NIGHTLY` variable in the
 `public-api` job in `.github/workflows/ci.yml`. Rustdoc renders paths

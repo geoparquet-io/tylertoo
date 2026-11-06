@@ -7,5 +7,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = tylertoo_core::overview::fuzz_convert_plan(data);
+    let _ = tylertoo_core::internal::overview::fuzz_convert_plan(data);
 });

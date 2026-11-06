@@ -1,11 +1,14 @@
-use tylertoo_core::diagnostics::{Diagnostic, Diagnostics};
+//! Diagnostic channel tests that build struct variants, which are
+//! `#[non_exhaustive]` outside the crate.
+
+use crate::diagnostics::{Diagnostic, Diagnostics};
 
 #[test]
 fn schema_resolution_defers_warning_logs_until_an_operation() {
+    use crate::diagnostics::{CoveringWarning, CrsWarning};
+    use crate::resolved_schema::ResolvedSchema;
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Mutex;
-    use tylertoo_core::diagnostics::{CoveringWarning, CrsWarning};
-    use tylertoo_core::resolved_schema::ResolvedSchema;
 
     static LINES: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
     struct Capture;
@@ -23,7 +26,11 @@ fn schema_resolution_defers_warning_logs_until_an_operation() {
         }
         fn flush(&self) {}
     }
-    log::set_logger(&Capture).expect("the only logger in this test binary");
+    // A shared `cargo test` process may already hold another logger;
+    // nextest runs each test in its own process.
+    if log::set_logger(&Capture).is_err() {
+        return;
+    }
     log::set_max_level(log::LevelFilter::Debug);
 
     let schema = Schema::new_with_metadata(
@@ -83,8 +90,8 @@ fn schema_resolution_defers_warning_logs_until_an_operation() {
 
 #[test]
 fn range_messages_require_events_and_a_denominator() {
-    use tylertoo_core::diagnostics::RangeContext;
-    use tylertoo_core::overview::level::Crs;
+    use crate::diagnostics::RangeContext;
+    use crate::overview::level::Crs;
 
     for make in [
         |count, context| Diagnostic::Wrapped {
@@ -156,7 +163,7 @@ fn out_of_range_display_preserves_excess_and_source_identity() {
         Diagnostic::OutOfRange {
             context: None,
             count: 1,
-            exemplars: vec![tylertoo_core::overview::convert::OutOfRangeExemplar {
+            exemplars: vec![crate::overview::convert::OutOfRangeExemplar {
                 part: Some(2),
                 row: 7,
                 axis,
@@ -181,7 +188,7 @@ fn out_of_range_display_preserves_excess_and_source_identity() {
 
 #[test]
 fn tile_losses_are_disjoint_and_cancelled_by_any_surviving_member() {
-    use tylertoo_core::diagnostics::SourceLossCause;
+    use crate::diagnostics::SourceLossCause;
     let sink = Diagnostics::default();
     sink.source_loss(3, Some(4), SourceLossCause::EncodeDropped)
         .unwrap();
@@ -253,7 +260,7 @@ fn child_contexts_are_preserved_independently_of_arrival_order() {
 
 #[test]
 fn counter_queries_preserve_diagnostic_subtypes() {
-    use tylertoo_core::diagnostics::PolygonRepairKind;
+    use crate::diagnostics::PolygonRepairKind;
     let sink = Diagnostics::default();
     sink.record(Diagnostic::PolygonRepaired {
         count: 2,
@@ -324,7 +331,7 @@ fn advisory_counts_are_queried_by_complete_message() {
 
 #[test]
 fn metadata_and_property_counters_preserve_the_query_key() {
-    use tylertoo_core::diagnostics::{CoveringWarning, CrsWarning};
+    use crate::diagnostics::{CoveringWarning, CrsWarning};
 
     for (first, second) in [
         (
@@ -369,8 +376,8 @@ fn metadata_and_property_counters_preserve_the_query_key() {
 
 #[test]
 fn range_aggregation_preserves_crs_and_combines_only_matching_contexts() {
-    use tylertoo_core::diagnostics::RangeContext;
-    use tylertoo_core::overview::level::Crs;
+    use crate::diagnostics::RangeContext;
+    use crate::overview::level::Crs;
 
     // Exercise every range diagnostic through the public sink. CRS is part
     // of its identity: degrees and metres must never share a denominator.
@@ -448,7 +455,7 @@ fn streamed_reports_preserve_the_previous_output_on_serialization_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("report.json");
     std::fs::write(&path, "previous report").unwrap();
-    let error = tylertoo_core::diagnostics::write_report(&path, &Broken).unwrap_err();
+    let error = crate::diagnostics::write_report(&path, &Broken).unwrap_err();
     assert!(error.to_string().contains("unreadable spill"));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous report");
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);

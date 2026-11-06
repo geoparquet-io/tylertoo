@@ -127,19 +127,51 @@ jobs:
           git tag -a "$TAG" -m "Release $TAG"
           git push origin "$TAG"
 
+      # tylertoo-io is an implementation detail of tylertoo-core with no
+      # stability guarantee, but core depends on it, so it publishes first.
+      # Each step skips a version crates.io already has, so a recovery rerun
+      # after a partial publish resumes at the first missing crate.
+      - name: Publish tylertoo-io to crates.io
+        if: steps.release_check.outputs.release_exists == 'false'
+        run: |
+          if curl -sf -A "tylertoo-release (github.com/geoparquet-io/tylertoo)" \
+              "https://crates.io/api/v1/crates/tylertoo-io/$VERSION" >/dev/null; then
+            echo "tylertoo-io $VERSION is already on crates.io; skipping"
+            exit 0
+          fi
+          cargo publish --locked --package tylertoo-io
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
       - name: Publish tylertoo-core to crates.io
         if: steps.release_check.outputs.release_exists == 'false'
-        run: cargo publish --locked --package tylertoo-core
+        run: |
+          if curl -sf -A "tylertoo-release (github.com/geoparquet-io/tylertoo)" \
+              "https://crates.io/api/v1/crates/tylertoo-core/$VERSION" >/dev/null; then
+            echo "tylertoo-core $VERSION is already on crates.io; skipping"
+            exit 0
+          fi
+          # Wait for crates.io to index tylertoo-io
+          sleep 30
+          cargo publish --locked --package tylertoo-core
         env:
+          VERSION: ${{ steps.version.outputs.version }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       - name: Publish tylertoo (CLI) to crates.io
         if: steps.release_check.outputs.release_exists == 'false'
         run: |
+          if curl -sf -A "tylertoo-release (github.com/geoparquet-io/tylertoo)" \
+              "https://crates.io/api/v1/crates/tylertoo/$VERSION" >/dev/null; then
+            echo "tylertoo $VERSION is already on crates.io; skipping"
+            exit 0
+          fi
           # Wait for crates.io to index tylertoo-core
           sleep 30
           cargo publish --locked --package tylertoo
         env:
+          VERSION: ${{ steps.version.outputs.version }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   # Prebuilt CLI binaries for users without a Rust toolchain (cargo install

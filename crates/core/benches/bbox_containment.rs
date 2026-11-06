@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{BoundingRect, Coord, Geometry, LineString, MultiPolygon, Polygon};
-use tylertoo_core::clip::clip_geometry;
-use tylertoo_core::tile::TileBounds;
+use tylertoo_core::internal::clip::clip_geometry;
+use tylertoo_core::internal::tile::TileBounds;
 
 /// Generate small building-like polygons (typical size: 10-30m)
 /// These should benefit greatly from bbox containment optimization at high zoom
@@ -121,7 +121,7 @@ fn bench_small_features_high_zoom(c: &mut Criterion) {
     let mut group = c.benchmark_group("bbox_containment/small_features_z14");
     // Hoisted: building the sink inside the timed closure charged its
     // allocation to every iteration (#773).
-    let diag = tylertoo_core::diagnostics::Diagnostics::default();
+    let diag = tylertoo_core::internal::diagnostics::Diagnostics::default();
 
     // Tile at z14 (typical for building-level detail)
     // Example: San Francisco area
@@ -167,7 +167,7 @@ fn bench_small_features_boundary_crossing(c: &mut Criterion) {
     let mut group = c.benchmark_group("bbox_containment/boundary_crossing");
     // Hoisted: building the sink inside the timed closure charged its
     // allocation to every iteration (#773).
-    let diag = tylertoo_core::diagnostics::Diagnostics::default();
+    let diag = tylertoo_core::internal::diagnostics::Diagnostics::default();
 
     let tile_bounds = TileBounds::new(-122.5, 37.7, -122.4, 37.8);
     let buffer = 0.0001;
@@ -238,7 +238,7 @@ fn bench_large_features_low_zoom(c: &mut Criterion) {
     let mut group = c.benchmark_group("bbox_containment/large_features_z4");
     // Hoisted: building the sink inside the timed closure charged its
     // allocation to every iteration (#773).
-    let diag = tylertoo_core::diagnostics::Diagnostics::default();
+    let diag = tylertoo_core::internal::diagnostics::Diagnostics::default();
 
     // Tile at z4 (continental scale)
     let tile_bounds = TileBounds::new(-112.5, 22.5, -67.5, 45.0);
@@ -283,7 +283,7 @@ fn bench_multipolygon_bbox_filter(c: &mut Criterion) {
     let mut group = c.benchmark_group("bbox_containment/multipolygon");
     // Hoisted: building the sink inside the timed closure charged its
     // allocation to every iteration (#773).
-    let diag = tylertoo_core::diagnostics::Diagnostics::default();
+    let diag = tylertoo_core::internal::diagnostics::Diagnostics::default();
 
     // Small tile that should only intersect a few sub-polygons
     let tile_bounds = TileBounds::new(-67.5, -66.51, -56.25, -61.61);
@@ -373,7 +373,7 @@ fn bench_optimization_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("bbox_containment/comparison");
     // Hoisted: building the sink inside the timed closure charged its
     // allocation to every iteration (#773).
-    let diag = tylertoo_core::diagnostics::Diagnostics::default();
+    let diag = tylertoo_core::internal::diagnostics::Diagnostics::default();
 
     let tile_bounds = TileBounds::new(-122.5, 37.7, -122.4, 37.8);
     let buffer = 0.0001;
@@ -402,7 +402,7 @@ fn bench_optimization_comparison(c: &mut Criterion) {
 
     // Comparison: force clipping even when fully inside (simulates no optimization)
     // Note: This uses the underlying clip_polygon_sh which still has some optimizations
-    use tylertoo_core::sutherland_hodgman::clip_polygon_sh;
+    use tylertoo_core::internal::sutherland_hodgman::clip_polygon_sh;
 
     group.bench_function("without_bbox_optimization", |b| {
         b.iter(|| {

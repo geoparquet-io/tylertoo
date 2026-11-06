@@ -48,6 +48,7 @@ use crate::{Error, Result};
 pub enum ArchiveError {
     /// The archive file could not be opened.
     #[error("failed to open {}: {error}", path.display())]
+    #[non_exhaustive]
     Open {
         /// The archive.
         path: PathBuf,
@@ -56,6 +57,7 @@ pub enum ArchiveError {
     },
     /// The archive file could not be read.
     #[error("failed to read {}: {error}", path.display())]
+    #[non_exhaustive]
     Read {
         /// The archive.
         path: PathBuf,
@@ -70,6 +72,7 @@ pub enum ArchiveError {
     Directory(String),
     /// A directory section did not decompress.
     #[error("failed to decompress {what} at byte offset {offset} ({length} bytes): {error}")]
+    #[non_exhaustive]
     DirectoryDecompress {
         /// `root directory` or `leaf directory`.
         what: &'static str,
@@ -86,6 +89,7 @@ pub enum ArchiveError {
          ceiling on an archive's internal sections",
         path.display()
     )]
+    #[non_exhaustive]
     MetadataTooLarge {
         /// The archive.
         path: PathBuf,
@@ -96,12 +100,14 @@ pub enum ArchiveError {
     },
     /// The header's metadata section runs past the end of the file.
     #[error("metadata past end of {}", path.display())]
+    #[non_exhaustive]
     MetadataPastEnd {
         /// The archive.
         path: PathBuf,
     },
     /// The metadata section did not decompress within the ceiling.
     #[error("{}: metadata: {error}", path.display())]
+    #[non_exhaustive]
     Metadata {
         /// The archive.
         path: PathBuf,
@@ -111,6 +117,7 @@ pub enum ArchiveError {
     /// A directory entry addresses bytes outside the tile-data section, or
     /// a range outside the file.
     #[error("tile data past end of {}", path.as_deref().map_or_else(|| "archive".to_owned(), |p| p.display().to_string()))]
+    #[non_exhaustive]
     TileDataPastEnd {
         /// The archive, when the reader knows it.
         path: Option<PathBuf>,
@@ -120,6 +127,7 @@ pub enum ArchiveError {
     TileIdOverflow,
     /// A tile id beyond the zoom-31 address space.
     #[error("tile id {id} exceeds the zoom 31 address space")]
+    #[non_exhaustive]
     TileIdOutOfRange {
         /// The tile id.
         id: u64,
@@ -130,6 +138,7 @@ pub enum ArchiveError {
         "directory entry for tile id {tile_id} claims a run of {run} tiles, past this \
          archive's run-length expansion limit of {limit} tiles"
     )]
+    #[non_exhaustive]
     RunTooLong {
         /// The entry's first tile id.
         tile_id: u64,

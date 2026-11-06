@@ -30,6 +30,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PropertySelection {
     /// When `Some`, only these properties are kept (`-y`), and `exclude` /
     /// `exclude_all` are ignored, as in tippecanoe. An empty list keeps
@@ -65,16 +66,25 @@ pub struct PropertySelection {
     pub exclude_all: bool,
 }
 
+with_setters!(PropertySelection {
+    with_include => include: Option<Vec<String>>,
+    with_exclude => exclude: Vec<String>,
+    with_exclude_all => exclude_all: bool,
+});
+
 /// Why a selection could not be applied to a schema.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PropertySelectionError {
     /// An `include` name matches no input column: asking for a column that
     /// is not there is a typo, not a preference.
     #[error("included property {name:?} is not a column of the input (columns: {available})")]
+    #[non_exhaustive]
     UnknownInclude { name: String, available: String },
 
     /// The geometry column was named as a property.
     #[error("{name:?} is the geometry column, not a property; it is always kept")]
+    #[non_exhaustive]
     GeometryColumn { name: String },
 
     /// The geometry's bbox covering struct was named in an include list
@@ -84,6 +94,7 @@ pub enum PropertySelectionError {
         "{name:?} is the geometry's bbox covering, not a property; the writer regenerates \
          it, so it cannot be selected"
     )]
+    #[non_exhaustive]
     CoveringColumn { name: String },
 
     /// A column a tuning knob reads was excluded.
@@ -91,6 +102,7 @@ pub enum PropertySelectionError {
         "property {name:?} is excluded but {knob} reads it; keep it in the selection or \
          drop the knob"
     )]
+    #[non_exhaustive]
     RequiredByKnob { name: String, knob: String },
 }
 
@@ -142,6 +154,7 @@ impl PropertySelection {
         !self.exclude.iter().any(|n| n == name)
     }
 
+    #[doc(hidden)]
     /// Resolve the selection against `schema` into the sorted root-column
     /// indices to keep: the geometry column plus every kept property.
     ///
