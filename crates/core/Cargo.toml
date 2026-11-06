@@ -69,7 +69,7 @@ log = { workspace = true }
 memory-stats = { workspace = true }
 flate2 = "1"
 # brotli and zstd follow parquet's majors (8 / 0.13) so each compiles once (#435).
-# Dependabot ignores newer majors; move them only with parquet (#649).
+# Renovate holds newer majors; move them only with parquet (#649).
 brotli = "8"
 zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3", "std"] }
@@ -77,7 +77,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3", "std"] }
 fast_hilbert = "2.1"
 # Orphan-cell nearest lookup (overview/cluster.rs); 0.12 is the version geo
 # already pulls in.
-rstar = "0.14"
+rstar = "0.12"
 serde = { workspace = true }
 serde_path_to_error = "0.1"
 # 1.0.129: Value::sort_all_objects (overview/writer.rs).

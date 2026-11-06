@@ -37,7 +37,7 @@ name: CodSpeed
 on:
   pull_request:
     # Keep in step with GLOBAL and the bench map in scripts/codspeed_benches.sh.
-    # No Cargo.lock: a lockfile-only PR (Dependabot, an advisory bump) is
+    # No Cargo.lock: a lockfile-only PR (Renovate, an advisory bump) is
     # measured by the run on main after it merges (#759).
     paths:
       - "crates/core/**"

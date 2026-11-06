@@ -874,9 +874,11 @@ versions, from a laptop to the release artifacts. To update it, run
 with the change. The security audit in the CI Lint job fails when the lock falls out
 of step with the manifests.
 
-Dependabot opens weekly updates for every dependency ecosystem in the
-repo. Patch and minor updates merge on their own once all gates
-pass, and majors wait for a human. The weekly security job runs
+Renovate (`.github/renovate.json5`) runs once a month and opens one PR
+holding every patch and minor update across Cargo, Python, and GitHub
+Actions. That PR merges on its own once all gates pass. Majors and
+geometry-engine bumps wait for a human; the Dependency Dashboard issue
+lists what is held. The weekly security job runs
 cargo-audit, cargo-deny, and pip-audit. It first re-resolves
 `Cargo.lock` from scratch, as early warning of what the next bump pulls
 in. On failure it opens or updates a pinned `security-audit`

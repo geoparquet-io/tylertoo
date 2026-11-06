@@ -75,7 +75,7 @@
 # day. We deliberately do NOT pin the toolchain: a pin needs a scheduled
 # bump job that itself rots, while beta failures are visible and actionable.
 # All third-party actions are pinned by commit SHA (enforced by zizmor);
-# Dependabot bumps the pins.
+# Renovate bumps the pins.
 
 name: CI
 

@@ -23,6 +23,7 @@ proselint('s)?
 WGS84
 Commitizen
 Dependabot
+Renovate
 Slurm
 [Cc]odecov
 [Cc]lippy
