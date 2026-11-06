@@ -1665,8 +1665,8 @@ fn run_merge(args: MergeArgs) -> Result<()> {
         work_dir: args.work_dir.clone(),
         metadata: args.publication.clone(),
     };
-    let report = merge_shards(&args.inputs, &args.output, &opts)
-        .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
+    let report =
+        merge_shards(&args.inputs, &args.output, &opts).map_err(|e| step_failed("merge", e))?;
 
     for (zoom, count) in &report.per_zoom_tile_counts {
         say!("  z{:<2} {:>10} tiles", zoom, format_number(*count));
