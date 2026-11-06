@@ -310,13 +310,32 @@ def summarize_leg(argv: list[str], runs: list[dict]) -> dict:
     }
 
 
+def converter_legs(converters: dict, tip_in: Path) -> tuple[dict, dict]:
+    """One leg per parquet -> fgb converter, and `chosen`: the converter
+    with the fastest warm-up, picked once. Its output is copied to `tip_in`,
+    tippecanoe's input, so the converter whose time the end-to-end sum
+    reports is the one whose output tippecanoe tiles."""
+    chosen: dict = {"tool": None, "wall_s": None}
+    tip_in.unlink(missing_ok=True)
+
+    def pick(tool: str, dst: Path, m: dict) -> None:
+        if chosen["wall_s"] is None or m["wall_s"] < chosen["wall_s"]:
+            shutil.copyfile(dst, tip_in)
+            chosen.update(tool=tool, wall_s=m["wall_s"])
+
+    legs = {f"convert:{tool}": {"argv": argv, "unlink_first": dst, "optional": f"convert:{tool}",
+                                "after_warmup": lambda m, t=tool, d=dst: pick(t, d, m)}
+            for tool, (argv, dst) in converters.items()}
+    return legs, chosen
+
+
 def run_rounds(legs: dict[str, dict], n: int, logdir: Path) -> tuple[dict, dict]:
     """Time every leg n times, the tools alternating within each round.
 
     `legs` maps a name to {argv, unlink_first?, needs?, after_warmup?,
     optional?}, in dependency order. One discarded warm-up run of each leg,
     in that order, makes every measurement warm-cache and produces the
-    inputs later legs read (`after_warmup` copies an output to a stable
+    inputs later legs read (`after_warmup(measurement)` copies an output to a stable
     path; `needs` names the file a leg cannot start without). Then n
     rounds, each running every leg once, in run_manifest.round_order: the
     order flips every round, so drift on the host lands on both tools.
@@ -346,7 +365,7 @@ def run_rounds(legs: dict[str, dict], n: int, logdir: Path) -> tuple[dict, dict]
             return
         if tag == "warmup":
             if leg.get("after_warmup"):
-                leg["after_warmup"]()
+                leg["after_warmup"](m)
         else:
             runs[name].append(m)
 
@@ -405,8 +424,9 @@ def fgb_converters(src: Path, dstdir: Path, stem: str) -> dict[str, tuple[list[s
     On a 1,000-feature fixture that start-up IS the conversion time, and using
     gpio alone would hand tylertoo a free win that has nothing to do with
     tiling. ogr2ogr is a C binary with negligible start-up. The harness times
-    both when both exist and the e2e number uses the FASTER one — the
-    opposite of cherry-picking.
+    both when both exist and the e2e number uses the FASTER one (the fastest
+    warm-up, picked once, whose output tippecanoe then reads) — the opposite
+    of cherry-picking.
     """
     out = {}
     if shutil.which("ogr2ogr"):
@@ -919,14 +939,12 @@ def main() -> int:
             if not converters:
                 return fail("neither ogr2ogr nor gpio found; cannot build "
                             "tippecanoe's input. Install GDAL or gpio.")
-            # tippecanoe reads a stable copy of the first converter output, as
-            # each converter deletes its own output before every timed run.
+            # tippecanoe reads a stable copy of the output of the converter with
+            # the fastest warm-up (each converter deletes its own output before
+            # every timed run), and the e2e sum reports that converter's time.
             tip_fgb = workdir / f"{did}.tippecanoe-input.fgb"
-            tip_fgb.unlink(missing_ok=True)
-            for tool, (argv, dst) in converters.items():
-                legs[f"convert:{tool}"] = {
-                    "argv": argv, "unlink_first": dst, "optional": f"convert:{tool}",
-                    "after_warmup": (lambda d=dst: tip_fgb.exists() or shutil.copyfile(d, tip_fgb))}
+            conv_legs, chosen = converter_legs(converters, tip_fgb)
+            legs.update(conv_legs)
             tp_out = workdir / f"{did}.tippecanoe-fgb.pmtiles"
             legs["tippecanoe_fgb"] = {"needs": tip_fgb, "argv": tippecanoe_argv(
                 tippecanoe, tip_fgb, tp_out, ds["layer"], zmin, zmax, False, tip_all)}
@@ -939,7 +957,7 @@ def main() -> int:
             if gconv:
                 legs["convert_geojsonseq"] = {
                     "argv": gconv, "unlink_first": gj, "optional": "geojson",
-                    "after_warmup": lambda: shutil.copyfile(gj, gj_in)}
+                    "after_warmup": lambda _m: shutil.copyfile(gj, gj_in)}
                 legs["tippecanoe_geojsonseq"] = {"optional": "geojson", "argv": tippecanoe_argv(
                     tippecanoe, gj_in, gj_out, ds["layer"], zmin, zmax, True, tip_all)}
             print(f"  {len(legs)} legs, {args.repeat} alternating rounds: "
@@ -983,7 +1001,12 @@ def main() -> int:
             if not ok:
                 return fail(f"no parquet->fgb converter succeeded for {did}; "
                             "see the converter errors printed above")
-            entry["convert_fgb"] = min(ok, key=lambda m: m["wall_median_s"])
+            # The converter picked at warm-up: tippecanoe read its output, so
+            # its time is the one the end-to-end sum carries.
+            entry["convert_fgb"] = entry["convert_fgb_candidates"].get(chosen["tool"])
+            if not entry["convert_fgb"] or entry["convert_fgb"].get("failed"):
+                return fail(f"{did}: the converter tippecanoe read ({chosen['tool']}) "
+                            "failed in a timed round")
             entry["tippecanoe_fgb"] = summ["tippecanoe_fgb"]
             entry["tippecanoe_fgb"]["output_bytes"] = tp_out.stat().st_size
             entry["tippecanoe_fgb"]["per_zoom"] = per_zoom_counts(tylertoo, tp_out)
@@ -995,7 +1018,7 @@ def main() -> int:
                 "peak_rss_bytes": max_opt(entry["convert_fgb"]["peak_rss_bytes"],
                                           entry["tippecanoe_fgb"]["peak_rss_bytes"]),
                 "converter": entry["convert_fgb"]["tool"],
-                "note": "parquet->fgb (fastest available converter) then "
+                "note": "parquet->fgb (the converter with the fastest warm-up) then "
                         "fgb->pmtiles, run as two processes; peak RSS is the "
                         "larger of the two stages, not their sum",
             }

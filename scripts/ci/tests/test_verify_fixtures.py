@@ -48,19 +48,23 @@ def test_one_corrupted_byte_fails(pinned):
     body[0] ^= 0xFF
     (d / "a.parquet").write_bytes(bytes(body))
     res = _verify(d, pins)
-    assert res.returncode != 0
-    assert "a.parquet" in res.stdout + res.stderr
+    assert res.returncode == 1, res.stdout + res.stderr  # not 127: the script ran
+    assert "a.parquet: FAILED" in res.stdout + res.stderr
 
 
 def test_a_missing_file_fails(pinned):
     d, pins = pinned
     (d / "b.parquet").unlink()
-    assert _verify(d, pins).returncode != 0
+    res = _verify(d, pins)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "b.parquet: FAILED open or read" in res.stdout + res.stderr
 
 
 def test_a_missing_directory_fails(tmp_path, pinned):
     _, pins = pinned
-    assert _verify(tmp_path / "nope", pins).returncode != 0
+    res = _verify(tmp_path / "nope", pins)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "verify_fixtures: no directory" in res.stderr
 
 
 def test_the_committed_pins_cover_every_release_asset():

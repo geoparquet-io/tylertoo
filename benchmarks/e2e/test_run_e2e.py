@@ -60,10 +60,29 @@ def test_a_failing_required_leg_raises(tmp_path):
 def test_after_warmup_hook_and_needs(tmp_path):
     src, stable = tmp_path / "a.fgb", tmp_path / "tip.fgb"
     legs = {"convert": {"argv": ["sh", "-c", f"echo x > {src}"], "unlink_first": src,
-                        "after_warmup": lambda: stable.write_text(src.read_text())},
+                        "after_warmup": lambda _m: stable.write_text(src.read_text())},
             "tippecanoe": {"argv": ["cat", str(stable)], "needs": stable}}
     summ, _ = run_e2e.run_rounds(legs, 1, tmp_path)
     assert set(summ) == {"convert", "tippecanoe"}
     with pytest.raises(run_e2e.MissingInput):
         run_e2e.run_rounds({"tippecanoe": {"argv": ["true"], "needs": tmp_path / "nope"}}, 1,
                            tmp_path)
+
+
+def test_tippecanoe_reads_the_converter_whose_time_is_reported(tmp_path):
+    """The converter is picked once, at warm-up: its output is tippecanoe's
+    input, and its time is the one the end-to-end sum reports."""
+    slow, fast = tmp_path / "slow.fgb", tmp_path / "fast.fgb"
+    converters = {
+        "slow": (["sh", "-c", f"sleep 0.4; echo slow > {slow}"], slow),
+        "fast": (["sh", "-c", f"echo fast > {fast}"], fast),
+    }
+    tip_in = tmp_path / "tip.fgb"
+    order = tmp_path / "read"
+    legs, chosen = run_e2e.converter_legs(converters, tip_in)
+    legs["tippecanoe_fgb"] = {"needs": tip_in,
+                              "argv": ["sh", "-c", f"cat {tip_in} >> {order}"]}
+    summ, _ = run_e2e.run_rounds(legs, 2, tmp_path)
+    assert chosen["tool"] == "fast"
+    assert set(order.read_text().split()) == {"fast"}
+    assert "convert:fast" in summ

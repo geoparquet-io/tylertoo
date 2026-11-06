@@ -842,7 +842,7 @@ def tippecanoe_refs(cfg, plan, steps, inputs: Path, work: Path) -> dict:
         scratch = d / "tmp"
         scratch.mkdir(exist_ok=True)
         print(f"[tippecanoe] {ds_name}: {' '.join(targs)} (this takes a while)", flush=True)
-        subprocess.run(["sync"])
+        subprocess.run(run_matrix.SYNC, check=False)
         load_before, waited = run_matrix.wait_for_quiet()
         # -t keeps tippecanoe's temporary files (GB on NZ) under --work, not /tmp.
         run = run_matrix.run_capped(

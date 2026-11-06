@@ -8,7 +8,8 @@
 # Idempotent: existing outputs are skipped (use --force to refetch), but
 # every output, new or kept, is checked against its pin in manifest.json and
 # the script fails on a mismatch (#810): `sha256` of the download (the zip for
-# Natural Earth), or for an Overture extract its exact row count and
+# Natural Earth, kept beside its parquet; the parquet's row count is checked
+# too), or for an Overture extract its exact row count and
 # `ids_sha256` (sha256 of its ids, sorted, joined with ','). An overridden
 # GPQ_OVERTURE_RELEASE has no pins, so its extracts are not checked.
 # Source of truth for dataset definitions is manifest.json.
@@ -82,6 +83,15 @@ check_sha256() {
   fi
 }
 
+check_rows() {
+  local id="$1" file="$2" want="$3" got
+  got="$(duckdb -noheader -list -c "SELECT count(*) FROM read_parquet('$file')" | tail -1)"
+  if [ "$got" != "$want" ]; then
+    echo "ERROR: [$id] $file has $got rows, manifest.json pins $want" >&2
+    exit 1
+  fi
+}
+
 check_overture_pin() {
   local id="$1" file="$2" rows="$3" ids="$4" got
   if [ "$REL" != "$PINNED_REL" ]; then
@@ -105,7 +115,16 @@ check_pin() {
       check_overture_pin "$id" "$out" \
         "$(jq -r '.expected_features' <<<"$ds")" "$(jq -r '.ids_sha256' <<<"$ds")" ;;
     http-parquet) check_sha256 "$id" "$out" "$sha" ;;
-    *) echo "   [$id] pinned by its download sha256 (checked at fetch)"; return 0 ;;
+    natural-earth)
+      # The parquet is gpio's conversion, not byte-stable: the zip kept
+      # beside it carries the pin, and the row count checks the conversion.
+      if [ ! -f "$RAW/$id.zip" ]; then
+        echo "ERROR: [$id] no $RAW/$id.zip to check $out against; refetch with --force" >&2
+        exit 1
+      fi
+      check_sha256 "$id" "$RAW/$id.zip" "$sha"
+      check_rows "$id" "$out" "$(jq -r '.expected_features' <<<"$ds")" ;;
+    *) echo "ERROR: [$id] no pin check for this source" >&2; exit 1 ;;
   esac
   echo "   pin ok [$id]"
 }
@@ -145,9 +164,9 @@ fetch_natural_earth() {
 
   echo ">> [$id] Natural Earth $url"
   curl -sL --fail --max-time 300 \
-    -o "$tmp/ne.zip" "$url"
-  check_sha256 "$id" "$tmp/ne.zip" "$sha"
-  unzip -q -o "$tmp/ne.zip" -d "$tmp"
+    -o "$RAW/$id.zip" "$url"
+  check_sha256 "$id" "$RAW/$id.zip" "$sha"
+  unzip -q -o "$RAW/$id.zip" -d "$tmp"
   gpio convert geoparquet \
     "$tmp/$shp" "$out"
   rm -rf "$tmp"

@@ -118,6 +118,9 @@ LOAD_WAIT_S = 1800
 
 
 loadavg = rm.loadavg1
+# Flushes the page cache before each run; tests swap in ["true"] (a host-wide
+# sync can block for minutes on a busy machine).
+SYNC = ["sync"]
 sha256 = rm.sha256_file
 
 
@@ -188,7 +191,7 @@ def run_cell(binary: str, src: Path, out: Path, name: str, convert_flags: list[s
         # repeat's overview with --force costs up to 3x the wall time at the
         # same CPU time (NZ: 8 s against 24 s).
         ov.unlink(missing_ok=True)
-        subprocess.run(["sync"])
+        subprocess.run(SYNC, check=False)
         load_before, waited = wait_for_quiet()
         conv = run_capped(
             convert_argv(binary, src, ov, max_zoom, out / f"{name}.convert.json", convert_flags),
@@ -214,7 +217,7 @@ def run_cell(binary: str, src: Path, out: Path, name: str, convert_flags: list[s
             report = out / f"{name}.{valve}.report.json"
             profile = out / f"{name}.{valve}.{rep}.profile.jsonl"
             profile.unlink(missing_ok=True)
-            subprocess.run(["sync"])
+            subprocess.run(SYNC, check=False)
             load_before, waited = wait_for_quiet()
             env = dict(os.environ, TYLERTOO_PROFILE_JSON=str(profile))
             exp = run_capped(
