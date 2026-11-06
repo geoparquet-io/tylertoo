@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shim: the renderers live in scripts/gen_bench_docs.py (#810).
 
-    python3 format_results.py [results.json] [--section NAME] [--dataset ID]
+    python3 format_results.py [results file, default benchmarks/results/e2e-fixtures.json] [--section NAME] [--dataset ID]
 
 Prints the tables a results file would put in the docs; the docs themselves
 are rewritten by `uv run python scripts/gen_bench_docs.py`.
@@ -19,7 +19,7 @@ import gen_bench_docs as g  # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("results", type=Path, nargs="?",
-                    default=Path(__file__).parent / "results.json")
+                    default=Path(__file__).resolve().parents[1] / "results" / "e2e-fixtures.json")
     ap.add_argument("--section", choices=[*g.SECTIONS, "per-zoom"], default=None)
     ap.add_argument("--dataset", default=None, help="for --section per-zoom")
     args = ap.parse_args()

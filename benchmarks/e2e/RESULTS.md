@@ -87,8 +87,8 @@ test (Polygon, LineString) and nothing more. Do not average these rows.
 ## 1b. The corpus tier — engine-scale datasets (#447)
 
 Everything above and below this section is the committed fixture run
-(`results.json`). This section is the committed **corpus** run
-(`corpus_results.json`): the `corpus/manifest.json` datasets at 300k–813k
+(`../results/e2e-fixtures.json`). This section is the committed **corpus** run
+(`../results/e2e-corpus.json`): the `corpus/manifest.json` datasets at 300k–813k
 features, where tiling throughput, not process start-up, is what is measured.
 Tables are generated from `e2e-corpus.json`. Reproduce with one command: `./benchmarks/e2e/run_corpus.sh`.
 
@@ -109,7 +109,7 @@ Tables are generated from `e2e-corpus.json`. Reproduce with one command: `./benc
    points run (17%). The GeoParquet→FlatGeobuf conversion stages, which are
    included in tippecanoe's end-to-end sum, were noisier: up to 9.4% on
    `polygons-portland-medium`. All computed from `wall_all_s` in
-   `corpus_results.json`. Treat every ratio as provisional until
+   `../results/e2e-corpus.json`. Treat every ratio as provisional until
    re-recorded on an idle machine.
 2. **The Overture inputs are not byte-pinned.** The manifest's pinned release
    (`2026-06-17.0`) had expired from the Overture bucket, so this run fetched
@@ -141,7 +141,7 @@ _Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RA
 <!-- /bench -->
 
 The Moldova row is the one the stale table in
-[`../overview/RESULTS.md`](../overview/RESULTS.md) recorded at **3.6×
+[`../overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (in git history) recorded at **3.6×
 slower** (pre-H3, in-memory pipeline, 5.4 GB peak RSS). The streaming
 pipeline is 8.6× faster than tippecanoe end-to-end on the same file at
 1.8 GB peak RSS.
@@ -161,7 +161,7 @@ _Run: commit 5885c17, tylertoo 0.8.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB RA
 
 Peak RSS on the matched runs, which the table above leaves out
 (`tylertoo_quality_matched.peak_rss_bytes` vs `tippecanoe_fgb` in
-`corpus_results.json`): 786 MB vs 652 MB on lines (1.20×), 927 MB vs
+`../results/e2e-corpus.json`): 786 MB vs 652 MB on lines (1.20×), 927 MB vs
 967 MB on Portland buildings (0.96×), 1916 MB vs 926 MB on Moldova
 (2.07×), and 2110 MB vs 519 MB on points (4.07× — the highest memory
 ratio anywhere in this harness, on the same zoom-mismatched run as
@@ -376,7 +376,7 @@ either side):
 | z8 | **865** | 17,406 | **17,465** |
 | z11 | 3,888 | 17,465 | 17,465 |
 
-_(from `render_parity.py --zooms 4,8,11`, not from `results.json` — counting
+_(from `render_parity.py --zooms 4,8,11`, not from `../results/e2e-fixtures.json` — counting
 features means decoding tiles.)_
 
 At z8 tylertoo's default archive carries 865 of 17,465 admin-4 polygons. That
@@ -390,7 +390,7 @@ tippecanoe simplifies too). That reaches near-parity, not identical output:
 within 2 tiles of tippecanoe's count at every zoom, within 0.4% of its
 feature count at z8 (17,406 vs 17,465) and about 5% at z4 (5,786 vs 6,102),
 and 10 of its tiles hit tylertoo's per-tile size valve (`oversized_tiles` in
-`results.json`):
+`../results/e2e-fixtures.json`):
 
 <!-- bench:e2e-fixtures/quality-matched -->
 | dataset | tylertoo default | tylertoo quality-matched | tippecanoe tile-only | tile-only speedup, matched | tylertoo tiles (default → matched) | tippecanoe tiles | archive, matched | archive ratio |
@@ -477,10 +477,10 @@ This table is the defaults run. **tylertoo loses the memory column on the
 only dataset that matters** — 760 MB against tippecanoe's 413 MB on
 `madagascar-adm4` at defaults (1.8×), and 835 MB against 413 MB for the
 quality-matched run (2.0×; `tylertoo_quality_matched.peak_rss_bytes` in
-`results.json`), which is the run the parity claim uses. tylertoo's export
+`../results/e2e-fixtures.json`), which is the run the parity claim uses. tylertoo's export
 concurrency is `--partition-wave auto`, which sizes itself against available
 RAM, so this figure moves with machine state (from an earlier, uncommitted
-run of the same harness on the same machine, not in `results.json`: 457 MB
+run of the same harness on the same machine, not in `../results/e2e-fixtures.json`: 457 MB
 at defaults). Pin it with an explicit `--partition-wave N` before drawing
 conclusions. On the tiny
 fixtures tylertoo wins the column, 28 MB to 139 MB, because tippecanoe
@@ -607,7 +607,7 @@ _Run: commit 044360d, tylertoo 0.11.0, tippecanoe v2.79.0, Apple M3 Pro, 18 GB R
 <!-- /bench -->
 
 Between runs, from an earlier, uncommitted run that is **not** in
-`results.json` (so these figures cannot be regenerated from this record):
+`../results/e2e-fixtures.json` (so these figures cannot be regenerated from this record):
 an hour before the recorded run, on the same idle laptop, tylertoo's
 `madagascar-adm4` median was 2.34 s against the recorded 1.61 s, tippecanoe's
 was 23.93 s against 20.05 s, and the defaults ratio was 10.4× against 12.5×.
@@ -619,7 +619,7 @@ row here should be quoted to two significant figures.
 
 - **Anything above 813k features.** §1b's corpus tier covers 300k–813k
   features (and settles the Moldova question the archived table in
-  [`../overview/RESULTS.md`](../overview/RESULTS.md) left open); a
+  [`../overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (in git history) left open); a
   multi-million-feature run via `--dataset` (e.g. `lines-oregon-large`,
   `corpus/fetch.sh --large`) is still unmeasured.
 - **Points at fixture scale.** The corpus tier measures a 598k-point dataset

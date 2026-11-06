@@ -36,7 +36,8 @@ Standard library only. What one `run` does, cell by cell:
             the CPU other processes used while it ran and the peak size of
             its scratch, then deletes its outputs (.bench-out/), whatever
             the outcome, and runs `sync`. Only the result row, the profile
-            JSONL and the log (stdout + `time -v`) are kept. A run stops at
+            JSONL and the log (stdout + `time -v`) are kept, plus the output
+            file of a `keep_output = true` cell (<cell>/<tag>.<name>). A run stops at
             `wall_s`, `rss_gib` or `scratch_gib` (status TIMEOUT, RSS_CAP,
             SCRATCH_CAP), and the whole run stops before any command when
             the disk has less than `min_free_gb` free.
@@ -116,7 +117,7 @@ class ManifestError(ValueError):
 CELL_KEYS = {
     "label", "tickets", "input", "inputs", "command", "args", "zoom", "flags",
     "output", "setup", "pairs", "allocator", "wall_s", "rss_gib", "memory_max",
-    "serve", "env", "heavy", "notes", "scratch_gib", "watch", "warmup",
+    "serve", "env", "heavy", "notes", "scratch_gib", "watch", "warmup", "keep_output",
 }
 INPUT_KEYS = {"file", "path", "url", "sha256", "bytes", "rows", "geometry", "notes"}
 
@@ -646,6 +647,8 @@ def read_profile(path: Path) -> dict:
                 "threads": ex.get("threads"),
                 "phases": phase_fields(ex.get("rss_sampler")),
                 "serial_secs": ex.get("serial_secs"),
+                "levels": [{"zoom": z.get("zoom"), "wave_width": z.get("wave_width"),
+                            "spill_bytes": z.get("spill_bytes")} for z in ex.get("per_zoom", [])],
             }
         else:
             out["convert"] = {
@@ -798,6 +801,18 @@ def scope_memory(pid: int) -> dict | None:
         return None
     return {"scope": path, "events": {k: int(v) for k, v in events.items()},
             "peak_mib": round(int(peak) / (1 << 20), 1) if peak else None}
+
+
+def keep_output(out_dir: Path, output: str, cdir: Path, tag: str) -> Path | None:
+    """Move a cell's output file (a `keep_output` cell) out of the run's
+    scratch to <cell>/<tag>.<name> before the scratch is deleted."""
+    src = out_dir / output
+    if not src.is_file():
+        return None
+    cdir.mkdir(parents=True, exist_ok=True)
+    dst = cdir / f"{tag}.{src.name}"
+    shutil.move(src, dst)
+    return dst
 
 
 def output_digest(out_dir: Path, output: str) -> dict:
@@ -1004,6 +1019,9 @@ class Runner:
             # (our part still in the page cache at exit is not counted).
             res["device_write_mib"] = round((sectors_written(self.disk) - w0) * 512 / (1 << 20), 1)
             output = output_digest(out, cell["output"])
+            if cell.get("keep_output"):  # e.g. a showcase archive to render or ship
+                kept = keep_output(out, cell["output"], cdir, tag)
+                output["kept"] = str(kept) if kept else None
         finally:
             # Only the result row, the profile JSONL and the log survive a run.
             shutil.rmtree(out, ignore_errors=True)

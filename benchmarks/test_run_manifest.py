@@ -412,3 +412,39 @@ def test_timed_records_cpu_and_effective_cores(tmp_path):
     assert res["status"] == "ok"
     assert res["cpu_s"] is not None and res["effective_cores"] is not None
     assert res["profile"] == {}  # no TYLERTOO_PROFILE_JSON written by sh
+
+
+def test_profile_keeps_per_zoom_wave_width_and_spill(tmp_path):
+    export = {"phase": "export", "export": {"per_zoom": [
+        {"zoom": 0, "tiles": 1, "wave_width": 4, "spill_bytes": 10},
+        {"zoom": 1, "tiles": 4}]}}
+    p = tmp_path / "p.jsonl"
+    p.write_text(json.dumps(export) + "\n")
+    ex = rm.read_profile(p)["export"]
+    assert ex["levels"] == [{"zoom": 0, "wave_width": 4, "spill_bytes": 10},
+                            {"zoom": 1, "wave_width": None, "spill_bytes": None}]
+    assert ex["tiles"] == 5  # noqa: PLR2004
+
+
+def test_keep_output_copies_the_archive_out_of_scratch(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "o.pmtiles").write_bytes(b"PM")
+    kept = rm.keep_output(out, "o.pmtiles", tmp_path / "cell", "head-r0")
+    assert kept.read_bytes() == b"PM" and kept.parent == tmp_path / "cell"
+    assert rm.keep_output(out, "missing", tmp_path / "cell", "x") is None
+
+
+def test_keep_output_is_a_cell_key(tmp_path):
+    p = _write(tmp_path, f"""
+[inputs.a]
+file = "a.parquet"
+sha256 = "{SHA}"
+[cells.c]
+input = "a"
+command = "tiles"
+args = []
+output = "o"
+keep_output = true
+""")
+    assert rm.load_manifest(p)["cells"]["c"]["keep_output"] is True
