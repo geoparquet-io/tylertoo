@@ -63,7 +63,11 @@ _BOUNDARIES += [
     for k in ("simplify_factor", "drop_gamma")
     for v in (math.nan, math.inf, -math.inf)
 ]
-_BOUNDARIES += [("simplify_factor", 0.0), ("simplify_factor", -1.0), ("drop_gamma", 1.0)]
+_BOUNDARIES += [
+    ("simplify_factor", 0.0),
+    ("simplify_factor", -1.0),
+    ("drop_gamma", 1.0),
+]
 
 
 def _outcome(keyword: str, value: object) -> BaseException:
