@@ -225,6 +225,15 @@ impl From<arrow_schema::ArrowError> for InputError {
     }
 }
 
+impl crate::error::Classify for InputError {
+    /// An input the read boundary refused as hostile is
+    /// [`ErrorKind::Input`](crate::error::ErrorKind::Input); any other read
+    /// failure is a failed run.
+    fn kind(&self) -> crate::error::ErrorKind {
+        crate::error::fallback_kind(self)
+    }
+}
+
 #[doc(hidden)]
 impl From<tylertoo_io::Error> for InputError {
     fn from(e: tylertoo_io::Error) -> Self {

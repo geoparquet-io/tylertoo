@@ -1198,7 +1198,7 @@ impl crate::error::Classify for ExportError {
             | ExportError::UnsupportedProperty { .. }
             | ExportError::CoveringProperty { .. }
             | ExportError::PropertyRequiredByKnob { .. } => ErrorKind::Input,
-            _ => ErrorKind::Runtime,
+            _ => crate::error::fallback_kind(self),
         }
     }
 }
@@ -5259,8 +5259,11 @@ fn covering_batch_bboxes(
     names: &[String; 4],
     crs: Crs,
 ) -> Result<Option<Vec<Option<TileBounds>>>, ExportError> {
-    let not_covering =
-        || crate::Error::GeoParquetRead(format!("bbox covering {column:?} is not an f64 struct"));
+    let not_covering = || {
+        crate::Error::from(crate::GeoParquetReadError::CoveringNotF64Struct {
+            column: column.to_string(),
+        })
+    };
     let strukt = batch
         .column_by_name(column)
         .and_then(|c| c.as_struct_opt())
@@ -5332,7 +5335,7 @@ fn decode_batch_bboxes(
     let geom_field = schema.field(geom_idx).clone();
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+            .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
     let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
     extract_geometries_from_array(garr.as_ref(), &mut geoms, diagnostics)?;
     let bboxes = geoms
@@ -5844,7 +5847,7 @@ fn decode_batch_geometries(
     let geom_field = schema.field(geom_idx).clone();
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+            .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
     let chunks: Vec<Vec<Geometry<f64>>> = collect_chunks(batch.num_rows())
         .map(|range| {
             ExportTimers::time(&timers.decode, || {
@@ -6064,12 +6067,9 @@ fn collect_member_chunk(
     };
     for (i, items) in items.iter_mut().enumerate() {
         let row = first + i;
-        let source_row = input
-            .locator
-            .global_row(input.first_read + row)
-            .ok_or_else(|| {
-                crate::Error::GeoParquetRead("export read exceeded its selected row domain".into())
-            })?;
+        let source_row = input.locator.global_row(input.first_read + row).ok_or(
+            crate::Error::GeoParquetRead(crate::GeoParquetReadError::RowDomainExceeded),
+        )?;
         let (props, id) = attrs.row(i)?;
         if let Some(id) = id {
             out.losses.push((source_row, id));
@@ -8276,7 +8276,7 @@ fn decode_batch(
     // Decode geometries.
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+            .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
     let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
     extract_geometries_from_array(
         garr.as_ref(),
@@ -9423,8 +9423,11 @@ fn detect_crs(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Crs, ExportError> {
     let file = File::open(path).map_err(crate::Error::Io)?;
-    let metadata = tylertoo_io::read_parquet_metadata(&file)
-        .map_err(|e| crate::Error::GeoParquetRead(e.to_string()))?;
+    let metadata = tylertoo_io::read_parquet_metadata(&file).map_err(|e| {
+        crate::Error::from(crate::GeoParquetReadError::Schema {
+            message: e.to_string(),
+        })
+    })?;
     let descriptor = crate::resolved_schema::ResolvedSchema::from_metadata(&metadata)?;
     crs_from_descriptor(&descriptor, path, diagnostics)
 }

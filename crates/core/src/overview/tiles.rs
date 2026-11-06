@@ -728,7 +728,7 @@ impl crate::error::Classify for TilesError {
             TilesError::Config(_) => crate::error::ErrorKind::Usage,
             TilesError::Convert(e) => e.kind(),
             TilesError::Export(e) => e.kind(),
-            _ => crate::error::ErrorKind::Runtime,
+            _ => crate::error::fallback_kind(self),
         }
     }
 }

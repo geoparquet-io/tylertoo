@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::{Error, Result};
+use crate::{GeoParquetReadError, Result};
 
 /// CRS information extracted from GeoParquet metadata.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -319,10 +319,10 @@ pub(crate) fn is_wgs84_projjson(projjson: &Value) -> bool {
 /// malformed.
 pub fn extract_crs(path: &Path, diagnostics: &crate::diagnostics::Diagnostics) -> Result<CrsInfo> {
     let source = crate::input_set::ConvertSource::resolve_path(path)
-        .map_err(|e| Error::GeoParquetRead(e.to_string()))?;
+        .map_err(|e| GeoParquetReadError::Input(Box::new(e)))?;
     let schema = source
         .resolved_schema()
-        .map_err(|e| Error::GeoParquetRead(e.to_string()))?;
+        .map_err(|e| GeoParquetReadError::Input(Box::new(e)))?;
     schema.record_diagnostics(diagnostics);
     Ok(schema.crs_info().clone())
 }
@@ -375,13 +375,11 @@ pub fn validate_wgs84(path: &Path) -> Result<()> {
 
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
 
-    Err(Error::GeoParquetRead(format!(
-        "Input file uses CRS {}.\n\
-         tylertoo requires WGS84 (EPSG:4326) coordinates.\n\n\
-         Reproject with geoparquet-io:\n  \
-         gpio convert reproject {} reprojected.parquet -d EPSG:4326",
-        crs_desc, filename
-    )))
+    Err(GeoParquetReadError::NotWgs84 {
+        crs: crs_desc,
+        file: filename.into_owned(),
+    }
+    .into())
 }
 #[cfg(test)]
 mod tests {
@@ -902,7 +900,7 @@ mod tests {
             let err =
                 crs_info_from_kv_metadata(Some(&kv), &crate::diagnostics::Diagnostics::default());
             assert!(
-                matches!(err, Err(Error::GeoParquetRead(_))),
+                matches!(err, Err(crate::Error::GeoParquetRead(_))),
                 "{geo}: {err:?}"
             );
         }

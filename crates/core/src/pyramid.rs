@@ -130,7 +130,7 @@ pub enum PyramidError {
     Config(#[from] crate::overview::config::ConfigError),
     /// A band convert option, or the publication metadata, refused.
     #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
+    InvalidConfig(crate::InvalidConfigError),
     /// The output cannot be written (#452: checked before any work).
     #[error(transparent)]
     Output(#[from] crate::atomic_output::OutputNotWritable),
@@ -153,7 +153,7 @@ impl crate::error::Classify for PyramidError {
             PyramidError::BandConvert { error, .. } => error.kind(),
             PyramidError::BandExport { error, .. } => error.kind(),
             PyramidError::Archive(error) => error.kind(),
-            _ => ErrorKind::Runtime,
+            _ => crate::error::fallback_kind(self),
         }
     }
 }
@@ -1832,9 +1832,9 @@ impl PyramidOptions {
         self.metadata
             .check_size()
             .map_err(crate::overview::config::ConfigError::MetadataTooLarge)?;
-        self.convert
-            .validate()
-            .map_err(|e| PyramidError::InvalidConfig(format!("band convert options: {e}")))?;
+        self.convert.validate().map_err(|e| {
+            PyramidError::InvalidConfig(crate::InvalidConfigError::BandConvertOptions(Box::new(e)))
+        })?;
         self.export.validate()?;
         check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
         Ok(())
@@ -1952,7 +1952,9 @@ fn build_pyramid_validated(
             collect_band_metadata(&mut collector, band)?;
         }
     }
-    collector.resolve().map_err(PyramidError::InvalidConfig)?;
+    collector.resolve().map_err(|message| {
+        PyramidError::InvalidConfig(crate::InvalidConfigError::MetadataTooLarge { message })
+    })?;
 
     // Keeps every intermediate alive for the merge and unlinks them on drop —
     // including the early-return paths below. TempPaths, not open
@@ -2088,7 +2090,9 @@ fn collect_band_metadata(
     };
     collector
         .add_json(&band_label(band), &root)
-        .map_err(PyramidError::InvalidConfig)?;
+        .map_err(|message| {
+            PyramidError::InvalidConfig(crate::InvalidConfigError::MetadataTooLarge { message })
+        })?;
     Ok(true)
 }
 
@@ -2200,7 +2204,9 @@ fn merge_prepared_bands(
             bands_without_metadata.push(band_label(band));
         }
     }
-    let publication = collector.resolve().map_err(PyramidError::InvalidConfig)?;
+    let publication = collector.resolve().map_err(|message| {
+        PyramidError::InvalidConfig(crate::InvalidConfigError::MetadataTooLarge { message })
+    })?;
     collector.log_resolution();
 
     // StreamingPmtilesWriter, not PmtilesWriter: it spools tile bytes to a temp

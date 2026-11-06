@@ -19,7 +19,7 @@ use geoarrow_array::cast::AsGeoArrowArray;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
 
 use crate::wkb_column::check_wkb_column;
-use crate::{Error, Result};
+use crate::{GeoParquetReadError, Result};
 
 /// Resolve a path to a list of parquet files.
 ///
@@ -39,26 +39,25 @@ pub fn resolve_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
     }
 
     if path.is_dir() {
-        let files = crate::input_set::list_parquet_files(path).map_err(|e| {
-            Error::GeoParquetRead(format!(
-                "Failed to read directory {}: {}",
-                path.display(),
-                e
-            ))
+        let files = crate::input_set::list_parquet_files(path).map_err(|error| {
+            GeoParquetReadError::ReadDirectory {
+                path: path.to_path_buf(),
+                error: Box::new(error),
+            }
         })?;
         if files.is_empty() {
-            return Err(Error::GeoParquetRead(format!(
-                "No .parquet files found in directory: {}",
-                path.display()
-            )));
+            return Err(GeoParquetReadError::NoParquetFiles {
+                path: path.to_path_buf(),
+            }
+            .into());
         }
         return Ok(files);
     }
 
-    Err(Error::GeoParquetRead(format!(
-        "Path does not exist: {}",
-        path.display()
-    )))
+    Err(GeoParquetReadError::PathNotFound {
+        path: path.to_path_buf(),
+    }
+    .into())
 }
 
 /// Extract geometries from a GeoArrow array into a Vec.
@@ -162,10 +161,10 @@ pub(crate) fn visit_geoarrow_array<V: GeoArrowVisitor>(
         GeoArrowType::Wkt(_) => visitor.visit(array.as_wkt::<i32>()),
         GeoArrowType::LargeWkt(_) => visitor.visit(array.as_wkt::<i64>()),
         GeoArrowType::WktView(_) => visitor.visit(array.as_wkt_view()),
-        _ => Err(Error::GeoParquetRead(format!(
-            "Unsupported geometry type: {:?}",
-            array.data_type()
-        ))),
+        _ => Err(GeoParquetReadError::UnsupportedGeometryType {
+            data_type: format!("{:?}", array.data_type()),
+        }
+        .into()),
     }
 }
 
@@ -174,8 +173,13 @@ pub(crate) fn visit_geoarrow_array<V: GeoArrowVisitor>(
 /// without a depth limit, so a single crafted value would otherwise abort the
 /// process (see [`crate::wkb_column`]).
 fn check_wkb_array(wkb: &dyn GeoArrowArray) -> Result<()> {
-    check_wkb_column(wkb.to_array_ref().as_ref())
-        .map_err(|(i, e)| Error::GeoParquetRead(format!("Invalid geometry at index {i}: {e}")))
+    check_wkb_column(wkb.to_array_ref().as_ref()).map_err(|(index, e)| {
+        GeoParquetReadError::InvalidGeometry {
+            index,
+            message: e.to_string(),
+        }
+        .into()
+    })
 }
 
 /// Fuzzing hook: decode one WKB value the way a GeoParquet WKB column is
@@ -392,9 +396,11 @@ impl GeoArrowVisitor for ExtractGeometries<'_> {
         for (i, item) in accessor.iter().enumerate() {
             match item {
                 Some(geom_result) => {
-                    let geom_trait = geom_result.map_err(|e| {
-                        Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e))
-                    })?;
+                    let geom_trait =
+                        geom_result.map_err(|e| GeoParquetReadError::InvalidGeometry {
+                            index: i,
+                            message: e.to_string(),
+                        })?;
                     self.output
                         .push(to_finite_geometry(&geom_trait, self.diagnostics));
                 }

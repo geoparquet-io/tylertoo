@@ -6,7 +6,7 @@ use crate::covering::{CoveringSpec, RowGroupBounds};
 use crate::diagnostics::{CoveringWarning, CrsWarning, Diagnostic, Diagnostics};
 use crate::overview::level::Crs;
 use crate::quality::{is_wgs84_projjson, CrsInfo};
-use crate::{Error, Result};
+use crate::{GeoParquetReadError, Result};
 use arrow_schema::{DataType, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -181,8 +181,11 @@ impl ResolvedSchema {
     /// # Errors
     /// Returns an error for a malformed descriptor, schema or geo metadata.
     pub fn from_metadata(metadata: &ParquetMetaData) -> Result<Self> {
-        let reader = tylertoo_io::reader_metadata(Arc::new(metadata.clone()))
-            .map_err(|e| Error::GeoParquetRead(e.to_string()))?;
+        let reader = tylertoo_io::reader_metadata(Arc::new(metadata.clone())).map_err(|e| {
+            GeoParquetReadError::Schema {
+                message: e.to_string(),
+            }
+        })?;
         Self::from_parquet(reader.schema(), metadata)
     }
 
@@ -199,16 +202,14 @@ impl ResolvedSchema {
         let Some(json) = persisted else {
             return Self::resolve_with(schema, Some(metadata));
         };
-        let facts: SchemaFacts = serde_json::from_str(json)
-            .map_err(|e| Error::GeoParquetRead(format!("invalid resolved schema: {e}")))?;
+        let facts: SchemaFacts =
+            serde_json::from_str(json).map_err(GeoParquetReadError::ResolvedSchemaJson)?;
         // The resolver owns every fact, including fallback selection and
         // physical indices. A cached footer is a claim to verify against it,
         // never a second path for constructing a descriptor.
         let resolved = Self::resolve_with(schema, Some(metadata))?;
         if facts != resolved.facts {
-            return Err(Error::GeoParquetRead(
-                "resolved schema disagrees with the Parquet footer".into(),
-            ));
+            return Err(GeoParquetReadError::ResolvedSchemaMismatch.into());
         }
         Ok(resolved)
     }
@@ -225,7 +226,8 @@ impl ResolvedSchema {
     /// # Errors
     /// Returns an error if serialization fails.
     pub(crate) fn footer_json(&self) -> Result<String> {
-        serde_json::to_string(&self.facts).map_err(|e| Error::GeoParquetRead(e.to_string()))
+        serde_json::to_string(&self.facts)
+            .map_err(|e| GeoParquetReadError::ResolvedSchemaEncode(e).into())
     }
     /// WKB geometry fields whose byte values need structural validation before encoding.
     pub(crate) fn wkb_columns(&self) -> Vec<(usize, String)> {
@@ -754,8 +756,8 @@ pub(crate) fn parse_covering_metadata(
     geo_json: &str,
     geom_column: Option<&str>,
 ) -> Result<Option<CoveringSpec>> {
-    let metadata: GeoMetadata = serde_json::from_str(geo_json)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {}", e)))?;
+    let metadata: GeoMetadata =
+        serde_json::from_str(geo_json).map_err(GeoParquetReadError::GeoMetadataJson)?;
 
     let name = geom_column.or(metadata.primary_column.as_deref());
     let Some(column) = name.and_then(|n| metadata.columns.get(n)) else {
@@ -896,14 +898,9 @@ fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnost
 /// Parse a `geo` key's JSON. Invalid JSON and valid JSON that is not an
 /// object (`[]`, `null`, `42`) are the same hard error (#708).
 pub(crate) fn parse_geo_json(json: &str) -> Result<Value> {
-    let v: Value = serde_json::from_str(json)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {e}")))?;
+    let v: Value = serde_json::from_str(json).map_err(GeoParquetReadError::GeoMetadataJson)?;
     if !v.is_object() {
-        return Err(Error::GeoParquetRead(
-            "the 'geo' metadata is valid JSON but not an object; rewrite the file's \
-             GeoParquet metadata (e.g. re-save it with `gpio convert`)"
-                .to_string(),
-        ));
+        return Err(GeoParquetReadError::GeoMetadataNotObject.into());
     }
     Ok(v)
 }

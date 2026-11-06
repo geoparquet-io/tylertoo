@@ -39,7 +39,7 @@ use tylertoo_io::KeyValue;
 
 use tylertoo_core::internal::overview::check::validate_file;
 use tylertoo_core::internal::overview::convert::{
-    convert_to_overviews, ConvertError, ConvertOptions, LevelPlan,
+    convert_to_overviews, ConvertError, ConvertOptions, InvalidOption, LevelPlan,
 };
 use tylertoo_core::internal::overview::export::{export_pmtiles, ExportError, ExportOptions};
 use tylertoo_core::internal::overview::level::Mode;
@@ -1880,7 +1880,11 @@ fn entry_zoom_missing_column_is_rejected() {
     )));
     let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
     assert!(
-        matches!(err, ConvertError::InvalidConfig(ref m) if m.contains("nope")),
+        matches!(
+            err,
+            ConvertError::InvalidConfig(InvalidOption::EntryZoomColumnMissing { ref column, .. })
+                if column == "nope"
+        ),
         "got {err}"
     );
 }
@@ -1900,9 +1904,10 @@ fn entry_zoom_rungs_matching_no_value_are_rejected_by_name() {
         EntryZoomKind::Explicit(vec![(999.0, 2), (42.5, 4)]),
     )));
     let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
-    let ConvertError::InvalidConfig(m) = &err else {
+    let ConvertError::InvalidConfig(reason @ InvalidOption::EntryZoomLadder { .. }) = &err else {
         panic!("got {err}");
     };
+    let m = reason.to_string();
     assert!(!m.contains("named no values"), "{m}");
     for want in ["magnitude", "999", "42.5"] {
         assert!(m.contains(want), "{want} missing from {m}");

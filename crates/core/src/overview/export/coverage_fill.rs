@@ -1869,8 +1869,8 @@ pub(super) fn build_fill_map(
                 None => reader.read_level_batched(level_idx, None, super::EXPORT_BATCH_SIZE)?,
             };
             for batch in batches {
-                let batch = batch
-                    .map_err(|e| crate::Error::GeoParquetRead(format!("fill seed read: {e}")))?;
+                let batch =
+                    batch.map_err(|e| crate::GeoParquetReadError::decode("fill seed read", e))?;
                 if tx.send(batch).is_err() {
                     return Ok(()); // the consumer stopped (error path)
                 }

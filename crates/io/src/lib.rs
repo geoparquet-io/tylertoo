@@ -96,6 +96,10 @@ pub enum Error {
     /// An IPC footer declares a block outside the file.
     #[error("refusing a malformed Arrow IPC footer: {0}")]
     HostileIpcFooter(String),
+    /// A page header reads past the end of the file (#789): no honest one
+    /// does, and a crafted one costs minutes of CPU there.
+    #[error("unexpected end of file")]
+    HostilePageHeader,
 }
 
 /// Fixture construction only, excluded from the shipping API baseline.

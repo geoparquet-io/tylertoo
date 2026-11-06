@@ -57,6 +57,17 @@ pub fn kind_of(e: &(dyn StdError + 'static)) -> Option<ErrorKind> {
         crate::overview::export::ExportError,
         crate::overview::tiles::TilesError,
         crate::decode::DecodeError,
+        crate::input::InputError,
     );
     None
+}
+
+/// The kind of a failure none of this crate's own variants classifies: an
+/// input the read boundary refused as hostile (#789's page header) is the
+/// input's problem, anything else a failed run.
+pub(crate) fn fallback_kind(e: &(dyn StdError + 'static)) -> ErrorKind {
+    match tylertoo_io::input_error(e) {
+        Some(tylertoo_io::Error::HostilePageHeader) => ErrorKind::Input,
+        _ => ErrorKind::Runtime,
+    }
 }

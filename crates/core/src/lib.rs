@@ -148,8 +148,8 @@ pub(crate) mod wkb_column;
 // Convert: GeoParquet -> overview GeoParquet.
 pub use overview::convert::{
     convert_to_overviews, write_convert_plan, ClassRanking, ConvertError, ConvertOptions,
-    ConvertReport, GeneralizationOverrides, LevelPlan, LevelReport, OutOfRangeExemplar,
-    PlanLevelReport, PlanReport, RepresentationBand, SkippedLevelReport,
+    ConvertReport, GeneralizationOverrides, InvalidOption, LevelPlan, LevelReport,
+    OutOfRangeExemplar, PlanLevelReport, PlanReport, RepresentationBand, SkippedLevelReport,
 };
 pub use overview::{
     assign::{AssignConfig, BudgetKinds, DensityBudgetConfig, FeatureKind, SortDirection},
@@ -312,8 +312,9 @@ pub enum Error {
     /// Source loss accounting failed.
     #[error(transparent)]
     Accounting(#[from] crate::diagnostics::AccountingError),
+    /// A GeoParquet input could not be read; the payload says why.
     #[error("Failed to read GeoParquet file: {0}")]
-    GeoParquetRead(String),
+    GeoParquetRead(GeoParquetReadError),
 
     /// Writing a PMTiles archive failed (#438).
     #[error("Failed to write PMTiles: {0}")]
@@ -334,8 +335,9 @@ pub enum Error {
         error: Box<Error>,
     },
 
+    /// A refused bounds spec, or a refused set of archives to merge.
     #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
+    InvalidConfig(InvalidConfigError),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -374,8 +376,331 @@ impl error::Classify for Error {
         match self {
             Error::InvalidConfig(_) => error::ErrorKind::Usage,
             Error::At { error, .. } => error.kind(),
-            _ => error::ErrorKind::Runtime,
+            _ => error::fallback_kind(self),
         }
+    }
+}
+
+/// Why a GeoParquet input could not be read: the payload of
+/// [`Error::GeoParquetRead`]. A wrapped third-party error is kept as its
+/// message.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum GeoParquetReadError {
+    /// The input path does not exist.
+    #[error("Path does not exist: {}", path.display())]
+    #[non_exhaustive]
+    PathNotFound {
+        /// The path as given.
+        path: std::path::PathBuf,
+    },
+    /// A directory input holds no `.parquet` file.
+    #[error("No .parquet files found in directory: {}", path.display())]
+    #[non_exhaustive]
+    NoParquetFiles {
+        /// The directory.
+        path: std::path::PathBuf,
+    },
+    /// A directory input could not be listed.
+    #[error("Failed to read directory {}: {error}", path.display())]
+    #[non_exhaustive]
+    ReadDirectory {
+        /// The directory.
+        path: std::path::PathBuf,
+        /// The listing error.
+        error: Box<input::InputError>,
+    },
+    /// The file could not be opened.
+    #[error("Failed to open {}: {error}", path.display())]
+    #[non_exhaustive]
+    Open {
+        /// The file.
+        path: std::path::PathBuf,
+        /// The open error.
+        error: std::io::Error,
+    },
+    /// The file's Parquet footer could not be read.
+    #[error("Failed to read {}: {message}", path.display())]
+    #[non_exhaustive]
+    Footer {
+        /// The file.
+        path: std::path::PathBuf,
+        /// The reader's message.
+        message: String,
+    },
+    /// The input could not be resolved or its schema read.
+    #[error("{0}")]
+    Input(Box<input::InputError>),
+    /// The footer's Arrow schema could not be decoded.
+    #[error("{message}")]
+    #[non_exhaustive]
+    Schema {
+        /// The reader's message.
+        message: String,
+    },
+    /// The geometry column's Arrow type is not a GeoArrow geometry type.
+    #[error("Unsupported geometry type: {data_type}")]
+    #[non_exhaustive]
+    UnsupportedGeometryType {
+        /// The column's Arrow data type, as `Debug` prints it.
+        data_type: String,
+    },
+    /// One geometry value is malformed.
+    #[error("Invalid geometry at index {index}: {message}")]
+    #[non_exhaustive]
+    InvalidGeometry {
+        /// Row index within the batch or chunk.
+        index: usize,
+        /// The decoder's message.
+        message: String,
+    },
+    /// A batch or its geometry column could not be decoded.
+    #[error("{stage}: {message}")]
+    #[non_exhaustive]
+    Decode {
+        /// What was being decoded (`geometry decode`, `fill seed read`, …).
+        stage: &'static str,
+        /// The decoder's message.
+        message: String,
+    },
+    /// The `geo` metadata is not valid JSON.
+    #[error("Failed to parse geo metadata JSON: {0}")]
+    GeoMetadataJson(serde_json::Error),
+    /// The `geo` metadata is JSON but not an object.
+    #[error(
+        "the 'geo' metadata is valid JSON but not an object; rewrite the file's \
+         GeoParquet metadata (e.g. re-save it with `gpio convert`)"
+    )]
+    GeoMetadataNotObject,
+    /// The persisted resolved-schema footer is not valid JSON.
+    #[error("invalid resolved schema: {0}")]
+    ResolvedSchemaJson(serde_json::Error),
+    /// The persisted resolved-schema footer disagrees with the file.
+    #[error("resolved schema disagrees with the Parquet footer")]
+    ResolvedSchemaMismatch,
+    /// The resolved schema could not be serialized for the output footer.
+    #[error("{0}")]
+    ResolvedSchemaEncode(serde_json::Error),
+    /// A bbox covering column is not a struct.
+    #[error("bbox covering column is not a struct")]
+    CoveringNotStruct,
+    /// A bbox covering child field is not `Float64`.
+    #[error("bbox covering field {field} is not Float64")]
+    #[non_exhaustive]
+    CoveringFieldNotFloat64 {
+        /// The child field.
+        field: String,
+    },
+    /// A bbox covering column is not a struct of `f64` fields.
+    #[error("bbox covering {column:?} is not an f64 struct")]
+    #[non_exhaustive]
+    CoveringNotF64Struct {
+        /// The covering column.
+        column: String,
+    },
+    /// The input is not in WGS84.
+    #[error(
+        "Input file uses CRS {crs}.\n\
+         tylertoo requires WGS84 (EPSG:4326) coordinates.\n\n\
+         Reproject with geoparquet-io:\n  \
+         gpio convert reproject {file} reprojected.parquet -d EPSG:4326"
+    )]
+    #[non_exhaustive]
+    NotWgs84 {
+        /// The CRS, as the message names it.
+        crs: String,
+        /// The input's file name.
+        file: String,
+    },
+    /// An export read returned a row outside its selected row domain
+    /// (an internal invariant).
+    #[error("export read exceeded its selected row domain")]
+    RowDomainExceeded,
+    /// `error`, in the input rows `start..end` (#460: a decode error's own
+    /// index is chunk-local).
+    #[error("rows {start}..{end}: {}", rows_inner(error))]
+    #[non_exhaustive]
+    AtRows {
+        /// First global row of the chunk.
+        start: usize,
+        /// One past its last row.
+        end: usize,
+        /// The failure.
+        error: Box<Error>,
+    },
+}
+
+/// What [`Error::InvalidConfig`] refused: a bounds spec, or a set of
+/// archives to merge.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum InvalidConfigError {
+    /// A `z/x/y` tile spec past zoom 31.
+    #[error("Invalid tile '{input}': zoom {zoom} is past the maximum of 31")]
+    #[non_exhaustive]
+    TileZoomTooHigh {
+        /// The spec as given.
+        input: String,
+        /// Its zoom.
+        zoom: u8,
+    },
+    /// A `z/x/y` tile spec whose `x` or `y` is outside the zoom's tiles.
+    #[error("Invalid tile '{input}': x and y must be below {tiles} at zoom {zoom}")]
+    #[non_exhaustive]
+    TileOutOfRange {
+        /// The spec as given.
+        input: String,
+        /// Its zoom.
+        zoom: u8,
+        /// Tiles per axis at that zoom.
+        tiles: u64,
+    },
+    /// A bounds spec that is neither `z/x/y` nor four numbers.
+    #[error("Invalid bounds format '{input}'. Expected 'z/x/y' or 'xmin,ymin,xmax,ymax'")]
+    #[non_exhaustive]
+    BoundsFormat {
+        /// The spec as given.
+        input: String,
+    },
+    /// One bounds value is not a number.
+    #[error("Invalid {name} value '{value}' in bounds")]
+    #[non_exhaustive]
+    BoundsValue {
+        /// `xmin`, `ymin`, `xmax` or `ymax`.
+        name: &'static str,
+        /// The value as given.
+        value: String,
+    },
+    /// A bounds value is not finite.
+    #[error("Invalid bounds '{input}': every value must be a finite number")]
+    #[non_exhaustive]
+    BoundsNotFinite {
+        /// The spec as given.
+        input: String,
+    },
+    /// A bounds minimum is not below its maximum.
+    #[error("{axis}min ({min}) must be less than {axis}max ({max})")]
+    #[non_exhaustive]
+    BoundsInverted {
+        /// `x` or `y`.
+        axis: &'static str,
+        /// The minimum.
+        min: f64,
+        /// The maximum.
+        max: f64,
+    },
+    /// `merge` was given no archive.
+    #[error("merge needs at least one input archive")]
+    MergeNoInputs,
+    /// Two merge inputs hold different tile types.
+    #[error(
+        "inputs disagree on tile type: {} holds {first_type:?} but {} holds {other_type:?}; \
+         merge copies tile bodies verbatim under one header and cannot describe both",
+        first.display(),
+        other.display()
+    )]
+    #[non_exhaustive]
+    MergeTileTypeMismatch {
+        /// The first input.
+        first: std::path::PathBuf,
+        /// Its tile type.
+        first_type: TileType,
+        /// The input that disagrees.
+        other: std::path::PathBuf,
+        /// Its tile type.
+        other_type: TileType,
+    },
+    /// Two merge inputs use different tile compressions.
+    #[error(
+        "inputs disagree on tile compression: {} is {first_compression:?} but {} is \
+         {other_compression:?}; merge copies tile bodies verbatim, so a mixed set would \
+         mislabel every tile of one of them — re-tile the odd one out",
+        first.display(),
+        other.display()
+    )]
+    #[non_exhaustive]
+    MergeCompressionMismatch {
+        /// The first input.
+        first: std::path::PathBuf,
+        /// Its tile compression.
+        first_compression: Compression,
+        /// The input that disagrees.
+        other: std::path::PathBuf,
+        /// Its tile compression.
+        other_compression: Compression,
+    },
+    /// The merge inputs are not MVT archives.
+    #[error("{}: tile type is {tile_type:?}, but merge writes MVT archives", path.display())]
+    #[non_exhaustive]
+    MergeNotMvt {
+        /// The first input.
+        path: std::path::PathBuf,
+        /// Its tile type.
+        tile_type: TileType,
+    },
+    /// Two merge inputs (or one, twice) address the same tile id.
+    #[error(
+        "{} and {} claim overlapping tile ids: both address tile id {tile_id} ({zxy}). merge \
+         concatenates disjoint shards — it will not reconcile a tile two inputs both claim, \
+         so check how the shards were cut (a shard listed twice, or one left over from an \
+         earlier run, is the usual cause). The same archive named twice means its own \
+         directory addresses that id more than once, which no valid PMTiles archive does",
+        first.display(),
+        second.display()
+    )]
+    #[non_exhaustive]
+    MergeOverlap {
+        /// The input that claimed the id first.
+        first: std::path::PathBuf,
+        /// The input that claimed it again.
+        second: std::path::PathBuf,
+        /// The tile id.
+        tile_id: u64,
+        /// The id as `z{z}/{x}/{y}`, or `?`.
+        zxy: String,
+    },
+    /// The inputs' publication metadata cannot fit an archive's metadata
+    /// section.
+    #[error("{message}")]
+    #[non_exhaustive]
+    MetadataTooLarge {
+        /// Which field and by how much.
+        message: String,
+    },
+    /// A pyramid's band convert options are refused.
+    #[error("band convert options: {0}")]
+    BandConvertOptions(Box<overview::convert::ConvertError>),
+}
+
+impl From<InvalidConfigError> for Error {
+    fn from(reason: InvalidConfigError) -> Self {
+        Error::InvalidConfig(reason)
+    }
+}
+
+/// A [`GeoParquetReadError::AtRows`] cause without its own
+/// "Failed to read GeoParquet file" prefix, so the sentence is not repeated.
+fn rows_inner(error: &Error) -> String {
+    match error {
+        Error::GeoParquetRead(reason) => reason.to_string(),
+        other => other.to_string(),
+    }
+}
+
+impl GeoParquetReadError {
+    /// A [`Self::Decode`] failure of `stage`, as an [`Error`].
+    pub(crate) fn decode(stage: &'static str, e: impl std::fmt::Display) -> Error {
+        GeoParquetReadError::Decode {
+            stage,
+            message: e.to_string(),
+        }
+        .into()
+    }
+}
+
+impl From<GeoParquetReadError> for Error {
+    fn from(reason: GeoParquetReadError) -> Self {
+        Error::GeoParquetRead(reason)
     }
 }
 
@@ -390,11 +715,11 @@ mod tests {
     #[test]
     fn only_configuration_errors_are_classified_as_usage() {
         assert_eq!(
-            Error::InvalidConfig("invalid band options".into()).kind(),
+            Error::InvalidConfig(InvalidConfigError::MergeNoInputs).kind(),
             ErrorKind::Usage
         );
         for error in [
-            Error::GeoParquetRead("invalid footer".into()),
+            Error::GeoParquetRead(GeoParquetReadError::ResolvedSchemaMismatch),
             archive_index::ArchiveError::Header("invalid header".into()).into(),
             pmtiles_writer::WriteError::Finalized.into(),
             Error::Io(std::io::Error::other("disk full")),
@@ -411,9 +736,12 @@ mod tests {
     fn an_attributed_error_keeps_its_kind() {
         let at = Error::at(
             std::path::Path::new("a.pmtiles"),
-            Error::InvalidConfig("x".into()),
+            Error::InvalidConfig(InvalidConfigError::MergeNoInputs),
         );
         assert_eq!(at.kind(), ErrorKind::Usage);
-        assert_eq!(at.to_string(), "a.pmtiles: Invalid configuration: x");
+        assert_eq!(
+            at.to_string(),
+            "a.pmtiles: Invalid configuration: merge needs at least one input archive"
+        );
     }
 }

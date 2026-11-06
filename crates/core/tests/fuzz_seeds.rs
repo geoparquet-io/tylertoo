@@ -226,17 +226,24 @@ fn remote_footer_seeds() {
     {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(
-                tylertoo_core::internal::input::fuzz_remote_footer(&bytes)
-                    .map(|_| ())
-                    .map_err(|e| format!("{e:?}")),
-            );
+            let _ = tx.send(tylertoo_core::internal::input::fuzz_remote_footer(&bytes).map(|_| ()));
         });
         let err = rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .unwrap_or_else(|_| panic!("{name} did not finish in 30 s"))
             .expect_err("a hostile page header must be refused");
-        assert!(err.contains("unexpected end of file"), "{name}: {err}");
+        assert!(
+            matches!(
+                tylertoo_io::input_error(&err),
+                Some(tylertoo_io::Error::HostilePageHeader)
+            ),
+            "{name}: {err:?}"
+        );
+        assert_eq!(
+            tylertoo_core::internal::error::kind_of(&err),
+            Some(tylertoo_core::ErrorKind::Input),
+            "{name}: a hostile input is the input's problem"
+        );
     }
 }
 

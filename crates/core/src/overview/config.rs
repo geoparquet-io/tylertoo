@@ -1150,10 +1150,16 @@ pub mod cli;
 pub mod keywords;
 mod values;
 
-pub(super) fn finite_number(name: &str, value: f64) -> Result<(), String> {
+pub(super) fn finite_number(
+    name: &'static str,
+    value: f64,
+) -> Result<(), super::convert::InvalidOption> {
     if value.is_finite() {
         Ok(())
     } else {
-        Err(format!("{name} = {value} must be a finite value"))
+        Err(super::convert::InvalidOption::NotFinite {
+            option: name,
+            value,
+        })
     }
 }

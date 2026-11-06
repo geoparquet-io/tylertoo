@@ -1974,7 +1974,9 @@ mod tests {
             anyhow::Error::new(TilesError::Export(ExportError::Config(config_error()))),
             step_failed(
                 "pyramid build",
-                PyramidError::InvalidConfig("invalid band".into()),
+                PyramidError::InvalidConfig(tylertoo_core::InvalidConfigError::BandConvertOptions(
+                    Box::new(ConvertError::VerbatimPartitioningUnsupported),
+                )),
             ),
         ] {
             assert_eq!(exit_status(error_kind(&error)), 2, "{error:#}");

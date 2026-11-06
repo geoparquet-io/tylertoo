@@ -537,9 +537,13 @@ impl GeoArrowVisitor for SampledBboxes<'_> {
         self.rows
             .iter()
             .map(|&i| {
-                let item = accessor.get(i).map_err(|e| {
-                    crate::Error::GeoParquetRead(format!("Invalid geometry at index {i}: {e}"))
-                })?;
+                let item =
+                    accessor
+                        .get(i)
+                        .map_err(|e| crate::GeoParquetReadError::InvalidGeometry {
+                            index: i,
+                            message: e.to_string(),
+                        })?;
                 Ok(item.and_then(|g| {
                     let mut acc = BboxAcc::new();
                     acc.add_geometry(&g);
@@ -573,15 +577,19 @@ fn covering_bboxes(
     names: &[String; 4],
     rows: &[usize],
 ) -> crate::Result<Vec<Option<[f64; 4]>>> {
-    let strukt = col.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-        crate::Error::GeoParquetRead("bbox covering column is not a struct".into())
-    })?;
+    let strukt = col
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or(crate::GeoParquetReadError::CoveringNotStruct)?;
     let field = |name: &String| -> crate::Result<&Float64Array> {
         strukt
             .column_by_name(name)
             .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
             .ok_or_else(|| {
-                crate::Error::GeoParquetRead(format!("bbox covering field {name} is not Float64"))
+                crate::GeoParquetReadError::CoveringFieldNotFloat64 {
+                    field: name.clone(),
+                }
+                .into()
             })
     };
     let [xmin, ymin, xmax, ymax] = [
@@ -641,9 +649,7 @@ pub fn estimate_max_zoom(
 ) -> Result<AutoZoomEvidence, ConvertError> {
     options.validate()?;
     let LevelPlan::ZoomRange { min_zoom, .. } = options.levels else {
-        return Err(ConvertError::InvalidConfig(
-            "--max-zoom auto needs a zoom-range level plan, not an explicit GSD list".to_string(),
-        ));
+        return Err(super::convert::InvalidOption::AutoMaxZoomNeedsZoomRange.into());
     };
     estimate_with(
         source,
@@ -796,9 +802,7 @@ pub(crate) fn estimate_with(
                 None => {
                     let garr = from_arrow_array(batch.column(sample_pos).as_ref(), &geom_field)
                         .map_err(|e| {
-                            crate::Error::GeoParquetRead(format!(
-                                "auto max-zoom geometry decode: {e}"
-                            ))
+                            crate::GeoParquetReadError::decode("auto max-zoom geometry decode", e)
                         })?;
                     visit_geoarrow_array(garr.as_ref(), SampledBboxes { rows: &picks })?
                 }
