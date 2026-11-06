@@ -308,21 +308,25 @@ because Madagascar is small and this is one country):
 | `0` + `--coverage-fill` | 0.02% | 0.01% | 0.02% | 0.01% | 0.01% | 34.0 MB |
 
 With `--coverage-fill` on, residual missing coverage is 0.03–0.05% at the
-defaults. The fill hides slivers rather than isolating them.
+defaults. The fill closes the gaps, so it cannot show how much of the loss is slivers.
 
-Commands, from the repo root after `cargo build --release`. Factor 1 is the
-default:
+Commands, from the repo root. Factor 1 is the default. The layer name
+defaults to the file stem, and the archive sizes above come from a layer
+named `mad`, hence `--layer-name mad`:
 
 ```bash
-B=target/release/tylertoo
+cargo build --release --bin tylertoo
+B=$PWD/target/release/tylertoo
+R=$PWD
+W=$(mktemp -d); cd $W
 curl -LO https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1/madagascar-adm4-hilbert.parquet
 for f in 1 0.25 0; do
   for fill in off on; do
     extra=""; [ $fill = on ] && extra="--coverage-fill"
     n=sf$f-fill$fill
     $B tiles madagascar-adm4-hilbert.parquet $n.pmtiles --min-zoom 0 --max-zoom 12 \
-        --simplify-factor $f $extra --force
-    uv run benchmarks/coalesce/tile_metrics.py $n.pmtiles \
+        --simplify-factor $f $extra --layer-name mad --force
+    uv run $R/benchmarks/coalesce/tile_metrics.py $n.pmtiles \
         --source madagascar-adm4-hilbert.parquet --zooms 4,5,6,7,8 --max-tiles 150 \
         --raw-limit 0 --gz-limit 0 --json $n.json
   done
@@ -340,14 +344,18 @@ checked in total; the issue had 480 at z4–z11). The export reports 10,002
 RingsCross, 1,141 PartsOverlap, 2,668 CollapsedRing, 36 DisconnectedInterior
 and 58,525 RingSelfTouch tile-space repairs.
 
-Commands (same build; the raw input is the `bench-coalesce-v1` asset
+Commands (the raw input is the `bench-coalesce-v1` asset
 `moldova.parquet`, sha256 f5343419...):
 
 ```bash
+cargo build --release --bin tylertoo
+B=$PWD/target/release/tylertoo
+R=$PWD
+W=$(mktemp -d); cd $W
 curl -LO https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1/moldova.parquet
 uvx --from geoparquet-io==1.7.0 gpio sort hilbert --add-bbox --row-group-size 49152 \
     moldova.parquet hilbert.parquet
 $B overview hilbert.parquet ov.parquet --min-zoom 0 --max-zoom 12
 $B export-pmtiles ov.parquet out.pmtiles
-uv run benchmarks/coalesce/check_validity.py out.pmtiles
+uv run $R/benchmarks/coalesce/check_validity.py out.pmtiles
 ```
