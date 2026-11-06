@@ -5,7 +5,12 @@
 # Default profile = small + medium tiers (< ~2-3 GB).
 # Pass --large to also fetch large-tier (state/country) datasets.
 #
-# Idempotent: existing outputs are skipped (use --force to refetch).
+# Idempotent: existing outputs are skipped (use --force to refetch), but
+# every output, new or kept, is checked against its pin in manifest.json and
+# the script fails on a mismatch (#810): `sha256` of the download (the zip for
+# Natural Earth), or for an Overture extract its exact row count and
+# `ids_sha256` (sha256 of its ids, sorted, joined with ','). An overridden
+# GPQ_OVERTURE_RELEASE has no pins, so its extracts are not checked.
 # Source of truth for dataset definitions is manifest.json.
 #
 set -euo pipefail
@@ -60,6 +65,51 @@ echo "Large tier:       $([ $WANT_LARGE = 1 ] \
   && echo yes || echo no)"
 echo
 
+PINNED_REL="$(jq -r '.overture.release' "$MANIFEST")"
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# ---- pins: fail loudly on any input drift (#696, #810) ---------
+check_sha256() {
+  local id="$1" file="$2" want="$3" got
+  got="$(sha256_of "$file")"
+  if [ "$got" != "$want" ]; then
+    echo "ERROR: [$id] $file has sha256 $got, manifest.json pins $want" >&2
+    exit 1
+  fi
+}
+
+check_overture_pin() {
+  local id="$1" file="$2" rows="$3" ids="$4" got
+  if [ "$REL" != "$PINNED_REL" ]; then
+    echo "   (release $REL is not the pinned $PINNED_REL: pins not checked)"
+    return 0
+  fi
+  got="$(duckdb -noheader -list -c "SELECT count(*) || ' ' || \
+sha256(string_agg(id, ',' ORDER BY id)) FROM read_parquet('$file')" | tail -1)"
+  if [ "$got" != "$rows $ids" ]; then
+    echo "ERROR: [$id] $file has rows/ids_sha256 '$got', manifest.json pins '$rows $ids'" >&2
+    exit 1
+  fi
+}
+
+check_pin() {
+  local ds="$1" out="$2" id sha
+  id="$(jq -r '.id' <<<"$ds")"
+  sha="$(jq -r '.sha256 // empty' <<<"$ds")"
+  case "$(jq -r '.source' <<<"$ds")" in
+    overture)
+      check_overture_pin "$id" "$out" \
+        "$(jq -r '.expected_features' <<<"$ds")" "$(jq -r '.ids_sha256' <<<"$ds")" ;;
+    http-parquet) check_sha256 "$id" "$out" "$sha" ;;
+    *) echo "   [$id] pinned by its download sha256 (checked at fetch)"; return 0 ;;
+  esac
+  echo "   pin ok [$id]"
+}
+
 # ---- fetch one Overture dataset via DuckDB ---------------------
 fetch_overture() {
   local id="$1" theme="$2" type="$3" select="$4"
@@ -88,7 +138,7 @@ SQL
 
 # ---- fetch one Natural Earth dataset (shp -> parquet) ----------
 fetch_natural_earth() {
-  local id="$1" url="$2" shp="$3"
+  local id="$1" url="$2" shp="$3" sha="$4"
   local out="$RAW/$id.parquet"
   local tmp
   tmp="$(mktemp -d)"
@@ -96,6 +146,7 @@ fetch_natural_earth() {
   echo ">> [$id] Natural Earth $url"
   curl -sL --fail --max-time 300 \
     -o "$tmp/ne.zip" "$url"
+  check_sha256 "$id" "$tmp/ne.zip" "$sha"
   unzip -q -o "$tmp/ne.zip" -d "$tmp"
   gpio convert geoparquet \
     "$tmp/$shp" "$out"
@@ -138,6 +189,7 @@ while read -r ds; do
   if [ -f "$out" ] && [ "$FORCE" = 0 ]; then
     echo "== have [$id] ($(du -h "$out" | cut -f1)); \
 skip (use --force)"
+    check_pin "$ds" "$out"
     continue
   fi
 
@@ -156,7 +208,8 @@ skip (use --force)"
     natural-earth)
       url="$(jq -r '.url' <<<"$ds")"
       shp="$(jq -r '.shapefile' <<<"$ds")"
-      fetch_natural_earth "$id" "$url" "$shp"
+      fetch_natural_earth "$id" "$url" "$shp" \
+        "$(jq -r '.sha256' <<<"$ds")"
       ;;
     http-parquet)
       url="$(jq -r '.url' <<<"$ds")"
@@ -167,6 +220,7 @@ skip (use --force)"
 not auto-fetchable)"
       continue ;;
   esac
+  check_pin "$ds" "$out"
   COUNT=$((COUNT + 1))
 done < <(jq -c '.datasets[]' "$MANIFEST")
 

@@ -287,3 +287,24 @@ def test_a_run_whose_gate_timed_out_stays_out_of_the_medians():
     assert summ["a"]["wall_s"]["n"] == 2  # noqa: PLR2004
     assert summ["a"]["wall_s"]["median"] == 2.0  # noqa: PLR2004
     assert summ["a"]["statuses"] == ["GATE_TIMED_OUT", "ok"]
+
+
+# --- pinned inputs (#810) -----------------------------------------------------
+
+CORPUS = HERE.parent / "corpus" / "manifest.json"
+
+
+def test_one_overture_release_across_corpus_and_manifest(manifest):
+    corpus = json.loads(CORPUS.read_text())
+    release = corpus["overture"]["release"]
+    for name, inp in manifest["inputs"].items():
+        if "overture" in inp.get("url", "") + inp.get("file", ""):
+            assert f"/{release}/" in inp.get("url", "") and release in inp["file"], name
+
+
+def test_every_corpus_dataset_is_pinned():
+    corpus = json.loads(CORPUS.read_text())
+    for ds in corpus["datasets"]:
+        key = "ids_sha256" if ds["source"] == "overture" else "sha256"
+        assert len(ds.get(key, "")) == 64, f"{ds['id']}: no {key}"  # noqa: PLR2004
+        assert ds["verified_count"] is True and isinstance(ds["expected_features"], int), ds["id"]
