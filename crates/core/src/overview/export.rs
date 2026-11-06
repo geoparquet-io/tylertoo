@@ -9063,8 +9063,8 @@ fn candidate_columns<'a>(
 /// The columns pass 2 attaches to each member: the exportable properties
 /// ([`property_columns`]) and the resolved `--feature-id` column (#443).
 struct AttrColumns<'a> {
-    /// `(column index, published name)`; the names are interned once here
-    /// and shared by every row's [`SharedProps`] (#461).
+    /// `(column index, published name)`; each [`Self::extract`] copies the
+    /// names once, for every row of its batch to share (#461).
     props: Vec<(usize, Arc<str>)>,
     feature_id: Option<&'a ResolvedFeatureId>,
 }
@@ -9086,6 +9086,11 @@ impl<'a> AttrColumns<'a> {
     }
 
     /// Extract every column of one batch once, for per-row materialization.
+    ///
+    /// PERF (#803): each call gets its own copy of every name, shared by its
+    /// rows only. Cloning the schema table's handles made every pool thread
+    /// bump the same refcounts once per row and column (and drop them once
+    /// per member), about 10% of an export's cycles in contended atomics.
     fn extract(&self, batch: &RecordBatch) -> BatchAttributes<'a> {
         BatchAttributes {
             props: self
@@ -9093,7 +9098,7 @@ impl<'a> AttrColumns<'a> {
                 .iter()
                 .map(|(idx, name)| {
                     (
-                        Arc::clone(name),
+                        Arc::from(&**name),
                         extract_property_column(batch.column(*idx)),
                     )
                 })
@@ -14003,8 +14008,8 @@ mod tests {
             ]
         );
 
-        // The names are refcounted handles to the schema table, not copies.
-        let (name_key, rank_key) = (&cols.props[0].1, &cols.props[1].1);
+        // The names are refcounted handles to the batch's table, not copies.
+        let (name_key, rank_key) = (&attrs.props[0].0, &attrs.props[1].0);
         assert!(Arc::ptr_eq(&rows[0][0].0, name_key));
         assert!(Arc::ptr_eq(&rows[2][0].0, name_key));
         for row in &rows {
