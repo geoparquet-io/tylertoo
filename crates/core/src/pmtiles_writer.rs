@@ -1306,6 +1306,11 @@ fn tilestats_json(layer_name: &str, total_features: u64, field_count: usize) -> 
     )
 }
 
+/// The top-level metadata key that marks a variable-depth archive (#803):
+/// `{"enabled": true, "canonical_maxzoom": M}`. A tile missing below a
+/// stored one is drawn by that ancestor, overzoomed.
+pub(crate) const VARIABLE_DEPTH_KEY: &str = "tylertoo:variable_depth";
+
 /// Assemble the archive's metadata JSON.
 ///
 /// The structural keys keep their historical layout and order; publication
@@ -1474,6 +1479,8 @@ pub struct StreamingPmtilesWriter {
     /// `declared_min_zoom`, this reaches `vector_layers[].maxzoom` only,
     /// never the header.
     declared_max_zoom: Option<u8>,
+    /// #803: the canonical max zoom of a variable-depth archive.
+    variable_depth: Option<u8>,
     /// Geographic bounds
     bounds: TileBounds,
     /// Layer name for metadata
@@ -1789,6 +1796,7 @@ impl StreamingPmtilesWriter {
             max_zoom: 0,
             declared_min_zoom: None,
             declared_max_zoom: None,
+            variable_depth: None,
             bounds: TileBounds::empty(),
             layer_name: "layer".to_string(),
             fields: HashMap::new(),
@@ -1915,6 +1923,13 @@ impl StreamingPmtilesWriter {
     /// ignored.
     pub fn set_declared_max_zoom(&mut self, zoom: u8) {
         self.declared_max_zoom = Some(zoom);
+    }
+
+    /// Mark the archive variable-depth (#803): the metadata carries
+    /// [`VARIABLE_DEPTH_KEY`] with the canonical max zoom, so a reader knows
+    /// a missing tile is drawn by its nearest stored ancestor.
+    pub(crate) fn set_variable_depth(&mut self, canonical_max_zoom: u8) {
+        self.variable_depth = Some(canonical_max_zoom);
     }
 
     /// The header's minimum zoom: the coarsest tile actually written, never
@@ -2802,7 +2817,14 @@ impl StreamingPmtilesWriter {
             }
         };
 
-        metadata_json(&vector_layers, &tilestats_json, &self.metadata)
+        let mut json = metadata_json(&vector_layers, &tilestats_json, &self.metadata);
+        if let Some(max_zoom) = self.variable_depth {
+            json.pop();
+            json.push_str(&format!(
+                r#","{VARIABLE_DEPTH_KEY}":{{"enabled":true,"canonical_maxzoom":{max_zoom}}}}}"#
+            ));
+        }
+        json
     }
 
     fn build_fields_json(&self) -> String {

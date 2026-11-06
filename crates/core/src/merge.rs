@@ -372,11 +372,30 @@ fn at(idx: &ArchiveIndex, e: Error) -> Error {
     Error::PMTilesWrite(format!("{}: {e}", idx.path().display()))
 }
 
+/// Why `operation` refuses the variable-depth archive at `path` (#803).
+pub(crate) fn variable_depth_refusal(path: &std::path::Path, operation: &str) -> String {
+    format!(
+        "{}: is a variable-depth archive ({}), whose missing tiles are drawn by a stored \
+         ancestor; {operation} cannot combine it with other tiles. Re-tile it without \
+         --generate-variable-depth-tile-pyramid",
+        path.display(),
+        crate::pmtiles_writer::VARIABLE_DEPTH_KEY,
+    )
+}
+
 /// Every input must agree on tile type and tile compression, since the merge
 /// copies bodies verbatim under one header that declares both for all of
 /// them. Mirrors the pyramid's up-front checks; the mismatch names both
 /// archives, because "these disagree" is unactionable without knowing which.
 fn check_inputs_agree(indexes: &[ArchiveIndex]) -> Result<Compression> {
+    // #803: a variable-depth archive's missing tiles mean "draw the stored
+    // ancestor"; merged with another archive's tiles there, they would not.
+    if let Some(idx) = indexes.iter().find(|idx| idx.is_variable_depth()) {
+        return Err(Error::InvalidConfig(variable_depth_refusal(
+            idx.path(),
+            "merge",
+        )));
+    }
     let first = &indexes[0];
     let (tile_type, compression) = (first.header().tile_type, first.header().tile_compression);
     for idx in &indexes[1..] {

@@ -764,6 +764,7 @@ class ExportReport(TypedDict):
     encode_quantized_features: int
     skipped_property_columns: list[SkippedPropertyColumn]
     duration_secs: float
+    variable_depth: VariableDepthReport | None
 ```
 
 * `oversized_tiles`: Tiles that exceeded a size limit and triggered size reduction.
@@ -772,6 +773,7 @@ class ExportReport(TypedDict):
 * `encode_dropped_features`: Features removed by clipping. A nonzero count logs a warning for lost content.
 * `encode_quantized_features`: Features that collapsed at the tile extent, usually harmless edge slivers.
 * `skipped_property_columns`: Columns MVT cannot encode, such as binary. Struct, list, and map columns become JSON strings.
+* `variable_depth`: The `variable_depth=True` summary; None otherwise.
 
 ### `ZoomReport`
 
@@ -794,7 +796,10 @@ class ZoomReport(TypedDict):
     fill_polygons: int
     fill_vertices: int
     fill_shed: int
+    stopped_tiles: int
 ```
+
+* `stopped_tiles`: Tiles at this zoom that end their branch, with nothing stored below (`variable_depth=True`); 0 otherwise.
 
 ### `SkippedPropertyColumn`
 
@@ -805,6 +810,23 @@ class SkippedPropertyColumn(TypedDict):
     name: str
     data_type: str
 ```
+
+### `VariableDepthReport`
+
+How a `variable_depth=True` export stopped its branches.
+
+```python
+class VariableDepthReport(TypedDict):
+    canonical_max_zoom: int
+    stored_max_zoom: int | None
+    probed_tiles: int
+    stopped_tiles: int
+```
+
+* `canonical_max_zoom`: The finest level's zoom, which every stopped tile keeps the precision of.
+* `stored_max_zoom`: The deepest zoom holding a tile, the PMTiles header's max zoom.
+* `probed_tiles`: Tiles tested against both size caps.
+* `stopped_tiles`: Probed tiles that fit, and end their branch.
 
 ### `PyramidReport`
 

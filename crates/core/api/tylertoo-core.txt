@@ -2492,6 +2492,7 @@ pub tylertoo_core::overview::export::ExportReport::source_losses: tylertoo_core:
 pub tylertoo_core::overview::export::ExportReport::total_tile_features: usize
 pub tylertoo_core::overview::export::ExportReport::total_tiles: usize
 pub tylertoo_core::overview::export::ExportReport::valve_dropped_features: usize
+pub tylertoo_core::overview::export::ExportReport::variable_depth: core::option::Option<tylertoo_core::overview::export::VariableDepthReport>
 pub tylertoo_core::overview::export::ExportReport::zooms: alloc::vec::Vec<tylertoo_core::overview::export::ZoomReport>
 impl core::clone::Clone for tylertoo_core::overview::export::ExportReport
 pub fn tylertoo_core::overview::export::ExportReport::clone(&self) -> tylertoo_core::overview::export::ExportReport
@@ -2529,6 +2530,27 @@ impl core::marker::Unpin for tylertoo_core::overview::export::SkippedPropertyCol
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::SkippedPropertyColumn
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::SkippedPropertyColumn
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::SkippedPropertyColumn
+pub struct tylertoo_core::overview::export::VariableDepthReport
+pub tylertoo_core::overview::export::VariableDepthReport::canonical_max_zoom: u8
+pub tylertoo_core::overview::export::VariableDepthReport::probed_tiles: usize
+pub tylertoo_core::overview::export::VariableDepthReport::stopped_tiles: usize
+pub tylertoo_core::overview::export::VariableDepthReport::stored_max_zoom: core::option::Option<u8>
+impl core::clone::Clone for tylertoo_core::overview::export::VariableDepthReport
+pub fn tylertoo_core::overview::export::VariableDepthReport::clone(&self) -> tylertoo_core::overview::export::VariableDepthReport
+impl core::cmp::PartialEq for tylertoo_core::overview::export::VariableDepthReport
+pub fn tylertoo_core::overview::export::VariableDepthReport::eq(&self, &tylertoo_core::overview::export::VariableDepthReport) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::export::VariableDepthReport
+pub fn tylertoo_core::overview::export::VariableDepthReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::export::VariableDepthReport
+impl serde_core::ser::Serialize for tylertoo_core::overview::export::VariableDepthReport
+pub fn tylertoo_core::overview::export::VariableDepthReport::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for tylertoo_core::overview::export::VariableDepthReport
+impl core::marker::Send for tylertoo_core::overview::export::VariableDepthReport
+impl core::marker::Sync for tylertoo_core::overview::export::VariableDepthReport
+impl core::marker::Unpin for tylertoo_core::overview::export::VariableDepthReport
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::VariableDepthReport
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::VariableDepthReport
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::VariableDepthReport
 pub struct tylertoo_core::overview::export::ZoomReport
 pub tylertoo_core::overview::export::ZoomReport::encode_dropped_features: usize
 pub tylertoo_core::overview::export::ZoomReport::encode_quantized_features: usize
@@ -2540,6 +2562,7 @@ pub tylertoo_core::overview::export::ZoomReport::level_feature_count: usize
 pub tylertoo_core::overview::export::ZoomReport::max_valve_passes: u32
 pub tylertoo_core::overview::export::ZoomReport::merged_features: usize
 pub tylertoo_core::overview::export::ZoomReport::oversized_tiles: usize
+pub tylertoo_core::overview::export::ZoomReport::stopped_tiles: usize
 pub tylertoo_core::overview::export::ZoomReport::tile_count: usize
 pub tylertoo_core::overview::export::ZoomReport::tile_feature_count: usize
 pub tylertoo_core::overview::export::ZoomReport::valve_dropped_features: usize

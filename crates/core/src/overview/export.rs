@@ -753,6 +753,10 @@ pub struct ZoomReport {
     /// Fill polygons left out to stay within the fill's share of a tile's
     /// size limit, smallest first.
     pub fill_shed: usize,
+    /// #803 stopped tiles at this zoom, counted in `tile_count`: tiles that
+    /// hold every finest-level feature under them, with nothing stored
+    /// below. 0 without [`ExportOptions::variable_depth`].
+    pub stopped_tiles: usize,
 }
 
 /// Result of an export, `Serialize` for the `--report` JSON.
@@ -802,6 +806,26 @@ pub struct ExportReport {
     pub valve_dropped_features: usize,
     /// Wall-clock export duration in seconds.
     pub duration_secs: f64,
+    /// The #803 variable-depth summary; `None` without
+    /// [`ExportOptions::variable_depth`].
+    pub variable_depth: Option<VariableDepthReport>,
+}
+
+/// How a variable-depth export (#803) stopped its branches. Per-zoom stop
+/// counts are [`ZoomReport::stopped_tiles`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VariableDepthReport {
+    /// The finest level's zoom: what [`ExportReport::max_zoom`] declares, and
+    /// the precision every stopped tile keeps.
+    pub canonical_max_zoom: u8,
+    /// The deepest zoom holding a tile: the PMTiles header's `max_zoom`.
+    /// Shallower than the canonical one when every branch stopped above it.
+    pub stored_max_zoom: Option<u8>,
+    /// Tiles probed: drawn from the finest level's features to see whether
+    /// they fit both size caps.
+    pub probed_tiles: usize,
+    /// Probed tiles that fit, and stopped their branch.
+    pub stopped_tiles: usize,
 }
 
 /// A property column the export dropped because its Arrow type has no MVT
@@ -1882,17 +1906,35 @@ pub fn write_empty_archive(
     metadata: &TilesetMetadata,
 ) -> Result<(), ExportError> {
     check_metadata_size(metadata)?;
-    // Gzip and the tail layout, matching `export_pmtiles` exactly —
-    // `merge_shards` refuses inputs whose tile compression disagrees, so an
-    // empty shard written any other way would break the very merge it exists
-    // to keep working.
+    let mut writer = open_writer(output, layer_name, metadata, min_zoom)?;
+    writer.set_declared_max_zoom(max_zoom);
+    writer.finalize(output)?;
+    Ok(())
+}
+
+/// The writer every export archive starts from, empty or not: gzip tiles in
+/// the tail layout, with the layer name, metadata and declared min zoom set
+/// before the first tile, so every checkpoint carries them too.
+///
+/// #459: the tail layout appends tile bytes straight into
+/// `<output>.partial` after a reserved 16 KiB prefix and never copies them
+/// again, so a per-level checkpoint rewrites only the header, root
+/// directory, metadata and leaves — O(directory), not O(tile data). The
+/// spool lives beside the output rather than in `TMPDIR`. Gzip because
+/// `merge_shards` refuses inputs whose tile compression disagrees, so an
+/// empty shard written any other way would break the very merge it exists
+/// to keep working.
+fn open_writer(
+    output: &Path,
+    layer_name: &str,
+    metadata: &TilesetMetadata,
+    min_zoom: u8,
+) -> Result<StreamingPmtilesWriter, ExportError> {
     let mut writer = StreamingPmtilesWriter::with_tail_layout(output, Compression::Gzip)?;
     writer.set_layer_name(layer_name);
     writer.set_metadata(metadata.clone());
     writer.set_declared_min_zoom(min_zoom);
-    writer.set_declared_max_zoom(max_zoom);
-    writer.finalize(output)?;
-    Ok(())
+    Ok(writer)
 }
 
 /// Plan every level's partitions and wave width.
@@ -2229,26 +2271,21 @@ fn export_pmtiles_validated(
 
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
-    // #459: the tail-directory layout. Tile bytes append straight into
-    // `<output>.partial` after a reserved 16 KiB prefix and are never copied
-    // again, so a per-level checkpoint rewrites only the header, root
-    // directory, metadata and leaves — O(directory), not O(tile data). Under
-    // the old spooled layout each checkpoint re-copied the entire spool, so a
-    // planet-scale run with a dozen checkpoints spent hundreds of gigabytes of
-    // write I/O on salvage alone. Side effect worth knowing: the spool now
-    // lives beside the output rather than in `TMPDIR`.
-    let mut writer =
-        StreamingPmtilesWriter::with_tail_layout(output_path.as_ref(), Compression::Gzip)?;
+    let mut writer = open_writer(
+        output_path.as_ref(),
+        &options.layer_name,
+        &options.metadata,
+        min_zoom,
+    )?;
+    if let Some(&canonical) = level_zooms.last().filter(|_| options.variable_depth) {
+        writer.set_variable_depth(canonical);
+    }
     // #506: export now adds every tile in ascending PMTiles tile-id (Hilbert)
     // order — per zoom via `tile_key`, and zooms ascend across levels — so
     // the archive is genuinely clustered. Debug-only: catches an ordering
     // regression here rather than downstream as a quietly `clustered: false`
     // archive.
     writer.set_expect_clustered(true);
-    writer.set_layer_name(&options.layer_name);
-    // Before the first level, so every checkpoint carries it too.
-    writer.set_metadata(options.metadata.clone());
-    writer.set_declared_min_zoom(min_zoom);
     // #361: a `--feature-order` column that names nothing is a no-op, and an
     // indistinguishable one — every member's key is `Missing`, so they all
     // compare equal and the stable sort leaves input order. A typo therefore
@@ -2535,7 +2572,7 @@ fn export_pmtiles_validated(
     };
     let probe_timers = Arc::clone(&progress.profile.timers);
     #[cfg_attr(not(test), expect(unused_variables, reason = "the tests' schedule"))]
-    let (reports, level_groups) = match vd {
+    let (reports, level_groups, probed) = match vd {
         None => {
             let reports = export_level_groups(
                 &mut writer,
@@ -2546,32 +2583,35 @@ fn export_pmtiles_validated(
                 &mut progress,
                 diagnostics,
             )?;
-            (reports, level_groups)
+            (reports, level_groups, None)
         }
-        Some((plan, _)) => variable_depth::export_levels(
-            &mut writer,
-            mem,
-            &ckpt,
-            &mut progress,
-            diagnostics,
-            variable_depth::VdLevels {
-                plan,
-                probe: variable_depth::Probe {
-                    reader: &reader,
-                    crs,
-                    published: &published,
-                    feature_id: feature_id.as_ref(),
-                    options,
-                    budget: &partition_budget,
-                    timers: &probe_timers,
+        Some((plan, _)) => {
+            let (reports, groups, probed) = variable_depth::export_levels(
+                &mut writer,
+                mem,
+                &ckpt,
+                &mut progress,
+                diagnostics,
+                variable_depth::VdLevels {
+                    plan,
+                    probe: variable_depth::Probe {
+                        reader: &reader,
+                        crs,
+                        published: &published,
+                        feature_id: feature_id.as_ref(),
+                        options,
+                        budget: &partition_budget,
+                        timers: &probe_timers,
+                    },
+                    planned: (&levels, level_groups),
+                    rest,
+                    zooms: &level_zooms,
+                    template,
+                    group_cap,
                 },
-                planned: (&levels, level_groups),
-                rest,
-                zooms: &level_zooms,
-                template,
-                group_cap,
-            },
-        )?,
+            )?;
+            (reports, groups, Some(probed))
+        }
     };
     zooms.extend(reports);
 
@@ -2614,6 +2654,7 @@ fn export_pmtiles_validated(
             skipped_property_columns,
             start,
         )
+        .with_variable_depth(probed)
         .with_diagnostics(diagnostics)?,
         #[cfg(test)]
         level_groups,
@@ -2690,7 +2731,25 @@ impl ExportReport {
             valve_dropped_features: zooms.iter().map(|z| z.valve_dropped_features).sum(),
             zooms,
             duration_secs: start.elapsed().as_secs_f64(),
+            variable_depth: None,
         }
+    }
+
+    /// Add the #803 summary when `probed` (the probe's tile count) says the
+    /// export had variable depth.
+    fn with_variable_depth(mut self, probed: Option<usize>) -> Self {
+        self.variable_depth = probed.map(|probed_tiles| VariableDepthReport {
+            canonical_max_zoom: self.max_zoom,
+            stored_max_zoom: self
+                .zooms
+                .iter()
+                .rev()
+                .find(|z| z.tile_count > 0)
+                .map(|z| z.zoom),
+            probed_tiles,
+            stopped_tiles: self.zooms.iter().map(|z| z.stopped_tiles).sum(),
+        });
+        self
     }
 }
 
@@ -3735,6 +3794,7 @@ fn finish_level(
         fill_polygons: tally.fill.polygons,
         fill_vertices: tally.fill.vertices,
         fill_shed: tally.fill.shed,
+        stopped_tiles: tally.terminals,
     }
 }
 

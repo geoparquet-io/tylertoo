@@ -38,6 +38,7 @@ __all__ = [
     "SpilledSourceLosses",
     "ValidationCheck",
     "ValidationReport",
+    "VariableDepthReport",
     "ZoomReport",
     "convert",
     "decode",
@@ -237,9 +238,34 @@ ZoomReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
         "fill_polygons": "int",
         "fill_vertices": "int",
         "fill_shed": "int",
+        "stopped_tiles": "int",
     },
 )
-ZoomReport.__doc__ = """Tile and feature counts for one exported zoom."""
+ZoomReport.__doc__ = """Tile and feature counts for one exported zoom.
+
+Attributes:
+    stopped_tiles: Tiles at this zoom that end their branch, with
+        nothing stored below (`variable_depth=True`); 0 otherwise."""
+
+
+VariableDepthReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
+    "VariableDepthReport",
+    {
+        "canonical_max_zoom": "int",
+        "stored_max_zoom": "int | None",
+        "probed_tiles": "int",
+        "stopped_tiles": "int",
+    },
+)
+VariableDepthReport.__doc__ = """How a `variable_depth=True` export stopped its branches.
+
+Attributes:
+    canonical_max_zoom: The finest level's zoom, which every stopped
+        tile keeps the precision of.
+    stored_max_zoom: The deepest zoom holding a tile, the PMTiles
+        header's max zoom.
+    probed_tiles: Tiles tested against both size caps.
+    stopped_tiles: Probed tiles that fit, and end their branch."""
 
 
 SkippedPropertyColumn = TypedDict(  # noqa: UP013 - keys describe serialized report data
@@ -272,6 +298,7 @@ ExportReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
         "encode_quantized_features": "int",
         "skipped_property_columns": "list[SkippedPropertyColumn]",
         "duration_secs": "float",
+        "variable_depth": "VariableDepthReport | None",
     },
 )
 ExportReport.__doc__ = """Exported tile counts and encoding diagnostics.
@@ -288,7 +315,9 @@ Attributes:
     encode_quantized_features: Features that collapsed at the tile
         extent, usually harmless edge slivers.
     skipped_property_columns: Columns MVT cannot encode, such as
-        binary. Struct, list, and map columns become JSON strings."""
+        binary. Struct, list, and map columns become JSON strings.
+    variable_depth: The `variable_depth=True` summary; None
+        otherwise."""
 
 
 ConvertReport = TypedDict(  # noqa: UP013 - keys describe serialized report data

@@ -297,6 +297,13 @@ impl ArchiveIndex {
         self.src.bytes_read.load(Ordering::Relaxed)
     }
 
+    /// Whether the archive is variable-depth (#803): its tiles stop at
+    /// different zooms, so it cannot be merged with another archive.
+    pub(crate) fn is_variable_depth(&self) -> bool {
+        self.metadata_json()
+            .is_some_and(|m| m.get(crate::pmtiles_writer::VARIABLE_DEPTH_KEY).is_some())
+    }
+
     /// The archive's metadata parsed as JSON, or `None` when it is absent or
     /// unparseable (which is not fatal: the tiles are still copyable, they
     /// just describe no fields).

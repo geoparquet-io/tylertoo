@@ -157,6 +157,48 @@ fields are smaller than a pixel at coarse zooms, it halves the missing area
 but draws more area between fields, and the build takes about 1.5× as long
 (#762).
 
+## Variable-depth pyramid: `--generate-variable-depth-tile-pyramid`
+
+`export-pmtiles` and `tiles` take `--generate-variable-depth-tile-pyramid`
+(`variable_depth=True` in Python), like tippecanoe's flag of the same name.
+Off by default. Each branch of the pyramid stops at the coarsest tile that
+can hold every finest-level feature under it within both size caps
+(`--tile-size-limit` raw and `--compressed-tile-size-limit` gzip), with no
+size valve. Nothing is stored below a stopped tile. Sparse areas end at a
+coarse zoom; dense ones go down to the finest.
+
+A stopped tile at zoom z is drawn at the finest level's precision: its
+extent is `4096 << (M − z)`, where M is the finest zoom. Drawn past its own
+zoom, it shows exactly what the finest tiles would. The archive is smaller:
+on the buildings benchmark, 88.5 MB instead of 156 MB, and on 1.36M points
+with thinning off, 77 MB instead of 158 MB.
+
+A tile stops only when every coarser level agrees with the finest one in it.
+A tile is blocked when a coarser level holds a different number of points
+than the finest level in its buffered area, or holds a clustered point
+(`point_count > 1`): stopping there would freeze a thinned or clustered
+view at every deeper zoom. Lines and polygons are not counted, since
+simplification and the visibility gate only lose resolution, which the
+finest-level tile restores. A line or polygon with an entry zoom blocks every
+tile above its rung. With clustering or point thinning on, few tiles stop
+outside sparse areas.
+
+**Serving.** The PMTiles header's `max_zoom` is the deepest stored tile, and
+the metadata carries `"tylertoo:variable_depth": {"enabled": true,
+"canonical_maxzoom": M}`. A server or client must answer a missing tile with
+its nearest stored ancestor, scaled up, as tippecanoe's variable-depth
+output requires. A server that returns nothing for a missing tile shows
+holes. The `--report` JSON adds `variable_depth` (canonical and deepest
+stored max zoom, tiles probed and stopped) and `stopped_tiles` per zoom.
+
+**Refused combinations**, before any output is written: shards and
+`--tile-range`, `--zoom-ceiling` and partial overview files, partitioning
+mode, `--coverage-fill`, extents other than 4096, `--polygon-thinning` above
+0, a non-default `--line-thinning`, `--drop-lines`, `--drop-polygons`, and
+an entry-zoom ladder whose rungs the overview omits. `pyramid` does not take
+the flag, and `merge` and `pyramid` refuse an archive that carries the
+marker: their tiles would hide its stopped ones.
+
 ## The GSD ladder: `--gsd-base` and `--gsd`
 
 A zoom-range plan (`--min-zoom` and `--max-zoom`, the default) derives each

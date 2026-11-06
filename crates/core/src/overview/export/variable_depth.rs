@@ -606,14 +606,6 @@ pub(super) struct Frontier {
 const MIN_FEATURE_BYTES: usize = 11;
 
 impl VdPlan {
-    /// Probe every candidate tile, coarse to fine: a tile stops when the
-    /// canonical band's members under it, encoded at the canonical level's
-    /// precision (extent `4096 << (M - z)`), fit both size caps without the
-    /// valve. A stopped tile's descendants are not probed.
-    ///
-    /// DIVERGENCE FROM TIPPECANOE: tippecanoe probes on its fixed world-30
-    /// grid; this uses the canonical level's grid (world `M + 12` bits), so
-    /// a stopped tile draws exactly what the canonical tiles would.
     /// The probe's candidates at level `k`, given the stops so far: tiles
     /// rule A′ lets stop, not under a stop, not over the raw cap on their
     /// member count alone, and inside the coordinate clamp at the level's
@@ -674,7 +666,7 @@ impl VdPlan {
         p: &Probe<'_>,
         diagnostics: &crate::diagnostics::Diagnostics,
         mut each: impl FnMut(Probed) -> bool,
-    ) -> Result<(), ExportError> {
+    ) -> Result<usize, ExportError> {
         let mut frontier = Frontier::new(self.zooms.len());
         // Rows the probe reads are read again by the export proper, so
         // their decode and clip warnings are counted there, not here.
@@ -734,11 +726,11 @@ impl VdPlan {
             stops += level.stopped.len();
             frontier.stopped[k].clone_from(&level.stopped);
             if !each(level) {
-                return Ok(());
+                return Ok(probed);
             }
         }
         log::info!("[export] variable depth: probed {probed} tile(s), stopped {stops}");
-        Ok(())
+        Ok(probed)
     }
 }
 
@@ -916,10 +908,14 @@ pub(super) struct VdLevels<'a> {
     pub(super) group_cap: usize,
 }
 
+/// What [`export_levels`] returns: the level reports, the group schedule
+/// and the tiles probed.
+type Drawn = (Vec<ZoomReport>, Vec<Range<usize>>, usize);
+
 /// Export every level with variable depth: the levels no tile of which can
 /// stop are drawn while the probe runs on its own thread, then the rest,
-/// with their stopped tiles and without their subtrees. Returns the reports and the
-/// group schedule, as [`export_level_groups`] would.
+/// with their stopped tiles and without their subtrees. Returns the reports and
+/// the group schedule, as [`export_level_groups`] would, and the tiles probed.
 ///
 /// PERF (#803): the coarse levels of a dense file are a few huge tiles,
 /// each fitted by a serial valve, so they leave most of the pool idle; the
@@ -931,7 +927,7 @@ pub(super) fn export_levels(
     progress: &mut ExportProgress,
     diagnostics: &crate::diagnostics::Diagnostics,
     run: VdLevels<'_>,
-) -> Result<(Vec<ZoomReport>, Vec<Range<usize>>), ExportError> {
+) -> Result<Drawn, ExportError> {
     let VdLevels {
         plan,
         probe,
@@ -1014,19 +1010,19 @@ pub(super) fn export_levels(
         let (probed, secs) = prober
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        probed?;
+        let probed = probed?;
         progress.profile.walls.probe = secs;
-        Ok((reports, groups))
+        Ok((reports, groups, probed))
     })
 }
 
 /// The error a probe that stopped sending ended with.
 fn prober_error(
-    prober: std::thread::ScopedJoinHandle<'_, (Result<(), ExportError>, f64)>,
+    prober: std::thread::ScopedJoinHandle<'_, (Result<usize, ExportError>, f64)>,
 ) -> ExportError {
     match prober.join() {
         Ok((Err(error), _)) => error,
-        Ok((Ok(()), _)) => ExportError::Io(std::io::Error::other(
+        Ok((Ok(_), _)) => ExportError::Io(std::io::Error::other(
             "the variable-depth probe ended before every level was decided",
         )),
         Err(panic) => std::panic::resume_unwind(panic),
@@ -1461,7 +1457,9 @@ mod tests {
 
     use prost::Message;
 
-    use super::super::{buffer_deg_at_zoom, export_pmtiles_with_partition_target, ExportReport};
+    use super::super::{
+        buffer_deg_at_zoom, export_pmtiles_with_partition_target, ExportReport, VariableDepthReport,
+    };
     use super::{candidate_extent, within_clamp};
     use crate::archive_index::ArchiveIndex;
     use crate::tile::TileCoord;
@@ -1696,6 +1694,115 @@ mod tests {
         };
         let (_, tiles) = export_vd(&ov, gzip);
         assert!(stopped(&tiles, 6).is_empty());
+    }
+
+    /// The archive says it is variable-depth, with its canonical max zoom;
+    /// the header's max zoom is the deepest stored tile; the report keeps
+    /// the canonical and stored max zooms apart; and merge and pyramid
+    /// refuse the archive, since their tiles would hide its stopped ones.
+    #[test]
+    fn marked_archive_reports_its_depth_and_refuses_merging() {
+        let dir = tempfile::tempdir().unwrap();
+        let input: Vec<(f64, f64, f64)> =
+            (0..5).map(|i| (10.0 + f64::from(i), 45.0, 1.0)).collect();
+        let ov = unthinned(dir.path(), &input, 6);
+        let (report, tiles) = export_vd(&ov, raw_cap(1_000_000));
+        assert_eq!(tiles.keys().copied().collect::<Vec<_>>(), vec![(0, 0, 0)]);
+        let out = ov.with_extension("vd.pmtiles");
+        let index = ArchiveIndex::open(&out).unwrap();
+        assert_eq!(index.header().max_zoom, 0);
+        assert!(index.is_variable_depth());
+        assert_eq!(
+            index.metadata_json().unwrap()["tylertoo:variable_depth"],
+            serde_json::json!({"enabled": true, "canonical_maxzoom": 6})
+        );
+        assert_eq!(report.max_zoom, 6);
+        assert_eq!(
+            report.variable_depth,
+            Some(VariableDepthReport {
+                canonical_max_zoom: 6,
+                stored_max_zoom: Some(0),
+                probed_tiles: 1,
+                stopped_tiles: 1,
+            })
+        );
+        assert_eq!(report.zooms[0].stopped_tiles, 1);
+
+        let merged = dir.path().join("merged.pmtiles");
+        let err = crate::merge::merge_shards(
+            std::slice::from_ref(&out),
+            &merged,
+            &crate::merge::MergeOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("variable-depth"), "{err}");
+        let bands = crate::pyramid::parse_bands(&[format!("0-6:{}", out.display())]).unwrap();
+        let err = crate::pyramid::merge_bands(&bands, &merged).unwrap_err();
+        assert!(err.to_string().contains("variable-depth"), "{err}");
+        assert!(!merged.exists());
+
+        let off = dir.path().join("off.pmtiles");
+        let report = export_pmtiles(&ov, &off, &raw_cap(1_000_000)).unwrap();
+        assert_eq!(report.variable_depth, None);
+        assert!(report.zooms.iter().all(|z| z.stopped_tiles == 0));
+        assert!(!ArchiveIndex::open(&off).unwrap().is_variable_depth());
+    }
+
+    /// A rejected probe's repairs are not the export's: with every probe
+    /// over the gzip cap, nothing stops, and the tiles and diagnostics match
+    /// the export without variable depth.
+    #[test]
+    fn rejected_probes_leave_no_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        // Self-crossing bowties: every encode of one repairs it.
+        // Lopsided, so their signed area is not zero, and big enough for the
+        // visibility gate to keep them at z0.
+        let geoms: Vec<Geometry> = (0..20)
+            .map(|i| {
+                let (x, y) = (-170.0 + f64::from(i) * 17.0, 10.0);
+                Geometry::Polygon(geo::Polygon::new(
+                    geo::LineString::from(vec![
+                        (x, y),
+                        (x + 8.0, y + 8.0),
+                        (x + 8.0, y),
+                        (x, y + 2.0),
+                        (x, y),
+                    ]),
+                    vec![],
+                ))
+            })
+            .collect();
+        let v: Vec<f64> = (0..20).map(f64::from).collect();
+        let ov = overview_v(dir.path(), &geoms, &v, 6, ConvertOptions::default());
+        let gzip = ExportOptions {
+            tile_size_limit: None,
+            compressed_tile_size_limit: Some(40),
+            ..ExportOptions::default()
+        };
+        let off_path = dir.path().join("off.pmtiles");
+        let off = export_pmtiles(&ov, &off_path, &gzip).unwrap();
+        let (on, tiles) = export_vd(&ov, gzip);
+        let vd = on.variable_depth.as_ref().unwrap();
+        assert!(vd.probed_tiles > 0);
+        assert_eq!(vd.stopped_tiles, 0);
+        assert!(
+            off.diagnostics
+                .iter()
+                .any(|d| matches!(d, crate::diagnostics::Diagnostic::PolygonRepaired { .. })),
+            "{:?}",
+            off.diagnostics
+        );
+        // The memory budget note reads free RAM, which moves between runs.
+        let export_events = |r: &ExportReport| -> Vec<_> {
+            r.diagnostics
+                .iter()
+                .filter(|d| !matches!(d, crate::diagnostics::Diagnostic::MemoryBudget { .. }))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(export_events(&on), export_events(&off));
+        assert_eq!(on.source_losses, off.source_losses);
+        assert_eq!(tiles, read_tiles(&off_path));
     }
 
     /// A candidate's extent, buffer included, stays inside the MVT

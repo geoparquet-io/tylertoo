@@ -1214,6 +1214,11 @@ impl BandArchive {
                 header.tile_type
             )));
         }
+        if index.is_variable_depth() {
+            return Err(Error::PMTilesWrite(crate::merge::variable_depth_refusal(
+                path, "pyramid",
+            )));
+        }
 
         let internal = header.internal_compression;
         let header_zooms = (header.min_zoom, header.max_zoom);
