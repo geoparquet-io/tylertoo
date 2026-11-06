@@ -484,12 +484,16 @@ def tool_row(label: str, runs: list[dict], conversion_s: float | None = None,
     cores = [r["cpu_s"] / r["wall_s"] for r in runs if r.get("cpu_s") and r["wall_s"]]
     fetched = [r["bytes_fetched"] for r in runs if r.get("bytes_fetched")]
     sizes = sorted({r["output"]["bytes"] for r in runs if r["output"]["bytes"]})
+    shas = sorted({r["output"]["sha256"] for r in runs if r["output"]["sha256"]})
+    # A kept archive describes this row only if the timed runs produced it.
+    if archive and archive["sha256"] not in shas:
+        archive = None
     return {"label": label, "runs_wall_s": [r["wall_s"] for r in runs],
             "conversion_wall_s": conversion_s,
             "peak_rss_bytes": int(max(peak)) if peak else None,
             "effective_cores": round(median(cores), 1) if cores else None,
             "archive_bytes": sizes[-1] if sizes else None,
-            "archive_sha256": sorted({r["output"]["sha256"] for r in runs if r["output"]["sha256"]}),
+            "archive_sha256": shas,
             "peak_disk_bytes": max(r["scratch_peak_mib"] for r in runs) * (1 << 20) if runs else None,
             "fetched_bytes": int(median(fetched)) if fetched else None,
             "steps": steps, "archive": archive, "note": note}
@@ -556,7 +560,8 @@ def provenance(tylertoo: str) -> dict:
             return None
     return {"commit": sh(["git", "-C", str(ROOT), "rev-parse", "HEAD"]),
             "tylertoo_version": sh([tylertoo, "--version"]),
-            "host": f"{platform.node()}, {platform.machine()}",
+            # No hostname: it is a private network address on cloud hosts.
+            "host": "{machine}, {cpu_model}".format(**rm.host_class()),
             "nproc": os.cpu_count(), "kernel": platform.release(),
             "allocator": rm.detect_allocator(Path(tylertoo)),
             "tool_versions": {"tippecanoe": sh([TIPPECANOE, "--version"]),

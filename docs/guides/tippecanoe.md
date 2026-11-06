@@ -61,6 +61,26 @@ The honest footnotes, which are the point of this table:
 - On a small contiguous admin coverage (the 17k-polygon fixture set), the
   parity-matched ratio is **≈7.5×**, not 16–20×.
 
+## At scale: 21.6M Overture buildings
+
+The Netherlands bbox of Overture buildings release `2026-10-21.0`, every
+part pinned by ETag. tylertoo reads the GeoParquet parts straight from
+`s3://` with `--bbox`, fetching only the row groups the bbox touches.
+tippecanoe can't read GeoParquet or S3, so its time includes extracting the
+same bbox to local GeoParquet with gpio and converting it to FlatGeobuf.
+
+<!-- bench:overture-buildings-netherlands/vida-head-to-head -->
+Overture buildings 2026-10-21.0, netherlands (bbox 3.31,50.75,7.23,53.56): 21,557,082 features, 1.9 GB.
+
+| tool | end-to-end wall | peak RSS | effective cores | archive | note |
+|---|---|---|---|---|---|
+| tylertoo, s3:// in place | 107 s | 15.3 GB | 16.0 | 0.9 GB | reads the parts in place; no extract |
+| tylertoo, local extract | 321 s | 13.1 GB | 22.7 | 0.9 GB | end to end includes the gpio extract |
+| tippecanoe v2.79.0 | 1,417 s | 6.1 GB | 3.1 | 0.8 GB | extract + FlatGeobuf + tile |
+
+_Run: commit 875b1bdc9478e323668d48c366888c4ecb36d6f4, tylertoo 0.8.0, tippecanoe v2.79.0, gpio 1.7.0, aarch64, 0xd40, 2026-11-06._
+<!-- /bench -->
+
 Every number above is from a committed record
 ([`benchmarks/results/e2e-corpus.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/results/e2e-corpus.json),
 [`e2e-fixtures.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/results/e2e-fixtures.json))

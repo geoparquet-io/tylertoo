@@ -225,3 +225,12 @@ def test_shim_translates_tylertoo_argv_and_reports_steps(tmp_path):
     assert "fgb_bytes=5" in line
     assert (tmp_path / "keep" / "tippecanoe.pmtiles").exists()
     assert not (tmp_path / "tmp" / "input.fgb").exists()
+
+
+def test_kept_archive_attaches_only_to_the_row_that_produced_it():
+    run = {"wall_s": 10.0, "cpu_s": 20.0, "peak_rss_kib": 1024, "scratch_peak_mib": 1,
+           "output": {"bytes": 5, "sha256": "aa"}}
+    kept = {"sha256": "aa", "tiles": 1}
+    assert sc.tool_row("x", [run], archive=kept)["archive"] == kept
+    other = {**run, "output": {"bytes": 6, "sha256": "bb"}}
+    assert sc.tool_row("x", [other], archive=kept)["archive"] is None

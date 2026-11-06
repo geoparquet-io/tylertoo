@@ -422,7 +422,8 @@ SECTIONS = ["headline", "quality-matched", "memory", "input", "phases", "flags",
 
 def footer(r) -> str:
     p = r["provenance"]
-    tools = ", ".join(f"{k} {v}" for k, v in p["tool_versions"].items()
+    tools = ", ".join(v if str(v).startswith(k) else f"{k} {v}"
+                      for k, v in p["tool_versions"].items()
                       if k != "tippecanoe_commit") or "no tool versions recorded"
     return (f"_Run: commit {p['commit'] or 'unknown'}, tylertoo "
             f"{p['tylertoo_version'].removeprefix('tylertoo ')}, {tools}, {p['host']}, "
