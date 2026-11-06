@@ -1820,6 +1820,7 @@ impl PyramidOptions {
     ///
     /// [`PyramidError::Config`], or [`PyramidError::InvalidConfig`] for a convert knob.
     /// Validate these options and return the immutable engine configuration.
+    #[doc(hidden)]
     pub fn validate(
         &self,
     ) -> Result<crate::overview::config::ValidatedConfig<'_, Self>, PyramidError> {

@@ -549,6 +549,7 @@ impl TileRange {
     }
 
     /// How many pivot tiles the run holds.
+    #[doc(hidden)]
     pub fn pivot_tiles(&self) -> u64 {
         self.hi - self.lo + 1
     }
@@ -561,6 +562,7 @@ impl TileRange {
     /// descendants occupy `base(z) + h * 4^Δ ..= base(z) + (h+1) * 4^Δ - 1`
     /// (see `crate::tile::node_id_range`), and a contiguous run of `h`
     /// concatenates those blocks into one contiguous interval.
+    #[doc(hidden)]
     pub fn ids_at(&self, zoom: u8) -> Option<RangeInclusive<u64>> {
         if zoom < self.pivot_zoom || zoom > crate::tile::MAX_ZOOM {
             return None;
@@ -713,6 +715,7 @@ pub struct ShardPlan {
 
 impl ShardPlan {
     /// How many shards the plan cuts.
+    #[doc(hidden)]
     pub fn shards(&self) -> usize {
         self.ranges.len()
     }
@@ -732,6 +735,7 @@ impl ShardPlan {
     /// input fingerprint are advisory, and a plan re-cut to identical ranges
     /// with a different estimate is the same cut. What must match is which
     /// tiles each job owns.
+    #[doc(hidden)]
     pub fn cut_digest(&self) -> u64 {
         let mut h = xxhash_rust::xxh3::Xxh3::new();
         // Domain-separated and length-prefixed, so no two different cuts can
@@ -748,6 +752,7 @@ impl ShardPlan {
 
     /// [`ShardPlan::cut_digest`] as the fixed-width hex string the convert
     /// plan's fingerprint records.
+    #[doc(hidden)]
     pub fn cut_digest_hex(&self) -> String {
         format!("{:016x}", self.cut_digest())
     }
@@ -765,6 +770,7 @@ impl ShardPlan {
     ///
     /// Returns [`ShardError::PivotNotCoarser`] if the plan's pivot is finer
     /// than `max_zoom`.
+    #[doc(hidden)]
     pub fn check_max_zoom(&self, max_zoom: u8, path: &Path) -> Result<(), ShardError> {
         if self.pivot_zoom > max_zoom {
             return Err(ShardError::PivotNotCoarser {
@@ -782,6 +788,7 @@ impl ShardPlan {
     ///
     /// Returns [`ShardError::ShardIndexOutOfRange`] if the plan has no shard
     /// `index`.
+    #[doc(hidden)]
     pub fn range(&self, index: usize) -> Result<TileRange, ShardError> {
         let r = self
             .ranges
@@ -800,6 +807,7 @@ impl ShardPlan {
     ///
     /// Returns [`ShardError::ShardCountMismatch`] if the role's `N` differs
     /// from the plan's shard count, or an error if its index is out of range.
+    #[doc(hidden)]
     pub fn range_for(&self, role: ShardRole, path: &Path) -> Result<Option<TileRange>, ShardError> {
         match role {
             ShardRole::Coarse => Ok(None),

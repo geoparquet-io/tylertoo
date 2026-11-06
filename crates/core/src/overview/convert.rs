@@ -1090,6 +1090,7 @@ impl ConvertOptions {
     /// The first rule broken; every error this returns is
     /// [`ErrorKind::Usage`](crate::error::ErrorKind::Usage).
     /// Validate these options and return the immutable engine configuration.
+    #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
         super::config::validate_convert(self)
     }

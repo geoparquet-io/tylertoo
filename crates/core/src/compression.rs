@@ -48,6 +48,7 @@ impl Compression {
     }
 
     /// Get the PMTiles byte code for this compression type.
+    #[doc(hidden)]
     pub fn code(&self) -> u8 {
         *self as u8
     }
@@ -56,6 +57,7 @@ impl Compression {
     ///
     /// Inverse of [`Compression::code`]. Returns `None` for codes outside the
     /// PMTiles v3 spec (0-4).
+    #[doc(hidden)]
     pub fn from_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(Compression::Unknown),

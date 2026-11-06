@@ -663,6 +663,7 @@ impl ExportOptions {
     /// missing spill directory, or [`ConfigError::MetadataTooLarge`] if
     /// `metadata` is too large for an archive's metadata.
     /// Validate these options and return the immutable engine configuration.
+    #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConfigError> {
         super::config::validate_export(self)
     }

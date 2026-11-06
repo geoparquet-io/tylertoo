@@ -26,22 +26,26 @@
 //! | PMTiles → GeoParquet | [`decode_pmtiles`] | [`DecodeOptions`] | [`DecodeReport`] | [`DecodeError`] |
 //!
 //! Options start from `Default` and change through `with_*` setters (or
-//! their public fields); call `validate()` to check them before any input
+//! their public fields); each facade function checks them before any input
 //! is read. [`Classify::kind`] says what any error means to the caller
 //! ([`ErrorKind`]). Options, reports, errors and kinds are
 //! `#[non_exhaustive]`, so a minor release can add a field, variant or
 //! setter.
 //!
 //! ```
-//! use tylertoo_core::{Classify, ConvertOptions, ErrorKind, LevelPlan, TilesOptions};
+//! use std::path::Path;
+//! use tylertoo_core::{
+//!     convert_to_pmtiles, Classify, ConvertOptions, ErrorKind, LevelPlan, TilesInput, TilesOptions,
+//! };
 //!
 //! let options = TilesOptions::default().with_convert(
 //!     ConvertOptions::default()
 //!         .with_levels(LevelPlan::ZoomRange { min_zoom: 0, max_zoom: 12 })
 //!         .with_read_batch_size(0),
 //! );
-//! // Refused before any input is read.
-//! let err = options.validate().unwrap_err();
+//! // Refused before the (missing) input is read.
+//! let input = TilesInput::Path("missing.parquet".into());
+//! let err = convert_to_pmtiles(&input, Path::new("out.pmtiles"), &options).unwrap_err();
 //! assert_eq!(err.kind(), ErrorKind::Usage);
 //! ```
 //!
@@ -188,7 +192,11 @@ pub use diagnostics::{
 };
 pub use error::{Classify, ErrorKind};
 pub use input::{FetchStats, InputError};
-pub use overview::config::{ConfigError, OutputKind, ValidatedConfig};
+pub use overview::config::{ConfigError, OutputKind};
+// The facade validates its own options; the frontends call `validate()`
+// early for parity, so the proof type stays reachable but unstable.
+#[doc(hidden)]
+pub use overview::config::ValidatedConfig;
 pub use pmtiles_metadata::TilesetMetadata;
 pub use pmtiles_writer::{TileType, WriteError};
 pub use resolved_schema::GeoVersion;
@@ -371,6 +379,7 @@ impl error::Classify for Error {
     }
 }
 
+#[doc(hidden)]
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]

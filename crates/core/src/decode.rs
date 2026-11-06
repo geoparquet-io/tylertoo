@@ -142,6 +142,7 @@ impl DecodeOptions {
     ///
     /// [`DecodeError::InvalidZoomRange`] when both bounds are set and
     /// `min_zoom > max_zoom`.
+    #[doc(hidden)]
     pub fn validate(&self) -> Result<(), DecodeError> {
         match (self.min_zoom, self.max_zoom) {
             (Some(min_zoom), Some(max_zoom)) if min_zoom > max_zoom => {

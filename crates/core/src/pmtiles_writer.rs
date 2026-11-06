@@ -260,6 +260,7 @@ impl TileType {
     /// Parse a PMTiles spec byte code back into a tile type (byte 99).
     ///
     /// Returns `None` for codes outside the PMTiles v3 spec (0-5).
+    #[doc(hidden)]
     pub fn from_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(TileType::Unknown),

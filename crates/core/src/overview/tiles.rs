@@ -63,6 +63,7 @@ impl TilesInput {
     /// `s3://`/`gs://` prefix, last literal segment for a glob, manifest stem for
     /// a manifest (core owns the rules — see
     /// [`crate::input_set::derive_layer_name`]).
+    #[doc(hidden)]
     pub fn derive_layer_name(&self) -> String {
         let p = match self {
             TilesInput::Path(p) | TilesInput::Manifest(p) => p,
@@ -372,6 +373,7 @@ impl TilesOptions {
     /// either. An explicit cap set on the result still applies. The CLI's
     /// `tiles --verbatim` and the Python `convert(verbatim=True)` both start
     /// here.
+    #[doc(hidden)]
     pub fn export_defaults(verbatim: bool) -> ExportOptions {
         let export = ExportOptions::default();
         if verbatim {
@@ -397,6 +399,7 @@ impl TilesOptions {
     ///
     /// The first rule broken; each is [`ErrorKind::Usage`](crate::error::ErrorKind::Usage).
     /// Validate these options and return the immutable engine configuration.
+    #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, TilesError> {
         super::config::validate_tiles(self)
     }
@@ -413,6 +416,7 @@ impl TilesOptions {
     /// # Errors
     ///
     /// The first rule broken.
+    #[doc(hidden)]
     pub fn validate_plan_only(&self) -> Result<(), TilesError> {
         self.validate_for(Run::PlanOnly)
     }
@@ -589,6 +593,7 @@ impl TilesReport {
     /// summary covers the requested range, which can be wider than the
     /// archive's own PMTiles header — these are the zooms a caller should
     /// say hold nothing rather than imply they do.
+    #[doc(hidden)]
     pub fn empty_declared_zooms(&self) -> Vec<u8> {
         self.convert
             .skipped_empty_levels

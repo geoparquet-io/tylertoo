@@ -61,6 +61,7 @@ pub enum Crs {
 impl Crs {
     /// Convert a distance in meters into this CRS's coordinate units.
     #[inline]
+    #[doc(hidden)]
     pub fn meters_to_units(self, meters: f64) -> f64 {
         match self {
             Crs::Epsg3857 => meters,

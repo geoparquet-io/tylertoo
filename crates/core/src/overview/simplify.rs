@@ -116,6 +116,7 @@ pub enum CollapseMode {
 impl CollapseMode {
     /// The disposition that applies when no ladder has resolved
     /// [`Auto`](Self::Auto): `Auto` acts as `Square`.
+    #[doc(hidden)]
     pub fn resolved(self) -> Self {
         match self {
             Self::Auto => Self::Square,
@@ -124,6 +125,7 @@ impl CollapseMode {
     }
 
     /// Whether collapsed polygons become placeholder squares.
+    #[doc(hidden)]
     pub fn is_square(self) -> bool {
         self.resolved() == Self::Square
     }
