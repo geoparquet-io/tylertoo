@@ -112,7 +112,7 @@ def run(name, binary: Path, flag: bool, tmp: Path, version: str) -> dict:
 def build(args, tmp: Path) -> dict:
     pq = make_inputs(args.buildings, tmp)
     tc_v = subprocess.run([args.tippecanoe, "--version"], capture_output=True, text=True).stderr.strip() or "tippecanoe v2.79.0"
-    mb_v = subprocess.run([args.manby, "--version"], capture_output=True, text=True).stdout.strip()
+    mb_v = (lambda r: (r.stdout + r.stderr).strip())(subprocess.run([args.manby, "--version"], capture_output=True, text=True))
     runs = {
         "tippecanoe": run("tippecanoe-vd", args.tippecanoe, True, tmp, tc_v),
         "manby": run("manby-vd", args.manby, True, tmp, mb_v),
