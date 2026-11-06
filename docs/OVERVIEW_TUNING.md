@@ -201,7 +201,10 @@ thinned or clustered. Lines and polygons are not counted, since
 simplification and the visibility gate only lose resolution, which the
 finest-level tile restores. A line or polygon with an entry zoom blocks every
 tile above its rung. With clustering or point thinning on, few tiles stop
-outside sparse areas.
+outside sparse areas. On a file with both points and polygons, where a
+coarse level may draw a polygon as a point (`--collapse`, a `point`
+representation band, or an entry ladder), equal counts prove nothing, so
+no tile holding a point stops.
 
 **Serving.** The PMTiles header's `max_zoom` is the deepest stored tile, and
 the metadata carries `"tylertoo:variable_depth": {"enabled": true,
