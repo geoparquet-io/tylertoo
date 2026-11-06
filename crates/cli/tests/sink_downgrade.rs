@@ -48,6 +48,9 @@ const READ_BATCH_ROWS: &str = "256";
 /// ~195 MB the heavy tail buffers. At the 180 MB this test used before #788,
 /// the encode floor alone exceeds the allowance, so `auto` spills before
 /// pass 2 starts and there is nothing left to downgrade.
+/// The margins assume 4 encode threads (`min(threads, 4)` grants), so
+/// `run_overview` pins `RAYON_NUM_THREADS=4`: a 3-core macOS runner would
+/// otherwise grant 3 and leave the sinks too much.
 const MEM_LIMIT_BYTES: &str = "1850000000";
 
 fn tylertoo_bin() -> &'static str {
@@ -145,6 +148,7 @@ fn run_overview(
         "--read-batch-size",
         READ_BATCH_ROWS,
     ])
+    .env("RAYON_NUM_THREADS", "4")
     .env("TYLERTOO_PROFILE_JSON", &profile_json)
     .env_remove("TYLERTOO_AUTO_MEM_LIMIT_BYTES");
     if let Some(limit) = mem_limit {
