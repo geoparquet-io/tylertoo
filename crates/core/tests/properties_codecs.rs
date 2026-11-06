@@ -113,6 +113,17 @@ proptest! {
         prop_assert!(b.lng_min < b.lng_max && b.lat_min < b.lat_max);
         prop_assert!(b.lng_min >= -180.0 && b.lng_max <= 180.0);
         prop_assert!(b.lat_min >= -85.06 && b.lat_max <= 85.06);
+        // The grid covers the world: first column starts at -180, last ends
+        // at 180; the top row reaches the Web Mercator limit.
+        if x == 0 {
+            prop_assert_eq!(b.lng_min, -180.0);
+        }
+        if u64::from(x) + 1 == n {
+            prop_assert_eq!(b.lng_max, 180.0);
+        }
+        if y == 0 {
+            prop_assert!((b.lat_max - 85.0511287798).abs() < 1e-6, "{}", b.lat_max);
+        }
         // Neighbours share an edge exactly.
         if u64::from(x) + 1 < n {
             prop_assert_eq!(tile_bounds(x + 1, y, z).lng_min, b.lng_max);
@@ -169,5 +180,24 @@ proptest! {
             .collect();
         prop_assert_eq!(decode_lines(&encode_multi_linestring(&ml, &b, extent)), expected.clone());
         prop_assert_eq!(decode_lines(&encode_linestring(&ml.0[0], &b, extent)), vec![expected[0].clone()]);
+    }
+}
+
+/// The corners of the grid at every zoom, so the whole-world checks do not
+/// depend on the random draw landing on an edge tile.
+#[test]
+fn grid_corners_cover_the_world_at_every_zoom() {
+    for z in 0u8..=30 {
+        let last = (tiles_per_axis(z) - 1) as u32;
+        assert_eq!(tile_bounds(0, 0, z).lng_min, -180.0, "z{z}");
+        assert_eq!(tile_bounds(last, last, z).lng_max, 180.0, "z{z}");
+        assert!(
+            (tile_bounds(0, 0, z).lat_max - 85.0511287798).abs() < 1e-6,
+            "z{z}"
+        );
+        assert!(
+            (tile_bounds(last, last, z).lat_min + 85.0511287798).abs() < 1e-6,
+            "z{z}"
+        );
     }
 }

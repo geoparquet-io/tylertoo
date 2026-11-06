@@ -15,7 +15,7 @@ records the ownership refactors that landed in #787.
 
 | Concept | Owner |
 |---|---|
-| Opening untrusted Parquet/IPC input (batch-size cap, footer pre-check, panic → error) | `tylertoo_io::untrusted::{open_parquet, open_ipc}` |
+| Opening untrusted Parquet/IPC input (batch-size cap, footer pre-check, panic → error) | `tylertoo_io::{open_parquet, open_ipc}` |
 | Options and their validation, before any I/O, for tiles/overview/export/pyramid, CLI and Python | `TilesOptions { convert, export }` and its `validate()` (`overview/tiles.rs`, delegating to `ConvertOptions::validate` and `ExportOptions::validate`) |
 | Warnings, drop counters, and report lines | the typed `Diagnostic` channel in `diagnostics.rs`; one `Display` each |
 | Geometry column, CRS, version, renames, property columns of an input | `ResolvedSchema` (`resolved_schema.rs`), computed once per input part |
