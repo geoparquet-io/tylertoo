@@ -23,11 +23,11 @@ use super::super::level::{Mode, OverviewsMeta};
 use super::super::reader::OverviewReader;
 use super::{
     account_sources, buffer_deg_at_zoom, build_mvt_within, collect_wave, encoded_tile,
-    export_level_groups, for_each_member_key, key_to_xy, lnglat_bbox, near_world_edge, plan_level,
-    plan_level_groups, plan_levels, size_bboxes, sort_tile_for_encode, tile_fit, tile_key,
-    tiles_in_ranges, CheckpointCtx, Crs, EncodedTile, ExportError, ExportLevelCtx, ExportOptions,
-    ExportProgress, ExportTimers, FillTally, LevelCtx, LevelMemory, LevelScan, Member,
-    PartitionBudget, PublishedNames, ResolvedFeatureId, StreamingPmtilesWriter, TileMvt,
+    export_level_groups, for_each_member_key, geometry_lnglat_bbox, key_to_xy, near_world_edge,
+    plan_level, plan_level_groups, plan_levels, size_bboxes, sort_tile_for_encode, tile_fit,
+    tile_key, tiles_in_ranges, CheckpointCtx, Crs, EncodedTile, ExportError, ExportLevelCtx,
+    ExportOptions, ExportProgress, ExportTimers, FillTally, LevelCtx, LevelMemory, LevelScan,
+    Member, PartitionBudget, PublishedNames, ResolvedFeatureId, StreamingPmtilesWriter, TileMvt,
     ZoomReport, DEFAULT_EXTENT,
 };
 use crate::compression::TileGzipCache;
@@ -550,6 +550,8 @@ pub(super) struct VdPlan {
     /// Each level's zoom, and the canonical (finest) level's index.
     zooms: Vec<u8>,
     canonical: usize,
+    /// [`VdScan`]'s first level the clamp lets stop.
+    first_probed: usize,
 }
 
 impl VdScan {
@@ -643,11 +645,7 @@ impl VdScan {
             Some((
                 geoms
                     .iter()
-                    .map(|g| {
-                        g.as_ref()
-                            .and_then(geo::BoundingRect::bounding_rect)
-                            .map(|r| lnglat_bbox(r.min().x, r.min().y, r.max().x, r.max().y, crs))
-                    })
+                    .map(|g| g.as_ref().and_then(|g| geometry_lnglat_bbox(g, crs)))
                     .collect(),
                 geoms
                     .iter()
@@ -792,6 +790,7 @@ impl VdScan {
             canonical_counts,
             zooms: self.zooms,
             canonical: self.canonical,
+            first_probed: self.first_probed,
         }
     }
 }
@@ -859,7 +858,7 @@ impl VdPlan {
     /// probe runs.
     pub(super) fn first_probed_level(&self, options: &ExportOptions) -> usize {
         let none = Frontier::new(self.zooms.len());
-        (0..self.canonical)
+        (self.first_probed..self.canonical)
             .find(|&k| self.candidates(k, options, &none).is_some())
             .unwrap_or(self.canonical)
     }

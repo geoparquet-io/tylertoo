@@ -5425,11 +5425,7 @@ fn scan_all_levels_from(
                             }
                             ScanBboxSource::Geometry => Ok(geometries()?
                                 .iter()
-                                .map(|g| {
-                                    g.as_ref().and_then(BoundingRect::bounding_rect).map(|r| {
-                                        lnglat_bbox(r.min().x, r.min().y, r.max().x, r.max().y, crs)
-                                    })
-                                })
+                                .map(|g| g.as_ref().and_then(|g| geometry_lnglat_bbox(g, crs)))
                                 .collect()),
                         }
                     };
@@ -5490,57 +5486,36 @@ fn covering_batch_bboxes(
     names: &[String; 4],
     crs: Crs,
 ) -> Result<Option<Vec<Option<TileBounds>>>, ExportError> {
-    let not_covering =
-        || crate::Error::GeoParquetRead(format!("bbox covering {column:?} is not an f64 struct"));
-    let strukt = batch
-        .column_by_name(column)
-        .and_then(|c| c.as_struct_opt())
-        .ok_or_else(not_covering)?;
-    let child = |name: &String| {
-        strukt
-            .column_by_name(name)
-            .and_then(|c| c.as_primitive_opt::<Float64Type>())
-            .ok_or_else(not_covering)
-    };
-    let [xmin, ymin, xmax, ymax] = [
-        child(&names[0])?,
-        child(&names[1])?,
-        child(&names[2])?,
-        child(&names[3])?,
-    ];
-    let mut bboxes = Vec::with_capacity(strukt.len() - strukt.null_count());
-    for i in 0..strukt.len() {
-        if strukt.is_null(i) {
-            continue;
-        }
-        if [xmin, ymin, xmax, ymax].iter().any(|c| c.is_null(i)) {
-            return Ok(None);
-        }
-        let (x0, y0, x1, y1) = (xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i));
-        // Finite and ordered: `<=` is false for NaN, and an ordered pair with
-        // one infinite end cannot pass the finiteness check.
-        if !(x0 <= x1
-            && y0 <= y1
-            && x0.is_finite()
-            && x1.is_finite()
-            && y0.is_finite()
-            && y1.is_finite())
-        {
-            return Ok(None);
-        }
-        bboxes.push(Some(lnglat_bbox(x0, y0, x1, y1, crs)));
-    }
-    Ok(Some(bboxes))
+    Ok(covering_rows(batch, column, names, crs)?
+        .filter(|row| !matches!(row, Some(None)))
+        .collect())
 }
 
 /// [`covering_batch_bboxes`] row-aligned: `None` for a null row. Only called
-/// on a batch whose covering rows all passed that function's checks.
+/// on a batch whose covering rows all passed that function's checks; a row
+/// that does not is an error.
 fn covering_row_bboxes(
     batch: &RecordBatch,
     column: &str,
     names: &[String; 4],
     crs: Crs,
 ) -> Result<Vec<Option<TileBounds>>, ExportError> {
+    covering_rows(batch, column, names, crs)?
+        .collect::<Option<_>>()
+        .ok_or_else(|| {
+            crate::Error::GeoParquetRead(format!("bbox covering {column:?} has a malformed row"))
+                .into()
+        })
+}
+
+/// Each row of a bbox covering: `Some(None)` for a null row, `Some(bbox)`
+/// for a finite, ordered box, `None` for anything else.
+fn covering_rows<'a>(
+    batch: &'a RecordBatch,
+    column: &str,
+    names: &[String; 4],
+    crs: Crs,
+) -> Result<impl Iterator<Item = Option<Option<TileBounds>>> + 'a, ExportError> {
     let not_covering =
         || crate::Error::GeoParquetRead(format!("bbox covering {column:?} is not an f64 struct"));
     let strukt = batch
@@ -5559,19 +5534,24 @@ fn covering_row_bboxes(
         child(&names[2])?,
         child(&names[3])?,
     ];
-    Ok((0..strukt.len())
-        .map(|i| {
-            (!strukt.is_null(i)).then(|| {
-                lnglat_bbox(
-                    xmin.value(i),
-                    ymin.value(i),
-                    xmax.value(i),
-                    ymax.value(i),
-                    crs,
-                )
-            })
-        })
-        .collect())
+    Ok((0..strukt.len()).map(move |i| {
+        if strukt.is_null(i) {
+            return Some(None);
+        }
+        if [xmin, ymin, xmax, ymax].iter().any(|c| c.is_null(i)) {
+            return None;
+        }
+        let (x0, y0, x1, y1) = (xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i));
+        // Finite and ordered: `<=` is false for NaN, and an ordered pair with
+        // one infinite end cannot pass the finiteness check.
+        (x0 <= x1
+            && y0 <= y1
+            && x0.is_finite()
+            && x1.is_finite()
+            && y0.is_finite()
+            && y1.is_finite())
+        .then(|| Some(lnglat_bbox(x0, y0, x1, y1, crs)))
+    }))
 }
 
 /// A bbox in the file's CRS as lon/lat [`TileBounds`]: the two corners go
@@ -5586,6 +5566,13 @@ fn lnglat_bbox(x0: f64, y0: f64, x1: f64, y1: f64, crs: Crs) -> TileBounds {
     } else {
         TileBounds::new(x0, y0, x1, y1)
     }
+}
+
+/// A geometry's bounding box as lon/lat [`TileBounds`] (see
+/// [`lnglat_bbox`]); `None` when it has none (empty).
+pub(super) fn geometry_lnglat_bbox(geom: &Geometry<f64>, crs: Crs) -> Option<TileBounds> {
+    geom.bounding_rect()
+        .map(|r| lnglat_bbox(r.min().x, r.min().y, r.max().x, r.max().y, crs))
 }
 
 /// Decode one record batch's geometries into per-feature bounding boxes,
@@ -5609,11 +5596,7 @@ fn decode_batch_bboxes(
     extract_geometries_from_array(garr.as_ref(), &mut geoms, diagnostics)?;
     let bboxes = geoms
         .par_iter()
-        .map(|geom| {
-            geom.bounding_rect().map(|rect| {
-                lnglat_bbox(rect.min().x, rect.min().y, rect.max().x, rect.max().y, crs)
-            })
-        })
+        .map(|geom| geometry_lnglat_bbox(geom, crs))
         .collect();
     Ok(bboxes)
 }
