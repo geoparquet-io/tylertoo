@@ -48,6 +48,7 @@ pub const METERS_PER_DEGREE: f64 = 111_320.0;
 /// meters-denominated GSD tolerance is expressed in the geometry's
 /// coordinate units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Crs {
     /// Geographic lon/lat degrees. Meters are divided by
     /// [`METERS_PER_DEGREE`] (equatorial approximation; high-latitude
@@ -60,6 +61,7 @@ pub enum Crs {
 impl Crs {
     /// Convert a distance in meters into this CRS's coordinate units.
     #[inline]
+    #[doc(hidden)]
     pub fn meters_to_units(self, meters: f64) -> f64 {
         match self {
             Crs::Epsg3857 => meters,
@@ -110,6 +112,7 @@ pub struct Level {
 /// Level materialization mode (§2.2, §2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Mode {
     /// Each level is a self-contained rendering of the whole dataset (§2.2).
     Duplicating,
@@ -158,6 +161,7 @@ impl std::str::FromStr for Mode {
 /// `--no-default-features` build uses the system allocator (#739, #788).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum MemoryProfile {
     /// Size every phase to the machine (#788): the read-ahead, the compute
     /// window and the writer's encodes each take a share of one allowance
@@ -285,6 +289,13 @@ pub struct Generalization {
     /// this field existed; readers MUST tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub density_drop: Option<DensityProvenance>,
+    /// OPTIONAL line-thinning provenance (§3.5, additive; informative;
+    /// #803): the `--line-thinning` grid cell, as a multiple of the level
+    /// GSD, when it was not the default. Absent on a default run, so its
+    /// footer is byte-identical to before this field existed, and on files
+    /// written before it; readers MUST tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_thinning: Option<f64>,
     /// OPTIONAL point-clustering provenance (§3.5, additive; spec §12 draft).
     ///
     /// Records that clustering was enabled (Q4): the name of the cluster-size
@@ -424,6 +435,14 @@ pub struct DensityProvenance {
     pub gamma: f64,
     /// Super-cell edge length used for fairness, as a multiple of the level GSD.
     pub supercell_gsd_factor: f64,
+    /// Whether the budget also dropped lines (`--drop-lines`, #803).
+    /// Written only when true; absent on files written before it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drop_lines: bool,
+    /// Whether the budget also dropped polygons (`--drop-polygons`, #803).
+    /// Written only when true; absent on files written before it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drop_polygons: bool,
 }
 
 /// How the cell-winner priority (sort) key was chosen for a conversion (Q1).
@@ -433,6 +452,7 @@ pub struct DensityProvenance {
 /// so a reviewer can see whether a coarse render was ranked by class, by a
 /// numeric column, or fell back to size.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RankingProvenance {
     /// One of: `explicit-sort-key`, `class-ranking`, `auto-overture-roads`,
     /// `auto-confidence`, `size-fallback`.
@@ -576,6 +596,7 @@ pub struct OverviewsMeta {
 /// Structural validation errors (§3.3, §3.4). One variant per rule so callers
 /// (and tests) can assert exactly which invariant was violated.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum OverviewValidationError {
     /// `levels` is empty (§3.3).
     #[error("levels must be non-empty")]
@@ -585,6 +606,7 @@ pub enum OverviewValidationError {
     InvalidVersion(String),
     /// A `row_group_end` is < 0 or >= `num_row_groups` (§3.3).
     #[error("levels[{index}].row_group_end = {value} out of range [0, {num_row_groups})")]
+    #[non_exhaustive]
     RowGroupOutOfRange {
         /// Level index.
         index: usize,
@@ -597,6 +619,7 @@ pub enum OverviewValidationError {
     #[error(
         "levels[{index}].row_group_end = {value} is not strictly greater than previous {previous}"
     )]
+    #[non_exhaustive]
     RowGroupNotIncreasing {
         /// Level index.
         index: usize,
@@ -607,6 +630,7 @@ pub enum OverviewValidationError {
     },
     /// Final `row_group_end` != `num_row_groups - 1` (§3.3).
     #[error("final row_group_end = {final_value} must equal num_row_groups - 1 = {expected}")]
+    #[non_exhaustive]
     RowGroupFinalMismatch {
         /// The last level's `row_group_end`.
         final_value: i64,
@@ -615,6 +639,7 @@ pub enum OverviewValidationError {
     },
     /// A `gsd` is not > 0 (§3.3).
     #[error("levels[{index}].gsd = {value} must be > 0")]
+    #[non_exhaustive]
     GsdNotPositive {
         /// Level index.
         index: usize,
@@ -623,6 +648,7 @@ pub enum OverviewValidationError {
     },
     /// `gsd` is not strictly decreasing (§3.3).
     #[error("levels[{index}].gsd = {value} is not strictly less than previous {previous}")]
+    #[non_exhaustive]
     GsdNotDecreasing {
         /// Level index.
         index: usize,
@@ -633,12 +659,14 @@ pub enum OverviewValidationError {
     },
     /// `zoom` is present on some but not all levels (§3.3, all-or-none).
     #[error("zoom must be present on all levels or none; levels[{index}] disagrees")]
+    #[non_exhaustive]
     ZoomPartial {
         /// Level index that broke the all-or-none rule.
         index: usize,
     },
     /// `zoom` is not strictly increasing (§3.3).
     #[error("levels[{index}].zoom = {value} is not strictly greater than previous {previous}")]
+    #[non_exhaustive]
     ZoomNotIncreasing {
         /// Level index.
         index: usize,
@@ -652,6 +680,7 @@ pub enum OverviewValidationError {
     UnsupportedVersion(String),
     /// `duplicating` mode with `canonical_level` != `L-1` (§3.4).
     #[error("duplicating mode requires canonical_level = {expected} (L-1), got {actual:?}")]
+    #[non_exhaustive]
     CanonicalLevelMismatch {
         /// Expected value (`levels.len() - 1`).
         expected: i64,
@@ -660,6 +689,7 @@ pub enum OverviewValidationError {
     },
     /// `partitioning` (or absent) mode with a non-null `canonical_level` (§3.4).
     #[error("partitioning mode requires canonical_level = null, got {actual}")]
+    #[non_exhaustive]
     CanonicalLevelNotNull {
         /// Actual value found.
         actual: i64,
@@ -1202,6 +1232,7 @@ mod tests {
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
@@ -1245,6 +1276,7 @@ mod tests {
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
@@ -1288,6 +1320,7 @@ mod tests {
         let mut meta = duplicating_example();
         let mut g = Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
@@ -1386,6 +1419,7 @@ mod tests {
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
@@ -1395,6 +1429,8 @@ mod tests {
             entry_zoom: None,
             density_drop: Some(DensityProvenance {
                 drop_rate: 1.8,
+                drop_lines: false,
+                drop_polygons: false,
                 gamma: 1.5,
                 supercell_gsd_factor: 128.0,
             }),
@@ -1430,6 +1466,7 @@ mod tests {
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,
@@ -1513,6 +1550,7 @@ mod tests {
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
+            line_thinning: None,
             gsd_base: None,
             cascade: None,
             collapse: None,

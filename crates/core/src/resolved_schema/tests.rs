@@ -213,9 +213,13 @@ fn native_metadata(crs: Option<&str>) -> ParquetMetaData {
 }
 
 fn with_descriptor(md: &ParquetMetaData, json: String) -> ParquetMetaData {
+    with_kv(md, RESOLVED_SCHEMA_KEY, json)
+}
+
+fn with_kv(md: &ParquetMetaData, key: &str, json: String) -> ParquetMetaData {
     let file = md.file_metadata();
     let mut kv = file.key_value_metadata().cloned().unwrap_or_default();
-    kv.push(KeyValue::new(RESOLVED_SCHEMA_KEY.to_owned(), json));
+    kv.push(KeyValue::new(key.to_owned(), json));
     ParquetMetaData::new(
         FileMetaData::new(
             file.version(),
@@ -485,4 +489,84 @@ fn transformed_schema_preserves_crs_and_only_records_this_conversions_renames() 
         transformed.renames(),
         &BTreeMap::from([("geom".into(), "SHAPE".into())])
     );
+}
+
+#[test]
+fn geo_version_folds_parts() {
+    use super::GeoVersion::{Known, Missing, Mixed, Unknown};
+    let f = |v: &[Option<&str>]| super::GeoVersion::of_parts(v.iter().copied());
+    assert_eq!(f(&[None, None]), Missing);
+    assert_eq!(f(&[Some("1.1.0"), Some("1.1.0")]), Known("1.1.0".into()));
+    assert_eq!(f(&[Some("3.0.0")]), Unknown("3.0.0".into()));
+    assert_eq!(
+        f(&[Some("3.0.0"), Some("1.1.0")]),
+        Mixed(vec![Some("1.1.0".into()), Some("3.0.0".into())])
+    );
+    assert_eq!(
+        f(&[Some("1.1.0"), None]),
+        Mixed(vec![None, Some("1.1.0".into())])
+    );
+    let json = serde_json::to_value(Known("2.0.0".to_string())).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"status": "known", "version": "2.0.0"})
+    );
+    assert_eq!(
+        serde_json::to_value(Missing).unwrap(),
+        serde_json::json!({"status": "missing"})
+    );
+}
+
+/// #708: a non-string `version` is "unknown" in the warning AND the report
+/// (one classifier), and a declared "missing" is not a missing version.
+#[test]
+fn numeric_geo_version_is_unknown_in_the_warning_and_the_report() {
+    use super::GeoVersion;
+    let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "id",
+        arrow_schema::DataType::Int64,
+        false,
+    )])
+    .with_metadata(
+        [(
+            "geo".to_string(),
+            r#"{"version":1.1,"primary_column":"geometry","columns":{"geometry":{"crs":"EPSG:4326"}}}"#
+                .to_string(),
+        )]
+        .into(),
+    );
+    let resolved = super::ResolvedSchema::resolve(&schema).unwrap();
+    // The public accessor never invents a version string.
+    assert_eq!(resolved.version(), None);
+    assert_eq!(
+        GeoVersion::of_parts([resolved.declared_version()]),
+        GeoVersion::Unknown("non-string 1.1".into())
+    );
+    assert_eq!(
+        serde_json::to_value(GeoVersion::Mixed(vec![None, Some("missing".into())])).unwrap(),
+        serde_json::json!({"status": "mixed", "version": [null, "missing"]})
+    );
+}
+
+/// #708: a `geo` key without `version` on a native geometry column reads as
+/// 2.0.0 (the report says so), so the log must not say the version is missing.
+/// A non-native file with the same key still warns.
+#[test]
+fn native_column_implies_2_0_so_missing_geo_version_does_not_warn() {
+    let geo = r#"{"primary_column":"SHAPE","columns":{"SHAPE":{}}}"#.to_owned();
+    let native = with_kv(&native_metadata(None), "geo", geo.clone());
+    let resolved = ResolvedSchema::from_metadata(&native).unwrap();
+    assert_eq!(resolved.version(), Some("2.0.0"));
+    let sink = crate::diagnostics::Diagnostics::silent();
+    resolved.record_diagnostics(&sink);
+    assert!(sink.snapshot().is_empty(), "{:?}", sink.snapshot());
+
+    let schema = Schema::new_with_metadata(
+        vec![arrow_schema::Field::new("SHAPE", DataType::Binary, true)],
+        [("geo".into(), geo)].into(),
+    );
+    let resolved = ResolvedSchema::resolve(&schema).unwrap();
+    let sink = crate::diagnostics::Diagnostics::silent();
+    resolved.record_diagnostics(&sink);
+    assert_eq!(sink.snapshot().len(), 1);
 }

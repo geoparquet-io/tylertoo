@@ -569,7 +569,7 @@ pub struct OverviewArgs {
     pub min_zoom: u8,
 
     /// Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a
-    /// sample of the input. Ignored with `--gsd`.
+    /// sample of the input; `auto:14` caps the estimate at z14. Ignored with `--gsd`.
     #[arg(long, default_value_t = MaxZoom::Fixed(default_zooms(&ConvertOptions::default()).1))]
     pub max_zoom: MaxZoom,
 
@@ -617,7 +617,7 @@ pub struct TilesArgs {
     pub min_zoom: u8,
 
     /// Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a
-    /// sample of the input. Ignored with `--gsd`.
+    /// sample of the input; `auto:14` caps the estimate at z14. Ignored with `--gsd`.
     #[arg(long, default_value_t = MaxZoom::Fixed(TILES_DEFAULT_MAX_ZOOM))]
     pub max_zoom: MaxZoom,
 

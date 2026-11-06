@@ -142,6 +142,7 @@ impl SourceLosses {
         }
         Ok(())
     }
+    #[doc(hidden)]
     /// Prepare a bounded Python dict. Large lists become `{count, path}`.
     /// The file is removed on drop until [`Self::publish_python`] transfers
     /// ownership to the caller. Use [`Self::python_path`] for native Python
@@ -167,6 +168,7 @@ impl SourceLosses {
         Ok(out)
     }
 
+    #[doc(hidden)]
     /// Native filename of a prepared Python report, preserving non-UTF-8 bytes.
     pub fn python_path(&self) -> Option<PathBuf> {
         self.python_file.as_ref().map(|file| {
@@ -177,6 +179,7 @@ impl SourceLosses {
         })
     }
 
+    #[doc(hidden)]
     /// Transfer a prepared report file to its caller after the complete Python
     /// result has been constructed successfully. The caller must remove it.
     /// This is infallible, so publishing several report partitions is atomic

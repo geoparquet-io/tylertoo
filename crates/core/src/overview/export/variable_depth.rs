@@ -23,11 +23,11 @@ use super::super::level::{Mode, OverviewsMeta};
 use super::super::reader::OverviewReader;
 use super::{
     account_sources, buffer_deg_at_zoom, build_mvt_within, collect_wave, encoded_tile,
-    export_level_groups, for_each_member_key, key_to_xy, lnglat_bbox, near_world_edge, plan_level,
-    plan_level_groups, plan_levels, size_bboxes, sort_tile_for_encode, tile_fit, tile_key,
-    tiles_in_ranges, CheckpointCtx, Crs, EncodedTile, ExportError, ExportLevelCtx, ExportOptions,
-    ExportProgress, ExportTimers, FillTally, LevelCtx, LevelMemory, LevelScan, Member,
-    PartitionBudget, PublishedNames, ResolvedFeatureId, StreamingPmtilesWriter, TileMvt,
+    export_level_groups, for_each_member_key, geometry_lnglat_bbox, key_to_xy, near_world_edge,
+    plan_level, plan_level_groups, plan_levels, size_bboxes, sort_tile_for_encode, tile_fit,
+    tile_key, tiles_in_ranges, CheckpointCtx, Crs, EncodedTile, ExportError, ExportLevelCtx,
+    ExportOptions, ExportProgress, ExportTimers, FillTally, LevelCtx, LevelMemory, LevelScan,
+    Member, PartitionBudget, PublishedNames, ResolvedFeatureId, StreamingPmtilesWriter, TileMvt,
     ZoomReport, DEFAULT_EXTENT,
 };
 use crate::compression::TileGzipCache;
@@ -53,6 +53,10 @@ pub(crate) fn check_options(options: &ExportOptions) -> Result<(), ConfigError> 
         Some("--tile-range (a sharded build)".to_string())
     } else if options.zoom_ceiling.is_some() {
         Some("--zoom-ceiling (a sharded build)".to_string())
+    } else if options.tile_size_limit.is_none_or(|l| l == 0) {
+        // Without it, one candidate holds the whole canonical band, encoded
+        // in full before the gzip cap can reject it. tippecanoe always caps.
+        Some("--max-tile-size 0 (the probe needs the raw tile size cap)".to_string())
     } else {
         None
     };
@@ -63,8 +67,9 @@ pub(crate) fn check_options(options: &ExportOptions) -> Result<(), ConfigError> 
 
 /// The refusals the `tiles` facade checks against its convert options,
 /// before anything is read. Lines and polygons are never count-checked, so
-/// convert options that drop whole lines or polygons at coarse levels would
-/// let a coarse tile stop while hiding features its finer zooms show.
+/// under convert options that drop whole lines or polygons at coarse levels
+/// a stopped tile would draw, at its coarse zoom, the lines or polygons the
+/// user asked to be dropped there.
 ///
 /// # Errors
 ///
@@ -104,6 +109,7 @@ pub(crate) fn check_file(meta: &OverviewsMeta, mode: Mode) -> Result<(), ConfigE
     let unlisted_rungs = g
         .and_then(|g| g.entry_zoom.as_ref())
         .filter(|e| e.rungs.is_none());
+    let density = g.and_then(|g| g.density_drop.as_ref());
     let conflict = if mode == Mode::Partitioning {
         Some("a partitioning-mode overview".to_string())
     } else if let Some(z) = g.and_then(|g| g.zoom_ceiling) {
@@ -112,6 +118,12 @@ pub(crate) fn check_file(meta: &OverviewsMeta, mode: Mode) -> Result<(), ConfigE
         ))
     } else if g.is_some_and(|g| g.levels.iter().any(|l| l.thinning_factor > 0.0)) {
         Some("an overview built with --polygon-thinning above 0".to_string())
+    } else if g.is_some_and(|g| g.line_thinning.is_some()) {
+        Some("an overview built with a non-default --line-thinning".to_string())
+    } else if density.is_some_and(|d| d.drop_lines) {
+        Some("an overview built with --drop-lines".to_string())
+    } else if density.is_some_and(|d| d.drop_polygons) {
+        Some("an overview built with --drop-polygons".to_string())
     } else {
         unlisted_rungs.map(|e| {
             format!(
@@ -186,16 +198,62 @@ fn file_kinds(geo_json: Option<&str>) -> Kinds {
 }
 
 /// #794's hook: a rule that releases a canonical row only from some zoom on.
-/// A tile that would carry the row before its release cannot stop, so the
-/// row's member tile one zoom above its release, and every ancestor of it,
-/// is blocked.
+/// A tile that would carry the row before its release cannot stop, so every
+/// tile a coarser level's buffer gives the row, and its ancestors, is
+/// blocked.
 pub(crate) trait RowRelease: Sync + Send {
     /// The canonical columns the rule reads, by name.
     fn columns(&self) -> &[String];
     /// Each row's release zoom, row-aligned with `batch`: `0` for a row
     /// present at every zoom. `bboxes` is row-aligned too; a row without one
     /// is never drawn.
-    fn release_zooms(&self, batch: &RecordBatch, bboxes: &[Option<TileBounds>]) -> Vec<u8>;
+    ///
+    /// # Errors
+    ///
+    /// When a column is missing or its values do not read as the rule
+    /// needs: a rule that cannot read its rows would let tiles stop early.
+    fn release_zooms(
+        &self,
+        batch: &RecordBatch,
+        bboxes: &[Option<TileBounds>],
+    ) -> Result<Vec<u8>, ExportError>;
+}
+
+/// The index of a column rule A′ reads, refused when the file lacks it.
+pub(super) fn column_index(
+    schema: &arrow_schema::Schema,
+    name: &str,
+) -> Result<usize, ExportError> {
+    schema.index_of(name).map_err(|_| missing_column(name))
+}
+
+fn missing_column(name: &str) -> ExportError {
+    ExportError::VariableDepthColumn {
+        column: name.to_string(),
+        reason: "the overview's footer names but the file does not hold".to_string(),
+    }
+}
+
+/// Column `name` of `batch` cast to `to`, strictly: a value that does not
+/// convert is an error, not a null.
+fn read_column(
+    batch: &RecordBatch,
+    name: &str,
+    to: &arrow_schema::DataType,
+) -> Result<arrow_array::ArrayRef, ExportError> {
+    let column = batch
+        .column_by_name(name)
+        .ok_or_else(|| missing_column(name))?;
+    let strict = arrow_cast::CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    arrow_cast::cast_with_options(column, to, &strict).map_err(|e| {
+        ExportError::VariableDepthColumn {
+            column: name.to_string(),
+            reason: format!("holds values that do not read as {to} ({e})"),
+        }
+    })
 }
 
 /// The first [`RowRelease`]: an entry-zoom ladder (#364, #446) releases a
@@ -247,24 +305,25 @@ impl RowRelease for EntryRungs {
         &self.column
     }
 
-    fn release_zooms(&self, batch: &RecordBatch, bboxes: &[Option<TileBounds>]) -> Vec<u8> {
-        let values = batch
-            .column_by_name(&self.column[0])
-            .and_then(|c| arrow_cast::cast(c, &arrow_schema::DataType::Float64).ok());
-        let values = values.as_ref().map(|c| {
-            c.as_any()
-                .downcast_ref::<arrow_array::Float64Array>()
-                .expect("cast to Float64")
-        });
-        (0..batch.num_rows())
+    fn release_zooms(
+        &self,
+        batch: &RecordBatch,
+        bboxes: &[Option<TileBounds>],
+    ) -> Result<Vec<u8>, ExportError> {
+        let values = read_column(batch, &self.column[0], &arrow_schema::DataType::Float64)?;
+        let values = values
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .expect("cast to Float64");
+        Ok((0..batch.num_rows())
             .map(|i| {
-                let v = values.and_then(|c| c.is_valid(i).then(|| c.value(i)));
+                let v = values.is_valid(i).then(|| values.value(i));
                 match bboxes.get(i) {
                     Some(Some(_)) => self.ladder.entry_zoom(v).unwrap_or(0),
                     _ => 0,
                 }
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -464,6 +523,11 @@ pub(super) struct VdScan {
     kinds: Vec<Kinds>,
     cluster_column: Option<String>,
     release: Option<Box<dyn RowRelease>>,
+    /// Whether a coarse level may draw a polygon as a point: `--collapse`,
+    /// a `point` representation band, or an entry ladder (whose default
+    /// collapse is to points; the footer cannot tell it from
+    /// `--collapse-square`).
+    collapsed_points: bool,
     /// The canonical band sized at each level's zoom, every row.
     canonical_counts: Vec<HashMap<u64, usize>>,
     /// The canonical band's point rows at each level's zoom, when the band
@@ -488,6 +552,8 @@ pub(super) struct VdPlan {
     /// Each level's zoom, and the canonical (finest) level's index.
     zooms: Vec<u8>,
     canonical: usize,
+    /// [`VdScan`]'s first level the clamp lets stop.
+    first_probed: usize,
 }
 
 impl VdScan {
@@ -519,6 +585,11 @@ impl VdScan {
                 .filter(|c| c.enabled)
                 .map(|c| c.point_count_column.clone()),
             release: EntryRungs::from_meta(meta)?.map(|r| Box::new(r) as Box<dyn RowRelease>),
+            collapsed_points: g.is_some_and(|g| {
+                g.collapse.as_deref() == Some("point")
+                    || g.entry_zoom.is_some()
+                    || g.representation.iter().flatten().any(|b| b.repr == "point")
+            }),
             canonical_counts: vec![HashMap::new(); n],
             canonical_points: vec![HashMap::new(); n],
             canonical_rows: Vec::new(),
@@ -580,11 +651,7 @@ impl VdScan {
             Some((
                 geoms
                     .iter()
-                    .map(|g| {
-                        g.as_ref()
-                            .and_then(geo::BoundingRect::bounding_rect)
-                            .map(|r| lnglat_bbox(r.min().x, r.min().y, r.max().x, r.max().y, crs))
-                    })
+                    .map(|g| g.as_ref().and_then(|g| geometry_lnglat_bbox(g, crs)))
                     .collect(),
                 geoms
                     .iter()
@@ -618,16 +685,23 @@ impl VdScan {
                     .extend(points(flags).into_iter().flatten());
             }
             if let Some(release) = &self.release {
-                let zooms = release.release_zooms(batch, aligned);
-                let mut by_zoom: HashMap<u8, Vec<Option<TileBounds>>> = HashMap::new();
-                for (z, b) in zooms.iter().zip(aligned) {
-                    if *z > 0 && b.is_some() {
-                        by_zoom.entry(*z - 1).or_default().push(*b);
+                // A row is bad in every tile a coarser level's own buffer
+                // gives it, not only its rung's parent and that tile's
+                // ancestors: a coarser buffer reaches farther. Only level
+                // zooms are sized, so a rung past the finest level releases
+                // the row there, as convert clamps it.
+                let released = release.release_zooms(batch, aligned)?;
+                for &zoom in &self.zooms[self.first_probed..self.canonical] {
+                    let early: Vec<Option<TileBounds>> = released
+                        .iter()
+                        .zip(aligned)
+                        .filter(|&(&r, _)| r > zoom)
+                        .map(|(_, b)| *b)
+                        .collect();
+                    if !early.is_empty() {
+                        self.bad
+                            .extend(tile_keys(&early, zoom, opts).into_keys().map(|k| (zoom, k)));
                     }
-                }
-                for (zoom, rows) in by_zoom {
-                    self.bad
-                        .extend(tile_keys(&rows, zoom, opts).into_keys().map(|k| (zoom, k)));
                 }
             }
             return Ok(());
@@ -640,18 +714,15 @@ impl VdScan {
             );
         }
         if let Some(column) = &self.cluster_column {
-            let counts = batch
-                .column_by_name(column)
-                .and_then(|c| arrow_cast::cast(c, &arrow_schema::DataType::Int64).ok());
-            let counts = counts.as_ref().map(|c| {
-                c.as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()
-                    .expect("cast to Int64")
-            });
+            let counts = read_column(batch, column, &arrow_schema::DataType::Int64)?;
+            let counts = counts
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .expect("cast to Int64");
             let clustered: Vec<Option<TileBounds>> = aligned
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| counts.is_some_and(|c| c.is_valid(*i) && c.value(*i) > 1))
+                .filter(|(i, _)| counts.is_valid(*i) && counts.value(*i) > 1)
                 .map(|(_, b)| *b)
                 .collect();
             if !clustered.is_empty() {
@@ -710,8 +781,15 @@ impl VdScan {
                 Kinds::NoPoints => &empty,
             };
             let zoom = self.zooms[k];
+            // With both kinds in the canonical band and polygons that may
+            // stand as points, an equal count proves nothing: a collapsed
+            // polygon can replace a thinned point. Every tile with a point
+            // is blocked instead.
+            let unprovable = self.collapsed_points && canonical_kinds == Kinds::Mixed;
             for key in level.keys().chain(canon.keys()) {
-                if level.get(key).copied().unwrap_or(0) != canon.get(key).copied().unwrap_or(0) {
+                if unprovable
+                    || level.get(key).copied().unwrap_or(0) != canon.get(key).copied().unwrap_or(0)
+                {
                     policy.block(zoom, *key);
                 }
             }
@@ -727,6 +805,7 @@ impl VdScan {
             canonical_counts,
             zooms: self.zooms,
             canonical: self.canonical,
+            first_probed: self.first_probed,
         }
     }
 }
@@ -794,7 +873,7 @@ impl VdPlan {
     /// probe runs.
     pub(super) fn first_probed_level(&self, options: &ExportOptions) -> usize {
         let none = Frontier::new(self.zooms.len());
-        (0..self.canonical)
+        (self.first_probed..self.canonical)
             .find(|&k| self.candidates(k, options, &none).is_some())
             .unwrap_or(self.canonical)
     }
@@ -821,8 +900,13 @@ impl VdPlan {
         mut each: impl FnMut(Probed) -> bool,
     ) -> Result<usize, ExportError> {
         let mut frontier = Frontier::new(self.zooms.len());
-        // Rows the probe reads are read again by the export proper, so
-        // their decode and clip warnings are counted there, not here.
+        // The probe's reads are quiet. A canonical row's decode warnings are
+        // the export's wherever its tiles are drawn: by the scan, and by the
+        // canonical level's read for the rows of tiles that do not stop. The
+        // rows under a stopped tile are never read again, and their clip
+        // warnings, which belong to canonical tiles that are not written,
+        // are not reported. A stopped tile's encode events are staged per
+        // tile and kept only when it stops.
         let quiet = crate::diagnostics::Diagnostics::silent();
         let gzip_cache = Arc::new(TileGzipCache::new(
             crate::compression::tile_gzip::PAYLOAD_SLICE_BYTES,
@@ -1347,6 +1431,22 @@ mod tests {
                 },
                 "--zoom-ceiling",
             ),
+            // Without a raw cap one candidate is the whole canonical band.
+            (
+                ExportOptions {
+                    tile_size_limit: None,
+                    ..vd()
+                },
+                "--max-tile-size 0",
+            ),
+            (
+                ExportOptions {
+                    tile_size_limit: Some(0),
+                    compressed_tile_size_limit: None,
+                    ..vd()
+                },
+                "--max-tile-size 0",
+            ),
         ];
         for (options, needle) in cases {
             let out = dir.path().join("out.pmtiles");
@@ -1372,6 +1472,32 @@ mod tests {
                     ..ConvertOptions::default()
                 },
                 "partial overview",
+            ),
+            // What `tiles` refuses in its convert options, the standalone
+            // export refuses from the footer.
+            (
+                {
+                    let mut c = ConvertOptions::default();
+                    c.assign.line_thinning = 2.0;
+                    c
+                },
+                "--line-thinning",
+            ),
+            (
+                {
+                    let mut c = ConvertOptions::default();
+                    c.density.kinds.lines = true;
+                    c
+                },
+                "--drop-lines",
+            ),
+            (
+                {
+                    let mut c = ConvertOptions::default();
+                    c.density.kinds.polygons = true;
+                    c
+                },
+                "--drop-polygons",
             ),
         ] {
             let ov = overview(dir.path(), 64, convert);
@@ -1672,6 +1798,122 @@ mod tests {
         }
     }
 
+    /// A column rule A′ reads that is missing, or whose values do not read
+    /// as numbers, is refused: reading it as empty would let tiles stop.
+    /// (The reader already refuses a cluster column that is absent or not
+    /// INT64; the entry column has no such guard.)
+    #[test]
+    fn unreadable_rule_columns_fail_closed() {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use arrow_schema::DataType;
+
+        let rungs = super::EntryRungs {
+            column: ["v".to_string()],
+            ladder: super::EntryZoomLadder::explicit(vec![(5.0, 4)]).unwrap(),
+        };
+        let bboxes = [Some(crate::tile::TileBounds::new(0.0, 0.0, 1.0, 1.0))];
+        let missing =
+            RecordBatch::try_from_iter([("w", Arc::new(Int64Array::from(vec![5])) as ArrayRef)])
+                .unwrap();
+        let text = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(StringArray::from(vec!["five"])) as ArrayRef,
+        )])
+        .unwrap();
+        for (batch, needle) in [(&missing, "does not hold"), (&text, "do not read as")] {
+            let err = super::RowRelease::release_zooms(&rungs, batch, &bboxes).unwrap_err();
+            assert_eq!(
+                crate::error::Classify::kind(&err),
+                crate::error::ErrorKind::Input
+            );
+            assert!(err.to_string().contains(needle), "{err}");
+        }
+        assert!(super::read_column(&text, "v", &DataType::Int64).is_err());
+        assert!(super::column_index(&missing.schema(), "v").is_err());
+        let numbers =
+            RecordBatch::try_from_iter([("v", Arc::new(Int64Array::from(vec![5])) as ArrayRef)])
+                .unwrap();
+        assert_eq!(
+            super::RowRelease::release_zooms(&rungs, &numbers, &bboxes).unwrap(),
+            vec![4]
+        );
+    }
+
+    /// With polygons collapsing to points, a coarse level's point count
+    /// can match the canonical one while the sets differ: here a thinned
+    /// real point and a collapsed polygon cancel out. Such a tile may not
+    /// stop.
+    #[test]
+    fn collapsed_points_never_stand_in_for_thinned_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = [
+            pt(10.0, 45.0),
+            pt(10.01, 45.0),
+            // Same tile down to z3, another thinning cell there.
+            square(12.0, 46.0, 0.05),
+            square(-70.0, -30.0, 5.0),
+        ];
+        let v = [1.0; 4];
+        let mut convert = ConvertOptions::default();
+        convert.density.enabled = false;
+        convert.simplify.collapse = crate::overview::simplify::CollapseMode::Point;
+        // Past the gate, so simplification collapses the small square.
+        convert.assign.polygon_visibility = 0.0;
+        let ov = overview_v(dir.path(), &geoms, &v, 4, convert);
+        let reader = OverviewReader::open(&ov).unwrap();
+        assert!(reader.meta().levels.len() > 1);
+        let plan = plan(&ov);
+        for z in 0..4 {
+            assert!(!plan.policy.may_stop(z, key_at(10.0, 45.0, z)), "z{z}");
+        }
+    }
+
+    /// An entry rung past the export's finest zoom releases its rows at the
+    /// finest level, as convert clamps it: the scan never sizes a row at a
+    /// zoom the export does not have (z29 here, billions of keys).
+    #[test]
+    fn entry_rung_past_the_range_is_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = [square(10.0, 45.0, 0.1), square(-70.0, -30.0, 0.5)];
+        let v = [5.0, 1.0];
+        let convert = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "v".into(),
+                kind: EntryZoomKind::Explicit(vec![(5.0, 30)]),
+            }),
+            ..ConvertOptions::default()
+        };
+        let ov = overview_v(dir.path(), &geoms, &v, 6, convert);
+        let plan = plan(&ov);
+        for z in 0..6 {
+            assert!(!plan.policy.may_stop(z, key_at(10.05, 45.05, z)), "z{z}");
+        }
+    }
+
+    /// A row released at z4 is blocked at every coarser level by that
+    /// level's own buffered tiles: the z1 buffer (5.6°) reaches the western
+    /// z1/0/0 from 2°E, which no z3 tile's ancestors include.
+    #[test]
+    fn entry_blocks_each_level_by_its_own_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = [square(2.0, 10.0, 0.1), square(-80.0, 20.0, 20.0)];
+        let v = [5.0, 1.0];
+        let mut convert = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "v".into(),
+                kind: EntryZoomKind::Explicit(vec![(5.0, 4)]),
+            }),
+            ..ConvertOptions::default()
+        };
+        convert.density.enabled = false;
+        let ov = overview_v(dir.path(), &geoms, &v, 6, convert);
+        let plan = plan(&ov);
+        assert!(!plan.policy.may_stop(1, tile_key(0, 0, 1)));
+        assert!(!plan.policy.may_stop(1, tile_key(1, 0, 1)));
+    }
+
     // --- the probe -----------------------------------------------------------
 
     use std::collections::{BTreeMap, HashSet};
@@ -1843,6 +2085,167 @@ mod tests {
         assert_eq!(report.max_zoom, 10);
     }
 
+    /// A tile's features' `v` values, by bits.
+    fn vs(tile: &Tile) -> HashSet<u64> {
+        let layer = &tile.layers[0];
+        let Some(key) = layer.keys.iter().position(|k| k == "v") else {
+            return HashSet::new();
+        };
+        layer
+            .features
+            .iter()
+            .filter_map(|f| {
+                let kv = f.tags.chunks(2).find(|kv| kv[0] == key as u32)?;
+                layer.values[kv[1] as usize].double_value.map(f64::to_bits)
+            })
+            .collect()
+    }
+
+    /// Export `ov` with and without variable depth under `opts`: the
+    /// contract holds, some tile stops, and every stopped tile draws every
+    /// feature the flag-off finest tiles under it draw. The stops.
+    fn assert_stops_draw_the_finest(
+        ov: &Path,
+        opts: ExportOptions,
+        max_zoom: u8,
+    ) -> Vec<(u8, u32, u32)> {
+        let off = ov.with_extension("off.pmtiles");
+        export_pmtiles(ov, &off, &opts).unwrap();
+        let off = read_tiles(&off);
+        let (_, tiles) = export_vd(ov, opts);
+        assert_contract(&tiles, max_zoom);
+        let stops = stopped(&tiles, max_zoom);
+        assert!(!stops.is_empty());
+        for &(z, x, y) in &stops {
+            let shift = max_zoom - z;
+            let finest: HashSet<u64> = off
+                .iter()
+                .filter(|(&(fz, fx, fy), _)| fz == max_zoom && (fx >> shift, fy >> shift) == (x, y))
+                .flat_map(|(_, t)| vs(t))
+                .collect();
+            let drawn = vs(&tiles[&(z, x, y)]);
+            assert!(!finest.is_empty(), "z{z}/{x}/{y}");
+            assert!(finest.is_subset(&drawn), "z{z}/{x}/{y}");
+        }
+        stops
+    }
+
+    /// The dense block, plus `sparse` far from it; each feature's `v` is
+    /// its index.
+    fn dense_plus(dir: &Path, sparse: Vec<Geometry<f64>>, max_zoom: u8) -> std::path::PathBuf {
+        let mut geoms: Vec<_> = dense_and_sparse()[..2500]
+            .iter()
+            .map(|&(x, y, _)| pt(x, y))
+            .collect();
+        geoms.extend(sparse);
+        let v: Vec<f64> = (0..geoms.len()).map(|i| i as f64).collect();
+        let mut convert = ConvertOptions::default();
+        convert.density.enabled = false;
+        convert.assign.point_thinning = 0.0;
+        overview_v(dir, &geoms, &v, max_zoom, convert)
+    }
+
+    /// Points on both sides of the antimeridian stop, each side's tile
+    /// drawing what its finest tiles draw, the other side's buffer points
+    /// included.
+    #[test]
+    fn antimeridian_branches_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let ov = dense_plus(
+            dir.path(),
+            vec![pt(179.99, -30.0), pt(179.9, -31.0), pt(-179.99, -30.0)],
+            8,
+        );
+        let stops = assert_stops_draw_the_finest(&ov, raw_cap(20_000), 8);
+        let west = crate::tile::lng_lat_to_tile(-179.99, -30.0, 1);
+        let east = crate::tile::lng_lat_to_tile(179.99, -30.0, 1);
+        assert!(stops.contains(&(1, west.x, west.y)), "{stops:?}");
+        assert!(stops.contains(&(1, east.x, east.y)), "{stops:?}");
+    }
+
+    /// A MultiPoint is a point to rule A′: a sparse one stops.
+    #[test]
+    fn multipoint_branch_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let multi = Geometry::MultiPoint(geo::MultiPoint::from(vec![
+            (-70.0, -30.0),
+            (-70.01, -30.0),
+            (-70.02, -30.01),
+        ]));
+        let ov = dense_plus(dir.path(), vec![multi], 8);
+        let stops = assert_stops_draw_the_finest(&ov, raw_cap(20_000), 8);
+        assert_eq!(stops, vec![(1, 0, 1)]);
+    }
+
+    /// A file with points, lines and polygons: the sparse branch stops,
+    /// drawing every kind its finest tiles draw.
+    #[test]
+    fn mixed_kind_branch_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let line =
+            Geometry::LineString(geo::LineString::from(vec![(-70.0, -30.0), (-69.9, -30.1)]));
+        let ov = dense_plus(
+            dir.path(),
+            vec![line, square(-70.2, -30.2, 0.1), pt(-70.05, -30.05)],
+            8,
+        );
+        let reader = OverviewReader::open(&ov).unwrap();
+        assert_eq!(
+            super::file_kinds(reader.geo_metadata_json()),
+            super::Kinds::Mixed
+        );
+        let stops = assert_stops_draw_the_finest(&ov, raw_cap(20_000), 8);
+        assert_eq!(stops, vec![(1, 0, 1)]);
+    }
+
+    /// `--max-zoom auto:N` through the tiles facade: the canonical zoom is
+    /// the one the estimate resolved, the same as flag-off, and the
+    /// contract holds at it.
+    #[test]
+    fn auto_max_zoom_stops_at_the_resolved_zoom() {
+        use super::super::super::tiles::{
+            convert_to_pmtiles, TilesInput, TilesOptions, TilesOutcome,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dense_and_sparse();
+        let src = dir.path().join("src.parquet");
+        let geoms: Vec<_> = input.iter().map(|&(x, y, _)| Some(pt(x, y))).collect();
+        let v: Vec<f64> = input.iter().map(|&(.., v)| v).collect();
+        testutil::write_input_with_f64(&src, &geoms, "v", &v);
+        let mut convert = ConvertOptions::default()
+            .with_levels(LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 9,
+            })
+            .with_auto_max_zoom(true);
+        convert.density.enabled = false;
+        convert.assign.point_thinning = 0.0;
+        let run = |variable_depth: bool, name: &str| {
+            let out = dir.path().join(name);
+            let options = TilesOptions {
+                convert: convert.clone(),
+                export: raw_cap(20_000).with_variable_depth(variable_depth),
+                ..TilesOptions::default()
+            };
+            let TilesOutcome::Converted(report) =
+                convert_to_pmtiles(&TilesInput::Path(src.clone()), &out, &options).unwrap()
+            else {
+                panic!("converted")
+            };
+            (report, read_tiles(&out))
+        };
+        let (off, _) = run(false, "off.pmtiles");
+        let (on, tiles) = run(true, "on.pmtiles");
+        let m = off.export.max_zoom;
+        assert!(m <= 9);
+        let vd = on.export.variable_depth.as_ref().unwrap();
+        assert_eq!(vd.canonical_max_zoom, m);
+        assert_eq!(on.export.max_zoom, m);
+        assert_contract(&tiles, m);
+        assert!(!stopped(&tiles, m).is_empty());
+    }
+
     /// Nothing is stored below a stopped tile, wherever the stops fall.
     #[test]
     fn stopped_subtree_has_no_descendants() {
@@ -1909,7 +2312,7 @@ mod tests {
         let (_, tiles) = export_vd(&ov, raw_cap(40));
         assert!(stopped(&tiles, 6).is_empty());
         let gzip = ExportOptions {
-            tile_size_limit: None,
+            tile_size_limit: Some(usize::MAX),
             compressed_tile_size_limit: Some(40),
             ..ExportOptions::default()
         };
@@ -1969,6 +2372,89 @@ mod tests {
         assert!(!ArchiveIndex::open(&off).unwrap().is_variable_depth());
     }
 
+    /// The export's diagnostics are the same with and without variable
+    /// depth, on a mixed file (so the scan decodes its geometry for rule
+    /// A′) with a non-finite row, a self-crossing polygon in a dense block
+    /// that never stops, and a sparse branch that does. Written directly:
+    /// convert would empty the non-finite row.
+    #[test]
+    fn diagnostics_match_flag_off() {
+        use std::sync::Arc;
+
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use super::super::super::level::gsd;
+        use super::super::super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions};
+        use super::super::tests::{build_geometry_array, geometry_field};
+        use geoarrow_array::GeoArrowArray;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut geoms: Vec<Geometry> = dense_and_sparse()
+            .into_iter()
+            .map(|(x, y, _)| pt(x, y))
+            .collect();
+        geoms.push(pt(f64::NAN, 1.0));
+        geoms.push(Geometry::Polygon(geo::Polygon::new(
+            geo::LineString::from(vec![
+                (10.0, 45.0),
+                (10.2, 45.2),
+                (10.2, 45.0),
+                (10.0, 45.05),
+                (10.0, 45.0),
+            ]),
+            vec![],
+        )));
+        let ov = dir.path().join("ov.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            geometry_field(),
+        ]));
+        let specs = (0..=10).map(|z| LevelSpec::new(gsd(z), Some(z))).collect();
+        let mut writer = OverviewWriter::create(
+            &ov,
+            &schema,
+            OverviewWriterOptions::new(Mode::Duplicating, specs),
+        )
+        .unwrap();
+        for k in 0..=10 {
+            let n = geoms.len();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                    Arc::new(build_geometry_array(&geoms).to_array_ref()),
+                ],
+            )
+            .unwrap();
+            let _written = writer
+                .write_level(k, Some(n), std::iter::once(batch))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let off = export_pmtiles(&ov, dir.path().join("off.pmtiles"), &raw_cap(20_000)).unwrap();
+        let (on, tiles) = export_vd(&ov, raw_cap(20_000));
+        assert!(!stopped(&tiles, 10).is_empty());
+        let events = |r: &ExportReport| -> Vec<_> {
+            r.diagnostics
+                .iter()
+                .filter(|d| !matches!(d, crate::diagnostics::Diagnostic::MemoryBudget { .. }))
+                .cloned()
+                .collect()
+        };
+        let off_events = events(&off);
+        for kind in ["NonFiniteGeometry", "PolygonRepaired"] {
+            assert!(
+                off_events
+                    .iter()
+                    .any(|d| format!("{d:?}").starts_with(kind)),
+                "{kind} in {off_events:?}"
+            );
+        }
+        assert_eq!(events(&on), off_events);
+    }
+
     /// A rejected probe's repairs are not the export's: with every probe
     /// over the gzip cap, nothing stops, and the tiles and diagnostics match
     /// the export without variable depth.
@@ -1996,7 +2482,7 @@ mod tests {
         let v: Vec<f64> = (0..20).map(f64::from).collect();
         let ov = overview_v(dir.path(), &geoms, &v, 6, ConvertOptions::default());
         let gzip = ExportOptions {
-            tile_size_limit: None,
+            tile_size_limit: Some(usize::MAX),
             compressed_tile_size_limit: Some(40),
             ..ExportOptions::default()
         };

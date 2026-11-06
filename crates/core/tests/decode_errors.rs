@@ -9,13 +9,13 @@
 
 use std::path::PathBuf;
 
-use tylertoo_core::archive_index::ArchiveIndex;
-use tylertoo_core::compression::{compress, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
-use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
-use tylertoo_core::pmtiles_writer::{
+use tylertoo_core::internal::archive_index::ArchiveIndex;
+use tylertoo_core::internal::compression::{compress, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
+use tylertoo_core::internal::decode::{decode_pmtiles, DecodeError, DecodeOptions};
+use tylertoo_core::internal::pmtiles_writer::{
     encode_directory, tile_id, DirEntry, Header, MAX_LEAF_DIRECTORIES,
 };
-use tylertoo_core::{Compression, StreamingPmtilesWriter};
+use tylertoo_core::{internal::StreamingPmtilesWriter, Compression};
 
 /// A minimal MVT tile: one layer `t` with one point feature at (1, 1).
 const POINT_TILE: &[u8] = &[
@@ -662,18 +662,18 @@ fn inverted_zoom_range_is_rejected_before_any_work() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = small_archive(&dir);
     let out = dir.path().join("out.parquet");
-    let options = DecodeOptions {
-        min_zoom: Some(8),
-        max_zoom: Some(5),
-        layer: None,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(Some(8))
+        .with_max_zoom(Some(5))
+        .with_layer(None);
     let err = decode_pmtiles(&path, &out, &options).expect_err("inverted range must fail");
     assert!(
         matches!(
             err,
             DecodeError::InvalidZoomRange {
                 min_zoom: 8,
-                max_zoom: 5
+                max_zoom: 5,
+                ..
             }
         ),
         "{err:?}"
@@ -698,11 +698,10 @@ fn equal_zoom_bounds_are_one_zoom_not_an_inverted_range() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = small_archive(&dir);
     let out = dir.path().join("out.parquet");
-    let options = DecodeOptions {
-        min_zoom: Some(6),
-        max_zoom: Some(6),
-        layer: None,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(Some(6))
+        .with_max_zoom(Some(6))
+        .with_layer(None);
     assert!(options.validate().is_ok());
     let report = decode_pmtiles(&path, &out, &options).unwrap();
     assert_eq!(report.tiles_read, 0);
@@ -906,10 +905,7 @@ fn run_ending_on_the_last_tile_id_is_accepted() {
         }]
     };
     // z31 lies outside the zoom filter, so the run is validated, not decoded.
-    let options = DecodeOptions {
-        max_zoom: Some(5),
-        ..DecodeOptions::default()
-    };
+    let options = DecodeOptions::default().with_max_zoom(Some(5));
     let decode = |name: &str, tile_id: u64| {
         let path = dir.path().join(name);
         std::fs::write(&path, with_directories(&bytes, &run(tile_id), None)).unwrap();

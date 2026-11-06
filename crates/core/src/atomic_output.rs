@@ -227,6 +227,7 @@ pub(crate) fn reserve_path(prefix: &str, suffix: &str, dir: Option<&Path>) -> io
 /// An output path that [`check_writable`] found could not be written.
 #[derive(Debug, thiserror::Error)]
 #[error("cannot write {}: {reason}", .path.display())]
+#[non_exhaustive]
 pub struct OutputNotWritable {
     /// The output path as given.
     pub path: PathBuf,

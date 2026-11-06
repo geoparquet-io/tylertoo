@@ -14,10 +14,10 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{Coord, Geometry, LineString, Point};
 use prost::Message;
-use tylertoo_core::compression::{compress, Compression};
-use tylertoo_core::dedup::TileHasher;
-use tylertoo_core::mvt::{LayerBuilder, PropertyValue};
-use tylertoo_core::tile::TileBounds;
+use tylertoo_core::internal::compression::{compress, Compression};
+use tylertoo_core::internal::dedup::TileHasher;
+use tylertoo_core::internal::mvt::{LayerBuilder, PropertyValue};
+use tylertoo_core::internal::tile::TileBounds;
 
 /// Build a realistic encoded MVT tile of roughly `feature_count` mixed
 /// point/line features with the small repeated-tag property shape real
@@ -59,11 +59,11 @@ fn build_tile_bytes(feature_count: usize) -> Vec<u8> {
             &geom,
             &props,
             &bounds,
-            &tylertoo_core::diagnostics::Diagnostics::default(),
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
         );
     }
     let layer = builder.build();
-    let mut tb = tylertoo_core::mvt::TileBuilder::new();
+    let mut tb = tylertoo_core::internal::mvt::TileBuilder::new();
     tb.add_layer(layer);
     tb.build().encode_to_vec()
 }

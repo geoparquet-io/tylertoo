@@ -15,10 +15,10 @@
 
 use std::path::{Path, PathBuf};
 
-use tylertoo_core::overview::convert::{
+use tylertoo_core::internal::overview::convert::{
     convert_to_overviews, ConvertOptions, ConvertReport, LevelPlan,
 };
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions, ExportReport};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions, ExportReport};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;
@@ -51,10 +51,7 @@ fn tiles(
     let conv = convert_to_overviews(
         input,
         &overview,
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange { min_zoom, max_zoom },
-            ..convert
-        },
+        &convert.with_levels(LevelPlan::ZoomRange { min_zoom, max_zoom }),
     )
     .unwrap_or_else(|e| panic!("convert {}: {e}", input.display()));
     let exp = export_pmtiles(&overview, &archive, &export)
@@ -106,15 +103,12 @@ fn shape_column_tiles_like_the_geometry_column() {
 
 // --- #708: GeoParquet 2.0, native GEOMETRY type, no `geo` key ----------------
 
-fn native_geoparquet2(streaming: bool) -> (ConvertReport, ExportReport) {
+fn native_geoparquet2() -> (ConvertReport, ExportReport) {
     tiles(
         &invariant_fixture("geoparquet2-native.parquet"),
         0,
         14,
-        ConvertOptions {
-            streaming,
-            ..Default::default()
-        },
+        ConvertOptions::default(),
         ExportOptions::default(),
     )
 }
@@ -124,14 +118,12 @@ fn native_geoparquet2(streaming: bool) -> (ConvertReport, ExportReport) {
 /// "no CRS declared … assuming WGS84" warning must not fire.
 #[test]
 fn native_geoparquet2_declares_its_crs() {
-    for streaming in [true, false] {
-        let (conv, exp) = native_geoparquet2(streaming);
-        assert!(
-            !conv.crs_assumed_wgs84,
-            "#708: the logical type declares the CRS (streaming={streaming})"
-        );
-        assert!(exp.total_tile_features > 0);
-    }
+    let (conv, exp) = native_geoparquet2();
+    assert!(
+        !conv.crs_assumed_wgs84,
+        "#708: the logical type declares the CRS"
+    );
+    assert!(exp.total_tile_features > 0);
 }
 
 // --- #643: --bbox on data stored in 0..360 ----------------------------------
@@ -153,31 +145,25 @@ fn lon_0_360_expectation() -> ([f64; 4], usize) {
 }
 
 /// A `--bbox` in the -180..180 convention selects exactly the features the
-/// export draws inside it, wrapped by ±360 (#342), on both engines.
+/// export draws inside it, wrapped by ±360 (#342).
 #[test]
 fn bbox_on_0_360_data_selects_the_wrapped_draw_count() {
     let (bbox, expected) = lon_0_360_expectation();
     assert!(expected > 0, "the fixture must put features in the box");
-    for streaming in [true, false] {
-        let (conv, exp) = tiles(
-            &invariant_fixture("lon-0-360.parquet"),
-            0,
-            8,
-            ConvertOptions {
-                bbox: Some(bbox),
-                streaming,
-                ..Default::default()
-            },
-            ExportOptions::default(),
-        );
-        assert_eq!(
-            conv.input_features, expected,
-            "streaming={streaming}: --bbox {bbox:?} selected {} features, the wrap rule \
-             draws {expected} there (#643)",
-            conv.input_features
-        );
-        assert!(exp.total_tile_features > 0);
-    }
+    let (conv, exp) = tiles(
+        &invariant_fixture("lon-0-360.parquet"),
+        0,
+        8,
+        ConvertOptions::default().with_bbox(Some(bbox)),
+        ExportOptions::default(),
+    );
+    assert_eq!(
+        conv.input_features, expected,
+        "--bbox {bbox:?} selected {} features, the wrap rule \
+         draws {expected} there (#643)",
+        conv.input_features
+    );
+    assert!(exp.total_tile_features > 0);
 }
 
 // --- #768: banded, unsorted parcels through the merge valve ------------------
@@ -197,10 +183,7 @@ fn banded_vs_sorted() -> Vec<(u8, usize, usize)> {
             4,
             14,
             ConvertOptions::default(),
-            ExportOptions {
-                compressed_tile_size_limit: Some(BANDED_CAP),
-                ..ExportOptions::default()
-            },
+            ExportOptions::default().with_compressed_tile_size_limit(Some(BANDED_CAP)),
         )
         .1
     };

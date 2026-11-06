@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 /// The integer polygon rule a repair corrected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PolygonRepairKind {
     CollapsedRing,
     RingSelfTouch,
@@ -31,6 +32,7 @@ pub enum PolygonRepairKind {
 
 /// Coordinate-system facts needed to explain a scan diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RangeContext {
     /// Usable source rows scanned.
     pub total: usize,
@@ -43,95 +45,90 @@ pub struct RangeContext {
 /// A counted event or warning. The serialized tag is stable across frontends.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Diagnostic {
     /// Facts from the whole saved plan, not counts from this shard's scan.
+    #[non_exhaustive]
     SavedPlan {
         count: usize,
         diagnostics: Vec<Diagnostic>,
     },
     /// Advice or an I/O warning from the shared pipeline. Kept per run and
     /// deduplicated by its complete message; never persisted in a plan.
-    Advisory {
-        count: usize,
-        message: String,
-    },
+    #[non_exhaustive]
+    Advisory { count: usize, message: String },
+    #[non_exhaustive]
     OutOfRange {
         context: Option<RangeContext>,
         count: usize,
         exemplars: Vec<crate::overview::convert::OutOfRangeExemplar>,
     },
+    #[non_exhaustive]
     Unprojectable {
         context: Option<RangeContext>,
         count: usize,
     },
+    #[non_exhaustive]
     Wrapped {
         exemplars: Vec<OutOfRangeExemplar>,
         context: Option<RangeContext>,
         count: usize,
     },
-    AntimeridianSuspect {
-        count: usize,
-    },
-    EncodeDropped {
-        count: usize,
-    },
-    EncodeQuantized {
-        count: usize,
-    },
-    ClipGuardDropped {
-        count: usize,
-    },
-    NonFiniteGeometry {
-        count: usize,
-    },
+    #[non_exhaustive]
+    AntimeridianSuspect { count: usize },
+    #[non_exhaustive]
+    EncodeDropped { count: usize },
+    #[non_exhaustive]
+    EncodeQuantized { count: usize },
+    #[non_exhaustive]
+    ClipGuardDropped { count: usize },
+    #[non_exhaustive]
+    NonFiniteGeometry { count: usize },
+    #[non_exhaustive]
     PolygonRepaired {
         count: usize,
         #[serde(rename = "repair_kind")]
         kind: PolygonRepairKind,
     },
-    InvalidAfterEncode {
-        count: usize,
-    },
-    RowGroupAutoscaled {
-        count: usize,
-        cap: usize,
-    },
-    InvalidAfterSimplify {
-        count: usize,
-    },
-    FullResolutionFallback {
-        count: usize,
-    },
-    ValidationSkipped {
-        count: usize,
-    },
-    Merged {
-        count: usize,
-    },
-    ValveDropped {
-        count: usize,
-    },
+    #[non_exhaustive]
+    InvalidAfterEncode { count: usize },
+    #[non_exhaustive]
+    RowGroupAutoscaled { count: usize, cap: usize },
+    #[non_exhaustive]
+    InvalidAfterSimplify { count: usize },
+    #[non_exhaustive]
+    FullResolutionFallback { count: usize },
+    #[non_exhaustive]
+    ValidationSkipped { count: usize },
+    #[non_exhaustive]
+    Merged { count: usize },
+    #[non_exhaustive]
+    ValveDropped { count: usize },
+    #[non_exhaustive]
     PropertySkipped {
         count: usize,
         name: String,
         data_type: String,
     },
-    CrsMetadata {
-        count: usize,
-        reason: CrsWarning,
-    },
+    #[non_exhaustive]
+    CrsMetadata { count: usize, reason: CrsWarning },
+    #[non_exhaustive]
     CoveringRejected {
         count: usize,
         reason: CoveringWarning,
     },
-    UnusableGeometry {
-        count: usize,
-        total: usize,
-    },
+    #[non_exhaustive]
+    UnusableGeometry { count: usize, total: usize },
+    #[non_exhaustive]
     CrsAssumed {
         count: usize,
         input: String,
+        /// The input's root path (a multi-part input's `input` is a label).
+        /// Empty in plans saved before v0.9, which fall back to `input`.
+        #[serde(default)]
+        root: String,
     },
+    #[non_exhaustive]
     EmptyLevels {
         count: usize,
         levels: Vec<usize>,
@@ -141,31 +138,28 @@ pub enum Diagnostic {
         first_written_gsd: f64,
         first_written_zoom: Option<u8>,
     },
+    #[non_exhaustive]
     MemoryBudget {
         count: usize,
         machine: Option<u64>,
         limit: u64,
     },
-    PyramidSharedTiles {
-        count: usize,
-    },
-    PyramidSkippedTiles {
-        count: usize,
-    },
-    PyramidMissingBounds {
-        count: usize,
-    },
-    PyramidMetadataConflict {
-        count: usize,
-    },
-    PyramidMissingMetadata {
-        count: usize,
-    },
+    #[non_exhaustive]
+    PyramidSharedTiles { count: usize },
+    #[non_exhaustive]
+    PyramidSkippedTiles { count: usize },
+    #[non_exhaustive]
+    PyramidMissingBounds { count: usize },
+    #[non_exhaustive]
+    PyramidMetadataConflict { count: usize },
+    #[non_exhaustive]
+    PyramidMissingMetadata { count: usize },
 }
 
 /// Why CRS metadata could only be read best-effort.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "reason", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CrsWarning {
     #[error("GeoParquet file has no key-value metadata; assuming WGS84")]
     NoKeyValueMetadata,
@@ -192,6 +186,7 @@ pub enum CrsWarning {
 /// Why a bbox covering cannot replace geometry decoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CoveringWarning {
     NoCovering,
     UnsupportedPath,
@@ -389,7 +384,7 @@ impl fmt::Display for Diagnostic {
             Self::CrsMetadata {reason,..} => reason.fmt(f),
             Self::CoveringRejected {reason,..} => write!(f, "bbox covering fast path declined: {reason}; reading the geometry column"),
             Self::UnusableGeometry {total,..} => write!(f, "skipping {n} of {total} input rows with a null, empty, or non-finite geometry"),
-            Self::CrsAssumed {input,..} => write!(f, "input {input}: no CRS declared in the GeoParquet metadata; assuming WGS84 lon/lat (EPSG:4326). If the coordinates are not lon/lat degrees the output will be misplaced — check the input with `gpio inspect {input}`"),
+            Self::CrsAssumed {input,root,..} => write!(f, "input {input}: no CRS declared in the GeoParquet metadata; assuming WGS84 lon/lat (EPSG:4326). If the coordinates are not lon/lat degrees the output will be misplaced — check the input with `gpio inspect {}`", gpio_inspect_arg(if root.is_empty() { input } else { root })),
             Self::EmptyLevels {levels,gsd_min,gsd_max,input_features,first_written_gsd,first_written_zoom,..} => {
                 let ids = levels.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
                 let zoom = first_written_zoom.map_or_else(String::new, |z| format!(" (zoom {z})"));
@@ -411,6 +406,7 @@ impl fmt::Display for Diagnostic {
 
 /// A disjoint source-feature loss, rather than a (feature, tile) counter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SourceLoss {
     /// Row index: selected input stream before assignment, or original overview file at export.
     /// Convert reports restore this to the original input row index.
@@ -427,6 +423,7 @@ pub struct SourceLoss {
 /// The stage responsible for an absent source feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SourceLossCause {
     NonFiniteGeometry,
     MissingGeometry,
@@ -441,6 +438,7 @@ pub enum SourceLossCause {
 
 /// Accounting must fail explicitly rather than truncate the loss partition.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AccountingError {
     #[error("source accounting spill: {0}")]
     Io(#[from] std::io::Error),
@@ -785,8 +783,34 @@ pub fn write_report(path: &std::path::Path, report: &impl Serialize) -> Result<(
     pending.publish()
 }
 
+/// The shell-quoted path for a `gpio inspect` hint (#708).
+fn gpio_inspect_arg(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+#[path = "diagnostics_tests.rs"]
+mod api_tests;
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn crs_assumed_hint_is_a_copy_pasteable_command() {
+        let hint = |input: &str, root: &str| {
+            Diagnostic::CrsAssumed {
+                count: 1,
+                input: input.to_owned(),
+                root: root.to_owned(),
+            }
+            .to_string()
+        };
+        assert!(hint("/data/parts (800 partitions)", "/data/parts")
+            .ends_with("`gpio inspect '/data/parts'`"));
+        assert!(hint("/my data/a.parquet", "/my data/a.parquet")
+            .ends_with("`gpio inspect '/my data/a.parquet'`"));
+        assert!(hint("it's.parquet", "it's.parquet").ends_with(r"`gpio inspect 'it'\''s.parquet'`"));
+    }
+
     use super::*;
 
     #[test]

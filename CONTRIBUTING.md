@@ -55,10 +55,6 @@ Commit messages follow
    [PR template](https://github.com/geoparquet-io/tylertoo/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
    Never bypass the pre-commit hook with `--no-verify`.
 
-The diff-scoped mutation check is advisory. Its job summary and sticky PR
-comment list mutants in your change that tests missed. Use these to find
-test gaps. Run `scripts/mutants-diff.sh` to reproduce the check locally.
-
 ## Docstrings and help text
 
 For public docstrings, CLI help, and `///` docs:
@@ -168,6 +164,7 @@ A bump updates:
 |------|---------|
 | `Cargo.toml` | `version = "X.Y.Z"` (workspace) |
 | `Cargo.toml` | `tylertoo-core = { ..., version = "X.Y.Z" }` in `[workspace.dependencies]` |
+| `Cargo.toml` | `tylertoo-io = { ..., version = "X.Y.Z" }` in `[workspace.dependencies]` |
 | `crates/python/pyproject.toml` | `version = "X.Y.Z"` |
 | `.cz.toml` | its own `version` field |
 

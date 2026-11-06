@@ -8,7 +8,8 @@ Args:
     mode: `"duplicating"` makes each level a complete map;
         `"partitioning"` stores each feature once.
     min_zoom: Coarsest zoom.
-    max_zoom: Finest zoom, or `"auto"` to estimate it (at most 16).
+    max_zoom: Finest zoom, `"auto"` to estimate it (at most 16), or
+        `"auto:14"` to cap the estimate at z14.
     gsds: Per-level GSDs in meters, coarse to fine, instead of
         zooms.
     gsd_base: Pixels per tile edge when mapping zooms to GSDs. A
@@ -88,8 +89,6 @@ Args:
     row_group_size_policy: `"constant"`, or `"zoom-scaled"` to
         double the row-group cap per zoom coarser than the finest.
     full_column_stats: Keep Parquet statistics for every column.
-    streaming: Read the input in
-        [batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
     read_batch_size: Rows per
         [read batch](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
     bbox: Keep features that intersect this lon/lat box, also one

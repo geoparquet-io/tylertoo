@@ -112,6 +112,23 @@ fn tiles_surfaces_every_core_rule() {
             &["--keep-overview", "/nonexistent/tylertoo-779/o.parquet"][..],
             "does not exist",
         ),
+        // #803: what rule A′ cannot see, and a probe with no raw cap.
+        (
+            &[
+                "--generate-variable-depth-tile-pyramid",
+                "--polygon-thinning",
+                "0.5",
+            ][..],
+            "--polygon-thinning above 0",
+        ),
+        (
+            &[
+                "--generate-variable-depth-tile-pyramid",
+                "--max-tile-size",
+                "0",
+            ][..],
+            "--max-tile-size 0",
+        ),
     ] {
         tiles_refuses(flags, needle);
     }
@@ -298,4 +315,30 @@ fn tile_range_with_a_shard_is_a_core_rule() {
         );
         assert!(!output.exists());
     }
+}
+
+/// #803: merge and pyramid refuse a variable-depth archive as a usage error,
+/// since its missing tiles mean "draw the stored ancestor".
+#[test]
+fn merge_and_pyramid_refuse_a_variable_depth_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let vd = dir.path().join("vd.pmtiles");
+    let vd = vd.to_str().unwrap();
+    let (ok, stderr) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        vd,
+        "--max-zoom",
+        "4",
+        "--generate-variable-depth-tile-pyramid",
+    ]);
+    assert!(ok, "{stderr}");
+    let out = dir.path().join("out.pmtiles");
+    let out = out.to_str().unwrap();
+    let (code, stderr) = run_code(&["merge", out, vd]);
+    assert_refused(code, &stderr, "is a variable-depth archive", "merge");
+    let band = format!("0-4:{vd}");
+    let (code, stderr) = run_code(&["pyramid", out, "--band", &band]);
+    assert_refused(code, &stderr, "is a variable-depth archive", "pyramid");
+    assert!(!Path::new(out).exists());
 }

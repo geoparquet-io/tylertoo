@@ -24,7 +24,8 @@ Args:
         `include_properties` overrides it.
     exclude_all_properties: Drop every property, writing
         geometry-only tiles. `include_properties` overrides it.
-    feature_id: Integer column to use as the MVT feature ID.
+    feature_id: Integer column to use as the MVT feature ID. By default,
+        features have no ID.
     spill_dir: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
         used when memory runs short.
     profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles):

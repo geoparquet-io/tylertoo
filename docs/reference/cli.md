@@ -64,7 +64,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | --- | --- |
 | `--files-from <PATH>` | Read `.parquet` files from this manifest instead of `INPUT`: one path or URL per line, in dataset row order. Ignores blank lines and lines starting with `#`. |
 | `--min-zoom <MIN_ZOOM>` | Minimum (coarsest) Web Mercator zoom. Default: `0`. |
-| `--max-zoom <MAX_ZOOM>` | Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a sample of the input. Ignored with `--gsd`. Default: `14`. |
+| `--max-zoom <MAX_ZOOM>` | Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a sample of the input; `auto:14` caps the estimate at z14. Ignored with `--gsd`. Default: `14`. |
 | `--gsd <GSDS>` | Comma-separated ground sample distances (GSDs) in meters, each smaller than the last. Overrides `--min-zoom` and `--max-zoom`. |
 | `--name <TEXT>` | Human-readable name stored in the archive metadata. |
 | `--description <TEXT>` | Description stored in the archive metadata. |
@@ -79,7 +79,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | `--no-simple-clip-fastpath` | Clip all polygons with the full overlay for byte-stable tiles. The simple-ring fast path renders identically but can change a ring's starting vertex. |
 | `--partition-wave <N\|auto>` | Partitions to export at once, or `auto` to size the wave to the cores and free memory. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>. Default: `auto`. |
 | `--feature-order <input\|COLUMN[:asc\|:desc]>` | Feature order within each tile: `input` preserves source row order; `COLUMN[:asc\|:desc]` sorts by a property. Most renderers paint in this order unless the style overrides it. A `pyramid` band without that column keeps input order with a warning. Default: `input`. |
-| `--feature-id <COLUMN>` | Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. Defaults to tile-local ids. |
+| `--feature-id <COLUMN>` | Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. By default features have no id. |
 | `--report <PATH>` | Write a JSON report with `convert` and `export` sections, matching the reports of `overview` and `export-pmtiles`. |
 | `-v`, `--verbose` | Print per-level and per-zoom breakdowns. |
 | `-f`, `--force` | Overwrite the output if it exists. |
@@ -118,7 +118,7 @@ tylertoo overview [OPTIONS] [INPUT] [OUTPUT]
 | --- | --- |
 | `--files-from <PATH>` | Read `.parquet` files from this manifest instead of `INPUT`: one path or URL per line, in dataset row order. Ignores blank lines and lines starting with `#`. |
 | `--min-zoom <MIN_ZOOM>` | Minimum (coarsest) Web Mercator zoom. Default: `0`. |
-| `--max-zoom <MAX_ZOOM>` | Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a sample of the input. Ignored with `--gsd`. Default: `6`. |
+| `--max-zoom <MAX_ZOOM>` | Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a sample of the input; `auto:14` caps the estimate at z14. Ignored with `--gsd`. Default: `6`. |
 | `--gsd <GSDS>` | Comma-separated ground sample distances (GSDs) in meters, each smaller than the last. Overrides `--min-zoom` and `--max-zoom`. |
 | `--report <PATH>` | Write the JSON conversion report to this path. |
 | `-f`, `--force` | Overwrite the output if it exists. |
@@ -180,7 +180,7 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 | `--min-zoom <ZOOM>` | Minimum zoom in archive metadata, including empty coarse overview levels. Defaults to the coarsest level's zoom. |
 | `--tile-range <LO..HI>` | Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at one zoom, plus their descendants. Ranges that partition a zoom give disjoint archives, which `tylertoo merge` can join. |
 | `--zoom-ceiling <ZOOM>` | Emit only the tiles at or below this zoom, the coarse half of a sharded build. A partial overview kept from `tiles --shard coarse` needs a ceiling at or below its own. |
-| `--feature-id <COLUMN>` | Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. Defaults to tile-local ids. |
+| `--feature-id <COLUMN>` | Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. By default features have no id. |
 | `--report <PATH>` | Write the JSON export report, with per-zoom tile and feature counts, to this path. |
 | `-f`, `--force` | Overwrite the output if it exists. |
 
@@ -292,7 +292,7 @@ tylertoo pyramid [OPTIONS] --band <LO-HI:INPUT[:LAYER]> <OUTPUT>
 | `--no-simple-clip-fastpath` | Clip all polygons with the full overlay for byte-stable tiles. The simple-ring fast path renders identically but can change a ring's starting vertex. |
 | `--partition-wave <N\|auto>` | Partitions to export at once, or `auto` to size the wave to the cores and free memory. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>. Default: `auto`. |
 | `--feature-order <input\|COLUMN[:asc\|:desc]>` | Feature order within each tile: `input` preserves source row order; `COLUMN[:asc\|:desc]` sorts by a property. Most renderers paint in this order unless the style overrides it. A `pyramid` band without that column keeps input order with a warning. Default: `input`. |
-| `--feature-id <COLUMN>` | Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. Defaults to tile-local ids. |
+| `--feature-id <COLUMN>` | Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. By default features have no id. |
 | `--include-property <NAME>` | Keep only these properties in the tiles (repeatable). The input keeps every column, and the `--feature-order` column must stay. |
 | `--exclude-property <NAME>` | Drop these properties from the tiles (repeatable). `--include-property` overrides it. |
 | `--exclude-all-properties` | Drop every property, writing geometry-only tiles. `--include-property` overrides it. |
@@ -396,7 +396,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | --- | --- |
 | `--no-density-drop` | Turn off the per-level density budget, leaving cell-winner thinning only. |
 | `--drop-rate <F>` | Density budget decay: each coarser level keeps 1/rate of the next finer level's feature budget. Larger values thin mid zooms more. Default: `1.65`. |
-| `--drop-gamma <F>` | Sparse-area protection: 1 reduces every neighborhood equally; larger values protect sparse areas more. Default: `1.5`. |
+| `--drop-gamma <F>` | Sparse-area protection, at least 1: 1 reduces every neighborhood equally; larger values protect sparse areas more. Smaller values are rejected. Default: `1.5`. |
 | `--drop-lines` | Apply the density budget to lines as well as points: smaller, faster tiles that drop line features at coarse zooms (tippecanoe's `--drop-lines`). |
 | `--drop-polygons` | Apply the density budget to polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the budget excludes polygons by default (tippecanoe's `--drop-polygons`). |
 
@@ -412,7 +412,6 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 
 | Option | Description |
 | --- | --- |
-| `--no-streaming` | Load the whole dataset into memory instead of streaming it in two passes. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>. |
 | `--read-batch-size <ROWS>` | Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>. Default: `8192`. |
 | `--profile <PROFILE>` | Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build adds a fixed allocator floor of about 600 MiB that shows on small inputs; a `--no-default-features` build uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>. Default: `auto`. Possible values: `auto`, `speed`, `bounded`. |
 | `--in-flight-batches <N\|auto>` | Read batches in flight at once, or `auto` to size it to the cores. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>. Default: `auto`. |

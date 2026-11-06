@@ -60,11 +60,13 @@ pub enum FeatureIdColumnProblem {
     /// property column (non-geometry, non-`level`, MVT-encodable type) by its
     /// published name -- including columns the property selection or the
     /// #379 heuristic suppressed, which `--feature-id` can still name.
+    #[non_exhaustive]
     NotFound {
         /// Comma-separated, quoted published names.
         available: String,
     },
     /// The column's Arrow type cannot represent a `uint64` MVT feature id.
+    #[non_exhaustive]
     NotInteger {
         /// The column's Arrow data type, as `Debug`-formatted text.
         data_type: String,
@@ -75,6 +77,7 @@ pub enum FeatureIdColumnProblem {
     /// The column was aggregated across clustered points at convert time
     /// (`--accumulate-attribute`), so a cluster's value is a sum/min/max/mean
     /// of several ids -- an id of no feature.
+    #[non_exhaustive]
     Accumulated {
         /// The aggregation operator recorded in the file's clustering
         /// provenance (`sum`, `min`, `max`, `mean`).
@@ -117,11 +120,13 @@ pub enum InvalidFeatureIdReason {
     Null,
     /// The value is negative; tippecanoe would silently reinterpret it as a
     /// huge unsigned id instead.
+    #[non_exhaustive]
     Negative {
         /// The value, as text.
         value: String,
     },
     /// A `DECIMAL(p,0)` value above `u64::MAX`.
+    #[non_exhaustive]
     TooLarge {
         /// The value, as text.
         value: String,

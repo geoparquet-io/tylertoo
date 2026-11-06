@@ -8,5 +8,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = tylertoo_core::overview::check::fuzz_parquet_footer(data);
+    let _ = tylertoo_core::internal::overview::check::fuzz_parquet_footer(data);
 });

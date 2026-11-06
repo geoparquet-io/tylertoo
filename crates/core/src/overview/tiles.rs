@@ -36,6 +36,7 @@ use super::export::{
     export_pmtiles, write_empty_archive, ExportError, ExportOptions, ExportReport, FeatureOrder,
 };
 use super::writer::WriterError;
+use crate::error::Classify;
 use crate::input_set::ConvertSource;
 use crate::shard::{ShardRole, TileRange};
 
@@ -48,6 +49,7 @@ pub const TILES_DEFAULT_MAX_ZOOM: u8 = 14;
 /// core's input resolution) or a manifest of explicit files/URLs (the CLI's
 /// `--files-from`, order preserved verbatim).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TilesInput {
     /// A file, directory, glob, or URL/prefix.
     Path(PathBuf),
@@ -61,6 +63,7 @@ impl TilesInput {
     /// `s3://`/`gs://` prefix, last literal segment for a glob, manifest stem for
     /// a manifest (core owns the rules — see
     /// [`crate::input_set::derive_layer_name`]).
+    #[doc(hidden)]
     pub fn derive_layer_name(&self) -> String {
         let p = match self {
             TilesInput::Path(p) | TilesInput::Manifest(p) => p,
@@ -68,6 +71,7 @@ impl TilesInput {
         crate::input_set::derive_layer_name(&p.to_string_lossy())
     }
 
+    #[doc(hidden)]
     /// Resolve this input to the core's [`ConvertSource`], the one way: a
     /// path through [`ConvertSource::resolve_path`], a manifest through
     /// [`ConvertSource::from_manifest`].
@@ -82,6 +86,7 @@ impl TilesInput {
         }
     }
 
+    #[doc(hidden)]
     /// Run the convert half against this input, dispatching on the input
     /// shape and keeping the typed [`ConvertError`] — the facade's
     /// empty-shard handling (and any caller that routes both shapes) has to
@@ -118,6 +123,7 @@ impl TilesInput {
 /// ([`convert_to_pmtiles`] applies them to its own copy of
 /// [`TilesOptions::convert`], so callers never hand-sync the two).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TilesShard {
     /// Coarse job or data shard.
     pub role: ShardRole,
@@ -142,6 +148,7 @@ pub struct TilesShard {
 /// A loaded shard plan and the path it was read from, for
 /// [`TilesShard::binding`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ShardBinding {
     /// The plan ([`crate::shard::ShardPlan::load`]).
     pub plan: crate::shard::ShardPlan,
@@ -149,7 +156,34 @@ pub struct ShardBinding {
     pub path: PathBuf,
 }
 
+impl ShardBinding {
+    /// `plan`, read from `path`.
+    pub fn new(plan: crate::shard::ShardPlan, path: impl Into<PathBuf>) -> Self {
+        Self {
+            plan,
+            path: path.into(),
+        }
+    }
+}
+
 impl TilesShard {
+    /// A job of a sharded fleet; see the fields.
+    pub fn new(
+        role: ShardRole,
+        range: Option<TileRange>,
+        pivot_zoom: u8,
+        cut_digest: impl Into<String>,
+        binding: Option<ShardBinding>,
+    ) -> Self {
+        Self {
+            role,
+            range,
+            pivot_zoom,
+            cut_digest: cut_digest.into(),
+            binding,
+        }
+    }
+
     /// Verify the job's shard plan against `source`, the input the facade
     /// opened (#498): a plan cut for different parts is refused before any
     /// row is read.
@@ -177,6 +211,7 @@ impl TilesShard {
 }
 
 impl TilesShard {
+    #[doc(hidden)]
     /// What *every* job of a fleet applies to its convert, whether or not it
     /// goes on to build tiles (#498): the data shard's row-pruning range and
     /// the fleet's cut digest. The digest is fingerprinted and the range is
@@ -194,10 +229,9 @@ impl TilesShard {
 
     /// Every convert-side consequence of a tile-building job (#498/#541):
     /// [`TilesShard::apply_selection`] plus, for the coarse job of a
-    /// streaming zoom-plan run, the build ceiling just below the pivot
-    /// (#541: pass 1 and the level assignment stay full-range, so any saved
-    /// plan is byte-identical to a full run's; `--no-streaming` builds every
-    /// level and the export ceiling alone bounds the tiles).
+    /// zoom-plan run, the build ceiling just below the pivot (#541: pass 1
+    /// and the level assignment stay full-range, so any saved plan is
+    /// byte-identical to a full run's).
     ///
     /// `keep_finest_level` skips that ceiling: the coverage fill (#771)
     /// draws each coarse tile from the finest level, so a coarse job that
@@ -211,7 +245,6 @@ impl TilesShard {
         if self.range.is_none()
             && !keep_finest_level
             && matches!(convert.levels, LevelPlan::ZoomRange { .. })
-            && convert.streaming
         {
             convert.zoom_ceiling = Some(self.pivot_zoom.saturating_sub(1));
         }
@@ -244,6 +277,7 @@ impl TilesShard {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
+#[non_exhaustive]
 pub struct TilesOptions {
     /// The convert half ([`super::convert::convert_to_overviews`]). The
     /// facade reads `spill_dir` from here for the intermediate's location
@@ -276,6 +310,14 @@ pub struct TilesOptions {
     #[cfg_attr(feature = "cli", arg(skip = Self::default().shard))]
     pub shard: Option<TilesShard>,
 }
+
+with_setters!(TilesOptions {
+    with_convert => convert: ConvertOptions,
+    with_export => export: ExportOptions,
+    with_layer_name => layer_name: Option<String>,
+    with_keep_overview => keep_overview: Option<PathBuf>,
+    with_shard => shard: Option<TilesShard>,
+});
 
 impl Default for TilesOptions {
     fn default() -> Self {
@@ -331,6 +373,7 @@ impl TilesOptions {
     /// either. An explicit cap set on the result still applies. The CLI's
     /// `tiles --verbatim` and the Python `convert(verbatim=True)` both start
     /// here.
+    #[doc(hidden)]
     pub fn export_defaults(verbatim: bool) -> ExportOptions {
         let export = ExportOptions::default();
         if verbatim {
@@ -354,8 +397,9 @@ impl TilesOptions {
     ///
     /// # Errors
     ///
-    /// The first rule broken; [`TilesError::is_config`] is true for each.
+    /// The first rule broken; each is [`ErrorKind::Usage`](crate::error::ErrorKind::Usage).
     /// Validate these options and return the immutable engine configuration.
+    #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, TilesError> {
         super::config::validate_tiles(self)
     }
@@ -372,10 +416,12 @@ impl TilesOptions {
     /// # Errors
     ///
     /// The first rule broken.
+    #[doc(hidden)]
     pub fn validate_plan_only(&self) -> Result<(), TilesError> {
         self.validate_for(Run::PlanOnly)
     }
 
+    #[doc(hidden)]
     /// The export options a plan-only run (#560) ignores: every field of
     /// [`TilesOptions::export`] that differs from `defaults` (the
     /// [`TilesOptions::export_defaults`] the caller started from, which a
@@ -515,6 +561,7 @@ fn resolve_tile_range(
 /// reported — mid-run through [`TilesObserver::overview_written`], and on
 /// the final [`TilesReport`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IntermediateOverview {
     /// Where the intermediate overview was written.
     pub path: PathBuf,
@@ -537,6 +584,7 @@ pub struct IntermediateOverview {
 /// the two-step chain would write (`overview --report` +
 /// `export-pmtiles --report`).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct TilesReport {
     /// The convert half.
     pub convert: ConvertReport,
@@ -552,6 +600,7 @@ impl TilesReport {
     /// summary covers the requested range, which can be wider than the
     /// archive's own PMTiles header — these are the zooms a caller should
     /// say hold nothing rather than imply they do.
+    #[doc(hidden)]
     pub fn empty_declared_zooms(&self) -> Vec<u8> {
         self.convert
             .skipped_empty_levels
@@ -567,6 +616,7 @@ impl TilesReport {
 /// Both are legal outcomes of a legal cut, not failures — a fleet with red
 /// squares that mean "correct" would need hand-editing at merge.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct EmptyArchive {
     /// Output counts are present on empty outcomes too.
     pub total_tiles: usize,
@@ -594,6 +644,7 @@ pub struct EmptyArchive {
 
 /// What a successful [`convert_to_pmtiles`] run produced.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum TilesOutcome {
     /// The full chain ran; the archive holds tiles (or legitimately none)
     /// and both halves reported.
@@ -629,12 +680,12 @@ impl TilesObserver for () {}
 pub enum TilesError {
     /// The convert half failed. Not a `#[source]` chain: the message *is*
     /// the convert error's, prefixed, the way the CLI has always printed it.
-    /// A refused option ([`ConvertError::is_config`]) is not prefixed: it is
-    /// refused before any conversion starts (#779).
-    #[error("{prefix}{0}", prefix = failed_prefix(.0.is_config(), "overview conversion failed: "))]
+    /// A refused option ([`ErrorKind::Usage`](crate::error::ErrorKind::Usage))
+    /// is not prefixed: it is refused before any conversion starts (#779).
+    #[error("{prefix}{0}", prefix = failed_prefix(.0.kind(), "overview conversion failed: "))]
     Convert(ConvertError),
     /// The export half failed; prefixed like [`TilesError::Convert`].
-    #[error("{prefix}{0}", prefix = failed_prefix(.0.is_config(), "export failed: "))]
+    #[error("{prefix}{0}", prefix = failed_prefix(.0.kind(), "export failed: "))]
     Export(ExportError),
     /// An option refused before any work ([`TilesOptions::validate`], #779).
     #[error(transparent)]
@@ -648,6 +699,7 @@ pub enum TilesError {
          --spill-dir, $TMPDIR, the output directory)",
         dir.display()
     )]
+    #[non_exhaustive]
     IntermediateCreate {
         /// The directory the temp file was to be created in.
         dir: PathBuf,
@@ -668,24 +720,22 @@ pub enum TilesError {
 }
 
 /// `prefix`, unless the error is a refused option, which names no step.
-fn failed_prefix(is_config: bool, prefix: &'static str) -> &'static str {
-    if is_config {
+fn failed_prefix(kind: crate::error::ErrorKind, prefix: &'static str) -> &'static str {
+    if kind == crate::error::ErrorKind::Usage {
         ""
     } else {
         prefix
     }
 }
 
-impl TilesError {
-    /// Whether this is an option the caller must fix, refused before any
-    /// input was read, as opposed to a problem with the data or the run.
-    /// The Python bindings raise these as `tylertoo.ConfigError`.
-    pub fn is_config(&self) -> bool {
+impl crate::error::Classify for TilesError {
+    /// Each half classifies as its own error does.
+    fn kind(&self) -> crate::error::ErrorKind {
         match self {
-            TilesError::Config(_) => true,
-            TilesError::Convert(e) => e.is_config(),
-            TilesError::Export(e) => e.is_config(),
-            _ => false,
+            TilesError::Config(_) => crate::error::ErrorKind::Usage,
+            TilesError::Convert(e) => e.kind(),
+            TilesError::Export(e) => e.kind(),
+            _ => crate::error::fallback_kind(self),
         }
     }
 }
@@ -1540,7 +1590,6 @@ mod tests {
             },
             ..ConvertOptions::default()
         };
-        assert!(convert.streaming, "the ceiling is streaming-only");
 
         let coarse = TilesShard {
             role: ShardRole::Coarse,
@@ -1761,7 +1810,10 @@ mod tests {
             ),
             "{err:?}"
         );
-        assert!(err.is_config());
+        assert_eq!(
+            crate::error::Classify::kind(&err),
+            crate::error::ErrorKind::Usage
+        );
     }
 
     /// #386/#443: the knob-column guard fires before any work, with the
@@ -2010,7 +2062,7 @@ mod tests {
             let late =
                 convert_to_pmtiles(&input, &output, &options).expect_err("the facade must refuse");
             assert_eq!(early.to_string(), late.to_string());
-            assert!(early.is_config(), "{early:?}");
+            assert_eq!(early.kind(), crate::error::ErrorKind::Usage, "{early:?}");
             assert!(!output.exists());
             early
         };

@@ -4,7 +4,7 @@
 //! columnar-I/O contract: read a GeoParquet file's record batches with a
 //! plain `ParquetRecordBatchReaderBuilder`, then for each batch's geometry
 //! column call [`geoarrow::array::from_arrow_array`] +
-//! [`tylertoo_core::batch_processor::extract_geometries_from_array`]. Until
+//! [`tylertoo_core::internal::batch_processor::extract_geometries_from_array`]. Until
 //! #650 that was the pair `overview::stream::scan_chunk` (the production
 //! pass-1 path) wrapped per chunk; pass 1 now scans geometry in place and
 //! converts only the rows whose geometry it needs (coalesced lines, or every
@@ -28,7 +28,7 @@ use arrow_schema::{Field, SchemaRef};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geoarrow::array::from_arrow_array;
 use std::time::Duration;
-use tylertoo_core::batch_processor::extract_geometries_from_array;
+use tylertoo_core::internal::batch_processor::extract_geometries_from_array;
 use tylertoo_io::open_parquet;
 
 /// Real-world fixtures under `tests/fixtures/realdata/` (#448 note: reuse
@@ -66,7 +66,7 @@ fn load_batches(path: &Path) -> Option<(SchemaRef, Field, usize, Vec<RecordBatch
 fn decode_all(gfield: &Field, gidx: usize, batches: &[RecordBatch]) -> usize {
     // Hoisted: building the sink inside the timed closure charged its
     // allocation to every iteration (#773).
-    let diag = tylertoo_core::diagnostics::Diagnostics::default();
+    let diag = tylertoo_core::internal::diagnostics::Diagnostics::default();
     let mut total = 0usize;
     for batch in batches {
         let garr = from_arrow_array(batch.column(gidx).as_ref(), gfield).unwrap();

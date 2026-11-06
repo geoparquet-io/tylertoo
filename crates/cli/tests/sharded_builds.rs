@@ -506,7 +506,8 @@ fn a_coarse_job_with_nothing_below_the_pivot_writes_an_empty_archive() {
         convert_plan.exists(),
         "the plan must still be written: {out}"
     );
-    let idx = tylertoo_core::archive_index::ArchiveIndex::open(&coarse).expect("valid archive");
+    let idx =
+        tylertoo_core::internal::archive_index::ArchiveIndex::open(&coarse).expect("valid archive");
     assert_eq!(
         idx.tiles().count(),
         0,
@@ -514,41 +515,25 @@ fn a_coarse_job_with_nothing_below_the_pivot_writes_an_empty_archive() {
     );
 }
 
-/// #541 review (S3b): `--shard coarse --no-streaming` is not an error about
-/// a "convert-side zoom ceiling" the user never asked for. The in-memory
-/// path cannot cap its levels, so the coarse job falls back to building all
-/// of them — same tiles, more work.
+/// #440: the in-memory engine switch is gone; `--no-streaming` is an
+/// unknown argument (a usage error, exit 2), not a silent no-op.
 #[test]
-fn a_coarse_job_without_streaming_falls_back_to_the_uncapped_convert() {
+fn no_streaming_flag_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let shard_plan = dir.path().join("shards.json");
-    let (ok, out) = run(&[
-        "shard-plan",
-        grid().to_str().unwrap(),
-        "--shards",
-        "2",
-        "--pivot",
-        "3",
-        "-o",
-        shard_plan.to_str().unwrap(),
-    ]);
-    assert!(ok, "{out}");
-    let (ok, out) = run(&[
-        "tiles",
-        grid().to_str().unwrap(),
-        dir.path().join("coarse.pmtiles").to_str().unwrap(),
-        "--min-zoom",
-        "0",
-        "--max-zoom",
-        "5",
-        "--shard",
-        "coarse",
-        "--shard-plan",
-        shard_plan.to_str().unwrap(),
-        "--no-streaming",
-    ]);
-    assert!(ok, "--shard coarse --no-streaming must succeed: {out}");
-    assert!(!out.contains("zoom ceiling"), "{out}");
+    let out = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            grid().to_str().unwrap(),
+            dir.path().join("t.pmtiles").to_str().unwrap(),
+            "--no-streaming",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--no-streaming"),
+        "{out:?}"
+    );
 }
 
 /// `export-pmtiles --tile-range LO..HI` is the manual form of a shard's

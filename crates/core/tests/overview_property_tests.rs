@@ -47,12 +47,16 @@ use std::collections::HashMap;
 use geo::{Geometry, LineString, MultiLineString, Point};
 use proptest::prelude::*;
 
-use tylertoo_core::overview::assign::{
+use tylertoo_core::internal::overview::assign::{
     apply_density_budget, assign_levels, AssignConfig, AssignFeature, Assignment, BudgetKinds, Crs,
     DensityBudgetConfig, FeatureKind, FeatureTable, SortDirection, MIN_DENSITY_LEVEL_FEATURES,
 };
-use tylertoo_core::overview::cluster::{build_cluster_tables, verify_sum_invariant, AccumulateOp};
-use tylertoo_core::overview::coalesce::{coalesce_level_lines, CoalesceInput, CoalesceParams};
+use tylertoo_core::internal::overview::cluster::{
+    build_cluster_tables, verify_sum_invariant, AccumulateOp,
+};
+use tylertoo_core::internal::overview::coalesce::{
+    coalesce_level_lines, CoalesceInput, CoalesceParams,
+};
 
 /// Array-of-structs fixture → the column-major table the engine takes (#543).
 fn table(feats: &[AssignFeature]) -> FeatureTable {
@@ -151,13 +155,14 @@ fn assign_config() -> impl Strategy<Value = AssignConfig> {
         0.0..16.0f64,
         prop_oneof![Just(SortDirection::Desc), Just(SortDirection::Asc)],
     )
-        .prop_map(|(pt, lt, at, lv, av, sort_direction)| AssignConfig {
-            point_thinning: pt,
-            line_thinning: lt,
-            polygon_thinning: at,
-            line_visibility: lv,
-            polygon_visibility: av,
-            sort_direction,
+        .prop_map(|(pt, lt, at, lv, av, sort_direction)| {
+            AssignConfig::default()
+                .with_point_thinning(pt)
+                .with_line_thinning(lt)
+                .with_polygon_thinning(at)
+                .with_line_visibility(lv)
+                .with_polygon_visibility(av)
+                .with_sort_direction(sort_direction)
         })
 }
 
@@ -175,22 +180,22 @@ fn crs() -> impl Strategy<Value = Crs> {
 /// included.
 fn budget_kinds() -> impl Strategy<Value = BudgetKinds> {
     (any::<bool>(), any::<bool>(), any::<bool>()).prop_map(|(points, lines, polygons)| {
-        BudgetKinds {
-            points,
-            lines,
-            polygons,
-        }
+        BudgetKinds::default()
+            .with_points(points)
+            .with_lines(lines)
+            .with_polygons(polygons)
     })
 }
 
 /// A valid, enabled-or-not density budget within sensible knob bounds.
 fn budget_config() -> impl Strategy<Value = DensityBudgetConfig> {
     (any::<bool>(), 1.05..4.0f64, 1.0..3.0f64, budget_kinds()).prop_map(
-        |(enabled, drop_rate, gamma, kinds)| DensityBudgetConfig {
-            enabled,
-            drop_rate,
-            gamma,
-            kinds,
+        |(enabled, drop_rate, gamma, kinds)| {
+            DensityBudgetConfig::default()
+                .with_enabled(enabled)
+                .with_drop_rate(drop_rate)
+                .with_gamma(gamma)
+                .with_kinds(kinds)
         },
     )
 }
@@ -305,11 +310,9 @@ proptest! {
         crs in crs(),
         bump in 0.0..16.0f64,
     ) {
-        let stricter = AssignConfig {
-            line_visibility: config.line_visibility + bump,
-            polygon_visibility: config.polygon_visibility + bump,
-            ..config
-        };
+        let stricter = config
+            .with_line_visibility(config.line_visibility + bump)
+            .with_polygon_visibility(config.polygon_visibility + bump);
         let base = assign_levels(&table(&feats), &gsds, &config, crs);
         let gated = assign_levels(&table(&feats), &gsds, &stricter, crs);
         prop_assert!(
@@ -412,12 +415,11 @@ proptest! {
         crs in crs(),
     ) {
         let cw = assign_levels(&table(&feats), &gsds, &config, crs);
-        let mk = |drop_rate: f64| DensityBudgetConfig {
-            enabled: true,
-            drop_rate,
-            gamma,
-            kinds,
-        };
+        let mk = |drop_rate: f64| DensityBudgetConfig::default()
+            .with_enabled(true)
+            .with_drop_rate(drop_rate)
+            .with_gamma(gamma)
+            .with_kinds(kinds);
         let loose = apply_density_budget(&cw, &table(&feats), &gsds, &config, &mk(rate), crs);
         let strict = apply_density_budget(&cw, &table(&feats), &gsds, &config, &mk(rate * factor), crs);
         for level in 0..gsds.len() as u8 {

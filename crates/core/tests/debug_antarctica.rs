@@ -6,8 +6,8 @@ use geo::MultiPolygon;
 use std::fs::File;
 use std::io::Read;
 use std::time::{Duration, Instant};
-use tylertoo_core::ioverlay_clip::clip_multipolygon_ioverlay;
-use tylertoo_core::tile::TileBounds;
+use tylertoo_core::internal::ioverlay_clip::clip_multipolygon_ioverlay;
+use tylertoo_core::internal::tile::TileBounds;
 
 /// Convert tile coordinates to geographic bounds
 fn tile_to_bounds(x: u32, y: u32, zoom: u32) -> TileBounds {
@@ -84,7 +84,7 @@ fn find_problematic_tiles() {
             let _result = clip_multipolygon_ioverlay(
                 &mp,
                 &bounds,
-                &tylertoo_core::diagnostics::Diagnostics::default(),
+                &tylertoo_core::internal::diagnostics::Diagnostics::default(),
             );
             let elapsed = start.elapsed();
 
@@ -151,7 +151,7 @@ fn test_single_tile() {
     let result = clip_multipolygon_ioverlay(
         &mp,
         &bounds,
-        &tylertoo_core::diagnostics::Diagnostics::default(),
+        &tylertoo_core::internal::diagnostics::Diagnostics::default(),
     );
     let elapsed = start.elapsed();
 

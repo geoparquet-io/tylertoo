@@ -352,6 +352,8 @@ Provenance := {
                                // zoom ladder; absent when none
                                // applied
   "density_drop": DensityDrop, // OPTIONAL: per-level feature budget
+  "line_thinning": number,     // OPTIONAL: line cell-winner grid, ×
+                               // GSD, when not the default 1.0
   "clustering":   Clustering,  // OPTIONAL: point clustering (§12.4)
   "coalescing":   Coalescing,  // OPTIONAL: line coalescing (§13.4)
   "renamed_columns": { string: string, ... }
@@ -405,7 +407,11 @@ EntryZoom := {
 DensityDrop := {
   "drop_rate":            number,  // each coarser level keeps 1/rate
   "gamma":                number,  // spatial-fairness exponent (>= 1)
-  "supercell_gsd_factor": number   // fairness neighborhood, × GSD
+  "supercell_gsd_factor": number,  // fairness neighborhood, × GSD
+  "drop_lines":           boolean, // OPTIONAL: the budget also dropped
+                                   // lines; absent when it did not
+  "drop_polygons":        boolean  // OPTIONAL: the budget also dropped
+                                   // polygons; absent when it did not
 }
 ```
 
@@ -506,6 +512,9 @@ If the writer also emits the optional `cogp` compatibility key
 subset of the above.
 
 ### 3.8 Versioning
+
+The format remains at version 0.x, independently of the tylertoo release
+version. Readers accept newer MINOR versions within the supported MAJOR.
 
 `version` is semver. Minor bumps MAY add optional fields but MUST NOT alter
 existing semantics; major bumps MAY break. Readers MUST ignore unrecognized

@@ -33,21 +33,22 @@ use std::path::{Path, PathBuf};
     reason = "#445: process-wide Python logging bridge reset handle"
 )]
 use std::sync::OnceLock;
-use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
-use tylertoo_core::input_set::ConvertSource;
-use tylertoo_core::overview::check::validate_file;
-use tylertoo_core::overview::config::keywords as config_keywords;
-use tylertoo_core::overview::convert::{
+use tylertoo_core::internal::decode::{decode_pmtiles, DecodeError, DecodeOptions};
+use tylertoo_core::internal::error::{Classify, ErrorKind};
+use tylertoo_core::internal::input_set::ConvertSource;
+use tylertoo_core::internal::overview::check::validate_file;
+use tylertoo_core::internal::overview::config::keywords as config_keywords;
+use tylertoo_core::internal::overview::convert::{
     convert_to_overviews, convert_to_overviews_sources, ConvertError, ConvertOptions,
 };
-use tylertoo_core::overview::export::{
+use tylertoo_core::internal::overview::export::{
     export_pmtiles as export_pmtiles_core, ExportError, ExportOptions,
 };
-use tylertoo_core::overview::tiles::{
+use tylertoo_core::internal::overview::tiles::{
     convert_to_pmtiles, intermediate_space_preflight, SpaceRemedies, TilesError, TilesInput,
     TilesOptions, TilesOutcome,
 };
-use tylertoo_core::pyramid::{build_pyramid, parse_bands};
+use tylertoo_core::internal::pyramid::{build_pyramid, parse_bands, PyramidError};
 
 pyo3::create_exception!(
     _tylertoo,
@@ -126,81 +127,54 @@ fn keywords(
     Ok(out)
 }
 
-/// Map a [`ConvertError`] to the Python exception type it deserves: a
-/// refused option ([`ConvertError::is_config`]) is `tylertoo.ConfigError`;
-/// other user-input problems (missing/mistyped columns, an input whose
-/// coordinates or CRS the tiler cannot work with) are `ValueError`; the #543
-/// pass-1 memory preflight is `MemoryError`; everything else (I/O, decode,
-/// writer) is `RuntimeError`.
+/// A core error as the Python exception its [`ErrorKind`] names (#438): a
+/// refused option is `tylertoo.ConfigError`, an input problem `ValueError`,
+/// the memory preflight `MemoryError`, and a failed run `RuntimeError`,
+/// prefixed `"{failed} failed: "` when the caller names the step.
+fn to_py(kind: ErrorKind, message: String, failed: Option<&str>) -> PyErr {
+    match kind {
+        ErrorKind::Usage => config_err(message),
+        ErrorKind::Input => PyValueError::new_err(message),
+        ErrorKind::Resource => PyMemoryError::new_err(message),
+        _ => PyRuntimeError::new_err(match failed {
+            Some(step) => format!("{step} failed: {message}"),
+            None => message,
+        }),
+    }
+}
+
 fn convert_error_to_py(e: ConvertError) -> PyErr {
-    if e.is_config() {
-        return config_err(e);
-    }
-    match e {
-        // The box is too small for this input (#543).
-        ConvertError::BudgetExceeded { .. } => PyMemoryError::new_err(e.to_string()),
-        // The input itself is the problem, not the run (#429).
-        ConvertError::AllFeaturesOutOfRange { .. }
-        | ConvertError::UnsupportedCrs { .. }
-        | ConvertError::SortKeyColumnMissing { .. }
-        | ConvertError::ClassRankColumnMissing { .. }
-        | ConvertError::ClassRankColumnNotString { .. }
-        | ConvertError::AccumulateColumnMissing { .. }
-        | ConvertError::AccumulateColumnNotNumeric { .. }
-        | ConvertError::AutoZoomNoSignal { .. }
-        | ConvertError::Properties(_) => PyValueError::new_err(e.to_string()),
-        other => PyRuntimeError::new_err(format!("overview conversion failed: {other}")),
-    }
+    to_py(e.kind(), e.to_string(), Some("overview conversion"))
 }
 
-/// Map an [`ExportError`] to a Python exception: a refused option
-/// ([`ExportError::is_config`]) is `tylertoo.ConfigError`; a property
-/// selection the overview file cannot satisfy is `ValueError`; everything
-/// else keeps the `RuntimeError` it always was.
 fn export_error_to_py(e: ExportError) -> PyErr {
-    if e.is_config() {
-        return config_err(e);
-    }
-    match e {
-        ExportError::UnknownProperty { .. }
-        | ExportError::UnsupportedProperty { .. }
-        | ExportError::CoveringProperty { .. }
-        | ExportError::PropertyRequiredByKnob { .. } => PyValueError::new_err(e.to_string()),
-        other => PyRuntimeError::new_err(format!("export failed: {other}")),
-    }
+    to_py(e.kind(), e.to_string(), Some("export"))
 }
 
-/// Map a [`TilesError`] the way its halves map, with refused options as
-/// `tylertoo.ConfigError`.
+/// Each half maps the way its own call does; the cause chain is kept for
+/// the facade's own errors.
 fn tiles_error_to_py(e: TilesError) -> PyErr {
     match e {
         TilesError::Convert(inner) => convert_error_to_py(inner),
         TilesError::Export(inner) => export_error_to_py(inner),
-        e if e.is_config() => config_err(with_sources(&e)),
-        other => PyRuntimeError::new_err(with_sources(&other)),
+        other => to_py(other.kind(), with_sources(&other), None),
     }
 }
 
-/// Map a pyramid build's error: a refused option is `tylertoo.ConfigError`.
-fn pyramid_error_to_py(e: tylertoo_core::Error) -> PyErr {
-    match e {
-        e if e.is_config() => config_err(with_sources(&e)),
-        other => PyRuntimeError::new_err(format!("pyramid build failed: {}", with_sources(&other))),
-    }
+fn pyramid_error_to_py(e: PyramidError) -> PyErr {
+    to_py(e.kind(), with_sources(&e), Some("pyramid build"))
 }
 
-/// Map a [`DecodeError`] to a Python exception: an inverted zoom range, a
-/// raster archive, or a property that collides with a provenance column is
-/// the caller's input problem (`ValueError`); a damaged or unreadable
-/// archive, or a failed write, is `RuntimeError`. The cause chain is kept,
-/// since `DecodeError` leaves it out of its own `Display` (#396).
+/// The cause chain is kept, since `DecodeError` leaves it out of its own
+/// `Display` (#396).
 fn decode_error_to_py(e: DecodeError) -> PyErr {
-    match e {
-        DecodeError::InvalidZoomRange { .. }
-        | DecodeError::NotVectorTiles(_)
-        | DecodeError::ReservedColumn(_) => PyValueError::new_err(with_sources(&e)),
-        other => PyRuntimeError::new_err(format!("decode failed: {}", with_sources(&other))),
-    }
+    to_py(e.kind(), with_sources(&e), Some("decode"))
+}
+
+/// A source-loss spill that could not be handed to Python.
+fn accounting_error_to_py(e: tylertoo_core::internal::diagnostics::AccountingError) -> PyErr {
+    let e = tylertoo_core::Error::from(e);
+    to_py(e.kind(), e.to_string(), None)
 }
 
 /// A core report as the dict it is: every report struct serializes as a
@@ -217,7 +191,10 @@ fn report_dict<T: serde::Serialize>(py: Python<'_>, report: &T) -> PyResult<Py<P
 fn report_dict_with_losses(
     py: Python<'_>,
     report: &impl serde::Serialize,
-    losses: &[(&tylertoo_core::diagnostics::SourceLosses, Option<&str>)],
+    losses: &[(
+        &tylertoo_core::internal::diagnostics::SourceLosses,
+        Option<&str>,
+    )],
 ) -> PyResult<Py<PyDict>> {
     let dict = report_dict(py, report)?;
     for (losses, section) in losses {
@@ -270,7 +247,7 @@ fn export_config(values: serde_json::Map<String, serde_json::Value>) -> PyResult
 
 fn pyramid_config(
     values: serde_json::Map<String, serde_json::Value>,
-) -> PyResult<tylertoo_core::pyramid::PyramidOptions> {
+) -> PyResult<tylertoo_core::internal::pyramid::PyramidOptions> {
     check_keywords("pyramid", &values)?;
     config_keywords::pyramid(values).map_err(config_err)
 }
@@ -328,10 +305,10 @@ fn convert(
         TilesOutcome::Converted(mut report) => {
             report.convert.source_losses = report.convert.source_losses
                 .for_python()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(accounting_error_to_py)?;
             report.export.source_losses = report.export.source_losses
                 .for_python()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(accounting_error_to_py)?;
             report_dict_with_losses(py, &*report, &[
                 (&report.convert.source_losses, Some("convert")),
                 (&report.export.source_losses, Some("export")),
@@ -392,7 +369,7 @@ fn overview(
 
     report.source_losses = report.source_losses
                 .for_python()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(accounting_error_to_py)?;
     report_dict_with_losses(py, &report, &[(&report.source_losses, None)])
 }
 }
@@ -415,7 +392,7 @@ fn export_pmtiles(
 
     report.source_losses = report.source_losses
                 .for_python()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(accounting_error_to_py)?;
     report_dict_with_losses(py, &report, &[(&report.source_losses, None)])
 }
 }
@@ -425,7 +402,8 @@ fn validate(py: Python<'_>, file: &str) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
     let path = Path::new(file).to_path_buf();
     let report = py.detach(|| validate_file(&path)).map_err(|e| {
-        PyErr::new::<PyRuntimeError, _>(format!("could not open '{}': {}", file, e))
+        let kind = tylertoo_core::internal::error::kind_of(&e).unwrap_or(ErrorKind::Runtime);
+        to_py(kind, format!("could not open '{file}': {e}"), None)
     })?;
 
     let dict = PyDict::new(py);
@@ -455,11 +433,10 @@ fn decode(
     let mut defaults = config_keywords::command_defaults("decode");
     for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
     defaults.extend(values);
-    let options = DecodeOptions {
-        min_zoom: serde_json::from_value(defaults.remove("min_zoom").unwrap()).map_err(config_err)?,
-        max_zoom: serde_json::from_value(defaults.remove("max_zoom").unwrap()).map_err(config_err)?,
-        layer: serde_json::from_value(defaults.remove("layer").unwrap()).map_err(config_err)?,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(serde_json::from_value(defaults.remove("min_zoom").unwrap()).map_err(config_err)?)
+        .with_max_zoom(serde_json::from_value(defaults.remove("max_zoom").unwrap()).map_err(config_err)?)
+        .with_layer(serde_json::from_value(defaults.remove("layer").unwrap()).map_err(config_err)?);
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
     let report = py
@@ -545,8 +522,8 @@ mod config_parity {
     use super::*;
     use clap::Parser;
     use serde_json::{json, Value};
-    use tylertoo_core::overview::config::cli;
-    use tylertoo_core::overview::convert::LevelPlan;
+    use tylertoo_core::internal::overview::config::cli;
+    use tylertoo_core::internal::overview::convert::LevelPlan;
 
     fn native_keywords(value: Value) -> serde_json::Map<String, Value> {
         Python::attach(|py| {
@@ -591,17 +568,15 @@ mod config_parity {
         ]);
         let cli = cli::overview_options(&args).unwrap();
         let python = overview_config(native_keywords(json!({"min_zoom": 1, "max_zoom": 3, "row_group_size": 1234, "cascade": false, "drop_lines": true, "sort_direction": "asc", "include_properties": ["id"]}))).unwrap();
-        let mut core = ConvertOptions {
-            levels: LevelPlan::ZoomRange {
+        let mut core = ConvertOptions::default()
+            .with_levels(LevelPlan::ZoomRange {
                 min_zoom: 1,
                 max_zoom: 3,
-            },
-            max_row_group_size: 1234,
-            ..Default::default()
-        };
+            })
+            .with_max_row_group_size(1234);
         core.simplify.cascade = false;
         core.density.kinds.lines = true;
-        core.assign.sort_direction = tylertoo_core::overview::assign::SortDirection::Asc;
+        core.assign.sort_direction = tylertoo_core::internal::overview::assign::SortDirection::Asc;
         core.properties.include = Some(vec!["id".into()]);
         let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
         assert_eq!(
@@ -703,13 +678,11 @@ mod config_parity {
         ]);
         let cli = cli::export_options(&args).unwrap();
         let python = export_config(native_keywords(json!({"extent": 8192, "tile_buffer": 4, "name": "Example", "include_properties": ["rank"], "feature_order": "rank:desc", "simple_clip_fastpath": false}))).unwrap();
-        let mut core = ExportOptions {
-            extent: 8192,
-            tile_buffer: 4,
-            simple_clip_fastpath: false,
-            feature_order: "rank:desc".parse().unwrap(),
-            ..Default::default()
-        };
+        let mut core = ExportOptions::default()
+            .with_extent(8192)
+            .with_tile_buffer(4)
+            .with_simple_clip_fastpath(false)
+            .with_feature_order("rank:desc".parse().unwrap());
         core.metadata.name = Some("Example".into());
         core.properties.include = Some(vec!["rank".into()]);
         let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
@@ -729,7 +702,7 @@ mod config_parity {
             cli::PyramidArgs::parse_from(["pyramid", "out", "--band", "0-3:never-read.parquet"]);
         let cli_defaults = cli::pyramid_options(&defaults);
         let python = pyramid_config(native_keywords(json!({}))).unwrap();
-        let core = tylertoo_core::pyramid::PyramidOptions::default();
+        let core = tylertoo_core::internal::pyramid::PyramidOptions::default();
         let expected = serde_json::to_value(core.validate().unwrap().options()).unwrap();
         assert_eq!(
             serde_json::to_value(cli_defaults.validate().unwrap().options()).unwrap(),
@@ -755,7 +728,7 @@ mod config_parity {
         ]);
         let cli = cli::pyramid_options(&args);
         let python = pyramid_config(native_keywords(json!({"generalize": true, "tile_size_limit": 1048576, "extent": 8192, "name": "Bands", "allow_missing_zooms": true}))).unwrap();
-        let mut core = tylertoo_core::pyramid::PyramidOptions::new(true);
+        let mut core = tylertoo_core::internal::pyramid::PyramidOptions::new(true);
         core.export.tile_size_limit = Some(1048576);
         core.export.extent = 8192;
         core.metadata.name = Some("Bands".into());
@@ -769,5 +742,46 @@ mod config_parity {
             serde_json::to_value(python.validate().unwrap().options()).unwrap(),
             core
         );
+    }
+}
+
+#[cfg(test)]
+mod error_classes {
+    use super::*;
+
+    /// #438: every [`ErrorKind`] maps to one Python exception class, and only
+    /// a failed run carries the step prefix.
+    #[test]
+    fn exception_class_follows_the_error_kind() {
+        Python::attach(|py| {
+            let table = [
+                (ErrorKind::Usage, py.get_type::<ConfigError>(), "m"),
+                (ErrorKind::Input, py.get_type::<PyValueError>(), "m"),
+                (ErrorKind::Resource, py.get_type::<PyMemoryError>(), "m"),
+                (
+                    ErrorKind::Runtime,
+                    py.get_type::<PyRuntimeError>(),
+                    "step failed: m",
+                ),
+            ];
+            for (kind, class, message) in table {
+                let err = to_py(kind, "m".to_owned(), Some("step"));
+                assert!(err.get_type(py).is(&class), "{kind:?}: {err}");
+                assert_eq!(err.value(py).to_string(), message, "{kind:?}");
+            }
+        });
+    }
+
+    /// The mappers read the kind from core: a band whose convert refused an
+    /// option is a `ConfigError`, not a failed pyramid build.
+    #[test]
+    fn a_band_convert_refusal_is_a_config_error() {
+        Python::attach(|py| {
+            let err = pyramid_error_to_py(PyramidError::band_convert(
+                "a",
+                ConvertError::VerbatimPartitioningUnsupported,
+            ));
+            assert!(err.get_type(py).is(py.get_type::<ConfigError>()), "{err}");
+        });
     }
 }

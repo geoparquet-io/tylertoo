@@ -16,7 +16,7 @@ pub use tylertoo_io::RowGroupMetaData
 pub use tylertoo_io::SerializedFileWriter
 pub use tylertoo_io::Statistics
 pub use tylertoo_io::compute_leaves
-pub enum tylertoo_io::Error
+#[non_exhaustive] pub enum tylertoo_io::Error
 pub tylertoo_io::Error::ByteArrayRowTooLarge
 pub tylertoo_io::Error::ByteArrayRowTooLarge::bytes: u64
 pub tylertoo_io::Error::ByteArrayRowTooLarge::column: alloc::string::String
@@ -29,6 +29,7 @@ pub tylertoo_io::Error::DecoderPanic::message: alloc::string::String
 pub tylertoo_io::Error::DecoderPanic::what: &'static str
 pub tylertoo_io::Error::HostileFooter(alloc::string::String)
 pub tylertoo_io::Error::HostileIpcFooter(alloc::string::String)
+pub tylertoo_io::Error::HostilePageHeader
 impl core::error::Error for tylertoo_io::Error
 impl core::fmt::Debug for tylertoo_io::Error
 pub fn tylertoo_io::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

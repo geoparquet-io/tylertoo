@@ -1,5 +1,9 @@
 //! Checked Parquet and Arrow IPC I/O for tylertoo.
 //!
+//! This crate is an implementation detail of `tylertoo-core`, published only
+//! because `tylertoo-core` depends on it. It has no stability guarantee: any
+//! release may change or remove any item. Use `tylertoo-core` instead.
+//!
 //! Raw readers remain private. The few upstream types exported below are
 //! required by the remote byte-range adapter, statistics pruning, and parallel
 //! row-group encoding; none permits constructing an unchecked reader.
@@ -58,6 +62,7 @@ pub use parquet::file::writer::SerializedFileWriter;
 
 /// Errors refused by the input boundary before or during upstream decoding.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// One row cannot fit the decoded batch memory bound.
     #[error("one decoded row needs {bytes} bytes, past the {limit_bytes}-byte read batch memory limit; reduce the property columns or simplify the geometry")]
@@ -91,6 +96,10 @@ pub enum Error {
     /// An IPC footer declares a block outside the file.
     #[error("refusing a malformed Arrow IPC footer: {0}")]
     HostileIpcFooter(String),
+    /// A page header reads past the end of the file (#789): no honest one
+    /// does, and a crafted one costs minutes of CPU there.
+    #[error("unexpected end of file")]
+    HostilePageHeader,
 }
 
 /// Fixture construction only, excluded from the shipping API baseline.

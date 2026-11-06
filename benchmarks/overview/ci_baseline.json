@@ -83,9 +83,9 @@
       "total_vertices": 5483718
     },
     "export": {
-      "archive_bytes": 125449436,
-      "decoded_features_total": 595951,
-      "total_tile_features": 595951,
+      "archive_bytes": 124224512,
+      "decoded_features_total": 596255,
+      "total_tile_features": 596255,
       "total_tiles": 153053,
       "zooms": [
         {
@@ -113,15 +113,15 @@
           "zoom": 3
         },
         {
-          "decoded_features": 16518,
+          "decoded_features": 16673,
           "tile_count": 4,
-          "tile_feature_count": 16518,
+          "tile_feature_count": 16673,
           "zoom": 4
         },
         {
-          "decoded_features": 15392,
+          "decoded_features": 15541,
           "tile_count": 4,
-          "tile_feature_count": 15392,
+          "tile_feature_count": 15541,
           "zoom": 5
         },
         {
@@ -240,7 +240,7 @@
       "total_vertices": 19838
     },
     "export": {
-      "archive_bytes": 159642,
+      "archive_bytes": 145228,
       "decoded_features_total": 6397,
       "total_tile_features": 6397,
       "total_tiles": 78,
@@ -362,7 +362,7 @@
       "total_vertices": 20473
     },
     "export": {
-      "archive_bytes": 153908,
+      "archive_bytes": 145268,
       "decoded_features_total": 3941,
       "total_tile_features": 3941,
       "total_tiles": 87,

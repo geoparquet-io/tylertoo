@@ -6,7 +6,7 @@ use crate::covering::{CoveringSpec, RowGroupBounds};
 use crate::diagnostics::{CoveringWarning, CrsWarning, Diagnostic, Diagnostics};
 use crate::overview::level::Crs;
 use crate::quality::{is_wgs84_projjson, CrsInfo};
-use crate::{Error, Result};
+use crate::{GeoParquetReadError, Result};
 use arrow_schema::{DataType, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,12 +45,12 @@ struct SchemaFacts {
 /// including through serde deserialization.
 ///
 /// ```compile_fail
-/// use tylertoo_core::resolved_schema::ResolvedSchema;
+/// use tylertoo_core::internal::resolved_schema::ResolvedSchema;
 /// fn replace_facts(schema: &mut ResolvedSchema) { schema.facts = unreachable!(); }
 /// ```
 ///
 /// ```compile_fail
-/// use tylertoo_core::resolved_schema::ResolvedSchema;
+/// use tylertoo_core::internal::resolved_schema::ResolvedSchema;
 /// let _: ResolvedSchema = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Debug, Clone)]
@@ -114,16 +114,7 @@ impl ResolvedSchema {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
             .map(|(_, v)| v.clone());
-        let geo = geo_json
-            .as_deref()
-            .map(serde_json::from_str::<Value>)
-            .transpose()
-            .map_err(|e| {
-                Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {e}"))
-            })?;
-        if let Some(geo) = &geo {
-            warn_geo_version(geo, diagnostics);
-        }
+        let geo = geo_json.as_deref().map(parse_geo_json).transpose()?;
         let fields: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         let primary_column = geo.as_ref().and_then(primary_name).map(str::to_owned);
         let geometry_columns = geometry_columns(schema, geo.as_ref(), metadata);
@@ -132,6 +123,9 @@ impl ResolvedSchema {
         let geometry_index = selected.and_then(|n| fields.iter().position(|f| f == n));
         let geometry_name = selected.map(str::to_owned);
         let native = metadata.and_then(|md| find_native_geometry_leaf_column(md, selected?));
+        if let Some(geo) = &geo {
+            warn_geo_version(geo, native.is_some(), diagnostics);
+        }
         let crs = resolve_crs(
             geo.as_ref(),
             selected.or(primary_column.as_deref()),
@@ -187,8 +181,11 @@ impl ResolvedSchema {
     /// # Errors
     /// Returns an error for a malformed descriptor, schema or geo metadata.
     pub fn from_metadata(metadata: &ParquetMetaData) -> Result<Self> {
-        let reader = tylertoo_io::reader_metadata(Arc::new(metadata.clone()))
-            .map_err(|e| Error::GeoParquetRead(e.to_string()))?;
+        let reader = tylertoo_io::reader_metadata(Arc::new(metadata.clone())).map_err(|e| {
+            GeoParquetReadError::Schema {
+                message: e.to_string(),
+            }
+        })?;
         Self::from_parquet(reader.schema(), metadata)
     }
 
@@ -205,16 +202,14 @@ impl ResolvedSchema {
         let Some(json) = persisted else {
             return Self::resolve_with(schema, Some(metadata));
         };
-        let facts: SchemaFacts = serde_json::from_str(json)
-            .map_err(|e| Error::GeoParquetRead(format!("invalid resolved schema: {e}")))?;
+        let facts: SchemaFacts =
+            serde_json::from_str(json).map_err(GeoParquetReadError::ResolvedSchemaJson)?;
         // The resolver owns every fact, including fallback selection and
         // physical indices. A cached footer is a claim to verify against it,
         // never a second path for constructing a descriptor.
         let resolved = Self::resolve_with(schema, Some(metadata))?;
         if facts != resolved.facts {
-            return Err(Error::GeoParquetRead(
-                "resolved schema disagrees with the Parquet footer".into(),
-            ));
+            return Err(GeoParquetReadError::ResolvedSchemaMismatch.into());
         }
         Ok(resolved)
     }
@@ -231,7 +226,8 @@ impl ResolvedSchema {
     /// # Errors
     /// Returns an error if serialization fails.
     pub(crate) fn footer_json(&self) -> Result<String> {
-        serde_json::to_string(&self.facts).map_err(|e| Error::GeoParquetRead(e.to_string()))
+        serde_json::to_string(&self.facts)
+            .map_err(|e| GeoParquetReadError::ResolvedSchemaEncode(e).into())
     }
     /// WKB geometry fields whose byte values need structural validation before encoding.
     pub(crate) fn wkb_columns(&self) -> Vec<(usize, String)> {
@@ -281,9 +277,24 @@ impl ResolvedSchema {
             crate::quality::CrsKind::Unknown => None,
         }
     }
-    /// GeoParquet version, including native 2.0 without a geo key.
+    /// GeoParquet version, including native 2.0 without a geo key. `None`
+    /// when the `geo` metadata declares none or declares a non-string.
     pub fn version(&self) -> Option<&str> {
         self.facts.version.as_deref()
+    }
+
+    /// The version the report classifies: [`Self::version`], except that a
+    /// non-string `geo.version` is kept (as `"non-string <json>"`, which
+    /// classifies unknown) instead of vanishing (#708).
+    pub(crate) fn declared_version(&self) -> Option<String> {
+        let geo = self
+            .facts
+            .geo_json
+            .as_deref()
+            .and_then(|j| parse_geo_json(j).ok());
+        geo.as_ref()
+            .and_then(declared_version)
+            .or_else(|| self.facts.version.clone())
     }
     /// Schema indices of data properties, excluding all geometry and covering fields.
     pub fn properties(&self) -> &[usize] {
@@ -745,8 +756,8 @@ pub(crate) fn parse_covering_metadata(
     geo_json: &str,
     geom_column: Option<&str>,
 ) -> Result<Option<CoveringSpec>> {
-    let metadata: GeoMetadata = serde_json::from_str(geo_json)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {}", e)))?;
+    let metadata: GeoMetadata =
+        serde_json::from_str(geo_json).map_err(GeoParquetReadError::GeoMetadataJson)?;
 
     let name = geom_column.or(metadata.primary_column.as_deref());
     let Some(column) = name.and_then(|n| metadata.columns.get(n)) else {
@@ -800,16 +811,82 @@ pub(crate) fn geo_version_disposition(version: Option<&str>) -> GeoVersionDispos
     }
 }
 
+/// The GeoParquet version verdict of a whole input (#708).
+///
+/// Carried by the report and serialized as `{"status": "missing" | "known" | "unknown" |
+/// "mixed", "version": ...}`: `version` is the version string for `known`
+/// and `unknown`, the sorted distinct versions (`null` for a part with
+/// none) for `mixed`, and absent for `missing`. `known` means every part
+/// resolves to the same version, and its major is one this reader knows
+/// (1, 2). A part resolves to its `geo.version`, or to "2.0.0" when it has no
+/// such field but a native Parquet geometry column (native input implies 2.0).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+#[serde(tag = "status", content = "version", rename_all = "snake_case")]
+pub enum GeoVersion {
+    /// No part declares a version.
+    Missing,
+    /// All parts declare this one version, of a known major.
+    Known(String),
+    /// All parts declare this one version, of a major this reader does not know.
+    Unknown(String),
+    /// The parts disagree (including some declaring none).
+    Mixed(Vec<Option<String>>),
+}
+
+impl GeoVersion {
+    /// Fold the per-part versions (one item per part, in any order).
+    pub(crate) fn of_parts<S: AsRef<str>>(parts: impl IntoIterator<Item = Option<S>>) -> Self {
+        let owned: Vec<Option<String>> = parts
+            .into_iter()
+            .map(|v| v.map(|s| s.as_ref().to_owned()))
+            .collect();
+        let distinct: std::collections::BTreeSet<Option<&str>> =
+            owned.iter().map(Option::as_deref).collect();
+        match distinct.iter().next().copied() {
+            Some(first) if distinct.len() == 1 => match first {
+                None => Self::Missing,
+                Some(v) if geo_version_disposition(Some(v)) == GeoVersionDisposition::Known => {
+                    Self::Known(v.to_owned())
+                }
+                Some(v) => Self::Unknown(v.to_owned()),
+            },
+            _ => Self::Mixed(distinct.iter().map(|v| v.map(str::to_owned)).collect()),
+        }
+    }
+}
+
+/// The `geo` metadata's declared `version`, the one source for both the
+/// warning and the report. A non-string value (`1.1`, `true`, `null`) is
+/// present but not a version string: it is kept as `"non-string <json>"`,
+/// which classifies as unknown, never as missing (#708).
+fn declared_version(geo_json: &Value) -> Option<String> {
+    match geo_json.get("version")? {
+        Value::String(s) => Some(s.clone()),
+        other => Some(format!("non-string {other}")),
+    }
+}
+
 /// Warn (once per run) when a `geo` metadata `version` is missing or
 /// names a spec this reader does not know (#451). A warning, never an error:
 /// the fields read from the metadata (`primary_column`, `crs`, `bbox`,
 /// `covering`) are read best-effort and a future spec most likely still
 /// carries them, so rejecting the file outright would refuse inputs that
 /// parse fine — matching the issue's "hard-warn on unknown majors" ask.
-fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnostics) {
-    let version = geo_json.get("version").and_then(Value::as_str);
-    match geo_version_disposition(version) {
+///
+/// A native geometry column implies GeoParquet 2.0, so a `geo` key without a
+/// `version` is not worth a warning there (the report says "2.0.0" too).
+fn warn_geo_version(
+    geo_json: &Value,
+    native_implies_2: bool,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
+    // A non-string `version` (`1.1`, `true`, an object) is present but not a
+    // version: unknown, not "missing" (#708).
+    let version = declared_version(geo_json);
+    match geo_version_disposition(version.as_deref()) {
         GeoVersionDisposition::Known => {}
+        GeoVersionDisposition::Missing if native_implies_2 => {}
         GeoVersionDisposition::Missing => {
             diagnostics.once(crate::diagnostics::Diagnostic::CrsMetadata {
                 count: 1,
@@ -817,16 +894,25 @@ fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnost
             });
         }
         GeoVersionDisposition::Unknown => {
-            // The version string is untrusted input headed for a log line;
+            // The version is untrusted input headed for a log line;
             // {:?} escapes it and the cap keeps a pathological value short.
-            let version = version.unwrap_or_default();
-            let shown: String = version.chars().take(64).collect();
+            let shown: String = version.unwrap_or_default().chars().take(64).collect();
             diagnostics.once(crate::diagnostics::Diagnostic::CrsMetadata {
                 count: 1,
                 reason: crate::diagnostics::CrsWarning::UnknownVersion(shown),
             });
         }
     }
+}
+
+/// Parse a `geo` key's JSON. Invalid JSON and valid JSON that is not an
+/// object (`[]`, `null`, `42`) are the same hard error (#708).
+pub(crate) fn parse_geo_json(json: &str) -> Result<Value> {
+    let v: Value = serde_json::from_str(json).map_err(GeoParquetReadError::GeoMetadataJson)?;
+    if !v.is_object() {
+        return Err(GeoParquetReadError::GeoMetadataNotObject.into());
+    }
+    Ok(v)
 }
 
 /// Extract CRS information from already-parsed parquet key-value metadata.
@@ -868,12 +954,11 @@ pub(crate) fn crs_info_from_kv_metadata(
     };
 
     // Parse the geo metadata JSON
-    let geo_json: Value = serde_json::from_str(geo_json_str)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {}", e)))?;
+    let geo_json = parse_geo_json(geo_json_str)?;
 
     // #451: flag a `geo.version` from a spec this reader does not know
     // before interpreting any of its fields.
-    warn_geo_version(&geo_json, diagnostics);
+    warn_geo_version(&geo_json, false, diagnostics);
 
     let primary_column = primary_name(&geo_json).unwrap_or(DEFAULT_GEOMETRY_COLUMN);
 

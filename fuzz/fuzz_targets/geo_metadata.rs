@@ -8,6 +8,6 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(s) = std::str::from_utf8(data) {
-        let _ = tylertoo_core::overview::convert::fuzz_geo_metadata(s);
+        let _ = tylertoo_core::internal::overview::convert::fuzz_geo_metadata(s);
     }
 });
