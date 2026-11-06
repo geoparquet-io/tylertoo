@@ -388,6 +388,8 @@ impl PendingOutput {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::io::Write;
 
     /// Regression (#791): a publish by rename must land on a path that does
     /// not exist, or ext4 flushes the whole file inside the rename. The
@@ -413,8 +415,6 @@ mod tests {
         drop(b);
         assert_eq!(listing(dir.path()), Vec::<String>::new());
     }
-    use super::*;
-    use std::io::Write;
 
     fn listing(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
