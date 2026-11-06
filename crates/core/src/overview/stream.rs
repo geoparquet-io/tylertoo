@@ -4344,8 +4344,9 @@ impl Drop for StageScope<'_> {
 pub(super) struct ExportPhaseWalls {
     /// `scan_all_levels` + the #498 range restriction + `plan_levels`.
     pub(super) scan: f64,
-    /// The #803 variable-depth probe, which the scan wall excludes. Exactly
-    /// 0.0 without `--generate-variable-depth-tile-pyramid`.
+    /// The #803 variable-depth probe, on its own thread alongside `levels`
+    /// (so the walls then overlap). Exactly 0.0 without
+    /// `--generate-variable-depth-tile-pyramid`.
     pub(super) probe: f64,
     /// The partitioning-mode single-read fill (`fill_member_store`, #235).
     /// Exactly 0.0 when there is no fill (duplicating mode, or the legacy

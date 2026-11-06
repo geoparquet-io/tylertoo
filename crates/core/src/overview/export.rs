@@ -2343,32 +2343,19 @@ fn export_pmtiles_validated(
         budget: *budget,
         fit_limit: knobs.memory_limit.or_else(probe_oom_memory_limit),
     };
-    // #803: stop each branch where the canonical tile fits, and plan only
-    // the tiles that remain.
-    let terminals = match vd_plan {
-        Some(plan) => {
-            progress.enter_phase("probe");
-            let t_probe = Instant::now();
-            let frontier = plan.probe(
-                &variable_depth::Probe {
-                    reader: &reader,
-                    crs,
-                    published: &published,
-                    feature_id: feature_id.as_ref(),
-                    options,
-                    budget: &partition_budget,
-                    timers: &progress.profile.timers,
-                },
-                diagnostics,
-            )?;
-            frontier.restrict(&mut scans, &level_zooms);
-            progress.end_probe(t_probe);
-            frontier.into_terminals()
-        }
-        None => (0..num_levels).map(|_| Vec::new()).collect(),
-    };
-    let scans = scans;
-    let plans = plan_levels(&scans, &level_zooms, &partition_budget)?;
+    // #803: the levels coarser than every candidate tile cannot change, so
+    // they are planned now and drawn while the probe runs; the rest are
+    // planned one by one as the probe releases them.
+    let vd = vd_plan.map(|plan| {
+        let first = plan.first_probed_level(options);
+        (plan, first)
+    });
+    let planned = vd.as_ref().map_or(num_levels, |(_, first)| *first);
+    let plans = plan_levels(
+        &scans[..planned],
+        &level_zooms[..planned],
+        &partition_budget,
+    )?;
     progress.end_scan(t_scan);
 
     // Pass 2 read strategy (#235): in partitioning mode a level's render set
@@ -2495,44 +2482,98 @@ fn export_pmtiles_validated(
     });
     #[cfg(test)]
     let work = Mutex::new(ExportWorkTally::default());
+    let (head, rest) = scans.split_at_mut(planned);
+    let unplanned = (
+        LevelScan {
+            feature_count: 0,
+            bounds: None,
+            tile_counts: BTreeMap::new(),
+        },
+        LevelPlan {
+            zoom: 0,
+            partitions: Vec::new(),
+            wave: 1,
+        },
+    );
+    let template = ExportLevelCtx {
+        reader: &reader,
+        scan: &unplanned.0,
+        plan: &unplanned.1,
+        level_idx: 0,
+        num_levels,
+        crs,
+        published: &published,
+        feature_id: feature_id.as_ref(),
+        options,
+        gzip_cache: &gzip_cache,
+        start,
+        fills: None,
+        terminals: &[],
+        level_read,
+        #[cfg(test)]
+        work: &work,
+    };
     let levels: Vec<ExportLevelCtx<'_>> = plans
         .iter()
+        .zip(head.iter())
         .enumerate()
-        .map(|(level_idx, plan)| ExportLevelCtx {
-            reader: &reader,
-            scan: &scans[level_idx],
+        .map(|(level_idx, (plan, scan))| ExportLevelCtx {
+            scan,
             plan,
             level_idx,
-            num_levels,
-            crs,
-            published: &published,
-            feature_id: feature_id.as_ref(),
-            options,
-            gzip_cache: &gzip_cache,
-            start,
-            fills: None,
-            terminals: &terminals[level_idx],
-            level_read,
-            #[cfg(test)]
-            work: &work,
+            ..template
         })
         .collect();
     let level_groups = plan_level_groups(&plans, group_cap);
-    zooms.extend(export_level_groups(
-        &mut writer,
-        LevelMemory {
-            store: store.as_mut(),
-            budget: &mut *budget,
-        },
-        &levels,
-        &level_groups,
-        &CheckpointCtx {
-            output_path: output_path.as_ref(),
-            coarsest_zoom,
-        },
-        &mut progress,
-        diagnostics,
-    )?);
+    let mem = LevelMemory {
+        store: store.as_mut(),
+        budget: &mut *budget,
+    };
+    let ckpt = CheckpointCtx {
+        output_path: output_path.as_ref(),
+        coarsest_zoom,
+    };
+    let probe_timers = Arc::clone(&progress.profile.timers);
+    #[cfg_attr(not(test), expect(unused_variables, reason = "the tests' schedule"))]
+    let (reports, level_groups) = match vd {
+        None => {
+            let reports = export_level_groups(
+                &mut writer,
+                mem,
+                &levels,
+                &level_groups,
+                &ckpt,
+                &mut progress,
+                diagnostics,
+            )?;
+            (reports, level_groups)
+        }
+        Some((plan, _)) => variable_depth::export_levels(
+            &mut writer,
+            mem,
+            &ckpt,
+            &mut progress,
+            diagnostics,
+            variable_depth::VdLevels {
+                plan,
+                probe: variable_depth::Probe {
+                    reader: &reader,
+                    crs,
+                    published: &published,
+                    feature_id: feature_id.as_ref(),
+                    options,
+                    budget: &partition_budget,
+                    timers: &probe_timers,
+                },
+                planned: (&levels, level_groups),
+                rest,
+                zooms: &level_zooms,
+                template,
+                group_cap,
+            },
+        )?,
+    };
+    zooms.extend(reports);
 
     budget.release(store_grant);
     budget.release(gzip_grant);
@@ -2837,16 +2878,9 @@ impl ExportProgress {
         }
     }
 
-    /// Close the scan (+ plan) phase wall, less the #803 probe inside it,
-    /// and sample RSS.
+    /// Close the scan (+ plan) phase wall and sample RSS.
     fn end_scan(&mut self, t_scan: Instant) {
-        self.profile.walls.scan = t_scan.elapsed().as_secs_f64() - self.profile.walls.probe;
-        self.sample_boundary_rss();
-    }
-
-    /// Close the #803 variable-depth probe's phase wall and sample RSS.
-    fn end_probe(&mut self, t_probe: Instant) {
-        self.profile.walls.probe = t_probe.elapsed().as_secs_f64();
+        self.profile.walls.scan = t_scan.elapsed().as_secs_f64();
         self.sample_boundary_rss();
     }
 
@@ -7285,6 +7319,14 @@ fn sort_members_for_encode(members: &mut [Member], order: &FeatureOrder) {
     }
 }
 
+/// One tile's members, already in `(key, seq)` order, into feature order:
+/// [`sort_members_for_encode`]'s per-tile step.
+fn sort_tile_for_encode(tile: &mut [Member], order: &FeatureOrder) {
+    if let FeatureOrder::Column { name, descending } = order {
+        tile.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
+    }
+}
+
 /// Record which of a tile's members reached it and which were lost, by
 /// source row, when a `--feature-id` is set (#443): a source drawn in any
 /// tile at any zoom is never lost.
@@ -8271,6 +8313,21 @@ fn build_mvt_with<M: TileFeature>(
     fill: &[&FillFeature],
     encode: impl Fn(&M) -> EncodedFeatureGeometry + Sync,
 ) -> TileMvt {
+    build_mvt_within(gzip_cache, members, opts, fill, encode, usize::MAX)
+        .expect("no limit to exceed")
+}
+
+/// [`build_mvt_with`], given up (`None`) as soon as the layer's encoded
+/// features and tables pass `raw_limit` bytes: the tile can only grow, so
+/// it is already over a raw cap of that size (#803's probe).
+fn build_mvt_within<M: TileFeature>(
+    gzip_cache: &Arc<TileGzipCache>,
+    members: &[M],
+    opts: &ExportOptions,
+    fill: &[&FillFeature],
+    encode: impl Fn(&M) -> EncodedFeatureGeometry + Sync,
+    raw_limit: usize,
+) -> Option<TileMvt> {
     // #443: a resolved `--feature-id` always wins; the no-flag default
     // (`m.id` is `None`) keeps the pre-#443 tile-local member index.
     let id_of = |i: usize, m: &M| Some(m.feature_id().unwrap_or(i as u64));
@@ -8310,12 +8367,18 @@ fn build_mvt_with<M: TileFeature>(
                 track(m.feature_id().map(|_| m.source_row()), &geom);
                 layer.add_encoded_feature(id_of(i, m), geom, m.properties());
             }
+            if layer.encoded_len() > raw_limit {
+                return None;
+            }
         }
     } else {
         for (i, m) in members.iter().enumerate() {
             let geom = encode(m);
             track(m.feature_id().map(|_| m.source_row()), &geom);
             layer.add_encoded_feature(id_of(i, m), geom, m.properties());
+            if layer.encoded_len() > raw_limit {
+                return None;
+            }
         }
     }
     // The fill is drawn but is not the data's own features: the report,
@@ -8323,7 +8386,7 @@ fn build_mvt_with<M: TileFeature>(
     let features = layer.feature_count() - fill.len();
     let unencodable = layer.dropped_features();
     let quantized = layer.quantized_features();
-    TileMvt {
+    Some(TileMvt {
         gzip_cache: Arc::clone(gzip_cache),
         source_ids,
         source_losses,
@@ -8333,7 +8396,7 @@ fn build_mvt_with<M: TileFeature>(
         quantized,
         oversized: false,
         valve: ValveTally::default(),
-    }
+    })
 }
 
 // ============================================================================

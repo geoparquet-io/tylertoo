@@ -10,6 +10,7 @@
 //! honour are refused before any output is written.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch};
@@ -21,10 +22,12 @@ use super::super::ladder::EntryZoomLadder;
 use super::super::level::{Mode, OverviewsMeta};
 use super::super::reader::OverviewReader;
 use super::{
-    account_sources, buffer_deg_at_zoom, build_mvt, collect_wave, encoded_tile, key_to_xy,
-    lnglat_bbox, plan_level, size_bboxes, sort_members_for_encode, tile_fit, tile_key, Crs,
-    EncodedTile, ExportError, ExportOptions, ExportTimers, FillTally, LevelCtx, LevelScan, Member,
-    PartitionBudget, PublishedNames, ResolvedFeatureId, TileMvt, DEFAULT_EXTENT,
+    account_sources, buffer_deg_at_zoom, build_mvt_within, collect_wave, encoded_tile,
+    export_level_groups, key_to_xy, lnglat_bbox, plan_level, plan_level_groups, plan_levels,
+    size_bboxes, sort_tile_for_encode, tile_fit, tile_key, CheckpointCtx, Crs, EncodedTile,
+    ExportError, ExportLevelCtx, ExportOptions, ExportProgress, ExportTimers, FillTally, LevelCtx,
+    LevelMemory, LevelScan, Member, PartitionBudget, PublishedNames, ResolvedFeatureId,
+    StreamingPmtilesWriter, TileMvt, ZoomReport, DEFAULT_EXTENT,
 };
 use crate::compression::TileGzipCache;
 use crate::tile::{TileBounds, TileCoord};
@@ -590,11 +593,9 @@ pub(super) struct Probe<'a> {
     pub(super) timers: &'a ExportTimers,
 }
 
-/// The stopped tiles: per level, their keys and their encoded tiles in key
-/// order.
+/// The stopped tiles' keys, per level.
 pub(super) struct Frontier {
     stopped: Vec<HashSet<u64>>,
-    terminals: Vec<Vec<EncodedTile>>,
 }
 
 /// The fewest bytes one member can add to a tile: a point feature with an
@@ -613,17 +614,68 @@ impl VdPlan {
     /// DIVERGENCE FROM TIPPECANOE: tippecanoe probes on its fixed world-30
     /// grid; this uses the canonical level's grid (world `M + 12` bits), so
     /// a stopped tile draws exactly what the canonical tiles would.
+    /// The probe's candidates at level `k`, given the stops so far: tiles
+    /// rule A′ lets stop, not under a stop, not over the raw cap on their
+    /// member count alone, and inside the coordinate clamp at the level's
+    /// candidate extent. `None` when the level has none.
+    fn candidates(
+        &self,
+        k: usize,
+        options: &ExportOptions,
+        frontier: &Frontier,
+    ) -> Option<(ExportOptions, BTreeMap<u64, usize>)> {
+        let zoom = self.zooms[k];
+        let extent = candidate_extent(zoom, self.zooms[self.canonical])?;
+        let opts = ExportOptions {
+            extent,
+            ..options.clone()
+        };
+        let raw_cap = opts.tile_size_limit.filter(|&l| l > 0);
+        let candidates: BTreeMap<u64, usize> = self.canonical_counts[k]
+            .iter()
+            .filter(|&(&key, &n)| {
+                self.policy.may_stop(zoom, key)
+                    && !frontier.covers(&self.zooms, zoom, key)
+                    && raw_cap.is_none_or(|cap| n.saturating_mul(MIN_FEATURE_BYTES) <= cap)
+                    && within_clamp(key, zoom, &opts)
+            })
+            .map(|(&key, &n)| (key, n))
+            .collect();
+        (!candidates.is_empty()).then_some((opts, candidates))
+    }
+
+    /// The first level with a candidate. No tile of a coarser level can
+    /// stop or sit under a stop, so those levels can be drawn while the
+    /// probe runs.
+    pub(super) fn first_probed_level(&self, options: &ExportOptions) -> usize {
+        let none = Frontier::new(self.zooms.len());
+        (0..self.canonical)
+            .find(|&k| self.candidates(k, options, &none).is_some())
+            .unwrap_or(self.canonical)
+    }
+
+    /// The canonical (finest) level's index.
+    pub(super) fn canonical(&self) -> usize {
+        self.canonical
+    }
+
+    /// Probe every candidate tile, coarse to fine: a tile stops when the
+    /// canonical band's members under it, encoded at the canonical level's
+    /// precision (extent `4096 << (M - z)`), fit both size caps without the
+    /// valve. A stopped tile's descendants are not probed. `each` gets every
+    /// level coarser than the canonical one, in order, as soon as it is
+    /// probed; the probe stops early, with no error, when it returns false.
+    ///
+    /// DIVERGENCE FROM TIPPECANOE: tippecanoe probes on its fixed world-30
+    /// grid; this uses the canonical level's grid (world `M + 12` bits), so
+    /// a stopped tile draws exactly what the canonical tiles would.
     pub(super) fn probe(
         self,
         p: &Probe<'_>,
         diagnostics: &crate::diagnostics::Diagnostics,
-    ) -> Result<Frontier, ExportError> {
-        let levels = self.zooms.len();
-        let max_zoom = self.zooms[self.canonical];
-        let mut frontier = Frontier {
-            stopped: vec![HashSet::new(); levels],
-            terminals: (0..levels).map(|_| Vec::new()).collect(),
-        };
+        mut each: impl FnMut(Probed) -> bool,
+    ) -> Result<(), ExportError> {
+        let mut frontier = Frontier::new(self.zooms.len());
         // Rows the probe reads are read again by the export proper, so
         // their decode and clip warnings are counted there, not here.
         let quiet = crate::diagnostics::Diagnostics::silent();
@@ -632,89 +684,118 @@ impl VdPlan {
         ));
         #[cfg(test)]
         let work = std::sync::Mutex::default();
-        let mut probed = 0usize;
+        let (mut probed, mut stops) = (0usize, 0usize);
         for k in 0..self.canonical {
             let zoom = self.zooms[k];
-            let Some(extent) = candidate_extent(zoom, max_zoom) else {
-                continue;
+            let mut level = Probed {
+                level: k,
+                stopped: HashSet::new(),
+                terminals: Vec::new(),
             };
-            let opts = ExportOptions {
-                extent,
-                ..p.options.clone()
-            };
-            let raw_cap = opts.tile_size_limit.filter(|&l| l > 0);
-            let candidates: BTreeMap<u64, usize> = self.canonical_counts[k]
-                .iter()
-                .filter(|&(&key, &n)| {
-                    self.policy.may_stop(zoom, key)
-                        && !frontier.covers(&self.zooms, zoom, key)
-                        && raw_cap.is_none_or(|cap| n.saturating_mul(MIN_FEATURE_BYTES) <= cap)
-                        && within_clamp(key, zoom, &opts)
-                })
-                .map(|(&key, &n)| (key, n))
-                .collect();
-            if candidates.is_empty() {
-                continue;
-            }
-            probed += candidates.len();
-            let plan = plan_level(&candidates, zoom, p.budget, || {
-                format!("variable-depth probe z{zoom}")
-            });
-            let ctx = LevelCtx {
-                reader: p.reader,
-                level_idx: self.canonical,
-                crs: p.crs,
-                zoom,
-                opts: &opts,
-                gzip_cache: &gzip_cache,
-                published: p.published,
-                feature_id: p.feature_id,
-                timers: p.timers,
-                fills: None,
-                tiles: Some(&candidates),
-                #[cfg(test)]
-                work: &work,
-            };
-            for wave in plan.partitions.chunks(plan.wave) {
-                let mut members: Vec<Member> = collect_wave(&ctx, wave, &quiet)?
-                    .buckets
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                sort_members_for_encode(&mut members, &opts.feature_order);
-                let tiles: Vec<&[Member]> = members.chunk_by(|a, b| a.key == b.key).collect();
-                // Largest first, one tile per task, as `encode_members` does.
-                let mut order: Vec<usize> = (0..tiles.len()).collect();
-                order.sort_by_key(|&i| std::cmp::Reverse(tiles[i].len()));
-                let mut stops: Vec<(usize, TileMvt, Vec<crate::diagnostics::Diagnostic>)> = order
-                    .into_par_iter()
-                    .with_max_len(1)
-                    .map(|i| {
-                        let _encode = ExportTimers::scope(&p.timers.encode);
-                        Ok(probe_tile(&gzip_cache, tiles[i], zoom, &opts)?
-                            .map(|(mvt, events)| (i, mvt, events)))
-                    })
-                    .filter_map(Result::transpose)
-                    .collect::<Result<_, ExportError>>()?;
-                stops.sort_unstable_by_key(|(i, ..)| *i);
-                for (i, mvt, events) in stops {
-                    // Only the chosen tile's events and sources count.
-                    account_sources(tiles[i], &mvt, zoom, p.options, diagnostics)?;
-                    diagnostics.extend(events);
-                    let key = tiles[i][0].key;
-                    let (x, y) = key_to_xy(key, zoom);
-                    frontier.stopped[k].insert(key);
-                    frontier.terminals[k].push(encoded_tile(x, y, mvt, FillTally::default())?);
+            if let Some((opts, candidates)) = self.candidates(k, p.options, &frontier) {
+                probed += candidates.len();
+                let plan = plan_level(&candidates, zoom, p.budget, || {
+                    format!("variable-depth probe z{zoom}")
+                });
+                let ctx = LevelCtx {
+                    reader: p.reader,
+                    level_idx: self.canonical,
+                    crs: p.crs,
+                    zoom,
+                    opts: &opts,
+                    gzip_cache: &gzip_cache,
+                    published: p.published,
+                    feature_id: p.feature_id,
+                    timers: p.timers,
+                    fills: None,
+                    tiles: Some(&candidates),
+                    #[cfg(test)]
+                    work: &work,
+                };
+                let t = std::time::Instant::now();
+                for wave in plan.partitions.chunks(plan.wave) {
+                    let members: Vec<Member> = collect_wave(&ctx, wave, &quiet)?
+                        .buckets
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    probe_wave(members, &ctx, &mut level, diagnostics)?;
                 }
+                level
+                    .terminals
+                    .sort_unstable_by_key(|t| tile_key(t.x, t.y, zoom));
+                log::info!(
+                    "[export] variable depth z{zoom}: {} of {} candidate(s) stopped, {:.2}s",
+                    level.terminals.len(),
+                    candidates.len(),
+                    t.elapsed().as_secs_f64(),
+                );
             }
-            frontier.terminals[k].sort_unstable_by_key(|t| tile_key(t.x, t.y, zoom));
+            stops += level.stopped.len();
+            frontier.stopped[k].clone_from(&level.stopped);
+            if !each(level) {
+                return Ok(());
+            }
         }
-        log::info!(
-            "[export] variable depth: probed {probed} tile(s), stopped {}",
-            frontier.stopped.iter().map(HashSet::len).sum::<usize>()
-        );
-        Ok(frontier)
+        log::info!("[export] variable depth: probed {probed} tile(s), stopped {stops}");
+        Ok(())
     }
+}
+
+/// One level's probe result: its stopped tiles' keys, and the tiles
+/// themselves in key order.
+pub(super) struct Probed {
+    pub(super) level: usize,
+    pub(super) stopped: HashSet<u64>,
+    pub(super) terminals: Vec<EncodedTile>,
+}
+
+/// Probe one wave's tiles from their canonical `members`, adding the ones
+/// that stop to `level`.
+fn probe_wave(
+    mut members: Vec<Member>,
+    ctx: &LevelCtx<'_>,
+    level: &mut Probed,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<(), ExportError> {
+    let (zoom, opts) = (ctx.zoom, ctx.opts);
+    members.par_sort_unstable_by_key(|m| (m.key, m.seq));
+    // Largest first, one tile per task, as `encode_members` does; each task
+    // sorts its own tile into feature order.
+    let mut tiles: Vec<(usize, &mut [Member])> = members
+        .chunk_by_mut(|a, b| a.key == b.key)
+        .enumerate()
+        .collect();
+    tiles.sort_by_key(|(_, t)| std::cmp::Reverse(t.len()));
+    let mut stops: Vec<(usize, &[Member], TileMvt, Vec<_>)> = tiles
+        .into_par_iter()
+        .with_max_len(1)
+        .map(|(i, tile)| {
+            let _encode = ExportTimers::scope(&ctx.timers.encode);
+            sort_tile_for_encode(tile, &opts.feature_order);
+            let tile: &[Member] = tile;
+            Ok(probe_tile(ctx.gzip_cache, tile, zoom, opts)?
+                .map(|(mvt, events)| (i, tile, mvt, events)))
+        })
+        .filter_map(Result::transpose)
+        .collect::<Result<_, ExportError>>()?;
+    stops.sort_unstable_by_key(|(i, ..)| *i);
+    for (_, tile, mvt, events) in stops {
+        // Only the chosen tile's events and sources count, at its zoom; the
+        // options' own extent does not enter the accounting.
+        account_sources(tile, &mvt, zoom, opts, diagnostics)?;
+        diagnostics.extend(events);
+        let key = tile[0].key;
+        let (x, y) = key_to_xy(key, zoom);
+        level.stopped.insert(key);
+        level
+            .terminals
+            .push(encoded_tile(x, y, mvt, FillTally::default())?);
+    }
+    // Freeing the members one by one is a serial walk over every clipped
+    // geometry; let the pool do it while the next wave reads.
+    rayon::spawn(move || drop(members));
+    Ok(())
 }
 
 /// The extent a stopped tile at `zoom` carries the canonical level's
@@ -760,14 +841,35 @@ fn probe_tile(
     let (x, y) = key_to_xy(tile[0].key, zoom);
     let tb = TileCoord::new(x, y, zoom).bounds();
     let staged = crate::diagnostics::Diagnostics::silent();
-    let mut mvt = build_mvt(gzip_cache, tile, &tb, opts, &[], &staged);
-    if mvt.features == 0 || tile_fit(&mut mvt, opts)? < 1.0 {
+    // The raw cap is checked as the tile is built, so a tile far over it
+    // costs only the members that fill the cap, and is never compressed.
+    let raw_cap = opts
+        .tile_size_limit
+        .filter(|&l| l > 0)
+        .unwrap_or(usize::MAX);
+    let Some(mut mvt) = build_mvt_within(
+        gzip_cache,
+        tile,
+        opts,
+        &[],
+        |m| crate::mvt::EncodedFeatureGeometry::encode(&m.geom, &tb, opts.extent, &staged),
+        raw_cap,
+    ) else {
+        return Ok(None);
+    };
+    if mvt.features == 0 || mvt.data.len() > raw_cap || tile_fit(&mut mvt, opts)? < 1.0 {
         return Ok(None);
     }
     Ok(Some((mvt, staged.snapshot())))
 }
 
 impl Frontier {
+    pub(super) fn new(levels: usize) -> Self {
+        Self {
+            stopped: vec![HashSet::new(); levels],
+        }
+    }
+
     /// Whether a stopped tile at a zoom coarser than `zoom` covers `key`.
     fn covers(&self, zooms: &[u8], zoom: u8, key: u64) -> bool {
         let (x, y) = key_to_xy(key, zoom);
@@ -781,20 +883,153 @@ impl Frontier {
             })
     }
 
-    /// Drop every stopped tile, and every tile under one, from the scans,
-    /// so the export plans and draws only what remains.
-    pub(super) fn restrict(&self, scans: &mut [LevelScan], zooms: &[u8]) {
-        for (k, scan) in scans.iter_mut().enumerate() {
-            let zoom = zooms[k];
-            scan.tile_counts.retain(|&key, _| {
-                !self.stopped[k].contains(&key) && !self.covers(zooms, zoom, key)
-            });
-        }
+    /// Take in a probed level's stops, before any finer level is restricted.
+    pub(super) fn add(&mut self, level: &Probed) {
+        self.stopped[level.level].clone_from(&level.stopped);
     }
 
-    /// Each level's stopped tiles, in key order.
-    pub(super) fn into_terminals(self) -> Vec<Vec<EncodedTile>> {
-        self.terminals
+    /// Drop level `k`'s stopped tiles, and every tile under a coarser stop,
+    /// from its scan, so the export plans and draws only what remains.
+    pub(super) fn restrict(&self, k: usize, scan: &mut LevelScan, zooms: &[u8]) {
+        let zoom = zooms[k];
+        scan.tile_counts
+            .retain(|&key, _| !self.stopped[k].contains(&key) && !self.covers(zooms, zoom, key));
+    }
+}
+
+// ============================================================================
+// Drawing the levels around the probe
+// ============================================================================
+
+/// What [`export_levels`] draws: the rule-A′ plan to probe with, the levels
+/// planned before the probe with their groups, and the scans of the rest.
+pub(super) struct VdLevels<'a> {
+    pub(super) plan: VdPlan,
+    pub(super) probe: Probe<'a>,
+    pub(super) planned: (&'a [ExportLevelCtx<'a>], Vec<Range<usize>>),
+    pub(super) rest: &'a mut [LevelScan],
+    pub(super) zooms: &'a [u8],
+    /// Every level's shared context; each level sets its own scan, plan,
+    /// index and stopped tiles.
+    pub(super) template: ExportLevelCtx<'a>,
+    /// The [`plan_level_groups`] member cap.
+    pub(super) group_cap: usize,
+}
+
+/// Export every level with variable depth: the levels no tile of which can
+/// stop are drawn while the probe runs on its own thread, then the rest,
+/// with their stopped tiles and without their subtrees. Returns the reports and the
+/// group schedule, as [`export_level_groups`] would.
+///
+/// PERF (#803): the coarse levels of a dense file are a few huge tiles,
+/// each fitted by a serial valve, so they leave most of the pool idle; the
+/// probe reads and encodes the canonical band in that room.
+pub(super) fn export_levels(
+    writer: &mut StreamingPmtilesWriter,
+    mem: LevelMemory<'_>,
+    ckpt: &CheckpointCtx<'_>,
+    progress: &mut ExportProgress,
+    diagnostics: &crate::diagnostics::Diagnostics,
+    run: VdLevels<'_>,
+) -> Result<(Vec<ZoomReport>, Vec<Range<usize>>), ExportError> {
+    let VdLevels {
+        plan,
+        probe,
+        planned: (levels, mut groups),
+        rest,
+        zooms,
+        template,
+        group_cap,
+    } = run;
+    let LevelMemory { mut store, budget } = mem;
+    let canonical = plan.canonical();
+    let first = levels.len();
+    let partition_budget = probe.budget;
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let prober = scope.spawn(move || {
+            let t = std::time::Instant::now();
+            let probed = plan.probe(&probe, diagnostics, |level| tx.send(level).is_ok());
+            (probed, t.elapsed().as_secs_f64())
+        });
+        let mut reports = export_level_groups(
+            writer,
+            LevelMemory {
+                store: store.as_deref_mut(),
+                budget: &mut *budget,
+            },
+            levels,
+            &groups,
+            ckpt,
+            progress,
+            diagnostics,
+        )?;
+        // The rest wait for the whole probe, so they can run as groups.
+        let mut frontier = Frontier::new(zooms.len());
+        let mut terminals: Vec<Vec<EncodedTile>> = (0..zooms.len()).map(|_| Vec::new()).collect();
+        for _ in 0..canonical {
+            let Ok(level) = rx.recv() else {
+                // The probe failed, or ended early.
+                return Err(prober_error(prober));
+            };
+            frontier.add(&level);
+            debug_assert!(level.terminals.is_empty() || level.level >= first);
+            terminals[level.level] = level.terminals;
+        }
+        for (k, scan) in (first..).zip(rest.iter_mut()) {
+            frontier.restrict(k, scan, zooms);
+        }
+        let plans = plan_levels(rest, &zooms[first..], partition_budget)?;
+        let rest_levels: Vec<ExportLevelCtx<'_>> = plans
+            .iter()
+            .zip(rest.iter())
+            .enumerate()
+            .map(|(i, (plan, scan))| ExportLevelCtx {
+                scan,
+                plan,
+                level_idx: first + i,
+                terminals: &terminals[first + i],
+                ..template
+            })
+            .collect();
+        let rest_groups = plan_level_groups(&plans, group_cap);
+        reports.extend(export_level_groups(
+            writer,
+            LevelMemory {
+                store,
+                budget: &mut *budget,
+            },
+            &rest_levels,
+            &rest_groups,
+            ckpt,
+            progress,
+            diagnostics,
+        )?);
+        groups.extend(
+            rest_groups
+                .into_iter()
+                .map(|g| g.start + first..g.end + first),
+        );
+        drop(rx);
+        let (probed, secs) = prober
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        probed?;
+        progress.profile.walls.probe = secs;
+        Ok((reports, groups))
+    })
+}
+
+/// The error a probe that stopped sending ended with.
+fn prober_error(
+    prober: std::thread::ScopedJoinHandle<'_, (Result<(), ExportError>, f64)>,
+) -> ExportError {
+    match prober.join() {
+        Ok((Err(error), _)) => error,
+        Ok((Ok(()), _)) => ExportError::Io(std::io::Error::other(
+            "the variable-depth probe ended before every level was decided",
+        )),
+        Err(panic) => std::panic::resume_unwind(panic),
     }
 }
 
