@@ -164,6 +164,7 @@ A bump updates:
 |------|---------|
 | `Cargo.toml` | `version = "X.Y.Z"` (workspace) |
 | `Cargo.toml` | `tylertoo-core = { ..., version = "X.Y.Z" }` in `[workspace.dependencies]` |
+| `Cargo.toml` | `tylertoo-io = { ..., version = "X.Y.Z" }` in `[workspace.dependencies]` |
 | `crates/python/pyproject.toml` | `version = "X.Y.Z"` |
 | `.cz.toml` | its own `version` field |
 

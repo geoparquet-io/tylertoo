@@ -1,5 +1,9 @@
 //! Checked Parquet and Arrow IPC I/O for tylertoo.
 //!
+//! This crate is an implementation detail of `tylertoo-core`, published only
+//! because `tylertoo-core` depends on it. It has no stability guarantee: any
+//! release may change or remove any item. Use `tylertoo-core` instead.
+//!
 //! Raw readers remain private. The few upstream types exported below are
 //! required by the remote byte-range adapter, statistics pruning, and parallel
 //! row-group encoding; none permits constructing an unchecked reader.

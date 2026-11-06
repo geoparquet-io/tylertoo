@@ -127,9 +127,20 @@ jobs:
           git tag -a "$TAG" -m "Release $TAG"
           git push origin "$TAG"
 
+      # tylertoo-io is an implementation detail of tylertoo-core with no
+      # stability guarantee, but core depends on it, so it publishes first.
+      - name: Publish tylertoo-io to crates.io
+        if: steps.release_check.outputs.release_exists == 'false'
+        run: cargo publish --locked --package tylertoo-io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
       - name: Publish tylertoo-core to crates.io
         if: steps.release_check.outputs.release_exists == 'false'
-        run: cargo publish --locked --package tylertoo-core
+        run: |
+          # Wait for crates.io to index tylertoo-io
+          sleep 30
+          cargo publish --locked --package tylertoo-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
