@@ -22,13 +22,13 @@ use super::super::level::{Mode, OverviewsMeta};
 use super::super::reader::OverviewReader;
 use super::{
     account_sources, buffer_deg_at_zoom, build_mvt, collect_wave, encoded_tile,
-    for_each_member_key, key_to_xy, lnglat_bbox, plan_level, size_bboxes, sort_members_for_encode,
-    tile_fit, tile_key, Crs, EncodedTile, ExportError, ExportOptions, ExportTimers, FillTally,
-    LevelCtx, LevelScan, Member, PartitionBudget, PublishedNames, ResolvedFeatureId, TileMvt,
-    DEFAULT_EXTENT,
+    for_each_member_key, key_to_xy, lnglat_bbox, near_world_edge, plan_level, size_bboxes,
+    sort_members_for_encode, tile_fit, tile_key, tiles_in_ranges, Crs, EncodedTile, ExportError,
+    ExportOptions, ExportTimers, FillTally, LevelCtx, LevelScan, Member, PartitionBudget,
+    PublishedNames, ResolvedFeatureId, TileMvt, DEFAULT_EXTENT,
 };
 use crate::compression::TileGzipCache;
-use crate::tile::{TileBounds, TileCoord};
+use crate::tile::{max_tile_index, BboxTileRanges, TileBounds, TileCoord, MAX_LATITUDE};
 
 /// The refusals that need no file: the export options alone.
 ///
@@ -334,15 +334,24 @@ fn member_runs(
     zooms: &[u8],
     opts: &ExportOptions,
 ) -> Vec<Vec<Vec<(u64, usize)>>> {
+    let widest = zooms
+        .iter()
+        .map(|&z| buffer_deg_at_zoom(z, opts))
+        .fold(0.0, f64::max);
     bboxes
         .par_chunks(RUN_ROWS)
         .map(|chunk| {
+            let rows: Vec<(TileBounds, RowY)> = chunk
+                .iter()
+                .flatten()
+                .map(|b| (*b, RowY::new(b, widest)))
+                .collect();
             zooms
                 .iter()
                 .map(|&zoom| {
                     let mut runs: Vec<(u64, usize)> = Vec::new();
-                    for bbox in chunk.iter().flatten() {
-                        for_each_member_key(bbox, zoom, opts, |key| match runs.last_mut() {
+                    for (bbox, row) in &rows {
+                        row_member_keys(bbox, row, zoom, opts, |key| match runs.last_mut() {
                             Some((k, n)) if *k == key => *n += 1,
                             _ => runs.push((key, 1)),
                         });
@@ -352,6 +361,79 @@ fn member_runs(
                 .collect()
         })
         .collect()
+}
+
+/// Web Mercator's normalized row (0 north, 1 south) of `lat`, computed
+/// exactly as [`crate::tile::lng_lat_to_tile`] computes it before scaling.
+fn mercator_v(lat: f64) -> f64 {
+    let lat_rad = lat.clamp(-MAX_LATITUDE, MAX_LATITUDE).to_radians();
+    (1.0 - lat_rad.tan().asinh() / std::f64::consts::PI) / 2.0
+}
+
+/// A row's Mercator rows at its own latitude edges, and a bound on how far
+/// any buffer up to `widest` degrees can move them: enough to place its
+/// buffered edges at most zooms without a `tan` per zoom.
+struct RowY {
+    top: f64,
+    bottom: f64,
+    /// Max `|dv/dlat|` per degree over the bbox grown by `widest`.
+    slope: f64,
+}
+
+impl RowY {
+    fn new(bbox: &TileBounds, widest: f64) -> Self {
+        let phi = (bbox.lat_min.abs().max(bbox.lat_max.abs()) + widest).min(MAX_LATITUDE);
+        Self {
+            top: mercator_v(bbox.lat_max),
+            bottom: mercator_v(bbox.lat_min),
+            // dv/dlat = 1 / (360 cos lat), growing with |lat|; 1.001 covers
+            // the rounding of `cos`.
+            slope: 1.001 / (360.0 * phi.to_radians().cos()),
+        }
+    }
+}
+
+/// [`for_each_member_key`] for one row at `zoom`, the same keys in the same
+/// order, with its buffered latitude edges placed from `row` when the
+/// buffer cannot move them across a tile row. The row index is monotone in
+/// the normalized row, so when both ends of the interval the edge can lie
+/// in floor to the same row, the exact edge does too; otherwise, and for
+/// any bbox near or across the antimeridian, it takes the exact path.
+#[inline]
+fn row_member_keys(
+    bbox: &TileBounds,
+    row: &RowY,
+    zoom: u8,
+    opts: &ExportOptions,
+    mut f: impl FnMut(u64),
+) {
+    let buffer = buffer_deg_at_zoom(zoom, opts);
+    if bbox.lng_min > bbox.lng_max || near_world_edge(bbox, buffer) {
+        return for_each_member_key(bbox, zoom, opts, f);
+    }
+    let n = 2_f64.powi(i32::from(zoom));
+    let max = max_tile_index(zoom);
+    let index = |v: f64| ((v * n).floor() as u32).min(max);
+    let one = |lo: f64, hi: f64| (index(lo) == index(hi)).then(|| index(lo));
+    // Float slack on the exact path's own rounding of the row.
+    const EPS: f64 = 1e-12;
+    let reach = buffer * row.slope + EPS;
+    let (Some(y0), Some(y1)) = (
+        one(row.top - reach, row.top + EPS),
+        one(row.bottom - EPS, row.bottom + reach),
+    ) else {
+        return for_each_member_key(bbox, zoom, opts, f);
+    };
+    // Off the world edge the buffered longitudes need no clamp.
+    let x = |lng: f64| ((((lng + 180.0) / 360.0) * n).floor() as u32).min(max);
+    let ranges = BboxTileRanges {
+        y: (y0, y1),
+        x: (x(bbox.lng_min - buffer), x(bbox.lng_max + buffer)),
+        x2: None,
+    };
+    for tc in tiles_in_ranges(&ranges, zoom) {
+        f(tile_key(tc.x, tc.y, zoom));
+    }
 }
 
 /// Adds [`member_runs`]' runs into per-zoom counts, one task per zoom.
@@ -875,28 +957,30 @@ mod tests {
     #[test]
     fn member_runs_match_tile_keys() {
         use crate::tile::TileBounds;
-        let bboxes: Vec<Option<TileBounds>> = (0..1000)
-            .map(|i| {
-                let f = f64::from(i);
-                (i % 97 != 0).then(|| {
-                    let lng = -180.0 + (f * 0.3591) % 360.0;
-                    let lat = -80.0 + (f * 0.161) % 160.0;
-                    TileBounds::new(
-                        lng,
-                        lat,
-                        (lng + 0.01 * f64::from(i % 7)).min(180.0),
-                        lat + 0.01,
-                    )
+        // Small boxes at every zoom, wide ones only where they span few tiles
+        // (a 30° box spans ~10^6 tiles at z14).
+        let check = |widths: &[f64], zooms: std::ops::RangeInclusive<u8>| {
+            let bboxes: Vec<Option<TileBounds>> = (0..4000)
+                .map(|i| {
+                    let f = f64::from(i);
+                    (i % 97 != 0).then(|| {
+                        let lng = -180.0 + (f * 0.3591) % 360.0;
+                        let lat = -89.0 + (f * 0.1781) % 178.0;
+                        let w = widths[i as usize % widths.len()];
+                        TileBounds::new(lng, lat, (lng + w).min(180.0), (lat + w).min(90.0))
+                    })
                 })
-            })
-            .collect();
-        let opts = ExportOptions::default();
-        let zooms: Vec<u8> = (0..=14).collect();
-        let mut fused = vec![std::collections::HashMap::new(); zooms.len()];
-        super::add_runs(&mut fused, super::member_runs(&bboxes, &zooms, &opts));
-        for (k, &z) in zooms.iter().enumerate() {
-            assert_eq!(fused[k], super::tile_keys(&bboxes, z, &opts), "z{z}");
-        }
+                .collect();
+            let opts = ExportOptions::default();
+            let zooms: Vec<u8> = zooms.collect();
+            let mut fused = vec![std::collections::HashMap::new(); zooms.len()];
+            super::add_runs(&mut fused, super::member_runs(&bboxes, &zooms, &opts));
+            for (k, &z) in zooms.iter().enumerate() {
+                assert_eq!(fused[k], super::tile_keys(&bboxes, z, &opts), "z{z}");
+            }
+        };
+        check(&[0.0, 1e-7, 0.01, 0.3], 0..=14);
+        check(&[2.0, 30.0], 0..=6);
     }
 
     /// A small grid of points near (10°E, 45°N).
