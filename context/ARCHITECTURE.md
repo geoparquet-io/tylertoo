@@ -12,7 +12,7 @@ Related canonical documents:
   rendered from this same file (#442).
 - **Tuning**: [`docs/OVERVIEW_TUNING.md`](https://github.com/geoparquet-io/tylertoo/blob/main/docs/OVERVIEW_TUNING.md) — every
   generalization knob, its default, and its direction.
-- **Benchmarks**: [`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/RESULTS.md)
+- **Benchmarks**: [`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (2026-07-03, before H3; removed in #810, kept in history)
   (storage/access numbers) and
   [`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/PROFILE.md)
   (performance methodology + history).
@@ -201,7 +201,7 @@ verbatim (spec §2.4).
    window and HTTP client options are env-overridable sweep knobs
    (`TYLERTOO_STAGING_*`, `TYLERTOO_HTTP_*`, #290; see
    docs/OVERVIEW_TUNING.md "Remote staging (env)" and
-   benchmarks/staging/RESULTS.md). They change request scheduling only, never
+   [benchmarks/staging/RESULTS.md](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/staging/RESULTS.md), in git history since #810). They change request scheduling only, never
    staged bytes or batch order.
 1. **Pass 1** streams the input once, keeping only a small per-feature record
    (bbox, kind, ranking key). Level assignment + density budget run over
@@ -1329,7 +1329,7 @@ and high-cardinality string/binary property columns by default
 column always keep full stats — they are the pruning index. Row groups are
 sized **per level** (`--row-group-size` is a per-level cap; levels never
 share a row group, spec §4.2). Rationale and numbers: the H1 revision note
-in `benchmarks/overview/RESULTS.md` (a 631k-feature file's footer dropped
+in [`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (in git history since #810; a 631k-feature file's footer dropped
 8.84 MB → 0.24 MB).
 
 ## StreamingPmtilesWriter

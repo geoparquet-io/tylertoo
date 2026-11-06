@@ -2,8 +2,8 @@
 
 V3 access + storage benchmark for **overview GeoParquet** vs the status-quo
 web-map deployment (**gpio GeoParquet + tippecanoe PMTiles**) vs **COGP**
-(`cogp-rs`). The publishable numbers and full method notes live in
-[`RESULTS.md`](./RESULTS.md); pipeline performance methodology + history
+(`cogp-rs`). The last recorded numbers and method notes (2026-07-03, before H3) are in
+git history: [`RESULTS.md` at 139aa99](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md), removed in #810; pipeline performance methodology + history
 live in [`PROFILE.md`](./PROFILE.md); this README is the operator's guide.
 
 ## What it measures
@@ -34,7 +34,7 @@ tippecanoe goldens come from `corpus/goldens.sh`.
 | `make_viewports.py` | derive the 3 viewport rectangles per dataset from the inputs → `viewports.json` |
 | `logging_server.py` | byte-range HTTP server with per-request byte/request logging; `/__reset` + `/__stats` control endpoints |
 | `bench_storage.py` | storage table → `storage_results.json` + markdown |
-| `bench_access.py` | the headline access benchmark → `access_results.json` + markdown |
+| `bench_access.py` | the headline access benchmark → `access_results.json` (not committed since #810) + markdown |
 | `format_access.py` | render `access_results.json` into the RESULTS.md tables |
 | `bench_access_remote.py` | the same access benchmark over real S3 (issue #176) → `remote_access_results.json` |
 | `format_remote.py` | render `remote_access_results.json` into the RESULTS.md §2b tables + `remote_access_chart.svg` |
@@ -47,7 +47,7 @@ tippecanoe goldens come from `corpus/goldens.sh`.
 
 Raw/large outputs (regenerated overview parquet, per-run logs, timing
 captures) are written under `corpus/data/bench/` which is **gitignored**.
-Only the scripts, `viewports.json`, `RESULTS.md`, and the small
+Only the scripts, `viewports.json`, and the small
 `*_results.json` are intended to be committed.
 
 ## Run

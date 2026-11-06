@@ -51,7 +51,8 @@ def test_light_cells_run_at_least_three_pairs(manifest):
 def test_the_final_window_covers_every_light_cell(manifest):
     light = {n for n, c in manifest["cells"].items() if not c["heavy"]}
     sets = manifest["sets"]
-    final = set(sets["window1"]) | set(sets["final-gate"]) | set(sets["final-held"])
+    final = (set(sets["window1"]) | set(sets["final-gate"]) | set(sets["final-held"])
+             | set(sets["results-table"]))
     assert final >= light
     assert not set(sets["window1"]) & set(sets["final-gate"])
 
@@ -287,3 +288,163 @@ def test_a_run_whose_gate_timed_out_stays_out_of_the_medians():
     assert summ["a"]["wall_s"]["n"] == 2  # noqa: PLR2004
     assert summ["a"]["wall_s"]["median"] == 2.0  # noqa: PLR2004
     assert summ["a"]["statuses"] == ["GATE_TIMED_OUT", "ok"]
+
+
+# --- pinned inputs (#810) -----------------------------------------------------
+
+CORPUS = HERE.parent / "corpus" / "manifest.json"
+
+
+def test_one_overture_release_across_corpus_and_manifest(manifest):
+    corpus = json.loads(CORPUS.read_text())
+    release = corpus["overture"]["release"]
+    for name, inp in manifest["inputs"].items():
+        if "overture" in inp.get("url", "") + inp.get("file", ""):
+            assert f"/{release}/" in inp.get("url", "") and release in inp["file"], name
+
+
+def test_every_corpus_dataset_is_pinned():
+    corpus = json.loads(CORPUS.read_text())
+    for ds in corpus["datasets"]:
+        key = "ids_sha256" if ds["source"] == "overture" else "sha256"
+        assert len(ds.get(key, "")) == 64, f"{ds['id']}: no {key}"  # noqa: PLR2004
+        assert ds["verified_count"] is True and isinstance(ds["expected_features"], int), ds["id"]
+
+
+# --- CPU, saturation and provenance (#810) ---------------------------------
+
+def _ok(binary: str, wall: float, cpu: float, profile: dict | None = None) -> dict:
+    return {"binary": binary, "status": "ok", "wall_s": wall, "cpu_s": cpu, "peak_rss_kib": 1024,
+            "foreign_cores": 0.0, "output": {"sha256": "aa", "bytes": 5}, "profile": profile or {}}
+
+
+def test_summary_keeps_whole_run_effective_cores():
+    bins = [{"label": "a", "allocator": "glibc"}]
+    summ = rm.summarize([_ok("a", 2.0, 8.0), _ok("a", 4.0, 8.0), _ok("a", 1.0, 3.0)], bins)
+    assert summ["a"]["effective_cores"]["median"] == 3.0  # noqa: PLR2004
+    assert rm.effective_cores({"wall_s": 2.0, "cpu_s": None}) is None
+
+
+PHASE = {"cpu_user_secs": 6.0, "cpu_sys_secs": 2.0, "effective_cores": 4.0, "utilization": 0.5,
+         "unattributed_core_secs": 1.0, "read_bytes": 10, "write_bytes": 20}
+
+
+def _profile_lines(tmp_path: Path, with_810: bool) -> Path:
+    sampler = {"true_peak_mib": 10.0}
+    if with_810:
+        sampler |= {"phase_order": ["pass1 scan"], "phases": {"pass1 scan": {**PHASE, "extra": 1}},
+                    "timeline": [[0.0, 0.0, 1, 0, 0, 0]] * 3}
+    convert = {"phase": "convert", "phase_walls": {"total": 2.0}, "rss_sampler": sampler,
+               "pass2": {"rows": 5, **({"writer_busy_secs": 0.7} if with_810 else {})}}
+    export = {"phase": "export", "export": {
+        "phase_walls": {"total": 1.0}, "rss_sampler": {"phases": {"levels": PHASE}} if with_810 else {},
+        **({"serial_secs": {"spool_write": 0.1, "finalize": 0.2, "group_commit_wait": 0.0}}
+           if with_810 else {})}}
+    p = tmp_path / "p.jsonl"
+    p.write_text(json.dumps(convert) + "\n" + json.dumps(export) + "\n")
+    return p
+
+
+def test_profile_keeps_the_per_phase_saturation_fields(tmp_path):
+    prof = rm.read_profile(_profile_lines(tmp_path, with_810=True))
+    assert prof["convert"]["phases"] == {"pass1 scan": PHASE}
+    assert prof["convert"]["writer_busy_secs"] == 0.7  # noqa: PLR2004
+    assert prof["export"]["phases"] == {"levels": PHASE}
+    assert prof["export"]["serial_secs"]["finalize"] == 0.2  # noqa: PLR2004
+    assert "timeline" not in json.dumps(prof)  # the JSONL keeps it; the record does not
+
+
+def test_profile_without_the_saturation_fields_still_reads(tmp_path):
+    prof = rm.read_profile(_profile_lines(tmp_path, with_810=False))
+    assert prof["convert"]["phases"] == {}
+    assert prof["convert"]["writer_busy_secs"] is None
+    assert prof["export"]["serial_secs"] is None
+
+
+def test_summary_carries_per_phase_effective_cores(tmp_path):
+    prof = rm.read_profile(_profile_lines(tmp_path, with_810=True))
+    bins = [{"label": "a", "allocator": "glibc"}]
+    summ = rm.summarize([_ok("a", 2.0, 4.0, prof), _ok("a", 2.0, 4.0, prof)], bins)
+    assert summ["a"]["phase_effective_cores"] == {"convert/pass1 scan": rm.spread([4.0, 4.0]),
+                                                  "export/levels": rm.spread([4.0, 4.0])}
+
+
+# The keys scripts/gen_bench_docs.py requires of every benchmarks/results file.
+PROVENANCE_KEYS = ["commit", "tylertoo_version", "host", "nproc", "kernel", "allocator",
+                   "tool_versions", "inputs", "date"]
+
+
+def test_provenance_has_every_contract_key(tmp_path):
+    exe = tmp_path / "tylertoo"
+    exe.write_text("#!/bin/sh\necho tylertoo 9.9.9\n")
+    exe.chmod(0o755)
+    bins = [{"label": "head", "path": str(exe), "allocator": "mimalloc", "sha256": "1" * 64}]
+    inputs = {"x": {"file": "x.parquet", "sha256": "2" * 64,
+                    "url": "s3://overturemaps-us-west-2/release/2026-10-21.0/theme=a/b.parquet"}}
+    p = rm.provenance(bins, inputs)
+    assert list(p) == PROVENANCE_KEYS
+    assert p["tylertoo_version"] == "tylertoo 9.9.9"
+    assert p["allocator"] == "mimalloc"
+    assert p["tool_versions"]["head"] == "tylertoo 9.9.9"
+    assert p["inputs"] == [{"name": "x", "sha256": "2" * 64, "release": "2026-10-21.0",
+                            "url": inputs["x"]["url"]}]
+    assert p["nproc"] >= 1
+
+
+def test_report_json_out_writes_a_results_file(tmp_path):
+    bins = [{"label": "a", "allocator": "glibc", "sha256": "1" * 64}]
+    (tmp_path / "binaries.json").write_text(json.dumps(bins))
+    (tmp_path / "provenance.json").write_text(json.dumps({k: None for k in PROVENANCE_KEYS}))
+    cdir = tmp_path / "cell"
+    cdir.mkdir()
+    (cdir / "a-r0.json").write_text(json.dumps(_ok("a", 2.0, 6.0)))
+    out = tmp_path / "results" / "x.json"
+    rm.write_results_json(tmp_path, out)
+    doc = json.loads(out.read_text())
+    assert list(doc["provenance"]) == PROVENANCE_KEYS
+    assert doc["cells"]["cell"]["a"]["effective_cores"]["median"] == 3.0  # noqa: PLR2004
+
+
+@pytest.mark.skipif(not Path("/usr/bin/time").exists(), reason="needs GNU time")
+def test_timed_records_cpu_and_effective_cores(tmp_path):
+    res = rm.timed(["sh", "-c", "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done"],
+                   tmp_path / "log.txt")
+    assert res["status"] == "ok"
+    assert res["cpu_s"] is not None and res["effective_cores"] is not None
+    assert res["profile"] == {}  # no TYLERTOO_PROFILE_JSON written by sh
+
+
+def test_profile_keeps_per_zoom_wave_width_and_spill(tmp_path):
+    export = {"phase": "export", "export": {"per_zoom": [
+        {"zoom": 0, "tiles": 1, "wave_width": 4, "spill_bytes": 10},
+        {"zoom": 1, "tiles": 4}]}}
+    p = tmp_path / "p.jsonl"
+    p.write_text(json.dumps(export) + "\n")
+    ex = rm.read_profile(p)["export"]
+    assert ex["levels"] == [{"zoom": 0, "wave_width": 4, "spill_bytes": 10},
+                            {"zoom": 1, "wave_width": None, "spill_bytes": None}]
+    assert ex["tiles"] == 5  # noqa: PLR2004
+
+
+def test_keep_output_copies_the_archive_out_of_scratch(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "o.pmtiles").write_bytes(b"PM")
+    kept = rm.keep_output(out, "o.pmtiles", tmp_path / "cell", "head-r0")
+    assert kept.read_bytes() == b"PM" and kept.parent == tmp_path / "cell"
+    assert rm.keep_output(out, "missing", tmp_path / "cell", "x") is None
+
+
+def test_keep_output_is_a_cell_key(tmp_path):
+    p = _write(tmp_path, f"""
+[inputs.a]
+file = "a.parquet"
+sha256 = "{SHA}"
+[cells.c]
+input = "a"
+command = "tiles"
+args = []
+output = "o"
+keep_output = true
+""")
+    assert rm.load_manifest(p)["cells"]["c"]["keep_output"] is True
