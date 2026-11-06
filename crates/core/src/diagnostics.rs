@@ -124,6 +124,8 @@ pub enum Diagnostic {
         count: usize,
         input: String,
         /// The input's root path (a multi-part input's `input` is a label).
+        /// Empty in plans saved before v0.9, which fall back to `input`.
+        #[serde(default)]
         root: String,
     },
     #[non_exhaustive]
@@ -382,7 +384,7 @@ impl fmt::Display for Diagnostic {
             Self::CrsMetadata {reason,..} => reason.fmt(f),
             Self::CoveringRejected {reason,..} => write!(f, "bbox covering fast path declined: {reason}; reading the geometry column"),
             Self::UnusableGeometry {total,..} => write!(f, "skipping {n} of {total} input rows with a null, empty, or non-finite geometry"),
-            Self::CrsAssumed {input,root,..} => write!(f, "input {input}: no CRS declared in the GeoParquet metadata; assuming WGS84 lon/lat (EPSG:4326). If the coordinates are not lon/lat degrees the output will be misplaced — check the input with `gpio inspect {}`", gpio_inspect_arg(root)),
+            Self::CrsAssumed {input,root,..} => write!(f, "input {input}: no CRS declared in the GeoParquet metadata; assuming WGS84 lon/lat (EPSG:4326). If the coordinates are not lon/lat degrees the output will be misplaced — check the input with `gpio inspect {}`", gpio_inspect_arg(if root.is_empty() { input } else { root })),
             Self::EmptyLevels {levels,gsd_min,gsd_max,input_features,first_written_gsd,first_written_zoom,..} => {
                 let ids = levels.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
                 let zoom = first_written_zoom.map_or_else(String::new, |z| format!(" (zoom {z})"));

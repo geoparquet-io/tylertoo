@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 
 import tylertoo
@@ -60,8 +62,6 @@ def spill(request, tmp_path, monkeypatch):
 
 def _write_source(path: Path, slivers: bool = False) -> Path:
     """ROWS rows: one point (id 0), then points or slivers."""
-    pa = pytest.importorskip("pyarrow")
-    pq = pytest.importorskip("pyarrow.parquet")
     types = ["Point", "Polygon"] if slivers else ["Point"]
     metadata: dict[str, Any] = {
         "version": "1.1.0",
@@ -149,8 +149,6 @@ def test_failed_conversion_leaves_no_spilled_files(tmp_path, spill):
 
 def test_report_carries_the_crs_assumption_and_geo_version(tmp_path):
     """#708: the CRS assumption and the geo.version verdict reach the report."""
-    pa = pytest.importorskip("pyarrow")
-    pq = pytest.importorskip("pyarrow.parquet")
     field = pa.field(
         "geometry", pa.binary(), metadata={"ARROW:extension:name": "geoarrow.wkb"}
     )

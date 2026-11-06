@@ -33,7 +33,7 @@ fn documented(knob: usize, v: f64) -> Option<bool> {
     match knob {
         0 => Some((1.0..=1_048_576.0).contains(&v.trunc()) && v >= 0.0),
         1 => non_finite.then_some(false),
-        2 => Some(!non_finite && v >= 0.0).filter(|ok| *ok || non_finite),
+        2 => Some(!non_finite && v >= 0.0),
         // "exponent (>=1)" in OVERVIEW_TUNING.md.
         3 => Some(v.is_finite() && v >= 1.0),
         _ => (v >= 0.0).then_some(v.trunc() >= 1.0),
@@ -102,6 +102,9 @@ fn documented_boundaries() {
         check(2, v).unwrap();
     }
     check(3, 1.0).unwrap();
+    // A negative simplify factor is refused (it used to behave like 0).
+    check(2, -1.0).unwrap();
+    check(2, -0.0).unwrap();
 }
 
 /// `--drop-gamma` is an exponent >= 1; below that is refused, naming the flag.

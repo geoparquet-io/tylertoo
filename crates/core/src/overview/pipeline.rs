@@ -154,7 +154,9 @@ pub(super) fn auto_backing(
 ///    [`MemoryBudget::remaining`]'s fallback allowance, which export's
 ///    wave sizing shares).
 ///
-/// The result is computed once per process and cached: the probe is called ~5×
+/// The machine/cgroup probe is computed once per process and cached (the
+/// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override is not: it is read on every call,
+/// so set it before a run starts, not during one). The probe is called ~5×
 /// per run (convert's pass-1 grid budget and pass-2 backing decision, export's
 /// wave preflight and its log line), every input is process-global, and a
 /// cached figure also keeps the paired "decide" and "log/assert" calls from
@@ -179,7 +181,7 @@ pub(super) fn available_memory_bytes() -> Option<u64> {
 /// override is never cached: it is read on every call, so a long-lived
 /// process (Python) that sets or clears `TYLERTOO_AUTO_MEM_LIMIT_BYTES`
 /// after its first conversion is honoured, and a cached machine figure never
-/// outlives the override that was in force when it was probed (#708 follow-up).
+/// outlives the override that was in force when it was probed (found in the #708 work; the other env caches are #804).
 #[expect(
     clippy::disallowed_types,
     reason = "#455: the memory probe cache, injectable so the override can be tested"
