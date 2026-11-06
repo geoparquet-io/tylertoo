@@ -1433,6 +1433,28 @@ impl MultiSource {
                     raw_crs_of(&metas[0]),
                 )));
             }
+            // #708: a declared 4326 and an assumed one are different facts;
+            // the report's `crs_assumed_wgs84` is one flag for the whole set.
+            let (assumed, first_assumed) = (
+                meta.resolved.crs_info().assumed_wgs84,
+                metas[0].resolved.crs_info().assumed_wgs84,
+            );
+            if assumed != first_assumed {
+                let word = |a: bool| {
+                    if a {
+                        "assumed (no CRS declared)"
+                    } else {
+                        "declared"
+                    }
+                };
+                return Err(incompatible(format!(
+                    "CRS mismatch: partition's WGS84 is {} but the first \
+                     partition's is {} (all partitions must declare their CRS, \
+                     or none)",
+                    word(assumed),
+                    word(first_assumed),
+                )));
+            }
             if crs.is_none() {
                 // Both undetectable: still require the RAW declarations to
                 // agree, so the eventual UnsupportedCrs error is truthful.
@@ -2167,6 +2189,43 @@ mod tests {
                 );
             }
             other => panic!("expected IncompatiblePartition, got {other:?}"),
+        }
+    }
+
+    /// #708: a part that declares EPSG:4326 and a part that declares nothing
+    /// (WGS84 merely assumed) are not the same CRS; the set must not report
+    /// 799 assumptions as one declaration (nor the reverse).
+    #[test]
+    fn declared_versus_assumed_wgs84_rejected_either_order() {
+        for (declared, assumed) in [("a.parquet", "b.parquet"), ("b.parquet", "a.parquet")] {
+            let dir = tmpdir();
+            for file in [declared, assumed] {
+                let path = dir.path().join(file);
+                let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int64Array::from(vec![1i64])) as ArrayRef],
+                )
+                .unwrap();
+                let mut writer =
+                    ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+                writer.write(&batch).unwrap();
+                if file == declared {
+                    writer.append_key_value_metadata(tylertoo_io::KeyValue::new(
+                        "geo".to_string(),
+                        r#"{"version":"1.0.0","primary_column":"geometry","columns":{"geometry":{"crs":"EPSG:4326"}}}"#.to_string(),
+                    ));
+                }
+                writer.close().unwrap();
+            }
+            let err = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap_err();
+            match err {
+                InputError::IncompatiblePartition { detail, .. } => assert!(
+                    detail.contains("assumed") && detail.contains("declared"),
+                    "{detail}"
+                ),
+                other => panic!("expected IncompatiblePartition, got {other:?}"),
+            }
         }
     }
 

@@ -127,6 +127,11 @@ pub(crate) fn classify_crs_identifier(id: &str) -> CrsKind {
     if is_web_mercator_marker(&up) {
         return CrsKind::WebMercator;
     }
+    // A WKT projected CRS embeds its WGS 84 base (`ID["EPSG",4326]`): metres,
+    // not degrees (#708).
+    if up.contains("PROJCRS") || up.contains("PROJCS") || up.contains("BASEGEOGCRS") {
+        return CrsKind::Unknown;
+    }
     // 2. Explicit lon/lat identifiers, including the URN/URL spellings
     //    ("urn:ogc:def:crs:EPSG::4326", "http://.../EPSG/0/4326").
     if up.contains("4326") || up.contains("CRS84") || up == "SRID:4326" {
@@ -834,6 +839,16 @@ mod tests {
     /// #451: every fallback branch that assumes WGS84 because the file
     /// declared nothing usable must say so on the returned `CrsInfo`, so the
     /// convert path can surface the assumption (warning + report field).
+    /// #708 item 4: a WKT2 projected CRS embeds its WGS 84 base (`ID["EPSG",4326]`)
+    /// and must not read as degrees.
+    #[test]
+    fn wkt_projected_crs_embedding_4326_is_not_wgs84() {
+        let utm = r#"PROJCRS["WGS 84 / UTM zone 33N",BASEGEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],ID["EPSG",4326]],CONVERSION["UTM zone 33N",METHOD["Transverse Mercator"]],ID["EPSG",32633]]"#;
+        assert_eq!(classify_crs_identifier(utm), CrsKind::Unknown);
+        let geog = r#"GEOGCRS["WGS 84",DATUM["World Geodetic System 1984"],ID["EPSG",4326]]"#;
+        assert_eq!(classify_crs_identifier(geog), CrsKind::Wgs84);
+    }
+
     #[test]
     fn missing_metadata_fallbacks_set_assumed_wgs84() {
         // (1) No key-value metadata at all.
