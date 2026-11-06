@@ -18262,6 +18262,118 @@ mod diagnostic_row_alignment {
     use super::*;
 
     #[test]
+    fn mutation_regression_source_loss_valve_causes() {
+        use crate::diagnostics::{Diagnostics, SourceLossCause};
+
+        let line = || Geometry::LineString(geo::LineString::from(vec![(-10., 0.), (10., 0.)]));
+        let point = || Geometry::Point(geo::Point::new(0., 0.));
+        let empty = || Geometry::GeometryCollection(geo::GeometryCollection::default());
+        // With no valve loss, every lost row has an explicit encode cause.
+        // That overrides the tile fallback, making `merged >= 0` equivalent
+        // to `merged > 0` for the recorded losses in the zero/zero case.
+        for (geoms, valve, limit, dropped, merged, expected) in [
+            (
+                vec![point(), empty()],
+                SizeValve::Drop,
+                None,
+                0,
+                0,
+                vec![(1, SourceLossCause::EncodeDropped)],
+            ),
+            (
+                vec![line(), line()],
+                SizeValve::Merge,
+                Some(1),
+                0,
+                1,
+                vec![(1, SourceLossCause::Merged)],
+            ),
+            (
+                vec![point(), point()],
+                SizeValve::Drop,
+                Some(1),
+                1,
+                0,
+                vec![(1, SourceLossCause::ValveDropped)],
+            ),
+            (
+                vec![line(), line(), point(), point()],
+                SizeValve::Merge,
+                Some(1),
+                1,
+                1,
+                vec![
+                    (1, SourceLossCause::ValveDropped),
+                    (3, SourceLossCause::ValveDropped),
+                ],
+            ),
+        ] {
+            let members: Vec<_> = geoms
+                .into_iter()
+                .enumerate()
+                .map(|(row, geom)| Member {
+                    key: 0,
+                    seq: row as u64,
+                    geom,
+                    props: Arc::new(vec![]),
+                    id: Some(100 + row as u64),
+                    gap: if row == 0 { GAP_NONE } else { 1 },
+                    band: 0,
+                })
+                .collect();
+            let opts = ExportOptions {
+                feature_id: Some("id".into()),
+                size_valve: valve,
+                tile_size_limit: limit,
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            };
+            let expected_features = members.len() - expected.len();
+            let cache = test_gzip_cache();
+            let mvt = encode_tile(
+                &cache,
+                &members,
+                &TileCoord::new(0, 0, 0).bounds(),
+                &opts,
+                &[],
+                &mut FillTally::default(),
+                &Diagnostics::default(),
+            );
+            assert_eq!(
+                (mvt.valve.dropped, mvt.valve.merged),
+                (dropped, merged),
+                "valve={:?}, features={}, bytes={}",
+                mvt.valve,
+                mvt.features,
+                mvt.data.len()
+            );
+            let diagnostics = Diagnostics::default();
+            let tiles = encode_members(
+                &cache,
+                members,
+                0,
+                &opts,
+                None,
+                &ExportTimers::default(),
+                &diagnostics,
+            )
+            .unwrap();
+            assert_eq!(tiles.len(), 1);
+            assert_eq!(tiles[0].feature_count, expected_features);
+            let losses = diagnostics.source_losses().unwrap();
+            let actual: Vec<_> = losses
+                .iter()
+                .map(|loss| {
+                    let loss = loss.unwrap();
+                    assert_eq!(loss.feature_id, Some(100 + loss.id));
+                    (loss.id, loss.cause)
+                })
+                .collect();
+            assert_eq!(actual, expected, "dropped={dropped}, merged={merged}");
+        }
+    }
+
+    #[test]
     fn duplicate_feature_ids_do_not_cancel_another_source_rows_loss() {
         let diagnostics = crate::diagnostics::Diagnostics::default();
         let geoms = vec![

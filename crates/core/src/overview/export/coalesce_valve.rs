@@ -431,6 +431,62 @@ mod tests {
     }
 
     #[test]
+    fn mutation_regression_merged_coords_count() {
+        // An unabsorbed Rect has four coordinates; once concatenated it is
+        // represented by a closed five-coordinate polygon ring.
+        let ms = [
+            member(
+                0,
+                Geometry::Rect(geo::Rect::new((0., 0.), (1., 1.))),
+                GAP_NONE,
+                0,
+            ),
+            member(
+                1,
+                Geometry::Triangle(geo::Triangle::new(
+                    coord! { x: 2., y: 0. },
+                    coord! { x: 3., y: 0. },
+                    coord! { x: 2., y: 1. },
+                )),
+                1,
+                0,
+            ),
+            member(2, square(4.), 1, 0),
+        ];
+        let ordered: Vec<_> = ms.iter().collect();
+        let separate = coalesce_members(&ordered, 0);
+        assert_eq!(
+            separate
+                .iter()
+                .map(Merged::coords_count)
+                .collect::<Vec<_>>(),
+            [4, 3, 5]
+        );
+        let merged = coalesce_members(&ordered, 2);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].absorbed, 2);
+        assert_eq!(merged[0].coords_count(), 14);
+        assert_eq!(merged[0].geometry().coords_count(), 14);
+    }
+
+    #[test]
+    fn mutation_regression_tile_feature_coords_count_forwards() {
+        use super::super::TileFeature;
+
+        fn count<T: TileFeature>(feature: T) -> usize {
+            feature.coords_count()
+        }
+
+        let ms = [member(0, line(0.), GAP_NONE, 0), member(1, line(2.), 1, 0)];
+        let ordered: Vec<_> = ms.iter().collect();
+        for (threshold, expected) in [(0, 2), (2, 4)] {
+            let merged = coalesce_members(&ordered, threshold);
+            assert_eq!(TileFeature::coords_count(&merged[0]), expected);
+            assert_eq!(count(&merged[0]), expected);
+        }
+    }
+
+    #[test]
     fn world_xy_spans_the_32_bit_world() {
         let (x0, y0) = world_xy(-180.0, MAX_LAT);
         let (x1, y1) = world_xy(180.0, -MAX_LAT);

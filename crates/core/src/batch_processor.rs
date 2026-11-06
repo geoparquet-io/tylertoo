@@ -405,6 +405,45 @@ impl GeoArrowVisitor for ExtractGeometries<'_> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mutation_regression_finite_line_and_multi_geometries() {
+        use crate::diagnostics::{Diagnostic, Diagnostics};
+
+        // Deleting a specialized match arm also passes these assertions:
+        // try_to_geometry + finite_or_empty is the equivalent fallback.
+        for value in [2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let line = geo::LineString::from(vec![(0.0, 0.0), (value, 1.0), (3.0, 0.0)]);
+            let polygon = geo::Polygon::new(line.clone(), vec![]);
+            for geometry in [
+                Geometry::LineString(line.clone()),
+                Geometry::MultiLineString(geo::MultiLineString(vec![
+                    geo::LineString::from(vec![(0.0, 0.0), (1.0, 1.0)]),
+                    line,
+                ])),
+                Geometry::MultiPolygon(geo::MultiPolygon(vec![
+                    geo::Rect::new((10.0, 10.0), (11.0, 11.0)).to_polygon(),
+                    polygon,
+                ])),
+            ] {
+                let diagnostics = Diagnostics::default();
+                let converted = to_finite_geometry(&geometry, &diagnostics).unwrap();
+                if value.is_finite() {
+                    assert_eq!(converted, geometry);
+                } else {
+                    assert_eq!(
+                        converted,
+                        Geometry::GeometryCollection(geo::GeometryCollection::default()),
+                        "{geometry:?}"
+                    );
+                }
+                assert_eq!(
+                    diagnostics.count(&Diagnostic::NonFiniteGeometry { count: 0 }),
+                    usize::from(!value.is_finite())
+                );
+            }
+        }
+    }
+
     /// The fused copy must match upstream's XY conversion, ring closing and
     /// empty handling, and count non-finite rows exactly as the old guard did.
     #[test]

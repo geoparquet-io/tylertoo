@@ -394,6 +394,11 @@ mod tests {
     /// Regression (#791): a publish by rename must land on a path that does
     /// not exist, or ext4 flushes the whole file inside the rename. The
     /// reservation still owns the name and cleans up after itself.
+    ///
+    /// Reaching the `NotFound` arm requires another actor to unlink the file
+    /// between `tempfile_in` and `remove_file`: Builder creates a regular
+    /// file and exposes no callback in that interval. Racing a remover would
+    /// make this test flaky. Other removal errors are tested with Landlock.
     #[test]
     fn reserved_path_is_absent_unique_and_cleaned_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -414,6 +419,80 @@ mod tests {
         drop(a);
         drop(b);
         assert_eq!(listing(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn mutation_regression_reservation_directory_collision_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let placeholder = dir.path().join("reserved");
+        std::fs::create_dir(&placeholder).unwrap();
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("reserved").rand_bytes(0);
+        // This fails at tempfile creation, rather than exercising the later
+        // remove_file error arm: no regular placeholder was created.
+        let error = reserve_path(&builder, Some(dir.path())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(placeholder.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mutation_regression_reservation_propagates_removal_error() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().to_path_buf();
+        // Landlock v1 can deny unlink without denying file creation. Apply
+        // it only to a fresh thread: restrictions cannot be undone, and the
+        // parent thread must still be able to clean up the placeholder.
+        std::thread::spawn(move || {
+            #[repr(C)]
+            struct RulesetAttr {
+                handled_access_fs: u64,
+            }
+            let attr = RulesetAttr {
+                handled_access_fs: 1 << 5, // LANDLOCK_ACCESS_FS_REMOVE_FILE
+            };
+            // SAFETY: attr is the initialized v1 kernel ABI structure, and
+            // its pointer is valid for the supplied size during the call.
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_landlock_create_ruleset,
+                    &attr as *const RulesetAttr,
+                    std::mem::size_of_val(&attr),
+                    0,
+                )
+            };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) {
+                    eprintln!("Landlock unavailable; cannot test unlink denial: {error}");
+                    return;
+                }
+                panic!("cannot create Landlock ruleset: {error}");
+            }
+            // SAFETY: the successful syscall returned a new owned fd.
+            let ruleset = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+            // SAFETY: PR_SET_NO_NEW_PRIVS takes these integer arguments and
+            // changes only this thread and its future children.
+            let result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+            assert_eq!(result, 0, "{}", io::Error::last_os_error());
+            // SAFETY: ruleset is live; flags=0 restricts only this thread.
+            let result =
+                unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0) };
+            assert_eq!(result, 0, "{}", io::Error::last_os_error());
+
+            let mut builder = tempfile::Builder::new();
+            builder.prefix("reserved").rand_bytes(0);
+            let error = reserve_path(&builder, Some(&parent)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                parent.join("reserved").is_file(),
+                "creation must have succeeded"
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     fn listing(dir: &Path) -> Vec<String> {
