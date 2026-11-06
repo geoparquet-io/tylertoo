@@ -48,34 +48,34 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::AccumulateOp
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::AccumulateOp
 #[non_exhaustive] pub enum tylertoo_core::ArchiveError
 pub tylertoo_core::ArchiveError::Directory(alloc::string::String)
-pub tylertoo_core::ArchiveError::DirectoryDecompress
+#[non_exhaustive] pub tylertoo_core::ArchiveError::DirectoryDecompress
 pub tylertoo_core::ArchiveError::DirectoryDecompress::error: core::io::error::Error
 pub tylertoo_core::ArchiveError::DirectoryDecompress::length: u64
 pub tylertoo_core::ArchiveError::DirectoryDecompress::offset: u64
 pub tylertoo_core::ArchiveError::DirectoryDecompress::what: &'static str
 pub tylertoo_core::ArchiveError::Header(alloc::string::String)
-pub tylertoo_core::ArchiveError::Metadata
+#[non_exhaustive] pub tylertoo_core::ArchiveError::Metadata
 pub tylertoo_core::ArchiveError::Metadata::error: core::io::error::Error
 pub tylertoo_core::ArchiveError::Metadata::path: std::path::PathBuf
-pub tylertoo_core::ArchiveError::MetadataPastEnd
+#[non_exhaustive] pub tylertoo_core::ArchiveError::MetadataPastEnd
 pub tylertoo_core::ArchiveError::MetadataPastEnd::path: std::path::PathBuf
-pub tylertoo_core::ArchiveError::MetadataTooLarge
+#[non_exhaustive] pub tylertoo_core::ArchiveError::MetadataTooLarge
 pub tylertoo_core::ArchiveError::MetadataTooLarge::ceiling: u64
 pub tylertoo_core::ArchiveError::MetadataTooLarge::claimed: u64
 pub tylertoo_core::ArchiveError::MetadataTooLarge::path: std::path::PathBuf
-pub tylertoo_core::ArchiveError::Open
+#[non_exhaustive] pub tylertoo_core::ArchiveError::Open
 pub tylertoo_core::ArchiveError::Open::error: core::io::error::Error
 pub tylertoo_core::ArchiveError::Open::path: std::path::PathBuf
-pub tylertoo_core::ArchiveError::Read
+#[non_exhaustive] pub tylertoo_core::ArchiveError::Read
 pub tylertoo_core::ArchiveError::Read::error: core::io::error::Error
 pub tylertoo_core::ArchiveError::Read::path: std::path::PathBuf
-pub tylertoo_core::ArchiveError::RunTooLong
+#[non_exhaustive] pub tylertoo_core::ArchiveError::RunTooLong
 pub tylertoo_core::ArchiveError::RunTooLong::limit: u64
 pub tylertoo_core::ArchiveError::RunTooLong::run: u64
 pub tylertoo_core::ArchiveError::RunTooLong::tile_id: u64
-pub tylertoo_core::ArchiveError::TileDataPastEnd
+#[non_exhaustive] pub tylertoo_core::ArchiveError::TileDataPastEnd
 pub tylertoo_core::ArchiveError::TileDataPastEnd::path: core::option::Option<std::path::PathBuf>
-pub tylertoo_core::ArchiveError::TileIdOutOfRange
+#[non_exhaustive] pub tylertoo_core::ArchiveError::TileIdOutOfRange
 pub tylertoo_core::ArchiveError::TileIdOutOfRange::id: u64
 pub tylertoo_core::ArchiveError::TileIdOverflow
 impl core::convert::From<tylertoo_core::ArchiveError> for tylertoo_core::Error
@@ -118,9 +118,6 @@ pub tylertoo_core::CollapseMode::Auto
 pub tylertoo_core::CollapseMode::Drop
 pub tylertoo_core::CollapseMode::Point
 pub tylertoo_core::CollapseMode::Square
-impl tylertoo_core::CollapseMode
-pub fn tylertoo_core::CollapseMode::is_square(self) -> bool
-pub fn tylertoo_core::CollapseMode::resolved(self) -> Self
 impl core::clone::Clone for tylertoo_core::CollapseMode
 pub fn tylertoo_core::CollapseMode::clone(&self) -> tylertoo_core::CollapseMode
 impl core::cmp::Eq for tylertoo_core::CollapseMode
@@ -150,8 +147,6 @@ pub tylertoo_core::Compression::None = 1
 pub tylertoo_core::Compression::Unknown = 0
 pub tylertoo_core::Compression::Zstd = 4
 impl tylertoo_core::Compression
-pub fn tylertoo_core::Compression::code(&self) -> u8
-pub fn tylertoo_core::Compression::from_code(u8) -> core::option::Option<Self>
 pub fn tylertoo_core::Compression::name(&self) -> &'static str
 pub fn tylertoo_core::Compression::parse(&str) -> core::option::Option<Self>
 impl core::clone::Clone for tylertoo_core::Compression
@@ -177,55 +172,55 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::Compression
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::Compression
 #[non_exhaustive] pub enum tylertoo_core::ConfigError
 pub tylertoo_core::ConfigError::ClassRankIncomplete
-pub tylertoo_core::ConfigError::ClassRankNotFinite
+#[non_exhaustive] pub tylertoo_core::ConfigError::ClassRankNotFinite
 pub tylertoo_core::ConfigError::ClassRankNotFinite::class: core::option::Option<alloc::string::String>
 pub tylertoo_core::ConfigError::ClassRankNotFinite::rank: f64
 pub tylertoo_core::ConfigError::ClassRankSpelledTwice
 pub tylertoo_core::ConfigError::CoalescePartitioningUnsupported
-pub tylertoo_core::ConfigError::CoarseShardHasNoZoom
+#[non_exhaustive] pub tylertoo_core::ConfigError::CoarseShardHasNoZoom
 pub tylertoo_core::ConfigError::CoarseShardHasNoZoom::min_zoom: u8
 pub tylertoo_core::ConfigError::CoarseShardHasNoZoom::pivot: u8
 pub tylertoo_core::ConfigError::CollapseConflict
 pub tylertoo_core::ConfigError::EntryZoomConflict
-pub tylertoo_core::ConfigError::FeatureIdAccumulated
+#[non_exhaustive] pub tylertoo_core::ConfigError::FeatureIdAccumulated
 pub tylertoo_core::ConfigError::FeatureIdAccumulated::name: alloc::string::String
 pub tylertoo_core::ConfigError::FeatureIdAccumulated::op: alloc::string::String
-pub tylertoo_core::ConfigError::FeatureIdColumnExcluded
+#[non_exhaustive] pub tylertoo_core::ConfigError::FeatureIdColumnExcluded
 pub tylertoo_core::ConfigError::FeatureIdColumnExcluded::name: alloc::string::String
-pub tylertoo_core::ConfigError::FeatureOrderColumnExcluded
+#[non_exhaustive] pub tylertoo_core::ConfigError::FeatureOrderColumnExcluded
 pub tylertoo_core::ConfigError::FeatureOrderColumnExcluded::name: alloc::string::String
-pub tylertoo_core::ConfigError::InvalidBbox
+#[non_exhaustive] pub tylertoo_core::ConfigError::InvalidBbox
 pub tylertoo_core::ConfigError::InvalidBbox::bbox: [f64; 4]
-pub tylertoo_core::ConfigError::InvalidExtent
+#[non_exhaustive] pub tylertoo_core::ConfigError::InvalidExtent
 pub tylertoo_core::ConfigError::InvalidExtent::extent: u32
-pub tylertoo_core::ConfigError::InvalidSpec
+#[non_exhaustive] pub tylertoo_core::ConfigError::InvalidSpec
 pub tylertoo_core::ConfigError::InvalidSpec::message: alloc::string::String
 pub tylertoo_core::ConfigError::InvalidSpec::option: &'static str
-pub tylertoo_core::ConfigError::KeepOverviewDirMissing
+#[non_exhaustive] pub tylertoo_core::ConfigError::KeepOverviewDirMissing
 pub tylertoo_core::ConfigError::KeepOverviewDirMissing::dir: std::path::PathBuf
 pub tylertoo_core::ConfigError::MetadataTooLarge(alloc::string::String)
-pub tylertoo_core::ConfigError::OptionIgnored
+#[non_exhaustive] pub tylertoo_core::ConfigError::OptionIgnored
 pub tylertoo_core::ConfigError::OptionIgnored::command: &'static str
 pub tylertoo_core::ConfigError::OptionIgnored::option: &'static str
 pub tylertoo_core::ConfigError::OptionIgnored::reason: &'static str
 pub tylertoo_core::ConfigError::Output(tylertoo_core::OutputNotWritable)
-pub tylertoo_core::ConfigError::OutputExists
+#[non_exhaustive] pub tylertoo_core::ConfigError::OutputExists
 pub tylertoo_core::ConfigError::OutputExists::kind: tylertoo_core::OutputKind
 pub tylertoo_core::ConfigError::OutputExists::path: std::path::PathBuf
-pub tylertoo_core::ConfigError::OutputIsDirectory
+#[non_exhaustive] pub tylertoo_core::ConfigError::OutputIsDirectory
 pub tylertoo_core::ConfigError::OutputIsDirectory::kind: tylertoo_core::OutputKind
 pub tylertoo_core::ConfigError::OutputIsDirectory::path: std::path::PathBuf
 pub tylertoo_core::ConfigError::PlanOnlyDataShard
 pub tylertoo_core::ConfigError::PlanOnlyWithoutSavePlan
 pub tylertoo_core::ConfigError::SavePlanWithPlan
-pub tylertoo_core::ConfigError::ShardPivotMismatch
+#[non_exhaustive] pub tylertoo_core::ConfigError::ShardPivotMismatch
 pub tylertoo_core::ConfigError::ShardPivotMismatch::pivot: u8
 pub tylertoo_core::ConfigError::ShardPivotMismatch::range_pivot: u8
 pub tylertoo_core::ConfigError::SpillDirNotDirectory(std::path::PathBuf)
-pub tylertoo_core::ConfigError::SpillDirNotWritable
+#[non_exhaustive] pub tylertoo_core::ConfigError::SpillDirNotWritable
 pub tylertoo_core::ConfigError::SpillDirNotWritable::dir: std::path::PathBuf
 pub tylertoo_core::ConfigError::SpillDirNotWritable::reason: alloc::string::String
-pub tylertoo_core::ConfigError::TileBufferTooWide
+#[non_exhaustive] pub tylertoo_core::ConfigError::TileBufferTooWide
 pub tylertoo_core::ConfigError::TileBufferTooWide::buffer: u32
 pub tylertoo_core::ConfigError::TileBufferTooWide::max: u32
 pub tylertoo_core::ConfigError::TileRangeWithShard
@@ -256,31 +251,31 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ConfigError
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ConfigError
 #[non_exhaustive] pub enum tylertoo_core::ConvertError
 pub tylertoo_core::ConvertError::Accounting(tylertoo_core::AccountingError)
-pub tylertoo_core::ConvertError::AccumulateColumnMissing
+#[non_exhaustive] pub tylertoo_core::ConvertError::AccumulateColumnMissing
 pub tylertoo_core::ConvertError::AccumulateColumnMissing::name: alloc::string::String
-pub tylertoo_core::ConvertError::AccumulateColumnNotNumeric
+#[non_exhaustive] pub tylertoo_core::ConvertError::AccumulateColumnNotNumeric
 pub tylertoo_core::ConvertError::AccumulateColumnNotNumeric::data_type: alloc::string::String
 pub tylertoo_core::ConvertError::AccumulateColumnNotNumeric::name: alloc::string::String
 pub tylertoo_core::ConvertError::AccumulateWithoutCluster
-pub tylertoo_core::ConvertError::AllFeaturesOutOfRange
+#[non_exhaustive] pub tylertoo_core::ConvertError::AllFeaturesOutOfRange
 pub tylertoo_core::ConvertError::AllFeaturesOutOfRange::crs: tylertoo_core::Crs
 pub tylertoo_core::ConvertError::AllFeaturesOutOfRange::max_abs: f64
 pub tylertoo_core::ConvertError::AllFeaturesOutOfRange::out_of_range: usize
 pub tylertoo_core::ConvertError::AllFeaturesOutOfRange::total: usize
 pub tylertoo_core::ConvertError::AllFeaturesOutOfRange::unprojectable: usize
-pub tylertoo_core::ConvertError::AutoZoomMinAboveCeiling
+#[non_exhaustive] pub tylertoo_core::ConvertError::AutoZoomMinAboveCeiling
 pub tylertoo_core::ConvertError::AutoZoomMinAboveCeiling::ceiling: u8
 pub tylertoo_core::ConvertError::AutoZoomMinAboveCeiling::min_zoom: u8
-pub tylertoo_core::ConvertError::AutoZoomNoSignal
+#[non_exhaustive] pub tylertoo_core::ConvertError::AutoZoomNoSignal
 pub tylertoo_core::ConvertError::AutoZoomNoSignal::rows: u64
 pub tylertoo_core::ConvertError::AutoZoomNoSignal::sampled: usize
-pub tylertoo_core::ConvertError::BudgetExceeded
+#[non_exhaustive] pub tylertoo_core::ConvertError::BudgetExceeded
 pub tylertoo_core::ConvertError::BudgetExceeded::available: u64
 pub tylertoo_core::ConvertError::BudgetExceeded::needed: u64
 pub tylertoo_core::ConvertError::BudgetExceeded::phase: &'static str
-pub tylertoo_core::ConvertError::ClassRankColumnMissing
+#[non_exhaustive] pub tylertoo_core::ConvertError::ClassRankColumnMissing
 pub tylertoo_core::ConvertError::ClassRankColumnMissing::name: alloc::string::String
-pub tylertoo_core::ConvertError::ClassRankColumnNotString
+#[non_exhaustive] pub tylertoo_core::ConvertError::ClassRankColumnNotString
 pub tylertoo_core::ConvertError::ClassRankColumnNotString::data_type: alloc::string::String
 pub tylertoo_core::ConvertError::ClassRankColumnNotString::name: alloc::string::String
 pub tylertoo_core::ConvertError::ClusterInvariant(alloc::string::String)
@@ -290,29 +285,29 @@ pub tylertoo_core::ConvertError::Config(tylertoo_core::ConfigError)
 pub tylertoo_core::ConvertError::Core(tylertoo_core::Error)
 pub tylertoo_core::ConvertError::Filter(tylertoo_core::FilterError)
 pub tylertoo_core::ConvertError::Input(tylertoo_core::InputError)
-pub tylertoo_core::ConvertError::InvalidConfig(alloc::string::String)
+pub tylertoo_core::ConvertError::InvalidConfig(tylertoo_core::InvalidOption)
 pub tylertoo_core::ConvertError::InvalidLevels(alloc::string::String)
 pub tylertoo_core::ConvertError::Io(core::io::error::Error)
 pub tylertoo_core::ConvertError::NoData
-pub tylertoo_core::ConvertError::NoGeometryColumn
+#[non_exhaustive] pub tylertoo_core::ConvertError::NoGeometryColumn
 pub tylertoo_core::ConvertError::NoGeometryColumn::input: alloc::string::String
-pub tylertoo_core::ConvertError::NothingAtOrBelowCeiling
+#[non_exhaustive] pub tylertoo_core::ConvertError::NothingAtOrBelowCeiling
 pub tylertoo_core::ConvertError::NothingAtOrBelowCeiling::ceiling: u8
 pub tylertoo_core::ConvertError::Output(tylertoo_core::OutputNotWritable)
 pub tylertoo_core::ConvertError::PointCountColumnPresent
 pub tylertoo_core::ConvertError::Properties(tylertoo_core::PropertySelectionError)
 pub tylertoo_core::ConvertError::RankingConflict
-pub tylertoo_core::ConvertError::RowGroupCeilingUnreachable
+#[non_exhaustive] pub tylertoo_core::ConvertError::RowGroupCeilingUnreachable
 pub tylertoo_core::ConvertError::RowGroupCeilingUnreachable::ceiling: usize
 pub tylertoo_core::ConvertError::RowGroupCeilingUnreachable::levels: usize
-pub tylertoo_core::ConvertError::SortKeyColumnMissing
+#[non_exhaustive] pub tylertoo_core::ConvertError::SortKeyColumnMissing
 pub tylertoo_core::ConvertError::SortKeyColumnMissing::name: alloc::string::String
-pub tylertoo_core::ConvertError::UnsupportedCrs
+#[non_exhaustive] pub tylertoo_core::ConvertError::UnsupportedCrs
 pub tylertoo_core::ConvertError::UnsupportedCrs::crs: alloc::string::String
 pub tylertoo_core::ConvertError::UnsupportedCrs::input: alloc::string::String
 pub tylertoo_core::ConvertError::VerbatimPartitioningUnsupported
 pub tylertoo_core::ConvertError::Writer(tylertoo_core::WriterError)
-pub tylertoo_core::ConvertError::ZoomAboveCeiling
+#[non_exhaustive] pub tylertoo_core::ConvertError::ZoomAboveCeiling
 pub tylertoo_core::ConvertError::ZoomAboveCeiling::asked: alloc::string::String
 pub tylertoo_core::ConvertError::ZoomAboveCeiling::ceiling: u8
 pub tylertoo_core::ConvertError::ZoomAboveCeiling::zoom: i64
@@ -328,6 +323,8 @@ impl core::convert::From<tylertoo_core::FilterError> for tylertoo_core::ConvertE
 pub fn tylertoo_core::ConvertError::from(tylertoo_core::FilterError) -> Self
 impl core::convert::From<tylertoo_core::InputError> for tylertoo_core::ConvertError
 pub fn tylertoo_core::ConvertError::from(tylertoo_core::InputError) -> Self
+impl core::convert::From<tylertoo_core::InvalidOption> for tylertoo_core::ConvertError
+pub fn tylertoo_core::ConvertError::from(tylertoo_core::InvalidOption) -> Self
 impl core::convert::From<tylertoo_core::OutputNotWritable> for tylertoo_core::ConvertError
 pub fn tylertoo_core::ConvertError::from(tylertoo_core::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::PropertySelectionError> for tylertoo_core::ConvertError
@@ -386,8 +383,6 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::CoveringWarning
 #[non_exhaustive] pub enum tylertoo_core::Crs
 pub tylertoo_core::Crs::Epsg3857
 pub tylertoo_core::Crs::Epsg4326
-impl tylertoo_core::Crs
-pub fn tylertoo_core::Crs::meters_to_units(self, f64) -> f64
 impl core::clone::Clone for tylertoo_core::Crs
 pub fn tylertoo_core::Crs::clone(&self) -> tylertoo_core::Crs
 impl core::cmp::Eq for tylertoo_core::Crs
@@ -442,30 +437,29 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::CrsWarning
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::CrsWarning
 #[non_exhaustive] pub enum tylertoo_core::DecodeError
 pub tylertoo_core::DecodeError::Archive(tylertoo_core::Error)
-pub tylertoo_core::DecodeError::Decompress
+#[non_exhaustive] pub tylertoo_core::DecodeError::Decompress
 pub tylertoo_core::DecodeError::Decompress::length: u64
 pub tylertoo_core::DecodeError::Decompress::offset: u64
 pub tylertoo_core::DecodeError::Decompress::source: core::io::error::Error
 pub tylertoo_core::DecodeError::Decompress::what: &'static str
-pub tylertoo_core::DecodeError::Geometry
+#[non_exhaustive] pub tylertoo_core::DecodeError::Geometry
 pub tylertoo_core::DecodeError::Geometry::reason: alloc::string::String
 pub tylertoo_core::DecodeError::Geometry::x: u32
 pub tylertoo_core::DecodeError::Geometry::y: u32
 pub tylertoo_core::DecodeError::Geometry::z: u8
 pub tylertoo_core::DecodeError::InvalidArchive(alloc::string::String)
-pub tylertoo_core::DecodeError::InvalidZoomRange
+#[non_exhaustive] pub tylertoo_core::DecodeError::InvalidZoomRange
 pub tylertoo_core::DecodeError::InvalidZoomRange::max_zoom: u8
 pub tylertoo_core::DecodeError::InvalidZoomRange::min_zoom: u8
 pub tylertoo_core::DecodeError::Io(core::io::error::Error)
-pub tylertoo_core::DecodeError::Mvt
-pub tylertoo_core::DecodeError::Mvt::source: prost::error::DecodeError
+#[non_exhaustive] pub tylertoo_core::DecodeError::Mvt
 pub tylertoo_core::DecodeError::Mvt::x: u32
 pub tylertoo_core::DecodeError::Mvt::y: u32
 pub tylertoo_core::DecodeError::Mvt::z: u8
 pub tylertoo_core::DecodeError::NotVectorTiles(tylertoo_core::TileType)
 pub tylertoo_core::DecodeError::Output(tylertoo_core::OutputNotWritable)
 pub tylertoo_core::DecodeError::ReservedColumn(alloc::string::String)
-pub tylertoo_core::DecodeError::TileDecompress
+#[non_exhaustive] pub tylertoo_core::DecodeError::TileDecompress
 pub tylertoo_core::DecodeError::TileDecompress::length: u64
 pub tylertoo_core::DecodeError::TileDecompress::offset: u64
 pub tylertoo_core::DecodeError::TileDecompress::source: core::io::error::Error
@@ -495,24 +489,24 @@ impl core::marker::UnsafeUnpin for tylertoo_core::DecodeError
 impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::DecodeError
 impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::DecodeError
 #[non_exhaustive] pub enum tylertoo_core::Diagnostic
-pub tylertoo_core::Diagnostic::Advisory
+#[non_exhaustive] pub tylertoo_core::Diagnostic::Advisory
 pub tylertoo_core::Diagnostic::Advisory::count: usize
 pub tylertoo_core::Diagnostic::Advisory::message: alloc::string::String
-pub tylertoo_core::Diagnostic::AntimeridianSuspect
+#[non_exhaustive] pub tylertoo_core::Diagnostic::AntimeridianSuspect
 pub tylertoo_core::Diagnostic::AntimeridianSuspect::count: usize
-pub tylertoo_core::Diagnostic::ClipGuardDropped
+#[non_exhaustive] pub tylertoo_core::Diagnostic::ClipGuardDropped
 pub tylertoo_core::Diagnostic::ClipGuardDropped::count: usize
-pub tylertoo_core::Diagnostic::CoveringRejected
+#[non_exhaustive] pub tylertoo_core::Diagnostic::CoveringRejected
 pub tylertoo_core::Diagnostic::CoveringRejected::count: usize
 pub tylertoo_core::Diagnostic::CoveringRejected::reason: tylertoo_core::CoveringWarning
-pub tylertoo_core::Diagnostic::CrsAssumed
+#[non_exhaustive] pub tylertoo_core::Diagnostic::CrsAssumed
 pub tylertoo_core::Diagnostic::CrsAssumed::count: usize
 pub tylertoo_core::Diagnostic::CrsAssumed::input: alloc::string::String
 pub tylertoo_core::Diagnostic::CrsAssumed::root: alloc::string::String
-pub tylertoo_core::Diagnostic::CrsMetadata
+#[non_exhaustive] pub tylertoo_core::Diagnostic::CrsMetadata
 pub tylertoo_core::Diagnostic::CrsMetadata::count: usize
 pub tylertoo_core::Diagnostic::CrsMetadata::reason: tylertoo_core::CrsWarning
-pub tylertoo_core::Diagnostic::EmptyLevels
+#[non_exhaustive] pub tylertoo_core::Diagnostic::EmptyLevels
 pub tylertoo_core::Diagnostic::EmptyLevels::count: usize
 pub tylertoo_core::Diagnostic::EmptyLevels::first_written_gsd: f64
 pub tylertoo_core::Diagnostic::EmptyLevels::first_written_zoom: core::option::Option<u8>
@@ -520,62 +514,62 @@ pub tylertoo_core::Diagnostic::EmptyLevels::gsd_max: f64
 pub tylertoo_core::Diagnostic::EmptyLevels::gsd_min: f64
 pub tylertoo_core::Diagnostic::EmptyLevels::input_features: usize
 pub tylertoo_core::Diagnostic::EmptyLevels::levels: alloc::vec::Vec<usize>
-pub tylertoo_core::Diagnostic::EncodeDropped
+#[non_exhaustive] pub tylertoo_core::Diagnostic::EncodeDropped
 pub tylertoo_core::Diagnostic::EncodeDropped::count: usize
-pub tylertoo_core::Diagnostic::EncodeQuantized
+#[non_exhaustive] pub tylertoo_core::Diagnostic::EncodeQuantized
 pub tylertoo_core::Diagnostic::EncodeQuantized::count: usize
-pub tylertoo_core::Diagnostic::FullResolutionFallback
+#[non_exhaustive] pub tylertoo_core::Diagnostic::FullResolutionFallback
 pub tylertoo_core::Diagnostic::FullResolutionFallback::count: usize
-pub tylertoo_core::Diagnostic::InvalidAfterEncode
+#[non_exhaustive] pub tylertoo_core::Diagnostic::InvalidAfterEncode
 pub tylertoo_core::Diagnostic::InvalidAfterEncode::count: usize
-pub tylertoo_core::Diagnostic::InvalidAfterSimplify
+#[non_exhaustive] pub tylertoo_core::Diagnostic::InvalidAfterSimplify
 pub tylertoo_core::Diagnostic::InvalidAfterSimplify::count: usize
-pub tylertoo_core::Diagnostic::MemoryBudget
+#[non_exhaustive] pub tylertoo_core::Diagnostic::MemoryBudget
 pub tylertoo_core::Diagnostic::MemoryBudget::count: usize
 pub tylertoo_core::Diagnostic::MemoryBudget::limit: u64
 pub tylertoo_core::Diagnostic::MemoryBudget::machine: core::option::Option<u64>
-pub tylertoo_core::Diagnostic::Merged
+#[non_exhaustive] pub tylertoo_core::Diagnostic::Merged
 pub tylertoo_core::Diagnostic::Merged::count: usize
-pub tylertoo_core::Diagnostic::NonFiniteGeometry
+#[non_exhaustive] pub tylertoo_core::Diagnostic::NonFiniteGeometry
 pub tylertoo_core::Diagnostic::NonFiniteGeometry::count: usize
-pub tylertoo_core::Diagnostic::OutOfRange
+#[non_exhaustive] pub tylertoo_core::Diagnostic::OutOfRange
 pub tylertoo_core::Diagnostic::OutOfRange::context: core::option::Option<tylertoo_core::RangeContext>
 pub tylertoo_core::Diagnostic::OutOfRange::count: usize
 pub tylertoo_core::Diagnostic::OutOfRange::exemplars: alloc::vec::Vec<tylertoo_core::OutOfRangeExemplar>
-pub tylertoo_core::Diagnostic::PolygonRepaired
+#[non_exhaustive] pub tylertoo_core::Diagnostic::PolygonRepaired
 pub tylertoo_core::Diagnostic::PolygonRepaired::count: usize
 pub tylertoo_core::Diagnostic::PolygonRepaired::kind: tylertoo_core::PolygonRepairKind
-pub tylertoo_core::Diagnostic::PropertySkipped
+#[non_exhaustive] pub tylertoo_core::Diagnostic::PropertySkipped
 pub tylertoo_core::Diagnostic::PropertySkipped::count: usize
 pub tylertoo_core::Diagnostic::PropertySkipped::data_type: alloc::string::String
 pub tylertoo_core::Diagnostic::PropertySkipped::name: alloc::string::String
-pub tylertoo_core::Diagnostic::PyramidMetadataConflict
+#[non_exhaustive] pub tylertoo_core::Diagnostic::PyramidMetadataConflict
 pub tylertoo_core::Diagnostic::PyramidMetadataConflict::count: usize
-pub tylertoo_core::Diagnostic::PyramidMissingBounds
+#[non_exhaustive] pub tylertoo_core::Diagnostic::PyramidMissingBounds
 pub tylertoo_core::Diagnostic::PyramidMissingBounds::count: usize
-pub tylertoo_core::Diagnostic::PyramidMissingMetadata
+#[non_exhaustive] pub tylertoo_core::Diagnostic::PyramidMissingMetadata
 pub tylertoo_core::Diagnostic::PyramidMissingMetadata::count: usize
-pub tylertoo_core::Diagnostic::PyramidSharedTiles
+#[non_exhaustive] pub tylertoo_core::Diagnostic::PyramidSharedTiles
 pub tylertoo_core::Diagnostic::PyramidSharedTiles::count: usize
-pub tylertoo_core::Diagnostic::PyramidSkippedTiles
+#[non_exhaustive] pub tylertoo_core::Diagnostic::PyramidSkippedTiles
 pub tylertoo_core::Diagnostic::PyramidSkippedTiles::count: usize
-pub tylertoo_core::Diagnostic::RowGroupAutoscaled
+#[non_exhaustive] pub tylertoo_core::Diagnostic::RowGroupAutoscaled
 pub tylertoo_core::Diagnostic::RowGroupAutoscaled::cap: usize
 pub tylertoo_core::Diagnostic::RowGroupAutoscaled::count: usize
-pub tylertoo_core::Diagnostic::SavedPlan
+#[non_exhaustive] pub tylertoo_core::Diagnostic::SavedPlan
 pub tylertoo_core::Diagnostic::SavedPlan::count: usize
 pub tylertoo_core::Diagnostic::SavedPlan::diagnostics: alloc::vec::Vec<tylertoo_core::Diagnostic>
-pub tylertoo_core::Diagnostic::Unprojectable
+#[non_exhaustive] pub tylertoo_core::Diagnostic::Unprojectable
 pub tylertoo_core::Diagnostic::Unprojectable::context: core::option::Option<tylertoo_core::RangeContext>
 pub tylertoo_core::Diagnostic::Unprojectable::count: usize
-pub tylertoo_core::Diagnostic::UnusableGeometry
+#[non_exhaustive] pub tylertoo_core::Diagnostic::UnusableGeometry
 pub tylertoo_core::Diagnostic::UnusableGeometry::count: usize
 pub tylertoo_core::Diagnostic::UnusableGeometry::total: usize
-pub tylertoo_core::Diagnostic::ValidationSkipped
+#[non_exhaustive] pub tylertoo_core::Diagnostic::ValidationSkipped
 pub tylertoo_core::Diagnostic::ValidationSkipped::count: usize
-pub tylertoo_core::Diagnostic::ValveDropped
+#[non_exhaustive] pub tylertoo_core::Diagnostic::ValveDropped
 pub tylertoo_core::Diagnostic::ValveDropped::count: usize
-pub tylertoo_core::Diagnostic::Wrapped
+#[non_exhaustive] pub tylertoo_core::Diagnostic::Wrapped
 pub tylertoo_core::Diagnostic::Wrapped::context: core::option::Option<tylertoo_core::RangeContext>
 pub tylertoo_core::Diagnostic::Wrapped::count: usize
 pub tylertoo_core::Diagnostic::Wrapped::exemplars: alloc::vec::Vec<tylertoo_core::OutOfRangeExemplar>
@@ -626,11 +620,11 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::EntryZoomKind
 #[non_exhaustive] pub enum tylertoo_core::Error
 pub tylertoo_core::Error::Accounting(tylertoo_core::AccountingError)
 pub tylertoo_core::Error::Archive(tylertoo_core::ArchiveError)
-pub tylertoo_core::Error::At
+#[non_exhaustive] pub tylertoo_core::Error::At
 pub tylertoo_core::Error::At::error: alloc::boxed::Box<tylertoo_core::Error>
 pub tylertoo_core::Error::At::path: std::path::PathBuf
-pub tylertoo_core::Error::GeoParquetRead(alloc::string::String)
-pub tylertoo_core::Error::InvalidConfig(alloc::string::String)
+pub tylertoo_core::Error::GeoParquetRead(tylertoo_core::GeoParquetReadError)
+pub tylertoo_core::Error::InvalidConfig(tylertoo_core::InvalidConfigError)
 pub tylertoo_core::Error::Io(core::io::error::Error)
 pub tylertoo_core::Error::Output(tylertoo_core::OutputNotWritable)
 pub tylertoo_core::Error::Write(tylertoo_core::WriteError)
@@ -648,6 +642,10 @@ impl core::convert::From<tylertoo_core::Error> for tylertoo_core::ExportError
 pub fn tylertoo_core::ExportError::from(tylertoo_core::Error) -> Self
 impl core::convert::From<tylertoo_core::Error> for tylertoo_core::PyramidError
 pub fn tylertoo_core::PyramidError::from(tylertoo_core::Error) -> Self
+impl core::convert::From<tylertoo_core::GeoParquetReadError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::GeoParquetReadError) -> Self
+impl core::convert::From<tylertoo_core::InvalidConfigError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::InvalidConfigError) -> Self
 impl core::convert::From<tylertoo_core::OutputNotWritable> for tylertoo_core::Error
 pub fn tylertoo_core::Error::from(tylertoo_core::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::WriteError> for tylertoo_core::Error
@@ -690,62 +688,62 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ErrorKind
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ErrorKind
 #[non_exhaustive] pub enum tylertoo_core::ExportError
 pub tylertoo_core::ExportError::Accounting(tylertoo_core::AccountingError)
-pub tylertoo_core::ExportError::BudgetExceeded
+#[non_exhaustive] pub tylertoo_core::ExportError::BudgetExceeded
 pub tylertoo_core::ExportError::BudgetExceeded::available: u64
 pub tylertoo_core::ExportError::BudgetExceeded::needed: u64
 pub tylertoo_core::ExportError::BudgetExceeded::phase: &'static str
 pub tylertoo_core::ExportError::Config(tylertoo_core::ConfigError)
 pub tylertoo_core::ExportError::Core(tylertoo_core::Error)
-pub tylertoo_core::ExportError::CoveringProperty
+#[non_exhaustive] pub tylertoo_core::ExportError::CoveringProperty
 pub tylertoo_core::ExportError::CoveringProperty::name: alloc::string::String
-pub tylertoo_core::ExportError::DeclaredMinZoomAboveCeiling
+#[non_exhaustive] pub tylertoo_core::ExportError::DeclaredMinZoomAboveCeiling
 pub tylertoo_core::ExportError::DeclaredMinZoomAboveCeiling::ceiling: u8
 pub tylertoo_core::ExportError::DeclaredMinZoomAboveCeiling::declared: u8
-pub tylertoo_core::ExportError::DeclaredMinZoomTooFine
+#[non_exhaustive] pub tylertoo_core::ExportError::DeclaredMinZoomTooFine
 pub tylertoo_core::ExportError::DeclaredMinZoomTooFine::coarsest: u8
 pub tylertoo_core::ExportError::DeclaredMinZoomTooFine::declared: u8
-pub tylertoo_core::ExportError::FeatureIdColumn
+#[non_exhaustive] pub tylertoo_core::ExportError::FeatureIdColumn
 pub tylertoo_core::ExportError::FeatureIdColumn::column: alloc::string::String
 pub tylertoo_core::ExportError::FeatureIdColumn::reason: tylertoo_core::FeatureIdColumnProblem
-pub tylertoo_core::ExportError::InvalidFeatureId
+#[non_exhaustive] pub tylertoo_core::ExportError::InvalidFeatureId
 pub tylertoo_core::ExportError::InvalidFeatureId::column: alloc::string::String
 pub tylertoo_core::ExportError::InvalidFeatureId::level: usize
 pub tylertoo_core::ExportError::InvalidFeatureId::reason: tylertoo_core::InvalidFeatureIdReason
 pub tylertoo_core::ExportError::InvalidFeatureId::row: u64
 pub tylertoo_core::ExportError::InvalidFeatureId::zoom: u8
 pub tylertoo_core::ExportError::Io(core::io::error::Error)
-pub tylertoo_core::ExportError::LevelGsdNotFinitePositive
+#[non_exhaustive] pub tylertoo_core::ExportError::LevelGsdNotFinitePositive
 pub tylertoo_core::ExportError::LevelGsdNotFinitePositive::gsd: f64
 pub tylertoo_core::ExportError::LevelGsdNotFinitePositive::level: usize
-pub tylertoo_core::ExportError::LevelZoomAboveCeiling
+#[non_exhaustive] pub tylertoo_core::ExportError::LevelZoomAboveCeiling
 pub tylertoo_core::ExportError::LevelZoomAboveCeiling::ceiling: u8
 pub tylertoo_core::ExportError::LevelZoomAboveCeiling::gsd: f64
 pub tylertoo_core::ExportError::LevelZoomAboveCeiling::implied: i64
 pub tylertoo_core::ExportError::LevelZoomAboveCeiling::level: usize
-pub tylertoo_core::ExportError::LevelZoomsNotAscending
+#[non_exhaustive] pub tylertoo_core::ExportError::LevelZoomsNotAscending
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::gsd: f64
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::level: usize
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::previous_gsd: f64
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::previous_level: usize
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::previous_zoom: u8
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::zoom: u8
-pub tylertoo_core::ExportError::NoGeometryColumn
+#[non_exhaustive] pub tylertoo_core::ExportError::NoGeometryColumn
 pub tylertoo_core::ExportError::NoGeometryColumn::path: core::option::Option<alloc::string::String>
 pub tylertoo_core::ExportError::Output(tylertoo_core::OutputNotWritable)
-pub tylertoo_core::ExportError::PartialOverview
+#[non_exhaustive] pub tylertoo_core::ExportError::PartialOverview
 pub tylertoo_core::ExportError::PartialOverview::recorded: u8
 pub tylertoo_core::ExportError::PartialOverview::requested: core::option::Option<u8>
-pub tylertoo_core::ExportError::PropertyRequiredByKnob
+#[non_exhaustive] pub tylertoo_core::ExportError::PropertyRequiredByKnob
 pub tylertoo_core::ExportError::PropertyRequiredByKnob::knob: alloc::string::String
 pub tylertoo_core::ExportError::PropertyRequiredByKnob::name: alloc::string::String
 pub tylertoo_core::ExportError::Reader(tylertoo_core::ReaderError)
-pub tylertoo_core::ExportError::RestrictionEmitsNoZoom
+#[non_exhaustive] pub tylertoo_core::ExportError::RestrictionEmitsNoZoom
 pub tylertoo_core::ExportError::RestrictionEmitsNoZoom::coarsest: u8
 pub tylertoo_core::ExportError::RestrictionEmitsNoZoom::finest: u8
-pub tylertoo_core::ExportError::TileBufferTooWideForShard
+#[non_exhaustive] pub tylertoo_core::ExportError::TileBufferTooWideForShard
 pub tylertoo_core::ExportError::TileBufferTooWideForShard::buffer: u32
 pub tylertoo_core::ExportError::TileBufferTooWideForShard::max: u32
-pub tylertoo_core::ExportError::TileExceedsMemory
+#[non_exhaustive] pub tylertoo_core::ExportError::TileExceedsMemory
 pub tylertoo_core::ExportError::TileExceedsMemory::available_bytes: u64
 pub tylertoo_core::ExportError::TileExceedsMemory::estimate_bytes: u64
 pub tylertoo_core::ExportError::TileExceedsMemory::level: usize
@@ -754,13 +752,13 @@ pub tylertoo_core::ExportError::TileExceedsMemory::members: usize
 pub tylertoo_core::ExportError::TileExceedsMemory::x: u32
 pub tylertoo_core::ExportError::TileExceedsMemory::y: u32
 pub tylertoo_core::ExportError::TileExceedsMemory::zoom: u8
-pub tylertoo_core::ExportError::UnknownProperty
+#[non_exhaustive] pub tylertoo_core::ExportError::UnknownProperty
 pub tylertoo_core::ExportError::UnknownProperty::available: alloc::string::String
 pub tylertoo_core::ExportError::UnknownProperty::name: alloc::string::String
-pub tylertoo_core::ExportError::UnsupportedCrs
+#[non_exhaustive] pub tylertoo_core::ExportError::UnsupportedCrs
 pub tylertoo_core::ExportError::UnsupportedCrs::crs: alloc::string::String
 pub tylertoo_core::ExportError::UnsupportedCrs::path: alloc::string::String
-pub tylertoo_core::ExportError::UnsupportedProperty
+#[non_exhaustive] pub tylertoo_core::ExportError::UnsupportedProperty
 pub tylertoo_core::ExportError::UnsupportedProperty::data_type: alloc::string::String
 pub tylertoo_core::ExportError::UnsupportedProperty::name: alloc::string::String
 impl core::convert::From<core::io::error::Error> for tylertoo_core::ExportError
@@ -791,12 +789,12 @@ impl core::marker::UnsafeUnpin for tylertoo_core::ExportError
 impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ExportError
 impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::ExportError
 #[non_exhaustive] pub enum tylertoo_core::FeatureIdColumnProblem
-pub tylertoo_core::FeatureIdColumnProblem::Accumulated
+#[non_exhaustive] pub tylertoo_core::FeatureIdColumnProblem::Accumulated
 pub tylertoo_core::FeatureIdColumnProblem::Accumulated::op: alloc::string::String
 pub tylertoo_core::FeatureIdColumnProblem::ConflictsWithFeatureOrder
-pub tylertoo_core::FeatureIdColumnProblem::NotFound
+#[non_exhaustive] pub tylertoo_core::FeatureIdColumnProblem::NotFound
 pub tylertoo_core::FeatureIdColumnProblem::NotFound::available: alloc::string::String
-pub tylertoo_core::FeatureIdColumnProblem::NotInteger
+#[non_exhaustive] pub tylertoo_core::FeatureIdColumnProblem::NotInteger
 pub tylertoo_core::FeatureIdColumnProblem::NotInteger::data_type: alloc::string::String
 impl core::clone::Clone for tylertoo_core::FeatureIdColumnProblem
 pub fn tylertoo_core::FeatureIdColumnProblem::clone(&self) -> tylertoo_core::FeatureIdColumnProblem
@@ -863,21 +861,21 @@ impl core::marker::UnsafeUnpin for tylertoo_core::FeatureOrder
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::FeatureOrder
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::FeatureOrder
 #[non_exhaustive] pub enum tylertoo_core::FilterError
-pub tylertoo_core::FilterError::BooleanOrdering
+#[non_exhaustive] pub tylertoo_core::FilterError::BooleanOrdering
 pub tylertoo_core::FilterError::BooleanOrdering::name: alloc::string::String
 pub tylertoo_core::FilterError::Parse(alloc::string::String)
-pub tylertoo_core::FilterError::TimestampLiteral
+#[non_exhaustive] pub tylertoo_core::FilterError::TimestampLiteral
 pub tylertoo_core::FilterError::TimestampLiteral::literal: alloc::string::String
 pub tylertoo_core::FilterError::TimestampLiteral::msg: alloc::string::String
 pub tylertoo_core::FilterError::TimestampLiteral::name: alloc::string::String
-pub tylertoo_core::FilterError::TypeMismatch
+#[non_exhaustive] pub tylertoo_core::FilterError::TypeMismatch
 pub tylertoo_core::FilterError::TypeMismatch::kind: &'static str
 pub tylertoo_core::FilterError::TypeMismatch::literal: alloc::string::String
 pub tylertoo_core::FilterError::TypeMismatch::name: alloc::string::String
-pub tylertoo_core::FilterError::UnknownColumn
+#[non_exhaustive] pub tylertoo_core::FilterError::UnknownColumn
 pub tylertoo_core::FilterError::UnknownColumn::available: alloc::string::String
 pub tylertoo_core::FilterError::UnknownColumn::name: alloc::string::String
-pub tylertoo_core::FilterError::UnsupportedColumnType
+#[non_exhaustive] pub tylertoo_core::FilterError::UnsupportedColumnType
 pub tylertoo_core::FilterError::UnsupportedColumnType::data_type: alloc::string::String
 pub tylertoo_core::FilterError::UnsupportedColumnType::name: alloc::string::String
 impl core::convert::From<tylertoo_core::FilterError> for tylertoo_core::ConvertError
@@ -894,6 +892,63 @@ impl core::marker::Unpin for tylertoo_core::FilterError
 impl core::marker::UnsafeUnpin for tylertoo_core::FilterError
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::FilterError
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::FilterError
+#[non_exhaustive] pub enum tylertoo_core::GeoParquetReadError
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::AtRows
+pub tylertoo_core::GeoParquetReadError::AtRows::end: usize
+pub tylertoo_core::GeoParquetReadError::AtRows::error: alloc::boxed::Box<tylertoo_core::Error>
+pub tylertoo_core::GeoParquetReadError::AtRows::start: usize
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::CoveringFieldNotFloat64
+pub tylertoo_core::GeoParquetReadError::CoveringFieldNotFloat64::field: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::CoveringNotF64Struct
+pub tylertoo_core::GeoParquetReadError::CoveringNotF64Struct::column: alloc::string::String
+pub tylertoo_core::GeoParquetReadError::CoveringNotStruct
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::Decode
+pub tylertoo_core::GeoParquetReadError::Decode::message: alloc::string::String
+pub tylertoo_core::GeoParquetReadError::Decode::stage: &'static str
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::Footer
+pub tylertoo_core::GeoParquetReadError::Footer::message: alloc::string::String
+pub tylertoo_core::GeoParquetReadError::Footer::path: std::path::PathBuf
+pub tylertoo_core::GeoParquetReadError::GeoMetadataJson(serde_json::error::Error)
+pub tylertoo_core::GeoParquetReadError::GeoMetadataNotObject
+pub tylertoo_core::GeoParquetReadError::Input(alloc::boxed::Box<tylertoo_core::InputError>)
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::InvalidGeometry
+pub tylertoo_core::GeoParquetReadError::InvalidGeometry::index: usize
+pub tylertoo_core::GeoParquetReadError::InvalidGeometry::message: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::NoParquetFiles
+pub tylertoo_core::GeoParquetReadError::NoParquetFiles::path: std::path::PathBuf
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::NotWgs84
+pub tylertoo_core::GeoParquetReadError::NotWgs84::crs: alloc::string::String
+pub tylertoo_core::GeoParquetReadError::NotWgs84::file: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::Open
+pub tylertoo_core::GeoParquetReadError::Open::error: core::io::error::Error
+pub tylertoo_core::GeoParquetReadError::Open::path: std::path::PathBuf
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::PathNotFound
+pub tylertoo_core::GeoParquetReadError::PathNotFound::path: std::path::PathBuf
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::ReadDirectory
+pub tylertoo_core::GeoParquetReadError::ReadDirectory::error: alloc::boxed::Box<tylertoo_core::InputError>
+pub tylertoo_core::GeoParquetReadError::ReadDirectory::path: std::path::PathBuf
+pub tylertoo_core::GeoParquetReadError::ResolvedSchemaEncode(serde_json::error::Error)
+pub tylertoo_core::GeoParquetReadError::ResolvedSchemaJson(serde_json::error::Error)
+pub tylertoo_core::GeoParquetReadError::ResolvedSchemaMismatch
+pub tylertoo_core::GeoParquetReadError::RowDomainExceeded
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::Schema
+pub tylertoo_core::GeoParquetReadError::Schema::message: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::GeoParquetReadError::UnsupportedGeometryType
+pub tylertoo_core::GeoParquetReadError::UnsupportedGeometryType::data_type: alloc::string::String
+impl core::convert::From<tylertoo_core::GeoParquetReadError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::GeoParquetReadError) -> Self
+impl core::error::Error for tylertoo_core::GeoParquetReadError
+impl core::fmt::Debug for tylertoo_core::GeoParquetReadError
+pub fn tylertoo_core::GeoParquetReadError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::GeoParquetReadError
+pub fn tylertoo_core::GeoParquetReadError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::GeoParquetReadError
+impl core::marker::Send for tylertoo_core::GeoParquetReadError
+impl core::marker::Sync for tylertoo_core::GeoParquetReadError
+impl core::marker::Unpin for tylertoo_core::GeoParquetReadError
+impl core::marker::UnsafeUnpin for tylertoo_core::GeoParquetReadError
+impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::GeoParquetReadError
+impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::GeoParquetReadError
 #[non_exhaustive] pub enum tylertoo_core::GeoVersion
 pub tylertoo_core::GeoVersion::Known(alloc::string::String)
 pub tylertoo_core::GeoVersion::Missing
@@ -917,37 +972,36 @@ impl core::marker::UnsafeUnpin for tylertoo_core::GeoVersion
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::GeoVersion
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::GeoVersion
 #[non_exhaustive] pub enum tylertoo_core::InputError
-pub tylertoo_core::InputError::Decode(tylertoo_io::Error)
-pub tylertoo_core::InputError::Footer
+#[non_exhaustive] pub tylertoo_core::InputError::Footer
 pub tylertoo_core::InputError::Footer::input: alloc::string::String
-pub tylertoo_core::InputError::GlobPattern
+#[non_exhaustive] pub tylertoo_core::InputError::GlobPattern
 pub tylertoo_core::InputError::GlobPattern::message: alloc::string::String
 pub tylertoo_core::InputError::GlobPattern::pattern: alloc::string::String
-pub tylertoo_core::InputError::IncompatiblePartition
+#[non_exhaustive] pub tylertoo_core::InputError::IncompatiblePartition
 pub tylertoo_core::InputError::IncompatiblePartition::detail: alloc::string::String
 pub tylertoo_core::InputError::IncompatiblePartition::first: alloc::string::String
 pub tylertoo_core::InputError::IncompatiblePartition::offender: alloc::string::String
 pub tylertoo_core::InputError::Io(core::io::error::Error)
-pub tylertoo_core::InputError::ManifestRead
+#[non_exhaustive] pub tylertoo_core::InputError::ManifestRead
 pub tylertoo_core::InputError::ManifestRead::path: alloc::string::String
 pub tylertoo_core::InputError::ManifestRead::source: core::io::error::Error
-pub tylertoo_core::InputError::MissingListedInput
+#[non_exhaustive] pub tylertoo_core::InputError::MissingListedInput
 pub tylertoo_core::InputError::MissingListedInput::context: alloc::string::String
 pub tylertoo_core::InputError::MissingListedInput::input: alloc::string::String
-pub tylertoo_core::InputError::NoParquetInputs
+#[non_exhaustive] pub tylertoo_core::InputError::NoParquetInputs
 pub tylertoo_core::InputError::NoParquetInputs::input: alloc::string::String
-pub tylertoo_core::InputError::Open
+#[non_exhaustive] pub tylertoo_core::InputError::Open
 pub tylertoo_core::InputError::Open::error: core::io::error::Error
 pub tylertoo_core::InputError::Open::input: alloc::string::String
-pub tylertoo_core::InputError::PlanInputChanged
+#[non_exhaustive] pub tylertoo_core::InputError::PlanInputChanged
 pub tylertoo_core::InputError::PlanInputChanged::current: alloc::string::String
 pub tylertoo_core::InputError::PlanInputChanged::field: &'static str
 pub tylertoo_core::InputError::PlanInputChanged::input: alloc::string::String
 pub tylertoo_core::InputError::PlanInputChanged::saved: alloc::string::String
 pub tylertoo_core::InputError::RemoteDisabled(alloc::string::String)
-pub tylertoo_core::InputError::RemotePrefixUnsupported
+#[non_exhaustive] pub tylertoo_core::InputError::RemotePrefixUnsupported
 pub tylertoo_core::InputError::RemotePrefixUnsupported::url: alloc::string::String
-pub tylertoo_core::InputError::UnsupportedScheme
+#[non_exhaustive] pub tylertoo_core::InputError::UnsupportedScheme
 pub tylertoo_core::InputError::UnsupportedScheme::scheme: alloc::string::String
 pub tylertoo_core::InputError::UnsupportedScheme::url: alloc::string::String
 impl core::convert::From<core::io::error::Error> for tylertoo_core::InputError
@@ -956,14 +1010,14 @@ impl core::convert::From<tylertoo_core::InputError> for tylertoo_core::ConvertEr
 pub fn tylertoo_core::ConvertError::from(tylertoo_core::InputError) -> Self
 impl core::convert::From<tylertoo_core::InputError> for tylertoo_core::ShardError
 pub fn tylertoo_core::ShardError::from(tylertoo_core::InputError) -> Self
-impl core::convert::From<tylertoo_io::Error> for tylertoo_core::InputError
-pub fn tylertoo_core::InputError::from(tylertoo_io::Error) -> Self
 impl core::error::Error for tylertoo_core::InputError
 pub fn tylertoo_core::InputError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for tylertoo_core::InputError
 pub fn tylertoo_core::InputError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for tylertoo_core::InputError
 pub fn tylertoo_core::InputError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl tylertoo_core::Classify for tylertoo_core::InputError
+pub fn tylertoo_core::InputError::kind(&self) -> tylertoo_core::ErrorKind
 impl core::marker::Freeze for tylertoo_core::InputError
 impl core::marker::Send for tylertoo_core::InputError
 impl core::marker::Sync for tylertoo_core::InputError
@@ -971,11 +1025,66 @@ impl core::marker::Unpin for tylertoo_core::InputError
 impl core::marker::UnsafeUnpin for tylertoo_core::InputError
 impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::InputError
 impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::InputError
+#[non_exhaustive] pub enum tylertoo_core::InvalidConfigError
+pub tylertoo_core::InvalidConfigError::BandConvertOptions(alloc::boxed::Box<tylertoo_core::ConvertError>)
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::BoundsFormat
+pub tylertoo_core::InvalidConfigError::BoundsFormat::input: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::BoundsInverted
+pub tylertoo_core::InvalidConfigError::BoundsInverted::axis: &'static str
+pub tylertoo_core::InvalidConfigError::BoundsInverted::max: f64
+pub tylertoo_core::InvalidConfigError::BoundsInverted::min: f64
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::BoundsNotFinite
+pub tylertoo_core::InvalidConfigError::BoundsNotFinite::input: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::BoundsValue
+pub tylertoo_core::InvalidConfigError::BoundsValue::name: &'static str
+pub tylertoo_core::InvalidConfigError::BoundsValue::value: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::MergeCompressionMismatch
+pub tylertoo_core::InvalidConfigError::MergeCompressionMismatch::first: std::path::PathBuf
+pub tylertoo_core::InvalidConfigError::MergeCompressionMismatch::first_compression: tylertoo_core::Compression
+pub tylertoo_core::InvalidConfigError::MergeCompressionMismatch::other: std::path::PathBuf
+pub tylertoo_core::InvalidConfigError::MergeCompressionMismatch::other_compression: tylertoo_core::Compression
+pub tylertoo_core::InvalidConfigError::MergeNoInputs
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::MergeNotMvt
+pub tylertoo_core::InvalidConfigError::MergeNotMvt::path: std::path::PathBuf
+pub tylertoo_core::InvalidConfigError::MergeNotMvt::tile_type: tylertoo_core::TileType
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::MergeOverlap
+pub tylertoo_core::InvalidConfigError::MergeOverlap::first: std::path::PathBuf
+pub tylertoo_core::InvalidConfigError::MergeOverlap::second: std::path::PathBuf
+pub tylertoo_core::InvalidConfigError::MergeOverlap::tile_id: u64
+pub tylertoo_core::InvalidConfigError::MergeOverlap::zxy: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::MergeTileTypeMismatch
+pub tylertoo_core::InvalidConfigError::MergeTileTypeMismatch::first: std::path::PathBuf
+pub tylertoo_core::InvalidConfigError::MergeTileTypeMismatch::first_type: tylertoo_core::TileType
+pub tylertoo_core::InvalidConfigError::MergeTileTypeMismatch::other: std::path::PathBuf
+pub tylertoo_core::InvalidConfigError::MergeTileTypeMismatch::other_type: tylertoo_core::TileType
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::MetadataTooLarge
+pub tylertoo_core::InvalidConfigError::MetadataTooLarge::message: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::TileOutOfRange
+pub tylertoo_core::InvalidConfigError::TileOutOfRange::input: alloc::string::String
+pub tylertoo_core::InvalidConfigError::TileOutOfRange::tiles: u64
+pub tylertoo_core::InvalidConfigError::TileOutOfRange::zoom: u8
+#[non_exhaustive] pub tylertoo_core::InvalidConfigError::TileZoomTooHigh
+pub tylertoo_core::InvalidConfigError::TileZoomTooHigh::input: alloc::string::String
+pub tylertoo_core::InvalidConfigError::TileZoomTooHigh::zoom: u8
+impl core::convert::From<tylertoo_core::InvalidConfigError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::InvalidConfigError) -> Self
+impl core::error::Error for tylertoo_core::InvalidConfigError
+impl core::fmt::Debug for tylertoo_core::InvalidConfigError
+pub fn tylertoo_core::InvalidConfigError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::InvalidConfigError
+pub fn tylertoo_core::InvalidConfigError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::InvalidConfigError
+impl core::marker::Send for tylertoo_core::InvalidConfigError
+impl core::marker::Sync for tylertoo_core::InvalidConfigError
+impl core::marker::Unpin for tylertoo_core::InvalidConfigError
+impl core::marker::UnsafeUnpin for tylertoo_core::InvalidConfigError
+impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::InvalidConfigError
+impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::InvalidConfigError
 #[non_exhaustive] pub enum tylertoo_core::InvalidFeatureIdReason
-pub tylertoo_core::InvalidFeatureIdReason::Negative
+#[non_exhaustive] pub tylertoo_core::InvalidFeatureIdReason::Negative
 pub tylertoo_core::InvalidFeatureIdReason::Negative::value: alloc::string::String
 pub tylertoo_core::InvalidFeatureIdReason::Null
-pub tylertoo_core::InvalidFeatureIdReason::TooLarge
+#[non_exhaustive] pub tylertoo_core::InvalidFeatureIdReason::TooLarge
 pub tylertoo_core::InvalidFeatureIdReason::TooLarge::value: alloc::string::String
 impl core::clone::Clone for tylertoo_core::InvalidFeatureIdReason
 pub fn tylertoo_core::InvalidFeatureIdReason::clone(&self) -> tylertoo_core::InvalidFeatureIdReason
@@ -994,6 +1103,71 @@ impl core::marker::Unpin for tylertoo_core::InvalidFeatureIdReason
 impl core::marker::UnsafeUnpin for tylertoo_core::InvalidFeatureIdReason
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::InvalidFeatureIdReason
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::InvalidFeatureIdReason
+#[non_exhaustive] pub enum tylertoo_core::InvalidOption
+pub tylertoo_core::InvalidOption::AutoMaxZoomNeedsZoomRange
+#[non_exhaustive] pub tylertoo_core::InvalidOption::BandCoversCanonical
+pub tylertoo_core::InvalidOption::BandCoversCanonical::band: tylertoo_core::RepresentationBand
+pub tylertoo_core::InvalidOption::BandCoversCanonical::plan_max: u8
+#[non_exhaustive] pub tylertoo_core::InvalidOption::BandInverted
+pub tylertoo_core::InvalidOption::BandInverted::band: tylertoo_core::RepresentationBand
+#[non_exhaustive] pub tylertoo_core::InvalidOption::BandOutsidePlan
+pub tylertoo_core::InvalidOption::BandOutsidePlan::band: tylertoo_core::RepresentationBand
+pub tylertoo_core::InvalidOption::BandOutsidePlan::plan_max: u8
+pub tylertoo_core::InvalidOption::BandOutsidePlan::plan_min: u8
+pub tylertoo_core::InvalidOption::BandsNeedDuplicating
+pub tylertoo_core::InvalidOption::BandsNeedZoomRange
+#[non_exhaustive] pub tylertoo_core::InvalidOption::BandsOverlap
+pub tylertoo_core::InvalidOption::BandsOverlap::zoom: u8
+#[non_exhaustive] pub tylertoo_core::InvalidOption::CeilingBelowMinZoom
+pub tylertoo_core::InvalidOption::CeilingBelowMinZoom::ceiling: u8
+pub tylertoo_core::InvalidOption::CeilingBelowMinZoom::min_zoom: u8
+pub tylertoo_core::InvalidOption::CeilingInPlanOnly
+pub tylertoo_core::InvalidOption::CeilingNeedsDuplicating
+pub tylertoo_core::InvalidOption::CeilingNeedsZoomRange
+pub tylertoo_core::InvalidOption::CeilingWithShardRange
+#[non_exhaustive] pub tylertoo_core::InvalidOption::DropGamma
+pub tylertoo_core::InvalidOption::DropGamma::gamma: f64
+#[non_exhaustive] pub tylertoo_core::InvalidOption::EntryZoomColumnMissing
+pub tylertoo_core::InvalidOption::EntryZoomColumnMissing::column: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::InvalidOption::EntryZoomLadder
+pub tylertoo_core::InvalidOption::EntryZoomLadder::message: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::InvalidOption::Negative
+pub tylertoo_core::InvalidOption::Negative::option: &'static str
+pub tylertoo_core::InvalidOption::Negative::value: f64
+#[non_exhaustive] pub tylertoo_core::InvalidOption::NotFinite
+pub tylertoo_core::InvalidOption::NotFinite::option: &'static str
+pub tylertoo_core::InvalidOption::NotFinite::value: f64
+#[non_exhaustive] pub tylertoo_core::InvalidOption::NotPositive
+pub tylertoo_core::InvalidOption::NotPositive::option: &'static str
+pub tylertoo_core::InvalidOption::NotPositive::value: f64
+#[non_exhaustive] pub tylertoo_core::InvalidOption::Plan
+pub tylertoo_core::InvalidOption::Plan::message: alloc::string::String
+pub tylertoo_core::InvalidOption::PlanOnlyWithoutSavePlan
+pub tylertoo_core::InvalidOption::PointBandsNotPrefix
+pub tylertoo_core::InvalidOption::ReadBatchSize
+#[non_exhaustive] pub tylertoo_core::InvalidOption::ReadWorkers
+pub tylertoo_core::InvalidOption::ReadWorkers::ceiling: usize
+#[non_exhaustive] pub tylertoo_core::InvalidOption::SavePlan
+pub tylertoo_core::InvalidOption::SavePlan::message: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::InvalidOption::ShardWithCoalescedLines
+pub tylertoo_core::InvalidOption::ShardWithCoalescedLines::chains: usize
+pub tylertoo_core::InvalidOption::ShardWithCoalescedLines::plan: std::path::PathBuf
+pub tylertoo_core::InvalidOption::ShardWithSavePlan
+pub tylertoo_core::InvalidOption::ShardWithoutPlan
+impl core::convert::From<tylertoo_core::InvalidOption> for tylertoo_core::ConvertError
+pub fn tylertoo_core::ConvertError::from(tylertoo_core::InvalidOption) -> Self
+impl core::error::Error for tylertoo_core::InvalidOption
+impl core::fmt::Debug for tylertoo_core::InvalidOption
+pub fn tylertoo_core::InvalidOption::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::InvalidOption
+pub fn tylertoo_core::InvalidOption::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::InvalidOption
+impl core::marker::Send for tylertoo_core::InvalidOption
+impl core::marker::Sync for tylertoo_core::InvalidOption
+impl core::marker::Unpin for tylertoo_core::InvalidOption
+impl core::marker::UnsafeUnpin for tylertoo_core::InvalidOption
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::InvalidOption
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::InvalidOption
 #[non_exhaustive] pub enum tylertoo_core::LevelPlan
 pub tylertoo_core::LevelPlan::Gsds(alloc::vec::Vec<f64>)
 pub tylertoo_core::LevelPlan::ZoomRange
@@ -1101,37 +1275,37 @@ impl core::marker::UnsafeUnpin for tylertoo_core::OutputKind
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::OutputKind
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::OutputKind
 #[non_exhaustive] pub enum tylertoo_core::OverviewValidationError
-pub tylertoo_core::OverviewValidationError::CanonicalLevelMismatch
+#[non_exhaustive] pub tylertoo_core::OverviewValidationError::CanonicalLevelMismatch
 pub tylertoo_core::OverviewValidationError::CanonicalLevelMismatch::actual: core::option::Option<i64>
 pub tylertoo_core::OverviewValidationError::CanonicalLevelMismatch::expected: i64
-pub tylertoo_core::OverviewValidationError::CanonicalLevelNotNull
+#[non_exhaustive] pub tylertoo_core::OverviewValidationError::CanonicalLevelNotNull
 pub tylertoo_core::OverviewValidationError::CanonicalLevelNotNull::actual: i64
 pub tylertoo_core::OverviewValidationError::EmptyLevels
-pub tylertoo_core::OverviewValidationError::GsdNotDecreasing
+#[non_exhaustive] pub tylertoo_core::OverviewValidationError::GsdNotDecreasing
 pub tylertoo_core::OverviewValidationError::GsdNotDecreasing::index: usize
 pub tylertoo_core::OverviewValidationError::GsdNotDecreasing::previous: f64
 pub tylertoo_core::OverviewValidationError::GsdNotDecreasing::value: f64
-pub tylertoo_core::OverviewValidationError::GsdNotPositive
+#[non_exhaustive] pub tylertoo_core::OverviewValidationError::GsdNotPositive
 pub tylertoo_core::OverviewValidationError::GsdNotPositive::index: usize
 pub tylertoo_core::OverviewValidationError::GsdNotPositive::value: f64
 pub tylertoo_core::OverviewValidationError::InvalidVersion(alloc::string::String)
-pub tylertoo_core::OverviewValidationError::RowGroupFinalMismatch
+#[non_exhaustive] pub tylertoo_core::OverviewValidationError::RowGroupFinalMismatch
 pub tylertoo_core::OverviewValidationError::RowGroupFinalMismatch::expected: i64
 pub tylertoo_core::OverviewValidationError::RowGroupFinalMismatch::final_value: i64
-pub tylertoo_core::OverviewValidationError::RowGroupNotIncreasing
+#[non_exhaustive] pub tylertoo_core::OverviewValidationError::RowGroupNotIncreasing
 pub tylertoo_core::OverviewValidationError::RowGroupNotIncreasing::index: usize
 pub tylertoo_core::OverviewValidationError::RowGroupNotIncreasing::previous: i64
 pub tylertoo_core::OverviewValidationError::RowGroupNotIncreasing::value: i64
-pub tylertoo_core::OverviewValidationError::RowGroupOutOfRange
+#[non_exhaustive] pub tylertoo_core::OverviewValidationError::RowGroupOutOfRange
 pub tylertoo_core::OverviewValidationError::RowGroupOutOfRange::index: usize
 pub tylertoo_core::OverviewValidationError::RowGroupOutOfRange::num_row_groups: i64
 pub tylertoo_core::OverviewValidationError::RowGroupOutOfRange::value: i64
 pub tylertoo_core::OverviewValidationError::UnsupportedVersion(alloc::string::String)
-pub tylertoo_core::OverviewValidationError::ZoomNotIncreasing
+#[non_exhaustive] pub tylertoo_core::OverviewValidationError::ZoomNotIncreasing
 pub tylertoo_core::OverviewValidationError::ZoomNotIncreasing::index: usize
 pub tylertoo_core::OverviewValidationError::ZoomNotIncreasing::previous: u8
 pub tylertoo_core::OverviewValidationError::ZoomNotIncreasing::value: u8
-pub tylertoo_core::OverviewValidationError::ZoomPartial
+#[non_exhaustive] pub tylertoo_core::OverviewValidationError::ZoomPartial
 pub tylertoo_core::OverviewValidationError::ZoomPartial::index: usize
 impl core::clone::Clone for tylertoo_core::OverviewValidationError
 pub fn tylertoo_core::OverviewValidationError::clone(&self) -> tylertoo_core::OverviewValidationError
@@ -1186,14 +1360,14 @@ impl core::marker::UnsafeUnpin for tylertoo_core::PolygonRepairKind
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::PolygonRepairKind
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::PolygonRepairKind
 #[non_exhaustive] pub enum tylertoo_core::PropertySelectionError
-pub tylertoo_core::PropertySelectionError::CoveringColumn
+#[non_exhaustive] pub tylertoo_core::PropertySelectionError::CoveringColumn
 pub tylertoo_core::PropertySelectionError::CoveringColumn::name: alloc::string::String
-pub tylertoo_core::PropertySelectionError::GeometryColumn
+#[non_exhaustive] pub tylertoo_core::PropertySelectionError::GeometryColumn
 pub tylertoo_core::PropertySelectionError::GeometryColumn::name: alloc::string::String
-pub tylertoo_core::PropertySelectionError::RequiredByKnob
+#[non_exhaustive] pub tylertoo_core::PropertySelectionError::RequiredByKnob
 pub tylertoo_core::PropertySelectionError::RequiredByKnob::knob: alloc::string::String
 pub tylertoo_core::PropertySelectionError::RequiredByKnob::name: alloc::string::String
-pub tylertoo_core::PropertySelectionError::UnknownInclude
+#[non_exhaustive] pub tylertoo_core::PropertySelectionError::UnknownInclude
 pub tylertoo_core::PropertySelectionError::UnknownInclude::available: alloc::string::String
 pub tylertoo_core::PropertySelectionError::UnknownInclude::name: alloc::string::String
 impl core::cmp::Eq for tylertoo_core::PropertySelectionError
@@ -1216,31 +1390,31 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::PropertySelectio
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::PropertySelectionError
 #[non_exhaustive] pub enum tylertoo_core::PyramidError
 pub tylertoo_core::PyramidError::Archive(tylertoo_core::Error)
-pub tylertoo_core::PyramidError::BandConvert
+#[non_exhaustive] pub tylertoo_core::PyramidError::BandConvert
 pub tylertoo_core::PyramidError::BandConvert::error: tylertoo_core::ConvertError
 pub tylertoo_core::PyramidError::BandConvert::layer: alloc::string::String
-pub tylertoo_core::PyramidError::BandExport
+#[non_exhaustive] pub tylertoo_core::PyramidError::BandExport
 pub tylertoo_core::PyramidError::BandExport::error: tylertoo_core::ExportError
 pub tylertoo_core::PyramidError::BandExport::layer: alloc::string::String
 pub tylertoo_core::PyramidError::BandMismatch(alloc::string::String)
-pub tylertoo_core::PyramidError::BandWorkFile
+#[non_exhaustive] pub tylertoo_core::PyramidError::BandWorkFile
 pub tylertoo_core::PyramidError::BandWorkFile::error: core::io::error::Error
 pub tylertoo_core::PyramidError::BandWorkFile::layer: alloc::string::String
 pub tylertoo_core::PyramidError::Bands(alloc::string::String)
 pub tylertoo_core::PyramidError::Config(tylertoo_core::ConfigError)
-pub tylertoo_core::PyramidError::InvalidConfig(alloc::string::String)
+pub tylertoo_core::PyramidError::InvalidConfig(tylertoo_core::InvalidConfigError)
 pub tylertoo_core::PyramidError::Io(core::io::error::Error)
-pub tylertoo_core::PyramidError::OutOfOrder
+#[non_exhaustive] pub tylertoo_core::PyramidError::OutOfOrder
 pub tylertoo_core::PyramidError::OutOfOrder::id: u64
 pub tylertoo_core::PyramidError::OutOfOrder::path: std::path::PathBuf
 pub tylertoo_core::PyramidError::OutOfOrder::prev: u64
 pub tylertoo_core::PyramidError::Output(tylertoo_core::OutputNotWritable)
-pub tylertoo_core::PyramidError::TileCompress
+#[non_exhaustive] pub tylertoo_core::PyramidError::TileCompress
 pub tylertoo_core::PyramidError::TileCompress::error: core::io::error::Error
 pub tylertoo_core::PyramidError::TileCompress::x: u32
 pub tylertoo_core::PyramidError::TileCompress::y: u32
 pub tylertoo_core::PyramidError::TileCompress::z: u8
-pub tylertoo_core::PyramidError::TileDecompress
+#[non_exhaustive] pub tylertoo_core::PyramidError::TileDecompress
 pub tylertoo_core::PyramidError::TileDecompress::error: core::io::error::Error
 pub tylertoo_core::PyramidError::TileDecompress::layer: alloc::string::String
 pub tylertoo_core::PyramidError::TileDecompress::x: u32
@@ -1275,17 +1449,17 @@ impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::PyramidError
 impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::PyramidError
 #[non_exhaustive] pub enum tylertoo_core::ReaderError
 pub tylertoo_core::ReaderError::Conformance(alloc::string::String)
-pub tylertoo_core::ReaderError::Footer
+#[non_exhaustive] pub tylertoo_core::ReaderError::Footer
 pub tylertoo_core::ReaderError::Footer::path: alloc::string::String
 pub tylertoo_core::ReaderError::InvalidMetadata(tylertoo_core::OverviewValidationError)
 pub tylertoo_core::ReaderError::InvalidOverviewsJson(serde_json::error::Error)
 pub tylertoo_core::ReaderError::Io(core::io::error::Error)
-pub tylertoo_core::ReaderError::LevelOutOfRange
+#[non_exhaustive] pub tylertoo_core::ReaderError::LevelOutOfRange
 pub tylertoo_core::ReaderError::LevelOutOfRange::level: usize
 pub tylertoo_core::ReaderError::LevelOutOfRange::num_levels: usize
-pub tylertoo_core::ReaderError::MissingOverviewsKey
+#[non_exhaustive] pub tylertoo_core::ReaderError::MissingOverviewsKey
 pub tylertoo_core::ReaderError::MissingOverviewsKey::path: alloc::string::String
-pub tylertoo_core::ReaderError::Open
+#[non_exhaustive] pub tylertoo_core::ReaderError::Open
 pub tylertoo_core::ReaderError::Open::error: core::io::error::Error
 pub tylertoo_core::ReaderError::Open::path: alloc::string::String
 impl core::convert::From<core::io::error::Error> for tylertoo_core::ReaderError
@@ -1364,49 +1538,49 @@ impl core::marker::UnsafeUnpin for tylertoo_core::RowGroupSizePolicy
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::RowGroupSizePolicy
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::RowGroupSizePolicy
 #[non_exhaustive] pub enum tylertoo_core::ShardError
-pub tylertoo_core::ShardError::BadShardSelector
+#[non_exhaustive] pub tylertoo_core::ShardError::BadShardSelector
 pub tylertoo_core::ShardError::BadShardSelector::value: alloc::string::String
-pub tylertoo_core::ShardError::BadTileId
+#[non_exhaustive] pub tylertoo_core::ShardError::BadTileId
 pub tylertoo_core::ShardError::BadTileId::id: u64
 pub tylertoo_core::ShardError::BadTileId::reason: alloc::string::String
-pub tylertoo_core::ShardError::BadTileRange
+#[non_exhaustive] pub tylertoo_core::ShardError::BadTileRange
 pub tylertoo_core::ShardError::BadTileRange::value: alloc::string::String
-pub tylertoo_core::ShardError::EmptyTileRange
+#[non_exhaustive] pub tylertoo_core::ShardError::EmptyTileRange
 pub tylertoo_core::ShardError::EmptyTileRange::hi: u64
 pub tylertoo_core::ShardError::EmptyTileRange::lo: u64
 pub tylertoo_core::ShardError::Input(tylertoo_core::InputError)
-pub tylertoo_core::ShardError::Io
+#[non_exhaustive] pub tylertoo_core::ShardError::Io
 pub tylertoo_core::ShardError::Io::path: alloc::string::String
 pub tylertoo_core::ShardError::Io::source: core::io::error::Error
-pub tylertoo_core::ShardError::Malformed
+#[non_exhaustive] pub tylertoo_core::ShardError::Malformed
 pub tylertoo_core::ShardError::Malformed::path: alloc::string::String
 pub tylertoo_core::ShardError::Malformed::what: alloc::string::String
-pub tylertoo_core::ShardError::PivotNotCoarser
+#[non_exhaustive] pub tylertoo_core::ShardError::PivotNotCoarser
 pub tylertoo_core::ShardError::PivotNotCoarser::max_zoom: u8
 pub tylertoo_core::ShardError::PivotNotCoarser::path: alloc::string::String
 pub tylertoo_core::ShardError::PivotNotCoarser::pivot: u8
-pub tylertoo_core::ShardError::PivotOutOfRange
+#[non_exhaustive] pub tylertoo_core::ShardError::PivotOutOfRange
 pub tylertoo_core::ShardError::PivotOutOfRange::pivot: u8
-pub tylertoo_core::ShardError::ShardCountMismatch
+#[non_exhaustive] pub tylertoo_core::ShardError::ShardCountMismatch
 pub tylertoo_core::ShardError::ShardCountMismatch::index: usize
 pub tylertoo_core::ShardError::ShardCountMismatch::path: alloc::string::String
 pub tylertoo_core::ShardError::ShardCountMismatch::plan_shards: usize
 pub tylertoo_core::ShardError::ShardCountMismatch::shards: usize
-pub tylertoo_core::ShardError::ShardCountOutOfRange
+#[non_exhaustive] pub tylertoo_core::ShardError::ShardCountOutOfRange
 pub tylertoo_core::ShardError::ShardCountOutOfRange::max: u64
 pub tylertoo_core::ShardError::ShardCountOutOfRange::pivot: u8
 pub tylertoo_core::ShardError::ShardCountOutOfRange::shards: usize
-pub tylertoo_core::ShardError::ShardIndexOutOfRange
+#[non_exhaustive] pub tylertoo_core::ShardError::ShardIndexOutOfRange
 pub tylertoo_core::ShardError::ShardIndexOutOfRange::index: usize
 pub tylertoo_core::ShardError::ShardIndexOutOfRange::shards: usize
-pub tylertoo_core::ShardError::SourceMismatch
+#[non_exhaustive] pub tylertoo_core::ShardError::SourceMismatch
 pub tylertoo_core::ShardError::SourceMismatch::field: alloc::string::String
 pub tylertoo_core::ShardError::SourceMismatch::now: alloc::string::String
 pub tylertoo_core::ShardError::SourceMismatch::path: alloc::string::String
 pub tylertoo_core::ShardError::SourceMismatch::saved: alloc::string::String
-pub tylertoo_core::ShardError::TileRangePivotOutOfRange
+#[non_exhaustive] pub tylertoo_core::ShardError::TileRangePivotOutOfRange
 pub tylertoo_core::ShardError::TileRangePivotOutOfRange::pivot: u8
-pub tylertoo_core::ShardError::TileRangeZoomMismatch
+#[non_exhaustive] pub tylertoo_core::ShardError::TileRangeZoomMismatch
 pub tylertoo_core::ShardError::TileRangeZoomMismatch::hi: u64
 pub tylertoo_core::ShardError::TileRangeZoomMismatch::hi_zoom: u8
 pub tylertoo_core::ShardError::TileRangeZoomMismatch::lo: u64
@@ -1548,8 +1722,6 @@ pub tylertoo_core::TileType::Mvt = 1
 pub tylertoo_core::TileType::Png = 2
 pub tylertoo_core::TileType::Unknown = 0
 pub tylertoo_core::TileType::Webp = 4
-impl tylertoo_core::TileType
-pub fn tylertoo_core::TileType::from_code(u8) -> core::option::Option<Self>
 impl core::clone::Clone for tylertoo_core::TileType
 pub fn tylertoo_core::TileType::clone(&self) -> tylertoo_core::TileType
 impl core::cmp::Eq for tylertoo_core::TileType
@@ -1572,7 +1744,7 @@ pub tylertoo_core::TilesError::Convert(tylertoo_core::ConvertError)
 pub tylertoo_core::TilesError::EmptyCoarseArchive(tylertoo_core::ExportError)
 pub tylertoo_core::TilesError::EmptyShardArchive(tylertoo_core::ExportError)
 pub tylertoo_core::TilesError::Export(tylertoo_core::ExportError)
-pub tylertoo_core::TilesError::IntermediateCreate
+#[non_exhaustive] pub tylertoo_core::TilesError::IntermediateCreate
 pub tylertoo_core::TilesError::IntermediateCreate::dir: std::path::PathBuf
 pub tylertoo_core::TilesError::IntermediateCreate::source: core::io::error::Error
 pub tylertoo_core::TilesError::Output(tylertoo_core::OutputNotWritable)
@@ -1599,8 +1771,6 @@ impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::TilesError
 #[non_exhaustive] pub enum tylertoo_core::TilesInput
 pub tylertoo_core::TilesInput::Manifest(std::path::PathBuf)
 pub tylertoo_core::TilesInput::Path(std::path::PathBuf)
-impl tylertoo_core::TilesInput
-pub fn tylertoo_core::TilesInput::derive_layer_name(&self) -> alloc::string::String
 impl core::clone::Clone for tylertoo_core::TilesInput
 pub fn tylertoo_core::TilesInput::clone(&self) -> tylertoo_core::TilesInput
 impl core::cmp::Eq for tylertoo_core::TilesInput
@@ -1631,19 +1801,19 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TilesOutcome
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TilesOutcome
 #[non_exhaustive] pub enum tylertoo_core::WriteError
 pub tylertoo_core::WriteError::Finalized
-pub tylertoo_core::WriteError::Io
+#[non_exhaustive] pub tylertoo_core::WriteError::Io
 pub tylertoo_core::WriteError::Io::error: core::io::error::Error
 pub tylertoo_core::WriteError::Io::step: alloc::string::String
-pub tylertoo_core::WriteError::MetadataTooLarge
+#[non_exhaustive] pub tylertoo_core::WriteError::MetadataTooLarge
 pub tylertoo_core::WriteError::MetadataTooLarge::bytes: u64
 pub tylertoo_core::WriteError::MetadataTooLarge::cap: u64
-pub tylertoo_core::WriteError::Publish
+#[non_exhaustive] pub tylertoo_core::WriteError::Publish
 pub tylertoo_core::WriteError::Publish::error: core::io::error::Error
 pub tylertoo_core::WriteError::Publish::kept: std::path::PathBuf
-pub tylertoo_core::WriteError::StoredMetadataTooLarge
+#[non_exhaustive] pub tylertoo_core::WriteError::StoredMetadataTooLarge
 pub tylertoo_core::WriteError::StoredMetadataTooLarge::bytes: u64
 pub tylertoo_core::WriteError::StoredMetadataTooLarge::cap: u64
-pub tylertoo_core::WriteError::WrongOutput
+#[non_exhaustive] pub tylertoo_core::WriteError::WrongOutput
 pub tylertoo_core::WriteError::WrongOutput::requested: std::path::PathBuf
 pub tylertoo_core::WriteError::WrongOutput::reserved: std::path::PathBuf
 impl core::convert::From<tylertoo_core::WriteError> for tylertoo_core::Error
@@ -1665,16 +1835,16 @@ impl core::marker::UnsafeUnpin for tylertoo_core::WriteError
 impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::WriteError
 impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::WriteError
 #[non_exhaustive] pub enum tylertoo_core::WriterError
-pub tylertoo_core::WriterError::AllLevelsEmpty
+#[non_exhaustive] pub tylertoo_core::WriterError::AllLevelsEmpty
 pub tylertoo_core::WriterError::AllLevelsEmpty::expected: usize
 pub tylertoo_core::WriterError::GeoParquet(alloc::string::String)
-pub tylertoo_core::WriterError::IncompleteLevels
+#[non_exhaustive] pub tylertoo_core::WriterError::IncompleteLevels
 pub tylertoo_core::WriterError::IncompleteLevels::expected: usize
 pub tylertoo_core::WriterError::IncompleteLevels::written: usize
 pub tylertoo_core::WriterError::Io(core::io::error::Error)
 pub tylertoo_core::WriterError::Json(serde_json::error::Error)
 pub tylertoo_core::WriterError::LevelColumnExists
-pub tylertoo_core::WriterError::LevelOutOfOrder
+#[non_exhaustive] pub tylertoo_core::WriterError::LevelOutOfOrder
 pub tylertoo_core::WriterError::LevelOutOfOrder::expected: usize
 pub tylertoo_core::WriterError::LevelOutOfOrder::got: usize
 pub tylertoo_core::WriterError::NoGeometryColumn
@@ -1700,9 +1870,11 @@ impl core::marker::Unpin for tylertoo_core::WriterError
 impl core::marker::UnsafeUnpin for tylertoo_core::WriterError
 impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::WriterError
 impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::WriterError
-pub struct tylertoo_core::AccumulateSpec
+#[non_exhaustive] pub struct tylertoo_core::AccumulateSpec
 pub tylertoo_core::AccumulateSpec::column: alloc::string::String
 pub tylertoo_core::AccumulateSpec::op: tylertoo_core::AccumulateOp
+impl tylertoo_core::AccumulateSpec
+pub fn tylertoo_core::AccumulateSpec::new(impl core::convert::Into<alloc::string::String>, tylertoo_core::AccumulateOp) -> Self
 impl core::clone::Clone for tylertoo_core::AccumulateSpec
 pub fn tylertoo_core::AccumulateSpec::clone(&self) -> tylertoo_core::AccumulateSpec
 impl core::cmp::PartialEq for tylertoo_core::AccumulateSpec
@@ -1749,12 +1921,13 @@ impl core::marker::Unpin for tylertoo_core::AssignConfig
 impl core::marker::UnsafeUnpin for tylertoo_core::AssignConfig
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::AssignConfig
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::AssignConfig
-pub struct tylertoo_core::Band
+#[non_exhaustive] pub struct tylertoo_core::Band
 pub tylertoo_core::Band::input: std::path::PathBuf
 pub tylertoo_core::Band::layer: alloc::string::String
 pub tylertoo_core::Band::max_zoom: u8
 pub tylertoo_core::Band::min_zoom: u8
 impl tylertoo_core::Band
+pub fn tylertoo_core::Band::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<alloc::string::String>, u8, u8) -> Self
 pub fn tylertoo_core::Band::parse(&str) -> core::result::Result<Self, alloc::string::String>
 impl core::clone::Clone for tylertoo_core::Band
 pub fn tylertoo_core::Band::clone(&self) -> tylertoo_core::Band
@@ -1786,7 +1959,7 @@ impl core::marker::Unpin for tylertoo_core::BandMergeOptions
 impl core::marker::UnsafeUnpin for tylertoo_core::BandMergeOptions
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::BandMergeOptions
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::BandMergeOptions
-pub struct tylertoo_core::BudgetKinds
+#[non_exhaustive] pub struct tylertoo_core::BudgetKinds
 pub tylertoo_core::BudgetKinds::lines: bool
 pub tylertoo_core::BudgetKinds::points: bool
 pub tylertoo_core::BudgetKinds::polygons: bool
@@ -1794,6 +1967,10 @@ impl tylertoo_core::BudgetKinds
 pub const tylertoo_core::BudgetKinds::ALL: Self
 pub const tylertoo_core::BudgetKinds::POINTS: Self
 pub fn tylertoo_core::BudgetKinds::includes(self, tylertoo_core::FeatureKind) -> bool
+impl tylertoo_core::BudgetKinds
+pub fn tylertoo_core::BudgetKinds::with_lines(self, bool) -> Self
+pub fn tylertoo_core::BudgetKinds::with_points(self, bool) -> Self
+pub fn tylertoo_core::BudgetKinds::with_polygons(self, bool) -> Self
 impl core::clone::Clone for tylertoo_core::BudgetKinds
 pub fn tylertoo_core::BudgetKinds::clone(&self) -> tylertoo_core::BudgetKinds
 impl core::cmp::Eq for tylertoo_core::BudgetKinds
@@ -1837,12 +2014,12 @@ impl core::marker::Unpin for tylertoo_core::CheckResult
 impl core::marker::UnsafeUnpin for tylertoo_core::CheckResult
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::CheckResult
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::CheckResult
-pub struct tylertoo_core::ClassRanking
-pub tylertoo_core::ClassRanking::column: alloc::string::String
-pub tylertoo_core::ClassRanking::ranks: alloc::vec::Vec<(alloc::string::String, f64)>
-pub tylertoo_core::ClassRanking::unknown_rank: f64
+#[non_exhaustive] pub struct tylertoo_core::ClassRanking
 impl tylertoo_core::ClassRanking
+pub fn tylertoo_core::ClassRanking::column(&self) -> &str
 pub fn tylertoo_core::ClassRanking::new(impl core::convert::Into<alloc::string::String>, alloc::vec::Vec<(alloc::string::String, f64)>, core::option::Option<f64>) -> core::result::Result<Self, alloc::string::String>
+pub fn tylertoo_core::ClassRanking::ranks(&self) -> &[(alloc::string::String, f64)]
+pub fn tylertoo_core::ClassRanking::unknown_rank(&self) -> f64
 impl core::clone::Clone for tylertoo_core::ClassRanking
 pub fn tylertoo_core::ClassRanking::clone(&self) -> tylertoo_core::ClassRanking
 impl core::cmp::PartialEq for tylertoo_core::ClassRanking
@@ -1899,7 +2076,6 @@ pub tylertoo_core::ConvertOptions::spill_dir: core::option::Option<std::path::Pa
 pub tylertoo_core::ConvertOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::ConvertOptions
 pub fn tylertoo_core::ConvertOptions::is_verbatim(&self) -> bool
-pub fn tylertoo_core::ConvertOptions::validate(&self) -> core::result::Result<tylertoo_core::ValidatedConfig<'_, Self>, tylertoo_core::ConvertError>
 pub fn tylertoo_core::ConvertOptions::verbatim(self) -> Self
 pub fn tylertoo_core::ConvertOptions::with_generalization(self, &tylertoo_core::GeneralizationOverrides, bool) -> core::result::Result<Self, tylertoo_core::ConvertError>
 impl tylertoo_core::ConvertOptions
@@ -2000,8 +2176,6 @@ pub tylertoo_core::DecodeOptions::layer: core::option::Option<alloc::string::Str
 pub tylertoo_core::DecodeOptions::max_zoom: core::option::Option<u8>
 pub tylertoo_core::DecodeOptions::min_zoom: core::option::Option<u8>
 impl tylertoo_core::DecodeOptions
-pub fn tylertoo_core::DecodeOptions::validate(&self) -> core::result::Result<(), tylertoo_core::DecodeError>
-impl tylertoo_core::DecodeOptions
 pub fn tylertoo_core::DecodeOptions::with_layer(self, core::option::Option<alloc::string::String>) -> Self
 pub fn tylertoo_core::DecodeOptions::with_max_zoom(self, core::option::Option<u8>) -> Self
 pub fn tylertoo_core::DecodeOptions::with_min_zoom(self, core::option::Option<u8>) -> Self
@@ -2094,9 +2268,11 @@ impl core::marker::Unpin for tylertoo_core::EmptyArchive
 impl core::marker::UnsafeUnpin for tylertoo_core::EmptyArchive
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::EmptyArchive
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::EmptyArchive
-pub struct tylertoo_core::EntryZoomSpec
+#[non_exhaustive] pub struct tylertoo_core::EntryZoomSpec
 pub tylertoo_core::EntryZoomSpec::column: alloc::string::String
 pub tylertoo_core::EntryZoomSpec::kind: tylertoo_core::EntryZoomKind
+impl tylertoo_core::EntryZoomSpec
+pub fn tylertoo_core::EntryZoomSpec::new(impl core::convert::Into<alloc::string::String>, tylertoo_core::EntryZoomKind) -> Self
 impl core::clone::Clone for tylertoo_core::EntryZoomSpec
 pub fn tylertoo_core::EntryZoomSpec::clone(&self) -> tylertoo_core::EntryZoomSpec
 impl core::cmp::PartialEq for tylertoo_core::EntryZoomSpec
@@ -2135,7 +2311,6 @@ pub tylertoo_core::ExportOptions::tile_range: core::option::Option<tylertoo_core
 pub tylertoo_core::ExportOptions::tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::ExportOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::ExportOptions
-pub fn tylertoo_core::ExportOptions::validate(&self) -> core::result::Result<tylertoo_core::ValidatedConfig<'_, Self>, tylertoo_core::ConfigError>
 pub fn tylertoo_core::ExportOptions::verbatim(self) -> Self
 impl tylertoo_core::ExportOptions
 pub fn tylertoo_core::ExportOptions::with_compressed_tile_size_limit(self, core::option::Option<usize>) -> Self
@@ -2311,7 +2486,7 @@ impl core::marker::Unpin for tylertoo_core::LevelReport
 impl core::marker::UnsafeUnpin for tylertoo_core::LevelReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::LevelReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::LevelReport
-pub struct tylertoo_core::OutOfRangeExemplar
+#[non_exhaustive] pub struct tylertoo_core::OutOfRangeExemplar
 pub tylertoo_core::OutOfRangeExemplar::axis: &'static str
 pub tylertoo_core::OutOfRangeExemplar::part: core::option::Option<usize>
 pub tylertoo_core::OutOfRangeExemplar::row: usize
@@ -2419,7 +2594,7 @@ impl core::marker::Unpin for tylertoo_core::PlanReport
 impl core::marker::UnsafeUnpin for tylertoo_core::PlanReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::PlanReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::PlanReport
-pub struct tylertoo_core::PropertySelection
+#[non_exhaustive] pub struct tylertoo_core::PropertySelection
 pub tylertoo_core::PropertySelection::exclude: alloc::vec::Vec<alloc::string::String>
 pub tylertoo_core::PropertySelection::exclude_all: bool
 pub tylertoo_core::PropertySelection::include: core::option::Option<alloc::vec::Vec<alloc::string::String>>
@@ -2427,6 +2602,10 @@ impl tylertoo_core::PropertySelection
 pub fn tylertoo_core::PropertySelection::all() -> Self
 pub fn tylertoo_core::PropertySelection::is_identity(&self) -> bool
 pub fn tylertoo_core::PropertySelection::keeps(&self, &str) -> bool
+impl tylertoo_core::PropertySelection
+pub fn tylertoo_core::PropertySelection::with_exclude(self, alloc::vec::Vec<alloc::string::String>) -> Self
+pub fn tylertoo_core::PropertySelection::with_exclude_all(self, bool) -> Self
+pub fn tylertoo_core::PropertySelection::with_include(self, core::option::Option<alloc::vec::Vec<alloc::string::String>>) -> Self
 impl core::clone::Clone for tylertoo_core::PropertySelection
 pub fn tylertoo_core::PropertySelection::clone(&self) -> tylertoo_core::PropertySelection
 impl core::cmp::Eq for tylertoo_core::PropertySelection
@@ -2456,7 +2635,6 @@ pub tylertoo_core::PyramidOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::PyramidOptions::work_dir: core::option::Option<std::path::PathBuf>
 impl tylertoo_core::PyramidOptions
 pub fn tylertoo_core::PyramidOptions::new(bool) -> Self
-pub fn tylertoo_core::PyramidOptions::validate(&self) -> core::result::Result<tylertoo_core::ValidatedConfig<'_, Self>, tylertoo_core::PyramidError>
 impl tylertoo_core::PyramidOptions
 pub fn tylertoo_core::PyramidOptions::with_allow_missing_zooms(self, bool) -> Self
 pub fn tylertoo_core::PyramidOptions::with_convert(self, tylertoo_core::ConvertOptions) -> Self
@@ -2502,7 +2680,7 @@ impl core::marker::Unpin for tylertoo_core::PyramidReport
 impl core::marker::UnsafeUnpin for tylertoo_core::PyramidReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::PyramidReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::PyramidReport
-pub struct tylertoo_core::RangeContext
+#[non_exhaustive] pub struct tylertoo_core::RangeContext
 pub tylertoo_core::RangeContext::crs: tylertoo_core::Crs
 pub tylertoo_core::RangeContext::max_abs: f64
 pub tylertoo_core::RangeContext::total: usize
@@ -2548,10 +2726,12 @@ impl core::marker::Unpin for tylertoo_core::RankingProvenance
 impl core::marker::UnsafeUnpin for tylertoo_core::RankingProvenance
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::RankingProvenance
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::RankingProvenance
-pub struct tylertoo_core::RepresentationBand
+#[non_exhaustive] pub struct tylertoo_core::RepresentationBand
 pub tylertoo_core::RepresentationBand::max_zoom: u8
 pub tylertoo_core::RepresentationBand::min_zoom: u8
 pub tylertoo_core::RepresentationBand::repr: tylertoo_core::Representation
+impl tylertoo_core::RepresentationBand
+pub fn tylertoo_core::RepresentationBand::new(u8, u8, tylertoo_core::Representation) -> Self
 impl core::clone::Clone for tylertoo_core::RepresentationBand
 pub fn tylertoo_core::RepresentationBand::clone(&self) -> tylertoo_core::RepresentationBand
 impl core::cmp::Eq for tylertoo_core::RepresentationBand
@@ -2572,9 +2752,11 @@ impl core::marker::Unpin for tylertoo_core::RepresentationBand
 impl core::marker::UnsafeUnpin for tylertoo_core::RepresentationBand
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::RepresentationBand
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::RepresentationBand
-pub struct tylertoo_core::ShardBinding
+#[non_exhaustive] pub struct tylertoo_core::ShardBinding
 pub tylertoo_core::ShardBinding::path: std::path::PathBuf
 pub tylertoo_core::ShardBinding::plan: tylertoo_core::ShardPlan
+impl tylertoo_core::ShardBinding
+pub fn tylertoo_core::ShardBinding::new(tylertoo_core::ShardPlan, impl core::convert::Into<std::path::PathBuf>) -> Self
 impl core::clone::Clone for tylertoo_core::ShardBinding
 pub fn tylertoo_core::ShardBinding::clone(&self) -> tylertoo_core::ShardBinding
 impl core::cmp::Eq for tylertoo_core::ShardBinding
@@ -2590,7 +2772,7 @@ impl core::marker::Unpin for tylertoo_core::ShardBinding
 impl core::marker::UnsafeUnpin for tylertoo_core::ShardBinding
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ShardBinding
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ShardBinding
-pub struct tylertoo_core::ShardInput
+#[non_exhaustive] pub struct tylertoo_core::ShardInput
 pub tylertoo_core::ShardInput::num_rows: i64
 pub tylertoo_core::ShardInput::path: alloc::string::String
 pub tylertoo_core::ShardInput::row_groups: usize
@@ -2613,7 +2795,7 @@ impl core::marker::Unpin for tylertoo_core::ShardInput
 impl core::marker::UnsafeUnpin for tylertoo_core::ShardInput
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ShardInput
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ShardInput
-pub struct tylertoo_core::ShardPlan
+#[non_exhaustive] pub struct tylertoo_core::ShardPlan
 pub tylertoo_core::ShardPlan::estimated_rows_total: u64
 pub tylertoo_core::ShardPlan::format: alloc::string::String
 pub tylertoo_core::ShardPlan::inputs: alloc::vec::Vec<tylertoo_core::ShardInput>
@@ -2622,14 +2804,8 @@ pub tylertoo_core::ShardPlan::ranges: alloc::vec::Vec<tylertoo_core::ShardRange>
 pub tylertoo_core::ShardPlan::unplaced_rows: u64
 pub tylertoo_core::ShardPlan::version: u32
 impl tylertoo_core::ShardPlan
-pub fn tylertoo_core::ShardPlan::check_max_zoom(&self, u8, &std::path::Path) -> core::result::Result<(), tylertoo_core::ShardError>
-pub fn tylertoo_core::ShardPlan::cut_digest(&self) -> u64
-pub fn tylertoo_core::ShardPlan::cut_digest_hex(&self) -> alloc::string::String
 pub fn tylertoo_core::ShardPlan::load(&std::path::Path) -> core::result::Result<Self, tylertoo_core::ShardError>
-pub fn tylertoo_core::ShardPlan::range(&self, usize) -> core::result::Result<tylertoo_core::TileRange, tylertoo_core::ShardError>
-pub fn tylertoo_core::ShardPlan::range_for(&self, tylertoo_core::ShardRole, &std::path::Path) -> core::result::Result<core::option::Option<tylertoo_core::TileRange>, tylertoo_core::ShardError>
 pub fn tylertoo_core::ShardPlan::save(&self, &std::path::Path) -> core::result::Result<(), tylertoo_core::ShardError>
-pub fn tylertoo_core::ShardPlan::shards(&self) -> usize
 impl core::clone::Clone for tylertoo_core::ShardPlan
 pub fn tylertoo_core::ShardPlan::clone(&self) -> tylertoo_core::ShardPlan
 impl core::cmp::Eq for tylertoo_core::ShardPlan
@@ -2649,7 +2825,7 @@ impl core::marker::Unpin for tylertoo_core::ShardPlan
 impl core::marker::UnsafeUnpin for tylertoo_core::ShardPlan
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ShardPlan
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ShardPlan
-pub struct tylertoo_core::ShardRange
+#[non_exhaustive] pub struct tylertoo_core::ShardRange
 pub tylertoo_core::ShardRange::estimated_rows: u64
 pub tylertoo_core::ShardRange::hi: u64
 pub tylertoo_core::ShardRange::lo: u64
@@ -2793,11 +2969,9 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::SourceLosses
 pub struct tylertoo_core::TileRange
 impl tylertoo_core::TileRange
 pub fn tylertoo_core::TileRange::hi(&self) -> u64
-pub fn tylertoo_core::TileRange::ids_at(&self, u8) -> core::option::Option<core::ops::range::RangeInclusive<u64>>
 pub fn tylertoo_core::TileRange::lo(&self) -> u64
 pub fn tylertoo_core::TileRange::new(u8, u64, u64) -> core::result::Result<Self, tylertoo_core::ShardError>
 pub fn tylertoo_core::TileRange::parse(&str) -> core::result::Result<Self, tylertoo_core::ShardError>
-pub fn tylertoo_core::TileRange::pivot_tiles(&self) -> u64
 pub fn tylertoo_core::TileRange::pivot_zoom(&self) -> u8
 impl core::clone::Clone for tylertoo_core::TileRange
 pub fn tylertoo_core::TileRange::clone(&self) -> tylertoo_core::TileRange
@@ -2828,10 +3002,6 @@ pub tylertoo_core::TilesOptions::keep_overview: core::option::Option<std::path::
 pub tylertoo_core::TilesOptions::layer_name: core::option::Option<alloc::string::String>
 pub tylertoo_core::TilesOptions::shard: core::option::Option<tylertoo_core::TilesShard>
 impl tylertoo_core::TilesOptions
-pub fn tylertoo_core::TilesOptions::export_defaults(bool) -> tylertoo_core::ExportOptions
-pub fn tylertoo_core::TilesOptions::validate(&self) -> core::result::Result<tylertoo_core::ValidatedConfig<'_, Self>, tylertoo_core::TilesError>
-pub fn tylertoo_core::TilesOptions::validate_plan_only(&self) -> core::result::Result<(), tylertoo_core::TilesError>
-impl tylertoo_core::TilesOptions
 pub fn tylertoo_core::TilesOptions::with_convert(self, tylertoo_core::ConvertOptions) -> Self
 pub fn tylertoo_core::TilesOptions::with_export(self, tylertoo_core::ExportOptions) -> Self
 pub fn tylertoo_core::TilesOptions::with_keep_overview(self, core::option::Option<std::path::PathBuf>) -> Self
@@ -2858,8 +3028,6 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TilesOptions
 pub tylertoo_core::TilesReport::convert: tylertoo_core::ConvertReport
 pub tylertoo_core::TilesReport::export: tylertoo_core::ExportReport
 pub tylertoo_core::TilesReport::intermediate: tylertoo_core::IntermediateOverview
-impl tylertoo_core::TilesReport
-pub fn tylertoo_core::TilesReport::empty_declared_zooms(&self) -> alloc::vec::Vec<u8>
 impl core::clone::Clone for tylertoo_core::TilesReport
 pub fn tylertoo_core::TilesReport::clone(&self) -> tylertoo_core::TilesReport
 impl core::fmt::Debug for tylertoo_core::TilesReport
@@ -2873,12 +3041,14 @@ impl core::marker::Unpin for tylertoo_core::TilesReport
 impl core::marker::UnsafeUnpin for tylertoo_core::TilesReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TilesReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TilesReport
-pub struct tylertoo_core::TilesShard
+#[non_exhaustive] pub struct tylertoo_core::TilesShard
 pub tylertoo_core::TilesShard::binding: core::option::Option<tylertoo_core::ShardBinding>
 pub tylertoo_core::TilesShard::cut_digest: alloc::string::String
 pub tylertoo_core::TilesShard::pivot_zoom: u8
 pub tylertoo_core::TilesShard::range: core::option::Option<tylertoo_core::TileRange>
 pub tylertoo_core::TilesShard::role: tylertoo_core::ShardRole
+impl tylertoo_core::TilesShard
+pub fn tylertoo_core::TilesShard::new(tylertoo_core::ShardRole, core::option::Option<tylertoo_core::TileRange>, u8, impl core::convert::Into<alloc::string::String>, core::option::Option<tylertoo_core::ShardBinding>) -> Self
 impl core::clone::Clone for tylertoo_core::TilesShard
 pub fn tylertoo_core::TilesShard::clone(&self) -> tylertoo_core::TilesShard
 impl core::cmp::Eq for tylertoo_core::TilesShard
@@ -2924,21 +3094,6 @@ impl core::marker::Unpin for tylertoo_core::TilesetMetadata
 impl core::marker::UnsafeUnpin for tylertoo_core::TilesetMetadata
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TilesetMetadata
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TilesetMetadata
-pub struct tylertoo_core::ValidatedConfig<'a, T>
-impl<'a, T> tylertoo_core::ValidatedConfig<'a, T>
-pub fn tylertoo_core::ValidatedConfig<'a, T>::options(&self) -> &'a T
-impl<'a, T: core::clone::Clone> core::clone::Clone for tylertoo_core::ValidatedConfig<'a, T>
-pub fn tylertoo_core::ValidatedConfig<'a, T>::clone(&self) -> tylertoo_core::ValidatedConfig<'a, T>
-impl<'a, T: core::fmt::Debug> core::fmt::Debug for tylertoo_core::ValidatedConfig<'a, T>
-pub fn tylertoo_core::ValidatedConfig<'a, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<'a, T: core::marker::Copy> core::marker::Copy for tylertoo_core::ValidatedConfig<'a, T>
-impl<'a, T> core::marker::Freeze for tylertoo_core::ValidatedConfig<'a, T> where &'a T: core::marker::Freeze
-impl<'a, T> core::marker::Send for tylertoo_core::ValidatedConfig<'a, T> where &'a T: core::marker::Send
-impl<'a, T> core::marker::Sync for tylertoo_core::ValidatedConfig<'a, T> where &'a T: core::marker::Sync
-impl<'a, T> core::marker::Unpin for tylertoo_core::ValidatedConfig<'a, T> where &'a T: core::marker::Unpin
-impl<'a, T> core::marker::UnsafeUnpin for tylertoo_core::ValidatedConfig<'a, T> where &'a T: core::marker::UnsafeUnpin
-impl<'a, T> core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ValidatedConfig<'a, T> where &'a T: core::panic::unwind_safe::RefUnwindSafe
-impl<'a, T> core::panic::unwind_safe::UnwindSafe for tylertoo_core::ValidatedConfig<'a, T> where &'a T: core::panic::unwind_safe::UnwindSafe
 #[non_exhaustive] pub struct tylertoo_core::ValidationReport
 pub tylertoo_core::ValidationReport::checks: alloc::vec::Vec<tylertoo_core::CheckResult>
 impl tylertoo_core::ValidationReport
@@ -3004,6 +3159,8 @@ impl tylertoo_core::Classify for tylertoo_core::Error
 pub fn tylertoo_core::Error::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::ExportError
 pub fn tylertoo_core::ExportError::kind(&self) -> tylertoo_core::ErrorKind
+impl tylertoo_core::Classify for tylertoo_core::InputError
+pub fn tylertoo_core::InputError::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::PyramidError
 pub fn tylertoo_core::PyramidError::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::TilesError
@@ -3020,4 +3177,3 @@ pub fn tylertoo_core::merge_bands_with_options(&[tylertoo_core::Band], &std::pat
 pub fn tylertoo_core::validate_file<P: core::convert::AsRef<std::path::Path>>(P) -> core::result::Result<tylertoo_core::ValidationReport, tylertoo_core::CheckError>
 pub fn tylertoo_core::write_convert_plan(impl core::convert::AsRef<std::path::Path>, &tylertoo_core::ConvertOptions) -> core::result::Result<tylertoo_core::PlanReport, tylertoo_core::ConvertError>
 pub fn tylertoo_core::write_plan(&tylertoo_core::TilesInput, &tylertoo_core::TilesOptions) -> core::result::Result<tylertoo_core::PlanReport, tylertoo_core::TilesError>
-pub type tylertoo_core::Result<T> = core::result::Result<T, tylertoo_core::Error>

@@ -1,8 +1,9 @@
 //! #437 gate on the committed public-API baseline (`api/tylertoo-core.txt`,
 //! which CI's public-api job keeps equal to the real surface).
 //!
-//! 1. No stable signature names a pre-1.0 or fast-moving dependency, so a
-//!    major release of one cannot force a tylertoo-core major release.
+//! 1. Every path a stable signature names starts at an allowed root
+//!    ([`ALLOWED_ROOTS`]), so no dependency's major release can force a
+//!    tylertoo-core major release.
 //! 2. Every `tylertoo_core::` path a stable signature names is itself in
 //!    the baseline: a stable item does not lean on an `internal` one.
 
@@ -13,42 +14,64 @@ fn baseline() -> String {
     std::fs::read_to_string(path).expect("read the public-API baseline")
 }
 
-/// Crate path prefixes no stable signature may name.
-const FORBIDDEN: &[&str] = &[
-    "arrow::",
-    "arrow_",
-    "parquet::",
-    "geo_types::",
-    "geo::",
-    "geoarrow::",
-    "geoarrow_",
-    "object_store::",
+/// The path roots a stable signature may name: this crate, the standard
+/// library, serde (the JSON wire shape), and `serde_json` (1.x; its error type
+/// is opaque). Anything else is a dependency whose major release would force
+/// one here: hide the signature or wrap the type.
+const ALLOWED_ROOTS: &[&str] = &[
+    "tylertoo_core",
+    "core",
+    "alloc",
+    "std",
+    "serde_core",
+    "serde_json",
+    "Self",
 ];
 
-/// Whether `line` names one of the [`FORBIDDEN`] crates at the start of a
-/// path, not inside a longer identifier (`my_geo::`) or a path
-/// (`tylertoo_core::X::arrow_bytes`).
-fn names_forbidden_crate(line: &str) -> Option<&'static str> {
-    FORBIDDEN.iter().copied().find(|prefix| {
-        line.match_indices(prefix).any(|(at, _)| {
-            !line[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':')
-        })
+/// The root of every path in `line`: the identifier before a `::` that is
+/// not itself preceded by an identifier character or `:`.
+fn path_roots(line: &str) -> impl Iterator<Item = &str> {
+    line.match_indices("::").filter_map(move |(at, _)| {
+        let head = &line[..at];
+        let start = head
+            .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .map_or(0, |i| i + 1);
+        let root = &head[start..];
+        let preceded = head[..start].ends_with(':');
+        (!root.is_empty() && !preceded).then_some(root)
     })
 }
 
+/// The baseline, checked to be the real one: an empty or truncated file
+/// would pass every check below.
+fn checked_baseline() -> String {
+    let text = baseline();
+    assert!(
+        text.lines().count() > 1000
+            && text
+                .lines()
+                .any(|l| l.starts_with("pub fn tylertoo_core::convert_to_overviews")),
+        "api/tylertoo-core.txt is not the public-API baseline (too short, or no \
+         `pub fn tylertoo_core::convert_to_overviews`); regenerate it"
+    );
+    text
+}
+
 #[test]
-fn the_stable_surface_names_no_third_party_data_types() {
-    let leaks: Vec<_> = baseline()
+fn the_stable_surface_names_only_allowed_path_roots() {
+    let text = checked_baseline();
+    let leaks: Vec<_> = text
         .lines()
-        .filter_map(|line| names_forbidden_crate(line).map(|krate| format!("{krate}  {line}")))
+        .flat_map(|line| {
+            path_roots(line)
+                .filter(|root| !ALLOWED_ROOTS.contains(root))
+                .map(move |root| format!("{root}  {line}"))
+        })
         .collect();
     assert!(
         leaks.is_empty(),
-        "stable signatures name third-party types; move them behind \
-         `tylertoo_core::internal` or `#[doc(hidden)]`:\n{}",
+        "stable signatures name dependency types; move them behind \
+         `tylertoo_core::internal` or `#[doc(hidden)]`, or wrap them:\n{}",
         leaks.join("\n")
     );
 }
@@ -66,7 +89,7 @@ fn core_paths(text: &str) -> impl Iterator<Item = &str> {
 
 #[test]
 fn every_type_a_stable_signature_names_is_stable() {
-    let text = baseline();
+    let text = checked_baseline();
     // The item each `pub struct|enum|trait|type|fn|const|static|mod` line declares.
     let declared: BTreeSet<&str> = text
         .lines()
@@ -110,16 +133,18 @@ fn every_type_a_stable_signature_names_is_stable() {
 }
 
 #[test]
-fn the_crate_matcher_ignores_longer_identifiers() {
-    assert_eq!(names_forbidden_crate("pub fn f(geo::Point)"), Some("geo::"));
+fn the_root_matcher_finds_only_path_starts() {
+    let roots = |line| path_roots(line).collect::<Vec<_>>();
+    assert_eq!(roots("pub fn f(prost::error::DecodeError)"), ["prost"]);
+    assert_eq!(roots("(&arrow_schema::Schema)"), ["arrow_schema"]);
     assert_eq!(
-        names_forbidden_crate("(&arrow_schema::Schema)"),
-        Some("arrow_")
+        roots("<__S as serde_core::ser::Serializer>::Ok"),
+        ["serde_core"]
     );
-    assert_eq!(names_forbidden_crate("pub fn f(my_geo::Point)"), None);
-    assert_eq!(names_forbidden_crate("pub fn sparrow_count()"), None);
     assert_eq!(
-        names_forbidden_crate("pub fn tylertoo_core::X::arrow_bytes()"),
-        None
+        roots("pub fn tylertoo_core::X::arrow_bytes()"),
+        ["tylertoo_core"]
     );
+    assert_eq!(roots("pub type Self::Err = u8"), ["Self"]);
+    assert!(roots("pub fn sparrow_count()").is_empty());
 }
