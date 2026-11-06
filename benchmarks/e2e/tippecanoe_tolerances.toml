@@ -22,6 +22,14 @@
 # intended change that moves a ratio - closing a divergence, a new default -
 # updates the band in the same PR, with the new measurement in the comment.
 #
+# 2026-11-06 (#443, v0.9 freeze): with no --feature-id, export now writes NO
+# MVT feature id (tippecanoe's default), so every tylertoo tile is smaller.
+# Only the open-buildings and road-detections BYTE bands that failed moved,
+# by the same relative margins as before: open-buildings total 1.326 -> 1.231
+# and z13 1.022 -> 0.958; road-detections total 0.921 -> 0.826, z8 0.575 ->
+# 0.486 ... z14 1.095 -> 1.020 (-7% to -16%, largest where tiles are
+# smallest). Tile, feature, vertex and tile-median ratios are unchanged.
+#
 # The recurring divergences behind the bands, all in context/ARCHITECTURE.md
 # "Known Divergences from Tippecanoe":
 #
@@ -167,7 +175,7 @@ tile_features_median = [0.99, 1.01]  # measured 1.000 over 113,991 shared tiles
 tiles = [1.03, 1.12]          # measured 1.078 (97 / 90): tylertoo tiles at z0-z4
 features = [1.25, 1.38]       # measured 1.316 (0.537 before #745)
 vertices = [1.10, 1.21]       # measured 1.157 (0.519 before #745)
-bytes = [1.26, 1.39]          # measured 1.326 (archive size; 0.754 before #745)
+bytes = [1.17, 1.29]          # measured 1.231 (archive size; 1.326 before #443; 0.754 before #745)
 
 # z5-z8: tippecanoe emits one tile per zoom holding 1-97 placeholder squares;
 # tylertoo 249-257 (the #749 overshoot). Below min_reference; not gated.
@@ -198,7 +206,7 @@ zooms = [13, 13]
 tiles = [0.95, 1.05]          # measured 1.000 (20 / 20)
 features = [0.97, 1.04]       # measured 1.003 (1,061 / 1,058; 0.897 before #745)
 vertices = [0.77, 0.87]       # measured 0.823
-bytes = [0.97, 1.07]          # measured 1.022
+bytes = [0.91, 1.01]          # measured 0.958 (1.022 before #443)
 tile_features_median = [0.95, 1.05]  # measured 1.000 over 20 shared tiles
 
 [[datasets."open-buildings".zoom_bands]]
@@ -219,7 +227,7 @@ tile_features_median = [0.99, 1.01]  # measured 1.000 over 52 shared tiles
 tiles = [0.93, 0.99]          # measured 0.963 (79 / 82): z0-z3 are tippecanoe-only (D)
 features = [0.63, 0.70]       # measured 0.663: (A) at z4-z10
 vertices = [0.60, 0.68]       # measured 0.636
-bytes = [0.88, 0.96]          # measured 0.921 (archive size)
+bytes = [0.79, 0.86]          # measured 0.826 (archive size; 0.921 before #443)
 
 # z0-z3: tippecanoe emits one tile per zoom with 34-213 line instances;
 # tylertoo emits no tile (D). Not gated.
@@ -242,31 +250,31 @@ bytes = [0.32, 0.48]          # measured 0.396
 zooms = [8, 8]
 features = [0.34, 0.47]       # measured 0.402 (423 / 1,053)
 vertices = [0.28, 0.41]       # measured 0.340
-bytes = [0.50, 0.66]          # measured 0.575
+bytes = [0.42, 0.56]          # measured 0.486 (0.575 before #443)
 
 [[datasets."road-detections".zoom_bands]]
 zooms = [9, 9]
 features = [0.62, 0.76]       # measured 0.691 (725 / 1,049)
 vertices = [0.45, 0.60]       # measured 0.525
-bytes = [0.72, 0.88]          # measured 0.803
+bytes = [0.61, 0.74]          # measured 0.675 (0.803 before #443)
 
 [[datasets."road-detections".zoom_bands]]
 zooms = [10, 10]
 features = [0.88, 0.97]       # measured 0.924 (932 / 1,009): end of the ramp
 vertices = [0.57, 0.71]       # measured 0.639
-bytes = [0.90, 1.01]          # measured 0.952
+bytes = [0.76, 0.85]          # measured 0.804 (0.952 before #443)
 
 # z11-z13: every line present on both sides; (B) on vertices.
 [[datasets."road-detections".zoom_bands]]
 zooms = [11, 13]
 features = [0.97, 1.02]       # measured 0.993, 0.998, 0.998
 vertices = [0.60, 0.90]       # measured 0.677, 0.723, 0.844
-bytes = [0.95, 1.09]          # measured 0.991, 1.004, 1.041
+bytes = [0.81, 0.99]          # measured 0.845, 0.876, 0.943 (0.991, 1.004, 1.041 before #443)
 
 [[datasets."road-detections".zoom_bands]]
 zooms = [14, 14]
 tiles = [0.97, 1.06]          # measured 1.025 (41 / 40): one extra seam tile (C)
 features = [0.99, 1.02]       # measured 1.005
 vertices = [0.98, 1.06]       # measured 1.020
-bytes = [1.04, 1.15]          # measured 1.095
+bytes = [0.97, 1.07]          # measured 1.020 (1.095 before #443)
 tile_features_median = [0.99, 1.01]  # measured 1.000 over 40 shared tiles
