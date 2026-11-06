@@ -2190,6 +2190,15 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     non_negative("polygon-thinning", options.assign.polygon_thinning)?;
     non_negative("line-visibility", options.assign.line_visibility)?;
     non_negative("polygon-visibility", options.assign.polygon_visibility)?;
+    non_negative("simplify-factor", options.simplify.factor)?;
+    // Below 1 the budget used to clamp silently to 1; refuse it instead.
+    if options.density.gamma < 1.0 {
+        return Err(ConvertError::InvalidConfig(format!(
+            "--drop-gamma must be at least 1 (got {}). Use 1 for a proportional cut, or \
+             --no-density-drop to turn the density budget off.",
+            options.density.gamma
+        )));
+    }
     if let Some(bb) = options.bbox {
         if bb.iter().any(|v| !v.is_finite()) || bb[0] > bb[2] || bb[1] > bb[3] {
             return Err(super::config::ConfigError::InvalidBbox { bbox: bb }.into());

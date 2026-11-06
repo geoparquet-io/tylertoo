@@ -2036,7 +2036,7 @@ pub struct DensityBudgetConfig {
     ))]
     #[cfg_attr(feature = "cli", arg(help = "Density budget decay: each coarser level keeps 1/rate of the next finer level's feature budget. Larger values thin mid zooms more", long_help = None))]
     pub drop_rate: f64,
-    /// Spatial-fairness strength (`>= 1`). `1.0` = proportional cut; larger =
+    /// Spatial-fairness strength (`>= 1`; smaller is rejected by validation). `1.0` = proportional cut; larger =
     /// sublinear, protecting sparse neighborhoods (dense areas kept to the
     /// `1/gamma` power of their population).
     #[serde(rename = "drop_gamma")]
@@ -2045,7 +2045,7 @@ pub struct DensityBudgetConfig {
         default_value_t = Self::default().gamma,
         help_heading = "Density budget"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Sparse-area protection: 1 reduces every neighborhood equally; larger values protect sparse areas more", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Sparse-area protection, at least 1: 1 reduces every neighborhood equally; larger values protect sparse areas more. Smaller values are rejected", long_help = None))]
     pub gamma: f64,
     /// Which geometry kinds the budget thins (#745). A kind left out keeps
     /// its cell-winner level and does not count toward `N`. Default: points
@@ -2460,7 +2460,7 @@ pub(super) fn select_budget_survivors(
         .for_each(|run| run.sort_unstable_by(|a, b| priority_order(features, dir, a.1, b.1)));
     drop(runs);
 
-    let alpha = 1.0 / gamma.max(1.0);
+    let alpha = 1.0 / gamma;
     let allocs = water_fill(&pops, available, alpha);
 
     let mut chosen = Vec::with_capacity(available);
@@ -4581,7 +4581,7 @@ mod tests {
         }
         assert!(cells.len() > 1, "the replay must span several super-cells");
         let pops: Vec<usize> = cells.values().map(Vec::len).collect();
-        let allocs = water_fill(&pops, available, 1.0 / gamma.max(1.0));
+        let allocs = water_fill(&pops, available, 1.0 / gamma);
         let mut expected: Vec<usize> = Vec::new();
         for ((_, members), alloc) in cells.iter_mut().zip(allocs) {
             members.sort_unstable_by(|&a, &b| table_order(&prio, a, b));

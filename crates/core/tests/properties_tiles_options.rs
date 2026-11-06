@@ -34,9 +34,8 @@ fn documented(knob: usize, v: f64) -> Option<bool> {
         0 => Some((1.0..=1_048_576.0).contains(&v.trunc()) && v >= 0.0),
         1 => non_finite.then_some(false),
         2 => Some(!non_finite && v >= 0.0).filter(|ok| *ok || non_finite),
-        // "exponent (>=1)" in OVERVIEW_TUNING.md; only finiteness is
-        // enforced (FOLLOWUP-drop-gamma), so below 1 is not asserted here.
-        3 => (non_finite || v >= 1.0).then_some(v.is_finite()),
+        // "exponent (>=1)" in OVERVIEW_TUNING.md.
+        3 => Some(v.is_finite() && v >= 1.0),
         _ => (v >= 0.0).then_some(v.trunc() >= 1.0),
     }
 }
@@ -105,18 +104,17 @@ fn documented_boundaries() {
     check(3, 1.0).unwrap();
 }
 
-/// `OVERVIEW_TUNING.md` documents `--drop-gamma` as an exponent >= 1, but
-/// core accepts anything finite. Strict expected failure: when the follow-up
-/// lands this stops panicking and must be un-marked.
+/// `--drop-gamma` is an exponent >= 1; below that is refused, naming the flag.
 #[test]
-#[should_panic(expected = "FOLLOWUP-drop-gamma")]
 fn drop_gamma_below_one_is_refused() {
-    for v in [0.0, 0.5, -1.0] {
+    for v in [0.0, 0.5, -1.0, f64::NAN] {
         let mut o = TilesOptions::default();
         o.convert.density.gamma = v;
+        let e = o.validate().expect_err("gamma below 1 must be refused");
+        assert!(e.to_string().contains("drop-gamma"), "{e}");
         assert!(
-            o.validate().is_err(),
-            "FOLLOWUP-drop-gamma: gamma={v} accepted"
+            v.is_nan() || e.to_string().contains("must be at least 1"),
+            "{e}"
         );
     }
 }
