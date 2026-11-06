@@ -5914,9 +5914,27 @@ fn collect_into(
             for p in &wave[1..] {
                 region.expand(&p.bbox);
             }
+            // #803: with variable depth the wave's tiles can be few and far
+            // apart (the rest stopped), so prune to each tile, not their union.
+            let regions: Vec<PruneRegion> = match ctx.tiles {
+                Some(tiles) => {
+                    let margin = 360.0 / 2f64.powi(i32::from(ctx.zoom));
+                    tiles
+                        .range(wave[0].key_lo..=wave[wave.len() - 1].key_hi)
+                        .map(|(&key, _)| {
+                            let (x, y) = key_to_xy(key, ctx.zoom);
+                            let mut r = PruneRegion::of(TileCoord::new(x, y, ctx.zoom).bounds());
+                            r.grow(margin);
+                            r
+                        })
+                        .collect()
+                }
+                None => vec![region],
+            };
             Some(
-                region
-                    .rects()
+                regions
+                    .iter()
+                    .flat_map(PruneRegion::rects)
                     .flat_map(|b| {
                         [0.0, -360.0, 360.0].map(|shift| {
                             [b.lng_min + shift, b.lat_min, b.lng_max + shift, b.lat_max]
