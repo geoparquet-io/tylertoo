@@ -67,8 +67,9 @@ pub(crate) fn check_options(options: &ExportOptions) -> Result<(), ConfigError> 
 
 /// The refusals the `tiles` facade checks against its convert options,
 /// before anything is read. Lines and polygons are never count-checked, so
-/// convert options that drop whole lines or polygons at coarse levels would
-/// let a coarse tile stop while hiding features its finer zooms show.
+/// under convert options that drop whole lines or polygons at coarse levels
+/// a stopped tile would draw, at its coarse zoom, the lines or polygons the
+/// user asked to be dropped there.
 ///
 /// # Errors
 ///

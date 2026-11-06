@@ -163,7 +163,7 @@ but draws more area between fields, and the build takes about 1.5× as long
 (`variable_depth=True` in Python), like tippecanoe's flag of the same name.
 Off by default. Each branch of the pyramid stops at the coarsest tile that
 can hold every finest-level feature under it within both size caps
-(`--tile-size-limit` raw and `--compressed-tile-size-limit` gzip), with no
+(`--max-tile-size` raw and `--max-compressed-tile-size` gzip), with no
 size valve. Nothing is stored below a stopped tile. Sparse areas end at a
 coarse zoom; dense ones go down to the finest.
 
@@ -176,8 +176,9 @@ with thinning off, 77 MB instead of 158 MB.
 A tile stops only when every coarser level agrees with the finest one in it.
 A tile is blocked when a coarser level holds a different number of points
 than the finest level in its buffered area, or holds a clustered point
-(`point_count > 1`): stopping there would freeze a thinned or clustered
-view at every deeper zoom. Lines and polygons are not counted, since
+(`point_count > 1`): the stopped tile would draw, at that coarser zoom,
+all the points the finest level holds, where you asked for them to be
+thinned or clustered. Lines and polygons are not counted, since
 simplification and the visibility gate only lose resolution, which the
 finest-level tile restores. A line or polygon with an entry zoom blocks every
 tile above its rung. With clustering or point thinning on, few tiles stop
