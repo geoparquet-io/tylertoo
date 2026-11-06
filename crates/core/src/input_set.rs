@@ -2273,7 +2273,7 @@ mod tests {
                 .resolved_schemas()
                 .unwrap()
                 .iter()
-                .map(|r| r.version()),
+                .map(|r| r.declared_version()),
         );
         assert_eq!(
             verdict,

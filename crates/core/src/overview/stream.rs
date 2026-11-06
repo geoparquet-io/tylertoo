@@ -2504,7 +2504,10 @@ fn preflight_with_memory_limit(
         super::convert::warn_assumed_wgs84(source, diagnostics);
     }
     let geo_version = crate::resolved_schema::GeoVersion::of_parts(
-        source.resolved_schemas()?.iter().map(|r| r.version()),
+        source
+            .resolved_schemas()?
+            .iter()
+            .map(|r| r.declared_version()),
     );
 
     // Reserved-column collisions (#288) are resolved BEFORE row-group

@@ -19,7 +19,7 @@ use tylertoo_io::Statistics;
 use crate::covering::find_bbox_column_indices;
 use crate::resolved_schema::ResolvedSchema;
 
-use super::level::{Mode, OverviewsMeta, COGP_KEY, OVERVIEWS_KEY};
+use super::level::{Mode, OverviewValidationError, OverviewsMeta, COGP_KEY, OVERVIEWS_KEY};
 use super::writer::LEVEL_COLUMN;
 
 /// The overviews-spec MAJOR version this validator supports (§3.8).
@@ -193,50 +193,57 @@ pub(crate) fn validate_resolved_metadata(
 
     // --- geo:overviews key present / parses / version / MAJOR (§6.2). --------
     let ov_json = footer_value(metadata, OVERVIEWS_KEY);
+    let mut validated = None;
     let meta: Option<OverviewsMeta> = match ov_json {
         None => {
             report.fail("overviews_key_present", "'geo:overviews' footer key absent");
             None
         }
-        Some(j) => match OverviewsMeta::from_json(&j) {
-            Err(e) => {
-                report.fail(
-                    "overviews_key_present",
-                    format!("'geo:overviews' is not valid JSON: {e}"),
-                );
-                None
-            }
-            Ok(meta) => {
-                report.pass(
-                    "overviews_key_present",
-                    "'geo:overviews' present and parses",
-                );
-                // version semver + MAJOR supported.
-                match parse_semver_major(&meta.version) {
-                    None => report.fail(
-                        "overviews_version",
-                        format!("version {:?} is not valid semver", meta.version),
-                    ),
-                    Some(major) if major != SUPPORTED_MAJOR => report.fail(
-                        "overviews_version",
-                        format!("unsupported MAJOR version {major} (supported: {SUPPORTED_MAJOR})"),
-                    ),
-                    Some(_) => report.pass(
-                        "overviews_version",
-                        format!(
-                            "version {} (MAJOR {SUPPORTED_MAJOR} supported)",
-                            meta.version
-                        ),
-                    ),
+        Some(j) => {
+            match OverviewsMeta::from_json(&j) {
+                Err(e) => {
+                    report.fail(
+                        "overviews_key_present",
+                        format!("'geo:overviews' is not valid JSON: {e}"),
+                    );
+                    None
                 }
-                Some(meta)
+                Ok(meta) => {
+                    report.pass(
+                        "overviews_key_present",
+                        "'geo:overviews' present and parses",
+                    );
+                    // Validation checks the version before structural invariants.
+                    let result = meta.validate(num_row_groups as i64);
+                    match &result {
+                        Err(OverviewValidationError::InvalidVersion(v)) => report.fail(
+                            "overviews_version",
+                            format!("version {v:?} is not valid semver"),
+                        ),
+                        Err(OverviewValidationError::UnsupportedVersion(v)) => report.fail(
+                            "overviews_version",
+                            format!(
+                                "unsupported MAJOR version in {v:?} (supported: {SUPPORTED_MAJOR})"
+                            ),
+                        ),
+                        _ => report.pass(
+                            "overviews_version",
+                            format!(
+                                "version {} (MAJOR {SUPPORTED_MAJOR} supported)",
+                                meta.version
+                            ),
+                        ),
+                    }
+                    validated = Some(result);
+                    Some(meta)
+                }
             }
-        },
+        }
     };
 
     // --- structural invariants via level::validate (§3.3, §3.4). ------------
-    if let Some(meta) = &meta {
-        match meta.validate(num_row_groups as i64) {
+    if let (Some(meta), Some(validated)) = (&meta, validated) {
+        match validated {
             Ok(()) => report.pass(
                 "overviews_structure",
                 "levels/gsd/zoom/canonical invariants satisfied",
@@ -903,6 +910,7 @@ fn find_level_column(metadata: &ParquetMetaData) -> Option<usize> {
     (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == LEVEL_COLUMN)
 }
 
+#[cfg(test)]
 use super::level::parse_semver_major;
 
 /// Fuzz hook (#633): decode `thrift` as a Parquet footer (the bytes before
@@ -1296,6 +1304,35 @@ mod tests {
         assert_eq!(report.check_passed("overviews_key_present"), Some(false));
         assert_eq!(report.check_passed("geoparquet_geo_metadata"), Some(false));
         assert_eq!(report.check_passed("level_column"), Some(false));
+    }
+
+    /// #708: a non-string `geo.version` is not a version; the geo-metadata
+    /// check must keep failing it rather than accept a made-up string.
+    #[test]
+    fn numeric_geo_version_fails_the_geo_metadata_check() {
+        use tylertoo_io::test_support::ArrowWriter;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "geometry",
+            DataType::Binary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::BinaryArray::from_iter_values([b"x"]))],
+        )
+        .unwrap();
+        let file = File::create(tmp.path()).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.append_key_value_metadata(tylertoo_io::KeyValue::new(
+            "geo".to_string(),
+            r#"{"version":1.1,"primary_column":"geometry","columns":{"geometry":{"encoding":"WKB"}}}"#
+                .to_string(),
+        ));
+        w.close().unwrap();
+        let report = validate_file(tmp.path()).unwrap();
+        assert_eq!(report.check_passed("geoparquet_geo_metadata"), Some(false));
     }
 
     // --- Q4 clustering checks -------------------------------------------------

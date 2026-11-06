@@ -134,7 +134,9 @@ impl ResolvedSchema {
         );
         let version = geo
             .as_ref()
-            .and_then(declared_version)
+            .and_then(|g| g.get("version"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
             .or_else(|| native.as_ref().map(|_| "2.0.0".to_owned()));
         let covering = geo_json
             .as_deref()
@@ -273,9 +275,24 @@ impl ResolvedSchema {
             crate::quality::CrsKind::Unknown => None,
         }
     }
-    /// GeoParquet version, including native 2.0 without a geo key.
+    /// GeoParquet version, including native 2.0 without a geo key. `None`
+    /// when the `geo` metadata declares none or declares a non-string.
     pub fn version(&self) -> Option<&str> {
         self.facts.version.as_deref()
+    }
+
+    /// The version the report classifies: [`Self::version`], except that a
+    /// non-string `geo.version` is kept (as `"non-string <json>"`, which
+    /// classifies unknown) instead of vanishing (#708).
+    pub(crate) fn declared_version(&self) -> Option<String> {
+        let geo = self
+            .facts
+            .geo_json
+            .as_deref()
+            .and_then(|j| parse_geo_json(j).ok());
+        geo.as_ref()
+            .and_then(declared_version)
+            .or_else(|| self.facts.version.clone())
     }
     /// Schema indices of data properties, excluding all geometry and covering fields.
     pub fn properties(&self) -> &[usize] {
@@ -815,8 +832,13 @@ pub enum GeoVersion {
 
 impl GeoVersion {
     /// Fold the per-part versions (one item per part, in any order).
-    pub(crate) fn of_parts<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Self {
-        let distinct: std::collections::BTreeSet<Option<&str>> = parts.into_iter().collect();
+    pub(crate) fn of_parts<S: AsRef<str>>(parts: impl IntoIterator<Item = Option<S>>) -> Self {
+        let owned: Vec<Option<String>> = parts
+            .into_iter()
+            .map(|v| v.map(|s| s.as_ref().to_owned()))
+            .collect();
+        let distinct: std::collections::BTreeSet<Option<&str>> =
+            owned.iter().map(Option::as_deref).collect();
         match distinct.iter().next().copied() {
             Some(first) if distinct.len() == 1 => match first {
                 None => Self::Missing,

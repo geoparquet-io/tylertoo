@@ -10,12 +10,10 @@ drift apart.
 
 !!! warning "Draft specification"
 
-    `geo:overviews` is a **draft**. The format can still change in
-    response to implementation experience and GeoParquet community
-    review. The formal stability declaration — the compatibility
-    promise tylertoo 1.0 makes to files it has already written — is
-    not yet part of this document; it is tracked in
-    [#441](https://github.com/geoparquet-io/tylertoo/issues/441).
+    `geo:overviews` is a **draft** and remains at format version 0.x.
+    Its version is independent of the tylertoo release version. Readers reject
+    a foreign MAJOR version and accept newer MINOR versions, ignoring unknown
+    fields as specified below.
 
 !!! info "Status"
 

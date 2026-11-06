@@ -90,6 +90,25 @@ still helps where polygons stay drawable (Moldova at z5: 22% of the field
 area missing at the default, 13% at 0.25, 12% at 0), but in dense blocks the
 squares themselves overlap and leave gaps regardless of the factor (#750).
 
+Madagascar admin-4 (17,465 polygons, a gap-free coverage) at the coarse
+zooms, where most polygons are drawn as placeholder squares. Missing share of
+the source area, mean over the tiles with at least 1% source cover
+(`tile_metrics.py`, 128 px per tile; 4, 4, 5, 15, and 42 tiles at z4–z8):
+
+| Settings | z4 | z5 | z6 | z7 | z8 |
+|---|---|---|---|---|---|
+| default | 11.78% | 4.46% | 1.73% | 0.64% | 0.29% |
+| `--simplify-factor 0.25` | 2.17% | 0.85% | 0.29% | 0.11% | 0.07% |
+| `--simplify-factor 0` | 0.44% | 0.07% | 0.07% | 0.04% | 0.02% |
+| default + `--coverage-fill` | 0.05% | 0.03% | 0.04% | 0.03% | 0.04% |
+| `--simplify-factor 0` + `--coverage-fill` | 0.02% | 0.01% | 0.02% | 0.01% | 0.01% |
+
+With `--coverage-fill` on, residual missing coverage is 0.03–0.05% of the
+area at z4–z8 at the defaults. The tile counts are small because Madagascar
+is small and this is one country; they are nearly every tile at each zoom.
+The archive grows from 26.9 MB (default) to 29.3 MB (`0.25`) and 33.5 MB
+(`0`).
+
 ### What merging does to attributes
 
 Merging follows tippecanoe's `--coalesce-densest-as-needed`. The merged
@@ -212,7 +231,10 @@ smaller of two measures, in Web Mercator meters:
 - the median size of the features that have an extent
 - the tenth-percentile spacing between nearby features
 
-The result is clamped to `[--min-zoom, 16]` and logged with its measurements
+The result is clamped to `[--min-zoom, 16]`. Use `--max-zoom auto:14`
+(Python: `max_zoom="auto:14"`) to cap it further at z14. The cap must be
+between the minimum zoom and 30; values above 16 leave the auto ceiling at 16.
+The chosen zoom is logged with its measurements
 at `info`. Treat it as a starting point. From Python, the line reaches
 `logging` at `INFO` under the `tylertoo_core` logger, and the finest `zoom`
 in the report's `levels` gives the chosen zoom.
@@ -1279,8 +1301,7 @@ one stable sort per tile over features already in memory.
 
 ## Stable feature ids: `--feature-id`
 
-Every MVT feature carries an `id`, defaulting to its position in one tile
-at one zoom. This tile-local id can change across tiles and zooms.
+By default MVT features have no `id`.
 
 `--feature-id COLUMN` writes the column's value as the feature id instead, on
 every tile and zoom the feature appears in. It matches tippecanoe's
@@ -1329,9 +1350,8 @@ map.setFeatureState({ source, sourceLayer, id }, { hover: true });
   give features that share an id, and feature state then applies to all
   of them at once.
 
-`pyramid` does not take `--feature-id`, and neither do the Python
-`pyramid()` and `convert()` one-shot. Use `overview()` and then
-`export_pmtiles(..., feature_id=...)` instead.
+`pyramid` also accepts `--feature-id`. The Python `convert()`, `pyramid()`,
+and `export_pmtiles()` functions accept `feature_id`.
 
 ---
 

@@ -532,8 +532,10 @@ fn numeric_geo_version_is_unknown_in_the_warning_and_the_report() {
         .into(),
     );
     let resolved = super::ResolvedSchema::resolve(&schema).unwrap();
+    // The public accessor never invents a version string.
+    assert_eq!(resolved.version(), None);
     assert_eq!(
-        GeoVersion::of_parts([resolved.version()]),
+        GeoVersion::of_parts([resolved.declared_version()]),
         GeoVersion::Unknown("non-string 1.1".into())
     );
     assert_eq!(

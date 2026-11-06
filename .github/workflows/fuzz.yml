@@ -11,7 +11,7 @@
 # here touches the per-PR build. One matrix job per target keeps a crash in
 # one parser from hiding the others' results; the `notify` job then opens or
 # updates a single pinned `fuzz` issue when any target failed, following the
-# mutation-tests.yml pattern.
+# retired mutation workflow pattern.
 #
 # A crash uploads fuzz/artifacts/<target>/ (the reproducer input) as a job
 # artifact. Minimize it with `cargo +nightly fuzz tmin <target> <artifact>`
@@ -22,7 +22,7 @@ name: Nightly Fuzz
 
 on:
   schedule:
-    # Every day at 3 AM UTC (an hour after the Sunday mutation run starts).
+    # Every day at 3 AM UTC.
     - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
@@ -202,7 +202,7 @@ jobs:
       actions: read
     steps:
       - name: Open or update the fuzz issue
-        # Ported from mutation-tests.yml. Any failing target — a crash, a
+        # Ported from the retired weekly mutation workflow. Any failing target — a crash, a
         # timeout, an OOM, or a build failure — gets one pinned `fuzz` issue
         # that is updated, not duplicated, on every failing run.
         env:
