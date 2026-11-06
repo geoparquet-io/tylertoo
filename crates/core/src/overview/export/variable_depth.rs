@@ -186,9 +186,9 @@ fn file_kinds(geo_json: Option<&str>) -> Kinds {
 }
 
 /// #794's hook: a rule that releases a canonical row only from some zoom on.
-/// A tile that would carry the row before its release cannot stop, so the
-/// row's member tile one zoom above its release, and every ancestor of it,
-/// is blocked.
+/// A tile that would carry the row before its release cannot stop, so every
+/// tile a coarser level's buffer gives the row, and its ancestors, is
+/// blocked.
 pub(crate) trait RowRelease: Sync + Send {
     /// The canonical columns the rule reads, by name.
     fn columns(&self) -> &[String];
@@ -619,16 +619,23 @@ impl VdScan {
                 );
             }
             if let Some(release) = &self.release {
-                let zooms = release.release_zooms(batch, aligned);
-                let mut by_zoom: HashMap<u8, Vec<Option<TileBounds>>> = HashMap::new();
-                for (z, b) in zooms.iter().zip(aligned) {
-                    if *z > 0 && b.is_some() {
-                        by_zoom.entry(*z - 1).or_default().push(*b);
+                // A row is bad in every tile a coarser level's own buffer
+                // gives it, not only its rung's parent and that tile's
+                // ancestors: a coarser buffer reaches farther. Only level
+                // zooms are sized, so a rung past the finest level releases
+                // the row there, as convert clamps it.
+                let released = release.release_zooms(batch, aligned);
+                for &zoom in coarser {
+                    let early: Vec<Option<TileBounds>> = released
+                        .iter()
+                        .zip(aligned)
+                        .filter(|&(&r, _)| r > zoom)
+                        .map(|(_, b)| *b)
+                        .collect();
+                    if !early.is_empty() {
+                        self.bad
+                            .extend(tile_keys(&early, zoom, opts).into_keys().map(|k| (zoom, k)));
                     }
-                }
-                for (zoom, rows) in by_zoom {
-                    self.bad
-                        .extend(tile_keys(&rows, zoom, opts).into_keys().map(|k| (zoom, k)));
                 }
             }
             return Ok(());
@@ -1620,6 +1627,50 @@ mod tests {
                 "unladdered z{z}"
             );
         }
+    }
+
+    /// An entry rung past the export's finest zoom releases its rows at the
+    /// finest level, as convert clamps it: the scan never sizes a row at a
+    /// zoom the export does not have (z29 here, billions of keys).
+    #[test]
+    fn entry_rung_past_the_range_is_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = [square(10.0, 45.0, 0.1), square(-70.0, -30.0, 0.5)];
+        let v = [5.0, 1.0];
+        let convert = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "v".into(),
+                kind: EntryZoomKind::Explicit(vec![(5.0, 30)]),
+            }),
+            ..ConvertOptions::default()
+        };
+        let ov = overview_v(dir.path(), &geoms, &v, 6, convert);
+        let plan = plan(&ov);
+        for z in 0..6 {
+            assert!(!plan.policy.may_stop(z, key_at(10.05, 45.05, z)), "z{z}");
+        }
+    }
+
+    /// A row released at z4 is blocked at every coarser level by that
+    /// level's own buffered tiles: the z1 buffer (5.6°) reaches the western
+    /// z1/0/0 from 2°E, which no z3 tile's ancestors include.
+    #[test]
+    fn entry_blocks_each_level_by_its_own_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = [square(2.0, 10.0, 0.1), square(-80.0, 20.0, 20.0)];
+        let v = [5.0, 1.0];
+        let mut convert = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "v".into(),
+                kind: EntryZoomKind::Explicit(vec![(5.0, 4)]),
+            }),
+            ..ConvertOptions::default()
+        };
+        convert.density.enabled = false;
+        let ov = overview_v(dir.path(), &geoms, &v, 6, convert);
+        let plan = plan(&ov);
+        assert!(!plan.policy.may_stop(1, tile_key(0, 0, 1)));
+        assert!(!plan.policy.may_stop(1, tile_key(1, 0, 1)));
     }
 
     // --- the probe -----------------------------------------------------------
