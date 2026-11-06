@@ -44,14 +44,14 @@ _KNOBS: dict[str, Any] = {
         _FLOATS,
         "simplify.factor",
         _finite_ge(0),
-        lambda v: not math.isfinite(v),
+        lambda v: not (math.isfinite(v) and v >= 0),
     ),
-    # Documented "exponent (>=1)"; only finiteness is enforced (FOLLOWUP-drop-gamma).
+    # Documented "exponent (>=1)".
     "drop_gamma": (
         _FLOATS,
         "drop.gamma",
         _finite_ge(1),
-        lambda v: not math.isfinite(v),
+        lambda v: not (math.isfinite(v) and v >= 1),
     ),
 }
 # Boundary values, so a loosened bound fails deterministically.
@@ -63,7 +63,11 @@ _BOUNDARIES += [
     for k in ("simplify_factor", "drop_gamma")
     for v in (math.nan, math.inf, -math.inf)
 ]
-_BOUNDARIES += [("simplify_factor", 0.0), ("drop_gamma", 1.0)]
+_BOUNDARIES += [
+    ("simplify_factor", 0.0),
+    ("simplify_factor", -1.0),
+    ("drop_gamma", 1.0),
+]
 
 
 def _outcome(keyword: str, value: object) -> BaseException:
@@ -107,9 +111,6 @@ def test_documented_ranges(data: st.DataObject, keyword: str) -> None:
     _check(keyword, data.draw(_KNOBS[keyword][0]))
 
 
-@pytest.mark.xfail(
-    strict=True, reason="FOLLOWUP-drop-gamma: documented >=1, not enforced"
-)
 @pytest.mark.parametrize("value", [0.0, 0.5, -1.0])
 def test_drop_gamma_below_one_is_refused(value: float) -> None:
     assert isinstance(_outcome("drop_gamma", value), tylertoo.ConfigError)
