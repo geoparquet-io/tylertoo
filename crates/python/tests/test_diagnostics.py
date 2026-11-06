@@ -155,11 +155,11 @@ def test_report_carries_the_crs_assumption_and_geo_version(tmp_path):
         "geometry", pa.binary(), metadata={"ARROW:extension:name": "geoarrow.wkb"}
     )
     cases = {
-        "none": (None, True, None, False),
-        "future": ("3.0.0", False, "3.0.0", False),
-        "known": ("1.1.0", False, "1.1.0", True),
+        "none": (None, True, {"status": "missing"}),
+        "future": ("3.0.0", False, {"status": "unknown", "version": "3.0.0"}),
+        "known": ("1.1.0", False, {"status": "known", "version": "1.1.0"}),
     }
-    for name, (version, assumed, shown, known) in cases.items():
+    for name, (version, assumed, expected) in cases.items():
         schema = pa.schema([field, pa.field("id", pa.int64())])
         if version:
             geo = {
@@ -177,5 +177,4 @@ def test_report_carries_the_crs_assumption_and_geo_version(tmp_path):
             str(source), str(tmp_path / f"{name}-out.parquet"), max_zoom=2
         )
         assert report["crs_assumed_wgs84"] is assumed, name
-        assert report["geo_version"] == shown, name
-        assert report["geo_version_known"] is known, name
+        assert report["geo_version"] == expected, name

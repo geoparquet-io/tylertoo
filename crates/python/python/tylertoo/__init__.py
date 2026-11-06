@@ -168,6 +168,17 @@ class SpilledSourceLosses(TypedDict):
     path: str
 
 
+GeoVersion = TypedDict(  # noqa: UP013 - keys describe serialized report data
+    "GeoVersion",
+    {
+        "status": "Literal['known', 'unknown', 'missing', 'mixed']",
+        "version": "str | list[str]",
+    },
+    total=False,
+)
+GeoVersion.__doc__ = """GeoParquet version verdict; `version` is absent when missing."""
+
+
 OverviewReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
     "OverviewReport",
     {
@@ -188,8 +199,7 @@ OverviewReport = TypedDict(  # noqa: UP013 - keys describe serialized report dat
         "out_of_range_features": "int",
         "unprojectable_features": "int",
         "crs_assumed_wgs84": "bool",
-        "geo_version": "str | None",
-        "geo_version_known": "bool",
+        "geo_version": "GeoVersion",
         "out_of_range_exemplars": "list[OutOfRangeExemplar]",
         "wrapped_features": "int",
         "duration_secs": "float",
@@ -216,11 +226,13 @@ Attributes:
     crs_assumed_wgs84: True when the input declared no CRS and
         lon/lat WGS84 was assumed. If the coordinates are not
         lon/lat degrees, the output is misplaced.
-    geo_version: The input's GeoParquet version, or None when it
-        declared none (a multi-file input reports the first file's).
-    geo_version_known: False when `geo_version` is missing or a major
-        tylertoo does not know (it reads 1.x and 2.x); the metadata was
-        then read best-effort and may be misread.
+    geo_version: The input's GeoParquet version across all its files:
+        `{"status": "known", "version": "1.1.0"}` (every file declares
+        it, a major tylertoo reads: 1.x, 2.x); `"unknown"` (same shape,
+        an unreadable major, so metadata may be misread); `"missing"`
+        (no `version` key); or `"mixed"` with `version` a list of the
+        distinct versions (`"missing"` for a file with none). Anything
+        but "known" also logged a warning.
     effective_max_row_group_size: The row-group cap actually used,
         when it had to be raised above `row_group_size` to keep the
         file under Parquet's row-group limit. None otherwise."""

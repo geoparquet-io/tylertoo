@@ -51,6 +51,7 @@ dev = [
     "vulture>=2.13",
     "xenon>=0.9",
     "pip-audit>=2.7",
+    "pyarrow>=21.0.0",
 ]
 # Tools the tutorials call and the site builder (tests/docs, docs.yml).
 # Exact pins: tutorial output is compared line by line, and zensical is

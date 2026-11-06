@@ -592,6 +592,15 @@ impl ConvertSource {
         }
     }
 
+    /// The input's path (a multi-part input's root directory or glob), as
+    /// opposed to [`Self::display_name`]'s label.
+    pub fn root_path(&self) -> String {
+        match self {
+            ConvertSource::Single(s) => s.input().display_name(),
+            ConvertSource::Multi(m) => m.root.clone(),
+        }
+    }
+
     /// Human-readable input name: the path/URL for a single source,
     /// `"<root> (N partitions)"` for a multi source.
     pub fn display_name(&self) -> String {
@@ -1311,7 +1320,12 @@ fn load_part_meta(source: &InputSource) -> Result<PartMeta, InputError> {
     // footer parse and no second `ARROW:schema` decode.
     let reader = builder.reader_metadata().clone();
     let resolved = crate::resolved_schema::ResolvedSchema::from_parquet(builder.schema(), &parquet)
-        .map_err(|e| InputError::Parquet(tylertoo_io::ParquetError::General(e.to_string())))?;
+        .map_err(|e| {
+            InputError::Parquet(tylertoo_io::ParquetError::General(format!(
+                "{}: {e}",
+                source.display_name()
+            )))
+        })?;
     Ok(PartMeta {
         resolved: Arc::new(resolved),
         schema: builder.schema().clone(),
@@ -2227,6 +2241,63 @@ mod tests {
                 other => panic!("expected IncompatiblePartition, got {other:?}"),
             }
         }
+    }
+
+    /// #708: the version verdict covers every part, not part 0.
+    #[test]
+    fn geo_version_covers_every_part() {
+        use crate::resolved_schema::GeoVersion;
+        let dir = tmpdir();
+        for (file, v) in [("a.parquet", "1.1.0"), ("b.parquet", "3.0.0")] {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1i64])) as ArrayRef],
+            )
+            .unwrap();
+            let mut w =
+                ArrowWriter::try_new(File::create(dir.path().join(file)).unwrap(), schema, None)
+                    .unwrap();
+            w.write(&batch).unwrap();
+            w.append_key_value_metadata(tylertoo_io::KeyValue::new(
+                "geo".to_string(),
+                format!(
+                    r#"{{"version":"{v}","primary_column":"geometry","columns":{{"geometry":{{"crs":"EPSG:4326"}}}}}}"#
+                ),
+            ));
+            w.close().unwrap();
+        }
+        let source = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
+        let verdict = GeoVersion::of_parts(
+            source
+                .resolved_schemas()
+                .unwrap()
+                .iter()
+                .map(|r| r.version()),
+        );
+        assert_eq!(
+            verdict,
+            GeoVersion::Mixed(vec!["1.1.0".into(), "3.0.0".into()])
+        );
+    }
+
+    /// #708: a non-object `geo` value names the file and the remedy.
+    #[test]
+    fn non_object_geo_error_names_the_file_and_the_fix() {
+        let dir = tmpdir();
+        let path = dir.path().join("bad.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mut w = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(tylertoo_io::KeyValue::new(
+            "geo".to_string(),
+            "[]".to_string(),
+        ));
+        w.close().unwrap();
+        let msg = ConvertSource::resolve(path.to_str().unwrap())
+            .and_then(|s| s.resolved_schema().map(|_| ()))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("bad.parquet") && msg.contains("gpio"), "{msg}");
     }
 
     /// A field-metadata mismatch must say WHAT differs: the key and a

@@ -794,6 +794,48 @@ pub(crate) fn geo_version_disposition(version: Option<&str>) -> GeoVersionDispos
     }
 }
 
+/// The GeoParquet version verdict of a whole input (#708).
+///
+/// Carried by the report and serialized as `{"status": "missing" | "known" | "unknown" |
+/// "mixed", "version": ...}`: `version` is the version string for `known`
+/// and `unknown`, the sorted distinct versions (`"missing"` for a part with
+/// none) for `mixed`, and absent for `missing`. `known` means every part
+/// declares the same version, and its major is one this reader knows (1, 2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", content = "version", rename_all = "snake_case")]
+pub enum GeoVersion {
+    /// No part declares a version.
+    Missing,
+    /// All parts declare this one version, of a known major.
+    Known(String),
+    /// All parts declare this one version, of a major this reader does not know.
+    Unknown(String),
+    /// The parts disagree (including some declaring none).
+    Mixed(Vec<String>),
+}
+
+impl GeoVersion {
+    /// Fold the per-part versions (one item per part, in any order).
+    pub(crate) fn of_parts<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Self {
+        let distinct: std::collections::BTreeSet<Option<&str>> = parts.into_iter().collect();
+        match distinct.iter().next().copied() {
+            Some(first) if distinct.len() == 1 => match first {
+                None => Self::Missing,
+                Some(v) if geo_version_disposition(Some(v)) == GeoVersionDisposition::Known => {
+                    Self::Known(v.to_owned())
+                }
+                Some(v) => Self::Unknown(v.to_owned()),
+            },
+            _ => Self::Mixed(
+                distinct
+                    .iter()
+                    .map(|v| v.unwrap_or("missing").to_owned())
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// Warn (once per run) when a `geo` metadata `version` is missing or
 /// names a spec this reader does not know (#451). A warning, never an error:
 /// the fields read from the metadata (`primary_column`, `crs`, `bbox`,
@@ -840,7 +882,9 @@ pub(crate) fn parse_geo_json(json: &str) -> Result<Value> {
         .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {e}")))?;
     if !v.is_object() {
         return Err(Error::GeoParquetRead(
-            "Failed to parse geo metadata JSON: not a JSON object".to_string(),
+            "the 'geo' metadata is valid JSON but not an object; rewrite the file's \
+             GeoParquet metadata (e.g. re-save it with `gpio convert`)"
+                .to_string(),
         ));
     }
     Ok(v)

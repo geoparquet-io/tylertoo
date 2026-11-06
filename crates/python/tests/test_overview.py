@@ -301,8 +301,8 @@ class TestOverviewIntegration:
             # fallback must not be flagged (the field is always present).
             assert report["crs_assumed_wgs84"] is False
             # #708: the version verdict is on the report too.
-            assert isinstance(report["geo_version"], str)
-            assert report["geo_version_known"] is True
+            assert report["geo_version"]["status"] == "known"
+            assert isinstance(report["geo_version"]["version"], str)
             # #644: in-range input, but the key is always present.
             assert report["wrapped_features"] == 0
             # z0..z6 requested; coarse levels where every (tiny) building falls

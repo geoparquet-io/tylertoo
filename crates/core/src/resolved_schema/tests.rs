@@ -486,3 +486,29 @@ fn transformed_schema_preserves_crs_and_only_records_this_conversions_renames() 
         &BTreeMap::from([("geom".into(), "SHAPE".into())])
     );
 }
+
+#[test]
+fn geo_version_folds_parts() {
+    use super::GeoVersion::{Known, Missing, Mixed, Unknown};
+    let f = |v: &[Option<&str>]| super::GeoVersion::of_parts(v.iter().copied());
+    assert_eq!(f(&[None, None]), Missing);
+    assert_eq!(f(&[Some("1.1.0"), Some("1.1.0")]), Known("1.1.0".into()));
+    assert_eq!(f(&[Some("3.0.0")]), Unknown("3.0.0".into()));
+    assert_eq!(
+        f(&[Some("3.0.0"), Some("1.1.0")]),
+        Mixed(vec!["1.1.0".into(), "3.0.0".into()])
+    );
+    assert_eq!(
+        f(&[Some("1.1.0"), None]),
+        Mixed(vec!["missing".into(), "1.1.0".into()])
+    );
+    let json = serde_json::to_value(Known("2.0.0".to_string())).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"status": "known", "version": "2.0.0"})
+    );
+    assert_eq!(
+        serde_json::to_value(Missing).unwrap(),
+        serde_json::json!({"status": "missing"})
+    );
+}

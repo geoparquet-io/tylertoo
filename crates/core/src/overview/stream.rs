@@ -2452,7 +2452,7 @@ struct Preflight {
     /// the report.
     crs_assumed_wgs84: bool,
     /// The input's GeoParquet `version` (#708).
-    geo_version: Option<String>,
+    geo_version: crate::resolved_schema::GeoVersion,
     /// The #543 pass-1 memory verdict this preflight reached, carried to the
     /// `TYLERTOO_PROFILE_JSON` dump (#626 item 4).
     pass1_memory: super::convert::Pass1MemoryReport,
@@ -2501,9 +2501,11 @@ fn preflight_with_memory_limit(
     let (crs, crs_assumed_wgs84) =
         super::convert::crs_from_resolved(&descriptor, &source.display_name(), diagnostics)?;
     if crs_assumed_wgs84 {
-        super::convert::warn_assumed_wgs84(&source.display_name(), diagnostics);
+        super::convert::warn_assumed_wgs84(source, diagnostics);
     }
-    let geo_version = descriptor.version().map(str::to_owned);
+    let geo_version = crate::resolved_schema::GeoVersion::of_parts(
+        source.resolved_schemas()?.iter().map(|r| r.version()),
+    );
 
     // Reserved-column collisions (#288) are resolved BEFORE row-group
     // selection so the attribute filter (#315) can bind against the final
@@ -3649,7 +3651,7 @@ struct ConvertReportInputs<'a> {
     effective_max_row_group_size: Option<usize>,
     /// The input declared no CRS and WGS84 was assumed (#451).
     crs_assumed_wgs84: bool,
-    geo_version: Option<String>,
+    geo_version: crate::resolved_schema::GeoVersion,
 }
 
 fn build_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
@@ -3673,9 +3675,6 @@ fn build_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
         out_of_range_exemplars: inputs.tallies.out_of_range_exemplars,
         wrapped_features: inputs.tallies.wrapped,
         crs_assumed_wgs84: inputs.crs_assumed_wgs84,
-        geo_version_known: crate::resolved_schema::geo_version_disposition(
-            inputs.geo_version.as_deref(),
-        ) == crate::resolved_schema::GeoVersionDisposition::Known,
         geo_version: inputs.geo_version,
         duration_secs: inputs.start.elapsed().as_secs_f64(),
         remote_fetch: super::convert::log_remote_fetch(inputs.source),
