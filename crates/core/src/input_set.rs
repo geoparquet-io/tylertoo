@@ -1000,9 +1000,16 @@ impl ConvertSource {
             .iter()
             .enumerate()
             .fold(requested, |rows, (pi, m)| {
+                let mask = self.column_projection().map(|roots| {
+                    tylertoo_io::ProjectionMask::roots(
+                        m.parquet.file_metadata().schema_descr(),
+                        roots.iter().copied(),
+                    )
+                });
                 tylertoo_io::read_batch_plan(
                     &m.parquet,
                     selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice),
+                    mask.as_ref(),
                     rows,
                     limit,
                 )
@@ -2460,6 +2467,40 @@ mod tests {
     /// #717: a root column's bytes come from the footer, summed over every
     /// leaf under it (a nested column has several) and over the selected row
     /// groups only, so they cannot depend on how the rows are read.
+    /// The read plan sees only the columns the source reads: a dropped list
+    /// column (Overture's `sources`) must not collapse the batch size.
+    #[test]
+    fn read_batch_rows_ignores_columns_outside_the_restriction() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use arrow_array::Array;
+        let dir = tmpdir();
+        let path = dir.path().join("p0.parquet");
+        let n = 10_000;
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        for _ in 0..n {
+            tags.values().append_value("a");
+            tags.values().append_value("b");
+            tags.append(true);
+        }
+        let tags = tags.finish();
+        write_parquet(
+            &path,
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("tags", tags.data_type().clone(), true),
+            ],
+            vec![Arc::new(Int64Array::from_iter_values(0..n)), Arc::new(tags)],
+            None,
+        );
+        let src = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        src.restrict_columns(vec![0]).unwrap();
+        assert_eq!(
+            src.read_batch_rows(None, 8192, tylertoo_io::byte_array_limit())
+                .unwrap(),
+            8192
+        );
+    }
+
     #[test]
     fn selected_column_bytes_sums_leaves_over_the_selection() {
         use arrow_array::{Float64Array, StructArray};

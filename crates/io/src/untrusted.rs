@@ -1119,12 +1119,17 @@ fn check_batch_under(batch: &RecordBatch, limit: u64) -> Result<(), ArrowError> 
 /// refine the size; [`UntrustedBatchReader`] checks actual expanded bytes
 /// before casting views, so dictionary expansion and skew cannot defeat it.
 /// Both engines and every reader use this plan. An oversized row is refused.
+/// Only the leaves `projection` reads count (all of them when `None`): an
+/// unread list column would otherwise shrink every batch (Overture
+/// buildings' `sources` took a 3-column read to 6 rows per batch).
 pub fn read_batch_plan(
     metadata: &ParquetMetaData,
     row_groups: Option<&[usize]>,
+    projection: Option<&ProjectionMask>,
     requested: usize,
     limit: u64,
 ) -> usize {
+    let read = |leaf: &usize| projection.is_none_or(|mask| mask.leaf_included(*leaf));
     let avg = metadata
         .row_groups()
         .iter()
@@ -1135,6 +1140,9 @@ pub fn read_batch_plan(
             group
                 .columns()
                 .iter()
+                .enumerate()
+                .filter(move |(leaf, _)| read(leaf))
+                .map(|(_, column)| column)
                 .filter(|column| {
                     column.column_descr().physical_type() == parquet::basic::Type::BYTE_ARRAY
                 })
@@ -1157,7 +1165,9 @@ pub fn read_batch_plan(
             group
                 .columns()
                 .iter()
-                .map(|column| {
+                .enumerate()
+                .filter(|(leaf, _)| read(leaf))
+                .map(|(_, column)| {
                     use parquet::basic::Type;
                     let width = match column.column_descr().physical_type() {
                         Type::BOOLEAN => 1,
@@ -1423,6 +1433,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
         let rows = read_batch_plan(
             self.metadata(),
             self.row_groups.as_deref(),
+            self.projection.as_ref(),
             self.batch_rows,
             limit,
         );
@@ -1785,6 +1796,53 @@ mod tests {
         );
     }
 
+    /// A repeated leaf the read does not project must not shrink its batches:
+    /// Overture buildings' unread `sources`/`names` lists took a 3-column
+    /// read from 8,192 rows per batch to 6.
+    #[test]
+    fn read_plan_ignores_unprojected_repeated_leaves() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use arrow_array::{ArrayRef, Int64Array};
+        use parquet::arrow::ArrowWriter;
+        let n = 10_000;
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        for _ in 0..n {
+            tags.values().append_value("a");
+            tags.values().append_value("b");
+            tags.append(true);
+        }
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(0..n)) as ArrayRef,
+            ),
+            ("tags", Arc::new(tags.finish()) as ArrayRef),
+        ])
+        .unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let source = open_parquet(file).unwrap();
+        let limit = byte_array_limit();
+        let md = source.metadata().clone();
+        assert!(read_batch_plan(&md, None, None, 8192, limit) < 8192);
+        let id_only = ProjectionMask::roots(source.parquet_schema(), [0]);
+        assert_eq!(
+            read_batch_plan(&md, None, Some(&id_only), 8192, limit),
+            8192
+        );
+        let first = source
+            .with_projection_roots([0])
+            .with_batch_rows(8192)
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.num_rows(), 8192);
+    }
+
     #[test]
     fn read_plan_bounds_fixed_width_batches() {
         use arrow_array::{ArrayRef, Float64Array};
@@ -1801,7 +1859,7 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         let source = open_parquet(file).unwrap();
-        let rows = read_batch_plan(source.metadata(), None, 100, 1000);
+        let rows = read_batch_plan(source.metadata(), None, None, 100, 1000);
         assert!(rows * 100 * 8 <= 2000, "planned {rows} wide numeric rows");
     }
 
