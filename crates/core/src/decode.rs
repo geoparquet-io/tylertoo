@@ -224,6 +224,8 @@ pub enum DecodeError {
         z: u8,
         x: u32,
         y: u32,
+        // #437: hidden, so the pre-1.0 `prost` type is not stable API.
+        #[doc(hidden)]
         source: prost::DecodeError,
     },
 

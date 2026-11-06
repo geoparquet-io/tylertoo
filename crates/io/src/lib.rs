@@ -62,6 +62,7 @@ pub use parquet::file::writer::SerializedFileWriter;
 
 /// Errors refused by the input boundary before or during upstream decoding.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// One row cannot fit the decoded batch memory bound.
     #[error("one decoded row needs {bytes} bytes, past the {limit_bytes}-byte read batch memory limit; reduce the property columns or simplify the geometry")]

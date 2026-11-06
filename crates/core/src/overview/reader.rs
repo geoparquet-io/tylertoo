@@ -59,6 +59,7 @@ pub enum ReaderError {
         "cannot read the Parquet footer of {path}: {}",
         crate::input::parquet_error_detail(.error)
     )]
+    #[non_exhaustive]
     Footer {
         /// The file as given.
         path: String,

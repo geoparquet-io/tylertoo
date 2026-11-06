@@ -77,7 +77,9 @@ pub enum InputError {
     },
     /// A checked-I/O boundary refused the input.
     #[error(transparent)]
-    Decode(#[from] tylertoo_io::Error),
+    // #437: hidden, so the internal `tylertoo_io` type is not stable API.
+    #[doc(hidden)]
+    Decode(tylertoo_io::Error),
     /// Local I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -99,6 +101,7 @@ pub enum InputError {
     /// An input's Parquet footer could not be read or fetched (#452: the
     /// bare [`Self::Parquet`] named no file).
     #[error("cannot read the Parquet footer of {input}: {}", parquet_error_detail(.error))]
+    #[non_exhaustive]
     Footer {
         /// Display name of the input (path or URL).
         input: String,
@@ -209,6 +212,13 @@ pub enum InputError {
 impl From<arrow_schema::ArrowError> for InputError {
     fn from(e: arrow_schema::ArrowError) -> Self {
         InputError::Arrow(e)
+    }
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::Error> for InputError {
+    fn from(e: tylertoo_io::Error) -> Self {
+        InputError::Decode(e)
     }
 }
 
