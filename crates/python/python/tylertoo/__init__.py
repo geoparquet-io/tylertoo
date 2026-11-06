@@ -275,7 +275,7 @@ VariableDepthReport = TypedDict(  # noqa: UP013 - keys describe serialized repor
         "stopped_tiles": "int",
     },
 )
-VariableDepthReport.__doc__ = """How a `variable_depth=True` export stopped its branches.
+VariableDepthReport.__doc__ = """How a `variable_depth=True` export stopped branches.
 
 Attributes:
     canonical_max_zoom: The finest level's zoom, which every stopped
