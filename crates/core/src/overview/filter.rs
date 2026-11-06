@@ -79,6 +79,7 @@ pub enum FilterError {
     Parse(String),
     /// The expression references a column absent from the input schema.
     #[error("--filter references unknown column {name:?} (input columns: {available})")]
+    #[non_exhaustive]
     UnknownColumn {
         /// The unresolved column name.
         name: String,
@@ -90,6 +91,7 @@ pub enum FilterError {
         "--filter column {name:?} has unsupported type {data_type} \
          (supported: numeric, string, boolean, timestamp)"
     )]
+    #[non_exhaustive]
     UnsupportedColumnType {
         /// The column name.
         name: String,
@@ -98,6 +100,7 @@ pub enum FilterError {
     },
     /// A literal's type does not match the column's type.
     #[error("--filter: cannot compare {kind} column {name:?} to {literal}")]
+    #[non_exhaustive]
     TypeMismatch {
         /// The column name.
         name: String,
@@ -108,6 +111,7 @@ pub enum FilterError {
     },
     /// An ordering comparison (`<`, `<=`, `>`, `>=`) on a boolean column.
     #[error("--filter: ordering comparison on boolean column {name:?} is not supported")]
+    #[non_exhaustive]
     BooleanOrdering {
         /// The column name.
         name: String,
@@ -118,6 +122,7 @@ pub enum FilterError {
         "--filter: cannot parse {literal:?} as a datetime for timestamp column {name:?} \
          (accepted: '2025-01-01', '2025-01-01 12:30:00', RFC 3339): {msg}"
     )]
+    #[non_exhaustive]
     TimestampLiteral {
         /// The column name.
         name: String,

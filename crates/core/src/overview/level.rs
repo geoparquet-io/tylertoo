@@ -590,6 +590,7 @@ pub enum OverviewValidationError {
     InvalidVersion(String),
     /// A `row_group_end` is < 0 or >= `num_row_groups` (§3.3).
     #[error("levels[{index}].row_group_end = {value} out of range [0, {num_row_groups})")]
+    #[non_exhaustive]
     RowGroupOutOfRange {
         /// Level index.
         index: usize,
@@ -602,6 +603,7 @@ pub enum OverviewValidationError {
     #[error(
         "levels[{index}].row_group_end = {value} is not strictly greater than previous {previous}"
     )]
+    #[non_exhaustive]
     RowGroupNotIncreasing {
         /// Level index.
         index: usize,
@@ -612,6 +614,7 @@ pub enum OverviewValidationError {
     },
     /// Final `row_group_end` != `num_row_groups - 1` (§3.3).
     #[error("final row_group_end = {final_value} must equal num_row_groups - 1 = {expected}")]
+    #[non_exhaustive]
     RowGroupFinalMismatch {
         /// The last level's `row_group_end`.
         final_value: i64,
@@ -620,6 +623,7 @@ pub enum OverviewValidationError {
     },
     /// A `gsd` is not > 0 (§3.3).
     #[error("levels[{index}].gsd = {value} must be > 0")]
+    #[non_exhaustive]
     GsdNotPositive {
         /// Level index.
         index: usize,
@@ -628,6 +632,7 @@ pub enum OverviewValidationError {
     },
     /// `gsd` is not strictly decreasing (§3.3).
     #[error("levels[{index}].gsd = {value} is not strictly less than previous {previous}")]
+    #[non_exhaustive]
     GsdNotDecreasing {
         /// Level index.
         index: usize,
@@ -638,12 +643,14 @@ pub enum OverviewValidationError {
     },
     /// `zoom` is present on some but not all levels (§3.3, all-or-none).
     #[error("zoom must be present on all levels or none; levels[{index}] disagrees")]
+    #[non_exhaustive]
     ZoomPartial {
         /// Level index that broke the all-or-none rule.
         index: usize,
     },
     /// `zoom` is not strictly increasing (§3.3).
     #[error("levels[{index}].zoom = {value} is not strictly greater than previous {previous}")]
+    #[non_exhaustive]
     ZoomNotIncreasing {
         /// Level index.
         index: usize,
@@ -657,6 +664,7 @@ pub enum OverviewValidationError {
     UnsupportedVersion(String),
     /// `duplicating` mode with `canonical_level` != `L-1` (§3.4).
     #[error("duplicating mode requires canonical_level = {expected} (L-1), got {actual:?}")]
+    #[non_exhaustive]
     CanonicalLevelMismatch {
         /// Expected value (`levels.len() - 1`).
         expected: i64,
@@ -665,6 +673,7 @@ pub enum OverviewValidationError {
     },
     /// `partitioning` (or absent) mode with a non-null `canonical_level` (§3.4).
     #[error("partitioning mode requires canonical_level = null, got {actual}")]
+    #[non_exhaustive]
     CanonicalLevelNotNull {
         /// Actual value found.
         actual: i64,

@@ -65,6 +65,7 @@ const REMOTE_SCHEMES: &[&str] = &["s3", "s3a", "http", "https", "gs"];
 pub enum InputError {
     /// A saved convert plan belongs to a different version of an input.
     #[error("--plan: saved plan does not match this run: input {input:?} {field} was {saved:?} when the plan was saved but is {current:?} now. Re-run without --plan (add --save-plan to write a fresh one).")]
+    #[non_exhaustive]
     PlanInputChanged {
         /// Input path or URL.
         input: String,
@@ -92,6 +93,7 @@ pub enum InputError {
     /// no file). Not a `#[source]`: the message already carries the reason,
     /// and a source would repeat it in every `Caused by:` chain.
     #[error("cannot open {input}: {error}")]
+    #[non_exhaustive]
     Open {
         /// Display name of the input (path or URL).
         input: String,
@@ -114,6 +116,7 @@ pub enum InputError {
         "unsupported input URL scheme `{scheme}://` in {url:?}: supported inputs are \
          local paths and s3://, https://, http://, gs:// URLs"
     )]
+    #[non_exhaustive]
     UnsupportedScheme {
         /// The unrecognized scheme.
         scheme: String,
@@ -130,6 +133,7 @@ pub enum InputError {
     /// The remote object store rejected a request.
     #[cfg(feature = "remote")]
     #[error("remote input error for {url}: {source}")]
+    #[non_exhaustive]
     Remote {
         /// The input URL.
         url: String,
@@ -151,6 +155,7 @@ pub enum InputError {
     /// A partition of a multi-file input does not match the first partition
     /// (schema shape, geometry extension metadata, or CRS).
     #[error("incompatible input partition {offender:?}: {detail} (first partition: {first:?})")]
+    #[non_exhaustive]
     IncompatiblePartition {
         /// Display name of the reference (first) partition.
         first: String,
@@ -161,6 +166,7 @@ pub enum InputError {
     },
     /// A directory or glob input matched no `.parquet` files.
     #[error("no .parquet files found for input {input:?}")]
+    #[non_exhaustive]
     NoParquetInputs {
         /// The original input string (directory path or glob pattern).
         input: String,
@@ -174,12 +180,14 @@ pub enum InputError {
          <manifest> (one per line); s3:// and gs:// prefixes are listed \
          natively"
     )]
+    #[non_exhaustive]
     RemotePrefixUnsupported {
         /// The rejected URL.
         url: String,
     },
     /// The `--files-from` manifest itself could not be read.
     #[error("cannot read --files-from manifest {path:?}: {source}")]
+    #[non_exhaustive]
     ManifestRead {
         /// The manifest path as supplied.
         path: String,
@@ -192,6 +200,7 @@ pub enum InputError {
     /// entries are single files/objects only — no directory, glob, or
     /// prefix expansion.
     #[error("{context}: input {input:?} does not exist or is not a file")]
+    #[non_exhaustive]
     MissingListedInput {
         /// Where the entry came from (manifest line / list position).
         context: String,
@@ -200,6 +209,7 @@ pub enum InputError {
     },
     /// A glob input string is not a valid glob pattern.
     #[error("invalid glob pattern {pattern:?}: {message}")]
+    #[non_exhaustive]
     GlobPattern {
         /// The pattern as supplied.
         pattern: String,

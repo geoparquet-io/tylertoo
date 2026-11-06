@@ -327,7 +327,7 @@ fn export_counts_a_non_finite_overview_vertex() {
     )
     .unwrap();
     assert!(
-        report.diagnostics.iter().any(|d| matches!(d, tylertoo_core::internal::diagnostics::Diagnostic::NonFiniteGeometry { count } if *count > 0)),
+        report.diagnostics.iter().any(|d| matches!(d, tylertoo_core::internal::diagnostics::Diagnostic::NonFiniteGeometry { count, .. } if *count > 0)),
         "the non-finite feature is counted"
     );
 }

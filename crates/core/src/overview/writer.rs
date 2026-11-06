@@ -301,6 +301,7 @@ pub enum WriterError {
     NoGeometryColumn,
     /// `write_level` was called out of order (must be 0, 1, 2, ... coarse→fine).
     #[error("write_level called out of order: expected level {expected}, got {got}")]
+    #[non_exhaustive]
     LevelOutOfOrder {
         /// Expected next level index.
         expected: usize,
@@ -313,12 +314,14 @@ pub enum WriterError {
         "all {expected} declared level(s) were empty — no output rows at any \
          level (empty input, or every feature dropped at every scale)"
     )]
+    #[non_exhaustive]
     AllLevelsEmpty {
         /// Levels declared in the options.
         expected: usize,
     },
     /// `finish` was called before all declared levels were written.
     #[error("finish called with {written} of {expected} levels written")]
+    #[non_exhaustive]
     IncompleteLevels {
         /// Levels written so far.
         written: usize,

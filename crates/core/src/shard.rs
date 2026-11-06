@@ -145,6 +145,7 @@ pub enum ShardError {
          {MAX_SHARD_PIVOT_ZOOM}. A pivot wants to sit where the dataset has a few tiles per \
          shard, which is z4-z8 for any realistic fleet size."
     )]
+    #[non_exhaustive]
     PivotOutOfRange {
         /// The rejected pivot zoom.
         pivot: u8,
@@ -162,6 +163,7 @@ pub enum ShardError {
          between 1 and {MAX_SHARD_PIVOT_ZOOM}. (z0 is the single world tile — a range there is \
          the whole build, not a shard of it.)"
     )]
+    #[non_exhaustive]
     TileRangePivotOutOfRange {
         /// The pivot zoom the ids implied.
         pivot: u8,
@@ -178,6 +180,7 @@ pub enum ShardError {
          {max_zoom}: the shards would own no zoom at all. Re-cut the plan with a coarser \
          --pivot, or raise --max-zoom."
     )]
+    #[non_exhaustive]
     PivotNotCoarser {
         /// The rejected pivot zoom.
         pivot: u8,
@@ -192,6 +195,7 @@ pub enum ShardError {
         "--shards {shards} is out of range for pivot z{pivot}: it must be between 1 and {max} \
          (the number of tiles at that zoom). Use a deeper --shard-pivot for a larger fleet."
     )]
+    #[non_exhaustive]
     ShardCountOutOfRange {
         /// The rejected shard count.
         shards: usize,
@@ -207,6 +211,7 @@ pub enum ShardError {
          valid indices are 0..={}",
         shards.saturating_sub(1)
     )]
+    #[non_exhaustive]
     ShardIndexOutOfRange {
         /// The rejected index.
         index: usize,
@@ -220,6 +225,7 @@ pub enum ShardError {
          Every job in a fleet must be given the same shard plan, and its N must be the N the \
          plan was cut for."
     )]
+    #[non_exhaustive]
     ShardCountMismatch {
         /// The index the caller asked for.
         index: usize,
@@ -238,6 +244,7 @@ pub enum ShardError {
          pivot and \
          writes the convert plan."
     )]
+    #[non_exhaustive]
     BadShardSelector {
         /// The rejected text.
         value: String,
@@ -249,6 +256,7 @@ pub enum ShardError {
          at the SAME zoom (that zoom becomes the pivot, and the range then names every \
          descendant of those tiles at every deeper zoom)."
     )]
+    #[non_exhaustive]
     BadTileRange {
         /// The rejected text.
         value: String,
@@ -260,6 +268,7 @@ pub enum ShardError {
          z{lo_zoom} and {hi} is at z{hi_zoom}. A range is a run of tiles at one pivot zoom; \
          its descendants at deeper zooms follow from that."
     )]
+    #[non_exhaustive]
     TileRangeZoomMismatch {
         /// The low id.
         lo: u64,
@@ -273,6 +282,7 @@ pub enum ShardError {
 
     /// A tile-id range whose low id is past its high id.
     #[error("tile-id range {lo}..{hi} is empty: LO must not exceed HI.")]
+    #[non_exhaustive]
     EmptyTileRange {
         /// The low id.
         lo: u64,
@@ -282,6 +292,7 @@ pub enum ShardError {
 
     /// A tile id that is not addressable at all.
     #[error("tile id {id} is not a valid PMTiles tile id: {reason}")]
+    #[non_exhaustive]
     BadTileId {
         /// The rejected id.
         id: u64,
@@ -291,6 +302,7 @@ pub enum ShardError {
 
     /// The plan file could not be read or written.
     #[error("--shard-plan {path}: {source}")]
+    #[non_exhaustive]
     Io {
         /// The plan's path.
         path: String,
@@ -301,6 +313,7 @@ pub enum ShardError {
     /// The plan file is not a shard plan, or is a shard plan this build
     /// cannot read.
     #[error("--shard-plan {path}: {what}")]
+    #[non_exhaustive]
     Malformed {
         /// The plan's path.
         path: String,
@@ -313,6 +326,7 @@ pub enum ShardError {
         "--shard-plan {path}: saved plan does not match this run: {field} was {saved:?} when \
          the plan was cut but is {now:?} now. Re-cut it with `tylertoo shard-plan`."
     )]
+    #[non_exhaustive]
     SourceMismatch {
         /// The plan's path.
         path: String,

@@ -672,7 +672,8 @@ fn inverted_zoom_range_is_rejected_before_any_work() {
             err,
             DecodeError::InvalidZoomRange {
                 min_zoom: 8,
-                max_zoom: 5
+                max_zoom: 5,
+                ..
             }
         ),
         "{err:?}"

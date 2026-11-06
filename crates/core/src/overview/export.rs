@@ -846,6 +846,7 @@ pub enum ExportError {
     /// the preflight escape hatch: `TYLERTOO_SKIP_MEMORY_PREFLIGHT` covers
     /// the up-front checks only, never this one.
     #[error("io error: {phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter.")]
+    #[non_exhaustive]
     BudgetExceeded {
         /// Export phase that cannot fit.
         phase: &'static str,
@@ -867,6 +868,7 @@ pub enum ExportError {
     Core(#[from] crate::Error),
     /// The input CRS is neither EPSG:4326 nor EPSG:3857.
     #[error("unsupported CRS {crs:?} in {path}: export requires EPSG:4326 or EPSG:3857")]
+    #[non_exhaustive]
     UnsupportedCrs {
         /// The rejected CRS identifier.
         crs: String,
@@ -878,6 +880,7 @@ pub enum ExportError {
         "{} has no geometry column",
         path.as_deref().unwrap_or("an overview batch")
     )]
+    #[non_exhaustive]
     NoGeometryColumn {
         /// The overview file (#452). `None` only from per-batch decoding,
         /// which runs after the file's own check has passed, so it means a
@@ -890,6 +893,7 @@ pub enum ExportError {
          {coarsest}): the declared zoom range can widen over empty zooms, not narrow \
          over real tiles (#380)"
     )]
+    #[non_exhaustive]
     DeclaredMinZoomTooFine { declared: u8, coarsest: u8 },
 
     /// A level resolves to a zoom above [`crate::tile::MAX_ZOOM`] (#371).
@@ -905,6 +909,7 @@ pub enum ExportError {
          maximum supported zoom {ceiling}; beyond z{ceiling} the tile grid overflows \
          32-bit tile coordinates and the PMTiles Hilbert tile-id arithmetic (#371)"
     )]
+    #[non_exhaustive]
     LevelZoomAboveCeiling {
         /// Index of the offending level.
         level: usize,
@@ -928,6 +933,7 @@ pub enum ExportError {
         "overview level {level} has gsd {gsd}, which is not a finite positive ground \
          sample distance in meters (#371)"
     )]
+    #[non_exhaustive]
     LevelGsdNotFinitePositive {
         /// Index of the offending level.
         level: usize,
@@ -954,6 +960,7 @@ pub enum ExportError {
          geometry into a tile from a row group the shard never read. Lower --tile-buffer to \
          {max} or less (the default is 8), or build without --tile-range."
     )]
+    #[non_exhaustive]
     TileBufferTooWideForShard {
         /// The requested buffer, in tile pixels.
         buffer: u32,
@@ -973,6 +980,7 @@ pub enum ExportError {
          stops at z{finest}. A --tile-range's pivot must be no finer than the overview's \
          finest level, and a coarse job's zoom ceiling no coarser than its coarsest."
     )]
+    #[non_exhaustive]
     RestrictionEmitsNoZoom {
         /// The coarsest zoom the restriction would emit.
         coarsest: u8,
@@ -995,6 +1003,7 @@ pub enum ExportError {
             None => " and cannot be exported as a whole pyramid".to_string(),
         }
     )]
+    #[non_exhaustive]
     PartialOverview {
         /// The ceiling recorded in the file's footer.
         recorded: u8,
@@ -1004,6 +1013,7 @@ pub enum ExportError {
 
     /// `--min-zoom` is above [`crate::tile::MAX_ZOOM`] (#371).
     #[error("--min-zoom {declared} is above the maximum supported zoom {ceiling} (#371)")]
+    #[non_exhaustive]
     DeclaredMinZoomAboveCeiling {
         /// The requested minimum zoom.
         declared: u8,
@@ -1033,6 +1043,7 @@ pub enum ExportError {
          both resolve to zoom {zoom}; every level must resolve to a distinct, strictly \
          increasing zoom"
     )]
+    #[non_exhaustive]
     LevelZoomsNotAscending {
         /// Index of the earlier, colliding level.
         previous_level: usize,
@@ -1052,6 +1063,7 @@ pub enum ExportError {
         "included property {name:?} is not a property this overview file exports \
          (exportable: {available})"
     )]
+    #[non_exhaustive]
     UnknownProperty { name: String, available: String },
 
     /// `--include-property` names a column the file has but the export
@@ -1065,6 +1077,7 @@ pub enum ExportError {
          timestamps, decimals, and struct/list/map columns as JSON strings); cast or \
          encode it as text first, e.g. with gpio or DuckDB"
     )]
+    #[non_exhaustive]
     UnsupportedProperty { name: String, data_type: String },
 
     /// `--include-property` names the geometry's bbox covering struct
@@ -1076,12 +1089,14 @@ pub enum ExportError {
         "included property {name:?} is the geometry's bbox covering, not a property; \
          the writer regenerates it, so it cannot be selected"
     )]
+    #[non_exhaustive]
     CoveringProperty { name: String },
 
     #[error(
         "property {name:?} is excluded but {knob} reads it; keep it in the selection or \
          drop the knob"
     )]
+    #[non_exhaustive]
     PropertyRequiredByKnob { name: String, knob: String },
 
     /// `--feature-id` (#443) names a column that cannot supply MVT feature
@@ -1089,6 +1104,7 @@ pub enum ExportError {
     /// column, or aggregated by `--accumulate-attribute`. Raised before any
     /// row is read.
     #[error("--feature-id column {column:?} {reason}")]
+    #[non_exhaustive]
     FeatureIdColumn {
         /// The `--feature-id` column, as the caller named it.
         column: String,
@@ -1105,6 +1121,7 @@ pub enum ExportError {
          {level}, z{zoom}; the overview file's own row order, not the source file's): every \
          exported feature needs a non-negative integer id"
     )]
+    #[non_exhaustive]
     InvalidFeatureId {
         /// The `--feature-id` column, as the caller named it.
         column: String,
@@ -1137,6 +1154,7 @@ pub enum ExportError {
         human_bytes(*.estimate_bytes),
         human_bytes(*.available_bytes)
     )]
+    #[non_exhaustive]
     TileExceedsMemory {
         /// 0-based overview level.
         level: usize,

@@ -658,6 +658,7 @@ pub enum TilesError {
          --spill-dir, $TMPDIR, the output directory)",
         dir.display()
     )]
+    #[non_exhaustive]
     IntermediateCreate {
         /// The directory the temp file was to be created in.
         dir: PathBuf,

@@ -777,10 +777,10 @@ mod error_classes {
     #[test]
     fn a_band_convert_refusal_is_a_config_error() {
         Python::attach(|py| {
-            let err = pyramid_error_to_py(PyramidError::BandConvert {
-                layer: "a".into(),
-                error: ConvertError::VerbatimPartitioningUnsupported,
-            });
+            let err = pyramid_error_to_py(PyramidError::band_convert(
+                "a",
+                ConvertError::VerbatimPartitioningUnsupported,
+            ));
             assert!(err.get_type(py).is(py.get_type::<ConfigError>()), "{err}");
         });
     }

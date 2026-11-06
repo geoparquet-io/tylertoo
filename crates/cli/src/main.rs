@@ -1436,10 +1436,8 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
 
     // Spec parsing, band-set validation and the band-input existence check
     // (with its stripped-`=LAYER` hint) all live in core (#445).
-    let bands = parse_bands(&args.bands).map_err(|message| config::ConfigError::InvalidSpec {
-        option: "--band",
-        message,
-    })?;
+    let bands = parse_bands(&args.bands)
+        .map_err(|message| config::ConfigError::invalid_spec("--band", message))?;
 
     let report =
         build_pyramid(&bands, &args.output, &opts).map_err(|e| step_failed("pyramid build", e))?;
@@ -1960,7 +1958,7 @@ mod tests {
         use tylertoo_core::internal::overview::tiles::TilesError;
         use tylertoo_core::internal::pyramid::PyramidError;
 
-        let config_error = || config::ConfigError::InvalidExtent { extent: 0 };
+        let config_error = || config::ConfigError::CollapseConflict;
         for error in [
             anyhow::Error::new(config_error()),
             step_failed(
@@ -1986,10 +1984,7 @@ mod tests {
         // message names the band.
         let band = step_failed(
             "pyramid build",
-            PyramidError::BandConvert {
-                layer: "a".into(),
-                error: ConvertError::VerbatimPartitioningUnsupported,
-            },
+            PyramidError::band_convert("a", ConvertError::VerbatimPartitioningUnsupported),
         );
         assert_eq!(exit_status(error_kind(&band)), 2, "{band:#}");
         assert!(!band.to_string().contains("pyramid build failed"), "{band}");
@@ -2005,32 +2000,16 @@ mod tests {
     /// #438: every kind core gives an error maps to one exit status.
     #[test]
     fn exit_status_follows_the_error_kind() {
-        use tylertoo_core::internal::overview::convert::ConvertError;
-        use tylertoo_core::internal::overview::export::ExportError;
         use tylertoo_core::internal::pyramid::PyramidError;
 
-        let table: [(anyhow::Error, Option<ErrorKind>, u8); 6] = [
+        // Core classifies its own errors (e.g. `BudgetExceeded` is Resource);
+        // this table checks the CLI's kind -> status map.
+        assert_eq!(exit_status(Some(ErrorKind::Resource)), 1);
+        let table: [(anyhow::Error, Option<ErrorKind>, u8); 4] = [
             (
-                anyhow::Error::new(config::ConfigError::InvalidExtent { extent: 0 }),
+                anyhow::Error::new(config::ConfigError::CollapseConflict),
                 Some(ErrorKind::Usage),
                 2,
-            ),
-            (
-                anyhow::Error::new(ExportError::UnknownProperty {
-                    name: "x".into(),
-                    available: String::new(),
-                }),
-                Some(ErrorKind::Input),
-                1,
-            ),
-            (
-                anyhow::Error::new(ConvertError::BudgetExceeded {
-                    phase: "pass-1 scan",
-                    needed: 2,
-                    available: 1,
-                }),
-                Some(ErrorKind::Resource),
-                1,
             ),
             (
                 anyhow::Error::new(PyramidError::BandMismatch("empty band".into())),

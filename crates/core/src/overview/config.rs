@@ -76,6 +76,7 @@ pub enum ConfigError {
     /// The output path is an existing directory (#427, #551). The final
     /// rename can never replace one, `--force` or not.
     #[error("{} is a directory; the output must be a {kind} file path", path.display())]
+    #[non_exhaustive]
     OutputIsDirectory {
         /// The output path.
         path: PathBuf,
@@ -84,6 +85,7 @@ pub enum ConfigError {
     },
     /// The output exists and overwriting it was not asked for (#427, #551).
     #[error("{} exists (use --force to overwrite){}", path.display(), if matches!(kind, OutputKind::ShardPlan) { ". Every job of a fleet must be given the SAME shard plan, so replacing one mid-build silently re-cuts the tile space." } else { "" })]
+    #[non_exhaustive]
     OutputExists {
         /// What the existing output represents.
         kind: OutputKind,
@@ -101,6 +103,7 @@ pub enum ConfigError {
     /// `--spill-dir` exists but does not accept new files (a read-only
     /// directory): found by creating and removing a probe file.
     #[error("spill-dir {} is not writable: {reason}", dir.display())]
+    #[non_exhaustive]
     SpillDirNotWritable {
         /// The spill directory.
         dir: PathBuf,
@@ -115,6 +118,7 @@ pub enum ConfigError {
          coordinate resolution and must be positive (the default is {})",
         super::export::DEFAULT_EXTENT
     )]
+    #[non_exhaustive]
     InvalidExtent {
         /// The rejected extent.
         extent: u32,
@@ -127,6 +131,7 @@ pub enum ConfigError {
          belongs to O(buffer²) tiles. Lower --tile-buffer to {max} or less (the default is {}).",
         super::export::DEFAULT_TILE_BUFFER_PX
     )]
+    #[non_exhaustive]
     TileBufferTooWide {
         /// The requested buffer, in tile pixels.
         buffer: u32,
@@ -140,6 +145,7 @@ pub enum ConfigError {
         "bbox {bbox:?} must hold finite values with xmin <= xmax and ymin <= ymax \
          (xmin,ymin,xmax,ymax)"
     )]
+    #[non_exhaustive]
     InvalidBbox {
         /// The rejected bbox.
         bbox: [f64; 4],
@@ -155,6 +161,7 @@ pub enum ConfigError {
          against other classes)",
         class.as_deref().map_or_else(|| "unknown (unlisted) classes".to_string(), |c| format!("class {c:?}"))
     )]
+    #[non_exhaustive]
     ClassRankNotFinite {
         /// The class, or `None` for the unknown-class rank.
         class: Option<String>,
@@ -173,6 +180,7 @@ pub enum ConfigError {
     /// `--accumulate-attribute`) did not parse. The message names the flag
     /// and the offending part.
     #[error("{message}")]
+    #[non_exhaustive]
     InvalidSpec {
         /// The flag, as the CLI spells it.
         option: &'static str,
@@ -220,6 +228,7 @@ pub enum ConfigError {
          --pivot.",
         pivot.saturating_sub(1)
     )]
+    #[non_exhaustive]
     CoarseShardHasNoZoom {
         /// The plan's pivot zoom.
         pivot: u8,
@@ -232,6 +241,7 @@ pub enum ConfigError {
         "the shard's tile range is cut at z{range_pivot}, but the job's pivot is z{pivot}: \
          both come from one shard plan"
     )]
+    #[non_exhaustive]
     ShardPivotMismatch {
         /// [`TilesShard::pivot_zoom`](super::tiles::TilesShard::pivot_zoom).
         pivot: u8,
@@ -254,6 +264,7 @@ pub enum ConfigError {
     PlanOnlyWithoutSavePlan,
     /// `--keep-overview` names a directory that does not exist (#433).
     #[error("--keep-overview directory {} does not exist", dir.display())]
+    #[non_exhaustive]
     KeepOverviewDirMissing {
         /// The missing parent directory.
         dir: PathBuf,
@@ -265,6 +276,7 @@ pub enum ConfigError {
         "property {name:?} is excluded but --feature-order reads it; keep it in the \
          selection or drop the knob"
     )]
+    #[non_exhaustive]
     FeatureOrderColumnExcluded {
         /// The excluded property.
         name: String,
@@ -275,6 +287,7 @@ pub enum ConfigError {
         "property {name:?} is excluded but --feature-id reads it; keep it in the \
          selection or drop the flag"
     )]
+    #[non_exhaustive]
     FeatureIdColumnExcluded {
         /// The excluded property.
         name: String,
@@ -286,6 +299,7 @@ pub enum ConfigError {
          cluster's aggregated value identifies no single feature, so accumulate a \
          different column"
     )]
+    #[non_exhaustive]
     FeatureIdAccumulated {
         /// The offending column.
         name: String,
@@ -295,6 +309,7 @@ pub enum ConfigError {
     /// An option set on a command that would ignore it (#600, #443): the
     /// command derives the value itself, or has no use for it.
     #[error("{option} has no effect on {command}: {reason}")]
+    #[non_exhaustive]
     OptionIgnored {
         /// The option, as a Rust field path.
         option: &'static str,
@@ -303,6 +318,15 @@ pub enum ConfigError {
         /// Why, and what to set instead.
         reason: &'static str,
     },
+}
+
+impl ConfigError {
+    /// [`Self::InvalidSpec`] for the CLI, which cannot build the
+    /// `#[non_exhaustive]` variant.
+    #[doc(hidden)]
+    pub fn invalid_spec(option: &'static str, message: String) -> Self {
+        ConfigError::InvalidSpec { option, message }
+    }
 }
 
 impl crate::error::Classify for ConfigError {

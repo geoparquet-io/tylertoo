@@ -48,6 +48,7 @@ pub enum ReaderError {
     /// named no file). Not a `#[source]`, so `Caused by:` chains do not
     /// repeat the reason.
     #[error("cannot open {path}: {error}")]
+    #[non_exhaustive]
     Open {
         /// The file as given.
         path: String,
@@ -72,6 +73,7 @@ pub enum ReaderError {
         "{path} has no 'geo:overviews' footer key: not an overview file (make one with \
          `tylertoo overview`)"
     )]
+    #[non_exhaustive]
     MissingOverviewsKey {
         /// The file as given.
         path: String,
@@ -91,6 +93,7 @@ pub enum ReaderError {
     Conformance(String),
     /// A level index was requested that does not exist in the file.
     #[error("level {level} out of range (file has {num_levels} levels)")]
+    #[non_exhaustive]
     LevelOutOfRange {
         /// The offending level index.
         level: usize,

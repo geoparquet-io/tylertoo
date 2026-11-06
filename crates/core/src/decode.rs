@@ -182,6 +182,7 @@ pub struct DecodeReport {
 #[non_exhaustive]
 pub enum DecodeError {
     #[error("minimum zoom {min_zoom} exceeds maximum zoom {max_zoom}")]
+    #[non_exhaustive]
     InvalidZoomRange { min_zoom: u8, max_zoom: u8 },
 
     #[error("I/O error")]
@@ -202,6 +203,7 @@ pub enum DecodeError {
     NotVectorTiles(TileType),
 
     #[error("failed to decompress {what} at byte offset {offset} ({length} bytes)")]
+    #[non_exhaustive]
     Decompress {
         what: &'static str,
         offset: u64,
@@ -210,6 +212,7 @@ pub enum DecodeError {
     },
 
     #[error("failed to decompress tile z{z}/{x}/{y} at byte offset {offset} ({length} bytes)")]
+    #[non_exhaustive]
     TileDecompress {
         z: u8,
         x: u32,
@@ -220,6 +223,7 @@ pub enum DecodeError {
     },
 
     #[error("MVT protobuf decode failed for tile z{z}/{x}/{y}")]
+    #[non_exhaustive]
     Mvt {
         z: u8,
         x: u32,
@@ -230,6 +234,7 @@ pub enum DecodeError {
     },
 
     #[error("invalid MVT geometry in tile z{z}/{x}/{y}: {reason}")]
+    #[non_exhaustive]
     Geometry {
         z: u8,
         x: u32,

@@ -26,6 +26,7 @@ use std::path::Path;
 pub enum WriteError {
     /// An I/O step of the write failed.
     #[error("Failed to {step}: {error}")]
+    #[non_exhaustive]
     Io {
         /// The step, as "flush temp file" or "create output file PATH".
         step: String,
@@ -37,6 +38,7 @@ pub enum WriteError {
         "metadata JSON is {bytes} bytes, over the {cap}-byte limit readers accept; \
          shorten the name, description or attribution"
     )]
+    #[non_exhaustive]
     MetadataTooLarge {
         /// The JSON's length.
         bytes: u64,
@@ -45,6 +47,7 @@ pub enum WriteError {
     },
     /// The compressed metadata section is over the readers' limit.
     #[error("metadata section is {bytes} bytes stored, over the {cap}-byte limit readers accept")]
+    #[non_exhaustive]
     StoredMetadataTooLarge {
         /// The stored section's length.
         bytes: u64,
@@ -58,6 +61,7 @@ pub enum WriteError {
          -- rename it manually",
         kept.display()
     )]
+    #[non_exhaustive]
     Publish {
         /// The rename's error.
         error: std::io::Error,
@@ -72,6 +76,7 @@ pub enum WriteError {
         reserved.display(),
         requested.display()
     )]
+    #[non_exhaustive]
     WrongOutput {
         /// The `.partial` file the writer reserved.
         reserved: std::path::PathBuf,

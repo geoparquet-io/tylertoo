@@ -318,6 +318,7 @@ pub enum Error {
     /// `error`, at `path`: the archive or output it concerns, for a caller
     /// that holds several.
     #[error("{}: {error}", path.display())]
+    #[non_exhaustive]
     At {
         /// The archive or output.
         path: std::path::PathBuf,

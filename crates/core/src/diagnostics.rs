@@ -47,95 +47,85 @@ pub struct RangeContext {
 #[non_exhaustive]
 pub enum Diagnostic {
     /// Facts from the whole saved plan, not counts from this shard's scan.
+    #[non_exhaustive]
     SavedPlan {
         count: usize,
         diagnostics: Vec<Diagnostic>,
     },
     /// Advice or an I/O warning from the shared pipeline. Kept per run and
     /// deduplicated by its complete message; never persisted in a plan.
-    Advisory {
-        count: usize,
-        message: String,
-    },
+    #[non_exhaustive]
+    Advisory { count: usize, message: String },
+    #[non_exhaustive]
     OutOfRange {
         context: Option<RangeContext>,
         count: usize,
         exemplars: Vec<crate::overview::convert::OutOfRangeExemplar>,
     },
+    #[non_exhaustive]
     Unprojectable {
         context: Option<RangeContext>,
         count: usize,
     },
+    #[non_exhaustive]
     Wrapped {
         exemplars: Vec<OutOfRangeExemplar>,
         context: Option<RangeContext>,
         count: usize,
     },
-    AntimeridianSuspect {
-        count: usize,
-    },
-    EncodeDropped {
-        count: usize,
-    },
-    EncodeQuantized {
-        count: usize,
-    },
-    ClipGuardDropped {
-        count: usize,
-    },
-    NonFiniteGeometry {
-        count: usize,
-    },
+    #[non_exhaustive]
+    AntimeridianSuspect { count: usize },
+    #[non_exhaustive]
+    EncodeDropped { count: usize },
+    #[non_exhaustive]
+    EncodeQuantized { count: usize },
+    #[non_exhaustive]
+    ClipGuardDropped { count: usize },
+    #[non_exhaustive]
+    NonFiniteGeometry { count: usize },
+    #[non_exhaustive]
     PolygonRepaired {
         count: usize,
         #[serde(rename = "repair_kind")]
         kind: PolygonRepairKind,
     },
-    InvalidAfterEncode {
-        count: usize,
-    },
-    RowGroupAutoscaled {
-        count: usize,
-        cap: usize,
-    },
-    InvalidAfterSimplify {
-        count: usize,
-    },
-    FullResolutionFallback {
-        count: usize,
-    },
-    ValidationSkipped {
-        count: usize,
-    },
-    Merged {
-        count: usize,
-    },
-    ValveDropped {
-        count: usize,
-    },
+    #[non_exhaustive]
+    InvalidAfterEncode { count: usize },
+    #[non_exhaustive]
+    RowGroupAutoscaled { count: usize, cap: usize },
+    #[non_exhaustive]
+    InvalidAfterSimplify { count: usize },
+    #[non_exhaustive]
+    FullResolutionFallback { count: usize },
+    #[non_exhaustive]
+    ValidationSkipped { count: usize },
+    #[non_exhaustive]
+    Merged { count: usize },
+    #[non_exhaustive]
+    ValveDropped { count: usize },
+    #[non_exhaustive]
     PropertySkipped {
         count: usize,
         name: String,
         data_type: String,
     },
-    CrsMetadata {
-        count: usize,
-        reason: CrsWarning,
-    },
+    #[non_exhaustive]
+    CrsMetadata { count: usize, reason: CrsWarning },
+    #[non_exhaustive]
     CoveringRejected {
         count: usize,
         reason: CoveringWarning,
     },
-    UnusableGeometry {
-        count: usize,
-        total: usize,
-    },
+    #[non_exhaustive]
+    UnusableGeometry { count: usize, total: usize },
+    #[non_exhaustive]
     CrsAssumed {
         count: usize,
         input: String,
         /// The input's root path (a multi-part input's `input` is a label).
         root: String,
     },
+    #[non_exhaustive]
     EmptyLevels {
         count: usize,
         levels: Vec<usize>,
@@ -145,26 +135,22 @@ pub enum Diagnostic {
         first_written_gsd: f64,
         first_written_zoom: Option<u8>,
     },
+    #[non_exhaustive]
     MemoryBudget {
         count: usize,
         machine: Option<u64>,
         limit: u64,
     },
-    PyramidSharedTiles {
-        count: usize,
-    },
-    PyramidSkippedTiles {
-        count: usize,
-    },
-    PyramidMissingBounds {
-        count: usize,
-    },
-    PyramidMetadataConflict {
-        count: usize,
-    },
-    PyramidMissingMetadata {
-        count: usize,
-    },
+    #[non_exhaustive]
+    PyramidSharedTiles { count: usize },
+    #[non_exhaustive]
+    PyramidSkippedTiles { count: usize },
+    #[non_exhaustive]
+    PyramidMissingBounds { count: usize },
+    #[non_exhaustive]
+    PyramidMetadataConflict { count: usize },
+    #[non_exhaustive]
+    PyramidMissingMetadata { count: usize },
 }
 
 /// Why CRS metadata could only be read best-effort.
@@ -798,6 +784,10 @@ pub fn write_report(path: &std::path::Path, report: &impl Serialize) -> Result<(
 fn gpio_inspect_arg(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
+
+#[cfg(test)]
+#[path = "diagnostics_tests.rs"]
+mod api_tests;
 
 #[cfg(test)]
 mod tests {

@@ -61,6 +61,7 @@ pub enum PyramidError {
          must address tiles in ascending id order",
         path.display()
     )]
+    #[non_exhaustive]
     OutOfOrder {
         /// The band archive.
         path: PathBuf,
@@ -71,6 +72,7 @@ pub enum PyramidError {
     },
     /// A tile two bands share did not decompress.
     #[error("tile {z}/{x}/{y} of band {layer:?} failed to decompress: {error}")]
+    #[non_exhaustive]
     TileDecompress {
         /// Tile zoom.
         z: u8,
@@ -85,6 +87,7 @@ pub enum PyramidError {
     },
     /// A combined shared-zoom tile did not compress.
     #[error("tile {z}/{x}/{y} failed to compress: {error}")]
+    #[non_exhaustive]
     TileCompress {
         /// Tile zoom.
         z: u8,
@@ -97,6 +100,7 @@ pub enum PyramidError {
     },
     /// A band's intermediate file could not be reserved.
     #[error("band {layer:?}: {error}")]
+    #[non_exhaustive]
     BandWorkFile {
         /// The band's layer.
         layer: String,
@@ -105,6 +109,7 @@ pub enum PyramidError {
     },
     /// Tiling a GeoParquet band failed in its convert half.
     #[error("band {layer:?}: convert failed: {error}")]
+    #[non_exhaustive]
     BandConvert {
         /// The band's layer.
         layer: String,
@@ -113,6 +118,7 @@ pub enum PyramidError {
     },
     /// Tiling a GeoParquet band failed in its export half.
     #[error("band {layer:?}: export failed: {error}")]
+    #[non_exhaustive]
     BandExport {
         /// The band's layer.
         layer: String,
@@ -154,6 +160,18 @@ impl crate::error::Classify for PyramidError {
 
 // Not `#[from]` on the variant: the inner error's message is already in this
 // one's, so it is not also a `source()` the CLI would print a second time.
+impl PyramidError {
+    /// [`Self::BandConvert`] for the frontends' classification tests, which
+    /// cannot build the `#[non_exhaustive]` variant.
+    #[doc(hidden)]
+    pub fn band_convert(layer: impl Into<String>, error: ConvertError) -> Self {
+        PyramidError::BandConvert {
+            layer: layer.into(),
+            error,
+        }
+    }
+}
+
 impl From<crate::pmtiles_writer::WriteError> for PyramidError {
     fn from(e: crate::pmtiles_writer::WriteError) -> Self {
         PyramidError::Archive(e.into())

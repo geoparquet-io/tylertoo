@@ -1854,6 +1854,7 @@ pub enum ConvertError {
     Writer(#[from] WriterError),
     /// The input CRS is neither EPSG:4326 nor EPSG:3857 (spec Q3).
     #[error("unsupported CRS {crs:?} in {input}: overviews require EPSG:4326 or EPSG:3857")]
+    #[non_exhaustive]
     UnsupportedCrs {
         /// The rejected CRS identifier.
         crs: String,
@@ -1867,6 +1868,7 @@ pub enum ConvertError {
     /// archive. The threshold is a share rather than 100% so a wrong-CRS file
     /// carrying a handful of `POINT(0 0)` placeholder rows still fails.
     #[error("{}", all_lost_message(.crs, .out_of_range, .unprojectable, .total, .max_abs))]
+    #[non_exhaustive]
     AllFeaturesOutOfRange {
         /// The CRS the input's metadata declares.
         crs: Crs,
@@ -1887,12 +1889,14 @@ pub enum ConvertError {
     /// The input has no geometry column: neither the GeoParquet `geo`
     /// metadata's `primary_column` nor a recognized geometry column name.
     #[error("{input} has no geometry column")]
+    #[non_exhaustive]
     NoGeometryColumn {
         /// Display name of the input (path, URL, or partition set).
         input: String,
     },
     /// The `--sort-key` column is not present in the input schema.
     #[error("sort-key column {name:?} not found in input schema")]
+    #[non_exhaustive]
     SortKeyColumnMissing {
         /// The requested column name.
         name: String,
@@ -1902,12 +1906,14 @@ pub enum ConvertError {
     RankingConflict,
     /// The `--class-rank` column is not present in the input schema.
     #[error("class-rank column {name:?} not found in input schema")]
+    #[non_exhaustive]
     ClassRankColumnMissing {
         /// The requested column name.
         name: String,
     },
     /// The `--class-rank` column is not a string (Utf8/LargeUtf8) column.
     #[error("class-rank column {name:?} is {data_type} but must be a string column")]
+    #[non_exhaustive]
     ClassRankColumnNotString {
         /// The requested column name.
         name: String,
@@ -1928,6 +1934,7 @@ pub enum ConvertError {
          tile grid overflows 32-bit tile coordinates and the PMTiles Hilbert tile-id \
          arithmetic"
     )]
+    #[non_exhaustive]
     ZoomAboveCeiling {
         /// The knob that asked for it, already naming the zoom: `--max-zoom 33`,
         /// or `--gsd 5e-6 (…), which implies z33`. The zoom is not repeated by
@@ -1982,6 +1989,7 @@ pub enum ConvertError {
     AccumulateWithoutCluster,
     /// An `--accumulate-attribute` column is not present in the input schema.
     #[error("accumulate-attribute column {name:?} not found in input schema")]
+    #[non_exhaustive]
     AccumulateColumnMissing {
         /// The requested column name.
         name: String,
@@ -1991,6 +1999,7 @@ pub enum ConvertError {
         "accumulate-attribute column {name:?} is {data_type} but must be numeric \
          (int/uint/float)"
     )]
+    #[non_exhaustive]
     AccumulateColumnNotNumeric {
         /// The requested column name.
         name: String,
@@ -2019,6 +2028,7 @@ pub enum ConvertError {
         "--max-zoom auto cannot honor --min-zoom {min_zoom}: auto never picks a zoom \
          above z{ceiling}. Lower --min-zoom, or pass an explicit --max-zoom"
     )]
+    #[non_exhaustive]
     AutoZoomMinAboveCeiling {
         /// The requested minimum zoom.
         min_zoom: u8,
@@ -2034,6 +2044,7 @@ pub enum ConvertError {
          have fewer than two distinct locations and no measurable extent. Pass an \
          explicit --max-zoom"
     )]
+    #[non_exhaustive]
     AutoZoomNoSignal {
         /// Input rows the estimate read (after `--bbox`/`--filter` row-group
         /// pruning).
@@ -2053,6 +2064,7 @@ pub enum ConvertError {
         "no output rows at or coarser than the zoom ceiling z{ceiling}: every feature first \
          appears at a finer zoom"
     )]
+    #[non_exhaustive]
     NothingAtOrBelowCeiling {
         /// The ceiling that was applied.
         ceiling: u8,
@@ -2078,6 +2090,7 @@ pub enum ConvertError {
          preflight safety ceiling (parquet's hard limit is 32,768 row groups per file) \
          even after auto-scaling --row-group-size; reduce the number of overview levels"
     )]
+    #[non_exhaustive]
     RowGroupCeilingUnreachable {
         /// Levels the preflight expects to hold rows. Counted from pass 1's
         /// pre-simplification winner hints, so a level that ends up empty
@@ -2091,6 +2104,7 @@ pub enum ConvertError {
     /// Only the pass-1 scan's is the preflight that
     /// `TYLERTOO_SKIP_MEMORY_PREFLIGHT` downgrades, so only it names that.
     #[error("{phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter.{}", skip_preflight_hint(phase))]
+    #[non_exhaustive]
     BudgetExceeded {
         /// Pipeline stage that cannot fit.
         phase: &'static str,

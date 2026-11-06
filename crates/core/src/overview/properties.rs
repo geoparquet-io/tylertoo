@@ -72,10 +72,12 @@ pub enum PropertySelectionError {
     /// An `include` name matches no input column: asking for a column that
     /// is not there is a typo, not a preference.
     #[error("included property {name:?} is not a column of the input (columns: {available})")]
+    #[non_exhaustive]
     UnknownInclude { name: String, available: String },
 
     /// The geometry column was named as a property.
     #[error("{name:?} is the geometry column, not a property; it is always kept")]
+    #[non_exhaustive]
     GeometryColumn { name: String },
 
     /// The geometry's bbox covering struct was named in an include list
@@ -85,6 +87,7 @@ pub enum PropertySelectionError {
         "{name:?} is the geometry's bbox covering, not a property; the writer regenerates \
          it, so it cannot be selected"
     )]
+    #[non_exhaustive]
     CoveringColumn { name: String },
 
     /// A column a tuning knob reads was excluded.
@@ -92,6 +95,7 @@ pub enum PropertySelectionError {
         "property {name:?} is excluded but {knob} reads it; keep it in the selection or \
          drop the knob"
     )]
+    #[non_exhaustive]
     RequiredByKnob { name: String, knob: String },
 }
 
