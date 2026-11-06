@@ -254,7 +254,7 @@ pub fn tylertoo_io::open_parquet<R: parquet::file::reader::ChunkReader + 'static
 pub fn tylertoo_io::open_parquet_with_metadata<R: parquet::file::reader::ChunkReader + 'static>(R, tylertoo_io::ReaderMetadata) -> tylertoo_io::ParquetSource<R>
 pub fn tylertoo_io::overview_writer<W: core::io::write::Write + core::marker::Send>(W, arrow_schema::schema::SchemaRef, &arrow_schema::schema::Schema, &tylertoo_io::OverviewWriteOptions) -> core::result::Result<tylertoo_io::BatchWriter<W>, parquet::errors::ParquetError>
 pub fn tylertoo_io::precheck_footer(&[u8]) -> core::result::Result<(), tylertoo_io::Error>
-pub fn tylertoo_io::read_batch_plan(&parquet::file::metadata::ParquetMetaData, core::option::Option<&[usize]>, usize, u64) -> usize
+pub fn tylertoo_io::read_batch_plan(&parquet::file::metadata::ParquetMetaData, core::option::Option<&[usize]>, core::option::Option<&parquet::arrow::ProjectionMask>, usize, u64) -> usize
 pub fn tylertoo_io::read_parquet_metadata<R: parquet::file::reader::ChunkReader>(&R) -> core::result::Result<alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>, parquet::errors::ParquetError>
 pub fn tylertoo_io::reader_metadata(alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>) -> core::result::Result<tylertoo_io::ReaderMetadata, parquet::errors::ParquetError>
 pub fn tylertoo_io::schema_without_metadata(&parquet::file::metadata::ParquetMetaData) -> core::result::Result<arrow_schema::schema::Schema, parquet::errors::ParquetError>

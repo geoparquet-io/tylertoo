@@ -9118,6 +9118,51 @@ mod tests {
         );
     }
 
+    /// The read batch size is a memory knob, never an output one: Overture
+    /// buildings planned 6-row batches where a narrower read plans 8,192, and
+    /// both must write the same archive. Small polygons over 3 parts, so
+    /// batches split row groups, parts and the levels' tiny-polygon dropping.
+    #[test]
+    fn read_batch_size_does_not_change_output_bytes() {
+        let geoms: Vec<Geometry<f64>> = (0..3000)
+            .map(|i| {
+                let (x, y) = (f64::from(i % 60) * 0.05, f64::from(i / 60) * 0.05);
+                let s = 0.0005 * f64::from(1 + i % 7);
+                Geometry::Polygon(geo::Rect::new((x, y), (x + s, y + s)).to_polygon())
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let parts = dir.path().join("parts");
+        std::fs::create_dir(&parts).unwrap();
+        write_input_partition(&parts.join("part-000.parquet"), &geoms, 0..1000, Some(300));
+        write_input_partition(
+            &parts.join("part-001.parquet"),
+            &geoms,
+            1000..3000,
+            Some(300),
+        );
+        let archive = |rows: usize| {
+            let opts = ConvertOptions {
+                read_batch_size: rows,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 12,
+                },
+                ..Default::default()
+            };
+            let work = dir.path().join(format!("rows-{rows}"));
+            std::fs::create_dir(&work).unwrap();
+            convert_and_export(&parts, &work, &opts)
+        };
+        let (small, large) = (archive(6), archive(8192));
+        assert!(
+            small == large,
+            "6- and 8192-row reads differ ({} vs {} bytes)",
+            small.len(),
+            large.len()
+        );
+    }
+
     /// A 0-row partition mid-set is skipped cleanly: global row offsets are
     /// unaffected and the output still matches the single-file equivalent.
     #[test]
