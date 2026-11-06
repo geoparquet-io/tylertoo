@@ -2,13 +2,13 @@
 //! each option, and a refusal names the option (#677; replaces mutation
 //! testing for the options owner).
 //!
-//! The oracle is the documented range (docs/OVERVIEW_TUNING.md, the CLI
+//! The oracle is the documented range (`docs/OVERVIEW_TUNING.md`, the CLI
 //! help, `core_owns_read_bounds`), not core's code, so loosening a bound
 //! fails. `None` means the range is undocumented and only the name is checked.
 use proptest::prelude::*;
 use tylertoo_core::overview::tiles::TilesOptions;
 
-/// (flag the refusal must name, documented verdict for value `v`).
+/// The flag each refusal must name.
 const KNOBS: [&str; 5] = [
     "read-batch-size",
     "gsd-base",
@@ -33,13 +33,11 @@ fn documented(knob: usize, v: f64) -> Option<bool> {
     match knob {
         0 => Some((1.0..=1_048_576.0).contains(&v.trunc()) && v >= 0.0),
         1 => non_finite.then_some(false),
-        2 => Some(v >= 0.0)
-            .filter(|_| !non_finite)
-            .or(non_finite.then_some(false)),
+        2 => Some(!non_finite && v >= 0.0).filter(|ok| *ok || non_finite),
         // "exponent (>=1)" in OVERVIEW_TUNING.md; only finiteness is
         // enforced (FOLLOWUP-drop-gamma), so below 1 is not asserted here.
         3 => (non_finite || v >= 1.0).then_some(v.is_finite()),
-        _ => Some(v.trunc() >= 1.0).filter(|_| v >= 0.0),
+        _ => (v >= 0.0).then_some(v.trunc() >= 1.0),
     }
 }
 
@@ -107,7 +105,7 @@ fn documented_boundaries() {
     check(3, 1.0).unwrap();
 }
 
-/// OVERVIEW_TUNING.md documents `--drop-gamma` as an exponent >= 1, but
+/// `OVERVIEW_TUNING.md` documents `--drop-gamma` as an exponent >= 1, but
 /// core accepts anything finite. Strict expected failure: when the follow-up
 /// lands this stops panicking and must be un-marked.
 #[test]
