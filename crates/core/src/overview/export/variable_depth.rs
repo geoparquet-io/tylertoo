@@ -409,9 +409,14 @@ fn member_runs(
                 .map(|&zoom| {
                     let mut runs: Vec<(u64, usize)> = Vec::new();
                     for (bbox, row) in &rows {
-                        row_member_keys(bbox, row, zoom, opts, |key| match runs.last_mut() {
-                            Some((k, n)) if *k == key => *n += 1,
-                            _ => runs.push((key, 1)),
+                        // Rows in a buffer alternate between two tiles, so
+                        // the last two runs both stay open.
+                        row_member_keys(bbox, row, zoom, opts, |key| {
+                            let open = runs.len().saturating_sub(2);
+                            match runs[open..].iter_mut().rev().find(|(k, _)| *k == key) {
+                                Some((_, n)) => *n += 1,
+                                None => runs.push((key, 1)),
+                            }
                         });
                     }
                     runs
@@ -758,40 +763,47 @@ impl VdScan {
             policy.block(zoom, key);
         }
         let canonical_kinds = self.kinds[self.canonical];
-        for (k, scan) in scans
-            .iter()
-            .enumerate()
-            .take(self.canonical)
-            .skip(self.first_probed)
-        {
-            let level_kinds = self.kinds[k];
-            if !level_kinds.may_have_points() && !canonical_kinds.may_have_points() {
-                continue;
-            }
-            let all: HashMap<u64, usize> = scan.tile_counts.iter().map(|(&k, &v)| (k, v)).collect();
-            let level = match level_kinds {
-                Kinds::Points => &all,
-                Kinds::Mixed => &self.level_points[k],
-                Kinds::NoPoints => &HashMap::new(),
-            };
-            let empty = HashMap::new();
-            let canon = match canonical_kinds {
-                Kinds::Points => &self.canonical_counts[k],
-                Kinds::Mixed => &self.canonical_points[k],
-                Kinds::NoPoints => &empty,
-            };
-            let zoom = self.zooms[k];
-            // With both kinds in the canonical band and polygons that may
-            // stand as points, an equal count proves nothing: a collapsed
-            // polygon can replace a thinned point. Every tile with a point
-            // is blocked instead.
-            let unprovable = self.collapsed_points && canonical_kinds == Kinds::Mixed;
-            for key in level.keys().chain(canon.keys()) {
-                if unprovable
-                    || level.get(key).copied().unwrap_or(0) != canon.get(key).copied().unwrap_or(0)
-                {
-                    policy.block(zoom, *key);
+        // With both kinds in the canonical band and polygons that may
+        // stand as points, an equal count proves nothing: a collapsed
+        // polygon can replace a thinned point. Every tile with a point
+        // is blocked instead.
+        let unprovable = self.collapsed_points && canonical_kinds == Kinds::Mixed;
+        let empty = HashMap::new();
+        // Each level compares on its own, so the levels run in parallel.
+        let bad: Vec<(u8, Vec<u64>)> = (self.first_probed..self.canonical)
+            .into_par_iter()
+            .filter_map(|k| {
+                let level_kinds = self.kinds[k];
+                if !level_kinds.may_have_points() && !canonical_kinds.may_have_points() {
+                    return None;
                 }
+                let all = &scans[k].tile_counts;
+                let level = |key: &u64| match level_kinds {
+                    Kinds::Points => all.get(key).copied().unwrap_or(0),
+                    Kinds::Mixed => self.level_points[k].get(key).copied().unwrap_or(0),
+                    Kinds::NoPoints => 0,
+                };
+                let level_keys: Box<dyn Iterator<Item = &u64> + '_> = match level_kinds {
+                    Kinds::Points => Box::new(all.keys()),
+                    Kinds::Mixed => Box::new(self.level_points[k].keys()),
+                    Kinds::NoPoints => Box::new(std::iter::empty()),
+                };
+                let canon = match canonical_kinds {
+                    Kinds::Points => &self.canonical_counts[k],
+                    Kinds::Mixed => &self.canonical_points[k],
+                    Kinds::NoPoints => &empty,
+                };
+                let keys = level_keys
+                    .chain(canon.keys())
+                    .filter(|key| unprovable || level(key) != canon.get(key).copied().unwrap_or(0))
+                    .copied()
+                    .collect();
+                Some((self.zooms[k], keys))
+            })
+            .collect();
+        for (zoom, keys) in bad {
+            for key in keys {
+                policy.block(zoom, key);
             }
         }
         let mut canonical_counts = self.canonical_counts;
