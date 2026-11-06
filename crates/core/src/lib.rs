@@ -147,8 +147,8 @@ pub(crate) mod wkb_column;
 
 // Convert: GeoParquet -> overview GeoParquet.
 pub use overview::convert::{
-    convert_to_overviews, write_convert_plan, ClassRanking, ConvertError, ConvertOptions,
-    ConvertReport, GeneralizationOverrides, InvalidOption, LevelPlan, LevelReport,
+    convert_to_overviews, write_convert_plan, ClassRanking, ClassRankingError, ConvertError,
+    ConvertOptions, ConvertReport, GeneralizationOverrides, InvalidOption, LevelPlan, LevelReport,
     OutOfRangeExemplar, PlanLevelReport, PlanReport, RepresentationBand, SkippedLevelReport,
 };
 pub use overview::{
@@ -177,8 +177,8 @@ pub use overview::tiles::{
 pub use shard::{ShardError, ShardInput, ShardPlan, ShardRange, ShardRole, TileRange};
 // Pyramid: build or merge zoom bands into one archive.
 pub use pyramid::{
-    build_pyramid, merge_bands, merge_bands_with_options, Band, BandMergeOptions, PyramidError,
-    PyramidOptions, PyramidReport,
+    build_pyramid, merge_bands, merge_bands_with_options, Band, BandMergeOptions, BandSpecError,
+    PyramidError, PyramidOptions, PyramidReport,
 };
 // Decode: PMTiles -> GeoParquet.
 pub use decode::{decode_pmtiles, DecodeError, DecodeOptions, DecodeReport};

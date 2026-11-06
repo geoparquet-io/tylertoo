@@ -96,6 +96,50 @@ impl core::marker::Unpin for tylertoo_core::ArchiveError
 impl core::marker::UnsafeUnpin for tylertoo_core::ArchiveError
 impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ArchiveError
 impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::ArchiveError
+#[non_exhaustive] pub enum tylertoo_core::BandSpecError
+#[non_exhaustive] pub tylertoo_core::BandSpecError::BadMaxZoom
+pub tylertoo_core::BandSpecError::BadMaxZoom::spec: alloc::string::String
+pub tylertoo_core::BandSpecError::BadMaxZoom::zoom: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::BandSpecError::BadMinZoom
+pub tylertoo_core::BandSpecError::BadMinZoom::spec: alloc::string::String
+pub tylertoo_core::BandSpecError::BadMinZoom::zoom: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::BandSpecError::EmptyInput
+pub tylertoo_core::BandSpecError::EmptyInput::spec: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::BandSpecError::EmptyLayer
+pub tylertoo_core::BandSpecError::EmptyLayer::spec: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::BandSpecError::MaxAboveCeiling
+pub tylertoo_core::BandSpecError::MaxAboveCeiling::max_zoom: u8
+pub tylertoo_core::BandSpecError::MaxAboveCeiling::spec: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::BandSpecError::MinAboveMax
+pub tylertoo_core::BandSpecError::MinAboveMax::spec: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::BandSpecError::NoLayer
+pub tylertoo_core::BandSpecError::NoLayer::path: alloc::string::String
+pub tylertoo_core::BandSpecError::NoLayer::sep: char
+pub tylertoo_core::BandSpecError::NoLayer::spec: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::BandSpecError::NoZoomRange
+pub tylertoo_core::BandSpecError::NoZoomRange::spec: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::BandSpecError::RangeNotLoHi
+pub tylertoo_core::BandSpecError::RangeNotLoHi::spec: alloc::string::String
+impl core::clone::Clone for tylertoo_core::BandSpecError
+pub fn tylertoo_core::BandSpecError::clone(&self) -> tylertoo_core::BandSpecError
+impl core::cmp::Eq for tylertoo_core::BandSpecError
+impl core::cmp::PartialEq for tylertoo_core::BandSpecError
+pub fn tylertoo_core::BandSpecError::eq(&self, &tylertoo_core::BandSpecError) -> bool
+impl core::error::Error for tylertoo_core::BandSpecError
+impl core::fmt::Debug for tylertoo_core::BandSpecError
+pub fn tylertoo_core::BandSpecError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::BandSpecError
+pub fn tylertoo_core::BandSpecError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::BandSpecError
+impl tylertoo_core::Classify for tylertoo_core::BandSpecError
+pub fn tylertoo_core::BandSpecError::kind(&self) -> tylertoo_core::ErrorKind
+impl core::marker::Freeze for tylertoo_core::BandSpecError
+impl core::marker::Send for tylertoo_core::BandSpecError
+impl core::marker::Sync for tylertoo_core::BandSpecError
+impl core::marker::Unpin for tylertoo_core::BandSpecError
+impl core::marker::UnsafeUnpin for tylertoo_core::BandSpecError
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::BandSpecError
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::BandSpecError
 #[non_exhaustive] pub enum tylertoo_core::CheckError
 pub tylertoo_core::CheckError::Io(core::io::error::Error)
 impl core::convert::From<core::io::error::Error> for tylertoo_core::CheckError
@@ -113,6 +157,30 @@ impl core::marker::Unpin for tylertoo_core::CheckError
 impl core::marker::UnsafeUnpin for tylertoo_core::CheckError
 impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::CheckError
 impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::CheckError
+#[non_exhaustive] pub enum tylertoo_core::ClassRankingError
+pub tylertoo_core::ClassRankingError::Empty
+#[non_exhaustive] pub tylertoo_core::ClassRankingError::NotFinite
+pub tylertoo_core::ClassRankingError::NotFinite::class: core::option::Option<alloc::string::String>
+pub tylertoo_core::ClassRankingError::NotFinite::rank: f64
+impl core::clone::Clone for tylertoo_core::ClassRankingError
+pub fn tylertoo_core::ClassRankingError::clone(&self) -> tylertoo_core::ClassRankingError
+impl core::cmp::PartialEq for tylertoo_core::ClassRankingError
+pub fn tylertoo_core::ClassRankingError::eq(&self, &tylertoo_core::ClassRankingError) -> bool
+impl core::error::Error for tylertoo_core::ClassRankingError
+impl core::fmt::Debug for tylertoo_core::ClassRankingError
+pub fn tylertoo_core::ClassRankingError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::ClassRankingError
+pub fn tylertoo_core::ClassRankingError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::ClassRankingError
+impl tylertoo_core::Classify for tylertoo_core::ClassRankingError
+pub fn tylertoo_core::ClassRankingError::kind(&self) -> tylertoo_core::ErrorKind
+impl core::marker::Freeze for tylertoo_core::ClassRankingError
+impl core::marker::Send for tylertoo_core::ClassRankingError
+impl core::marker::Sync for tylertoo_core::ClassRankingError
+impl core::marker::Unpin for tylertoo_core::ClassRankingError
+impl core::marker::UnsafeUnpin for tylertoo_core::ClassRankingError
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ClassRankingError
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ClassRankingError
 #[non_exhaustive] pub enum tylertoo_core::CollapseMode
 pub tylertoo_core::CollapseMode::Auto
 pub tylertoo_core::CollapseMode::Drop
@@ -1928,7 +1996,7 @@ pub tylertoo_core::Band::max_zoom: u8
 pub tylertoo_core::Band::min_zoom: u8
 impl tylertoo_core::Band
 pub fn tylertoo_core::Band::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<alloc::string::String>, u8, u8) -> Self
-pub fn tylertoo_core::Band::parse(&str) -> core::result::Result<Self, alloc::string::String>
+pub fn tylertoo_core::Band::parse(&str) -> core::result::Result<Self, tylertoo_core::BandSpecError>
 impl core::clone::Clone for tylertoo_core::Band
 pub fn tylertoo_core::Band::clone(&self) -> tylertoo_core::Band
 impl core::fmt::Debug for tylertoo_core::Band
@@ -2017,7 +2085,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::CheckResult
 #[non_exhaustive] pub struct tylertoo_core::ClassRanking
 impl tylertoo_core::ClassRanking
 pub fn tylertoo_core::ClassRanking::column(&self) -> &str
-pub fn tylertoo_core::ClassRanking::new(impl core::convert::Into<alloc::string::String>, alloc::vec::Vec<(alloc::string::String, f64)>, core::option::Option<f64>) -> core::result::Result<Self, alloc::string::String>
+pub fn tylertoo_core::ClassRanking::new(impl core::convert::Into<alloc::string::String>, alloc::vec::Vec<(alloc::string::String, f64)>, core::option::Option<f64>) -> core::result::Result<Self, tylertoo_core::ClassRankingError>
 pub fn tylertoo_core::ClassRanking::ranks(&self) -> &[(alloc::string::String, f64)]
 pub fn tylertoo_core::ClassRanking::unknown_rank(&self) -> f64
 impl core::clone::Clone for tylertoo_core::ClassRanking
@@ -3149,6 +3217,10 @@ pub trait tylertoo_core::Classify
 pub fn tylertoo_core::Classify::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::ArchiveError
 pub fn tylertoo_core::ArchiveError::kind(&self) -> tylertoo_core::ErrorKind
+impl tylertoo_core::Classify for tylertoo_core::BandSpecError
+pub fn tylertoo_core::BandSpecError::kind(&self) -> tylertoo_core::ErrorKind
+impl tylertoo_core::Classify for tylertoo_core::ClassRankingError
+pub fn tylertoo_core::ClassRankingError::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::ConfigError
 pub fn tylertoo_core::ConfigError::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::ConvertError

@@ -156,11 +156,7 @@ pub enum ConfigError {
     /// A class ranking built without [`ClassRanking::new`] carries a rank
     /// that is not finite (#428, b8fa58a). A NaN is not ordered, so the
     /// incumbent of a contested cell would silently keep it.
-    #[error(
-        "rank {rank} for {} must be a finite number (NaN and infinity cannot be ordered \
-         against other classes)",
-        class.as_deref().map_or_else(|| "unknown (unlisted) classes".to_string(), |c| format!("class {c:?}"))
-    )]
+    #[error("{}", rank_not_finite_message(class.as_deref(), *rank))]
     #[non_exhaustive]
     ClassRankNotFinite {
         /// The class, or `None` for the unknown-class rank.
@@ -557,7 +553,7 @@ pub fn class_ranking(
         (None, Some(column), Some(ranks)) => {
             ClassRanking::new(column, ranks.into_iter().collect(), unknown_rank)
                 .map(Some)
-                .map_err(invalid)
+                .map_err(|e| invalid(e.to_string()))
         }
     }
 }
@@ -577,22 +573,33 @@ pub fn representation(spec: Option<&str>) -> Result<Vec<RepresentationBand>, Con
     })
 }
 
-/// Every rank, and an explicit unknown-class rank, is finite (#428): the
-/// one rule and message behind [`ClassRanking::new`] (so `--class-rank` and
-/// Python's `class_ranks` read the same) and [`check_class_ranking`].
-pub(crate) fn check_ranks_finite(
+/// The one message for a non-finite class rank (#428), shared by
+/// [`ConfigError::ClassRankNotFinite`] and
+/// [`ClassRankingError::NotFinite`](super::convert::ClassRankingError::NotFinite).
+pub(crate) fn rank_not_finite_message(class: Option<&str>, rank: f64) -> String {
+    let who = class.map_or_else(
+        || "unknown (unlisted) classes".to_string(),
+        |c| format!("class {c:?}"),
+    );
+    format!(
+        "rank {rank} for {who} must be a finite number (NaN and infinity cannot be ordered \
+         against other classes)"
+    )
+}
+
+/// The first non-finite rank (#428), as `(class, rank)` with `None` for the
+/// unknown-class rank: the one rule behind [`ClassRanking::new`] (so
+/// `--class-rank` and Python's `class_ranks` read the same) and
+/// [`check_class_ranking`].
+pub(crate) fn first_non_finite_rank(
     ranks: &[(String, f64)],
     unknown_rank: Option<f64>,
-) -> Result<(), ConfigError> {
-    if let Some((class, rank)) = ranks.iter().find(|(_, r)| !r.is_finite()) {
-        return Err(ConfigError::ClassRankNotFinite {
-            class: Some(class.clone()),
-            rank: *rank,
-        });
-    }
-    match unknown_rank.filter(|u| !u.is_finite()) {
-        Some(rank) => Err(ConfigError::ClassRankNotFinite { class: None, rank }),
-        None => Ok(()),
+) -> Option<(Option<String>, f64)> {
+    match ranks.iter().find(|(_, r)| !r.is_finite()) {
+        Some((class, rank)) => Some((Some(class.clone()), *rank)),
+        None => unknown_rank
+            .filter(|u| !u.is_finite())
+            .map(|rank| (None, rank)),
     }
 }
 
@@ -601,6 +608,17 @@ pub(crate) fn check_ranks_finite(
 /// are public.
 pub(crate) fn check_class_ranking(ranking: &ClassRanking) -> Result<(), ConfigError> {
     check_ranks_finite(&ranking.ranks, Some(ranking.unknown_rank))
+}
+
+/// [`first_non_finite_rank`] as a [`ConfigError`].
+pub(crate) fn check_ranks_finite(
+    ranks: &[(String, f64)],
+    unknown_rank: Option<f64>,
+) -> Result<(), ConfigError> {
+    match first_non_finite_rank(ranks, unknown_rank) {
+        Some((class, rank)) => Err(ConfigError::ClassRankNotFinite { class, rank }),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

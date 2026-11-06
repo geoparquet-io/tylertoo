@@ -248,59 +248,56 @@ impl Band {
     ///
     /// # Errors
     ///
-    /// Returns a description of the problem if the spec has no zoom range, a
-    /// zoom that does not parse, a minimum above the maximum, a maximum above
+    /// A [`BandSpecError`] if the spec has no zoom range, a zoom that does
+    /// not parse, a minimum above the maximum, a maximum above
     /// [`crate::tile::MAX_ZOOM`], an empty input or layer, or no layer when
     /// none can be derived from the input.
-    pub fn parse(spec: &str) -> Result<Self, String> {
-        let (sep, at) =
-            band_separator(spec).ok_or_else(|| format!("band {spec:?}: {BAND_FORMS}"))?;
+    pub fn parse(spec: &str) -> Result<Self, BandSpecError> {
+        use BandSpecError as E;
+        let owned = || spec.to_string();
+        let (sep, at) = band_separator(spec).ok_or_else(|| E::NoZoomRange { spec: owned() })?;
         let (range, rest) = spec.split_at(at);
         let rest = &rest[sep.len_utf8()..];
-        let (lo, hi) = range.split_once('-').ok_or_else(|| {
-            format!(
-                "band {spec:?}: zoom range must be LO-HI; every band spec must \
-                 start with a LO-HI: (or LO-HI=) zoom range, e.g. \"0-5:{spec}\""
-            )
+        let (lo, hi) = range
+            .split_once('-')
+            .ok_or_else(|| E::RangeNotLoHi { spec: owned() })?;
+        let min_zoom: u8 = lo.trim().parse().map_err(|_| E::BadMinZoom {
+            spec: owned(),
+            zoom: lo.to_string(),
         })?;
-        let min_zoom: u8 = lo
-            .trim()
-            .parse()
-            .map_err(|_| format!("band {spec:?}: bad min zoom {lo:?}"))?;
-        let max_zoom: u8 = hi
-            .trim()
-            .parse()
-            .map_err(|_| format!("band {spec:?}: bad max zoom {hi:?}"))?;
+        let max_zoom: u8 = hi.trim().parse().map_err(|_| E::BadMaxZoom {
+            spec: owned(),
+            zoom: hi.to_string(),
+        })?;
         if min_zoom > max_zoom {
-            return Err(format!("band {spec:?}: min zoom above max zoom"));
+            return Err(E::MinAboveMax { spec: owned() });
         }
         if max_zoom > Self::MAX_ZOOM {
-            return Err(format!(
-                "band {spec:?}: max zoom {max_zoom} is above the supported ceiling {}",
-                Self::MAX_ZOOM
-            ));
+            return Err(E::MaxAboveCeiling {
+                spec: owned(),
+                max_zoom,
+            });
         }
 
         // A trailing separator is an empty layer name, not part of the path.
         // Falling through would silently keep it in the path.
         if rest.trim_end().ends_with(sep) {
-            return Err(format!("band {spec:?}: empty layer name"));
+            return Err(E::EmptyLayer { spec: owned() });
         }
         let (path, layer) = match sep {
             ':' => split_colon_form(rest),
             _ => split_equals_form(rest),
         };
         if path.is_empty() {
-            return Err(format!("band {spec:?}: empty input path"));
+            return Err(E::EmptyInput { spec: owned() });
         }
         let layer = match layer {
-            Some("") => return Err(format!("band {spec:?}: empty layer name")),
+            Some("") => return Err(E::EmptyLayer { spec: owned() }),
             Some(l) => l.to_string(),
-            None => default_layer_for(path).ok_or_else(|| {
-                format!(
-                    "band {spec:?}: cannot derive a layer name from {path:?}; \
-                     append {sep}LAYER"
-                )
+            None => default_layer_for(path).ok_or_else(|| E::NoLayer {
+                spec: owned(),
+                path: path.to_string(),
+                sep,
             })?,
         };
 
@@ -310,6 +307,102 @@ impl Band {
             min_zoom,
             max_zoom,
         })
+    }
+}
+
+/// Why [`Band::parse`] refused a band spec. Each variant carries the spec
+/// as given, and every one is a usage error
+/// ([`ErrorKind::Usage`](crate::ErrorKind::Usage)).
+///
+/// `#[non_exhaustive]`: new rules are added without a breaking change; match
+/// with a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum BandSpecError {
+    /// Neither `:` nor `=` closes a zoom range.
+    #[error("band {spec:?}: {BAND_FORMS}")]
+    #[non_exhaustive]
+    NoZoomRange {
+        /// The spec.
+        spec: String,
+    },
+    /// The zoom range has no `-`.
+    #[error(
+        "band {spec:?}: zoom range must be LO-HI; every band spec must \
+         start with a LO-HI: (or LO-HI=) zoom range, e.g. \"0-5:{spec}\""
+    )]
+    #[non_exhaustive]
+    RangeNotLoHi {
+        /// The spec.
+        spec: String,
+    },
+    /// The minimum zoom, as spelled, is not a `u8`.
+    #[error("band {spec:?}: bad min zoom {zoom:?}")]
+    #[non_exhaustive]
+    BadMinZoom {
+        /// The spec.
+        spec: String,
+        /// The minimum zoom as spelled.
+        zoom: String,
+    },
+    /// The maximum zoom, as spelled, is not a `u8`.
+    #[error("band {spec:?}: bad max zoom {zoom:?}")]
+    #[non_exhaustive]
+    BadMaxZoom {
+        /// The spec.
+        spec: String,
+        /// The maximum zoom as spelled.
+        zoom: String,
+    },
+    /// The minimum zoom is above the maximum.
+    #[error("band {spec:?}: min zoom above max zoom")]
+    #[non_exhaustive]
+    MinAboveMax {
+        /// The spec.
+        spec: String,
+    },
+    /// The maximum zoom is above [`crate::tile::MAX_ZOOM`].
+    #[error(
+        "band {spec:?}: max zoom {max_zoom} is above the supported ceiling {}",
+        crate::tile::MAX_ZOOM
+    )]
+    #[non_exhaustive]
+    MaxAboveCeiling {
+        /// The spec.
+        spec: String,
+        /// The maximum zoom.
+        max_zoom: u8,
+    },
+    /// The layer after the last separator is empty.
+    #[error("band {spec:?}: empty layer name")]
+    #[non_exhaustive]
+    EmptyLayer {
+        /// The spec.
+        spec: String,
+    },
+    /// The input path is empty.
+    #[error("band {spec:?}: empty input path")]
+    #[non_exhaustive]
+    EmptyInput {
+        /// The spec.
+        spec: String,
+    },
+    /// No layer was given and none can be derived from the input path.
+    #[error("band {spec:?}: cannot derive a layer name from {path:?}; append {sep}LAYER")]
+    #[non_exhaustive]
+    NoLayer {
+        /// The spec.
+        spec: String,
+        /// The input path.
+        path: String,
+        /// The separator the spec uses (`:` or `=`).
+        sep: char,
+    },
+}
+
+impl crate::error::Classify for BandSpecError {
+    fn kind(&self) -> crate::error::ErrorKind {
+        crate::error::ErrorKind::Usage
     }
 }
 
@@ -631,7 +724,8 @@ pub fn parse_bands<S: AsRef<str>>(specs: &[S]) -> Result<Vec<Band>, String> {
     let bands = specs
         .iter()
         .map(|s| Band::parse(s.as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
     validate_bands(&bands).map_err(|e| e.to_string())?;
     for (spec, band) in specs.iter().zip(&bands) {
         check_band_input_exists(spec.as_ref(), band)?;
@@ -5346,9 +5440,71 @@ mod tests {
     /// escape hatch from the error rather than the manual.
     #[test]
     fn band_spec_error_shows_both_forms() {
-        let err = Band::parse("0-5").unwrap_err();
+        let err = Band::parse("0-5").unwrap_err().to_string();
         assert!(err.contains("LO-HI:INPUT[:LAYER]"), "{err}");
         assert!(err.contains("LO-HI=INPUT[=LAYER]"), "{err}");
+    }
+
+    /// Each refusal's variant, kind and message; the messages are the
+    /// pre-typed (`String`) ones byte for byte.
+    #[test]
+    fn band_spec_errors_are_typed_usage_errors_with_the_old_messages() {
+        use crate::error::{Classify, ErrorKind};
+        type IsVariant = fn(&BandSpecError) -> bool;
+        let cases: [(&str, IsVariant, &str); 9] = [
+            (
+                "0-5",
+                |e| matches!(e, BandSpecError::NoZoomRange { .. }),
+                "band \"0-5\": expected LO-HI:INPUT[:LAYER] or LO-HI=INPUT[=LAYER]",
+            ),
+            (
+                "5:a.parquet",
+                |e| matches!(e, BandSpecError::RangeNotLoHi { .. }),
+                "band \"5:a.parquet\": zoom range must be LO-HI; every band spec must \
+                 start with a LO-HI: (or LO-HI=) zoom range, e.g. \"0-5:5:a.parquet\"",
+            ),
+            (
+                "x-5:a.parquet",
+                |e| matches!(e, BandSpecError::BadMinZoom { zoom, .. } if zoom == "x"),
+                "band \"x-5:a.parquet\": bad min zoom \"x\"",
+            ),
+            (
+                "0-y:a.parquet",
+                |e| matches!(e, BandSpecError::BadMaxZoom { zoom, .. } if zoom == "y"),
+                "band \"0-y:a.parquet\": bad max zoom \"y\"",
+            ),
+            (
+                "5-0:a.parquet",
+                |e| matches!(e, BandSpecError::MinAboveMax { .. }),
+                "band \"5-0:a.parquet\": min zoom above max zoom",
+            ),
+            (
+                "0-40:a.parquet",
+                |e| matches!(e, BandSpecError::MaxAboveCeiling { max_zoom: 40, .. }),
+                "band \"0-40:a.parquet\": max zoom 40 is above the supported ceiling 30",
+            ),
+            (
+                "0-5:a.parquet:",
+                |e| matches!(e, BandSpecError::EmptyLayer { .. }),
+                "band \"0-5:a.parquet:\": empty layer name",
+            ),
+            (
+                "0-5:",
+                |e| matches!(e, BandSpecError::EmptyInput { .. }),
+                "band \"0-5:\": empty input path",
+            ),
+            (
+                "0-5=/",
+                |e| matches!(e, BandSpecError::NoLayer { sep: '=', .. }),
+                "band \"0-5=/\": cannot derive a layer name from \"/\"; append =LAYER",
+            ),
+        ];
+        for (spec, is_variant, message) in cases {
+            let err = Band::parse(spec).expect_err(spec);
+            assert!(is_variant(&err), "{spec:?}: {err:?}");
+            assert_eq!(err.kind(), ErrorKind::Usage, "{spec:?}");
+            assert_eq!(err.to_string(), message, "{spec:?}");
+        }
     }
 
     /// #482: a remote input is a GeoParquet source, decided from the URL
