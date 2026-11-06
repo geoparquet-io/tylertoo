@@ -59,6 +59,7 @@ pub mod covering;
 pub mod decode;
 pub mod dedup;
 pub mod diagnostics;
+pub mod error;
 pub mod fs_probe;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -94,8 +95,14 @@ pub use pmtiles_writer::{StreamingPmtilesWriter, StreamingWriteStats};
 // Re-export CRS validation for public API
 pub use quality::{extract_crs, validate_wgs84, CrsInfo};
 
-/// Errors that can occur while reading GeoParquet or writing PMTiles.
+/// Errors that can occur while reading GeoParquet or reading and writing
+/// PMTiles.
+///
+/// `#[non_exhaustive]`: new failure modes are added without a breaking
+/// change; match with a wildcard arm. [`error::Classify::kind`] says what a
+/// failure means to the caller.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Source loss accounting failed.
     #[error(transparent)]
@@ -103,17 +110,23 @@ pub enum Error {
     #[error("Failed to read GeoParquet file: {0}")]
     GeoParquetRead(String),
 
+    /// Writing a PMTiles archive failed (#438).
     #[error("Failed to write PMTiles: {0}")]
-    PMTilesWrite(String),
+    Write(pmtiles_writer::WriteError),
 
+    /// A PMTiles archive could not be read (#438).
     #[error("Failed to read PMTiles: {0}")]
-    PMTilesRead(String),
+    Archive(archive_index::ArchiveError),
 
-    #[error("Invalid geometry at feature {feature_id}: {reason}")]
-    InvalidGeometry { feature_id: usize, reason: String },
-
-    #[error("MVT encoding failed: {0}")]
-    MvtEncoding(String),
+    /// `error`, at `path`: the archive or output it concerns, for a caller
+    /// that holds several.
+    #[error("{}: {error}", path.display())]
+    At {
+        /// The archive or output.
+        path: std::path::PathBuf,
+        /// What went wrong there.
+        error: Box<Error>,
+    },
 
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
@@ -124,19 +137,39 @@ pub enum Error {
     /// The output cannot be written (#452: checked before any work).
     #[error(transparent)]
     Output(#[from] atomic_output::OutputNotWritable),
+}
 
-    /// An option refused before any work
-    /// ([`pyramid::PyramidOptions::validate`], #779).
-    #[error(transparent)]
-    Config(#[from] overview::config::ConfigError),
+// Not `#[from]`: the inner error's message is already in this one's, so it
+// is not also a `source()` the CLI would print a second time.
+impl From<pmtiles_writer::WriteError> for Error {
+    fn from(e: pmtiles_writer::WriteError) -> Self {
+        Error::Write(e)
+    }
+}
+
+impl From<archive_index::ArchiveError> for Error {
+    fn from(e: archive_index::ArchiveError) -> Self {
+        Error::Archive(e)
+    }
 }
 
 impl Error {
-    /// Whether this is an option the caller must fix, refused before any
-    /// work (#779), as `ConvertError::is_config` and its siblings classify
-    /// theirs.
-    pub fn is_config(&self) -> bool {
-        matches!(self, Error::Config(_) | Error::InvalidConfig(_))
+    /// `error`, attributed to `path` ([`Error::At`]).
+    pub(crate) fn at(path: &std::path::Path, error: impl Into<Error>) -> Self {
+        Error::At {
+            path: path.to_path_buf(),
+            error: Box::new(error.into()),
+        }
+    }
+}
+
+impl error::Classify for Error {
+    fn kind(&self) -> error::ErrorKind {
+        match self {
+            Error::InvalidConfig(_) => error::ErrorKind::Usage,
+            Error::At { error, .. } => error.kind(),
+            _ => error::ErrorKind::Runtime,
+        }
     }
 }
 
@@ -144,29 +177,36 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
+    use super::error::{Classify, ErrorKind};
     use super::*;
 
     #[test]
-    fn only_configuration_errors_are_classified_as_config() {
-        assert!(
-            Error::Config(overview::config::ConfigError::InvalidExtent { extent: 0 }).is_config()
+    fn only_configuration_errors_are_classified_as_usage() {
+        assert_eq!(
+            Error::InvalidConfig("invalid band options".into()).kind(),
+            ErrorKind::Usage
         );
-        assert!(Error::InvalidConfig("invalid band options".into()).is_config());
         for error in [
             Error::GeoParquetRead("invalid footer".into()),
-            Error::PMTilesRead("invalid header".into()),
-            Error::PMTilesWrite("disk full".into()),
-            Error::InvalidGeometry {
-                feature_id: 7,
-                reason: "invalid ring".into(),
-            },
-            Error::MvtEncoding("invalid property".into()),
+            archive_index::ArchiveError::Header("invalid header".into()).into(),
+            pmtiles_writer::WriteError::Finalized.into(),
             Error::Io(std::io::Error::other("disk full")),
             Error::Accounting(diagnostics::AccountingError::Io(std::io::Error::other(
                 "spill failed",
             ))),
         ] {
-            assert!(!error.is_config(), "runtime error misclassified: {error}");
+            assert_eq!(error.kind(), ErrorKind::Runtime, "{error}");
         }
+    }
+
+    /// An error attributed to a path keeps its own kind and prefixes the path.
+    #[test]
+    fn an_attributed_error_keeps_its_kind() {
+        let at = Error::at(
+            std::path::Path::new("a.pmtiles"),
+            Error::InvalidConfig("x".into()),
+        );
+        assert_eq!(at.kind(), ErrorKind::Usage);
+        assert_eq!(at.to_string(), "a.pmtiles: Invalid configuration: x");
     }
 }

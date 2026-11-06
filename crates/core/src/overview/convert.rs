@@ -1027,8 +1027,8 @@ impl ConvertOptions {
     ///
     /// # Errors
     ///
-    /// The first rule broken. [`ConvertError::is_config`] is true for every
-    /// error this returns.
+    /// The first rule broken; every error this returns is
+    /// [`ErrorKind::Usage`](crate::error::ErrorKind::Usage).
     /// Validate these options and return the immutable engine configuration.
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
         super::config::validate_convert(self)
@@ -2034,25 +2034,39 @@ pub enum ConvertError {
     },
 }
 
-impl ConvertError {
-    /// Whether this is an option the caller must fix, refused before any
-    /// input was read ([`ConvertOptions::validate`]'s errors), as opposed to
-    /// a problem with the data or the run. The Python bindings raise these
-    /// as `tylertoo.ConfigError`.
-    pub fn is_config(&self) -> bool {
-        matches!(
-            self,
+impl crate::error::Classify for ConvertError {
+    /// [`ErrorKind::Usage`](crate::error::ErrorKind::Usage) is an option
+    /// refused before any input was read ([`ConvertOptions::validate`]'s
+    /// errors); [`ErrorKind::Input`](crate::error::ErrorKind::Input) a
+    /// column or an input the tiler cannot work with; the #543 memory
+    /// preflight is [`ErrorKind::Resource`](crate::error::ErrorKind::Resource).
+    fn kind(&self) -> crate::error::ErrorKind {
+        use crate::error::ErrorKind;
+        match self {
             ConvertError::Config(_)
-                | ConvertError::InvalidConfig(_)
-                | ConvertError::InvalidLevels(_)
-                | ConvertError::ZoomAboveCeiling { .. }
-                | ConvertError::RankingConflict
-                | ConvertError::ClusterPartitioningUnsupported
-                | ConvertError::VerbatimPartitioningUnsupported
-                | ConvertError::AccumulateWithoutCluster
-                | ConvertError::AutoZoomMinAboveCeiling { .. }
-                | ConvertError::Filter(super::filter::FilterError::Parse(_))
-        )
+            | ConvertError::InvalidConfig(_)
+            | ConvertError::InvalidLevels(_)
+            | ConvertError::ZoomAboveCeiling { .. }
+            | ConvertError::RankingConflict
+            | ConvertError::ClusterPartitioningUnsupported
+            | ConvertError::VerbatimPartitioningUnsupported
+            | ConvertError::AccumulateWithoutCluster
+            | ConvertError::AutoZoomMinAboveCeiling { .. }
+            | ConvertError::Filter(super::filter::FilterError::Parse(_)) => ErrorKind::Usage,
+            // The box is too small for this input (#543).
+            ConvertError::BudgetExceeded { .. } => ErrorKind::Resource,
+            // The input itself is the problem, not the run (#429).
+            ConvertError::AllFeaturesOutOfRange { .. }
+            | ConvertError::UnsupportedCrs { .. }
+            | ConvertError::SortKeyColumnMissing { .. }
+            | ConvertError::ClassRankColumnMissing { .. }
+            | ConvertError::ClassRankColumnNotString { .. }
+            | ConvertError::AccumulateColumnMissing { .. }
+            | ConvertError::AccumulateColumnNotNumeric { .. }
+            | ConvertError::AutoZoomNoSignal { .. }
+            | ConvertError::Properties(_) => ErrorKind::Input,
+            _ => ErrorKind::Runtime,
+        }
     }
 }
 

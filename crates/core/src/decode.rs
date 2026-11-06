@@ -242,6 +242,22 @@ pub enum DecodeError {
     Write(String),
 }
 
+impl crate::error::Classify for DecodeError {
+    /// An inverted zoom range, a raster archive, or a property that collides
+    /// with a provenance column is the caller's input problem; a damaged or
+    /// unreadable archive, or a failed write, is a failed run.
+    fn kind(&self) -> crate::error::ErrorKind {
+        use crate::error::ErrorKind;
+        match self {
+            DecodeError::InvalidZoomRange { .. }
+            | DecodeError::NotVectorTiles(_)
+            | DecodeError::ReservedColumn(_) => ErrorKind::Input,
+            DecodeError::Archive(e) => e.kind(),
+            _ => ErrorKind::Runtime,
+        }
+    }
+}
+
 /// Decode a PMTiles archive into a GeoParquet file.
 ///
 /// See the module docs for output semantics (no deduplication, tiled
