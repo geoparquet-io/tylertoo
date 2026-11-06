@@ -122,7 +122,7 @@ fn pyramid_has_parity_with_export_flags() {
         // Redundant with pyramid's --work-dir, which band export spill falls
         // back to (pyramid.rs, #427).
         "spill-dir",
-        // Real gap, not an intent: follow-up issue: pyramid --profile
+        // Real gap, not an intent: follow-up issue #801 (pyramid --profile)
         "profile",
     ]
     .into_iter()
