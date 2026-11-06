@@ -34,6 +34,7 @@ use super::level::{gsd, Mode, OverviewsMeta, OVERVIEWS_KEY};
 
 /// Errors produced when opening or reading an overview file.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReaderError {
     /// I/O error opening the backing file.
     #[error("io error: {0}")]

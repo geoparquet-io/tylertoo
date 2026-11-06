@@ -971,7 +971,7 @@ fn makes_placeholder_squares(
     let global = match options.simplify.collapse {
         CollapseMode::Square => true,
         CollapseMode::Auto => options.entry_zoom.is_none(),
-        CollapseMode::Point | CollapseMode::Drop => false,
+        _ => false,
     };
     let banded = options
         .representation
@@ -1105,6 +1105,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
                 return Ok(());
             }
             TilesOutcome::Converted(report) => report,
+            other => anyhow::bail!("unhandled tiles outcome: {other:?}"),
         };
     let (convert_report, export_report) = (&report.convert, &report.export);
 
@@ -1708,11 +1709,10 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
         Some(z) => (Some(z), Some(z)),
         None => (args.min_zoom, args.max_zoom),
     };
-    let options = DecodeOptions {
-        min_zoom,
-        max_zoom,
-        layer: args.layer,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(min_zoom)
+        .with_max_zoom(max_zoom)
+        .with_layer(args.layer);
     // Before the "Decoding" line, so an inverted range prints nothing else.
     options.validate()?;
 
@@ -2981,10 +2981,8 @@ mod tests {
             "--representation",
             "0-3:point,4-6:geom"
         ])));
-        let partitioning = tylertoo_core::internal::overview::convert::ConvertOptions {
-            mode: tylertoo_core::internal::overview::level::Mode::Partitioning,
-            ..verbatim_opts(&[])
-        };
+        let partitioning = verbatim_opts(&[])
+            .with_mode(tylertoo_core::internal::overview::level::Mode::Partitioning);
         assert!(!makes_placeholder_squares(&partitioning));
     }
 

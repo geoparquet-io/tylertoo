@@ -9,15 +9,17 @@ fn plan_sources_validates_before_opening_input() {
     let input = dir.path().join("corrupt.parquet");
     std::fs::write(&input, b"corrupt").unwrap();
     let source = ConvertSource::resolve_path(&input).unwrap();
-    let opts = ConvertOptions {
-        levels: tylertoo_core::internal::overview::convert::LevelPlan::Gsds(vec![]),
-        properties: tylertoo_core::internal::overview::properties::PropertySelection {
-            exclude_all: true,
-            ..Default::default()
-        },
-        save_plan: Some(dir.path().join("plan.arrow")),
-        ..Default::default()
-    };
+    let opts = ConvertOptions::default()
+        .with_levels(tylertoo_core::internal::overview::convert::LevelPlan::Gsds(
+            vec![],
+        ))
+        .with_properties(
+            tylertoo_core::internal::overview::properties::PropertySelection {
+                exclude_all: true,
+                ..Default::default()
+            },
+        )
+        .with_save_plan(Some(dir.path().join("plan.arrow")));
     let err = write_convert_plan_sources(&source, &opts).unwrap_err();
     assert_eq!(
         err.kind(),
@@ -32,10 +34,7 @@ fn path_validates_before_resolving_partitions() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.parquet"), b"corrupt").unwrap();
     std::fs::write(dir.path().join("b.parquet"), b"corrupt").unwrap();
-    let opts = ConvertOptions {
-        gsd_base: 0.0,
-        ..Default::default()
-    };
+    let opts = ConvertOptions::default().with_gsd_base(0.0);
     let err = convert_to_overviews(dir.path(), dir.path().join("out.parquet"), &opts).unwrap_err();
     assert_eq!(
         err.kind(),
@@ -47,24 +46,17 @@ fn path_validates_before_resolving_partitions() {
 #[test]
 fn core_owns_read_bounds() {
     for size in [0, 1_048_577] {
-        let opts = ConvertOptions {
-            read_batch_size: size,
-            ..Default::default()
-        };
+        let opts = ConvertOptions::default().with_read_batch_size(size);
         assert!(opts.validate().is_err(), "accepted read_batch_size={size}");
     }
     for size in [1, 1_048_576] {
-        ConvertOptions {
-            read_batch_size: size,
-            ..Default::default()
-        }
-        .validate()
-        .unwrap();
+        ConvertOptions::default()
+            .with_read_batch_size(size)
+            .validate()
+            .unwrap();
     }
-    let opts = ConvertOptions {
-        read_workers: tylertoo_core::internal::overview::convert::read_workers_ceiling() + 1,
-        ..Default::default()
-    };
+    let opts = ConvertOptions::default()
+        .with_read_workers(tylertoo_core::internal::overview::convert::read_workers_ceiling() + 1);
     assert!(opts.validate().is_err(), "accepted excess read_workers");
 }
 

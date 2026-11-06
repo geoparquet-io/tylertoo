@@ -106,6 +106,7 @@ const PMTILES_VERSION: u8 = 3;
 /// Tile type enumeration (byte 99 in header)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum TileType {
     Unknown = 0,
     Mvt = 1,

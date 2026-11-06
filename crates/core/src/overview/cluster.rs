@@ -65,6 +65,7 @@ pub const POINT_COUNT_COLUMN: &str = "point_count";
 
 /// Numeric aggregation operators for `--accumulate-attribute` (Q6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AccumulateOp {
     /// Sum of the non-null values.
     Sum,

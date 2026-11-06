@@ -45,15 +45,13 @@ const FIXTURES: &[(&str, &str)] = &[
 /// Zooms 0-12: deep enough that export cuts real tiles from these
 /// city-scale fixtures, shallow enough to stay a CI-sized bench.
 fn convert_options() -> ConvertOptions {
-    ConvertOptions {
-        levels: LevelPlan::ZoomRange {
+    ConvertOptions::default()
+        .with_levels(LevelPlan::ZoomRange {
             min_zoom: 0,
             max_zoom: 12,
-        },
-        read_workers: 1,
-        in_flight_batches: 1,
-        ..Default::default()
-    }
+        })
+        .with_read_workers(1)
+        .with_in_flight_batches(1)
 }
 
 fn fixture_path(name: &str) -> PathBuf {

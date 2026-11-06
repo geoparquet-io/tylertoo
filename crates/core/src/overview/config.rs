@@ -41,6 +41,7 @@ pub const DEFAULT_LADDER_STEP: u8 = 1;
 
 /// What an output file is, for [`ConfigError::OutputIsDirectory`]'s message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OutputKind {
     /// A PMTiles archive (`tiles`, `export-pmtiles`, `pyramid`, `merge`).
     Pmtiles,

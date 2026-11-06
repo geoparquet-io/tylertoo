@@ -70,13 +70,10 @@ fn bench_coverage_fill(c: &mut Criterion) {
     convert_to_overviews(
         &input,
         &overview,
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 0,
-                max_zoom: 12,
-            },
-            ..Default::default()
-        },
+        &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 12,
+        }),
     )
     .expect("convert");
     let archive = dir.path().join("out.pmtiles");
@@ -85,10 +82,7 @@ fn bench_coverage_fill(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
     group.sample_size(10);
     for (name, fill) in [("export/off", false), ("export/fill", true)] {
-        let opts = ExportOptions {
-            coverage_fill: fill,
-            ..ExportOptions::default()
-        };
+        let opts = ExportOptions::default().with_coverage_fill(fill);
         group.bench_function(name, |b| {
             b.iter(|| export_pmtiles(&overview, &archive, &opts).expect("export"));
         });

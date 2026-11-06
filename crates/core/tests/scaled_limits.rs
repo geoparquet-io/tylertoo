@@ -46,13 +46,10 @@ const SCALED_LIMIT: u64 = 16 * 1024;
 const BELOW_ONE_ROW: u64 = 64;
 
 fn options() -> ConvertOptions {
-    ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: 0,
-            max_zoom: 14,
-        },
-        ..Default::default()
-    }
+    ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: 0,
+        max_zoom: 14,
+    })
 }
 
 type Signature = (Vec<(usize, usize)>, Vec<(u8, usize, usize)>);
@@ -347,15 +344,13 @@ fn loss_reports_exceeding_the_memory_allowance(dir: &Path) {
     writer.write(&batch).unwrap();
     writer.close().unwrap();
     let plan = dir.join("losses.plan");
-    let options = ConvertOptions {
-        save_plan: Some(plan.clone()),
-        filter: Some("id = 0".into()),
-        levels: LevelPlan::ZoomRange {
+    let options = ConvertOptions::default()
+        .with_save_plan(Some(plan.clone()))
+        .with_filter(Some("id = 0".into()))
+        .with_levels(LevelPlan::ZoomRange {
             min_zoom: 0,
             max_zoom: 0,
-        },
-        ..Default::default()
-    };
+        });
     assert!(
         (ROWS - 1) * std::mem::size_of::<tylertoo_core::internal::diagnostics::SourceLoss>()
             > (1 << 20) / 10
@@ -384,11 +379,7 @@ fn loss_reports_exceeding_the_memory_allowance(dir: &Path) {
     let replay = convert_to_overviews(
         &input,
         dir.join("loss-replay.parquet"),
-        &ConvertOptions {
-            plan: Some(plan),
-            save_plan: None,
-            ..options.clone()
-        },
+        &options.clone().with_plan(Some(plan)).with_save_plan(None),
     )
     .unwrap();
     assert_eq!(replay.source_losses.len(), ROWS - 1);
@@ -399,13 +390,8 @@ fn loss_reports_exceeding_the_memory_allowance(dir: &Path) {
     let tiles = tylertoo_core::internal::overview::tiles::convert_to_pmtiles(
         &tylertoo_core::internal::overview::tiles::TilesInput::Path(input.clone()),
         &dir.join("losses.pmtiles"),
-        &tylertoo_core::internal::overview::tiles::TilesOptions {
-            convert: ConvertOptions {
-                save_plan: None,
-                ..options.clone()
-            },
-            ..Default::default()
-        },
+        &tylertoo_core::internal::overview::tiles::TilesOptions::default()
+            .with_convert(options.clone().with_save_plan(None)),
     )
     .unwrap();
     let tylertoo_core::internal::overview::tiles::TilesOutcome::Converted(tiles) = tiles else {
@@ -446,20 +432,14 @@ fn loss_reports_exceeding_the_memory_allowance(dir: &Path) {
     convert_to_overviews(
         &polygons,
         &overview,
-        &ConvertOptions {
-            filter: None,
-            save_plan: None,
-            ..options
-        },
+        &options.with_filter(None).with_save_plan(None),
     )
     .unwrap();
     let exported = tylertoo_core::internal::overview::export::export_pmtiles(
         &overview,
         dir.join("quantized.pmtiles"),
-        &tylertoo_core::internal::overview::export::ExportOptions {
-            feature_id: Some("id".into()),
-            ..Default::default()
-        },
+        &tylertoo_core::internal::overview::export::ExportOptions::default()
+            .with_feature_id(Some("id".into())),
     )
     .unwrap();
     assert_eq!(exported.source_losses.len(), ROWS - 1);

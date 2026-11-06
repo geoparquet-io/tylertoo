@@ -45,13 +45,10 @@ fn convert_in_pool(input: &Path, output: &Path) {
             convert_to_overviews(
                 &input,
                 &output,
-                &ConvertOptions {
-                    levels: LevelPlan::ZoomRange {
-                        min_zoom: 0,
-                        max_zoom: 12,
-                    },
-                    ..Default::default()
-                },
+                &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 12,
+                }),
             )
             .expect("convert");
         });

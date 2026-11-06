@@ -19,13 +19,10 @@ fn shape_descriptor_survives_convert_check_export_and_auto_zoom() {
     let descriptor = source.resolved_schema().unwrap();
     assert_eq!(descriptor.geometry_name(), Some("SHAPE"));
     assert_eq!(descriptor.primary_column(), Some("SHAPE"));
-    let options = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: 14,
-            max_zoom: 14,
-        },
-        ..Default::default()
-    };
+    let options = ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: 14,
+        max_zoom: 14,
+    });
     let evidence =
         tylertoo_core::internal::overview::auto_zoom::estimate_max_zoom(&source, &options).unwrap();
     assert!(evidence.chosen_zoom >= 14);
@@ -95,13 +92,10 @@ fn native_geoparquet2_multipart_reports_declared_crs() {
     }
     let source = ConvertSource::resolve_path(&input).unwrap();
     let output = temp.path().join("overview.parquet");
-    let options = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: 14,
-            max_zoom: 14,
-        },
-        ..Default::default()
-    };
+    let options = ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: 14,
+        max_zoom: 14,
+    });
     let report = tylertoo_core::internal::overview::convert::convert_to_overviews_sources(
         &source, &output, &options,
     )

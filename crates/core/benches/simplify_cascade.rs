@@ -108,10 +108,7 @@ fn bench_simplify_cascade(c: &mut Criterion) {
     // collapsed parts into placeholder squares, which costs more on a
     // boundary with many small islands (about +55% on fieldmaps_boundary);
     // the `square/` ids track that default from here on.
-    let opts = SimplifyOptions {
-        collapse: CollapseMode::Drop,
-        ..SimplifyOptions::default()
-    };
+    let opts = SimplifyOptions::default().with_collapse(CollapseMode::Drop);
     let square_opts = SimplifyOptions::default();
 
     let fixtures: Vec<(&str, Option<Geometry<f64>>)> = vec![

@@ -1552,6 +1552,7 @@ fn parse_layers(
 
 /// What a pyramid build produced.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PyramidReport {
     /// Aggregated diagnostics for this pyramid only.
     pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
@@ -1638,6 +1639,7 @@ impl serde::Serialize for PyramidReport {
 
 /// Knobs for [`merge_bands_with_options`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct BandMergeOptions {
     /// Let a pre-tiled band's declared zoom range overshoot what its archive
     /// actually holds (#495) instead of failing. Off matches
@@ -1655,10 +1657,16 @@ pub struct BandMergeOptions {
     pub metadata: TilesetMetadata,
 }
 
+with_setters!(BandMergeOptions {
+    with_allow_missing_zooms => allow_missing_zooms: bool,
+    with_metadata => metadata: TilesetMetadata,
+});
+
 /// How the one-shot pyramid tiles each GeoParquet band.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
+#[non_exhaustive]
 pub struct PyramidOptions {
     /// Convert knobs applied to every source band, with the band's own zoom
     /// range substituted for [`ConvertOptions::levels`].
@@ -1704,6 +1712,14 @@ pub struct PyramidOptions {
     #[cfg_attr(feature = "cli", arg(skip = Self::default().metadata))]
     pub metadata: TilesetMetadata,
 }
+
+with_setters!(PyramidOptions {
+    with_convert => convert: ConvertOptions,
+    with_export => export: ExportOptions,
+    with_work_dir => work_dir: Option<PathBuf>,
+    with_allow_missing_zooms => allow_missing_zooms: bool,
+    with_metadata => metadata: TilesetMetadata,
+});
 
 impl Default for PyramidOptions {
     fn default() -> Self {

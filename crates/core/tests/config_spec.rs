@@ -84,20 +84,14 @@ fn invalid_level_plans_cannot_produce_a_validation_proof() {
         },
         LevelPlan::Gsds(vec![]),
     ] {
-        let options = ConvertOptions {
-            levels,
-            ..Default::default()
-        };
+        let options = ConvertOptions::default().with_levels(levels);
         assert!(options.validate().is_err());
     }
 }
 
 #[test]
 fn export_zoom_bounds_are_checked_without_an_input() {
-    let options = ExportOptions {
-        min_zoom: Some(255),
-        ..Default::default()
-    };
+    let options = ExportOptions::default().with_min_zoom(Some(255));
     assert!(options
         .validate()
         .unwrap_err()
@@ -108,15 +102,13 @@ fn export_zoom_bounds_are_checked_without_an_input() {
 #[test]
 fn accumulation_specs_round_trip_without_losing_order_or_repeated_columns() {
     use tylertoo_core::internal::overview::convert::parse_accumulate;
-    let options = ConvertOptions {
-        cluster: true,
-        accumulate: vec![
+    let options = ConvertOptions::default()
+        .with_cluster(true)
+        .with_accumulate(vec![
             parse_accumulate("z:sum").unwrap(),
             parse_accumulate("a:max").unwrap(),
             parse_accumulate("z:mean").unwrap(),
-        ],
-        ..Default::default()
-    };
+        ]);
     let encoded = serde_json::to_value(&options).unwrap();
     let decoded: ConvertOptions = serde_json::from_value(encoded).unwrap();
     assert_eq!(decoded.accumulate.len(), options.accumulate.len());

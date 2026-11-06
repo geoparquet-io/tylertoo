@@ -95,6 +95,7 @@ const MIN_LINESTRING_POINTS: usize = 2;
 ///   tiny-polygon reduction). Type-preserving — `geometry_types` stays
 ///   `["Polygon"]`, so fill-styled renderers need no style changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum CollapseMode {
     /// Omit the collapsed feature (the default before #745).
     Drop,
@@ -132,6 +133,7 @@ impl CollapseMode {
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SimplifyOptions {
     /// Tolerance multiplier: `tolerance = factor * gsd`. See
     /// [`DEFAULT_SIMPLIFY_FACTOR`].
@@ -164,6 +166,12 @@ pub struct SimplifyOptions {
     #[cfg_attr(feature = "cli", arg(help = "Simplify each level from the source instead of from the next finer level. Slower, but each level stays within its own tolerance of the source", long_help = None))]
     pub cascade: bool,
 }
+
+with_setters!(SimplifyOptions {
+    with_factor => factor: f64,
+    with_collapse => collapse: CollapseMode,
+    with_cascade => cascade: bool,
+});
 
 impl Default for SimplifyOptions {
     fn default() -> Self {
@@ -459,6 +467,7 @@ pub(super) fn simplify_for_level_checked(
 /// Kept an enum (never a boolean) in options, contexts, and cascade steps so
 /// further dispositions slot in without another plumbing change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum Representation {
     /// Full (simplified) geometry — the normal path. Below-tolerance
     /// polygons follow the global [`CollapseMode`].

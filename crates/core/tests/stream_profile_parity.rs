@@ -60,11 +60,10 @@ fn assert_parity(name: &str, input: &Path, base: &ConvertOptions) {
     ] {
         for in_flight in [IN_FLIGHT_BATCHES_AUTO, 1, 2, IN_FLIGHT_BATCHES_MAX] {
             let label = format!("{name}/profile={profile:?}/in_flight={in_flight}");
-            let options = ConvertOptions {
-                profile,
-                in_flight_batches: in_flight,
-                ..base.clone()
-            };
+            let options = base
+                .clone()
+                .with_profile(profile)
+                .with_in_flight_batches(in_flight);
             let out = dir
                 .path()
                 .join(format!("{name}-{profile:?}-{in_flight}.parquet"));
@@ -102,12 +101,10 @@ fn assert_parity(name: &str, input: &Path, base: &ConvertOptions) {
 /// batches are ever resident at once (1000 rows / 64 = 16 batches; a single
 /// batch would make every depth equivalent by construction).
 fn base_options(min_zoom: u8, max_zoom: u8, read_batch_size: usize) -> ConvertOptions {
-    ConvertOptions {
-        mode: Mode::Duplicating,
-        levels: LevelPlan::ZoomRange { min_zoom, max_zoom },
-        read_batch_size,
-        ..ConvertOptions::default()
-    }
+    ConvertOptions::default()
+        .with_mode(Mode::Duplicating)
+        .with_levels(LevelPlan::ZoomRange { min_zoom, max_zoom })
+        .with_read_batch_size(read_batch_size)
 }
 
 fn fixture_or_skip(name: &str) -> Option<PathBuf> {

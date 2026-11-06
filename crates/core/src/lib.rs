@@ -32,6 +32,26 @@
 //! `#[non_exhaustive]`, so a minor release can add a field, variant or
 //! setter.
 //!
+//! ```
+//! use tylertoo_core::{Classify, ConvertOptions, ErrorKind, LevelPlan, TilesOptions};
+//!
+//! let options = TilesOptions::default().with_convert(
+//!     ConvertOptions::default()
+//!         .with_levels(LevelPlan::ZoomRange { min_zoom: 0, max_zoom: 12 })
+//!         .with_read_batch_size(0),
+//! );
+//! // Refused before any input is read.
+//! let err = options.validate().unwrap_err();
+//! assert_eq!(err.kind(), ErrorKind::Usage);
+//! ```
+//!
+//! A struct literal does not compile outside this crate, so adding a field
+//! is not a breaking change:
+//!
+//! ```compile_fail
+//! let options = tylertoo_core::DecodeOptions { min_zoom: None, max_zoom: None, layer: None };
+//! ```
+//!
 //! No signature here names an `arrow`, `parquet`, `geo-types`, `geoarrow`
 //! or `object_store` type, so their major releases do not break this API.
 //! The `internal` module holds everything else for the CLI, the Python
@@ -50,6 +70,31 @@
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use thiserror::Error;
+
+/// `with_*` setters for an options struct (#436), one per public field.
+///
+/// The options structs are `#[non_exhaustive]`, so callers outside this
+/// crate cannot build them with a struct literal; they start from
+/// `Default` and chain these setters. The `const` destructures the struct
+/// with every listed field, so a field added without a setter fails to
+/// compile.
+macro_rules! with_setters {
+    ($ty:ident { $($setter:ident => $field:ident: $fty:ty,)* }) => {
+        impl $ty {
+            $(
+                #[doc = concat!("Set [`", stringify!($field), "`](Self::", stringify!($field), ").")]
+                #[must_use]
+                pub fn $setter(mut self, value: $fty) -> Self {
+                    self.$field = value;
+                    self
+                }
+            )*
+        }
+        const _: fn($ty) = |options| {
+            let $ty { $($field: _,)* } = options;
+        };
+    };
+}
 
 // Include the protobuf-generated code
 mod vector_tile {

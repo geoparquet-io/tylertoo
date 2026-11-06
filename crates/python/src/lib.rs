@@ -433,11 +433,10 @@ fn decode(
     let mut defaults = config_keywords::command_defaults("decode");
     for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
     defaults.extend(values);
-    let options = DecodeOptions {
-        min_zoom: serde_json::from_value(defaults.remove("min_zoom").unwrap()).map_err(config_err)?,
-        max_zoom: serde_json::from_value(defaults.remove("max_zoom").unwrap()).map_err(config_err)?,
-        layer: serde_json::from_value(defaults.remove("layer").unwrap()).map_err(config_err)?,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(serde_json::from_value(defaults.remove("min_zoom").unwrap()).map_err(config_err)?)
+        .with_max_zoom(serde_json::from_value(defaults.remove("max_zoom").unwrap()).map_err(config_err)?)
+        .with_layer(serde_json::from_value(defaults.remove("layer").unwrap()).map_err(config_err)?);
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
     let report = py
@@ -569,14 +568,12 @@ mod config_parity {
         ]);
         let cli = cli::overview_options(&args).unwrap();
         let python = overview_config(native_keywords(json!({"min_zoom": 1, "max_zoom": 3, "row_group_size": 1234, "cascade": false, "drop_lines": true, "sort_direction": "asc", "include_properties": ["id"]}))).unwrap();
-        let mut core = ConvertOptions {
-            levels: LevelPlan::ZoomRange {
+        let mut core = ConvertOptions::default()
+            .with_levels(LevelPlan::ZoomRange {
                 min_zoom: 1,
                 max_zoom: 3,
-            },
-            max_row_group_size: 1234,
-            ..Default::default()
-        };
+            })
+            .with_max_row_group_size(1234);
         core.simplify.cascade = false;
         core.density.kinds.lines = true;
         core.assign.sort_direction = tylertoo_core::internal::overview::assign::SortDirection::Asc;
@@ -681,13 +678,11 @@ mod config_parity {
         ]);
         let cli = cli::export_options(&args).unwrap();
         let python = export_config(native_keywords(json!({"extent": 8192, "tile_buffer": 4, "name": "Example", "include_properties": ["rank"], "feature_order": "rank:desc", "simple_clip_fastpath": false}))).unwrap();
-        let mut core = ExportOptions {
-            extent: 8192,
-            tile_buffer: 4,
-            simple_clip_fastpath: false,
-            feature_order: "rank:desc".parse().unwrap(),
-            ..Default::default()
-        };
+        let mut core = ExportOptions::default()
+            .with_extent(8192)
+            .with_tile_buffer(4)
+            .with_simple_clip_fastpath(false)
+            .with_feature_order("rank:desc".parse().unwrap());
         core.metadata.name = Some("Example".into());
         core.properties.include = Some(vec!["rank".into()]);
         let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();

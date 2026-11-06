@@ -67,6 +67,7 @@ pub struct PropertySelection {
 
 /// Why a selection could not be applied to a schema.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PropertySelectionError {
     /// An `include` name matches no input column: asking for a column that
     /// is not there is a typo, not a preference.

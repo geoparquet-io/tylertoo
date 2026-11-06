@@ -50,13 +50,10 @@ fn header_clustered_flag_matches_the_actual_entry_layout() {
     convert_to_overviews(
         &fixture_path,
         overview.path(),
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 0,
-                max_zoom: 10,
-            },
-            ..Default::default()
-        },
+        &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 10,
+        }),
     )
     .expect("convert");
     export_pmtiles(overview.path(), output.path(), &ExportOptions::default()).expect("export");

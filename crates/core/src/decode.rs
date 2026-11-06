@@ -116,6 +116,7 @@ const RESERVED_COLUMNS: [&str; 4] = [
 
 /// Options for [`decode_pmtiles`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DecodeOptions {
     /// Only decode tiles with `zoom >= min_zoom`.
     pub min_zoom: Option<u8>,
@@ -124,6 +125,12 @@ pub struct DecodeOptions {
     /// Only decode features from this MVT layer.
     pub layer: Option<String>,
 }
+
+with_setters!(DecodeOptions {
+    with_min_zoom => min_zoom: Option<u8>,
+    with_max_zoom => max_zoom: Option<u8>,
+    with_layer => layer: Option<String>,
+});
 
 impl DecodeOptions {
     /// Reject an inverted zoom range (`min_zoom > max_zoom`), which would
@@ -147,6 +154,7 @@ impl DecodeOptions {
 
 /// Summary of a completed decode.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct DecodeReport {
     /// Tiles read (after zoom filtering).
     pub tiles_read: u64,
@@ -171,6 +179,7 @@ pub struct DecodeReport {
 /// cause twice (#396). Callers that want one line use `{:#}` on an
 /// `anyhow::Error`, or walk `source()`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DecodeError {
     #[error("minimum zoom {min_zoom} exceeds maximum zoom {max_zoom}")]
     InvalidZoomRange { min_zoom: u8, max_zoom: u8 },

@@ -61,6 +61,7 @@ const REMOTE_SCHEMES: &[&str] = &["s3", "s3a", "http", "https", "gs"];
 
 /// Errors from opening or reading an [`InputSource`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum InputError {
     /// A saved convert plan belongs to a different version of an input.
     #[error("--plan: saved plan does not match this run: input {input:?} {field} was {saved:?} when the plan was saved but is {current:?} now. Re-run without --plan (add --save-plan to write a fresh one).")]
@@ -234,6 +235,7 @@ pub(crate) fn parquet_error_detail(error: &ParquetError) -> String {
 /// Byte/request counters for a remote input. `Serialize` so conversion
 /// reports can carry it (benchmark tasks).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Default)]
+#[non_exhaustive]
 pub struct FetchStats {
     /// Number of range GET requests issued (HEAD not included).
     pub requests: u64,

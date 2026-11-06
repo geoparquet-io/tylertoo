@@ -23,6 +23,7 @@ pub(crate) use tile_gzip::TileGzipCache;
 /// - 4: Zstd
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Compression {
     Unknown = 0,
     None = 1,

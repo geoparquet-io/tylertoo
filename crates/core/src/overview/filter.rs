@@ -72,6 +72,7 @@ use tylertoo_io::{ParquetMetaData, RowGroupMetaData};
 
 /// Errors from parsing or binding a `--filter` expression.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FilterError {
     /// The expression source failed to parse.
     #[error("invalid --filter expression: {0}")]

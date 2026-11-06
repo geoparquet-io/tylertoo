@@ -132,6 +132,7 @@ impl LevelSpec {
 /// How the per-level row-group cap is derived from `max_row_group_size`
 /// (issue #202).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum RowGroupSizePolicy {
     /// Every level uses `max_row_group_size` as its cap (the shipped default).
     #[default]
@@ -265,6 +266,7 @@ impl OverviewWriterOptions {
 
 /// Errors produced by [`OverviewWriter`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WriterError {
     /// Underlying parquet error.
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]

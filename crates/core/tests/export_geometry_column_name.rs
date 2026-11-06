@@ -165,13 +165,10 @@ fn round_trip(geom_name: &str, centroid: Option<&str>) {
     convert_to_overviews(
         &input,
         &overview,
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 4,
-                max_zoom: MAX_ZOOM,
-            },
-            ..Default::default()
-        },
+        &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+            min_zoom: 4,
+            max_zoom: MAX_ZOOM,
+        }),
     )
     .unwrap_or_else(|e| panic!("convert with {case}: {e}"));
 

@@ -160,13 +160,10 @@ fn webmercator_input_round_trips_through_convert_and_export() {
     convert_to_overviews(
         &input,
         &overview,
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 4,
-                max_zoom: 8,
-            },
-            ..Default::default()
-        },
+        &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+            min_zoom: 4,
+            max_zoom: 8,
+        }),
     )
     .expect("a Pseudo-Mercator input must convert");
 

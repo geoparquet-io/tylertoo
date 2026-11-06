@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 /// The integer polygon rule a repair corrected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PolygonRepairKind {
     CollapsedRing,
     RingSelfTouch,
@@ -43,6 +44,7 @@ pub struct RangeContext {
 /// A counted event or warning. The serialized tag is stable across frontends.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Diagnostic {
     /// Facts from the whole saved plan, not counts from this shard's scan.
     SavedPlan {
@@ -168,6 +170,7 @@ pub enum Diagnostic {
 /// Why CRS metadata could only be read best-effort.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "reason", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CrsWarning {
     #[error("GeoParquet file has no key-value metadata; assuming WGS84")]
     NoKeyValueMetadata,
@@ -194,6 +197,7 @@ pub enum CrsWarning {
 /// Why a bbox covering cannot replace geometry decoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CoveringWarning {
     NoCovering,
     UnsupportedPath,
@@ -413,6 +417,7 @@ impl fmt::Display for Diagnostic {
 
 /// A disjoint source-feature loss, rather than a (feature, tile) counter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SourceLoss {
     /// Row index: selected input stream before assignment, or original overview file at export.
     /// Convert reports restore this to the original input row index.
@@ -429,6 +434,7 @@ pub struct SourceLoss {
 /// The stage responsible for an absent source feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SourceLossCause {
     NonFiniteGeometry,
     MissingGeometry,
@@ -443,6 +449,7 @@ pub enum SourceLossCause {
 
 /// Accounting must fail explicitly rather than truncate the loss partition.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AccountingError {
     #[error("source accounting spill: {0}")]
     Io(#[from] std::io::Error),

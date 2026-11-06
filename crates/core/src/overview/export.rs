@@ -270,6 +270,7 @@ pub const DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize = 500 * 1024;
 /// points always takes the stride of [`SizeValve::Drop`]. See
 /// `overview::export::coalesce_valve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum SizeValve {
     /// Merge the densest lines and polygons, re-measure, and repeat until
     /// the tile fits (the default).
@@ -320,6 +321,7 @@ use crate::tile::WEBMERC_HALF_M;
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(feature = "cli", command(group(clap::ArgGroup::new("export_only").multiple(true))))]
+#[non_exhaustive]
 pub struct ExportOptions {
     /// MVT layer name written into every tile and the archive metadata.
     #[cfg_attr(feature = "cli", arg(long, default_value_t = Self::default().layer_name))]
@@ -580,6 +582,27 @@ pub struct ExportOptions {
     pub metadata: TilesetMetadata,
 }
 
+with_setters!(ExportOptions {
+    with_layer_name => layer_name: String,
+    with_tile_buffer => tile_buffer: u32,
+    with_extent => extent: u32,
+    with_tile_size_limit => tile_size_limit: Option<usize>,
+    with_compressed_tile_size_limit => compressed_tile_size_limit: Option<usize>,
+    with_size_valve => size_valve: SizeValve,
+    with_coverage_fill => coverage_fill: bool,
+    with_simple_clip_fastpath => simple_clip_fastpath: bool,
+    with_partition_wave => partition_wave: usize,
+    with_feature_order => feature_order: FeatureOrder,
+    with_min_zoom => min_zoom: Option<u8>,
+    with_properties => properties: PropertySelection,
+    with_tile_range => tile_range: Option<crate::shard::TileRange>,
+    with_zoom_ceiling => zoom_ceiling: Option<u8>,
+    with_feature_id => feature_id: Option<String>,
+    with_spill_dir => spill_dir: Option<PathBuf>,
+    with_profile => profile: MemoryProfile,
+    with_metadata => metadata: TilesetMetadata,
+});
+
 impl Default for ExportOptions {
     fn default() -> Self {
         Self {
@@ -690,6 +713,7 @@ fn check_metadata_size(metadata: &TilesetMetadata) -> Result<(), ConfigError> {
 
 /// Per-zoom statistics in an [`ExportReport`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct ZoomReport {
     /// Web Mercator zoom this level was exported at.
     pub zoom: u8,
@@ -741,6 +765,7 @@ pub struct ZoomReport {
 
 /// Result of an export, `Serialize` for the `--report` JSON.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct ExportReport {
     /// Exact source losses, disjoint from any source emitted at that zoom.
     pub source_losses: crate::diagnostics::SourceLosses,
@@ -791,6 +816,7 @@ pub struct ExportReport {
 /// A property column the export dropped because its Arrow type has no MVT
 /// encoding (#434). See [`ExportReport::skipped_property_columns`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct SkippedPropertyColumn {
     /// The column's name as the tile would have published it.
     pub name: String,
@@ -6836,6 +6862,7 @@ fn members_recursive_vec(
 /// tippecanoe specified one before, which made a tiler swap a silent visual
 /// change; naming it makes it something a caller can depend on.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum FeatureOrder {
     /// Input row order — the overview file's row order, which is the source
     /// file's row order restricted to the rows the level kept. This is what

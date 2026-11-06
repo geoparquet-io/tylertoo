@@ -137,6 +137,7 @@ const _: () = assert!(
 
 /// Everything that can go wrong cutting, reading or applying a shard plan.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ShardError {
     /// `--pivot` outside `1..=``MAX_SHARD_PIVOT_ZOOM`.
     #[error(
@@ -331,6 +332,7 @@ pub enum ShardError {
 /// Which job of a sharded fleet this run is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ShardRole {
     /// The run that owns zooms `[0, pivot - 1]` over the whole input and
     /// writes the convert plan the data shards consume.

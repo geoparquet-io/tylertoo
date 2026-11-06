@@ -185,13 +185,10 @@ fn coverage_fill_closes_coarse_holes_without_overdrawing() {
     convert_to_overviews(
         &fixture_path,
         &overview,
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 0,
-                max_zoom: 8,
-            },
-            ..Default::default()
-        },
+        &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 8,
+        }),
     )
     .expect("convert");
 
@@ -200,12 +197,10 @@ fn coverage_fill_closes_coarse_holes_without_overdrawing() {
         // tippecanoe's cap on the compressed tile, with a 2M raw backstop
         // (#761): the fill takes only the room the tile's own features
         // leave, and a 500K raw cap leaves z4 almost none.
-        let opts = ExportOptions {
-            coverage_fill: fill,
-            tile_size_limit: Some(2048 * 1024),
-            compressed_tile_size_limit: Some(500 * 1024),
-            ..ExportOptions::default()
-        };
+        let opts = ExportOptions::default()
+            .with_coverage_fill(fill)
+            .with_tile_size_limit(Some(2048 * 1024))
+            .with_compressed_tile_size_limit(Some(500 * 1024));
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -268,22 +263,17 @@ fn coverage_fill_work_stays_bounded_on_scattered_fields() {
     convert_to_overviews(
         &fixture_path,
         &overview,
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 0,
-                max_zoom: 12,
-            },
-            ..Default::default()
-        },
+        &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 12,
+        }),
     )
     .expect("convert");
     let export = |fill: bool| -> ExportReport {
-        let opts = ExportOptions {
-            coverage_fill: fill,
-            tile_size_limit: Some(200_000),
-            compressed_tile_size_limit: None,
-            ..ExportOptions::default()
-        };
+        let opts = ExportOptions::default()
+            .with_coverage_fill(fill)
+            .with_tile_size_limit(Some(200_000))
+            .with_compressed_tile_size_limit(None);
         export_pmtiles(&overview, dir.path().join("out.pmtiles"), &opts).expect("export")
     };
     let sum = |r: &ExportReport,
@@ -363,20 +353,14 @@ fn a_coarse_job_draws_the_unsharded_fill_below_its_ceiling() {
     convert_to_overviews(
         &fixture_path,
         &overview,
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 0,
-                max_zoom: 12,
-            },
-            ..Default::default()
-        },
+        &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 12,
+        }),
     )
     .expect("convert");
     let export = |name: &str, opts: ExportOptions| -> ExportReport {
-        let opts = ExportOptions {
-            coverage_fill: true,
-            ..opts
-        };
+        let opts = opts.with_coverage_fill(true);
         export_pmtiles(&overview, dir.path().join(name), &opts).expect("export")
     };
     let fill = |r: &ExportReport, z: u8| {
@@ -390,10 +374,7 @@ fn a_coarse_job_draws_the_unsharded_fill_below_its_ceiling() {
     let ceiling = 8;
     let coarse = export(
         "coarse.pmtiles",
-        ExportOptions {
-            zoom_ceiling: Some(ceiling),
-            ..ExportOptions::default()
-        },
+        ExportOptions::default().with_zoom_ceiling(Some(ceiling)),
     );
     let drawn: usize = coarse.zooms.iter().map(|z| z.fill_polygons).sum();
     assert!(drawn > 0, "the coarse job drew no fill");
@@ -409,10 +390,8 @@ fn a_coarse_job_draws_the_unsharded_fill_below_its_ceiling() {
     // matters least, and does not build it.
     let shard = export(
         "shard.pmtiles",
-        ExportOptions {
-            tile_range: Some(TileRange::parse("5..12").expect("a valid range")),
-            ..ExportOptions::default()
-        },
+        ExportOptions::default()
+            .with_tile_range(Some(TileRange::parse("5..12").expect("a valid range"))),
     );
     assert_eq!(
         shard.zooms.iter().map(|z| z.fill_polygons).sum::<usize>(),
@@ -441,21 +420,13 @@ fn tiles_shard_coarse_draws_the_unsharded_fill() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pivot = 9;
     let run = |name: &str, shard: Option<TilesShard>| -> ExportReport {
-        let options = TilesOptions {
-            convert: ConvertOptions {
-                levels: LevelPlan::ZoomRange {
-                    min_zoom: 0,
-                    max_zoom: 12,
-                },
-                ..Default::default()
-            },
-            export: ExportOptions {
-                coverage_fill: true,
-                ..ExportOptions::default()
-            },
-            shard,
-            ..TilesOptions::default()
-        };
+        let options = TilesOptions::default()
+            .with_convert(ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 12,
+            }))
+            .with_export(ExportOptions::default().with_coverage_fill(true))
+            .with_shard(shard);
         let input = TilesInput::Path(fixture_path.clone());
         match convert_to_pmtiles(&input, &dir.path().join(name), &options).expect("tiles") {
             TilesOutcome::Converted(report) => report.export,

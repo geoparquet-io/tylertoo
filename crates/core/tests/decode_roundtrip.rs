@@ -128,13 +128,10 @@ fn build_archive(dir: &tempfile::TempDir, extra_col: Option<&str>) -> PathBuf {
     let pmtiles = dir.path().join("fixture.pmtiles");
 
     write_fixture(&input, &fixture_geometries(), extra_col);
-    let convert_opts = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: MIN_ZOOM,
-            max_zoom: MAX_ZOOM,
-        },
-        ..Default::default()
-    };
+    let convert_opts = ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: MIN_ZOOM,
+        max_zoom: MAX_ZOOM,
+    });
     convert_to_overviews(&input, &overviews, &convert_opts).unwrap();
     export_pmtiles(&overviews, &pmtiles, &ExportOptions::default()).unwrap();
     pmtiles
@@ -318,19 +315,14 @@ fn assert_feature_id_roundtrip(mode: Mode) {
     let output = dir.path().join("decoded.parquet");
 
     write_fixture(&input, &fixture_geometries(), None);
-    let convert_opts = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
+    let convert_opts = ConvertOptions::default()
+        .with_levels(LevelPlan::ZoomRange {
             min_zoom: MIN_ZOOM,
             max_zoom: MAX_ZOOM,
-        },
-        mode,
-        ..Default::default()
-    };
+        })
+        .with_mode(mode);
     convert_to_overviews(&input, &overviews, &convert_opts).unwrap();
-    let export_opts = ExportOptions {
-        feature_id: Some("id".to_string()),
-        ..Default::default()
-    };
+    let export_opts = ExportOptions::default().with_feature_id(Some("id".to_string()));
     export_pmtiles(&overviews, &pmtiles, &export_opts).unwrap();
 
     let report = decode_pmtiles(&pmtiles, &output, &DecodeOptions::default()).unwrap();
@@ -398,11 +390,10 @@ fn decode_single_zoom_filter() {
     let pmtiles = build_archive(&dir, None);
     let output = dir.path().join("decoded-z8.parquet");
 
-    let options = DecodeOptions {
-        min_zoom: Some(8),
-        max_zoom: Some(8),
-        layer: None,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(Some(8))
+        .with_max_zoom(Some(8))
+        .with_layer(None);
     let report = decode_pmtiles(&pmtiles, &output, &options).unwrap();
     let rows = read_rows(&output);
 
@@ -418,11 +409,10 @@ fn decode_zoom_range_filter() {
     let pmtiles = build_archive(&dir, None);
     let output = dir.path().join("decoded-z10-12.parquet");
 
-    let options = DecodeOptions {
-        min_zoom: Some(10),
-        max_zoom: Some(12),
-        layer: None,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(Some(10))
+        .with_max_zoom(Some(12))
+        .with_layer(None);
     decode_pmtiles(&pmtiles, &output, &options).unwrap();
     let rows = read_rows(&output);
     assert!(!rows.is_empty());
@@ -439,10 +429,7 @@ fn decode_layer_filter_matching_and_not() {
     let report = decode_pmtiles(
         &pmtiles,
         &out_match,
-        &DecodeOptions {
-            layer: Some("overview".to_string()),
-            ..Default::default()
-        },
+        &DecodeOptions::default().with_layer(Some("overview".to_string())),
     )
     .unwrap();
     assert!(report.features_written > 0);
@@ -452,10 +439,7 @@ fn decode_layer_filter_matching_and_not() {
     let report = decode_pmtiles(
         &pmtiles,
         &out_none,
-        &DecodeOptions {
-            layer: Some("does-not-exist".to_string()),
-            ..Default::default()
-        },
+        &DecodeOptions::default().with_layer(Some("does-not-exist".to_string())),
     )
     .unwrap();
     assert_eq!(report.features_written, 0);
@@ -608,11 +592,10 @@ fn decode_golden_against_tippecanoe_decode() {
     let output = dir.path().join("decoded.parquet");
 
     // Ours, max zoom only.
-    let options = DecodeOptions {
-        min_zoom: Some(MAX_ZOOM),
-        max_zoom: Some(MAX_ZOOM),
-        layer: None,
-    };
+    let options = DecodeOptions::default()
+        .with_min_zoom(Some(MAX_ZOOM))
+        .with_max_zoom(Some(MAX_ZOOM))
+        .with_layer(None);
     decode_pmtiles(&pmtiles, &output, &options).unwrap();
     let ours = read_rows(&output);
 

@@ -36,13 +36,10 @@ impl log::Log for Capture {
 fn wrapped_lines(input: &Path) -> Vec<String> {
     LINES.lock().unwrap().clear();
     let tout = tempfile::NamedTempFile::new().unwrap();
-    let o = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: 2,
-            max_zoom: 6,
-        },
-        ..Default::default()
-    };
+    let o = ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: 2,
+        max_zoom: 6,
+    });
     convert_to_overviews(input, tout.path(), &o).unwrap_or_else(|e| panic!("{e}"));
     LINES
         .lock()

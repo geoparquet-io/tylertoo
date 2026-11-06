@@ -153,21 +153,16 @@ const CASES: &[Case] = &[
 /// The conversion knobs, fixed. Everything not named here is a default, and
 /// a default that moves is an output change this guard should catch.
 fn convert_options() -> ConvertOptions {
-    ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: MIN_ZOOM,
-            max_zoom: MAX_ZOOM,
-        },
-        ..Default::default()
-    }
+    ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: MIN_ZOOM,
+        max_zoom: MAX_ZOOM,
+    })
 }
 
 fn export_options(case: &Case) -> ExportOptions {
-    ExportOptions {
-        layer_name: LAYER.to_string(),
-        simple_clip_fastpath: case.simple_clip_fastpath,
-        ..Default::default()
-    }
+    ExportOptions::default()
+        .with_layer_name(LAYER.to_string())
+        .with_simple_clip_fastpath(case.simple_clip_fastpath)
 }
 
 /// Run one case end to end and return its golden lines.

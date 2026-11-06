@@ -27,6 +27,7 @@ pub use super::level::SUPPORTED_MAJOR;
 
 /// Result of a single conformance check.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CheckResult {
     /// Short stable identifier for the check (e.g. `"level_column_type"`).
     pub name: String,
@@ -38,6 +39,7 @@ pub struct CheckResult {
 
 /// A collected report of every conformance check run against a file.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ValidationReport {
     /// One entry per check, in the order they were run.
     pub checks: Vec<CheckResult>,
@@ -90,6 +92,7 @@ impl ValidationReport {
 /// The messages carry no path and no "io error:" prefix: every caller
 /// already says `could not open '<path>': ` in front (#452).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CheckError {
     /// I/O error opening the file.
     #[error("{0}")]

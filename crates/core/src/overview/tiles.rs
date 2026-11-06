@@ -49,6 +49,7 @@ pub const TILES_DEFAULT_MAX_ZOOM: u8 = 14;
 /// core's input resolution) or a manifest of explicit files/URLs (the CLI's
 /// `--files-from`, order preserved verbatim).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TilesInput {
     /// A file, directory, glob, or URL/prefix.
     Path(PathBuf),
@@ -246,6 +247,7 @@ impl TilesShard {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
+#[non_exhaustive]
 pub struct TilesOptions {
     /// The convert half ([`super::convert::convert_to_overviews`]). The
     /// facade reads `spill_dir` from here for the intermediate's location
@@ -278,6 +280,14 @@ pub struct TilesOptions {
     #[cfg_attr(feature = "cli", arg(skip = Self::default().shard))]
     pub shard: Option<TilesShard>,
 }
+
+with_setters!(TilesOptions {
+    with_convert => convert: ConvertOptions,
+    with_export => export: ExportOptions,
+    with_layer_name => layer_name: Option<String>,
+    with_keep_overview => keep_overview: Option<PathBuf>,
+    with_shard => shard: Option<TilesShard>,
+});
 
 impl Default for TilesOptions {
     fn default() -> Self {
@@ -511,6 +521,7 @@ fn resolve_tile_range(
 /// reported — mid-run through [`TilesObserver::overview_written`], and on
 /// the final [`TilesReport`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IntermediateOverview {
     /// Where the intermediate overview was written.
     pub path: PathBuf,
@@ -533,6 +544,7 @@ pub struct IntermediateOverview {
 /// the two-step chain would write (`overview --report` +
 /// `export-pmtiles --report`).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct TilesReport {
     /// The convert half.
     pub convert: ConvertReport,
@@ -563,6 +575,7 @@ impl TilesReport {
 /// Both are legal outcomes of a legal cut, not failures — a fleet with red
 /// squares that mean "correct" would need hand-editing at merge.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct EmptyArchive {
     /// Output counts are present on empty outcomes too.
     pub total_tiles: usize,
@@ -590,6 +603,7 @@ pub struct EmptyArchive {
 
 /// What a successful [`convert_to_pmtiles`] run produced.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum TilesOutcome {
     /// The full chain ran; the archive holds tiles (or legitimately none)
     /// and both halves reported.

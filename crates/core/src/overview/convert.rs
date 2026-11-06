@@ -75,6 +75,7 @@ use super::writer::{LevelWriteOutcome, RowGroupSizePolicy, WriterError, LEVEL_CO
 
 /// How the caller specifies the overview levels.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum LevelPlan {
     /// A Web Mercator zoom range, mapped through `gsd_for_zoom`. `min_zoom`
     /// is the coarsest (level 0), `max_zoom` the finest. Both inclusive.
@@ -393,6 +394,7 @@ pub(super) const ROAD_VOCAB_MIN_DISTINCT: usize = 3;
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(feature = "cli", command(group(clap::ArgGroup::new("overview_only").multiple(true))))]
+#[non_exhaustive]
 pub struct ConvertOptions {
     /// Level materialization mode. Default [`Mode::Duplicating`].
     #[cfg_attr(feature = "cli", arg(long, default_value = Self::default().mode.as_str(), value_parser = super::config::cli::spelled::<Mode>(&["duplicating", "partitioning"])))]
@@ -404,10 +406,14 @@ pub struct ConvertOptions {
     pub levels: LevelPlan,
     /// `--max-zoom auto` (#444): the conversion estimates the finest zoom
     /// from its own input and writes it into a [`LevelPlan::ZoomRange`]'s
-    /// `max_zoom` before anything else reads the plan
-    /// ([`super::auto_zoom::MaxZoom::resolve`]). Build the plan with
-    /// [`super::auto_zoom::MaxZoom::plan_zoom`] as the placeholder. Ignored
-    /// (with a log line) for an explicit GSD list.
+    /// `max_zoom` before anything else reads the plan. Ignored (with a log
+    /// line) for an explicit GSD list.
+    ///
+    /// The pick is capped at the plan's `max_zoom` (`--max-zoom auto:N`,
+    /// #793): set it to 16, the auto ceiling, for an uncapped estimate, or
+    /// lower to cap it. Before 0.9 the plan's `max_zoom` was ignored here, so
+    /// a caller that set `auto_max_zoom` with any other `max_zoom` now gets a
+    /// capped pick.
     ///
     /// The estimate reads the same source the conversion then reads, so a
     /// remote input's sampled chunks are fetched once (#788). Not a keyword
@@ -870,6 +876,44 @@ pub struct ConvertOptions {
     pub zoom_ceiling: Option<u8>,
 }
 
+with_setters!(ConvertOptions {
+    with_mode => mode: Mode,
+    with_levels => levels: LevelPlan,
+    with_auto_max_zoom => auto_max_zoom: bool,
+    with_assign => assign: AssignConfig,
+    with_entry_zoom => entry_zoom: Option<EntryZoomSpec>,
+    with_sort_key => sort_key: Option<String>,
+    with_class_ranking => class_ranking: Option<ClassRanking>,
+    with_no_auto_rank => no_auto_rank: bool,
+    with_simplify => simplify: SimplifyOptions,
+    with_representation => representation: Vec<RepresentationBand>,
+    with_density => density: DensityBudgetConfig,
+    with_gsd_base => gsd_base: f64,
+    with_cogp_compat_key => cogp_compat_key: bool,
+    with_max_row_group_size => max_row_group_size: usize,
+    with_row_group_size_policy => row_group_size_policy: RowGroupSizePolicy,
+    with_full_column_stats => full_column_stats: bool,
+    with_read_batch_size => read_batch_size: usize,
+    with_profile => profile: MemoryProfile,
+    with_in_flight_batches => in_flight_batches: usize,
+    with_read_workers => read_workers: usize,
+    with_cluster => cluster: bool,
+    with_accumulate => accumulate: Vec<AccumulateSpec>,
+    with_coalesce_lines => coalesce_lines: bool,
+    with_coalesce_snap => coalesce_snap: f64,
+    with_coalesce_max_level_rows => coalesce_max_level_rows: usize,
+    with_coalesce_junction_angle => coalesce_junction_angle: f64,
+    with_bbox => bbox: Option<[f64; 4]>,
+    with_filter => filter: Option<String>,
+    with_properties => properties: PropertySelection,
+    with_spill_dir => spill_dir: Option<PathBuf>,
+    with_save_plan => save_plan: Option<PathBuf>,
+    with_plan => plan: Option<PathBuf>,
+    with_shard => shard: Option<TileRange>,
+    with_shard_plan_digest => shard_plan_digest: Option<String>,
+    with_zoom_ceiling => zoom_ceiling: Option<u8>,
+});
+
 /// Default rows per read batch for the streaming pipeline (H3).
 pub const DEFAULT_READ_BATCH_SIZE: usize = 8192;
 
@@ -1231,6 +1275,7 @@ impl ConvertOptions {
 /// `--no-coalesce-lines`) and per Python keyword argument.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct GeneralizationOverrides {
     /// Point grid cell size in GSDs.
     pub point_thinning: Option<f64>,
@@ -1249,6 +1294,17 @@ pub struct GeneralizationOverrides {
     /// Whether touching same-class lines are joined at coarse levels.
     pub coalesce_lines: Option<bool>,
 }
+
+with_setters!(GeneralizationOverrides {
+    with_point_thinning => point_thinning: Option<f64>,
+    with_line_thinning => line_thinning: Option<f64>,
+    with_polygon_thinning => polygon_thinning: Option<f64>,
+    with_line_visibility => line_visibility: Option<f64>,
+    with_polygon_visibility => polygon_visibility: Option<f64>,
+    with_simplify_factor => simplify_factor: Option<f64>,
+    with_density_drop => density_drop: Option<bool>,
+    with_coalesce_lines => coalesce_lines: Option<bool>,
+});
 
 #[cfg(test)]
 mod generalization_override_tests {
@@ -1442,6 +1498,7 @@ impl Default for ConvertOptions {
 
 /// Per-level statistics in a [`ConvertReport`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct LevelReport {
     /// Level index in the output file (0 = coarsest).
     pub level: usize,
@@ -1467,6 +1524,7 @@ pub struct LevelReport {
 /// where every feature is culled by the visibility gates at world zooms, so
 /// the written pyramid starts at the first zoom with visible features.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct SkippedLevelReport {
     /// Index of the level in the *planned* (requested) level range
     /// (0 = requested coarsest). NOT an index into the written file.
@@ -1618,6 +1676,7 @@ pub struct PlanReport {
 
 /// Result of a conversion, `Serialize` for JSON output (benchmark tasks).
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct ConvertReport {
     /// Input rows read before filtering unusable geometries.
     pub input_rows: usize,

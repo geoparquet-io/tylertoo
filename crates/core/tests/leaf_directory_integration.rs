@@ -106,13 +106,10 @@ fn test_real_data_conversion_keeps_the_root_directory_small() {
     convert_to_overviews(
         &fixture_path,
         overview.path(),
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 0,
-                max_zoom: 10,
-            },
-            ..Default::default()
-        },
+        &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 10,
+        }),
     )
     .expect("convert");
     export_pmtiles(overview.path(), output.path(), &ExportOptions::default()).expect("export");

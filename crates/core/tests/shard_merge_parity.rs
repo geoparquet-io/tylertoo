@@ -150,46 +150,32 @@ fn convert_options(build: Build) -> ConvertOptions {
         // carries one. Turning it off keeps this flavor honest about what it
         // is testing; `Flavor::Defaults` covers the on-by-default case, where
         // a polygon input produces an empty-but-present section.
-        Flavor::NoCoalesce => ConvertOptions {
-            levels,
-            read_workers,
-            coalesce_lines: false,
-            ..Default::default()
-        },
-        Flavor::Defaults => ConvertOptions {
-            levels,
-            read_workers,
-            ..Default::default()
-        },
-        Flavor::Carriers => ConvertOptions {
-            levels,
-            read_workers,
-            coalesce_lines: false,
-            simplify: SimplifyOptions {
-                collapse: CollapseMode::Square,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        Flavor::ClusteredPoints => ConvertOptions {
-            levels,
-            read_workers,
-            coalesce_lines: false,
-            cluster: true,
-            accumulate: vec![AccumulateSpec {
+        Flavor::NoCoalesce => ConvertOptions::default()
+            .with_levels(levels)
+            .with_read_workers(read_workers)
+            .with_coalesce_lines(false),
+        Flavor::Defaults => ConvertOptions::default()
+            .with_levels(levels)
+            .with_read_workers(read_workers),
+        Flavor::Carriers => ConvertOptions::default()
+            .with_levels(levels)
+            .with_read_workers(read_workers)
+            .with_coalesce_lines(false)
+            .with_simplify(SimplifyOptions::default().with_collapse(CollapseMode::Square)),
+        Flavor::ClusteredPoints => ConvertOptions::default()
+            .with_levels(levels)
+            .with_read_workers(read_workers)
+            .with_coalesce_lines(false)
+            .with_cluster(true)
+            .with_accumulate(vec![AccumulateSpec {
                 column: "weight".to_string(),
                 op: AccumulateOp::Sum,
-            }],
-            ..Default::default()
-        },
+            }]),
     }
 }
 
 fn export_options() -> ExportOptions {
-    ExportOptions {
-        layer_name: LAYER.to_string(),
-        ..Default::default()
-    }
+    ExportOptions::default().with_layer_name(LAYER.to_string())
 }
 
 /// Every tile in an archive: `zoom -> tile id -> body bytes`.
@@ -230,23 +216,19 @@ fn build_shard(
     convert_to_overviews(
         input,
         &overview,
-        &ConvertOptions {
-            plan: Some(plan.to_path_buf()),
-            shard: Some(range),
-            ..convert_options(build)
-        },
+        &convert_options(build)
+            .with_plan(Some(plan.to_path_buf()))
+            .with_shard(Some(range)),
     )
     .unwrap_or_else(|e| panic!("shard {index} convert: {e}"));
     export_pmtiles(
         &overview,
         &archive,
-        &ExportOptions {
-            tile_range: Some(range),
+        &export_options()
+            .with_tile_range(Some(range))
             // The shard owns no zoom coarser than the pivot, and says so
             // rather than claiming the coarse job's half.
-            min_zoom: Some(build.pivot),
-            ..export_options()
-        },
+            .with_min_zoom(Some(build.pivot)),
     )
     .unwrap_or_else(|e| panic!("shard {index} export: {e}"));
     archive
@@ -274,11 +256,9 @@ fn level_capped_coarse_overview(
     let report = convert_to_overviews(
         input,
         &capped_overview,
-        &ConvertOptions {
-            save_plan: Some(capped_plan.clone()),
-            zoom_ceiling: Some(pivot - 1),
-            ..convert_options(build)
-        },
+        &convert_options(build)
+            .with_save_plan(Some(capped_plan.clone()))
+            .with_zoom_ceiling(Some(pivot - 1)),
     )
     .expect("level-capped coarse convert");
     assert_eq!(
@@ -316,10 +296,7 @@ fn plan_only_plan(input: &Path, dir: &Path, build: Build, full_plan: &Path) -> P
     let path = dir.join("plan-only.plan");
     let report = write_convert_plan(
         input,
-        &ConvertOptions {
-            save_plan: Some(path.clone()),
-            ..convert_options(build)
-        },
+        &convert_options(build).with_save_plan(Some(path.clone())),
     )
     .expect("plan-only run");
     assert_eq!(
@@ -394,10 +371,7 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
     convert_to_overviews(
         input,
         &overview,
-        &ConvertOptions {
-            save_plan: Some(convert_plan.clone()),
-            ..convert_options(build)
-        },
+        &convert_options(build).with_save_plan(Some(convert_plan.clone())),
     )
     .expect("coarse convert");
 
@@ -418,11 +392,9 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
     export_pmtiles(
         &coarse_overview,
         &coarse,
-        &ExportOptions {
-            zoom_ceiling: Some(pivot - 1),
-            min_zoom: Some(min_zoom),
-            ..export_options()
-        },
+        &export_options()
+            .with_zoom_ceiling(Some(pivot - 1))
+            .with_min_zoom(Some(min_zoom)),
     )
     .expect("coarse export");
 
@@ -454,10 +426,7 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
     export_pmtiles(
         &overview,
         &mono,
-        &ExportOptions {
-            min_zoom: Some(min_zoom),
-            ..export_options()
-        },
+        &export_options().with_min_zoom(Some(min_zoom)),
     )
     .expect("monolithic export");
 
@@ -1071,10 +1040,7 @@ fn level_capped_coarse_job_matches_monolithic_on_coalesced_line_chains() {
     convert_to_overviews(
         &input,
         &mono_overview,
-        &ConvertOptions {
-            save_plan: Some(full_plan.clone()),
-            ..opts
-        },
+        &opts.with_save_plan(Some(full_plan.clone())),
     )
     .expect("monolithic convert");
     let coarse_overview = level_capped_coarse_overview(&input, dir, build, &full_plan);
@@ -1123,21 +1089,16 @@ fn level_capped_coarse_job_matches_monolithic_on_coalesced_line_chains() {
     export_pmtiles(
         &mono_overview,
         &mono,
-        &ExportOptions {
-            min_zoom: Some(build.min_zoom),
-            ..export_options()
-        },
+        &export_options().with_min_zoom(Some(build.min_zoom)),
     )
     .expect("monolithic export");
     let coarse = dir.join("coarse.pmtiles");
     export_pmtiles(
         &coarse_overview,
         &coarse,
-        &ExportOptions {
-            zoom_ceiling: Some(PIVOT - 1),
-            min_zoom: Some(build.min_zoom),
-            ..export_options()
-        },
+        &export_options()
+            .with_zoom_ceiling(Some(PIVOT - 1))
+            .with_min_zoom(Some(build.min_zoom)),
     )
     .expect("coarse export");
 
