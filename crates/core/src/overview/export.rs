@@ -5522,6 +5522,33 @@ fn decode_batch_bboxes(
     Ok(bboxes)
 }
 
+/// Every tile key one feature with `bbox` is a member of at `zoom`, once each.
+/// Counts must match what `feature_tile_members` will emit, so both go
+/// through `wrap_shifts` and `member_ranges`.
+#[inline]
+fn for_each_member_key(bbox: &TileBounds, zoom: u8, opts: &ExportOptions, mut f: impl FnMut(u64)) {
+    let buffer = buffer_deg_at_zoom(zoom, opts);
+    if !near_world_edge(bbox, buffer) {
+        let ranges = member_ranges(bbox, zoom, opts);
+        for tc in tiles_in_ranges(&ranges, zoom) {
+            f(tile_key(tc.x, tc.y, zoom));
+        }
+        return;
+    }
+    let copies: Vec<BboxTileRanges> = wrap_shifts(bbox, buffer)
+        .map(|shift| member_ranges(&shift_bbox(bbox, shift), zoom, opts))
+        .collect();
+    for (i, ranges) in copies.iter().enumerate() {
+        for tc in tiles_in_ranges(ranges, zoom) {
+            // A tile two copies share is one member (#342).
+            if copies[..i].iter().any(|r| ranges_contain(r, tc)) {
+                continue;
+            }
+            f(tile_key(tc.x, tc.y, zoom));
+        }
+    }
+}
+
 /// Size a batch of (already-reprojected) feature bboxes at `zoom`: union their
 /// bounds and count one member per tile each spans. Sizing is embarrassingly
 /// parallel per feature (issue #227): fold into per-thread `(bounds, counts)`
@@ -5545,30 +5572,11 @@ fn size_bboxes(
                             None => bounds = Some(extent),
                         }
                     }
-                    // Counts must match what `feature_tile_members` will emit,
-                    // so both go through `wrap_shifts` and `member_ranges`; the
-                    // accumulated `bounds` above stay the true (wrapped)
+                    // The accumulated `bounds` above stay the true (wrapped)
                     // extent, since they become the archive's advertised bbox.
-                    let buffer = buffer_deg_at_zoom(zoom, opts);
-                    if !near_world_edge(bbox, buffer) {
-                        let ranges = member_ranges(bbox, zoom, opts);
-                        for tc in tiles_in_ranges(&ranges, zoom) {
-                            *counts.entry(tile_key(tc.x, tc.y, zoom)).or_insert(0) += 1;
-                        }
-                        return (bounds, counts);
-                    }
-                    let copies: Vec<BboxTileRanges> = wrap_shifts(bbox, buffer)
-                        .map(|shift| member_ranges(&shift_bbox(bbox, shift), zoom, opts))
-                        .collect();
-                    for (i, ranges) in copies.iter().enumerate() {
-                        for tc in tiles_in_ranges(ranges, zoom) {
-                            // A tile two copies share is one member (#342).
-                            if copies[..i].iter().any(|r| ranges_contain(r, tc)) {
-                                continue;
-                            }
-                            *counts.entry(tile_key(tc.x, tc.y, zoom)).or_insert(0) += 1;
-                        }
-                    }
+                    for_each_member_key(bbox, zoom, opts, |key| {
+                        *counts.entry(key).or_insert(0) += 1;
+                    });
                 }
                 (bounds, counts)
             },

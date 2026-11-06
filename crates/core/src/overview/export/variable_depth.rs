@@ -21,10 +21,11 @@ use super::super::ladder::EntryZoomLadder;
 use super::super::level::{Mode, OverviewsMeta};
 use super::super::reader::OverviewReader;
 use super::{
-    account_sources, buffer_deg_at_zoom, build_mvt, collect_wave, encoded_tile, key_to_xy,
-    lnglat_bbox, plan_level, size_bboxes, sort_members_for_encode, tile_fit, tile_key, Crs,
-    EncodedTile, ExportError, ExportOptions, ExportTimers, FillTally, LevelCtx, LevelScan, Member,
-    PartitionBudget, PublishedNames, ResolvedFeatureId, TileMvt, DEFAULT_EXTENT,
+    account_sources, buffer_deg_at_zoom, build_mvt, collect_wave, encoded_tile,
+    for_each_member_key, key_to_xy, lnglat_bbox, plan_level, size_bboxes, sort_members_for_encode,
+    tile_fit, tile_key, Crs, EncodedTile, ExportError, ExportOptions, ExportTimers, FillTally,
+    LevelCtx, LevelScan, Member, PartitionBudget, PublishedNames, ResolvedFeatureId, TileMvt,
+    DEFAULT_EXTENT,
 };
 use crate::compression::TileGzipCache;
 use crate::tile::{TileBounds, TileCoord};
@@ -320,6 +321,48 @@ fn add_counts(into: &mut HashMap<u64, usize>, from: HashMap<u64, usize>) {
     }
 }
 
+/// Rows per task in [`member_runs`]: a batch's rows, sized at every zoom,
+/// in a few dozen tasks rather than one `par_iter` per zoom.
+const RUN_ROWS: usize = 256;
+
+/// Sizes rows at every zoom in `zooms` in one parallel pass, with the same
+/// members as [`tile_keys`]: per task, per zoom, `(key, members)` runs.
+/// Rows come in spatial order, so most consecutive members share a tile at
+/// a coarse zoom and fold into one run instead of one hash update each.
+fn member_runs(
+    bboxes: &[Option<TileBounds>],
+    zooms: &[u8],
+    opts: &ExportOptions,
+) -> Vec<Vec<Vec<(u64, usize)>>> {
+    bboxes
+        .par_chunks(RUN_ROWS)
+        .map(|chunk| {
+            zooms
+                .iter()
+                .map(|&zoom| {
+                    let mut runs: Vec<(u64, usize)> = Vec::new();
+                    for bbox in chunk.iter().flatten() {
+                        for_each_member_key(bbox, zoom, opts, |key| match runs.last_mut() {
+                            Some((k, n)) if *k == key => *n += 1,
+                            _ => runs.push((key, 1)),
+                        });
+                    }
+                    runs
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Adds [`member_runs`]' runs into per-zoom counts, one task per zoom.
+fn add_runs(into: &mut [HashMap<u64, usize>], runs: Vec<Vec<Vec<(u64, usize)>>>) {
+    into.par_iter_mut().enumerate().for_each(|(z, counts)| {
+        for (key, n) in runs.iter().filter_map(|task| task.get(z)).flatten() {
+            *counts.entry(*key).or_insert(0) += n;
+        }
+    });
+}
+
 /// How [`VdScan::fold`] gets a batch's rows one by one when it needs them:
 /// row-aligned bboxes (`None` for a null row), or the decoded geometries.
 pub(super) struct RowSource<'a> {
@@ -468,17 +511,16 @@ impl VdScan {
                 .collect()
         };
         if canonical {
-            for k in 0..self.canonical {
-                add_counts(
-                    &mut self.canonical_counts[k],
-                    tile_keys(bboxes, self.zooms[k], opts),
+            let coarser = &self.zooms[..self.canonical];
+            add_runs(
+                &mut self.canonical_counts,
+                member_runs(bboxes, coarser, opts),
+            );
+            if let Some((_, flags)) = decoded.as_ref().filter(|_| mixed) {
+                add_runs(
+                    &mut self.canonical_points,
+                    member_runs(&points(flags), coarser, opts),
                 );
-                if let Some((_, flags)) = decoded.as_ref().filter(|_| mixed) {
-                    add_counts(
-                        &mut self.canonical_points[k],
-                        tile_keys(&points(flags), self.zooms[k], opts),
-                    );
-                }
             }
             if let Some(release) = &self.release {
                 let zooms = release.release_zooms(batch, aligned);
@@ -811,6 +853,35 @@ mod tests {
     use super::super::super::testutil;
     use super::super::super::tiles::{TilesError, TilesOptions};
     use super::super::{export_pmtiles, ExportError, ExportOptions};
+
+    /// The fused multi-zoom sizing counts exactly what per-zoom
+    /// `tile_keys` counts, world-edge copies and null rows included.
+    #[test]
+    fn member_runs_match_tile_keys() {
+        use crate::tile::TileBounds;
+        let bboxes: Vec<Option<TileBounds>> = (0..1000)
+            .map(|i| {
+                let f = f64::from(i);
+                (i % 97 != 0).then(|| {
+                    let lng = -180.0 + (f * 0.3591) % 360.0;
+                    let lat = -80.0 + (f * 0.161) % 160.0;
+                    TileBounds::new(
+                        lng,
+                        lat,
+                        (lng + 0.01 * f64::from(i % 7)).min(180.0),
+                        lat + 0.01,
+                    )
+                })
+            })
+            .collect();
+        let opts = ExportOptions::default();
+        let zooms: Vec<u8> = (0..=14).collect();
+        let mut fused = vec![std::collections::HashMap::new(); zooms.len()];
+        super::add_runs(&mut fused, super::member_runs(&bboxes, &zooms, &opts));
+        for (k, &z) in zooms.iter().enumerate() {
+            assert_eq!(fused[k], super::tile_keys(&bboxes, z, &opts), "z{z}");
+        }
+    }
 
     /// A small grid of points near (10°E, 45°N).
     fn points(n: usize) -> Vec<Option<Geometry<f64>>> {
