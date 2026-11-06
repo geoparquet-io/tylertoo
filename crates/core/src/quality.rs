@@ -849,6 +849,71 @@ mod tests {
         assert_eq!(classify_crs_identifier(geog), CrsKind::Wgs84);
     }
 
+    fn version_warnings(geo: &str) -> Vec<String> {
+        let d = crate::diagnostics::Diagnostics::default();
+        let kv = vec![tylertoo_io::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        )];
+        crs_info_from_kv_metadata(Some(&kv), &d).unwrap();
+        d.snapshot().iter().map(ToString::to_string).collect()
+    }
+
+    /// #708 item 5: the version warnings are actually emitted, and name what
+    /// the file declared; a non-string `version` is "unknown", not "missing".
+    #[test]
+    fn version_warnings_are_emitted_and_name_the_declared_value() {
+        let cols = r#""primary_column":"geometry","columns":{"geometry":{"crs":"EPSG:4326"}}"#;
+        let w = version_warnings(&format!(r#"{{"version":"3.0.0",{cols}}}"#));
+        assert!(w.iter().any(|m| m.contains("\"3.0.0\"")), "{w:?}");
+        let w = version_warnings(&format!(r#"{{{cols}}}"#));
+        assert!(w.iter().any(|m| m.contains("no 'version' field")), "{w:?}");
+        for raw in ["1.1", "true", r#"{"a":1}"#] {
+            let w = version_warnings(&format!(r#"{{"version":{raw},{cols}}}"#));
+            assert!(
+                w.iter().any(|m| m.contains("does not know"))
+                    && !w.iter().any(|m| m.contains("no 'version'")),
+                "{raw}: {w:?}"
+            );
+        }
+        assert!(version_warnings(&format!(r#"{{"version":"1.1.0",{cols}}}"#)).is_empty());
+    }
+
+    /// #708 item 5: valid JSON that is not an object is a hard error, like
+    /// invalid JSON, not two warnings and an assumed CRS.
+    #[test]
+    fn non_object_geo_json_is_a_hard_error() {
+        for geo in ["[]", "null", "42", "not json"] {
+            let kv = vec![tylertoo_io::KeyValue::new(
+                "geo".to_string(),
+                geo.to_string(),
+            )];
+            let err =
+                crs_info_from_kv_metadata(Some(&kv), &crate::diagnostics::Diagnostics::default());
+            assert!(
+                matches!(err, Err(Error::GeoParquetRead(_))),
+                "{geo}: {err:?}"
+            );
+        }
+    }
+
+    /// #708 item 5: a declared but unsupported CRS (EPSG:27700) is neither
+    /// "assumed" nor WGS84.
+    #[test]
+    fn declared_unsupported_crs_is_not_assumed() {
+        let geo = serde_json::json!({
+            "version": "1.1.0", "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:27700"}}
+        });
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
+        assert!(!info.assumed_wgs84);
+        assert_eq!(classify_crs_info(&info), CrsKind::Unknown);
+    }
+
     #[test]
     fn missing_metadata_fallbacks_set_assumed_wgs84() {
         // (1) No key-value metadata at all.

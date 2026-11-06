@@ -114,13 +114,7 @@ impl ResolvedSchema {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
             .map(|(_, v)| v.clone());
-        let geo = geo_json
-            .as_deref()
-            .map(serde_json::from_str::<Value>)
-            .transpose()
-            .map_err(|e| {
-                Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {e}"))
-            })?;
+        let geo = geo_json.as_deref().map(parse_geo_json).transpose()?;
         if let Some(geo) = &geo {
             warn_geo_version(geo, diagnostics);
         }
@@ -807,8 +801,15 @@ pub(crate) fn geo_version_disposition(version: Option<&str>) -> GeoVersionDispos
 /// carries them, so rejecting the file outright would refuse inputs that
 /// parse fine — matching the issue's "hard-warn on unknown majors" ask.
 fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnostics) {
-    let version = geo_json.get("version").and_then(Value::as_str);
-    match geo_version_disposition(version) {
+    // A non-string `version` (`1.1`, `true`, an object) is present but not a
+    // version: unknown, not "missing" (#708).
+    let raw = geo_json.get("version");
+    let version = raw.and_then(Value::as_str);
+    let disposition = match raw {
+        Some(v) if !v.is_string() => GeoVersionDisposition::Unknown,
+        _ => geo_version_disposition(version),
+    };
+    match disposition {
         GeoVersionDisposition::Known => {}
         GeoVersionDisposition::Missing => {
             diagnostics.once(crate::diagnostics::Diagnostic::CrsMetadata {
@@ -817,9 +818,12 @@ fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnost
             });
         }
         GeoVersionDisposition::Unknown => {
-            // The version string is untrusted input headed for a log line;
+            // The version is untrusted input headed for a log line;
             // {:?} escapes it and the cap keeps a pathological value short.
-            let version = version.unwrap_or_default();
+            let version = version.map_or_else(
+                || raw.map_or_else(String::new, Value::to_string),
+                str::to_owned,
+            );
             let shown: String = version.chars().take(64).collect();
             diagnostics.once(crate::diagnostics::Diagnostic::CrsMetadata {
                 count: 1,
@@ -827,6 +831,19 @@ fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnost
             });
         }
     }
+}
+
+/// Parse a `geo` key's JSON. Invalid JSON and valid JSON that is not an
+/// object (`[]`, `null`, `42`) are the same hard error (#708).
+pub(crate) fn parse_geo_json(json: &str) -> Result<Value> {
+    let v: Value = serde_json::from_str(json)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {e}")))?;
+    if !v.is_object() {
+        return Err(Error::GeoParquetRead(
+            "Failed to parse geo metadata JSON: not a JSON object".to_string(),
+        ));
+    }
+    Ok(v)
 }
 
 /// Extract CRS information from already-parsed parquet key-value metadata.
@@ -868,8 +885,7 @@ pub(crate) fn crs_info_from_kv_metadata(
     };
 
     // Parse the geo metadata JSON
-    let geo_json: Value = serde_json::from_str(geo_json_str)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {}", e)))?;
+    let geo_json = parse_geo_json(geo_json_str)?;
 
     // #451: flag a `geo.version` from a spec this reader does not know
     // before interpreting any of its fields.

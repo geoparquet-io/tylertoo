@@ -389,7 +389,7 @@ impl fmt::Display for Diagnostic {
             Self::CrsMetadata {reason,..} => reason.fmt(f),
             Self::CoveringRejected {reason,..} => write!(f, "bbox covering fast path declined: {reason}; reading the geometry column"),
             Self::UnusableGeometry {total,..} => write!(f, "skipping {n} of {total} input rows with a null, empty, or non-finite geometry"),
-            Self::CrsAssumed {input,..} => write!(f, "input {input}: no CRS declared in the GeoParquet metadata; assuming WGS84 lon/lat (EPSG:4326). If the coordinates are not lon/lat degrees the output will be misplaced — check the input with `gpio inspect {input}`"),
+            Self::CrsAssumed {input,..} => write!(f, "input {input}: no CRS declared in the GeoParquet metadata; assuming WGS84 lon/lat (EPSG:4326). If the coordinates are not lon/lat degrees the output will be misplaced — check the input with `gpio inspect {}`", gpio_inspect_arg(input)),
             Self::EmptyLevels {levels,gsd_min,gsd_max,input_features,first_written_gsd,first_written_zoom,..} => {
                 let ids = levels.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
                 let zoom = first_written_zoom.map_or_else(String::new, |z| format!(" (zoom {z})"));
@@ -912,5 +912,34 @@ mod tests {
             2,
             "reports retain the run's memory advice"
         );
+    }
+}
+
+/// The shell-quoted path for a `gpio inspect` hint. A multi-part input's
+/// display name is `<root> (N partitions)`; only the root is a path (#708).
+fn gpio_inspect_arg(input: &str) -> String {
+    let path = input
+        .strip_suffix(" partitions)")
+        .and_then(|s| s.rsplit_once(" ("))
+        .map_or(input, |(root, _)| root);
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod gpio_hint_tests {
+    use super::*;
+
+    #[test]
+    fn crs_assumed_hint_is_a_copy_pasteable_command() {
+        let hint = |input: &str| {
+            Diagnostic::CrsAssumed {
+                count: 1,
+                input: input.to_owned(),
+            }
+            .to_string()
+        };
+        assert!(hint("/data/parts (800 partitions)").ends_with("`gpio inspect '/data/parts'`"));
+        assert!(hint("/my data/a.parquet").ends_with("`gpio inspect '/my data/a.parquet'`"));
+        assert!(hint("it's.parquet").ends_with(r"`gpio inspect 'it'\''s.parquet'`"));
     }
 }
