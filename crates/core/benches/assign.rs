@@ -16,7 +16,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use tylertoo_core::overview::assign::{
+use tylertoo_core::internal::overview::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, Crs,
     DensityBudgetConfig, FeatureKind, FeatureTable,
 };

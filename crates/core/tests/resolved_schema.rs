@@ -1,10 +1,10 @@
 //! Regression coverage for the one schema owner and its persisted descriptor.
 use std::path::{Path, PathBuf};
-use tylertoo_core::input_set::ConvertSource;
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
-use tylertoo_core::overview::reader::OverviewReader;
-use tylertoo_core::resolved_schema::{ResolvedSchema, RESOLVED_SCHEMA_KEY};
+use tylertoo_core::internal::input_set::ConvertSource;
+use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_core::internal::overview::reader::OverviewReader;
+use tylertoo_core::internal::resolved_schema::{ResolvedSchema, RESOLVED_SCHEMA_KEY};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -19,15 +19,12 @@ fn shape_descriptor_survives_convert_check_export_and_auto_zoom() {
     let descriptor = source.resolved_schema().unwrap();
     assert_eq!(descriptor.geometry_name(), Some("SHAPE"));
     assert_eq!(descriptor.primary_column(), Some("SHAPE"));
-    let options = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: 14,
-            max_zoom: 14,
-        },
-        ..Default::default()
-    };
+    let options = ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: 14,
+        max_zoom: 14,
+    });
     let evidence =
-        tylertoo_core::overview::auto_zoom::estimate_max_zoom(&source, &options).unwrap();
+        tylertoo_core::internal::overview::auto_zoom::estimate_max_zoom(&source, &options).unwrap();
     assert!(evidence.chosen_zoom >= 14);
     let temp = tempfile::tempdir().unwrap();
     let overview = temp.path().join("overview.parquet");
@@ -55,10 +52,13 @@ fn shape_descriptor_survives_convert_check_export_and_auto_zoom() {
         overview_source.resolved_schema().unwrap().geometry_name(),
         Some("SHAPE")
     );
-    tylertoo_core::overview::auto_zoom::estimate_max_zoom(&overview_source, &options).unwrap();
-    assert!(tylertoo_core::overview::check::validate_file(&overview)
-        .unwrap()
-        .is_valid());
+    tylertoo_core::internal::overview::auto_zoom::estimate_max_zoom(&overview_source, &options)
+        .unwrap();
+    assert!(
+        tylertoo_core::internal::overview::check::validate_file(&overview)
+            .unwrap()
+            .is_valid()
+    );
     let archive = temp.path().join("tiles.pmtiles");
     let report = export_pmtiles(&overview, &archive, &ExportOptions::default()).unwrap();
     assert!(report.total_tile_features > 0);
@@ -92,16 +92,14 @@ fn native_geoparquet2_multipart_reports_declared_crs() {
     }
     let source = ConvertSource::resolve_path(&input).unwrap();
     let output = temp.path().join("overview.parquet");
-    let options = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: 14,
-            max_zoom: 14,
-        },
-        ..Default::default()
-    };
-    let report =
-        tylertoo_core::overview::convert::convert_to_overviews_sources(&source, &output, &options)
-            .unwrap();
+    let options = ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: 14,
+        max_zoom: 14,
+    });
+    let report = tylertoo_core::internal::overview::convert::convert_to_overviews_sources(
+        &source, &output, &options,
+    )
+    .unwrap();
     assert_eq!(report.input_features, 2000);
     assert!(
         !report.crs_assumed_wgs84,

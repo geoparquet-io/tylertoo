@@ -1,6 +1,6 @@
 use serde_json::json;
-use tylertoo_core::overview::convert::ConvertOptions;
-use tylertoo_core::overview::export::ExportOptions;
+use tylertoo_core::internal::overview::convert::ConvertOptions;
+use tylertoo_core::internal::overview::export::ExportOptions;
 
 #[test]
 fn ordinary_keywords_deserialize_into_convert_options() {
@@ -76,7 +76,7 @@ fn non_finite_generalization_values_are_configuration_errors() {
 
 #[test]
 fn invalid_level_plans_cannot_produce_a_validation_proof() {
-    use tylertoo_core::overview::convert::LevelPlan;
+    use tylertoo_core::internal::overview::convert::LevelPlan;
     for levels in [
         LevelPlan::ZoomRange {
             min_zoom: 7,
@@ -84,20 +84,14 @@ fn invalid_level_plans_cannot_produce_a_validation_proof() {
         },
         LevelPlan::Gsds(vec![]),
     ] {
-        let options = ConvertOptions {
-            levels,
-            ..Default::default()
-        };
+        let options = ConvertOptions::default().with_levels(levels);
         assert!(options.validate().is_err());
     }
 }
 
 #[test]
 fn export_zoom_bounds_are_checked_without_an_input() {
-    let options = ExportOptions {
-        min_zoom: Some(255),
-        ..Default::default()
-    };
+    let options = ExportOptions::default().with_min_zoom(Some(255));
     assert!(options
         .validate()
         .unwrap_err()
@@ -107,16 +101,14 @@ fn export_zoom_bounds_are_checked_without_an_input() {
 
 #[test]
 fn accumulation_specs_round_trip_without_losing_order_or_repeated_columns() {
-    use tylertoo_core::overview::convert::parse_accumulate;
-    let options = ConvertOptions {
-        cluster: true,
-        accumulate: vec![
+    use tylertoo_core::internal::overview::convert::parse_accumulate;
+    let options = ConvertOptions::default()
+        .with_cluster(true)
+        .with_accumulate(vec![
             parse_accumulate("z:sum").unwrap(),
             parse_accumulate("a:max").unwrap(),
             parse_accumulate("z:mean").unwrap(),
-        ],
-        ..Default::default()
-    };
+        ]);
     let encoded = serde_json::to_value(&options).unwrap();
     let decoded: ConvertOptions = serde_json::from_value(encoded).unwrap();
     assert_eq!(decoded.accumulate.len(), options.accumulate.len());
@@ -128,7 +120,7 @@ fn accumulation_specs_round_trip_without_losing_order_or_repeated_columns() {
 
 #[test]
 fn type_errors_name_the_keyword_in_flattened_and_optional_groups() {
-    use tylertoo_core::overview::config::keywords;
+    use tylertoo_core::internal::overview::config::keywords;
     for (key, value) in [
         ("read_batch_size", json!(true)),
         ("simplify_factor", json!("wrong")),
@@ -146,7 +138,7 @@ fn type_errors_name_the_keyword_in_flattened_and_optional_groups() {
 
 #[test]
 fn convert_syntax_preserves_explicit_overrides() {
-    use tylertoo_core::overview::config::keywords;
+    use tylertoo_core::internal::overview::config::keywords;
     let options = keywords::convert(
         json!({
             "verbatim": true, "point_thinning": 3.0,
@@ -163,14 +155,14 @@ fn convert_syntax_preserves_explicit_overrides() {
     options.validate().unwrap();
     assert_eq!(options.assign.point_thinning, 3.0);
     assert_eq!(options.assign.line_thinning, 0.0);
-    assert_eq!(options.class_ranking.unwrap().column, "kind");
+    assert_eq!(options.class_ranking.unwrap().column(), "kind");
     assert_eq!(options.accumulate.len(), 1);
     assert!(options.density.kinds.lines);
 }
 
 #[test]
 fn command_defaults_have_no_internal_engine_keys() {
-    use tylertoo_core::overview::config::keywords;
+    use tylertoo_core::internal::overview::config::keywords;
     for command in ["convert", "overview", "export_pmtiles", "pyramid"] {
         let values = keywords::command_defaults(command);
         for key in [
@@ -189,7 +181,7 @@ fn command_defaults_have_no_internal_engine_keys() {
 
 #[test]
 fn tiles_keywords_match_core_defaults() {
-    use tylertoo_core::overview::{config::keywords, tiles::TilesOptions};
+    use tylertoo_core::internal::overview::{config::keywords, tiles::TilesOptions};
     let options = keywords::tiles(Default::default()).unwrap();
     options.validate().unwrap();
     let expected = TilesOptions::default()
@@ -208,7 +200,7 @@ fn tiles_keywords_match_core_defaults() {
 
 #[test]
 fn automatic_caps_are_resolved_by_each_command() {
-    use tylertoo_core::overview::config::keywords;
+    use tylertoo_core::internal::overview::config::keywords;
     let options = keywords::tiles(
         json!({"verbatim": true, "tile_size_limit": "auto", "max_compressed_tile_size": 1200})
             .as_object()

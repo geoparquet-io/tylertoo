@@ -34,17 +34,21 @@ use super::level::{gsd, Mode, OverviewsMeta, OVERVIEWS_KEY};
 
 /// Errors produced when opening or reading an overview file.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReaderError {
     /// I/O error opening the backing file.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     /// Underlying parquet error (footer parse, row-group read).
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] tylertoo_io::ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] tylertoo_io::ParquetError),
     /// The overview file could not be opened (#452: the bare [`Self::Io`]
     /// named no file). Not a `#[source]`, so `Caused by:` chains do not
     /// repeat the reason.
     #[error("cannot open {path}: {error}")]
+    #[non_exhaustive]
     Open {
         /// The file as given.
         path: String,
@@ -56,10 +60,12 @@ pub enum ReaderError {
         "cannot read the Parquet footer of {path}: {}",
         crate::input::parquet_error_detail(.error)
     )]
+    #[non_exhaustive]
     Footer {
         /// The file as given.
         path: String,
         /// The underlying Parquet error.
+        #[doc(hidden)]
         error: tylertoo_io::ParquetError,
     },
     /// The `geo:overviews` footer key is absent — not an overview file.
@@ -67,6 +73,7 @@ pub enum ReaderError {
         "{path} has no 'geo:overviews' footer key: not an overview file (make one with \
          `tylertoo overview`)"
     )]
+    #[non_exhaustive]
     MissingOverviewsKey {
         /// The file as given.
         path: String,
@@ -86,12 +93,20 @@ pub enum ReaderError {
     Conformance(String),
     /// A level index was requested that does not exist in the file.
     #[error("level {level} out of range (file has {num_levels} levels)")]
+    #[non_exhaustive]
     LevelOutOfRange {
         /// The offending level index.
         level: usize,
         /// The number of levels in the file.
         num_levels: usize,
     },
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::ParquetError> for ReaderError {
+    fn from(e: tylertoo_io::ParquetError) -> Self {
+        ReaderError::Parquet(e)
+    }
 }
 
 /// A reader over a local GeoParquet overview file.
@@ -851,6 +866,54 @@ mod tests {
             rows += rgm.num_rows();
         }
         assert_eq!(mean, bytes / rows as u64);
+    }
+
+    #[test]
+    fn open_rejects_foreign_major_and_accepts_newer_minor() {
+        use tylertoo_io::test_support::{ArrowWriter, WriterProperties};
+        use tylertoo_io::KeyValue;
+
+        let donor = tempfile::NamedTempFile::new().unwrap();
+        let mut meta = write_int_column_fixture(
+            donor.path(),
+            Field::new("n", DataType::Int64, false),
+            Arc::new(Int64Array::from(vec![1])),
+        );
+        for (version, accepted) in [("5.0.0", false), ("0.999.0", true)] {
+            meta.version = version.to_string();
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
+                    .unwrap();
+            let props = WriterProperties::builder()
+                .set_key_value_metadata(Some(vec![KeyValue::new(
+                    OVERVIEWS_KEY.to_string(),
+                    meta.to_json().unwrap(),
+                )]))
+                .build();
+            let mut writer = ArrowWriter::try_new(
+                File::create(tmp.path()).unwrap(),
+                schema.clone(),
+                Some(props),
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let result = OverviewReader::open(tmp.path());
+            if accepted {
+                assert!(meta.validate(1).is_ok());
+                // Fails later (fixture has no levels), but never on the version.
+                let message = result.unwrap_err().to_string();
+                assert!(!message.contains("MAJOR"), "{version}: {message}");
+            } else {
+                let message = result.unwrap_err().to_string();
+                assert!(
+                    message.contains("unsupported overview MAJOR") && message.contains(version),
+                    "{message}"
+                );
+            }
+        }
     }
 
     #[test]

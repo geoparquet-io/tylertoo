@@ -228,9 +228,10 @@ pub(super) fn column_index(
 }
 
 fn missing_column(name: &str) -> ExportError {
-    ExportError::Config(ConfigError::VariableDepthConflict {
-        conflict: format!("an overview whose footer names a column {name:?} it does not hold"),
-    })
+    ExportError::VariableDepthColumn {
+        column: name.to_string(),
+        reason: "the overview's footer names but the file does not hold".to_string(),
+    }
 }
 
 /// Column `name` of `batch` cast to `to`, strictly: a value that does not
@@ -248,9 +249,10 @@ fn read_column(
         ..Default::default()
     };
     arrow_cast::cast_with_options(column, to, &strict).map_err(|e| {
-        ExportError::Config(ConfigError::VariableDepthConflict {
-            conflict: format!("a column {name:?} whose values do not read as {to} ({e})"),
-        })
+        ExportError::VariableDepthColumn {
+            column: name.to_string(),
+            reason: format!("holds values that do not read as {to} ({e})"),
+        }
     })
 }
 
@@ -1772,6 +1774,10 @@ mod tests {
         .unwrap();
         for (batch, needle) in [(&missing, "does not hold"), (&text, "do not read as")] {
             let err = super::RowRelease::release_zooms(&rungs, batch, &bboxes).unwrap_err();
+            assert_eq!(
+                crate::error::Classify::kind(&err),
+                crate::error::ErrorKind::Input
+            );
             assert!(err.to_string().contains(needle), "{err}");
         }
         assert!(super::read_column(&text, "v", &DataType::Int64).is_err());

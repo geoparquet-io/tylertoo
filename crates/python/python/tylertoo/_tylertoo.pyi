@@ -69,7 +69,7 @@ def overview(
     line_thinning: float | None = None,
     line_visibility: float | None = None,
     magnitude_ladder: str | None = None,
-    max_zoom: int | Literal["auto"] = 6,
+    max_zoom: int | str = 6,
     min_zoom: int = 0,
     mode: Literal["duplicating", "partitioning"] = "duplicating",
     no_auto_rank: bool = False,
@@ -89,7 +89,6 @@ def overview(
     sort_direction: Literal["desc", "asc"] = "desc",
     sort_key: str | None = None,
     spill_dir: str | os.PathLike[str] | None = None,
-    streaming: bool = True,
     verbatim: bool = False,
 ) -> OverviewReport: ...
 def export_pmtiles(
@@ -157,7 +156,7 @@ def convert(
     input: str,
     output: str,
     min_zoom: int = 0,
-    max_zoom: int | Literal["auto"] = 14,
+    max_zoom: int | str = 14,
     layer_name: str | None = None,
     tile_size_limit: int | Literal["auto"] | None = "auto",
     simple_clip_fastpath: bool = True,
@@ -223,7 +222,6 @@ def convert(
     size_valve: Literal["merge", "drop"] = "merge",
     sort_direction: Literal["desc", "asc"] = "desc",
     sort_key: str | None = None,
-    streaming: bool = True,
     tile_buffer: int = 8,
     tile_range: str | None = None,
     verbatim: bool = False,

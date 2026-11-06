@@ -398,10 +398,16 @@ pub fn command_defaults(command: &str) -> Map<String, Value> {
 fn max_zoom_value(value: Value) -> Result<crate::overview::auto_zoom::MaxZoom, ConvertError> {
     use crate::overview::auto_zoom::MaxZoom;
     if let Some(s) = value.as_str() {
-        if !s.eq_ignore_ascii_case("auto") {
-            return Err(error("max_zoom", "must be an int or \"auto\"").into());
-        }
-        return Ok(MaxZoom::Auto);
+        return s
+            .parse::<MaxZoom>()
+            .and_then(|z| {
+                if z.is_auto() {
+                    Ok(z)
+                } else {
+                    Err("must be an int or auto[:cap]".into())
+                }
+            })
+            .map_err(|e| error("max_zoom", e).into());
     }
     value
         .as_u64()
@@ -638,5 +644,32 @@ mod auto_max_zoom_tests {
             ConvertOptions::default()
         )
         .is_err());
+    }
+
+    #[test]
+    fn capped_auto_keyword_validates() {
+        let options = convert(
+            keywords(serde_json::json!({"max_zoom": "auto:14"})),
+            ConvertOptions::default(),
+        )
+        .unwrap();
+        assert!(options.auto_max_zoom);
+        assert!(matches!(
+            options.levels,
+            LevelPlan::ZoomRange { max_zoom: 14, .. }
+        ));
+        options.validate().unwrap();
+        let invalid = convert(
+            keywords(serde_json::json!({"max_zoom": "auto:31"})),
+            ConvertOptions::default(),
+        )
+        .unwrap();
+        assert!(invalid.validate().is_err());
+        let inverted = convert(
+            keywords(serde_json::json!({"min_zoom": 15, "max_zoom": "auto:14"})),
+            ConvertOptions::default(),
+        )
+        .unwrap();
+        assert!(inverted.validate().is_err());
     }
 }

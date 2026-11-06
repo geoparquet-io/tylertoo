@@ -53,6 +53,7 @@ echo "Prose lint passed!"
 echo "Checking version consistency..."
 WORKSPACE_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
 CORE_DEP_VERSION=$(grep 'tylertoo-core.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+IO_DEP_VERSION=$(grep 'tylertoo-io.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
 PYTHON_VERSION=$(grep -m1 '^version = ' crates/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
 
 VERSION_ERROR=0
@@ -62,6 +63,14 @@ if [ -n "$CORE_DEP_VERSION" ] && [ "$WORKSPACE_VERSION" != "$CORE_DEP_VERSION" ]
     echo "ERROR: Cargo version mismatch!"
     echo "  workspace.package.version = $WORKSPACE_VERSION"
     echo "  tylertoo-core dependency = $CORE_DEP_VERSION"
+    VERSION_ERROR=1
+fi
+
+if [ -n "$IO_DEP_VERSION" ] && [ "$WORKSPACE_VERSION" != "$IO_DEP_VERSION" ]; then
+    echo ""
+    echo "ERROR: Cargo version mismatch!"
+    echo "  workspace.package.version = $WORKSPACE_VERSION"
+    echo "  tylertoo-io dependency    = $IO_DEP_VERSION"
     VERSION_ERROR=1
 fi
 

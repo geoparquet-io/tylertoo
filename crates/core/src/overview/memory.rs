@@ -72,7 +72,6 @@ const EXPORT_SHARE: f64 = EXPORT_FRACTION / ALLOWANCE_FRACTION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MemoryPhase {
-    EagerInput,
     Scan,
     Assign,
     /// Remote staging's requests in flight (pass 0, track R).
@@ -96,11 +95,10 @@ pub(super) enum MemoryPhase {
 
 impl MemoryPhase {
     /// Number of phases: the length of the per-phase ledger.
-    const COUNT: usize = 12;
+    const COUNT: usize = 11;
 
     pub(super) fn name(self) -> &'static str {
         match self {
-            Self::EagerInput => "eager input",
             Self::Scan => "pass-1 scan",
             Self::Assign => "assignment",
             Self::Stage => "remote staging",
@@ -131,13 +129,9 @@ impl MemoryPhase {
         match self {
             Self::Encode | Self::ExportCollect | Self::ExportEncode | Self::Fill => floor,
             Self::Stage => stage_units.min(want),
-            Self::EagerInput
-            | Self::Scan
-            | Self::Assign
-            | Self::Read
-            | Self::Compute
-            | Self::Write
-            | Self::Spill => want,
+            Self::Scan | Self::Assign | Self::Read | Self::Compute | Self::Write | Self::Spill => {
+                want
+            }
         }
     }
 
@@ -148,13 +142,7 @@ impl MemoryPhase {
             Self::Compute => COMPUTE_SHARE,
             Self::Encode => ENCODE_SHARE,
             Self::ExportCollect | Self::ExportEncode => EXPORT_SHARE,
-            Self::EagerInput
-            | Self::Scan
-            | Self::Assign
-            | Self::Stage
-            | Self::Write
-            | Self::Spill
-            | Self::Fill => 1.0,
+            Self::Scan | Self::Assign | Self::Stage | Self::Write | Self::Spill | Self::Fill => 1.0,
         }
     }
 }
@@ -282,7 +270,7 @@ impl MemoryBudget {
     )]
     pub(super) fn estimate(self, phase: MemoryPhase, rows: u64, geometry: Option<u64>) -> u64 {
         let per_row = match phase {
-            MemoryPhase::EagerInput | MemoryPhase::Scan => FeatureTable::MAX_BYTES_PER_ROW,
+            MemoryPhase::Scan => FeatureTable::MAX_BYTES_PER_ROW,
             MemoryPhase::Assign => FeatureTable::MAX_BYTES_PER_ROW,
             // The phases that price themselves (staging, encodes, spill,
             // export, fill) have no per-row model of their own; a decoded
@@ -477,16 +465,6 @@ impl MemoryBudget {
         *slot = slot.saturating_add(taken);
         taken
     }
-
-    /// Data that must be resident (the retained input stays resident across
-    /// every later phase): charge it all or fail. Charged before any
-    /// allowance is calculated from this budget.
-    pub(super) fn reserve(&mut self, phase: MemoryPhase, bytes: u64) -> Result<(), ConvertError> {
-        self.require(phase, bytes)?;
-        let slot = &mut self.reserved[phase as usize];
-        *slot = slot.saturating_add(bytes);
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -497,7 +475,6 @@ mod tests {
     fn budget_exceeded_names_each_phase() {
         let budget = MemoryBudget::with_available(Some(100));
         for phase in [
-            MemoryPhase::EagerInput,
             MemoryPhase::Scan,
             MemoryPhase::Assign,
             MemoryPhase::Read,
@@ -523,12 +500,10 @@ mod tests {
     #[test]
     fn retained_input_reduces_every_later_allowance() {
         let mut budget = MemoryBudget::with_available(Some(1000));
-        budget.reserve(MemoryPhase::EagerInput, 600).unwrap();
+        assert_eq!(budget.reserve_up_to(MemoryPhase::Spill, 600), 600);
         assert_eq!(budget.available(), Some(400));
         assert_eq!(budget.allowance(MemoryProfile::Bounded), 240);
         assert!(budget.require(MemoryPhase::Scan, 401).is_err());
-        assert!(budget.reserve(MemoryPhase::EagerInput, 401).is_err());
-        assert_eq!(budget.available(), Some(400));
     }
 
     /// A window of `requested` batches priced by the per-row model.
@@ -632,7 +607,7 @@ mod tests {
             budget.affordable(MemoryProfile::Auto, MemoryPhase::Read, Price::model(unit)),
             4
         );
-        budget.reserve(MemoryPhase::EagerInput, u64::MAX).unwrap();
+        assert_eq!(budget.reserve_up_to(MemoryPhase::Spill, u64::MAX), 0);
         assert_eq!(budget.remaining(), FALLBACK_ALLOWANCE_BYTES);
         assert_eq!(budget.available(), None);
     }
@@ -777,7 +752,6 @@ mod tests {
     #[test]
     fn every_profile_grants_by_one_rule() {
         let phases = [
-            MemoryPhase::EagerInput,
             MemoryPhase::Scan,
             MemoryPhase::Assign,
             MemoryPhase::Stage,

@@ -20,9 +20,11 @@ mod fixture;
 
 #[test]
 fn madagascar_adm4_keeps_every_polygon_at_z8_by_default() {
-    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
-    use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+    use tylertoo_core::internal::decode::{decode_pmtiles, DecodeOptions};
+    use tylertoo_core::internal::overview::convert::{
+        convert_to_overviews, ConvertOptions, LevelPlan,
+    };
+    use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions};
 
     let Some(fixture_path) = fixture::realdata("fieldmaps-madagascar-adm4.parquet") else {
         return;
@@ -35,13 +37,10 @@ fn madagascar_adm4_keeps_every_polygon_at_z8_by_default() {
     convert_to_overviews(
         &fixture_path,
         &overview,
-        &ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 0,
-                max_zoom: 10,
-            },
-            ..Default::default()
-        },
+        &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 10,
+        }),
     )
     .expect("convert");
     let report = export_pmtiles(&overview, &archive, &ExportOptions::default()).expect("export");
@@ -53,11 +52,10 @@ fn madagascar_adm4_keeps_every_polygon_at_z8_by_default() {
     decode_pmtiles(
         &archive,
         &decoded,
-        &DecodeOptions {
-            min_zoom: Some(8),
-            max_zoom: Some(8),
-            layer: None,
-        },
+        &DecodeOptions::default()
+            .with_min_zoom(Some(8))
+            .with_max_zoom(Some(8))
+            .with_layer(None),
     )
     .expect("decode z8");
 

@@ -7,6 +7,8 @@ version_files = [
     "Cargo.toml:^version",
     # tylertoo-core dependency in workspace.dependencies
     "Cargo.toml:tylertoo-core.*version",
+    # tylertoo-io dependency in workspace.dependencies
+    "Cargo.toml:tylertoo-io.*version",
     # Python package version
     "crates/python/pyproject.toml:^version",
 ]

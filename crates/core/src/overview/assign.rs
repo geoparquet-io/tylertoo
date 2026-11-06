@@ -142,6 +142,7 @@ pub use super::simplify::Representation;
 
 /// Geometry kind, for per-kind thinning and visibility gating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FeatureKind {
     Point,
     Line,
@@ -793,6 +794,7 @@ impl From<Vec<AssignFeature>> for FeatureTable {
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct AssignConfig {
     /// Grid-cell multiplier for points (coarser grid ⇒ more aggressive thin).
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
@@ -839,6 +841,15 @@ pub struct AssignConfig {
     #[cfg_attr(feature = "cli", arg(help = "Whether the larger (`desc`) or the smaller (`asc`) `--sort-key` value wins a cell", long_help = None))]
     pub sort_direction: SortDirection,
 }
+
+with_setters!(AssignConfig {
+    with_point_thinning => point_thinning: f64,
+    with_line_thinning => line_thinning: f64,
+    with_polygon_thinning => polygon_thinning: f64,
+    with_line_visibility => line_visibility: f64,
+    with_polygon_visibility => polygon_visibility: f64,
+    with_sort_direction => sort_direction: SortDirection,
+});
 
 /// Default `point_thinning` when point clustering is enabled.
 ///
@@ -2018,6 +2029,7 @@ pub const MIN_DENSITY_LEVEL_FEATURES: usize = 256;
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct DensityBudgetConfig {
     /// Master switch. When `false`, [`apply_density_budget`] is an identity and
     /// the pipeline reproduces the pre-Q2 cell-winner behavior byte-for-byte.
@@ -2036,7 +2048,7 @@ pub struct DensityBudgetConfig {
     ))]
     #[cfg_attr(feature = "cli", arg(help = "Density budget decay: each coarser level keeps 1/rate of the next finer level's feature budget. Larger values thin mid zooms more", long_help = None))]
     pub drop_rate: f64,
-    /// Spatial-fairness strength (`>= 1`). `1.0` = proportional cut; larger =
+    /// Spatial-fairness strength (`>= 1`; smaller is rejected by validation). `1.0` = proportional cut; larger =
     /// sublinear, protecting sparse neighborhoods (dense areas kept to the
     /// `1/gamma` power of their population).
     #[serde(rename = "drop_gamma")]
@@ -2045,7 +2057,7 @@ pub struct DensityBudgetConfig {
         default_value_t = Self::default().gamma,
         help_heading = "Density budget"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Sparse-area protection: 1 reduces every neighborhood equally; larger values protect sparse areas more", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Sparse-area protection, at least 1: 1 reduces every neighborhood equally; larger values protect sparse areas more. Smaller values are rejected", long_help = None))]
     pub gamma: f64,
     /// Which geometry kinds the budget thins (#745). A kind left out keeps
     /// its cell-winner level and does not count toward `N`. Default: points
@@ -2055,6 +2067,13 @@ pub struct DensityBudgetConfig {
     pub kinds: BudgetKinds,
 }
 
+with_setters!(DensityBudgetConfig {
+    with_enabled => enabled: bool,
+    with_drop_rate => drop_rate: f64,
+    with_gamma => gamma: f64,
+    with_kinds => kinds: BudgetKinds,
+});
+
 /// The geometry kinds a [`DensityBudgetConfig`] thins (#745).
 ///
 /// tippecanoe's drop rate (`-r`) thins only points unless `--drop-lines` or
@@ -2063,6 +2082,7 @@ pub struct DensityBudgetConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct BudgetKinds {
     #[serde(skip)]
     #[cfg_attr(feature = "cli", arg(skip = Self::default().points))]
@@ -2090,6 +2110,12 @@ pub struct BudgetKinds {
     #[cfg_attr(feature = "cli", arg(help = "Apply the density budget to polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the budget excludes polygons by default (tippecanoe's `--drop-polygons`)", long_help = None))]
     pub polygons: bool,
 }
+
+with_setters!(BudgetKinds {
+    with_points => points: bool,
+    with_lines => lines: bool,
+    with_polygons => polygons: bool,
+});
 
 impl BudgetKinds {
     /// Every kind: the budget before #745.
@@ -2460,6 +2486,8 @@ pub(super) fn select_budget_survivors(
         .for_each(|run| run.sort_unstable_by(|a, b| priority_order(features, dir, a.1, b.1)));
     drop(runs);
 
+    // validate_options refuses gamma < 1; the clamp keeps direct library callers
+    // (apply_density_budget, CoalesceParams::budget) on their previous behavior.
     let alpha = 1.0 / gamma.max(1.0);
     let allocs = water_fill(&pops, available, alpha);
 

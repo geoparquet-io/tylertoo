@@ -12,7 +12,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     if let Ok(s) = std::str::from_utf8(json) {
-        if let Ok(meta) = tylertoo_core::overview::level::OverviewsMeta::from_json(s) {
+        if let Ok(meta) = tylertoo_core::internal::overview::level::OverviewsMeta::from_json(s) {
             let _ = meta.validate(i64::from(n));
         }
     }

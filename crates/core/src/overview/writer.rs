@@ -132,6 +132,7 @@ impl LevelSpec {
 /// How the per-level row-group cap is derived from `max_row_group_size`
 /// (issue #202).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum RowGroupSizePolicy {
     /// Every level uses `max_row_group_size` as its cap (the shipped default).
     #[default]
@@ -265,13 +266,18 @@ impl OverviewWriterOptions {
 
 /// Errors produced by [`OverviewWriter`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WriterError {
     /// Underlying parquet error.
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] tylertoo_io::ParquetError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Parquet(#[source] tylertoo_io::ParquetError),
     /// Arrow error (e.g. building a record batch).
     #[error("arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    // #437: hidden, so the third-party payload type is not stable API.
+    #[doc(hidden)]
+    Arrow(#[source] arrow_schema::ArrowError),
     /// I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -295,6 +301,7 @@ pub enum WriterError {
     NoGeometryColumn,
     /// `write_level` was called out of order (must be 0, 1, 2, ... coarse→fine).
     #[error("write_level called out of order: expected level {expected}, got {got}")]
+    #[non_exhaustive]
     LevelOutOfOrder {
         /// Expected next level index.
         expected: usize,
@@ -307,18 +314,34 @@ pub enum WriterError {
         "all {expected} declared level(s) were empty — no output rows at any \
          level (empty input, or every feature dropped at every scale)"
     )]
+    #[non_exhaustive]
     AllLevelsEmpty {
         /// Levels declared in the options.
         expected: usize,
     },
     /// `finish` was called before all declared levels were written.
     #[error("finish called with {written} of {expected} levels written")]
+    #[non_exhaustive]
     IncompleteLevels {
         /// Levels written so far.
         written: usize,
         /// Levels declared in the options.
         expected: usize,
     },
+}
+
+#[doc(hidden)]
+impl From<arrow_schema::ArrowError> for WriterError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        WriterError::Arrow(e)
+    }
+}
+
+#[doc(hidden)]
+impl From<tylertoo_io::ParquetError> for WriterError {
+    fn from(e: tylertoo_io::ParquetError) -> Self {
+        WriterError::Parquet(e)
+    }
 }
 
 /// Outcome of one [`OverviewWriter::write_level`] call.

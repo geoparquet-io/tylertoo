@@ -592,6 +592,15 @@ impl ConvertSource {
         }
     }
 
+    /// The input's path (a multi-part input's root directory or glob), as
+    /// opposed to [`Self::display_name`]'s label.
+    pub fn root_path(&self) -> String {
+        match self {
+            ConvertSource::Single(s) => s.input().display_name(),
+            ConvertSource::Multi(m) => m.root.clone(),
+        }
+    }
+
     /// Human-readable input name: the path/URL for a single source,
     /// `"<root> (N partitions)"` for a multi source.
     pub fn display_name(&self) -> String {
@@ -1311,7 +1320,12 @@ fn load_part_meta(source: &InputSource) -> Result<PartMeta, InputError> {
     // footer parse and no second `ARROW:schema` decode.
     let reader = builder.reader_metadata().clone();
     let resolved = crate::resolved_schema::ResolvedSchema::from_parquet(builder.schema(), &parquet)
-        .map_err(|e| InputError::Parquet(tylertoo_io::ParquetError::General(e.to_string())))?;
+        .map_err(|e| {
+            InputError::Parquet(tylertoo_io::ParquetError::General(format!(
+                "{}: {e}",
+                source.display_name()
+            )))
+        })?;
     Ok(PartMeta {
         resolved: Arc::new(resolved),
         schema: builder.schema().clone(),
@@ -1431,6 +1445,28 @@ impl MultiSource {
                      declares {:?} (all partitions must share one CRS)",
                     raw_crs_of(meta),
                     raw_crs_of(&metas[0]),
+                )));
+            }
+            // #708: a declared 4326 and an assumed one are different facts;
+            // the report's `crs_assumed_wgs84` is one flag for the whole set.
+            let (assumed, first_assumed) = (
+                meta.resolved.crs_info().assumed_wgs84,
+                metas[0].resolved.crs_info().assumed_wgs84,
+            );
+            if assumed != first_assumed {
+                let word = |a: bool| {
+                    if a {
+                        "assumed (no CRS declared)"
+                    } else {
+                        "declared"
+                    }
+                };
+                return Err(incompatible(format!(
+                    "CRS mismatch: partition's WGS84 is {} but the first \
+                     partition's is {} (all partitions must declare their CRS, \
+                     or none)",
+                    word(assumed),
+                    word(first_assumed),
                 )));
             }
             if crs.is_none() {
@@ -2168,6 +2204,100 @@ mod tests {
             }
             other => panic!("expected IncompatiblePartition, got {other:?}"),
         }
+    }
+
+    /// #708: a part that declares EPSG:4326 and a part that declares nothing
+    /// (WGS84 merely assumed) are not the same CRS; the set must not report
+    /// 799 assumptions as one declaration (nor the reverse).
+    #[test]
+    fn declared_versus_assumed_wgs84_rejected_either_order() {
+        for (declared, assumed) in [("a.parquet", "b.parquet"), ("b.parquet", "a.parquet")] {
+            let dir = tmpdir();
+            for file in [declared, assumed] {
+                let path = dir.path().join(file);
+                let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int64Array::from(vec![1i64])) as ArrayRef],
+                )
+                .unwrap();
+                let mut writer =
+                    ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+                writer.write(&batch).unwrap();
+                if file == declared {
+                    writer.append_key_value_metadata(tylertoo_io::KeyValue::new(
+                        "geo".to_string(),
+                        r#"{"version":"1.0.0","primary_column":"geometry","columns":{"geometry":{"crs":"EPSG:4326"}}}"#.to_string(),
+                    ));
+                }
+                writer.close().unwrap();
+            }
+            let err = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap_err();
+            match err {
+                InputError::IncompatiblePartition { detail, .. } => assert!(
+                    detail.contains("assumed") && detail.contains("declared"),
+                    "{detail}"
+                ),
+                other => panic!("expected IncompatiblePartition, got {other:?}"),
+            }
+        }
+    }
+
+    /// #708: the version verdict covers every part, not part 0.
+    #[test]
+    fn geo_version_covers_every_part() {
+        use crate::resolved_schema::GeoVersion;
+        let dir = tmpdir();
+        for (file, v) in [("a.parquet", "1.1.0"), ("b.parquet", "3.0.0")] {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1i64])) as ArrayRef],
+            )
+            .unwrap();
+            let mut w =
+                ArrowWriter::try_new(File::create(dir.path().join(file)).unwrap(), schema, None)
+                    .unwrap();
+            w.write(&batch).unwrap();
+            w.append_key_value_metadata(tylertoo_io::KeyValue::new(
+                "geo".to_string(),
+                format!(
+                    r#"{{"version":"{v}","primary_column":"geometry","columns":{{"geometry":{{"crs":"EPSG:4326"}}}}}}"#
+                ),
+            ));
+            w.close().unwrap();
+        }
+        let source = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
+        let verdict = GeoVersion::of_parts(
+            source
+                .resolved_schemas()
+                .unwrap()
+                .iter()
+                .map(|r| r.declared_version()),
+        );
+        assert_eq!(
+            verdict,
+            GeoVersion::Mixed(vec![Some("1.1.0".into()), Some("3.0.0".into())])
+        );
+    }
+
+    /// #708: a non-object `geo` value names the file and the remedy.
+    #[test]
+    fn non_object_geo_error_names_the_file_and_the_fix() {
+        let dir = tmpdir();
+        let path = dir.path().join("bad.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mut w = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(tylertoo_io::KeyValue::new(
+            "geo".to_string(),
+            "[]".to_string(),
+        ));
+        w.close().unwrap();
+        let msg = ConvertSource::resolve(path.to_str().unwrap())
+            .and_then(|s| s.resolved_schema().map(|_| ()))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("bad.parquet") && msg.contains("gpio"), "{msg}");
     }
 
     /// A field-metadata mismatch must say WHAT differs: the key and a

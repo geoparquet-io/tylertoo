@@ -1,5 +1,5 @@
 use std::{env, fs, path::PathBuf};
-use tylertoo_core::overview::config::keywords::{command_defaults, CONVERT_POSITIONAL};
+use tylertoo_core::internal::overview::config::keywords::{command_defaults, CONVERT_POSITIONAL};
 
 fn literal(value: &serde_json::Value) -> String {
     match value {

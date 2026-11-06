@@ -118,6 +118,20 @@ class TestPyramidIntegration:
         assert report["skipped_tiles"] > 0
 
 
+class TestPyramidErrorClasses:
+    """#438: the exception class comes from core's error kind."""
+
+    def test_a_band_outside_its_archive_is_a_value_error(self) -> None:
+        # The archive holds z0-10; a z12-14 band has nothing to write. That
+        # is the input's problem, not a failed run.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.pmtiles"
+            with pytest.raises(ValueError, match="entirely outside") as raised:
+                tylertoo.pyramid([f"12-14:{ROADS_PMTILES}:roads"], str(out))
+            assert raised.type is ValueError
+            assert not out.exists()
+
+
 class TestPyramidMetadata:
     """`name=`, `description=` and `attribution=`, and what the report says."""
 

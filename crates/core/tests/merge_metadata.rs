@@ -6,11 +6,11 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use serde_json::json;
-use tylertoo_core::archive_index::ArchiveIndex;
-use tylertoo_core::compression::{self, Compression};
-use tylertoo_core::merge::{merge_shards, MergeOptions};
-use tylertoo_core::overview::export::write_empty_archive;
-use tylertoo_core::pmtiles_writer::{Header, StreamingPmtilesWriter, HEADER_BYTES};
+use tylertoo_core::internal::archive_index::ArchiveIndex;
+use tylertoo_core::internal::compression::{self, Compression};
+use tylertoo_core::internal::merge::{merge_shards, MergeOptions};
+use tylertoo_core::internal::overview::export::write_empty_archive;
+use tylertoo_core::internal::pmtiles_writer::{Header, StreamingPmtilesWriter, HEADER_BYTES};
 use tylertoo_core::TilesetMetadata;
 
 static WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
