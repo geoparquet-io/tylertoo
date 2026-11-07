@@ -33,7 +33,7 @@ conversion runs. tippecanoe can't do this at all: it reads neither
 GeoParquet nor S3, so this run has no tippecanoe row. A single run.
 
 <!-- bench:overture-buildings-africa/stream-at-scale -->
-Overture buildings 2026-10-21.0, Africa (bbox -18,-35,52,37.5): 526,532,679 features kept by `--bbox`. The bbox touches 118 of the release's partitioned GeoParquet files and 17,372 of its 84,224 row groups; those row groups hold 58.7 GB of the release's 276.9 GB.
+Overture buildings 2026-10-21.0, Africa (bbox `-18,-35,52,37.5`): 526,532,679 features kept by `--bbox`. The bbox touches 118 of the release's partitioned GeoParquet files and 17,372 of its 84,224 row groups; those row groups hold 58.7 GB of the release's 276.9 GB.
 
 | run | wall | peak RSS | effective cores | fetched | peak local disk | archive |
 |---|---|---|---|---|---|---|
@@ -65,7 +65,7 @@ same bbox with gpio and converting the extract to FlatGeobuf; the extract
 alone took 10.5 minutes and every row but the `s3://` one pays it.
 
 <!-- bench:overture-buildings-brazil/vida-head-to-head -->
-Overture buildings 2026-10-21.0, Brazil (bbox -74,-33.8,-34.7,5.3): 148,088,547 features, 10.3 GB.
+Overture buildings 2026-10-21.0, Brazil (bbox `-74,-33.8,-34.7,5.3`): 148,088,547 features, 10.3 GB.
 
 | tool | end-to-end wall | peak RSS | effective cores | archive | note |
 |---|---|---|---|---|---|

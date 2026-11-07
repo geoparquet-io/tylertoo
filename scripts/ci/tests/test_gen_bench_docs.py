@@ -106,5 +106,5 @@ def test_showcase_region_round_trips(tmp_path):
 def test_region_slug_renders_as_a_display_name():
     r = {"dataset": "Overture buildings 2026-10-21.0, new-york (bbox 1,2,3,4)",
          "region": "new-york"}
-    assert g.region_name(r) == "Overture buildings 2026-10-21.0, New York (bbox 1,2,3,4)"
+    assert g.region_name(r) == "Overture buildings 2026-10-21.0, New York (bbox `1,2,3,4`)"
     assert g.region_name({"dataset": "x"}) == "x"

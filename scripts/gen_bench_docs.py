@@ -354,10 +354,12 @@ def _gb(v):
 def region_name(r) -> str:
     """The dataset label with its region slug as a display name (netherlands ->
     Netherlands, new-york -> New York): the slug is an id, not prose."""
+    # coordinates go in code spans, so prose lint reads no negative numbers
+    name = re.sub(r"\(bbox ([-0-9.,]+)\)", r"(bbox `\1`)", r["dataset"])
     slug = r.get("region")
     if not slug:
-        return r["dataset"]
-    return r["dataset"].replace(f", {slug} (", f", {slug.replace('-', ' ').title()} (")
+        return name
+    return name.replace(f", {slug} (", f", {slug.replace('-', ' ').title()} (")
 
 
 def vida_head_to_head(r) -> str:
