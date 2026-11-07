@@ -131,11 +131,13 @@ def test_rendered_manifest_loads_and_pins_the_region(tmp_path):
     assert s3["env"]["AWS_SKIP_SIGNATURE"] == "true"
     local = rm.build_argv(m["cells"]["ovt-local"], {"input": "I", "files_from": "F", "out": "O"})
     assert local[1] == "I" and not any(a.startswith("--bbox") for a in local)
+    bounded = rm.build_argv(m["cells"]["ovt-local-bounded"], {"input": "I", "files_from": "F", "out": "O"})
+    assert bounded[-2:] == ["--profile", "bounded"] and bounded[:-2] == local
 
 
 def test_committed_manifest_loads():
     m = rm.load_manifest(sc.MANIFEST)
-    assert set(m["cells"]) == {"ovt-s3", "ovt-local"}
+    assert set(m["cells"]) == {"ovt-s3", "ovt-local", "ovt-local-bounded"}
     assert m["inputs"]["overture-listing"]["sha256"] == rm.sha256_file(sc.PARTS_TSV)
 
 
@@ -250,3 +252,27 @@ def test_collect_takes_provenance_from_the_timed_runs(tmp_path):
     p = sc.run_provenance(tmp_path, sys.executable)  # any real binary
     assert (p["commit"], p["host"], p["nproc"], p["date"]) == ("abc", "the bench host", 64, "then")
     assert "tippecanoe_commit" in p["tool_versions"]
+
+
+def test_bounded_runs_add_a_row_after_the_local_one():
+    d = doc(bounded=[run(80, rss_mib=10)])
+    labels = [r["label"] for r in d["rows"]]
+    assert labels[2] == "tylertoo, local extract, `--profile bounded`" and len(labels) == 4
+    assert d["rows"][2]["conversion_wall_s"] == 20.0 and d["rows"][2]["peak_rss_bytes"] == 10 << 20
+    assert len(doc()["rows"]) == 3
+
+
+def test_stream_doc_has_one_row_and_no_other_tools():
+    parts = [{"url": "s3://b/p0", "etag": "e0", "bytes": 5, "bbox": (0, 0, 1, 1), "rows": 1},
+             {"url": "s3://b/p1", "etag": "e1", "bytes": 7, "bbox": (9, 9, 10, 10), "rows": 1}]
+    prov = {k: None for k in g.PROVENANCE_KEYS} | {"tool_versions": {"tippecanoe": "x"}, "inputs": [],
+                                                   "tylertoo_version": "tylertoo 0.8.0", "host": "h"}
+    d = sc.build_stream_doc("africa", (0, 0, 2, 2), [run(3000, fetched=40)], parts, prov, (4, 2))
+    g.check_provenance("x", d)
+    assert d["provenance"]["tool_versions"] == {}
+    assert [r["label"] for r in d["rows"]] == ["tylertoo, s3:// in place"]
+    assert (d["parts_touched"], d["parts_bytes"], d["release_bytes"], d["in_scope_bytes"]) == (1, 5, 12, 4)
+    out = g.stream_at_scale(d)
+    assert "Africa" in out and "| 50 min (3,000 s) |" in out
+    assert "in 50 min on one machine" in g.stream_claim(d)
+    assert "tippecanoe" not in g.footer(d)

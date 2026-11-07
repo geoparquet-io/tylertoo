@@ -96,6 +96,8 @@ CANDIDATES = [
     ("japan", (122.9, 24.0, 146.0, 45.6)),
     ("germany", (5.87, 47.27, 15.04, 55.06)),
     ("france", (-5.14, 41.33, 9.56, 51.09)),
+    ("brazil", (-74.0, -33.8, -34.7, 5.3)),
+    ("africa", (-18.0, -35.0, 52.0, 37.5)),
 ]
 
 
@@ -390,9 +392,9 @@ def render_manifest(region: str, bbox: tuple, extract: dict) -> str:
 pairs = 3
 warmup = 1
 allocator = "any"
-wall_s = 9000
-rss_gib = 100
-scratch_gib = 45
+wall_s = 21600
+rss_gib = 110
+scratch_gib = 140
 min_free_gb = 5
 load_max = 3.0
 load_wait_s = 1800
@@ -434,6 +436,18 @@ args = ["{{input}}", "{{out}}/out.pmtiles"]
 output = "out.pmtiles"
 zoom = [{ZOOM[0]}, {ZOOM[1]}]
 flags = {q(flags)}
+watch = "tmp"
+heavy = true
+
+[cells.ovt-local-bounded]
+label = "Overture buildings {region}: tylertoo on the local extract with --profile bounded"
+tickets = [664]
+input = "overture-{region}"
+command = "tiles"
+args = ["{{input}}", "{{out}}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [{ZOOM[0]}, {ZOOM[1]}]
+flags = {q([*flags, "--profile", "bounded"])}
 watch = "tmp"
 heavy = true
 """
@@ -514,7 +528,7 @@ def archive_facts(path: Path, tylertoo: str, cap: int = 500_000) -> dict:
 
 def build_doc(region: str, bbox: tuple, extract_rec: dict, extract_pin: dict, s3: list[dict],
               local: list[dict], tc: list[dict], parts: list[dict], prov: dict,
-              archives: dict | None = None) -> dict:
+              archives: dict | None = None, bounded: list[dict] | None = None) -> dict:
     """The results document: gen_bench_docs.py's head-to-head schema, plus
     the per-step, disk, fetch and provenance detail of this showcase."""
     archives = archives or {}
@@ -537,6 +551,10 @@ def build_doc(region: str, bbox: tuple, extract_rec: dict, extract_pin: dict, s3
                  note="end to end includes the gpio extract", archive=archives.get("tylertoo")),
         tc_row,
     ]
+    if bounded:
+        rows.insert(2, tool_row("tylertoo, local extract, `--profile bounded`", bounded,
+                                conversion_s=ext_s, note="end to end includes the gpio extract",
+                                archive=archives.get("tylertoo")))
     inputs = [{"name": f"overture-buildings-{RELEASE}", "release": RELEASE, "path": PREFIX,
                "bbox": list(bbox), "sha256": rm.sha256_file(PARTS_TSV), "sha256_of": PARTS_TSV.name,
                "parts": [{"url": p["url"], "etag": p["etag"], "bytes": p["bytes"]} for p in touched]},
@@ -594,9 +612,77 @@ def collect(opts) -> None:
     doc = build_doc(opts.region, reg["bbox"], ext, pin, ok_runs(res("s3"), "ovt-s3", "tylertoo"),
                     ok_runs(res("local"), "ovt-local", "tylertoo"),
                     ok_runs(res("tc"), "ovt-local", "tippecanoe"), read_parts(),
-                    run_provenance(res("s3"), opts.tylertoo), archives)
+                    run_provenance(res("s3"), opts.tylertoo), archives,
+                    ok_runs(res("bounded"), "ovt-local-bounded", "tylertoo")
+                    if res("bounded").is_dir() else None)
     out = Path(opts.out or RESULTS / f"overture-buildings-{opts.region}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(doc, indent=2) + "\n")
+    print(f"wrote {out}")
+
+
+def bbox_row_group_bytes(bbox: tuple, parts: list[dict]) -> tuple[int, int]:
+    """Compressed bytes and rows of the row groups whose bbox statistics
+    intersect `bbox`, over the touched parts (footers only, anonymous): the
+    GeoParquet a --bbox run has in scope, every column counted."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    import pyarrow.fs as pafs
+    import pyarrow.parquet as pq
+
+    s3 = pafs.S3FileSystem(anonymous=True, region="us-west-2")
+
+    def one(url: str) -> tuple[int, int]:
+        md = pq.ParquetFile(url.removeprefix("s3://"), filesystem=s3).metadata
+        names = [md.schema.column(i).path for i in range(md.num_columns)]
+        ix = [names.index(f"bbox.{k}") for k in ("xmin", "ymin", "xmax", "ymax")]
+        b = n = 0
+        for g in range(md.num_row_groups):
+            rg = md.row_group(g)
+            st = [rg.column(i).statistics for i in ix]
+            if intersects((st[0].min, st[1].min, st[2].max, st[3].max), bbox):
+                b += sum(rg.column(i).total_compressed_size for i in range(rg.num_columns))
+                n += rg.num_rows
+        return b, n
+
+    with ThreadPoolExecutor(32) as ex:
+        got = list(ex.map(one, [p["url"] for p in parts_touching(bbox, parts)]))
+    return sum(b for b, _ in got), sum(n for _, n in got)
+
+
+def build_stream_doc(region: str, bbox: tuple, s3: list[dict], parts: list[dict], prov: dict,
+                     in_scope: tuple[int, int], archive: dict | None = None) -> dict:
+    """The record of a streaming-only run: tylertoo reads the parts in place
+    and no other tool takes part (tippecanoe cannot read s3:// GeoParquet)."""
+    touched = parts_touching(bbox, parts)
+    feats = next((c["pass1_rows"] for r in s3
+                  if (c := r["profile"].get("convert") or {}).get("pass1_rows")), None)
+    inputs = [{"name": f"overture-buildings-{RELEASE}", "release": RELEASE, "path": PREFIX,
+               "bbox": list(bbox), "sha256": rm.sha256_file(PARTS_TSV), "sha256_of": PARTS_TSV.name,
+               "parts": [{"url": p["url"], "etag": p["etag"], "bytes": p["bytes"]} for p in touched]}]
+    # No other tool ran: drop the showcase's tippecanoe and gpio pins.
+    return {"provenance": {**prov, "tool_versions": {}, "inputs": inputs},
+            "dataset": f"Overture buildings {RELEASE}, {region} (bbox {bbox_arg(bbox)})",
+            "features": feats, "region": region, "bbox": list(bbox),
+            "release_bytes": sum(p["bytes"] for p in parts), "parts_touched": len(touched),
+            "parts_bytes": sum(p["bytes"] for p in touched),
+            "in_scope_bytes": in_scope[0], "in_scope_rows": in_scope[1],
+            "rows": [tool_row("tylertoo, s3:// in place", s3, note="reads the parts in place; no extract",
+                              archive=archive)]}
+
+
+def collect_stream(opts) -> None:
+    """benchmarks/results/overture-buildings-<region>.json for a streaming-only
+    run (results dir <region>-s3, cell ovt-s3)."""
+    data = Path(opts.data).expanduser().resolve()
+    bbox = read_regions()[opts.region]["bbox"]
+    run_dir = data / "results" / f"{opts.region}-s3"
+    archive = archive_facts(Path(opts.archive), opts.tylertoo) if opts.archive else None
+    parts = read_parts()
+    doc = build_stream_doc(opts.region, bbox, ok_runs(run_dir, "ovt-s3", "tylertoo"), parts,
+                           run_provenance(run_dir, opts.tylertoo),
+                           bbox_row_group_bytes(bbox, parts), archive)
+    out = Path(opts.out or RESULTS / f"overture-buildings-{opts.region}.json")
     out.write_text(json.dumps(doc, indent=2) + "\n")
     print(f"wrote {out}")
 
@@ -605,7 +691,7 @@ def collect(opts) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Subcommands: regions, calibrate, extract, collect."""
+    """Subcommands: regions, calibrate, extract, collect, collect-stream."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("regions")
@@ -625,8 +711,15 @@ def main(argv: list[str] | None = None) -> int:
     k.add_argument("--archive", action="append", default=[], metavar="TOOL=PATH",
                    help="a kept archive (tylertoo=..., tippecanoe=...) for `stats --json`")
     k.add_argument("--out")
+    k = sub.add_parser("collect-stream")
+    k.add_argument("region")
+    k.add_argument("--tylertoo", required=True)
+    k.add_argument("--data", default="~/bench-data/showcase")
+    k.add_argument("--archive", help="the kept archive of the timed run")
+    k.add_argument("--out")
     a = ap.parse_args(argv)
-    {"regions": regions, "calibrate": calibrate, "extract": extract, "collect": collect}[a.cmd](a)
+    {"regions": regions, "calibrate": calibrate, "extract": extract, "collect": collect,
+     "collect-stream": collect_stream}[a.cmd](a)
     return 0
 
 

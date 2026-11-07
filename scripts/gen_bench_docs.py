@@ -374,6 +374,35 @@ def vida_head_to_head(r) -> str:
     return "\n".join(out)
 
 
+def _min(sec):
+    return f"{sec / 60:,.0f} min"
+
+
+def stream_at_scale(r) -> str:
+    """A streaming-only record: one tylertoo run from s3:// to PMTiles."""
+    row = r["rows"][0]
+    wall = statistics.median(row["runs_wall_s"])
+    ec = row.get("effective_cores")
+    return "\n".join([
+        f"{region_name(r)}: {r['features']:,} features. The bbox touches "
+        f"{r['parts_touched']} of the release's partitioned GeoParquet files; the row groups "
+        f"it intersects hold {_gb(r['in_scope_bytes'])} of the release's {_gb(r['release_bytes'])}.",
+        "",
+        "| run | wall | peak RSS | effective cores | fetched | peak local disk | archive |",
+        "|---|---|---|---|---|---|---|",
+        f"| {row['label']} | {_min(wall)} ({wall:,.0f} s) | {_gb(row['peak_rss_bytes'])} "
+        f"| {'—' if ec is None else f'{ec:.1f}'} | {_gb(row.get('fetched_bytes'))} "
+        f"| {_gb(row.get('peak_disk_bytes'))} | {_gb(row['archive_bytes'])} |"])
+
+
+def stream_claim(r) -> str:
+    """One inline sentence for the README."""
+    wall = statistics.median(r["rows"][0]["runs_wall_s"])
+    return (f"streams {r['features'] / 1e6:,.0f} million Overture buildings "
+            f"({_gb(r['in_scope_bytes'])} of partitioned GeoParquet) from S3 into PMTiles "
+            f"in {_min(wall)} on one machine")
+
+
 def overture_scaling(r) -> str:
     out = [f"{r['dataset']}: {r['features']:,} features, {_gb(r['dataset_bytes'])}.",
            "",
@@ -424,6 +453,8 @@ RENDERERS = {
     "readme-claim": (lambda r, a: readme_claim(r), True, False),
     "vida-head-to-head": (lambda r, a: vida_head_to_head(r), False, True),
     "overture-scaling": (lambda r, a: overture_scaling(r), False, True),
+    "stream-at-scale": (lambda r, a: stream_at_scale(r), False, True),
+    "stream-claim": (lambda r, a: stream_claim(r), True, False),
     "brazil-table": (lambda r, a: brazil_table(r), False, True),
 }
 SECTIONS = ["headline", "quality-matched", "memory", "input", "phases", "flags",
@@ -434,9 +465,9 @@ def footer(r) -> str:
     p = r["provenance"]
     tools = ", ".join(v if str(v).startswith(k) else f"{k} {v}"
                       for k, v in p["tool_versions"].items()
-                      if k != "tippecanoe_commit") or "no tool versions recorded"
+                      if k != "tippecanoe_commit")
     return (f"_Run: commit {p['commit'] or 'unknown'}, tylertoo "
-            f"{p['tylertoo_version'].removeprefix('tylertoo ')}, {tools}, {p['host']}, "
+            f"{p['tylertoo_version'].removeprefix('tylertoo ')}, {tools + ', ' if tools else ''}{p['host']}, "
             f"{(p['date'] or 'undated')[:10]}._")
 
 

@@ -10,7 +10,7 @@ predictions out of the 629.6 GiB Fields of The World (FTW) collection:
 | Convert, including 40.7 GiB read remotely | 1 h 11 m 56 s | 9.6 GiB | 15-level overview |
 | Export | 11 m 44 s | 1.54 GiB | 1,647,927 tiles, z0 to z14 |
 
-_Run: commit unknown, tylertoo 0.6.0, no tool versions recorded, 16 cores, 54 GiB RAM (machine type not recorded), undated._
+_Run: commit unknown, tylertoo 0.6.0, 16 cores, 54 GiB RAM (machine type not recorded), undated._
 <!-- /bench -->
 
 [`demo/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/demo/RESULTS.md)
