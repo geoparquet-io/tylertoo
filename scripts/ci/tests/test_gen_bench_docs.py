@@ -101,3 +101,10 @@ def test_showcase_region_round_trips(tmp_path):
     g.run(root=tmp_path, results_dir=d, files=["a.md"])
     assert "commit abc1234, tylertoo 0.9.0" in doc.read_text()
     assert g.run(root=tmp_path, results_dir=d, check=True, files=["a.md"]) == []
+
+
+def test_region_slug_renders_as_a_display_name():
+    r = {"dataset": "Overture buildings 2026-10-21.0, new-york (bbox 1,2,3,4)",
+         "region": "new-york"}
+    assert g.region_name(r) == "Overture buildings 2026-10-21.0, New York (bbox 1,2,3,4)"
+    assert g.region_name({"dataset": "x"}) == "x"

@@ -8265,7 +8265,9 @@ mod tests {
     /// RSS is per process. `cargo test --lib` (the Check job) runs every lib
     /// test as a thread of one process, so another test that frees memory
     /// mid-window shrinks the gap between a boundary sample and the sampled
-    /// peak below the margin these tests assert (#651). nextest already
+    /// peak below the margin these tests assert (#651). Process CPU time
+    /// has the same problem: other tests' threads count toward a phase's
+    /// `effective_cores` (#810). nextest already
     /// gives each test its own process; the re-exec is harmless there.
     fn run_alone(test: &str) -> bool {
         const CHILD: &str = "TYLERTOO_RSS_TEST_CHILD";
@@ -8439,6 +8441,9 @@ mod tests {
     /// in run order, and the tick records a timeline.
     #[test]
     fn rss_sampler_reports_per_phase_cpu_and_a_timeline() {
+        if !run_alone("rss_sampler_reports_per_phase_cpu_and_a_timeline") {
+            return;
+        }
         let sampler = RssSampler::start_if_with_interval(true, "spin", Duration::from_millis(10))
             .expect("profiling_on=true always starts a sampler");
         spin(100);
@@ -8487,6 +8492,9 @@ mod tests {
     fn effective_cores_drop_when_work_is_serialized() {
         if !cfg!(unix) {
             eprintln!("Skipping: needs getrusage");
+            return;
+        }
+        if !run_alone("effective_cores_drop_when_work_is_serialized") {
             return;
         }
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);

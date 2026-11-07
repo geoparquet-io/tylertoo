@@ -63,7 +63,7 @@ The honest footnotes, which are the point of this table:
   older 12-core laptop run in `benchmarks/e2e/RESULTS.md`), the
   parity-matched ratio was **≈7.5×**, well below the corpus rows.
 
-## At scale: 21.6M Overture buildings
+## At scale: 21.6 million buildings
 
 The Netherlands bbox of Overture buildings release `2026-10-21.0`, every
 part pinned by ETag. tylertoo reads the GeoParquet parts straight from
@@ -75,7 +75,7 @@ archive differs from the local extract's by 3 KB of 912 MB; that
 difference has not been traced.
 
 <!-- bench:overture-buildings-netherlands/vida-head-to-head -->
-Overture buildings 2026-10-21.0, netherlands (bbox 3.31,50.75,7.23,53.56): 21,557,082 features, 1.9 GB.
+Overture buildings 2026-10-21.0, Netherlands (bbox 3.31,50.75,7.23,53.56): 21,557,082 features, 1.9 GB.
 
 | tool | end-to-end wall | peak RSS | effective cores | archive | note |
 |---|---|---|---|---|---|

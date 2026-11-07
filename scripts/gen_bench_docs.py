@@ -350,8 +350,17 @@ def _gb(v):
     return "—" if v is None else f"{v / 1e9:,.1f} GB"
 
 
+def region_name(r) -> str:
+    """The dataset label with its region slug as a display name (netherlands ->
+    Netherlands, new-york -> New York): the slug is an id, not prose."""
+    slug = r.get("region")
+    if not slug:
+        return r["dataset"]
+    return r["dataset"].replace(f", {slug} (", f", {slug.replace('-', ' ').title()} (")
+
+
 def vida_head_to_head(r) -> str:
-    out = [f"{r['dataset']}: {r['features']:,} features, {_gb(r['input_bytes'])}.",
+    out = [f"{region_name(r)}: {r['features']:,} features, {_gb(r['input_bytes'])}.",
            "",
            "| tool | end-to-end wall | peak RSS | effective cores | archive | note |",
            "|---|---|---|---|---|---|"]
