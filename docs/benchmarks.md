@@ -101,8 +101,16 @@ _Run: commit 395a55f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio 1.7.0, aarch64, C
 
   On the faster disk `bounded` costs about a fifth more wall time than the
   default, in a quarter to a third of its memory.
-- **The archives differ in size.** tylertoo's is larger than tippecanoe's;
-  the record's per-zoom tile counts and sizes show where.
+- **tylertoo's archive is 1.9× tippecanoe's because it keeps more
+  buildings.** tippecanoe's `--drop-densest-as-needed` thins a whole zoom
+  at once: at z13 it kept 27.9 million features to tylertoo's 152 million,
+  at z12 10 million to 100 million, and at z14 it dropped 40.8 million
+  buildings, about a quarter, from its densest tiles. tylertoo cuts only
+  the tiles over the size limit, by merging features, and drops none. z12
+  and z13 account for three quarters of the 2 GB gap. Per feature the two
+  are close: the same three properties, extent and gzip level. tylertoo
+  also does not simplify z14, where tippecanoe's `-S 10` simplifies every
+  zoom.
 - **The `s3://` and local archives differ by a few KB** of 4.2 GB. tylertoo's
   `--bbox` and gpio's extract keep slightly different features on the bbox
   edge (82 of 434 million overview rows); each path on its own is
