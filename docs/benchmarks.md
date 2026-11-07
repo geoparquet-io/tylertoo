@@ -145,8 +145,8 @@ For a sharded build across machines, see [scaling](guides/scaling.md).
   walks through picking a region, extracting it, and collecting the record.
 - **One build against another:** `benchmarks/run_manifest.py` times the
   workloads in `benchmarks/manifest.toml` for two binaries, interleaved,
-  with a load gate, and records each output's sha256 so you can confirm
-  both builds wrote the same bytes.
+  with a load gate. It records each output's sha256: equal hashes mean both
+  builds wrote the same bytes.
 - **The tables on this page:** copy a new record into `benchmarks/results/`,
   then run `uv run python scripts/gen_bench_docs.py`. `--check` exits 1 if
   any generated region is stale.
