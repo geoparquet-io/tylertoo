@@ -4,8 +4,6 @@
 tylertoo applies the same concepts to stored overview levels in world space
 before encoding tiles. `context/ARCHITECTURE.md` describes the deliberate
 differences.
-[`benchmarks/e2e/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md)
-compares speed, size, and memory use, with methods and caveats.
 
 Like tippecanoe, tylertoo thins points by default and keeps lines and
 polygons. This preserves polygon coverage at coarse and middle zooms.
@@ -14,84 +12,8 @@ tiles, tylertoo merges dense polygons into their neighbors, as
 `--coalesce-densest-as-needed` does. To adjust this behavior, see
 [complete tiles or small tiles](../OVERVIEW_TUNING.md#complete-tiles-or-small-tiles).
 
-## How much faster — the skeptical reader's table
-
-Measured end-to-end (GeoParquet in, z0–z14 PMTiles out) against **tippecanoe
-v2.79.0 built from a verified pinned commit**, on the corpus datasets with
-tippecanoe running its recorded flags for each (`--drop-densest-as-needed`,
-`--simplification=10`, …) — both tools in a production configuration, not a
-rigged one. The "thinning off" column re-runs tylertoo with `--verbatim
---simplify-factor 1.0` so it cannot win by emitting fewer features. Median
-of 3 warm runs per tool, alternating the tools within each round, on a 64-core
-arm64 host with no other jobs running (the run line under the table names
-it). Both speedup columns are end to end.
-
-<!-- bench:e2e-corpus/tippecanoe-table -->
-| dataset (class) | features | tylertoo | tippecanoe e2e | speedup | speedup, thinning off | peak RSS (tylertoo / tippecanoe) |
-|---|---|---|---|---|---|---|
-| NYC places (point) † | 630,065 | 1.57 s | 42.66 s | **27.2×** | 2.3×* | 2,210 / 1,352 MB |
-| Portland buildings (polygon) | 813,456 | 3.68 s | 84.81 s | **23.0×** | 13.7× | 3,132 / 2,127 MB |
-| Oregon roads (line) | 1,203,997 | 10.65 s | 180.69 s | **17.0×** | 17.3× | 9,051 / 2,435 MB |
-| Moldova parcels (polygon, dense) | 631,910 | 7.78 s | 167.27 s | **21.5×** | 17.9× | 4,520 / 2,431 MB |
-
-_Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
-<!-- /bench -->
-
-The honest footnotes, which are the point of this table:
-
-- † *The point row is not a parity measurement at all.* tippecanoe's recorded
-  flags (`--extend-zooms-if-still-dropping`) had it building z15–z16 — 9,694
-  of its 10,543 tiles and 69% of its output bytes — while tylertoo stopped at
-  the requested z14. Both of that row's ratios include that extra work.
-- *The point row's "thinning off" 2.3× is the weakest number this harness has
-  produced, and it carries a second mismatch on top of †:* `--verbatim` makes
-  tylertoo carry all 630k points at every zoom (1.57 s → 18.38 s). The two
-  tools also thin points by different rules, so they keep different points
-  at each zoom ([#666](https://github.com/geoparquet-io/tylertoo/issues/666)
-  measures it on this dataset). Read the line and polygon rows for parity
-  numbers.
-- tylertoo's peak memory is **higher on all four datasets** — up to <!-- bench:e2e-corpus/max-memory-ratio -->3.7×<!-- /bench -->
-  on lines. The speed is parallelism (19–29 of 64 cores busy vs tippecanoe's
-  2–3) plus the native GeoParquet read, paid for in working set.
-- Archives are equal on Moldova (1.00×) and larger elsewhere: Oregon roads
-  1.12× at defaults (1.23× thinning off), Portland buildings 1.41× (1.47×).
-  For points, the 0.65× compares tylertoo's z0–14 archive against
-  tippecanoe's z0–16; at z0–14 on both sides tylertoo's is 2.1× bigger.
-- Converting GeoParquet for tippecanoe is only 2–4% of its end-to-end wall at
-  this scale — the gap is tiler vs tiler, not a format-conversion tax.
-- On a small contiguous admin coverage (the 17k-polygon fixture set, an
-  older 12-core laptop run in `benchmarks/e2e/RESULTS.md`), the
-  parity-matched ratio was **≈7.5×**, well below the corpus rows.
-
-## At scale: 21.6 million buildings
-
-The Netherlands bbox of Overture buildings release `2026-10-21.0`, every
-part pinned by ETag. tylertoo reads the GeoParquet parts straight from
-`s3://` with `--bbox`, fetching only the row groups the bbox touches.
-tippecanoe can't read GeoParquet or S3, so its time includes extracting the
-same bbox to local GeoParquet with gpio and converting it to FlatGeobuf.
-The `s3://` row is a single run (the local rows are medians of 3). Its
-archive differs from the local extract's by 3 KB of 912 MB; that
-difference has not been traced.
-
-<!-- bench:overture-buildings-netherlands/vida-head-to-head -->
-Overture buildings 2026-10-21.0, Netherlands (bbox 3.31,50.75,7.23,53.56): 21,557,082 features, 1.9 GB.
-
-| tool | end-to-end wall | peak RSS | effective cores | archive | note |
-|---|---|---|---|---|---|
-| tylertoo, s3:// in place | 107 s | 15.4 GB | 16.0 | 0.9 GB | reads the parts in place; no extract |
-| tylertoo, local extract | 321 s | 13.3 GB | 22.7 | 0.9 GB | end to end includes the gpio extract |
-| tippecanoe v2.79.0 | 1,417 s | 6.1 GB | 3.1 | 0.8 GB | extract + FlatGeobuf + tile |
-
-_Run: commit 875b1bd, tylertoo 0.8.0, tippecanoe v2.79.0, gpio 1.7.0, aarch64 0xd40 x64, 2026-11-06._
-<!-- /bench -->
-
-Every number above is from a committed record
-([`benchmarks/results/e2e-corpus.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/results/e2e-corpus.json),
-[`e2e-fixtures.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/results/e2e-fixtures.json))
-with full provenance, per-zoom tile counts, and the asymmetry list in
-[`benchmarks/e2e/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md).
-Reproduce with `./benchmarks/e2e/run_corpus.sh`.
+For speed, memory, and archive size against tippecanoe, with methods and
+caveats, see [benchmarks](../benchmarks.md).
 
 ## Flag mapping
 
@@ -121,13 +43,39 @@ Reproduce with `./benchmarks/e2e/run_corpus.sh`.
 
 ## What only tylertoo does
 
-- Reads GeoParquet directly. It decodes required columns, prunes row groups
-  with `--bbox` and `--filter`, and reads remote objects by byte range. See
+- **Reads GeoParquet natively.** There is no conversion step and no
+  intermediate file: tylertoo decodes only the columns it needs, straight
+  from Arrow. tippecanoe needs the data converted to FlatGeobuf, GeoJSON, or
+  CSV first.
+- **Streams remote data in place.** Pass an `s3://`, `gs://`, `https://`, or
+  `http://` URL where a local path would go. tylertoo reads each file's
+  footer, then fetches only the column chunks of the row groups it needs, by
+  byte range, without downloading the dataset. See
   [remote reads](remote-reads.md).
-- Stores world-space overview levels in GeoParquet. Query them with DuckDB,
-  export them multiple times, or validate them against the `geo:overviews` spec.
-- Splits builds across machines and merges shards without re-encoding tiles.
-  See [scaling](scaling.md#sharded-builds).
+- **Reads a multi-file dataset as one input.** Pass a directory, a glob, an
+  `s3://` or `gs://` prefix ending in `/`, or a `--files-from` manifest that
+  mixes local paths and URLs. Hive layouts such as
+  `year=2024/part-00000.parquet` work; tylertoo walks them recursively and
+  reads the parts in a fixed order, so the output is reproducible.
+- **Skips data it does not need.** `--bbox` uses GeoParquet 1.1 bbox
+  covering statistics to skip row groups outside the query before reading
+  them, and `--filter` (a SQL `WHERE` predicate) skips row groups whose
+  statistics cannot match. See [what gets skipped](remote-reads.md#what-gets-skipped).
+- **Bounds its memory.** Conversion streams the input in batches, so peak
+  memory follows the largest row group and the feature count, not the file
+  size. `--profile bounded` spills buffered levels to disk for the smallest
+  footprint. See [one machine, bounded memory](scaling.md#one-machine-bounded-memory).
+- **Uses every core.** Reading, generalization, and tile encoding run in
+  parallel; on the benchmark host tylertoo kept 19–29 of 64 cores busy, to
+  tippecanoe's 2–3. See [benchmarks](../benchmarks.md).
+- **Shards a build across machines.** `shard-plan` cuts the job, each machine
+  builds its shard, and `merge` joins the archives by copying tiles without
+  re-encoding them. Tile bodies match a single-machine build byte for byte.
+  See [sharded builds](scaling.md#sharded-builds).
+- **Stores overview levels in GeoParquet.** `overview` writes world-space
+  generalized levels in the `geo:overviews` format. Query them with DuckDB,
+  export them to PMTiles as often as you like with `export-pmtiles`, or check
+  them with `validate`.
 
 ## What only tippecanoe does
 

@@ -66,7 +66,9 @@ For public docstrings, CLI help, and `///` docs:
 - Give a performance-only knob one sentence and a link to the
   [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/).
   Put tippecanoe comparisons in the
-  [tippecanoe guide](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/).
+  [tippecanoe guide](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/),
+  and benchmark numbers on the
+  [benchmarks page](https://geoparquet-io.github.io/tylertoo/benchmarks/).
 - Keep one short runnable example per function. Move removed material
   users still need to `docs/OVERVIEW_TUNING.md`, a guide, or
   `CHANGELOG.md`.

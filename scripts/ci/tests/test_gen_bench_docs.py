@@ -25,20 +25,20 @@ def test_every_results_file_has_full_provenance():
 
 
 def test_check_catches_one_hand_edited_number(tmp_path):
-    doc = tmp_path / "docs/guides/tippecanoe.md"
+    doc = tmp_path / "docs/benchmarks.md"
     doc.parent.mkdir(parents=True)
-    shutil.copy(REPO / "docs/guides/tippecanoe.md", doc)
-    assert g.run(root=tmp_path, check=True, files=["docs/guides/tippecanoe.md"]) == []
+    shutil.copy(REPO / "docs/benchmarks.md", doc)
+    assert g.run(root=tmp_path, check=True, files=["docs/benchmarks.md"]) == []
     # Bump the last digit before the first " MB |" in the generated table,
     # whatever the current numbers are.
     text = doc.read_text()
     k = text.index(" MB |", text.index("<!-- bench:e2e-corpus/tippecanoe-table -->")) - 1
     doc.write_text(text[:k] + str((int(text[k]) + 1) % 10) + text[k + 1 :])
-    assert g.run(root=tmp_path, check=True, files=["docs/guides/tippecanoe.md"]) == [
-        "docs/guides/tippecanoe.md"
+    assert g.run(root=tmp_path, check=True, files=["docs/benchmarks.md"]) == [
+        "docs/benchmarks.md"
     ]
-    assert g.run(root=tmp_path, files=["docs/guides/tippecanoe.md"])  # rewrite heals it
-    assert g.run(root=tmp_path, check=True, files=["docs/guides/tippecanoe.md"]) == []
+    assert g.run(root=tmp_path, files=["docs/benchmarks.md"])  # rewrite heals it
+    assert g.run(root=tmp_path, check=True, files=["docs/benchmarks.md"]) == []
 
 
 def test_readme_and_docs_agree_on_memory_ratio():
@@ -47,7 +47,7 @@ def test_readme_and_docs_agree_on_memory_ratio():
     r = g.load_results()["e2e-corpus"]
     ratio = g.max_memory_ratio(r)
     assert f"up to {ratio} peak memory" in g.readme_claim(r)
-    assert f"-->{ratio}<!-- /bench -->" in (REPO / "docs/guides/tippecanoe.md").read_text()
+    assert f"-->{ratio}<!-- /bench -->" in (REPO / "docs/benchmarks.md").read_text()
 
 
 def test_unknown_region_is_an_error():

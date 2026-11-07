@@ -64,6 +64,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "benchmarks" / "results"
 DOC_FILES = [
     "README.md",
+    "docs/benchmarks.md",
     "docs/guides/tippecanoe.md",
     "docs/guides/scaling.md",
     "docs/OVERVIEW_TUNING.md",
@@ -75,7 +76,7 @@ PROVENANCE_KEYS = ["commit", "tylertoo_version", "host", "nproc", "kernel",
 DAG = " \u2020"
 DASH = "\u2014"
 
-# Display names for the tippecanoe.md table; unknown ids fall back to the id.
+# Display names for the benchmarks.md table; unknown ids fall back to the id.
 DISPLAY = {
     "points-nyc-medium": "NYC places (point)",
     "lines-portland-medium": "Portland roads (line)",
@@ -286,7 +287,7 @@ def variance(r, did="madagascar-adm4") -> str:
     return "\n".join(out)
 
 
-# ---- docs-facing renderers (tippecanoe.md, README) ------------------------
+# ---- docs-facing renderers (benchmarks.md, README) ------------------------
 
 def _is_point(did):
     return did.startswith("points-")
