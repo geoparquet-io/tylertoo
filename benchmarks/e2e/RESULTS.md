@@ -614,9 +614,10 @@ row here should be quoted to two significant figures.
 
 - **Anything above 1.2M features here.** §1b's corpus tier covers
   631k–1.2M features (and settles the Moldova question the archived table in
-  [`../overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (in git history) left open). The 21.6M-building
-  Overture run is in [`docs/benchmarks.md`](../../docs/benchmarks.md)
-  and `../results/overture-buildings-netherlands.json`.
+  [`../overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (in git history) left open). The Overture runs
+  at scale (148M buildings in Brazil, 526M streamed for Africa) are in
+  [`docs/benchmarks.md`](../../docs/benchmarks.md) and
+  `../results/overture-buildings-{brazil,africa}.json`.
 - **Points at fixture scale.** The corpus tier measures a 630k-point dataset
   (§1b); the fixture set below has none, so §§1–7's numbers are
   polygon/line only.

@@ -13,10 +13,100 @@ run line that names the commit, tool versions, host, and date.
 - **tippecanoe** is v2.79.0, built from source at a verified pinned commit
   by `benchmarks/e2e/setup_tippecanoe.sh`.
 - **tylertoo** is a release build of the commit in each run line.
+- **Disk.** A network disk (AWS gp3). The corpus, Brazil, and memory-profile
+  runs used 125 MB/s, much slower than a laptop's NVMe drive; the Africa run
+  started during the upgrade to 1,000 MB/s. Spilling runs are sensitive to
+  it.
 - **Inputs are pinned.** The Overture corpus extracts are pinned to release
   `2026-10-21.0`, with each extract's ids hashed in `corpus/manifest.json`.
   The Moldova parcels file is a stable direct download. Each Overture
   buildings part in the at-scale run is pinned by ETag.
+
+## Streaming at scale: Africa, straight from S3
+
+One `tylertoo tiles` command reads Overture's buildings release
+`2026-10-21.0` in place on `s3://`, as the partitioned GeoParquet files
+Overture publishes, and writes one PMTiles archive. `--bbox` selects Africa;
+tylertoo reads only the row groups whose bbox statistics intersect it, and
+only the columns it tiles. Nothing is downloaded first, and no format
+conversion runs. tippecanoe can't do this at all: it reads neither
+GeoParquet nor S3, so this run has no tippecanoe row. A single run.
+
+<!-- bench:overture-buildings-africa/stream-at-scale -->
+Overture buildings 2026-10-21.0, Africa (bbox -18,-35,52,37.5): 526,532,679 features kept by `--bbox`. The bbox touches 118 of the release's partitioned GeoParquet files and 17,372 of its 84,224 row groups; those row groups hold 58.7 GB of the release's 276.9 GB.
+
+| run | wall | peak RSS | effective cores | fetched | peak local disk | archive |
+|---|---|---|---|---|---|---|
+| tylertoo, s3:// in place | 54 min (3,243 s) | 107.1 GB | 11.9 | 35.6 GB | 145.8 GB | 12.5 GB |
+| tylertoo, s3:// in place, `--profile bounded` | 50 min (3,018 s) | 41.1 GB | 13.6 | 35.6 GB | 194.9 GB | 12.5 GB |
+
+_Run: commit afb6b15, tylertoo 0.8.0, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
+<!-- /bench -->
+
+- **Both profiles write the same archive,** byte for byte. `--profile
+  bounded` peaks at 41 GB, against the default's 107 GB on this 123 GB host,
+  so bounded is the one to use on a smaller machine.
+- **Disk:** the default run overlapped an upgrade of the host's disk from
+  125 to 1,000 MB/s; the bounded run had the fast disk throughout, which is
+  part of why it is faster here. On Brazil, on the same fast disk, bounded
+  is about a fifth slower than the default.
+- **Cores:** about 12–14 of 64 are busy on average; #813 tracks raising
+  that.
+- The bbox is a rectangle, so it also takes in the Middle East west of 52°E
+  and southern Europe below 37.5°N.
+
+## Against tippecanoe at scale: Brazil
+
+The Brazil bbox of the same release, 148 million buildings. tylertoo runs
+three ways: straight from `s3://` (median of 3), on a local GeoParquet
+extract of the bbox, and on that extract with `--profile bounded`.
+tippecanoe can't read GeoParquet or S3, so its time includes extracting the
+same bbox with gpio and converting the extract to FlatGeobuf; the extract
+alone took 10.5 minutes and every row but the `s3://` one pays it.
+
+<!-- bench:overture-buildings-brazil/vida-head-to-head -->
+Overture buildings 2026-10-21.0, Brazil (bbox -74,-33.8,-34.7,5.3): 148,088,547 features, 10.3 GB.
+
+| tool | end-to-end wall | peak RSS | effective cores | archive | note |
+|---|---|---|---|---|---|
+| tylertoo, s3:// in place | 855 s | 50.3 GB | 13.6 | 4.2 GB | reads the parts in place; no extract |
+| tylertoo, local extract | 1,356 s | 48.3 GB | 15.8 | 4.2 GB | end to end includes the gpio extract |
+| tylertoo, local extract, `--profile bounded` | 1,341 s | 12.3 GB | 18.9 | 4.2 GB | end to end includes the gpio extract |
+| tippecanoe v2.79.0 | 5,905 s | 23.6 GB | 4.1 | 2.2 GB | extract + FlatGeobuf + tile |
+
+_Run: commit 395a55f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio 1.7.0, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
+<!-- /bench -->
+
+- **On this disk, `--profile bounded` is not slower,** and it peaks at a
+  quarter of the default's memory, below tippecanoe's. At this size the default profile
+  spills its intermediate overview to disk anyway (35 GB), so the memory it
+  holds buys no speed. On inputs that fit in memory, bounded is slower; see
+  [memory profiles](#memory-profiles).
+- **Disk speed shows at this size.** These runs used a 125 MB/s network
+  disk, far slower than a laptop's NVMe drive. Convert's second pass is
+  bound by writing that spill: 275 s of the local run's 725 s. The same
+  tylertoo runs after the disk was upgraded to 1,000 MB/s (tippecanoe was
+  not re-run):
+
+<!-- bench:overture-buildings-brazil/fast-disk -->
+| tylertoo run | wall | peak RSS | effective cores |
+|---|---|---|---|
+| s3:// in place | 653 s | 50.2 GB | 17.6 |
+| s3:// in place, `--profile bounded` | 793 s | 15.1 GB | 17.1 |
+| local extract | 530 s | 48.1 GB | 21.2 |
+| local extract, `--profile bounded` | 665 s | 12.3 GB | 20.2 |
+
+_Run: commit 395a55f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio 1.7.0, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
+<!-- /bench -->
+
+  On the faster disk `bounded` costs about a fifth more wall time than the
+  default, in a quarter to a third of its memory.
+- **The archives differ in size.** tylertoo's is larger than tippecanoe's;
+  the record's per-zoom tile counts and sizes show where.
+- **The `s3://` and local archives differ by a few KB** of 4.2 GB. tylertoo's
+  `--bbox` and gpio's extract keep slightly different features on the bbox
+  edge (82 of 434 million overview rows); each path on its own is
+  byte-identical across runs.
 
 ## Against tippecanoe on the corpus
 
@@ -72,28 +162,28 @@ thinning off costs memory as well as time. The export's concurrency,
 moves with the machine; pin `--partition-wave N` before you compare memory
 across hosts.
 
-## At scale: 21.6 million buildings
+## Memory profiles
 
-The Netherlands bbox of Overture buildings release `2026-10-21.0`, every
-part pinned by ETag. tylertoo reads the GeoParquet parts straight from
-`s3://` with `--bbox`, fetching only the row groups the bbox touches.
-tippecanoe can't read GeoParquet or S3, so its time includes extracting the
-same bbox to local GeoParquet with gpio and converting it to FlatGeobuf.
-The `s3://` row is a single run (the local rows are medians of 3). Its
-archive differs from the local extract's by 3 KB of 912 MB; that
-difference has not been traced.
+`--profile auto`, the default, holds what fits in memory; `--profile
+bounded` caps every buffer and spills the rest. Three alternating rounds
+per input, same commit; the archives are byte-identical:
 
-<!-- bench:overture-buildings-netherlands/vida-head-to-head -->
-Overture buildings 2026-10-21.0, Netherlands (bbox 3.31,50.75,7.23,53.56): 21,557,082 features, 1.9 GB.
+<!-- bench:memory-profiles/memory-profiles -->
+| input | `auto` wall | `bounded` wall | bounded costs | `auto` peak | `bounded` peak | same archive |
+|---|---|---|---|---|---|---|
+| Madagascar admin level 4, z0–12 | 1.15 s | 1.27 s | +10% | 1.4 GiB | 1.2 GiB | yes |
+| Moldova parcels, z0–14 | 4.33 s | 5.63 s | +30% | 3.7 GiB | 2.7 GiB | yes |
+| NZ parcels, z0–14 | 58.24 s | 79.03 s | +36% | 9.8 GiB | 4.7 GiB | yes |
 
-| tool | end-to-end wall | peak RSS | effective cores | archive | note |
-|---|---|---|---|---|---|
-| tylertoo, s3:// in place | 107 s | 15.4 GB | 16.0 | 0.9 GB | reads the parts in place; no extract |
-| tylertoo, local extract | 321 s | 13.3 GB | 22.7 | 0.9 GB | end to end includes the gpio extract |
-| tippecanoe v2.79.0 | 1,417 s | 6.1 GB | 3.1 | 0.8 GB | extract + FlatGeobuf + tile |
-
-_Run: commit 875b1bd, tylertoo 0.8.0, tippecanoe v2.79.0, gpio 1.7.0, aarch64 0xd40 x64, 2026-11-06._
+_Run: commit afb6b15, tylertoo 0.8.0, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
 <!-- /bench -->
+
+On inputs that fit in memory, bounded costs <!-- bench:memory-profiles/bounded-cost -->10–36%<!-- /bench -->
+of the wall for its lower peak. On Brazil, where the default spills anyway,
+the two tie on the slow disk; on the fast one bounded is about a fifth
+slower, in a quarter to a third of the memory. So `auto` stays the
+default, and `bounded` is the choice for inputs larger than the machine's
+memory or for jobs with a hard memory cap.
 
 ## What the numbers don't show
 

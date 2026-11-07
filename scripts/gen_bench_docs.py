@@ -379,20 +379,34 @@ def _min(sec):
 
 
 def stream_at_scale(r) -> str:
-    """A streaming-only record: one tylertoo run from s3:// to PMTiles."""
-    row = r["rows"][0]
-    wall = statistics.median(row["runs_wall_s"])
-    ec = row.get("effective_cores")
-    return "\n".join([
-        f"{region_name(r)}: {r['features']:,} features. The bbox touches "
-        f"{r['parts_touched']} of the release's partitioned GeoParquet files; the row groups "
-        f"it intersects hold {_gb(r['in_scope_bytes'])} of the release's {_gb(r['release_bytes'])}.",
-        "",
-        "| run | wall | peak RSS | effective cores | fetched | peak local disk | archive |",
-        "|---|---|---|---|---|---|---|",
-        f"| {row['label']} | {_min(wall)} ({wall:,.0f} s) | {_gb(row['peak_rss_bytes'])} "
-        f"| {'—' if ec is None else f'{ec:.1f}'} | {_gb(row.get('fetched_bytes'))} "
-        f"| {_gb(row.get('peak_disk_bytes'))} | {_gb(row['archive_bytes'])} |"])
+    """A streaming-only record: tylertoo from s3:// to PMTiles, one row per profile."""
+    out = [f"{region_name(r)}: {r['features']:,} features kept by `--bbox`. The bbox touches "
+           f"{r['parts_touched']} of the release's partitioned GeoParquet files"
+           + (f" and {r['row_groups_read']:,} of its {r['row_groups_total']:,} row groups"
+              if r.get("row_groups_read") else "")
+           + f"; those row groups hold {_gb(r['in_scope_bytes'])} of the release's "
+             f"{_gb(r['release_bytes'])}.",
+           "",
+           "| run | wall | peak RSS | effective cores | fetched | peak local disk | archive |",
+           "|---|---|---|---|---|---|---|"]
+    for row in r["rows"]:
+        wall = statistics.median(row["runs_wall_s"])
+        ec = row.get("effective_cores")
+        out.append(f"| {row['label']} | {_min(wall)} ({wall:,.0f} s) | {_gb(row['peak_rss_bytes'])} "
+                   f"| {'—' if ec is None else f'{ec:.1f}'} | {_gb(row.get('fetched_bytes'))} "
+                   f"| {_gb(row.get('peak_disk_bytes'))} | {_gb(row['archive_bytes'])} |")
+    return "\n".join(out)
+
+
+def fast_disk(r) -> str:
+    """A showcase record's fast-disk re-runs (tylertoo only)."""
+    out = ["| tylertoo run | wall | peak RSS | effective cores |", "|---|---|---|---|"]
+    for row in r.get("fast_disk_rows", []):
+        wall = statistics.median(row["runs_wall_s"])
+        ec = row.get("effective_cores")
+        out.append(f"| {row['label'].removeprefix('tylertoo, ')} | {wall:,.0f} s "
+                   f"| {_gb(row['peak_rss_bytes'])} | {'—' if ec is None else f'{ec:.1f}'} |")
+    return "\n".join(out)
 
 
 def stream_claim(r) -> str:
@@ -401,6 +415,34 @@ def stream_claim(r) -> str:
     return (f"streams {r['features'] / 1e6:,.0f} million Overture buildings "
             f"({_gb(r['in_scope_bytes'])} of partitioned GeoParquet) from S3 into PMTiles "
             f"in {_min(wall)} on one machine")
+
+
+PROFILE_INPUTS = {"tiles-madagascar": "Madagascar admin level 4, z0–12",
+                  "polygons": "Moldova parcels, z0–14",
+                  "tiles-nz": "NZ parcels, z0–14"}
+
+
+def _profile_rows(r):
+    for cell, name in PROFILE_INPUTS.items():
+        a, b = r["cells"][cell]["auto"], r["cells"][cell]["bounded"]
+        yield (name, a["wall_s"]["median"], b["wall_s"]["median"],
+               a["true_peak_mib"]["median"], b["true_peak_mib"]["median"], a["outputs"] == b["outputs"])
+
+
+def memory_profiles(r) -> str:
+    """`--profile auto` (the default) against `bounded`, alternating rounds."""
+    out = ["| input | `auto` wall | `bounded` wall | bounded costs | `auto` peak | `bounded` peak | same archive |",
+           "|---|---|---|---|---|---|---|"]
+    for name, aw, bw, ap, bp, same in _profile_rows(r):
+        out.append(f"| {name} | {aw:,.2f} s | {bw:,.2f} s | {(bw / aw - 1) * 100:+.0f}% "
+                   f"| {ap / 1024:,.1f} GiB | {bp / 1024:,.1f} GiB | {'yes' if same else 'no'} |")
+    return "\n".join(out)
+
+
+def bounded_cost(r) -> str:
+    """The range of bounded's slowdown, inline."""
+    c = sorted((bw / aw - 1) * 100 for _, aw, bw, *_ in _profile_rows(r))
+    return f"{c[0]:.0f}–{c[-1]:.0f}%"
 
 
 def overture_scaling(r) -> str:
@@ -455,6 +497,9 @@ RENDERERS = {
     "overture-scaling": (lambda r, a: overture_scaling(r), False, True),
     "stream-at-scale": (lambda r, a: stream_at_scale(r), False, True),
     "stream-claim": (lambda r, a: stream_claim(r), True, False),
+    "fast-disk": (lambda r, a: fast_disk(r), False, True),
+    "memory-profiles": (lambda r, a: memory_profiles(r), False, True),
+    "bounded-cost": (lambda r, a: bounded_cost(r), True, False),
     "brazil-table": (lambda r, a: brazil_table(r), False, True),
 }
 SECTIONS = ["headline", "quality-matched", "memory", "input", "phases", "flags",
@@ -465,7 +510,8 @@ def footer(r) -> str:
     p = r["provenance"]
     tools = ", ".join(v if str(v).startswith(k) else f"{k} {v}"
                       for k, v in p["tool_versions"].items()
-                      if k != "tippecanoe_commit")
+                      # run_manifest names each --bin label; tylertoo builds are in the run line already
+                      if k != "tippecanoe_commit" and v != p["tylertoo_version"])
     return (f"_Run: commit {p['commit'] or 'unknown'}, tylertoo "
             f"{p['tylertoo_version'].removeprefix('tylertoo ')}, {tools + ', ' if tools else ''}{p['host']}, "
             f"{(p['date'] or 'undated')[:10]}._")

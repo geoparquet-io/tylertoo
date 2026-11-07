@@ -439,6 +439,21 @@ flags = {q(flags)}
 watch = "tmp"
 heavy = true
 
+[cells.ovt-s3-bounded]
+label = "Overture buildings {region}: tylertoo straight from s3:// with --profile bounded"
+tickets = [664]
+input = "overture-listing"
+command = "tiles"
+args = ["{PREFIX}", "{{out}}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [{ZOOM[0]}, {ZOOM[1]}]
+flags = {q([*flags, f"--bbox={bbox_arg(bbox)}", "--profile", "bounded"])}
+env = {{ AWS_REGION = "us-west-2", AWS_SKIP_SIGNATURE = "true" }}
+watch = "tmp"
+pairs = 1
+warmup = 0
+heavy = true
+
 [cells.ovt-local-bounded]
 label = "Overture buildings {region}: tylertoo on the local extract with --profile bounded"
 tickets = [664]
@@ -475,6 +490,19 @@ def extract(opts) -> None:
 # --- collect ----------------------------------------------------------------
 
 
+def scan_counts(log: Path) -> dict:
+    """tylertoo's own log lines: features kept after --bbox (pass 1 reads
+    whole row groups, so its row count includes rows outside the bbox) and
+    the row groups the bbox filter read."""
+    text = log.read_text(errors="replace") if log.is_file() else ""
+    out = {}
+    if m := re.search(r"scan complete: (\d+) feature\(s\) from (\d+) row\(s\)", text):
+        out["features"], out["rows_read"] = int(m[1]), int(m[2])
+    if m := re.search(r"bbox filter: reading (\d+)/(\d+) input row groups", text):
+        out["row_groups_read"], out["row_groups_total"] = int(m[1]), int(m[2])
+    return out
+
+
 def ok_runs(results: Path, cell: str, binary: str) -> list[dict]:
     """The ok run rows of one cell and binary in a run_manifest results dir,
     with each run's fetched bytes and shim steps."""
@@ -483,6 +511,7 @@ def ok_runs(results: Path, cell: str, binary: str) -> list[dict]:
         stem = results / cell / f"{binary}-r{r['round']}"
         r["bytes_fetched"] = bytes_fetched(stem.with_suffix(".profile.jsonl"))
         r["shim"] = shim_phases(stem.with_suffix(".log"))
+        r["scan"] = scan_counts(stem.with_suffix(".log"))
     return [r for r in rows if rm.run_status(r) == "ok"]
 
 
@@ -528,7 +557,8 @@ def archive_facts(path: Path, tylertoo: str, cap: int = 500_000) -> dict:
 
 def build_doc(region: str, bbox: tuple, extract_rec: dict, extract_pin: dict, s3: list[dict],
               local: list[dict], tc: list[dict], parts: list[dict], prov: dict,
-              archives: dict | None = None, bounded: list[dict] | None = None) -> dict:
+              archives: dict | None = None, bounded: list[dict] | None = None,
+              fast_disk: dict | None = None) -> dict:
     """The results document: gen_bench_docs.py's head-to-head schema, plus
     the per-step, disk, fetch and provenance detail of this showcase."""
     archives = archives or {}
@@ -567,7 +597,10 @@ def build_doc(region: str, bbox: tuple, extract_rec: dict, extract_pin: dict, s3
             "parts_bytes": sum(p["bytes"] for p in touched),
             "extract": {"wall_s": ext_s, "peak_rss_bytes": (extract_rec["peak_rss_kib"] or 0) * 1024,
                         "peak_disk_bytes": extract_rec["scratch_peak_mib"] * (1 << 20)},
-            "rows": rows}
+            "rows": rows,
+            # The same tylertoo cells re-run after the disk upgrade, apart from
+            # the head-to-head so no table mixes disk speeds.
+            "fast_disk_rows": [tool_row(label, runs) for label, runs in (fast_disk or {}).items() if runs]}
 
 
 def provenance(tylertoo: str) -> dict:
@@ -600,6 +633,13 @@ def run_provenance(run_dir: Path, tylertoo: str) -> dict:
     return prov
 
 
+# (row label, results-dir suffix, cell) of the fast-disk re-runs
+FAST_DISK_CELLS = [("tylertoo, s3:// in place", "s3-fastdisk", "ovt-s3"),
+                   ("tylertoo, s3:// in place, `--profile bounded`", "s3-bounded-fastdisk", "ovt-s3-bounded"),
+                   ("tylertoo, local extract", "local-fastdisk", "ovt-local"),
+                   ("tylertoo, local extract, `--profile bounded`", "bounded-fastdisk", "ovt-local-bounded")]
+
+
 def collect(opts) -> None:
     """benchmarks/results/overture-buildings-<region>.json from the runs."""
     data = Path(opts.data).expanduser().resolve()
@@ -614,7 +654,9 @@ def collect(opts) -> None:
                     ok_runs(res("tc"), "ovt-local", "tippecanoe"), read_parts(),
                     run_provenance(res("s3"), opts.tylertoo), archives,
                     ok_runs(res("bounded"), "ovt-local-bounded", "tylertoo")
-                    if res("bounded").is_dir() else None)
+                    if res("bounded").is_dir() else None,
+                    {label: ok_runs(res(d), cell, "tylertoo") for label, d, cell in FAST_DISK_CELLS
+                     if res(d).is_dir()})
     out = Path(opts.out or RESULTS / f"overture-buildings-{opts.region}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(doc, indent=2) + "\n")
@@ -651,12 +693,15 @@ def bbox_row_group_bytes(bbox: tuple, parts: list[dict]) -> tuple[int, int]:
 
 
 def build_stream_doc(region: str, bbox: tuple, s3: list[dict], parts: list[dict], prov: dict,
-                     in_scope: tuple[int, int], archive: dict | None = None) -> dict:
+                     in_scope: tuple[int, int], archive: dict | None = None,
+                     bounded: list[dict] | None = None) -> dict:
     """The record of a streaming-only run: tylertoo reads the parts in place
     and no other tool takes part (tippecanoe cannot read s3:// GeoParquet)."""
     touched = parts_touching(bbox, parts)
-    feats = next((c["pass1_rows"] for r in s3
-                  if (c := r["profile"].get("convert") or {}).get("pass1_rows")), None)
+    scan = next((r["scan"] for r in s3 if r.get("scan", {}).get("features")), {})
+    # pass-1 rows include rows outside the bbox, so they are only the fallback
+    feats = scan.get("features") or next(
+        (c["pass1_rows"] for r in s3 if (c := r["profile"].get("convert") or {}).get("pass1_rows")), None)
     inputs = [{"name": f"overture-buildings-{RELEASE}", "release": RELEASE, "path": PREFIX,
                "bbox": list(bbox), "sha256": rm.sha256_file(PARTS_TSV), "sha256_of": PARTS_TSV.name,
                "parts": [{"url": p["url"], "etag": p["etag"], "bytes": p["bytes"]} for p in touched]}]
@@ -667,8 +712,13 @@ def build_stream_doc(region: str, bbox: tuple, s3: list[dict], parts: list[dict]
             "release_bytes": sum(p["bytes"] for p in parts), "parts_touched": len(touched),
             "parts_bytes": sum(p["bytes"] for p in touched),
             "in_scope_bytes": in_scope[0], "in_scope_rows": in_scope[1],
+            "rows_read": scan.get("rows_read"), "row_groups_read": scan.get("row_groups_read"),
+            "row_groups_total": scan.get("row_groups_total"),
             "rows": [tool_row("tylertoo, s3:// in place", s3, note="reads the parts in place; no extract",
-                              archive=archive)]}
+                              archive=archive),
+                     *([tool_row("tylertoo, s3:// in place, `--profile bounded`", bounded,
+                                 note="reads the parts in place; no extract", archive=archive)]
+                       if bounded else [])]}
 
 
 def collect_stream(opts) -> None:
@@ -679,9 +729,11 @@ def collect_stream(opts) -> None:
     run_dir = data / "results" / f"{opts.region}-s3"
     archive = archive_facts(Path(opts.archive), opts.tylertoo) if opts.archive else None
     parts = read_parts()
+    bdir = data / "results" / f"{opts.region}-s3-bounded"
     doc = build_stream_doc(opts.region, bbox, ok_runs(run_dir, "ovt-s3", "tylertoo"), parts,
                            run_provenance(run_dir, opts.tylertoo),
-                           bbox_row_group_bytes(bbox, parts), archive)
+                           bbox_row_group_bytes(bbox, parts), archive,
+                           ok_runs(bdir, "ovt-s3-bounded", "tylertoo") if bdir.is_dir() else None)
     out = Path(opts.out or RESULTS / f"overture-buildings-{opts.region}.json")
     out.write_text(json.dumps(doc, indent=2) + "\n")
     print(f"wrote {out}")

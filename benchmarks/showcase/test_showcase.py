@@ -137,7 +137,7 @@ def test_rendered_manifest_loads_and_pins_the_region(tmp_path):
 
 def test_committed_manifest_loads():
     m = rm.load_manifest(sc.MANIFEST)
-    assert set(m["cells"]) == {"ovt-s3", "ovt-local", "ovt-local-bounded"}
+    assert set(m["cells"]) == {"ovt-s3", "ovt-s3-bounded", "ovt-local", "ovt-local-bounded"}
     assert m["inputs"]["overture-listing"]["sha256"] == rm.sha256_file(sc.PARTS_TSV)
 
 
@@ -276,3 +276,7 @@ def test_stream_doc_has_one_row_and_no_other_tools():
     assert "Africa" in out and "| 50 min (3,000 s) |" in out
     assert "in 50 min on one machine" in g.stream_claim(d)
     assert "tippecanoe" not in g.footer(d)
+    b = sc.build_stream_doc("africa", (0, 0, 2, 2), [run(3000, fetched=40)], parts, prov, (4, 2),
+                            bounded=[run(2800, fetched=40)])
+    assert [r["label"] for r in b["rows"]][1] == "tylertoo, s3:// in place, `--profile bounded`"
+    assert "| 47 min (2,800 s) |" in g.stream_at_scale(b)

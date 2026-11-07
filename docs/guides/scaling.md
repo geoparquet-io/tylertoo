@@ -52,6 +52,15 @@ batches processed at once, and the row groups the writer encodes at once.
 `auto` is its own shape, not a switch between the other two: on a large
 machine it holds more than `bounded` and less than `speed`.
 
+Keep `auto` unless the input is larger than the machine's memory or the job
+has a hard memory cap. On inputs that fit, `bounded` costs <!-- bench:memory-profiles/bounded-cost -->10–36%<!-- /bench -->
+more wall time for a lower peak, with byte-identical output. On inputs
+larger than memory, `auto` spills too, and the gap narrows: on 148 million
+Overture buildings `bounded` took about a fifth longer at a quarter of the
+peak, and tied on a slow disk. A spilling run is bound by the spill disk's
+speed, so point `--spill-dir` at the fastest local disk. See
+[the benchmarks](../benchmarks.md#memory-profiles).
+
 Export follows the same profile. `tiles` passes its `--profile` to the export,
 and a two-step build sets it with `export-pmtiles --profile speed|bounded|auto`.
 Under `speed`, export keeps every level's tile members in RAM and sizes its
