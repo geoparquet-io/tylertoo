@@ -388,7 +388,7 @@ def test_run_scorers_refuses_when_the_score_step_is_off(tmp_path):
 
 
 @pytest.mark.skipif(not Path("/usr/bin/time").exists(), reason="needs GNU time")
-def test_run_cell_starts_every_convert_repeat_without_the_previous_overview(tmp_path):
+def test_run_cell_starts_every_convert_repeat_without_the_previous_overview(tmp_path, monkeypatch):
     # A stand-in binary: convert logs whether its output already exists, then
     # writes it; export writes the archive and a minimal report.
     log = tmp_path / "seen.log"
@@ -406,6 +406,9 @@ fi
     fake.chmod(0o755)
     src = tmp_path / "in.parquet"
     src.write_text("x")
+    # No host-wide sync in a test: it can block for minutes on a busy host.
+    synced = tmp_path / "synced"
+    monkeypatch.setattr(run_matrix, "SYNC", ["sh", "-c", f"echo x >> {synced}"])
     old = run_matrix.LOAD_MAX
     run_matrix.LOAD_MAX = 1e9
     try:
@@ -415,8 +418,20 @@ fi
     finally:
         run_matrix.LOAD_MAX = old
     assert log.read_text().split() == ["missing", "missing", "missing"]
+    assert len(synced.read_text().split()) == 4  # noqa: PLR2004  (3 converts + 1 export)
     assert [r["status"] for r in recs[0]["convert_runs"]] == ["ok"] * 3
     assert recs[1]["export_run"]["status"] == "ok"
+    # Timed by run_manifest's one run path (#810): CPU and effective cores too.
+    assert recs[1]["export_run"]["effective_cores"] is not None
+    assert recs[0]["convert_run"]["cpu_s"] is not None
+
+
+def test_coalesce_times_runs_through_run_manifest():
+    """One owner of timed runs (#810): no second GNU-time parser here."""
+    import run_manifest
+    assert not hasattr(run_matrix, "gnu_elapsed_s")
+    assert not hasattr(run_matrix, "tree_rss_kib")
+    assert run_matrix.rm is run_manifest
 
 
 def test_load_gate_scales_with_cores():

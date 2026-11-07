@@ -1,0 +1,105 @@
+# The one bench list (#810). scripts/bench_list.py reads it for
+# criterion_compare.sh (the weekly wall-clock gate), codspeed.yml, and the
+# DEVELOPMENT.md table. Every [[bench]] in crates/core/Cargo.toml has an
+# entry here and every entry has a [[bench]] (scripts/ci/tests/test_bench_list.py).
+#
+# A bench runs in both systems unless ci/exemptions.toml exempts it from
+# `weekly` or `codspeed`, with the reason.
+#
+#   kind    cpu: the timed closure is CPU work. syscall: it writes files or
+#           wakes threads, which CodSpeed's simulation leaves out of its count
+#           ("dominated by system calls" on #799/#805), so it needs a
+#           [codspeed.<name>] exemption.
+#   paths   regexes (full match, repo-relative) of the files whose change can
+#           move the bench: a PR touching one runs it on CodSpeed. The bench's
+#           own file always does. No `paths`: any crates/core change does.
+#           Kept by hand: each bench's entry modules and their direct
+#           `use crate::` dependencies. A change that moves a bench only
+#           through a distant module shows up in the next run on main.
+#   covers  the DEVELOPMENT.md table text.
+
+# A change to one of these can move every bench: the build, the generated MVT
+# protobuf, the shared bench support, and the bench list itself. Not
+# Cargo.lock, the crate root or overview/mod.rs (#759): those ran every bench
+# for dependency bumps and one-line `pub mod` edits and moved none.
+global_paths = [
+    'Cargo\.toml',
+    'crates/core/Cargo\.toml',
+    'crates/core/build\.rs',
+    'crates/core/proto/.*',
+    'crates/core/benches/support/.*',
+    'crates/core/benches/benches\.toml',
+    'ci/exemptions\.toml',
+    '\.github/workflows/codspeed\.yml',
+    'scripts/bench_list\.py',
+]
+
+[bench.pass1_decode]
+kind = "cpu"
+paths = ['crates/core/src/(batch_processor|wkb|wkb_column)\.rs']
+covers = "Arrow columnar decode: `from_arrow_array` and `extract_geometries_from_array`"
+
+[bench.assign]
+kind = "syscall"
+paths = ['crates/core/src/overview/(assign|level)\.rs']
+covers = "`assign_levels_bounded` and `apply_density_budget` at a fixed, CI-sized feature count"
+
+[bench.simplify_cascade]
+kind = "cpu"
+paths = [
+    'crates/core/src/overview/(simplify|level)\.rs',
+    'crates/core/src/(mvt|tile)(\.rs|/.+)',
+    'crates/core/src/(batch_processor|wkb|wkb_column)\.rs',
+]
+covers = "`simplify_cascade` over real polygons through a 10-level chain with a zoom-band `Point` tail"
+
+[bench.algorithmic]
+kind = "cpu"
+paths = ['crates/core/src/overview/(coalesce|simplify)\.rs']
+covers = "Junction matching in `coalesce_level_lines`, adversarial RDP on sawtooth rings, and (with `PHASE1_INPUT`) unchanged-geometry costs (#788)"
+
+[bench.mvt_encode]
+kind = "cpu"
+paths = ['crates/core/src/(mvt|tile)(\.rs|/.+)']
+covers = "`encode_polygon`, its over-cap early exit (`antarctica_316k_over_cap`), and `LayerBuilder::add_feature`/`build`"
+
+[bench.clipping]
+kind = "cpu"
+paths = ['crates/core/src/(clip|ioverlay_clip|sutherland_hodgman|tile)\.rs']
+covers = "Sutherland-Hodgman against `i_overlay`, plus `export_clip_mix`, the point, line, and polygon mix that export clips per tile"
+
+[bench.bbox_containment]
+kind = "cpu"
+paths = ['crates/core/src/(clip|ioverlay_clip|sutherland_hodgman|tile)\.rs']
+covers = "Bounding-box containment fast paths"
+
+[bench.hostile_geometry]
+kind = "cpu"
+paths = ['crates/core/src/(clip|ioverlay_clip|sutherland_hodgman|tile)\.rs']
+covers = "Production clip, raw Sutherland-Hodgman and raw `i_overlay` on clean, invalid and pathological polygons (#205)"
+
+[bench.tile_compress_dedup]
+kind = "cpu"
+paths = [
+    'crates/core/src/(compression|dedup)(\.rs|/.+)',
+    'crates/core/src/(mvt|tile)(\.rs|/.+)',
+]
+covers = "Per-tile gzip and the XXH3 tile-content dedup cache"
+
+[bench.pipeline]
+kind = "syscall"
+# convert + export end to end: any library source can move it (#759).
+paths = ['crates/core/src/.*']
+covers = "`convert_to_overviews` then `export_pmtiles` on two small real fixtures, single-threaded: the production path end to end"
+
+[bench.coverage_fill]
+kind = "syscall"
+paths = [
+    'crates/core/src/overview/(export|export/.*|stream)\.rs',
+    'crates/core/src/(mvt|tile)(\.rs|/.+)',
+]
+covers = "`export_pmtiles` with coverage fill off and on, over a 1,500-field Moldova prefix"
+
+[bench.assign_scaling]
+kind = "syscall"
+covers = "Thread-count scaling of level assignment at dataset scale: a plain wall-clock harness, not Criterion"

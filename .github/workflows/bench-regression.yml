@@ -159,6 +159,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # Cached or downloaded, the fixtures must match benchmarks/fixtures.sha256.
+      - name: Verify test fixtures
+        run: scripts/ci/verify_fixtures.sh tests/fixtures/realdata
+
+      # criterion_compare.sh reads the bench list through scripts/bench_list.py.
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
@@ -201,31 +209,27 @@ jobs:
       #   +14.9% (sutherland_hodgman/316000), +14.2% (sutherland_hodgman/
       #   1000), +12.5% (wide_polygon_clip/sutherland_hodgman/10000), each
       #   with an interval under 3 points wide.
-      # Criterion's interval only covers noise within one run, and those
+      # Criterion's interval only covers noise within one run, and some
       # benches move between runs of the same code. The old flat +25% failed
       # the fourth run on no change. Hence: fail at a +10% lower bound, and
-      # +50% (about twice the worst A/A result) for the --noisy family, a
+      # +50% (about twice the worst A/A result) for the noisy globs, a
       # backstop for gross regressions only; CodSpeed's instruction counts
       # are the finer signal there.
       # Replayed on #432 (overflow checks in release, 36328559030), this
       # fails clip_geometry/100000 at +12.9%; the old +25% passed it.
-      # #773: the 2026-11-02 Monday run failed 14 benches (a49932b -> 6c3cec4).
-      # Local interleaved re-runs (3 rounds each side) reproduced 12 and not
-      # the two below: bbox_containment_large_features_z4/10_boundaries_* and
-      # /100_boundaries_* read -4% and -3% there against +20% and +22% on the
-      # runner, so they are listed as noisy. Of the 12, eight were the benches
-      # building a Diagnostics sink inside the timed closure (fixed in
-      # benches/); the three multipolygon clip benches (+9%) and pass1_decode (+11%) are real.
+      # The noisy globs and the measurements behind each are the [noisy]
+      # entries in ci/exemptions.toml (#810), not this file.
       # Re-measure with A/A dispatches (a branch whose only change is outside
-      # BENCHED) before tightening further.
+      # the benched code) before tightening further.
       - name: Check for regressions
-        run: >-
-          python3 scripts/criterion_gate.py --check
-          --criterion-dir "$CRITERION_HOME" --baseline base --warn 10 --fail 10
-          --noisy 'sutherland_hodgman/*' --noisy 'wide_polygon_clip/sutherland_hodgman/*'
-          --noisy 'bbox_containment_large_features_z4/10_boundaries_*'
-          --noisy 'bbox_containment_large_features_z4/100_boundaries_*'
-          --noisy-fail 50 --markdown "$CRITERION_HOME/report.md"
+        run: |
+          set -euo pipefail
+          noisy=$(scripts/bench_list.py noisy)
+          mapfile -t globs <<<"$noisy"
+          python3 scripts/criterion_gate.py --check \
+            --criterion-dir "$CRITERION_HOME" --baseline base --warn 10 --fail 10 \
+            "${globs[@]/#/--noisy=}" \
+            --noisy-fail 50 --markdown "$CRITERION_HOME/report.md"
 
       - name: Job summary
         if: always()

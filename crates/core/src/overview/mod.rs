@@ -35,6 +35,7 @@ mod read;
 #[doc(hidden)]
 pub use plan_state::fuzz_convert_plan;
 mod procmem;
+mod procstat;
 pub mod properties;
 pub mod reader;
 pub mod simplify;

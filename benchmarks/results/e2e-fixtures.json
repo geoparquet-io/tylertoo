@@ -1,4 +1,35 @@
 {
+  "provenance": {
+    "commit": "044360d",
+    "tylertoo_version": "0.11.0",
+    "host": "Apple M3 Pro, 18 GB RAM, macOS-15.6-arm64-arm-64bit",
+    "nproc": 12,
+    "kernel": null,
+    "allocator": null,
+    "tool_versions": {
+      "tippecanoe": "v2.79.0",
+      "tippecanoe_commit": "68ab8dcc229f95b8b25877697d5e8d66783af503"
+    },
+    "inputs": [
+      {
+        "name": "madagascar-adm4",
+        "sha256": null
+      },
+      {
+        "name": "open-buildings",
+        "sha256": null
+      },
+      {
+        "name": "road-detections",
+        "sha256": null
+      }
+    ],
+    "date": "2026-09-26T20:41:10Z",
+    "notes": [
+      "tylertoo_version is the string the binary reported ('tylertoo 0.11.0'); the project was 0.8.0 at the time, so it is unreliable. The commit is the trustworthy field.",
+      "Copy of benchmarks/e2e/results.json; input sha256 was not recorded."
+    ]
+  },
   "schema_version": 1,
   "generated_at": "2026-09-26T20:41:10Z",
   "machine": {

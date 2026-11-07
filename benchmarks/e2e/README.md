@@ -28,10 +28,17 @@ uv run benchmarks/e2e/compare_tippecanoe.py   # the parity gate (#420); exit 1 o
 ```
 
 A run writes `results-<UTC timestamp>.json` (gitignored), so an ad-hoc run
-never overwrites the committed record. `format_results.py` with no argument
-prints the committed `results.json`. Replacing the committed record is a
-deliberate act: pass `--out benchmarks/e2e/results.json`, then regenerate
-RESULTS.md's tables from it.
+never overwrites the committed record. The committed records are
+`benchmarks/results/e2e-fixtures.json` and `e2e-corpus.json`, each with a
+`provenance` block (commit, versions, host, kernel, allocator, input sha256).
+Replacing one is a deliberate act: pass
+`--out benchmarks/results/e2e-fixtures.json`, then run
+`uv run python scripts/gen_bench_docs.py` to regenerate the docs from it.
+
+Every run is timed by `benchmarks/run_manifest.py` (`timed`), the one owner of
+timed runs (#810): wall, user+sys CPU, effective cores and peak RSS from GNU
+`/usr/bin/time -v`, so the harness runs on Linux only. Within each round the
+tools alternate, and the order flips every round.
 
 `run_e2e.py` is standard library only. The optional visual-parity renderer
 needs plotting packages and runs under `uv`:
@@ -103,7 +110,7 @@ with `sha: null`. Re-pinning to another tag requires both `TIPPECANOE_TAG` and
 The **pin itself** lives in `setup_tippecanoe.sh` (`TIPPECANOE_TAG` /
 `TIPPECANOE_SHA`); the lockfile is a machine-local artifact naming a built
 binary, so it is gitignored. The tag and SHA that were actually measured are
-copied into `results.json`, which *is* committed — the record of a run travels
+copied into the results file, which *is* committed — the record of a run travels
 with the run, not with the toolchain.
 
 Why not just use the one on `$PATH`: on the machine these numbers were taken
@@ -120,7 +127,7 @@ drift the next time the formula moves; the source pin will not.
 
 tylertoo's `tiles` defaults, mapped onto the nearest tippecanoe flag. The
 harness passes exactly this and records the full argv of both tools in
-`results.json`.
+the results file.
 
 | knob | tylertoo (default) | tippecanoe flag passed | status |
 |---|---|---|---|
@@ -160,7 +167,7 @@ These are real and are not tuned away in either direction.
 | 5 | **Coarse-zoom emptiness.** With everything at defaults, tylertoo's visibility gate can generalize a small-extent dataset to nothing at z0–z4 and emit no tile there; tippecanoe emits a (nearly empty) tile at every zoom in range. Visible in the per-zoom counts. | favours tylertoo on tile count and archive size |
 | 6 | **tylertoo writes an intermediate.** `tiles` materialises the overview GeoParquet to a temp file and exports from it. That write is inside tylertoo's measured wall (it is not free, and it is not hidden), but it also means tylertoo's number includes producing an artifact tippecanoe never produces. | favours tippecanoe on time; favours tylertoo on what you get |
 | 7 | **Converter start-up.** `gpio` is a Python CLI (~0.3 s interpreter start-up); `ogr2ogr` is a C binary. On a 1,000-feature fixture the start-up *is* the conversion time. The harness times **both** converters and the e2e number uses the **faster**. A converter that fails on a dataset is recorded and skipped, not fatal — `gpio convert flatgeobuf` currently fails on the madagascar fixture (`NULL geometry not supported with spatial index`, although the parquet has no null, empty or invalid geometry), so `ogr2ogr` supplied that input. | neutralised |
-| 8 | **Thread counts.** Both tools use all cores; neither is pinned. tylertoo's export wave width is `auto` (memory-preflighted). Numbers are machine-specific, which is why `results.json` records CPU, core count and RAM. | neutral, but not portable |
+| 8 | **Thread counts.** Both tools use all cores; neither is pinned. tylertoo's export wave width is `auto` (memory-preflighted). Numbers are machine-specific, which is why the results file records CPU, core count and RAM. | neutral, but not portable |
 | 9 | **Warm cache.** A discarded warm-up run precedes the timed repeats for every stage, on both sides. No cold-cache numbers are published — macOS cannot drop caches without root. | neutral |
 | 10 | **Fixed run order.** Every dataset runs tylertoo first (defaults, then quality-matched), then the converters, then tippecanoe; runs are not interleaved. On a laptop, thermal state drifts across a run, so the later, longer tippecanoe stages may run on a hotter (throttled) or cooler machine than tylertoo's. | unknown direction; machine-dependent |
 
@@ -207,20 +214,19 @@ its comment.
 
 ## Metrics
 
-Recorded per dataset, per stage, in `results.json`:
+Recorded per dataset, per stage, in the results file:
 
-- **wall** — `time.perf_counter()` around the process, median of `--repeat`
-  (default 3) timed runs after one discarded warm-up; `min`, `max` and every
-  individual run are kept.
-- **peak RSS** — from `/usr/bin/time` (`-l` on Darwin, `-v` on GNU), i.e. the
+- **wall** — GNU time's elapsed time, median of `--repeat` (default 3) timed
+  rounds after one discarded warm-up of every leg; the legs alternate within
+  each round. `min`, `max` and every individual run are kept.
+- **CPU** — user+sys seconds and `effective_cores` = CPU / wall, medians across
+  the rounds; `cpu_pct` is the same as a percentage (>100% means multi-core).
+- **peak RSS** — from GNU `/usr/bin/time -v`, i.e. the
   kernel's `ru_maxrss`, not sampled. Reported as the **maximum across the
   repeats** (a peak is a peak; taking its median would understate it), which
   is why wall is a median and memory is not. For the two-process tippecanoe
   pipeline the reported figure is the **larger of the two stages**, not their
   sum, because they never run concurrently.
-- **CPU utilisation** — percent of one core, median across the repeats, from
-  the same `/usr/bin/time` wrap (GNU prints it; Darwin's is computed as
-  (user + sys) / real). >100% means multi-core.
 - **output archive size** — bytes on disk.
 - **per-zoom tile counts and stored bytes** — from `tylertoo stats --json`,
   which reads PMTiles directory entries only. The *same code* reads both
@@ -281,9 +287,9 @@ results file per dataset:
   few percent. The Moldova parcels file is a direct download and stable. The
   run's actual input sizes are in the results file.
 
-The committed corpus record is `corpus_results.json` (the fixture record stays
-in `results.json`); `format_results.py corpus_results.json` regenerates its
-tables.
+The committed corpus record is `benchmarks/results/e2e-corpus.json` (the
+fixture record is `e2e-fixtures.json` beside it);
+`format_results.py benchmarks/results/e2e-corpus.json` prints its tables.
 
 For a dataset of your own, pass it directly:
 
@@ -300,14 +306,14 @@ dataset. That is the path for cluster-scale runs.
 | file | what it is |
 |---|---|
 | `setup_tippecanoe.sh` | clones + verifies + builds the pinned tippecanoe; writes `tippecanoe.lock.json` |
-| `run_e2e.py` | the harness (stdlib only); writes `results-<UTC timestamp>.json` (or `--out`) and a markdown table |
+| `run_e2e.py` | the harness (stdlib only, timed by `../run_manifest.py`); writes `results-<UTC timestamp>.json` (or `--out`) and a markdown table |
 | `run_corpus.sh` | one command for the corpus tier: fetch + optimize the corpus, build both binaries, run `run_e2e.py --corpus --quality-matched`, print the tables |
-| `format_results.py` | prints RESULTS.md's tables from a results file (default `results.json`), so no number is retyped |
+| `format_results.py` | prints RESULTS.md's tables from a results file, so no number is retyped |
 | `render_parity.py` | side-by-side PNG renders of two archives at chosen zooms, with distinct-feature counts |
 | `compare_tippecanoe.py` | the parity gate (#420): tiles both tools, decodes both archives, per-zoom ratios vs `tippecanoe_tolerances.toml`; exit 1 on a breach |
 | `tippecanoe_tolerances.toml` | the gate's bands, one comment per band with the measured ratio and the divergence behind it |
-| `results.json` | the recorded fixture run behind RESULTS.md (machine, argv, every repeat) |
-| `corpus_results.json` | the recorded corpus run (#447) behind RESULTS.md's corpus section |
+| `../results/e2e-fixtures.json` | the recorded fixture run behind RESULTS.md (provenance, argv, every repeat) |
+| `../results/e2e-corpus.json` | the recorded corpus run (#447) behind RESULTS.md's corpus section |
 | `RESULTS.md` | measured numbers, machine, caveats |
 | `tippecanoe.lock.json` | local resolution of the pin (gitignored; written by setup) |
 | `<repo>/.tools/` | built tippecanoe, next to go-pmtiles (gitignored) |
@@ -324,4 +330,4 @@ dataset. That is the path for cluster-scale runs.
 | `--tippecanoe-extra="…"` | probe a single tippecanoe flag's cost, recorded in the results file (use `=`, or argparse eats a leading `-`) |
 | `--work DIR --keep` | keep intermediates and archives, e.g. to feed `render_parity.py` |
 | `--tippecanoe PATH` | use a different tippecanoe (its `--version` must still be `tippecanoe v2.79.0`; recorded with `sha: null`) |
-| `--out FILE` | results file; default `results-<UTC timestamp>.json`. Name `results.json` only to replace the committed record |
+| `--out FILE` | results file; default `results-<UTC timestamp>.json`. Name `../results/e2e-fixtures.json` (or `e2e-corpus.json`) only to replace the committed record |

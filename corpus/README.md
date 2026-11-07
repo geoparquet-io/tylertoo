@@ -107,9 +107,11 @@ Default stays well under the 2-3 GB budget. The large tier is opt-in.
 ## Data sources & licenses
 
 - **Overture Maps** (`s3://overturemaps-us-west-2`), release pinned
-  in `manifest.json` (`2026-06-17.0`, verified 2026-07-02).
-  Override with `GPQ_OVERTURE_RELEASE=<release>` or query the STAC
-  catalog (`https://stac.overturemaps.org/catalog.json`) for latest.
+  in `manifest.json` (`2026-10-21.0`, re-pinned 2026-11-06, #696), the same
+  release as `benchmarks/manifest.toml`. `fetch.sh` checks every output
+  against its pin (row count and `ids_sha256` for Overture, `sha256` of the
+  download otherwise) and fails on drift. `GPQ_OVERTURE_RELEASE=<release>`
+  overrides the release, unchecked.
   - places → CDLA-Permissive-2.0
   - transportation, buildings → ODbL-1.0 (contains OpenStreetMap)
 - **Natural Earth** 10m (`naciscdn.org`) → Public Domain.

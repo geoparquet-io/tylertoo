@@ -1,0 +1,25 @@
+{
+  "provenance": {
+    "commit": null,
+    "tylertoo_version": "0.6.0",
+    "host": "16 cores, 54 GiB RAM (machine type not recorded)",
+    "nproc": 16,
+    "kernel": null,
+    "allocator": null,
+    "tool_versions": {},
+    "inputs": [
+      {"name": "FTW predictions results/ collection, 52 of 1,000 part files intersect the Brazil bbox (demo/brazil-2025-manifest.txt)", "sha256": null}
+    ],
+    "date": null,
+    "notes": [
+      "Transcribed by hand from demo/RESULTS.md (Numbers section); no machine-readable record of this run exists.",
+      "demo/RESULTS.md says 'tylertoo 0.6.0 (release) + this PR's timestamp-filter and null-CRS support', so no single commit is known.",
+      "Run date not recorded; demo/RESULTS.md was last committed 2026-10-06."
+    ]
+  },
+  "scenario": "Brazil 2025 field predictions, z0-z14, remote read",
+  "stages": [
+    {"name": "Convert, including 40.7 GiB read remotely", "wall_s": 4316, "peak_rss_gib": 9.6, "output": "15-level overview"},
+    {"name": "Export", "wall_s": 704, "peak_rss_gib": 1.54, "output": "1,647,927 tiles, z0 to z14"}
+  ]
+}

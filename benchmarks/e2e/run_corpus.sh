@@ -19,8 +19,8 @@
 #      method and every asymmetry)
 #   5. format_results.py on the fresh record
 #
-# Portable: timing and RSS come from run_e2e.py's /usr/bin/time wrap
-# (`-l` on Darwin, `-v` on GNU), not from GNU-only shell parsing.
+# Timing, CPU and RSS come from benchmarks/run_manifest.py (GNU time, Linux),
+# through run_e2e.py, which alternates the tools within every round.
 #
 # Usage:
 #   ./benchmarks/e2e/run_corpus.sh                 # the default four datasets
@@ -29,9 +29,9 @@
 #   SKIP_FETCH=1 ./benchmarks/e2e/run_corpus.sh    # corpus already built
 #
 # The record lands in benchmarks/e2e/results-corpus-<UTC stamp>.json
-# (gitignored). The committed record is corpus_results.json; replacing it is
-# a deliberate act: OUT=benchmarks/e2e/corpus_results.json, then regenerate
-# RESULTS.md's corpus tables with format_results.py.
+# (gitignored). The committed record is benchmarks/results/e2e-corpus.json;
+# replacing it is a deliberate act: OUT=benchmarks/results/e2e-corpus.json,
+# then `uv run python scripts/gen_bench_docs.py` regenerates the docs.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

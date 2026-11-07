@@ -100,15 +100,12 @@ fs4 = "1.1"
 # 0.3.4 restored. See the `into` call in input_set::expand_glob.
 glob = "0.3.4"
 
-# Linux-only: statfs(2) for best-effort tmpfs/ramfs detection of the
-# remote-input spill directory (#273). Compiles to a no-op elsewhere.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Unix-only: statfs(2) for best-effort tmpfs/ramfs detection of the
+# remote-input spill directory (#273, Linux only), and getrusage(2) for the
+# profiling sampler's per-phase CPU time (#810, Linux and macOS).
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Unix-only, benches/tests only: getrusage(2) for the `assign_scaling`
-# harness's peak-RSS line (#565). The shipped crate does not gain a dependency.
-[target.'cfg(unix)'.dev-dependencies]
-libc = "0.2"
 
 [build-dependencies]
 prost-build = { workspace = true }

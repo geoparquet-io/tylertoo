@@ -148,6 +148,25 @@ fn profile_json_written_and_parses() {
     check_export_line(&report, &export);
 }
 
+/// #810: the saturation fields on a committed fixture (a plain git blob,
+/// not LFS), so this runs on every host, unlike the real-data tests above
+/// that skip without the fixture release.
+#[test]
+fn profile_json_saturation_fields_on_a_committed_fixture() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+    let (_dir, _report, convert, export) = run_tiles_with_profile(&fixture, "0", "6");
+    check_saturation(&convert, &convert, &CONVERT_PHASES);
+    assert!(
+        convert["pass2"]["writer_busy_secs"]
+            .as_f64()
+            .is_some_and(|s| s >= 0.0),
+        "pass2.writer_busy_secs: {convert}"
+    );
+    check_saturation(&export, &export["export"], &["scan", "levels", "finalize"]);
+    check_export_serial_path(&export);
+}
+
 /// The convert line of [`profile_json_written_and_parses`]'s `tiles` run.
 fn check_convert_line(
     dir: &std::path::Path,
@@ -342,6 +361,12 @@ fn check_convert_line(
     );
 
     check_rss_sampler(value, value, &CONVERT_PHASES);
+    assert!(
+        value["pass2"]["writer_busy_secs"]
+            .as_f64()
+            .is_some_and(|s| s >= 0.0),
+        "pass2.writer_busy_secs must be a non-negative number (#810): {value}"
+    );
     check_sink_measurement(value);
     check_pass1_memory_preflight(value);
     check_pass2_windows(value);
@@ -521,6 +546,83 @@ fn check_rss_sampler(line: &serde_json::Value, holder: &serde_json::Value, phase
          boundary-sampled peak_rss_mib ({boundary}): {line}"
     );
     check_627_breakdown(line, sampler, phases);
+    check_saturation(line, holder, phases);
+}
+
+/// #810: `rss_sampler.phases`, one saturation record per phase, named in
+/// run order by `rss_sampler.phase_order`, and the per-tick timeline.
+fn check_saturation(line: &serde_json::Value, holder: &serde_json::Value, phases: &[&str]) {
+    let sampler = &holder["rss_sampler"];
+    assert_eq!(
+        sampler["phase_order"],
+        serde_json::json!(phases),
+        "rss_sampler.phase_order must list the phases in run order: {line}"
+    );
+    let threads = holder["threads"].as_f64().expect("threads");
+    let num = |p: &serde_json::Value, key: &str| -> Option<f64> {
+        assert!(
+            p.as_object().is_some_and(|o| o.contains_key(key)),
+            "rss_sampler.phases.*.{key} must be present: {line}"
+        );
+        p[key].as_f64()
+    };
+    let (mut cpu_sum, mut wall_sum) = (0.0, 0.0);
+    for phase in phases {
+        let p = &sampler["phases"][*phase];
+        let wall = num(p, "wall_secs").expect("wall_secs is always a number");
+        let stage = num(p, "stage_secs").expect("stage_secs is always a number");
+        assert!(wall >= 0.0 && stage >= 0.0, "{phase}: {line}");
+        wall_sum += wall;
+        let (user, sys) = (num(p, "cpu_user_secs"), num(p, "cpu_sys_secs"));
+        let io = (num(p, "read_bytes"), num(p, "write_bytes"));
+        // Null off Linux, and where the host hides `/proc/self/io`.
+        let have_io = cfg!(target_os = "linux") && std::fs::read("/proc/self/io").is_ok();
+        assert_eq!(
+            io.0.is_some() && io.1.is_some(),
+            have_io,
+            "{phase}: read/write bytes are numbers exactly when /proc/self/io is readable: {line}"
+        );
+        let (Some(user), Some(sys)) = (user, sys) else {
+            assert!(
+                user.is_none() && sys.is_none() && !cfg!(unix),
+                "{phase}: getrusage must report on unix: {line}"
+            );
+            continue;
+        };
+        let cpu = user + sys;
+        cpu_sum += cpu;
+        let cores = num(p, "effective_cores").expect("effective_cores");
+        assert!(
+            (cores - cpu / wall.max(1e-9)).abs() <= 1e-6 * cores.max(1.0),
+            "{phase}: {line}"
+        );
+        let util = num(p, "utilization").expect("utilization");
+        assert!((util - cores / threads).abs() < 1e-9, "{phase}: {line}");
+        let unattributed = num(p, "unattributed_core_secs").expect("unattributed_core_secs");
+        assert!(
+            (unattributed - (cpu - stage)).abs() < 1e-6,
+            "{phase}: {line}"
+        );
+        // No `stage <= cpu` bound here: stage windows are wall time, so a
+        // descheduled thread overstates them under load. The deterministic
+        // double-count guard is `stage_core_secs_count_each_stage_once`.
+    }
+    if cfg!(unix) {
+        assert!(
+            cpu_sum / wall_sum > 0.0,
+            "the run used CPU, so effective_cores > 0: {line}"
+        );
+    }
+    let timeline = sampler["timeline"].as_array().expect("timeline array");
+    assert!(!timeline.is_empty(), "the tick records from t=0: {line}");
+    let mut last_t = -1.0;
+    for row in timeline {
+        let row = row.as_array().expect("timeline row array");
+        assert_eq!(row.len(), 6, "[t, cpu, rss, read, write, rchar]: {line}");
+        let t = row[0].as_f64().expect("t_secs");
+        assert!(t >= last_t, "timeline must be in time order: {line}");
+        last_t = t;
+    }
 }
 
 /// Keys of a `phase_rss_breakdown` entry (#627): the `/proc/self/status`
@@ -773,6 +875,38 @@ fn check_export_line(report: &serde_json::Value, export_value: &serde_json::Valu
     );
     // Duplicating mode runs no fill, so the sampler has no `fill` entry.
     check_rss_sampler(export_value, export, &["scan", "levels", "finalize"]);
+    check_export_serial_path(export_value);
+}
+
+/// #810: the export's serial-path seconds, and each zoom's wave width and
+/// spilled bytes.
+fn check_export_serial_path(export_value: &serde_json::Value) {
+    let export = &export_value["export"];
+    let serial = &export["serial_secs"];
+    for key in ["spool_write", "finalize", "group_commit_wait"] {
+        assert!(
+            serial[key].as_f64().is_some_and(|s| s >= 0.0),
+            "export.serial_secs.{key} must be a non-negative number: {export_value}"
+        );
+    }
+    assert_eq!(serial["finalize"], export["phase_walls"]["finalize"]);
+    assert_eq!(serial["spool_write"], export["stage_secs"]["spool_write"]);
+    assert!(
+        export["serial_share"]
+            .as_f64()
+            .is_some_and(|s| (0.0..=1.0).contains(&s)),
+        "export.serial_share must be a fraction: {export_value}"
+    );
+    for z in export["per_zoom"].as_array().expect("per_zoom") {
+        assert!(
+            z["wave_width"].as_u64().is_some_and(|w| w >= 1),
+            "per_zoom[].wave_width must be >= 1: {export_value}"
+        );
+        assert!(
+            z["spill_bytes"].is_u64(),
+            "per_zoom[].spill_bytes: {export_value}"
+        );
+    }
 }
 
 /// `export.phase_walls` are disjoint wall windows of the export, so they

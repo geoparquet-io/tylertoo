@@ -2033,7 +2033,7 @@ environment overrides** so the
 sweep knobs, not stable API: deliberately env-only, with no CLI flags, and
 they may change or disappear. They alter request *scheduling* only, so the
 output is identical whatever their values. The sweep that measured them, and
-chose to keep the defaults, is in `benchmarks/staging/RESULTS.md`.
+chose to keep the defaults, is in [`benchmarks/staging/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/staging/RESULTS.md) (in git history).
 
 | Variable | Default | Bounds | Effect |
 |----------|---------|--------|--------|

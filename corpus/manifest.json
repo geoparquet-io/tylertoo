@@ -2,10 +2,10 @@
   "schema_version": 1,
   "description": "tylertoo overview test corpus. Datasets per geometry class (point/line/polygon/monster) at small/medium/large scale tiers. Scripts only; data never committed.",
   "overture": {
-    "release": "2026-06-17.0",
+    "release": "2026-10-21.0",
     "bucket": "s3://overturemaps-us-west-2/release",
     "region": "us-west-2",
-    "release_note": "Pinned release verified 2026-07-02. To use latest, override GPQ_OVERTURE_RELEASE env var or query the STAC catalog at https://stac.overturemaps.org/catalog.json (SET VARIABLE latest = (SELECT latest FROM 'https://stac.overturemaps.org/catalog.json'))."
+    "release_note": "Pinned release, re-pinned 2026-11-06 (#696: 2026-06-17.0 left the bucket). benchmarks/manifest.toml uses the same release (test_run_manifest.py checks it). Overture extracts are pinned by exact row count and ids_sha256 = sha256 of the extract's ids sorted and joined with ',' (DuckDB: sha256(string_agg(id, ',' ORDER BY id))), which is independent of the parquet writer; fetch.sh checks both and fails on a mismatch. Releases expire after a few months: re-pin all of them together."
   },
   "profiles": {
     "default": "small + medium tiers, target < 2-3 GB total (fetch.sh)",
@@ -24,7 +24,7 @@
       "region": "Boise, ID metro",
       "bbox": [-116.7, 43.4, -115.9, 43.8],
       "select": "id, names.primary AS name, confidence, geometry",
-      "expected_features": 37000,
+      "expected_features": 42398,
       "verified_count": true,
       "expected_size_mb": 2,
       "license": "CDLA-Permissive-2.0 (Overture places)",
@@ -32,7 +32,8 @@
         "minzoom": 0,
         "maxzoom": 14,
         "flags": "--drop-densest-as-needed --extend-zooms-if-still-dropping"
-      }
+      },
+      "ids_sha256": "4db0ef4c08d6fe5da2c1e824fbf906040dd713fb4d594aec4cb6c9e707858cb7"
     },
     {
       "id": "points-nyc-medium",
@@ -45,7 +46,7 @@
       "region": "New York City (5 boroughs)",
       "bbox": [-74.3, 40.5, -73.7, 40.9],
       "select": "id, names.primary AS name, confidence, geometry",
-      "expected_features": 458000,
+      "expected_features": 630065,
       "verified_count": true,
       "expected_size_mb": 22,
       "license": "CDLA-Permissive-2.0 (Overture places)",
@@ -53,7 +54,8 @@
         "minzoom": 0,
         "maxzoom": 14,
         "flags": "--drop-densest-as-needed --extend-zooms-if-still-dropping"
-      }
+      },
+      "ids_sha256": "8336a140e0b7a2fc3f0ac08ee7ccfa015772bd83f28b692a941b43c43c043993"
     },
     {
       "id": "lines-boise-small",
@@ -66,7 +68,7 @@
       "region": "Boise, ID metro",
       "bbox": [-116.7, 43.4, -115.9, 43.8],
       "select": "id, class AS road_class, subtype, geometry",
-      "expected_features": 152000,
+      "expected_features": 154241,
       "verified_count": true,
       "expected_size_mb": 30,
       "license": "ODbL-1.0 (Overture transportation, contains OpenStreetMap)",
@@ -74,7 +76,8 @@
         "minzoom": 0,
         "maxzoom": 14,
         "flags": "--simplification=10 --drop-densest-as-needed"
-      }
+      },
+      "ids_sha256": "f34098c88438dcd386827b1dbfddf88e71d1c8505a9499539a60f8f56ce42d46"
     },
     {
       "id": "lines-portland-medium",
@@ -87,15 +90,16 @@
       "region": "Portland, OR metro",
       "bbox": [-123.0, 45.3, -122.3, 45.7],
       "select": "id, class AS road_class, subtype, geometry",
-      "expected_features": 280000,
-      "verified_count": false,
+      "expected_features": 302087,
+      "verified_count": true,
       "expected_size_mb": 55,
       "license": "ODbL-1.0 (Overture transportation, contains OpenStreetMap)",
       "tippecanoe": {
         "minzoom": 0,
         "maxzoom": 14,
         "flags": "--simplification=10 --drop-densest-as-needed"
-      }
+      },
+      "ids_sha256": "b4d08b43fd1d73c8d7e1b79f5a8a5d90a4faa220139b9dbb0edb09a31f249d0b"
     },
     {
       "id": "polygons-portland-medium",
@@ -108,15 +112,16 @@
       "region": "Portland, OR metro",
       "bbox": [-123.0, 45.3, -122.3, 45.7],
       "select": "id, class AS building_class, height, geometry",
-      "expected_features": 650000,
-      "verified_count": false,
+      "expected_features": 813456,
+      "verified_count": true,
       "expected_size_mb": 160,
       "license": "ODbL-1.0 (Overture buildings, contains OpenStreetMap)",
       "tippecanoe": {
         "minzoom": 0,
         "maxzoom": 14,
         "flags": "--simplification=10 --drop-densest-as-needed --coalesce-densest-as-needed"
-      }
+      },
+      "ids_sha256": "7b5a51ca3deeb09c9a9bbebf4fc916a9fa8d44d7e61e55c632f6eede9c8bfb97"
     },
     {
       "id": "monster-coastline",
@@ -128,15 +133,16 @@
       "shapefile": "ne_10m_coastline.shp",
       "region": "Global coastline (10m)",
       "geometry_kind": "line",
-      "expected_features": 4200,
-      "verified_count": false,
+      "expected_features": 4133,
+      "verified_count": true,
       "expected_size_mb": 6,
       "license": "Public Domain (Natural Earth)",
       "tippecanoe": {
         "minzoom": 0,
         "maxzoom": 10,
         "flags": "--simplification=10"
-      }
+      },
+      "sha256": "bfa04cdbcbef07ef90dfca1dabb48062eca29900a113df0f389303e255484017"
     },
     {
       "id": "monster-admin",
@@ -149,14 +155,15 @@
       "region": "Global admin-0 country boundaries (10m)",
       "geometry_kind": "polygon",
       "expected_features": 258,
-      "verified_count": false,
+      "verified_count": true,
       "expected_size_mb": 12,
       "license": "Public Domain (Natural Earth)",
       "tippecanoe": {
         "minzoom": 0,
         "maxzoom": 10,
         "flags": "--simplification=10 --coalesce-densest-as-needed"
-      }
+      },
+      "sha256": "ce1ac7036499a0edd641fbc093cd209a98f96a49d2eca8480aaacad35138a7f6"
     },
     {
       "id": "lines-oregon-large",
@@ -169,15 +176,16 @@
       "region": "State of Oregon, USA",
       "bbox": [-124.6, 41.9, -116.4, 46.3],
       "select": "id, class AS road_class, subtype, geometry",
-      "expected_features": 5000000,
-      "verified_count": false,
+      "expected_features": 1203997,
+      "verified_count": true,
       "expected_size_mb": 900,
       "license": "ODbL-1.0 (Overture transportation, contains OpenStreetMap)",
       "tippecanoe": {
         "minzoom": 0,
         "maxzoom": 14,
         "flags": "--simplification=10 --drop-densest-as-needed"
-      }
+      },
+      "ids_sha256": "6fb83735f759fb8e1bc37723b9376eda209759937068af03a5369a2e327f44c3"
     },
     {
       "id": "polygons-ftw-moldova-large",
@@ -196,7 +204,8 @@
         "minzoom": 0,
         "maxzoom": 14,
         "flags": "--simplification=10 --drop-densest-as-needed --coalesce-densest-as-needed"
-      }
+      },
+      "sha256": "f5343419fd6b2f8054136eb6ccd6a65d66d1c7d01446c8ea04e809e96fe97afd"
     }
   ]
 }
