@@ -530,12 +530,13 @@ The guard sets `RAYON_NUM_THREADS` itself for every run (16 for the scaling
 arm, removed otherwise); `record` and `check` refuse to start when the parent
 environment sets it. `check --inject-threads N` is the one supported way to
 pin the full arm, for the failure demo; the verdict and `--json-out` say it was
-injected, and `record --inject-threads` is refused. A baseline field missing
-from the current run (or from some of its rounds) fails the check; a matched
-baseline recorded before these fields exist reports `baseline: NOT APPLICABLE
-(... run record)`. `record --cells X` merges into the host class entry (other
-cells and `floors` stay). CPU core-seconds baselines under 0.05 s are skipped
-with a printed reason.
+injected, and `record --inject-threads` is refused. A phase the cell measures
+(pass 2 and levels on `tiles`, levels on export; both thread arms on a scaling
+cell) missing from any round fails the check and makes `record` refuse to
+write; a matched baseline missing one (recorded before these fields) reports
+`baseline: NOT APPLICABLE (... run record)`. `record --cells X` merges into the host class entry (other
+cells and `floors` stay). A CPU core-seconds check that cannot run (baseline
+under 0.05 s, or the output changed) prints a `SKIP` line.
 
 On the pinned 64-core host (build both binaries first, see valve_guard.py):
 
