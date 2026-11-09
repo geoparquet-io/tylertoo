@@ -118,6 +118,7 @@ pub(super) mod cost_probe {
         pub(crate) seed_windows: usize,
         pub(crate) pyramid_wave_tiles: usize,
         pub(crate) pyramid_waves: usize,
+        pub(crate) pyramid_share_misses: usize,
         pub(crate) seed_frame_writers: usize,
         pub(crate) map_peak: usize,
         pub(crate) live_peak: usize,
@@ -1166,6 +1167,8 @@ struct FillCounts {
 /// Fixed charge covers the file, path, vector and map node. Payloads live
 /// on disk. The active writer additionally owns its 8 KiB buffered output.
 const ZOOM_INDEX_FIXED_BYTES: usize = 1024;
+/// The seed window's rows at the workspace floor; a larger grant scales it.
+const SEED_FLOOR_ROWS: usize = 128;
 /// A run frame writer's buffered file plus its encode buffer.
 const RUN_WRITER_BYTES: usize = 8192 + 8192;
 const ZOOM_WRITER_FIXED_BYTES: usize = ZOOM_INDEX_FIXED_BYTES + 8192;
@@ -1681,15 +1684,14 @@ fn pyramid_tile(
     reserved: usize,
 ) -> Result<TileFill, super::ExportError> {
     let fill = pyramid_fill(path, step.seed, timers, budget, reserved)?;
+    // Checked before anything is allocated: concurrent tiles must not
+    // overrun their shares first and find out after.
+    require_fill_bytes(prepare_bound(&fill), budget)?;
     let mut lifted = Vec::new();
     if step.lift {
         let (x, y) = super::key_to_xy(key, step.zoom);
         lift_into_parent(&fill, x & 1, y & 1, &mut lifted);
     }
-    require_fill_bytes(
-        shape_capacity_bytes(&fill).saturating_add(shape_capacity_bytes(&lifted)),
-        budget,
-    )?;
     let area = fill.iter().map(|s| net_area(s)).sum::<f64>();
     let vertices = fill.iter().flatten().map(Vec::len).sum::<usize>();
     #[cfg(test)]
@@ -1703,14 +1705,25 @@ fn pyramid_tile(
     for shape in fill {
         polys.extend(to_tile_polygons(std::slice::from_ref(&shape), step.scale));
     }
-    let tile = TileFill {
+    Ok(TileFill {
         polys,
         lifted,
         area,
         vertices,
-    };
-    require_fill_bytes(tile.capacity_bytes(), budget)?;
-    Ok(tile)
+    })
+}
+
+/// An upper bound on what a tile holds while it lifts and snaps `fill`:
+/// the fill; a lift no larger than it, as each lifted ring is allocated at
+/// its source ring's length, plus its outer vector's doubling; and the
+/// snapped polygons' outer vector. A snapped polygon (8-byte points) is
+/// smaller than the shape it replaces (16-byte points), and that shape is
+/// freed as it is snapped.
+fn prepare_bound(fill: &Vec<Shape>) -> usize {
+    let outer = std::mem::size_of::<Shape>() + std::mem::size_of::<FillPolygon>();
+    shape_capacity_bytes(fill)
+        .saturating_mul(2)
+        .saturating_add(fill.len().saturating_mul(2 * outer))
 }
 
 /// A pyramid tile's fill, built within `budget`.
@@ -1878,6 +1891,12 @@ struct Slide<'a> {
     /// No more launches: a tile did not fit its share, or an error.
     stopped: bool,
     error: Option<super::ExportError>,
+    /// Tiles known not to fit a share: the window stops short of them, and
+    /// the next is built alone.
+    oversized: &'a mut std::collections::BTreeSet<u64>,
+    /// Tiles that missed their share, and the most ever in flight.
+    misses: usize,
+    peak: usize,
 }
 
 struct SlideCtx<'a> {
@@ -1902,19 +1921,29 @@ impl<'a> SlideCtx<'a> {
 /// as in a wave.
 fn slide_launch<'s, 'a: 's>(scope: &rayon::Scope<'s>, ctx: &'s SlideCtx<'a>, s: &mut Slide<'a>) {
     let SlideCtx { share, .. } = *ctx;
+    // `fixed` still counts the candidate's path among the queued ones.
     while !s.stopped
-        && s.commit.fixed(s.queue.len()) + (s.in_flight + 3) * share + (s.in_flight + 1) * 512
+        && s.commit.fixed(s.queue.len()) + s.in_flight * 512 + (s.in_flight + 3) * share
             <= ctx.workspace
     {
-        let Some((key, path)) = s.queue.pop_first() else {
+        let Some(next) = s.queue.first_entry() else {
             break;
         };
+        if s.oversized.contains(next.key()) {
+            break;
+        }
+        let (key, path) = next.remove_entry();
         let (seq, reserved) = (s.next_seq, s.commit.fixed(s.queue.len()));
         s.next_seq += 1;
         s.in_flight += 1;
+        s.peak = s.peak.max(s.in_flight);
         scope.spawn(move |scope| {
             let result = pyramid_tile(&path, key, ctx.step, ctx.timers, share, reserved);
             let mut s = ctx.lock();
+            s.misses += usize::from(matches!(
+                result,
+                Err(super::ExportError::BudgetExceeded { .. })
+            ));
             s.done.insert(seq, (key, path, result));
             let consumed = slide_commit(&mut s, ctx.step, share, ctx.workspace);
             slide_launch(scope, ctx, &mut s);
@@ -1971,9 +2000,11 @@ fn slide_commit(
 ///
 /// A tile that does not fit its share stops the window; once the window
 /// drains, that tile is built alone on the whole workspace, as a wave's
-/// serial retry would, and the window resumes after it. Tiles the window
-/// cannot take (a grant too small for two lanes, a last tile) stay in
-/// `buckets` for the wave loop.
+/// serial retry would, and the window resumes after it. Every tile seen to
+/// miss its share is remembered, so the window stops short of it rather
+/// than building it at a share again. Tiles the window cannot take (a
+/// grant too small for two lanes, a last tile) stay in `buckets` for the
+/// wave loop.
 fn pyramid_slide(
     buckets: &mut SpillBuckets,
     commit: &mut ZoomCommit,
@@ -1981,7 +2012,8 @@ fn pyramid_slide(
     timers: &super::ExportTimers,
     workspace: usize,
 ) -> Result<(), super::ExportError> {
-    while slide_window(buckets, commit, step, timers, workspace)? {
+    let mut oversized = std::collections::BTreeSet::new();
+    while slide_window(buckets, commit, &mut oversized, step, timers, workspace)? {
         let (key, path) = buckets
             .tiles
             .pop_first()
@@ -2000,11 +2032,13 @@ fn pyramid_slide(
     Ok(())
 }
 
-/// One run of the window; `true` when a tile did not fit its share. That
-/// tile and every tile after it are back in `buckets`, runs intact.
+/// One run of the window; `true` when it stopped at a tile that does not
+/// fit its share. That tile and every tile after it are back in `buckets`,
+/// runs intact, and the tile is first.
 fn slide_window(
     buckets: &mut SpillBuckets,
     commit: &mut ZoomCommit,
+    oversized: &mut std::collections::BTreeSet<u64>,
     step: PyramidStep,
     timers: &super::ExportTimers,
     workspace: usize,
@@ -2014,8 +2048,6 @@ fn slide_window(
     if lanes < 2 {
         return Ok(false);
     }
-    #[cfg(test)]
-    cost_probe::update(|c| c.pyramid_wave_tiles = c.pyramid_wave_tiles.max(lanes));
     let ctx = SlideCtx {
         state: std::sync::Mutex::new(Slide {
             queue: &mut buckets.tiles,
@@ -2026,6 +2058,9 @@ fn slide_window(
             done: Default::default(),
             stopped: false,
             error: None,
+            oversized,
+            misses: 0,
+            peak: 0,
         }),
         step,
         timers,
@@ -2040,12 +2075,20 @@ fn slide_window(
     if let Some(error) = s.error {
         return Err(error);
     }
-    // Stopped by a tile over its share: the window's next tile is that one.
-    let over_share = s.stopped && !s.done.is_empty();
-    for (_, (key, path, _)) in s.done {
+    #[cfg(test)]
+    cost_probe::update(|c| {
+        c.pyramid_wave_tiles = c.pyramid_wave_tiles.max(s.peak);
+        c.pyramid_share_misses += s.misses;
+    });
+    for (_, (key, path, result)) in s.done {
+        if matches!(result, Err(super::ExportError::BudgetExceeded { .. })) {
+            s.oversized.insert(key);
+        }
         s.queue.insert(key, path);
     }
-    Ok(over_share)
+    Ok(s.queue
+        .first_key_value()
+        .is_some_and(|(key, _)| s.oversized.contains(key)))
 }
 
 /// One seed batch: every polygon clipped into its tiles at `seed_zoom`,
@@ -2083,6 +2126,9 @@ fn seed_batch(
         diagnostics,
     )?;
     *features += geoms.len();
+    // A floor-sized window keeps the serial writes and frees: its few rows
+    // and tiles do not repay three more parallel dispatches per window.
+    let wide = geoms.len() > SEED_FLOOR_ROWS;
     let pieces: Vec<Vec<(u64, Bucket)>> = geoms
         .par_iter()
         .map(|g| {
@@ -2111,7 +2157,9 @@ fn seed_batch(
         })
         .collect();
     // Freeing the decoded batch is per-geometry allocator work.
-    geoms.into_par_iter().for_each(drop);
+    if wide {
+        geoms.into_par_iter().for_each(drop);
+    }
     let live_bytes: usize = pieces
         .iter()
         .flatten()
@@ -2154,7 +2202,7 @@ fn seed_batch(
         c.live_peak = c.live_peak.max(pending_bytes);
     });
     for key in pending.keys() {
-        buckets.reserve_run(*key, 0)?;
+        buckets.reserve_run(*key, pending_bytes)?;
     }
     // Each tile's run is its own file, so its frame is written in parallel;
     // every run still gets one frame per window, in window order. Writers
@@ -2163,22 +2211,33 @@ fn seed_batch(
         .budget
         .saturating_sub(pending_bytes.saturating_add(buckets.tiles.len() * 512));
     let writers = (1 + spare / RUN_WRITER_BYTES)
-        .min(rayon::current_num_threads())
+        .min(if wide {
+            rayon::current_num_threads()
+        } else {
+            1
+        })
         .min(pending.len())
         .max(1);
     #[cfg(test)]
     cost_probe::update(|c| c.seed_frame_writers = c.seed_frame_writers.max(writers));
     let frames: Vec<_> = pending.iter().collect();
     let runs = &buckets.tiles;
-    frames
-        .par_chunks(frames.len().div_ceil(writers).max(1))
-        .try_for_each(|chunk| {
-            chunk.iter().try_for_each(|(key, (shapes, credits))| {
-                SpillBuckets::write_frame(&runs[*key], shapes, credits)
-            })
-        })?;
+    let write = |chunk: &[(&u64, &Bucket)]| {
+        chunk.iter().try_for_each(|(key, (shapes, credits))| {
+            SpillBuckets::write_frame(&runs[*key], shapes, credits)
+        })
+    };
+    if writers > 1 {
+        frames
+            .par_chunks(frames.len().div_ceil(writers))
+            .try_for_each(write)?;
+    } else {
+        write(&frames)?;
+    }
     drop(frames);
-    pending.into_par_iter().for_each(drop);
+    if wide {
+        pending.into_par_iter().for_each(drop);
+    }
     Ok(())
 }
 
@@ -2263,7 +2322,7 @@ pub(super) fn build_fill_map(
                 // The 32 MiB floor keeps the original 128-row window. A
                 // larger grant amortizes Rayon dispatch and run opens; the
                 // same byte guards still check the materialized capacities.
-                let rows = 128usize
+                let rows = SEED_FLOOR_ROWS
                     .saturating_mul((workspace / WORKSPACE_FLOOR_BYTES).max(1))
                     .min(super::EXPORT_BATCH_SIZE);
                 for offset in (0..batch.num_rows()).step_by(rows) {
@@ -2605,6 +2664,7 @@ pub(super) mod tests {
             vertices: 0,
         };
         let mut queue = std::collections::BTreeMap::new();
+        let mut oversized = std::collections::BTreeSet::new();
         let mut slide = Slide {
             queue: &mut queue,
             commit: &mut commit,
@@ -2614,6 +2674,9 @@ pub(super) mod tests {
             done: Default::default(),
             stopped: false,
             error: None,
+            oversized: &mut oversized,
+            misses: 0,
+            peak: 4,
         };
         // Tile 1 finishes first: nothing commits ahead of tile 0.
         slide.done.insert(1, (2, paths.remove(1), Ok(tile())));
@@ -2644,6 +2707,91 @@ pub(super) mod tests {
             "a stopped slide stays put"
         );
         assert_eq!(commit.tiles, 2);
+    }
+
+    /// A zoom's runs at z4, `big` of them first holding a ring of `points`
+    /// collinear points per side, then `small` unit squares.
+    fn slide_runs(big: u32, points: usize, small: u32) -> SpillBuckets {
+        let opts = super::super::ExportOptions::default();
+        let mut runs = SpillBuckets::new(&opts, usize::MAX);
+        let side = |i: usize| i as f64 * 100.0 / points as f64;
+        let ring: Ring = (0..points)
+            .map(|i| [side(i), 0.0])
+            .chain((0..points).map(|i| [100.0, side(i)]))
+            .chain((0..points).map(|i| [100.0 - side(i), 100.0]))
+            .chain((0..points).map(|i| [0.0, 100.0 - side(i)]))
+            .collect();
+        for x in 0..big + small {
+            let key = crate::pmtiles_writer::tile_id(4, x, 0);
+            let shape = if x < big {
+                vec![ring.clone()]
+            } else {
+                square(10.0, 10.0, 100.0)
+            };
+            runs.append(key, &[shape], &[], 0).unwrap();
+        }
+        runs
+    }
+
+    fn slide_zoom(runs: &mut SpillBuckets, workspace: usize) -> (ZoomCommit, cost_probe::Counts) {
+        let opts = super::super::ExportOptions::default();
+        let mut commit = ZoomCommit {
+            map_bytes: 0,
+            snapped: ZoomBuilder::new(&opts).unwrap(),
+            parents: SpillBuckets::new(&opts, workspace),
+            tiles: 0,
+            area: 0.0,
+            vertices: 0,
+        };
+        let step = PyramidStep {
+            zoom: 4,
+            seed: false,
+            lift: true,
+            scale: 1.0,
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        // The probe is per thread: read it on the thread that slides.
+        let counts = pool.install(|| {
+            cost_probe::take();
+            pyramid_slide(
+                runs,
+                &mut commit,
+                step,
+                &super::super::ExportTimers::default(),
+                workspace,
+            )
+            .unwrap();
+            cost_probe::take()
+        });
+        (commit, counts)
+    }
+
+    /// #817 review: a grant for two lanes keeps two tiles in flight; the
+    /// candidate's path was charged twice, so the window held one.
+    #[test]
+    fn a_two_lane_slide_keeps_two_tiles_in_flight() {
+        let mut runs = slide_runs(0, 0, 3);
+        // 4 floors: two lanes after the two commit shares.
+        let (commit, counts) = slide_zoom(&mut runs, 4 * WORKSPACE_FLOOR_BYTES + (64 << 10));
+        assert_eq!(commit.tiles, 3);
+        assert_eq!(counts.pyramid_wave_tiles, 2, "{counts:?}");
+    }
+
+    /// #817 review: consecutive tiles over their share are each built at a
+    /// share once, then alone; the window does not rebuild them at a share
+    /// every time it reopens.
+    #[test]
+    fn consecutive_tiles_over_their_share_miss_it_once_each() {
+        // Two lanes with ~32 MiB shares; each big run is 35 MB of points,
+        // over its share and within the whole grant.
+        let mut runs = slide_runs(3, 550_000, 2);
+        let (commit, counts) = slide_zoom(&mut runs, 4 * WORKSPACE_FLOOR_BYTES + (64 << 10));
+        assert!(runs.tiles.is_empty());
+        assert_eq!(commit.tiles, 5);
+        assert_eq!(counts.pyramid_share_misses, 3, "{counts:?}");
     }
 
     /// #817: a parallel wave hands the ordered commit only appends. Each
@@ -3299,6 +3447,27 @@ pub(super) mod tests {
         )
         .expect_err("the merged bucket outgrows its pieces");
         assert_eq!(pending, pieces + 2 * std::mem::size_of::<Shape>() as u64);
+    }
+
+    /// #817 review: a new tile run is charged while the window's pending
+    /// geometry is still held, not after it.
+    #[test]
+    fn the_seed_charges_a_new_run_with_its_pending_geometry() {
+        let opts = super::super::ExportOptions::default();
+        let batch = geometry_batch(&[degree_square(1.0, 1.0)]);
+        let mut features = 0;
+        let pieces = seed_z4(&batch, &mut SpillBuckets::new(&opts, 0), &mut features)
+            .expect_err("nothing fits a zero budget");
+        let pending = seed_z4(
+            &batch,
+            &mut SpillBuckets::new(&opts, usize::try_from(pieces).unwrap()),
+            &mut features,
+        )
+        .expect_err("the merged bucket outgrows its pieces");
+        let budget = usize::try_from(pending).unwrap();
+        let needed = seed_z4(&batch, &mut SpillBuckets::new(&opts, budget), &mut features)
+            .expect_err("the run's node does not fit beside the pending geometry");
+        assert_eq!(needed, pending + 512);
     }
 
     fn square(x: f64, y: f64, side: f64) -> Shape {
