@@ -1715,15 +1715,17 @@ fn pyramid_tile(
 
 /// An upper bound on what a tile holds while it lifts and snaps `fill`:
 /// the fill; a lift no larger than it, as each lifted ring is allocated at
-/// its source ring's length, plus its outer vector's doubling; and the
-/// snapped polygons' outer vector. A snapped polygon (8-byte points) is
-/// smaller than the shape it replaces (16-byte points), and that shape is
-/// freed as it is snapped.
+/// its source ring's length, plus its outer vector's doubling; the snapped
+/// polygons' outer vector; and the polygon being snapped, beside its
+/// source. A finished polygon (8-byte points) is no larger than the shape
+/// it replaced (16-byte points), and that shape is freed once snapped.
 fn prepare_bound(fill: &Vec<Shape>) -> usize {
     let outer = std::mem::size_of::<Shape>() + std::mem::size_of::<FillPolygon>();
+    let snapping = fill.iter().map(shape_payload_bytes).max().unwrap_or(0);
     shape_capacity_bytes(fill)
         .saturating_mul(2)
         .saturating_add(fill.len().saturating_mul(2 * outer))
+        .saturating_add(snapping)
 }
 
 /// A pyramid tile's fill, built within `budget`.
@@ -2159,6 +2161,8 @@ fn seed_batch(
     // Freeing the decoded batch is per-geometry allocator work.
     if wide {
         geoms.into_par_iter().for_each(drop);
+    } else {
+        drop(geoms);
     }
     let live_bytes: usize = pieces
         .iter()
@@ -2205,12 +2209,14 @@ fn seed_batch(
         buckets.reserve_run(*key, pending_bytes)?;
     }
     // Each tile's run is its own file, so its frame is written in parallel;
-    // every run still gets one frame per window, in window order. Writers
-    // beyond the serial one are charged to the spare workspace.
-    let spare = buckets
-        .budget
-        .saturating_sub(pending_bytes.saturating_add(buckets.tiles.len() * 512));
-    let writers = (1 + spare / RUN_WRITER_BYTES)
+    // every run still gets one frame per window, in window order. The frame
+    // list and every writer are charged; a writer that does not fit is not
+    // started, and the first must fit.
+    let held = pending_bytes
+        .saturating_add(buckets.tiles.len() * 512)
+        .saturating_add(pending.len() * std::mem::size_of::<(&u64, &Bucket)>());
+    require_fill_bytes(held.saturating_add(RUN_WRITER_BYTES), buckets.budget)?;
+    let writers = (buckets.budget.saturating_sub(held) / RUN_WRITER_BYTES)
         .min(if wide {
             rayon::current_num_threads()
         } else {
