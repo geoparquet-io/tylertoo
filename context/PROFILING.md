@@ -540,7 +540,7 @@ with a printed reason.
 On the pinned 64-core host (build both binaries first, see valve_guard.py):
 
 ```bash
-G="uv run python -I benchmarks/valve_guard.py"
+G="uv run --no-project --python 3.12 python -I benchmarks/valve_guard.py"
 A="--mim target/release/tylertoo --glibc target/glibc/release/tylertoo --data ~/bench-data"
 $G record $A                                     # (i) baseline, seeds floors
 $G check  $A                                     # (ii) must pass

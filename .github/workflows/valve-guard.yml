@@ -192,7 +192,7 @@ jobs:
         if: steps.inputs.outputs.input_ok == 'true'
         shell: bash
         run: |
-          uv run python -I benchmarks/valve_guard.py check \
+          uv run --no-project --python 3.12 python -I benchmarks/valve_guard.py check \
             --mim "$RUNNER_TEMP/tylertoo-mim" --glibc "$RUNNER_TEMP/tylertoo-glibc" \
             --data "$DATA" --json-out "$RUNNER_TEMP/valve-guard.json" \
             | tee "$RUNNER_TEMP/valve-guard.txt"
@@ -273,7 +273,7 @@ jobs:
           \`\`\`
           cargo build --release -p tylertoo
           cargo build --release -p tylertoo --no-default-features --target-dir target/glibc
-          uv run python -I benchmarks/valve_guard.py check \\
+          uv run --no-project --python 3.12 python -I benchmarks/valve_guard.py check \\
             --mim target/release/tylertoo --glibc target/glibc/release/tylertoo
           \`\`\`
 
