@@ -4142,6 +4142,8 @@ struct ExportWorkTally {
     /// Band batches read on the thread that collects them, which then
     /// waits on the read (#817).
     band_reads_on_consumer: u64,
+    /// Groups clipped while an earlier group still waited to finish (#817).
+    collect_overlaps: u64,
 }
 
 struct LevelCtx<'a> {
@@ -6230,7 +6232,22 @@ fn collect_into(
     let mut group = CollectGroup::new(collect_group_rows(ctx.band.profile));
     let mut clipped: Option<ClippedGroup> = None;
     let rows = &mut rows;
+    // `bounded` finishes each group before clipping the next, so it never
+    // holds two groups' geometry and members: that overlap is not budgeted.
+    let overlap = !matches!(ctx.band.profile, MemoryProfile::Bounded);
     let mut step = |batches: Vec<RecordBatch>| -> Result<(), ExportError> {
+        if !overlap {
+            if let Some(c) = clipped.take() {
+                finish_group(ctx, wave, c, rows, sink, diagnostics)?;
+            }
+        }
+        #[cfg(test)]
+        if clipped.is_some() {
+            ctx.work
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .collect_overlaps += 1;
+        }
         let (finished, next) = rayon::join(
             || {
                 clipped.take().map_or(Ok(()), |c| {
@@ -11946,6 +11963,10 @@ mod tests {
         };
         let (tight, tight_bytes) = run(64, &bounded);
         assert_eq!(tight.collect_groups, 3, "bounded collects batch by batch");
+        assert_eq!(
+            tight.collect_overlaps, 0,
+            "bounded held two clipped groups at once"
+        );
         assert!(tight_bytes == one_bytes, "bounded changed the archive");
     }
 
