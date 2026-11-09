@@ -171,3 +171,4 @@ WKB
 # listing it exempts it from Microsoft.Wordiness.
 [Ee]xtract
 [Jj]scpd
+NVMe

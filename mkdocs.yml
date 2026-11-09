@@ -70,6 +70,7 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - Benchmarks: benchmarks.md
   - Tutorials:
       - Madagascar boundaries: tutorials/madagascar.md
       - Brazil fields from the cloud: tutorials/brazil.md

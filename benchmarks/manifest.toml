@@ -404,6 +404,29 @@ output = "out.pmtiles"
 zoom = [0, 12]
 flags = ["--verbatim"]
 
+# The before/after table of #810: `tiles` at its defaults on the four
+# polygon inputs (Madagascar, Moldova, Mato Grosso, NZ parcels). `polygons`
+# and `polygons-mt` are the Moldova and Mato Grosso rows.
+[cells.tiles-madagascar]
+label = "tiles defaults: Madagascar adm4 (the smoke cell)"
+tickets = [810]
+input = "madagascar-adm4"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+
+[cells.tiles-nz]
+label = "tiles defaults: NZ parcels z0-14"
+tickets = [810]
+input = "nz-parcels"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 14]
+wall_s = 2700
+rss_gib = 96
+
 [cells.coverage-fill]
 label = "Coverage fill: FTW Moldova z0-14, --coverage-fill (track F's claim)"
 input = "moldova"
@@ -715,4 +738,5 @@ final-gate = ["lz4-mad-bounded", "lz4-mol-bounded", "spill-codec"]
 final-held = ["memory-capped", "memory-capped-auto", "coverage-fill", "coverage-fill-bounded",
               "remote-mol-auto", "remote-mp13-auto", "remote-mp13"]
 final-sweep = ["wave-nz-cg-auto", "wave-nz-cg-16", "wave-nz-cg-64"]
+results-table = ["tiles-madagascar", "polygons", "polygons-mt", "tiles-nz"]
 export-740 = ["export-nz", "polygons-mt", "export-moldova", "export-moldova-w8"]

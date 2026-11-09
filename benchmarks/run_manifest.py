@@ -30,11 +30,14 @@ Standard library only. What one `run` does, cell by cell:
             and never summarized.
   each run  waits for a quiet host (load gate below), runs the command under
             `/usr/bin/time -v` with a fresh TYLERTOO_PROFILE_JSON, records
-            wall, CPU, peak RSS, the profile lines, output size and sha256,
+            wall, user+sys CPU, effective cores (CPU / wall), peak RSS, the
+            profile lines (with the per-phase CPU and I/O fields of #810 when
+            the binary writes them), output size and sha256,
             the CPU other processes used while it ran and the peak size of
             its scratch, then deletes its outputs (.bench-out/), whatever
             the outcome, and runs `sync`. Only the result row, the profile
-            JSONL and the log (stdout + `time -v`) are kept. A run stops at
+            JSONL and the log (stdout + `time -v`) are kept, plus the output
+            file of a `keep_output = true` cell (<cell>/<tag>.<name>). A run stops at
             `wall_s`, `rss_gib` or `scratch_gib` (status TIMEOUT, RSS_CAP,
             SCRATCH_CAP), and the whole run stops before any command when
             the disk has less than `min_free_gb` free.
@@ -44,7 +47,14 @@ Standard library only. What one `run` does, cell by cell:
             the saved binaries.json (hash, allocator, --bin-env, CPU count)
             is refused, so one median never mixes two builds.
   report    results.jsonl (one line per run) and report.md (median and
-            spread per cell and binary) in <results>.
+            spread per cell and binary) in <results>, with provenance.json
+            (commit, versions, host, kernel, input sha256s). `--json-out
+            benchmarks/results/<name>.json` writes the run as the one results
+            file the generated docs read (scripts/gen_bench_docs.py).
+
+`--manifest <path>` reads another manifest of the same shape. e2e/run_e2e.py
+and coalesce/run_matrix.py keep their own flow and time each run with
+`timed()`, the same GNU-time and profile path as a cell's run.
 
 The load gate: the 1-minute load average must be under --load-max (3). Our
 own previous run holds that average up for minutes after it exits, so within
@@ -71,6 +81,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -106,7 +117,7 @@ class ManifestError(ValueError):
 CELL_KEYS = {
     "label", "tickets", "input", "inputs", "command", "args", "zoom", "flags",
     "output", "setup", "pairs", "allocator", "wall_s", "rss_gib", "memory_max",
-    "serve", "env", "heavy", "notes", "scratch_gib", "watch", "warmup",
+    "serve", "env", "heavy", "notes", "scratch_gib", "watch", "warmup", "keep_output",
 }
 INPUT_KEYS = {"file", "path", "url", "sha256", "bytes", "rows", "geometry", "notes"}
 
@@ -397,6 +408,60 @@ class Gate:
             f.write(line + "\n")
 
 
+def host_class() -> dict:
+    """What makes wall and RSS comparable between two runs: architecture,
+    CPU model and count. A baseline applies only on the same class."""
+    model = ""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith(("model name", "Model name", "CPU part")):
+                model = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    return {"machine": platform.machine(), "cpu_model": model, "cpus": os.cpu_count()}
+
+
+def _out(argv: list[str]) -> str | None:
+    """First line of a command's output, or None when it cannot run."""
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)  # noqa: S603
+    except OSError:
+        return None
+    lines = (res.stdout or res.stderr).strip().splitlines()
+    return lines[0] if res.returncode == 0 and lines else None
+
+
+def provenance(bins: list[dict], inputs: dict) -> dict:
+    """The provenance block every benchmarks/results/*.json carries (#810).
+    The measured binary is the last --bin (base first, head last); every
+    binary's `--version` is under tool_versions. `commit` is this checkout's
+    HEAD, which is the head binary's source only when it was built here.
+    Unknown values are null."""
+    head = bins[-1]
+    h = host_class()
+    ins = []
+    for name, inp in inputs.items():
+        rec = {"name": name, "sha256": inp["sha256"]}
+        m = re.search(r"/release/([^/]+)/", inp.get("url", ""))
+        if m:
+            rec["release"] = m.group(1)
+        if inp.get("url"):
+            rec["url"] = inp["url"]
+        ins.append(rec)
+    return {
+        "commit": _out(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"]),
+        "tylertoo_version": _out([head["path"], "--version"]),
+        "host": f"{h['machine']}, CPU {h['cpu_model'] or 'unknown'}, {h['cpus']} CPUs",
+        "nproc": os.cpu_count(),
+        "kernel": platform.release(),
+        "allocator": head["allocator"],
+        "tool_versions": {b["label"]: _out([b["path"], "--version"]) for b in bins},
+        "inputs": ins,
+        "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
 def require_disk(path: Path, min_free_gb: float) -> None:
     """Stop the whole run when the disk under `path` is below the floor."""
     free = shutil.disk_usage(path).free / (1 << 30)
@@ -547,6 +612,19 @@ def parse_gnu_time(stderr: str) -> dict:
     }
 
 
+# Per-phase saturation fields of `rss_sampler.phases` (#810, written by the
+# sampler when profiling is on; older binaries have none, read as absent).
+PHASE_KEYS = ("cpu_user_secs", "cpu_sys_secs", "effective_cores", "utilization",
+              "unattributed_core_secs", "read_bytes", "write_bytes")
+
+
+def phase_fields(sampler: dict | None) -> dict:
+    """`{phase: {PHASE_KEYS present}}` from an `rss_sampler` object; the
+    timeline stays in the profile JSONL, out of the run record."""
+    phases = (sampler or {}).get("phases") or {}
+    return {name: {k: p[k] for k in PHASE_KEYS if k in p} for name, p in phases.items()}
+
+
 def read_profile(path: Path) -> dict:
     """The convert and export lines of a fresh TYLERTOO_PROFILE_JSON file,
     reduced to what the report compares."""
@@ -567,6 +645,10 @@ def read_profile(path: Path) -> dict:
                 "true_anon_peak_mib": (ex.get("rss_sampler") or {}).get("true_anon_peak_mib"),
                 "tiles": sum(z.get("tiles", 0) for z in ex.get("per_zoom", [])),
                 "threads": ex.get("threads"),
+                "phases": phase_fields(ex.get("rss_sampler")),
+                "serial_secs": ex.get("serial_secs"),
+                "levels": [{"zoom": z.get("zoom"), "wave_width": z.get("wave_width"),
+                            "spill_bytes": z.get("spill_bytes")} for z in ex.get("per_zoom", [])],
             }
         else:
             out["convert"] = {
@@ -577,6 +659,8 @@ def read_profile(path: Path) -> dict:
                 "true_anon_peak_mib": (rec.get("rss_sampler") or {}).get("true_anon_peak_mib"),
                 "memory_profile": rec.get("memory_profile"),
                 "threads": rec.get("threads"),
+                "phases": phase_fields(rec.get("rss_sampler")),
+                "writer_busy_secs": (rec.get("pass2") or {}).get("writer_busy_secs"),
             }
     return out
 
@@ -593,13 +677,21 @@ def dir_bytes(path: Path) -> int:
     return total
 
 
-def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path,
+def effective_cores(run: dict) -> float | None:
+    """Whole-run cores kept busy: user+sys CPU over wall."""
+    if run.get("cpu_s") is None or not run.get("wall_s"):
+        return None
+    return round(run["cpu_s"] / run["wall_s"], 2)
+
+
+def run_capped(argv: list[str], caps: dict, env: dict | None, log: Path, scratch: Path | None,
                cpus: frozenset[int] | None = None) -> dict:
     """Run argv (already wrapped in GNU time). A wall, RSS or scratch-disk
     cap (`caps`: wall_s, rss_gib, scratch_gib) kills the process group and
     is reported as the status, not raised. `foreign_cores` is the CPU other
     processes used during the run: on `cpus` when given (the isolated set the
-    run is pinned to; the rest is `context_cores`), else on the whole host."""
+    run is pinned to; the rest is `context_cores`), else on the whole host.
+    With no `scratch`, no scratch cap applies."""
     others = all_cpus() - cpus if cpus else None
     o0 = cpu_busy_jiffies(others)[0] if cpus else 0
     cap_kib = int(caps["rss_gib"] * 1024 * 1024)
@@ -618,7 +710,7 @@ def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path,
             while proc.poll() is None:
                 rss = tree_rss_kib(proc.pid)
                 outcome["peak_poll_kib"] = max(outcome["peak_poll_kib"], rss)
-                if tick % 10 == 0:  # the scratch walk every ~2 s
+                if scratch and tick % 10 == 0:  # the scratch walk every ~2 s
                     outcome["scratch_peak"] = max(outcome["scratch_peak"], dir_bytes(scratch))
                 if watch_dir:  # a cell's own watched subdirectory, every tick
                     outcome["watch_peak"] = max(outcome["watch_peak"], dir_bytes(watch_dir))
@@ -657,7 +749,7 @@ def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path,
     wall = gt["wall_s"] if status == "ok" and gt["wall_s"] else wall_poll
     busy_s = (b1 - b0) / CLK_TCK
     foreign = max(0.0, busy_s - (gt["cpu_s"] or 0.0)) / max(wall_poll, 1e-6)
-    return {
+    res = {
         "status": status,
         "returncode": proc.returncode,
         "wall_s": round(wall, 3),
@@ -671,6 +763,28 @@ def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path,
         "cgroup_memory": outcome["cgroup"],
         "stderr_tail": stderr[-2500:] if status != "ok" else None,
     }
+    res["effective_cores"] = effective_cores(res)
+    return res
+
+
+# Caps for a run that names none: the manifest's defaults.
+DEFAULT_CAPS = {"wall_s": 1800, "rss_gib": 32, "scratch_gib": 30}
+
+
+def timed(argv: list[str], log: Path, env: dict | None = None, scratch: Path | None = None,
+          caps: dict | None = None) -> dict:
+    """One run of argv under GNU time, for the scripts that keep their own
+    flow (e2e/run_e2e.py, coalesce/run_matrix.py): wall, user+sys CPU,
+    effective cores, peak RSS and the reduced TYLERTOO_PROFILE_JSON, from
+    `run_capped`. The profile JSONL is kept beside `log`. No load gate:
+    the caller waits for a quiet host (`Gate`) if it wants one."""
+    prof = log.with_name(log.name + ".profile.jsonl")
+    prof.unlink(missing_ok=True)
+    env = {**(os.environ if env is None else env), "TYLERTOO_PROFILE_JSON": str(prof)}
+    res = run_capped(["/usr/bin/time", "-v", *argv], {**DEFAULT_CAPS, **(caps or {})}, env,
+                     log, scratch)
+    res["profile"] = read_profile(prof)
+    return res
 
 
 def scope_memory(pid: int) -> dict | None:
@@ -687,6 +801,18 @@ def scope_memory(pid: int) -> dict | None:
         return None
     return {"scope": path, "events": {k: int(v) for k, v in events.items()},
             "peak_mib": round(int(peak) / (1 << 20), 1) if peak else None}
+
+
+def keep_output(out_dir: Path, output: str, cdir: Path, tag: str) -> Path | None:
+    """Move a cell's output file (a `keep_output` cell) out of the run's
+    scratch to <cell>/<tag>.<name> before the scratch is deleted."""
+    src = out_dir / output
+    if not src.is_file():
+        return None
+    cdir.mkdir(parents=True, exist_ok=True)
+    dst = cdir / f"{tag}.{src.name}"
+    shutil.move(src, dst)
+    return dst
 
 
 def output_digest(out_dir: Path, output: str) -> dict:
@@ -777,6 +903,17 @@ class Runner:
 
     def run_all(self) -> None:
         """Every selected cell in manifest order, then the report."""
+        names = sorted({i for c in self.cells() for i in cell_input_names(self.m["cells"][c])})
+        prov_path = self.results / "provenance.json"
+        prov = provenance(self.bins, {n: self.m["inputs"][n] for n in names})
+        if prov_path.exists():
+            # A resume keeps the provenance of the runs already recorded
+            # (check_resume has matched the binaries); it only adds new inputs.
+            old = json.loads(prov_path.read_text())
+            have = {i["name"] for i in old["inputs"]}
+            old["inputs"] += [i for i in prov["inputs"] if i["name"] not in have]
+            prov = old
+        prov_path.write_text(json.dumps(prov, indent=2))
         for name in self.cells():
             self.run_cell(name)
         write_report(self.results)
@@ -890,6 +1027,9 @@ class Runner:
             # (our part still in the page cache at exit is not counted).
             res["device_write_mib"] = round((sectors_written(self.disk) - w0) * 512 / (1 << 20), 1)
             output = output_digest(out, cell["output"])
+            if cell.get("keep_output"):  # e.g. a showcase archive to render or ship
+                kept = keep_output(out, cell["output"], cdir, tag)
+                output["kept"] = str(kept) if kept else None
         finally:
             # Only the result row, the profile JSONL and the log survive a run.
             shutil.rmtree(out, ignore_errors=True)
@@ -969,6 +1109,18 @@ def run_status(run: dict) -> str:
     return run["status"]
 
 
+def phase_cores(runs: list[dict]) -> dict:
+    """`{"convert/<phase>": spread}` of each phase's effective cores (#810),
+    for the phases the runs' profiles report."""
+    vals: dict[str, list[float]] = {}
+    for r in runs:
+        for line in ("convert", "export"):
+            for name, p in ((r.get("profile") or {}).get(line) or {}).get("phases", {}).items():
+                if p.get("effective_cores") is not None:
+                    vals.setdefault(f"{line}/{name}", []).append(p["effective_cores"])
+    return {k: spread(v) for k, v in vals.items()}
+
+
 def summarize(runs: list[dict], bins: list[dict]) -> dict:
     """Per binary: wall, CPU, peak RSS and phase totals over its ok runs
     (a run whose gate timed out is not ok, see `run_status`)."""
@@ -981,6 +1133,8 @@ def summarize(runs: list[dict], bins: list[dict]) -> dict:
             "statuses": sorted({run_status(r) for r in mine}),
             "wall_s": spread([r["wall_s"] for r in ok]),
             "cpu_s": spread([r["cpu_s"] for r in ok if r["cpu_s"] is not None]),
+            "effective_cores": spread([v for r in ok if (v := effective_cores(r)) is not None]),
+            "phase_effective_cores": phase_cores(ok),
             "peak_rss_mib": spread([r["peak_rss_kib"] / 1024 for r in ok if r["peak_rss_kib"]]),
             "convert_s": spread([v for r in ok if (v := phase_total(r, "convert")) is not None]),
             "export_s": spread([v for r in ok if (v := phase_total(r, "export")) is not None]),
@@ -1021,9 +1175,9 @@ def write_report(results: Path) -> None:
              "`foreign` is the most cores other processes used during any run of the row (on the "
              "--gate-cpus set when given); `context` is the median busy cores on the other CPUs.", "",
              "Binaries: " + ", ".join(f"`{b['label']}` ({b['allocator']}, {b['sha256'][:12]})" for b in bins),
-             "", "| cell | binary | runs | status | wall | vs first | vs prev | convert | export | CPU s "
+             "", "| cell | binary | runs | status | wall | vs first | vs prev | convert | export | CPU s | cores "
              "| peak RSS MiB | true peak MiB | RSS vs first | RSS vs prev | foreign | context | output |",
-             "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+             "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for cdir in sorted(p for p in results.iterdir() if p.is_dir()):
         runs = load_runs(cdir)
         if not runs:
@@ -1046,7 +1200,7 @@ def write_report(results: Path) -> None:
                 f"| {cdir.name} | {b['label']} | {s['wall_s']['n']} | {','.join(s['statuses'])} "
                 f"| {fmt(s['wall_s'], ' s')} | {ratio(i, 0, 'wall_s')} | {ratio(i, prev, 'wall_s')} "
                 f"| {fmt(s['convert_s'])} | {fmt(s['export_s'])} "
-                f"| {fmt(s['cpu_s'])} | {fmt(s['peak_rss_mib'])} | {fmt(s['true_peak_mib'])} "
+                f"| {fmt(s['cpu_s'])} | {fmt(s['effective_cores'])} | {fmt(s['peak_rss_mib'])} | {fmt(s['true_peak_mib'])} "
                 f"| {ratio(i, 0, 'peak_rss_mib')} | {ratio(i, prev, 'peak_rss_mib')} "
                 f"| {s['foreign_cores_max']} | {fmt(s['context_cores'])} "
                 f"| {same} {s['output_bytes'][0] if s['output_bytes'] else ''} |")
@@ -1068,6 +1222,23 @@ def write_report(results: Path) -> None:
     (results / "report.md").write_text("\n".join(lines) + "\n")
 
 
+def write_results_json(results: Path, out: Path) -> None:
+    """A run as one results file for benchmarks/results/ (#810): its
+    provenance and, per cell, the summary of every binary."""
+    bins = json.loads((results / "binaries.json").read_text())
+    prov_path = results / "provenance.json"
+    doc = {
+        "provenance": json.loads(prov_path.read_text()) if prov_path.exists() else None,
+        "run": results.name,
+        "binaries": [{k: b.get(k) for k in BUILD_KEYS} for b in bins],
+        "cells": {c.name: summarize(runs, bins)
+                  for c in sorted(p for p in results.iterdir() if p.is_dir())
+                  if (runs := load_runs(c))},
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(doc, indent=2) + "\n")
+
+
 # --- CLI --------------------------------------------------------------------
 
 
@@ -1084,6 +1255,8 @@ def main(argv: list[str] | None = None) -> int:
         if name != "fetch":
             p.add_argument("--name", required=True, help="the run's name; results/<name> resumes it")
             p.add_argument("--results", help="results directory (default <data>/results/<name>)")
+            p.add_argument("--json-out", help="also write the run as one results file, with "
+                           "provenance (e.g. benchmarks/results/<name>.json)")
     run = sub.choices["run"]
     run.add_argument("--bin", action="append", required=True, help="label=path or label=allocator:path; first is the base")
     run.add_argument("--cells", help="comma-separated cells (default: every cell not marked heavy)")
@@ -1121,11 +1294,15 @@ def main(argv: list[str] | None = None) -> int:
         fetch(manifest, Path(args.data).expanduser(), [Path(d).expanduser() for d in args.input_dir],
               list(manifest["inputs"]))
         return 0
+    if args.cmd == "report" and args.json_out:
+        write_results_json(results_dir(args), Path(args.json_out))
     if args.cmd == "report":
         write_report(results_dir(args))
         print((results_dir(args) / "report.md").read_text())
         return 0
     Runner(args, manifest).run_all()
+    if args.json_out:
+        write_results_json(results_dir(args), Path(args.json_out))
     print((results_dir(args) / "report.md").read_text())
     return 0
 

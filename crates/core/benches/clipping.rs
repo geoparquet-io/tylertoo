@@ -316,9 +316,27 @@ fn bench_export_clip_mix(c: &mut Criterion) {
 // gate's A/A runs (#678) put the noise between runs, with intervals under 3
 // points wide, so the extra samples bought nothing and cost ~8 min a run.
 fn config() -> Criterion {
+    keep_freed_memory();
     Criterion::default()
         .sample_size(30)
         .measurement_time(Duration::from_secs(2))
+}
+
+// With glibc's default mmap and trim thresholds, every clip_polygon_sh call
+// at 100k and 316k vertices handed its buffers back to the kernel and took
+// ~590 and ~1,930 minor page faults on fresh, kernel-zeroed pages (getrusage,
+// #810), so those benches timed the VM's fault path rather than the clip: the
+// `sutherland_hodgman/*` noise between runs of the same code (#678). Keep
+// freed memory in the heap, as mimalloc, the shipped allocator (#739), does:
+// 0 faults per call.
+fn keep_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: mallopt only sets allocator tunables, before any bench allocates.
+    unsafe {
+        // 32 MiB is glibc's largest mmap threshold on 64-bit.
+        assert_eq!(libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20), 1);
+        assert_eq!(libc::mallopt(libc::M_TRIM_THRESHOLD, 64 << 20), 1);
+    }
 }
 
 criterion_group!(

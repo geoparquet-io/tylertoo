@@ -1,0 +1,60 @@
+# The at-scale streaming run: tylertoo alone, s3:// to PMTiles, no extract.
+# Derived from manifest.toml (Brazil); only the bbox and caps differ.
+# The showcase cells (#810, track D), in benchmarks/manifest.toml's format:
+#
+#   uv run --no-project python -I benchmarks/run_manifest.py \
+#       --manifest benchmarks/showcase/manifest.toml run --cells ... --bin ...
+#
+# Region `africa`: bbox -18,-35,52,37.5 of Overture buildings 2026-10-21.0 (takes in
+# the Middle East west of 52E and southern Europe below 37.5N).
+# Settings parity is run_e2e.py's (z0-14, buffer 8, 500,000-byte compressed
+# cap). tippecanoe runs the `ovt-local` cell through tippecanoe_shim.sh.
+
+[defaults]
+pairs = 3
+warmup = 1
+allocator = "any"
+wall_s = 21600
+rss_gib = 110
+scratch_gib = 240
+min_free_gb = 5
+load_max = 3.0
+load_wait_s = 1800
+
+# The listing pins every part by key, size and ETag. The s3:// cell reads
+# the parts in place, so the listing is its input.
+[inputs.overture-listing]
+path = "benchmarks/showcase/overture-buildings-2026-10-21.0.tsv"
+sha256 = "4d981b3ee0d61199c4e999b7b96bf81d71f4a447237e25c527eb88e410155bdd"
+
+[cells.ovt-s3]
+label = "Overture buildings africa: tylertoo straight from s3://"
+tickets = [664]
+input = "overture-listing"
+command = "tiles"
+args = ["s3://overturemaps-us-west-2/release/2026-10-21.0/theme=buildings/type=building/", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 14]
+flags = ["--layer-name", "buildings", "--tile-buffer", "8", "--max-compressed-tile-size", "500000", "--max-tile-size", "0", "--include-property", "class", "--include-property", "subtype", "--include-property", "height", "--bbox=-18,-35,52,37.5"]
+env = { AWS_REGION = "us-west-2", AWS_SKIP_SIGNATURE = "true" }
+watch = "tmp"
+keep_output = true
+pairs = 1
+warmup = 0
+heavy = true
+
+[cells.ovt-s3-bounded]
+label = "Overture buildings africa: tylertoo straight from s3:// with --profile bounded"
+tickets = [664]
+input = "overture-listing"
+command = "tiles"
+args = ["s3://overturemaps-us-west-2/release/2026-10-21.0/theme=buildings/type=building/", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 14]
+flags = ["--layer-name", "buildings", "--tile-buffer", "8", "--max-compressed-tile-size", "500000", "--max-tile-size", "0", "--include-property", "class", "--include-property", "subtype", "--include-property", "height", "--bbox=-18,-35,52,37.5", "--profile", "bounded"]
+env = { AWS_REGION = "us-west-2", AWS_SKIP_SIGNATURE = "true" }
+watch = "tmp"
+keep_output = true
+pairs = 1
+warmup = 0
+heavy = true

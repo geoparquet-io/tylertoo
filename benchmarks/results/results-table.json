@@ -1,0 +1,1160 @@
+{
+  "provenance": {
+    "commit": "ae0363f",
+    "tylertoo_version": "tylertoo 0.8.0",
+    "host": "aarch64 0xd40 x64",
+    "nproc": 64,
+    "kernel": "7.0.0-1014-aws",
+    "allocator": "mimalloc",
+    "tool_versions": {
+      "main": "tylertoo 0.8.0",
+      "head": "tylertoo 0.8.0"
+    },
+    "inputs": [
+      {
+        "name": "ftw-br-mt",
+        "sha256": "ddd65369f461896bc8aa5497dae0f18fed06cd079013e5157a0d054b34ad1108",
+        "url": "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_MT.parquet"
+      },
+      {
+        "name": "madagascar-adm4",
+        "sha256": "6f666e18e06a87eeb219dfd6c1ef407fb9bce0e72c4cd7736fdd1c245c72f0b9",
+        "url": "https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1/madagascar-adm4-hilbert.parquet"
+      },
+      {
+        "name": "moldova",
+        "sha256": "06bddb7a42283812c1032d85a6b138daf198b1b46592ba96ad84cbe09a12e5f5",
+        "url": "https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1/moldova-hilbert.parquet"
+      },
+      {
+        "name": "nz-parcels",
+        "sha256": "3a8336ce71d623c44eee44e1226ce87052e13950d2918f4e91a9b75e80bb7998",
+        "url": "https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1/nz-parcels-hilbert.parquet"
+      }
+    ],
+    "date": "2026-11-06T18:48:08Z"
+  },
+  "run": "results-table-ae0363f",
+  "binaries": [
+    {
+      "label": "main",
+      "sha256": "50295bfd2c3580e21c0ea1354a3256407dd444454bac8eafbf199b5b57bcd5b7",
+      "allocator": "mimalloc",
+      "env": {},
+      "affinity_cpus": 64
+    },
+    {
+      "label": "head",
+      "sha256": "3bc91659775f408bf12bd49cbb387de326e6602ae9928fbb2c4d5b9b7baf4568",
+      "allocator": "mimalloc",
+      "env": {},
+      "affinity_cpus": 64
+    }
+  ],
+  "cells": {
+    "polygons": {
+      "main": {
+        "allocator": "mimalloc",
+        "statuses": [
+          "ok"
+        ],
+        "wall_s": {
+          "n": 3,
+          "median": 4.32,
+          "min": 4.27,
+          "max": 4.48,
+          "spread": 0.0486
+        },
+        "cpu_s": {
+          "n": 3,
+          "median": 108.22,
+          "min": 107.94,
+          "max": 109.35,
+          "spread": 0.013
+        },
+        "effective_cores": {
+          "n": 3,
+          "median": 24.99,
+          "min": 24.41,
+          "max": 25.34,
+          "spread": 0.0372
+        },
+        "phase_effective_cores": {},
+        "peak_rss_mib": {
+          "n": 3,
+          "median": 3811.414,
+          "min": 3778.418,
+          "max": 3869.652,
+          "spread": 0.0239
+        },
+        "convert_s": {
+          "n": 3,
+          "median": 1.316,
+          "min": 1.314,
+          "max": 1.335,
+          "spread": 0.0161
+        },
+        "export_s": {
+          "n": 3,
+          "median": 2.859,
+          "min": 2.83,
+          "max": 3.005,
+          "spread": 0.0611
+        },
+        "true_peak_mib": {
+          "n": 3,
+          "median": 3807.152,
+          "min": 3783.504,
+          "max": 3875.938,
+          "spread": 0.0243
+        },
+        "pass2_s": {
+          "n": 3,
+          "median": 0.87,
+          "min": 0.866,
+          "max": 0.885,
+          "spread": 0.0213
+        },
+        "writer_finish_s": {
+          "n": 3,
+          "median": 0.003,
+          "min": 0.003,
+          "max": 0.003,
+          "spread": 0.0138
+        },
+        "gate_disk_mbps": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": null
+        },
+        "device_write_mib": {
+          "n": 3,
+          "median": 87.4,
+          "min": 87.4,
+          "max": 87.4,
+          "spread": 0.0
+        },
+        "watch_peak_mib": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "foreign_cores_max": 0.0,
+        "context_cores": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "outputs": [
+          "5e28169bc423d99919956705a376d9335d72f3ebc159c0bbf787f47b6f113a94"
+        ],
+        "output_bytes": [
+          91524458
+        ]
+      },
+      "head": {
+        "allocator": "mimalloc",
+        "statuses": [
+          "ok"
+        ],
+        "wall_s": {
+          "n": 3,
+          "median": 4.34,
+          "min": 4.34,
+          "max": 4.4,
+          "spread": 0.0138
+        },
+        "cpu_s": {
+          "n": 3,
+          "median": 108.17,
+          "min": 107.69,
+          "max": 109.48,
+          "spread": 0.0165
+        },
+        "effective_cores": {
+          "n": 3,
+          "median": 24.88,
+          "min": 24.81,
+          "max": 24.92,
+          "spread": 0.0044
+        },
+        "phase_effective_cores": {
+          "convert/assignment+budget (winner tables)": {
+            "n": 3,
+            "median": 2.575,
+            "min": 2.328,
+            "max": 2.62,
+            "spread": 0.1135
+          },
+          "convert/pass1 scan": {
+            "n": 3,
+            "median": 13.007,
+            "min": 12.952,
+            "max": 13.125,
+            "spread": 0.0133
+          },
+          "convert/pass2 (output sink)": {
+            "n": 3,
+            "median": 20.153,
+            "min": 19.93,
+            "max": 20.153,
+            "spread": 0.0111
+          },
+          "convert/pre-pass2 (winner tables freed)": {
+            "n": 3,
+            "median": 0.999,
+            "min": 0.999,
+            "max": 1.0,
+            "spread": 0.0004
+          },
+          "convert/preflight": {
+            "n": 3,
+            "median": 1.736,
+            "min": 1.714,
+            "max": 1.76,
+            "spread": 0.0267
+          },
+          "convert/writer.finish": {
+            "n": 3,
+            "median": 1.0,
+            "min": 1.0,
+            "max": 1.0,
+            "spread": 0.0001
+          },
+          "export/finalize": {
+            "n": 3,
+            "median": 0.269,
+            "min": 0.22,
+            "max": 0.317,
+            "spread": 0.3638
+          },
+          "export/levels": {
+            "n": 3,
+            "median": 31.172,
+            "min": 30.93,
+            "max": 31.357,
+            "spread": 0.0137
+          },
+          "export/scan": {
+            "n": 3,
+            "median": 40.524,
+            "min": 39.007,
+            "max": 40.964,
+            "spread": 0.0483
+          }
+        },
+        "peak_rss_mib": {
+          "n": 3,
+          "median": 3830.805,
+          "min": 3632.953,
+          "max": 3867.789,
+          "spread": 0.0613
+        },
+        "convert_s": {
+          "n": 3,
+          "median": 1.325,
+          "min": 1.319,
+          "max": 1.355,
+          "spread": 0.0265
+        },
+        "export_s": {
+          "n": 3,
+          "median": 2.884,
+          "min": 2.846,
+          "max": 2.947,
+          "spread": 0.0348
+        },
+        "true_peak_mib": {
+          "n": 3,
+          "median": 3828.047,
+          "min": 3638.809,
+          "max": 3873.523,
+          "spread": 0.0613
+        },
+        "pass2_s": {
+          "n": 3,
+          "median": 0.878,
+          "min": 0.872,
+          "max": 0.88,
+          "spread": 0.0085
+        },
+        "writer_finish_s": {
+          "n": 3,
+          "median": 0.003,
+          "min": 0.003,
+          "max": 0.004,
+          "spread": 0.0503
+        },
+        "gate_disk_mbps": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": null
+        },
+        "device_write_mib": {
+          "n": 3,
+          "median": 87.4,
+          "min": 87.4,
+          "max": 87.4,
+          "spread": 0.0
+        },
+        "watch_peak_mib": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "foreign_cores_max": 0.01,
+        "context_cores": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "outputs": [
+          "5e28169bc423d99919956705a376d9335d72f3ebc159c0bbf787f47b6f113a94"
+        ],
+        "output_bytes": [
+          91524458
+        ]
+      }
+    },
+    "polygons-mt": {
+      "main": {
+        "allocator": "mimalloc",
+        "statuses": [
+          "ok"
+        ],
+        "wall_s": {
+          "n": 3,
+          "median": 60.54,
+          "min": 60.36,
+          "max": 63.85,
+          "spread": 0.0576
+        },
+        "cpu_s": {
+          "n": 3,
+          "median": 1170.21,
+          "min": 1166.15,
+          "max": 1177.41,
+          "spread": 0.0096
+        },
+        "effective_cores": {
+          "n": 3,
+          "median": 19.26,
+          "min": 18.44,
+          "max": 19.39,
+          "spread": 0.0493
+        },
+        "phase_effective_cores": {},
+        "peak_rss_mib": {
+          "n": 3,
+          "median": 4805.836,
+          "min": 4700.219,
+          "max": 4831.086,
+          "spread": 0.0272
+        },
+        "convert_s": {
+          "n": 3,
+          "median": 19.911,
+          "min": 19.849,
+          "max": 19.922,
+          "spread": 0.0037
+        },
+        "export_s": {
+          "n": 3,
+          "median": 40.416,
+          "min": 40.165,
+          "max": 43.664,
+          "spread": 0.0866
+        },
+        "true_peak_mib": {
+          "n": 3,
+          "median": 4808.344,
+          "min": 4685.969,
+          "max": 4819.012,
+          "spread": 0.0277
+        },
+        "pass2_s": {
+          "n": 3,
+          "median": 17.518,
+          "min": 17.461,
+          "max": 17.521,
+          "spread": 0.0034
+        },
+        "writer_finish_s": {
+          "n": 3,
+          "median": 0.027,
+          "min": 0.025,
+          "max": 0.054,
+          "spread": 1.0954
+        },
+        "gate_disk_mbps": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": null
+        },
+        "device_write_mib": {
+          "n": 3,
+          "median": 1154.9,
+          "min": 1075.2,
+          "max": 1155.0,
+          "spread": 0.0691
+        },
+        "watch_peak_mib": {
+          "n": 3,
+          "median": 6873.1,
+          "min": 6873.1,
+          "max": 6873.1,
+          "spread": 0.0
+        },
+        "foreign_cores_max": 0.0,
+        "context_cores": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "outputs": [
+          "20946f2f5f0a273f2ed772b88cc3f6daa8c8ae9ae5222922483a5e821a9536a3"
+        ],
+        "output_bytes": [
+          874944396
+        ]
+      },
+      "head": {
+        "allocator": "mimalloc",
+        "statuses": [
+          "ok"
+        ],
+        "wall_s": {
+          "n": 3,
+          "median": 62.02,
+          "min": 61.11,
+          "max": 62.21,
+          "spread": 0.0177
+        },
+        "cpu_s": {
+          "n": 3,
+          "median": 1166.87,
+          "min": 1157.73,
+          "max": 1183.16,
+          "spread": 0.0218
+        },
+        "effective_cores": {
+          "n": 3,
+          "median": 18.76,
+          "min": 18.67,
+          "max": 19.36,
+          "spread": 0.0368
+        },
+        "phase_effective_cores": {
+          "convert/assignment+budget (winner tables)": {
+            "n": 3,
+            "median": 1.853,
+            "min": 1.819,
+            "max": 1.923,
+            "spread": 0.0562
+          },
+          "convert/pass1 scan": {
+            "n": 3,
+            "median": 26.223,
+            "min": 25.981,
+            "max": 26.321,
+            "spread": 0.0129
+          },
+          "convert/pass2 (output sink)": {
+            "n": 3,
+            "median": 11.508,
+            "min": 11.471,
+            "max": 11.589,
+            "spread": 0.0103
+          },
+          "convert/pre-pass2 (winner tables freed)": {
+            "n": 3,
+            "median": 1.0,
+            "min": 1.0,
+            "max": 1.0,
+            "spread": 0.0001
+          },
+          "convert/preflight": {
+            "n": 3,
+            "median": 1.609,
+            "min": 1.572,
+            "max": 1.615,
+            "spread": 0.0268
+          },
+          "convert/writer.finish": {
+            "n": 3,
+            "median": 1.0,
+            "min": 1.0,
+            "max": 1.115,
+            "spread": 0.1147
+          },
+          "export/finalize": {
+            "n": 3,
+            "median": 0.129,
+            "min": 0.116,
+            "max": 0.15,
+            "spread": 0.2623
+          },
+          "export/levels": {
+            "n": 3,
+            "median": 24.081,
+            "min": 23.717,
+            "max": 24.267,
+            "spread": 0.0228
+          },
+          "export/scan": {
+            "n": 3,
+            "median": 43.172,
+            "min": 43.038,
+            "max": 43.914,
+            "spread": 0.0203
+          }
+        },
+        "peak_rss_mib": {
+          "n": 3,
+          "median": 4824.566,
+          "min": 4724.98,
+          "max": 4908.289,
+          "spread": 0.038
+        },
+        "convert_s": {
+          "n": 3,
+          "median": 20.004,
+          "min": 19.849,
+          "max": 20.034,
+          "spread": 0.0093
+        },
+        "export_s": {
+          "n": 3,
+          "median": 41.714,
+          "min": 40.643,
+          "max": 42.092,
+          "spread": 0.0347
+        },
+        "true_peak_mib": {
+          "n": 3,
+          "median": 4804.895,
+          "min": 4722.258,
+          "max": 4920.266,
+          "spread": 0.0412
+        },
+        "pass2_s": {
+          "n": 3,
+          "median": 17.598,
+          "min": 17.489,
+          "max": 17.657,
+          "spread": 0.0095
+        },
+        "writer_finish_s": {
+          "n": 3,
+          "median": 0.025,
+          "min": 0.025,
+          "max": 0.026,
+          "spread": 0.0524
+        },
+        "gate_disk_mbps": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": null
+        },
+        "device_write_mib": {
+          "n": 3,
+          "median": 1194.9,
+          "min": 1154.9,
+          "max": 1215.0,
+          "spread": 0.0503
+        },
+        "watch_peak_mib": {
+          "n": 3,
+          "median": 6873.1,
+          "min": 6873.1,
+          "max": 6873.1,
+          "spread": 0.0
+        },
+        "foreign_cores_max": 0.0,
+        "context_cores": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "outputs": [
+          "20946f2f5f0a273f2ed772b88cc3f6daa8c8ae9ae5222922483a5e821a9536a3"
+        ],
+        "output_bytes": [
+          874944396
+        ]
+      }
+    },
+    "tiles-madagascar": {
+      "main": {
+        "allocator": "mimalloc",
+        "statuses": [
+          "ok"
+        ],
+        "wall_s": {
+          "n": 3,
+          "median": 1.14,
+          "min": 1.11,
+          "max": 1.15,
+          "spread": 0.0351
+        },
+        "cpu_s": {
+          "n": 3,
+          "median": 11.79,
+          "min": 11.75,
+          "max": 11.83,
+          "spread": 0.0068
+        },
+        "effective_cores": {
+          "n": 3,
+          "median": 10.31,
+          "min": 10.29,
+          "max": 10.62,
+          "spread": 0.032
+        },
+        "phase_effective_cores": {},
+        "peak_rss_mib": {
+          "n": 3,
+          "median": 1311.012,
+          "min": 1308.484,
+          "max": 1322.262,
+          "spread": 0.0105
+        },
+        "convert_s": {
+          "n": 3,
+          "median": 0.684,
+          "min": 0.68,
+          "max": 0.691,
+          "spread": 0.0162
+        },
+        "export_s": {
+          "n": 3,
+          "median": 0.416,
+          "min": 0.41,
+          "max": 0.437,
+          "spread": 0.0648
+        },
+        "true_peak_mib": {
+          "n": 3,
+          "median": 1302.645,
+          "min": 1296.492,
+          "max": 1324.77,
+          "spread": 0.0217
+        },
+        "pass2_s": {
+          "n": 3,
+          "median": 0.617,
+          "min": 0.613,
+          "max": 0.625,
+          "spread": 0.019
+        },
+        "writer_finish_s": {
+          "n": 3,
+          "median": 0.001,
+          "min": 0.001,
+          "max": 0.001,
+          "spread": 0.0516
+        },
+        "gate_disk_mbps": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": null
+        },
+        "device_write_mib": {
+          "n": 3,
+          "median": 25.3,
+          "min": 25.3,
+          "max": 25.3,
+          "spread": 0.0
+        },
+        "watch_peak_mib": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "foreign_cores_max": 0.12,
+        "context_cores": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "outputs": [
+          "411dec020ef29f77a21cf0ccd875095ea22582552f09109af930fb0cacd9dd13"
+        ],
+        "output_bytes": [
+          26428618
+        ]
+      },
+      "head": {
+        "allocator": "mimalloc",
+        "statuses": [
+          "ok"
+        ],
+        "wall_s": {
+          "n": 3,
+          "median": 1.15,
+          "min": 1.15,
+          "max": 1.15,
+          "spread": 0.0
+        },
+        "cpu_s": {
+          "n": 3,
+          "median": 11.75,
+          "min": 11.65,
+          "max": 11.84,
+          "spread": 0.0162
+        },
+        "effective_cores": {
+          "n": 3,
+          "median": 10.22,
+          "min": 10.13,
+          "max": 10.3,
+          "spread": 0.0166
+        },
+        "phase_effective_cores": {
+          "convert/assignment+budget (winner tables)": {
+            "n": 3,
+            "median": 11.669,
+            "min": 11.125,
+            "max": 11.845,
+            "spread": 0.0617
+          },
+          "convert/pass1 scan": {
+            "n": 3,
+            "median": 4.538,
+            "min": 4.516,
+            "max": 4.654,
+            "spread": 0.0304
+          },
+          "convert/pass2 (output sink)": {
+            "n": 3,
+            "median": 3.311,
+            "min": 3.301,
+            "max": 3.358,
+            "spread": 0.0172
+          },
+          "convert/pre-pass2 (winner tables freed)": {
+            "n": 3,
+            "median": 0.999,
+            "min": 0.999,
+            "max": 0.999,
+            "spread": 0.0
+          },
+          "convert/preflight": {
+            "n": 3,
+            "median": 1.695,
+            "min": 1.644,
+            "max": 1.725,
+            "spread": 0.0474
+          },
+          "convert/writer.finish": {
+            "n": 3,
+            "median": 1.0,
+            "min": 1.0,
+            "max": 1.001,
+            "spread": 0.0013
+          },
+          "export/finalize": {
+            "n": 3,
+            "median": 0.267,
+            "min": 0.184,
+            "max": 0.289,
+            "spread": 0.3916
+          },
+          "export/levels": {
+            "n": 3,
+            "median": 22.596,
+            "min": 22.514,
+            "max": 24.255,
+            "spread": 0.077
+          },
+          "export/scan": {
+            "n": 3,
+            "median": 36.055,
+            "min": 35.741,
+            "max": 36.062,
+            "spread": 0.0089
+          }
+        },
+        "peak_rss_mib": {
+          "n": 3,
+          "median": 1339.918,
+          "min": 1336.543,
+          "max": 1432.5,
+          "spread": 0.0716
+        },
+        "convert_s": {
+          "n": 3,
+          "median": 0.689,
+          "min": 0.682,
+          "max": 0.69,
+          "spread": 0.0119
+        },
+        "export_s": {
+          "n": 3,
+          "median": 0.432,
+          "min": 0.432,
+          "max": 0.44,
+          "spread": 0.0184
+        },
+        "true_peak_mib": {
+          "n": 3,
+          "median": 1336.891,
+          "min": 1314.641,
+          "max": 1434.805,
+          "spread": 0.0899
+        },
+        "pass2_s": {
+          "n": 3,
+          "median": 0.621,
+          "min": 0.615,
+          "max": 0.623,
+          "spread": 0.013
+        },
+        "writer_finish_s": {
+          "n": 3,
+          "median": 0.001,
+          "min": 0.001,
+          "max": 0.001,
+          "spread": 0.0451
+        },
+        "gate_disk_mbps": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": null
+        },
+        "device_write_mib": {
+          "n": 3,
+          "median": 25.3,
+          "min": 25.3,
+          "max": 25.3,
+          "spread": 0.0
+        },
+        "watch_peak_mib": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "foreign_cores_max": 0.0,
+        "context_cores": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "outputs": [
+          "411dec020ef29f77a21cf0ccd875095ea22582552f09109af930fb0cacd9dd13"
+        ],
+        "output_bytes": [
+          26428618
+        ]
+      }
+    },
+    "tiles-nz": {
+      "main": {
+        "allocator": "mimalloc",
+        "statuses": [
+          "ok"
+        ],
+        "wall_s": {
+          "n": 3,
+          "median": 53.05,
+          "min": 52.78,
+          "max": 53.4,
+          "spread": 0.0117
+        },
+        "cpu_s": {
+          "n": 3,
+          "median": 1107.82,
+          "min": 1100.0,
+          "max": 1107.92,
+          "spread": 0.0071
+        },
+        "effective_cores": {
+          "n": 3,
+          "median": 20.75,
+          "min": 20.74,
+          "max": 20.99,
+          "spread": 0.012
+        },
+        "phase_effective_cores": {},
+        "peak_rss_mib": {
+          "n": 3,
+          "median": 10091.801,
+          "min": 10034.824,
+          "max": 10095.523,
+          "spread": 0.006
+        },
+        "convert_s": {
+          "n": 3,
+          "median": 8.57,
+          "min": 8.563,
+          "max": 8.605,
+          "spread": 0.005
+        },
+        "export_s": {
+          "n": 3,
+          "median": 44.056,
+          "min": 43.759,
+          "max": 44.416,
+          "spread": 0.0149
+        },
+        "true_peak_mib": {
+          "n": 3,
+          "median": 9988.723,
+          "min": 9948.531,
+          "max": 10060.547,
+          "spread": 0.0112
+        },
+        "pass2_s": {
+          "n": 3,
+          "median": 6.05,
+          "min": 6.027,
+          "max": 6.095,
+          "spread": 0.0112
+        },
+        "writer_finish_s": {
+          "n": 3,
+          "median": 0.04,
+          "min": 0.039,
+          "max": 0.066,
+          "spread": 0.69
+        },
+        "gate_disk_mbps": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": null
+        },
+        "device_write_mib": {
+          "n": 3,
+          "median": 1327.0,
+          "min": 1255.2,
+          "max": 1375.2,
+          "spread": 0.0904
+        },
+        "watch_peak_mib": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "foreign_cores_max": 0.0,
+        "context_cores": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "outputs": [
+          "01623db10367598413b296da6217781d2701078874b31c4e8717e37d16724c92"
+        ],
+        "output_bytes": [
+          1164669347
+        ]
+      },
+      "head": {
+        "allocator": "mimalloc",
+        "statuses": [
+          "ok"
+        ],
+        "wall_s": {
+          "n": 3,
+          "median": 53.34,
+          "min": 52.96,
+          "max": 59.14,
+          "spread": 0.1159
+        },
+        "cpu_s": {
+          "n": 3,
+          "median": 1100.23,
+          "min": 1095.27,
+          "max": 1101.75,
+          "spread": 0.0059
+        },
+        "effective_cores": {
+          "n": 3,
+          "median": 20.66,
+          "min": 18.52,
+          "max": 20.77,
+          "spread": 0.1089
+        },
+        "phase_effective_cores": {
+          "convert/assignment+budget (winner tables)": {
+            "n": 3,
+            "median": 2.036,
+            "min": 1.986,
+            "max": 2.069,
+            "spread": 0.0407
+          },
+          "convert/pass1 scan": {
+            "n": 3,
+            "median": 19.035,
+            "min": 18.961,
+            "max": 19.102,
+            "spread": 0.0074
+          },
+          "convert/pass2 (output sink)": {
+            "n": 3,
+            "median": 24.016,
+            "min": 23.757,
+            "max": 24.098,
+            "spread": 0.0142
+          },
+          "convert/pre-pass2 (winner tables freed)": {
+            "n": 3,
+            "median": 1.0,
+            "min": 1.0,
+            "max": 1.0,
+            "spread": 0.0002
+          },
+          "convert/preflight": {
+            "n": 3,
+            "median": 1.6,
+            "min": 1.597,
+            "max": 1.6,
+            "spread": 0.0018
+          },
+          "convert/writer.finish": {
+            "n": 3,
+            "median": 1.0,
+            "min": 1.0,
+            "max": 1.0,
+            "spread": 0.0
+          },
+          "export/finalize": {
+            "n": 3,
+            "median": 0.194,
+            "min": 0.113,
+            "max": 0.276,
+            "spread": 0.8424
+          },
+          "export/levels": {
+            "n": 3,
+            "median": 23.961,
+            "min": 23.938,
+            "max": 24.187,
+            "spread": 0.0104
+          },
+          "export/scan": {
+            "n": 3,
+            "median": 42.688,
+            "min": 42.539,
+            "max": 43.165,
+            "spread": 0.0147
+          }
+        },
+        "peak_rss_mib": {
+          "n": 3,
+          "median": 10084.004,
+          "min": 10060.102,
+          "max": 10119.754,
+          "spread": 0.0059
+        },
+        "convert_s": {
+          "n": 3,
+          "median": 8.534,
+          "min": 8.44,
+          "max": 8.634,
+          "spread": 0.0227
+        },
+        "export_s": {
+          "n": 3,
+          "median": 44.296,
+          "min": 44.1,
+          "max": 50.021,
+          "spread": 0.1337
+        },
+        "true_peak_mib": {
+          "n": 3,
+          "median": 10027.098,
+          "min": 9978.969,
+          "max": 10084.008,
+          "spread": 0.0105
+        },
+        "pass2_s": {
+          "n": 3,
+          "median": 6.008,
+          "min": 5.997,
+          "max": 6.075,
+          "spread": 0.013
+        },
+        "writer_finish_s": {
+          "n": 3,
+          "median": 0.039,
+          "min": 0.038,
+          "max": 0.04,
+          "spread": 0.0674
+        },
+        "gate_disk_mbps": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": null
+        },
+        "device_write_mib": {
+          "n": 3,
+          "median": 1399.8,
+          "min": 1367.5,
+          "max": 2823.4,
+          "spread": 1.0401
+        },
+        "watch_peak_mib": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "foreign_cores_max": 0.0,
+        "context_cores": {
+          "n": 0,
+          "median": null,
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "outputs": [
+          "01623db10367598413b296da6217781d2701078874b31c4e8717e37d16724c92"
+        ],
+        "output_bytes": [
+          1164669347
+        ]
+      }
+    }
+  }
+}

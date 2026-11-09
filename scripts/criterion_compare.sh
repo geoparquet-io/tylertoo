@@ -22,16 +22,14 @@
 #   python3 scripts/criterion_gate.py --check \
 #     --criterion-dir target/criterion-compare --baseline base
 #
-# This file is the single list of gated benches. `assign_scaling` is left out
-# on purpose: it is a wall-clock thread-scaling harness, not criterion.
-# A new bench here also wants an entry in scripts/codspeed_benches.sh, which
-# maps source paths to these names for CodSpeed's per-PR selection.
+# The gated set is the weekly list from crates/core/benches/benches.toml minus
+# the [weekly] exemptions in ci/exemptions.toml (scripts/bench_list.py).
 set -euo pipefail
 
-BENCHES="${CRITERION_BENCHES:-clipping bbox_containment pass1_decode assign simplify_cascade mvt_encode tile_compress_dedup pipeline coverage_fill}"
+BENCHES="${CRITERION_BENCHES:-$("$(dirname "$0")/bench_list.py" weekly)}"
 
 if [ $# -lt 1 ]; then
-  sed -n '2,25p' "$0"
+  sed -n '2,26p' "$0"
   exit 2
 fi
 if [ "$1" = "--list" ]; then

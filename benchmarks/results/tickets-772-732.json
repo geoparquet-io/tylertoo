@@ -1,0 +1,437 @@
+{
+ "provenance": {
+  "commit": "ae0363f",
+  "tylertoo_version": "tylertoo 0.8.0",
+  "host": "aarch64, Neoverse-V1",
+  "nproc": 64,
+  "kernel": "7.0.0-1014-aws",
+  "allocator": "mimalloc",
+  "tool_versions": {},
+  "inputs": [
+   {
+    "name": "moldova-hilbert.parquet",
+    "sha256": "06bddb7a42283812c1032d85a6b138daf198b1b46592ba96ad84cbe09a12e5f5"
+   },
+   {
+    "name": "nz-parcels-hilbert.parquet",
+    "sha256": "3a8336ce71d623c44eee44e1226ce87052e13950d2918f4e91a9b75e80bb7998"
+   }
+  ],
+  "date": "2026-11-06"
+ },
+ "method": "benchmarks/tickets/remeasure_772_732.sh: 3 interleaved rounds per cell, warm cache, sync and delete outputs between runs; caps via systemd-run --user --scope -p MemoryMax=<cap> -p MemorySwapMax=0",
+ "runs": [
+  {
+   "cell": "mold-default",
+   "cap": "none",
+   "rc": 0,
+   "wall_s": 4.47,
+   "peak_rss_mib": 3825,
+   "sha": "5e28169bc423d999",
+   "partition_wave_width": 64,
+   "waves_total": 13,
+   "wave_widths": [
+    64
+   ]
+  },
+  {
+   "cell": "mold-factor0",
+   "cap": "none",
+   "rc": 0,
+   "wall_s": 18.23,
+   "peak_rss_mib": 6355,
+   "sha": "4df1b8e1b56455f2",
+   "partition_wave_width": 64,
+   "waves_total": 13,
+   "wave_widths": [
+    64
+   ]
+  },
+  {
+   "cell": "mold-default",
+   "cap": "none",
+   "rc": 0,
+   "wall_s": 4.35,
+   "peak_rss_mib": 3780,
+   "sha": "5e28169bc423d999",
+   "partition_wave_width": 64,
+   "waves_total": 13,
+   "wave_widths": [
+    64
+   ]
+  },
+  {
+   "cell": "mold-factor0",
+   "cap": "none",
+   "rc": 0,
+   "wall_s": 17.84,
+   "peak_rss_mib": 6260,
+   "sha": "4df1b8e1b56455f2",
+   "partition_wave_width": 64,
+   "waves_total": 13,
+   "wave_widths": [
+    64
+   ]
+  },
+  {
+   "cell": "mold-default",
+   "cap": "none",
+   "rc": 0,
+   "wall_s": 4.52,
+   "peak_rss_mib": 3759,
+   "sha": "5e28169bc423d999",
+   "partition_wave_width": 64,
+   "waves_total": 13,
+   "wave_widths": [
+    64
+   ]
+  },
+  {
+   "cell": "mold-factor0",
+   "cap": "none",
+   "rc": 0,
+   "wall_s": 17.27,
+   "peak_rss_mib": 6307,
+   "sha": "4df1b8e1b56455f2",
+   "partition_wave_width": 64,
+   "waves_total": 13,
+   "wave_widths": [
+    64
+   ]
+  },
+  {
+   "cell": "nz-auto-nocap",
+   "cap": "none",
+   "rc": 0,
+   "wall_s": 53.23,
+   "peak_rss_mib": 10008,
+   "sha": "01623db103675984",
+   "partition_wave_width": 64,
+   "waves_total": 22,
+   "wave_widths": [
+    64
+   ]
+  },
+  {
+   "cell": "nz-auto-16G",
+   "cap": "16G",
+   "rc": 0,
+   "wall_s": 100.61,
+   "peak_rss_mib": 6229,
+   "sha": "01623db103675984",
+   "partition_wave_width": 64,
+   "waves_total": 53,
+   "wave_widths": [
+    8,
+    9,
+    11,
+    15,
+    18,
+    25,
+    27,
+    36,
+    64
+   ]
+  },
+  {
+   "cell": "nz-auto-8G",
+   "cap": "8G",
+   "rc": 0,
+   "wall_s": 153.92,
+   "peak_rss_mib": 4598,
+   "sha": "01623db103675984",
+   "partition_wave_width": 45,
+   "waves_total": 102,
+   "wave_widths": [
+    4,
+    5,
+    7,
+    8,
+    12,
+    13,
+    17,
+    36,
+    45
+   ]
+  },
+  {
+   "cell": "nz-w16-16G",
+   "cap": "16G",
+   "rc": 0,
+   "wall_s": 93.3,
+   "peak_rss_mib": 9235,
+   "sha": "01623db103675984",
+   "partition_wave_width": 16,
+   "waves_total": 53,
+   "wave_widths": [
+    16
+   ]
+  },
+  {
+   "cell": "nz-w64-16G",
+   "cap": "16G",
+   "rc": 0,
+   "wall_s": 102.84,
+   "peak_rss_mib": 4878,
+   "sha": "01623db103675984",
+   "partition_wave_width": 64,
+   "waves_total": 22,
+   "wave_widths": [
+    64
+   ]
+  },
+  {
+   "cell": "nz-auto-nocap",
+   "cap": "none",
+   "rc": 0,
+   "wall_s": 50.59,
+   "peak_rss_mib": 10083,
+   "sha": "01623db103675984",
+   "partition_wave_width": 64,
+   "waves_total": 22,
+   "wave_widths": [
+    64
+   ]
+  },
+  {
+   "cell": "nz-auto-16G",
+   "cap": "16G",
+   "rc": 0,
+   "wall_s": 99.02,
+   "peak_rss_mib": 6281,
+   "sha": "01623db103675984",
+   "partition_wave_width": 64,
+   "waves_total": 52,
+   "wave_widths": [
+    8,
+    9,
+    11,
+    15,
+    18,
+    26,
+    28,
+    37,
+    64
+   ]
+  },
+  {
+   "cell": "nz-auto-8G",
+   "cap": "8G",
+   "rc": 0,
+   "wall_s": 152.64,
+   "peak_rss_mib": 4389,
+   "sha": "01623db103675984",
+   "partition_wave_width": 43,
+   "waves_total": 103,
+   "wave_widths": [
+    4,
+    5,
+    7,
+    8,
+    12,
+    16,
+    35,
+    43
+   ]
+  },
+  {
+   "cell": "nz-w16-16G",
+   "cap": "16G",
+   "rc": 0,
+   "wall_s": 90.11,
+   "peak_rss_mib": 9336,
+   "sha": "01623db103675984",
+   "partition_wave_width": 16,
+   "waves_total": 53,
+   "wave_widths": [
+    16
+   ]
+  },
+  {
+   "cell": "nz-w64-16G",
+   "cap": "16G",
+   "rc": 0,
+   "wall_s": 105.66,
+   "peak_rss_mib": 4864,
+   "sha": "01623db103675984",
+   "partition_wave_width": 64,
+   "waves_total": 22,
+   "wave_widths": [
+    64
+   ]
+  },
+  {
+   "cell": "nz-auto-nocap",
+   "cap": "none",
+   "rc": 0,
+   "wall_s": 50.18,
+   "peak_rss_mib": 10107,
+   "sha": "01623db103675984",
+   "partition_wave_width": 64,
+   "waves_total": 22,
+   "wave_widths": [
+    64
+   ]
+  },
+  {
+   "cell": "nz-auto-16G",
+   "cap": "16G",
+   "rc": 0,
+   "wall_s": 102.82,
+   "peak_rss_mib": 6385,
+   "sha": "01623db103675984",
+   "partition_wave_width": 64,
+   "waves_total": 48,
+   "wave_widths": [
+    9,
+    10,
+    12,
+    16,
+    19,
+    28,
+    29,
+    39,
+    64
+   ]
+  },
+  {
+   "cell": "nz-auto-8G",
+   "cap": "8G",
+   "rc": 0,
+   "wall_s": 156.33,
+   "peak_rss_mib": 4668,
+   "sha": "01623db103675984",
+   "partition_wave_width": 45,
+   "waves_total": 102,
+   "wave_widths": [
+    4,
+    5,
+    7,
+    8,
+    12,
+    13,
+    17,
+    36,
+    45
+   ]
+  },
+  {
+   "cell": "nz-w16-16G",
+   "cap": "16G",
+   "rc": 0,
+   "wall_s": 94.01,
+   "peak_rss_mib": 9304,
+   "sha": "01623db103675984",
+   "partition_wave_width": 16,
+   "waves_total": 53,
+   "wave_widths": [
+    16
+   ]
+  },
+  {
+   "cell": "nz-w64-16G",
+   "cap": "16G",
+   "rc": 0,
+   "wall_s": 104.08,
+   "peak_rss_mib": 4870,
+   "sha": "01623db103675984",
+   "partition_wave_width": 64,
+   "waves_total": 22,
+   "wave_widths": [
+    64
+   ]
+  }
+ ],
+ "last_run_phases": {
+  "nz-auto-nocap": {
+   "convert_phase_walls": {
+    "assign": 1.393581956,
+    "pass1": 0.828162897,
+    "pass2": 6.027416888,
+    "total": 8.537058933,
+    "writer_finish": 0.040396697
+   },
+   "export_phase_walls": {
+    "fill": 0.0,
+    "finalize": 4.508047522,
+    "levels": 33.999155618,
+    "probe": 0.0,
+    "scan": 2.160620691,
+    "total": 41.024195319
+   },
+   "export_spill_write_s": 0.0
+  },
+  "nz-auto-16G": {
+   "convert_phase_walls": {
+    "assign": 1.419896107,
+    "pass1": 0.716337421,
+    "pass2": 36.901394651,
+    "total": 39.180110619,
+    "writer_finish": 0.036054585
+   },
+   "export_phase_walls": {
+    "fill": 0.0,
+    "finalize": 1.53107194,
+    "levels": 59.422373585,
+    "probe": 0.0,
+    "scan": 2.108772617,
+    "total": 63.224611766
+   },
+   "export_spill_write_s": 9.997587612
+  },
+  "nz-auto-8G": {
+   "convert_phase_walls": {
+    "assign": 1.407250391,
+    "pass1": 0.634712171,
+    "pass2": 57.000528957,
+    "total": 59.175660947,
+    "writer_finish": 0.033862585
+   },
+   "export_phase_walls": {
+    "fill": 0.0,
+    "finalize": 0.503466815,
+    "levels": 94.240637173,
+    "probe": 0.0,
+    "scan": 2.13782743,
+    "total": 96.994767372
+   },
+   "export_spill_write_s": 19.120607368
+  },
+  "nz-w16-16G": {
+   "convert_phase_walls": {
+    "assign": 1.423588606,
+    "pass1": 0.714486276,
+    "pass2": 37.501103567,
+    "total": 39.800555441,
+    "writer_finish": 0.053429326
+   },
+   "export_phase_walls": {
+    "fill": 0.0,
+    "finalize": 4.544479436,
+    "levels": 46.684721633,
+    "probe": 0.0,
+    "scan": 2.130910563,
+    "total": 53.830713472
+   },
+   "export_spill_write_s": 1.192e-06
+  },
+  "nz-w64-16G": {
+   "convert_phase_walls": {
+    "assign": 1.422303085,
+    "pass1": 0.711955572,
+    "pass2": 35.233123196,
+    "total": 37.536543541,
+    "writer_finish": 0.036207382
+   },
+   "export_phase_walls": {
+    "fill": 0.0,
+    "finalize": 0.759787225,
+    "levels": 63.17618389,
+    "probe": 0.0,
+    "scan": 2.149001028,
+    "total": 66.189625327
+   },
+   "export_spill_write_s": 15.152312136
+  }
+ }
+}

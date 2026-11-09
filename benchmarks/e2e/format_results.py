@@ -1,226 +1,42 @@
 #!/usr/bin/env python3
+"""Shim: the renderers live in scripts/gen_bench_docs.py (#810).
+
+    python3 format_results.py [results file, default benchmarks/results/e2e-fixtures.json] [--section NAME] [--dataset ID]
+
+Prints the tables a results file would put in the docs; the docs themselves
+are rewritten by `uv run python scripts/gen_bench_docs.py`.
 """
-format_results.py — turn results.json into the tables RESULTS.md carries.
-
-Kept separate from run_e2e.py so the numbers in RESULTS.md are regenerated
-from the recorded run rather than retyped. Retyped benchmark numbers drift,
-and a drifted number is indistinguishable from a dishonest one.
-
-    python3 format_results.py                         # the committed results.json
-    python3 format_results.py results-<stamp>.json    # an ad-hoc run
-    python3 format_results.py results.json --section headline
-"""
-
-from __future__ import annotations
 
 import argparse
 import json
 import sys
 from pathlib import Path
 
-
-def s(v, unit="s", nd=2):
-    return "—" if v is None else f"{v:.{nd}f} {unit}"
-
-
-def mb(v):
-    return "—" if not v else f"{v / 1024**2:.0f} MB"
-
-
-def mbf(v, nd=1):
-    return "—" if not v else f"{v / 1024**2:.{nd}f} MB"
-
-
-def headline(r) -> str:
-    out = ["| dataset | features | tylertoo (parquet→pmtiles) | tippecanoe e2e "
-           "(convert+tile) | tippecanoe tile-only (fgb in) | e2e | tile-only |",
-           "|---|---|---|---|---|---|---|"]
-    for did, e in r["datasets"].items():
-        feats = (e.get("tylertoo", {}).get("phases", {}) or {}).get("input_features")
-        out.append(
-            f"| `{did}` | {feats:,} | {s(e['tylertoo']['wall_median_s'])} "
-            f"| {s(e['tippecanoe_e2e']['wall_median_s'])} "
-            f"| {s(e['tippecanoe_fgb']['wall_median_s'])} "
-            f"| **{e['ratios']['e2e_speedup']:.1f}×** "
-            f"| **{e['ratios']['tiles_only_speedup']:.1f}×** |")
-    return "\n".join(out)
-
-
-def quality_matched(r) -> str:
-    """The comparison to quote when output parity matters more than defaults."""
-    rows = [(did, e) for did, e in r["datasets"].items()
-            if e.get("tylertoo_quality_matched")]
-    if not rows:
-        return ("_(no quality-matched runs in this results file; re-run with "
-                "`--quality-matched`)_")
-    out = ["| dataset | tylertoo default | tylertoo quality-matched "
-           "| tippecanoe tile-only | tile-only speedup, matched "
-           "| tylertoo tiles (default → matched) | tippecanoe tiles "
-           "| archive, matched | archive ratio |",
-           "|---|---|---|---|---|---|---|---|---|"]
-    for did, e in rows:
-        qm = e["tylertoo_quality_matched"]
-        d_tiles = (e["tylertoo"].get("per_zoom") or {}).get("tiles_total")
-        q_tiles = (qm.get("per_zoom") or {}).get("tiles_total")
-        p_tiles = (e["tippecanoe_fgb"].get("per_zoom") or {}).get("tiles_total")
-        out.append(
-            f"| `{did}` | {s(e['tylertoo']['wall_median_s'])} "
-            f"| {s(qm['wall_median_s'])} "
-            f"| {s(e['tippecanoe_fgb']['wall_median_s'])} "
-            f"| **{e['ratios']['tiles_only_speedup_quality_matched']:.1f}×** "
-            f"| {d_tiles:,} → {q_tiles:,} | {p_tiles:,} "
-            f"| {mbf(qm['output_bytes'])} "
-            f"| {e['ratios']['archive_size_ratio_quality_matched']:.2f}× |")
-    return "\n".join(out)
-
-
-def cpu(v):
-    """CPU utilisation; >100% means multi-core. Recorded from run_e2e.py's
-    /usr/bin/time wrap (older results files predate the field)."""
-    return "—" if v is None else f"{v:.0f}%"
-
-
-def memory_and_size(r) -> str:
-    out = ["| dataset | tylertoo peak RSS | tippecanoe peak RSS | converter peak RSS "
-           "| tylertoo CPU | tippecanoe CPU "
-           "| tylertoo archive | tippecanoe archive | archive ratio |",
-           "|---|---|---|---|---|---|---|---|---|"]
-    for did, e in r["datasets"].items():
-        out.append(
-            f"| `{did}` | {mb(e['tylertoo']['peak_rss_bytes'])} "
-            f"| {mb(e['tippecanoe_fgb']['peak_rss_bytes'])} "
-            f"| {mb(e['convert_fgb'].get('peak_rss_bytes'))} "
-            f"| {cpu(e['tylertoo'].get('cpu_pct'))} "
-            f"| {cpu(e['tippecanoe_fgb'].get('cpu_pct'))} "
-            f"| {mbf(e['tylertoo']['output_bytes'])} "
-            f"| {mbf(e['tippecanoe_fgb']['output_bytes'])} "
-            f"| {e['ratios']['archive_size_ratio_tylertoo_over_tippecanoe']:.2f}× |")
-    return "\n".join(out)
-
-
-def input_cost(r) -> str:
-    out = ["| dataset | parquet in | fgb out | conversion (fastest tool) | tool "
-           "| conversion share of tippecanoe e2e | ldGeoJSON out | ldGeoJSON convert "
-           "| tippecanoe -P on ldGeoJSON |",
-           "|---|---|---|---|---|---|---|---|---|"]
-    for did, e in r["datasets"].items():
-        gj_c = e.get("convert_geojsonseq")
-        gj_t = e.get("tippecanoe_geojsonseq")
-        out.append(
-            f"| `{did}` | {mbf(e['input_bytes'])} "
-            f"| {mbf(e['convert_fgb']['output_bytes'])} "
-            f"| {s(e['convert_fgb']['wall_median_s'])} "
-            f"| `{e['convert_fgb']['tool']}` "
-            f"| {e['ratios']['input_conversion_share_of_tippecanoe_e2e'] * 100:.0f}% "
-            f"| {mbf(gj_c['output_bytes']) if gj_c else '—'} "
-            f"| {s(gj_c['wall_median_s']) if gj_c else '—'} "
-            f"| {s(gj_t['wall_median_s']) if gj_t else '—'} |")
-    return "\n".join(out)
-
-
-def phases(r) -> str:
-    out = ["| dataset | convert (parquet read + ladder) | export (MVT + archive) "
-           "| row groups read/total | tiles | tile features | oversized tiles |",
-           "|---|---|---|---|---|---|---|"]
-    for did, e in r["datasets"].items():
-        p = e["tylertoo"].get("phases") or {}
-        out.append(
-            f"| `{did}` | {s(p.get('convert_wall_s'))} | {s(p.get('export_wall_s'))} "
-            f"| {p.get('row_groups_read')}/{p.get('row_groups_total')} "
-            f"| {p.get('total_tiles'):,} | {p.get('total_tile_features'):,} "
-            f"| {p.get('oversized_tiles')} |")
-    return "\n".join(out)
-
-
-def per_zoom(r, did) -> str:
-    e = r["datasets"][did]
-    tt = (e["tylertoo"].get("per_zoom") or {}).get("by_zoom", {})
-    tp = (e["tippecanoe_fgb"].get("per_zoom") or {}).get("by_zoom", {})
-    zooms = sorted({int(z) for z in list(tt) + list(tp)})
-    out = ["| zoom | tylertoo tiles | tippecanoe tiles | tylertoo bytes "
-           "| tippecanoe bytes |", "|---|---|---|---|---|"]
-    for z in zooms:
-        a = tt.get(str(z), {})
-        b = tp.get(str(z), {})
-        out.append(f"| z{z} | {a.get('tiles', 0):,} | {b.get('tiles', 0):,} "
-                   f"| {mbf(a.get('total_bytes'), 2)} "
-                   f"| {mbf(b.get('total_bytes'), 2)} |")
-    ta = sum(v.get("tiles") or 0 for v in tt.values())
-    tb = sum(v.get("tiles") or 0 for v in tp.values())
-    out.append(f"| **total** | **{ta:,}** | **{tb:,}** | | |")
-    return "\n".join(out)
-
-
-def provenance(r) -> str:
-    m, t, p = r["machine"], r["tylertoo"], r["tippecanoe"]
-    s_ = r["settings"]
-    return "\n".join([
-        f"- **Machine** — {m.get('cpu')}, {m.get('cpu_count')} cores, "
-        f"{m.get('ram_gb')} GB RAM, {m.get('platform')}",
-        f"- **tylertoo** — {t['version']} @ `{t['git_sha']}` (release build)",
-        (f"- **tippecanoe** — {p['version']}, tag `{p['tag']}`, "
-         f"commit `{p['sha']}`, built from source by `setup_tippecanoe.sh`"
-         if p.get("sha") else
-         f"- **tippecanoe** — {p['version']}, not the `setup_tippecanoe.sh` "
-         f"build (commit unknown)"),
-        f"- **Settings** — z{s_['min_zoom']}–z{s_['max_zoom']}, tile buffer "
-        f"{s_['tile_buffer']}, per-tile cap {s_['max_tile_bytes']:,} bytes",
-        f"- **Method** — median of {s_['repeat']} timed runs after one "
-        f"discarded warm-up; warm page cache (machine load during the run is "
-        f"a caveat the write-up must state; the script cannot know it)",
-        f"- **Recorded** — {r['generated_at']} → "
-        f"`{r.get('_source_file', 'results.json')}`",
-    ])
-
-
-def dataset_flags(r) -> str:
-    """Per-dataset zoom range and recorded tippecanoe flags (corpus rows carry
-    the flags from corpus/manifest.json; fixture rows carry none)."""
-    out = ["| dataset | zooms | tippecanoe flags beyond the parity set |",
-           "|---|---|---|"]
-    for did, e in r["datasets"].items():
-        flags = " ".join(e.get("tippecanoe_dataset_flags") or []) or "—"
-        zmin = e.get("min_zoom", r["settings"]["min_zoom"])
-        zmax = e.get("max_zoom", r["settings"]["max_zoom"])
-        out.append(f"| `{did}` | z{zmin}–z{zmax} | `{flags}` |"
-                   .replace("`—`", "—"))
-    return "\n".join(out)
-
-
-SECTIONS = {
-    "headline": headline,
-    "quality-matched": quality_matched,
-    "memory": memory_and_size,
-    "input": input_cost,
-    "phases": phases,
-    "flags": dataset_flags,
-    "provenance": provenance,
-}
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+import gen_bench_docs as g  # noqa: E402
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("results", type=Path, nargs="?",
-                    default=Path(__file__).parent / "results.json")
-    ap.add_argument("--section", choices=[*SECTIONS, "per-zoom"], default=None)
+                    default=Path(__file__).resolve().parents[1] / "results" / "e2e-fixtures.json")
+    ap.add_argument("--section", choices=[*g.SECTIONS, "per-zoom"], default=None)
     ap.add_argument("--dataset", default=None, help="for --section per-zoom")
     args = ap.parse_args()
     r = json.loads(args.results.read_text())
     r["_source_file"] = args.results.name
-
+    ds = args.dataset or next(iter(r["datasets"]))
     if args.section == "per-zoom":
-        did = args.dataset or next(iter(r["datasets"]))
-        print(per_zoom(r, did))
-        return 0
-    if args.section:
-        print(SECTIONS[args.section](r))
-        return 0
-    for name, fn in SECTIONS.items():
-        print(f"\n### {name}\n")
-        print(fn(r))
-    for did in r["datasets"]:
-        print(f"\n### per-zoom: {did}\n")
-        print(per_zoom(r, did))
+        print(g.per_zoom(r, ds))
+    elif args.section:
+        print(g.RENDERERS[args.section][0](r, None))
+    else:
+        for name in g.SECTIONS:
+            print(f"\n### {name}\n")
+            print(g.RENDERERS[name][0](r, None))
+        for did in r["datasets"]:
+            print(f"\n### per-zoom: {did}\n")
+            print(g.per_zoom(r, did))
     return 0
 
 
