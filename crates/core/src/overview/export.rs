@@ -142,7 +142,7 @@ use super::pipeline::{
     SinkBacking,
 };
 use super::properties::PropertySelection;
-use super::read::{footer_price, read_in_order, ReadFlow, ReadPass, ReadTuning};
+use super::read::{footer_price, read_in_order_capped, ReadFlow, ReadPass, ReadTuning};
 use super::reader::{OverviewReader, ReaderError};
 use super::stream::{
     add_nanos, preflight_profile_json_path, profile_json_target, sample_rss_peak,
@@ -6198,7 +6198,7 @@ fn collect_into(
     // PERF (#817): a group's ordered finish (the gap walk, member routing
     // and the sink appends) runs alongside the next group's decode and clip,
     // so the pool is not idle while this thread walks the rows.
-    let group_rows = COLLECT_GROUP_ROWS_PER_THREAD.saturating_mul(rayon::current_num_threads());
+    let group_rows = collect_group_rows();
     let mut group: Vec<RecordBatch> = Vec::new();
     let mut grouped = 0usize;
     let mut clipped: Option<ClippedGroup> = None;
@@ -6283,11 +6283,15 @@ fn read_band(
     // The consumer's error is kept here and the read stopped, so the
     // export reports it rather than a read error.
     let mut failed = None;
-    read_in_order(
+    // The collect holds two groups (one clipping, one finishing), so each
+    // reader needs about that many batches queued, not the budget's depth.
+    let ahead = 2 * collect_group_rows().div_ceil(EXPORT_BATCH_SIZE);
+    read_in_order_capped(
         band.source,
         Some(&selection),
         None,
         tuning,
+        Some(ahead),
         |batch, _, read| {
             add_nanos(&timers.band_read, read);
             Ok(match on_batch(batch) {
@@ -6319,6 +6323,11 @@ fn read_error(e: ConvertError) -> ExportError {
 /// 8,192-row batches at a time, 16 threads one. Each group holds its
 /// batches and their members until it is merged.
 const COLLECT_GROUP_ROWS_PER_THREAD: usize = 512;
+
+/// The rows [`collect_into`] gathers per group on this pool.
+fn collect_group_rows() -> usize {
+    COLLECT_GROUP_ROWS_PER_THREAD.saturating_mul(rayon::current_num_threads())
+}
 
 /// The wave partition owning `key`. The wave's partitions are contiguous,
 /// disjoint, ascending `[key_lo, key_hi]` ranges, and every emitted key was
