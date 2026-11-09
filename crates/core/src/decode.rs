@@ -338,24 +338,41 @@ pub fn decode_pmtiles(
     let mut col_types: BTreeMap<String, ColType> = BTreeMap::new();
     let mut layers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut tiles_read = 0u64;
-    let mut reader = TileReader::new(&src);
-    for tile in tile_refs(&entries, &header, options) {
-        let tile = tile?;
-        tiles_read += 1;
-        for (layer_name, feature) in decode_tile_features(&mut reader, &header, &tile, options)? {
-            layers.insert(layer_name);
-            for (key, value) in &feature.props {
-                if RESERVED_COLUMNS.contains(&key.as_str()) {
-                    return Err(DecodeError::ReservedColumn(key.clone()));
+    for_each_tile(
+        &src,
+        &header,
+        &entries,
+        options,
+        |features| {
+            let mut types: BTreeMap<String, ColType> = BTreeMap::new();
+            let mut names: std::collections::BTreeSet<String> = Default::default();
+            for (layer_name, feature) in features {
+                names.insert(layer_name);
+                for (key, value) in &feature.props {
+                    if RESERVED_COLUMNS.contains(&key.as_str()) {
+                        return Err(DecodeError::ReservedColumn(key.clone()));
+                    }
+                    let t = ColType::of(value);
+                    types
+                        .entry(key.clone())
+                        .and_modify(|e| *e = e.unify(t))
+                        .or_insert(t);
                 }
-                let t = ColType::of(value);
+            }
+            Ok((names, types))
+        },
+        |_, (names, types)| {
+            tiles_read += 1;
+            layers.extend(names);
+            for (key, t) in types {
                 col_types
-                    .entry(key.clone())
+                    .entry(key)
                     .and_modify(|e| *e = e.unify(t))
                     .or_insert(t);
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
 
     // ---- Output schema: zoom, layer, mvt_id, properties (sorted), geometry.
     let geom_field = GeometryBuilder::new(GeometryType::new(Default::default()))
@@ -395,10 +412,8 @@ pub fn decode_pmtiles(
         elapsed_secs: 0.0,
     };
     let mut batch = RowBatch::new(&col_types);
-    let mut reader = TileReader::new(&src);
-    for tile in tile_refs(&entries, &header, options) {
-        let tile = tile?;
-        for (layer_name, feature) in decode_tile_features(&mut reader, &header, &tile, options)? {
+    for_each_tile(&src, &header, &entries, options, Ok, |tile, features| {
+        for (layer_name, feature) in features {
             match feature.geometry {
                 Some(geometry) => {
                     batch.push(
@@ -420,7 +435,8 @@ pub fn decode_pmtiles(
                 None => report.features_skipped += 1,
             }
         }
-    }
+        Ok(())
+    })?;
     if batch.len() > 0 {
         flush_batch(&mut batch, &schema, &mut encoder, &mut writer, &col_types)?;
     }
@@ -625,6 +641,62 @@ fn tile_ref(
         start,
         len: entry.length as usize,
     }))
+}
+
+/// Tiles decoded per parallel chunk, per rayon thread. Bounds the decoded
+/// features held at once to O(threads x tiles) instead of O(archive).
+const TILES_PER_THREAD_CHUNK: usize = 1;
+
+// Chunks dispatched by [`for_each_tile`]; a structural counter for tests.
+#[cfg(test)]
+thread_local! {
+    static CHUNKS_DISPATCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Read and decode every selected tile (read, gunzip, MVT, geometry) in
+/// parallel chunks, running `work` on each tile's features on the pool, then
+/// hand the results to `sink` serially in tile order. The output therefore
+/// does not depend on the thread count, and the first error in tile order wins.
+fn for_each_tile<S, T, W, K>(
+    src: &S,
+    header: &Header,
+    entries: &[DirEntry],
+    options: &DecodeOptions,
+    work: W,
+    mut sink: K,
+) -> Result<(), DecodeError>
+where
+    S: ArchiveBytes + Sync + ?Sized,
+    T: Send,
+    W: Fn(Vec<(String, DecodedFeature)>) -> Result<T, DecodeError> + Sync,
+    K: FnMut(&TileRef, T) -> Result<(), DecodeError>,
+{
+    use rayon::prelude::*;
+    let chunk_len = rayon::current_num_threads().max(1) * TILES_PER_THREAD_CHUNK;
+    let mut refs = tile_refs(entries, header, options);
+    loop {
+        let chunk = refs
+            .by_ref()
+            .take(chunk_len)
+            .collect::<Result<Vec<_>, _>>()?;
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        CHUNKS_DISPATCHED.with(|c| c.set(c.get() + 1));
+        // One reader per rayon split keeps the read-ahead window (#462) for
+        // consecutive tiles of a clustered archive.
+        let results: Vec<Result<T, DecodeError>> = chunk
+            .par_iter()
+            .map_init(
+                || TileReader::new(src),
+                |reader, tile| work(decode_tile_features(reader, header, tile, options)?),
+            )
+            .collect();
+        for (tile, r) in chunk.iter().zip(results) {
+            sink(tile, r?)?;
+        }
+    }
 }
 
 /// How much tile data [`TileReader`] reads at a time.
@@ -1953,5 +2025,41 @@ mod tests {
             dir_listing(dir.path()),
             vec!["decoded.parquet".to_string(), "in.pmtiles".to_string()]
         );
+    }
+
+    /// Output is byte-identical at any thread count, and the tiles are
+    /// dispatched in bounded parallel chunks (two passes, one chunk per
+    /// `threads * TILES_PER_THREAD_CHUNK` tiles), not one serial walk.
+    #[test]
+    fn decode_is_thread_count_independent_and_chunked() {
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.pmtiles");
+        let mut writer = StreamingPmtilesWriter::new(crate::Compression::Gzip).unwrap();
+        writer.set_layer_name("t");
+        for i in 0..40u32 {
+            let mut tile = POINT_TILE.to_vec();
+            tile[12] = 0x02 + 2 * (i as u8 % 8);
+            writer.add_tile(6, i, 7, &tile).unwrap();
+        }
+        writer.finalize(&input).unwrap();
+
+        let run = |threads: usize| {
+            let out = dir.path().join(format!("out{threads}.parquet"));
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let chunks = pool.install(|| {
+                CHUNKS_DISPATCHED.with(|c| c.set(0));
+                decode_pmtiles(&input, &out, &DecodeOptions::default()).unwrap();
+                CHUNKS_DISPATCHED.with(|c| c.get())
+            });
+            (std::fs::read(&out).unwrap(), chunks)
+        };
+        let (one, c1) = run(1);
+        let (four, c4) = run(4);
+        assert_eq!(one, four);
+        assert_eq!((c1, c4), (2 * 40, 2 * 10), "40 tiles, two passes");
     }
 }
