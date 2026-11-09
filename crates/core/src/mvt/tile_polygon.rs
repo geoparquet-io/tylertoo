@@ -39,7 +39,7 @@
 
 use super::{
     any_box_pair, edge_box, ring_area2, ring_box, segments_cross_or_overlap, segments_meet,
-    TileRing,
+    strip_box_pairs, TileRing,
 };
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay::{ContourDirection, IntOverlayOptions, Overlay, ShapeType};
@@ -286,20 +286,19 @@ pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), De
         }));
     }
     let boxes: Vec<_> = edges.iter().map(|e| edge_box(e.a, e.b)).collect();
-    let mut defect = None;
     // Points where two different rings touch, with the edge of each that
     // the touch was found on (lower ring first).
     let mut touches: Vec<Touch> = Vec::new();
-    any_box_pair(&boxes, |i, j| {
+    let mut visit = |i: usize, j: usize| -> Option<Defect> {
         let (ei, ej) = (edges[i], edges[j]);
         if ei.ring == ej.ring {
             let n = rings[ei.ring as usize].len() as u32 - 1;
             let adjacent = (ei.pos + 1) % n == ej.pos || (ej.pos + 1) % n == ei.pos;
             if !adjacent && segments_meet((ei.a, ei.b), (ej.a, ej.b)) {
-                defect = Some(Defect::RingSelfTouch);
+                return Some(Defect::RingSelfTouch);
             }
         } else if segments_cross_or_overlap((ei.a, ei.b), (ej.a, ej.b)) {
-            defect = Some(crossing_defect(&ring_part, ei.ring, ej.ring));
+            return Some(crossing_defect(&ring_part, ei.ring, ej.ring));
         } else if let Some(p) = touch_point((ei.a, ei.b), (ej.a, ej.b)) {
             let (lo, hi) = if ei.ring < ej.ring {
                 (ei, ej)
@@ -308,8 +307,21 @@ pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), De
             };
             touches.push(Touch { p, lo, hi });
         }
+        None
+    };
+    // The strips find whether a defect exists; the touches below do not
+    // depend on the order they were found in. Which defect is reported does,
+    // so a feature with one is swept again in `any_box_pair`'s order.
+    let mut defect = None;
+    if strip_box_pairs(&boxes, |i, j| {
+        defect = visit(i, j);
         defect.is_some()
-    });
+    }) {
+        any_box_pair(&boxes, |i, j| {
+            defect = visit(i, j);
+            defect.is_some()
+        });
+    }
     if let Some(d) = defect {
         return Err(d);
     }
@@ -406,7 +418,7 @@ fn check_lone_ring(ring: &TileRing) -> Result<(), Defect> {
     }
     let n = ring.len() - 1;
     let boxes: Vec<_> = ring.windows(2).map(|w| edge_box(w[0], w[1])).collect();
-    let touches = any_box_pair(&boxes, |i, j| {
+    let touches = strip_box_pairs(&boxes, |i, j| {
         let adjacent = (i + 1) % n == j || (j + 1) % n == i;
         !adjacent && segments_meet((ring[i], ring[i + 1]), (ring[j], ring[j + 1]))
     });
@@ -512,7 +524,7 @@ fn check_nesting<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
         }
         if holes.len() > 1 {
             let boxes: Vec<_> = holes.iter().map(|h| ring_box(h)).collect();
-            let nested = any_box_pair(&boxes, |i, j| {
+            let nested = strip_box_pairs(&boxes, |i, j| {
                 (box_within(boxes[i], boxes[j]) && locate_ring(holes[i], holes[j]) == Loc::Inside)
                     || (box_within(boxes[j], boxes[i])
                         && locate_ring(holes[j], holes[i]) == Loc::Inside)
@@ -533,7 +545,7 @@ fn check_nesting<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
                 .iter()
                 .any(|h| locate_ring(&inner[0], h) == Loc::Inside)
     };
-    let nested = any_box_pair(&boxes, |i, j| {
+    let nested = strip_box_pairs(&boxes, |i, j| {
         (box_within(boxes[i], boxes[j]) && in_fill(parts[i], parts[j]))
             || (box_within(boxes[j], boxes[i]) && in_fill(parts[j], parts[i]))
     });
@@ -816,6 +828,98 @@ mod tests {
 
     fn square(x0: i32, y0: i32, x1: i32, y1: i32) -> TileRing {
         ring(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+    }
+
+    /// `cols` columns of `rows` small squares each, every one its own part.
+    fn square_grid(cols: i32, rows: i32) -> Vec<Vec<TileRing>> {
+        (0..cols)
+            .flat_map(|c| (0..rows).map(move |r| vec![square(4 * c, 4 * r, 4 * c + 2, 4 * r + 2)]))
+            .collect()
+    }
+
+    /// #772: a merged feature spans the tile, so an x-only sweep paired each
+    /// edge with every edge in its column (168 candidates per meeting pair on
+    /// Moldova factor 0). The check's work must follow the pairs that meet.
+    #[test]
+    fn check_work_follows_meeting_pairs_not_shared_columns() {
+        let parts = square_grid(20, 1000);
+        let edges: u64 = 4 * 20 * 1000;
+        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        assert_eq!(check_polygons(&parts), Ok(()));
+        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        assert!(
+            compared < 16 * edges,
+            "{compared} box comparisons for {edges} edges"
+        );
+    }
+
+    #[test]
+    fn strips_visit_the_sweeps_pairs_in_the_same_orientation() {
+        let mut seed = 0x772_u64;
+        let mut next = move |m: i32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as i32 % m
+        };
+        for n in [10, 600, 5000] {
+            let boxes: Vec<_> = (0..n)
+                .map(|_| {
+                    let (x, y) = (next(9000) - 4500, next(9000) - 4500);
+                    // Mostly short edges, some spanning many strips.
+                    let (w, h) = if next(20) == 0 {
+                        (next(3000), next(9000))
+                    } else {
+                        (next(8), next(8))
+                    };
+                    (x, y, x + w, y + h)
+                })
+                .collect();
+            let (mut all, mut strips) = (Vec::new(), Vec::new());
+            any_box_pair(&boxes, |i, j| {
+                all.push((i, j));
+                false
+            });
+            strip_box_pairs(&boxes, |i, j| {
+                strips.push((i, j));
+                false
+            });
+            all.sort_unstable();
+            strips.sort_unstable();
+            assert!(n < 600 || all.len() > n as usize, "{} pairs", all.len());
+            assert_eq!(strips, all, "n={n}");
+        }
+    }
+
+    /// With several defects, the check still reports the first one the
+    /// x-ordered sweep meets, whatever order the strips find them in.
+    #[test]
+    fn a_large_feature_reports_the_first_defect_in_sweep_order() {
+        // Overlapping parts far left, a self-touching ring far right.
+        let mut parts = square_grid(20, 1000);
+        parts.push(vec![square(-10, 3000, -5, 3005)]);
+        parts.push(vec![square(-8, 3002, -3, 3007)]);
+        parts.push(vec![ring(&[
+            (200, 10),
+            (210, 10),
+            (205, 15),
+            (210, 20),
+            (200, 20),
+            (205, 15),
+        ])]);
+        assert_eq!(check_polygons(&parts), Err(Defect::PartsOverlap));
+        let mut parts = square_grid(20, 1000);
+        parts.push(vec![ring(&[
+            (-20, 10),
+            (-10, 10),
+            (-15, 15),
+            (-10, 20),
+            (-20, 20),
+            (-15, 15),
+        ])]);
+        parts.push(vec![square(200, 3000, 205, 3005)]);
+        parts.push(vec![square(202, 3002, 207, 3007)]);
+        assert_eq!(check_polygons(&parts), Err(Defect::RingSelfTouch));
     }
 
     #[test]

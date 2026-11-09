@@ -509,6 +509,12 @@ fn edge_box(p: (i32, i32), q: (i32, i32)) -> (i32, i32, i32, i32) {
     (p.0.min(q.0), p.1.min(q.1), p.0.max(q.0), p.1.max(q.1))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Box pairs a sweep compared, on this thread.
+    pub(crate) static SWEEP_CANDIDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Visit every pair of boxes that meet, once, and stop at the first pair
 /// `hit` accepts. A plane sweep over x: boxes are sorted by their min x and
 /// each is paired with the following ones until their min x passes its max
@@ -525,8 +531,69 @@ fn any_box_pair(boxes: &[(i32, i32, i32, i32)], mut hit: impl FnMut(usize, usize
             if bj.0 > bi.2 {
                 break;
             }
+            #[cfg(test)]
+            SWEEP_CANDIDATES.with(|c| c.set(c.get() + 1));
             if bj.1 <= bi.3 && bi.1 <= bj.3 && hit(i as usize, j as usize) {
                 return true;
+            }
+        }
+    }
+    false
+}
+
+/// Boxes per horizontal strip in [`strip_box_pairs`].
+const STRIP_BOXES: usize = 256;
+
+/// Most strips [`strip_box_pairs`] cuts the boxes' y range into.
+const MAX_STRIPS: usize = 1024;
+
+/// [`any_box_pair`] in horizontal strips: the same pairs, each with the same
+/// one first in `hit(i, j)`, but not in the same order. Each strip runs the
+/// x sweep over the boxes that reach it, and a pair is visited only in the
+/// strip holding the bottom of the two boxes' overlap. An x-only sweep pairs
+/// every box with all the boxes that share its x range, however far apart
+/// in y: on a merged feature spanning the tile (#772) that is about 170
+/// candidates per pair that meets.
+pub(crate) fn strip_box_pairs(
+    boxes: &[(i32, i32, i32, i32)],
+    mut hit: impl FnMut(usize, usize) -> bool,
+) -> bool {
+    let strips = (boxes.len() / STRIP_BOXES).min(MAX_STRIPS);
+    if strips < 2 {
+        return any_box_pair(boxes, hit);
+    }
+    let (y0, y1) = boxes.iter().fold((i32::MAX, i32::MIN), |(lo, hi), b| {
+        (lo.min(b.1), hi.max(b.3))
+    });
+    let span = i64::from(y1) - i64::from(y0) + 1;
+    let strip_of = |y: i32| ((i64::from(y) - i64::from(y0)) * strips as i64 / span) as usize;
+    // `any_box_pair`'s order, so each strip is a subsequence of it.
+    let mut order: Vec<u32> = (0..boxes.len() as u32).collect();
+    order.sort_unstable_by_key(|&i| boxes[i as usize].0);
+    let mut members: Vec<Vec<u32>> = vec![Vec::new(); strips];
+    for &i in &order {
+        let b = boxes[i as usize];
+        for list in &mut members[strip_of(b.1)..=strip_of(b.3)] {
+            list.push(i);
+        }
+    }
+    for (s, list) in members.iter().enumerate() {
+        for (p, &i) in list.iter().enumerate() {
+            let bi = boxes[i as usize];
+            for &j in &list[p + 1..] {
+                let bj = boxes[j as usize];
+                if bj.0 > bi.2 {
+                    break;
+                }
+                #[cfg(test)]
+                SWEEP_CANDIDATES.with(|c| c.set(c.get() + 1));
+                if bj.1 <= bi.3
+                    && bi.1 <= bj.3
+                    && strip_of(bi.1.max(bj.1)) == s
+                    && hit(i as usize, j as usize)
+                {
+                    return true;
+                }
             }
         }
     }
