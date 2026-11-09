@@ -39,7 +39,7 @@
 
 use super::{
     any_box_pair, edge_box, ring_area2, ring_box, segments_cross_or_overlap, segments_meet,
-    TileRing,
+    strip_box_pairs, TileRing,
 };
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay::{ContourDirection, IntOverlayOptions, Overlay, ShapeType};
@@ -74,9 +74,8 @@ pub(crate) fn finalize_polygons(
         count: 1,
         kind: defect,
     });
-    let repaired = repair_polygons(&parts);
-    if let Err(left) = check_polygons(&repaired) {
-        let _ = left;
+    let (repaired, passed) = repair_and_check(&parts);
+    if !passed && check_polygons(&repaired).is_err() {
         diagnostics.record(Diagnostic::InvalidAfterEncode { count: 1 });
     }
     repaired
@@ -93,15 +92,21 @@ pub(crate) fn finalize_polygons(
 /// stay within the input's bounding box, which [`super::TILE_COORD_CLAMP`]
 /// keeps well inside the i32 engine's ±2^30 range.
 pub(crate) fn repair_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Vec<Vec<TileRing>> {
+    repair_and_check(parts).0
+}
+
+/// [`repair_polygons`], and whether the result already passed
+/// [`check_polygons`] inside it.
+fn repair_and_check<P: AsRef<[TileRing]>>(parts: &[P]) -> (Vec<Vec<TileRing>>, bool) {
     // i_overlay snaps intersections within one engine unit to endpoints.
     // A half-unit grid preserves small lobes (Madagascar ADM4, #779) until
     // extraction. Rounding those nodes can introduce fresh grid defects;
     // resolve those through the same kernel on the final grid when needed.
     let snapped = overlay_polygons(parts, 2);
     if check_polygons(&snapped).is_ok() {
-        snapped
+        (snapped, true)
     } else {
-        overlay_polygons(&snapped, 1)
+        (overlay_polygons(&snapped, 1), false)
     }
 }
 
@@ -191,20 +196,39 @@ fn bind_holes(shells: &mut [Vec<TileRing>], holes: Vec<TileRing>) {
         return;
     }
     let boxes: Vec<_> = holes.iter().map(ring_box).collect();
-    let areas: Vec<i64> = shells.iter().map(|s| ring_area2(&s[0]).abs()).collect();
+    // Holes by min x, so a shell considers only those starting in its x range.
+    let mut by_x: Vec<usize> = (0..holes.len()).collect();
+    by_x.sort_unstable_by_key(|&k| boxes[k].0);
+    let xs: Vec<i32> = by_x.iter().map(|&k| boxes[k].0).collect();
+    // Smallest shell first, the first of equal ones: the first shell found to
+    // contain a hole is its target, and the hole is not tried again.
+    let mut order: Vec<(i64, usize)> = shells
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (ring_area2(&s[0]).abs(), i))
+        .collect();
+    order.sort_unstable();
     let mut targets: Vec<Option<usize>> = vec![None; holes.len()];
-    for (i, shell) in shells.iter().enumerate() {
-        let shell_box = ring_box(&shell[0]);
-        let candidates: Vec<usize> = (0..holes.len())
+    for (_, i) in order {
+        let shell = &shells[i][0];
+        let shell_box = ring_box(shell);
+        let (lo, hi) = (
+            xs.partition_point(|&x| x < shell_box.0),
+            xs.partition_point(|&x| x <= shell_box.2),
+        );
+        let candidates: Vec<usize> = by_x[lo..hi]
+            .iter()
+            .copied()
             .filter(|&k| {
-                targets[k].is_none_or(|old| areas[i] < areas[old])
-                    && box_within(boxes[k], shell_box)
+                #[cfg(test)]
+                BIND_TESTS.with(|c| c.set(c.get() + 1));
+                targets[k].is_none() && box_within(boxes[k], shell_box)
             })
             .collect();
         // Share one edge scan across the candidate holes. The exact locator
         // also retries boundary vertices and midpoints when necessary.
         let rings: Vec<&TileRing> = candidates.iter().map(|&k| &holes[k]).collect();
-        for (k, location) in candidates.into_iter().zip(locate_rings(&rings, &shell[0])) {
+        for (k, location) in candidates.into_iter().zip(locate_rings(&rings, shell)) {
             if location == Loc::Inside {
                 targets[k] = Some(i);
             }
@@ -215,6 +239,14 @@ fn bind_holes(shells: &mut [Vec<TileRing>], holes: Vec<TileRing>) {
             shells[i].push(hole);
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`check_polygons`] calls on this thread.
+    static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Hole/shell pairs [`bind_holes`] considered on this thread.
+    static BIND_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One edge of the feature, with the ring it belongs to.
@@ -247,6 +279,8 @@ enum Loc {
 /// rules: every hole inside its exterior, no hole in another hole, no part
 /// inside another part's fill.
 pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
+    #[cfg(test)]
+    CHECKS.with(|c| c.set(c.get() + 1));
     // The usual feature, one polygon without holes: only the ring's own
     // rules apply, and the sweep runs on the ring itself, without the
     // ring/part bookkeeping the general case needs.
@@ -286,20 +320,19 @@ pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), De
         }));
     }
     let boxes: Vec<_> = edges.iter().map(|e| edge_box(e.a, e.b)).collect();
-    let mut defect = None;
     // Points where two different rings touch, with the edge of each that
     // the touch was found on (lower ring first).
     let mut touches: Vec<Touch> = Vec::new();
-    any_box_pair(&boxes, |i, j| {
+    let mut visit = |i: usize, j: usize| -> Option<Defect> {
         let (ei, ej) = (edges[i], edges[j]);
         if ei.ring == ej.ring {
             let n = rings[ei.ring as usize].len() as u32 - 1;
             let adjacent = (ei.pos + 1) % n == ej.pos || (ej.pos + 1) % n == ei.pos;
             if !adjacent && segments_meet((ei.a, ei.b), (ej.a, ej.b)) {
-                defect = Some(Defect::RingSelfTouch);
+                return Some(Defect::RingSelfTouch);
             }
         } else if segments_cross_or_overlap((ei.a, ei.b), (ej.a, ej.b)) {
-            defect = Some(crossing_defect(&ring_part, ei.ring, ej.ring));
+            return Some(crossing_defect(&ring_part, ei.ring, ej.ring));
         } else if let Some(p) = touch_point((ei.a, ei.b), (ej.a, ej.b)) {
             let (lo, hi) = if ei.ring < ej.ring {
                 (ei, ej)
@@ -308,8 +341,21 @@ pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), De
             };
             touches.push(Touch { p, lo, hi });
         }
+        None
+    };
+    // The strips find whether a defect exists; the touches below do not
+    // depend on the order they were found in. Which defect is reported does,
+    // so a feature with one is swept again in `any_box_pair`'s order.
+    let mut defect = None;
+    if strip_box_pairs(&boxes, |i, j| {
+        defect = visit(i, j);
         defect.is_some()
-    });
+    }) {
+        any_box_pair(&boxes, |i, j| {
+            defect = visit(i, j);
+            defect.is_some()
+        });
+    }
     if let Some(d) = defect {
         return Err(d);
     }
@@ -406,7 +452,7 @@ fn check_lone_ring(ring: &TileRing) -> Result<(), Defect> {
     }
     let n = ring.len() - 1;
     let boxes: Vec<_> = ring.windows(2).map(|w| edge_box(w[0], w[1])).collect();
-    let touches = any_box_pair(&boxes, |i, j| {
+    let touches = strip_box_pairs(&boxes, |i, j| {
         let adjacent = (i + 1) % n == j || (j + 1) % n == i;
         !adjacent && segments_meet((ring[i], ring[i + 1]), (ring[j], ring[j + 1]))
     });
@@ -512,7 +558,7 @@ fn check_nesting<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
         }
         if holes.len() > 1 {
             let boxes: Vec<_> = holes.iter().map(|h| ring_box(h)).collect();
-            let nested = any_box_pair(&boxes, |i, j| {
+            let nested = strip_box_pairs(&boxes, |i, j| {
                 (box_within(boxes[i], boxes[j]) && locate_ring(holes[i], holes[j]) == Loc::Inside)
                     || (box_within(boxes[j], boxes[i])
                         && locate_ring(holes[j], holes[i]) == Loc::Inside)
@@ -533,7 +579,7 @@ fn check_nesting<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
                 .iter()
                 .any(|h| locate_ring(&inner[0], h) == Loc::Inside)
     };
-    let nested = any_box_pair(&boxes, |i, j| {
+    let nested = strip_box_pairs(&boxes, |i, j| {
         (box_within(boxes[i], boxes[j]) && in_fill(parts[i], parts[j]))
             || (box_within(boxes[j], boxes[i]) && in_fill(parts[j], parts[i]))
     });
@@ -818,6 +864,160 @@ mod tests {
         ring(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
     }
 
+    /// `cols` columns of `rows` small squares each, every one its own part.
+    fn square_grid(cols: i32, rows: i32) -> Vec<Vec<TileRing>> {
+        (0..cols)
+            .flat_map(|c| (0..rows).map(move |r| vec![square(4 * c, 4 * r, 4 * c + 2, 4 * r + 2)]))
+            .collect()
+    }
+
+    /// #772: a merged feature spans the tile, so an x-only sweep paired each
+    /// edge with every edge in its column (168 candidates per meeting pair on
+    /// Moldova factor 0). The check's work must follow the pairs that meet.
+    #[test]
+    fn check_work_follows_meeting_pairs_not_shared_columns() {
+        let parts = square_grid(20, 1000);
+        let edges: u64 = 4 * 20 * 1000;
+        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        assert_eq!(check_polygons(&parts), Ok(()));
+        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        assert!(
+            compared < 16 * edges,
+            "{compared} box comparisons for {edges} edges"
+        );
+    }
+
+    /// roborev 337: edges spanning many strips met each other in every strip
+    /// they shared. Long, mutually overlapping edges must cost no more than
+    /// the x-only sweep did.
+    #[test]
+    fn long_edges_spanning_every_strip_are_not_compared_per_strip() {
+        let parts: Vec<Vec<TileRing>> = (0..1024)
+            .map(|k| {
+                vec![ring(&[
+                    (3 * k, 0),
+                    (3 * k + 1, 0),
+                    (3 * k + 4097, 4096),
+                    (3 * k + 4096, 4096),
+                ])]
+            })
+            .collect();
+        let boxes: Vec<_> = parts
+            .iter()
+            .flat_map(|p| p[0].windows(2).map(|w| edge_box(w[0], w[1])))
+            .collect();
+        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        any_box_pair(&boxes, |_, _| false);
+        let swept = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        check_polygons(&parts).ok();
+        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        assert!(
+            compared <= 2 * swept,
+            "{compared} comparisons, the x sweep makes {swept}"
+        );
+    }
+
+    /// roborev 352: a few long edges among many short ones kept the average
+    /// low and were still compared in every strip they crossed.
+    #[test]
+    fn long_edges_among_short_ones_are_not_compared_per_strip() {
+        let mut parts: Vec<Vec<TileRing>> = (0..64)
+            .map(|k| {
+                vec![ring(&[
+                    (3 * k, 0),
+                    (3 * k + 1, 0),
+                    (3 * k + 1025, 4096),
+                    (3 * k + 1024, 4096),
+                ])]
+            })
+            .collect();
+        parts.extend((0..960).map(|k| vec![square(2048 + 2 * k, 100, 2049 + 2 * k, 101)]));
+        let boxes: Vec<_> = parts
+            .iter()
+            .flat_map(|p| p[0].windows(2).map(|w| edge_box(w[0], w[1])))
+            .collect();
+        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        any_box_pair(&boxes, |_, _| false);
+        let swept = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        check_polygons(&parts).ok();
+        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        assert!(
+            compared <= 2 * swept,
+            "{compared} comparisons, the x sweep makes {swept}"
+        );
+    }
+
+    #[test]
+    fn strips_visit_the_sweeps_pairs_in_the_same_orientation() {
+        let mut seed = 0x772_u64;
+        let mut next = move |m: i32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as i32 % m
+        };
+        for n in [10, 600, 5000] {
+            let boxes: Vec<_> = (0..n)
+                .map(|_| {
+                    let (x, y) = (next(9000) - 4500, next(9000) - 4500);
+                    // Mostly short edges, some spanning many strips.
+                    let (w, h) = if next(20) == 0 {
+                        (next(3000), next(9000))
+                    } else {
+                        (next(8), next(8))
+                    };
+                    (x, y, x + w, y + h)
+                })
+                .collect();
+            let (mut all, mut strips) = (Vec::new(), Vec::new());
+            any_box_pair(&boxes, |i, j| {
+                all.push((i, j));
+                false
+            });
+            strip_box_pairs(&boxes, |i, j| {
+                strips.push((i, j));
+                false
+            });
+            all.sort_unstable();
+            strips.sort_unstable();
+            assert!(n < 600 || all.len() > n as usize, "{} pairs", all.len());
+            assert_eq!(strips, all, "n={n}");
+        }
+    }
+
+    /// With several defects, the check still reports the first one the
+    /// x-ordered sweep meets, whatever order the strips find them in.
+    #[test]
+    fn a_large_feature_reports_the_first_defect_in_sweep_order() {
+        // Overlapping parts far left, a self-touching ring far right.
+        let mut parts = square_grid(20, 1000);
+        parts.push(vec![square(-10, 3000, -5, 3005)]);
+        parts.push(vec![square(-8, 3002, -3, 3007)]);
+        parts.push(vec![ring(&[
+            (200, 10),
+            (210, 10),
+            (205, 15),
+            (210, 20),
+            (200, 20),
+            (205, 15),
+        ])]);
+        assert_eq!(check_polygons(&parts), Err(Defect::PartsOverlap));
+        let mut parts = square_grid(20, 1000);
+        parts.push(vec![ring(&[
+            (-20, 10),
+            (-10, 10),
+            (-15, 15),
+            (-10, 20),
+            (-20, 20),
+            (-15, 15),
+        ])]);
+        parts.push(vec![square(200, 3000, 205, 3005)]);
+        parts.push(vec![square(202, 3002, 207, 3007)]);
+        assert_eq!(check_polygons(&parts), Err(Defect::RingSelfTouch));
+    }
+
     #[test]
     fn a_plain_square_is_valid_and_untouched() {
         let parts = vec![vec![square(0, 0, 10, 10)]];
@@ -1089,6 +1289,84 @@ mod tests {
         assert!(area(&fixed) > 0);
     }
 
+    /// #772 (P1 tail): binding scanned every hole for every shell. An
+    /// overlay of a merged feature has thousands of each.
+    #[test]
+    fn hole_binding_considers_only_holes_near_each_shell() {
+        let mut shells = Vec::new();
+        let mut holes = Vec::new();
+        for c in 0..50 {
+            for r in 0..40 {
+                let (x, y) = (10 * c, 10 * r);
+                shells.push(vec![square(x, y, x + 8, y + 8)]);
+                holes.push(square(x + 2, y + 2, x + 4, y + 4));
+            }
+        }
+        let expected: Vec<Vec<TileRing>> = shells
+            .iter()
+            .zip(&holes)
+            .map(|(s, h)| vec![s[0].clone(), h.clone()])
+            .collect();
+        BIND_TESTS.with(|c| c.set(0));
+        bind_holes(&mut shells, holes);
+        let considered = BIND_TESTS.with(|c| c.get());
+        assert_eq!(shells, expected);
+        assert!(
+            considered < 2000 * 2000 / 10,
+            "{considered} pairs considered"
+        );
+    }
+
+    /// Smallest containing shell, the first of equal ones, holes in input
+    /// order: as the shell-by-shell scan bound them, on random nested rings.
+    #[test]
+    fn hole_binding_matches_the_shell_by_shell_scan() {
+        fn reference(shells: &mut [Vec<TileRing>], holes: Vec<TileRing>) {
+            let areas: Vec<i64> = shells.iter().map(|s| ring_area2(&s[0]).abs()).collect();
+            let mut targets: Vec<Option<usize>> = vec![None; holes.len()];
+            for (i, shell) in shells.iter().enumerate() {
+                for (k, h) in holes.iter().enumerate() {
+                    if targets[k].is_none_or(|old| areas[i] < areas[old])
+                        && box_within(ring_box(h), ring_box(&shell[0]))
+                        && locate_ring(h, &shell[0]) == Loc::Inside
+                    {
+                        targets[k] = Some(i);
+                    }
+                }
+            }
+            for (hole, target) in holes.into_iter().zip(targets) {
+                if let Some(i) = target {
+                    shells[i].push(hole);
+                }
+            }
+        }
+        let mut seed = 0x77_2b_u64;
+        let mut next = move |m: i32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as i32 % m
+        };
+        for _ in 0..200 {
+            let shells: Vec<Vec<TileRing>> = (0..=next(30))
+                .map(|_| {
+                    let (x, y, w) = (next(200), next(200), 4 + next(120));
+                    vec![square(x, y, x + w, y + next(2) + w)]
+                })
+                .collect();
+            let holes: Vec<TileRing> = (0..next(60))
+                .map(|_| {
+                    let (x, y, w) = (next(300), next(300), 1 + next(10));
+                    square(x, y, x + w, y + w)
+                })
+                .collect();
+            let (mut a, mut b) = (shells.clone(), shells);
+            bind_holes(&mut a, holes.clone());
+            reference(&mut b, holes);
+            assert_eq!(a, b);
+        }
+    }
+
     #[test]
     fn hole_binding_keeps_order_and_chooses_first_smallest_shell() {
         let big = ring(&[(0, 0), (40, 0), (40, 40), (0, 40)]);
@@ -1290,6 +1568,19 @@ mod tests {
             repaired > 1000 && kept > 50,
             "repaired={repaired} kept={kept}"
         );
+    }
+
+    /// #772: a repaired feature whose overlay already passed the check inside
+    /// the repair is not checked a second time; the check is a full sweep
+    /// of a merged feature that can span the tile.
+    #[test]
+    fn a_repair_that_passed_its_check_is_not_checked_again() {
+        let parts = vec![vec![square(0, 0, 10, 10)], vec![square(5, 5, 15, 15)]];
+        CHECKS.with(|c| c.set(0));
+        let fixed = finalize_polygons(parts, &crate::diagnostics::Diagnostics::default());
+        assert_eq!(fixed.len(), 1);
+        // The input's check, then the overlay's inside the repair.
+        assert_eq!(CHECKS.with(|c| c.get()), 2);
     }
 
     #[test]
