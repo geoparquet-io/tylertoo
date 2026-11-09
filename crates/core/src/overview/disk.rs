@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use crate::input_set::{ConvertSource, RowGroupSelection};
 
-use super::convert::{ConvertError, ConvertOptions};
+use super::convert::{BboxQuery, ConvertError, ConvertOptions};
 use super::level::{MemoryProfile, Mode};
 use super::memory::MemoryBudget;
+use super::stream::select_row_groups_streaming;
 use super::tiles::SpaceRemedies;
 
 const MARGIN_DENOM: u64 = 20;
@@ -108,6 +109,26 @@ impl DiskFootprint {
         options: &ConvertOptions,
         overview: Option<&Path>,
     ) -> Result<Self, ConvertError> {
+        // The `tiles` facade sizes before the passes select (#817 R1): select
+        // here as they will, or a `--bbox` is sized as the whole input.
+        let derived = if selection.is_none() && (options.bbox.is_some() || options.shard.is_some())
+        {
+            source.resolved_schema()?.crs().and_then(|crs| {
+                let bbox = options.bbox.map(|b| BboxQuery::new(&b, crs));
+                select_row_groups_streaming(
+                    source,
+                    bbox.as_ref(),
+                    None,
+                    options.shard.as_ref(),
+                    crs,
+                )
+                .ok()
+                .flatten()
+            })
+        } else {
+            None
+        };
+        let selection = selection.or(derived.as_ref());
         let mut footprint = Self::default();
         let scratch = options.spill_dir.clone().unwrap_or_else(std::env::temp_dir);
         // The staging owner accounts for projected columns and selected row groups.
@@ -269,6 +290,39 @@ mod tests {
         )
         .unwrap();
         assert!(disk.spill_bytes() > 0);
+    }
+
+    /// #817 R1: the `tiles` facade sizes the footprint with no selection; a
+    /// `--bbox` must still size only the row groups it selects, not the whole
+    /// input (a Connecticut bbox over Overture warned of 33 TiB).
+    #[test]
+    fn unselected_footprint_still_honors_the_bbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        let geoms: Vec<_> = (0..100)
+            .map(|i| Some(geo::Geometry::Point(geo::Point::new(f64::from(i), 0.0))))
+            .collect();
+        super::super::testutil::write_input_with_f64_row_groups(
+            &input,
+            &geoms,
+            "v",
+            &[0.0; 100],
+            Some(10),
+        );
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        let out = dir.path().join("out.parquet");
+        let spill = |bbox| {
+            let options = ConvertOptions {
+                bbox,
+                ..ConvertOptions::default()
+            };
+            DiskFootprint::conversion(&source, None, &options, Some(&out))
+                .unwrap()
+                .spill_bytes()
+        };
+        let whole = spill(None);
+        let clipped = spill(Some([0.0, -1.0, 5.0, 1.0]));
+        assert!(clipped > 0 && clipped * 3 < whole, "{clipped} vs {whole}");
     }
 
     #[test]

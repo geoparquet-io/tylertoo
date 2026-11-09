@@ -1100,7 +1100,7 @@ fn build_writer_options_with_ceiling(
 /// relation in shard mode instead of an equality, and why the plan's
 /// row-indexed tables are then re-addressed onto the subset rather than
 /// re-derived over it.
-fn select_row_groups_streaming(
+pub(super) fn select_row_groups_streaming(
     source: &ConvertSource,
     bbox_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
