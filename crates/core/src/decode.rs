@@ -90,7 +90,7 @@ use tylertoo_io::KeyValue;
 use crate::archive_index::FileBytes;
 use crate::compression::{decompress_capped, MAX_TILE_BYTES};
 use crate::mvt::{command_decode, zigzag_decode};
-use crate::overview::writer::geo_metadata_json_deterministic;
+use crate::overview::writer::{fold_geo_metadata, geo_metadata_json_deterministic};
 use crate::pmtiles_writer::{
     max_expanded_entries, tile_id_to_zxy, walk_directories, ArchiveBytes, DirEntry, DirWalkError,
     Header, TileType, HEADER_BYTES,
@@ -414,7 +414,7 @@ pub fn decode_pmtiles(
     // Rows short of a full batch carry over to the next chunk, so batch (and
     // row-group) boundaries are the serial walk's.
     let mut carry: Vec<Row> = Vec::with_capacity(BATCH_SIZE);
-    let mut geo_meta = encoder.into_geoparquet_metadata();
+    let mut geo_meta = Some(encoder.into_geoparquet_metadata());
     // The writer thread writes one chunk's batches while the pool decodes and
     // encodes the next; the one-slot channel bounds that to two chunks.
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<EncodedBatch>>(1);
@@ -424,7 +424,7 @@ pub fn decode_pmtiles(
             for batches in rx {
                 for (batch, meta) in batches {
                     writer.write(&batch)?;
-                    merge_geo_metadata(geo_meta, &meta);
+                    fold_geo_metadata(geo_meta, meta).map_err(DecodeError::Write)?;
                 }
             }
             Ok(writer)
@@ -488,8 +488,12 @@ pub fn decode_pmtiles(
     // deterministic serialization `overview::writer` uses.
     writer.append_key_value_metadata(KeyValue::new(
         "geo".to_string(),
-        geo_metadata_json_deterministic(&geo_meta)
-            .map_err(|e| DecodeError::Write(e.to_string()))?,
+        geo_metadata_json_deterministic(
+            geo_meta
+                .as_ref()
+                .ok_or_else(|| DecodeError::Write("no GeoParquet metadata".into()))?,
+        )
+        .map_err(|e| DecodeError::Write(e.to_string()))?,
     ));
     writer.close()?;
     #[cfg(test)]
@@ -1520,7 +1524,7 @@ fn writer_stopped() -> DecodeError {
 type EncodedBatch = (RecordBatch, GeoParquetMetadata);
 
 /// Build and encode one output batch. Each batch has its own encoder, so
-/// batches encode in parallel; [`merge_geo_metadata`] folds their metadata
+/// batches encode in parallel; [`fold_geo_metadata`] folds their metadata
 /// in batch order into what one encoder fed every batch would report.
 fn encode_rows(
     rows: Vec<Row>,
@@ -1552,38 +1556,6 @@ fn encode_rows(
         .encode_record_batch(&record)
         .map_err(|e| DecodeError::Write(e.to_string()))?;
     Ok((encoded, encoder.into_geoparquet_metadata()))
-}
-
-/// Fold one batch's GeoParquet metadata into the file's, exactly as a single
-/// encoder accumulates it: the geometry types are a union, and the bbox
-/// grows by the batch bbox's min corner then its max corner under strict
-/// comparisons (geoparquet's `BoundingRect::add_rect`), so ties and
-/// signed zeros resolve as they did.
-fn merge_geo_metadata(into: &mut GeoParquetMetadata, batch: &GeoParquetMetadata) {
-    for (name, col) in &mut into.columns {
-        let Some(other) = batch.columns.get(name) else {
-            continue;
-        };
-        col.geometry_types
-            .extend(other.geometry_types.iter().copied());
-        match (&mut col.bbox, &other.bbox) {
-            (None, Some(b)) => col.bbox = Some(b.clone()),
-            (Some(acc), Some(b)) if acc.len() == b.len() => {
-                let n = b.len() / 2;
-                for corner in [&b[..n], &b[n..]] {
-                    for (i, &v) in corner.iter().enumerate() {
-                        if v < acc[i] {
-                            acc[i] = v;
-                        }
-                        if v > acc[n + i] {
-                            acc[n + i] = v;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 // ============================================================================
@@ -2179,6 +2151,47 @@ mod tests {
         .unwrap();
         assert_eq!(tiles, 10_000);
         assert!(largest <= CHUNK_TILES, "{largest}-tile chunk");
+    }
+
+    /// The batch metadata fold must report what main's single serial encoder
+    /// did, including for a batch whose geometries hold no coordinates (an
+    /// empty MultiPoint here): geoparquet's `BoundingRect::add_rect` adds
+    /// that batch's empty rect corner by corner.
+    #[test]
+    fn folded_batch_metadata_matches_one_serial_encoder() {
+        let schema = Arc::new(Schema::new(vec![GeometryBuilder::new(GeometryType::new(
+            Default::default(),
+        ))
+        .finish()
+        .data_type()
+        .to_field(crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN, true)]));
+        let batch = |geoms: Vec<Geometry<f64>>| {
+            let mut b = GeometryBuilder::new(GeometryType::new(Default::default()));
+            b.extend_from_iter(geoms.iter().map(Some));
+            RecordBatch::try_new(schema.clone(), vec![b.finish().to_array_ref()]).unwrap()
+        };
+        let batches = [
+            batch(vec![Geometry::Point(Point::new(1.0, 2.0))]),
+            batch(vec![Geometry::MultiPoint(MultiPoint::new(vec![]))]),
+            batch(vec![Geometry::Point(Point::new(-3.0, 0.5))]),
+        ];
+        let bbox = |m: &GeoParquetMetadata| {
+            m.columns[crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN]
+                .bbox
+                .clone()
+        };
+        let mut serial = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options()).unwrap();
+        let mut folded = None;
+        for b in &batches {
+            serial.encode_record_batch(b).unwrap();
+            let mut own = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options()).unwrap();
+            own.encode_record_batch(b).unwrap();
+            fold_geo_metadata(&mut folded, own.into_geoparquet_metadata()).unwrap();
+        }
+        assert_eq!(
+            bbox(&folded.unwrap()),
+            bbox(&serial.into_geoparquet_metadata())
+        );
     }
 
     #[test]
