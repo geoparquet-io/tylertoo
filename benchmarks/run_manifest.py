@@ -614,7 +614,7 @@ def parse_gnu_time(stderr: str) -> dict:
 
 # Per-phase saturation fields of `rss_sampler.phases` (#810, written by the
 # sampler when profiling is on; older binaries have none, read as absent).
-PHASE_KEYS = ("cpu_user_secs", "cpu_sys_secs", "effective_cores", "utilization",
+PHASE_KEYS = ("wall_secs", "cpu_user_secs", "cpu_sys_secs", "effective_cores", "utilization",
               "unattributed_core_secs", "read_bytes", "write_bytes")
 
 
@@ -647,6 +647,7 @@ def read_profile(path: Path) -> dict:
                 "threads": ex.get("threads"),
                 "phases": phase_fields(ex.get("rss_sampler")),
                 "serial_secs": ex.get("serial_secs"),
+                "serial_share": ex.get("serial_share"),
                 "levels": [{"zoom": z.get("zoom"), "wave_width": z.get("wave_width"),
                             "spill_bytes": z.get("spill_bytes")} for z in ex.get("per_zoom", [])],
             }
@@ -1135,6 +1136,9 @@ def summarize(runs: list[dict], bins: list[dict]) -> dict:
             "cpu_s": spread([r["cpu_s"] for r in ok if r["cpu_s"] is not None]),
             "effective_cores": spread([v for r in ok if (v := effective_cores(r)) is not None]),
             "phase_effective_cores": phase_cores(ok),
+            "serial_share": spread([v for r in ok
+                                    if (v := ((r.get("profile") or {}).get("export") or {}).get("serial_share"))
+                                    is not None]),
             "peak_rss_mib": spread([r["peak_rss_kib"] / 1024 for r in ok if r["peak_rss_kib"]]),
             "convert_s": spread([v for r in ok if (v := phase_total(r, "convert")) is not None]),
             "export_s": spread([v for r in ok if (v := phase_total(r, "export")) is not None]),

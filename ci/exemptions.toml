@@ -12,6 +12,8 @@
 #             scripts/criterion_compare.sh) does not run
 #   noisy     a criterion bench-name glob that criterion_gate.py fails at
 #             --noisy-fail (+50%) instead of --fail (+10%)
+#   cores_floor  a valve_guard.py cell exempt from the effective-cores floors
+#             (#817); reason, issue and measured cores required
 
 # --- CodSpeed: syscall-dominated benches ------------------------------------
 # CodSpeed's comments on #799 and #805: "8 benchmarks are dominated by system
