@@ -884,6 +884,37 @@ mod tests {
         );
     }
 
+    /// roborev 352: a few long edges among many short ones kept the average
+    /// low and were still compared in every strip they crossed.
+    #[test]
+    fn long_edges_among_short_ones_are_not_compared_per_strip() {
+        let mut parts: Vec<Vec<TileRing>> = (0..64)
+            .map(|k| {
+                vec![ring(&[
+                    (3 * k, 0),
+                    (3 * k + 1, 0),
+                    (3 * k + 1025, 4096),
+                    (3 * k + 1024, 4096),
+                ])]
+            })
+            .collect();
+        parts.extend((0..960).map(|k| vec![square(2048 + 2 * k, 100, 2049 + 2 * k, 101)]));
+        let boxes: Vec<_> = parts
+            .iter()
+            .flat_map(|p| p[0].windows(2).map(|w| edge_box(w[0], w[1])))
+            .collect();
+        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        any_box_pair(&boxes, |_, _| false);
+        let swept = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        check_polygons(&parts).ok();
+        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        assert!(
+            compared <= 2 * swept,
+            "{compared} comparisons, the x sweep makes {swept}"
+        );
+    }
+
     #[test]
     fn strips_visit_the_sweeps_pairs_in_the_same_orientation() {
         let mut seed = 0x772_u64;

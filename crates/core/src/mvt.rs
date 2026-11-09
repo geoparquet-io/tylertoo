@@ -550,7 +550,8 @@ const MAX_STRIPS: usize = 1024;
 /// [`any_box_pair`] in horizontal strips: the same pairs, each with the same
 /// one first in `hit(i, j)`, but not in the same order. Each strip runs the
 /// x sweep over the boxes that reach it, and a pair is visited only in the
-/// strip holding the bottom of the two boxes' overlap. An x-only sweep pairs
+/// strip holding the bottom of the two boxes' overlap; a box reaching more
+/// than two strips is paired by the x sweep instead. An x-only sweep pairs
 /// every box with all the boxes that share its x range, however far apart
 /// in y: on a merged feature spanning the tile (#772) that is about 170
 /// candidates per pair that meets.
@@ -575,23 +576,45 @@ pub(crate) fn strip_box_pairs(
         return any_box_pair(boxes, hit);
     }
     let strip_of = |y: i32| ((i64::from(y) - i64::from(y0)) * strips as i64 / span) as usize;
-    // Two boxes that share strips are compared in each of them: when boxes
-    // reach across many strips (long edges), the x sweep is cheaper.
-    let copies: usize = boxes
-        .iter()
-        .map(|b| strip_of(b.3) - strip_of(b.1) + 1)
-        .sum();
-    if copies > 2 * boxes.len() {
-        return any_box_pair(boxes, hit);
-    }
     // `any_box_pair`'s order, so each strip is a subsequence of it.
     let mut order: Vec<u32> = (0..boxes.len() as u32).collect();
     order.sort_unstable_by_key(|&i| boxes[i as usize].0);
+    // Two boxes are compared in every strip they share, so a box reaching
+    // more than two strips is tall: its pairs are found once, in x order.
     let mut members: Vec<Vec<u32>> = vec![Vec::new(); strips];
-    for &i in &order {
+    let mut tall: Vec<usize> = Vec::new();
+    for (p, &i) in order.iter().enumerate() {
         let b = boxes[i as usize];
-        for list in &mut members[strip_of(b.1)..=strip_of(b.3)] {
+        let (lo, hi) = (strip_of(b.1), strip_of(b.3));
+        if hi - lo > 1 {
+            tall.push(p);
+            continue;
+        }
+        for list in &mut members[lo..=hi] {
             list.push(i);
+        }
+    }
+    // A tall box meets every box after it in the window; a short one only
+    // the tall boxes after it.
+    let mut next = 0;
+    for (p, &i) in order.iter().enumerate() {
+        let bi = boxes[i as usize];
+        let after: &mut dyn Iterator<Item = u32> = if tall.get(next) == Some(&p) {
+            next += 1;
+            &mut order[p + 1..].iter().copied()
+        } else {
+            &mut tall[next..].iter().map(|&q| order[q])
+        };
+        for j in after {
+            let bj = boxes[j as usize];
+            if bj.0 > bi.2 {
+                break;
+            }
+            #[cfg(test)]
+            SWEEP_CANDIDATES.with(|c| c.set(c.get() + 1));
+            if bj.1 <= bi.3 && bi.1 <= bj.3 && hit(i as usize, j as usize) {
+                return true;
+            }
         }
     }
     for (s, list) in members.iter().enumerate() {
