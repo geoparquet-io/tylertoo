@@ -45,7 +45,7 @@ use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
 use super::cluster::{ClusterEntry, ClusterTables};
-use super::coalesce::{collected_line_bytes, CoalesceInput};
+use super::coalesce::{collected_line_bytes, CoalesceInput, ExactChains};
 use super::config::ValidatedConfig;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
@@ -1218,7 +1218,11 @@ fn build_pass2_coalesce_tables(
                 "[convert] building coalesce chain tables for {} level(s)",
                 emitted.len()
             );
-            let inputs = scratch.inputs();
+            let lines = ExactChains::new(
+                scratch.inputs(),
+                options.coalesce_junction_angle,
+                options.assign.sort_direction,
+            );
             emitted
                 .par_iter()
                 .map(|e| {
@@ -1226,7 +1230,7 @@ fn build_pass2_coalesce_tables(
                         matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
                     (!verbatim).then(|| {
                         build_level_coalesce_table(
-                            &inputs,
+                            &lines,
                             e.orig as usize,
                             finest,
                             e.gsd,
@@ -1984,8 +1988,13 @@ fn pass2_coalesce(
                             "[convert] coalesce level {} was not prebuilt; building it now",
                             e.orig
                         );
+                        let lines = ExactChains::new(
+                            scratch.inputs(),
+                            options.coalesce_junction_angle,
+                            options.assign.sort_direction,
+                        );
                         Some(build_level_coalesce_table(
-                            &scratch.inputs(),
+                            &lines,
                             e.orig as usize,
                             finest,
                             e.gsd,
@@ -2030,13 +2039,17 @@ fn coalesce_merged_anywhere(
     if unmaterialized.is_empty() || matches!(options.mode, Mode::Partitioning) {
         return false;
     }
-    let inputs = scratch.inputs();
+    let lines = ExactChains::new(
+        scratch.inputs(),
+        options.coalesce_junction_angle,
+        options.assign.sort_direction,
+    );
     unmaterialized
         .par_iter()
         .filter(|e| e.orig as usize != finest)
         .any(|e| {
             coalesce_table_merged(&build_level_coalesce_table(
-                &inputs,
+                &lines,
                 e.orig as usize,
                 finest,
                 e.gsd,
@@ -2328,7 +2341,12 @@ fn coalesce_level_counts_in_waves(
         wave,
     } = inputs;
     let num_levels = level_specs.len();
-    let inputs = scratch.inputs();
+    // Phase 1 of the chain stage, shared by every level (#817 A2).
+    let lines = ExactChains::new(
+        scratch.inputs(),
+        options.coalesce_junction_angle,
+        options.assign.sort_direction,
+    );
     let wave = wave.max(1);
     log::info!(
         "[convert] {} coalesce chains for {num_levels} level(s) ({} candidate line(s), \
@@ -2338,7 +2356,7 @@ fn coalesce_level_counts_in_waves(
         } else {
             "counting"
         },
-        inputs.len()
+        lines.lines().len()
     );
     // One run per level, `wave` levels at a time. With `prebuild` it produces
     // BOTH the count the level plan needs and the table pass 2 needs.
@@ -2353,13 +2371,12 @@ fn coalesce_level_counts_in_waves(
             }
             let gsd = level_specs[level].0;
             if !prebuild {
-                let chains = super::convert::coalesce_level_chains(
-                    &inputs, level, finest, gsd, crs, options,
-                );
+                let chains =
+                    super::convert::coalesce_level_chains(&lines, level, finest, gsd, crs, options);
                 return (chains.len(), None, false);
             }
             let (table, hint) = super::convert::build_level_coalesce_table_and_hint(
-                &inputs,
+                &lines,
                 level,
                 finest,
                 gsd,
@@ -9949,6 +9966,41 @@ mod tests {
         assert!(full_build.tables[finest].is_none());
         assert!(full_build.merged, "10-segment polylines merge");
         assert_eq!(full_counts[finest], scratch.rows.len());
+    }
+
+    /// #817 A2: the exact-endpoint join (phase 1 of the chain stage) does
+    /// not depend on the level, so one run serves every level. It used to
+    /// run once per level (15 times on a z0-z14 ladder; 0.75 s each on
+    /// Oregon roads, one thread per level).
+    #[test]
+    fn chain_stage_runs_the_exact_join_once_for_all_levels() {
+        let scratch = chained_scratch(40);
+        let level_specs: Vec<(f64, Option<u8>)> = (0..6u8)
+            .map(|z| (20_000.0 / f64::from(1u32 << z), Some(z + 4)))
+            .collect();
+        let options = ConvertOptions::default();
+        // One pool thread: the counter is thread-local, and every level's
+        // stage runs on that thread.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let joins = pool.install(|| {
+            super::super::coalesce::EXACT_JOINS.with(|c| c.set(0));
+            for prebuild in [true, false] {
+                coalesce_level_counts(
+                    MemoryBudget::with_available(None),
+                    &scratch,
+                    &level_specs,
+                    Crs::Epsg4326,
+                    &options,
+                    prebuild,
+                    &crate::diagnostics::Diagnostics::default(),
+                );
+            }
+            super::super::coalesce::EXACT_JOINS.with(std::cell::Cell::get)
+        });
+        assert_eq!(joins, 2, "one exact join per chain stage, not per level");
     }
 
     /// How many levels' chain stages may run at once: the memory budget over
