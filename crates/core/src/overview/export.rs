@@ -1750,6 +1750,30 @@ fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Ra
     groups
 }
 
+/// `member_cap` bounded by the largest wave of any level in `plans`, but
+/// never below one `partition_target`.
+///
+/// A group holds every member it collected until its levels encode, valve
+/// and MVT workspace included, so a group past the largest wave raised the
+/// export's peak above what the serial loop holds anyway. #817: on Moldova
+/// `f0` all of z0..z11 (1.57M members) formed one group under a 2.1M cap;
+/// once the collect sped up, the group's valve-heavy encodes overlapped and
+/// peak RSS rose 15-20%. Bounded by the 766k-member z12 wave, it fell below
+/// `main`'s. One partition target is the floor: a group that small is
+/// smaller than one partition the serial loop may hold.
+fn bound_group_cap(member_cap: usize, plans: &[LevelPlan], partition_target: usize) -> usize {
+    let largest_wave = plans
+        .iter()
+        .flat_map(|plan| {
+            plan.partitions
+                .chunks(plan.wave.max(1))
+                .map(|wave| wave.iter().map(|p| p.members).sum::<usize>())
+        })
+        .max()
+        .unwrap_or(0);
+    member_cap.min(largest_wave.max(partition_target))
+}
+
 /// Resolve a requested partition-wave width to a concrete value.
 ///
 /// [`PARTITION_WAVE_AUTO`] (0) runs the memory-budget preflight (#303): the
@@ -2649,7 +2673,8 @@ fn export_pmtiles_validated(
             ..template
         })
         .collect();
-    let level_groups = plan_level_groups(&plans, group_cap);
+    let level_groups =
+        plan_level_groups(&plans, bound_group_cap(group_cap, &plans, partition_target));
     let mem = LevelMemory {
         store: store.as_mut(),
         budget: &mut *budget,
@@ -11357,6 +11382,31 @@ mod tests {
         assert!(plan_level_groups(&[], 100).is_empty());
     }
 
+    /// #817: a group never holds more members than the export's largest
+    /// wave, or one partition target when that is larger. On `origin/main`
+    /// the three levels below formed one group of 60 members under a cap of
+    /// 100, twice the 30-member wave the export holds anyway.
+    #[test]
+    fn a_level_group_never_outgrows_the_largest_wave() {
+        let plans = vec![
+            plan_with_members(3, &[10], 6),
+            plan_with_members(4, &[20], 6),
+            plan_with_members(5, &[30], 6),
+        ];
+        let cap = bound_group_cap(100, &plans, 1);
+        assert_eq!(plan_level_groups(&plans, cap), vec![0..2, 2..3]);
+        // A multi-wave level's largest wave, not its whole band, is the bound.
+        let multi = vec![
+            plan_with_members(3, &[10], 6),
+            plan_with_members(4, &[10], 6),
+            plan_with_members(5, &[3; 12], 6),
+        ];
+        assert_eq!(bound_group_cap(100, &multi, 1), 18);
+        // One partition target is the floor, and the serial cap stays 0.
+        assert_eq!(bound_group_cap(100, &plans, 64), 64);
+        assert_eq!(bound_group_cap(0, &plans, 64), 0);
+    }
+
     /// #647: the group cap is one full ceiling-width wave of target-sized
     /// partitions, narrowed by the same RAM budget the #311 per-level guard
     /// uses when the member size and RAM are both known.
@@ -11941,8 +11991,11 @@ mod tests {
                     let single_read = input == t_part.path() && !force_legacy_pass2;
                     assert_eq!(serial.single_read, single_read, "{input:?}");
                     assert_eq!(concurrent.single_read, single_read, "{input:?}");
+                    // #817: at a target of 4 the finest level's wave is the
+                    // largest, so it runs alone ([`bound_group_cap`]).
                     assert!(
-                        concurrent.level_groups.iter().any(|g| g.len() > 1),
+                        target != DEFAULT_PARTITION_TARGET
+                            || concurrent.level_groups.iter().any(|g| g.len() > 1),
                         "no level group formed (target {target}, wave {wave}): {:?}",
                         concurrent.level_groups
                     );
