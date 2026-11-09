@@ -526,6 +526,17 @@ Two checks, both exit 1:
   `ci/exemptions.toml`, with the count bumped in
   `scripts/ci/tests/test_exemptions.py`.
 
+The guard sets `RAYON_NUM_THREADS` itself for every run (16 for the scaling
+arm, removed otherwise); `record` and `check` refuse to start when the parent
+environment sets it. `check --inject-threads N` is the one supported way to
+pin the full arm, for the failure demo; the verdict and `--json-out` say it was
+injected, and `record --inject-threads` is refused. A baseline field missing
+from the current run (or from some of its rounds) fails the check; a matched
+baseline recorded before these fields exist reports `baseline: NOT APPLICABLE
+(... run record)`. `record --cells X` merges into the host class entry (other
+cells and `floors` stay). CPU core-seconds baselines under 0.05 s are skipped
+with a printed reason.
+
 On the pinned 64-core host (build both binaries first, see valve_guard.py):
 
 ```bash
@@ -533,7 +544,7 @@ G="uv run python -I benchmarks/valve_guard.py"
 A="--mim target/release/tylertoo --glibc target/glibc/release/tylertoo --data ~/bench-data"
 $G record $A                                     # (i) baseline, seeds floors
 $G check  $A                                     # (ii) must pass
-RAYON_NUM_THREADS=1 $G check $A --cells moldova-tiles   # (iii) demo: must fail
+$G check  $A --cells moldova-tiles --inject-threads 1   # (iii) demo: must fail, labelled INJECTED
 ```
 
 All of this is collected only while `TYLERTOO_PROFILE_JSON` is set, and it

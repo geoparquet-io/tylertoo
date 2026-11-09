@@ -89,6 +89,7 @@ SPEEDUP_DROP_MAX = 0.15  # 16-to-full-thread speedup may fall 15% below the base
 CPU_RISE_MAX = 0.25      # a phase's CPU core-seconds may rise 25% over the baseline's (same output)
 LOW_THREADS = 16
 SCALING_CELLS = ("moldova-tiles",)  # the cells also run at RAYON_NUM_THREADS=LOW_THREADS
+CPU_MIN_BASELINE_S = 0.05  # a shorter phase's core-seconds are noise: skipped, said so
 CORE_PHASES = ("convert/pass2 (output sink)", "export/levels")
 EXEMPTIONS = HERE.parent / "ci" / "exemptions.toml"
 
@@ -150,7 +151,27 @@ def prepare(bins: dict, data: Path, work: Path, cells: list[str]) -> dict:
     return {"ov792": str(ov792), "movf0": str(movf0), "moldova": str(moldova)}
 
 
-def measure(cells: list[str], bins: dict, data: Path, rounds: int, gate) -> dict:
+def run_env(parent: dict, threads: int | None, prof: str) -> dict:
+    """The child env: RAYON_NUM_THREADS set explicitly per arm (`threads`) or
+    removed, so a parent's limit never reaches a run unannounced."""
+    env = {k: v for k, v in parent.items() if k != "RAYON_NUM_THREADS"}
+    env["TYLERTOO_PROFILE_JSON"] = prof
+    if threads:
+        env["RAYON_NUM_THREADS"] = str(threads)
+    return env
+
+
+def refuse_thread_env(mode: str, inject: int | None, parent: dict) -> None:
+    """record never runs with a thread limit; check takes one only as --inject-threads."""
+    if mode == "record" and inject:
+        raise SystemExit("--inject-threads is check-only: a recorded baseline must be unrestricted")
+    if "RAYON_NUM_THREADS" in parent:
+        raise SystemExit("RAYON_NUM_THREADS is set in the environment; unset it (the guard sets it "
+                         "per arm). To demonstrate a failure use `check --inject-threads N`")
+
+
+def measure(cells: list[str], bins: dict, data: Path, rounds: int, gate,
+            inject_threads: int | None = None) -> dict:
     caps = {"wall_s": 1800, "rss_gib": 32, "scratch_gib": 30}
     results: dict[str, list[dict]] = {c: [] for c in cells}
     low: dict[str, list[dict]] = {c: [] for c in cells if c in SCALING_CELLS}
@@ -160,8 +181,9 @@ def measure(cells: list[str], bins: dict, data: Path, rounds: int, gate) -> dict
         gate.last_own_end = time.monotonic()
         for rnd in range(rounds):
             order = cells if rnd % 2 == 0 else cells[::-1]  # drift cancels
-            jobs = [(c, None) for c in order] + [(c, LOW_THREADS) for c in order if c in low]
-            for cell, threads in jobs:
+            jobs = [(c, False) for c in order] + [(c, True) for c in order if c in low]
+            for cell, is_low in jobs:
+                threads = LOW_THREADS if is_low else inject_threads
                 rm.require_disk(work, 10)
                 if gate.wait().get("gate") == "TIMED_OUT":
                     raise SystemExit(f"{cell} round {rnd}: host stayed busy past the gate; "
@@ -169,8 +191,7 @@ def measure(cells: list[str], bins: dict, data: Path, rounds: int, gate) -> dict
                 argv = ["/usr/bin/time", "-v", *command(cell, bins, work, prepared)]
                 prof = work / "profile.jsonl"
                 prof.unlink(missing_ok=True)
-                run = rm.run_capped(argv, caps, {**os.environ, "TYLERTOO_PROFILE_JSON": str(prof),
-                                                  **({"RAYON_NUM_THREADS": str(threads)} if threads else {})},
+                run = rm.run_capped(argv, caps, run_env(os.environ, threads, str(prof)),
                                     work / "log.txt", work)
                 if (work / "out.pmtiles").is_file():
                     run["output_sha256"] = rm.sha256_file(work / "out.pmtiles")
@@ -180,49 +201,64 @@ def measure(cells: list[str], bins: dict, data: Path, rounds: int, gate) -> dict
                 subprocess.run(["sync"], check=False)
                 if run["status"] != "ok":
                     raise SystemExit(f"{cell} round {rnd}: {run['status']}\n{run['stderr_tail']}")
-                (low if threads else results)[cell].append(run)
+                (low if is_low else results)[cell].append(run)
                 print(f"  {cell:16} r{rnd} t{threads or 'all'} {run['wall_s']:7.2f} s {run['peak_rss_kib'] / 1048576:6.2f} GiB",
                       flush=True)
     return {c: cell_summary(rs, low.get(c)) for c, rs in results.items()}
 
 
-def _phase(runs: list[dict], key: str, fn) -> dict:
-    """{phase: median of fn(sampler phase)} over the runs, CORE_PHASES only."""
+def _phase(runs: list[dict], fn) -> tuple[dict, dict]:
+    """({phase: median of fn(sampler phase)}, {phase: rounds that had it}) over
+    the runs, CORE_PHASES only. A round counts only if fn gave a value."""
     vals: dict[str, list[float]] = {}
     for r in runs:
         for line in ("convert", "export"):
             for name, p in ((r.get("profile") or {}).get(line) or {}).get("phases", {}).items():
                 if f"{line}/{name}" in CORE_PHASES and (v := fn(p)) is not None:
                     vals.setdefault(f"{line}/{name}", []).append(v)
-    return {k: round(statistics.median(v), 3) for k, v in vals.items()}
+    # six decimals: a short phase must not round to a zero baseline
+    return ({k: round(statistics.median(v), 6) for k, v in vals.items()}, {k: len(v) for k, v in vals.items()})
 
 
 def _cpu(p: dict) -> float | None:
-    return p["cpu_user_secs"] + p["cpu_sys_secs"] if p.get("cpu_user_secs") is not None else None
+    if p.get("cpu_user_secs") is None or p.get("cpu_sys_secs") is None:
+        return None
+    return p["cpu_user_secs"] + p["cpu_sys_secs"]
+
+
+def _whole(p: dict) -> float | None:
+    """A phase's wall, only when its cores and CPU were reported too."""
+    return p.get("wall_secs") if p.get("effective_cores") is not None and _cpu(p) is not None else None
 
 
 def cell_summary(rs: list[dict], low: list[dict] | None = None) -> dict:
     """One cell's baseline record from its runs: medians of wall, RSS, whole-run
     cores, the pass-2 and levels phase cores, wall and CPU core-seconds, and
-    the export serial share. `low` are the same cell's runs at LOW_THREADS:
-    they add `speedup_16_to_full` (low wall over full wall, whole run and per phase)."""
+    the export serial share, with how many rounds reported each (a gate must
+    not pass on a sample thinner than the run). `low` are the same cell's runs
+    at LOW_THREADS: they add `speedup_16_to_full` (low wall over full wall,
+    whole run and per phase)."""
     shares = [v for r in rs if (v := (r.get("profile", {}).get("export") or {}).get("serial_share")) is not None]
+    walls, counts = _phase(rs, _whole)
     out = {"wall_s": round(statistics.median(r["wall_s"] for r in rs), 3),
            "peak_rss_kib": int(statistics.median(r["peak_rss_kib"] for r in rs)),
            "peak_rss_min_kib": min(r["peak_rss_kib"] for r in rs),
            "effective_cores": statistics.median(r["effective_cores"] or 0 for r in rs),
            "phase_cores": {k: v["median"] for k, v in rm.phase_cores(rs).items() if k in CORE_PHASES},
-           "phase_wall_s": _phase(rs, "wall", lambda p: p.get("wall_secs")),
-           "phase_cpu_s": _phase(rs, "cpu", _cpu),
+           "phase_wall_s": walls, "phase_cpu_s": _phase(rs, lambda p: _cpu(p) if _whole(p) is not None else None)[0],
+           "phase_rounds": counts,
            "serial_share": statistics.median(shares) if shares else None,
+           "serial_share_rounds": len(shares),
            "output_sha256": rs[0].get("output_sha256"),
            "rounds": len(rs)}
     if low:
-        lo = {"whole": statistics.median(r["wall_s"] for r in low),
-              **_phase(low, "wall", lambda p: p.get("wall_secs"))}
-        hi = {"whole": statistics.median(r["wall_s"] for r in rs), **out["phase_wall_s"]}
+        lo_walls, lo_counts = _phase(low, _whole)
+        lo = {"whole": statistics.median(r["wall_s"] for r in low), **lo_walls}
+        hi = {"whole": statistics.median(r["wall_s"] for r in rs), **walls}
         out["speedup_16_to_full"] = {k: round(lo[k] / hi[k], 3) for k in hi if k in lo and hi[k]}
         out["low_threads"] = LOW_THREADS
+        out["low_rounds"] = len(low)
+        out["low_phase_rounds"] = lo_counts
     return out
 
 
@@ -242,9 +278,16 @@ def ratio_failures(cells: dict) -> list[str]:  # noqa: D103
     return bad
 
 
-def baseline_failures(cells: dict, baseline: dict) -> list[str]:
-    """Cells over their limits against one host class's baseline record."""
-    bad = []
+def _stale(base: dict, cell: str) -> bool:
+    """A baseline cell recorded before #817's fields (so the new checks cannot run)."""
+    return "phase_cores" not in base or (cell in SCALING_CELLS and "speedup_16_to_full" not in base)
+
+
+def baseline_failures(cells: dict, baseline: dict) -> tuple[list[str], list[str], list[str]]:
+    """(failures, stale cells, skipped checks) of the cells against one host
+    class's baseline record. A field the baseline has must be in the current
+    run, in every round; a baseline cell without the #817 fields is `stale`."""
+    bad, stale, skipped = [], [], []
     for cell, now in cells.items():
         base = baseline["cells"].get(cell)
         if not base:
@@ -260,23 +303,42 @@ def baseline_failures(cells: dict, baseline: dict) -> list[str]:
             bad.append(f"{cell} wall {now['wall_s']} s is {wall:.2f}x its baseline {base['wall_s']} s")
         if rss > RSS_REGRESSION_MAX:
             bad.append(f"{cell} peak RSS is {rss:.2f}x its baseline")
+        if _stale(base, cell):
+            stale.append(cell)
+        rounds, low_rounds = now.get("rounds", 0), now.get("low_rounds", 0)
+        for phase in base.get("phase_cores") or {}:
+            n = (now.get("phase_rounds") or {}).get(phase, 0)
+            if n < rounds or n == 0:
+                bad.append(f"{cell} {phase} telemetry missing in {rounds - n} of {rounds} rounds")
+        for phase in base.get("speedup_16_to_full") or {}:
+            n = low_rounds if phase == "whole" else (now.get("low_phase_rounds") or {}).get(phase, 0)
+            if n < low_rounds or n == 0:
+                bad.append(f"{cell} {phase} {LOW_THREADS}-thread telemetry missing in "
+                           f"{low_rounds - n} of {low_rounds} rounds")
         for phase, was in (base.get("phase_cores") or {}).items():
             got = (now.get("phase_cores") or {}).get(phase)
-            if got is not None and was and got < was * (1 - CORES_DROP_MAX):
+            if got is not None and was is not None and got < was * (1 - CORES_DROP_MAX):
                 bad.append(f"{cell} {phase} effective cores {got} is more than "
                            f"{CORES_DROP_MAX:.0%} below its baseline {was}")
         for phase, was in (base.get("speedup_16_to_full") or {}).items():
             got = (now.get("speedup_16_to_full") or {}).get(phase)
-            if got is not None and got < was * (1 - SPEEDUP_DROP_MAX):
+            if got is None:
+                bad.append(f"{cell} {phase} {LOW_THREADS}-to-full speedup missing from this run")
+            elif got < was * (1 - SPEEDUP_DROP_MAX):
                 bad.append(f"{cell} {phase} {LOW_THREADS}-to-full speedup {got} is more than "
                            f"{SPEEDUP_DROP_MAX:.0%} below its baseline {was}")
-        same = base.get("output_sha256") and base.get("output_sha256") == now.get("output_sha256")
-        for phase, was in ((base.get("phase_cpu_s") or {}).items() if same else ()):
-            got = (now.get("phase_cpu_s") or {}).get(phase)
-            if got is not None and was and got > was * (1 + CPU_RISE_MAX):
-                bad.append(f"{cell} {phase} CPU core-seconds {got} is more than "
-                           f"{CPU_RISE_MAX:.0%} above its baseline {was}")
-    return bad
+        if base.get("output_sha256") and base.get("output_sha256") == now.get("output_sha256"):
+            for phase, was in (base.get("phase_cpu_s") or {}).items():
+                got = (now.get("phase_cpu_s") or {}).get(phase)
+                if got is None:
+                    bad.append(f"{cell} {phase} CPU core-seconds missing from this run")
+                elif was < CPU_MIN_BASELINE_S:
+                    skipped.append(f"{cell} {phase} CPU core-seconds: baseline {was} s is under "
+                                   f"{CPU_MIN_BASELINE_S} s")
+                elif got > was * (1 + CPU_RISE_MAX):
+                    bad.append(f"{cell} {phase} CPU core-seconds {got} is more than "
+                               f"{CPU_RISE_MAX:.0%} above its baseline {was}")
+    return bad, stale, skipped
 
 
 def load_exemptions(path: Path = EXEMPTIONS) -> set[str]:
@@ -296,18 +358,26 @@ def floor_failures(cells: dict, floors: dict, cpus: int, exempt) -> list[str]:
         if whole is not None and whole < need:
             bad.append(f"{cell} effective cores {whole} < floor {need:g} "
                        f"({floors['whole_cores_frac']} x {cpus} CPUs)")
-        if share is not None and share > floors["serial_share_max"]:
+        if share is None:
+            bad.append(f"{cell} serial share missing from this run (export profile not read)")
+        elif now.get("serial_share_rounds", now.get("rounds", 0)) < now.get("rounds", 0):
+            bad.append(f"{cell} serial share telemetry missing in "
+                       f"{now['rounds'] - now['serial_share_rounds']} of {now['rounds']} rounds")
+        elif share > floors["serial_share_max"]:
             bad.append(f"{cell} serial share {share} > {floors['serial_share_max']}")
     return bad
 
 
-def verdict(cells: dict, baseline_doc: dict | None, host: dict, exempt=frozenset()) -> dict:
+def verdict(cells: dict, baseline_doc: dict | None, host: dict, exempt=frozenset(),
+            injected_threads: int | None = None) -> dict:
     """Three halves: ratio always; baseline (wall, RSS, phase cores) and floors
     only against a baseline recorded on this host class (floors also need its
     `floors` section), else `not applicable` and why."""
     ratio = ratio_failures(cells)
     out = {"host_class": host_class_key(host),
            "ratio": {"status": "fail" if ratio else "pass", "failures": ratio}}
+    if injected_threads:
+        out["injected_threads"] = injected_threads
     have = sorted((baseline_doc or {}).get("hosts", {}))
     base = (baseline_doc or {}).get("hosts", {}).get(host_class_key(host))
     if base is None:
@@ -316,9 +386,12 @@ def verdict(cells: dict, baseline_doc: dict | None, host: dict, exempt=frozenset
         out["baseline"] = {"status": "not applicable", "reason": reason, "failures": []}
         out["floors"] = {"status": "not applicable", "reason": reason, "failures": []}
     else:
-        bad = baseline_failures(cells, base)
+        bad, stale, skipped = baseline_failures(cells, base)
         out["baseline"] = {"status": "fail" if bad else "pass", "failures": bad,
-                           "measured": base.get("measured")}
+                           "measured": base.get("measured"), "skipped": skipped}
+        if stale and not bad:
+            out["baseline"].update(status="not applicable", reason=(
+                f"baseline predates #817 fields for {', '.join(stale)}; run record"))
         if base.get("floors"):
             bad = floor_failures(cells, base["floors"], host["cpus"], exempt)
             out["floors"] = {"status": "fail" if bad else "pass", "failures": bad}
@@ -333,7 +406,8 @@ def summary_lines(v: dict) -> list[str]:
     def line(name: str, h: dict) -> str:
         why = f" ({h['reason']})" if h["status"] == "not applicable" else ""
         return f"{name}: {h['status'].upper()}{why}"
-    return [f"ratio: {v['ratio']['status'].upper()}", line("baseline", v["baseline"]),
+    inj = f" (INJECTED: full arm pinned to {v['injected_threads']} threads)" if v.get("injected_threads") else ""
+    return [f"ratio: {v['ratio']['status'].upper()}{inj}", line("baseline", v["baseline"]),
             line("floors", v["floors"])]
 
 
@@ -349,7 +423,8 @@ def with_record(baseline_doc: dict | None, record: dict) -> dict:
     old = hosts.get(host_class_key(record["host"]), {}).get("floors")
     if old and "floors" not in record:
         record = {**record, "floors": old}
-    hosts[host_class_key(record["host"])] = record
+    prev = hosts.get(host_class_key(record["host"]), {}).get("cells", {})
+    hosts[host_class_key(record["host"])] = {**record, "cells": {**prev, **record["cells"]}}
     return {"hosts": hosts}
 
 
@@ -362,6 +437,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--cells", nargs="*", default=list(CELLS), choices=list(CELLS))
     ap.add_argument("--baseline", type=Path, default=BASELINE)
+    ap.add_argument("--inject-threads", type=int, help="check only: pin the full-thread arm to N "
+                    "threads (a failure demo); the verdict is labelled INJECTED")
     ap.add_argument("--load-max", type=float, default=3.0)
     ap.add_argument("--json-out", type=Path, help="also write the measured cells here")
     args = ap.parse_args(argv)
@@ -373,14 +450,17 @@ def main(argv: list[str] | None = None) -> int:
         if not b.exists():
             raise SystemExit(f"missing binary {b}")
     gate = rm.Gate(args.load_max, 3600, Path(tempfile.gettempdir()) / "valve-guard-gate.log")
-    cells = measure(args.cells, bins, args.data, args.rounds, gate)
+    refuse_thread_env(args.mode, args.inject_threads, os.environ)
+    cells = measure(args.cells, bins, args.data, args.rounds, gate, args.inject_threads)
     record = {"host": rm.host_class(),
               "inputs": {"792": (rm.sha256_file(p) if (p := args.data / "792" / "buildings.parquet").exists() else None),
                          "moldova": rm.load_manifest()["inputs"]["moldova"]["sha256"]},
               "hostname": platform.node(), "measured": time.strftime("%F"), "cells": cells,
               "limits": {"ratio_wall": RATIO_WALL_MAX, "ratio_rss": RATIO_RSS_MAX,
                          "wall": WALL_REGRESSION_MAX, "rss": RSS_REGRESSION_MAX}}
-    record["limits"]["cores_drop"] = CORES_DROP_MAX
+    record["limits"].update(cores_drop=CORES_DROP_MAX, speedup_drop=SPEEDUP_DROP_MAX, cpu_rise=CPU_RISE_MAX)
+    if args.inject_threads:
+        record["injected_threads"] = args.inject_threads
     doc = json.loads(args.baseline.read_text()) if args.baseline.exists() else None
     if args.mode == "record" and not (doc or {}).get("hosts", {}).get(host_class_key(record["host"]), {}).get("floors"):
         record["floors"] = DEFAULT_FLOORS
@@ -389,7 +469,7 @@ def main(argv: list[str] | None = None) -> int:
         args.baseline.write_text(json.dumps(with_record(doc, record), indent=2) + "\n")
         print(f"wrote {args.baseline} [{host_class_key(record['host'])}]")
         doc = with_record(doc, record)
-    v = verdict(cells, doc, record["host"], load_exemptions())
+    v = verdict(cells, doc, record["host"], load_exemptions(), args.inject_threads)
     if args.json_out:
         args.json_out.write_text(json.dumps({**record, "verdict": v}, indent=2) + "\n")
     for f in v["ratio"]["failures"] + v["baseline"]["failures"] + v["floors"]["failures"]:

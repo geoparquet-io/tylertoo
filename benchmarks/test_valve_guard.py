@@ -77,9 +77,13 @@ PASS2, LEVELS = "convert/pass2 (output sink)", "export/levels"
 FLOORS = {"whole_cores_frac": 0.25, "serial_share_max": 0.10}  # 16 of 64 cores
 
 
-def _cores_cell(pass2=40.0, levels=40.0, whole=30.0, share=0.05) -> dict:
+def _cores_cell(pass2=40.0, levels=40.0, whole=30.0, share=0.05, speed=3.0, cpu=100.0, sha="aa") -> dict:
     return {**_cell(10.0), "effective_cores": whole, "serial_share": share,
-            "phase_cores": {PASS2: pass2, LEVELS: levels}}
+            "phase_cores": {PASS2: pass2, LEVELS: levels},
+            "speedup_16_to_full": {PASS2: speed, LEVELS: speed, "whole": speed},
+            "phase_cpu_s": {PASS2: cpu, LEVELS: cpu}, "output_sha256": sha,
+            "phase_rounds": {PASS2: 3, LEVELS: 3}, "serial_share_rounds": 3,
+            "low_phase_rounds": {PASS2: 3, LEVELS: 3}, "low_rounds": 3}
 
 
 def _cores_baseline(floors=FLOORS) -> dict:
@@ -159,8 +163,7 @@ def test_record_keeps_the_classes_floors():
 
 # --- scaling and core-seconds checks (#817 follow-up) --------------------------
 def _scaled(speed=3.0, cpu=100.0, sha="aa", **kw) -> dict:
-    return {**_cores_cell(**kw), "speedup_16_to_full": {PASS2: speed, LEVELS: speed, "whole": speed},
-            "phase_cpu_s": {PASS2: cpu, LEVELS: cpu}, "output_sha256": sha}
+    return _cores_cell(speed=speed, cpu=cpu, sha=sha, **kw)
 
 
 def _scaled_check(cell: dict, host=VM) -> dict:
@@ -202,3 +205,90 @@ def test_cell_summary_derives_speedup_and_core_seconds():
     assert out["speedup_16_to_full"] == {"whole": 2.0, PASS2: 3.0, LEVELS: 2.0}
     assert out["phase_cpu_s"] == {PASS2: 50.0, LEVELS: 40.0}
     assert out["output_sha256"] == "aa"
+
+
+# --- review fixes (#817) ----------------------------------------------------------
+def _vs(cell: dict, base_cell: dict | None = None, floors=FLOORS) -> dict:
+    rec = {"host": VM, "cells": {"moldova-tiles": base_cell or _cores_cell()}}
+    if floors:
+        rec["floors"] = floors
+    return vg.verdict({"moldova-tiles": cell}, {"hosts": {vg.host_class_key(VM): rec}}, VM)
+
+
+def test_a_baseline_without_the_new_fields_is_not_applicable_not_pass():
+    v = _vs(_cores_cell(), base_cell=_cell(10.0))
+    assert v["baseline"]["status"] == "not applicable"
+    assert "run record" in v["baseline"]["reason"] and vg.exit_status(v) == 0
+    assert _vs(_cell(20.0), base_cell=_cell(10.0))["baseline"]["status"] == "fail"  # wall still gates
+
+
+def test_missing_phase_telemetry_fails():
+    gone = {**_cores_cell(), "phase_cores": {}, "phase_cpu_s": {}, "speedup_16_to_full": {"whole": 3.0},
+            "phase_rounds": {}}
+    v = _vs(gone)
+    assert v["baseline"]["status"] == "fail"
+    assert any("telemetry missing" in f for f in v["baseline"]["failures"])
+
+
+def test_phase_telemetry_in_only_some_rounds_fails():
+    part = {**_cores_cell(), "phase_rounds": {PASS2: 3, LEVELS: 1}}
+    v = _vs(part)
+    assert any("telemetry missing in 2 of 3 rounds" in f for f in v["baseline"]["failures"])
+
+
+def test_missing_serial_share_fails_the_floor():
+    v = _vs({**_cores_cell(), "serial_share": None, "serial_share_rounds": 0})
+    assert v["floors"]["status"] == "fail"
+    assert "serial share" in v["floors"]["failures"][0]
+    part = _vs({**_cores_cell(), "serial_share_rounds": 2})
+    assert part["floors"]["status"] == "fail"
+
+
+def test_a_zero_cpu_baseline_is_skipped_with_a_reason_not_by_truthiness():
+    base = _cores_cell(cpu=0.0)
+    v = _vs(_cores_cell(cpu=50.0), base_cell=base)
+    assert v["baseline"]["status"] == "pass" and v["baseline"]["skipped"]
+    # a real baseline of 0.5 core-s is compared
+    v = _vs(_cores_cell(cpu=0.7), base_cell=_cores_cell(cpu=0.5))
+    assert any("core-seconds" in f for f in v["baseline"]["failures"])
+
+
+def test_cell_summary_keeps_precision_and_counts_rounds():
+    def run(ph):
+        prof = {"convert": {"phases": {"pass2 (output sink)": ph} if ph else {}}}
+        return {"wall_s": 1.0, "peak_rss_kib": 5, "effective_cores": 3, "profile": prof}
+    tiny = {"wall_secs": 0.0004, "cpu_user_secs": 0.0003, "cpu_sys_secs": 0.0, "effective_cores": 0.7}
+    out = vg.cell_summary([run(tiny), run(tiny), run(None)])
+    assert out["phase_cpu_s"][PASS2] == 0.0003  # noqa: PLR2004
+    assert out["phase_rounds"][PASS2] == 2  # noqa: PLR2004 and rounds == 3
+
+
+def test_record_merges_per_cell_and_keeps_floors():
+    old = _cores_baseline()
+    new = vg.with_record(old, {"host": VM, "cells": {"792-def": _cell(9.0)}})
+    entry = new["hosts"][vg.host_class_key(VM)]
+    assert set(entry["cells"]) == {"moldova-tiles", "792-def"} and entry["floors"] == FLOORS
+
+
+def test_thread_env_is_explicit_per_arm():
+    env = {"PATH": "/bin", "RAYON_NUM_THREADS": "16"}
+    assert "RAYON_NUM_THREADS" not in vg.run_env(env, None, "p")
+    assert vg.run_env(env, 16, "p")["RAYON_NUM_THREADS"] == "16"
+    assert vg.run_env(env, 1, "p")["TYLERTOO_PROFILE_JSON"] == "p"
+
+
+def test_record_and_untagged_check_refuse_a_parent_thread_limit():
+    for mode, inject in (("record", None), ("check", None), ("record", 1)):
+        try:
+            vg.refuse_thread_env(mode, inject, {"RAYON_NUM_THREADS": "16"})
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError((mode, inject))
+    vg.refuse_thread_env("check", 1, {})  # --inject-threads on check is the supported path
+
+
+def test_an_injected_run_is_labelled():
+    v = vg.verdict({"moldova-tiles": _cores_cell()}, None, VM, injected_threads=1)
+    assert v["injected_threads"] == 1
+    assert "INJECTED" in vg.summary_lines(v)[0]
