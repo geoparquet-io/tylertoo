@@ -34,8 +34,18 @@ Two kinds of failure, both exit status 1:
             of its class (ubuntu-latest, say) this half reports
             "baseline: NOT APPLICABLE", never a pass.
 
-Every check ends with two lines, one per half: `ratio: PASS|FAIL` and
-`baseline: PASS|FAIL|NOT APPLICABLE (<why>)`; --json-out records both.
+  cores     (#817) on a matched host class, the median effective cores of the
+            convert pass 2 and export levels phases (moldova-tiles measures
+            both) more than CORES_DROP_MAX (15%) below the baseline's fail
+            (part of `baseline`). The pinned class's baseline entry may also
+            hold `floors` {whole_cores_frac, serial_share_max}: whole-run
+            cores under frac x CPUs, or export serial_share over the max,
+            fail (`floors`). A cell is exempt only via `[cores_floor.<cell>]`
+            in ci/exemptions.toml.
+
+Every check ends with three lines: `ratio: PASS|FAIL`,
+`baseline: PASS|FAIL|NOT APPLICABLE (<why>)` and
+`floors: PASS|FAIL|NOT APPLICABLE (<why>)`; --json-out records all.
 
     uv run python -I benchmarks/valve_guard.py check \\
         --mim target/release/tylertoo --glibc target/glibc/release/tylertoo \\
@@ -56,6 +66,7 @@ import platform
 import statistics
 import subprocess
 import sys
+import tomllib
 import tempfile
 import time
 from pathlib import Path
@@ -70,6 +81,12 @@ RATIO_WALL_MAX = 1.8
 RATIO_RSS_MAX = 1.5
 WALL_REGRESSION_MAX = 1.15
 RSS_REGRESSION_MAX = 1.20
+CORES_DROP_MAX = 0.15  # a phase's median effective cores may fall 15% below the baseline's
+# Seeded into a recorded host class that has no `floors` yet; tighten them in
+# the baseline file as #813 lands (they are data there, not constants here).
+DEFAULT_FLOORS = {"whole_cores_frac": 0.05, "serial_share_max": 0.10}
+CORE_PHASES = ("convert/pass2 (output sink)", "export/levels")
+EXEMPTIONS = HERE.parent / "ci" / "exemptions.toml"
 
 SIZE_ARGS = ["--max-tile-size", "2000000", "--feature-order", "_size:desc"]
 OVERVIEW_792 = ["--max-zoom", "14", "--no-density-drop", "--polygon-visibility", "0",
@@ -142,7 +159,11 @@ def measure(cells: list[str], bins: dict, data: Path, rounds: int, gate) -> dict
                     raise SystemExit(f"{cell} round {rnd}: host stayed busy past the gate; "
                                      "nothing recorded")
                 argv = ["/usr/bin/time", "-v", *command(cell, bins, work, prepared)]
-                run = rm.run_capped(argv, caps, dict(os.environ), work / "log.txt", work)
+                prof = work / "profile.jsonl"
+                prof.unlink(missing_ok=True)
+                run = rm.run_capped(argv, caps, {**os.environ, "TYLERTOO_PROFILE_JSON": str(prof)},
+                                    work / "log.txt", work)
+                run["profile"] = rm.read_profile(prof)
                 gate.last_own_end = time.monotonic()  # our own load average is not a busy host
                 (work / "out.pmtiles").unlink(missing_ok=True)
                 subprocess.run(["sync"], check=False)
@@ -151,11 +172,20 @@ def measure(cells: list[str], bins: dict, data: Path, rounds: int, gate) -> dict
                 results[cell].append(run)
                 print(f"  {cell:16} r{rnd} {run['wall_s']:7.2f} s {run['peak_rss_kib'] / 1048576:6.2f} GiB",
                       flush=True)
-    return {c: {"wall_s": round(statistics.median(r["wall_s"] for r in rs), 3),
-                "peak_rss_kib": int(statistics.median(r["peak_rss_kib"] for r in rs)),
-                "peak_rss_min_kib": min(r["peak_rss_kib"] for r in rs),
-                "effective_cores": statistics.median(r["effective_cores"] or 0 for r in rs),
-                "rounds": len(rs)} for c, rs in results.items()}
+    return {c: cell_summary(rs) for c, rs in results.items()}
+
+
+def cell_summary(rs: list[dict]) -> dict:
+    """One cell's baseline record from its runs: medians of wall, RSS, whole-run
+    cores, the pass-2 and levels phase cores, and the export serial share."""
+    shares = [v for r in rs if (v := (r.get("profile", {}).get("export") or {}).get("serial_share")) is not None]
+    return {"wall_s": round(statistics.median(r["wall_s"] for r in rs), 3),
+            "peak_rss_kib": int(statistics.median(r["peak_rss_kib"] for r in rs)),
+            "peak_rss_min_kib": min(r["peak_rss_kib"] for r in rs),
+            "effective_cores": statistics.median(r["effective_cores"] or 0 for r in rs),
+            "phase_cores": {k: v["median"] for k, v in rm.phase_cores(rs).items() if k in CORE_PHASES},
+            "serial_share": statistics.median(shares) if shares else None,
+            "rounds": len(rs)}
 
 
 def ratio_failures(cells: dict) -> list[str]:  # noqa: D103
@@ -192,12 +222,40 @@ def baseline_failures(cells: dict, baseline: dict) -> list[str]:
             bad.append(f"{cell} wall {now['wall_s']} s is {wall:.2f}x its baseline {base['wall_s']} s")
         if rss > RSS_REGRESSION_MAX:
             bad.append(f"{cell} peak RSS is {rss:.2f}x its baseline")
+        for phase, was in (base.get("phase_cores") or {}).items():
+            got = (now.get("phase_cores") or {}).get(phase)
+            if got is not None and was and got < was * (1 - CORES_DROP_MAX):
+                bad.append(f"{cell} {phase} effective cores {got} is more than "
+                           f"{CORES_DROP_MAX:.0%} below its baseline {was}")
     return bad
 
 
-def verdict(cells: dict, baseline_doc: dict | None, host: dict) -> dict:
-    """Both halves: the ratio half always, the baseline half only against a
-    baseline recorded on this host class, else `not applicable` and why."""
+def load_exemptions(path: Path = EXEMPTIONS) -> set[str]:
+    """Cells exempt from the floors: `[cores_floor.<cell>]` in ci/exemptions.toml."""
+    return set(tomllib.loads(path.read_text()).get("cores_floor", {}))
+
+
+def floor_failures(cells: dict, floors: dict, cpus: int, exempt) -> list[str]:
+    """Cells under the pinned class's floors: whole-run cores as a fraction of
+    the CPUs, and the export serial share."""
+    bad = []
+    need = floors["whole_cores_frac"] * cpus
+    for cell, now in cells.items():
+        if cell in exempt:
+            continue
+        whole, share = now.get("effective_cores"), now.get("serial_share")
+        if whole is not None and whole < need:
+            bad.append(f"{cell} effective cores {whole} < floor {need:g} "
+                       f"({floors['whole_cores_frac']} x {cpus} CPUs)")
+        if share is not None and share > floors["serial_share_max"]:
+            bad.append(f"{cell} serial share {share} > {floors['serial_share_max']}")
+    return bad
+
+
+def verdict(cells: dict, baseline_doc: dict | None, host: dict, exempt=frozenset()) -> dict:
+    """Three halves: ratio always; baseline (wall, RSS, phase cores) and floors
+    only against a baseline recorded on this host class (floors also need its
+    `floors` section), else `not applicable` and why."""
     ratio = ratio_failures(cells)
     out = {"host_class": host_class_key(host),
            "ratio": {"status": "fail" if ratio else "pass", "failures": ratio}}
@@ -207,28 +265,41 @@ def verdict(cells: dict, baseline_doc: dict | None, host: dict) -> dict:
         reason = (f"no baseline for host class {host_class_key(host)}; recorded classes: "
                   f"{', '.join(have) or 'none'}")
         out["baseline"] = {"status": "not applicable", "reason": reason, "failures": []}
+        out["floors"] = {"status": "not applicable", "reason": reason, "failures": []}
     else:
         bad = baseline_failures(cells, base)
         out["baseline"] = {"status": "fail" if bad else "pass", "failures": bad,
                            "measured": base.get("measured")}
+        if base.get("floors"):
+            bad = floor_failures(cells, base["floors"], host["cpus"], exempt)
+            out["floors"] = {"status": "fail" if bad else "pass", "failures": bad}
+        else:
+            out["floors"] = {"status": "not applicable", "failures": [],
+                             "reason": f"host class {host_class_key(host)} has no floors section"}
     return out
 
 
 def summary_lines(v: dict) -> list[str]:
     """`ratio: ...` and `baseline: ...`, the two lines a check ends with."""
-    b = v["baseline"]
-    why = f" ({b['reason']})" if b["status"] == "not applicable" else ""
-    return [f"ratio: {v['ratio']['status'].upper()}", f"baseline: {b['status'].upper()}{why}"]
+    def line(name: str, h: dict) -> str:
+        why = f" ({h['reason']})" if h["status"] == "not applicable" else ""
+        return f"{name}: {h['status'].upper()}{why}"
+    return [f"ratio: {v['ratio']['status'].upper()}", line("baseline", v["baseline"]),
+            line("floors", v["floors"])]
 
 
 def exit_status(v: dict) -> int:
-    """1 when either half failed; `not applicable` is not a failure."""
-    return 1 if v["ratio"]["failures"] or v["baseline"]["failures"] else 0
+    """1 when any half failed; `not applicable` is not a failure."""
+    return 1 if v["ratio"]["failures"] or v["baseline"]["failures"] or v["floors"]["failures"] else 0
 
 
 def with_record(baseline_doc: dict | None, record: dict) -> dict:
-    """The baseline file with this host class's entry replaced."""
+    """The baseline file with this host class's entry replaced; the class's
+    hand-tuned `floors` survive a re-record."""
     hosts = dict((baseline_doc or {}).get("hosts", {}))
+    old = hosts.get(host_class_key(record["host"]), {}).get("floors")
+    if old and "floors" not in record:
+        record = {**record, "floors": old}
     hosts[host_class_key(record["host"])] = record
     return {"hosts": hosts}
 
@@ -258,16 +329,19 @@ def main(argv: list[str] | None = None) -> int:
               "hostname": platform.node(), "measured": time.strftime("%F"), "cells": cells,
               "limits": {"ratio_wall": RATIO_WALL_MAX, "ratio_rss": RATIO_RSS_MAX,
                          "wall": WALL_REGRESSION_MAX, "rss": RSS_REGRESSION_MAX}}
+    record["limits"]["cores_drop"] = CORES_DROP_MAX
     doc = json.loads(args.baseline.read_text()) if args.baseline.exists() else None
+    if args.mode == "record" and not (doc or {}).get("hosts", {}).get(host_class_key(record["host"]), {}).get("floors"):
+        record["floors"] = DEFAULT_FLOORS
     if args.mode == "record":
         args.baseline.parent.mkdir(parents=True, exist_ok=True)
         args.baseline.write_text(json.dumps(with_record(doc, record), indent=2) + "\n")
         print(f"wrote {args.baseline} [{host_class_key(record['host'])}]")
         doc = with_record(doc, record)
-    v = verdict(cells, doc, record["host"])
+    v = verdict(cells, doc, record["host"], load_exemptions())
     if args.json_out:
         args.json_out.write_text(json.dumps({**record, "verdict": v}, indent=2) + "\n")
-    for f in v["ratio"]["failures"] + v["baseline"]["failures"]:
+    for f in v["ratio"]["failures"] + v["baseline"]["failures"] + v["floors"]["failures"]:
         print(f"FAIL {f}")
     for line in summary_lines(v):
         print(line)

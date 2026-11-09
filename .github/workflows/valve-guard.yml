@@ -6,6 +6,9 @@
 # 6c3cec4 reads 2.0-2.1x wall at both, the fixed code 1.45-1.64x at both. The
 # ratio does move with core count, so these are not machine independent;
 # re-measure if the runner changes shape.
+# On the pinned host the script also gates effective cores (#817): phase cores
+# 15% under the baseline's, and the baseline entry's `floors` (whole-run cores,
+# export serial share). See context/PROFILING.md for the demo command.
 # The cell-by-cell comparison with benchmarks/baseline/valve_guard.json
 # (15% slower, 20% heavier) applies only when the runner matches the host the
 # baseline was recorded on (the script compares CPU model and count).
