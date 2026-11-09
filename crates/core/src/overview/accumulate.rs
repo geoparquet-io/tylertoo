@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 use super::assign::{gsd_to_coord_units, FeatureKind, FeatureTable};
-use super::level::Crs;
+use super::level::{Crs, MemoryProfile};
 use super::simplify::{
     dither_u01, export_zoom, level_tolerance, placeholder_side, CollapseMode, Representation,
 };
@@ -128,17 +128,22 @@ pub fn tiny_polygon_carriers(
     areas: &[f32],
     levels: &[AccumulateLevel],
     crs: Crs,
+    profile: MemoryProfile,
 ) -> Vec<Vec<usize>> {
     debug_assert_eq!(features.len(), min_levels.len());
     debug_assert_eq!(features.len(), areas.len());
     // Each level reads the shared inputs and writes only its own list, so
     // the levels run concurrently (#817: serial, this was 0.2 s of Moldova's
-    // and 1.4 s of NZ parcels' convert at any thread count).
-    let per_level: Vec<(Vec<usize>, Option<f64>)> = levels
-        .par_iter()
-        .enumerate()
-        .map(|(li, level)| level_carriers(features, min_levels, areas, li, level, crs))
-        .collect();
+    // and 1.4 s of NZ parcels' convert at any thread count). Each level holds
+    // its own occupied-patch map; bounded holds one at a time.
+    let run = |(li, level): (usize, &AccumulateLevel)| {
+        level_carriers(features, min_levels, areas, li, level, crs)
+    };
+    let per_level: Vec<(Vec<usize>, Option<f64>)> = if profile == MemoryProfile::Bounded {
+        levels.iter().enumerate().map(run).collect()
+    } else {
+        levels.par_iter().enumerate().map(run).collect()
+    };
     let floored_zooms: Vec<f64> = per_level.iter().filter_map(|(_, z)| *z).collect();
     let out: Vec<Vec<usize>> = per_level.into_iter().map(|(c, _)| c).collect();
     if !floored_zooms.is_empty() {
@@ -375,9 +380,44 @@ mod tests {
         let pool = rendezvous::pool(4);
         let _guard = rendezvous::arm("accumulate level", 4);
         let out = pool.install(|| {
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &levels, Crs::Epsg3857)
+            tiny_polygon_carriers(
+                &table(&feats),
+                &min_levels,
+                &areas,
+                &levels,
+                Crs::Epsg3857,
+                MemoryProfile::Auto,
+            )
         });
         assert!(rendezvous::met(), "the 4 levels never ran at once");
+        assert_eq!(out.len(), 4);
+    }
+
+    /// #817 review: under bounded, one occupied-patch map at a time.
+    #[test]
+    fn bounded_accumulates_one_level_at_a_time() {
+        let feats: Vec<AssignFeature> = (0..10).map(|i| square(i, 10.0, 10.0, 400.0)).collect();
+        let min_levels = vec![4u8; 10];
+        let areas = vec![160_000.0f32; 10];
+        let levels: Vec<AccumulateLevel> = (0..4)
+            .map(|l| AccumulateLevel::new(1000.0 / f64::from(1u32 << l), None, true))
+            .collect();
+        let pool = rendezvous::pool(4);
+        let _guard = rendezvous::arm("accumulate level", 2);
+        let out = pool.install(|| {
+            tiny_polygon_carriers(
+                &table(&feats),
+                &min_levels,
+                &areas,
+                &levels,
+                Crs::Epsg3857,
+                MemoryProfile::Bounded,
+            )
+        });
+        assert!(
+            !rendezvous::met(),
+            "bounded must not hold two levels' maps at once"
+        );
         assert_eq!(out.len(), 4);
     }
 
@@ -391,8 +431,14 @@ mod tests {
             .collect();
         let min_levels = vec![1u8; 10];
         let areas = vec![160_000.0f32; 10];
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         assert_eq!(out[0], vec![6]);
         assert!(out[1].is_empty(), "disabled level accumulates nothing");
     }
@@ -404,8 +450,14 @@ mod tests {
         let mut min_levels = vec![1u8; 10];
         min_levels[0] = 0; // already a member of level 0
         let areas = vec![160_000.0f32; 10];
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         // 8 polygons accumulate (10 minus the member minus the point):
         // 1.28e6 ⇒ one carrier, and it is the 7th accumulated (index 8).
         assert_eq!(out[0], vec![8]);
@@ -423,13 +475,25 @@ mod tests {
         }
         let min_levels = vec![1u8; 10];
         let areas = vec![160_000.0f32; 10]; // 5 × 160k = 800k < 1e6 per cell
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         assert!(out[0].is_empty(), "{:?}", out[0]);
         // Bigger fields: 5 × 300k = 1.5e6 per cell ⇒ one carrier per cell.
         let areas = vec![300_000.0f32; 10];
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         assert_eq!(out[0].len(), 2);
         assert_eq!(out[0], vec![3, 8], "the 4th field of each cell crosses");
     }
@@ -447,8 +511,14 @@ mod tests {
         let min_levels = vec![1u8; 11];
         let mut areas = vec![1_400_000.0f32; 10];
         areas.push(500_000.0);
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         assert_eq!(
             out[0],
             (0..10).collect::<Vec<_>>(),
@@ -472,8 +542,14 @@ mod tests {
             areas.push((0.1 * t) as f32);
         }
         let min_levels = vec![1u8; feats.len()];
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         let expected: f64 = areas.iter().map(|&a| f64::from(a).min(t)).sum();
         let emitted = out[0].len() as f64 * t;
         assert!(
@@ -497,8 +573,14 @@ mod tests {
         }
         let min_levels = vec![3u8; 3];
         let areas = vec![25_000_000.0f32; 3]; // 25 T each
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         assert!(
             out[0].is_empty(),
             "laddered features became carriers: {:?}",
@@ -553,8 +635,15 @@ mod tests {
         let min_levels = vec![1u8; n];
         let run = |levels: &[AccumulateLevel], area: f64| {
             let areas = vec![area as f32; n];
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, levels, Crs::Epsg3857)
-                .swap_remove(0)
+            tiny_polygon_carriers(
+                &table(&feats),
+                &min_levels,
+                &areas,
+                levels,
+                Crs::Epsg3857,
+                MemoryProfile::Auto,
+            )
+            .swap_remove(0)
         };
         let floored = run(&floored_lv, 0.5 * side * side);
         let sd = (n as f64 * 0.25).sqrt();
@@ -619,8 +708,14 @@ mod tests {
             .collect();
         let min_levels = vec![1u8; 1000];
         let areas = vec![90_000.0f32; 1000];
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         let cells = 4; // 128 km / 32 km patches
         let n = out[0].len();
         assert!((90 - cells..=90).contains(&n), "{n} carriers");
