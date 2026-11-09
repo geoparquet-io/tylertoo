@@ -690,18 +690,21 @@ fn tile_ref(
 /// (gzip'd MVT inflated roughly 50x into `geo` geometries and owned
 /// properties) and the batches cut from them are what parallel decoding
 /// holds beyond the serial walk, so this bounds that in bytes. A tile larger
-/// than this is a chunk of its own. Provisional (#817): see
-/// [`DECODE_THREADS`].
-const CHUNK_BYTES: usize = 256 << 10;
+/// than this is a chunk of its own. 2 MiB gives 16 threads several batches
+/// to encode per chunk; see [`DECODE_THREADS`] for the curve.
+const CHUNK_BYTES: usize = 2 << 20;
 
-/// Most threads that decode and encode. Each thread keeps the high-water mark
-/// of its tile and batch working sets in the allocator for the rest of the
-/// run (Moldova z12: ~15-20 MB a thread against ~100 MB of live heap at 64
-/// threads), so peak RSS grows with the threads used, not the work.
-/// Provisional (#817): 4 threads and 256 KiB chunks cost Moldova z12 about
-/// +10% peak RSS for 2.2x the serial speed; the cap is chosen from the
-/// speed-vs-RSS curve once the per-thread cost is attributed.
-const DECODE_THREADS: usize = 4;
+/// Most threads that decode and encode. Each thread keeps about 19 MB of
+/// allocator (mimalloc) high-water for the rest of the run, so peak RSS
+/// grows with the threads used, not the work (#817). Measured at 64
+/// threads, wall s / peak RSS GB, base -> 4 x 256 KiB -> 16 x 2 MiB ->
+/// unbounded (64 x 2 MiB):
+/// Moldova z12 8.6/0.95 -> 3.9/1.06 -> 1.75/1.63 -> 1.2/2.3;
+/// Moldova all zooms 15.1/1.01 -> 7.7/1.16 -> 3.2/1.69;
+/// Madagascar adm4 (58 columns) 3.8/0.21 -> 2.1/0.32 -> 0.86/0.77.
+/// 16 is the knee: 4.4-4.9x the serial walk for about +0.6 GB, which the
+/// 64-thread pool would raise by ~0.8 GB more for no wall gain.
+const DECODE_THREADS: usize = 16;
 
 /// Most tiles per chunk, whatever their bytes: a run of empty tile bodies
 /// would otherwise make one chunk of millions of tiles.
