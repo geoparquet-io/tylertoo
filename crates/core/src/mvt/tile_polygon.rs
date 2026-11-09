@@ -196,20 +196,39 @@ fn bind_holes(shells: &mut [Vec<TileRing>], holes: Vec<TileRing>) {
         return;
     }
     let boxes: Vec<_> = holes.iter().map(ring_box).collect();
-    let areas: Vec<i64> = shells.iter().map(|s| ring_area2(&s[0]).abs()).collect();
+    // Holes by min x, so a shell considers only those starting in its x range.
+    let mut by_x: Vec<usize> = (0..holes.len()).collect();
+    by_x.sort_unstable_by_key(|&k| boxes[k].0);
+    let xs: Vec<i32> = by_x.iter().map(|&k| boxes[k].0).collect();
+    // Smallest shell first, the first of equal ones: the first shell found to
+    // contain a hole is its target, and the hole is not tried again.
+    let mut order: Vec<(i64, usize)> = shells
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (ring_area2(&s[0]).abs(), i))
+        .collect();
+    order.sort_unstable();
     let mut targets: Vec<Option<usize>> = vec![None; holes.len()];
-    for (i, shell) in shells.iter().enumerate() {
-        let shell_box = ring_box(&shell[0]);
-        let candidates: Vec<usize> = (0..holes.len())
+    for (_, i) in order {
+        let shell = &shells[i][0];
+        let shell_box = ring_box(shell);
+        let (lo, hi) = (
+            xs.partition_point(|&x| x < shell_box.0),
+            xs.partition_point(|&x| x <= shell_box.2),
+        );
+        let candidates: Vec<usize> = by_x[lo..hi]
+            .iter()
+            .copied()
             .filter(|&k| {
-                targets[k].is_none_or(|old| areas[i] < areas[old])
-                    && box_within(boxes[k], shell_box)
+                #[cfg(test)]
+                BIND_TESTS.with(|c| c.set(c.get() + 1));
+                targets[k].is_none() && box_within(boxes[k], shell_box)
             })
             .collect();
         // Share one edge scan across the candidate holes. The exact locator
         // also retries boundary vertices and midpoints when necessary.
         let rings: Vec<&TileRing> = candidates.iter().map(|&k| &holes[k]).collect();
-        for (k, location) in candidates.into_iter().zip(locate_rings(&rings, &shell[0])) {
+        for (k, location) in candidates.into_iter().zip(locate_rings(&rings, shell)) {
             if location == Loc::Inside {
                 targets[k] = Some(i);
             }
@@ -226,6 +245,8 @@ fn bind_holes(shells: &mut [Vec<TileRing>], holes: Vec<TileRing>) {
 thread_local! {
     /// [`check_polygons`] calls on this thread.
     static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Hole/shell pairs [`bind_holes`] considered on this thread.
+    static BIND_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One edge of the feature, with the ring it belongs to.
@@ -1266,6 +1287,84 @@ mod tests {
                 .sum()
         };
         assert!(area(&fixed) > 0);
+    }
+
+    /// #772 (P1 tail): binding scanned every hole for every shell. An
+    /// overlay of a merged feature has thousands of each.
+    #[test]
+    fn hole_binding_considers_only_holes_near_each_shell() {
+        let mut shells = Vec::new();
+        let mut holes = Vec::new();
+        for c in 0..50 {
+            for r in 0..40 {
+                let (x, y) = (10 * c, 10 * r);
+                shells.push(vec![square(x, y, x + 8, y + 8)]);
+                holes.push(square(x + 2, y + 2, x + 4, y + 4));
+            }
+        }
+        let expected: Vec<Vec<TileRing>> = shells
+            .iter()
+            .zip(&holes)
+            .map(|(s, h)| vec![s[0].clone(), h.clone()])
+            .collect();
+        BIND_TESTS.with(|c| c.set(0));
+        bind_holes(&mut shells, holes);
+        let considered = BIND_TESTS.with(|c| c.get());
+        assert_eq!(shells, expected);
+        assert!(
+            considered < 2000 * 2000 / 10,
+            "{considered} pairs considered"
+        );
+    }
+
+    /// Smallest containing shell, the first of equal ones, holes in input
+    /// order: as the shell-by-shell scan bound them, on random nested rings.
+    #[test]
+    fn hole_binding_matches_the_shell_by_shell_scan() {
+        fn reference(shells: &mut [Vec<TileRing>], holes: Vec<TileRing>) {
+            let areas: Vec<i64> = shells.iter().map(|s| ring_area2(&s[0]).abs()).collect();
+            let mut targets: Vec<Option<usize>> = vec![None; holes.len()];
+            for (i, shell) in shells.iter().enumerate() {
+                for (k, h) in holes.iter().enumerate() {
+                    if targets[k].is_none_or(|old| areas[i] < areas[old])
+                        && box_within(ring_box(h), ring_box(&shell[0]))
+                        && locate_ring(h, &shell[0]) == Loc::Inside
+                    {
+                        targets[k] = Some(i);
+                    }
+                }
+            }
+            for (hole, target) in holes.into_iter().zip(targets) {
+                if let Some(i) = target {
+                    shells[i].push(hole);
+                }
+            }
+        }
+        let mut seed = 0x77_2b_u64;
+        let mut next = move |m: i32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as i32 % m
+        };
+        for _ in 0..200 {
+            let shells: Vec<Vec<TileRing>> = (0..=next(30))
+                .map(|_| {
+                    let (x, y, w) = (next(200), next(200), 4 + next(120));
+                    vec![square(x, y, x + w, y + next(2) + w)]
+                })
+                .collect();
+            let holes: Vec<TileRing> = (0..next(60))
+                .map(|_| {
+                    let (x, y, w) = (next(300), next(300), 1 + next(10));
+                    square(x, y, x + w, y + w)
+                })
+                .collect();
+            let (mut a, mut b) = (shells.clone(), shells);
+            bind_holes(&mut a, holes.clone());
+            reference(&mut b, holes);
+            assert_eq!(a, b);
+        }
     }
 
     #[test]
