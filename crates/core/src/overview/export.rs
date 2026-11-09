@@ -150,6 +150,7 @@ use super::stream::{
     ExportZoomProfile, RssSampler, RssSamplerReport,
 };
 use super::writer::LEVEL_COLUMN;
+use crate::input::InputError;
 use crate::input_set::{ConvertSource, RowGroupSelection};
 
 mod coalesce_valve;
@@ -4113,6 +4114,9 @@ struct ExportWorkTally {
     /// set of pool joins) it took them in (#817).
     collect_batches: u64,
     collect_groups: u64,
+    /// Band batches read on the thread that collects them, which then
+    /// waits on the read (#817).
+    band_reads_on_consumer: u64,
 }
 
 struct LevelCtx<'a> {
@@ -6198,9 +6202,13 @@ fn collect_into(
     // PERF (#817): a group's ordered finish (the gap walk, member routing
     // and the sink appends) runs alongside the next group's decode and clip,
     // so the pool is not idle while this thread walks the rows.
-    let group_rows = collect_group_rows();
+    let group_rows = collect_group_rows(ctx.band.profile);
+    // A group of wide rows closes at one reader batch's worth of bytes, so
+    // grouping never holds more than the reader's own batch cap allows.
+    let group_max_bytes = usize::try_from(tylertoo_io::decoded_batch_limit()).unwrap_or(usize::MAX);
     let mut group: Vec<RecordBatch> = Vec::new();
     let mut grouped = 0usize;
+    let mut group_bytes = 0usize;
     let mut clipped: Option<ClippedGroup> = None;
     let rows = &mut rows;
     let mut step = |batches: Vec<RecordBatch>| -> Result<(), ExportError> {
@@ -6216,15 +6224,24 @@ fn collect_into(
         clipped = Some(next?);
         Ok(())
     };
-    read_band(ctx.band, &selected, timers, |batch| {
-        grouped += batch.num_rows();
-        group.push(batch);
-        if grouped >= group_rows {
-            grouped = 0;
-            step(std::mem::take(&mut group))?;
-        }
-        Ok(())
-    })?;
+    read_band(
+        ctx.band,
+        &selected,
+        timers,
+        #[cfg(test)]
+        ctx.work,
+        |batch| {
+            grouped += batch.num_rows();
+            group_bytes += batch.get_array_memory_size();
+            group.push(batch);
+            if grouped >= group_rows || group_bytes >= group_max_bytes {
+                grouped = 0;
+                group_bytes = 0;
+                step(std::mem::take(&mut group))?;
+            }
+            Ok(())
+        },
+    )?;
     if !group.is_empty() {
         step(group)?;
     }
@@ -6263,6 +6280,7 @@ fn read_band(
     band: BandRead<'_>,
     selected: &[usize],
     timers: &ExportTimers,
+    #[cfg(test)] work: &Mutex<ExportWorkTally>,
     mut on_batch: impl FnMut(RecordBatch) -> Result<(), ExportError>,
 ) -> Result<(), ExportError> {
     let selection = RowGroupSelection::from_parts(vec![selected.to_vec()]);
@@ -6275,46 +6293,72 @@ fn read_band(
     let tuning = ReadTuning {
         budget: band.budget,
         batch_size: EXPORT_BATCH_SIZE,
-        workers: resolve_pass_read_workers(ReadPass::Build, READ_WORKERS_AUTO),
+        // `bounded` reads with one worker, as before #817: concurrent level
+        // reads each size their read-ahead from the same budget, uncharged.
+        workers: match band.profile {
+            MemoryProfile::Bounded => 1,
+            MemoryProfile::Auto | MemoryProfile::Speed => {
+                resolve_pass_read_workers(ReadPass::Build, READ_WORKERS_AUTO)
+            }
+        },
         avg_geom_bytes: None,
         footer: footer_price(band.source, Some(&selection), 0..columns).map_err(read_error)?,
         profile: band.profile,
     };
-    // The consumer's error is kept here and the read stopped, so the
-    // export reports it rather than a read error.
-    let mut failed = None;
-    // The collect holds two groups (one clipping, one finishing), so each
-    // reader needs about that many batches queued, not the budget's depth.
-    let ahead = 2 * collect_group_rows().div_ceil(EXPORT_BATCH_SIZE);
-    read_in_order_capped(
-        band.source,
-        Some(&selection),
-        None,
-        tuning,
-        Some(ahead),
-        |batch, _, read| {
-            add_nanos(&timers.band_read, read);
-            Ok(match on_batch(batch) {
-                Ok(()) => ReadFlow::Continue,
-                Err(e) => {
-                    failed = Some(e);
-                    ReadFlow::Stop
-                }
-            })
+    // The collect takes a group at a time, so each reader needs about one
+    // group queued, not the budget's depth: concurrent levels each read.
+    let ahead = collect_group_rows(band.profile).div_ceil(EXPORT_BATCH_SIZE);
+    #[cfg(test)]
+    let consumer = std::thread::current().id();
+    // The read runs on its own thread: with one reader (few cores, a tight
+    // budget, one segment) `read_in_order` reads on its caller's thread,
+    // and the pool would wait on each read.
+    scoped_pipe(
+        SINGLE_READ_IN_FLIGHT,
+        |tx: &Sender<RecordBatch>| -> Result<(), ExportError> {
+            read_in_order_capped(
+                band.source,
+                Some(&selection),
+                None,
+                tuning,
+                Some(ahead),
+                |batch, _, read| {
+                    add_nanos(&timers.band_read, read);
+                    #[cfg(test)]
+                    if std::thread::current().id() == consumer {
+                        work.lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .band_reads_on_consumer += 1;
+                    }
+                    // A closed channel is the consumer's error: stop cleanly.
+                    Ok(if tx.send(batch).is_ok() {
+                        ReadFlow::Continue
+                    } else {
+                        ReadFlow::Stop
+                    })
+                },
+            )
+            .map_err(read_error)
         },
+        |rx| rx.into_iter().try_for_each(&mut on_batch),
     )
-    .map_err(read_error)?;
-    failed.map_or(Ok(()), Err)
 }
 
-/// A band read's [`ConvertError`] as the export's error.
+/// A band read's [`ConvertError`] as the export's error, keeping its typed
+/// cause: [`Classify`](crate::error::Classify) finds a hostile input in the
+/// source chain.
 fn read_error(e: ConvertError) -> ExportError {
     match e {
-        ConvertError::Parquet(e) => ExportError::Reader(ReaderError::Parquet(e)),
-        ConvertError::Io(e) => ExportError::Io(e),
+        ConvertError::Parquet(e) | ConvertError::Input(InputError::Parquet(e)) => {
+            ExportError::Reader(ReaderError::Parquet(e))
+        }
+        ConvertError::Io(e) | ConvertError::Input(InputError::Io(e)) => ExportError::Io(e),
         ConvertError::Core(e) => ExportError::Core(e),
-        ConvertError::Arrow(e) => ExportError::Arrow(e),
-        e => ExportError::Io(std::io::Error::other(e.to_string())),
+        ConvertError::Arrow(e) | ConvertError::Input(InputError::Arrow(e)) => ExportError::Arrow(e),
+        ConvertError::Input(InputError::Decode(e)) => {
+            ExportError::Arrow(arrow_schema::ArrowError::ExternalError(Box::new(e)))
+        }
+        e => ExportError::Arrow(arrow_schema::ArrowError::ExternalError(Box::new(e))),
     }
 }
 
@@ -6324,9 +6368,16 @@ fn read_error(e: ConvertError) -> ExportError {
 /// batches and their members until it is merged.
 const COLLECT_GROUP_ROWS_PER_THREAD: usize = 512;
 
-/// The rows [`collect_into`] gathers per group on this pool.
-fn collect_group_rows() -> usize {
-    COLLECT_GROUP_ROWS_PER_THREAD.saturating_mul(rayon::current_num_threads())
+/// The rows [`collect_into`] gathers per group on this pool. `bounded`
+/// keeps one batch a group, the in-flight rows it held before #817: the
+/// groups' decoded and clipped rows are not priced in the budget.
+fn collect_group_rows(profile: MemoryProfile) -> usize {
+    match profile {
+        MemoryProfile::Bounded => EXPORT_BATCH_SIZE,
+        MemoryProfile::Auto | MemoryProfile::Speed => {
+            COLLECT_GROUP_ROWS_PER_THREAD.saturating_mul(rayon::current_num_threads())
+        }
+    }
 }
 
 /// The wave partition owning `key`. The wave's partitions are contiguous,
@@ -11767,7 +11818,7 @@ mod tests {
             layer_name: "ref".to_string(),
             ..Default::default()
         };
-        let run = |threads: usize| {
+        let run = |threads: usize, opts: &ExportOptions| {
             let out = tempfile::NamedTempFile::new().unwrap();
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -11777,7 +11828,7 @@ mod tests {
                 export_pmtiles_run(
                     input.path(),
                     out.path(),
-                    &opts,
+                    opts,
                     DEFAULT_PARTITION_TARGET,
                     &knobs(false, None, false),
                 )
@@ -11785,15 +11836,43 @@ mod tests {
             });
             (run.work, std::fs::read(out.path()).unwrap())
         };
-        let (wide, wide_bytes) = run(64);
+        let (wide, wide_bytes) = run(64, &opts);
         assert_eq!(wide.collect_batches, 3, "20,000 rows in 8,192-row batches");
         assert_eq!(
             wide.collect_groups, 1,
             "64 threads collect up to 32,768 rows per group"
         );
-        let (one, one_bytes) = run(1);
+        assert_eq!(
+            wide.band_reads_on_consumer, 0,
+            "a one-segment read ran on the collecting thread"
+        );
+        let (one, one_bytes) = run(1, &opts);
         assert_eq!(one.collect_groups, 3, "one thread collects batch by batch");
         assert!(wide_bytes == one_bytes, "grouping changed the archive");
+        let bounded = ExportOptions {
+            profile: MemoryProfile::Bounded,
+            ..opts.clone()
+        };
+        let (tight, tight_bytes) = run(64, &bounded);
+        assert_eq!(tight.collect_groups, 3, "bounded collects batch by batch");
+        assert!(tight_bytes == one_bytes, "bounded changed the archive");
+    }
+
+    /// #817: a band read's input error keeps its class. A hostile page
+    /// header arrives from the reader as `ConvertError::Input`; flattened to
+    /// a string, it read as a runtime failure.
+    #[test]
+    fn band_read_errors_keep_their_class() {
+        use crate::error::{Classify, ErrorKind};
+        let hostile = || {
+            arrow_schema::ArrowError::ExternalError(Box::new(tylertoo_io::Error::HostilePageHeader))
+        };
+        let e = read_error(ConvertError::Input(InputError::Arrow(hostile())));
+        assert_eq!(e.kind(), ErrorKind::Input, "{e}");
+        let e = read_error(ConvertError::Input(InputError::Decode(
+            tylertoo_io::Error::HostilePageHeader,
+        )));
+        assert_eq!(e.kind(), ErrorKind::Input, "{e}");
     }
 
     /// #817 (S1): the scan sizes a batch in a few tasks, not one per pool
