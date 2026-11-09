@@ -456,16 +456,17 @@ pub fn decode_pmtiles(
                 use rayon::prelude::*;
                 if !full.is_empty() {
                     let encoded = full.into_par_iter().map(encode).collect::<Result<_, _>>()?;
-                    // A send fails only when the writer stopped on an error,
-                    // which its join below returns.
-                    let _ = tx.send(encoded);
+                    // A send fails only when the writer stopped on its own
+                    // error, which the join below returns ahead of this one.
+                    tx.send(encoded).map_err(|_| writer_stopped())?;
                 }
                 Ok(())
             })
         })
         .and_then(|()| {
             if !carry.is_empty() {
-                let _ = tx.send(vec![encode(std::mem::take(&mut carry))?]);
+                tx.send(vec![encode(std::mem::take(&mut carry))?])
+                    .map_err(|_| writer_stopped())?;
             }
             Ok(())
         });
@@ -475,8 +476,9 @@ pub fn decode_pmtiles(
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         (walked, writer)
     });
-    walked?;
+    // A writer error is the cause of the walk's `writer_stopped`.
     let mut writer = writer?;
+    walked?;
 
     // #508: the encoder's own `into_keyvalue()` serializes `geometry_types`
     // straight out of a `HashSet`, so two decodes of the same archive produce
@@ -697,6 +699,10 @@ const CHUNK_BYTES: usize = 256 << 10;
 /// speed-vs-RSS curve once the per-thread cost is attributed.
 const DECODE_THREADS: usize = 4;
 
+/// Most tiles per chunk, whatever their bytes: a run of empty tile bodies
+/// would otherwise make one chunk of millions of tiles.
+const CHUNK_TILES: usize = 4096;
+
 #[cfg(test)]
 thread_local! {
     /// Chunks [`for_each_tile`] dispatched; a structural counter for tests.
@@ -742,13 +748,19 @@ where
         .map_err(|e| DecodeError::Write(format!("decode thread pool: {e}")))?;
     let mut job: Option<J> = None;
     let run = |job: Option<J>| job.map_or(Ok(()), |job| job());
+    // Every job runs on the capped pool, the last one included.
+    let in_pool = |job: Option<J>| match &pool {
+        Some(pool) => pool.install(|| run(job)),
+        None => run(job),
+    };
     loop {
         let mut chunk = Vec::new();
         let mut bytes = 0;
         // An unreadable tile ends the walk after the tiles before it, which
         // may hold an earlier error.
         let mut stop = None;
-        while bytes < chunk_bytes {
+        // Empty bodies weigh nothing, so the tile count is capped too.
+        while bytes < chunk_bytes && chunk.len() < CHUNK_TILES {
             let body = match refs.next() {
                 None => break,
                 Some(tile) => tile.and_then(|tile| {
@@ -768,7 +780,7 @@ where
             }
         }
         if chunk.is_empty() {
-            run(job)?;
+            in_pool(job)?;
             return stop.map_or(Ok(()), Err);
         }
         #[cfg(test)]
@@ -799,7 +811,7 @@ where
             .collect::<Result<Vec<_>, DecodeError>>()?;
         job = Some(sink(done)?);
         if let Some(e) = stop {
-            run(job)?;
+            in_pool(job)?;
             return Err(e);
         }
     }
@@ -1500,6 +1512,10 @@ type Row = (
     Geometry<f64>,
 );
 
+fn writer_stopped() -> DecodeError {
+    DecodeError::Write("the GeoParquet writer stopped".into())
+}
+
 /// An encoded batch and the GeoParquet metadata its encoder gathered.
 type EncodedBatch = (RecordBatch, GeoParquetMetadata);
 
@@ -2098,6 +2114,73 @@ mod tests {
         }
     }
 
+    /// roborev 344: the parallel walk keeps #462's read-ahead. One reader
+    /// walks the tiles in order however the chunks and threads fall, so 40
+    /// small clustered tiles cost one positioned read, not one window each.
+    #[test]
+    fn parallel_walk_reads_each_window_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::read(small_archive_of(dir.path(), 40)).unwrap();
+        let header = Header::from_bytes(&file[..HEADER_BYTES]).unwrap();
+        let entries = collect_entries(&file.as_slice(), &header).unwrap();
+        let src = CountingBytes {
+            bytes: &file,
+            reads: std::cell::Cell::new(0),
+        };
+        let tiles = {
+            CHUNK_BYTES_OVERRIDE.with(|c| c.set(Some(1)));
+            let mut tiles = 0;
+            for_each_tile(
+                &src,
+                &header,
+                &entries,
+                &DecodeOptions::default(),
+                |_| Ok(()),
+                |chunk| {
+                    tiles += chunk.len();
+                    Ok(|| Ok(()))
+                },
+            )
+            .unwrap();
+            CHUNK_BYTES_OVERRIDE.with(|c| c.set(None));
+            tiles
+        };
+        assert_eq!((tiles, src.reads.get()), (40, 1));
+    }
+
+    /// roborev 368: a run of empty tile bodies weighs no bytes, so the tile
+    /// count caps a chunk too; one entry for 10,000 empty tiles must not
+    /// become one 10,000-tile chunk.
+    #[test]
+    fn empty_bodies_still_split_into_bounded_chunks() {
+        let header = Header {
+            tile_compression: crate::compression::Compression::None,
+            ..Header::default()
+        };
+        let entries = [DirEntry {
+            tile_id: 0,
+            offset: 0,
+            length: 0,
+            run_length: 10_000,
+        }];
+        let (mut tiles, mut largest) = (0, 0);
+        for_each_tile(
+            &[0u8; 16].as_slice(),
+            &header,
+            &entries,
+            &DecodeOptions::default(),
+            |_| Ok(()),
+            |chunk| {
+                tiles += chunk.len();
+                largest = largest.max(chunk.len());
+                Ok(|| Ok(()))
+            },
+        )
+        .unwrap();
+        assert_eq!(tiles, 10_000);
+        assert!(largest <= CHUNK_TILES, "{largest}-tile chunk");
+    }
+
     #[test]
     fn coltype_unify_lattice() {
         use ColType::*;
@@ -2125,14 +2208,18 @@ mod tests {
     ];
 
     fn small_archive(dir: &Path) -> std::path::PathBuf {
+        small_archive_of(dir, 4)
+    }
+
+    fn small_archive_of(dir: &Path, tiles: u32) -> std::path::PathBuf {
         use crate::pmtiles_writer::StreamingPmtilesWriter;
         let path = dir.join("in.pmtiles");
         let mut writer = StreamingPmtilesWriter::new(crate::Compression::Gzip).unwrap();
         writer.set_layer_name("t");
-        for i in 0..4u32 {
+        for i in 0..tiles {
             let mut tile = POINT_TILE.to_vec();
             tile[12] = 0x02 + 2 * (i as u8); // MoveTo x = 1 + i (zigzag)
-            writer.add_tile(5, i, 7, &tile).unwrap();
+            writer.add_tile(5, i % 32, 7 + i / 32, &tile).unwrap();
         }
         writer.finalize(&path).unwrap();
         path
