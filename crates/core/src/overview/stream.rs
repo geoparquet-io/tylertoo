@@ -2617,6 +2617,16 @@ fn resolve_winner_tables(
     })
 }
 
+/// Free `items` across the rayon pool (#817 T1). One thread freeing
+/// millions of geometries was 0.6 s of Oregon's convert at 1 core; export
+/// frees its spill buckets the same way.
+fn release_in_parallel<I>(items: I)
+where
+    I: IntoParallelIterator,
+{
+    items.into_par_iter().for_each(drop);
+}
+
 /// Footer-only preparation: everything the convert driver settles before the
 /// first data page is read.
 ///
@@ -3624,6 +3634,11 @@ pub(crate) fn run_stages(
         },
         diagnostics,
     );
+    // Pass 2 reads the chain tables, never the line scratch: free it now,
+    // across the pool, rather than holding it through pass 2 (#817 T1).
+    if let Some(scratch) = coalesce_scratch {
+        release_in_parallel(scratch.geoms);
+    }
 
     let spill_reservation = reserve_spill_cache(
         &mut budget,
@@ -3718,6 +3733,13 @@ pub(crate) fn run_stages(
         },
         strategy,
     )?;
+
+    // The chain tables hold every level's simplified strokes: free them
+    // across the pool, not serially at scope end (#817 T1).
+    drop(ctxs);
+    // Per table: flattening the maps into one Vec would add a copy of every
+    // entry at the end of the run.
+    release_in_parallel(coalesce_tables);
 
     let (mut level_reports, level_spill_bytes) =
         build_level_reports(emitted, level_stats, &mut skipped, diagnostics);
@@ -9966,6 +9988,30 @@ mod tests {
         assert!(full_build.tables[finest].is_none());
         assert!(full_build.merged, "10-segment polylines merge");
         assert_eq!(full_counts[finest], scratch.rows.len());
+    }
+
+    /// #817 T1: convert's O(dataset) leftovers (the line scratch, the chain
+    /// tables) are freed across the pool, not by one thread at scope end
+    /// (0.6 s at 1 core on Oregon roads, in no profiled phase).
+    #[test]
+    fn release_in_parallel_frees_on_several_threads() {
+        struct Arrive;
+        impl Drop for Arrive {
+            fn drop(&mut self) {
+                super::super::accumulate::rendezvous::arrive("release");
+            }
+        }
+        let items: Vec<Arrive> = (0..4).map(|_| Arrive).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let _guard = super::super::accumulate::rendezvous::arm("release", 4);
+        pool.install(|| release_in_parallel(items));
+        assert!(
+            super::super::accumulate::rendezvous::met(),
+            "the 4 drops never ran at once"
+        );
     }
 
     /// #817 A2: the exact-endpoint join (phase 1 of the chain stage) does
