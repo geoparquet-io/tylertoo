@@ -1173,7 +1173,14 @@ fn build_carriers(
         return vec![Vec::new(); level_specs.len()];
     }
     let t = Instant::now();
-    let carriers = tiny_polygon_carriers(features, feat_min_levels, &areas, &acc_levels, crs);
+    let carriers = tiny_polygon_carriers(
+        features,
+        feat_min_levels,
+        &areas,
+        &acc_levels,
+        crs,
+        options.profile,
+    );
     let total: usize = carriers.iter().map(Vec::len).sum();
     log::info!(
         "[convert] tiny-polygon accumulator: {total} placeholder square(s) across {} \
