@@ -6227,13 +6227,7 @@ fn collect_into(
     // PERF (#817): a group's ordered finish (the gap walk, member routing
     // and the sink appends) runs alongside the next group's decode and clip,
     // so the pool is not idle while this thread walks the rows.
-    let group_rows = collect_group_rows(ctx.band.profile);
-    // A group of wide rows closes at one reader batch's worth of bytes, so
-    // grouping never holds more than the reader's own batch cap allows.
-    let group_max_bytes = usize::try_from(tylertoo_io::decoded_batch_limit()).unwrap_or(usize::MAX);
-    let mut group: Vec<RecordBatch> = Vec::new();
-    let mut grouped = 0usize;
-    let mut group_bytes = 0usize;
+    let mut group = CollectGroup::new(collect_group_rows(ctx.band.profile));
     let mut clipped: Option<ClippedGroup> = None;
     let rows = &mut rows;
     let mut step = |batches: Vec<RecordBatch>| -> Result<(), ExportError> {
@@ -6256,19 +6250,12 @@ fn collect_into(
         #[cfg(test)]
         ctx.work,
         |batch| {
-            grouped += batch.num_rows();
-            group_bytes += batch.get_array_memory_size();
-            group.push(batch);
-            if grouped >= group_rows || group_bytes >= group_max_bytes {
-                grouped = 0;
-                group_bytes = 0;
-                step(std::mem::take(&mut group))?;
-            }
-            Ok(())
+            let bytes = batch.get_array_memory_size();
+            group.push(batch, bytes, &mut step)
         },
     )?;
-    if !group.is_empty() {
-        step(group)?;
+    if !group.batches.is_empty() {
+        step(group.batches)?;
     }
     if let Some(c) = clipped.take() {
         finish_group(ctx, wave, c, rows, sink, diagnostics)?;
@@ -6279,6 +6266,60 @@ fn collect_into(
         *work.band_rows_read.entry(ctx.level_idx).or_default() += rows.read;
     }
     Ok(rows.read)
+}
+
+/// The batches [`collect_into`] gathers before one [`clip_group`]: up to
+/// `max_rows` rows, and never past one reader batch's decoded-byte cap
+/// ([`tylertoo_io::decoded_batch_limit`]) unless a single batch is that
+/// large on its own, so grouping holds no more than the reader allows.
+struct CollectGroup {
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    bytes: usize,
+    max_rows: usize,
+    max_bytes: usize,
+}
+
+impl CollectGroup {
+    fn new(max_rows: usize) -> Self {
+        Self {
+            batches: Vec::new(),
+            rows: 0,
+            bytes: 0,
+            max_rows,
+            max_bytes: usize::try_from(tylertoo_io::decoded_batch_limit()).unwrap_or(usize::MAX),
+        }
+    }
+
+    /// Add `batch` (`bytes` decoded), handing each full group to `flush`:
+    /// the gathered batches first when `batch` would take them past the
+    /// byte cap, then the group once it reaches either cap.
+    fn push(
+        &mut self,
+        batch: RecordBatch,
+        bytes: usize,
+        flush: &mut impl FnMut(Vec<RecordBatch>) -> Result<(), ExportError>,
+    ) -> Result<(), ExportError> {
+        if !self.batches.is_empty() && self.bytes.saturating_add(bytes) > self.max_bytes {
+            self.flush(flush)?;
+        }
+        self.rows += batch.num_rows();
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.batches.push(batch);
+        if self.rows >= self.max_rows || self.bytes >= self.max_bytes {
+            self.flush(flush)?;
+        }
+        Ok(())
+    }
+
+    fn flush(
+        &mut self,
+        flush: &mut impl FnMut(Vec<RecordBatch>) -> Result<(), ExportError>,
+    ) -> Result<(), ExportError> {
+        self.rows = 0;
+        self.bytes = 0;
+        flush(std::mem::take(&mut self.batches))
+    }
 }
 
 /// How the export reads a band: the overview file as a [`ConvertSource`],
@@ -6394,11 +6435,11 @@ fn read_error(e: ConvertError) -> ExportError {
 const COLLECT_GROUP_ROWS_PER_THREAD: usize = 512;
 
 /// The rows [`collect_into`] gathers per group on this pool. `bounded`
-/// keeps one batch a group, the in-flight rows it held before #817: the
-/// groups' decoded and clipped rows are not priced in the budget.
+/// takes each read batch on its own, as before #817: the groups' decoded
+/// and clipped rows are not priced in the budget.
 fn collect_group_rows(profile: MemoryProfile) -> usize {
     match profile {
-        MemoryProfile::Bounded => EXPORT_BATCH_SIZE,
+        MemoryProfile::Bounded => 1,
         MemoryProfile::Auto | MemoryProfile::Speed => {
             COLLECT_GROUP_ROWS_PER_THREAD.saturating_mul(rayon::current_num_threads())
         }
@@ -11906,6 +11947,45 @@ mod tests {
         let (tight, tight_bytes) = run(64, &bounded);
         assert_eq!(tight.collect_groups, 3, "bounded collects batch by batch");
         assert!(tight_bytes == one_bytes, "bounded changed the archive");
+    }
+
+    /// #817: a collect group closes before a batch that would take it past
+    /// the byte cap, and at either cap; a batch over the cap alone is a
+    /// group of its own. On review of 81cd824 the cap was checked only
+    /// after the batch joined, so two 48 MiB batches made a 96 MiB group.
+    #[test]
+    fn collect_groups_stay_within_the_byte_cap() {
+        let batch = |rows: i64| {
+            RecordBatch::try_from_iter([(
+                "id",
+                Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())) as ArrayRef,
+            )])
+            .unwrap()
+        };
+        let mut group = CollectGroup::new(100);
+        group.max_bytes = 64;
+        let mut flushed: Vec<Vec<usize>> = Vec::new();
+        let mut flush = |b: Vec<RecordBatch>| {
+            flushed.push(b.iter().map(RecordBatch::num_rows).collect());
+            Ok(())
+        };
+        for (rows, bytes) in [(1, 48), (2, 48), (3, 10), (4, 100), (5, 1), (90, 1)] {
+            group.push(batch(rows), bytes, &mut flush).unwrap();
+        }
+        assert_eq!(flushed, vec![vec![1], vec![2, 3], vec![4]]);
+        let pending: Vec<usize> = group.batches.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(pending, [5, 90], "under both caps: still gathering");
+        // bounded: one batch a group.
+        let mut one = CollectGroup::new(collect_group_rows(MemoryProfile::Bounded));
+        let mut sizes = Vec::new();
+        for rows in [3, 1, 2] {
+            one.push(batch(rows), 8, &mut |b| {
+                sizes.push(b.len());
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(sizes, [1, 1, 1]);
     }
 
     /// #817: a band read's input error keeps its class. A hostile page
