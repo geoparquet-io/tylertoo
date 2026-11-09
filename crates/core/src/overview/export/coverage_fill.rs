@@ -2245,19 +2245,30 @@ fn seed_batch(
         c.bucket_peak = c.bucket_peak.max(pending_bytes);
         c.live_peak = c.live_peak.max(pending_bytes);
     });
-    // Runs and the serial writer are charged as the serial seed before #817
-    // charged them, so no budget it fit fails here.
+    // Writing every frame at once holds every pending bucket beside the new
+    // runs' nodes, the frame list and a writer. When that does not fit, the
+    // serial seed's loop frees each bucket as its frame is written, with its
+    // checks, so no budget it fit fails here.
+    let new_runs = pending
+        .keys()
+        .filter(|key| !buckets.tiles.contains_key(key))
+        .count();
+    let held = pending_bytes
+        .saturating_add((buckets.tiles.len() + new_runs) * 512)
+        .saturating_add(pending.len() * std::mem::size_of::<(&u64, &Bucket)>());
+    if held.saturating_add(RUN_WRITER_BYTES) > buckets.budget {
+        for (key, (shapes, credits)) in pending {
+            buckets.append(key, &shapes, &credits, 0)?;
+        }
+        return Ok(());
+    }
     for key in pending.keys() {
-        buckets.reserve_run(*key, 0)?;
+        buckets.reserve_run(*key, pending_bytes)?;
     }
     // Each tile's run is its own file, so its frame is written in parallel;
     // every run still gets one frame per window, in window order. Writers
-    // beyond the serial one, and the frame list, are charged to the spare
-    // workspace.
-    let held = pending_bytes
-        .saturating_add(buckets.tiles.len() * 512)
-        .saturating_add(pending.len() * std::mem::size_of::<(&u64, &Bucket)>());
-    let writers = (1 + buckets.budget.saturating_sub(held) / RUN_WRITER_BYTES)
+    // beyond the first are charged to the spare workspace.
+    let writers = (buckets.budget.saturating_sub(held) / RUN_WRITER_BYTES)
         .min(if wide {
             rayon::current_num_threads()
         } else {
@@ -3515,9 +3526,17 @@ pub(super) mod tests {
         )
         .expect_err("the merged bucket outgrows its pieces");
         // The serial seed's own checks: the pending geometry, then each new
-        // run's node on its own. Its runs and its writer fit beside it.
+        // run's node on its own. It frees each bucket as it writes it, so
+        // the batched writer, which holds them all beside the runs and a
+        // writer, does not run here.
         let budget = usize::try_from(pending).unwrap().max(512);
+        cost_probe::take();
         seed_z4(&batch, &mut SpillBuckets::new(&opts, budget), &mut features).unwrap();
+        assert_eq!(cost_probe::take().seed_frame_writers, 0);
+        // With room for all of it, the batched writer runs.
+        let room = budget + 512 + RUN_WRITER_BYTES + 64;
+        seed_z4(&batch, &mut SpillBuckets::new(&opts, room), &mut features).unwrap();
+        assert_eq!(cost_probe::take().seed_frame_writers, 1);
     }
 
     /// #817 review: a tile built alone needs no more workspace than the
