@@ -614,7 +614,7 @@ def parse_gnu_time(stderr: str) -> dict:
 
 # Per-phase saturation fields of `rss_sampler.phases` (#810, written by the
 # sampler when profiling is on; older binaries have none, read as absent).
-PHASE_KEYS = ("cpu_user_secs", "cpu_sys_secs", "effective_cores", "utilization",
+PHASE_KEYS = ("wall_secs", "cpu_user_secs", "cpu_sys_secs", "effective_cores", "utilization",
               "unattributed_core_secs", "read_bytes", "write_bytes")
 
 

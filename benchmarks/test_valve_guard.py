@@ -155,3 +155,50 @@ def test_exemptions_file_is_read_by_cell(tmp_path):
 def test_record_keeps_the_classes_floors():
     doc = vg.with_record(_cores_baseline(), {"host": VM, "cells": BASE})
     assert doc["hosts"][vg.host_class_key(VM)]["floors"] == FLOORS
+
+
+# --- scaling and core-seconds checks (#817 follow-up) --------------------------
+def _scaled(speed=3.0, cpu=100.0, sha="aa", **kw) -> dict:
+    return {**_cores_cell(**kw), "speedup_16_to_full": {PASS2: speed, LEVELS: speed, "whole": speed},
+            "phase_cpu_s": {PASS2: cpu, LEVELS: cpu}, "output_sha256": sha}
+
+
+def _scaled_check(cell: dict, host=VM) -> dict:
+    base = {"hosts": {vg.host_class_key(VM): {"host": VM, "cells": {"moldova-tiles": _scaled()}}}}
+    return vg.verdict({"moldova-tiles": cell}, base, host)
+
+
+def test_a_20pct_speedup_drop_fails_and_10pct_passes():
+    bad = _scaled_check(_scaled(speed=2.4))
+    assert bad["baseline"]["status"] == "fail"
+    assert any("speedup" in f for f in bad["baseline"]["failures"])
+    assert _scaled_check(_scaled(speed=2.7))["baseline"]["status"] == "pass"
+
+
+def test_cpu_core_seconds_up_30pct_fails_and_20pct_passes():
+    bad = _scaled_check(_scaled(cpu=130.0))
+    assert any("core-seconds" in f for f in bad["baseline"]["failures"])
+    assert _scaled_check(_scaled(cpu=120.0))["baseline"]["status"] == "pass"
+
+
+def test_core_seconds_are_not_compared_across_different_outputs():
+    v = _scaled_check(_scaled(cpu=300.0, sha="bb"))
+    assert v["baseline"]["status"] == "pass"
+
+
+def test_scaling_checks_are_not_applicable_on_another_class():
+    v = _scaled_check(_scaled(speed=0.5, cpu=900.0), host=GH)
+    assert v["baseline"]["status"] == "not applicable" and vg.exit_status(v) == 0
+
+
+def test_cell_summary_derives_speedup_and_core_seconds():
+    def run(wall, p2, lv):
+        ph = lambda w, c: {"wall_secs": w, "cpu_user_secs": c - 1, "cpu_sys_secs": 1, "effective_cores": c / w}  # noqa: E731
+        prof = {"convert": {"phases": {"pass2 (output sink)": ph(p2, 50)}},
+                "export": {"phases": {"levels": ph(lv, 40)}}}
+        return {"wall_s": wall, "peak_rss_kib": 5, "effective_cores": 3, "profile": prof,
+                "output_sha256": "aa"}
+    out = vg.cell_summary([run(10, 4, 5)], [run(20, 12, 10)])
+    assert out["speedup_16_to_full"] == {"whole": 2.0, PASS2: 3.0, LEVELS: 2.0}
+    assert out["phase_cpu_s"] == {PASS2: 50.0, LEVELS: 40.0}
+    assert out["output_sha256"] == "aa"

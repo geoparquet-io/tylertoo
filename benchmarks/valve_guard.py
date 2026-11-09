@@ -85,6 +85,10 @@ CORES_DROP_MAX = 0.15  # a phase's median effective cores may fall 15% below the
 # Seeded into a recorded host class that has no `floors` yet; tighten them in
 # the baseline file as #813 lands (they are data there, not constants here).
 DEFAULT_FLOORS = {"whole_cores_frac": 0.05, "serial_share_max": 0.10}
+SPEEDUP_DROP_MAX = 0.15  # 16-to-full-thread speedup may fall 15% below the baseline's
+CPU_RISE_MAX = 0.25      # a phase's CPU core-seconds may rise 25% over the baseline's (same output)
+LOW_THREADS = 16
+SCALING_CELLS = ("moldova-tiles",)  # the cells also run at RAYON_NUM_THREADS=LOW_THREADS
 CORE_PHASES = ("convert/pass2 (output sink)", "export/levels")
 EXEMPTIONS = HERE.parent / "ci" / "exemptions.toml"
 
@@ -121,11 +125,13 @@ def command(cell: str, bins: dict, work: Path, prepared: dict) -> list[str]:
     return [exe, "export-pmtiles", prepared[inp], out, *size_args, *extra]
 
 
-def prepare(bins: dict, data: Path, work: Path) -> dict:
-    """The untimed overviews: #792 at its benchmark settings, Moldova at factor 0."""
+def prepare(bins: dict, data: Path, work: Path, cells: list[str]) -> dict:
+    """The untimed overviews the chosen cells need: #792 at its benchmark settings,
+    Moldova at factor 0."""
+    kinds = {CELLS[c][1] for c in cells}
     b792 = data / "792" / "buildings.parquet"
     moldova = data / "coalesce" / "inputs" / "moldova-hilbert.parquet"
-    for p in (b792, moldova):
+    for p in ([b792] if "ov792" in kinds else []) + [moldova]:
         if not p.exists():
             raise SystemExit(f"missing input {p}")
     # Moldova is pinned in manifest.toml; the #792 file is made locally
@@ -134,10 +140,10 @@ def prepare(bins: dict, data: Path, work: Path) -> dict:
         raise SystemExit(f"{moldova} does not match manifest.toml's moldova sha256")
     ov792, movf0 = work / "ov792.parquet", work / "moldova-f0.parquet"
     mim = str(bins["mim"])
-    if not ov792.exists():
+    if "ov792" in kinds and not ov792.exists():
         subprocess.run([mim, "overview", str(b792), str(ov792), *OVERVIEW_792], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if not movf0.exists():
+    if "movf0" in kinds and not movf0.exists():
         subprocess.run([mim, "overview", str(moldova), str(movf0), "--max-zoom", "12",
                         "--simplify-factor", "0"], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -147,13 +153,15 @@ def prepare(bins: dict, data: Path, work: Path) -> dict:
 def measure(cells: list[str], bins: dict, data: Path, rounds: int, gate) -> dict:
     caps = {"wall_s": 1800, "rss_gib": 32, "scratch_gib": 30}
     results: dict[str, list[dict]] = {c: [] for c in cells}
+    low: dict[str, list[dict]] = {c: [] for c in cells if c in SCALING_CELLS}
     with tempfile.TemporaryDirectory(prefix="valve-guard-", dir=os.environ.get("VALVE_GUARD_TMP")) as tmp:
         work = Path(tmp)
-        prepared = prepare(bins, data, work)
+        prepared = prepare(bins, data, work, cells)
         gate.last_own_end = time.monotonic()
         for rnd in range(rounds):
             order = cells if rnd % 2 == 0 else cells[::-1]  # drift cancels
-            for cell in order:
+            jobs = [(c, None) for c in order] + [(c, LOW_THREADS) for c in order if c in low]
+            for cell, threads in jobs:
                 rm.require_disk(work, 10)
                 if gate.wait().get("gate") == "TIMED_OUT":
                     raise SystemExit(f"{cell} round {rnd}: host stayed busy past the gate; "
@@ -161,31 +169,61 @@ def measure(cells: list[str], bins: dict, data: Path, rounds: int, gate) -> dict
                 argv = ["/usr/bin/time", "-v", *command(cell, bins, work, prepared)]
                 prof = work / "profile.jsonl"
                 prof.unlink(missing_ok=True)
-                run = rm.run_capped(argv, caps, {**os.environ, "TYLERTOO_PROFILE_JSON": str(prof)},
+                run = rm.run_capped(argv, caps, {**os.environ, "TYLERTOO_PROFILE_JSON": str(prof),
+                                                  **({"RAYON_NUM_THREADS": str(threads)} if threads else {})},
                                     work / "log.txt", work)
+                if (work / "out.pmtiles").is_file():
+                    run["output_sha256"] = rm.sha256_file(work / "out.pmtiles")
                 run["profile"] = rm.read_profile(prof)
                 gate.last_own_end = time.monotonic()  # our own load average is not a busy host
                 (work / "out.pmtiles").unlink(missing_ok=True)
                 subprocess.run(["sync"], check=False)
                 if run["status"] != "ok":
                     raise SystemExit(f"{cell} round {rnd}: {run['status']}\n{run['stderr_tail']}")
-                results[cell].append(run)
-                print(f"  {cell:16} r{rnd} {run['wall_s']:7.2f} s {run['peak_rss_kib'] / 1048576:6.2f} GiB",
+                (low if threads else results)[cell].append(run)
+                print(f"  {cell:16} r{rnd} t{threads or 'all'} {run['wall_s']:7.2f} s {run['peak_rss_kib'] / 1048576:6.2f} GiB",
                       flush=True)
-    return {c: cell_summary(rs) for c, rs in results.items()}
+    return {c: cell_summary(rs, low.get(c)) for c, rs in results.items()}
 
 
-def cell_summary(rs: list[dict]) -> dict:
+def _phase(runs: list[dict], key: str, fn) -> dict:
+    """{phase: median of fn(sampler phase)} over the runs, CORE_PHASES only."""
+    vals: dict[str, list[float]] = {}
+    for r in runs:
+        for line in ("convert", "export"):
+            for name, p in ((r.get("profile") or {}).get(line) or {}).get("phases", {}).items():
+                if f"{line}/{name}" in CORE_PHASES and (v := fn(p)) is not None:
+                    vals.setdefault(f"{line}/{name}", []).append(v)
+    return {k: round(statistics.median(v), 3) for k, v in vals.items()}
+
+
+def _cpu(p: dict) -> float | None:
+    return p["cpu_user_secs"] + p["cpu_sys_secs"] if p.get("cpu_user_secs") is not None else None
+
+
+def cell_summary(rs: list[dict], low: list[dict] | None = None) -> dict:
     """One cell's baseline record from its runs: medians of wall, RSS, whole-run
-    cores, the pass-2 and levels phase cores, and the export serial share."""
+    cores, the pass-2 and levels phase cores, wall and CPU core-seconds, and
+    the export serial share. `low` are the same cell's runs at LOW_THREADS:
+    they add `speedup_16_to_full` (low wall over full wall, whole run and per phase)."""
     shares = [v for r in rs if (v := (r.get("profile", {}).get("export") or {}).get("serial_share")) is not None]
-    return {"wall_s": round(statistics.median(r["wall_s"] for r in rs), 3),
-            "peak_rss_kib": int(statistics.median(r["peak_rss_kib"] for r in rs)),
-            "peak_rss_min_kib": min(r["peak_rss_kib"] for r in rs),
-            "effective_cores": statistics.median(r["effective_cores"] or 0 for r in rs),
-            "phase_cores": {k: v["median"] for k, v in rm.phase_cores(rs).items() if k in CORE_PHASES},
-            "serial_share": statistics.median(shares) if shares else None,
-            "rounds": len(rs)}
+    out = {"wall_s": round(statistics.median(r["wall_s"] for r in rs), 3),
+           "peak_rss_kib": int(statistics.median(r["peak_rss_kib"] for r in rs)),
+           "peak_rss_min_kib": min(r["peak_rss_kib"] for r in rs),
+           "effective_cores": statistics.median(r["effective_cores"] or 0 for r in rs),
+           "phase_cores": {k: v["median"] for k, v in rm.phase_cores(rs).items() if k in CORE_PHASES},
+           "phase_wall_s": _phase(rs, "wall", lambda p: p.get("wall_secs")),
+           "phase_cpu_s": _phase(rs, "cpu", _cpu),
+           "serial_share": statistics.median(shares) if shares else None,
+           "output_sha256": rs[0].get("output_sha256"),
+           "rounds": len(rs)}
+    if low:
+        lo = {"whole": statistics.median(r["wall_s"] for r in low),
+              **_phase(low, "wall", lambda p: p.get("wall_secs"))}
+        hi = {"whole": statistics.median(r["wall_s"] for r in rs), **out["phase_wall_s"]}
+        out["speedup_16_to_full"] = {k: round(lo[k] / hi[k], 3) for k in hi if k in lo and hi[k]}
+        out["low_threads"] = LOW_THREADS
+    return out
 
 
 def ratio_failures(cells: dict) -> list[str]:  # noqa: D103
@@ -227,6 +265,17 @@ def baseline_failures(cells: dict, baseline: dict) -> list[str]:
             if got is not None and was and got < was * (1 - CORES_DROP_MAX):
                 bad.append(f"{cell} {phase} effective cores {got} is more than "
                            f"{CORES_DROP_MAX:.0%} below its baseline {was}")
+        for phase, was in (base.get("speedup_16_to_full") or {}).items():
+            got = (now.get("speedup_16_to_full") or {}).get(phase)
+            if got is not None and got < was * (1 - SPEEDUP_DROP_MAX):
+                bad.append(f"{cell} {phase} {LOW_THREADS}-to-full speedup {got} is more than "
+                           f"{SPEEDUP_DROP_MAX:.0%} below its baseline {was}")
+        same = base.get("output_sha256") and base.get("output_sha256") == now.get("output_sha256")
+        for phase, was in ((base.get("phase_cpu_s") or {}).items() if same else ()):
+            got = (now.get("phase_cpu_s") or {}).get(phase)
+            if got is not None and was and got > was * (1 + CPU_RISE_MAX):
+                bad.append(f"{cell} {phase} CPU core-seconds {got} is more than "
+                           f"{CPU_RISE_MAX:.0%} above its baseline {was}")
     return bad
 
 
@@ -308,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["check", "record"])
     ap.add_argument("--mim", type=Path, required=True, help="tylertoo built with the default (mimalloc)")
-    ap.add_argument("--glibc", type=Path, required=True, help="tylertoo built with --no-default-features")
+    ap.add_argument("--glibc", type=Path, help="tylertoo built with --no-default-features")
     ap.add_argument("--data", type=Path, default=Path.home() / "bench-data")
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--cells", nargs="*", default=list(CELLS), choices=list(CELLS))
@@ -317,14 +366,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json-out", type=Path, help="also write the measured cells here")
     args = ap.parse_args(argv)
 
-    bins = {"mim": args.mim.resolve(), "glibc": args.glibc.resolve()}
+    bins = {"mim": args.mim.resolve(), **({"glibc": args.glibc.resolve()} if args.glibc else {})}
+    if any(CELLS[c][0] == "glibc" for c in args.cells) and not args.glibc:
+        raise SystemExit("--glibc is required for the -glibc cells (or pick --cells without them)")
     for b in bins.values():
         if not b.exists():
             raise SystemExit(f"missing binary {b}")
     gate = rm.Gate(args.load_max, 3600, Path(tempfile.gettempdir()) / "valve-guard-gate.log")
     cells = measure(args.cells, bins, args.data, args.rounds, gate)
     record = {"host": rm.host_class(),
-              "inputs": {"792": rm.sha256_file(args.data / "792" / "buildings.parquet"),
+              "inputs": {"792": (rm.sha256_file(p) if (p := args.data / "792" / "buildings.parquet").exists() else None),
                          "moldova": rm.load_manifest()["inputs"]["moldova"]["sha256"]},
               "hostname": platform.node(), "measured": time.strftime("%F"), "cells": cells,
               "limits": {"ratio_wall": RATIO_WALL_MAX, "ratio_rss": RATIO_RSS_MAX,

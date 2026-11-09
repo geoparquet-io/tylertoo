@@ -506,7 +506,15 @@ Two checks, both exit 1:
 
 - **Drop** (part of the `baseline` line): on a host class with a baseline
   entry, a phase median more than 15% (`CORES_DROP_MAX`) below the baseline's
-  fails. Another host class prints `baseline: NOT APPLICABLE`.
+  fails. Effective cores alone is a weak signal (export levels shows 29-31
+  cores at 64 threads with a 16-to-64 wall speedup of about 1, because rayon
+  spin counts as busy), so the guard also runs `moldova-tiles` at
+  `RAYON_NUM_THREADS=16` and fails when `speedup_16_to_full` (wall at 16
+  threads over wall at full threads; whole run, pass 2, levels) falls more
+  than 15% below the baseline's (`SPEEDUP_DROP_MAX`), or a phase's CPU
+  core-seconds (`phase_cpu_s`) rise more than 25% (`CPU_RISE_MAX`) over the
+  baseline's. Core-seconds are compared only when the output sha256 equals
+  the baseline's. Another host class prints `baseline: NOT APPLICABLE`.
 - **Floors** (the `floors` line): only a baseline entry with a `floors`
   section is checked. `whole_cores_frac` x CPUs is the minimum whole-run
   effective cores and `serial_share_max` (0.10) the maximum serial share.
