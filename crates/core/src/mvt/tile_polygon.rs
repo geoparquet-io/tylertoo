@@ -74,9 +74,8 @@ pub(crate) fn finalize_polygons(
         count: 1,
         kind: defect,
     });
-    let repaired = repair_polygons(&parts);
-    if let Err(left) = check_polygons(&repaired) {
-        let _ = left;
+    let (repaired, passed) = repair_and_check(&parts);
+    if !passed && check_polygons(&repaired).is_err() {
         diagnostics.record(Diagnostic::InvalidAfterEncode { count: 1 });
     }
     repaired
@@ -93,15 +92,21 @@ pub(crate) fn finalize_polygons(
 /// stay within the input's bounding box, which [`super::TILE_COORD_CLAMP`]
 /// keeps well inside the i32 engine's ±2^30 range.
 pub(crate) fn repair_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Vec<Vec<TileRing>> {
+    repair_and_check(parts).0
+}
+
+/// [`repair_polygons`], and whether the result already passed
+/// [`check_polygons`] inside it.
+fn repair_and_check<P: AsRef<[TileRing]>>(parts: &[P]) -> (Vec<Vec<TileRing>>, bool) {
     // i_overlay snaps intersections within one engine unit to endpoints.
     // A half-unit grid preserves small lobes (Madagascar ADM4, #779) until
     // extraction. Rounding those nodes can introduce fresh grid defects;
     // resolve those through the same kernel on the final grid when needed.
     let snapped = overlay_polygons(parts, 2);
     if check_polygons(&snapped).is_ok() {
-        snapped
+        (snapped, true)
     } else {
-        overlay_polygons(&snapped, 1)
+        (overlay_polygons(&snapped, 1), false)
     }
 }
 
@@ -217,6 +222,12 @@ fn bind_holes(shells: &mut [Vec<TileRing>], holes: Vec<TileRing>) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`check_polygons`] calls on this thread.
+    static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One edge of the feature, with the ring it belongs to.
 #[derive(Clone, Copy)]
 struct Edge {
@@ -247,6 +258,8 @@ enum Loc {
 /// rules: every hole inside its exterior, no hole in another hole, no part
 /// inside another part's fill.
 pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
+    #[cfg(test)]
+    CHECKS.with(|c| c.set(c.get() + 1));
     // The usual feature, one polygon without holes: only the ring's own
     // rules apply, and the sweep runs on the ring itself, without the
     // ring/part bookkeeping the general case needs.
@@ -1456,6 +1469,19 @@ mod tests {
             repaired > 1000 && kept > 50,
             "repaired={repaired} kept={kept}"
         );
+    }
+
+    /// #772: a repaired feature whose overlay already passed the check inside
+    /// the repair is not checked a second time; the check is a full sweep
+    /// of a merged feature that can span the tile.
+    #[test]
+    fn a_repair_that_passed_its_check_is_not_checked_again() {
+        let parts = vec![vec![square(0, 0, 10, 10)], vec![square(5, 5, 15, 15)]];
+        CHECKS.with(|c| c.set(0));
+        let fixed = finalize_polygons(parts, &crate::diagnostics::Diagnostics::default());
+        assert_eq!(fixed.len(), 1);
+        // The input's check, then the overlay's inside the repair.
+        assert_eq!(CHECKS.with(|c| c.get()), 2);
     }
 
     #[test]
