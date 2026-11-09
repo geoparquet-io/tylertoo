@@ -6899,6 +6899,18 @@ const DIRECT_CLIP_BUDGET: u64 = 100_000;
 /// microtasks. Small features take the direct path and never reach here.
 const CASCADE_PARALLEL_DEPTH: u32 = 3;
 
+/// Vertices in a cascade node's piece at which its children fork whatever
+/// the depth (M1, #817): every child clips the whole piece, so a monster
+/// coastline at a coarse zoom otherwise clips on one thread. The same
+/// break-even reasoning as [`PARALLEL_ENCODE_MIN_COORDS`].
+const CASCADE_PARALLEL_COORDS: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    /// Cascade nodes that split their children across Rayon tasks.
+    static CASCADE_FORKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Number of leaf tiles the feature's bbox covers at the target zoom (both
 /// x-bands when it crosses the antimeridian).
 #[inline]
@@ -7128,9 +7140,9 @@ fn split_feature_into_tiles(
 }
 
 /// Recurse into a node's four children with `child_geom` (already reduced to the
-/// parent's buffered bounds). Near the top of a large cascade the two halves run
-/// on separate Rayon threads (issue #237, RC4); deeper down — or for the common
-/// small-cascade case — it stays sequential. Emission order is irrelevant:
+/// parent's buffered bounds). Near the top of a large cascade (issue #237, RC4),
+/// or under a piece of [`CASCADE_PARALLEL_COORDS`] vertices, the four subtrees
+/// run as separate Rayon tasks; otherwise it stays sequential. Emission order is irrelevant:
 /// `collect_wave_members` buckets members by tile key, and a feature emits at
 /// most one member per key, so parallel interleaving cannot change the archive.
 fn fanout_children(
@@ -7150,51 +7162,39 @@ fn fanout_children(
         assume_simple,
         diagnostics,
     } = inputs;
-    if (zoom - node_z) as u32 > CASCADE_PARALLEL_DEPTH {
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        rayon::join(
-            || {
-                for &child in &children[..2] {
-                    split_feature_into_tiles(
-                        child,
-                        child_geom,
-                        child_bbox,
-                        TileTarget {
-                            zoom,
-                            opts,
-                            key_lo,
-                            key_hi,
-                            assume_simple,
-                            diagnostics,
-                        },
-                        ranges,
-                        &mut left,
-                    );
-                }
-            },
-            || {
-                for &child in &children[2..] {
-                    split_feature_into_tiles(
-                        child,
-                        child_geom,
-                        child_bbox,
-                        TileTarget {
-                            zoom,
-                            opts,
-                            key_lo,
-                            key_hi,
-                            assume_simple,
-                            diagnostics,
-                        },
-                        ranges,
-                        &mut right,
-                    );
-                }
-            },
-        );
-        out.append(&mut left);
-        out.append(&mut right);
+    // M1 (#817): each child clips the whole parent piece, so a huge piece
+    // forks at any depth; the four subtrees' members are appended in child
+    // order, as the sequential loop emits them.
+    if (zoom - node_z) as u32 > CASCADE_PARALLEL_DEPTH
+        || child_geom.coords_count() >= CASCADE_PARALLEL_COORDS
+    {
+        #[cfg(test)]
+        CASCADE_FORKS.with(|c| c.set(c.get() + 1));
+        let subtrees: Vec<Vec<(u64, Geometry<f64>)>> = children
+            .par_iter()
+            .map(|&child| {
+                let mut members = Vec::new();
+                split_feature_into_tiles(
+                    child,
+                    child_geom,
+                    child_bbox,
+                    TileTarget {
+                        zoom,
+                        opts,
+                        key_lo,
+                        key_hi,
+                        assume_simple,
+                        diagnostics,
+                    },
+                    ranges,
+                    &mut members,
+                );
+                members
+            })
+            .collect();
+        for mut members in subtrees {
+            out.append(&mut members);
+        }
     } else {
         for child in children {
             split_feature_into_tiles(
@@ -12818,6 +12818,32 @@ mod tests {
                 "tile ({kx}, {ky}) MVT diverges at z{zoom}",
             );
         }
+    }
+
+    /// M1 (#817): a monster coastline holds tens of thousands of vertices in
+    /// one feature. At a coarse zoom its whole cascade ran on one thread:
+    /// each child re-clips the parent's piece, four times per node.
+    #[test]
+    fn a_huge_feature_forks_its_cascade_at_coarse_zooms() {
+        let coast = Geometry::LineString(LineString::from(
+            (0..20_000)
+                .map(|k| {
+                    let t = f64::from(k) / 20_000.0;
+                    (-150.0 + 300.0 * t, 60.0 * (t * 40.0).sin())
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let forks = pool.install(|| {
+            CASCADE_FORKS.with(|c| c.set(0));
+            members_recursive_vec(&coast, 3, &ExportOptions::default(), 0, u64::MAX);
+            CASCADE_FORKS.with(|c| c.get())
+        });
+        assert!(forks > 0, "the z3 cascade never forked");
+        assert_recursive_matches_direct(&coast, 3, &ExportOptions::default());
     }
 
     /// Feature corpus + zoom caps chosen so the oracle's `tiles×vertices` cost
