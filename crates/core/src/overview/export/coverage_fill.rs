@@ -1651,13 +1651,19 @@ impl SpillBuckets {
 struct TileFill {
     polys: Vec<FillPolygon>,
     lifted: Vec<Shape>,
+    /// A tile built alone keeps its fill unsnapped and unlifted: its commit
+    /// snaps, spills, then lifts, never holding both, within the same
+    /// workspace as the serial pyramid before #817.
+    fill: Vec<Shape>,
     area: f64,
     vertices: usize,
 }
 
 impl TileFill {
     fn capacity_bytes(&self) -> usize {
-        polygon_capacity_bytes(&self.polys) + shape_capacity_bytes(&self.lifted)
+        polygon_capacity_bytes(&self.polys)
+            + shape_capacity_bytes(&self.lifted)
+            + shape_capacity_bytes(&self.fill)
     }
 }
 
@@ -1671,10 +1677,11 @@ struct PyramidStep {
     scale: f64,
 }
 
-/// One independent pyramid tile, with the per-tile work of its commit
-/// (snap and lift) done here so the ordered commit only appends. Its
-/// workspace is a share of the original Fill grant; retained indexes and
-/// other wave outputs are charged separately.
+/// One independent pyramid tile. Built at a share (`prepare`), the
+/// per-tile work of its commit (snap and lift) is done here so the ordered
+/// commit only appends; its workspace is a share of the original Fill
+/// grant, and retained indexes and other outputs are charged separately.
+/// Built alone, the commit does that work.
 fn pyramid_tile(
     path: &std::path::Path,
     key: u64,
@@ -1682,18 +1689,28 @@ fn pyramid_tile(
     timers: &super::ExportTimers,
     budget: usize,
     reserved: usize,
+    prepare: bool,
 ) -> Result<TileFill, super::ExportError> {
     let fill = pyramid_fill(path, step.seed, timers, budget, reserved)?;
+    let area = fill.iter().map(|s| net_area(s)).sum::<f64>();
+    let vertices = fill.iter().flatten().map(Vec::len).sum::<usize>();
+    if !prepare {
+        return Ok(TileFill {
+            polys: Vec::new(),
+            lifted: Vec::new(),
+            fill,
+            area,
+            vertices,
+        });
+    }
     // Checked before anything is allocated: concurrent tiles must not
-    // overrun their shares first and find out after.
-    require_fill_bytes(prepare_bound(&fill), budget)?;
+    // overrun their shares first and find out after. A miss is rebuilt alone.
+    require_fill_bytes(prepare_bound(&fill, step.lift), budget)?;
     let mut lifted = Vec::new();
     if step.lift {
         let (x, y) = super::key_to_xy(key, step.zoom);
         lift_into_parent(&fill, x & 1, y & 1, &mut lifted);
     }
-    let area = fill.iter().map(|s| net_area(s)).sum::<f64>();
-    let vertices = fill.iter().flatten().map(Vec::len).sum::<usize>();
     #[cfg(test)]
     cost_probe::update(|c| {
         let live = reserved + shape_capacity_bytes(&fill) + shape_capacity_bytes(&lifted);
@@ -1708,23 +1725,30 @@ fn pyramid_tile(
     Ok(TileFill {
         polys,
         lifted,
+        fill: Vec::new(),
         area,
         vertices,
     })
 }
 
 /// An upper bound on what a tile holds while it lifts and snaps `fill`:
-/// the fill; a lift no larger than it, as each lifted ring is allocated at
-/// its source ring's length, plus its outer vector's doubling; the snapped
-/// polygons' outer vector; and the polygon being snapped, beside its
-/// source. A finished polygon (8-byte points) is no larger than the shape
-/// it replaced (16-byte points), and that shape is freed once snapped.
-fn prepare_bound(fill: &Vec<Shape>) -> usize {
-    let outer = std::mem::size_of::<Shape>() + std::mem::size_of::<FillPolygon>();
+/// the fill; with `lift`, a lift no larger than it, as each lifted ring is
+/// allocated at its source ring's length, plus its outer vector's doubling;
+/// the snapped polygons' outer vector; and the polygon being snapped,
+/// beside its source. A finished polygon (8-byte points) is no larger than
+/// the shape it replaced (16-byte points), and that shape is freed once
+/// snapped.
+fn prepare_bound(fill: &Vec<Shape>, lift: bool) -> usize {
     let snapping = fill.iter().map(shape_payload_bytes).max().unwrap_or(0);
+    let outer = 2 * std::mem::size_of::<FillPolygon>();
+    let lifted = if lift {
+        shape_capacity_bytes(fill) + fill.len() * 2 * std::mem::size_of::<Shape>()
+    } else {
+        0
+    };
     shape_capacity_bytes(fill)
-        .saturating_mul(2)
-        .saturating_add(fill.len().saturating_mul(2 * outer))
+        .saturating_add(lifted)
+        .saturating_add(fill.len().saturating_mul(outer))
         .saturating_add(snapping)
 }
 
@@ -1779,7 +1803,7 @@ fn pyramid_wave(
             .par_iter()
             .map(|(key, path)| {
                 let path = path.as_deref().expect("a wave job holds its run");
-                pyramid_tile(path, *key, step, timers, share, reserved)
+                pyramid_tile(path, *key, step, timers, share, reserved, true)
             })
             .collect();
         match result {
@@ -1835,17 +1859,24 @@ impl ZoomCommit {
         workspace: usize,
     ) -> Result<(), super::ExportError> {
         let tile_bytes = tile.capacity_bytes();
-        if !tile.polys.is_empty() {
+        // A tile built alone is snapped here and its polygons freed before
+        // its lift is allocated.
+        let snapped_here =
+            (!tile.fill.is_empty()).then(|| to_tile_polygons(&tile.fill, step.scale));
+        let polys = snapped_here.as_ref().unwrap_or(&tile.polys);
+        if !polys.is_empty() {
             self.snapped.append(
                 key,
-                &tile.polys,
+                polys,
                 self.map_bytes
                     + (queued + self.parents.tiles.len()) * 512
                     + shape_capacity_bytes(&tile.lifted)
+                    + shape_capacity_bytes(&tile.fill)
                     + others,
                 workspace,
             )?;
         }
+        drop(snapped_here);
         #[cfg(test)]
         note_capacity(
             "snapped",
@@ -1859,12 +1890,20 @@ impl ZoomCommit {
             self.vertices += tile.vertices;
             let (x, y) = super::key_to_xy(key, step.zoom);
             let parent = crate::pmtiles_writer::tile_id(step.zoom - 1, x / 2, y / 2);
+            let mut lifted_here = Vec::new();
+            lift_into_parent(&tile.fill, x & 1, y & 1, &mut lifted_here);
+            let lifted = if tile.fill.is_empty() {
+                &tile.lifted
+            } else {
+                &lifted_here
+            };
             self.parents.append(
                 parent,
-                &tile.lifted,
+                lifted,
                 &[],
                 (queued * 512)
                     .saturating_add(tile_bytes)
+                    .saturating_add(shape_capacity_bytes(&lifted_here))
                     .saturating_add(self.map_bytes)
                     .saturating_add(self.snapped.resident_bytes())
                     .saturating_add(others),
@@ -1940,7 +1979,7 @@ fn slide_launch<'s, 'a: 's>(scope: &rayon::Scope<'s>, ctx: &'s SlideCtx<'a>, s: 
         s.in_flight += 1;
         s.peak = s.peak.max(s.in_flight);
         scope.spawn(move |scope| {
-            let result = pyramid_tile(&path, key, ctx.step, ctx.timers, share, reserved);
+            let result = pyramid_tile(&path, key, ctx.step, ctx.timers, share, reserved, true);
             let mut s = ctx.lock();
             s.misses += usize::from(matches!(
                 result,
@@ -2028,6 +2067,7 @@ fn pyramid_slide(
             timers,
             workspace.saturating_sub(reserved),
             reserved,
+            false,
         )?;
         commit.commit(key, &tile, step, buckets.tiles.len(), 512, workspace)?;
     }
@@ -2205,17 +2245,29 @@ fn seed_batch(
         c.bucket_peak = c.bucket_peak.max(pending_bytes);
         c.live_peak = c.live_peak.max(pending_bytes);
     });
+    // Writing every frame at once holds every pending bucket beside the new
+    // runs' nodes, the frame list and a writer. When that does not fit, the
+    // serial seed's loop frees each bucket as its frame is written, with its
+    // checks, so no budget it fit fails here.
+    let new_runs = pending
+        .keys()
+        .filter(|key| !buckets.tiles.contains_key(key))
+        .count();
+    let held = pending_bytes
+        .saturating_add((buckets.tiles.len() + new_runs) * 512)
+        .saturating_add(pending.len() * std::mem::size_of::<(&u64, &Bucket)>());
+    if held.saturating_add(RUN_WRITER_BYTES) > buckets.budget {
+        for (key, (shapes, credits)) in pending {
+            buckets.append(key, &shapes, &credits, 0)?;
+        }
+        return Ok(());
+    }
     for key in pending.keys() {
         buckets.reserve_run(*key, pending_bytes)?;
     }
     // Each tile's run is its own file, so its frame is written in parallel;
-    // every run still gets one frame per window, in window order. The frame
-    // list and every writer are charged; a writer that does not fit is not
-    // started, and the first must fit.
-    let held = pending_bytes
-        .saturating_add(buckets.tiles.len() * 512)
-        .saturating_add(pending.len() * std::mem::size_of::<(&u64, &Bucket)>());
-    require_fill_bytes(held.saturating_add(RUN_WRITER_BYTES), buckets.budget)?;
+    // every run still gets one frame per window, in window order. Writers
+    // beyond the first are charged to the spare workspace.
     let writers = (buckets.budget.saturating_sub(held) / RUN_WRITER_BYTES)
         .min(if wide {
             rayon::current_num_threads()
@@ -2415,6 +2467,7 @@ pub(super) fn build_fill_map(
                         timers,
                         workspace.saturating_sub(reserved),
                         reserved,
+                        false,
                     )?
                 };
                 commit.commit(
@@ -2658,6 +2711,7 @@ pub(super) mod tests {
         let tile = || TileFill {
             polys: vec![vec![vec![(0, 0), (4, 0), (0, 4)]]],
             lifted: Vec::new(),
+            fill: Vec::new(),
             area: 1.0,
             vertices: 3,
         };
@@ -3455,10 +3509,11 @@ pub(super) mod tests {
         assert_eq!(pending, pieces + 2 * std::mem::size_of::<Shape>() as u64);
     }
 
-    /// #817 review: a new tile run is charged while the window's pending
-    /// geometry is still held, not after it.
+    /// #817 review: the parallel seed needs no more workspace than the
+    /// serial seed did; it charged each new run's node and its writer
+    /// beside the pending geometry, and failed budgets the serial seed fit.
     #[test]
-    fn the_seed_charges_a_new_run_with_its_pending_geometry() {
+    fn the_seed_fits_the_serial_seeds_budget() {
         let opts = super::super::ExportOptions::default();
         let batch = geometry_batch(&[degree_square(1.0, 1.0)]);
         let mut features = 0;
@@ -3470,10 +3525,88 @@ pub(super) mod tests {
             &mut features,
         )
         .expect_err("the merged bucket outgrows its pieces");
-        let budget = usize::try_from(pending).unwrap();
-        let needed = seed_z4(&batch, &mut SpillBuckets::new(&opts, budget), &mut features)
-            .expect_err("the run's node does not fit beside the pending geometry");
-        assert_eq!(needed, pending + 512);
+        // The serial seed's own checks: the pending geometry, then each new
+        // run's node on its own. It frees each bucket as it writes it, so
+        // the batched writer, which holds them all beside the runs and a
+        // writer, does not run here.
+        let budget = usize::try_from(pending).unwrap().max(512);
+        cost_probe::take();
+        seed_z4(&batch, &mut SpillBuckets::new(&opts, budget), &mut features).unwrap();
+        assert_eq!(cost_probe::take().seed_frame_writers, 0);
+        // With room for all of it, the batched writer runs.
+        let room = budget + 512 + RUN_WRITER_BYTES + 64;
+        seed_z4(&batch, &mut SpillBuckets::new(&opts, room), &mut features).unwrap();
+        assert_eq!(cost_probe::take().seed_frame_writers, 1);
+    }
+
+    /// #817 review: a tile built alone needs no more workspace than the
+    /// serial pyramid did, its fill beside its snapped polygons. A lone tile
+    /// on the last zoom (no lift) with many surviving holes was priced at
+    /// two fills plus a shape, and failed a budget the serial build fit.
+    #[test]
+    fn a_lone_tile_builds_in_the_serial_pyramids_workspace() {
+        let opts = super::super::ExportOptions::default();
+        let timers = super::super::ExportTimers::default();
+        let step = PyramidStep {
+            zoom: 4,
+            seed: true,
+            lift: false,
+            scale: 1.0,
+        };
+        let mut buckets = SpillBuckets::new(&opts, usize::MAX);
+        buckets.append(1, &[holed(2000)], &[], 0).unwrap();
+        let (key, path) = buckets.tiles.pop_first().unwrap();
+        let fill = pyramid_fill(&path, true, &timers, usize::MAX, 0).unwrap();
+        let mut commit = ZoomCommit {
+            map_bytes: 0,
+            snapped: ZoomBuilder::new(&opts).unwrap(),
+            parents: SpillBuckets::new(&opts, usize::MAX),
+            tiles: 0,
+            area: 0.0,
+            vertices: 0,
+        };
+        // The serial pyramid's snap check: its path, fill and polygons, and
+        // the zoom writer with its first index allocation.
+        let workspace = 512
+            + shape_capacity_bytes(&fill)
+            + polygon_capacity_bytes(&to_tile_polygons(&fill, 1.0))
+            + ZOOM_WRITER_FIXED_BYTES
+            + 4 * std::mem::size_of::<FillEntry>();
+        assert!(workspace < prepare_bound(&fill, true));
+        // As the zoom loop builds a lone tile.
+        let reserved = commit.fixed(0) + 512;
+        let tile = pyramid_tile(
+            &path,
+            key,
+            step,
+            &timers,
+            workspace - reserved,
+            reserved,
+            false,
+        )
+        .unwrap();
+        commit.commit(key, &tile, step, 0, 512, workspace).unwrap();
+        assert_eq!(commit.tiles, 1);
+    }
+
+    /// One exterior with `n` separated 8x8 px holes, which survive the
+    /// fill's simplification.
+    fn holed(n: usize) -> Shape {
+        let mut shape = vec![vec![
+            [0.0, 0.0],
+            [4096.0, 0.0],
+            [4096.0, 4096.0],
+            [0.0, 4096.0],
+        ]];
+        let per_row = 4096 / 16 - 1;
+        for i in 0..n {
+            let (x, y) = (
+                8.0 + 16.0 * (i % per_row) as f64,
+                8.0 + 16.0 * (i / per_row) as f64,
+            );
+            shape.push(vec![[x, y], [x, y + 8.0], [x + 8.0, y + 8.0], [x + 8.0, y]]);
+        }
+        shape
     }
 
     fn square(x: f64, y: f64, side: f64) -> Shape {
