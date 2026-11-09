@@ -241,6 +241,12 @@ pub struct OverviewWriterOptions {
     /// The levels were independently cropped to a shard's spatial domain.
     /// Such levels do not obey a whole-source cluster-mass equality.
     pub source_is_subset: bool,
+    /// Let a level's row-group encodes run on while the next level's start
+    /// (#817): the previous level's may overlap the current one's, within
+    /// `encode_concurrency`. Off, every level drains its own encodes before
+    /// `write_level` returns, which holds at most one level's row groups
+    /// (the bounded profile's envelope). Default `false`.
+    pub overlap_levels: bool,
 }
 
 impl OverviewWriterOptions {
@@ -260,6 +266,7 @@ impl OverviewWriterOptions {
             encode_concurrency: 1,
             primary_column: None,
             source_is_subset: false,
+            overlap_levels: false,
         }
     }
 }
@@ -796,9 +803,15 @@ impl<W: Write + Send> OverviewWriter<W> {
             self.submit_row_group(&mut asm, cur)?;
         }
 
-        // This level's encodes stay in flight (#817): the next level's
-        // batches start while they finish, and every append still happens in
-        // submission order (on a later submit or in `finish`).
+        // With `overlap_levels`, this level's encodes stay in flight (#817):
+        // the next level's batches start while they finish, and every append
+        // still happens in submission order (on a later submit or in
+        // `finish`).
+        if !self.options.overlap_levels {
+            while let Some((_, rx)) = self.rg_inflight.pop_front() {
+                self.drain_encoded(rx)?;
+            }
+        }
         let rg_after = self.row_groups_submitted();
         if rg_after <= rg_before {
             // Empty level: omit it entirely and renumber (§7.3). No rows were
@@ -1795,6 +1808,7 @@ mod tests {
         let schema = Arc::new(source_schema());
         let mut opts = duplicating_options();
         opts.encode_concurrency = 4;
+        opts.overlap_levels = true;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let pool = super::super::accumulate::rendezvous::pool(4);
         let ids: Vec<i64> = (0..10).collect();
@@ -3454,6 +3468,7 @@ mod tests {
                 let schema = Arc::new(source_schema());
                 let mut opts = duplicating_options();
                 opts.encode_concurrency = 4;
+                opts.overlap_levels = true;
                 let dir = tempfile::tempdir().unwrap();
                 let dest = dir.path().join("out.parquet");
                 let mut writer = OverviewWriter::create(&dest, &schema, opts).unwrap();
@@ -3485,6 +3500,36 @@ mod tests {
         );
     }
 
+    /// #817: without `overlap_levels` (the bounded profile) a level drains
+    /// its own encodes, so its failure surfaces from its own call.
+    #[test]
+    fn without_overlap_a_level_drains_its_own_encodes() {
+        within("without_overlap_a_level_drains_its_own_encodes", || {
+            let schema = Arc::new(source_schema());
+            let mut opts = duplicating_options();
+            opts.encode_concurrency = 4;
+            opts.overlap_levels = false;
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            writer.set_encode_faults(EncodeFaults {
+                row_group: true,
+                wkb: false,
+            });
+            let ids: Vec<i64> = (0..3).collect();
+            let err = writer
+                .write_level(
+                    0,
+                    Some(ids.len()),
+                    vec![source_batch(&schema, &ids)].into_iter(),
+                )
+                .expect_err("the level's own encode failure surfaces from its call");
+            assert!(
+                err.to_string().contains("injected row-group encode panic"),
+                "{err}"
+            );
+        });
+    }
+
     /// #817: the last levels' encodes are drained by `finish`; a failure
     /// there is an error and publishes nothing.
     #[test]
@@ -3493,6 +3538,7 @@ mod tests {
             let schema = Arc::new(source_schema());
             let mut opts = duplicating_options();
             opts.encode_concurrency = 4;
+            opts.overlap_levels = true;
             let dir = tempfile::tempdir().unwrap();
             let dest = dir.path().join("out.parquet");
             let mut writer = OverviewWriter::create(&dest, &schema, opts).unwrap();

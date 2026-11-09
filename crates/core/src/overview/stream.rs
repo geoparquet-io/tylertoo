@@ -2121,6 +2121,9 @@ fn create_level_writer(
         budget.remaining(),
     );
     writer_opts.encode_concurrency = encodes.units;
+    // Overlapping levels holds up to two levels' row groups (#817); the
+    // bounded profile keeps its one-level envelope.
+    writer_opts.overlap_levels = !matches!(options.profile, super::level::MemoryProfile::Bounded);
 
     let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
