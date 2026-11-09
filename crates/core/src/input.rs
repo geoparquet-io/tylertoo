@@ -572,6 +572,32 @@ pub(crate) fn stage_parts(
     }
 }
 
+/// Fetch the footers of `parts`' remote members, `in_flight` at a time, so
+/// their parse reads them from memory instead of paying two round trips
+/// each in turn (#817 R1). `landed(i)` is called once for every index of
+/// `parts` as its footer is ready to parse: at once for a local part, on
+/// arrival for a remote one. Best effort: a part whose prefetch fails is
+/// fetched, and its error reported, by the parse.
+pub(crate) fn prefetch_footers(
+    parts: &[InputSource],
+    in_flight: usize,
+    mut landed: impl FnMut(usize),
+) {
+    #[cfg(feature = "remote")]
+    let mut remote = Vec::new();
+    for (i, source) in parts.iter().enumerate() {
+        match source {
+            #[cfg(feature = "remote")]
+            InputSource::Remote(r) => remote.push((i, r)),
+            _ => landed(i),
+        }
+    }
+    #[cfg(feature = "remote")]
+    remote::prefetch_footers(&remote, in_flight, landed);
+    #[cfg(not(feature = "remote"))]
+    let _ = in_flight;
+}
+
 /// What one pass-0 staging did (#788): the `pass0` record of the profile
 /// dump.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -630,13 +656,38 @@ impl PartStaging {
 /// and the `--max-zoom auto` sample from them (`MemoryBudget::stage_requests`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StageAdmission {
-    /// Requests a run wants in flight (`TYLERTOO_STAGING_CONCURRENCY`, else 8).
+    /// Requests a run wants in flight: `TYLERTOO_STAGING_CONCURRENCY`, else
+    /// the floor of [`Self::requests_for`] (8).
     pub(crate) max_concurrency: usize,
+    /// Whether `TYLERTOO_STAGING_CONCURRENCY` set [`Self::max_concurrency`].
+    pub(crate) concurrency_set: bool,
+    /// Most requests [`Self::requests_for`] ever puts in flight.
+    pub(crate) concurrency_cap: usize,
     /// Main's in-flight byte budget: `TYLERTOO_STAGING_MEM_BUDGET_BYTES`,
     /// else 256 MiB.
     pub(crate) mem_budget: u64,
     /// Whether `TYLERTOO_STAGING_MEM_BUDGET_BYTES` set [`Self::mem_budget`].
     pub(crate) mem_budget_set: bool,
+}
+
+impl StageAdmission {
+    /// Remote requests to keep in flight when each holds `request_bytes`
+    /// (#817 R1): what [`Self::mem_budget`] holds, never fewer than
+    /// [`Self::max_concurrency`] nor more than [`Self::concurrency_cap`];
+    /// exactly `TYLERTOO_STAGING_CONCURRENCY` when that is set. Remote
+    /// requests are latency-bound, so a fixed count of small ones left the
+    /// run waiting on round trips the byte budget could have overlapped.
+    pub(crate) fn requests_for(&self, request_bytes: u64) -> usize {
+        if self.concurrency_set {
+            return self.max_concurrency;
+        }
+        usize::try_from(self.mem_budget / request_bytes.max(1))
+            .unwrap_or(usize::MAX)
+            .clamp(
+                self.max_concurrency,
+                self.concurrency_cap.max(self.max_concurrency),
+            )
+    }
 }
 
 /// The one accessor of the staging admission's knobs ([`StageAdmission`]).
@@ -646,6 +697,8 @@ pub(crate) fn stage_admission() -> StageAdmission {
     #[cfg(not(feature = "remote"))]
     StageAdmission {
         max_concurrency: 1,
+        concurrency_set: false,
+        concurrency_cap: 1,
         mem_budget: 0,
         mem_budget_set: false,
     }
@@ -850,6 +903,10 @@ pub(crate) mod remote {
         /// Byte ranges of every column chunk, sorted by start; populated
         /// from the parsed footer on first open.
         chunk_ranges: OnceLock<Vec<Range<u64>>>,
+        /// The object's tail (footer + 8-byte trailer) and where it starts,
+        /// fetched ahead by [`prefetch_footers`]; served to the footer parse,
+        /// then dropped.
+        footer_tail: Mutex<Option<(u64, Bytes)>>,
     }
 
     impl SharedState {
@@ -1036,6 +1093,51 @@ pub(crate) mod remote {
         }
     }
 
+    /// One counted range GET (see `RemoteReader::fetch`).
+    async fn counted_get(
+        store: &dyn ObjectStore,
+        location: &ObjectPath,
+        object_meta: &tylertoo_io::RemoteObjectMeta,
+        shared: &SharedState,
+        range: Range<u64>,
+    ) -> Result<Bytes, ParquetError> {
+        let bytes = object_meta
+            .get_range(store, location, range.clone())
+            .await
+            .map_err(|e| ParquetError::External(Box::new(e)))?;
+        shared.requests.fetch_add(1, Ordering::Relaxed);
+        shared
+            .bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        shared
+            .ranges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(range);
+        Ok(bytes)
+    }
+
+    /// See [`super::prefetch_footers`].
+    pub(crate) fn prefetch_footers(
+        sources: &[(usize, &RemoteSource)],
+        in_flight: usize,
+        mut landed: impl FnMut(usize),
+    ) {
+        use futures_util::stream::{self, StreamExt};
+        runtime().block_on(
+            stream::iter(sources)
+                .map(|&(i, source)| async move {
+                    source.prefetch_footer().await;
+                    i
+                })
+                .buffer_unordered(in_flight.max(1))
+                .for_each(|i| {
+                    landed(i);
+                    async {}
+                }),
+        );
+    }
+
     impl RemoteSource {
         /// Connect to `url`, resolving the backing store from the scheme
         /// (cached per bucket, see [`store_and_location`]) and HEAD-ing the
@@ -1201,15 +1303,69 @@ pub(crate) mod remote {
             // The owner (#779) runs the footer pre-check, the #430 chunk-range
             // check against the object size and the guarded schema decode,
             // exactly as it does for a local file.
-            let md =
-                tylertoo_io::load_reader_metadata(&reader).map_err(|error| InputError::Footer {
-                    input: self.url.clone(),
-                    error,
-                })?;
+            let md = tylertoo_io::load_reader_metadata(&reader);
+            // The prefetched tail (#817 R1) has served its one parse.
+            self.shared
+                .footer_tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let md = md.map_err(|error| InputError::Footer {
+                input: self.url.clone(),
+                error,
+            })?;
             // A concurrent open may have won the race; either copy is
             // equivalent.
             let _ = self.metadata.set(md.clone());
             Ok(md)
+        }
+
+        /// Fetch the trailer, then the footer, exactly as the parse would
+        /// (the same two counted requests), into `footer_tail`. Any failure
+        /// or an encrypted or implausible trailer leaves the parse to fetch it.
+        async fn prefetch_footer(&self) {
+            const TRAILER: u64 = 8;
+            if self.metadata.get().is_some() {
+                return;
+            }
+            let get = |range| {
+                counted_get(
+                    self.store.as_ref(),
+                    &self.location,
+                    &self.object_meta,
+                    &self.shared,
+                    range,
+                )
+            };
+            let size = self.object_meta.size;
+            let Some(trailer_at) = size.checked_sub(TRAILER) else {
+                return;
+            };
+            let Ok(trailer) = get(trailer_at..size).await else {
+                return;
+            };
+            // `<u32 LE footer length>PAR1`; an encrypted footer ends `PARE`.
+            let (Ok(len), true) = (
+                <[u8; 4]>::try_from(&trailer[..trailer.len().min(4)]),
+                trailer.ends_with(b"PAR1") && trailer.len() as u64 == TRAILER,
+            ) else {
+                return;
+            };
+            let Some(footer_at) = trailer_at.checked_sub(u64::from(u32::from_le_bytes(len))) else {
+                return;
+            };
+            let Ok(footer) = get(footer_at..trailer_at).await else {
+                return;
+            };
+            let mut both = Vec::with_capacity(footer.len() + trailer.len());
+            both.extend_from_slice(&footer);
+            both.extend_from_slice(&trailer);
+            *self
+                .shared
+                .footer_tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((footer_at, Bytes::from(both)));
         }
 
         /// Pass 0 (#286/#287): stage the selected row groups to the disk spill
@@ -1767,6 +1923,9 @@ pub(crate) mod remote {
         pub(super) struct StagingTunables {
             /// Ceiling on in-flight row-group spans ([`CONCURRENCY_VAR`]).
             pub(super) max_concurrency: usize,
+            /// Was [`CONCURRENCY_VAR`] set? Unset, the in-flight count is
+            /// what the byte budget holds (#817 R1).
+            pub(super) concurrency_set: bool,
             /// Transient-memory budget in bytes ([`MEM_BUDGET_VAR`]); live
             /// concurrency is `min(max_concurrency, mem_budget / largest span)`.
             pub(super) mem_budget: u64,
@@ -1789,6 +1948,7 @@ pub(crate) mod remote {
             fn default() -> Self {
                 Self {
                     max_concurrency: STAGE_MAX_CONCURRENCY,
+                    concurrency_set: false,
                     mem_budget: STAGE_MEM_BUDGET,
                     coalesce_window: STAGE_COALESCE_WINDOW,
                     overridden: false,
@@ -1847,6 +2007,7 @@ pub(crate) mod remote {
             (
                 StagingTunables {
                     max_concurrency,
+                    concurrency_set: lookup(CONCURRENCY_VAR).is_some(),
                     mem_budget,
                     coalesce_window,
                     overridden: false,
@@ -2204,6 +2365,8 @@ pub(crate) mod remote {
         let tunables = staging_tunables::effective();
         super::StageAdmission {
             max_concurrency: tunables.max_concurrency,
+            concurrency_set: tunables.concurrency_set,
+            concurrency_cap: staging_tunables::CONCURRENCY_MAX,
             mem_budget: tunables.mem_budget,
             mem_budget_set: tunables.mem_budget_set,
         }
@@ -2251,12 +2414,21 @@ pub(crate) mod remote {
             .map(|(_, r, _)| r.span.end - r.span.start)
             .max()
             .unwrap_or(0);
+        // #817 R1: as many as the byte budget (a grant of whole largest
+        // requests) holds, unless the env pins the count.
+        let max_in_flight = if tunables.concurrency_set {
+            tunables.max_concurrency
+        } else {
+            usize::try_from(tunables.mem_budget / largest.max(1))
+                .unwrap_or(usize::MAX)
+                .clamp(1, staging_tunables::CONCURRENCY_MAX)
+        };
         log::debug!(
             "[stage] fetching {} span(s) over {} part(s), up to {} in flight \
              (largest span {largest} B, budget {} B)",
             queue.len(),
             parts.iter().filter(|(_, p)| !p.requests.is_empty()).count(),
-            tunables.max_concurrency,
+            max_in_flight,
             tunables.mem_budget
         );
         runtime().block_on(async {
@@ -2266,7 +2438,7 @@ pub(crate) mod remote {
                 while let Some((_, request, _)) = queue.front() {
                     let len = request.span.end - request.span.start;
                     let admit = inflight.is_empty()
-                        || (inflight.len() < tunables.max_concurrency
+                        || (inflight.len() < max_in_flight
                             && inflight_bytes.saturating_add(len) <= tunables.mem_budget);
                     if !admit {
                         break;
@@ -2709,6 +2881,19 @@ pub(crate) mod remote {
                 })?;
             if length == 0 {
                 return Ok(Bytes::new());
+            }
+            if let Some((at, tail)) = &*self
+                .shared
+                .footer_tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                if start >= *at {
+                    let off = usize::try_from(start - at).unwrap_or(usize::MAX);
+                    if let Some(bytes) = off.checked_add(length).and_then(|e| tail.get(off..e)) {
+                        return Ok(tail.slice_ref(bytes));
+                    }
+                }
             }
             // Page reads land inside a column chunk: serve them from the
             // whole-chunk buffer (one request per chunk). Everything else

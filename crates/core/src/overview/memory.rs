@@ -407,18 +407,19 @@ impl MemoryBudget {
         self.fit(profile, MemoryPhase::Compute, price, requested.max(1), 1)
     }
     /// Remote staging requests in flight at once (#727, #788), per
-    /// [`fit`](Self::fit): the concurrency ceiling wanted, or what
-    /// `TYLERTOO_STAGING_MEM_BUDGET_BYTES` holds when it is set, one at the
-    /// floor (a request larger than the grant is still admitted alone),
-    /// priced at the plan's largest request. `bounded` keeps main's staging
-    /// byte budget ([`MemoryPhase::bounded_cap`]).
+    /// [`fit`](Self::fit): what the staging budget holds
+    /// ([`StageAdmission::requests_for`](crate::input::StageAdmission::requests_for),
+    /// #817), never more than `TYLERTOO_STAGING_MEM_BUDGET_BYTES` holds when
+    /// it is set, one at the floor (a request larger than the grant is still
+    /// admitted alone), priced at the plan's largest request. `bounded`
+    /// keeps main's staging byte budget ([`MemoryPhase::bounded_cap`]).
     pub(super) fn stage_requests(&mut self, profile: MemoryProfile, largest_request: u64) -> Grant {
         let price = Price::new(largest_request.max(1), PriceBasis::Footer);
-        let ceiling = self.stage.max_concurrency.max(1);
+        let want = self.stage.requests_for(price.bytes);
         let want = if self.stage.mem_budget_set {
-            self.stage_units(price).min(ceiling)
+            want.min(self.stage_units(price))
         } else {
-            ceiling
+            want
         };
         self.fit(profile, MemoryPhase::Stage, price, want, 1)
     }
@@ -701,6 +702,35 @@ mod tests {
         budget.require(MemoryPhase::Scan, estimate).unwrap();
     }
 
+    /// #817 R1: small staging requests go in flight as many as the 256 MiB
+    /// staging budget holds (64 of 4 MiB, capped at 128 for tiny ones),
+    /// not main's fixed 8; `TYLERTOO_STAGING_CONCURRENCY` still pins it.
+    #[test]
+    fn small_staging_requests_fill_the_staging_budget() {
+        use crate::input::StageAdmission;
+        const MIB: u64 = 1 << 20;
+        let units_with = |largest: u64, set: Option<usize>, mem_budget_set: bool| {
+            let mut budget = MemoryBudget::with_available(Some(1 << 40));
+            budget.stage = StageAdmission {
+                max_concurrency: set.unwrap_or(8),
+                concurrency_set: set.is_some(),
+                concurrency_cap: 128,
+                mem_budget: 256 * MIB,
+                mem_budget_set,
+            };
+            let grant = budget.stage_requests(MemoryProfile::Auto, largest);
+            grant.bytes() / largest
+        };
+        let units = |largest, set| units_with(largest, set, false);
+        assert_eq!(units(4 * MIB, None), 64);
+        assert_eq!(units(1024, None), 128);
+        assert_eq!(units(64 * MIB, None), 8);
+        assert_eq!(units(4 * MIB, Some(8)), 8);
+        // An explicit TYLERTOO_STAGING_MEM_BUDGET_BYTES sizes the count too.
+        assert_eq!(units_with(4 * MIB, None, true), 64);
+        assert_eq!(units_with(64 * MIB, None, true), 4);
+    }
+
     /// #788: remote staging requests in flight per profile, for 64 MiB
     /// requests against main's 256 MiB staging budget and a ceiling of 8.
     /// `bounded` keeps main's budget (4 in flight, not 8); `auto` is decided
@@ -715,6 +745,8 @@ mod tests {
             let mut budget = MemoryBudget::with_available(Some(available));
             budget.stage = StageAdmission {
                 max_concurrency: 8,
+                concurrency_set: false,
+                concurrency_cap: 128,
                 mem_budget: set_budget.unwrap_or(256 * MIB),
                 mem_budget_set: set_budget.is_some(),
             };
