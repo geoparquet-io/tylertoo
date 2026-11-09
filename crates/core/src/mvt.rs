@@ -558,15 +558,32 @@ pub(crate) fn strip_box_pairs(
     boxes: &[(i32, i32, i32, i32)],
     mut hit: impl FnMut(usize, usize) -> bool,
 ) -> bool {
-    let strips = (boxes.len() / STRIP_BOXES).min(MAX_STRIPS);
-    if strips < 2 {
+    if boxes.len() < 2 * STRIP_BOXES {
         return any_box_pair(boxes, hit);
     }
     let (y0, y1) = boxes.iter().fold((i32::MAX, i32::MIN), |(lo, hi), b| {
         (lo.min(b.1), hi.max(b.3))
     });
     let span = i64::from(y1) - i64::from(y0) + 1;
+    // Strips no lower than the mean box, so a box reaches about two.
+    let heights: i64 = boxes.iter().map(|b| i64::from(b.3) - i64::from(b.1)).sum();
+    let mean_height = (heights / boxes.len() as i64).max(1);
+    let strips = (boxes.len() / STRIP_BOXES)
+        .min(MAX_STRIPS)
+        .min(usize::try_from(span / mean_height).unwrap_or(usize::MAX));
+    if strips < 2 {
+        return any_box_pair(boxes, hit);
+    }
     let strip_of = |y: i32| ((i64::from(y) - i64::from(y0)) * strips as i64 / span) as usize;
+    // Two boxes that share strips are compared in each of them: when boxes
+    // reach across many strips (long edges), the x sweep is cheaper.
+    let copies: usize = boxes
+        .iter()
+        .map(|b| strip_of(b.3) - strip_of(b.1) + 1)
+        .sum();
+    if copies > 2 * boxes.len() {
+        return any_box_pair(boxes, hit);
+    }
     // `any_box_pair`'s order, so each strip is a subsequence of it.
     let mut order: Vec<u32> = (0..boxes.len() as u32).collect();
     order.sort_unstable_by_key(|&i| boxes[i as usize].0);

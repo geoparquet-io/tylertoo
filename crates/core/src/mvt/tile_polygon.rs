@@ -853,6 +853,37 @@ mod tests {
         );
     }
 
+    /// roborev 337: edges spanning many strips met each other in every strip
+    /// they shared. Long, mutually overlapping edges must cost no more than
+    /// the x-only sweep did.
+    #[test]
+    fn long_edges_spanning_every_strip_are_not_compared_per_strip() {
+        let parts: Vec<Vec<TileRing>> = (0..1024)
+            .map(|k| {
+                vec![ring(&[
+                    (3 * k, 0),
+                    (3 * k + 1, 0),
+                    (3 * k + 4097, 4096),
+                    (3 * k + 4096, 4096),
+                ])]
+            })
+            .collect();
+        let boxes: Vec<_> = parts
+            .iter()
+            .flat_map(|p| p[0].windows(2).map(|w| edge_box(w[0], w[1])))
+            .collect();
+        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        any_box_pair(&boxes, |_, _| false);
+        let swept = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        check_polygons(&parts).ok();
+        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        assert!(
+            compared <= 2 * swept,
+            "{compared} comparisons, the x sweep makes {swept}"
+        );
+    }
+
     #[test]
     fn strips_visit_the_sweeps_pairs_in_the_same_orientation() {
         let mut seed = 0x772_u64;
