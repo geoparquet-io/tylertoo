@@ -414,11 +414,11 @@ impl MemoryBudget {
     /// byte budget ([`MemoryPhase::bounded_cap`]).
     pub(super) fn stage_requests(&mut self, profile: MemoryProfile, largest_request: u64) -> Grant {
         let price = Price::new(largest_request.max(1), PriceBasis::Footer);
-        let ceiling = self.stage.max_concurrency.max(1);
         let want = if self.stage.mem_budget_set {
-            self.stage_units(price).min(ceiling)
+            self.stage_units(price)
+                .min(self.stage.max_concurrency.max(1))
         } else {
-            ceiling
+            self.stage.requests_for(price.bytes)
         };
         self.fit(profile, MemoryPhase::Stage, price, want, 1)
     }
@@ -701,6 +701,31 @@ mod tests {
         budget.require(MemoryPhase::Scan, estimate).unwrap();
     }
 
+    /// #817 R1: small staging requests go in flight as many as the 256 MiB
+    /// staging budget holds (64 of 4 MiB, capped at 128 for tiny ones),
+    /// not main's fixed 8; `TYLERTOO_STAGING_CONCURRENCY` still pins it.
+    #[test]
+    fn small_staging_requests_fill_the_staging_budget() {
+        use crate::input::StageAdmission;
+        const MIB: u64 = 1 << 20;
+        let units = |largest: u64, set: Option<usize>| {
+            let mut budget = MemoryBudget::with_available(Some(1 << 40));
+            budget.stage = StageAdmission {
+                max_concurrency: set.unwrap_or(8),
+                concurrency_set: set.is_some(),
+                concurrency_cap: 128,
+                mem_budget: 256 * MIB,
+                mem_budget_set: false,
+            };
+            let grant = budget.stage_requests(MemoryProfile::Auto, largest);
+            grant.bytes() / largest
+        };
+        assert_eq!(units(4 * MIB, None), 64);
+        assert_eq!(units(1024, None), 128);
+        assert_eq!(units(64 * MIB, None), 8);
+        assert_eq!(units(4 * MIB, Some(8)), 8);
+    }
+
     /// #788: remote staging requests in flight per profile, for 64 MiB
     /// requests against main's 256 MiB staging budget and a ceiling of 8.
     /// `bounded` keeps main's budget (4 in flight, not 8); `auto` is decided
@@ -715,6 +740,8 @@ mod tests {
             let mut budget = MemoryBudget::with_available(Some(available));
             budget.stage = StageAdmission {
                 max_concurrency: 8,
+                concurrency_set: false,
+                concurrency_cap: 128,
                 mem_budget: set_budget.unwrap_or(256 * MIB),
                 mem_budget_set: set_budget.is_some(),
             };
