@@ -52,7 +52,7 @@ use super::cluster::{
     POINT_COUNT_COLUMN,
 };
 use super::coalesce::{
-    coalesce_level_lines, CoalesceInput, CoalesceParams, COALESCED_COUNT_COLUMN,
+    coalesce_level_lines_with, CoalesceParams, ExactChains, COALESCED_COUNT_COLUMN,
     COALESCE_NOMINAL_BYTES_PER_LINE, DEFAULT_COALESCE_MAX_LEVEL_ROWS, DEFAULT_JUNCTION_ANGLE_DEG,
     DEFAULT_SNAP_GSD_FACTOR,
 };
@@ -6345,14 +6345,14 @@ impl GroupInterner {
 /// the budget was calibrated for. Deterministic; shared verbatim by both
 /// pipelines (and the streaming counting pass) so their outputs and hints
 /// stay identical.
-pub(super) fn coalesce_level_chains(
-    inputs: &[CoalesceInput<'_>],
+pub(super) fn coalesce_level_chains<'e>(
+    lines: &'e ExactChains<'_>,
     level: usize,
     finest: usize,
     gsd_m: f64,
     crs: Crs,
     options: &ConvertOptions,
-) -> Vec<super::coalesce::CoalescedLine> {
+) -> Vec<super::coalesce::CoalescedLine<'e>> {
     // #745: the chain budget thins lines, so it follows the budget's line
     // switch.
     let budget = if options.density.enabled
@@ -6362,14 +6362,14 @@ pub(super) fn coalesce_level_chains(
         && level < finest
     {
         let keep = 1.0 / options.density.drop_rate;
-        let raw = inputs.len() as f64 * keep.powi((finest - level) as i32);
+        let raw = lines.lines().len() as f64 * keep.powi((finest - level) as i32);
         let max_chains = (raw.round() as usize).max(super::assign::MIN_DENSITY_LEVEL_FEATURES);
         Some((max_chains, options.density.gamma))
     } else {
         None
     };
-    coalesce_level_lines(
-        inputs,
+    coalesce_level_lines_with(
+        lines,
         gsd_m,
         crs,
         &options.assign,
@@ -6387,7 +6387,7 @@ pub(super) fn coalesce_level_chains(
 /// knobs never hit this: the 2×GSD gate is stricter than the 1×GSD simplify
 /// drop gate).
 pub(super) fn build_level_coalesce_table(
-    inputs: &[CoalesceInput<'_>],
+    lines: &ExactChains<'_>,
     level: usize,
     finest: usize,
     gsd_m: f64,
@@ -6395,7 +6395,7 @@ pub(super) fn build_level_coalesce_table(
     options: &ConvertOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> CoalesceTable {
-    build_level_coalesce_table_and_hint(inputs, level, finest, gsd_m, crs, options, diagnostics).0
+    build_level_coalesce_table_and_hint(lines, level, finest, gsd_m, crs, options, diagnostics).0
 }
 
 /// [`build_level_coalesce_table`] plus the level's PRE-simplification chain
@@ -6409,7 +6409,7 @@ pub(super) fn build_level_coalesce_table(
 /// hint bit-for-bit what the count-only pass produced — `chains.len()`,
 /// counted BEFORE the simplify drops the table applies.
 pub(super) fn build_level_coalesce_table_and_hint(
-    inputs: &[CoalesceInput<'_>],
+    lines: &ExactChains<'_>,
     level: usize,
     finest: usize,
     gsd_m: f64,
@@ -6420,7 +6420,7 @@ pub(super) fn build_level_coalesce_table_and_hint(
     use rayon::prelude::*;
 
     let t_chains = Instant::now();
-    let chains = coalesce_level_chains(inputs, level, finest, gsd_m, crs, options);
+    let chains = coalesce_level_chains(lines, level, finest, gsd_m, crs, options);
     let chain_secs = t_chains.elapsed().as_secs_f64();
     let hint = chains.len();
     let t_simplify = Instant::now();
@@ -6452,7 +6452,7 @@ pub(super) fn build_level_coalesce_table_and_hint(
     log::debug!(
         "[profile] coalesce level {level}: {} line(s) -> {} kept chain(s), longest chain \
          {longest} vertices; chain {chain_secs:.2}s + simplify {:.2}s",
-        inputs.len(),
+        lines.lines().len(),
         table.len(),
         t_simplify.elapsed().as_secs_f64(),
     );

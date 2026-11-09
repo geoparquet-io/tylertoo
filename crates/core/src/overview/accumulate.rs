@@ -45,6 +45,8 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use super::assign::{gsd_to_coord_units, FeatureKind, FeatureTable};
 use super::level::Crs;
 use super::simplify::{
@@ -129,82 +131,16 @@ pub fn tiny_polygon_carriers(
 ) -> Vec<Vec<usize>> {
     debug_assert_eq!(features.len(), min_levels.len());
     debug_assert_eq!(features.len(), areas.len());
-    let mut out: Vec<Vec<usize>> = vec![Vec::new(); levels.len()];
-    let mut floored_zooms: Vec<f64> = Vec::new();
-    for (li, level) in levels.iter().enumerate() {
-        if !level.enabled {
-            continue;
-        }
-        let gsd_units = gsd_to_coord_units(level.gsd_meters, crs);
-        let side = placeholder_side(level.gsd_meters, level.zoom, crs);
-        let floored = side > level_tolerance(level.gsd_meters, crs, 1.0);
-        if floored {
-            floored_zooms.push(export_zoom(level.gsd_meters, level.zoom));
-        }
-        let threshold = side * side;
-        let cell = ACCUMULATE_CELL_GSD * gsd_units;
-        // NaN / zero guards (a NaN compares false everywhere).
-        if threshold.is_nan() || threshold <= 0.0 || cell.is_nan() || cell <= 0.0 {
-            continue;
-        }
-        let mut acc: HashMap<(i64, i64), Patch> = HashMap::new();
-        for (pos, (&ml, &area)) in min_levels.iter().zip(areas).enumerate() {
-            if features.kind(pos) != FeatureKind::Polygon || usize::from(ml) <= li {
-                continue; // not a polygon, or already present at this level
-            }
-            if features.entry_level(pos).is_some() {
-                continue; // #364: the ladder decides where it first appears
-            }
-            let area = f64::from(area);
-            if area.is_nan() || area <= 0.0 {
-                continue;
-            }
-            // DIVERGENCE FROM TIPPECANOE: tippecanoe only accumulates rings
-            // with area <= pixel² and keeps larger rings as geometry, so its
-            // residual never exceeds one placeholder. Here a non-member is
-            // gone whatever its size (gate-failed polygons routinely sit in
-            // (T, 2T); thinning and budget losers are unbounded), so clamp
-            // the contribution instead: a polygon is worth at most one
-            // placeholder, and the residual invariant (< T per patch) holds.
-            let area = area.min(threshold);
-            // The patch key comes from the bbox centre. A polygon whose bbox
-            // spans the antimeridian (lng_min near -180, lng_max near 180)
-            // therefore lands in a patch near lng 0, far from where it
-            // sits. The rest of the pipeline has no wrap handling either
-            // (#342); this stays consistent with it until that lands.
-            let (cx, cy) = features.center(pos);
-            let key = ((cx / cell).floor() as i64, (cy / cell).floor() as i64);
-            let patch = acc.entry(key).or_default();
-            patch.total += area;
-            if patch.total >= threshold {
-                out[li].push(features.indices()[pos]);
-                patch.total -= threshold;
-            } else {
-                patch.last_free = Some((features.indices()[pos], cx, cy));
-            }
-        }
-        // A patch keeps less than one `T` unemitted. At a floored level `T`
-        // is up to several times one GSD², so that
-        // truncation would thin sparse patches noticeably (at `--gsd-base
-        // 8192`, ~12% of the z3 area in the #407 probe). There, dither the
-        // residual instead: the patch's last non-carrier contributor also
-        // becomes a carrier with probability `residual / T`, decided by the
-        // same anchor hash the `--collapse-square` dither uses, so expected
-        // placeholder area equals the clamped dropped area. Unfloored levels
-        // keep the plain truncation, byte-identical to before #407.
-        if floored {
-            for patch in acc.values() {
-                if let Some((index, cx, cy)) = patch.last_free {
-                    if dither_u01(cx, cy) < patch.total / threshold {
-                        out[li].push(index);
-                    }
-                }
-            }
-        }
-        // `features` is in input order and `index` is monotone in it, but
-        // sort anyway: the lookup is a binary search.
-        out[li].sort_unstable();
-    }
+    // Each level reads the shared inputs and writes only its own list, so
+    // the levels run concurrently (#817: serial, this was 0.2 s of Moldova's
+    // and 1.4 s of NZ parcels' convert at any thread count).
+    let per_level: Vec<(Vec<usize>, Option<f64>)> = levels
+        .par_iter()
+        .enumerate()
+        .map(|(li, level)| level_carriers(features, min_levels, areas, li, level, crs))
+        .collect();
+    let floored_zooms: Vec<f64> = per_level.iter().filter_map(|(_, z)| *z).collect();
+    let out: Vec<Vec<usize>> = per_level.into_iter().map(|(c, _)| c).collect();
     if !floored_zooms.is_empty() {
         let zooms: Vec<String> = floored_zooms.iter().map(|z| format!("z{z}")).collect();
         log::info!(
@@ -214,6 +150,92 @@ pub fn tiny_polygon_carriers(
         );
     }
     out
+}
+
+/// One level of [`tiny_polygon_carriers`]: its sorted carrier rows, and its
+/// export zoom when the placeholder side is floored there.
+fn level_carriers(
+    features: &FeatureTable,
+    min_levels: &[u8],
+    areas: &[f32],
+    li: usize,
+    level: &AccumulateLevel,
+    crs: Crs,
+) -> (Vec<usize>, Option<f64>) {
+    let mut out = Vec::new();
+    if !level.enabled {
+        return (out, None);
+    }
+    #[cfg(test)]
+    rendezvous::arrive("accumulate level");
+    let gsd_units = gsd_to_coord_units(level.gsd_meters, crs);
+    let side = placeholder_side(level.gsd_meters, level.zoom, crs);
+    let floored = side > level_tolerance(level.gsd_meters, crs, 1.0);
+    let floored_zoom = floored.then(|| export_zoom(level.gsd_meters, level.zoom));
+    let threshold = side * side;
+    let cell = ACCUMULATE_CELL_GSD * gsd_units;
+    // NaN / zero guards (a NaN compares false everywhere).
+    if threshold.is_nan() || threshold <= 0.0 || cell.is_nan() || cell <= 0.0 {
+        return (out, floored_zoom);
+    }
+    let mut acc: HashMap<(i64, i64), Patch> = HashMap::new();
+    for (pos, (&ml, &area)) in min_levels.iter().zip(areas).enumerate() {
+        if features.kind(pos) != FeatureKind::Polygon || usize::from(ml) <= li {
+            continue; // not a polygon, or already present at this level
+        }
+        if features.entry_level(pos).is_some() {
+            continue; // #364: the ladder decides where it first appears
+        }
+        let area = f64::from(area);
+        if area.is_nan() || area <= 0.0 {
+            continue;
+        }
+        // DIVERGENCE FROM TIPPECANOE: tippecanoe only accumulates rings
+        // with area <= pixel² and keeps larger rings as geometry, so its
+        // residual never exceeds one placeholder. Here a non-member is
+        // gone whatever its size (gate-failed polygons routinely sit in
+        // (T, 2T); thinning and budget losers are unbounded), so clamp
+        // the contribution instead: a polygon is worth at most one
+        // placeholder, and the residual invariant (< T per patch) holds.
+        let area = area.min(threshold);
+        // The patch key comes from the bbox centre. A polygon whose bbox
+        // spans the antimeridian (lng_min near -180, lng_max near 180)
+        // therefore lands in a patch near lng 0, far from where it
+        // sits. The rest of the pipeline has no wrap handling either
+        // (#342); this stays consistent with it until that lands.
+        let (cx, cy) = features.center(pos);
+        let key = ((cx / cell).floor() as i64, (cy / cell).floor() as i64);
+        let patch = acc.entry(key).or_default();
+        patch.total += area;
+        if patch.total >= threshold {
+            out.push(features.indices()[pos]);
+            patch.total -= threshold;
+        } else {
+            patch.last_free = Some((features.indices()[pos], cx, cy));
+        }
+    }
+    // A patch keeps less than one `T` unemitted. At a floored level `T`
+    // is up to several times one GSD², so that
+    // truncation would thin sparse patches noticeably (at `--gsd-base
+    // 8192`, ~12% of the z3 area in the #407 probe). There, dither the
+    // residual instead: the patch's last non-carrier contributor also
+    // becomes a carrier with probability `residual / T`, decided by the
+    // same anchor hash the `--collapse-square` dither uses, so expected
+    // placeholder area equals the clamped dropped area. Unfloored levels
+    // keep the plain truncation, byte-identical to before #407.
+    if floored {
+        for patch in acc.values() {
+            if let Some((index, cx, cy)) = patch.last_free {
+                if dither_u01(cx, cy) < patch.total / threshold {
+                    out.push(index);
+                }
+            }
+        }
+    }
+    // `features` is in input order and `index` is monotone in it, but
+    // sort anyway: the lookup is a binary search.
+    out.sort_unstable();
+    (out, floored_zoom)
 }
 
 /// One accumulation patch's running state.
@@ -230,6 +252,80 @@ struct Patch {
 #[inline]
 pub fn is_carrier(carriers: &[usize], g: usize) -> bool {
     carriers.binary_search(&g).is_ok()
+}
+
+/// Test-only rendezvous (#817): proves that `n` tasks run at the same time.
+/// A test [`arm`](rendezvous::arm)s a site; every task at that site calls
+/// [`arrive`](rendezvous::arrive), which waits until `n` tasks have arrived
+/// (or a 2 s guard expires). [`met`](rendezvous::met) reports whether all
+/// `n` were in flight at once, which a serial loop can never achieve.
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "#817: test-only rendezvous across pool threads; no diagnostic globals"
+)]
+pub(super) mod rendezvous {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+    static ARMED: Mutex<Option<(&'static str, usize)>> = Mutex::new(None);
+    static ARRIVED: AtomicUsize = AtomicUsize::new(0);
+    static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+
+    /// Arm `site` for `n` arrivals. Hold the guard for the test's duration:
+    /// it serializes rendezvous tests under plain `cargo test`.
+    pub(in crate::overview) fn arm(site: &'static str, n: usize) -> MutexGuard<'static, ()> {
+        let guard = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ARRIVED.store(0, Ordering::SeqCst);
+        TIMED_OUT.store(false, Ordering::SeqCst);
+        *ARMED.lock().unwrap() = Some((site, n));
+        guard
+    }
+
+    const POOL_THREAD: &str = "rendezvous";
+
+    /// The pool a rendezvous test runs its tasks on. Only its threads count
+    /// as arrivals, so another test's calls through the same site (under
+    /// plain `cargo test`, one process) cannot complete the rendezvous.
+    pub(in crate::overview) fn pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|_| POOL_THREAD.to_owned())
+            .build()
+            .unwrap()
+    }
+
+    pub(in crate::overview) fn arrive(site: &'static str) {
+        if std::thread::current().name() != Some(POOL_THREAD) {
+            return;
+        }
+        let Some((armed, n)) = *ARMED.lock().unwrap() else {
+            return;
+        };
+        if armed != site {
+            return;
+        }
+        ARRIVED.fetch_add(1, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ARRIVED.load(Ordering::SeqCst) < n {
+            if Instant::now() > deadline {
+                TIMED_OUT.store(true, Ordering::SeqCst);
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Whether every arrival found all `n` in flight (none waited out the
+    /// guard). Disarms the site.
+    pub(in crate::overview) fn met() -> bool {
+        let n = ARMED.lock().unwrap().take().map_or(0, |(_, n)| n);
+        ARRIVED.load(Ordering::SeqCst) >= n && !TIMED_OUT.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +358,27 @@ mod tests {
             AccumulateLevel::new(1000.0, None, true),
             AccumulateLevel::new(10.0, None, false),
         ]
+    }
+
+    /// #817 A1: the levels are independent, so they run concurrently. A
+    /// serial level loop (the old shape: one main thread for the whole
+    /// accumulator, 0.2-1.4 s on Moldova/NZ at any thread count) never has
+    /// four levels in flight at once.
+    #[test]
+    fn levels_accumulate_concurrently() {
+        let feats: Vec<AssignFeature> = (0..10).map(|i| square(i, 10.0, 10.0, 400.0)).collect();
+        let min_levels = vec![4u8; 10];
+        let areas = vec![160_000.0f32; 10];
+        let levels: Vec<AccumulateLevel> = (0..4)
+            .map(|l| AccumulateLevel::new(1000.0 / f64::from(1u32 << l), None, true))
+            .collect();
+        let pool = rendezvous::pool(4);
+        let _guard = rendezvous::arm("accumulate level", 4);
+        let out = pool.install(|| {
+            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &levels, Crs::Epsg3857)
+        });
+        assert!(rendezvous::met(), "the 4 levels never ran at once");
+        assert_eq!(out.len(), 4);
     }
 
     #[test]

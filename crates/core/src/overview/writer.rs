@@ -241,6 +241,13 @@ pub struct OverviewWriterOptions {
     /// The levels were independently cropped to a shard's spatial domain.
     /// Such levels do not obey a whole-source cluster-mass equality.
     pub source_is_subset: bool,
+    /// Let a level's row-group encodes run on while the next level's start
+    /// (#817): the previous level's may overlap the current one's, within
+    /// `encode_concurrency`. Off, every level drains its own encodes before
+    /// `write_level` returns, which holds at most one level's row groups
+    /// (the auto and bounded envelope). Convert sets it for `speed` only.
+    /// Default `false`.
+    pub overlap_levels: bool,
 }
 
 impl OverviewWriterOptions {
@@ -260,6 +267,7 @@ impl OverviewWriterOptions {
             encode_concurrency: 1,
             primary_column: None,
             source_is_subset: false,
+            overlap_levels: false,
         }
     }
 }
@@ -378,6 +386,12 @@ pub struct OverviewWriter<W: Write + Send> {
     /// Count of row groups appended to the file so far. Replaces the
     /// `ArrowWriter::flushed_row_groups().len()` bookkeeping.
     row_groups_written: usize,
+    /// Row-group encodes submitted but not yet appended, oldest first
+    /// (#296), with the level each belongs to. Not drained at a level's end
+    /// (#817): the next level's encodes overlap them. A level drains the
+    /// one before the previous before it starts, so at most two levels'
+    /// row groups are held at once; [`Self::finish`] drains the rest.
+    rg_inflight: VecDeque<(usize, Receiver<EncodeResult>)>,
     /// Shared GeoParquet encoder used by the **serial** path
     /// (`encode_concurrency == 1`): it both encodes batches and accumulates the
     /// file-level `geo` covering across them. The parallel path (#304) encodes
@@ -479,15 +493,14 @@ type WkbEncodeResult = Result<(RecordBatch, GeoParquetMetadata), String>;
 
 /// Mutable per-level row-group assembly state threaded through the batch
 /// loop: the target rows per row group, the encode concurrency, the rows
-/// accumulated into the current (not-yet-submitted) row group, that group's
-/// encoded slices in read order, and the bounded FIFO of in-flight row-group
-/// encodes (#296).
+/// accumulated into the current (not-yet-submitted) row group, and that
+/// group's encoded slices in read order. The in-flight encodes themselves
+/// are the writer's ([`OverviewWriter::rg_inflight`]), since they span levels.
 struct RgAssembly {
     target: usize,
     concurrency: usize,
     in_rg: usize,
     cur_rg: Vec<RecordBatch>,
-    inflight: VecDeque<Receiver<EncodeResult>>,
 }
 
 impl OverviewWriter<File> {
@@ -616,6 +629,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             rg_factory,
             target_schema,
             row_groups_written: 0,
+            rg_inflight: VecDeque::new(),
             encoder,
             geo_meta_acc: None,
             augmented_schema,
@@ -669,7 +683,10 @@ impl<W: Write + Send> OverviewWriter<W> {
     /// # Errors
     ///
     /// Returns a [`WriterError`] if `level_idx` is out of order, if an earlier
-    /// write failed, or if encoding or writing a batch fails.
+    /// write failed, or if encoding or writing a batch fails. A row group's
+    /// encode may still be running when its level returns (#817), so its
+    /// failure can surface from a later `write_level` or from
+    /// [`Self::finish`]; either way the writer is then poisoned.
     pub fn write_level(
         &mut self,
         level_idx: usize,
@@ -686,7 +703,18 @@ impl<W: Write + Send> OverviewWriter<W> {
             });
         }
 
-        let rg_before = self.row_groups_written;
+        // Only the previous level's encodes may still run alongside this
+        // one's: an older level's row groups are appended first.
+        while self
+            .rg_inflight
+            .front()
+            .is_some_and(|(level, _)| level + 1 < level_idx)
+        {
+            if let Some((_, rx)) = self.rg_inflight.pop_front() {
+                self.drain_encoded(rx)?;
+            }
+        }
+        let rg_before = self.row_groups_submitted();
 
         // Rows per row group for THIS level (§4.2, §4.5). The parquet writer
         // never splits on its own (its `max_row_group_size` is set to
@@ -706,7 +734,6 @@ impl<W: Write + Send> OverviewWriter<W> {
             concurrency,
             in_rg: 0,
             cur_rg: Vec::new(),
-            inflight: VecDeque::new(),
         };
 
         // The PHYSICAL level index this level will occupy in the output file:
@@ -777,12 +804,16 @@ impl<W: Write + Send> OverviewWriter<W> {
             self.submit_row_group(&mut asm, cur)?;
         }
 
-        // Drain every remaining in-flight encode, appending in submission order.
-        while let Some(rx) = asm.inflight.pop_front() {
-            self.drain_encoded(rx)?;
+        // With `overlap_levels`, this level's encodes stay in flight (#817):
+        // the next level's batches start while they finish, and every append
+        // still happens in submission order (on a later submit or in
+        // `finish`).
+        if !self.options.overlap_levels {
+            while let Some((_, rx)) = self.rg_inflight.pop_front() {
+                self.drain_encoded(rx)?;
+            }
         }
-
-        let rg_after = self.row_groups_written;
+        let rg_after = self.row_groups_submitted();
         if rg_after <= rg_before {
             // Empty level: omit it entirely and renumber (§7.3). No rows were
             // written, so the file carries no trace of it; only the bookkeeping
@@ -927,15 +958,15 @@ impl<W: Write + Send> OverviewWriter<W> {
     ) -> Result<(), WriterError> {
         // Backpressure: never let more than `concurrency` row groups sit in
         // flight, bounding peak memory to O(concurrency × row_group).
-        while asm.inflight.len() >= asm.concurrency {
-            if let Some(rx) = asm.inflight.pop_front() {
+        while self.rg_inflight.len() >= asm.concurrency {
+            if let Some((_, rx)) = self.rg_inflight.pop_front() {
                 self.drain_encoded(rx)?;
             }
         }
         // The row-group ordinal this group will occupy once appended (rows
         // already written + those ahead of it in flight). Only consulted by the
         // parquet encryptor, which is disabled here, but kept correct.
-        let rg_index = self.row_groups_written + asm.inflight.len();
+        let rg_index = self.row_groups_submitted();
         let writers = self.rg_factory.create_column_writers(rg_index)?;
         let target_schema = self.target_schema.clone();
         #[cfg(test)]
@@ -951,13 +982,21 @@ impl<W: Write + Send> OverviewWriter<W> {
             let result = catch_encode_panic(&rg_task_label, move || {
                 #[cfg(test)]
                 faults.trip_row_group();
+                #[cfg(test)]
+                super::accumulate::rendezvous::arrive("encode row group");
                 encode_row_group(writers, batches, &target_schema)
             })
             .unwrap_or_else(|msg| Err(ParquetError::General(msg)));
             let _ = tx.send(result);
         });
-        asm.inflight.push_back(rx);
+        self.rg_inflight.push_back((self.next_level_idx, rx));
         Ok(())
+    }
+
+    /// Row groups appended plus those still encoding: the ordinal the next
+    /// submitted row group will occupy.
+    fn row_groups_submitted(&self) -> usize {
+        self.row_groups_written + self.rg_inflight.len()
     }
 
     /// Wait for one in-flight row group's encode to finish and append its
@@ -1007,6 +1046,10 @@ impl<W: Write + Send> OverviewWriter<W> {
     pub fn finish(mut self) -> Result<OverviewsMeta, WriterError> {
         if self.failed {
             return Err(poisoned_writer_error());
+        }
+        // Append the encodes the last levels left in flight, in order.
+        while let Some((_, rx)) = self.rg_inflight.pop_front() {
+            self.drain_encoded(rx)?;
         }
         if self.next_level_idx != self.options.levels.len() {
             return Err(WriterError::IncompleteLevels {
@@ -1755,6 +1798,35 @@ mod tests {
             }
         }
         (rows_per_rg, rows)
+    }
+
+    /// #817 W1: a level's row-group encodes overlap the next level's. A
+    /// level of a wide or small table is often one row group, so draining
+    /// every level before taking the next ran pass 2's encodes ~one at a
+    /// time (Madagascar 58 columns: ~2 busy threads; monster coastline: one).
+    #[test]
+    fn row_group_encodes_overlap_across_levels() {
+        let schema = Arc::new(source_schema());
+        let mut opts = duplicating_options();
+        opts.encode_concurrency = 4;
+        opts.overlap_levels = true;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let pool = super::super::accumulate::rendezvous::pool(4);
+        let ids: Vec<i64> = (0..10).collect();
+        let _guard = super::super::accumulate::rendezvous::arm("encode row group", 2);
+        pool.install(|| {
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            for level in 0..3 {
+                let batch = std::iter::once(source_batch(&schema, &ids));
+                let outcome = writer.write_level(level, Some(ids.len()), batch).unwrap();
+                assert_eq!(outcome, LevelWriteOutcome::Written);
+            }
+            writer.finish().unwrap();
+        });
+        assert!(
+            super::super::accumulate::rendezvous::met(),
+            "two levels' row groups never encoded at once"
+        );
     }
 
     /// #296: parallel row-group encoding (`encode_concurrency > 1`) must produce
@@ -3383,6 +3455,117 @@ mod tests {
                 );
             },
         );
+    }
+
+    /// #817: a level's encodes stay in flight after its `write_level`
+    /// returns, so its failure surfaces from a later call. Level 0 fails;
+    /// level 2 drains it (only the previous level may overlap): that call
+    /// errors and poisons the writer.
+    #[test]
+    fn deferred_encode_failure_surfaces_from_a_later_level_and_poisons() {
+        within(
+            "deferred_encode_failure_surfaces_from_a_later_level",
+            || {
+                let schema = Arc::new(source_schema());
+                let mut opts = duplicating_options();
+                opts.encode_concurrency = 4;
+                opts.overlap_levels = true;
+                let dir = tempfile::tempdir().unwrap();
+                let dest = dir.path().join("out.parquet");
+                let mut writer = OverviewWriter::create(&dest, &schema, opts).unwrap();
+                let ids: Vec<i64> = (0..3).collect();
+                let level = |w: &mut OverviewWriter<_>, l: usize| {
+                    w.write_level(
+                        l,
+                        Some(ids.len()),
+                        vec![source_batch(&schema, &ids)].into_iter(),
+                    )
+                };
+                writer.set_encode_faults(EncodeFaults {
+                    row_group: true,
+                    wkb: false,
+                });
+                let _ = level(&mut writer, 0);
+                writer.set_encode_faults(EncodeFaults::default());
+                let err = level(&mut writer, 1)
+                    .and_then(|_| level(&mut writer, 2))
+                    .expect_err("level 0's failed encode must surface by level 2");
+                assert!(
+                    err.to_string().contains("injected row-group encode panic"),
+                    "{err}"
+                );
+                let err = writer.finish().expect_err("the writer is poisoned");
+                assert!(err.to_string().contains("writer is poisoned"), "{err}");
+                assert!(!dest.exists(), "nothing published");
+            },
+        );
+    }
+
+    /// #817: without `overlap_levels` (auto and bounded) a level drains
+    /// its own encodes, so its failure surfaces from its own call.
+    #[test]
+    fn without_overlap_a_level_drains_its_own_encodes() {
+        within("without_overlap_a_level_drains_its_own_encodes", || {
+            let schema = Arc::new(source_schema());
+            let mut opts = duplicating_options();
+            opts.encode_concurrency = 4;
+            opts.overlap_levels = false;
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            writer.set_encode_faults(EncodeFaults {
+                row_group: true,
+                wkb: false,
+            });
+            let ids: Vec<i64> = (0..3).collect();
+            let err = writer
+                .write_level(
+                    0,
+                    Some(ids.len()),
+                    vec![source_batch(&schema, &ids)].into_iter(),
+                )
+                .expect_err("the level's own encode failure surfaces from its call");
+            assert!(
+                err.to_string().contains("injected row-group encode panic"),
+                "{err}"
+            );
+        });
+    }
+
+    /// #817: the last levels' encodes are drained by `finish`; a failure
+    /// there is an error and publishes nothing.
+    #[test]
+    fn deferred_encode_failure_surfaces_from_finish() {
+        within("deferred_encode_failure_surfaces_from_finish", || {
+            let schema = Arc::new(source_schema());
+            let mut opts = duplicating_options();
+            opts.encode_concurrency = 4;
+            opts.overlap_levels = true;
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("out.parquet");
+            let mut writer = OverviewWriter::create(&dest, &schema, opts).unwrap();
+            let ids: Vec<i64> = (0..3).collect();
+            for l in 0..3 {
+                writer.set_encode_faults(EncodeFaults {
+                    row_group: l == 2,
+                    wkb: false,
+                });
+                let _ = writer
+                    .write_level(
+                        l,
+                        Some(ids.len()),
+                        vec![source_batch(&schema, &ids)].into_iter(),
+                    )
+                    .expect("the last level's encode is still in flight");
+            }
+            let err = writer
+                .finish()
+                .expect_err("finish drains the failed encode");
+            assert!(
+                err.to_string().contains("injected row-group encode panic"),
+                "{err}"
+            );
+            assert!(!dest.exists(), "nothing published");
+        });
     }
 
     // ---- #427: the destination is untouched until `finish` publishes. ----

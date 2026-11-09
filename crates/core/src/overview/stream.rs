@@ -45,7 +45,7 @@ use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
 use super::cluster::{ClusterEntry, ClusterTables};
-use super::coalesce::{collected_line_bytes, CoalesceInput};
+use super::coalesce::{collected_line_bytes, CoalesceInput, ExactChains};
 use super::config::ValidatedConfig;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
@@ -1212,21 +1212,26 @@ fn build_pass2_coalesce_tables(
     options: &ConvertOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Vec<Option<CoalesceTable>> {
+    let verbatim =
+        |e: &EmitLevel| matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
     match coalesce_scratch {
-        Some(scratch) => {
+        // A ladder of verbatim levels has no chain table to build.
+        Some(scratch) if !emitted.iter().all(verbatim) => {
             log::info!(
                 "[convert] building coalesce chain tables for {} level(s)",
                 emitted.len()
             );
-            let inputs = scratch.inputs();
+            let lines = ExactChains::new(
+                scratch.inputs(),
+                options.coalesce_junction_angle,
+                options.assign.sort_direction,
+            );
             emitted
                 .par_iter()
                 .map(|e| {
-                    let verbatim =
-                        matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
-                    (!verbatim).then(|| {
+                    (!verbatim(e)).then(|| {
                         build_level_coalesce_table(
-                            &inputs,
+                            &lines,
                             e.orig as usize,
                             finest,
                             e.gsd,
@@ -1238,7 +1243,7 @@ fn build_pass2_coalesce_tables(
                 })
                 .collect()
         }
-        None => std::iter::repeat_with(|| None)
+        _ => std::iter::repeat_with(|| None)
             .take(emitted.len())
             .collect(),
     }
@@ -1984,8 +1989,13 @@ fn pass2_coalesce(
                             "[convert] coalesce level {} was not prebuilt; building it now",
                             e.orig
                         );
+                        let lines = ExactChains::new(
+                            scratch.inputs(),
+                            options.coalesce_junction_angle,
+                            options.assign.sort_direction,
+                        );
                         Some(build_level_coalesce_table(
-                            &scratch.inputs(),
+                            &lines,
                             e.orig as usize,
                             finest,
                             e.gsd,
@@ -2027,16 +2037,22 @@ fn coalesce_merged_anywhere(
     let Some(scratch) = scratch else {
         return false;
     };
-    if unmaterialized.is_empty() || matches!(options.mode, Mode::Partitioning) {
+    if unmaterialized.iter().all(|e| e.orig as usize == finest)
+        || matches!(options.mode, Mode::Partitioning)
+    {
         return false;
     }
-    let inputs = scratch.inputs();
+    let lines = ExactChains::new(
+        scratch.inputs(),
+        options.coalesce_junction_angle,
+        options.assign.sort_direction,
+    );
     unmaterialized
         .par_iter()
         .filter(|e| e.orig as usize != finest)
         .any(|e| {
             coalesce_table_merged(&build_level_coalesce_table(
-                &inputs,
+                &lines,
                 e.orig as usize,
                 finest,
                 e.gsd,
@@ -2105,6 +2121,10 @@ fn create_level_writer(
         budget.remaining(),
     );
     writer_opts.encode_concurrency = encodes.units;
+    // Overlapping levels holds up to two levels' row groups (#817): -15-20%
+    // wall on Madagascar adm4 but +25% peak RSS at 16 threads, over auto's
+    // 10% allowance, so only `speed` (no memory promise) takes it.
+    writer_opts.overlap_levels = matches!(options.profile, super::level::MemoryProfile::Speed);
 
     let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
@@ -2328,7 +2348,15 @@ fn coalesce_level_counts_in_waves(
         wave,
     } = inputs;
     let num_levels = level_specs.len();
-    let inputs = scratch.inputs();
+    // Phase 1 of the chain stage, shared by every level (#817 A2); none
+    // when the canonical level is the only one.
+    let lines = (0..num_levels).any(|l| l != finest).then(|| {
+        ExactChains::new(
+            scratch.inputs(),
+            options.coalesce_junction_angle,
+            options.assign.sort_direction,
+        )
+    });
     let wave = wave.max(1);
     log::info!(
         "[convert] {} coalesce chains for {num_levels} level(s) ({} candidate line(s), \
@@ -2338,7 +2366,7 @@ fn coalesce_level_counts_in_waves(
         } else {
             "counting"
         },
-        inputs.len()
+        scratch.rows.len()
     );
     // One run per level, `wave` levels at a time. With `prebuild` it produces
     // BOTH the count the level plan needs and the table pass 2 needs.
@@ -2352,14 +2380,16 @@ fn coalesce_level_counts_in_waves(
                 return (scratch.rows.len(), None, false);
             }
             let gsd = level_specs[level].0;
+            let lines = lines
+                .as_ref()
+                .expect("a non-canonical level implies the exact join");
             if !prebuild {
-                let chains = super::convert::coalesce_level_chains(
-                    &inputs, level, finest, gsd, crs, options,
-                );
+                let chains =
+                    super::convert::coalesce_level_chains(lines, level, finest, gsd, crs, options);
                 return (chains.len(), None, false);
             }
             let (table, hint) = super::convert::build_level_coalesce_table_and_hint(
-                &inputs,
+                lines,
                 level,
                 finest,
                 gsd,
@@ -2598,6 +2628,16 @@ fn resolve_winner_tables(
         carriers,
         finest,
     })
+}
+
+/// Free `items` across the rayon pool (#817 T1). One thread freeing
+/// millions of geometries was 0.6 s of Oregon's convert at 1 core; export
+/// frees its spill buckets the same way.
+fn release_in_parallel<I>(items: I)
+where
+    I: IntoParallelIterator,
+{
+    items.into_par_iter().for_each(drop);
 }
 
 /// Footer-only preparation: everything the convert driver settles before the
@@ -3607,6 +3647,11 @@ pub(crate) fn run_stages(
         },
         diagnostics,
     );
+    // Pass 2 reads the chain tables, never the line scratch: free it now,
+    // across the pool, rather than holding it through pass 2 (#817 T1).
+    if let Some(scratch) = coalesce_scratch {
+        release_in_parallel(scratch.geoms);
+    }
 
     let spill_reservation = reserve_spill_cache(
         &mut budget,
@@ -3701,6 +3746,13 @@ pub(crate) fn run_stages(
         },
         strategy,
     )?;
+
+    // The chain tables hold every level's simplified strokes: free them
+    // across the pool, not serially at scope end (#817 T1).
+    drop(ctxs);
+    // Per table: flattening the maps into one Vec would add a copy of every
+    // entry at the end of the run.
+    release_in_parallel(coalesce_tables);
 
     let (mut level_reports, level_spill_bytes) =
         build_level_reports(emitted, level_stats, &mut skipped, diagnostics);
@@ -9949,6 +10001,106 @@ mod tests {
         assert!(full_build.tables[finest].is_none());
         assert!(full_build.merged, "10-segment polylines merge");
         assert_eq!(full_counts[finest], scratch.rows.len());
+    }
+
+    /// #817 T1: convert's O(dataset) leftovers (the line scratch, the chain
+    /// tables) are freed across the pool, not by one thread at scope end
+    /// (0.6 s at 1 core on Oregon roads, in no profiled phase).
+    #[test]
+    fn release_in_parallel_frees_on_several_threads() {
+        struct Arrive;
+        impl Drop for Arrive {
+            fn drop(&mut self) {
+                super::super::accumulate::rendezvous::arrive("release");
+            }
+        }
+        let items: Vec<Arrive> = (0..4).map(|_| Arrive).collect();
+        let pool = super::super::accumulate::rendezvous::pool(4);
+        let _guard = super::super::accumulate::rendezvous::arm("release", 4);
+        pool.install(|| release_in_parallel(items));
+        assert!(
+            super::super::accumulate::rendezvous::met(),
+            "the 4 drops never ran at once"
+        );
+    }
+
+    /// #817 A2: the exact-endpoint join (phase 1 of the chain stage) does
+    /// not depend on the level, so one run serves every level. It used to
+    /// run once per level (15 times on a z0-z14 ladder; 0.75 s each on
+    /// Oregon roads, one thread per level).
+    #[test]
+    fn chain_stage_runs_the_exact_join_once_for_all_levels() {
+        let scratch = chained_scratch(40);
+        let level_specs: Vec<(f64, Option<u8>)> = (0..6u8)
+            .map(|z| (20_000.0 / f64::from(1u32 << z), Some(z + 4)))
+            .collect();
+        let options = ConvertOptions::default();
+        // One pool thread: the counter is thread-local, and every level's
+        // stage runs on that thread.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let joins = pool.install(|| {
+            super::super::coalesce::EXACT_JOINS.with(|c| c.set(0));
+            for prebuild in [true, false] {
+                coalesce_level_counts(
+                    MemoryBudget::with_available(None),
+                    &scratch,
+                    &level_specs,
+                    Crs::Epsg4326,
+                    &options,
+                    prebuild,
+                    &crate::diagnostics::Diagnostics::default(),
+                );
+            }
+            super::super::coalesce::EXACT_JOINS.with(std::cell::Cell::get)
+        });
+        assert_eq!(joins, 2, "one exact join per chain stage, not per level");
+    }
+
+    /// #817 A2 review: a single-level ladder's only level is canonical and
+    /// verbatim, so no chain stage needs the exact join.
+    #[test]
+    fn single_level_ladder_skips_the_exact_join() {
+        let scratch = chained_scratch(40);
+        let level_specs = [(20_000.0, Some(4u8))];
+        let options = ConvertOptions::default();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let joins = pool.install(|| {
+            super::super::coalesce::EXACT_JOINS.with(|c| c.set(0));
+            for prebuild in [true, false] {
+                coalesce_level_counts(
+                    MemoryBudget::with_available(None),
+                    &scratch,
+                    &level_specs,
+                    Crs::Epsg4326,
+                    &options,
+                    prebuild,
+                    &crate::diagnostics::Diagnostics::default(),
+                );
+            }
+            let emitted = [EmitLevel {
+                orig: 0,
+                gsd: 20_000.0,
+                zoom: Some(4),
+                hint: 40,
+            }];
+            let tables = build_pass2_coalesce_tables(
+                Some(&scratch),
+                &emitted,
+                0,
+                Crs::Epsg4326,
+                &options,
+                &crate::diagnostics::Diagnostics::default(),
+            );
+            assert!(tables.iter().all(Option::is_none));
+            super::super::coalesce::EXACT_JOINS.with(std::cell::Cell::get)
+        });
+        assert_eq!(joins, 0, "no level coalesces, so no exact join");
     }
 
     /// How many levels' chain stages may run at once: the memory budget over
