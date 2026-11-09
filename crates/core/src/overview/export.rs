@@ -133,6 +133,7 @@ use crate::TilesetMetadata;
 
 use super::coalesce::COALESCED_COUNT_COLUMN;
 use super::convert::{human_bytes, skip_memory_preflight_from_env, SKIP_MEMORY_PREFLIGHT_ENV};
+use super::convert::{resolve_pass_read_workers, ConvertError, READ_WORKERS_AUTO};
 use super::level::{zoom_for_gsd, Crs, MemoryProfile, Mode, OverviewsMeta};
 use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
 use super::pipe::scoped_pipe;
@@ -141,6 +142,7 @@ use super::pipeline::{
     SinkBacking,
 };
 use super::properties::PropertySelection;
+use super::read::{footer_price, read_in_order, ReadFlow, ReadPass, ReadTuning};
 use super::reader::{OverviewReader, ReaderError};
 use super::stream::{
     add_nanos, preflight_profile_json_path, profile_json_target, sample_rss_peak,
@@ -148,6 +150,7 @@ use super::stream::{
     ExportZoomProfile, RssSampler, RssSamplerReport,
 };
 use super::writer::LEVEL_COLUMN;
+use crate::input_set::{ConvertSource, RowGroupSelection};
 
 mod coalesce_valve;
 mod tile_data;
@@ -1254,7 +1257,7 @@ impl crate::error::Classify for ExportError {
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
 /// properties carried over from the overview file (level column + covering
 /// struct excluded). Test-support only: production streams members directly
-/// instead of materializing features (see [`collect_wave_members`]).
+/// instead of materializing features (see [`finish_group`]).
 #[cfg(test)]
 struct Feature {
     geom: Geometry<f64>,
@@ -2248,6 +2251,9 @@ fn export_pmtiles_validated(
     let input_path = input_path.as_ref();
 
     let reader = OverviewReader::open(input_path)?;
+    let band_source = ConvertSource::single(crate::input::InputSource::Local(
+        reader.path().to_path_buf(),
+    ));
     let meta = reader.meta().clone();
     if options.variable_depth {
         variable_depth::check_file(&meta, reader.mode())?;
@@ -2606,6 +2612,15 @@ fn export_pmtiles_validated(
     );
     let template = ExportLevelCtx {
         reader: &reader,
+        band: BandRead {
+            source: &band_source,
+            // shortcut: the read-ahead is sized from the budget as the levels
+            // start and is not charged to it (the old one-thread pipe was not
+            // either); charge a `grant_read_ahead` per band read if a profile
+            // shows the levels' peak RSS growing.
+            budget: *budget,
+            profile: options.profile,
+        },
         scan: &unplanned.0,
         plan: &unplanned.1,
         level_idx: 0,
@@ -2668,6 +2683,7 @@ fn export_pmtiles_validated(
                     plan,
                     probe: variable_depth::Probe {
                         reader: &reader,
+                        band: template.band,
                         crs,
                         published: &published,
                         feature_id: feature_id.as_ref(),
@@ -3198,6 +3214,8 @@ struct ResolvedColumns {
 /// member store.
 struct ExportLevelCtx<'a> {
     reader: &'a OverviewReader,
+    /// How the band is read: [`read_band`].
+    band: BandRead<'a>,
     /// This level's scan-pass result (feature count, bounds, tile counts).
     scan: &'a LevelScan,
     /// This level's partitions and wave width, fixed by [`plan_levels`].
@@ -3230,6 +3248,7 @@ impl<'a> ExportLevelCtx<'a> {
     fn level_ctx(&self, timers: &'a ExportTimers) -> LevelCtx<'a> {
         LevelCtx {
             reader: self.reader,
+            band: self.band,
             level_idx: self.level_idx,
             crs: self.crs,
             zoom: self.plan.zoom,
@@ -4084,16 +4103,22 @@ struct ExportWorkTally {
     /// wave already read adds them again.
     band_rows_read: BTreeMap<usize, u64>,
     /// Rows whose per-row collect work (geometry decode, property
-    /// materialization and member routing in [`collect_wave_members`]) ran
+    /// materialization and member routing in [`finish_group`]) ran
     /// on the wave's consumer thread, outside the Rayon pool, so that no
     /// other core could share it (#740).
     serial_collect_rows: u64,
     /// Bytes each multi-wave level's one-level member store spilled (#740).
     level_spill_bytes: BTreeMap<usize, u64>,
+    /// Read batches [`finish_group`] took, and the calls (each a
+    /// set of pool joins) it took them in (#817).
+    collect_batches: u64,
+    collect_groups: u64,
 }
 
 struct LevelCtx<'a> {
     reader: &'a OverviewReader,
+    /// How the band is read: [`read_band`].
+    band: BandRead<'a>,
     level_idx: usize,
     crs: Crs,
     zoom: u8,
@@ -5100,7 +5125,7 @@ fn fill_member_store(
 /// Decode one band batch and fan its members out: clip every feature (in
 /// parallel) at each including level's zoom over the **full** key range, then
 /// route each member to its `(level, partition wave)` bucket. The legacy
-/// analogue is [`collect_wave_members`]; see the section comment for why the
+/// analogue is [`finish_group`]; see the section comment for why the
 /// results are byte-identical.
 fn fanout_batch_members(
     batch: &RecordBatch,
@@ -5251,7 +5276,7 @@ fn route_fanout_rows(
 
 /// Pass-2 drain for one wave under the single-read path: take the wave's
 /// buffered members, bucket them per partition (exactly as
-/// [`collect_wave_members`] routes), and encode each partition as
+/// [`finish_group`] routes), and encode each partition as
 /// [`process_wave`] would — same parallel section, same ascending output
 /// order.
 fn encode_wave_from_store(
@@ -5277,7 +5302,7 @@ fn encode_wave_from_store(
 }
 
 /// Route a wave's members to their partitions, one bucket per partition, as
-/// [`collect_wave_members`] routes them.
+/// [`finish_group`] routes them.
 fn bucket_members(members: Vec<Member>, wave: &[Partition]) -> Vec<Vec<Member>> {
     let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
     for m in members {
@@ -6151,24 +6176,14 @@ fn collect_into(
     };
     // #535: `band_read` is the reader open (footer/page-index setup, paid
     // per wave on this path) plus each `next()` (read + Arrow decode);
-    // `collect_wave_members` charges its own `decode`/`clip`.
+    // `clip_group` and `finish_group` charge their own `decode`/`clip`.
     let timers = ctx.timers;
 
-    // PERF (#535): the read runs on its own thread, one batch ahead of the
-    // clip, instead of alternating with it on this one. The read is
-    // single-threaded by nature (one Parquet reader, sequential row groups)
-    // while the clip fans out over the whole Rayon pool, so a read-then-clip
-    // loop left 11 of 12 cores parked for the whole read: `band_read` was
-    // 5.3 of the 17 s `levels` wall on a 3.07 M-feature z0–13 export, all of
-    // it on the critical path. The partitioning path (#235's
-    // [`fill_member_store`]) is already shaped this way; this brings the
-    // duplicating path in line, without touching wave widths, partitions or
-    // the work either side does.
-    //
-    // Output is unchanged: one producer over a FIFO channel delivers batches
-    // in read order, so `seq` — the band-order counter the within-tile
-    // ordering derives from — advances exactly as it did serially, and the
-    // consumer does the same work in the same order.
+    // PERF (#535, #817): the read runs on reader threads ahead of the clip
+    // ([`read_band`]), so the pool never waits for a read-then-clip loop.
+    // Output is unchanged: the batches arrive in read order, so `seq` — the
+    // band-order counter the within-tile ordering derives from — advances
+    // exactly as it did serially.
     // #745: the same row groups the read below selects, so the cursor knows
     // where each one starts and which band it belongs to.
     let selected = ctx
@@ -6180,33 +6195,42 @@ fn collect_into(
             .measuring(valve_merges(ctx.opts)),
         locator: ctx.reader.row_locator(&selected),
     };
-    let rows_ref = &mut rows;
-    scoped_pipe(
-        WAVE_READ_IN_FLIGHT,
-        |tx: &Sender<RecordBatch>| -> Result<(), ExportError> {
-            let mut batch_reader = ExportTimers::time(&timers.band_read, || {
-                ctx.reader.read_level_any_bbox_batched(
-                    ctx.level_idx,
-                    bboxes.as_deref(),
-                    EXPORT_BATCH_SIZE,
-                )
-            })?;
-            loop {
-                let next = ExportTimers::time(&timers.band_read, || batch_reader.next());
-                let Some(batch) = next else { break };
-                if tx.send(batch?).is_err() {
-                    return Ok(()); // consumer dropped the receiver (error path)
-                }
-            }
-            Ok(())
-        },
-        |rx: Receiver<RecordBatch>| -> Result<(), ExportError> {
-            for batch in rx.iter() {
-                collect_wave_members(ctx, wave, &batch, rows_ref, sink, diagnostics)?;
-            }
-            Ok(())
-        },
-    )?;
+    // PERF (#817): a group's ordered finish (the gap walk, member routing
+    // and the sink appends) runs alongside the next group's decode and clip,
+    // so the pool is not idle while this thread walks the rows.
+    let group_rows = COLLECT_GROUP_ROWS_PER_THREAD.saturating_mul(rayon::current_num_threads());
+    let mut group: Vec<RecordBatch> = Vec::new();
+    let mut grouped = 0usize;
+    let mut clipped: Option<ClippedGroup> = None;
+    let rows = &mut rows;
+    let mut step = |batches: Vec<RecordBatch>| -> Result<(), ExportError> {
+        let (finished, next) = rayon::join(
+            || {
+                clipped.take().map_or(Ok(()), |c| {
+                    finish_group(ctx, wave, c, rows, sink, diagnostics)
+                })
+            },
+            || clip_group(ctx, wave, batches, diagnostics),
+        );
+        finished?;
+        clipped = Some(next?);
+        Ok(())
+    };
+    read_band(ctx.band, &selected, timers, |batch| {
+        grouped += batch.num_rows();
+        group.push(batch);
+        if grouped >= group_rows {
+            grouped = 0;
+            step(std::mem::take(&mut group))?;
+        }
+        Ok(())
+    })?;
+    if !group.is_empty() {
+        step(group)?;
+    }
+    if let Some(c) = clipped.take() {
+        finish_group(ctx, wave, c, rows, sink, diagnostics)?;
+    }
     #[cfg(test)]
     {
         let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
@@ -6214,6 +6238,87 @@ fn collect_into(
     }
     Ok(rows.read)
 }
+
+/// How the export reads a band: the overview file as a [`ConvertSource`],
+/// so every band read goes through the ordered multi-worker reader
+/// ([`read_in_order`]), and the budget and profile that size its read-ahead.
+#[derive(Clone, Copy)]
+struct BandRead<'a> {
+    source: &'a ConvertSource,
+    budget: MemoryBudget,
+    profile: MemoryProfile,
+}
+
+/// Read the row groups `selected` of the overview file in file order, in
+/// [`EXPORT_BATCH_SIZE`] batches, and hand each to `on_batch` on this
+/// thread. Up to [`resolve_pass_read_workers`] readers decode disjoint runs
+/// of row groups ahead of the consumer, and the merge puts their batches
+/// back in read order, so `on_batch` sees the rows exactly as one reader
+/// would hand them over. `band_read` is charged the readers' core-seconds.
+///
+/// PERF (#817): a band read used to be one reader thread (`scoped_pipe`)
+/// feeding the whole pool; on Moldova z12 that thread sat at 1.2 cores in
+/// ZSTD page decompression while the clip waited on it.
+fn read_band(
+    band: BandRead<'_>,
+    selected: &[usize],
+    timers: &ExportTimers,
+    mut on_batch: impl FnMut(RecordBatch) -> Result<(), ExportError>,
+) -> Result<(), ExportError> {
+    let selection = RowGroupSelection::from_parts(vec![selected.to_vec()]);
+    let columns = band
+        .source
+        .schema()
+        .map_err(|e| read_error(e.into()))?
+        .fields()
+        .len();
+    let tuning = ReadTuning {
+        budget: band.budget,
+        batch_size: EXPORT_BATCH_SIZE,
+        workers: resolve_pass_read_workers(ReadPass::Build, READ_WORKERS_AUTO),
+        avg_geom_bytes: None,
+        footer: footer_price(band.source, Some(&selection), 0..columns).map_err(read_error)?,
+        profile: band.profile,
+    };
+    // The consumer's error is kept here and the read stopped, so the
+    // export reports it rather than a read error.
+    let mut failed = None;
+    read_in_order(
+        band.source,
+        Some(&selection),
+        None,
+        tuning,
+        |batch, _, read| {
+            add_nanos(&timers.band_read, read);
+            Ok(match on_batch(batch) {
+                Ok(()) => ReadFlow::Continue,
+                Err(e) => {
+                    failed = Some(e);
+                    ReadFlow::Stop
+                }
+            })
+        },
+    )
+    .map_err(read_error)?;
+    failed.map_or(Ok(()), Err)
+}
+
+/// A band read's [`ConvertError`] as the export's error.
+fn read_error(e: ConvertError) -> ExportError {
+    match e {
+        ConvertError::Parquet(e) => ExportError::Reader(ReaderError::Parquet(e)),
+        ConvertError::Io(e) => ExportError::Io(e),
+        ConvertError::Core(e) => ExportError::Core(e),
+        ConvertError::Arrow(e) => ExportError::Arrow(e),
+        e => ExportError::Io(std::io::Error::other(e.to_string())),
+    }
+}
+
+/// Rows per pool thread that [`collect_into`] gathers, in whole batches,
+/// before one [`clip_group`] and [`finish_group`]: 64 threads collect four
+/// 8,192-row batches at a time, 16 threads one. Each group holds its
+/// batches and their members until it is merged.
+const COLLECT_GROUP_ROWS_PER_THREAD: usize = 512;
 
 /// The wave partition owning `key`. The wave's partitions are contiguous,
 /// disjoint, ascending `[key_lo, key_hi]` ranges, and every emitted key was
@@ -6315,79 +6420,169 @@ fn decode_geometry_chunk(
         .collect())
 }
 
-/// Decode one record batch and append its members to the wave's per-partition
-/// buckets: clip every feature (in parallel) into its intersecting tiles across
-/// the wave's whole key range, route each member to its owning partition, then
-/// attach shared per-feature properties in band order. `rows` restores the
-/// original overview addresses after pruning, keeping identity stable between
-/// waves while preserving the relative within-tile feature order.
+/// One feature's clipped pieces, one per tile key.
+type TileMembers = Vec<(u64, Geometry<f64>)>;
+
+/// A group of consecutive read batches, decoded and clipped by
+/// [`clip_group`], waiting for [`finish_group`] to append their members to
+/// the wave's per-partition buckets. Together the two clip every feature (in
+/// parallel) into its intersecting tiles across the wave's whole key range,
+/// route each member to its owning partition, then attach shared per-feature
+/// properties in band order. `rows` restores the original overview addresses after pruning,
+/// keeping identity stable between waves while preserving the relative
+/// within-tile feature order.
 ///
 /// PERF (#740): property extraction, member materialization and routing run
 /// over row chunks in the pool ([`collect_member_chunk`]); only appending
-/// each chunk's buckets, in chunk order, stays on this thread. On a 64-core
+/// each chunk's buckets, in chunk order, stays serial. On a 64-core
 /// Moldova export this thread used to do all of it serially while about 8
 /// cores were busy. The chunks are merged in row order, so every bucket
 /// holds the same members in the same order as the serial loop gave.
-fn collect_wave_members(
+///
+/// PERF (#817): the batches of a group ([`COLLECT_GROUP_ROWS_PER_THREAD`])
+/// share each parallel step, so a 64-thread pool joins once per group, not
+/// once per 8,192-row batch; the joins left 30-38% of the pool spinning.
+/// Batches and their chunks are still merged in row order.
+struct ClippedGroup {
+    batches: Vec<RecordBatch>,
+    geom_idxs: Vec<usize>,
+    /// The decoded geometries, kept for the in-order gap walk.
+    geoms: Vec<Vec<Geometry<f64>>>,
+    /// Per batch, per row: the row's `(key, clipped geometry)` members.
+    row_members: Vec<Vec<TileMembers>>,
+}
+
+/// The order-free half of a group's collect: decode a group's
+/// geometries and clip every feature into its tiles, all in the pool.
+fn clip_group(
     ctx: &LevelCtx<'_>,
     wave: &[Partition],
-    batch: &RecordBatch,
+    batches: Vec<RecordBatch>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<ClippedGroup, ExportError> {
+    let key_lo = wave[0].key_lo;
+    let key_hi = wave[wave.len() - 1].key_hi;
+    let timers = ctx.timers;
+    let geom_idxs: Vec<usize> = batches
+        .iter()
+        .map(|b| batch_geometry_index(b, ctx.published.geometry.as_deref()))
+        .collect::<Result<_, _>>()?;
+    let geoms: Vec<Vec<Geometry<f64>>> = batches
+        .par_iter()
+        .zip(&geom_idxs)
+        .map(|(b, &gi)| decode_batch_geometries(b, &b.schema(), gi, ctx.crs, timers, diagnostics))
+        .collect::<Result<_, _>>()?;
+    // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
+    // range. #535: `clip` is timed per geometry inside the closure.
+    let row_members = geoms
+        .par_iter()
+        .map(|geoms| {
+            geoms
+                .par_iter()
+                .map(|g| {
+                    ExportTimers::time(&timers.clip, || {
+                        let mut members = feature_tile_members(
+                            g,
+                            ctx.zoom,
+                            ctx.opts,
+                            key_lo,
+                            key_hi,
+                            diagnostics,
+                        );
+                        if let Some(tiles) = ctx.tiles {
+                            members.retain(|(key, _)| tiles.contains_key(key));
+                        }
+                        members
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    Ok(ClippedGroup {
+        batches,
+        geom_idxs,
+        geoms,
+        row_members,
+    })
+}
+
+/// The ordered half of a group's collect ([`clip_group`] is the other): walk the group's rows for
+/// their gaps, in read order, then materialize and route their members and
+/// append them to `sink` in row order.
+fn finish_group(
+    ctx: &LevelCtx<'_>,
+    wave: &[Partition],
+    group: ClippedGroup,
     rows: &mut WaveRows,
     sink: &mut dyn MemberSink,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ExportError> {
-    let key_lo = wave[0].key_lo;
-    let key_hi = wave[wave.len() - 1].key_hi;
     let timers = ctx.timers;
-
-    let schema = batch.schema();
-    let geom_idx = batch_geometry_index(batch, ctx.published.geometry.as_deref())?;
-    let geoms = decode_batch_geometries(batch, &schema, geom_idx, ctx.crs, timers, diagnostics)?;
-    let row_gaps = ExportTimers::time(&timers.decode, || rows.gaps.batch(&geoms));
-
-    // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
-    // range. #535: `clip` is timed per geometry inside the closure. Each
-    // decoded geometry is consumed, so it is freed in the pool too (#740).
-    let mut row_members: Vec<Vec<(u64, Geometry<f64>)>> = geoms
-        .into_par_iter()
-        .map(|g| {
-            ExportTimers::time(&timers.clip, || {
-                let mut members =
-                    feature_tile_members(&g, ctx.zoom, ctx.opts, key_lo, key_hi, diagnostics);
-                if let Some(tiles) = ctx.tiles {
-                    members.retain(|(key, _)| tiles.contains_key(key));
-                }
-                members
-            })
-        })
-        .collect();
+    let ClippedGroup {
+        batches,
+        geom_idxs,
+        geoms,
+        mut row_members,
+    } = group;
+    let batches = &batches;
+    #[cfg(test)]
+    {
+        let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
+        work.collect_batches += batches.len() as u64;
+        work.collect_groups += 1;
+    }
+    let row_gaps: Vec<Vec<(u64, u16)>> = ExportTimers::time(&timers.decode, || {
+        geoms.iter().map(|g| rows.gaps.batch(g)).collect()
+    });
+    // Freed in the pool (#740).
+    geoms.into_par_iter().flatten().for_each(drop);
 
     // Property extraction and member routing, per chunk in the pool. #535:
     // `decode`, timed per chunk and around the merge below.
-    let attrs = AttrColumns::new(&schema, geom_idx, ctx.published, ctx.feature_id);
-    let chunk_rows = collect_chunk_rows(batch.num_rows());
-    let chunk = ChunkInput {
-        #[cfg(test)]
-        work: ctx.work,
-        wave,
-        batch,
-        attrs: &attrs,
-        row_gaps: &row_gaps,
-        locator: &rows.locator,
-        first_read: rows.read as usize,
-    };
-    let chunks: Vec<Result<ChunkMembers, ExportError>> = row_members
-        .par_chunks_mut(chunk_rows)
-        .enumerate()
-        .map(|(i, items)| {
-            ExportTimers::time(&timers.decode, || {
-                collect_member_chunk(&chunk, i * chunk_rows, items)
-            })
+    let mut first_read = rows.read as usize;
+    let attrs: Vec<AttrColumns<'_>> = batches
+        .iter()
+        .zip(&geom_idxs)
+        .map(|(b, &gi)| AttrColumns::new(&b.schema(), gi, ctx.published, ctx.feature_id))
+        .collect();
+    let chunk_inputs: Vec<ChunkInput<'_>> = batches
+        .iter()
+        .zip(&attrs)
+        .zip(&row_gaps)
+        .map(|((batch, attrs), row_gaps)| {
+            let input = ChunkInput {
+                #[cfg(test)]
+                work: ctx.work,
+                wave,
+                batch,
+                attrs,
+                row_gaps,
+                locator: &rows.locator,
+                first_read,
+            };
+            first_read += batch.num_rows();
+            input
+        })
+        .collect();
+    let chunks: Vec<Vec<Result<ChunkMembers, ExportError>>> = row_members
+        .par_iter_mut()
+        .zip(&chunk_inputs)
+        .map(|(row_members, chunk)| {
+            let chunk_rows = collect_chunk_rows(chunk.batch.num_rows());
+            row_members
+                .par_chunks_mut(chunk_rows)
+                .enumerate()
+                .map(|(i, items)| {
+                    ExportTimers::time(&timers.decode, || {
+                        collect_member_chunk(chunk, i * chunk_rows, items)
+                    })
+                })
+                .collect()
         })
         .collect();
     drop(row_members);
 
-    for chunk in chunks {
+    for chunk in chunks.into_iter().flatten() {
         let ChunkMembers {
             buckets: chunk_buckets,
             losses,
@@ -6411,16 +6606,16 @@ fn collect_wave_members(
             }
         }
     }
-    rows.read += batch.num_rows() as u64;
+    rows.read = first_read as u64;
     Ok(())
 }
 
-/// Where [`collect_wave_members`] puts a read's members: one call per
+/// Where [`finish_group`] puts a read's members: one call per
 /// partition (an index into the partitions being read) and row chunk, in row
 /// order. The per-wave read collects into one bucket per partition; a
 /// multi-wave level's single read (#740) into a [`MemberStore`], whose waves
 /// the drain then takes, or replays from spill, one at a time.
-trait MemberSink {
+trait MemberSink: Send {
     fn append(&mut self, partition: usize, members: Vec<Member>) -> Result<(), ExportError>;
 }
 
@@ -7149,7 +7344,7 @@ fn split_feature_into_tiles(
 /// parent's buffered bounds). Near the top of a large cascade the two halves run
 /// on separate Rayon threads (issue #237, RC4); deeper down — or for the common
 /// small-cascade case — it stays sequential. Emission order is irrelevant:
-/// `collect_wave_members` buckets members by tile key, and a feature emits at
+/// `finish_group` buckets members by tile key, and a feature emits at
 /// most one member per key, so parallel interleaving cannot change the archive.
 fn fanout_children(
     children: [TileCoord; 4],
@@ -11537,6 +11732,59 @@ mod tests {
             run.work.serial_collect_rows, 0,
             "rows whose collect work ran serially on the consumer thread"
         );
+    }
+
+    /// #817: a band read's batches are collected in groups, so a 64-thread
+    /// pool joins once per group instead of once per 8,192-row batch. On
+    /// `origin/main` every batch is its own set of joins (30-38% of the
+    /// export's level samples were Rayon spin). The grouping is scheduling
+    /// only: one thread, which collects batch by batch, writes the same
+    /// bytes.
+    #[test]
+    fn band_batches_are_collected_in_groups() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let points: Vec<Geometry<f64>> = (0..20_000)
+            .map(|i| {
+                let f = f64::from(i);
+                Geometry::Point(Point::new(
+                    -170.0 + (f * 0.0171) % 340.0,
+                    -60.0 + (f * 0.0067) % 120.0,
+                ))
+            })
+            .collect();
+        let ids: Vec<i64> = (0..20_000).collect();
+        write_fixture(input.path(), &[(ids, points)]);
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            ..Default::default()
+        };
+        let run = |threads: usize| {
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let run = pool.install(|| {
+                export_pmtiles_run(
+                    input.path(),
+                    out.path(),
+                    &opts,
+                    DEFAULT_PARTITION_TARGET,
+                    &knobs(false, None, false),
+                )
+                .unwrap()
+            });
+            (run.work, std::fs::read(out.path()).unwrap())
+        };
+        let (wide, wide_bytes) = run(64);
+        assert_eq!(wide.collect_batches, 3, "20,000 rows in 8,192-row batches");
+        assert_eq!(
+            wide.collect_groups, 1,
+            "64 threads collect up to 32,768 rows per group"
+        );
+        let (one, one_bytes) = run(1);
+        assert_eq!(one.collect_groups, 3, "one thread collects batch by batch");
+        assert!(wide_bytes == one_bytes, "grouping changed the archive");
     }
 
     /// #817 (S1): the scan sizes a batch in a few tasks, not one per pool

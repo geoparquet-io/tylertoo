@@ -25,10 +25,10 @@ use super::{
     account_sources, buffer_deg_at_zoom, build_mvt_within, collect_wave, encoded_tile,
     export_level_groups, for_each_member_key, geometry_lnglat_bbox, key_to_xy, near_world_edge,
     plan_level, plan_level_groups, plan_levels, size_bboxes, sort_tile_for_encode, tile_fit,
-    tile_key, tiles_in_ranges, CheckpointCtx, Crs, EncodedTile, ExportError, ExportLevelCtx,
-    ExportOptions, ExportProgress, ExportTimers, FillTally, LevelCtx, LevelMemory, LevelScan,
-    Member, PartitionBudget, PublishedNames, ResolvedFeatureId, StreamingPmtilesWriter, TileMvt,
-    ZoomReport, DEFAULT_EXTENT,
+    tile_key, tiles_in_ranges, BandRead, CheckpointCtx, Crs, EncodedTile, ExportError,
+    ExportLevelCtx, ExportOptions, ExportProgress, ExportTimers, FillTally, LevelCtx, LevelMemory,
+    LevelScan, Member, PartitionBudget, PublishedNames, ResolvedFeatureId, StreamingPmtilesWriter,
+    TileMvt, ZoomReport, DEFAULT_EXTENT,
 };
 use crate::compression::TileGzipCache;
 use crate::tile::{max_tile_index, BboxTileRanges, TileBounds, TileCoord, MAX_LATITUDE};
@@ -829,6 +829,7 @@ impl VdScan {
 /// What the probe reads with: the export's own inputs.
 pub(super) struct Probe<'a> {
     pub(super) reader: &'a OverviewReader,
+    pub(super) band: BandRead<'a>,
     pub(super) crs: Crs,
     pub(super) published: &'a PublishedNames,
     pub(super) feature_id: Option<&'a ResolvedFeatureId>,
@@ -947,6 +948,7 @@ impl VdPlan {
                 });
                 let ctx = LevelCtx {
                     reader: p.reader,
+                    band: p.band,
                     level_idx: self.canonical,
                     crs: p.crs,
                     zoom,
