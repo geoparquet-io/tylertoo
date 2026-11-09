@@ -3442,6 +3442,85 @@ mod tests {
         );
     }
 
+    /// #817: a level's encodes stay in flight after its `write_level`
+    /// returns, so its failure surfaces from a later call. Level 0 fails;
+    /// level 2 drains it (only the previous level may overlap): that call
+    /// errors and poisons the writer.
+    #[test]
+    fn deferred_encode_failure_surfaces_from_a_later_level_and_poisons() {
+        within(
+            "deferred_encode_failure_surfaces_from_a_later_level",
+            || {
+                let schema = Arc::new(source_schema());
+                let mut opts = duplicating_options();
+                opts.encode_concurrency = 4;
+                let dir = tempfile::tempdir().unwrap();
+                let dest = dir.path().join("out.parquet");
+                let mut writer = OverviewWriter::create(&dest, &schema, opts).unwrap();
+                let ids: Vec<i64> = (0..3).collect();
+                let level = |w: &mut OverviewWriter<_>, l: usize| {
+                    w.write_level(
+                        l,
+                        Some(ids.len()),
+                        vec![source_batch(&schema, &ids)].into_iter(),
+                    )
+                };
+                writer.set_encode_faults(EncodeFaults {
+                    row_group: true,
+                    wkb: false,
+                });
+                let _ = level(&mut writer, 0);
+                writer.set_encode_faults(EncodeFaults::default());
+                let err = level(&mut writer, 1)
+                    .and_then(|_| level(&mut writer, 2))
+                    .expect_err("level 0's failed encode must surface by level 2");
+                assert!(
+                    err.to_string().contains("injected row-group encode panic"),
+                    "{err}"
+                );
+                let err = writer.finish().expect_err("the writer is poisoned");
+                assert!(err.to_string().contains("writer is poisoned"), "{err}");
+                assert!(!dest.exists(), "nothing published");
+            },
+        );
+    }
+
+    /// #817: the last levels' encodes are drained by `finish`; a failure
+    /// there is an error and publishes nothing.
+    #[test]
+    fn deferred_encode_failure_surfaces_from_finish() {
+        within("deferred_encode_failure_surfaces_from_finish", || {
+            let schema = Arc::new(source_schema());
+            let mut opts = duplicating_options();
+            opts.encode_concurrency = 4;
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("out.parquet");
+            let mut writer = OverviewWriter::create(&dest, &schema, opts).unwrap();
+            let ids: Vec<i64> = (0..3).collect();
+            for l in 0..3 {
+                writer.set_encode_faults(EncodeFaults {
+                    row_group: l == 2,
+                    wkb: false,
+                });
+                let _ = writer
+                    .write_level(
+                        l,
+                        Some(ids.len()),
+                        vec![source_batch(&schema, &ids)].into_iter(),
+                    )
+                    .expect("the last level's encode is still in flight");
+            }
+            let err = writer
+                .finish()
+                .expect_err("finish drains the failed encode");
+            assert!(
+                err.to_string().contains("injected row-group encode panic"),
+                "{err}"
+            );
+            assert!(!dest.exists(), "nothing published");
+        });
+    }
+
     // ---- #427: the destination is untouched until `finish` publishes. ----
 
     fn dir_listing(dir: &Path) -> Vec<String> {
