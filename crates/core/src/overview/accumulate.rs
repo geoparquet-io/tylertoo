@@ -286,7 +286,23 @@ pub(super) mod rendezvous {
         guard
     }
 
+    const POOL_THREAD: &str = "rendezvous";
+
+    /// The pool a rendezvous test runs its tasks on. Only its threads count
+    /// as arrivals, so another test's calls through the same site (under
+    /// plain `cargo test`, one process) cannot complete the rendezvous.
+    pub(in crate::overview) fn pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|_| POOL_THREAD.to_owned())
+            .build()
+            .unwrap()
+    }
+
     pub(in crate::overview) fn arrive(site: &'static str) {
+        if std::thread::current().name() != Some(POOL_THREAD) {
+            return;
+        }
         let Some((armed, n)) = *ARMED.lock().unwrap() else {
             return;
         };
@@ -356,10 +372,7 @@ mod tests {
         let levels: Vec<AccumulateLevel> = (0..4)
             .map(|l| AccumulateLevel::new(1000.0 / f64::from(1u32 << l), None, true))
             .collect();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
+        let pool = rendezvous::pool(4);
         let _guard = rendezvous::arm("accumulate level", 4);
         let out = pool.install(|| {
             tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &levels, Crs::Epsg3857)

@@ -1796,10 +1796,7 @@ mod tests {
         let mut opts = duplicating_options();
         opts.encode_concurrency = 4;
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
+        let pool = super::super::accumulate::rendezvous::pool(4);
         let ids: Vec<i64> = (0..10).collect();
         let _guard = super::super::accumulate::rendezvous::arm("encode row group", 2);
         pool.install(|| {
