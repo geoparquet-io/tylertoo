@@ -117,6 +117,7 @@ pub(super) mod cost_probe {
         pub(crate) bucket_peak: usize,
         pub(crate) seed_windows: usize,
         pub(crate) pyramid_wave_tiles: usize,
+        pub(crate) pyramid_waves: usize,
         pub(crate) seed_frame_writers: usize,
         pub(crate) map_peak: usize,
         pub(crate) live_peak: usize,
@@ -1858,6 +1859,195 @@ impl ZoomCommit {
     }
 }
 
+/// The pyramid's sliding window (#817): what [`pyramid_slide`] tasks share.
+struct Slide<'a> {
+    queue: &'a mut std::collections::BTreeMap<u64, tempfile::TempPath>,
+    commit: &'a mut ZoomCommit,
+    /// Launched and not yet committed; each holds a share and a path.
+    in_flight: usize,
+    next_seq: usize,
+    next_commit: usize,
+    done: std::collections::BTreeMap<
+        usize,
+        (
+            u64,
+            tempfile::TempPath,
+            Result<TileFill, super::ExportError>,
+        ),
+    >,
+    /// No more launches: a tile did not fit its share, or an error.
+    stopped: bool,
+    error: Option<super::ExportError>,
+}
+
+struct SlideCtx<'a> {
+    state: std::sync::Mutex<Slide<'a>>,
+    step: PyramidStep,
+    timers: &'a super::ExportTimers,
+    workspace: usize,
+    share: usize,
+}
+
+impl<'a> SlideCtx<'a> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Slide<'a>> {
+        // A poisoned lock means a task panicked; the scope re-raises it.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Launch tiles while the window fits the workspace: every in-flight tile
+/// holds a share and a path, and two more shares stay free for the commit,
+/// as in a wave.
+fn slide_launch<'s, 'a: 's>(scope: &rayon::Scope<'s>, ctx: &'s SlideCtx<'a>, s: &mut Slide<'a>) {
+    let SlideCtx { share, .. } = *ctx;
+    while !s.stopped
+        && s.commit.fixed(s.queue.len()) + (s.in_flight + 3) * share + (s.in_flight + 1) * 512
+            <= ctx.workspace
+    {
+        let Some((key, path)) = s.queue.pop_first() else {
+            break;
+        };
+        let (seq, reserved) = (s.next_seq, s.commit.fixed(s.queue.len()));
+        s.next_seq += 1;
+        s.in_flight += 1;
+        scope.spawn(move |scope| {
+            let result = pyramid_tile(&path, key, ctx.step, ctx.timers, share, reserved);
+            let mut s = ctx.lock();
+            s.done.insert(seq, (key, path, result));
+            let consumed = slide_commit(&mut s, ctx.step, share, ctx.workspace);
+            slide_launch(scope, ctx, &mut s);
+            drop(s);
+            // Unlinking frees each run's page cache: kernel work, kept
+            // outside the lock.
+            drop(consumed);
+        });
+    }
+}
+
+/// Commit every finished tile that is next in key order; returns their
+/// consumed runs. A tile that did not fit its share stays, and stops the slide.
+fn slide_commit(
+    s: &mut Slide<'_>,
+    step: PyramidStep,
+    share: usize,
+    workspace: usize,
+) -> Vec<tempfile::TempPath> {
+    let mut consumed = Vec::new();
+    while let Some(entry) = s.done.first_entry() {
+        if *entry.key() != s.next_commit || s.error.is_some() {
+            break;
+        }
+        if matches!(
+            entry.get().2,
+            Err(super::ExportError::BudgetExceeded { .. })
+        ) {
+            s.stopped = true;
+            break;
+        }
+        let (key, path, result) = entry.remove();
+        s.in_flight -= 1;
+        let others = s.in_flight * (share + 512);
+        let queued = s.queue.len();
+        let committed =
+            result.and_then(|tile| s.commit.commit(key, &tile, step, queued, others, workspace));
+        consumed.push(path);
+        if let Err(error) = committed {
+            s.error = Some(error);
+            s.stopped = true;
+            break;
+        }
+        s.next_commit += 1;
+    }
+    consumed
+}
+
+/// Build a zoom's tiles in a sliding window of up to `lanes` (#817). Waves
+/// left every lane idle behind each wave's slowest tile and its serial
+/// commit; here the task that finishes the next tile in key order commits
+/// it, and every finished task launches the next tile. The commit order,
+/// and so every run and the output, is the waves' order.
+///
+/// A tile that does not fit its share stops the window; once the window
+/// drains, that tile is built alone on the whole workspace, as a wave's
+/// serial retry would, and the window resumes after it. Tiles the window
+/// cannot take (a grant too small for two lanes, a last tile) stay in
+/// `buckets` for the wave loop.
+fn pyramid_slide(
+    buckets: &mut SpillBuckets,
+    commit: &mut ZoomCommit,
+    step: PyramidStep,
+    timers: &super::ExportTimers,
+    workspace: usize,
+) -> Result<(), super::ExportError> {
+    while slide_window(buckets, commit, step, timers, workspace)? {
+        let (key, path) = buckets
+            .tiles
+            .pop_first()
+            .expect("the tile that stopped the slide");
+        let reserved = commit.fixed(buckets.tiles.len()) + 512;
+        let tile = pyramid_tile(
+            &path,
+            key,
+            step,
+            timers,
+            workspace.saturating_sub(reserved),
+            reserved,
+        )?;
+        commit.commit(key, &tile, step, buckets.tiles.len(), 512, workspace)?;
+    }
+    Ok(())
+}
+
+/// One run of the window; `true` when a tile did not fit its share. That
+/// tile and every tile after it are back in `buckets`, runs intact.
+fn slide_window(
+    buckets: &mut SpillBuckets,
+    commit: &mut ZoomCommit,
+    step: PyramidStep,
+    timers: &super::ExportTimers,
+    workspace: usize,
+) -> Result<bool, super::ExportError> {
+    let available = workspace.saturating_sub(commit.fixed(buckets.tiles.len()));
+    let lanes = pyramid_lanes(available).min(buckets.tiles.len());
+    if lanes < 2 {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    cost_probe::update(|c| c.pyramid_wave_tiles = c.pyramid_wave_tiles.max(lanes));
+    let ctx = SlideCtx {
+        state: std::sync::Mutex::new(Slide {
+            queue: &mut buckets.tiles,
+            commit,
+            in_flight: 0,
+            next_seq: 0,
+            next_commit: 0,
+            done: Default::default(),
+            stopped: false,
+            error: None,
+        }),
+        step,
+        timers,
+        workspace,
+        share: available / (lanes + 2),
+    };
+    rayon::in_place_scope(|scope| slide_launch(scope, &ctx, &mut ctx.lock()));
+    let s = ctx
+        .state
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(error) = s.error {
+        return Err(error);
+    }
+    // Stopped by a tile over its share: the window's next tile is that one.
+    let over_share = s.stopped && !s.done.is_empty();
+    for (_, (key, path, _)) in s.done {
+        s.queue.insert(key, path);
+    }
+    Ok(over_share)
+}
+
 /// One seed batch: every polygon clipped into its tiles at `seed_zoom`,
 /// projected to tile pixels and simplified, appended to its tile's bucket in
 /// file order.
@@ -2120,6 +2310,9 @@ pub(super) fn build_fill_map(
             area: 0.0,
             vertices: 0,
         };
+        pyramid_slide(&mut buckets, &mut commit, step, timers, workspace)?;
+        // The waves take whatever the slide left: a tile that did not fit
+        // its share, the tiles after it, or a grant too small for two lanes.
         while !buckets.tiles.is_empty() {
             let fixed = commit.fixed(buckets.tiles.len());
             let available = workspace.saturating_sub(fixed);
@@ -2132,6 +2325,8 @@ pub(super) fn build_fill_map(
                 .filter_map(|_| buckets.tiles.pop_first())
                 .map(|(key, path)| (key, Some(path)))
                 .collect();
+            #[cfg(test)]
+            cost_probe::update(|c| c.pyramid_waves += usize::from(jobs.len() > 1));
             let parallel = pyramid_wave(&mut jobs, step, timers, available, fixed)?;
             let mut held = parallel
                 .as_ref()
@@ -2349,6 +2544,9 @@ pub(super) mod tests {
                 counts.seed_frame_writers >= 2,
                 "serial seed writes: {counts:?}"
             );
+            // #817: a sliding window, not waves that idle every lane behind
+            // their slowest tile and serial commit.
+            assert_eq!(counts.pyramid_waves, 0, "wave barriers: {counts:?}");
         });
     }
 
@@ -2378,6 +2576,74 @@ pub(super) mod tests {
                 fill_from(vec![square(10.0, 10.0, 100.0)], Vec::new()),
             );
         }
+    }
+
+    /// #817: the slide commits only in key order, and a tile that did not
+    /// fit its share stops it with that tile and every later one uncommitted,
+    /// their runs kept for the wave loop's serial retry.
+    #[test]
+    fn a_slide_stops_at_a_tile_over_its_share_and_keeps_the_rest() {
+        let opts = super::super::ExportOptions::default();
+        let mut runs = SpillBuckets::new(&opts, WORKSPACE_FLOOR_BYTES);
+        for key in 1..=4 {
+            runs.append(key, &[square(10.0, 10.0, 100.0)], &[], 0)
+                .unwrap();
+        }
+        let mut paths: Vec<_> = std::mem::take(&mut runs.tiles).into_values().collect();
+        let tile = || TileFill {
+            polys: vec![vec![vec![(0, 0), (4, 0), (0, 4)]]],
+            lifted: Vec::new(),
+            area: 1.0,
+            vertices: 3,
+        };
+        let mut commit = ZoomCommit {
+            map_bytes: 0,
+            snapped: ZoomBuilder::new(&opts).unwrap(),
+            parents: SpillBuckets::new(&opts, WORKSPACE_FLOOR_BYTES),
+            tiles: 0,
+            area: 0.0,
+            vertices: 0,
+        };
+        let mut queue = std::collections::BTreeMap::new();
+        let mut slide = Slide {
+            queue: &mut queue,
+            commit: &mut commit,
+            in_flight: 4,
+            next_seq: 4,
+            next_commit: 0,
+            done: Default::default(),
+            stopped: false,
+            error: None,
+        };
+        // Tile 1 finishes first: nothing commits ahead of tile 0.
+        slide.done.insert(1, (2, paths.remove(1), Ok(tile())));
+        let step = PyramidStep {
+            zoom: 4,
+            seed: false,
+            lift: false,
+            scale: 1.0,
+        };
+        let budget = WORKSPACE_FLOOR_BYTES;
+        assert!(slide_commit(&mut slide, step, 0, budget).is_empty());
+        slide.done.insert(0, (1, paths.remove(0), Ok(tile())));
+        slide.done.insert(
+            2,
+            (
+                3,
+                paths.remove(0),
+                require_fill_bytes(2, 1).map(|()| tile()),
+            ),
+        );
+        slide.done.insert(3, (4, paths.remove(0), Ok(tile())));
+        assert_eq!(slide_commit(&mut slide, step, 0, budget).len(), 2);
+        assert!(slide.stopped && slide.error.is_none());
+        assert_eq!((slide.next_commit, slide.in_flight), (2, 2));
+        assert_eq!(slide.done.keys().copied().collect::<Vec<_>>(), [2, 3]);
+        assert!(
+            slide_commit(&mut slide, step, 0, budget).is_empty(),
+            "a stopped slide stays put"
+        );
+        assert_eq!(commit.tiles, 2);
     }
 
     /// #817: a parallel wave hands the ordered commit only appends. Each
