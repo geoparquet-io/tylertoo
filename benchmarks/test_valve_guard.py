@@ -292,3 +292,38 @@ def test_an_injected_run_is_labelled():
     v = vg.verdict({"moldova-tiles": _cores_cell()}, None, VM, injected_threads=1)
     assert v["injected_threads"] == 1
     assert "INJECTED" in vg.summary_lines(v)[0]
+
+
+# --- roborev fixes (#817) -------------------------------------------------------
+def test_a_baseline_missing_a_required_phase_is_stale_not_pass():
+    # a recording whose 16-thread runs lacked the convert line has no pass-2 speedup
+    holed = {**_cores_cell(), "speedup_16_to_full": {LEVELS: 3.0, "whole": 3.0},
+             "low_phase_rounds": {LEVELS: 3}}
+    v = _vs(_cores_cell(), base_cell=holed)
+    assert v["baseline"]["status"] == "not applicable" and "run record" in v["baseline"]["reason"]
+
+
+def test_current_run_missing_a_required_low_thread_phase_fails():
+    holed = {**_cores_cell(), "low_phase_rounds": {LEVELS: 3}}
+    v = _vs(holed)
+    assert any(PASS2 in f and "16-thread" in f for f in v["baseline"]["failures"])
+
+
+def test_export_cells_require_only_the_levels_phase():
+    cell = {**_cores_cell(), "phase_rounds": {LEVELS: 3}}
+    assert vg.missing_telemetry("792-def", cell) == []
+    assert vg.missing_telemetry("moldova-tiles", cell)
+
+
+def test_record_refuses_an_incomplete_measurement():
+    assert vg.record_problems({"moldova-tiles": _cores_cell()}) == []
+    assert vg.record_problems({"moldova-tiles": {**_cores_cell(), "phase_rounds": {PASS2: 3}}})
+    assert vg.record_problems({"moldova-tiles": {**_cores_cell(), "serial_share_rounds": 2}})
+
+
+def test_skipped_checks_are_printed_and_a_changed_output_says_so():
+    v = _vs(_cores_cell(cpu=900.0, sha="bb"))
+    assert v["baseline"]["status"] == "pass"
+    lines = vg.report_lines(v)
+    assert any(line.startswith("SKIP ") and "output differs" in line for line in lines)
+    assert lines[-3].startswith("ratio:")

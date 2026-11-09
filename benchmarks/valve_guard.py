@@ -43,11 +43,12 @@ Two kinds of failure, both exit status 1:
             fail (`floors`). A cell is exempt only via `[cores_floor.<cell>]`
             in ci/exemptions.toml.
 
-Every check ends with three lines: `ratio: PASS|FAIL`,
+Every check ends with FAIL lines, SKIP lines (a check that could not run,
+e.g. CPU core-seconds when the output changed), then three lines: `ratio: PASS|FAIL`,
 `baseline: PASS|FAIL|NOT APPLICABLE (<why>)` and
 `floors: PASS|FAIL|NOT APPLICABLE (<why>)`; --json-out records all.
 
-    uv run python -I benchmarks/valve_guard.py check \\
+    uv run --no-project --python 3.12 python -I benchmarks/valve_guard.py check \\
         --mim target/release/tylertoo --glibc target/glibc/release/tylertoo \\
         --data ~/bench-data
     ... record   (same flags) rewrites this host class's baseline, keeping
@@ -278,15 +279,36 @@ def ratio_failures(cells: dict) -> list[str]:  # noqa: D103
     return bad
 
 
-def _stale(base: dict, cell: str) -> bool:
-    """A baseline cell recorded before #817's fields (so the new checks cannot run)."""
-    return "phase_cores" not in base or (cell in SCALING_CELLS and "speedup_16_to_full" not in base)
+def missing_telemetry(cell: str, s: dict) -> list[str]:
+    """What a complete record of `cell` lacks: each phase the cell measures
+    (pass 2 only on `tiles`) in every round, and at LOW_THREADS too for a
+    scaling cell. A gate must not pass, nor a baseline be kept, on less."""
+    phases = CORE_PHASES if CELLS[cell][1] == "moldova" else ("export/levels",)
+    arms = [("", s.get("rounds", 0), s.get("phase_rounds"))]
+    if cell in SCALING_CELLS:
+        arms.append((f" {LOW_THREADS}-thread", s.get("low_rounds", 0), s.get("low_phase_rounds")))
+    out = []
+    for label, rounds, got in arms:
+        for phase in phases:
+            n = (got or {}).get(phase, 0)
+            if n < rounds or n == 0:
+                out.append(f"{cell} {phase}{label} telemetry missing in {rounds - n} of {rounds} rounds")
+    return out
+
+
+def record_problems(cells: dict) -> list[str]:
+    """Why these measurements must not become a baseline (empty when complete)."""
+    out = [m for cell, s in cells.items() for m in missing_telemetry(cell, s)]
+    return out + [f"{cell} serial share telemetry missing in {s['rounds'] - s.get('serial_share_rounds', 0)} "
+                  f"of {s['rounds']} rounds" for cell, s in cells.items()
+                  if s.get("serial_share_rounds", 0) < s["rounds"]]
 
 
 def baseline_failures(cells: dict, baseline: dict) -> tuple[list[str], list[str], list[str]]:
     """(failures, stale cells, skipped checks) of the cells against one host
-    class's baseline record. A field the baseline has must be in the current
-    run, in every round; a baseline cell without the #817 fields is `stale`."""
+    class's baseline record. The current run must be complete
+    (`missing_telemetry`); an incomplete baseline cell (recorded before #817's
+    fields) is `stale`."""
     bad, stale, skipped = [], [], []
     for cell, now in cells.items():
         base = baseline["cells"].get(cell)
@@ -303,18 +325,9 @@ def baseline_failures(cells: dict, baseline: dict) -> tuple[list[str], list[str]
             bad.append(f"{cell} wall {now['wall_s']} s is {wall:.2f}x its baseline {base['wall_s']} s")
         if rss > RSS_REGRESSION_MAX:
             bad.append(f"{cell} peak RSS is {rss:.2f}x its baseline")
-        if _stale(base, cell):
+        if missing_telemetry(cell, base):  # recorded before #817's fields, or incompletely
             stale.append(cell)
-        rounds, low_rounds = now.get("rounds", 0), now.get("low_rounds", 0)
-        for phase in base.get("phase_cores") or {}:
-            n = (now.get("phase_rounds") or {}).get(phase, 0)
-            if n < rounds or n == 0:
-                bad.append(f"{cell} {phase} telemetry missing in {rounds - n} of {rounds} rounds")
-        for phase in base.get("speedup_16_to_full") or {}:
-            n = low_rounds if phase == "whole" else (now.get("low_phase_rounds") or {}).get(phase, 0)
-            if n < low_rounds or n == 0:
-                bad.append(f"{cell} {phase} {LOW_THREADS}-thread telemetry missing in "
-                           f"{low_rounds - n} of {low_rounds} rounds")
+        bad += missing_telemetry(cell, now)
         for phase, was in (base.get("phase_cores") or {}).items():
             got = (now.get("phase_cores") or {}).get(phase)
             if got is not None and was is not None and got < was * (1 - CORES_DROP_MAX):
@@ -327,7 +340,9 @@ def baseline_failures(cells: dict, baseline: dict) -> tuple[list[str], list[str]
             elif got < was * (1 - SPEEDUP_DROP_MAX):
                 bad.append(f"{cell} {phase} {LOW_THREADS}-to-full speedup {got} is more than "
                            f"{SPEEDUP_DROP_MAX:.0%} below its baseline {was}")
-        if base.get("output_sha256") and base.get("output_sha256") == now.get("output_sha256"):
+        if not base.get("output_sha256") or base.get("output_sha256") != now.get("output_sha256"):
+            skipped.append(f"{cell} CPU core-seconds: output differs from the baseline's (or no sha)")
+        else:
             for phase, was in (base.get("phase_cpu_s") or {}).items():
                 got = (now.get("phase_cpu_s") or {}).get(phase)
                 if got is None:
@@ -411,6 +426,13 @@ def summary_lines(v: dict) -> list[str]:
             line("floors", v["floors"])]
 
 
+def report_lines(v: dict) -> list[str]:
+    """Everything a check prints at the end: FAIL and SKIP lines, then the summary."""
+    fails = v["ratio"]["failures"] + v["baseline"]["failures"] + v["floors"]["failures"]
+    return ([f"FAIL {f}" for f in fails] + [f"SKIP {s}" for s in v["baseline"].get("skipped", [])]
+            + summary_lines(v))
+
+
 def exit_status(v: dict) -> int:
     """1 when any half failed; `not applicable` is not a failure."""
     return 1 if v["ratio"]["failures"] or v["baseline"]["failures"] or v["floors"]["failures"] else 0
@@ -465,6 +487,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "record" and not (doc or {}).get("hosts", {}).get(host_class_key(record["host"]), {}).get("floors"):
         record["floors"] = DEFAULT_FLOORS
     if args.mode == "record":
+        if problems := record_problems(cells):
+            raise SystemExit("not recording an incomplete baseline:\n  " + "\n  ".join(problems))
         args.baseline.parent.mkdir(parents=True, exist_ok=True)
         args.baseline.write_text(json.dumps(with_record(doc, record), indent=2) + "\n")
         print(f"wrote {args.baseline} [{host_class_key(record['host'])}]")
@@ -472,9 +496,7 @@ def main(argv: list[str] | None = None) -> int:
     v = verdict(cells, doc, record["host"], load_exemptions(), args.inject_threads)
     if args.json_out:
         args.json_out.write_text(json.dumps({**record, "verdict": v}, indent=2) + "\n")
-    for f in v["ratio"]["failures"] + v["baseline"]["failures"] + v["floors"]["failures"]:
-        print(f"FAIL {f}")
-    for line in summary_lines(v):
+    for line in report_lines(v):
         print(line)
     return exit_status(v)
 
