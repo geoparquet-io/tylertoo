@@ -1370,7 +1370,7 @@ fn align_to_target_schema(
 /// encoder accumulates across batches. All other fields (encoding, CRS,
 /// covering paths, edges) are constants of the schema + options, identical in
 /// every chunk's metadata; the first fold seeds them.
-fn fold_geo_metadata(
+pub(crate) fn fold_geo_metadata(
     acc: &mut Option<GeoParquetMetadata>,
     other: GeoParquetMetadata,
 ) -> Result<(), String> {
@@ -1397,16 +1397,20 @@ fn fold_geo_metadata(
                     ));
                 }
                 // `[mins..., maxs...]`: length 4 = `[xmin, ymin, xmax, ymax]`,
-                // length 6 = `[xmin, ymin, zmin, xmax, ymax, zmax]`.
+                // length 6 = `[xmin, ymin, zmin, xmax, ymax, zmax]`. Each
+                // corner is added as a coordinate, as the serial encoder's
+                // `BoundingRect::add_rect` does: for a chunk with no
+                // coordinates (`[inf.., -inf..]`) that differs from a
+                // min/max union, and the serial result is the contract.
                 let half = a.len() / 2;
-                for i in 0..half {
-                    if b[i] < a[i] {
-                        a[i] = b[i];
-                    }
-                }
-                for i in half..a.len() {
-                    if b[i] > a[i] {
-                        a[i] = b[i];
+                for corner in [&b[..half], &b[half..]] {
+                    for (i, &v) in corner.iter().enumerate() {
+                        if v < a[i] {
+                            a[i] = v;
+                        }
+                        if v > a[half + i] {
+                            a[half + i] = v;
+                        }
                     }
                 }
             }
