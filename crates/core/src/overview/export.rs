@@ -5761,6 +5761,19 @@ fn for_each_member_key(bbox: &TileBounds, zoom: u8, opts: &ExportOptions, mut f:
     }
 }
 
+/// Fewest bboxes one [`size_bboxes`] task sizes. Sizing a bbox costs well
+/// under a microsecond, so finer splits only buy accumulator maps to merge
+/// and a pool to wake: at 64 threads, splitting a batch to the thread count
+/// left about 95% of the export scan's samples in Rayon's spin loop (#817),
+/// slower than at 16 threads.
+const SIZE_BBOXES_MIN_ROWS: usize = 2048;
+
+#[cfg(test)]
+thread_local! {
+    /// [`size_bboxes`] accumulators this thread started (test counter, #817).
+    static SIZE_ACCUMULATORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Size a batch of (already-reprojected) feature bboxes at `zoom`: union their
 /// bounds and count one member per tile each spans. Sizing is embarrassingly
 /// parallel per feature (issue #227): fold into per-thread `(bounds, counts)`
@@ -5774,8 +5787,13 @@ fn size_bboxes(
 ) -> (Option<TileBounds>, HashMap<u64, usize>) {
     bboxes
         .par_iter()
+        .with_min_len(SIZE_BBOXES_MIN_ROWS)
         .fold(
-            || (None::<TileBounds>, HashMap::<u64, usize>::new()),
+            || {
+                #[cfg(test)]
+                SIZE_ACCUMULATORS.with(|n| n.set(n.get() + 1));
+                (None::<TileBounds>, HashMap::<u64, usize>::new())
+            },
             |(mut bounds, mut counts), bbox| {
                 if let Some(bbox) = bbox {
                     for extent in wrapped_extents(bbox) {
@@ -11518,6 +11536,35 @@ mod tests {
         assert_eq!(
             run.work.serial_collect_rows, 0,
             "rows whose collect work ran serially on the consumer thread"
+        );
+    }
+
+    /// #817 (S1): the scan sizes a batch in a few tasks, not one per pool
+    /// thread. On `origin/main` a 64-thread pool split an 8,192-row batch
+    /// into dozens of accumulator maps, and about 95% of the scan's samples
+    /// were Rayon spin, slower at 64 threads than at 16.
+    #[test]
+    fn size_bboxes_splits_a_batch_into_few_tasks() {
+        let bboxes: Vec<Option<TileBounds>> = (0..EXPORT_BATCH_SIZE)
+            .map(|i| {
+                let x = -170.0 + (i as f64 * 0.04) % 340.0;
+                Some(TileBounds::new(x, 10.0, x + 0.01, 10.01))
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(64)
+            .build()
+            .unwrap();
+        let opts = ExportOptions::default();
+        let (_, counts) = pool.install(|| size_bboxes(&bboxes, 12, &opts));
+        assert!(counts.values().sum::<usize>() >= EXPORT_BATCH_SIZE);
+        let accumulators: usize = pool
+            .broadcast(|_| SIZE_ACCUMULATORS.with(std::cell::Cell::take))
+            .into_iter()
+            .sum();
+        assert!(
+            accumulators <= EXPORT_BATCH_SIZE / SIZE_BBOXES_MIN_ROWS,
+            "{accumulators} accumulators for one batch"
         );
     }
 
