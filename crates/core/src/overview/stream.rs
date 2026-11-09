@@ -2121,9 +2121,10 @@ fn create_level_writer(
         budget.remaining(),
     );
     writer_opts.encode_concurrency = encodes.units;
-    // Overlapping levels holds up to two levels' row groups (#817); the
-    // bounded profile keeps its one-level envelope.
-    writer_opts.overlap_levels = !matches!(options.profile, super::level::MemoryProfile::Bounded);
+    // Overlapping levels holds up to two levels' row groups (#817): -15-20%
+    // wall on Madagascar adm4 but +25% peak RSS at 16 threads, over auto's
+    // 10% allowance, so only `speed` (no memory promise) takes it.
+    writer_opts.overlap_levels = matches!(options.profile, super::level::MemoryProfile::Speed);
 
     let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
