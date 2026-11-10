@@ -432,7 +432,7 @@ stats(
 
 Summarize tile sizes in a PMTiles archive.
 
-The Python form of `tylertoo stats`, returning the same dict as `stats --json`. Tile sizes come from the archive directory alone and measure stored compressed bytes per addressed tile. Run members and deduplicated tiles each count individually.
+Return the same dict as `tylertoo stats --json`. Tile sizes come from the archive directory alone and measure stored compressed bytes per addressed tile. Run members and deduplicated tiles each count individually.
 
 ### Parameters
 
@@ -442,7 +442,11 @@ The Python form of `tylertoo stats`, returning the same dict as `stats --json`. 
 
 ### Returns
 
-`dict[str, Any]`: A dict with `per_zoom` entries containing `z`, `tile_count`, `total_bytes`, `mean_bytes`, `p50_bytes`, `p99_bytes`, and `max_bytes`, and `largest` entries containing `z`, `x`, `y`, and `bytes`, ordered by stored size, largest first. With `layers=True`, also includes `per_layer` entries with `z`, `layer`, `feature_count`, `bytes` (the layer's uncompressed encoded size), and `geometry_types` (feature counts per `Point`, `LineString`, `Polygon`, or `Unknown`). These totals also count per addressed tile. `per_layer` is absent otherwise.
+`dict[str, Any]`: A dict with `per_zoom` entries containing `z`, `tile_count`, `total_bytes`, `mean_bytes`, `p50_bytes`, `p99_bytes`, and `max_bytes` for each zoom's tile count and stored-size statistics.
+
+`largest` entries contain `z`, `x`, `y`, and `bytes`. They list tiles by stored size, largest first.
+
+With `layers=True`, `per_layer` entries contain `z`, `layer`, `feature_count`, `bytes`, and `geometry_types` for each zoom and layer. `bytes` measures the layer's uncompressed encoded size. `geometry_types` counts features per `Point`, `LineString`, `Polygon`, or `Unknown`. These totals count each addressed tile. The dict omits `per_layer` otherwise.
 
 ### Raises
 
