@@ -808,7 +808,7 @@ fn cluster_sum_by_level(
             .as_primitive::<Int64Type>()
             .clone();
 
-        if category_problem.is_none() {
+        if clustering.categories.is_some() && category_problem.is_none() {
             category_problem = category_sum_mismatch(&batch, &category_columns, &counts, &levels)?;
         }
 
@@ -855,9 +855,6 @@ fn category_sum_mismatch(
     use arrow_array::types::Int64Type;
     use arrow_array::Array;
 
-    if category_columns.is_empty() {
-        return Ok(None);
-    }
     let columns = category_columns
         .iter()
         .map(|name| {
@@ -2206,6 +2203,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(msg.contains("sum to 1 but its point_count is 2"), "{msg}");
+        // Codex review: declared but empty labels count zero, never pass.
+        let none = super::category_sum_mismatch(&batch, &[], &ok, &levels)
+            .unwrap()
+            .unwrap();
+        assert!(none.contains("sum to 0 but its point_count is 3"), "{none}");
     }
 
     /// #827 review: cropping exempts a spatial subset from whole-source mass
