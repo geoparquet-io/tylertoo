@@ -257,7 +257,10 @@ impl Band {
         // An error names the spec, minus a URL input's query (#820).
         let owned = || match spec.find("://") {
             Some(i) => {
-                let url_at = spec[..i].rfind([':', '=']).map_or(0, |j| j + 1);
+                // The URL starts where its scheme does.
+                let url_at = spec[..i]
+                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+                    .map_or(0, |j| j + 1);
                 format!("{}{}", &spec[..url_at], redact_query(&spec[url_at..]))
             }
             None => spec.to_string(),
@@ -303,7 +306,7 @@ impl Band {
             Some(l) => l.to_string(),
             None => default_layer_for(path).ok_or_else(|| E::NoLayer {
                 spec: owned(),
-                path: path.to_string(),
+                path: redact_query(path).into_owned(),
                 sep,
             })?,
         };
@@ -2914,11 +2917,17 @@ mod tests {
         let err = remote_archive_rejection(Path::new("https://h/a.pmtiles?sig=SECRET")).unwrap();
         assert!(!err.contains("SECRET"), "{err}");
         // A refused spec is named without its query too.
-        let err = parse_bands(&[format!("9-5:{url}:a")]).unwrap_err();
-        assert!(
-            err.contains("https://h/a.parquet?<redacted") && !err.contains("SECRET"),
-            "{err}"
-        );
+        for spec in [
+            format!("9-5:{url}:a"),
+            format!("9-5: {url}:a"),
+            "0-5:https://h/[p]/download?sig=SECRET".to_string(),
+        ] {
+            let err = parse_bands(&[spec]).unwrap_err();
+            assert!(
+                err.contains("<redacted") && !err.contains("SECRET"),
+                "{err}"
+            );
+        }
     }
 
     /// Spec and set errors come through unchanged, before any existence
