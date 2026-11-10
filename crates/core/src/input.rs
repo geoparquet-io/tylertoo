@@ -2046,39 +2046,35 @@ pub(crate) mod remote {
         matches!(key, ClientConfigKey::ProxyUrl)
     }
 
-    /// The client overrides, resolved from the environment on every store
-    /// build (#804). Warnings and one info line naming the overrides in force
-    /// (so a #290 sweep run records what it tested) are logged when they
-    /// change.
+    /// The client overrides, read from the environment on every store build
+    /// (#804). Parsing probe-builds a client per variable, so the result is
+    /// cached by the raw `TYLERTOO_HTTP_*` values and redone, with its
+    /// warnings and one info line naming the overrides in force (so a #290
+    /// sweep run records what it tested), only when they change.
     fn effective_client_overrides() -> Vec<(ClientConfigKey, String)> {
-        type Resolved = (Vec<(ClientConfigKey, String)>, Vec<String>);
-        static LOGGED: Mutex<Option<Resolved>> = Mutex::new(None);
-        let vars = std::env::vars_os()
-            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
-        let resolved = client_overrides(vars);
-        if changed(&LOGGED, &resolved) {
-            let (overrides, warnings) = &resolved;
-            for w in warnings {
-                log::warn!("[remote] {w}");
-            }
-            if let Some(line) = overrides_log_line(overrides) {
-                log::info!("[remote] {line}");
-            }
-        }
-        resolved.0
-    }
-
-    /// Whether `now` differs from the value last seen in `last` (recording
-    /// it), so a setting re-read on every call is logged once per change.
-    fn changed<T: PartialEq + Clone>(last: &Mutex<Option<T>>, now: &T) -> bool {
-        let mut last = last
+        type Raw = Vec<(String, String)>;
+        type Overrides = Vec<(ClientConfigKey, String)>;
+        static LAST: Mutex<Option<(Raw, Overrides)>> = Mutex::new(None);
+        let mut raw: Raw = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .filter(|(k, _)| k.starts_with(CLIENT_VAR_PREFIX))
+            .collect();
+        raw.sort();
+        let mut last = LAST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let changed = last.as_ref() != Some(now);
-        if changed {
-            *last = Some(now.clone());
+        if let Some((_, overrides)) = last.as_ref().filter(|(seen, _)| *seen == raw) {
+            return overrides.clone();
         }
-        changed
+        let (overrides, warnings) = client_overrides(raw.clone());
+        for w in &warnings {
+            log::warn!("[remote] {w}");
+        }
+        if let Some(line) = overrides_log_line(&overrides) {
+            log::info!("[remote] {line}");
+        }
+        *last = Some((raw, overrides.clone()));
+        overrides
     }
 
     /// The environment a store is built from: the `AWS_*`, `GOOGLE_*` and
@@ -2401,8 +2397,13 @@ pub(crate) mod remote {
             let (mut tunables, warnings) = resolve(lookup);
             tunables.overridden = overridden;
             tunables.mem_budget_set = mem_budget_set;
-            if super::changed(&LOGGED, &(tunables, warnings.clone())) {
-                for w in &warnings {
+            let now = Some((tunables, warnings));
+            let mut logged = LOGGED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *logged != now {
+                *logged = now;
+                for w in &logged.as_ref().expect("just set").1 {
                     log::warn!("[stage] {w}");
                 }
                 let line = format!(
