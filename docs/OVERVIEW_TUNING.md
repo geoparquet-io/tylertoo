@@ -1480,7 +1480,7 @@ tylertoo tiles admin.parquet admin.pmtiles --tile-format mlt
 Python:
 
 ```python
-tylertoo.convert('admin.parquet', 'admin.pmtiles', tile_format='mlt')
+tylertoo.convert('admin.parquet', 'admin.pmtiles', tile_format='mlt')  # notest: needs your own admin.parquet
 ```
 
 ---
