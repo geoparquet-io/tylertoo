@@ -185,10 +185,11 @@ fn routable(dt: &DataType) -> bool {
 /// properties the caller kept.
 fn stage_columns(
     source: &ConvertSource,
-    selection: &super::properties::PropertySelection,
+    convert: &super::convert::ConvertOptions,
     routing: usize,
     filter: Option<&super::filter::BoundFilter>,
 ) -> Result<super::properties::PropertySelection, ConvertError> {
+    let selection = &convert.properties;
     let schema = source.file_schema()?;
     let column = schema.field(routing).name();
     let mut layer = selection.clone();
@@ -201,7 +202,11 @@ fn stage_columns(
             input: source.display_name(),
         }
     })?;
-    let kept = selection.resolve(&schema, geom, &[], &mut |m| log::warn!("[tiles] {m}"))?;
+    // A knob reading an excluded property is refused here, before anything
+    // is staged, as convert refuses it. The filter is not one: it runs
+    // before the split, on the columns it reads.
+    let required = super::convert::knob_columns(convert, &schema);
+    let kept = selection.resolve(&schema, geom, &required, &mut |m| log::warn!("[tiles] {m}"))?;
     let properties = super::properties::property_indices(&schema, geom);
     let mut keep: Vec<usize> = (0..schema.fields().len())
         .filter(|i| kept.contains(i) || !properties.contains(i))
@@ -619,8 +624,8 @@ pub(super) fn convert_by_layer(
     let mut convert = convert;
     convert.filter = None;
     check_knobs(&convert, &options.export, column, Some(&file_schema))?;
-    convert.properties = stage_columns(&source, &convert.properties, idx, filter.as_ref())
-        .map_err(TilesError::Convert)?;
+    convert.properties =
+        stage_columns(&source, &convert, idx, filter.as_ref()).map_err(TilesError::Convert)?;
     let schema = source.schema().map_err(|e| TilesError::Convert(e.into()))?;
     let idx = schema
         .index_of(column)
@@ -1268,6 +1273,33 @@ mod tests {
             )),
             "{:?}",
             report.diagnostics
+        );
+    }
+
+    /// A knob that reads an excluded property is refused by the selection,
+    /// before the input is read and staged.
+    #[test]
+    fn a_knob_on_an_excluded_property_is_refused_before_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("crops.parquet");
+        write_multi_rg_attr_input(&input, &rows());
+        let mut options = options("crop");
+        options.convert.properties.exclude = vec!["confidence".into()];
+        options.convert.sort_key = Some("confidence".into());
+        let err = convert_to_pmtiles(
+            &TilesInput::Path(input),
+            &dir.path().join("o.pmtiles"),
+            &options,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TilesError::Convert(ConvertError::Properties(
+                    super::super::properties::PropertySelectionError::RequiredByKnob { .. }
+                ))
+            ),
+            "{err:?}"
         );
     }
 
