@@ -170,6 +170,10 @@ pub fn stage_arrow_stream(
         .collect::<Result<Vec<_>, _>>()?;
     // Schema-level metadata dropped: a stale `geo` key would sit beside ours.
     let schema = Arc::new(Schema::new(fields));
+    // Every WKB column the encoder will parse, selected or not.
+    let wkb: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| schema.field(i).extension_type_name() == Some("geoarrow.wkb"))
+        .collect();
 
     let options = GeoParquetWriterOptionsBuilder::default()
         .set_encoding(GeoParquetWriterEncoding::WKB)
@@ -200,7 +204,7 @@ pub fn stage_arrow_stream(
             .map_err(ConvertError::Arrow)?;
         // The pinned WKB reader panics on some malformed values; refuse them
         // first, as the file readers do.
-        for &i in &geometry {
+        for &i in &wkb {
             crate::wkb_column::check_wkb_column(columns[i].as_ref()).map_err(|(row, e)| {
                 stream_error(format!(
                     "geometry column {:?}, row {}: {e}",
@@ -342,8 +346,25 @@ mod tests {
             vec![Arc::new(BinaryArray::from_iter_values([wkb]))],
         )
         .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema);
         let err = stage_arrow_stream(reader, Some("wkb"), None, None, "x").unwrap_err();
         assert!(err.to_string().contains("row 0"), "{err}");
+
+        // A secondary GeoArrow column is parsed too, so it is checked too.
+        let secondary = Field::new("other", DataType::Binary, true)
+            .with_metadata([(EXTENSION_NAME.to_string(), "geoarrow.wkb".to_string())].into());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("wkb", DataType::Binary, true),
+            secondary,
+        ]));
+        let good = BinaryArray::from_iter_values([point_wkb(0.0, 0.0)]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(good), batch.column(0).clone()],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let err = stage_arrow_stream(reader, Some("wkb"), None, None, "x").unwrap_err();
+        assert!(err.to_string().contains(r#""other", row 0"#), "{err}");
     }
 }
