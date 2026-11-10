@@ -4,6 +4,9 @@ Args:
     input: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
         (`EPSG:3857`). Pass a file, directory, glob, `s3://`,
         `gs://`, or `https://` URL or prefix, or a list of files.
+        First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas)
+        to a GeoParquet file using `gpio` or DuckDB
+        `COPY (... ORDER BY ST_Hilbert(...)) TO 'x.parquet'`.
     output: Overview file to write.
     mode: `"duplicating"` makes each level a complete map;
         `"partitioning"` stores each feature once.

@@ -82,7 +82,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 #### Input and levels
 
-* `input`: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator (`EPSG:3857`). Pass a file, directory, glob, `s3://`, `gs://`, or `https://` URL or prefix, or a list of files.
+* `input`: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator (`EPSG:3857`). Pass a file, directory, glob, `s3://`, `gs://`, or `https://` URL or prefix, or a list of files. First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas) to a GeoParquet file using `gpio` or DuckDB `COPY (... ORDER BY ST_Hilbert(...)) TO 'x.parquet'`.
 * `output`: Overview file to write.
 * `mode`: `"duplicating"` makes each level a complete map; `"partitioning"` stores each feature once.
 * `min_zoom`: Coarsest zoom.
@@ -506,7 +506,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 
 ### Parameters
 
-* `input`: See `overview()`.
+* `input`: See `overview()`. First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas) to a GeoParquet file using `gpio` or DuckDB `COPY (... ORDER BY ST_Hilbert(...)) TO 'x.parquet'`.
 * `output`: PMTiles archive to write.
 * `min_zoom`: See `overview()`.
 * `max_zoom`: See `overview()`.

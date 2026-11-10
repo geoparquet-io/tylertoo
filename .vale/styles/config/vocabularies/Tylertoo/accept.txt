@@ -15,6 +15,7 @@ geoparquet-io
 MBTiles
 gpio
 DuckDB
+Polars
 MVT
 GSDs?
 rustdoc
