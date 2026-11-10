@@ -857,8 +857,8 @@ the layer declarations alike.
 every row it merged, carrying its rep row's attributes, so no single input
 row group's bbox bounds it. Each data shard rebuilds every level's chains
 over the plan's dataset-wide line scratch (the tables a monolithic run
-builds), keeps those whose bbox reaches its read window, and widens its read
-selection with the row groups holding their reps. Tiles stay byte-identical
+builds) and widens its read selection with the row groups holding the reps
+of the chains whose bbox reaches its read window. Tiles stay byte-identical
 at the cost of the chain stage running on every shard. Clustering,
 accumulation and tiny-polygon carriers each key off one input row whose own
 bbox bounds it, so the row-group argument that makes ordinary features safe

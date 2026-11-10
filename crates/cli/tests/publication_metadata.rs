@@ -302,7 +302,7 @@ fn a_sharded_fleet_carries_the_values_through_empty_shards() {
         "--shards",
         "4",
         "--pivot",
-        "3",
+        "4",
         "-o",
         s(&plan),
     ]);
@@ -320,8 +320,9 @@ fn a_sharded_fleet_carries_the_values_through_empty_shards() {
             "0",
             "--max-zoom",
             "4",
-            // One corner of the world, so most shards own nothing.
-            "--bbox=-175,-70,-120,-20",
+            // One patch away from the antimeridian (a shard reads across
+            // it, #546), so most shards own nothing.
+            "--bbox=-100,-70,-60,-20",
             "--report",
             s(&report),
             "--no-coalesce-lines",

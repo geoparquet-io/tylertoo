@@ -627,10 +627,13 @@ impl TileRange {
     pub fn read_bounds(&self) -> TileBounds {
         let b = self.tile_bounds();
         let margin = SHARD_READ_MARGIN_TILES * 360.0 / 2f64.powi(i32::from(self.pivot_zoom));
+        // Longitude is not clamped: past ±180 the margin covers the far
+        // side's features, which export draws wrapped into the edge tiles
+        // (#342); the readers test the wrapped query boxes (#643).
         TileBounds::new(
-            (b.lng_min - margin).max(-180.0),
+            b.lng_min - margin,
             (b.lat_min - margin).max(-90.0),
-            (b.lng_max + margin).min(180.0),
+            b.lng_max + margin,
             (b.lat_max + margin).min(90.0),
         )
     }

@@ -552,24 +552,23 @@ struct KeptRun {
 /// that bbox cannot land in a tile the shard owns.
 ///
 /// Coalesced chains (#546) are the exception: a chain takes its rep row's
-/// attributes but spans rows from anywhere, so `chains` (built over the whole
-/// plan, already narrowed to the chains that reach the shard) also keeps the
-/// row group of every rep, and its tables are re-keyed with the rest.
+/// attributes but spans rows from anywhere, so the shard also keeps the row
+/// group of every rep in `reps` (the chains that reach it), and the chain
+/// tables (built over the whole plan) are re-keyed with the rest.
 ///
 /// Returns the shard's read selection when the reps widened it.
 pub(super) fn rebase_plan_for_shard(
     plan: &mut ConvertPlan,
     source: &ConvertSource,
     shard_selection: Option<&RowGroupSelection>,
-    mut chains: Option<&mut CoalesceBuild>,
+    (mut chains, reps): (
+        Option<&mut CoalesceBuild>,
+        &std::collections::BTreeSet<usize>,
+    ),
     path: &Path,
 ) -> Result<Option<RowGroupSelection>, ConvertError> {
     let rg_rows = source.part_row_group_row_counts()?;
     let named = || path.display().to_string();
-    let reps = chains
-        .as_deref()
-        .map(CoalesceBuild::rep_rows)
-        .unwrap_or_default();
     let mut read: Vec<Vec<usize>> = vec![Vec::new(); rg_rows.len()];
     let mut widened = false;
 
@@ -2671,10 +2670,15 @@ mod tests {
             let mut plan = tiny_plan();
             plan.fingerprint.inputs[0].row_groups = Some(forged.clone());
             plan.min_levels = vec![0; 9];
-            let err =
-                rebase_plan_for_shard(&mut plan, &source, None, None, Path::new("forged.plan"))
-                    .unwrap_err()
-                    .to_string();
+            let err = rebase_plan_for_shard(
+                &mut plan,
+                &source,
+                None,
+                (None, &Default::default()),
+                Path::new("forged.plan"),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(
                 err.contains("strictly ascending"),
                 "selection {forged:?} must be refused: {err}"
@@ -2707,7 +2711,7 @@ mod tests {
             &mut plan,
             &source,
             Some(&RowGroupSelection::from_parts(vec![vec![1]])),
-            None,
+            (None, &Default::default()),
             Path::new("test.plan"),
         )
         .unwrap();
@@ -2899,7 +2903,7 @@ mod tests {
             &mut plan,
             &source,
             Some(&RowGroupSelection::from_parts(vec![vec![1]])),
-            None,
+            (None, &Default::default()),
             Path::new("test.plan"),
         )
         .unwrap();

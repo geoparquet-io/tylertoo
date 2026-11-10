@@ -1099,18 +1099,6 @@ fn build_writer_options_with_ceiling(
     Ok(writer_opts)
 }
 
-/// Combined per-part footer-statistics row-group selection for the streaming
-/// path: bbox covering pruning (#102) intersected with attribute-filter
-/// statistics pushdown (#315) and, on a data shard, with the shard's own tile
-/// range (#498). `None` when none of the three is active.
-///
-/// The shard term is the one that is *not* fingerprinted: `--bbox` and
-/// `--filter` change which features exist and so change the assignment, but a
-/// shard reads a subset of the same dataset under the same assignment. That
-/// asymmetry is why the plan's fingerprint compares the selection as a subset
-/// relation in shard mode instead of an equality, and why the plan's
-/// row-indexed tables are then re-addressed onto the subset rather than
-/// re-derived over it.
 /// A shard's read window as a query in the input's CRS: its tile range plus
 /// the read margin, with the wrapped copies.
 fn shard_read_query(range: &crate::shard::TileRange, crs: Crs) -> BboxQuery {
@@ -1118,21 +1106,23 @@ fn shard_read_query(range: &crate::shard::TileRange, crs: Crs) -> BboxQuery {
     BboxQuery::new(&[b.lng_min, b.lat_min, b.lng_max, b.lat_max], crs)
 }
 
-/// #546: a data shard's coalesce chains.
+/// #546: a data shard's coalesce chains, and the reps it must read.
 ///
 /// A chain merges rows from anywhere in the input and carries its rep row's
 /// attributes, so a shard cannot build it from the rows it reads. It builds
 /// every level's chains over the plan's dataset-wide line scratch instead —
-/// the same tables a monolithic run builds — and keeps those whose bbox
-/// reaches its read window. The re-addressing then also reads each kept
-/// rep's row group.
+/// the same tables a monolithic run builds — and returns the reps of the
+/// chains whose bbox reaches its read window, so the re-addressing reads
+/// their row groups too. No chain of a group the shard reads is dropped: its
+/// overview then holds what a monolithic one holds for that group, which the
+/// size valve's per-row-group gaps depend on.
 fn shard_chain_tables(
     plan: &mut super::plan_state::ConvertPlan,
     range: &crate::shard::TileRange,
     (crs, memory): (Crs, MemoryBudget),
     options: &ConvertOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<Option<CoalesceBuild>, ConvertError> {
+) -> Result<Option<(CoalesceBuild, std::collections::BTreeSet<usize>)>, ConvertError> {
     let Some(scratch) = plan.take_coalesce_scratch()? else {
         return Ok(None);
     };
@@ -1147,12 +1137,35 @@ fn shard_chain_tables(
     );
     let mut build = build.expect("prebuild returns the tables");
     let window = shard_read_query(range, crs);
-    for table in build.tables.iter_mut().flatten() {
-        table.retain(|_, (geom, _)| window.intersects(&super::convert::geometry_bbox(geom)));
+    let mut reps = std::collections::BTreeSet::new();
+    for (table, &(_, zoom)) in build.tables.iter_mut().zip(&plan.level_specs) {
+        let Some(table) = table else { continue };
+        // A data shard exports no zoom below its pivot.
+        if zoom.is_some_and(|z| z < range.pivot_zoom()) {
+            table.clear();
+        }
+        reps.extend(
+            table
+                .iter()
+                .filter(|(_, (geom, _))| window.intersects(&super::convert::geometry_bbox(geom)))
+                .map(|(&rep, _)| rep),
+        );
     }
-    Ok(Some(build))
+    Ok(Some((build, reps)))
 }
 
+/// Combined per-part footer-statistics row-group selection for the streaming
+/// path: bbox covering pruning (#102) intersected with attribute-filter
+/// statistics pushdown (#315) and, on a data shard, with the shard's own tile
+/// range (#498). `None` when none of the three is active.
+///
+/// The shard term is the one that is *not* fingerprinted: `--bbox` and
+/// `--filter` change which features exist and so change the assignment, but a
+/// shard reads a subset of the same dataset under the same assignment. That
+/// asymmetry is why the plan's fingerprint compares the selection as a subset
+/// relation in shard mode instead of an equality, and why the plan's
+/// row-indexed tables are then re-addressed onto the subset rather than
+/// re-derived over it.
 pub(super) fn select_row_groups_streaming(
     source: &ConvertSource,
     bbox_query: Option<&BboxQuery>,
@@ -2325,17 +2338,6 @@ pub(super) struct CoalesceBuild {
     /// materialized or not — the same set [`coalesce_merged_anywhere`] covers,
     /// since a level omitted for having no rows has no chains to merge.
     merged: bool,
-}
-
-impl CoalesceBuild {
-    /// Every level's chain reps: the rows whose attributes the chains carry.
-    pub(super) fn rep_rows(&self) -> std::collections::BTreeSet<usize> {
-        self.tables
-            .iter()
-            .flatten()
-            .flat_map(|t| t.keys().copied())
-            .collect()
-    }
 }
 
 /// Whether a level with this zoom can be materialized under `ceiling`.
@@ -3517,12 +3519,17 @@ fn load_plan_state(
     let mut chains = None;
     let mut read_selection = None;
     if let Some(range) = &options.shard {
-        chains = shard_chain_tables(&mut plan, range, crs_memory, options, diagnostics)?;
+        let built = shard_chain_tables(&mut plan, range, crs_memory, options, diagnostics)?;
+        let reps = built
+            .as_ref()
+            .map(|(_, reps)| reps.clone())
+            .unwrap_or_default();
+        chains = built.map(|(build, _)| build);
         read_selection = super::plan_state::rebase_plan_for_shard(
             &mut plan,
             source,
             selected_row_groups,
-            chains.as_mut(),
+            (chains.as_mut(), &reps),
             path,
         )?;
         if let Some(read) = &read_selection {
@@ -3593,9 +3600,7 @@ fn load_plan_state(
     let ranking_provenance = plan.rank_provenance.clone();
     let entry_zoom = plan.entry_zoom.clone();
     let mut tables = plan.into_winner_tables()?;
-    if chains.is_some() {
-        tables.coalesce_build = chains;
-    }
+    tables.coalesce_build = chains;
     Ok(PlanState {
         tables,
         read_selection,
@@ -10050,6 +10055,24 @@ mod tests {
         let (ids, batches) = ids_read_in_order(&source, Some(&sel), 1);
         assert!(ids.is_empty(), "{ids:?}");
         assert_eq!(batches, 0);
+    }
+
+    /// #546 review: a feature at lng 179.9 is drawn at -180.1, inside the
+    /// buffer of the west-edge tiles, so the west-edge shard must read it.
+    /// Clamping the read margin at -180 lost that side of the wrap.
+    #[test]
+    fn shard_selection_keeps_its_read_margin_past_the_antimeridian() {
+        let coords = [(10.0, 10.0), (179.9, 10.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        // z4 tile x=0 spans lng -180..-157.5.
+        let id = crate::pmtiles_writer::tile_id(4, 0, 7);
+        let range = crate::shard::TileRange::new(4, id, id).unwrap();
+        let sel = select_row_groups_streaming(&source, None, None, Some(&range), Crs::Epsg4326)
+            .unwrap()
+            .expect("a shard always yields a selection");
+        assert_eq!(sel.parts(), &[vec![1usize]]);
     }
 
     /// #643: export draws a 0..360 feature stored at lng 200 at lng -160

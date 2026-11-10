@@ -952,13 +952,14 @@ fn a_shard_given_a_different_cut_than_the_plan_is_refused() {
 #[test]
 fn a_shard_that_owns_no_rows_writes_an_empty_archive_and_the_fleet_still_merges() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let plan = cut_plan(dir.path(), "4", "3");
+    let plan = cut_plan(dir.path(), "4", "4");
     let convert_plan = dir.path().join("convert.plan");
-    // A bbox confining the build to one corner of the world, so most of the
-    // four ranges own nothing at all.
-    // `--bbox=` rather than `--bbox -175,...`: a leading minus is a flag to
+    // A bbox confining the build to one patch of the world, away from the
+    // antimeridian (a shard reads across it, #546), so most of the four
+    // ranges own nothing at all.
+    // `--bbox=` rather than `--bbox -100,...`: a leading minus is a flag to
     // clap otherwise.
-    let bbox = "-175,-70,-120,-20";
+    let bbox = "-100,-70,-60,-20";
 
     let coarse = dir.path().join("coarse.pmtiles");
     let common = |extra: &[&str], out: &Path| -> Vec<String> {
