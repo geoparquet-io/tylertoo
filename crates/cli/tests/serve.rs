@@ -199,3 +199,49 @@ fn a_stalled_download_blocks_nothing() {
     handle.join().unwrap().unwrap();
     drop(stalled);
 }
+
+/// A directory entry claiming a body over the tile ceiling is refused
+/// before the read allocates it, as `decode` refuses it (#510).
+#[test]
+fn an_oversized_tile_body_is_refused_before_the_read() {
+    use tylertoo_core::internal::compression::{compress, MAX_TILE_BYTES};
+    use tylertoo_core::internal::pmtiles_writer::{encode_directory, DirEntry, Header};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("huge.pmtiles");
+    write_archive(&path, 1);
+    let mut out = std::fs::read(&path).unwrap();
+    let mut header = Header::from_bytes(&out[..127]).unwrap();
+    let body_len = MAX_TILE_BYTES + 1;
+    let root = [DirEntry {
+        tile_id: 0,
+        offset: 0,
+        length: u32::try_from(body_len).unwrap(),
+        run_length: 1,
+    }];
+    let enc = compress(&encode_directory(&root), header.internal_compression).unwrap();
+    header.root_dir_offset = out.len() as u64;
+    header.root_dir_length = enc.len() as u64;
+    out.extend_from_slice(&enc);
+    header.tile_data_offset = out.len() as u64;
+    header.tile_data_length = body_len;
+    out[..127].copy_from_slice(&header.to_bytes());
+    std::fs::write(&path, &out).unwrap();
+    // A sparse tail: the body exists on disk without taking the space.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(out.len() as u64 + body_len)
+        .unwrap();
+
+    let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0).unwrap();
+    let addr = server
+        .url()
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_owned();
+    std::thread::spawn(move || server.run(|| true));
+    let (code, _, body) = get(&addr, "/huge/0/0/0.mvt", "");
+    assert_eq!(code, 500);
+    assert!(String::from_utf8_lossy(&body).contains("tile ceiling"));
+}

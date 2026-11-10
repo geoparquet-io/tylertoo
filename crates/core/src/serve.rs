@@ -6,7 +6,9 @@
 //! its size, modification time or inode changes.
 
 use crate::archive_index::ArchiveIndex;
-use crate::compression::{decompress, decompress_capped, Compression, MAX_INTERNAL_BYTES};
+use crate::compression::{
+    decompress, decompress_capped, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES,
+};
 use crate::error::{Classify, ErrorKind};
 use crate::pmtiles_writer::TileType;
 use crate::stats::{compute_stats, DEFAULT_LARGEST};
@@ -347,6 +349,14 @@ fn tile(index: &ArchiveIndex, z: u8, x: u32, y: u32) -> Response<Box<dyn Read + 
         Ok(None) => return status(204),
         Err(e) => return error(&e),
     };
+    // The length is the directory's claim: capped before the read allocates
+    // it, as `decode` does (#510).
+    if range.len() as u64 > MAX_TILE_BYTES {
+        return error(&format!(
+            "tile {z}/{x}/{y}: compressed body of {} bytes exceeds the {MAX_TILE_BYTES}-byte tile ceiling",
+            range.len()
+        ));
+    }
     let bytes = match index.read_range(range) {
         Ok(b) => b,
         Err(e) => return error(&e),

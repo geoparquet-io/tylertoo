@@ -40,7 +40,7 @@ const $ = (id) => document.getElementById(id);
 const text = (s) => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
 let drawn = [], loading = 0;
 
-async function load(name) {
+async function load(name, fit) {
   // A newer selection wins: drop this one's results once it is stale.
   const me = ++loading;
   const tj = await (await fetch(`/${encodeURIComponent(name)}.json`)).json();
@@ -76,7 +76,7 @@ async function load(name) {
       $("layers").append(box);
     });
   }
-  if (!location.hash) map.fitBounds(tj.bounds, { animate: false, padding: 20 });
+  if (fit) map.fitBounds(tj.bounds, { animate: false, padding: 20 });
   $("stats").innerHTML = "<table><tr><th>z</th><th>tiles</th><th>bytes</th><th>max</th></tr>" +
     st.per_zoom.map((r) => `<tr><td>${r.z}</td><td>${r.tile_count.toLocaleString()}</td>` +
       `<td>${r.total_bytes.toLocaleString()}</td><td>${r.max_bytes.toLocaleString()}</td></tr>`).join("") + "</table>";
@@ -91,8 +91,9 @@ map.on("mousemove", (e) => {
 map.on("load", async () => {
   const names = await (await fetch("/index.json")).json();
   for (const n of names) $("archive").add(new Option(n, n));
-  $("archive").onchange = (e) => load(e.target.value);
-  await load(names[0]);
+  $("archive").onchange = (e) => load(e.target.value, true);
+  // A shared link's #zoom/lat/lng wins over the first archive's bounds.
+  await load(names[0], !location.hash);
 });
 </script>
 </body>
