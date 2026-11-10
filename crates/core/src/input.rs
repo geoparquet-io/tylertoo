@@ -802,7 +802,7 @@ pub(crate) fn url_scheme(input: &str) -> Option<&str> {
 /// So that a re-signed URL still matches its plan while `?file=a` and
 /// `?file=b` do not, the parameters a re-signing does not change are hashed
 /// into a tag, `?<redacted:1a2b3c4d>`; the signing parameters
-/// ([`signing_params`]) are left out. A signing parameter missing from that
+/// (`signing_params`) are left out. A signing parameter missing from that
 /// list only makes a re-signed URL fail its plan check, loudly.
 pub fn redact_query(input: &str) -> std::borrow::Cow<'_, str> {
     let end = input.find('#').unwrap_or(input.len());
