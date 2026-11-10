@@ -1459,6 +1459,22 @@ pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> Result<u8, Expo
 /// memory.
 const DEFAULT_PARTITION_TARGET: usize = 32_768;
 
+/// The partition target under `--profile bounded` (#815): a quarter of
+/// [`DEFAULT_PARTITION_TARGET`]. A wave keeps one partition per core, so its
+/// resident members shrink by the same factor while every core still encodes
+/// a partition; the archive does not depend on the target. Export levels set
+/// bounded's peak on large inputs (NZ parcels 4,458 -> 2,742 MiB, `BR_MT` 4,423
+/// -> 2,384 MiB export-only, byte-identical).
+const BOUNDED_PARTITION_TARGET: usize = DEFAULT_PARTITION_TARGET / 4;
+
+/// The production partition target for `profile`.
+fn export_partition_target(profile: MemoryProfile) -> usize {
+    match profile {
+        MemoryProfile::Bounded => BOUNDED_PARTITION_TARGET,
+        MemoryProfile::Auto | MemoryProfile::Speed => DEFAULT_PARTITION_TARGET,
+    }
+}
+
 /// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing.
 ///
 /// The size comes from the machine's available parallelism (see
@@ -2002,7 +2018,12 @@ pub fn export_pmtiles(
     output_path: impl AsRef<Path>,
     options: &ExportOptions,
 ) -> Result<ExportReport, ExportError> {
-    export_pmtiles_with_partition_target(input_path, output_path, options, DEFAULT_PARTITION_TARGET)
+    export_pmtiles_with_partition_target(
+        input_path,
+        output_path,
+        options,
+        export_partition_target(options.profile),
+    )
 }
 
 /// Implementation of [`export_pmtiles`] with an explicit partition-size target,
@@ -17906,6 +17927,21 @@ mod tests {
             std::fs::read_dir(dir.path()).unwrap().count(),
             0,
             "spill file removed"
+        );
+    }
+
+    /// #815: a bounded wave of one partition per core holds a quarter of the
+    /// members an auto wave does (2 Mi on 64 cores, which set bounded's peak
+    /// on NZ parcels and `BR_MT`), and auto keeps its target.
+    #[test]
+    fn bounded_waves_hold_a_quarter_of_the_members() {
+        assert_eq!(
+            64 * export_partition_target(MemoryProfile::Bounded),
+            512 * 1024
+        );
+        assert_eq!(
+            export_partition_target(MemoryProfile::Auto),
+            DEFAULT_PARTITION_TARGET
         );
     }
 
