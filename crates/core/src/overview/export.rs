@@ -173,13 +173,6 @@ struct PartitionBudget {
     fit_limit: Option<MemoryLimit>,
 }
 
-struct FanoutRows<'a> {
-    plans: &'a [LevelPlan],
-    targets: &'a [usize],
-    per_level: Vec<RowMembers>,
-    row_gaps: &'a [(u64, u16)],
-}
-
 #[derive(Clone, Copy)]
 struct TileTarget<'a> {
     zoom: u8,
@@ -4418,6 +4411,31 @@ fn key_to_xy(key: u64, zoom: u8) -> (u32, u32) {
     (x, y)
 }
 
+/// A member's geometry: its own, or the feature's decoded geometry shared by
+/// every level whose tile holds the feature unclipped (#815: the partitioning
+/// fill held one copy per level). Reads as a plain [`Geometry`].
+enum MemberGeom {
+    Owned(Geometry<f64>),
+    Shared(Arc<Geometry<f64>>),
+}
+
+impl std::ops::Deref for MemberGeom {
+    type Target = Geometry<f64>;
+
+    fn deref(&self) -> &Geometry<f64> {
+        match self {
+            MemberGeom::Owned(g) => g,
+            MemberGeom::Shared(g) => g,
+        }
+    }
+}
+
+impl From<Geometry<f64>> for MemberGeom {
+    fn from(g: Geometry<f64>) -> Self {
+        MemberGeom::Owned(g)
+    }
+}
+
 /// One tile member: a feature's clipped geometry destined for the tile with
 /// key `key`, the feature's band-order sequence number (stable within-tile
 /// ordering), the feature's MVT properties (shared across the feature's tile
@@ -4427,7 +4445,7 @@ fn key_to_xy(key: u64, zoom: u8) -> (u32, u32) {
 struct Member {
     key: u64,
     seq: u64,
-    geom: Geometry<f64>,
+    geom: MemberGeom,
     props: SharedProps,
     /// `Some` on every member when [`ExportOptions::feature_id`] is set
     /// (every row of the file validated up front, #443); `None` when it is
@@ -5157,7 +5175,7 @@ fn decode_member(cur: &mut SpillCursor<'_>, names: &mut SpillNames) -> Result<Me
     Ok(Member {
         key,
         seq,
-        geom,
+        geom: geom.into(),
         props: Arc::new(props),
         id,
         gap,
@@ -5566,11 +5584,14 @@ fn fill_member_store(
     Ok(store)
 }
 
-/// Decode one band batch and fan its members out: clip every feature (in
-/// parallel) at each including level's zoom over the **full** key range, then
-/// route each member to its `(level, partition wave)` bucket. The legacy
-/// analogue is [`finish_group`]; see the section comment for why the
-/// results are byte-identical.
+/// Decode one band batch and fan its members out: per including level, clip
+/// every feature (in parallel) at the level's zoom over the **full** key
+/// range, then route each member to its `(level, partition wave)` bucket
+/// before the next level is clipped, so one level's clipped batch is held at
+/// a time. A member the clip left whole shares the feature's decoded
+/// geometry with every other level's (#815). The legacy analogue is
+/// [`finish_group`]; see the section comment for why the results are
+/// byte-identical.
 fn fanout_batch_members(
     batch: &RecordBatch,
     band: usize,
@@ -5593,6 +5614,7 @@ fn fanout_batch_members(
     let geoms = decode_batch_geometries(batch, &schema, geom_idx, crs, timers, diagnostics)?;
     let row_gaps = ExportTimers::time(&timers.decode, || gaps.batch(&geoms));
     debug_assert!(row_gaps.iter().all(|&(_, b)| usize::from(b) == band));
+    let geoms: Vec<Arc<Geometry<f64>>> = geoms.into_iter().map(Arc::new).collect();
 
     // Band `j` belongs to every level `k >= j`'s render set (partitioning
     // prefix). A level with no planned partitions sized no tiles, so no
@@ -5601,47 +5623,87 @@ fn fanout_batch_members(
     let targets: Vec<usize> = (band..plans.len())
         .filter(|&k| !plans[k].partitions.is_empty())
         .collect();
-    // `[target][row]` -> the row's `(key, clipped geometry)` members at that
-    // target level.
-    let per_level: Vec<RowMembers> = targets
-        .iter()
-        .map(|&k| {
-            geoms
-                .par_iter()
-                .map(|g| {
-                    ExportTimers::time(&timers.clip, || {
-                        let finest = (k + 1 == plans.len()).then_some(plans[k].zoom);
-                        let g = finest_zoom_geometry(g, finest, opts, diagnostics);
-                        feature_tile_members(&g, plans[k].zoom, opts, 0, u64::MAX, diagnostics)
-                    })
-                })
-                .collect()
-        })
-        .collect();
-    drop(geoms);
 
-    // #535: the rest (property extraction + routing into the store) is
-    // `decode`, minus any spill flush a `store.push` triggers, which the fill
-    // charges to `spill_write` instead.
+    // #535: property extraction and routing into the store are `decode`,
+    // minus any spill flush a `store.push` triggers, which the fill charges
+    // to `spill_write` instead.
     let t_route = Instant::now();
     let flushed_before = store.flush_time;
+    // Each row's properties, materialized once and shared via `Arc` by its
+    // members at every level (as the legacy path does per wave).
     let cols = AttrColumns::new(&schema, geom_idx, published, feature_id);
-    let routed = route_fanout_rows(
-        batch,
-        &cols,
-        FanoutRows {
-            plans,
-            targets: &targets,
-            per_level,
-            row_gaps: &row_gaps,
-        },
-        seq,
-        store,
-        diagnostics,
-    );
+    let mut attrs = cols.extract(batch);
+    let rows: Vec<(SharedProps, Option<u64>)> = (0..batch.num_rows())
+        .map(|row| attrs.row(row))
+        .collect::<Result<_, _>>()?;
+    for (row, (_, id)) in rows.iter().enumerate() {
+        if let Some(id) = *id {
+            for &k in &targets {
+                diagnostics.source_member_loss(
+                    *seq + row as u64,
+                    id,
+                    plans[k].zoom,
+                    crate::diagnostics::SourceLossCause::ClipDropped,
+                )?;
+            }
+        }
+    }
+    let mut routed = t_route.elapsed();
+    for &k in &targets {
+        let plan = &plans[k];
+        let finest = (k + 1 == plans.len()).then_some(plan.zoom);
+        let clipped: RowMembers = geoms
+            .par_iter()
+            .map(|g| {
+                ExportTimers::time(&timers.clip, || {
+                    let g = finest_zoom_geometry(g, finest, opts, diagnostics);
+                    feature_tile_members(&g, plan.zoom, opts, 0, u64::MAX, diagnostics)
+                })
+            })
+            .collect();
+        let t_level = Instant::now();
+        for (row, items) in clipped.into_iter().enumerate() {
+            let (props, id) = &rows[row];
+            let (gap, band) = row_gaps[row];
+            for (key, geom) in items {
+                let pidx = route_partition(&plan.partitions, key);
+                store.push(
+                    k,
+                    pidx / plan.wave.max(1),
+                    Member {
+                        key,
+                        seq: *seq + row as u64,
+                        geom: shared_or_owned(geom, &geoms[row]),
+                        props: Arc::clone(props),
+                        id: *id,
+                        gap,
+                        band,
+                    },
+                )?;
+            }
+        }
+        routed += t_level.elapsed();
+    }
+    *seq += batch.num_rows() as u64;
     let flushed = store.flush_time.saturating_sub(flushed_before);
-    add_nanos(&timers.decode, t_route.elapsed().saturating_sub(flushed));
-    routed
+    add_nanos(&timers.decode, routed.saturating_sub(flushed));
+    Ok(())
+}
+
+/// `clipped` as a member geometry: the feature's shared `source` when the
+/// clip left it whole, bit for bit, else its own.
+fn shared_or_owned(clipped: Geometry<f64>, source: &Arc<Geometry<f64>>) -> MemberGeom {
+    let same_bits = || {
+        clipped
+            .coords_iter()
+            .zip(source.coords_iter())
+            .all(|(a, b)| a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits())
+    };
+    if clipped == **source && same_bits() {
+        MemberGeom::Shared(Arc::clone(source))
+    } else {
+        MemberGeom::Owned(clipped)
+    }
 }
 
 /// Per row of a batch, the row's `(key, clipped geometry)` members at one
@@ -5655,70 +5717,6 @@ type RowMembers = Vec<Vec<(u64, Geometry<f64>)>>;
 /// materializing a row costs a refcount bump per property, not a `String`
 /// allocation.
 type SharedProps = Arc<Vec<(Arc<str>, PropertyValue)>>;
-
-/// [`fanout_batch_members`]' second half: attach each member-producing row's
-/// properties (materialized once per row, shared via `Arc`) and push its
-/// members into their `(level, wave)` store buckets, in band order.
-fn route_fanout_rows(
-    batch: &RecordBatch,
-    cols: &AttrColumns<'_>,
-    inputs: FanoutRows<'_>,
-    seq: &mut u64,
-    store: &mut MemberStore,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<(), ExportError> {
-    let FanoutRows {
-        plans,
-        targets,
-        mut per_level,
-        row_gaps,
-    } = inputs;
-    // Extract property columns once per batch; materialize per-feature props
-    // only for rows that produced members at any level, shared across the
-    // row's members via `Arc` (as the legacy path does per wave).
-    let mut attrs = cols.extract(batch);
-    for row in 0..batch.num_rows() {
-        let (props, id) = attrs.row(row)?;
-        if let Some(id) = id {
-            for &k in targets {
-                diagnostics.source_member_loss(
-                    *seq,
-                    id,
-                    plans[k].zoom,
-                    crate::diagnostics::SourceLossCause::ClipDropped,
-                )?;
-            }
-        }
-        if per_level.iter().all(|rows| rows[row].is_empty()) {
-            *seq += 1;
-            continue;
-        }
-        let (gap, band) = row_gaps[row];
-        for (ti, &k) in targets.iter().enumerate() {
-            let items = std::mem::take(&mut per_level[ti][row]);
-            let plan = &plans[k];
-            for (key, geom) in items {
-                let pidx = route_partition(&plan.partitions, key);
-                let wave = pidx / plan.wave.max(1);
-                store.push(
-                    k,
-                    wave,
-                    Member {
-                        key,
-                        seq: *seq,
-                        geom,
-                        props: Arc::clone(&props),
-                        id,
-                        gap,
-                        band,
-                    },
-                )?;
-            }
-        }
-        *seq += 1;
-    }
-    Ok(())
-}
 
 /// Pass-2 drain for one wave under the single-read path: take the wave's
 /// buffered members, bucket them per partition (exactly as
@@ -7409,7 +7407,7 @@ fn collect_member_chunk(
             out.buckets[route_partition(input.wave, key)].push(Member {
                 key,
                 seq: source_row,
-                geom,
+                geom: geom.into(),
                 props: Arc::clone(&props),
                 id,
                 gap,
@@ -8734,7 +8732,8 @@ fn fill_features(
     let proj = crate::mvt::TileProjector::new(tb, opts.extent);
     // A polygon fill takes a polygon's tags when the tile has polygons: a
     // road's or a point's would colour it by the wrong attributes.
-    let polygonal = |m: &Member| matches!(m.geom, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
+    let polygonal =
+        |m: &Member| matches!(*m.geom, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
     let any_polygon = members.iter().any(polygonal);
     let hosts: Vec<[f64; 4]> = members
         .iter()
@@ -9213,7 +9212,7 @@ fn merge_to_fit(
         }
         let cached = quantized.get_or_insert_with(|| {
             crate::mvt::QuantizedPolygons::new(
-                ordered.iter().map(|m| (&m.geom, u64::from(m.band))),
+                ordered.iter().map(|m| (&*m.geom, u64::from(m.band))),
                 tb,
                 opts.extent,
             )
@@ -9597,7 +9596,7 @@ fn encode_level_tiles(
             members.push(Member {
                 key,
                 seq,
-                geom,
+                geom: geom.into(),
                 props: Arc::clone(&props),
                 id,
                 gap,
@@ -13084,7 +13083,7 @@ mod tests {
         let member = |geom: Geometry| Member {
             key: 0,
             seq: 0,
-            geom,
+            geom: geom.into(),
             props: Arc::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
@@ -13154,7 +13153,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: i as u64,
-                    geom,
+                    geom: geom.into(),
                     props: Arc::new(props),
                     id: None,
                     gap: GAP_NONE,
@@ -13786,7 +13785,7 @@ mod tests {
         let m = Member {
             key,
             seq: 0,
-            geom: geom.clone(),
+            geom: geom.clone().into(),
             props: Arc::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
@@ -13890,7 +13889,8 @@ mod tests {
                             geo::coord! { x: x + dx, y: y + dy },
                         )
                         .to_polygon(),
-                    ),
+                    )
+                    .into(),
                     props: Arc::new(vec![(Arc::from("n"), PropertyValue::UInt(i))]),
                     id: Some(i),
                     gap: if i == 0 { GAP_NONE } else { 10 },
@@ -14122,7 +14122,8 @@ mod tests {
                     geo::coord! { x: lng1, y: tb.lat_max },
                 )
                 .to_polygon(),
-            ),
+            )
+            .into(),
             props: Arc::new(vec![(
                 Arc::from("name"),
                 PropertyValue::String(name.to_string()),
@@ -16596,7 +16597,7 @@ mod tests {
         let member = Member {
             key: tile_key(tiles[0].x, tiles[0].y, 4),
             seq: 0,
-            geom: poly.clone(),
+            geom: poly.clone().into(),
             props: Arc::new(vec![]),
             id: None,
             gap: GAP_NONE,
@@ -16999,7 +17000,7 @@ mod tests {
                 members.push(Member {
                     key,
                     seq: i as u64,
-                    geom,
+                    geom: geom.into(),
                     props: Arc::clone(&props),
                     id: None,
                     gap,
@@ -17271,7 +17272,7 @@ mod tests {
         Member {
             key: 0,
             seq,
-            geom: Geometry::Point(Point::new(x, y)),
+            geom: Geometry::Point(Point::new(x, y)).into(),
             props: Arc::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
@@ -17287,7 +17288,7 @@ mod tests {
         Member {
             key: 0,
             seq,
-            geom: Geometry::Point(Point::new(seq as f64 * 0.001, 0.0)),
+            geom: Geometry::Point(Point::new(seq as f64 * 0.001, 0.0)).into(),
             props: Arc::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
             gap: GAP_NONE,
@@ -17445,7 +17446,7 @@ mod tests {
         let mk = |key: u64, seq: u64, level: f64| Member {
             key,
             seq,
-            geom: Geometry::Point(Point::new(0.0, 0.0)),
+            geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
             props: Arc::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
             gap: GAP_NONE,
@@ -17477,7 +17478,7 @@ mod tests {
         let mk = |seq: u64, v: PropertyValue| Member {
             key: 0,
             seq,
-            geom: Geometry::Point(Point::new(0.0, 0.0)),
+            geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
             props: Arc::new(vec![("n".into(), v)]),
             id: None,
             gap: GAP_NONE,
@@ -17537,7 +17538,7 @@ mod tests {
         let kept = select_kept_members(&members, 5);
         let xs: Vec<f64> = kept
             .iter()
-            .map(|m| match &m.geom {
+            .map(|m| match &*m.geom {
                 Geometry::Point(p) => p.x(),
                 _ => unreachable!("built points"),
             })
@@ -17557,7 +17558,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: n as u64,
-                    geom: Geometry::LineString(LineString::from(coords)),
+                    geom: Geometry::LineString(LineString::from(coords)).into(),
                     props: Arc::new(Vec::new()),
                     id: None,
                     gap: GAP_NONE,
@@ -17666,7 +17667,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: i,
-                    geom: Geometry::LineString(coords.into_iter().collect()),
+                    geom: Geometry::LineString(coords.into_iter().collect()).into(),
                     props: Arc::new(vec![("level".into(), PropertyValue::Double(i as f64))]),
                     id: None,
                     gap: GAP_NONE,
@@ -17818,7 +17819,7 @@ mod tests {
             let m = Member {
                 key: tile_key(7, 11, 5) + i as u64,
                 seq: u64::MAX - i as u64,
-                geom: g,
+                geom: g.into(),
                 props: Arc::new(props.clone()),
                 id,
                 // #745: both the "no predecessor" sentinel and real values.
@@ -17908,6 +17909,83 @@ mod tests {
         );
     }
 
+    /// #815: in a partitioning fill a feature that no level clips is held
+    /// once. Every level's member of it shares the decoded geometry, where
+    /// each level held its own copy (the copies were most of a Moldova
+    /// partitioning export's peak heap).
+    #[test]
+    fn partitioning_fill_holds_an_unclipped_feature_once() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let square = |x: f64, y: f64| {
+            Geometry::Polygon(geo::Polygon::new(
+                LineString::from(vec![(x, y), (x + 0.1, y), (x + 0.1, y + 0.1), (x, y)]),
+                vec![],
+            ))
+        };
+        // Squares well inside one tile at every level's zoom (z2, z4, z6).
+        let meta = write_partitioning_fixture(
+            tmp.path(),
+            &[
+                (vec![0, 1], vec![square(-100.3, 40.3), square(10.3, 10.3)]),
+                (vec![2], vec![square(50.3, -20.3)]),
+                (vec![3], vec![square(-60.3, 5.3)]),
+            ],
+        );
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        let opts = ExportOptions::default();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let scans = scan_all_levels(
+            &reader,
+            test_band(&band_source(&reader)),
+            Crs::Epsg4326,
+            &opts,
+            &ExportTimers::default(),
+            None,
+            &diagnostics,
+        )
+        .unwrap();
+        let plans: Vec<LevelPlan> = scans
+            .iter()
+            .enumerate()
+            .map(|(k, scan)| {
+                let zoom = zoom_for_level(&meta, k).unwrap();
+                let partitions = plan_partitions(&scan.tile_counts, zoom, DEFAULT_PARTITION_TARGET);
+                let wave = partitions.len().max(1);
+                LevelPlan {
+                    zoom,
+                    partitions,
+                    wave,
+                }
+            })
+            .collect();
+        let store = fill_member_store(
+            &reader,
+            &FanoutCtx {
+                crs: Crs::Epsg4326,
+                plans: &plans,
+                opts: &opts,
+                published: &PublishedNames::from_reader(&reader),
+                feature_id: None,
+                timers: &ExportTimers::default(),
+            },
+            StoreBacking {
+                backing: SinkBacking::Ram,
+                ram_budget: MEMBER_STORE_RAM_BUDGET,
+                resident: 0,
+            },
+            &diagnostics,
+        )
+        .unwrap();
+        let members: Vec<&Member> = store.buckets.iter().flatten().flatten().collect();
+        // At least one member per feature and level it renders at.
+        assert!(members.len() >= 2 + 3 + 4, "{}", members.len());
+        let held: HashSet<*const Geometry<f64>> = members
+            .iter()
+            .map(|m| std::ptr::from_ref::<Geometry<f64>>(&m.geom))
+            .collect();
+        assert_eq!(held.len(), 4, "one geometry per feature");
+    }
+
     /// The member store's spill path: bucket flushes append segments to one
     /// temp file; `take_wave` reads a wave's segments back in append order
     /// (plus any RAM remainder), returning exactly the members pushed to it.
@@ -17924,7 +18002,7 @@ mod tests {
         let mk = |key: u64, seq: u64| Member {
             key,
             seq,
-            geom: Geometry::Point(Point::new(seq as f64, -1.0)),
+            geom: Geometry::Point(Point::new(seq as f64, -1.0)).into(),
             props: Arc::new(vec![("id".into(), PropertyValue::Int(seq as i64))]),
             id: None,
             gap: GAP_NONE,
@@ -17955,7 +18033,7 @@ mod tests {
         let m = |props: Vec<(Arc<str>, PropertyValue)>| Member {
             key: 0,
             seq: 0,
-            geom: Geometry::LineString(LineString::from(vec![(0.0, 0.0), (1.0, 1.0)])),
+            geom: Geometry::LineString(LineString::from(vec![(0.0, 0.0), (1.0, 1.0)])).into(),
             props: Arc::new(props),
             id: None,
             gap: GAP_NONE,
@@ -17988,7 +18066,7 @@ mod tests {
         let mk = |seq: u64, props: Vec<(Arc<str>, PropertyValue)>| Member {
             key: 0,
             seq,
-            geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+            geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
             props: Arc::new(props),
             id: None,
             gap: GAP_NONE,
@@ -18042,7 +18120,7 @@ mod tests {
         let member = |seq: u64| Member {
             key: 0,
             seq,
-            geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+            geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
             props: Arc::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
@@ -18091,7 +18169,7 @@ mod tests {
                     Member {
                         key: 0,
                         seq,
-                        geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+                        geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
                         props: Arc::new(vec![(name, PropertyValue::UInt(seq))]),
                         id: None,
                         gap: GAP_NONE,
@@ -20324,7 +20402,7 @@ mod tests {
                     .map(|seq| Member {
                         key: 0,
                         seq,
-                        geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+                        geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
                         props: Arc::new(Vec::new()),
                         id: None,
                         gap: GAP_NONE,
@@ -20356,7 +20434,8 @@ mod tests {
                 geom: Geometry::Point(Point::new(
                     -170.0 + (i % 300) as f64 * 0.5,
                     10.0 + (i / 300) as f64 * 0.5,
-                )),
+                ))
+                .into(),
                 props: Arc::new(Vec::new()),
                 id: None,
                 gap: GAP_NONE,
@@ -20438,7 +20517,7 @@ mod diagnostic_row_alignment {
                 .map(|(row, geom)| Member {
                     key: 0,
                     seq: row as u64,
-                    geom,
+                    geom: geom.into(),
                     props: Arc::new(vec![]),
                     id: Some(100 + row as u64),
                     gap: if row == 0 { GAP_NONE } else { 1 },
@@ -20527,7 +20606,7 @@ mod diagnostic_row_alignment {
                 Member {
                     key: 0,
                     seq: row as u64,
-                    geom,
+                    geom: geom.into(),
                     id: Some(7),
                     props: Arc::new(vec![]),
                     gap: GAP_NONE,
@@ -20584,7 +20663,7 @@ mod diagnostic_row_alignment {
         let members = vec![Member {
             key: 0,
             seq: 0,
-            geom: triangle,
+            geom: triangle.into(),
             props: Arc::new(vec![]),
             id: Some(7),
             gap: GAP_NONE,

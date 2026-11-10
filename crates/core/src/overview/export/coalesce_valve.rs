@@ -293,7 +293,7 @@ impl Merged<'_> {
         }
         self.members
             .iter()
-            .map(|&i| match &self.ordered[i].geom {
+            .map(|&i| match &*self.ordered[i].geom {
                 Geometry::Rect(_) => 5,
                 Geometry::Triangle(_) => 4,
                 g => g.coords_count(),
@@ -461,7 +461,7 @@ mod tests {
         Member {
             key: 0,
             seq,
-            geom,
+            geom: geom.into(),
             props: Arc::new(vec![(Arc::from("n"), crate::mvt::PropertyValue::UInt(seq))]),
             id: Some(seq * 10),
             gap,
@@ -714,7 +714,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out
             .iter()
-            .all(|m| std::ptr::eq(m.geometry(), &m.target.geom)));
+            .all(|m| std::ptr::eq(m.geometry(), &*m.target.geom)));
     }
 
     #[test]
