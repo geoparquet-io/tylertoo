@@ -25,8 +25,17 @@
 //! of a comparison. String literals escape an embedded quote by doubling it
 //! (`'it''s'`). `= NULL` is rejected with a hint to use `IS NULL`.
 //!
-//! TODO(docs): LIKE / ILIKE pattern syntax (`%`, `_`, backslash escape),
-//! ILIKE case folding, and literal-prefix pruning.
+//! `LIKE` and `ILIKE` require a string column. In patterns, `%` matches any
+//! run of characters, including none, and `_` matches exactly one character.
+//! A backslash escapes the next character: `'50\%'` matches the literal
+//! `50%`. A trailing backslash is literal. There is no `ESCAPE` clause.
+//! `LIKE` is case-sensitive; `ILIKE` uses Unicode simple case folding:
+//! `'são%'` matches `'SÃO PAULO'`, but `ß` does not match `SS`.
+//! A NULL value yields UNKNOWN, so both `LIKE` and `NOT LIKE` drop the row;
+//! the same holds for `ILIKE` and `NOT ILIKE`.
+//! A case-sensitive `LIKE` with a literal prefix, such as `'São%'`, prunes
+//! row groups using min/max statistics, like `=`. `ILIKE`, `NOT LIKE`, and
+//! `NOT ILIKE` prune only all-null row groups.
 //!
 //! # Null semantics (SQL three-valued logic)
 //!

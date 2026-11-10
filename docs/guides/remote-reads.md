@@ -47,6 +47,7 @@ gpio sort hilbert raw.parquet sorted.parquet --add-bbox \
   `crop_type IN ('soy', 'corn')`.
 
 Attribute filters support comparison operators, `IN`, `IS [NOT] NULL`,
+`[NOT] LIKE` (case-sensitive patterns), `[NOT] ILIKE` (patterns that ignore case),
 `AND`, `OR`, `NOT`, parentheses, quoted strings, numbers, quoted column names,
 and timestamp comparisons against date strings interpreted as Coordinated
 Universal Time (UTC). Nulls follow SQL three-valued logic: a row is kept only
