@@ -660,12 +660,17 @@ pub struct ConvertOptions {
     #[cfg_attr(feature = "cli", arg(long = "accumulate-attribute", id = "accumulate_attributes", value_name = "COL:OP", help_heading = "Clustering", value_parser = parse_accumulate))]
     #[cfg_attr(feature = "cli", arg(help = "Aggregate a numeric column over each cluster as `COL:OP`, where `OP` is `sum`, `max`, `min`, or `mean` (repeatable). Requires `--cluster`", long_help = None))]
     pub accumulate: Vec<AccumulateSpec>,
-    /// TODO(docs)
+    /// Count a string column's values per cluster in `COL:value` INT64 columns.
+    /// Keep up to 100 values, ranked by frequency then ascending value; count
+    /// the rest, nulls, and literal `other` in `COL:other` when needed.
+    /// Null count cells mean zero; unclustered points count 1 for their own
+    /// value, and each row's counts sum to `point_count`.
+    /// Requires [`cluster`](Self::cluster). Off by default.
     #[cfg_attr(
         feature = "cli",
         arg(long, value_name = "COL", help_heading = "Clustering")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "TODO(docs)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Count a string column's values per cluster in `COL:value` columns (up to 100 values plus `other`, requires `--cluster`)", long_help = None))]
     pub cluster_categories: Option<String>,
     /// Enable line network coalescing (plan Q3). **Default `true`** (like
     /// `line_thinning = 1.0` and the clustering point grid, chosen by

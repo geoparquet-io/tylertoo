@@ -426,6 +426,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | --- | --- |
 | `--cluster` | Merge each thinning cell's points into its surviving point, which gains a `point_count` column. Duplicating mode only. |
 | `--accumulate-attribute <COL:OP>` | Aggregate a numeric column over each cluster as `COL:OP`, where `OP` is `sum`, `max`, `min`, or `mean` (repeatable). Requires `--cluster`. |
+| `--cluster-categories <COL>` | Count a string column's values per cluster in `COL:value` columns (up to 100 values plus `other`, requires `--cluster`). |
 
 ### Line coalescing
 

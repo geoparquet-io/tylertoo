@@ -408,17 +408,17 @@ pub struct ClusteringProvenance {
     /// Columns whose values were aggregated across clustered points.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accumulated: Vec<AccumulatedColumn>,
-    /// TODO(docs)
+    /// Category count columns whose per-row sum equals `point_count`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub categories: Option<ClusterCategories>,
 }
 
-/// TODO(docs)
+/// Source column and value slots for per-cluster category counts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClusterCategories {
-    /// TODO(docs)
+    /// Source string column name, used as the `COLUMN:value` prefix.
     pub column: String,
-    /// TODO(docs)
+    /// Value labels in count-column order, including `other` when needed.
     pub values: Vec<String>,
 }
 
