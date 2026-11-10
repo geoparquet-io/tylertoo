@@ -1412,7 +1412,7 @@ pub(super) fn run_pass2_buffered(
     );
     #[cfg(test)]
     spill_tests::DRAIN_WIDTH.with(|c| c.set(width));
-    writer.set_encode_concurrency(width);
+    writer.set_encode_concurrency(width)?;
     for li in 0..num_levels {
         let sink = std::mem::replace(&mut sinks[li], LevelSink::Ram(Vec::new()));
         let t_drain_level = Instant::now();
@@ -1425,7 +1425,9 @@ pub(super) fn run_pass2_buffered(
         );
         outcomes.push(outcome);
     }
-    writer.set_encode_concurrency(writer_units);
+    // Drains the widened encodes past `writer_units` before the caller
+    // releases the read grants they were priced against.
+    writer.set_encode_concurrency(writer_units)?;
 
     if let Some(per_row) = tuner.bytes_per_row() {
         // #626: the number the up-front estimate could only guess at. Info

@@ -658,9 +658,21 @@ impl<W: Write + Send> OverviewWriter<W> {
 
     /// Re-grant the encode concurrency between levels (#817 B1): pass 2's
     /// drain reuses the bytes its finished read held. Boundaries are decided
-    /// serially, so the file is identical at any value.
-    pub(super) fn set_encode_concurrency(&mut self, units: usize) {
+    /// serially, so the file is identical at any value. Lowering it appends
+    /// the oldest in-flight row groups until at most `units` remain, so the
+    /// memory a wider grant priced is free once this returns.
+    ///
+    /// # Errors
+    ///
+    /// A drained row group's encode or append failed (the writer is poisoned).
+    pub(super) fn set_encode_concurrency(&mut self, units: usize) -> Result<(), WriterError> {
         self.options.encode_concurrency = units.max(1);
+        while self.rg_inflight.len() > self.options.encode_concurrency {
+            if let Some((_, rx)) = self.rg_inflight.pop_front() {
+                self.drain_encoded(rx)?;
+            }
+        }
+        Ok(())
     }
 
     /// Test-only: arm the encode-task fault injection (#426).
@@ -3515,6 +3527,42 @@ mod tests {
                 assert!(!dest.exists(), "nothing published");
             },
         );
+    }
+
+    /// #817 review: lowering the encode concurrency drains the in-flight
+    /// row groups down to it, so encodes a wider drain left running are not
+    /// still holding memory once its caller hands that memory back.
+    #[test]
+    fn lowering_encode_concurrency_drains_down_to_it() {
+        within("lowering_encode_concurrency_drains_down_to_it", || {
+            let schema = Arc::new(source_schema());
+            let mut opts = duplicating_options();
+            opts.encode_concurrency = 4;
+            opts.overlap_levels = true;
+            opts.row_group_size_policy = RowGroupSizePolicy::Constant;
+            opts.max_row_group_size = 1;
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            let ids: Vec<i64> = (0..4).collect();
+            writer
+                .write_level(
+                    0,
+                    Some(ids.len()),
+                    vec![source_batch(&schema, &ids)].into_iter(),
+                )
+                .map(drop)
+                .unwrap();
+            assert!(
+                writer.rg_inflight.len() > 1,
+                "the fixture must leave several in flight"
+            );
+            writer.set_encode_concurrency(1).unwrap();
+            assert!(
+                writer.rg_inflight.len() <= 1,
+                "{} in flight",
+                writer.rg_inflight.len()
+            );
+        });
     }
 
     /// #817: without `overlap_levels` (bounded) a level drains
