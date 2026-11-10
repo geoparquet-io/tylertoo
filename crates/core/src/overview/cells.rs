@@ -480,9 +480,22 @@ impl Cells {
                     };
                     (slots + held, new + k as u64)
                 });
-        slots * cell_bytes(specs) + category_bytes + new * FIRST_COUNTS_BYTES
+        RSS_PER_PRICED_BYTE
+            * (slots * cell_bytes(specs) + category_bytes + new * FIRST_COUNTS_BYTES)
     }
 }
+
+/// Resident bytes per byte the cells are priced at. Measured on 10.1M points
+/// in 927k grid cells with 275 categories (#332): 694 MB resident after the
+/// scan against 308 MB priced plus 37 MB of read-ahead. The gap is the
+/// allocator holding the batches' freed partial maps and the map's
+/// pre-growth tables, and each cell's own small allocations.
+const RSS_PER_PRICED_BYTE: u64 = 2;
+
+/// Resident bytes each pool thread's allocator heap holds while it builds a
+/// batch's partial maps. Measured on 10.1M points (#332): 454 MB resident at
+/// the first batch under 64 threads, 168 MB under 8.
+const THREAD_HEAP_BYTES: u64 = 5 << 20;
 
 /// Heap bytes of a cell's first category count: a `Vec` grows from empty to
 /// four `(u32, i64)` slots.
@@ -521,10 +534,11 @@ pub(crate) fn write_cell_tables(
         aggregate(input, system, max_zoom, rollup, read, diagnostics)?;
     let specs = rollup.accumulate.len();
     log::info!(
-        "[cells] {} aggregate: {} cell(s) at z{max_zoom} in {:.1}s",
+        "[cells] {} aggregate: {} cell(s) at z{max_zoom} in {:.1}s, priced {} B",
         system.name(),
         cells.len(),
-        started.elapsed().as_secs_f64()
+        started.elapsed().as_secs_f64(),
+        cells.bytes(specs, cat_bytes, &[])
     );
     let mut res = system.resolution(max_zoom);
     for z in (min_zoom..=max_zoom).rev() {
@@ -532,7 +546,11 @@ pub(crate) fn write_cell_tables(
         if to < res {
             // A rollup holds children and their parents at once; a parent
             // holds no more cells or category pairs than its children.
-            budget.require(MemoryPhase::Scan, 2 * cells.bytes(specs, cat_bytes, &[]))?;
+            budget.require_allowance(
+                read.profile,
+                MemoryPhase::Scan,
+                2 * cells.bytes(specs, cat_bytes, &[]),
+            )?;
             cells = cells.roll_up(system, res, to);
             cat_bytes = cells.category_bytes();
             res = to;
@@ -541,10 +559,8 @@ pub(crate) fn write_cell_tables(
         // columns: counts (8 bytes plus null bits), rollups, id and outline.
         let batch_bytes = cells.len().min(WRITE_ROWS) as u64
             * (17 * labels.len() as u64 + 9 * specs as u64 + 512);
-        budget.require(
-            MemoryPhase::Scan,
-            cells.bytes(specs, cat_bytes, &[]) + cells.len() as u64 * 16 + batch_bytes,
-        )?;
+        let priced = cells.bytes(specs, cat_bytes, &[]) + cells.len() as u64 * 16 + batch_bytes;
+        budget.require_allowance(read.profile, MemoryPhase::Scan, priced)?;
         write_table(
             tables[usize::from(z - min_zoom)],
             system,
@@ -554,8 +570,9 @@ pub(crate) fn write_cell_tables(
             &labels,
         )?;
         log::info!(
-            "[cells] z{z}: {} cell(s), total {:.1}s",
+            "[cells] z{z}: {} cell(s), {} label(s), total {:.1}s, priced {priced} B",
             cells.len(),
+            labels.len(),
             started.elapsed().as_secs_f64()
         );
     }
@@ -624,6 +641,10 @@ fn aggregate(
     };
     // Every reader's queue, plus the batch being aggregated.
     let read_ahead = grant_read_ahead(&mut budget, tuning, 1);
+    // Checked before the readers start, so a budget too small for the pool
+    // fails here.
+    let threads = rayon::current_num_threads() as u64 * THREAD_HEAP_BYTES;
+    budget.require_allowance(read.profile, MemoryPhase::Scan, threads)?;
     let mut cells = Cells::new();
     let mut interner = GroupInterner::default();
     let (mut rows, mut skipped, mut cat_bytes) = (0usize, 0usize, 0u64);
@@ -636,9 +657,13 @@ fn aggregate(
         // mid-doubling: three slots a row), then, once they are built, for
         // them as they are and the shards they grow.
         let per_row = 3 * cell_bytes(specs) + FIRST_COUNTS_BYTES;
-        budget.require(
+        budget.require_allowance(
+            read.profile,
             MemoryPhase::Scan,
-            cells.bytes(specs, cat_bytes, &[]) + interner.heap_bytes() + n as u64 * per_row,
+            threads
+                + cells.bytes(specs, cat_bytes, &[])
+                + interner.heap_bytes()
+                + n as u64 * per_row,
         )?;
         let bschema = batch.schema();
         let col = |name: &str| bschema.index_of(name).map(|i| batch.column(i).clone());
@@ -713,10 +738,9 @@ fn aggregate(
                     + m.values().map(|c| c.cats.heap_bytes()).sum::<u64>();
             }
         }
-        budget.require(
-            MemoryPhase::Scan,
-            cells.bytes(specs, cat_bytes, &incoming) + interner.heap_bytes() + partial,
-        )?;
+        let need =
+            threads + cells.bytes(specs, cat_bytes, &incoming) + interner.heap_bytes() + partial;
+        budget.require_allowance(read.profile, MemoryPhase::Scan, need)?;
         cat_bytes += cells.absorb(chunks.into_iter().map(|c| c.0).collect());
         Ok(ReadFlow::Continue)
     })?;
@@ -1257,11 +1281,12 @@ mod tests {
         assert_eq!(tracked, 4 * FIRST_COUNTS_BYTES);
 
         // Ten new cells in an empty shard: it grows to hold them, old and
-        // doubled table at once, and each brings its first counts.
+        // doubled table at once, and each brings its first counts; all of
+        // it resident at the measured allocator overhead.
         let empty = Cells::new();
         assert_eq!(
             empty.bytes(0, 0, &[10]),
-            20 * cell_bytes(0) + 10 * FIRST_COUNTS_BYTES
+            RSS_PER_PRICED_BYTE * (20 * cell_bytes(0) + 10 * FIRST_COUNTS_BYTES)
         );
 
         // A full shard grows even when the others have room to spare.
