@@ -530,6 +530,7 @@ fn aggregate(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(Cells, Vec<String>, MemoryBudget, u64), ConvertError> {
     let source = ConvertSource::resolve_path(input)?;
+    source.set_spill_dir(read.spill_dir.as_deref());
     let descriptor = source.resolved_schema()?;
     let (crs, _) =
         super::convert::crs_from_resolved(descriptor, &source.display_name(), diagnostics)?;
