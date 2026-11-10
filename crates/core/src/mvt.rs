@@ -579,7 +579,8 @@ pub(crate) fn strip_box_pairs(
                 (
                     lo.min(b.0),
                     hi.max(b.2),
-                    w + i64::from(b.2) - i64::from(b.0),
+                    // Inclusive: a vertical edge still shares its x.
+                    w + i64::from(b.2) - i64::from(b.0) + 1,
                 )
             });
     if 16 * widths < X_SWEEP_DENSITY * (i64::from(x1) - i64::from(x0) + 1) {
