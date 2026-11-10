@@ -4110,13 +4110,23 @@ pub(crate) mod remote {
             }
             let (_, module) = module_path!().split_once("::").expect("crate::module path");
             let name = format!("{module}::{test}");
-            let out =
-                std::process::Command::new(std::env::current_exe().expect("test binary path"))
-                    .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
-                    .env(CHILD, "1")
-                    .envs(vars.iter().copied())
-                    .output()
-                    .expect("re-run the test binary");
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test binary path"));
+            // The child sees only the test's overrides, never the shell's.
+            for (k, _) in
+                std::env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("TYLERTOO_"))
+            {
+                child.env_remove(k);
+            }
+            for (k, _) in super::store_env() {
+                child.env_remove(k);
+            }
+            let out = child
+                .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .envs(vars.iter().copied())
+                .output()
+                .expect("re-run the test binary");
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(
                 out.status.success() && stdout.contains("1 passed"),
