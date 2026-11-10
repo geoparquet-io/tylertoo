@@ -60,12 +60,14 @@ pyo3::create_exception!(
      rules are the core library's, the same ones the CLI enforces."
 );
 
-/// The installed log bridge's cache handle (#445), set once at import.
+/// The log bridge's cache handle (#445), set by the first binding call:
+/// `None` when another logger already owned the process (the CLI's, after
+/// [`_run_cli`]).
 #[expect(
     clippy::disallowed_types,
     reason = "#445: process-wide Python logging bridge reset handle"
 )]
-static LOG_RESET: OnceLock<pyo3_log::ResetHandle> = OnceLock::new();
+static LOG_RESET: OnceLock<Option<pyo3_log::ResetHandle>> = OnceLock::new();
 
 /// Drop pyo3-log's cached Python loggers and levels, so a `logging`
 /// configuration change made since the last call (`basicConfig`,
@@ -73,9 +75,17 @@ static LOG_RESET: OnceLock<pyo3_log::ResetHandle> = OnceLock::new();
 ///
 /// The cache is what lets a filtered-out record on a worker thread skip the
 /// GIL entirely; resetting it once per call keeps that, at the cost of one
-/// atomic store. Every entry point calls this first.
-fn refresh_log_levels() {
-    if let Some(handle) = LOG_RESET.get() {
+/// atomic store. Every entry point calls this first, and the first call
+/// installs the bridge: not at import, so that `python -m tylertoo` can
+/// give the CLI its own stderr logger (#819).
+fn refresh_log_levels(py: Python<'_>) {
+    let handle = LOG_RESET.get_or_init(|| {
+        pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels)
+            .ok()?
+            .install()
+            .ok()
+    });
+    if let Some(handle) = handle {
         handle.reset();
     }
 }
@@ -270,7 +280,7 @@ fn convert(
     args: &Bound<'_, pyo3::types::PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels();
+    refresh_log_levels(py);
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
 
@@ -331,7 +341,7 @@ fn overview(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels();
+    refresh_log_levels(py);
     let options = overview_config(keywords(kwargs)?)?;
     // #779: every rule that needs no input, before anything is read.
     options.validate().map_err(convert_error_to_py)?;
@@ -383,7 +393,7 @@ fn export_pmtiles(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels();
+    refresh_log_levels(py);
     let options = export_config(keywords(kwargs)?)?;
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
@@ -401,7 +411,7 @@ fn export_pmtiles(
 
 signature_validate! {
 fn validate(py: Python<'_>, file: &str) -> PyResult<Py<PyDict>> {
-    refresh_log_levels();
+    refresh_log_levels(py);
     let path = Path::new(file).to_path_buf();
     let report = py.detach(|| validate_file(&path)).map_err(|e| {
         let kind = tylertoo_core::internal::error::kind_of(&e).unwrap_or(ErrorKind::Runtime);
@@ -430,7 +440,7 @@ fn decode(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels();
+    refresh_log_levels(py);
     let values = keywords(kwargs)?;
     let mut defaults = config_keywords::command_defaults("decode");
     for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
@@ -486,7 +496,7 @@ fn pyramid(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels();
+    refresh_log_levels(py);
     // Spec grammar, band-set rules and the input-exists check are core's,
     // shared with the CLI's `--band` (#445).
     let options = pyramid_config(keywords(kwargs)?)?;
@@ -524,11 +534,19 @@ fn _defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     Ok(out.unbind())
 }
 
+/// Run the CLI on `argv` (program name first) and return its exit status,
+/// for `python -m tylertoo` (#819). The binary's own code: its stderr
+/// logger, `--quiet`, and exit codes, a panic included (101).
+#[pyfunction]
+fn _run_cli(py: Python<'_>, argv: Vec<std::ffi::OsString>) -> u8 {
+    py.detach(|| tylertoo_cli::run(argv))
+}
+
 /// The compiled extension, imported as `tylertoo._tylertoo`.
 ///
 /// `python/tylertoo/__init__.py` reexports the native functions directly.
 ///
-/// Importing it installs pyo3-log as the `log` backend (#445), so core's
+/// The first binding call installs pyo3-log as the `log` backend (#445), so core's
 /// diagnostics reach Python's `logging` under `tylertoo_core.*` (the Rust
 /// module path, `::` → `.`) — the warnings and progress lines the CLI
 /// prints. Records below DEBUG are never forwarded. Forwarding takes the GIL,
@@ -536,13 +554,6 @@ fn _defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// while this thread waited on it with the GIL held would deadlock.
 #[pymodule]
 fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Another extension in this process may already own the global logger;
-    // keep it rather than fail the import.
-    if let Ok(handle) =
-        pyo3_log::Logger::new(m.py(), pyo3_log::Caching::LoggersAndLevels)?.install()
-    {
-        let _ = LOG_RESET.set(handle);
-    }
     m.add("ConfigError", m.py().get_type::<ConfigError>())?;
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add_function(wrap_pyfunction!(overview, m)?)?;
@@ -552,6 +563,7 @@ fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pyramid, m)?)?;
     m.add_function(wrap_pyfunction!(stats, m)?)?;
     m.add_function(wrap_pyfunction!(_defaults, m)?)?;
+    m.add_function(wrap_pyfunction!(_run_cli, m)?)?;
     Ok(())
 }
 

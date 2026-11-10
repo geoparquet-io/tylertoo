@@ -183,7 +183,10 @@ so log lines stay out of the snapshots. `NO_COLOR=1` keeps a
 backtrace to each `Error:` line. The test also sets
 `TYLERTOO_DHAT=off`: CI tests with `--all-features`, and a `dhat-heap`
 build otherwise prints a heap summary on exit. The test runs in the
-`quick` tier.
+`quick` tier. `TYLERTOO_SNAPSHOT_BIN=<path>` runs the cases against
+another `tylertoo`; CI's Python Quality job points it at the wheel's
+script, `crates/python/.venv/bin/tylertoo`, so `python -m tylertoo`
+must match the binary too.
 
 - **Inputs.** A case that only reads names committed fixtures by a
   path relative to `crates/cli`, for example

@@ -666,6 +666,14 @@ jobs:
       - name: pytest
         run: uv run --no-sync pytest tests/ -v
 
+      # The CLI snapshot cases (crates/cli/tests/cmd) against the `tylertoo`
+      # script this package installs (#819): the wheel's CLI must print and
+      # exit exactly as the binary does.
+      - name: CLI snapshots through the Python entry point
+        run: cargo test --profile ci --locked -p tylertoo --test cli_snapshots
+        env:
+          TYLERTOO_SNAPSHOT_BIN: ${{ github.workspace }}/crates/python/.venv/bin/tylertoo
+
       - name: vulture (dead code)
         run: uv run vulture
 

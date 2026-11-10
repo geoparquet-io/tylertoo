@@ -29,6 +29,10 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 
+# The CLI, as the binary runs it (#819); `python -m tylertoo` is the same.
+[project.scripts]
+tylertoo = "tylertoo.__main__:main"
+
 [project.urls]
 Homepage = "https://github.com/geoparquet-io/tylertoo"
 Repository = "https://github.com/geoparquet-io/tylertoo"

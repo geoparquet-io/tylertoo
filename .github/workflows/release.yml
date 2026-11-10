@@ -488,6 +488,8 @@ jobs:
         run: |
           pip install --no-index --find-links dist tylertoo
           python -c "import tylertoo; print(tylertoo.__doc__ or 'ok')"
+          # The CLI the wheel installs (#819), through a sharded build.
+          scripts/ci/smoke_cli.sh
 
       - name: Upload wheels
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -510,6 +512,33 @@ jobs:
         with:
           command: sdist
           args: --out dist -m crates/python/Cargo.toml
+
+      # Build the sdist the way `pip install` does on a platform with no
+      # wheel, then run the CLI it installs (#819). Release behavior without
+      # fat LTO, which only makes this smoke build slower.
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Smoke test the sdist
+        env:
+          CARGO_PROFILE_RELEASE_LTO: 'false'
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+        run: |
+          python -m venv /tmp/sdist-venv
+          /tmp/sdist-venv/bin/pip install dist/*.tar.gz
+          PATH="/tmp/sdist-venv/bin:$PATH" scripts/ci/smoke_cli.sh
 
       - name: Upload sdist
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -6,12 +6,18 @@
 //! then review the diff by hand: a wrong capture pins a bug as correct
 //! behavior. See DEVELOPMENT.md, "Updating CLI snapshots".
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+/// `TYLERTOO_SNAPSHOT_BIN` runs the cases against another `tylertoo`: CI
+/// points it at the Python wheel's script, which must behave the same (#819).
 #[test]
 fn cli_snapshots() {
+    let bin = std::env::var_os("TYLERTOO_SNAPSHOT_BIN").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_tylertoo")),
+        PathBuf::from,
+    );
     trycmd::TestCases::new()
-        .register_bin("tylertoo", Path::new(env!("CARGO_BIN_EXE_tylertoo")))
+        .register_bin("tylertoo", bin)
         // Log lines carry timestamps, core counts, RSS, and elapsed times;
         // the cases pin what the CLI prints, not what core logs.
         .env("RUST_LOG", "off")

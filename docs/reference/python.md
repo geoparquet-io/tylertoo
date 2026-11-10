@@ -546,7 +546,7 @@ convert(
 
 Convert GeoParquet to PMTiles in one call, like `tylertoo tiles`.
 
-Runs the same core facade as `tylertoo tiles`, with the same options and defaults, so the chain — the removed-after-export intermediate overview, its free-space preflight, the option rules, and the declared zoom range — matches the CLI. `overview()` followed by `export_pmtiles()` is the same chain in two steps. Sharded builds (`--shard`, `--plan-only`) stay CLI-only.
+Runs the same core facade as `tylertoo tiles`, with the same options and defaults, so the chain — the removed-after-export intermediate overview, its free-space preflight, the option rules, and the declared zoom range — matches the CLI. `overview()` followed by `export_pmtiles()` is the same chain in two steps. Sharded builds (`--shard`, `--plan-only`) have no keyword: run them with the CLI the wheel installs, `python -m tylertoo`.
 
 ### Parameters
 

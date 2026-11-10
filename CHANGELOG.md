@@ -75,6 +75,11 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The convert report gains `geo_version`:
   `{"status": "known" | "unknown" | "missing" | "mixed", "version": ...}`,
   covering every input part (#708).
+- The Python wheel runs the full CLI as `python -m tylertoo` and as a
+  `tylertoo` script (#819): every subcommand, `shard-plan`, `merge`,
+  `stats` and `--shard` included, with the binary's output, stderr logging
+  and exit codes. The Python API now installs its `logging` bridge on its
+  first call instead of at import.
 
 ### Fixed
 

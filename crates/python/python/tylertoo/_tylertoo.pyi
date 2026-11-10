@@ -21,6 +21,7 @@ from . import (
 __all__ = [
     "ConfigError",
     "_defaults",
+    "_run_cli",
     "convert",
     "decode",
     "export_pmtiles",
@@ -33,6 +34,7 @@ __all__ = [
 class ConfigError(ValueError): ...
 
 def _defaults() -> dict[str, dict[str, Any]]: ...
+def _run_cli(argv: list[str]) -> int: ...
 def overview(
     input: str | Sequence[str],
     output: str,
