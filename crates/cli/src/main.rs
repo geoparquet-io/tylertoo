@@ -117,8 +117,7 @@ enum Command {
     ExportPmtiles(Box<ExportPmtilesArgs>),
     /// Decode a PMTiles vector-tile archive back to GeoParquet.
     Decode(DecodeArgs),
-    /// Report per-zoom tile sizes for a PMTiles archive, from its
-    /// directory alone.
+    /// Report per-zoom tile sizes and optional per-layer stats for a PMTiles archive.
     Stats(StatsArgs),
     /// Build one archive from several inputs, each owning a zoom range.
     Pyramid(Box<PyramidArgs>),
@@ -337,8 +336,13 @@ struct StatsArgs {
     archive: PathBuf,
 
     /// Number of largest tiles to list, ranked by stored size.
-    #[arg(long, value_name = "N", default_value = "10")]
+    #[arg(long, value_name = "N", default_value_t = tylertoo_core::internal::stats::DEFAULT_LARGEST)]
     largest: usize,
+
+    /// Add per-zoom, per-layer feature counts, uncompressed bytes, and geometry
+    /// types. Decodes tile bodies; requires a vector (MVT) archive.
+    #[arg(long)]
+    layers: bool,
 
     /// Print the report as JSON instead of a human-readable table.
     #[arg(long)]
@@ -1783,7 +1787,7 @@ fn run_stats(args: StatsArgs) -> Result<()> {
             anyhow::anyhow!("could not open {}: {e}", args.archive.display())
         }
     })?;
-    let report = compute_stats(&archive, args.largest)
+    let report = compute_stats(&archive, args.largest, args.layers)
         .map_err(|e| anyhow::anyhow!("stats failed for {}: {e}", args.archive.display()))?;
 
     if args.json {
@@ -1864,6 +1868,32 @@ fn print_stats_table(report: &tylertoo_core::internal::stats::StatsReport) {
             })
             .collect();
         println!("{}", render_table(&["z", "x", "y", "bytes"], &largest_rows));
+    }
+
+    if let Some(per_layer) = &report.per_layer {
+        let rows: Vec<Vec<String>> = per_layer
+            .iter()
+            .map(|l| {
+                let types = l
+                    .geometry_types
+                    .iter()
+                    .map(|(t, n)| format!("{t}:{n}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                vec![
+                    l.z.to_string(),
+                    l.layer.clone(),
+                    format_number(l.feature_count),
+                    format_number(l.bytes),
+                    types,
+                ]
+            })
+            .collect();
+        println!("\nPer layer:");
+        println!(
+            "{}",
+            render_table(&["z", "layer", "features", "bytes", "geometry"], &rows)
+        );
     }
 }
 
@@ -3524,6 +3554,31 @@ mod tests {
         ] {
             assert_eq!(publication_flags_of(&cmd), [false; 3], "{label}");
         }
+    }
+
+    /// `stats` and `tylertoo.stats()` take the same options with the same
+    /// defaults: core's keyword table, which the Python signature is built
+    /// from. `--json` is the CLI's output switch; Python always returns data.
+    #[test]
+    fn stats_flags_match_python_keywords() {
+        use clap::CommandFactory;
+        use tylertoo_core::internal::overview::config::keywords::command_defaults;
+        let cmd = StatsArgs::command();
+        let cli: std::collections::BTreeMap<String, serde_json::Value> = cmd
+            .get_arguments()
+            .filter_map(|a| Some((a.get_long()?, a)))
+            .filter(|(long, _)| *long != "json")
+            .map(|(long, a)| {
+                let default = match a.get_default_values() {
+                    [v] => serde_json::from_str(v.to_str().unwrap()).unwrap(),
+                    _ => serde_json::Value::Bool(false),
+                };
+                (long.replace('-', "_"), default)
+            })
+            .collect();
+        let python: std::collections::BTreeMap<String, serde_json::Value> =
+            command_defaults("stats").into_iter().collect();
+        assert_eq!(cli, python);
     }
 
     #[test]

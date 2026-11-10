@@ -3,17 +3,17 @@
 //! Every "which zoom is blowing our tile budget" question this week (the
 //! handover zoom, the 600 KB cells budget, r5/r7/r8 comparisons) needed
 //! per-zoom stored-tile-size stats. This walks an already-opened
-//! [`ArchiveIndex`]'s directory entries — header + directories, never a tile
-//! body — so an entry's length is the tile's STORED (compressed) size
-//! directly. No tile is decompressed and the archive is never read whole
-//! into memory.
+//! [`ArchiveIndex`]'s directory entries, so an entry's length is the tile's
+//! STORED (compressed) size directly. Without `layers`, no tile body is read.
+//! With `layers`, each distinct stored body (deduplicated by data offset) is
+//! decoded once, in parallel, to add per-zoom, per-layer stats.
 //!
 //! Aggregation is per directory entry, with multiplicity: a run of `k`
 //! identical tiles contributes one `(stored_len, k)` pair (split at zoom
 //! boundaries when the run crosses one), and every statistic is weighted by
 //! those counts. Run lengths are never expanded, so memory and time are
-//! O(directory entries), not O(addressed tiles), and the report is not
-//! subject to [`ArchiveIndex::tiles`]' run-length expansion ceiling — a
+//! O(directory entries) without `layers`, not O(addressed tiles), and the
+//! report is not subject to [`ArchiveIndex::tiles`]' run-length expansion ceiling — a
 //! mostly-ocean archive whose runs address billions of tiles reports as
 //! cheaply as its directory reads.
 //!
@@ -24,12 +24,21 @@
 //! it is the bytes a client would fetch, not the bytes on disk.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
+
+use prost::Message;
+use rayon::prelude::*;
 
 use crate::archive_index::{ArchiveError, ArchiveIndex};
-use crate::pmtiles_writer::tile_id_to_zxy;
+use crate::compression::{decompress_capped, MAX_TILE_BYTES};
+use crate::pmtiles_writer::{tile_id_to_zxy, TileType};
 use crate::tile::hilbert_zoom_base;
+use crate::vector_tile::tile::{GeomType, Layer};
 use crate::Result;
+
+/// Largest tiles listed when the caller does not say (`stats --largest`,
+/// `tylertoo.stats(largest=)`).
+pub const DEFAULT_LARGEST: usize = 10;
 
 /// One zoom level's tile-size distribution, in STORED (compressed) bytes per
 /// addressed tile.
@@ -74,6 +83,30 @@ pub struct LargestTile {
 pub struct StatsReport {
     pub per_zoom: Vec<ZoomStats>,
     pub largest: Vec<LargestTile>,
+    /// Per-(zoom, layer) stats, sorted by zoom then layer name.
+    /// `None` unless `layers` is enabled; omitted from JSON when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_layer: Option<Vec<LayerStats>>,
+}
+
+/// One layer's totals at one zoom, counted per addressed tile.
+/// Run members and deduplicated tiles each contribute the shared body's
+/// feature counts and layer bytes, as in the per-zoom stats.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct LayerStats {
+    /// Zoom level.
+    pub z: u8,
+    /// MVT layer name.
+    pub layer: String,
+    /// Total features across addressed tiles (saturating at `u64::MAX`).
+    pub feature_count: u64,
+    /// Sum of the layer's UNCOMPRESSED encoded size inside each addressed
+    /// MVT, not stored (compressed) bytes (saturating at `u64::MAX`).
+    pub bytes: u64,
+    /// Feature counts per MVT geometry type: `Point`, `LineString`, `Polygon`,
+    /// or `Unknown`. Counts saturate at `u64::MAX`; absent types have no entry.
+    pub geometry_types: BTreeMap<&'static str, u64>,
 }
 
 /// Nearest-rank percentile over `(size, count)` pairs sorted ascending by
@@ -129,15 +162,28 @@ fn zoom_stats_from_weighted(z: u8, mut sizes: Vec<(u64, u64)>) -> ZoomStats {
 /// descending, tile id ascending).
 ///
 /// Walks [`ArchiveIndex::entries`] once without expanding run lengths:
-/// memory is O(directory entries + `largest_n`).
+/// without `layers`, memory is O(directory entries + `largest_n`).
+///
+/// With `layers`, also reads and decodes each distinct stored tile body once
+/// (deduplicated by data offset), in parallel, and fills [`StatsReport::per_layer`].
+/// This requires a vector (MVT) archive and adds memory for decoded bodies and
+/// layer totals. With `layers` set to `false`, reads no tile bodies and omits
+/// `per_layer` from JSON.
 ///
 /// # Errors
 ///
 /// Returns an error if a directory entry points past the tile-data section or
-/// holds a tile id that does not decode.
-pub fn compute_stats(archive: &ArchiveIndex, largest_n: usize) -> Result<StatsReport> {
+/// holds a tile id that does not decode. With `layers`, also returns an error
+/// if the archive is not MVT or a tile body cannot be read, decompressed, or parsed.
+pub fn compute_stats(
+    archive: &ArchiveIndex,
+    largest_n: usize,
+    layers: bool,
+) -> Result<StatsReport> {
     let tile_data_length = archive.header().tile_data_length;
     let mut by_zoom: Vec<Vec<(u64, u64)>> = Vec::new();
+    // Distinct body (offset, length) -> addressed tiles per zoom.
+    let mut bodies: BTreeMap<(u64, u32), Vec<(u8, u64)>> = BTreeMap::new();
     // Min-heap keyed (bytes, Reverse(id)): its top is the WORST kept tile —
     // smallest bytes, and among equal bytes the highest tile id — so popping
     // it keeps exactly the first `largest_n` by (bytes desc, id asc).
@@ -168,6 +214,13 @@ pub fn compute_stats(archive: &ArchiveIndex, largest_n: usize) -> Result<StatsRe
             let lo = first.max(hilbert_zoom_base(z));
             let hi = last.min(hilbert_zoom_base(z + 1) - 1);
             by_zoom[usize::from(z)].push((bytes, hi - lo + 1));
+            if layers {
+                let zooms = bodies.entry((e.offset, e.length)).or_default();
+                match zooms.iter_mut().find(|(bz, _)| *bz == z) {
+                    Some((_, n)) => *n += hi - lo + 1,
+                    None => zooms.push((z, hi - lo + 1)),
+                }
+            }
         }
 
         if largest_n > 0 {
@@ -210,7 +263,151 @@ pub fn compute_stats(archive: &ArchiveIndex, largest_n: usize) -> Result<StatsRe
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(StatsReport { per_zoom, largest })
+    let per_layer = if layers {
+        Some(layer_stats(archive, bodies)?)
+    } else {
+        None
+    };
+    Ok(StatsReport {
+        per_zoom,
+        largest,
+        per_layer,
+    })
+}
+
+/// Per-(zoom, layer) running sums: features, bytes, features per geometry type.
+type LayerAcc = BTreeMap<(u8, String), (u64, u64, BTreeMap<&'static str, u64>)>;
+
+/// Decode every distinct body once, in parallel, and weight each layer by
+/// the tiles that address the body at each zoom.
+fn layer_stats(
+    archive: &ArchiveIndex,
+    bodies: BTreeMap<(u64, u32), Vec<(u8, u64)>>,
+) -> Result<Vec<LayerStats>> {
+    let header = archive.header();
+    if header.tile_type != TileType::Mvt {
+        return Err(ArchiveError::Header(format!(
+            "per-layer stats need vector tiles; this archive holds {:?} tiles",
+            header.tile_type
+        ))
+        .into());
+    }
+    // Offset order, so each rayon split reads a contiguous stretch of the file.
+    let bodies: Vec<_> = bodies.into_iter().collect();
+    let pool = crate::decode::decode_pool().map_err(std::io::Error::other)?;
+    let work = || {
+        bodies
+            .par_iter()
+            .try_fold(LayerAcc::new, |mut acc, ((offset, length), zooms)| {
+                for (layer, bytes) in &decode_body(archive, *offset, *length)? {
+                    let (layer, bytes) = (layer, *bytes);
+                    let features = layer.features.len() as u64;
+                    let mut types: BTreeMap<&'static str, u64> = BTreeMap::new();
+                    for f in &layer.features {
+                        *types.entry(geom_type_name(f.r#type())).or_default() += 1;
+                    }
+                    for &(z, n) in zooms {
+                        let e = acc.entry((z, layer.name.clone())).or_default();
+                        e.0 = e.0.saturating_add(features.saturating_mul(n));
+                        e.1 = e.1.saturating_add(bytes.saturating_mul(n));
+                        for (&t, &c) in &types {
+                            let v = e.2.entry(t).or_default();
+                            *v = v.saturating_add(c.saturating_mul(n));
+                        }
+                    }
+                }
+                Ok::<_, crate::Error>(acc)
+            })
+            .try_reduce(LayerAcc::new, |mut a, b| {
+                for (k, (f, bytes, types)) in b {
+                    let e = a.entry(k).or_default();
+                    e.0 = e.0.saturating_add(f);
+                    e.1 = e.1.saturating_add(bytes);
+                    for (t, c) in types {
+                        let v = e.2.entry(t).or_default();
+                        *v = v.saturating_add(c);
+                    }
+                }
+                Ok(a)
+            })
+    };
+    let acc = match &pool {
+        Some(pool) => pool.install(work),
+        None => work(),
+    }?;
+    Ok(acc
+        .into_iter()
+        .map(
+            |((z, layer), (feature_count, bytes, geometry_types))| LayerStats {
+                z,
+                layer,
+                feature_count,
+                bytes,
+                geometry_types,
+            },
+        )
+        .collect())
+}
+
+/// One stored tile body, decompressed and parsed as MVT: each layer with its
+/// encoded length.
+fn decode_body(archive: &ArchiveIndex, offset: u64, length: u32) -> Result<Vec<(Layer, u64)>> {
+    let header = archive.header();
+    let fail = |error: String| ArchiveError::Tile {
+        offset,
+        length: u64::from(length),
+        error,
+    };
+    // The same ceiling `decode` applies before allocating a body (#510).
+    if u64::from(length) > MAX_TILE_BYTES {
+        return Err(fail(format!("exceeds the {MAX_TILE_BYTES}-byte tile ceiling")).into());
+    }
+    let start = header
+        .tile_data_offset
+        .checked_add(offset)
+        .and_then(|s| usize::try_from(s).ok())
+        .ok_or(ArchiveError::TileDataPastEnd { path: None })?;
+    let raw = archive.read_range(start..start + length as usize)?;
+    let plain = decompress_capped(&raw, header.tile_compression, MAX_TILE_BYTES)
+        .map_err(|e| fail(e.to_string()))?;
+    Ok(mvt_layers(&plain).map_err(fail)?)
+}
+
+/// The layers of an uncompressed MVT, each with its length on the wire.
+/// Measured from the wire, not `encoded_len()`, which misses the fields
+/// (layer extensions) prost drops on decode.
+fn mvt_layers(mut buf: &[u8]) -> std::result::Result<Vec<(Layer, u64)>, String> {
+    use prost::encoding::{decode_key, decode_varint, skip_field, DecodeContext, WireType};
+    let mut layers = Vec::new();
+    while !buf.is_empty() {
+        let (tag, wire) = decode_key(&mut buf).map_err(|e| e.to_string())?;
+        // `Tile.layers` is field 3.
+        if tag != 3 {
+            skip_field(wire, tag, &mut buf, DecodeContext::default()).map_err(|e| e.to_string())?;
+            continue;
+        }
+        if wire != WireType::LengthDelimited {
+            return Err(format!("layer field has wire type {wire:?}"));
+        }
+        let len = decode_varint(&mut buf).map_err(|e| e.to_string())?;
+        let len = usize::try_from(len)
+            .ok()
+            .filter(|&l| l <= buf.len())
+            .ok_or("layer runs past the end of the tile")?;
+        let (body, rest) = buf.split_at(len);
+        layers.push((Layer::decode(body).map_err(|e| e.to_string())?, len as u64));
+        buf = rest;
+    }
+    Ok(layers)
+}
+
+fn geom_type_name(t: GeomType) -> &'static str {
+    match t {
+        GeomType::Unknown => "Unknown",
+        GeomType::Point => "Point",
+        GeomType::Linestring => "LineString",
+        GeomType::Polygon => "Polygon",
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +415,8 @@ mod tests {
     use super::*;
     use crate::compression::Compression;
     use crate::pmtiles_writer::{tile_id, StreamingPmtilesWriter};
+    use crate::vector_tile::tile::Feature;
+    use crate::vector_tile::Tile;
 
     /// A synthetic archive: `Compression::None` so the stored byte count is
     /// exactly the length of the buffer handed to `add_tile` — the whole
@@ -330,7 +529,7 @@ mod tests {
         );
 
         let archive = ArchiveIndex::open(&path).unwrap();
-        let report = compute_stats(&archive, 10).unwrap();
+        let report = compute_stats(&archive, 10, false).unwrap();
 
         assert_eq!(report.per_zoom.len(), 2);
         let z2 = report.per_zoom.iter().find(|z| z.z == 2).unwrap();
@@ -374,7 +573,7 @@ mod tests {
         );
 
         let archive = ArchiveIndex::open(&path).unwrap();
-        let report = compute_stats(&archive, 2).unwrap();
+        let report = compute_stats(&archive, 2, false).unwrap();
 
         assert_eq!(report.largest.len(), 2);
         assert_eq!(report.largest[0].bytes, 90);
@@ -388,7 +587,7 @@ mod tests {
         write_synthetic(&path, &[(1, 0, 0, 10)]);
 
         let archive = ArchiveIndex::open(&path).unwrap();
-        let report = compute_stats(&archive, 0).unwrap();
+        let report = compute_stats(&archive, 0, false).unwrap();
         assert!(report.largest.is_empty());
         assert_eq!(report.per_zoom.len(), 1);
     }
@@ -407,7 +606,7 @@ mod tests {
         write_synthetic(&path, &tiles);
 
         let archive = ArchiveIndex::open(&path).unwrap();
-        let report = compute_stats(&archive, 3).unwrap();
+        let report = compute_stats(&archive, 3, false).unwrap();
         let ids: Vec<u64> = report
             .largest
             .iter()
@@ -451,7 +650,7 @@ mod tests {
         // Precondition: the writer really did run-length encode.
         assert!(archive.entries().iter().any(|e| e.run_length == 4));
 
-        let report = compute_stats(&archive, 10).unwrap();
+        let report = compute_stats(&archive, 10, false).unwrap();
         assert_eq!(report.per_zoom.len(), 1);
         let z2 = report.per_zoom[0];
         assert_eq!(z2.tile_count, 6);
@@ -488,7 +687,7 @@ mod tests {
             archive.entries()
         );
 
-        let report = compute_stats(&archive, 1).unwrap();
+        let report = compute_stats(&archive, 1, false).unwrap();
         assert_eq!(report.per_zoom.len(), 2);
         let z0 = report.per_zoom[0];
         assert_eq!((z0.z, z0.tile_count, z0.max_bytes), (0, 1, 50));
@@ -507,6 +706,134 @@ mod tests {
         );
     }
 
+    /// An MVT body with one layer per `(name, types)`, one feature per type.
+    fn mvt(layers: &[(&str, &[GeomType])]) -> Vec<u8> {
+        let tile = Tile {
+            layers: layers
+                .iter()
+                .map(|&(name, types)| Layer {
+                    version: 2,
+                    name: name.to_owned(),
+                    features: types
+                        .iter()
+                        .map(|&t| Feature {
+                            r#type: Some(t as i32),
+                            geometry: vec![9, 2, 2],
+                            ..Feature::default()
+                        })
+                        .collect(),
+                    extent: Some(4096),
+                    ..Layer::default()
+                })
+                .collect(),
+        };
+        tile.encode_to_vec()
+    }
+
+    fn layer_len(name: &str, types: &[GeomType]) -> u64 {
+        let tile = Tile::decode(mvt(&[(name, types)]).as_slice()).unwrap();
+        tile.layers[0].encoded_len() as u64
+    }
+
+    /// #825: a two-layer gzip archive. z1's two tiles share one body (decoded
+    /// once, counted twice), and every layer is reported per zoom.
+    #[test]
+    fn layers_report_features_bytes_and_geometry_types_per_zoom() {
+        use GeomType::{Linestring, Point, Polygon};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layers.pmtiles");
+        let a = mvt(&[("roads", &[Linestring, Linestring]), ("pois", &[Point])]);
+        let b = mvt(&[("roads", &[Polygon])]);
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name("roads");
+        w.add_tile(0, 0, 0, &a).unwrap();
+        w.add_tile(1, 0, 0, &b).unwrap();
+        w.add_tile(1, 1, 1, &b).unwrap();
+        w.finalize(&path).unwrap();
+        let archive = ArchiveIndex::open(&path).unwrap();
+
+        assert_eq!(compute_stats(&archive, 0, false).unwrap().per_layer, None);
+        let report = compute_stats(&archive, 0, true).unwrap();
+        let row = |z, layer: &str, features, bytes, types: &[(&'static str, u64)]| LayerStats {
+            z,
+            layer: layer.to_owned(),
+            feature_count: features,
+            bytes,
+            geometry_types: types.iter().copied().collect(),
+        };
+        assert_eq!(
+            report.per_layer.unwrap(),
+            vec![
+                row(0, "pois", 1, layer_len("pois", &[Point]), &[("Point", 1)]),
+                row(
+                    0,
+                    "roads",
+                    2,
+                    layer_len("roads", &[Linestring, Linestring]),
+                    &[("LineString", 2)]
+                ),
+                row(
+                    1,
+                    "roads",
+                    2,
+                    2 * layer_len("roads", &[Polygon]),
+                    &[("Polygon", 2)]
+                ),
+            ]
+        );
+    }
+
+    /// `--layers` decodes on `decode`'s capped pool: under a 64-thread pool
+    /// it gets 16 workers, under a small pool it adds none.
+    #[test]
+    fn layer_decode_pool_is_capped_at_decode_threads() {
+        let wide = rayon::ThreadPoolBuilder::new()
+            .num_threads(64)
+            .build()
+            .unwrap();
+        let capped = wide.install(|| crate::decode::decode_pool().unwrap());
+        assert_eq!(capped.map(|p| p.current_num_threads()), Some(16));
+        let narrow = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        assert!(narrow
+            .install(|| crate::decode::decode_pool().unwrap())
+            .is_none());
+    }
+
+    /// A layer's bytes are its length on the wire, including a layer
+    /// extension field prost does not keep.
+    #[test]
+    fn layer_bytes_count_fields_prost_drops() {
+        let mut layer = Layer {
+            version: 2,
+            name: "r".to_owned(),
+            ..Layer::default()
+        }
+        .encode_to_vec();
+        layer.extend([0x80, 0x01, 5]); // key 128 = field 16 (an extension), varint 5
+        let mut tile = vec![3 << 3 | 2, layer.len() as u8];
+        tile.extend(&layer);
+        tile.extend([5 << 3, 7]); // an unknown top-level field is skipped
+        let layers = mvt_layers(&tile).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].0.name, "r");
+        assert_eq!(layers[0].1, layer.len() as u64);
+        assert!(mvt_layers(&[3 << 3 | 2, 9, 0]).is_err());
+        assert!(mvt_layers(&[3 << 3, 0]).is_err(), "a varint layer field");
+    }
+
+    /// Without `layers`, the JSON report is the pre-#825 shape exactly.
+    #[test]
+    fn json_without_layers_has_no_per_layer_key() {
+        let report = StatsReport::default();
+        assert_eq!(
+            serde_json::to_string(&report).unwrap(),
+            r#"{"per_zoom":[],"largest":[]}"#
+        );
+    }
+
     #[test]
     fn empty_archive_reports_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -514,7 +841,7 @@ mod tests {
         write_synthetic(&path, &[]);
 
         let archive = ArchiveIndex::open(&path).unwrap();
-        let report = compute_stats(&archive, 10).unwrap();
+        let report = compute_stats(&archive, 10, false).unwrap();
         assert!(report.per_zoom.is_empty());
         assert!(report.largest.is_empty());
     }

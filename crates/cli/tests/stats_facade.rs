@@ -160,6 +160,29 @@ fn stats_largest_flag_caps_the_list() {
     assert_eq!(largest[1]["bytes"], 12678);
 }
 
+/// #825: `--layers` adds one row per (zoom, layer), decoded from the tile
+/// bodies; the fixture is single-layer, so its zooms and feature totals line
+/// up with the per-zoom rows.
+#[test]
+fn stats_layers_reports_each_zoom_and_layer() {
+    assert!(run_stats_json(&[]).get("per_layer").is_none());
+    let json = run_stats_json(&["--layers"]);
+    let per_layer = json["per_layer"].as_array().expect("per_layer array");
+    let zooms: Vec<u64> = per_layer.iter().map(|r| r["z"].as_u64().unwrap()).collect();
+    assert_eq!(zooms, (0..=10).collect::<Vec<_>>());
+    for row in per_layer {
+        assert!(row["layer"].is_string(), "{row}");
+        assert!(row["feature_count"].as_u64().unwrap() > 0, "{row}");
+        assert!(row["bytes"].as_u64().unwrap() > 0, "{row}");
+        let types = row["geometry_types"].as_object().expect("geometry_types");
+        let typed: u64 = types.values().map(|v| v.as_u64().unwrap()).sum();
+        assert_eq!(typed, row["feature_count"].as_u64().unwrap(), "{row}");
+    }
+    let table = run_stats(&["--layers"]);
+    let stdout = String::from_utf8_lossy(&table.stdout);
+    assert!(stdout.contains("features"), "got:\n{stdout}");
+}
+
 /// A nonexistent archive is a clean error naming the path, not a panic.
 #[test]
 fn stats_on_missing_archive_errors_cleanly() {

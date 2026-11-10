@@ -15,7 +15,7 @@ Commands:
   validate        Check a GeoParquet overview file against the overviews spec
   export-pmtiles  Export a PMTiles archive from an overview GeoParquet file
   decode          Decode a PMTiles vector-tile archive back to GeoParquet
-  stats           Report per-zoom tile sizes for a PMTiles archive, from its directory alone
+  stats           Report per-zoom tile sizes and optional per-layer stats for a PMTiles archive
   pyramid         Build one archive from several inputs, each owning a zoom range
   merge           Combine PMTiles archives that hold disjoint tiles into one
   shard-plan      Cut a dataset's tile space into N disjoint shards for a sharded build

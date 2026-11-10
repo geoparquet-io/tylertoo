@@ -19,10 +19,12 @@ fn main() {
         "pyramid",
         "decode",
         "validate",
+        "stats",
     ] {
         let mut defaults = command_defaults(name);
         let positional = match name {
             "validate" => "file",
+            "stats" => "archive",
             "pyramid" => "bands, output",
             _ => "input, output",
         };
@@ -46,6 +48,8 @@ fn main() {
             "file"
         } else if name == "convert" {
             "input, output, *args, **kwargs"
+        } else if name == "stats" {
+            "archive, **kwargs"
         } else if name == "pyramid" {
             "bands, output, **kwargs"
         } else {

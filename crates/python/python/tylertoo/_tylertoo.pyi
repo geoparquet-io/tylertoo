@@ -26,6 +26,7 @@ __all__ = [
     "export_pmtiles",
     "overview",
     "pyramid",
+    "stats",
     "validate",
 ]
 
@@ -153,6 +154,12 @@ def decode(
     max_zoom: int | None = None,
     min_zoom: int | None = None,
 ) -> DecodeReport: ...
+def stats(
+    archive: str,
+    *,
+    largest: int = 10,
+    layers: bool = False,
+) -> dict[str, Any]: ...
 def validate(file: str) -> ValidationReport: ...
 def convert(
     input: str,
