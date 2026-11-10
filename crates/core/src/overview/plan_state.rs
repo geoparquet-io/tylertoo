@@ -1591,6 +1591,15 @@ impl ConvertPlan {
                 ),
             ));
         }
+        if meta.finest != meta.num_levels.saturating_sub(1) {
+            return Err(plan_err(
+                path,
+                &format!(
+                    "names level {} of {} as the finest level, which is always the last",
+                    meta.finest, meta.num_levels,
+                ),
+            ));
+        }
         let batch = reader
             .next()
             .transpose()
@@ -3261,9 +3270,21 @@ mod tests {
         let specs: Vec<(f64, Option<u8>)> = (0..300).map(|i| (1.0 + f64::from(i), None)).collect();
         meta["num_levels"] = serde_json::json!(300);
         meta["level_specs"] = serde_json::to_value(&specs).unwrap();
-        forge(f.path(), &serde_json::to_string(&meta).unwrap(), columns);
+        forge(
+            f.path(),
+            &serde_json::to_string(&meta).unwrap(),
+            columns.clone(),
+        );
         let err = load_err(f.path());
         assert!(err.contains("at most 255"), "{err}");
+
+        // In range but not the last level: the canonical level is always
+        // the finest, and a shard's chain build relies on it (#546 review).
+        let mut meta = meta_of(&schema);
+        meta["finest"] = serde_json::json!(1);
+        forge(f.path(), &serde_json::to_string(&meta).unwrap(), columns);
+        let err = load_err(f.path());
+        assert!(err.contains("finest level"), "{err}");
     }
 
     /// A different plan-format version is refused rather than misread.
