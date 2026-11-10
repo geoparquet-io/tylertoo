@@ -3,6 +3,8 @@
 import tempfile
 from pathlib import Path
 
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import pytest
 
 import tylertoo
@@ -217,16 +219,13 @@ class TestCellBands:
 
     @pytest.mark.parametrize("system", ["grid", "h3", "s2", "a5"])
     def test_every_zoom_counts_every_feature_once(self, system: str) -> None:
-        import pyarrow.compute as pc
-        import pyarrow.parquet as pq
-
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "cells.pmtiles"
             decoded = Path(tmpdir) / "cells.parquet"
             report = tylertoo.pyramid(
                 [f"3-6:{system}:{BUILDINGS}:density"],
                 str(out),
-                accumulate_attributes=["area_in_meters:sum"],
+                accumulate_attributes={"area_in_meters": "sum"},
                 cluster_categories="bf_source",
             )
             tylertoo.decode(str(out), str(decoded))
@@ -251,10 +250,12 @@ class TestCellBands:
                 assert sum(col[i] or 0 for col in by_source) == counts[i]
 
     def test_rollups_need_a_cell_band(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match="cell bands"):
-                tylertoo.pyramid(
-                    [f"3-6:{BUILDINGS}:b"],
-                    str(Path(tmpdir) / "x.pmtiles"),
-                    cluster_categories="bf_source",
-                )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="cell bands"),
+        ):
+            tylertoo.pyramid(
+                [f"3-6:{BUILDINGS}:b"],
+                str(Path(tmpdir) / "x.pmtiles"),
+                cluster_categories="bf_source",
+            )

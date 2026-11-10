@@ -44,16 +44,23 @@ use super::read::{read_in_order, ReadFlow, ReadPass, ReadTuning};
 use crate::input_set::ConvertSource;
 
 /// A discrete global grid a cell band aggregates into.
+///
+/// Each feature counts in the cell holding its centroid. Cells cover about
+/// a 4×4-pixel block of a 256-pixel tile at the equator; resolutions follow
+/// the tables in this module and stop at each system's resolution limit.
+/// Coarser zooms roll child cells up by parent id: exact for grid and S2,
+/// approximate for H3 and A5 because their children do not nest exactly
+/// inside their parents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CellSystem {
-    /// TODO(docs)
+    /// Web Mercator quadkey grid at zoom + 6, capped at 30.
     Grid,
-    /// TODO(docs)
+    /// H3 hexagonal cells, with resolution chosen by equatorial cell area.
     H3,
-    /// TODO(docs)
+    /// S2 quadrilateral cells, with resolution chosen by equatorial cell area.
     S2,
-    /// TODO(docs)
+    /// A5 pentagonal cells, with resolution chosen by equatorial cell area.
     A5,
 }
 
@@ -90,10 +97,10 @@ const A5_RES: [u8; 31] = [
 ];
 
 impl CellSystem {
-    /// TODO(docs)
+    /// Every supported cell system, in grid, H3, S2, A5 order.
     pub const ALL: [Self; 4] = [Self::Grid, Self::H3, Self::S2, Self::A5];
 
-    /// TODO(docs)
+    /// The lowercase system name used in a band spec.
     pub fn name(self) -> &'static str {
         match self {
             Self::Grid => "grid",
@@ -103,7 +110,7 @@ impl CellSystem {
         }
     }
 
-    /// TODO(docs)
+    /// Parse a lowercase system name, or return `None` for an unknown name.
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|s| s.name() == name)
     }
@@ -362,6 +369,10 @@ impl CellAcc {
 
 type CellMap = HashMap<u64, CellAcc>;
 
+/// Rows per parallel task within a batch. Fixed, so float rollups add up
+/// the same way on any number of cores.
+const CHUNK_ROWS: usize = 8192;
+
 /// Shards of the cell map, so batches and rollups merge on every core.
 const SHARDS: usize = 64;
 
@@ -487,13 +498,14 @@ pub(crate) fn write_cell_tables(
     for z in (min_zoom..=max_zoom).rev() {
         let to = system.resolution(z);
         if to < res {
-            cells = cells.roll_up(system, res, to);
-            res = to;
-            // A parent holds no more category pairs than its children did.
+            // A rollup holds children and their parents at once; a parent
+            // holds no more cells or category pairs than its children.
             budget.require(
                 MemoryPhase::Scan,
-                cells.capacity() * cell_bytes(specs) + cat_pairs * 12,
+                2 * (cells.capacity() * cell_bytes(specs) + cat_pairs * 12),
             )?;
+            cells = cells.roll_up(system, res, to);
+            res = to;
         }
         write_table(
             tables[usize::from(z - min_zoom)],
@@ -579,14 +591,12 @@ fn aggregate(
         if let Some(name) = &cat_name {
             interner.extend(col(name)?.as_ref(), &mut ids);
         }
-        // Enough tasks to keep every core busy, none too small to pay off.
-        let chunk_rows = (n / (rayon::current_num_threads() * 4)).max(1024);
         let chunks: Vec<(Vec<CellMap>, usize)> = (0..n)
-            .step_by(chunk_rows)
+            .step_by(CHUNK_ROWS)
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|off| {
-                let len = chunk_rows.min(n - off);
+                let len = CHUNK_ROWS.min(n - off);
                 let garr = from_arrow_array(geom_col.slice(off, len).as_ref(), &geom_field)
                     .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
                 let mut geoms = Vec::with_capacity(len);
@@ -1045,5 +1055,49 @@ mod tests {
             cells.windows(2).all(|w| w[0] < w[1]),
             "rows in cell id order"
         );
+    }
+
+    /// A float sum adds up the same way on any number of cores, even where
+    /// the order of additions decides the result.
+    #[test]
+    fn sums_do_not_depend_on_core_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pts.parquet");
+        let n = 3 * CHUNK_ROWS;
+        let geoms = vec![Some(Geometry::Point(geo::Point::new(1.0, 1.0))); n];
+        let mut values = vec![0.0; n];
+        for (k, v) in [1e16, 1.0, -1e16, 1.0].into_iter().enumerate() {
+            values[k * CHUNK_ROWS / 2 + 1] = v;
+        }
+        crate::overview::testutil::write_input_with_f64(&src, &geoms, "v", &values);
+        let spec = [AccumulateSpec::new(
+            "v",
+            super::super::cluster::AccumulateOp::Sum,
+        )];
+        let rollup = CellRollup {
+            accumulate: &spec,
+            categories: None,
+        };
+        let sum_on = |threads: usize| {
+            let table = dir.path().join(format!("t{threads}.parquet"));
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let diagnostics = crate::diagnostics::Diagnostics::default();
+            pool.install(|| {
+                write_cell_tables(
+                    &src,
+                    CellSystem::S2,
+                    (3, 3),
+                    rollup,
+                    &[&table],
+                    &diagnostics,
+                )
+            })
+            .unwrap();
+            std::fs::read(&table).unwrap()
+        };
+        assert_eq!(sum_on(1), sum_on(8));
     }
 }
