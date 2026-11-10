@@ -157,6 +157,8 @@ fn index_is_a_reserved_archive_name() {
     write_archive(&path, 1);
     let err = Server::bind(&[path], "127.0.0.1", 0).err().unwrap();
     assert!(err.to_string().contains("reserved"), "{err}");
+    let err = Server::bind(&[], "127.0.0.1", 0).err().unwrap();
+    assert!(err.to_string().contains("no archive"), "{err}");
 }
 
 /// A client stalled mid-download of a whole archive blocks neither other
@@ -244,4 +246,33 @@ fn an_oversized_tile_body_is_refused_before_the_read() {
     let (code, _, body) = get(&addr, "/huge/0/0/0.mvt", "");
     assert_eq!(code, 500);
     assert!(String::from_utf8_lossy(&body).contains("tile ceiling"));
+}
+
+/// A file rewritten in place (same inode) that does not reopen is refused,
+/// not read at the old directory's offsets; once it opens, it serves again.
+#[test]
+fn a_broken_in_place_rewrite_is_refused_until_it_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("inplace.pmtiles");
+    write_archive(&path, 1);
+    let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0).unwrap();
+    let addr = server
+        .url()
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_owned();
+    std::thread::spawn(move || server.run(|| true));
+    assert_eq!(get(&addr, "/inplace/0/0/0.mvt", "").0, 200);
+
+    // `fs::write` truncates and rewrites the same inode.
+    std::fs::write(&path, vec![0u8; 4096]).unwrap();
+    assert_eq!(get(&addr, "/inplace/0/0/0.mvt", "").0, 503);
+
+    let next = dir.path().join("next.pmtiles");
+    write_archive(&next, 2);
+    std::fs::write(&path, std::fs::read(&next).unwrap()).unwrap();
+    let index = ArchiveIndex::open(&path).unwrap();
+    let r = index.find(0, 0, 0).unwrap().unwrap();
+    let (code, _, body) = get(&addr, "/inplace/0/0/0.mvt", "");
+    assert_eq!((code, body), (200, index.read_range(r).unwrap()));
 }

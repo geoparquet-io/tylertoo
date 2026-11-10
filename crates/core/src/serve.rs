@@ -29,6 +29,9 @@ pub enum ServeError {
     #[error("{}: an archive needs a UTF-8 file name", path.display())]
     #[non_exhaustive]
     BadName { path: PathBuf },
+    /// No archive was given.
+    #[error("no archive to serve")]
+    NoArchives,
     /// Two archives share a file stem, so one URL would name both.
     #[error("two archives are named {name:?}; rename one")]
     #[non_exhaustive]
@@ -57,6 +60,7 @@ impl Classify for ServeError {
     fn kind(&self) -> ErrorKind {
         match self {
             ServeError::BadName { .. }
+            | ServeError::NoArchives
             | ServeError::DuplicateName { .. }
             | ServeError::ReservedName { .. } => ErrorKind::Usage,
             ServeError::Open { error, .. } => error.kind(),
@@ -93,15 +97,18 @@ struct Served {
 }
 
 impl Served {
-    /// Reopen the archive if the file changed. A file caught mid-rewrite
-    /// fails to open; the old index keeps serving and the next request
-    /// tries again.
-    fn refresh(&mut self) {
+    /// Reopen the archive if the file changed, and say whether the index
+    /// still describes the bytes it reads. A file caught mid-rewrite fails
+    /// to open, and the next request tries again: meanwhile a replaced file
+    /// (new inode) keeps serving the old one through its open handle, but a
+    /// file rewritten in place does not, since that handle reads the new
+    /// bytes at the old offsets.
+    fn refresh(&mut self) -> bool {
         let Ok(now) = std::fs::metadata(&self.path).map(|m| stamp(&m)) else {
-            return;
+            return true;
         };
         if now == self.stamp {
-            return;
+            return true;
         }
         match ArchiveIndex::open(&self.path) {
             Ok(index) => {
@@ -109,8 +116,12 @@ impl Served {
                 warn_variable_depth(&index);
                 self.index = index;
                 self.stamp = now;
+                true
             }
-            Err(e) => log::warn!("{} changed but did not reopen: {e}", self.path.display()),
+            Err(e) => {
+                log::warn!("{} changed but did not reopen: {e}", self.path.display());
+                now.2 != self.stamp.2
+            }
         }
     }
 }
@@ -142,6 +153,9 @@ impl Server {
     /// An archive that does not open, two archives with the same file stem,
     /// or an address that cannot be bound.
     pub fn bind(archives: &[PathBuf], host: &str, port: u16) -> Result<Self, ServeError> {
+        if archives.is_empty() {
+            return Err(ServeError::NoArchives);
+        }
         let mut served: Vec<Served> = Vec::new();
         for path in archives {
             let name = path
@@ -252,8 +266,9 @@ impl Server {
             }
             [file] => {
                 let (name, ext) = file.rsplit_once('.').unwrap_or((file, ""));
-                let Some(a) = self.archive(name) else {
-                    return status(404);
+                let a = match self.archive(name) {
+                    Ok(a) => a,
+                    Err(res) => return res,
                 };
                 match ext {
                     "json" => json(&tilejson(a, host.unwrap_or("localhost"))),
@@ -262,15 +277,15 @@ impl Server {
                 }
             }
             [name, "metadata.json"] => match self.archive(name) {
-                Some(a) => metadata(&a.index),
-                None => status(404),
+                Ok(a) => metadata(&a.index),
+                Err(res) => res,
             },
             [name, "stats.json"] => match self.archive(name) {
-                Some(a) => match compute_stats(&a.index, DEFAULT_LARGEST, false) {
+                Ok(a) => match compute_stats(&a.index, DEFAULT_LARGEST, false) {
                     Ok(report) => json(&serde_json::json!(report)),
                     Err(e) => error(&e),
                 },
-                None => status(404),
+                Err(res) => res,
             },
             [name, z, x, y] => {
                 let y = y.split_once('.').map_or(*y, |(y, _)| y);
@@ -278,18 +293,27 @@ impl Server {
                     return status(404);
                 };
                 match self.archive(name) {
-                    Some(a) => tile(&a.index, z, x, y),
-                    None => status(404),
+                    Ok(a) => tile(&a.index, z, x, y),
+                    Err(res) => res,
                 }
             }
             _ => status(404),
         }
     }
 
-    fn archive(&mut self, name: &str) -> Option<&Served> {
-        let a = self.archives.iter_mut().find(|a| a.name == name)?;
-        a.refresh();
-        Some(a)
+    /// The archive named `name`, or the response that replaces it: 404 for
+    /// no such archive, 503 while a file rewritten in place cannot reopen.
+    fn archive(&mut self, name: &str) -> Result<&Served, Response<Box<dyn Read + Send>>> {
+        let a = self
+            .archives
+            .iter_mut()
+            .find(|a| a.name == name)
+            .ok_or_else(|| status(404))?;
+        if a.refresh() {
+            Ok(a)
+        } else {
+            Err(status(503))
+        }
     }
 }
 
