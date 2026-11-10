@@ -102,6 +102,8 @@ fn tiles_surfaces_every_core_rule() {
         ),
         // Q4: formerly a `bail!` "(also enforced in core)".
         (&["--accumulate-attribute", "pop:sum"][..], "--cluster"),
+        // #827: category counts without clustering.
+        (&["--cluster-categories", "kind"][..], "--cluster"),
         // #386/#443: the feature id excluded by the property selection.
         (
             &["--exclude-property", "id", "--feature-id", "id"][..],

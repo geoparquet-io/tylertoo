@@ -68,6 +68,7 @@ Args:
     cluster: Merge each cell's points and add `point_count`.
     accumulate_attributes: Aggregation method for each column in
         a cluster.
+    cluster_categories: TODO(docs)
     coalesce_lines: Join touching same-class lines at coarse levels,
         or `None` for on (off with `verbatim`). `True` is refused in
         partitioning mode.

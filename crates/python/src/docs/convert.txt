@@ -74,6 +74,7 @@ Args:
     drop_polygons: See `overview()`.
     cluster: See `overview()`.
     accumulate_attributes: See `overview()`.
+    cluster_categories: See `overview()`.
     coalesce_lines: See `overview()`.
     coalesce_snap: See `overview()`.
     coalesce_junction_angle: See `overview()`.

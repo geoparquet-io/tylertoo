@@ -120,6 +120,8 @@ def _convert(tmp_path: Path, **kwargs: object) -> None:
         ),
         # Q4: accumulation without clustering.
         ({"accumulate_attributes": {"pop": "sum"}}, "--cluster"),
+        # #827: category counts without clustering.
+        ({"cluster_categories": "kind"}, "--cluster"),
         # #279/#745: two collapse switches.
         ({"collapse": True, "no_collapse": True}, "mutually exclusive"),
         # #364: both ladder spellings.

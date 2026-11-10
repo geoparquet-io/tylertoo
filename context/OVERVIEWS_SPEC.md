@@ -1072,6 +1072,12 @@ does so MUST observe the following:
 - The aggregated column keeps its declared type; producers SHOULD
   prefer floating-point columns for `mean`.
 
+### 12.3.1 Category counts (normative when used)
+
+TODO(docs): state the `--cluster-categories` (#827) count columns, the
+`other` slot, nulls as zero, and the per-row invariant that a row's
+category counts sum to its `point_count`.
+
 ### 12.4 Metadata (normative when clustering)
 
 Clustering is recorded in the `generalization` provenance block
@@ -1085,6 +1091,9 @@ Clustering := {
                      "op": "sum"|"max"|"min"|"mean" } ]  // OPTIONAL
 }
 ```
+
+TODO(docs): add the OPTIONAL `categories` member
+(`{ "column": string, "values": [string] }`) and the validator rule for it.
 
 This member is one of the two exceptions to §3.5's informative rule:
 when `clustering.enabled` is true a validator MUST enforce §12.2

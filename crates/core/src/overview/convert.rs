@@ -48,8 +48,8 @@ use super::assign::{
     AssignConfig, DensityBudgetConfig, FeatureKind, FeatureTable, SUPERCELL_GSD_FACTOR,
 };
 use super::cluster::{
-    build_cluster_tables, verify_sum_invariant, AccumulateSpec, ClusterEntry, ClusterTables,
-    POINT_COUNT_COLUMN,
+    build_cluster_tables_summing, verify_sum_invariant, AccumulateSpec, ClusterEntry, ClusterSums,
+    ClusterTables, POINT_COUNT_COLUMN,
 };
 use super::coalesce::{
     coalesce_level_lines_with, CoalesceParams, ExactChains, COALESCED_COUNT_COLUMN,
@@ -60,10 +60,10 @@ use super::ladder::{
     build_ladder, dense_rank_span, entry_levels, EntryZoomKind, EntryZoomLadder, EntryZoomSpec,
 };
 use super::level::{
-    gsd_with_base, zoom_for_gsd, AccumulatedColumn, ClusteringProvenance, CoalescingProvenance,
-    Crs, DensityProvenance, EntryZoomProvenance, Generalization, GeneralizationLevel,
-    MemoryProfile, Mode, RankingProvenance, RepresentationBandProvenance, GSD_TILE_BASE,
-    METERS_PER_DEGREE,
+    gsd_with_base, zoom_for_gsd, AccumulatedColumn, ClusterCategories, ClusteringProvenance,
+    CoalescingProvenance, Crs, DensityProvenance, EntryZoomProvenance, Generalization,
+    GeneralizationLevel, MemoryProfile, Mode, RankingProvenance, RepresentationBandProvenance,
+    GSD_TILE_BASE, METERS_PER_DEGREE,
 };
 use super::pipeline::{gib, MemoryLimit, MemoryLimitSource};
 use super::properties::{PropertySelection, PropertySelectionError};
@@ -660,6 +660,13 @@ pub struct ConvertOptions {
     #[cfg_attr(feature = "cli", arg(long = "accumulate-attribute", id = "accumulate_attributes", value_name = "COL:OP", help_heading = "Clustering", value_parser = parse_accumulate))]
     #[cfg_attr(feature = "cli", arg(help = "Aggregate a numeric column over each cluster as `COL:OP`, where `OP` is `sum`, `max`, `min`, or `mean` (repeatable). Requires `--cluster`", long_help = None))]
     pub accumulate: Vec<AccumulateSpec>,
+    /// TODO(docs)
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "COL", help_heading = "Clustering")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "TODO(docs)", long_help = None))]
+    pub cluster_categories: Option<String>,
     /// Enable line network coalescing (plan Q3). **Default `true`** (like
     /// `line_thinning = 1.0` and the clustering point grid, chosen by
     /// maintainer render review: defaults should look right). At each
@@ -945,6 +952,7 @@ with_setters!(ConvertOptions {
     with_read_workers => read_workers: usize,
     with_cluster => cluster: bool,
     with_accumulate => accumulate: Vec<AccumulateSpec>,
+    with_cluster_categories => cluster_categories: Option<String>,
     with_coalesce_lines => coalesce_lines: bool,
     with_coalesce_snap => coalesce_snap: f64,
     with_coalesce_max_level_rows => coalesce_max_level_rows: usize,
@@ -1526,6 +1534,7 @@ impl Default for ConvertOptions {
             read_workers: READ_WORKERS_AUTO,
             cluster: false,
             accumulate: Vec::new(),
+            cluster_categories: None,
             coalesce_lines: true,
             coalesce_snap: DEFAULT_SNAP_GSD_FACTOR,
             coalesce_max_level_rows: DEFAULT_COALESCE_MAX_LEVEL_ROWS,
@@ -2034,6 +2043,18 @@ pub enum ConvertError {
     /// `--accumulate-attribute` was supplied without `--cluster`.
     #[error("--accumulate-attribute requires --cluster")]
     AccumulateWithoutCluster,
+    /// `--cluster-categories` was supplied without `--cluster`.
+    #[error("--cluster-categories requires --cluster")]
+    ClusterCategoriesWithoutCluster,
+    /// The `--cluster-categories` column cannot be counted.
+    #[error("--cluster-categories column {name:?} {problem}")]
+    #[non_exhaustive]
+    ClusterCategoriesColumn {
+        /// The requested column name.
+        name: String,
+        /// What is wrong with it.
+        problem: String,
+    },
     /// An `--accumulate-attribute` column is not present in the input schema.
     #[error("accumulate-attribute column {name:?} not found in input schema")]
     #[non_exhaustive]
@@ -2454,6 +2475,7 @@ impl crate::error::Classify for ConvertError {
             | ConvertError::ClusterPartitioningUnsupported
             | ConvertError::VerbatimPartitioningUnsupported
             | ConvertError::AccumulateWithoutCluster
+            | ConvertError::ClusterCategoriesWithoutCluster
             | ConvertError::AutoZoomMinAboveCeiling { .. }
             | ConvertError::Filter(super::filter::FilterError::Parse(_)) => ErrorKind::Usage,
             // The box is too small for this input (#543).
@@ -2466,6 +2488,7 @@ impl crate::error::Classify for ConvertError {
             | ConvertError::ClassRankColumnNotString { .. }
             | ConvertError::AccumulateColumnMissing { .. }
             | ConvertError::AccumulateColumnNotNumeric { .. }
+            | ConvertError::ClusterCategoriesColumn { .. }
             | ConvertError::AutoZoomNoSignal { .. }
             | ConvertError::Properties(_) => ErrorKind::Input,
             _ => crate::error::fallback_kind(self),
@@ -3441,6 +3464,9 @@ fn check_mode_combinations(options: &ConvertOptions) -> Result<(), ConvertError>
     if !options.accumulate.is_empty() && !options.cluster {
         return Err(ConvertError::AccumulateWithoutCluster);
     }
+    if options.cluster_categories.is_some() && !options.cluster {
+        return Err(ConvertError::ClusterCategoriesWithoutCluster);
+    }
     Ok(())
 }
 
@@ -3468,6 +3494,9 @@ fn knob_columns(options: &ConvertOptions, schema: &Schema) -> Vec<(String, Strin
     }
     for a in &options.accumulate {
         out.push((a.column.clone(), "--accumulate-attribute".to_string()));
+    }
+    if let Some(c) = &options.cluster_categories {
+        out.push((c.clone(), "--cluster-categories".to_string()));
     }
     if let Some(f) = &options.filter {
         // Syntax was validated by `validate_options`; a parse failure here
@@ -3938,18 +3967,22 @@ pub(super) fn build_verified_cluster_tables(
     min_levels: &[u8],
     level_gsds: &[f64],
     acc_values: &[Vec<Option<f64>>],
+    categories: Option<&[u32]>,
     crs: Crs,
     options: &ConvertOptions,
 ) -> Result<ClusterTables, ConvertError> {
     let ops: Vec<_> = options.accumulate.iter().map(|s| s.op).collect();
-    let tables = build_cluster_tables(
+    let tables = build_cluster_tables_summing(
         features,
         min_levels,
         level_gsds,
         &options.assign,
         crs,
-        acc_values,
-        &ops,
+        ClusterSums {
+            values: acc_values,
+            ops: &ops,
+            categories,
+        },
     );
     // Strict §12.1 accounting: Σ point_count per level == source point count,
     // and no clustered level thins its points to zero.
@@ -5960,7 +5993,41 @@ pub(super) fn validate_cluster_schema(
         }
         indices.push(idx);
     }
+    if let Some(name) = &options.cluster_categories {
+        let problem = |problem: String| ConvertError::ClusterCategoriesColumn {
+            name: name.clone(),
+            problem,
+        };
+        let idx = schema
+            .index_of(name)
+            .map_err(|_| problem("is not in the input schema".to_string()))?;
+        let dt = schema.field(idx).data_type();
+        // The `GroupInterner` types: a non-string column would count every row
+        // as `other`.
+        if !matches!(dt, DataType::Utf8 | DataType::LargeUtf8) {
+            return Err(problem(format!("is {dt:?} but must be a string column")));
+        }
+        let prefix = format!("{name}:");
+        if let Some(f) = schema
+            .fields()
+            .iter()
+            .find(|f| f.name().starts_with(&prefix))
+        {
+            return Err(problem(format!(
+                "would write {prefix}<value> count columns, but the input already has a \
+                 column named {:?}",
+                f.name()
+            )));
+        }
+    }
     Ok(indices)
+}
+
+/// Schema index of the `--cluster-categories` column (#827), which
+/// [`validate_cluster_schema`] has checked; `None` when the option is off.
+pub(super) fn cluster_category_column(schema: &Schema, options: &ConvertOptions) -> Option<usize> {
+    let name = options.cluster_categories.as_ref()?;
+    schema.index_of(name).ok()
 }
 
 /// Whether an Arrow type is accepted by `--accumulate-attribute`.
@@ -5982,13 +6049,26 @@ fn is_numeric_type(dt: &DataType) -> bool {
 
 /// The writer source schema with the trailing `point_count` INT64 NOT NULL
 /// column appended (clustering enabled).
-pub(super) fn append_point_count_field(schema: &Schema) -> Schema {
+///
+/// With `--cluster-categories` (#827), one nullable INT64 count column per
+/// category slot follows it, in slot order.
+pub(super) fn append_point_count_field(
+    schema: &Schema,
+    categories: Option<&ClusterCategories>,
+) -> Schema {
     let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new(
         POINT_COUNT_COLUMN,
         DataType::Int64,
         false,
     )));
+    if let Some(c) = categories {
+        fields.extend(
+            c.values
+                .iter()
+                .map(|v| Arc::new(Field::new(c.count_column(v), DataType::Int64, true))),
+        );
+    }
     Schema::new(fields)
 }
 
@@ -6008,12 +6088,17 @@ pub(super) fn append_point_count_field(schema: &Schema) -> Schema {
 /// non-singleton winners have `point_count > 1` and rewritten aggregates.
 /// Aggregates are computed in `f64`; written back in the column's original
 /// type (integer columns round to nearest — relevant for `mean`).
+///
+/// `category_col` is the `--cluster-categories` source column (#827): the
+/// count columns trailing `point_count` in `out_schema` are filled from a
+/// cluster's counts, or with 1 for a row's own value when it is no cluster.
+/// A zero count is written as null.
 pub(super) fn apply_cluster_columns(
     batch: RecordBatch,
     out_schema: &Schema,
     global_indices: &[usize],
     table: Option<&HashMap<usize, ClusterEntry>>,
-    acc_cols: &[usize],
+    (acc_cols, category_col): (&[usize], Option<usize>),
 ) -> Result<RecordBatch, ConvertError> {
     use arrow_array::Int64Array;
 
@@ -6039,8 +6124,71 @@ pub(super) fn apply_cluster_columns(
         .map(|g| table.and_then(|t| t.get(g)).map_or(1, |e| e.point_count))
         .collect();
     columns.push(Arc::new(Int64Array::from(counts)));
+    if let Some(col) = category_col {
+        let slots = category_count_columns(
+            &batch,
+            &out_schema.fields()[columns.len()..],
+            col,
+            global_indices,
+            table,
+        );
+        columns.extend(slots);
+    }
 
     Ok(RecordBatch::try_new(Arc::new(out_schema.clone()), columns)?)
+}
+
+/// The `--cluster-categories` count columns (#827) for one level batch, one
+/// per field of `slot_fields` (named `COLUMN:value`, in slot order).
+fn category_count_columns(
+    batch: &RecordBatch,
+    slot_fields: &[Arc<Field>],
+    col: usize,
+    global_indices: &[usize],
+    table: Option<&HashMap<usize, ClusterEntry>>,
+) -> Vec<Arc<dyn Array>> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::Int64Array;
+
+    let prefix = format!("{}:", batch.schema().field(col).name());
+    let slot_of: HashMap<&str, usize> = slot_fields
+        .iter()
+        .enumerate()
+        .map(|(slot, f)| (&f.name()[prefix.len()..], slot))
+        .collect();
+    let other = slot_of.get(super::cluster::OTHER_CATEGORY).copied();
+    let values = batch.column(col);
+    // `validate_cluster_schema` admits only these two types.
+    let value_at = |row: usize| -> Option<&str> {
+        if values.is_null(row) {
+            return None;
+        }
+        match values.data_type() {
+            DataType::Utf8 => Some(values.as_string::<i32>().value(row)),
+            DataType::LargeUtf8 => Some(values.as_string::<i64>().value(row)),
+            _ => None,
+        }
+    };
+    let mut counts = vec![vec![None; global_indices.len()]; slot_fields.len()];
+    for (row, g) in global_indices.iter().enumerate() {
+        match table.and_then(|t| t.get(g)) {
+            Some(e) if !e.categories.as_slice().is_empty() => {
+                for &(slot, n) in e.categories.as_slice() {
+                    counts[slot as usize][row] = Some(n);
+                }
+            }
+            _ => {
+                let slot = value_at(row).and_then(|v| slot_of.get(v).copied());
+                if let Some(slot) = slot.or(other) {
+                    counts[slot][row] = Some(1);
+                }
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .map(|c| Arc::new(Int64Array::from(c)) as Arc<dyn Array>)
+        .collect()
 }
 
 /// Rebuild a numeric column with per-row override values (`None` keeps the
@@ -6239,6 +6387,9 @@ pub(super) fn resolve_reserved_column_collisions(
             spec.column = new;
         }
     }
+    if let Some(new) = options.cluster_categories.as_deref().and_then(remap) {
+        options.cluster_categories = Some(new);
+    }
     // #364: the motivating ladder column is literally named `level` (#359's
     // reporter and #364's are the same dataset), so a ladder is the
     // single most likely option to name a reserved column.
@@ -6334,6 +6485,15 @@ impl GroupInterner {
             DataType::LargeUtf8 => intern!(col.as_string::<i64>()),
             _ => out.extend(std::iter::repeat_n(Self::NULL_GROUP, col.len())),
         }
+    }
+
+    /// The interned values, indexed by id.
+    pub(super) fn into_values(self) -> Vec<String> {
+        let mut values = vec![String::new(); self.map.len()];
+        for (value, id) in self.map {
+            values[id as usize] = value;
+        }
+        values
     }
 }
 
@@ -6802,6 +6962,8 @@ pub(super) fn build_generalization(
                         op: s.op.as_str().to_string(),
                     })
                     .collect(),
+                // Known only after pass 1; `create_level_writer` fills it in.
+                categories: None,
             })
         } else {
             None
@@ -12782,6 +12944,72 @@ mod tests {
         assert!(coarse.iter().any(|&c| c > 1), "no clustering happened");
         assert!(coarse.len() < geoms.len());
         assert_eq!(report.levels.last().unwrap().feature_count, geoms.len());
+    }
+
+    /// #827: `--cluster-categories` adds one count column per kept value plus
+    /// `other`; every row's counts sum to its `point_count`, every level
+    /// conserves each value's total, and the file validates.
+    #[test]
+    fn cluster_categories_count_members_per_value() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        // 600 distinct names, each once: the 100 smallest by value keep a
+        // column, the other 500 count as `other`.
+        let geoms = grid_points(600);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+        let opts = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 8,
+            },
+            cluster: true,
+            cluster_categories: Some("name".to_string()),
+            ..Default::default()
+        };
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        let vr = validate_file(tout.path()).unwrap();
+        assert!(vr.is_valid(), "{:?}", vr.failures().collect::<Vec<_>>());
+        assert_eq!(vr.check_passed("cluster_category_counts"), Some(true));
+
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let mut clustered = false;
+        for level in 0..reader.num_levels() {
+            let mut totals: HashMap<String, i64> = HashMap::new();
+            for batch in reader.read_level(level, None).unwrap() {
+                let batch = batch.unwrap();
+                let schema = batch.schema();
+                let cats: Vec<usize> = (0..schema.fields().len())
+                    .filter(|&i| schema.field(i).name().starts_with("name:"))
+                    .collect();
+                assert_eq!(cats.len(), 101, "100 kept values + other");
+                let pc = batch
+                    .column_by_name("point_count")
+                    .unwrap()
+                    .as_primitive::<Int64Type>();
+                for row in 0..batch.num_rows() {
+                    let mut sum = 0;
+                    for &c in &cats {
+                        let col = batch.column(c).as_primitive::<Int64Type>();
+                        if col.is_valid(row) {
+                            sum += col.value(row);
+                            *totals.entry(schema.field(c).name().clone()).or_default() +=
+                                col.value(row);
+                        }
+                    }
+                    assert_eq!(sum, pc.value(row), "level {level} row {row}");
+                    clustered |= pc.value(row) > 1;
+                }
+            }
+            assert_eq!(totals["name:other"], 500, "level {level}");
+            assert_eq!(totals["name:f0"], 1, "level {level}");
+            assert!(
+                totals.contains_key("name:f107"),
+                "f107 sorts among the 100 smallest"
+            );
+        }
+        assert!(clustered, "no clustering happened");
     }
 
     /// §12.1 sum-invariant property across knob combinations: clustering
