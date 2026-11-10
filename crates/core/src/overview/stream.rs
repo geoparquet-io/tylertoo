@@ -3144,7 +3144,7 @@ fn run_front_half(
     let options = &preflight.options;
     let config = options.validate()?;
     #[cfg(test)]
-    let memory = super::source::eager_input()
+    let mut memory = super::source::eager_input()
         .then(|| {
             MemorySource::load(
                 source,
@@ -3176,6 +3176,15 @@ fn run_front_half(
     )?;
     if let Some(read) = plan.read_selection.take() {
         preflight.widen_selection(read, source, diagnostics)?;
+        // The test-only eager snapshot holds the narrower selection.
+        #[cfg(test)]
+        if memory.is_some() {
+            memory = Some(MemorySource::load(
+                source,
+                preflight.selected_row_groups.as_ref(),
+                pass1_read_tuning(preflight.budget, &preflight.options, 0, 0),
+            )?);
+        }
     }
     if replay {
         stage_pass0(source, &mut preflight, rss, "plan load", diagnostics);

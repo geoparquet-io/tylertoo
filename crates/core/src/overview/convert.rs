@@ -14017,6 +14017,80 @@ mod tests {
     /// Fixture writers shared with `overview::stream`'s tests (#422).
     use super::super::testutil::{write_multi_rg_input, write_multi_rg_input_with_crs};
 
+    /// #546 review: a data shard whose coalesced chains widen its read
+    /// selection must build the same overview from the eager (test-only)
+    /// input as from the stream. The chain's rep lies in a row group west of,
+    /// and before, the ones the shard's window selects.
+    #[test]
+    fn shard_chain_widening_matches_on_eager_and_streaming_input() {
+        use geo::{coord, LineString};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        // One 1-degree segment per row group along lat 10, from lng -60 to 60:
+        // one chain at the coarse levels, its rep far west of the shard.
+        let segments: Vec<Geometry<f64>> = (-60..60)
+            .map(|x| {
+                let x = f64::from(x);
+                Geometry::LineString(LineString::new(vec![
+                    coord! { x: x, y: 10.0 },
+                    coord! { x: x + 1.0, y: 10.0 },
+                ]))
+            })
+            .collect();
+        super::super::testutil::write_one_row_groups(&input, &segments, true, None);
+        let levels = LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 6,
+        };
+        let plan = dir.path().join("convert.plan");
+        convert_to_overviews(
+            &input,
+            dir.path().join("coarse.parquet"),
+            &ConvertOptions {
+                levels: levels.clone(),
+                zoom_ceiling: Some(3),
+                save_plan: Some(plan.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The z4 tile over lng 22.5..45: its window (two pivot tiles of
+        // margin) stops at lng -22.5.
+        let id = crate::pmtiles_writer::tile_id(4, 9, 7);
+        let shard = ConvertOptions {
+            levels,
+            plan: Some(plan),
+            shard: Some(crate::shard::TileRange::new(4, id, id).unwrap()),
+            ..Default::default()
+        };
+        let build = |eager: bool| {
+            let out = dir.path().join(format!("shard-{eager}.parquet"));
+            super::super::source::with_eager_input(eager, || {
+                convert_to_overviews(&input, &out, &shard).unwrap()
+            });
+            let reader = OverviewReader::open(&out).unwrap();
+            (0..reader.num_levels())
+                .flat_map(|l| reader.read_level(l, None).unwrap().map(|b| b.unwrap()))
+                .collect::<Vec<RecordBatch>>()
+        };
+        let streaming = build(false);
+        let chains = streaming
+            .iter()
+            .filter_map(|b| b.column_by_name("coalesced_count"))
+            .flat_map(|c| {
+                c.as_any()
+                    .downcast_ref::<arrow_array::Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .filter(|&n| n > 1)
+            .count();
+        assert!(chains > 0, "the shard must carry merged chains");
+        assert_eq!(build(true), streaming);
+    }
+
     /// Read all ids from all levels of an overview file.
     fn read_all_ids(reader: &OverviewReader) -> Vec<i64> {
         use arrow_array::cast::AsArray;

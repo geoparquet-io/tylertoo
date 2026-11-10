@@ -164,12 +164,24 @@ pub(crate) fn write_multi_rg_input_with_crs(
     crs_metadata: Option<geoarrow::datatypes::Metadata>,
 ) {
     use geo::Point;
-    use tylertoo_io::test_support::WriterProperties;
 
     let geoms: Vec<Geometry<f64>> = coords
         .iter()
         .map(|&(x, y)| Geometry::Point(Point::new(x, y)))
         .collect();
+    write_one_row_groups(path, &geoms, with_covering, crs_metadata);
+}
+
+/// One row group per geometry, with `id` = row-group index (#546: line
+/// chains that span row groups).
+pub(crate) fn write_one_row_groups(
+    path: &Path,
+    geoms: &[Geometry<f64>],
+    with_covering: bool,
+    crs_metadata: Option<geoarrow::datatypes::Metadata>,
+) {
+    use tylertoo_io::test_support::WriterProperties;
+
     let n = geoms.len();
     let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
     let typ = match crs_metadata {
