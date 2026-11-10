@@ -352,6 +352,10 @@ pub tylertoo_core::ConvertError::ClassRankColumnMissing::name: alloc::string::St
 #[non_exhaustive] pub tylertoo_core::ConvertError::ClassRankColumnNotString
 pub tylertoo_core::ConvertError::ClassRankColumnNotString::data_type: alloc::string::String
 pub tylertoo_core::ConvertError::ClassRankColumnNotString::name: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::ConvertError::ClusterCategoriesColumn
+pub tylertoo_core::ConvertError::ClusterCategoriesColumn::name: alloc::string::String
+pub tylertoo_core::ConvertError::ClusterCategoriesColumn::problem: alloc::string::String
+pub tylertoo_core::ConvertError::ClusterCategoriesWithoutCluster
 pub tylertoo_core::ConvertError::ClusterInvariant(alloc::string::String)
 pub tylertoo_core::ConvertError::ClusterPartitioningUnsupported
 pub tylertoo_core::ConvertError::CoalescedCountColumnPresent
@@ -2127,6 +2131,7 @@ pub tylertoo_core::ConvertOptions::auto_max_zoom: bool
 pub tylertoo_core::ConvertOptions::bbox: core::option::Option<[f64; 4]>
 pub tylertoo_core::ConvertOptions::class_ranking: core::option::Option<tylertoo_core::ClassRanking>
 pub tylertoo_core::ConvertOptions::cluster: bool
+pub tylertoo_core::ConvertOptions::cluster_categories: core::option::Option<alloc::string::String>
 pub tylertoo_core::ConvertOptions::coalesce_junction_angle: f64
 pub tylertoo_core::ConvertOptions::coalesce_lines: bool
 pub tylertoo_core::ConvertOptions::coalesce_max_level_rows: usize
@@ -2167,6 +2172,7 @@ pub fn tylertoo_core::ConvertOptions::with_auto_max_zoom(self, bool) -> Self
 pub fn tylertoo_core::ConvertOptions::with_bbox(self, core::option::Option<[f64; 4]>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_class_ranking(self, core::option::Option<tylertoo_core::ClassRanking>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_cluster(self, bool) -> Self
+pub fn tylertoo_core::ConvertOptions::with_cluster_categories(self, core::option::Option<alloc::string::String>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_coalesce_junction_angle(self, f64) -> Self
 pub fn tylertoo_core::ConvertOptions::with_coalesce_lines(self, bool) -> Self
 pub fn tylertoo_core::ConvertOptions::with_coalesce_max_level_rows(self, usize) -> Self

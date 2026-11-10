@@ -1072,6 +1072,17 @@ does so MUST observe the following:
 - The aggregated column keeps its declared type; producers SHOULD
   prefer floating-point columns for `mean`.
 
+### 12.3.1 Category counts (normative when used)
+
+A writer MAY count category values using §12.3 accumulation: each
+source member contributes an implicit `1` to its category's count and
+`0` to the others, combined by `sum` from source values at each level.
+Count columns MUST be named `COLUMN:value` and have type INT64;
+null count cells MUST mean zero. Singleton rows MUST count `1` in
+their own value's slot. A writer MAY group values into an `other`
+slot; null source values MUST count there. Each row's category counts
+MUST sum to its `point_count`.
+
 ### 12.4 Metadata (normative when clustering)
 
 Clustering is recorded in the `generalization` provenance block
@@ -1082,9 +1093,14 @@ Clustering := {
   "enabled":            true,
   "point_count_column": string,   // e.g. "point_count"
   "accumulated": [ { "column": string,
-                     "op": "sum"|"max"|"min"|"mean" } ]  // OPTIONAL
+                     "op": "sum"|"max"|"min"|"mean" } ], // OPTIONAL
+  "categories": { "column": string,
+                  "values": [string] }                // OPTIONAL
 }
 ```
+
+When `categories` is present, a validator MUST check that each row's
+category counts sum to its `point_count` (§12.3.1).
 
 This member is one of the two exceptions to §3.5's informative rule:
 when `clustering.enabled` is true a validator MUST enforce §12.2

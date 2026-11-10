@@ -4,6 +4,9 @@ Args:
     input: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
         (`EPSG:3857`). Pass a file, directory, glob, `s3://`,
         `gs://`, or `https://` URL or prefix, or a list of files.
+        First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas)
+        to a GeoParquet file using `gpio` or DuckDB
+        `COPY (... ORDER BY ST_Hilbert(...)) TO 'x.parquet'`.
     output: Overview file to write.
     mode: `"duplicating"` makes each level a complete map;
         `"partitioning"` stores each feature once.
@@ -72,6 +75,12 @@ Args:
     cluster: Merge each cell's points and add `point_count`.
     accumulate_attributes: Aggregation method for each column in
         a cluster.
+    cluster_categories: String column to count per cluster in `COL:value`
+        columns, or `None` for off. Requires `cluster`. Keep up to 100
+        values by frequency, breaking ties by ascending value; count the
+        rest, nulls, and literal `other` in `COL:other` when needed.
+        Null count cells mean zero. A point outside any cluster counts 1
+        for its own value; each row's counts sum to `point_count`.
     coalesce_lines: Join touching same-class lines at coarse levels,
         or `None` for on (off with `verbatim`). `True` is refused in
         partitioning mode.

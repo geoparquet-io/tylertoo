@@ -9,6 +9,9 @@ Sharded builds (`--shard`, `--plan-only`) stay CLI-only.
 
 Args:
     input: See `overview()`.
+        First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas)
+        to a GeoParquet file using `gpio` or DuckDB
+        `COPY (... ORDER BY ST_Hilbert(...)) TO 'x.parquet'`.
     output: PMTiles archive to write.
     min_zoom: See `overview()`.
     max_zoom: See `overview()`.
@@ -77,6 +80,7 @@ Args:
     drop_polygons: See `overview()`.
     cluster: See `overview()`.
     accumulate_attributes: See `overview()`.
+    cluster_categories: See `overview()`.
     coalesce_lines: See `overview()`.
     coalesce_snap: See `overview()`.
     coalesce_junction_angle: See `overview()`.

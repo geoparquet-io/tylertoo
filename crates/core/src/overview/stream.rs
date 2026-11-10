@@ -50,16 +50,16 @@ use super::config::ValidatedConfig;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
     apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
-    build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_table_merged,
-    count_vertices, extract_class_ranks, extract_numeric_values, extract_sort_keys,
-    fill_level_bytes, mixed_geometry_field, overture_road_ranking, record_coalesce_merged,
-    record_level_outcome, resolve_pass_read_workers, resolve_reserved_column_collisions,
-    scan_feature_traits, validate_cluster_schema, validate_coalesce_schema,
-    warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking, CoalesceTable, ConvertError,
-    ConvertOptions, ConvertReport, GroupInterner, LevelReport, PlanLevelReport, PlanReport,
-    SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    build_source_schema, class_ranking_provenance, cluster_category_column, coalesce_effective,
+    coalesce_table_merged, count_vertices, extract_class_ranks, extract_numeric_values,
+    extract_sort_keys, fill_level_bytes, mixed_geometry_field, overture_road_ranking,
+    record_coalesce_merged, record_level_outcome, resolve_pass_read_workers,
+    resolve_reserved_column_collisions, scan_feature_traits, validate_cluster_schema,
+    validate_coalesce_schema, warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking,
+    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
+    PlanLevelReport, PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
-use super::level::{Crs, EntryZoomProvenance, Mode, RankingProvenance};
+use super::level::{ClusterCategories, Crs, EntryZoomProvenance, Mode, RankingProvenance};
 use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
 use super::pipe::{for_each_window, scoped_pipe, split_in_flight, WindowStats};
 use super::pipeline;
@@ -96,6 +96,11 @@ struct Pass1Keys<'a> {
     acc_cols: &'a [usize],
     acc_values: &'a mut [Vec<Option<f64>>],
     ladder_values: &'a mut Vec<Option<f64>>,
+    /// `--cluster-categories` (#827).
+    category: Option<&'a mut RowCategories>,
+    /// The budget the category interner is charged to, and the feature
+    /// table's bytes already resident.
+    budget: (&'a MemoryBudget, u64),
 }
 
 struct Pass1Accum<'a> {
@@ -132,6 +137,7 @@ struct Pass2Inputs<'a> {
 struct AssignmentInputs<'a> {
     features: &'a mut FeatureTable,
     acc_values: Vec<Vec<Option<f64>>>,
+    categories: Option<RowCategories>,
     areas: Vec<f32>,
     coalesce_scratch: Option<CoalesceScratch>,
     line_tally: (usize, u64),
@@ -940,6 +946,7 @@ fn levels_at_or_above_ceiling(planned: &[EmitLevel], ceiling: Option<u8>) -> usi
 pub(super) fn build_level_schemas(
     descriptor: &ResolvedSchema,
     options: &ConvertOptions,
+    categories: Option<&ClusterCategories>,
 ) -> (Schema, Schema, Schema) {
     let input_schema = descriptor.schema();
     let geom_name = descriptor
@@ -958,7 +965,7 @@ pub(super) fn build_level_schemas(
     );
     let source_schema = build_source_schema(descriptor, geom_out_field);
     let cluster_schema = if options.cluster {
-        append_point_count_field(&source_schema)
+        append_point_count_field(&source_schema, categories)
     } else {
         source_schema.clone()
     };
@@ -1355,6 +1362,7 @@ fn build_level_ctxs<'a>(
                     .filter(|_| e.orig as usize != inputs.finest)
                     .map(|t| &t[e.orig as usize]),
                 acc_cols: inputs.acc_cols,
+                category_col: cluster_category_column(inputs.source_schema, options),
                 coalesce_enabled: options.coalesce_lines,
                 kinds: inputs.kinds,
                 coalesce_table: inputs.coalesce_tables[i].as_ref(),
@@ -1953,6 +1961,9 @@ struct FooterFacts {
     zoom_ceiling: Option<u8>,
     /// The resolved entry-zoom ladder (`Generalization::entry_zoom`, #446).
     entry_zoom: Option<EntryZoomProvenance>,
+    /// The `--cluster-categories` slots (`ClusteringProvenance::categories`,
+    /// #827).
+    cluster_categories: Option<ClusterCategories>,
 }
 
 /// Whether line coalescing merged anything at ANY planned non-canonical level
@@ -2091,7 +2102,8 @@ fn create_level_writer(
         .expect("preflight checked geometry")
         .to_owned();
     let geom_idx = input_schema.index_of(&geom_name)?;
-    let (source_schema, cluster_schema, out_schema) = build_level_schemas(descriptor, options);
+    let (source_schema, cluster_schema, out_schema) =
+        build_level_schemas(descriptor, options, facts.cluster_categories.as_ref());
 
     let writer_levels: Vec<LevelSpec> = emitted
         .iter()
@@ -2113,6 +2125,9 @@ fn create_level_writer(
     if let Some(g) = writer_opts.generalization.as_mut() {
         g.zoom_ceiling = facts.zoom_ceiling;
         g.entry_zoom = facts.entry_zoom;
+        if let Some(c) = g.clustering.as_mut() {
+            c.categories = facts.cluster_categories;
+        }
     }
     // #507: `build_writer_options` may have raised the cap to fit parquet's
     // row-group ceiling. Record it before the options move into the writer.
@@ -2230,6 +2245,8 @@ pub(super) struct WinnerTables {
     pub(super) level_specs: Vec<(f64, Option<u8>)>,
     /// Cluster tables (Q4), or `None` when clustering is off.
     pub(super) cluster_tables: Option<ClusterTables>,
+    /// `--cluster-categories` slot labels, indexed by category slot (#827).
+    pub(super) cluster_categories: Option<Vec<String>>,
     /// Per-row geometry kinds (Q3), or `None` when line coalescing is off.
     pub(super) kinds: Option<Vec<FeatureKind>>,
     /// The pass-1 line scratch, kept only when coalescing survives the memory
@@ -2443,6 +2460,7 @@ fn resolve_winner_tables(
     let AssignmentInputs {
         features,
         acc_values,
+        categories,
         areas,
         coalesce_scratch,
         line_tally,
@@ -2529,6 +2547,18 @@ fn resolve_winner_tables(
     // O(non-singleton clusters), carried into pass 2 alongside `min_levels`.
     // Accumulate values are extracted per ROW; the cluster stage indexes them
     // by feature position, so remap through each feature's row index.
+    // #827: each feature's category slot, ranked over the features.
+    let (category_slots, cluster_categories) = categories
+        .map(|c| {
+            let ids: Vec<u32> = features.indices().iter().map(|&i| c.rows[i]).collect();
+            super::cluster::category_slots(
+                &ids,
+                &c.values.into_values(),
+                super::cluster::MAX_CLUSTER_CATEGORIES,
+                GroupInterner::NULL_GROUP,
+            )
+        })
+        .unzip();
     let cluster_tables: Option<ClusterTables> = if options.cluster {
         let acc_feat: Vec<Vec<Option<f64>>> = acc_values
             .iter()
@@ -2539,6 +2569,7 @@ fn resolve_winner_tables(
             &feat_min_levels,
             &level_gsds,
             &acc_feat,
+            category_slots.as_deref(),
             crs,
             options,
         )?)
@@ -2546,6 +2577,7 @@ fn resolve_winner_tables(
         None
     };
     drop(acc_values);
+    drop(category_slots);
 
     // Coalescing (Q3): keep the per-row kinds (1 byte/row — line rows bypass
     // the winner table at coalesced levels; skipped-geometry rows default to
@@ -2638,6 +2670,7 @@ fn resolve_winner_tables(
     Ok(WinnerTables {
         level_specs,
         cluster_tables,
+        cluster_categories,
         kinds,
         coalesce_scratch,
         coalesce_build,
@@ -3208,6 +3241,7 @@ fn run_pass1_and_assign(
         provenance: ranking_provenance,
         entry_zoom,
         acc_values,
+        categories,
         coalesce: coalesce_scratch,
         line_tally,
         num_rows,
@@ -3265,6 +3299,7 @@ fn run_pass1_and_assign(
         AssignmentInputs {
             features: &mut features,
             acc_values,
+            categories,
             areas,
             coalesce_scratch,
             line_tally,
@@ -3592,6 +3627,7 @@ pub(crate) fn run_stages(
             WinnerTables {
                 level_specs,
                 mut cluster_tables,
+                cluster_categories,
                 kinds,
                 coalesce_scratch,
                 coalesce_build,
@@ -3620,6 +3656,9 @@ pub(crate) fn run_stages(
         selected_row_groups.as_ref(),
         0..descriptor.schema().fields().len(),
     )?;
+    // Every output row also carries the generated category counts (#827).
+    let footer = footer
+        .map(|f| f.with_generated_int64_columns(cluster_categories.as_ref().map_or(0, Vec::len)));
     let row_bytes = footer.map(|f| f.row_bytes);
 
     // Planned levels with no winners are omitted (§7.3, #211 auto-clamp);
@@ -3701,6 +3740,11 @@ pub(crate) fn run_stages(
             coalesce_merged,
             zoom_ceiling: truncated_at,
             entry_zoom,
+            cluster_categories: options
+                .cluster_categories
+                .clone()
+                .zip(cluster_categories)
+                .map(|(column, values)| ClusterCategories { column, values }),
         },
         diagnostics,
     )?;
@@ -5022,6 +5066,68 @@ impl CoalesceScratch {
     }
 }
 
+/// `--cluster-categories` values seen in pass 1 (#827): the column, its
+/// interned values, and per input row its value's id
+/// ([`GroupInterner::NULL_GROUP`] for null).
+struct RowCategories {
+    col: usize,
+    values: GroupInterner,
+    rows: Vec<u32>,
+}
+
+impl RowCategories {
+    fn new(col: usize) -> Self {
+        Self {
+            col,
+            values: GroupInterner::default(),
+            rows: Vec::new(),
+        }
+    }
+
+    /// Fail with `BudgetExceeded` once the interned values and per-row ids,
+    /// on top of the `resident` scan state (the feature table's allocation,
+    /// capacity included), outgrow the
+    /// memory budget: a high-cardinality column would otherwise grow until
+    /// the process is OOM-killed.
+    fn require_fits(&self, budget: &MemoryBudget, resident: u64) -> Result<(), ConvertError> {
+        let row_bytes = (self.rows.capacity() * std::mem::size_of::<u32>()) as u64;
+        budget.require(
+            MemoryPhase::Scan,
+            resident + self.values.heap_bytes() + row_bytes,
+        )
+    }
+}
+
+/// `(offset, len)` chunks of `chunk_rows` rows over `n` rows: contiguous,
+/// non-overlapping, ascending.
+fn chunk_ranges(n: usize, chunk_rows: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut off = 0usize;
+    while off < n {
+        let len = chunk_rows.min(n - off);
+        ranges.push((off, len));
+        off += len;
+    }
+    ranges
+}
+
+/// Entry-zoom ladder column (#364), resolved by name against the (already
+/// #288-renamed) schema so a `--magnitude-ladder level` on a source that also
+/// has a reserved `level` still finds the caller's column.
+fn ladder_column(schema: &Schema, options: &ConvertOptions) -> Result<Option<usize>, ConvertError> {
+    options
+        .entry_zoom
+        .as_ref()
+        .map(|spec| {
+            schema.index_of(&spec.column).map_err(|_| {
+                ConvertError::from(super::convert::InvalidOption::EntryZoomColumnMissing {
+                    column: spec.column.clone(),
+                })
+            })
+        })
+        .transpose()
+}
+
 /// Result of [`run_pass1`].
 struct Pass1Output {
     /// Per-feature assignment inputs (center, squared diagonal, kind,
@@ -5042,6 +5148,8 @@ struct Pass1Output {
     entry_zoom: Option<EntryZoomProvenance>,
     /// Per-accumulate-spec source values (Q4), parallel to `acc_cols`.
     acc_values: Vec<Vec<Option<f64>>>,
+    /// `--cluster-categories` values (#827), when the option is on.
+    categories: Option<RowCategories>,
     /// Line geometries + groups for coalescing (Q3); `None` unless enabled
     /// AND inside the #449 memory ceiling.
     coalesce: Option<CoalesceScratch>,
@@ -5191,8 +5299,10 @@ fn pass1_projection(
     acc_cols: &[usize],
     filter: Option<&super::filter::BoundFilter>,
     ladder_col: Option<usize>,
+    categories: Option<&RowCategories>,
 ) -> Vec<usize> {
     let mut cols: Vec<usize> = vec![geom_idx];
+    cols.extend(categories.map(|c| c.col));
     // Entry-zoom ladder (#364): pass 1 decides the level, so its column has
     // to be read here even though nothing else in pass 1 looks at it.
     cols.extend(ladder_col);
@@ -5668,6 +5778,8 @@ fn extract_pass1_batch_keys(
         acc_cols,
         acc_values,
         ladder_values,
+        category,
+        budget,
     } = inputs;
     match plan {
         RankPlan::ExplicitSort { idx, .. } => {
@@ -5704,6 +5816,14 @@ fn extract_pass1_batch_keys(
     // uses: the two engines are byte-identical by contract.
     for (s, &idx) in acc_cols.iter().enumerate() {
         acc_values[s].extend(extract_numeric_values(batch.column(proj(idx)).as_ref()));
+    }
+    if let Some(c) = category {
+        c.values.extend_kept(
+            batch.column(proj(c.col)).as_ref(),
+            Some(kept_row),
+            &mut c.rows,
+        );
+        c.require_fits(budget.0, budget.1)?;
     }
 
     // Entry-zoom ladder (#364): row-indexed, like the ranking keys above, but
@@ -5970,22 +6090,17 @@ fn run_pass1_with_chunk_rows(
     let chunk_rows = chunk_rows.max(1);
     let mut plan = build_rank_plan(ctx.descriptor, options)?;
 
-    // Entry-zoom ladder column (#364), resolved by name against the (already
-    // #288-renamed) schema so a `--magnitude-ladder level` on a source that
-    // also has a reserved `level` still finds the caller's column.
-    let ladder_col = options
-        .entry_zoom
-        .as_ref()
-        .map(|spec| {
-            input_schema.index_of(&spec.column).map_err(|_| {
-                ConvertError::from(super::convert::InvalidOption::EntryZoomColumnMissing {
-                    column: spec.column.clone(),
-                })
-            })
-        })
-        .transpose()?;
+    let ladder_col = ladder_column(input_schema, options)?;
 
-    let cols = pass1_projection(geom_idx, &plan, acc_cols, filter, ladder_col);
+    let mut category = cluster_category_column(input_schema, options).map(RowCategories::new);
+    let cols = pass1_projection(
+        geom_idx,
+        &plan,
+        acc_cols,
+        filter,
+        ladder_col,
+        category.as_ref(),
+    );
     // Original schema index → projected batch column index.
     let proj = |orig: usize| cols.binary_search(&orig).expect("projected column");
     let gcol_idx = proj(geom_idx);
@@ -6093,14 +6208,7 @@ fn run_pass1_with_chunk_rows(
                     filter.map(|f| f.eval_mask(&batch, &proj));
                 Pass1Timers::add(&timers_ref.scan, t_filter);
 
-                // Chunk boundaries: contiguous, non-overlapping, ascending.
-                let mut ranges: Vec<(usize, usize)> = Vec::new();
-                let mut off = 0usize;
-                while off < n {
-                    let len = chunk_rows.min(n - off);
-                    ranges.push((off, len));
-                    off += len;
-                }
+                let ranges = chunk_ranges(n, chunk_rows);
 
                 // Sampled once per batch: every chunk of it scans in the same
                 // mode, so the merge below can only over-collect by the lines
@@ -6182,6 +6290,8 @@ fn run_pass1_with_chunk_rows(
                         acc_cols,
                         acc_values: &mut acc_values,
                         ladder_values: &mut ladder_values,
+                        category: category.as_mut(),
+                        budget: (ctx.budget, features.allocated_bytes()),
                     },
                 )?;
                 Pass1Timers::add(&timers_ref.keys, t_keys);
@@ -6237,6 +6347,7 @@ fn run_pass1_with_chunk_rows(
         provenance,
         entry_zoom,
         acc_values,
+        categories: category,
         coalesce,
         line_tally,
         num_rows,
@@ -6507,6 +6618,8 @@ pub(super) struct LevelStreamCtx<'a> {
     cluster_table: Option<&'a std::collections::HashMap<usize, ClusterEntry>>,
     /// Schema indices of the accumulate columns.
     acc_cols: &'a [usize],
+    /// Schema index of the `--cluster-categories` column (#827).
+    category_col: Option<usize>,
     /// Coalescing (Q3): append `coalesced_count` at every level.
     coalesce_enabled: bool,
     /// Per-row geometry kinds (line rows bypass the winner table at
@@ -6932,7 +7045,7 @@ fn assemble_level_batch(
                 ctx.cluster_schema,
                 &globals,
                 ctx.cluster_table,
-                ctx.acc_cols,
+                (ctx.acc_cols, ctx.category_col),
             )?;
         }
         if ctx.coalesce_enabled {
@@ -9467,7 +9580,7 @@ mod tests {
             .expect("fixture has a geometry column");
         let crs = Crs::Epsg4326;
         let (source_schema, cluster_schema, out_schema) =
-            build_level_schemas(source.resolved_schema().unwrap(), &options);
+            build_level_schemas(source.resolved_schema().unwrap(), &options, None);
 
         // Tiny row groups + concurrency 2: the first row-group encode is
         // submitted after 4 rows and drained (surfacing the injected panic)
@@ -9512,6 +9625,7 @@ mod tests {
             cluster_enabled: false,
             cluster_table: None,
             acc_cols: &[],
+            category_col: None,
             coalesce_enabled: false,
             kinds: None,
             coalesce_table: None,
@@ -10726,5 +10840,39 @@ mod tests {
         };
         let (none, _) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &speed, 100);
         assert_eq!((none.reserved_bytes, none.reason), (0, "nothing spills"));
+    }
+
+    /// #827 review: the `--cluster-categories` interner grows with the
+    /// column's distinct values, so pass 1 charges it to the memory budget
+    /// and fails loudly instead of growing until the process is OOM-killed.
+    #[test]
+    fn category_interner_is_charged_to_the_memory_budget() {
+        let values: Vec<String> = (0..1000).map(|i| format!("value-{i:04}")).collect();
+        let col = arrow_array::StringArray::from(values);
+        let mut cats = RowCategories::new(0);
+        cats.values.extend(&col, &mut cats.rows);
+
+        let budget = MemoryBudget::with_available(Some(100_000));
+        cats.require_fits(&budget, 0)
+            .expect("1000 short values fit 100 kB");
+        // The resident feature table counts against the same budget.
+        assert!(cats.require_fits(&budget, 50_000).is_err());
+        match cats.require_fits(&MemoryBudget::with_available(Some(1000)), 0) {
+            Err(ConvertError::BudgetExceeded {
+                phase: "pass-1 scan",
+                needed,
+                available: 1000,
+            }) => {
+                assert!(needed > 10_000, "counts the strings and row ids: {needed}");
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+
+        // Rejected rows keep their row slot but intern nothing.
+        let mut kept = RowCategories::new(0);
+        let mask: Vec<bool> = (0..1000).map(|i| i == 0).collect();
+        kept.values.extend_kept(&col, Some(&mask), &mut kept.rows);
+        assert_eq!(kept.rows.len(), 1000);
+        assert_eq!(kept.values.into_values(), ["value-0000"]);
     }
 }

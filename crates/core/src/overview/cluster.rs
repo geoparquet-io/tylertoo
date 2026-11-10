@@ -131,6 +131,128 @@ pub struct ClusterEntry {
     /// Finalized aggregate per [`AccumulateSpec`], parallel to the spec list.
     /// `None` = no non-null contributor; the winner's own (null) value stands.
     pub aggregates: Vec<Option<f64>>,
+    /// Members per `--cluster-categories` slot (#827); empty when the option
+    /// is off. Sums to `point_count` when it is on.
+    pub categories: CategoryCounts,
+}
+
+/// Per-category member counts: a sum of one per member, by category slot
+/// (#827).
+///
+/// Sparse and sorted by slot, holding only non-zero counts. Counts are sums,
+/// so [`merge`](Self::merge) is commutative and associative: any split of
+/// the members (partitions, waves, shards, or H3/S2 parents for #332)
+/// merges back to the same counts in any order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CategoryCounts(Vec<(u32, i64)>);
+
+impl CategoryCounts {
+    /// Count one member in `slot`.
+    pub fn add(&mut self, slot: u32) {
+        self.add_n(slot, 1);
+    }
+
+    fn add_n(&mut self, slot: u32, n: i64) {
+        match self.0.binary_search_by_key(&slot, |e| e.0) {
+            Ok(i) => self.0[i].1 += n,
+            Err(i) => self.0.insert(i, (slot, n)),
+        }
+    }
+
+    /// Add every count of `other` into `self`.
+    pub fn merge(&mut self, other: &Self) {
+        for &(slot, n) in &other.0 {
+            self.add_n(slot, n);
+        }
+    }
+
+    /// `(slot, count)` pairs, ascending by slot, every count `>= 1`.
+    pub fn as_slice(&self) -> &[(u32, i64)] {
+        &self.0
+    }
+
+    /// Total members counted.
+    pub fn total(&self) -> i64 {
+        self.0.iter().map(|e| e.1).sum()
+    }
+
+    /// Rebuild from stored pairs, rejecting any that [`as_slice`](Self::as_slice)
+    /// could not have produced (unsorted, repeated, or non-positive).
+    pub fn from_pairs(pairs: Vec<(u32, i64)>) -> Option<Self> {
+        let sorted = pairs.windows(2).all(|w| w[0].0 < w[1].0);
+        (sorted && pairs.iter().all(|e| e.1 >= 1)).then_some(Self(pairs))
+    }
+}
+
+/// Most distinct `--cluster-categories` values that get their own column
+/// (#827); the rest count under [`OTHER_CATEGORY`]. Matches tippecanoe's
+/// default `--tile-stats-values-limit`.
+pub const MAX_CLUSTER_CATEGORIES: usize = 100;
+
+/// Label of the category slot that counts every value past
+/// [`MAX_CLUSTER_CATEGORIES`], nulls, and a literal `other` value.
+pub const OTHER_CATEGORY: &str = "other";
+
+/// Pick the category slots for `--cluster-categories` (#827).
+///
+/// `ids` is each feature's interned value (`null_id` for null), indexing
+/// `values`. The `cap` most frequent values keep a slot each, in descending
+/// frequency then ascending value, so the choice is deterministic. Every
+/// other feature goes to a trailing [`OTHER_CATEGORY`] slot, which exists only
+/// when some feature needs it. Returns each feature's slot and the slot
+/// labels.
+pub fn category_slots(
+    ids: &[u32],
+    values: &[String],
+    cap: usize,
+    null_id: u32,
+) -> (Vec<u32>, Vec<String>) {
+    let mut freq = vec![0u64; values.len()];
+    for &id in ids.iter().filter(|&&id| id != null_id) {
+        freq[id as usize] += 1;
+    }
+    let mut ranked: Vec<usize> = (0..values.len())
+        .filter(|&id| freq[id] > 0 && values[id] != OTHER_CATEGORY)
+        .collect();
+    ranked.sort_by(|&a, &b| {
+        freq[b]
+            .cmp(&freq[a])
+            .then_with(|| values[a].cmp(&values[b]))
+    });
+    ranked.truncate(cap);
+    let other = ranked.len() as u32;
+    let mut slot_of = vec![other; values.len()];
+    for (slot, &id) in ranked.iter().enumerate() {
+        slot_of[id] = slot as u32;
+    }
+    let slots: Vec<u32> = ids
+        .iter()
+        .map(|&id| {
+            if id == null_id {
+                other
+            } else {
+                slot_of[id as usize]
+            }
+        })
+        .collect();
+    let mut labels: Vec<String> = ranked.iter().map(|&id| values[id].clone()).collect();
+    if slots.contains(&other) {
+        labels.push(OTHER_CATEGORY.to_string());
+    }
+    (slots, labels)
+}
+
+/// What [`build_cluster_tables_summing`] adds up over each cluster's members.
+#[derive(Debug, Clone, Copy)]
+pub struct ClusterSums<'a> {
+    /// Per [`AccumulateSpec`], the per-feature source values (parallel to
+    /// `features`; `None` = null).
+    pub values: &'a [Vec<Option<f64>>],
+    /// The operators, parallel to `values`.
+    pub ops: &'a [AccumulateOp],
+    /// Per feature, its `--cluster-categories` slot (#827), or `None` when
+    /// the option is off.
+    pub categories: Option<&'a [u32]>,
 }
 
 /// Per-level cluster tables, parallel to `level_gsds`.
@@ -216,6 +338,35 @@ pub fn build_cluster_tables(
     values: &[Vec<Option<f64>>],
     ops: &[AccumulateOp],
 ) -> ClusterTables {
+    build_cluster_tables_summing(
+        features,
+        min_levels,
+        level_gsds,
+        config,
+        crs,
+        ClusterSums {
+            values,
+            ops,
+            categories: None,
+        },
+    )
+}
+
+/// [`build_cluster_tables`], plus the per-category member counts of
+/// [`ClusterSums::categories`] (#827).
+pub fn build_cluster_tables_summing(
+    features: &FeatureTable,
+    min_levels: &[u8],
+    level_gsds: &[f64],
+    config: &AssignConfig,
+    crs: Crs,
+    sums: ClusterSums<'_>,
+) -> ClusterTables {
+    let ClusterSums {
+        values,
+        ops,
+        categories,
+    } = sums;
     debug_assert_eq!(features.len(), min_levels.len());
     debug_assert_eq!(values.len(), ops.len());
 
@@ -349,23 +500,30 @@ pub fn build_cluster_tables(
         // values are added in `point_pos` order. The merged table is still not
         // a valid output (the writer would stamp the merged count on every row
         // sharing the index), and `verify_sum_invariant` rejects it.
-        let mut acc: HashMap<usize, (i64, Vec<AggState>)> = HashMap::new();
+        let mut acc: HashMap<usize, (i64, Vec<AggState>, CategoryCounts)> = HashMap::new();
         for (i, &pos) in point_pos.iter().enumerate() {
             let w = rep[i];
-            let entry = acc
-                .entry(features.indices()[w])
-                .or_insert_with(|| (0, vec![AggState::new(); ops.len()]));
+            let entry = acc.entry(features.indices()[w]).or_insert_with(|| {
+                (
+                    0,
+                    vec![AggState::new(); ops.len()],
+                    CategoryCounts::default(),
+                )
+            });
             entry.0 += 1;
             for (s, vals) in values.iter().enumerate() {
                 if let Some(v) = vals[pos] {
                     entry.1[s].add(v);
                 }
             }
+            if let Some(slots) = categories {
+                entry.2.add(slots[pos]);
+            }
         }
 
         // Keep only non-singleton clusters (singletons pass through verbatim).
         let table = &mut tables[level];
-        for (index, (count, states)) in acc {
+        for (index, (count, states, category_counts)) in acc {
             if count <= 1 {
                 continue;
             }
@@ -378,6 +536,7 @@ pub fn build_cluster_tables(
                         .zip(ops)
                         .map(|(st, &op)| st.finalize(op))
                         .collect(),
+                    categories: category_counts,
                 },
             );
         }
@@ -419,6 +578,11 @@ pub fn verify_sum_invariant(
     if total == 0 {
         return Ok(()); // no source points: nothing to account for
     }
+    // #827: categories are on iff any entry carries them.
+    let categories_on = tables
+        .iter()
+        .flat_map(|t| t.values())
+        .any(|e| !e.categories.as_slice().is_empty());
     for (level, table) in tables.iter().enumerate() {
         let mut sum = 0i64;
         let mut point_rows = 0usize;
@@ -446,6 +610,14 @@ pub fn verify_sum_invariant(
                              by index, so each row would carry the same \
                              point_count (point feature indices must be unique)",
                             f_index
+                        ));
+                    }
+                    let cats = e.categories.total();
+                    if categories_on && cats != e.point_count {
+                        return Err(format!(
+                            "clustered level {level}: feature index {f_index} has \
+                             point_count {} but its category counts sum to {cats}",
+                            e.point_count
                         ));
                     }
                     sum += e.point_count;
@@ -1633,5 +1805,74 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 10_000, "only {checked} orphans checked");
+    }
+
+    /// #827: a cluster's category counts are a sum of one per member, so
+    /// they partition its `point_count`.
+    #[test]
+    fn category_counts_sum_to_point_count() {
+        let feats: Vec<AssignFeature> = (0..4).map(|i| point(i, i as f64 * 100.0, 0.0)).collect();
+        let gsds = [gsd(2), gsd(10)];
+        let cfg = AssignConfig::default();
+        let assignment = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
+        let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
+        let tables = build_cluster_tables_summing(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            ClusterSums {
+                values: &[],
+                ops: &[],
+                categories: Some(&[0, 2, 2, 1]),
+            },
+        );
+        let entry = tables[0].values().next().unwrap();
+        assert_eq!(entry.point_count, 4);
+        assert_eq!(entry.categories.as_slice(), &[(0, 1), (1, 1), (2, 2)]);
+        assert_eq!(entry.categories.total(), entry.point_count);
+        verify_sum_invariant(&table(&feats), &min_levels, &tables).unwrap();
+
+        let mut bad = tables.clone();
+        bad[0].values_mut().next().unwrap().categories =
+            CategoryCounts::from_pairs(vec![(0, 1)]).unwrap();
+        let err = verify_sum_invariant(&table(&feats), &min_levels, &bad).unwrap_err();
+        assert!(err.contains("category counts"), "{err}");
+    }
+
+    /// #827: counts merge by summing, so the order partitions, waves or
+    /// shards arrive in does not change the result.
+    #[test]
+    fn category_counts_merge_in_any_order() {
+        let mut a = CategoryCounts::default();
+        [3, 1, 3].iter().for_each(|&s| a.add(s));
+        let mut b = CategoryCounts::default();
+        [1, 0].iter().for_each(|&s| b.add(s));
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        assert_eq!(ab, ba);
+        assert_eq!(ab.as_slice(), &[(0, 1), (1, 2), (3, 2)]);
+        assert_eq!(ab.total(), 5);
+    }
+
+    /// #827: the most frequent values keep their own slot (ties by value);
+    /// the rest, nulls, and a literal `other` share the `other` slot.
+    #[test]
+    fn category_slots_keep_the_most_frequent_values() {
+        let values: Vec<String> = ["b", "a", "c", "other"].map(String::from).to_vec();
+        const NULL: u32 = u32::MAX;
+        // a×2, b×2, c×1, other×1, null×1; cap 2 keeps a and b.
+        let ids = [0, 1, 1, 0, 2, 3, NULL];
+        let (slots, labels) = category_slots(&ids, &values, 2, NULL);
+        assert_eq!(labels, ["a", "b", "other"]);
+        assert_eq!(slots, [1, 0, 0, 1, 2, 2, 2]);
+
+        // Nothing falls outside the kept values: no `other` slot.
+        let (slots, labels) = category_slots(&[0, 1], &values, 2, NULL);
+        assert_eq!(labels, ["a", "b"]);
+        assert_eq!(slots, [1, 0]);
     }
 }

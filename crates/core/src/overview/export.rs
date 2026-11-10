@@ -18344,6 +18344,7 @@ mod tests {
                 enabled: true,
                 point_count_column: "point_count".to_string(),
                 accumulated: vec![],
+                categories: None,
             }),
             coalescing: None,
             ..coalescing_generalization(None)

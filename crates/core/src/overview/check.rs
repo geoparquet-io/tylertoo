@@ -614,15 +614,17 @@ pub(crate) fn check_cluster_sum_invariant(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) {
     // A malformed count/level type must be reported by the metadata validator,
-    // never passed into Arrow's infallible primitive casts. A partial file has
-    // no canonical source band against which to check the sum.
+    // never passed into Arrow's infallible primitive casts.
     if report.check_passed("cluster_point_count_column") != Some(true)
         || report.check_passed("level_column") != Some(true)
         || report.check_passed("overviews_structure") != Some(true)
-        || report.check_passed("complete_pyramid") == Some(false)
     {
         return;
     }
+    // A partial file has no canonical source band, and a spatial subset's
+    // levels are cropped independently: neither can check whole-source mass.
+    // The per-row category invariant (#827) still holds on both.
+    let partial = report.check_passed("complete_pyramid") == Some(false);
     // Prerequisites: parseable footer, enabled clustering, duplicating mode
     // with a valid canonical level, the named INT64 count column, the level
     // column, and a geometry column (needed to tell point rows apart).
@@ -646,8 +648,11 @@ pub(crate) fn check_cluster_sum_invariant(
         return; // mode_canonical already failed
     };
 
-    if descriptor.source_is_subset() {
-        report.pass("cluster_sum_invariant", "spatial subset: levels are independently cropped; whole-source mass equality is not applicable");
+    let subset = descriptor.source_is_subset();
+    if (partial || subset) && clustering.categories.is_none() {
+        if subset && !partial {
+            report.pass("cluster_sum_invariant", "spatial subset: levels are independently cropped; whole-source mass equality is not applicable");
+        }
         return;
     }
 
@@ -657,7 +662,23 @@ pub(crate) fn check_cluster_sum_invariant(
             format!("could not read cluster columns: {e}"),
         ),
         Ok(None) => { /* prerequisite column absent: already failed elsewhere */ }
-        Ok(Some(per_level)) => {
+        Ok(Some((per_level, category_problem))) => {
+            if clustering.categories.is_some() {
+                match category_problem {
+                    None => report.pass(
+                        "cluster_category_counts",
+                        "every row's category counts sum to its point_count (§12.3.1)",
+                    ),
+                    Some(problem) => report.fail("cluster_category_counts", problem),
+                }
+            }
+            if partial {
+                return;
+            }
+            if subset {
+                report.pass("cluster_sum_invariant", "spatial subset: levels are independently cropped; whole-source mass equality is not applicable");
+                return;
+            }
             let Some(&(_, expected)) = per_level.get(canonical as usize) else {
                 return; // canonical band outside levels: structure failed
             };
@@ -702,16 +723,24 @@ pub(crate) fn check_cluster_sum_invariant(
     }
 }
 
+/// Per level `(point rows, Σ point_count)`, then the first category-count
+/// mismatch (#827).
+type LevelSums = (Vec<(usize, i64)>, Option<String>);
+
 /// Per level: `(point-row count, Σ point_count over point rows)`, read from
 /// the file with a projection over the geometry / `level` / count columns.
 /// `Ok(None)` when a prerequisite column is missing from the schema.
+///
+/// With `--cluster-categories` provenance (#827) it also reads the category
+/// count columns and returns the first row whose counts do not sum to its
+/// `point_count`.
 fn cluster_sum_by_level(
     path: &Path,
     meta: &OverviewsMeta,
     clustering: &crate::overview::level::ClusteringProvenance,
     descriptor: &ResolvedSchema,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<Option<Vec<(usize, i64)>>, String> {
+) -> Result<Option<LevelSums>, String> {
     use super::convert::feature_kind;
     use crate::batch_processor::extract_geometries_opt_from_array;
     use arrow_array::cast::AsArray;
@@ -732,11 +761,27 @@ fn cluster_sum_by_level(
         return Ok(None);
     };
     let geom_field = schema.field(geom_idx).clone();
+    let category_columns: Vec<String> = clustering
+        .categories
+        .iter()
+        .flat_map(|c| c.values.iter().map(|v| c.count_column(v)))
+        .collect();
+    let mut roots = vec![geom_idx, pc_idx, level_idx];
+    for name in &category_columns {
+        let idx = schema
+            .index_of(name)
+            .map_err(|_| format!("category count column {name:?} is missing"))?;
+        if schema.field(idx).data_type() != &arrow_schema::DataType::Int64 {
+            return Err(format!("category count column {name:?} is not INT64"));
+        }
+        roots.push(idx);
+    }
+    let mut category_problem: Option<String> = None;
 
     // The reader's default batch, capped by the owner (#607) so one batch of
     // the widest byte-array column stays under arrow's 2 GiB offset limit.
     let reader = builder
-        .with_projection_roots([geom_idx, pc_idx, level_idx])
+        .with_projection_roots(roots)
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -762,6 +807,10 @@ fn cluster_sum_by_level(
             )
             .as_primitive::<Int64Type>()
             .clone();
+
+        if clustering.categories.is_some() && category_problem.is_none() {
+            category_problem = category_sum_mismatch(&batch, &category_columns, &counts, &levels)?;
+        }
 
         let garr = from_arrow_array(g.as_ref(), &geom_field)
             .map_err(|e| format!("geometry decode: {e}"))?;
@@ -791,7 +840,57 @@ fn cluster_sum_by_level(
             })?;
         }
     }
-    Ok(Some(per_level))
+    Ok(Some((per_level, category_problem)))
+}
+
+/// The first row of `batch` whose category counts (nulls as 0) do not sum to
+/// its `point_count` (#827), described for the report.
+fn category_sum_mismatch(
+    batch: &arrow_array::RecordBatch,
+    category_columns: &[String],
+    counts: &arrow_array::Int64Array,
+    levels: &arrow_array::Int32Array,
+) -> Result<Option<String>, String> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+    use arrow_array::Array;
+
+    let columns = category_columns
+        .iter()
+        .map(|name| {
+            let col = batch
+                .column_by_name(name)
+                .ok_or_else(|| format!("{name:?} not read"))?;
+            Ok(col.as_primitive::<Int64Type>().clone())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for row in 0..batch.num_rows() {
+        let mut sum = 0i64;
+        for (name, col) in category_columns.iter().zip(&columns) {
+            if !col.is_valid(row) {
+                continue;
+            }
+            let n = col.value(row);
+            // Counts are member tallies: a negative one could cancel another out.
+            if n < 0 {
+                return Ok(Some(format!(
+                    "level {}: a row's category count {name:?} is {n}, but counts are never negative",
+                    levels.value(row)
+                )));
+            }
+            sum = sum
+                .checked_add(n)
+                .ok_or("category counts overflow i64 (hostile counts)")?;
+        }
+        if sum != counts.value(row) {
+            return Ok(Some(format!(
+                "level {}: a row's category counts sum to {sum} but its point_count is {}",
+                levels.value(row),
+                counts.value(row)
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// Per-RG `level` column statistics must be `min == max ==` the footer-implied
@@ -1364,7 +1463,7 @@ mod tests {
         level_ids: &[Vec<i64>],
         point_counts: Option<&[Vec<i64>]>,
     ) {
-        write_cluster_fixture_with_subset(path, level_ids, point_counts, false);
+        write_cluster_fixture_with_subset(path, level_ids, point_counts, false, None);
     }
 
     fn write_cluster_fixture_with_subset(
@@ -1372,8 +1471,12 @@ mod tests {
         level_ids: &[Vec<i64>],
         point_counts: Option<&[Vec<i64>]>,
         source_is_subset: bool,
+        // #827: one `name:x` category count column per level row.
+        category_counts: Option<&[Vec<i64>]>,
     ) {
-        use crate::overview::level::{AccumulatedColumn, ClusteringProvenance, Generalization};
+        use crate::overview::level::{
+            AccumulatedColumn, ClusterCategories, ClusteringProvenance, Generalization,
+        };
         use arrow_array::Int64Array as I64;
 
         let mut fields = vec![
@@ -1383,6 +1486,9 @@ mod tests {
         ];
         if point_counts.is_some() {
             fields.push(Arc::new(Field::new("point_count", DataType::Int64, false)));
+        }
+        if category_counts.is_some() {
+            fields.push(Arc::new(Field::new("name:x", DataType::Int64, true)));
         }
         let schema = Arc::new(Schema::new(fields));
 
@@ -1412,6 +1518,10 @@ mod tests {
                     column: "id".to_string(),
                     op: "sum".to_string(),
                 }],
+                categories: category_counts.map(|_| ClusterCategories {
+                    column: "name".to_string(),
+                    values: vec!["x".to_string()],
+                }),
             }),
             coalescing: None,
             renamed_columns: None,
@@ -1430,6 +1540,9 @@ mod tests {
                 Arc::new(geom_array.to_array_ref()),
             ];
             if let Some(counts) = point_counts {
+                columns.push(Arc::new(I64::from(counts[k].clone())));
+            }
+            if let Some(counts) = category_counts {
                 columns.push(Arc::new(I64::from(counts[k].clone())));
             }
             let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
@@ -1461,6 +1574,7 @@ mod tests {
             &[vec![0], vec![0]],
             Some(&[vec![2], vec![1]]),
             true,
+            None,
         );
         assert!(validate_file(&current).unwrap().is_valid());
         OverviewReader::open(&current).unwrap();
@@ -2072,5 +2186,77 @@ mod tests {
             tylertoo_io::read_batch_plan(&md, None, None, 1024, tylertoo_io::byte_array_limit()),
             1024
         );
+    }
+
+    /// #827: a row whose category counts miss its `point_count` is named;
+    /// null counts are zero.
+    #[test]
+    fn category_sum_mismatch_names_the_row() {
+        use arrow_array::{Int32Array, Int64Array, RecordBatch};
+        use std::sync::Arc;
+        let batch = RecordBatch::try_from_iter([
+            ("c:a", Arc::new(Int64Array::from(vec![Some(2), None])) as _),
+            (
+                "c:b",
+                Arc::new(Int64Array::from(vec![Some(1), Some(1)])) as _,
+            ),
+        ])
+        .unwrap();
+        let cols = ["c:a".to_string(), "c:b".to_string()];
+        let levels = Int32Array::from(vec![0, 0]);
+        let ok = Int64Array::from(vec![3, 1]);
+        assert_eq!(
+            super::category_sum_mismatch(&batch, &cols, &ok, &levels),
+            Ok(None)
+        );
+        let bad = Int64Array::from(vec![3, 2]);
+        let msg = super::category_sum_mismatch(&batch, &cols, &bad, &levels)
+            .unwrap()
+            .unwrap();
+        assert!(msg.contains("sum to 1 but its point_count is 2"), "{msg}");
+        // Codex review: declared but empty labels count zero, never pass.
+        let none = super::category_sum_mismatch(&batch, &[], &ok, &levels)
+            .unwrap()
+            .unwrap();
+        assert!(none.contains("sum to 0 but its point_count is 3"), "{none}");
+        // Review: negative counts that cancel out must not pass.
+        let cancel = RecordBatch::try_from_iter([
+            ("c:a", Arc::new(Int64Array::from(vec![2])) as _),
+            ("c:b", Arc::new(Int64Array::from(vec![-1])) as _),
+        ])
+        .unwrap();
+        let msg = super::category_sum_mismatch(
+            &cancel,
+            &cols,
+            &Int64Array::from(vec![1]),
+            &Int32Array::from(vec![0]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(msg.contains("\"c:b\" is -1"), "{msg}");
+    }
+
+    /// #827 review: cropping exempts a spatial subset from whole-source mass
+    /// equality, but not from the per-row category invariant.
+    #[test]
+    fn subset_still_checks_category_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("ok.parquet");
+        let bad = dir.path().join("bad.parquet");
+        let levels = [vec![0], vec![0]];
+        let counts = [vec![2], vec![1]];
+        write_cluster_fixture_with_subset(&ok, &levels, Some(&counts), true, Some(&counts));
+        let vr = validate_file(&ok).unwrap();
+        assert_eq!(vr.check_passed("cluster_category_counts"), Some(true));
+
+        write_cluster_fixture_with_subset(
+            &bad,
+            &levels,
+            Some(&counts),
+            true,
+            Some(&[vec![1], vec![1]]),
+        );
+        let vr = validate_file(&bad).unwrap();
+        assert_eq!(vr.check_passed("cluster_category_counts"), Some(false));
     }
 }

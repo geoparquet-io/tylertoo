@@ -97,7 +97,7 @@ use tylertoo_io::IpcFileWriter as FileWriter;
 use crate::input_set::{ConvertSource, RowGroupSelection};
 
 use super::assign::FeatureKind;
-use super::cluster::{ClusterEntry, ClusterTables};
+use super::cluster::{CategoryCounts, ClusterEntry, ClusterTables};
 use super::convert::{ConvertError, ConvertOptions};
 use super::ladder::EntryZoomSpec;
 use super::level::{EntryZoomProvenance, RankingProvenance};
@@ -117,7 +117,8 @@ pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
 /// The optional ETag/last-modified fields alone were backwards readable, but
 /// older plans cannot provide the required typed totals. v6 streams losses in
 /// a length-prefixed JSONL partition before IPC, outside resident metadata.
-pub(super) const PLAN_FORMAT_VERSION: u32 = 6;
+/// v7 adds the `--cluster-categories` labels and per-entry counts (#827).
+pub(super) const PLAN_FORMAT_VERSION: u32 = 7;
 
 /// The first bytes of every plan artifact, ahead of the Arrow IPC payload.
 ///
@@ -126,7 +127,7 @@ pub(super) const PLAN_FORMAT_VERSION: u32 = 6;
 /// not a plan" and "this plan is damaged" *before* handing a single byte to
 /// an Arrow decoder — a byte-flip sweep over a real 10.5 KB artifact panicked
 /// inside arrow's buffer/IPC decoders at 11 of 203 positions (#512).
-pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x06";
+pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x07";
 
 /// The format-independent part of [`PLAN_MAGIC`]: everything but the trailing
 /// version byte.
@@ -920,6 +921,7 @@ fn options_digest(o: &ConvertOptions) -> BTreeMap<String, String> {
     put("representation", format!("{:?}", o.representation));
     put("cluster", format!("{:?}", o.cluster));
     put("accumulate", format!("{:?}", o.accumulate));
+    put("cluster_categories", format!("{:?}", o.cluster_categories));
     put("coalesce_lines", format!("{:?}", o.coalesce_lines));
     put("coalesce_snap", format!("{:?}", o.coalesce_snap));
     put(
@@ -1069,6 +1071,8 @@ pub(super) struct ConvertPlan {
     pub carriers: Vec<Vec<usize>>,
     /// Cluster tables (Q4), or `None` when clustering is off.
     pub cluster_tables: Option<ClusterTables>,
+    /// `--cluster-categories` slot labels, indexed by category slot (#827).
+    pub cluster_categories: Option<Vec<String>>,
     /// Line scratch for coalescing (Q3), or `None`.
     pub coalesce: Option<CoalescePlan>,
     /// The ranking provenance block the writer stamps into the footer.
@@ -1127,6 +1131,7 @@ impl ConvertPlan {
             kinds: tables.kinds.clone(),
             carriers: tables.carriers.clone(),
             cluster_tables: tables.cluster_tables.clone(),
+            cluster_categories: tables.cluster_categories.clone(),
             coalesce,
             rank_provenance: rank_provenance.clone(),
             rank_plan: RankPlanProvenance::from_provenance(rank_provenance),
@@ -1166,6 +1171,7 @@ impl ConvertPlan {
         Ok(WinnerTables {
             level_specs: self.level_specs,
             cluster_tables: self.cluster_tables,
+            cluster_categories: self.cluster_categories,
             kinds: self.kinds,
             coalesce_scratch,
             // The `--plan` path skips pass 1 entirely, so nothing prebuilt the
@@ -1192,6 +1198,7 @@ struct PlanMeta {
     /// is a flat array with this stride.
     cluster_agg_stride: usize,
     has_cluster: bool,
+    cluster_categories: Option<Vec<String>>,
     has_coalesce: bool,
     rank_provenance: RankingProvenance,
     rank_plan: RankPlanProvenance,
@@ -1221,6 +1228,9 @@ fn plan_schema(meta: String) -> Schema {
         list("cluster_row", DataType::UInt64),
         list("cluster_point_count", DataType::Int64),
         list("cluster_agg", DataType::Float64),
+        list("cluster_category_len", DataType::UInt32),
+        list("cluster_category_slot", DataType::UInt32),
+        list("cluster_category_count", DataType::Int64),
         list("coalesce_row", DataType::UInt64),
         list("coalesce_wkb", DataType::Binary),
         list("coalesce_sort_key", DataType::Float64),
@@ -1262,6 +1272,7 @@ impl ConvertPlan {
             num_levels: self.level_specs.len(),
             cluster_agg_stride: stride,
             has_cluster: self.cluster_tables.is_some(),
+            cluster_categories: self.cluster_categories.clone(),
             has_coalesce: self.coalesce.is_some(),
             rank_provenance: self.rank_provenance.clone(),
             rank_plan: self.rank_plan.clone(),
@@ -1351,6 +1362,38 @@ impl ConvertPlan {
                     for &(_, _, e) in &cluster {
                         for v in &e.aggregates {
                             b.values().append_option(*v);
+                        }
+                    }
+                }
+            ),
+            list_col!(
+                UInt32Builder::new(),
+                self.cluster_tables.is_some(),
+                |b: &mut LargeListBuilder<UInt32Builder>| {
+                    for &(_, _, e) in &cluster {
+                        b.values()
+                            .append_value(e.categories.as_slice().len() as u32);
+                    }
+                }
+            ),
+            list_col!(
+                UInt32Builder::new(),
+                self.cluster_tables.is_some(),
+                |b: &mut LargeListBuilder<UInt32Builder>| {
+                    for &(_, _, e) in &cluster {
+                        for &(slot, _) in e.categories.as_slice() {
+                            b.values().append_value(slot);
+                        }
+                    }
+                }
+            ),
+            list_col!(
+                Int64Builder::new(),
+                self.cluster_tables.is_some(),
+                |b: &mut LargeListBuilder<Int64Builder>| {
+                    for &(_, _, e) in &cluster {
+                        for &(_, n) in e.categories.as_slice() {
+                            b.values().append_value(n);
                         }
                     }
                 }
@@ -1640,6 +1683,7 @@ impl ConvertPlan {
             kinds,
             carriers,
             cluster_tables,
+            cluster_categories: meta.cluster_categories,
             coalesce,
             rank_provenance: meta.rank_provenance,
             rank_plan: meta.rank_plan,
@@ -1908,6 +1952,7 @@ fn rebuild_cluster_tables(
             ),
         ));
     }
+    let mut categories = rebuild_cluster_categories(batch, meta, &counts, path)?.into_iter();
     let mut tables: ClusterTables = vec![HashMap::new(); meta.num_levels];
     for (i, ((&level, &row), &point_count)) in levels
         .iter()
@@ -1932,10 +1977,69 @@ fn rebuild_cluster_tables(
                 // In range: `aggs.len() == levels.len() * stride` exactly,
                 // and `i < levels.len()`.
                 aggregates: aggs[i * stride..(i + 1) * stride].to_vec(),
+                categories: categories.next().unwrap_or_default(),
             },
         );
     }
     Ok(tables)
+}
+
+/// The per-entry `--cluster-categories` counts (#827), one per cluster entry,
+/// each checked against the plan's slot labels and its entry's `point_count`
+/// (§12.3.1). Empty when the option is off.
+fn rebuild_cluster_categories(
+    batch: &RecordBatch,
+    meta: &PlanMeta,
+    point_counts: &[i64],
+    path: &Path,
+) -> Result<Vec<CategoryCounts>, ConvertError> {
+    let entries = point_counts.len();
+    let lens = u32_section(batch, "cluster_category_len", path)?.unwrap_or_default();
+    let slots = u32_section(batch, "cluster_category_slot", path)?.unwrap_or_default();
+    let counts = i64_section(batch, "cluster_category_count", path)?.unwrap_or_default();
+    let labels = meta.cluster_categories.as_ref().map_or(0, Vec::len);
+    let bad = |what: &str| plan_err(path, &format!("cluster category sections {what}"));
+    if labels == 0 {
+        return if slots.is_empty() && lens.iter().all(|&n| n == 0) {
+            Ok(Vec::new())
+        } else {
+            Err(bad("carry counts but the plan declares no category labels"))
+        };
+    }
+    if lens.len() != entries || slots.len() != counts.len() {
+        return Err(bad("have mismatched lengths"));
+    }
+    let mut out = Vec::with_capacity(entries);
+    let mut at = 0usize;
+    for (&n, &point_count) in lens.iter().zip(point_counts) {
+        let end = at
+            .checked_add(n as usize)
+            .filter(|&e| e <= slots.len())
+            .ok_or_else(|| bad("have mismatched lengths"))?;
+        let pairs: Vec<(u32, i64)> = slots[at..end]
+            .iter()
+            .copied()
+            .zip(counts[at..end].iter().copied())
+            .collect();
+        if pairs.iter().any(|&(slot, _)| slot as usize >= labels) {
+            return Err(bad("name a slot past the plan's category labels"));
+        }
+        let total = pairs
+            .iter()
+            .try_fold(0i64, |sum, &(_, c)| sum.checked_add(c));
+        if total != Some(point_count) {
+            return Err(bad("do not sum to their entry's point_count"));
+        }
+        out.push(
+            CategoryCounts::from_pairs(pairs)
+                .ok_or_else(|| bad("are not sorted, positive counts"))?,
+        );
+        at = end;
+    }
+    if at != slots.len() {
+        return Err(bad("have mismatched lengths"));
+    }
+    Ok(out)
 }
 
 fn rebuild_coalesce(batch: &RecordBatch, path: &Path) -> Result<CoalescePlan, ConvertError> {
@@ -2212,6 +2316,7 @@ mod tests {
                         ClusterEntry {
                             point_count: 3,
                             aggregates: vec![Some(1.5), None],
+                            categories: CategoryCounts::from_pairs(vec![(0, 1), (2, 2)]).unwrap(),
                         },
                     ),
                     (
@@ -2219,12 +2324,14 @@ mod tests {
                         ClusterEntry {
                             point_count: 7,
                             aggregates: vec![None, Some(-2.25)],
+                            categories: CategoryCounts::from_pairs(vec![(1, 7)]).unwrap(),
                         },
                     ),
                 ]),
                 HashMap::new(),
                 HashMap::new(),
             ]),
+            cluster_categories: Some(vec!["a".into(), "b".into(), "other".into()]),
             coalesce: Some(CoalescePlan {
                 rows: vec![1, 4, 8],
                 wkb: vec![vec![1, 2, 3], vec![], vec![9]],
@@ -2310,6 +2417,20 @@ mod tests {
         assert_eq!(plan, back);
     }
 
+    /// #827 review: a saved plan whose category counts miss an entry's
+    /// `point_count` is refused, not written into a file that breaks §12.3.1.
+    #[test]
+    fn plan_with_inconsistent_category_totals_is_refused() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let mut plan = tiny_plan();
+        let tables = plan.cluster_tables.as_mut().unwrap();
+        tables[0].get_mut(&5).unwrap().categories =
+            CategoryCounts::from_pairs(vec![(0, 1)]).unwrap();
+        plan.save(f.path()).unwrap();
+        let err = load_err(f.path());
+        assert!(err.contains("point_count"), "{err}");
+    }
+
     /// The empty/absent sections must round trip too (no clustering, no
     /// coalescing, no kinds, no carriers).
     #[test]
@@ -2318,6 +2439,7 @@ mod tests {
         let plan = ConvertPlan {
             kinds: None,
             cluster_tables: None,
+            cluster_categories: None,
             coalesce: None,
             carriers: vec![vec![], vec![], vec![]],
             ladder: None,

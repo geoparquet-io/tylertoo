@@ -53,6 +53,7 @@ overview(
     drop_polygons: bool = False,
     cluster: bool = False,
     accumulate_attributes: dict[str, Literal['sum', 'max', 'min', 'mean']] | None = None,
+    cluster_categories: str | None = None,
     coalesce_lines: bool | None = None,
     coalesce_snap: float = 1.0,
     coalesce_junction_angle: float = 0.0,
@@ -82,7 +83,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 #### Input and levels
 
-* `input`: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator (`EPSG:3857`). Pass a file, directory, glob, `s3://`, `gs://`, or `https://` URL or prefix, or a list of files.
+* `input`: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator (`EPSG:3857`). Pass a file, directory, glob, `s3://`, `gs://`, or `https://` URL or prefix, or a list of files. First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas) to a GeoParquet file using `gpio` or DuckDB `COPY (... ORDER BY ST_Hilbert(...)) TO 'x.parquet'`.
 * `output`: Overview file to write.
 * `mode`: `"duplicating"` makes each level a complete map; `"partitioning"` stores each feature once.
 * `min_zoom`: Coarsest zoom.
@@ -127,6 +128,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 * `cluster`: Merge each cell's points and add `point_count`.
 * `accumulate_attributes`: Aggregation method for each column in a cluster.
+* `cluster_categories`: String column to count per cluster in `COL:value` columns, or `None` for off. Requires `cluster`. Keep up to 100 values by frequency, breaking ties by ascending value; count the rest, nulls, and literal `other` in `COL:other` when needed. Null count cells mean zero. A point outside any cluster counts 1 for its own value; each row's counts sum to `point_count`.
 
 #### Line coalescing
 
@@ -532,6 +534,7 @@ convert(
     drop_polygons: bool = False,
     cluster: bool = False,
     accumulate_attributes: dict[str, Literal['sum', 'max', 'min', 'mean']] | None = None,
+    cluster_categories: str | None = None,
     coalesce_lines: bool | None = None,
     coalesce_snap: float = 1.0,
     coalesce_junction_angle: float = 0.0,
@@ -555,7 +558,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 
 ### Parameters
 
-* `input`: See `overview()`.
+* `input`: See `overview()`. First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas) to a GeoParquet file using `gpio` or DuckDB `COPY (... ORDER BY ST_Hilbert(...)) TO 'x.parquet'`.
 * `output`: PMTiles archive to write.
 * `min_zoom`: See `overview()`.
 * `max_zoom`: See `overview()`.
@@ -613,6 +616,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `drop_polygons`: See `overview()`.
 * `cluster`: See `overview()`.
 * `accumulate_attributes`: See `overview()`.
+* `cluster_categories`: See `overview()`.
 * `coalesce_lines`: See `overview()`.
 * `coalesce_snap`: See `overview()`.
 * `coalesce_junction_angle`: See `overview()`.

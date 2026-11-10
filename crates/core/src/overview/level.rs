@@ -408,6 +408,25 @@ pub struct ClusteringProvenance {
     /// Columns whose values were aggregated across clustered points.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accumulated: Vec<AccumulatedColumn>,
+    /// Category count columns whose per-row sum equals `point_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub categories: Option<ClusterCategories>,
+}
+
+/// Source column and value slots for per-cluster category counts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClusterCategories {
+    /// Source string column name, used as the `COLUMN:value` prefix.
+    pub column: String,
+    /// Value labels in count-column order, including `other` when needed.
+    pub values: Vec<String>,
+}
+
+impl ClusterCategories {
+    /// The output column that counts `value`: `COLUMN:value`.
+    pub fn count_column(&self, value: &str) -> String {
+        format!("{}:{value}", self.column)
+    }
 }
 
 /// One accumulated attribute column in [`ClusteringProvenance`].
@@ -1566,6 +1585,7 @@ mod tests {
                     column: "confidence".to_string(),
                     op: "mean".to_string(),
                 }],
+                categories: None,
             }),
             coalescing: None,
             renamed_columns: None,

@@ -170,7 +170,8 @@ fn convert_options(build: Build) -> ConvertOptions {
             .with_accumulate(vec![AccumulateSpec::new(
                 "weight".to_string(),
                 AccumulateOp::Sum,
-            )]),
+            )])
+            .with_cluster_categories(Some("category".to_string())),
     }
 }
 
@@ -649,7 +650,9 @@ fn assert_archive_metadata_matches(mono: &Path, merged: &Path, shards: usize) {
 fn write_point_grid(path: &Path) {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, BinaryArray, Float64Array, Int64Array, RecordBatch, StructArray};
+    use arrow_array::{
+        ArrayRef, BinaryArray, Float64Array, Int64Array, RecordBatch, StringArray, StructArray,
+    };
     use arrow_schema::{DataType, Field, Fields, Schema};
     use tylertoo_io::test_support::ArrowWriter;
     use tylertoo_io::test_support::WriterProperties;
@@ -696,6 +699,7 @@ fn write_point_grid(path: &Path) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("cell_id", DataType::Int64, false),
         Field::new("weight", DataType::Float64, false),
+        Field::new("category", DataType::Utf8, true),
         Field::new("geometry", DataType::Binary, false),
         Field::new("bbox", DataType::Struct(bbox_fields.clone()), false),
     ]));
@@ -705,6 +709,13 @@ fn write_point_grid(path: &Path) {
     ));
     let weights: ArrayRef = Arc::new(Float64Array::from(
         rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+    ));
+    // #827: 120 distinct values (past the 100-value cap, so `other` fills)
+    // and some nulls.
+    let categories: ArrayRef = Arc::new(StringArray::from(
+        rows.iter()
+            .map(|r| (r.0 % 50 != 0).then(|| format!("c{}", r.0 % 120)))
+            .collect::<Vec<_>>(),
     ));
     let geoms: Vec<Vec<u8>> = rows.iter().map(|r| wkb(r.2, r.3)).collect();
     let geometry: ArrayRef = Arc::new(BinaryArray::from(
@@ -746,8 +757,11 @@ fn write_point_grid(path: &Path) {
             }
         }
     });
-    let batch = RecordBatch::try_new(schema.clone(), vec![ids, weights, geometry, bbox])
-        .expect("point batch");
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![ids, weights, categories, geometry, bbox],
+    )
+    .expect("point batch");
 
     let props = WriterProperties::builder()
         // 20 row groups over 3,600 points, matching the polygon grid's shape.
