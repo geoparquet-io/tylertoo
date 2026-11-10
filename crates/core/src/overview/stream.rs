@@ -1169,10 +1169,6 @@ pub(super) fn select_row_groups_streaming(
         Some(q) => Some(source.select_row_groups_any(q.boxes())?),
         None => None,
     };
-    let filter_selection: Option<RowGroupSelection> = match filter {
-        Some(f) => Some(source.select_row_groups_matching(f)?),
-        None => None,
-    };
     // The shard's read bounds stop at ±180, but export draws a feature one
     // world width away at its wrapped position (#342), so a 0..360 row group
     // at lng 200 belongs to the shard covering -160: test the wrapped copies
@@ -1181,7 +1177,17 @@ pub(super) fn select_row_groups_streaming(
         Some(range) => Some(source.select_row_groups_any(shard_read_query(range, crs).boxes())?),
         None => None,
     };
-    Ok([bbox_selection, filter_selection, shard_selection]
+    let spatial = [bbox_selection, shard_selection]
+        .into_iter()
+        .flatten()
+        .reduce(|a, b| a.intersect(&b));
+    // The filter reads column statistics from footers: only over the parts
+    // the spatial prunings left (#815), which the intersection keeps anyway.
+    let filter_selection: Option<RowGroupSelection> = match filter {
+        Some(f) => Some(source.select_row_groups_matching_within(f, spatial.as_ref())?),
+        None => None,
+    };
+    Ok([spatial, filter_selection]
         .into_iter()
         .flatten()
         .reduce(|a, b| a.intersect(&b)))
@@ -2759,7 +2765,7 @@ fn preflight_with_memory_limit(
         crs,
     )?;
     if let Some(selection) = &selected_row_groups {
-        source.release_unselected(selection)?;
+        source.release_unselected(selection);
     }
     diagnostics.set_input_rows(source.stream_row_locator(selected_row_groups.as_ref())?);
     let row_groups_read = selected_row_groups

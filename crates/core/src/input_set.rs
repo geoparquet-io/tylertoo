@@ -119,8 +119,10 @@ struct PartMeta {
     /// reader over this part never re-parses it ([`InputSource::open_with_metadata`]).
     /// Load-bearing for the pass-2 parallel read (#494), which opens one
     /// reader per segment: a 1084-segment run parsed the footer 1084 times,
-    /// twice per conversion. `None` once [`ConvertSource::release_unselected`]
-    /// dropped it (#815: 512 pruned S3 footers held ~2 GiB); re-read on use.
+    /// twice per conversion. `None` for every part but the first once a
+    /// multi-part source is resolved (#815: 512 S3 footers held ~2 GiB before
+    /// a bbox pruned all but a few); [`ConvertSource::metas_with_footers`]
+    /// re-reads the ones a selection reads.
     footer: std::sync::Mutex<Option<ReaderMetadata>>,
 }
 
@@ -869,7 +871,7 @@ impl ConvertSource {
     ) -> Result<u64, InputError> {
         let root = self.column_projection().map_or(column, |p| p[column]);
         let mut total = 0u64;
-        for (i, m) in self.metas()?.iter().enumerate() {
+        for (i, m) in self.metas_with_footers(selected)?.iter().enumerate() {
             let picked = selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice);
             if picked.is_some_and(<[usize]>::is_empty) {
                 continue;
@@ -978,11 +980,28 @@ impl ConvertSource {
         &self,
         filter: &crate::overview::filter::BoundFilter,
     ) -> Result<RowGroupSelection, InputError> {
+        self.select_row_groups_matching_within(filter, None)
+    }
+
+    /// [`Self::select_row_groups_matching`] over the parts `within` reads
+    /// (`None` = all); a part it reads nothing of selects nothing, so its
+    /// footer is never re-read (#815).
+    pub(crate) fn select_row_groups_matching_within(
+        &self,
+        filter: &crate::overview::filter::BoundFilter,
+        within: Option<&RowGroupSelection>,
+    ) -> Result<RowGroupSelection, InputError> {
         let per_part = self
-            .metas()?
+            .metas_with_footers(within)?
             .iter()
             .zip(self.parts())
-            .map(|(m, part)| Ok(filter.select_row_groups(m.parquet(part)?.as_ref())))
+            .enumerate()
+            .map(|(i, (m, part))| {
+                if within.is_some_and(|w| w.0[i].is_empty()) {
+                    return Ok(Vec::new());
+                }
+                Ok(filter.select_row_groups(m.parquet(part)?.as_ref()))
+            })
             .collect::<Result<_, InputError>>()?;
         Ok(RowGroupSelection(per_part))
     }
@@ -999,7 +1018,7 @@ impl ConvertSource {
         &self,
         selection: Option<&RowGroupSelection>,
     ) -> Result<u64, InputError> {
-        let metas = self.metas()?;
+        let metas = self.metas_with_footers(selection)?;
         if let Some(sel) = selection {
             debug_assert_eq!(metas.len(), sel.0.len());
         }
@@ -1027,7 +1046,7 @@ impl ConvertSource {
     ) -> Result<usize, InputError> {
         let roots = self.file_roots(projection);
         let mut rows = requested;
-        for (pi, m) in self.metas()?.iter().enumerate() {
+        for (pi, m) in self.metas_with_footers(selected)?.iter().enumerate() {
             let picked = selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice);
             // A part this run never opens plans no batch.
             if picked.is_some_and(<[usize]>::is_empty) {
@@ -1087,6 +1106,9 @@ impl ConvertSource {
         selection: Option<&RowGroupSelection>,
         projection: Option<&[usize]>,
     ) -> Result<StagingPlan, InputError> {
+        // The remote plan reads each part's footer: re-read the released
+        // ones together rather than one round trip at a time.
+        self.metas_with_footers(selection)?;
         let roots = self.file_roots(projection);
         let roots = roots.as_deref();
         let parts = self.parts();
@@ -1211,7 +1233,7 @@ impl ConvertSource {
         // construction for `Multi`); every reader this stream opens reuses
         // them rather than re-decoding O(row_groups × columns) of thrift.
         let metas = self
-            .metas()?
+            .metas_with_footers(plan.row_groups)?
             .iter()
             .zip(parts)
             .enumerate()
@@ -1352,22 +1374,49 @@ impl ConvertSource {
         }
     }
 
-    /// Drop the decoded footer of every part `selection` reads nothing of
-    /// (#815): a `--bbox` over Overture's 512 S3 parts kept ~2 GiB of
-    /// footers for parts it never opens. Row counts, bounds and schemas
-    /// stay; a later use of a released footer re-reads it.
-    pub(crate) fn release_unselected(
+    /// [`Self::metas`] with the decoded footer of every part `selection`
+    /// reads (`None` = every part) in place. A multi-part source keeps only
+    /// part 0's footer once resolved (#815), so this re-reads the others it
+    /// needs together, footer fetches overlapped as at resolve.
+    fn metas_with_footers(
         &self,
-        selection: &RowGroupSelection,
-    ) -> Result<(), InputError> {
-        let parts = self.metas()?.iter().zip(self.parts());
-        for ((m, part), picked) in parts.zip(selection.parts()) {
+        selection: Option<&RowGroupSelection>,
+    ) -> Result<&[PartMeta], InputError> {
+        let metas = self.metas()?;
+        let parts = self.parts();
+        let missing: Vec<usize> = (0..metas.len())
+            .filter(|&i| !selection.is_some_and(|s| s.0[i].is_empty()))
+            .filter(|&i| metas[i].footer.lock().expect("footer slot lock").is_none())
+            .collect();
+        if missing.is_empty() {
+            return Ok(metas);
+        }
+        let first_bytes = metas[0].parquet(&parts[0])?.memory_size() as u64;
+        let subset: Vec<InputSource> = missing.iter().map(|&i| parts[i].clone()).collect();
+        let errors = std::sync::Mutex::new(Vec::new());
+        parse_footers(&subset, first_bytes, |j| {
+            match metas[missing[j]].footer(&subset[j]) {
+                Ok(_) => {}
+                Err(e) => errors.lock().expect("footer error lock").push((j, e)),
+            }
+        });
+        let mut errors = errors.into_inner().expect("footer error lock");
+        errors.sort_by_key(|(j, _)| *j);
+        match errors.into_iter().next() {
+            Some((_, e)) => Err(e),
+            None => Ok(metas),
+        }
+    }
+
+    /// Forget everything kept of the footers of the parts `selection` reads
+    /// nothing of (#815): their encoded tails, ~0.65 MiB per Overture part,
+    /// are only there for a cheap re-parse the run will not need.
+    pub(crate) fn release_unselected(&self, selection: &RowGroupSelection) {
+        for (part, picked) in self.parts().iter().zip(selection.parts()) {
             if picked.is_empty() {
-                *m.footer.lock().expect("footer slot lock") = None;
-                part.release_footer();
+                part.forget_footer();
             }
         }
-        Ok(())
     }
 
     /// Parts whose decoded footer is held.
@@ -1414,40 +1463,25 @@ const FOOTER_PARSE_THREADS: usize = 8;
 /// trips, so a fixed few in flight leave a many-part prefix waiting). Each
 /// fetched footer is parsed as it lands, on [`FOOTER_PARSE_THREADS`]
 /// threads. Results are written into per-index slots so the order always
-/// matches `parts`; the first error (by part index) wins.
+/// matches `parts`; the first error (by part index) wins. Every footer but
+/// part 0's is dropped once parsed (#815).
 fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
     let Some((first, rest)) = parts.split_first() else {
         return Ok(Vec::new());
     };
     let first = load_part_meta(first)?;
     let first_bytes = first.parquet(&parts[0])?.memory_size() as u64;
-    let admission = crate::input::stage_admission();
-    let in_flight = admission.requests_for(first_bytes);
-    // A fetched footer holds its bytes until a parse thread takes it: at
-    // most what `in_flight` was priced at, or the staging budget.
-    let retain = admission
-        .mem_budget
-        .max(first_bytes.saturating_mul(in_flight as u64));
     let slots: Vec<std::sync::Mutex<Option<Result<PartMeta, InputError>>>> = (0..rest.len())
         .map(|_| std::sync::Mutex::new(None))
         .collect();
-    let (ready, landed) = std::sync::mpsc::channel::<usize>();
-    let landed = std::sync::Mutex::new(landed);
-    std::thread::scope(|scope| {
-        for _ in 0..FOOTER_PARSE_THREADS.min(rest.len()) {
-            scope.spawn(|| loop {
-                let next = landed.lock().expect("footer queue lock").recv();
-                let Ok(i) = next else {
-                    break;
-                };
-                let meta = load_part_meta(&rest[i]);
-                *slots[i].lock().expect("footer slot lock") = Some(meta);
-            });
-        }
-        crate::input::prefetch_footers(rest, in_flight, retain, |i| {
-            let _ = ready.send(i);
+    parse_footers(rest, first_bytes, |i| {
+        // #815: keep what validation, selection and row addressing need and
+        // drop the decoded footer; the parts a run reads re-read theirs.
+        let meta = load_part_meta(&rest[i]).inspect(|meta| {
+            *meta.footer.lock().expect("footer slot lock") = None;
+            rest[i].release_footer();
         });
-        drop(ready);
+        *slots[i].lock().expect("footer slot lock") = Some(meta);
     });
     std::iter::once(Ok(first))
         .chain(slots.into_iter().map(|slot| {
@@ -1456,6 +1490,38 @@ fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
                 .expect("every part's footer is parsed")
         }))
         .collect()
+}
+
+/// Run `parse(i)` for every part of `parts` as its footer lands, on
+/// [`FOOTER_PARSE_THREADS`] threads. `first_bytes` (one decoded footer)
+/// prices a footer in flight, and the staging admission sets how many
+/// remote footers are fetched at once (#817 R1: each footer is two round
+/// trips, so a fixed few in flight leave a many-part prefix waiting).
+fn parse_footers(parts: &[InputSource], first_bytes: u64, parse: impl Fn(usize) + Sync) {
+    let admission = crate::input::stage_admission();
+    let in_flight = admission.requests_for(first_bytes);
+    // A fetched footer holds its bytes until a parse thread takes it: at
+    // most what `in_flight` was priced at, or the staging budget.
+    let retain = admission
+        .mem_budget
+        .max(first_bytes.saturating_mul(in_flight as u64));
+    let (ready, landed) = std::sync::mpsc::channel::<usize>();
+    let landed = std::sync::Mutex::new(landed);
+    std::thread::scope(|scope| {
+        for _ in 0..FOOTER_PARSE_THREADS.min(parts.len()) {
+            scope.spawn(|| loop {
+                let next = landed.lock().expect("footer queue lock").recv();
+                let Ok(i) = next else {
+                    break;
+                };
+                parse(i);
+            });
+        }
+        crate::input::prefetch_footers(parts, in_flight, retain, |i| {
+            let _ = ready.send(i);
+        });
+        drop(ready);
+    });
 }
 
 impl MultiSource {
@@ -2687,10 +2753,10 @@ mod tests {
         assert_eq!(src.selected_input_bytes(None).unwrap(), all_bytes);
     }
 
-    /// #815: a selection releases the footers of the parts it never reads;
-    /// reads, counts and a later use of a released footer stay correct.
+    /// #815: a resolved multi-part source holds part 0's footer only; a
+    /// read re-reads the footers of the parts it selects, and nothing else.
     #[test]
-    fn release_unselected_drops_pruned_footers() {
+    fn multi_source_rereads_only_the_selected_footers() {
         let dir = tmpdir();
         for (i, base) in [0i64, 10, 20].into_iter().enumerate() {
             write_parquet(
@@ -2706,12 +2772,12 @@ mod tests {
             );
         }
         let src = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
-        let all_bytes = src.selected_input_bytes(None).unwrap();
-        let sel = RowGroupSelection::from_parts(vec![vec![], vec![1], vec![]]);
-        assert_eq!(src.resident_footers().unwrap(), 3);
-        src.release_unselected(&sel).unwrap();
+        assert_eq!(src.resident_footers().unwrap(), 1);
+        assert_eq!(src.part_row_counts().unwrap(), vec![(4, 2); 3]);
+        assert_eq!(src.num_row_groups_total().unwrap(), 6);
         assert_eq!(src.resident_footers().unwrap(), 1);
 
+        let sel = RowGroupSelection::from_parts(vec![vec![], vec![1], vec![]]);
         let plan = ReadPlan {
             batch_size: 1024,
             projection: None,
@@ -2719,11 +2785,14 @@ mod tests {
         };
         assert_eq!(stream_ids(&src, &plan), vec![12, 13]);
         assert_eq!(src.selected_row_count(Some(&sel)).unwrap(), 2);
-        assert_eq!(src.part_row_counts().unwrap(), vec![(4, 2); 3]);
-        assert_eq!(src.num_row_groups_total().unwrap(), 6);
-        assert_eq!(src.resident_footers().unwrap(), 1);
-        // A full read re-reads the released footers.
-        assert_eq!(src.selected_input_bytes(None).unwrap(), all_bytes);
+        assert_eq!(src.resident_footers().unwrap(), 2);
+        // A full read re-reads the rest.
+        let full = ReadPlan {
+            batch_size: 1024,
+            projection: None,
+            row_groups: None,
+        };
+        assert_eq!(stream_ids(&src, &full).len(), 12);
         assert_eq!(src.resident_footers().unwrap(), 3);
     }
 
@@ -3512,7 +3581,7 @@ mod staging_counter_tests {
 
         let src = ConvertSource::single(crate::input::test_memory_source(bytes, "p.parquet"));
         src.restrict_columns(vec![0, 2]).unwrap();
-        src.num_row_groups_total().unwrap(); // footer first, so it is not counted
+        src.selected_input_bytes(None).unwrap(); // footer first, so it is not counted
 
         let (requests, fetched, ranges) = counted(&src, || src.stage_selected(None).unwrap());
         for r in &ranges {
@@ -3637,7 +3706,7 @@ mod staging_counter_tests {
 
         let src = ConvertSource::single(crate::input::test_memory_source(bytes, "w.parquet"));
         src.restrict_columns(vec![0, 2]).unwrap();
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
 
         let (requests, fetched, _) = counted(&src, || src.stage_selected(None).unwrap());
         assert_eq!(fetched, needed, "only the kept chunks' bytes");
@@ -3667,7 +3736,7 @@ mod staging_counter_tests {
         let store = ProbeStore::new(&named, Duration::from_millis(100));
         let parts = objects.iter().map(|(n, _)| store.source(n)).collect();
         let src = ConvertSource::from_parts("memory://", parts).unwrap();
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
         store.take_max_in_flight(); // footers do not count
 
         let (requests, _, _) = counted(&src, || src.stage_selected(None).unwrap());
@@ -3702,7 +3771,7 @@ mod staging_counter_tests {
         let store = ProbeStore::new(&named, Duration::from_millis(50));
         let parts = objects.iter().map(|(n, _)| store.source(n)).collect();
         let src = ConvertSource::from_parts("memory://", parts).unwrap();
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
         // Part 0 prices a footer, then the other 19 load together.
         assert_eq!(store.take_max_in_flight(), 19, "footers in flight");
         let (requests, _, _) = counted(&src, || src.stage_selected(None).unwrap());
@@ -3732,7 +3801,7 @@ mod staging_counter_tests {
         let store = ProbeStore::new(&named, Duration::ZERO);
         let parts = objects.iter().map(|(n, _)| store.source(n)).collect();
         let src = ConvertSource::from_parts("memory://", parts).unwrap();
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
         store.fail_next_gets("f-0.parquet", usize::MAX);
         let before: Vec<u64> = src
             .parts()
@@ -3788,7 +3857,7 @@ mod staging_counter_tests {
         let bytes = three_column_parquet(1000, 5);
         let store = ProbeStore::new(&[("r.parquet", bytes)], Duration::ZERO);
         let src = ConvertSource::single(store.source("r.parquet"));
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
         store.fail_next_gets("r.parquet", 1);
 
         let (requests, _, _) = counted(&src, || {
@@ -3814,7 +3883,7 @@ mod staging_counter_tests {
     fn staged_remote_rows_serve_concurrent_readers_without_the_network() {
         let bytes = three_column_parquet(1000, 4);
         let src = ConvertSource::single(crate::input::test_memory_source(bytes, "c.parquet"));
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
         src.stage_selected(None).unwrap();
         let (requests, _, _) = counted(&src, || {
             std::thread::scope(|s| {
