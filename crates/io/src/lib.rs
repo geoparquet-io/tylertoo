@@ -106,6 +106,8 @@ pub enum Error {
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod test_support {
+    mod http;
+    pub use http::serve_bytes_over_http;
     /// Fixtures need raw encoding to construct deliberately malformed inputs.
     pub use parquet::arrow::ArrowWriter;
     /// Fixtures construct footer column chunks without allocating huge data pages.

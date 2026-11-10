@@ -28,7 +28,7 @@ use crate::atomic_output::Reserved;
 use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::dedup::TileHasher;
-use crate::input::url_scheme;
+use crate::input::{redact_query, url_scheme};
 use crate::overview::config::{check_ignored_export_fields, ExportField};
 use crate::overview::convert::{convert_to_overviews, ConvertError, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportError, ExportOptions};
@@ -254,7 +254,17 @@ impl Band {
     /// none can be derived from the input.
     pub fn parse(spec: &str) -> Result<Self, BandSpecError> {
         use BandSpecError as E;
-        let owned = || spec.to_string();
+        // An error names the spec, minus a URL input's query (#820).
+        // Everything from the first `?` after `://` goes, malformed spec or not.
+        let owned = || {
+            let query = spec
+                .find("://")
+                .and_then(|i| spec[i..].find('?').map(|q| i + q));
+            match query {
+                Some(q) => format!("{}?<redacted>", &spec[..q]),
+                None => spec.to_string(),
+            }
+        };
         let (sep, at) = band_separator(spec).ok_or_else(|| E::NoZoomRange { spec: owned() })?;
         let (range, rest) = spec.split_at(at);
         let rest = &rest[sep.len_utf8()..];
@@ -279,12 +289,17 @@ impl Band {
             });
         }
 
+        // A query's own `:` and `=` (`se=2026-11-11T12:00:00Z`,
+        // `token=a=b`) cannot be told from a layer separator, so a URL with a
+        // query is the whole input and takes its layer from its path (#820).
+        let queried_url = url_scheme(rest.trim()).is_some() && rest.contains('?');
         // A trailing separator is an empty layer name, not part of the path.
         // Falling through would silently keep it in the path.
-        if rest.trim_end().ends_with(sep) {
+        if !queried_url && rest.trim_end().ends_with(sep) {
             return Err(E::EmptyLayer { spec: owned() });
         }
         let (path, layer) = match sep {
+            _ if queried_url => (rest.trim(), None),
             ':' => split_colon_form(rest),
             _ => split_equals_form(rest),
         };
@@ -296,7 +311,7 @@ impl Band {
             Some(l) => l.to_string(),
             None => default_layer_for(path).ok_or_else(|| E::NoLayer {
                 spec: owned(),
-                path: path.to_string(),
+                path: redact_query(path).into_owned(),
                 sep,
             })?,
         };
@@ -498,6 +513,12 @@ fn is_drive_letter(s: &str) -> bool {
 /// client has to reference as `"source-layer": "*"`. A glob's parent directory
 /// is the useful name, and failing that the caller is asked for one.
 fn default_layer_for(path: &str) -> Option<String> {
+    // A URL's query and fragment are not part of its name (#820: and a
+    // presigned query would put its signature in the layer name).
+    let path = match url_scheme(path) {
+        Some(_) => path.split(['?', '#']).next().unwrap_or(path),
+        None => path,
+    };
     // Strip a Windows drive prefix first: on Unix, `Path` has no notion of one,
     // so `C:data.parquet` would otherwise yield the stem `C:data` — a layer id
     // with a colon in it.
@@ -546,8 +567,9 @@ fn remote_archive_rejection(input: &Path) -> Option<String> {
         return None;
     }
     Some(format!(
-        "band input {s:?}: a remote band must be GeoParquet; stage PMTiles \
-         archives locally and point the band at the local file"
+        "band input {:?}: a remote band must be GeoParquet; stage PMTiles \
+         archives locally and point the band at the local file",
+        redact_query(s)
     ))
 }
 
@@ -2093,7 +2115,7 @@ fn build_pyramid_validated(
             band.min_zoom,
             band.max_zoom,
             band.layer,
-            band.input.display(),
+            redact_query(&band.input.to_string_lossy()),
             if opts.convert.is_verbatim() {
                 " (verbatim)"
             } else {
@@ -2210,7 +2232,8 @@ fn collect_band_metadata(
 
 /// How reports and messages name a band: `"layer (path)"`.
 fn band_label(band: &Band) -> String {
-    format!("{} ({})", band.layer, band.input.display())
+    let input = band.input.to_string_lossy();
+    format!("{} ({})", band.layer, redact_query(&input))
 }
 
 /// Merge per-band archives into one, in band order.
@@ -2887,6 +2910,54 @@ mod tests {
         assert_eq!(bands.len(), 2);
         assert_eq!(bands[0].layer, "a");
         assert_eq!((bands[1].min_zoom, bands[1].max_zoom), (6, 9));
+    }
+
+    /// #820: a presigned band URL keeps its whole query (the reader sends
+    /// it) in both spellings, takes its layer from its path, and is never
+    /// shown with its query.
+    #[test]
+    fn a_presigned_band_url_keeps_its_query_but_never_shows_it() {
+        let url = "https://h/a.parquet?X-Amz-Signature=SECRET&X-Amz-Expires=60";
+        for spec in [format!("0-5={url}"), format!("0-5:{url}")] {
+            let bands = parse_bands(&[spec.as_str()]).unwrap();
+            assert_eq!(
+                (bands[0].input.to_str(), bands[0].layer.as_str()),
+                (Some(url), "a")
+            );
+            assert_eq!(band_label(&bands[0]), "a (https://h/a.parquet?<redacted>)");
+        }
+        // A separator inside the query is not a layer separator.
+        for spec in [
+            "0-5=https://h/a.parquet?X-Amz-Signature=SECRET",
+            "0-5:https://h/a.parquet?st=00:00&sig=SECRET",
+            "0-5:https://h/a.parquet?sv=1&se=2026-11-11T12:00:00Z&sig=SECRET",
+            "0-5:https://h/a.parquet?sig=SECRET&se=2026-11-11T12:00:00Z",
+            "0-5=https://h/a.parquet?token=prefix=SECRET",
+            "0-5=https://h/a.parquet?X-Amz-Signature=SECRET=",
+        ] {
+            let bands = parse_bands(&[spec]).unwrap();
+            assert_eq!(bands[0].layer, "a", "{spec}");
+            let input = bands[0].input.to_string_lossy();
+            assert_eq!(input, spec[4..], "{spec}");
+        }
+        // An implicit layer comes from the URL's path, not its query.
+        let bands = parse_bands(&["0-5:https://h/download?path=/dataset&sig=SECRET"]).unwrap();
+        assert_eq!(bands[0].layer, "download");
+        let err = remote_archive_rejection(Path::new("https://h/a.pmtiles?sig=SECRET")).unwrap();
+        assert!(!err.contains("SECRET"), "{err}");
+        // A refused spec is named without its query too.
+        for spec in [
+            format!("9-5:{url}:a"),
+            format!("9-5: {url}:a"),
+            format!("9-5:\u{2003}{url}:a"),
+            format!("0-5{url}"),
+        ] {
+            let err = parse_bands(&[spec]).unwrap_err();
+            assert!(
+                err.contains("<redacted") && !err.contains("SECRET"),
+                "{err}"
+            );
+        }
     }
 
     /// Spec and set errors come through unchanged, before any existence

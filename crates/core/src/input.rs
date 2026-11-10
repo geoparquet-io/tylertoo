@@ -327,7 +327,7 @@ impl InputSource {
         {
             return Err(InputError::UnsupportedScheme {
                 scheme: scheme.to_string(),
-                url: input.to_string(),
+                url: redact_query(input).into_owned(),
             });
         }
         #[cfg(feature = "remote")]
@@ -336,7 +336,7 @@ impl InputSource {
         }
         #[cfg(not(feature = "remote"))]
         {
-            Err(InputError::RemoteDisabled(input.to_string()))
+            Err(InputError::RemoteDisabled(redact_query(input).into_owned()))
         }
     }
 
@@ -790,6 +790,77 @@ pub(crate) fn url_scheme(input: &str) -> Option<&str> {
     }
 }
 
+/// `input` with its URL query replaced by `?<redacted>` (#820).
+///
+/// Every copy of an input that is displayed or persisted (logs, errors,
+/// reports, plans) goes through this. A presigned S3 or Azure SAS URL
+/// carries its signature in the query, and so can any other API, under any
+/// parameter name, so no value is ever shown. A local path (no `scheme://`)
+/// is returned as is: `?` is a glob character there.
+///
+/// The result is also the input's identity in saved plans and shard plans.
+/// So that a re-signed URL still matches its plan while `?file=a` and
+/// `?file=b` do not, the parameters a re-signing does not change are hashed
+/// into a tag, `?<redacted:1a2b3c4d>`; the signing parameters
+/// (`signing_params`) are left out. A signing parameter missing from that
+/// list only makes a re-signed URL fail its plan check, loudly.
+pub fn redact_query(input: &str) -> std::borrow::Cow<'_, str> {
+    let end = input.find('#').unwrap_or(input.len());
+    let Some(q) = input[..end]
+        .find('?')
+        .filter(|_| url_scheme(input).is_some())
+    else {
+        return input.into();
+    };
+    let params: Vec<&str> = input[q + 1..end].split('&').collect();
+    let signing = signing_params(&params);
+    // In URL order: an endpoint can select by order (the last `file=` wins).
+    let kept: Vec<&str> = params
+        .into_iter()
+        .filter(|p| !p.is_empty() && !signing(&param_name(p)))
+        .collect();
+    let tag = if kept.is_empty() {
+        String::new()
+    } else {
+        // 32 bits tell a plan's few inputs apart without fingerprinting a value.
+        let hash = xxhash_rust::xxh3::xxh3_64(kept.join("&").as_bytes());
+        format!(":{:08x}", hash >> 32)
+    };
+    format!("{}?<redacted{tag}>{}", &input[..q], &input[end..]).into()
+}
+
+/// Which parameters of a query its signer set, so that re-signing changes
+/// them: S3's `X-Amz-*`, GCS's `X-Goog-*`, and Azure SAS's signature,
+/// validity window and signing-key fields. Each set counts only when its
+/// signature is there: on an unsigned API, `st=2025` may pick the object.
+fn signing_params(params: &[&str]) -> impl Fn(&str) -> bool {
+    let has = |name: &str| params.iter().any(|p| param_name(p) == name);
+    // Every account and service SAS carries its version, `sv`, with `sig`.
+    let (s3, gcs, sas) = (
+        has("x-amz-signature"),
+        has("x-goog-signature"),
+        has("sig") && has("sv"),
+    );
+    move |name: &str| {
+        (s3 && name.starts_with("x-amz-"))
+            || (gcs && name.starts_with("x-goog-"))
+            || (sas
+                && matches!(
+                    name,
+                    "sig" | "se" | "st" | "sv" | "skt" | "ske" | "skoid" | "sktid" | "sks" | "skv"
+                ))
+    }
+}
+
+/// A query parameter's name, lowercased.
+fn param_name(param: &str) -> String {
+    param
+        .split('=')
+        .next()
+        .unwrap_or(param)
+        .to_ascii_lowercase()
+}
+
 /// A [`ChunkReader`] over an [`InputSource`]: the type the parquet reader
 /// plumbing is instantiated with.
 #[derive(Debug)]
@@ -852,20 +923,24 @@ pub(crate) mod remote {
 
     use bytes::Bytes;
     use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential};
+    use object_store::client::{
+        HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse,
+        HttpService, ReqwestConnector,
+    };
     use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
     use object_store::http::HttpBuilder;
     use object_store::path::Path as ObjectPath;
     // ObjectStoreExt: object_store 0.14 moved `get_range` and `head` off the
     // base trait onto an extension trait.
     use object_store::{
-        ClientConfigKey, ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt,
-        ObjectStoreScheme,
+        ClientConfigKey, ClientOptions, CredentialProvider, GetOptions, ObjectStore,
+        ObjectStoreExt, ObjectStoreScheme,
     };
     use tylertoo_io::ParquetError;
     use tylertoo_io::ReaderMetadata;
     use url::Url;
 
-    use super::{FetchStats, InputError, InputReader};
+    use super::{param_name, redact_query, FetchStats, InputError, InputReader};
 
     /// Readahead for the *sequential* read path
     /// ([`tylertoo_io::ChunkReader::get_read`]). The page reader
@@ -970,7 +1045,7 @@ pub(crate) mod remote {
     /// Resolve the object store + object path for `url_str`.
     ///
     /// Stores are cached per `scheme://authority` for the life of the
-    /// process, so one convert resolves credentials ONCE per bucket: a
+    /// process (except an http(s) URL with a query, see below), so one convert resolves credentials ONCE per bucket: a
     /// prefix listing and its N per-part sources, or N `--files-from`
     /// manifest entries in the same bucket, all share one store instance
     /// (the AWS credential chain probe in [`build_s3`] is otherwise paid
@@ -985,17 +1060,37 @@ pub(crate) mod remote {
         static STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<dyn ObjectStore>>>> =
             OnceLock::new();
 
+        let shown = redact_query(url_str);
         let url = Url::parse(url_str)
-            .map_err(|e| InputError::RemoteConfig(format!("invalid URL {url_str:?}: {e}")))?;
-        let (scheme, location) = ObjectStoreScheme::parse(&url).map_err(|e| {
-            InputError::RemoteConfig(format!("cannot interpret URL {url_str:?}: {e}"))
-        })?;
+            .map_err(|e| InputError::RemoteConfig(format!("invalid URL {shown:?}: {e}")))?;
+        let interpret_err = |e: &dyn std::fmt::Display| {
+            InputError::RemoteConfig(format!("cannot interpret URL {shown:?}: {e}"))
+        };
+        // A signed query is the URL's own credential (a presigned S3/GCS or
+        // Azure SAS URL), so it is read as the web URL it is, even on a cloud
+        // host that `parse` would hand to a store signing with ambient
+        // credentials. An unsigned query (`?x-id=GetObject`) keeps that store.
+        let signed = url.scheme().starts_with("http") && url.query().is_some_and(query_is_signed);
+        let (scheme, location) = if signed {
+            let path = ObjectPath::from_url_path(url.path()).map_err(|e| interpret_err(&e))?;
+            (ObjectStoreScheme::Http, path)
+        } else {
+            ObjectStoreScheme::parse(&url).map_err(|e| interpret_err(&e))?
+        };
+        // An http(s) query (a presigned/SAS signature) belongs to one object,
+        // so its store is built for that URL alone and never cached: sharing
+        // it would sign other objects' requests with it, and caching one per
+        // URL would grow without bound in a long-lived Python process.
+        let query = url
+            .query()
+            .filter(|_| matches!(scheme, ObjectStoreScheme::Http));
         let key = url[..url::Position::BeforePath].to_ascii_lowercase();
         let stores = STORES.get_or_init(Default::default);
         if let Some(store) = stores
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
+            .filter(|_| query.is_none())
         {
             return Ok((Arc::clone(store), location));
         }
@@ -1014,15 +1109,20 @@ pub(crate) mod remote {
             ),
             ObjectStoreScheme::Http => {
                 let origin = &url[..url::Position::BeforePath];
+                let builder = HttpBuilder::new()
+                    .with_url(origin)
+                    .with_client_options(ClientOptions::new().with_allow_http(true));
+                let builder = match query {
+                    Some(q) => builder.with_http_connector(QueryConnector {
+                        origin: key.clone(),
+                        query: q.into(),
+                    }),
+                    None => builder,
+                };
                 Arc::new(
                     overrides
                         .iter()
-                        .fold(
-                            HttpBuilder::new()
-                                .with_url(origin)
-                                .with_client_options(ClientOptions::new().with_allow_http(true)),
-                            |b, (k, v)| b.with_config(*k, v),
-                        )
+                        .fold(builder, |b, (k, v)| b.with_config(*k, v))
                         .build()
                         .map_err(|e| store_error(url_str, e))?,
                 )
@@ -1030,17 +1130,131 @@ pub(crate) mod remote {
             _ => {
                 return Err(InputError::UnsupportedScheme {
                     scheme: url.scheme().to_string(),
-                    url: url_str.to_string(),
+                    url: shown.into_owned(),
                 })
             }
         };
         // A concurrent resolve may have raced us; either instance works,
         // last insert wins.
-        stores
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key, Arc::clone(&store));
+        if query.is_none() {
+            stores
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, Arc::clone(&store));
+        }
         Ok((store, location))
+    }
+
+    /// Whether a query carries a presigned S3/GCS or Azure SAS signature.
+    fn query_is_signed(query: &str) -> bool {
+        query.split('&').any(|p| {
+            matches!(
+                param_name(p).as_str(),
+                "x-amz-signature" | "x-goog-signature" | "sig"
+            )
+        })
+    }
+
+    /// Sends an http(s) input's query string (a presigned S3 or Azure SAS
+    /// signature, #820) on every request its store makes.
+    ///
+    /// `object_store`'s `HttpStore` addresses objects by path alone, so the
+    /// query is added below it, at the transport: `object_store` never holds
+    /// the query, so none of its error messages (which quote the request URI)
+    /// can leak it.
+    ///
+    /// The store is per URL, but the connection pool below it is per origin,
+    /// as for an unsigned URL's cached store: a client per URL held a socket
+    /// per input, and 1,500 signed URLs ran out of file descriptors.
+    #[derive(Debug)]
+    struct QueryConnector {
+        origin: String,
+        query: String,
+    }
+
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+    )]
+    static HTTP_CLIENTS: OnceLock<Mutex<std::collections::HashMap<String, HttpClient>>> =
+        OnceLock::new();
+
+    impl HttpConnector for QueryConnector {
+        fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+            let mut clients = HTTP_CLIENTS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inner = match clients.get(&self.origin) {
+                Some(client) => client.clone(),
+                None => {
+                    let client = ReqwestConnector::default().connect(options)?;
+                    #[cfg(test)]
+                    CLIENTS_BUILT
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(self.origin.clone());
+                    clients.insert(self.origin.clone(), client.clone());
+                    client
+                }
+            };
+            Ok(HttpClient::new(QueryService {
+                inner,
+                query: self.query.clone(),
+            }))
+        }
+    }
+
+    #[cfg(test)]
+    static CLIENTS_BUILT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// How many connection pools signed URLs on `origin` have built.
+    #[cfg(test)]
+    pub(super) fn shared_http_clients_for(origin: &str) -> usize {
+        let built = CLIENTS_BUILT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        built.iter().filter(|o| *o == origin).count()
+    }
+
+    #[derive(Debug)]
+    struct QueryService {
+        inner: HttpClient,
+        query: String,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpService for QueryService {
+        async fn call(&self, mut req: HttpRequest) -> Result<HttpResponse, HttpError> {
+            let uri = req.uri();
+            let sep = if uri.query().is_some() { '&' } else { '?' };
+            *req.uri_mut() = format!("{uri}{sep}{}", self.query)
+                .parse()
+                .map_err(|e| HttpError::new(HttpErrorKind::Request, e))?;
+            let res = self.inner.execute(req).await?;
+            if res.status().is_success() {
+                return Ok(res);
+            }
+            // object_store prints an error response's body, and a refusal can
+            // quote the request: S3's SignatureDoesNotMatch echoes its
+            // canonical query, security token included. Keep only the code.
+            let (mut parts, body) = res.into_parts();
+            let text = body.bytes().await.unwrap_or_default();
+            parts.headers.remove("content-length");
+            Ok(HttpResponse::from_parts(parts, error_code(&text).into()))
+        }
+    }
+
+    /// The `<Code>` of an S3/GCS/Azure XML error body (`AccessDenied`,
+    /// `SignatureDoesNotMatch`, ...), or empty: nothing else of it is kept.
+    fn error_code(body: &[u8]) -> String {
+        let text = String::from_utf8_lossy(body);
+        text.split_once("<Code>")
+            .and_then(|(_, rest)| rest.split_once("</Code>"))
+            .map(|(code, _)| code)
+            .filter(|c| c.len() <= 64 && c.chars().all(|ch| ch.is_ascii_alphanumeric()))
+            .unwrap_or_default()
+            .to_string()
     }
 
     /// List the `.parquet` objects under remote prefix `prefix`, applying
@@ -1166,10 +1380,21 @@ pub(crate) mod remote {
 
         /// Connect to `url`, resolving the backing store from the scheme
         /// (cached per bucket, see [`store_and_location`]) and HEAD-ing the
-        /// object for its size.
+        /// object for its size (a one-byte GET for a URL with a query).
         pub(crate) fn connect(url_str: &str) -> Result<Self, InputError> {
             let (store, location) = store_and_location(url_str)?;
-            Self::from_store(store, location, url_str.to_string())
+            let url = redact_query(url_str).into_owned();
+            if url == url_str {
+                return Self::from_store(store, location, url);
+            }
+            // A presigned URL signs one method, GET (#820): S3 and GCS refuse
+            // a HEAD on it, so its size and ETag come from a one-byte GET.
+            let opts = GetOptions::default().with_range(Some(0..1));
+            let meta = runtime()
+                .block_on(store.get_opts(&location, opts))
+                .map_err(|e| store_error(&url, e))?
+                .meta;
+            Ok(Self::from_store_meta(store, url, meta))
         }
 
         /// Build a source over an explicit store + location (also the test
@@ -1672,6 +1897,7 @@ pub(crate) mod remote {
         source: object_store::Error,
         custom_endpoint: bool,
     ) -> InputError {
+        let url = redact_query(url);
         if custom_endpoint {
             let text = source.to_string();
             if looks_like_signature_error(&text) {
@@ -1683,7 +1909,7 @@ pub(crate) mod remote {
             }
         }
         InputError::Remote {
-            url: url.to_string(),
+            url: url.into_owned(),
             source,
         }
     }
@@ -3925,6 +4151,42 @@ pub(crate) mod remote {
                 .expect("gs:// builds a GCS store");
             assert_eq!(location.as_ref(), "dir/part.parquet");
         }
+
+        /// #820: a signed https URL on an S3 or Azure host is a plain web
+        /// URL (its query is the credential), not a bucket to sign for.
+        #[test]
+        fn signed_cloud_https_urls_resolve_to_the_http_store() {
+            for (url, key) in [
+                (
+                    "https://b.s3.us-east-1.amazonaws.com/dir/a.parquet?X-Amz-Signature=x",
+                    "dir/a.parquet",
+                ),
+                (
+                    "https://acct.blob.core.windows.net/c/dir/a.parquet?sp=r&sig=x",
+                    "c/dir/a.parquet",
+                ),
+            ] {
+                let (store, location) = store_and_location(url).expect(url);
+                assert!(store.to_string().starts_with("HttpStore"), "{url}: {store}");
+                assert_eq!(location.as_ref(), key, "{url}");
+            }
+            // Each signed URL gets its own store, but one origin's share a
+            // connection pool: a client each held a socket per input, and a
+            // manifest of 1,500 signed URLs ran out of file descriptors.
+            for n in 0..3 {
+                store_and_location(&format!("https://pool820.test/{n}.parquet?sig=x{n}"))
+                    .expect("signed http URL");
+            }
+            assert_eq!(super::shared_http_clients_for("https://pool820.test"), 1);
+            // An unsigned query keeps the cloud store and its credentials
+            // (Azure's is not built in, so it stays refused).
+            let err = store_and_location("https://acct.blob.core.windows.net/c/a.parquet?x-id=1")
+                .expect_err("an unsigned Azure URL is not read over plain http");
+            assert!(
+                matches!(err, super::InputError::UnsupportedScheme { .. }),
+                "{err}"
+            );
+        }
     }
 
     #[cfg(test)]
@@ -4401,6 +4663,65 @@ pub(crate) fn test_memory_source_with_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #820: a URL's query (a presigned or SAS signature) never reaches a
+    /// displayed or persisted copy of the input; a local path keeps its `?`.
+    #[test]
+    fn redact_query_hides_a_url_query_only() {
+        let cases = [
+            (
+                "https://h/o.parquet?X-Amz-Signature=abc&X-Amz-Date=1#frag",
+                "https://h/o.parquet?<redacted>#frag",
+            ),
+            ("https://h/o.parquet#a?b", "https://h/o.parquet#a?b"),
+            ("s3://b/k.parquet", "s3://b/k.parquet"),
+            ("data/file?.parquet", "data/file?.parquet"),
+        ];
+        for (input, shown) in cases {
+            assert_eq!(redact_query(input), shown, "{input}");
+        }
+    }
+
+    /// #820: the redacted form is also the input's identity in saved plans,
+    /// so a re-signed URL for the same object keeps it, while a query that
+    /// selects another object changes it, without showing any value.
+    #[test]
+    fn redact_query_keeps_identity_across_re_signing_only() {
+        let s3 = |sig: &str, date: &str| {
+            redact_query(&format!(
+                "https://b.s3.amazonaws.com/k.parquet?x-id=GetObject&X-Amz-Date={date}\
+                 &X-Amz-Signature={sig}&X-Amz-Credential=AKIA%2F{date}"
+            ))
+            .into_owned()
+        };
+        assert_eq!(s3("aaa", "20261110"), s3("bbb", "20261111"));
+        let sas = |sig: &str, se: &str| {
+            redact_query(&format!(
+                "https://a.blob.core.windows.net/c/k?sp=r&se={se}&sv=2022-11-02&sig={sig}"
+            ))
+            .into_owned()
+        };
+        assert_eq!(sas("aaa", "2026-11-11"), sas("bbb", "2026-12-01"));
+        let pick = |q: &str| redact_query(&format!("https://h/download?{q}")).into_owned();
+        assert_ne!(pick("file=a&sv=1&sig=x"), pick("file=b&sv=1&sig=x"));
+        assert_eq!(pick("file=a&sv=1&sig=x"), pick("sv=1&sig=y&file=a"));
+        // Order can select: some endpoints take the last of a repeated key.
+        assert_ne!(pick("file=a&file=b"), pick("file=b&file=a"));
+        // A signing field's name means nothing without its signature.
+        assert_ne!(pick("st=2025"), pick("st=2026"));
+        assert_ne!(pick("st=2025&sig=x"), pick("st=2026&sig=x"));
+        assert_ne!(pick("X-Amz-Date=1"), pick("X-Amz-Date=2"));
+        for shown in [s3("aaa", "1"), sas("aaa", "1"), pick("file=a&sig=x")] {
+            assert!(!shown.contains("aaa") && !shown.contains("file"), "{shown}");
+        }
+    }
+
+    /// #820: an unsupported or remote-disabled URL is named without its query.
+    #[test]
+    fn scheme_errors_redact_the_query() {
+        let err = InputSource::from_str_input("ftp://h/o.parquet?sig=SECRET").unwrap_err();
+        assert!(!err.to_string().contains("SECRET"), "{err}");
+    }
 
     #[test]
     fn local_path_is_local() {

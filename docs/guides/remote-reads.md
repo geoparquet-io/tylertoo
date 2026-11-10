@@ -13,6 +13,17 @@ Use an `s3://`, `https://`, or `gs://` URL in place of a local path:
 tylertoo tiles https://example.com/fields.parquet fields.pmtiles
 ```
 
+A presigned S3 URL or an Azure SAS URL works as an `https://` input: its
+query string goes with every request. Quote it in the shell, since `&` ends a
+command. Logs, errors, reports and saved plans show the query as
+`?<redacted>`, so a plan saved from one signed URL still matches the same
+object behind a freshly signed one. Query parameters other than the S3, GCS
+and Azure signing ones become a short hash, as in `?<redacted:1a2b3c4d>`, so
+URLs that pick different objects stay distinct.
+A signed URL as a `pyramid` band takes its layer name from the file name in
+its path: its query can contain `:` and `=`, so `LO-HI:URL:LAYER` cannot
+split a layer off it.
+
 An `s3://` or `gs://` prefix ending in `/` includes every `.parquet` object
 below it as one dataset. Local directories and globs work the same way.
 

@@ -415,7 +415,7 @@ impl ConvertSource {
             {
                 if _scheme.eq_ignore_ascii_case("http") || _scheme.eq_ignore_ascii_case("https") {
                     return Err(InputError::RemotePrefixUnsupported {
-                        url: input.to_string(),
+                        url: crate::input::redact_query(input).into_owned(),
                     });
                 }
                 return Self::from_remote_prefix(input);
@@ -476,7 +476,7 @@ impl ConvertSource {
     fn from_remote_prefix(input: &str) -> Result<Self, InputError> {
         let sources = crate::input::remote::sources_under_prefix(input)?;
         Self::from_parts(
-            input,
+            &crate::input::redact_query(input),
             sources.into_iter().map(InputSource::Remote).collect(),
         )
     }
