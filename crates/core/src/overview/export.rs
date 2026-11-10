@@ -1312,6 +1312,14 @@ pub enum ExportError {
         /// Where that figure came from, as messages name it.
         limit_source: &'static str,
     },
+
+    /// A finished MVT tile did not convert to MLT (`--tile-format mlt`,
+    /// #823): mlt-core refused it.
+    #[error("a tile did not convert to MLT: {message}; rerun with --tile-format mvt")]
+    MltConversion {
+        /// mlt-core's message.
+        message: String,
+    },
 }
 
 #[doc(hidden)]
@@ -8476,6 +8484,7 @@ fn account_sources(
 /// nothing (#431) is an empty carrier the writer loop skips: there is no
 /// tile to write, but the drops must still reach the report.
 fn encoded_tile(x: u32, y: u32, mvt: TileMvt, fill: FillTally) -> Result<EncodedTile, ExportError> {
+    check_mlt(&mvt)?;
     if mvt.features == 0 {
         return Ok(EncodedTile {
             x,
@@ -8620,6 +8629,9 @@ struct TileMvt {
     oversized: bool,
     /// What the size valve did to the tile (#745).
     valve: ValveTally,
+    /// Why the MVT did not convert to the export's MLT, if it did not;
+    /// `data` is then empty and the export fails at this tile.
+    mlt_error: Option<String>,
 }
 
 // A read-only cached-gzip view for fill's existing cost observer. All raw
@@ -9001,6 +9013,7 @@ fn is_point_like<M: TileFeature>(members: &[M]) -> bool {
 /// unchanged; `TileData` invalidates it on every mutable raw-buffer access.
 /// Both currently active limits are recomputed even on a cache hit.
 fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError> {
+    check_mlt(mvt)?;
     let mut fit = f64::INFINITY;
     if let Some(limit) = opts.tile_size_limit.filter(|&l| l > 0) {
         fit = fit.min(limit as f64 / mvt.data.len() as f64);
@@ -9010,6 +9023,16 @@ fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError>
         fit = fit.min(limit as f64 / gz.len() as f64);
     }
     Ok(fit)
+}
+
+/// The export's failure for a tile whose MVT did not convert to MLT.
+fn check_mlt(mvt: &TileMvt) -> Result<(), ExportError> {
+    match &mvt.mlt_error {
+        Some(message) => Err(ExportError::MltConversion {
+            message: message.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Encodes the drop valve may take before it gives up and writes the tile
@@ -9499,17 +9522,22 @@ fn build_mvt_within<M: TileFeature>(
     let features = layer.feature_count() - fill.len();
     let unencodable = layer.dropped_features();
     let quantized = layer.quantized_features();
+    let (data, mlt_error) =
+        match crate::tile_format::finish_tile(layer.build(), opts.tile_format, opts.mlt_profile) {
+            Ok(data) => (data, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
     Some(TileMvt {
         gzip_cache: Arc::clone(gzip_cache),
         source_ids,
         source_losses,
-        data: crate::tile_format::finish_tile(layer.build(), opts.tile_format, opts.mlt_profile)
-            .into(),
+        data: data.into(),
         features,
         unencodable,
         quantized,
         oversized: false,
         valve: ValveTally::default(),
+        mlt_error,
     })
 }
 

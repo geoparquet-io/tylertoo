@@ -807,6 +807,8 @@ pub tylertoo_core::ExportError::LevelZoomsNotAscending::previous_gsd: f64
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::previous_level: usize
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::previous_zoom: u8
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::zoom: u8
+pub tylertoo_core::ExportError::MltConversion
+pub tylertoo_core::ExportError::MltConversion::message: alloc::string::String
 #[non_exhaustive] pub tylertoo_core::ExportError::NoGeometryColumn
 pub tylertoo_core::ExportError::NoGeometryColumn::path: core::option::Option<alloc::string::String>
 pub tylertoo_core::ExportError::Output(tylertoo_core::OutputNotWritable)

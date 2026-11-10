@@ -108,18 +108,17 @@ pub(crate) const MLT_SUPPORTED: bool = cfg!(feature = "mlt");
 
 /// The finished tile bytes for `format`: the MVT itself, or its MLT.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the MVT cannot be converted, which validation rules out: the
-/// export refuses MLT in a build without the `mlt` feature and an empty
-/// layer name, and tylertoo's own MVT always parses.
-// shortcut: panics rather than threading a Result through every build_mvt
-// caller; upgrade if mlt-core gains a failure tylertoo's MVT can trigger.
-pub(crate) fn finish_tile(mvt: Vec<u8>, format: TileFormat, profile: MltProfile) -> Vec<u8> {
+/// mlt-core's message when the MVT does not convert to MLT.
+pub(crate) fn finish_tile(
+    mvt: Vec<u8>,
+    format: TileFormat,
+    profile: MltProfile,
+) -> Result<Vec<u8>, String> {
     match format {
-        TileFormat::Mvt => mvt,
-        TileFormat::Mlt => mvt_to_mlt(&mvt, profile)
-            .unwrap_or_else(|e| panic!("tylertoo's MVT failed to convert to MLT: {e}")),
+        TileFormat::Mvt => Ok(mvt),
+        TileFormat::Mlt => mvt_to_mlt(&mvt, profile),
     }
 }
 
@@ -285,7 +284,7 @@ mod tests {
     }
 
     fn mlt_column(mvt: &[u8], profile: MltProfile) -> (PropKind, Vec<PropValue>) {
-        let mlt = finish_tile(mvt.to_vec(), TileFormat::Mlt, profile);
+        let mlt = finish_tile(mvt.to_vec(), TileFormat::Mlt, profile).unwrap();
         let back = mvt_to_tile_layers(mlt_to_mvt(&mlt).unwrap()).unwrap();
         let layer = &back[0];
         let kind = layer.property_kinds()[0];
@@ -303,7 +302,7 @@ mod tests {
     fn mvt_is_passed_through_untouched() {
         let mvt = mvt_with(&[PropValue::I64(Some(1))]);
         assert_eq!(
-            finish_tile(mvt.clone(), TileFormat::Mvt, MltProfile::Web),
+            finish_tile(mvt.clone(), TileFormat::Mvt, MltProfile::Web).unwrap(),
             mvt
         );
     }
@@ -315,7 +314,7 @@ mod tests {
             PropValue::Str(None),
             PropValue::Str(Some("c".into())),
         ]);
-        let mlt = finish_tile(mvt.clone(), TileFormat::Mlt, MltProfile::Web);
+        let mlt = finish_tile(mvt.clone(), TileFormat::Mlt, MltProfile::Web).unwrap();
         assert_ne!(mlt, mvt);
         assert_eq!(
             mvt_to_tile_layers(mlt_to_mvt(&mlt).unwrap()).unwrap(),
@@ -345,7 +344,7 @@ mod tests {
             MltProfile::Diffable,
             MltProfile::FastEncoding,
         ] {
-            let mlt = finish_tile(mvt.clone(), TileFormat::Mlt, profile);
+            let mlt = finish_tile(mvt.clone(), TileFormat::Mlt, profile).unwrap();
             let got = mvt_to_tile_layers(mlt_to_mvt(&mlt).unwrap()).unwrap();
             assert_eq!(got, want, "{profile}");
         }
@@ -376,7 +375,7 @@ mod tests {
     #[test]
     fn layer_lengths_are_the_mlt_wire_lengths() {
         let a = mvt_with(&[PropValue::Bool(Some(true))]);
-        let mlt = finish_tile(a, TileFormat::Mlt, MltProfile::Web);
+        let mlt = finish_tile(a, TileFormat::Mlt, MltProfile::Web).unwrap();
         let layers = mlt_to_mvt_layers(&mlt).unwrap();
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].1, mlt.len() as u64);
