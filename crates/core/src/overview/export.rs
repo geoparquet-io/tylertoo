@@ -2215,6 +2215,7 @@ fn export_pmtiles_impl(
             concurrent_levels: true,
             checkpoint_interval: CHECKPOINT_INTERVAL,
             fail_level: None,
+            #[cfg(test)]
             panic_write_level: None,
             memory_limit: None,
             budget_available: None,
@@ -2240,6 +2241,7 @@ struct Pass2Knobs {
     fail_level: Option<usize>,
     /// Panic while a level group writes this level's first wave, to test
     /// that a panicking write fails the group instead of hanging it.
+    #[cfg(test)]
     panic_write_level: Option<usize>,
     /// The memory figure for the #665 dense-tile refusal. `None` probes
     /// ([`probe_oom_memory_limit`]); tests inject one.
@@ -3044,6 +3046,7 @@ fn fill_backing(
 struct ExportProgress {
     fail_level: Option<usize>,
     /// [`Pass2Knobs::panic_write_level`].
+    #[cfg(test)]
     panic_write_level: Option<usize>,
     /// When the last checkpoint was written (or the export started): a
     /// checkpoint is due once [`CHECKPOINT_INTERVAL`] has elapsed since. A
@@ -3083,6 +3086,7 @@ impl ExportProgress {
             checkpoint_throttle: Instant::now(),
             checkpoint_interval: knobs.checkpoint_interval,
             fail_level: knobs.fail_level,
+            #[cfg(test)]
             panic_write_level: knobs.panic_write_level,
             #[cfg(test)]
             checkpoint_zooms: Vec::new(),
@@ -3976,6 +3980,7 @@ impl GroupCommit<'_> {
     fn write_wave(&mut self, encoded: EncodedWave) -> Result<(), ExportError> {
         let (i, w) = self.next;
         let level = &self.levels[i];
+        #[cfg(test)]
         assert!(
             w > 0 || self.progress.panic_write_level != Some(level.level_idx),
             "injected write panic at level {}",
