@@ -56,6 +56,8 @@ tylertoo tiles parcels.parquet parcels.pmtiles --preset tippecanoe
 ```
 
 ```python
+import tylertoo  # notest: needs your own parcels.parquet
+
 tylertoo.convert("parcels.parquet", "parcels.pmtiles", preset="tippecanoe")
 ```
 
