@@ -10041,15 +10041,15 @@ mod tests {
         struct Arrive;
         impl Drop for Arrive {
             fn drop(&mut self) {
-                super::super::accumulate::rendezvous::arrive("release");
+                super::super::testutil::rendezvous::arrive("release");
             }
         }
         let items: Vec<Arrive> = (0..4).map(|_| Arrive).collect();
-        let pool = super::super::accumulate::rendezvous::pool(4);
-        let _guard = super::super::accumulate::rendezvous::arm("release", 4);
+        let pool = super::super::testutil::rendezvous::pool(4);
+        let _guard = super::super::testutil::rendezvous::arm("release", 4);
         pool.install(|| release_in_parallel(items));
         assert!(
-            super::super::accumulate::rendezvous::met(),
+            super::super::testutil::rendezvous::met(),
             "the 4 drops never ran at once"
         );
     }

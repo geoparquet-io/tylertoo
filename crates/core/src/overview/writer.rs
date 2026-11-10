@@ -1023,7 +1023,7 @@ impl<W: Write + Send> OverviewWriter<W> {
                 #[cfg(test)]
                 faults.trip_row_group();
                 #[cfg(test)]
-                super::accumulate::rendezvous::arrive("encode row group");
+                super::testutil::rendezvous::arrive("encode row group");
                 encode_row_group(writers, batches, &target_schema)
             })
             .unwrap_or_else(|msg| Err(ParquetError::General(msg)));
@@ -1856,9 +1856,9 @@ mod tests {
         opts.encode_concurrency = 4;
         opts.overlap_levels = true;
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let pool = super::super::accumulate::rendezvous::pool(4);
+        let pool = super::super::testutil::rendezvous::pool(4);
         let ids: Vec<i64> = (0..10).collect();
-        let _guard = super::super::accumulate::rendezvous::arm("encode row group", 2);
+        let _guard = super::super::testutil::rendezvous::arm("encode row group", 2);
         pool.install(|| {
             let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
             for level in 0..3 {
@@ -1869,7 +1869,7 @@ mod tests {
             writer.finish().unwrap();
         });
         assert!(
-            super::super::accumulate::rendezvous::met(),
+            super::super::testutil::rendezvous::met(),
             "two levels' row groups never encoded at once"
         );
     }
