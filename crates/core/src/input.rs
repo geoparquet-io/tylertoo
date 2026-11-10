@@ -2067,13 +2067,15 @@ pub(crate) mod remote {
             return overrides.clone();
         }
         let (overrides, warnings) = client_overrides(raw.clone());
+        *last = Some((raw, overrides.clone()));
+        // Log unlocked: a logger (Python's) could re-enter a conversion.
+        drop(last);
         for w in &warnings {
             log::warn!("[remote] {w}");
         }
         if let Some(line) = overrides_log_line(&overrides) {
             log::info!("[remote] {line}");
         }
-        *last = Some((raw, overrides.clone()));
         overrides
     }
 
@@ -2397,13 +2399,18 @@ pub(crate) mod remote {
             let (mut tunables, warnings) = resolve(lookup);
             tunables.overridden = overridden;
             tunables.mem_budget_set = mem_budget_set;
-            let now = Some((tunables, warnings));
+            let now = Some((tunables, warnings.clone()));
             let mut logged = LOGGED
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *logged != now {
+            let changed = *logged != now;
+            if changed {
                 *logged = now;
-                for w in &logged.as_ref().expect("just set").1 {
+            }
+            // Log unlocked: a logger (Python's) could re-enter a conversion.
+            drop(logged);
+            if changed {
+                for w in &warnings {
                     log::warn!("[stage] {w}");
                 }
                 let line = format!(
