@@ -157,7 +157,12 @@ fn mvt_to_mlt(mvt: &[u8], profile: MltProfile) -> Result<Vec<u8>, String> {
         MltProfile::MinSize => EncoderConfig::from_profile(Profile::MinSize),
         MltProfile::Diffable => EncoderConfig::from_profile(Profile::Diffable),
         MltProfile::FastEncoding => EncoderConfig::from_profile(Profile::FastEncoding),
-    };
+    }
+    // Feature order is draw order (--feature-order, coverage fill under
+    // the features): no profile may reorder features to save bytes.
+    .with_spatial_morton_sort(false)
+    .with_spatial_hilbert_sort(false)
+    .with_id_sort(false);
     let mut out = Vec::new();
     for layer in mlt_core::mvt::mvt_to_tile_layers(mvt).map_err(|e| e.to_string())? {
         let layer = match profile {
@@ -316,6 +321,34 @@ mod tests {
             mvt_to_tile_layers(mlt_to_mvt(&mlt).unwrap()).unwrap(),
             mvt_to_tile_layers(&mvt).unwrap()
         );
+    }
+
+    /// Feature order is draw order (`--feature-order`, coverage fill), so
+    /// no profile may sort features by id or along a space-filling curve.
+    #[test]
+    fn every_profile_keeps_feature_order() {
+        let mut b = TileLayer::builder("l", 4096).unwrap();
+        for i in 0..2000_i32 {
+            // Ids descend and points jump across the tile, so an id or
+            // curve sort would encode smaller.
+            let (x, y) = ((i * 2654) % 4096, (i * 1013) % 4096);
+            let mut f = b.feature(Geometry::Point(Point::new(x, y)));
+            f.id(Some(10_000 - u64::try_from(i).unwrap()));
+            f.finish().unwrap();
+        }
+        let mvt = tile_layers_to_mvt(vec![b.finish()]).unwrap();
+        let want = mvt_to_tile_layers(&mvt).unwrap();
+        for profile in [
+            MltProfile::Web,
+            MltProfile::Native,
+            MltProfile::MinSize,
+            MltProfile::Diffable,
+            MltProfile::FastEncoding,
+        ] {
+            let mlt = finish_tile(mvt.clone(), TileFormat::Mlt, profile);
+            let got = mvt_to_tile_layers(mlt_to_mvt(&mlt).unwrap()).unwrap();
+            assert_eq!(got, want, "{profile}");
+        }
     }
 
     #[test]
