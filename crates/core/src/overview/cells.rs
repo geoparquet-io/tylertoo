@@ -371,7 +371,10 @@ type CellMap = HashMap<u64, CellAcc>;
 
 /// Rows per parallel task within a batch. Fixed, so float rollups add up
 /// the same way on any number of cores.
-const CHUNK_ROWS: usize = 8192;
+const CHUNK_ROWS: usize = 1024;
+
+/// Rows per read batch: enough chunks to keep every core busy.
+const READ_ROWS: usize = 64 * CHUNK_ROWS;
 
 /// Shards of the cell map, so batches and rollups merge on every core.
 const SHARDS: usize = 64;
@@ -566,7 +569,7 @@ fn aggregate(
     let budget = MemoryBudget::probe();
     let tuning = ReadTuning {
         budget,
-        batch_size: defaults.read_batch_size,
+        batch_size: READ_ROWS,
         workers: super::convert::resolve_pass_read_workers(ReadPass::Scan, defaults.read_workers),
         avg_geom_bytes: None,
         footer: None,
@@ -1063,11 +1066,16 @@ mod tests {
     fn sums_do_not_depend_on_core_count() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("pts.parquet");
-        let n = 3 * CHUNK_ROWS;
+        let n = 3 * READ_ROWS;
         let geoms = vec![Some(Geometry::Point(geo::Point::new(1.0, 1.0))); n];
         let mut values = vec![0.0; n];
-        for (k, v) in [1e16, 1.0, -1e16, 1.0].into_iter().enumerate() {
-            values[k * CHUNK_ROWS / 2 + 1] = v;
+        // Chunked by core count, 1 core sums these to 1 and 16 cores to 0.
+        for (row, v) in [
+            (0, 1e16),
+            (READ_ROWS / 64, -1e16),
+            (READ_ROWS / 64 + 1, 1.0),
+        ] {
+            values[row] = v;
         }
         crate::overview::testutil::write_input_with_f64(&src, &geoms, "v", &values);
         let spec = [AccumulateSpec::new(
@@ -1098,6 +1106,6 @@ mod tests {
             .unwrap();
             std::fs::read(&table).unwrap()
         };
-        assert_eq!(sum_on(1), sum_on(8));
+        assert_eq!(sum_on(1), sum_on(16));
     }
 }
