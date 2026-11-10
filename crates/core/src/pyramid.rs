@@ -458,6 +458,12 @@ fn split_colon_form(rest: &str) -> (&str, Option<&str>) {
         // fallback) because slicing by byte offset here is clearer than
         // re-deriving the scheme boundary from the split fallback would be.
         let authority_and_path = &rest[scheme.len() + 3..];
+        // A query's colons (`se=2026-11-11T12:00:00Z`) cannot be told from a
+        // layer separator, so a URL with a query names its layer with
+        // `LO-HI=URL=LAYER` (#820).
+        if authority_and_path.contains('?') {
+            return (rest, None);
+        }
         return match authority_and_path.rsplit_once(':') {
             // `is_bare_layer_token` rejects a segment containing `/`, which is
             // what keeps a port (`host:8080/x.parquet`) and a colon inside the
@@ -483,7 +489,7 @@ fn split_colon_form(rest: &str) -> (&str, Option<&str>) {
 fn split_equals_form(rest: &str) -> (&str, Option<&str>) {
     let rest = rest.trim();
     match rest.rsplit_once('=') {
-        Some((p, l)) if is_bare_layer_token(l) && !p.trim().is_empty() => {
+        Some((p, l)) if is_bare_layer_token(l) && !p.trim().is_empty() && !cuts_query(p, l) => {
             (p.trim(), Some(l.trim()))
         }
         _ => (rest, None),
@@ -495,6 +501,17 @@ fn split_equals_form(rest: &str) -> (&str, Option<&str>) {
 fn is_bare_layer_token(s: &str) -> bool {
     let s = s.trim();
     !s.is_empty() && !s.contains(['/', '\\', ':'])
+}
+
+/// Whether an `=` split of a URL into `path` and `layer` would cut through
+/// its query (#820): the layer would hold a query tail (`&`), or the path's
+/// last parameter would lose its value (`?X-Amz-Signature=SECRET` is no
+/// layer).
+fn cuts_query(path: &str, layer: &str) -> bool {
+    url_scheme(path.trim()).is_some()
+        && path.split_once('?').is_some_and(|(_, q)| {
+            layer.contains('&') || !q.rsplit('&').next().unwrap_or(q).contains('=')
+        })
 }
 
 /// A single ASCII letter — i.e. a Windows drive designator, not a path.
@@ -2914,13 +2931,27 @@ mod tests {
     #[test]
     fn a_presigned_band_url_keeps_its_query_but_never_shows_it() {
         let url = "https://h/a.parquet?X-Amz-Signature=SECRET&X-Amz-Expires=60";
-        for spec in [format!("0-5:{url}:a"), format!("0-5={url}=a")] {
+        for spec in [format!("0-5={url}=a"), format!("0-5:{url}")] {
             let bands = parse_bands(&[spec.as_str()]).unwrap();
             assert_eq!(
                 (bands[0].input.to_str(), bands[0].layer.as_str()),
                 (Some(url), "a")
             );
             assert_eq!(band_label(&bands[0]), "a (https://h/a.parquet?<redacted>)");
+        }
+        // A separator inside the query is not a layer separator.
+        for spec in [
+            "0-5=https://h/a.parquet?X-Amz-Signature=SECRET",
+            "0-5:https://h/a.parquet?st=00:00&sig=SECRET",
+            "0-5:https://h/a.parquet?sv=1&se=2026-11-11T12:00:00Z&sig=SECRET",
+            "0-5:https://h/a.parquet?sig=SECRET&se=2026-11-11T12:00:00Z",
+        ] {
+            let bands = parse_bands(&[spec]).unwrap();
+            assert_eq!(bands[0].layer, "a", "{spec}");
+            assert!(
+                bands[0].input.to_string_lossy().contains("SECRET"),
+                "{spec}"
+            );
         }
         // An implicit layer comes from the URL's path, not its query.
         let bands = parse_bands(&["0-5:https://h/download?path=/dataset&sig=SECRET"]).unwrap();
