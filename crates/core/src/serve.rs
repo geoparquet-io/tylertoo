@@ -94,20 +94,21 @@ struct Served {
     path: PathBuf,
     index: ArchiveIndex,
     stamp: Stamp,
+    /// The file changed and has not reopened since.
+    broken: bool,
 }
 
 impl Served {
-    /// Reopen the archive if the file changed, and say whether the index
-    /// still describes the bytes it reads. A file caught mid-rewrite fails
-    /// to open, and the next request tries again: meanwhile a replaced file
-    /// (new inode) keeps serving the old one through its open handle, but a
-    /// file rewritten in place does not, since that handle reads the new
-    /// bytes at the old offsets.
+    /// Reopen the archive if the file changed, and say whether it can be
+    /// served. A changed file that does not open (caught mid-rewrite,
+    /// removed, or damaged) is refused until it opens: a file rewritten in
+    /// place would otherwise be read at the old directory's offsets.
     fn refresh(&mut self) -> bool {
         let Ok(now) = std::fs::metadata(&self.path).map(|m| stamp(&m)) else {
-            return true;
+            self.broken = true;
+            return false;
         };
-        if now == self.stamp {
+        if now == self.stamp && !self.broken {
             return true;
         }
         match ArchiveIndex::open(&self.path) {
@@ -116,11 +117,13 @@ impl Served {
                 warn_variable_depth(&index);
                 self.index = index;
                 self.stamp = now;
+                self.broken = false;
                 true
             }
             Err(e) => {
-                log::warn!("{} changed but did not reopen: {e}", self.path.display());
-                now.2 != self.stamp.2
+                log::warn!("{} changed and does not open: {e}", self.path.display());
+                self.broken = true;
+                false
             }
         }
     }
@@ -183,6 +186,7 @@ impl Server {
                 path: path.clone(),
                 index,
                 stamp,
+                broken: false,
             });
         }
         let http = tiny_http::Server::http((host, port)).map_err(|error| ServeError::Bind {
@@ -302,7 +306,7 @@ impl Server {
     }
 
     /// The archive named `name`, or the response that replaces it: 404 for
-    /// no such archive, 503 while a file rewritten in place cannot reopen.
+    /// no such archive, 503 while a changed file does not reopen.
     fn archive(&mut self, name: &str) -> Result<&Served, Response<Box<dyn Read + Send>>> {
         let a = self
             .archives

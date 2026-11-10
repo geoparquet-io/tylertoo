@@ -248,8 +248,8 @@ fn an_oversized_tile_body_is_refused_before_the_read() {
     assert!(String::from_utf8_lossy(&body).contains("tile ceiling"));
 }
 
-/// A file rewritten in place (same inode) that does not reopen is refused,
-/// not read at the old directory's offsets; once it opens, it serves again.
+/// A changed file that does not reopen is refused, never read at the old
+/// directory's offsets; once it opens, it serves again.
 #[test]
 fn a_broken_in_place_rewrite_is_refused_until_it_reopens() {
     let dir = tempfile::tempdir().unwrap();
@@ -267,6 +267,12 @@ fn a_broken_in_place_rewrite_is_refused_until_it_reopens() {
     // `fs::write` truncates and rewrites the same inode.
     std::fs::write(&path, vec![0u8; 4096]).unwrap();
     assert_eq!(get(&addr, "/inplace/0/0/0.mvt", "").0, 503);
+    // Still refused once the damaged file is gone, or replaced by another
+    // file that does not open.
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(get(&addr, "/inplace/0/0/0.mvt", "").0, 503);
+    std::fs::write(&path, vec![1u8; 4096]).unwrap();
+    assert_eq!(get(&addr, "/inplace.pmtiles", "").0, 503);
 
     let next = dir.path().join("next.pmtiles");
     write_archive(&next, 2);
