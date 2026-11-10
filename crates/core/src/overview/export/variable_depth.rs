@@ -22,8 +22,8 @@ use super::super::ladder::EntryZoomLadder;
 use super::super::level::{Mode, OverviewsMeta};
 use super::super::reader::OverviewReader;
 use super::{
-    account_sources, bound_group_cap, buffer_deg_at_zoom, build_mvt_within, collect_wave,
-    encoded_tile, export_level_groups, for_each_member_key, geometry_lnglat_bbox, key_to_xy,
+    account_sources, buffer_deg_at_zoom, build_mvt_within, collect_wave, encoded_tile,
+    export_level_groups, for_each_member_key, geometry_lnglat_bbox, group_gate, key_to_xy,
     near_world_edge, plan_level, plan_level_groups, plan_levels, size_bboxes, sort_tile_for_encode,
     tile_fit, tile_key, tiles_in_ranges, BandRead, CheckpointCtx, Crs, EncodedTile, ExportError,
     ExportLevelCtx, ExportOptions, ExportProgress, ExportTimers, FillTally, LevelCtx, LevelMemory,
@@ -1221,10 +1221,11 @@ pub(super) fn export_levels(
             levels,
             (
                 &groups,
-                bound_group_cap(
+                group_gate(
                     group_cap,
                     levels.iter().map(|l| l.plan),
                     partition_budget.partition_target,
+                    template.options.profile,
                 ),
             ),
             ckpt,
@@ -1287,9 +1288,13 @@ pub(super) fn export_levels(
                     ..template
                 })
                 .collect();
-            let now_groups = plan_level_groups(&plans, group_cap);
-            let in_flight_cap =
-                bound_group_cap(group_cap, &plans, partition_budget.partition_target);
+            let gate = group_gate(
+                group_cap,
+                &plans,
+                partition_budget.partition_target,
+                template.options.profile,
+            );
+            let now_groups = plan_level_groups(&plans, group_cap, gate.waves);
             reports.extend(export_level_groups(
                 writer,
                 LevelMemory {
@@ -1297,7 +1302,7 @@ pub(super) fn export_levels(
                     budget: &mut *budget,
                 },
                 &now_levels,
-                (&now_groups, in_flight_cap),
+                (&now_groups, gate),
                 ckpt,
                 progress,
                 diagnostics,

@@ -1721,7 +1721,11 @@ fn check_levels_fit(
 /// within `member_cap`. A multi-wave level, or a level that alone exceeds
 /// the cap, is a group of one and exports through the unchanged wave loop.
 /// A `member_cap` of 0 is the serial schedule, one level per group.
-fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Range<usize>> {
+fn plan_level_groups(
+    plans: &[LevelPlan],
+    member_cap: usize,
+    waves: bool,
+) -> Vec<std::ops::Range<usize>> {
     if member_cap == 0 {
         return (0..plans.len()).map(|i| i..i + 1).collect();
     }
@@ -1730,6 +1734,15 @@ fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Ra
     for (i, plan) in plans.iter().enumerate() {
         let members: usize = plan.partitions.iter().map(|p| p.members).sum();
         let single_wave = plan.partitions.len() <= plan.wave.max(1);
+        if waves && !single_wave {
+            // #817: its waves are bounded in flight and in write order, not
+            // by the group's sum, so it joins the open group.
+            match open.as_mut() {
+                Some((range, _)) => range.end = i + 1,
+                None => open = Some((i..i + 1, 0)),
+            }
+            continue;
+        }
         if let Some((range, sum)) = open.as_mut() {
             if single_wave && sum.saturating_add(members) <= member_cap {
                 range.end = i + 1;
@@ -1783,6 +1796,28 @@ fn bound_group_cap<'p>(
         .max()
         .unwrap_or(0);
     member_cap.min(largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN)))
+}
+
+/// How a group of `plans` runs: [`bound_group_cap`] members in flight, and
+/// under every profile but `bounded` a multi-wave level's waves overlap
+/// (#817). `bounded` keeps the serial wave loop: the overlap is not in its
+/// budget. A `member_cap` of 0 is the serial schedule.
+///
+/// The cap takes no slack for the overlap. NZ parcels z0-z14 at 0, 2, 6
+/// and 16 partitions of slack ran its levels in 25.2, 25.3, 25.9 and
+/// 25.0 s (its finer levels' waves are narrower than the largest), while
+/// Moldova `f0` export peaked at 4694, 5304 and 5531 MiB at 0, 2 and 6.
+fn group_gate<'p>(
+    member_cap: usize,
+    plans: impl IntoIterator<Item = &'p LevelPlan>,
+    partition_target: usize,
+    profile: MemoryProfile,
+) -> GroupGate {
+    let cap = bound_group_cap(member_cap, plans, partition_target);
+    GroupGate {
+        cap,
+        waves: cap > 0 && profile != MemoryProfile::Bounded,
+    }
 }
 
 /// Resolve a requested partition-wave width to a concrete value.
@@ -2689,8 +2724,8 @@ fn export_pmtiles_validated(
             ..template
         })
         .collect();
-    let level_groups = plan_level_groups(&plans, group_cap);
-    let in_flight_cap = bound_group_cap(group_cap, &plans, partition_target);
+    let gate = group_gate(group_cap, &plans, partition_target, options.profile);
+    let level_groups = plan_level_groups(&plans, group_cap, gate.waves);
     let mem = LevelMemory {
         store: store.as_mut(),
         budget: &mut *budget,
@@ -2707,7 +2742,7 @@ fn export_pmtiles_validated(
                 &mut writer,
                 mem,
                 &levels,
-                (&level_groups, in_flight_cap),
+                (&level_groups, gate),
                 &ckpt,
                 &mut progress,
                 diagnostics,
@@ -3459,7 +3494,7 @@ fn export_level_groups(
     writer: &mut StreamingPmtilesWriter,
     mem: LevelMemory<'_>,
     levels: &[ExportLevelCtx<'_>],
-    (groups, in_flight_cap): (&[std::ops::Range<usize>], usize),
+    (groups, gate): (&[std::ops::Range<usize>], GroupGate),
     ckpt: &CheckpointCtx<'_>,
     progress: &mut ExportProgress,
     diagnostics: &crate::diagnostics::Diagnostics,
@@ -3488,7 +3523,7 @@ fn export_level_groups(
                 store: store.as_deref_mut(),
                 budget: &mut *budget,
             },
-            (&group_levels, in_flight_cap),
+            (&group_levels, gate),
             ckpt,
             progress.fail_level,
             progress,
@@ -3519,29 +3554,37 @@ fn injected_fault(
 }
 
 /// Export a group of consecutive levels planned by [`plan_level_groups`]
-/// (#647), encoding the group's levels concurrently.
+/// (#647), encoding the group's levels, and their waves, concurrently.
 ///
-/// A group of one is [`export_level`] unchanged. In a larger group every
-/// level fits in a single wave. The calling thread collects the levels'
-/// members in level order, as the serial loop does: the single-read store's
-/// wave 0, or one [`collect_wave`] read. Each collected level then encodes
-/// in its own Rayon task while the next level is collected, so a z3 tile no
-/// longer waits for the z2 tiles to finish.
+/// A group of one single-wave level, or of one multi-wave level when
+/// `gate.waves` is off (`bounded`, the serial oracle), is [`export_level`]
+/// unchanged. Otherwise the calling thread collects every wave of every
+/// level in order, as the serial loop does: the single-read store's wave,
+/// a multi-wave level's one-level store (#740, filled as the level starts),
+/// or one [`collect_wave`] read. Each collected wave then encodes in its own
+/// Rayon task while the next one is collected, so a z3 tile no longer waits
+/// for the z2 tiles to finish, and a wave's valve tail no longer idles the
+/// pool until the next wave is read (#817).
+///
+/// [`InFlight`] bounds the members collected and not yet encoded. A wave of
+/// a multi-wave level also waits until every wave but the one before it is
+/// written, so at most two of its waves' tiles wait on a slower coarser
+/// one; a group's single-wave levels are bounded by the group's sum.
 ///
 /// The collect stays on the calling thread because the legacy read blocks on
 /// a channel (see [`scoped_pipe`]). In a Rayon task it would park a worker,
 /// and a worker waiting in a nested join could pick up another level's read
 /// and block under it.
 ///
-/// [`GroupCommit`] writes each level as soon as it and every coarser level
-/// of the group are encoded, then takes a due checkpoint. The writer gets
-/// the same tiles in the same order as from the serial loop, so the archive
-/// is byte-identical. A failed level leaves every coarser level of the group
-/// written and, when due, checkpointed.
+/// [`GroupCommit`] writes each wave as soon as it and every earlier wave
+/// of the group are encoded, and takes a due checkpoint after each level.
+/// The writer gets the same tiles in the same order as from the serial
+/// loop, so the archive is byte-identical. A failed level leaves every
+/// coarser level of the group written and, when due, checkpointed.
 fn export_level_group(
     writer: &mut StreamingPmtilesWriter,
     mem: LevelMemory<'_>,
-    (levels, in_flight_cap): (&[ExportLevelCtx<'_>], usize),
+    (levels, gate): (&[ExportLevelCtx<'_>], GroupGate),
     ckpt: &CheckpointCtx<'_>,
     fail_level: Option<usize>,
     progress: &mut ExportProgress,
@@ -3549,10 +3592,12 @@ fn export_level_group(
 ) -> Result<Vec<ZoomReport>, ExportError> {
     let LevelMemory { mut store, budget } = mem;
     if let [level] = levels {
-        injected_fault(level, fail_level)?;
-        let report = export_level(writer, store, level, budget, progress, diagnostics)?;
-        checkpoint_if_due(writer, ckpt, checkpoint_zoom_after_level(level), progress)?;
-        return Ok(vec![report]);
+        if !gate.waves || level_waves(level.plan) == 1 {
+            injected_fault(level, fail_level)?;
+            let report = export_level(writer, store, level, budget, progress, diagnostics)?;
+            checkpoint_if_due(writer, ckpt, checkpoint_zoom_after_level(level), progress)?;
+            return Ok(vec![report]);
+        }
     }
     // A handle of its own, so the encode tasks can time themselves while
     // `GroupCommit` holds `progress` mutably.
@@ -3562,49 +3607,125 @@ fn export_level_group(
         progress,
         ckpt,
         levels,
-        next: 0,
+        next: (0, 0),
+        written: 0,
+        open: OpenLevel::default(),
         pending: BTreeMap::new(),
         reports: Vec::with_capacity(levels.len()),
         error: None,
     });
-    let in_flight = InFlight::new(in_flight_cap);
+    let in_flight = InFlight::new(gate.cap);
     let collected = rayon::in_place_scope(|scope| -> Result<(), (usize, ExportError)> {
-        for (i, level) in levels.iter().enumerate() {
+        // The group's ordinal of the next wave to collect.
+        let mut unit = 0;
+        'levels: for (i, level) in levels.iter().enumerate() {
             if lock_commit(&commit, &timers).error.is_some() {
                 // A coarser level already failed. Its error is returned.
                 break;
             }
-            let held = in_flight.admit(level.plan.partitions.iter().map(|p| p.members).sum());
-            let start = Instant::now();
-            let spill_bytes = store
-                .as_deref()
-                .map_or(0, |s| s.level_spilled_bytes(level.level_idx));
-            let buckets = injected_fault(level, fail_level)
-                .and_then(|()| collect_level(store.as_deref_mut(), level, &timers, diagnostics))
-                .map_err(|e| (i, e))?;
-            let collect_secs = start.elapsed().as_secs_f64();
-            let (commit, timers) = (&commit, &*timers);
-            scope.spawn(move |_| {
-                let t_encode = Instant::now();
-                let tiles = encode_buckets(
-                    level.gzip_cache,
-                    (buckets, Some(&held)),
-                    level.plan.zoom,
-                    level.options,
-                    level.fills,
-                    timers,
+            injected_fault(level, fail_level).map_err(|e| (i, e))?;
+            let partitions = &level.plan.partitions;
+            let multi_wave = level_waves(level.plan) > 1;
+            let mut level_store = None;
+            let mut grants = Vec::new();
+            for w in 0..level_waves(level.plan) {
+                if multi_wave {
+                    in_flight.wait_until(|| {
+                        let c = lock_commit(&commit, &timers);
+                        c.error.is_some() || c.written + 1 >= unit
+                    });
+                    if lock_commit(&commit, &timers).error.is_some() {
+                        break 'levels;
+                    }
+                }
+                let wave = partitions
+                    .chunks(level.plan.wave.max(1))
+                    .nth(w)
+                    .unwrap_or_default();
+                let fills = w == 0 && multi_wave && store.is_none() && level.level_read.is_some();
+                if fills {
+                    // The store's grant is sized beside this level's widest
+                    // wave only, so it fills once every earlier wave is
+                    // encoded: the grant plus one wave, as in the serial loop.
+                    drop(in_flight.wait_for(|held| held == 0));
+                }
+                let held = in_flight.admit(wave.iter().map(|p| p.members).sum());
+                let start = Instant::now();
+                if fills {
+                    if let Some(read) = level.level_read {
+                        let (backing, g) = level_read_backing(read, level.plan, budget);
+                        grants = g;
+                        let ctx = level.level_ctx(&timers);
+                        level_store = Some(
+                            fill_level_store(&ctx, level.plan, backing, diagnostics)
+                                .map_err(|e| (i, e))?,
+                        );
+                    }
+                }
+                let spill_bytes = match (&level_store, &store) {
+                    _ if w > 0 => 0,
+                    (Some(s), _) => s.level_spilled_bytes(0),
+                    (None, Some(s)) => s.level_spilled_bytes(level.level_idx),
+                    (None, None) => 0,
+                };
+                let own = level_store.is_some();
+                let buckets = collect_unit(
+                    level_store.as_mut().or(store.as_deref_mut()),
+                    (level, own),
+                    (w, wave),
+                    &timers,
                     diagnostics,
-                );
-                drop(held);
-                let encoded = tiles.map(|tiles| EncodedLevel {
-                    tiles,
-                    start,
-                    collect_secs,
-                    encode_secs: t_encode.elapsed().as_secs_f64(),
-                    spill_bytes,
+                )
+                .map_err(|e| (i, e))?;
+                let collect_secs = start.elapsed().as_secs_f64();
+                #[cfg(test)]
+                if multi_wave {
+                    level
+                        .work
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .group_waves += 1;
+                }
+                let (commit, timers, in_flight) = (&commit, &*timers, &in_flight);
+                scope.spawn(move |_| {
+                    let t_encode = Instant::now();
+                    let tiles = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        encode_buckets(
+                            level.gzip_cache,
+                            (buckets, Some(&held)),
+                            level.plan.zoom,
+                            level.options,
+                            level.fills,
+                            timers,
+                            diagnostics,
+                        )
+                    }));
+                    drop(held);
+                    let tiles = tiles.unwrap_or_else(|panic| {
+                        // The collect may wait on this wave's write: fail
+                        // the group so it stops, then let Rayon re-raise.
+                        let e = std::io::Error::other("a wave's encode panicked");
+                        lock_commit(commit, timers).fail(i, ExportError::Io(e));
+                        in_flight.notify();
+                        std::panic::resume_unwind(panic)
+                    });
+                    let encoded = tiles.map(|tiles| EncodedWave {
+                        tiles,
+                        start,
+                        collect_secs,
+                        encode_secs: t_encode.elapsed().as_secs_f64(),
+                        spill_bytes,
+                    });
+                    lock_commit(commit, timers).finish((i, w), encoded);
+                    in_flight.notify();
                 });
-                lock_commit(commit, timers).finish(i, encoded);
-            });
+                unit += 1;
+            }
+            // The level's waves are all taken: its one-level store is empty.
+            drop(level_store);
+            for grant in grants {
+                budget.release(grant);
+            }
         }
         Ok(())
     });
@@ -3613,6 +3734,20 @@ fn export_level_group(
         commit.fail(i, e);
     }
     commit.into_reports()
+}
+
+/// How a level group runs ([`export_level_group`]): the [`InFlight`] cap
+/// ([`bound_group_cap`]), and whether a multi-wave level's waves overlap.
+#[derive(Clone, Copy)]
+struct GroupGate {
+    cap: usize,
+    waves: bool,
+}
+
+/// The waves `plan` exports in, at least one: an empty level writes its
+/// stopped tiles and reports as one empty wave.
+fn level_waves(plan: &LevelPlan) -> usize {
+    plan.partitions.len().div_ceil(plan.wave.max(1)).max(1)
 }
 
 /// The members a level group has admitted to collect and not yet encoded
@@ -3656,10 +3791,12 @@ impl InFlight {
         }
     }
 
-    fn admit(&self, members: usize) -> Admitted<'_> {
+    /// Wait until `ready(held)`, re-checked whenever members are released or
+    /// [`Self::notify`] is called, and return the lock.
+    fn wait_for(&self, mut ready: impl FnMut(usize) -> bool) -> std::sync::MutexGuard<'_, usize> {
         let lock = || self.held.lock().unwrap_or_else(PoisonError::into_inner);
         let mut held = lock();
-        while *held > 0 && held.saturating_add(members) > self.cap {
+        while !ready(*held) {
             if rayon::current_thread_index().is_some() {
                 // A pool thread runs the encodes it waits on, never parks.
                 drop(held);
@@ -3674,11 +3811,28 @@ impl InFlight {
                     .unwrap_or_else(PoisonError::into_inner);
             }
         }
+        held
+    }
+
+    fn admit(&self, members: usize) -> Admitted<'_> {
+        let mut held = self.wait_for(|h| h == 0 || h.saturating_add(members) <= self.cap);
         *held += members;
+        drop(held);
         Admitted {
             gate: self,
             remaining: Mutex::new(members),
         }
+    }
+
+    /// Wait until `ready()`: a condition another thread changes before it
+    /// calls [`Self::notify`]. `ready` runs under this gate's lock.
+    fn wait_until(&self, mut ready: impl FnMut() -> bool) {
+        drop(self.wait_for(|_| ready()));
+    }
+
+    fn notify(&self) {
+        let _held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        self.freed.notify_all();
     }
 
     fn release(&self, members: usize) {
@@ -3710,55 +3864,69 @@ fn lock_commit<'g, 'a>(
     })
 }
 
-/// Collect one single-wave level's members, bucketed per partition: the
-/// single-read store's wave 0, or one [`collect_wave`] read. An empty level
-/// has no buckets.
-fn collect_level(
+/// Collect wave `w` of `level`, bucketed per partition: from `store` (the
+/// level's own one-level store when `own`, else the single-read store), or
+/// one [`collect_wave`] read. An empty wave has no buckets.
+fn collect_unit(
     store: Option<&mut MemberStore>,
-    level: &ExportLevelCtx<'_>,
+    (level, own): (&ExportLevelCtx<'_>, bool),
+    (w, wave): (usize, &[Partition]),
     timers: &ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<Vec<Member>>, ExportError> {
-    let partitions = &level.plan.partitions;
-    if partitions.is_empty() {
+    if wave.is_empty() {
         return Ok(Vec::new());
     }
     match store {
         Some(s) => {
-            let members =
-                ExportTimers::time(&timers.spill_read, || s.take_wave(level.level_idx, 0))?;
-            Ok(bucket_members(members, partitions))
+            let store_level = if own { 0 } else { level.level_idx };
+            let members = ExportTimers::time(&timers.spill_read, || s.take_wave(store_level, w))?;
+            Ok(bucket_members(members, wave))
         }
-        None => Ok(collect_wave(&level.level_ctx(timers), partitions, diagnostics)?.buckets),
+        None => Ok(collect_wave(&level.level_ctx(timers), wave, diagnostics)?.buckets),
     }
 }
 
-/// One encoded level of a group, waiting for [`GroupCommit`] to write it.
-struct EncodedLevel {
+/// One encoded wave of a group, waiting for [`GroupCommit`] to write it.
+struct EncodedWave {
     tiles: Vec<Vec<EncodedTile>>,
-    /// When the level's collect started: its wall in the profile runs from
-    /// here to the end of its write.
+    /// When the wave's collect started: its level's wall in the profile runs
+    /// from its first wave's start to the end of its write.
     start: Instant,
-    /// The level's collect time, on the calling thread.
+    /// The wave's collect time, on the calling thread.
     collect_secs: f64,
-    /// The level's encode time, in its Rayon task.
+    /// The wave's encode time, in its Rayon task.
     encode_secs: f64,
-    /// #810: the level's spilled member bytes, for its profile entry.
+    /// #810: the level's spilled member bytes (on its first wave).
     spill_bytes: u64,
 }
 
+/// The level [`GroupCommit`] is writing: its tally and times so far.
+#[derive(Default)]
+struct OpenLevel {
+    tally: LevelTally,
+    start: Option<Instant>,
+    collect_secs: f64,
+    encode_secs: f64,
+    last_log: Option<Instant>,
+}
+
 /// The ordered write side of a concurrent level group (#647). Encode tasks
-/// hand their levels to [`Self::finish`] in any order. Levels are written in
-/// level order, each as soon as every coarser level of the group is written.
+/// hand their waves to [`Self::finish`] in any order. Waves are written in
+/// (level, wave) order, each as soon as every earlier wave of the group is
+/// written; a level is reported and checkpointed after its last wave.
 struct GroupCommit<'a> {
     writer: &'a mut StreamingPmtilesWriter,
     progress: &'a mut ExportProgress,
     ckpt: &'a CheckpointCtx<'a>,
     levels: &'a [ExportLevelCtx<'a>],
-    /// The group index of the next level to write.
-    next: usize,
-    /// Encoded levels that wait for a coarser level.
-    pending: BTreeMap<usize, EncodedLevel>,
+    /// The (group level index, wave) of the next wave to write.
+    next: (usize, usize),
+    /// Waves written so far.
+    written: usize,
+    open: OpenLevel,
+    /// Encoded waves that wait for an earlier one.
+    pending: BTreeMap<(usize, usize), EncodedWave>,
     reports: Vec<ZoomReport>,
     /// The failure at the lowest group index so far. No level at or after
     /// it is written.
@@ -3766,14 +3934,14 @@ struct GroupCommit<'a> {
 }
 
 impl GroupCommit<'_> {
-    /// Take one level's encode result, then write every level that is ready.
-    fn finish(&mut self, i: usize, encoded: Result<EncodedLevel, ExportError>) {
+    /// Take one wave's encode result, then write every wave that is ready.
+    fn finish(&mut self, unit: (usize, usize), encoded: Result<EncodedWave, ExportError>) {
         match encoded {
-            Ok(level) => {
-                self.pending.insert(i, level);
+            Ok(wave) => {
+                self.pending.insert(unit, wave);
                 self.write_ready();
             }
-            Err(e) => self.fail(i, e),
+            Err(e) => self.fail(unit.0, e),
         }
     }
 
@@ -3785,27 +3953,35 @@ impl GroupCommit<'_> {
     }
 
     fn write_ready(&mut self) {
-        while self.error.as_ref().is_none_or(|(j, _)| self.next < *j) {
-            let Some(level) = self.pending.remove(&self.next) else {
+        while self.error.as_ref().is_none_or(|(j, _)| self.next.0 < *j) {
+            let Some(wave) = self.pending.remove(&self.next) else {
                 return;
             };
-            match self.write_level(self.next, level) {
-                Ok(report) => {
-                    self.reports.push(report);
-                    self.next += 1;
-                }
-                Err(e) => self.fail(self.next, e),
+            if let Err(e) = self.write_wave(wave) {
+                self.fail(self.next.0, e);
             }
         }
     }
 
-    /// Write one level's tiles, report it, and take a checkpoint when due.
-    fn write_level(&mut self, i: usize, encoded: EncodedLevel) -> Result<ZoomReport, ExportError> {
+    /// Write one wave's tiles. After a level's last wave, report the level
+    /// and take a checkpoint when due.
+    fn write_wave(&mut self, encoded: EncodedWave) -> Result<(), ExportError> {
+        let (i, w) = self.next;
         let level = &self.levels[i];
-        let mut tally = LevelTally {
-            spill_bytes: encoded.spill_bytes,
-            ..LevelTally::default()
-        };
+        let open = &mut self.open;
+        if w == 0 {
+            *open = OpenLevel {
+                tally: LevelTally {
+                    spill_bytes: encoded.spill_bytes,
+                    ..LevelTally::default()
+                },
+                start: Some(encoded.start),
+                last_log: Some(Instant::now()),
+                ..OpenLevel::default()
+            };
+        }
+        open.collect_secs += encoded.collect_secs;
+        open.encode_secs += encoded.encode_secs;
         let timers = &self.progress.profile.timers;
         let zoom = level.plan.zoom;
         write_encoded_tiles(
@@ -3813,19 +3989,47 @@ impl GroupCommit<'_> {
             zoom,
             &encoded.tiles,
             level.terminals,
-            &mut tally,
+            &mut open.tally,
             timers,
         )?;
-        write_terminals(self.writer, zoom, level.terminals, None, &mut tally, timers)?;
         drop(encoded.tiles);
+        self.written += 1;
+        let waves = level_waves(level.plan);
+        if w + 1 < waves {
+            self.next = (i, w + 1);
+            if open
+                .last_log
+                .is_some_and(|t| t.elapsed() >= WAVE_LOG_INTERVAL)
+            {
+                log::info!(
+                    "[export] level {}/{} z{zoom}: wave {}/{waves}, {} tiles, {:.0}s",
+                    level.level_idx + 1,
+                    level.num_levels,
+                    w + 1,
+                    open.tally.tile_count,
+                    level.start.elapsed().as_secs_f64(),
+                );
+                open.last_log = Some(Instant::now());
+            }
+            return Ok(());
+        }
+        write_terminals(
+            self.writer,
+            zoom,
+            level.terminals,
+            None,
+            &mut open.tally,
+            timers,
+        )?;
+        let open = std::mem::take(&mut self.open);
         let report = finish_level(
             level,
-            &tally,
-            level.plan.partitions.len().div_ceil(level.plan.wave),
+            &open.tally,
+            level.plan.partitions.len().div_ceil(level.plan.wave.max(1)),
             LevelWalls::grouped(
-                encoded.start.elapsed().as_secs_f64(),
-                encoded.collect_secs,
-                encoded.encode_secs,
+                open.start.map_or(0.0, |s| s.elapsed().as_secs_f64()),
+                open.collect_secs,
+                open.encode_secs,
             ),
             self.progress,
         );
@@ -3835,7 +4039,9 @@ impl GroupCommit<'_> {
             checkpoint_zoom_after_level(level),
             self.progress,
         )?;
-        Ok(report)
+        self.reports.push(report);
+        self.next = (i + 1, 0);
+        Ok(())
     }
 
     /// The group's reports in level order, or the coarsest failure.
@@ -4246,6 +4452,9 @@ struct ExportWorkTally {
     band_reads_on_consumer: u64,
     /// Groups clipped while an earlier group still waited to finish (#817).
     collect_overlaps: u64,
+    /// Waves of multi-wave levels a level group collected and encoded in
+    /// its pipeline, not the serial wave loop (#817).
+    group_waves: u64,
 }
 
 struct LevelCtx<'a> {
@@ -11616,12 +11825,12 @@ mod tests {
             plan_with_members(10, &[1], 6),
         ];
         assert_eq!(
-            plan_level_groups(&plans, 100),
+            plan_level_groups(&plans, 100, false),
             vec![0..4, 4..5, 5..6, 6..7, 7..8],
         );
         // A cap of 0 is the serial schedule.
         assert_eq!(
-            plan_level_groups(&plans, 0),
+            plan_level_groups(&plans, 0, false),
             (0..plans.len()).map(|i| i..i + 1).collect::<Vec<_>>(),
         );
         // A cap of 1 is not: an empty level still joins a 1-member level.
@@ -11630,15 +11839,27 @@ mod tests {
             plan_with_members(4, &[1], 6),
             plan_with_members(5, &[1], 6),
         ];
-        assert_eq!(plan_level_groups(&tiny, 1), vec![0..2, 2..3]);
+        assert_eq!(plan_level_groups(&tiny, 1, false), vec![0..2, 2..3]);
         // A multi-wave level under the cap does not open a group for the
         // single-wave level after it.
         let multi_first = vec![
             plan_with_members(3, &[1; 7], 6),
             plan_with_members(4, &[1], 6),
         ];
-        assert_eq!(plan_level_groups(&multi_first, 100), vec![0..1, 1..2]);
-        assert!(plan_level_groups(&[], 100).is_empty());
+        assert_eq!(
+            plan_level_groups(&multi_first, 100, false),
+            vec![0..1, 1..2]
+        );
+        assert!(plan_level_groups(&[], 100, false).is_empty());
+        // #817: with overlapping waves a multi-wave level joins the open
+        // group, adding nothing to its sum; a level alone over the cap
+        // still runs alone.
+        assert_eq!(
+            plan_level_groups(&plans, 100, true),
+            vec![0..4, 4..6, 6..7, 7..8],
+        );
+        let joined = plan_level_groups(&multi_first, 100, true);
+        assert!(joined.len() == 1 && joined[0] == (0..2), "{joined:?}");
     }
 
     /// #817: a group's members in flight never exceed the export's largest
@@ -11722,6 +11943,53 @@ mod tests {
         let (concurrent_bytes, concurrent) = run(true);
         assert_eq!(concurrent.level_groups, ONE_GROUP_OF_FOUR);
         assert_eq!(concurrent_bytes, serial_bytes);
+    }
+
+    /// #817: under `auto` a multi-wave level joins the level group before
+    /// it and its waves run through the group's pipeline, so the next wave
+    /// is read while one encodes; `bounded` keeps the serial wave loop. On
+    /// `origin/main` the multi-wave level always ran alone, wave by wave.
+    #[test]
+    fn multi_wave_levels_overlap_their_waves_except_bounded() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let pts = |n: usize, l: i64| -> (Vec<i64>, Vec<Geometry<f64>>) {
+            let g = (0..n)
+                .map(|k| Geometry::Point(Point::new(-150.3 + k as f64 * 70.0, -40.3)))
+                .collect();
+            ((0..n as i64).map(|k| l * 10 + k).collect(), g)
+        };
+        write_mode_fixture(input.path(), &[pts(1, 0), pts(5, 1)], Mode::Duplicating, 64);
+        let run = |profile: MemoryProfile, concurrent_levels: bool| {
+            let opts = ExportOptions {
+                layer_name: "waves".to_string(),
+                partition_wave: 2,
+                profile,
+                ..Default::default()
+            };
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &knobs(false, None, concurrent_levels),
+            )
+            .unwrap();
+            (std::fs::read(out.path()).unwrap(), run)
+        };
+        let (serial_bytes, serial) = run(MemoryProfile::Auto, false);
+        assert_eq!(serial.work.group_waves, 0);
+        let (auto_bytes, auto) = run(MemoryProfile::Auto, true);
+        let groups = &auto.level_groups;
+        assert!(groups.len() == 1 && groups[0] == (0..2), "{groups:?}");
+        // The 5 points sit on tile edges: 10 one-member tiles, in waves of 2.
+        assert_eq!(auto.work.group_waves, 5);
+        assert_eq!(auto_bytes, serial_bytes);
+        assert_eq!(auto.report.zooms, serial.report.zooms);
+        let (bounded_bytes, bounded) = run(MemoryProfile::Bounded, true);
+        assert_eq!(bounded.level_groups, vec![0..1, 1..2]);
+        assert_eq!(bounded.work.group_waves, 0);
+        assert_eq!(bounded_bytes, serial_bytes);
     }
 
     /// #647: the group cap is one full ceiling-width wave of target-sized
@@ -12463,8 +12731,11 @@ mod tests {
                     assert_eq!(serial.level_groups, vec![0..1, 1..2, 2..3, 3..4], "{ctx}");
                     let groups = &concurrent.level_groups;
                     if target == 1 {
+                        // #817: the multi-wave z8 level joins the group
+                        // before it, its waves overlapping in the pipeline.
                         assert!(groups[0].len() > 1, "{ctx}: {groups:?}");
-                        assert_eq!(groups.last(), Some(&(3..4)), "{ctx}: {groups:?}");
+                        let last = groups.last().map(ExactSizeIterator::len);
+                        assert!(last > Some(1), "{ctx}: {groups:?}");
                     } else {
                         assert_eq!(groups, &ONE_GROUP_OF_FOUR, "{ctx}");
                     }
