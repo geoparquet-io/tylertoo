@@ -852,7 +852,17 @@ impl ShardPlan {
             });
         }
 
-        let per_part = source.part_row_group_bounds()?;
+        // The estimator works in lon/lat; an EPSG:3857 file's statistics are
+        // metres.
+        let crs = source.resolved_schema()?.crs();
+        let mut per_part = source.part_row_group_bounds()?;
+        if let Some(crs) = crs {
+            for rg in per_part.iter_mut().flatten().flatten() {
+                let b =
+                    crate::overview::export::lnglat_bbox(rg.xmin, rg.ymin, rg.xmax, rg.ymax, crs);
+                (rg.xmin, rg.ymin, rg.xmax, rg.ymax) = (b.lng_min, b.lat_min, b.lng_max, b.lat_max);
+            }
+        }
         // Real per-group row counts, so a group with no usable bbox is still
         // weighted by what it actually holds rather than by "one average
         // group" (#498 review): the footers are already parsed, so this is
@@ -1470,6 +1480,40 @@ mod tests {
         }
         let mean = total as f64 / parts.len() as f64;
         parts.iter().map(|&p| p as f64).fold(0.0, f64::max) / mean
+    }
+
+    /// An EPSG:3857 input's row-group statistics are metres. Read as degrees
+    /// they all clamp to the antimeridian, and every row lands in the last
+    /// shard.
+    #[test]
+    fn cut_reads_pseudo_mercator_statistics_as_metres() {
+        let metres: Vec<(f64, f64)> = (0..8)
+            .map(|i| {
+                (
+                    f64::from(i * 40 - 140) * 20_037_508.342_789_244 / 180.0,
+                    0.0,
+                )
+            })
+            .collect();
+        let md = geoarrow::datatypes::Metadata::new(
+            geoarrow::datatypes::Crs::from_projjson(serde_json::json!({
+                "type": "ProjectedCRS",
+                "name": "WGS 84 / Pseudo-Mercator",
+                "id": { "authority": "EPSG", "code": 3857 }
+            })),
+            None,
+        );
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        crate::overview::testutil::write_multi_rg_input_with_crs(
+            tin.path(),
+            &metres,
+            true,
+            Some(md),
+        );
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let plan = ShardPlan::compute(&source, 3, 4).unwrap();
+        let rows: Vec<u64> = plan.ranges.iter().map(|r| r.estimated_rows).collect();
+        assert_eq!(rows, vec![2, 2, 2, 2], "{:?}", plan.ranges);
     }
 
     #[test]

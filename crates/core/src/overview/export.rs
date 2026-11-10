@@ -6183,7 +6183,7 @@ fn covering_rows<'a>(
 /// through [`webmerc_to_lnglat`] for an EPSG:3857 file. Reprojection is
 /// monotone per axis, so this is bit-identical to the bbox of the
 /// reprojected geometry. Both scan sources go through here.
-fn lnglat_bbox(x0: f64, y0: f64, x1: f64, y1: f64, crs: Crs) -> TileBounds {
+pub(crate) fn lnglat_bbox(x0: f64, y0: f64, x1: f64, y1: f64, crs: Crs) -> TileBounds {
     if matches!(crs, Crs::Epsg3857) {
         let (lng_min, lat_min) = webmerc_to_lnglat(x0, y0);
         let (lng_max, lat_max) = webmerc_to_lnglat(x1, y1);
