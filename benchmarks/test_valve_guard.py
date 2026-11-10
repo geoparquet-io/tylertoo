@@ -388,3 +388,12 @@ def test_792_def_speedup_collapse_fails_on_the_pinned_class():
     v = vg.verdict({"792-def": _cores_cell()}, {"hosts": {vg.PINNED_CLASS: {
         "host": VM, "floors": FLOORS, "cells": {"792-def": holed}}}}, VM)
     assert any(f"speedup_16_to_full[{LEVELS}]" in f for f in v["baseline"]["failures"])
+
+
+def test_moldova_f0_wall_uses_its_own_limit():
+    base = {"moldova-f0": _cell(9.42)}
+    doc = {"hosts": {vg.host_class_key(GH): {"host": GH, "cells": base}}}
+    noisy = vg.baseline_failures({"moldova-f0": _cell(9.42 * 1.16)}, doc["hosts"][vg.host_class_key(GH)])[0]
+    assert not any("moldova-f0 wall" in f for f in noisy)
+    slow = vg.baseline_failures({"moldova-f0": _cell(9.42 * 1.45)}, doc["hosts"][vg.host_class_key(GH)])[0]
+    assert any("moldova-f0 wall" in f for f in slow)
