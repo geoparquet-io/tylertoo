@@ -2762,7 +2762,7 @@ fn preflight_with_memory_limit(
     // tables stay aligned. Groups without stats are kept; the exact
     // per-feature filters in pass 1 guarantee identical output either way.
     let row_groups_total = source.num_row_groups_total()?;
-    // `--mask` (#826) ANDs with `--bbox`: its bbox narrows the same query.
+    // `--mask` (#826): its bbox prunes with its own query, ANDed with `--bbox`.
     let t_mask = Instant::now();
     let mask = options
         .mask
