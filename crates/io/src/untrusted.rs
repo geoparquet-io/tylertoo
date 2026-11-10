@@ -1113,7 +1113,9 @@ fn check_batch_under(batch: &RecordBatch, limit: u64) -> Result<(), ArrowError> 
     }
 }
 
-/// Choose the initial decode size from selected row-group statistics.
+/// Choose the rows per batch a reader yields from selected row-group
+/// statistics. The reader decodes fewer when list values could crowd one
+/// decode, and joins what it decoded back up to this many (#848).
 ///
 /// Fixed-width values and byte views are bounded before decode. Statistics
 /// refine the size; [`UntrustedBatchReader`] checks actual expanded bytes
@@ -1129,6 +1131,30 @@ pub fn read_batch_plan(
     requested: usize,
     limit: u64,
 ) -> usize {
+    batch_plan(metadata, row_groups, projection, requested, limit).1
+}
+
+/// `(decode, yield)` rows per batch, both at most `requested` and within the
+/// byte-array ceiling.
+///
+/// `decode` bounds what one decode holds before the reader splits it: a batch
+/// of `requested` rows touches at most ceil(requested / smallest group) + 1
+/// groups, so it holds at most the largest that many groups' repeated values,
+/// however they are spread over its rows. A file whose repeated values alone
+/// exceed the decode limit decodes one row at a time.
+///
+/// `yield` is what the reader hands out (#848): it joins decoded batches up to
+/// that many rows, priced at every leaf's width plus its group's repeated
+/// values per row. Overture segments' 86 list leaves decode one row at a
+/// time, and one-row batches held ~260 KB of fixed Arrow overhead per
+/// buffered row in pass 2.
+fn batch_plan(
+    metadata: &ParquetMetaData,
+    row_groups: Option<&[usize]>,
+    projection: Option<&ProjectionMask>,
+    requested: usize,
+    limit: u64,
+) -> (usize, usize) {
     let read = |leaf: &usize| projection.is_none_or(|mask| mask.leaf_included(*leaf));
     let avg = metadata
         .row_groups()
@@ -1194,26 +1220,35 @@ pub fn read_batch_plan(
             (row, repeated, group.num_rows())
         })
         .collect();
-    // A row pays every leaf's width plus its group's repeated values per row
-    // (#848). No row count bounds repeated values a footer cannot place: one
-    // row may hold a whole group's, which one-row batches decode as well.
-    // Planning for that worst case read Overture segments one row per batch,
-    // and pass 2 then held ~260 KB of Arrow overhead per buffered row. The
-    // skew is caught after decode by [`UntrustedBatchReader`]'s split.
+    let fixed = groups.iter().map(|g| g.0).max().unwrap_or(1).max(1);
+    let min_rows = groups.iter().map(|g| g.2.max(1) as u64).min().unwrap_or(1);
+    let spanned = (requested.max(1) as u64)
+        .div_ceil(min_rows)
+        .saturating_add(1);
+    let mut repeated: Vec<u64> = groups.iter().map(|g| g.1).collect();
+    repeated.sort_unstable_by(|a, b| b.cmp(a));
+    let repeated = repeated
+        .iter()
+        .take(usize::try_from(spanned).unwrap_or(usize::MAX))
+        .fold(0u64, |n, v| n.saturating_add(*v));
     let per_row = groups
         .iter()
         .map(|g| g.0.saturating_add(g.1.div_ceil(g.2.max(1) as u64)))
         .max()
         .unwrap_or(1)
         .max(1);
-    requested
-        .max(1)
-        .min((decoded_limit(limit) / per_row).max(1) as usize)
-        .min(
+    let rows = |budget: u64, per: u64| {
+        requested.max(1).min((budget / per).max(1) as usize).min(
             usize::try_from((limit / 2) / avg.max(1))
                 .unwrap_or(usize::MAX)
                 .max(1),
         )
+    };
+    let joined = rows(decoded_limit(limit), per_row);
+    (
+        rows(decoded_limit(limit).saturating_sub(repeated), fixed).min(joined),
+        joined,
+    )
 }
 
 /// The byte-array column that holds the most decoded bytes in total over some
@@ -1444,7 +1479,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
     /// Returns a [`ParquetError`] if planning or construction fails.
     pub fn build(self) -> Result<UntrustedBatchReader, ParquetError> {
         let limit = byte_array_limit();
-        let rows = read_batch_plan(
+        let (rows, join_rows) = batch_plan(
             self.metadata(),
             self.row_groups.as_deref(),
             self.projection.as_ref(),
@@ -1506,6 +1541,8 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
             schema,
             done: false,
             pending: None,
+            joined: None,
+            join_rows,
             limit,
         })
     }
@@ -1528,6 +1565,10 @@ pub struct UntrustedBatchReader {
     done: bool,
     schema: SchemaRef,
     pending: Option<RecordBatch>,
+    /// A decoded batch that did not fit the last join ([`join_decoded`]).
+    joined: Option<RecordBatch>,
+    /// Rows a yielded batch may join up to (#848).
+    join_rows: usize,
     limit: u64,
 }
 
@@ -1560,15 +1601,17 @@ impl Iterator for UntrustedBatchReader {
             let from_pending = self.pending.is_some();
             let batch = match self.pending.take() {
                 Some(batch) => batch,
-                None => match self.inner.next()? {
-                    Ok(batch) => batch,
-                    Err(_) if self.page_eof.load(Ordering::Relaxed) => {
-                        return Some(Err(ArrowError::ExternalError(Box::new(
-                            InputError::HostilePageHeader,
-                        ))));
+                None => {
+                    match join_decoded(&mut self.inner, &mut self.joined, self.join_rows, limit)? {
+                        Ok(batch) => batch,
+                        Err(_) if self.page_eof.load(Ordering::Relaxed) => {
+                            return Some(Err(ArrowError::ExternalError(Box::new(
+                                InputError::HostilePageHeader,
+                            ))));
+                        }
+                        Err(e) => return Some(Err(e)),
                     }
-                    Err(e) => return Some(Err(e)),
-                },
+                }
             };
             let fits = |rows| {
                 let prefix = batch.slice(0, rows);
@@ -1638,6 +1681,66 @@ impl Iterator for UntrustedBatchReader {
         item
     }
 }
+
+/// The inner reader's next decoded batch, joined with the ones after it up
+/// to `rows` rows while their expanded bytes stay under both ceilings (#848).
+/// A decode held to one row because a footer cannot place its list values
+/// must not reach the reader's split, cast and caller one row at a time.
+/// `carry` holds the batch that did not fit, first in the next join.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#848: joins decoded batches whose expanded bytes fit both ceilings"
+)]
+fn join_decoded(
+    inner: &mut ParquetRecordBatchReader,
+    carry: &mut Option<RecordBatch>,
+    rows: usize,
+    limit: u64,
+) -> Option<Result<RecordBatch, ArrowError>> {
+    let bound = limit.min(decoded_limit(limit));
+    let first = match carry.take() {
+        Some(batch) => batch,
+        None => match inner.next()? {
+            Ok(batch) => batch,
+            Err(e) => return Some(Err(e)),
+        },
+    };
+    let schema = first.schema();
+    let (mut held, mut bytes) = (first.num_rows(), expanded_batch_bytes(&first));
+    // Joined JOIN_CHUNK at a time: an unjoined one-row batch holds the
+    // schema's whole fixed Arrow overhead.
+    let (mut chunks, mut parts) = (Vec::new(), vec![first]);
+    while held < rows {
+        let batch = match inner.next() {
+            Some(Ok(batch)) => batch,
+            Some(Err(e)) => return Some(Err(e)),
+            None => break,
+        };
+        let more = expanded_batch_bytes(&batch);
+        if held + batch.num_rows() > rows || bytes.saturating_add(more) > bound {
+            *carry = Some(batch);
+            break;
+        }
+        held += batch.num_rows();
+        bytes = bytes.saturating_add(more);
+        parts.push(batch);
+        if parts.len() == JOIN_CHUNK {
+            match arrow_select::concat::concat_batches(&schema, &parts) {
+                Ok(chunk) => chunks.push(chunk),
+                Err(e) => return Some(Err(e)),
+            }
+            parts.clear();
+        }
+    }
+    chunks.append(&mut parts);
+    if chunks.len() == 1 {
+        return chunks.pop().map(Ok);
+    }
+    Some(arrow_select::concat::concat_batches(&schema, &chunks))
+}
+
+/// Decoded batches [`join_decoded`] joins at once.
+const JOIN_CHUNK: usize = 64;
 
 impl RecordBatchReader for UntrustedBatchReader {
     fn schema(&self) -> SchemaRef {
@@ -1917,10 +2020,11 @@ mod tests {
     /// values per 64k-row group, past the 64 MiB decode limit though each
     /// row holds about 1.3 KB of them. The plan read them one row per batch,
     /// and every one-row batch kept ~260 KB of fixed Arrow overhead per
-    /// buffered output row (118 GB on a 38 MB input). A row is priced at
-    /// its share of the repeated values instead.
+    /// buffered output row (118 GB on a 38 MB input). They still decode one
+    /// row at a time, since a footer cannot say which rows hold the values,
+    /// but the reader joins them up to rows priced at their share.
     #[test]
-    fn read_plan_prices_repeated_values_at_their_rows_average() {
+    fn list_heavy_rows_decode_singly_and_join_at_their_average() {
         use arrow_array::builder::{Int64Builder, ListBuilder};
         use arrow_array::{ArrayRef, Int64Array};
         use parquet::arrow::ArrowWriter;
@@ -1947,9 +2051,53 @@ mod tests {
         // past it. A row costs 9 + 9 B fixed and 64 x 9 B of list values.
         let limit = 100_000;
         assert_eq!(
-            read_batch_plan(&md, None, None, 8192, limit),
-            200_000 / (18 + 64 * 9)
+            batch_plan(&md, None, None, 8192, limit),
+            (1, 200_000 / (18 + 64 * 9))
         );
+    }
+
+    /// #848 review: joining must not undo the decode bound. Rows that each
+    /// hold most of the byte bound are yielded alone; the rest are joined up
+    /// to it, and every row comes through once.
+    #[test]
+    fn decoded_batches_join_within_the_byte_bound() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        use arrow_array::ArrayRef;
+        use parquet::arrow::ArrowWriter;
+        let n = 2_000;
+        let mut lists = ListBuilder::new(Int64Builder::new());
+        for i in 0..n {
+            let len = if i < 3 { 10_000 } else { 64 };
+            lists.values().append_slice(&vec![i; len]);
+            lists.append(true);
+        }
+        let batch =
+            RecordBatch::try_from_iter([("lists", Arc::new(lists.finish()) as ArrayRef)]).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#848: a raw one-row decode, as the plan gives a list-heavy file"
+        )]
+        let mut inner = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .with_batch_size(1)
+            .build()
+            .unwrap();
+        let limit = 100_000;
+        let mut carry = None;
+        let mut sizes = Vec::new();
+        while let Some(batch) = join_decoded(&mut inner, &mut carry, 1_000, limit) {
+            let batch = batch.unwrap();
+            assert!(batch.num_rows() == 1 || expanded_batch_bytes(&batch) <= limit);
+            sizes.push(batch.num_rows());
+        }
+        assert_eq!(sizes.iter().sum::<usize>(), n as usize);
+        assert_eq!(sizes[..3], [1, 1, 1]);
+        let joined = *sizes.iter().max().unwrap();
+        assert!(joined > 64 && joined < 1_000, "{sizes:?}");
     }
 
     #[test]

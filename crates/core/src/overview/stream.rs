@@ -8459,20 +8459,23 @@ mod tests {
     /// schema's whole fixed Arrow overhead, so a 38 MB input buffered 55 KB
     /// per row (262 KB resident) and was OOM-killed at 118 GB. Dense
     /// coalescing lines, the issue's shape; the decode ceiling is scaled
-    /// down (`TYLERTOO_BYTE_ARRAY_LIMIT_BYTES`, process environment, so the
-    /// run happens in a child).
+    /// down (`TYLERTOO_BYTE_ARRAY_LIMIT_BYTES`) and the batches are counted
+    /// in the profile dump, both process environment, so the run happens in
+    /// a child.
     #[cfg(feature = "testing")]
     #[test]
     fn list_heavy_lines_are_not_buffered_one_row_per_batch() {
         use arrow_array::builder::{Int64Builder, ListBuilder};
-        const CHILD: &str = "TYLERTOO_848_TEST";
-        if std::env::var_os(CHILD).is_none() {
+        const CHILD: &str = "TYLERTOO_848_TEST_JSON";
+        let Some(json) = std::env::var_os(CHILD) else {
+            let dir = tempfile::tempdir().unwrap();
             let (_, module) = module_path!().split_once("::").expect("crate::module path");
             let name = format!("{module}::list_heavy_lines_are_not_buffered_one_row_per_batch");
             let out =
                 std::process::Command::new(std::env::current_exe().expect("test binary path"))
                     .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
-                    .env(CHILD, "1")
+                    .env(CHILD, dir.path().join("profile.jsonl"))
+                    .env("TYLERTOO_PROFILE_JSON", dir.path().join("profile.jsonl"))
                     .env("TYLERTOO_BYTE_ARRAY_LIMIT_BYTES", "16384")
                     .output()
                     .expect("re-run the test binary");
@@ -8483,8 +8486,7 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
             return;
-        }
-        assert!(crate::test_log::install());
+        };
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.parquet");
         // 40 roads of 50 two-point segments end to end: every segment chains.
@@ -8528,17 +8530,16 @@ mod tests {
             },
         )
         .unwrap();
-        let lines = crate::test_log::take_thread_lines();
-        let per_row: u64 = lines
-            .iter()
-            .find_map(|l| {
-                let tail = l.strip_prefix("[convert] pass2 sink: measured ")?;
-                tail.split(' ').next()?.parse().ok()
-            })
-            .unwrap_or_else(|| panic!("no pass2 sink line: {lines:#?}"));
-        // A buffered row is a short line, an id, a name and 8 tags: a few
-        // hundred bytes with the 256 B floor. A one-row batch is ~20x that.
-        assert!(per_row < 1024, "{per_row} B per buffered row");
+        let contents = std::fs::read_to_string(json).expect("the profile dump");
+        let line: serde_json::Value =
+            serde_json::from_str(contents.lines().next().expect("a convert line")).unwrap();
+        // Decoded one row at a time, joined up to the scaled 16 KiB byte
+        // bound: 86 batches. Yielded one row per batch, it was 2,000.
+        let batches = line["pass2"]["windows"]["batches"].as_u64().unwrap();
+        assert!(
+            batches <= 200,
+            "{batches} pass-2 batches for 2,000 rows: {line}"
+        );
     }
 
     /// Runs the named test of this module alone in a child process. Returns

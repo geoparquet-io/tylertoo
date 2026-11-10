@@ -87,9 +87,12 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   URLs work; the query is shown as `?<redacted>` in logs, errors, reports
   and saved plans (#820).
 - Inputs with many list columns (Overture segments: 86 list leaves) are no
-  longer read one row per batch. Each one-row batch kept about 260 KB of
-  Arrow overhead per buffered output row, so `tiles` on a 38 MB extract
-  passed 118 GB and was OOM-killed. It now peaks at 2.8 GB in 7 s (#848).
+  longer handed out one row per batch. They still decode a row at a time,
+  since a footer cannot say which rows hold the list values, but the reader
+  joins those rows back into batches within the decode byte bound. Each
+  one-row batch kept about 260 KB of Arrow overhead per buffered output row,
+  so `tiles` on a 38 MB extract passed 118 GB and was OOM-killed. It now
+  peaks at 1.5 GB in 23 s (#848).
 - A crafted Parquet footer with an overlong varint, or a page header that
   skips past the end of the file, is refused instead of allocating gigabytes
   or spinning for minutes (#789).
