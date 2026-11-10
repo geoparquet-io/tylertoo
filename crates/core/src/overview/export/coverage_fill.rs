@@ -86,7 +86,9 @@ fn polygon_capacity_bytes(polys: &Vec<FillPolygon>) -> usize {
             .sum::<usize>()
 }
 
-type SeedBuckets = std::collections::BTreeMap<u64, (Vec<Shape>, Vec<Collapsed>)>;
+/// One seed tile's shapes and collapsed-ring credits.
+type SeedBucket = (Vec<Shape>, Vec<Collapsed>);
+type SeedBuckets = std::collections::BTreeMap<u64, SeedBucket>;
 
 #[cfg(test)]
 fn note_capacity(
@@ -2352,46 +2354,45 @@ fn seed_batch(
 
 /// The serial seed (#830): each write is charged the buckets still waiting,
 /// its own bucket less what its encoding has freed, and the runs' nodes.
-/// Writes go in four passes, each in key order, with no workspace of their
-/// own: buckets of runs that already exist (they add no node), then new
-/// runs' buckets that free at least their node before their run opens
-/// ([`freed_before_open`]), then the other new runs' buckets that free at
-/// least their node, then the rest. A write fails only when nothing left
-/// can free room for its run's node first. The charge so stays
-/// within the window's pending check until only the runs' nodes, which main
-/// also required, are left. Write order between tiles is immaterial.
+/// A run that already exists adds no node, so its bucket can always be
+/// written, and writing a bucket of at least a node's bytes only adds room.
+/// So each step writes, in key order, the first bucket of an existing run,
+/// else the first new run's bucket of at least a node's bytes that frees
+/// room for its node before its run opens ([`freed_before_open`]), else the
+/// smaller buckets, whose nodes main also required. A write fails only when
+/// no order fits. Write order between tiles is immaterial; the writes use
+/// no workspace of their own.
 fn seed_serial(
     buckets: &mut SpillBuckets,
     mut pending: SeedBuckets,
     pending_bytes: usize,
 ) -> Result<(), super::ExportError> {
-    let bytes = |(shapes, credits): &(Vec<Shape>, Vec<Collapsed>)| {
+    let bytes = |(shapes, credits): &SeedBucket| {
         shape_capacity_bytes(shapes) + credits.capacity() * std::mem::size_of::<Collapsed>()
     };
     let mut waiting = pending_bytes;
-    for pass in 0..4 {
-        let mut after = None;
-        loop {
-            let tiles = &buckets.tiles;
-            let next = pending
-                .range((
-                    after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
-                    std::ops::Bound::Unbounded,
-                ))
-                .find(|&(&key, bucket)| match pass {
-                    0 => tiles.contains_key(&key),
-                    1 => freed_before_open(bucket) >= 512,
-                    2 => bytes(bucket) >= 512,
-                    _ => true,
-                })
-                .map(|(&key, _)| key);
-            let Some(key) = next else { break };
-            after = Some(key);
-            let mut bucket = pending.remove(&key).expect("found above");
-            let freed = bytes(&bucket);
-            buckets.append(key, &mut bucket.0, &mut bucket.1, waiting)?;
-            waiting -= freed;
-        }
+    // shortcut: rescans the pending buckets per write (quadratic in the
+    // window's tiles); only grants too tight for the batched writer get here.
+    while !pending.is_empty() {
+        let tiles = &buckets.tiles;
+        let room = buckets
+            .budget
+            .saturating_sub(waiting.saturating_add(tiles.len() * 512));
+        let pick = |fits: &dyn Fn(u64, &SeedBucket) -> bool| {
+            pending
+                .iter()
+                .find(|&(&key, bucket)| fits(key, bucket))
+                .map(|(&key, _)| key)
+        };
+        let key = pick(&|key, _| tiles.contains_key(&key))
+            .or_else(|| pick(&|_, b| bytes(b) >= 512 && room + freed_before_open(b) >= 512))
+            .or_else(|| pick(&|_, b| bytes(b) >= 512))
+            .or_else(|| pick(&|_, _| true))
+            .expect("pending is not empty");
+        let mut bucket = pending.remove(&key).expect("picked above");
+        let freed = bytes(&bucket);
+        buckets.append(key, &mut bucket.0, &mut bucket.1, waiting)?;
+        waiting -= freed;
     }
     Ok(())
 }
@@ -2399,7 +2400,7 @@ fn seed_serial(
 /// What [`SpillBuckets::write_frame`] frees of `bucket` before its run opens
 /// at the stage's first flush: all of it when its frame fits the stage,
 /// otherwise the rings, and their shapes, it encodes whole before then.
-fn freed_before_open(bucket: &(Vec<Shape>, Vec<Collapsed>)) -> usize {
+fn freed_before_open(bucket: &SeedBucket) -> usize {
     let (shapes, credits) = bucket;
     if frame_bytes(bucket) <= FRAME_STAGE_BYTES {
         return shape_capacity_bytes(shapes)
@@ -2421,7 +2422,7 @@ fn freed_before_open(bucket: &(Vec<Shape>, Vec<Collapsed>)) -> usize {
 }
 
 /// The bytes [`SpillBuckets::write_frame`] encodes for a bucket.
-fn frame_bytes((shapes, credits): &(Vec<Shape>, Vec<Collapsed>)) -> usize {
+fn frame_bytes((shapes, credits): &SeedBucket) -> usize {
     16 + credits.len() * 24
         + shapes
             .iter()
@@ -3748,6 +3749,26 @@ pub(super) mod tests {
         cost_probe::take();
         seed_serial(&mut buckets, pending, bytes).expect("the freeing bucket makes room");
         assert!(cost_probe::take().seed_serial_peak <= bytes);
+        assert_eq!(buckets.tiles.len(), 2);
+    }
+
+    /// #830 review: a new run's bucket that frees less than its node before
+    /// its run opens still goes first when it frees enough for the room left.
+    #[test]
+    fn the_serial_seed_writes_first_what_fits_the_room_left() {
+        let opts = super::super::ExportOptions::default();
+        let ring = |n: u32| -> Ring { (0..n).map(|i| [f64::from(i), 0.0]).collect() };
+        let mut pending = SeedBuckets::new();
+        pending.insert(1, (vec![vec![ring(600)]], Vec::new()));
+        pending.insert(2, (vec![vec![ring(16)], vec![ring(600)]], Vec::new()));
+        let freed = freed_before_open(&pending[&2]);
+        assert!(freed > 0 && freed < 512, "{freed}");
+        let bytes: usize = pending.values().map(|(s, _)| shape_capacity_bytes(s)).sum();
+        let budget = bytes + 512 - freed;
+        let mut buckets = SpillBuckets::new(&opts, budget);
+        cost_probe::take();
+        seed_serial(&mut buckets, pending, bytes).expect("the second bucket makes room");
+        assert!(cost_probe::take().seed_serial_peak <= budget);
         assert_eq!(buckets.tiles.len(), 2);
     }
 
