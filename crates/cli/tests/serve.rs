@@ -113,6 +113,9 @@ fn serves_the_archives_own_bytes_and_reloads_a_rewrite() {
         format!("http://{addr}/my%20demo/{{z}}/{{x}}/{{y}}.mvt")
     );
     assert_eq!(tj["encoding"], "mvt");
+    // Written without bounds: the world, not the writer's inverted box.
+    assert_eq!(tj["bounds"][0], -180.0);
+    assert!(tj["bounds"][0].as_f64() < tj["bounds"][2].as_f64(), "{tj}");
     assert!(String::from_utf8(get(&addr, "/", "").2)
         .unwrap()
         .contains("maplibre-gl"));

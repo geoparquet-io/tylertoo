@@ -391,7 +391,11 @@ fn tilejson(a: &Served, host: &str) -> serde_json::Value {
         )],
         "minzoom": h.min_zoom,
         "maxzoom": h.max_zoom,
-        "bounds": [h.min_lon, h.min_lat, h.max_lon, h.max_lat],
+        // An archive written without bounds stores an inverted box that
+        // MapLibre rejects; the whole world stands in for it.
+        "bounds": a.index.bounds().map_or([-180.0, -85.051_129, 180.0, 85.051_129], |b| {
+            [b.lng_min, b.lat_min, b.lng_max, b.lat_max]
+        }),
         "center": [h.center_lon, h.center_lat, h.center_zoom],
         "encoding": encoding,
         "variable_depth": a.index.is_variable_depth(),
