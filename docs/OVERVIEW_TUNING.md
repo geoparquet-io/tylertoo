@@ -1732,6 +1732,8 @@ A built-in recursive-descent parser supports:
 - Comparisons: `=` (or `==`), `!=` (or `<>`), `<`, `<=`, `>`, `>=`, with the
   column on the left: `confidence > 0.8`, `country = 'BRA'`, `active = true`.
 - Membership: `col IN (v1, v2, ...)` and `col NOT IN (...)`.
+- String patterns: `col [NOT] LIKE 'São%'` matches case; `col [NOT] ILIKE 'são%'`
+  ignores case. `%` matches any run of characters; `_` matches one character.
 - Null tests: `col IS NULL` and `col IS NOT NULL`.
 - Boolean composition: `AND`, `OR`, `NOT`, and parentheses. `OR` binds
   loosest, then `AND`, then `NOT`.

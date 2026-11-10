@@ -14346,6 +14346,21 @@ mod tests {
                 convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
                 let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
                 assert_eq!(ids, vec![1, 2, 3], "OR (streaming={streaming})");
+
+                // LIKE / NOT ILIKE (#826), through the same option.
+                for (filter, want) in [
+                    ("crop LIKE 's%'", vec![0, 2]),
+                    ("crop NOT ILIKE 'SOY'", vec![1, 3]),
+                ] {
+                    let tout = tempfile::NamedTempFile::new().unwrap();
+                    let opts = ConvertOptions {
+                        filter: Some(filter.to_string()),
+                        ..attr_opts()
+                    };
+                    convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+                    let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+                    assert_eq!(ids, want, "{filter} (streaming={streaming})");
+                }
             });
         }
     }
