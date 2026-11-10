@@ -1148,13 +1148,10 @@ pub(crate) mod remote {
     }
 
     /// Cached stores per origin, each with the [`store_env`] that built it.
-    type StoreCache = std::collections::HashMap<
-        String,
-        (
-            Vec<(std::ffi::OsString, std::ffi::OsString)>,
-            Arc<dyn ObjectStore>,
-        ),
-    >;
+    type StoreCache = std::collections::HashMap<String, (StoreEnv, Arc<dyn ObjectStore>)>;
+
+    /// The variables a store or client was built from: see [`store_env`].
+    type StoreEnv = Vec<(std::ffi::OsString, std::ffi::OsString)>;
 
     /// Whether a query carries a presigned S3/GCS or Azure SAS signature.
     fn query_is_signed(query: &str) -> bool {
@@ -1187,8 +1184,9 @@ pub(crate) mod remote {
         clippy::disallowed_types,
         reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
     )]
-    static HTTP_CLIENTS: OnceLock<Mutex<std::collections::HashMap<String, HttpClient>>> =
-        OnceLock::new();
+    static HTTP_CLIENTS: OnceLock<
+        Mutex<std::collections::HashMap<String, (StoreEnv, HttpClient)>>,
+    > = OnceLock::new();
 
     impl HttpConnector for QueryConnector {
         fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
@@ -1196,8 +1194,14 @@ pub(crate) mod remote {
                 .get_or_init(Default::default)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let inner = match clients.get(&self.origin) {
-                Some(client) => client.clone(),
+            // Like a cached store, a pool is reused only while the client
+            // options that built it are unchanged (#804).
+            let env = store_env();
+            let inner = match clients
+                .get(&self.origin)
+                .filter(|(built_from, _)| *built_from == env)
+            {
+                Some((_, client)) => client.clone(),
                 None => {
                     let client = ReqwestConnector::default().connect(options)?;
                     #[cfg(test)]
@@ -1205,7 +1209,7 @@ pub(crate) mod remote {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(self.origin.clone());
-                    clients.insert(self.origin.clone(), client.clone());
+                    clients.insert(self.origin.clone(), (env, client.clone()));
                     client
                 }
             };
@@ -2081,7 +2085,7 @@ pub(crate) mod remote {
     /// variables the builders' `from_env` read, and the `TYLERTOO_HTTP_*`
     /// client overrides. A cached store is reused only while this is
     /// unchanged (#804), so a changed region or credential builds a new one.
-    fn store_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    fn store_env() -> StoreEnv {
         let mut vars: Vec<_> = std::env::vars_os()
             .filter(|(k, _)| {
                 let k = k.to_string_lossy();
@@ -4235,6 +4239,15 @@ pub(crate) mod remote {
                 return;
             }
             let store = |url: &str| store_and_location(url).expect(url).0;
+            // A signed URL's store is never cached, but its origin's
+            // connection pool is, and must follow the client options too.
+            let signed = || store("https://pool804.test/a.parquet?sig=x");
+            signed();
+            signed();
+            assert_eq!(super::shared_http_clients_for("https://pool804.test"), 1);
+            std::env::set_var("TYLERTOO_HTTP_TIMEOUT", "8s");
+            signed();
+            assert_eq!(super::shared_http_clients_for("https://pool804.test"), 2);
             for (url, var, value) in [
                 (
                     "http://env804.test/a.parquet",
