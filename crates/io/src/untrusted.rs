@@ -1060,22 +1060,30 @@ fn projected_field(
     original.clone().with_data_type(target)
 }
 
-/// Whether `data_type` holds a dictionary with 8- or 16-bit keys.
-fn narrow_dictionary(data_type: &arrow_schema::DataType) -> bool {
+/// The fewest values a dictionary in `data_type` can index, when its keys
+/// are 8 or 16 bits wide.
+fn dictionary_capacity(data_type: &arrow_schema::DataType) -> Option<usize> {
     use arrow_schema::DataType;
     match data_type {
         DataType::Dictionary(key, value) => {
-            matches!(
-                key.as_ref(),
-                DataType::Int8 | DataType::UInt8 | DataType::Int16 | DataType::UInt16
-            ) || narrow_dictionary(value)
+            let own = match key.as_ref() {
+                DataType::Int8 => Some(1 << 7),
+                DataType::UInt8 => Some(1 << 8),
+                DataType::Int16 => Some(1 << 15),
+                DataType::UInt16 => Some(1 << 16),
+                _ => None,
+            };
+            own.into_iter().chain(dictionary_capacity(value)).min()
         }
         DataType::List(f)
         | DataType::LargeList(f)
         | DataType::FixedSizeList(f, _)
-        | DataType::Map(f, _) => narrow_dictionary(f.data_type()),
-        DataType::Struct(fields) => fields.iter().any(|f| narrow_dictionary(f.data_type())),
-        _ => false,
+        | DataType::Map(f, _) => dictionary_capacity(f.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .filter_map(|f| dictionary_capacity(f.data_type()))
+            .min(),
+        _ => None,
     }
 }
 
@@ -1257,10 +1265,11 @@ pub fn read_batch_plan(
 /// time, and one-row batches held ~260 KB of fixed Arrow overhead per
 /// buffered row in pass 2.
 ///
-/// A read column with 8- or 16-bit dictionary keys yields batches of the
-/// decode size: a joined batch, here or in a caller's regrouping, can hold
-/// more distinct values than the key indexes, which the cast back refuses
-/// (#857).
+/// A read column with 8- or 16-bit dictionary keys holds both to the rows
+/// its keys can index and joins nothing past the decode: a batch, here or in
+/// a caller's regrouping, can then hold no more distinct values than the key
+/// indexes, which the cast back would refuse (#857). Only a dictionary
+/// nested in a list can still pass it.
 fn batch_plan(
     reader: &ReaderMetadata,
     row_groups: Option<&[usize]>,
@@ -1362,17 +1371,23 @@ fn batch_plan(
     let decode = rows(decoded_limit(limit).saturating_sub(repeated), fixed).min(joined);
     // Only read roots count; a whole root is checked when any leaf is read.
     let descr = reader.parquet_schema();
-    let narrow = reader
+    let capacity = reader
         .schema()
         .fields()
         .iter()
         .enumerate()
-        .any(|(root, f)| {
-            narrow_dictionary(f.data_type())
-                && (0..descr.num_columns())
-                    .any(|leaf| descr.get_column_root_idx(leaf) == root && read(&leaf))
-        });
-    (decode, if narrow { decode } else { joined })
+        .filter(|(root, _)| {
+            (0..descr.num_columns())
+                .any(|leaf| descr.get_column_root_idx(leaf) == *root && read(&leaf))
+        })
+        .filter_map(|(_, f)| dictionary_capacity(f.data_type()))
+        .min();
+    match capacity {
+        // No more rows than the key indexes: however a batch is cut and
+        // joined, it holds no more distinct values (#857).
+        Some(capacity) => (decode.min(capacity), decode.min(capacity)),
+        None => (decode, joined),
+    }
 }
 
 /// The byte-array column that holds the most decoded bytes in total over some
@@ -2352,6 +2367,51 @@ mod tests {
             let err = reader.next().unwrap().unwrap_err().to_string();
             assert!(err.contains("204"), "{rows}-row batches: {err}");
         }
+    }
+
+    /// #857 / #858 review: two 1,024-row groups cycling through disjoint
+    /// 128-value `Dictionary(Int8, Utf8)` sets, with rows heavy enough that
+    /// the byte bound cuts near 200 rows. A cut's carried rows joined across
+    /// the group seam would hold more than 128 distinct values; batches held
+    /// to 128 rows cannot.
+    #[test]
+    fn byte_cut_batches_stay_within_a_narrow_dictionary_key() {
+        use arrow_array::types::Int8Type;
+        use arrow_array::{ArrayRef, BinaryArray, DictionaryArray};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        let file = tempfile::tempfile().unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1_024))
+            .build();
+        let mut writer = None;
+        for group in 0..2 {
+            let names: Vec<String> = (0..1_024)
+                .map(|i| format!("g{group}-{}", i % 128))
+                .collect();
+            let names: DictionaryArray<Int8Type> = names.iter().map(String::as_str).collect();
+            let payload = BinaryArray::from_iter_values((0..1_024).map(|_| [7u8; 200]));
+            let batch = RecordBatch::try_from_iter([
+                ("name", Arc::new(names) as ArrayRef),
+                ("payload", Arc::new(payload) as ArrayRef),
+            ])
+            .unwrap();
+            let writer = writer.get_or_insert_with(|| {
+                ArrowWriter::try_new(
+                    file.try_clone().unwrap(),
+                    batch.schema(),
+                    Some(props.clone()),
+                )
+                .unwrap()
+            });
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.unwrap().close().unwrap();
+        let mut reader = open_parquet(file).unwrap().build().unwrap();
+        reader.limit = 50_000;
+        let rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+        assert_eq!(rows, 2_048);
     }
 
     #[test]

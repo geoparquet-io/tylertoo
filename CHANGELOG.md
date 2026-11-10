@@ -97,6 +97,10 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   batches by one reader or by several (`--read-workers`): one row-by-row
   byte rule cuts both, so the intermediate overview file no longer depends
   on the worker count there (#858).
+- A column with 8- or 16-bit dictionary keys is read in batches of no more
+  rows than its key indexes, so a batch spanning row groups no longer fails
+  with `DictionaryKeyOverflowError` (#857; a dictionary nested in a list
+  can still overflow).
 - A crafted Parquet footer with an overlong varint, or a page header that
   skips past the end of the file, is refused instead of allocating gigabytes
   or spinning for minutes (#789).
