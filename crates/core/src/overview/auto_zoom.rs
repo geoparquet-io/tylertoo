@@ -524,6 +524,9 @@ impl BboxAcc {
 /// for a null, empty or non-finite geometry.
 struct SampledBboxes<'r> {
     rows: &'r [usize],
+    /// `--mask` (#826): a row that misses it reads `None`, as conversion
+    /// drops it.
+    mask: Option<&'r super::mask::MaskIndex>,
 }
 
 impl GeoArrowVisitor for SampledBboxes<'_> {
@@ -547,7 +550,15 @@ impl GeoArrowVisitor for SampledBboxes<'_> {
                 Ok(item.and_then(|g| {
                     let mut acc = BboxAcc::new();
                     acc.add_geometry(&g);
-                    acc.finish()
+                    let bbox = acc.finish()?;
+                    match self.mask {
+                        Some(m) if !m.may_hit(&bbox) => None,
+                        Some(m) => g
+                            .try_to_geometry()
+                            .filter(|geom| m.intersects(geom, &bbox))
+                            .map(|_| bbox),
+                        None => Some(bbox),
+                    }
                 }))
             })
             .collect()
@@ -631,7 +642,7 @@ struct SampledSignals {
 /// The module docs describe the method. The minimum zoom comes from
 /// `options.levels` (which must be a zoom range), and `options.bbox` /
 /// `options.filter` scope the sample exactly as they scope the conversion;
-/// `options.mask` scopes it by the mask's bbox.
+/// `options.mask` scopes it exactly too, sampling the geometry column.
 /// [`MaxZoom::resolve`] is the usual entry point; this one returns the
 /// evidence without logging it or touching `options`.
 ///
@@ -692,12 +703,13 @@ pub(crate) fn estimate_with(
     let bound_filter = filter
         .map(|src| Ok::<_, ConvertError>(BoundFilter::bind(&parse_filter(src)?, &schema, &[])?))
         .transpose()?;
-    // `--mask` (#826) scopes the sample by its bbox, as it prunes.
+    // `--mask` (#826) prunes as the conversion does, then tests each sample.
     let mask = mask
         .map(|m| super::mask::load_for_input(m, crs))
         .transpose()?;
     let bbox_query = bbox.map(|b| super::convert::BboxQuery::new(b, crs));
     let mask_query = super::mask::mask_query(mask.as_ref(), crs);
+    let mask_index = mask.as_ref().map(|m| super::mask::MaskIndex::new(m, crs));
 
     // The conversion's footer-statistics pruning (#102 bbox, #315 filter).
     let bbox_sel = bbox_query
@@ -726,10 +738,15 @@ pub(crate) fn estimate_with(
     // Sample bboxes from the f64 covering struct when the file declares one
     // (#693) — the geometry column is then never projected at all — else from
     // the geometry scalars.
-    let declared = crate::resolved_schema::ResolvedSchema::auto_zoom_covering(
-        source.resolved_schemas()?,
-        diagnostics,
-    );
+    // A mask tests each sampled geometry, so it samples the geometry column.
+    let declared = if mask_index.is_some() {
+        None
+    } else {
+        crate::resolved_schema::ResolvedSchema::auto_zoom_covering(
+            source.resolved_schemas()?,
+            diagnostics,
+        )
+    };
 
     // One sampling pass over `source`, reading each row's bbox either from
     // the declared covering struct or from the geometry scalars.
@@ -816,15 +833,17 @@ pub(crate) fn estimate_with(
                         .map_err(|e| {
                             crate::GeoParquetReadError::decode("auto max-zoom geometry decode", e)
                         })?;
-                    visit_geoarrow_array(garr.as_ref(), SampledBboxes { rows: &picks })?
+                    visit_geoarrow_array(
+                        garr.as_ref(),
+                        SampledBboxes {
+                            rows: &picks,
+                            mask: mask_index.as_ref(),
+                        },
+                    )?
                 }
             };
             for bb in bboxes.into_iter().flatten() {
-                if [&bbox_query, &mask_query]
-                    .into_iter()
-                    .flatten()
-                    .any(|q| !q.intersects(&bb))
-                {
+                if bbox_query.as_ref().is_some_and(|q| !q.intersects(&bb)) {
                     continue;
                 }
                 let (cx, cy) = ((bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5);
@@ -1888,6 +1907,39 @@ mod tests {
             sparse.chosen_zoom,
             whole.chosen_zoom
         );
+    }
+
+    /// #826: a mask scopes the estimate by its polygon, not its bbox. The
+    /// mask's arm reaches toward the dense cluster, so its bbox holds it,
+    /// but the polygon does not.
+    #[test]
+    fn mask_scopes_the_estimate_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut geoms = point_grid(20, 0.0001); // dense, near (0, 0)
+        geoms.extend(point_grid(10, 0.1).into_iter().map(|g| {
+            g.map(|g| match g {
+                Geometry::Point(p) => Geometry::Point(Point::new(p.x() + 10.0, p.y() + 10.0)),
+                other => other,
+            })
+        }));
+        let source = write(&dir, "mask.parquet", &geoms);
+        let mask = dir.path().join("mask.geojson");
+        std::fs::write(
+            &mask,
+            r#"{"type":"Polygon","coordinates":[[[9.5,9.5],[12,9.5],[12,12],[9.5,12],[-1,1],[-1,-0.5],[9.5,9.5]]]}"#,
+        )
+        .unwrap();
+        let masked = estimate_with(
+            &source,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            None,
+            None,
+            Some(&super::super::mask::MaskSource::Path(mask)),
+            MemoryProfile::default(),
+        )
+        .unwrap();
+        assert_eq!(masked.sampled_count, 100);
     }
 
     /// #643: a western-hemisphere bbox scopes the estimate over a 0..360

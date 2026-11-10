@@ -70,17 +70,11 @@ pub(crate) struct LoadedMask {
 /// A `--mask` [`ConfigError`] naming what is wrong.
 pub(crate) fn load(source: &MaskSource) -> Result<LoadedMask, ConfigError> {
     // Validation runs once per option check, several times a run: parse a
-    // mask once and hand out copies while its file is unchanged.
-    type Key = (MaskSource, Option<(std::time::SystemTime, u64)>);
+    // mask once and hand out copies while its bytes are unchanged.
+    type Key = (MaskSource, Option<u64>);
     static LAST: std::sync::Mutex<Option<(Key, LoadedMask)>> = std::sync::Mutex::new(None);
-    let stamp = match source {
-        MaskSource::Path(p) => std::fs::metadata(p)
-            .and_then(|m| Ok((m.modified()?, m.len())))
-            .ok(),
-        MaskSource::Wkb(_) => None,
-    };
-    let key = (source.clone(), stamp);
-    let cacheable = stamp.is_some() || matches!(source, MaskSource::Wkb(_));
+    let key = (source.clone(), content_hash(source));
+    let cacheable = key.1.is_some() || matches!(source, MaskSource::Wkb(_));
     if cacheable {
         if let Some((k, mask)) = &*LAST
             .lock()
@@ -136,6 +130,18 @@ fn read(source: &MaskSource) -> Result<LoadedMask, ConfigError> {
         }
     }
     Ok(LoadedMask { polygons, crs })
+}
+
+/// The xxh3 of a mask file's bytes: the load cache's key and the convert
+/// plan's fingerprint, so both see the same mask. `None` for WKB or an
+/// unreadable file.
+pub(crate) fn content_hash(source: &MaskSource) -> Option<u64> {
+    match source {
+        MaskSource::Path(p) => std::fs::read(p)
+            .ok()
+            .map(|b| xxhash_rust::xxh3::xxh3_64(&b)),
+        MaskSource::Wkb(b) => Some(xxhash_rust::xxh3::xxh3_64(b)),
+    }
 }
 
 fn is_geojson(path: &Path) -> bool {

@@ -946,15 +946,7 @@ fn options_digest(o: &ConvertOptions) -> BTreeMap<String, String> {
     // The mask's bytes, not its path: an edited mask file changes the plan.
     put(
         "mask",
-        format!(
-            "{:?}",
-            o.mask.as_ref().map(|m| match m {
-                super::mask::MaskSource::Path(p) => std::fs::read(p)
-                    .map(|b| xxhash_rust::xxh3::xxh3_64(&b))
-                    .ok(),
-                super::mask::MaskSource::Wkb(b) => Some(xxhash_rust::xxh3::xxh3_64(b)),
-            })
-        ),
+        format!("{:?}", o.mask.as_ref().map(super::mask::content_hash)),
     );
     put("filter", format!("{:?}", o.filter));
     put("properties", format!("{:?}", o.properties));
