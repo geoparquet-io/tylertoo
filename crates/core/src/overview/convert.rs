@@ -757,9 +757,18 @@ pub struct ConvertOptions {
     #[cfg_attr(feature = "cli", arg(value_parser = super::config::cli::parse_bbox, long, value_name = "XMIN,YMIN,XMAX,YMAX"))]
     #[cfg_attr(feature = "cli", arg(help = "Convert features whose bbox intersects this lon/lat box, or would one ±360° wrap away (0..360 data). Skips row groups outside the box", long_help = None))]
     pub bbox: Option<[f64; 4]>,
-    /// TODO(docs)
+    /// Keep features whose geometry intersects this polygon or multipolygon
+    /// mask; touching counts. Accepts a GeoJSON (`.geojson` or `.json`,
+    /// lon/lat per RFC 7946) or GeoParquet file. The mask must use the input's
+    /// CRS; a mismatch is refused, so reproject the mask first.
+    /// The mask's bbox skips row groups like [`bbox`](Self::bbox).
+    /// Combines with `bbox` and [`filter`](Self::filter) by AND.
+    /// A feature also matches when its copy one world width away (±360°)
+    /// intersects the mask, as with `bbox`. In Python, `mask=` also accepts
+    /// a shapely geometry (any object with `.wkb`), taken to be in the
+    /// input's CRS. Default `None` (no mask).
     #[cfg_attr(feature = "cli", arg(value_parser = super::mask::parse_mask, long, value_name = "PATH", help_heading = "Filtering"))]
-    #[cfg_attr(feature = "cli", arg(help = "TODO(docs)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (.geojson/.json, RFC 7946 lon/lat) or GeoParquet file; touching and copies one ±360° wrap away count. Skips row groups by the mask's bbox, combines with --bbox and --filter by AND, and refuses a CRS mismatch: reproject the mask to the input's CRS first", long_help = None))]
     pub mask: Option<super::mask::MaskSource>,
     /// Attribute filter (#315): a SQL-WHERE-style predicate over the input's
     /// property columns (`--filter` / `--where`), e.g. `confidence > 0.8`,

@@ -1,7 +1,7 @@
 //! `--mask` (#826): keep only the features that intersect a polygon.
 //!
 //! The mask's bbox joins `--bbox` in the footer-statistics pruning
-//! ([`region_query`]); [`MaskIndex`] then tests each surviving feature
+//! (`region_query`); `MaskIndex` then tests each surviving feature
 //! exactly. The index answers in about O(feature vertices × log mask
 //! vertices): an R-tree over the mask's edges finds boundary contacts, and
 //! an interval tree answers point-in-mask.
@@ -20,15 +20,19 @@ use super::config::ConfigError;
 use super::convert::{BboxQuery, ConvertError};
 use super::level::Crs;
 
-/// Where a [`ConvertOptions::mask`](super::convert::ConvertOptions::mask)
-/// polygon comes from. TODO(docs)
+/// Polygons or multipolygons used by
+/// [`ConvertOptions::mask`](super::convert::ConvertOptions::mask) to keep
+/// intersecting features, including those that only touch the mask.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum MaskSource {
-    /// TODO(docs)
+    /// Read a GeoJSON (`.geojson` or `.json`, lon/lat per RFC 7946) or
+    /// GeoParquet file. Its CRS must match the input's; a mismatch is
+    /// refused, so reproject the mask first.
     Path(PathBuf),
-    /// TODO(docs)
+    /// Read WKB polygons or multipolygons in the input's CRS.
+    /// Python uses this for shapely geometries (any object with `.wkb`).
     Wkb(Vec<u8>),
 }
 

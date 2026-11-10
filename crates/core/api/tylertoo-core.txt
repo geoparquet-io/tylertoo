@@ -1276,6 +1276,30 @@ impl core::marker::Unpin for tylertoo_core::LevelPlan
 impl core::marker::UnsafeUnpin for tylertoo_core::LevelPlan
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::LevelPlan
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::LevelPlan
+#[non_exhaustive] pub enum tylertoo_core::MaskSource
+pub tylertoo_core::MaskSource::Path(std::path::PathBuf)
+pub tylertoo_core::MaskSource::Wkb(alloc::vec::Vec<u8>)
+impl core::clone::Clone for tylertoo_core::MaskSource
+pub fn tylertoo_core::MaskSource::clone(&self) -> tylertoo_core::MaskSource
+impl core::cmp::Eq for tylertoo_core::MaskSource
+impl core::cmp::PartialEq for tylertoo_core::MaskSource
+pub fn tylertoo_core::MaskSource::eq(&self, &tylertoo_core::MaskSource) -> bool
+impl core::convert::From<std::path::PathBuf> for tylertoo_core::MaskSource
+pub fn tylertoo_core::MaskSource::from(std::path::PathBuf) -> Self
+impl core::fmt::Debug for tylertoo_core::MaskSource
+pub fn tylertoo_core::MaskSource::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::MaskSource
+impl serde_core::ser::Serialize for tylertoo_core::MaskSource
+pub fn tylertoo_core::MaskSource::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::MaskSource
+pub fn tylertoo_core::MaskSource::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::MaskSource
+impl core::marker::Send for tylertoo_core::MaskSource
+impl core::marker::Sync for tylertoo_core::MaskSource
+impl core::marker::Unpin for tylertoo_core::MaskSource
+impl core::marker::UnsafeUnpin for tylertoo_core::MaskSource
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::MaskSource
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::MaskSource
 #[non_exhaustive] pub enum tylertoo_core::MemoryProfile
 pub tylertoo_core::MemoryProfile::Auto
 pub tylertoo_core::MemoryProfile::Bounded
@@ -1805,6 +1829,7 @@ pub tylertoo_core::SourceLossCause::Merged
 pub tylertoo_core::SourceLossCause::MissingGeometry
 pub tylertoo_core::SourceLossCause::NonFiniteGeometry
 pub tylertoo_core::SourceLossCause::OutsideBbox
+pub tylertoo_core::SourceLossCause::OutsideMask
 pub tylertoo_core::SourceLossCause::Quantized
 pub tylertoo_core::SourceLossCause::ValveDropped
 impl core::clone::Clone for tylertoo_core::SourceLossCause
@@ -2204,6 +2229,7 @@ pub tylertoo_core::ConvertOptions::full_column_stats: bool
 pub tylertoo_core::ConvertOptions::gsd_base: f64
 pub tylertoo_core::ConvertOptions::in_flight_batches: usize
 pub tylertoo_core::ConvertOptions::levels: tylertoo_core::LevelPlan
+pub tylertoo_core::ConvertOptions::mask: core::option::Option<tylertoo_core::MaskSource>
 pub tylertoo_core::ConvertOptions::max_row_group_size: usize
 pub tylertoo_core::ConvertOptions::mode: tylertoo_core::Mode
 pub tylertoo_core::ConvertOptions::no_auto_rank: bool
@@ -2245,6 +2271,7 @@ pub fn tylertoo_core::ConvertOptions::with_full_column_stats(self, bool) -> Self
 pub fn tylertoo_core::ConvertOptions::with_gsd_base(self, f64) -> Self
 pub fn tylertoo_core::ConvertOptions::with_in_flight_batches(self, usize) -> Self
 pub fn tylertoo_core::ConvertOptions::with_levels(self, tylertoo_core::LevelPlan) -> Self
+pub fn tylertoo_core::ConvertOptions::with_mask(self, core::option::Option<tylertoo_core::MaskSource>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_max_row_group_size(self, usize) -> Self
 pub fn tylertoo_core::ConvertOptions::with_mode(self, tylertoo_core::Mode) -> Self
 pub fn tylertoo_core::ConvertOptions::with_no_auto_rank(self, bool) -> Self
