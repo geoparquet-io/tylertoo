@@ -1952,7 +1952,7 @@ fn rebuild_cluster_tables(
             ),
         ));
     }
-    let mut categories = rebuild_cluster_categories(batch, meta, levels.len(), path)?.into_iter();
+    let mut categories = rebuild_cluster_categories(batch, meta, &counts, path)?.into_iter();
     let mut tables: ClusterTables = vec![HashMap::new(); meta.num_levels];
     for (i, ((&level, &row), &point_count)) in levels
         .iter()
@@ -1985,13 +1985,15 @@ fn rebuild_cluster_tables(
 }
 
 /// The per-entry `--cluster-categories` counts (#827), one per cluster entry,
-/// each checked against the plan's slot labels. Empty when the option is off.
+/// each checked against the plan's slot labels and its entry's `point_count`
+/// (§12.3.1). Empty when the option is off.
 fn rebuild_cluster_categories(
     batch: &RecordBatch,
     meta: &PlanMeta,
-    entries: usize,
+    point_counts: &[i64],
     path: &Path,
 ) -> Result<Vec<CategoryCounts>, ConvertError> {
+    let entries = point_counts.len();
     let lens = u32_section(batch, "cluster_category_len", path)?.unwrap_or_default();
     let slots = u32_section(batch, "cluster_category_slot", path)?.unwrap_or_default();
     let counts = i64_section(batch, "cluster_category_count", path)?.unwrap_or_default();
@@ -2009,7 +2011,7 @@ fn rebuild_cluster_categories(
     }
     let mut out = Vec::with_capacity(entries);
     let mut at = 0usize;
-    for &n in &lens {
+    for (&n, &point_count) in lens.iter().zip(point_counts) {
         let end = at
             .checked_add(n as usize)
             .filter(|&e| e <= slots.len())
@@ -2021,6 +2023,12 @@ fn rebuild_cluster_categories(
             .collect();
         if pairs.iter().any(|&(slot, _)| slot as usize >= labels) {
             return Err(bad("name a slot past the plan's category labels"));
+        }
+        let total = pairs
+            .iter()
+            .try_fold(0i64, |sum, &(_, c)| sum.checked_add(c));
+        if total != Some(point_count) {
+            return Err(bad("do not sum to their entry's point_count"));
         }
         out.push(
             CategoryCounts::from_pairs(pairs)
@@ -2407,6 +2415,20 @@ mod tests {
         plan.save(f.path()).unwrap();
         let back = ConvertPlan::load(f.path()).unwrap();
         assert_eq!(plan, back);
+    }
+
+    /// #827 review: a saved plan whose category counts miss an entry's
+    /// `point_count` is refused, not written into a file that breaks §12.3.1.
+    #[test]
+    fn plan_with_inconsistent_category_totals_is_refused() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let mut plan = tiny_plan();
+        let tables = plan.cluster_tables.as_mut().unwrap();
+        tables[0].get_mut(&5).unwrap().categories =
+            CategoryCounts::from_pairs(vec![(0, 1)]).unwrap();
+        plan.save(f.path()).unwrap();
+        let err = load_err(f.path());
+        assert!(err.contains("point_count"), "{err}");
     }
 
     /// The empty/absent sections must round trip too (no clustering, no
