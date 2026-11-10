@@ -430,7 +430,7 @@ impl ArchiveIndex {
 
     /// Whether the archive is variable-depth (#803): its tiles stop at
     /// different zooms, so it cannot be merged with another archive.
-    pub(crate) fn is_variable_depth(&self) -> bool {
+    pub fn is_variable_depth(&self) -> bool {
         self.metadata_json()
             .is_some_and(|m| m.get(crate::pmtiles_writer::VARIABLE_DEPTH_KEY).is_some())
     }

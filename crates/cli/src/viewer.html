@@ -38,22 +38,27 @@ const map = new maplibre.Map({ container: "map", style: { version: 8, sources: {
 map.addControl(new maplibre.NavigationControl());
 const $ = (id) => document.getElementById(id);
 const text = (s) => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
-let drawn = [];
+let drawn = [], loading = 0;
 
 async function load(name) {
+  // A newer selection wins: drop this one's results once it is stale.
+  const me = ++loading;
+  const tj = await (await fetch(`/${encodeURIComponent(name)}.json`)).json();
+  const st = await (await fetch(`/${encodeURIComponent(name)}/stats.json`)).json();
+  if (me !== loading) return;
   for (const id of drawn) map.removeLayer(id);
   if (map.getSource("a")) map.removeSource("a");
   drawn = [];
-  const tj = await (await fetch(`/${encodeURIComponent(name)}.json`)).json();
+  $("layers").innerHTML = "";
   $("info").innerHTML = `${text(tj.encoding.toUpperCase())} tiles, z${tj.minzoom}–z${tj.maxzoom}`;
+  if (tj.variable_depth) $("info").innerHTML += "<br>Variable-depth archive: areas below a stopped tile show as holes.";
   if (tj.encoding === "raster") {
-    map.addSource("a", { type: "raster", tiles: tj.tiles, minzoom: tj.minzoom, maxzoom: tj.maxzoom });
+    map.addSource("a", { type: "raster", tiles: tj.tiles, attribution: tj.attribution, minzoom: tj.minzoom, maxzoom: tj.maxzoom });
     map.addLayer({ id: "raster", type: "raster", source: "a" });
     drawn = ["raster"];
   } else {
     map.addSource("a", { type: "vector", tiles: tj.tiles, minzoom: tj.minzoom, maxzoom: tj.maxzoom,
-      bounds: tj.bounds, encoding: tj.encoding });
-    $("layers").innerHTML = "";
+      bounds: tj.bounds, encoding: tj.encoding, attribution: tj.attribution });
     tj.vector_layers.forEach((l, i) => {
       const c = COLORS[i % COLORS.length], s = { source: "a", "source-layer": l.id };
       const ids = [`${l.id}-fill`, `${l.id}-line`, `${l.id}-point`];
@@ -72,7 +77,6 @@ async function load(name) {
     });
   }
   if (!location.hash) map.fitBounds(tj.bounds, { animate: false, padding: 20 });
-  const st = await (await fetch(`/${encodeURIComponent(name)}/stats.json`)).json();
   $("stats").innerHTML = "<table><tr><th>z</th><th>tiles</th><th>bytes</th><th>max</th></tr>" +
     st.per_zoom.map((r) => `<tr><td>${r.z}</td><td>${r.tile_count.toLocaleString()}</td>` +
       `<td>${r.total_bytes.toLocaleString()}</td><td>${r.max_bytes.toLocaleString()}</td></tr>`).join("") + "</table>";

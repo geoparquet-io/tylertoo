@@ -6,6 +6,7 @@
 //! its size, modification time or inode changes.
 
 use anyhow::{bail, Context, Result};
+use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -21,13 +22,21 @@ const VIEWER: &str = include_str!("viewer.html");
 /// What identifies one version of a file on disk: size, mtime, inode.
 type Stamp = (u64, Option<SystemTime>, u64);
 
-fn stamp(path: &Path) -> std::io::Result<Stamp> {
-    let m = std::fs::metadata(path)?;
+fn stamp(m: &std::fs::Metadata) -> Stamp {
     #[cfg(unix)]
-    let ino = std::os::unix::fs::MetadataExt::ino(&m);
+    let ino = std::os::unix::fs::MetadataExt::ino(m);
     #[cfg(not(unix))]
     let ino = 0;
-    Ok((m.len(), m.modified().ok(), ino))
+    (m.len(), m.modified().ok(), ino)
+}
+
+/// A strong `ETag` for one version of the file, so a PMTiles client that
+/// cached the archive's directory notices a rebuild.
+fn etag((len, mtime, ino): Stamp) -> String {
+    let nanos = mtime
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    format!("\"{len:x}-{nanos:x}-{ino:x}\"")
 }
 
 struct Served {
@@ -42,18 +51,34 @@ impl Served {
     /// fails to open; the old index keeps serving and the next request
     /// tries again.
     fn refresh(&mut self) {
-        let Ok(now) = stamp(&self.path) else { return };
+        let Ok(now) = std::fs::metadata(&self.path).map(|m| stamp(&m)) else {
+            return;
+        };
         if now == self.stamp {
             return;
         }
         match ArchiveIndex::open(&self.path) {
             Ok(index) => {
                 log::info!("reloaded {}", self.path.display());
+                warn_variable_depth(&index);
                 self.index = index;
                 self.stamp = now;
             }
             Err(e) => log::warn!("{} changed but did not reopen: {e}", self.path.display()),
         }
+    }
+}
+
+// shortcut: a missing tile is a 204, never its nearest stored ancestor
+// scaled up, so a variable-depth archive (#803) shows holes below each
+// stopped branch. Overzoom here if serving those archives matters.
+fn warn_variable_depth(index: &ArchiveIndex) {
+    if index.is_variable_depth() {
+        log::warn!(
+            "{} is a variable-depth archive: serve does not overzoom stopped tiles, \
+             so the map shows holes below them",
+            index.path().display()
+        );
     }
 }
 
@@ -81,10 +106,19 @@ impl Server {
             if served.iter().any(|s| s.name == name) {
                 bail!("two archives are named {name:?}; rename one");
             }
-            let stamp =
-                stamp(path).with_context(|| format!("could not open {}", path.display()))?;
+            // `/index.json` is the archive list, not this archive's TileJSON.
+            if name == "index" {
+                bail!(
+                    "{}: the name \"index\" is reserved; rename it",
+                    path.display()
+                );
+            }
+            let stamp = std::fs::metadata(path)
+                .map(|m| stamp(&m))
+                .with_context(|| format!("could not open {}", path.display()))?;
             let index = ArchiveIndex::open(path)
                 .with_context(|| format!("could not open {}", path.display()))?;
+            warn_variable_depth(&index);
             served.push(Served {
                 name,
                 path: path.clone(),
@@ -139,7 +173,12 @@ impl Server {
             return status(405);
         }
         let path = req.url().split('?').next().unwrap_or("");
-        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        let parts: Vec<String> = path
+            .trim_start_matches('/')
+            .split('/')
+            .map(|p| percent_decode_str(p).decode_utf8_lossy().into_owned())
+            .collect();
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
         match parts.as_slice() {
             [""] => body(VIEWER.as_bytes().to_vec(), "text/html; charset=utf-8"),
             ["index.json"] => {
@@ -283,12 +322,16 @@ fn tilejson(a: &Served, host: &str) -> serde_json::Value {
     let mut tj = serde_json::json!({
         "tilejson": "3.0.0",
         "name": meta.get("name").and_then(|v| v.as_str()).unwrap_or(&a.name),
-        "tiles": [format!("http://{host}/{}/{{z}}/{{x}}/{{y}}.{ext}", a.name)],
+        "tiles": [format!(
+            "http://{host}/{}/{{z}}/{{x}}/{{y}}.{ext}",
+            utf8_percent_encode(&a.name, NON_ALPHANUMERIC)
+        )],
         "minzoom": h.min_zoom,
         "maxzoom": h.max_zoom,
         "bounds": [h.min_lon, h.min_lat, h.max_lon, h.max_lat],
         "center": [h.center_lon, h.center_lat, h.center_zoom],
         "encoding": encoding,
+        "variable_depth": a.index.is_variable_depth(),
         "vector_layers": meta.get("vector_layers").cloned().unwrap_or_default(),
     });
     for key in ["attribution", "description"] {
@@ -302,13 +345,14 @@ fn tilejson(a: &Served, host: &str) -> serde_json::Value {
 /// The archive file itself, honouring one `Range: bytes=` span, so a
 /// PMTiles client (pmtiles.io, the `pmtiles` JS library) can read it.
 fn raw(path: &Path, req: &Request) -> Response<Box<dyn Read + Send>> {
-    let (mut file, len) = match File::open(path).and_then(|f| {
-        let len = f.metadata()?.len();
-        Ok((f, len))
+    let (mut file, version) = match File::open(path).and_then(|f| {
+        let m = f.metadata()?;
+        Ok((f, stamp(&m)))
     }) {
         Ok(v) => v,
         Err(e) => return error(&e),
     };
+    let len = version.0;
     let range = req
         .headers()
         .iter()
@@ -328,6 +372,8 @@ fn raw(path: &Path, req: &Request) -> Response<Box<dyn Read + Send>> {
     let mut headers = vec![
         header("Content-Type", "application/vnd.pmtiles"),
         header("Accept-Ranges", "bytes"),
+        header("ETag", &etag(version)),
+        header("Access-Control-Expose-Headers", "ETag, Content-Range"),
     ];
     if code == 206 {
         headers.push(header(

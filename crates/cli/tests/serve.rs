@@ -44,7 +44,8 @@ fn get(addr: &str, path: &str, extra: &str) -> (u16, String, Vec<u8>) {
 #[test]
 fn serves_the_archives_own_bytes_and_reloads_a_rewrite() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("demo.pmtiles");
+    // A space in the name: URL segments are percent-decoded.
+    let path = dir.path().join("my demo.pmtiles");
     write_archive(&path, 1);
 
     let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0).unwrap();
@@ -58,33 +59,44 @@ fn serves_the_archives_own_bytes_and_reloads_a_rewrite() {
     let index = ArchiveIndex::open(&path).unwrap();
     for t in index.tiles() {
         let t = t.unwrap();
-        let (code, head, body) = get(&addr, &format!("/demo/{}/{}/{}.mvt", t.z, t.x, t.y), "");
+        let (code, head, body) = get(
+            &addr,
+            &format!("/my%20demo/{}/{}/{}.mvt", t.z, t.x, t.y),
+            "",
+        );
         assert_eq!(code, 200);
         assert!(head.contains("content-encoding: gzip"), "{head}");
         assert_eq!(body, index.read_range(t.range).unwrap());
     }
-    assert_eq!(get(&addr, "/demo/2/0/0.mvt", "").0, 204);
+    assert_eq!(get(&addr, "/my%20demo/2/0/0.mvt", "").0, 204);
     assert_eq!(get(&addr, "/nope/0/0/0.mvt", "").0, 404);
 
     let file = std::fs::read(&path).unwrap();
-    let (code, head, body) = get(&addr, "/demo.pmtiles", "Range: bytes=0-126\r\n");
+    let (code, head, body) = get(&addr, "/my%20demo.pmtiles", "Range: bytes=0-126\r\n");
     assert_eq!(code, 206);
     assert!(
         head.contains(&format!("content-range: bytes 0-126/{}", file.len())),
         "{head}"
     );
     assert_eq!(body, file[..127]);
-    let (code, _, body) = get(&addr, "/demo.pmtiles", "Range: bytes=-10\r\n");
+    let (code, _, body) = get(&addr, "/my%20demo.pmtiles", "Range: bytes=-10\r\n");
     assert_eq!((code, body.as_slice()), (206, &file[file.len() - 10..]));
-    assert_eq!(get(&addr, "/demo.pmtiles", "").2, file);
+    let (_, head, body) = get(&addr, "/my%20demo.pmtiles", "");
+    assert_eq!(body, file);
+    let etag = |head: &str| {
+        head.lines()
+            .find(|l| l.starts_with("etag:"))
+            .map(str::to_owned)
+    };
+    let before = etag(&head).expect("etag");
 
     let meta = ArchiveIndex::read_metadata_only(&path).unwrap();
-    assert_eq!(get(&addr, "/demo/metadata.json", "").2, meta);
-    let (_, _, tj) = get(&addr, "/demo.json", "");
+    assert_eq!(get(&addr, "/my%20demo/metadata.json", "").2, meta);
+    let (_, _, tj) = get(&addr, "/my%20demo.json", "");
     let tj: serde_json::Value = serde_json::from_slice(&tj).unwrap();
     assert_eq!(
         tj["tiles"][0],
-        format!("http://{addr}/demo/{{z}}/{{x}}/{{y}}.mvt")
+        format!("http://{addr}/my%20demo/{{z}}/{{x}}/{{y}}.mvt")
     );
     assert_eq!(tj["encoding"], "mvt");
     assert!(String::from_utf8(get(&addr, "/", "").2)
@@ -98,7 +110,18 @@ fn serves_the_archives_own_bytes_and_reloads_a_rewrite() {
     let index = ArchiveIndex::open(&path).unwrap();
     let r = index.find(0, 0, 0).unwrap().unwrap();
     assert_eq!(
-        get(&addr, "/demo/0/0/0.mvt", "").2,
+        get(&addr, "/my%20demo/0/0/0.mvt", "").2,
         index.read_range(r).unwrap()
     );
+    let (_, head, _) = get(&addr, "/my%20demo.pmtiles", "Range: bytes=0-9\r\n");
+    assert_ne!(etag(&head), Some(before), "a rebuild changes the ETag");
+}
+
+#[test]
+fn index_is_a_reserved_archive_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.pmtiles");
+    write_archive(&path, 1);
+    let err = Server::bind(&[path], "127.0.0.1", 0).err().unwrap();
+    assert!(err.to_string().contains("reserved"), "{err}");
 }
