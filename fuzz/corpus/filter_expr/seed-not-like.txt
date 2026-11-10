@@ -1,0 +1,1 @@
+NOT (name NOT ILIKE '%paulo%') OR code NOT LIKE '50\%'

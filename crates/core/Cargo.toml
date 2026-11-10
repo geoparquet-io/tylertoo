@@ -58,6 +58,7 @@ arrow-cast = { workspace = true }
 # --filter evaluation kernels (overview/filter.rs).
 arrow-ord = { workspace = true }
 arrow-arith = { workspace = true }
+arrow-string = { workspace = true }
 arrow-buffer = { workspace = true }
 geo = { workspace = true }
 wkb = { workspace = true }

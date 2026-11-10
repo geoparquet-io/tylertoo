@@ -15,6 +15,7 @@
 //! predicate := column cmp_op literal
 //!            | column [NOT] IN '(' literal ( ',' literal )* ')'
 //!            | column IS [NOT] NULL
+//!            | column [NOT] ( LIKE | ILIKE ) 'pattern'
 //! cmp_op    := '=' | '==' | '!=' | '<>' | '<' | '<=' | '>' | '>='
 //! column    := bare identifier | "double-quoted identifier"
 //! literal   := number | 'single-quoted string' | TRUE | FALSE
@@ -23,6 +24,9 @@
 //! Keywords are case-insensitive. The column must be on the left-hand side
 //! of a comparison. String literals escape an embedded quote by doubling it
 //! (`'it''s'`). `= NULL` is rejected with a hint to use `IS NULL`.
+//!
+//! TODO(docs): LIKE / ILIKE pattern syntax (`%`, `_`, backslash escape),
+//! ILIKE case folding, and literal-prefix pruning.
 //!
 //! # Null semantics (SQL three-valued logic)
 //!
@@ -205,6 +209,17 @@ pub enum FilterExpr {
         /// `IS NOT NULL` when true.
         negated: bool,
     },
+    /// `column [NOT] LIKE|ILIKE 'pattern'`
+    Like {
+        /// Column name.
+        column: String,
+        /// The pattern, `%` and `_` wildcards, `\\` escape.
+        pattern: String,
+        /// `NOT LIKE` / `NOT ILIKE` when true.
+        negated: bool,
+        /// `ILIKE` when true.
+        case_insensitive: bool,
+    },
     /// `NOT expr`
     Not(Box<FilterExpr>),
     /// `a AND b`
@@ -226,7 +241,8 @@ impl FilterExpr {
             match e {
                 FilterExpr::Compare { column, .. }
                 | FilterExpr::In { column, .. }
-                | FilterExpr::IsNull { column, .. } => push(column),
+                | FilterExpr::IsNull { column, .. }
+                | FilterExpr::Like { column, .. } => push(column),
                 FilterExpr::Not(inner) => walk(inner, out),
                 FilterExpr::And(a, b) | FilterExpr::Or(a, b) => {
                     walk(a, out);
@@ -281,6 +297,8 @@ enum Token {
     Not,
     In,
     Is,
+    Like,
+    ILike,
     Null,
     True,
     False,
@@ -428,6 +446,8 @@ fn tokenize(src: &str) -> Result<Vec<Token>, FilterError> {
                     "NOT" => Token::Not,
                     "IN" => Token::In,
                     "IS" => Token::Is,
+                    "LIKE" => Token::Like,
+                    "ILIKE" => Token::ILike,
                     "NULL" => Token::Null,
                     "TRUE" => Token::True,
                     "FALSE" => Token::False,
@@ -586,9 +606,13 @@ impl Parser {
                 self.pos += 1;
                 self.parse_in_list(column, false)
             }
+            Some(Token::Like | Token::ILike) => self.parse_like(column, false),
             Some(Token::Not) => {
                 self.pos += 1;
-                self.expect(Token::In, "IN after NOT")?;
+                if matches!(self.peek(), Some(Token::Like | Token::ILike)) {
+                    return self.parse_like(column, true);
+                }
+                self.expect(Token::In, "IN, LIKE or ILIKE after NOT")?;
                 self.parse_in_list(column, true)
             }
             Some(Token::Is) => {
@@ -598,7 +622,7 @@ impl Parser {
                 Ok(FilterExpr::IsNull { column, negated })
             }
             _ => Err(FilterError::Parse(format!(
-                "expected a comparison operator, IN, or IS after column \
+                "expected a comparison operator, IN, IS, LIKE or ILIKE after column \
                  {column:?}, found {}",
                 self.peek_desc()
             ))),
@@ -616,6 +640,25 @@ impl Parser {
             column,
             values,
             negated,
+        })
+    }
+
+    /// `LIKE|ILIKE 'pattern'`, the keyword at the cursor.
+    fn parse_like(&mut self, column: String, negated: bool) -> Result<FilterExpr, FilterError> {
+        let case_insensitive = self.peek() == Some(&Token::ILike);
+        self.pos += 1;
+        let Some(Token::Str(pattern)) = self.peek().cloned() else {
+            return Err(FilterError::Parse(format!(
+                "expected a 'string' pattern after LIKE / ILIKE, found {}",
+                self.peek_desc()
+            )));
+        };
+        self.pos += 1;
+        Ok(FilterExpr::Like {
+            column,
+            pattern,
+            negated,
+            case_insensitive,
         })
     }
 
@@ -734,6 +777,12 @@ enum BoundExpr {
     IsNull {
         col: BoundCol,
         negated: bool,
+    },
+    Like {
+        col: BoundCol,
+        pattern: String,
+        negated: bool,
+        case_insensitive: bool,
     },
     Not(Box<BoundExpr>),
     And(Box<BoundExpr>, Box<BoundExpr>),
@@ -949,6 +998,38 @@ fn bind_expr(
                 negated: *negated,
             })
         }
+        FilterExpr::Like {
+            column,
+            pattern,
+            negated,
+            case_insensitive,
+        } => {
+            let col = bind_col(column, columns)?;
+            let lit = Literal::String(pattern.clone());
+            if col.kind != ColKind::Str {
+                return Err(FilterError::TypeMismatch {
+                    name: col.parquet_name,
+                    kind: col.kind.name(),
+                    literal: lit.describe(),
+                });
+            }
+            // arrow-string compiles the pattern per batch; compile it once
+            // here so a bad one fails at bind time, not as all-UNKNOWN rows.
+            let probe = StringArray::from(Vec::<&str>::new());
+            like_kernel(
+                *negated,
+                *case_insensitive,
+                &probe,
+                &StringArray::new_scalar(pattern),
+            )
+            .map_err(|e| FilterError::Parse(format!("LIKE pattern {pattern:?}: {e}")))?;
+            Ok(BoundExpr::Like {
+                col,
+                pattern: pattern.clone(),
+                negated: *negated,
+                case_insensitive: *case_insensitive,
+            })
+        }
         FilterExpr::Not(inner) => Ok(BoundExpr::Not(Box::new(bind_expr(
             inner, schema, renames, columns,
         )?))),
@@ -1070,6 +1151,21 @@ fn ts_cmp(col: &dyn Array, unit: TimeUnit, pred: impl Fn(i128) -> bool) -> Boole
         .collect()
 }
 
+fn like_kernel(
+    negated: bool,
+    case_insensitive: bool,
+    lhs: &dyn arrow_array::Datum,
+    rhs: &dyn arrow_array::Datum,
+) -> Result<BooleanArray, arrow_schema::ArrowError> {
+    use arrow_string::like::{ilike, like, nilike, nlike};
+    match (negated, case_insensitive) {
+        (false, false) => like(lhs, rhs),
+        (false, true) => ilike(lhs, rhs),
+        (true, false) => nlike(lhs, rhs),
+        (true, true) => nilike(lhs, rhs),
+    }
+}
+
 fn ord_holds(ord: std::cmp::Ordering, op: CmpOp) -> bool {
     use std::cmp::Ordering::{Equal, Greater, Less};
     match op {
@@ -1182,6 +1278,17 @@ fn eval_expr(expr: &BoundExpr, batch: &RecordBatch, proj: &dyn Fn(usize) -> usiz
                 .map_or_else(|| BooleanBuffer::new_set(rows), |n| n.inner().clone());
             BooleanArray::new(if *negated { present } else { !&present }, None)
         }
+        BoundExpr::Like {
+            col,
+            pattern,
+            negated,
+            case_insensitive,
+        } => {
+            let arr = batch.column(proj(col.idx));
+            str_scalar(arr.as_ref(), pattern)
+                .and_then(|lit| like_kernel(*negated, *case_insensitive, arr, &lit).ok())
+                .unwrap_or_else(|| BooleanArray::new_null(rows))
+        }
         // Kleene: NOT UNKNOWN = UNKNOWN.
         BoundExpr::Not(inner) => {
             not(&eval_expr(inner, batch, proj)).expect("NOT of a boolean array")
@@ -1265,6 +1372,30 @@ fn range_can_match<T: PartialOrd>(min: T, max: T, op: CmpOp, lit: T) -> bool {
     }
 }
 
+/// The literal text a LIKE pattern's matches all start with: everything
+/// before the first unescaped `%` or `_`, unescaped the way arrow-string
+/// reads it (`\\x` is `x`; a trailing `\\` is itself).
+fn like_prefix(pattern: &str) -> String {
+    let mut out = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '%' | '_' => break,
+            '\\' => out.push(chars.next().unwrap_or('\\')),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Could some string in `[min, max]` start with `prefix`? The strings with
+/// a prefix are one contiguous byte-order run beginning at `prefix`, so no
+/// upper-bound string (and no multibyte successor) is needed: a `min` above
+/// `prefix` that does not start with it sorts above the whole run.
+fn prefix_can_match(min: &str, max: &str, prefix: &str) -> bool {
+    max >= prefix && (min <= prefix || min.starts_with(prefix))
+}
+
 /// Whether the row group could contain a row matching `expr`, judged by
 /// column chunk statistics alone. `true` = must read; `false` = provably no
 /// match (prune). Conservative in every uncertain case.
@@ -1316,6 +1447,25 @@ fn rg_can_match(expr: &BoundExpr, rg: &RowGroupMetaData, chunk_idx: &HashMap<&st
 
     match expr {
         BoundExpr::Compare { col, op, value } => !all_null(col) && value_can_match(col, *op, value),
+        // Only a case-sensitive LIKE has a byte-order prefix range; ILIKE and
+        // NOT LIKE prune just the all-null chunk.
+        BoundExpr::Like {
+            col,
+            pattern,
+            negated,
+            case_insensitive,
+        } => {
+            if all_null(col) {
+                return false;
+            }
+            if *negated || *case_insensitive {
+                return true;
+            }
+            match stats_for(col).and_then(str_bounds) {
+                Some((min, max)) => prefix_can_match(min, max, &like_prefix(pattern)),
+                None => true,
+            }
+        }
         BoundExpr::In {
             col,
             values,
@@ -2130,6 +2280,205 @@ mod tests {
         assert_eq!(selected("crop != 'soy'", &meta), vec![1, 3]);
         // NOT (...) is conservative: keeps everything.
         assert_eq!(selected("NOT (crop = 'soy')", &meta), vec![0, 1, 2, 3]);
+    }
+
+    // ---- LIKE / ILIKE (#826) ---------------------------------------------
+
+    #[test]
+    fn parses_like_ilike_and_negations() {
+        let like = |src: &str| parse_filter(src).unwrap();
+        assert_eq!(
+            like("crop LIKE 's%'"),
+            FilterExpr::Like {
+                column: "crop".into(),
+                pattern: "s%".into(),
+                negated: false,
+                case_insensitive: false,
+            }
+        );
+        assert_eq!(
+            like("crop not ilike 'S_Y'"),
+            FilterExpr::Like {
+                column: "crop".into(),
+                pattern: "S_Y".into(),
+                negated: true,
+                case_insensitive: true,
+            }
+        );
+        assert!(matches!(
+            like("crop NOT LIKE 'x'"),
+            FilterExpr::Like {
+                negated: true,
+                case_insensitive: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            like("crop ILIKE 'x'"),
+            FilterExpr::Like {
+                negated: false,
+                case_insensitive: true,
+                ..
+            }
+        ));
+        // The pattern must be a string literal.
+        assert!(parse_filter("crop LIKE 3").is_err());
+        assert!(parse_filter("crop LIKE").is_err());
+        assert!(parse_filter("crop NOT 's'").is_err());
+        // The fuzz seeds (fuzz/corpus/filter_expr/seed-*like.txt) parse.
+        for seed in ["seed-like.txt", "seed-not-like.txt"] {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fuzz/corpus/filter_expr/"
+            );
+            let src = std::fs::read_to_string(format!("{path}{seed}")).unwrap();
+            parse_filter(&src).unwrap_or_else(|e| panic!("{seed}: {e}"));
+        }
+    }
+
+    #[test]
+    fn eval_like_ilike_three_valued() {
+        // crop: soy, corn, soy, NULL
+        assert_eq!(
+            eval("crop LIKE 's%'"),
+            vec![Some(true), Some(false), Some(true), None]
+        );
+        assert_eq!(
+            eval("crop LIKE 'S%'"),
+            vec![Some(false), Some(false), Some(false), None]
+        );
+        assert_eq!(
+            eval("crop NOT LIKE 's%'"),
+            vec![Some(false), Some(true), Some(false), None]
+        );
+        assert_eq!(
+            eval("crop ILIKE 'S_Y'"),
+            vec![Some(true), Some(false), Some(true), None]
+        );
+        assert_eq!(
+            eval("crop NOT ILIKE 'SOY'"),
+            vec![Some(false), Some(true), Some(false), None]
+        );
+        assert_eq!(
+            eval("crop LIKE '%o%'"),
+            vec![Some(true), Some(true), Some(true), None]
+        );
+        assert_eq!(
+            eval("NOT (crop LIKE 'c%')"),
+            vec![Some(true), Some(false), Some(true), None]
+        );
+    }
+
+    fn eval_strings(values: Vec<Option<&str>>, src: &str) -> Vec<Option<bool>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let col: ArrayRef = Arc::new(StringArray::from(values));
+        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+        let bound = BoundFilter::bind(&parse_filter(src).unwrap(), &batch.schema(), &[]).unwrap();
+        bound.eval_mask(&batch, &|i| i)
+    }
+
+    #[test]
+    fn eval_ilike_folds_unicode_case_and_like_escapes_wildcards() {
+        let names = vec![Some("São Paulo"), Some("SÃO JOSÉ"), Some("Sao Carlos")];
+        assert_eq!(
+            eval_strings(names.clone(), "name ILIKE 'são%'"),
+            vec![Some(true), Some(true), Some(false)]
+        );
+        assert_eq!(
+            eval_strings(names, "name LIKE 'São%'"),
+            vec![Some(true), Some(false), Some(false)]
+        );
+        // Backslash escapes a wildcard.
+        assert_eq!(
+            eval_strings(
+                vec![Some("50%"), Some("500"), Some("5_0")],
+                r"name LIKE '50\%'"
+            ),
+            vec![Some(true), Some(false), Some(false)]
+        );
+        assert_eq!(
+            eval_strings(vec![Some("5_0"), Some("500")], r"name LIKE '5\_0'"),
+            vec![Some(true), Some(false)]
+        );
+    }
+
+    #[test]
+    fn eval_like_on_dictionary_and_view_columns() {
+        use arrow_array::types::Int32Type;
+        use arrow_array::DictionaryArray;
+        let dict: DictionaryArray<Int32Type> = vec![Some("soy"), None, Some("corn"), Some("soy")]
+            .into_iter()
+            .collect();
+        let view = StringViewArray::from(vec![Some("soy"), None, Some("corn"), Some("soy")]);
+        for col in [Arc::new(dict) as ArrayRef, Arc::new(view) as ArrayRef] {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "crop",
+                col.data_type().clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+            let bound = BoundFilter::bind(
+                &parse_filter("crop LIKE 's%'").unwrap(),
+                &batch.schema(),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                bound.eval_mask(&batch, &|i| i),
+                vec![Some(true), None, Some(false), Some(true)]
+            );
+        }
+    }
+
+    #[test]
+    fn bind_like_needs_a_string_column() {
+        let batch = test_batch();
+        let expr = parse_filter("id LIKE '1%'").unwrap();
+        assert!(matches!(
+            BoundFilter::bind(&expr, &batch.schema(), &[]),
+            Err(FilterError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn like_prefix_stops_at_the_first_wildcard_and_unescapes() {
+        assert_eq!(like_prefix("São%"), "São");
+        assert_eq!(like_prefix("ab_c%"), "ab");
+        assert_eq!(like_prefix("%x"), "");
+        assert_eq!(like_prefix(r"50\%x%"), "50%x");
+        assert_eq!(like_prefix("exact"), "exact");
+        // A trailing backslash is a literal backslash, as arrow-string reads it.
+        assert_eq!(like_prefix("a\\"), "a\\");
+    }
+
+    #[test]
+    fn prefix_range_check_is_byte_order_correct() {
+        // Some value in [min, max] starts with the prefix.
+        assert!(prefix_can_match("Sa", "T", "São"));
+        assert!(prefix_can_match("São Paulo", "São Paulo", "São"));
+        assert!(prefix_can_match("A", "São", "São"));
+        assert!(prefix_can_match("São\u{10FFFF}", "T", "São"));
+        assert!(prefix_can_match("x", "y", ""));
+        // Every value sorts below, or above, all strings with the prefix.
+        assert!(!prefix_can_match("A", "Sb", "São"));
+        assert!(!prefix_can_match("Sãp", "T", "São"));
+        assert!(!prefix_can_match("Sé", "T", "São"));
+    }
+
+    #[test]
+    fn pushdown_prunes_like_with_a_literal_prefix() {
+        let (_f, meta) = stats_file(&[
+            (Some(0.1), Some("Salvador")),
+            (Some(0.2), Some("São Paulo")),
+            (Some(0.3), Some("Sé")),
+            (Some(0.4), None),
+        ]);
+        assert_eq!(selected("crop LIKE 'São%'", &meta), vec![1]);
+        assert_eq!(selected("crop LIKE 'S_o%'", &meta), vec![0, 1, 2]);
+        assert_eq!(selected("crop LIKE '%o'", &meta), vec![0, 1, 2]);
+        // Only the all-null chunk is provably out for the rest.
+        assert_eq!(selected("crop ILIKE 'são%'", &meta), vec![0, 1, 2]);
+        assert_eq!(selected("crop NOT LIKE 'São%'", &meta), vec![0, 1, 2]);
     }
 
     // ---- timestamps ------------------------------------------------------
