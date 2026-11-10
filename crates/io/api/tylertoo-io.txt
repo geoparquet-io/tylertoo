@@ -67,6 +67,7 @@ pub struct tylertoo_io::BatchWriter<W: core::io::write::Write + core::marker::Se
 impl<W: core::io::write::Write + core::marker::Send> tylertoo_io::BatchWriter<W>
 pub fn tylertoo_io::BatchWriter<W>::append_key_value_metadata(&mut self, parquet::file::metadata::KeyValue)
 pub fn tylertoo_io::BatchWriter<W>::close(self) -> core::result::Result<(), parquet::errors::ParquetError>
+pub fn tylertoo_io::BatchWriter<W>::flush(&mut self) -> core::result::Result<(), parquet::errors::ParquetError>
 pub fn tylertoo_io::BatchWriter<W>::into_serialized_writer(self) -> core::result::Result<(parquet::file::writer::SerializedFileWriter<W>, parquet::arrow::arrow_writer::ArrowRowGroupWriterFactory), parquet::errors::ParquetError>
 pub fn tylertoo_io::BatchWriter<W>::write(&mut self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), parquet::errors::ParquetError>
 impl<W> core::marker::Freeze for tylertoo_io::BatchWriter<W> where parquet::arrow::arrow_writer::ArrowWriter<W>: core::marker::Freeze

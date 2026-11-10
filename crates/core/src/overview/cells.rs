@@ -392,10 +392,6 @@ impl Cells {
         self.0.iter().map(HashMap::len).sum()
     }
 
-    fn get(&self, id: u64) -> &CellAcc {
-        &self.0[shard_of(id)][&id]
-    }
-
     /// Merge partial maps, each split by shard, into these cells: shard by
     /// shard in parallel, the parts in order, so the result is the same on
     /// every run. Returns the category pairs added.
@@ -490,9 +486,16 @@ pub(crate) fn write_cell_tables(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ConvertError> {
     debug_assert_eq!(tables.len(), usize::from(max_zoom - min_zoom) + 1);
+    let started = std::time::Instant::now();
     let (mut cells, labels, budget, cat_pairs) =
         aggregate(input, system, max_zoom, rollup, read, diagnostics)?;
     let specs = rollup.accumulate.len();
+    log::info!(
+        "[cells] {} aggregate: {} cell(s) at z{max_zoom} in {:.1}s",
+        system.name(),
+        cells.len(),
+        started.elapsed().as_secs_f64()
+    );
     let mut res = system.resolution(max_zoom);
     for z in (min_zoom..=max_zoom).rev() {
         let to = system.resolution(z);
@@ -514,6 +517,11 @@ pub(crate) fn write_cell_tables(
             rollup,
             &labels,
         )?;
+        log::info!(
+            "[cells] z{z}: {} cell(s), total {:.1}s",
+            cells.len(),
+            started.elapsed().as_secs_f64()
+        );
     }
     Ok(())
 }
@@ -532,8 +540,11 @@ fn aggregate(
     let source = ConvertSource::resolve_path(input)?;
     source.set_spill_dir(read.spill_dir.as_deref());
     let descriptor = source.resolved_schema()?;
-    let (crs, _) =
+    let (crs, assumed) =
         super::convert::crs_from_resolved(descriptor, &source.display_name(), diagnostics)?;
+    if assumed {
+        super::convert::warn_assumed_wgs84(&source, diagnostics);
+    }
     let geom_idx = descriptor
         .geometry_index()
         .ok_or_else(|| ConvertError::NoGeometryColumn {
@@ -757,17 +768,17 @@ fn write_table(
     let (file, pending) = crate::atomic_output::create(path)?;
     let mut writer = tylertoo_io::batch_writer(file, encoder.target_schema())?;
 
-    let mut ids: Vec<u64> = Vec::with_capacity(cells.len());
+    let mut all: Vec<(u64, &CellAcc)> = Vec::with_capacity(cells.len());
     for shard in &cells.0 {
-        ids.extend(shard.keys());
+        all.extend(shard.iter().map(|(&id, acc)| (id, acc)));
     }
-    ids.par_sort_unstable();
-    for ids in ids.chunks(WRITE_ROWS) {
-        let rows: Vec<&CellAcc> = ids.iter().map(|&id| cells.get(id)).collect();
+    all.par_sort_unstable_by_key(|c| c.0);
+    for chunk in all.chunks(WRITE_ROWS) {
+        let ids: Vec<u64> = chunk.iter().map(|c| c.0).collect();
+        let rows: Vec<&CellAcc> = chunk.iter().map(|c| c.1).collect();
+        let tokens: Vec<String> = ids.par_iter().map(|&id| system.token(id, res)).collect();
         let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from_iter_values(
-                ids.iter().map(|&id| system.token(id, res)),
-            )),
+            Arc::new(StringArray::from(tokens)),
             Arc::new(Int64Array::from_iter_values(rows.iter().map(|c| c.count))),
         ];
         for (i, spec) in rollup.accumulate.iter().enumerate() {
@@ -776,19 +787,25 @@ fn write_table(
             )));
         }
         if rollup.categories.is_some() {
-            // A zero count is null, as `--cluster-categories` writes it.
-            let counts: Vec<ArrayRef> = (0..labels.len() as u32)
-                .into_par_iter()
-                .map(|slot| {
-                    Arc::new(Int64Array::from_iter(rows.iter().map(|c| {
-                        let cats = c.cats.as_slice();
-                        cats.binary_search_by_key(&slot, |e| e.0)
-                            .ok()
-                            .map(|k| cats[k].1)
-                    }))) as ArrayRef
+            // One pass over the cells' counts, scattered into a column per
+            // slot; a zero count is null, as `--cluster-categories` writes it.
+            let n = rows.len();
+            let mut counts = vec![0i64; labels.len() * n];
+            for (r, c) in rows.iter().enumerate() {
+                for &(slot, k) in c.cats.as_slice() {
+                    counts[slot as usize * n + r] = k;
+                }
+            }
+            let arrays: Vec<ArrayRef> = counts
+                .par_chunks(n.max(1))
+                .take(labels.len())
+                .map(|col| {
+                    Arc::new(Int64Array::from_iter(
+                        col.iter().map(|&k| (k != 0).then_some(k)),
+                    )) as ArrayRef
                 })
                 .collect();
-            columns.extend(counts);
+            columns.extend(arrays);
         }
         let geoms: Vec<Geometry<f64>> = ids
             .par_iter()
@@ -799,6 +816,8 @@ fn write_table(
         columns.push(builder.finish().to_array_ref());
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
         writer.write(&encoder.encode_record_batch(&batch).map_err(gpq)?)?;
+        // One row group per batch, so the writer buffers one batch at most.
+        writer.flush()?;
     }
     writer.append_key_value_metadata(encoder.into_keyvalue().map_err(gpq)?);
     writer.close()?;
@@ -1060,6 +1079,8 @@ mod tests {
             cells.windows(2).all(|w| w[0] < w[1]),
             "rows in cell id order"
         );
+        let groups = source.num_row_groups_total().unwrap();
+        assert_eq!(groups, 2, "one row group per written batch");
     }
 
     /// A float sum adds up the same way on any number of cores, even where

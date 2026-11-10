@@ -71,6 +71,15 @@ impl<W: Write + Send> BatchWriter<W> {
         self.0.write(batch)
     }
 
+    /// Close the buffered rows as a row group of their own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding or I/O error.
+    pub fn flush(&mut self) -> Result<(), ParquetError> {
+        self.0.flush()
+    }
+
     /// Add file metadata before closing the writer.
     pub fn append_key_value_metadata(&mut self, metadata: KeyValue) {
         self.0.append_key_value_metadata(metadata);
