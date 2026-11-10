@@ -2354,9 +2354,10 @@ fn seed_batch(
 /// its own bucket less what its encoding has freed, and the runs' nodes.
 /// Writes go in four passes, each in key order, with no workspace of their
 /// own: buckets of runs that already exist (they add no node), then new
-/// runs' buckets that free at least their node and whose frame fits the
-/// encoder's stage (freed before their run opens), then the other new runs'
-/// buckets that free at least their node, then the rest. The charge so stays
+/// runs' buckets that free at least their node before their run opens
+/// ([`freed_before_open`]), then the other new runs' buckets that free at
+/// least their node, then the rest. A write fails only when nothing left
+/// can free room for its run's node first. The charge so stays
 /// within the window's pending check until only the runs' nodes, which main
 /// also required, are left. Write order between tiles is immaterial.
 fn seed_serial(
@@ -2379,7 +2380,7 @@ fn seed_serial(
                 ))
                 .find(|&(&key, bucket)| match pass {
                     0 => tiles.contains_key(&key),
-                    1 => bytes(bucket) >= 512 && frame_bytes(bucket) <= FRAME_STAGE_BYTES,
+                    1 => freed_before_open(bucket) >= 512,
                     2 => bytes(bucket) >= 512,
                     _ => true,
                 })
@@ -2393,6 +2394,30 @@ fn seed_serial(
         }
     }
     Ok(())
+}
+
+/// What [`SpillBuckets::write_frame`] frees of `bucket` before its run opens
+/// at the stage's first flush: all of it when its frame fits the stage,
+/// otherwise the rings, and their shapes, it encodes whole before then.
+fn freed_before_open(bucket: &(Vec<Shape>, Vec<Collapsed>)) -> usize {
+    let (shapes, credits) = bucket;
+    if frame_bytes(bucket) <= FRAME_STAGE_BYTES {
+        return shape_capacity_bytes(shapes)
+            + credits.capacity() * std::mem::size_of::<Collapsed>();
+    }
+    let (mut staged, mut freed) = (8, 0);
+    for shape in shapes {
+        staged += 8;
+        for ring in shape {
+            staged += 8 + ring.len() * 16;
+            if staged > FRAME_STAGE_BYTES {
+                return freed;
+            }
+            freed += ring.capacity() * std::mem::size_of::<[f64; 2]>();
+        }
+        freed += shape.capacity() * std::mem::size_of::<Ring>();
+    }
+    freed
 }
 
 /// The bytes [`SpillBuckets::write_frame`] encodes for a bucket.
@@ -3704,6 +3729,25 @@ pub(super) mod tests {
         cost_probe::take();
         seed_serial(&mut buckets, pending, bytes).expect("the existing run makes room");
         assert!(cost_probe::take().seed_serial_peak <= bytes + 512);
+        assert_eq!(buckets.tiles.len(), 2);
+    }
+
+    /// #830 review: of two new runs' buckets larger than the stage, the one
+    /// that frees a whole ring before its run opens is written first.
+    #[test]
+    fn the_serial_seed_writes_first_what_frees_before_its_run_opens() {
+        let opts = super::super::ExportOptions::default();
+        let ring = |n: u32| -> Ring { (0..n).map(|i| [f64::from(i), 0.0]).collect() };
+        let mut pending = SeedBuckets::new();
+        pending.insert(1, (vec![vec![ring(600)]], Vec::new()));
+        pending.insert(2, (vec![vec![ring(300)], vec![ring(300)]], Vec::new()));
+        assert_eq!(freed_before_open(&pending[&1]), 0);
+        assert!(freed_before_open(&pending[&2]) >= 512);
+        let bytes: usize = pending.values().map(|(s, _)| shape_capacity_bytes(s)).sum();
+        let mut buckets = SpillBuckets::new(&opts, bytes);
+        cost_probe::take();
+        seed_serial(&mut buckets, pending, bytes).expect("the freeing bucket makes room");
+        assert!(cost_probe::take().seed_serial_peak <= bytes);
         assert_eq!(buckets.tiles.len(), 2);
     }
 
