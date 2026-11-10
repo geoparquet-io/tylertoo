@@ -663,8 +663,8 @@ pub struct ConvertOptions {
     /// Count a string column's values per cluster in `COL:value` INT64 columns.
     /// Keep up to 100 values, ranked by frequency then ascending value; count
     /// the rest, nulls, and literal `other` in `COL:other` when needed.
-    /// Null count cells mean zero; unclustered points count 1 for their own
-    /// value, and each row's counts sum to `point_count`.
+    /// Null count cells mean zero. A point outside any cluster counts 1
+    /// for its own value; each row's counts sum to `point_count`.
     /// Requires [`cluster`](Self::cluster). Off by default.
     #[cfg_attr(
         feature = "cli",

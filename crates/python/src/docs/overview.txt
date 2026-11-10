@@ -72,8 +72,8 @@ Args:
         columns, or `None` for off. Requires `cluster`. Keep up to 100
         values by frequency, breaking ties by ascending value; count the
         rest, nulls, and literal `other` in `COL:other` when needed.
-        Null count cells mean zero. Unclustered points count 1 for their
-        own value; each row's counts sum to `point_count`.
+        Null count cells mean zero. A point outside any cluster counts 1
+        for its own value; each row's counts sum to `point_count`.
     coalesce_lines: Join touching same-class lines at coarse levels,
         or `None` for on (off with `verbatim`). `True` is refused in
         partitioning mode.

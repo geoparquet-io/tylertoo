@@ -126,7 +126,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 * `cluster`: Merge each cell's points and add `point_count`.
 * `accumulate_attributes`: Aggregation method for each column in a cluster.
-* `cluster_categories`: String column to count per cluster in `COL:value` columns, or `None` for off. Requires `cluster`. Keep up to 100 values by frequency, breaking ties by ascending value; count the rest, nulls, and literal `other` in `COL:other` when needed. Null count cells mean zero. Unclustered points count 1 for their own value; each row's counts sum to `point_count`.
+* `cluster_categories`: String column to count per cluster in `COL:value` columns, or `None` for off. Requires `cluster`. Keep up to 100 values by frequency, breaking ties by ascending value; count the rest, nulls, and literal `other` in `COL:other` when needed. Null count cells mean zero. A point outside any cluster counts 1 for its own value; each row's counts sum to `point_count`.
 
 #### Line coalescing
 
