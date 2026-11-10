@@ -410,7 +410,7 @@ pub struct ExportOptions {
             &["web", "native", "min-size", "diffable", "fast-encoding"]
         )
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "MLT profile, refused without `--tile-format mlt`: `web` (default) targets GL JS before 6.0 with @maplibre/mlt 1.1, omits FastPFOR, FSST and shared dictionaries, and stores integer columns wider than 32 bits as doubles when every value is exact (absolute value at most 2^53), since GL JS reads 64-bit integers as BigInt and style expressions do not compare BigInt with numbers; mlt-core profiles: `native` for MapLibre Native with every codec and stored polygon triangles, `min-size` for smallest tiles, `diffable` for small binary diffs between releases, `fast-encoding` for quickest encoding", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "MLT profile, non-default profiles need `--tile-format mlt`: `web` (default) targets GL JS before 6.0 with @maplibre/mlt 1.1, omits FastPFOR, FSST and shared dictionaries, and stores integer columns wider than 32 bits as doubles when every value is exact (absolute value at most 2^53), since GL JS reads 64-bit integers as BigInt and style expressions do not compare BigInt with numbers; mlt-core profiles: `native` for MapLibre Native with every codec and stored polygon triangles, `min-size` for smallest tiles, `diffable` for small binary diffs between releases, `fast-encoding` for quickest encoding", long_help = None))]
     pub mlt_profile: MltProfile,
     /// Experimental (#750): draw, under each tile's own features below the
     /// finest zoom, the area its child tiles cover, built from the finest

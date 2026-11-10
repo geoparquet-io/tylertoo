@@ -90,7 +90,8 @@ Args:
         feature becomes column order. MLT archives use PMTiles tile
         type 6 and metadata format `"mlt"`. Merge refuses to combine
         MVT and MLT archives.
-    mlt_profile: MLT profile, refused unless `tile_format="mlt"`.
+    mlt_profile: MLT profile. Non-default profiles need
+        `tile_format="mlt"`.
         `"web"` (default) targets GL JS before 6.0, which decodes with
         @maplibre/mlt 1.1. It omits FastPFOR, FSST and shared
         dictionaries, and stores integer columns wider than 32 bits

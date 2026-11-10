@@ -1445,7 +1445,7 @@ Python's `tile_format='mlt'` on `convert()`, `export_pmtiles()` and
 Each tile is built as MVT, then converted with `mlt-core` before the size
 caps and gzip.
 
-`--mlt-profile` is refused without `--tile-format mlt`:
+Non-default `--mlt-profile` values need `--tile-format mlt`:
 
 | Value | Use |
 |-------|-----|
