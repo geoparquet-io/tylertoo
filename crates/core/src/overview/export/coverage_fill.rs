@@ -1892,7 +1892,9 @@ struct Slide<'a> {
     /// the next is built alone.
     oversized: &'a mut std::collections::BTreeSet<u64>,
     /// Tiles that missed their share, and the most ever in flight.
+    #[cfg(test)]
     misses: usize,
+    #[cfg(test)]
     peak: usize,
 }
 
@@ -1932,14 +1934,20 @@ fn slide_launch<'s, 'a: 's>(scope: &rayon::Scope<'s>, ctx: &'s SlideCtx<'a>, s: 
         let (seq, reserved) = (s.next_seq, s.commit.fixed(s.queue.len()));
         s.next_seq += 1;
         s.in_flight += 1;
-        s.peak = s.peak.max(s.in_flight);
+        #[cfg(test)]
+        {
+            s.peak = s.peak.max(s.in_flight);
+        }
         scope.spawn(move |scope| {
             let result = pyramid_tile(&path, key, ctx.step, ctx.timers, share, reserved, true);
             let mut s = ctx.lock();
-            s.misses += usize::from(matches!(
-                result,
-                Err(super::ExportError::BudgetExceeded { .. })
-            ));
+            #[cfg(test)]
+            {
+                s.misses += usize::from(matches!(
+                    result,
+                    Err(super::ExportError::BudgetExceeded { .. })
+                ));
+            }
             s.done.insert(seq, (key, path, result));
             let consumed = slide_commit(&mut s, ctx.step, share, ctx.workspace);
             slide_launch(scope, ctx, &mut s);
@@ -2060,7 +2068,9 @@ fn slide_window(
             stopped: false,
             error: None,
             oversized,
+            #[cfg(test)]
             misses: 0,
+            #[cfg(test)]
             peak: 0,
         }),
         step,
