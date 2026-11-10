@@ -2114,9 +2114,9 @@ mod golden_digest {
         // #850 re-pinned both: the chain budget's cells are laid in Web
         // Mercator and shared out in Z-order with a running total, and a
         // tile it would empty keeps one chain, so it keeps other chains.
-        assert_eq!(merged, 9558, "the generator must keep exercising joins");
+        assert_eq!(merged, 9580, "the generator must keep exercising joins");
         assert_eq!(
-            h, 0xf6bb_850a_0aee_d0a8,
+            h, 0xb72a_26f5_ca69_39de,
             "chain builder output changed against the pre-#570 golden digest"
         );
     }

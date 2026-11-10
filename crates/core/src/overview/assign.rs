@@ -2621,14 +2621,25 @@ const SUPERCELLS_PER_TILE: i64 = 1024 / SUPERCELL_GSD_FACTOR as i64;
 /// `super_m` is the cell's side in Web Mercator meters: the grid is laid in
 /// Mercator for either CRS, so its 8 × 8 blocks are the level's tiles.
 fn super_cell(cx: f64, cy: f64, super_m: f64, crs: Crs) -> SuperCell {
+    use crate::tile::WEBMERC_HALF_M as HALF;
     let (mx, my) = match crs {
         Crs::Epsg3857 => (cx, cy),
         Crs::Epsg4326 => super::convert::lnglat_to_webmerc(cx, cy),
     };
-    // y grows south and a cell holds its north edge, as a tile does.
+    // Cells across the world: a power of two on a zoom level, but its GSD
+    // carries the rounded 40,075,016.69 m circumference, so snap it, or the
+    // grid drifts off the exact tile edges.
+    let n = 2.0 * HALF / super_m;
+    let n = if (n - n.round()).abs() <= 1e-6 * n {
+        n.round()
+    } else {
+        n
+    };
+    // From the world's north-west corner, as tiles are counted: y grows
+    // south, and a cell holds its west and north edges.
     let (gx, gy) = (
-        (mx / super_m).floor() as i64,
-        (-my / super_m).floor() as i64,
+        ((mx + HALF) / (2.0 * HALF) * n).floor() as i64,
+        ((HALF - my) / (2.0 * HALF) * n).floor() as i64,
     );
     // The offset is a multiple of a tile, so a tile's cells stay aligned.
     let biased = |g: i64| g.saturating_add(1 << 31).clamp(0, i64::from(u32::MAX)) as u32;
@@ -4200,19 +4211,25 @@ mod tests {
     /// the tile floor and the Z-order runs follow the archive's tiles.
     #[test]
     fn super_cell_blocks_are_the_levels_tiles() {
-        for z in [4u8, 9, 13] {
-            let super_m = gsd(u32::from(z)) * SUPERCELL_GSD_FACTOR;
-            let half = 1i64 << (z - 1);
-            for (lng, lat) in [(-99.13, 19.43), (174.76, -36.85), (2.35, 48.86)] {
+        let side = |z: u8| gsd(u32::from(z)) * SUPERCELL_GSD_FACTOR;
+        // 90° east is the west edge of z2 tile x = 3, exactly.
+        let points = [
+            (-99.13, 19.43),
+            (174.76, -36.85),
+            (2.35, 48.86),
+            (90.0, 10.0),
+        ];
+        for z in [2u8, 4, 9, 13] {
+            for (lng, lat) in points {
                 let t = crate::tile::lng_lat_to_tile(lng, lat, z);
-                let (bx, by) = tile_of(&super_cell(lng, lat, super_m, Crs::Epsg4326));
-                assert_eq!((bx + half, by + half), (i64::from(t.x), i64::from(t.y)));
+                let block = tile_of(&super_cell(lng, lat, side(z), Crs::Epsg4326));
+                assert_eq!(block, (i64::from(t.x), i64::from(t.y)), "z{z} {lng},{lat}");
             }
         }
         // A cell holds its north edge, as a tile does: y = 0 is the top of
-        // the tile row south of the equator, and anything north of it is not.
-        let row = |y: f64| tile_of(&super_cell(100.0, y, 1000.0, Crs::Epsg3857)).1;
-        assert_eq!((row(0.0), row(1e-3)), (0, -1));
+        // the z4 tile row south of the equator, and anything north of it is not.
+        let row = |y: f64| tile_of(&super_cell(100.0, y, side(4), Crs::Epsg3857)).1;
+        assert_eq!((row(0.0), row(1e-3)), (8, 7));
     }
 
     /// #850: at gamma 1 (the tippecanoe preset's) an isolated group keeps
@@ -4822,12 +4839,14 @@ mod tests {
     fn small_shares_are_spread_along_the_cells() {
         // One tile of 64 one-feature cells, and a 4,000-feature cell in a
         // tile of its own: each small cell's share is 1000 / 4064 ≈ 0.25.
+        let side = gsd(10) * SUPERCELL_GSD_FACTOR;
         let mut grid: Vec<(i64, i64)> = (0..64).map(|i| (i % 8, i / 8)).collect();
         grid.push((800, 800));
-        let keys = cell_keys(&grid, 100.0);
+        let keys = cell_keys(&grid, side);
+        let big = cell_keys(&[(800, 800)], side)[0];
         let pops: Vec<usize> = keys
             .iter()
-            .map(|k| if k.1 == 800 { 4000 } else { 1 })
+            .map(|k| if *k == big { 4000 } else { 1 })
             .collect();
         let allocs = newcomer_allocs(&keys, &pops, &[], 1000, 1.0);
         assert_eq!(allocs.iter().sum::<usize>(), 1000);
