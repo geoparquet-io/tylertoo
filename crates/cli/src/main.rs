@@ -336,7 +336,7 @@ struct StatsArgs {
     archive: PathBuf,
 
     /// Number of largest tiles to list, ranked by stored size.
-    #[arg(long, value_name = "N", default_value = "10")]
+    #[arg(long, value_name = "N", default_value_t = tylertoo_core::internal::stats::DEFAULT_LARGEST)]
     largest: usize,
 
     /// Add per-zoom, per-layer feature counts, uncompressed bytes, and geometry
@@ -3555,6 +3555,31 @@ mod tests {
         ] {
             assert_eq!(publication_flags_of(&cmd), [false; 3], "{label}");
         }
+    }
+
+    /// `stats` and `tylertoo.stats()` take the same options with the same
+    /// defaults: core's keyword table, which the Python signature is built
+    /// from. `--json` is the CLI's output switch; Python always returns data.
+    #[test]
+    fn stats_flags_match_python_keywords() {
+        use clap::CommandFactory;
+        use tylertoo_core::internal::overview::config::keywords::command_defaults;
+        let cmd = StatsArgs::command();
+        let cli: std::collections::BTreeMap<String, serde_json::Value> = cmd
+            .get_arguments()
+            .filter_map(|a| Some((a.get_long()?, a)))
+            .filter(|(long, _)| *long != "json")
+            .map(|(long, a)| {
+                let default = match a.get_default_values() {
+                    [v] => serde_json::from_str(v.to_str().unwrap()).unwrap(),
+                    _ => serde_json::Value::Bool(false),
+                };
+                (long.replace('-', "_"), default)
+            })
+            .collect();
+        let python: std::collections::BTreeMap<String, serde_json::Value> =
+            command_defaults("stats").into_iter().collect();
+        assert_eq!(cli, python);
     }
 
     #[test]

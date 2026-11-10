@@ -17,7 +17,15 @@ from typing import Any, Literal, TypedDict
 
 from tylertoo import _tylertoo
 
-from ._tylertoo import convert, decode, export_pmtiles, overview, pyramid, validate
+from ._tylertoo import (
+    convert,
+    decode,
+    export_pmtiles,
+    overview,
+    pyramid,
+    stats,
+    validate,
+)
 
 __all__ = [
     "ConfigError",
@@ -45,6 +53,7 @@ __all__ = [
     "export_pmtiles",
     "overview",
     "pyramid",
+    "stats",
     "validate",
 ]
 
@@ -474,5 +483,13 @@ _defaults = _tylertoo._defaults
 # Use their original examples.
 __test__ = {
     function.__name__: function.__doc__ or ""
-    for function in (convert, decode, export_pmtiles, overview, pyramid, validate)
+    for function in (
+        convert,
+        decode,
+        export_pmtiles,
+        overview,
+        pyramid,
+        stats,
+        validate,
+    )
 }

@@ -27,13 +27,14 @@ import tylertoo
 
 # Workflow order, so the diff guard sees deterministic output: the
 # overview -> export path, multi-band pyramids, then decoding,
-# validation, and the deprecated one-shot.
+# validation, archive stats, and the deprecated one-shot.
 FUNCTION_ORDER = [
     "overview",
     "export_pmtiles",
     "pyramid",
     "decode",
     "validate",
+    "stats",
     "convert",
 ]
 

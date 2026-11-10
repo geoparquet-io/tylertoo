@@ -382,6 +382,10 @@ pub fn command_defaults(command: &str) -> Map<String, Value> {
             out.insert("generalize".into(), false.into());
             out
         }
+        "stats" => Map::from_iter([
+            ("largest".into(), crate::stats::DEFAULT_LARGEST.into()),
+            ("layers".into(), false.into()),
+        ]),
         "decode" => Map::from_iter([
             ("min_zoom".into(), Value::Null),
             ("max_zoom".into(), Value::Null),

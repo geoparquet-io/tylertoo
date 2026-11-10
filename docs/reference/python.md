@@ -419,6 +419,44 @@ Check an overview file against the overview format specification.
 True
 ```
 
+## `stats`
+
+```python
+stats(
+    archive: str,
+    *,
+    largest: int = 10,
+    layers: bool = False,
+) -> dict[str, Any]
+```
+
+Summarize tile sizes in a PMTiles archive.
+
+The Python form of `tylertoo stats`, returning the same dict as `stats --json`. Tile sizes come from the archive directory alone and measure stored compressed bytes per addressed tile. Run members and deduplicated tiles each count individually.
+
+### Parameters
+
+* `archive`: PMTiles archive to summarize.
+* `largest`: Number of largest tiles to return, or 0 for none. Defaults to 10.
+* `layers`: Decode each distinct stored tile body once and include per-layer statistics. Defaults to `False`.
+
+### Returns
+
+`dict[str, Any]`: A dict with `per_zoom` entries containing `z`, `tile_count`, `total_bytes`, `mean_bytes`, `p50_bytes`, `p99_bytes`, and `max_bytes`, and `largest` entries containing `z`, `x`, `y`, and `bytes`, ordered by stored size, largest first. With `layers=True`, also includes `per_layer` entries with `z`, `layer`, `feature_count`, `bytes` (the layer's uncompressed encoded size), and `geometry_types` (feature counts per `Point`, `LineString`, `Polygon`, or `Unknown`). These totals also count per addressed tile. `per_layer` is absent otherwise.
+
+### Raises
+
+* `ConfigError`: An unknown keyword or a bad value.
+* `RuntimeError`: Not a PMTiles archive, a damaged tile, a raster archive with `layers=True`, or reading failed.
+
+### Example
+
+```python
+>>> report = stats("buildings.pmtiles", layers=True)
+>>> report["per_layer"][0]["layer"]
+'overview'
+```
+
 ## `convert`
 
 ```python

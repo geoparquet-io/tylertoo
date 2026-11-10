@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
     reason = "#445: process-wide Python logging bridge reset handle"
 )]
 use std::sync::OnceLock;
+use tylertoo_core::internal::archive_index::ArchiveIndex;
 use tylertoo_core::internal::decode::{decode_pmtiles, DecodeError, DecodeOptions};
 use tylertoo_core::internal::error::{Classify, ErrorKind};
 use tylertoo_core::internal::input_set::ConvertSource;
@@ -49,6 +50,7 @@ use tylertoo_core::internal::overview::tiles::{
     TilesOptions, TilesOutcome,
 };
 use tylertoo_core::internal::pyramid::{build_pyramid, parse_bands, PyramidError};
+use tylertoo_core::internal::stats::compute_stats;
 
 pyo3::create_exception!(
     _tylertoo,
@@ -449,6 +451,34 @@ fn decode(
 }
 }
 
+signature_stats! {
+fn stats(
+    py: Python<'_>,
+    archive: &str,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyDict>> {
+    refresh_log_levels();
+    let values = keywords(kwargs)?;
+    let mut defaults = config_keywords::command_defaults("stats");
+    for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
+    defaults.extend(values);
+    let largest: usize = serde_json::from_value(defaults.remove("largest").unwrap()).map_err(|e| config_err(format!("largest: {e}")))?;
+    let layers: bool = serde_json::from_value(defaults.remove("layers").unwrap()).map_err(|e| config_err(format!("layers: {e}")))?;
+    let path = PathBuf::from(archive);
+    let report = py
+        .detach(|| {
+            let index = ArchiveIndex::open(&path)?;
+            compute_stats(&index, largest, layers)
+        })
+        .map_err(|e| {
+            let kind = tylertoo_core::internal::error::kind_of(&e).unwrap_or(ErrorKind::Runtime);
+            to_py(kind, format!("stats failed for '{archive}': {e}"), None)
+        })?;
+    // The same shape as the CLI's `stats --json`.
+    report_dict(py, &report)
+}
+}
+
 signature_pyramid! {
 fn pyramid(
     py: Python<'_>,
@@ -478,7 +508,14 @@ fn pyramid(
 #[pyfunction]
 fn _defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let out = PyDict::new(py);
-    for name in ["convert", "overview", "export_pmtiles", "pyramid", "decode"] {
+    for name in [
+        "convert",
+        "overview",
+        "export_pmtiles",
+        "pyramid",
+        "decode",
+        "stats",
+    ] {
         out.set_item(
             name,
             pythonize::pythonize(py, &config_keywords::command_defaults(name))?,
@@ -513,6 +550,7 @@ fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(pyramid, m)?)?;
+    m.add_function(wrap_pyfunction!(stats, m)?)?;
     m.add_function(wrap_pyfunction!(_defaults, m)?)?;
     Ok(())
 }

@@ -36,6 +36,10 @@ use crate::tile::hilbert_zoom_base;
 use crate::vector_tile::tile::{GeomType, Layer};
 use crate::Result;
 
+/// Largest tiles listed when the caller does not say (`stats --largest`,
+/// `tylertoo.stats(largest=)`).
+pub const DEFAULT_LARGEST: usize = 10;
+
 /// One zoom level's tile-size distribution, in STORED (compressed) bytes per
 /// addressed tile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
