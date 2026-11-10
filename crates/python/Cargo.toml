@@ -50,13 +50,15 @@ pythonize = "0.29"
 serde = { workspace = true }
 # Flat keyword values are normalized by core syntax adapters.
 serde_json = "1"
-mimalloc = { version = "0.1", optional = true }
+# local_dynamic_tls: a dlopen'd extension must not use initial-exec TLS,
+# which glibc fits into a small static block (#823's mlt-core TLS overflowed it).
+mimalloc = { version = "0.1", optional = true, features = ["local_dynamic_tls"] }
 
 # musllinux wheels: musl's mallocng fails small allocations under
 # multi-threaded fragmentation (#480), the failure the musl CLI binary avoids
 # with mimalloc. The wheel runs the same pipeline, so it gets the same fix.
 [target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = "0.1"
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 
 [lints]
 workspace = true
