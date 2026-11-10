@@ -453,10 +453,6 @@ impl Cells {
         parents
     }
 
-    fn capacity(&self) -> u64 {
-        self.0.iter().map(|m| m.capacity() as u64).sum()
-    }
-
     /// Heap bytes of every cell's category counts, by allocated capacity.
     fn category_bytes(&self) -> u64 {
         self.0
@@ -465,21 +461,26 @@ impl Cells {
             .sum()
     }
 
-    /// What holding these cells costs, with room for `incoming` more rows
-    /// (#332): the map's slots, `category_bytes` of counts, and per incoming
-    /// row a cell and its first counts both in a batch's partial map and as
-    /// a new cell here; a map that must grow to take them holds its old and
-    /// its doubled table at once.
-    fn bytes(&self, specs: usize, category_bytes: u64, incoming: usize) -> u64 {
-        let cap = self.capacity();
-        let need = (self.len() + incoming) as u64;
-        let slots = if need > cap {
-            cap + 2 * cap.max(need)
-        } else {
-            cap
-        };
-        let per_row = cell_bytes(specs) + FIRST_COUNTS_BYTES;
-        slots * cell_bytes(specs) + category_bytes + 2 * incoming as u64 * per_row
+    /// What holding these cells costs (#332): every shard's slots and
+    /// `category_bytes` of counts, with room for `incoming[s]` more cells in
+    /// shard `s`, each with its first counts. A shard that must grow to
+    /// take them holds its old and its doubled table at once.
+    fn bytes(&self, specs: usize, category_bytes: u64, incoming: &[usize]) -> u64 {
+        let incoming = incoming.iter().copied().chain(std::iter::repeat(0));
+        let (slots, new) =
+            self.0
+                .iter()
+                .zip(incoming)
+                .fold((0u64, 0u64), |(slots, new), (m, k)| {
+                    let (cap, need) = (m.capacity() as u64, (m.len() + k) as u64);
+                    let held = if need > cap {
+                        cap + 2 * cap.max(need)
+                    } else {
+                        cap
+                    };
+                    (slots + held, new + k as u64)
+                });
+        slots * cell_bytes(specs) + category_bytes + new * FIRST_COUNTS_BYTES
     }
 }
 
@@ -531,7 +532,7 @@ pub(crate) fn write_cell_tables(
         if to < res {
             // A rollup holds children and their parents at once; a parent
             // holds no more cells or category pairs than its children.
-            budget.require(MemoryPhase::Scan, 2 * cells.bytes(specs, cat_bytes, 0))?;
+            budget.require(MemoryPhase::Scan, 2 * cells.bytes(specs, cat_bytes, &[]))?;
             cells = cells.roll_up(system, res, to);
             cat_bytes = cells.category_bytes();
             res = to;
@@ -542,7 +543,7 @@ pub(crate) fn write_cell_tables(
             * (17 * labels.len() as u64 + 9 * specs as u64 + 512);
         budget.require(
             MemoryPhase::Scan,
-            cells.bytes(specs, cat_bytes, 0) + cells.len() as u64 * 16 + batch_bytes,
+            cells.bytes(specs, cat_bytes, &[]) + cells.len() as u64 * 16 + batch_bytes,
         )?;
         write_table(
             tables[usize::from(z - min_zoom)],
@@ -611,9 +612,11 @@ fn aggregate(
     let res = system.resolution(max_zoom);
     let specs = rollup.accumulate.len();
     let mut budget = MemoryBudget::probe();
+    // A small input is priced as the batches it can fill, not as full ones.
+    let total_rows = source.selected_row_count(None)?;
     let tuning = ReadTuning {
         budget,
-        batch_size: READ_ROWS,
+        batch_size: READ_ROWS.min(usize::try_from(total_rows).unwrap_or(READ_ROWS).max(1)),
         workers: super::convert::resolve_pass_read_workers(ReadPass::Scan, read.read_workers),
         avg_geom_bytes: None,
         footer: footer_price(&source, None, projection.iter().copied())?,
@@ -628,10 +631,13 @@ fn aggregate(
         let n = batch.num_rows();
         rows += n;
         // Checked before the batch lands, so a cell map that would outgrow
-        // the budget fails here, not by OOM kill.
+        // the budget fails here, not by OOM kill: first for the batch's
+        // partial maps at worst (a new cell per row), then, once they are
+        // built, for them as they are and the shards they grow.
+        let per_row = cell_bytes(specs) + FIRST_COUNTS_BYTES;
         budget.require(
             MemoryPhase::Scan,
-            cells.bytes(specs, cat_bytes, n) + interner.heap_bytes(),
+            cells.bytes(specs, cat_bytes, &[]) + interner.heap_bytes() + n as u64 * per_row,
         )?;
         let bschema = batch.schema();
         let col = |name: &str| bschema.index_of(name).map(|i| batch.column(i).clone());
@@ -697,6 +703,19 @@ fn aggregate(
             })
             .collect::<Result<_, ConvertError>>()?;
         skipped += chunks.iter().map(|c| c.1).sum::<usize>();
+        let mut incoming = vec![0usize; SHARDS];
+        let mut partial = 0u64;
+        for (maps, _) in &chunks {
+            for (s, m) in maps.iter().enumerate() {
+                incoming[s] += m.len();
+                partial += m.capacity() as u64 * cell_bytes(specs)
+                    + m.values().map(|c| c.cats.heap_bytes()).sum::<u64>();
+            }
+        }
+        budget.require(
+            MemoryPhase::Scan,
+            cells.bytes(specs, cat_bytes, &incoming) + interner.heap_bytes() + partial,
+        )?;
         cat_bytes += cells.absorb(chunks.into_iter().map(|c| c.0).collect());
         Ok(ReadFlow::Continue)
     })?;
@@ -1236,10 +1255,28 @@ mod tests {
         assert_eq!(tracked, cells.category_bytes());
         assert_eq!(tracked, 4 * FIRST_COUNTS_BYTES);
 
-        // A batch's worst case: every row a new cell, held in a partial map
-        // and in the map, which here must also grow.
+        // Ten new cells in an empty shard: it grows to hold them, old and
+        // doubled table at once, and each brings its first counts.
         let empty = Cells::new();
-        let per_row = cell_bytes(0) + FIRST_COUNTS_BYTES;
-        assert_eq!(empty.bytes(0, 0, 10), 20 * cell_bytes(0) + 20 * per_row);
+        assert_eq!(
+            empty.bytes(0, 0, &[10]),
+            20 * cell_bytes(0) + 10 * FIRST_COUNTS_BYTES
+        );
+
+        // A full shard grows even when the others have room to spare.
+        let mut uneven = Cells::new();
+        uneven.0[1] = CellMap::with_capacity(4096);
+        let mut id = 0u64;
+        while uneven.0[0].len() < uneven.0[0].capacity().max(1) {
+            uneven.0[0].insert(id, CellAcc::new(0));
+            id += 1;
+        }
+        let cap0 = uneven.0[0].capacity() as u64;
+        let still = uneven.bytes(0, 0, &[]);
+        let grown = uneven.bytes(0, 0, &[1]);
+        assert!(
+            grown - still >= 2 * cap0 * cell_bytes(0),
+            "{still} -> {grown}"
+        );
     }
 }
