@@ -283,18 +283,22 @@ impl Gates {
         options: &super::convert::ConvertOptions,
     ) -> Result<Self, ConvertError> {
         let filter = super::convert::bind_attribute_filter(options, schema, &[])?;
-        let crs = source.resolved_schema()?.crs();
+        // An unsupported CRS is refused here, from the footer, not by every
+        // layer after the split. The layers log the input's CRS warnings.
+        let (crs, _) = super::convert::crs_from_resolved(
+            source.resolved_schema()?,
+            &source.display_name(),
+            &crate::diagnostics::Diagnostics::silent(),
+        )?;
         let bbox = options
             .bbox
-            .zip(crs)
-            .map(|(b, crs)| super::convert::BboxQuery::new(&b, crs));
+            .map(|b| super::convert::BboxQuery::new(&b, crs));
         let row_groups = super::stream::select_row_groups_streaming(
             source,
             bbox.as_ref(),
             filter.as_ref(),
             None,
-            // Only a shard's bounds read the CRS, and there is no shard.
-            crs.unwrap_or(super::level::Crs::Epsg4326),
+            crs,
         )?;
         Ok(Self {
             filter,
@@ -1298,6 +1302,27 @@ mod tests {
                 TilesError::Convert(ConvertError::Properties(
                     super::super::properties::PropertySelectionError::RequiredByKnob { .. }
                 ))
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// An unsupported CRS is refused from the footer, before the split.
+    #[test]
+    fn an_unsupported_crs_is_refused_before_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("utm.parquet");
+        write_native_input(&input, "EPSG:32633", &[(500_000.0, 0.0, "soy")], &[]);
+        let err = convert_to_pmtiles(
+            &TilesInput::Path(input),
+            &dir.path().join("o.pmtiles"),
+            &options("crop"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TilesError::Convert(ConvertError::UnsupportedCrs { .. })
             ),
             "{err:?}"
         );
