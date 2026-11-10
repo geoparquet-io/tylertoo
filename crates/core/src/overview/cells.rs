@@ -509,6 +509,16 @@ pub(crate) fn write_cell_tables(
             cells = cells.roll_up(system, res, to);
             res = to;
         }
+        // Writing adds an id-ordered index of the cells and one batch's
+        // columns: counts (8 bytes plus null bits), rollups, id and outline.
+        let batch_bytes = WRITE_ROWS as u64 * (17 * labels.len() as u64 + 9 * specs as u64 + 512);
+        budget.require(
+            MemoryPhase::Scan,
+            cells.capacity() * cell_bytes(specs)
+                + cat_pairs * 12
+                + cells.len() as u64 * 16
+                + batch_bytes,
+        )?;
         write_table(
             tables[usize::from(z - min_zoom)],
             system,
