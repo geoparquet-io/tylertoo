@@ -66,6 +66,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -710,8 +711,17 @@ const DECODE_THREADS: usize = 16;
 /// would otherwise make one chunk of millions of tiles.
 const CHUNK_TILES: usize = 4096;
 
+/// Most decompressed tile bytes a chunk keeps decoded before [`for_each_tile`]
+/// hands them to its sink. A 2 MiB chunk of ordinary tiles inflates to tens
+/// of MiB; a crafted archive of highly compressible tiles (each capped at
+/// [`MAX_TILE_BYTES`] plain) could otherwise hold thousands of them decoded
+/// at once, where the serial walk held one.
+const CHUNK_DECODED_BYTES: usize = 256 << 20;
+
 #[cfg(test)]
 thread_local! {
+    /// Test override of [`CHUNK_DECODED_BYTES`].
+    static CHUNK_DECODED_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Chunks [`for_each_tile`] dispatched; a structural counter for tests.
     static CHUNKS_DISPATCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Test override of [`CHUNK_BYTES`].
@@ -748,6 +758,11 @@ where
     let chunk_bytes = CHUNK_BYTES_OVERRIDE
         .with(|c| c.get())
         .unwrap_or(chunk_bytes);
+    let decoded_cap = CHUNK_DECODED_BYTES;
+    #[cfg(test)]
+    let decoded_cap = CHUNK_DECODED_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or(decoded_cap);
     let threads = rayon::current_num_threads().min(DECODE_THREADS);
     let pool = (threads < rayon::current_num_threads())
         .then(|| rayon::ThreadPoolBuilder::new().num_threads(threads).build())
@@ -760,14 +775,16 @@ where
         Some(pool) => pool.install(|| run(job)),
         None => run(job),
     };
+    // An unreadable tile ends the walk after the tiles before it, which
+    // may hold an earlier error.
+    let mut stop = None;
+    // The tiles a chunk left undecoded past `decoded_cap`, which start the next.
+    let mut carry: Vec<(TileRef, Vec<u8>)> = Vec::new();
     loop {
-        let mut chunk = Vec::new();
-        let mut bytes = 0;
-        // An unreadable tile ends the walk after the tiles before it, which
-        // may hold an earlier error.
-        let mut stop = None;
+        let mut chunk = std::mem::take(&mut carry);
+        let mut bytes: usize = chunk.iter().map(|(_, body)| body.len()).sum();
         // Empty bodies weigh nothing, so the tile count is capped too.
-        while bytes < chunk_bytes && chunk.len() < CHUNK_TILES {
+        while stop.is_none() && bytes < chunk_bytes && chunk.len() < CHUNK_TILES {
             let body = match refs.next() {
                 None => break,
                 Some(tile) => tile.and_then(|tile| {
@@ -793,16 +810,32 @@ where
         #[cfg(test)]
         CHUNKS_DISPATCHED.with(|c| c.set(c.get() + 1));
         let prev = job.take();
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#817: a per-chunk count shared with its decode tasks"
+        )]
+        let decoded = std::sync::atomic::AtomicUsize::new(0);
         let step = || {
             rayon::join(
                 || run(prev),
                 || {
                     chunk
                         .par_iter()
-                        .map(|(tile, body)| {
-                            work(decode_tile_features(body, header, tile, options)?)
+                        .enumerate()
+                        .map(|(i, (tile, body))| {
+                            // Past the cap, a tile waits for the next chunk;
+                            // the first always decodes, so the walk advances.
+                            if i > 0 && decoded.load(Ordering::Relaxed) >= decoded_cap {
+                                return None;
+                            }
+                            Some(decode_tile_features(body, header, tile, options).and_then(
+                                |(features, plain)| {
+                                    decoded.fetch_add(plain, Ordering::Relaxed);
+                                    work(features)
+                                },
+                            ))
                         })
-                        .collect::<Vec<Result<T, DecodeError>>>()
+                        .collect::<Vec<Option<Result<T, DecodeError>>>>()
                 },
             )
         };
@@ -811,15 +844,19 @@ where
             None => step(),
         };
         prev?;
+        let taken = results.iter().take_while(|r| r.is_some()).count();
+        carry = chunk.split_off(taken);
         let done = chunk
             .into_iter()
-            .zip(results)
+            .zip(results.into_iter().flatten())
             .map(|((tile, _), r)| Ok((tile, r?)))
             .collect::<Result<Vec<_>, DecodeError>>()?;
         job = Some(sink(done)?);
-        if let Some(e) = stop {
-            in_pool(job)?;
-            return Err(e);
+        if carry.is_empty() {
+            if let Some(e) = stop {
+                in_pool(job)?;
+                return Err(e);
+            }
         }
     }
 }
@@ -933,7 +970,7 @@ fn decode_tile_features(
     header: &Header,
     tile: &TileRef,
     options: &DecodeOptions,
-) -> Result<Vec<(String, DecodedFeature)>, DecodeError> {
+) -> Result<(Vec<(String, DecodedFeature)>, usize), DecodeError> {
     let plain = decompress_capped(raw, header.tile_compression, MAX_TILE_BYTES)
         .map_err(|e| tile.decompress_error(e))?;
     let decoded = Tile::decode(plain.as_slice()).map_err(|source| DecodeError::Mvt {
@@ -1018,7 +1055,7 @@ fn decode_tile_features(
             ));
         }
     }
-    Ok(out)
+    Ok((out, plain.len()))
 }
 
 /// Fuzz hook (#424): decode one *uncompressed* MVT tile at `(z, x, y)`
@@ -1051,7 +1088,7 @@ pub fn fuzz_decode_tile(
         start: 0,
         len: plain.len(),
     };
-    let decoded = decode_tile_features(plain, &header, &tile, &DecodeOptions::default())?;
+    let (decoded, _) = decode_tile_features(plain, &header, &tile, &DecodeOptions::default())?;
     let with_geometry = decoded.iter().filter(|(_, f)| f.geometry.is_some()).count();
     Ok((decoded.len(), with_geometry))
 }
@@ -1083,7 +1120,7 @@ pub fn fuzz_decode_archive(bytes: &[u8]) -> Result<(usize, usize), DecodeError> 
         let tile = tile?;
         tiles += 1;
         let body = read_tile_body(&mut reader, &tile)?;
-        for (_layer, feature) in decode_tile_features(&body, &header, &tile, &options)? {
+        for (_layer, feature) in decode_tile_features(&body, &header, &tile, &options)?.0 {
             features += 1;
             for (key, value) in &feature.props {
                 if RESERVED_COLUMNS.contains(&key.as_str()) {
@@ -2121,6 +2158,57 @@ mod tests {
             tiles
         };
         assert_eq!((tiles, src.reads.get()), (40, 1));
+    }
+
+    /// #817 review: a chunk closes on its decoded bytes too, so tiles that
+    /// inflate far beyond their compressed size are not all held decoded at
+    /// once. Past the cap the rest of the chunk waits for the next one; the
+    /// sink sees the same tiles in the same order.
+    #[test]
+    fn a_chunk_closes_on_its_decoded_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::read(small_archive_of(dir.path(), 40)).unwrap();
+        let header = Header::from_bytes(&file[..HEADER_BYTES]).unwrap();
+        let entries = collect_entries(&file.as_slice(), &header).unwrap();
+        let walk = |cap: Option<usize>| {
+            // One thread, so tiles decode in order and the split is exact.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                CHUNK_DECODED_OVERRIDE.with(|c| c.set(cap));
+                let mut chunks = Vec::new();
+                for_each_tile(
+                    &file.as_slice(),
+                    &header,
+                    &entries,
+                    &DecodeOptions::default(),
+                    |features| Ok(features.len()),
+                    |chunk| {
+                        chunks.push(
+                            chunk
+                                .into_iter()
+                                .map(|(t, n)| (t.z, t.x, t.y, n))
+                                .collect::<Vec<_>>(),
+                        );
+                        Ok(|| Ok(()))
+                    },
+                )
+                .unwrap();
+                CHUNK_DECODED_OVERRIDE.with(|c| c.set(None));
+                chunks
+            })
+        };
+        let whole = walk(None);
+        let split = walk(Some(1));
+        assert_eq!(whole.len(), 1, "the fixture fits one chunk by bytes");
+        assert!(
+            split.iter().all(|c| c.len() == 1),
+            "{:?}",
+            split.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert_eq!(split.concat(), whole.concat());
     }
 
     /// roborev 368: a run of empty tile bodies weighs no bytes, so the tile
