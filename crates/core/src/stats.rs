@@ -371,9 +371,12 @@ fn mvt_layers(mut buf: &[u8]) -> std::result::Result<Vec<(Layer, u64)>, String> 
     while !buf.is_empty() {
         let (tag, wire) = decode_key(&mut buf).map_err(|e| e.to_string())?;
         // `Tile.layers` is field 3.
-        if tag != 3 || wire != WireType::LengthDelimited {
+        if tag != 3 {
             skip_field(wire, tag, &mut buf, DecodeContext::default()).map_err(|e| e.to_string())?;
             continue;
+        }
+        if wire != WireType::LengthDelimited {
+            return Err(format!("layer field has wire type {wire:?}"));
         }
         let len = decode_varint(&mut buf).map_err(|e| e.to_string())?;
         let len = usize::try_from(len)
@@ -788,6 +791,7 @@ mod tests {
         assert_eq!(layers[0].0.name, "r");
         assert_eq!(layers[0].1, layer.len() as u64);
         assert!(mvt_layers(&[3 << 3 | 2, 9, 0]).is_err());
+        assert!(mvt_layers(&[3 << 3, 0]).is_err(), "a varint layer field");
     }
 
     /// Without `layers`, the JSON report is the pre-#825 shape exactly.
