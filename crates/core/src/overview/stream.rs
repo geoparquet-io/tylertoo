@@ -2841,6 +2841,7 @@ fn preflight_with_memory_limit(
     // ceiling against actual values before narrowing, including skewed rows.
     let read_batch_rows = source.read_batch_rows(
         selected_row_groups.as_ref(),
+        None,
         options.read_batch_size,
         tylertoo_io::byte_array_limit(),
     )?;

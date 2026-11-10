@@ -427,7 +427,14 @@ pub(super) fn read_in_order_capped<F>(
 where
     F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
 {
-    let batch_size = tuning.batch_size.max(1);
+    // The reader's own plan (#858): the parallel merge regroups to the yield
+    // the sequential reader delivers, never past a narrow key (#857).
+    let batch_size = source.read_batch_rows(
+        row_groups,
+        projection,
+        tuning.batch_size.max(1),
+        tylertoo_io::byte_array_limit(),
+    )?;
     let shape = resolve_read_shape(tuning).capped(max_depth, batch_size);
     let parallel = reads_in_parallel(source, row_groups, projection, shape);
     if shape.workers > 1 && !parallel {
@@ -1189,6 +1196,44 @@ mod read_tests {
                 "--read-workers {workers} must cut the same batches as a single reader"
             );
             assert_eq!(got, reference);
+        }
+    }
+
+    /// #857: six 100-row groups, each with its own 100 `Dictionary(Int8, _)`
+    /// values. The reader plans 128-row batches; a merge regrouping to the
+    /// 8,192 rows asked for would join 600 distinct values and overflow.
+    #[test]
+    fn parallel_reads_stay_within_a_narrow_dictionary_key() {
+        use arrow_array::types::Int8Type;
+        use arrow_array::DictionaryArray;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.parquet");
+        let group = |start: i64| {
+            let names: Vec<String> = (start..start + 100).map(|i| format!("v{i}")).collect();
+            let names: DictionaryArray<Int8Type> = names.iter().map(String::as_str).collect();
+            RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(Int64Array::from_iter_values(start..start + 100)) as ArrayRef,
+                ),
+                ("name", Arc::new(names) as ArrayRef),
+            ])
+            .unwrap()
+        };
+        let mut w =
+            ArrowWriter::try_new(File::create(&path).unwrap(), group(0).schema(), None).unwrap();
+        for start in (0..600).step_by(100) {
+            w.write(&group(start)).unwrap();
+            w.flush().unwrap();
+        }
+        w.close().unwrap();
+        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        let reference = read_all(&source, 8_192, 1, None);
+        assert!(reference.0.iter().all(|&n| n <= 128), "{:?}", reference.0);
+        for workers in [2usize, 3, 4] {
+            let got = read_all(&source, 8_192, workers, None);
+            assert!(last_read_workers() > 1, "the fixture must read in parallel");
+            assert_eq!(got, reference, "--read-workers {workers}");
         }
     }
 

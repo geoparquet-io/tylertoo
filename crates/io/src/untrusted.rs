@@ -1266,10 +1266,10 @@ pub fn read_batch_plan(
 /// buffered row in pass 2.
 ///
 /// A read column with 8- or 16-bit dictionary keys holds both to the rows
-/// its keys can index and joins nothing past the decode: a batch, here or in
-/// a caller's regrouping, can then hold no more distinct values than the key
-/// indexes, which the cast back would refuse (#857). Only a dictionary
-/// nested in a list can still pass it.
+/// its keys can index: a batch, here or in a caller's regrouping to the
+/// yield, can then hold no more distinct values than the key indexes, which
+/// the cast back would refuse (#857). Only a dictionary nested in a list can
+/// still pass it.
 fn batch_plan(
     reader: &ReaderMetadata,
     row_groups: Option<&[usize]>,
@@ -1381,13 +1381,11 @@ fn batch_plan(
                 .any(|leaf| descr.get_column_root_idx(leaf) == *root && read(&leaf))
         })
         .filter_map(|(_, f)| dictionary_capacity(f.data_type()))
-        .min();
-    match capacity {
-        // No more rows than the key indexes: however a batch is cut and
-        // joined, it holds no more distinct values (#857).
-        Some(capacity) => (decode.min(capacity), decode.min(capacity)),
-        None => (decode, joined),
-    }
+        .min()
+        .unwrap_or(usize::MAX);
+    // No more rows than the key indexes: however a batch is cut and joined,
+    // it holds no more distinct values (#857).
+    (decode.min(capacity), joined.min(capacity))
 }
 
 /// The byte-array column that holds the most decoded bytes in total over some
@@ -2236,7 +2234,7 @@ mod tests {
     /// Int8 key on the cast back; a narrow-key schema plans and yields its
     /// decode size.
     #[test]
-    fn narrow_dictionaries_are_not_joined_past_their_key() {
+    fn narrow_dictionaries_join_no_more_rows_than_their_key() {
         use arrow_array::builder::{Int64Builder, ListBuilder};
         use arrow_array::types::Int8Type;
         use arrow_array::{ArrayRef, DictionaryArray};
@@ -2275,8 +2273,9 @@ mod tests {
         let source = open_parquet(file).unwrap();
         let limit = byte_array_limit();
         let (decode, join) = batch_plan(&source.metadata, None, None, DEFAULT_BATCH_ROWS, limit);
-        // Callers regroup to the plan's yield too (core's `Regrouper`).
-        assert!(decode < 100 && join == decode, "({decode}, {join})");
+        // The lists still join, to the 128 rows an Int8 key indexes; callers
+        // regroup to the plan's yield too (core's `Regrouper`).
+        assert!(decode < 100 && join == 128, "({decode}, {join})");
         // Unread, the dictionary does not hold the lists back.
         let lists = ProjectionMask::leaves(source.metadata().file_metadata().schema_descr(), [1]);
         let (_, join) = batch_plan(
