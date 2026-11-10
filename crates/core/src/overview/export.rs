@@ -7579,6 +7579,17 @@ fn shared_tile_members(
 ) -> Vec<(u64, MemberGeom)> {
     let g = finest_zoom_geometry(source, finest, opts, diagnostics);
     let pieces = feature_tile_pieces(&g, zoom, opts, key_lo, key_hi, diagnostics);
+    // A point holds no coordinate heap: sharing it would only add the
+    // `Arc`'s allocation.
+    if matches!(*g, Geometry::Point(_)) {
+        return pieces
+            .into_iter()
+            .map(|(key, piece)| match piece {
+                TilePiece::Whole => (key, MemberGeom::Owned(g.clone().into_owned())),
+                TilePiece::Clipped(g) => (key, MemberGeom::Owned(g)),
+            })
+            .collect();
+    }
     let whole = pieces
         .iter()
         .any(|(_, piece)| matches!(piece, TilePiece::Whole))
@@ -14673,8 +14684,17 @@ mod tests {
     fn tiles_holding_a_feature_whole_share_its_geometry() {
         let opts = ExportOptions::default();
         let zoom = 4;
+        let square = |x: f64, y: f64| {
+            Geometry::Polygon(
+                geo::Rect::new(
+                    geo::coord! { x: x, y: y },
+                    geo::coord! { x: x + 1e-6, y: y + 1e-6 },
+                )
+                .to_polygon(),
+            )
+        };
         // On the x=7 | x=8 border: inside both tiles' buffers.
-        let source = Arc::new(Geometry::Point(geo::Point::new(1e-6, 10.0)));
+        let source = Arc::new(square(1e-7, 10.0));
         let members = shared_tile_members(
             &source,
             None,
@@ -14719,7 +14739,7 @@ mod tests {
         // On the world edge, the stored copy's tile shares it; the shifted
         // copy in the far tile's buffer is its own.
         let lng = 180.0 - 0.5 * buffer_deg_at_zoom(zoom, &opts);
-        let source = Arc::new(Geometry::Point(geo::Point::new(lng, 10.0)));
+        let source = Arc::new(square(lng, 10.0));
         let members = shared_tile_members(
             &source,
             None,
@@ -14731,6 +14751,21 @@ mod tests {
         let y = crate::tile::lng_lat_to_tile(lng, 10.0, zoom).y;
         assert!(shared(&members, tile_key(15, y, zoom), &source));
         assert!(!shared(&members, tile_key(0, y, zoom), &source));
+
+        // A point has no coordinates to share: each tile holds it inline.
+        let source = Arc::new(Geometry::Point(geo::Point::new(1e-6, 10.0)));
+        let members = shared_tile_members(
+            &source,
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(members.len(), 2);
+        assert!(members
+            .iter()
+            .all(|(_, g)| matches!(g, MemberGeom::Owned(_))));
     }
 
     /// Tile buffers continue across the antimeridian. A point just west of
