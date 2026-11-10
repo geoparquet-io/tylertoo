@@ -802,7 +802,7 @@ pub(crate) fn url_scheme(input: &str) -> Option<&str> {
 /// So that a re-signed URL still matches its plan while `?file=a` and
 /// `?file=b` do not, the parameters a re-signing does not change are hashed
 /// into a tag, `?<redacted:1a2b3c4d>`; the signing parameters
-/// ([`is_signing_param`]) are left out. A signing parameter missing from that
+/// ([`signing_params`]) are left out. A signing parameter missing from that
 /// list only makes a re-signed URL fail its plan check, loudly.
 pub fn redact_query(input: &str) -> std::borrow::Cow<'_, str> {
     let end = input.find('#').unwrap_or(input.len());
@@ -812,10 +812,12 @@ pub fn redact_query(input: &str) -> std::borrow::Cow<'_, str> {
     else {
         return input.into();
     };
+    let params: Vec<&str> = input[q + 1..end].split('&').collect();
+    let signing = signing_params(&params);
     // In URL order: an endpoint can select by order (the last `file=` wins).
-    let kept: Vec<&str> = input[q + 1..end]
-        .split('&')
-        .filter(|p| !p.is_empty() && !is_signing_param(p))
+    let kept: Vec<&str> = params
+        .into_iter()
+        .filter(|p| !p.is_empty() && !signing(&param_name(p)))
         .collect();
     let tag = if kept.is_empty() {
         String::new()
@@ -827,21 +829,31 @@ pub fn redact_query(input: &str) -> std::borrow::Cow<'_, str> {
     format!("{}?<redacted{tag}>{}", &input[..q], &input[end..]).into()
 }
 
-/// Whether a query parameter is one a presigned URL's signer sets, so that
-/// re-signing changes it: S3's `X-Amz-*`, GCS's `X-Goog-*`, and Azure SAS's
-/// signature, validity window and signing-key fields.
-fn is_signing_param(param: &str) -> bool {
-    let name = param
+/// Which parameters of a query its signer set, so that re-signing changes
+/// them: S3's `X-Amz-*`, GCS's `X-Goog-*`, and Azure SAS's signature,
+/// validity window and signing-key fields. Each set counts only when its
+/// signature is there: on an unsigned API, `st=2025` may pick the object.
+fn signing_params(params: &[&str]) -> impl Fn(&str) -> bool {
+    let has = |name: &str| params.iter().any(|p| param_name(p) == name);
+    let (s3, gcs, sas) = (has("x-amz-signature"), has("x-goog-signature"), has("sig"));
+    move |name: &str| {
+        (s3 && name.starts_with("x-amz-"))
+            || (gcs && name.starts_with("x-goog-"))
+            || (sas
+                && matches!(
+                    name,
+                    "sig" | "se" | "st" | "sv" | "skt" | "ske" | "skoid" | "sktid" | "sks" | "skv"
+                ))
+    }
+}
+
+/// A query parameter's name, lowercased.
+fn param_name(param: &str) -> String {
+    param
         .split('=')
         .next()
         .unwrap_or(param)
-        .to_ascii_lowercase();
-    name.starts_with("x-amz-")
-        || name.starts_with("x-goog-")
-        || matches!(
-            name.as_str(),
-            "sig" | "se" | "st" | "sv" | "skt" | "ske" | "skoid" | "sktid" | "sks" | "skv"
-        )
+        .to_ascii_lowercase()
 }
 
 /// A [`ChunkReader`] over an [`InputSource`]: the type the parquet reader
@@ -4616,6 +4628,9 @@ mod tests {
         assert_eq!(pick("file=a&sig=x"), pick("sig=y&file=a"));
         // Order can select: some endpoints take the last of a repeated key.
         assert_ne!(pick("file=a&file=b"), pick("file=b&file=a"));
+        // A signing field's name means nothing without its signature.
+        assert_ne!(pick("st=2025"), pick("st=2026"));
+        assert_ne!(pick("X-Amz-Date=1"), pick("X-Amz-Date=2"));
         for shown in [s3("aaa", "1"), sas("aaa", "1"), pick("file=a&sig=x")] {
             assert!(!shown.contains("aaa") && !shown.contains("file"), "{shown}");
         }
