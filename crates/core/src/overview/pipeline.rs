@@ -76,6 +76,9 @@ pub(super) struct BufferOptions<'a> {
     pub(super) backing: SinkBacking,
     pub(super) out_schema: &'a Schema,
     pub(super) spill_dir: Option<&'a Path>,
+    /// Row groups the drain may encode at once
+    /// ([`MemoryBudget::drain_encodes`](super::memory::MemoryBudget::drain_encodes)).
+    pub(super) drain_encodes: usize,
 }
 
 /// How a level's buffered output is held until it is written.
@@ -1226,6 +1229,7 @@ pub(super) fn run_pass2_buffered(
         backing,
         out_schema,
         spill_dir,
+        drain_encodes,
     } = inputs;
     let num_levels = ctxs.len();
     debug_assert_eq!(num_levels, hints.len());
@@ -1380,6 +1384,9 @@ pub(super) fn run_pass2_buffered(
     // buffered level is skipped and renumbered by the writer (#211); the
     // outcome is threaded back to the caller with the level's stats.
     let mut outcomes = Vec::with_capacity(num_levels);
+    // #817 B1: the read is over, so the drain encodes on its grants' bytes.
+    let writer_units = writer.encode_concurrency();
+    writer.set_encode_concurrency(drain_encodes);
     for li in 0..num_levels {
         let sink = std::mem::replace(&mut sinks[li], LevelSink::Ram(Vec::new()));
         let t_drain_level = Instant::now();
@@ -1392,6 +1399,7 @@ pub(super) fn run_pass2_buffered(
         );
         outcomes.push(outcome);
     }
+    writer.set_encode_concurrency(writer_units);
 
     if let Some(per_row) = tuner.bytes_per_row() {
         // #626: the number the up-front estimate could only guess at. Info
@@ -1460,21 +1468,27 @@ fn drain_sink(
             // deliberately: excluding it would mean splitting the join out of
             // the drain timer and losing the (real) wall time the drain spends
             // waiting, which is the thing the drain counter exists to show.
-            let (mut reader, _temp) = state.into_reader(timers)?;
-            let err: std::cell::RefCell<Option<ConvertError>> = std::cell::RefCell::new(None);
-            let iter = std::iter::from_fn(|| match reader.next() {
-                None => None,
-                Some(Ok(b)) => Some(b),
-                Some(Err(e)) => {
-                    *err.borrow_mut() = Some(ConvertError::Arrow(e));
-                    None
-                }
-            });
-            let res = writer.write_level(level_idx, Some(hint), iter);
-            if let Some(e) = err.borrow_mut().take() {
-                return Err(e); // spill read error takes precedence over the writer's
-            }
-            res?
+            let (reader, _temp) = state.into_reader(timers)?;
+            // #817 B1: the spill decodes on its own thread, so the writer's
+            // thread only feeds row groups (on Oregon roads the decode was
+            // most of what it did). A read error ends the stream and, as the
+            // producer's, takes precedence over the writer's.
+            scoped_pipe(
+                SPILL_QUEUE_DEPTH,
+                move |tx: &Sender<RecordBatch>| -> Result<(), ConvertError> {
+                    for batch in reader {
+                        #[cfg(test)]
+                        spill_tests::note_decode();
+                        if tx.send(batch?).is_err() {
+                            break; // the writer failed; its error is reported
+                        }
+                    }
+                    Ok(())
+                },
+                |rx: Receiver<RecordBatch>| {
+                    Ok(writer.write_level(level_idx, Some(hint), rx.into_iter())?)
+                },
+            )?
         }
     };
     Pass2Timers::add_dur(timers.drain_cell(), t_drain.elapsed());
@@ -1497,6 +1511,44 @@ mod spill_tests {
     type SpillObservations = std::collections::BTreeMap<std::path::PathBuf, Vec<(u64, u64)>>;
     static OBSERVED: std::sync::Mutex<SpillObservations> =
         std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    thread_local! {
+        /// Spilled batches decoded on this thread (#817 B1).
+        static DECODED_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn note_decode() {
+        DECODED_HERE.with(|c| c.set(c.get() + 1));
+    }
+
+    /// #817 B1: a spilled level decodes on its own thread, not on the one
+    /// that feeds the writer (the drain's critical path: Oregon roads spent
+    /// 1.2 of its 1.5 core-seconds there decoding).
+    #[test]
+    fn spill_decodes_off_the_draining_thread() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let geoms: Vec<_> = (0..2000)
+            .map(|i| {
+                let x = f64::from(i % 50) * 0.01;
+                let y = f64::from(i / 50) * 0.01;
+                Some(geo::Geometry::Point(geo::Point::new(x, y)))
+            })
+            .collect();
+        crate::overview::testutil::write_input(tin.path(), &geoms, true, None);
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let options = crate::overview::convert::ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: crate::overview::convert::LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            profile: MemoryProfile::Bounded,
+            ..Default::default()
+        };
+        DECODED_HERE.with(|c| c.set(0));
+        crate::overview::convert::convert_to_overviews(tin.path(), tout.path(), &options).unwrap();
+        assert_eq!(DECODED_HERE.with(std::cell::Cell::get), 0);
+    }
 
     pub(super) fn record_spill(temp: &NamedTempFile, rows: u64) {
         if let Some(observations) = OBSERVED

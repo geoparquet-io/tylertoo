@@ -123,6 +123,10 @@ struct Pass2Inputs<'a> {
     geom_bytes: u64,
     /// What the footers say pass 2 decodes ([`footer_price`]).
     footer: Option<FooterPrice>,
+    /// The writer's row-group encode grant (#817 B1: the drain widens it).
+    encode: Grant,
+    /// What one more drain encode holds ([`drain_slot_price`]).
+    drain_slot_bytes: u64,
 }
 
 struct AssignmentInputs<'a> {
@@ -1564,6 +1568,8 @@ fn run_pass2_levels(
         num_rows,
         geom_bytes,
         footer,
+        encode,
+        drain_slot_bytes,
     } = inputs;
     let n = ctxs.len();
     // #626: filled in by the buffered engine. Stays at its default for the
@@ -1678,6 +1684,12 @@ fn run_pass2_levels(
                         backing,
                         out_schema,
                         spill_dir: options.spill_dir.as_deref(),
+                        drain_encodes: MemoryBudget::drain_encodes(
+                            encode,
+                            drain_slot_bytes,
+                            grants.read.bytes().saturating_add(grants.window.bytes()),
+                            rayon::current_num_threads(),
+                        ),
                     },
                 );
                 grants.release(&mut budget);
@@ -1873,6 +1885,10 @@ struct LevelWriter {
     /// parquet's row-group ceiling — see
     /// [`ConvertReport::effective_max_row_group_size`].
     effective_max_row_group_size: Option<usize>,
+    /// What `writer`'s encode concurrency was granted.
+    encode: Grant,
+    /// What one more pass-2 drain encode holds ([`drain_slot_price`]).
+    drain_slot_bytes: u64,
 }
 
 /// #541: apply a convert-side zoom ceiling to the planned levels. Returns how
@@ -2121,6 +2137,7 @@ fn create_level_writer(
         rayon::current_num_threads(),
         encode_price(&writer_opts, &level_row_counts, row_bytes),
     );
+    let drain_slot_bytes = drain_slot_price(&writer_opts, &level_row_counts, row_bytes).bytes;
     log::info!(
         "[convert] writer: {} concurrent row-group encode(s) x {} B, {} B left",
         encodes.units,
@@ -2146,6 +2163,8 @@ fn create_level_writer(
         out_schema,
         non_geom_cols,
         effective_max_row_group_size,
+        encode: encodes,
+        drain_slot_bytes,
     })
 }
 
@@ -2169,6 +2188,32 @@ fn encode_price(
     level_row_counts: &[usize],
     row_bytes: Option<u64>,
 ) -> Price {
+    encode_price_at_least(writer_opts, level_row_counts, row_bytes, 1)
+}
+
+/// What one encode slot holds once pass 2's drain widens the writer (#817
+/// B1): a slot also admits one WKB chunk of up to
+/// [`WKB_ENCODE_CHUNK_ROWS`](super::writer::WKB_ENCODE_CHUNK_ROWS) rows, so
+/// a level of small row groups is priced at the chunk, not the group.
+fn drain_slot_price(
+    writer_opts: &OverviewWriterOptions,
+    level_row_counts: &[usize],
+    row_bytes: Option<u64>,
+) -> Price {
+    encode_price_at_least(
+        writer_opts,
+        level_row_counts,
+        row_bytes,
+        super::writer::WKB_ENCODE_CHUNK_ROWS as u64,
+    )
+}
+
+fn encode_price_at_least(
+    writer_opts: &OverviewWriterOptions,
+    level_row_counts: &[usize],
+    row_bytes: Option<u64>,
+    min_rows: u64,
+) -> Price {
     let finest_zoom = writer_opts.levels.last().and_then(|l| l.zoom);
     let largest = writer_opts
         .levels
@@ -2187,6 +2232,7 @@ fn encode_price(
         .max()
         .unwrap_or(0)
         .max(1) as u64;
+    let largest = largest.max(min_rows);
     match row_bytes {
         Some(row) => Price::new(
             largest
@@ -3677,6 +3723,8 @@ pub(crate) fn run_stages(
         out_schema,
         non_geom_cols,
         effective_max_row_group_size,
+        encode,
+        drain_slot_bytes,
     } = create_level_writer(
         output_path,
         &descriptor,
@@ -3750,6 +3798,8 @@ pub(crate) fn run_stages(
             num_rows,
             geom_bytes,
             footer,
+            encode,
+            drain_slot_bytes,
         },
         strategy,
     )?;
@@ -10028,6 +10078,58 @@ mod tests {
         assert!(
             super::super::accumulate::rendezvous::met(),
             "the 4 drops never ran at once"
+        );
+    }
+
+    /// #817 B1 review: a widened drain slot also admits a WKB chunk of up to
+    /// 10,000 rows, so a ladder of 128-row groups must not price the slot
+    /// at 128 rows (the drain would hold far more than the read it reuses).
+    #[test]
+    fn drain_slot_is_priced_at_least_at_a_wkb_chunk() {
+        let mut opts = OverviewWriterOptions::new(Mode::Duplicating, three_levels());
+        opts.max_row_group_size = 128;
+        let counts = [1_000usize, 50_000, 200_000];
+        let row = Some(100u64);
+        let group = encode_price(&opts, &counts, row).bytes;
+        let slot = drain_slot_price(&opts, &counts, row).bytes;
+        assert!(group < slot, "group {group} B vs slot {slot} B");
+        assert_eq!(slot, 10_000 * 100 * ENCODE_COPIES);
+    }
+
+    /// #817 B1: under `bounded` the writer may encode `ENCODE_FLOOR` (4) row
+    /// groups at once, and pass 2's spilled levels drained through those 4
+    /// while 60 cores sat idle (Oregon roads: 2.5 s of a 10 s run). By the
+    /// drain the read-ahead and compute window are empty, so the drain
+    /// encodes on their bytes: more than 4 row groups at once.
+    #[test]
+    fn bounded_drain_encodes_beyond_the_writer_grant() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &point_geoms(3000), true, None);
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let options = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            profile: MemoryProfile::Bounded,
+            max_row_group_size: 8,
+            ..ConvertOptions::default()
+        };
+        let pool = super::super::accumulate::rendezvous::pool(8);
+        let _guard = super::super::accumulate::rendezvous::arm("encode row group", 5);
+        pool.install(|| {
+            super::super::convert::convert_to_overviews_strategy(
+                tin.path(),
+                tout.path(),
+                &options,
+                Pass2Strategy::Pipelined,
+            )
+            .unwrap();
+        });
+        assert!(
+            super::super::accumulate::rendezvous::met(),
+            "the bounded drain never had 5 row groups encoding at once"
         );
     }
 

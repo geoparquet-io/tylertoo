@@ -651,6 +651,18 @@ impl<W: Write + Send> OverviewWriter<W> {
         self.options.levels.len()
     }
 
+    /// Row groups that may encode at once (#296), as granted.
+    pub(super) fn encode_concurrency(&self) -> usize {
+        self.options.encode_concurrency
+    }
+
+    /// Re-grant the encode concurrency between levels (#817 B1): pass 2's
+    /// drain reuses the bytes its finished read held. Boundaries are decided
+    /// serially, so the file is identical at any value.
+    pub(super) fn set_encode_concurrency(&mut self, units: usize) {
+        self.options.encode_concurrency = units.max(1);
+    }
+
     /// Test-only: arm the encode-task fault injection (#426).
     #[cfg(test)]
     pub(super) fn set_encode_faults(&mut self, faults: EncodeFaults) {

@@ -443,6 +443,25 @@ impl MemoryBudget {
             threads.min(ENCODE_FLOOR),
         )
     }
+    /// Row groups pass 2's buffered drain may encode at once (#817 B1): the
+    /// writer's `encode` grant plus as many more slots of `slot_bytes` (at
+    /// least the grant's own unit) as `reused` bytes hold, at most `threads`.
+    /// `reused` is what the finished read was granted (its read-ahead and
+    /// compute window are empty by the drain), so the drain spends bytes
+    /// pass 2 already holds and charges nothing new.
+    pub(super) fn drain_encodes(
+        encode: Grant,
+        slot_bytes: u64,
+        reused: u64,
+        threads: usize,
+    ) -> usize {
+        let slot = slot_bytes.max(encode.unit_bytes).max(1);
+        let extra = usize::try_from(reused / slot).unwrap_or(usize::MAX);
+        encode
+            .units
+            .saturating_add(extra)
+            .min(threads.max(encode.units))
+    }
     pub(super) fn require(&self, phase: MemoryPhase, needed: u64) -> Result<(), ConvertError> {
         if let Some(available) = self.available() {
             if needed > available {
@@ -471,6 +490,22 @@ impl MemoryBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_encodes_adds_what_the_reused_bytes_hold_up_to_the_threads() {
+        let encode = Grant {
+            phase: MemoryPhase::Encode,
+            units: 4,
+            unit_bytes: 100,
+        };
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 0, 64), 4);
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 399, 64), 7);
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 64), 64);
+        // A slot costing more than the grant's unit (a WKB chunk) buys fewer.
+        assert_eq!(MemoryBudget::drain_encodes(encode, 200, 399, 64), 5);
+        // Never below the writer's own grant, even on fewer threads.
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 2), 4);
+    }
 
     #[test]
     fn budget_exceeded_names_each_phase() {
