@@ -55,7 +55,7 @@ const PYTHON_LOSS_SHARE: f64 = 0.10;
 
 /// Fewest row groups a non-`speed` writer encodes at once, pool permitting:
 /// #545's A/B kept 4 as the point below which the drain serializes.
-const ENCODE_FLOOR: usize = 4;
+pub(super) const ENCODE_FLOOR: usize = 4;
 
 /// Fraction of the probed memory export's waves, level stores and tile
 /// encodes may hold (#303, #311, #788 E1), as export's own budget always
@@ -446,16 +446,23 @@ impl MemoryBudget {
     /// Row groups pass 2's buffered drain may encode at once (#817 B1): the
     /// writer's `encode` grant plus as many more slots of `slot_bytes` (at
     /// least the grant's own unit) as `reused` bytes hold, at most `threads`.
-    /// `reused` is what the finished read was granted (its read-ahead and
-    /// compute window are empty by the drain), so the drain spends bytes
-    /// pass 2 already holds and charges nothing new.
+    /// `reused` is what the finished read's read-ahead and compute window
+    /// actually held (empty by the drain), capped at their grants: the
+    /// grants alone overstate it (bounded Moldova: 2.1 GB granted, a 1.94 GB
+    /// pass-2 peak in all), and spending them raised the run's peak. It is
+    /// also capped at `below_peak` (how far the process sits below its peak
+    /// RSS) less the `encode` grant's own slots, which the drain spends
+    /// anyway, so the whole drain fits under the peak.
     pub(super) fn drain_encodes(
         encode: Grant,
         slot_bytes: u64,
         reused: u64,
+        below_peak: u64,
         threads: usize,
     ) -> usize {
         let slot = slot_bytes.max(encode.unit_bytes).max(1);
+        let reused =
+            reused.min(below_peak.saturating_sub((encode.units as u64).saturating_mul(slot)));
         let extra = usize::try_from(reused / slot).unwrap_or(usize::MAX);
         encode
             .units
@@ -498,13 +505,34 @@ mod tests {
             units: 4,
             unit_bytes: 100,
         };
-        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 0, 64), 4);
-        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 399, 64), 7);
-        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 64), 64);
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 0, u64::MAX, 64), 4);
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 399, u64::MAX, 64), 7);
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 0, 1 << 40, u64::MAX, 64),
+            64
+        );
         // A slot costing more than the grant's unit (a WKB chunk) buys fewer.
-        assert_eq!(MemoryBudget::drain_encodes(encode, 200, 399, 64), 5);
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 200, 399, u64::MAX, 64),
+            5
+        );
+        // The whole drain, the grant's own 4 included, fits below the peak.
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 500, 64), 5);
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 300, 64), 4);
+        // The grant's own slots also admit WKB chunks, so they cost `slot` too.
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 200, 1 << 40, 600, 64),
+            4
+        );
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 200, 1 << 40, 1_000, 64),
+            5
+        );
         // Never below the writer's own grant, even on fewer threads.
-        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 2), 4);
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 0, 1 << 40, u64::MAX, 2),
+            4
+        );
     }
 
     #[test]

@@ -76,9 +76,10 @@ pub(super) struct BufferOptions<'a> {
     pub(super) backing: SinkBacking,
     pub(super) out_schema: &'a Schema,
     pub(super) spill_dir: Option<&'a Path>,
-    /// Row groups the drain may encode at once
+    /// Row groups the drain may encode at once, given the input bytes the
+    /// read actually held
     /// ([`MemoryBudget::drain_encodes`](super::memory::MemoryBudget::drain_encodes)).
-    pub(super) drain_encodes: usize,
+    pub(super) drain_encodes: &'a dyn Fn(u64, u64) -> usize,
 }
 
 /// How a level's buffered output is held until it is written.
@@ -1265,6 +1266,14 @@ pub(super) fn run_pass2_buffered(
     // The window was granted from the run's budget after the read-ahead
     // (`stream::grant_pass2_read`, #716).
     let (read_depth, _) = split_in_flight(in_flight);
+    // #817 B1: the largest input batch read, so the drain reuses what the
+    // read-ahead and window really held, not what they were granted.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#817 B1: a per-call measurement shared with the read thread"
+    )]
+    let peak_batch = std::sync::atomic::AtomicU64::new(0);
+    let peak_batch_ref = &peak_batch;
     scoped_pipe(
         read_depth,
         // Producer: the input, in read order, over the per-part bbox-selected
@@ -1280,6 +1289,10 @@ pub(super) fn run_pass2_buffered(
                 None,
                 read_tuning,
                 &mut |batch, row_offset, read_dur| {
+                    peak_batch_ref.fetch_max(
+                        batch.get_array_memory_size() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     Ok(
                         if tx
                             .send(ReadMsg {
@@ -1384,9 +1397,22 @@ pub(super) fn run_pass2_buffered(
     // buffered level is skipped and renumbered by the writer (#211); the
     // outcome is threaded back to the caller with the level's stats.
     let mut outcomes = Vec::with_capacity(num_levels);
-    // #817 B1: the read is over, so the drain encodes on its grants' bytes.
+    // #817 B1: the read is over, so the drain reuses what it measurably held
     let writer_units = writer.encode_concurrency();
-    writer.set_encode_concurrency(drain_encodes);
+    // ...and only what the process gave back below its peak RSS: freed input
+    // the allocator kept is not free for the drain (bounded Moldova still
+    // peaked 114 MiB higher on the input bytes alone). None off Linux.
+    let below_peak = super::procmem::read_proc_status()
+        .and_then(|m| Some(m.hwm_kib?.saturating_sub(m.rss_kib?) * 1024))
+        .unwrap_or(0);
+    let held = peak_batch.into_inner().saturating_mul(in_flight as u64);
+    let width = drain_encodes(held, below_peak);
+    log::debug!(
+        "[profile] pass 2 drain: {width} encode(s) on {held} B ({below_peak} B below peak RSS)"
+    );
+    #[cfg(test)]
+    spill_tests::DRAIN_WIDTH.with(|c| c.set(width));
+    writer.set_encode_concurrency(width);
     for li in 0..num_levels {
         let sink = std::mem::replace(&mut sinks[li], LevelSink::Ram(Vec::new()));
         let t_drain_level = Instant::now();
@@ -1513,6 +1539,8 @@ mod spill_tests {
         std::sync::Mutex::new(std::collections::BTreeMap::new());
 
     thread_local! {
+        /// The last drain width set on this thread (#817 B1).
+        pub(super) static DRAIN_WIDTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// Spilled batches decoded on this thread (#817 B1).
         static DECODED_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
@@ -1548,6 +1576,48 @@ mod spill_tests {
         DECODED_HERE.with(|c| c.set(0));
         crate::overview::convert::convert_to_overviews(tin.path(), tout.path(), &options).unwrap();
         assert_eq!(DECODED_HERE.with(std::cell::Cell::get), 0);
+    }
+
+    /// #817 B1 bisect: the drain widened on the read's grants (bounded
+    /// Moldova: 2.1 GB, about 20 extra encodes) though the read held far
+    /// less, and raised the run's peak. A read of a few KiB buys no slot.
+    #[test]
+    fn drain_widens_only_on_what_the_read_held() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let geoms: Vec<_> = (0..2000)
+            .map(|i| {
+                Some(geo::Geometry::Point(geo::Point::new(
+                    f64::from(i % 50) * 0.01,
+                    f64::from(i / 50) * 0.01,
+                )))
+            })
+            .collect();
+        crate::overview::testutil::write_input(tin.path(), &geoms, true, None);
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let options = crate::overview::convert::ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: crate::overview::convert::LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            profile: MemoryProfile::Bounded,
+            ..Default::default()
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()
+            .unwrap();
+        let width = pool.install(|| {
+            DRAIN_WIDTH.with(|c| c.set(0));
+            crate::overview::convert::convert_to_overviews(tin.path(), tout.path(), &options)
+                .unwrap();
+            DRAIN_WIDTH.with(std::cell::Cell::get)
+        });
+        assert_eq!(
+            width,
+            crate::overview::memory::ENCODE_FLOOR,
+            "drain width {width}"
+        );
     }
 
     pub(super) fn record_spill(temp: &NamedTempFile, rows: u64) {
