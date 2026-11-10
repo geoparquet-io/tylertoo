@@ -555,6 +555,7 @@ fn input_layers(idx: &ArchiveIndex, meta: Option<&Value>) -> (Vec<LayerMeta>, (u
                             .filter(|f| f.is_object())
                             .cloned()
                             .unwrap_or_else(|| Value::Object(Default::default())),
+                        feature_count: None,
                     });
                 }
             }

@@ -85,11 +85,11 @@ def test_pyramid_metadata_fails_before_band_input_lookup(tmp_path: Path) -> None
 def _convert(tmp_path: Path, **kwargs: object) -> None:
     # `max_zoom="auto"` reads the input to pick a zoom, so a rule checked
     # after it would surface as the missing input's RuntimeError instead.
-    tylertoo.convert(
+    tylertoo.convert(  # type: ignore[call-overload]
         MISSING,
         str(tmp_path / "out.pmtiles"),
         max_zoom="auto",
-        **kwargs,  # type: ignore[arg-type]
+        **kwargs,
     )
 
 

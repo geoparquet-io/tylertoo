@@ -55,6 +55,10 @@ dev = [
     "pip-audit>=2.7",
     "pyarrow>=26.0.0",
     "hypothesis>=6.141.1",
+    # Independent PMTiles/MVT readers for archive assertions (the pins
+    # scripts/verify_archive.py uses).
+    "pmtiles==3.8.1",
+    "mapbox-vector-tile==2.2.0",
 ]
 # Tools the tutorials call and the site builder (tests/docs, docs.yml).
 # Exact pins: tutorial output is compared line by line, and zensical is

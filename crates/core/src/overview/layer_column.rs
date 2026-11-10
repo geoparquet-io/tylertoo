@@ -1,0 +1,903 @@
+//! `tiles --layer-column` (#821): one input, one MVT layer per value of a
+//! column. This is tippecanoe's per-feature `tippecanoe.layer`, and what
+//! geoparquet-io's `--layer-by-column` sets on each feature.
+//!
+//! It is a thin layer over pyramid composition (#385/#392). The input is
+//! read once and its rows are split by value into per-layer staged
+//! GeoParquet files. Each file then runs the ordinary `tiles` chain with the
+//! caller's options, and [`crate::pyramid::merge_bands_with_options`]
+//! concatenates the layers tile by tile. So each layer has its own ladder:
+//! the density budget, thinning, coalescing and the per-tile size valve run
+//! per layer, as for separate tippecanoe inputs. Each layer is generalized
+//! independently, so the overview spec's one-dataset-per-file rule holds.
+//!
+//! - A null value, or one that is blank after trimming, goes to
+//!   [`UNKNOWN_LAYER`]. Any other value is trimmed and used as the layer name.
+//!   This matches gpio's tippecanoe pipeline.
+//! - The column decides the layer and is not written as a property;
+//!   tippecanoe does not write `tippecanoe.layer` either.
+//! - DIVERGENCE FROM TIPPECANOE: the tile size caps apply to each layer
+//!   before the layers are joined, not to the combined tile. The merge
+//!   concatenates encoded layers and has no features left to shed.
+//! - At most [`MAX_LAYERS`] layers.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
+use arrow_schema::{DataType, SchemaRef};
+use serde::Serialize;
+
+use super::convert::ConvertError;
+use super::tiles::{TilesError, TilesInput, TilesOptions, TilesOutcome, TilesReport};
+use crate::atomic_output::{PendingOutput, Reserved};
+use crate::input::InputError;
+use crate::input_set::{ConvertSource, ReadPlan};
+use crate::pyramid::{Band, BandMergeOptions};
+
+/// The layer a null or blank value goes to.
+pub const UNKNOWN_LAYER: &str = "_unknown";
+
+/// The most layers one `--layer-column` run builds.
+///
+/// Each layer is a full convert and export with its own temporary overview
+/// and archive, and the split holds one open writer per layer. Even a fine
+/// categorical split (land-cover classes, admin levels, years) stays well
+/// under 64. A column with more values than that is probably an id or a
+/// free-text field, and building thousands of layers would take hours
+/// before anything failed. Subset the input with `--filter`, or route by a
+/// coarser column.
+pub const MAX_LAYERS: usize = 64;
+
+/// Why a `--layer-column` split could not run.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum LayerColumnError {
+    /// The column is not in the input.
+    #[error("--layer-column {name:?} is not a column of the input (columns: {available})")]
+    #[non_exhaustive]
+    MissingColumn {
+        /// The requested column.
+        name: String,
+        /// The input's columns, comma-separated.
+        available: String,
+    },
+    /// The column's type cannot name a layer.
+    #[error(
+        "--layer-column {name:?} is {data_type}; a layer column must hold strings, integers \
+         or booleans"
+    )]
+    #[non_exhaustive]
+    UnsupportedType {
+        /// The column.
+        name: String,
+        /// Its Arrow type.
+        data_type: String,
+    },
+    /// The column has more distinct values than [`MAX_LAYERS`].
+    #[error(
+        "--layer-column {name:?} has more than {limit} distinct values; each value becomes a \
+         layer with its own convert and export. Route by a coarser column, or subset the \
+         input with --filter"
+    )]
+    #[non_exhaustive]
+    TooManyLayers {
+        /// The column.
+        name: String,
+        /// [`MAX_LAYERS`].
+        limit: usize,
+    },
+    /// Reading the input failed.
+    #[error(transparent)]
+    Input(#[from] InputError),
+    /// Writing a staged layer file failed.
+    #[error("failed to stage the rows of layer {layer:?} in {}: {message}", dir.display())]
+    #[non_exhaustive]
+    Stage {
+        /// The layer being written.
+        layer: String,
+        /// Where the staged files go.
+        dir: std::path::PathBuf,
+        /// The underlying error.
+        message: String,
+    },
+}
+
+impl crate::error::Classify for LayerColumnError {
+    fn kind(&self) -> crate::error::ErrorKind {
+        match self {
+            Self::MissingColumn { .. }
+            | Self::UnsupportedType { .. }
+            | Self::TooManyLayers { .. } => crate::error::ErrorKind::Input,
+            Self::Input(e) => e.kind(),
+            Self::Stage { .. } => crate::error::ErrorKind::Runtime,
+        }
+    }
+}
+
+/// One layer of a `--layer-column` run: its name, how many input rows it
+/// took, and its own convert and export reports. Row numbers in those
+/// reports count that layer's rows, in input order.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct LayerReport {
+    /// The MVT layer name.
+    pub layer: String,
+    /// Input rows routed to this layer, after `--filter`.
+    pub input_rows: u64,
+    /// The layer's convert and export.
+    #[serde(flatten)]
+    pub report: TilesReport,
+}
+
+/// What a `--layer-column` run produced: one report per layer, in layer
+/// name order, and the merged archive's totals.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct LayeredReport {
+    /// The column the layers were routed by.
+    pub layer_column: String,
+    /// Every layer that produced tiles.
+    pub layers: Vec<LayerReport>,
+    /// Layers whose features all generalized or filtered away, with no
+    /// tiles to merge.
+    pub empty_layers: Vec<String>,
+    /// Input rows `--filter` dropped before the split, in no layer.
+    pub filtered_rows: u64,
+    /// Distinct tiles in the merged archive.
+    pub total_tiles: usize,
+    /// The merge's own diagnostics.
+    pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
+}
+
+/// The layer `value` routes to: [`UNKNOWN_LAYER`] for null or blank, else
+/// the trimmed value.
+fn layer_name(value: Option<&str>) -> &str {
+    match value.map(str::trim) {
+        Some(v) if !v.is_empty() => v,
+        _ => UNKNOWN_LAYER,
+    }
+}
+
+/// Whether a column of type `dt` can name layers.
+fn routable(dt: &DataType) -> bool {
+    match dt {
+        // An all-null column (Arrow `Null`) routes every row to `_unknown`.
+        DataType::Null
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Boolean => true,
+        DataType::Dictionary(_, value) => routable(value),
+        dt => dt.is_integer(),
+    }
+}
+
+/// Narrow `source` to the columns a layer can use, and return the layers'
+/// property selection: the caller's, without the routing column.
+///
+/// The default selection stages every column. Otherwise only the kept
+/// properties are staged, with the geometry, its covering, the routing
+/// column and what `filter` reads, and each layer includes exactly the
+/// properties the caller kept.
+fn stage_columns(
+    source: &ConvertSource,
+    selection: &super::properties::PropertySelection,
+    routing: usize,
+    filter: Option<&super::filter::BoundFilter>,
+) -> Result<super::properties::PropertySelection, ConvertError> {
+    let schema = source.file_schema()?;
+    let column = schema.field(routing).name();
+    let mut layer = selection.clone();
+    if selection.is_identity() {
+        layer.exclude.push(column.clone());
+        return Ok(layer);
+    }
+    let geom = source.resolved_schema()?.geometry_index().ok_or_else(|| {
+        ConvertError::NoGeometryColumn {
+            input: source.display_name(),
+        }
+    })?;
+    let kept = selection.resolve(&schema, geom, &[], &mut |m| log::warn!("[tiles] {m}"))?;
+    let properties = super::properties::property_indices(&schema, geom);
+    let mut keep: Vec<usize> = (0..schema.fields().len())
+        .filter(|i| kept.contains(i) || !properties.contains(i))
+        .chain(std::iter::once(routing))
+        .chain(filter.map_or(&[][..], |f| f.columns()).iter().copied())
+        .collect();
+    keep.sort_unstable();
+    keep.dedup();
+    source.restrict_columns(keep)?;
+    layer.include = Some(
+        kept.iter()
+            .filter(|&&i| i != geom && i != routing)
+            .map(|&i| schema.field(i).name().clone())
+            .collect(),
+    );
+    layer.exclude.clear();
+    layer.exclude_all = false;
+    Ok(layer)
+}
+
+/// Refuse a knob that reads the routing column, which no layer keeps.
+pub(super) fn check_knobs(
+    convert: &super::convert::ConvertOptions,
+    export: &super::export::ExportOptions,
+    column: &str,
+    schema: Option<&arrow_schema::Schema>,
+) -> Result<(), super::config::ConfigError> {
+    let mut knobs = schema
+        .map(|s| super::convert::knob_columns(convert, s))
+        .unwrap_or_default();
+    if let super::export::FeatureOrder::Column { name, .. } = &export.feature_order {
+        knobs.push((name.clone(), "--feature-order".to_string()));
+    }
+    if let Some(name) = &export.feature_id {
+        knobs.push((name.clone(), "--feature-id".to_string()));
+    }
+    match knobs.into_iter().find(|(name, _)| name == column) {
+        Some((name, knob)) => Err(super::config::ConfigError::LayerColumnReadByKnob { name, knob }),
+        None => Ok(()),
+    }
+}
+
+/// A layer's staged GeoParquet file while the split writes it.
+struct StagedWriter {
+    path: Reserved,
+    pending: PendingOutput,
+    writer: tylertoo_io::BatchWriter<std::fs::File>,
+    rows: u64,
+}
+
+/// A layer's finished staged file.
+struct Staged {
+    name: String,
+    path: Reserved,
+    rows: u64,
+}
+
+/// Read `source` once and write each layer's rows that `filter` keeps,
+/// every column included, to its own GeoParquet file in `dir`. Layers come
+/// back in name order, with the number of rows the filter dropped.
+///
+/// Every writer's buffered row group counts against the staging memory
+/// budget ([`crate::input::unbudgeted_stage_admission`]); past it, the
+/// largest buffer is flushed as a row group.
+fn split(
+    source: &ConvertSource,
+    schema: &SchemaRef,
+    idx: usize,
+    filter: Option<&super::filter::BoundFilter>,
+    dir: &Path,
+    batch_size: usize,
+) -> Result<(Vec<Staged>, u64), LayerColumnError> {
+    let field = schema.field(idx);
+    let column = field.name().as_str();
+    // The writer embeds its own Arrow schema; everything else (the `geo`
+    // block above all) is copied so a staged file reads like the input.
+    let metadata: Vec<_> = source
+        .key_value_metadata()?
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|kv| kv.key != "ARROW:schema")
+        .collect();
+    let budget = crate::input::unbudgeted_stage_admission() as usize;
+    let stage_err = |layer: &str, e: &dyn std::fmt::Display| LayerColumnError::Stage {
+        layer: layer.to_string(),
+        dir: dir.to_path_buf(),
+        message: e.to_string(),
+    };
+
+    let mut layers: BTreeMap<String, StagedWriter> = BTreeMap::new();
+    let mut filtered = 0u64;
+    let stream = source.open_stream(&ReadPlan {
+        batch_size,
+        projection: None,
+        row_groups: None,
+    })?;
+    for batch in stream {
+        let batch = batch?;
+        // A multi-part source's parts may differ in nullability; write
+        // every part under the union schema the source validated.
+        let batch = RecordBatch::try_new(Arc::clone(schema), batch.columns().to_vec())
+            .map_err(|e| stage_err(column, &e))?;
+        let keep = filter.map(|f| f.eval_mask(&batch, &|i| i));
+        let values = arrow_cast::cast(batch.column(idx), &DataType::Utf8)
+            .map_err(|e| stage_err(column, &e))?;
+        let values = values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("cast to Utf8 yields a StringArray");
+        let mut rows: BTreeMap<&str, Vec<u32>> = BTreeMap::new();
+        for i in 0..values.len() {
+            // SQL semantics: a row the filter cannot decide is dropped.
+            if keep.as_ref().is_some_and(|k| k[i] != Some(true)) {
+                filtered += 1;
+                continue;
+            }
+            let value = values.is_valid(i).then(|| values.value(i));
+            rows.entry(layer_name(value)).or_default().push(i as u32);
+        }
+        for (name, take) in rows {
+            if !layers.contains_key(name) {
+                if layers.len() == MAX_LAYERS {
+                    return Err(LayerColumnError::TooManyLayers {
+                        name: field.name().clone(),
+                        limit: MAX_LAYERS,
+                    });
+                }
+                let staged =
+                    open_staged(dir, schema, &metadata).map_err(|e| stage_err(name, &e))?;
+                layers.insert(name.to_string(), staged);
+            }
+            let staged = layers.get_mut(name).expect("inserted above");
+            let part = arrow_select::take::take_record_batch(&batch, &UInt32Array::from(take))
+                .map_err(|e| stage_err(name, &e))?;
+            staged.rows += part.num_rows() as u64;
+            staged
+                .writer
+                .write(&part)
+                .map_err(|e| stage_err(name, &e))?;
+        }
+        flush_over_budget(&mut layers, budget).map_err(|(name, e)| stage_err(&name, &e))?;
+    }
+
+    let staged = layers
+        .into_iter()
+        .map(|(name, staged)| {
+            staged.writer.close().map_err(|e| stage_err(&name, &e))?;
+            staged.pending.publish().map_err(|e| stage_err(&name, &e))?;
+            Ok(Staged {
+                name,
+                path: staged.path,
+                rows: staged.rows,
+            })
+        })
+        .collect::<Result<Vec<_>, LayerColumnError>>()?;
+    Ok((staged, filtered))
+}
+
+/// The index of the routing column in `schema`, refusing a missing column or
+/// one whose values cannot name a layer.
+fn routing_column(schema: &arrow_schema::Schema, column: &str) -> Result<usize, LayerColumnError> {
+    let idx = super::filter::resolve_column(schema, column).ok_or_else(|| {
+        LayerColumnError::MissingColumn {
+            name: column.to_string(),
+            available: schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    })?;
+    let field = schema.field(idx);
+    if !routable(field.data_type()) {
+        return Err(LayerColumnError::UnsupportedType {
+            name: field.name().clone(),
+            data_type: field.data_type().to_string(),
+        });
+    }
+    Ok(idx)
+}
+
+/// Create one layer's staged file under `dir`.
+fn open_staged(
+    dir: &Path,
+    schema: &SchemaRef,
+    metadata: &[tylertoo_io::KeyValue],
+) -> Result<StagedWriter, Box<dyn std::error::Error>> {
+    let path = crate::atomic_output::reserve_path(".tylertoo-layer-", ".parquet", Some(dir))?;
+    let (file, pending) = crate::atomic_output::create(&path)?;
+    let mut writer = tylertoo_io::batch_writer(file, Arc::clone(schema))?;
+    for kv in metadata {
+        writer.append_key_value_metadata(kv.clone());
+    }
+    Ok(StagedWriter {
+        path,
+        pending,
+        writer,
+        rows: 0,
+    })
+}
+
+/// Flush the largest buffered row groups until all of them fit `budget`.
+fn flush_over_budget(
+    layers: &mut BTreeMap<String, StagedWriter>,
+    budget: usize,
+) -> Result<(), (String, tylertoo_io::ParquetError)> {
+    loop {
+        let total: usize = layers.values().map(|s| s.writer.in_progress_size()).sum();
+        if total <= budget {
+            return Ok(());
+        }
+        let Some((name, staged)) = layers
+            .iter_mut()
+            .max_by_key(|(_, s)| s.writer.in_progress_size())
+        else {
+            return Ok(());
+        };
+        if staged.writer.in_progress_size() == 0 {
+            return Ok(());
+        }
+        staged.writer.flush().map_err(|e| (name.clone(), e))?;
+    }
+}
+
+/// The `--layer-column` run of [`super::tiles::convert_to_pmtiles_observed`]:
+/// split, tile each layer, merge. `options` has been validated.
+///
+/// The layers' intermediate overviews are not reported to an observer: they
+/// are temporary per layer, and `--keep-overview` is refused here.
+pub(super) fn convert_by_layer(
+    input: &TilesInput,
+    output: &Path,
+    options: &TilesOptions,
+    column: &str,
+) -> Result<TilesOutcome, TilesError> {
+    crate::atomic_output::check_writable(output)?;
+    let source = input.source().map_err(TilesError::Convert)?;
+    // One zoom range for every layer: `--max-zoom auto` is estimated over
+    // the whole input, as tippecanoe's `-zg` is.
+    let convert = super::tiles::resolve_on_source(
+        &source,
+        None,
+        std::borrow::Cow::Borrowed(&options.convert),
+    )?
+    .into_owned();
+    let file_schema = source
+        .file_schema()
+        .map_err(|e| TilesError::Convert(e.into()))?;
+    let idx = routing_column(&file_schema, column)?;
+    // The schema's own spelling: the property selection matches names exactly.
+    let column = file_schema.field(idx).name().as_str();
+    // The filter runs once, here, so it may read the routing column and the
+    // layer limit counts only the rows it keeps; the layers skip it.
+    let filter = super::convert::bind_attribute_filter(&convert, &file_schema, &[])
+        .map_err(TilesError::Convert)?;
+    let mut convert = convert;
+    convert.filter = None;
+    check_knobs(&convert, &options.export, column, Some(&file_schema))?;
+    convert.properties = stage_columns(&source, &convert.properties, idx, filter.as_ref())
+        .map_err(TilesError::Convert)?;
+    let schema = source.schema().map_err(|e| TilesError::Convert(e.into()))?;
+    let idx = schema
+        .index_of(column)
+        .expect("the routing column is staged");
+    let filter = super::convert::bind_attribute_filter(&options.convert, &schema, &[])
+        .map_err(TilesError::Convert)?;
+
+    let dir = super::tiles::intermediate_dir(options, output);
+    let (staged, filtered_rows) = split(
+        &source,
+        &schema,
+        idx,
+        filter.as_ref(),
+        &dir,
+        options.convert.read_batch_size,
+    )?;
+    drop(source);
+    log::info!(
+        "[tiles] --layer-column {column:?}: {} layer(s): {}",
+        staged.len(),
+        staged
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let layer_convert = convert;
+    let mut layers = Vec::new();
+    let mut empty_layers = Vec::new();
+    let mut archives: Vec<(Band, Reserved)> = Vec::new();
+    for layer in staged {
+        let archive =
+            crate::atomic_output::reserve_path(".tylertoo-layer-", ".pmtiles", Some(&dir))
+                .map_err(|source| TilesError::IntermediateCreate {
+                    dir: dir.clone(),
+                    source,
+                })?;
+        let layer_options = TilesOptions {
+            convert: layer_convert.clone(),
+            export: super::export::ExportOptions {
+                // The merged archive's metadata is set once, by the merge.
+                metadata: crate::pmtiles_metadata::TilesetMetadata::default(),
+                ..options.export.clone()
+            },
+            layer_name: Some(layer.name.clone()),
+            layer_column: None,
+            ..options.clone()
+        };
+        let config = layer_options.validate()?;
+        let staged_input = TilesInput::Path(layer.path.to_path_buf());
+        let in_layer = |e| TilesError::Layer {
+            layer: layer.name.clone(),
+            source: Box::new(e),
+        };
+        let report = match super::tiles::convert_to_pmtiles_validated(
+            &staged_input,
+            || staged_input.source(),
+            &archive,
+            &config,
+            &mut (),
+        ) {
+            Ok(TilesOutcome::Converted(report)) => report,
+            Err(TilesError::Convert(e)) if super::tiles::convert_produced_nothing(&e) => {
+                log::warn!(
+                    "[tiles] layer {:?} has nothing to draw ({e}); left out",
+                    layer.name
+                );
+                empty_layers.push(layer.name);
+                continue;
+            }
+            // Only a shard job ends empty without an error, and
+            // `--layer-column` refuses `--shard`.
+            Ok(other) => {
+                return Err(in_layer(TilesError::Convert(ConvertError::Io(
+                    std::io::Error::other(format!("unexpected outcome {other:?}")),
+                ))))
+            }
+            Err(e) => return Err(in_layer(e)),
+        };
+        if report.export.total_tiles == 0 {
+            log::warn!("[tiles] layer {:?} wrote no tiles; left out", layer.name);
+            empty_layers.push(layer.name);
+            continue;
+        }
+        archives.push((
+            Band::new(
+                archive.to_path_buf(),
+                layer.name.clone(),
+                report.export.min_zoom,
+                report.export.max_zoom,
+            ),
+            archive,
+        ));
+        layers.push(LayerReport {
+            layer: layer.name,
+            input_rows: layer.rows,
+            report: *report,
+        });
+    }
+    if archives.is_empty() {
+        return Err(TilesError::Convert(ConvertError::NoData));
+    }
+    let bands: Vec<Band> = archives.iter().map(|(band, _)| band.clone()).collect();
+    let merged = crate::pyramid::merge_bands_with_options(
+        &bands,
+        output,
+        &BandMergeOptions {
+            allow_missing_zooms: false,
+            metadata: options.export.metadata.clone(),
+            // The layers' archives are spooled there already.
+            spill_dir: Some(dir.clone()),
+        },
+    )
+    .map_err(TilesError::Merge)?;
+    Ok(TilesOutcome::Layered(Box::new(LayeredReport {
+        layer_column: column.to_string(),
+        layers,
+        empty_layers,
+        filtered_rows,
+        total_tiles: merged.total_tiles,
+        diagnostics: merged.diagnostics,
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
+
+    use prost::Message;
+
+    use super::*;
+    use crate::archive_index::ArchiveIndex;
+    use crate::compression::{self, Compression};
+    use crate::overview::convert::LevelPlan;
+    use crate::overview::testutil::{write_multi_rg_attr_input, AttrRow};
+    use crate::overview::tiles::convert_to_pmtiles;
+
+    /// Per layer, the features of every tile at `zoom`, each as its tag keys.
+    fn layers_at(path: &Path, zoom: u8) -> BTreeMap<String, Vec<Vec<String>>> {
+        let index = ArchiveIndex::open(path).unwrap();
+        let mut out: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
+        for tile in index.tiles() {
+            let tile = tile.unwrap();
+            if tile.z != zoom {
+                continue;
+            }
+            let raw = index.read_range(tile.range).unwrap();
+            let plain = compression::decompress_capped(&raw, Compression::Gzip, 1 << 26).unwrap();
+            for layer in crate::vector_tile::Tile::decode(plain.as_slice())
+                .unwrap()
+                .layers
+            {
+                let features = layer
+                    .features
+                    .iter()
+                    .map(|f| {
+                        f.tags
+                            .chunks(2)
+                            .map(|kv| layer.keys[kv[0] as usize].clone())
+                            .collect()
+                    })
+                    .collect::<Vec<Vec<String>>>();
+                out.entry(layer.name).or_default().extend(features);
+            }
+        }
+        out
+    }
+
+    fn rows() -> Vec<AttrRow> {
+        vec![
+            ((10.0, 10.0), Some(0.5), Some("soy")),
+            ((-20.0, 5.0), Some(0.5), Some("corn")),
+            ((30.0, -15.0), Some(0.5), None),
+            ((40.0, 20.0), Some(0.5), Some("   ")),
+            ((-50.0, -30.0), Some(0.5), Some(" soy ")),
+            ((60.0, 45.0), Some(0.5), Some("a:b")),
+        ]
+    }
+
+    fn options(column: &str) -> TilesOptions {
+        TilesOptions {
+            convert: crate::overview::convert::ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 3,
+                },
+                ..TilesOptions::default().convert
+            },
+            layer_column: Some(column.to_string()),
+            ..TilesOptions::default()
+        }
+    }
+
+    /// #821: each value lands in its own layer, null and blank in
+    /// `_unknown`, the routing column is not a property, and the metadata
+    /// lists every layer.
+    #[test]
+    fn routes_each_value_to_its_own_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("crops.parquet");
+        write_multi_rg_attr_input(&input, &rows());
+        let out = dir.path().join("crops.pmtiles");
+
+        let outcome = convert_to_pmtiles(&TilesInput::Path(input), &out, &options("crop")).unwrap();
+        let TilesOutcome::Layered(report) = outcome else {
+            panic!("expected a layered outcome, got {outcome:?}");
+        };
+        let names: Vec<&str> = report.layers.iter().map(|l| l.layer.as_str()).collect();
+        assert_eq!(names, ["_unknown", "a:b", "corn", "soy"]);
+        let rows: Vec<u64> = report.layers.iter().map(|l| l.input_rows).collect();
+        assert_eq!(rows, [2, 1, 1, 2]);
+
+        let layers = layers_at(&out, 3);
+        let counts: BTreeMap<&str, usize> =
+            layers.iter().map(|(k, v)| (k.as_str(), v.len())).collect();
+        assert_eq!(
+            counts,
+            BTreeMap::from([("_unknown", 2), ("a:b", 1), ("corn", 1), ("soy", 2)])
+        );
+        for features in layers.values() {
+            for keys in features {
+                assert!(
+                    !keys.iter().any(|k| k == "crop"),
+                    "routing column emitted: {keys:?}"
+                );
+                assert!(
+                    keys.iter().any(|k| k == "confidence"),
+                    "properties kept: {keys:?}"
+                );
+            }
+        }
+
+        let meta = ArchiveIndex::open(&out).unwrap().metadata_json().unwrap();
+        let ids: BTreeSet<&str> = meta["vector_layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, BTreeSet::from(["_unknown", "a:b", "corn", "soy"]));
+        for layer in meta["vector_layers"].as_array().unwrap() {
+            assert!(layer["fields"].get("crop").is_none(), "{layer}");
+            assert_eq!(layer["maxzoom"], 3, "{layer}");
+        }
+        let stats: BTreeSet<&str> = meta["tilestats"]["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["layer"].as_str().unwrap())
+            .collect();
+        assert_eq!(stats, ids);
+        assert_eq!(meta["tilestats"]["layerCount"], 4);
+
+        // The staged inputs, overviews and per-layer archives are gone.
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 2, "left behind: {left:?}");
+    }
+
+    fn refusal(mut options: TilesOptions, edit: impl FnOnce(&mut TilesOptions)) -> String {
+        edit(&mut options);
+        options.validate().unwrap_err().to_string()
+    }
+
+    #[test]
+    fn refuses_options_a_layer_run_cannot_honour() {
+        let base = options("crop");
+        type Edit = Box<dyn FnOnce(&mut TilesOptions)>;
+        let cases: [(&str, Edit); 6] = [
+            (
+                "--layer-name",
+                Box::new(|o| o.layer_name = Some("x".into())),
+            ),
+            (
+                "--shard",
+                Box::new(|o| {
+                    o.shard = Some(crate::overview::tiles::TilesShard::new(
+                        crate::shard::ShardRole::Coarse,
+                        None,
+                        2,
+                        "0",
+                        None,
+                    ))
+                }),
+            ),
+            (
+                "--save-plan",
+                Box::new(|o| o.convert.save_plan = Some("p".into())),
+            ),
+            (
+                "--keep-overview",
+                Box::new(|o| o.keep_overview = Some("k.parquet".into())),
+            ),
+            (
+                "--generate-variable-depth-tile-pyramid",
+                Box::new(|o| o.export.variable_depth = true),
+            ),
+            (
+                "--feature-id",
+                Box::new(|o| o.export.feature_id = Some("crop".into())),
+            ),
+        ];
+        for (flag, edit) in cases {
+            let message = refusal(base.clone(), edit);
+            assert!(message.contains("--layer-column"), "{flag}: {message}");
+            assert!(message.contains(flag), "{flag}: {message}");
+        }
+    }
+
+    /// The filter runs once, before the split: it may read the routing
+    /// column, and the column's case-insensitive spelling still keeps it out
+    /// of the properties.
+    #[test]
+    fn filters_before_the_split_and_resolves_the_column_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("crops.parquet");
+        write_multi_rg_attr_input(&input, &rows());
+        let out = dir.path().join("o.pmtiles");
+        let mut options = options("CROP");
+        options.convert.filter = Some("crop != 'corn'".into());
+        let outcome = convert_to_pmtiles(&TilesInput::Path(input), &out, &options).unwrap();
+        let TilesOutcome::Layered(report) = outcome else {
+            panic!("expected a layered outcome, got {outcome:?}");
+        };
+        assert_eq!(report.layer_column, "crop");
+        // The null row is neither kept nor dropped by `!=`: SQL drops it.
+        let rows: Vec<(&str, u64)> = report
+            .layers
+            .iter()
+            .map(|l| (l.layer.as_str(), l.input_rows))
+            .collect();
+        assert_eq!(rows, [("_unknown", 1), ("a:b", 1), ("soy", 2)]);
+        assert_eq!(report.filtered_rows, 2);
+        for features in layers_at(&out, 3).values() {
+            for keys in features {
+                assert!(!keys.iter().any(|k| k == "crop"), "{keys:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_a_missing_or_unroutable_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("crops.parquet");
+        write_multi_rg_attr_input(&input, &rows());
+        let out = dir.path().join("o.pmtiles");
+        let input = TilesInput::Path(input);
+
+        let err = convert_to_pmtiles(&input, &out, &options("nope")).unwrap_err();
+        assert!(
+            err.to_string().contains("\"nope\" is not a column"),
+            "{err}"
+        );
+        assert_eq!(
+            crate::error::Classify::kind(&err),
+            crate::error::ErrorKind::Input
+        );
+
+        let err = convert_to_pmtiles(&input, &out, &options("confidence")).unwrap_err();
+        assert!(
+            err.to_string().contains("strings, integers or booleans"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn refuses_more_layers_than_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("many.parquet");
+        let names: Vec<&'static str> = (0..=MAX_LAYERS)
+            .map(|i| &*Box::leak(format!("v{i}").into_boxed_str()))
+            .collect();
+        let rows: Vec<AttrRow> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| ((i as f64 - 30.0, 0.0), None, Some(*n)))
+            .collect();
+        write_multi_rg_attr_input(&input, &rows);
+        let input = TilesInput::Path(input);
+        let err = convert_to_pmtiles(&input, &dir.path().join("o.pmtiles"), &options("crop"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("more than {MAX_LAYERS}")),
+            "{err}"
+        );
+
+        // The limit counts the layers the filter keeps.
+        let mut options = options("crop");
+        options.convert.filter = Some("crop = 'v3'".into());
+        let outcome = convert_to_pmtiles(&input, &dir.path().join("o.pmtiles"), &options).unwrap();
+        let TilesOutcome::Layered(report) = outcome else {
+            panic!("expected a layered outcome, got {outcome:?}");
+        };
+        assert_eq!(report.layers.len(), 1);
+    }
+
+    /// A property selection stages only what a layer can use: a filter may
+    /// read an excluded column, which no layer then writes.
+    #[test]
+    fn stages_the_selection_and_what_the_filter_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("crops.parquet");
+        write_multi_rg_attr_input(&input, &rows());
+        let out = dir.path().join("o.pmtiles");
+        let mut options = options("crop");
+        options.convert.properties.exclude = vec!["confidence".into()];
+        options.convert.filter = Some("confidence > 0.4 AND crop = 'soy'".into());
+        let outcome = convert_to_pmtiles(&TilesInput::Path(input), &out, &options).unwrap();
+        let TilesOutcome::Layered(report) = outcome else {
+            panic!("expected a layered outcome, got {outcome:?}");
+        };
+        let rows: Vec<(&str, u64)> = report
+            .layers
+            .iter()
+            .map(|l| (l.layer.as_str(), l.input_rows))
+            .collect();
+        assert_eq!(rows, [("soy", 1)]);
+        for features in layers_at(&out, 3).values() {
+            for keys in features {
+                assert_eq!(keys, &["id"], "only the kept property");
+            }
+        }
+    }
+
+    #[test]
+    fn layer_names_trim_and_bucket_blanks() {
+        assert!(
+            routable(&DataType::Null),
+            "an all-null column routes to _unknown"
+        );
+        assert_eq!(layer_name(None), UNKNOWN_LAYER);
+        assert_eq!(layer_name(Some("")), UNKNOWN_LAYER);
+        assert_eq!(layer_name(Some(" \t")), UNKNOWN_LAYER);
+        assert_eq!(layer_name(Some(" soy ")), "soy");
+    }
+}

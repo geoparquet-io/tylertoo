@@ -26,6 +26,7 @@ To start from tippecanoe's defaults instead of tylertoo's, pass
 | `-zg` guess the maximum zoom | `--max-zoom auto` | Uses a bounded sample of feature extents and spacing at 256 px per tile, capped at z16 (`auto:N` lowers the cap to zN). Inspired by `-zg`; the algorithm differs. Both reject input with nothing to measure |
 | `-l` layer name | `--layer-name` | Set at export |
 | `-L` one layer per input | `pyramid --band LO-HI:INPUT:LAYER …` with bands sharing a zoom range | Each band has its own ladder; tiles at shared zooms contain every layer |
+| per-feature `tippecanoe.layer` | `tiles --layer-column COLUMN` | One layer per value, `_unknown` for null or blank. Each layer has its own ladder, and the size caps apply per layer (#838) |
 | `-n` name / `-N` description / `-A` attribution | `--name` / `--description` / `--attribution` | An unset field is left out of the archive. tippecanoe names the tileset after the output file and copies the name into `description`. `merge` and `pyramid` keep every inherited credit; see [attribution](attribution.md) |
 | `-b` buffer (default 5) | `--tile-buffer` (default 8) | Tile-pixel seam buffer |
 | `-y` / `-x` / `-X` property selection | `--include-property` / `--exclude-property` / `--exclude-all-properties` | Applied during scans for `overview` / `tiles`, during export for `export-pmtiles`. In both tools, an include list overrides exclusions |

@@ -1310,6 +1310,8 @@ pub(crate) struct LayerMeta {
     pub(crate) maxzoom: u8,
     /// The input's `fields` object, lifted verbatim from its metadata.
     pub(crate) fields: Value,
+    /// The layer's `tilestats` feature count, when known (#821).
+    pub(crate) feature_count: Option<u64>,
 }
 
 /// Collapse layers sharing an `id` into one entry, and serialize the result
@@ -1453,9 +1455,22 @@ struct BandArchive {
     /// Every `vector_layers` entry's validated `(minzoom, maxzoom)` (see
     /// [`layer_zoom_range`]). Empty when the metadata has none.
     layer_zooms: Vec<(u8, u8)>,
+    /// The band layer's `tilestats` feature count, when the metadata has one.
+    feature_count: Option<u64>,
 }
 
 impl BandArchive {
+    /// The band's entry in the merged `vector_layers`.
+    fn layer_meta(&self, band: &Band) -> LayerMeta {
+        LayerMeta {
+            id: band.layer.clone(),
+            minzoom: band.min_zoom,
+            maxzoom: band.max_zoom,
+            fields: self.fields.clone(),
+            feature_count: self.feature_count,
+        }
+    }
+
     /// Read `path` once: header, directories, metadata and bounds together.
     ///
     /// `label` is the band's own `--band LO-HI:PATH:LAYER` name (or, for a
@@ -1520,6 +1535,7 @@ impl BandArchive {
             fields: parsed.fields,
             layer_ids: parsed.ids,
             layer_zooms: parsed.zooms,
+            feature_count: parsed.count,
         })
     }
 
@@ -1606,6 +1622,8 @@ struct ParsedLayers {
     ids: Vec<String>,
     /// Every entry's validated `(minzoom, maxzoom)`.
     zooms: Vec<(u8, u8)>,
+    /// The chosen layer's `tilestats` feature count.
+    count: Option<u64>,
 }
 
 /// Lift the `vector_layers` entry whose `id` matches `label` — the band's
@@ -1660,6 +1678,7 @@ fn parse_layers(
                 fields: json!({}),
                 ids: Vec::new(),
                 zooms: Vec::new(),
+                count: None,
             });
         }
     };
@@ -1706,7 +1725,17 @@ fn parse_layers(
                 .collect()
         })
         .unwrap_or_default();
-    Ok(ParsedLayers { fields, ids, zooms })
+    let chosen_id = chosen.and_then(|l| l.get("id")).and_then(Value::as_str);
+    let count = parsed["tilestats"]["layers"]
+        .as_array()
+        .and_then(|v| v.iter().find(|l| l["layer"].as_str() == chosen_id))
+        .and_then(|l| l["count"].as_u64());
+    Ok(ParsedLayers {
+        fields,
+        ids,
+        zooms,
+        count,
+    })
 }
 
 /// What a pyramid build produced.
@@ -1814,11 +1843,15 @@ pub struct BandMergeOptions {
     /// that uses only some of its archive's zooms still passes on the
     /// archive's whole credit.
     pub metadata: TilesetMetadata,
+    /// Where the merge spools tile bytes before writing the archive.
+    /// `None` is the system temporary directory.
+    pub spill_dir: Option<PathBuf>,
 }
 
 with_setters!(BandMergeOptions {
     with_allow_missing_zooms => allow_missing_zooms: bool,
     with_metadata => metadata: TilesetMetadata,
+    with_spill_dir => spill_dir: Option<PathBuf>,
 });
 
 /// How the one-shot pyramid tiles each GeoParquet band.
@@ -2197,6 +2230,11 @@ fn build_pyramid_validated(
         &BandMergeOptions {
             allow_missing_zooms: opts.allow_missing_zooms,
             metadata: opts.metadata.clone(),
+            spill_dir: opts
+                .export
+                .spill_dir
+                .clone()
+                .or_else(|| opts.work_dir.clone()),
         },
     )?;
     diagnostics.extend(report.diagnostics);
@@ -2349,7 +2387,8 @@ fn merge_prepared_bands(
     // is exactly the workload that needs both — an aggregate band is mostly
     // identical tiles, and re-expanding its runs without dedup turned a
     // 300-byte band archive into 164 KiB.
-    let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)
+    let spool = options.spill_dir.clone().unwrap_or_else(std::env::temp_dir);
+    let mut writer = StreamingPmtilesWriter::with_temp_dir(Compression::Gzip, spool)
         .map_err(|e| crate::pmtiles_writer::WriteError::io("create streaming writer", e))?;
     // The writer appends tile data in add order and stamps the header
     // `clustered`, which promises offsets monotonic in tile id. Both paths
@@ -2398,12 +2437,7 @@ fn merge_prepared_bands(
                 &mut bands_without_bounds,
                 diagnostics,
             );
-            layers.push(LayerMeta {
-                id: band.layer.clone(),
-                minzoom: band.min_zoom,
-                maxzoom: band.max_zoom,
-                fields: archive.fields.clone(),
-            });
+            layers.push(archive.layer_meta(band));
         }
         let mut counts = vec![0usize; bands.len()];
         let mut skipped = vec![0usize; bands.len()];
@@ -2591,12 +2625,7 @@ fn merge_prepared_bands(
         skipped_total += skipped;
         total_tiles += n;
         per_band.push((band.layer.clone(), band.min_zoom, band.max_zoom, n));
-        layers.push(LayerMeta {
-            id: band.layer.clone(),
-            minzoom: band.min_zoom,
-            maxzoom: band.max_zoom,
-            fields: archive.fields.clone(),
-        });
+        layers.push(archive.layer_meta(band));
     }
 
     finish_merge(
@@ -2691,6 +2720,30 @@ struct MergeTally {
     bands_without_metadata: Vec<String>,
 }
 
+/// The merged archive's per-layer `tilestats` (#821): each layer's feature
+/// count summed over its bands, and its merged field count. `None`, and no
+/// `tilestats` at all, unless every band carried a count and gave every tile
+/// it holds to the merge: a band cut to part of its archive's zooms would
+/// overstate its layer.
+fn layer_stats(
+    vector_layers: &Value,
+    counts: &std::collections::BTreeMap<String, Option<u64>>,
+    skipped_total: usize,
+) -> Option<Vec<(String, u64, usize)>> {
+    if skipped_total > 0 {
+        return None;
+    }
+    vector_layers
+        .as_array()?
+        .iter()
+        .map(|l| {
+            let id = l["id"].as_str()?;
+            let fields = l["fields"].as_object().map_or(0, serde_json::Map::len);
+            Some((id.to_string(), (*counts.get(id)?)?, fields))
+        })
+        .collect()
+}
+
 /// The tail shared by both merge paths: bounds, `vector_layers`, finalize.
 fn finish_merge(
     mut writer: StreamingPmtilesWriter,
@@ -2714,7 +2767,17 @@ fn finish_merge(
     // Several bands may share a layer name (the aggregate bands do). Collapse
     // them into one entry spanning their combined zooms, or a client sees the
     // same layer declared twice with conflicting ranges.
-    writer.set_vector_layers_json(vector_layers_json(layers, diagnostics).to_string());
+    let mut counts = std::collections::BTreeMap::<String, Option<u64>>::new();
+    for l in &layers {
+        let sum = counts.entry(l.id.clone()).or_insert(Some(0));
+        // Untrusted metadata: an overflowing sum writes no tilestats.
+        *sum = sum.zip(l.feature_count).and_then(|(a, b)| a.checked_add(b));
+    }
+    let vector_layers = vector_layers_json(layers, diagnostics);
+    if let Some(stats) = layer_stats(&vector_layers, &counts, tally.skipped_total) {
+        writer.set_layer_stats(stats);
+    }
+    writer.set_vector_layers_json(vector_layers.to_string());
     writer.finalize(output).map_err(|e| Error::at(output, e))?;
 
     let sink = diagnostics;
@@ -2842,6 +2905,7 @@ pub fn fuzz_layer_zooms(bytes: &[u8]) -> Result<Value, PyramidError> {
                 .filter(|f| f.is_object())
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Default::default())),
+            feature_count: None,
         });
     }
     check(declared_zoom_range(
@@ -3566,6 +3630,25 @@ mod tests {
             w.add_tile(*z, *x, *y, payload).unwrap();
         }
         w.finalize(path).unwrap();
+    }
+
+    /// #821: the merge spools in the caller's spill directory, not the
+    /// system one. A missing one fails the merge before it writes anything.
+    #[test]
+    fn merge_spools_in_the_spill_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, out) = (dir.path().join("a.pmtiles"), dir.path().join("out.pmtiles"));
+        write_band_tiles(&a, "a", &[((0, 0, 0), layer_tile("a"))]);
+        let bands = [Band::parse(&format!("0-0:{}:a", a.display())).unwrap()];
+        let options = |spill: PathBuf| BandMergeOptions {
+            spill_dir: Some(spill),
+            ..Default::default()
+        };
+        let missing = dir.path().join("missing");
+        assert!(merge_bands_with_options(&bands, &out, &options(missing)).is_err());
+        assert!(!out.exists());
+        merge_bands_with_options(&bands, &out, &options(dir.path().to_path_buf())).unwrap();
+        assert!(out.exists());
     }
 
     /// #403: the shared-zoom merge hands the writer one dedup keyspace. A

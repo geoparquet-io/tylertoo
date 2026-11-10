@@ -1114,6 +1114,14 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
                 return Ok(());
             }
             TilesOutcome::Converted(report) => report,
+            TilesOutcome::Layered(report) => {
+                let name = output.file_name().unwrap_or_default().to_string_lossy();
+                print_layered(&report, &spec.label(), &name);
+                if let Some(report_path) = &args.report {
+                    write_report(report_path, &*report)?;
+                }
+                return Ok(());
+            }
             other => anyhow::bail!("unhandled tiles outcome: {other:?}"),
         };
     let (convert_report, export_report) = (&report.convert, &report.export);
@@ -1189,6 +1197,43 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The `tiles --layer-column` summary (#821): a line per layer, then totals.
+fn print_layered(report: &tylertoo_core::LayeredReport, input: &str, output: &str) {
+    for layer in &report.layers {
+        say!(
+            "  layer {:?}: {} rows → {} tiles across z{}..z{}",
+            layer.layer,
+            format_number(layer.input_rows),
+            format_number(layer.report.export.total_tiles as u64),
+            layer.report.export.min_zoom,
+            layer.report.export.max_zoom,
+        );
+    }
+    for layer in &report.empty_layers {
+        say!("  layer {layer:?}: nothing left to draw; left out");
+    }
+    if report.filtered_rows > 0 {
+        say!(
+            "  {} rows dropped by --filter",
+            format_number(report.filtered_rows)
+        );
+    }
+    say!(
+        "✓ Converted {input} → {output} ({} layers by {:?})",
+        report.layers.len(),
+        report.layer_column,
+    );
+    say!("  {} tiles", format_number(report.total_tiles as u64));
+    print_diagnostics(report.layers.iter().flat_map(|l| {
+        l.report
+            .convert
+            .diagnostics
+            .iter()
+            .chain(&l.report.export.diagnostics)
+    }));
+    print_diagnostics(&report.diagnostics);
 }
 
 fn write_report(path: &Path, report: &impl serde::Serialize) -> Result<()> {

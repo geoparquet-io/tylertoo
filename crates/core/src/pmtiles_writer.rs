@@ -1389,20 +1389,28 @@ fn fields_json(fields: &HashMap<String, String>) -> String {
     format!("{{{}}}", field_strings.join(","))
 }
 
-/// Render the TileJSON `tilestats` fragment, including its trailing comma.
+/// Render the TileJSON `tilestats` fragment, including its trailing comma,
+/// from each layer's `(name, feature count, attribute count)`.
 ///
 /// Returns an empty string when the archive holds no features, which keeps the
 /// surrounding metadata object valid.
-fn tilestats_json(layer_name: &str, total_features: u64, field_count: usize) -> String {
-    if total_features == 0 {
+fn tilestats_json(layers: &[(String, u64, usize)]) -> String {
+    if layers.iter().all(|(_, count, _)| *count == 0) {
         return String::new();
     }
-
+    let entries: Vec<String> = layers
+        .iter()
+        .map(|(name, count, attributes)| {
+            format!(
+                r#"{{"layer":{},"count":{count},"attributeCount":{attributes}}}"#,
+                json_string(name)
+            )
+        })
+        .collect();
     format!(
-        r#""tilestats":{{"layerCount":1,"layers":[{{"layer":{},"count":{},"attributeCount":{}}}]}},"#,
-        json_string(layer_name),
-        total_features,
-        field_count
+        r#""tilestats":{{"layerCount":{},"layers":[{}]}},"#,
+        layers.len(),
+        entries.join(",")
     )
 }
 
@@ -1592,6 +1600,9 @@ pub struct StreamingPmtilesWriter {
     /// layer `layer_name`/`fields` can describe (a merged band pyramid). When
     /// set it replaces the single-layer entry the writer would otherwise build.
     vector_layers_json: Option<String>,
+    /// Per-layer `tilestats` entries that replace the single-layer one
+    /// ([`Self::set_layer_stats`]).
+    layer_stats: Option<Vec<(String, u64, usize)>>,
     /// Top-level publication metadata (`name`, `description`, `attribution`).
     metadata: TilesetMetadata,
     /// Compression for tile data
@@ -1902,6 +1913,7 @@ impl StreamingPmtilesWriter {
             layer_name: "layer".to_string(),
             fields: HashMap::new(),
             vector_layers_json: None,
+            layer_stats: None,
             metadata: TilesetMetadata::default(),
             tile_compression: compression,
             internal_compression: compression,
@@ -2110,6 +2122,13 @@ impl StreamingPmtilesWriter {
     /// so a checkpointed archive and the final one cannot disagree.
     pub fn set_vector_layers_json(&mut self, json: String) {
         self.vector_layers_json = Some(json);
+    }
+
+    /// Replace the single-layer `tilestats` with one entry per layer:
+    /// `(name, feature count, attribute count)`, for a merged archive whose
+    /// writer never saw the features (#821).
+    pub fn set_layer_stats(&mut self, layers: Vec<(String, u64, usize)>) {
+        self.layer_stats = Some(layers);
     }
 
     /// Set geographic bounds.
@@ -2934,7 +2953,14 @@ impl StreamingPmtilesWriter {
     }
 
     fn build_tilestats_json(&self) -> String {
-        tilestats_json(&self.layer_name, self.total_features, self.fields.len())
+        match &self.layer_stats {
+            Some(layers) => tilestats_json(layers),
+            None => tilestats_json(&[(
+                self.layer_name.clone(),
+                self.total_features,
+                self.fields.len(),
+            )]),
+        }
     }
 }
 

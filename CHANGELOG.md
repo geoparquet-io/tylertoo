@@ -69,6 +69,16 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   simplification, tile buffer, size caps and size valve (#822). Options you
   pass still win. `docs/guides/tippecanoe.md` lists every value and what still
   differs.
+- `tiles --layer-column COLUMN` and Python `convert(layer_column=...)` put
+  each feature in the layer named by its value in COLUMN, and null or blank
+  values in `_unknown` (#821). This is tippecanoe's `tippecanoe.layer`. The
+  column is not written as a property. Each layer is tiled on its own ladder
+  and the layers are merged, so the size caps apply per layer (#838).
+  `--shard` and `--keep-overview` are refused with it (#839). Rust callers
+  that match `TilesOutcome` or `TilesError` get new `Layered`,
+  `LayerColumn`, `Layer` and `Merge` arms.
+- `pyramid` archives whose bands share a zoom now carry a `tilestats` entry
+  per layer.
 - `--max-zoom auto:N` and Python `max_zoom="auto:N"` cap the automatic zoom
   pick at N (#793). Plain `auto` keeps its z16 ceiling. Rust callers that
   match `MaxZoom` exhaustively need the new `AutoCapped` arm.

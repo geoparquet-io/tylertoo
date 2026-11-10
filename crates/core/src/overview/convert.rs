@@ -3504,7 +3504,7 @@ fn check_mode_combinations(options: &ConvertOptions) -> Result<(), ConvertError>
 /// unique case-insensitive fallback, #401), so `--filter "NAME > 0"` guards
 /// the `name` column. A name the binder cannot resolve is passed through
 /// unchanged, and the binder reports it.
-fn knob_columns(options: &ConvertOptions, schema: &Schema) -> Vec<(String, String)> {
+pub(super) fn knob_columns(options: &ConvertOptions, schema: &Schema) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Some(c) = &options.sort_key {
         out.push((c.clone(), "--sort-key".to_string()));
