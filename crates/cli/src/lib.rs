@@ -102,7 +102,18 @@ enum Command {
     Merge(MergeArgs),
     /// Cut a dataset's tile space into N disjoint shards for a sharded build.
     ShardPlan(ShardPlanArgs),
-    /// TODO(docs)
+    /// Serve PMTiles archives over HTTP with a map viewer.
+    ///
+    /// Run until Ctrl-C. The viewer at `/` handles MVT and MLT archives.
+    /// It loads MapLibre GL JS from unpkg.com and needs internet access.
+    ///
+    /// `/index.json` lists archive names. Each `{name}` is the archive's file
+    /// stem. `/{name}.json` returns TileJSON; `/{name}/{z}/{x}/{y}` returns
+    /// tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns
+    /// archive metadata; `/{name}/stats.json` returns tile-size statistics.
+    /// `/{name}.pmtiles` serves the archive with HTTP Range support.
+    ///
+    /// An archive rewritten on disk is reopened on the next request for it.
     Serve(ServeArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///
@@ -331,15 +342,16 @@ struct StatsArgs {
 /// Arguments for `tylertoo serve`.
 #[derive(Parser, Debug)]
 struct ServeArgs {
-    /// TODO(docs)
+    /// PMTiles archives to serve, each named by its file stem.
     #[arg(value_name = "ARCHIVE", required = true)]
     archives: Vec<PathBuf>,
 
-    /// TODO(docs)
+    /// Address to bind. The default allows local access only.
+    /// Use `--host 0.0.0.0` or another address to expose it to the network.
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1")]
     host: String,
 
-    /// TODO(docs)
+    /// Port to listen on. Use `--port 0` to pick a free port.
     #[arg(long, value_name = "N", default_value_t = 8080)]
     port: u16,
 }

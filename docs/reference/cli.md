@@ -34,6 +34,7 @@ Exit status:
 | [`pyramid`](#tylertoo-pyramid) | Build one archive from several inputs, each owning a zoom range |
 | [`merge`](#tylertoo-merge) | Combine PMTiles archives that hold disjoint tiles into one |
 | [`shard-plan`](#tylertoo-shard-plan) | Cut a dataset's tile space into N disjoint shards for a sharded build |
+| [`serve`](#tylertoo-serve) | Serve PMTiles archives over HTTP with a map viewer |
 
 ### Global options
 
@@ -382,6 +383,33 @@ tylertoo shard-plan [OPTIONS] --output <PATH> --shards <N> [INPUT]
 | `--shards <N>` | Number of data shards. Run one `tiles --shard i/N` job per shard plus one `--shard coarse` job, then merge all N+1 archives. |
 | `--pivot <ZOOM>` | Pivot zoom: data shards cover this zoom through `--max-zoom`; the coarse job covers lower zooms. Choose a zoom with a few populated tiles per shard, usually z4 to z8. Default: `6`. |
 | `-f`, `--force` | Overwrite an existing plan at `--output`. |
+
+## `tylertoo serve`
+
+Serve PMTiles archives over HTTP with a map viewer.
+
+Run until Ctrl-C. The viewer at `/` handles MVT and MLT archives. It loads MapLibre GL JS from unpkg.com and needs internet access.
+
+`/index.json` lists archive names. Each `{name}` is the archive's file stem. `/{name}.json` returns TileJSON; `/{name}/{z}/{x}/{y}` returns tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns archive metadata; `/{name}/stats.json` returns tile-size statistics. `/{name}.pmtiles` serves the archive with HTTP Range support.
+
+An archive rewritten on disk is reopened on the next request for it.
+
+```text
+tylertoo serve [OPTIONS] <ARCHIVE>...
+```
+
+### Arguments
+
+| Argument | Description |
+| --- | --- |
+| `<ARCHIVE>` | PMTiles archives to serve, each named by its file stem. |
+
+### Options
+
+| Option | Description |
+| --- | --- |
+| `--host <ADDR>` | Address to bind. The default allows local access only. Use `--host 0.0.0.0` or another address to expose it to the network. Default: `127.0.0.1`. |
+| `--port <N>` | Port to listen on. Use `--port 0` to pick a free port. Default: `8080`. |
 
 ## Shared conversion options
 

@@ -481,6 +481,45 @@ With `layers=True`, `per_layer` entries contain `z`, `layer`, `feature_count`, `
 'overview'
 ```
 
+## `serve`
+
+```python
+serve(
+    archive: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+) -> None
+```
+
+Serve PMTiles archives over HTTP with a map viewer.
+
+Print the server URL and block until Ctrl-C, which raises `KeyboardInterrupt`. The viewer at `/` handles MVT and MLT archives. It loads MapLibre GL JS from unpkg.com and needs internet access.
+
+`/index.json` lists archive names. Each `{name}` is the archive's file stem. `/{name}.json` returns TileJSON. `/{name}/{z}/{x}/{y}` returns tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns archive metadata. `/{name}/stats.json` returns tile-size statistics. `/{name}.pmtiles` serves the archive with HTTP Range support. An archive rewritten on disk is reopened on the next request for it.
+
+### Parameters
+
+* `archive`: One PMTiles path or a list of paths, with distinct file stems.
+* `host`: Address to bind. Defaults to `"127.0.0.1"` (local access only). Use `"0.0.0.0"` or another address to expose it to the network.
+* `port`: Port to listen on. Defaults to 8080. Use 0 to pick a free port.
+
+### Returns
+
+`None`: `None` when the server stops.
+
+### Raises
+
+* `ConfigError`: An unknown keyword or a bad option value.
+* `RuntimeError`: An archive could not be opened, file stems repeat, the address could not be bound, or the listening socket failed.
+* `KeyboardInterrupt`: Ctrl-C stops the server.
+
+### Example
+
+```python
+>>> serve("buildings.pmtiles", port=0)  # Blocks until Ctrl-C.
+```
+
 ## `convert`
 
 ```python
