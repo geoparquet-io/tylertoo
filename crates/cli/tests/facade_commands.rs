@@ -95,6 +95,34 @@ fn pyramid_builds_two_bands() {
     assert_eq!(index.actual_zoom_range().unwrap(), Some((0, 1)));
 }
 
+/// #801: `pyramid --profile` runs every band under that profile, and a
+/// profile changes memory, never the archive.
+#[test]
+fn pyramid_profiles_write_identical_archives() {
+    let dir = tempfile::tempdir().unwrap();
+    let b0 = format!("0-0:{}:grid", grid().display());
+    let b1 = format!("1-3:{}:grid", grid().display());
+    let archives: Vec<Vec<u8>> = ["auto", "speed", "bounded"]
+        .into_iter()
+        .map(|profile| {
+            let out = dir.path().join(format!("{profile}.pmtiles"));
+            success(&[
+                "pyramid",
+                s(&out),
+                "--band",
+                &b0,
+                "--band",
+                &b1,
+                "--profile",
+                profile,
+            ]);
+            std::fs::read(out).unwrap()
+        })
+        .collect();
+    assert_eq!(archives[0], archives[1]);
+    assert_eq!(archives[0], archives[2]);
+}
+
 #[test]
 fn pyramid_has_parity_with_export_flags() {
     fn longs(cmd: clap::Command) -> BTreeSet<String> {
