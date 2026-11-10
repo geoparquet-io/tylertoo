@@ -837,17 +837,19 @@ pub(super) struct RssTracker {
     /// `peak_rss_mib` in the profile JSON exactly as before.
     pub(super) boundary_peak_mib: Option<f64>,
     sampler: Option<RssSampler>,
+    /// Whether this run restarted the kernel's peak-RSS mark (VmHWM): only
+    /// then is it this run's peak rather than the process's.
+    hwm_reset: bool,
 }
 
 impl RssTracker {
     pub(super) fn new(profiling_on: bool, initial_phase: &str) -> Self {
-        if profiling_on {
-            // Restart the kernel's peak-RSS mark (VmHWM) for this run, so the
-            // profile's `peak_rss_mib` is the run's true peak, not a phase
-            // boundary's. Best effort: off Linux the boundary peak stands.
-            let _ = std::fs::write("/proc/self/clear_refs", "5");
-        }
+        // Restart the kernel's peak-RSS mark (VmHWM) for this run, so the
+        // profile's `peak_rss_mib` is the run's true peak, not a phase
+        // boundary's. Best effort: off Linux the boundary peak stands.
+        let hwm_reset = profiling_on && std::fs::write("/proc/self/clear_refs", "5").is_ok();
         Self {
+            hwm_reset,
             boundary_peak_mib: None,
             sampler: RssSampler::start_if(profiling_on, initial_phase),
         }
@@ -859,6 +861,7 @@ impl RssTracker {
         Self {
             boundary_peak_mib: None,
             sampler,
+            hwm_reset: false,
         }
     }
 
@@ -3517,13 +3520,16 @@ fn log_rss_true_peak_if_notable(boundary_peak_mib: Option<f64>, report: &Option<
 /// JSON. Pulled out of [`run_stages`] for clippy's
 /// function-length ceiling; called once, right after the last `log_phase`.
 fn finish_convert_rss(mut rss: RssTracker) -> (Option<f64>, Option<RssSamplerReport>) {
-    // The kernel's mark sees between the boundaries too; with profiling on,
+    // The kernel's mark sees between the boundaries too, once
     // `RssTracker::new` restarted it for this run.
-    let hwm_mib = rss.sampler.as_ref().and_then(|_| {
-        super::procmem::read_proc_status()?
-            .hwm_kib
-            .map(|k| k as f64 / 1024.0)
-    });
+    let hwm_mib = rss
+        .hwm_reset
+        .then(|| {
+            super::procmem::read_proc_status()?
+                .hwm_kib
+                .map(|k| k as f64 / 1024.0)
+        })
+        .flatten();
     let peak_rss_mib = [rss.boundary_peak_mib, hwm_mib]
         .into_iter()
         .flatten()
@@ -8834,6 +8840,27 @@ mod tests {
             .find(|(p, _)| p == phase)
             .unwrap_or_else(|| panic!("no usage entry for {phase}"))
             .1
+    }
+
+    /// Convert's `peak_rss_mib` includes a spike that rises and falls
+    /// between two boundaries, which the boundary samples cannot see.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn convert_peak_rss_includes_a_spike_between_boundaries() {
+        let rss = RssTracker::new(true, "spike");
+        let before = super::super::procmem::read_proc_status()
+            .and_then(|m| m.rss_kib)
+            .expect("Linux reports RSS") as f64
+            / 1024.0;
+        let spike = vec![1u8; 256 << 20];
+        std::hint::black_box(&spike);
+        drop(spike);
+        let (peak, _) = finish_convert_rss(rss);
+        let peak = peak.expect("Linux reports a peak");
+        assert!(
+            peak >= before + 200.0,
+            "peak {peak} MiB misses a 256 MiB spike over {before} MiB"
+        );
     }
 
     /// #810: every phase gets its CPU and wall deltas from the boundaries,
