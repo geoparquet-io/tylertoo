@@ -274,14 +274,7 @@ fn split(
 ) -> Result<(Vec<Staged>, u64), LayerColumnError> {
     let field = schema.field(idx);
     let column = field.name().as_str();
-    // The writer embeds its own Arrow schema; everything else (the `geo`
-    // block above all) is copied so a staged file reads like the input.
-    let metadata: Vec<_> = source
-        .key_value_metadata()?
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|kv| kv.key != "ARROW:schema")
-        .collect();
+    let metadata = staged_metadata(source)?;
     let budget = crate::input::unbudgeted_stage_admission() as usize;
     let stage_err = |layer: &str, e: &dyn std::fmt::Display| LayerColumnError::Stage {
         layer: layer.to_string(),
@@ -380,6 +373,46 @@ fn routing_column(schema: &arrow_schema::Schema, column: &str) -> Result<usize, 
         });
     }
     Ok(idx)
+}
+
+/// The footer metadata of every staged file, so that it reads like the
+/// input: the input's own (the `geo` block above all), less the writer's
+/// Arrow schema and the input's schema descriptor, which a property
+/// selection makes stale (the reader derives one when it is absent).
+///
+/// A CRS that only a native `GEOMETRY` type declares is restated in a `geo`
+/// block, since the staging writer cannot emit that type. Its identifier is
+/// copied verbatim: the reader parses a `geo` string `crs` the way it parses
+/// the native one, so the layers resolve, or refuse, the same CRS.
+fn staged_metadata(source: &ConvertSource) -> Result<Vec<tylertoo_io::KeyValue>, InputError> {
+    let mut metadata: Vec<_> = source
+        .key_value_metadata()?
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|kv| {
+            kv.key != "ARROW:schema" && kv.key != crate::resolved_schema::RESOLVED_SCHEMA_KEY
+        })
+        .collect();
+    let resolved = source.resolved_schema()?;
+    let crs = resolved.crs_info();
+    let declared_natively =
+        !crs.assumed_wgs84 && !metadata.iter().any(|kv| kv.key.eq_ignore_ascii_case("geo"));
+    if let (true, Some(name)) = (declared_natively, resolved.geometry_name()) {
+        let mut column = serde_json::json!({ "encoding": "WKB", "geometry_types": [] });
+        if let Some(id) = &crs.identifier {
+            column["crs"] = id.as_str().into();
+        }
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": name,
+            "columns": { name: column },
+        });
+        metadata.push(tylertoo_io::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+    }
+    Ok(metadata)
 }
 
 /// Create one layer's staged file under `dir`.
@@ -887,6 +920,145 @@ mod tests {
                 assert_eq!(keys, &["id"], "only the kept property");
             }
         }
+    }
+
+    /// A GeoParquet 2.0 input: a native `GEOMETRY(crs)` column, no `geo`
+    /// key, and optionally a `tylertoo:resolved_schema` descriptor JSON.
+    /// Hand-assembled, since this workspace's `ArrowWriter` cannot emit the
+    /// native type.
+    fn write_native_input(
+        path: &Path,
+        crs: &str,
+        rows: &[(f64, f64, &str)],
+        descriptor: Option<String>,
+    ) {
+        use arrow_array::{BinaryArray, RecordBatch, StringArray};
+        use arrow_schema::{Field, Schema};
+        use tylertoo_io::test_support::{Type, WriterProperties};
+        use tylertoo_io::{compute_leaves, ArrowRowGroupWriterFactory, LogicalType, PhysicalType};
+
+        let wkb = rows.iter().map(|&(x, y, _)| {
+            [
+                &[1u8][..],
+                &1u32.to_le_bytes(),
+                &x.to_le_bytes(),
+                &y.to_le_bytes(),
+            ]
+            .concat()
+        });
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, true),
+            Field::new("crop", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkb)),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.2))),
+            ],
+        )
+        .unwrap();
+        let column = |name, physical, logical| {
+            Arc::new(
+                Type::primitive_type_builder(name, physical)
+                    .with_logical_type(Some(logical))
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let parquet = Type::group_type_builder("schema")
+            .with_fields(vec![
+                column(
+                    "geometry",
+                    PhysicalType::BYTE_ARRAY,
+                    LogicalType::geometry(Some(crs.to_string())),
+                ),
+                column("crop", PhysicalType::BYTE_ARRAY, LogicalType::String),
+            ])
+            .build()
+            .unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = tylertoo_io::SerializedFileWriter::new(
+            file,
+            Arc::new(parquet),
+            Arc::new(WriterProperties::default()),
+        )
+        .unwrap();
+        let mut columns = ArrowRowGroupWriterFactory::new(&writer, Arc::clone(&schema))
+            .create_column_writers(0)
+            .unwrap();
+        for ((array, field), column) in batch
+            .columns()
+            .iter()
+            .zip(schema.fields())
+            .zip(&mut columns)
+        {
+            for leaf in compute_leaves(field, array).unwrap() {
+                column.write(&leaf).unwrap();
+            }
+        }
+        let mut row_group = writer.next_row_group().unwrap();
+        for column in columns {
+            column
+                .close()
+                .unwrap()
+                .append_to_row_group(&mut row_group)
+                .unwrap();
+        }
+        row_group.close().unwrap();
+        if let Some(json) = descriptor {
+            writer.append_key_value_metadata(tylertoo_io::KeyValue::new(
+                crate::resolved_schema::RESOLVED_SCHEMA_KEY.to_string(),
+                json,
+            ));
+        }
+        writer.close().unwrap();
+    }
+
+    /// A staged layer reads like its input: a CRS only the native type
+    /// declares survives staging, and the input's schema descriptor, which a
+    /// property selection makes stale, is not copied.
+    #[test]
+    fn staged_layers_keep_a_native_crs_and_drop_the_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("native-3857.parquet");
+        // EPSG:3857 metres for (10E, 10N) and (20W, 5N).
+        let rows = [
+            (1_113_194.9, 1_118_890.0, "soy"),
+            (-2_226_389.8, 557_305.3, "corn"),
+        ];
+        // Written twice: the descriptor describes the file as first written.
+        write_native_input(&input, "EPSG:3857", &rows, None);
+        let descriptor = TilesInput::Path(input.clone())
+            .source()
+            .unwrap()
+            .resolved_schema()
+            .unwrap()
+            .footer_json()
+            .unwrap();
+        write_native_input(&input, "EPSG:3857", &rows, Some(descriptor));
+        let out = dir.path().join("o.pmtiles");
+        let mut options = options("crop");
+        options.convert.properties.exclude_all = true;
+        let outcome = convert_to_pmtiles(&TilesInput::Path(input), &out, &options).unwrap();
+        let TilesOutcome::Layered(report) = outcome else {
+            panic!("expected a layered outcome, got {outcome:?}");
+        };
+        assert!(report.empty_layers.is_empty(), "{report:?}");
+        for layer in &report.layers {
+            assert!(
+                !layer.report.convert.crs_assumed_wgs84,
+                "{}: CRS assumed, not read",
+                layer.layer
+            );
+        }
+        let at_z3 = layers_at(&out, 3);
+        assert_eq!(at_z3.keys().collect::<Vec<_>>(), ["corn", "soy"]);
+        // In metres read as degrees, both points would be off the map.
+        assert!(
+            at_z3.values().all(|features| features.len() == 1),
+            "{at_z3:?}"
+        );
     }
 
     #[test]
