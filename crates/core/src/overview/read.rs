@@ -435,6 +435,10 @@ where
         tuning.batch_size.max(1),
         tylertoo_io::byte_array_limit(),
     )?;
+    let tuning = ReadTuning {
+        batch_size,
+        ..tuning
+    };
     let shape = resolve_read_shape(tuning).capped(max_depth, batch_size);
     let parallel = reads_in_parallel(source, row_groups, projection, shape);
     if shape.workers > 1 && !parallel {
