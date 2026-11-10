@@ -449,14 +449,19 @@ impl MemoryBudget {
     /// `reused` is what the finished read's read-ahead and compute window
     /// actually held (empty by the drain), capped at their grants: the
     /// grants alone overstate it (bounded Moldova: 2.1 GB granted, a 1.94 GB
-    /// pass-2 peak in all), and spending them raised the run's peak.
+    /// pass-2 peak in all), and spending them raised the run's peak. It is
+    /// also capped at `below_peak` (how far the process sits below its peak
+    /// RSS) less the `encode` grant itself, which the drain spends anyway, so
+    /// the whole drain fits under the peak.
     pub(super) fn drain_encodes(
         encode: Grant,
         slot_bytes: u64,
         reused: u64,
+        below_peak: u64,
         threads: usize,
     ) -> usize {
         let slot = slot_bytes.max(encode.unit_bytes).max(1);
+        let reused = reused.min(below_peak.saturating_sub(encode.bytes()));
         let extra = usize::try_from(reused / slot).unwrap_or(usize::MAX);
         encode
             .units
@@ -499,13 +504,25 @@ mod tests {
             units: 4,
             unit_bytes: 100,
         };
-        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 0, 64), 4);
-        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 399, 64), 7);
-        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 64), 64);
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 0, u64::MAX, 64), 4);
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 399, u64::MAX, 64), 7);
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 0, 1 << 40, u64::MAX, 64),
+            64
+        );
         // A slot costing more than the grant's unit (a WKB chunk) buys fewer.
-        assert_eq!(MemoryBudget::drain_encodes(encode, 200, 399, 64), 5);
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 200, 399, u64::MAX, 64),
+            5
+        );
+        // The whole drain, the grant's own 4 included, fits below the peak.
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 500, 64), 5);
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 300, 64), 4);
         // Never below the writer's own grant, even on fewer threads.
-        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 2), 4);
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 0, 1 << 40, u64::MAX, 2),
+            4
+        );
     }
 
     #[test]

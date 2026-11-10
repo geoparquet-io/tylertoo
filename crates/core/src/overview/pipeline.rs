@@ -79,7 +79,7 @@ pub(super) struct BufferOptions<'a> {
     /// Row groups the drain may encode at once, given the input bytes the
     /// read actually held
     /// ([`MemoryBudget::drain_encodes`](super::memory::MemoryBudget::drain_encodes)).
-    pub(super) drain_encodes: &'a dyn Fn(u64) -> usize,
+    pub(super) drain_encodes: &'a dyn Fn(u64, u64) -> usize,
 }
 
 /// How a level's buffered output is held until it is written.
@@ -1397,7 +1397,7 @@ pub(super) fn run_pass2_buffered(
     // buffered level is skipped and renumbered by the writer (#211); the
     // outcome is threaded back to the caller with the level's stats.
     let mut outcomes = Vec::with_capacity(num_levels);
-    // #817 B1: the read is over, so the drain encodes on its grants' bytes.
+    // #817 B1: the read is over, so the drain reuses what it measurably held
     let writer_units = writer.encode_concurrency();
     // ...and only what the process gave back below its peak RSS: freed input
     // the allocator kept is not free for the drain (bounded Moldova still
@@ -1405,11 +1405,8 @@ pub(super) fn run_pass2_buffered(
     let below_peak = super::procmem::read_proc_status()
         .and_then(|m| Some(m.hwm_kib?.saturating_sub(m.rss_kib?) * 1024))
         .unwrap_or(0);
-    let held = peak_batch
-        .into_inner()
-        .saturating_mul(in_flight as u64)
-        .min(below_peak);
-    let width = drain_encodes(held);
+    let held = peak_batch.into_inner().saturating_mul(in_flight as u64);
+    let width = drain_encodes(held, below_peak);
     log::debug!(
         "[profile] pass 2 drain: {width} encode(s) on {held} B ({below_peak} B below peak RSS)"
     );
