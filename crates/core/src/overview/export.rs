@@ -1750,20 +1750,31 @@ fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Ra
     groups
 }
 
-/// `member_cap` bounded by the largest wave of any level in `plans`, but
-/// never below one `partition_target`.
+/// The members a concurrent level group may hold collected but not yet
+/// encoded ([`InFlight`]): `member_cap` bounded by the largest wave of any
+/// level in `plans`, but never below [`PARTITION_WAVE_MIN`] partitions of
+/// `partition_target`, the narrowest full wave the serial loop holds on any
+/// machine, so a small export's levels all overlap, as on `main`.
 ///
-/// A group holds every member it collected until its levels encode, valve
-/// and MVT workspace included, so a group past the largest wave raised the
+/// Collected members wait, valve and MVT workspace included, until their
+/// level encodes, so more of them in flight than the largest wave raises the
 /// export's peak above what the serial loop holds anyway. #817: on Moldova
 /// `f0` all of z0..z11 (1.57M members) formed one group under a 2.1M cap;
-/// once the collect sped up, the group's valve-heavy encodes overlapped and
-/// peak RSS rose 15-20%. Bounded by the 766k-member z12 wave, it fell below
-/// `main`'s. One partition target is the floor: a group that small is
-/// smaller than one partition the serial loop may hold.
-fn bound_group_cap(member_cap: usize, plans: &[LevelPlan], partition_target: usize) -> usize {
+/// once the collect sped up, the group's valve-heavy encodes fell behind it
+/// and peak RSS rose 15-20%. Bounded by the 766k-member z12 wave, it fell
+/// below `main`'s. This bounds the members in flight, not the group: when
+/// the encodes keep up (Madagascar, NYC), every level of the group still
+/// overlaps, as on `main`. Bounding the group instead ran their levels one
+/// small group after another, +24% wall on Madagascar. The group keeps
+/// `member_cap` on its sum, which also bounds the encoded tiles a group
+/// holds while a slow coarser level keeps them from being written.
+fn bound_group_cap<'p>(
+    member_cap: usize,
+    plans: impl IntoIterator<Item = &'p LevelPlan>,
+    partition_target: usize,
+) -> usize {
     let largest_wave = plans
-        .iter()
+        .into_iter()
         .flat_map(|plan| {
             plan.partitions
                 .chunks(plan.wave.max(1))
@@ -1771,7 +1782,7 @@ fn bound_group_cap(member_cap: usize, plans: &[LevelPlan], partition_target: usi
         })
         .max()
         .unwrap_or(0);
-    member_cap.min(largest_wave.max(partition_target))
+    member_cap.min(largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN)))
 }
 
 /// Resolve a requested partition-wave width to a concrete value.
@@ -2678,8 +2689,8 @@ fn export_pmtiles_validated(
             ..template
         })
         .collect();
-    let level_groups =
-        plan_level_groups(&plans, bound_group_cap(group_cap, &plans, partition_target));
+    let level_groups = plan_level_groups(&plans, group_cap);
+    let in_flight_cap = bound_group_cap(group_cap, &plans, partition_target);
     let mem = LevelMemory {
         store: store.as_mut(),
         budget: &mut *budget,
@@ -2696,7 +2707,7 @@ fn export_pmtiles_validated(
                 &mut writer,
                 mem,
                 &levels,
-                &level_groups,
+                (&level_groups, in_flight_cap),
                 &ckpt,
                 &mut progress,
                 diagnostics,
@@ -3448,7 +3459,7 @@ fn export_level_groups(
     writer: &mut StreamingPmtilesWriter,
     mem: LevelMemory<'_>,
     levels: &[ExportLevelCtx<'_>],
-    groups: &[std::ops::Range<usize>],
+    (groups, in_flight_cap): (&[std::ops::Range<usize>], usize),
     ckpt: &CheckpointCtx<'_>,
     progress: &mut ExportProgress,
     diagnostics: &crate::diagnostics::Diagnostics,
@@ -3477,7 +3488,7 @@ fn export_level_groups(
                 store: store.as_deref_mut(),
                 budget: &mut *budget,
             },
-            &group_levels,
+            (&group_levels, in_flight_cap),
             ckpt,
             progress.fail_level,
             progress,
@@ -3530,7 +3541,7 @@ fn injected_fault(
 fn export_level_group(
     writer: &mut StreamingPmtilesWriter,
     mem: LevelMemory<'_>,
-    levels: &[ExportLevelCtx<'_>],
+    (levels, in_flight_cap): (&[ExportLevelCtx<'_>], usize),
     ckpt: &CheckpointCtx<'_>,
     fail_level: Option<usize>,
     progress: &mut ExportProgress,
@@ -3556,12 +3567,14 @@ fn export_level_group(
         reports: Vec::with_capacity(levels.len()),
         error: None,
     });
+    let in_flight = InFlight::new(in_flight_cap);
     let collected = rayon::in_place_scope(|scope| -> Result<(), (usize, ExportError)> {
         for (i, level) in levels.iter().enumerate() {
             if lock_commit(&commit, &timers).error.is_some() {
                 // A coarser level already failed. Its error is returned.
                 break;
             }
+            let held = in_flight.admit(level.plan.partitions.iter().map(|p| p.members).sum());
             let start = Instant::now();
             let spill_bytes = store
                 .as_deref()
@@ -3575,13 +3588,14 @@ fn export_level_group(
                 let t_encode = Instant::now();
                 let tiles = encode_buckets(
                     level.gzip_cache,
-                    buckets,
+                    (buckets, Some(&held)),
                     level.plan.zoom,
                     level.options,
                     level.fills,
                     timers,
                     diagnostics,
                 );
+                drop(held);
                 let encoded = tiles.map(|tiles| EncodedLevel {
                     tiles,
                     start,
@@ -3599,6 +3613,89 @@ fn export_level_group(
         commit.fail(i, e);
     }
     commit.into_reports()
+}
+
+/// The members a level group has admitted to collect and not yet encoded
+/// (#817, see [`bound_group_cap`]). The collecting thread waits in
+/// [`Self::admit`] while the next level would take them past `cap`, unless
+/// none are in flight, so a level larger than the cap still runs.
+struct InFlight {
+    cap: usize,
+    held: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// A level's admitted members. Each partition's are released as it
+/// encodes ([`Self::release`]), so the next level's collect overlaps the
+/// encode's tail; the rest when its encode task drops it, panicking or not.
+struct Admitted<'g> {
+    gate: &'g InFlight,
+    remaining: Mutex<usize>,
+}
+
+impl Admitted<'_> {
+    /// Release up to `members` of the admitted members (a partition's
+    /// collected count can differ from its planned one).
+    fn release(&self, members: usize) {
+        let mut remaining = self
+            .remaining
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let freed = members.min(*remaining);
+        *remaining -= freed;
+        self.gate.release(freed);
+    }
+}
+
+impl InFlight {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            held: Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn admit(&self, members: usize) -> Admitted<'_> {
+        let lock = || self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = lock();
+        while *held > 0 && held.saturating_add(members) > self.cap {
+            if rayon::current_thread_index().is_some() {
+                // A pool thread runs the encodes it waits on, never parks.
+                drop(held);
+                if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                    std::thread::yield_now();
+                }
+                held = lock();
+            } else {
+                held = self
+                    .freed
+                    .wait(held)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+        *held += members;
+        Admitted {
+            gate: self,
+            remaining: Mutex::new(members),
+        }
+    }
+
+    fn release(&self, members: usize) {
+        if members == 0 {
+            return;
+        }
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        *held -= members;
+        self.freed.notify_all();
+    }
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        let remaining = self.remaining.get_mut().unwrap_or_else(|e| e.into_inner());
+        self.gate.release(*remaining);
+    }
 }
 
 /// Lock the group's [`GroupCommit`]. A poisoned lock means an encode task
@@ -5328,7 +5425,7 @@ fn encode_wave_from_store(
     })?;
     encode_buckets(
         ctx.gzip_cache,
-        bucket_members(members, wave),
+        (bucket_members(members, wave), None),
         ctx.zoom,
         ctx.opts,
         ctx.fills,
@@ -5348,10 +5445,11 @@ fn bucket_members(members: Vec<Member>, wave: &[Partition]) -> Vec<Vec<Member>> 
 }
 
 /// Encode a wave's partition buckets in parallel. The tiles come back in
-/// ascending partition order.
+/// ascending partition order. Each bucket's members are released from
+/// `admitted`, when given, as the bucket is encoded ([`InFlight`]).
 fn encode_buckets(
     gzip_cache: &Arc<TileGzipCache>,
-    buckets: Vec<Vec<Member>>,
+    (buckets, admitted): (Vec<Vec<Member>>, Option<&Admitted<'_>>),
     zoom: u8,
     opts: &ExportOptions,
     fills: Option<&coverage_fill::FillMap>,
@@ -5360,7 +5458,14 @@ fn encode_buckets(
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
     buckets
         .into_par_iter()
-        .map(|members| encode_members(gzip_cache, members, zoom, opts, fills, timers, diagnostics))
+        .map(|members| {
+            let n = members.len();
+            let tiles = encode_members(gzip_cache, members, zoom, opts, fills, timers, diagnostics);
+            if let Some(a) = admitted {
+                a.release(n);
+            }
+            tiles
+        })
         .collect::<Result<_, _>>()
 }
 
@@ -6114,7 +6219,7 @@ fn process_wave(
     let t_encode = Instant::now();
     let tiles = encode_buckets(
         ctx.gzip_cache,
-        buckets,
+        (buckets, None),
         ctx.zoom,
         ctx.opts,
         ctx.fills,
@@ -11536,19 +11641,16 @@ mod tests {
         assert!(plan_level_groups(&[], 100).is_empty());
     }
 
-    /// #817: a group never holds more members than the export's largest
-    /// wave, or one partition target when that is larger. On `origin/main`
-    /// the three levels below formed one group of 60 members under a cap of
-    /// 100, twice the 30-member wave the export holds anyway.
+    /// #817: a group's members in flight never exceed the export's largest
+    /// wave, or the narrowest wave of full partitions when that is larger.
     #[test]
-    fn a_level_group_never_outgrows_the_largest_wave() {
+    fn the_in_flight_cap_is_the_largest_wave() {
         let plans = vec![
             plan_with_members(3, &[10], 6),
             plan_with_members(4, &[20], 6),
             plan_with_members(5, &[30], 6),
         ];
-        let cap = bound_group_cap(100, &plans, 1);
-        assert_eq!(plan_level_groups(&plans, cap), vec![0..2, 2..3]);
+        assert_eq!(bound_group_cap(100, &plans, 1), 30);
         // A multi-wave level's largest wave, not its whole band, is the bound.
         let multi = vec![
             plan_with_members(3, &[10], 6),
@@ -11556,9 +11658,70 @@ mod tests {
             plan_with_members(5, &[3; 12], 6),
         ];
         assert_eq!(bound_group_cap(100, &multi, 1), 18);
-        // One partition target is the floor, and the serial cap stays 0.
-        assert_eq!(bound_group_cap(100, &plans, 64), 64);
+        // The narrowest wave of full partitions is the floor, and the serial
+        // cap stays 0.
+        assert_eq!(bound_group_cap(1_000, &plans, 64), 64 * PARTITION_WAVE_MIN);
         assert_eq!(bound_group_cap(0, &plans, 64), 0);
+    }
+
+    /// #817: the collect waits while the next level would take the members
+    /// in flight past the cap, and goes on once an encode releases them. A
+    /// level larger than the cap is admitted when nothing is in flight.
+    #[test]
+    fn in_flight_admits_a_level_only_within_the_cap() {
+        let gate = InFlight::new(5);
+        let first = gate.admit(4);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| drop(gate.admit(3)));
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!waiter.is_finished(), "admitted 7 members past a cap of 5");
+            drop(first);
+            waiter.join().unwrap();
+        });
+        drop(gate.admit(9));
+        assert_eq!(*gate.held.lock().unwrap(), 0);
+    }
+
+    /// #817: small single-wave levels whose summed members exceed the
+    /// largest wave still form one concurrent group. `bound_group_cap` used
+    /// to bound the group itself, so each level here ran alone, one after
+    /// another (Madagascar z0..z12 split into six groups, +24% wall).
+    #[test]
+    fn small_levels_stay_one_concurrent_group() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let level = |l: i64| -> (Vec<i64>, Vec<Geometry<f64>>) {
+            let pts = (0..5)
+                .map(|k| Geometry::Point(Point::new(-150.3 + k as f64 * 70.0, -40.3 + l as f64)))
+                .collect();
+            ((0..5).map(|k| l * 10 + k).collect(), pts)
+        };
+        write_mode_fixture(
+            input.path(),
+            &[level(0), level(1), level(2), level(3)],
+            Mode::Duplicating,
+            64,
+        );
+        let opts = ExportOptions {
+            layer_name: "small".to_string(),
+            partition_wave: 64,
+            ..Default::default()
+        };
+        let run = |concurrent_levels: bool| {
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &knobs(false, None, concurrent_levels),
+            )
+            .unwrap();
+            (std::fs::read(out.path()).unwrap(), run)
+        };
+        let (serial_bytes, _) = run(false);
+        let (concurrent_bytes, concurrent) = run(true);
+        assert_eq!(concurrent.level_groups, ONE_GROUP_OF_FOUR);
+        assert_eq!(concurrent_bytes, serial_bytes);
     }
 
     /// #647: the group cap is one full ceiling-width wave of target-sized
@@ -12188,11 +12351,8 @@ mod tests {
                     let single_read = input == t_part.path() && !force_legacy_pass2;
                     assert_eq!(serial.single_read, single_read, "{input:?}");
                     assert_eq!(concurrent.single_read, single_read, "{input:?}");
-                    // #817: at a target of 4 the finest level's wave is the
-                    // largest, so it runs alone ([`bound_group_cap`]).
                     assert!(
-                        target != DEFAULT_PARTITION_TARGET
-                            || concurrent.level_groups.iter().any(|g| g.len() > 1),
+                        concurrent.level_groups.iter().any(|g| g.len() > 1),
                         "no level group formed (target {target}, wave {wave}): {:?}",
                         concurrent.level_groups
                     );

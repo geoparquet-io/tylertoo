@@ -1219,7 +1219,14 @@ pub(super) fn export_levels(
                 budget: &mut *budget,
             },
             levels,
-            &groups,
+            (
+                &groups,
+                bound_group_cap(
+                    group_cap,
+                    levels.iter().map(|l| l.plan),
+                    partition_budget.partition_target,
+                ),
+            ),
             ckpt,
             progress,
             diagnostics,
@@ -1280,10 +1287,9 @@ pub(super) fn export_levels(
                     ..template
                 })
                 .collect();
-            let now_groups = plan_level_groups(
-                &plans,
-                bound_group_cap(group_cap, &plans, partition_budget.partition_target),
-            );
+            let now_groups = plan_level_groups(&plans, group_cap);
+            let in_flight_cap =
+                bound_group_cap(group_cap, &plans, partition_budget.partition_target);
             reports.extend(export_level_groups(
                 writer,
                 LevelMemory {
@@ -1291,7 +1297,7 @@ pub(super) fn export_levels(
                     budget: &mut *budget,
                 },
                 &now_levels,
-                &now_groups,
+                (&now_groups, in_flight_cap),
                 ckpt,
                 progress,
                 diagnostics,
