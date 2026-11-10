@@ -775,15 +775,19 @@ fn write_table(
             )));
         }
         if rollup.categories.is_some() {
-            for slot in 0..labels.len() as u32 {
-                // A zero count is null, as `--cluster-categories` writes it.
-                columns.push(Arc::new(Int64Array::from_iter(rows.iter().map(|c| {
-                    let cats = c.cats.as_slice();
-                    cats.binary_search_by_key(&slot, |e| e.0)
-                        .ok()
-                        .map(|k| cats[k].1)
-                }))));
-            }
+            // A zero count is null, as `--cluster-categories` writes it.
+            let counts: Vec<ArrayRef> = (0..labels.len() as u32)
+                .into_par_iter()
+                .map(|slot| {
+                    Arc::new(Int64Array::from_iter(rows.iter().map(|c| {
+                        let cats = c.cats.as_slice();
+                        cats.binary_search_by_key(&slot, |e| e.0)
+                            .ok()
+                            .map(|k| cats[k].1)
+                    }))) as ArrayRef
+                })
+                .collect();
+            columns.extend(counts);
         }
         let geoms: Vec<Geometry<f64>> = ids
             .par_iter()
