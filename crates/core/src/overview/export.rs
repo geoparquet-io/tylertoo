@@ -1763,31 +1763,27 @@ fn plan_level_groups(
     groups
 }
 
-/// The members a concurrent level group may hold collected but not yet
-/// encoded ([`InFlight`]): `member_cap` bounded by the largest wave of any
-/// level in `plans`, but never below [`PARTITION_WAVE_MIN`] partitions of
-/// `partition_target`, the narrowest full wave the serial loop holds on any
-/// machine, so a small export's levels all overlap, as on `main`.
+/// The level groups `plans` export in ([`plan_level_groups`]) and how each
+/// runs. Its members in flight are capped at `member_cap`, bounded by the
+/// largest wave of any level but never below [`PARTITION_WAVE_MIN`]
+/// partitions of `partition_target` (the narrowest full wave the serial loop
+/// holds), so a small export's levels all overlap. Collected members wait,
+/// valve and MVT workspace included, until their level encodes, so more of
+/// them in flight than the largest wave would raise the export's peak above
+/// the serial loop's. The cap bounds members in flight, not the group, so a
+/// group whose encodes keep up still overlaps every level.
 ///
-/// Collected members wait, valve and MVT workspace included, until their
-/// level encodes, so more of them in flight than the largest wave raises the
-/// export's peak above what the serial loop holds anyway. #817: on Moldova
-/// `f0` all of z0..z11 (1.57M members) formed one group under a 2.1M cap;
-/// once the collect sped up, the group's valve-heavy encodes fell behind it
-/// and peak RSS rose 15-20%. Bounded by the 766k-member z12 wave, it fell
-/// below `main`'s. This bounds the members in flight, not the group: when
-/// the encodes keep up (Madagascar, NYC), every level of the group still
-/// overlaps, as on `main`. Bounding the group instead ran their levels one
-/// small group after another, +24% wall on Madagascar. The group keeps
-/// `member_cap` on its sum, which also bounds the encoded tiles a group
-/// holds while a slow coarser level keeps them from being written.
-fn bound_group_cap<'p>(
+/// Under every profile but `bounded` a multi-wave level's waves overlap
+/// (#817); `bounded` keeps the serial wave loop, as the overlap is not in its
+/// budget. A `member_cap` of 0 is the serial schedule.
+fn group_schedule(
     member_cap: usize,
-    plans: impl IntoIterator<Item = &'p LevelPlan>,
+    plans: &[LevelPlan],
     partition_target: usize,
-) -> usize {
+    profile: MemoryProfile,
+) -> (Vec<std::ops::Range<usize>>, GroupGate) {
     let largest_wave = plans
-        .into_iter()
+        .iter()
         .flat_map(|plan| {
             plan.partitions
                 .chunks(plan.wave.max(1))
@@ -1795,29 +1791,12 @@ fn bound_group_cap<'p>(
         })
         .max()
         .unwrap_or(0);
-    member_cap.min(largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN)))
-}
-
-/// How a group of `plans` runs: [`bound_group_cap`] members in flight, and
-/// under every profile but `bounded` a multi-wave level's waves overlap
-/// (#817). `bounded` keeps the serial wave loop: the overlap is not in its
-/// budget. A `member_cap` of 0 is the serial schedule.
-///
-/// The cap takes no slack for the overlap. NZ parcels z0-z14 at 0, 2, 6
-/// and 16 partitions of slack ran its levels in 25.2, 25.3, 25.9 and
-/// 25.0 s (its finer levels' waves are narrower than the largest), while
-/// Moldova `f0` export peaked at 4694, 5304 and 5531 MiB at 0, 2 and 6.
-fn group_gate<'p>(
-    member_cap: usize,
-    plans: impl IntoIterator<Item = &'p LevelPlan>,
-    partition_target: usize,
-    profile: MemoryProfile,
-) -> GroupGate {
-    let cap = bound_group_cap(member_cap, plans, partition_target);
-    GroupGate {
+    let cap = member_cap.min(largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN)));
+    let gate = GroupGate {
         cap,
         waves: cap > 0 && profile != MemoryProfile::Bounded,
-    }
+    };
+    (plan_level_groups(plans, member_cap, gate.waves), gate)
 }
 
 /// Resolve a requested partition-wave width to a concrete value.
@@ -2215,6 +2194,8 @@ fn export_pmtiles_impl(
             concurrent_levels: true,
             checkpoint_interval: CHECKPOINT_INTERVAL,
             fail_level: None,
+            #[cfg(test)]
+            panic_write_level: None,
             memory_limit: None,
             budget_available: None,
         },
@@ -2237,6 +2218,10 @@ struct Pass2Knobs {
     /// Fail the export with an injected I/O error when this level starts,
     /// to test what an interrupted group leaves behind.
     fail_level: Option<usize>,
+    /// Panic while a level group writes this level's first wave, to test
+    /// that a panicking write fails the group instead of hanging it.
+    #[cfg(test)]
+    panic_write_level: Option<usize>,
     /// The memory figure for the #665 dense-tile refusal. `None` probes
     /// ([`probe_oom_memory_limit`]); tests inject one.
     memory_limit: Option<MemoryLimit>,
@@ -2724,8 +2709,7 @@ fn export_pmtiles_validated(
             ..template
         })
         .collect();
-    let gate = group_gate(group_cap, &plans, partition_target, options.profile);
-    let level_groups = plan_level_groups(&plans, group_cap, gate.waves);
+    let (level_groups, gate) = group_schedule(group_cap, &plans, partition_target, options.profile);
     let mem = LevelMemory {
         store: store.as_mut(),
         budget: &mut *budget,
@@ -2768,7 +2752,7 @@ fn export_pmtiles_validated(
                         budget: &partition_budget,
                         timers: &probe_timers,
                     },
-                    planned: (&levels, level_groups),
+                    planned: (&levels, level_groups, gate),
                     rest,
                     zooms: &level_zooms,
                     template,
@@ -3039,6 +3023,9 @@ fn fill_backing(
 ///   anything that affects the archive.
 struct ExportProgress {
     fail_level: Option<usize>,
+    /// [`Pass2Knobs::panic_write_level`].
+    #[cfg(test)]
+    panic_write_level: Option<usize>,
     /// When the last checkpoint was written (or the export started): a
     /// checkpoint is due once [`CHECKPOINT_INTERVAL`] has elapsed since. A
     /// fast export finishes before the first interval elapses and never
@@ -3077,6 +3064,8 @@ impl ExportProgress {
             checkpoint_throttle: Instant::now(),
             checkpoint_interval: knobs.checkpoint_interval,
             fail_level: knobs.fail_level,
+            #[cfg(test)]
+            panic_write_level: knobs.panic_write_level,
             #[cfg(test)]
             checkpoint_zooms: Vec::new(),
             profile: ExportProfile {
@@ -3688,9 +3677,9 @@ fn export_level_group(
                 }
                 let (commit, timers, in_flight) = (&commit, &*timers, &in_flight);
                 scope.spawn(move |_| {
-                    let t_encode = Instant::now();
-                    let tiles = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        encode_buckets(
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let t_encode = Instant::now();
+                        let tiles = encode_buckets(
                             level.gzip_cache,
                             (buckets, Some(&held)),
                             level.plan.zoom,
@@ -3698,26 +3687,27 @@ fn export_level_group(
                             level.fills,
                             timers,
                             diagnostics,
-                        )
+                        );
+                        drop(held);
+                        let encoded = tiles.map(|tiles| EncodedWave {
+                            tiles,
+                            start,
+                            collect_secs,
+                            encode_secs: t_encode.elapsed().as_secs_f64(),
+                            spill_bytes,
+                        });
+                        lock_commit(commit, timers).finish((i, w), encoded);
                     }));
-                    drop(held);
-                    let tiles = tiles.unwrap_or_else(|panic| {
+                    if run.is_err() {
                         // The collect may wait on this wave's write: fail
                         // the group so it stops, then let Rayon re-raise.
-                        let e = std::io::Error::other("a wave's encode panicked");
+                        let e = std::io::Error::other("a wave's encode or write panicked");
                         lock_commit(commit, timers).fail(i, ExportError::Io(e));
-                        in_flight.notify();
-                        std::panic::resume_unwind(panic)
-                    });
-                    let encoded = tiles.map(|tiles| EncodedWave {
-                        tiles,
-                        start,
-                        collect_secs,
-                        encode_secs: t_encode.elapsed().as_secs_f64(),
-                        spill_bytes,
-                    });
-                    lock_commit(commit, timers).finish((i, w), encoded);
+                    }
                     in_flight.notify();
+                    if let Err(panic) = run {
+                        std::panic::resume_unwind(panic);
+                    }
                 });
                 unit += 1;
             }
@@ -3737,7 +3727,7 @@ fn export_level_group(
 }
 
 /// How a level group runs ([`export_level_group`]): the [`InFlight`] cap
-/// ([`bound_group_cap`]), and whether a multi-wave level's waves overlap.
+/// ([`group_schedule`]), and whether a multi-wave level's waves overlap.
 #[derive(Clone, Copy)]
 struct GroupGate {
     cap: usize,
@@ -3968,6 +3958,12 @@ impl GroupCommit<'_> {
     fn write_wave(&mut self, encoded: EncodedWave) -> Result<(), ExportError> {
         let (i, w) = self.next;
         let level = &self.levels[i];
+        #[cfg(test)]
+        assert!(
+            w > 0 || self.progress.panic_write_level != Some(level.level_idx),
+            "injected write panic at level {}",
+            level.level_idx
+        );
         let open = &mut self.open;
         if w == 0 {
             *open = OpenLevel {
@@ -5910,8 +5906,8 @@ fn scan_all_levels_from(
             // time, level after level, kept the consumer to about one core.
             // Counts, unions and feature counts are sums and min/max, so the
             // scans are identical however rows are grouped.
-            // `bounded` sizes batch by batch, as before #817: a pool's worth
-            // at once held the bounded scan's peak at 2.3x (Oregon, 80 -> 180 MiB).
+            // `bounded` sizes batch by batch: a pool's worth at once is
+            // outside its scan's memory envelope.
             let size_rows = match band.profile {
                 MemoryProfile::Bounded => EXPORT_BATCH_SIZE,
                 MemoryProfile::Auto | MemoryProfile::Speed => {
@@ -6211,9 +6207,8 @@ fn for_each_member_key(bbox: &TileBounds, zoom: u8, opts: &ExportOptions, mut f:
 
 /// Fewest bboxes one [`size_bboxes`] task sizes. Sizing a bbox costs well
 /// under a microsecond, so finer splits only buy accumulator maps to merge
-/// and a pool to wake: at 64 threads, splitting a batch to the thread count
-/// left about 95% of the export scan's samples in Rayon's spin loop (#817),
-/// slower than at 16 threads.
+/// and a pool to wake: splitting a batch to the thread count leaves a large
+/// pool spinning in Rayon (#817).
 const SIZE_BBOXES_MIN_ROWS: usize = 2048;
 
 #[cfg(test)]
@@ -6748,9 +6743,8 @@ struct BandRead<'a> {
 /// back in read order, so `on_batch` sees the rows exactly as one reader
 /// would hand them over. `band_read` is charged the readers' core-seconds.
 ///
-/// PERF (#817): a band read used to be one reader thread (`scoped_pipe`)
-/// feeding the whole pool; on Moldova z12 that thread sat at 1.2 cores in
-/// ZSTD page decompression while the clip waited on it.
+/// PERF (#817): several readers, as one reader thread cannot decompress
+/// pages as fast as the pool clips them.
 fn read_band(
     band: BandRead<'_>,
     selected: &[usize],
@@ -6823,8 +6817,8 @@ fn band_tuning(
     Ok(ReadTuning {
         budget: band.budget,
         batch_size: EXPORT_BATCH_SIZE,
-        // `bounded` reads with one worker, as before #817: concurrent level
-        // reads each size their read-ahead from the same budget, uncharged.
+        // `bounded` reads with one worker: concurrent level reads each size
+        // their read-ahead from the same budget, uncharged.
         workers: match band.profile {
             MemoryProfile::Bounded => 1,
             MemoryProfile::Auto | MemoryProfile::Speed => {
@@ -6862,8 +6856,8 @@ fn read_error(e: ConvertError) -> ExportError {
 const COLLECT_GROUP_ROWS_PER_THREAD: usize = 512;
 
 /// The rows [`collect_into`] gathers per group on this pool. `bounded`
-/// takes each read batch on its own, as before #817: the groups' decoded
-/// and clipped rows are not priced in the budget.
+/// takes each read batch on its own: the groups' decoded and clipped rows
+/// are not priced in the budget.
 fn collect_group_rows(profile: MemoryProfile) -> usize {
     match profile {
         MemoryProfile::Bounded => 1,
@@ -6987,14 +6981,13 @@ type TileMembers = Vec<(u64, Geometry<f64>)>;
 ///
 /// PERF (#740): property extraction, member materialization and routing run
 /// over row chunks in the pool ([`collect_member_chunk`]); only appending
-/// each chunk's buckets, in chunk order, stays serial. On a 64-core
-/// Moldova export this thread used to do all of it serially while about 8
-/// cores were busy. The chunks are merged in row order, so every bucket
-/// holds the same members in the same order as the serial loop gave.
+/// each chunk's buckets, in chunk order, stays serial. The chunks are
+/// merged in row order, so every bucket holds the same members in the same
+/// order as the serial loop gave.
 ///
 /// PERF (#817): the batches of a group ([`COLLECT_GROUP_ROWS_PER_THREAD`])
 /// share each parallel step, so a 64-thread pool joins once per group, not
-/// once per 8,192-row batch; the joins left 30-38% of the pool spinning.
+/// once per 8,192-row batch, whose joins would leave the pool spinning.
 /// Batches and their chunks are still merged in row order.
 struct ClippedGroup {
     batches: Vec<RecordBatch>,
@@ -11871,18 +11864,23 @@ mod tests {
             plan_with_members(4, &[20], 6),
             plan_with_members(5, &[30], 6),
         ];
-        assert_eq!(bound_group_cap(100, &plans, 1), 30);
+        let cap = |member_cap, plans: &[LevelPlan], target| {
+            group_schedule(member_cap, plans, target, MemoryProfile::Auto)
+                .1
+                .cap
+        };
+        assert_eq!(cap(100, &plans, 1), 30);
         // A multi-wave level's largest wave, not its whole band, is the bound.
         let multi = vec![
             plan_with_members(3, &[10], 6),
             plan_with_members(4, &[10], 6),
             plan_with_members(5, &[3; 12], 6),
         ];
-        assert_eq!(bound_group_cap(100, &multi, 1), 18);
+        assert_eq!(cap(100, &multi, 1), 18);
         // The narrowest wave of full partitions is the floor, and the serial
         // cap stays 0.
-        assert_eq!(bound_group_cap(1_000, &plans, 64), 64 * PARTITION_WAVE_MIN);
-        assert_eq!(bound_group_cap(0, &plans, 64), 0);
+        assert_eq!(cap(1_000, &plans, 64), 64 * PARTITION_WAVE_MIN);
+        assert_eq!(cap(0, &plans, 64), 0);
     }
 
     /// #817: the collect waits while the next level would take the members
@@ -11904,9 +11902,8 @@ mod tests {
     }
 
     /// #817: small single-wave levels whose summed members exceed the
-    /// largest wave still form one concurrent group. `bound_group_cap` used
-    /// to bound the group itself, so each level here ran alone, one after
-    /// another (Madagascar z0..z12 split into six groups, +24% wall).
+    /// largest wave still form one concurrent group: the cap bounds members
+    /// in flight, not the group.
     #[test]
     fn small_levels_stay_one_concurrent_group() {
         let input = tempfile::NamedTempFile::new().unwrap();
@@ -11947,8 +11944,7 @@ mod tests {
 
     /// #817: under `auto` a multi-wave level joins the level group before
     /// it and its waves run through the group's pipeline, so the next wave
-    /// is read while one encodes; `bounded` keeps the serial wave loop. On
-    /// `origin/main` the multi-wave level always ran alone, wave by wave.
+    /// is read while one encodes; `bounded` keeps the serial wave loop.
     #[test]
     fn multi_wave_levels_overlap_their_waves_except_bounded() {
         let input = tempfile::NamedTempFile::new().unwrap();
@@ -12070,6 +12066,7 @@ mod tests {
             concurrent_levels,
             checkpoint_interval: Duration::ZERO,
             fail_level: None,
+            panic_write_level: None,
             memory_limit: None,
             budget_available: None,
         }
@@ -12106,11 +12103,62 @@ mod tests {
         (run, band_rows)
     }
 
+    /// #817 review: a panic while a group writes a wave fails the group and
+    /// re-raises, as an encode panic does. Before, the write ran outside the
+    /// encode's `catch_unwind`, so the next wave of a multi-wave level waited
+    /// for that write forever.
+    #[test]
+    fn level_group_write_panic_does_not_hang() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(input.path());
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            partition_wave: 1,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let good = export_pmtiles_run(
+            input.path(),
+            dir.path().join("good.pmtiles"),
+            &opts,
+            1,
+            &knobs(false, None, true),
+        )
+        .unwrap();
+        let level = good
+            .report
+            .zooms
+            .iter()
+            .find(|z| z.tile_count >= 3)
+            .expect("the fixture must give a level three waves")
+            .level;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let out = dir.path().join("panics.pmtiles");
+        std::thread::spawn(move || {
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                export_pmtiles_run(
+                    input.path(),
+                    &out,
+                    &opts,
+                    1,
+                    &Pass2Knobs {
+                        panic_write_level: Some(level),
+                        ..knobs(false, None, true)
+                    },
+                )
+                .map(|_| ())
+            }));
+            let _ = tx.send(run.is_err());
+        });
+        let panicked = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a panicking group write hung the export");
+        assert!(panicked, "the write panic must reach the caller");
+    }
+
     /// #740 (read amplification): a duplicating-mode level split into several
-    /// waves must read its band's rows once, not once per wave. On
-    /// `origin/main` every wave re-reads each row group its bbox touches, so
-    /// a level of `W` waves over one row group reads its band `W` times
-    /// (measured 1.2-2.5x per finest level on NZ parcels and FTW Moldova).
+    /// waves must read its band's rows once, not once per wave: re-reading
+    /// each row group a wave's bbox touches multiplies the band read.
     #[test]
     fn multi_wave_level_reads_each_band_row_once() {
         let (run, band_rows) = multi_wave_duplicating_run();
@@ -12430,11 +12478,9 @@ mod tests {
     }
 
     /// #817: a band read's batches are collected in groups, so a 64-thread
-    /// pool joins once per group instead of once per 8,192-row batch. On
-    /// `origin/main` every batch is its own set of joins (30-38% of the
-    /// export's level samples were Rayon spin). The grouping is scheduling
-    /// only: one thread, which collects batch by batch, writes the same
-    /// bytes.
+    /// pool joins once per group instead of once per 8,192-row batch. The
+    /// grouping is scheduling only: one thread, which collects batch by
+    /// batch, writes the same bytes.
     #[test]
     fn band_batches_are_collected_in_groups() {
         let input = tempfile::NamedTempFile::new().unwrap();
@@ -12554,9 +12600,7 @@ mod tests {
     }
 
     /// #817 (S1): the scan sizes a batch in a few tasks, not one per pool
-    /// thread. On `origin/main` a 64-thread pool split an 8,192-row batch
-    /// into dozens of accumulator maps, and about 95% of the scan's samples
-    /// were Rayon spin, slower at 64 threads than at 16.
+    /// thread: dozens of accumulator maps per batch leave the pool spinning.
     #[test]
     fn size_bboxes_splits_a_batch_into_few_tasks() {
         let bboxes: Vec<Option<TileBounds>> = (0..EXPORT_BATCH_SIZE)

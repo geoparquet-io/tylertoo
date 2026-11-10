@@ -581,6 +581,7 @@ pub(crate) fn stage_parts(
 pub(crate) fn prefetch_footers(
     parts: &[InputSource],
     in_flight: usize,
+    retain_bytes: u64,
     mut landed: impl FnMut(usize),
 ) {
     #[cfg(feature = "remote")]
@@ -593,9 +594,9 @@ pub(crate) fn prefetch_footers(
         }
     }
     #[cfg(feature = "remote")]
-    remote::prefetch_footers(&remote, in_flight, landed);
+    remote::prefetch_footers(&remote, in_flight, retain_bytes, landed);
     #[cfg(not(feature = "remote"))]
-    let _ = in_flight;
+    let _ = (in_flight, retain_bytes);
 }
 
 /// What one pass-0 staging did (#788): the `pass0` record of the profile
@@ -678,15 +679,21 @@ impl StageAdmission {
     /// requests are latency-bound, so a fixed count of small ones left the
     /// run waiting on round trips the byte budget could have overlapped.
     pub(crate) fn requests_for(&self, request_bytes: u64) -> usize {
+        self.requests_within(request_bytes, self.max_concurrency)
+    }
+
+    /// Requests of `request_bytes` that [`Self::mem_budget`] holds, at least `floor`
+    /// and at most [`Self::concurrency_cap`] (or `floor`, if larger);
+    /// exactly `TYLERTOO_STAGING_CONCURRENCY` when that is set. The one
+    /// in-flight count: [`Self::requests_for`] and pass 0's fetch loop,
+    /// which runs a granted budget down to one request.
+    pub(crate) fn requests_within(&self, request_bytes: u64, floor: usize) -> usize {
         if self.concurrency_set {
             return self.max_concurrency;
         }
         usize::try_from(self.mem_budget / request_bytes.max(1))
             .unwrap_or(usize::MAX)
-            .clamp(
-                self.max_concurrency,
-                self.concurrency_cap.max(self.max_concurrency),
-            )
+            .clamp(floor, self.concurrency_cap.max(floor))
     }
 }
 
@@ -905,8 +912,8 @@ pub(crate) mod remote {
         chunk_ranges: OnceLock<Vec<Range<u64>>>,
         /// The object's tail (footer + 8-byte trailer) and where it starts,
         /// fetched ahead by [`prefetch_footers`]; served to the footer parse,
-        /// then dropped.
-        footer_tail: Mutex<Option<(u64, Bytes)>>,
+        /// then dropped with the prefetch admission's permits for its bytes.
+        footer_tail: Mutex<Option<(u64, Bytes, tokio::sync::OwnedSemaphorePermit)>>,
     }
 
     impl SharedState {
@@ -1121,13 +1128,19 @@ pub(crate) mod remote {
     pub(crate) fn prefetch_footers(
         sources: &[(usize, &RemoteSource)],
         in_flight: usize,
+        retain_bytes: u64,
         mut landed: impl FnMut(usize),
     ) {
         use futures_util::stream::{self, StreamExt};
+        // Each fetched footer holds permits for its bytes until its parse
+        // takes it (`load_footer`), so fetches wait while parses fall behind.
+        let cap = u32::try_from(retain_bytes).unwrap_or(u32::MAX).max(1);
+        let retain = Arc::new(tokio::sync::Semaphore::new(cap as usize));
+        let retain = &retain;
         runtime().block_on(
             stream::iter(sources)
                 .map(|&(i, source)| async move {
-                    source.prefetch_footer().await;
+                    source.prefetch_footer(retain, cap).await;
                     i
                 })
                 .buffer_unordered(in_flight.max(1))
@@ -1139,6 +1152,18 @@ pub(crate) mod remote {
     }
 
     impl RemoteSource {
+        /// Test-only: bytes of the prefetched footer tail still waiting for
+        /// its parse.
+        #[cfg(test)]
+        pub(crate) fn footer_tail_len(&self) -> usize {
+            self.shared
+                .footer_tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map_or(0, |t| t.1.len())
+        }
+
         /// Connect to `url`, resolving the backing store from the scheme
         /// (cached per bucket, see [`store_and_location`]) and HEAD-ing the
         /// object for its size.
@@ -1297,6 +1322,12 @@ pub(crate) mod remote {
         /// it already, in which case this is a cheap clone with no fetch.
         fn load_footer(&self) -> Result<ReaderMetadata, InputError> {
             if let Some(md) = self.metadata.get() {
+                // A tail prefetched while another open loaded the footer.
+                self.shared
+                    .footer_tail
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
                 return Ok(md.clone());
             }
             let reader = InputReader::Remote(self.reader());
@@ -1323,7 +1354,10 @@ pub(crate) mod remote {
         /// Fetch the trailer, then the footer, exactly as the parse would
         /// (the same two counted requests), into `footer_tail`. Any failure
         /// or an encrypted or implausible trailer leaves the parse to fetch it.
-        async fn prefetch_footer(&self) {
+        /// The footer is fetched once `retain` grants its bytes (at most
+        /// `cap`, all of them, so an oversized footer still runs alone); the
+        /// permits stay with the tail until the parse drops it.
+        async fn prefetch_footer(&self, retain: &Arc<tokio::sync::Semaphore>, cap: u32) {
             const TRAILER: u64 = 8;
             if self.metadata.get().is_some() {
                 return;
@@ -1351,7 +1385,12 @@ pub(crate) mod remote {
             ) else {
                 return;
             };
-            let Some(footer_at) = trailer_at.checked_sub(u64::from(u32::from_le_bytes(len))) else {
+            let len = u32::from_le_bytes(len);
+            let Some(footer_at) = trailer_at.checked_sub(u64::from(len)) else {
+                return;
+            };
+            let want = len.saturating_add(8).min(cap);
+            let Ok(permit) = Arc::clone(retain).acquire_many_owned(want).await else {
                 return;
             };
             let Ok(footer) = get(footer_at..trailer_at).await else {
@@ -1365,7 +1404,7 @@ pub(crate) mod remote {
                 .footer_tail
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some((footer_at, Bytes::from(both)));
+                Some((footer_at, Bytes::from(both), permit));
         }
 
         /// Pass 0 (#286/#287): stage the selected row groups to the disk spill
@@ -2362,7 +2401,10 @@ pub(crate) mod remote {
 
     /// See [`super::stage_admission`].
     pub(crate) fn stage_admission() -> super::StageAdmission {
-        let tunables = staging_tunables::effective();
+        admission(staging_tunables::effective())
+    }
+
+    fn admission(tunables: &staging_tunables::StagingTunables) -> super::StageAdmission {
         super::StageAdmission {
             max_concurrency: tunables.max_concurrency,
             concurrency_set: tunables.concurrency_set,
@@ -2416,13 +2458,7 @@ pub(crate) mod remote {
             .unwrap_or(0);
         // #817 R1: as many as the byte budget (a grant of whole largest
         // requests) holds, unless the env pins the count.
-        let max_in_flight = if tunables.concurrency_set {
-            tunables.max_concurrency
-        } else {
-            usize::try_from(tunables.mem_budget / largest.max(1))
-                .unwrap_or(usize::MAX)
-                .clamp(1, staging_tunables::CONCURRENCY_MAX)
-        };
+        let max_in_flight = admission(tunables).requests_within(largest, 1);
         log::debug!(
             "[stage] fetching {} span(s) over {} part(s), up to {} in flight \
              (largest span {largest} B, budget {} B)",
@@ -2882,7 +2918,7 @@ pub(crate) mod remote {
             if length == 0 {
                 return Ok(Bytes::new());
             }
-            if let Some((at, tail)) = &*self
+            if let Some((at, tail, _)) = &*self
                 .shared
                 .footer_tail
                 .lock()
@@ -4569,6 +4605,47 @@ mod tests {
             for r in source.fetched_ranges().unwrap() {
                 assert!(r.end <= total, "range {r:?} beyond object size {total}");
             }
+        }
+
+        /// #817 review: prefetched footers wait for a parse thread holding
+        /// their bytes. Fetches that outpace the parse must stop once the
+        /// retained tails reach `retain_bytes`, not queue every footer.
+        #[test]
+        fn prefetched_footers_retain_at_most_the_budget() {
+            let parts: Vec<InputSource> = (0..16)
+                .map(|i| memory_source(tiny_parquet(), &format!("p{i}.parquet")))
+                .collect();
+            let tail = |s: &InputSource| match s {
+                InputSource::Remote(r) => r.footer_tail_len(),
+                InputSource::Local(_) => unreachable!(),
+            };
+            let bytes = tiny_parquet();
+            let footer = u64::from(u32::from_le_bytes(
+                bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap(),
+            )) + 8;
+            let retain = 2 * footer;
+            let (tx, rx) = std::sync::mpsc::channel::<usize>();
+            let mut most = 0;
+            std::thread::scope(|scope| {
+                let parts = &parts;
+                scope.spawn(move || {
+                    for i in rx {
+                        // A parse slower than the fetches.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        parts[i].open().unwrap();
+                    }
+                });
+                crate::input::prefetch_footers(parts, parts.len(), retain, |i| {
+                    most = most.max(parts.iter().map(tail).sum::<usize>() as u64);
+                    tx.send(i).unwrap();
+                });
+                drop(tx);
+            });
+            assert!(most > 0, "the footers must be prefetched");
+            assert!(
+                most <= retain,
+                "{most} B of footers retained, budget {retain} B"
+            );
         }
 
         #[test]

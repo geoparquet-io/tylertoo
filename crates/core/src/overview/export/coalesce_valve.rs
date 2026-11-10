@@ -617,9 +617,7 @@ mod tests {
 
     /// #817: `batch` measures its gaps in the pool, and gives exactly the
     /// gaps `next_row` gives row by row, across row groups, empty rows and
-    /// batch boundaries. On `origin/main` every gap was measured on the
-    /// calling thread (the export's ordered collect stage, which then held
-    /// the pool at one core).
+    /// batch boundaries.
     #[test]
     fn batch_gaps_are_measured_in_the_pool_and_match_the_row_walk() {
         let geoms: Vec<Geometry<f64>> = (0..3000)

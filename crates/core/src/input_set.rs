@@ -1350,24 +1350,27 @@ const FOOTER_PARSE_THREADS: usize = 8;
 
 /// Load every part's footer, in order. Part 0 loads first: its decoded size
 /// prices one footer in flight, and the staging admission sets how many
-/// remote footers are fetched at once (#817 R1: two round trips per footer,
-/// eight at a time, spent 4.5 s on a 512-part prefix). Each fetched footer
-/// is parsed as it lands, on [`FOOTER_PARSE_THREADS`] threads. Results are
-/// written into per-index slots so the order always matches `parts`; the
-/// first error (by part index) wins.
+/// remote footers are fetched at once (#817 R1: each footer is two round
+/// trips, so a fixed few in flight leave a many-part prefix waiting). Each
+/// fetched footer is parsed as it lands, on [`FOOTER_PARSE_THREADS`]
+/// threads. Results are written into per-index slots so the order always
+/// matches `parts`; the first error (by part index) wins.
 fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
     let Some((first, rest)) = parts.split_first() else {
         return Ok(Vec::new());
     };
     let first = load_part_meta(first)?;
-    let in_flight =
-        crate::input::stage_admission().requests_for(first.parquet.memory_size() as u64);
+    let first_bytes = first.parquet.memory_size() as u64;
+    let admission = crate::input::stage_admission();
+    let in_flight = admission.requests_for(first_bytes);
+    // A fetched footer holds its bytes until a parse thread takes it: at
+    // most what `in_flight` was priced at, or the staging budget.
+    let retain = admission
+        .mem_budget
+        .max(first_bytes.saturating_mul(in_flight as u64));
     let slots: Vec<std::sync::Mutex<Option<Result<PartMeta, InputError>>>> = (0..rest.len())
         .map(|_| std::sync::Mutex::new(None))
         .collect();
-    // shortcut: unbounded, so a fetched footer waits in memory if the parse
-    // falls behind (parsing is faster than two round trips); bound it if a
-    // host ever fetches faster than 8 threads parse.
     let (ready, landed) = std::sync::mpsc::channel::<usize>();
     let landed = std::sync::Mutex::new(landed);
     std::thread::scope(|scope| {
@@ -1381,7 +1384,7 @@ fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
                 *slots[i].lock().expect("footer slot lock") = Some(meta);
             });
         }
-        crate::input::prefetch_footers(rest, in_flight, |i| {
+        crate::input::prefetch_footers(rest, in_flight, retain, |i| {
             let _ = ready.send(i);
         });
         drop(ready);

@@ -658,9 +658,37 @@ impl<W: Write + Send> OverviewWriter<W> {
 
     /// Re-grant the encode concurrency between levels (#817 B1): pass 2's
     /// drain reuses the bytes its finished read held. Boundaries are decided
-    /// serially, so the file is identical at any value.
-    pub(super) fn set_encode_concurrency(&mut self, units: usize) {
-        self.options.encode_concurrency = units.max(1);
+    /// serially, so the file is identical at any value. Lowering it appends
+    /// the oldest in-flight row groups until at most `units` remain, so the
+    /// memory a wider grant priced is free once this returns.
+    ///
+    /// Once a level is written, the concurrency stays on its side of 1: the
+    /// serial encode accumulates the `geo` metadata in [`Self::encoder`] and
+    /// the parallel one in [`Self::geo_meta_acc`], and [`Self::finish`]
+    /// reads only one of them. Pass 2's drain never crosses (its encode
+    /// grant is at least 2 units on 2+ threads, and its width is 1 on one).
+    ///
+    /// # Errors
+    ///
+    /// A drained row group's encode or append failed (the writer is poisoned).
+    ///
+    /// # Panics
+    ///
+    /// If `units` crosses between serial (1) and parallel (2+) after a level.
+    pub(super) fn set_encode_concurrency(&mut self, units: usize) -> Result<(), WriterError> {
+        let units = units.max(1);
+        assert!(
+            self.next_level_idx == 0 || (units > 1) == (self.options.encode_concurrency > 1),
+            "encode concurrency {} -> {units} would mix the serial and parallel geo metadata",
+            self.options.encode_concurrency
+        );
+        self.options.encode_concurrency = units;
+        while self.rg_inflight.len() > self.options.encode_concurrency {
+            if let Some((_, rx)) = self.rg_inflight.pop_front() {
+                self.drain_encoded(rx)?;
+            }
+        }
+        Ok(())
     }
 
     /// Test-only: arm the encode-task fault injection (#426).
@@ -995,7 +1023,7 @@ impl<W: Write + Send> OverviewWriter<W> {
                 #[cfg(test)]
                 faults.trip_row_group();
                 #[cfg(test)]
-                super::accumulate::rendezvous::arrive("encode row group");
+                super::testutil::rendezvous::arrive("encode row group");
                 encode_row_group(writers, batches, &target_schema)
             })
             .unwrap_or_else(|msg| Err(ParquetError::General(msg)));
@@ -1088,7 +1116,8 @@ impl<W: Write + Send> OverviewWriter<W> {
         // parallel WKB path (#304) folds per-chunk contributions into
         // `geo_meta_acc`; the serial path accumulates inside the shared
         // encoder. A writer only ever populates one of the two (the encode
-        // concurrency is fixed at construction). Either way, the metadata is
+        // concurrency never crosses 1 after a level, see
+        // `set_encode_concurrency`). Either way, the metadata is
         // serialized through `geo_metadata_json_deterministic` (#508) rather
         // than the encoder's own `into_keyvalue`/`serde_json::to_string`, so
         // the `geometry_types` array's element order is stable run to run.
@@ -1827,9 +1856,9 @@ mod tests {
         opts.encode_concurrency = 4;
         opts.overlap_levels = true;
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let pool = super::super::accumulate::rendezvous::pool(4);
+        let pool = super::super::testutil::rendezvous::pool(4);
         let ids: Vec<i64> = (0..10).collect();
-        let _guard = super::super::accumulate::rendezvous::arm("encode row group", 2);
+        let _guard = super::super::testutil::rendezvous::arm("encode row group", 2);
         pool.install(|| {
             let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
             for level in 0..3 {
@@ -1840,7 +1869,7 @@ mod tests {
             writer.finish().unwrap();
         });
         assert!(
-            super::super::accumulate::rendezvous::met(),
+            super::super::testutil::rendezvous::met(),
             "two levels' row groups never encoded at once"
         );
     }
@@ -3515,6 +3544,62 @@ mod tests {
                 assert!(!dest.exists(), "nothing published");
             },
         );
+    }
+
+    /// #817 review: lowering the encode concurrency drains the in-flight
+    /// row groups down to it, so encodes a wider drain left running are not
+    /// still holding memory once its caller hands that memory back.
+    #[test]
+    fn lowering_encode_concurrency_drains_down_to_it() {
+        within("lowering_encode_concurrency_drains_down_to_it", || {
+            let schema = Arc::new(source_schema());
+            let mut opts = duplicating_options();
+            opts.encode_concurrency = 4;
+            opts.overlap_levels = true;
+            opts.row_group_size_policy = RowGroupSizePolicy::Constant;
+            opts.max_row_group_size = 1;
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            let ids: Vec<i64> = (0..4).collect();
+            writer
+                .write_level(
+                    0,
+                    Some(ids.len()),
+                    vec![source_batch(&schema, &ids)].into_iter(),
+                )
+                .map(drop)
+                .unwrap();
+            assert!(
+                writer.rg_inflight.len() > 1,
+                "the fixture must leave several in flight"
+            );
+            writer.set_encode_concurrency(2).unwrap();
+            assert!(
+                writer.rg_inflight.len() <= 2,
+                "{} in flight",
+                writer.rg_inflight.len()
+            );
+        });
+    }
+
+    /// #817 review: the serial and parallel encodes accumulate the `geo`
+    /// metadata in different places and `finish` reads one, so a written
+    /// level pins which side of 1 the concurrency stays on.
+    #[test]
+    #[should_panic(expected = "serial and parallel")]
+    fn encode_concurrency_cannot_cross_serial_after_a_level() {
+        let schema = Arc::new(source_schema());
+        let mut opts = duplicating_options();
+        opts.encode_concurrency = 1;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+        writer.set_encode_concurrency(4).unwrap();
+        writer.set_encode_concurrency(1).unwrap();
+        writer
+            .write_level(0, Some(2), vec![source_batch(&schema, &[0, 1])].into_iter())
+            .map(drop)
+            .unwrap();
+        writer.set_encode_concurrency(4).unwrap();
     }
 
     /// #817: without `overlap_levels` (bounded) a level drains

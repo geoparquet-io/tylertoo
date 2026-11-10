@@ -23,12 +23,12 @@ use super::super::level::{Mode, OverviewsMeta};
 use super::super::reader::OverviewReader;
 use super::{
     account_sources, buffer_deg_at_zoom, build_mvt_within, collect_wave, encoded_tile,
-    export_level_groups, for_each_member_key, geometry_lnglat_bbox, group_gate, key_to_xy,
-    near_world_edge, plan_level, plan_level_groups, plan_levels, size_bboxes, sort_tile_for_encode,
-    tile_fit, tile_key, tiles_in_ranges, BandRead, CheckpointCtx, Crs, EncodedTile, ExportError,
-    ExportLevelCtx, ExportOptions, ExportProgress, ExportTimers, FillTally, LevelCtx, LevelMemory,
-    LevelScan, Member, PartitionBudget, PublishedNames, ResolvedFeatureId, StreamingPmtilesWriter,
-    TileMvt, ZoomReport, DEFAULT_EXTENT,
+    export_level_groups, for_each_member_key, geometry_lnglat_bbox, group_schedule, key_to_xy,
+    near_world_edge, plan_level, plan_levels, size_bboxes, sort_tile_for_encode, tile_fit,
+    tile_key, tiles_in_ranges, BandRead, CheckpointCtx, Crs, EncodedTile, ExportError,
+    ExportLevelCtx, ExportOptions, ExportProgress, ExportTimers, FillTally, GroupGate, LevelCtx,
+    LevelMemory, LevelScan, Member, PartitionBudget, PublishedNames, ResolvedFeatureId,
+    StreamingPmtilesWriter, TileMvt, ZoomReport, DEFAULT_EXTENT,
 };
 use crate::compression::TileGzipCache;
 use crate::tile::{max_tile_index, BboxTileRanges, TileBounds, TileCoord, MAX_LATITUDE};
@@ -1159,13 +1159,13 @@ impl Frontier {
 pub(super) struct VdLevels<'a> {
     pub(super) plan: VdPlan,
     pub(super) probe: Probe<'a>,
-    pub(super) planned: (&'a [ExportLevelCtx<'a>], Vec<Range<usize>>),
+    pub(super) planned: (&'a [ExportLevelCtx<'a>], Vec<Range<usize>>, GroupGate),
     pub(super) rest: &'a mut [LevelScan],
     pub(super) zooms: &'a [u8],
     /// Every level's shared context; each level sets its own scan, plan,
     /// index and stopped tiles.
     pub(super) template: ExportLevelCtx<'a>,
-    /// The [`plan_level_groups`] member cap.
+    /// The [`group_schedule`] member cap.
     pub(super) group_cap: usize,
 }
 
@@ -1192,7 +1192,7 @@ pub(super) fn export_levels(
     let VdLevels {
         plan,
         probe,
-        planned: (levels, mut groups),
+        planned: (levels, mut groups, gate),
         rest,
         zooms,
         template,
@@ -1219,15 +1219,7 @@ pub(super) fn export_levels(
                 budget: &mut *budget,
             },
             levels,
-            (
-                &groups,
-                group_gate(
-                    group_cap,
-                    levels.iter().map(|l| l.plan),
-                    partition_budget.partition_target,
-                    template.options.profile,
-                ),
-            ),
+            (&groups, gate),
             ckpt,
             progress,
             diagnostics,
@@ -1288,13 +1280,12 @@ pub(super) fn export_levels(
                     ..template
                 })
                 .collect();
-            let gate = group_gate(
+            let (now_groups, gate) = group_schedule(
                 group_cap,
                 &plans,
                 partition_budget.partition_target,
                 template.options.profile,
             );
-            let now_groups = plan_level_groups(&plans, group_cap, gate.waves);
             reports.extend(export_level_groups(
                 writer,
                 LevelMemory {

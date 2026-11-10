@@ -133,9 +133,8 @@ pub fn tiny_polygon_carriers(
     debug_assert_eq!(features.len(), min_levels.len());
     debug_assert_eq!(features.len(), areas.len());
     // Each level reads the shared inputs and writes only its own list, so
-    // the levels run concurrently (#817: serial, this was 0.2 s of Moldova's
-    // and 1.4 s of NZ parcels' convert at any thread count). Each level holds
-    // its own occupied-patch map; bounded holds one at a time.
+    // the levels run concurrently (#817). Each level holds its own
+    // occupied-patch map; bounded holds one at a time.
     let run = |(li, level): (usize, &AccumulateLevel)| {
         level_carriers(features, min_levels, areas, li, level, crs)
     };
@@ -172,7 +171,7 @@ fn level_carriers(
         return (out, None);
     }
     #[cfg(test)]
-    rendezvous::arrive("accumulate level");
+    super::testutil::rendezvous::arrive("accumulate level");
     let gsd_units = gsd_to_coord_units(level.gsd_meters, crs);
     let side = placeholder_side(level.gsd_meters, level.zoom, crs);
     let floored = side > level_tolerance(level.gsd_meters, crs, 1.0);
@@ -259,83 +258,10 @@ pub fn is_carrier(carriers: &[usize], g: usize) -> bool {
     carriers.binary_search(&g).is_ok()
 }
 
-/// Test-only rendezvous (#817): proves that `n` tasks run at the same time.
-/// A test [`arm`](rendezvous::arm)s a site; every task at that site calls
-/// [`arrive`](rendezvous::arrive), which waits until `n` tasks have arrived
-/// (or a 2 s guard expires). [`met`](rendezvous::met) reports whether all
-/// `n` were in flight at once, which a serial loop can never achieve.
-#[cfg(test)]
-#[expect(
-    clippy::disallowed_types,
-    reason = "#817: test-only rendezvous across pool threads; no diagnostic globals"
-)]
-pub(super) mod rendezvous {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Mutex, MutexGuard};
-    use std::time::{Duration, Instant};
-
-    static SERIAL: Mutex<()> = Mutex::new(());
-    static ARMED: Mutex<Option<(&'static str, usize)>> = Mutex::new(None);
-    static ARRIVED: AtomicUsize = AtomicUsize::new(0);
-    static TIMED_OUT: AtomicBool = AtomicBool::new(false);
-
-    /// Arm `site` for `n` arrivals. Hold the guard for the test's duration:
-    /// it serializes rendezvous tests under plain `cargo test`.
-    pub(in crate::overview) fn arm(site: &'static str, n: usize) -> MutexGuard<'static, ()> {
-        let guard = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ARRIVED.store(0, Ordering::SeqCst);
-        TIMED_OUT.store(false, Ordering::SeqCst);
-        *ARMED.lock().unwrap() = Some((site, n));
-        guard
-    }
-
-    const POOL_THREAD: &str = "rendezvous";
-
-    /// The pool a rendezvous test runs its tasks on. Only its threads count
-    /// as arrivals, so another test's calls through the same site (under
-    /// plain `cargo test`, one process) cannot complete the rendezvous.
-    pub(in crate::overview) fn pool(threads: usize) -> rayon::ThreadPool {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|_| POOL_THREAD.to_owned())
-            .build()
-            .unwrap()
-    }
-
-    pub(in crate::overview) fn arrive(site: &'static str) {
-        if std::thread::current().name() != Some(POOL_THREAD) {
-            return;
-        }
-        let Some((armed, n)) = *ARMED.lock().unwrap() else {
-            return;
-        };
-        if armed != site {
-            return;
-        }
-        ARRIVED.fetch_add(1, Ordering::SeqCst);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while ARRIVED.load(Ordering::SeqCst) < n {
-            if Instant::now() > deadline {
-                TIMED_OUT.store(true, Ordering::SeqCst);
-                return;
-            }
-            std::thread::yield_now();
-        }
-    }
-
-    /// Whether every arrival found all `n` in flight (none waited out the
-    /// guard). Disarms the site.
-    pub(in crate::overview) fn met() -> bool {
-        let n = ARMED.lock().unwrap().take().map_or(0, |(_, n)| n);
-        ARRIVED.load(Ordering::SeqCst) >= n && !TIMED_OUT.load(Ordering::SeqCst)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::assign::AssignFeature;
+    use super::super::testutil::rendezvous;
 
     /// Array-of-structs fixture → the column-major table the engine takes
     /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
@@ -365,10 +291,8 @@ mod tests {
         ]
     }
 
-    /// #817 A1: the levels are independent, so they run concurrently. A
-    /// serial level loop (the old shape: one main thread for the whole
-    /// accumulator, 0.2-1.4 s on Moldova/NZ at any thread count) never has
-    /// four levels in flight at once.
+    /// #817 A1: the levels are independent, so they run concurrently; a
+    /// serial level loop never has four levels in flight at once.
     #[test]
     fn levels_accumulate_concurrently() {
         let feats: Vec<AssignFeature> = (0..10).map(|i| square(i, 10.0, 10.0, 400.0)).collect();

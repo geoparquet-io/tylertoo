@@ -125,7 +125,7 @@ struct Pass2Inputs<'a> {
     footer: Option<FooterPrice>,
     /// The writer's row-group encode grant (#817 B1: the drain widens it).
     encode: Grant,
-    /// What one more drain encode holds ([`drain_slot_price`]).
+    /// What one more drain encode holds ([`encode_price`] at a WKB chunk).
     drain_slot_bytes: u64,
 }
 
@@ -1232,11 +1232,7 @@ fn build_pass2_coalesce_tables(
                 "[convert] building coalesce chain tables for {} level(s)",
                 emitted.len()
             );
-            let lines = ExactChains::new(
-                scratch.inputs(),
-                options.coalesce_junction_angle,
-                options.assign.sort_direction,
-            );
+            let lines = scratch.exact_chains(options);
             emitted
                 .par_iter()
                 .map(|e| {
@@ -1684,15 +1680,11 @@ fn run_pass2_levels(
                         backing,
                         out_schema,
                         spill_dir: options.spill_dir.as_deref(),
-                        drain_encodes: &|held, below_peak| {
-                            MemoryBudget::drain_encodes(
-                                encode,
-                                drain_slot_bytes,
-                                held.min(grants.read.bytes().saturating_add(grants.window.bytes())),
-                                below_peak,
-                                rayon::current_num_threads(),
-                            )
-                        },
+                        drain: (
+                            encode,
+                            drain_slot_bytes,
+                            grants.read.bytes().saturating_add(grants.window.bytes()),
+                        ),
                     },
                 );
                 grants.release(&mut budget);
@@ -1890,7 +1882,7 @@ struct LevelWriter {
     effective_max_row_group_size: Option<usize>,
     /// What `writer`'s encode concurrency was granted.
     encode: Grant,
-    /// What one more pass-2 drain encode holds ([`drain_slot_price`]).
+    /// What one more pass-2 drain encode holds ([`encode_price`] at a WKB chunk).
     drain_slot_bytes: u64,
 }
 
@@ -2015,11 +2007,7 @@ fn pass2_coalesce(
                             "[convert] coalesce level {} was not prebuilt; building it now",
                             e.orig
                         );
-                        let lines = ExactChains::new(
-                            scratch.inputs(),
-                            options.coalesce_junction_angle,
-                            options.assign.sort_direction,
-                        );
+                        let lines = scratch.exact_chains(options);
                         Some(build_level_coalesce_table(
                             &lines,
                             e.orig as usize,
@@ -2068,11 +2056,7 @@ fn coalesce_merged_anywhere(
     {
         return false;
     }
-    let lines = ExactChains::new(
-        scratch.inputs(),
-        options.coalesce_junction_angle,
-        options.assign.sort_direction,
-    );
+    let lines = scratch.exact_chains(options);
     unmaterialized
         .par_iter()
         .filter(|e| e.orig as usize != finest)
@@ -2138,9 +2122,15 @@ fn create_level_writer(
     let encodes = budget.encode_concurrency(
         options.profile,
         rayon::current_num_threads(),
-        encode_price(&writer_opts, &level_row_counts, row_bytes),
+        encode_price(&writer_opts, &level_row_counts, row_bytes, 1),
     );
-    let drain_slot_bytes = drain_slot_price(&writer_opts, &level_row_counts, row_bytes).bytes;
+    let drain_slot_bytes = encode_price(
+        &writer_opts,
+        &level_row_counts,
+        row_bytes,
+        super::writer::WKB_ENCODE_CHUNK_ROWS as u64,
+    )
+    .bytes;
     log::info!(
         "[convert] writer: {} concurrent row-group encode(s) x {} B, {} B left",
         encodes.units,
@@ -2148,7 +2138,9 @@ fn create_level_writer(
         budget.remaining(),
     );
     writer_opts.encode_concurrency = encodes.units;
-    writer_opts.overlap_levels = overlaps_levels(options.profile);
+    // #817 W1: a level's encodes run on under the next, holding up to two
+    // levels' row groups; `bounded` keeps its one-level envelope.
+    writer_opts.overlap_levels = !matches!(options.profile, super::level::MemoryProfile::Bounded);
 
     let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
@@ -2182,33 +2174,10 @@ const ENCODE_COPIES: u64 = 5;
 /// the writer's own per-level split ([`super::writer::projected_row_groups`]);
 /// a row is priced at the footers' bytes per input row (an upper bound for
 /// a simplified level), or at [`MemoryBudget::estimate`]'s sink row without
-/// them.
+/// them. A group is priced at `min_rows` at least: a pass-2 drain slot (#817
+/// B1) also admits one WKB chunk of up to
+/// [`WKB_ENCODE_CHUNK_ROWS`](super::writer::WKB_ENCODE_CHUNK_ROWS) rows.
 fn encode_price(
-    writer_opts: &OverviewWriterOptions,
-    level_row_counts: &[usize],
-    row_bytes: Option<u64>,
-) -> Price {
-    encode_price_at_least(writer_opts, level_row_counts, row_bytes, 1)
-}
-
-/// What one encode slot holds once pass 2's drain widens the writer (#817
-/// B1): a slot also admits one WKB chunk of up to
-/// [`WKB_ENCODE_CHUNK_ROWS`](super::writer::WKB_ENCODE_CHUNK_ROWS) rows, so
-/// a level of small row groups is priced at the chunk, not the group.
-fn drain_slot_price(
-    writer_opts: &OverviewWriterOptions,
-    level_row_counts: &[usize],
-    row_bytes: Option<u64>,
-) -> Price {
-    encode_price_at_least(
-        writer_opts,
-        level_row_counts,
-        row_bytes,
-        super::writer::WKB_ENCODE_CHUNK_ROWS as u64,
-    )
-}
-
-fn encode_price_at_least(
     writer_opts: &OverviewWriterOptions,
     level_row_counts: &[usize],
     row_bytes: Option<u64>,
@@ -2403,13 +2372,9 @@ fn coalesce_level_counts_in_waves(
     let num_levels = level_specs.len();
     // Phase 1 of the chain stage, shared by every level (#817 A2); none
     // when the canonical level is the only one.
-    let lines = (0..num_levels).any(|l| l != finest).then(|| {
-        ExactChains::new(
-            scratch.inputs(),
-            options.coalesce_junction_angle,
-            options.assign.sort_direction,
-        )
-    });
+    let lines = (0..num_levels)
+        .any(|l| l != finest)
+        .then(|| scratch.exact_chains(options));
     let wave = wave.max(1);
     log::info!(
         "[convert] {} coalesce chains for {num_levels} level(s) ({} candidate line(s), \
@@ -2683,9 +2648,9 @@ fn resolve_winner_tables(
     })
 }
 
-/// Free `items` across the rayon pool (#817 T1). One thread freeing
-/// millions of geometries was 0.6 s of Oregon's convert at 1 core; export
-/// frees its spill buckets the same way.
+/// Free `items` across the rayon pool (#817 T1): one thread freeing
+/// millions of geometries is a serial stretch in no phase. Export frees its
+/// spill buckets the same way.
 fn release_in_parallel<I>(items: I)
 where
     I: IntoParallelIterator,
@@ -5035,6 +5000,15 @@ pub(super) struct CoalesceScratch {
 }
 
 impl CoalesceScratch {
+    /// The exact-endpoint join over these lines that every level shares.
+    fn exact_chains(&self, options: &ConvertOptions) -> ExactChains<'_> {
+        ExactChains::new(
+            self.inputs(),
+            options.coalesce_junction_angle,
+            options.assign.sort_direction,
+        )
+    }
+
     /// The per-level chaining inputs (borrowing the collected geometries).
     fn inputs(&self) -> Vec<CoalesceInput<'_>> {
         (0..self.rows.len())
@@ -7221,25 +7195,8 @@ pub(super) fn process_batch_cascade(
 
 // ============================================================================
 
-/// Whether pass 2's writer lets the previous level's row-group encodes run
-/// on under the next level (#817 W1). It holds up to two levels' row groups:
-/// on Madagascar adm4 z12, -12-14% wall for +3% (64 threads) to +10% (16)
-/// peak RSS; deeper overlap bought 2-4% more for +9-23%. `bounded` keeps
-/// its one-level envelope.
-fn overlaps_levels(profile: super::level::MemoryProfile) -> bool {
-    !matches!(profile, super::level::MemoryProfile::Bounded)
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn auto_overlaps_level_encodes_bounded_does_not() {
-        use super::super::level::MemoryProfile;
-        assert!(super::overlaps_levels(MemoryProfile::Auto));
-        assert!(super::overlaps_levels(MemoryProfile::Speed));
-        assert!(!super::overlaps_levels(MemoryProfile::Bounded));
-    }
-
     /// Array-of-structs fixture → the column-major table the engine takes
     /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
     /// pipeline fills a [`FeatureTable`] directly from the scan, so this
@@ -10077,22 +10034,21 @@ mod tests {
     }
 
     /// #817 T1: convert's O(dataset) leftovers (the line scratch, the chain
-    /// tables) are freed across the pool, not by one thread at scope end
-    /// (0.6 s at 1 core on Oregon roads, in no profiled phase).
+    /// tables) are freed across the pool, not by one thread at scope end.
     #[test]
     fn release_in_parallel_frees_on_several_threads() {
         struct Arrive;
         impl Drop for Arrive {
             fn drop(&mut self) {
-                super::super::accumulate::rendezvous::arrive("release");
+                super::super::testutil::rendezvous::arrive("release");
             }
         }
         let items: Vec<Arrive> = (0..4).map(|_| Arrive).collect();
-        let pool = super::super::accumulate::rendezvous::pool(4);
-        let _guard = super::super::accumulate::rendezvous::arm("release", 4);
+        let pool = super::super::testutil::rendezvous::pool(4);
+        let _guard = super::super::testutil::rendezvous::arm("release", 4);
         pool.install(|| release_in_parallel(items));
         assert!(
-            super::super::accumulate::rendezvous::met(),
+            super::super::testutil::rendezvous::met(),
             "the 4 drops never ran at once"
         );
     }
@@ -10106,16 +10062,15 @@ mod tests {
         opts.max_row_group_size = 128;
         let counts = [1_000usize, 50_000, 200_000];
         let row = Some(100u64);
-        let group = encode_price(&opts, &counts, row).bytes;
-        let slot = drain_slot_price(&opts, &counts, row).bytes;
+        let group = encode_price(&opts, &counts, row, 1).bytes;
+        let chunk = crate::overview::writer::WKB_ENCODE_CHUNK_ROWS as u64;
+        let slot = encode_price(&opts, &counts, row, chunk).bytes;
         assert!(group < slot, "group {group} B vs slot {slot} B");
         assert_eq!(slot, 10_000 * 100 * ENCODE_COPIES);
     }
 
     /// #817 A2: the exact-endpoint join (phase 1 of the chain stage) does
-    /// not depend on the level, so one run serves every level. It used to
-    /// run once per level (15 times on a z0-z14 ladder; 0.75 s each on
-    /// Oregon roads, one thread per level).
+    /// not depend on the level, so one run serves every level.
     #[test]
     fn chain_stage_runs_the_exact_join_once_for_all_levels() {
         let scratch = chained_scratch(40);

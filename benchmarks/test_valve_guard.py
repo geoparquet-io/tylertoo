@@ -162,6 +162,8 @@ def test_exemptions_file_is_read_by_cell(tmp_path):
 def test_record_keeps_the_classes_floors():
     doc = vg.with_record(_cores_baseline(), {"host": VM, "cells": BASE})
     assert doc["hosts"][vg.host_class_key(VM)]["floors"] == FLOORS
+    seeded = vg.with_record(_cores_baseline(floors=None), {"host": VM, "cells": BASE})
+    assert seeded["hosts"][vg.host_class_key(VM)]["floors"] == vg.DEFAULT_FLOORS
 
 
 # --- scaling and core-seconds checks (#817 follow-up) --------------------------

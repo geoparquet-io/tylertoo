@@ -448,8 +448,7 @@ impl MemoryBudget {
     /// least the grant's own unit) as `reused` bytes hold, at most `threads`.
     /// `reused` is what the finished read's read-ahead and compute window
     /// actually held (empty by the drain), capped at their grants: the
-    /// grants alone overstate it (bounded Moldova: 2.1 GB granted, a 1.94 GB
-    /// pass-2 peak in all), and spending them raised the run's peak. It is
+    /// grants alone overstate it, and spending them raises the run's peak. It is
     /// also capped at `below_peak` (how far the process sits below its peak
     /// RSS) less the `encode` grant's own slots, which the drain spends
     /// anyway, so the whole drain fits under the peak.
