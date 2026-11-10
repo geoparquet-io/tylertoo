@@ -33,7 +33,7 @@
 //!   of the input groups it read, under prorated row-group sizes, so its
 //!   predecessors and the merges in an over-cap tile can differ from a
 //!   single-machine build; make the gap shard-independent (a dataset-global
-//!   predecessor) when sharded merge-valve output must match exactly.
+//!   predecessor, #854) when sharded merge-valve output must match exactly.
 //!   Tippecanoe measures against the previous feature in its global index.
 //! - Members merge only within their own level band. In partitioning mode a
 //!   tile holds several bands, each in its own spatial order, so the row
