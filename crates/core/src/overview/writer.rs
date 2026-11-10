@@ -662,11 +662,27 @@ impl<W: Write + Send> OverviewWriter<W> {
     /// the oldest in-flight row groups until at most `units` remain, so the
     /// memory a wider grant priced is free once this returns.
     ///
+    /// Once a level is written, the concurrency stays on its side of 1: the
+    /// serial encode accumulates the `geo` metadata in [`Self::encoder`] and
+    /// the parallel one in [`Self::geo_meta_acc`], and [`Self::finish`]
+    /// reads only one of them. Pass 2's drain never crosses (its encode
+    /// grant is at least 2 units on 2+ threads, and its width is 1 on one).
+    ///
     /// # Errors
     ///
     /// A drained row group's encode or append failed (the writer is poisoned).
+    ///
+    /// # Panics
+    ///
+    /// If `units` crosses between serial (1) and parallel (2+) after a level.
     pub(super) fn set_encode_concurrency(&mut self, units: usize) -> Result<(), WriterError> {
-        self.options.encode_concurrency = units.max(1);
+        let units = units.max(1);
+        assert!(
+            self.next_level_idx == 0 || (units > 1) == (self.options.encode_concurrency > 1),
+            "encode concurrency {} -> {units} would mix the serial and parallel geo metadata",
+            self.options.encode_concurrency
+        );
+        self.options.encode_concurrency = units;
         while self.rg_inflight.len() > self.options.encode_concurrency {
             if let Some((_, rx)) = self.rg_inflight.pop_front() {
                 self.drain_encoded(rx)?;
@@ -1100,7 +1116,8 @@ impl<W: Write + Send> OverviewWriter<W> {
         // parallel WKB path (#304) folds per-chunk contributions into
         // `geo_meta_acc`; the serial path accumulates inside the shared
         // encoder. A writer only ever populates one of the two (the encode
-        // concurrency is fixed at construction). Either way, the metadata is
+        // concurrency never crosses 1 after a level, see
+        // `set_encode_concurrency`). Either way, the metadata is
         // serialized through `geo_metadata_json_deterministic` (#508) rather
         // than the encoder's own `into_keyvalue`/`serde_json::to_string`, so
         // the `geometry_types` array's element order is stable run to run.
@@ -3556,13 +3573,33 @@ mod tests {
                 writer.rg_inflight.len() > 1,
                 "the fixture must leave several in flight"
             );
-            writer.set_encode_concurrency(1).unwrap();
+            writer.set_encode_concurrency(2).unwrap();
             assert!(
-                writer.rg_inflight.len() <= 1,
+                writer.rg_inflight.len() <= 2,
                 "{} in flight",
                 writer.rg_inflight.len()
             );
         });
+    }
+
+    /// #817 review: the serial and parallel encodes accumulate the `geo`
+    /// metadata in different places and `finish` reads one, so a written
+    /// level pins which side of 1 the concurrency stays on.
+    #[test]
+    #[should_panic(expected = "serial and parallel")]
+    fn encode_concurrency_cannot_cross_serial_after_a_level() {
+        let schema = Arc::new(source_schema());
+        let mut opts = duplicating_options();
+        opts.encode_concurrency = 1;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+        writer.set_encode_concurrency(4).unwrap();
+        writer.set_encode_concurrency(1).unwrap();
+        writer
+            .write_level(0, Some(2), vec![source_batch(&schema, &[0, 1])].into_iter())
+            .map(drop)
+            .unwrap();
+        writer.set_encode_concurrency(4).unwrap();
     }
 
     /// #817: without `overlap_levels` (bounded) a level drains
