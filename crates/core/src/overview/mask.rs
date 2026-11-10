@@ -1,7 +1,7 @@
 //! `--mask` (#826): keep only the features that intersect a polygon.
 //!
 //! The mask's bbox joins `--bbox` in the footer-statistics pruning
-//! (`region_query`); `MaskIndex` then tests each surviving feature
+//! (`mask_query`); `MaskIndex` then tests each surviving feature
 //! exactly. The index answers in about O(feature vertices × log mask
 //! vertices): an R-tree over the mask's edges finds boundary contacts, and
 //! an interval tree answers point-in-mask.
@@ -107,6 +107,14 @@ fn read(source: &MaskSource) -> Result<LoadedMask, ConfigError> {
                 .map_err(|e| invalid(format!("invalid WKB: {e}")))?],
             None,
         ),
+        // One regular file: a directory or glob would hide edits from the
+        // load cache and the plan fingerprint.
+        MaskSource::Path(path) if !path.is_file() => {
+            return Err(invalid(format!(
+                "cannot read {}: not a file",
+                path.display()
+            )))
+        }
         MaskSource::Path(path) if is_geojson(path) => (read_geojson(path)?, Some(Crs::Epsg4326)),
         MaskSource::Path(path) => read_geoparquet(path)?,
     };
@@ -117,6 +125,15 @@ fn read(source: &MaskSource) -> Result<LoadedMask, ConfigError> {
     let polygons = MultiPolygon::new(polygons);
     if polygons.is_empty() {
         return Err(invalid("the mask holds no polygon area".into()));
+    }
+    {
+        use geo::CoordsIter;
+        if polygons
+            .coords_iter()
+            .any(|c| !c.x.is_finite() || !c.y.is_finite())
+        {
+            return Err(invalid("the mask has a non-finite coordinate".into()));
+        }
     }
     Ok(LoadedMask { polygons, crs })
 }
@@ -179,7 +196,17 @@ fn read_geoparquet(path: &Path) -> Result<(Vec<Geometry<f64>>, Option<Crs>), Con
             &diagnostics,
         )
         .map_err(|e| fail(&e))?;
-        geoms.extend(out.into_iter().flatten());
+        // The reader turns a non-finite geometry into an empty one; a mask
+        // must not shrink silently, so an empty row is refused.
+        for g in out.into_iter().flatten() {
+            if g.is_empty() {
+                return Err(invalid(format!(
+                    "{} has an empty or non-finite geometry",
+                    path.display()
+                )));
+            }
+            geoms.push(g);
+        }
     }
     Ok((geoms, Some(crs)))
 }
@@ -238,26 +265,12 @@ pub(crate) fn load_for_input(
     load(source)?.into_input_crs(crs)
 }
 
-/// The footer-pruning and per-feature bbox query for `--bbox` AND `--mask`:
-/// the bbox (lon/lat degrees) and the mask's bbox (CRS units), intersected.
-pub(crate) fn region_query(
-    bbox: Option<&[f64; 4]>,
-    mask: Option<&MultiPolygon<f64>>,
-    crs: Crs,
-) -> Option<BboxQuery> {
-    let bbox = bbox.map(|b| super::convert::bbox_to_crs_units(b, crs));
-    let mask = mask.and_then(BoundingRect::bounding_rect).map(rect_box);
-    let base = match (bbox, mask) {
-        (Some(a), Some(b)) => [
-            a[0].max(b[0]),
-            a[1].max(b[1]),
-            a[2].min(b[2]),
-            a[3].min(b[3]),
-        ],
-        (Some(a), None) | (None, Some(a)) => a,
-        (None, None) => return None,
-    };
-    Some(BboxQuery::in_crs_units(base, crs))
+/// The mask's bbox as a query in `crs` units, with its copies one world
+/// width west and east (#643). It prunes row groups alongside `--bbox`'s
+/// own query; the two are tested apart, so each keeps its wrapped copies.
+pub(crate) fn mask_query(mask: Option<&MultiPolygon<f64>>, crs: Crs) -> Option<BboxQuery> {
+    let r = mask?.bounding_rect()?;
+    Some(BboxQuery::in_crs_units(rect_box(r), crs))
 }
 
 fn rect_box(r: geo::Rect<f64>) -> [f64; 4] {
@@ -299,7 +312,7 @@ impl MaskIndex {
             area: IntervalTreeMultiPolygon::new(mask),
             edges: RTree::bulk_load(mask.lines_iter().collect()),
             parts: RTree::bulk_load(parts),
-            query: region_query(None, Some(mask), crs).expect("a mask has a bbox"),
+            query: mask_query(Some(mask), crs).expect("a mask has a bbox"),
             world: super::convert::world_width(crs),
         }
     }
@@ -613,18 +626,30 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_directory_and_non_finite_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = load(&MaskSource::Path(dir.path().into()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a file"), "{err}");
+        let wkb = crate::wkb::geometry_to_wkb(
+            &Polygon::new(
+                LineString::from(vec![(0.0, 0.0), (f64::NAN, 0.0), (1.0, 1.0), (0.0, 0.0)]),
+                vec![],
+            )
+            .into(),
+        )
+        .unwrap();
+        let err = load(&MaskSource::Wkb(wkb)).unwrap_err().to_string();
+        assert!(err.contains("non-finite"), "{err}");
+    }
+
+    #[test]
     fn loads_wkb_without_a_crs() {
         let wkb =
             crate::wkb::geometry_to_wkb(&wkt!(POLYGON((0.0 0.0,1.0 0.0,1.0 1.0,0.0 0.0))).into())
                 .unwrap();
         let loaded = load(&MaskSource::Wkb(wkb)).unwrap();
         assert!(loaded.into_input_crs(Crs::Epsg3857).is_ok());
-    }
-
-    #[test]
-    fn mask_and_bbox_intersect_into_one_query() {
-        let mask = MultiPolygon::new(vec![wkt!(POLYGON((0.0 0.0,4.0 0.0,4.0 4.0,0.0 0.0)))]);
-        let q = region_query(Some(&[2.0, -1.0, 10.0, 1.0]), Some(&mask), Crs::Epsg4326).unwrap();
-        assert_eq!(q.boxes()[0], [2.0, 0.0, 4.0, 1.0]);
     }
 }

@@ -1159,11 +1159,18 @@ fn shard_chain_reps(
 pub(super) fn select_row_groups_streaming(
     source: &ConvertSource,
     bbox_query: Option<&BboxQuery>,
+    mask_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
     shard: Option<&crate::shard::TileRange>,
     crs: Crs,
 ) -> Result<Option<RowGroupSelection>, ConvertError> {
     let bbox_selection: Option<RowGroupSelection> = match bbox_query {
+        Some(q) => Some(source.select_row_groups_any(q.boxes())?),
+        None => None,
+    };
+    // `--mask` (#826): its own query, so `--bbox` and the mask each keep
+    // their wrapped copies (#643).
+    let mask_selection: Option<RowGroupSelection> = match mask_query {
         Some(q) => Some(source.select_row_groups_any(q.boxes())?),
         None => None,
     };
@@ -1179,10 +1186,15 @@ pub(super) fn select_row_groups_streaming(
         Some(range) => Some(source.select_row_groups_any(shard_read_query(range, crs).boxes())?),
         None => None,
     };
-    Ok([bbox_selection, filter_selection, shard_selection]
-        .into_iter()
-        .flatten()
-        .reduce(|a, b| a.intersect(&b)))
+    Ok([
+        bbox_selection,
+        mask_selection,
+        filter_selection,
+        shard_selection,
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(|a, b| a.intersect(&b)))
 }
 
 /// Unsigned area of a polygonal geometry in CRS units², 0 for anything else
@@ -2757,7 +2769,8 @@ fn preflight_with_memory_limit(
         .as_ref()
         .map(|m| super::mask::load_for_input(m, crs))
         .transpose()?;
-    let bbox_query = super::mask::region_query(options.bbox.as_ref(), mask.as_ref(), crs);
+    let bbox_query = options.bbox.map(|b| BboxQuery::new(&b, crs));
+    let mask_query = super::mask::mask_query(mask.as_ref(), crs);
     let t_index = Instant::now();
     let mask = mask.map(|m| super::mask::MaskIndex::new(&m, crs));
     if mask.is_some() {
@@ -2770,6 +2783,7 @@ fn preflight_with_memory_limit(
     let selected_row_groups = select_row_groups_streaming(
         source,
         bbox_query.as_ref(),
+        mask_query.as_ref(),
         bound_filter.as_ref(),
         options.shard.as_ref(),
         crs,
@@ -2782,7 +2796,7 @@ fn preflight_with_memory_limit(
     // present: a `--shard` run prunes too, and reporting its selection as an
     // "attribute filter" would send whoever read the log looking for a
     // `--filter` that was never passed. The shard has its own line below.
-    if bbox_query.is_some() || bound_filter.is_some() {
+    if bbox_query.is_some() || mask.is_some() || bound_filter.is_some() {
         let what = super::convert::pruning_label(
             options.bbox.is_some(),
             mask.is_some(),
@@ -2818,7 +2832,7 @@ fn preflight_with_memory_limit(
             selected_rows.max(0) as u64,
             memory_limit,
             skip_memory_preflight,
-            bbox_query.is_some() || bound_filter.is_some(),
+            bbox_query.is_some() || mask.is_some() || bound_filter.is_some(),
             diagnostics,
         )?
     } else {
@@ -9911,7 +9925,7 @@ mod tests {
 
         // No pruning active: no selection, and the reader delivers every group.
         assert!(
-            select_row_groups_streaming(&source, None, None, None, crs)
+            select_row_groups_streaming(&source, None, None, None, None, crs)
                 .unwrap()
                 .is_none(),
             "no bbox, filter, or shard means no selection at all"
@@ -9927,6 +9941,7 @@ mod tests {
         let sel = select_row_groups_streaming(
             &source,
             Some(&BboxQuery::new(&bbox, crs)),
+            None,
             None,
             None,
             crs,
@@ -9951,6 +9966,7 @@ mod tests {
         let sel = select_row_groups_streaming(
             &source,
             Some(&BboxQuery::new(&nowhere, crs)),
+            None,
             None,
             None,
             crs,
@@ -9990,7 +10006,7 @@ mod tests {
 
         // Filter alone: group 0 (0.1) and group 3 (all null) are provably
         // non-matching by their column statistics.
-        let sel = select_row_groups_streaming(&source, None, Some(&filter), None, crs)
+        let sel = select_row_groups_streaming(&source, None, None, Some(&filter), None, crs)
             .unwrap()
             .expect("a filter always yields a selection");
         assert_eq!(sel.parts(), &[vec![1usize, 2]], "statistics pushdown");
@@ -10003,6 +10019,7 @@ mod tests {
         let sel = select_row_groups_streaming(
             &source,
             Some(&BboxQuery::new(&bbox, crs)),
+            None,
             Some(&filter),
             None,
             crs,
@@ -10020,6 +10037,7 @@ mod tests {
         let sel = select_row_groups_streaming(
             &source,
             Some(&BboxQuery::new(&bbox, crs)),
+            None,
             Some(&filter),
             None,
             crs,
@@ -10044,9 +10062,10 @@ mod tests {
         // z4 tile x=0 spans lng -180..-157.5.
         let id = crate::pmtiles_writer::tile_id(4, 0, 7);
         let range = crate::shard::TileRange::new(4, id, id).unwrap();
-        let sel = select_row_groups_streaming(&source, None, None, Some(&range), Crs::Epsg4326)
-            .unwrap()
-            .expect("a shard always yields a selection");
+        let sel =
+            select_row_groups_streaming(&source, None, None, None, Some(&range), Crs::Epsg4326)
+                .unwrap()
+                .expect("a shard always yields a selection");
         assert_eq!(sel.parts(), &[vec![1usize]]);
     }
 
@@ -10071,7 +10090,7 @@ mod tests {
         let read = range.read_bounds();
         assert!(read.lng_min <= -160.0 && read.lng_max < -10.0, "{read:?}");
 
-        let sel = select_row_groups_streaming(&source, None, None, Some(&range), crs)
+        let sel = select_row_groups_streaming(&source, None, None, None, Some(&range), crs)
             .unwrap()
             .expect("a shard always yields a selection");
         assert_eq!(

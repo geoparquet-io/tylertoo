@@ -576,9 +576,9 @@ mod config_parity {
     use tylertoo_core::internal::overview::convert::LevelPlan;
 
     /// A `--mask` file for the parity entries; validation reads it (#826).
-    fn mask_file() -> String {
+    fn mask_file(test: &str) -> String {
         let path = std::env::temp_dir().join(format!(
-            "tylertoo-parity-mask-{}.geojson",
+            "tylertoo-parity-mask-{test}-{}.geojson",
             std::process::id()
         ));
         std::fs::write(
@@ -613,7 +613,7 @@ mod config_parity {
             serde_json::to_value(python.validate().unwrap().options()).unwrap(),
             expected
         );
-        let mask = mask_file();
+        let mask = mask_file("overview");
         let args = cli::OverviewArgs::parse_from([
             "overview",
             "in",
@@ -679,7 +679,7 @@ mod config_parity {
             serde_json::to_value(python.validate().unwrap().options()).unwrap(),
             expected
         );
-        let mask = mask_file();
+        let mask = mask_file("tiles");
         let args = cli::TilesArgs::parse_from([
             "tiles",
             "in",

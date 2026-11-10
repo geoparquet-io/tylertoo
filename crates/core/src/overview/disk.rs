@@ -120,10 +120,14 @@ impl DiskFootprint {
                     .mask
                     .as_ref()
                     .and_then(|m| super::mask::load_for_input(m, crs).ok());
-                let bbox = super::mask::region_query(options.bbox.as_ref(), mask.as_ref(), crs);
+                let bbox = options
+                    .bbox
+                    .map(|b| super::convert::BboxQuery::new(&b, crs));
+                let mask = super::mask::mask_query(mask.as_ref(), crs);
                 select_row_groups_streaming(
                     source,
                     bbox.as_ref(),
+                    mask.as_ref(),
                     None,
                     options.shard.as_ref(),
                     crs,

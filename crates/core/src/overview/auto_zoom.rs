@@ -696,10 +696,15 @@ pub(crate) fn estimate_with(
     let mask = mask
         .map(|m| super::mask::load_for_input(m, crs))
         .transpose()?;
-    let bbox_query = super::mask::region_query(bbox, mask.as_ref(), crs);
+    let bbox_query = bbox.map(|b| super::convert::BboxQuery::new(b, crs));
+    let mask_query = super::mask::mask_query(mask.as_ref(), crs);
 
     // The conversion's footer-statistics pruning (#102 bbox, #315 filter).
     let bbox_sel = bbox_query
+        .as_ref()
+        .map(|q| source.select_row_groups_any(q.boxes()))
+        .transpose()?;
+    let mask_sel = mask_query
         .as_ref()
         .map(|q| source.select_row_groups_any(q.boxes()))
         .transpose()?;
@@ -707,7 +712,7 @@ pub(crate) fn estimate_with(
         .as_ref()
         .map(|f| source.select_row_groups_matching(f))
         .transpose()?;
-    let selection = [bbox_sel, filter_sel]
+    let selection = [bbox_sel, mask_sel, filter_sel]
         .into_iter()
         .flatten()
         .reduce(|a, b| a.intersect(&b));
@@ -815,7 +820,11 @@ pub(crate) fn estimate_with(
                 }
             };
             for bb in bboxes.into_iter().flatten() {
-                if bbox_query.as_ref().is_some_and(|q| !q.intersects(&bb)) {
+                if [&bbox_query, &mask_query]
+                    .into_iter()
+                    .flatten()
+                    .any(|q| !q.intersects(&bb))
+                {
                     continue;
                 }
                 let (cx, cy) = ((bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5);

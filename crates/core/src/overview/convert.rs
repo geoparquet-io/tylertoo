@@ -14434,6 +14434,34 @@ mod tests {
         assert_eq!(report.input_features, 1);
     }
 
+    /// #826: `--bbox` and `--mask` each keep their ±360° copies (#643): a
+    /// 0..360 mask and a -180..180 bbox both reach a feature at lng 200.
+    #[test]
+    fn mask_and_bbox_each_match_wrapped_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_multi_rg_input(&input, &[(200.0, 10.0)], true);
+        let mask = write_mask(
+            &dir,
+            r#"{"type":"Polygon","coordinates":[[[199,9],[201,9],[201,11],[199,11],[199,9]]]}"#,
+        );
+        let report = convert_to_overviews(
+            &input,
+            dir.path().join("out.parquet"),
+            &ConvertOptions {
+                mask: Some(mask),
+                bbox: Some([-161.0, 9.0, -159.0, 11.0]),
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.input_features, 1);
+    }
+
     /// #826: until reprojection (#670), a mask in another CRS is refused.
     #[test]
     fn mask_in_another_crs_is_refused() {
