@@ -12844,8 +12844,11 @@ mod tests {
             .build()
             .unwrap();
         let (auto, readers, flushes) = pool.install(|| scan(MemoryProfile::Auto));
-        assert!(
+        // The auto reader count follows the host's cores: one on one CPU.
+        let several = resolve_pass_read_workers(ReadPass::Scan, READ_WORKERS_AUTO) > 1;
+        assert_eq!(
             readers > 1,
+            several,
             "auto scanned a 4-row-group band with {readers} reader(s)"
         );
         assert_eq!(
