@@ -1350,11 +1350,11 @@ const FOOTER_PARSE_THREADS: usize = 8;
 
 /// Load every part's footer, in order. Part 0 loads first: its decoded size
 /// prices one footer in flight, and the staging admission sets how many
-/// remote footers are fetched at once (#817 R1: two round trips per footer,
-/// eight at a time, spent 4.5 s on a 512-part prefix). Each fetched footer
-/// is parsed as it lands, on [`FOOTER_PARSE_THREADS`] threads. Results are
-/// written into per-index slots so the order always matches `parts`; the
-/// first error (by part index) wins.
+/// remote footers are fetched at once (#817 R1: each footer is two round
+/// trips, so a fixed few in flight leave a many-part prefix waiting). Each
+/// fetched footer is parsed as it lands, on [`FOOTER_PARSE_THREADS`]
+/// threads. Results are written into per-index slots so the order always
+/// matches `parts`; the first error (by part index) wins.
 fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
     let Some((first, rest)) = parts.split_first() else {
         return Ok(Vec::new());

@@ -1651,8 +1651,8 @@ struct TileFill {
     polys: Vec<FillPolygon>,
     lifted: Vec<Shape>,
     /// A tile built alone keeps its fill unsnapped and unlifted: its commit
-    /// snaps, spills, then lifts, never holding both, within the same
-    /// workspace as the serial pyramid before #817.
+    /// snaps, spills, then lifts, never holding both, so it fits the whole
+    /// workspace alone.
     fill: Vec<Shape>,
     area: f64,
     vertices: usize,

@@ -2648,9 +2648,9 @@ fn resolve_winner_tables(
     })
 }
 
-/// Free `items` across the rayon pool (#817 T1). One thread freeing
-/// millions of geometries was 0.6 s of Oregon's convert at 1 core; export
-/// frees its spill buckets the same way.
+/// Free `items` across the rayon pool (#817 T1): one thread freeing
+/// millions of geometries is a serial stretch in no phase. Export frees its
+/// spill buckets the same way.
 fn release_in_parallel<I>(items: I)
 where
     I: IntoParallelIterator,
@@ -10034,8 +10034,7 @@ mod tests {
     }
 
     /// #817 T1: convert's O(dataset) leftovers (the line scratch, the chain
-    /// tables) are freed across the pool, not by one thread at scope end
-    /// (0.6 s at 1 core on Oregon roads, in no profiled phase).
+    /// tables) are freed across the pool, not by one thread at scope end.
     #[test]
     fn release_in_parallel_frees_on_several_threads() {
         struct Arrive;
@@ -10071,9 +10070,7 @@ mod tests {
     }
 
     /// #817 A2: the exact-endpoint join (phase 1 of the chain stage) does
-    /// not depend on the level, so one run serves every level. It used to
-    /// run once per level (15 times on a z0-z14 ladder; 0.75 s each on
-    /// Oregon roads, one thread per level).
+    /// not depend on the level, so one run serves every level.
     #[test]
     fn chain_stage_runs_the_exact_join_once_for_all_levels() {
         let scratch = chained_scratch(40);

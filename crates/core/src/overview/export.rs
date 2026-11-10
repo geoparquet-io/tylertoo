@@ -5906,8 +5906,8 @@ fn scan_all_levels_from(
             // time, level after level, kept the consumer to about one core.
             // Counts, unions and feature counts are sums and min/max, so the
             // scans are identical however rows are grouped.
-            // `bounded` sizes batch by batch, as before #817: a pool's worth
-            // at once held the bounded scan's peak at 2.3x (Oregon, 80 -> 180 MiB).
+            // `bounded` sizes batch by batch: a pool's worth at once is
+            // outside its scan's memory envelope.
             let size_rows = match band.profile {
                 MemoryProfile::Bounded => EXPORT_BATCH_SIZE,
                 MemoryProfile::Auto | MemoryProfile::Speed => {
@@ -6207,9 +6207,8 @@ fn for_each_member_key(bbox: &TileBounds, zoom: u8, opts: &ExportOptions, mut f:
 
 /// Fewest bboxes one [`size_bboxes`] task sizes. Sizing a bbox costs well
 /// under a microsecond, so finer splits only buy accumulator maps to merge
-/// and a pool to wake: at 64 threads, splitting a batch to the thread count
-/// left about 95% of the export scan's samples in Rayon's spin loop (#817),
-/// slower than at 16 threads.
+/// and a pool to wake: splitting a batch to the thread count leaves a large
+/// pool spinning in Rayon (#817).
 const SIZE_BBOXES_MIN_ROWS: usize = 2048;
 
 #[cfg(test)]
@@ -6744,9 +6743,8 @@ struct BandRead<'a> {
 /// back in read order, so `on_batch` sees the rows exactly as one reader
 /// would hand them over. `band_read` is charged the readers' core-seconds.
 ///
-/// PERF (#817): a band read used to be one reader thread (`scoped_pipe`)
-/// feeding the whole pool; on Moldova z12 that thread sat at 1.2 cores in
-/// ZSTD page decompression while the clip waited on it.
+/// PERF (#817): several readers, as one reader thread cannot decompress
+/// pages as fast as the pool clips them.
 fn read_band(
     band: BandRead<'_>,
     selected: &[usize],
@@ -6819,8 +6817,8 @@ fn band_tuning(
     Ok(ReadTuning {
         budget: band.budget,
         batch_size: EXPORT_BATCH_SIZE,
-        // `bounded` reads with one worker, as before #817: concurrent level
-        // reads each size their read-ahead from the same budget, uncharged.
+        // `bounded` reads with one worker: concurrent level reads each size
+        // their read-ahead from the same budget, uncharged.
         workers: match band.profile {
             MemoryProfile::Bounded => 1,
             MemoryProfile::Auto | MemoryProfile::Speed => {
@@ -6858,8 +6856,8 @@ fn read_error(e: ConvertError) -> ExportError {
 const COLLECT_GROUP_ROWS_PER_THREAD: usize = 512;
 
 /// The rows [`collect_into`] gathers per group on this pool. `bounded`
-/// takes each read batch on its own, as before #817: the groups' decoded
-/// and clipped rows are not priced in the budget.
+/// takes each read batch on its own: the groups' decoded and clipped rows
+/// are not priced in the budget.
 fn collect_group_rows(profile: MemoryProfile) -> usize {
     match profile {
         MemoryProfile::Bounded => 1,
@@ -6983,14 +6981,13 @@ type TileMembers = Vec<(u64, Geometry<f64>)>;
 ///
 /// PERF (#740): property extraction, member materialization and routing run
 /// over row chunks in the pool ([`collect_member_chunk`]); only appending
-/// each chunk's buckets, in chunk order, stays serial. On a 64-core
-/// Moldova export this thread used to do all of it serially while about 8
-/// cores were busy. The chunks are merged in row order, so every bucket
-/// holds the same members in the same order as the serial loop gave.
+/// each chunk's buckets, in chunk order, stays serial. The chunks are
+/// merged in row order, so every bucket holds the same members in the same
+/// order as the serial loop gave.
 ///
 /// PERF (#817): the batches of a group ([`COLLECT_GROUP_ROWS_PER_THREAD`])
 /// share each parallel step, so a 64-thread pool joins once per group, not
-/// once per 8,192-row batch; the joins left 30-38% of the pool spinning.
+/// once per 8,192-row batch, whose joins would leave the pool spinning.
 /// Batches and their chunks are still merged in row order.
 struct ClippedGroup {
     batches: Vec<RecordBatch>,
@@ -11905,9 +11902,8 @@ mod tests {
     }
 
     /// #817: small single-wave levels whose summed members exceed the
-    /// largest wave still form one concurrent group. The cap once bounded
-    /// the group itself, so each level here ran alone, one after
-    /// another (Madagascar z0..z12 split into six groups, +24% wall).
+    /// largest wave still form one concurrent group: the cap bounds members
+    /// in flight, not the group.
     #[test]
     fn small_levels_stay_one_concurrent_group() {
         let input = tempfile::NamedTempFile::new().unwrap();
@@ -11948,8 +11944,7 @@ mod tests {
 
     /// #817: under `auto` a multi-wave level joins the level group before
     /// it and its waves run through the group's pipeline, so the next wave
-    /// is read while one encodes; `bounded` keeps the serial wave loop. On
-    /// `origin/main` the multi-wave level always ran alone, wave by wave.
+    /// is read while one encodes; `bounded` keeps the serial wave loop.
     #[test]
     fn multi_wave_levels_overlap_their_waves_except_bounded() {
         let input = tempfile::NamedTempFile::new().unwrap();
@@ -12162,10 +12157,8 @@ mod tests {
     }
 
     /// #740 (read amplification): a duplicating-mode level split into several
-    /// waves must read its band's rows once, not once per wave. On
-    /// `origin/main` every wave re-reads each row group its bbox touches, so
-    /// a level of `W` waves over one row group reads its band `W` times
-    /// (measured 1.2-2.5x per finest level on NZ parcels and FTW Moldova).
+    /// waves must read its band's rows once, not once per wave: re-reading
+    /// each row group a wave's bbox touches multiplies the band read.
     #[test]
     fn multi_wave_level_reads_each_band_row_once() {
         let (run, band_rows) = multi_wave_duplicating_run();
@@ -12485,11 +12478,9 @@ mod tests {
     }
 
     /// #817: a band read's batches are collected in groups, so a 64-thread
-    /// pool joins once per group instead of once per 8,192-row batch. On
-    /// `origin/main` every batch is its own set of joins (30-38% of the
-    /// export's level samples were Rayon spin). The grouping is scheduling
-    /// only: one thread, which collects batch by batch, writes the same
-    /// bytes.
+    /// pool joins once per group instead of once per 8,192-row batch. The
+    /// grouping is scheduling only: one thread, which collects batch by
+    /// batch, writes the same bytes.
     #[test]
     fn band_batches_are_collected_in_groups() {
         let input = tempfile::NamedTempFile::new().unwrap();
@@ -12609,9 +12600,7 @@ mod tests {
     }
 
     /// #817 (S1): the scan sizes a batch in a few tasks, not one per pool
-    /// thread. On `origin/main` a 64-thread pool split an 8,192-row batch
-    /// into dozens of accumulator maps, and about 95% of the scan's samples
-    /// were Rayon spin, slower at 64 threads than at 16.
+    /// thread: dozens of accumulator maps per batch leave the pool spinning.
     #[test]
     fn size_bboxes_splits_a_batch_into_few_tasks() {
         let bboxes: Vec<Option<TileBounds>> = (0..EXPORT_BATCH_SIZE)

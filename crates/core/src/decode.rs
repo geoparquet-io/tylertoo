@@ -695,16 +695,9 @@ fn tile_ref(
 /// to encode per chunk; see [`DECODE_THREADS`] for the curve.
 const CHUNK_BYTES: usize = 2 << 20;
 
-/// Most threads that decode and encode. Each thread keeps about 19 MB of
-/// allocator (mimalloc) high-water for the rest of the run, so peak RSS
-/// grows with the threads used, not the work (#817). Measured at 64
-/// threads, wall s / peak RSS GB, base -> 4 x 256 KiB -> 16 x 2 MiB ->
-/// unbounded (64 x 2 MiB):
-/// Moldova z12 8.6/0.95 -> 3.9/1.06 -> 1.75/1.63 -> 1.2/2.3;
-/// Moldova all zooms 15.1/1.01 -> 7.7/1.16 -> 3.2/1.69;
-/// Madagascar adm4 (58 columns) 3.8/0.21 -> 2.1/0.32 -> 0.86/0.77.
-/// 16 is the knee: 4.4-4.9x the serial walk for about +0.6 GB, which the
-/// 64-thread pool would raise by ~0.8 GB more for no wall gain.
+/// Most threads that decode and encode. Each thread keeps its allocator
+/// high-water for the rest of the run, so peak RSS grows with the threads
+/// used, not the work (#817); 16 is where more threads stop buying wall.
 const DECODE_THREADS: usize = 16;
 
 /// Most tiles per chunk, whatever their bytes: a run of empty tile bodies

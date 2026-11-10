@@ -1586,9 +1586,8 @@ mod spill_tests {
         assert_eq!(DECODED_HERE.with(std::cell::Cell::get), 0);
     }
 
-    /// #817 B1 bisect: the drain widened on the read's grants (bounded
-    /// Moldova: 2.1 GB, about 20 extra encodes) though the read held far
-    /// less, and raised the run's peak. A read of a few KiB buys no slot.
+    /// #817 B1: the drain widens only on what the read held, not its grants,
+    /// which overstate it. A read of a few KiB buys no slot.
     #[test]
     fn drain_widens_only_on_what_the_read_held() {
         let tin = tempfile::NamedTempFile::new().unwrap();

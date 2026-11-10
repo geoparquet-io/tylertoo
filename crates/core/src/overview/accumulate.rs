@@ -133,9 +133,8 @@ pub fn tiny_polygon_carriers(
     debug_assert_eq!(features.len(), min_levels.len());
     debug_assert_eq!(features.len(), areas.len());
     // Each level reads the shared inputs and writes only its own list, so
-    // the levels run concurrently (#817: serial, this was 0.2 s of Moldova's
-    // and 1.4 s of NZ parcels' convert at any thread count). Each level holds
-    // its own occupied-patch map; bounded holds one at a time.
+    // the levels run concurrently (#817). Each level holds its own
+    // occupied-patch map; bounded holds one at a time.
     let run = |(li, level): (usize, &AccumulateLevel)| {
         level_carriers(features, min_levels, areas, li, level, crs)
     };
@@ -292,10 +291,8 @@ mod tests {
         ]
     }
 
-    /// #817 A1: the levels are independent, so they run concurrently. A
-    /// serial level loop (the old shape: one main thread for the whole
-    /// accumulator, 0.2-1.4 s on Moldova/NZ at any thread count) never has
-    /// four levels in flight at once.
+    /// #817 A1: the levels are independent, so they run concurrently; a
+    /// serial level loop never has four levels in flight at once.
     #[test]
     fn levels_accumulate_concurrently() {
         let feats: Vec<AssignFeature> = (0..10).map(|i| square(i, 10.0, 10.0, 400.0)).collect();
