@@ -477,10 +477,10 @@ pub struct PyramidArgs {
     /// Output PMTiles archive.
     pub output: PathBuf,
 
-    /// One zoom band as `LO-HI:INPUT[:LAYER]` (repeatable). `INPUT` is a
-    /// GeoParquet source or PMTiles archive for zooms `LO` to `HI`, and
-    /// `LAYER` defaults to its file stem. TODO(docs) The tuning guide covers the colon
-    /// rules and the `LO-HI=INPUT[=LAYER]` form:
+    /// One zoom band as `LO-HI:[SYSTEM:]INPUT[:LAYER]` or
+    /// `LO-HI=[SYSTEM=]INPUT[=LAYER]` (repeatable; layer defaults to file stem).
+    /// Omit SYSTEM to tile GeoParquet or reuse PMTiles; grid/h3/s2/a5 aggregate
+    /// GeoParquet centroids into cells (H3/A5 parents are approximate):
     /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
     #[arg(
         long = "band",

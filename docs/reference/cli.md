@@ -283,7 +283,7 @@ tylertoo stats [OPTIONS] <ARCHIVE>
 Build one archive from several inputs, each owning a zoom range
 
 ```text
-tylertoo pyramid [OPTIONS] --band <LO-HI:INPUT[:LAYER]> <OUTPUT>
+tylertoo pyramid [OPTIONS] --band <LO-HI:[SYSTEM:]INPUT[:LAYER]> <OUTPUT>
 ```
 
 ### Arguments
@@ -296,7 +296,7 @@ tylertoo pyramid [OPTIONS] --band <LO-HI:INPUT[:LAYER]> <OUTPUT>
 
 | Option | Description |
 | --- | --- |
-| `--band <LO-HI:INPUT[:LAYER]>` | One zoom band as `LO-HI:INPUT[:LAYER]` (repeatable). `INPUT` is a GeoParquet source or PMTiles archive for zooms `LO` to `HI`, and `LAYER` defaults to its file stem. The tuning guide covers the colon rules and the `LO-HI=INPUT[=LAYER]` form: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
+| `--band <LO-HI:[SYSTEM:]INPUT[:LAYER]>` | One zoom band as `LO-HI:[SYSTEM:]INPUT[:LAYER]` or `LO-HI=[SYSTEM=]INPUT[=LAYER]` (repeatable; layer defaults to file stem). Omit SYSTEM to tile GeoParquet or reuse PMTiles; grid/h3/s2/a5 aggregate GeoParquet centroids into cells (H3/A5 parents are approximate): <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
 | `--name <TEXT>` | Human-readable name stored in the archive metadata. |
 | `--description <TEXT>` | Description stored in the archive metadata. |
 | `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
@@ -320,6 +320,8 @@ tylertoo pyramid [OPTIONS] --band <LO-HI:INPUT[:LAYER]> <OUTPUT>
 | `-f`, `--force` | Overwrite the output if it exists. |
 | `--work-dir <DIR>` | Directory for temporary per-band files, deleted after the build. Defaults to the system temp directory. |
 | `--allow-missing-zooms` | Accept a pre-tiled band with fewer zooms than declared. Missing zooms render empty; use only for a sparse pyramid. |
+| `--accumulate-attribute <COL:OP>` | Aggregate a numeric column in every cell band as COL:OP, where OP is sum, min, max, or mean (repeatable). Requires a cell band. |
+| `--cluster-categories <COL>` | Count a string column's values in every cell band as COL:label columns (up to 100 values plus 'other'). Requires a cell band; ranks categories as in tiles. |
 
 ### Generalization
 

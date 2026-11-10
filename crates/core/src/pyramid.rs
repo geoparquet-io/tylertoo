@@ -185,7 +185,8 @@ impl From<crate::archive_index::ArchiveError> for PyramidError {
     }
 }
 
-/// One band: an input tiled verbatim across `min_zoom..=max_zoom` into `layer`.
+/// One band: an input tiled or aggregated into cells across
+/// `min_zoom..=max_zoom` into `layer`.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Band {
@@ -193,7 +194,8 @@ pub struct Band {
     pub layer: String,
     pub min_zoom: u8,
     pub max_zoom: u8,
-    /// TODO(docs)
+    /// Aggregate the GeoParquet input into this system's cells per zoom.
+    /// `None` tiles the input verbatim; cell tables are always tiled verbatim.
     pub cells: Option<CellSystem>,
 }
 
@@ -215,7 +217,8 @@ impl Band {
         }
     }
 
-    /// TODO(docs)
+    /// Aggregate the GeoParquet input into cells per zoom before tiling.
+    /// See [`CellSystem`] for cell sizing and approximate H3/A5 parents.
     #[must_use]
     pub fn with_cells(mut self, system: CellSystem) -> Self {
         self.cells = Some(system);
@@ -232,6 +235,11 @@ impl Band {
     /// * `LO-HI:INPUT[:LAYER]` — the usual one.
     /// * `LO-HI=INPUT[=LAYER]` — an escape form for an INPUT the colon form
     ///   cannot express, `=` being invalid in a zoom range.
+    ///
+    /// Insert `SYSTEM` before `INPUT` to aggregate a GeoParquet input into
+    /// cells: `LO-HI:SYSTEM:INPUT[:LAYER]` or `LO-HI=SYSTEM=INPUT[=LAYER]`,
+    /// with `SYSTEM` one of `grid`, `h3`, `s2`, `a5`. An input literally
+    /// named after a system needs a path prefix, such as `./h3`.
     ///
     /// Which one a spec is in is decided by whichever of `:` and `=` closes
     /// the zoom range, i.e. whichever comes first (`band_separator`).
@@ -1915,17 +1923,21 @@ pub struct PyramidOptions {
     /// none on.
     #[cfg_attr(feature = "cli", arg(skip = Self::default().metadata))]
     pub metadata: TilesetMetadata,
-    /// TODO(docs)
+    /// Numeric aggregates for every cell band; requires a cell band.
+    /// Each `COL:OP` writes a Float64 column named `COL`, with `OP` one of
+    /// `sum`, `min`, `max`, `mean`.
     #[serde(
         rename = "accumulate_attributes",
         with = "crate::overview::config::accumulation"
     )]
     #[cfg_attr(feature = "cli", arg(long = "accumulate-attribute", id = "accumulate_attributes", value_name = "COL:OP", value_parser = crate::overview::convert::parse_accumulate))]
-    #[cfg_attr(feature = "cli", arg(help = "TODO(docs)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Aggregate a numeric column in every cell band as COL:OP, where OP is sum, min, max, or mean (repeatable). Requires a cell band", long_help = None))]
     pub accumulate: Vec<crate::overview::cluster::AccumulateSpec>,
-    /// TODO(docs)
+    /// Category counts applied to every cell band; requires a cell band.
+    /// Writes `COL:label` columns for the top categories plus `other`, ranked
+    /// as in tiles' `--cluster-categories`; zero counts are null.
     #[cfg_attr(feature = "cli", arg(long, value_name = "COL"))]
-    #[cfg_attr(feature = "cli", arg(help = "TODO(docs)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Count a string column's values in every cell band as COL:label columns (up to 100 values plus 'other'). Requires a cell band; ranks categories as in tiles", long_help = None))]
     pub cluster_categories: Option<String>,
 }
 

@@ -287,6 +287,8 @@ pyramid(
     tile_size_limit: int | Literal['auto'] | None = "auto",
     feature_order: Literal['input'] | str = "input",
     work_dir: str | os.PathLike[str] | None = None,
+    accumulate_attributes: dict[str, Literal['sum', 'max', 'min', 'mean']] | None = None,
+    cluster_categories: str | None = None,
     allow_missing_zooms: bool = False,
     name: str | None = None,
     description: str | None = None,
@@ -315,12 +317,14 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 
 ### Parameters
 
-* `bands`: Band specs as `"LO-HI:INPUT"` or `"LO-HI:INPUT:LAYER"`, such as `"0-7:countries.parquet:admin"`. `INPUT` is a GeoParquet source or a PMTiles archive for zooms `LO` to `HI`; `LAYER` defaults to the input's file stem. See the [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/) for the `LO-HI=INPUT=LAYER` form.
+* `bands`: Band specs as `"LO-HI:[SYSTEM:]INPUT[:LAYER]"`, such as `"0-7:countries.parquet:admin"`. `INPUT` is a GeoParquet source or a PMTiles archive for zooms `LO` to `HI`; `LAYER` defaults to the input's file stem. See the [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/) for the `LO-HI=[SYSTEM=]INPUT[=LAYER]` form. Omit `SYSTEM` to tile the input; `grid`, `h3`, `s2`, or `a5` aggregates GeoParquet features into cells per zoom, counting each feature at its centroid. An input named `grid`, `h3`, `s2`, or `a5` needs a path prefix, such as `./h3`. Cells cover about a 4x4-pixel block of a 256-pixel tile at the equator. Grid uses zoom + 6 (capped at 30); the other systems choose resolutions by equatorial cell area. Coarser zooms roll child cells up by parent id: exact for grid and S2, approximate for H3 and A5 because their children do not nest exactly inside their parents. Each row has a `cell` id token and `point_count`. Cell tables are tiled verbatim, even with `generalize=True`. Cell bands require GeoParquet, not PMTiles, and reject the convert filter and bbox options.
 * `output`: PMTiles archive to write.
 * `generalize`: Generalize each GeoParquet band, as `overview()` does. By default each band is tiled verbatim, keeping every feature, for input already made for its zooms.
 * `tile_size_limit`: Maximum raw tile size in bytes for bands tiled here; `"auto"`, `0` and `None` are no limit, so every feature is kept.
 * `feature_order`: Paint order within a tile for GeoParquet bands; see `export_pmtiles()`. A band without that column keeps input order, with a warning.
 * `work_dir`: Directory for temporary per-band files, deleted after the build, or `None` for the system temporary directory.
+* `accumulate_attributes`: Aggregation method for each numeric column, `sum`, `min`, `max`, or `mean`. Applies to every cell band and requires one. Each column's result is a Float64 column of the same name.
+* `cluster_categories`: Column to count by category in every cell band; requires a cell band. Writes `COL:label` count columns for the top categories plus `other`, ranked as in `tiles()`. Zero counts are null.
 * `allow_missing_zooms`: Accept a pre-tiled band with fewer zooms than declared. Missing zooms render empty.
 * `name`: The output's tileset name. Unset, the PMTiles bands' name is kept when they agree and left out when they don't.
 * `description`: Description for the output, inherited the same way.

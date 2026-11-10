@@ -341,10 +341,14 @@ Bands tile verbatim by default to preserve their input resolution. Pass
 
 ### Band sources and syntax
 
-A band accepts GeoParquet or PMTiles via `--band LO-HI:PATH[:LAYER]`.
+A band accepts GeoParquet or PMTiles via `--band LO-HI:[SYSTEM:]PATH[:LAYER]`.
 tylertoo detects the format from the contents, tiles GeoParquet over the
-band's range, and merges an archive as-is. Mix formats to reuse a coarse
-archive while rebuilding a fine band.
+band's range when `SYSTEM` is omitted, and merges an archive as-is. Set
+`SYSTEM` to `grid`, `h3`, `s2`, or `a5` to aggregate GeoParquet features
+into cells per zoom; cell bands require GeoParquet and tile the cell
+tables verbatim. An input literally named `grid`, `h3`, `s2`, or `a5`
+needs a path prefix, such as `./h3`. Mix formats to reuse a coarse archive
+while rebuilding a fine band.
 
 A GeoParquet band may be remote:
 `--band 9-13:https://data.source.coop/…/features.parquet` streams with
@@ -361,7 +365,7 @@ drive-relative path such as `C:data.parquet` also stays whole: a single ASCII
 letter before the last colon counts as a drive letter.
 
 For an input ending in a bare colon segment, such as the Hive directory
-`admin:country_code=BR`, use `--band LO-HI=INPUT[=LAYER]`.
+`admin:country_code=BR`, use `--band LO-HI=[SYSTEM=]INPUT[=LAYER]`.
 tylertoo splits the range at
 the first `=` and the layer at the last. As before, it splits only when the
 text after it has no `/`, `\`, or `:`. That keeps `--band 0-13=admin:country_code=BR/part.parquet`
@@ -390,8 +394,9 @@ shares no zoom with its archive is always an error.
 `pyramid` takes the export flags `tiles` and `export-pmtiles` take
 (`--max-tile-size`, `--max-compressed-tile-size`, `--size-valve`,
 `--tile-buffer`, `--feature-order`, `--feature-id`, the property selection,
-and the rest), and applies them to every GeoParquet band alike, as
-`--generalize` does. Both size caps are off by default for pyramid bands,
+and the rest), and applies them to every GeoParquet band alike.
+`--generalize` applies only to bands without a cell system. Both size caps
+are off by default for pyramid bands,
 preserving every cell. When set, a cap applies to each band's tiles before
 tylertoo combines them. Every GeoParquet band needs the `--feature-id`
 column. A band that lacks the column exports in input order with a warning

@@ -26,7 +26,7 @@ code and output shown here.
 | Tool | Install | Used for |
 | --- | --- | --- |
 | `tylertoo` | `cargo install tylertoo` | Overviews, sharded tiling, merging, pyramids |
-| `tylertoo` Python package and DuckDB | `pip install tylertoo duckdb` | Validation and the density layer |
+| `tylertoo` Python package and DuckDB | `pip install tylertoo duckdb` | Validation and field export |
 | `gpio` | `pip install geoparquet-io` | Row-group bounds for the shard plan |
 
 Run the steps in order in an empty working directory. Step 1 downloads
@@ -87,11 +87,12 @@ requires more row-group reads; the footer count stays the same.
 
 `tylertoo.validate` checks the GeoParquet overview against the
 `geo:overviews` spec and returns a `dict`. DuckDB then exports its finest
-level as `fields-raw.parquet` for tiling in step 3, and builds a density
-grid for low zooms.
+level as `fields-raw.parquet` for tiling in step 3 and prints the field
+count and total hectares.
 
 At z5, a pixel spans about 5 km, so individual fields are too small to see.
-The grid uses 0.01° cells, each recording a field count and total area.
+Step 4 builds a pyramid grid band for low zooms, counting fields at their
+centroids and summing their area.
 
 File: `02_layers.py`
 
@@ -215,7 +216,8 @@ produced no duplicate tiles.
 `pyramid` combines zoom bands into one archive. It tiles GeoParquet inputs
 and copies tiles from PMTiles inputs. Here, `density` covers z0–z7 and
 `fields` covers z8–z14. Style the map with filled density cells colored by
-their `fields` count and outlined field polygons.
+their `point_count` and outlined field polygons; `metrics:area` holds each
+cell's total field area.
 
 `tylertoo stats` reports tile sizes at each zoom.
 
@@ -248,8 +250,8 @@ tylertoo stats brazil.pmtiles
 ...
 ```
 
-The density tiles stay around 3 KB or less, holding just 266 squares. Field
-tiles are heaviest at z11–z12, where each tile contains many whole fields,
+The density grid uses cells sized for each zoom. Field tiles are heaviest
+at z11–z12, where each tile contains many whole fields,
 and shrink at higher zooms. Drop
 `brazil.pmtiles` onto [pmtiles.io](https://pmtiles.io/) to see both layers.
 
