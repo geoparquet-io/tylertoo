@@ -78,6 +78,7 @@ use arrow_schema::{DataType, Field, Schema};
 use geo::{Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use geoarrow::array::GeometryBuilder;
 use geoarrow::datatypes::GeometryType;
+use geoarrow_array::capacity::GeometryCapacity;
 use geoarrow_array::GeoArrowArray;
 use geoparquet::metadata::GeoParquetMetadata;
 use geoparquet::writer::{
@@ -1598,7 +1599,11 @@ fn encode_rows(
     for (zoom, layer, mvt_id, props, geometry) in rows {
         batch.push(zoom, &layer, mvt_id, &props, geometry);
     }
-    let mut geom_builder = GeometryBuilder::new(GeometryType::new(Default::default()));
+    // #828: sized up front, so the coordinate buffers never grow by doubling.
+    let capacity = GeometryCapacity::from_geometries(batch.geoms.iter().map(Some))
+        .map_err(|e| DecodeError::Write(e.to_string()))?;
+    let mut geom_builder =
+        GeometryBuilder::with_capacity(GeometryType::new(Default::default()), capacity);
     geom_builder.extend_from_iter(batch.geoms.iter().map(Some));
     let geom_arr = geom_builder.finish();
 
