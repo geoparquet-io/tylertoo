@@ -1030,7 +1030,7 @@ class LayerReport(TypedDict):
 ```
 
 * `layer`: The MVT layer name: the column's trimmed value, or `"_unknown"` for null and blank values.
-* `input_rows`: Input rows routed to this layer, after `filter`. Row numbers in the layer's reports count these rows, in input order.
+* `input_rows`: Input rows routed to this layer, after `filter` and `bbox`. Row numbers in the layer's reports count these rows, in input order.
 * `convert`: The layer's overview conversion.
 * `export`: The layer's PMTiles export.
 

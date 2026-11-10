@@ -124,7 +124,7 @@ impl crate::error::Classify for LayerColumnError {
 pub struct LayerReport {
     /// The MVT layer name.
     pub layer: String,
-    /// Input rows routed to this layer, after `--filter`.
+    /// Input rows routed to this layer, after `--filter` and `--bbox`.
     pub input_rows: u64,
     /// The layer's convert and export.
     #[serde(flatten)]
