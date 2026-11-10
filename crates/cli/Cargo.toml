@@ -53,6 +53,8 @@ log = { workspace = true }
 indicatif = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"
+# `serve` (#825): a small blocking HTTP server, no async runtime in the CLI.
+tiny_http = "0.12"
 dhat = { version = "0.3", optional = true }
 # Exact pin (not caret): the CI drift-guard regenerates reference/cli.md and
 # fails on any byte change — so a new clap-markdown patch with different

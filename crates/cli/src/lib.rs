@@ -25,6 +25,8 @@ use tylertoo_core::internal::overview::config::{self, OutputKind};
 use tylertoo_core::internal::overview::tiles::TilesOptions;
 use tylertoo_core::TilesetMetadata as TilesetMetadataArgs;
 
+pub mod serve;
+
 /// `-q/--quiet` (#452), set once in [`run`] before dispatch.
 #[expect(
     clippy::disallowed_types,
@@ -100,6 +102,8 @@ enum Command {
     Merge(MergeArgs),
     /// Cut a dataset's tile space into N disjoint shards for a sharded build.
     ShardPlan(ShardPlanArgs),
+    /// TODO(docs)
+    Serve(ServeArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///
     /// Compiled only under the `gen-docs` feature; used by CI to regenerate
@@ -324,6 +328,22 @@ struct StatsArgs {
     json: bool,
 }
 
+/// Arguments for `tylertoo serve`.
+#[derive(Parser, Debug)]
+struct ServeArgs {
+    /// TODO(docs)
+    #[arg(value_name = "ARCHIVE", required = true)]
+    archives: Vec<PathBuf>,
+
+    /// TODO(docs)
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1")]
+    host: String,
+
+    /// TODO(docs)
+    #[arg(long, value_name = "N", default_value_t = 8080)]
+    port: u16,
+}
+
 /// Run the CLI on `argv` (program name first) and return its exit status,
 /// one of those in [`EXIT_STATUS_HELP`].
 ///
@@ -391,6 +411,7 @@ where
         Command::Pyramid(args) => run_pyramid(*args),
         Command::Merge(args) => run_merge(args),
         Command::ShardPlan(args) => run_shard_plan(args),
+        Command::Serve(args) => run_serve(&args),
         Command::Tiles(args) => run_tiles(*args),
         #[cfg(feature = "gen-docs")]
         Command::GenReferenceDocs => {
@@ -1772,6 +1793,13 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
 /// Run `tylertoo stats`: per-zoom tile-weight report over a PMTiles archive
 /// (issue #552). Thin facade over `tylertoo_core::internal::stats::compute_stats`,
 /// which does all the work off `ArchiveIndex` (header + directories only).
+fn run_serve(args: &ServeArgs) -> Result<()> {
+    let server = serve::Server::bind(&args.archives, &args.host, args.port)?;
+    // The URL is the result, so `--quiet` keeps it.
+    println!("Serving {} on {}", args.archives.len(), server.url());
+    server.run(|| true)
+}
+
 fn run_stats(args: StatsArgs) -> Result<()> {
     use tylertoo_core::internal::archive_index::ArchiveIndex;
     use tylertoo_core::internal::stats::compute_stats;
@@ -3536,6 +3564,7 @@ mod tests {
             ("decode", DecodeArgs::command()),
             ("stats", StatsArgs::command()),
             ("shard-plan", ShardPlanArgs::command()),
+            ("serve", ServeArgs::command()),
         ] {
             assert_eq!(publication_flags_of(&cmd), [false; 3], "{label}");
         }
@@ -3564,6 +3593,27 @@ mod tests {
         let python: std::collections::BTreeMap<String, serde_json::Value> =
             command_defaults("stats").into_iter().collect();
         assert_eq!(cli, python);
+    }
+
+    /// `serve` and `tylertoo.serve()` take the same options with the same
+    /// defaults (#825), loopback by default in both.
+    #[test]
+    fn serve_flags_match_python_keywords() {
+        use clap::CommandFactory;
+        use tylertoo_core::internal::overview::config::keywords::command_defaults;
+        let cli: std::collections::BTreeMap<String, serde_json::Value> = ServeArgs::command()
+            .get_arguments()
+            .filter_map(|a| Some((a.get_long()?.to_owned(), a.get_default_values())))
+            .map(|(long, d)| {
+                let d = d[0].to_str().unwrap();
+                let v = serde_json::from_str(d).unwrap_or_else(|_| d.into());
+                (long, v)
+            })
+            .collect();
+        let python: std::collections::BTreeMap<String, serde_json::Value> =
+            command_defaults("serve").into_iter().collect();
+        assert_eq!(cli, python);
+        assert_eq!(python["host"], "127.0.0.1");
     }
 
     #[test]

@@ -23,6 +23,7 @@ from ._tylertoo import (
     export_pmtiles,
     overview,
     pyramid,
+    serve,
     stats,
     validate,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "export_pmtiles",
     "overview",
     "pyramid",
+    "serve",
     "stats",
     "validate",
 ]

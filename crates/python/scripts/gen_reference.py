@@ -35,6 +35,7 @@ FUNCTION_ORDER = [
     "decode",
     "validate",
     "stats",
+    "serve",
     "convert",
 ]
 
