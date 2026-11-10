@@ -4,6 +4,7 @@ The archive is opened with the `pmtiles` reader and its tiles decoded
 with `mapbox-vector-tile`, neither of which shares code with tylertoo.
 """
 
+import ast
 import gzip
 import json
 import struct
@@ -105,3 +106,26 @@ def test_missing_layer_column_is_a_value_error(tmp_path: Path) -> None:
     _write_source(source)
     with pytest.raises(ValueError, match="not a column"):
         tylertoo.convert(str(source), str(tmp_path / "o.pmtiles"), layer_column="nope")
+
+
+def test_the_layered_overload_takes_every_convert_parameter() -> None:
+    """The two `convert` overloads differ only in `layer_column`'s type.
+
+    A parameter added to one alone makes a valid call match neither.
+    """
+    stub = Path(tylertoo.__file__).with_name("_tylertoo.pyi")
+    overloads = [
+        node
+        for node in ast.parse(stub.read_text(encoding="utf-8")).body
+        if isinstance(node, ast.FunctionDef) and node.name == "convert"
+    ]
+
+    def signature(fn: ast.FunctionDef) -> list[tuple[str, str]]:
+        params = fn.args.args + fn.args.kwonlyargs
+        return [
+            (p.arg, "" if p.arg == "layer_column" else ast.unparse(p.annotation or p))
+            for p in params
+        ]
+
+    assert len(overloads) == 2
+    assert signature(overloads[0]) == signature(overloads[1])
