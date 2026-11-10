@@ -1753,14 +1753,20 @@ fn join_decoded(
             Some(Err(e)) => return Some(Err(e)),
             None => break,
         };
-        let more = expanded_batch_bytes(&batch);
-        if held + batch.num_rows() > rows || bytes.saturating_add(more) > bound {
+        // Fill exactly `rows`, as the parallel read's regrouping does, so
+        // both deliver the same batches; the rest of the piece is carried.
+        let room = batch.num_rows().min(rows - held);
+        let more = expanded_batch_bytes(&batch.slice(0, room));
+        if bytes.saturating_add(more) > bound {
             *carry = Some(batch);
             break;
         }
-        held += batch.num_rows();
+        if room < batch.num_rows() {
+            *carry = Some(batch.slice(room, batch.num_rows() - room));
+        }
+        held += room;
         bytes = bytes.saturating_add(more);
-        parts.push(batch);
+        parts.push(batch.slice(0, room));
         if parts.len() == JOIN_CHUNK {
             match arrow_select::concat::concat_batches(&schema, &parts) {
                 Ok(chunk) => chunks.push(chunk),
@@ -2203,6 +2209,50 @@ mod tests {
             .map(|batch| batch.unwrap().num_rows())
             .sum();
         assert_eq!(rows, 1_300);
+    }
+
+    /// #848 review: a decode size that does not divide the join size still
+    /// yields full batches, the ones the parallel read's regrouping makes.
+    #[test]
+    fn joined_batches_fill_the_join_size() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::{ArrayRef, Int64Array};
+        use parquet::arrow::ArrowWriter;
+        let batch = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int64Array::from_iter_values(0..20)) as ArrayRef,
+        )])
+        .unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#848: a raw decode of 3 rows, joined to 8"
+        )]
+        let mut inner = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .with_batch_size(3)
+            .build()
+            .unwrap();
+        let mut carry = None;
+        let mut ids = Vec::new();
+        let mut sizes = Vec::new();
+        while let Some(batch) = join_decoded(&mut inner, &mut carry, 8, 100_000) {
+            let batch = batch.unwrap();
+            sizes.push(batch.num_rows());
+            ids.extend(
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+        }
+        assert_eq!(sizes, [8, 8, 4]);
+        assert_eq!(ids, (0..20).collect::<Vec<_>>());
     }
 
     #[test]
