@@ -3519,12 +3519,9 @@ fn load_plan_state(
     let mut chains = None;
     let mut read_selection = None;
     if let Some(range) = &options.shard {
-        let built = shard_chain_tables(&mut plan, range, crs_memory, options, diagnostics)?;
-        let reps = built
-            .as_ref()
-            .map(|(_, reps)| reps.clone())
-            .unwrap_or_default();
-        chains = built.map(|(build, _)| build);
+        let reps;
+        (chains, reps) = shard_chain_tables(&mut plan, range, crs_memory, options, diagnostics)?
+            .map_or_else(Default::default, |(build, reps)| (Some(build), reps));
         read_selection = super::plan_state::rebase_plan_for_shard(
             &mut plan,
             source,
