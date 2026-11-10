@@ -442,9 +442,6 @@ True
 convert(
     input: str | _ArrowStream,
     output: str,
-    *,
-    geometry_column: str | None = None,
-    crs: str | None = None,
     min_zoom: int = 0,
     max_zoom: int | str = 14,
     layer_name: str | None = None,
@@ -452,6 +449,9 @@ convert(
     simple_clip_fastpath: bool = True,
     feature_order: Literal['input'] | str = "input",
     spill_dir: str | os.PathLike[str] | None = None,
+    *,
+    geometry_column: str | None = None,
+    crs: str | None = None,
     include_properties: Sequence[str] | None = None,
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
@@ -524,8 +524,6 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 
 * `input`: See `overview()`.
 * `output`: PMTiles archive to write.
-* `geometry_column`: See `overview()`.
-* `crs`: See `overview()`.
 * `min_zoom`: See `overview()`.
 * `max_zoom`: See `overview()`.
 * `layer_name`: MVT layer name, or `None` for the input's file stem (the output's file stem for a stream).
@@ -533,6 +531,8 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `simple_clip_fastpath`: See `export_pmtiles()`.
 * `feature_order`: See `export_pmtiles()`.
 * `spill_dir`: Scratch directory for the intermediate overview and the export's spill (the CLI's `--spill-dir`). The intermediate is at least input-sized; without this it goes to `$TMPDIR`, then the output's directory. Set it when `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised when the chosen volume looks too small, whether or not the run then fails.
+* `geometry_column`: See `overview()`.
+* `crs`: See `overview()`.
 * `include_properties`: See `overview()`.
 * `exclude_properties`: See `overview()`.
 * `exclude_all_properties`: See `overview()`.
