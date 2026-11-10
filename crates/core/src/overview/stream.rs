@@ -5082,11 +5082,12 @@ impl RowCategories {
     }
 
     /// Fail with `BudgetExceeded` once the interned values and per-row ids,
-    /// on top of the `resident` scan state (the feature table), outgrow the
+    /// on top of the `resident` scan state (the feature table's allocation,
+    /// capacity included), outgrow the
     /// memory budget: a high-cardinality column would otherwise grow until
     /// the process is OOM-killed.
     fn require_fits(&self, budget: &MemoryBudget, resident: u64) -> Result<(), ConvertError> {
-        let row_bytes = (self.rows.len() * std::mem::size_of::<u32>()) as u64;
+        let row_bytes = (self.rows.capacity() * std::mem::size_of::<u32>()) as u64;
         budget.require(
             MemoryPhase::Scan,
             resident + self.values.heap_bytes() + row_bytes,
@@ -6287,7 +6288,7 @@ fn run_pass1_with_chunk_rows(
                         acc_values: &mut acc_values,
                         ladder_values: &mut ladder_values,
                         category: category.as_mut(),
-                        budget: (ctx.budget, features.heap_bytes()),
+                        budget: (ctx.budget, features.allocated_bytes()),
                     },
                 )?;
                 Pass1Timers::add(&timers_ref.keys, t_keys);
