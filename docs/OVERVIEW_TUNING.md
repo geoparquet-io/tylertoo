@@ -2134,19 +2134,23 @@ request in flight; S3 does not negotiate HTTP/2, so `HTTP2_ONLY` fails there.
 
 A negative or malformed value warns and keeps the default; a non-negative
 integer outside the bounds warns and clamps to the bound, including one too
-large for the underlying type. The values resolve once per process, at the
-first remote staging, so a long-lived library caller will not see a later change
-to the environment.
+large for the underlying type. Each conversion re-reads the `TYLERTOO_STAGING_*`
+and `TYLERTOO_HTTP_*` variables, so a long-lived caller sees changes between
+conversions. Cached remote stores are rebuilt when the `AWS_*`, `GOOGLE_*`
+or `TYLERTOO_HTTP_*` variables that built them change.
 
-Two lines are logged at staging start, at info when an override is set (so a
-sweep run records what it tested) and debug otherwise: the resolved ceiling,
-budget and window, and the **live** concurrency, which is what the run actually
-used. Watch the second one — the budget can cap the ceiling, so
+The resolved ceiling, budget and window are logged on first use and when they
+or their warnings change, at info when an override is set (so a sweep run
+records what it tested) and debug otherwise. When an override is set, each
+staging operation also logs the **live** concurrency at info, showing what the
+run actually used.
+Watch the live concurrency — the budget can cap the ceiling, so
 `TYLERTOO_STAGING_CONCURRENCY=16` and `=8` produce identical runs on an input
 whose row groups are large enough that `budget ÷ largest span` is the binding
-constraint. A third info line, `[remote] client options from
-TYLERTOO_HTTP_*`, lists the client overrides in force, with a `PROXY_URL`
-value shown as `<redacted>`.
+constraint. The info line `[remote] client options from TYLERTOO_HTTP_*`
+lists the client overrides in force, with a `PROXY_URL` value shown as
+`<redacted>`. The staging and client-option lines and their warnings
+do not repeat while their values stay unchanged.
 
 These warnings and lines go to the Rust log, which the CLI prints at its
 default `info` filter. Python receives them through `logging` under the
