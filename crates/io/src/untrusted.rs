@@ -1168,9 +1168,10 @@ pub fn read_batch_plan(
 /// time, and one-row batches held ~260 KB of fixed Arrow overhead per
 /// buffered row in pass 2.
 ///
-/// A schema with 8- or 16-bit dictionary keys yields batches of the decode
-/// size: a joined batch, here or in a caller's regrouping, can hold more
-/// distinct values than the key indexes, which the cast back refuses (#857).
+/// A read column with 8- or 16-bit dictionary keys yields batches of the
+/// decode size: a joined batch, here or in a caller's regrouping, can hold
+/// more distinct values than the key indexes, which the cast back refuses
+/// (#857).
 fn batch_plan(
     reader: &ReaderMetadata,
     row_groups: Option<&[usize]>,
@@ -1270,11 +1271,18 @@ fn batch_plan(
     };
     let joined = rows(decoded_limit(limit), per_row);
     let decode = rows(decoded_limit(limit).saturating_sub(repeated), fixed).min(joined);
+    // Only read roots count; a whole root is checked when any leaf is read.
+    let descr = reader.parquet_schema();
     let narrow = reader
         .schema()
         .fields()
         .iter()
-        .any(|f| narrow_dictionary(f.data_type()));
+        .enumerate()
+        .any(|(root, f)| {
+            narrow_dictionary(f.data_type())
+                && (0..descr.num_columns())
+                    .any(|leaf| descr.get_column_root_idx(leaf) == root && read(&leaf))
+        });
     (decode, if narrow { decode } else { joined })
 }
 
@@ -2179,6 +2187,16 @@ mod tests {
         let (decode, join) = batch_plan(&source.metadata, None, None, DEFAULT_BATCH_ROWS, limit);
         // Callers regroup to the plan's yield too (core's `Regrouper`).
         assert!(decode < 100 && join == decode, "({decode}, {join})");
+        // Unread, the dictionary does not hold the lists back.
+        let lists = ProjectionMask::leaves(source.metadata().file_metadata().schema_descr(), [1]);
+        let (_, join) = batch_plan(
+            &source.metadata,
+            None,
+            Some(&lists),
+            DEFAULT_BATCH_ROWS,
+            limit,
+        );
+        assert!(join > 256, "{join}");
         let rows: usize = source
             .build()
             .unwrap()
