@@ -2032,19 +2032,19 @@ impl PyramidOptions {
         }
         self.export.validate()?;
         check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
-        // A cell table writes one column per spec, named after its source.
+        // A cell table writes one column per spec, named after its source,
+        // beside its own cell id, count and geometry columns.
+        let reserved = crate::overview::cells::RESERVED_COLUMNS;
         let mut seen = std::collections::HashSet::new();
         for spec in &self.accumulate {
-            if !seen.insert(spec.column.as_str())
-                || spec.column == crate::overview::cells::CELL_COLUMN
-            {
+            if !seen.insert(spec.column.as_str()) || reserved.contains(&spec.column.as_str()) {
                 return Err(crate::overview::config::ConfigError::invalid_spec(
                     "--accumulate-attribute",
                     format!(
-                        "column {:?} would name two columns of a cell band; \
-                         aggregate each column once and not one named {:?}",
+                        "column {:?} would name two columns of a cell band: aggregate \
+                         each column once, and none named {}",
                         spec.column,
-                        crate::overview::cells::CELL_COLUMN
+                        reserved.join(", ")
                     ),
                 )
                 .into());
@@ -2132,6 +2132,15 @@ fn build_pyramid_validated(
         return Err(PyramidError::Bands(
             "--accumulate-attribute and --cluster-categories apply to cell bands \
              (LO-HI:SYSTEM:INPUT[:LAYER]), and no band is one"
+                .to_string(),
+        ));
+    }
+    if bands.iter().any(|b| b.cells.is_some())
+        && (opts.convert.filter.is_some() || opts.convert.bbox.is_some())
+    {
+        return Err(PyramidError::Bands(
+            "a cell band counts every feature of its input: it does not take the \
+             convert options' filter or bbox"
                 .to_string(),
         ));
     }
@@ -3865,6 +3874,34 @@ mod tests {
             ..Default::default()
         };
         assert!(twice.validate().is_err());
+        let reserved = PyramidOptions {
+            accumulate: vec![crate::overview::cluster::AccumulateSpec::new(
+                "geometry",
+                crate::overview::cluster::AccumulateOp::Sum,
+            )],
+            ..Default::default()
+        };
+        assert!(reserved.validate().is_err());
+
+        let mut filtered = PyramidOptions {
+            work_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        filtered.convert.filter = Some("id > 3".to_string());
+        let band = Band::new(&src, "pts", 0, 3).with_cells(CellSystem::H3);
+        let err = build_pyramid(&[band], &out, &filtered).unwrap_err();
+        assert!(err.to_string().contains("filter or bbox"), "{err}");
+
+        // An input `point_count` column is not one the cell table writes.
+        let counted = dir.path().join("counted.parquet");
+        let geoms = vec![Some(geo::Geometry::Point(geo::Point::new(1.0, 2.0))); 3];
+        crate::overview::testutil::write_input(&counted, &geoms, false, Some("point_count"));
+        let band = Band::new(&counted, "pts", 0, 2).with_cells(CellSystem::S2);
+        let opts = PyramidOptions {
+            work_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        build_pyramid(&[band], &out, &opts).unwrap();
     }
 
     #[test]

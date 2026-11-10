@@ -60,6 +60,9 @@ pub enum CellSystem {
 /// Name of the cell id column every cell table carries.
 pub(crate) const CELL_COLUMN: &str = "cell";
 
+/// The columns a cell table writes besides its rollups.
+pub(crate) const RESERVED_COLUMNS: [&str; 3] = [CELL_COLUMN, POINT_COUNT_COLUMN, "geometry"];
+
 // Zoom → resolution, one entry per zoom 0..=30. A cell is sized to about a
 // 4×4 pixel block of a 256-pixel tile: 1/64 of the tile's width, so a tile
 // holds at most ~4,096 cells. Grid cells are exactly that (zoom + 6, capped
@@ -395,7 +398,10 @@ pub(crate) fn write_cell_tables(
         let to = system.resolution(z);
         if to < res {
             let mut parents = CellMap::with_capacity(cells.len() / 2);
-            for (id, acc) in cells.drain() {
+            // In id order, so a float sum adds up the same way every run.
+            let mut children: Vec<(u64, CellAcc)> = cells.drain().collect();
+            children.sort_unstable_by_key(|c| c.0);
+            for (id, acc) in children {
                 parents
                     .entry(system.parent(id, res, to))
                     .and_modify(|p| p.merge(&acc))
@@ -436,12 +442,11 @@ fn aggregate(
         })?;
     // The rollup columns are checked exactly as `--cluster` checks them.
     let check = ConvertOptions {
-        cluster: true,
         accumulate: rollup.accumulate.to_vec(),
         cluster_categories: rollup.categories.map(str::to_string),
         ..ConvertOptions::default()
     };
-    let acc_idx = super::convert::validate_cluster_schema(descriptor, &check)?;
+    let acc_idx = super::convert::validate_rollup_columns(descriptor.schema(), &check)?;
     let cat_idx = super::convert::cluster_category_column(descriptor.schema(), &check);
     let mut projection: Vec<usize> = std::iter::once(geom_idx)
         .chain(acc_idx.iter().copied())
@@ -618,6 +623,9 @@ fn relabel_categories(cells: &mut CellMap, values: &[String]) -> Vec<String> {
     labels
 }
 
+/// Rows per written batch: bounds the output buffers to a slice of cells.
+const WRITE_ROWS: usize = 65_536;
+
 /// Write one zoom's cells as a GeoParquet table, rows in cell id order.
 fn write_table(
     path: &Path,
@@ -627,61 +635,71 @@ fn write_table(
     rollup: CellRollup<'_>,
     labels: &[String],
 ) -> Result<(), ConvertError> {
-    let mut ids: Vec<u64> = cells.keys().copied().collect();
-    ids.par_sort_unstable();
-    let rows: Vec<&CellAcc> = ids.iter().map(|id| &cells[id]).collect();
-    let geoms: Vec<Option<Geometry<f64>>> = ids
-        .par_iter()
-        .map(|&id| Some(Geometry::MultiPolygon(system.polygon(id, res))))
-        .collect();
-
+    use super::writer::WriterError;
+    let gpq = |e: geoarrow::error::GeoArrowError| WriterError::GeoParquet(e.to_string());
+    let geom_type = GeometryType::new(Default::default());
     let mut fields = vec![
         Field::new(CELL_COLUMN, DataType::Utf8, false),
         Field::new(POINT_COUNT_COLUMN, DataType::Int64, false),
     ];
-    let mut columns: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from_iter_values(
-            ids.iter().map(|&id| system.token(id, res)),
-        )),
-        Arc::new(Int64Array::from_iter_values(rows.iter().map(|c| c.count))),
-    ];
-    for (i, spec) in rollup.accumulate.iter().enumerate() {
+    for spec in rollup.accumulate {
         fields.push(Field::new(&spec.column, DataType::Float64, true));
-        columns.push(Arc::new(arrow_array::Float64Array::from_iter(
-            rows.iter().map(|c| c.aggs[i].finalize(spec.op)),
-        )));
     }
     if let Some(col) = rollup.categories {
-        for (slot, label) in labels.iter().enumerate() {
+        for label in labels {
             fields.push(Field::new(format!("{col}:{label}"), DataType::Int64, true));
-            // A zero count is null, as `--cluster-categories` writes it.
-            columns.push(Arc::new(Int64Array::from_iter(rows.iter().map(|c| {
-                c.cats
-                    .as_slice()
-                    .iter()
-                    .find(|e| e.0 == slot as u32)
-                    .map(|e| e.1)
-            }))));
         }
     }
-    let mut builder =
-        GeometryBuilder::new(GeometryType::new(Default::default())).with_prefer_multi(false);
-    builder.extend_from_iter(geoms.iter().map(Option::as_ref));
-    let geom = builder.finish();
-    fields.push(geom.data_type().to_field("geometry", true));
-    columns.push(geom.to_array_ref());
-
+    let geom_field = GeometryBuilder::new(geom_type.clone())
+        .finish()
+        .data_type()
+        .to_field("geometry", true);
+    fields.push(geom_field);
     let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema.clone(), columns)?;
-    use super::writer::WriterError;
-    let gpq = |e: geoarrow::error::GeoArrowError| WriterError::GeoParquet(e.to_string());
+
     let options = GeoParquetWriterOptionsBuilder::default()
         .set_encoding(GeoParquetWriterEncoding::WKB)
         .build();
     let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &options).map_err(gpq)?;
     let (file, pending) = crate::atomic_output::create(path)?;
     let mut writer = tylertoo_io::batch_writer(file, encoder.target_schema())?;
-    writer.write(&encoder.encode_record_batch(&batch).map_err(gpq)?)?;
+
+    let mut ids: Vec<u64> = cells.keys().copied().collect();
+    ids.par_sort_unstable();
+    for ids in ids.chunks(WRITE_ROWS) {
+        let rows: Vec<&CellAcc> = ids.iter().map(|id| &cells[id]).collect();
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from_iter_values(
+                ids.iter().map(|&id| system.token(id, res)),
+            )),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|c| c.count))),
+        ];
+        for (i, spec) in rollup.accumulate.iter().enumerate() {
+            columns.push(Arc::new(arrow_array::Float64Array::from_iter(
+                rows.iter().map(|c| c.aggs[i].finalize(spec.op)),
+            )));
+        }
+        if rollup.categories.is_some() {
+            for slot in 0..labels.len() as u32 {
+                // A zero count is null, as `--cluster-categories` writes it.
+                columns.push(Arc::new(Int64Array::from_iter(rows.iter().map(|c| {
+                    let cats = c.cats.as_slice();
+                    cats.binary_search_by_key(&slot, |e| e.0)
+                        .ok()
+                        .map(|k| cats[k].1)
+                }))));
+            }
+        }
+        let geoms: Vec<Geometry<f64>> = ids
+            .par_iter()
+            .map(|&id| Geometry::MultiPolygon(system.polygon(id, res)))
+            .collect();
+        let mut builder = GeometryBuilder::new(geom_type.clone()).with_prefer_multi(false);
+        builder.extend_from_iter(geoms.iter().map(Some));
+        columns.push(builder.finish().to_array_ref());
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
+        writer.write(&encoder.encode_record_batch(&batch).map_err(gpq)?)?;
+    }
     writer.append_key_value_metadata(encoder.into_keyvalue().map_err(gpq)?);
     writer.close()?;
     pending.publish()?;
