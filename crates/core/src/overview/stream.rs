@@ -1111,6 +1111,48 @@ fn build_writer_options_with_ceiling(
 /// relation in shard mode instead of an equality, and why the plan's
 /// row-indexed tables are then re-addressed onto the subset rather than
 /// re-derived over it.
+/// A shard's read window as a query in the input's CRS: its tile range plus
+/// the read margin, with the wrapped copies.
+fn shard_read_query(range: &crate::shard::TileRange, crs: Crs) -> BboxQuery {
+    let b = range.read_bounds();
+    BboxQuery::new(&[b.lng_min, b.lat_min, b.lng_max, b.lat_max], crs)
+}
+
+/// #546: a data shard's coalesce chains.
+///
+/// A chain merges rows from anywhere in the input and carries its rep row's
+/// attributes, so a shard cannot build it from the rows it reads. It builds
+/// every level's chains over the plan's dataset-wide line scratch instead —
+/// the same tables a monolithic run builds — and keeps those whose bbox
+/// reaches its read window. The re-addressing then also reads each kept
+/// rep's row group.
+fn shard_chain_tables(
+    plan: &mut super::plan_state::ConvertPlan,
+    range: &crate::shard::TileRange,
+    (crs, memory): (Crs, MemoryBudget),
+    options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<Option<CoalesceBuild>, ConvertError> {
+    let Some(scratch) = plan.take_coalesce_scratch()? else {
+        return Ok(None);
+    };
+    let (_, build) = coalesce_level_counts(
+        memory,
+        &scratch,
+        &plan.level_specs,
+        crs,
+        options,
+        true,
+        diagnostics,
+    );
+    let mut build = build.expect("prebuild returns the tables");
+    let window = shard_read_query(range, crs);
+    for table in build.tables.iter_mut().flatten() {
+        table.retain(|_, (geom, _)| window.intersects(&super::convert::geometry_bbox(geom)));
+    }
+    Ok(Some(build))
+}
+
 pub(super) fn select_row_groups_streaming(
     source: &ConvertSource,
     bbox_query: Option<&BboxQuery>,
@@ -1131,11 +1173,7 @@ pub(super) fn select_row_groups_streaming(
     // at lng 200 belongs to the shard covering -160: test the wrapped copies
     // too, as `--bbox` does (#643).
     let shard_selection: Option<RowGroupSelection> = match shard {
-        Some(range) => {
-            let b = range.read_bounds();
-            let query = BboxQuery::new(&[b.lng_min, b.lat_min, b.lng_max, b.lat_max], crs);
-            Some(source.select_row_groups_any(query.boxes())?)
-        }
+        Some(range) => Some(source.select_row_groups_any(shard_read_query(range, crs).boxes())?),
         None => None,
     };
     Ok([bbox_selection, filter_selection, shard_selection]
@@ -2281,12 +2319,23 @@ pub(super) struct CoalesceBuild {
     /// of sitting resident through pass 1. Pass 2 rebuilds any level whose
     /// entry is missing, so this stays a caching decision, never a
     /// correctness one.
-    tables: Vec<Option<CoalesceTable>>,
+    pub(super) tables: Vec<Option<CoalesceTable>>,
     /// Whether ANY non-canonical level's chains merged two or more segments
     /// (`CoalescingProvenance::merged`). Evaluated over every planned level,
     /// materialized or not — the same set [`coalesce_merged_anywhere`] covers,
     /// since a level omitted for having no rows has no chains to merge.
     merged: bool,
+}
+
+impl CoalesceBuild {
+    /// Every level's chain reps: the rows whose attributes the chains carry.
+    pub(super) fn rep_rows(&self) -> std::collections::BTreeSet<usize> {
+        self.tables
+            .iter()
+            .flatten()
+            .flat_map(|t| t.keys().copied())
+            .collect()
+    }
 }
 
 /// Whether a level with this zoom can be materialized under `ceiling`.
@@ -2725,6 +2774,49 @@ struct Preflight {
     pass0: Option<Pass0Record>,
 }
 
+impl Preflight {
+    /// #546: take a data shard's read selection, widened by its coalesced
+    /// chains, and redo what the preflight derived from the selection.
+    fn widen_selection(
+        &mut self,
+        read: RowGroupSelection,
+        source: &ConvertSource,
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) -> Result<(), ConvertError> {
+        diagnostics.set_input_rows(source.stream_row_locator(Some(&read))?);
+        self.options.read_batch_size = source.read_batch_rows(
+            Some(&read),
+            self.options.read_batch_size,
+            tylertoo_io::byte_array_limit(),
+        )?;
+        self.row_groups_read = read.total_selected();
+        self.selected_row_groups = Some(read);
+        Ok(())
+    }
+}
+
+/// Pass 0 for a remote input, in its own RSS phase, then back to `resume`.
+fn stage_pass0(
+    source: &ConvertSource,
+    preflight: &mut Preflight,
+    rss: &RssTracker,
+    resume: &str,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
+    if source.is_remote() {
+        rss.enter_phase("pass0 staging");
+        let profile = preflight.options.profile;
+        preflight.pass0 = stage_input_pass0(
+            source,
+            preflight.selected_row_groups.as_ref(),
+            preflight.row_groups_read,
+            (&mut preflight.budget, profile),
+            diagnostics,
+        );
+        rss.enter_phase(resume);
+    }
+}
+
 fn preflight(
     source: &ConvertSource,
     options: &ConvertOptions,
@@ -2995,6 +3087,9 @@ struct PlanState {
     /// (it is one extra O(N) pass over the pass-1 features), `(0, 0, 0)`
     /// otherwise; the plan-only report (#560) is its only reader.
     kind_counts: (usize, usize, usize),
+    /// A data shard's read selection when its coalesced chains widened it
+    /// (#546); `None` keeps the preflight's.
+    read_selection: Option<RowGroupSelection>,
 }
 
 /// The front half of a streaming convert: the preflight, and pass 1 + the
@@ -3034,18 +3129,12 @@ fn run_front_half(
     let mut preflight = preflight(source, options, diagnostics, overview)?;
     // Pass 0 (#286/#287): stage the selected row groups to local disk so both
     // passes below read from the spill, not the network. Its own RSS phase
-    // for a remote input (#788); the in-memory load below is still
-    // "preflight", as before.
-    if source.is_remote() {
-        rss.enter_phase("pass0 staging");
-        preflight.pass0 = stage_input_pass0(
-            source,
-            preflight.selected_row_groups.as_ref(),
-            preflight.row_groups_read,
-            (&mut preflight.budget, options.profile),
-            diagnostics,
-        );
-        rss.enter_phase("preflight");
+    // for a remote input (#788). A `--plan` run reads no data before pass 2,
+    // so it stages after the plan loads: a shard's coalesced chains can widen
+    // what it reads (#546).
+    let replay = options.plan.is_some();
+    if !replay {
+        stage_pass0(source, &mut preflight, rss, "preflight", diagnostics);
     }
     // The PREFLIGHT-RESOLVED options from here on (auto-detected ranking,
     // profile-derived knobs): what pass 1, the assignment and the plan's
@@ -3066,7 +3155,7 @@ fn run_front_half(
     let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
     #[cfg(not(test))]
     let reader: &dyn BatchSource = source;
-    let plan = resolve_plan_state(
+    let mut plan = resolve_plan_state(
         &Pass1Ctx {
             descriptor: &preflight.descriptor,
             config: &config,
@@ -3083,6 +3172,12 @@ fn run_front_half(
         },
         rss,
     )?;
+    if let Some(read) = plan.read_selection.take() {
+        preflight.widen_selection(read, source, diagnostics)?;
+    }
+    if replay {
+        stage_pass0(source, &mut preflight, rss, "plan load", diagnostics);
+    }
     Ok(FrontHalf {
         preflight,
         plan,
@@ -3216,6 +3311,7 @@ fn resolve_plan_state(
                 options,
                 inputs.source,
                 inputs.selected_row_groups,
+                (inputs.crs, *inputs.budget),
                 diagnostics,
             )
         }
@@ -3357,6 +3453,7 @@ fn run_pass1_and_assign(
         pass1_wall,
         assign_wall,
         kind_counts: kind_counts.unwrap_or_default(),
+        read_selection: None,
     })
 }
 
@@ -3381,6 +3478,7 @@ fn load_plan_state(
     options: &ConvertOptions,
     source: &ConvertSource,
     selected_row_groups: Option<&RowGroupSelection>,
+    crs_memory: (Crs, MemoryBudget),
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<PlanState, ConvertError> {
     let t_pass1 = Instant::now();
@@ -3416,16 +3514,26 @@ fn load_plan_state(
     // sections are then re-addressed onto this shard's narrower stream, and
     // the equality below is what proves the re-addressing landed — the
     // compacted table must be exactly as long as what the shard will read.
-    if options.shard.is_some() {
-        if plan.coalesce.as_ref().is_some_and(|c| !c.rows.is_empty()) {
-            return Err(super::convert::InvalidOption::ShardWithCoalescedLines {
-                plan: path.to_path_buf(),
-                chains: plan.coalesce.as_ref().map_or(0, |c| c.rows.len()),
-            }
-            .into());
+    let mut chains = None;
+    let mut read_selection = None;
+    if let Some(range) = &options.shard {
+        chains = shard_chain_tables(&mut plan, range, crs_memory, options, diagnostics)?;
+        read_selection = super::plan_state::rebase_plan_for_shard(
+            &mut plan,
+            source,
+            selected_row_groups,
+            chains.as_mut(),
+            path,
+        )?;
+        if let Some(read) = &read_selection {
+            log::info!(
+                "[convert] shard {range}: also reading the row groups of the coalesced chains \
+                 that reach it, {} in all",
+                read.total_selected()
+            );
         }
-        super::plan_state::rebase_plan_for_shard(&mut plan, source, selected_row_groups, path)?;
     }
+    let selected_row_groups = read_selection.as_ref().or(selected_row_groups);
     // Captured after the shard re-addressing, so the report and the pass-2
     // memory estimate describe what THIS run will read.
     let totals = plan.totals.clone();
@@ -3484,8 +3592,13 @@ fn load_plan_state(
     );
     let ranking_provenance = plan.rank_provenance.clone();
     let entry_zoom = plan.entry_zoom.clone();
+    let mut tables = plan.into_winner_tables()?;
+    if chains.is_some() {
+        tables.coalesce_build = chains;
+    }
     Ok(PlanState {
-        tables: plan.into_winner_tables()?,
+        tables,
+        read_selection,
         ranking_provenance,
         entry_zoom,
         num_rows: totals.n_rows,
@@ -3646,6 +3759,7 @@ pub(crate) fn run_stages(
         pass1_wall,
         assign_wall,
         kind_counts: _,
+        read_selection: _,
     } = plan;
     rss.enter_phase("pre-pass2 (winner tables freed)"); // #571
                                                         // #716/#545: footer bytes per input row over every column pass 2 reads;

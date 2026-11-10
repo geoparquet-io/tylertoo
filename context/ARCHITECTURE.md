@@ -853,12 +853,14 @@ write a valid tile-less archive (`export::write_empty_archive`) and exit 0;
 `merge` excludes a tile-less input from the zoom union, the bounds union and
 the layer declarations alike.
 
-**v1 restriction: line coalescing.** A coalesced chain is a new geometry
-spanning every row it merged, which no single input row group's bbox bounds.
-The shard holding the chain's row would emit tiles past its range while its
-neighbour emitted none — a gap at the seam. A shard against a plan carrying
-chains is refused, naming `--no-coalesce-lines`. Clustering, accumulation and
-tiny-polygon carriers are supported: each keys off one input row whose own
+**Line coalescing (#546).** A coalesced chain is a new geometry spanning
+every row it merged, carrying its rep row's attributes, so no single input
+row group's bbox bounds it. Each data shard rebuilds every level's chains
+over the plan's dataset-wide line scratch (the tables a monolithic run
+builds), keeps those whose bbox reaches its read window, and widens its read
+selection with the row groups holding their reps. Tiles stay byte-identical
+at the cost of the chain stage running on every shard. Clustering,
+accumulation and tiny-polygon carriers each key off one input row whose own
 bbox bounds it, so the row-group argument that makes ordinary features safe
 covers them unchanged.
 

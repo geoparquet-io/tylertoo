@@ -288,12 +288,10 @@ fn a_pivot_past_the_finest_zoom_is_refused() {
     );
 }
 
-/// A convert plan carrying coalesced line chains is refused under `--shard`:
-/// a chain is a new geometry spanning every row it merged, which no single
-/// row group's bbox bounds, so one shard would emit tiles past its range
-/// while its neighbour emitted none — a gap at the seam.
+/// #546: a data shard accepts a convert plan carrying coalesced line chains.
+/// `shard_merge_parity.rs` checks the fleet's tiles; this checks the CLI path.
 #[test]
-fn shard_with_coalesced_lines_in_the_plan_is_refused() {
+fn a_shard_over_a_plan_with_coalesced_lines_builds() {
     let Some(lines) = fixture::realdata("road-detections.parquet") else {
         return;
     };
@@ -319,8 +317,7 @@ fn shard_with_coalesced_lines_in_the_plan_is_refused() {
     // Coalescing on (the default), so the plan carries chains. Written by the
     // COARSE JOB of this fleet, which is the only run whose plan a shard will
     // accept: the shard plan's cut digest is part of the convert plan's
-    // fingerprint (#498), so a plan saved by an unsharded run is refused
-    // before the coalescing rule is ever reached.
+    // fingerprint (#498), so a plan saved by an unsharded run is refused.
     let (ok, out) = run(&[
         "tiles",
         lines.to_str().unwrap(),
@@ -353,11 +350,7 @@ fn shard_with_coalesced_lines_in_the_plan_is_refused() {
         "--plan",
         convert_plan.to_str().unwrap(),
     ]);
-    assert!(!ok, "a shard over a coalesced plan must be refused: {out}");
-    assert!(
-        out.contains("not supported with line coalescing") && out.contains("--no-coalesce-lines"),
-        "the error must name the flag that fixes it: {out}"
-    );
+    assert!(ok, "a shard over a coalesced plan must build: {out}");
 }
 
 /// #541: `--shard coarse` caps the CONVERT at the pivot, not just the export.

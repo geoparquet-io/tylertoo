@@ -234,7 +234,7 @@ that gives each shard a few populated tiles. Zooms z4 to z8 suit most fleets.
 
 ```bash
 tylertoo tiles fields.parquet coarse.pmtiles \
-    --min-zoom 0 --max-zoom 14 --no-coalesce-lines \
+    --min-zoom 0 --max-zoom 14 \
     --shard coarse --shard-plan shards.json \
     --save-plan convert.plan
 ```
@@ -254,7 +254,7 @@ at z0 to z8 with polygons at z9 to z13. Set the pivot to the handover zoom
 
 ```bash
 tylertoo tiles fields.parquet \
-    --min-zoom 9 --max-zoom 13 --no-coalesce-lines \
+    --min-zoom 9 --max-zoom 13 \
     --shard coarse --shard-plan shards.json \
     --save-plan convert.plan \
     --plan-only
@@ -270,7 +270,7 @@ same memory.
 
 ```bash
 tylertoo tiles fields.parquet shard-$i.pmtiles \
-    --min-zoom 0 --max-zoom 14 --no-coalesce-lines \
+    --min-zoom 0 --max-zoom 14 \
     --shard $i/16 --shard-plan shards.json \
     --plan convert.plan
 ```
@@ -324,7 +324,7 @@ sbatch --dependency=afterok:$coarse shards.sh
 #SBATCH --time=08:00:00
 
 tylertoo tiles "$INPUT" "$OUT/shard-${SLURM_ARRAY_TASK_ID}.pmtiles" \
-    --min-zoom 0 --max-zoom 14 --no-coalesce-lines \
+    --min-zoom 0 --max-zoom 14 \
     --shard "${SLURM_ARRAY_TASK_ID}/16" \
     --shard-plan "$OUT/shards.json" \
     --plan "$OUT/convert.plan" \
@@ -336,10 +336,15 @@ Set `SPILL` to an existing directory on real disk. To rerun shard 7, submit
 
 ### Constraints
 
-- **No line coalescing.** Coalesced chains span row groups and can leave gaps
-  at shard boundaries. Pass `--no-coalesce-lines` to every job, including the
-  coarse job. tylertoo supports clustering, `--accumulate-attribute`, and
-  tiny-polygon carriers.
+- **Line coalescing costs every shard.** A coalesced chain joins line
+  segments from anywhere in the input and carries one segment's attributes.
+  Each data shard builds every chain from the plan, as the coarse job does,
+  and also reads the row groups of that segment for each chain that reaches
+  its tiles. On line data, every shard therefore needs the coarse job's
+  memory for chaining. To save it, pass `--no-coalesce-lines` to every job,
+  including the coarse job. This changes the line output. tylertoo supports
+  clustering, `--accumulate-attribute`, and tiny-polygon carriers at no extra
+  cost.
 - **`--tile-buffer` must be at most 256 tile pixels**, the cap for every
   export. This fits inside the two pivot tiles (512 pixels) read around each
   shard's range.

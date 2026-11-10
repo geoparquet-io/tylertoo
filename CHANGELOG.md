@@ -80,6 +80,11 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `stats` and `--shard` included, with the binary's output, stderr logging
   and exit codes. The Python API now installs its `logging` bridge on its
   first call instead of at import.
+- Sharded builds work with line coalescing, which is on by default (#546).
+  Every data shard rebuilds the chains from the plan and reads the row groups
+  of the chains that reach its tiles. Tile bodies match a single-machine
+  build byte for byte. `--no-coalesce-lines` is no longer needed, and
+  `InvalidOption::ShardWithCoalescedLines` is gone.
 
 ### Fixed
 

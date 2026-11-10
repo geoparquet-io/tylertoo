@@ -1235,9 +1235,6 @@ pub tylertoo_core::InvalidOption::ReadBatchSize
 pub tylertoo_core::InvalidOption::ReadWorkers::ceiling: usize
 #[non_exhaustive] pub tylertoo_core::InvalidOption::SavePlan
 pub tylertoo_core::InvalidOption::SavePlan::message: alloc::string::String
-#[non_exhaustive] pub tylertoo_core::InvalidOption::ShardWithCoalescedLines
-pub tylertoo_core::InvalidOption::ShardWithCoalescedLines::chains: usize
-pub tylertoo_core::InvalidOption::ShardWithCoalescedLines::plan: std::path::PathBuf
 pub tylertoo_core::InvalidOption::ShardWithSavePlan
 pub tylertoo_core::InvalidOption::ShardWithoutPlan
 impl core::convert::From<tylertoo_core::InvalidOption> for tylertoo_core::ConvertError

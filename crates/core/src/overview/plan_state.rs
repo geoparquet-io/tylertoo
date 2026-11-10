@@ -101,7 +101,7 @@ use super::cluster::{CategoryCounts, ClusterEntry, ClusterTables};
 use super::convert::{ConvertError, ConvertOptions};
 use super::ladder::EntryZoomSpec;
 use super::level::{EntryZoomProvenance, RankingProvenance};
-use super::stream::{CoalesceScratch, WinnerTables};
+use super::stream::{CoalesceBuild, CoalesceScratch, WinnerTables};
 
 /// Schema-metadata key under which the plan's JSON scalars travel.
 pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
@@ -551,15 +551,27 @@ struct KeptRun {
 /// when its bbox does not reach the shard's tile range, and a feature inside
 /// that bbox cannot land in a tile the shard owns.
 ///
-/// Returns the compacted row count.
+/// Coalesced chains (#546) are the exception: a chain takes its rep row's
+/// attributes but spans rows from anywhere, so `chains` (built over the whole
+/// plan, already narrowed to the chains that reach the shard) also keeps the
+/// row group of every rep, and its tables are re-keyed with the rest.
+///
+/// Returns the shard's read selection when the reps widened it.
 pub(super) fn rebase_plan_for_shard(
     plan: &mut ConvertPlan,
     source: &ConvertSource,
     shard_selection: Option<&RowGroupSelection>,
+    mut chains: Option<&mut CoalesceBuild>,
     path: &Path,
-) -> Result<usize, ConvertError> {
+) -> Result<Option<RowGroupSelection>, ConvertError> {
     let rg_rows = source.part_row_group_row_counts()?;
     let named = || path.display().to_string();
+    let reps = chains
+        .as_deref()
+        .map(CoalesceBuild::rep_rows)
+        .unwrap_or_default();
+    let mut read: Vec<Vec<usize>> = vec![Vec::new(); rg_rows.len()];
+    let mut widened = false;
 
     // Walk the PLAN's stream in read order, marking the runs the shard keeps.
     let mut runs: Vec<KeptRun> = Vec::new();
@@ -607,7 +619,13 @@ pub(super) fn rebase_plan_for_shard(
             .map(|v| v.iter().copied().collect());
         for g in plan_groups {
             let rows = part_rows.get(g).copied().unwrap_or(0).max(0) as usize;
-            let kept = shard_groups.as_ref().is_none_or(|s| s.contains(&g));
+            let in_window = shard_groups.as_ref().is_none_or(|s| s.contains(&g));
+            let holds_rep = reps.range(plan_cursor..plan_cursor + rows).next().is_some();
+            widened |= holds_rep && !in_window;
+            let kept = in_window || holds_rep;
+            if kept {
+                read[part_idx].push(g);
+            }
             if kept && rows > 0 {
                 // Extend the previous run when the groups are adjacent in
                 // BOTH streams, so a shard that keeps everything collapses to
@@ -636,10 +654,11 @@ pub(super) fn rebase_plan_for_shard(
         )));
     }
 
+    let read = widened.then(|| RowGroupSelection::from_parts(read));
     // Nothing was pruned: the shard reads exactly the plan's stream, so the
     // addressing already matches and there is nothing to move.
     if shard_cursor == plan_cursor {
-        return Ok(plan_cursor);
+        return Ok(read);
     }
 
     // Fallible rather than a slice index: `runs` is derived from the plan's
@@ -710,30 +729,17 @@ pub(super) fn rebase_plan_for_shard(
         out.sort_unstable();
         *level = out;
     }
-    if let Some(tables) = &mut plan.cluster_tables {
-        for table in tables.iter_mut() {
-            *table = table
-                .drain()
-                .filter_map(|(row, entry)| shard_row(&runs, row).map(|r| (r, entry)))
-                .collect();
+    for table in plan.cluster_tables.iter_mut().flatten() {
+        rekey(table, &runs);
+    }
+    if let Some(chains) = &mut chains {
+        for table in chains.tables.iter_mut().flatten() {
+            rekey(table, &runs);
         }
     }
-    // Line coalescing is refused alongside `--shard` up front (a merged chain
-    // spans whatever rows the chain touched, which no single row group's bbox
-    // bounds), so no CHAIN can survive to here.
-    //
-    // A *present but empty* section can, and does, on the default workflow:
-    // `coalesce_lines` is on by default, so a polygon dataset saves a
-    // coalesce section carrying zero rows, and `load_plan_state` — which
-    // gates on `!c.rows.is_empty()`, correctly — lets it through. An
-    // `is_none()` assertion here therefore panicked every debug-build shard
-    // of an ordinary polygon fleet while release builds ran correctly, which
-    // is the worst possible split. Assert what is actually required: nothing
-    // to re-address.
     debug_assert!(
-        plan.coalesce.as_ref().is_none_or(|c| c.rows.is_empty()),
-        "load_plan_state must have refused a --shard run whose plan carries coalesced chains \
-         before it reached the re-addressing"
+        plan.coalesce.is_none(),
+        "load_plan_state turns the line scratch into `chains` before the re-addressing"
     );
 
     // The totals describe what this run will read, not the dataset: they feed
@@ -796,7 +802,16 @@ pub(super) fn rebase_plan_for_shard(
          {plan_cursor} row(s) in {} contiguous run(s); {assigned} feature(s) to build",
         runs.len()
     );
-    Ok(shard_cursor)
+    Ok(read)
+}
+
+/// Re-key a row-keyed side table onto the shard's stream, dropping the rows
+/// the shard does not read.
+fn rekey<V>(table: &mut HashMap<usize, V>, runs: &[KeptRun]) {
+    *table = table
+        .drain()
+        .filter_map(|(row, v)| shard_row(runs, row).map(|r| (r, v)))
+        .collect();
 }
 
 /// Map a plan-stream row index into the shard's stream, or `None` when the
@@ -1144,11 +1159,12 @@ impl ConvertPlan {
         })
     }
 
-    /// Rebuild the winner tables pass 2 addresses. Consumes the plan's
-    /// O(dataset) tables rather than cloning them.
-    pub(super) fn into_winner_tables(self) -> Result<WinnerTables, ConvertError> {
-        let coalesce_scratch = self
-            .coalesce
+    /// Take the line scratch out of the plan, decoded for the chain stage.
+    pub(super) fn take_coalesce_scratch(
+        &mut self,
+    ) -> Result<Option<CoalesceScratch>, ConvertError> {
+        self.coalesce
+            .take()
             .map(|c| {
                 let geoms = c
                     .wkb
@@ -1167,7 +1183,13 @@ impl ConvertPlan {
                     groups: c.groups,
                 })
             })
-            .transpose()?;
+            .transpose()
+    }
+
+    /// Rebuild the winner tables pass 2 addresses. Consumes the plan's
+    /// O(dataset) tables rather than cloning them.
+    pub(super) fn into_winner_tables(mut self) -> Result<WinnerTables, ConvertError> {
+        let coalesce_scratch = self.take_coalesce_scratch()?;
         Ok(WinnerTables {
             level_specs: self.level_specs,
             cluster_tables: self.cluster_tables,
@@ -2649,9 +2671,10 @@ mod tests {
             let mut plan = tiny_plan();
             plan.fingerprint.inputs[0].row_groups = Some(forged.clone());
             plan.min_levels = vec![0; 9];
-            let err = rebase_plan_for_shard(&mut plan, &source, None, Path::new("forged.plan"))
-                .unwrap_err()
-                .to_string();
+            let err =
+                rebase_plan_for_shard(&mut plan, &source, None, None, Path::new("forged.plan"))
+                    .unwrap_err()
+                    .to_string();
             assert!(
                 err.contains("strictly ascending"),
                 "selection {forged:?} must be refused: {err}"
@@ -2684,6 +2707,7 @@ mod tests {
             &mut plan,
             &source,
             Some(&RowGroupSelection::from_parts(vec![vec![1]])),
+            None,
             Path::new("test.plan"),
         )
         .unwrap();
@@ -2875,6 +2899,7 @@ mod tests {
             &mut plan,
             &source,
             Some(&RowGroupSelection::from_parts(vec![vec![1]])),
+            None,
             Path::new("test.plan"),
         )
         .unwrap();

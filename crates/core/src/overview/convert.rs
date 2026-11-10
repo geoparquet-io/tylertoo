@@ -24,7 +24,6 @@ use std::time::Instant;
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_select::take::take;
-#[cfg(test)]
 use geo::BoundingRect;
 use geo::Geometry;
 use geo_traits::to_geo::ToGeoGeometry;
@@ -2323,24 +2322,6 @@ pub enum InvalidOption {
          give every shard that plan with --plan."
     )]
     ShardWithoutPlan,
-    /// A shard whose plan carries coalesced line chains.
-    #[error(
-        "--shard is not supported with line coalescing: {} carries {chains} coalesced line \
-         chain(s). A chain is a NEW geometry spanning every row it merged, so no \
-         single input row group's bbox bounds it — the shard that holds the chain's \
-         row would emit tiles outside its own range while the neighbouring shard, \
-         which never reads that row, would emit none, leaving a gap at the seam. \
-         Re-run the whole fleet (including the coarse job, so the plan matches) with \
-         --no-coalesce-lines.",
-        plan.display()
-    )]
-    #[non_exhaustive]
-    ShardWithCoalescedLines {
-        /// The plan file.
-        plan: PathBuf,
-        /// Coalesced chains it carries.
-        chains: usize,
-    },
     /// `--max-zoom auto` with an explicit GSD ladder.
     #[error("--max-zoom auto needs a zoom-range level plan, not an explicit GSD list")]
     AutoMaxZoomNeedsZoomRange,
@@ -4472,7 +4453,6 @@ pub(super) fn pruning_label(bbox: bool, filter: bool) -> &'static str {
 }
 
 /// `[xmin, ymin, xmax, ymax]` of a geometry (`[0;4]` when the bbox is undefined).
-#[cfg(test)]
 pub(super) fn geometry_bbox(g: &Geometry<f64>) -> [f64; 4] {
     match g.bounding_rect() {
         Some(r) => [r.min().x, r.min().y, r.max().x, r.max().y],
