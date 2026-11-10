@@ -106,19 +106,59 @@ impl SingleSource {
 }
 
 /// Footer-derived metadata of one partition.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PartMeta {
     resolved: Arc<crate::resolved_schema::ResolvedSchema>,
     /// Arrow schema decoded from the part's footer.
     schema: SchemaRef,
-    /// Parsed parquet metadata (row groups, key-value metadata).
-    parquet: Arc<ParquetMetaData>,
-    /// The same footer in the shape the arrow reader wants, so opening a
+    /// The footer's row count and per-row-group row counts, kept when the
+    /// decoded footer is released: they address rows in every part.
+    num_rows: i64,
+    row_group_rows: Vec<i64>,
+    /// The decoded footer in the shape the arrow reader wants, so opening a
     /// reader over this part never re-parses it ([`InputSource::open_with_metadata`]).
     /// Load-bearing for the pass-2 parallel read (#494), which opens one
     /// reader per segment: a 1084-segment run parsed the footer 1084 times,
-    /// twice per conversion.
-    reader: ReaderMetadata,
+    /// twice per conversion. `None` once [`ConvertSource::release_unselected`]
+    /// dropped it (#815: 512 pruned S3 footers held ~2 GiB); re-read on use.
+    footer: std::sync::Mutex<Option<ReaderMetadata>>,
+}
+
+impl PartMeta {
+    fn new(resolved: crate::resolved_schema::ResolvedSchema, reader: ReaderMetadata) -> Self {
+        let parquet = reader.metadata();
+        PartMeta {
+            resolved: Arc::new(resolved),
+            schema: reader.schema().clone(),
+            num_rows: parquet.file_metadata().num_rows(),
+            row_group_rows: parquet
+                .row_groups()
+                .iter()
+                .map(tylertoo_io::RowGroupMetaData::num_rows)
+                .collect(),
+            footer: std::sync::Mutex::new(Some(reader)),
+        }
+    }
+
+    /// The decoded footer, re-read from `source` if it was released.
+    fn footer(&self, source: &InputSource) -> Result<ReaderMetadata, InputError> {
+        let mut slot = self.footer.lock().expect("footer slot lock");
+        if let Some(reader) = slot.as_ref() {
+            return Ok(reader.clone());
+        }
+        log::debug!(
+            "re-reading the released footer of {}",
+            source.display_name()
+        );
+        let reader = source.open()?.reader_metadata().clone();
+        *slot = Some(reader.clone());
+        Ok(reader)
+    }
+
+    /// The parsed parquet metadata (row groups, key-value metadata).
+    fn parquet(&self, source: &InputSource) -> Result<Arc<ParquetMetaData>, InputError> {
+        Ok(self.footer(source)?.metadata().clone())
+    }
 }
 
 /// An ordered set of parquet partitions (local files and/or remote
@@ -361,7 +401,8 @@ pub struct SourceStream<'a> {
     parts: &'a [InputSource],
     /// Each part's already-parsed footer, parallel to `parts`, so opening a
     /// part's reader costs a `File::open` and nothing else (#494 follow-up).
-    metas: Vec<ReaderMetadata>,
+    /// `None` for a part the selection never opens.
+    metas: Vec<Option<ReaderMetadata>>,
     projection: Option<Vec<usize>>,
     row_groups: Option<Vec<Vec<usize>>>,
     batch_size: usize,
@@ -702,12 +743,12 @@ impl ConvertSource {
         match self {
             ConvertSource::Single(s) => Ok(s
                 .meta()?
-                .parquet
+                .parquet(s.input())?
                 .file_metadata()
                 .key_value_metadata()
                 .cloned()),
             ConvertSource::Multi(m) => Ok(m.metas[0]
-                .parquet
+                .parquet(&m.parts[0])?
                 .file_metadata()
                 .key_value_metadata()
                 .cloned()),
@@ -743,11 +784,7 @@ impl ConvertSource {
     ///
     /// Returns an [`InputError`] if a part's footer cannot be read.
     pub fn num_row_groups_total(&self) -> Result<usize, InputError> {
-        Ok(self
-            .metas()?
-            .iter()
-            .map(|m| m.parquet.num_row_groups())
-            .sum())
+        Ok(self.metas()?.iter().map(|m| m.row_group_rows.len()).sum())
     }
 
     /// Per-part `(row count, row-group count)` straight from each part's
@@ -768,12 +805,7 @@ impl ConvertSource {
         Ok(self
             .metas()?
             .iter()
-            .map(|m| {
-                (
-                    m.parquet.file_metadata().num_rows(),
-                    m.parquet.num_row_groups(),
-                )
-            })
+            .map(|m| (m.num_rows, m.row_group_rows.len()))
             .collect())
     }
 
@@ -804,13 +836,12 @@ impl ConvertSource {
             .metas()?
             .iter()
             .enumerate()
-            .map(|(i, m)| {
-                crate::input::selected_groups(
-                    &m.parquet,
-                    selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice),
-                )
-                .map(tylertoo_io::RowGroupMetaData::num_rows)
-                .sum::<i64>()
+            .map(|(i, m)| match selected.and_then(|s| s.parts().get(i)) {
+                Some(picked) => picked
+                    .iter()
+                    .filter_map(|&g| m.row_group_rows.get(g))
+                    .sum::<i64>(),
+                None => m.row_group_rows.iter().sum(),
             })
             .sum())
     }
@@ -839,14 +870,16 @@ impl ConvertSource {
         let root = self.column_projection().map_or(column, |p| p[column]);
         let mut total = 0u64;
         for (i, m) in self.metas()?.iter().enumerate() {
-            let descr = m.parquet.file_metadata().schema_descr();
+            let picked = selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice);
+            if picked.is_some_and(<[usize]>::is_empty) {
+                continue;
+            }
+            let parquet = m.parquet(&self.parts()[i])?;
+            let descr = parquet.file_metadata().schema_descr();
             let leaves: Vec<usize> = (0..descr.num_columns())
                 .filter(|&leaf| descr.get_column_root_idx(leaf) == root)
                 .collect();
-            for rg in crate::input::selected_groups(
-                &m.parquet,
-                selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice),
-            ) {
+            for rg in crate::input::selected_groups(&parquet, picked) {
                 for &leaf in &leaves {
                     let col = rg.column(leaf);
                     let bytes = col
@@ -888,13 +921,7 @@ impl ConvertSource {
         Ok(self
             .metas()?
             .iter()
-            .map(|m| {
-                m.parquet
-                    .row_groups()
-                    .iter()
-                    .map(tylertoo_io::RowGroupMetaData::num_rows)
-                    .collect()
-            })
+            .map(|m| m.row_group_rows.clone())
             .collect())
     }
 
@@ -954,8 +981,9 @@ impl ConvertSource {
         let per_part = self
             .metas()?
             .iter()
-            .map(|m| filter.select_row_groups(&m.parquet))
-            .collect();
+            .zip(self.parts())
+            .map(|(m, part)| Ok(filter.select_row_groups(m.parquet(part)?.as_ref())))
+            .collect::<Result<_, InputError>>()?;
         Ok(RowGroupSelection(per_part))
     }
 
@@ -975,17 +1003,17 @@ impl ConvertSource {
         if let Some(sel) = selection {
             debug_assert_eq!(metas.len(), sel.0.len());
         }
-        Ok(metas
-            .iter()
-            .enumerate()
-            .map(|(pi, m)| {
-                crate::input::selected_compressed_bytes(
-                    &m.parquet,
-                    selection.map(|s| s.0[pi].as_slice()),
-                )
-            })
+        let mut total = 0u64;
+        for (pi, m) in metas.iter().enumerate() {
+            let picked = selection.map(|s| s.0[pi].as_slice());
+            if picked.is_some_and(<[usize]>::is_empty) {
+                continue;
+            }
+            let parquet = m.parquet(&self.parts()[pi])?;
             // Saturating: each part's figure is footer-declared (#686).
-            .fold(0, u64::saturating_add))
+            total = total.saturating_add(crate::input::selected_compressed_bytes(&parquet, picked));
+        }
+        Ok(total)
     }
 
     /// Plan reads for all selected parts through the untrusted-reader owner.
@@ -998,25 +1026,23 @@ impl ConvertSource {
         limit: u64,
     ) -> Result<usize, InputError> {
         let roots = self.file_roots(projection);
-        Ok(self
-            .metas()?
-            .iter()
-            .enumerate()
-            .fold(requested, |rows, (pi, m)| {
-                let mask = roots.as_deref().map(|roots| {
-                    tylertoo_io::ProjectionMask::roots(
-                        m.parquet.file_metadata().schema_descr(),
-                        roots.iter().copied(),
-                    )
-                });
-                tylertoo_io::read_batch_plan(
-                    &m.reader,
-                    selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice),
-                    mask.as_ref(),
-                    rows,
-                    limit,
+        let mut rows = requested;
+        for (pi, m) in self.metas()?.iter().enumerate() {
+            let picked = selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice);
+            // A part this run never opens plans no batch.
+            if picked.is_some_and(<[usize]>::is_empty) {
+                continue;
+            }
+            let reader = m.footer(&self.parts()[pi])?;
+            let mask = roots.as_deref().map(|roots| {
+                tylertoo_io::ProjectionMask::roots(
+                    reader.metadata().file_metadata().schema_descr(),
+                    roots.iter().copied(),
                 )
-            }))
+            });
+            rows = tylertoo_io::read_batch_plan(&reader, picked, mask.as_ref(), rows, limit);
+        }
+        Ok(rows)
     }
 
     /// Fetch counters summed over remote parts (`None` when no part is
@@ -1187,8 +1213,18 @@ impl ConvertSource {
         let metas = self
             .metas()?
             .iter()
-            .map(|m| m.reader.clone())
-            .collect::<Vec<_>>();
+            .zip(parts)
+            .enumerate()
+            .map(|(i, (m, part))| {
+                let picked = plan.row_groups.map(|s| s.0[i].as_slice());
+                // A part with an empty selection is never opened.
+                if picked.is_some_and(<[usize]>::is_empty) {
+                    Ok(None)
+                } else {
+                    m.footer(part).map(Some)
+                }
+            })
+            .collect::<Result<Vec<_>, InputError>>()?;
         // #563: each part's reader caps the batch for its selected row
         // groups' widest byte-array column (`untrusted::ParquetSource::build`),
         // so no batch can pass arrow's i32 offset ceiling. Output does not
@@ -1249,11 +1285,11 @@ impl ConvertSource {
         for (part, meta) in metas.iter().enumerate() {
             let selected: Vec<usize> = match selection {
                 Some(sel) => sel.0[part].clone(),
-                None => (0..meta.parquet.num_row_groups()).collect(),
+                None => (0..meta.row_group_rows.len()).collect(),
             };
             let (mut run, mut run_rows) = (Vec::new(), 0usize);
             for rg in selected {
-                let rows = meta.parquet.row_group(rg).num_rows().max(0) as usize;
+                let rows = meta.row_group_rows[rg].max(0) as usize;
                 if !run.is_empty() && run_rows + rows > target_rows {
                     out.push(ReadSegment {
                         part,
@@ -1309,13 +1345,39 @@ impl ConvertSource {
 
     /// Footer metadata per part: borrowed for `Multi` (loaded at
     /// construction), loaded on demand for `Single`.
-    fn metas(&self) -> Result<std::borrow::Cow<'_, [PartMeta]>, InputError> {
+    fn metas(&self) -> Result<&[PartMeta], InputError> {
         match self {
-            ConvertSource::Single(s) => {
-                Ok(std::borrow::Cow::Borrowed(std::slice::from_ref(s.meta()?)))
-            }
-            ConvertSource::Multi(m) => Ok(std::borrow::Cow::Borrowed(&m.metas)),
+            ConvertSource::Single(s) => Ok(std::slice::from_ref(s.meta()?)),
+            ConvertSource::Multi(m) => Ok(&m.metas),
         }
+    }
+
+    /// Drop the decoded footer of every part `selection` reads nothing of
+    /// (#815): a `--bbox` over Overture's 512 S3 parts kept ~2 GiB of
+    /// footers for parts it never opens. Row counts, bounds and schemas
+    /// stay; a later use of a released footer re-reads it.
+    pub(crate) fn release_unselected(
+        &self,
+        selection: &RowGroupSelection,
+    ) -> Result<(), InputError> {
+        let parts = self.metas()?.iter().zip(self.parts());
+        for ((m, part), picked) in parts.zip(selection.parts()) {
+            if picked.is_empty() {
+                *m.footer.lock().expect("footer slot lock") = None;
+                part.release_footer();
+            }
+        }
+        Ok(())
+    }
+
+    /// Parts whose decoded footer is held.
+    #[cfg(test)]
+    fn resident_footers(&self) -> Result<usize, InputError> {
+        Ok(self
+            .metas()?
+            .iter()
+            .filter(|m| m.footer.lock().expect("footer slot lock").is_some())
+            .count())
     }
 }
 
@@ -1336,12 +1398,7 @@ fn load_part_meta(source: &InputSource) -> Result<PartMeta, InputError> {
                 source.display_name()
             )))
         })?;
-    Ok(PartMeta {
-        resolved: Arc::new(resolved),
-        schema: builder.schema().clone(),
-        parquet,
-        reader,
-    })
+    Ok(PartMeta::new(resolved, reader))
 }
 
 /// Threads parsing footers in [`load_part_metas`]. Parsing is CPU work of a
@@ -1363,7 +1420,7 @@ fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
         return Ok(Vec::new());
     };
     let first = load_part_meta(first)?;
-    let first_bytes = first.parquet.memory_size() as u64;
+    let first_bytes = first.parquet(&parts[0])?.memory_size() as u64;
     let admission = crate::input::stage_admission();
     let in_flight = admission.requests_for(first_bytes);
     // A fetched footer holds its bytes until a parse thread takes it: at
@@ -1618,7 +1675,10 @@ impl SourceStream<'_> {
     /// selection / batch size. Schemas are identical across parts, so the
     /// root-column projection indices are valid for every part.
     fn open_part(&self, i: usize) -> Result<tylertoo_io::UntrustedBatchReader, InputError> {
-        let mut builder = self.parts[i].open_with_metadata(&self.metas[i])?;
+        let meta = self.metas[i]
+            .as_ref()
+            .expect("an opened part has a selection, so its footer");
+        let mut builder = self.parts[i].open_with_metadata(meta)?;
         if let Some(cols) = &self.projection {
             builder = builder.with_projection_roots(cols.iter().copied());
         }
@@ -2625,6 +2685,46 @@ mod tests {
         let all_bytes = src.selected_input_bytes(Some(&all)).unwrap();
         assert!(all_bytes > bytes);
         assert_eq!(src.selected_input_bytes(None).unwrap(), all_bytes);
+    }
+
+    /// #815: a selection releases the footers of the parts it never reads;
+    /// reads, counts and a later use of a released footer stay correct.
+    #[test]
+    fn release_unselected_drops_pruned_footers() {
+        let dir = tmpdir();
+        for (i, base) in [0i64, 10, 20].into_iter().enumerate() {
+            write_parquet(
+                &dir.path().join(format!("p{i}.parquet")),
+                vec![Field::new("id", DataType::Int64, false)],
+                vec![Arc::new(Int64Array::from(vec![
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                ]))],
+                Some(2),
+            );
+        }
+        let src = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
+        let all_bytes = src.selected_input_bytes(None).unwrap();
+        let sel = RowGroupSelection::from_parts(vec![vec![], vec![1], vec![]]);
+        assert_eq!(src.resident_footers().unwrap(), 3);
+        src.release_unselected(&sel).unwrap();
+        assert_eq!(src.resident_footers().unwrap(), 1);
+
+        let plan = ReadPlan {
+            batch_size: 1024,
+            projection: None,
+            row_groups: Some(&sel),
+        };
+        assert_eq!(stream_ids(&src, &plan), vec![12, 13]);
+        assert_eq!(src.selected_row_count(Some(&sel)).unwrap(), 2);
+        assert_eq!(src.part_row_counts().unwrap(), vec![(4, 2); 3]);
+        assert_eq!(src.num_row_groups_total().unwrap(), 6);
+        assert_eq!(src.resident_footers().unwrap(), 1);
+        // A full read re-reads the released footers.
+        assert_eq!(src.selected_input_bytes(None).unwrap(), all_bytes);
+        assert_eq!(src.resident_footers().unwrap(), 3);
     }
 
     #[test]

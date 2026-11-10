@@ -481,6 +481,15 @@ impl InputSource {
         }
     }
 
+    /// Drop a remote object's cached footer (#815); a later open re-reads it.
+    pub(crate) fn release_footer(&self) {
+        match self {
+            InputSource::Local(_) => {}
+            #[cfg(feature = "remote")]
+            InputSource::Remote(r) => r.release_footer(),
+        }
+    }
+
     /// Stage the selected row groups to the local disk spill up front (pass
     /// 0, #286/#287), coalescing each row group into one parallel range
     /// request so the later passes read entirely from disk. No-op for local
@@ -522,6 +531,12 @@ impl InputSource {
         let _ = (selected, roots);
         match self {
             InputSource::Local(_) => Ok(PartStaging::default()),
+            // A part the run reads nothing of stages nothing, and needs no
+            // footer (#815 releases it).
+            #[cfg(feature = "remote")]
+            InputSource::Remote(_) if selected.is_some_and(<[usize]>::is_empty) => {
+                Ok(PartStaging::default())
+            }
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => {
                 let remote = r.plan_staging(selected, roots)?;
@@ -1025,11 +1040,9 @@ pub(crate) mod remote {
         location: ObjectPath,
         pub(super) object_meta: tylertoo_io::RemoteObjectMeta,
         shared: Arc<SharedState>,
-        #[expect(
-            clippy::disallowed_types,
-            reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
-        )]
-        metadata: OnceLock<ReaderMetadata>,
+        /// The parsed footer, shared by every clone; [`Self::release_footer`]
+        /// drops it for a part a run never reads (#815).
+        metadata: Arc<Mutex<Option<ReaderMetadata>>>,
         cache: Arc<Mutex<ChunkCache>>,
         /// On-disk overflow for fetched column chunks (issue #219), shared by
         /// every reader clone across the pipeline's passes so a chunk fetched
@@ -1448,11 +1461,7 @@ pub(crate) mod remote {
                 location: meta.location.clone(),
                 object_meta: meta.into(),
                 shared: Arc::new(SharedState::default()),
-                #[expect(
-                    clippy::disallowed_types,
-                    reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
-                )]
-                metadata: OnceLock::new(),
+                metadata: Arc::default(),
                 cache: Arc::new(Mutex::new(ChunkCache::new(cap_base))),
                 spill: Arc::new(Mutex::new(DiskSpill::default())),
                 cap_base,
@@ -1546,14 +1555,14 @@ pub(crate) mod remote {
         /// not depend on a builder open; the header phase has usually loaded
         /// it already, in which case this is a cheap clone with no fetch.
         fn load_footer(&self) -> Result<ReaderMetadata, InputError> {
-            if let Some(md) = self.metadata.get() {
+            if let Some(md) = self.cached_footer() {
                 // A tail prefetched while another open loaded the footer.
                 self.shared
                     .footer_tail
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
-                return Ok(md.clone());
+                return Ok(md);
             }
             let reader = InputReader::Remote(self.reader());
             // The owner (#779) runs the footer pre-check, the #430 chunk-range
@@ -1572,8 +1581,27 @@ pub(crate) mod remote {
             })?;
             // A concurrent open may have won the race; either copy is
             // equivalent.
-            let _ = self.metadata.set(md.clone());
-            Ok(md)
+            Ok(self
+                .metadata
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert(md)
+                .clone())
+        }
+
+        fn cached_footer(&self) -> Option<ReaderMetadata> {
+            self.metadata
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        /// Drop the cached footer; the next open parses it again (#815).
+        pub(crate) fn release_footer(&self) {
+            self.metadata
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
         }
 
         /// Fetch the trailer, then the footer, exactly as the parse would
@@ -1584,7 +1612,7 @@ pub(crate) mod remote {
         /// permits stay with the tail until the parse drops it.
         async fn prefetch_footer(&self, retain: &Arc<tokio::sync::Semaphore>, cap: u32) {
             const TRAILER: u64 = 8;
-            if self.metadata.get().is_some() {
+            if self.cached_footer().is_some() {
                 return;
             }
             let get = |range| {
