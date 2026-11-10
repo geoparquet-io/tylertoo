@@ -87,9 +87,11 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   URLs work; the query is shown as `?<redacted>` in logs, errors, reports
   and saved plans (#820).
 - Inputs with many list columns (Overture segments: 86 list leaves) are no
-  longer handed out one row per batch. They still decode a row at a time,
-  since a footer cannot say which rows hold the list values, but the reader
-  joins those rows back into batches within the decode byte bound. Each
+  longer handed out one row per batch. A decode no longer crosses a row
+  group, so it is charged with one group's list values rather than two:
+  Overture's 22k-row groups decode whole instead of a row at a time. A group
+  whose list values alone pass the bound still decodes a row at a time, and
+  the reader joins those rows back into batches within the byte bound. Each
   one-row batch kept about 260 KB of Arrow overhead per buffered output row,
   so `tiles` on a 38 MB extract passed 118 GB and was OOM-killed. It now
   peaks at 1.5 GB in 23 s (#848).

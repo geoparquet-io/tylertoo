@@ -499,8 +499,17 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
     reason = "#789: a per-reader flag, not process-global diagnostic state"
 )]
 struct PageGuard<R> {
-    reader: R,
+    reader: Arc<R>,
     hit: Arc<AtomicBool>,
+}
+
+impl<R> Clone for PageGuard<R> {
+    fn clone(&self) -> Self {
+        Self {
+            reader: self.reader.clone(),
+            hit: self.hit.clone(),
+        }
+    }
 }
 
 /// [`PageGuard::get_read`]'s stream.
@@ -1274,11 +1283,11 @@ pub fn read_batch_plan(
 /// `(decode, yield)` rows per batch, both at most `requested` and within the
 /// byte-array ceiling.
 ///
-/// `decode` bounds what one decode holds before the reader splits it: a batch
-/// of `requested` rows touches at most ceil(requested / smallest group) + 1
-/// groups, so it holds at most the largest that many groups' repeated values,
-/// however they are spread over its rows. A file whose repeated values alone
-/// exceed the decode limit decodes one row at a time.
+/// `decode` bounds what one decode holds before the reader splits it. A
+/// decode never crosses a row-group seam ([`GroupReaders`]), so it holds at
+/// most the largest group's repeated values, however they are spread over
+/// its rows. A file with a group whose repeated values alone exceed the
+/// decode limit decodes one row at a time.
 ///
 /// `yield` is what the reader hands out (#848): it joins decoded batches up to
 /// that many rows, priced at every leaf's width plus its group's repeated
@@ -1365,16 +1374,7 @@ fn batch_plan(
         })
         .collect();
     let fixed = groups.iter().map(|g| g.0).max().unwrap_or(1).max(1);
-    let min_rows = groups.iter().map(|g| g.2.max(1) as u64).min().unwrap_or(1);
-    let spanned = (requested.max(1) as u64)
-        .div_ceil(min_rows)
-        .saturating_add(1);
-    let mut repeated: Vec<u64> = groups.iter().map(|g| g.1).collect();
-    repeated.sort_unstable_by(|a, b| b.cmp(a));
-    let repeated = repeated
-        .iter()
-        .take(usize::try_from(spanned).unwrap_or(usize::MAX))
-        .fold(0u64, |n, v| n.saturating_add(*v));
+    let repeated = groups.iter().map(|g| g.1).max().unwrap_or(0);
     let per_row = groups
         .iter()
         .map(|g| g.0.saturating_add(g.1.div_ceil(g.2.max(1) as u64)))
@@ -1673,27 +1673,34 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
         )]
         let page_eof = Arc::new(AtomicBool::new(false));
         let guard = PageGuard {
-            reader: self.reader,
+            reader: Arc::new(self.reader),
             hit: page_eof.clone(),
         };
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "#779: reader owner reuses checked metadata and applies batch limits"
-        )]
-        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(guard, metadata)
-            .with_batch_size(rows);
-        if let Some(projection) = self.projection {
-            builder = builder.with_projection(projection);
-        }
-        if let Some(row_groups) = self.row_groups {
-            builder = builder.with_row_groups(row_groups);
-        }
-        if let Some(limit) = self.limit {
-            builder = builder.with_limit(limit);
-        }
-        let inner = guard_parquet("parquet reader", || builder.build())?;
+        let projection = self.projection;
+        let open: OpenGroups = Box::new(move |groups, limit| {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "#779: reader owner reuses checked metadata and applies batch limits"
+            )]
+            let mut builder =
+                ParquetRecordBatchReaderBuilder::new_with_metadata(guard.clone(), metadata.clone())
+                    .with_batch_size(rows)
+                    .with_row_groups(groups);
+            if let Some(projection) = &projection {
+                builder = builder.with_projection(projection.clone());
+            }
+            if let Some(limit) = limit {
+                builder = builder.with_limit(limit);
+            }
+            guard_parquet("parquet reader", || builder.build())
+        });
+        let groups = self
+            .row_groups
+            .unwrap_or_else(|| (0..self.metadata.metadata().num_row_groups()).collect());
+        let inner = GroupReaders::open(open, groups, self.limit)?;
         let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
             inner
+                .current
                 .schema()
                 .fields()
                 .iter()
@@ -1717,6 +1724,71 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
     }
 }
 
+/// Opens a Parquet reader over some row groups, reading at most some rows.
+type OpenGroups = Box<
+    dyn FnMut(Vec<usize>, Option<usize>) -> Result<ParquetRecordBatchReader, ParquetError> + Send,
+>;
+
+/// The decoded row stream of some row groups, read one group at a time
+/// (#848): no decode crosses a group seam, so one holds at most one group's
+/// repeated values ([`batch_plan`]). [`join_decoded`] joins across seams.
+struct GroupReaders {
+    open: OpenGroups,
+    groups: std::vec::IntoIter<usize>,
+    current: ParquetRecordBatchReader,
+    /// Rows the reader's limit still allows.
+    left: Option<usize>,
+}
+
+impl std::fmt::Debug for GroupReaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupReaders")
+            .field("groups", &self.groups)
+            .field("left", &self.left)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GroupReaders {
+    /// Open the first group now, so a bad selection or projection fails here.
+    fn open(
+        mut open: OpenGroups,
+        groups: Vec<usize>,
+        left: Option<usize>,
+    ) -> Result<Self, ParquetError> {
+        let mut groups = groups.into_iter();
+        let current = open(groups.next().into_iter().collect(), left)?;
+        Ok(Self {
+            open,
+            groups,
+            current,
+            left,
+        })
+    }
+}
+
+impl Iterator for GroupReaders {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.left == Some(0) {
+                return None;
+            }
+            if let Some(batch) = self.current.next() {
+                if let (Ok(batch), Some(left)) = (&batch, &mut self.left) {
+                    *left = left.saturating_sub(batch.num_rows());
+                }
+                return Some(batch);
+            }
+            match (self.open)(vec![self.groups.next()?], self.left) {
+                Ok(reader) => self.current = reader,
+                Err(e) => return Some(Err(e.into())),
+            }
+        }
+    }
+}
+
 /// A Parquet record batch reader whose every batch is decoded inside the
 /// panic boundary (#687).
 ///
@@ -1728,7 +1800,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
     reason = "#789: a per-reader flag, not process-global diagnostic state"
 )]
 pub struct UntrustedBatchReader {
-    inner: ParquetRecordBatchReader,
+    inner: GroupReaders,
     /// Raised when a page read ran past the end of the file ([`PageGuard`]).
     page_eof: Arc<AtomicBool>,
     done: bool,
@@ -1837,7 +1909,7 @@ impl Iterator for UntrustedBatchReader {
     reason = "#848: joins decoded batches up to concat_prefix_rows' cut"
 )]
 fn join_decoded(
-    inner: &mut ParquetRecordBatchReader,
+    inner: &mut impl Iterator<Item = Result<RecordBatch, ArrowError>>,
     carry: &mut Option<RecordBatch>,
     rows: usize,
     limit: u64,
@@ -2271,10 +2343,9 @@ mod tests {
     }
 
     /// #848 review (#857): row groups of 100 rows with disjoint
-    /// `Dictionary(Int8, Utf8)` values, and lists heavy enough to decode one
-    /// row at a time. Joined, a batch would span groups and overflow the
-    /// Int8 key on the cast back; a narrow-key schema plans and yields its
-    /// decode size.
+    /// `Dictionary(Int8, Utf8)` values, and heavy lists. Joined past 128
+    /// rows, a batch would span groups and overflow the Int8 key on the cast
+    /// back; a narrow-key schema plans and yields at most 128 rows.
     #[test]
     fn narrow_dictionaries_join_no_more_rows_than_their_key() {
         use arrow_array::builder::{Int64Builder, ListBuilder};
@@ -2317,7 +2388,7 @@ mod tests {
         let (decode, join) = batch_plan(&source.metadata, None, None, DEFAULT_BATCH_ROWS, limit);
         // The lists still join, to the 128 rows an Int8 key indexes; callers
         // regroup to the plan's yield too (core's `Regrouper`).
-        assert!(decode < 100 && join == 128, "({decode}, {join})");
+        assert!(decode <= 128 && join == 128, "({decode}, {join})");
         // Unread, the dictionary does not hold the lists back.
         let lists = ProjectionMask::leaves(source.metadata().file_metadata().schema_descr(), [1]);
         let (_, join) = batch_plan(
@@ -2504,6 +2575,71 @@ mod tests {
         let list = DataType::List(item);
         assert_eq!(dictionary_capacity(&list), None);
         assert!(listed_dictionary(&list));
+    }
+
+    /// Two 100-row groups of 120 Int64 list values per row: 108 KB of list
+    /// values each, 216 KB together, against a 200 KB decode limit. A decode
+    /// never crosses a group seam, so the plan charges one group, and each
+    /// group decodes whole while the reader still yields the same rows.
+    fn two_list_groups() -> std::fs::File {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        use arrow_array::ArrayRef;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        let mut lists = ListBuilder::new(Int64Builder::new());
+        for i in 0..200 {
+            lists.values().append_slice(&[i; 120]);
+            lists.append(true);
+        }
+        let batch =
+            RecordBatch::try_from_iter([("lists", Arc::new(lists.finish()) as ArrayRef)]).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        file
+    }
+
+    #[test]
+    fn the_decode_plan_charges_one_row_group() {
+        let source = open_parquet(two_list_groups()).unwrap();
+        let (decode, _) = batch_plan(&source.metadata, None, None, 1_000, 100_000);
+        assert!(decode >= 100, "{decode}");
+    }
+
+    #[test]
+    fn decodes_stop_at_row_group_seams() {
+        use arrow_array::cast::AsArray;
+        let file = two_list_groups();
+        let reader = open_parquet(file.try_clone().unwrap())
+            .unwrap()
+            .with_batch_rows(150)
+            .build()
+            .unwrap();
+        let pieces: Vec<usize> = reader.inner.map(|b| b.unwrap().num_rows()).collect();
+        assert_eq!(pieces, [100, 100]);
+        let reader = open_parquet(file)
+            .unwrap()
+            .with_batch_rows(150)
+            .build()
+            .unwrap();
+        let (mut sizes, mut firsts) = (Vec::new(), Vec::new());
+        for batch in reader {
+            let batch = batch.unwrap();
+            sizes.push(batch.num_rows());
+            let lists = batch.column(0).as_list::<i32>();
+            firsts.extend((0..batch.num_rows()).map(|r| {
+                lists
+                    .value(r)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .value(0)
+            }));
+        }
+        assert_eq!(sizes, [150, 50]);
+        assert_eq!(firsts, (0..200).collect::<Vec<i64>>());
     }
 
     #[test]
