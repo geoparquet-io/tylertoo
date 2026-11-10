@@ -29,6 +29,10 @@ dhat-heap = ["dhat"]
 # decode inside `decode`, `pyramid::BandArchive`). Never enabled by default,
 # never part of the public API baseline; only `fuzz/Cargo.toml` turns it on.
 fuzzing = []
+# MapLibre Tile output (#823): `--tile-format mlt`. Off by default because
+# mlt-core needs Rust 1.98, above this crate's rust-version; the CLI and the
+# Python wheel turn it on.
+mlt = ["dep:mlt-core"]
 # Remote input support: read GeoParquet directly from s3://, https://,
 # and gs:// URLs via range requests (issue #210). Off by default to keep
 # the pure-local library build dependency-light; the CLI enables it.
@@ -63,6 +67,7 @@ arrow-buffer = { workspace = true }
 geo = { workspace = true }
 wkb = { workspace = true }
 prost = { workspace = true }
+mlt-core = { workspace = true, optional = true }
 rayon = { workspace = true }
 crossbeam-channel = { workspace = true }
 thiserror = { workspace = true }
