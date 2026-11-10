@@ -280,23 +280,18 @@ fn lonlat_cell(ring: &[(f64, f64)]) -> MultiPolygon<f64> {
     split_antimeridian(&poly)
 }
 
-/// Points from `a` to just before `b` along the great circle, one at least
-/// every degree.
+/// Points from `a` to just before `b` along the great circle, at most a
+/// degree apart.
 fn great_circle(a: (f64, f64), b: (f64, f64)) -> Vec<(f64, f64)> {
-    let to_xyz = |(lon, lat): (f64, f64)| {
-        let (lon, lat) = (lon.to_radians(), lat.to_radians());
-        [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
-    };
-    let (p, q) = (to_xyz(a), to_xyz(b));
-    let dot = (p[0] * q[0] + p[1] * q[1] + p[2] * q[2]).clamp(-1.0, 1.0);
-    let steps = dot.acos().to_degrees().ceil().max(1.0) as usize;
-    let mut out = vec![a];
-    for s in 1..steps {
-        let t = s as f64 / steps as f64;
-        let v: Vec<f64> = (0..3).map(|i| p[i] * (1.0 - t) + q[i] * t).collect();
-        let lat = v[2].atan2(v[0].hypot(v[1])).to_degrees();
-        out.push((v[1].atan2(v[0]).to_degrees(), lat));
-    }
+    use geo::{Haversine, InterpolatePoint};
+    let degree = Haversine.radius().to_radians();
+    let (a, b) = (geo::Point::new(a.0, a.1), geo::Point::new(b.0, b.1));
+    let mut out = vec![a.x_y()];
+    out.extend(
+        Haversine
+            .points_along_line(a, b, degree, false)
+            .map(|p| p.x_y()),
+    );
     out
 }
 
@@ -491,11 +486,12 @@ pub(crate) fn write_cell_tables(
     (min_zoom, max_zoom): (u8, u8),
     rollup: CellRollup<'_>,
     tables: &[&Path],
+    read: &ConvertOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ConvertError> {
     debug_assert_eq!(tables.len(), usize::from(max_zoom - min_zoom) + 1);
     let (mut cells, labels, budget, cat_pairs) =
-        aggregate(input, system, max_zoom, rollup, diagnostics)?;
+        aggregate(input, system, max_zoom, rollup, read, diagnostics)?;
     let specs = rollup.accumulate.len();
     let mut res = system.resolution(max_zoom);
     for z in (min_zoom..=max_zoom).rev() {
@@ -530,6 +526,7 @@ fn aggregate(
     system: CellSystem,
     max_zoom: u8,
     rollup: CellRollup<'_>,
+    read: &ConvertOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(Cells, Vec<String>, MemoryBudget, u64), ConvertError> {
     let source = ConvertSource::resolve_path(input)?;
@@ -565,15 +562,14 @@ fn aggregate(
 
     let res = system.resolution(max_zoom);
     let specs = rollup.accumulate.len();
-    let defaults = ConvertOptions::default();
     let budget = MemoryBudget::probe();
     let tuning = ReadTuning {
         budget,
         batch_size: READ_ROWS,
-        workers: super::convert::resolve_pass_read_workers(ReadPass::Scan, defaults.read_workers),
+        workers: super::convert::resolve_pass_read_workers(ReadPass::Scan, read.read_workers),
         avg_geom_bytes: None,
         footer: None,
-        profile: defaults.profile,
+        profile: read.profile,
     };
     let mut cells = Cells::new();
     let mut interner = GroupInterner::default();
@@ -1023,6 +1019,7 @@ mod tests {
             (12, 12),
             rollup,
             &[&table],
+            &ConvertOptions::default(),
             &diagnostics,
         )
         .unwrap();
@@ -1100,6 +1097,7 @@ mod tests {
                     (3, 3),
                     rollup,
                     &[&table],
+                    &ConvertOptions::default(),
                     &diagnostics,
                 )
             })

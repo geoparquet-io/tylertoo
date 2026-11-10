@@ -2048,15 +2048,23 @@ impl PyramidOptions {
         // beside its own cell id, count and geometry columns.
         let reserved = crate::overview::cells::RESERVED_COLUMNS;
         let mut seen = std::collections::HashSet::new();
+        let category_prefix = self.cluster_categories.as_ref().map(|c| format!("{c}:"));
         for spec in &self.accumulate {
-            if !seen.insert(spec.column.as_str()) || reserved.contains(&spec.column.as_str()) {
+            let counted = category_prefix
+                .as_ref()
+                .is_some_and(|p| spec.column.starts_with(p.as_str()));
+            if !seen.insert(spec.column.as_str())
+                || reserved.contains(&spec.column.as_str())
+                || counted
+            {
                 return Err(crate::overview::config::ConfigError::invalid_spec(
                     "--accumulate-attribute",
                     format!(
                         "column {:?} would name two columns of a cell band: aggregate \
-                         each column once, and none named {}",
+                         each column once, and none named {} or {}LABEL",
                         spec.column,
-                        reserved.join(", ")
+                        reserved.join(", "),
+                        category_prefix.as_deref().unwrap_or("CATEGORY:")
                     ),
                 )
                 .into());
@@ -2289,16 +2297,26 @@ fn build_pyramid_validated(
                     accumulate: &opts.accumulate,
                     categories: opts.cluster_categories.as_deref(),
                 };
+                // The caller's resource settings; the cell tables need no others.
+                let c = &opts.convert;
+                let resources = ConvertOptions {
+                    profile: c.profile,
+                    in_flight_batches: c.in_flight_batches,
+                    read_workers: c.read_workers,
+                    spill_dir: c.spill_dir.clone(),
+                    ..ConvertOptions::default()
+                };
                 crate::overview::cells::write_cell_tables(
                     &band.input,
                     system,
                     (band.min_zoom, band.max_zoom),
                     rollup,
                     &paths,
+                    &resources,
                     diagnostics,
                 )
                 .map_err(|error| PyramidError::band_convert(band.layer.clone(), error))?;
-                let verbatim = ConvertOptions::default().verbatim();
+                let verbatim = resources.verbatim();
                 let mut zooms = Vec::with_capacity(tables.len());
                 for (z, table) in (band.min_zoom..=band.max_zoom).zip(&tables) {
                     zooms.push((z, tile(table, (z, z), &verbatim)?));
@@ -3894,6 +3912,15 @@ mod tests {
             ..Default::default()
         };
         assert!(reserved.validate().is_err());
+        let counted = PyramidOptions {
+            accumulate: vec![crate::overview::cluster::AccumulateSpec::new(
+                "kind:forest",
+                crate::overview::cluster::AccumulateOp::Sum,
+            )],
+            cluster_categories: Some("kind".to_string()),
+            ..Default::default()
+        };
+        assert!(counted.validate().is_err());
 
         let mut filtered = PyramidOptions {
             work_dir: Some(dir.path().to_path_buf()),
