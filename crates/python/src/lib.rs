@@ -28,11 +28,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-#[expect(
-    clippy::disallowed_types,
-    reason = "#445: process-wide Python logging bridge reset handle"
-)]
-use std::sync::OnceLock;
 use tylertoo_core::internal::archive_index::ArchiveIndex;
 use tylertoo_core::internal::decode::{decode_pmtiles, DecodeError, DecodeOptions};
 use tylertoo_core::internal::error::{Classify, ErrorKind};
@@ -62,12 +57,10 @@ pyo3::create_exception!(
 
 /// The log bridge's cache handle (#445), set by the first binding call:
 /// `None` when another logger already owned the process (the CLI's, after
-/// [`_run_cli`]).
-#[expect(
-    clippy::disallowed_types,
-    reason = "#445: process-wide Python logging bridge reset handle"
-)]
-static LOG_RESET: OnceLock<Option<pyo3_log::ResetHandle>> = OnceLock::new();
+/// [`_run_cli`]). A `PyOnceLock`: a second thread waits for the first's
+/// install detached, where a `OnceLock` would hold the GIL and deadlock.
+static LOG_RESET: pyo3::sync::PyOnceLock<Option<pyo3_log::ResetHandle>> =
+    pyo3::sync::PyOnceLock::new();
 
 /// Drop pyo3-log's cached Python loggers and levels, so a `logging`
 /// configuration change made since the last call (`basicConfig`,
@@ -79,7 +72,7 @@ static LOG_RESET: OnceLock<Option<pyo3_log::ResetHandle>> = OnceLock::new();
 /// installs the bridge: not at import, so that `python -m tylertoo` can
 /// give the CLI its own stderr logger (#819).
 fn refresh_log_levels(py: Python<'_>) {
-    let handle = LOG_RESET.get_or_init(|| {
+    let handle = LOG_RESET.get_or_init(py, || {
         pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels)
             .ok()?
             .install()
