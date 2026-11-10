@@ -73,6 +73,10 @@ pub tylertoo_core::ArchiveError::Read::path: std::path::PathBuf
 pub tylertoo_core::ArchiveError::RunTooLong::limit: u64
 pub tylertoo_core::ArchiveError::RunTooLong::run: u64
 pub tylertoo_core::ArchiveError::RunTooLong::tile_id: u64
+#[non_exhaustive] pub tylertoo_core::ArchiveError::Tile
+pub tylertoo_core::ArchiveError::Tile::error: alloc::string::String
+pub tylertoo_core::ArchiveError::Tile::length: u64
+pub tylertoo_core::ArchiveError::Tile::offset: u64
 #[non_exhaustive] pub tylertoo_core::ArchiveError::TileDataPastEnd
 pub tylertoo_core::ArchiveError::TileDataPastEnd::path: core::option::Option<std::path::PathBuf>
 #[non_exhaustive] pub tylertoo_core::ArchiveError::TileIdOutOfRange
