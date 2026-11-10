@@ -419,6 +419,13 @@ pub struct ExportOptions {
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().simple_clip_fastpath, action = clap::ArgAction::SetFalse, long = "no-simple-clip-fastpath"))]
     #[cfg_attr(feature = "cli", arg(help = "Clip all polygons with the full overlay for byte-stable tiles. The simple-ring fast path renders identically but can change a ring's starting vertex", long_help = None))]
     pub simple_clip_fastpath: bool,
+    /// TODO(docs)
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "FACTOR", help_heading = "Generalization")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "TODO(docs)", long_help = None))]
+    pub max_zoom_simplify_factor: Option<f64>,
     /// Number of partitions processed per band read (the export concurrency
     /// knob). Default [`PARTITION_WAVE_AUTO`], which [`resolve_partition_wave`]
     /// expands at export start via the memory-budget preflight (#303): the
@@ -606,6 +613,7 @@ with_setters!(ExportOptions {
     with_size_valve => size_valve: SizeValve,
     with_coverage_fill => coverage_fill: bool,
     with_simple_clip_fastpath => simple_clip_fastpath: bool,
+    with_max_zoom_simplify_factor => max_zoom_simplify_factor: Option<f64>,
     with_partition_wave => partition_wave: usize,
     with_feature_order => feature_order: FeatureOrder,
     with_min_zoom => min_zoom: Option<u8>,
@@ -631,6 +639,7 @@ impl Default for ExportOptions {
             coverage_fill: false,
             variable_depth: false,
             simple_clip_fastpath: true,
+            max_zoom_simplify_factor: None,
             partition_wave: PARTITION_WAVE_AUTO,
             feature_order: FeatureOrder::default(),
             min_zoom: None,
@@ -697,6 +706,16 @@ impl ExportOptions {
                 });
             }
         }
+        if let Some(factor) = self
+            .max_zoom_simplify_factor
+            .filter(|f| !(f.is_finite() && *f >= 0.0))
+        {
+            let option = "--max-zoom-simplify-factor / max_zoom_simplify_factor";
+            return Err(ConfigError::InvalidSpec {
+                option,
+                message: format!("{option} must be a finite number >= 0, got {factor}"),
+            });
+        }
         if self.extent == 0 {
             return Err(ConfigError::InvalidExtent {
                 extent: self.extent,
@@ -747,6 +766,8 @@ pub struct ZoomReport {
     pub tile_feature_count: usize,
     /// Number of tiles at this zoom that hit the oversized safety valve.
     pub oversized_tiles: usize,
+    /// TODO(docs)
+    pub over_limit_tiles: usize,
     /// Tile members at this zoom that had nothing to encode (#431): empty
     /// geometries and empty `GeometryCollection`s. Counted per (feature,
     /// tile) pair, like `tile_feature_count`. Non-zero means content was lost
@@ -815,6 +836,8 @@ pub struct ExportReport {
     pub total_tile_features: usize,
     /// Total tiles that hit the oversized safety valve.
     pub oversized_tiles: usize,
+    /// TODO(docs)
+    pub over_limit_tiles: usize,
     /// Property columns of the overview file that the export could not
     /// encode and therefore dropped (#434): binary columns and any other
     /// Arrow type with neither an MVT scalar nor a JSON rendering. Each is
@@ -2840,6 +2863,9 @@ impl ExportReport {
         sink.record(Diagnostic::ValveDropped {
             count: self.valve_dropped_features,
         });
+        sink.record(Diagnostic::TilesOverLimit {
+            count: self.over_limit_tiles,
+        });
         for column in &self.skipped_property_columns {
             sink.once(Diagnostic::PropertySkipped {
                 count: 1,
@@ -2853,6 +2879,7 @@ impl ExportReport {
         self.encode_quantized_features = sink.count(&Diagnostic::EncodeQuantized { count: 0 });
         self.merged_features = sink.count(&Diagnostic::Merged { count: 0 });
         self.valve_dropped_features = sink.count(&Diagnostic::ValveDropped { count: 0 });
+        self.over_limit_tiles = sink.count(&Diagnostic::TilesOverLimit { count: 0 });
         Ok(self)
     }
 
@@ -2875,6 +2902,7 @@ impl ExportReport {
             total_tiles: zooms.iter().map(|z| z.tile_count).sum(),
             total_tile_features: zooms.iter().map(|z| z.tile_feature_count).sum(),
             oversized_tiles: zooms.iter().map(|z| z.oversized_tiles).sum(),
+            over_limit_tiles: zooms.iter().map(|z| z.over_limit_tiles).sum(),
             skipped_property_columns,
             encode_dropped_features: zooms.iter().map(|z| z.encode_dropped_features).sum(),
             encode_quantized_features: zooms.iter().map(|z| z.encode_quantized_features).sum(),
@@ -4160,6 +4188,7 @@ fn write_tile(
     tally.encode_quantized += t.encode_quantized;
     tally.valve.merged += t.valve.merged;
     tally.valve.dropped += t.valve.dropped;
+    tally.valve.over_limit += t.valve.over_limit;
     tally.valve.passes = tally.valve.passes.max(t.valve.passes);
     tally.valve_passes += u64::from(t.valve.passes);
     tally.fill.polygons += t.fill.polygons;
@@ -4254,6 +4283,7 @@ fn finish_level(
         tile_count,
         tile_feature_count: tally.tile_feature_count,
         oversized_tiles: tally.oversized,
+        over_limit_tiles: tally.valve.over_limit,
         encode_dropped_features: tally.encode_dropped,
         encode_quantized_features: tally.encode_quantized,
         merged_features: tally.valve.merged,
@@ -5504,7 +5534,9 @@ fn fanout_batch_members(
                 .par_iter()
                 .map(|g| {
                     ExportTimers::time(&timers.clip, || {
-                        feature_tile_members(g, plans[k].zoom, opts, 0, u64::MAX, diagnostics)
+                        let finest = k + 1 == plans.len();
+                        let g = finest_zoom_geometry(g, finest, plans[k].zoom, opts, diagnostics);
+                        feature_tile_members(&g, plans[k].zoom, opts, 0, u64::MAX, diagnostics)
                     })
                 })
                 .collect()
@@ -6967,6 +6999,44 @@ fn decode_geometry_chunk(
         .collect())
 }
 
+/// A feature of the finest level, simplified for its zoom by
+/// [`ExportOptions::max_zoom_simplify_factor`] (#814): `factor × gsd(zoom)`,
+/// the tolerance `--simplify-factor` gives every coarser level. Borrowed
+/// unchanged at every other level, and with the option off.
+///
+/// DIVERGENCE FROM TIPPECANOE: tippecanoe's `-S` simplifies each tile's
+/// clipped geometry, at every zoom, in tile units (`tile.cpp`,
+/// `simplify_lines`). Coarser levels here are already simplified by convert,
+/// so this touches only the finest one, and simplifies each feature once,
+/// before clipping, so neighbouring tiles agree at their seam. A feature
+/// under the tolerance keeps its own geometry rather than being dropped.
+fn finest_zoom_geometry<'g>(
+    geom: &'g Geometry<f64>,
+    finest: bool,
+    zoom: u8,
+    opts: &ExportOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> std::borrow::Cow<'g, Geometry<f64>> {
+    use super::simplify::{simplify_for_level, CollapseMode, Simplified, SimplifyOptions};
+    let Some(factor) = opts.max_zoom_simplify_factor.filter(|_| finest) else {
+        return std::borrow::Cow::Borrowed(geom);
+    };
+    let simplify = SimplifyOptions::default()
+        .with_factor(factor)
+        .with_collapse(CollapseMode::Drop);
+    // Export geometry is lon/lat whatever the file's CRS (`decode_geometry_chunk`).
+    match simplify_for_level(
+        geom,
+        super::level::gsd(zoom),
+        Crs::Epsg4326,
+        &simplify,
+        diagnostics,
+    ) {
+        Simplified::Keep(g) => std::borrow::Cow::Owned(g),
+        Simplified::Dropped => std::borrow::Cow::Borrowed(geom),
+    }
+}
+
 /// One feature's clipped pieces, one per tile key.
 type TileMembers = Vec<(u64, Geometry<f64>)>;
 
@@ -7027,8 +7097,10 @@ fn clip_group(
                 .par_iter()
                 .map(|g| {
                     ExportTimers::time(&timers.clip, || {
+                        let finest = ctx.level_idx + 1 == ctx.reader.num_levels();
+                        let g = finest_zoom_geometry(g, finest, ctx.zoom, ctx.opts, diagnostics);
                         let mut members = feature_tile_members(
-                            g,
+                            &g,
                             ctx.zoom,
                             ctx.opts,
                             key_lo,
@@ -8500,6 +8572,8 @@ struct ValveTally {
     passes: u32,
     /// The merge threshold the tile ended on.
     mingap: u64,
+    /// Tiles the valve left over the limit: 0 or 1 per tile, summed (#814).
+    over_limit: usize,
 }
 
 /// One #750 coverage-fill feature of a tile: the fill polygons that joined
@@ -8895,6 +8969,7 @@ fn drop_to_fit(
         let fitted = TileMvt {
             valve: ValveTally {
                 passes: 1,
+                over_limit: usize::from(fit < 1.0),
                 ..ValveTally::default()
             },
             ..full
@@ -8915,7 +8990,7 @@ fn drop_to_fit(
         let mut shed = build_mvt(gzip_cache, &kept, tb, opts, &[], diagnostics);
         fit = tile_fit(&mut shed, opts).unwrap_or(f64::INFINITY);
         if fit >= 1.0 || keep <= 1 || passes >= MAX_DROP_PASSES {
-            log::warn!(
+            log::debug!(
                 "oversized tile ({} bytes): dropped {} of {} features ({passes} encodes){}",
                 full_bytes,
                 members.len() - keep,
@@ -8931,6 +9006,7 @@ fn drop_to_fit(
                 valve: ValveTally {
                     dropped: members.len() - keep,
                     passes,
+                    over_limit: usize::from(fit < 1.0),
                     ..ValveTally::default()
                 },
                 ..shed
@@ -9077,6 +9153,7 @@ fn merge_to_fit(
             dropped: 0,
             passes,
             mingap,
+            over_limit: usize::from(fit < 1.0),
         };
         if fit >= 1.0 || feats.len() <= 1 {
             let fitted = TileMvt {
@@ -9138,7 +9215,7 @@ fn merge_to_fit(
             }
             dropped = single.len() - (kept.len() - whole.len());
         }
-        log::warn!(
+        log::debug!(
             "oversized tile: merged {absorbed} of {} features and dropped {dropped} unmerged \
              ones{}",
             members.len(),
@@ -9153,6 +9230,7 @@ fn merge_to_fit(
             valve: ValveTally {
                 dropped,
                 passes,
+                over_limit: usize::from(fit < 1.0),
                 ..tally
             },
             ..out
@@ -10960,7 +11038,9 @@ mod tests {
             // and metadata all hash the same as before. See the REPIN note
             // above this test for the full before/after evidence.
             // #443: default features no longer carry tile-local ids.
-            "caf04e1922c86b7b",
+            // #814: tiles are gzipped at level 9; the raw MVT bytes are
+            // unchanged (the decoded-tile checks below still pass).
+            "aa9c455e2f2de08d",
             "archive bytes diverged from the pre-refactor reference"
         );
 
@@ -16882,6 +16962,114 @@ mod tests {
             limited_count < full_count,
             "valve must drop features ({limited_count} !< {full_count})"
         );
+    }
+
+    /// #814: tiles the valve leaves over the limit, a lone feature included,
+    /// are counted on the report and summed in one diagnostic.
+    #[test]
+    fn tiles_left_over_the_limit_are_counted_in_the_report() {
+        let coords: Vec<_> = (0..200)
+            .map(|k| (-100.0 + k as f64 * 0.001, 40.0 + (k as f64 * 0.01).sin()))
+            .collect();
+        let line = Geometry::LineString(LineString::from(coords));
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let ids: Vec<i64> = (0..20).collect();
+        write_fixture(
+            tin.path(),
+            &[(vec![0], vec![line.clone()]), (ids, vec![line; 20])],
+        );
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            tile_size_limit: Some(64),
+            ..Default::default()
+        };
+        let report = export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
+        assert_eq!(
+            report.over_limit_tiles, report.total_tiles,
+            "no tile with a feature fits in 64 bytes"
+        );
+        let summary: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, crate::diagnostics::Diagnostic::TilesOverLimit { .. }))
+            .collect();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].count(), report.over_limit_tiles);
+    }
+
+    /// #814: `max_zoom_simplify_factor` thins the finest zoom's tiles, keeps
+    /// every feature there, and leaves coarser zooms alone, in both pass-2
+    /// engines. A feature under the tolerance keeps its own geometry.
+    #[test]
+    fn max_zoom_simplify_factor_thins_only_the_finest_zoom() {
+        let wiggly = |x0: f64, r: f64| {
+            let ring: Vec<(f64, f64)> = (0..400)
+                .map(|k| {
+                    let a = f64::from(k) / 400.0 * std::f64::consts::TAU;
+                    let r = r * (1.0 + 0.002 * (f64::from(k) * 7.0).sin());
+                    (x0 + r * a.cos(), 0.5 + r * a.sin())
+                })
+                .collect();
+            Geometry::Polygon(geo::Polygon::new(LineString::from(ring), vec![]))
+        };
+        let (big, tiny) = (wiggly(0.0, 5.0), wiggly(20.0, 1e-4));
+        for mode in [Mode::Duplicating, Mode::Partitioning] {
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            write_mode_fixture(
+                tin.path(),
+                &[
+                    (vec![0], vec![big.clone()]),
+                    (vec![0, 1], vec![big.clone(), tiny.clone()]),
+                ],
+                mode,
+                2,
+            );
+            let run = |factor: Option<f64>| {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let opts = ExportOptions {
+                    max_zoom_simplify_factor: factor,
+                    ..Default::default()
+                };
+                let report = export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
+                (report, stored_tiles(&std::fs::read(tout.path()).unwrap()))
+            };
+            let (r0, t0) = run(None);
+            let (r1, t1) = run(Some(1.0));
+            let finest = r0.max_zoom;
+            for (z0, z1) in r0.zooms.iter().zip(&r1.zooms) {
+                assert_eq!(z0.tile_feature_count, z1.tile_feature_count, "{mode:?}");
+            }
+            assert_eq!(t0.keys().collect::<Vec<_>>(), t1.keys().collect::<Vec<_>>());
+            let mut thinned = 0;
+            for (id, b0) in &t0 {
+                let z = crate::pmtiles_writer::tile_id_to_zxy(*id).unwrap().0;
+                let (raw0, raw1) = (
+                    compression::decompress(b0, compression::Compression::Gzip).unwrap(),
+                    compression::decompress(&t1[id], compression::Compression::Gzip).unwrap(),
+                );
+                if z < finest {
+                    assert_eq!(raw0, raw1, "{mode:?}: z{z} must not change");
+                } else if raw1.len() < raw0.len() {
+                    thinned += 1;
+                }
+            }
+            assert!(thinned > 0, "{mode:?}: no finest-zoom tile was thinned");
+        }
+    }
+
+    #[test]
+    fn max_zoom_simplify_factor_must_be_finite_and_non_negative() {
+        let with = |f| ExportOptions {
+            max_zoom_simplify_factor: Some(f),
+            ..Default::default()
+        };
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                matches!(with(bad).validate(), Err(ConfigError::InvalidSpec { .. })),
+                "{bad}"
+            );
+        }
+        assert!(with(0.0).validate().is_ok());
     }
 
     /// #280, #761: the per-tile caps are on by default: tippecanoe's 500 KiB

@@ -247,6 +247,7 @@ ZoomReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
         "tile_count": "int",
         "tile_feature_count": "int",
         "oversized_tiles": "int",
+        "over_limit_tiles": "int",
         "encode_dropped_features": "int",
         "encode_quantized_features": "int",
         "merged_features": "int",
@@ -310,6 +311,7 @@ ExportReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
         "total_tiles": "int",
         "total_tile_features": "int",
         "oversized_tiles": "int",
+        "over_limit_tiles": "int",
         "merged_features": "int",
         "valve_dropped_features": "int",
         "encode_dropped_features": "int",
@@ -324,6 +326,7 @@ ExportReport.__doc__ = """Exported tile counts and encoding diagnostics.
 Attributes:
     oversized_tiles: Tiles that exceeded a size limit and triggered
         size reduction.
+    over_limit_tiles: TODO(docs)
     merged_features: Tile features merged into a neighbor to fit a
         size limit (`size_valve="merge"`).
     valve_dropped_features: Tile features dropped to fit a size

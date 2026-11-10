@@ -5207,8 +5207,8 @@ mod tests {
     fn test_large_archive_uses_leaf_directories() {
         // Create enough tiles to exceed 16KB root directory
         // gzip compresses directory entries very well (~2-5 bytes/entry compressed)
-        // Need 10,000+ entries to reliably exceed the 16KB threshold
-        let num_tiles = 10_000;
+        // Need 20,000 entries to exceed the 16KB threshold at gzip level 9 (#814)
+        let num_tiles = 20_000;
 
         let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         writer.set_layer_name("test");

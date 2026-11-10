@@ -105,6 +105,8 @@ pub enum Diagnostic {
     #[non_exhaustive]
     ValveDropped { count: usize },
     #[non_exhaustive]
+    TilesOverLimit { count: usize },
+    #[non_exhaustive]
     PropertySkipped {
         count: usize,
         name: String,
@@ -253,6 +255,7 @@ macro_rules! event_count {
             | Self::ValidationSkipped { count }
             | Self::Merged { count }
             | Self::ValveDropped { count }
+            | Self::TilesOverLimit { count }
             | Self::PropertySkipped { count, .. }
             | Self::CrsMetadata { count, .. }
             | Self::CoveringRejected { count, .. }
@@ -380,6 +383,7 @@ impl fmt::Display for Diagnostic {
             Self::ValidationSkipped {..} => write!(f, "{n} oversized RDP candidate(s) skipped exact validity checking and were assumed valid (#242)"),
             Self::Merged {..} => write!(f, "{n} tile feature(s) merged by the size valve"),
             Self::ValveDropped {..} => write!(f, "{n} tile feature(s) dropped by the size valve"),
+            Self::TilesOverLimit {..} => write!(f, "{n} tile(s) still over the size limit after the size valve, written as is"),
             Self::PropertySkipped {name,data_type,..} => write!(f, "property {name:?} ({data_type}) skipped: no MVT encoding"),
             Self::CrsMetadata {reason,..} => reason.fmt(f),
             Self::CoveringRejected {reason,..} => write!(f, "bbox covering fast path declined: {reason}; reading the geometry column"),

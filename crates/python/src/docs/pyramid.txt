@@ -37,6 +37,7 @@ Args:
         limit.
     size_valve: See `export_pmtiles()`.
     coverage_fill: See `export_pmtiles()`.
+    max_zoom_simplify_factor: See `export_pmtiles()`.
     simple_clip_fastpath: See `export_pmtiles()`.
     tile_buffer: See `export_pmtiles()`.
     extent: See `export_pmtiles()`.
