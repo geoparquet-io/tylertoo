@@ -25,10 +25,10 @@ use super::{
     account_sources, bound_group_cap, buffer_deg_at_zoom, build_mvt_within, collect_wave,
     encoded_tile, export_level_groups, for_each_member_key, geometry_lnglat_bbox, key_to_xy,
     near_world_edge, plan_level, plan_level_groups, plan_levels, size_bboxes, sort_tile_for_encode,
-    tile_fit, tile_key, tiles_in_ranges, BandRead, CheckpointCtx, Crs, EncodedTile, ExportError,
-    ExportLevelCtx, ExportOptions, ExportProgress, ExportTimers, FillTally, LevelCtx, LevelMemory,
-    LevelScan, Member, PartitionBudget, PublishedNames, ResolvedFeatureId, StreamingPmtilesWriter,
-    TileMvt, ZoomReport, DEFAULT_EXTENT,
+    tile_fit, tile_key, tiles_in_ranges, unbounded_group_cap, BandRead, CheckpointCtx, Crs,
+    EncodedTile, ExportError, ExportLevelCtx, ExportOptions, ExportProgress, ExportTimers,
+    FillTally, LevelCtx, LevelMemory, LevelScan, Member, PartitionBudget, PublishedNames,
+    ResolvedFeatureId, StreamingPmtilesWriter, TileMvt, ZoomReport, DEFAULT_EXTENT,
 };
 use crate::compression::TileGzipCache;
 use crate::tile::{max_tile_index, BboxTileRanges, TileBounds, TileCoord, MAX_LATITUDE};
@@ -1219,7 +1219,14 @@ pub(super) fn export_levels(
                 budget: &mut *budget,
             },
             levels,
-            &groups,
+            (
+                &groups,
+                bound_group_cap(
+                    group_cap,
+                    levels.iter().map(|l| l.plan),
+                    partition_budget.partition_target,
+                ),
+            ),
             ckpt,
             progress,
             diagnostics,
@@ -1280,10 +1287,9 @@ pub(super) fn export_levels(
                     ..template
                 })
                 .collect();
-            let now_groups = plan_level_groups(
-                &plans,
-                bound_group_cap(group_cap, &plans, partition_budget.partition_target),
-            );
+            let now_groups = plan_level_groups(&plans, unbounded_group_cap(group_cap));
+            let in_flight_cap =
+                bound_group_cap(group_cap, &plans, partition_budget.partition_target);
             reports.extend(export_level_groups(
                 writer,
                 LevelMemory {
@@ -1291,7 +1297,7 @@ pub(super) fn export_levels(
                     budget: &mut *budget,
                 },
                 &now_levels,
-                &now_groups,
+                (&now_groups, in_flight_cap),
                 ckpt,
                 progress,
                 diagnostics,
