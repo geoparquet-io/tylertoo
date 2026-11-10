@@ -887,6 +887,29 @@ mod tests {
         );
     }
 
+    /// roborev 416: the same grid with every ring starting on a vertical
+    /// edge. Zero-width boxes still share their x, so the strips must still
+    /// be chosen when the sampled boxes are all vertical.
+    #[test]
+    fn check_work_follows_meeting_pairs_when_rings_start_vertical() {
+        let parts: Vec<Vec<TileRing>> = (0..20)
+            .flat_map(|c| {
+                (0..1000).map(move |r| {
+                    let (x0, y0, x1, y1) = (4 * c, 4 * r, 4 * c + 2, 4 * r + 2);
+                    vec![ring(&[(x1, y0), (x1, y1), (x0, y1), (x0, y0)])]
+                })
+            })
+            .collect();
+        let edges: u64 = 4 * 20 * 1000;
+        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        assert_eq!(check_polygons(&parts), Ok(()));
+        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        assert!(
+            compared < 16 * edges,
+            "{compared} box comparisons for {edges} edges"
+        );
+    }
+
     /// roborev 337: edges spanning many strips met each other in every strip
     /// they shared. Long, mutually overlapping edges must cost no more than
     /// the x-only sweep did.

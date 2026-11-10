@@ -547,6 +547,10 @@ const STRIP_BOXES: usize = 256;
 /// Most strips [`strip_box_pairs`] cuts the boxes' y range into.
 const MAX_STRIPS: usize = 1024;
 
+/// Mean boxes sharing a box's x range below which [`strip_box_pairs`] keeps
+/// the x sweep.
+const X_SWEEP_DENSITY: i64 = 8;
+
 /// [`any_box_pair`] in horizontal strips: the same pairs, each with the same
 /// one first in `hit(i, j)`, but not in the same order. Each strip runs the
 /// x sweep over the boxes that reach it, and a pair is visited only in the
@@ -560,6 +564,26 @@ pub(crate) fn strip_box_pairs(
     mut hit: impl FnMut(usize, usize) -> bool,
 ) -> bool {
     if boxes.len() < 2 * STRIP_BOXES {
+        return any_box_pair(boxes, hit);
+    }
+    // About the boxes the x sweep pairs each box with, from every 16th box.
+    // Where that is few (a ring's edges: about two), the strips' sort and
+    // lists cost more than they save. shortcut: a uniform-x estimate, so
+    // boxes bunched in x with an outlier far off keep the x sweep and its
+    // cost; bucket min x if a profile shows that.
+    let (x0, x1, widths) =
+        boxes
+            .iter()
+            .step_by(16)
+            .fold((i32::MAX, i32::MIN, 0_i64), |(lo, hi, w), b| {
+                (
+                    lo.min(b.0),
+                    hi.max(b.2),
+                    // Inclusive: a vertical edge still shares its x.
+                    w + i64::from(b.2) - i64::from(b.0) + 1,
+                )
+            });
+    if 16 * widths < X_SWEEP_DENSITY * (i64::from(x1) - i64::from(x0) + 1) {
         return any_box_pair(boxes, hit);
     }
     let (y0, y1) = boxes.iter().fold((i32::MAX, i32::MIN), |(lo, hi), b| {
