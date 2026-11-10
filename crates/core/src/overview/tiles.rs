@@ -1016,6 +1016,7 @@ pub(super) fn convert_to_pmtiles_validated(
                         range.pivot_zoom(),
                         max_zoom,
                         metadata,
+                        options.export.tile_format,
                     )
                     .map_err(TilesError::EmptyShardArchive)?;
                     log::info!(
@@ -1052,8 +1053,15 @@ pub(super) fn convert_to_pmtiles_validated(
                     // ladder), so the fallback is unreachable in practice.
                     let min_zoom = zoom_plan.map_or(0, |(min, _)| min);
                     let max_zoom = job.pivot_zoom.saturating_sub(1);
-                    write_empty_archive(output, &layer_name, min_zoom, max_zoom, metadata)
-                        .map_err(TilesError::EmptyCoarseArchive)?;
+                    write_empty_archive(
+                        output,
+                        &layer_name,
+                        min_zoom,
+                        max_zoom,
+                        metadata,
+                        options.export.tile_format,
+                    )
+                    .map_err(TilesError::EmptyCoarseArchive)?;
                     log::info!(
                         "[tiles] shard job {} has nothing to write ({e}); wrote an empty archive",
                         job.role

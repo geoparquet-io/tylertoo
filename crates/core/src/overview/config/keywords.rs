@@ -377,7 +377,6 @@ pub fn command_defaults(command: &str) -> Map<String, Value> {
                 "tile_range",
                 "zoom_ceiling",
                 "spill_dir",
-                "profile",
                 "variable_depth",
                 // #822: bands tile verbatim, so a preset has no convert half.
                 "preset",

@@ -498,6 +498,16 @@ pub struct PyramidArgs {
     #[command(flatten)]
     pub export: ExportArgs,
 
+    /// Memory profile, as for tiles, for every GeoParquet band's convert
+    /// and export; changes memory use, not output bytes
+    #[arg(
+        long,
+        default_value = ExportOptions::default().profile.as_str(),
+        value_parser = spelled::<crate::overview::level::MemoryProfile>(&["auto", "speed", "bounded"]),
+        help_heading = "Memory & performance"
+    )]
+    pub profile: crate::overview::level::MemoryProfile,
+
     #[command(flatten)]
     pub properties: ExportPropertyArgs,
 
@@ -862,6 +872,7 @@ pub fn pyramid_options(args: &PyramidArgs) -> crate::pyramid::PyramidOptions {
     crate::pyramid::PyramidOptions {
         export: ExportOptions {
             properties: args.properties.clone(),
+            profile: args.profile,
             ..args.export.apply(base.export)
         },
         // The final archive's overrides; the band exports write none, so

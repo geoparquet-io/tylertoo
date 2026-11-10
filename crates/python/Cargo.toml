@@ -17,7 +17,9 @@ name = "tylertoo"
 crate-type = ["cdylib"]
 
 [features]
-default = ["mimalloc"]
+default = ["mimalloc", "mlt"]
+# MapLibre Tile output (#823), on by default; see tylertoo-core's `mlt`.
+mlt = ["tylertoo-core/mlt"]
 # mimalloc as the extension's global allocator on every target, as for the
 # CLI (#739, #788, #792); `--no-default-features` builds with the system
 # allocator. musl targets (musllinux) always get it, below, whatever this

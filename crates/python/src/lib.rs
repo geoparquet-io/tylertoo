@@ -667,9 +667,11 @@ mod config_parity {
             "1M",
             "--layer-name",
             "places",
+            "--tile-format",
+            "mlt",
         ]);
         let cli = cli::tiles_options(&args).unwrap();
-        let python = tiles_config(native_keywords(json!({"verbatim": true, "point_thinning": 2.0, "extent": 8192, "max_compressed_tile_size": 1048576, "layer_name": "places"}))).unwrap();
+        let python = tiles_config(native_keywords(json!({"verbatim": true, "point_thinning": 2.0, "extent": 8192, "max_compressed_tile_size": 1048576, "layer_name": "places", "tile_format": "mlt"}))).unwrap();
         let mut core = TilesOptions::default();
         core.convert = core.convert.verbatim();
         core.convert.assign.point_thinning = 2.0;
@@ -677,6 +679,7 @@ mod config_parity {
         core.export.extent = 8192;
         core.export.compressed_tile_size_limit = Some(1048576);
         core.layer_name = Some("places".into());
+        core.export.tile_format = tylertoo_core::TileFormat::Mlt;
         let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
         assert_eq!(
             serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
@@ -720,10 +723,16 @@ mod config_parity {
             "--no-simple-clip-fastpath",
             "--max-zoom-simplify-factor",
             "0.5",
+            "--tile-format",
+            "mlt",
+            "--mlt-profile",
+            "native",
         ]);
         let cli = cli::export_options(&args).unwrap();
-        let python = export_config(native_keywords(json!({"extent": 8192, "tile_buffer": 4, "name": "Example", "include_properties": ["rank"], "feature_order": "rank:desc", "simple_clip_fastpath": false, "max_zoom_simplify_factor": 0.5}))).unwrap();
+        let python = export_config(native_keywords(json!({"extent": 8192, "tile_buffer": 4, "name": "Example", "include_properties": ["rank"], "feature_order": "rank:desc", "simple_clip_fastpath": false, "max_zoom_simplify_factor": 0.5, "tile_format": "mlt", "mlt_profile": "native"}))).unwrap();
         let mut core = ExportOptions::default()
+            .with_tile_format(tylertoo_core::TileFormat::Mlt)
+            .with_mlt_profile(tylertoo_core::MltProfile::Native)
             .with_extent(8192)
             .with_tile_buffer(4)
             .with_simple_clip_fastpath(false)
@@ -839,10 +848,16 @@ mod config_parity {
             "--name",
             "Bands",
             "--allow-missing-zooms",
+            "--profile",
+            "bounded",
+            "--tile-format",
+            "mlt",
         ]);
         let cli = cli::pyramid_options(&args);
-        let python = pyramid_config(native_keywords(json!({"generalize": true, "tile_size_limit": 1048576, "extent": 8192, "name": "Bands", "allow_missing_zooms": true}))).unwrap();
+        let python = pyramid_config(native_keywords(json!({"generalize": true, "tile_size_limit": 1048576, "extent": 8192, "name": "Bands", "allow_missing_zooms": true, "profile": "bounded", "tile_format": "mlt"}))).unwrap();
         let mut core = tylertoo_core::internal::pyramid::PyramidOptions::new(true);
+        core.export.profile = tylertoo_core::MemoryProfile::Bounded;
+        core.export.tile_format = tylertoo_core::TileFormat::Mlt;
         core.export.tile_size_limit = Some(1048576);
         core.export.extent = 8192;
         core.metadata.name = Some("Bands".into());

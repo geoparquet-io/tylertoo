@@ -57,6 +57,10 @@ geozero = { version = "0.15", features = ["with-wkb", "with-geo"] }
 # The WKB reader and writer geoarrow already uses for GeoParquet columns.
 wkb = "0.9.3"
 
+# MapLibre Tile (MLT) output (#823). Its rust-version (1.98) is above ours,
+# so core takes it behind the optional `mlt` feature.
+mlt-core = "0.22.1"
+
 # Protobuf for MVT encoding
 prost = "0.14"
 prost-build = "0.14"

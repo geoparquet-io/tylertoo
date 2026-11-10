@@ -118,6 +118,38 @@ class TestPyramidIntegration:
         assert report["skipped_tiles"] > 0
 
 
+class TestPyramidTileFormat:
+    """#823 `tile_format=` and #801 `profile=`."""
+
+    def test_mlt_bands_profile_and_readers(self) -> None:
+        bands = [f"8-9:{STREAMING_SMALL}:coarse", f"10-12:{STREAMING_SMALL}:fine"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mvt, mlt, bounded = (
+                Path(tmpdir) / f"{n}.pmtiles" for n in ("mvt", "mlt", "bounded")
+            )
+            tylertoo.pyramid(bands, str(mvt))
+            tylertoo.pyramid(bands, str(mlt), tile_format="mlt")
+            tylertoo.pyramid(bands, str(bounded), profile="bounded")
+            assert mlt.read_bytes()[99] == 6
+            assert bounded.read_bytes() == mvt.read_bytes()
+            per_layer = [
+                tylertoo.stats(str(p), layers=True)["per_layer"] for p in (mvt, mlt)
+            ]
+            decoded = [
+                tylertoo.decode(str(p), str(Path(tmpdir) / f"{p.stem}.parquet"))
+                for p in (mvt, mlt)
+            ]
+        counts = [[(r["z"], r["layer"], r["feature_count"]) for r in s] for s in per_layer]
+        assert counts[0] == counts[1]
+        assert decoded[0]["features_written"] == decoded[1]["features_written"] > 0
+
+    def test_mlt_profile_needs_mlt(self) -> None:
+        with pytest.raises(tylertoo.ConfigError, match="mlt_profile"):
+            tylertoo.pyramid(
+                [f"8-9:{STREAMING_SMALL}"], "/tmp/out.pmtiles", mlt_profile="native"
+            )
+
+
 class TestPyramidErrorClasses:
     """#438: the exception class comes from core's error kind."""
 
