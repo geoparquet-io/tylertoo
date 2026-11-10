@@ -2624,6 +2624,7 @@ pub(super) mod tests {
                 concurrent_levels: true,
                 checkpoint_interval: super::super::CHECKPOINT_INTERVAL,
                 fail_level: None,
+                panic_write_level: None,
                 memory_limit: None,
                 // Pin the grant; this work counter must not depend on the
                 // host's available RAM or another test's memory pressure.

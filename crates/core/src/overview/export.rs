@@ -2215,6 +2215,7 @@ fn export_pmtiles_impl(
             concurrent_levels: true,
             checkpoint_interval: CHECKPOINT_INTERVAL,
             fail_level: None,
+            panic_write_level: None,
             memory_limit: None,
             budget_available: None,
         },
@@ -2237,6 +2238,9 @@ struct Pass2Knobs {
     /// Fail the export with an injected I/O error when this level starts,
     /// to test what an interrupted group leaves behind.
     fail_level: Option<usize>,
+    /// Panic while a level group writes this level's first wave, to test
+    /// that a panicking write fails the group instead of hanging it.
+    panic_write_level: Option<usize>,
     /// The memory figure for the #665 dense-tile refusal. `None` probes
     /// ([`probe_oom_memory_limit`]); tests inject one.
     memory_limit: Option<MemoryLimit>,
@@ -3039,6 +3043,8 @@ fn fill_backing(
 ///   anything that affects the archive.
 struct ExportProgress {
     fail_level: Option<usize>,
+    /// [`Pass2Knobs::panic_write_level`].
+    panic_write_level: Option<usize>,
     /// When the last checkpoint was written (or the export started): a
     /// checkpoint is due once [`CHECKPOINT_INTERVAL`] has elapsed since. A
     /// fast export finishes before the first interval elapses and never
@@ -3077,6 +3083,7 @@ impl ExportProgress {
             checkpoint_throttle: Instant::now(),
             checkpoint_interval: knobs.checkpoint_interval,
             fail_level: knobs.fail_level,
+            panic_write_level: knobs.panic_write_level,
             #[cfg(test)]
             checkpoint_zooms: Vec::new(),
             profile: ExportProfile {
@@ -3688,9 +3695,9 @@ fn export_level_group(
                 }
                 let (commit, timers, in_flight) = (&commit, &*timers, &in_flight);
                 scope.spawn(move |_| {
-                    let t_encode = Instant::now();
-                    let tiles = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        encode_buckets(
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let t_encode = Instant::now();
+                        let tiles = encode_buckets(
                             level.gzip_cache,
                             (buckets, Some(&held)),
                             level.plan.zoom,
@@ -3698,26 +3705,27 @@ fn export_level_group(
                             level.fills,
                             timers,
                             diagnostics,
-                        )
+                        );
+                        drop(held);
+                        let encoded = tiles.map(|tiles| EncodedWave {
+                            tiles,
+                            start,
+                            collect_secs,
+                            encode_secs: t_encode.elapsed().as_secs_f64(),
+                            spill_bytes,
+                        });
+                        lock_commit(commit, timers).finish((i, w), encoded);
                     }));
-                    drop(held);
-                    let tiles = tiles.unwrap_or_else(|panic| {
+                    if run.is_err() {
                         // The collect may wait on this wave's write: fail
                         // the group so it stops, then let Rayon re-raise.
-                        let e = std::io::Error::other("a wave's encode panicked");
+                        let e = std::io::Error::other("a wave's encode or write panicked");
                         lock_commit(commit, timers).fail(i, ExportError::Io(e));
-                        in_flight.notify();
-                        std::panic::resume_unwind(panic)
-                    });
-                    let encoded = tiles.map(|tiles| EncodedWave {
-                        tiles,
-                        start,
-                        collect_secs,
-                        encode_secs: t_encode.elapsed().as_secs_f64(),
-                        spill_bytes,
-                    });
-                    lock_commit(commit, timers).finish((i, w), encoded);
+                    }
                     in_flight.notify();
+                    if let Err(panic) = run {
+                        std::panic::resume_unwind(panic);
+                    }
                 });
                 unit += 1;
             }
@@ -3968,6 +3976,11 @@ impl GroupCommit<'_> {
     fn write_wave(&mut self, encoded: EncodedWave) -> Result<(), ExportError> {
         let (i, w) = self.next;
         let level = &self.levels[i];
+        assert!(
+            w > 0 || self.progress.panic_write_level != Some(level.level_idx),
+            "injected write panic at level {}",
+            level.level_idx
+        );
         let open = &mut self.open;
         if w == 0 {
             *open = OpenLevel {
@@ -12070,6 +12083,7 @@ mod tests {
             concurrent_levels,
             checkpoint_interval: Duration::ZERO,
             fail_level: None,
+            panic_write_level: None,
             memory_limit: None,
             budget_available: None,
         }
@@ -12104,6 +12118,59 @@ mod tests {
             .map(|z| (z.level, z.level_feature_count as u64))
             .collect();
         (run, band_rows)
+    }
+
+    /// #817 review: a panic while a group writes a wave fails the group and
+    /// re-raises, as an encode panic does. Before, the write ran outside the
+    /// encode's `catch_unwind`, so the next wave of a multi-wave level waited
+    /// for that write forever.
+    #[test]
+    fn level_group_write_panic_does_not_hang() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(input.path());
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            partition_wave: 1,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let good = export_pmtiles_run(
+            input.path(),
+            dir.path().join("good.pmtiles"),
+            &opts,
+            1,
+            &knobs(false, None, true),
+        )
+        .unwrap();
+        let level = good
+            .report
+            .zooms
+            .iter()
+            .find(|z| z.tile_count >= 3)
+            .expect("the fixture must give a level three waves")
+            .level;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let out = dir.path().join("panics.pmtiles");
+        std::thread::spawn(move || {
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                export_pmtiles_run(
+                    input.path(),
+                    &out,
+                    &opts,
+                    1,
+                    &Pass2Knobs {
+                        panic_write_level: Some(level),
+                        ..knobs(false, None, true)
+                    },
+                )
+                .map(|_| ())
+            }));
+            let _ = tx.send(run.is_err());
+        });
+        let panicked = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a panicking group write hung the export");
+        assert!(panicked, "the write panic must reach the caller");
     }
 
     /// #740 (read amplification): a duplicating-mode level split into several
