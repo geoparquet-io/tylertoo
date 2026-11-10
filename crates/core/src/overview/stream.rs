@@ -10125,7 +10125,7 @@ mod tests {
             .map(|t| {
                 t.map(|t| {
                     t.into_iter()
-                        .map(|(k, (g, c))| (k, (g.into_inner().unwrap(), c)))
+                        .map(|(k, (g, c))| (k, (g.into_inner().unwrap().map(|g| *g), c)))
                         .collect()
                 })
             })
@@ -10148,9 +10148,9 @@ mod tests {
         t.insert(
             rep,
             (
-                super::super::convert::ChainGeometry::new(Some(Geometry::LineString(
+                super::super::convert::ChainGeometry::new(Some(Box::new(Geometry::LineString(
                     LineString::from(vec![(0.0, 0.0), (1.0, 1.0)]),
-                ))),
+                )))),
                 7,
             ),
         );
@@ -10394,6 +10394,19 @@ mod tests {
             "the table still holds the chain"
         );
         assert_eq!(*count, 7);
+    }
+
+    /// #851: a chain table's slots stay allocated until convert returns,
+    /// after pass 2 has moved every geometry out, so a slot must not carry
+    /// the geometry inline (it was 80 B with an inline `Geometry`).
+    #[test]
+    fn a_chain_table_slot_is_small() {
+        type Slot = (usize, (super::super::convert::ChainGeometry, i32));
+        assert!(
+            std::mem::size_of::<Slot>() <= 32,
+            "{}",
+            std::mem::size_of::<Slot>()
+        );
     }
 
     /// Pass 2 takes pass 1's prebuilt tables verbatim, level by level, and

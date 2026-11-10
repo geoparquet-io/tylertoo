@@ -6278,8 +6278,10 @@ fn overwrite_numeric_column(
 /// as pass 2 emits them, not held until convert returns (#851).
 pub(super) type CoalesceTable = HashMap<usize, (ChainGeometry, i32)>;
 
-/// A chain table's geometry slot, emptied when pass 2 emits the rep.
-pub(super) type ChainGeometry = std::sync::Mutex<Option<Geometry<f64>>>;
+/// A chain table's geometry slot, emptied when pass 2 emits the rep. Boxed:
+/// the map's slots outlive the geometry until convert returns, and a boxed
+/// slot is 16 B where an inline `Geometry` is 64 B (#851).
+pub(super) type ChainGeometry = std::sync::Mutex<Option<Box<Geometry<f64>>>>;
 
 /// Move rep `row`'s merged geometry out of `table`; `None` when `row` is not
 /// a chain rep at this level.
@@ -6292,7 +6294,7 @@ pub(super) fn take_chain_geometry(table: &CoalesceTable, row: usize) -> Option<G
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    Some(geom.expect("pass 2 emits each chain rep once per level"))
+    Some(*geom.expect("pass 2 emits each chain rep once per level"))
 }
 
 /// Validate the coalescing-related schema constraint: the input must not
@@ -6656,9 +6658,10 @@ pub(super) fn build_level_coalesce_table_and_hint(
         .into_par_iter()
         .filter_map(|chain| {
             match simplify_for_level(&chain.geom, gsd_m, crs, &options.simplify, diagnostics) {
-                Simplified::Keep(g) => {
-                    Some((chain.rep, (ChainGeometry::new(Some(g)), chain.count)))
-                }
+                Simplified::Keep(g) => Some((
+                    chain.rep,
+                    (ChainGeometry::new(Some(Box::new(g))), chain.count),
+                )),
                 Simplified::Dropped => None,
             }
         })
