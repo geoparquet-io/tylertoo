@@ -80,7 +80,7 @@ Args:
         `"LO..HI"`: one shard of a sharded build.
     zoom_ceiling: Export only the tiles at or below this zoom: the
         coarse job of a sharded build.
-    tile_format: Tile encoding, "mvt" (default) or "mlt". MLT needs
+    tile_format: Tile encoding, `"mvt"` (default) or `"mlt"`. MLT needs
         MapLibre GL JS 5.12 or later, or MapLibre Native. Each finished
         MVT tile is converted with mlt-core before gzip and both size
         caps, so the caps measure MLT bytes. MLT stores each attribute
@@ -88,19 +88,19 @@ Args:
         conversion: integers mixed with floats become f64 (doubles),
         and other mixes become strings. Attribute order within a
         feature becomes column order. MLT archives use PMTiles tile
-        type 6 and metadata format "mlt". Merge refuses to combine
+        type 6 and metadata format `"mlt"`. Merge refuses to combine
         MVT and MLT archives.
-    mlt_profile: MLT profile, refused unless tile_format="mlt".
-        "web" (default) targets GL JS before 6.0, which decodes with
+    mlt_profile: MLT profile, refused unless `tile_format="mlt"`.
+        `"web"` (default) targets GL JS before 6.0, which decodes with
         @maplibre/mlt 1.1. It omits FastPFOR, FSST and shared
         dictionaries, and stores integer columns wider than 32 bits
         as doubles when every value is exact (absolute value at most
         2^53): GL JS reads 64-bit integers as BigInt, and style
         expressions do not compare BigInt with numbers. The others
-        are mlt-core's profiles: "native" for MapLibre Native with
-        every codec and stored polygon triangles; "min-size" for
-        smallest tiles; "diffable" for small binary diffs between
-        releases; "fast-encoding" for quickest encoding.
+        are mlt-core's profiles: `"native"` for MapLibre Native with
+        every codec and stored polygon triangles; `"min-size"` for
+        smallest tiles; `"diffable"` for small binary diffs between
+        releases; `"fast-encoding"` for quickest encoding.
 
 Returns:
     Tile counts for each zoom written, with encoding diagnostics.

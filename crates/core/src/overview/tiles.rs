@@ -448,6 +448,8 @@ impl TilesOptions {
                 e.compressed_tile_size_limit != defaults.compressed_tile_size_limit,
             ),
             ("--size-valve", e.size_valve != defaults.size_valve),
+            ("--tile-format", e.tile_format != defaults.tile_format),
+            ("--mlt-profile", e.mlt_profile != defaults.mlt_profile),
             ("--coverage-fill", e.coverage_fill != defaults.coverage_fill),
             (
                 "--generate-variable-depth-tile-pyramid",
@@ -508,7 +510,17 @@ impl TilesOptions {
             }
         }
         self.convert.validate().map_err(TilesError::Convert)?;
-        self.export.validate()?;
+        // Under the layer name the export will get, so its rules (an MLT
+        // layer needs one) hold before the convert runs.
+        match &self.layer_name {
+            Some(name) => ExportOptions {
+                layer_name: name.clone(),
+                ..self.export.clone()
+            }
+            .validate()
+            .map(|_| ())?,
+            None => self.export.validate().map(|_| ())?,
+        }
         if self.export.variable_depth {
             super::export::variable_depth::check_convert(&self.convert, self.shard.is_some())?;
         }
@@ -2418,6 +2430,17 @@ mod tests {
     }
 
     /// The derived layer name follows core's input rules for both shapes.
+    #[test]
+    fn an_empty_mlt_layer_name_is_refused_before_any_io() {
+        let options = TilesOptions {
+            layer_name: Some(String::new()),
+            export: ExportOptions::default().with_tile_format(crate::TileFormat::Mlt),
+            ..TilesOptions::default()
+        };
+        let err = options.validate().unwrap_err().to_string();
+        assert!(err.contains("an MLT layer needs a name"), "{err}");
+    }
+
     #[test]
     fn derive_layer_name_follows_input_rules() {
         assert_eq!(
