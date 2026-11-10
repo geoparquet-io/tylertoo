@@ -545,8 +545,41 @@ fn _run_cli(py: Python<'_>, argv: Vec<std::ffi::OsString>) -> u8 {
 /// prints. Records below DEBUG are never forwarded. Forwarding takes the GIL,
 /// so every core call here runs inside `py.detach`: a worker thread logging
 /// while this thread waited on it with the GIL held would deadlock.
+/// #828: return this thread's freed mimalloc pages to the OS now, as the
+/// CLI does; core runs it when a phase ends.
+#[cfg(all(
+    any(target_env = "musl", feature = "mimalloc"),
+    not(feature = "dhat-heap")
+))]
+fn release_retained() {
+    // SAFETY: mi_collect takes no pointers and only touches mimalloc's state.
+    unsafe { libmimalloc_sys::mi_collect(true) }
+}
+
+/// #828: no transparent huge pages for mimalloc's arenas. On a `madvise`
+/// THP host they kept 0.5-1 GiB of freed 4 KiB pages resident inside
+/// 2 MiB pages (Moldova z12: 3.7 -> 3.0 GiB peak, same archive). Then
+/// install the phase-boundary release.
+#[cfg(all(
+    any(target_env = "musl", feature = "mimalloc"),
+    not(feature = "dhat-heap")
+))]
+fn configure_allocator() {
+    /// `mi_option_allow_thp` in mimalloc v3's `mi_option_e` (mimalloc.h);
+    /// libmimalloc-sys 0.1 exports no constant for it.
+    const MI_OPTION_ALLOW_THP: libmimalloc_sys::mi_option_t = 43;
+    // SAFETY: sets one mimalloc option; no pointers are involved.
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_ALLOW_THP, 0) };
+    tylertoo_core::internal::alloc_release::set_release_hook(release_retained);
+}
+
 #[pymodule]
 fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(all(
+        any(target_env = "musl", feature = "mimalloc"),
+        not(feature = "dhat-heap")
+    ))]
+    configure_allocator();
     m.add("ConfigError", m.py().get_type::<ConfigError>())?;
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add_function(wrap_pyfunction!(overview, m)?)?;

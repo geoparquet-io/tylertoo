@@ -105,6 +105,7 @@ mod vector_tile {
     include!(concat!(env!("OUT_DIR"), "/vector_tile.rs"));
 }
 
+mod alloc_release;
 mod archive_index;
 mod atomic_output;
 mod batch_processor;
@@ -213,6 +214,9 @@ pub use tile_format::{MltProfile, TileFormat};
 /// Any release may change or remove any item without a semver bump. The
 /// supported API is the crate root.
 pub mod internal {
+    pub mod alloc_release {
+        pub use crate::alloc_release::set_release_hook;
+    }
     /// The MLT codec, for tests that decode MLT archives independently.
     #[cfg(feature = "mlt")]
     pub use mlt_core;

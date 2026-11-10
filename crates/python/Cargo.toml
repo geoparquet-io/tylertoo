@@ -28,7 +28,7 @@ mlt = ["tylertoo-core/mlt"]
 # feature says. Only the extension's own
 # Rust allocations go through it: the interpreter's allocator is untouched,
 # and every Rust allocation is freed by Rust (data reaches Python as copies).
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # dhat owns the global allocator (installed in tylertoo-core), so mimalloc is
 # compiled out under it; rustc allows only one in the crate graph.
 dhat-heap = ["tylertoo-core/dhat-heap"]
@@ -53,12 +53,15 @@ serde_json = "1"
 # local_dynamic_tls: a dlopen'd extension must not use initial-exec TLS,
 # which glibc fits into a small static block (#823's mlt-core TLS overflowed it).
 mimalloc = { version = "0.1", optional = true, features = ["local_dynamic_tls"] }
+# `mi_collect`, run on every pool thread when a phase ends (#828), as the CLI.
+libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
 
 # musllinux wheels: musl's mallocng fails small allocations under
 # multi-threaded fragmentation (#480), the failure the musl CLI binary avoids
 # with mimalloc. The wheel runs the same pipeline, so it gets the same fix.
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
 
 [lints]
 workspace = true
