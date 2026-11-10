@@ -3,8 +3,8 @@
 import tempfile
 from pathlib import Path
 
-import pyarrow.compute as pc
-import pyarrow.parquet as pq
+import pyarrow.compute as pc  # type: ignore[import-untyped]
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 
 import tylertoo
@@ -52,7 +52,7 @@ class TestPyramidApi:
             tylertoo.pyramid(
                 [f"0-5:{STREAMING_SMALL}"],
                 "/tmp/out.pmtiles",
-                True,  # type: ignore[misc]
+                True,  # type: ignore[misc, arg-type]
             )
 
 
