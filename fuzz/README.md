@@ -107,7 +107,7 @@ and from tylertoo's own output on them: `geo_metadata` is a file's `geo`
 key-value string; `parquet_footer` is the thrift footer (the `N` bytes before
 the trailing 4-byte length `N` and `PAR1`); `remote_footer` and
 `overview_file` are whole small files; `plan_file` is a
-v6 `tiles INPUT --save-plan FILE --plan-only` file without its first 16 bytes
+v7 `tiles INPUT --save-plan FILE --plan-only` file without its first 16 bytes
 (magic and checksum). Keep the length-prefixed JSON Lines loss partition and
 the following Arrow IPC bytes: the hook restores only the header through the
 production writer. Regenerate `seed-grid.arrow` from
