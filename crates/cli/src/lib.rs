@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 )]
 use std::sync::atomic::{AtomicBool, Ordering};
 use tylertoo_core::internal::error::{Classify, ErrorKind};
+use tylertoo_core::internal::input::redact_query;
 use tylertoo_core::internal::overview::auto_zoom::MaxZoom;
 use tylertoo_core::internal::overview::config::cli::{
     export_options, overview_options, pyramid_options, tiles_export_defaults, tiles_options,
@@ -539,10 +540,11 @@ enum InputSpec {
 
 impl InputSpec {
     /// The input as the user wrote it, for messages that name it in full
-    /// (a re-runnable command line, not a summary line).
+    /// (a re-runnable command line, not a summary line), minus a URL's
+    /// query: it can be a presigned signature (#820).
     fn display(&self) -> String {
         match self {
-            InputSpec::Path(p) => p.display().to_string(),
+            InputSpec::Path(p) => redact_query(&p.to_string_lossy()).into_owned(),
             InputSpec::Manifest(p) => format!("--files-from {}", p.display()),
         }
     }
@@ -556,7 +558,8 @@ impl InputSpec {
 
     /// Label for summary lines (input file name or manifest file name).
     fn label(&self) -> String {
-        self.path()
+        let shown = redact_query(&self.path().to_string_lossy()).into_owned();
+        Path::new(&shown)
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
@@ -586,7 +589,7 @@ fn resolve_io(
             (Some(input), Some(output)) => anyhow::bail!(
                 "--files-from conflicts with the positional INPUT: got both the \
                  manifest and {:?}; pass only the OUTPUT ({:?})",
-                input,
+                redact_query(&input.to_string_lossy()),
                 output
             ),
             (None, _) => {
@@ -609,7 +612,7 @@ fn resolve_io_for_planning(
         (Some(i), Some(m)) => anyhow::bail!(
             "--files-from conflicts with the positional INPUT: got both {} and the manifest \
              {}; pass one",
-            i.display(),
+            redact_query(&i.to_string_lossy()),
             m.display()
         ),
         // Unreachable via clap (`required_unless_present`), kept for direct
@@ -1309,20 +1312,21 @@ fn require_single_local_file(input: &std::path::Path, subcommand: &str) -> Resul
     if s.contains("://") {
         // Query string / fragment stripped: `s3://b/set/?x` is a prefix.
         let no_meta = s.split(['?', '#']).next().unwrap_or(&s);
+        let shown = redact_query(&s);
         if no_meta.ends_with('/') {
             anyhow::bail!(
                 "`tylertoo {subcommand}` reads a single local file, but {} is a \
                  remote prefix; multi-partition input (directories, globs, \
                  s3://gs:// prefixes, --files-from) is supported by the `overview` \
                  and `tiles` subcommands",
-                input.display()
+                shown
             );
         }
         anyhow::bail!(
             "`tylertoo {subcommand}` does not support remote inputs (got {}); \
              remote URLs (s3://, https://, gs://) are supported by the `overview` \
              and `tiles` subcommands — download the file first (e.g. `aws s3 cp`)",
-            input.display()
+            shown
         );
     }
     let kind = if input.is_dir() {
