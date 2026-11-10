@@ -2630,6 +2630,7 @@ impl Preflight {
         diagnostics.set_input_rows(source.stream_row_locator(Some(&read))?);
         self.options.read_batch_size = source.read_batch_rows(
             Some(&read),
+            None,
             self.options.read_batch_size,
             tylertoo_io::byte_array_limit(),
         )?;
