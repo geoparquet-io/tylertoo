@@ -899,6 +899,76 @@ mod config_parity {
         );
     }
 
+    /// #823: `--tile-format` and `--mlt-profile` on every command that
+    /// takes them. MLT validates only in a build with the `mlt` feature.
+    #[cfg(feature = "mlt")]
+    #[test]
+    fn tile_format_cli_python_core_configs_are_equal() {
+        use tylertoo_core::{MltProfile, TileFormat};
+        let flags = ["--tile-format", "mlt", "--mlt-profile", "native"];
+        let keywords = || native_keywords(json!({"tile_format": "mlt", "mlt_profile": "native"}));
+        let mlt = |e: ExportOptions| {
+            e.with_tile_format(TileFormat::Mlt)
+                .with_mlt_profile(MltProfile::Native)
+        };
+
+        let args = cli::ExportPmtilesArgs::parse_from(
+            [&["export-pmtiles", "in", "out"][..], &flags].concat(),
+        );
+        let core = mlt(ExportOptions::default());
+        let expected = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        let cli = cli::export_options(&args).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
+            expected
+        );
+        let python = export_config(keywords()).unwrap();
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            expected
+        );
+
+        let args = cli::TilesArgs::parse_from([&["tiles", "in", "out"][..], &flags].concat());
+        let mut core = TilesOptions::default();
+        core.convert = core
+            .convert
+            .with_generalization(&Default::default(), false)
+            .unwrap();
+        core.export = mlt(core.export);
+        let expected = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        let cli = cli::tiles_options(&args).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
+            expected
+        );
+        let python = tiles_config(keywords()).unwrap();
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            expected
+        );
+
+        let args = cli::PyramidArgs::parse_from(
+            [
+                &["pyramid", "out", "--band", "0-3:never-read.parquet"][..],
+                &flags,
+            ]
+            .concat(),
+        );
+        let mut core = tylertoo_core::internal::pyramid::PyramidOptions::default();
+        core.export = mlt(core.export);
+        let expected = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        let cli = cli::pyramid_options(&args);
+        assert_eq!(
+            serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
+            expected
+        );
+        let python = pyramid_config(keywords()).unwrap();
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            expected
+        );
+    }
+
     #[test]
     fn pyramid_cli_python_core_configs_are_equal() {
         let defaults =
@@ -928,10 +998,13 @@ mod config_parity {
             "--name",
             "Bands",
             "--allow-missing-zooms",
+            "--profile",
+            "bounded",
         ]);
         let cli = cli::pyramid_options(&args);
-        let python = pyramid_config(native_keywords(json!({"generalize": true, "tile_size_limit": 1048576, "extent": 8192, "name": "Bands", "allow_missing_zooms": true}))).unwrap();
+        let python = pyramid_config(native_keywords(json!({"generalize": true, "tile_size_limit": 1048576, "extent": 8192, "name": "Bands", "allow_missing_zooms": true, "profile": "bounded"}))).unwrap();
         let mut core = tylertoo_core::internal::pyramid::PyramidOptions::new(true);
+        core.export.profile = tylertoo_core::MemoryProfile::Bounded;
         core.export.tile_size_limit = Some(1048576);
         core.export.extent = 8192;
         core.metadata.name = Some("Bands".into());

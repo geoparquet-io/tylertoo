@@ -90,12 +90,64 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `stats` and `--shard` included, with the binary's output, stderr logging
   and exit codes. The Python API now installs its `logging` bridge on its
   first call instead of at import.
+- Sharded builds work with line coalescing, which is on by default (#546).
+  The convert plan carries the coalesce chains the coarse job built, so a
+  data shard runs no chain stage: it reads the row groups of the chains that
+  reach its tiles. Its memory follows its own share of the data (on 2.8M
+  Overture segments at 64 shards, about 1 GB per shard against 4 GB when
+  each shard rebuilt the chains). Plans saved by earlier builds must be
+  re-created with `--save-plan`. Tile bodies match a single-machine
+  build byte for byte, except for over-cap tiles under the default
+  `--size-valve merge` when a shard prunes row groups (#854; pass
+  `--size-valve drop` for an exact match). `--no-coalesce-lines` is no longer
+  needed, and `InvalidOption::ShardWithCoalescedLines` is gone.
 
 ### Fixed
 
 - An `https://` input keeps its query string, so presigned S3 and Azure SAS
   URLs work; the query is shown as `?<redacted>` in logs, errors, reports
   and saved plans (#820).
+- The density budget no longer empties sparse tiles (#850). Three causes,
+  all fixed: the rounding leftover went to the first neighborhoods in scan
+  order, so equal small shares emptied every later one; each level shared
+  out only its newcomers, so rounding errors compounded level by level; and
+  nothing matched tippecanoe's rule that a tile keeps its first feature
+  whatever the drop rate. Now the shares are rounded as a running total in Z-order over
+  a Web Mercator grid, each counts what coarser levels kept, and a tile the
+  budget would empty keeps one feature. On 1.05M Overture places,
+  `--preset tippecanoe` missed 298 of tippecanoe's 1,645 z12 tiles and 1,022
+  of its 5,094 z13 tiles; it now misses 12 and 28, with the same per-zoom
+  feature counts. Any budgeted output changes, the default included.
+- `--generate-variable-depth-tile-pyramid` takes `--max-tile-size 0`, and so
+  `--preset tippecanoe`, which sets it (#849). It used to refuse them, naming
+  a flag the preset user never passed. With no raw cap the probe is bounded
+  by the default 2M; a tile over it is drawn at the usual depth.
+- A data shard at the antimeridian reads the features from across it that
+  export draws into its edge tiles. Its read margin used to stop at ±180°
+  (#546 review).
+- `shard-plan` cuts an EPSG:3857 input by where its rows are. It used to
+  read the row-group statistics, which are metres, as degrees, and put every
+  row in the last shard (#546 review).
+- A data shard no longer warns that a level below its pivot "became empty
+  after simplification". It exports no such level, and its share of one is
+  often empty (#546 review).
+- Inputs with many list columns (Overture segments: 86 list leaves) are no
+  longer handed out one row per batch. A decode no longer crosses a row
+  group, so it is charged with one group's list values rather than two:
+  Overture's 22k-row groups decode whole instead of a row at a time. A group
+  whose list values alone pass the bound still decodes a row at a time, and
+  the reader joins those rows back into batches within the byte bound. Each
+  one-row batch kept about 260 KB of Arrow overhead per buffered output row,
+  so `tiles` on a 38 MB extract passed 118 GB and was OOM-killed. It now
+  peaks at 1.5 GB in 23 s (#848).
+- A read whose batches hit the decode byte bound is cut into the same
+  batches by one reader or by several (`--read-workers`): one row-by-row
+  byte rule cuts both, so the intermediate overview file no longer depends
+  on the worker count there (#858).
+- A column with 8- or 16-bit dictionary keys is read in batches of no more
+  rows than its key indexes, so a batch spanning row groups no longer fails
+  with `DictionaryKeyOverflowError` (#857; a dictionary nested in a list
+  can still overflow).
 - A crafted Parquet footer with an overlong varint, or a page header that
   skips past the end of the file, is refused instead of allocating gigabytes
   or spinning for minutes (#789).

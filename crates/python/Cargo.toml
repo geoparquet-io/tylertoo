@@ -3,7 +3,9 @@ name = "tylertoo-python"
 description = "Python bindings for tylertoo"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# mlt-core (default `mlt` feature, #823) needs 1.98; the libraries keep the
+# workspace's 1.95.
+rust-version = "1.98"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,7 +19,9 @@ name = "tylertoo"
 crate-type = ["cdylib"]
 
 [features]
-default = ["mimalloc"]
+default = ["mimalloc", "mlt"]
+# MapLibre Tile output (#823), on by default; see tylertoo-core's `mlt`.
+mlt = ["tylertoo-core/mlt"]
 # mimalloc as the extension's global allocator on every target, as for the
 # CLI (#739, #788, #792); `--no-default-features` builds with the system
 # allocator. musl targets (musllinux) always get it, below, whatever this
@@ -46,13 +50,15 @@ pythonize = "0.29"
 serde = { workspace = true }
 # Flat keyword values are normalized by core syntax adapters.
 serde_json = "1"
-mimalloc = { version = "0.1", optional = true }
+# local_dynamic_tls: a dlopen'd extension must not use initial-exec TLS,
+# which glibc fits into a small static block (#823's mlt-core TLS overflowed it).
+mimalloc = { version = "0.1", optional = true, features = ["local_dynamic_tls"] }
 
 # musllinux wheels: musl's mallocng fails small allocations under
 # multi-threaded fragmentation (#480), the failure the musl CLI binary avoids
 # with mimalloc. The wheel runs the same pipeline, so it gets the same fix.
 [target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = "0.1"
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 
 [lints]
 workspace = true

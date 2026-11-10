@@ -216,8 +216,7 @@ stored max zoom, tiles probed and stopped) and `stopped_tiles` per zoom.
 
 **Refused combinations**, before any output is written: shards and
 `--tile-range`, `--zoom-ceiling` and partial overview files, partitioning
-mode, `--coverage-fill`, extents other than 4096, `--max-tile-size 0` (the
-raw cap bounds each probe), `--polygon-thinning` above 0, a non-default
+mode, `--coverage-fill`, extents other than 4096, `--polygon-thinning` above 0, a non-default
 `--line-thinning`, `--drop-lines`, `--drop-polygons`, and an entry-zoom
 ladder whose rungs the overview omits. `pyramid` does not take
 the flag, and `merge` and `pyramid` refuse an archive that carries the
@@ -1002,7 +1001,8 @@ keep(level)   = min(cell_winner_survivors(level), budget(level))
 
 The canonical level keeps everything (spec §2.4). Levels below their budget
 stay unchanged, typically including coarse zooms where thinning already
-limits counts.
+limits counts. No budget is under 256 features (`MIN_DENSITY_LEVEL_FEATURES`),
+so a level that 256 or fewer features reach is not thinned at all.
 
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
@@ -1035,12 +1035,17 @@ tippecanoe's.
 ### Spatial fairness
 
 `--drop-gamma` protects sparse areas by distributing the budget across
-`128 × GSD` super-cells. Each keeps its highest-priority features up to an
-allocation `∝ population^(1/gamma)`. Water-filling reallocates unused
+`128 × GSD` super-cells, laid on a Web Mercator grid whatever the input's
+CRS. Each keeps its highest-priority features up to an allocation
+`∝ population^(1/gamma)`. Water-filling reallocates unused
 capacity so no cell gets more than it has:
 
 - `gamma = 1` is a proportional cut: every neighborhood keeps the same
-  fraction.
+  fraction. A cell whose share is under one feature still keeps one at that
+  rate: the shares are summed in Z-order and rounded as they go, so one
+  cell in five keeps its feature at a share of 0.2. A cell's share counts
+  what coarser levels already kept there, so rounding at each level cannot
+  add up to an empty cell (#850).
 - `gamma > 1` is **sublinear**: dense neighborhoods keep proportionally fewer
   features, and sparse ones proportionally more.
 
@@ -1048,6 +1053,12 @@ This is tippecanoe's `-g` gamma dot-dropping ("reduce dots to the `1/gamma`
 power in dense areas"), applied per super-cell. `--drop-gamma` does **not**
 change per-level totals. It only redistributes *which* features survive
 spatially, so it is independent of `--drop-rate`.
+
+A tile the budget would leave empty keeps one feature, the best of its
+first super-cell, as tippecanoe keeps the first feature of every tile
+whatever its drop rate (#850). "Tile" here is 8 × 8 super-cells, one tile
+at the default `--gsd-base`. These features come on top of the level's
+budget.
 
 Points often stay below the budget because `--point-thinning` (default 4)
 already removes many, as with New York City points of interest. Changing
@@ -1467,6 +1478,61 @@ reject zero extents.
 
 The MVT spec recommends a power of two, which decoders assume for coordinate
 precision. Other positive values are accepted with a warning.
+
+---
+
+## Tile format: `--tile-format`, `--mlt-profile`
+
+MLT (MapLibre Tile) is a columnar vector-tile format. MapLibre GL JS 5.12 or
+later and MapLibre Native decode it.
+
+Other clients (Mapbox GL, OpenLayers, older GL JS) need MVT. MVT stays the
+default.
+
+Use `--tile-format mlt` on `tiles`, `export-pmtiles` and `pyramid`, or
+Python's `tile_format='mlt'` on `convert()`, `export_pmtiles()` and
+`pyramid()`.
+
+Each tile is built as MVT, then converted with `mlt-core` before the size
+caps and gzip.
+
+Non-default `--mlt-profile` values need `--tile-format mlt`:
+
+| Value | Use |
+|-------|-----|
+| `web` (default) | For GL JS before 6.0, whose `@maplibre/mlt` 1.1 decoder reads no FastPFOR, FSST or shared dictionaries. Integer columns wider than 32 bits become doubles when every value is exact (absolute value at most 2^53), since GL JS reads 64-bit integers as BigInt. |
+| `native` | MapLibre Native, every codec and stored polygon triangles. |
+| `min-size` | Smallest tiles. |
+| `diffable` | Small binary diffs between releases. |
+| `fast-encoding` | Quickest encode, larger tiles. |
+
+No profile reorders features, so `--feature-order` holds.
+
+Measured on tylertoo's real-data fixtures, archives were 10% smaller for
+Madagascar admin-4 polygons (125.5 MB to 113.2 MB), 20% for road-detection
+lines and 28% for a two-band pyramid. Export wall time was about 5–10%
+longer.
+
+The size caps measure MLT bytes, so a tile near the cap keeps more features
+than its MVT would. Thinning can differ from an MVT build.
+
+`merge` refuses to combine MVT and MLT archives. Pyramid bands must all
+match `--tile-format`.
+
+MLT archives use PMTiles tile type 6 and metadata format `mlt`. `stats
+--layers` and `decode` read MLT archives.
+
+CLI:
+
+```bash
+tylertoo tiles admin.parquet admin.pmtiles --tile-format mlt
+```
+
+Python:
+
+```python
+tylertoo.convert('admin.parquet', 'admin.pmtiles', tile_format='mlt')  # notest: needs your own admin.parquet
+```
 
 ---
 

@@ -39,6 +39,22 @@ pub(crate) fn write_input(
     covering: bool,
     extra_col: Option<&str>,
 ) {
+    let extra = extra_col.map(|col| {
+        (
+            Field::new(col, DataType::Int32, false),
+            Arc::new(Int32Array::from(vec![0i32; geoms.len()])) as Arc<dyn Array>,
+        )
+    });
+    write_input_columns(path, geoms, covering, extra.into_iter().collect());
+}
+
+/// [`write_input`] with `extra` property columns after `id` and `name`.
+pub(crate) fn write_input_columns(
+    path: &Path,
+    geoms: &[Option<Geometry<f64>>],
+    covering: bool,
+    extra: Vec<(Field, Arc<dyn Array>)>,
+) {
     let n = geoms.len();
     let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
     let name = StringArray::from((0..n).map(|i| format!("f{i}")).collect::<Vec<_>>());
@@ -54,9 +70,9 @@ pub(crate) fn write_input(
         Arc::new(Field::new("name", DataType::Utf8, false)),
     ];
     let mut columns: Vec<Arc<dyn Array>> = vec![Arc::new(id), Arc::new(name)];
-    if let Some(col) = extra_col {
-        fields.push(Arc::new(Field::new(col, DataType::Int32, false)));
-        columns.push(Arc::new(Int32Array::from(vec![0i32; n])));
+    for (field, column) in extra {
+        fields.push(Arc::new(field));
+        columns.push(column);
     }
     fields.push(Arc::new(geom_field));
     columns.push(geom_arr.to_array_ref());
@@ -104,12 +120,23 @@ pub(crate) fn write_input_with_f64_row_groups(
     values: &[f64],
     rg_rows: Option<usize>,
 ) {
-    use arrow_array::Float64Array;
+    let attr = arrow_array::Float64Array::from(values.to_vec());
+    write_input_with_column(path, geoms, column, Arc::new(attr), rg_rows);
+}
+
+/// [`write_input_with_f64_row_groups`] with any attribute array: one value
+/// per geometry, typed as the array is.
+pub(crate) fn write_input_with_column(
+    path: &Path,
+    geoms: &[Option<Geometry<f64>>],
+    column: &str,
+    attr: Arc<dyn Array>,
+    rg_rows: Option<usize>,
+) {
     use tylertoo_io::test_support::WriterProperties;
 
-    assert_eq!(geoms.len(), values.len(), "one value per geometry");
+    assert_eq!(geoms.len(), attr.len(), "one value per geometry");
     let id = Int64Array::from((0..geoms.len() as i64).collect::<Vec<_>>());
-    let attr = Float64Array::from(values.to_vec());
 
     let typ = GeometryType::new(Default::default());
     let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
@@ -119,10 +146,10 @@ pub(crate) fn write_input_with_f64_row_groups(
 
     let schema = Arc::new(Schema::new(vec![
         Arc::new(Field::new("id", DataType::Int64, false)),
-        Arc::new(Field::new(column, DataType::Float64, true)),
+        Arc::new(Field::new(column, attr.data_type().clone(), true)),
         Arc::new(geom_field),
     ]));
-    let columns: Vec<Arc<dyn Array>> = vec![Arc::new(id), Arc::new(attr), geom_arr.to_array_ref()];
+    let columns: Vec<Arc<dyn Array>> = vec![Arc::new(id), attr, geom_arr.to_array_ref()];
     let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
 
     let gpq_options = GeoParquetWriterOptionsBuilder::default()
@@ -164,12 +191,24 @@ pub(crate) fn write_multi_rg_input_with_crs(
     crs_metadata: Option<geoarrow::datatypes::Metadata>,
 ) {
     use geo::Point;
-    use tylertoo_io::test_support::WriterProperties;
 
     let geoms: Vec<Geometry<f64>> = coords
         .iter()
         .map(|&(x, y)| Geometry::Point(Point::new(x, y)))
         .collect();
+    write_one_row_groups(path, &geoms, with_covering, crs_metadata);
+}
+
+/// One row group per geometry, with `id` = row-group index (#546: line
+/// chains that span row groups).
+pub(crate) fn write_one_row_groups(
+    path: &Path,
+    geoms: &[Geometry<f64>],
+    with_covering: bool,
+    crs_metadata: Option<geoarrow::datatypes::Metadata>,
+) {
+    use tylertoo_io::test_support::WriterProperties;
+
     let n = geoms.len();
     let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
     let typ = match crs_metadata {

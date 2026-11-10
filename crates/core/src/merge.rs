@@ -177,10 +177,10 @@ pub fn merge_shards(
         .map(|p| ArchiveIndex::open(p))
         .collect::<Result<_>>()?;
 
-    // Tile type is validated (and must be MVT, which is all the writer can
-    // stamp); compression is validated AND adopted, since the merged header
-    // has to declare whatever the copied bodies actually are.
-    let tile_compression = check_inputs_agree(&indexes)?;
+    // Tile type (MVT or MLT) and compression are validated AND adopted,
+    // since the merged header has to declare whatever the copied bodies
+    // actually are.
+    let (tile_type, tile_compression) = check_inputs_agree(&indexes)?;
 
     // Computed once and reused: the same "did this input contribute anything"
     // question decides the zoom union AND which layer declarations are folded
@@ -225,6 +225,7 @@ pub fn merge_shards(
     }
     .map_err(|e| WriteError::io("create streaming writer", e))?;
     writer.set_metadata(publication.metadata.clone());
+    writer.set_tile_type(tile_type);
     // The k-way heap emits ids in ascending order, so the merge is clustered
     // by construction; #506's hook turns that doc claim into a checked
     // contract (debug assertion per add, release warn at finalize).
@@ -372,7 +373,7 @@ fn at(idx: &ArchiveIndex, e: Error) -> Error {
 /// copies bodies verbatim under one header that declares both for all of
 /// them. Mirrors the pyramid's up-front checks; the mismatch names both
 /// archives, because "these disagree" is unactionable without knowing which.
-fn check_inputs_agree(indexes: &[ArchiveIndex]) -> Result<Compression> {
+fn check_inputs_agree(indexes: &[ArchiveIndex]) -> Result<(TileType, Compression)> {
     // #803: a variable-depth archive's missing tiles mean "draw the stored
     // ancestor"; merged with another archive's tiles there, they would not.
     if let Some(idx) = indexes.iter().find(|idx| idx.is_variable_depth()) {
@@ -404,16 +405,15 @@ fn check_inputs_agree(indexes: &[ArchiveIndex]) -> Result<Compression> {
             .into());
         }
     }
-    // The writer stamps `TileType::Mvt` into the header it assembles, so an
-    // agreed-on non-MVT set would still come out mislabelled.
-    if tile_type != TileType::Mvt {
+    // Concatenating disjoint tile sets is only defined for vector tiles.
+    if !matches!(tile_type, TileType::Mvt | TileType::Mlt) {
         return Err(InvalidConfigError::MergeNotMvt {
             path: first.path().to_path_buf(),
             tile_type,
         }
         .into());
     }
-    Ok(compression)
+    Ok((tile_type, compression))
 }
 
 /// The error for a tile id claimed twice, naming both sides.
@@ -1291,6 +1291,7 @@ mod tests {
             &TilesetMetadata::new()
                 .with_name("Parks")
                 .with_attribution("NPS"),
+            crate::TileFormat::Mvt,
         )
         .unwrap();
         let out = dir.path().join("out.pmtiles");

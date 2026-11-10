@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -217,13 +218,18 @@ def test_batch_bounds_are_accepted_before_missing_input(
 
 
 def test_variable_depth_refusals_are_config_errors(tmp_path: Path) -> None:
-    # #803: what the stop rule cannot see, and a probe with no raw cap.
+    # #803: what the stop rule cannot see.
     with pytest.raises(tylertoo.ConfigError, match="polygon-thinning"):
         _convert(tmp_path, variable_depth=True, polygon_thinning=0.5)
-    with pytest.raises(tylertoo.ConfigError, match="max-tile-size 0"):
+
+
+@pytest.mark.parametrize("options", [{"tile_size_limit": 0}, {"preset": "tippecanoe"}])
+def test_variable_depth_takes_no_raw_cap(
+    tmp_path: Path, options: dict[str, Any]
+) -> None:
+    # #849: the tippecanoe preset sets no raw cap; the probe bounds itself.
+    with pytest.raises(RuntimeError) as raised:
         tylertoo.export_pmtiles(
-            MISSING,
-            str(tmp_path / "out.pmtiles"),
-            variable_depth=True,
-            tile_size_limit=0,
+            MISSING, str(tmp_path / "out.pmtiles"), variable_depth=True, **options
         )
+    assert not isinstance(raised.value, tylertoo.ConfigError)

@@ -119,6 +119,8 @@ pub enum TileType {
     Jpeg = 3,
     Webp = 4,
     Avif = 5,
+    /// MapLibre Tile (#823).
+    Mlt = 6,
 }
 
 // Compression enum is now imported from crate::compression
@@ -259,7 +261,7 @@ impl Header {
 impl TileType {
     /// Parse a PMTiles spec byte code back into a tile type (byte 99).
     ///
-    /// Returns `None` for codes outside the PMTiles v3 spec (0-5).
+    /// Returns `None` for codes outside the PMTiles v3 spec (0-6).
     #[doc(hidden)]
     pub fn from_code(code: u8) -> Option<Self> {
         match code {
@@ -269,6 +271,7 @@ impl TileType {
             3 => Some(TileType::Jpeg),
             4 => Some(TileType::Webp),
             5 => Some(TileType::Avif),
+            6 => Some(TileType::Mlt),
             _ => None,
         }
     }
@@ -1428,9 +1431,15 @@ fn metadata_json(
     vector_layers: &str,
     tilestats_json: &str,
     publication: &TilesetMetadata,
+    tile_type: TileType,
 ) -> String {
+    let format = if tile_type == TileType::Mlt {
+        "mlt"
+    } else {
+        "pbf"
+    };
     let mut json = format!(
-        r#"{{"vector_layers":{},{}"format":"pbf","generator":"tylertoo""#,
+        r#"{{"vector_layers":{},{}"format":"{format}","generator":"tylertoo""#,
         vector_layers, tilestats_json
     );
     publication.append_json_fields(&mut json);
@@ -1600,6 +1609,8 @@ pub struct StreamingPmtilesWriter {
     /// layer `layer_name`/`fields` can describe (a merged band pyramid). When
     /// set it replaces the single-layer entry the writer would otherwise build.
     vector_layers_json: Option<String>,
+    /// The header's tile type and the metadata's `format`: MVT unless set.
+    tile_type: TileType,
     /// Per-layer `tilestats` entries that replace the single-layer one
     /// ([`Self::set_layer_stats`]).
     layer_stats: Option<Vec<(String, u64, usize)>>,
@@ -1913,6 +1924,7 @@ impl StreamingPmtilesWriter {
             layer_name: "layer".to_string(),
             fields: HashMap::new(),
             vector_layers_json: None,
+            tile_type: TileType::Mvt,
             layer_stats: None,
             metadata: TilesetMetadata::default(),
             tile_compression: compression,
@@ -2111,6 +2123,13 @@ impl StreamingPmtilesWriter {
     /// [`Self::set_layer_name`] describe.
     pub fn set_metadata(&mut self, metadata: TilesetMetadata) {
         self.metadata = metadata;
+    }
+
+    /// Set the tile type stamped in the header, and the metadata `format`
+    /// that names it (`pbf` for MVT, `mlt` for MapLibre Tiles). Default
+    /// [`TileType::Mvt`].
+    pub fn set_tile_type(&mut self, tile_type: TileType) {
+        self.tile_type = tile_type;
     }
 
     /// Replace the whole `vector_layers` array with a verbatim JSON array.
@@ -2684,7 +2703,7 @@ impl StreamingPmtilesWriter {
             clustered: sections.clustered,
             internal_compression: self.internal_compression,
             tile_compression: self.tile_compression,
-            tile_type: TileType::Mvt,
+            tile_type: self.tile_type,
             // DIVERGENCE FROM TIPPECANOE: header zoom range = actual tiles.
             // Tippecanoe stamps the requested -Z/-z range in the header even
             // when the coarse zooms are empty (golden
@@ -2938,7 +2957,12 @@ impl StreamingPmtilesWriter {
             }
         };
 
-        let mut json = metadata_json(&vector_layers, &tilestats_json, &self.metadata);
+        let mut json = metadata_json(
+            &vector_layers,
+            &tilestats_json,
+            &self.metadata,
+            self.tile_type,
+        );
         if let Some(max_zoom) = self.variable_depth {
             json.pop();
             json.push_str(&format!(

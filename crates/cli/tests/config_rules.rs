@@ -114,7 +114,7 @@ fn tiles_surfaces_every_core_rule() {
             &["--keep-overview", "/nonexistent/tylertoo-779/o.parquet"][..],
             "does not exist",
         ),
-        // #803: what rule A′ cannot see, and a probe with no raw cap.
+        // #803: what rule A′ cannot see.
         (
             &[
                 "--generate-variable-depth-tile-pyramid",
@@ -122,14 +122,6 @@ fn tiles_surfaces_every_core_rule() {
                 "0.5",
             ][..],
             "--polygon-thinning above 0",
-        ),
-        (
-            &[
-                "--generate-variable-depth-tile-pyramid",
-                "--max-tile-size",
-                "0",
-            ][..],
-            "--max-tile-size 0",
         ),
         // #821: what a per-layer run cannot honour. The CLI reads a
         // --shard-plan before core sees it, so core's own test covers --shard.
@@ -207,6 +199,26 @@ fn unreadable_input_is_a_runtime_error() {
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("missing.parquet"), "{stderr}");
     assert!(!output.exists());
+}
+
+/// #849: the tippecanoe preset sets no raw cap, and variable depth used to
+/// refuse that as a `--max-tile-size 0` nobody passed.
+#[test]
+fn tippecanoe_preset_builds_a_variable_depth_pyramid() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.pmtiles");
+    let (ok, stderr) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        output.to_str().unwrap(),
+        "--max-zoom",
+        "6",
+        "--preset",
+        "tippecanoe",
+        "--generate-variable-depth-tile-pyramid",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(output.exists());
 }
 
 /// The output preflight is one core rule for every command (#427, #551).

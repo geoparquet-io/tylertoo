@@ -242,12 +242,11 @@ verbatim (spec §2.4).
    pass alone was 53 s of a 79 s run. The hint stays exactly what the
    count-only pass produced (`chains.len()`, before simplification drops
    anything), and tables for levels a zoom ceiling will not materialize are
-   dropped rather than carried; pass 2 rebuilds any level whose table is
-   missing, so the ceiling predicate is a caching decision, never a
-   correctness one. The `--plan` path skips pass 1 entirely and pass 2 builds
-   the tables itself, as before. `--plan-only` has no pass 2, so it counts
-   the chains without simplifying or keeping them; the counts, and so the
-   plan artifact, are the same. The levels run in parallel waves sized
+   dropped rather than carried, unless a plan is being saved: the plan
+   carries every level's table, not the line scratch they came from (#546),
+   so the line scratch is freed as soon as the chain stage ends. The `--plan`
+   path skips pass 1 and the chain stage entirely and takes the plan's
+   tables; a missing table is an error, never a rebuild. The levels run in parallel waves sized
    against the profile's pass-1 memory budget (`chain_stage_wave`), since
    each level's chain stage spans the whole line scratch and pass 1 runs
    levels that turn out empty, which pass 2 used to skip. Wave size changes
@@ -853,12 +852,14 @@ write a valid tile-less archive (`export::write_empty_archive`) and exit 0;
 `merge` excludes a tile-less input from the zoom union, the bounds union and
 the layer declarations alike.
 
-**v1 restriction: line coalescing.** A coalesced chain is a new geometry
-spanning every row it merged, which no single input row group's bbox bounds.
-The shard holding the chain's row would emit tiles past its range while its
-neighbour emitted none — a gap at the seam. A shard against a plan carrying
-chains is refused, naming `--no-coalesce-lines`. Clustering, accumulation and
-tiny-polygon carriers are supported: each keys off one input row whose own
+**Line coalescing (#546).** A coalesced chain is a new geometry spanning
+every row it merged, carrying its rep row's attributes, so no single input
+row group's bbox bounds it. The plan carries the chain tables the coarse
+job built (the tables a monolithic run builds). Each data shard keeps the
+levels it exports, widens its read selection with the row groups holding
+the reps of the chains whose bbox reaches its read window, and keeps every
+chain whose rep it reads. It runs no chain stage and holds no line scratch. Clustering,
+accumulation and tiny-polygon carriers each key off one input row whose own
 bbox bounds it, so the row-group argument that makes ordinary features safe
 covers them unchanged.
 
@@ -924,7 +925,8 @@ therefore its band, in the same PR, with the new measurement in the comment.
 | Shared borders (#450) | Each polygon is simplified independently, which leaves thin gaps along shared borders. On dense parcels, these gaps cover about 2% of the area at the default tolerance (Auckland z12: 97.6% drawn, against 99.5% for tippecanoe). To reduce these gaps, lower `--simplify-factor` or set it to `0` (the tile grid snaps shared borders identically); measured curve in `docs/OVERVIEW_TUNING.md` § Coverage and simplification | Same per-feature simplification by default, at 1 tile unit (about a quarter of tylertoo's tolerance), so its slivers are smaller; `-pn` / `--no-simplification-of-shared-nodes` keeps junction nodes and simplifies shared stretches identically | Shared-border simplification is #450 Phase 1, post-1.0; `-pn` is the model, not the deprecated `--detect-shared-borders` |
 | Simplification | RDP, tolerance = factor × level GSD, **cascading** by default (#218) with boolean-overlay validity repair (vertex-capped, #242) | `douglas_peucker` in tile pixel space | Canonical level always verbatim; `--no-cascade` reverts to per-level eps-halving. The RDP kernel (`rdp_coords`, #575) is iterative like tippecanoe's, but keeps `geo`'s split rules: float distances (tippecanoe: integer tile coordinates rounded to 1/16), last-maximum tie-break in index order (tippecanoe: lexicographically smallest vertex, winding-independent), and the `INITIAL_MIN` floor of 2 per line / 4 per ring (tippecanoe: its `retain` count). Both split on a strict `> epsilon` |
 | Density drop rate | `--drop-rate 1.65`, budget anchored on the full canonical count `N` of the kinds it thins; thins **points only** by default (#745). Use `--drop-lines` or `--drop-polygons` to include lines or polygons | `-r`/`--drop-rate` 2.5, anchored on per-tile basezoom count; points only unless `--drop-lines` or `--drop-polygons` is set | Same geometric ladder and the same per-kind default; different anchor ⇒ different numeric default (see `corpus/SWEEPS.md`) |
-| Spatial fairness | `--drop-gamma` per super-cell allocation ∝ population^(1/γ) | gamma dot-dropping in dense areas | Same idea, applied per super-cell so per-level totals are unchanged |
+| Spatial fairness | `--drop-gamma` per super-cell allocation ∝ population^(1/γ) of everything the level keeps, the features coarser levels admitted included; a cell's newcomers get what its share leaves. The shares are summed in Z-order and rounded as they go, so a cell whose share is under one feature keeps one at that rate (#850) | gamma dot-dropping in dense areas; `-g 0` keeps every Nth feature along the quadkey order, carrying the remainder from feature to feature | Same idea, applied per super-cell so per-level totals are unchanged. The running total over Z-ordered cells is tippecanoe's carry at cell grain. A cell whose earlier survivors already pass its share keeps them, takes no newcomer, and the rest of the budget is shared again without it. A tile the budget would empty keeps one feature past the budget, as tippecanoe keeps each tile's first (`tile.cpp`); the tile is 8 × 8 super-cells, one tile only at the default `--gsd-base` |
+| Density budget floor | No level's budget is under `MIN_DENSITY_LEVEL_FEATURES` = 256 features (`assign.rs`), so a level that 256 or fewer budgeted features reach is not thinned | The drop rate applies at any count | Small inputs keep every cell winner at every zoom; a level that small is already limited by cell-winner thinning, and a budget would only fight it |
 | Sub-pixel polygons at coarse zooms | Placeholder squares by default since #745 (`CollapseMode::Auto`: an area-dithered 1×GSD square regardless of `--simplify-factor` (#745), #279, plus the #384 accumulator for polygons the gate and thinning remove; a representative Point under an entry-zoom ladder, #364); `--collapse` → Point (spec Q4), `--no-collapse` → drop | Tiny-polygon reduction ON by default: accumulates dropped area serially per tile, emits placeholder squares | Accumulated per 32×GSD patch of the level, independent of tiles; see `docs/OVERVIEW_TUNING.md` § collapse-square |
 | Per-zoom-band representation (#317) | `--representation "0-7:point,8-14:geom"` (or `…:square`): one run, one archive, representation switches per zoom band; point bands bypass the polygon visibility gate and thin on the point grid | `--convert-polygons-to-label-points` applies at EVERY zoom and emits one label point per intersecting tile; zoom-banded representation needs two tilesets merged with `tile-join` | Overview levels are tile-free (a level is a parquet row band), so a per-tile label point is not representable; we emit one deterministic per-feature centroid and the band replaces the two-archive merge. Point flavor: centroid (with bbox-center → first-vertex fallbacks), matching the existing `--collapse` path; planetiler exposes centroid / point-on-surface / innermost-point per layer, tippecanoe leaves the label-point flavor unspecified |
 | Point clustering | Winner **keeps its own geometry** and absorbs cell losers into `point_count` | Cluster centroid is the mean position | Deliberate: anchor stays a real feature; deterministic |

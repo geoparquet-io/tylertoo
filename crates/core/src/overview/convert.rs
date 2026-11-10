@@ -24,7 +24,6 @@ use std::time::Instant;
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_select::take::take;
-#[cfg(test)]
 use geo::BoundingRect;
 use geo::Geometry;
 use geo_traits::to_geo::ToGeoGeometry;
@@ -1641,16 +1640,21 @@ pub(super) fn warn_plan_skipped_levels(
 /// [`LevelReport`] renumbered to the written count; an empty level (every
 /// candidate collapsed during simplification) warns and records `planned` in
 /// the skipped list instead.
+///
+/// A data shard does not warn about a level below its pivot (`floor`): it
+/// exports none, and its share of one is routinely empty.
 pub(super) fn record_level_outcome(
     outcome: LevelWriteOutcome,
-    planned: SkippedLevelReport,
+    (planned, floor): (SkippedLevelReport, Option<u8>),
     counts: (usize, usize, usize),
     level_reports: &mut Vec<LevelReport>,
     skipped: &mut Vec<SkippedLevelReport>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) {
     let (candidates, rows, vertices) = counts;
+    let owned = planned.zoom.zip(floor).is_none_or(|(z, f)| z >= f);
     match outcome {
+        LevelWriteOutcome::SkippedEmpty if !owned => skipped.push(planned),
         LevelWriteOutcome::SkippedEmpty => {
             diagnostics.warn(format!(
                 "level planned at GSD {:.2} m{} became empty after simplification \
@@ -2323,24 +2327,6 @@ pub enum InvalidOption {
          give every shard that plan with --plan."
     )]
     ShardWithoutPlan,
-    /// A shard whose plan carries coalesced line chains.
-    #[error(
-        "--shard is not supported with line coalescing: {} carries {chains} coalesced line \
-         chain(s). A chain is a NEW geometry spanning every row it merged, so no \
-         single input row group's bbox bounds it — the shard that holds the chain's \
-         row would emit tiles outside its own range while the neighbouring shard, \
-         which never reads that row, would emit none, leaving a gap at the seam. \
-         Re-run the whole fleet (including the coarse job, so the plan matches) with \
-         --no-coalesce-lines.",
-        plan.display()
-    )]
-    #[non_exhaustive]
-    ShardWithCoalescedLines {
-        /// The plan file.
-        plan: PathBuf,
-        /// Coalesced chains it carries.
-        chains: usize,
-    },
     /// `--max-zoom auto` with an explicit GSD ladder.
     #[error("--max-zoom auto needs a zoom-range level plan, not an explicit GSD list")]
     AutoMaxZoomNeedsZoomRange,
@@ -4256,7 +4242,7 @@ use crate::tile::WEBMERC_HALF_M;
 /// clamped to [`crate::tile::MAX_LATITUDE`], the edge of the square
 /// world extent (the projection itself diverges at the poles).
 #[inline]
-fn lnglat_to_webmerc(lng: f64, lat: f64) -> (f64, f64) {
+pub(crate) fn lnglat_to_webmerc(lng: f64, lat: f64) -> (f64, f64) {
     use crate::tile::MAX_LATITUDE;
     use std::f64::consts::{FRAC_PI_4, PI};
     let x = lng / 180.0 * WEBMERC_HALF_M;
@@ -4472,7 +4458,6 @@ pub(super) fn pruning_label(bbox: bool, filter: bool) -> &'static str {
 }
 
 /// `[xmin, ymin, xmax, ymax]` of a geometry (`[0;4]` when the bbox is undefined).
-#[cfg(test)]
 pub(super) fn geometry_bbox(g: &Geometry<f64>) -> [f64; 4] {
     match g.bounding_rect() {
         Some(r) => [r.min().x, r.min().y, r.max().x, r.max().y],
@@ -6607,21 +6592,8 @@ pub(super) fn coalesce_level_chains<'e>(
 /// ([`coalesce_level_chains`]), then simplify each surviving chain for the
 /// level. Chains that degenerate during simplification are dropped (default
 /// knobs never hit this: the 2×GSD gate is stricter than the 1×GSD simplify
-/// drop gate).
-pub(super) fn build_level_coalesce_table(
-    lines: &ExactChains<'_>,
-    level: usize,
-    finest: usize,
-    gsd_m: f64,
-    crs: Crs,
-    options: &ConvertOptions,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> CoalesceTable {
-    build_level_coalesce_table_and_hint(lines, level, finest, gsd_m, crs, options, diagnostics).0
-}
-
-/// [`build_level_coalesce_table`] plus the level's PRE-simplification chain
-/// count — the streaming engine's `level_row_hint` for the level.
+/// drop gate). Also returns the level's PRE-simplification chain count — the
+/// streaming engine's `level_row_hint` for the level.
 ///
 /// The two used to come from two separate runs of the whole chain stage: the
 /// hint from a count-only pass in `resolve_winner_tables` (which needs it
@@ -14036,6 +14008,148 @@ mod tests {
 
     /// Fixture writers shared with `overview::stream`'s tests (#422).
     use super::super::testutil::{write_multi_rg_input, write_multi_rg_input_with_crs};
+
+    /// One 1-degree segment per row group along lat 10, from lng -60 to 60
+    /// (one chain at the coarse levels, its rep far west of a z4 shard at
+    /// lng 22.5..45), and the plan a coarse job capped at z3 saves for it.
+    fn coarse_plan_over_one_chain() -> (tempfile::TempDir, PathBuf, LevelPlan, PathBuf) {
+        use geo::{coord, LineString};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        let segments: Vec<Geometry<f64>> = (-60..60)
+            .map(|x| {
+                let x = f64::from(x);
+                Geometry::LineString(LineString::new(vec![
+                    coord! { x: x, y: 10.0 },
+                    coord! { x: x + 1.0, y: 10.0 },
+                ]))
+            })
+            .collect();
+        super::super::testutil::write_one_row_groups(&input, &segments, true, None);
+        let levels = LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 6,
+        };
+        let plan = dir.path().join("convert.plan");
+        convert_to_overviews(
+            &input,
+            dir.path().join("coarse.parquet"),
+            &ConvertOptions {
+                levels: levels.clone(),
+                zoom_ceiling: Some(3),
+                save_plan: Some(plan.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (dir, input, levels, plan)
+    }
+
+    /// #546 review: a data shard whose coalesced chains widen its read
+    /// selection must build the same overview from the eager (test-only)
+    /// input as from the stream. The chain's rep lies in a row group west of,
+    /// and before, the ones the shard's window selects.
+    #[test]
+    fn shard_chain_widening_matches_on_eager_and_streaming_input() {
+        let (dir, input, levels, plan) = coarse_plan_over_one_chain();
+        // The z4 tile over lng 22.5..45: its window (two pivot tiles of
+        // margin) stops at lng -22.5.
+        let id = crate::pmtiles_writer::tile_id(4, 9, 7);
+        let shard = ConvertOptions {
+            levels,
+            plan: Some(plan),
+            shard: Some(crate::shard::TileRange::new(4, id, id).unwrap()),
+            ..Default::default()
+        };
+        let build = |eager: bool| {
+            let out = dir.path().join(format!("shard-{eager}.parquet"));
+            super::super::source::with_eager_input(eager, || {
+                convert_to_overviews(&input, &out, &shard).unwrap()
+            });
+            let reader = OverviewReader::open(&out).unwrap();
+            (0..reader.num_levels())
+                .flat_map(|l| reader.read_level(l, None).unwrap().map(|b| b.unwrap()))
+                .collect::<Vec<RecordBatch>>()
+        };
+        let streaming = build(false);
+        let chains = streaming
+            .iter()
+            .filter_map(|b| b.column_by_name("coalesced_count"))
+            .flat_map(|c| {
+                c.as_any()
+                    .downcast_ref::<arrow_array::Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .filter(|&n| n > 1)
+            .count();
+        assert!(chains > 0, "the shard must carry merged chains");
+        assert_eq!(build(true), streaming);
+        // Levels below the pivot are not the shard's to export, so their
+        // emptiness is not the shard's to warn about.
+        let report = convert_to_overviews(&input, dir.path().join("s.parquet"), &shard).unwrap();
+        let empty: Vec<&String> = report
+            .diagnostics
+            .iter()
+            .filter_map(|d| match d {
+                crate::diagnostics::Diagnostic::Advisory { message, .. }
+                    if message.contains("became empty") =>
+                {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(empty.is_empty(), "{empty:#?}");
+    }
+
+    /// A data shard takes its coalesce chains from the plan instead of
+    /// rebuilding them from the whole dataset's lines (#546 review: the
+    /// rebuild cost every shard 70–100% of a single machine's peak). A
+    /// count planted in the plan comes out in the shard's output.
+    #[test]
+    fn shard_takes_its_chains_from_the_plan() {
+        let (dir, input, levels, plan_path) = coarse_plan_over_one_chain();
+        let mut plan = super::super::plan_state::ConvertPlan::load(&plan_path).unwrap();
+        let chains = plan.chains.as_mut().expect("the plan carries the chains");
+        assert!(
+            chains.entries.iter().any(|c| c.level >= 4),
+            "chains above the coarse job's ceiling are saved too"
+        );
+        for c in &mut chains.entries {
+            c.count = 777;
+        }
+        plan.save(&plan_path).unwrap();
+
+        let id = crate::pmtiles_writer::tile_id(4, 9, 7);
+        let out = dir.path().join("shard.parquet");
+        convert_to_overviews(
+            &input,
+            &out,
+            &ConvertOptions {
+                levels,
+                plan: Some(plan_path),
+                shard: Some(crate::shard::TileRange::new(4, id, id).unwrap()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let reader = OverviewReader::open(&out).unwrap();
+        let counts: Vec<i32> = (0..reader.num_levels())
+            .flat_map(|l| reader.read_level(l, None).unwrap().map(|b| b.unwrap()))
+            .filter_map(|b| b.column_by_name("coalesced_count").cloned())
+            .flat_map(|c| {
+                c.as_any()
+                    .downcast_ref::<arrow_array::Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(counts.contains(&777), "{counts:?}");
+    }
 
     /// Read all ids from all levels of an overview file.
     fn read_all_ids(reader: &OverviewReader) -> Vec<i64> {

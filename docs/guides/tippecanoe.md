@@ -74,11 +74,11 @@ Values are from tippecanoe v2.82.0 (`main.cpp`, `tile.cpp`, `geometry.cpp`).
 | Option | tylertoo default | With the preset | tippecanoe source |
 |---|---|---|---|
 | `--drop-rate` (convert) | 1.65 | 2.5 | `-r`, `droprate = 2.5` |
-| `--drop-gamma` (convert) | 1.5 | 1 | `-g`, `gamma = 0` ("no effect"). tylertoo's 1 also thins every neighborhood by the same share |
+| `--drop-gamma` (convert) | 1.5 | 1 | `-g`, `gamma = 0` ("no effect"). tylertoo's 1 also thins every neighborhood by the same share. In both tools a tile the drop rate would empty keeps one feature |
 | `--simplify-factor` (convert) | 1 | 0.25 | `-S`, `simplification = 1`: one tile unit at detail 12 (4096). A tile unit is a quarter GSD at the default `--gsd-base 1024` |
 | `--tile-buffer` (export) | 8 | 5 | `-b`, `buffer = 5` screen pixels, 1/256 of a tile |
 | `--max-compressed-tile-size` (export) | 500K (512,000 bytes) | 500,000 bytes | `-M`, `max_tile_size = 500000` |
-| `--max-tile-size` (export) | 2M | 0 (no cap) | tippecanoe does not cap the uncompressed tile |
+| `--max-tile-size` (export) | 2M | 0 (no cap) | tippecanoe does not cap the uncompressed tile. A variable-depth pyramid still ends no branch on a tile over 2M; that tile is drawn at the usual depth |
 | `--size-valve` (export) | `merge` | `drop` | See below |
 
 tippecanoe has no default size valve. An oversized tile is retried at
@@ -113,6 +113,10 @@ Differences the preset does not remove:
   tylertoo does not simplify the maximum zoom.
 - **Feature count cap.** tippecanoe also caps a tile at 200,000 features
   (`-O`). tylertoo has no feature count cap.
+- **Small inputs are not thinned.** The drop rate never cuts a zoom below
+  256 features of the kinds it thins, so an input of 256 points or fewer
+  keeps every point that wins a cell at every zoom. tippecanoe applies its
+  drop rate at any count.
 
 ## What only tylertoo does
 

@@ -201,6 +201,7 @@ fn fit_payload() -> TileMvt {
         quantized: 0,
         oversized: true,
         valve: ValveTally::default(),
+        mlt_error: None,
     }
 }
 
@@ -262,4 +263,24 @@ fn tile_fit_reuses_only_unchanged_bytes_and_rechecks_active_limits() {
         missing_calls, 1,
         "a missing cache uses the normal compression path"
     );
+}
+
+/// #823: a tile whose MVT did not convert to MLT fails the export with a
+/// runtime error, at the fit check and at the write, instead of a panic.
+#[test]
+fn an_mlt_conversion_failure_is_an_export_error() {
+    use crate::error::{Classify, ErrorKind};
+    let failed = || TileMvt {
+        data: Vec::new().into(),
+        mlt_error: Some("bad layer".into()),
+        ..fit_payload()
+    };
+    let opts = ExportOptions::default();
+    let err = tile_fit(&mut failed(), &opts).unwrap_err();
+    assert!(matches!(err, ExportError::MltConversion { .. }), "{err}");
+    let Err(err) = encoded_tile(0, 0, failed(), FillTally::default()) else {
+        panic!("a failed conversion was written");
+    };
+    assert_eq!(err.kind(), ErrorKind::Runtime);
+    assert!(err.to_string().contains("bad layer"), "{err}");
 }

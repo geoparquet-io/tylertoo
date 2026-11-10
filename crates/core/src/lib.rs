@@ -136,6 +136,7 @@ mod sutherland_hodgman;
 #[cfg(test)]
 pub(crate) mod test_log;
 mod tile;
+mod tile_format;
 #[cfg(test)]
 mod valve_counter;
 mod wkb;
@@ -201,6 +202,7 @@ pub use overview::config::ValidatedConfig;
 pub use pmtiles_metadata::TilesetMetadata;
 pub use pmtiles_writer::{TileType, WriteError};
 pub use resolved_schema::GeoVersion;
+pub use tile_format::{MltProfile, TileFormat};
 
 #[doc(hidden)]
 /// Implementation detail of the tylertoo CLI and Python bindings; no
@@ -212,6 +214,9 @@ pub use resolved_schema::GeoVersion;
 /// Any release may change or remove any item without a semver bump. The
 /// supported API is the crate root.
 pub mod internal {
+    /// The MLT codec, for tests that decode MLT archives independently.
+    #[cfg(feature = "mlt")]
+    pub use mlt_core;
     pub mod archive_index {
         pub use crate::archive_index::*;
     }
@@ -596,7 +601,8 @@ pub enum InvalidConfigError {
     /// Two merge inputs hold different tile types.
     #[error(
         "inputs disagree on tile type: {} holds {first_type:?} but {} holds {other_type:?}; \
-         merge copies tile bodies verbatim under one header and cannot describe both",
+         merge copies tile bodies verbatim under one header and cannot describe both, so \
+         build every input with the same --tile-format",
         first.display(),
         other.display()
     )]
@@ -630,8 +636,11 @@ pub enum InvalidConfigError {
         /// Its tile compression.
         other_compression: Compression,
     },
-    /// The merge inputs are not MVT archives.
-    #[error("{}: tile type is {tile_type:?}, but merge writes MVT archives", path.display())]
+    /// The merge inputs are not vector tile (MVT or MLT) archives.
+    #[error(
+        "{}: tile type is {tile_type:?}, but merge writes vector tile (MVT or MLT) archives",
+        path.display()
+    )]
     #[non_exhaustive]
     MergeNotMvt {
         /// The first input.

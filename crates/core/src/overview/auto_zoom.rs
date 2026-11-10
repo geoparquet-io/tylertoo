@@ -339,7 +339,7 @@ pub(crate) fn mercator_delta_m(dx: f64, dy: f64, lat_deg: f64, crs: Crs) -> f64 
 
 /// Spread `x`'s low 32 bits so each occupies every other bit of a `u64` —
 /// the bit-interleave building block of a 2D Morton (Z-order) code.
-fn spread_bits(x: u32) -> u64 {
+pub(crate) fn spread_bits(x: u32) -> u64 {
     let mut x = x as u64;
     x = (x | (x << 16)) & 0x0000_FFFF_0000_FFFF;
     x = (x | (x << 8)) & 0x00FF_00FF_00FF_00FF;

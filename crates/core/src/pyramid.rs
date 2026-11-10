@@ -1190,6 +1190,28 @@ fn track_band_bounds(
     }
 }
 
+/// Stamp `writer` with the first band's tile type (MVT or MLT), refusing a
+/// later band whose type differs: one header describes every merged tile.
+fn agree_tile_type(
+    first: &mut Option<TileType>,
+    band: &Band,
+    archive: &BandArchive,
+    writer: &mut StreamingPmtilesWriter,
+) -> Result<(), PyramidError> {
+    let tile_type = archive.index.header().tile_type;
+    match *first.get_or_insert(tile_type) {
+        t if t == tile_type => {
+            writer.set_tile_type(tile_type);
+            Ok(())
+        }
+        t => Err(PyramidError::BandMismatch(format!(
+            "band {}: holds {tile_type:?} tiles but an earlier band holds {t:?}; build every \
+             band with the same --tile-format",
+            band_label(band)
+        ))),
+    }
+}
+
 /// Log a band's skipped-tile count, keyed on the [`RangeFit`]
 /// [`check_band_zoom_range`] accepted it under (#495, corrected for #514).
 ///
@@ -1502,10 +1524,11 @@ impl BandArchive {
             )));
         }
         // The merge concatenates tile bodies at shared zooms, which is only
-        // meaningful for MVT: two PNGs glued together are not a PNG.
-        if header.tile_type != TileType::Mvt {
+        // meaningful for vector tiles: two PNGs glued together are not a PNG.
+        // An MVT or MLT tile is a sequence of layers, so either concatenates.
+        if !matches!(header.tile_type, TileType::Mvt | TileType::Mlt) {
             return Err(PyramidError::BandMismatch(format!(
-                "{}: tile type is {:?}, but a pyramid band must hold MVT tiles",
+                "{}: tile type is {:?}, but a pyramid band must hold MVT or MLT tiles",
                 path.display(),
                 header.tile_type
             )));
@@ -2106,6 +2129,16 @@ fn build_pyramid_validated(
         if *kind == BandSource::Archive {
             let archive = BandArchive::open(&band.input, &band.layer, diagnostics)?;
             check_band_zoom_range(band, &archive, opts.allow_missing_zooms, diagnostics)?;
+            // Before any band is tiled, which would otherwise be wasted on
+            // a merge that refuses the mix.
+            let tile_type = archive.index.header().tile_type;
+            if tile_type != opts.export.tile_format.tile_type() {
+                return Err(PyramidError::BandMismatch(format!(
+                    "band {}: holds {tile_type:?} tiles, but --tile-format is {}",
+                    band_label(band),
+                    opts.export.tile_format
+                )));
+            }
         }
     }
 
@@ -2176,6 +2209,8 @@ fn build_pyramid_validated(
                 min_zoom: band.min_zoom,
                 max_zoom: band.max_zoom,
             },
+            // #801: one memory profile governs the band's convert and export.
+            profile: opts.export.profile,
             ..opts.convert.clone()
         };
         let report = convert_to_overviews(&band.input, &overview, &convert).map_err(|error| {
@@ -2352,6 +2387,10 @@ pub fn merge_bands_with_options(
     merge_prepared_bands(bands, output, options, diagnostics)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one merge with two paths, shared-zoom and disjoint, over the same state"
+)]
 fn merge_prepared_bands(
     bands: &[Band],
     output: &Path,
@@ -2411,6 +2450,7 @@ fn merge_prepared_bands(
     let mut skipped_total = 0usize;
     let mut union: Option<TileBounds> = None;
     let mut bands_without_bounds: Vec<String> = Vec::new();
+    let mut tile_type = None;
 
     if bands_share_zooms(bands) {
         // #385: bands in different layers share zooms, so one tile id can
@@ -2430,6 +2470,7 @@ fn merge_prepared_bands(
         // each archive's tiles; this is the check that catches the mismatch.
         check_shared_zoom_layer_labels(bands, &archives)?;
         for (band, archive) in bands.iter().zip(&archives) {
+            agree_tile_type(&mut tile_type, band, archive, &mut writer)?;
             track_band_bounds(
                 band,
                 archive,
@@ -2592,6 +2633,7 @@ fn merge_prepared_bands(
         // #495: catch a band whose declared range the archive cannot honor
         // before any tile is touched.
         let fit = check_band_zoom_range(band, &archive, allow_missing_zooms, diagnostics)?;
+        agree_tile_type(&mut tile_type, band, &archive, &mut writer)?;
         track_band_bounds(
             band,
             &archive,

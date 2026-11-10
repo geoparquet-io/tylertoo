@@ -115,6 +115,9 @@ def export_pmtiles(
     max_compressed_tile_size: int | Literal["auto"] | None = "auto",
     max_zoom_simplify_factor: float | None = None,
     min_zoom: int | None = None,
+    mlt_profile: Literal[
+        "web", "native", "min-size", "diffable", "fast-encoding"
+    ] = "web",
     name: str | None = None,
     partition_wave: int = 0,
     preset: Literal["tippecanoe"] | None = None,
@@ -123,6 +126,7 @@ def export_pmtiles(
     size_valve: Literal["merge", "drop"] = "merge",
     spill_dir: str | os.PathLike[str] | None = None,
     tile_buffer: int = 8,
+    tile_format: Literal["mvt", "mlt"] = "mvt",
     tile_range: str | None = None,
     tile_size_limit: int | Literal["auto"] | None = "auto",
     zoom_ceiling: int | None = None,
@@ -144,11 +148,16 @@ def pyramid(
     include_properties: Sequence[str] | None = None,
     max_compressed_tile_size: int | Literal["auto"] | None = "auto",
     max_zoom_simplify_factor: float | None = None,
+    mlt_profile: Literal[
+        "web", "native", "min-size", "diffable", "fast-encoding"
+    ] = "web",
     name: str | None = None,
     partition_wave: int = 0,
+    profile: Literal["auto", "speed", "bounded"] = "auto",
     simple_clip_fastpath: bool = True,
     size_valve: Literal["merge", "drop"] = "merge",
     tile_buffer: int = 8,
+    tile_format: Literal["mvt", "mlt"] = "mvt",
     tile_size_limit: int | Literal["auto"] | None = "auto",
     work_dir: str | os.PathLike[str] | None = None,
 ) -> PyramidReport: ...
@@ -222,6 +231,9 @@ def convert(
     magnitude_ladder: str | None = None,
     max_compressed_tile_size: int | Literal["auto"] | None = "auto",
     max_zoom_simplify_factor: float | None = None,
+    mlt_profile: Literal[
+        "web", "native", "min-size", "diffable", "fast-encoding"
+    ] = "web",
     name: str | None = None,
     no_auto_rank: bool = False,
     no_collapse: bool = False,
@@ -243,6 +255,7 @@ def convert(
     sort_direction: Literal["desc", "asc"] = "desc",
     sort_key: str | None = None,
     tile_buffer: int = 8,
+    tile_format: Literal["mvt", "mlt"] = "mvt",
     tile_range: str | None = None,
     verbatim: bool = False,
 ) -> ConvertReport: ...

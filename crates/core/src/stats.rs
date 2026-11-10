@@ -285,7 +285,7 @@ fn layer_stats(
     bodies: BTreeMap<(u64, u32), Vec<(u8, u64)>>,
 ) -> Result<Vec<LayerStats>> {
     let header = archive.header();
-    if header.tile_type != TileType::Mvt {
+    if !matches!(header.tile_type, TileType::Mvt | TileType::Mlt) {
         return Err(ArchiveError::Header(format!(
             "per-layer stats need vector tiles; this archive holds {:?} tiles",
             header.tile_type
@@ -370,7 +370,21 @@ fn decode_body(archive: &ArchiveIndex, offset: u64, length: u32) -> Result<Vec<(
     let raw = archive.read_range(start..start + length as usize)?;
     let plain = decompress_capped(&raw, header.tile_compression, MAX_TILE_BYTES)
         .map_err(|e| fail(e.to_string()))?;
-    Ok(mvt_layers(&plain).map_err(fail)?)
+    if header.tile_type != TileType::Mlt {
+        return Ok(mvt_layers(&plain).map_err(fail)?);
+    }
+    // An MLT layer's bytes are its MLT bytes; its features are read back
+    // through the MVT it converts to.
+    let mut layers = Vec::new();
+    for (mvt, mlt_len) in crate::tile_format::mlt_to_mvt_layers(&plain).map_err(fail)? {
+        layers.extend(
+            mvt_layers(&mvt)
+                .map_err(fail)?
+                .into_iter()
+                .map(|(l, _)| (l, mlt_len)),
+        );
+    }
+    Ok(layers)
 }
 
 /// The layers of an uncompressed MVT, each with its length on the wire.
