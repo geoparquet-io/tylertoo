@@ -645,6 +645,29 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_geoparquet_mask_with_an_empty_or_non_finite_row() {
+        let valid: Geometry<f64> = wkt!(POLYGON((0.0 0.0,1.0 0.0,1.0 1.0,0.0 0.0))).into();
+        let non_finite: Geometry<f64> = Polygon::new(
+            LineString::from(vec![(0.0, 0.0), (f64::NAN, 0.0), (1.0, 1.0), (0.0, 0.0)]),
+            vec![],
+        )
+        .into();
+        let empty: Geometry<f64> = Polygon::new(LineString::new(vec![]), vec![]).into();
+        for bad in [non_finite, empty] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("m.parquet");
+            crate::overview::testutil::write_input(
+                &path,
+                &[Some(valid.clone()), Some(bad)],
+                false,
+                None,
+            );
+            let err = load(&MaskSource::Path(path)).unwrap_err().to_string();
+            assert!(err.contains("empty or non-finite"), "{err}");
+        }
+    }
+
+    #[test]
     fn loads_wkb_without_a_crs() {
         let wkb =
             crate::wkb::geometry_to_wkb(&wkt!(POLYGON((0.0 0.0,1.0 0.0,1.0 1.0,0.0 0.0))).into())
