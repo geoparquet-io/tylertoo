@@ -290,11 +290,16 @@ def ratio_failures(cells: dict) -> list[str]:  # noqa: D103
     return bad
 
 
+def cell_phases(cell: str) -> tuple[str, ...]:
+    """The phases `cell` measures: pass 2 only on `tiles`."""
+    return CORE_PHASES if CELLS[cell][1] == "moldova" else ("export/levels",)
+
+
 def missing_telemetry(cell: str, s: dict) -> list[str]:
     """What a complete record of `cell` lacks: each phase the cell measures
-    (pass 2 only on `tiles`) in every round, and at LOW_THREADS too for a
+    in every round, and at LOW_THREADS too for a
     scaling cell. A gate must not pass, nor a baseline be kept, on less."""
-    phases = CORE_PHASES if CELLS[cell][1] == "moldova" else ("export/levels",)
+    phases = cell_phases(cell)
     arms = [("", s.get("rounds", 0), s.get("phase_rounds"))]
     if cell in SCALING_CELLS:
         arms.append((f" {LOW_THREADS}-thread", s.get("low_rounds", 0), s.get("low_phase_rounds")))
@@ -309,7 +314,7 @@ def missing_telemetry(cell: str, s: dict) -> list[str]:
 
 def baseline_gaps(cell: str, base: dict) -> list[str]:
     """The fields the gate compares that one baseline cell lacks."""
-    phases = CORE_PHASES if CELLS[cell][1] == "moldova" else ("export/levels",)
+    phases = cell_phases(cell)
     gaps = [f"{k}[{p}]" for k in ("phase_cores", "phase_cpu_s") for p in phases
             if (base.get(k) or {}).get(p) is None]
     if cell in SCALING_CELLS:
@@ -478,11 +483,11 @@ def exit_status(v: dict) -> int:
 
 def with_record(baseline_doc: dict | None, record: dict) -> dict:
     """The baseline file with this host class's entry replaced; the class's
-    hand-tuned `floors` survive a re-record."""
+    hand-tuned `floors` survive a re-record, and a class without them gets
+    DEFAULT_FLOORS."""
     hosts = dict((baseline_doc or {}).get("hosts", {}))
     old = hosts.get(host_class_key(record["host"]), {}).get("floors")
-    if old and "floors" not in record:
-        record = {**record, "floors": old}
+    record = {**record, "floors": old or DEFAULT_FLOORS}
     prev = hosts.get(host_class_key(record["host"]), {}).get("cells", {})
     hosts[host_class_key(record["host"])] = {**record, "cells": {**prev, **record["cells"]}}
     return {"hosts": hosts}
@@ -522,8 +527,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.inject_threads:
         record["injected_threads"] = args.inject_threads
     doc = json.loads(args.baseline.read_text()) if args.baseline.exists() else None
-    if args.mode == "record" and not (doc or {}).get("hosts", {}).get(host_class_key(record["host"]), {}).get("floors"):
-        record["floors"] = DEFAULT_FLOORS
     if args.mode == "record":
         if problems := record_problems(cells):
             raise SystemExit("not recording an incomplete baseline:\n  " + "\n  ".join(problems))
