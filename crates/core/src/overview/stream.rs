@@ -45,7 +45,9 @@ use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
 use super::cluster::{ClusterEntry, ClusterTables};
-use super::coalesce::{collected_line_bytes, CoalesceInput, ExactChains};
+use super::coalesce::{
+    chain_stage_resident_bytes, collected_line_bytes, CoalesceInput, ExactChains,
+};
 use super::config::ValidatedConfig;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
@@ -54,7 +56,7 @@ use super::convert::{
     count_vertices, extract_class_ranks, extract_numeric_values, extract_sort_keys,
     fill_level_bytes, mixed_geometry_field, overture_road_ranking, record_coalesce_merged,
     record_level_outcome, resolve_pass_read_workers, resolve_reserved_column_collisions,
-    scan_feature_traits, validate_cluster_schema, validate_coalesce_schema,
+    scan_feature_traits, take_chain_geometry, validate_cluster_schema, validate_coalesce_schema,
     warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking, CoalesceTable, ConvertError,
     ConvertOptions, ConvertReport, GroupInterner, LevelReport, PlanLevelReport, PlanReport,
     SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
@@ -1983,7 +1985,7 @@ fn pass2_coalesce(
         options,
     } = inputs;
     let Some(build) = prebuilt else {
-        return Ok((vec![None; kept], false));
+        return Ok(((0..kept).map(|_| None).collect(), false));
     };
     let mut by_level = build.tables;
     let tables = planned[..kept]
@@ -2243,7 +2245,7 @@ fn coalesce_level_counts(
     let finest = level_specs.len().saturating_sub(1);
     let line_bytes: u64 = scratch.geoms.iter().map(collected_line_bytes).sum();
     let budget = memory.allowance(options.profile);
-    let wave = chain_stage_wave(level_specs.len(), line_bytes, budget);
+    let wave = chain_stage_wave(level_specs.len(), scratch.rows.len(), line_bytes, budget);
     coalesce_level_counts_in_waves(
         scratch,
         CoalesceCountPlan {
@@ -2262,19 +2264,24 @@ fn coalesce_level_counts(
 /// pieces and sorted endpoint incidences, the merged chain runs, and the
 /// simplified table. Measured on 1.5M 7-vertex lines (240 MiB modelled):
 /// ≈310 MiB per concurrently running level, about 1.3×; 2 leaves headroom
-/// for longer merged strokes.
+/// for longer merged strokes. Since #851 one level holds about 0.8× on
+/// Overture segments. What every level shares (the scratch and the exact
+/// join, [`chain_stage_resident_bytes`]) comes off the budget first.
 const CHAIN_STAGE_TRANSIENT_FACTOR: u64 = 2;
 
 /// How many levels' chain stages [`coalesce_level_counts`] runs at once:
-/// `budget` over one level's modelled transient, clamped to `1..=levels`.
-/// No line bytes (or an unbounded `speed` budget) means no bound.
-fn chain_stage_wave(levels: usize, line_bytes: u64, budget: u64) -> usize {
+/// what `budget` holds beyond the stage's resident bytes
+/// ([`chain_stage_resident_bytes`] of `lines` lines, `line_bytes` modelled),
+/// over one level's modelled transient, clamped to `1..=levels`. No line
+/// bytes (or an unbounded `speed` budget) means no bound.
+fn chain_stage_wave(levels: usize, lines: usize, line_bytes: u64, budget: u64) -> usize {
     let levels = levels.max(1);
     let per_level = line_bytes.saturating_mul(CHAIN_STAGE_TRANSIENT_FACTOR);
     if per_level == 0 {
         return levels;
     }
-    usize::try_from(budget / per_level)
+    let free = budget.saturating_sub(chain_stage_resident_bytes(lines, line_bytes));
+    usize::try_from(free / per_level)
         .unwrap_or(usize::MAX)
         .clamp(1, levels)
 }
@@ -3753,8 +3760,16 @@ pub(crate) fn run_stages(
         strategy,
     )?;
 
-    // The chain tables hold every level's simplified strokes: free them
-    // across the pool, not serially at scope end (#817 T1).
+    // Pass 2 moved every chain's geometry out as it emitted the rep (#851);
+    // what is left is the reps' counts and the maps' slots.
+    debug_assert!(
+        coalesce_tables
+            .iter()
+            .flatten()
+            .flat_map(|t| t.values())
+            .all(|(g, _)| g.lock().is_ok_and(|g| g.is_none())),
+        "pass 2 left a chain rep unemitted"
+    );
     drop(ctxs);
     // Per table: flattening the maps into one Vec would add a copy of every
     // entry at the end of the run.
@@ -6902,9 +6917,11 @@ pub(super) fn process_level_batch(
             .par_iter()
             .zip(&selected)
             .map(|(g, &i)| {
-                if let Some((merged, _)) = ctx.coalesce_table.and_then(|t| t.get(&(row_offset + i)))
+                if let Some(merged) = ctx
+                    .coalesce_table
+                    .and_then(|t| take_chain_geometry(t, row_offset + i))
                 {
-                    Simplified::Keep(merged.clone())
+                    Simplified::Keep(merged)
                 } else if ctx.is_carrier_row(row_offset + i) {
                     // #384: a carrier stands in for its neighbourhood's
                     // dropped area as one placeholder square.
@@ -7204,10 +7221,10 @@ pub(super) fn process_batch_cascade(
                 let g = row_offset + i;
                 if let Some(table) = ctx.coalesce_table {
                     if ctx.kinds.expect("kinds present when coalescing")[g] == FeatureKind::Line {
-                        if let Some((merged, _)) = table.get(&g) {
-                            verts += count_vertices(merged);
+                        if let Some(merged) = take_chain_geometry(table, g) {
+                            verts += count_vertices(&merged);
                             kept_idx.push(i);
-                            kept_geoms.push(Arc::new(merged.clone()));
+                            kept_geoms.push(Arc::new(merged));
                         }
                         continue;
                     }
@@ -10106,6 +10123,31 @@ mod tests {
 
     // ---- #570: the chain tables are built once, in pass 1 -------------------
 
+    type PlainTable = std::collections::HashMap<usize, (Option<Geometry<f64>>, i32)>;
+
+    /// A chain table's entries without the take-once slots, for comparing.
+    fn plain_tables(tables: Vec<Option<CoalesceTable>>) -> Vec<Option<PlainTable>> {
+        tables
+            .into_iter()
+            .map(|t| {
+                t.map(|t| {
+                    t.into_iter()
+                        .map(|(k, (g, c))| (k, (g.into_inner().unwrap().map(|g| *g), c)))
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
+    fn clone_table(t: &CoalesceTable) -> CoalesceTable {
+        t.iter()
+            .map(|(&k, (g, c))| {
+                let g = g.lock().unwrap().clone();
+                (k, (super::super::convert::ChainGeometry::new(g), *c))
+            })
+            .collect()
+    }
+
     /// A chain table no real build could produce, so its presence in pass 2's
     /// output proves the table was REUSED rather than rebuilt.
     fn sentinel_table(rep: usize) -> CoalesceTable {
@@ -10113,7 +10155,9 @@ mod tests {
         t.insert(
             rep,
             (
-                Geometry::LineString(LineString::from(vec![(0.0, 0.0), (1.0, 1.0)])),
+                super::super::convert::ChainGeometry::new(Some(Box::new(Geometry::LineString(
+                    LineString::from(vec![(0.0, 0.0), (1.0, 1.0)]),
+                )))),
                 7,
             ),
         );
@@ -10292,12 +10336,26 @@ mod tests {
     #[test]
     fn chain_stage_wave_is_bounded_by_the_budget() {
         let per_level = 100 * CHAIN_STAGE_TRANSIENT_FACTOR;
-        assert_eq!(chain_stage_wave(7, 100, u64::MAX), 7, "unbounded: all");
-        assert_eq!(chain_stage_wave(7, 100, per_level * 3), 3);
-        assert_eq!(chain_stage_wave(7, 100, per_level * 3 + 1), 3);
-        assert_eq!(chain_stage_wave(7, 100, 1), 1, "never below one level");
-        assert_eq!(chain_stage_wave(7, 0, 1), 7, "no line bytes: no bound");
-        assert_eq!(chain_stage_wave(0, 100, u64::MAX), 1);
+        // No lines: only the modelled bytes are resident.
+        let resident = chain_stage_resident_bytes(0, 100);
+        assert_eq!(chain_stage_wave(7, 0, 100, u64::MAX), 7, "unbounded: all");
+        assert_eq!(chain_stage_wave(7, 0, 100, resident + per_level * 3), 3);
+        assert_eq!(chain_stage_wave(7, 0, 100, resident + per_level * 3 + 1), 3);
+        assert_eq!(chain_stage_wave(7, 0, 100, 1), 1, "never below one level");
+        assert_eq!(chain_stage_wave(7, 0, 0, 1), 7, "no line bytes: no bound");
+        assert_eq!(chain_stage_wave(0, 0, 100, u64::MAX), 1);
+    }
+
+    /// The line scratch and the exact join are resident before any level
+    /// runs, so they come off the budget before it is split into levels
+    /// (#851): a budget holding them plus one level runs one level at a time.
+    #[test]
+    fn chain_stage_waves_leave_room_for_what_every_level_shares() {
+        let lines = 1_000_000;
+        let modelled = 200 * lines as u64;
+        let per_level = modelled * CHAIN_STAGE_TRANSIENT_FACTOR;
+        let budget = chain_stage_resident_bytes(lines, modelled) + per_level;
+        assert_eq!(chain_stage_wave(14, lines, modelled, budget), 1);
     }
 
     /// Running the levels in bounded waves changes the peak, never the result:
@@ -10328,8 +10386,48 @@ mod tests {
             let (counts, build) = run(wave);
             assert_eq!(counts, all_counts, "wave {wave}");
             assert_eq!(build.merged, all_build.merged, "wave {wave}");
-            assert_eq!(build.tables, all_build.tables, "wave {wave}");
+            assert_eq!(
+                plain_tables(build.tables),
+                plain_tables(
+                    all_build
+                        .tables
+                        .iter()
+                        .map(|t| t.as_ref().map(clone_table))
+                        .collect()
+                ),
+                "wave {wave}"
+            );
         }
+    }
+
+    /// #851: pass 2 moves a rep's merged geometry out of the table when it
+    /// emits the rep, so the table frees its chains as pass 2 advances; the
+    /// rep's count stays for the `coalesced_count` column.
+    #[test]
+    fn emitting_a_chain_rep_frees_its_geometry() {
+        let table = sentinel_table(100);
+        assert!(take_chain_geometry(&table, 7).is_none(), "not a rep");
+        let g = take_chain_geometry(&table, 100).expect("the rep's chain");
+        assert_eq!(count_vertices(&g), 2);
+        let (slot, count) = &table[&100];
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the table still holds the chain"
+        );
+        assert_eq!(*count, 7);
+    }
+
+    /// #851: a chain table's slots stay allocated until convert returns,
+    /// after pass 2 has moved every geometry out, so a slot must not carry
+    /// the geometry inline (it was 80 B with an inline `Geometry`).
+    #[test]
+    fn a_chain_table_slot_is_small() {
+        type Slot = (usize, (super::super::convert::ChainGeometry, i32));
+        assert!(
+            std::mem::size_of::<Slot>() <= 32,
+            "{}",
+            std::mem::size_of::<Slot>()
+        );
     }
 
     /// Pass 2 takes pass 1's prebuilt tables verbatim, level by level, and

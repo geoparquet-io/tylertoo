@@ -6272,7 +6272,30 @@ fn overwrite_numeric_column(
 
 /// One level's coalescing result: rep source row → (simplified merged
 /// geometry, number of source segments merged).
-pub(super) type CoalesceTable = HashMap<usize, (Geometry<f64>, i32)>;
+///
+/// Pass 2 reads each rep row once per level, so it MOVES the geometry out
+/// ([`take_chain_geometry`]) instead of cloning it: a level's chains are freed
+/// as pass 2 emits them, not held until convert returns (#851).
+pub(super) type CoalesceTable = HashMap<usize, (ChainGeometry, i32)>;
+
+/// A chain table's geometry slot, emptied when pass 2 emits the rep. Boxed:
+/// the map's slots outlive the geometry until convert returns, and a boxed
+/// slot is 16 B where an inline `Geometry` is 64 B (#851).
+pub(super) type ChainGeometry = std::sync::Mutex<Option<Box<Geometry<f64>>>>;
+
+/// Move rep `row`'s merged geometry out of `table`; `None` when `row` is not
+/// a chain rep at this level.
+///
+/// # Panics
+/// When the rep's geometry was already taken: pass 2 emits each rep once.
+pub(super) fn take_chain_geometry(table: &CoalesceTable, row: usize) -> Option<Geometry<f64>> {
+    let (slot, _) = table.get(&row)?;
+    let geom = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    Some(*geom.expect("pass 2 emits each chain rep once per level"))
+}
 
 /// Validate the coalescing-related schema constraint: the input must not
 /// already carry a `coalesced_count` column (case-insensitive, mirroring the
@@ -6635,7 +6658,10 @@ pub(super) fn build_level_coalesce_table_and_hint(
         .into_par_iter()
         .filter_map(|chain| {
             match simplify_for_level(&chain.geom, gsd_m, crs, &options.simplify, diagnostics) {
-                Simplified::Keep(g) => Some((chain.rep, (g, chain.count))),
+                Simplified::Keep(g) => Some((
+                    chain.rep,
+                    (ChainGeometry::new(Some(Box::new(g))), chain.count),
+                )),
                 Simplified::Dropped => None,
             }
         })
