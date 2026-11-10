@@ -205,6 +205,16 @@ impl AsRef<Path> for Reserved {
 /// the window before the writer creates the file. `dir` is `None` for the
 /// system temp directory.
 pub(crate) fn reserve_path(prefix: &str, suffix: &str, dir: Option<&Path>) -> io::Result<Reserved> {
+    reserve_named(prefix, &format!("{prefix}out{suffix}"), dir)
+}
+
+/// [`reserve_path`] with the file named `file_name` (#824: a staged stream
+/// keeps the output's stem, which becomes the layer name).
+pub(crate) fn reserve_named(
+    prefix: &str,
+    file_name: &str,
+    dir: Option<&Path>,
+) -> io::Result<Reserved> {
     let mut builder = tempfile::Builder::new();
     builder.prefix(prefix);
     // `tempdir` creates 0777 minus the umask; ask for owner-only.
@@ -217,7 +227,7 @@ pub(crate) fn reserve_path(prefix: &str, suffix: &str, dir: Option<&Path>) -> io
         Some(dir) => builder.tempdir_in(dir)?,
         None => builder.tempdir()?,
     };
-    let path = private.path().join(format!("{prefix}out{suffix}"));
+    let path = private.path().join(file_name);
     Ok(Reserved {
         path,
         _dir: private,

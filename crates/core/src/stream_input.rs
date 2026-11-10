@@ -5,7 +5,7 @@
 //! directory a remote input's disk spill uses, and is removed when the
 //! [`StagedStream`] drops, whether the run succeeded or failed.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
@@ -27,17 +27,15 @@ pub const STAGE_ROW_GROUP_ROWS: usize = 122_880;
 const EXTENSION_NAME: &str = "ARROW:extension:name";
 const EXTENSION_METADATA: &str = "ARROW:extension:metadata";
 
-/// A staged stream: a GeoParquet file deleted (with its directory) on drop.
+/// A staged stream: a GeoParquet file in a private (0700) directory,
+/// deleted with it on drop.
 #[derive(Debug)]
-pub struct StagedStream {
-    _dir: tempfile::TempDir,
-    path: PathBuf,
-}
+pub struct StagedStream(crate::atomic_output::Reserved);
 
 impl StagedStream {
     /// The staged GeoParquet file.
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.0
     }
 }
 
@@ -181,19 +179,16 @@ pub fn stage_arrow_stream(
     let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &options)
         .map_err(|e| stream_error(e.to_string()))?;
 
-    let dir = match spill_dir {
-        Some(d) => tempfile::Builder::new()
-            .prefix(".tylertoo-stream")
-            .tempdir_in(d),
-        None => tempfile::Builder::new()
-            .prefix(".tylertoo-stream")
-            .tempdir(),
-    }?;
-    let path = dir.path().join(format!("{stem}.parquet"));
-    let file = std::fs::File::create_new(&path)?;
+    let staged = StagedStream(crate::atomic_output::reserve_named(
+        ".tylertoo-stream-",
+        &format!("{stem}.parquet"),
+        spill_dir,
+    )?);
+    let file = std::fs::File::create_new(staged.path())?;
     let mut writer =
         tylertoo_io::batch_writer(file, encoder.target_schema(), Some(STAGE_ROW_GROUP_ROWS))
             .map_err(ConvertError::Parquet)?;
+    let mut rows = 0;
     for batch in reader {
         let columns = batch
             .map_err(ConvertError::Arrow)?
@@ -203,6 +198,18 @@ pub fn stage_arrow_stream(
             .map(|(column, field)| arrow_cast::cast(column, field.data_type()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(ConvertError::Arrow)?;
+        // The pinned WKB reader panics on some malformed values; refuse them
+        // first, as the file readers do.
+        for &i in &geometry {
+            crate::wkb_column::check_wkb_column(columns[i].as_ref()).map_err(|(row, e)| {
+                stream_error(format!(
+                    "geometry column {:?}, row {}: {e}",
+                    schema.field(i).name(),
+                    rows + row
+                ))
+            })?;
+        }
+        rows += columns.first().map_or(0, |c| c.len());
         let batch = RecordBatch::try_new(schema.clone(), columns).map_err(ConvertError::Arrow)?;
         let encoded = encoder
             .encode_record_batch(&batch)
@@ -215,7 +222,7 @@ pub fn stage_arrow_stream(
             .map_err(|e| stream_error(e.to_string()))?,
     );
     writer.close().map_err(ConvertError::Parquet)?;
-    Ok(StagedStream { _dir: dir, path })
+    Ok(staged)
 }
 
 #[cfg(test)]
@@ -276,6 +283,12 @@ mod tests {
         assert_eq!(geo["columns"]["wkb"]["crs"], "EPSG:3857");
 
         let dir = staged.path().parent().unwrap().to_path_buf();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "other users cannot read the stage");
+        }
         drop(staged);
         assert!(!dir.exists(), "the staged directory is removed on drop");
     }
@@ -312,5 +325,25 @@ mod tests {
             crate::error::Classify::kind(&err),
             crate::error::ErrorKind::Input
         );
+    }
+
+    /// A MultiPoint whose last member claims an SRID it has no room for
+    /// panics the pinned WKB reader; staging refuses it instead.
+    #[test]
+    fn a_malformed_wkb_value_is_refused_not_a_panic() {
+        let mut wkb = vec![1u8, 4, 0, 0, 0, 2, 0, 0, 0];
+        wkb.extend_from_slice(&point_wkb(1.0, 2.0));
+        wkb.extend_from_slice(&[1, 1, 0, 0, 0x20]);
+        wkb.extend_from_slice(&3.0f64.to_le_bytes());
+        wkb.extend_from_slice(&4.0f64.to_le_bytes());
+        let schema = Arc::new(Schema::new(vec![Field::new("wkb", DataType::Binary, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BinaryArray::from_iter_values([wkb]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let err = stage_arrow_stream(reader, Some("wkb"), None, None, "x").unwrap_err();
+        assert!(err.to_string().contains("row 0"), "{err}");
     }
 }
