@@ -28,6 +28,9 @@ fn get(addr: &str, path: &str, extra: &str) -> (u16, String, Vec<u8>) {
 
 fn request(addr: &str, method: &str, path: &str, extra: &str) -> (u16, String, Vec<u8>) {
     let mut s = TcpStream::connect(addr).unwrap();
+    // A server that stops answering fails the test instead of hanging it.
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
     write!(s, "{method} {path} HTTP/1.0\r\nHost: {addr}\r\n{extra}\r\n").unwrap();
     let mut r = BufReader::new(s);
     let mut head = String::new();
@@ -151,4 +154,45 @@ fn index_is_a_reserved_archive_name() {
     write_archive(&path, 1);
     let err = Server::bind(&[path], "127.0.0.1", 0).err().unwrap();
     assert!(err.to_string().contains("reserved"), "{err}");
+}
+
+/// A client stalled mid-download of a whole archive blocks neither other
+/// requests nor the server's stop poll.
+#[test]
+fn a_stalled_download_blocks_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.pmtiles");
+    let mut w = StreamingPmtilesWriter::new(Compression::None).unwrap();
+    w.set_layer_name("l");
+    // ~32 MiB of distinct bodies: far more than the socket buffers hold.
+    for i in 0..512u32 {
+        let body: Vec<u8> = (0..65536u32)
+            .map(|j| (i ^ j.wrapping_mul(2654435761)) as u8)
+            .collect();
+        w.add_tile(9, i, 0, &body).unwrap();
+    }
+    w.finalize(&path).unwrap();
+
+    let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0).unwrap();
+    let addr = server
+        .url()
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_owned();
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || server.run(|| stopped.try_recv().is_err()));
+
+    let mut stalled = TcpStream::connect(&addr).unwrap();
+    write!(stalled, "GET /big.pmtiles HTTP/1.0\r\nHost: {addr}\r\n\r\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(get(&addr, "/big/9/3/0.mvt", "").0, 200);
+
+    stop.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !handle.is_finished() {
+        assert!(std::time::Instant::now() < deadline, "server did not stop");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    handle.join().unwrap().unwrap();
+    drop(stalled);
 }
