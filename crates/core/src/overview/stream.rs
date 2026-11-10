@@ -8453,6 +8453,94 @@ mod tests {
         assert_eq!(line["pass2"]["sink"]["spill_codec"], "lz4", "{line}");
     }
 
+    /// #848: list properties whose row groups hold more repeated values than
+    /// one decoded batch may (Overture segments: 86 list leaves) must not
+    /// read pass 2 one row per batch. Each one-row output batch carries the
+    /// schema's whole fixed Arrow overhead, so a 38 MB input buffered 55 KB
+    /// per row (262 KB resident) and was OOM-killed at 118 GB. Dense
+    /// coalescing lines, the issue's shape; the decode ceiling is scaled
+    /// down (`TYLERTOO_BYTE_ARRAY_LIMIT_BYTES`, process environment, so the
+    /// run happens in a child).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn list_heavy_lines_are_not_buffered_one_row_per_batch() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        const CHILD: &str = "TYLERTOO_848_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let (_, module) = module_path!().split_once("::").expect("crate::module path");
+            let name = format!("{module}::list_heavy_lines_are_not_buffered_one_row_per_batch");
+            let out =
+                std::process::Command::new(std::env::current_exe().expect("test binary path"))
+                    .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                    .env(CHILD, "1")
+                    .env("TYLERTOO_BYTE_ARRAY_LIMIT_BYTES", "16384")
+                    .output()
+                    .expect("re-run the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{name} failed in its own process:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        assert!(crate::test_log::install());
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        // 40 roads of 50 two-point segments end to end: every segment chains.
+        let geoms: Vec<Option<geo::Geometry<f64>>> = (0..40)
+            .flat_map(|road| {
+                (0..50).map(move |s| {
+                    let (x, y) = (f64::from(s) * 0.01, f64::from(road) * 0.1);
+                    Some(geo::Geometry::LineString(geo::LineString::from(vec![
+                        (x, y),
+                        (x + 0.01, y),
+                    ])))
+                })
+            })
+            .collect();
+        // 8 values per row: 144 KB of repeated values in the one row group,
+        // past the 32 KiB the scaled ceiling lets one batch decode.
+        let mut tags = ListBuilder::new(Int64Builder::new());
+        for i in 0..geoms.len() as i64 {
+            tags.values().append_slice(&[i; 8]);
+            tags.append(true);
+        }
+        let tags = tags.finish();
+        crate::overview::testutil::write_input_columns(
+            &input,
+            &geoms,
+            true,
+            vec![(
+                Field::new("tags", tags.data_type().clone(), true),
+                Arc::new(tags),
+            )],
+        );
+        crate::overview::convert::convert_to_overviews(
+            &input,
+            dir.path().join("out.parquet"),
+            &crate::overview::convert::ConvertOptions {
+                levels: crate::overview::convert::LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 14,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let lines = crate::test_log::take_thread_lines();
+        let per_row: u64 = lines
+            .iter()
+            .find_map(|l| {
+                let tail = l.strip_prefix("[convert] pass2 sink: measured ")?;
+                tail.split(' ').next()?.parse().ok()
+            })
+            .unwrap_or_else(|| panic!("no pass2 sink line: {lines:#?}"));
+        // A buffered row is a short line, an id, a name and 8 tags: a few
+        // hundred bytes with the 256 B floor. A one-row batch is ~20x that.
+        assert!(per_row < 1024, "{per_row} B per buffered row");
+    }
+
     /// Runs the named test of this module alone in a child process. Returns
     /// `true` inside that child, where the caller runs its body, and `false`
     /// in the parent once the child has passed.

@@ -1182,7 +1182,6 @@ pub fn read_batch_plan(
                     };
                     let value = width.saturating_add(1);
                     let repeated = if column.column_descr().max_rep_level() > 0 {
-                        // A repeated leaf can put all its values in a single row.
                         value.saturating_mul(column.num_values().max(0) as u64)
                     } else {
                         0
@@ -1195,23 +1194,21 @@ pub fn read_batch_plan(
             (row, repeated, group.num_rows())
         })
         .collect();
-    let fixed = groups.iter().map(|g| g.0).max().unwrap_or(1).max(1);
-    // A batch of `requested` rows touches at most ceil(requested / smallest
-    // group) + 1 groups, so it holds at most the largest that many groups'
-    // repeated values, however they are spread over its rows.
-    let min_rows = groups.iter().map(|g| g.2.max(1) as u64).min().unwrap_or(1);
-    let spanned = (requested.max(1) as u64)
-        .div_ceil(min_rows)
-        .saturating_add(1);
-    let mut repeated: Vec<u64> = groups.iter().map(|g| g.1).collect();
-    repeated.sort_unstable_by(|a, b| b.cmp(a));
-    let repeated = repeated
+    // A row pays every leaf's width plus its group's repeated values per row
+    // (#848). No row count bounds repeated values a footer cannot place: one
+    // row may hold a whole group's, which one-row batches decode as well.
+    // Planning for that worst case read Overture segments one row per batch,
+    // and pass 2 then held ~260 KB of Arrow overhead per buffered row. The
+    // skew is caught after decode by [`UntrustedBatchReader`]'s split.
+    let per_row = groups
         .iter()
-        .take(usize::try_from(spanned).unwrap_or(usize::MAX))
-        .fold(0u64, |n, v| n.saturating_add(*v));
+        .map(|g| g.0.saturating_add(g.1.div_ceil(g.2.max(1) as u64)))
+        .max()
+        .unwrap_or(1)
+        .max(1);
     requested
         .max(1)
-        .min((decoded_limit(limit).saturating_sub(repeated) / fixed).max(1) as usize)
+        .min((decoded_limit(limit) / per_row).max(1) as usize)
         .min(
             usize::try_from((limit / 2) / avg.max(1))
                 .unwrap_or(usize::MAX)
@@ -1914,8 +1911,45 @@ mod tests {
         // Small groups: a batch spans many of them, and still fits.
         let small = write(100_000, 1_000);
         assert_eq!(read_batch_plan(&small, None, None, 8192, limit), 8192);
-        // Crafted: the repeated values alone exceed the decode limit.
-        assert_eq!(read_batch_plan(&md, None, None, 8192, 100_000), 1);
+    }
+
+    /// #848: Overture segments carry 86 list leaves, about 87 MB of repeated
+    /// values per 64k-row group, past the 64 MiB decode limit though each
+    /// row holds about 1.3 KB of them. The plan read them one row per batch,
+    /// and every one-row batch kept ~260 KB of fixed Arrow overhead per
+    /// buffered output row (118 GB on a 38 MB input). A row is priced at
+    /// its share of the repeated values instead.
+    #[test]
+    fn read_plan_prices_repeated_values_at_their_rows_average() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        use arrow_array::{ArrayRef, Int64Array};
+        use parquet::arrow::ArrowWriter;
+        let n = 100_000;
+        let mut lists = ListBuilder::new(Int64Builder::new());
+        for i in 0..n {
+            lists.values().append_slice(&[i; 64]);
+            lists.append(true);
+        }
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(0..n)) as ArrayRef,
+            ),
+            ("lists", Arc::new(lists.finish()) as ArrayRef),
+        ])
+        .unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let md = open_parquet(file).unwrap().metadata().clone();
+        // 200 KB decode limit; the group's 6.4M values (57.6 MB) are far
+        // past it. A row costs 9 + 9 B fixed and 64 x 9 B of list values.
+        let limit = 100_000;
+        assert_eq!(
+            read_batch_plan(&md, None, None, 8192, limit),
+            200_000 / (18 + 64 * 9)
+        );
     }
 
     #[test]

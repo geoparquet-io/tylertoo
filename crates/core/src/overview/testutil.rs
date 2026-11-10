@@ -39,6 +39,22 @@ pub(crate) fn write_input(
     covering: bool,
     extra_col: Option<&str>,
 ) {
+    let extra = extra_col.map(|col| {
+        (
+            Field::new(col, DataType::Int32, false),
+            Arc::new(Int32Array::from(vec![0i32; geoms.len()])) as Arc<dyn Array>,
+        )
+    });
+    write_input_columns(path, geoms, covering, extra.into_iter().collect());
+}
+
+/// [`write_input`] with `extra` property columns after `id` and `name`.
+pub(crate) fn write_input_columns(
+    path: &Path,
+    geoms: &[Option<Geometry<f64>>],
+    covering: bool,
+    extra: Vec<(Field, Arc<dyn Array>)>,
+) {
     let n = geoms.len();
     let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
     let name = StringArray::from((0..n).map(|i| format!("f{i}")).collect::<Vec<_>>());
@@ -54,9 +70,9 @@ pub(crate) fn write_input(
         Arc::new(Field::new("name", DataType::Utf8, false)),
     ];
     let mut columns: Vec<Arc<dyn Array>> = vec![Arc::new(id), Arc::new(name)];
-    if let Some(col) = extra_col {
-        fields.push(Arc::new(Field::new(col, DataType::Int32, false)));
-        columns.push(Arc::new(Int32Array::from(vec![0i32; n])));
+    for (field, column) in extra {
+        fields.push(Arc::new(field));
+        columns.push(column);
     }
     fields.push(Arc::new(geom_field));
     columns.push(geom_arr.to_array_ref());
