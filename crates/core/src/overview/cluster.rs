@@ -166,6 +166,12 @@ impl CategoryCounts {
         }
     }
 
+    /// Bytes the counts hold on the heap: their allocated capacity, spare
+    /// slots included.
+    pub(crate) fn heap_bytes(&self) -> u64 {
+        (self.0.capacity() * std::mem::size_of::<(u32, i64)>()) as u64
+    }
+
     /// `(slot, count)` pairs, ascending by slot, every count `>= 1`.
     pub fn as_slice(&self) -> &[(u32, i64)] {
         &self.0

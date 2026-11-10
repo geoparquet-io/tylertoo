@@ -40,7 +40,7 @@ use super::cluster::{MAX_CLUSTER_CATEGORIES, OTHER_CATEGORY, POINT_COUNT_COLUMN}
 use super::convert::{ConvertError, ConvertOptions, GroupInterner};
 use super::level::Crs;
 use super::memory::{MemoryBudget, MemoryPhase};
-use super::read::{read_in_order, ReadFlow, ReadPass, ReadTuning};
+use super::read::{footer_price, grant_read_ahead, read_in_order, ReadFlow, ReadPass, ReadTuning};
 use crate::input_set::ConvertSource;
 
 /// A discrete global grid a cell band aggregates into.
@@ -394,7 +394,7 @@ impl Cells {
 
     /// Merge partial maps, each split by shard, into these cells: shard by
     /// shard in parallel, the parts in order, so the result is the same on
-    /// every run. Returns the category pairs added.
+    /// every run. Returns the category heap bytes added.
     fn absorb(&mut self, parts: Vec<Vec<CellMap>>) -> u64 {
         let mut by_shard: Vec<Vec<CellMap>> = (0..SHARDS).map(|_| Vec::new()).collect();
         for part in parts {
@@ -406,23 +406,23 @@ impl Cells {
             .par_iter_mut()
             .zip(by_shard)
             .map(|(shard, maps)| {
-                let mut pairs = 0u64;
+                let mut bytes = 0u64;
                 for map in maps {
                     for (id, acc) in map {
                         match shard.get_mut(&id) {
                             Some(c) => {
-                                let before = c.cats.as_slice().len();
+                                let before = c.cats.heap_bytes();
                                 c.merge(&acc);
-                                pairs += (c.cats.as_slice().len() - before) as u64;
+                                bytes += c.cats.heap_bytes() - before;
                             }
                             None => {
-                                pairs += acc.cats.as_slice().len() as u64;
+                                bytes += acc.cats.heap_bytes();
                                 shard.insert(id, acc);
                             }
                         }
                     }
                 }
-                pairs
+                bytes
             })
             .sum()
     }
@@ -456,7 +456,36 @@ impl Cells {
     fn capacity(&self) -> u64 {
         self.0.iter().map(|m| m.capacity() as u64).sum()
     }
+
+    /// Heap bytes of every cell's category counts, by allocated capacity.
+    fn category_bytes(&self) -> u64 {
+        self.0
+            .par_iter()
+            .map(|m| m.values().map(|c| c.cats.heap_bytes()).sum::<u64>())
+            .sum()
+    }
+
+    /// What holding these cells costs, with room for `incoming` more rows
+    /// (#332): the map's slots, `category_bytes` of counts, and per incoming
+    /// row a cell and its first counts both in a batch's partial map and as
+    /// a new cell here; a map that must grow to take them holds its old and
+    /// its doubled table at once.
+    fn bytes(&self, specs: usize, category_bytes: u64, incoming: usize) -> u64 {
+        let cap = self.capacity();
+        let need = (self.len() + incoming) as u64;
+        let slots = if need > cap {
+            cap + 2 * cap.max(need)
+        } else {
+            cap
+        };
+        let per_row = cell_bytes(specs) + FIRST_COUNTS_BYTES;
+        slots * cell_bytes(specs) + category_bytes + 2 * incoming as u64 * per_row
+    }
 }
+
+/// Heap bytes of a cell's first category count: a `Vec` grows from empty to
+/// four `(u32, i64)` slots.
+const FIRST_COUNTS_BYTES: u64 = 4 * std::mem::size_of::<(u32, i64)>() as u64;
 
 /// Bytes one occupied cell holds, besides its category counts.
 fn cell_bytes(specs: usize) -> u64 {
@@ -487,7 +516,7 @@ pub(crate) fn write_cell_tables(
 ) -> Result<(), ConvertError> {
     debug_assert_eq!(tables.len(), usize::from(max_zoom - min_zoom) + 1);
     let started = std::time::Instant::now();
-    let (mut cells, labels, budget, cat_pairs) =
+    let (mut cells, labels, budget, mut cat_bytes) =
         aggregate(input, system, max_zoom, rollup, read, diagnostics)?;
     let specs = rollup.accumulate.len();
     log::info!(
@@ -502,11 +531,9 @@ pub(crate) fn write_cell_tables(
         if to < res {
             // A rollup holds children and their parents at once; a parent
             // holds no more cells or category pairs than its children.
-            budget.require(
-                MemoryPhase::Scan,
-                2 * (cells.capacity() * cell_bytes(specs) + cat_pairs * 12),
-            )?;
+            budget.require(MemoryPhase::Scan, 2 * cells.bytes(specs, cat_bytes, 0))?;
             cells = cells.roll_up(system, res, to);
+            cat_bytes = cells.category_bytes();
             res = to;
         }
         // Writing adds an id-ordered index of the cells and one batch's
@@ -515,10 +542,7 @@ pub(crate) fn write_cell_tables(
             * (17 * labels.len() as u64 + 9 * specs as u64 + 512);
         budget.require(
             MemoryPhase::Scan,
-            cells.capacity() * cell_bytes(specs)
-                + cat_pairs * 12
-                + cells.len() as u64 * 16
-                + batch_bytes,
+            cells.bytes(specs, cat_bytes, 0) + cells.len() as u64 * 16 + batch_bytes,
         )?;
         write_table(
             tables[usize::from(z - min_zoom)],
@@ -539,7 +563,7 @@ pub(crate) fn write_cell_tables(
 
 /// Read `input` once into the cell map at `max_zoom`'s resolution. Returns
 /// the map, its category counts keyed by category slot, the slot labels,
-/// the budget it was charged to, and its category pairs.
+/// the budget it was charged to, and its category heap bytes.
 fn aggregate(
     input: &Path,
     system: CellSystem,
@@ -567,7 +591,8 @@ fn aggregate(
         cluster_categories: rollup.categories.map(str::to_string),
         ..ConvertOptions::default()
     };
-    let acc_idx = super::convert::validate_rollup_columns(descriptor.schema(), &check)?;
+    // A cell table drops the input's other columns: they cannot collide.
+    let acc_idx = super::convert::validate_rollup_columns(descriptor.schema(), &check, false)?;
     let cat_idx = super::convert::cluster_category_column(descriptor.schema(), &check);
     let mut projection: Vec<usize> = std::iter::once(geom_idx)
         .chain(acc_idx.iter().copied())
@@ -585,21 +610,29 @@ fn aggregate(
 
     let res = system.resolution(max_zoom);
     let specs = rollup.accumulate.len();
-    let budget = MemoryBudget::probe();
+    let mut budget = MemoryBudget::probe();
     let tuning = ReadTuning {
         budget,
         batch_size: READ_ROWS,
         workers: super::convert::resolve_pass_read_workers(ReadPass::Scan, read.read_workers),
         avg_geom_bytes: None,
-        footer: None,
+        footer: footer_price(&source, None, projection.iter().copied())?,
         profile: read.profile,
     };
+    // Every reader's queue, plus the batch being aggregated.
+    let read_ahead = grant_read_ahead(&mut budget, tuning, 1);
     let mut cells = Cells::new();
     let mut interner = GroupInterner::default();
-    let (mut rows, mut skipped, mut cat_pairs) = (0usize, 0usize, 0u64);
+    let (mut rows, mut skipped, mut cat_bytes) = (0usize, 0usize, 0u64);
     read_in_order(&source, None, Some(&projection), tuning, |batch, _, _| {
         let n = batch.num_rows();
         rows += n;
+        // Checked before the batch lands, so a cell map that would outgrow
+        // the budget fails here, not by OOM kill.
+        budget.require(
+            MemoryPhase::Scan,
+            cells.bytes(specs, cat_bytes, n) + interner.heap_bytes(),
+        )?;
         let bschema = batch.schema();
         let col = |name: &str| bschema.index_of(name).map(|i| batch.column(i).clone());
         let geom_i = bschema.index_of(&geom_name)?;
@@ -664,14 +697,10 @@ fn aggregate(
             })
             .collect::<Result<_, ConvertError>>()?;
         skipped += chunks.iter().map(|c| c.1).sum::<usize>();
-        cat_pairs += cells.absorb(chunks.into_iter().map(|c| c.0).collect());
-        // A cell map that outgrows the budget fails here, not by OOM kill.
-        budget.require(
-            MemoryPhase::Scan,
-            cells.capacity() * cell_bytes(specs) + cat_pairs * 12 + interner.heap_bytes(),
-        )?;
+        cat_bytes += cells.absorb(chunks.into_iter().map(|c| c.0).collect());
         Ok(ReadFlow::Continue)
     })?;
+    budget.release(read_ahead);
     if skipped > 0 {
         diagnostics.once(crate::diagnostics::Diagnostic::UnusableGeometry {
             count: skipped,
@@ -679,11 +708,13 @@ fn aggregate(
         });
     }
     let labels = if cat_name.is_some() {
-        relabel_categories(&mut cells, &interner.into_values())
+        let labels = relabel_categories(&mut cells, &interner.into_values());
+        cat_bytes = cells.category_bytes();
+        labels
     } else {
         Vec::new()
     };
-    Ok((cells, labels, budget, cat_pairs))
+    Ok((cells, labels, budget, cat_bytes))
 }
 
 /// The point a feature is counted at: its centroid, `None` when it has
@@ -1142,5 +1173,73 @@ mod tests {
             std::fs::read(&table).unwrap()
         };
         assert_eq!(sum_on(1), sum_on(16));
+    }
+
+    /// A cell table drops the input's other columns, so one named like a
+    /// category count column (`name:legacy` beside `name`) is no collision.
+    #[test]
+    fn unrelated_category_named_columns_are_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pts.parquet");
+        let geoms = vec![Some(Geometry::Point(geo::Point::new(1.0, 1.0))); 3];
+        crate::overview::testutil::write_input(&src, &geoms, false, Some("name:legacy"));
+        let table = dir.path().join("t.parquet");
+        let rollup = CellRollup {
+            accumulate: &[],
+            categories: Some("name"),
+        };
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let read = ConvertOptions::default();
+        write_cell_tables(
+            &src,
+            CellSystem::S2,
+            (3, 3),
+            rollup,
+            &[&table],
+            &read,
+            &diagnostics,
+        )
+        .unwrap();
+    }
+
+    /// Category counts are priced by what they allocate: a first count
+    /// takes four 16-byte `(u32, i64)` slots, and the tracked total matches
+    /// a recount after batches merge.
+    #[test]
+    fn category_bytes_are_priced_by_capacity() {
+        let mut one = CategoryCounts::default();
+        one.add(7);
+        assert_eq!(one.heap_bytes(), FIRST_COUNTS_BYTES);
+        assert_eq!(FIRST_COUNTS_BYTES, 64);
+        for slot in 0..5 {
+            one.add(slot);
+        }
+        assert_eq!(
+            one.heap_bytes(),
+            8 * 16,
+            "six pairs grow the Vec to eight slots"
+        );
+
+        let part = |ids: &[u64], slot: u32| {
+            let mut maps: Vec<CellMap> = (0..SHARDS).map(|_| CellMap::new()).collect();
+            for &id in ids {
+                let acc = maps[shard_of(id)]
+                    .entry(id)
+                    .or_insert_with(|| CellAcc::new(0));
+                acc.count += 1;
+                acc.cats.add(slot);
+            }
+            maps
+        };
+        let mut cells = Cells::new();
+        let tracked = cells.absorb(vec![part(&[1, 2, 3], 0), part(&[2, 3, 4], 1)]);
+        assert_eq!(tracked, cells.category_bytes());
+        assert_eq!(tracked, 4 * FIRST_COUNTS_BYTES);
+
+        // A batch's worst case: every row a new cell, held in a partial map
+        // and in the map, which here must also grow.
+        let empty = Cells::new();
+        let per_row = cell_bytes(0) + FIRST_COUNTS_BYTES;
+        assert_eq!(empty.bytes(0, 0, 10), 20 * cell_bytes(0) + 20 * per_row);
     }
 }

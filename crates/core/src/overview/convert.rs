@@ -5987,16 +5987,19 @@ pub(super) fn validate_cluster_schema(
     {
         return Err(ConvertError::PointCountColumnPresent);
     }
-    validate_rollup_columns(schema, options)
+    validate_rollup_columns(schema, options, true)
 }
 
 /// The rollup half of [`validate_cluster_schema`], which a pyramid cell band
 /// (#332) also runs: every accumulate column exists and is numeric, and the
-/// `--cluster-categories` column is a string whose count columns are free.
+/// `--cluster-categories` column is a string. When `keeps_source_columns`,
+/// the output keeps the input's columns, so its `COL:<value>` count columns
+/// must not already be taken; a cell table drops them and skips that check.
 /// Returns the accumulate columns' indices.
 pub(super) fn validate_rollup_columns(
     schema: &Schema,
     options: &ConvertOptions,
+    keeps_source_columns: bool,
 ) -> Result<Vec<usize>, ConvertError> {
     let mut indices = Vec::with_capacity(options.accumulate.len());
     for spec in &options.accumulate {
@@ -6033,7 +6036,7 @@ pub(super) fn validate_rollup_columns(
         if let Some(f) = schema
             .fields()
             .iter()
-            .find(|f| f.name().starts_with(&prefix))
+            .find(|f| keeps_source_columns && f.name().starts_with(&prefix))
         {
             return Err(problem(format!(
                 "would write {prefix}<value> count columns, but the input already has a \
