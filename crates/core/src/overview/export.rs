@@ -1459,21 +1459,15 @@ pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> Result<u8, Expo
 /// memory.
 const DEFAULT_PARTITION_TARGET: usize = 32_768;
 
-/// The partition target under `--profile bounded` (#815): a quarter of
-/// [`DEFAULT_PARTITION_TARGET`]. A wave keeps one partition per core, so its
-/// resident members shrink by the same factor while every core still encodes
-/// a partition; the archive does not depend on the target. Export levels set
-/// bounded's peak on large inputs (NZ parcels 4,458 -> 2,742 MiB, `BR_MT` 4,423
-/// -> 2,384 MiB export-only, byte-identical).
-const BOUNDED_PARTITION_TARGET: usize = DEFAULT_PARTITION_TARGET / 4;
-
-/// The production partition target for `profile`.
-fn export_partition_target(profile: MemoryProfile) -> usize {
-    match profile {
-        MemoryProfile::Bounded => BOUNDED_PARTITION_TARGET,
-        MemoryProfile::Auto | MemoryProfile::Speed => DEFAULT_PARTITION_TARGET,
-    }
-}
+/// How much smaller `bounded` plans a level's partitions once the level
+/// takes several waves (#815). A wave keeps one partition per core, so its
+/// members shrink by this factor while every core still encodes one. Such a
+/// level already spills every wave but the one it encodes, so smaller waves
+/// add wave barriers but no spill; a one-wave level keeps its partitions, as
+/// splitting it would spill what it holds. The archive does not depend on
+/// the target. NZ parcels 4,458 -> 2,742 MiB, `BR_MT` 4,423 -> 2,384 MiB
+/// export-only.
+const BOUNDED_MULTI_WAVE_SPLIT: usize = 4;
 
 /// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing.
 ///
@@ -2018,12 +2012,7 @@ pub fn export_pmtiles(
     output_path: impl AsRef<Path>,
     options: &ExportOptions,
 ) -> Result<ExportReport, ExportError> {
-    export_pmtiles_with_partition_target(
-        input_path,
-        output_path,
-        options,
-        export_partition_target(options.profile),
-    )
+    export_pmtiles_with_partition_target(input_path, output_path, options, DEFAULT_PARTITION_TARGET)
 }
 
 /// Implementation of [`export_pmtiles`] with an explicit partition-size target,
@@ -2227,26 +2216,32 @@ fn plan_level(
         ref budget,
         ..
     } = *inputs;
-    let partitions = plan_partitions(tile_counts, zoom, partition_target);
-    // Per-level memory guard (#311): on `auto`, narrow the wave from THIS
-    // level's densest planned partition so a dense finest zoom does not OOM
-    // the whole run. Explicit waves are honoured verbatim.
-    let wave = if auto_wave {
-        let w = memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, profile, budget);
-        if w < ceiling_wave {
-            let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
-            log::info!(
-                "[export] {}: wave {ceiling_wave} → {w} (densest partition {densest} \
-                 members × ~{} B/member resident, {} MiB budget) — #311 density guard",
-                label(),
-                member_bytes.unwrap_or(0),
-                export_collect_bytes(profile, budget) / (1024 * 1024),
-            );
-        }
-        w
-    } else {
-        ceiling_wave
+    let plan = |target: usize| {
+        let partitions = plan_partitions(tile_counts, zoom, target);
+        let wave = if auto_wave {
+            memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, profile, budget)
+        } else {
+            ceiling_wave
+        };
+        (partitions, wave)
     };
+    // Per-level memory guard (#311): on `auto`, the wave is narrowed from
+    // THIS level's densest planned partition so a dense finest zoom does not
+    // OOM the whole run. Explicit waves are honoured verbatim.
+    let (mut partitions, mut wave) = plan(partition_target);
+    if profile == MemoryProfile::Bounded && partitions.len() > wave {
+        (partitions, wave) = plan(partition_target / BOUNDED_MULTI_WAVE_SPLIT);
+    }
+    if wave < ceiling_wave {
+        let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
+        log::info!(
+            "[export] {}: wave {ceiling_wave} → {wave} (densest partition {densest} \
+             members × ~{} B/member resident, {} MiB budget) — #311 density guard",
+            label(),
+            member_bytes.unwrap_or(0),
+            export_collect_bytes(profile, budget) / (1024 * 1024),
+        );
+    }
     LevelPlan {
         zoom,
         partitions,
@@ -17930,19 +17925,44 @@ mod tests {
         );
     }
 
-    /// #815: a bounded wave of one partition per core holds a quarter of the
-    /// members an auto wave does (2 Mi on 64 cores, which set bounded's peak
-    /// on NZ parcels and `BR_MT`), and auto keeps its target.
+    /// #815: `bounded` plans a level that takes several waves in a quarter
+    /// of the partition target, so each wave holds a quarter of the members;
+    /// a one-wave level, and `auto`, keep the target.
     #[test]
-    fn bounded_waves_hold_a_quarter_of_the_members() {
-        assert_eq!(
-            64 * export_partition_target(MemoryProfile::Bounded),
-            512 * 1024
-        );
-        assert_eq!(
-            export_partition_target(MemoryProfile::Auto),
-            DEFAULT_PARTITION_TARGET
-        );
+    fn bounded_multi_wave_levels_hold_a_quarter_of_the_members_per_wave() {
+        let plan = |tiles: u64, profile| {
+            let counts: BTreeMap<u64, usize> = (0..tiles)
+                .map(|t| (tile_key(u32::try_from(t).unwrap(), 0, 10), 1_000))
+                .collect();
+            plan_level(
+                &counts,
+                10,
+                &PartitionBudget {
+                    partition_target: 8_000,
+                    ceiling_wave: 4,
+                    auto_wave: false,
+                    member_bytes: None,
+                    fit_member_bytes: None,
+                    profile,
+                    budget: MemoryBudget::with_available(None),
+                    fit_limit: None,
+                },
+                String::new,
+            )
+        };
+        let wave_members = |p: &LevelPlan| {
+            p.partitions
+                .chunks(p.wave)
+                .map(|w| w.iter().map(|p| p.members).sum::<usize>())
+                .max()
+                .unwrap()
+        };
+        // 64 tiles of 1,000 members: 8 partitions, two waves of four.
+        let auto = plan(64, MemoryProfile::Auto);
+        assert_eq!(wave_members(&auto), 32_000);
+        assert_eq!(wave_members(&plan(64, MemoryProfile::Bounded)), 8_000);
+        // 32 tiles: one wave, kept whole.
+        assert_eq!(plan(32, MemoryProfile::Bounded).partitions.len(), 4);
     }
 
     /// #815: in a partitioning fill a feature that no level clips is held
