@@ -212,6 +212,8 @@ export_pmtiles(
     variable_depth: bool = False,
     tile_range: str | None = None,
     zoom_ceiling: int | None = None,
+    tile_format: Literal['mvt', 'mlt'] = "mvt",
+    mlt_profile: Literal['web', 'native', 'min-size', 'diffable', 'fast-encoding'] = "web",
 ) -> ExportReport
 ```
 
@@ -246,6 +248,8 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `variable_depth`: End each branch of the tile pyramid at the coarsest zoom whose tile holds all of that area's finest-level features within both size caps, like tippecanoe's `--generate-variable-depth-tile-pyramid`. The server must serve the nearest ancestor for a missing tile. See `docs/OVERVIEW_TUNING.md`.
 * `tile_range`: Export only the tiles in this tile-id range, `"LO..HI"`: one shard of a sharded build.
 * `zoom_ceiling`: Export only the tiles at or below this zoom: the coarse job of a sharded build.
+* `tile_format`: TODO(docs)
+* `mlt_profile`: TODO(docs)
 
 ### Returns
 
@@ -299,6 +303,9 @@ pyramid(
     include_properties: Sequence[str] | None = None,
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
+    profile: Literal['auto', 'speed', 'bounded'] = "auto",
+    tile_format: Literal['mvt', 'mlt'] = "mvt",
+    mlt_profile: Literal['web', 'native', 'min-size', 'diffable', 'fast-encoding'] = "web",
 ) -> PyramidReport
 ```
 
@@ -330,6 +337,9 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 * `include_properties`: Keep only these properties in the tiles of GeoParquet bands. `[]` keeps none.
 * `exclude_properties`: Drop these properties from the tiles of GeoParquet bands. `include_properties` overrides it.
 * `exclude_all_properties`: Drop every property from the tiles of GeoParquet bands. `include_properties` overrides it.
+* `profile`: TODO(docs)
+* `tile_format`: TODO(docs)
+* `mlt_profile`: TODO(docs)
 
 ### Returns
 
@@ -549,6 +559,8 @@ convert(
     read_workers: int = 0,
     save_plan: str | os.PathLike[str] | None = None,
     plan: str | os.PathLike[str] | None = None,
+    tile_format: Literal['mvt', 'mlt'] = "mvt",
+    mlt_profile: Literal['web', 'native', 'min-size', 'diffable', 'fast-encoding'] = "web",
 ) -> ConvertReport
 ```
 
@@ -631,6 +643,8 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `read_workers`: See `overview()`.
 * `save_plan`: See `overview()`.
 * `plan`: See `overview()`.
+* `tile_format`: TODO(docs)
+* `mlt_profile`: TODO(docs)
 
 ### Returns
 
