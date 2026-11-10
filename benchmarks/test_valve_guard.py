@@ -371,3 +371,18 @@ def test_other_class_with_the_same_stale_baseline_is_not_applicable():
 def test_a_complete_pinned_baseline_still_passes():
     v = _check(_cores_cell())
     assert v["baseline"]["status"] == "pass" and v["floors"]["status"] == "pass"
+
+
+def test_792_def_speedup_collapse_fails_on_the_pinned_class():
+    # export levels regressed most often; its effective cores hide spin, so 792-def is a scaling cell
+    base = {"hosts": {vg.PINNED_CLASS: {"host": VM, "floors": FLOORS,
+                                        "cells": {"792-def": _cores_cell(speed=3.0)}}}}
+    v = vg.verdict({"792-def": _cores_cell(speed=1.0)}, base, VM)
+    assert vg.exit_status(v) == 1
+    assert any("792-def" in f and LEVELS in f and "speedup" in f for f in v["baseline"]["failures"])
+    assert vg.verdict({"792-def": _cores_cell(speed=3.0)}, base, VM)["baseline"]["status"] == "pass"
+    # a 792-def baseline recorded without the 16-thread arm is stale
+    holed = {**_cores_cell(), "speedup_16_to_full": {}}
+    v = vg.verdict({"792-def": _cores_cell()}, {"hosts": {vg.PINNED_CLASS: {
+        "host": VM, "floors": FLOORS, "cells": {"792-def": holed}}}}, VM)
+    assert any(f"speedup_16_to_full[{LEVELS}]" in f for f in v["baseline"]["failures"])

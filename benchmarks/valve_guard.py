@@ -91,7 +91,9 @@ DEFAULT_FLOORS = {"whole_cores_frac": 0.05, "serial_share_max": 0.10}
 SPEEDUP_DROP_MAX = 0.15  # 16-to-full-thread speedup may fall 15% below the baseline's
 CPU_RISE_MAX = 0.25      # a phase's CPU core-seconds may rise 25% over the baseline's (same output)
 LOW_THREADS = 16
-SCALING_CELLS = ("moldova-tiles",)  # the cells also run at RAYON_NUM_THREADS=LOW_THREADS
+# The cells also run at RAYON_NUM_THREADS=LOW_THREADS. 792-def: export levels is
+# where parallelism regressed most often, and its effective cores hide spin.
+SCALING_CELLS = ("moldova-tiles", "792-def")
 CPU_MIN_BASELINE_S = 0.05  # a shorter phase's core-seconds are noise: skipped, said so
 CORE_PHASES = ("convert/pass2 (output sink)", "export/levels")
 EXEMPTIONS = HERE.parent / "ci" / "exemptions.toml"
