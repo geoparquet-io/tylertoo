@@ -104,3 +104,12 @@ def test_stream_arguments_are_refused_for_a_file(tmp_path: Path) -> None:
 def test_a_stream_without_geometry_names_the_argument(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="geometry_column="):
         tylertoo.convert(pl.read_parquet(FIXTURE), str(tmp_path / "o.pmtiles"))
+
+
+def test_a_saved_plan_is_refused_for_a_stream(tmp_path: Path) -> None:
+    with pytest.raises(tylertoo.ConfigError, match="file input"):
+        tylertoo.overview(
+            geoarrow_table(),
+            str(tmp_path / "o.parquet"),
+            save_plan=str(tmp_path / "plan"),
+        )

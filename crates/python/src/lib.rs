@@ -294,7 +294,7 @@ fn stage_stream(
     py: Python<'_>,
     input: &Bound<'_, PyAny>,
     args: StreamArgs,
-    spill_dir: Option<&Path>,
+    options: &ConvertOptions,
     output: &Path,
 ) -> PyResult<Option<StagedStream>> {
     if !input.hasattr("__arrow_c_stream__")? {
@@ -305,6 +305,12 @@ fn stage_stream(
             ));
         }
         return Ok(None);
+    }
+    // A plan fingerprints its input file; a staged stream's is new each run.
+    if options.save_plan.is_some() || options.plan.is_some() {
+        return Err(config_err(
+            "save_plan and plan need a file input; an Arrow stream is staged anew each run",
+        ));
     }
     // Refuse an unwritable output before staging the whole stream.
     tylertoo_core::internal::atomic_output::check_writable(output).map_err(|e| {
@@ -322,7 +328,7 @@ fn stage_stream(
             reader,
             args.geometry_column.as_deref(),
             args.crs.as_deref(),
-            spill_dir,
+            options.spill_dir.as_deref(),
             &stem,
         )
     })
@@ -367,7 +373,7 @@ fn convert(
     // it converts (#444, #788).
     options.validate().map_err(tiles_error_to_py)?;
 
-    let staged = stage_stream(py, input, stream_args, options.convert.spill_dir.as_deref(), &output_path)?;
+    let staged = stage_stream(py, input, stream_args, &options.convert, &output_path)?;
     let input_path = match &staged {
         Some(staged) => staged.path().to_path_buf(),
         None => PathBuf::from(input.extract::<String>().map_err(|_| {
@@ -421,7 +427,7 @@ fn overview(
     // #779: every rule that needs no input, before anything is read.
     options.validate().map_err(convert_error_to_py)?;
     let output_path = PathBuf::from(output);
-    let staged = stage_stream(py, input, stream_args, options.spill_dir.as_deref(), &output_path)?;
+    let staged = stage_stream(py, input, stream_args, &options, &output_path)?;
 
     // `str` stays the single-input path (files, directories, globs, remote
     // URLs/prefixes — resolved by core); `list[str]` is an explicit ordered

@@ -194,31 +194,37 @@ pub fn stage_arrow_stream(
             .map_err(ConvertError::Parquet)?;
     let mut rows = 0;
     for batch in reader {
-        let columns = batch
-            .map_err(ConvertError::Arrow)?
-            .columns()
-            .iter()
-            .zip(schema.fields())
-            .map(|(column, field)| arrow_cast::cast(column, field.data_type()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(ConvertError::Arrow)?;
-        // The pinned WKB reader panics on some malformed values; refuse them
-        // first, as the file readers do.
-        for &i in &wkb {
-            crate::wkb_column::check_wkb_column(columns[i].as_ref()).map_err(|(row, e)| {
-                stream_error(format!(
-                    "geometry column {:?}, row {}: {e}",
-                    schema.field(i).name(),
-                    rows + row
-                ))
-            })?;
+        let batch = batch.map_err(ConvertError::Arrow)?;
+        // At most one row group per slice, so the cast and the encode never
+        // hold more than that whatever batch size the producer chose.
+        for at in (0..batch.num_rows()).step_by(STAGE_ROW_GROUP_ROWS) {
+            let slice = batch.slice(at, STAGE_ROW_GROUP_ROWS.min(batch.num_rows() - at));
+            let columns = slice
+                .columns()
+                .iter()
+                .zip(schema.fields())
+                .map(|(column, field)| arrow_cast::cast(column, field.data_type()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ConvertError::Arrow)?;
+            // The pinned WKB reader panics on some malformed values; refuse
+            // them first, as the file readers do.
+            for &i in &wkb {
+                crate::wkb_column::check_wkb_column(columns[i].as_ref()).map_err(|(row, e)| {
+                    stream_error(format!(
+                        "geometry column {:?}, row {}: {e}",
+                        schema.field(i).name(),
+                        rows + row
+                    ))
+                })?;
+            }
+            rows += slice.num_rows();
+            let slice =
+                RecordBatch::try_new(schema.clone(), columns).map_err(ConvertError::Arrow)?;
+            let encoded = encoder
+                .encode_record_batch(&slice)
+                .map_err(|e| stream_error(e.to_string()))?;
+            writer.write(&encoded).map_err(ConvertError::Parquet)?;
         }
-        rows += columns.first().map_or(0, |c| c.len());
-        let batch = RecordBatch::try_new(schema.clone(), columns).map_err(ConvertError::Arrow)?;
-        let encoded = encoder
-            .encode_record_batch(&batch)
-            .map_err(|e| stream_error(e.to_string()))?;
-        writer.write(&encoded).map_err(ConvertError::Parquet)?;
     }
     writer.append_key_value_metadata(
         encoder
