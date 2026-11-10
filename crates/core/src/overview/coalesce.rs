@@ -448,6 +448,7 @@ fn coalesce_chains<'g>(
             let cands: Vec<usize> = (0..survivors.len()).collect();
             let mut chosen = super::assign::select_budget_survivors(
                 &cands,
+                &[],
                 max_chains,
                 &feats,
                 config.sort_direction,
@@ -2110,9 +2111,12 @@ mod golden_digest {
             merged += m;
             h = h.rotate_left(7) ^ digest(&out);
         }
-        assert_eq!(merged, 8349, "the generator must keep exercising joins");
+        // #850 re-pinned both: the chain budget's cells are laid in Web
+        // Mercator and shared out in Z-order with a running total, and a
+        // tile it would empty keeps one chain, so it keeps other chains.
+        assert_eq!(merged, 9571, "the generator must keep exercising joins");
         assert_eq!(
-            h, 0x98cb_5976_7524_9af4,
+            h, 0x8956_2abd_e71f_352d,
             "chain builder output changed against the pre-#570 golden digest"
         );
     }

@@ -28,7 +28,7 @@ use super::{
     tile_key, tiles_in_ranges, BandRead, CheckpointCtx, Crs, EncodedTile, ExportError,
     ExportLevelCtx, ExportOptions, ExportProgress, ExportTimers, FillTally, GroupGate, LevelCtx,
     LevelMemory, LevelScan, Member, PartitionBudget, PublishedNames, ResolvedFeatureId,
-    StreamingPmtilesWriter, TileMvt, ZoomReport, DEFAULT_EXTENT,
+    StreamingPmtilesWriter, TileMvt, ZoomReport, DEFAULT_EXTENT, DEFAULT_TILE_SIZE_LIMIT,
 };
 use crate::compression::TileGzipCache;
 use crate::tile::{max_tile_index, BboxTileRanges, TileBounds, TileCoord, MAX_LATITUDE};
@@ -53,10 +53,6 @@ pub(crate) fn check_options(options: &ExportOptions) -> Result<(), ConfigError> 
         Some("--tile-range (a sharded build)".to_string())
     } else if options.zoom_ceiling.is_some() {
         Some("--zoom-ceiling (a sharded build)".to_string())
-    } else if options.tile_size_limit.is_none_or(|l| l == 0) {
-        // Without it, one candidate holds the whole canonical band, encoded
-        // in full before the gzip cap can reject it. tippecanoe always caps.
-        Some("--max-tile-size 0 (the probe needs the raw tile size cap)".to_string())
     } else {
         None
     };
@@ -850,6 +846,16 @@ pub(super) struct Frontier {
 /// drawn at the usual depth.
 const MIN_FEATURE_BYTES: usize = 11;
 
+/// The raw bytes a probed tile may reach: the raw cap, or the default one
+/// when there is none (#849). Without a bound a coarse candidate is the
+/// whole canonical band, encoded in full before the gzip cap could reject
+/// it. A tile over the bound is not a stop; it is drawn at the usual depth.
+fn probe_raw_cap(opts: &ExportOptions) -> usize {
+    opts.tile_size_limit
+        .filter(|&l| l > 0)
+        .unwrap_or(DEFAULT_TILE_SIZE_LIMIT)
+}
+
 impl VdPlan {
     /// The probe's candidates at level `k`, given the stops so far: tiles
     /// rule A′ lets stop, not under a stop, not over the raw cap on their
@@ -867,13 +873,13 @@ impl VdPlan {
             extent,
             ..options.clone()
         };
-        let raw_cap = opts.tile_size_limit.filter(|&l| l > 0);
+        let raw_cap = probe_raw_cap(&opts);
         let candidates: BTreeMap<u64, usize> = self.canonical_counts[k]
             .iter()
             .filter(|&(&key, &n)| {
                 self.policy.may_stop(zoom, key)
                     && !frontier.covers(&self.zooms, zoom, key)
-                    && raw_cap.is_none_or(|cap| n.saturating_mul(MIN_FEATURE_BYTES) <= cap)
+                    && n.saturating_mul(MIN_FEATURE_BYTES) <= raw_cap
                     && within_clamp(key, zoom, &opts)
             })
             .map(|(&key, &n)| (key, n))
@@ -1096,10 +1102,7 @@ fn probe_tile(
     let staged = crate::diagnostics::Diagnostics::silent();
     // The raw cap is checked as the tile is built, so a tile far over it
     // costs only the members that fill the cap, and is never compressed.
-    let raw_cap = opts
-        .tile_size_limit
-        .filter(|&l| l > 0)
-        .unwrap_or(usize::MAX);
+    let raw_cap = probe_raw_cap(opts);
     let Some(mut mvt) = build_mvt_within(
         gzip_cache,
         tile,
@@ -1457,22 +1460,6 @@ mod tests {
                     ..vd()
                 },
                 "--zoom-ceiling",
-            ),
-            // Without a raw cap one candidate is the whole canonical band.
-            (
-                ExportOptions {
-                    tile_size_limit: None,
-                    ..vd()
-                },
-                "--max-tile-size 0",
-            ),
-            (
-                ExportOptions {
-                    tile_size_limit: Some(0),
-                    compressed_tile_size_limit: None,
-                    ..vd()
-                },
-                "--max-tile-size 0",
             ),
         ];
         for (options, needle) in cases {
@@ -2338,6 +2325,16 @@ mod tests {
         let (_, tiles) = export_vd(&ov, raw_cap(1_000_000));
         assert_eq!(tiles.keys().copied().collect::<Vec<_>>(), vec![(0, 0, 0)]);
         assert_eq!(extent(&tiles[&(0, 0, 0)]), 4096 << 6);
+        // #849: no raw cap (the tippecanoe preset's) is not refused; the
+        // probe is bounded by the default raw cap instead.
+        for none in [None, Some(0)] {
+            let opts = ExportOptions {
+                tile_size_limit: none,
+                ..raw_cap(0)
+            };
+            let (_, tiles) = export_vd(&ov, opts);
+            assert_eq!(tiles.keys().copied().collect::<Vec<_>>(), vec![(0, 0, 0)]);
+        }
         let (_, tiles) = export_vd(&ov, raw_cap(40));
         assert!(stopped(&tiles, 6).is_empty());
         let gzip = ExportOptions {

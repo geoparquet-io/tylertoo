@@ -86,6 +86,21 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An `https://` input keeps its query string, so presigned S3 and Azure SAS
   URLs work; the query is shown as `?<redacted>` in logs, errors, reports
   and saved plans (#820).
+- The density budget no longer empties sparse tiles (#850). Three causes,
+  all fixed: the rounding leftover went to the first neighborhoods in scan
+  order, so equal small shares emptied every later one; each level shared
+  out only its newcomers, so rounding errors compounded level by level; and
+  nothing matched tippecanoe's rule that a tile keeps its first feature
+  whatever the drop rate. Now the shares are rounded as a running total in Z-order over
+  a Web Mercator grid, each counts what coarser levels kept, and a tile the
+  budget would empty keeps one feature. On 1.05M Overture places,
+  `--preset tippecanoe` missed 298 of tippecanoe's 1,645 z12 tiles and 1,022
+  of its 5,094 z13 tiles; it now misses 13 and 42, with the same per-zoom
+  feature counts. Any budgeted output changes, the default included.
+- `--generate-variable-depth-tile-pyramid` takes `--max-tile-size 0`, and so
+  `--preset tippecanoe`, which sets it (#849). It used to refuse them, naming
+  a flag the preset user never passed. With no raw cap the probe is bounded
+  by the default 2M; a tile over it is drawn at the usual depth.
 - A crafted Parquet footer with an overlong varint, or a page header that
   skips past the end of the file, is refused instead of allocating gigabytes
   or spinning for minutes (#789).
