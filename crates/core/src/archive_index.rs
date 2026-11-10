@@ -122,6 +122,17 @@ pub enum ArchiveError {
         /// The archive, when the reader knows it.
         path: Option<PathBuf>,
     },
+    /// A tile body did not decompress or decode as MVT.
+    #[error("tile at byte offset {offset} ({length} bytes): {error}")]
+    #[non_exhaustive]
+    Tile {
+        /// The body's offset in the tile-data section.
+        offset: u64,
+        /// The body's stored length.
+        length: u64,
+        /// What went wrong.
+        error: String,
+    },
     /// A directory entry's run of tile ids overflows the id space.
     #[error("tile id past end of range")]
     TileIdOverflow,

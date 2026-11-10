@@ -340,6 +340,10 @@ struct StatsArgs {
     #[arg(long, value_name = "N", default_value = "10")]
     largest: usize,
 
+    /// TODO(docs)
+    #[arg(long)]
+    layers: bool,
+
     /// Print the report as JSON instead of a human-readable table.
     #[arg(long)]
     json: bool,
@@ -1784,7 +1788,7 @@ fn run_stats(args: StatsArgs) -> Result<()> {
             anyhow::anyhow!("could not open {}: {e}", args.archive.display())
         }
     })?;
-    let report = compute_stats(&archive, args.largest)
+    let report = compute_stats(&archive, args.largest, args.layers)
         .map_err(|e| anyhow::anyhow!("stats failed for {}: {e}", args.archive.display()))?;
 
     if args.json {
@@ -1865,6 +1869,32 @@ fn print_stats_table(report: &tylertoo_core::internal::stats::StatsReport) {
             })
             .collect();
         println!("{}", render_table(&["z", "x", "y", "bytes"], &largest_rows));
+    }
+
+    if let Some(per_layer) = &report.per_layer {
+        let rows: Vec<Vec<String>> = per_layer
+            .iter()
+            .map(|l| {
+                let types = l
+                    .geometry_types
+                    .iter()
+                    .map(|(t, n)| format!("{t}:{n}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                vec![
+                    l.z.to_string(),
+                    l.layer.clone(),
+                    format_number(l.feature_count),
+                    format_number(l.bytes),
+                    types,
+                ]
+            })
+            .collect();
+        println!("\nPer layer:");
+        println!(
+            "{}",
+            render_table(&["z", "layer", "features", "bytes", "geometry"], &rows)
+        );
     }
 }
 

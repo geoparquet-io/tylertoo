@@ -52,7 +52,7 @@ pub fn fuzz_archive_index(bytes: &[u8]) -> crate::Result<u64> {
         index.read_range(tile?.range)?;
         tiles += 1;
     }
-    crate::stats::compute_stats(&index, 10)?;
+    crate::stats::compute_stats(&index, 10, true)?;
     Ok(tiles)
 }
 
