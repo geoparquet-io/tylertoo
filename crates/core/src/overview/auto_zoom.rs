@@ -552,11 +552,7 @@ impl GeoArrowVisitor for SampledBboxes<'_> {
                     // skipped here too.
                     Some(m) => {
                         let (_, bbox) = super::convert::scan_feature_traits(&g)?;
-                        m.may_hit(&bbox)
-                            .then(|| g.try_to_geometry())
-                            .flatten()
-                            .filter(|geom| m.intersects(geom, &bbox))
-                            .map(|_| bbox)
+                        m.keep(&g, &bbox).map(|_| bbox)
                     }
                     None => {
                         let mut acc = BboxAcc::new();

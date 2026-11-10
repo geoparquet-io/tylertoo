@@ -5569,11 +5569,7 @@ impl GeoArrowVisitor for ScanRows<'_> {
             };
             let keep_geom = self.all_geoms || (self.line_geoms && kind == FeatureKind::Line);
             if let Some(mask) = self.mask {
-                let hit = mask
-                    .may_hit(&bbox)
-                    .then(|| g.try_to_geometry())
-                    .flatten()
-                    .filter(|geom| mask.intersects(geom, &bbox));
+                let hit = mask.keep(&g, &bbox);
                 out.push(Some(ScannedRow {
                     kind,
                     bbox,

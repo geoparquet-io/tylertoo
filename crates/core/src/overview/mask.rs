@@ -355,6 +355,19 @@ impl MaskIndex {
         self.query.intersects(fbbox)
     }
 
+    /// The row check conversion and the zoom estimate share: `g` (bbox
+    /// `fbbox`) as a `geo` geometry when it meets the mask, else `None`.
+    pub(crate) fn keep<G: geo_traits::to_geo::ToGeoGeometry<f64>>(
+        &self,
+        g: &G,
+        fbbox: &[f64; 4],
+    ) -> Option<Geometry<f64>> {
+        self.may_hit(fbbox)
+            .then(|| g.try_to_geometry())
+            .flatten()
+            .filter(|geom| self.intersects(geom, fbbox))
+    }
+
     /// Whether `g` (bbox `fbbox`) intersects the mask, or would one world
     /// width away, as `--bbox` matches (#643).
     pub(crate) fn intersects(&self, g: &Geometry<f64>, fbbox: &[f64; 4]) -> bool {
@@ -453,6 +466,10 @@ impl Hit<'_> {
     /// A vertex inside the mask decides at once; otherwise the line hits
     /// only by meeting a mask edge.
     fn hits_line(&self, ls: &LineString<f64>) -> bool {
+        if let [c] = ls.0.as_slice() {
+            // No segments: a single coordinate tests as a point.
+            return self.hits_point(*c);
+        }
         ls.0.first().is_some_and(|c| self.mask.area.contains(c))
             || ls.lines().any(|l| self.meets_edge(l.start, l.end))
     }
@@ -528,6 +545,9 @@ mod tests {
             &m,
             line_string![(x: 3.0, y: 0.5), (x: 3.5, y: 1.5)].into()
         ));
+        // A one-coordinate line on the boundary tests as a point.
+        assert!(hit(&m, LineString::from(vec![(2.0, 3.0)]).into()));
+        assert!(!hit(&m, LineString::from(vec![(3.0, 3.0)]).into()));
         // Polygons: in the notch, in the hole, holding the whole mask,
         // holding the mask in its own hole.
         assert!(!hit(
