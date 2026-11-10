@@ -212,6 +212,8 @@ export_pmtiles(
     variable_depth: bool = False,
     tile_range: str | None = None,
     zoom_ceiling: int | None = None,
+    tile_format: Literal['mvt', 'mlt'] = "mvt",
+    mlt_profile: Literal['web', 'native', 'min-size', 'diffable', 'fast-encoding'] = "web",
 ) -> ExportReport
 ```
 
@@ -246,6 +248,8 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `variable_depth`: End each branch of the tile pyramid at the coarsest zoom whose tile holds all of that area's finest-level features within both size caps, like tippecanoe's `--generate-variable-depth-tile-pyramid`. The server must serve the nearest ancestor for a missing tile. See `docs/OVERVIEW_TUNING.md`.
 * `tile_range`: Export only the tiles in this tile-id range, `"LO..HI"`: one shard of a sharded build.
 * `zoom_ceiling`: Export only the tiles at or below this zoom: the coarse job of a sharded build.
+* `tile_format`: Tile encoding, `"mvt"` (default) or `"mlt"`. MLT needs MapLibre GL JS 5.12 or later, or MapLibre Native. Each finished MVT tile is converted with mlt-core before gzip and both size caps, so the caps measure MLT bytes. MLT stores each attribute of a layer as one typed column, following mlt-core's MVT conversion: integers mixed with floats become f64 (doubles), and other mixes become strings. Attribute order within a feature becomes column order. MLT archives use PMTiles tile type 6 and metadata format `"mlt"`. Merge refuses to combine MVT and MLT archives.
+* `mlt_profile`: MLT profile. Non-default profiles need `tile_format="mlt"`. `"web"` (default) targets GL JS before 6.0, which decodes with @maplibre/mlt 1.1. It omits FastPFOR, FSST and shared dictionaries, and stores integer columns wider than 32 bits as doubles when every value is exact (absolute value at most 2^53): GL JS reads 64-bit integers as BigInt, and style expressions do not compare BigInt with numbers. The others are mlt-core's profiles: `"native"` for MapLibre Native with every codec and stored polygon triangles; `"min-size"` for smallest tiles; `"diffable"` for small binary diffs between releases; `"fast-encoding"` for quickest encoding.
 
 ### Returns
 
@@ -299,6 +303,9 @@ pyramid(
     include_properties: Sequence[str] | None = None,
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
+    profile: Literal['auto', 'speed', 'bounded'] = "auto",
+    tile_format: Literal['mvt', 'mlt'] = "mvt",
+    mlt_profile: Literal['web', 'native', 'min-size', 'diffable', 'fast-encoding'] = "web",
 ) -> PyramidReport
 ```
 
@@ -330,6 +337,9 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 * `include_properties`: Keep only these properties in the tiles of GeoParquet bands. `[]` keeps none.
 * `exclude_properties`: Drop these properties from the tiles of GeoParquet bands. `include_properties` overrides it.
 * `exclude_all_properties`: Drop every property from the tiles of GeoParquet bands. `include_properties` overrides it.
+* `profile`: Memory profile, as for `convert()`, applied to every GeoParquet band's convert and export. Changes memory use, not output bytes.
+* `tile_format`: See `export_pmtiles()`. Every band must have this format.
+* `mlt_profile`: See `export_pmtiles()`.
 
 ### Returns
 
@@ -549,6 +559,8 @@ convert(
     read_workers: int = 0,
     save_plan: str | os.PathLike[str] | None = None,
     plan: str | os.PathLike[str] | None = None,
+    tile_format: Literal['mvt', 'mlt'] = "mvt",
+    mlt_profile: Literal['web', 'native', 'min-size', 'diffable', 'fast-encoding'] = "web",
 ) -> ConvertReport
 ```
 
@@ -631,6 +643,8 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `read_workers`: See `overview()`.
 * `save_plan`: See `overview()`.
 * `plan`: See `overview()`.
+* `tile_format`: See `export_pmtiles()`.
+* `mlt_profile`: See `export_pmtiles()`.
 
 ### Returns
 

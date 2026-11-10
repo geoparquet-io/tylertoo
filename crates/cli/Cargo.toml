@@ -4,7 +4,9 @@ description = "CLI tool for converting GeoParquet to PMTiles vector tiles"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# mlt-core (default `mlt` feature, #823) needs 1.98; the libraries keep the
+# workspace's 1.95.
+rust-version = "1.98"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,7 +17,9 @@ categories.workspace = true
 [features]
 # mimalloc is the default global allocator (#739); `--no-default-features`
 # builds on the platform allocator (glibc malloc) instead.
-default = ["mimalloc"]
+default = ["mimalloc", "mlt"]
+# MapLibre Tile output (#823), on by default; see tylertoo-core's `mlt`.
+mlt = ["tylertoo-core/mlt"]
 dhat-heap = ["tylertoo-core/dhat-heap", "dhat"]
 # Off by default: compiles the hidden `gen-reference-docs` subcommand (and its
 # clap-markdown dependency) out of production builds. CI enables it to

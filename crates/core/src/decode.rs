@@ -327,7 +327,7 @@ pub fn decode_pmtiles(
     })?;
     let head_len = usize::try_from(src.total_len()).map_or(HEADER_BYTES, |l| l.min(HEADER_BYTES));
     let header = Header::from_bytes(&src.read_range(0, head_len)?)?;
-    if header.tile_type != TileType::Mvt {
+    if !matches!(header.tile_type, TileType::Mvt | TileType::Mlt) {
         return Err(DecodeError::NotVectorTiles(header.tile_type));
     }
 
@@ -986,8 +986,16 @@ fn decode_tile_features(
     tile: &TileRef,
     options: &DecodeOptions,
 ) -> Result<(Vec<(String, DecodedFeature)>, usize), DecodeError> {
-    let plain = decompress_capped(raw, header.tile_compression, MAX_TILE_BYTES)
+    let mut plain = decompress_capped(raw, header.tile_compression, MAX_TILE_BYTES)
         .map_err(|e| tile.decompress_error(e))?;
+    if header.tile_type == TileType::Mlt {
+        plain = crate::tile_format::mlt_to_mvt(&plain).map_err(|e| {
+            DecodeError::InvalidArchive(format!(
+                "tile z{}/{}/{} is not a valid MLT tile: {e}",
+                tile.z, tile.x, tile.y
+            ))
+        })?;
+    }
     let decoded = Tile::decode(plain.as_slice()).map_err(|source| DecodeError::Mvt {
         z: tile.z,
         x: tile.x,
@@ -1123,7 +1131,7 @@ pub fn fuzz_decode_tile(
 pub fn fuzz_decode_archive(bytes: &[u8]) -> Result<(usize, usize), DecodeError> {
     let options = DecodeOptions::default();
     let header = Header::from_bytes(bytes)?;
-    if header.tile_type != TileType::Mvt {
+    if !matches!(header.tile_type, TileType::Mvt | TileType::Mlt) {
         return Err(DecodeError::NotVectorTiles(header.tile_type));
     }
     let entries = collect_entries(&bytes, &header)?;

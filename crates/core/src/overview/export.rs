@@ -320,6 +320,7 @@ impl std::str::FromStr for SizeValve {
 }
 
 use crate::tile::WEBMERC_HALF_M;
+pub use crate::tile_format::{MltProfile, TileFormat};
 
 /// Options controlling a PMTiles export.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -387,6 +388,30 @@ pub struct ExportOptions {
     ))]
     #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile that exceeds its cap: `merge` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `drop` removes features, leaving holes while preserving each retained feature's attributes. Point tiles use feature dropping in both modes", long_help = None))]
     pub size_valve: SizeValve,
+    /// Tile encoding, MVT by default. Each finished MVT tile is converted
+    /// to MLT with mlt-core before gzip and both size caps, so the caps
+    /// measure MLT bytes. MLT uses PMTiles tile type 6 and metadata format
+    /// `mlt`; merge refuses to combine MVT and MLT archives.
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        default_value = ExportOptions::default().tile_format.as_str(),
+        value_parser = super::config::cli::spelled::<TileFormat>(&["mvt", "mlt"])
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Tile format: `mvt` (default) or `mlt` (MapLibre GL JS 5.12 or later, or MapLibre Native); MLT stores each attribute of a layer as one typed column, following mlt-core's MVT conversion: integers mixed with floats become f64 (doubles), other mixes become strings, and attribute order within a feature becomes column order; conversion precedes gzip and both size caps, so the caps measure MLT bytes; merge refuses mixed formats and pyramid bands must all have the given format", long_help = None))]
+    pub tile_format: TileFormat,
+    /// MLT encoding profile, accepted only with [`TileFormat::Mlt`].
+    /// Defaults to [`MltProfile::Web`].
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        default_value = ExportOptions::default().mlt_profile.as_str(),
+        value_parser = super::config::cli::spelled::<MltProfile>(
+            &["web", "native", "min-size", "diffable", "fast-encoding"]
+        )
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "MLT profile, non-default profiles need `--tile-format mlt`: `web` (default) targets GL JS before 6.0 with @maplibre/mlt 1.1, omits FastPFOR, FSST and shared dictionaries, and stores integer columns wider than 32 bits as doubles when every value is exact (absolute value at most 2^53), since GL JS reads 64-bit integers as BigInt and style expressions do not compare BigInt with numbers; mlt-core profiles: `native` for MapLibre Native with every codec and stored polygon triangles, `min-size` for smallest tiles, `diffable` for small binary diffs between releases, `fast-encoding` for quickest encoding", long_help = None))]
+    pub mlt_profile: MltProfile,
     /// Experimental (#750): draw, under each tile's own features below the
     /// finest zoom, the area its child tiles cover, built from the finest
     /// level before the export starts (`export/coverage_fill.rs`). Default
@@ -620,6 +645,8 @@ with_setters!(ExportOptions {
     with_tile_size_limit => tile_size_limit: Option<usize>,
     with_compressed_tile_size_limit => compressed_tile_size_limit: Option<usize>,
     with_size_valve => size_valve: SizeValve,
+    with_tile_format => tile_format: TileFormat,
+    with_mlt_profile => mlt_profile: MltProfile,
     with_coverage_fill => coverage_fill: bool,
     with_simple_clip_fastpath => simple_clip_fastpath: bool,
     with_max_zoom_simplify_factor => max_zoom_simplify_factor: Option<f64>,
@@ -645,6 +672,8 @@ impl Default for ExportOptions {
             tile_size_limit: Some(DEFAULT_TILE_SIZE_LIMIT),
             compressed_tile_size_limit: Some(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT),
             size_valve: SizeValve::Merge,
+            tile_format: TileFormat::Mvt,
+            mlt_profile: MltProfile::Web,
             coverage_fill: false,
             variable_depth: false,
             simple_clip_fastpath: true,
@@ -723,6 +752,25 @@ impl ExportOptions {
             return Err(ConfigError::InvalidSpec {
                 option,
                 message: format!("{option} must be a finite number >= 0, got {factor}"),
+            });
+        }
+        if self.tile_format == TileFormat::Mlt && !crate::tile_format::MLT_SUPPORTED {
+            return Err(ConfigError::InvalidSpec {
+                option: "--tile-format / tile_format",
+                message: "this build cannot write MLT: rebuild with the `mlt` cargo feature".into(),
+            });
+        }
+        if self.tile_format == TileFormat::Mvt && self.mlt_profile != MltProfile::default() {
+            return Err(ConfigError::OptionIgnored {
+                option: "mlt_profile",
+                command: "an MVT export",
+                reason: "it sets how MLT tiles are encoded; pass --tile-format mlt",
+            });
+        }
+        if self.tile_format == TileFormat::Mlt && self.layer_name.is_empty() {
+            return Err(ConfigError::InvalidSpec {
+                option: "--layer-name / layer_name",
+                message: "an MLT layer needs a name".into(),
             });
         }
         if self.extent == 0 {
@@ -1263,6 +1311,14 @@ pub enum ExportError {
         available_bytes: u64,
         /// Where that figure came from, as messages name it.
         limit_source: &'static str,
+    },
+
+    /// A finished MVT tile did not convert to MLT (`--tile-format mlt`,
+    /// #823): mlt-core refused it.
+    #[error("a tile did not convert to MLT: {message}; rerun with --tile-format mvt")]
+    MltConversion {
+        /// mlt-core's message.
+        message: String,
     },
 }
 
@@ -2065,9 +2121,10 @@ pub fn write_empty_archive(
     min_zoom: u8,
     max_zoom: u8,
     metadata: &TilesetMetadata,
+    tile_format: TileFormat,
 ) -> Result<(), ExportError> {
     check_metadata_size(metadata)?;
-    let mut writer = open_writer(output, layer_name, metadata, min_zoom)?;
+    let mut writer = open_writer(output, layer_name, metadata, min_zoom, tile_format)?;
     writer.set_declared_max_zoom(max_zoom);
     writer.finalize(output)?;
     Ok(())
@@ -2090,8 +2147,10 @@ fn open_writer(
     layer_name: &str,
     metadata: &TilesetMetadata,
     min_zoom: u8,
+    tile_format: TileFormat,
 ) -> Result<StreamingPmtilesWriter, ExportError> {
     let mut writer = StreamingPmtilesWriter::with_tail_layout(output, Compression::Gzip)?;
+    writer.set_tile_type(tile_format.tile_type());
     writer.set_layer_name(layer_name);
     writer.set_metadata(metadata.clone());
     writer.set_declared_min_zoom(min_zoom);
@@ -2449,6 +2508,7 @@ fn export_pmtiles_validated(
         &options.layer_name,
         &options.metadata,
         min_zoom,
+        options.tile_format,
     )?;
     if let Some(&canonical) = level_zooms.last().filter(|_| options.variable_depth) {
         writer.set_variable_depth(canonical);
@@ -6183,7 +6243,7 @@ fn covering_rows<'a>(
 /// through [`webmerc_to_lnglat`] for an EPSG:3857 file. Reprojection is
 /// monotone per axis, so this is bit-identical to the bbox of the
 /// reprojected geometry. Both scan sources go through here.
-fn lnglat_bbox(x0: f64, y0: f64, x1: f64, y1: f64, crs: Crs) -> TileBounds {
+pub(crate) fn lnglat_bbox(x0: f64, y0: f64, x1: f64, y1: f64, crs: Crs) -> TileBounds {
     if matches!(crs, Crs::Epsg3857) {
         let (lng_min, lat_min) = webmerc_to_lnglat(x0, y0);
         let (lng_max, lat_max) = webmerc_to_lnglat(x1, y1);
@@ -8424,6 +8484,7 @@ fn account_sources(
 /// nothing (#431) is an empty carrier the writer loop skips: there is no
 /// tile to write, but the drops must still reach the report.
 fn encoded_tile(x: u32, y: u32, mvt: TileMvt, fill: FillTally) -> Result<EncodedTile, ExportError> {
+    check_mlt(&mvt)?;
     if mvt.features == 0 {
         return Ok(EncodedTile {
             x,
@@ -8568,6 +8629,9 @@ struct TileMvt {
     oversized: bool,
     /// What the size valve did to the tile (#745).
     valve: ValveTally,
+    /// Why the MVT did not convert to the export's MLT, if it did not;
+    /// `data` is then empty and the export fails at this tile.
+    mlt_error: Option<String>,
 }
 
 // A read-only cached-gzip view for fill's existing cost observer. All raw
@@ -8949,6 +9013,7 @@ fn is_point_like<M: TileFeature>(members: &[M]) -> bool {
 /// unchanged; `TileData` invalidates it on every mutable raw-buffer access.
 /// Both currently active limits are recomputed even on a cache hit.
 fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError> {
+    check_mlt(mvt)?;
     let mut fit = f64::INFINITY;
     if let Some(limit) = opts.tile_size_limit.filter(|&l| l > 0) {
         fit = fit.min(limit as f64 / mvt.data.len() as f64);
@@ -8958,6 +9023,16 @@ fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError>
         fit = fit.min(limit as f64 / gz.len() as f64);
     }
     Ok(fit)
+}
+
+/// The export's failure for a tile whose MVT did not convert to MLT.
+fn check_mlt(mvt: &TileMvt) -> Result<(), ExportError> {
+    match &mvt.mlt_error {
+        Some(message) => Err(ExportError::MltConversion {
+            message: message.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Encodes the drop valve may take before it gives up and writes the tile
@@ -9387,6 +9462,12 @@ fn build_mvt_within<M: TileFeature>(
     encode: impl Fn(&M) -> EncodedFeatureGeometry + Sync,
     raw_limit: usize,
 ) -> Option<TileMvt> {
+    // The MVT's size says nothing of the MLT's, so only an MVT build can
+    // give up early; an MLT tile is measured after conversion.
+    let raw_limit = match opts.tile_format {
+        TileFormat::Mvt => raw_limit,
+        _ => usize::MAX,
+    };
     let mut source_ids = Vec::new();
     let mut source_losses = Vec::new();
     let mut track = |id: Option<u64>, geom: &EncodedFeatureGeometry| {
@@ -9441,16 +9522,22 @@ fn build_mvt_within<M: TileFeature>(
     let features = layer.feature_count() - fill.len();
     let unencodable = layer.dropped_features();
     let quantized = layer.quantized_features();
+    let (data, mlt_error) =
+        match crate::tile_format::finish_tile(layer.build(), opts.tile_format, opts.mlt_profile) {
+            Ok(data) => (data, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
     Some(TileMvt {
         gzip_cache: Arc::clone(gzip_cache),
         source_ids,
         source_losses,
-        data: layer.build().into(),
+        data: data.into(),
         features,
         unencodable,
         quantized,
         oversized: false,
         valve: ValveTally::default(),
+        mlt_error,
     })
 }
 
@@ -19959,8 +20046,16 @@ mod tests {
             dir.path().join("plain.pmtiles"),
             dir.path().join("published.pmtiles"),
         );
-        write_empty_archive(&plain, "parks", 3, 9, &TilesetMetadata::default()).unwrap();
-        write_empty_archive(&published, "parks", 3, 9, &park_metadata()).unwrap();
+        write_empty_archive(
+            &plain,
+            "parks",
+            3,
+            9,
+            &TilesetMetadata::default(),
+            TileFormat::Mvt,
+        )
+        .unwrap();
+        write_empty_archive(&published, "parks", 3, 9, &park_metadata(), TileFormat::Mvt).unwrap();
 
         let mut plain = metadata_object(&std::fs::read(&plain).unwrap());
         let mut published = metadata_object(&std::fs::read(&published).unwrap());
@@ -20000,7 +20095,8 @@ mod tests {
         assert!(err.to_string().contains("description"), "{err}");
         assert!(!out.exists());
 
-        let err = write_empty_archive(&out, "parks", 0, 4, &opts.metadata).unwrap_err();
+        let err =
+            write_empty_archive(&out, "parks", 0, 4, &opts.metadata, TileFormat::Mvt).unwrap_err();
         assert!(err.to_string().contains("description"), "{err}");
         assert!(!out.exists() && !out.with_extension("pmtiles.partial").exists());
     }

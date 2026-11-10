@@ -96,6 +96,8 @@ Args:
     read_workers: See `overview()`.
     save_plan: See `overview()`.
     plan: See `overview()`.
+    tile_format: See `export_pmtiles()`.
+    mlt_profile: See `export_pmtiles()`.
 
 Returns:
     Both halves' reports, keyed `"convert"` and `"export"` like the

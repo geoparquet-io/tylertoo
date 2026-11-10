@@ -17,6 +17,8 @@ gpio
 DuckDB
 Polars
 MVT
+Mapbox
+OpenLayers
 GSDs?
 rustdoc
 Zensical
