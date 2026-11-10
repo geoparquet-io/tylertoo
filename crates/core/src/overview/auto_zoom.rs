@@ -749,32 +749,9 @@ pub(crate) fn estimate_with(
             projection: Some(&cols),
             row_groups: selection.as_ref(),
         };
-        // A remote sample would otherwise fetch each sampled column chunk
-        // on its own, one at a time (#788: 52 serial requests for moldova's
-        // covering). Stage them first, concurrently, granted from a memory
-        // budget like pass 0's; best-effort, since the read below fetches
-        // whatever staging missed. The conversion that follows reads the same
-        // source, so its pass 0 skips the chunks staged here.
-        if source.is_remote() {
-            let staged = source
-                .staging_plan_for(plan.row_groups, plan.projection)
-                .and_then(|staging| {
-                    super::stream::stage_granted(
-                        source,
-                        &staging,
-                        &mut super::memory::MemoryBudget::probe(),
-                        profile,
-                    )
-                });
-            match staged {
-                Ok(r) => log::debug!(
-                    "[auto-zoom] staged the sample columns: {} request(s), {} B",
-                    r.requests,
-                    r.bytes_fetched
-                ),
-                Err(e) => log::debug!("[auto-zoom] staging the sample columns failed ({e})"),
-            }
-        }
+        // The conversion that follows reads the same source, so its pass 0
+        // skips the chunks staged here.
+        super::stream::stage_for_read(source, &plan, profile, "auto-zoom sample");
         let stream = source.open_stream(&plan)?;
 
         let mut diags_m: Vec<f64> = Vec::new();

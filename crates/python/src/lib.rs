@@ -335,13 +335,15 @@ fn convert(
         },
         // #821: one report per layer, each keyed like a plain run's.
         TilesOutcome::Layered(mut report) => {
+            // The layers share one run's allowance for inline loss lists.
+            let parts = report.layers.len();
             for layer in &mut report.layers {
                 let r = &mut layer.report;
                 r.convert.source_losses = r.convert.source_losses
-                    .for_python()
+                    .for_python_shared(parts)
                     .map_err(accounting_error_to_py)?;
                 r.export.source_losses = r.export.source_losses
-                    .for_python()
+                    .for_python_shared(parts)
                     .map_err(accounting_error_to_py)?;
             }
             let dict = report_dict(py, &*report)?;

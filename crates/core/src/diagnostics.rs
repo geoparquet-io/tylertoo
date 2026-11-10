@@ -817,6 +817,21 @@ mod tests {
 
     use super::*;
 
+    /// #821: reports returned together share the allowance, so a list one
+    /// report would keep inline is spilled when it is one of several.
+    #[test]
+    fn python_losses_shared_by_reports_spill_sooner() {
+        let sink = Diagnostics::default();
+        sink.set_python_loss_budget(2048);
+        for row in 0..2 {
+            sink.source_loss(row, None, SourceLossCause::Filtered)
+                .unwrap();
+        }
+        let losses = sink.source_losses().unwrap();
+        assert!(losses.for_python().unwrap().python_path().is_none());
+        assert!(losses.for_python_shared(2).unwrap().python_path().is_some());
+    }
+
     #[test]
     fn prepared_python_losses_are_cleaned_up_until_published() {
         let dir = tempfile::tempdir().unwrap();

@@ -1286,16 +1286,34 @@ pub fn intermediate_space_preflight(
     options: &TilesOptions,
     remedies: SpaceRemedies<'_>,
 ) -> Option<String> {
-    let source = input.source().ok()?;
+    space_preflight(&input.source().ok()?, None, output, options, remedies)
+}
+
+/// [`intermediate_space_preflight`] on an open source, reading `selection`.
+/// A `--layer-column` run (#821) also stages its split copy of the input
+/// there, beside one layer's conversion at a time; the whole input's
+/// conversion bounds each layer's.
+pub(super) fn space_preflight(
+    source: &ConvertSource,
+    selection: Option<&crate::input_set::RowGroupSelection>,
+    output: &Path,
+    options: &TilesOptions,
+    remedies: SpaceRemedies<'_>,
+) -> Option<String> {
     let dir = intermediate_dir(options, output);
-    super::disk::DiskFootprint::conversion(
-        &source,
-        None,
+    let mut footprint = super::disk::DiskFootprint::conversion(
+        source,
+        selection,
         &options.convert,
         Some(&dir.join("overview.parquet")),
     )
-    .ok()?
-    .warning(remedies)
+    .ok()?;
+    if options.layer_column.is_some() {
+        footprint
+            .add_staged_layers(source, selection, &options.convert, &dir)
+            .ok()?;
+    }
+    footprint.warning(remedies)
 }
 
 fn resolve_intermediate_dir(

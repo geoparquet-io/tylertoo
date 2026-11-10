@@ -328,21 +328,22 @@ fn provenance(
 /// A row whose geometry has no envelope (null, empty) is kept, for its
 /// layer to account for.
 ///
-/// Every writer's buffered row group counts against the staging memory
-/// budget ([`crate::input::unbudgeted_stage_admission`]); past it, the
-/// largest buffer is flushed as a row group.
+/// Every writer's buffered row group counts against the run's memory
+/// allowance under `convert.profile`; past it, the largest buffer is
+/// flushed as a row group.
 fn split(
     source: &ConvertSource,
     schema: &SchemaRef,
     idx: usize,
     gates: &Gates,
     dir: &Path,
-    batch_size: usize,
+    convert: &super::convert::ConvertOptions,
 ) -> Result<(Vec<Staged>, u64), LayerColumnError> {
     let field = schema.field(idx);
     let column = field.name().as_str();
     let metadata = staged_metadata(source)?;
-    let budget = crate::input::unbudgeted_stage_admission() as usize;
+    let budget = usize::try_from(super::memory::MemoryBudget::probe().allowance(convert.profile))
+        .unwrap_or(usize::MAX);
     let stage_err = |layer: &str, e: &dyn std::fmt::Display| LayerColumnError::Stage {
         layer: layer.to_string(),
         dir: dir.to_path_buf(),
@@ -364,11 +365,13 @@ fn split(
     // The rows of the row groups the gates prune count as dropped too.
     let pruned = source.selected_row_count(None)? - source.selected_row_count(row_groups)?;
     let mut filtered = u64::try_from(pruned).unwrap_or(0);
-    let stream = source.open_stream(&ReadPlan {
-        batch_size,
+    let plan = ReadPlan {
+        batch_size: convert.read_batch_size,
         projection: None,
         row_groups,
-    })?;
+    };
+    super::stream::stage_for_read(source, &plan, convert.profile, "--layer-column split");
+    let stream = source.open_stream(&plan)?;
     for batch in stream {
         let batch = batch?;
         // A multi-part source's parts may differ in nullability; write
@@ -627,14 +630,17 @@ pub(super) fn convert_by_layer(
         provenance(&source).map_err(|e| TilesError::Convert(e.into()))?;
 
     let dir = super::tiles::intermediate_dir(options, output);
-    let (staged, filtered_rows) = split(
+    // Warned before the split, which is the first thing to fill the volume.
+    if let Some(msg) = super::tiles::space_preflight(
         &source,
-        &schema,
-        idx,
-        &gates,
-        &dir,
-        options.convert.read_batch_size,
-    )?;
+        gates.row_groups.as_ref(),
+        output,
+        options,
+        super::tiles::CLI_REMEDIES,
+    ) {
+        log::warn!("{msg}");
+    }
+    let (staged, filtered_rows) = split(&source, &schema, idx, &gates, &dir, &options.convert)?;
     drop(source);
     log::info!(
         "[tiles] --layer-column {column:?}: {} layer(s): {}",
@@ -714,6 +720,13 @@ pub(super) fn convert_by_layer(
             archive,
         ));
         report.convert.geo_version = geo_version.clone();
+        // Every layer's report is kept until the end: close its loss ledgers'
+        // files, or 64 layers x 17 zooms of them exhaust the descriptor limit.
+        for losses in [&report.convert.source_losses, &report.export.source_losses] {
+            losses
+                .seal()
+                .map_err(|e| in_layer(TilesError::Convert(e.into())))?;
+        }
         layers.push(LayerReport {
             layer: layer.name,
             input_rows: layer.rows,
