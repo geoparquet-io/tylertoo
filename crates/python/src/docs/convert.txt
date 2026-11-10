@@ -14,7 +14,8 @@ Args:
     crs: See `overview()`.
     min_zoom: See `overview()`.
     max_zoom: See `overview()`.
-    layer_name: MVT layer name, or `None` for the input's file stem.
+    layer_name: MVT layer name, or `None` for the input's file stem
+        (the output's file stem for a stream).
     tile_size_limit: See `export_pmtiles()`. `"auto"` is no limit
         with `verbatim`.
     simple_clip_fastpath: See `export_pmtiles()`.

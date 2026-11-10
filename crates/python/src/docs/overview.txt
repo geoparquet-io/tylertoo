@@ -4,10 +4,23 @@ Args:
     input: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
         (`EPSG:3857`). Pass a file, directory, glob, `s3://`,
         `gs://`, or `https://` URL or prefix, or a list of files.
-        TODO(docs): Arrow stream input (__arrow_c_stream__), staged to spill_dir; DuckDB example with Hilbert ORDER BY.
+        Or pass any object with `__arrow_c_stream__`: a DuckDB
+        relation, Polars DataFrame, PyArrow Table or
+        RecordBatchReader, or GeoPandas via `to_arrow()`. The stream
+        is staged to a GeoParquet file in `spill_dir` (or the system
+        temp directory), in stream row order, and deleted after the
+        run. Geometry must be a GeoArrow extension column
+        (`geoarrow.wkb` or native) or a WKB binary column named by
+        `geometry_column`.
     output: Overview file to write.
-    geometry_column: TODO(docs)
-    crs: TODO(docs)
+    geometry_column: Geometry column to read from a stream. If
+        omitted, use the GeoArrow extension columns, the first one
+        primary. Refused with `ConfigError` for file input.
+    crs: CRS for a stream that declares none in its GeoArrow
+        metadata. Must be `EPSG:4326` or `EPSG:3857`, as must a
+        declared CRS. With neither, assume lon/lat and warn, as for
+        a file without a CRS. Refused with `ConfigError` for file
+        input.
     mode: `"duplicating"` makes each level a complete map;
         `"partitioning"` stores each feature once.
     min_zoom: Coarsest zoom.
@@ -111,7 +124,7 @@ Args:
     read_workers: [Reader threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),
         or `0` to size from the CPU count.
     spill_dir: [Staging directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
-        for remote input.
+        for remote input and Arrow streams.
     save_plan: Save the convert plan (pass 1 and the level
         assignment) here and continue converting.
     plan: Reuse a saved convert plan, skipping pass 1. Its
@@ -136,3 +149,16 @@ Example:
     ... )
     >>> report["input_features"]
     1000
+
+    Tile a DuckDB query in Hilbert order, for the row-group pruning
+    `gpio sort hilbert` gives a file:
+
+    >>> import duckdb  # doctest: +SKIP
+    >>> con = duckdb.connect()  # doctest: +SKIP
+    >>> con.execute("INSTALL spatial; LOAD spatial")  # doctest: +SKIP
+    >>> rel = con.sql(  # doctest: +SKIP
+    ...     "SELECT * FROM 'buildings.parquet' ORDER BY ST_Hilbert("
+    ...     "geometry, (SELECT ST_Extent(ST_Extent_Agg(geometry)) "
+    ...     "FROM 'buildings.parquet'))"
+    ... )
+    >>> report = overview(rel, "overview.parquet", max_zoom=10)  # doctest: +SKIP

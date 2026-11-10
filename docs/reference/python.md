@@ -16,9 +16,11 @@ Diagnostics go to Python's `logging` under the `tylertoo_core` logger: the warni
 
 ```python
 overview(
-    input: str | Sequence[str],
+    input: str | Sequence[str] | _ArrowStream,
     output: str,
     *,
+    geometry_column: str | None = None,
+    crs: str | None = None,
     mode: Literal['duplicating', 'partitioning'] = "duplicating",
     min_zoom: int = 0,
     max_zoom: int | str = 6,
@@ -81,8 +83,10 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 #### Input and levels
 
-* `input`: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator (`EPSG:3857`). Pass a file, directory, glob, `s3://`, `gs://`, or `https://` URL or prefix, or a list of files.
+* `input`: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator (`EPSG:3857`). Pass a file, directory, glob, `s3://`, `gs://`, or `https://` URL or prefix, or a list of files. Or pass any object with `__arrow_c_stream__`: a DuckDB relation, Polars DataFrame, PyArrow Table or RecordBatchReader, or GeoPandas via `to_arrow()`. The stream is staged to a GeoParquet file in `spill_dir` (or the system temp directory), in stream row order, and deleted after the run. Geometry must be a GeoArrow extension column (`geoarrow.wkb` or native) or a WKB binary column named by `geometry_column`.
 * `output`: Overview file to write.
+* `geometry_column`: Geometry column to read from a stream. If omitted, use the GeoArrow extension columns, the first one primary. Refused with `ConfigError` for file input.
+* `crs`: CRS for a stream that declares none in its GeoArrow metadata. Must be `EPSG:4326` or `EPSG:3857`, as must a declared CRS. With neither, assume lon/lat and warn, as for a file without a CRS. Refused with `ConfigError` for file input.
 * `mode`: `"duplicating"` makes each level a complete map; `"partitioning"` stores each feature once.
 * `min_zoom`: Coarsest zoom.
 * `max_zoom`: Finest zoom, `"auto"` to estimate it (at most 16), or `"auto:14"` to cap the estimate at z14.
@@ -151,7 +155,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `profile`: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles): `"speed"` holds everything in RAM, `"bounded"` uses disk and holds the least, and `"auto"` sizes to the machine's memory. Footprints compare for one allocator: wheels use mimalloc, which adds a fixed floor of about 600 MiB on small inputs. On a 1.4M polygon export it ran 8% faster and held 18% more peak memory than the system allocator; a non-musl source build can opt out with `maturin build --no-default-features` (musl always uses mimalloc).
 * `in_flight_batches`: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency), or `0` to size from the CPU count.
 * `read_workers`: [Reader threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency), or `0` to size from the CPU count.
-* `spill_dir`: [Staging directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) for remote input.
+* `spill_dir`: [Staging directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) for remote input and Arrow streams.
 * `save_plan`: Save the convert plan (pass 1 and the level assignment) here and continue converting.
 * `plan`: Reuse a saved convert plan, skipping pass 1. Its fingerprint must match this run's version, options and inputs.
 
@@ -174,6 +178,19 @@ Build a GeoParquet overview file: one generalized level per zoom.
 ... )
 >>> report["input_features"]
 1000
+
+Tile a DuckDB query in Hilbert order, for the row-group pruning
+`gpio sort hilbert` gives a file:
+
+>>> import duckdb  # doctest: +SKIP
+>>> con = duckdb.connect()  # doctest: +SKIP
+>>> con.execute("INSTALL spatial; LOAD spatial")  # doctest: +SKIP
+>>> rel = con.sql(  # doctest: +SKIP
+...     "SELECT * FROM 'buildings.parquet' ORDER BY ST_Hilbert("
+...     "geometry, (SELECT ST_Extent(ST_Extent_Agg(geometry)) "
+...     "FROM 'buildings.parquet'))"
+... )
+>>> report = overview(rel, "overview.parquet", max_zoom=10)  # doctest: +SKIP
 ```
 
 ## `export_pmtiles`
@@ -423,8 +440,11 @@ True
 
 ```python
 convert(
-    input: str,
+    input: str | _ArrowStream,
     output: str,
+    *,
+    geometry_column: str | None = None,
+    crs: str | None = None,
     min_zoom: int = 0,
     max_zoom: int | str = 14,
     layer_name: str | None = None,
@@ -432,7 +452,6 @@ convert(
     simple_clip_fastpath: bool = True,
     feature_order: Literal['input'] | str = "input",
     spill_dir: str | os.PathLike[str] | None = None,
-    *,
     include_properties: Sequence[str] | None = None,
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
@@ -505,9 +524,11 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 
 * `input`: See `overview()`.
 * `output`: PMTiles archive to write.
+* `geometry_column`: See `overview()`.
+* `crs`: See `overview()`.
 * `min_zoom`: See `overview()`.
 * `max_zoom`: See `overview()`.
-* `layer_name`: MVT layer name, or `None` for the input's file stem.
+* `layer_name`: MVT layer name, or `None` for the input's file stem (the output's file stem for a stream).
 * `tile_size_limit`: See `export_pmtiles()`. `"auto"` is no limit with `verbatim`.
 * `simple_clip_fastpath`: See `export_pmtiles()`.
 * `feature_order`: See `export_pmtiles()`.
