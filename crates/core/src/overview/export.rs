@@ -419,12 +419,19 @@ pub struct ExportOptions {
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().simple_clip_fastpath, action = clap::ArgAction::SetFalse, long = "no-simple-clip-fastpath"))]
     #[cfg_attr(feature = "cli", arg(help = "Clip all polygons with the full overlay for byte-stable tiles. The simple-ring fast path renders identically but can change a ring's starting vertex", long_help = None))]
     pub simple_clip_fastpath: bool,
-    /// TODO(docs)
+    /// Simplify each feature of the finest (canonical) level once, before
+    /// clipping, with tolerance `factor × GSD` at that level's zoom, the
+    /// same rule `--simplify-factor` uses for coarser levels. With the default
+    /// GSD base, 1 GSD is 4 tile units at extent 4096. A feature smaller than
+    /// the tolerance keeps its own geometry. Default `None` (off).
+    /// Changes the output; leaves coarser zooms and the overview file unchanged.
+    /// Comparable to tippecanoe's `-S`, which uses tile units at every zoom:
+    /// `-S 10` is about factor 2.5.
     #[cfg_attr(
         feature = "cli",
         arg(long, value_name = "FACTOR", help_heading = "Generalization")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "TODO(docs)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser zooms and the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5", long_help = None))]
     pub max_zoom_simplify_factor: Option<f64>,
     /// Number of partitions processed per band read (the export concurrency
     /// knob). Default [`PARTITION_WAVE_AUTO`], which [`resolve_partition_wave`]
@@ -766,7 +773,11 @@ pub struct ZoomReport {
     pub tile_feature_count: usize,
     /// Number of tiles at this zoom that hit the oversized safety valve.
     pub oversized_tiles: usize,
-    /// TODO(docs)
+    /// Tiles written at this zoom that the size valve could not bring under
+    /// the limit, including one-feature tiles; written as is. Unlike
+    /// `oversized_tiles`, counts tiles still over the limit, not all tiles
+    /// that triggered the valve. The report prints one summary line for
+    /// the total across zooms.
     pub over_limit_tiles: usize,
     /// Tile members at this zoom that had nothing to encode (#431): empty
     /// geometries and empty `GeometryCollection`s. Counted per (feature,
@@ -836,7 +847,10 @@ pub struct ExportReport {
     pub total_tile_features: usize,
     /// Total tiles that hit the oversized safety valve.
     pub oversized_tiles: usize,
-    /// TODO(docs)
+    /// Total tiles the size valve could not bring under the limit, including
+    /// one-feature tiles; written as is. Unlike `oversized_tiles`, counts
+    /// tiles still over the limit, not all tiles that triggered the valve.
+    /// The report prints one summary line for these tiles.
     pub over_limit_tiles: usize,
     /// Property columns of the overview file that the export could not
     /// encode and therefore dropped (#434): binary columns and any other

@@ -202,6 +202,7 @@ export_pmtiles(
     attribution: str | None = None,
     size_valve: Literal['merge', 'drop'] = "merge",
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
+    max_zoom_simplify_factor: float | None = None,
     coverage_fill: bool = False,
     variable_depth: bool = False,
     tile_range: str | None = None,
@@ -234,6 +235,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.
 * `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and `0` or `None` is no limit.
+* `max_zoom_simplify_factor`: Simplify each feature of the finest (canonical) level once, before clipping, with tolerance factor × GSD at that level's zoom, like `simplify_factor` for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Defaults to None (off). Changes the output; leaves coarser zooms and the overview file unchanged. Comparable to tippecanoe's `-S`, which uses tile units at every zoom: `-S 10` is about factor 2.5.
 * `coverage_fill`: Experimental: under each tile's features, draw the area its child tiles cover, so a polygon coverage shows no holes at coarse zooms. Holds the finest level's geometry in memory. See `docs/OVERVIEW_TUNING.md`.
 * `variable_depth`: End each branch of the tile pyramid at the coarsest zoom whose tile holds all of that area's finest-level features within both size caps, like tippecanoe's `--generate-variable-depth-tile-pyramid`. The server must serve the nearest ancestor for a missing tile. See `docs/OVERVIEW_TUNING.md`.
 * `tile_range`: Export only the tiles in this tile-id range, `"LO..HI"`: one shard of a sharded build.
@@ -282,6 +284,7 @@ pyramid(
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     size_valve: Literal['merge', 'drop'] = "merge",
     coverage_fill: bool = False,
+    max_zoom_simplify_factor: float | None = None,
     simple_clip_fastpath: bool = True,
     tile_buffer: int = 8,
     extent: int = 4096,
@@ -312,6 +315,7 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes for bands tiled here; `"auto"`, `0` and `None` are no limit.
 * `size_valve`: See `export_pmtiles()`.
 * `coverage_fill`: See `export_pmtiles()`.
+* `max_zoom_simplify_factor`: See `export_pmtiles()`.
 * `simple_clip_fastpath`: See `export_pmtiles()`.
 * `tile_buffer`: See `export_pmtiles()`.
 * `extent`: See `export_pmtiles()`.
@@ -439,6 +443,7 @@ convert(
     size_valve: Literal['merge', 'drop'] = "merge",
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     coverage_fill: bool = False,
+    max_zoom_simplify_factor: float | None = None,
     variable_depth: bool = False,
     gsds: Sequence[float] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
@@ -518,6 +523,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `size_valve`: See `export_pmtiles()`.
 * `max_compressed_tile_size`: See `export_pmtiles()`. `"auto"` is no limit with `verbatim`.
 * `coverage_fill`: See `export_pmtiles()`.
+* `max_zoom_simplify_factor`: See `export_pmtiles()`.
 * `variable_depth`: See `export_pmtiles()`.
 * `gsds`: See `overview()`.
 * `bbox`: See `overview()`.
@@ -757,6 +763,7 @@ class ExportReport(TypedDict):
     total_tiles: int
     total_tile_features: int
     oversized_tiles: int
+    over_limit_tiles: int
     merged_features: int
     valve_dropped_features: int
     encode_dropped_features: int
@@ -767,6 +774,7 @@ class ExportReport(TypedDict):
 ```
 
 * `oversized_tiles`: Tiles that exceeded a size limit and triggered size reduction.
+* `over_limit_tiles`: Tiles the size valve could not bring under the limit, including one-feature tiles; written as is. Unlike oversized_tiles, counts tiles still over the limit, not all tiles that triggered size reduction. The report prints one summary line for these tiles.
 * `merged_features`: Tile features merged into a neighbor to fit a size limit (`size_valve="merge"`).
 * `valve_dropped_features`: Tile features dropped to fit a size limit.
 * `encode_dropped_features`: Features removed by clipping. A nonzero count logs a warning for lost content.
@@ -786,6 +794,7 @@ class ZoomReport(TypedDict):
     tile_count: int
     tile_feature_count: int
     oversized_tiles: int
+    over_limit_tiles: int
     encode_dropped_features: int
     encode_quantized_features: int
     merged_features: int
