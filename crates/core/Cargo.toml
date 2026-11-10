@@ -68,7 +68,8 @@ crossbeam-channel = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 memory-stats = { workspace = true }
-flate2 = "1"
+# zlib-rs, not miniz_oxide: at level 9 it is 2.7x faster and slightly smaller (#814).
+flate2 = { version = "1", features = ["zlib-rs"] }
 # brotli and zstd follow parquet's majors (8 / 0.13) so each compiles once (#435).
 # Renovate holds newer majors; move them only with parquet (#649).
 brotli = "8"
