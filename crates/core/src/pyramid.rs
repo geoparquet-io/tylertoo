@@ -2387,10 +2387,6 @@ pub fn merge_bands_with_options(
     merge_prepared_bands(bands, output, options, diagnostics)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one merge with two paths, shared-zoom and disjoint, over the same state"
-)]
 fn merge_prepared_bands(
     bands: &[Band],
     output: &Path,
