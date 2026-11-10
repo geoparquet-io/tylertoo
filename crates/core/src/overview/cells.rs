@@ -511,7 +511,8 @@ pub(crate) fn write_cell_tables(
         }
         // Writing adds an id-ordered index of the cells and one batch's
         // columns: counts (8 bytes plus null bits), rollups, id and outline.
-        let batch_bytes = WRITE_ROWS as u64 * (17 * labels.len() as u64 + 9 * specs as u64 + 512);
+        let batch_bytes = cells.len().min(WRITE_ROWS) as u64
+            * (17 * labels.len() as u64 + 9 * specs as u64 + 512);
         budget.require(
             MemoryPhase::Scan,
             cells.capacity() * cell_bytes(specs)
