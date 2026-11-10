@@ -1044,8 +1044,9 @@ pub(crate) mod remote {
 
     /// Resolve the object store + object path for `url_str`.
     ///
-    /// Stores are cached per `scheme://authority` for the life of the
-    /// process (except an http(s) URL with a query, see below), so one convert resolves credentials ONCE per bucket: a
+    /// Stores are cached per `scheme://authority` (except an http(s) URL with
+    /// a query, see below), and rebuilt when the [`store_env`] that built
+    /// them changes, so one convert resolves credentials ONCE per bucket: a
     /// prefix listing and its N per-part sources, or N `--files-from`
     /// manifest entries in the same bucket, all share one store instance
     /// (the AWS credential chain probe in [`build_s3`] is otherwise paid
@@ -1057,8 +1058,7 @@ pub(crate) mod remote {
             clippy::disallowed_types,
             reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
         )]
-        static STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<dyn ObjectStore>>>> =
-            OnceLock::new();
+        static STORES: OnceLock<Mutex<StoreCache>> = OnceLock::new();
 
         let shown = redact_query(url_str);
         let url = Url::parse(url_str)
@@ -1086,11 +1086,12 @@ pub(crate) mod remote {
             .filter(|_| matches!(scheme, ObjectStoreScheme::Http));
         let key = url[..url::Position::BeforePath].to_ascii_lowercase();
         let stores = STORES.get_or_init(Default::default);
-        if let Some(store) = stores
+        let env = store_env();
+        if let Some((_, store)) = stores
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
-            .filter(|_| query.is_none())
+            .filter(|(built_from, _)| query.is_none() && *built_from == env)
         {
             return Ok((Arc::clone(store), location));
         }
@@ -1135,15 +1136,25 @@ pub(crate) mod remote {
             }
         };
         // A concurrent resolve may have raced us; either instance works,
-        // last insert wins.
+        // last insert wins. One entry per origin, so a changed environment
+        // replaces its store rather than growing the cache.
         if query.is_none() {
             stores
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key, Arc::clone(&store));
+                .insert(key, (env, Arc::clone(&store)));
         }
         Ok((store, location))
     }
+
+    /// Cached stores per origin, each with the [`store_env`] that built it.
+    type StoreCache = std::collections::HashMap<
+        String,
+        (
+            Vec<(std::ffi::OsString, std::ffi::OsString)>,
+            Arc<dyn ObjectStore>,
+        ),
+    >;
 
     /// Whether a query carries a presigned S3/GCS or Azure SAS signature.
     fn query_is_signed(query: &str) -> bool {
@@ -1673,7 +1684,7 @@ pub(crate) mod remote {
             selected: Option<&[usize]>,
             roots: Option<&[usize]>,
         ) -> Result<PartPlan, InputError> {
-            self.plan_staging_with(selected, roots, staging_tunables::effective())
+            self.plan_staging_with(selected, roots, &staging_tunables::effective())
         }
 
         /// [`Self::plan_staging`] with explicit tunables (the test seam).
@@ -1968,7 +1979,7 @@ pub(crate) mod remote {
             builder = builder.with_skip_signature(true);
         }
         for (k, v) in effective_client_overrides() {
-            builder = builder.with_config(AmazonS3ConfigKey::Client(*k), v);
+            builder = builder.with_config(AmazonS3ConfigKey::Client(k), v);
         }
 
         Ok(Arc::new(builder.build().map_err(|e| {
@@ -2031,27 +2042,56 @@ pub(crate) mod remote {
         matches!(key, ClientConfigKey::ProxyUrl)
     }
 
-    /// The process-wide client overrides: resolved from the environment once,
-    /// on the first store build, logging warnings plus one info line naming
-    /// the overrides in force (so a #290 sweep run records what it tested).
-    fn effective_client_overrides() -> &'static [(ClientConfigKey, String)] {
-        #[expect(
-            clippy::disallowed_types,
-            reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
-        )]
-        static CELL: OnceLock<Vec<(ClientConfigKey, String)>> = OnceLock::new();
-        CELL.get_or_init(|| {
-            let vars = std::env::vars_os()
-                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
-            let (overrides, warnings) = client_overrides(vars);
-            for w in &warnings {
+    /// The client overrides, resolved from the environment on every store
+    /// build (#804). Warnings and one info line naming the overrides in force
+    /// (so a #290 sweep run records what it tested) are logged when they
+    /// change.
+    fn effective_client_overrides() -> Vec<(ClientConfigKey, String)> {
+        type Resolved = (Vec<(ClientConfigKey, String)>, Vec<String>);
+        static LOGGED: Mutex<Option<Resolved>> = Mutex::new(None);
+        let vars = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+        let resolved = client_overrides(vars);
+        if changed(&LOGGED, &resolved) {
+            let (overrides, warnings) = &resolved;
+            for w in warnings {
                 log::warn!("[remote] {w}");
             }
-            if let Some(line) = overrides_log_line(&overrides) {
+            if let Some(line) = overrides_log_line(overrides) {
                 log::info!("[remote] {line}");
             }
-            overrides
-        })
+        }
+        resolved.0
+    }
+
+    /// Whether `now` differs from the value last seen in `last` (recording
+    /// it), so a setting re-read on every call is logged once per change.
+    fn changed<T: PartialEq + Clone>(last: &Mutex<Option<T>>, now: &T) -> bool {
+        let mut last = last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = last.as_ref() != Some(now);
+        if changed {
+            *last = Some(now.clone());
+        }
+        changed
+    }
+
+    /// The environment a store is built from: the `AWS_*` and `GOOGLE_*`
+    /// variables the builders' `from_env` read, and the `TYLERTOO_HTTP_*`
+    /// client overrides. A cached store is reused only while this is
+    /// unchanged (#804), so a changed region or credential builds a new one.
+    fn store_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        let mut vars: Vec<_> = std::env::vars_os()
+            .filter(|(k, _)| {
+                let k = k.to_string_lossy();
+                ["AWS_", "GOOGLE_", CLIENT_VAR_PREFIX]
+                    .iter()
+                    .any(|p| k.starts_with(p))
+            })
+            .collect();
+        vars.sort();
+        vars
     }
 
     /// The info line naming the client overrides in force, or `None` when
@@ -2339,31 +2379,24 @@ pub(crate) mod remote {
             }
         }
 
-        /// The process-wide effective tunables: resolved from the real
-        /// environment once, on first use (i.e. at staging start), logging
-        /// any fallback/clamp warnings plus one line with the effective
-        /// values — info when an override is set (so a #290 sweep run can
-        /// confirm what it tested), debug otherwise.
-        pub(super) fn effective() -> &'static StagingTunables {
-            #[expect(
-                clippy::disallowed_types,
-                reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
-            )]
-            use std::sync::OnceLock;
-            #[expect(
-                clippy::disallowed_types,
-                reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
-            )]
-            static CELL: OnceLock<StagingTunables> = OnceLock::new();
-            CELL.get_or_init(|| {
-                let lookup = |name: &str| std::env::var(name).ok();
-                let overridden = [CONCURRENCY_VAR, MEM_BUDGET_VAR, COALESCE_VAR]
-                    .iter()
-                    .any(|v| lookup(v).is_some());
-                let mem_budget_set = lookup(MEM_BUDGET_VAR).is_some();
-                let (mut tunables, warnings) = resolve(lookup);
-                tunables.overridden = overridden;
-                tunables.mem_budget_set = mem_budget_set;
+        /// The effective tunables, resolved from the real environment on
+        /// every call (#804), so a long-lived process (Python) that changes
+        /// a variable between conversions is honoured. Any fallback/clamp
+        /// warnings and one line with the effective values are logged when
+        /// the result changes — info when an override is set (so a #290
+        /// sweep run can confirm what it tested), debug otherwise.
+        pub(super) fn effective() -> StagingTunables {
+            static LOGGED: std::sync::Mutex<Option<(StagingTunables, Vec<String>)>> =
+                std::sync::Mutex::new(None);
+            let lookup = |name: &str| std::env::var(name).ok();
+            let overridden = [CONCURRENCY_VAR, MEM_BUDGET_VAR, COALESCE_VAR]
+                .iter()
+                .any(|v| lookup(v).is_some());
+            let mem_budget_set = lookup(MEM_BUDGET_VAR).is_some();
+            let (mut tunables, warnings) = resolve(lookup);
+            tunables.overridden = overridden;
+            tunables.mem_budget_set = mem_budget_set;
+            if super::changed(&LOGGED, &(tunables, warnings.clone())) {
                 for w in &warnings {
                     log::warn!("[stage] {w}");
                 }
@@ -2378,8 +2411,8 @@ pub(crate) mod remote {
                 } else {
                     log::debug!("{line}");
                 }
-                tunables
-            })
+            }
+            tunables
         }
 
         /// Log this operation's *live* in-flight concurrency, at info
@@ -2620,14 +2653,14 @@ pub(crate) mod remote {
             parts,
             &staging_tunables::StagingTunables {
                 mem_budget: budget,
-                ..*staging_tunables::effective()
+                ..staging_tunables::effective()
             },
         )
     }
 
     /// See [`super::stage_admission`].
     pub(crate) fn stage_admission() -> super::StageAdmission {
-        admission(staging_tunables::effective())
+        admission(&staging_tunables::effective())
     }
 
     fn admission(tunables: &staging_tunables::StagingTunables) -> super::StageAdmission {
@@ -4043,12 +4076,11 @@ pub(crate) mod remote {
 
     #[cfg(test)]
     mod process_env_tests {
-        //! The two `OnceLock`s that read the real process environment
+        //! The readers of the real process environment
         //! ([`staging_tunables::effective`], [`effective_client_overrides`])
         //! and the store each scheme resolves to. An environment test re-runs
-        //! itself in a child process with its variables set, so no test
-        //! mutates this process's environment and the cache is filled from
-        //! exactly those variables.
+        //! itself in a child process with its variables set, so a test that
+        //! changes the environment (#804) never touches this process's.
 
         use super::staging_tunables::{self, COALESCE_VAR, CONCURRENCY_VAR};
         use super::{effective_client_overrides, store_and_location};
@@ -4141,6 +4173,85 @@ pub(crate) mod remote {
                 "{:?}",
                 effective_client_overrides()
             );
+        }
+
+        /// #804: a long-lived process (Python) that changes a staging
+        /// override between conversions gets the new value, not the first.
+        #[test]
+        fn effective_staging_tunables_follow_environment_changes() {
+            if !run_in_child(
+                "effective_staging_tunables_follow_environment_changes",
+                &[(CONCURRENCY_VAR, "3")],
+            ) {
+                return;
+            }
+            assert_eq!(staging_tunables::effective().max_concurrency, 3);
+            std::env::set_var(CONCURRENCY_VAR, "5");
+            assert_eq!(staging_tunables::effective().max_concurrency, 5);
+            std::env::remove_var(CONCURRENCY_VAR);
+            let t = staging_tunables::effective();
+            assert_eq!(
+                t.max_concurrency,
+                staging_tunables::StagingTunables::default().max_concurrency
+            );
+            assert!(!t.overridden);
+        }
+
+        /// #804: the client overrides are re-read too.
+        #[test]
+        fn effective_client_overrides_follow_environment_changes() {
+            if !run_in_child(
+                "effective_client_overrides_follow_environment_changes",
+                &[("TYLERTOO_HTTP_TIMEOUT", "7s")],
+            ) {
+                return;
+            }
+            assert_eq!(
+                effective_client_overrides(),
+                vec![(ClientConfigKey::Timeout, "7s".to_string())]
+            );
+            std::env::set_var("TYLERTOO_HTTP_TIMEOUT", "9s");
+            assert_eq!(
+                effective_client_overrides(),
+                vec![(ClientConfigKey::Timeout, "9s".to_string())]
+            );
+        }
+
+        /// #804: a cached store is reused while the environment that built it
+        /// is unchanged, and rebuilt once a client option, region or
+        /// credential changes.
+        #[test]
+        fn cached_stores_are_rebuilt_when_their_environment_changes() {
+            if !run_in_child(
+                "cached_stores_are_rebuilt_when_their_environment_changes",
+                &[
+                    ("TYLERTOO_HTTP_TIMEOUT", "7s"),
+                    ("AWS_REGION", "us-east-1"),
+                    ("AWS_ACCESS_KEY_ID", "AKIA804"),
+                    ("AWS_SECRET_ACCESS_KEY", "secret804"),
+                    ("AWS_EC2_METADATA_DISABLED", "true"),
+                ],
+            ) {
+                return;
+            }
+            let store = |url: &str| store_and_location(url).expect(url).0;
+            for (url, var, value) in [
+                (
+                    "http://env804.test/a.parquet",
+                    "TYLERTOO_HTTP_TIMEOUT",
+                    "9s",
+                ),
+                ("s3://bucket804/a.parquet", "AWS_REGION", "eu-west-1"),
+                ("s3://bucket804/a.parquet", "AWS_ACCESS_KEY_ID", "AKIA805"),
+            ] {
+                let first = store(url);
+                assert!(std::sync::Arc::ptr_eq(&first, &store(url)), "{url}: reused");
+                std::env::set_var(var, value);
+                assert!(
+                    !std::sync::Arc::ptr_eq(&first, &store(url)),
+                    "{url}: {var} changed, so the store must be rebuilt"
+                );
+            }
         }
 
         #[test]
