@@ -73,7 +73,9 @@ use std::collections::HashMap;
 use geo::{BoundingRect, Geometry, LineString};
 use rayon::prelude::*;
 
-use super::assign::{AssignConfig, AssignFeature, FeatureKind, Priority, SortDirection};
+use super::assign::{
+    sort_unstable_maybe_par, AssignConfig, AssignFeature, FeatureKind, Priority, SortDirection,
+};
 use super::level::Crs;
 
 /// Name of the merged-segment-count column written when coalescing is
@@ -489,7 +491,7 @@ fn geom_bbox(g: &Geometry<f64>) -> [f64; 4] {
 /// tables are then plain position-indexed `Vec`s instead of two
 /// `HashMap<usize, _>`s with one entry per input line (#570).
 struct RawChain<'a> {
-    members: Vec<usize>,
+    members: Cow<'a, [usize]>,
     geom: Cow<'a, Geometry<f64>>,
 }
 
@@ -501,8 +503,9 @@ struct RawChain<'a> {
 /// before a single join happens (#570). Assembling a multi-piece walk
 /// allocates the merged run once, exactly as before.
 struct Piece<'a> {
-    /// Positions in the caller's `lines` slice, merged so far.
-    members: Vec<usize>,
+    /// Positions in the caller's `lines` slice, merged so far; a level's
+    /// snap pass borrows them from [`ExactChains`].
+    members: Cow<'a, [usize]>,
     coords: Cow<'a, [geo::Coord<f64>]>,
     group: u32,
     /// The [`ExactChains`] geometry this piece still is, unmerged, in a
@@ -512,6 +515,9 @@ struct Piece<'a> {
 
 /// [`Piece::src`] of a piece that is not one exact-join geometry as is.
 const MERGED: usize = usize::MAX;
+
+/// Fewest lines [`ExactChains::new`] ranks in parallel.
+const PAR_RANK_MIN_LINES: usize = 4096;
 
 /// Exact node key: coordinate bit pattern (phase 1).
 #[inline]
@@ -557,7 +563,7 @@ fn build_chains<'a>(
         .chains(snap_tol)
         .into_iter()
         .map(|c| RawChain {
-            members: c.members,
+            members: Cow::Owned(c.members.into_owned()),
             geom: Cow::Owned(c.geom.into_owned()),
         })
         .collect()
@@ -605,7 +611,7 @@ impl<'a> ExactChains<'a> {
         for (pos, l) in lines.iter().enumerate() {
             match l.geom {
                 Geometry::LineString(ls) if ls.0.len() >= 2 => pieces.push(Piece {
-                    members: vec![pos],
+                    members: Cow::Owned(vec![pos]),
                     coords: Cow::Borrowed(&ls.0[..]),
                     group: l.group,
                     src: MERGED,
@@ -619,19 +625,22 @@ impl<'a> ExactChains<'a> {
         // with one entry per input line cost ~100 MiB at 1.5M lines, per
         // level, in parallel across levels (#570). Sort keys are read
         // straight off `lines`.
-        let prio: Vec<Priority> = lines
-            .par_iter()
-            .map(|l| {
-                let feat = AssignFeature {
-                    index: l.index,
-                    bbox: geom_bbox(l.geom),
-                    kind: FeatureKind::Line,
-                    sort_key: l.sort_key,
-                    entry_level: None,
-                };
-                Priority::new(feat.row(), sort_direction)
-            })
-            .collect();
+        let rank = |l: &CoalesceInput<'_>| {
+            let feat = AssignFeature {
+                index: l.index,
+                bbox: geom_bbox(l.geom),
+                kind: FeatureKind::Line,
+                sort_key: l.sort_key,
+                entry_level: None,
+            };
+            Priority::new(feat.row(), sort_direction)
+        };
+        // Entering the pool costs more than ranking a few lines.
+        let prio: Vec<Priority> = if lines.len() < PAR_RANK_MIN_LINES {
+            lines.iter().map(rank).collect()
+        } else {
+            lines.par_iter().map(rank).collect()
+        };
         let (pieces, geoms) = join_pieces(pieces, exact_key, junction_angle_deg)
             .into_iter()
             .map(|p| {
@@ -644,7 +653,7 @@ impl<'a> ExactChains<'a> {
                         Cow::Owned(Geometry::LineString(LineString::new(coords.into_owned())))
                     }
                 };
-                ((p.members, p.group), geom)
+                ((p.members.into_owned(), p.group), geom)
             })
             .unzip();
         Self {
@@ -673,7 +682,7 @@ impl<'a> ExactChains<'a> {
             .zip(&self.geoms)
             .enumerate()
             .map(|(src, ((members, group), geom))| Piece {
-                members: members.clone(),
+                members: Cow::Borrowed(members),
                 coords: match &**geom {
                     Geometry::LineString(ls) => Cow::Borrowed(&ls.0[..]),
                     _ => unreachable!("an exact-join piece is a LineString"),
@@ -707,7 +716,7 @@ impl<'a> ExactChains<'a> {
         // Non-chainable singletons pass through unmerged (original geometry).
         for &pos in &self.singles {
             chains.push(RawChain {
-                members: vec![pos],
+                members: Cow::Owned(vec![pos]),
                 geom: Cow::Borrowed(self.lines[pos].geom),
             });
         }
@@ -771,7 +780,7 @@ fn join_pieces<'a>(
     }
     // Unique keys (`piece << 1 | end` is unique), so the parallel sort's
     // order is the serial one's.
-    incidents.par_sort_unstable();
+    sort_unstable_maybe_par(&mut incidents, Ord::cmp);
 
     // Joins: per piece, the (other piece, other end) connected at each end.
     let mut joins: Vec<[Option<(usize, End)>; 2]> = vec![[None, None]; pieces.len()];
@@ -877,8 +886,8 @@ fn join_pieces<'a>(
         let mut coords: Vec<geo::Coord<f64>> = Vec::new();
         let mut group = 0u32;
         for &(pi, seg_entry) in &walk {
-            let mut p = slots[pi].take().expect("piece consumed once");
-            members.append(&mut p.members);
+            let p = slots[pi].take().expect("piece consumed once");
+            members.extend_from_slice(&p.members);
             group = p.group;
             // Reversing in place and then appending forward is the same
             // sequence as appending in reverse — done this way so a
@@ -886,7 +895,7 @@ fn join_pieces<'a>(
             append_run(&mut coords, &p.coords, seg_entry == 1);
         }
         out.push(Piece {
-            members,
+            members: Cow::Owned(members),
             coords: Cow::Owned(coords),
             group,
             src: MERGED,
@@ -2183,7 +2192,7 @@ mod lazy_pairing_tests {
             .iter()
             .map(|c| {
                 (
-                    c.members.clone(),
+                    c.members.to_vec(),
                     c.geom
                         .coords_iter()
                         .map(|p| (p.x.to_bits(), p.y.to_bits()))

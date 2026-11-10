@@ -1,8 +1,8 @@
 //! Junction matching, adversarial RDP and unchanged-geometry costs (#788).
 //!
 //! Replaces the four manual profiling tests in coalesce.rs/simplify.rs.
-//! Uses public entry points: junction cases time the whole coalescing level
-//! with snap, visibility and thinning off; RDP cases include polygon checks.
+//! Uses public entry points: junction cases time the exact join and one
+//! coalescing level on it with snap, visibility and thinning off; RDP cases include polygon checks.
 //! These are new Criterion series, not continuations of private-kernel counts.
 //!
 //! `cargo bench -p tylertoo-core --bench algorithmic`
@@ -27,7 +27,7 @@ use geo::{Coord, Geometry, LineString, Polygon};
 use tylertoo_core::internal::diagnostics::Diagnostics;
 use tylertoo_core::internal::overview::assign::AssignConfig;
 use tylertoo_core::internal::overview::coalesce::{
-    coalesce_level_lines, CoalesceInput, CoalesceParams,
+    coalesce_level_lines_with, CoalesceInput, CoalesceParams, ExactChains,
 };
 use tylertoo_core::internal::overview::simplify::{
     simplify_cascade, simplify_for_level, CascadeStep, Crs, Simplified, SimplifyOptions,
@@ -79,14 +79,19 @@ fn bench_junctions(c: &mut Criterion) {
                 })
                 .collect();
             group.bench_with_input(BenchmarkId::new(label, n), &lines, |b, lines| {
+                // Production's shape: the exact join, then the level on it
+                // (a ladder's levels share the join). `coalesce_level_lines`
+                // adds an owned copy of every chain that production skips.
                 b.iter(|| {
-                    black_box(coalesce_level_lines(
-                        black_box(lines),
-                        1.,
-                        Crs::Epsg3857,
-                        &config,
-                        &params,
-                    ))
+                    let exact = ExactChains::new(
+                        black_box(lines).to_vec(),
+                        params.junction_angle_deg,
+                        config.sort_direction,
+                    );
+                    black_box(
+                        coalesce_level_lines_with(&exact, 1., Crs::Epsg3857, &config, &params)
+                            .len(),
+                    )
                 });
             });
         }
