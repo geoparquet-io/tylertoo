@@ -115,6 +115,9 @@ struct PartMeta {
     /// decoded footer is released: they address rows in every part.
     num_rows: i64,
     row_group_rows: Vec<i64>,
+    /// The decoded footer's size: what one footer in flight costs when the
+    /// released ones are re-parsed, without holding any of them.
+    decoded_bytes: u64,
     /// The decoded footer in the shape the arrow reader wants, so opening a
     /// reader over this part never re-parses it ([`InputSource::open_with_metadata`]).
     /// Load-bearing for the pass-2 parallel read (#494), which opens one
@@ -133,6 +136,7 @@ impl PartMeta {
             resolved: Arc::new(resolved),
             schema: reader.schema().clone(),
             num_rows: parquet.file_metadata().num_rows(),
+            decoded_bytes: parquet.memory_size() as u64,
             row_group_rows: parquet
                 .row_groups()
                 .iter()
@@ -1391,7 +1395,7 @@ impl ConvertSource {
         if missing.is_empty() {
             return Ok(metas);
         }
-        let first_bytes = metas[0].parquet(&parts[0])?.memory_size() as u64;
+        let first_bytes = metas[0].decoded_bytes;
         let subset: Vec<InputSource> = missing.iter().map(|&i| parts[i].clone()).collect();
         let errors = std::sync::Mutex::new(Vec::new());
         parse_footers(&subset, first_bytes, |j| {
@@ -2820,6 +2824,27 @@ mod tests {
         src.release_unselected(&sel).unwrap();
         assert_eq!(src.resident_footers().unwrap(), 1);
         assert_eq!(src.selected_row_count(Some(&sel)).unwrap(), 1);
+    }
+
+    /// #815 review: re-parsing the selected footers does not bring back a
+    /// pruned part 0's.
+    #[test]
+    fn reading_a_selection_leaves_pruned_part_0_released() {
+        let dir = tmpdir();
+        for i in 0..3 {
+            write_standard(&dir.path().join(format!("p{i}.parquet")), vec![i], false);
+        }
+        let src = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
+        let sel = RowGroupSelection::from_parts(vec![vec![], vec![0], vec![0]]);
+        src.release_unselected(&sel).unwrap();
+        assert_eq!(src.resident_footers().unwrap(), 0);
+        let plan = ReadPlan {
+            batch_size: 1024,
+            projection: None,
+            row_groups: Some(&sel),
+        };
+        assert_eq!(stream_ids(&src, &plan), vec![1, 2]);
+        assert_eq!(src.resident_footers().unwrap(), 2);
     }
 
     #[test]
