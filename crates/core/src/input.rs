@@ -812,11 +812,11 @@ pub fn redact_query(input: &str) -> std::borrow::Cow<'_, str> {
     else {
         return input.into();
     };
-    let mut kept: Vec<&str> = input[q + 1..end]
+    // In URL order: an endpoint can select by order (the last `file=` wins).
+    let kept: Vec<&str> = input[q + 1..end]
         .split('&')
         .filter(|p| !p.is_empty() && !is_signing_param(p))
         .collect();
-    kept.sort_unstable();
     let tag = if kept.is_empty() {
         String::new()
     } else {
@@ -1046,9 +1046,18 @@ pub(crate) mod remote {
         let shown = redact_query(url_str);
         let url = Url::parse(url_str)
             .map_err(|e| InputError::RemoteConfig(format!("invalid URL {shown:?}: {e}")))?;
-        let (scheme, location) = ObjectStoreScheme::parse(&url).map_err(|e| {
+        let interpret_err = |e: &dyn std::fmt::Display| {
             InputError::RemoteConfig(format!("cannot interpret URL {shown:?}: {e}"))
-        })?;
+        };
+        // A query on an http(s) URL is its own credential (a presigned S3 or
+        // Azure SAS URL), so the URL is read as the web URL it is, even on an
+        // S3 or Azure host that `parse` would hand to a signing store.
+        let (scheme, location) = if url.query().is_some() && url.scheme().starts_with("http") {
+            let path = ObjectPath::from_url_path(url.path()).map_err(|e| interpret_err(&e))?;
+            (ObjectStoreScheme::Http, path)
+        } else {
+            ObjectStoreScheme::parse(&url).map_err(|e| interpret_err(&e))?
+        };
         // An http(s) query (a presigned/SAS signature) belongs to one object,
         // so its store is built for that URL alone and never cached: sharing
         // it would sign other objects' requests with it, and caching one per
@@ -1147,8 +1156,30 @@ pub(crate) mod remote {
             *req.uri_mut() = format!("{uri}{sep}{}", self.query)
                 .parse()
                 .map_err(|e| HttpError::new(HttpErrorKind::Request, e))?;
-            self.inner.execute(req).await
+            let res = self.inner.execute(req).await?;
+            if res.status().is_success() {
+                return Ok(res);
+            }
+            // object_store prints an error response's body, and a refusal can
+            // quote the request: S3's SignatureDoesNotMatch echoes its
+            // canonical query, security token included. Keep only the code.
+            let (mut parts, body) = res.into_parts();
+            let text = body.bytes().await.unwrap_or_default();
+            parts.headers.remove("content-length");
+            Ok(HttpResponse::from_parts(parts, error_code(&text).into()))
         }
+    }
+
+    /// The `<Code>` of an S3/GCS/Azure XML error body (`AccessDenied`,
+    /// `SignatureDoesNotMatch`, ...), or empty: nothing else of it is kept.
+    fn error_code(body: &[u8]) -> String {
+        let text = String::from_utf8_lossy(body);
+        text.split_once("<Code>")
+            .and_then(|(_, rest)| rest.split_once("</Code>"))
+            .map(|(code, _)| code)
+            .filter(|c| c.len() <= 64 && c.chars().all(|ch| ch.is_ascii_alphanumeric()))
+            .unwrap_or_default()
+            .to_string()
     }
 
     /// List the `.parquet` objects under remote prefix `prefix`, applying
@@ -4045,6 +4076,26 @@ pub(crate) mod remote {
                 .expect("gs:// builds a GCS store");
             assert_eq!(location.as_ref(), "dir/part.parquet");
         }
+
+        /// #820: a signed https URL on an S3 or Azure host is a plain web
+        /// URL (its query is the credential), not a bucket to sign for.
+        #[test]
+        fn signed_cloud_https_urls_resolve_to_the_http_store() {
+            for (url, key) in [
+                (
+                    "https://b.s3.us-east-1.amazonaws.com/dir/a.parquet?X-Amz-Signature=x",
+                    "dir/a.parquet",
+                ),
+                (
+                    "https://acct.blob.core.windows.net/c/dir/a.parquet?sp=r&sig=x",
+                    "c/dir/a.parquet",
+                ),
+            ] {
+                let (store, location) = store_and_location(url).expect(url);
+                assert!(store.to_string().starts_with("HttpStore"), "{url}: {store}");
+                assert_eq!(location.as_ref(), key, "{url}");
+            }
+        }
     }
 
     #[cfg(test)]
@@ -4563,6 +4614,8 @@ mod tests {
         let pick = |q: &str| redact_query(&format!("https://h/download?{q}")).into_owned();
         assert_ne!(pick("file=a&sig=x"), pick("file=b&sig=x"));
         assert_eq!(pick("file=a&sig=x"), pick("sig=y&file=a"));
+        // Order can select: some endpoints take the last of a repeated key.
+        assert_ne!(pick("file=a&file=b"), pick("file=b&file=a"));
         for shown in [s3("aaa", "1"), sas("aaa", "1"), pick("file=a&sig=x")] {
             assert!(!shown.contains("aaa") && !shown.contains("file"), "{shown}");
         }

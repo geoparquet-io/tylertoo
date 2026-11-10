@@ -10,7 +10,8 @@ use std::sync::Arc;
 /// exactly as `object_store`'s HTTP store expects, at any path. With
 /// `required_query` set, a request whose query string is not exactly that
 /// gets `403 Forbidden`, and so does any `HEAD`: an S3 or GCS presigned URL
-/// signs one method, GET, and its host refuses the rest (#820).
+/// signs one method, GET, and its host refuses the rest (#820). The refusal
+/// body echoes the query, as S3's `SignatureDoesNotMatch` does.
 ///
 /// Returns the base URL (`http://127.0.0.1:PORT`); the accept loop runs on a
 /// detached thread until the test process exits. Binding happens before
@@ -54,7 +55,16 @@ fn serve_connection(mut stream: std::net::TcpStream, body: &[u8], required: Opti
         let query = parts.next().and_then(|t| t.split_once('?')).map(|(_, q)| q);
         let range = read_range_header(&mut reader, body.len() as u64);
         let response = if required.is_some_and(|r| query != Some(r) || method == "HEAD") {
-            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec()
+            let echo = format!(
+                "<Error><Code>SignatureDoesNotMatch</Code>\
+                 <CanonicalQueryString>{}</CanonicalQueryString></Error>",
+                query.unwrap_or("")
+            );
+            format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\n\r\n{echo}",
+                echo.len()
+            )
+            .into_bytes()
         } else {
             respond(&method, range, body)
         };

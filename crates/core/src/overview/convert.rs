@@ -15189,7 +15189,11 @@ mod tests {
             let err = InputSource::from_str_input(&format!("{base}/in.parquet?sig=WRONG820"))
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("403") && !err.contains("WRONG820"), "{err}");
+            assert!(
+                err.contains("403") && err.contains("SignatureDoesNotMatch"),
+                "{err}"
+            );
+            assert!(!err.contains("WRONG820"), "{err}");
         }
 
         /// A URL with an unsupported scheme surfaces a helpful error through

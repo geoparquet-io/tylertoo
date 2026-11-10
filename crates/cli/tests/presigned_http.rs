@@ -106,6 +106,9 @@ fn a_refused_presigned_url_fails_without_echoing_it() {
 
     let (ok, out) = run(&["tiles", &url, out_path.to_str().unwrap()]);
     assert!(!ok, "a refused URL must fail: {out}");
-    assert!(out.contains("403"), "names the refusal: {out}");
+    assert!(
+        out.contains("403") && out.contains("SignatureDoesNotMatch"),
+        "names the refusal: {out}"
+    );
     assert!(!out.contains("WRONG820SECRET"), "leaks the query: {out}");
 }
