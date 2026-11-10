@@ -35,19 +35,20 @@ const ROWS: usize = 40_000;
 /// over them projects the whole buffered set under the budget.
 const LIGHT_HEAD_ROWS: usize = 16_000;
 /// Bytes of `name` on every row after the head: the whole skewed pass
-/// buffers ~108 MB, past the budget.
+/// buffers ~81 MB, past the budget.
 const HEAVY_NAME_BYTES: usize = 4_096;
 /// Pass-2 read batch size, in rows.
 const READ_BATCH_ROWS: &str = "256";
 /// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` for the `auto` run. The sinks get what
 /// the run's allowance (60% of it) has left after the writer's encodes and
-/// the pass-2 read-ahead and window (#716, #788, #791): ~95 MB here, between
-/// what the light input projects (~49 MB) and the ~108 MB the skewed run
-/// buffers once its levels share each input batch's rows (#852).
+/// the pass-2 read-ahead and window (#716, #788, #791): ~65 MB here, between
+/// what the light input projects (~22 MB) and the ~81 MB the skewed run
+/// buffers once its levels share each input batch's rows and geometries
+/// (#852).
 /// The margins assume 4 encode threads (`min(threads, 4)` grants), so
 /// `run_overview` pins `RAYON_NUM_THREADS=4`: a 3-core macOS runner would
 /// otherwise grant 3 and leave the sinks too much.
-const MEM_LIMIT_BYTES: &str = "200000000";
+const MEM_LIMIT_BYTES: &str = "150000000";
 
 fn tylertoo_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tylertoo")
