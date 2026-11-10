@@ -83,12 +83,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BinaryBuilder, Float64Builder, Int64Builder, LargeListBuilder, UInt32Builder, UInt64Builder,
-    UInt8Builder,
+    BinaryBuilder, Float64Builder, Int32Builder, Int64Builder, LargeListBuilder, UInt32Builder,
+    UInt64Builder, UInt8Builder,
 };
 use arrow_array::{
-    Array, BinaryArray, Float64Array, Int64Array, LargeListArray, RecordBatch, UInt32Array,
-    UInt64Array, UInt8Array,
+    Array, BinaryArray, Float64Array, Int32Array, Int64Array, LargeListArray, RecordBatch,
+    UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
@@ -98,10 +98,11 @@ use crate::input_set::{ConvertSource, RowGroupSelection};
 
 use super::assign::FeatureKind;
 use super::cluster::{CategoryCounts, ClusterEntry, ClusterTables};
+use super::convert::CoalesceTable;
 use super::convert::{ConvertError, ConvertOptions};
 use super::ladder::EntryZoomSpec;
 use super::level::{EntryZoomProvenance, RankingProvenance};
-use super::stream::{CoalesceBuild, CoalesceScratch, WinnerTables};
+use super::stream::{CoalesceBuild, WinnerTables};
 
 /// Schema-metadata key under which the plan's JSON scalars travel.
 pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
@@ -118,7 +119,9 @@ pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
 /// older plans cannot provide the required typed totals. v6 streams losses in
 /// a length-prefixed JSONL partition before IPC, outside resident metadata.
 /// v7 adds the `--cluster-categories` labels and per-entry counts (#827).
-pub(super) const PLAN_FORMAT_VERSION: u32 = 7;
+/// v8 replaces the coalesce line scratch with the chain tables built from it
+/// (#546).
+pub(super) const PLAN_FORMAT_VERSION: u32 = 8;
 
 /// The first bytes of every plan artifact, ahead of the Arrow IPC payload.
 ///
@@ -127,7 +130,7 @@ pub(super) const PLAN_FORMAT_VERSION: u32 = 7;
 /// not a plan" and "this plan is damaged" *before* handing a single byte to
 /// an Arrow decoder — a byte-flip sweep over a real 10.5 KB artifact panicked
 /// inside arrow's buffer/IPC decoders at 11 of 203 positions (#512).
-pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x07";
+pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x08";
 
 /// The format-independent part of [`PLAN_MAGIC`]: everything but the trailing
 /// version byte.
@@ -553,18 +556,15 @@ struct KeptRun {
 ///
 /// Coalesced chains (#546) are the exception: a chain takes its rep row's
 /// attributes but spans rows from anywhere, so the shard also keeps the row
-/// group of every rep in `reps` (the chains that reach it), and the chain
-/// tables (built over the whole plan) are re-keyed with the rest.
+/// group of every rep in `reps` (the chains that reach it), and the plan's
+/// chains are re-keyed with the rest.
 ///
 /// Returns the shard's read selection when the reps widened it.
 pub(super) fn rebase_plan_for_shard(
     plan: &mut ConvertPlan,
     source: &ConvertSource,
     shard_selection: Option<&RowGroupSelection>,
-    (mut chains, reps): (
-        Option<&mut CoalesceBuild>,
-        &std::collections::BTreeSet<usize>,
-    ),
+    reps: &std::collections::BTreeSet<usize>,
     path: &Path,
 ) -> Result<Option<RowGroupSelection>, ConvertError> {
     let rg_rows = source.part_row_group_row_counts()?;
@@ -731,15 +731,11 @@ pub(super) fn rebase_plan_for_shard(
     for table in plan.cluster_tables.iter_mut().flatten() {
         rekey(table, &runs);
     }
-    if let Some(chains) = &mut chains {
-        for table in chains.tables.iter_mut().flatten() {
-            rekey(table, &runs);
-        }
+    if let Some(chains) = &mut plan.chains {
+        chains
+            .entries
+            .retain_mut(|c| shard_row(&runs, c.rep).map(|r| c.rep = r).is_some());
     }
-    debug_assert!(
-        plan.coalesce.is_none(),
-        "load_plan_state turns the line scratch into `chains` before the re-addressing"
-    );
 
     // The totals describe what this run will read, not the dataset: they feed
     // the report and the pass-2 RAM-vs-spill decision, and a global
@@ -1047,17 +1043,91 @@ pub(super) struct LadderProvenance {
     pub kind: String,
 }
 
-/// The coalescing (Q3) line scratch, geometry encoded as WKB.
+/// One saved coalesce chain: its planned level, rep row, segment count, and
+/// where its WKB sits in [`SavedChains::wkb`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SavedChain {
+    pub level: usize,
+    pub rep: usize,
+    pub count: i32,
+    at: usize,
+}
+
+/// The coalescing (Q3) chain tables pass 1 built (#546), geometry kept as
+/// the plan's own WKB until a consumer decodes the chains it needs.
+///
+/// A plan carries the chains rather than the line scratch they were built
+/// from: a data shard then decodes only the chains that reach it, instead
+/// of holding the whole dataset's lines and re-running the chain stage.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct CoalescePlan {
-    /// Source row index per collected line, ascending input order.
-    pub rows: Vec<usize>,
-    /// WKB of each line, parallel to `rows`.
-    pub wkb: Vec<Vec<u8>>,
-    /// Sort key per line, parallel to `rows`.
-    pub sort_keys: Vec<Option<f64>>,
-    /// Interned class group per line; `None` = no class ranking active.
-    pub groups: Option<Vec<u32>>,
+pub(super) struct SavedChains {
+    /// Sorted by `(level, rep)`.
+    pub entries: Vec<SavedChain>,
+    wkb: BinaryArray,
+    /// Whether any chain of any non-canonical level merged two or more
+    /// segments ([`CoalesceBuild::merged`]).
+    pub merged: bool,
+}
+
+impl SavedChains {
+    fn from_build(build: &CoalesceBuild) -> Result<Self, ConvertError> {
+        let mut entries = Vec::new();
+        let mut wkb = BinaryBuilder::new();
+        for (level, table) in build.tables.iter().enumerate() {
+            let Some(table) = table else { continue };
+            let mut reps: Vec<&usize> = table.keys().collect();
+            reps.sort_unstable();
+            for &rep in reps {
+                let (geom, count) = &table[&rep];
+                let bytes = crate::wkb::geometry_to_wkb(geom).map_err(|e| {
+                    super::convert::InvalidOption::save_plan(format!(
+                        "--save-plan: encoding a coalesce chain failed: {e}"
+                    ))
+                })?;
+                wkb.append_value(bytes);
+                entries.push(SavedChain {
+                    level,
+                    rep,
+                    count: *count,
+                    at: entries.len(),
+                });
+            }
+        }
+        Ok(Self {
+            entries,
+            wkb: wkb.finish(),
+            merged: build.merged,
+        })
+    }
+
+    /// Chain `c`'s geometry.
+    pub(super) fn geometry(&self, c: &SavedChain) -> Result<geo::Geometry<f64>, ConvertError> {
+        crate::wkb::wkb_to_geometry(self.wkb.value(c.at)).map_err(|e| {
+            super::convert::InvalidOption::plan(format!(
+                "--plan: decoding a coalesce chain failed: {e}"
+            ))
+        })
+    }
+
+    /// The chain tables, one per planned level: every non-canonical level
+    /// gets one, empty when none of its chains is left; the canonical level
+    /// (verbatim) gets none.
+    fn into_build(self, num_levels: usize, finest: usize) -> Result<CoalesceBuild, ConvertError> {
+        let mut tables: Vec<Option<CoalesceTable>> = (0..num_levels)
+            .map(|l| (l != finest).then(HashMap::new))
+            .collect();
+        for c in &self.entries {
+            let geom = self.geometry(c)?;
+            // `level` was bounded at load; the canonical level has no table.
+            if let Some(table) = tables.get_mut(c.level).and_then(Option::as_mut) {
+                table.insert(c.rep, (geom, c.count));
+            }
+        }
+        Ok(CoalesceBuild {
+            tables,
+            merged: self.merged,
+        })
+    }
 }
 
 /// The persisted pass-1 + assignment result.
@@ -1087,8 +1157,8 @@ pub(super) struct ConvertPlan {
     pub cluster_tables: Option<ClusterTables>,
     /// `--cluster-categories` slot labels, indexed by category slot (#827).
     pub cluster_categories: Option<Vec<String>>,
-    /// Line scratch for coalescing (Q3), or `None`.
-    pub coalesce: Option<CoalescePlan>,
+    /// The coalesce chain tables (Q3), or `None` when coalescing is off.
+    pub chains: Option<SavedChains>,
     /// The ranking provenance block the writer stamps into the footer.
     pub rank_provenance: RankingProvenance,
     /// The dataset-global rank-plan decision, for a reviewer.
@@ -1113,27 +1183,10 @@ impl ConvertPlan {
         entry_zoom: Option<&EntryZoomProvenance>,
         totals: PlanTotals,
     ) -> Result<ConvertPlan, ConvertError> {
-        let coalesce = tables
-            .coalesce_scratch
+        let chains = tables
+            .coalesce_build
             .as_ref()
-            .map(|s| {
-                let wkb = s
-                    .geoms
-                    .iter()
-                    .map(crate::wkb::geometry_to_wkb)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| {
-                        super::convert::InvalidOption::save_plan(format!(
-                            "--save-plan: encoding a coalesce line failed: {e}"
-                        ))
-                    })?;
-                Ok::<_, ConvertError>(CoalescePlan {
-                    rows: s.rows.clone(),
-                    wkb,
-                    sort_keys: s.sort_keys.clone(),
-                    groups: s.groups.clone(),
-                })
-            })
+            .map(SavedChains::from_build)
             .transpose()?;
         Ok(ConvertPlan {
             version: PLAN_FORMAT_VERSION,
@@ -1146,7 +1199,7 @@ impl ConvertPlan {
             carriers: tables.carriers.clone(),
             cluster_tables: tables.cluster_tables.clone(),
             cluster_categories: tables.cluster_categories.clone(),
-            coalesce,
+            chains,
             rank_provenance: rank_provenance.clone(),
             rank_plan: RankPlanProvenance::from_provenance(rank_provenance),
             ladder: ladder.map(|s| LadderProvenance {
@@ -1158,46 +1211,20 @@ impl ConvertPlan {
         })
     }
 
-    /// Take the line scratch out of the plan, decoded for the chain stage.
-    pub(super) fn take_coalesce_scratch(
-        &mut self,
-    ) -> Result<Option<CoalesceScratch>, ConvertError> {
-        self.coalesce
-            .take()
-            .map(|c| {
-                let geoms = c
-                    .wkb
-                    .iter()
-                    .map(|w| crate::wkb::wkb_to_geometry(w))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| {
-                        super::convert::InvalidOption::plan(format!(
-                            "--plan: decoding a coalesce line failed: {e}"
-                        ))
-                    })?;
-                Ok::<_, ConvertError>(CoalesceScratch {
-                    rows: c.rows,
-                    geoms,
-                    sort_keys: c.sort_keys,
-                    groups: c.groups,
-                })
-            })
-            .transpose()
-    }
-
     /// Rebuild the winner tables pass 2 addresses. Consumes the plan's
     /// O(dataset) tables rather than cloning them.
-    pub(super) fn into_winner_tables(mut self) -> Result<WinnerTables, ConvertError> {
-        let coalesce_scratch = self.take_coalesce_scratch()?;
+    pub(super) fn into_winner_tables(self) -> Result<WinnerTables, ConvertError> {
+        let num_levels = self.level_specs.len();
+        let coalesce_build = self
+            .chains
+            .map(|c| c.into_build(num_levels, self.finest))
+            .transpose()?;
         Ok(WinnerTables {
             level_specs: self.level_specs,
             cluster_tables: self.cluster_tables,
             cluster_categories: self.cluster_categories,
             kinds: self.kinds,
-            coalesce_scratch,
-            // The `--plan` path skips pass 1 entirely, so nothing prebuilt the
-            // chain tables; pass 2 builds them itself (#570).
-            coalesce_build: None,
+            coalesce_build,
             min_levels: self.min_levels,
             counts: self.counts,
             carriers: self.carriers,
@@ -1257,6 +1284,8 @@ struct PlanMeta {
     has_cluster: bool,
     cluster_categories: Option<Vec<String>>,
     has_coalesce: bool,
+    /// [`SavedChains::merged`]; `false` when coalescing is off.
+    coalesce_merged: bool,
     rank_provenance: RankingProvenance,
     rank_plan: RankPlanProvenance,
     ladder: Option<LadderProvenance>,
@@ -1267,8 +1296,8 @@ struct PlanMeta {
 /// The single-batch schema every section list hangs off.
 fn plan_schema(meta: String) -> Schema {
     // Every inner field is nullable: that is what the Arrow list builders
-    // produce, and only `cluster_agg` / `coalesce_sort_key` actually carry
-    // nulls (a missing aggregate / a missing sort key).
+    // produce, and only `cluster_agg` actually carries nulls (a missing
+    // aggregate).
     let list = |name: &str, inner: DataType| {
         Field::new(
             name,
@@ -1288,10 +1317,10 @@ fn plan_schema(meta: String) -> Schema {
         list("cluster_category_len", DataType::UInt32),
         list("cluster_category_slot", DataType::UInt32),
         list("cluster_category_count", DataType::Int64),
-        list("coalesce_row", DataType::UInt64),
-        list("coalesce_wkb", DataType::Binary),
-        list("coalesce_sort_key", DataType::Float64),
-        list("coalesce_group", DataType::UInt32),
+        list("chain_level", DataType::UInt32),
+        list("chain_rep", DataType::UInt64),
+        list("chain_count", DataType::Int32),
+        list("chain_wkb", DataType::Binary),
     ];
     Schema::new(fields).with_metadata(HashMap::from([(PLAN_META_KEY.to_string(), meta)]))
 }
@@ -1330,7 +1359,8 @@ impl ConvertPlan {
             cluster_agg_stride: stride,
             has_cluster: self.cluster_tables.is_some(),
             cluster_categories: self.cluster_categories.clone(),
-            has_coalesce: self.coalesce.is_some(),
+            has_coalesce: self.chains.is_some(),
+            coalesce_merged: self.chains.as_ref().is_some_and(|c| c.merged),
             rank_provenance: self.rank_provenance.clone(),
             rank_plan: self.rank_plan.clone(),
             ladder: self.ladder.clone(),
@@ -1456,43 +1486,40 @@ impl ConvertPlan {
                 }
             ),
             list_col!(
+                UInt32Builder::new(),
+                self.chains.is_some(),
+                |b: &mut LargeListBuilder<UInt32Builder>| {
+                    for c in self.chains.iter().flat_map(|c| &c.entries) {
+                        b.values().append_value(c.level as u32);
+                    }
+                }
+            ),
+            list_col!(
                 UInt64Builder::new(),
-                self.coalesce.is_some(),
+                self.chains.is_some(),
                 |b: &mut LargeListBuilder<UInt64Builder>| {
-                    for row in self.coalesce.iter().flat_map(|c| &c.rows) {
-                        b.values().append_value(*row as u64);
+                    for c in self.chains.iter().flat_map(|c| &c.entries) {
+                        b.values().append_value(c.rep as u64);
+                    }
+                }
+            ),
+            list_col!(
+                Int32Builder::new(),
+                self.chains.is_some(),
+                |b: &mut LargeListBuilder<Int32Builder>| {
+                    for c in self.chains.iter().flat_map(|c| &c.entries) {
+                        b.values().append_value(c.count);
                     }
                 }
             ),
             list_col!(
                 BinaryBuilder::new(),
-                self.coalesce.is_some(),
+                self.chains.is_some(),
                 |b: &mut LargeListBuilder<BinaryBuilder>| {
-                    for w in self.coalesce.iter().flat_map(|c| &c.wkb) {
-                        b.values().append_value(w);
-                    }
-                }
-            ),
-            list_col!(
-                Float64Builder::new(),
-                self.coalesce.is_some(),
-                |b: &mut LargeListBuilder<Float64Builder>| {
-                    for k in self.coalesce.iter().flat_map(|c| &c.sort_keys) {
-                        b.values().append_option(*k);
-                    }
-                }
-            ),
-            list_col!(
-                UInt32Builder::new(),
-                self.coalesce.as_ref().is_some_and(|c| c.groups.is_some()),
-                |b: &mut LargeListBuilder<UInt32Builder>| {
-                    for g in self
-                        .coalesce
-                        .iter()
-                        .filter_map(|c| c.groups.as_ref())
-                        .flatten()
-                    {
-                        b.values().append_value(*g);
+                    if let Some(chains) = &self.chains {
+                        for c in &chains.entries {
+                            b.values().append_value(chains.wkb.value(c.at));
+                        }
                     }
                 }
             ),
@@ -1702,8 +1729,8 @@ impl ConvertPlan {
             None
         };
 
-        let coalesce = if meta.has_coalesce {
-            Some(rebuild_coalesce(&batch, path)?)
+        let chains = if meta.has_coalesce {
+            Some(rebuild_chains(&batch, &meta, path)?)
         } else {
             None
         };
@@ -1719,7 +1746,7 @@ impl ConvertPlan {
             carriers,
             cluster_tables,
             cluster_categories: meta.cluster_categories,
-            coalesce,
+            chains,
             rank_provenance: meta.rank_provenance,
             rank_plan: meta.rank_plan,
             ladder: meta.ladder,
@@ -1902,6 +1929,7 @@ typed_section!(u8_section, UInt8Array, u8);
 typed_section!(u64_section, UInt64Array, u64);
 typed_section!(u32_section, UInt32Array, u32);
 typed_section!(i64_section, Int64Array, i64);
+typed_section!(i32_section, Int32Array, i32);
 
 /// A nullable `Float64` section, preserving nulls (a missing aggregate / a
 /// missing sort key are both real values here).
@@ -2077,48 +2105,59 @@ fn rebuild_cluster_categories(
     Ok(out)
 }
 
-fn rebuild_coalesce(batch: &RecordBatch, path: &Path) -> Result<CoalescePlan, ConvertError> {
-    let rows: Vec<usize> = u64_section(batch, "coalesce_row", path)?
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| r as usize)
-        .collect();
-    let sort_keys = f64_opt_section(batch, "coalesce_sort_key", path)?.unwrap_or_default();
-    let groups = u32_section(batch, "coalesce_group", path)?;
-    let wkb = match section(batch, "coalesce_wkb", path)? {
-        None => Vec::new(),
+fn rebuild_chains(
+    batch: &RecordBatch,
+    meta: &PlanMeta,
+    path: &Path,
+) -> Result<SavedChains, ConvertError> {
+    let levels = u32_section(batch, "chain_level", path)?.unwrap_or_default();
+    let reps = u64_section(batch, "chain_rep", path)?.unwrap_or_default();
+    let counts = i32_section(batch, "chain_count", path)?.unwrap_or_default();
+    let wkb = match section(batch, "chain_wkb", path)? {
+        None => BinaryBuilder::new().finish(),
         Some(values) => {
             let a = values
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    plan_err(path, "section \"coalesce_wkb\" has the wrong value type")
-                })?;
+                .ok_or_else(|| plan_err(path, "section \"chain_wkb\" has the wrong value type"))?;
             if a.null_count() > 0 {
                 return Err(plan_err(
                     path,
                     &format!(
-                        "section \"coalesce_wkb\" holds {} null geometry/geometries",
+                        "section \"chain_wkb\" holds {} null geometry/geometries",
                         a.null_count(),
                     ),
                 ));
             }
-            (0..a.len()).map(|i| a.value(i).to_vec()).collect()
+            a.clone()
         }
     };
-    if wkb.len() != rows.len() || sort_keys.len() != rows.len() {
-        return Err(plan_err(path, "coalesce sections have mismatched lengths"));
+    if reps.len() != levels.len() || counts.len() != levels.len() || wkb.len() != levels.len() {
+        return Err(plan_err(path, "chain sections have mismatched lengths"));
     }
-    if let Some(g) = &groups {
-        if g.len() != rows.len() {
-            return Err(plan_err(path, "coalesce sections have mismatched lengths"));
+    let mut entries = Vec::with_capacity(levels.len());
+    for (at, ((&level, &rep), &count)) in levels.iter().zip(&reps).zip(&counts).enumerate() {
+        let level = level as usize;
+        if level >= meta.num_levels {
+            return Err(plan_err(
+                path,
+                &format!(
+                    "holds a coalesce chain at level {level} of a {}-level plan",
+                    meta.num_levels
+                ),
+            ));
         }
+        entries.push(SavedChain {
+            level,
+            rep: rep as usize,
+            count,
+            at,
+        });
     }
-    Ok(CoalescePlan {
-        rows,
+    Ok(SavedChains {
+        entries,
         wkb,
-        sort_keys,
-        groups,
+        merged: meta.coalesce_merged,
     })
 }
 
@@ -2324,6 +2363,25 @@ mod tests {
         }
     }
 
+    fn tiny_chains() -> SavedChains {
+        use geo::{coord, Geometry, LineString};
+        let line = |x: f64| {
+            Geometry::LineString(LineString::new(vec![
+                coord! { x: x, y: 0.0 },
+                coord! { x: x + 1.0, y: 0.5 },
+            ]))
+        };
+        SavedChains::from_build(&CoalesceBuild {
+            tables: vec![
+                Some(HashMap::from([(8, (line(2.0), 1)), (1, (line(-3.5), 3))])),
+                Some(HashMap::new()),
+                None,
+            ],
+            merged: true,
+        })
+        .unwrap()
+    }
+
     fn tiny_plan() -> ConvertPlan {
         ConvertPlan {
             version: PLAN_FORMAT_VERSION,
@@ -2367,12 +2425,7 @@ mod tests {
                 HashMap::new(),
             ]),
             cluster_categories: Some(vec!["a".into(), "b".into(), "other".into()]),
-            coalesce: Some(CoalescePlan {
-                rows: vec![1, 4, 8],
-                wkb: vec![vec![1, 2, 3], vec![], vec![9]],
-                sort_keys: vec![Some(0.5), None, Some(3.0)],
-                groups: Some(vec![0, 1, 0]),
-            }),
+            chains: Some(tiny_chains()),
             rank_provenance: RankingProvenance {
                 mode: "class-ranking".to_string(),
                 column: Some("class".to_string()),
@@ -2475,7 +2528,7 @@ mod tests {
             kinds: None,
             cluster_tables: None,
             cluster_categories: None,
-            coalesce: None,
+            chains: None,
             carriers: vec![vec![], vec![], vec![]],
             ladder: None,
             ..tiny_plan()
@@ -2484,21 +2537,42 @@ mod tests {
         assert_eq!(plan, ConvertPlan::load(f.path()).unwrap());
     }
 
-    /// A coalesce scratch with no class groups keeps `groups: None`.
+    /// The chain tables round trip into the build pass 2 consumes: every
+    /// non-canonical level gets a table, empty or not.
     #[test]
-    fn plan_roundtrip_coalesce_without_groups() {
+    fn plan_roundtrip_rebuilds_the_chain_tables() {
         let f = tempfile::NamedTempFile::new().unwrap();
-        let plan = ConvertPlan {
-            coalesce: Some(CoalescePlan {
-                rows: vec![0, 1],
-                wkb: vec![vec![7], vec![8, 9]],
-                sort_keys: vec![None, None],
-                groups: None,
-            }),
-            ..tiny_plan()
-        };
+        tiny_plan().save(f.path()).unwrap();
+        let tables = ConvertPlan::load(f.path())
+            .unwrap()
+            .into_winner_tables()
+            .unwrap()
+            .coalesce_build
+            .unwrap();
+        assert!(tables.merged);
+        let reps: Vec<Option<Vec<(usize, i32)>>> = tables
+            .tables
+            .iter()
+            .map(|t| {
+                t.as_ref().map(|t| {
+                    let mut v: Vec<_> = t.iter().map(|(&r, (_, n))| (r, *n)).collect();
+                    v.sort_unstable();
+                    v
+                })
+            })
+            .collect();
+        assert_eq!(reps, vec![Some(vec![(1, 3), (8, 1)]), Some(vec![]), None]);
+    }
+
+    /// A chain at a level the plan does not have is refused, not indexed.
+    #[test]
+    fn plan_rejects_a_chain_past_its_levels() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let mut plan = tiny_plan();
+        plan.chains.as_mut().unwrap().entries[0].level = 3;
         plan.save(f.path()).unwrap();
-        assert_eq!(plan, ConvertPlan::load(f.path()).unwrap());
+        let err = ConvertPlan::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("level 3 of a 3-level plan"), "{err}");
     }
 
     #[test]
@@ -2688,7 +2762,7 @@ mod tests {
                 &mut plan,
                 &source,
                 None,
-                (None, &Default::default()),
+                &Default::default(),
                 Path::new("forged.plan"),
             )
             .unwrap_err()
@@ -2706,7 +2780,7 @@ mod tests {
         let (source, _path) = one_part_source(&dir, &[2, 2]);
         let mut plan = tiny_plan();
         plan.fingerprint.inputs[0].row_groups = None;
-        plan.coalesce = None;
+        plan.chains = None;
         plan.min_levels = vec![0; 4];
         plan.kinds = Some(vec![
             FeatureKind::Point,
@@ -2725,7 +2799,7 @@ mod tests {
             &mut plan,
             &source,
             Some(&RowGroupSelection::from_parts(vec![vec![1]])),
-            (None, &Default::default()),
+            &Default::default(),
             Path::new("test.plan"),
         )
         .unwrap();
@@ -2846,7 +2920,7 @@ mod tests {
     fn fuzz_hook_reads_the_saved_v6_payload() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut plan = tiny_plan();
-        plan.coalesce = None;
+        plan.chains = None;
         let sink = crate::diagnostics::Diagnostics::default();
         sink.source_loss(3, None, crate::diagnostics::SourceLossCause::Filtered)
             .unwrap();
@@ -2905,7 +2979,7 @@ mod tests {
         plan.fingerprint.inputs[0].row_groups = None;
         plan.min_levels = vec![0; 6000];
         plan.kinds = Some(vec![FeatureKind::Point; 6000]);
-        plan.coalesce = None;
+        plan.chains = None;
         plan.totals.n_rows = 6000;
         let sink = crate::diagnostics::Diagnostics::default();
         sink.set_accounting_spill_dir(Some(spill.path()));
@@ -2917,7 +2991,7 @@ mod tests {
             &mut plan,
             &source,
             Some(&RowGroupSelection::from_parts(vec![vec![1]])),
-            (None, &Default::default()),
+            &Default::default(),
             Path::new("test.plan"),
         )
         .unwrap();
@@ -3070,6 +3144,7 @@ mod tests {
         let original = &schema.metadata()[PLAN_META_KEY];
         let mut meta: serde_json::Value = serde_json::from_str(original).unwrap();
         meta["version"] = PLAN_FORMAT_VERSION.into();
+        meta["coalesce_merged"] = false.into();
         let totals = meta["totals"].as_object_mut().unwrap();
         for key in [
             "antimeridian_suspect",

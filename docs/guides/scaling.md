@@ -343,15 +343,20 @@ Set `SPILL` to an existing directory on real disk. To rerun shard 7, submit
 
 ### Constraints
 
-- **Line coalescing costs every shard.** A coalesced chain joins line
-  segments from anywhere in the input and carries one segment's attributes.
-  Each data shard builds every chain from the plan, as the coarse job does,
-  and also reads the row groups of that segment for each chain that reaches
-  its tiles. On line data, every shard therefore needs the coarse job's
-  memory for chaining. To save it, pass `--no-coalesce-lines` to every job,
-  including the coarse job. This changes the line output. tylertoo supports
-  clustering, `--accumulate-attribute`, and tiny-polygon carriers at no extra
-  cost.
+- **Line coalescing follows each shard's share.** A coalesced chain joins
+  line segments from anywhere in the input and carries one segment's
+  attributes. The coarse job builds every chain and saves them in the plan.
+  Each data shard loads the chains of the zooms it exports, and also reads
+  the row group of the segment behind each chain that reaches its tiles. A
+  shard's memory therefore follows the rows it reads, as it does with
+  `--no-coalesce-lines`. On 2.8 million Overture road segments at z0 to z12,
+  cut into 64 shards at pivot 10 under a 12 GiB cap with 4 threads, the
+  single machine peaked at 5.0 GiB and the coarse job at 3.9 GiB. The shards
+  peaked at 0.75 to 3.4 GiB, median 0.96 GiB; with `--no-coalesce-lines`
+  they peaked at 0.6 to 4.8 GiB, median 1.0 GiB. The largest shards were the
+  ones whose range reached every row group. The plan holds the chains, 354 MB
+  for that input. Clustering, `--accumulate-attribute`, and tiny-polygon
+  carriers cost shards nothing extra.
 - **`--tile-buffer` must be at most 256 tile pixels**, the cap for every
   export. This fits inside the two pivot tiles (512 pixels) read around each
   shard's range.

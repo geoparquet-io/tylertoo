@@ -49,15 +49,15 @@ use super::coalesce::{collected_line_bytes, CoalesceInput, ExactChains};
 use super::config::ValidatedConfig;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
-    apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
-    build_source_schema, class_ranking_provenance, cluster_category_column, coalesce_effective,
-    coalesce_table_merged, count_vertices, extract_class_ranks, extract_numeric_values,
-    extract_sort_keys, fill_level_bytes, mixed_geometry_field, overture_road_ranking,
-    record_coalesce_merged, record_level_outcome, resolve_pass_read_workers,
-    resolve_reserved_column_collisions, scan_feature_traits, validate_cluster_schema,
-    validate_coalesce_schema, warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking,
-    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
-    PlanLevelReport, PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    apply_coalesced_count, build_generalization, build_level_batch, build_source_schema,
+    class_ranking_provenance, cluster_category_column, coalesce_effective, coalesce_table_merged,
+    count_vertices, extract_class_ranks, extract_numeric_values, extract_sort_keys,
+    fill_level_bytes, mixed_geometry_field, overture_road_ranking, record_coalesce_merged,
+    record_level_outcome, resolve_pass_read_workers, resolve_reserved_column_collisions,
+    scan_feature_traits, validate_cluster_schema, validate_coalesce_schema,
+    warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking, CoalesceTable, ConvertError,
+    ConvertOptions, ConvertReport, GroupInterner, LevelReport, PlanLevelReport, PlanReport,
+    SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{ClusterCategories, Crs, EntryZoomProvenance, Mode, RankingProvenance};
 use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
@@ -148,7 +148,6 @@ struct CoalescePlan<'a> {
     planned: &'a [EmitLevel],
     kept: usize,
     finest: usize,
-    crs: Crs,
     options: &'a ConvertOptions,
 }
 
@@ -157,7 +156,6 @@ struct CoalesceCountPlan<'a> {
     finest: usize,
     crs: Crs,
     options: &'a ConvertOptions,
-    prebuild: bool,
     wave: usize,
 }
 
@@ -1106,52 +1104,44 @@ fn shard_read_query(range: &crate::shard::TileRange, crs: Crs) -> BboxQuery {
     BboxQuery::new(&[b.lng_min, b.lat_min, b.lng_max, b.lat_max], crs)
 }
 
-/// #546: a data shard's coalesce chains, and the reps it must read.
+/// #546: the reps a data shard must read for the coalesce chains that reach
+/// it.
 ///
 /// A chain merges rows from anywhere in the input and carries its rep row's
-/// attributes, so a shard cannot build it from the rows it reads. It builds
-/// every level's chains over the plan's dataset-wide line scratch instead —
-/// the same tables a monolithic run builds — and returns the reps of the
-/// chains whose bbox reaches its read window, so the re-addressing reads
-/// their row groups too. No chain of a group the shard reads is dropped: its
-/// overview then holds what a monolithic one holds for that group, which the
-/// size valve's per-row-group gaps depend on.
-fn shard_chain_tables(
+/// attributes, so a shard cannot build it from the rows it reads. The plan
+/// carries every level's chains, as the coarse job built them; the shard
+/// keeps the levels it exports (zoom ≥ pivot) and reads the row group of
+/// every rep whose chain reaches its read window. No chain of a group the
+/// shard reads is dropped afterwards: its overview then holds what a
+/// monolithic one holds for that group, which the size valve's per-row-group
+/// gaps depend on.
+fn shard_chain_reps(
     plan: &mut super::plan_state::ConvertPlan,
     range: &crate::shard::TileRange,
-    (crs, memory): (Crs, MemoryBudget),
-    options: &ConvertOptions,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<Option<(CoalesceBuild, std::collections::BTreeSet<usize>)>, ConvertError> {
-    let Some(scratch) = plan.take_coalesce_scratch()? else {
-        return Ok(None);
+    crs: Crs,
+) -> Result<std::collections::BTreeSet<usize>, ConvertError> {
+    let Some(chains) = &mut plan.chains else {
+        return Ok(std::collections::BTreeSet::new());
     };
-    let (_, build) = coalesce_level_counts(
-        memory,
-        &scratch,
-        &plan.level_specs,
-        crs,
-        options,
-        true,
-        diagnostics,
-    );
-    let mut build = build.expect("prebuild returns the tables");
+    let level_specs = &plan.level_specs;
+    chains.entries.retain(|c| {
+        level_specs
+            .get(c.level)
+            .and_then(|&(_, zoom)| zoom)
+            .is_none_or(|z| z >= range.pivot_zoom())
+    });
     let window = shard_read_query(range, crs);
-    let mut reps = std::collections::BTreeSet::new();
-    for (table, &(_, zoom)) in build.tables.iter_mut().zip(&plan.level_specs) {
-        let Some(table) = table else { continue };
-        // A data shard exports no zoom below its pivot.
-        if zoom.is_some_and(|z| z < range.pivot_zoom()) {
-            table.clear();
-        }
-        reps.extend(
-            table
-                .iter()
-                .filter(|(_, (geom, _))| window.intersects(&super::convert::geometry_bbox(geom)))
-                .map(|(&rep, _)| rep),
-        );
-    }
-    Ok(Some((build, reps)))
+    let chains = &*chains;
+    chains
+        .entries
+        .par_iter()
+        .filter_map(|c| match chains.geometry(c) {
+            Ok(geom) => window
+                .intersects(&super::convert::geometry_bbox(&geom))
+                .then_some(Ok(c.rep)),
+            Err(e) => Some(Err(e)),
+        })
+        .collect()
 }
 
 /// Combined per-part footer-statistics row-group selection for the streaming
@@ -1266,52 +1256,6 @@ fn accumulator_requested(options: &ConvertOptions) -> bool {
                 .representation
                 .iter()
                 .any(|b| b.repr == Representation::Square))
-}
-
-/// Prebuild every non-verbatim level's coalesce chain table.
-///
-/// The single read fans each batch out to all levels at once, so every level's
-/// table has to exist before the read starts. Deterministic and keyed by rep
-/// row, so the result is byte-identical to the former per-level build.
-fn build_pass2_coalesce_tables(
-    coalesce_scratch: Option<&CoalesceScratch>,
-    emitted: &[EmitLevel],
-    finest: usize,
-    crs: Crs,
-    options: &ConvertOptions,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> Vec<Option<CoalesceTable>> {
-    let verbatim =
-        |e: &EmitLevel| matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
-    match coalesce_scratch {
-        // A ladder of verbatim levels has no chain table to build.
-        Some(scratch) if !emitted.iter().all(verbatim) => {
-            log::info!(
-                "[convert] building coalesce chain tables for {} level(s)",
-                emitted.len()
-            );
-            let lines = scratch.exact_chains(options);
-            emitted
-                .par_iter()
-                .map(|e| {
-                    (!verbatim(e)).then(|| {
-                        build_level_coalesce_table(
-                            &lines,
-                            e.orig as usize,
-                            finest,
-                            e.gsd,
-                            crs,
-                            options,
-                            diagnostics,
-                        )
-                    })
-                })
-                .collect()
-        }
-        _ => std::iter::repeat_with(|| None)
-            .take(emitted.len())
-            .collect(),
-    }
 }
 
 /// Cascading (#218): per level, the fine→coarse GSD chain from the finest
@@ -2020,122 +1964,47 @@ struct FooterFacts {
     cluster_categories: Option<ClusterCategories>,
 }
 
-/// Whether line coalescing merged anything at ANY planned non-canonical level
-/// (#379 / #541 review) — a property of the conversion, independent of which
-/// levels a zoom ceiling lets this run materialize.
+/// The materialized levels' chain tables (`planned[..kept]`), taken from
+/// the tables pass 1 built or the plan saved (#570, #546), and whether any
+/// planned level's chains merged (#379 / #541 review).
 ///
-/// `built` are the chain tables for the materialized levels; when one of them
-/// already merged something, that settles it. Otherwise each unmaterialized
-/// level's table is built (the same `build_level_coalesce_table` a full run
-/// would call), checked and dropped — short-circuiting at the first merge, so
-/// the extra cost is paid only by a capped run over line data that merged
-/// nothing coarse. Without it a capped coarse job and the full run would
-/// disagree on whether `coalesced_count` is published, and the coarse tiles
-/// would differ from the monolithic build's.
-/// The materialized levels' chain tables (`planned[..kept]`; a level above
-/// the ceiling never emits a row, so its table would be built and thrown
-/// away), plus [`coalesce_merged_anywhere`] over the whole plan.
+/// A non-verbatim level without a table is an error, never a rebuild: no
+/// line scratch survives pass 1, and a replay never had one. Pass 1 keeps
+/// every level `kept` covers and a plan supplies every level, so only a
+/// damaged plan gets here.
 fn pass2_coalesce(
-    scratch: Option<&CoalesceScratch>,
     prebuilt: Option<CoalesceBuild>,
     inputs: CoalescePlan<'_>,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> (Vec<Option<CoalesceTable>>, bool) {
+) -> Result<(Vec<Option<CoalesceTable>>, bool), ConvertError> {
     let CoalescePlan {
         planned,
         kept,
         finest,
-        crs,
         options,
     } = inputs;
-    // #570: pass 1 already ran the chain stage once per level, to count the
-    // rows each level would get. Take those tables rather than rebuilding
-    // them; `merged` came out of the same run, over the whole planned ladder.
-    if let Some(build) = prebuilt {
-        let mut by_level = build.tables;
-        let tables = planned[..kept]
-            .iter()
-            .map(|e| {
-                let verbatim =
-                    matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
-                if verbatim {
-                    return None;
-                }
-                by_level
-                    .get_mut(e.orig as usize)
-                    .and_then(Option::take)
-                    // Only reachable if the ceiling predicate and the plan
-                    // disagree; correctness does not depend on it.
-                    .or_else(|| {
-                        let scratch = scratch.expect("a prebuilt table implies a scratch");
-                        log::debug!(
-                            "[convert] coalesce level {} was not prebuilt; building it now",
-                            e.orig
-                        );
-                        let lines = scratch.exact_chains(options);
-                        Some(build_level_coalesce_table(
-                            &lines,
-                            e.orig as usize,
-                            finest,
-                            e.gsd,
-                            crs,
-                            options,
-                            diagnostics,
-                        ))
-                    })
-            })
-            .collect();
-        return (tables, build.merged);
-    }
-    let tables =
-        build_pass2_coalesce_tables(scratch, &planned[..kept], finest, crs, options, diagnostics);
-    let merged = coalesce_merged_anywhere(
-        scratch,
-        &tables,
-        &planned[kept..],
-        finest,
-        crs,
-        options,
-        diagnostics,
-    );
-    (tables, merged)
-}
-
-fn coalesce_merged_anywhere(
-    scratch: Option<&CoalesceScratch>,
-    built: &[Option<CoalesceTable>],
-    unmaterialized: &[EmitLevel],
-    finest: usize,
-    crs: Crs,
-    options: &ConvertOptions,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> bool {
-    if built.iter().flatten().any(coalesce_table_merged) {
-        return true;
-    }
-    let Some(scratch) = scratch else {
-        return false;
+    let Some(build) = prebuilt else {
+        return Ok((vec![None; kept], false));
     };
-    if unmaterialized.iter().all(|e| e.orig as usize == finest)
-        || matches!(options.mode, Mode::Partitioning)
-    {
-        return false;
-    }
-    let lines = scratch.exact_chains(options);
-    unmaterialized
-        .par_iter()
-        .filter(|e| e.orig as usize != finest)
-        .any(|e| {
-            coalesce_table_merged(&build_level_coalesce_table(
-                &lines,
-                e.orig as usize,
-                finest,
-                e.gsd,
-                crs,
-                options,
-                diagnostics,
-            ))
+    let mut by_level = build.tables;
+    let tables = planned[..kept]
+        .iter()
+        .map(|e| {
+            let level = e.orig as usize;
+            if matches!(options.mode, Mode::Partitioning) || level == finest {
+                return Ok(None);
+            }
+            by_level
+                .get_mut(level)
+                .and_then(Option::take)
+                .map(Some)
+                .ok_or_else(|| {
+                    super::convert::InvalidOption::plan(format!(
+                        "--plan: holds no coalesce chain table for level {level}"
+                    ))
+                })
         })
+        .collect::<Result<_, _>>()?;
+    Ok((tables, build.merged))
 }
 
 fn create_level_writer(
@@ -2303,13 +2172,10 @@ pub(super) struct WinnerTables {
     pub(super) cluster_categories: Option<Vec<String>>,
     /// Per-row geometry kinds (Q3), or `None` when line coalescing is off.
     pub(super) kinds: Option<Vec<FeatureKind>>,
-    /// The pass-1 line scratch, kept only when coalescing survives the memory
-    /// guard.
-    pub(super) coalesce_scratch: Option<CoalesceScratch>,
     /// The chain tables the per-level counts were computed from (#570), ready
-    /// for pass 2 to consume instead of running the whole chain stage again.
-    /// `None` when coalescing is off, and on the `--plan` path, where pass 1
-    /// never ran — pass 2 then builds them itself, as it always did.
+    /// for pass 2 to consume instead of running the whole chain stage again;
+    /// on the `--plan` path, the ones the plan saved. `None` when coalescing
+    /// is off.
     pub(super) coalesce_build: Option<CoalesceBuild>,
     /// Coarsest level per INPUT ROW; [`UNASSIGNED_LEVEL`] for skipped rows.
     pub(super) min_levels: Vec<u8>,
@@ -2330,17 +2196,15 @@ pub(super) struct WinnerTables {
 /// what it built rather than pass 2 running the whole stage a second time.
 pub(super) struct CoalesceBuild {
     /// Per PLANNED level (`level_specs` index), that level's chain table.
-    /// `None` at the canonical level and at levels a zoom ceiling will not
-    /// materialize — a table pass 2 would throw away is dropped here instead
-    /// of sitting resident through pass 1. Pass 2 rebuilds any level whose
-    /// entry is missing, so this stays a caching decision, never a
-    /// correctness one.
+    /// `None` at the canonical level, and at levels a zoom ceiling will not
+    /// materialize unless a plan is being saved — a table pass 2 would throw
+    /// away is dropped here instead of sitting resident through pass 1.
     pub(super) tables: Vec<Option<CoalesceTable>>,
     /// Whether ANY non-canonical level's chains merged two or more segments
     /// (`CoalescingProvenance::merged`). Evaluated over every planned level,
-    /// materialized or not — the same set [`coalesce_merged_anywhere`] covers,
-    /// since a level omitted for having no rows has no chains to merge.
-    merged: bool,
+    /// materialized or not: a level omitted for having no rows has no chains
+    /// to merge.
+    pub(super) merged: bool,
 }
 
 /// Whether a level with this zoom can be materialized under `ceiling`.
@@ -2358,14 +2222,7 @@ fn level_within_ceiling(zoom: Option<u8>, ceiling: Option<u8>) -> bool {
 
 /// Per planned level, the rows the coalesced lines contribute (the level's
 /// surviving chain count; every collected line at the canonical level), plus
-/// the chain tables pass 2 will consume when `prebuild` is set (#570).
-///
-/// `prebuild` is off for `--plan-only` (#560), which stops after the plan is
-/// written: it runs the chain stage for the counts alone, so it neither
-/// simplifies every chain nor holds every level's table while the plan's WKB
-/// copy of the line scratch is encoded. The counts are identical either way:
-/// both come from [`super::convert::coalesce_level_chains`], taken before
-/// simplification.
+/// the chain tables pass 2 and a saved plan consume (#570, #546).
 ///
 /// The levels run in parallel waves of at most [`chain_stage_wave`] levels,
 /// sized against the profile's pass-1 memory budget: every level runs the
@@ -2381,9 +2238,8 @@ fn coalesce_level_counts(
     level_specs: &[(f64, Option<u8>)],
     crs: Crs,
     options: &ConvertOptions,
-    prebuild: bool,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> (Vec<usize>, Option<CoalesceBuild>) {
+) -> (Vec<usize>, CoalesceBuild) {
     let finest = level_specs.len().saturating_sub(1);
     let line_bytes: u64 = scratch.geoms.iter().map(collected_line_bytes).sum();
     let budget = memory.allowance(options.profile);
@@ -2395,7 +2251,6 @@ fn coalesce_level_counts(
             finest,
             crs,
             options,
-            prebuild,
             wave,
         },
         diagnostics,
@@ -2431,13 +2286,12 @@ fn coalesce_level_counts_in_waves(
     scratch: &CoalesceScratch,
     inputs: CoalesceCountPlan<'_>,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> (Vec<usize>, Option<CoalesceBuild>) {
+) -> (Vec<usize>, CoalesceBuild) {
     let CoalesceCountPlan {
         level_specs,
         finest,
         crs,
         options,
-        prebuild,
         wave,
     } = inputs;
     let num_levels = level_specs.len();
@@ -2448,17 +2302,12 @@ fn coalesce_level_counts_in_waves(
         .then(|| scratch.exact_chains(options));
     let wave = wave.max(1);
     log::info!(
-        "[convert] {} coalesce chains for {num_levels} level(s) ({} candidate line(s), \
-         {wave} level(s) at a time)",
-        if prebuild {
-            "building the tables of"
-        } else {
-            "counting"
-        },
+        "[convert] building the tables of coalesce chains for {num_levels} level(s) \
+         ({} candidate line(s), {wave} level(s) at a time)",
         scratch.rows.len()
     );
-    // One run per level, `wave` levels at a time. With `prebuild` it produces
-    // BOTH the count the level plan needs and the table pass 2 needs.
+    // One run per level, `wave` levels at a time, producing BOTH the count
+    // the level plan needs and the table pass 2 needs.
     let levels: Vec<usize> = (0..num_levels).collect();
     let mut per_level: Vec<(usize, Option<CoalesceTable>, bool)> = Vec::with_capacity(num_levels);
     for chunk in levels.chunks(wave) {
@@ -2472,11 +2321,6 @@ fn coalesce_level_counts_in_waves(
             let lines = lines
                 .as_ref()
                 .expect("a non-canonical level implies the exact join");
-            if !prebuild {
-                let chains =
-                    super::convert::coalesce_level_chains(lines, level, finest, gsd, crs, options);
-                return (chains.len(), None, false);
-            }
             let (table, hint) = super::convert::build_level_coalesce_table_and_hint(
                 lines,
                 level,
@@ -2487,7 +2331,9 @@ fn coalesce_level_counts_in_waves(
                 diagnostics,
             );
             let merged = coalesce_table_merged(&table);
-            let keep = level_within_ceiling(level_specs[level].1, options.zoom_ceiling);
+            // A saved plan carries every level's table (#546).
+            let keep = options.save_plan.is_some()
+                || level_within_ceiling(level_specs[level].1, options.zoom_ceiling);
             (hint, keep.then_some(table), merged)
         }));
     }
@@ -2499,10 +2345,10 @@ fn coalesce_level_counts_in_waves(
         tables.push(table);
         merged_anywhere |= merged;
     }
-    let build = prebuild.then_some(CoalesceBuild {
+    let build = CoalesceBuild {
         tables,
         merged: merged_anywhere,
-    });
+    };
     (counts, build)
 }
 
@@ -2523,7 +2369,6 @@ fn resolve_winner_tables(
     let memory = *ctx.budget;
     let crs = ctx.crs;
     let options = ctx.config.options();
-    let prebuild_chain_tables = ctx.prebuild_chain_tables;
     let diagnostics = ctx.diagnostics;
     // --- Winner tables (assignment + Q2 density budget). ---------------------
     let level_specs = options.levels.resolve(options.gsd_base)?;
@@ -2701,21 +2546,16 @@ fn resolve_winner_tables(
         *count += level_carriers.len();
     }
     let mut coalesce_build = None;
-    if let Some(scratch) = &coalesce_scratch {
+    if let Some(scratch) = coalesce_scratch {
         // Duplicating only (partitioning + coalescing is rejected upstream).
-        let (chain_counts, build) = coalesce_level_counts(
-            memory,
-            scratch,
-            &level_specs,
-            crs,
-            options,
-            prebuild_chain_tables,
-            diagnostics,
-        );
+        let (chain_counts, build) =
+            coalesce_level_counts(memory, &scratch, &level_specs, crs, options, diagnostics);
         for (count, chains) in counts.iter_mut().zip(chain_counts) {
             *count += chains;
         }
-        coalesce_build = build;
+        coalesce_build = Some(build);
+        // Everything downstream reads the chain tables, never the lines.
+        release_in_parallel(scratch.geoms);
         // A boundary sample only: the background sampler keeps crediting the
         // assignment phase, whose name set the profile JSON pins (#571).
         rss.log_phase("coalesce chain stage");
@@ -2726,7 +2566,6 @@ fn resolve_winner_tables(
         cluster_tables,
         cluster_categories,
         kinds,
-        coalesce_scratch,
         coalesce_build,
         min_levels,
         counts,
@@ -3051,9 +2890,6 @@ struct Pass1Ctx<'a> {
     bbox_query: Option<&'a BboxQuery>,
     bound_filter: Option<&'a super::filter::BoundFilter>,
     crs: Crs,
-    /// Keep the coalesce chain tables the level counts are built from, for
-    /// pass 2 (#570). Off for `--plan-only`, which has no pass 2.
-    prebuild_chain_tables: bool,
 }
 
 /// Everything the rest of the driver consumes from pass 1 and the level
@@ -3114,14 +2950,9 @@ struct FrontHalf {
 /// That sharing is the #560 invariant's implementation: there is no separate
 /// plan-writing path that could drift from the one the fleet's full coarse job
 /// takes, so the artifact cannot differ.
-///
-/// `prebuild_chain_tables` is the one difference, and it never reaches the
-/// artifact: a full convert keeps the coalesce chain tables pass 1 built for
-/// pass 2 (#570); `--plan-only` has no pass 2, so it only counts the chains.
 fn run_front_half(
     source: &ConvertSource,
     options: &ConvertOptions,
-    prebuild_chain_tables: bool,
     rss: &mut RssTracker,
     diagnostics: &crate::diagnostics::Diagnostics,
     overview: Option<&Path>,
@@ -3173,7 +3004,6 @@ fn run_front_half(
             bbox_query: preflight.bbox_query.as_ref(),
             bound_filter: preflight.bound_filter.as_ref(),
             crs: preflight.crs,
-            prebuild_chain_tables,
         },
         rss,
     )?;
@@ -3218,7 +3048,7 @@ pub(crate) fn write_plan_streaming(
     let mut rss = RssTracker::new(false, "preflight");
     let FrontHalf {
         preflight, plan, ..
-    } = run_front_half(source, options, false, &mut rss, diagnostics, None)?;
+    } = run_front_half(source, options, &mut rss, diagnostics, None)?;
     let options = &preflight.options;
     let path = options
         .save_plan
@@ -3325,7 +3155,7 @@ fn resolve_plan_state(
                 options,
                 inputs.source,
                 inputs.selected_row_groups,
-                (inputs.crs, *inputs.budget),
+                inputs.crs,
                 diagnostics,
             )
         }
@@ -3492,7 +3322,7 @@ fn load_plan_state(
     options: &ConvertOptions,
     source: &ConvertSource,
     selected_row_groups: Option<&RowGroupSelection>,
-    crs_memory: (Crs, MemoryBudget),
+    crs: Crs,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<PlanState, ConvertError> {
     let t_pass1 = Instant::now();
@@ -3528,17 +3358,14 @@ fn load_plan_state(
     // sections are then re-addressed onto this shard's narrower stream, and
     // the equality below is what proves the re-addressing landed — the
     // compacted table must be exactly as long as what the shard will read.
-    let mut chains = None;
     let mut read_selection = None;
     if let Some(range) = &options.shard {
-        let reps;
-        (chains, reps) = shard_chain_tables(&mut plan, range, crs_memory, options, diagnostics)?
-            .map_or_else(Default::default, |(build, reps)| (Some(build), reps));
+        let reps = shard_chain_reps(&mut plan, range, crs)?;
         read_selection = super::plan_state::rebase_plan_for_shard(
             &mut plan,
             source,
             selected_row_groups,
-            (chains.as_mut(), &reps),
+            &reps,
             path,
         )?;
         if let Some(read) = &read_selection {
@@ -3608,8 +3435,7 @@ fn load_plan_state(
     );
     let ranking_provenance = plan.rank_provenance.clone();
     let entry_zoom = plan.entry_zoom.clone();
-    let mut tables = plan.into_winner_tables()?;
-    tables.coalesce_build = chains;
+    let tables = plan.into_winner_tables()?;
     Ok(PlanState {
         tables,
         read_selection,
@@ -3717,14 +3543,7 @@ pub(crate) fn run_stages(
         plan,
         #[cfg(test)]
         memory,
-    } = run_front_half(
-        source,
-        options,
-        true,
-        &mut rss,
-        diagnostics,
-        Some(output_path),
-    )?;
+    } = run_front_half(source, options, &mut rss, diagnostics, Some(output_path))?;
     #[cfg(test)]
     let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
     #[cfg(not(test))]
@@ -3756,7 +3575,6 @@ pub(crate) fn run_stages(
                 mut cluster_tables,
                 cluster_categories,
                 kinds,
-                coalesce_scratch,
                 coalesce_build,
                 min_levels,
                 counts,
@@ -3821,22 +3639,14 @@ pub(crate) fn run_stages(
     // Only the levels that get written need a chain table (#541); built
     // before the writer because the footer records whether any chain merged.
     let (coalesce_tables, coalesce_merged) = pass2_coalesce(
-        coalesce_scratch.as_ref(),
         coalesce_build,
         CoalescePlan {
             planned: &planned,
             kept,
             finest,
-            crs,
             options,
         },
-        diagnostics,
-    );
-    // Pass 2 reads the chain tables, never the line scratch: free it now,
-    // across the pool, rather than holding it through pass 2 (#817 T1).
-    if let Some(scratch) = coalesce_scratch {
-        release_in_parallel(scratch.geoms);
-    }
+    )?;
 
     let spill_reservation = reserve_spill_cache(
         &mut budget,
@@ -7078,7 +6888,7 @@ pub(super) fn process_level_batch(
         // callers (the pass-2 engine and `write_level_streaming`) hand the
         // result to a writer that parallelizes its own encode (#296, #304).
         // Chain reps substitute their merged, already-simplified geometry
-        // (simplified once in `build_level_coalesce_table`, identically to
+        // (simplified once in `build_level_coalesce_table_and_hint`, identically to
         // the in-memory path).
         //
         // Cascading (#218): a non-empty `cascade_chain` folds canonical
@@ -7823,7 +7633,6 @@ mod tests {
                 bbox_query: pre.bbox_query.as_ref(),
                 bound_filter: pre.bound_filter.as_ref(),
                 crs: pre.crs,
-                prebuild_chain_tables: false,
             },
             chunk_rows,
         )
@@ -10256,45 +10065,40 @@ mod tests {
         }
     }
 
-    /// `--plan-only` never reaches pass 2, so it must count the chains
-    /// without building (and holding) every level's simplified chain table,
-    /// and the counts must be exactly the ones a full run plans with.
+    /// A run that saves a plan keeps every level's chain table, above its
+    /// zoom ceiling too: the plan carries them to the shards (#546). Without
+    /// a plan to save, a table the ceiling will not materialize is dropped.
     #[test]
-    fn plan_only_counts_chains_without_building_tables() {
+    fn a_saved_plan_keeps_every_levels_chain_table() {
         let scratch = chained_scratch(40);
         let level_specs: Vec<(f64, Option<u8>)> = (0..6u8)
             .map(|z| (20_000.0 / f64::from(1u32 << z), Some(z + 4)))
             .collect();
         let finest = level_specs.len() - 1;
-        let options = ConvertOptions::default();
-        let (full_counts, full_build) = coalesce_level_counts(
-            MemoryBudget::with_available(None),
-            &scratch,
-            &level_specs,
-            Crs::Epsg4326,
-            &options,
-            true,
-            &crate::diagnostics::Diagnostics::default(),
-        );
-        let (plan_counts, plan_build) = coalesce_level_counts(
-            MemoryBudget::with_available(None),
-            &scratch,
-            &level_specs,
-            Crs::Epsg4326,
-            &options,
-            false,
-            &crate::diagnostics::Diagnostics::default(),
-        );
-        assert_eq!(plan_counts, full_counts, "plan-only plans the same levels");
-        assert!(
-            plan_build.is_none(),
-            "plan-only must not build chain tables"
-        );
-        let full_build = full_build.expect("a full run keeps its tables for pass 2");
-        assert_eq!(full_build.tables.len(), level_specs.len());
-        assert!(full_build.tables[finest].is_none());
-        assert!(full_build.merged, "10-segment polylines merge");
-        assert_eq!(full_counts[finest], scratch.rows.len());
+        let build = |save_plan: Option<std::path::PathBuf>| {
+            let options = ConvertOptions {
+                zoom_ceiling: Some(6),
+                save_plan,
+                ..Default::default()
+            };
+            coalesce_level_counts(
+                MemoryBudget::with_available(None),
+                &scratch,
+                &level_specs,
+                Crs::Epsg4326,
+                &options,
+                &crate::diagnostics::Diagnostics::default(),
+            )
+        };
+        let (capped_counts, capped) = build(None);
+        let (saved_counts, saved) = build(Some("convert.plan".into()));
+        assert_eq!(saved_counts, capped_counts);
+        let kept = |b: &CoalesceBuild| b.tables.iter().map(Option::is_some).collect::<Vec<_>>();
+        assert_eq!(kept(&capped), [true, true, true, false, false, false]);
+        assert_eq!(kept(&saved), [true, true, true, true, true, false]);
+        assert!(saved.tables[finest].is_none());
+        assert!(saved.merged, "10-segment polylines merge");
+        assert_eq!(saved_counts[finest], scratch.rows.len());
     }
 
     /// #817 T1: convert's O(dataset) leftovers (the line scratch, the chain
@@ -10350,14 +10154,13 @@ mod tests {
             .unwrap();
         let joins = pool.install(|| {
             super::super::coalesce::EXACT_JOINS.with(|c| c.set(0));
-            for prebuild in [true, false] {
+            for _ in 0..2 {
                 coalesce_level_counts(
                     MemoryBudget::with_available(None),
                     &scratch,
                     &level_specs,
                     Crs::Epsg4326,
                     &options,
-                    prebuild,
                     &crate::diagnostics::Diagnostics::default(),
                 );
             }
@@ -10379,32 +10182,15 @@ mod tests {
             .unwrap();
         let joins = pool.install(|| {
             super::super::coalesce::EXACT_JOINS.with(|c| c.set(0));
-            for prebuild in [true, false] {
-                coalesce_level_counts(
-                    MemoryBudget::with_available(None),
-                    &scratch,
-                    &level_specs,
-                    Crs::Epsg4326,
-                    &options,
-                    prebuild,
-                    &crate::diagnostics::Diagnostics::default(),
-                );
-            }
-            let emitted = [EmitLevel {
-                orig: 0,
-                gsd: 20_000.0,
-                zoom: Some(4),
-                hint: 40,
-            }];
-            let tables = build_pass2_coalesce_tables(
-                Some(&scratch),
-                &emitted,
-                0,
+            let (_, build) = coalesce_level_counts(
+                MemoryBudget::with_available(None),
+                &scratch,
+                &level_specs,
                 Crs::Epsg4326,
                 &options,
                 &crate::diagnostics::Diagnostics::default(),
             );
-            assert!(tables.iter().all(Option::is_none));
+            assert!(build.tables.iter().all(Option::is_none));
             super::super::coalesce::EXACT_JOINS.with(std::cell::Cell::get)
         });
         assert_eq!(joins, 0, "no level coalesces, so no exact join");
@@ -10441,17 +10227,14 @@ mod tests {
                     finest,
                     crs: Crs::Epsg4326,
                     options: &options,
-                    prebuild: true,
                     wave,
                 },
                 &crate::diagnostics::Diagnostics::default(),
             )
         };
         let (all_counts, all_build) = run(level_specs.len());
-        let all_build = all_build.unwrap();
         for wave in [1, 2, 4] {
             let (counts, build) = run(wave);
-            let build = build.unwrap();
             assert_eq!(counts, all_counts, "wave {wave}");
             assert_eq!(build.merged, all_build.merged, "wave {wave}");
             assert_eq!(build.tables, all_build.tables, "wave {wave}");
@@ -10469,18 +10252,15 @@ mod tests {
             merged: true,
         };
         let (tables, merged) = pass2_coalesce(
-            None,
-            // no scratch: a rebuild would panic, which is the point
             Some(prebuilt),
             CoalescePlan {
                 planned: &planned,
                 kept: planned.len(),
                 finest,
-                crs: Crs::Epsg4326,
                 options: &ConvertOptions::default(),
             },
-            &crate::diagnostics::Diagnostics::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(tables.len(), 3);
         assert_eq!(tables[0].as_ref().map(|t| t.len()), Some(1));
         assert!(tables[0].as_ref().unwrap().contains_key(&100));
@@ -10492,26 +10272,47 @@ mod tests {
         assert!(merged, "the merged verdict rides along with the tables");
     }
 
-    /// Without a scratch there is nothing to prebuild and nothing to reuse —
-    /// the `--plan` path, where pass 1 never ran.
+    /// With coalescing off there are no tables and nothing merged.
     #[test]
-    fn pass2_builds_the_tables_itself_without_a_prebuild() {
+    fn pass2_has_no_chain_tables_without_coalescing() {
         let planned = emit_levels(&[4, 5]);
         let (tables, merged) = pass2_coalesce(
-            None,
             None,
             CoalescePlan {
                 planned: &planned,
                 kept: planned.len(),
                 finest: 1,
-                crs: Crs::Epsg4326,
                 options: &ConvertOptions::default(),
             },
-            &crate::diagnostics::Diagnostics::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(tables.len(), 2);
         assert!(tables.iter().all(Option::is_none));
         assert!(!merged);
+    }
+
+    /// A level whose table is missing is an error. It used to fall back to
+    /// rebuilding from the line scratch, which a shard had already given up
+    /// (#546 review: `expect` on a scratch that was not there).
+    #[test]
+    fn pass2_refuses_a_missing_chain_table() {
+        let planned = emit_levels(&[4, 5, 6]);
+        let prebuilt = CoalesceBuild {
+            tables: vec![Some(sentinel_table(100)), None, None],
+            merged: true,
+        };
+        let err = pass2_coalesce(
+            Some(prebuilt),
+            CoalescePlan {
+                planned: &planned,
+                kept: planned.len(),
+                finest: 2,
+                options: &ConvertOptions::default(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no coalesce chain table for level 1"), "{err}");
     }
 
     /// The per-level cache predicate must agree with the prefix the ceiling
@@ -10657,7 +10458,6 @@ mod tests {
             bbox_query: bbox,
             bound_filter: None,
             crs,
-            prebuild_chain_tables: false,
         };
         scan_chunk(
             &ctx,

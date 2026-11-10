@@ -81,8 +81,12 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and exit codes. The Python API now installs its `logging` bridge on its
   first call instead of at import.
 - Sharded builds work with line coalescing, which is on by default (#546).
-  Every data shard rebuilds the chains from the plan and reads the row groups
-  of the chains that reach its tiles. Tile bodies match a single-machine
+  The convert plan carries the coalesce chains the coarse job built, so a
+  data shard runs no chain stage: it reads the row groups of the chains that
+  reach its tiles. Its memory follows its own share of the data (on 2.8M
+  Overture segments at 64 shards, about 1 GB per shard against 4 GB when
+  each shard rebuilt the chains). Plans saved by earlier builds must be
+  re-created with `--save-plan`. Tile bodies match a single-machine
   build byte for byte, except for over-cap tiles under the default
   `--size-valve merge` when a shard prunes row groups (#854; pass
   `--size-valve drop` for an exact match). `--no-coalesce-lines` is no longer

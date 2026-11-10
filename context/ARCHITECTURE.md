@@ -242,12 +242,11 @@ verbatim (spec §2.4).
    pass alone was 53 s of a 79 s run. The hint stays exactly what the
    count-only pass produced (`chains.len()`, before simplification drops
    anything), and tables for levels a zoom ceiling will not materialize are
-   dropped rather than carried; pass 2 rebuilds any level whose table is
-   missing, so the ceiling predicate is a caching decision, never a
-   correctness one. The `--plan` path skips pass 1 entirely and pass 2 builds
-   the tables itself, as before. `--plan-only` has no pass 2, so it counts
-   the chains without simplifying or keeping them; the counts, and so the
-   plan artifact, are the same. The levels run in parallel waves sized
+   dropped rather than carried, unless a plan is being saved: the plan
+   carries every level's table, not the line scratch they came from (#546),
+   so the line scratch is freed as soon as the chain stage ends. The `--plan`
+   path skips pass 1 and the chain stage entirely and takes the plan's
+   tables; a missing table is an error, never a rebuild. The levels run in parallel waves sized
    against the profile's pass-1 memory budget (`chain_stage_wave`), since
    each level's chain stage spans the whole line scratch and pass 1 runs
    levels that turn out empty, which pass 2 used to skip. Wave size changes
@@ -855,11 +854,11 @@ the layer declarations alike.
 
 **Line coalescing (#546).** A coalesced chain is a new geometry spanning
 every row it merged, carrying its rep row's attributes, so no single input
-row group's bbox bounds it. Each data shard rebuilds every level's chains
-over the plan's dataset-wide line scratch (the tables a monolithic run
-builds) and widens its read selection with the row groups holding the reps
-of the chains whose bbox reaches its read window. Tiles stay byte-identical
-at the cost of the chain stage running on every shard. Clustering,
+row group's bbox bounds it. The plan carries the chain tables the coarse
+job built (the tables a monolithic run builds). Each data shard keeps the
+levels it exports, widens its read selection with the row groups holding
+the reps of the chains whose bbox reaches its read window, and keeps every
+chain whose rep it reads. It runs no chain stage and holds no line scratch. Clustering,
 accumulation and tiny-polygon carriers each key off one input row whose own
 bbox bounds it, so the row-group argument that makes ordinary features safe
 covers them unchanged.

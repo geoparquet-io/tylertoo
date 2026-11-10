@@ -6592,21 +6592,8 @@ pub(super) fn coalesce_level_chains<'e>(
 /// ([`coalesce_level_chains`]), then simplify each surviving chain for the
 /// level. Chains that degenerate during simplification are dropped (default
 /// knobs never hit this: the 2×GSD gate is stricter than the 1×GSD simplify
-/// drop gate).
-pub(super) fn build_level_coalesce_table(
-    lines: &ExactChains<'_>,
-    level: usize,
-    finest: usize,
-    gsd_m: f64,
-    crs: Crs,
-    options: &ConvertOptions,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> CoalesceTable {
-    build_level_coalesce_table_and_hint(lines, level, finest, gsd_m, crs, options, diagnostics).0
-}
-
-/// [`build_level_coalesce_table`] plus the level's PRE-simplification chain
-/// count — the streaming engine's `level_row_hint` for the level.
+/// drop gate). Also returns the level's PRE-simplification chain count — the
+/// streaming engine's `level_row_hint` for the level.
 ///
 /// The two used to come from two separate runs of the whole chain stage: the
 /// hint from a count-only pass in `resolve_winner_tables` (which needs it
@@ -14110,6 +14097,81 @@ mod tests {
             })
             .collect();
         assert!(empty.is_empty(), "{empty:#?}");
+    }
+
+    /// A data shard takes its coalesce chains from the plan instead of
+    /// rebuilding them from the whole dataset's lines (#546 review: the
+    /// rebuild cost every shard 70–100% of a single machine's peak). A
+    /// count planted in the plan comes out in the shard's output.
+    #[test]
+    fn shard_takes_its_chains_from_the_plan() {
+        use geo::{coord, LineString};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        let segments: Vec<Geometry<f64>> = (-60..60)
+            .map(|x| {
+                let x = f64::from(x);
+                Geometry::LineString(LineString::new(vec![
+                    coord! { x: x, y: 10.0 },
+                    coord! { x: x + 1.0, y: 10.0 },
+                ]))
+            })
+            .collect();
+        super::super::testutil::write_one_row_groups(&input, &segments, true, None);
+        let levels = LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 6,
+        };
+        let plan_path = dir.path().join("convert.plan");
+        convert_to_overviews(
+            &input,
+            dir.path().join("coarse.parquet"),
+            &ConvertOptions {
+                levels: levels.clone(),
+                zoom_ceiling: Some(3),
+                save_plan: Some(plan_path.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut plan = super::super::plan_state::ConvertPlan::load(&plan_path).unwrap();
+        let chains = plan.chains.as_mut().expect("the plan carries the chains");
+        assert!(
+            chains.entries.iter().any(|c| c.level >= 4),
+            "chains above the coarse job's ceiling are saved too"
+        );
+        for c in &mut chains.entries {
+            c.count = 777;
+        }
+        plan.save(&plan_path).unwrap();
+
+        let id = crate::pmtiles_writer::tile_id(4, 9, 7);
+        let out = dir.path().join("shard.parquet");
+        convert_to_overviews(
+            &input,
+            &out,
+            &ConvertOptions {
+                levels,
+                plan: Some(plan_path),
+                shard: Some(crate::shard::TileRange::new(4, id, id).unwrap()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let reader = OverviewReader::open(&out).unwrap();
+        let counts: Vec<i32> = (0..reader.num_levels())
+            .flat_map(|l| reader.read_level(l, None).unwrap().map(|b| b.unwrap()))
+            .filter_map(|b| b.column_by_name("coalesced_count").cloned())
+            .flat_map(|c| {
+                c.as_any()
+                    .downcast_ref::<arrow_array::Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(counts.contains(&777), "{counts:?}");
     }
 
     /// Read all ids from all levels of an overview file.
