@@ -757,6 +757,10 @@ pub struct ConvertOptions {
     #[cfg_attr(feature = "cli", arg(value_parser = super::config::cli::parse_bbox, long, value_name = "XMIN,YMIN,XMAX,YMAX"))]
     #[cfg_attr(feature = "cli", arg(help = "Convert features whose bbox intersects this lon/lat box, or would one ±360° wrap away (0..360 data). Skips row groups outside the box", long_help = None))]
     pub bbox: Option<[f64; 4]>,
+    /// TODO(docs)
+    #[cfg_attr(feature = "cli", arg(value_parser = super::mask::parse_mask, long, value_name = "PATH", help_heading = "Filtering"))]
+    #[cfg_attr(feature = "cli", arg(help = "TODO(docs)", long_help = None))]
+    pub mask: Option<super::mask::MaskSource>,
     /// Attribute filter (#315): a SQL-WHERE-style predicate over the input's
     /// property columns (`--filter` / `--where`), e.g. `confidence > 0.8`,
     /// `crop_type IN ('soy', 'corn') AND note IS NOT NULL`. Evaluated during
@@ -962,6 +966,7 @@ with_setters!(ConvertOptions {
     with_coalesce_max_level_rows => coalesce_max_level_rows: usize,
     with_coalesce_junction_angle => coalesce_junction_angle: f64,
     with_bbox => bbox: Option<[f64; 4]>,
+    with_mask => mask: Option<super::mask::MaskSource>,
     with_filter => filter: Option<String>,
     with_properties => properties: PropertySelection,
     with_spill_dir => spill_dir: Option<PathBuf>,
@@ -1565,6 +1570,7 @@ impl Default for ConvertOptions {
             coalesce_max_level_rows: DEFAULT_COALESCE_MAX_LEVEL_ROWS,
             coalesce_junction_angle: DEFAULT_JUNCTION_ANGLE_DEG,
             bbox: None,
+            mask: None,
             filter: None,
             properties: PropertySelection::default(),
             spill_dir: None,
@@ -2617,6 +2623,11 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
         if bb.iter().any(|v| !v.is_finite()) || bb[0] > bb[2] || bb[1] > bb[3] {
             return Err(super::config::ConfigError::InvalidBbox { bbox: bb }.into());
         }
+    }
+    // `--mask` (#826): readable, polygonal and not empty, before any input
+    // is opened. The CRS check needs the input, so it runs at preflight.
+    if let Some(m) = &options.mask {
+        super::mask::load(m)?;
     }
     // Attribute filter (#315): fail fast on a syntactically invalid
     // expression, before any input is opened. Binding (unknown column /
@@ -4265,6 +4276,15 @@ pub(super) fn bbox_to_crs_units(bbox: &[f64; 4], crs: Crs) -> [f64; 4] {
     }
 }
 
+/// One world width in `crs` units.
+pub(crate) fn world_width(crs: Crs) -> f64 {
+    match crs {
+        Crs::Epsg4326 => 360.0,
+        // `lnglat_to_webmerc` is linear in x, so one world is exact.
+        Crs::Epsg3857 => 2.0 * WEBMERC_HALF_M,
+    }
+}
+
 /// A [`ConvertOptions::bbox`] query in the input's CRS units, with its copies
 /// shifted one world width west and east (#643).
 ///
@@ -4282,12 +4302,12 @@ pub(crate) struct BboxQuery {
 impl BboxQuery {
     /// Build the query from a lon/lat-degree bbox for an input in `crs`.
     pub(crate) fn new(bbox_deg: &[f64; 4], crs: Crs) -> Self {
-        let world = match crs {
-            Crs::Epsg4326 => 360.0,
-            // `lnglat_to_webmerc` is linear in x, so one world is exact.
-            Crs::Epsg3857 => 2.0 * WEBMERC_HALF_M,
-        };
-        let base = bbox_to_crs_units(bbox_deg, crs);
+        Self::in_crs_units(bbox_to_crs_units(bbox_deg, crs), crs)
+    }
+
+    /// Build the query from a bbox already in `crs` units (`--mask`, #826).
+    pub(crate) fn in_crs_units(base: [f64; 4], crs: Crs) -> Self {
+        let world = world_width(crs);
         let shift = |dx: f64| [base[0] + dx, base[1], base[2] + dx, base[3]];
         Self {
             boxes: [base, shift(-world), shift(world)],
@@ -4449,12 +4469,12 @@ pub(super) fn bind_attribute_filter(
 }
 
 /// Log label for the active footer-statistics prunings.
-pub(super) fn pruning_label(bbox: bool, filter: bool) -> &'static str {
-    match (bbox, filter) {
-        (true, true) => "bbox+attribute",
-        (true, false) => "bbox",
-        _ => "attribute",
-    }
+pub(super) fn pruning_label(bbox: bool, mask: bool, filter: bool) -> String {
+    [(bbox, "bbox"), (mask, "mask"), (filter, "attribute")]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 /// `[xmin, ymin, xmax, ymax]` of a geometry (`[0;4]` when the bbox is undefined).
@@ -11072,6 +11092,7 @@ mod tests {
             16,
             None,
             None,
+            None,
             MemoryProfile::default(),
         )
         .unwrap_err()
@@ -14308,6 +14329,149 @@ mod tests {
             report.source_losses.iter().next().unwrap().unwrap().cause,
             crate::diagnostics::SourceLossCause::OutsideBbox
         );
+    }
+
+    fn write_mask(dir: &tempfile::TempDir, geojson: &str) -> super::super::mask::MaskSource {
+        let path = dir.path().join("mask.geojson");
+        std::fs::write(&path, geojson).unwrap();
+        super::super::mask::MaskSource::Path(path)
+    }
+
+    /// #826: a concave mask keeps exactly the features that intersect it,
+    /// not every feature in its bbox, and accounts for the rest.
+    #[test]
+    fn mask_keeps_only_intersecting_features() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        crate::overview::testutil::write_input(
+            &input,
+            &[
+                Some(Geometry::Point(Point::new(1.0, 1.0))),   // inside
+                Some(Geometry::Point(Point::new(3.0, 3.0))),   // in the notch
+                Some(Geometry::Point(Point::new(30.0, 30.0))), // outside the bbox
+                Some(Geometry::Point(Point::new(2.0, 3.0))),   // on the edge
+            ],
+            false,
+            None,
+        );
+        let mask = write_mask(
+            &dir,
+            r#"{"type":"Polygon","coordinates":[[[0,0],[4,0],[4,2],[2,2],[2,4],[0,4],[0,0]]]}"#,
+        );
+        let report = convert_to_overviews(
+            &input,
+            dir.path().join("out.parquet"),
+            &ConvertOptions {
+                mask: Some(mask),
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.input_features, 2);
+        let lost: Vec<_> = report
+            .source_losses
+            .iter()
+            .map(|l| {
+                let l = l.unwrap();
+                (l.id, l.cause)
+            })
+            .collect();
+        assert_eq!(
+            lost,
+            [
+                (1, crate::diagnostics::SourceLossCause::OutsideMask),
+                (2, crate::diagnostics::SourceLossCause::OutsideMask),
+            ]
+        );
+        // Masked rows are not reported as unusable geometry.
+        assert!(
+            !report.diagnostics.iter().any(|d| matches!(
+                d,
+                crate::diagnostics::Diagnostic::UnusableGeometry { count, .. } if *count > 0
+            )),
+            "{:?}",
+            report.diagnostics
+        );
+    }
+
+    /// #826: the mask's bbox prunes row groups as `--bbox` does.
+    #[test]
+    fn mask_prunes_row_groups_by_its_bbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_multi_rg_input(&input, &[(0.0, 0.0), (10.0, 10.0), (20.0, 20.0)], true);
+        let mask = write_mask(
+            &dir,
+            r#"{"type":"Polygon","coordinates":[[[9,9],[11,9],[11,11],[9,9]]]}"#,
+        );
+        let report = convert_to_overviews(
+            &input,
+            dir.path().join("out.parquet"),
+            &ConvertOptions {
+                mask: Some(mask),
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.row_groups_read, 1);
+        assert_eq!(report.input_features, 1);
+    }
+
+    /// #826: until reprojection (#670), a mask in another CRS is refused.
+    #[test]
+    fn mask_in_another_crs_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        let md = geoarrow::datatypes::Metadata::new(
+            geoarrow::datatypes::Crs::from_projjson(serde_json::json!({
+                "type": "ProjectedCRS",
+                "name": "WGS 84 / Pseudo-Mercator",
+                "id": { "authority": "EPSG", "code": 3857 }
+            })),
+            None,
+        );
+        crate::overview::testutil::write_multi_rg_input_with_crs(
+            &input,
+            &[(1000.0, 1000.0)],
+            true,
+            Some(md),
+        );
+        let mask = write_mask(
+            &dir,
+            r#"{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}"#,
+        );
+        let err = convert_to_overviews(
+            &input,
+            dir.path().join("out.parquet"),
+            &ConvertOptions {
+                mask: Some(mask),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(crate::Classify::kind(&err), crate::ErrorKind::Usage);
+        assert!(err.to_string().contains("--mask"), "{err}");
+    }
+
+    /// #826: an unusable mask is refused by validation, before any input I/O.
+    #[test]
+    fn unusable_mask_is_refused_by_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mask = write_mask(&dir, r#"{"type":"Point","coordinates":[0,0]}"#);
+        let opts = ConvertOptions {
+            mask: Some(mask),
+            ..Default::default()
+        };
+        let err = opts.validate().expect_err("a point mask is refused");
+        assert_eq!(crate::Classify::kind(&err), crate::ErrorKind::Usage);
     }
 
     #[test]

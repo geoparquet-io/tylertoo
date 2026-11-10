@@ -26,6 +26,7 @@ pub mod filter;
 mod hostile;
 pub mod ladder;
 pub mod level;
+pub mod mask;
 mod memory;
 mod pipe;
 mod pipeline;

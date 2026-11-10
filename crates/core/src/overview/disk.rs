@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::input_set::{ConvertSource, RowGroupSelection};
 
-use super::convert::{BboxQuery, ConvertError, ConvertOptions};
+use super::convert::{ConvertError, ConvertOptions};
 use super::level::{MemoryProfile, Mode};
 use super::memory::MemoryBudget;
 use super::stream::select_row_groups_streaming;
@@ -111,10 +111,16 @@ impl DiskFootprint {
     ) -> Result<Self, ConvertError> {
         // The `tiles` facade sizes before the passes select (#817 R1): select
         // here as they will, or a `--bbox` is sized as the whole input.
-        let derived = if selection.is_none() && (options.bbox.is_some() || options.shard.is_some())
+        let derived = if selection.is_none()
+            && (options.bbox.is_some() || options.mask.is_some() || options.shard.is_some())
         {
             source.resolved_schema()?.crs().and_then(|crs| {
-                let bbox = options.bbox.map(|b| BboxQuery::new(&b, crs));
+                // An unusable mask fails the preflight later; size without it.
+                let mask = options
+                    .mask
+                    .as_ref()
+                    .and_then(|m| super::mask::load_for_input(m, crs).ok());
+                let bbox = super::mask::region_query(options.bbox.as_ref(), mask.as_ref(), crs);
                 select_row_groups_streaming(
                     source,
                     bbox.as_ref(),

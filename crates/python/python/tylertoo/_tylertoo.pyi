@@ -7,7 +7,7 @@
 # signatures generated from the core option structs in build.rs.
 import os
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from . import (
     ConvertReport,
@@ -17,6 +17,12 @@ from . import (
     PyramidReport,
     ValidationReport,
 )
+
+class _Geometry(Protocol):
+    """A shapely geometry, or anything with its `wkb` bytes."""
+
+    @property
+    def wkb(self) -> bytes: ...
 
 __all__ = [
     "ConfigError",
@@ -73,6 +79,7 @@ def overview(
     line_thinning: float | None = None,
     line_visibility: float | None = None,
     magnitude_ladder: str | None = None,
+    mask: str | os.PathLike[str] | _Geometry | None = None,
     max_zoom: int | str = 6,
     min_zoom: int = 0,
     mode: Literal["duplicating", "partitioning"] = "duplicating",
@@ -226,6 +233,7 @@ def convert(
     line_thinning: float | None = None,
     line_visibility: float | None = None,
     magnitude_ladder: str | None = None,
+    mask: str | os.PathLike[str] | _Geometry | None = None,
     max_compressed_tile_size: int | Literal["auto"] | None = "auto",
     max_zoom_simplify_factor: float | None = None,
     mlt_profile: Literal[

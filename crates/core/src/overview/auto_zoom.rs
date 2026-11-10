@@ -67,7 +67,7 @@ use crate::diagnostics::{CoveringWarning, Diagnostic, Diagnostics};
 use crate::input_set::{ConvertSource, ReadPlan};
 use crate::tile::MAX_LATITUDE;
 
-use super::convert::{validate_options, BboxQuery, ConvertError, ConvertOptions, LevelPlan};
+use super::convert::{validate_options, ConvertError, ConvertOptions, LevelPlan};
 use super::filter::{parse_filter, BoundFilter};
 use super::level::{Crs, WEBMERC_CIRCUMFERENCE_M};
 
@@ -630,7 +630,8 @@ struct SampledSignals {
 ///
 /// The module docs describe the method. The minimum zoom comes from
 /// `options.levels` (which must be a zoom range), and `options.bbox` /
-/// `options.filter` scope the sample exactly as they scope the conversion.
+/// `options.filter` scope the sample exactly as they scope the conversion;
+/// `options.mask` scopes it by the mask's bbox.
 /// [`MaxZoom::resolve`] is the usual entry point; this one returns the
 /// evidence without logging it or touching `options`.
 ///
@@ -657,6 +658,7 @@ pub fn estimate_max_zoom(
         AUTO_MAX_ZOOM_CEILING,
         options.bbox.as_ref(),
         options.filter.as_deref(),
+        options.mask.as_ref(),
         options.profile,
     )
 }
@@ -668,6 +670,7 @@ pub(crate) fn estimate_with(
     ceiling: u8,
     bbox: Option<&[f64; 4]>,
     filter: Option<&str>,
+    mask: Option<&super::mask::MaskSource>,
     profile: super::level::MemoryProfile,
 ) -> Result<AutoZoomEvidence, ConvertError> {
     check_auto_min_zoom(min_zoom, ceiling)?;
@@ -689,7 +692,11 @@ pub(crate) fn estimate_with(
     let bound_filter = filter
         .map(|src| Ok::<_, ConvertError>(BoundFilter::bind(&parse_filter(src)?, &schema, &[])?))
         .transpose()?;
-    let bbox_query = bbox.map(|b| BboxQuery::new(b, crs));
+    // `--mask` (#826) scopes the sample by its bbox, as it prunes.
+    let mask = mask
+        .map(|m| super::mask::load_for_input(m, crs))
+        .transpose()?;
+    let bbox_query = super::mask::region_query(bbox, mask.as_ref(), crs);
 
     // The conversion's footer-statistics pruning (#102 bbox, #315 filter).
     let bbox_sel = bbox_query
@@ -930,6 +937,7 @@ mod tests {
             source,
             min_zoom,
             AUTO_MAX_ZOOM_CEILING,
+            None,
             None,
             None,
             MemoryProfile::default(),
@@ -1331,8 +1339,26 @@ mod tests {
         let plain = write(&dir, "plain.parquet", &geoms);
         let bbox = Some([-0.1, -0.1, 1.0, 1.0]);
         assert_eq!(
-            estimate_with(&stale, 0, 16, bbox.as_ref(), None, MemoryProfile::default()).unwrap(),
-            estimate_with(&plain, 0, 16, bbox.as_ref(), None, MemoryProfile::default()).unwrap(),
+            estimate_with(
+                &stale,
+                0,
+                16,
+                bbox.as_ref(),
+                None,
+                None,
+                MemoryProfile::default()
+            )
+            .unwrap(),
+            estimate_with(
+                &plain,
+                0,
+                16,
+                bbox.as_ref(),
+                None,
+                None,
+                MemoryProfile::default()
+            )
+            .unwrap(),
             "rejecting the sidecar must retain both row groups"
         );
         for streaming in [true, false] {
@@ -1589,6 +1615,7 @@ mod tests {
             AUTO_MAX_ZOOM_CEILING,
             bbox.as_ref(),
             None,
+            None,
             MemoryProfile::default(),
         )
         .unwrap();
@@ -1597,6 +1624,7 @@ mod tests {
             0,
             AUTO_MAX_ZOOM_CEILING,
             bbox.as_ref(),
+            None,
             None,
             MemoryProfile::default(),
         )
@@ -1613,6 +1641,7 @@ mod tests {
             AUTO_MAX_ZOOM_CEILING,
             None,
             Some("id >= 400"),
+            None,
             MemoryProfile::default(),
         )
         .unwrap();
@@ -1622,6 +1651,7 @@ mod tests {
             AUTO_MAX_ZOOM_CEILING,
             None,
             Some("id >= 400"),
+            None,
             MemoryProfile::default(),
         )
         .unwrap();
@@ -1838,6 +1868,7 @@ mod tests {
             AUTO_MAX_ZOOM_CEILING,
             Some(&[9.5, 9.5, 12.0, 12.0]),
             None,
+            None,
             MemoryProfile::default(),
         )
         .unwrap();
@@ -1871,6 +1902,7 @@ mod tests {
             AUTO_MAX_ZOOM_CEILING,
             Some(&[-161.0, -1.0, -158.0, 2.0]),
             None,
+            None,
             MemoryProfile::default(),
         )
         .unwrap();
@@ -1896,6 +1928,7 @@ mod tests {
             AUTO_MAX_ZOOM_CEILING,
             None,
             Some("id >= 400"),
+            None,
             MemoryProfile::default(),
         )
         .unwrap();

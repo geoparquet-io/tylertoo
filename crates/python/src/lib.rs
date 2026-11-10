@@ -120,6 +120,13 @@ fn keywords(
             let key = key.extract::<String>()?;
             let value = if !value.is_instance_of::<PyString>() && value.hasattr("__fspath__")? {
                 fspath.call1((value,))?
+            } else if key == "mask"
+                && !value.is_instance_of::<PyString>()
+                && value.hasattr("wkb")?
+            {
+                // A shapely geometry: core reads its own WKB (#826).
+                let wkb: Vec<u8> = value.getattr("wkb")?.extract()?;
+                pyo3::types::PyList::new(py, wkb)?.into_any()
             } else {
                 value
             };
@@ -568,6 +575,20 @@ mod config_parity {
     use tylertoo_core::internal::overview::config::cli;
     use tylertoo_core::internal::overview::convert::LevelPlan;
 
+    /// A `--mask` file for the parity entries; validation reads it (#826).
+    fn mask_file() -> String {
+        let path = std::env::temp_dir().join(format!(
+            "tylertoo-parity-mask-{}.geojson",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}"#,
+        )
+        .unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
     fn native_keywords(value: Value) -> serde_json::Map<String, Value> {
         Python::attach(|py| {
             let value = pythonize::pythonize(py, &value).unwrap();
@@ -592,10 +613,13 @@ mod config_parity {
             serde_json::to_value(python.validate().unwrap().options()).unwrap(),
             expected
         );
+        let mask = mask_file();
         let args = cli::OverviewArgs::parse_from([
             "overview",
             "in",
             "out",
+            "--mask",
+            &mask,
             "--min-zoom",
             "1",
             "--max-zoom",
@@ -610,7 +634,7 @@ mod config_parity {
             "id",
         ]);
         let cli = cli::overview_options(&args).unwrap();
-        let python = overview_config(native_keywords(json!({"min_zoom": 1, "max_zoom": 3, "row_group_size": 1234, "cascade": false, "drop_lines": true, "sort_direction": "asc", "include_properties": ["id"]}))).unwrap();
+        let python = overview_config(native_keywords(json!({"min_zoom": 1, "max_zoom": 3, "row_group_size": 1234, "cascade": false, "drop_lines": true, "sort_direction": "asc", "include_properties": ["id"], "mask": mask}))).unwrap();
         let mut core = ConvertOptions::default()
             .with_levels(LevelPlan::ZoomRange {
                 min_zoom: 1,
@@ -621,6 +645,7 @@ mod config_parity {
         core.density.kinds.lines = true;
         core.assign.sort_direction = tylertoo_core::internal::overview::assign::SortDirection::Asc;
         core.properties.include = Some(vec!["id".into()]);
+        core.mask = Some(std::path::PathBuf::from(&mask).into());
         let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
         assert_eq!(
             serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
@@ -654,10 +679,13 @@ mod config_parity {
             serde_json::to_value(python.validate().unwrap().options()).unwrap(),
             expected
         );
+        let mask = mask_file();
         let args = cli::TilesArgs::parse_from([
             "tiles",
             "in",
             "out",
+            "--mask",
+            &mask,
             "--verbatim",
             "--point-thinning",
             "2",
@@ -669,7 +697,7 @@ mod config_parity {
             "places",
         ]);
         let cli = cli::tiles_options(&args).unwrap();
-        let python = tiles_config(native_keywords(json!({"verbatim": true, "point_thinning": 2.0, "extent": 8192, "max_compressed_tile_size": 1048576, "layer_name": "places"}))).unwrap();
+        let python = tiles_config(native_keywords(json!({"verbatim": true, "point_thinning": 2.0, "extent": 8192, "max_compressed_tile_size": 1048576, "layer_name": "places", "mask": mask}))).unwrap();
         let mut core = TilesOptions::default();
         core.convert = core.convert.verbatim();
         core.convert.assign.point_thinning = 2.0;
@@ -677,6 +705,7 @@ mod config_parity {
         core.export.extent = 8192;
         core.export.compressed_tile_size_limit = Some(1048576);
         core.layer_name = Some("places".into());
+        core.convert.mask = Some(std::path::PathBuf::from(&mask).into());
         let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
         assert_eq!(
             serde_json::to_value(cli.validate().unwrap().options()).unwrap(),

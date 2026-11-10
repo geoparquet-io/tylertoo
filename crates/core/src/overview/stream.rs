@@ -2601,6 +2601,8 @@ struct Preflight {
     /// Schema indices of the accumulate columns (Q4).
     acc_cols: Vec<usize>,
     bbox_query: Option<BboxQuery>,
+    /// `--mask` (#826), indexed for pass 1's exact test.
+    mask: Option<super::mask::MaskIndex>,
     bound_filter: Option<super::filter::BoundFilter>,
     selected_row_groups: Option<RowGroupSelection>,
     row_groups_total: usize,
@@ -2748,7 +2750,23 @@ fn preflight_with_memory_limit(
     // tables stay aligned. Groups without stats are kept; the exact
     // per-feature filters in pass 1 guarantee identical output either way.
     let row_groups_total = source.num_row_groups_total()?;
-    let bbox_query = options.bbox.map(|b| BboxQuery::new(&b, crs));
+    // `--mask` (#826) ANDs with `--bbox`: its bbox narrows the same query.
+    let t_mask = Instant::now();
+    let mask = options
+        .mask
+        .as_ref()
+        .map(|m| super::mask::load_for_input(m, crs))
+        .transpose()?;
+    let bbox_query = super::mask::region_query(options.bbox.as_ref(), mask.as_ref(), crs);
+    let t_index = Instant::now();
+    let mask = mask.map(|m| super::mask::MaskIndex::new(&m, crs));
+    if mask.is_some() {
+        log::debug!(
+            "[profile] mask: load {:.3}s, index {:.3}s",
+            (t_index - t_mask).as_secs_f64(),
+            t_index.elapsed().as_secs_f64()
+        );
+    }
     let selected_row_groups = select_row_groups_streaming(
         source,
         bbox_query.as_ref(),
@@ -2764,8 +2782,12 @@ fn preflight_with_memory_limit(
     // present: a `--shard` run prunes too, and reporting its selection as an
     // "attribute filter" would send whoever read the log looking for a
     // `--filter` that was never passed. The shard has its own line below.
-    if options.bbox.is_some() || bound_filter.is_some() {
-        let what = super::convert::pruning_label(options.bbox.is_some(), bound_filter.is_some());
+    if bbox_query.is_some() || bound_filter.is_some() {
+        let what = super::convert::pruning_label(
+            options.bbox.is_some(),
+            mask.is_some(),
+            bound_filter.is_some(),
+        );
         log::info!("{what} filter: reading {row_groups_read}/{row_groups_total} input row groups");
     }
     if let Some(range) = &options.shard {
@@ -2846,6 +2868,7 @@ fn preflight_with_memory_limit(
         geom_idx,
         acc_cols,
         bbox_query,
+        mask,
         bound_filter,
         selected_row_groups,
         row_groups_total,
@@ -2890,6 +2913,7 @@ struct Pass1Ctx<'a> {
     acc_cols: &'a [usize],
     selected_row_groups: Option<&'a RowGroupSelection>,
     bbox_query: Option<&'a BboxQuery>,
+    mask: Option<&'a super::mask::MaskIndex>,
     bound_filter: Option<&'a super::filter::BoundFilter>,
     crs: Crs,
 }
@@ -3004,6 +3028,7 @@ fn run_front_half(
             acc_cols: &preflight.acc_cols,
             selected_row_groups: preflight.selected_row_groups.as_ref(),
             bbox_query: preflight.bbox_query.as_ref(),
+            mask: preflight.mask.as_ref(),
             bound_filter: preflight.bound_filter.as_ref(),
             crs: preflight.crs,
         },
@@ -3560,6 +3585,7 @@ pub(crate) fn run_stages(
         // Pass-1 inputs only: pass 2 reads the assignment's `min_levels`,
         // where a row the bbox or the filter dropped is already UNASSIGNED.
         bbox_query: _,
+        mask: _,
         bound_filter: _,
         selected_row_groups,
         row_groups_total,
@@ -5445,6 +5471,8 @@ struct ScannedRow {
     bbox: [f64; 4],
     /// `Some` exactly for the rows [`ScanRows`] was asked to convert.
     geom: Option<Geometry<f64>>,
+    /// The row misses `--mask` (#826); [`scan_chunk`] drops it.
+    outside_mask: bool,
 }
 
 /// Pass 1's geometry visitor (#650): scan each row where it lies and convert
@@ -5466,6 +5494,9 @@ struct ScanRows<'m> {
     diagnostics: &'m crate::diagnostics::Diagnostics,
     row_base: usize,
     filter_mask: Option<&'m [Option<bool>]>,
+    /// `--mask` (#826): rows that miss it are dropped here, where the
+    /// geometry is at hand. Its test converts the rows whose bbox reaches it.
+    mask: Option<&'m super::mask::MaskIndex>,
     line_geoms: bool,
     all_geoms: bool,
 }
@@ -5522,7 +5553,22 @@ impl GeoArrowVisitor for ScanRows<'_> {
                 out.push(None);
                 continue;
             };
-            let geom = if self.all_geoms || (self.line_geoms && kind == FeatureKind::Line) {
+            let keep_geom = self.all_geoms || (self.line_geoms && kind == FeatureKind::Line);
+            if let Some(mask) = self.mask {
+                let hit = mask
+                    .may_hit(&bbox)
+                    .then(|| g.try_to_geometry())
+                    .flatten()
+                    .filter(|geom| mask.intersects(geom, &bbox));
+                out.push(Some(ScannedRow {
+                    kind,
+                    bbox,
+                    outside_mask: hit.is_none(),
+                    geom: hit.filter(|_| keep_geom),
+                }));
+                continue;
+            }
+            let geom = if keep_geom {
                 // `scan_feature_traits` is `Some` only where this conversion
                 // is, so this `None` arm never runs; if it did, the row would
                 // be skipped, as the old path skipped it.
@@ -5534,7 +5580,12 @@ impl GeoArrowVisitor for ScanRows<'_> {
             } else {
                 None
             };
-            out.push(Some(ScannedRow { kind, bbox, geom }));
+            out.push(Some(ScannedRow {
+                kind,
+                bbox,
+                geom,
+                outside_mask: false,
+            }));
         }
         Ok(out)
     }
@@ -5586,6 +5637,7 @@ fn scan_chunk(
             diagnostics,
             row_base: diag_row_base,
             filter_mask,
+            mask: ctx.mask,
             line_geoms: collect_lines != LineCollect::Off,
             all_geoms: want_areas,
         },
@@ -5627,11 +5679,20 @@ fn scan_chunk(
             kind,
             bbox: fbbox,
             geom,
+            outside_mask,
         }) = row
         else {
             skipped_rows += 1;
             continue;
         };
+        if outside_mask {
+            diagnostics.source_loss(
+                (diag_row_base + i) as u64,
+                None,
+                crate::diagnostics::SourceLossCause::OutsideMask,
+            )?;
+            continue;
+        }
         // Regional extract (#102): a feature whose bbox misses the region
         // produces no AssignFeature — its winner-table slot stays at the
         // UNASSIGNED sentinel, so pass 2 drops the row too. The row index
@@ -6085,7 +6146,7 @@ fn run_pass1_with_chunk_rows(
     // (realloc = alloc + copy + free under mimalloc): 128 GiB at 1.58B rows.
     // `try_reserve_exact` so an absurd size falls back to growth instead of
     // aborting. Capacity only — output is unchanged.
-    if bbox_query.is_none() && filter.is_none() {
+    if bbox_query.is_none() && filter.is_none() && ctx.mask.is_none() {
         let _ = features.try_reserve_exact(usize::try_from(selected_rows).unwrap_or(0));
     }
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
@@ -7633,6 +7694,7 @@ mod tests {
                 acc_cols: &pre.acc_cols,
                 selected_row_groups: pre.selected_row_groups.as_ref(),
                 bbox_query: pre.bbox_query.as_ref(),
+                mask: pre.mask.as_ref(),
                 bound_filter: pre.bound_filter.as_ref(),
                 crs: pre.crs,
             },
@@ -10547,6 +10609,7 @@ mod tests {
             acc_cols: &[],
             selected_row_groups: None,
             bbox_query: bbox,
+            mask: None,
             bound_filter: None,
             crs,
         };

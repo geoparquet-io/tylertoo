@@ -433,6 +433,7 @@ pub enum SourceLossCause {
     MissingGeometry,
     Filtered,
     OutsideBbox,
+    OutsideMask,
     EncodeDropped,
     Quantized,
     Merged,
