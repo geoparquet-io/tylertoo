@@ -778,11 +778,17 @@ where
     // An unreadable tile ends the walk after the tiles before it, which
     // may hold an earlier error.
     let mut stop = None;
-    // The tiles a chunk left undecoded past `decoded_cap`, which start the next.
-    let mut carry: Vec<(TileRef, Vec<u8>)> = Vec::new();
+    // A chunk's tiles from the first one left undecoded past `decoded_cap`:
+    // they start the next chunk, those already decoded with their result
+    // and decompressed size.
+    #[expect(
+        clippy::type_complexity,
+        reason = "one slot per tile; a named type would need the walk's generics"
+    )]
+    let mut carry: Vec<(TileRef, Vec<u8>, Option<(Result<T, DecodeError>, usize)>)> = Vec::new();
     loop {
         let mut chunk = std::mem::take(&mut carry);
-        let mut bytes: usize = chunk.iter().map(|(_, body)| body.len()).sum();
+        let mut bytes: usize = chunk.iter().map(|(_, body, _)| body.len()).sum();
         // Empty bodies weigh nothing, so the tile count is capped too.
         while stop.is_none() && bytes < chunk_bytes && chunk.len() < CHUNK_TILES {
             let body = match refs.next() {
@@ -795,7 +801,7 @@ where
             match body {
                 Ok((tile, body)) => {
                     bytes += body.len();
-                    chunk.push((tile, body));
+                    chunk.push((tile, body, None));
                 }
                 Err(e) => {
                     stop = Some(e);
@@ -814,42 +820,51 @@ where
             clippy::disallowed_types,
             reason = "#817: a per-chunk count shared with its decode tasks"
         )]
-        let decoded = std::sync::atomic::AtomicUsize::new(0);
+        let decoded = std::sync::atomic::AtomicUsize::new(
+            chunk
+                .iter()
+                .filter_map(|(_, _, slot)| slot.as_ref().map(|(_, plain)| plain))
+                .sum(),
+        );
         let step = || {
             rayon::join(
                 || run(prev),
                 || {
                     chunk
-                        .par_iter()
+                        .par_iter_mut()
                         .enumerate()
-                        .map(|(i, (tile, body))| {
+                        .for_each(|(i, (tile, body, slot))| {
                             // Past the cap, a tile waits for the next chunk;
                             // the first always decodes, so the walk advances.
-                            if i > 0 && decoded.load(Ordering::Relaxed) >= decoded_cap {
-                                return None;
+                            if slot.is_some()
+                                || (i > 0 && decoded.load(Ordering::Relaxed) >= decoded_cap)
+                            {
+                                return;
                             }
-                            Some(decode_tile_features(body, header, tile, options).and_then(
-                                |(features, plain)| {
+                            *slot = Some(match decode_tile_features(body, header, tile, options) {
+                                Ok((features, plain)) => {
                                     decoded.fetch_add(plain, Ordering::Relaxed);
-                                    work(features)
-                                },
-                            ))
-                        })
-                        .collect::<Vec<Option<Result<T, DecodeError>>>>()
+                                    (work(features), plain)
+                                }
+                                Err(e) => (Err(e), 0),
+                            });
+                        });
                 },
             )
         };
-        let (prev, results) = match &pool {
+        let (prev, ()) = match &pool {
             Some(pool) => pool.install(step),
             None => step(),
         };
         prev?;
-        let taken = results.iter().take_while(|r| r.is_some()).count();
+        let taken = chunk
+            .iter()
+            .take_while(|(_, _, slot)| slot.is_some())
+            .count();
         carry = chunk.split_off(taken);
         let done = chunk
             .into_iter()
-            .zip(results.into_iter().flatten())
-            .map(|((tile, _), r)| Ok((tile, r?)))
+            .filter_map(|(tile, _, slot)| slot.map(|(r, _)| r.map(|t| (tile, t))))
             .collect::<Result<Vec<_>, DecodeError>>()?;
         job = Some(sink(done)?);
         if carry.is_empty() {
@@ -2202,6 +2217,42 @@ mod tests {
         };
         let whole = walk(None);
         let split = walk(Some(1));
+        // On several threads a later tile can finish before an earlier one
+        // stops at the cap: it is carried decoded, never decoded again.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for _ in 0..20 {
+            let calls = std::sync::Mutex::new(0usize);
+            let tiles = pool.install(|| {
+                CHUNK_DECODED_OVERRIDE.with(|c| c.set(Some(1)));
+                let mut tiles = Vec::new();
+                for_each_tile(
+                    &file.as_slice(),
+                    &header,
+                    &entries,
+                    &DecodeOptions::default(),
+                    |features| {
+                        *calls.lock().unwrap() += 1;
+                        Ok(features.len())
+                    },
+                    |chunk| {
+                        tiles.extend(chunk.into_iter().map(|(t, n)| (t.z, t.x, t.y, n)));
+                        Ok(|| Ok(()))
+                    },
+                )
+                .unwrap();
+                CHUNK_DECODED_OVERRIDE.with(|c| c.set(None));
+                tiles
+            });
+            assert_eq!(tiles, whole.concat());
+            assert_eq!(
+                calls.into_inner().unwrap(),
+                tiles.len(),
+                "a tile decoded twice"
+            );
+        }
         assert_eq!(whole.len(), 1, "the fixture fits one chunk by bytes");
         assert!(
             split.iter().all(|c| c.len() == 1),
