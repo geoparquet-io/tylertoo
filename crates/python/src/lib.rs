@@ -49,6 +49,7 @@ use tylertoo_core::internal::overview::tiles::{
     TilesOptions, TilesOutcome,
 };
 use tylertoo_core::internal::pyramid::{build_pyramid, parse_bands, PyramidError};
+use tylertoo_core::internal::stream_input::{stage_arrow_stream, StagedStream};
 
 pyo3::create_exception!(
     _tylertoo,
@@ -252,6 +253,83 @@ fn pyramid_config(
     config_keywords::pyramid(values).map_err(config_err)
 }
 
+/// `geometry_column=` and `crs=` (#824): they describe an Arrow stream
+/// input, not a run, so they never reach the core option keywords.
+#[derive(Default)]
+struct StreamArgs {
+    geometry_column: Option<String>,
+    crs: Option<String>,
+}
+
+/// `kwargs` without the [`StreamArgs`], and the args.
+fn take_stream_args<'py>(
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<(Option<Bound<'py, PyDict>>, StreamArgs)> {
+    let Some(kwargs) = kwargs else {
+        return Ok((None, StreamArgs::default()));
+    };
+    let kwargs = kwargs.copy()?;
+    let take = |key: &str| -> PyResult<Option<String>> {
+        let value = kwargs.get_item(key)?;
+        if value.is_some() {
+            kwargs.del_item(key)?;
+        }
+        value
+            .filter(|v| !v.is_none())
+            .map(|v| v.extract())
+            .transpose()
+    };
+    let args = StreamArgs {
+        geometry_column: take("geometry_column")?,
+        crs: take("crs")?,
+    };
+    Ok((Some(kwargs), args))
+}
+
+/// An `input` with `__arrow_c_stream__`, staged to GeoParquet in
+/// `spill_dir` for the run (#824); `None` for a path input. The staged file
+/// is named after `output`, so the layer name defaults to its stem, as
+/// tippecanoe names a stdin layer after its output.
+fn stage_stream(
+    py: Python<'_>,
+    input: &Bound<'_, PyAny>,
+    args: StreamArgs,
+    spill_dir: Option<&Path>,
+    output: &Path,
+) -> PyResult<Option<StagedStream>> {
+    if !input.hasattr("__arrow_c_stream__")? {
+        if args.geometry_column.is_some() || args.crs.is_some() {
+            return Err(config_err(
+                "geometry_column and crs apply only to an Arrow stream input; \
+                 a file declares its own in its GeoParquet metadata",
+            ));
+        }
+        return Ok(None);
+    }
+    // Refuse an unwritable output before staging the whole stream.
+    tylertoo_core::internal::atomic_output::check_writable(output).map_err(|e| {
+        let e = tylertoo_core::Error::from(e);
+        to_py(e.kind(), e.to_string(), None)
+    })?;
+    let reader = input
+        .extract::<pyo3_arrow::PyRecordBatchReader>()?
+        .into_reader()?;
+    let stem = output
+        .file_stem()
+        .map_or_else(|| "layer".into(), |s| s.to_string_lossy().into_owned());
+    py.detach(|| {
+        stage_arrow_stream(
+            reader,
+            args.geometry_column.as_deref(),
+            args.crs.as_deref(),
+            spill_dir,
+            &stem,
+        )
+    })
+    .map(Some)
+    .map_err(convert_error_to_py)
+}
+
 // --- functions -------------------------------------------------------------------
 
 /// The #314 remedies as `convert()` spells them (#709).
@@ -263,16 +341,16 @@ const PY_REMEDIES: SpaceRemedies<'static> = SpaceRemedies {
 signature_convert! {
 fn convert(
     py: Python<'_>,
-    input: &str,
+    input: &Bound<'_, PyAny>,
     output: &str,
     args: &Bound<'_, pyo3::types::PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
-    let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
 
-    let mut values = keywords(kwargs)?;
+    let (kwargs, stream_args) = take_stream_args(kwargs)?;
+    let mut values = keywords(kwargs.as_ref())?;
     if args.len() > config_keywords::CONVERT_POSITIONAL.len() {
         return Err(PyTypeError::new_err("convert received too many positional arguments"));
     }
@@ -288,6 +366,14 @@ fn convert(
     // facade runs it again, then resolves `max_zoom="auto"` over the source
     // it converts (#444, #788).
     options.validate().map_err(tiles_error_to_py)?;
+
+    let staged = stage_stream(py, input, stream_args, options.convert.spill_dir.as_deref(), &output_path)?;
+    let input_path = match &staged {
+        Some(staged) => staged.path().to_path_buf(),
+        None => PathBuf::from(input.extract::<String>().map_err(|_| {
+            PyTypeError::new_err("input must be a str path/URL or an Arrow stream (__arrow_c_stream__)")
+        })?),
+    };
 
     // #314/#709: core's free-space preflight, raised before the run starts
     // (so it is heard on the failure it predicts) and naming the kwargs.
@@ -330,9 +416,12 @@ fn overview(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
-    let options = overview_config(keywords(kwargs)?)?;
+    let (kwargs, stream_args) = take_stream_args(kwargs)?;
+    let options = overview_config(keywords(kwargs.as_ref())?)?;
     // #779: every rule that needs no input, before anything is read.
     options.validate().map_err(convert_error_to_py)?;
+    let output_path = PathBuf::from(output);
+    let staged = stage_stream(py, input, stream_args, options.spill_dir.as_deref(), &output_path)?;
 
     // `str` stays the single-input path (files, directories, globs, remote
     // URLs/prefixes — resolved by core); `list[str]` is an explicit ordered
@@ -343,16 +432,17 @@ fn overview(
         Path(PathBuf),
         List(Vec<String>),
     }
-    let parsed = if let Ok(s) = input.extract::<String>() {
+    let parsed = if let Some(staged) = &staged {
+        OverviewInput::Path(staged.path().to_path_buf())
+    } else if let Ok(s) = input.extract::<String>() {
         OverviewInput::Path(PathBuf::from(s))
     } else if let Ok(list) = input.extract::<Vec<String>>() {
         OverviewInput::List(list)
     } else {
         return Err(PyTypeError::new_err(
-            "input must be a str path/URL or a list[str] of paths/URLs",
+            "input must be a str path/URL, a list[str] of paths/URLs, or an Arrow stream (__arrow_c_stream__)",
         ));
     };
-    let output_path = PathBuf::from(output);
 
     // Release the GIL while the Rust pipeline runs.
     let mut report = py

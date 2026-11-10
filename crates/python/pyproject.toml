@@ -51,6 +51,8 @@ dev = [
     "pip-audit>=2.7",
     "pyarrow>=26.0.0",
     "hypothesis>=6.141.1",
+    "polars>=2.1.0",
+    "duckdb==1.5.6 ; python_full_version >= '3.11'",
 ]
 # Tools the tutorials call and the site builder (tests/docs, docs.yml).
 # Exact pins: tutorial output is compared line by line, and zensical is

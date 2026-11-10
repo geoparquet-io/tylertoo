@@ -30,7 +30,11 @@ pub struct OverviewWriteOptions {
 /// A Parquet batch writer constructed from this crate's encoding policy.
 pub struct BatchWriter<W: Write + Send>(ArrowWriter<W>);
 
-/// Construct a default Parquet writer (used by decoded-tile export).
+/// Construct a default Parquet writer (used by decoded-tile export and
+/// Arrow-stream staging).
+///
+/// `max_row_group_rows` caps each row group; `None` keeps the Parquet
+/// default (1M rows), which the writer buffers whole in memory (#829).
 ///
 /// # Errors
 ///
@@ -38,8 +42,14 @@ pub struct BatchWriter<W: Write + Send>(ArrowWriter<W>);
 pub fn batch_writer<W: Write + Send>(
     sink: W,
     schema: SchemaRef,
+    max_row_group_rows: Option<usize>,
 ) -> Result<BatchWriter<W>, ParquetError> {
-    ArrowWriter::try_new(sink, schema, None).map(BatchWriter)
+    let props = max_row_group_rows.map(|rows| {
+        WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows))
+            .build()
+    });
+    ArrowWriter::try_new(sink, schema, props).map(BatchWriter)
 }
 
 /// Construct the overview writer: ZSTD, manual row-group boundaries, no

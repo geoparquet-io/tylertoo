@@ -1899,6 +1899,9 @@ pub enum ConvertError {
     /// The overview writer failed.
     #[error("writer error: {0}")]
     Writer(#[from] WriterError),
+    /// An Arrow stream input has no usable geometry column (#824).
+    #[error("arrow stream: {0}")]
+    ArrowStream(String),
     /// The input CRS is neither EPSG:4326 nor EPSG:3857 (spec Q3).
     #[error("unsupported CRS {crs:?} in {input}: overviews require EPSG:4326 or EPSG:3857")]
     #[non_exhaustive]
@@ -2461,6 +2464,7 @@ impl crate::error::Classify for ConvertError {
             // The input itself is the problem, not the run (#429).
             ConvertError::AllFeaturesOutOfRange { .. }
             | ConvertError::UnsupportedCrs { .. }
+            | ConvertError::ArrowStream(_)
             | ConvertError::SortKeyColumnMissing { .. }
             | ConvertError::ClassRankColumnMissing { .. }
             | ConvertError::ClassRankColumnNotString { .. }

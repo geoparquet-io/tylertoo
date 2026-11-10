@@ -38,6 +38,8 @@ tylertoo-core = { workspace = true, features = ["remote"] }
 # nothing here.
 pyo3 = { workspace = true, features = ["abi3-py311"] }
 pyo3-log = { workspace = true }
+# Arrow PyCapsule stream import (#824): pyo3 0.29 and arrow 59, as ours.
+pyo3-arrow = { version = "0.19", default-features = false }
 # Report structs (already serde::Serialize in core) to Python dicts.
 pythonize = "0.29"
 serde = { workspace = true }

@@ -4,7 +4,10 @@ Args:
     input: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
         (`EPSG:3857`). Pass a file, directory, glob, `s3://`,
         `gs://`, or `https://` URL or prefix, or a list of files.
+        TODO(docs): Arrow stream input (__arrow_c_stream__), staged to spill_dir; DuckDB example with Hilbert ORDER BY.
     output: Overview file to write.
+    geometry_column: TODO(docs)
+    crs: TODO(docs)
     mode: `"duplicating"` makes each level a complete map;
         `"partitioning"` stores each feature once.
     min_zoom: Coarsest zoom.

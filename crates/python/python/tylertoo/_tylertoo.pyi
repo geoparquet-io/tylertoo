@@ -7,7 +7,7 @@
 # signatures generated from the core option structs in build.rs.
 import os
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from . import (
     ConvertReport,
@@ -31,9 +31,14 @@ __all__ = [
 
 class ConfigError(ValueError): ...
 
+class _ArrowStream(Protocol):
+    """Any object with the Arrow PyCapsule stream interface (#824)."""
+
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object: ...
+
 def _defaults() -> dict[str, dict[str, Any]]: ...
 def overview(
-    input: str | Sequence[str],
+    input: str | Sequence[str] | _ArrowStream,
     output: str,
     *,
     accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
@@ -51,6 +56,7 @@ def overview(
     cogp_compat: bool = False,
     collapse: bool = False,
     collapse_square: bool = False,
+    crs: str | None = None,
     density_drop: bool | None = None,
     drop_gamma: float = 1.5,
     drop_lines: bool = False,
@@ -61,6 +67,7 @@ def overview(
     exclude_properties: Sequence[str] | None = None,
     filter: str | None = None,
     full_column_stats: bool = False,
+    geometry_column: str | None = None,
     gsd_base: float = 1024.0,
     gsds: Sequence[float] | None = None,
     in_flight_batches: int = 0,
@@ -153,7 +160,7 @@ def decode(
 ) -> DecodeReport: ...
 def validate(file: str) -> ValidationReport: ...
 def convert(
-    input: str,
+    input: str | _ArrowStream,
     output: str,
     min_zoom: int = 0,
     max_zoom: int | str = 14,
@@ -179,6 +186,7 @@ def convert(
     collapse: bool = False,
     collapse_square: bool = False,
     coverage_fill: bool = False,
+    crs: str | None = None,
     variable_depth: bool = False,
     density_drop: bool | None = None,
     description: str | None = None,
@@ -193,6 +201,7 @@ def convert(
     feature_id: str | None = None,
     filter: str | None = None,
     full_column_stats: bool = False,
+    geometry_column: str | None = None,
     gsd_base: float = 1024.0,
     gsds: Sequence[float] | None = None,
     in_flight_batches: int = 0,

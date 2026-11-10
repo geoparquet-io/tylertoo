@@ -399,7 +399,7 @@ pub fn decode_pmtiles(
     // only once it is complete, so an interrupted decode leaves a previous
     // output intact.
     let (file, pending) = crate::atomic_output::create(output_path.as_ref())?;
-    let mut writer = tylertoo_io::batch_writer(file, encoder.target_schema())?;
+    let mut writer = tylertoo_io::batch_writer(file, encoder.target_schema(), None)?;
 
     // ---- Pass B: decode again, cut the rows into BATCH_SIZE batches in tile
     // order, encode the batches on the pool, write them in order. ----------

@@ -34,6 +34,7 @@ tylertoo-core = { path = "crates/core", version = "0.8.0" }
 # Core geospatial dependencies
 geoarrow = "0.9"
 geoarrow-array = "0.9"
+geoarrow-schema = "0.9"
 geo-traits = "0.3"
 geoparquet = "0.9"
 # arrow-rs is pinned to 59 by the geoarrow stack above, NOT by choice: geoarrow

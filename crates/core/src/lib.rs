@@ -132,6 +132,7 @@ mod quality;
 mod resolved_schema;
 mod shard;
 mod stats;
+mod stream_input;
 mod sutherland_hodgman;
 #[cfg(test)]
 pub(crate) mod test_log;
@@ -249,6 +250,9 @@ pub mod internal {
     }
     pub mod input_set {
         pub use crate::input_set::*;
+    }
+    pub mod stream_input {
+        pub use crate::stream_input::*;
     }
     pub mod ioverlay_clip {
         pub use crate::ioverlay_clip::*;

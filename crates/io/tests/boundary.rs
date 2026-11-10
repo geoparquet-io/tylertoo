@@ -66,7 +66,7 @@ fn row_limit_is_applied_before_batch_decoding() {
     )
     .unwrap();
     let mut file = tempfile::tempfile().unwrap();
-    let mut writer = tylertoo_io::batch_writer(&mut file, schema).unwrap();
+    let mut writer = tylertoo_io::batch_writer(&mut file, schema, None).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
     let mut reader = open_parquet(file).unwrap().with_limit(2).build().unwrap();

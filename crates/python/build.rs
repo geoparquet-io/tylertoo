@@ -35,6 +35,11 @@ fn main() {
                 signature.push_str(&format!(", {key}={}", literal(&value)));
             }
         }
+        // #824: Arrow stream input descriptors, handled by the binding.
+        if matches!(name, "convert" | "overview") {
+            defaults.insert("crs".into(), serde_json::Value::Null);
+            defaults.insert("geometry_column".into(), serde_json::Value::Null);
+        }
         if !defaults.is_empty() {
             signature.push_str(", *");
             for (key, value) in defaults {

@@ -48,6 +48,8 @@ clap = { workspace = true, optional = true }
 dhat = { version = "0.3", optional = true }
 geoarrow = { workspace = true }
 geoarrow-array = { workspace = true }
+# CrsTransform, which geoarrow does not re-export (#824).
+geoarrow-schema = { workspace = true }
 geo-traits = { workspace = true }
 geoparquet = { workspace = true }
 tylertoo-io = { workspace = true }

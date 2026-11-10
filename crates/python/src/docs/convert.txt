@@ -10,6 +10,8 @@ Sharded builds (`--shard`, `--plan-only`) stay CLI-only.
 Args:
     input: See `overview()`.
     output: PMTiles archive to write.
+    geometry_column: See `overview()`.
+    crs: See `overview()`.
     min_zoom: See `overview()`.
     max_zoom: See `overview()`.
     layer_name: MVT layer name, or `None` for the input's file stem.
