@@ -339,6 +339,12 @@ thread_local! {
     static LAST_READ_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// [`LAST_READ_WORKERS`] on this thread (test seam for other modules).
+#[cfg(test)]
+pub(super) fn last_read_workers() -> usize {
+    LAST_READ_WORKERS.with(std::cell::Cell::get)
+}
+
 /// Deliver every selected input row to `on_batch`, in exact read order, in
 /// batches of at most `tuning.batch_size` rows, preserving the I/O owner's
 /// memory and offset bounds with either sequential or concurrent readers.

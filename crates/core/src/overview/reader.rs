@@ -562,22 +562,6 @@ impl OverviewReader {
         Ok(self.rows(self.band(level_idx)?, batch_size)?.build()?)
     }
 
-    /// [`Self::read_band_batched`] projected to the top-level columns
-    /// `roots` (indexes into [`Self::schema`]); batches carry only those
-    /// columns, in schema order, with their field metadata intact.
-    ///
-    /// For consumers that need a narrow slice of every row — the export's
-    /// fan-out bbox scan reads only the geometry — so the property columns are
-    /// neither read nor held in the batches in flight.
-    pub(crate) fn read_band_projected(
-        &self,
-        level_idx: usize,
-        batch_size: usize,
-        roots: &[usize],
-    ) -> Result<UntrustedBatchReader, ReaderError> {
-        self.read_row_groups_projected(self.band(level_idx)?, batch_size, roots)
-    }
-
     /// Read exactly the row groups `row_groups` (ascending, file order),
     /// projected to the top-level columns `roots`, with an explicit batch
     /// size. Batches may straddle row-group boundaries.
@@ -634,7 +618,7 @@ impl OverviewReader {
     }
 
     /// `level_idx`'s own row-group band, `start..=end`.
-    fn band(&self, level_idx: usize) -> Result<Vec<usize>, ReaderError> {
+    pub(crate) fn band(&self, level_idx: usize) -> Result<Vec<usize>, ReaderError> {
         let (start, end) = self.level_band(level_idx)?;
         Ok((start..=end).collect())
     }

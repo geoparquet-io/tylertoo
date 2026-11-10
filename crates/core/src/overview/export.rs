@@ -2428,6 +2428,11 @@ fn export_pmtiles_validated(
         .transpose()?;
     let mut scans = scan_all_levels(
         &reader,
+        BandRead {
+            source: &band_source,
+            budget: *budget,
+            profile: options.profile,
+        },
         crs,
         options,
         &timers,
@@ -4372,7 +4377,7 @@ const SINGLE_READ_IN_FLIGHT: usize = 4;
 /// `EXPORT_BATCH_SIZE` batches here. For a wave that is noise next to its own
 /// member buffer and is not folded into the preflight estimate; the scan
 /// additionally projects its read to the geometry column
-/// ([`OverviewReader::read_band_projected`]), so its batches carry no
+/// ([`read_in_order_capped`] with a projection), so its batches carry no
 /// property columns.
 const WAVE_READ_IN_FLIGHT: usize = 2;
 
@@ -5389,6 +5394,7 @@ fn encode_buckets(
 /// from the geometry from the start.
 fn scan_all_levels(
     reader: &OverviewReader,
+    band: BandRead<'_>,
     crs: Crs,
     opts: &ExportOptions,
     timers: &ExportTimers,
@@ -5407,7 +5413,7 @@ fn scan_all_levels(
     let source = ScanBboxSource::for_reader(reader);
     if matches!(source, ScanBboxSource::Covering { .. }) {
         if let Some(scans) = scan_all_levels_from(
-            reader,
+            (reader, band),
             crs,
             opts,
             timers,
@@ -5426,7 +5432,7 @@ fn scan_all_levels(
         }
     }
     let scans = scan_all_levels_from(
-        reader,
+        (reader, band),
         crs,
         opts,
         timers,
@@ -5477,7 +5483,7 @@ impl ScanBboxSource {
 /// [`ScanBboxSource::Covering`], when a covering row has no exact bbox
 /// ([`covering_batch_bboxes`]) and the pass is abandoned.
 fn scan_all_levels_from(
-    reader: &OverviewReader,
+    (reader, band): (&OverviewReader, BandRead<'_>),
     crs: Crs,
     opts: &ExportOptions,
     timers: &ExportTimers,
@@ -5498,21 +5504,22 @@ fn scan_all_levels_from(
         })
         .collect();
 
-    // PERF (#535): same read/compute overlap as [`process_wave`] — the Parquet
-    // read is inherently single-threaded while the decode + sizing fans out
+    // PERF (#535): same read/compute overlap as [`process_wave`] — the read
+    // runs off the consumer's thread while the decode + sizing fans out
     // over the Rayon pool, so reading and sizing alternately on one thread left
     // the pool parked for the whole read. The scan was 3.9 of the 16 s export
     // wall on a 3.07 M-feature z0–13 run. Every band goes down one channel in
-    // band order (as [`fill_member_store`] does), so the consumer folds batches
-    // in exactly the order the serial loop did and the `LevelScan`s come out
-    // identical — not merely equivalent under the commutativity argument in
-    // this function's docs.
+    // band order (as [`fill_member_store`] does), so variable depth folds
+    // batches in the order the serial loop did; the `LevelScan`s are sums
+    // and min/max, identical however the consumer groups the rows.
     //
     // Memory (#559 review): the scan needs only each feature's bbox, so the
     // read is projected to the one column the bbox comes from — the covering
     // struct, else the geometry — and the pipe is the shallow
     // [`WAVE_READ_IN_FLIGHT`]: this runs before any wave preflight, so its
-    // in-flight batches are unbudgeted. Projection keeps every row and the
+    // in-flight batches are unbudgeted (shortcut: under `auto` up to four
+    // readers each hold [`SCAN_READ_AHEAD_BATCHES`] of them too; charge a
+    // `grant_read_ahead` if a geometry-column scan shows in peak RSS). Projection keeps every row and the
     // column's field (name and metadata), so the bboxes — and the scan — are
     // unchanged. With no recognizable geometry column the read stays
     // unprojected, so the error surfaces from the decode exactly as before.
@@ -5543,29 +5550,86 @@ fn scan_all_levels_from(
     let zooms_ref = &zooms;
     let mut abandoned = false;
     let abandoned_ref = &mut abandoned;
+    #[cfg(test)]
+    let mut readers = 0;
+    #[cfg(test)]
+    let readers_ref = &mut readers;
+    // PERF (#817): each band is read by the ordered parallel reader, in
+    // the same batches one reader makes; `bounded` keeps the one reader.
     scoped_pipe(
         WAVE_READ_IN_FLIGHT,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
             for j in 0..num_levels {
-                let mut band_reader = ExportTimers::time(&timers.scan_read, || match &roots {
-                    Some(r) => reader.read_band_projected(j, EXPORT_BATCH_SIZE, r),
-                    None => reader.read_band_batched(j, EXPORT_BATCH_SIZE),
-                })?;
-                while let Some(batch) = ExportTimers::time(&timers.scan_read, || band_reader.next())
+                let selection = RowGroupSelection::from_parts(vec![reader.band(j)?]);
+                let tuning = band_tuning(band, &selection, roots.as_deref(), ReadPass::Scan)?;
+                let mut hung_up = false;
+                read_in_order_capped(
+                    band.source,
+                    Some(&selection),
+                    roots.as_deref(),
+                    tuning,
+                    Some(SCAN_READ_AHEAD_BATCHES),
+                    |batch, _, read| {
+                        add_nanos(&timers.scan_read, read);
+                        hung_up = tx.send((j, batch)).is_err();
+                        Ok(if hung_up {
+                            ReadFlow::Stop
+                        } else {
+                            ReadFlow::Continue
+                        })
+                    },
+                )
+                .map_err(read_error)?;
+                #[cfg(test)]
                 {
-                    if tx.send((j, batch?)).is_err() {
-                        return Ok(()); // consumer dropped the receiver
-                    }
+                    *readers_ref = (*readers_ref).max(super::read::last_read_workers());
+                }
+                if hung_up {
+                    return Ok(()); // consumer dropped the receiver
                 }
             }
             Ok(())
         },
         |rx: Receiver<(usize, RecordBatch)>| -> Result<(), ExportError> {
-            for (j, batch) in rx.iter() {
+            // PERF (#817): one band's bboxes are sized a pool's worth at a
+            // time, into each target level at once; one 8,192-row batch at a
+            // time, level after level, kept the consumer to about one core.
+            // Counts, unions and feature counts are sums and min/max, so the
+            // scans are identical however rows are grouped.
+            let size_rows = SIZE_BBOXES_MIN_ROWS.saturating_mul(rayon::current_num_threads());
+            let mut pending: Vec<Option<TileBounds>> = Vec::with_capacity(size_rows);
+            let mut pending_band = 0;
+            let mut size_pending = |j: usize, pending: &mut Vec<Option<TileBounds>>| {
+                if pending.is_empty() {
+                    return;
+                }
+                #[cfg(test)]
+                SCAN_SIZE_FLUSHES.with(|n| n.set(n.get() + 1));
                 // Bands accumulate into finer levels' render sets only in
                 // partitioning mode; duplicating bands are self-contained, so
                 // band `j` feeds level `j` alone.
                 let last = if partitioning { num_levels - 1 } else { j };
+                ExportTimers::time(&timers.scan_size, || {
+                    scans_ref[j..=last]
+                        .par_iter_mut()
+                        .zip(&zooms_ref[j..=last])
+                        .for_each(|(scan, &zoom)| {
+                            scan.feature_count += pending.len();
+                            let (bounds, counts) = size_bboxes(pending, zoom, opts);
+                            if let Some(b) = bounds {
+                                match &mut scan.bounds {
+                                    Some(acc) => acc.expand(&b),
+                                    None => scan.bounds = Some(b),
+                                }
+                            }
+                            for (key, v) in counts {
+                                *scan.tile_counts.entry(key).or_insert(0) += v;
+                            }
+                        });
+                });
+                pending.clear();
+            };
+            for (j, batch) in rx.iter() {
                 // Read + (for 3857) reproject each feature's bbox once per
                 // band; sizing the same bbox into every target level below is
                 // bit-identical to reprojecting it once per level, since
@@ -5626,28 +5690,35 @@ fn scan_all_levels_from(
                         )
                     })?;
                 }
-                for k in j..=last {
-                    let scan = &mut scans_ref[k];
-                    scan.feature_count += bboxes.len();
-                    let (batch_bounds, batch_counts) =
-                        ExportTimers::time(&timers.scan_size, || {
-                            size_bboxes(&bboxes, zooms_ref[k], opts)
-                        });
-                    if let Some(b) = batch_bounds {
-                        match &mut scan.bounds {
-                            Some(acc) => acc.expand(&b),
-                            None => scan.bounds = Some(b),
-                        }
-                    }
-                    for (key, v) in batch_counts {
-                        *scan.tile_counts.entry(key).or_insert(0) += v;
-                    }
+                if j != pending_band {
+                    size_pending(pending_band, &mut pending);
+                    pending_band = j;
+                }
+                pending.extend(bboxes);
+                if pending.len() >= size_rows {
+                    size_pending(j, &mut pending);
                 }
             }
+            size_pending(pending_band, &mut pending);
             Ok(())
         },
     )?;
+    #[cfg(test)]
+    SCAN_READ_WORKERS.with(|w| w.set(readers));
     Ok((!abandoned).then_some(scans))
+}
+
+/// Read-ahead per scan reader, in batches: the scan's projected batches are
+/// small and its consumer keeps up, so the floor is enough.
+const SCAN_READ_AHEAD_BATCHES: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    /// Most reader threads one band read of this thread's last scan used
+    /// (test counter, #817).
+    static SCAN_READ_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Sizing passes this thread's scans ran, summed (test counter, #817).
+    static SCAN_SIZE_FLUSHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One record batch's per-feature bboxes read from its f64 bbox covering
@@ -6367,27 +6438,7 @@ fn read_band(
     mut on_batch: impl FnMut(RecordBatch) -> Result<(), ExportError>,
 ) -> Result<(), ExportError> {
     let selection = RowGroupSelection::from_parts(vec![selected.to_vec()]);
-    let columns = band
-        .source
-        .schema()
-        .map_err(|e| read_error(e.into()))?
-        .fields()
-        .len();
-    let tuning = ReadTuning {
-        budget: band.budget,
-        batch_size: EXPORT_BATCH_SIZE,
-        // `bounded` reads with one worker, as before #817: concurrent level
-        // reads each size their read-ahead from the same budget, uncharged.
-        workers: match band.profile {
-            MemoryProfile::Bounded => 1,
-            MemoryProfile::Auto | MemoryProfile::Speed => {
-                resolve_pass_read_workers(ReadPass::Build, READ_WORKERS_AUTO)
-            }
-        },
-        avg_geom_bytes: None,
-        footer: footer_price(band.source, Some(&selection), 0..columns).map_err(read_error)?,
-        profile: band.profile,
-    };
+    let tuning = band_tuning(band, &selection, None, ReadPass::Build)?;
     // The collect takes a group at a time, so each reader needs about one
     // group queued, not the budget's depth: concurrent levels each read.
     let ahead = collect_group_rows(band.profile).div_ceil(EXPORT_BATCH_SIZE);
@@ -6425,6 +6476,44 @@ fn read_band(
         },
         |rx| rx.into_iter().try_for_each(&mut on_batch),
     )
+}
+
+/// How [`read_in_order_capped`] reads `selection` of the overview for
+/// `pass`, over the `projection` columns (`None`: all of them).
+fn band_tuning(
+    band: BandRead<'_>,
+    selection: &RowGroupSelection,
+    projection: Option<&[usize]>,
+    pass: ReadPass,
+) -> Result<ReadTuning, ExportError> {
+    let footer = match projection {
+        Some(p) => footer_price(band.source, Some(selection), p.iter().copied()),
+        None => {
+            let columns = band
+                .source
+                .schema()
+                .map_err(|e| read_error(e.into()))?
+                .fields()
+                .len();
+            footer_price(band.source, Some(selection), 0..columns)
+        }
+    }
+    .map_err(read_error)?;
+    Ok(ReadTuning {
+        budget: band.budget,
+        batch_size: EXPORT_BATCH_SIZE,
+        // `bounded` reads with one worker, as before #817: concurrent level
+        // reads each size their read-ahead from the same budget, uncharged.
+        workers: match band.profile {
+            MemoryProfile::Bounded => 1,
+            MemoryProfile::Auto | MemoryProfile::Speed => {
+                resolve_pass_read_workers(pass, READ_WORKERS_AUTO)
+            }
+        },
+        avg_geom_bytes: None,
+        footer,
+        profile: band.profile,
+    })
 }
 
 /// A band read's [`ConvertError`] as the export's error, keeping its typed
@@ -12697,6 +12786,77 @@ mod tests {
         ]
     }
 
+    /// The overview at `reader`'s path as a band source.
+    pub(super) fn band_source(reader: &OverviewReader) -> ConvertSource {
+        ConvertSource::single(crate::input::InputSource::Local(
+            reader.path().to_path_buf(),
+        ))
+    }
+
+    /// An `auto` band read of `source` with no memory limit.
+    pub(super) fn test_band(source: &ConvertSource) -> BandRead<'_> {
+        BandRead {
+            source,
+            budget: MemoryBudget::with_available(None),
+            profile: MemoryProfile::Auto,
+        }
+    }
+
+    /// The export scan reads a band of several row groups with the ordered
+    /// parallel reader under `auto`, and with one reader under `bounded`,
+    /// to the same scans (#817: one reader thread capped the scan at about
+    /// one core).
+    #[test]
+    fn scan_reads_and_sizes_a_band_in_parallel() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let points: Vec<Geometry<f64>> = (0..40_000)
+            .map(|i| {
+                let f = f64::from(i);
+                Geometry::Point(Point::new(
+                    -170.0 + (f * 0.0171) % 340.0,
+                    -60.0 + (f * 0.0067) % 120.0,
+                ))
+            })
+            .collect();
+        write_fixture(input.path(), &[((0..40_000).collect(), points)]);
+        let reader = OverviewReader::open(input.path()).unwrap();
+        let source = band_source(&reader);
+        let scan = |profile| {
+            let flushes = SCAN_SIZE_FLUSHES.with(std::cell::Cell::get);
+            let scans = scan_all_levels(
+                &reader,
+                BandRead {
+                    profile,
+                    ..test_band(&source)
+                },
+                Crs::Epsg4326,
+                &ExportOptions::default(),
+                &ExportTimers::default(),
+                None,
+                &crate::diagnostics::Diagnostics::default(),
+            )
+            .unwrap();
+            let flushes = SCAN_SIZE_FLUSHES.with(std::cell::Cell::get) - flushes;
+            (scans, SCAN_READ_WORKERS.with(std::cell::Cell::get), flushes)
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(64)
+            .build()
+            .unwrap();
+        let (auto, readers, flushes) = pool.install(|| scan(MemoryProfile::Auto));
+        assert!(
+            readers > 1,
+            "auto scanned a 4-row-group band with {readers} reader(s)"
+        );
+        assert_eq!(
+            flushes, 1,
+            "64 threads size a 40,000-row band at once, not batch by batch"
+        );
+        let (bounded, readers, _) = scan(MemoryProfile::Bounded);
+        assert_eq!(readers, 1, "bounded keeps the one scan reader");
+        assert_eq!(auto, bounded);
+    }
+
     /// Both sources' scans of one file, for every level: (covering, geometry).
     fn scans_by_source(path: &Path, crs: Crs) -> (Option<Vec<LevelScan>>, Vec<LevelScan>) {
         let reader = OverviewReader::open(path).unwrap();
@@ -12708,7 +12868,7 @@ mod tests {
         let timers = ExportTimers::default();
         let opts = ExportOptions::default();
         let covering = scan_all_levels_from(
-            &reader,
+            (&reader, test_band(&band_source(&reader))),
             crs,
             &opts,
             &timers,
@@ -12718,7 +12878,7 @@ mod tests {
         )
         .unwrap();
         let geometry = scan_all_levels_from(
-            &reader,
+            (&reader, test_band(&band_source(&reader))),
             crs,
             &opts,
             &timers,
@@ -12795,6 +12955,7 @@ mod tests {
         let reader = OverviewReader::open(tmp.path()).unwrap();
         let scans = scan_all_levels(
             &reader,
+            test_band(&band_source(&reader)),
             Crs::Epsg4326,
             &ExportOptions::default(),
             &ExportTimers::default(),
@@ -14408,6 +14569,7 @@ mod tests {
         let opts = ExportOptions::default();
         let scans = scan_all_levels(
             &reader,
+            test_band(&band_source(&reader)),
             Crs::Epsg4326,
             &opts,
             &ExportTimers::default(),
