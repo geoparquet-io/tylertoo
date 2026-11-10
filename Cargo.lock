@@ -4508,6 +4508,7 @@ dependencies = [
  "pythonize",
  "serde",
  "serde_json",
+ "tylertoo",
  "tylertoo-core",
 ]
 
