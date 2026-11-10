@@ -835,7 +835,12 @@ pub fn redact_query(input: &str) -> std::borrow::Cow<'_, str> {
 /// signature is there: on an unsigned API, `st=2025` may pick the object.
 fn signing_params(params: &[&str]) -> impl Fn(&str) -> bool {
     let has = |name: &str| params.iter().any(|p| param_name(p) == name);
-    let (s3, gcs, sas) = (has("x-amz-signature"), has("x-goog-signature"), has("sig"));
+    // Every account and service SAS carries its version, `sv`, with `sig`.
+    let (s3, gcs, sas) = (
+        has("x-amz-signature"),
+        has("x-goog-signature"),
+        has("sig") && has("sv"),
+    );
     move |name: &str| {
         (s3 && name.starts_with("x-amz-"))
             || (gcs && name.starts_with("x-goog-"))
@@ -4618,18 +4623,19 @@ mod tests {
         assert_eq!(s3("aaa", "20261110"), s3("bbb", "20261111"));
         let sas = |sig: &str, se: &str| {
             redact_query(&format!(
-                "https://a.blob.core.windows.net/c/k?sp=r&se={se}&sig={sig}"
+                "https://a.blob.core.windows.net/c/k?sp=r&se={se}&sv=2022-11-02&sig={sig}"
             ))
             .into_owned()
         };
         assert_eq!(sas("aaa", "2026-11-11"), sas("bbb", "2026-12-01"));
         let pick = |q: &str| redact_query(&format!("https://h/download?{q}")).into_owned();
-        assert_ne!(pick("file=a&sig=x"), pick("file=b&sig=x"));
-        assert_eq!(pick("file=a&sig=x"), pick("sig=y&file=a"));
+        assert_ne!(pick("file=a&sv=1&sig=x"), pick("file=b&sv=1&sig=x"));
+        assert_eq!(pick("file=a&sv=1&sig=x"), pick("sv=1&sig=y&file=a"));
         // Order can select: some endpoints take the last of a repeated key.
         assert_ne!(pick("file=a&file=b"), pick("file=b&file=a"));
         // A signing field's name means nothing without its signature.
         assert_ne!(pick("st=2025"), pick("st=2026"));
+        assert_ne!(pick("st=2025&sig=x"), pick("st=2026&sig=x"));
         assert_ne!(pick("X-Amz-Date=1"), pick("X-Amz-Date=2"));
         for shown in [s3("aaa", "1"), sas("aaa", "1"), pick("file=a&sig=x")] {
             assert!(!shown.contains("aaa") && !shown.contains("file"), "{shown}");

@@ -259,8 +259,10 @@ impl Band {
             Some(i) => {
                 // The URL starts where its scheme does.
                 let url_at = spec[..i]
-                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-                    .map_or(0, |j| j + 1);
+                    .trim_end_matches(|c: char| {
+                        c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
+                    })
+                    .len();
                 format!("{}{}", &spec[..url_at], redact_query(&spec[url_at..]))
             }
             None => spec.to_string(),
@@ -508,6 +510,12 @@ fn is_drive_letter(s: &str) -> bool {
 /// client has to reference as `"source-layer": "*"`. A glob's parent directory
 /// is the useful name, and failing that the caller is asked for one.
 fn default_layer_for(path: &str) -> Option<String> {
+    // A URL's query and fragment are not part of its name (#820: and a
+    // presigned query would put its signature in the layer name).
+    let path = match url_scheme(path) {
+        Some(_) => path.split(['?', '#']).next().unwrap_or(path),
+        None => path,
+    };
     // Strip a Windows drive prefix first: on Unix, `Path` has no notion of one,
     // so `C:data.parquet` would otherwise yield the stem `C:data` — a layer id
     // with a colon in it.
@@ -2914,13 +2922,16 @@ mod tests {
             );
             assert_eq!(band_label(&bands[0]), "a (https://h/a.parquet?<redacted>)");
         }
+        // An implicit layer comes from the URL's path, not its query.
+        let bands = parse_bands(&["0-5:https://h/download?path=/dataset&sig=SECRET"]).unwrap();
+        assert_eq!(bands[0].layer, "download");
         let err = remote_archive_rejection(Path::new("https://h/a.pmtiles?sig=SECRET")).unwrap();
         assert!(!err.contains("SECRET"), "{err}");
         // A refused spec is named without its query too.
         for spec in [
             format!("9-5:{url}:a"),
             format!("9-5: {url}:a"),
-            "0-5:https://h/[p]/download?sig=SECRET".to_string(),
+            format!("9-5:\u{2003}{url}:a"),
         ] {
             let err = parse_bands(&[spec]).unwrap_err();
             assert!(
