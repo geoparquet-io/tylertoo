@@ -33,8 +33,7 @@ use crate::archive_index::{ArchiveError, ArchiveIndex};
 use crate::compression::{decompress_capped, MAX_TILE_BYTES};
 use crate::pmtiles_writer::{tile_id_to_zxy, TileType};
 use crate::tile::hilbert_zoom_base;
-use crate::vector_tile::tile::GeomType;
-use crate::vector_tile::Tile;
+use crate::vector_tile::tile::{GeomType, Layer};
 use crate::Result;
 
 /// One zoom level's tile-size distribution, in STORED (compressed) bytes per
@@ -294,10 +293,9 @@ fn layer_stats(
     let acc = bodies
         .par_iter()
         .try_fold(LayerAcc::new, |mut acc, ((offset, length), zooms)| {
-            let tile = decode_body(archive, *offset, *length)?;
-            for layer in &tile.layers {
+            for (layer, bytes) in &decode_body(archive, *offset, *length)? {
+                let (layer, bytes) = (layer, *bytes);
                 let features = layer.features.len() as u64;
-                let bytes = layer.encoded_len() as u64;
                 let mut types: BTreeMap<&'static str, u64> = BTreeMap::new();
                 for f in &layer.features {
                     *types.entry(geom_type_name(f.r#type())).or_default() += 1;
@@ -340,8 +338,9 @@ fn layer_stats(
         .collect())
 }
 
-/// One stored tile body, decompressed and parsed as MVT.
-fn decode_body(archive: &ArchiveIndex, offset: u64, length: u32) -> Result<Tile> {
+/// One stored tile body, decompressed and parsed as MVT: each layer with its
+/// encoded length.
+fn decode_body(archive: &ArchiveIndex, offset: u64, length: u32) -> Result<Vec<(Layer, u64)>> {
     let header = archive.header();
     let fail = |error: String| ArchiveError::Tile {
         offset,
@@ -360,7 +359,32 @@ fn decode_body(archive: &ArchiveIndex, offset: u64, length: u32) -> Result<Tile>
     let raw = archive.read_range(start..start + length as usize)?;
     let plain = decompress_capped(&raw, header.tile_compression, MAX_TILE_BYTES)
         .map_err(|e| fail(e.to_string()))?;
-    Ok(Tile::decode(plain.as_slice()).map_err(|e| fail(e.to_string()))?)
+    Ok(mvt_layers(&plain).map_err(fail)?)
+}
+
+/// The layers of an uncompressed MVT, each with its length on the wire.
+/// Measured from the wire, not `encoded_len()`, which misses the fields
+/// (layer extensions) prost drops on decode.
+fn mvt_layers(mut buf: &[u8]) -> std::result::Result<Vec<(Layer, u64)>, String> {
+    use prost::encoding::{decode_key, decode_varint, skip_field, DecodeContext, WireType};
+    let mut layers = Vec::new();
+    while !buf.is_empty() {
+        let (tag, wire) = decode_key(&mut buf).map_err(|e| e.to_string())?;
+        // `Tile.layers` is field 3.
+        if tag != 3 || wire != WireType::LengthDelimited {
+            skip_field(wire, tag, &mut buf, DecodeContext::default()).map_err(|e| e.to_string())?;
+            continue;
+        }
+        let len = decode_varint(&mut buf).map_err(|e| e.to_string())?;
+        let len = usize::try_from(len)
+            .ok()
+            .filter(|&l| l <= buf.len())
+            .ok_or("layer runs past the end of the tile")?;
+        let (body, rest) = buf.split_at(len);
+        layers.push((Layer::decode(body).map_err(|e| e.to_string())?, len as u64));
+        buf = rest;
+    }
+    Ok(layers)
 }
 
 fn geom_type_name(t: GeomType) -> &'static str {
@@ -377,7 +401,7 @@ mod tests {
     use super::*;
     use crate::compression::Compression;
     use crate::pmtiles_writer::{tile_id, StreamingPmtilesWriter};
-    use crate::vector_tile::tile::{Feature, GeomType, Layer};
+    use crate::vector_tile::tile::Feature;
     use crate::vector_tile::Tile;
 
     /// A synthetic archive: `Compression::None` so the stored byte count is
@@ -743,6 +767,27 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// A layer's bytes are its length on the wire, including a layer
+    /// extension field prost does not keep.
+    #[test]
+    fn layer_bytes_count_fields_prost_drops() {
+        let mut layer = Layer {
+            version: 2,
+            name: "r".to_owned(),
+            ..Layer::default()
+        }
+        .encode_to_vec();
+        layer.extend([0x80, 0x01, 5]); // key 128 = field 16 (an extension), varint 5
+        let mut tile = vec![3 << 3 | 2, layer.len() as u8];
+        tile.extend(&layer);
+        tile.extend([5 << 3, 7]); // an unknown top-level field is skipped
+        let layers = mvt_layers(&tile).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].0.name, "r");
+        assert_eq!(layers[0].1, layer.len() as u64);
+        assert!(mvt_layers(&[3 << 3 | 2, 9, 0]).is_err());
     }
 
     /// Without `layers`, the JSON report is the pre-#825 shape exactly.
