@@ -563,14 +563,14 @@ fn build_chains<'a>(
         .collect()
 }
 
-/// Phase 1 of [`build_chains`], the exact-endpoint join, over one set of
+/// Phase 1 of `build_chains`, the exact-endpoint join, over one set of
 /// candidate lines.
 ///
 /// It depends on the lines and the junction angle only, not on the level's
 /// GSD, so one run serves every level of a ladder (#817: run per level it
 /// was 15 identical joins on a z0-z14 ladder, 0.75 s each on Oregon roads,
 /// and one copy of every merged coordinate run per concurrent level). Each
-/// level's [`chains`](Self::chains) borrows the merged runs for its snap
+/// level's `chains` call borrows the merged runs for its snap
 /// pass.
 pub struct ExactChains<'a> {
     /// The candidate lines the join was built from.
