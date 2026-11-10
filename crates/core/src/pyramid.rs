@@ -2297,15 +2297,7 @@ fn build_pyramid_validated(
                     accumulate: &opts.accumulate,
                     categories: opts.cluster_categories.as_deref(),
                 };
-                // The caller's resource settings; the cell tables need no others.
-                let c = &opts.convert;
-                let resources = ConvertOptions {
-                    profile: c.profile,
-                    in_flight_batches: c.in_flight_batches,
-                    read_workers: c.read_workers,
-                    spill_dir: c.spill_dir.clone(),
-                    ..ConvertOptions::default()
-                };
+                let resources = cell_resources(opts);
                 crate::overview::cells::write_cell_tables(
                     &band.input,
                     system,
@@ -2357,6 +2349,20 @@ fn build_pyramid_validated(
 /// Tile one GeoParquet `input` into `layer` across zooms `lo..=hi`: the
 /// ordinary convert → export chain, with intermediates from `named`. Returns
 /// the band's archive.
+/// The caller's resource settings for a cell band; the cell tables need no
+/// others.
+fn cell_resources(opts: &PyramidOptions) -> ConvertOptions {
+    let c = &opts.convert;
+    ConvertOptions {
+        // #801: one memory profile governs the band, as in `tile_source_band`.
+        profile: opts.export.profile,
+        in_flight_batches: c.in_flight_batches,
+        read_workers: c.read_workers,
+        spill_dir: c.spill_dir.clone(),
+        ..ConvertOptions::default()
+    }
+}
+
 fn tile_source_band(
     input: &Path,
     layer: &str,
@@ -3087,6 +3093,13 @@ mod tests {
 
     /// #445: `parse_bands` names a missing local input instead of letting
     /// the reader fail later without a path.
+
+    #[test]
+    fn cell_band_uses_the_selected_profile() {
+        let mut opts = PyramidOptions::default();
+        opts.export.profile = crate::MemoryProfile::Speed;
+        assert_eq!(cell_resources(&opts).profile, crate::MemoryProfile::Speed);
+    }
     #[test]
     fn parse_bands_names_a_missing_input() {
         let dir = tempfile::tempdir().unwrap();
