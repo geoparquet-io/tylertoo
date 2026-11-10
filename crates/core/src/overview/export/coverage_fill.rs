@@ -123,8 +123,8 @@ pub(super) mod cost_probe {
         /// The most a window held: retained bytes, in-flight shares and paths.
         pub(crate) pyramid_reserved_peak: usize,
         pub(crate) seed_frame_writers: usize,
-        /// #830: the most the serial seed held while writing one bucket: it,
-        /// the buckets waiting behind it, and the runs' nodes.
+        /// #830: the most a run's append held as its run opened: the buckets
+        /// waiting, its own bucket less what its encoding freed, the nodes.
         pub(crate) seed_serial_peak: usize,
         pub(crate) map_peak: usize,
         pub(crate) live_peak: usize,
@@ -1175,7 +1175,7 @@ struct FillCounts {
 const ZOOM_INDEX_FIXED_BYTES: usize = 1024;
 /// The seed window's rows at the workspace floor; a larger grant scales it.
 const SEED_FLOOR_ROWS: usize = 128;
-/// A run frame writer's buffered file plus its encode buffer.
+/// What one more parallel run frame writer is charged: its stack stage and file.
 const RUN_WRITER_BYTES: usize = 8192 + 8192;
 const ZOOM_WRITER_FIXED_BYTES: usize = ZOOM_INDEX_FIXED_BYTES + 8192;
 
@@ -1440,6 +1440,45 @@ fn project_polygon(p: &geo::Polygon<f64>, proj: &crate::mvt::TileProjector) -> S
         .collect()
 }
 
+fn open_run(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().append(true).open(path)
+}
+
+/// A run frame's write buffer; see [`SpillBuckets::write_frame`].
+struct FrameStage<F> {
+    buf: [u8; 8192],
+    len: usize,
+    /// Frame bytes freed so far, priced as [`shape_capacity_bytes`] does.
+    freed: usize,
+    file: Option<std::fs::File>,
+    open: Option<F>,
+}
+
+impl<F: FnOnce(usize) -> Result<std::fs::File, super::ExportError>> FrameStage<F> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), super::ExportError> {
+        if self.len + bytes.len() > self.buf.len() {
+            self.flush()?;
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), super::ExportError> {
+        use std::io::Write;
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => {
+                let open = self.open.take().expect("a stage opens its run once");
+                self.file.insert(open(self.freed)?)
+            }
+        };
+        file.write_all(&self.buf[..self.len])?;
+        self.len = 0;
+        Ok(())
+    }
+}
+
 fn require_fill_bytes(needed: usize, available: usize) -> Result<(), super::ExportError> {
     if needed > available {
         return Err(super::ExportError::BudgetExceeded {
@@ -1470,27 +1509,40 @@ impl SpillBuckets {
         }
     }
 
+    /// Append one frame to `key`'s run, freeing its rings as they are
+    /// written. `reserved` counts the frame's own bytes among what is held;
+    /// the run is opened, and its node charged, once the frame's first
+    /// stage is encoded, less the bytes that freed (#830).
     fn append(
         &mut self,
         key: u64,
-        shapes: &[Shape],
-        credits: &[Collapsed],
+        shapes: &mut Vec<Shape>,
+        credits: &mut Vec<Collapsed>,
         reserved: usize,
     ) -> Result<(), super::ExportError> {
-        self.reserve_run(key, reserved)?;
-        Self::write_frame(&self.tiles[&key], shapes, credits)
+        Self::write_frame(shapes, credits, |freed| {
+            let held = reserved.saturating_sub(freed);
+            #[cfg(test)]
+            cost_probe::update(|c| {
+                let nodes = self.tiles.len() + usize::from(!self.tiles.contains_key(&key));
+                c.seed_serial_peak = c.seed_serial_peak.max(held + nodes * 512);
+            });
+            self.reserve_run(key, held)?;
+            Ok(open_run(&self.tiles[&key])?)
+        })
     }
 
     /// Create `key`'s run if it is new, charging its tree node, path and file.
     fn reserve_run(&mut self, key: u64, reserved: usize) -> Result<(), super::ExportError> {
         // Include a conservative allowance for each tree node, path and file.
+        let new = usize::from(!self.tiles.contains_key(&key));
         require_fill_bytes(
-            (self.tiles.len() + 1)
+            (self.tiles.len() + new)
                 .saturating_mul(512)
                 .saturating_add(reserved),
             self.budget,
         )?;
-        if !self.tiles.contains_key(&key) {
+        if new == 1 {
             self.tiles.insert(
                 key,
                 super::super::pipeline::spill_temp_file(self.spill_dir.as_deref())?
@@ -1500,47 +1552,50 @@ impl SpillBuckets {
         Ok(())
     }
 
-    /// Append one frame to the run at `path`; it holds `RUN_WRITER_BYTES`.
+    /// Encode one frame into an 8 KiB stage on the stack, freeing each ring,
+    /// shape and then the credits once encoded. `open` gets the run's file at the
+    /// first flush and is told the bytes freed by then, so a frame that fits
+    /// the stage is gone before its run is opened. No heap beyond the frame.
     fn write_frame(
-        path: &std::path::Path,
-        shapes: &[Shape],
-        credits: &[Collapsed],
+        shapes: &mut Vec<Shape>,
+        credits: &mut Vec<Collapsed>,
+        open: impl FnOnce(usize) -> Result<std::fs::File, super::ExportError>,
     ) -> Result<(), super::ExportError> {
-        use std::io::Write;
-        let file = std::fs::OpenOptions::new().append(true).open(path)?;
-        let mut w = std::io::BufWriter::new(file);
-        w.write_all(&(shapes.len() as u64).to_le_bytes())?;
-        for shape in shapes {
-            w.write_all(&(shape.len() as u64).to_le_bytes())?;
-            for ring in shape {
-                w.write_all(&(ring.len() as u64).to_le_bytes())?;
-                let mut buffer = [0u8; 8192];
-                for points in ring.chunks(512) {
-                    for (point, bytes) in
-                        points.iter().zip(buffer.as_chunks_mut::<16>().0.iter_mut())
-                    {
-                        bytes[..8].copy_from_slice(&point[0].to_bits().to_le_bytes());
-                        bytes[8..].copy_from_slice(&point[1].to_bits().to_le_bytes());
-                    }
-                    w.write_all(&buffer[..points.len() * 16])?;
+        let mut out = FrameStage {
+            buf: [0; 8192],
+            len: 0,
+            freed: 0,
+            file: None,
+            open: Some(open),
+        };
+        out.put(&(shapes.len() as u64).to_le_bytes())?;
+        for shape in shapes.iter_mut() {
+            out.put(&(shape.len() as u64).to_le_bytes())?;
+            for ring in shape.iter_mut() {
+                out.put(&(ring.len() as u64).to_le_bytes())?;
+                for point in ring.iter() {
+                    let mut bytes = [0u8; 16];
+                    bytes[..8].copy_from_slice(&point[0].to_bits().to_le_bytes());
+                    bytes[8..].copy_from_slice(&point[1].to_bits().to_le_bytes());
+                    out.put(&bytes)?;
                 }
+                out.freed += ring.capacity() * std::mem::size_of::<[f64; 2]>();
+                *ring = Vec::new();
+            }
+            out.freed += shape.capacity() * std::mem::size_of::<Ring>();
+            *shape = Vec::new();
+        }
+        out.freed += shapes.capacity() * std::mem::size_of::<Shape>();
+        *shapes = Vec::new();
+        out.put(&(credits.len() as u64).to_le_bytes())?;
+        for credit in credits.iter() {
+            for value in [credit.area, credit.at[0], credit.at[1]] {
+                out.put(&value.to_bits().to_le_bytes())?;
             }
         }
-        w.write_all(&(credits.len() as u64).to_le_bytes())?;
-        let mut buffer = [0u8; 8184];
-        for chunk in credits.chunks(341) {
-            for (credit, bytes) in chunk.iter().zip(buffer.as_chunks_mut::<24>().0.iter_mut()) {
-                for (value, word) in [credit.area, credit.at[0], credit.at[1]]
-                    .iter()
-                    .zip(bytes.as_chunks_mut::<8>().0.iter_mut())
-                {
-                    word.copy_from_slice(&value.to_bits().to_le_bytes());
-                }
-            }
-            w.write_all(&buffer[..chunk.len() * 24])?;
-        }
-        w.flush()?;
-        Ok(())
+        out.freed += credits.capacity() * std::mem::size_of::<Collapsed>();
+        *credits = Vec::new();
+        out.flush()
     }
 
     #[cfg(test)]
@@ -1815,7 +1870,7 @@ impl ZoomCommit {
     fn commit(
         &mut self,
         key: u64,
-        tile: &TileFill,
+        tile: &mut TileFill,
         step: PyramidStep,
         queued: usize,
         others: usize,
@@ -1855,18 +1910,19 @@ impl ZoomCommit {
             let parent = crate::pmtiles_writer::tile_id(step.zoom - 1, x / 2, y / 2);
             let mut lifted_here = Vec::new();
             lift_into_parent(&tile.fill, x & 1, y & 1, &mut lifted_here);
+            let lifted_bytes = shape_capacity_bytes(&lifted_here);
             let lifted = if tile.fill.is_empty() {
-                &tile.lifted
+                &mut tile.lifted
             } else {
-                &lifted_here
+                &mut lifted_here
             };
             self.parents.append(
                 parent,
                 lifted,
-                &[],
+                &mut Vec::new(),
                 (queued * 512)
                     .saturating_add(tile_bytes)
-                    .saturating_add(shape_capacity_bytes(&lifted_here))
+                    .saturating_add(lifted_bytes)
                     .saturating_add(self.map_bytes)
                     .saturating_add(self.snapped.resident_bytes())
                     .saturating_add(others),
@@ -2001,8 +2057,10 @@ fn slide_commit(
         s.in_flight -= 1;
         let others = s.in_flight * (share + 512);
         let queued = s.queue.len();
-        let committed =
-            result.and_then(|tile| s.commit.commit(key, &tile, step, queued, others, workspace));
+        let committed = result.and_then(|mut tile| {
+            s.commit
+                .commit(key, &mut tile, step, queued, others, workspace)
+        });
         consumed.push(path);
         if let Err(error) = committed {
             s.error = Some(error);
@@ -2051,7 +2109,7 @@ fn pyramid_slide(
             break;
         };
         let reserved = commit.fixed(buckets.tiles.len()) + 512;
-        let tile = pyramid_tile(
+        let mut tile = pyramid_tile(
             &path,
             key,
             step,
@@ -2060,7 +2118,7 @@ fn pyramid_slide(
             reserved,
             false,
         )?;
-        commit.commit(key, &tile, step, buckets.tiles.len(), 512, workspace)?;
+        commit.commit(key, &mut tile, step, buckets.tiles.len(), 512, workspace)?;
     }
     Ok(())
 }
@@ -2253,9 +2311,10 @@ fn seed_batch(
         .saturating_add((buckets.tiles.len() + new_runs) * 512)
         .saturating_add(pending.len() * std::mem::size_of::<(&u64, &Bucket)>());
     if held.saturating_add(RUN_WRITER_BYTES) > buckets.budget {
-        // #830: each write is charged its bucket, the buckets still waiting
-        // behind it and its writer, beside the runs' nodes. Largest first,
-        // so the waiting bytes fall fastest while new runs add their nodes;
+        // #830: each write is charged the buckets still waiting, its own
+        // bucket less what its encoding has freed, and the runs' nodes. The
+        // writes that free the most net of a new node go first, so the charge
+        // stays within the check above until only the runs' nodes are left;
         // write order between tiles is immaterial.
         let mut serial: Vec<(u64, Bucket, usize)> = pending
             .into_iter()
@@ -2265,17 +2324,18 @@ fn seed_batch(
                 (key, (shapes, credits), bytes)
             })
             .collect();
-        serial.sort_by_key(|&(key, _, bytes)| (std::cmp::Reverse(bytes), key));
+        serial.sort_by_key(|&(key, _, bytes)| {
+            let node = if buckets.tiles.contains_key(&key) {
+                0
+            } else {
+                512
+            };
+            (std::cmp::Reverse(bytes + 512 - node), key)
+        });
         let mut waiting = pending_bytes;
-        for (key, (shapes, credits), bytes) in serial {
+        for (key, (mut shapes, mut credits), bytes) in serial {
+            buckets.append(key, &mut shapes, &mut credits, waiting)?;
             waiting -= bytes;
-            #[cfg(test)]
-            cost_probe::update(|c| {
-                c.seed_serial_peak = c
-                    .seed_serial_peak
-                    .max(waiting + bytes + RUN_WRITER_BYTES + (buckets.tiles.len() + 1) * 512);
-            });
-            buckets.append(key, &shapes, &credits, waiting + bytes + RUN_WRITER_BYTES)?;
         }
         return Ok(());
     }
@@ -2295,23 +2355,19 @@ fn seed_batch(
         .max(1);
     #[cfg(test)]
     cost_probe::update(|c| c.seed_frame_writers = c.seed_frame_writers.max(writers));
-    let frames: Vec<_> = pending.iter().collect();
+    // The writers free each frame's rings as they encode them.
+    let mut frames: Vec<_> = pending.iter_mut().collect();
     let runs = &buckets.tiles;
-    let write = |chunk: &[(&u64, &Bucket)]| {
-        chunk.iter().try_for_each(|(key, (shapes, credits))| {
-            SpillBuckets::write_frame(&runs[*key], shapes, credits)
+    let write = |chunk: &mut [(&u64, &mut Bucket)]| {
+        chunk.iter_mut().try_for_each(|(key, (shapes, credits))| {
+            SpillBuckets::write_frame(shapes, credits, |_| Ok(open_run(&runs[*key])?))
         })
     };
     if writers > 1 {
-        frames
-            .par_chunks(frames.len().div_ceil(writers))
-            .try_for_each(write)?;
+        let chunk = frames.len().div_ceil(writers);
+        frames.par_chunks_mut(chunk).try_for_each(write)?;
     } else {
-        write(&frames)?;
-    }
-    drop(frames);
-    if wide {
-        pending.into_par_iter().for_each(drop);
+        write(&mut frames)?;
     }
     Ok(())
 }
@@ -2639,7 +2695,7 @@ pub(super) mod tests {
         let opts = super::super::ExportOptions::default();
         let mut runs = SpillBuckets::new(&opts, WORKSPACE_FLOOR_BYTES);
         for key in 1..=4 {
-            runs.append(key, &[square(10.0, 10.0, 100.0)], &[], 0)
+            runs.append(key, &mut vec![square(10.0, 10.0, 100.0)], &mut vec![], 0)
                 .unwrap();
         }
         let mut paths: Vec<_> = std::mem::take(&mut runs.tiles).into_values().collect();
@@ -2724,7 +2780,7 @@ pub(super) mod tests {
             } else {
                 square(10.0, 10.0, 100.0)
             };
-            runs.append(key, &[shape], &[], 0).unwrap();
+            runs.append(key, &mut vec![shape], &mut vec![], 0).unwrap();
         }
         runs
     }
@@ -2930,8 +2986,8 @@ pub(super) mod tests {
         for area in [1e16, -1e16, 1.0] {
             runs.append(
                 7,
-                &shapes,
-                &[Collapsed {
+                &mut shapes.clone(),
+                &mut vec![Collapsed {
                     area,
                     at: [3.0, 2.0],
                 }],
@@ -2989,7 +3045,8 @@ pub(super) mod tests {
         };
         let workspace = WORKSPACE_FLOOR_BYTES;
         let mut runs = SpillBuckets::new(&opts, workspace);
-        runs.append(9, &[square(0.0, 0.0, 10.0)], &[], 0).unwrap();
+        runs.append(9, &mut vec![square(0.0, 0.0, 10.0)], &mut vec![], 0)
+            .unwrap();
         runs.budget = 32;
         assert!(matches!(
             runs.pop_first(0).unwrap_err(),
@@ -3330,7 +3387,7 @@ pub(super) mod tests {
             at: [5.0, 6.0],
         };
         buckets
-            .append(7, std::slice::from_ref(&shape), &[credit], 0)
+            .append(7, &mut vec![shape.clone()], &mut vec![credit], 0)
             .unwrap();
         let path = buckets.tiles[&7].to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -3500,23 +3557,22 @@ pub(super) mod tests {
             &mut features,
         )
         .expect_err("the merged bucket outgrows its pieces");
-        // The serial seed's own checks: the pending geometry, then each
-        // write's bucket, the buckets waiting behind it and its writer beside
-        // the runs' nodes (#830). It frees each bucket as it writes it, so
-        // the batched writer, which holds them all at once, does not run here.
-        let budget = usize::try_from(pending).unwrap() + 512 + RUN_WRITER_BYTES;
+        // The serial seed's own checks: the pending geometry, then each new
+        // run's node on its own. It frees each bucket as it writes it, so
+        // the batched writer, which holds them all beside the runs and a
+        // writer, does not run here.
+        let budget = usize::try_from(pending).unwrap().max(512);
         cost_probe::take();
         seed_z4(&batch, &mut SpillBuckets::new(&opts, budget), &mut features).unwrap();
         assert_eq!(cost_probe::take().seed_frame_writers, 0);
         // With room for all of it, the batched writer runs.
-        let room = budget + 64;
+        let room = budget + 512 + RUN_WRITER_BYTES + 64;
         seed_z4(&batch, &mut SpillBuckets::new(&opts, room), &mut features).unwrap();
         assert_eq!(cost_probe::take().seed_frame_writers, 1);
     }
 
     /// #830: the serial seed charges the buckets still waiting behind each
-    /// write. Many small buckets ahead of one large one in key order held
-    /// every small run's node beside the large bucket, past the grant.
+    /// write and still completes in the grant main did, inside it.
     #[test]
     fn the_serial_seed_counts_the_buckets_waiting_to_be_written() {
         let opts = super::super::ExportOptions::default();
@@ -3550,19 +3606,25 @@ pub(super) mod tests {
             .collect();
         let batch = geometry_batch(&geoms);
         let mut features = 0;
-        // The tightest grant the seed completes in: its checks pass, and the
-        // batched writer does not fit, so the serial seed runs.
-        let (mut lo, mut hi) = (0usize, 1usize << 24);
-        while lo + 1 < hi {
-            let mid = lo.midpoint(hi);
-            match seed_z4(&batch, &mut SpillBuckets::new(&opts, mid), &mut features) {
-                Ok(()) => hi = mid,
-                Err(_) => lo = mid,
-            }
-        }
-        let budget = hi;
+        // The grant main completes in: the window's pending geometry, and
+        // every run's node. Main wrote in key order and charged neither the
+        // waiting buckets nor its writer, so it held up to every small run's
+        // node beside the large bucket, past this grant.
+        let pieces = seed_z4(&batch, &mut SpillBuckets::new(&opts, 0), &mut features)
+            .expect_err("nothing fits a zero budget");
+        let pending = seed_z4(
+            &batch,
+            &mut SpillBuckets::new(&opts, usize::try_from(pieces).unwrap()),
+            &mut features,
+        )
+        .map_or_else(
+            |needed| usize::try_from(needed).unwrap(),
+            |()| usize::try_from(pieces).unwrap(),
+        );
+        let budget = pending.max(tiles.len() * 512);
         cost_probe::take();
-        seed_z4(&batch, &mut SpillBuckets::new(&opts, budget), &mut features).unwrap();
+        seed_z4(&batch, &mut SpillBuckets::new(&opts, budget), &mut features)
+            .expect("the serial seed completes in main's grant");
         let counts = cost_probe::take();
         assert_eq!(counts.seed_frame_writers, 0, "the serial seed ran");
         assert!(
@@ -3587,7 +3649,9 @@ pub(super) mod tests {
             scale: 1.0,
         };
         let mut buckets = SpillBuckets::new(&opts, usize::MAX);
-        buckets.append(1, &[holed(2000)], &[], 0).unwrap();
+        buckets
+            .append(1, &mut vec![holed(2000)], &mut vec![], 0)
+            .unwrap();
         let (key, path) = buckets.tiles.pop_first().unwrap();
         let fill = pyramid_fill(&path, true, &timers, usize::MAX, 0).unwrap();
         let mut commit = ZoomCommit {
@@ -3608,7 +3672,7 @@ pub(super) mod tests {
         assert!(workspace < prepare_bound(&fill, true));
         // As the zoom loop builds a lone tile.
         let reserved = commit.fixed(0) + 512;
-        let tile = pyramid_tile(
+        let mut tile = pyramid_tile(
             &path,
             key,
             step,
@@ -3618,7 +3682,9 @@ pub(super) mod tests {
             false,
         )
         .unwrap();
-        commit.commit(key, &tile, step, 0, 512, workspace).unwrap();
+        commit
+            .commit(key, &mut tile, step, 0, 512, workspace)
+            .unwrap();
         assert_eq!(commit.tiles, 1);
     }
 
