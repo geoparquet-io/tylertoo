@@ -148,7 +148,8 @@ pub struct LayeredReport {
     pub filtered_rows: u64,
     /// Distinct tiles in the merged archive.
     pub total_tiles: usize,
-    /// The merge's own diagnostics.
+    /// A multipart input's schema warnings (each layer reads a copy of the
+    /// first part's footer), then the merge's own diagnostics.
     pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
 }
 
@@ -258,6 +259,69 @@ struct Staged {
     rows: u64,
 }
 
+/// What decides, before the split, which input rows reach a layer.
+struct Gates {
+    filter: Option<super::filter::BoundFilter>,
+    bbox: Option<super::convert::BboxQuery>,
+    /// The row groups whose footer statistics let the two through.
+    row_groups: Option<crate::input_set::RowGroupSelection>,
+}
+
+impl Gates {
+    /// `--filter` and `--bbox`, bound to the staged `schema`. They run once,
+    /// before the split, so the filter may read the routing column and the
+    /// layer limit counts only the rows they keep. The layers keep the bbox,
+    /// which then passes every row.
+    fn new(
+        source: &ConvertSource,
+        schema: &arrow_schema::Schema,
+        options: &super::convert::ConvertOptions,
+    ) -> Result<Self, ConvertError> {
+        let filter = super::convert::bind_attribute_filter(options, schema, &[])?;
+        let crs = source.resolved_schema()?.crs();
+        let bbox = options
+            .bbox
+            .zip(crs)
+            .map(|(b, crs)| super::convert::BboxQuery::new(&b, crs));
+        let row_groups = super::stream::select_row_groups_streaming(
+            source,
+            bbox.as_ref(),
+            filter.as_ref(),
+            None,
+            // Only a shard's bounds read the CRS, and there is no shard.
+            crs.unwrap_or(super::level::Crs::Epsg4326),
+        )?;
+        Ok(Self {
+            filter,
+            bbox,
+            row_groups,
+        })
+    }
+}
+
+/// The input's GeoParquet version verdict over all its parts, and a
+/// multipart input's schema warnings. A staged file carries the first
+/// part's footer, so its layers would report that part's alone.
+fn provenance(
+    source: &ConvertSource,
+) -> Result<
+    (
+        crate::resolved_schema::GeoVersion,
+        Vec<crate::diagnostics::Diagnostic>,
+    ),
+    InputError,
+> {
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    source.record_diagnostics(&diagnostics);
+    let version = crate::resolved_schema::GeoVersion::of_parts(
+        source
+            .resolved_schemas()?
+            .iter()
+            .map(|r| r.declared_version()),
+    );
+    Ok((version, diagnostics.snapshot()))
+}
+
 /// Read `source` once and write each layer's rows that the filter and the
 /// bbox keep, every column included, to its own GeoParquet file in `dir`.
 /// Layers come back in name order, with the number of rows the two dropped.
@@ -271,10 +335,7 @@ fn split(
     source: &ConvertSource,
     schema: &SchemaRef,
     idx: usize,
-    (filter, bbox): (
-        Option<&super::filter::BoundFilter>,
-        Option<&super::convert::BboxQuery>,
-    ),
+    gates: &Gates,
     dir: &Path,
     batch_size: usize,
 ) -> Result<(Vec<Staged>, u64), LayerColumnError> {
@@ -288,6 +349,7 @@ fn split(
         message: e.to_string(),
     };
 
+    let (filter, bbox) = (gates.filter.as_ref(), gates.bbox.as_ref());
     // The bbox's geometry column, restated in the staged schema.
     let geom = match bbox {
         Some(_) => source
@@ -296,19 +358,16 @@ fn split(
             .and_then(|name| schema.index_of(name).ok()),
         None => None,
     };
-    let row_groups = bbox
-        .map(|q| source.select_row_groups_any(q.boxes()))
-        .transpose()?;
+    let row_groups = gates.row_groups.as_ref();
 
     let mut layers: BTreeMap<String, StagedWriter> = BTreeMap::new();
-    // The rows of the row groups the bbox prunes count as dropped too.
-    let pruned =
-        source.selected_row_count(None)? - source.selected_row_count(row_groups.as_ref())?;
+    // The rows of the row groups the gates prune count as dropped too.
+    let pruned = source.selected_row_count(None)? - source.selected_row_count(row_groups)?;
     let mut filtered = u64::try_from(pruned).unwrap_or(0);
     let stream = source.open_stream(&ReadPlan {
         batch_size,
         projection: None,
-        row_groups: row_groups.as_ref(),
+        row_groups,
     })?;
     for batch in stream {
         let batch = batch?;
@@ -563,26 +622,16 @@ pub(super) fn convert_by_layer(
     let idx = schema
         .index_of(column)
         .expect("the routing column is staged");
-    let filter = super::convert::bind_attribute_filter(&options.convert, &schema, &[])
-        .map_err(TilesError::Convert)?;
-
-    // `--bbox` too, so the layer limit counts only the rows it keeps. The
-    // layers keep it, which re-tests rows that all pass.
-    let crs = source
-        .resolved_schema()
-        .map_err(|e| TilesError::Convert(e.into()))?
-        .crs();
-    let bbox = convert
-        .bbox
-        .zip(crs)
-        .map(|(b, crs)| super::convert::BboxQuery::new(&b, crs));
+    let gates = Gates::new(&source, &schema, &options.convert).map_err(TilesError::Convert)?;
+    let (geo_version, input_diagnostics) =
+        provenance(&source).map_err(|e| TilesError::Convert(e.into()))?;
 
     let dir = super::tiles::intermediate_dir(options, output);
     let (staged, filtered_rows) = split(
         &source,
         &schema,
         idx,
-        (filter.as_ref(), bbox.as_ref()),
+        &gates,
         &dir,
         options.convert.read_batch_size,
     )?;
@@ -625,7 +674,7 @@ pub(super) fn convert_by_layer(
             layer: layer.name.clone(),
             source: Box::new(e),
         };
-        let report = match super::tiles::convert_to_pmtiles_validated(
+        let mut report = match super::tiles::convert_to_pmtiles_validated(
             &staged_input,
             || staged_input.source(),
             &archive,
@@ -664,6 +713,7 @@ pub(super) fn convert_by_layer(
             ),
             archive,
         ));
+        report.convert.geo_version = geo_version.clone();
         layers.push(LayerReport {
             layer: layer.name,
             input_rows: layer.rows,
@@ -691,7 +741,10 @@ pub(super) fn convert_by_layer(
         empty_layers,
         filtered_rows,
         total_tiles: merged.total_tiles,
-        diagnostics: merged.diagnostics,
+        diagnostics: input_diagnostics
+            .into_iter()
+            .chain(merged.diagnostics)
+            .collect(),
     })))
 }
 
@@ -968,6 +1021,7 @@ mod tests {
             panic!("expected a layered outcome, got {outcome:?}");
         };
         assert_eq!(report.layers.len(), 1);
+        assert_eq!(report.filtered_rows, MAX_LAYERS as u64);
 
         // And the layers `--bbox` keeps: v0..v4 lie at x = -30..-26.
         let mut boxed = super::tests::options("crop");
@@ -1155,6 +1209,53 @@ mod tests {
                 "{geo:?}: {at_z3:?}"
             );
         }
+    }
+
+    /// Staged files carry the first part's footer, so a multipart input's
+    /// version verdict and schema warnings are taken from every part.
+    #[test]
+    fn a_multipart_input_keeps_every_part_s_version() {
+        use crate::diagnostics::{CrsWarning, Diagnostic};
+        use crate::resolved_schema::GeoVersion;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parts = dir.path().join("parts");
+        std::fs::create_dir(&parts).unwrap();
+        for (file, version, crop) in [
+            ("a.parquet", "1.1.0", "soy"),
+            ("b.parquet", "3.0.0", "corn"),
+        ] {
+            let geo = format!(
+                r#"{{"version":"{version}","primary_column":"geometry","columns":{{"geometry":{{"encoding":"WKB","geometry_types":[]}}}}}}"#
+            );
+            write_native_input(
+                &parts.join(file),
+                "OGC:CRS84",
+                &[(10.0, 10.0, crop)],
+                &[("geo", geo)],
+            );
+        }
+        let outcome = convert_to_pmtiles(
+            &TilesInput::Path(parts),
+            &dir.path().join("o.pmtiles"),
+            &options("crop"),
+        )
+        .unwrap();
+        let TilesOutcome::Layered(report) = outcome else {
+            panic!("expected a layered outcome, got {outcome:?}");
+        };
+        let mixed = GeoVersion::Mixed(vec![Some("1.1.0".into()), Some("3.0.0".into())]);
+        for layer in &report.layers {
+            assert_eq!(layer.report.convert.geo_version, mixed, "{}", layer.layer);
+        }
+        assert!(
+            report.diagnostics.iter().any(|d| matches!(
+                d,
+                Diagnostic::CrsMetadata { reason: CrsWarning::UnknownVersion(v), .. } if v == "3.0.0"
+            )),
+            "{:?}",
+            report.diagnostics
+        );
     }
 
     #[test]
