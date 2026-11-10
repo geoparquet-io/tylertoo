@@ -4446,6 +4446,13 @@ impl std::ops::Deref for MemberGeom {
     }
 }
 
+/// A feature's share of one tile: the feature whole, when the tile's
+/// buffered bounds hold it, or its clip.
+enum TilePiece {
+    Whole,
+    Clipped(Geometry<f64>),
+}
+
 impl From<Geometry<f64>> for MemberGeom {
     fn from(g: Geometry<f64>) -> Self {
         MemberGeom::Owned(g)
@@ -5672,8 +5679,7 @@ fn fanout_batch_members(
             .par_iter()
             .map(|g| {
                 ExportTimers::time(&timers.clip, || {
-                    let g = finest_zoom_geometry(g, finest, opts, diagnostics);
-                    feature_tile_members(&g, plan.zoom, opts, 0, u64::MAX, diagnostics)
+                    shared_tile_members(g, finest, plan.zoom, opts, (0, u64::MAX), diagnostics)
                 })
             })
             .collect();
@@ -5689,7 +5695,7 @@ fn fanout_batch_members(
                     Member {
                         key,
                         seq: *seq + row as u64,
-                        geom: shared_or_owned(geom, &geoms[row]),
+                        geom,
                         props: Arc::clone(props),
                         id: *id,
                         gap,
@@ -5706,25 +5712,9 @@ fn fanout_batch_members(
     Ok(())
 }
 
-/// `clipped` as a member geometry: the feature's shared `source` when the
-/// clip left it whole, bit for bit, else its own.
-fn shared_or_owned(clipped: Geometry<f64>, source: &Arc<Geometry<f64>>) -> MemberGeom {
-    let same_bits = || {
-        clipped
-            .coords_iter()
-            .zip(source.coords_iter())
-            .all(|(a, b)| a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits())
-    };
-    if clipped == **source && same_bits() {
-        MemberGeom::Shared(Arc::clone(source))
-    } else {
-        MemberGeom::Owned(clipped)
-    }
-}
-
 /// Per row of a batch, the row's `(key, clipped geometry)` members at one
 /// target level.
-type RowMembers = Vec<Vec<(u64, Geometry<f64>)>>;
+type RowMembers = Vec<TileMembers>;
 
 /// A feature's MVT properties, shared across its tile members.
 ///
@@ -7128,7 +7118,7 @@ fn finest_zoom_geometry<'g>(
 }
 
 /// One feature's clipped pieces, one per tile key.
-type TileMembers = Vec<(u64, Geometry<f64>)>;
+type TileMembers = Vec<(u64, MemberGeom)>;
 
 /// A group of consecutive read batches, decoded and clipped by
 /// [`clip_group`], waiting for [`finish_group`] to append their members to
@@ -7152,8 +7142,9 @@ type TileMembers = Vec<(u64, Geometry<f64>)>;
 struct ClippedGroup {
     batches: Vec<RecordBatch>,
     geom_idxs: Vec<usize>,
-    /// The decoded geometries, kept for the in-order gap walk.
-    geoms: Vec<Vec<Geometry<f64>>>,
+    /// The decoded geometries, kept for the in-order gap walk; members that
+    /// hold a feature whole share them.
+    geoms: Vec<Vec<Arc<Geometry<f64>>>>,
     /// Per batch, per row: the row's `(key, clipped geometry)` members.
     row_members: Vec<Vec<TileMembers>>,
 }
@@ -7173,10 +7164,13 @@ fn clip_group(
         .iter()
         .map(|b| batch_geometry_index(b, ctx.published.geometry.as_deref()))
         .collect::<Result<_, _>>()?;
-    let geoms: Vec<Vec<Geometry<f64>>> = batches
+    let geoms: Vec<Vec<Arc<Geometry<f64>>>> = batches
         .par_iter()
         .zip(&geom_idxs)
-        .map(|(b, &gi)| decode_batch_geometries(b, &b.schema(), gi, ctx.crs, timers, diagnostics))
+        .map(|(b, &gi)| {
+            decode_batch_geometries(b, &b.schema(), gi, ctx.crs, timers, diagnostics)
+                .map(|geoms| geoms.into_iter().map(Arc::new).collect())
+        })
         .collect::<Result<_, _>>()?;
     // The canonical level's own zoom, not `ctx.zoom`: a variable-depth probe
     // clips canonical geometry at an ancestor's zoom (#803).
@@ -7192,13 +7186,12 @@ fn clip_group(
                 .par_iter()
                 .map(|g| {
                     ExportTimers::time(&timers.clip, || {
-                        let g = finest_zoom_geometry(g, finest_zoom, ctx.opts, diagnostics);
-                        let mut members = feature_tile_members(
-                            &g,
+                        let mut members = shared_tile_members(
+                            g,
+                            finest_zoom,
                             ctx.zoom,
                             ctx.opts,
-                            key_lo,
-                            key_hi,
+                            (key_lo, key_hi),
                             diagnostics,
                         );
                         if let Some(tiles) = ctx.tiles {
@@ -7390,7 +7383,7 @@ struct ChunkMembers {
 fn collect_member_chunk(
     input: &ChunkInput<'_>,
     first: usize,
-    items: &mut [Vec<(u64, Geometry<f64>)>],
+    items: &mut [TileMembers],
 ) -> Result<ChunkMembers, ExportError> {
     #[cfg(test)]
     if rayon::current_thread_index().is_none() {
@@ -7423,7 +7416,7 @@ fn collect_member_chunk(
             out.buckets[route_partition(input.wave, key)].push(Member {
                 key,
                 seq: source_row,
-                geom: geom.into(),
+                geom,
                 props: Arc::clone(&props),
                 id,
                 gap,
@@ -7476,14 +7469,14 @@ fn collect_member_chunk(
 /// 180°–181° part at -180°…-179° in the west-edge tile. Where two copies land
 /// in one tile (z0 holds the whole world), their pieces join into one
 /// multi-geometry, so a feature still emits at most one member per key.
-fn feature_tile_members(
+fn feature_tile_pieces(
     geom: &Geometry<f64>,
     zoom: u8,
     opts: &ExportOptions,
     key_lo: u64,
     key_hi: u64,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Vec<(u64, Geometry<f64>)> {
+) -> Vec<(u64, TilePiece)> {
     let Some(rect) = geom.bounding_rect() else {
         return Vec::new();
     };
@@ -7526,13 +7519,72 @@ fn feature_tile_members(
             &mut out,
         );
         for (key, piece) in out.drain(..) {
+            let piece = match piece {
+                TilePiece::Whole => copy.clone().into_owned(),
+                TilePiece::Clipped(g) => g,
+            };
             match by_key.remove(&key) {
                 Some(prev) => by_key.insert(key, join_wrapped_pieces(prev, piece)),
                 None => by_key.insert(key, piece),
             };
         }
     }
-    by_key.into_iter().collect()
+    by_key
+        .into_iter()
+        .map(|(key, g)| (key, TilePiece::Clipped(g)))
+        .collect()
+}
+
+/// [`feature_tile_pieces`] with each whole piece a copy of `geom`.
+fn feature_tile_members(
+    geom: &Geometry<f64>,
+    zoom: u8,
+    opts: &ExportOptions,
+    key_lo: u64,
+    key_hi: u64,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<(u64, Geometry<f64>)> {
+    feature_tile_pieces(geom, zoom, opts, key_lo, key_hi, diagnostics)
+        .into_iter()
+        .map(|(key, piece)| match piece {
+            TilePiece::Whole => (key, geom.clone()),
+            TilePiece::Clipped(g) => (key, g),
+        })
+        .collect()
+}
+
+/// `source`'s members at `zoom`, at its finest-zoom simplification when
+/// `finest` is set, as member geometries. Every tile that holds the feature
+/// whole shares one geometry, the decoded `source` itself unless simplified,
+/// instead of holding its own copy (manby holds each feature once; the copies
+/// were a third of a Moldova export's peak live heap).
+fn shared_tile_members(
+    source: &Arc<Geometry<f64>>,
+    finest: Option<u8>,
+    zoom: u8,
+    opts: &ExportOptions,
+    (key_lo, key_hi): (u64, u64),
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<(u64, MemberGeom)> {
+    let g = finest_zoom_geometry(source, finest, opts, diagnostics);
+    let pieces = feature_tile_pieces(&g, zoom, opts, key_lo, key_hi, diagnostics);
+    let whole = pieces
+        .iter()
+        .any(|(_, piece)| matches!(piece, TilePiece::Whole))
+        .then(|| match g {
+            std::borrow::Cow::Borrowed(_) => Arc::clone(source),
+            std::borrow::Cow::Owned(g) => Arc::new(g),
+        });
+    pieces
+        .into_iter()
+        .map(|(key, piece)| match piece {
+            TilePiece::Whole => (
+                key,
+                MemberGeom::Shared(Arc::clone(whole.as_ref().expect("a whole piece"))),
+            ),
+            TilePiece::Clipped(g) => (key, MemberGeom::Owned(g)),
+        })
+        .collect()
 }
 
 /// Longitude shift of each world copy of a feature with `bbox` that reaches
@@ -7646,7 +7698,7 @@ fn copy_tile_members(
     geom: &Geometry<f64>,
     bbox: &TileBounds,
     inputs: TileTarget<'_>,
-    out: &mut Vec<(u64, Geometry<f64>)>,
+    out: &mut Vec<(u64, TilePiece)>,
 ) {
     let TileTarget {
         zoom,
@@ -7857,7 +7909,7 @@ fn feature_tile_members_direct(
     bbox: &TileBounds,
     inputs: TileTarget<'_>,
     ranges: &BboxTileRanges,
-    out: &mut Vec<(u64, Geometry<f64>)>,
+    out: &mut Vec<(u64, TilePiece)>,
 ) {
     let TileTarget {
         zoom,
@@ -7875,7 +7927,7 @@ fn feature_tile_members_direct(
         let tb = tc.bounds();
         let buffer_deg = tb.width() * buffer_fraction(opts);
         if bbox_within_buffered(bbox, &tb, buffer_deg) {
-            out.push((key, geom.clone()));
+            out.push((key, TilePiece::Whole));
         } else if let Some(clipped) = clip_geometry_simple(
             geom,
             &tb,
@@ -7884,7 +7936,7 @@ fn feature_tile_members_direct(
             opts.simple_clip_fastpath,
             diagnostics,
         ) {
-            out.push((key, clipped));
+            out.push((key, TilePiece::Clipped(clipped)));
         }
     }
 }
@@ -7961,7 +8013,7 @@ fn split_feature_into_tiles(
     cur_bbox: &TileBounds,
     inputs: TileTarget<'_>,
     ranges: &BboxTileRanges,
-    out: &mut Vec<(u64, Geometry<f64>)>,
+    out: &mut Vec<(u64, TilePiece)>,
 ) {
     let TileTarget {
         zoom,
@@ -7992,7 +8044,7 @@ fn split_feature_into_tiles(
         // `geom.clone()` byte-for-byte, since every ancestor also fast-pathed
         // and `cur` is still the original geometry.
         if bbox_within_buffered(cur_bbox, &tb, buffer_deg) {
-            out.push((key, cur.clone()));
+            out.push((key, TilePiece::Clipped(cur.clone())));
         } else if let Some(clipped) = clip_geometry_simple(
             cur,
             &tb,
@@ -8001,7 +8053,7 @@ fn split_feature_into_tiles(
             opts.simple_clip_fastpath,
             diagnostics,
         ) {
-            out.push((key, clipped));
+            out.push((key, TilePiece::Clipped(clipped)));
         }
         return;
     }
@@ -8077,7 +8129,7 @@ fn fanout_children(
     child_bbox: &TileBounds,
     inputs: TileTarget<'_>,
     ranges: &BboxTileRanges,
-    out: &mut Vec<(u64, Geometry<f64>)>,
+    out: &mut Vec<(u64, TilePiece)>,
 ) {
     let TileTarget {
         zoom,
@@ -8095,7 +8147,7 @@ fn fanout_children(
     {
         #[cfg(test)]
         CASCADE_FORKS.with(|c| c.set(c.get() + 1));
-        let subtrees: Vec<Vec<(u64, Geometry<f64>)>> = children
+        let subtrees: Vec<Vec<(u64, TilePiece)>> = children
             .par_iter()
             .map(|&child| {
                 let mut members = Vec::new();
@@ -8173,7 +8225,12 @@ fn members_direct_vec(
         &ranges,
         &mut out,
     );
-    out
+    out.into_iter()
+        .map(|(key, piece)| match piece {
+            TilePiece::Whole => (key, geom.clone()),
+            TilePiece::Clipped(g) => (key, g),
+        })
+        .collect()
 }
 
 /// Test helper: run the recursive cascade unconditionally (bypassing the
@@ -8211,7 +8268,12 @@ fn members_recursive_vec(
         &ranges,
         &mut out,
     );
-    out
+    out.into_iter()
+        .map(|(key, piece)| match piece {
+            TilePiece::Whole => (key, geom.clone()),
+            TilePiece::Clipped(g) => (key, g),
+        })
+        .collect()
 }
 
 /// Within-tile feature order (#361).
@@ -14577,6 +14639,31 @@ mod tests {
         }
     }
 
+    /// Every tile that holds a feature whole shares the decoded geometry
+    /// instead of holding its own copy (manby holds each feature once).
+    #[test]
+    fn tiles_holding_a_feature_whole_share_its_geometry() {
+        let opts = ExportOptions::default();
+        let zoom = 4;
+        // On the x=7 | x=8 border: inside both tiles' buffers.
+        let source = Arc::new(Geometry::Point(geo::Point::new(1e-6, 10.0)));
+        let members = shared_tile_members(
+            &source,
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(members.len(), 2);
+        for (key, geom) in &members {
+            let MemberGeom::Shared(g) = geom else {
+                panic!("tile {key} holds its own copy");
+            };
+            assert!(Arc::ptr_eq(g, &source));
+        }
+    }
+
     /// Tile buffers continue across the antimeridian. A point just west of
     /// +180° sits inside the buffer of the westmost tile column, so that tile
     /// carries it too. tippecanoe does the same: its z0 clip copies every
@@ -20429,7 +20516,7 @@ mod tests {
             locator: &locator,
             first_read: 0,
         };
-        let mut items: Vec<Vec<(u64, Geometry<f64>)>> = vec![Vec::new(); 3];
+        let mut items: Vec<TileMembers> = (0..3).map(|_| Vec::new()).collect();
         assert!(rayon::current_thread_index().is_none());
         collect_member_chunk(&input, 0, &mut items).unwrap();
         collect_member_chunk(&input, 1, &mut items[1..]).unwrap();
