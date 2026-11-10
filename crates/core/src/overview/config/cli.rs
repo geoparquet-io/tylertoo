@@ -766,6 +766,15 @@ pub fn default_zooms(options: &ConvertOptions) -> (u8, u8) {
     }
 }
 
+/// The export defaults a `tiles` command line starts from, before its
+/// explicit export flags: `--verbatim`'s, then `--preset`'s (#822).
+pub fn tiles_export_defaults(args: &TilesArgs) -> ExportOptions {
+    super::Preset::export(
+        args.tuning.syntax.preset,
+        TilesOptions::export_defaults(args.tuning.syntax.verbatim),
+    )
+}
+
 ///
 /// # Errors
 /// Returns a specific configuration error for invalid syntax or option values.
@@ -786,10 +795,7 @@ pub fn tiles_options(args: &TilesArgs) -> Result<TilesOptions, TilesError> {
         .map_err(TilesError::Convert)?;
     // LOCKSTEP with the plan's placeholder zoom: see `keywords::convert`.
     convert.auto_max_zoom = args.max_zoom.is_auto();
-    let export = args.export.apply(super::Preset::export(
-        args.tuning.syntax.preset,
-        TilesOptions::export_defaults(args.tuning.syntax.verbatim),
-    ));
+    let export = args.export.apply(tiles_export_defaults(args));
     Ok(TilesOptions {
         convert,
         export: ExportOptions {
