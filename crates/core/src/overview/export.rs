@@ -4188,7 +4188,6 @@ fn write_tile(
     tally.encode_quantized += t.encode_quantized;
     tally.valve.merged += t.valve.merged;
     tally.valve.dropped += t.valve.dropped;
-    tally.valve.over_limit += t.valve.over_limit;
     tally.valve.passes = tally.valve.passes.max(t.valve.passes);
     tally.valve_passes += u64::from(t.valve.passes);
     tally.fill.polygons += t.fill.polygons;
@@ -4202,6 +4201,7 @@ fn write_tile(
         if t.oversized {
             tally.oversized += 1;
         }
+        tally.valve.over_limit += t.valve.over_limit;
         writer.add_tile_precompressed(
             crate::tile::TileCoord {
                 z: zoom,
@@ -5534,8 +5534,8 @@ fn fanout_batch_members(
                 .par_iter()
                 .map(|g| {
                     ExportTimers::time(&timers.clip, || {
-                        let finest = k + 1 == plans.len();
-                        let g = finest_zoom_geometry(g, finest, plans[k].zoom, opts, diagnostics);
+                        let finest = (k + 1 == plans.len()).then_some(plans[k].zoom);
+                        let g = finest_zoom_geometry(g, finest, opts, diagnostics);
                         feature_tile_members(&g, plans[k].zoom, opts, 0, u64::MAX, diagnostics)
                     })
                 })
@@ -6999,10 +6999,11 @@ fn decode_geometry_chunk(
         .collect())
 }
 
-/// A feature of the finest level, simplified for its zoom by
-/// [`ExportOptions::max_zoom_simplify_factor`] (#814): `factor × gsd(zoom)`,
-/// the tolerance `--simplify-factor` gives every coarser level. Borrowed
-/// unchanged at every other level, and with the option off.
+/// A feature of the finest level, simplified by
+/// [`ExportOptions::max_zoom_simplify_factor`] (#814): `factor × gsd(z)` at
+/// that level's zoom `finest_zoom`, the tolerance `--simplify-factor` gives
+/// every coarser level. Borrowed unchanged at other levels (`None`) and with
+/// the option off.
 ///
 /// DIVERGENCE FROM TIPPECANOE: tippecanoe's `-S` simplifies each tile's
 /// clipped geometry, at every zoom, in tile units (`tile.cpp`,
@@ -7012,13 +7013,12 @@ fn decode_geometry_chunk(
 /// under the tolerance keeps its own geometry rather than being dropped.
 fn finest_zoom_geometry<'g>(
     geom: &'g Geometry<f64>,
-    finest: bool,
-    zoom: u8,
+    finest_zoom: Option<u8>,
     opts: &ExportOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> std::borrow::Cow<'g, Geometry<f64>> {
     use super::simplify::{simplify_for_level, CollapseMode, Simplified, SimplifyOptions};
-    let Some(factor) = opts.max_zoom_simplify_factor.filter(|_| finest) else {
+    let (Some(factor), Some(zoom)) = (opts.max_zoom_simplify_factor, finest_zoom) else {
         return std::borrow::Cow::Borrowed(geom);
     };
     let simplify = SimplifyOptions::default()
@@ -7088,6 +7088,11 @@ fn clip_group(
         .zip(&geom_idxs)
         .map(|(b, &gi)| decode_batch_geometries(b, &b.schema(), gi, ctx.crs, timers, diagnostics))
         .collect::<Result<_, _>>()?;
+    // The canonical level's own zoom, not `ctx.zoom`: a variable-depth probe
+    // clips canonical geometry at an ancestor's zoom (#803).
+    let finest_zoom = (ctx.level_idx + 1 == ctx.reader.num_levels())
+        .then(|| zoom_for_level(ctx.reader.meta(), ctx.level_idx))
+        .transpose()?;
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
     // range. #535: `clip` is timed per geometry inside the closure.
     let row_members = geoms
@@ -7097,8 +7102,7 @@ fn clip_group(
                 .par_iter()
                 .map(|g| {
                     ExportTimers::time(&timers.clip, || {
-                        let finest = ctx.level_idx + 1 == ctx.reader.num_levels();
-                        let g = finest_zoom_geometry(g, finest, ctx.zoom, ctx.opts, diagnostics);
+                        let g = finest_zoom_geometry(g, finest_zoom, ctx.opts, diagnostics);
                         let mut members = feature_tile_members(
                             &g,
                             ctx.zoom,
