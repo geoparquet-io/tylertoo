@@ -30,7 +30,7 @@ Exit status:
 | [`validate`](#tylertoo-validate) | Check a GeoParquet overview file against the overviews spec |
 | [`export-pmtiles`](#tylertoo-export-pmtiles) | Export a PMTiles archive from an overview GeoParquet file |
 | [`decode`](#tylertoo-decode) | Decode a PMTiles vector-tile archive back to GeoParquet |
-| [`stats`](#tylertoo-stats) | Report per-zoom tile sizes for a PMTiles archive, from its directory alone |
+| [`stats`](#tylertoo-stats) | Report per-zoom tile sizes and optional per-layer stats for a PMTiles archive |
 | [`pyramid`](#tylertoo-pyramid) | Build one archive from several inputs, each owning a zoom range |
 | [`merge`](#tylertoo-merge) | Combine PMTiles archives that hold disjoint tiles into one |
 | [`shard-plan`](#tylertoo-shard-plan) | Cut a dataset's tile space into N disjoint shards for a sharded build |
@@ -241,7 +241,7 @@ A source property named `zoom`, `layer`, `mvt_id`, or `geometry` is an error.
 
 ## `tylertoo stats`
 
-Report per-zoom tile sizes for a PMTiles archive, from its directory alone
+Report per-zoom tile sizes and optional per-layer stats for a PMTiles archive
 
 ```text
 tylertoo stats [OPTIONS] <ARCHIVE>
@@ -258,6 +258,7 @@ tylertoo stats [OPTIONS] <ARCHIVE>
 | Option | Description |
 | --- | --- |
 | `--largest <N>` | Number of largest tiles to list, ranked by stored size. Default: `10`. |
+| `--layers` | Add per-zoom, per-layer feature counts, uncompressed bytes, and geometry types. Decodes tile bodies; requires a vector (MVT) archive. |
 | `--json` | Print the report as JSON instead of a human-readable table. |
 
 ## `tylertoo pyramid`

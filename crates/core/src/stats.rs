@@ -3,17 +3,17 @@
 //! Every "which zoom is blowing our tile budget" question this week (the
 //! handover zoom, the 600 KB cells budget, r5/r7/r8 comparisons) needed
 //! per-zoom stored-tile-size stats. This walks an already-opened
-//! [`ArchiveIndex`]'s directory entries — header + directories, never a tile
-//! body — so an entry's length is the tile's STORED (compressed) size
-//! directly. No tile is decompressed and the archive is never read whole
-//! into memory.
+//! [`ArchiveIndex`]'s directory entries, so an entry's length is the tile's
+//! STORED (compressed) size directly. Without `layers`, no tile body is read.
+//! With `layers`, each distinct stored body (deduplicated by data offset) is
+//! decoded once, in parallel, to add per-zoom, per-layer stats.
 //!
 //! Aggregation is per directory entry, with multiplicity: a run of `k`
 //! identical tiles contributes one `(stored_len, k)` pair (split at zoom
 //! boundaries when the run crosses one), and every statistic is weighted by
 //! those counts. Run lengths are never expanded, so memory and time are
-//! O(directory entries), not O(addressed tiles), and the report is not
-//! subject to [`ArchiveIndex::tiles`]' run-length expansion ceiling — a
+//! O(directory entries) without `layers`, not O(addressed tiles), and the
+//! report is not subject to [`ArchiveIndex::tiles`]' run-length expansion ceiling — a
 //! mostly-ocean archive whose runs address billions of tiles reports as
 //! cheaply as its directory reads.
 //!
@@ -80,22 +80,29 @@ pub struct LargestTile {
 pub struct StatsReport {
     pub per_zoom: Vec<ZoomStats>,
     pub largest: Vec<LargestTile>,
-    /// TODO(docs)
+    /// Per-(zoom, layer) stats, sorted by zoom then layer name.
+    /// `None` unless `layers` is enabled; omitted from JSON when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub per_layer: Option<Vec<LayerStats>>,
 }
 
-/// TODO(docs)
+/// One layer's totals at one zoom, counted per addressed tile.
+/// Run members and deduplicated tiles each contribute the shared body's
+/// feature counts and layer bytes, as in the per-zoom stats.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct LayerStats {
+    /// Zoom level.
     pub z: u8,
+    /// MVT layer name.
     pub layer: String,
-    /// TODO(docs)
+    /// Total features across addressed tiles (saturating at `u64::MAX`).
     pub feature_count: u64,
-    /// TODO(docs)
+    /// Sum of the layer's UNCOMPRESSED encoded size inside each addressed
+    /// MVT, not stored (compressed) bytes (saturating at `u64::MAX`).
     pub bytes: u64,
-    /// TODO(docs)
+    /// Feature counts per MVT geometry type: `Point`, `LineString`, `Polygon`,
+    /// or `Unknown`. Counts saturate at `u64::MAX`; absent types have no entry.
     pub geometry_types: BTreeMap<&'static str, u64>,
 }
 
@@ -152,12 +159,19 @@ fn zoom_stats_from_weighted(z: u8, mut sizes: Vec<(u64, u64)>) -> ZoomStats {
 /// descending, tile id ascending).
 ///
 /// Walks [`ArchiveIndex::entries`] once without expanding run lengths:
-/// memory is O(directory entries + `largest_n`).
+/// without `layers`, memory is O(directory entries + `largest_n`).
+///
+/// With `layers`, also reads and decodes each distinct stored tile body once
+/// (deduplicated by data offset), in parallel, and fills [`StatsReport::per_layer`].
+/// This requires a vector (MVT) archive and adds memory for decoded bodies and
+/// layer totals. With `layers` set to `false`, reads no tile bodies and omits
+/// `per_layer` from JSON.
 ///
 /// # Errors
 ///
 /// Returns an error if a directory entry points past the tile-data section or
-/// holds a tile id that does not decode.
+/// holds a tile id that does not decode. With `layers`, also returns an error
+/// if the archive is not MVT or a tile body cannot be read, decompressed, or parsed.
 pub fn compute_stats(
     archive: &ArchiveIndex,
     largest_n: usize,

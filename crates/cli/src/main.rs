@@ -117,8 +117,7 @@ enum Command {
     ExportPmtiles(Box<ExportPmtilesArgs>),
     /// Decode a PMTiles vector-tile archive back to GeoParquet.
     Decode(DecodeArgs),
-    /// Report per-zoom tile sizes for a PMTiles archive, from its
-    /// directory alone.
+    /// Report per-zoom tile sizes and optional per-layer stats for a PMTiles archive.
     Stats(StatsArgs),
     /// Build one archive from several inputs, each owning a zoom range.
     Pyramid(Box<PyramidArgs>),
@@ -340,7 +339,8 @@ struct StatsArgs {
     #[arg(long, value_name = "N", default_value = "10")]
     largest: usize,
 
-    /// TODO(docs)
+    /// Add per-zoom, per-layer feature counts, uncompressed bytes, and geometry
+    /// types. Decodes tile bodies; requires a vector (MVT) archive.
     #[arg(long)]
     layers: bool,
 
