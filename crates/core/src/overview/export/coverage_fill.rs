@@ -118,6 +118,10 @@ pub(super) mod cost_probe {
         pub(crate) seed_windows: usize,
         pub(crate) pyramid_wave_tiles: usize,
         pub(crate) pyramid_share_misses: usize,
+        /// Windows reopened after running dry with tiles still queued.
+        pub(crate) pyramid_reopens: usize,
+        /// The most a window held: retained bytes, in-flight shares and paths.
+        pub(crate) pyramid_reserved_peak: usize,
         pub(crate) seed_frame_writers: usize,
         pub(crate) map_peak: usize,
         pub(crate) live_peak: usize,
@@ -1896,6 +1900,16 @@ struct Slide<'a> {
     misses: usize,
     #[cfg(test)]
     peak: usize,
+    #[cfg(test)]
+    reserved_peak: usize,
+}
+
+#[cfg(test)]
+impl Slide<'_> {
+    fn note_reserved(&mut self, share: usize) {
+        let held = self.commit.fixed(self.queue.len()) + self.in_flight * (share + 512);
+        self.reserved_peak = self.reserved_peak.max(held);
+    }
 }
 
 struct SlideCtx<'a> {
@@ -1937,6 +1951,7 @@ fn slide_launch<'s, 'a: 's>(scope: &rayon::Scope<'s>, ctx: &'s SlideCtx<'a>, s: 
         #[cfg(test)]
         {
             s.peak = s.peak.max(s.in_flight);
+            s.note_reserved(share);
         }
         scope.spawn(move |scope| {
             let result = pyramid_tile(&path, key, ctx.step, ctx.timers, share, reserved, true);
@@ -1992,6 +2007,8 @@ fn slide_commit(
             break;
         }
         s.next_commit += 1;
+        #[cfg(test)]
+        s.note_reserved(share);
     }
     consumed
 }
@@ -2021,6 +2038,10 @@ fn pyramid_slide(
         // A window that committed and ran dry (its retained bytes grew past
         // the share it opened with) reopens at a smaller share.
         if !stopped && commit.tiles > before {
+            #[cfg(test)]
+            if !buckets.tiles.is_empty() {
+                cost_probe::update(|c| c.pyramid_reopens += 1);
+            }
             continue;
         }
         let Some((key, path)) = buckets.tiles.pop_first() else {
@@ -2072,6 +2093,8 @@ fn slide_window(
             misses: 0,
             #[cfg(test)]
             peak: 0,
+            #[cfg(test)]
+            reserved_peak: 0,
         }),
         step,
         timers,
@@ -2090,6 +2113,7 @@ fn slide_window(
     cost_probe::update(|c| {
         c.pyramid_wave_tiles = c.pyramid_wave_tiles.max(s.peak);
         c.pyramid_share_misses += s.misses;
+        c.pyramid_reserved_peak = c.pyramid_reserved_peak.max(s.reserved_peak);
     });
     for (_, (key, path, result)) in s.done {
         if matches!(result, Err(super::ExportError::BudgetExceeded { .. })) {
@@ -2624,6 +2648,7 @@ pub(super) mod tests {
             oversized: &mut oversized,
             misses: 0,
             peak: 4,
+            reserved_peak: 0,
         };
         // Tile 1 finishes first: nothing commits ahead of tile 0.
         slide.done.insert(1, (2, paths.remove(1), Ok(tile())));
@@ -2681,15 +2706,29 @@ pub(super) mod tests {
     }
 
     fn slide_zoom(runs: &mut SpillBuckets, workspace: usize) -> (ZoomCommit, cost_probe::Counts) {
+        let mut commit = empty_commit(workspace);
+        let counts = slide_into(runs, &mut commit, workspace, 4);
+        (commit, counts)
+    }
+
+    fn empty_commit(workspace: usize) -> ZoomCommit {
         let opts = super::super::ExportOptions::default();
-        let mut commit = ZoomCommit {
+        ZoomCommit {
             map_bytes: 0,
             snapped: ZoomBuilder::new(&opts).unwrap(),
             parents: SpillBuckets::new(&opts, workspace),
             tiles: 0,
             area: 0.0,
             vertices: 0,
-        };
+        }
+    }
+
+    fn slide_into(
+        runs: &mut SpillBuckets,
+        commit: &mut ZoomCommit,
+        workspace: usize,
+        threads: usize,
+    ) -> cost_probe::Counts {
         let step = PyramidStep {
             zoom: 4,
             seed: false,
@@ -2697,23 +2736,22 @@ pub(super) mod tests {
             scale: 1.0,
         };
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
+            .num_threads(threads)
             .build()
             .unwrap();
         // The probe is per thread: read it on the thread that slides.
-        let counts = pool.install(|| {
+        pool.install(|| {
             cost_probe::take();
             pyramid_slide(
                 runs,
-                &mut commit,
+                commit,
                 step,
                 &super::super::ExportTimers::default(),
                 workspace,
             )
             .unwrap();
             cost_probe::take()
-        });
-        (commit, counts)
+        })
     }
 
     /// #817 review: a grant for two lanes keeps two tiles in flight; the
@@ -2739,6 +2777,79 @@ pub(super) mod tests {
         assert!(runs.tiles.is_empty());
         assert_eq!(commit.tiles, 5);
         assert_eq!(counts.pyramid_share_misses, 3, "{counts:?}");
+    }
+
+    /// #817 review: a window whose retained bytes grow past its slack runs
+    /// dry with tiles still queued, and reopens at a smaller share. Here the
+    /// snapped index sits at capacity, so the first commit doubles it.
+    #[test]
+    fn a_window_that_runs_dry_reopens_and_matches_the_serial_build() {
+        const TILES: u32 = 6;
+        // 1.75 floors of index: over the first window's slack (1.5 floors at
+        // k=0) and under what leaves a second two-lane window (4 floors).
+        const ENTRIES: usize = 7 * WORKSPACE_FLOOR_BYTES / 4 / std::mem::size_of::<FillEntry>();
+        let full_index = |workspace: usize| {
+            let mut commit = empty_commit(workspace);
+            let mut index = Vec::with_capacity(ENTRIES);
+            index.extend((0..ENTRIES).map(|_| FillEntry {
+                key: 0,
+                offset: 0,
+                len: 0,
+            }));
+            assert_eq!(index.capacity(), ENTRIES);
+            commit.snapped.index = index;
+            commit
+        };
+        let output = |commit: &mut ZoomCommit| {
+            use std::io::Write;
+            commit.snapped.writer.flush().unwrap();
+            let entries: Vec<_> = commit.snapped.index[ENTRIES..]
+                .iter()
+                .map(|e| (e.key, e.offset, e.len))
+                .collect();
+            let snapped = std::fs::read(commit.snapped.writer.get_ref().path()).unwrap();
+            let parents: Vec<_> = commit
+                .parents
+                .tiles
+                .iter()
+                .map(|(key, path)| (*key, std::fs::read(path).unwrap()))
+                .collect();
+            let tallies = (commit.tiles, commit.area.to_bits(), commit.vertices);
+            (entries, snapped, parents, tallies)
+        };
+        let fixed = full_index(0).fixed(TILES as usize);
+
+        // Six floors free: two lanes (two threads) at 1.5-floor shares.
+        let workspace = fixed + 6 * WORKSPACE_FLOOR_BYTES + (64 << 10);
+        let mut runs = slide_runs(0, 0, TILES);
+        let keys: Vec<u64> = runs.tiles.keys().copied().collect();
+        let mut commit = full_index(workspace);
+        let counts = slide_into(&mut runs, &mut commit, workspace, 2);
+        assert_eq!(counts.pyramid_reopens, 1, "{counts:?}");
+        assert_eq!(counts.pyramid_wave_tiles, 2, "{counts:?}");
+        // Built once each: no share miss rebuilt a tile, and each key was
+        // committed once, in key order.
+        assert_eq!(counts.pyramid_share_misses, 0, "{counts:?}");
+        assert!(runs.tiles.is_empty());
+        let slid = output(&mut commit);
+        assert_eq!(slid.0.iter().map(|e| e.0).collect::<Vec<_>>(), keys);
+        assert!(
+            counts.pyramid_reserved_peak <= workspace,
+            "{} > {workspace}",
+            counts.pyramid_reserved_peak
+        );
+
+        // Three floors free: one lane, every tile built alone.
+        let serial_workspace = fixed + 3 * WORKSPACE_FLOOR_BYTES;
+        let mut runs = slide_runs(0, 0, TILES);
+        let mut commit = full_index(serial_workspace);
+        let counts = slide_into(&mut runs, &mut commit, serial_workspace, 2);
+        assert_eq!(
+            (counts.pyramid_reopens, counts.pyramid_wave_tiles),
+            (0, 0),
+            "{counts:?}"
+        );
+        assert!(output(&mut commit) == slid, "the slide's output differs");
     }
 
     /// #767: east-west strips share x but have disjoint y ranges. Pin the
