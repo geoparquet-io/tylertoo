@@ -3256,6 +3256,93 @@ mod tests {
         assert!(!out.exists(), "nothing should be written on a bad plan");
     }
 
+    /// #814: `max_zoom_simplify_factor` reaches each band's export, so it
+    /// simplifies each band's own finest zoom and leaves every other zoom
+    /// byte-identical.
+    #[test]
+    fn build_pyramid_max_zoom_simplify_changes_only_each_bands_finest_zoom() {
+        use geo::{Geometry, LineString, Polygon};
+        let dir = tempfile::tempdir().unwrap();
+        // Each band's wiggle survives quantization at its finest zoom but sits
+        // under one GSD there: z2 has GSD 0.088° and 0.022° units, z4 0.022°
+        // and 0.0055° units. RDP sees twice the amplitude across a wiggle.
+        let wiggly = |name: &str, amplitude: f64| {
+            let geoms: Vec<Option<Geometry<f64>>> = (0..4)
+                .map(|i| {
+                    let ring: Vec<(f64, f64)> = (0..400)
+                        .map(|k| {
+                            let a = f64::from(k) / 400.0 * std::f64::consts::TAU;
+                            let r = 3.0 + if k % 2 == 0 { amplitude } else { -amplitude };
+                            (-20.0 + f64::from(i) * 8.0 + r * a.cos(), 10.0 + r * a.sin())
+                        })
+                        .collect();
+                    Some(Geometry::Polygon(Polygon::new(
+                        LineString::from(ring),
+                        vec![],
+                    )))
+                })
+                .collect();
+            let path = dir.path().join(name);
+            crate::overview::testutil::write_input(&path, &geoms, true, None);
+            path
+        };
+        let band = |input: PathBuf, min_zoom, max_zoom| Band {
+            input,
+            layer: "wiggly".to_string(),
+            min_zoom,
+            max_zoom,
+        };
+        let bands = vec![
+            band(wiggly("coarse.parquet", 0.03), 0, 2),
+            band(wiggly("fine.parquet", 0.008), 3, 4),
+        ];
+        let build = |factor: Option<f64>, name: &str| {
+            let out = dir.path().join(name);
+            let mut opts = PyramidOptions {
+                work_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            };
+            opts.export.max_zoom_simplify_factor = factor;
+            build_pyramid(&bands, &out, &opts).unwrap();
+            decoded_tiles(&out)
+        };
+        let (plain, simplified) = (build(None, "plain.pmtiles"), build(Some(1.0), "s.pmtiles"));
+        assert_eq!(
+            plain.keys().collect::<Vec<_>>(),
+            simplified.keys().collect::<Vec<_>>()
+        );
+        let mut changed = std::collections::BTreeSet::new();
+        for (id, raw) in &plain {
+            if simplified[id] != *raw {
+                changed.insert(crate::pmtiles_writer::tile_id_to_zxy(*id).unwrap().0);
+            }
+        }
+        assert_eq!(
+            changed.into_iter().collect::<Vec<_>>(),
+            vec![2, 4],
+            "only each band's finest zoom may change"
+        );
+    }
+
+    /// Every addressed tile's decompressed bytes, by tile id.
+    fn decoded_tiles(path: &Path) -> std::collections::BTreeMap<u64, Vec<u8>> {
+        let bytes = std::fs::read(path).unwrap();
+        let header = Header::from_bytes(&bytes[..127]).unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        for e in crate::pmtiles_writer::read_all_entries(&bytes, &header).unwrap() {
+            let start = (header.tile_data_offset + e.offset) as usize;
+            let raw = compression::decompress(
+                &bytes[start..start + e.length as usize],
+                header.tile_compression,
+            )
+            .unwrap();
+            for r in 0..u64::from(e.run_length) {
+                out.insert(e.tile_id + r, raw.clone());
+            }
+        }
+        out
+    }
+
     /// A grid of uniform cells: the shape of a DGGS aggregate band.
     fn write_cell_source(path: &Path, n: usize, size: f64) {
         use geo::{Geometry, LineString, Polygon};

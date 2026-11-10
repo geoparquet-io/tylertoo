@@ -713,13 +713,16 @@ mod config_parity {
             "--feature-order",
             "rank:desc",
             "--no-simple-clip-fastpath",
+            "--max-zoom-simplify-factor",
+            "0.5",
         ]);
         let cli = cli::export_options(&args).unwrap();
-        let python = export_config(native_keywords(json!({"extent": 8192, "tile_buffer": 4, "name": "Example", "include_properties": ["rank"], "feature_order": "rank:desc", "simple_clip_fastpath": false}))).unwrap();
+        let python = export_config(native_keywords(json!({"extent": 8192, "tile_buffer": 4, "name": "Example", "include_properties": ["rank"], "feature_order": "rank:desc", "simple_clip_fastpath": false, "max_zoom_simplify_factor": 0.5}))).unwrap();
         let mut core = ExportOptions::default()
             .with_extent(8192)
             .with_tile_buffer(4)
             .with_simple_clip_fastpath(false)
+            .with_max_zoom_simplify_factor(Some(0.5))
             .with_feature_order("rank:desc".parse().unwrap());
         core.metadata.name = Some("Example".into());
         core.properties.include = Some(vec!["rank".into()]);

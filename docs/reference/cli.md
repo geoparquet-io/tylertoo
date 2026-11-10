@@ -86,6 +86,12 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | `--layer-name <LAYER_NAME>` | Layer name for the tiles. Defaults to the input's file stem. |
 | `--keep-overview <PATH>` | Save the intermediate overview GeoParquet to PATH after export. Does not change the PMTiles output. |
 
+### Generalization
+
+| Option | Description |
+| --- | --- |
+| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
+
 ### Sharded builds
 
 | Option | Description |
@@ -184,6 +190,12 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 | `--preset <tippecanoe>` | Start from another tool's export defaults instead of tylertoo's; options you pass still override them. `tippecanoe` sets its tile buffer, size caps and size valve: <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>. Possible values: `tippecanoe`. |
 | `--report <PATH>` | Write the JSON export report, with per-zoom tile and feature counts, to this path. |
 | `-f`, `--force` | Overwrite the output if it exists. |
+
+### Generalization
+
+| Option | Description |
+| --- | --- |
+| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
 
 ### Memory & performance
 
@@ -302,6 +314,12 @@ tylertoo pyramid [OPTIONS] --band <LO-HI:INPUT[:LAYER]> <OUTPUT>
 | `-f`, `--force` | Overwrite the output if it exists. |
 | `--work-dir <DIR>` | Directory for temporary per-band files, deleted after the build. Defaults to the system temp directory. |
 | `--allow-missing-zooms` | Accept a pre-tiled band with fewer zooms than declared. Missing zooms render empty; use only for a sparse pyramid. |
+
+### Generalization
+
+| Option | Description |
+| --- | --- |
+| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
 
 ## `tylertoo merge`
 

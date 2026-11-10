@@ -633,6 +633,8 @@ pub tylertoo_core::Diagnostic::RowGroupAutoscaled::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::SavedPlan
 pub tylertoo_core::Diagnostic::SavedPlan::count: usize
 pub tylertoo_core::Diagnostic::SavedPlan::diagnostics: alloc::vec::Vec<tylertoo_core::Diagnostic>
+#[non_exhaustive] pub tylertoo_core::Diagnostic::TilesOverLimit
+pub tylertoo_core::Diagnostic::TilesOverLimit::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::Unprojectable
 pub tylertoo_core::Diagnostic::Unprojectable::context: core::option::Option<tylertoo_core::RangeContext>
 pub tylertoo_core::Diagnostic::Unprojectable::count: usize
@@ -2378,6 +2380,7 @@ pub tylertoo_core::ExportOptions::extent: u32
 pub tylertoo_core::ExportOptions::feature_id: core::option::Option<alloc::string::String>
 pub tylertoo_core::ExportOptions::feature_order: tylertoo_core::FeatureOrder
 pub tylertoo_core::ExportOptions::layer_name: alloc::string::String
+pub tylertoo_core::ExportOptions::max_zoom_simplify_factor: core::option::Option<f64>
 pub tylertoo_core::ExportOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::ExportOptions::min_zoom: core::option::Option<u8>
 pub tylertoo_core::ExportOptions::partition_wave: usize
@@ -2400,6 +2403,7 @@ pub fn tylertoo_core::ExportOptions::with_extent(self, u32) -> Self
 pub fn tylertoo_core::ExportOptions::with_feature_id(self, core::option::Option<alloc::string::String>) -> Self
 pub fn tylertoo_core::ExportOptions::with_feature_order(self, tylertoo_core::FeatureOrder) -> Self
 pub fn tylertoo_core::ExportOptions::with_layer_name(self, alloc::string::String) -> Self
+pub fn tylertoo_core::ExportOptions::with_max_zoom_simplify_factor(self, core::option::Option<f64>) -> Self
 pub fn tylertoo_core::ExportOptions::with_metadata(self, tylertoo_core::TilesetMetadata) -> Self
 pub fn tylertoo_core::ExportOptions::with_min_zoom(self, core::option::Option<u8>) -> Self
 pub fn tylertoo_core::ExportOptions::with_partition_wave(self, usize) -> Self
@@ -2439,6 +2443,7 @@ pub tylertoo_core::ExportReport::max_zoom: u8
 pub tylertoo_core::ExportReport::merged_features: usize
 pub tylertoo_core::ExportReport::min_zoom: u8
 pub tylertoo_core::ExportReport::mode: alloc::string::String
+pub tylertoo_core::ExportReport::over_limit_tiles: usize
 pub tylertoo_core::ExportReport::oversized_tiles: usize
 pub tylertoo_core::ExportReport::skipped_property_columns: alloc::vec::Vec<tylertoo_core::SkippedPropertyColumn>
 pub tylertoo_core::ExportReport::source_losses: tylertoo_core::SourceLosses
@@ -3227,6 +3232,7 @@ pub tylertoo_core::ZoomReport::level: usize
 pub tylertoo_core::ZoomReport::level_feature_count: usize
 pub tylertoo_core::ZoomReport::max_valve_passes: u32
 pub tylertoo_core::ZoomReport::merged_features: usize
+pub tylertoo_core::ZoomReport::over_limit_tiles: usize
 pub tylertoo_core::ZoomReport::oversized_tiles: usize
 pub tylertoo_core::ZoomReport::stopped_tiles: usize
 pub tylertoo_core::ZoomReport::tile_count: usize
