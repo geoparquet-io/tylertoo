@@ -96,7 +96,7 @@ The grid uses 0.01° cells, each recording a field count and total area.
 File: `02_layers.py`
 
 ```python
-"""Check the extract, then derive the two layers the map needs."""
+"""Check the extract, then export its finest level for tiling."""
 
 import duckdb
 
@@ -117,40 +117,20 @@ con.sql(f"""
     TO 'fields-raw.parquet' (FORMAT parquet)
 """)
 
-# Zoomed out, single fields are too small to see. Count them per
-# 0.01-degree cell (about 1 km) instead, and keep the cell as a square.
-con.sql(f"""
-    COPY (
-        SELECT count(*) AS fields,
-               round(sum("metrics:area") / 1e4, 1) AS hectares,
-               ST_MakeEnvelope(gx * 0.01, gy * 0.01, (gx + 1) * 0.01, (gy + 1) * 0.01)
-                   AS geometry
-        FROM (
-            SELECT "metrics:area",
-                   floor(ST_X(ST_Centroid(geometry)) / 0.01) AS gx,
-                   floor(ST_Y(ST_Centroid(geometry)) / 0.01) AS gy
-            FROM '{OV}' WHERE level = {finest}
-        )
-        GROUP BY gx, gy
-        ORDER BY gx, gy
-    ) TO 'density.parquet' (FORMAT parquet)
-""")
-
 con.sql("""
-    SELECT count(*) AS cells, sum(fields) AS fields,
-           max(fields) AS busiest_cell, round(sum(hectares)) AS hectares
-    FROM 'density.parquet'
+    SELECT count(*) AS fields, round(sum("metrics:area") / 1e4) AS hectares
+    FROM 'fields-raw.parquet'
 """).show()
 ```
 
 ```text
 valid=True  checks=12
-┌───────┬────────┬──────────────┬──────────┐
-│ cells │ fields │ busiest_cell │ hectares │
-│ int64 │ int128 │    int64     │  double  │
-├───────┼────────┼──────────────┼──────────┤
-│   266 │    534 │            9 │  36733.0 │
-└───────┴────────┴──────────────┴──────────┘
+┌────────┬──────────┐
+│ fields │ hectares │
+│ int64  │  double  │
+├────────┼──────────┤
+│    534 │  36733.0 │
+└────────┴──────────┘
 ```
 
 The 534 fields cover 36,733 ha, averaging 69 ha each: large, regular fields
@@ -246,8 +226,10 @@ File: `04-pyramid.sh`
 set -euo pipefail
 
 # One archive, two layers: density cells at z0-z7, fields at z8-z14.
+# The grid band counts the fields in each cell and sums their area.
 tylertoo pyramid brazil.pmtiles \
-  --band 0-7:density.parquet:density \
+  --band 0-7:grid:fields.parquet:density \
+  --accumulate-attribute metrics:area:sum \
   --band 8-14:fields.pmtiles:fields
 tylertoo stats brazil.pmtiles
 ```
@@ -257,9 +239,9 @@ tylertoo stats brazil.pmtiles
   z8-14 -> layer "fields": 191 tiles
 ✓ Built 2 band(s) → brazil.pmtiles (199 tiles)
  z  tiles    total    mean     p50     p99     max
- 0      1      133     133     133     133     133
+ 0      1      125     125     125     125     125
 ...
- 7      1    2,577   2,577   2,577   2,577   2,577
+ 7      1      765     765     765     765     765
  8      2   29,109  14,554  13,919  15,190  15,190
 ...
 14    125  230,523   1,844   1,792   4,532   4,990

@@ -362,8 +362,96 @@ impl CellAcc {
 
 type CellMap = HashMap<u64, CellAcc>;
 
-/// Rows per parallel task within a batch.
-const CHUNK_ROWS: usize = 8192;
+/// Shards of the cell map, so batches and rollups merge on every core.
+const SHARDS: usize = 64;
+
+/// Which shard holds cell `id`: a multiplicative hash, since cell ids of
+/// one area share their high bits.
+fn shard_of(id: u64) -> usize {
+    (id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize
+}
+
+/// The cell map, split into [`SHARDS`] maps by [`shard_of`].
+struct Cells(Vec<CellMap>);
+
+impl Cells {
+    fn new() -> Self {
+        Self((0..SHARDS).map(|_| CellMap::new()).collect())
+    }
+
+    fn len(&self) -> usize {
+        self.0.iter().map(HashMap::len).sum()
+    }
+
+    fn get(&self, id: u64) -> &CellAcc {
+        &self.0[shard_of(id)][&id]
+    }
+
+    /// Merge partial maps, each split by shard, into these cells: shard by
+    /// shard in parallel, the parts in order, so the result is the same on
+    /// every run. Returns the category pairs added.
+    fn absorb(&mut self, parts: Vec<Vec<CellMap>>) -> u64 {
+        let mut by_shard: Vec<Vec<CellMap>> = (0..SHARDS).map(|_| Vec::new()).collect();
+        for part in parts {
+            for (s, map) in part.into_iter().enumerate() {
+                by_shard[s].push(map);
+            }
+        }
+        self.0
+            .par_iter_mut()
+            .zip(by_shard)
+            .map(|(shard, maps)| {
+                let mut pairs = 0u64;
+                for map in maps {
+                    for (id, acc) in map {
+                        match shard.get_mut(&id) {
+                            Some(c) => {
+                                let before = c.cats.as_slice().len();
+                                c.merge(&acc);
+                                pairs += (c.cats.as_slice().len() - before) as u64;
+                            }
+                            None => {
+                                pairs += acc.cats.as_slice().len() as u64;
+                                shard.insert(id, acc);
+                            }
+                        }
+                    }
+                }
+                pairs
+            })
+            .sum()
+    }
+
+    /// The cells at resolution `to`, each the merge of its children at
+    /// `from` in child id order (so a float sum adds up the same way every
+    /// run). Consumes the children shard by shard.
+    fn roll_up(self, system: CellSystem, from: u8, to: u8) -> Self {
+        let parts: Vec<Vec<CellMap>> = self
+            .0
+            .into_par_iter()
+            .map(|shard| {
+                let mut out: Vec<CellMap> = (0..SHARDS).map(|_| CellMap::new()).collect();
+                let mut children: Vec<(u64, CellAcc)> = shard.into_iter().collect();
+                children.sort_unstable_by_key(|c| c.0);
+                for (id, acc) in children {
+                    let parent = system.parent(id, from, to);
+                    out[shard_of(parent)]
+                        .entry(parent)
+                        .and_modify(|p| p.merge(&acc))
+                        .or_insert(acc);
+                }
+                out
+            })
+            .collect();
+        let mut parents = Self::new();
+        parents.absorb(parts);
+        parents
+    }
+
+    fn capacity(&self) -> u64 {
+        self.0.iter().map(|m| m.capacity() as u64).sum()
+    }
+}
 
 /// Bytes one occupied cell holds, besides its category counts.
 fn cell_bytes(specs: usize) -> u64 {
@@ -392,23 +480,20 @@ pub(crate) fn write_cell_tables(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ConvertError> {
     debug_assert_eq!(tables.len(), usize::from(max_zoom - min_zoom) + 1);
-    let (mut cells, labels) = aggregate(input, system, max_zoom, rollup, diagnostics)?;
+    let (mut cells, labels, budget, cat_pairs) =
+        aggregate(input, system, max_zoom, rollup, diagnostics)?;
+    let specs = rollup.accumulate.len();
     let mut res = system.resolution(max_zoom);
     for z in (min_zoom..=max_zoom).rev() {
         let to = system.resolution(z);
         if to < res {
-            let mut parents = CellMap::with_capacity(cells.len() / 2);
-            // In id order, so a float sum adds up the same way every run.
-            let mut children: Vec<(u64, CellAcc)> = cells.drain().collect();
-            children.sort_unstable_by_key(|c| c.0);
-            for (id, acc) in children {
-                parents
-                    .entry(system.parent(id, res, to))
-                    .and_modify(|p| p.merge(&acc))
-                    .or_insert(acc);
-            }
-            cells = parents;
+            cells = cells.roll_up(system, res, to);
             res = to;
+            // A parent holds no more category pairs than its children did.
+            budget.require(
+                MemoryPhase::Scan,
+                cells.capacity() * cell_bytes(specs) + cat_pairs * 12,
+            )?;
         }
         write_table(
             tables[usize::from(z - min_zoom)],
@@ -423,14 +508,15 @@ pub(crate) fn write_cell_tables(
 }
 
 /// Read `input` once into the cell map at `max_zoom`'s resolution. Returns
-/// the map, its category counts keyed by category slot, and the slot labels.
+/// the map, its category counts keyed by category slot, the slot labels,
+/// the budget it was charged to, and its category pairs.
 fn aggregate(
     input: &Path,
     system: CellSystem,
     max_zoom: u8,
     rollup: CellRollup<'_>,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<(CellMap, Vec<String>), ConvertError> {
+) -> Result<(Cells, Vec<String>, MemoryBudget, u64), ConvertError> {
     let source = ConvertSource::resolve_path(input)?;
     let descriptor = source.resolved_schema()?;
     let (crs, _) =
@@ -474,7 +560,7 @@ fn aggregate(
         footer: None,
         profile: defaults.profile,
     };
-    let mut cells = CellMap::new();
+    let mut cells = Cells::new();
     let mut interner = GroupInterner::default();
     let (mut rows, mut skipped, mut cat_pairs) = (0usize, 0usize, 0u64);
     read_in_order(&source, None, Some(&projection), tuning, |batch, _, _| {
@@ -493,12 +579,14 @@ fn aggregate(
         if let Some(name) = &cat_name {
             interner.extend(col(name)?.as_ref(), &mut ids);
         }
-        let chunks: Vec<(CellMap, usize)> = (0..n)
-            .step_by(CHUNK_ROWS)
+        // Enough tasks to keep every core busy, none too small to pay off.
+        let chunk_rows = (n / (rayon::current_num_threads() * 4)).max(1024);
+        let chunks: Vec<(Vec<CellMap>, usize)> = (0..n)
+            .step_by(chunk_rows)
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|off| {
-                let len = CHUNK_ROWS.min(n - off);
+                let len = chunk_rows.min(n - off);
                 let garr = from_arrow_array(geom_col.slice(off, len).as_ref(), &geom_field)
                     .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
                 let mut geoms = Vec::with_capacity(len);
@@ -507,7 +595,7 @@ fn aggregate(
                     &mut geoms,
                     diagnostics,
                 )?;
-                let mut local = CellMap::new();
+                let mut local: Vec<CellMap> = (0..SHARDS).map(|_| CellMap::new()).collect();
                 let mut bad = 0usize;
                 for (r, g) in geoms.iter().enumerate() {
                     let Some(id) = g
@@ -524,7 +612,9 @@ fn aggregate(
                         bad += 1;
                         continue;
                     };
-                    let acc = local.entry(id).or_insert_with(|| CellAcc::new(specs));
+                    let acc = local[shard_of(id)]
+                        .entry(id)
+                        .or_insert_with(|| CellAcc::new(specs));
                     acc.count += 1;
                     let row = off + r;
                     for (state, v) in acc.aggs.iter_mut().zip(&values) {
@@ -541,26 +631,12 @@ fn aggregate(
                 Ok((local, bad))
             })
             .collect::<Result<_, ConvertError>>()?;
-        for (local, bad) in chunks {
-            skipped += bad;
-            for (id, acc) in local {
-                match cells.get_mut(&id) {
-                    Some(c) => {
-                        let before = c.cats.as_slice().len();
-                        c.merge(&acc);
-                        cat_pairs += (c.cats.as_slice().len() - before) as u64;
-                    }
-                    None => {
-                        cat_pairs += acc.cats.as_slice().len() as u64;
-                        cells.insert(id, acc);
-                    }
-                }
-            }
-        }
+        skipped += chunks.iter().map(|c| c.1).sum::<usize>();
+        cat_pairs += cells.absorb(chunks.into_iter().map(|c| c.0).collect());
         // A cell map that outgrows the budget fails here, not by OOM kill.
         budget.require(
             MemoryPhase::Scan,
-            cells.capacity() as u64 * cell_bytes(specs) + cat_pairs * 12 + interner.heap_bytes(),
+            cells.capacity() * cell_bytes(specs) + cat_pairs * 12 + interner.heap_bytes(),
         )?;
         Ok(ReadFlow::Continue)
     })?;
@@ -575,7 +651,7 @@ fn aggregate(
     } else {
         Vec::new()
     };
-    Ok((cells, labels))
+    Ok((cells, labels, budget, cat_pairs))
 }
 
 /// The point a feature is counted at: its centroid, `None` when it has
@@ -591,10 +667,10 @@ fn representative_point(g: &Geometry<f64>) -> Option<(f64, f64)> {
 /// Re-key every cell's category counts from interned value ids to the
 /// ranked category slots of `--cluster-categories`, and return the slot
 /// labels.
-fn relabel_categories(cells: &mut CellMap, values: &[String]) -> Vec<String> {
+fn relabel_categories(cells: &mut Cells, values: &[String]) -> Vec<String> {
     let null = GroupInterner::NULL_GROUP;
     let mut freq = vec![0u64; values.len()];
-    for acc in cells.values() {
+    for acc in cells.0.iter().flat_map(HashMap::values) {
         for &(id, n) in acc.cats.as_slice() {
             if id != null {
                 freq[id as usize] += n as u64;
@@ -603,20 +679,27 @@ fn relabel_categories(cells: &mut CellMap, values: &[String]) -> Vec<String> {
     }
     let (slot_of, mut labels) = rank_categories(&freq, values, MAX_CLUSTER_CATEGORIES);
     let other = labels.len() as u32;
-    let mut uses_other = false;
-    for acc in cells.values_mut() {
-        let mut slots = CategoryCounts::default();
-        for &(id, n) in acc.cats.as_slice() {
-            let slot = if id == null {
-                other
-            } else {
-                slot_of[id as usize]
-            };
-            uses_other |= slot == other;
-            slots.add_n(slot, n);
-        }
-        acc.cats = slots;
-    }
+    let uses_other = cells
+        .0
+        .par_iter_mut()
+        .map(|shard| {
+            let mut uses_other = false;
+            for acc in shard.values_mut() {
+                let mut slots = CategoryCounts::default();
+                for &(id, n) in acc.cats.as_slice() {
+                    let slot = if id == null {
+                        other
+                    } else {
+                        slot_of[id as usize]
+                    };
+                    uses_other |= slot == other;
+                    slots.add_n(slot, n);
+                }
+                acc.cats = slots;
+            }
+            uses_other
+        })
+        .reduce(|| false, |a, b| a || b);
     if uses_other {
         labels.push(OTHER_CATEGORY.to_string());
     }
@@ -631,7 +714,7 @@ fn write_table(
     path: &Path,
     system: CellSystem,
     res: u8,
-    cells: &CellMap,
+    cells: &Cells,
     rollup: CellRollup<'_>,
     labels: &[String],
 ) -> Result<(), ConvertError> {
@@ -664,10 +747,13 @@ fn write_table(
     let (file, pending) = crate::atomic_output::create(path)?;
     let mut writer = tylertoo_io::batch_writer(file, encoder.target_schema())?;
 
-    let mut ids: Vec<u64> = cells.keys().copied().collect();
+    let mut ids: Vec<u64> = Vec::with_capacity(cells.len());
+    for shard in &cells.0 {
+        ids.extend(shard.keys());
+    }
     ids.par_sort_unstable();
     for ids in ids.chunks(WRITE_ROWS) {
-        let rows: Vec<&CellAcc> = ids.iter().map(|id| &cells[id]).collect();
+        let rows: Vec<&CellAcc> = ids.iter().map(|&id| cells.get(id)).collect();
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from_iter_values(
                 ids.iter().map(|&id| system.token(id, res)),
@@ -895,6 +981,69 @@ mod tests {
         assert_eq!(
             ab.aggs[0].finalize(super::super::cluster::AccumulateOp::Mean),
             Some(3.0)
+        );
+    }
+
+    /// A table longer than one written batch keeps every cell, once, in
+    /// cell id order.
+    #[test]
+    fn tables_span_several_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pts.parquet");
+        let n = WRITE_ROWS + 4_464;
+        let geoms: Vec<Option<Geometry<f64>>> = (0..n)
+            .map(|i| {
+                let (x, y) = ((i % 300) as f64 * 0.01, (i / 300) as f64 * 0.01);
+                Some(Geometry::Point(geo::Point::new(x, y)))
+            })
+            .collect();
+        crate::overview::testutil::write_input(&src, &geoms, false, None);
+        let table = dir.path().join("z12.parquet");
+        let rollup = CellRollup {
+            accumulate: &[],
+            categories: None,
+        };
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        write_cell_tables(
+            &src,
+            CellSystem::Grid,
+            (12, 12),
+            rollup,
+            &[&table],
+            &diagnostics,
+        )
+        .unwrap();
+        let source = ConvertSource::resolve_path(&table).unwrap();
+        let plan = crate::input_set::ReadPlan {
+            batch_size: 1 << 20,
+            projection: None,
+            row_groups: None,
+        };
+        let mut cells: Vec<(u64, u64)> = Vec::new();
+        let mut total = 0i64;
+        for batch in source.open_stream(&plan).unwrap() {
+            let batch = batch.unwrap();
+            let col = |name: &str| batch.column(batch.schema().index_of(name).unwrap()).clone();
+            let tokens = col(CELL_COLUMN);
+            for t in tokens.as_string::<i32>().iter().flatten() {
+                let mut parts = t.split('/').skip(1).map(|v| v.parse::<u64>().unwrap());
+                cells.push((parts.next().unwrap(), parts.next().unwrap()));
+            }
+            total += col(POINT_COUNT_COLUMN)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .iter()
+                .flatten()
+                .sum::<i64>();
+        }
+        assert_eq!(total, n as i64);
+        assert_eq!(
+            cells.len(),
+            n,
+            "0.01° apart, every point has its own z12 cell"
+        );
+        assert!(
+            cells.windows(2).all(|w| w[0] < w[1]),
+            "rows in cell id order"
         );
     }
 }
