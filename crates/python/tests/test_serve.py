@@ -43,7 +43,7 @@ class TestServe:
 
     def test_unknown_keyword_is_a_config_error(self) -> None:
         with pytest.raises(tylertoo.ConfigError, match="unknown keyword"):
-            tylertoo.serve(str(ROADS_PMTILES), bogus=1)
+            tylertoo.serve(str(ROADS_PMTILES), bogus=1)  # type: ignore[call-arg]
 
     def test_missing_archive_raises_before_serving(self, tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="could not open"):
@@ -52,7 +52,10 @@ class TestServe:
     def test_serves_the_archive_bytes(self) -> None:
         port = free_port()
         threading.Thread(
-            target=tylertoo.serve, args=([ROADS_PMTILES],), kwargs={"port": port}, daemon=True
+            target=tylertoo.serve,
+            args=([ROADS_PMTILES],),
+            kwargs={"port": port},
+            daemon=True,
         ).start()
         base = f"http://127.0.0.1:{port}"
         head = fetch(f"{base}/road-detections.pmtiles", {"Range": "bytes=0-126"})
