@@ -66,6 +66,9 @@ class TestServe:
         assert head == ROADS_PMTILES.read_bytes()[:127]
         assert b"maplibre-gl" in fetch(f"{base}/")
 
+    # Windows has no SIGINT to send to a child; a console Ctrl-C reaches
+    # the same `check_signals` poll.
+    @pytest.mark.skipif(sys.platform == "win32", reason="no SIGINT on Windows")
     def test_ctrl_c_stops_the_server(self) -> None:
         port = free_port()
         proc = subprocess.Popen(
@@ -77,8 +80,11 @@ class TestServe:
             stderr=subprocess.PIPE,
             text=True,
         )
-        fetch(f"http://127.0.0.1:{port}/index.json")
-        proc.send_signal(signal.SIGINT)
-        _, err = proc.communicate(timeout=10)
+        try:
+            fetch(f"http://127.0.0.1:{port}/index.json")
+            proc.send_signal(signal.SIGINT)
+            _, err = proc.communicate(timeout=10)
+        finally:
+            proc.kill()
         assert proc.returncode != 0
         assert "KeyboardInterrupt" in err
