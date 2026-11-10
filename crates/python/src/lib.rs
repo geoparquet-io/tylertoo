@@ -524,8 +524,8 @@ fn serve(
         Err(_) => archive.extract()?,
     };
     let server = py
-        .detach(|| tylertoo_cli::serve::Server::bind(&archives, &host, port))
-        .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+        .detach(|| tylertoo_core::internal::serve::Server::bind(&archives, &host, port))
+        .map_err(|e| to_py(e.kind(), e.to_string(), None))?;
     let builtins = PyModule::import(py, "builtins")?;
     builtins.getattr("print")?.call1((format!("Serving {} on {}", archives.len(), server.url()),))?;
     // The loop polls Python's signal handlers, so Ctrl-C raises
@@ -538,7 +538,7 @@ fn serve(
                 .is_ok()
         })
     })
-    .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+    .map_err(|e| to_py(e.kind(), e.to_string(), None))?;
     interrupted.map_or(Ok(()), Err)
 }
 }

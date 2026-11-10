@@ -45,6 +45,10 @@ class TestServe:
         with pytest.raises(tylertoo.ConfigError, match="unknown keyword"):
             tylertoo.serve(str(ROADS_PMTILES), bogus=1)  # type: ignore[call-arg]
 
+    def test_repeated_name_is_a_config_error(self) -> None:
+        with pytest.raises(tylertoo.ConfigError, match="two archives"):
+            tylertoo.serve([ROADS_PMTILES, ROADS_PMTILES], port=free_port())
+
     def test_missing_archive_raises_before_serving(self, tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="could not open"):
             tylertoo.serve(str(tmp_path / "missing.pmtiles"), port=free_port())

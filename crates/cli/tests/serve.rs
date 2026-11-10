@@ -4,9 +4,9 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use tylertoo_cli::serve::Server;
 use tylertoo_core::internal::archive_index::ArchiveIndex;
 use tylertoo_core::internal::pmtiles_writer::StreamingPmtilesWriter;
+use tylertoo_core::internal::serve::Server;
 use tylertoo_core::Compression;
 
 fn write_archive(path: &Path, tag: u8) {
@@ -23,8 +23,12 @@ fn write_archive(path: &Path, tag: u8) {
 
 /// `GET path` with extra header lines: (status, headers, body).
 fn get(addr: &str, path: &str, extra: &str) -> (u16, String, Vec<u8>) {
+    request(addr, "GET", path, extra)
+}
+
+fn request(addr: &str, method: &str, path: &str, extra: &str) -> (u16, String, Vec<u8>) {
     let mut s = TcpStream::connect(addr).unwrap();
-    write!(s, "GET {path} HTTP/1.0\r\nHost: {addr}\r\n{extra}\r\n").unwrap();
+    write!(s, "{method} {path} HTTP/1.0\r\nHost: {addr}\r\n{extra}\r\n").unwrap();
     let mut r = BufReader::new(s);
     let mut head = String::new();
     loop {
@@ -70,6 +74,13 @@ fn serves_the_archives_own_bytes_and_reloads_a_rewrite() {
     }
     assert_eq!(get(&addr, "/my%20demo/2/0/0.mvt", "").0, 204);
     assert_eq!(get(&addr, "/nope/0/0/0.mvt", "").0, 404);
+    // The CORS preflight of a cross-origin Range request.
+    let (code, head, _) = request(&addr, "OPTIONS", "/my%20demo.pmtiles", "");
+    assert_eq!(code, 204);
+    assert!(
+        head.contains("access-control-allow-headers: range, if-match, if-range"),
+        "{head}"
+    );
 
     let file = std::fs::read(&path).unwrap();
     let (code, head, body) = get(&addr, "/my%20demo.pmtiles", "Range: bytes=0-126\r\n");

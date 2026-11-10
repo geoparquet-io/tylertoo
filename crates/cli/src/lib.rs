@@ -25,8 +25,6 @@ use tylertoo_core::internal::overview::config::{self, OutputKind};
 use tylertoo_core::internal::overview::tiles::TilesOptions;
 use tylertoo_core::TilesetMetadata as TilesetMetadataArgs;
 
-pub mod serve;
-
 /// `-q/--quiet` (#452), set once in [`run`] before dispatch.
 #[expect(
     clippy::disallowed_types,
@@ -1802,16 +1800,17 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_serve(args: &ServeArgs) -> Result<()> {
+    let server =
+        tylertoo_core::internal::serve::Server::bind(&args.archives, &args.host, args.port)?;
+    // The URL is the result, so `--quiet` keeps it.
+    println!("Serving {} on {}", args.archives.len(), server.url());
+    Ok(server.run(|| true)?)
+}
+
 /// Run `tylertoo stats`: per-zoom tile-weight report over a PMTiles archive
 /// (issue #552). Thin facade over `tylertoo_core::internal::stats::compute_stats`,
 /// which does all the work off `ArchiveIndex` (header + directories only).
-fn run_serve(args: &ServeArgs) -> Result<()> {
-    let server = serve::Server::bind(&args.archives, &args.host, args.port)?;
-    // The URL is the result, so `--quiet` keeps it.
-    println!("Serving {} on {}", args.archives.len(), server.url());
-    server.run(|| true)
-}
-
 fn run_stats(args: StatsArgs) -> Result<()> {
     use tylertoo_core::internal::archive_index::ArchiveIndex;
     use tylertoo_core::internal::stats::compute_stats;

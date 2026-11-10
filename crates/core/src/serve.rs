@@ -5,19 +5,63 @@
 //! while it is served cannot fault the server. The archive is reopened when
 //! its size, modification time or inode changes.
 
-use anyhow::{bail, Context, Result};
+use crate::archive_index::ArchiveIndex;
+use crate::compression::{decompress, decompress_capped, Compression, MAX_INTERNAL_BYTES};
+use crate::error::{Classify, ErrorKind};
+use crate::pmtiles_writer::TileType;
+use crate::stats::{compute_stats, DEFAULT_LARGEST};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
-use tylertoo_core::internal::archive_index::ArchiveIndex;
-use tylertoo_core::internal::compression::{decompress, decompress_capped, MAX_INTERNAL_BYTES};
-use tylertoo_core::internal::stats::{compute_stats, DEFAULT_LARGEST};
-use tylertoo_core::{Compression, TileType};
 
 const VIEWER: &str = include_str!("viewer.html");
+
+/// Why `serve` could not start or keep listening.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ServeError {
+    /// An archive path has no UTF-8 file stem to name it by.
+    #[error("{}: an archive needs a UTF-8 file name", path.display())]
+    #[non_exhaustive]
+    BadName { path: PathBuf },
+    /// Two archives share a file stem, so one URL would name both.
+    #[error("two archives are named {name:?}; rename one")]
+    #[non_exhaustive]
+    DuplicateName { name: String },
+    /// `index` would shadow `/index.json`, the archive list.
+    #[error("{}: the name \"index\" is reserved; rename it", path.display())]
+    #[non_exhaustive]
+    ReservedName { path: PathBuf },
+    /// An archive did not open.
+    #[error("could not open {}: {error}", path.display())]
+    #[non_exhaustive]
+    Open { path: PathBuf, error: crate::Error },
+    /// The address could not be bound.
+    #[error("could not listen on {addr}: {error}")]
+    #[non_exhaustive]
+    Bind {
+        addr: String,
+        error: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// The listening socket failed.
+    #[error("the server socket failed: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl Classify for ServeError {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            ServeError::BadName { .. }
+            | ServeError::DuplicateName { .. }
+            | ServeError::ReservedName { .. } => ErrorKind::Usage,
+            ServeError::Open { error, .. } => error.kind(),
+            ServeError::Bind { .. } | ServeError::Io(_) => ErrorKind::Runtime,
+        }
+    }
+}
 
 /// What identifies one version of a file on disk: size, mtime, inode.
 type Stamp = (u64, Option<SystemTime>, u64);
@@ -95,29 +139,28 @@ impl Server {
     ///
     /// An archive that does not open, two archives with the same file stem,
     /// or an address that cannot be bound.
-    pub fn bind(archives: &[PathBuf], host: &str, port: u16) -> Result<Self> {
+    pub fn bind(archives: &[PathBuf], host: &str, port: u16) -> Result<Self, ServeError> {
         let mut served: Vec<Served> = Vec::new();
         for path in archives {
             let name = path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .with_context(|| format!("{} has no usable file name", path.display()))?
+                .ok_or_else(|| ServeError::BadName { path: path.clone() })?
                 .to_owned();
             if served.iter().any(|s| s.name == name) {
-                bail!("two archives are named {name:?}; rename one");
+                return Err(ServeError::DuplicateName { name });
             }
-            // `/index.json` is the archive list, not this archive's TileJSON.
             if name == "index" {
-                bail!(
-                    "{}: the name \"index\" is reserved; rename it",
-                    path.display()
-                );
+                return Err(ServeError::ReservedName { path: path.clone() });
             }
+            let open = |error| ServeError::Open {
+                path: path.clone(),
+                error,
+            };
             let stamp = std::fs::metadata(path)
                 .map(|m| stamp(&m))
-                .with_context(|| format!("could not open {}", path.display()))?;
-            let index = ArchiveIndex::open(path)
-                .with_context(|| format!("could not open {}", path.display()))?;
+                .map_err(|e| open(e.into()))?;
+            let index = ArchiveIndex::open(path).map_err(open)?;
             warn_variable_depth(&index);
             served.push(Served {
                 name,
@@ -126,8 +169,10 @@ impl Server {
                 stamp,
             });
         }
-        let http = tiny_http::Server::http((host, port))
-            .map_err(|e| anyhow::anyhow!("could not listen on {host}:{port}: {e}"))?;
+        let http = tiny_http::Server::http((host, port)).map_err(|error| ServeError::Bind {
+            addr: format!("{host}:{port}"),
+            error,
+        })?;
         Ok(Server {
             http,
             archives: served,
@@ -149,10 +194,7 @@ impl Server {
     /// # Errors
     ///
     /// The listening socket failed.
-    pub fn run(mut self, mut keep_going: impl FnMut() -> bool) -> Result<()> {
-        // shortcut: one request at a time; tile reads are sub-millisecond,
-        // so a local viewer does not notice. Add worker threads if a
-        // shared deployment ever needs them.
+    pub fn run(mut self, mut keep_going: impl FnMut() -> bool) -> Result<(), ServeError> {
         while keep_going() {
             if let Some(req) = self.http.recv_timeout(Duration::from_millis(200))? {
                 let host = req
@@ -160,17 +202,38 @@ impl Server {
                     .iter()
                     .find(|h| h.field.equiv("Host"))
                     .map(|h| h.value.to_string());
-                let res = self.respond(&req, host.as_deref());
-                // A client that hung up mid-response is not the server's error.
-                let _ = req.respond(res.with_header(header("Access-Control-Allow-Origin", "*")));
+                let res = self
+                    .respond(&req, host.as_deref())
+                    .with_header(header("Access-Control-Allow-Origin", "*"));
+                // Responses are built here (a lookup and a positioned read)
+                // and sent on their own thread, so a whole-archive download
+                // stalls neither the tiles nor the `keep_going` poll.
+                // shortcut: one thread per response, unbounded, as tiny_http
+                // already has one per connection; pool them if a shared
+                // deployment ever needs a cap.
+                std::thread::spawn(move || {
+                    // A client that hung up mid-response is not the server's error.
+                    let _ = req.respond(res);
+                });
             }
         }
         Ok(())
     }
 
     fn respond(&mut self, req: &Request, host: Option<&str>) -> Response<Box<dyn Read + Send>> {
-        if !matches!(req.method(), Method::Get | Method::Head) {
-            return status(405);
+        match req.method() {
+            Method::Get | Method::Head => {}
+            // The CORS preflight a browser sends before a Range or
+            // conditional request from another origin.
+            Method::Options => {
+                return status(204)
+                    .with_header(header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"))
+                    .with_header(header(
+                        "Access-Control-Allow-Headers",
+                        "Range, If-Match, If-Range",
+                    ));
+            }
+            _ => return status(405),
         }
         let path = req.url().split('?').next().unwrap_or("");
         let parts: Vec<String> = path
