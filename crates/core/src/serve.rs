@@ -297,7 +297,17 @@ impl Server {
                     return status(404);
                 };
                 match self.archive(name) {
-                    Ok(a) => tile(&a.index, z, x, y),
+                    Ok(a) => {
+                        let res = tile(&a.index, z, x, y);
+                        // A rewrite in place that began after `refresh` has
+                        // moved the bytes under the old offsets.
+                        let same = std::fs::metadata(&a.path).is_ok_and(|m| stamp(&m) == a.stamp);
+                        if same {
+                            res
+                        } else {
+                            status(503)
+                        }
+                    }
                     Err(res) => res,
                 }
             }
