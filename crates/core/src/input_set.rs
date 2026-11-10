@@ -1411,12 +1411,20 @@ impl ConvertSource {
     /// Forget everything kept of the footers of the parts `selection` reads
     /// nothing of (#815): their encoded tails, ~0.65 MiB per Overture part,
     /// are only there for a cheap re-parse the run will not need.
-    pub(crate) fn release_unselected(&self, selection: &RowGroupSelection) {
-        for (part, picked) in self.parts().iter().zip(selection.parts()) {
+    /// A `--filter` with no spatial pruning has re-parsed every footer by
+    /// then; those of the parts it pruned are dropped here too.
+    pub(crate) fn release_unselected(
+        &self,
+        selection: &RowGroupSelection,
+    ) -> Result<(), InputError> {
+        let parts = self.metas()?.iter().zip(self.parts());
+        for ((meta, part), picked) in parts.zip(selection.parts()) {
             if picked.is_empty() {
+                *meta.footer.lock().expect("footer slot lock") = None;
                 part.forget_footer();
             }
         }
+        Ok(())
     }
 
     /// Parts whose decoded footer is held.
@@ -2794,6 +2802,24 @@ mod tests {
         };
         assert_eq!(stream_ids(&src, &full).len(), 12);
         assert_eq!(src.resident_footers().unwrap(), 3);
+    }
+
+    /// #815 review: footers re-parsed for a selection (a `--filter` with no
+    /// bbox reads every part's statistics) are dropped for the parts the
+    /// selection then prunes; part 0 included.
+    #[test]
+    fn release_unselected_drops_reparsed_footers() {
+        let dir = tmpdir();
+        for i in 0..3 {
+            write_standard(&dir.path().join(format!("p{i}.parquet")), vec![i], false);
+        }
+        let src = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
+        src.selected_input_bytes(None).unwrap();
+        assert_eq!(src.resident_footers().unwrap(), 3);
+        let sel = RowGroupSelection::from_parts(vec![vec![], vec![0], vec![]]);
+        src.release_unselected(&sel).unwrap();
+        assert_eq!(src.resident_footers().unwrap(), 1);
+        assert_eq!(src.selected_row_count(Some(&sel)).unwrap(), 1);
     }
 
     #[test]

@@ -2765,7 +2765,7 @@ fn preflight_with_memory_limit(
         crs,
     )?;
     if let Some(selection) = &selected_row_groups {
-        source.release_unselected(selection);
+        source.release_unselected(selection)?;
     }
     diagnostics.set_input_rows(source.stream_row_locator(selected_row_groups.as_ref())?);
     let row_groups_read = selected_row_groups
