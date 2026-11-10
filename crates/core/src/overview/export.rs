@@ -3741,7 +3741,7 @@ fn level_waves(plan: &LevelPlan) -> usize {
 }
 
 /// The members a level group has admitted to collect and not yet encoded
-/// (#817, see [`bound_group_cap`]). The collecting thread waits in
+/// (#817, see [`group_schedule`]). The collecting thread waits in
 /// [`Self::admit`] while the next level would take them past `cap`, unless
 /// none are in flight, so a level larger than the cap still runs.
 struct InFlight {
