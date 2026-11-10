@@ -13,7 +13,7 @@ GeoParquet to PMTiles with a Rust engine, CLI, and Python API. [<!-- bench:e2e-c
 
 ```bash
 cargo install tylertoo    # CLI
-pip install tylertoo      # Python
+pip install tylertoo      # Python API, and the CLI as `tylertoo` or `python -m tylertoo`
 ```
 
 ## Quickstart

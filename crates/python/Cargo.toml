@@ -38,6 +38,9 @@ tylertoo-core = { workspace = true, features = ["remote"] }
 # nothing here.
 pyo3 = { workspace = true, features = ["abi3-py311"] }
 pyo3-log = { workspace = true }
+# The CLI itself, as a library: `python -m tylertoo` calls `tylertoo_cli::run`
+# (#819). No default features: the allocator lives in its binary, not here.
+tylertoo = { path = "../cli", default-features = false }
 # Report structs (already serde::Serialize in core) to Python dicts.
 pythonize = "0.29"
 serde = { workspace = true }

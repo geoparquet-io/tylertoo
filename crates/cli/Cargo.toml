@@ -30,6 +30,12 @@ gen-docs = ["dep:clap-markdown"]
 # says. Ignored under `dhat-heap` (dhat owns the allocator).
 mimalloc = ["dep:mimalloc"]
 
+# The whole CLI is `tylertoo_cli::run`, so the Python wheel runs the same
+# code as the binary (#819); main.rs adds only the allocator and profiler.
+[lib]
+name = "tylertoo_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tylertoo"
 path = "src/main.rs"
