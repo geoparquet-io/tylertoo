@@ -390,7 +390,9 @@ Serve PMTiles archives over HTTP with a map viewer.
 
 Run until Ctrl-C. The viewer at `/` handles MVT and MLT archives. It loads MapLibre GL JS from unpkg.com and needs internet access.
 
-`/index.json` lists archive names. Each `{name}` is the archive's file stem. `/{name}.json` returns TileJSON; `/{name}/{z}/{x}/{y}` returns tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns archive metadata; `/{name}/stats.json` returns tile-size statistics. `/{name}.pmtiles` serves the archive with HTTP Range support.
+`/index.json` lists archive names. Each `{name}` is the archive's file stem. `/{name}.json` returns TileJSON; `/{name}/{z}/{x}/{y}` returns tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns archive metadata; `/{name}/stats.json` returns tile-size statistics. `/{name}.pmtiles` serves the archive with HTTP Range support. It honours `If-Match` and `If-Range` against its `ETag`.
+
+`serve` returns HTTP 204 for missing tiles without scaling up a stored ancestor, so variable-depth archives (`--generate-variable-depth-tile-pyramid`) show holes below stopped tiles; `serve` warns when it opens one.
 
 An archive rewritten on disk is reopened on the next request for it.
 

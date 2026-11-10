@@ -110,6 +110,11 @@ enum Command {
     /// tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns
     /// archive metadata; `/{name}/stats.json` returns tile-size statistics.
     /// `/{name}.pmtiles` serves the archive with HTTP Range support.
+    /// It honours `If-Match` and `If-Range` against its `ETag`.
+    ///
+    /// `serve` returns HTTP 204 for missing tiles without scaling up a stored
+    /// ancestor, so variable-depth archives (`--generate-variable-depth-tile-pyramid`)
+    /// show holes below stopped tiles; `serve` warns when it opens one.
     ///
     /// An archive rewritten on disk is reopened on the next request for it.
     Serve(ServeArgs),
