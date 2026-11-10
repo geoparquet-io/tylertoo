@@ -125,7 +125,7 @@ struct Pass2Inputs<'a> {
     footer: Option<FooterPrice>,
     /// The writer's row-group encode grant (#817 B1: the drain widens it).
     encode: Grant,
-    /// What one more drain encode holds ([`drain_slot_price`]).
+    /// What one more drain encode holds ([`encode_price`] at a WKB chunk).
     drain_slot_bytes: u64,
 }
 
@@ -1886,7 +1886,7 @@ struct LevelWriter {
     effective_max_row_group_size: Option<usize>,
     /// What `writer`'s encode concurrency was granted.
     encode: Grant,
-    /// What one more pass-2 drain encode holds ([`drain_slot_price`]).
+    /// What one more pass-2 drain encode holds ([`encode_price`] at a WKB chunk).
     drain_slot_bytes: u64,
 }
 
@@ -2126,9 +2126,15 @@ fn create_level_writer(
     let encodes = budget.encode_concurrency(
         options.profile,
         rayon::current_num_threads(),
-        encode_price(&writer_opts, &level_row_counts, row_bytes),
+        encode_price(&writer_opts, &level_row_counts, row_bytes, 1),
     );
-    let drain_slot_bytes = drain_slot_price(&writer_opts, &level_row_counts, row_bytes).bytes;
+    let drain_slot_bytes = encode_price(
+        &writer_opts,
+        &level_row_counts,
+        row_bytes,
+        super::writer::WKB_ENCODE_CHUNK_ROWS as u64,
+    )
+    .bytes;
     log::info!(
         "[convert] writer: {} concurrent row-group encode(s) x {} B, {} B left",
         encodes.units,
@@ -2170,33 +2176,10 @@ const ENCODE_COPIES: u64 = 5;
 /// the writer's own per-level split ([`super::writer::projected_row_groups`]);
 /// a row is priced at the footers' bytes per input row (an upper bound for
 /// a simplified level), or at [`MemoryBudget::estimate`]'s sink row without
-/// them.
+/// them. A group is priced at `min_rows` at least: a pass-2 drain slot (#817
+/// B1) also admits one WKB chunk of up to
+/// [`WKB_ENCODE_CHUNK_ROWS`](super::writer::WKB_ENCODE_CHUNK_ROWS) rows.
 fn encode_price(
-    writer_opts: &OverviewWriterOptions,
-    level_row_counts: &[usize],
-    row_bytes: Option<u64>,
-) -> Price {
-    encode_price_at_least(writer_opts, level_row_counts, row_bytes, 1)
-}
-
-/// What one encode slot holds once pass 2's drain widens the writer (#817
-/// B1): a slot also admits one WKB chunk of up to
-/// [`WKB_ENCODE_CHUNK_ROWS`](super::writer::WKB_ENCODE_CHUNK_ROWS) rows, so
-/// a level of small row groups is priced at the chunk, not the group.
-fn drain_slot_price(
-    writer_opts: &OverviewWriterOptions,
-    level_row_counts: &[usize],
-    row_bytes: Option<u64>,
-) -> Price {
-    encode_price_at_least(
-        writer_opts,
-        level_row_counts,
-        row_bytes,
-        super::writer::WKB_ENCODE_CHUNK_ROWS as u64,
-    )
-}
-
-fn encode_price_at_least(
     writer_opts: &OverviewWriterOptions,
     level_row_counts: &[usize],
     row_bytes: Option<u64>,
@@ -10099,8 +10082,9 @@ mod tests {
         opts.max_row_group_size = 128;
         let counts = [1_000usize, 50_000, 200_000];
         let row = Some(100u64);
-        let group = encode_price(&opts, &counts, row).bytes;
-        let slot = drain_slot_price(&opts, &counts, row).bytes;
+        let group = encode_price(&opts, &counts, row, 1).bytes;
+        let chunk = crate::overview::writer::WKB_ENCODE_CHUNK_ROWS as u64;
+        let slot = encode_price(&opts, &counts, row, chunk).bytes;
         assert!(group < slot, "group {group} B vs slot {slot} B");
         assert_eq!(slot, 10_000 * 100 * ENCODE_COPIES);
     }
