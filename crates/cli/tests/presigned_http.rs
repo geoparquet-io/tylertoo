@@ -112,3 +112,21 @@ fn a_refused_presigned_url_fails_without_echoing_it() {
     );
     assert!(!out.contains("WRONG820SECRET"), "leaks the query: {out}");
 }
+
+/// A misused flag pair names the input without its query.
+#[test]
+fn a_flag_conflict_does_not_echo_a_presigned_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("inputs.txt");
+    std::fs::write(&manifest, "a.parquet\n").unwrap();
+    let url = format!("https://h/a.parquet?X-Amz-Signature={SIGNATURE}");
+    let (ok, out) = run(&[
+        "tiles",
+        &url,
+        "out.pmtiles",
+        "--files-from",
+        manifest.to_str().unwrap(),
+    ]);
+    assert!(!ok && out.contains("--files-from conflicts"), "{out}");
+    assert_no_signature("the conflict error", &out);
+}

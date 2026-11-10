@@ -254,7 +254,14 @@ impl Band {
     /// none can be derived from the input.
     pub fn parse(spec: &str) -> Result<Self, BandSpecError> {
         use BandSpecError as E;
-        let owned = || spec.to_string();
+        // An error names the spec, minus a URL input's query (#820).
+        let owned = || match spec.find("://") {
+            Some(i) => {
+                let url_at = spec[..i].rfind([':', '=']).map_or(0, |j| j + 1);
+                format!("{}{}", &spec[..url_at], redact_query(&spec[url_at..]))
+            }
+            None => spec.to_string(),
+        };
         let (sep, at) = band_separator(spec).ok_or_else(|| E::NoZoomRange { spec: owned() })?;
         let (range, rest) = spec.split_at(at);
         let rest = &rest[sep.len_utf8()..];
@@ -2906,6 +2913,12 @@ mod tests {
         }
         let err = remote_archive_rejection(Path::new("https://h/a.pmtiles?sig=SECRET")).unwrap();
         assert!(!err.contains("SECRET"), "{err}");
+        // A refused spec is named without its query too.
+        let err = parse_bands(&[format!("9-5:{url}:a")]).unwrap_err();
+        assert!(
+            err.contains("https://h/a.parquet?<redacted") && !err.contains("SECRET"),
+            "{err}"
+        );
     }
 
     /// Spec and set errors come through unchanged, before any existence
