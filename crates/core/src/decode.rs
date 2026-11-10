@@ -700,6 +700,17 @@ const CHUNK_BYTES: usize = 2 << 20;
 /// used, not the work (#817); 16 is where more threads stop buying wall.
 const DECODE_THREADS: usize = 16;
 
+/// A pool of at most [`DECODE_THREADS`] workers for decoding tile bodies, or
+/// `None` when the current pool is already that small. `stats --layers`
+/// decodes on it too, so a crafted archive cannot inflate one 64 MiB body
+/// per core at once.
+pub(crate) fn decode_pool() -> Result<Option<rayon::ThreadPool>, rayon::ThreadPoolBuildError> {
+    let threads = rayon::current_num_threads().min(DECODE_THREADS);
+    (threads < rayon::current_num_threads())
+        .then(|| rayon::ThreadPoolBuilder::new().num_threads(threads).build())
+        .transpose()
+}
+
 /// Most tiles per chunk, whatever their bytes: a run of empty tile bodies
 /// would otherwise make one chunk of millions of tiles.
 const CHUNK_TILES: usize = 4096;
@@ -756,11 +767,7 @@ where
     let decoded_cap = CHUNK_DECODED_OVERRIDE
         .with(|c| c.get())
         .unwrap_or(decoded_cap);
-    let threads = rayon::current_num_threads().min(DECODE_THREADS);
-    let pool = (threads < rayon::current_num_threads())
-        .then(|| rayon::ThreadPoolBuilder::new().num_threads(threads).build())
-        .transpose()
-        .map_err(|e| DecodeError::Write(format!("decode thread pool: {e}")))?;
+    let pool = decode_pool().map_err(|e| DecodeError::Write(format!("decode thread pool: {e}")))?;
     let mut job: Option<J> = None;
     let run = |job: Option<J>| job.map_or(Ok(()), |job| job());
     // Every job runs on the capped pool, the last one included.

@@ -290,40 +290,47 @@ fn layer_stats(
     }
     // Offset order, so each rayon split reads a contiguous stretch of the file.
     let bodies: Vec<_> = bodies.into_iter().collect();
-    let acc = bodies
-        .par_iter()
-        .try_fold(LayerAcc::new, |mut acc, ((offset, length), zooms)| {
-            for (layer, bytes) in &decode_body(archive, *offset, *length)? {
-                let (layer, bytes) = (layer, *bytes);
-                let features = layer.features.len() as u64;
-                let mut types: BTreeMap<&'static str, u64> = BTreeMap::new();
-                for f in &layer.features {
-                    *types.entry(geom_type_name(f.r#type())).or_default() += 1;
-                }
-                for &(z, n) in zooms {
-                    let e = acc.entry((z, layer.name.clone())).or_default();
-                    e.0 = e.0.saturating_add(features.saturating_mul(n));
-                    e.1 = e.1.saturating_add(bytes.saturating_mul(n));
-                    for (&t, &c) in &types {
-                        let v = e.2.entry(t).or_default();
-                        *v = v.saturating_add(c.saturating_mul(n));
+    let pool = crate::decode::decode_pool().map_err(std::io::Error::other)?;
+    let work = || {
+        bodies
+            .par_iter()
+            .try_fold(LayerAcc::new, |mut acc, ((offset, length), zooms)| {
+                for (layer, bytes) in &decode_body(archive, *offset, *length)? {
+                    let (layer, bytes) = (layer, *bytes);
+                    let features = layer.features.len() as u64;
+                    let mut types: BTreeMap<&'static str, u64> = BTreeMap::new();
+                    for f in &layer.features {
+                        *types.entry(geom_type_name(f.r#type())).or_default() += 1;
+                    }
+                    for &(z, n) in zooms {
+                        let e = acc.entry((z, layer.name.clone())).or_default();
+                        e.0 = e.0.saturating_add(features.saturating_mul(n));
+                        e.1 = e.1.saturating_add(bytes.saturating_mul(n));
+                        for (&t, &c) in &types {
+                            let v = e.2.entry(t).or_default();
+                            *v = v.saturating_add(c.saturating_mul(n));
+                        }
                     }
                 }
-            }
-            Ok::<_, crate::Error>(acc)
-        })
-        .try_reduce(LayerAcc::new, |mut a, b| {
-            for (k, (f, bytes, types)) in b {
-                let e = a.entry(k).or_default();
-                e.0 = e.0.saturating_add(f);
-                e.1 = e.1.saturating_add(bytes);
-                for (t, c) in types {
-                    let v = e.2.entry(t).or_default();
-                    *v = v.saturating_add(c);
+                Ok::<_, crate::Error>(acc)
+            })
+            .try_reduce(LayerAcc::new, |mut a, b| {
+                for (k, (f, bytes, types)) in b {
+                    let e = a.entry(k).or_default();
+                    e.0 = e.0.saturating_add(f);
+                    e.1 = e.1.saturating_add(bytes);
+                    for (t, c) in types {
+                        let v = e.2.entry(t).or_default();
+                        *v = v.saturating_add(c);
+                    }
                 }
-            }
-            Ok(a)
-        })?;
+                Ok(a)
+            })
+    };
+    let acc = match &pool {
+        Some(pool) => pool.install(work),
+        None => work(),
+    }?;
     Ok(acc
         .into_iter()
         .map(
@@ -770,6 +777,25 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// `--layers` decodes on `decode`'s capped pool: under a 64-thread pool
+    /// it gets 16 workers, under a small pool it adds none.
+    #[test]
+    fn layer_decode_pool_is_capped_at_decode_threads() {
+        let wide = rayon::ThreadPoolBuilder::new()
+            .num_threads(64)
+            .build()
+            .unwrap();
+        let capped = wide.install(|| crate::decode::decode_pool().unwrap());
+        assert_eq!(capped.map(|p| p.current_num_threads()), Some(16));
+        let narrow = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        assert!(narrow
+            .install(|| crate::decode::decode_pool().unwrap())
+            .is_none());
     }
 
     /// A layer's bytes are its length on the wire, including a layer
