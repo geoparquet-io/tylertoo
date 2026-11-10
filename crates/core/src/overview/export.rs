@@ -11058,9 +11058,7 @@ mod tests {
             // and metadata all hash the same as before. See the REPIN note
             // above this test for the full before/after evidence.
             // #443: default features no longer carry tile-local ids.
-            // #814: tiles are gzipped at level 9; the raw MVT bytes are
-            // unchanged (the decoded-tile checks below still pass).
-            "aa9c455e2f2de08d",
+            "caf04e1922c86b7b",
             "archive bytes diverged from the pre-refactor reference"
         );
 

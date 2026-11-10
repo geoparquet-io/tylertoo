@@ -313,9 +313,7 @@ fn compress_gzip(data: &[u8], _: ()) -> io::Result<Vec<u8>> {
     use flate2::write::GzEncoder;
     use flate2::Compression as GzCompression;
 
-    // #814: level 9 on zlib-rs is 1.75% smaller than the default level 6 on
-    // Brazil buildings tiles, for 1.8x the gzip time (about 1% of a run's CPU).
-    let mut encoder = GzEncoder::new(Vec::new(), GzCompression::best());
+    let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
     encoder.write_all(data)?;
     encoder.finish()
 }
@@ -426,13 +424,6 @@ mod tests {
             compressed.len(),
             data.len()
         );
-    }
-
-    #[test]
-    fn gzip_uses_maximum_compression() {
-        // #814: the gzip header's XFL byte is 2 only at maximum compression.
-        let compressed = compress(b"Hello, PMTiles!", Compression::Gzip).unwrap();
-        assert_eq!(compressed[8], 2, "XFL byte: gzip level must be 9");
     }
 
     #[test]
