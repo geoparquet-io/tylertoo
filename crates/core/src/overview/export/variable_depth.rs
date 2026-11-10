@@ -2346,6 +2346,56 @@ mod tests {
         assert!(stopped(&tiles, 6).is_empty());
     }
 
+    /// #849: with no raw cap the probe is still bounded, by the default raw
+    /// cap. 1,100 points in one z3 tile, each with its own 2,000-byte name,
+    /// draw over 2 MiB raw at every coarser zoom, so nothing stops and the
+    /// z3 tile is stored.
+    #[test]
+    fn no_raw_cap_probe_is_bounded_by_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = 1_100;
+        let geoms: Vec<_> = (0..n)
+            .map(|i| {
+                Some(pt(
+                    6.0 + f64::from(i % 40) * 0.1,
+                    46.0 + f64::from(i / 40) * 0.1,
+                ))
+            })
+            .collect();
+        let names: Vec<String> = (0..n)
+            .map(|i| format!("{i:04}{}", "x".repeat(1996)))
+            .collect();
+        let src = dir.path().join("src_wide.parquet");
+        testutil::write_input_with_column(
+            &src,
+            &geoms,
+            "name",
+            std::sync::Arc::new(arrow_array::StringArray::from(names)),
+            None,
+        );
+        let mut convert = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 3,
+            },
+            ..ConvertOptions::default()
+        };
+        convert.density.enabled = false;
+        convert.assign.point_thinning = 0.0;
+        let ov = dir.path().join("ov_wide.parquet");
+        convert_to_overviews(&src, &ov, &convert).unwrap();
+        for none in [None, Some(0)] {
+            let opts = ExportOptions {
+                tile_size_limit: none,
+                ..raw_cap(0)
+            };
+            let (_, tiles) = export_vd(&ov, opts);
+            assert_contract(&tiles, 3);
+            assert!(stopped(&tiles, 3).is_empty(), "{none:?}");
+            assert!(tiles.contains_key(&(3, 4, 2)), "{none:?}");
+        }
+    }
+
     /// The archive says it is variable-depth, with its canonical max zoom;
     /// the header's max zoom is the deepest stored tile; the report keeps
     /// the canonical and stored max zooms apart; and merge and pyramid
