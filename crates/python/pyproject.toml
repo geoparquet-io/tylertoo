@@ -59,6 +59,10 @@ dev = [
     # scripts/verify_archive.py uses).
     "pmtiles==3.8.1",
     "mapbox-vector-tile==2.2.0",
+    # shortcut: numpy (via mapbox-vector-tile's shapely) 2.5+ is 3.12-only and
+    # its stubs use `type` statements, which mypy's python_version 3.11 cannot
+    # parse once pytest imports them; lift the cap when mypy targets 3.12.
+    "numpy<2.5",
 ]
 # Tools the tutorials call and the site builder (tests/docs, docs.yml).
 # Exact pins: tutorial output is compared line by line, and zensical is
