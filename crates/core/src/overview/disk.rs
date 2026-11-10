@@ -116,10 +116,10 @@ impl DiskFootprint {
         {
             source.resolved_schema()?.crs().and_then(|crs| {
                 // An unusable mask fails the preflight later; size without it.
-                let mask = options
-                    .mask
-                    .as_ref()
-                    .and_then(|m| super::mask::load_for_input(m, crs).ok());
+                let mask = options.mask.as_ref().and_then(|m| {
+                    super::mask::load_for_input(m, crs, &crate::diagnostics::Diagnostics::silent())
+                        .ok()
+                });
                 let bbox = options
                     .bbox
                     .map(|b| super::convert::BboxQuery::new(&b, crs));

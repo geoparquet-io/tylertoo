@@ -709,7 +709,7 @@ pub(crate) fn estimate_with(
         .transpose()?;
     // `--mask` (#826) prunes as the conversion does, then tests each sample.
     let mask = mask
-        .map(|m| super::mask::load_for_input(m, crs))
+        .map(|m| super::mask::load_for_input(m, crs, &crate::diagnostics::Diagnostics::silent()))
         .transpose()?;
     let bbox_query = bbox.map(|b| super::convert::BboxQuery::new(b, crs));
     let mask_query = super::mask::mask_query(mask.as_ref(), crs);

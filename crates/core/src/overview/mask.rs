@@ -19,6 +19,7 @@ use rstar::{RTree, AABB};
 use super::config::ConfigError;
 use super::convert::{BboxQuery, ConvertError};
 use super::level::Crs;
+use crate::diagnostics::{Diagnostic, Diagnostics};
 
 /// Polygons or multipolygons used by
 /// [`ConvertOptions::mask`](super::convert::ConvertOptions::mask) to keep
@@ -62,6 +63,8 @@ fn invalid(message: String) -> ConfigError {
 pub(crate) struct LoadedMask {
     polygons: MultiPolygon<f64>,
     crs: Option<Crs>,
+    /// A GeoParquet mask declared no CRS and WGS84 was assumed (#451).
+    crs_assumed: bool,
 }
 
 /// Read and check a mask: readable, polygonal, not empty.
@@ -97,11 +100,12 @@ pub(crate) fn load(source: &MaskSource) -> Result<LoadedMask, ConfigError> {
 }
 
 fn read(source: &MaskSource) -> Result<LoadedMask, ConfigError> {
-    let (geoms, crs) = match source {
+    let (geoms, crs, crs_assumed) = match source {
         MaskSource::Wkb(bytes) => (
             vec![crate::wkb::wkb_to_geometry(bytes)
                 .map_err(|e| invalid(format!("invalid WKB: {e}")))?],
             None,
+            false,
         ),
         // One regular file: a directory or glob would hide edits from the
         // load cache and the plan fingerprint.
@@ -111,7 +115,9 @@ fn read(source: &MaskSource) -> Result<LoadedMask, ConfigError> {
                 path.display()
             )))
         }
-        MaskSource::Path(path) if is_geojson(path) => (read_geojson(path)?, Some(Crs::Epsg4326)),
+        MaskSource::Path(path) if is_geojson(path) => {
+            (read_geojson(path)?, Some(Crs::Epsg4326), false)
+        }
         MaskSource::Path(path) => read_geoparquet(path)?,
     };
     let mut polygons = Vec::new();
@@ -131,7 +137,11 @@ fn read(source: &MaskSource) -> Result<LoadedMask, ConfigError> {
             return Err(invalid("the mask has a non-finite coordinate".into()));
         }
     }
-    Ok(LoadedMask { polygons, crs })
+    Ok(LoadedMask {
+        polygons,
+        crs,
+        crs_assumed,
+    })
 }
 
 /// The xxh3 of a mask file's bytes: the load cache's key and the convert
@@ -169,7 +179,10 @@ fn read_geojson(path: &Path) -> Result<Vec<Geometry<f64>>, ConfigError> {
     }
 }
 
-fn read_geoparquet(path: &Path) -> Result<(Vec<Geometry<f64>>, Option<Crs>), ConfigError> {
+/// Geometries, their CRS, and whether that CRS was assumed (#451).
+type ReadMask = (Vec<Geometry<f64>>, Option<Crs>, bool);
+
+fn read_geoparquet(path: &Path) -> Result<ReadMask, ConfigError> {
     use crate::input_set::{ConvertSource, ReadPlan};
     let fail = |e: &dyn std::fmt::Display| invalid(format!("cannot read {}: {e}", path.display()));
     let source = ConvertSource::resolve_path(path).map_err(|e| fail(&e))?;
@@ -179,15 +192,14 @@ fn read_geoparquet(path: &Path) -> Result<(Vec<Geometry<f64>>, Option<Crs>), Con
         .geometry_name()
         .and_then(|n| schema.index_of(n).ok())
         .ok_or_else(|| invalid(format!("{} has no geometry column", path.display())))?;
-    let crs = super::convert::crs_from_resolved(
+    let (crs, crs_assumed) = super::convert::crs_from_resolved(
         descriptor,
         &source.display_name(),
-        &crate::diagnostics::Diagnostics::silent(),
+        &Diagnostics::silent(),
     )
-    .map_err(|e| fail(&e))?
-    .0;
+    .map_err(|e| fail(&e))?;
     let field = schema.field(geom_idx).clone();
-    let diagnostics = crate::diagnostics::Diagnostics::silent();
+    let diagnostics = Diagnostics::silent();
     let mut geoms = Vec::new();
     let stream = source
         .open_stream(&ReadPlan {
@@ -219,7 +231,7 @@ fn read_geoparquet(path: &Path) -> Result<(Vec<Geometry<f64>>, Option<Crs>), Con
             geoms.push(g);
         }
     }
-    Ok((geoms, Some(crs)))
+    Ok((geoms, Some(crs), crs_assumed))
 }
 
 fn not_polygonal(kind: &str) -> ConfigError {
@@ -265,15 +277,25 @@ impl LoadedMask {
     }
 }
 
-/// Load `source` for an input in `crs` (load, then the CRS check).
+/// Load `source` for an input in `crs` (load, then the CRS check), naming
+/// the mask in `diagnostics` when its CRS is an assumption (#451).
 ///
 /// # Errors
 /// As [`load`] and [`LoadedMask::into_input_crs`].
 pub(crate) fn load_for_input(
     source: &MaskSource,
     crs: Crs,
+    diagnostics: &Diagnostics,
 ) -> Result<MultiPolygon<f64>, ConvertError> {
-    load(source)?.into_input_crs(crs)
+    let mask = load(source)?;
+    if let (true, MaskSource::Path(path)) = (mask.crs_assumed, source) {
+        diagnostics.once(Diagnostic::CrsAssumed {
+            count: 1,
+            input: format!("--mask {}", path.display()),
+            root: path.display().to_string(),
+        });
+    }
+    mask.into_input_crs(crs)
 }
 
 /// The mask's bbox as a query in `crs` units, with its copies one world
@@ -634,6 +656,58 @@ mod tests {
         let loaded = load(&MaskSource::Path(path)).unwrap();
         assert_eq!(loaded.polygons.0.len(), 1);
         assert_eq!(loaded.crs, Some(Crs::Epsg4326));
+    }
+
+    /// #451: a GeoParquet mask that declares no CRS is taken as WGS84, and
+    /// the run's diagnostics name the mask so the guess stays visible.
+    #[test]
+    fn a_geoparquet_mask_without_a_crs_is_named_as_assumed() {
+        use arrow_array::{BinaryArray, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Little-endian WKB polygon: one ring (0 0, 1 0, 1 1, 0 0).
+        let mut wkb = vec![1u8];
+        wkb.extend_from_slice(&3u32.to_le_bytes());
+        wkb.extend_from_slice(&1u32.to_le_bytes());
+        wkb.extend_from_slice(&4u32.to_le_bytes());
+        for (x, y) in [(0.0f64, 0.0f64), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0)] {
+            wkb.extend_from_slice(&x.to_le_bytes());
+            wkb.extend_from_slice(&y.to_le_bytes());
+        }
+        let field = Field::new("geometry", DataType::Binary, true).with_metadata(
+            [(
+                "ARROW:extension:name".to_string(),
+                "geoarrow.wkb".to_string(),
+            )]
+            .into(),
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BinaryArray::from(vec![wkb.as_slice()]))],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bare.parquet");
+        let mut writer = tylertoo_io::test_support::ArrowWriter::try_new(
+            std::fs::File::create(&path).unwrap(),
+            schema,
+            None,
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let diagnostics = Diagnostics::silent();
+        let mask =
+            load_for_input(&MaskSource::Path(path.clone()), Crs::Epsg4326, &diagnostics).unwrap();
+        assert_eq!(mask.0.len(), 1);
+        let named = diagnostics.snapshot().iter().any(|d| {
+            matches!(d, Diagnostic::CrsAssumed { input, .. }
+                if input == &format!("--mask {}", path.display()))
+        });
+        assert!(named, "{:?}", diagnostics.snapshot());
     }
 
     #[test]

@@ -2767,7 +2767,7 @@ fn preflight_with_memory_limit(
     let mask = options
         .mask
         .as_ref()
-        .map(|m| super::mask::load_for_input(m, crs))
+        .map(|m| super::mask::load_for_input(m, crs, diagnostics))
         .transpose()?;
     let bbox_query = options.bbox.map(|b| BboxQuery::new(&b, crs));
     let mask_query = super::mask::mask_query(mask.as_ref(), crs);
