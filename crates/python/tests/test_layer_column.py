@@ -89,6 +89,33 @@ def test_each_value_is_its_own_layer(tmp_path: Path) -> None:
         assert "crop" not in layer["fields"]
 
 
+def test_layered_mlt_matches_layered_mvt(tmp_path: Path) -> None:
+    """#823 meets #821: every layer is encoded as MLT and merged as one."""
+    source = tmp_path / "crops.parquet"
+    _write_source(source)
+    mvt, mlt = tmp_path / "mvt.pmtiles", tmp_path / "mlt.pmtiles"
+    tylertoo.convert(str(source), str(mvt), max_zoom=4, layer_column="crop")
+    tylertoo.convert(
+        str(source), str(mlt), max_zoom=4, layer_column="crop", tile_format="mlt"
+    )
+
+    assert mlt.read_bytes()[99] == 6  # the header's tile type: MLT
+    counts = [
+        sorted(
+            (r["z"], r["layer"], r["feature_count"])
+            for r in tylertoo.stats(str(p), layers=True)["per_layer"]
+        )
+        for p in (mvt, mlt)
+    ]
+    assert counts[0] == counts[1]
+    assert {layer for _, layer, _ in counts[1]} == {
+        "_unknown",
+        "corn",
+        "rice:2024",
+        "soy",
+    }
+
+
 def test_layer_column_excludes_layer_name(tmp_path: Path) -> None:
     source = tmp_path / "crops.parquet"
     _write_source(source)

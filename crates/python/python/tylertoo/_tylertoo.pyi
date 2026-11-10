@@ -314,6 +314,9 @@ def convert(
     magnitude_ladder: str | None = None,
     max_compressed_tile_size: int | Literal["auto"] | None = "auto",
     max_zoom_simplify_factor: float | None = None,
+    mlt_profile: Literal[
+        "web", "native", "min-size", "diffable", "fast-encoding"
+    ] = "web",
     name: str | None = None,
     no_auto_rank: bool = False,
     no_collapse: bool = False,
@@ -335,6 +338,7 @@ def convert(
     sort_direction: Literal["desc", "asc"] = "desc",
     sort_key: str | None = None,
     tile_buffer: int = 8,
+    tile_format: Literal["mvt", "mlt"] = "mvt",
     tile_range: str | None = None,
     verbatim: bool = False,
 ) -> LayeredConvertReport: ...
