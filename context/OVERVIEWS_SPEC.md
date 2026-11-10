@@ -4,7 +4,7 @@ Version: `0.2.0`
 Status: Draft — v0.1.0 design decisions (§11) APPROVED by maintainer
 2026-07-02; the point-clustering (§12) and line-coalescing (§13)
 extensions consolidated into this version 2026-07-03. Implementation
-may proceed against this document.
+may proceed against this document except §14 (DRAFT, post-1.0).
 License intent: CC BY 4.0
 Standardization target: candidate official GeoParquet extension via
 the opengeospatial/geoparquet process (the `covering` path into 1.1)
@@ -862,6 +862,8 @@ This spec explicitly does NOT address:
 
 Attribute aggregation of dropped features — a v0.1.0 non-goal — is
 now specified as the opt-in point-clustering extension (§12).
+Cell aggregation (DGGS rollup), a separate mechanism, remains out of
+scope for 1.0; §14 is a **DRAFT, post-1.0** proposal.
 
 ---
 
@@ -1055,6 +1057,9 @@ named `point_count` under case-insensitive comparison (same rationale
 as the `level` column rule, §4.1).
 
 ### 12.3 Attribute accumulation (normative when used)
+
+This section applies to point clustering, not the proposed cell rollup
+(§14), whose mergeable partials have different requirements.
 
 A writer MAY additionally aggregate **numeric** columns across each
 cluster (the tippecanoe `--accumulate-attribute` convention): the
@@ -1271,7 +1276,147 @@ requirements of this spec.
 
 ---
 
-## 14. Changelog
+## 14. Cell aggregation (DRAFT — post-1.0)
+
+**Status:** design proposal for #360 (pre-levelled input and format)
+and #332 (native H3/S2/A5 output). This section does not change v0.2.0
+conformance or promise implementation for 1.0. RFC 2119 requirements
+below apply only to the proposed mechanism; its wire format and open
+questions require maintainer approval.
+
+### 14.1 Model and provenance
+
+Cell aggregation is a group-by on a computable parent cell ID, not
+thinning, simplification, or a spatial join. Input MAY be points,
+cell IDs at one resolution, or precomputed aggregate levels. Coarse
+rows summarize finer rows; no surviving source feature is required.
+
+Provenance MUST declare:
+
+- The cell system (`h3`, `s2`, or `a5`), its ID convention/version,
+  the cell-ID column, and any grouping columns (e.g. date).
+- The aggregate levels and their cell resolutions, mapped explicitly
+  to overview level indices and zoom bands. Cell resolution is not
+  the overview `level` or the display zoom.
+- For each aggregate output column, its input column (or row count),
+  function (`count`, `sum`, `min`, `max`, or `mean`), and stored
+  partial-state columns. `mean` MUST carry both sum and non-null
+  count; a finalized mean alone is insufficient.
+- The represented source population, the finest aggregate level,
+  and, for a hybrid, the raw-feature bands and their relationship to
+  that population. Pre-aggregated counts MUST retain their weights;
+  counting input cell rows is not counting their source observations.
+
+### 14.2 Accounting and validation
+
+For levels declared to roll up the same population, a validator MUST
+check the following on logical rows, before tile clipping or boundary
+duplication, and separately for each grouping-key tuple:
+
+- Cell IDs are valid for the declared system and level resolution;
+  `(level, grouping keys, cell ID)` is unique. Resolutions progress
+  coarse to fine (the same resolution MAY serve several zoom bands).
+- Each finer cell maps to exactly one parent ID at the declared
+  coarser resolution, using the system's logical parent operation.
+  The coarser keys MUST equal the grouped finer keys: no populated
+  parent or child is silently dropped or counted twice.
+- Each parent's represented count MUST equal the sum of its children's
+  represented counts **by ID**, and total represented count MUST be
+  conserved across aggregate levels. This is accounting alongside
+  §12's `point_count` and §13's `coalesced_count`, not permission to
+  reinterpret those columns or require aggregate canonical counts of 1.
+- Parent states MUST equal the combination of child states: add
+  counts and sums, take extrema for `min`/`max`, and add both sum and
+  count for `mean`, finalizing as `sum / count`. Means MUST NOT be
+  averaged without their counts. Null inputs do not contribute to
+  numeric states; mean count counts non-null inputs, which can differ
+  from represented population count.
+- Partial states for disjoint subsets MUST combine associatively and
+  commutatively, so partitions, export waves, and shards can merge in
+  any order without changing the represented result. Counts MUST be
+  exact; overflow MUST NOT silently wrap. Floating-point arithmetic
+  is not associative; numerical comparison/reproducibility policy
+  remains an open question, not a claim of bitwise equality.
+
+These checks establish internal consistency, not correctness against
+unavailable original observations. Aggregate-only input cannot recover
+or validate observations it no longer contains. §12.3's requirement to
+recompute clustering attributes from source does not prohibit combining
+sufficient cell-aggregate states under this proposal.
+
+### 14.3 Canonical fidelity, mode, and hybrid bands
+
+Cell aggregation MUST use `duplicating` mode: each level represents
+the complete declared population, and readers select one band rather
+than sum a prefix. `partitioning` cannot express repeated summaries
+under its feature-once contract (§2.3).
+
+For an aggregate-only pyramid, the **finest aggregate level IS the
+source** for §2.4: `canonical_level = L-1` preserves its cell rows,
+geometries, attributes, and partial states value-for-value. It makes
+no fidelity claim about raw observations used upstream to create it.
+This is the proposed carve-out to §§2.2/2.4/6.1, not a relaxation for
+ordinary generalized files.
+
+A hybrid MAY contain cell polygons at coarse zooms and raw features
+at fine zooms in one file/archive, representing the same dataset.
+Bands MUST declare unambiguous zoom ownership so a reader does not
+double-count cells and raw features at a handover. In a GeoParquet
+overview file the shared-schema and row-group rules still apply;
+the finest raw level is canonical under §2.4 without the aggregate-only
+carve-out. Archive band/layer metadata is not defined by this draft.
+
+### 14.4 Nesting and pre-levelled input
+
+S2 children tile their parent exactly. H3 children do not: a parent's
+polygon only approximates the area covered by its logical children.
+A5 also has a logical, non-nesting hierarchy: child pentagons overlap
+their parent without being contained by it (see the upstream
+[A5 hierarchy documentation](https://github.com/felixpalmer/a5/blob/459639e0456f5a880d4860d9fcb4adf346c42e37/docs/api-reference/hierarchy.md)).
+For all three systems, accounting MUST use parent IDs, not polygon
+containment or area-weighted allocation. For H3/A5, independently
+re-indexing observations at every resolution need not give the same
+groups as rolling up their finest cell IDs.
+
+A pre-levelled writer MUST honor the supplied level assignment and
+aggregate values without re-generalizing: no visibility gates,
+thinning, simplification, density drops, clustering, or coalescing.
+It MUST validate level-column/footer agreement (§4.1); spatial sorting
+and row-group packing MAY change physical order. Tile clipping and
+quantization are export operations, not aggregate recomputation.
+
+Implementation context (informative): #367's `--verbatim` supplies
+defaults disabling thinning, visibility gates, simplification, density
+budget, and line coalescing; it leaves the level plan, CRS, layout,
+and explicitly requested clustering unchanged. Explicit tuning
+overrides still win. `tiles --verbatim` also defaults both raw and
+compressed tile-size caps off; explicit caps can still shed features.
+It does **not** consume pre-existing level assignments: conversion
+renames an input `level` column on collision and generates its own.
+Consuming pre-levelled input remains #360(a); exporting an already
+conforming overview file is distinct from converting ordinary input.
+
+### Open questions
+
+- What metadata member names, ID/state column encodings, grouping-key
+  rules, and extension/version negotiation should readers implement?
+- How are resolutions selected from GSD/zoom for H3, S2, and A5, and
+  how is the initial point-to-cell assignment recorded?
+- What count variants, empty/all-null states, result types, overflow
+  handling, and floating-point tolerance or reproducibility rules apply?
+- How are source population, aggregate-only canonical status, and
+  hybrid band handovers/layers encoded and validated across archives?
+- How is pre-levelled input selected and mapped to the footer, and
+  which incompatible generalization/export overrides must be rejected?
+
+---
+
+## 15. Changelog
+
+- **Unreleased (DRAFT, post-1.0)**: proposed cell aggregation (§14)
+  for #360/#332, including provenance, rollup accounting, canonical
+  fidelity, hybrid bands, nesting, and pre-levelled preservation;
+  distinguished it from §12.3 clustering accumulation and the §8 scope.
 
 - **Unreleased (additive, informative)**: `generalization.zoom_ceiling`
   marks a partial file (§3.5), and `coalescing.merged` records whether
