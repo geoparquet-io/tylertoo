@@ -763,8 +763,11 @@ fn write_covered_grid(
             .collect(),
         None,
     ));
-    let batch = RecordBatch::try_new(schema.clone(), vec![ids, weights, categories, geometry, bbox])
-        .expect("grid batch");
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![ids, weights, categories, geometry, bbox],
+    )
+    .expect("grid batch");
 
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(rows_per_group))

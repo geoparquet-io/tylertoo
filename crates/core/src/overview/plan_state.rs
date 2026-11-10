@@ -1206,6 +1206,42 @@ impl ConvertPlan {
     }
 }
 
+/// The plan's level scalars, bounded before anything indexes or allocates by
+/// them: the JSON block is user-reachable input.
+fn check_level_meta(meta: &PlanMeta, path: &Path) -> Result<(), ConvertError> {
+    // `num_levels` sizes an allocation and `finest`/`counts` index it.
+    if meta.num_levels != meta.level_specs.len() {
+        return Err(plan_err(
+            path,
+            &format!(
+                "declares {} level(s) but carries {} level spec(s)",
+                meta.num_levels,
+                meta.level_specs.len(),
+            ),
+        ));
+    }
+    if meta.num_levels > super::convert::MAX_LEVELS {
+        return Err(plan_err(
+            path,
+            &format!(
+                "declares {} level(s); at most {} are supported",
+                meta.num_levels,
+                super::convert::MAX_LEVELS,
+            ),
+        ));
+    }
+    if meta.finest != meta.num_levels.saturating_sub(1) {
+        return Err(plan_err(
+            path,
+            &format!(
+                "names level {} of {} as the finest level, which is always the last",
+                meta.finest, meta.num_levels,
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The JSON block carried in the IPC schema metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanMeta {
@@ -1568,38 +1604,7 @@ impl ConvertPlan {
                 ),
             ));
         }
-        // The JSON block is user-reachable input too: `num_levels` sizes an
-        // allocation and `finest`/`counts` index it, so bound them here
-        // rather than trusting them into a `vec![_; n]`.
-        if meta.num_levels != meta.level_specs.len() {
-            return Err(plan_err(
-                path,
-                &format!(
-                    "declares {} level(s) but carries {} level spec(s)",
-                    meta.num_levels,
-                    meta.level_specs.len(),
-                ),
-            ));
-        }
-        if meta.num_levels > super::convert::MAX_LEVELS {
-            return Err(plan_err(
-                path,
-                &format!(
-                    "declares {} level(s); at most {} are supported",
-                    meta.num_levels,
-                    super::convert::MAX_LEVELS,
-                ),
-            ));
-        }
-        if meta.finest != meta.num_levels.saturating_sub(1) {
-            return Err(plan_err(
-                path,
-                &format!(
-                    "names level {} of {} as the finest level, which is always the last",
-                    meta.finest, meta.num_levels,
-                ),
-            ));
-        }
+        check_level_meta(&meta, path)?;
         let batch = reader
             .next()
             .transpose()
