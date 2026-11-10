@@ -89,6 +89,9 @@ confidence-threshold = 0.8
 # no better one).
 multiple-versions = "deny"
 wildcards = "deny"
+# A bare path dependency is fine in a crate that is never published
+# (`publish = false`): tylertoo-python's on the CLI crate (#819).
+allow-wildcard-paths = true
 deny = [
     # Upstream direct parents must also be named; workspace callers use io.
     { crate = "parquet", wrappers = ["tylertoo-io", "geoparquet"] },
