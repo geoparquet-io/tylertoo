@@ -83,6 +83,9 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- An `https://` input keeps its query string, so presigned S3 and Azure SAS
+  URLs work; the query is shown as `?<redacted>` in logs, errors, reports
+  and saved plans (#820).
 - A crafted Parquet footer with an overlong varint, or a page header that
   skips past the end of the file, is refused instead of allocating gigabytes
   or spinning for minutes (#789).

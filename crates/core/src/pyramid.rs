@@ -28,7 +28,7 @@ use crate::atomic_output::Reserved;
 use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::dedup::TileHasher;
-use crate::input::url_scheme;
+use crate::input::{redact_query, url_scheme};
 use crate::overview::config::{check_ignored_export_fields, ExportField};
 use crate::overview::convert::{convert_to_overviews, ConvertError, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportError, ExportOptions};
@@ -546,8 +546,9 @@ fn remote_archive_rejection(input: &Path) -> Option<String> {
         return None;
     }
     Some(format!(
-        "band input {s:?}: a remote band must be GeoParquet; stage PMTiles \
-         archives locally and point the band at the local file"
+        "band input {:?}: a remote band must be GeoParquet; stage PMTiles \
+         archives locally and point the band at the local file",
+        redact_query(s)
     ))
 }
 
@@ -2093,7 +2094,7 @@ fn build_pyramid_validated(
             band.min_zoom,
             band.max_zoom,
             band.layer,
-            band.input.display(),
+            redact_query(&band.input.to_string_lossy()),
             if opts.convert.is_verbatim() {
                 " (verbatim)"
             } else {
@@ -2210,7 +2211,8 @@ fn collect_band_metadata(
 
 /// How reports and messages name a band: `"layer (path)"`.
 fn band_label(band: &Band) -> String {
-    format!("{} ({})", band.layer, band.input.display())
+    let input = band.input.to_string_lossy();
+    format!("{} ({})", band.layer, redact_query(&input))
 }
 
 /// Merge per-band archives into one, in band order.
@@ -2887,6 +2889,23 @@ mod tests {
         assert_eq!(bands.len(), 2);
         assert_eq!(bands[0].layer, "a");
         assert_eq!((bands[1].min_zoom, bands[1].max_zoom), (6, 9));
+    }
+
+    /// #820: a presigned band URL keeps its query (the reader sends it) in
+    /// both spellings, and a band's label never shows it.
+    #[test]
+    fn a_presigned_band_url_keeps_its_query_but_never_shows_it() {
+        let url = "https://h/a.parquet?X-Amz-Signature=SECRET&X-Amz-Expires=60";
+        for spec in [format!("0-5:{url}:a"), format!("0-5={url}=a")] {
+            let bands = parse_bands(&[spec.as_str()]).unwrap();
+            assert_eq!(
+                (bands[0].input.to_str(), bands[0].layer.as_str()),
+                (Some(url), "a")
+            );
+            assert_eq!(band_label(&bands[0]), "a (https://h/a.parquet?<redacted>)");
+        }
+        let err = remote_archive_rejection(Path::new("https://h/a.pmtiles?sig=SECRET")).unwrap();
+        assert!(!err.contains("SECRET"), "{err}");
     }
 
     /// Spec and set errors come through unchanged, before any existence

@@ -86,6 +86,7 @@ cgroup('s)?
 tmpfs
 mtime
 pushdown
+[Pp]resigned
 preflights
 pipelined
 subprocess

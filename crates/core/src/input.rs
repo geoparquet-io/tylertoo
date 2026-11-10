@@ -327,7 +327,7 @@ impl InputSource {
         {
             return Err(InputError::UnsupportedScheme {
                 scheme: scheme.to_string(),
-                url: input.to_string(),
+                url: redact_query(input).into_owned(),
             });
         }
         #[cfg(feature = "remote")]
@@ -336,7 +336,7 @@ impl InputSource {
         }
         #[cfg(not(feature = "remote"))]
         {
-            Err(InputError::RemoteDisabled(input.to_string()))
+            Err(InputError::RemoteDisabled(redact_query(input).into_owned()))
         }
     }
 
@@ -790,6 +790,24 @@ pub(crate) fn url_scheme(input: &str) -> Option<&str> {
     }
 }
 
+/// `input` with its URL query replaced by `?<redacted>` (#820).
+///
+/// Every copy of an input that is displayed or persisted (logs, errors,
+/// reports, plans) goes through this. A presigned S3 or Azure SAS URL
+/// carries its signature in the query, and so can any other API, under any
+/// parameter name, so the whole query goes rather than a list of known
+/// credential keys. A local path (no `scheme://`) is returned as is: `?` is
+/// a glob character there.
+pub fn redact_query(input: &str) -> std::borrow::Cow<'_, str> {
+    let end = input.find('#').unwrap_or(input.len());
+    match input[..end].find('?') {
+        Some(q) if url_scheme(input).is_some() => {
+            format!("{}?<redacted>{}", &input[..q], &input[end..]).into()
+        }
+        _ => input.into(),
+    }
+}
+
 /// A [`ChunkReader`] over an [`InputSource`]: the type the parquet reader
 /// plumbing is instantiated with.
 #[derive(Debug)]
@@ -852,6 +870,10 @@ pub(crate) mod remote {
 
     use bytes::Bytes;
     use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential};
+    use object_store::client::{
+        HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse,
+        HttpService, ReqwestConnector,
+    };
     use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
     use object_store::http::HttpBuilder;
     use object_store::path::Path as ObjectPath;
@@ -865,7 +887,7 @@ pub(crate) mod remote {
     use tylertoo_io::ReaderMetadata;
     use url::Url;
 
-    use super::{FetchStats, InputError, InputReader};
+    use super::{redact_query, FetchStats, InputError, InputReader};
 
     /// Readahead for the *sequential* read path
     /// ([`tylertoo_io::ChunkReader::get_read`]). The page reader
@@ -969,7 +991,8 @@ pub(crate) mod remote {
 
     /// Resolve the object store + object path for `url_str`.
     ///
-    /// Stores are cached per `scheme://authority` for the life of the
+    /// Stores are cached per `scheme://authority` (plus an http(s) URL's
+    /// query, which its store sends on every request) for the life of the
     /// process, so one convert resolves credentials ONCE per bucket: a
     /// prefix listing and its N per-part sources, or N `--files-from`
     /// manifest entries in the same bucket, all share one store instance
@@ -985,12 +1008,21 @@ pub(crate) mod remote {
         static STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<dyn ObjectStore>>>> =
             OnceLock::new();
 
+        let shown = redact_query(url_str);
         let url = Url::parse(url_str)
-            .map_err(|e| InputError::RemoteConfig(format!("invalid URL {url_str:?}: {e}")))?;
+            .map_err(|e| InputError::RemoteConfig(format!("invalid URL {shown:?}: {e}")))?;
         let (scheme, location) = ObjectStoreScheme::parse(&url).map_err(|e| {
-            InputError::RemoteConfig(format!("cannot interpret URL {url_str:?}: {e}"))
+            InputError::RemoteConfig(format!("cannot interpret URL {shown:?}: {e}"))
         })?;
-        let key = url[..url::Position::BeforePath].to_ascii_lowercase();
+        // An http(s) query (a presigned/SAS signature) is per object, so it
+        // is part of the store's identity; other schemes ignore it.
+        let query = url
+            .query()
+            .filter(|_| matches!(scheme, ObjectStoreScheme::Http));
+        let mut key = url[..url::Position::BeforePath].to_ascii_lowercase();
+        if let Some(q) = query {
+            key = format!("{key}?{q}");
+        }
         let stores = STORES.get_or_init(Default::default);
         if let Some(store) = stores
             .lock()
@@ -1014,15 +1046,17 @@ pub(crate) mod remote {
             ),
             ObjectStoreScheme::Http => {
                 let origin = &url[..url::Position::BeforePath];
+                let builder = HttpBuilder::new()
+                    .with_url(origin)
+                    .with_client_options(ClientOptions::new().with_allow_http(true));
+                let builder = match query {
+                    Some(q) => builder.with_http_connector(QueryConnector(q.into())),
+                    None => builder,
+                };
                 Arc::new(
                     overrides
                         .iter()
-                        .fold(
-                            HttpBuilder::new()
-                                .with_url(origin)
-                                .with_client_options(ClientOptions::new().with_allow_http(true)),
-                            |b, (k, v)| b.with_config(*k, v),
-                        )
+                        .fold(builder, |b, (k, v)| b.with_config(*k, v))
                         .build()
                         .map_err(|e| store_error(url_str, e))?,
                 )
@@ -1030,7 +1064,7 @@ pub(crate) mod remote {
             _ => {
                 return Err(InputError::UnsupportedScheme {
                     scheme: url.scheme().to_string(),
-                    url: url_str.to_string(),
+                    url: shown.into_owned(),
                 })
             }
         };
@@ -1041,6 +1075,43 @@ pub(crate) mod remote {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, Arc::clone(&store));
         Ok((store, location))
+    }
+
+    /// Sends an http(s) input's query string (a presigned S3 or Azure SAS
+    /// signature, #820) on every request its store makes.
+    ///
+    /// `object_store`'s `HttpStore` addresses objects by path alone, so the
+    /// query is added below it, at the transport: `object_store` never holds
+    /// the query, so none of its error messages (which quote the request URI)
+    /// can leak it.
+    #[derive(Debug)]
+    struct QueryConnector(String);
+
+    impl HttpConnector for QueryConnector {
+        fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+            Ok(HttpClient::new(QueryService {
+                inner: ReqwestConnector::default().connect(options)?,
+                query: self.0.clone(),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct QueryService {
+        inner: HttpClient,
+        query: String,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpService for QueryService {
+        async fn call(&self, mut req: HttpRequest) -> Result<HttpResponse, HttpError> {
+            let uri = req.uri();
+            let sep = if uri.query().is_some() { '&' } else { '?' };
+            *req.uri_mut() = format!("{uri}{sep}{}", self.query)
+                .parse()
+                .map_err(|e| HttpError::new(HttpErrorKind::Request, e))?;
+            self.inner.execute(req).await
+        }
     }
 
     /// List the `.parquet` objects under remote prefix `prefix`, applying
@@ -1169,7 +1240,7 @@ pub(crate) mod remote {
         /// object for its size.
         pub(crate) fn connect(url_str: &str) -> Result<Self, InputError> {
             let (store, location) = store_and_location(url_str)?;
-            Self::from_store(store, location, url_str.to_string())
+            Self::from_store(store, location, redact_query(url_str).into_owned())
         }
 
         /// Build a source over an explicit store + location (also the test
@@ -1672,6 +1743,7 @@ pub(crate) mod remote {
         source: object_store::Error,
         custom_endpoint: bool,
     ) -> InputError {
+        let url = redact_query(url);
         if custom_endpoint {
             let text = source.to_string();
             if looks_like_signature_error(&text) {
@@ -1683,7 +1755,7 @@ pub(crate) mod remote {
             }
         }
         InputError::Remote {
-            url: url.to_string(),
+            url: url.into_owned(),
             source,
         }
     }
@@ -4401,6 +4473,31 @@ pub(crate) fn test_memory_source_with_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #820: a URL's query (a presigned or SAS signature) never reaches a
+    /// displayed or persisted copy of the input; a local path keeps its `?`.
+    #[test]
+    fn redact_query_hides_a_url_query_only() {
+        let cases = [
+            (
+                "https://h/o.parquet?X-Amz-Signature=abc&x=1#frag",
+                "https://h/o.parquet?<redacted>#frag",
+            ),
+            ("https://h/o.parquet#a?b", "https://h/o.parquet#a?b"),
+            ("s3://b/k.parquet", "s3://b/k.parquet"),
+            ("data/file?.parquet", "data/file?.parquet"),
+        ];
+        for (input, shown) in cases {
+            assert_eq!(redact_query(input), shown, "{input}");
+        }
+    }
+
+    /// #820: an unsupported or remote-disabled URL is named without its query.
+    #[test]
+    fn scheme_errors_redact_the_query() {
+        let err = InputSource::from_str_input("ftp://h/o.parquet?sig=SECRET").unwrap_err();
+        assert!(!err.to_string().contains("SECRET"), "{err}");
+    }
 
     #[test]
     fn local_path_is_local() {
