@@ -1144,13 +1144,13 @@ fn check_batch_under(batch: &RecordBatch, limit: u64) -> Result<(), ArrowError> 
 /// unread list column would otherwise shrink every batch (Overture
 /// buildings' `sources` took a 3-column read to 6 rows per batch).
 pub fn read_batch_plan(
-    metadata: &ParquetMetaData,
+    reader: &ReaderMetadata,
     row_groups: Option<&[usize]>,
     projection: Option<&ProjectionMask>,
     requested: usize,
     limit: u64,
 ) -> usize {
-    batch_plan(metadata, row_groups, projection, requested, limit).1
+    batch_plan(reader, row_groups, projection, requested, limit).1
 }
 
 /// `(decode, yield)` rows per batch, both at most `requested` and within the
@@ -1167,13 +1167,18 @@ pub fn read_batch_plan(
 /// values per row. Overture segments' 86 list leaves decode one row at a
 /// time, and one-row batches held ~260 KB of fixed Arrow overhead per
 /// buffered row in pass 2.
+///
+/// A schema with 8- or 16-bit dictionary keys yields batches of the decode
+/// size: a joined batch, here or in a caller's regrouping, can hold more
+/// distinct values than the key indexes, which the cast back refuses (#857).
 fn batch_plan(
-    metadata: &ParquetMetaData,
+    reader: &ReaderMetadata,
     row_groups: Option<&[usize]>,
     projection: Option<&ProjectionMask>,
     requested: usize,
     limit: u64,
 ) -> (usize, usize) {
+    let metadata = reader.metadata().as_ref();
     let read = |leaf: &usize| projection.is_none_or(|mask| mask.leaf_included(*leaf));
     let avg = metadata
         .row_groups()
@@ -1264,10 +1269,13 @@ fn batch_plan(
         )
     };
     let joined = rows(decoded_limit(limit), per_row);
-    (
-        rows(decoded_limit(limit).saturating_sub(repeated), fixed).min(joined),
-        joined,
-    )
+    let decode = rows(decoded_limit(limit).saturating_sub(repeated), fixed).min(joined);
+    let narrow = reader
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| narrow_dictionary(f.data_type()));
+    (decode, if narrow { decode } else { joined })
 }
 
 /// The byte-array column that holds the most decoded bytes in total over some
@@ -1499,7 +1507,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
     pub fn build(self) -> Result<UntrustedBatchReader, ParquetError> {
         let limit = byte_array_limit();
         let (rows, join_rows) = batch_plan(
-            self.metadata(),
+            &self.metadata,
             self.row_groups.as_deref(),
             self.projection.as_ref(),
             self.batch_rows,
@@ -1554,18 +1562,6 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
                 .collect::<Result<Vec<_>, _>>()?,
             original.metadata().clone(),
         ));
-        // A joined batch can hold more distinct values than a narrow
-        // dictionary key indexes, which the cast back refuses (#857). Such a
-        // schema keeps batches of the decoded size, as before #848.
-        let join_rows = if schema
-            .fields()
-            .iter()
-            .any(|f| narrow_dictionary(f.data_type()))
-        {
-            rows
-        } else {
-            join_rows
-        };
         Ok(UntrustedBatchReader {
             inner,
             page_eof,
@@ -1976,7 +1972,7 @@ mod tests {
         let source = open_parquet(file).unwrap();
         // A limit the 20,000 list values (340 KB) press against.
         let limit = 200_000;
-        let md = source.metadata().clone();
+        let md = source.metadata.clone();
         assert!(read_batch_plan(&md, None, None, 8192, limit) < 8192);
         let id_only = ProjectionMask::roots(source.parquet_schema(), [0]);
         assert_eq!(
@@ -2039,7 +2035,7 @@ mod tests {
             let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
             writer.write(&batch).unwrap();
             writer.close().unwrap();
-            open_parquet(file).unwrap().metadata().clone()
+            open_parquet(file).unwrap().metadata
         };
         let limit = byte_array_limit();
         let md = write(100_000, 100_000);
@@ -2079,7 +2075,7 @@ mod tests {
         let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
-        let md = open_parquet(file).unwrap().metadata().clone();
+        let md = open_parquet(file).unwrap().metadata;
         // 200 KB decode limit; the group's 6.4M values (57.6 MB) are far
         // past it. A row costs 9 + 9 B fixed and 64 x 9 B of list values.
         let limit = 100_000;
@@ -2139,7 +2135,7 @@ mod tests {
     /// #848 review (#857): row groups of 100 rows with disjoint
     /// `Dictionary(Int8, Utf8)` values, and lists heavy enough to decode one
     /// row at a time. Joined, a batch would span groups and overflow the
-    /// Int8 key on the cast back; a narrow-key schema is not joined past its
+    /// Int8 key on the cast back; a narrow-key schema plans and yields its
     /// decode size.
     #[test]
     fn narrow_dictionaries_are_not_joined_past_their_key() {
@@ -2180,8 +2176,9 @@ mod tests {
         writer.unwrap().close().unwrap();
         let source = open_parquet(file).unwrap();
         let limit = byte_array_limit();
-        let (decode, join) = batch_plan(source.metadata(), None, None, DEFAULT_BATCH_ROWS, limit);
-        assert!(decode < 100 && join > 256, "({decode}, {join})");
+        let (decode, join) = batch_plan(&source.metadata, None, None, DEFAULT_BATCH_ROWS, limit);
+        // Callers regroup to the plan's yield too (core's `Regrouper`).
+        assert!(decode < 100 && join == decode, "({decode}, {join})");
         let rows: usize = source
             .build()
             .unwrap()
@@ -2206,7 +2203,7 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         let source = open_parquet(file).unwrap();
-        let rows = read_batch_plan(source.metadata(), None, None, 100, 1000);
+        let rows = read_batch_plan(&source.metadata, None, None, 100, 1000);
         assert!(rows * 100 * 8 <= 2000, "planned {rows} wide numeric rows");
     }
 

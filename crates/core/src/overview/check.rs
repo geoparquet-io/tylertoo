@@ -1068,16 +1068,19 @@ pub fn fuzz_parquet_footer(thrift: &[u8]) -> Result<ValidationReport, tylertoo_i
         let _ = crate::covering::extract_row_group_bounds_tiered(&md, crs, geom.as_deref());
     }
 
+    let reader = tylertoo_io::reader_metadata(std::sync::Arc::new(md.clone())).ok();
     let some: Vec<usize> = (0..n).step_by(2).collect();
     for selected in [None, Some(some.as_slice())] {
         let _ = crate::input::selected_compressed_bytes(&md, selected);
-        let _ = tylertoo_io::read_batch_plan(
-            &md,
-            selected,
-            None,
-            8192,
-            tylertoo_io::byte_array_limit(),
-        );
+        if let Some(reader) = &reader {
+            let _ = tylertoo_io::read_batch_plan(
+                reader,
+                selected,
+                None,
+                8192,
+                tylertoo_io::byte_array_limit(),
+            );
+        }
         let _ = tylertoo_io::largest_byte_array_column(&md, selected, |i| i % 2 == 0);
     }
 
@@ -2172,7 +2175,7 @@ mod tests {
         // #607: 4 MiB rows put 1024 of them at 4 GiB, past arrow's i32
         // offsets. The owner's cap, which the cluster read now goes
         // through, keeps a batch near 1 GiB: 256 rows.
-        let md = wide_rows_meta(4, 4 << 20);
+        let md = tylertoo_io::reader_metadata(Arc::new(wide_rows_meta(4, 4 << 20))).unwrap();
         let rows =
             tylertoo_io::read_batch_plan(&md, None, None, 1024, tylertoo_io::byte_array_limit());
         assert!(rows < 1024, "{rows}");
@@ -2181,7 +2184,7 @@ mod tests {
 
     #[test]
     fn cluster_read_batch_rows_keeps_the_default_for_narrow_rows() {
-        let md = wide_rows_meta(16, 100);
+        let md = tylertoo_io::reader_metadata(Arc::new(wide_rows_meta(16, 100))).unwrap();
         assert_eq!(
             tylertoo_io::read_batch_plan(&md, None, None, 1024, tylertoo_io::byte_array_limit()),
             1024

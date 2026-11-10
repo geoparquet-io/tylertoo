@@ -1007,7 +1007,7 @@ impl ConvertSource {
                     )
                 });
                 tylertoo_io::read_batch_plan(
-                    &m.parquet,
+                    &m.reader,
                     selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice),
                     mask.as_ref(),
                     rows,
