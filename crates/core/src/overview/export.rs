@@ -3638,6 +3638,14 @@ fn export_level_group(
                         break 'levels;
                     }
                 }
+                let wave = partitions
+                    .chunks(level.plan.wave.max(1))
+                    .nth(w)
+                    .unwrap_or_default();
+                // Admitted before a level's store fills, so the fill waits
+                // until the waves still encoding and this one fit the cap:
+                // the store's grant plus one wave, as in the serial loop.
+                let held = in_flight.admit(wave.iter().map(|p| p.members).sum());
                 let start = Instant::now();
                 if w == 0 && multi_wave && store.is_none() {
                     if let Some(read) = level.level_read {
@@ -3650,11 +3658,6 @@ fn export_level_group(
                         );
                     }
                 }
-                let wave = partitions
-                    .chunks(level.plan.wave.max(1))
-                    .nth(w)
-                    .unwrap_or_default();
-                let held = in_flight.admit(wave.iter().map(|p| p.members).sum());
                 let spill_bytes = match (&level_store, &store) {
                     _ if w > 0 => 0,
                     (Some(s), _) => s.level_spilled_bytes(0),
