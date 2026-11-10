@@ -123,6 +123,9 @@ pub(super) mod cost_probe {
         /// The most a window held: retained bytes, in-flight shares and paths.
         pub(crate) pyramid_reserved_peak: usize,
         pub(crate) seed_frame_writers: usize,
+        /// #830: the most the serial seed held while writing one bucket: it,
+        /// the buckets waiting behind it, and the runs' nodes.
+        pub(crate) seed_serial_peak: usize,
         pub(crate) map_peak: usize,
         pub(crate) live_peak: usize,
         pub(crate) box_comparisons: usize,
@@ -2250,8 +2253,29 @@ fn seed_batch(
         .saturating_add((buckets.tiles.len() + new_runs) * 512)
         .saturating_add(pending.len() * std::mem::size_of::<(&u64, &Bucket)>());
     if held.saturating_add(RUN_WRITER_BYTES) > buckets.budget {
-        for (key, (shapes, credits)) in pending {
-            buckets.append(key, &shapes, &credits, 0)?;
+        // #830: each write is charged its bucket, the buckets still waiting
+        // behind it and its writer, beside the runs' nodes. Largest first,
+        // so the waiting bytes fall fastest while new runs add their nodes;
+        // write order between tiles is immaterial.
+        let mut serial: Vec<(u64, Bucket, usize)> = pending
+            .into_iter()
+            .map(|(key, (shapes, credits))| {
+                let bytes = shape_capacity_bytes(&shapes)
+                    + credits.capacity() * std::mem::size_of::<Collapsed>();
+                (key, (shapes, credits), bytes)
+            })
+            .collect();
+        serial.sort_by_key(|&(key, _, bytes)| (std::cmp::Reverse(bytes), key));
+        let mut waiting = pending_bytes;
+        for (key, (shapes, credits), bytes) in serial {
+            waiting -= bytes;
+            #[cfg(test)]
+            cost_probe::update(|c| {
+                c.seed_serial_peak = c
+                    .seed_serial_peak
+                    .max(waiting + bytes + RUN_WRITER_BYTES + (buckets.tiles.len() + 1) * 512);
+            });
+            buckets.append(key, &shapes, &credits, waiting + bytes + RUN_WRITER_BYTES)?;
         }
         return Ok(());
     }
@@ -3476,18 +3500,76 @@ pub(super) mod tests {
             &mut features,
         )
         .expect_err("the merged bucket outgrows its pieces");
-        // The serial seed's own checks: the pending geometry, then each new
-        // run's node on its own. It frees each bucket as it writes it, so
-        // the batched writer, which holds them all beside the runs and a
-        // writer, does not run here.
-        let budget = usize::try_from(pending).unwrap().max(512);
+        // The serial seed's own checks: the pending geometry, then each
+        // write's bucket, the buckets waiting behind it and its writer beside
+        // the runs' nodes (#830). It frees each bucket as it writes it, so
+        // the batched writer, which holds them all at once, does not run here.
+        let budget = usize::try_from(pending).unwrap() + 512 + RUN_WRITER_BYTES;
         cost_probe::take();
         seed_z4(&batch, &mut SpillBuckets::new(&opts, budget), &mut features).unwrap();
         assert_eq!(cost_probe::take().seed_frame_writers, 0);
         // With room for all of it, the batched writer runs.
-        let room = budget + 512 + RUN_WRITER_BYTES + 64;
+        let room = budget + 64;
         seed_z4(&batch, &mut SpillBuckets::new(&opts, room), &mut features).unwrap();
         assert_eq!(cost_probe::take().seed_frame_writers, 1);
+    }
+
+    /// #830: the serial seed charges the buckets still waiting behind each
+    /// write. Many small buckets ahead of one large one in key order held
+    /// every small run's node beside the large bucket, past the grant.
+    #[test]
+    fn the_serial_seed_counts_the_buckets_waiting_to_be_written() {
+        let opts = super::super::ExportOptions::default();
+        let tiles: Vec<(u32, u32)> = (0..16).flat_map(|x| [(x, 6), (x, 7)]).collect();
+        let big = *tiles
+            .iter()
+            .max_by_key(|&&(x, y)| super::super::tile_key(x, y, 4))
+            .unwrap();
+        // One square per small tile, and a 30 x 30 grid of squares in the
+        // large one: its merged bucket far outweighs a run's node.
+        let geoms: Vec<geo::Geometry<f64>> = tiles
+            .iter()
+            .flat_map(|&(x, y)| {
+                let b = super::super::TileCoord::new(x, y, 4).bounds();
+                let (cx, cy) = (
+                    f64::midpoint(b.lng_min, b.lng_max),
+                    f64::midpoint(b.lat_min, b.lat_max),
+                );
+                let n = if (x, y) == big { 30 } else { 1 };
+                (0..n * n).map(move |i| {
+                    let (dx, dy) = (f64::from(i % n), f64::from(i / n));
+                    geo::Geometry::Polygon(
+                        geo::Rect::new(
+                            geo::coord! { x: cx + 0.3 * dx, y: cy - 0.3 * dy },
+                            geo::coord! { x: cx + 0.3 * dx + 0.2, y: cy - 0.3 * dy + 0.2 },
+                        )
+                        .to_polygon(),
+                    )
+                })
+            })
+            .collect();
+        let batch = geometry_batch(&geoms);
+        let mut features = 0;
+        // The tightest grant the seed completes in: its checks pass, and the
+        // batched writer does not fit, so the serial seed runs.
+        let (mut lo, mut hi) = (0usize, 1usize << 24);
+        while lo + 1 < hi {
+            let mid = lo.midpoint(hi);
+            match seed_z4(&batch, &mut SpillBuckets::new(&opts, mid), &mut features) {
+                Ok(()) => hi = mid,
+                Err(_) => lo = mid,
+            }
+        }
+        let budget = hi;
+        cost_probe::take();
+        seed_z4(&batch, &mut SpillBuckets::new(&opts, budget), &mut features).unwrap();
+        let counts = cost_probe::take();
+        assert_eq!(counts.seed_frame_writers, 0, "the serial seed ran");
+        assert!(
+            counts.seed_serial_peak <= budget,
+            "the serial seed held {} B against a {budget} B grant",
+            counts.seed_serial_peak
+        );
     }
 
     /// #817 review: a tile built alone needs no more workspace than the
