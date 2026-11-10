@@ -173,6 +173,30 @@ pub(crate) fn collected_line_bytes(g: &Geometry<f64>) -> u64 {
     COALESCE_MODEL_SLOT_BYTES + (g.coords_count() as u64) * COALESCE_MODEL_COORD_BYTES
 }
 
+/// Resident bytes per collected line that [`collected_line_bytes`] leaves
+/// out, measured with dhat on 594,621 Overture segments (#851): the scratch
+/// `Vec`s' growth slack and its `rows`/`sort_keys`/`groups` side vectors,
+/// 162 MiB held against 118 MiB modelled, about 77 B per line.
+///
+/// A price, not part of the guard's model: [`collected_line_bytes`] decides
+/// whether a file is coalesced, so it must not move; this only sizes memory.
+pub(crate) const LINE_SCRATCH_UNMODELLED_BYTES_PER_LINE: u64 = 80;
+
+/// Bytes per collected line of the exact-endpoint join every level of the
+/// chain stage shares ([`ExactChains`]): the borrowed inputs, the ranks, and
+/// the joined pieces. Measured 145 B per line alongside
+/// [`LINE_SCRATCH_UNMODELLED_BYTES_PER_LINE`].
+pub(crate) const EXACT_JOIN_BYTES_PER_LINE: u64 = 150;
+
+/// What the chain stage holds before any level runs: the line scratch
+/// (`modelled` bytes of [`collected_line_bytes`] plus what that model leaves
+/// out) and the exact join every level shares.
+pub(crate) fn chain_stage_resident_bytes(lines: usize, modelled: u64) -> u64 {
+    (lines as u64)
+        .saturating_mul(LINE_SCRATCH_UNMODELLED_BYTES_PER_LINE + EXACT_JOIN_BYTES_PER_LINE)
+        .saturating_add(modelled)
+}
+
 /// One candidate line feature for a level's coalescing pass.
 #[derive(Debug, Clone)]
 pub struct CoalesceInput<'a> {

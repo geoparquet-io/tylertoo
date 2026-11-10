@@ -45,7 +45,9 @@ use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
 use super::cluster::{ClusterEntry, ClusterTables};
-use super::coalesce::{collected_line_bytes, CoalesceInput, ExactChains};
+use super::coalesce::{
+    chain_stage_resident_bytes, collected_line_bytes, CoalesceInput, ExactChains,
+};
 use super::config::ValidatedConfig;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
@@ -2243,7 +2245,7 @@ fn coalesce_level_counts(
     let finest = level_specs.len().saturating_sub(1);
     let line_bytes: u64 = scratch.geoms.iter().map(collected_line_bytes).sum();
     let budget = memory.allowance(options.profile);
-    let wave = chain_stage_wave(level_specs.len(), line_bytes, budget);
+    let wave = chain_stage_wave(level_specs.len(), scratch.rows.len(), line_bytes, budget);
     coalesce_level_counts_in_waves(
         scratch,
         CoalesceCountPlan {
@@ -2262,19 +2264,24 @@ fn coalesce_level_counts(
 /// pieces and sorted endpoint incidences, the merged chain runs, and the
 /// simplified table. Measured on 1.5M 7-vertex lines (240 MiB modelled):
 /// ≈310 MiB per concurrently running level, about 1.3×; 2 leaves headroom
-/// for longer merged strokes.
+/// for longer merged strokes. Since #851 one level holds about 0.8× on
+/// Overture segments. What every level shares (the scratch and the exact
+/// join, [`chain_stage_resident_bytes`]) comes off the budget first.
 const CHAIN_STAGE_TRANSIENT_FACTOR: u64 = 2;
 
 /// How many levels' chain stages [`coalesce_level_counts`] runs at once:
-/// `budget` over one level's modelled transient, clamped to `1..=levels`.
-/// No line bytes (or an unbounded `speed` budget) means no bound.
-fn chain_stage_wave(levels: usize, line_bytes: u64, budget: u64) -> usize {
+/// what `budget` holds beyond the stage's resident bytes
+/// ([`chain_stage_resident_bytes`] of `lines` lines, `line_bytes` modelled),
+/// over one level's modelled transient, clamped to `1..=levels`. No line
+/// bytes (or an unbounded `speed` budget) means no bound.
+fn chain_stage_wave(levels: usize, lines: usize, line_bytes: u64, budget: u64) -> usize {
     let levels = levels.max(1);
     let per_level = line_bytes.saturating_mul(CHAIN_STAGE_TRANSIENT_FACTOR);
     if per_level == 0 {
         return levels;
     }
-    usize::try_from(budget / per_level)
+    let free = budget.saturating_sub(chain_stage_resident_bytes(lines, line_bytes));
+    usize::try_from(free / per_level)
         .unwrap_or(usize::MAX)
         .clamp(1, levels)
 }
@@ -10329,12 +10336,26 @@ mod tests {
     #[test]
     fn chain_stage_wave_is_bounded_by_the_budget() {
         let per_level = 100 * CHAIN_STAGE_TRANSIENT_FACTOR;
-        assert_eq!(chain_stage_wave(7, 100, u64::MAX), 7, "unbounded: all");
-        assert_eq!(chain_stage_wave(7, 100, per_level * 3), 3);
-        assert_eq!(chain_stage_wave(7, 100, per_level * 3 + 1), 3);
-        assert_eq!(chain_stage_wave(7, 100, 1), 1, "never below one level");
-        assert_eq!(chain_stage_wave(7, 0, 1), 7, "no line bytes: no bound");
-        assert_eq!(chain_stage_wave(0, 100, u64::MAX), 1);
+        // No lines: only the modelled bytes are resident.
+        let resident = chain_stage_resident_bytes(0, 100);
+        assert_eq!(chain_stage_wave(7, 0, 100, u64::MAX), 7, "unbounded: all");
+        assert_eq!(chain_stage_wave(7, 0, 100, resident + per_level * 3), 3);
+        assert_eq!(chain_stage_wave(7, 0, 100, resident + per_level * 3 + 1), 3);
+        assert_eq!(chain_stage_wave(7, 0, 100, 1), 1, "never below one level");
+        assert_eq!(chain_stage_wave(7, 0, 0, 1), 7, "no line bytes: no bound");
+        assert_eq!(chain_stage_wave(0, 0, 100, u64::MAX), 1);
+    }
+
+    /// The line scratch and the exact join are resident before any level
+    /// runs, so they come off the budget before it is split into levels
+    /// (#851): a budget holding them plus one level runs one level at a time.
+    #[test]
+    fn chain_stage_waves_leave_room_for_what_every_level_shares() {
+        let lines = 1_000_000;
+        let modelled = 200 * lines as u64;
+        let per_level = modelled * CHAIN_STAGE_TRANSIENT_FACTOR;
+        let budget = chain_stage_resident_bytes(lines, modelled) + per_level;
+        assert_eq!(chain_stage_wave(14, lines, modelled, budget), 1);
     }
 
     /// Running the levels in bounded waves changes the peak, never the result:
