@@ -76,31 +76,36 @@ reason = "+22% on the 2026-11-02 runner (#773) against -3% in local interleaved 
 # benchmarks/baseline/valve_guard.json. Drop an entry when its cell clears the floor.
 
 [cores_floor.792-def]
-reason = "Export-only cell (no convert phase): levels is about 95% of wall (9.4 of 9.9 s at 21.5 cores, 16-to-64 levels speedup 1.07). perf on fe2bdc9 (~/wt/817-notes/vg-perf/def.windows.txt): the run averages 23 cores and spends 3.1 s in five windows of 3-8 cores, each a few size-capped building tiles still in the size valve (merge_to_fit 22-59% inclusive: compare_by_feature_order sort, union_group/interacting_pairs, gzip), the V1 long tail of ~/wt/817-notes/ab/ROUND2.md that PROFILE-LOG-V.md stops at (next step needs i_overlay internals or an output change)."
+reason = "Export-only cell (no convert phase): levels is about 95% of wall (9.4 of 9.9 s at 21.5 cores, 16-to-64 levels speedup 1.07). perf on fe2bdc9: the run averages 23 cores and spends 3.1 s in five windows of 3-8 cores, each a few size-capped building tiles still in the size valve (merge_to_fit 22-59% inclusive: compare_by_feature_order sort, union_group/interacting_pairs, gzip), the V1 long tail of the #818 profile notes (next step needs i_overlay internals or an output change)."
 issue = 813
 measured = "20.88 cores, serial_share 0.020, at 64 threads, fe2bdc9"
 
 [cores_floor.792-nocap]
-reason = "Same export as 792-def (no compressed-size cap); levels runs at 22.8 cores. perf of 792-def on fe2bdc9 (~/wt/817-notes/vg-perf/def.windows.txt): the run averages 23 cores and spends 3.1 s in five windows of 3-8 cores, each a few size-capped building tiles still in the size valve (merge_to_fit 22-59% inclusive: compare_by_feature_order sort, union_group/interacting_pairs, gzip), the V1 long tail of ~/wt/817-notes/ab/ROUND2.md that PROFILE-LOG-V.md stops at (next step needs i_overlay internals or an output change)."
+reason = "Same export as 792-def (no compressed-size cap); levels runs at 22.8 cores. perf of 792-def on fe2bdc9: the run averages 23 cores and spends 3.1 s in five windows of 3-8 cores, each a few size-capped building tiles still in the size valve (merge_to_fit 22-59% inclusive: compare_by_feature_order sort, union_group/interacting_pairs, gzip), the V1 long tail of the #818 profile notes (next step needs i_overlay internals or an output change)."
 issue = 813
 measured = "21.92 cores, serial_share 0.022, at 64 threads, fe2bdc9"
 
 [cores_floor.792-def-glibc]
-reason = "Same export as 792-def (glibc build); levels runs at 19.3 cores. perf of 792-def on fe2bdc9 (~/wt/817-notes/vg-perf/def.windows.txt): the run averages 23 cores and spends 3.1 s in five windows of 3-8 cores, each a few size-capped building tiles still in the size valve (merge_to_fit 22-59% inclusive: compare_by_feature_order sort, union_group/interacting_pairs, gzip), the V1 long tail of ~/wt/817-notes/ab/ROUND2.md that PROFILE-LOG-V.md stops at (next step needs i_overlay internals or an output change)."
+reason = "Same export as 792-def (glibc build); levels runs at 19.3 cores. perf of 792-def on fe2bdc9: the run averages 23 cores and spends 3.1 s in five windows of 3-8 cores, each a few size-capped building tiles still in the size valve (merge_to_fit 22-59% inclusive: compare_by_feature_order sort, union_group/interacting_pairs, gzip), the V1 long tail of the #818 profile notes (next step needs i_overlay internals or an output change)."
 issue = 813
 measured = "18.63 cores, serial_share 0.016, at 64 threads, fe2bdc9"
 
 [cores_floor.792-drop]
-reason = "Export-only cell (no convert phase): levels is about 94% of wall (5.9 of 6.3 s at 19.2 cores). perf on fe2bdc9 (~/wt/817-notes/vg-perf/drop.windows.txt): mean 19 cores; 2.2 s in two windows of 5-7 cores where only the last dense tiles of a level encode (encode_buckets, compress_gzip, add_encoded_feature), the per-level fork-join tail E1 in ~/wt/817-notes/ab/ROUND2.md; under drop the valve does no merging, so nothing to split."
+reason = "Export-only cell (no convert phase): levels is about 94% of wall (5.9 of 6.3 s at 19.2 cores). perf on fe2bdc9: mean 19 cores; 2.2 s in two windows of 5-7 cores where only the last dense tiles of a level encode (encode_buckets, compress_gzip, add_encoded_feature), the per-level fork-join tail E1 in the #818 profile notes; under drop the valve does no merging, so nothing to split."
 issue = 813
 measured = "18.36 cores, serial_share 0.021, at 64 threads, fe2bdc9"
 
 [cores_floor.792-dropnocap]
-reason = "Same export as 792-drop (no compressed-size cap); levels runs at 21.7 cores. perf of 792-drop on fe2bdc9 (~/wt/817-notes/vg-perf/drop.windows.txt): mean 19 cores; 2.2 s in two windows of 5-7 cores where only the last dense tiles of a level encode (encode_buckets, compress_gzip, add_encoded_feature), the per-level fork-join tail E1 in ~/wt/817-notes/ab/ROUND2.md; under drop the valve does no merging, so nothing to split."
+reason = "Same export as 792-drop (no compressed-size cap); levels runs at 21.7 cores. perf of 792-drop on fe2bdc9: mean 19 cores; 2.2 s in two windows of 5-7 cores where only the last dense tiles of a level encode (encode_buckets, compress_gzip, add_encoded_feature), the per-level fork-join tail E1 in the #818 profile notes; under drop the valve does no merging, so nothing to split."
 issue = 813
 measured = "20.19 cores, serial_share 0.040, at 64 threads, fe2bdc9"
 
 [cores_floor.792-drop-glibc]
-reason = "Same export as 792-drop (glibc build); levels runs at 17.3 cores. perf of 792-drop on fe2bdc9 (~/wt/817-notes/vg-perf/drop.windows.txt): mean 19 cores; 2.2 s in two windows of 5-7 cores where only the last dense tiles of a level encode (encode_buckets, compress_gzip, add_encoded_feature), the per-level fork-join tail E1 in ~/wt/817-notes/ab/ROUND2.md; under drop the valve does no merging, so nothing to split."
+reason = "Same export as 792-drop (glibc build); levels runs at 17.3 cores. perf of 792-drop on fe2bdc9: mean 19 cores; 2.2 s in two windows of 5-7 cores where only the last dense tiles of a level encode (encode_buckets, compress_gzip, add_encoded_feature), the per-level fork-join tail E1 in the #818 profile notes; under drop the valve does no merging, so nothing to split."
 issue = 813
 measured = "16.5 cores, serial_share 0.020, at 64 threads, fe2bdc9"
+
+[cores_floor.moldova-f0]
+reason = "Factor-0 tiles run whose levels phase ends in the size-valve long tail (merge_to_fit -> union_group on one merged feature per tile, the remaining #772 cost). Whole-run cores sit on the 0.4 x nproc floor: 27.17 at record, then 25.55 and 26.45 on unchanged reruns of fe2bdc9 (wall 8.6-11.7 s), so the floor would flap nightly. Exempt until the valve tail moves (#772)."
+issue = 772
+measured = "25.55-27.17 cores across 3 runs, at 64 threads, fe2bdc9"

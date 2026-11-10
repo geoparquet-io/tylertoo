@@ -10,7 +10,7 @@ from pathlib import Path
 EXEMPTIONS = Path(__file__).resolve().parents[3] / "ci" / "exemptions.toml"
 
 # Update with the entry you add or remove, and say why in the PR.
-EXPECTED_COUNT = 17
+EXPECTED_COUNT = 18
 
 
 def _entries():
