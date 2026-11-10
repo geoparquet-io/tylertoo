@@ -1430,6 +1430,61 @@ precision. Other positive values are accepted with a warning.
 
 ---
 
+## Tile format: `--tile-format`, `--mlt-profile`
+
+MLT (MapLibre Tile) is a columnar vector-tile format. MapLibre GL JS 5.12 or
+later and MapLibre Native decode it.
+
+Other clients (Mapbox GL, OpenLayers, older GL JS) need MVT. MVT stays the
+default.
+
+Use `--tile-format mlt` on `tiles`, `export-pmtiles` and `pyramid`, or
+Python's `tile_format='mlt'` on `convert()`, `export_pmtiles()` and
+`pyramid()`.
+
+Each tile is built as MVT, then converted with `mlt-core` before the size
+caps and gzip.
+
+`--mlt-profile` is refused without `--tile-format mlt`:
+
+| Value | Use |
+|-------|-----|
+| `web` (default) | For GL JS before 6.0, whose `@maplibre/mlt` 1.1 decoder reads no FastPFOR, FSST or shared dictionaries. Integer columns wider than 32 bits become doubles when every value is exact (absolute value at most 2^53), since GL JS reads 64-bit integers as BigInt. |
+| `native` | MapLibre Native, every codec and stored polygon triangles. |
+| `min-size` | Smallest tiles. |
+| `diffable` | Small binary diffs between releases. |
+| `fast-encoding` | Quickest encode, larger tiles. |
+
+No profile reorders features, so `--feature-order` holds.
+
+Measured on tylertoo's real-data fixtures, archives were 10% smaller for
+Madagascar admin-4 polygons (125.5 MB to 113.2 MB), 20% for road-detection
+lines and 28% for a two-band pyramid. Export wall time was about 5–10%
+longer.
+
+The size caps measure MLT bytes, so a tile near the cap keeps more features
+than its MVT would. Thinning can differ from an MVT build.
+
+`merge` refuses to combine MVT and MLT archives. Pyramid bands must all
+match `--tile-format`.
+
+MLT archives use PMTiles tile type 6 and metadata format `mlt`. `stats
+--layers` and `decode` read MLT archives.
+
+CLI:
+
+```bash
+tylertoo tiles admin.parquet admin.pmtiles --tile-format mlt
+```
+
+Python:
+
+```python
+tylertoo.convert('admin.parquet', 'admin.pmtiles', tile_format='mlt')
+```
+
+---
+
 ## Export and archive commands: `export-pmtiles`, `merge`, `stats`
 
 ### Tile size cap
