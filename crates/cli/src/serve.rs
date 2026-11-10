@@ -353,11 +353,22 @@ fn raw(path: &Path, req: &Request) -> Response<Box<dyn Read + Send>> {
         Err(e) => return error(&e),
     };
     let len = version.0;
-    let range = req
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Range"))
-        .map(|h| parse_range(h.value.as_str(), len));
+    let tag = etag(version);
+    let get = |name: &'static str| {
+        req.headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().trim())
+    };
+    // A client holding offsets from an older version must not get bytes
+    // of this one: `If-Match` fails, and `If-Range` falls back to the whole
+    // file (RFC 9110 13.1.1, 13.1.5).
+    if get("If-Match").is_some_and(|m| m != "*" && m.split(',').all(|t| t.trim() != tag)) {
+        return status(412).with_header(header("ETag", &tag));
+    }
+    let range = get("Range")
+        .filter(|_| get("If-Range").is_none_or(|t| t == tag))
+        .map(|v| parse_range(v, len));
     let (code, start, end) = match range {
         None | Some(RangeSpec::Ignore) => (200, 0, len),
         Some(RangeSpec::Span(s, e)) => (206, s, e),
@@ -372,7 +383,7 @@ fn raw(path: &Path, req: &Request) -> Response<Box<dyn Read + Send>> {
     let mut headers = vec![
         header("Content-Type", "application/vnd.pmtiles"),
         header("Accept-Ranges", "bytes"),
-        header("ETag", &etag(version)),
+        header("ETag", &tag),
         header("Access-Control-Expose-Headers", "ETag, Content-Range"),
     ];
     if code == 206 {

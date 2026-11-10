@@ -114,7 +114,23 @@ fn serves_the_archives_own_bytes_and_reloads_a_rewrite() {
         index.read_range(r).unwrap()
     );
     let (_, head, _) = get(&addr, "/my%20demo.pmtiles", "Range: bytes=0-9\r\n");
-    assert_ne!(etag(&head), Some(before), "a rebuild changes the ETag");
+    assert_ne!(
+        etag(&head),
+        Some(before.clone()),
+        "a rebuild changes the ETag"
+    );
+    // A client still holding the old version's offsets is told so.
+    let old_tag = before.trim_start_matches("etag:").trim();
+    let cond = format!("Range: bytes=0-9\r\nIf-Match: {old_tag}\r\n");
+    assert_eq!(get(&addr, "/my%20demo.pmtiles", &cond).0, 412);
+    let cond = format!("Range: bytes=0-9\r\nIf-Range: {old_tag}\r\n");
+    assert_eq!(get(&addr, "/my%20demo.pmtiles", &cond).0, 200);
+    let now = etag(&head).unwrap();
+    let cond = format!(
+        "Range: bytes=0-9\r\nIf-Match: {}\r\n",
+        now.trim_start_matches("etag:").trim()
+    );
+    assert_eq!(get(&addr, "/my%20demo.pmtiles", &cond).0, 206);
 }
 
 #[test]
