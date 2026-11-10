@@ -920,8 +920,9 @@ mod read_tests {
                 .unwrap(),
             );
         }
-        // A 600-byte row costs 616 bytes and an empty one 16 under a
-        // 1000-byte bound: every cut holds 25 rows.
+        // A 600-byte row costs 617 bytes and an empty one 17 under a
+        // 1000-byte bound: 23 rows from a long row, then the 27 empty ones
+        // left before the next long row.
         let mut sizes = Vec::new();
         while let Some(batch) = regroup.take_all().unwrap() {
             let array = batch
@@ -935,7 +936,7 @@ mod read_tests {
             );
             sizes.push(batch.num_rows());
         }
-        assert_eq!(sizes, [25, 25, 25, 25]);
+        assert_eq!(sizes, [23, 27, 23, 27]);
     }
 
     fn schema() -> Arc<Schema> {
@@ -1122,8 +1123,8 @@ mod read_tests {
 
     /// #858: the contract once the byte bound cuts batches before the batch
     /// size. List-heavy rows (25 Int64 values each, 1,000-row groups) decode
-    /// one row at a time and cost 216 bytes, so the 16 KiB scaled ceiling cuts
-    /// every batch near 75 rows of the 128 asked for. Sequential joins and the
+    /// one row at a time and cost 447 bytes, so the 16 KiB scaled ceiling cuts
+    /// every batch near 36 rows of the 128 asked for. Sequential joins and the
     /// parallel regrouping must cut the same rows. The ceiling is process
     /// environment, so the read runs in a child.
     #[cfg(feature = "testing")]

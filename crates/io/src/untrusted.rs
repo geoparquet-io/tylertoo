@@ -862,21 +862,27 @@ pub fn concat_prefix_rows<'a>(
     rows.max(1)
 }
 
-/// Bytes rows `start..end` of `array` hold, summed row by row: byte payloads
-/// in full (as a dictionary would expand them), 16 bytes of view or offset
-/// per value, 8 per list and each fixed-width value's width (#858). The same
-/// rows cost the same in any batch, and in the decoded views a reader holds
-/// as in the input's own types after the cast back.
+/// Bytes rows `start..end` of `array` take once decoded, summed row by row
+/// (#858): byte payloads in full (as a dictionary would expand them) plus 17
+/// per value, each fixed-width value's width plus 9 (a dictionary cast may
+/// allocate 64-bit keys), 5 per list or map value, 9 per large list or union
+/// value and 1 per struct or fixed-size list value. The same rows cost the
+/// same in any batch, and in the decoded views a reader holds as in the
+/// input's own types after the cast back. Both the cut
+/// ([`concat_prefix_rows`]) and the refusal of an oversized row use it.
 fn rows_bytes(array: &dyn arrow_array::Array, start: usize, end: usize) -> u64 {
     use arrow_array::cast::AsArray;
     use arrow_schema::DataType;
     let n = (end - start) as u64;
-    let payload = |from: i64, to: i64| n.saturating_mul(16).saturating_add((to - from) as u64);
+    let each = |bytes: u64| n.saturating_mul(bytes);
+    let payload = |from: i64, to: i64| each(17).saturating_add((to - from) as u64);
     // A view's low 32 bits are its value's length.
     let views = |v: &[u128]| {
-        v.iter().fold(n.saturating_mul(16), |b, v| {
-            b.saturating_add(u64::from(*v as u32))
-        })
+        v.iter()
+            .fold(each(17), |b, v| b.saturating_add(u64::from(*v as u32)))
+    };
+    let child = |own: u64, values: &dyn arrow_array::Array, from: usize, to: usize| {
+        each(own).saturating_add(rows_bytes(values, from, to))
     };
     match array.data_type() {
         DataType::Utf8 => {
@@ -900,39 +906,28 @@ fn rows_bytes(array: &dyn arrow_array::Array, start: usize, end: usize) -> u64 {
         DataType::List(_) => {
             let a = array.as_list::<i32>();
             let o = a.value_offsets();
-            n.saturating_mul(8).saturating_add(rows_bytes(
-                a.values().as_ref(),
-                o[start] as usize,
-                o[end] as usize,
-            ))
+            child(5, a.values().as_ref(), o[start] as usize, o[end] as usize)
         }
         DataType::LargeList(_) => {
             let a = array.as_list::<i64>();
             let o = a.value_offsets();
-            n.saturating_mul(8).saturating_add(rows_bytes(
-                a.values().as_ref(),
-                o[start] as usize,
-                o[end] as usize,
-            ))
+            child(9, a.values().as_ref(), o[start] as usize, o[end] as usize)
         }
         DataType::Map(_, _) => {
             let a = array.as_map();
             let o = a.value_offsets();
-            n.saturating_mul(8).saturating_add(rows_bytes(
-                a.entries(),
-                o[start] as usize,
-                o[end] as usize,
-            ))
+            child(5, a.entries(), o[start] as usize, o[end] as usize)
         }
         DataType::FixedSizeList(_, k) => {
             let k = *k as usize;
-            rows_bytes(
+            child(
+                1,
                 array.as_fixed_size_list().values().as_ref(),
                 start * k,
                 end * k,
             )
         }
-        DataType::Struct(_) => array.as_struct().columns().iter().fold(0, |b, c| {
+        DataType::Struct(_) => array.as_struct().columns().iter().fold(each(1), |b, c| {
             b.saturating_add(rows_bytes(c.as_ref(), start, end))
         }),
         DataType::Dictionary(_, value) => {
@@ -950,17 +945,25 @@ fn rows_bytes(array: &dyn arrow_array::Array, start: usize, end: usize) -> u64 {
             let u = array.as_union();
             (start..end).fold(0, |b, i| {
                 let at = u.value_offset(i);
-                b.saturating_add(8).saturating_add(rows_bytes(
+                b.saturating_add(9).saturating_add(rows_bytes(
                     u.child(u.type_id(i)).as_ref(),
                     at,
                     at + 1,
                 ))
             })
         }
-        DataType::Boolean => n,
+        other => each(fixed_bytes(other)),
+    }
+}
+
+/// [`rows_bytes`] of a fixed-width value of `data_type`.
+fn fixed_bytes(data_type: &arrow_schema::DataType) -> u64 {
+    use arrow_schema::DataType;
+    9 + match data_type {
+        DataType::Boolean => 1,
         DataType::Null => 0,
-        DataType::FixedSizeBinary(w) => n.saturating_mul(*w as u64),
-        other => n.saturating_mul(other.primitive_width().unwrap_or(16) as u64),
+        DataType::FixedSizeBinary(w) => *w as u64,
+        other => other.primitive_width().unwrap_or(16) as u64,
     }
 }
 
@@ -974,18 +977,15 @@ fn null_bytes(data_type: &arrow_schema::DataType) -> u64 {
         | DataType::LargeUtf8
         | DataType::LargeBinary
         | DataType::Utf8View
-        | DataType::BinaryView => 16,
-        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => 8,
-        DataType::FixedSizeList(f, k) => null_bytes(f.data_type()).saturating_mul(*k as u64),
+        | DataType::BinaryView => 17,
+        DataType::List(_) | DataType::Map(_, _) => 5,
+        DataType::LargeList(_) | DataType::Union(_, _) => 9,
+        DataType::FixedSizeList(f, k) => 1 + null_bytes(f.data_type()).saturating_mul(*k as u64),
         DataType::Struct(fields) => fields
             .iter()
-            .fold(0, |b, f| b.saturating_add(null_bytes(f.data_type()))),
+            .fold(1, |b, f| b.saturating_add(null_bytes(f.data_type()))),
         DataType::Dictionary(_, value) => null_bytes(value),
-        DataType::Union(_, _) => 8,
-        DataType::Boolean => 1,
-        DataType::Null => 0,
-        DataType::FixedSizeBinary(w) => *w as u64,
-        other => other.primitive_width().unwrap_or(16) as u64,
+        other => fixed_bytes(other),
     }
 }
 
@@ -1204,75 +1204,11 @@ fn array_overflow(
     }
 }
 
-// Charge the expanded values, not just the views' shared backing buffers.
-// Slicing child data first also avoids charging unused list/dictionary data.
-fn expanded_bytes(array: &dyn arrow_array::Array) -> u64 {
-    use arrow_array::cast::AsArray;
-    use arrow_schema::DataType;
-    let own = (array.len() as u64).saturating_add(1);
-    match array.data_type() {
-        DataType::Utf8View => array
-            .as_string_view()
-            .views()
-            .iter()
-            .fold(own.saturating_mul(17), |n, v| {
-                n.saturating_add(u64::from(*v as u32))
-            }),
-        DataType::BinaryView => array
-            .as_binary_view()
-            .views()
-            .iter()
-            .fold(own.saturating_mul(17), |n, v| {
-                n.saturating_add(u64::from(*v as u32))
-            }),
-        DataType::List(_) => {
-            let a = array.as_list::<i32>();
-            let o = a.value_offsets();
-            own.saturating_mul(5).saturating_add(expanded_bytes(
-                a.values()
-                    .slice(o[0] as usize, (*o.last().unwrap() - o[0]) as usize)
-                    .as_ref(),
-            ))
-        }
-        DataType::LargeList(_) => {
-            let a = array.as_list::<i64>();
-            let o = a.value_offsets();
-            own.saturating_mul(9).saturating_add(expanded_bytes(
-                a.values()
-                    .slice(o[0] as usize, (*o.last().unwrap() - o[0]) as usize)
-                    .as_ref(),
-            ))
-        }
-        DataType::Struct(_) => array
-            .as_struct()
-            .columns()
-            .iter()
-            .fold(own, |n, a| n.saturating_add(expanded_bytes(a.as_ref()))),
-        DataType::Map(_, _) => {
-            let a = array.as_map();
-            let o = a.value_offsets();
-            own.saturating_mul(5).saturating_add(expanded_bytes(
-                &a.entries()
-                    .slice(o[0] as usize, (*o.last().unwrap() - o[0]) as usize),
-            ))
-        }
-        DataType::FixedSizeList(_, _) => {
-            own.saturating_add(expanded_bytes(array.as_fixed_size_list().values().as_ref()))
-        }
-        _ => (array
-            .to_data()
-            .get_slice_memory_size()
-            .unwrap_or(usize::MAX) as u64)
-            // A dictionary cast may additionally allocate 64-bit keys.
-            .saturating_add((array.len() as u64).saturating_mul(9)),
-    }
-}
-
-fn expanded_batch_bytes(batch: &RecordBatch) -> u64 {
-    batch
-        .columns()
-        .iter()
-        .fold(0u64, |n, a| n.saturating_add(expanded_bytes(a.as_ref())))
+/// [`rows_bytes`] of every row of `batch`.
+fn batch_bytes(batch: &RecordBatch) -> u64 {
+    batch.columns().iter().fold(0u64, |n, c| {
+        n.saturating_add(rows_bytes(c.as_ref(), 0, batch.num_rows()))
+    })
 }
 
 fn check_batch_under(batch: &RecordBatch, limit: u64) -> Result<(), ArrowError> {
@@ -1806,7 +1742,7 @@ impl Iterator for UntrustedBatchReader {
                         },
                     ))));
                 }
-                let bytes = expanded_batch_bytes(&batch);
+                let bytes = batch_bytes(&batch);
                 if bytes > decoded_limit(limit) {
                     return Some(Err(ArrowError::ExternalError(Box::new(
                         InputError::DecodedRowTooLarge {
@@ -1869,14 +1805,9 @@ fn join_decoded(
             Err(e) => return Some(Err(e)),
         },
     };
-    let cost = |b: &RecordBatch| {
-        b.columns().iter().fold(0u64, |n, c| {
-            n.saturating_add(rows_bytes(c.as_ref(), 0, b.num_rows()))
-        })
-    };
     let schema = first.schema();
-    let (mut held, mut bytes) = (first.num_rows(), cost(&first));
-    let mut parts = vec![first];
+    let (mut held, mut bytes) = (first.num_rows(), batch_bytes(&first));
+    let (mut parts, mut unjoined) = (vec![first], 1);
     // Past the bound the cut is known: the row after an oversized one is not
     // decoded before the reader refuses it.
     while held < rows && bytes <= bound {
@@ -1886,10 +1817,21 @@ fn join_decoded(
             None => break,
         };
         held += batch.num_rows();
-        bytes = bytes.saturating_add(cost(&batch));
+        bytes = bytes.saturating_add(batch_bytes(&batch));
         parts.push(batch);
+        unjoined += 1;
+        // Joined JOIN_CHUNK at a time while decoding: an unjoined one-row
+        // batch holds the schema's whole fixed Arrow overhead.
+        if unjoined == JOIN_CHUNK {
+            let chunk = parts.split_off(parts.len() - JOIN_CHUNK);
+            match arrow_select::concat::concat_batches(&schema, &chunk) {
+                Ok(joined) => parts.push(joined),
+                Err(e) => return Some(Err(e)),
+            }
+            unjoined = 0;
+        }
     }
-    // Every part before the last fits, so the cut falls in the last.
+    // Every row before the last part fits, so the cut falls in the last.
     let cut = concat_prefix_rows(&parts, rows, limit);
     let last = parts.pop()?;
     let keep = cut - (held - last.num_rows());
@@ -1901,23 +1843,7 @@ fn join_decoded(
         return Some(Ok((last.slice(0, keep), sliced)));
     }
     parts.push(last.slice(0, keep));
-    // Joined JOIN_CHUNK at a time: an unjoined one-row batch holds the
-    // schema's whole fixed Arrow overhead.
-    let chunks = parts
-        .chunks(JOIN_CHUNK)
-        .map(|chunk| arrow_select::concat::concat_batches(&schema, chunk))
-        .collect::<Result<Vec<_>, _>>();
-    Some(chunks.and_then(|mut chunks| match chunks.pop() {
-        Some(only) if chunks.is_empty() => Ok((only, false)),
-        Some(tail) => {
-            chunks.push(tail);
-            Ok((
-                arrow_select::concat::concat_batches(&schema, &chunks)?,
-                false,
-            ))
-        }
-        None => Ok((RecordBatch::new_empty(schema.clone()), false)),
-    }))
+    Some(arrow_select::concat::concat_batches(&schema, &parts).map(|joined| (joined, false)))
 }
 
 /// Decoded batches [`join_decoded`] joins at once.
@@ -2398,6 +2324,36 @@ mod tests {
         assert_eq!(ids, (0..20).collect::<Vec<_>>());
     }
 
+    /// #858 review: a row is refused by the measure that cuts batches, so it
+    /// is refused alone and among other rows alike. 12,000 Int64 list values
+    /// cost 204 KB, past the 200 KB decode limit of a 100 KB ceiling.
+    #[test]
+    fn an_oversized_row_is_refused_wherever_the_cut_puts_it() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        use arrow_array::ArrayRef;
+        use parquet::arrow::ArrowWriter;
+        let mut lists = ListBuilder::new(Int64Builder::new());
+        lists.values().append_slice(&vec![7; 12_000]);
+        lists.append(true);
+        lists.append(true);
+        let batch =
+            RecordBatch::try_from_iter([("lists", Arc::new(lists.finish()) as ArrayRef)]).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        for rows in [1, 2] {
+            let mut reader = open_parquet(file.try_clone().unwrap())
+                .unwrap()
+                .with_batch_rows(rows)
+                .build()
+                .unwrap();
+            reader.limit = 100_000;
+            let err = reader.next().unwrap().unwrap_err().to_string();
+            assert!(err.contains("204"), "{rows}-row batches: {err}");
+        }
+    }
+
     #[test]
     fn read_plan_bounds_fixed_width_batches() {
         use arrow_array::{ArrayRef, Float64Array};
@@ -2448,7 +2404,7 @@ mod tests {
             [1, 1]
         );
         for batch in batches {
-            assert!(expanded_batch_bytes(&batch) <= 2000);
+            assert!(batch_bytes(&batch) <= 2000);
         }
     }
 
