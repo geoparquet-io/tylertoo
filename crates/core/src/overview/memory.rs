@@ -55,7 +55,7 @@ const PYTHON_LOSS_SHARE: f64 = 0.10;
 
 /// Fewest row groups a non-`speed` writer encodes at once, pool permitting:
 /// #545's A/B kept 4 as the point below which the drain serializes.
-const ENCODE_FLOOR: usize = 4;
+pub(super) const ENCODE_FLOOR: usize = 4;
 
 /// Fraction of the probed memory export's waves, level stores and tile
 /// encodes may hold (#303, #311, #788 E1), as export's own budget always
@@ -407,18 +407,19 @@ impl MemoryBudget {
         self.fit(profile, MemoryPhase::Compute, price, requested.max(1), 1)
     }
     /// Remote staging requests in flight at once (#727, #788), per
-    /// [`fit`](Self::fit): the concurrency ceiling wanted, or what
-    /// `TYLERTOO_STAGING_MEM_BUDGET_BYTES` holds when it is set, one at the
-    /// floor (a request larger than the grant is still admitted alone),
-    /// priced at the plan's largest request. `bounded` keeps main's staging
-    /// byte budget ([`MemoryPhase::bounded_cap`]).
+    /// [`fit`](Self::fit): what the staging budget holds
+    /// ([`StageAdmission::requests_for`](crate::input::StageAdmission::requests_for),
+    /// #817), never more than `TYLERTOO_STAGING_MEM_BUDGET_BYTES` holds when
+    /// it is set, one at the floor (a request larger than the grant is still
+    /// admitted alone), priced at the plan's largest request. `bounded`
+    /// keeps main's staging byte budget ([`MemoryPhase::bounded_cap`]).
     pub(super) fn stage_requests(&mut self, profile: MemoryProfile, largest_request: u64) -> Grant {
         let price = Price::new(largest_request.max(1), PriceBasis::Footer);
-        let ceiling = self.stage.max_concurrency.max(1);
+        let want = self.stage.requests_for(price.bytes);
         let want = if self.stage.mem_budget_set {
-            self.stage_units(price).min(ceiling)
+            want.min(self.stage_units(price))
         } else {
-            ceiling
+            want
         };
         self.fit(profile, MemoryPhase::Stage, price, want, 1)
     }
@@ -441,6 +442,31 @@ impl MemoryBudget {
             threads,
             threads.min(ENCODE_FLOOR),
         )
+    }
+    /// Row groups pass 2's buffered drain may encode at once (#817 B1): the
+    /// writer's `encode` grant plus as many more slots of `slot_bytes` (at
+    /// least the grant's own unit) as `reused` bytes hold, at most `threads`.
+    /// `reused` is what the finished read's read-ahead and compute window
+    /// actually held (empty by the drain), capped at their grants: the
+    /// grants alone overstate it, and spending them raises the run's peak. It is
+    /// also capped at `below_peak` (how far the process sits below its peak
+    /// RSS) less the `encode` grant's own slots, which the drain spends
+    /// anyway, so the whole drain fits under the peak.
+    pub(super) fn drain_encodes(
+        encode: Grant,
+        slot_bytes: u64,
+        reused: u64,
+        below_peak: u64,
+        threads: usize,
+    ) -> usize {
+        let slot = slot_bytes.max(encode.unit_bytes).max(1);
+        let reused =
+            reused.min(below_peak.saturating_sub((encode.units as u64).saturating_mul(slot)));
+        let extra = usize::try_from(reused / slot).unwrap_or(usize::MAX);
+        encode
+            .units
+            .saturating_add(extra)
+            .min(threads.max(encode.units))
     }
     pub(super) fn require(&self, phase: MemoryPhase, needed: u64) -> Result<(), ConvertError> {
         if let Some(available) = self.available() {
@@ -470,6 +496,43 @@ impl MemoryBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_encodes_adds_what_the_reused_bytes_hold_up_to_the_threads() {
+        let encode = Grant {
+            phase: MemoryPhase::Encode,
+            units: 4,
+            unit_bytes: 100,
+        };
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 0, u64::MAX, 64), 4);
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 399, u64::MAX, 64), 7);
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 0, 1 << 40, u64::MAX, 64),
+            64
+        );
+        // A slot costing more than the grant's unit (a WKB chunk) buys fewer.
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 200, 399, u64::MAX, 64),
+            5
+        );
+        // The whole drain, the grant's own 4 included, fits below the peak.
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 500, 64), 5);
+        assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 300, 64), 4);
+        // The grant's own slots also admit WKB chunks, so they cost `slot` too.
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 200, 1 << 40, 600, 64),
+            4
+        );
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 200, 1 << 40, 1_000, 64),
+            5
+        );
+        // Never below the writer's own grant, even on fewer threads.
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 0, 1 << 40, u64::MAX, 2),
+            4
+        );
+    }
 
     #[test]
     fn budget_exceeded_names_each_phase() {
@@ -701,6 +764,35 @@ mod tests {
         budget.require(MemoryPhase::Scan, estimate).unwrap();
     }
 
+    /// #817 R1: small staging requests go in flight as many as the 256 MiB
+    /// staging budget holds (64 of 4 MiB, capped at 128 for tiny ones),
+    /// not main's fixed 8; `TYLERTOO_STAGING_CONCURRENCY` still pins it.
+    #[test]
+    fn small_staging_requests_fill_the_staging_budget() {
+        use crate::input::StageAdmission;
+        const MIB: u64 = 1 << 20;
+        let units_with = |largest: u64, set: Option<usize>, mem_budget_set: bool| {
+            let mut budget = MemoryBudget::with_available(Some(1 << 40));
+            budget.stage = StageAdmission {
+                max_concurrency: set.unwrap_or(8),
+                concurrency_set: set.is_some(),
+                concurrency_cap: 128,
+                mem_budget: 256 * MIB,
+                mem_budget_set,
+            };
+            let grant = budget.stage_requests(MemoryProfile::Auto, largest);
+            grant.bytes() / largest
+        };
+        let units = |largest, set| units_with(largest, set, false);
+        assert_eq!(units(4 * MIB, None), 64);
+        assert_eq!(units(1024, None), 128);
+        assert_eq!(units(64 * MIB, None), 8);
+        assert_eq!(units(4 * MIB, Some(8)), 8);
+        // An explicit TYLERTOO_STAGING_MEM_BUDGET_BYTES sizes the count too.
+        assert_eq!(units_with(4 * MIB, None, true), 64);
+        assert_eq!(units_with(64 * MIB, None, true), 4);
+    }
+
     /// #788: remote staging requests in flight per profile, for 64 MiB
     /// requests against main's 256 MiB staging budget and a ceiling of 8.
     /// `bounded` keeps main's budget (4 in flight, not 8); `auto` is decided
@@ -715,6 +807,8 @@ mod tests {
             let mut budget = MemoryBudget::with_available(Some(available));
             budget.stage = StageAdmission {
                 max_concurrency: 8,
+                concurrency_set: false,
+                concurrency_cap: 128,
                 mem_budget: set_budget.unwrap_or(256 * MIB),
                 mem_budget_set: set_budget.is_some(),
             };

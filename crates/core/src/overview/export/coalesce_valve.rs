@@ -69,6 +69,10 @@ pub(super) fn world_xy(lng: f64, lat: f64) -> (f64, f64) {
 /// largest squared distance to one of its corners, saturating below
 /// [`GAP_NONE`].
 pub(super) fn gap_to_rect(from: (f64, f64), rect: &Rect<f64>) -> u64 {
+    #[cfg(test)]
+    if rayon::current_thread_index().is_none() {
+        SERIAL_GAPS.with(|n| n.set(n.get() + 1));
+    }
     let (min, max) = (rect.min(), rect.max());
     let mut d2_max = 0.0_f64;
     for (lng, lat) in [
@@ -84,6 +88,12 @@ pub(super) fn gap_to_rect(from: (f64, f64), rect: &Rect<f64>) -> u64 {
     // `as` saturates at `u64::MAX`; keep one below so a real gap never reads
     // as GAP_NONE.
     (d2_max as u64).min(GAP_NONE - 1)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Gaps this thread measured outside the Rayon pool (test counter, #817).
+    static SERIAL_GAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A rect's centre in world units: the point the next row's gap is measured
@@ -133,6 +143,22 @@ impl RowGapCursor {
     /// The next row's `(gap, band)`, given its bbox (`None` for an empty
     /// geometry, which gets [`GAP_NONE`] and leaves the predecessor as is).
     pub(super) fn next_row(&mut self, rect: Option<Rect<f64>>) -> (u64, u16) {
+        self.enter_row();
+        let Some(rect) = rect else {
+            return (GAP_NONE, self.band);
+        };
+        let gap = match self.prev {
+            Some(p) => gap_to_rect(p, &rect),
+            None => GAP_NONE,
+        };
+        self.prev = Some(rect_center(&rect));
+        (gap, self.band)
+    }
+
+    /// Step to the next row: into the next non-empty row group when this
+    /// one is done, which forgets the predecessor. `true` when it did.
+    fn enter_row(&mut self) -> bool {
+        let entered = self.left == 0;
         while self.left == 0 {
             let Some(&(band, rows)) = self.groups.get(self.next_group) else {
                 // More rows than the footer promised: cannot happen for a
@@ -149,19 +175,17 @@ impl RowGapCursor {
             self.prev = None;
         }
         self.left -= 1;
-        let Some(rect) = rect else {
-            return (GAP_NONE, self.band);
-        };
-        let gap = match self.prev {
-            Some(p) => gap_to_rect(p, &rect),
-            None => GAP_NONE,
-        };
-        self.prev = Some(rect_center(&rect));
-        (gap, self.band)
+        entered
     }
 
-    /// [`Self::next_row`] over a whole batch of decoded geometries. The
-    /// bboxes are computed in parallel; the walk itself is sequential.
+    /// [`Self::next_row`] over a whole batch of decoded geometries.
+    ///
+    /// PERF (#817): only the row-group walk is sequential. It finds each
+    /// row's predecessor; the bboxes, centres and gaps, five Web Mercator
+    /// projections a row, are computed in the pool. Each gap is the same
+    /// `gap_to_rect` of the same predecessor centre, so the gaps are those
+    /// of the row-by-row walk. Measured on the calling thread, they held the
+    /// export's ordered collect stage, and with it the pool, to one core.
     pub(super) fn batch(&mut self, geoms: &[Geometry<f64>]) -> Vec<(u64, u16)> {
         if !self.measure {
             return geoms.iter().map(|_| self.next_row(None)).collect();
@@ -169,7 +193,35 @@ impl RowGapCursor {
         #[cfg(test)]
         crate::valve_counter::note(|c| c.gap_rows += geoms.len());
         let rects: Vec<Option<Rect<f64>>> = geoms.par_iter().map(|g| g.bounding_rect()).collect();
-        rects.into_iter().map(|r| self.next_row(r)).collect()
+        let centres: Vec<Option<(f64, f64)>> = rects
+            .par_iter()
+            .map(|r| r.as_ref().map(rect_center))
+            .collect();
+        // Each row's band and predecessor centre, in read order.
+        let mut last = self.prev;
+        let walk: Vec<(Option<(f64, f64)>, u16)> = centres
+            .iter()
+            .map(|centre| {
+                if self.enter_row() {
+                    // A new row group: no predecessor.
+                    last = None;
+                }
+                let pred = last;
+                if centre.is_some() {
+                    last = *centre;
+                }
+                (pred, self.band)
+            })
+            .collect();
+        self.prev = last;
+        rects
+            .par_iter()
+            .zip(walk)
+            .map(|(rect, (pred, band))| match (rect, pred) {
+                (Some(rect), Some(p)) => (gap_to_rect(p, rect), band),
+                _ => (GAP_NONE, band),
+            })
+            .collect()
     }
 }
 
@@ -561,6 +613,46 @@ mod tests {
         let mut d = RowGapCursor::new(vec![(0, 2)]);
         d.next_row(r(0.0));
         assert_eq!(c.next_row(r(1.0)).0, d.next_row(r(1.0)).0);
+    }
+
+    /// #817: `batch` measures its gaps in the pool, and gives exactly the
+    /// gaps `next_row` gives row by row, across row groups, empty rows and
+    /// batch boundaries.
+    #[test]
+    fn batch_gaps_are_measured_in_the_pool_and_match_the_row_walk() {
+        let geoms: Vec<Geometry<f64>> = (0..3000)
+            .map(|i| {
+                let x = f64::from(i % 97) * 0.37 - 170.0;
+                let y = f64::from(i % 89) * 0.41 - 40.0;
+                if i % 11 == 0 {
+                    Geometry::GeometryCollection(geo::GeometryCollection::default())
+                } else {
+                    Geometry::Polygon(polygon![
+                        (x: x, y: y),
+                        (x: x + 0.2, y: y),
+                        (x: x, y: y + 0.3),
+                    ])
+                }
+            })
+            .collect();
+        let groups = vec![(0, 700), (0, 0), (1, 1300), (2, 1000)];
+        let mut serial = RowGapCursor::new(groups.clone());
+        let expected: Vec<(u64, u16)> = geoms
+            .iter()
+            .map(|g| serial.next_row(g.bounding_rect()))
+            .collect();
+        let mut cursor = RowGapCursor::new(groups);
+        SERIAL_GAPS.with(|n| n.set(0));
+        let got: Vec<(u64, u16)> = [&geoms[..1], &geoms[1..1500], &geoms[1500..]]
+            .into_iter()
+            .flat_map(|chunk| cursor.batch(chunk))
+            .collect();
+        assert_eq!(got, expected);
+        assert_eq!(
+            SERIAL_GAPS.with(std::cell::Cell::get),
+            0,
+            "gaps measured on the calling thread"
+        );
     }
 
     #[test]

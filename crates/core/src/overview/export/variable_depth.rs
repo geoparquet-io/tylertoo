@@ -23,12 +23,12 @@ use super::super::level::{Mode, OverviewsMeta};
 use super::super::reader::OverviewReader;
 use super::{
     account_sources, buffer_deg_at_zoom, build_mvt_within, collect_wave, encoded_tile,
-    export_level_groups, for_each_member_key, geometry_lnglat_bbox, key_to_xy, near_world_edge,
-    plan_level, plan_level_groups, plan_levels, size_bboxes, sort_tile_for_encode, tile_fit,
-    tile_key, tiles_in_ranges, CheckpointCtx, Crs, EncodedTile, ExportError, ExportLevelCtx,
-    ExportOptions, ExportProgress, ExportTimers, FillTally, LevelCtx, LevelMemory, LevelScan,
-    Member, PartitionBudget, PublishedNames, ResolvedFeatureId, StreamingPmtilesWriter, TileMvt,
-    ZoomReport, DEFAULT_EXTENT,
+    export_level_groups, for_each_member_key, geometry_lnglat_bbox, group_schedule, key_to_xy,
+    near_world_edge, plan_level, plan_levels, size_bboxes, sort_tile_for_encode, tile_fit,
+    tile_key, tiles_in_ranges, BandRead, CheckpointCtx, Crs, EncodedTile, ExportError,
+    ExportLevelCtx, ExportOptions, ExportProgress, ExportTimers, FillTally, GroupGate, LevelCtx,
+    LevelMemory, LevelScan, Member, PartitionBudget, PublishedNames, ResolvedFeatureId,
+    StreamingPmtilesWriter, TileMvt, ZoomReport, DEFAULT_EXTENT,
 };
 use crate::compression::TileGzipCache;
 use crate::tile::{max_tile_index, BboxTileRanges, TileBounds, TileCoord, MAX_LATITUDE};
@@ -829,6 +829,7 @@ impl VdScan {
 /// What the probe reads with: the export's own inputs.
 pub(super) struct Probe<'a> {
     pub(super) reader: &'a OverviewReader,
+    pub(super) band: BandRead<'a>,
     pub(super) crs: Crs,
     pub(super) published: &'a PublishedNames,
     pub(super) feature_id: Option<&'a ResolvedFeatureId>,
@@ -947,6 +948,7 @@ impl VdPlan {
                 });
                 let ctx = LevelCtx {
                     reader: p.reader,
+                    band: p.band,
                     level_idx: self.canonical,
                     crs: p.crs,
                     zoom,
@@ -1157,13 +1159,13 @@ impl Frontier {
 pub(super) struct VdLevels<'a> {
     pub(super) plan: VdPlan,
     pub(super) probe: Probe<'a>,
-    pub(super) planned: (&'a [ExportLevelCtx<'a>], Vec<Range<usize>>),
+    pub(super) planned: (&'a [ExportLevelCtx<'a>], Vec<Range<usize>>, GroupGate),
     pub(super) rest: &'a mut [LevelScan],
     pub(super) zooms: &'a [u8],
     /// Every level's shared context; each level sets its own scan, plan,
     /// index and stopped tiles.
     pub(super) template: ExportLevelCtx<'a>,
-    /// The [`plan_level_groups`] member cap.
+    /// The [`group_schedule`] member cap.
     pub(super) group_cap: usize,
 }
 
@@ -1190,7 +1192,7 @@ pub(super) fn export_levels(
     let VdLevels {
         plan,
         probe,
-        planned: (levels, mut groups),
+        planned: (levels, mut groups, gate),
         rest,
         zooms,
         template,
@@ -1217,7 +1219,7 @@ pub(super) fn export_levels(
                 budget: &mut *budget,
             },
             levels,
-            &groups,
+            (&groups, gate),
             ckpt,
             progress,
             diagnostics,
@@ -1278,7 +1280,12 @@ pub(super) fn export_levels(
                     ..template
                 })
                 .collect();
-            let now_groups = plan_level_groups(&plans, group_cap);
+            let (now_groups, gate) = group_schedule(
+                group_cap,
+                &plans,
+                partition_budget.partition_target,
+                template.options.profile,
+            );
             reports.extend(export_level_groups(
                 writer,
                 LevelMemory {
@@ -1286,7 +1293,7 @@ pub(super) fn export_levels(
                     budget: &mut *budget,
                 },
                 &now_levels,
-                &now_groups,
+                (&now_groups, gate),
                 ckpt,
                 progress,
                 diagnostics,
@@ -1606,6 +1613,7 @@ mod tests {
 
     use super::super::super::cluster::{AccumulateOp, AccumulateSpec};
     use super::super::super::ladder::{EntryZoomKind, EntryZoomSpec};
+    use super::super::tests::{band_source, test_band};
     use super::super::Crs;
     use super::super::{resolve_level_zooms, scan_all_levels, tile_key, ExportTimers};
     use super::{VdPlan, VdScan};
@@ -1645,6 +1653,7 @@ mod tests {
         let mut scan = VdScan::new(&meta, reader.geo_metadata_json(), zooms).unwrap();
         let scans = scan_all_levels(
             &reader,
+            test_band(&band_source(&reader)),
             Crs::Epsg4326,
             &vd(),
             &ExportTimers::default(),

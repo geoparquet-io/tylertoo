@@ -133,6 +133,7 @@ use crate::TilesetMetadata;
 
 use super::coalesce::COALESCED_COUNT_COLUMN;
 use super::convert::{human_bytes, skip_memory_preflight_from_env, SKIP_MEMORY_PREFLIGHT_ENV};
+use super::convert::{resolve_pass_read_workers, ConvertError, READ_WORKERS_AUTO};
 use super::level::{zoom_for_gsd, Crs, MemoryProfile, Mode, OverviewsMeta};
 use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
 use super::pipe::scoped_pipe;
@@ -141,6 +142,7 @@ use super::pipeline::{
     SinkBacking,
 };
 use super::properties::PropertySelection;
+use super::read::{footer_price, read_in_order_capped, ReadFlow, ReadPass, ReadTuning};
 use super::reader::{OverviewReader, ReaderError};
 use super::stream::{
     add_nanos, preflight_profile_json_path, profile_json_target, sample_rss_peak,
@@ -148,6 +150,8 @@ use super::stream::{
     ExportZoomProfile, RssSampler, RssSamplerReport,
 };
 use super::writer::LEVEL_COLUMN;
+use crate::input::InputError;
+use crate::input_set::{ConvertSource, RowGroupSelection};
 
 mod coalesce_valve;
 mod tile_data;
@@ -1254,7 +1258,7 @@ impl crate::error::Classify for ExportError {
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
 /// properties carried over from the overview file (level column + covering
 /// struct excluded). Test-support only: production streams members directly
-/// instead of materializing features (see [`collect_wave_members`]).
+/// instead of materializing features (see [`finish_group`]).
 #[cfg(test)]
 struct Feature {
     geom: Geometry<f64>,
@@ -1717,7 +1721,11 @@ fn check_levels_fit(
 /// within `member_cap`. A multi-wave level, or a level that alone exceeds
 /// the cap, is a group of one and exports through the unchanged wave loop.
 /// A `member_cap` of 0 is the serial schedule, one level per group.
-fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Range<usize>> {
+fn plan_level_groups(
+    plans: &[LevelPlan],
+    member_cap: usize,
+    waves: bool,
+) -> Vec<std::ops::Range<usize>> {
     if member_cap == 0 {
         return (0..plans.len()).map(|i| i..i + 1).collect();
     }
@@ -1726,6 +1734,15 @@ fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Ra
     for (i, plan) in plans.iter().enumerate() {
         let members: usize = plan.partitions.iter().map(|p| p.members).sum();
         let single_wave = plan.partitions.len() <= plan.wave.max(1);
+        if waves && !single_wave {
+            // #817: its waves are bounded in flight and in write order, not
+            // by the group's sum, so it joins the open group.
+            match open.as_mut() {
+                Some((range, _)) => range.end = i + 1,
+                None => open = Some((i..i + 1, 0)),
+            }
+            continue;
+        }
         if let Some((range, sum)) = open.as_mut() {
             if single_wave && sum.saturating_add(members) <= member_cap {
                 range.end = i + 1;
@@ -1744,6 +1761,42 @@ fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Ra
     }
     groups.extend(open.map(|(range, _)| range));
     groups
+}
+
+/// The level groups `plans` export in ([`plan_level_groups`]) and how each
+/// runs. Its members in flight are capped at `member_cap`, bounded by the
+/// largest wave of any level but never below [`PARTITION_WAVE_MIN`]
+/// partitions of `partition_target` (the narrowest full wave the serial loop
+/// holds), so a small export's levels all overlap. Collected members wait,
+/// valve and MVT workspace included, until their level encodes, so more of
+/// them in flight than the largest wave would raise the export's peak above
+/// the serial loop's. The cap bounds members in flight, not the group, so a
+/// group whose encodes keep up still overlaps every level.
+///
+/// Under every profile but `bounded` a multi-wave level's waves overlap
+/// (#817); `bounded` keeps the serial wave loop, as the overlap is not in its
+/// budget. A `member_cap` of 0 is the serial schedule.
+fn group_schedule(
+    member_cap: usize,
+    plans: &[LevelPlan],
+    partition_target: usize,
+    profile: MemoryProfile,
+) -> (Vec<std::ops::Range<usize>>, GroupGate) {
+    let largest_wave = plans
+        .iter()
+        .flat_map(|plan| {
+            plan.partitions
+                .chunks(plan.wave.max(1))
+                .map(|wave| wave.iter().map(|p| p.members).sum::<usize>())
+        })
+        .max()
+        .unwrap_or(0);
+    let cap = member_cap.min(largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN)));
+    let gate = GroupGate {
+        cap,
+        waves: cap > 0 && profile != MemoryProfile::Bounded,
+    };
+    (plan_level_groups(plans, member_cap, gate.waves), gate)
 }
 
 /// Resolve a requested partition-wave width to a concrete value.
@@ -2141,6 +2194,8 @@ fn export_pmtiles_impl(
             concurrent_levels: true,
             checkpoint_interval: CHECKPOINT_INTERVAL,
             fail_level: None,
+            #[cfg(test)]
+            panic_write_level: None,
             memory_limit: None,
             budget_available: None,
         },
@@ -2163,6 +2218,10 @@ struct Pass2Knobs {
     /// Fail the export with an injected I/O error when this level starts,
     /// to test what an interrupted group leaves behind.
     fail_level: Option<usize>,
+    /// Panic while a level group writes this level's first wave, to test
+    /// that a panicking write fails the group instead of hanging it.
+    #[cfg(test)]
+    panic_write_level: Option<usize>,
     /// The memory figure for the #665 dense-tile refusal. `None` probes
     /// ([`probe_oom_memory_limit`]); tests inject one.
     memory_limit: Option<MemoryLimit>,
@@ -2248,6 +2307,9 @@ fn export_pmtiles_validated(
     let input_path = input_path.as_ref();
 
     let reader = OverviewReader::open(input_path)?;
+    let band_source = ConvertSource::single(crate::input::InputSource::Local(
+        reader.path().to_path_buf(),
+    ));
     let meta = reader.meta().clone();
     if options.variable_depth {
         variable_depth::check_file(&meta, reader.mode())?;
@@ -2397,6 +2459,11 @@ fn export_pmtiles_validated(
         .transpose()?;
     let mut scans = scan_all_levels(
         &reader,
+        BandRead {
+            source: &band_source,
+            budget: *budget,
+            profile: options.profile,
+        },
         crs,
         options,
         &timers,
@@ -2606,6 +2673,15 @@ fn export_pmtiles_validated(
     );
     let template = ExportLevelCtx {
         reader: &reader,
+        band: BandRead {
+            source: &band_source,
+            // shortcut: the read-ahead is sized from the budget as the levels
+            // start and is not charged to it (the old one-thread pipe was not
+            // either); charge a `grant_read_ahead` per band read if a profile
+            // shows the levels' peak RSS growing.
+            budget: *budget,
+            profile: options.profile,
+        },
         scan: &unplanned.0,
         plan: &unplanned.1,
         level_idx: 0,
@@ -2633,7 +2709,7 @@ fn export_pmtiles_validated(
             ..template
         })
         .collect();
-    let level_groups = plan_level_groups(&plans, group_cap);
+    let (level_groups, gate) = group_schedule(group_cap, &plans, partition_target, options.profile);
     let mem = LevelMemory {
         store: store.as_mut(),
         budget: &mut *budget,
@@ -2650,7 +2726,7 @@ fn export_pmtiles_validated(
                 &mut writer,
                 mem,
                 &levels,
-                &level_groups,
+                (&level_groups, gate),
                 &ckpt,
                 &mut progress,
                 diagnostics,
@@ -2668,6 +2744,7 @@ fn export_pmtiles_validated(
                     plan,
                     probe: variable_depth::Probe {
                         reader: &reader,
+                        band: template.band,
                         crs,
                         published: &published,
                         feature_id: feature_id.as_ref(),
@@ -2675,7 +2752,7 @@ fn export_pmtiles_validated(
                         budget: &partition_budget,
                         timers: &probe_timers,
                     },
-                    planned: (&levels, level_groups),
+                    planned: (&levels, level_groups, gate),
                     rest,
                     zooms: &level_zooms,
                     template,
@@ -2946,6 +3023,9 @@ fn fill_backing(
 ///   anything that affects the archive.
 struct ExportProgress {
     fail_level: Option<usize>,
+    /// [`Pass2Knobs::panic_write_level`].
+    #[cfg(test)]
+    panic_write_level: Option<usize>,
     /// When the last checkpoint was written (or the export started): a
     /// checkpoint is due once [`CHECKPOINT_INTERVAL`] has elapsed since. A
     /// fast export finishes before the first interval elapses and never
@@ -2984,6 +3064,8 @@ impl ExportProgress {
             checkpoint_throttle: Instant::now(),
             checkpoint_interval: knobs.checkpoint_interval,
             fail_level: knobs.fail_level,
+            #[cfg(test)]
+            panic_write_level: knobs.panic_write_level,
             #[cfg(test)]
             checkpoint_zooms: Vec::new(),
             profile: ExportProfile {
@@ -3198,6 +3280,8 @@ struct ResolvedColumns {
 /// member store.
 struct ExportLevelCtx<'a> {
     reader: &'a OverviewReader,
+    /// How the band is read: [`read_band`].
+    band: BandRead<'a>,
     /// This level's scan-pass result (feature count, bounds, tile counts).
     scan: &'a LevelScan,
     /// This level's partitions and wave width, fixed by [`plan_levels`].
@@ -3230,6 +3314,7 @@ impl<'a> ExportLevelCtx<'a> {
     fn level_ctx(&self, timers: &'a ExportTimers) -> LevelCtx<'a> {
         LevelCtx {
             reader: self.reader,
+            band: self.band,
             level_idx: self.level_idx,
             crs: self.crs,
             zoom: self.plan.zoom,
@@ -3398,7 +3483,7 @@ fn export_level_groups(
     writer: &mut StreamingPmtilesWriter,
     mem: LevelMemory<'_>,
     levels: &[ExportLevelCtx<'_>],
-    groups: &[std::ops::Range<usize>],
+    (groups, gate): (&[std::ops::Range<usize>], GroupGate),
     ckpt: &CheckpointCtx<'_>,
     progress: &mut ExportProgress,
     diagnostics: &crate::diagnostics::Diagnostics,
@@ -3427,7 +3512,7 @@ fn export_level_groups(
                 store: store.as_deref_mut(),
                 budget: &mut *budget,
             },
-            &group_levels,
+            (&group_levels, gate),
             ckpt,
             progress.fail_level,
             progress,
@@ -3458,29 +3543,37 @@ fn injected_fault(
 }
 
 /// Export a group of consecutive levels planned by [`plan_level_groups`]
-/// (#647), encoding the group's levels concurrently.
+/// (#647), encoding the group's levels, and their waves, concurrently.
 ///
-/// A group of one is [`export_level`] unchanged. In a larger group every
-/// level fits in a single wave. The calling thread collects the levels'
-/// members in level order, as the serial loop does: the single-read store's
-/// wave 0, or one [`collect_wave`] read. Each collected level then encodes
-/// in its own Rayon task while the next level is collected, so a z3 tile no
-/// longer waits for the z2 tiles to finish.
+/// A group of one single-wave level, or of one multi-wave level when
+/// `gate.waves` is off (`bounded`, the serial oracle), is [`export_level`]
+/// unchanged. Otherwise the calling thread collects every wave of every
+/// level in order, as the serial loop does: the single-read store's wave,
+/// a multi-wave level's one-level store (#740, filled as the level starts),
+/// or one [`collect_wave`] read. Each collected wave then encodes in its own
+/// Rayon task while the next one is collected, so a z3 tile no longer waits
+/// for the z2 tiles to finish, and a wave's valve tail no longer idles the
+/// pool until the next wave is read (#817).
+///
+/// [`InFlight`] bounds the members collected and not yet encoded. A wave of
+/// a multi-wave level also waits until every wave but the one before it is
+/// written, so at most two of its waves' tiles wait on a slower coarser
+/// one; a group's single-wave levels are bounded by the group's sum.
 ///
 /// The collect stays on the calling thread because the legacy read blocks on
 /// a channel (see [`scoped_pipe`]). In a Rayon task it would park a worker,
 /// and a worker waiting in a nested join could pick up another level's read
 /// and block under it.
 ///
-/// [`GroupCommit`] writes each level as soon as it and every coarser level
-/// of the group are encoded, then takes a due checkpoint. The writer gets
-/// the same tiles in the same order as from the serial loop, so the archive
-/// is byte-identical. A failed level leaves every coarser level of the group
-/// written and, when due, checkpointed.
+/// [`GroupCommit`] writes each wave as soon as it and every earlier wave
+/// of the group are encoded, and takes a due checkpoint after each level.
+/// The writer gets the same tiles in the same order as from the serial
+/// loop, so the archive is byte-identical. A failed level leaves every
+/// coarser level of the group written and, when due, checkpointed.
 fn export_level_group(
     writer: &mut StreamingPmtilesWriter,
     mem: LevelMemory<'_>,
-    levels: &[ExportLevelCtx<'_>],
+    (levels, gate): (&[ExportLevelCtx<'_>], GroupGate),
     ckpt: &CheckpointCtx<'_>,
     fail_level: Option<usize>,
     progress: &mut ExportProgress,
@@ -3488,10 +3581,12 @@ fn export_level_group(
 ) -> Result<Vec<ZoomReport>, ExportError> {
     let LevelMemory { mut store, budget } = mem;
     if let [level] = levels {
-        injected_fault(level, fail_level)?;
-        let report = export_level(writer, store, level, budget, progress, diagnostics)?;
-        checkpoint_if_due(writer, ckpt, checkpoint_zoom_after_level(level), progress)?;
-        return Ok(vec![report]);
+        if !gate.waves || level_waves(level.plan) == 1 {
+            injected_fault(level, fail_level)?;
+            let report = export_level(writer, store, level, budget, progress, diagnostics)?;
+            checkpoint_if_due(writer, ckpt, checkpoint_zoom_after_level(level), progress)?;
+            return Ok(vec![report]);
+        }
     }
     // A handle of its own, so the encode tasks can time themselves while
     // `GroupCommit` holds `progress` mutably.
@@ -3501,46 +3596,126 @@ fn export_level_group(
         progress,
         ckpt,
         levels,
-        next: 0,
+        next: (0, 0),
+        written: 0,
+        open: OpenLevel::default(),
         pending: BTreeMap::new(),
         reports: Vec::with_capacity(levels.len()),
         error: None,
     });
+    let in_flight = InFlight::new(gate.cap);
     let collected = rayon::in_place_scope(|scope| -> Result<(), (usize, ExportError)> {
-        for (i, level) in levels.iter().enumerate() {
+        // The group's ordinal of the next wave to collect.
+        let mut unit = 0;
+        'levels: for (i, level) in levels.iter().enumerate() {
             if lock_commit(&commit, &timers).error.is_some() {
                 // A coarser level already failed. Its error is returned.
                 break;
             }
-            let start = Instant::now();
-            let spill_bytes = store
-                .as_deref()
-                .map_or(0, |s| s.level_spilled_bytes(level.level_idx));
-            let buckets = injected_fault(level, fail_level)
-                .and_then(|()| collect_level(store.as_deref_mut(), level, &timers, diagnostics))
-                .map_err(|e| (i, e))?;
-            let collect_secs = start.elapsed().as_secs_f64();
-            let (commit, timers) = (&commit, &*timers);
-            scope.spawn(move |_| {
-                let t_encode = Instant::now();
-                let tiles = encode_buckets(
-                    level.gzip_cache,
-                    buckets,
-                    level.plan.zoom,
-                    level.options,
-                    level.fills,
-                    timers,
+            injected_fault(level, fail_level).map_err(|e| (i, e))?;
+            let partitions = &level.plan.partitions;
+            let multi_wave = level_waves(level.plan) > 1;
+            let mut level_store = None;
+            let mut grants = Vec::new();
+            for w in 0..level_waves(level.plan) {
+                if multi_wave {
+                    in_flight.wait_until(|| {
+                        let c = lock_commit(&commit, &timers);
+                        c.error.is_some() || c.written + 1 >= unit
+                    });
+                    if lock_commit(&commit, &timers).error.is_some() {
+                        break 'levels;
+                    }
+                }
+                let wave = partitions
+                    .chunks(level.plan.wave.max(1))
+                    .nth(w)
+                    .unwrap_or_default();
+                let fills = w == 0 && multi_wave && store.is_none() && level.level_read.is_some();
+                if fills {
+                    // The store's grant is sized beside this level's widest
+                    // wave only, so it fills once every earlier wave is
+                    // encoded: the grant plus one wave, as in the serial loop.
+                    drop(in_flight.wait_for(|held| held == 0));
+                }
+                let held = in_flight.admit(wave.iter().map(|p| p.members).sum());
+                let start = Instant::now();
+                if fills {
+                    if let Some(read) = level.level_read {
+                        let (backing, g) = level_read_backing(read, level.plan, budget);
+                        grants = g;
+                        let ctx = level.level_ctx(&timers);
+                        level_store = Some(
+                            fill_level_store(&ctx, level.plan, backing, diagnostics)
+                                .map_err(|e| (i, e))?,
+                        );
+                    }
+                }
+                let spill_bytes = match (&level_store, &store) {
+                    _ if w > 0 => 0,
+                    (Some(s), _) => s.level_spilled_bytes(0),
+                    (None, Some(s)) => s.level_spilled_bytes(level.level_idx),
+                    (None, None) => 0,
+                };
+                let own = level_store.is_some();
+                let buckets = collect_unit(
+                    level_store.as_mut().or(store.as_deref_mut()),
+                    (level, own),
+                    (w, wave),
+                    &timers,
                     diagnostics,
-                );
-                let encoded = tiles.map(|tiles| EncodedLevel {
-                    tiles,
-                    start,
-                    collect_secs,
-                    encode_secs: t_encode.elapsed().as_secs_f64(),
-                    spill_bytes,
+                )
+                .map_err(|e| (i, e))?;
+                let collect_secs = start.elapsed().as_secs_f64();
+                #[cfg(test)]
+                if multi_wave {
+                    level
+                        .work
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .group_waves += 1;
+                }
+                let (commit, timers, in_flight) = (&commit, &*timers, &in_flight);
+                scope.spawn(move |_| {
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let t_encode = Instant::now();
+                        let tiles = encode_buckets(
+                            level.gzip_cache,
+                            (buckets, Some(&held)),
+                            level.plan.zoom,
+                            level.options,
+                            level.fills,
+                            timers,
+                            diagnostics,
+                        );
+                        drop(held);
+                        let encoded = tiles.map(|tiles| EncodedWave {
+                            tiles,
+                            start,
+                            collect_secs,
+                            encode_secs: t_encode.elapsed().as_secs_f64(),
+                            spill_bytes,
+                        });
+                        lock_commit(commit, timers).finish((i, w), encoded);
+                    }));
+                    if run.is_err() {
+                        // The collect may wait on this wave's write: fail
+                        // the group so it stops, then let Rayon re-raise.
+                        let e = std::io::Error::other("a wave's encode or write panicked");
+                        lock_commit(commit, timers).fail(i, ExportError::Io(e));
+                    }
+                    in_flight.notify();
+                    if let Err(panic) = run {
+                        std::panic::resume_unwind(panic);
+                    }
                 });
-                lock_commit(commit, timers).finish(i, encoded);
-            });
+                unit += 1;
+            }
+            // The level's waves are all taken: its one-level store is empty.
+            drop(level_store);
+            for grant in grants {
+                budget.release(grant);
+            }
         }
         Ok(())
     });
@@ -3549,6 +3724,122 @@ fn export_level_group(
         commit.fail(i, e);
     }
     commit.into_reports()
+}
+
+/// How a level group runs ([`export_level_group`]): the [`InFlight`] cap
+/// ([`group_schedule`]), and whether a multi-wave level's waves overlap.
+#[derive(Clone, Copy)]
+struct GroupGate {
+    cap: usize,
+    waves: bool,
+}
+
+/// The waves `plan` exports in, at least one: an empty level writes its
+/// stopped tiles and reports as one empty wave.
+fn level_waves(plan: &LevelPlan) -> usize {
+    plan.partitions.len().div_ceil(plan.wave.max(1)).max(1)
+}
+
+/// The members a level group has admitted to collect and not yet encoded
+/// (#817, see [`bound_group_cap`]). The collecting thread waits in
+/// [`Self::admit`] while the next level would take them past `cap`, unless
+/// none are in flight, so a level larger than the cap still runs.
+struct InFlight {
+    cap: usize,
+    held: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// A level's admitted members. Each partition's are released as it
+/// encodes ([`Self::release`]), so the next level's collect overlaps the
+/// encode's tail; the rest when its encode task drops it, panicking or not.
+struct Admitted<'g> {
+    gate: &'g InFlight,
+    remaining: Mutex<usize>,
+}
+
+impl Admitted<'_> {
+    /// Release up to `members` of the admitted members (a partition's
+    /// collected count can differ from its planned one).
+    fn release(&self, members: usize) {
+        let mut remaining = self
+            .remaining
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let freed = members.min(*remaining);
+        *remaining -= freed;
+        self.gate.release(freed);
+    }
+}
+
+impl InFlight {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            held: Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Wait until `ready(held)`, re-checked whenever members are released or
+    /// [`Self::notify`] is called, and return the lock.
+    fn wait_for(&self, mut ready: impl FnMut(usize) -> bool) -> std::sync::MutexGuard<'_, usize> {
+        let lock = || self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = lock();
+        while !ready(*held) {
+            if rayon::current_thread_index().is_some() {
+                // A pool thread runs the encodes it waits on, never parks.
+                drop(held);
+                if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                    std::thread::yield_now();
+                }
+                held = lock();
+            } else {
+                held = self
+                    .freed
+                    .wait(held)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+        held
+    }
+
+    fn admit(&self, members: usize) -> Admitted<'_> {
+        let mut held = self.wait_for(|h| h == 0 || h.saturating_add(members) <= self.cap);
+        *held += members;
+        drop(held);
+        Admitted {
+            gate: self,
+            remaining: Mutex::new(members),
+        }
+    }
+
+    /// Wait until `ready()`: a condition another thread changes before it
+    /// calls [`Self::notify`]. `ready` runs under this gate's lock.
+    fn wait_until(&self, mut ready: impl FnMut() -> bool) {
+        drop(self.wait_for(|_| ready()));
+    }
+
+    fn notify(&self) {
+        let _held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        self.freed.notify_all();
+    }
+
+    fn release(&self, members: usize) {
+        if members == 0 {
+            return;
+        }
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        *held -= members;
+        self.freed.notify_all();
+    }
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        let remaining = self.remaining.get_mut().unwrap_or_else(|e| e.into_inner());
+        self.gate.release(*remaining);
+    }
 }
 
 /// Lock the group's [`GroupCommit`]. A poisoned lock means an encode task
@@ -3563,55 +3854,69 @@ fn lock_commit<'g, 'a>(
     })
 }
 
-/// Collect one single-wave level's members, bucketed per partition: the
-/// single-read store's wave 0, or one [`collect_wave`] read. An empty level
-/// has no buckets.
-fn collect_level(
+/// Collect wave `w` of `level`, bucketed per partition: from `store` (the
+/// level's own one-level store when `own`, else the single-read store), or
+/// one [`collect_wave`] read. An empty wave has no buckets.
+fn collect_unit(
     store: Option<&mut MemberStore>,
-    level: &ExportLevelCtx<'_>,
+    (level, own): (&ExportLevelCtx<'_>, bool),
+    (w, wave): (usize, &[Partition]),
     timers: &ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<Vec<Member>>, ExportError> {
-    let partitions = &level.plan.partitions;
-    if partitions.is_empty() {
+    if wave.is_empty() {
         return Ok(Vec::new());
     }
     match store {
         Some(s) => {
-            let members =
-                ExportTimers::time(&timers.spill_read, || s.take_wave(level.level_idx, 0))?;
-            Ok(bucket_members(members, partitions))
+            let store_level = if own { 0 } else { level.level_idx };
+            let members = ExportTimers::time(&timers.spill_read, || s.take_wave(store_level, w))?;
+            Ok(bucket_members(members, wave))
         }
-        None => Ok(collect_wave(&level.level_ctx(timers), partitions, diagnostics)?.buckets),
+        None => Ok(collect_wave(&level.level_ctx(timers), wave, diagnostics)?.buckets),
     }
 }
 
-/// One encoded level of a group, waiting for [`GroupCommit`] to write it.
-struct EncodedLevel {
+/// One encoded wave of a group, waiting for [`GroupCommit`] to write it.
+struct EncodedWave {
     tiles: Vec<Vec<EncodedTile>>,
-    /// When the level's collect started: its wall in the profile runs from
-    /// here to the end of its write.
+    /// When the wave's collect started: its level's wall in the profile runs
+    /// from its first wave's start to the end of its write.
     start: Instant,
-    /// The level's collect time, on the calling thread.
+    /// The wave's collect time, on the calling thread.
     collect_secs: f64,
-    /// The level's encode time, in its Rayon task.
+    /// The wave's encode time, in its Rayon task.
     encode_secs: f64,
-    /// #810: the level's spilled member bytes, for its profile entry.
+    /// #810: the level's spilled member bytes (on its first wave).
     spill_bytes: u64,
 }
 
+/// The level [`GroupCommit`] is writing: its tally and times so far.
+#[derive(Default)]
+struct OpenLevel {
+    tally: LevelTally,
+    start: Option<Instant>,
+    collect_secs: f64,
+    encode_secs: f64,
+    last_log: Option<Instant>,
+}
+
 /// The ordered write side of a concurrent level group (#647). Encode tasks
-/// hand their levels to [`Self::finish`] in any order. Levels are written in
-/// level order, each as soon as every coarser level of the group is written.
+/// hand their waves to [`Self::finish`] in any order. Waves are written in
+/// (level, wave) order, each as soon as every earlier wave of the group is
+/// written; a level is reported and checkpointed after its last wave.
 struct GroupCommit<'a> {
     writer: &'a mut StreamingPmtilesWriter,
     progress: &'a mut ExportProgress,
     ckpt: &'a CheckpointCtx<'a>,
     levels: &'a [ExportLevelCtx<'a>],
-    /// The group index of the next level to write.
-    next: usize,
-    /// Encoded levels that wait for a coarser level.
-    pending: BTreeMap<usize, EncodedLevel>,
+    /// The (group level index, wave) of the next wave to write.
+    next: (usize, usize),
+    /// Waves written so far.
+    written: usize,
+    open: OpenLevel,
+    /// Encoded waves that wait for an earlier one.
+    pending: BTreeMap<(usize, usize), EncodedWave>,
     reports: Vec<ZoomReport>,
     /// The failure at the lowest group index so far. No level at or after
     /// it is written.
@@ -3619,14 +3924,14 @@ struct GroupCommit<'a> {
 }
 
 impl GroupCommit<'_> {
-    /// Take one level's encode result, then write every level that is ready.
-    fn finish(&mut self, i: usize, encoded: Result<EncodedLevel, ExportError>) {
+    /// Take one wave's encode result, then write every wave that is ready.
+    fn finish(&mut self, unit: (usize, usize), encoded: Result<EncodedWave, ExportError>) {
         match encoded {
-            Ok(level) => {
-                self.pending.insert(i, level);
+            Ok(wave) => {
+                self.pending.insert(unit, wave);
                 self.write_ready();
             }
-            Err(e) => self.fail(i, e),
+            Err(e) => self.fail(unit.0, e),
         }
     }
 
@@ -3638,27 +3943,41 @@ impl GroupCommit<'_> {
     }
 
     fn write_ready(&mut self) {
-        while self.error.as_ref().is_none_or(|(j, _)| self.next < *j) {
-            let Some(level) = self.pending.remove(&self.next) else {
+        while self.error.as_ref().is_none_or(|(j, _)| self.next.0 < *j) {
+            let Some(wave) = self.pending.remove(&self.next) else {
                 return;
             };
-            match self.write_level(self.next, level) {
-                Ok(report) => {
-                    self.reports.push(report);
-                    self.next += 1;
-                }
-                Err(e) => self.fail(self.next, e),
+            if let Err(e) = self.write_wave(wave) {
+                self.fail(self.next.0, e);
             }
         }
     }
 
-    /// Write one level's tiles, report it, and take a checkpoint when due.
-    fn write_level(&mut self, i: usize, encoded: EncodedLevel) -> Result<ZoomReport, ExportError> {
+    /// Write one wave's tiles. After a level's last wave, report the level
+    /// and take a checkpoint when due.
+    fn write_wave(&mut self, encoded: EncodedWave) -> Result<(), ExportError> {
+        let (i, w) = self.next;
         let level = &self.levels[i];
-        let mut tally = LevelTally {
-            spill_bytes: encoded.spill_bytes,
-            ..LevelTally::default()
-        };
+        #[cfg(test)]
+        assert!(
+            w > 0 || self.progress.panic_write_level != Some(level.level_idx),
+            "injected write panic at level {}",
+            level.level_idx
+        );
+        let open = &mut self.open;
+        if w == 0 {
+            *open = OpenLevel {
+                tally: LevelTally {
+                    spill_bytes: encoded.spill_bytes,
+                    ..LevelTally::default()
+                },
+                start: Some(encoded.start),
+                last_log: Some(Instant::now()),
+                ..OpenLevel::default()
+            };
+        }
+        open.collect_secs += encoded.collect_secs;
+        open.encode_secs += encoded.encode_secs;
         let timers = &self.progress.profile.timers;
         let zoom = level.plan.zoom;
         write_encoded_tiles(
@@ -3666,19 +3985,47 @@ impl GroupCommit<'_> {
             zoom,
             &encoded.tiles,
             level.terminals,
-            &mut tally,
+            &mut open.tally,
             timers,
         )?;
-        write_terminals(self.writer, zoom, level.terminals, None, &mut tally, timers)?;
         drop(encoded.tiles);
+        self.written += 1;
+        let waves = level_waves(level.plan);
+        if w + 1 < waves {
+            self.next = (i, w + 1);
+            if open
+                .last_log
+                .is_some_and(|t| t.elapsed() >= WAVE_LOG_INTERVAL)
+            {
+                log::info!(
+                    "[export] level {}/{} z{zoom}: wave {}/{waves}, {} tiles, {:.0}s",
+                    level.level_idx + 1,
+                    level.num_levels,
+                    w + 1,
+                    open.tally.tile_count,
+                    level.start.elapsed().as_secs_f64(),
+                );
+                open.last_log = Some(Instant::now());
+            }
+            return Ok(());
+        }
+        write_terminals(
+            self.writer,
+            zoom,
+            level.terminals,
+            None,
+            &mut open.tally,
+            timers,
+        )?;
+        let open = std::mem::take(&mut self.open);
         let report = finish_level(
             level,
-            &tally,
-            level.plan.partitions.len().div_ceil(level.plan.wave),
+            &open.tally,
+            level.plan.partitions.len().div_ceil(level.plan.wave.max(1)),
             LevelWalls::grouped(
-                encoded.start.elapsed().as_secs_f64(),
-                encoded.collect_secs,
-                encoded.encode_secs,
+                open.start.map_or(0.0, |s| s.elapsed().as_secs_f64()),
+                open.collect_secs,
+                open.encode_secs,
             ),
             self.progress,
         );
@@ -3688,7 +4035,9 @@ impl GroupCommit<'_> {
             checkpoint_zoom_after_level(level),
             self.progress,
         )?;
-        Ok(report)
+        self.reports.push(report);
+        self.next = (i + 1, 0);
+        Ok(())
     }
 
     /// The group's reports in level order, or the coarsest failure.
@@ -4084,16 +4433,30 @@ struct ExportWorkTally {
     /// wave already read adds them again.
     band_rows_read: BTreeMap<usize, u64>,
     /// Rows whose per-row collect work (geometry decode, property
-    /// materialization and member routing in [`collect_wave_members`]) ran
+    /// materialization and member routing in [`finish_group`]) ran
     /// on the wave's consumer thread, outside the Rayon pool, so that no
     /// other core could share it (#740).
     serial_collect_rows: u64,
     /// Bytes each multi-wave level's one-level member store spilled (#740).
     level_spill_bytes: BTreeMap<usize, u64>,
+    /// Read batches [`finish_group`] took, and the calls (each a
+    /// set of pool joins) it took them in (#817).
+    collect_batches: u64,
+    collect_groups: u64,
+    /// Band batches read on the thread that collects them, which then
+    /// waits on the read (#817).
+    band_reads_on_consumer: u64,
+    /// Groups clipped while an earlier group still waited to finish (#817).
+    collect_overlaps: u64,
+    /// Waves of multi-wave levels a level group collected and encoded in
+    /// its pipeline, not the serial wave loop (#817).
+    group_waves: u64,
 }
 
 struct LevelCtx<'a> {
     reader: &'a OverviewReader,
+    /// How the band is read: [`read_band`].
+    band: BandRead<'a>,
     level_idx: usize,
     crs: Crs,
     zoom: u8,
@@ -4316,7 +4679,7 @@ const SINGLE_READ_IN_FLIGHT: usize = 4;
 /// `EXPORT_BATCH_SIZE` batches here. For a wave that is noise next to its own
 /// member buffer and is not folded into the preflight estimate; the scan
 /// additionally projects its read to the geometry column
-/// ([`OverviewReader::read_band_projected`]), so its batches carry no
+/// ([`read_in_order_capped`] with a projection), so its batches carry no
 /// property columns.
 const WAVE_READ_IN_FLIGHT: usize = 2;
 
@@ -5100,7 +5463,7 @@ fn fill_member_store(
 /// Decode one band batch and fan its members out: clip every feature (in
 /// parallel) at each including level's zoom over the **full** key range, then
 /// route each member to its `(level, partition wave)` bucket. The legacy
-/// analogue is [`collect_wave_members`]; see the section comment for why the
+/// analogue is [`finish_group`]; see the section comment for why the
 /// results are byte-identical.
 fn fanout_batch_members(
     batch: &RecordBatch,
@@ -5251,7 +5614,7 @@ fn route_fanout_rows(
 
 /// Pass-2 drain for one wave under the single-read path: take the wave's
 /// buffered members, bucket them per partition (exactly as
-/// [`collect_wave_members`] routes), and encode each partition as
+/// [`finish_group`] routes), and encode each partition as
 /// [`process_wave`] would — same parallel section, same ascending output
 /// order.
 fn encode_wave_from_store(
@@ -5267,7 +5630,7 @@ fn encode_wave_from_store(
     })?;
     encode_buckets(
         ctx.gzip_cache,
-        bucket_members(members, wave),
+        (bucket_members(members, wave), None),
         ctx.zoom,
         ctx.opts,
         ctx.fills,
@@ -5277,7 +5640,7 @@ fn encode_wave_from_store(
 }
 
 /// Route a wave's members to their partitions, one bucket per partition, as
-/// [`collect_wave_members`] routes them.
+/// [`finish_group`] routes them.
 fn bucket_members(members: Vec<Member>, wave: &[Partition]) -> Vec<Vec<Member>> {
     let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
     for m in members {
@@ -5287,10 +5650,11 @@ fn bucket_members(members: Vec<Member>, wave: &[Partition]) -> Vec<Vec<Member>> 
 }
 
 /// Encode a wave's partition buckets in parallel. The tiles come back in
-/// ascending partition order.
+/// ascending partition order. Each bucket's members are released from
+/// `admitted`, when given, as the bucket is encoded ([`InFlight`]).
 fn encode_buckets(
     gzip_cache: &Arc<TileGzipCache>,
-    buckets: Vec<Vec<Member>>,
+    (buckets, admitted): (Vec<Vec<Member>>, Option<&Admitted<'_>>),
     zoom: u8,
     opts: &ExportOptions,
     fills: Option<&coverage_fill::FillMap>,
@@ -5299,7 +5663,14 @@ fn encode_buckets(
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
     buckets
         .into_par_iter()
-        .map(|members| encode_members(gzip_cache, members, zoom, opts, fills, timers, diagnostics))
+        .map(|members| {
+            let n = members.len();
+            let tiles = encode_members(gzip_cache, members, zoom, opts, fills, timers, diagnostics);
+            if let Some(a) = admitted {
+                a.release(n);
+            }
+            tiles
+        })
         .collect::<Result<_, _>>()
 }
 
@@ -5333,6 +5704,7 @@ fn encode_buckets(
 /// from the geometry from the start.
 fn scan_all_levels(
     reader: &OverviewReader,
+    band: BandRead<'_>,
     crs: Crs,
     opts: &ExportOptions,
     timers: &ExportTimers,
@@ -5351,7 +5723,7 @@ fn scan_all_levels(
     let source = ScanBboxSource::for_reader(reader);
     if matches!(source, ScanBboxSource::Covering { .. }) {
         if let Some(scans) = scan_all_levels_from(
-            reader,
+            (reader, band),
             crs,
             opts,
             timers,
@@ -5370,7 +5742,7 @@ fn scan_all_levels(
         }
     }
     let scans = scan_all_levels_from(
-        reader,
+        (reader, band),
         crs,
         opts,
         timers,
@@ -5421,7 +5793,7 @@ impl ScanBboxSource {
 /// [`ScanBboxSource::Covering`], when a covering row has no exact bbox
 /// ([`covering_batch_bboxes`]) and the pass is abandoned.
 fn scan_all_levels_from(
-    reader: &OverviewReader,
+    (reader, band): (&OverviewReader, BandRead<'_>),
     crs: Crs,
     opts: &ExportOptions,
     timers: &ExportTimers,
@@ -5442,21 +5814,22 @@ fn scan_all_levels_from(
         })
         .collect();
 
-    // PERF (#535): same read/compute overlap as [`process_wave`] — the Parquet
-    // read is inherently single-threaded while the decode + sizing fans out
+    // PERF (#535): same read/compute overlap as [`process_wave`] — the read
+    // runs off the consumer's thread while the decode + sizing fans out
     // over the Rayon pool, so reading and sizing alternately on one thread left
     // the pool parked for the whole read. The scan was 3.9 of the 16 s export
     // wall on a 3.07 M-feature z0–13 run. Every band goes down one channel in
-    // band order (as [`fill_member_store`] does), so the consumer folds batches
-    // in exactly the order the serial loop did and the `LevelScan`s come out
-    // identical — not merely equivalent under the commutativity argument in
-    // this function's docs.
+    // band order (as [`fill_member_store`] does), so variable depth folds
+    // batches in the order the serial loop did; the `LevelScan`s are sums
+    // and min/max, identical however the consumer groups the rows.
     //
     // Memory (#559 review): the scan needs only each feature's bbox, so the
     // read is projected to the one column the bbox comes from — the covering
     // struct, else the geometry — and the pipe is the shallow
     // [`WAVE_READ_IN_FLIGHT`]: this runs before any wave preflight, so its
-    // in-flight batches are unbudgeted. Projection keeps every row and the
+    // in-flight batches are unbudgeted (shortcut: under `auto` up to four
+    // readers each hold [`SCAN_READ_AHEAD_BATCHES`] of them too; charge a
+    // `grant_read_ahead` if a geometry-column scan shows in peak RSS). Projection keeps every row and the
     // column's field (name and metadata), so the bboxes — and the scan — are
     // unchanged. With no recognizable geometry column the read stays
     // unprojected, so the error surfaces from the decode exactly as before.
@@ -5487,29 +5860,93 @@ fn scan_all_levels_from(
     let zooms_ref = &zooms;
     let mut abandoned = false;
     let abandoned_ref = &mut abandoned;
+    #[cfg(test)]
+    let mut readers = 0;
+    #[cfg(test)]
+    let readers_ref = &mut readers;
+    // PERF (#817): each band is read by the ordered parallel reader, in
+    // the same batches one reader makes; `bounded` keeps the one reader.
     scoped_pipe(
         WAVE_READ_IN_FLIGHT,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
             for j in 0..num_levels {
-                let mut band_reader = ExportTimers::time(&timers.scan_read, || match &roots {
-                    Some(r) => reader.read_band_projected(j, EXPORT_BATCH_SIZE, r),
-                    None => reader.read_band_batched(j, EXPORT_BATCH_SIZE),
-                })?;
-                while let Some(batch) = ExportTimers::time(&timers.scan_read, || band_reader.next())
+                let selection = RowGroupSelection::from_parts(vec![reader.band(j)?]);
+                let tuning = band_tuning(band, &selection, roots.as_deref(), ReadPass::Scan)?;
+                let mut hung_up = false;
+                read_in_order_capped(
+                    band.source,
+                    Some(&selection),
+                    roots.as_deref(),
+                    tuning,
+                    Some(SCAN_READ_AHEAD_BATCHES),
+                    |batch, _, read| {
+                        add_nanos(&timers.scan_read, read);
+                        hung_up = tx.send((j, batch)).is_err();
+                        Ok(if hung_up {
+                            ReadFlow::Stop
+                        } else {
+                            ReadFlow::Continue
+                        })
+                    },
+                )
+                .map_err(read_error)?;
+                #[cfg(test)]
                 {
-                    if tx.send((j, batch?)).is_err() {
-                        return Ok(()); // consumer dropped the receiver
-                    }
+                    *readers_ref = (*readers_ref).max(super::read::last_read_workers());
+                }
+                if hung_up {
+                    return Ok(()); // consumer dropped the receiver
                 }
             }
             Ok(())
         },
         |rx: Receiver<(usize, RecordBatch)>| -> Result<(), ExportError> {
-            for (j, batch) in rx.iter() {
+            // PERF (#817): one band's bboxes are sized a pool's worth at a
+            // time, into each target level at once; one 8,192-row batch at a
+            // time, level after level, kept the consumer to about one core.
+            // Counts, unions and feature counts are sums and min/max, so the
+            // scans are identical however rows are grouped.
+            // `bounded` sizes batch by batch: a pool's worth at once is
+            // outside its scan's memory envelope.
+            let size_rows = match band.profile {
+                MemoryProfile::Bounded => EXPORT_BATCH_SIZE,
+                MemoryProfile::Auto | MemoryProfile::Speed => {
+                    SIZE_BBOXES_MIN_ROWS.saturating_mul(rayon::current_num_threads())
+                }
+            };
+            let mut pending: Vec<Option<TileBounds>> = Vec::with_capacity(size_rows);
+            let mut pending_band = 0;
+            let mut size_pending = |j: usize, pending: &mut Vec<Option<TileBounds>>| {
+                if pending.is_empty() {
+                    return;
+                }
+                #[cfg(test)]
+                SCAN_SIZE_FLUSHES.with(|n| n.set(n.get() + 1));
                 // Bands accumulate into finer levels' render sets only in
                 // partitioning mode; duplicating bands are self-contained, so
                 // band `j` feeds level `j` alone.
                 let last = if partitioning { num_levels - 1 } else { j };
+                ExportTimers::time(&timers.scan_size, || {
+                    scans_ref[j..=last]
+                        .par_iter_mut()
+                        .zip(&zooms_ref[j..=last])
+                        .for_each(|(scan, &zoom)| {
+                            scan.feature_count += pending.len();
+                            let (bounds, counts) = size_bboxes(pending, zoom, opts);
+                            if let Some(b) = bounds {
+                                match &mut scan.bounds {
+                                    Some(acc) => acc.expand(&b),
+                                    None => scan.bounds = Some(b),
+                                }
+                            }
+                            for (key, v) in counts {
+                                *scan.tile_counts.entry(key).or_insert(0) += v;
+                            }
+                        });
+                });
+                pending.clear();
+            };
+            for (j, batch) in rx.iter() {
                 // Read + (for 3857) reproject each feature's bbox once per
                 // band; sizing the same bbox into every target level below is
                 // bit-identical to reprojecting it once per level, since
@@ -5570,28 +6007,35 @@ fn scan_all_levels_from(
                         )
                     })?;
                 }
-                for k in j..=last {
-                    let scan = &mut scans_ref[k];
-                    scan.feature_count += bboxes.len();
-                    let (batch_bounds, batch_counts) =
-                        ExportTimers::time(&timers.scan_size, || {
-                            size_bboxes(&bboxes, zooms_ref[k], opts)
-                        });
-                    if let Some(b) = batch_bounds {
-                        match &mut scan.bounds {
-                            Some(acc) => acc.expand(&b),
-                            None => scan.bounds = Some(b),
-                        }
-                    }
-                    for (key, v) in batch_counts {
-                        *scan.tile_counts.entry(key).or_insert(0) += v;
-                    }
+                if j != pending_band {
+                    size_pending(pending_band, &mut pending);
+                    pending_band = j;
+                }
+                pending.extend(bboxes);
+                if pending.len() >= size_rows {
+                    size_pending(j, &mut pending);
                 }
             }
+            size_pending(pending_band, &mut pending);
             Ok(())
         },
     )?;
+    #[cfg(test)]
+    SCAN_READ_WORKERS.with(|w| w.set(readers));
     Ok((!abandoned).then_some(scans))
+}
+
+/// Read-ahead per scan reader, in batches: the scan's projected batches are
+/// small and its consumer keeps up, so the floor is enough.
+const SCAN_READ_AHEAD_BATCHES: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    /// Most reader threads one band read of this thread's last scan used
+    /// (test counter, #817).
+    static SCAN_READ_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Sizing passes this thread's scans ran, summed (test counter, #817).
+    static SCAN_SIZE_FLUSHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One record batch's per-feature bboxes read from its f64 bbox covering
@@ -5761,6 +6205,18 @@ fn for_each_member_key(bbox: &TileBounds, zoom: u8, opts: &ExportOptions, mut f:
     }
 }
 
+/// Fewest bboxes one [`size_bboxes`] task sizes. Sizing a bbox costs well
+/// under a microsecond, so finer splits only buy accumulator maps to merge
+/// and a pool to wake: splitting a batch to the thread count leaves a large
+/// pool spinning in Rayon (#817).
+const SIZE_BBOXES_MIN_ROWS: usize = 2048;
+
+#[cfg(test)]
+thread_local! {
+    /// [`size_bboxes`] accumulators this thread started (test counter, #817).
+    static SIZE_ACCUMULATORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Size a batch of (already-reprojected) feature bboxes at `zoom`: union their
 /// bounds and count one member per tile each spans. Sizing is embarrassingly
 /// parallel per feature (issue #227): fold into per-thread `(bounds, counts)`
@@ -5774,8 +6230,13 @@ fn size_bboxes(
 ) -> (Option<TileBounds>, HashMap<u64, usize>) {
     bboxes
         .par_iter()
+        .with_min_len(SIZE_BBOXES_MIN_ROWS)
         .fold(
-            || (None::<TileBounds>, HashMap::<u64, usize>::new()),
+            || {
+                #[cfg(test)]
+                SIZE_ACCUMULATORS.with(|n| n.set(n.get() + 1));
+                (None::<TileBounds>, HashMap::<u64, usize>::new())
+            },
             |(mut bounds, mut counts), bbox| {
                 if let Some(bbox) = bbox {
                     for extent in wrapped_extents(bbox) {
@@ -5962,7 +6423,7 @@ fn process_wave(
     let t_encode = Instant::now();
     let tiles = encode_buckets(
         ctx.gzip_cache,
-        buckets,
+        (buckets, None),
         ctx.zoom,
         ctx.opts,
         ctx.fills,
@@ -6133,24 +6594,14 @@ fn collect_into(
     };
     // #535: `band_read` is the reader open (footer/page-index setup, paid
     // per wave on this path) plus each `next()` (read + Arrow decode);
-    // `collect_wave_members` charges its own `decode`/`clip`.
+    // `clip_group` and `finish_group` charge their own `decode`/`clip`.
     let timers = ctx.timers;
 
-    // PERF (#535): the read runs on its own thread, one batch ahead of the
-    // clip, instead of alternating with it on this one. The read is
-    // single-threaded by nature (one Parquet reader, sequential row groups)
-    // while the clip fans out over the whole Rayon pool, so a read-then-clip
-    // loop left 11 of 12 cores parked for the whole read: `band_read` was
-    // 5.3 of the 17 s `levels` wall on a 3.07 M-feature z0–13 export, all of
-    // it on the critical path. The partitioning path (#235's
-    // [`fill_member_store`]) is already shaped this way; this brings the
-    // duplicating path in line, without touching wave widths, partitions or
-    // the work either side does.
-    //
-    // Output is unchanged: one producer over a FIFO channel delivers batches
-    // in read order, so `seq` — the band-order counter the within-tile
-    // ordering derives from — advances exactly as it did serially, and the
-    // consumer does the same work in the same order.
+    // PERF (#535, #817): the read runs on reader threads ahead of the clip
+    // ([`read_band`]), so the pool never waits for a read-then-clip loop.
+    // Output is unchanged: the batches arrive in read order, so `seq` — the
+    // band-order counter the within-tile ordering derives from — advances
+    // exactly as it did serially.
     // #745: the same row groups the read below selects, so the cursor knows
     // where each one starts and which band it belongs to.
     let selected = ctx
@@ -6162,39 +6613,258 @@ fn collect_into(
             .measuring(valve_merges(ctx.opts)),
         locator: ctx.reader.row_locator(&selected),
     };
-    let rows_ref = &mut rows;
-    scoped_pipe(
-        WAVE_READ_IN_FLIGHT,
-        |tx: &Sender<RecordBatch>| -> Result<(), ExportError> {
-            let mut batch_reader = ExportTimers::time(&timers.band_read, || {
-                ctx.reader.read_level_any_bbox_batched(
-                    ctx.level_idx,
-                    bboxes.as_deref(),
-                    EXPORT_BATCH_SIZE,
-                )
-            })?;
-            loop {
-                let next = ExportTimers::time(&timers.band_read, || batch_reader.next());
-                let Some(batch) = next else { break };
-                if tx.send(batch?).is_err() {
-                    return Ok(()); // consumer dropped the receiver (error path)
-                }
+    // PERF (#817): a group's ordered finish (the gap walk, member routing
+    // and the sink appends) runs alongside the next group's decode and clip,
+    // so the pool is not idle while this thread walks the rows.
+    let mut group = CollectGroup::new(collect_group_rows(ctx.band.profile));
+    let mut clipped: Option<ClippedGroup> = None;
+    let rows = &mut rows;
+    // `bounded` finishes each group before clipping the next, so it never
+    // holds two groups' geometry and members: that overlap is not budgeted.
+    let overlap = !matches!(ctx.band.profile, MemoryProfile::Bounded);
+    let mut step = |batches: Vec<RecordBatch>| -> Result<(), ExportError> {
+        if !overlap {
+            if let Some(c) = clipped.take() {
+                finish_group(ctx, wave, c, rows, sink, diagnostics)?;
             }
-            Ok(())
-        },
-        |rx: Receiver<RecordBatch>| -> Result<(), ExportError> {
-            for batch in rx.iter() {
-                collect_wave_members(ctx, wave, &batch, rows_ref, sink, diagnostics)?;
-            }
-            Ok(())
+        }
+        #[cfg(test)]
+        if clipped.is_some() {
+            ctx.work
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .collect_overlaps += 1;
+        }
+        let (finished, next) = rayon::join(
+            || {
+                clipped.take().map_or(Ok(()), |c| {
+                    finish_group(ctx, wave, c, rows, sink, diagnostics)
+                })
+            },
+            || clip_group(ctx, wave, batches, diagnostics),
+        );
+        finished?;
+        clipped = Some(next?);
+        Ok(())
+    };
+    read_band(
+        ctx.band,
+        &selected,
+        timers,
+        #[cfg(test)]
+        ctx.work,
+        |batch| {
+            let bytes = batch.get_array_memory_size();
+            group.push(batch, bytes, &mut step)
         },
     )?;
+    if !group.batches.is_empty() {
+        step(group.batches)?;
+    }
+    if let Some(c) = clipped.take() {
+        finish_group(ctx, wave, c, rows, sink, diagnostics)?;
+    }
     #[cfg(test)]
     {
         let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
         *work.band_rows_read.entry(ctx.level_idx).or_default() += rows.read;
     }
     Ok(rows.read)
+}
+
+/// The batches [`collect_into`] gathers before one [`clip_group`]: up to
+/// `max_rows` rows, and never past one reader batch's decoded-byte cap
+/// ([`tylertoo_io::decoded_batch_limit`]) unless a single batch is that
+/// large on its own, so grouping holds no more than the reader allows.
+struct CollectGroup {
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    bytes: usize,
+    max_rows: usize,
+    max_bytes: usize,
+}
+
+impl CollectGroup {
+    fn new(max_rows: usize) -> Self {
+        Self {
+            batches: Vec::new(),
+            rows: 0,
+            bytes: 0,
+            max_rows,
+            max_bytes: usize::try_from(tylertoo_io::decoded_batch_limit()).unwrap_or(usize::MAX),
+        }
+    }
+
+    /// Add `batch` (`bytes` decoded), handing each full group to `flush`:
+    /// the gathered batches first when `batch` would take them past the
+    /// byte cap, then the group once it reaches either cap.
+    fn push(
+        &mut self,
+        batch: RecordBatch,
+        bytes: usize,
+        flush: &mut impl FnMut(Vec<RecordBatch>) -> Result<(), ExportError>,
+    ) -> Result<(), ExportError> {
+        if !self.batches.is_empty() && self.bytes.saturating_add(bytes) > self.max_bytes {
+            self.flush(flush)?;
+        }
+        self.rows += batch.num_rows();
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.batches.push(batch);
+        if self.rows >= self.max_rows || self.bytes >= self.max_bytes {
+            self.flush(flush)?;
+        }
+        Ok(())
+    }
+
+    fn flush(
+        &mut self,
+        flush: &mut impl FnMut(Vec<RecordBatch>) -> Result<(), ExportError>,
+    ) -> Result<(), ExportError> {
+        self.rows = 0;
+        self.bytes = 0;
+        flush(std::mem::take(&mut self.batches))
+    }
+}
+
+/// How the export reads a band: the overview file as a [`ConvertSource`],
+/// so every band read goes through the ordered multi-worker reader
+/// ([`read_in_order`]), and the budget and profile that size its read-ahead.
+#[derive(Clone, Copy)]
+struct BandRead<'a> {
+    source: &'a ConvertSource,
+    budget: MemoryBudget,
+    profile: MemoryProfile,
+}
+
+/// Read the row groups `selected` of the overview file in file order, in
+/// [`EXPORT_BATCH_SIZE`] batches, and hand each to `on_batch` on this
+/// thread. Up to [`resolve_pass_read_workers`] readers decode disjoint runs
+/// of row groups ahead of the consumer, and the merge puts their batches
+/// back in read order, so `on_batch` sees the rows exactly as one reader
+/// would hand them over. `band_read` is charged the readers' core-seconds.
+///
+/// PERF (#817): several readers, as one reader thread cannot decompress
+/// pages as fast as the pool clips them.
+fn read_band(
+    band: BandRead<'_>,
+    selected: &[usize],
+    timers: &ExportTimers,
+    #[cfg(test)] work: &Mutex<ExportWorkTally>,
+    mut on_batch: impl FnMut(RecordBatch) -> Result<(), ExportError>,
+) -> Result<(), ExportError> {
+    let selection = RowGroupSelection::from_parts(vec![selected.to_vec()]);
+    let tuning = band_tuning(band, &selection, None, ReadPass::Build)?;
+    // The collect takes a group at a time, so each reader needs about one
+    // group queued, not the budget's depth: concurrent levels each read.
+    let ahead = collect_group_rows(band.profile).div_ceil(EXPORT_BATCH_SIZE);
+    #[cfg(test)]
+    let consumer = std::thread::current().id();
+    // The read runs on its own thread: with one reader (few cores, a tight
+    // budget, one segment) `read_in_order` reads on its caller's thread,
+    // and the pool would wait on each read.
+    scoped_pipe(
+        SINGLE_READ_IN_FLIGHT,
+        |tx: &Sender<RecordBatch>| -> Result<(), ExportError> {
+            read_in_order_capped(
+                band.source,
+                Some(&selection),
+                None,
+                tuning,
+                Some(ahead),
+                |batch, _, read| {
+                    add_nanos(&timers.band_read, read);
+                    #[cfg(test)]
+                    if std::thread::current().id() == consumer {
+                        work.lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .band_reads_on_consumer += 1;
+                    }
+                    // A closed channel is the consumer's error: stop cleanly.
+                    Ok(if tx.send(batch).is_ok() {
+                        ReadFlow::Continue
+                    } else {
+                        ReadFlow::Stop
+                    })
+                },
+            )
+            .map_err(read_error)
+        },
+        |rx| rx.into_iter().try_for_each(&mut on_batch),
+    )
+}
+
+/// How [`read_in_order_capped`] reads `selection` of the overview for
+/// `pass`, over the `projection` columns (`None`: all of them).
+fn band_tuning(
+    band: BandRead<'_>,
+    selection: &RowGroupSelection,
+    projection: Option<&[usize]>,
+    pass: ReadPass,
+) -> Result<ReadTuning, ExportError> {
+    let footer = match projection {
+        Some(p) => footer_price(band.source, Some(selection), p.iter().copied()),
+        None => {
+            let columns = band
+                .source
+                .schema()
+                .map_err(|e| read_error(e.into()))?
+                .fields()
+                .len();
+            footer_price(band.source, Some(selection), 0..columns)
+        }
+    }
+    .map_err(read_error)?;
+    Ok(ReadTuning {
+        budget: band.budget,
+        batch_size: EXPORT_BATCH_SIZE,
+        // `bounded` reads with one worker: concurrent level reads each size
+        // their read-ahead from the same budget, uncharged.
+        workers: match band.profile {
+            MemoryProfile::Bounded => 1,
+            MemoryProfile::Auto | MemoryProfile::Speed => {
+                resolve_pass_read_workers(pass, READ_WORKERS_AUTO)
+            }
+        },
+        avg_geom_bytes: None,
+        footer,
+        profile: band.profile,
+    })
+}
+
+/// A band read's [`ConvertError`] as the export's error, keeping its typed
+/// cause: [`Classify`](crate::error::Classify) finds a hostile input in the
+/// source chain.
+fn read_error(e: ConvertError) -> ExportError {
+    match e {
+        ConvertError::Parquet(e) | ConvertError::Input(InputError::Parquet(e)) => {
+            ExportError::Reader(ReaderError::Parquet(e))
+        }
+        ConvertError::Io(e) | ConvertError::Input(InputError::Io(e)) => ExportError::Io(e),
+        ConvertError::Core(e) => ExportError::Core(e),
+        ConvertError::Arrow(e) | ConvertError::Input(InputError::Arrow(e)) => ExportError::Arrow(e),
+        ConvertError::Input(InputError::Decode(e)) => {
+            ExportError::Arrow(arrow_schema::ArrowError::ExternalError(Box::new(e)))
+        }
+        e => ExportError::Arrow(arrow_schema::ArrowError::ExternalError(Box::new(e))),
+    }
+}
+
+/// Rows per pool thread that [`collect_into`] gathers, in whole batches,
+/// before one [`clip_group`] and [`finish_group`]: 64 threads collect four
+/// 8,192-row batches at a time, 16 threads one. Each group holds its
+/// batches and their members until it is merged.
+const COLLECT_GROUP_ROWS_PER_THREAD: usize = 512;
+
+/// The rows [`collect_into`] gathers per group on this pool. `bounded`
+/// takes each read batch on its own: the groups' decoded and clipped rows
+/// are not priced in the budget.
+fn collect_group_rows(profile: MemoryProfile) -> usize {
+    match profile {
+        MemoryProfile::Bounded => 1,
+        MemoryProfile::Auto | MemoryProfile::Speed => {
+            COLLECT_GROUP_ROWS_PER_THREAD.saturating_mul(rayon::current_num_threads())
+        }
+    }
 }
 
 /// The wave partition owning `key`. The wave's partitions are contiguous,
@@ -6297,79 +6967,168 @@ fn decode_geometry_chunk(
         .collect())
 }
 
-/// Decode one record batch and append its members to the wave's per-partition
-/// buckets: clip every feature (in parallel) into its intersecting tiles across
-/// the wave's whole key range, route each member to its owning partition, then
-/// attach shared per-feature properties in band order. `rows` restores the
-/// original overview addresses after pruning, keeping identity stable between
-/// waves while preserving the relative within-tile feature order.
+/// One feature's clipped pieces, one per tile key.
+type TileMembers = Vec<(u64, Geometry<f64>)>;
+
+/// A group of consecutive read batches, decoded and clipped by
+/// [`clip_group`], waiting for [`finish_group`] to append their members to
+/// the wave's per-partition buckets. Together the two clip every feature (in
+/// parallel) into its intersecting tiles across the wave's whole key range,
+/// route each member to its owning partition, then attach shared per-feature
+/// properties in band order. `rows` restores the original overview addresses after pruning,
+/// keeping identity stable between waves while preserving the relative
+/// within-tile feature order.
 ///
 /// PERF (#740): property extraction, member materialization and routing run
 /// over row chunks in the pool ([`collect_member_chunk`]); only appending
-/// each chunk's buckets, in chunk order, stays on this thread. On a 64-core
-/// Moldova export this thread used to do all of it serially while about 8
-/// cores were busy. The chunks are merged in row order, so every bucket
-/// holds the same members in the same order as the serial loop gave.
-fn collect_wave_members(
+/// each chunk's buckets, in chunk order, stays serial. The chunks are
+/// merged in row order, so every bucket holds the same members in the same
+/// order as the serial loop gave.
+///
+/// PERF (#817): the batches of a group ([`COLLECT_GROUP_ROWS_PER_THREAD`])
+/// share each parallel step, so a 64-thread pool joins once per group, not
+/// once per 8,192-row batch, whose joins would leave the pool spinning.
+/// Batches and their chunks are still merged in row order.
+struct ClippedGroup {
+    batches: Vec<RecordBatch>,
+    geom_idxs: Vec<usize>,
+    /// The decoded geometries, kept for the in-order gap walk.
+    geoms: Vec<Vec<Geometry<f64>>>,
+    /// Per batch, per row: the row's `(key, clipped geometry)` members.
+    row_members: Vec<Vec<TileMembers>>,
+}
+
+/// The order-free half of a group's collect: decode a group's
+/// geometries and clip every feature into its tiles, all in the pool.
+fn clip_group(
     ctx: &LevelCtx<'_>,
     wave: &[Partition],
-    batch: &RecordBatch,
+    batches: Vec<RecordBatch>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<ClippedGroup, ExportError> {
+    let key_lo = wave[0].key_lo;
+    let key_hi = wave[wave.len() - 1].key_hi;
+    let timers = ctx.timers;
+    let geom_idxs: Vec<usize> = batches
+        .iter()
+        .map(|b| batch_geometry_index(b, ctx.published.geometry.as_deref()))
+        .collect::<Result<_, _>>()?;
+    let geoms: Vec<Vec<Geometry<f64>>> = batches
+        .par_iter()
+        .zip(&geom_idxs)
+        .map(|(b, &gi)| decode_batch_geometries(b, &b.schema(), gi, ctx.crs, timers, diagnostics))
+        .collect::<Result<_, _>>()?;
+    // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
+    // range. #535: `clip` is timed per geometry inside the closure.
+    let row_members = geoms
+        .par_iter()
+        .map(|geoms| {
+            geoms
+                .par_iter()
+                .map(|g| {
+                    ExportTimers::time(&timers.clip, || {
+                        let mut members = feature_tile_members(
+                            g,
+                            ctx.zoom,
+                            ctx.opts,
+                            key_lo,
+                            key_hi,
+                            diagnostics,
+                        );
+                        if let Some(tiles) = ctx.tiles {
+                            members.retain(|(key, _)| tiles.contains_key(key));
+                        }
+                        members
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    Ok(ClippedGroup {
+        batches,
+        geom_idxs,
+        geoms,
+        row_members,
+    })
+}
+
+/// The ordered half of a group's collect ([`clip_group`] is the other): walk the group's rows for
+/// their gaps, in read order, then materialize and route their members and
+/// append them to `sink` in row order.
+fn finish_group(
+    ctx: &LevelCtx<'_>,
+    wave: &[Partition],
+    group: ClippedGroup,
     rows: &mut WaveRows,
     sink: &mut dyn MemberSink,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ExportError> {
-    let key_lo = wave[0].key_lo;
-    let key_hi = wave[wave.len() - 1].key_hi;
     let timers = ctx.timers;
-
-    let schema = batch.schema();
-    let geom_idx = batch_geometry_index(batch, ctx.published.geometry.as_deref())?;
-    let geoms = decode_batch_geometries(batch, &schema, geom_idx, ctx.crs, timers, diagnostics)?;
-    let row_gaps = ExportTimers::time(&timers.decode, || rows.gaps.batch(&geoms));
-
-    // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
-    // range. #535: `clip` is timed per geometry inside the closure. Each
-    // decoded geometry is consumed, so it is freed in the pool too (#740).
-    let mut row_members: Vec<Vec<(u64, Geometry<f64>)>> = geoms
-        .into_par_iter()
-        .map(|g| {
-            ExportTimers::time(&timers.clip, || {
-                let mut members =
-                    feature_tile_members(&g, ctx.zoom, ctx.opts, key_lo, key_hi, diagnostics);
-                if let Some(tiles) = ctx.tiles {
-                    members.retain(|(key, _)| tiles.contains_key(key));
-                }
-                members
-            })
-        })
-        .collect();
+    let ClippedGroup {
+        batches,
+        geom_idxs,
+        geoms,
+        mut row_members,
+    } = group;
+    let batches = &batches;
+    #[cfg(test)]
+    {
+        let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
+        work.collect_batches += batches.len() as u64;
+        work.collect_groups += 1;
+    }
+    let row_gaps: Vec<Vec<(u64, u16)>> = ExportTimers::time(&timers.decode, || {
+        geoms.iter().map(|g| rows.gaps.batch(g)).collect()
+    });
+    // Freed in the pool (#740).
+    geoms.into_par_iter().flatten().for_each(drop);
 
     // Property extraction and member routing, per chunk in the pool. #535:
     // `decode`, timed per chunk and around the merge below.
-    let attrs = AttrColumns::new(&schema, geom_idx, ctx.published, ctx.feature_id);
-    let chunk_rows = collect_chunk_rows(batch.num_rows());
-    let chunk = ChunkInput {
-        #[cfg(test)]
-        work: ctx.work,
-        wave,
-        batch,
-        attrs: &attrs,
-        row_gaps: &row_gaps,
-        locator: &rows.locator,
-        first_read: rows.read as usize,
-    };
-    let chunks: Vec<Result<ChunkMembers, ExportError>> = row_members
-        .par_chunks_mut(chunk_rows)
-        .enumerate()
-        .map(|(i, items)| {
-            ExportTimers::time(&timers.decode, || {
-                collect_member_chunk(&chunk, i * chunk_rows, items)
-            })
+    let mut first_read = rows.read as usize;
+    let attrs: Vec<AttrColumns<'_>> = batches
+        .iter()
+        .zip(&geom_idxs)
+        .map(|(b, &gi)| AttrColumns::new(&b.schema(), gi, ctx.published, ctx.feature_id))
+        .collect();
+    let chunk_inputs: Vec<ChunkInput<'_>> = batches
+        .iter()
+        .zip(&attrs)
+        .zip(&row_gaps)
+        .map(|((batch, attrs), row_gaps)| {
+            let input = ChunkInput {
+                #[cfg(test)]
+                work: ctx.work,
+                wave,
+                batch,
+                attrs,
+                row_gaps,
+                locator: &rows.locator,
+                first_read,
+            };
+            first_read += batch.num_rows();
+            input
+        })
+        .collect();
+    let chunks: Vec<Vec<Result<ChunkMembers, ExportError>>> = row_members
+        .par_iter_mut()
+        .zip(&chunk_inputs)
+        .map(|(row_members, chunk)| {
+            let chunk_rows = collect_chunk_rows(chunk.batch.num_rows());
+            row_members
+                .par_chunks_mut(chunk_rows)
+                .enumerate()
+                .map(|(i, items)| {
+                    ExportTimers::time(&timers.decode, || {
+                        collect_member_chunk(chunk, i * chunk_rows, items)
+                    })
+                })
+                .collect()
         })
         .collect();
     drop(row_members);
 
-    for chunk in chunks {
+    for chunk in chunks.into_iter().flatten() {
         let ChunkMembers {
             buckets: chunk_buckets,
             losses,
@@ -6393,16 +7152,16 @@ fn collect_wave_members(
             }
         }
     }
-    rows.read += batch.num_rows() as u64;
+    rows.read = first_read as u64;
     Ok(())
 }
 
-/// Where [`collect_wave_members`] puts a read's members: one call per
+/// Where [`finish_group`] puts a read's members: one call per
 /// partition (an index into the partitions being read) and row chunk, in row
 /// order. The per-wave read collects into one bucket per partition; a
 /// multi-wave level's single read (#740) into a [`MemberStore`], whose waves
 /// the drain then takes, or replays from spill, one at a time.
-trait MemberSink {
+trait MemberSink: Send {
     fn append(&mut self, partition: usize, members: Vec<Member>) -> Result<(), ExportError>;
 }
 
@@ -6899,6 +7658,18 @@ const DIRECT_CLIP_BUDGET: u64 = 100_000;
 /// microtasks. Small features take the direct path and never reach here.
 const CASCADE_PARALLEL_DEPTH: u32 = 3;
 
+/// Vertices in a cascade node's piece at which its children fork whatever
+/// the depth (M1, #817): every child clips the whole piece, so a monster
+/// coastline at a coarse zoom otherwise clips on one thread. The same
+/// break-even reasoning as [`PARALLEL_ENCODE_MIN_COORDS`].
+const CASCADE_PARALLEL_COORDS: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    /// Cascade nodes that split their children across Rayon tasks.
+    static CASCADE_FORKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Number of leaf tiles the feature's bbox covers at the target zoom (both
 /// x-bands when it crosses the antimeridian).
 #[inline]
@@ -7128,10 +7899,10 @@ fn split_feature_into_tiles(
 }
 
 /// Recurse into a node's four children with `child_geom` (already reduced to the
-/// parent's buffered bounds). Near the top of a large cascade the two halves run
-/// on separate Rayon threads (issue #237, RC4); deeper down — or for the common
-/// small-cascade case — it stays sequential. Emission order is irrelevant:
-/// `collect_wave_members` buckets members by tile key, and a feature emits at
+/// parent's buffered bounds). Near the top of a large cascade (issue #237, RC4),
+/// or under a piece of [`CASCADE_PARALLEL_COORDS`] vertices, the four subtrees
+/// run as separate Rayon tasks; otherwise it stays sequential. Emission order is irrelevant:
+/// `finish_group` buckets members by tile key, and a feature emits at
 /// most one member per key, so parallel interleaving cannot change the archive.
 fn fanout_children(
     children: [TileCoord; 4],
@@ -7150,51 +7921,39 @@ fn fanout_children(
         assume_simple,
         diagnostics,
     } = inputs;
-    if (zoom - node_z) as u32 > CASCADE_PARALLEL_DEPTH {
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        rayon::join(
-            || {
-                for &child in &children[..2] {
-                    split_feature_into_tiles(
-                        child,
-                        child_geom,
-                        child_bbox,
-                        TileTarget {
-                            zoom,
-                            opts,
-                            key_lo,
-                            key_hi,
-                            assume_simple,
-                            diagnostics,
-                        },
-                        ranges,
-                        &mut left,
-                    );
-                }
-            },
-            || {
-                for &child in &children[2..] {
-                    split_feature_into_tiles(
-                        child,
-                        child_geom,
-                        child_bbox,
-                        TileTarget {
-                            zoom,
-                            opts,
-                            key_lo,
-                            key_hi,
-                            assume_simple,
-                            diagnostics,
-                        },
-                        ranges,
-                        &mut right,
-                    );
-                }
-            },
-        );
-        out.append(&mut left);
-        out.append(&mut right);
+    // M1 (#817): each child clips the whole parent piece, so a huge piece
+    // forks at any depth; the four subtrees' members are appended in child
+    // order, as the sequential loop emits them.
+    if (zoom - node_z) as u32 > CASCADE_PARALLEL_DEPTH
+        || child_geom.coords_count() >= CASCADE_PARALLEL_COORDS
+    {
+        #[cfg(test)]
+        CASCADE_FORKS.with(|c| c.set(c.get() + 1));
+        let subtrees: Vec<Vec<(u64, Geometry<f64>)>> = children
+            .par_iter()
+            .map(|&child| {
+                let mut members = Vec::new();
+                split_feature_into_tiles(
+                    child,
+                    child_geom,
+                    child_bbox,
+                    TileTarget {
+                        zoom,
+                        opts,
+                        key_lo,
+                        key_hi,
+                        assume_simple,
+                        diagnostics,
+                    },
+                    ranges,
+                    &mut members,
+                );
+                members
+            })
+            .collect();
+        for mut members in subtrees {
+            out.append(&mut members);
+        }
     } else {
         for child in children {
             split_feature_into_tiles(
@@ -11059,12 +11818,12 @@ mod tests {
             plan_with_members(10, &[1], 6),
         ];
         assert_eq!(
-            plan_level_groups(&plans, 100),
+            plan_level_groups(&plans, 100, false),
             vec![0..4, 4..5, 5..6, 6..7, 7..8],
         );
         // A cap of 0 is the serial schedule.
         assert_eq!(
-            plan_level_groups(&plans, 0),
+            plan_level_groups(&plans, 0, false),
             (0..plans.len()).map(|i| i..i + 1).collect::<Vec<_>>(),
         );
         // A cap of 1 is not: an empty level still joins a 1-member level.
@@ -11073,15 +11832,160 @@ mod tests {
             plan_with_members(4, &[1], 6),
             plan_with_members(5, &[1], 6),
         ];
-        assert_eq!(plan_level_groups(&tiny, 1), vec![0..2, 2..3]);
+        assert_eq!(plan_level_groups(&tiny, 1, false), vec![0..2, 2..3]);
         // A multi-wave level under the cap does not open a group for the
         // single-wave level after it.
         let multi_first = vec![
             plan_with_members(3, &[1; 7], 6),
             plan_with_members(4, &[1], 6),
         ];
-        assert_eq!(plan_level_groups(&multi_first, 100), vec![0..1, 1..2]);
-        assert!(plan_level_groups(&[], 100).is_empty());
+        assert_eq!(
+            plan_level_groups(&multi_first, 100, false),
+            vec![0..1, 1..2]
+        );
+        assert!(plan_level_groups(&[], 100, false).is_empty());
+        // #817: with overlapping waves a multi-wave level joins the open
+        // group, adding nothing to its sum; a level alone over the cap
+        // still runs alone.
+        assert_eq!(
+            plan_level_groups(&plans, 100, true),
+            vec![0..4, 4..6, 6..7, 7..8],
+        );
+        let joined = plan_level_groups(&multi_first, 100, true);
+        assert!(joined.len() == 1 && joined[0] == (0..2), "{joined:?}");
+    }
+
+    /// #817: a group's members in flight never exceed the export's largest
+    /// wave, or the narrowest wave of full partitions when that is larger.
+    #[test]
+    fn the_in_flight_cap_is_the_largest_wave() {
+        let plans = vec![
+            plan_with_members(3, &[10], 6),
+            plan_with_members(4, &[20], 6),
+            plan_with_members(5, &[30], 6),
+        ];
+        let cap = |member_cap, plans: &[LevelPlan], target| {
+            group_schedule(member_cap, plans, target, MemoryProfile::Auto)
+                .1
+                .cap
+        };
+        assert_eq!(cap(100, &plans, 1), 30);
+        // A multi-wave level's largest wave, not its whole band, is the bound.
+        let multi = vec![
+            plan_with_members(3, &[10], 6),
+            plan_with_members(4, &[10], 6),
+            plan_with_members(5, &[3; 12], 6),
+        ];
+        assert_eq!(cap(100, &multi, 1), 18);
+        // The narrowest wave of full partitions is the floor, and the serial
+        // cap stays 0.
+        assert_eq!(cap(1_000, &plans, 64), 64 * PARTITION_WAVE_MIN);
+        assert_eq!(cap(0, &plans, 64), 0);
+    }
+
+    /// #817: the collect waits while the next level would take the members
+    /// in flight past the cap, and goes on once an encode releases them. A
+    /// level larger than the cap is admitted when nothing is in flight.
+    #[test]
+    fn in_flight_admits_a_level_only_within_the_cap() {
+        let gate = InFlight::new(5);
+        let first = gate.admit(4);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| drop(gate.admit(3)));
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!waiter.is_finished(), "admitted 7 members past a cap of 5");
+            drop(first);
+            waiter.join().unwrap();
+        });
+        drop(gate.admit(9));
+        assert_eq!(*gate.held.lock().unwrap(), 0);
+    }
+
+    /// #817: small single-wave levels whose summed members exceed the
+    /// largest wave still form one concurrent group: the cap bounds members
+    /// in flight, not the group.
+    #[test]
+    fn small_levels_stay_one_concurrent_group() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let level = |l: i64| -> (Vec<i64>, Vec<Geometry<f64>>) {
+            let pts = (0..5)
+                .map(|k| Geometry::Point(Point::new(-150.3 + k as f64 * 70.0, -40.3 + l as f64)))
+                .collect();
+            ((0..5).map(|k| l * 10 + k).collect(), pts)
+        };
+        write_mode_fixture(
+            input.path(),
+            &[level(0), level(1), level(2), level(3)],
+            Mode::Duplicating,
+            64,
+        );
+        let opts = ExportOptions {
+            layer_name: "small".to_string(),
+            partition_wave: 64,
+            ..Default::default()
+        };
+        let run = |concurrent_levels: bool| {
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &knobs(false, None, concurrent_levels),
+            )
+            .unwrap();
+            (std::fs::read(out.path()).unwrap(), run)
+        };
+        let (serial_bytes, _) = run(false);
+        let (concurrent_bytes, concurrent) = run(true);
+        assert_eq!(concurrent.level_groups, ONE_GROUP_OF_FOUR);
+        assert_eq!(concurrent_bytes, serial_bytes);
+    }
+
+    /// #817: under `auto` a multi-wave level joins the level group before
+    /// it and its waves run through the group's pipeline, so the next wave
+    /// is read while one encodes; `bounded` keeps the serial wave loop.
+    #[test]
+    fn multi_wave_levels_overlap_their_waves_except_bounded() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let pts = |n: usize, l: i64| -> (Vec<i64>, Vec<Geometry<f64>>) {
+            let g = (0..n)
+                .map(|k| Geometry::Point(Point::new(-150.3 + k as f64 * 70.0, -40.3)))
+                .collect();
+            ((0..n as i64).map(|k| l * 10 + k).collect(), g)
+        };
+        write_mode_fixture(input.path(), &[pts(1, 0), pts(5, 1)], Mode::Duplicating, 64);
+        let run = |profile: MemoryProfile, concurrent_levels: bool| {
+            let opts = ExportOptions {
+                layer_name: "waves".to_string(),
+                partition_wave: 2,
+                profile,
+                ..Default::default()
+            };
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &knobs(false, None, concurrent_levels),
+            )
+            .unwrap();
+            (std::fs::read(out.path()).unwrap(), run)
+        };
+        let (serial_bytes, serial) = run(MemoryProfile::Auto, false);
+        assert_eq!(serial.work.group_waves, 0);
+        let (auto_bytes, auto) = run(MemoryProfile::Auto, true);
+        let groups = &auto.level_groups;
+        assert!(groups.len() == 1 && groups[0] == (0..2), "{groups:?}");
+        // The 5 points sit on tile edges: 10 one-member tiles, in waves of 2.
+        assert_eq!(auto.work.group_waves, 5);
+        assert_eq!(auto_bytes, serial_bytes);
+        assert_eq!(auto.report.zooms, serial.report.zooms);
+        let (bounded_bytes, bounded) = run(MemoryProfile::Bounded, true);
+        assert_eq!(bounded.level_groups, vec![0..1, 1..2]);
+        assert_eq!(bounded.work.group_waves, 0);
+        assert_eq!(bounded_bytes, serial_bytes);
     }
 
     /// #647: the group cap is one full ceiling-width wave of target-sized
@@ -11162,6 +12066,7 @@ mod tests {
             concurrent_levels,
             checkpoint_interval: Duration::ZERO,
             fail_level: None,
+            panic_write_level: None,
             memory_limit: None,
             budget_available: None,
         }
@@ -11198,11 +12103,62 @@ mod tests {
         (run, band_rows)
     }
 
+    /// #817 review: a panic while a group writes a wave fails the group and
+    /// re-raises, as an encode panic does. Before, the write ran outside the
+    /// encode's `catch_unwind`, so the next wave of a multi-wave level waited
+    /// for that write forever.
+    #[test]
+    fn level_group_write_panic_does_not_hang() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(input.path());
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            partition_wave: 1,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let good = export_pmtiles_run(
+            input.path(),
+            dir.path().join("good.pmtiles"),
+            &opts,
+            1,
+            &knobs(false, None, true),
+        )
+        .unwrap();
+        let level = good
+            .report
+            .zooms
+            .iter()
+            .find(|z| z.tile_count >= 3)
+            .expect("the fixture must give a level three waves")
+            .level;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let out = dir.path().join("panics.pmtiles");
+        std::thread::spawn(move || {
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                export_pmtiles_run(
+                    input.path(),
+                    &out,
+                    &opts,
+                    1,
+                    &Pass2Knobs {
+                        panic_write_level: Some(level),
+                        ..knobs(false, None, true)
+                    },
+                )
+                .map(|_| ())
+            }));
+            let _ = tx.send(run.is_err());
+        });
+        let panicked = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a panicking group write hung the export");
+        assert!(panicked, "the write panic must reach the caller");
+    }
+
     /// #740 (read amplification): a duplicating-mode level split into several
-    /// waves must read its band's rows once, not once per wave. On
-    /// `origin/main` every wave re-reads each row group its bbox touches, so
-    /// a level of `W` waves over one row group reads its band `W` times
-    /// (measured 1.2-2.5x per finest level on NZ parcels and FTW Moldova).
+    /// waves must read its band's rows once, not once per wave: re-reading
+    /// each row group a wave's bbox touches multiplies the band read.
     #[test]
     fn multi_wave_level_reads_each_band_row_once() {
         let (run, band_rows) = multi_wave_duplicating_run();
@@ -11521,6 +12477,155 @@ mod tests {
         );
     }
 
+    /// #817: a band read's batches are collected in groups, so a 64-thread
+    /// pool joins once per group instead of once per 8,192-row batch. The
+    /// grouping is scheduling only: one thread, which collects batch by
+    /// batch, writes the same bytes.
+    #[test]
+    fn band_batches_are_collected_in_groups() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let points: Vec<Geometry<f64>> = (0..20_000)
+            .map(|i| {
+                let f = f64::from(i);
+                Geometry::Point(Point::new(
+                    -170.0 + (f * 0.0171) % 340.0,
+                    -60.0 + (f * 0.0067) % 120.0,
+                ))
+            })
+            .collect();
+        let ids: Vec<i64> = (0..20_000).collect();
+        write_fixture(input.path(), &[(ids, points)]);
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            ..Default::default()
+        };
+        let run = |threads: usize, opts: &ExportOptions| {
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let run = pool.install(|| {
+                export_pmtiles_run(
+                    input.path(),
+                    out.path(),
+                    opts,
+                    DEFAULT_PARTITION_TARGET,
+                    &knobs(false, None, false),
+                )
+                .unwrap()
+            });
+            (run.work, std::fs::read(out.path()).unwrap())
+        };
+        let (wide, wide_bytes) = run(64, &opts);
+        assert_eq!(wide.collect_batches, 3, "20,000 rows in 8,192-row batches");
+        assert_eq!(
+            wide.collect_groups, 1,
+            "64 threads collect up to 32,768 rows per group"
+        );
+        assert_eq!(
+            wide.band_reads_on_consumer, 0,
+            "a one-segment read ran on the collecting thread"
+        );
+        let (one, one_bytes) = run(1, &opts);
+        assert_eq!(one.collect_groups, 3, "one thread collects batch by batch");
+        assert!(wide_bytes == one_bytes, "grouping changed the archive");
+        let bounded = ExportOptions {
+            profile: MemoryProfile::Bounded,
+            ..opts.clone()
+        };
+        let (tight, tight_bytes) = run(64, &bounded);
+        assert_eq!(tight.collect_groups, 3, "bounded collects batch by batch");
+        assert_eq!(
+            tight.collect_overlaps, 0,
+            "bounded held two clipped groups at once"
+        );
+        assert!(tight_bytes == one_bytes, "bounded changed the archive");
+    }
+
+    /// #817: a collect group closes before a batch that would take it past
+    /// the byte cap, and at either cap; a batch over the cap alone is a
+    /// group of its own. On review of 81cd824 the cap was checked only
+    /// after the batch joined, so two 48 MiB batches made a 96 MiB group.
+    #[test]
+    fn collect_groups_stay_within_the_byte_cap() {
+        let batch = |rows: i64| {
+            RecordBatch::try_from_iter([(
+                "id",
+                Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())) as ArrayRef,
+            )])
+            .unwrap()
+        };
+        let mut group = CollectGroup::new(100);
+        group.max_bytes = 64;
+        let mut flushed: Vec<Vec<usize>> = Vec::new();
+        let mut flush = |b: Vec<RecordBatch>| {
+            flushed.push(b.iter().map(RecordBatch::num_rows).collect());
+            Ok(())
+        };
+        for (rows, bytes) in [(1, 48), (2, 48), (3, 10), (4, 100), (5, 1), (90, 1)] {
+            group.push(batch(rows), bytes, &mut flush).unwrap();
+        }
+        assert_eq!(flushed, vec![vec![1], vec![2, 3], vec![4]]);
+        let pending: Vec<usize> = group.batches.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(pending, [5, 90], "under both caps: still gathering");
+        // bounded: one batch a group.
+        let mut one = CollectGroup::new(collect_group_rows(MemoryProfile::Bounded));
+        let mut sizes = Vec::new();
+        for rows in [3, 1, 2] {
+            one.push(batch(rows), 8, &mut |b| {
+                sizes.push(b.len());
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(sizes, [1, 1, 1]);
+    }
+
+    /// #817: a band read's input error keeps its class. A hostile page
+    /// header arrives from the reader as `ConvertError::Input`; flattened to
+    /// a string, it read as a runtime failure.
+    #[test]
+    fn band_read_errors_keep_their_class() {
+        use crate::error::{Classify, ErrorKind};
+        let hostile = || {
+            arrow_schema::ArrowError::ExternalError(Box::new(tylertoo_io::Error::HostilePageHeader))
+        };
+        let e = read_error(ConvertError::Input(InputError::Arrow(hostile())));
+        assert_eq!(e.kind(), ErrorKind::Input, "{e}");
+        let e = read_error(ConvertError::Input(InputError::Decode(
+            tylertoo_io::Error::HostilePageHeader,
+        )));
+        assert_eq!(e.kind(), ErrorKind::Input, "{e}");
+    }
+
+    /// #817 (S1): the scan sizes a batch in a few tasks, not one per pool
+    /// thread: dozens of accumulator maps per batch leave the pool spinning.
+    #[test]
+    fn size_bboxes_splits_a_batch_into_few_tasks() {
+        let bboxes: Vec<Option<TileBounds>> = (0..EXPORT_BATCH_SIZE)
+            .map(|i| {
+                let x = -170.0 + (i as f64 * 0.04) % 340.0;
+                Some(TileBounds::new(x, 10.0, x + 0.01, 10.01))
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(64)
+            .build()
+            .unwrap();
+        let opts = ExportOptions::default();
+        let (_, counts) = pool.install(|| size_bboxes(&bboxes, 12, &opts));
+        assert!(counts.values().sum::<usize>() >= EXPORT_BATCH_SIZE);
+        let accumulators: usize = pool
+            .broadcast(|_| SIZE_ACCUMULATORS.with(std::cell::Cell::take))
+            .into_iter()
+            .sum();
+        assert!(
+            accumulators <= EXPORT_BATCH_SIZE / SIZE_BBOXES_MIN_ROWS,
+            "{accumulators} accumulators for one batch"
+        );
+    }
+
     /// #647: running a group of levels concurrently is scheduling only. Every
     /// pass-2 path (duplicating per-wave reads, the partitioning legacy read,
     /// and the single-read store under both backings) must write the same
@@ -11670,8 +12775,11 @@ mod tests {
                     assert_eq!(serial.level_groups, vec![0..1, 1..2, 2..3, 3..4], "{ctx}");
                     let groups = &concurrent.level_groups;
                     if target == 1 {
+                        // #817: the multi-wave z8 level joins the group
+                        // before it, its waves overlapping in the pipeline.
                         assert!(groups[0].len() > 1, "{ctx}: {groups:?}");
-                        assert_eq!(groups.last(), Some(&(3..4)), "{ctx}: {groups:?}");
+                        let last = groups.last().map(ExactSizeIterator::len);
+                        assert!(last > Some(1), "{ctx}: {groups:?}");
                     } else {
                         assert_eq!(groups, &ONE_GROUP_OF_FOUR, "{ctx}");
                     }
@@ -12160,6 +13268,81 @@ mod tests {
         ]
     }
 
+    /// The overview at `reader`'s path as a band source.
+    pub(super) fn band_source(reader: &OverviewReader) -> ConvertSource {
+        ConvertSource::single(crate::input::InputSource::Local(
+            reader.path().to_path_buf(),
+        ))
+    }
+
+    /// An `auto` band read of `source` with no memory limit.
+    pub(super) fn test_band(source: &ConvertSource) -> BandRead<'_> {
+        BandRead {
+            source,
+            budget: MemoryBudget::with_available(None),
+            profile: MemoryProfile::Auto,
+        }
+    }
+
+    /// The export scan reads a band of several row groups with the ordered
+    /// parallel reader and sizes it at once under `auto`, and with one
+    /// reader, batch by batch, under `bounded`, to the same scans (#817: one reader thread capped the scan at about
+    /// one core).
+    #[test]
+    fn scan_reads_and_sizes_a_band_in_parallel() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let points: Vec<Geometry<f64>> = (0..40_000)
+            .map(|i| {
+                let f = f64::from(i);
+                Geometry::Point(Point::new(
+                    -170.0 + (f * 0.0171) % 340.0,
+                    -60.0 + (f * 0.0067) % 120.0,
+                ))
+            })
+            .collect();
+        write_fixture(input.path(), &[((0..40_000).collect(), points)]);
+        let reader = OverviewReader::open(input.path()).unwrap();
+        let source = band_source(&reader);
+        let scan = |profile| {
+            let flushes = SCAN_SIZE_FLUSHES.with(std::cell::Cell::get);
+            let scans = scan_all_levels(
+                &reader,
+                BandRead {
+                    profile,
+                    ..test_band(&source)
+                },
+                Crs::Epsg4326,
+                &ExportOptions::default(),
+                &ExportTimers::default(),
+                None,
+                &crate::diagnostics::Diagnostics::default(),
+            )
+            .unwrap();
+            let flushes = SCAN_SIZE_FLUSHES.with(std::cell::Cell::get) - flushes;
+            (scans, SCAN_READ_WORKERS.with(std::cell::Cell::get), flushes)
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(64)
+            .build()
+            .unwrap();
+        let (auto, readers, flushes) = pool.install(|| scan(MemoryProfile::Auto));
+        // The auto reader count follows the host's cores: one on one CPU.
+        let several = resolve_pass_read_workers(ReadPass::Scan, READ_WORKERS_AUTO) > 1;
+        assert_eq!(
+            readers > 1,
+            several,
+            "auto scanned a 4-row-group band with {readers} reader(s)"
+        );
+        assert_eq!(
+            flushes, 1,
+            "64 threads size a 40,000-row band at once, not batch by batch"
+        );
+        let (bounded, readers, flushes) = pool.install(|| scan(MemoryProfile::Bounded));
+        assert_eq!(readers, 1, "bounded keeps the one scan reader");
+        assert_eq!(flushes, 5, "bounded sizes batch by batch");
+        assert_eq!(auto, bounded);
+    }
+
     /// Both sources' scans of one file, for every level: (covering, geometry).
     fn scans_by_source(path: &Path, crs: Crs) -> (Option<Vec<LevelScan>>, Vec<LevelScan>) {
         let reader = OverviewReader::open(path).unwrap();
@@ -12171,7 +13354,7 @@ mod tests {
         let timers = ExportTimers::default();
         let opts = ExportOptions::default();
         let covering = scan_all_levels_from(
-            &reader,
+            (&reader, test_band(&band_source(&reader))),
             crs,
             &opts,
             &timers,
@@ -12181,7 +13364,7 @@ mod tests {
         )
         .unwrap();
         let geometry = scan_all_levels_from(
-            &reader,
+            (&reader, test_band(&band_source(&reader))),
             crs,
             &opts,
             &timers,
@@ -12258,6 +13441,7 @@ mod tests {
         let reader = OverviewReader::open(tmp.path()).unwrap();
         let scans = scan_all_levels(
             &reader,
+            test_band(&band_source(&reader)),
             Crs::Epsg4326,
             &ExportOptions::default(),
             &ExportTimers::default(),
@@ -12818,6 +14002,32 @@ mod tests {
                 "tile ({kx}, {ky}) MVT diverges at z{zoom}",
             );
         }
+    }
+
+    /// M1 (#817): a monster coastline holds tens of thousands of vertices in
+    /// one feature. At a coarse zoom its whole cascade ran on one thread:
+    /// each child re-clips the parent's piece, four times per node.
+    #[test]
+    fn a_huge_feature_forks_its_cascade_at_coarse_zooms() {
+        let coast = Geometry::LineString(LineString::from(
+            (0..20_000)
+                .map(|k| {
+                    let t = f64::from(k) / 20_000.0;
+                    (-150.0 + 300.0 * t, 60.0 * (t * 40.0).sin())
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let forks = pool.install(|| {
+            CASCADE_FORKS.with(|c| c.set(0));
+            members_recursive_vec(&coast, 3, &ExportOptions::default(), 0, u64::MAX);
+            CASCADE_FORKS.with(|c| c.get())
+        });
+        assert!(forks > 0, "the z3 cascade never forked");
+        assert_recursive_matches_direct(&coast, 3, &ExportOptions::default());
     }
 
     /// Feature corpus + zoom caps chosen so the oracle's `tiles×vertices` cost
@@ -13845,6 +15055,7 @@ mod tests {
         let opts = ExportOptions::default();
         let scans = scan_all_levels(
             &reader,
+            test_band(&band_source(&reader)),
             Crs::Epsg4326,
             &opts,
             &ExportTimers::default(),

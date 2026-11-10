@@ -263,3 +263,76 @@ pub(crate) fn write_multi_rg_attr_input(path: &Path, rows: &[AttrRow]) {
     writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
     writer.close().unwrap();
 }
+
+/// Test-only rendezvous (#817): proves that `n` tasks run at the same time.
+/// A test [`arm`](rendezvous::arm)s a site; every task at that site calls
+/// [`arrive`](rendezvous::arrive), which waits until `n` tasks have arrived
+/// (or a 2 s guard expires). [`met`](rendezvous::met) reports whether all
+/// `n` were in flight at once, which a serial loop can never achieve.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#817: test-only rendezvous across pool threads; no diagnostic globals"
+)]
+pub(crate) mod rendezvous {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+    static ARMED: Mutex<Option<(&'static str, usize)>> = Mutex::new(None);
+    static ARRIVED: AtomicUsize = AtomicUsize::new(0);
+    static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+
+    /// Arm `site` for `n` arrivals. Hold the guard for the test's duration:
+    /// it serializes rendezvous tests under plain `cargo test`.
+    pub(crate) fn arm(site: &'static str, n: usize) -> MutexGuard<'static, ()> {
+        let guard = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ARRIVED.store(0, Ordering::SeqCst);
+        TIMED_OUT.store(false, Ordering::SeqCst);
+        *ARMED.lock().unwrap() = Some((site, n));
+        guard
+    }
+
+    const POOL_THREAD: &str = "rendezvous";
+
+    /// The pool a rendezvous test runs its tasks on. Only its threads count
+    /// as arrivals, so another test's calls through the same site (under
+    /// plain `cargo test`, one process) cannot complete the rendezvous.
+    pub(crate) fn pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|_| POOL_THREAD.to_owned())
+            .build()
+            .unwrap()
+    }
+
+    pub(crate) fn arrive(site: &'static str) {
+        if std::thread::current().name() != Some(POOL_THREAD) {
+            return;
+        }
+        let Some((armed, n)) = *ARMED.lock().unwrap() else {
+            return;
+        };
+        if armed != site {
+            return;
+        }
+        ARRIVED.fetch_add(1, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ARRIVED.load(Ordering::SeqCst) < n {
+            if Instant::now() > deadline {
+                TIMED_OUT.store(true, Ordering::SeqCst);
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Whether every arrival found all `n` in flight (none waited out the
+    /// guard). Disarms the site.
+    pub(crate) fn met() -> bool {
+        let n = ARMED.lock().unwrap().take().map_or(0, |(_, n)| n);
+        ARRIVED.load(Ordering::SeqCst) >= n && !TIMED_OUT.load(Ordering::SeqCst)
+    }
+}

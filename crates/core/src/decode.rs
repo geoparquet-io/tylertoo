@@ -66,6 +66,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -78,19 +79,19 @@ use geo::{Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point
 use geoarrow::array::GeometryBuilder;
 use geoarrow::datatypes::GeometryType;
 use geoarrow_array::GeoArrowArray;
+use geoparquet::metadata::GeoParquetMetadata;
 use geoparquet::writer::{
     GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
 };
 use prost::Message;
 use serde::Serialize;
 use thiserror::Error;
-use tylertoo_io::BatchWriter as ArrowWriter;
 use tylertoo_io::KeyValue;
 
 use crate::archive_index::FileBytes;
 use crate::compression::{decompress_capped, MAX_TILE_BYTES};
 use crate::mvt::{command_decode, zigzag_decode};
-use crate::overview::writer::geo_metadata_json_deterministic;
+use crate::overview::writer::{fold_geo_metadata, geo_metadata_json_deterministic};
 use crate::pmtiles_writer::{
     max_expanded_entries, tile_id_to_zxy, walk_directories, ArchiveBytes, DirEntry, DirWalkError,
     Header, TileType, HEADER_BYTES,
@@ -338,24 +339,43 @@ pub fn decode_pmtiles(
     let mut col_types: BTreeMap<String, ColType> = BTreeMap::new();
     let mut layers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut tiles_read = 0u64;
-    let mut reader = TileReader::new(&src);
-    for tile in tile_refs(&entries, &header, options) {
-        let tile = tile?;
-        tiles_read += 1;
-        for (layer_name, feature) in decode_tile_features(&mut reader, &header, &tile, options)? {
-            layers.insert(layer_name);
-            for (key, value) in &feature.props {
-                if RESERVED_COLUMNS.contains(&key.as_str()) {
-                    return Err(DecodeError::ReservedColumn(key.clone()));
+    for_each_tile(
+        &src,
+        &header,
+        &entries,
+        options,
+        |features| {
+            let mut types: BTreeMap<String, ColType> = BTreeMap::new();
+            let mut names: std::collections::BTreeSet<String> = Default::default();
+            for (layer_name, feature) in features {
+                names.insert(layer_name);
+                for (key, value) in &feature.props {
+                    if RESERVED_COLUMNS.contains(&key.as_str()) {
+                        return Err(DecodeError::ReservedColumn(key.clone()));
+                    }
+                    let t = ColType::of(value);
+                    types
+                        .entry(key.clone())
+                        .and_modify(|e| *e = e.unify(t))
+                        .or_insert(t);
                 }
-                let t = ColType::of(value);
-                col_types
-                    .entry(key.clone())
-                    .and_modify(|e| *e = e.unify(t))
-                    .or_insert(t);
             }
-        }
-    }
+            Ok((names, types))
+        },
+        |chunk| {
+            for (_, (names, types)) in chunk {
+                tiles_read += 1;
+                layers.extend(names);
+                for (key, t) in types {
+                    col_types
+                        .entry(key)
+                        .and_modify(|e| *e = e.unify(t))
+                        .or_insert(t);
+                }
+            }
+            Ok(|| Ok(()))
+        },
+    )?;
 
     // ---- Output schema: zoom, layer, mvt_id, properties (sorted), geometry.
     let geom_field = GeometryBuilder::new(GeometryType::new(Default::default()))
@@ -373,11 +393,7 @@ pub fn decode_pmtiles(
     fields.push(Arc::new(geom_field));
     let schema = Arc::new(Schema::new(fields));
 
-    let gpq_options = GeoParquetWriterOptionsBuilder::default()
-        .set_encoding(GeoParquetWriterEncoding::WKB)
-        .set_generate_covering(true)
-        .build();
-    let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options)
+    let encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options())
         .map_err(|e| DecodeError::Write(e.to_string()))?;
     // #427: build the output in a sibling and rename it over `output_path`
     // only once it is complete, so an interrupted decode leaves a previous
@@ -385,7 +401,8 @@ pub fn decode_pmtiles(
     let (file, pending) = crate::atomic_output::create(output_path.as_ref())?;
     let mut writer = tylertoo_io::batch_writer(file, encoder.target_schema())?;
 
-    // ---- Pass B: decode again, batch rows, stream to the writer. ----------
+    // ---- Pass B: decode again, cut the rows into BATCH_SIZE batches in tile
+    // order, encode the batches on the pool, write them in order. ----------
     let mut report = DecodeReport {
         tiles_read,
         features_written: 0,
@@ -394,36 +411,75 @@ pub fn decode_pmtiles(
         zoom_range: None,
         elapsed_secs: 0.0,
     };
-    let mut batch = RowBatch::new(&col_types);
-    let mut reader = TileReader::new(&src);
-    for tile in tile_refs(&entries, &header, options) {
-        let tile = tile?;
-        for (layer_name, feature) in decode_tile_features(&mut reader, &header, &tile, options)? {
-            match feature.geometry {
-                Some(geometry) => {
-                    batch.push(
-                        tile.z,
-                        &layer_name,
-                        feature.mvt_id,
-                        &feature.props,
-                        geometry,
-                    );
+    let encode = |rows: Vec<Row>| encode_rows(rows, &schema, &col_types);
+    // Rows short of a full batch carry over to the next chunk, so batch (and
+    // row-group) boundaries are the serial walk's.
+    let mut carry: Vec<Row> = Vec::with_capacity(BATCH_SIZE);
+    let mut geo_meta = Some(encoder.into_geoparquet_metadata());
+    // The writer thread writes one chunk's batches while the pool decodes and
+    // encodes the next; the one-slot channel bounds that to two chunks.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<EncodedBatch>>(1);
+    let (walked, writer) = std::thread::scope(|s| {
+        let geo_meta = &mut geo_meta;
+        let write = s.spawn(move || -> Result<_, DecodeError> {
+            for batches in rx {
+                for (batch, meta) in batches {
+                    writer.write(&batch)?;
+                    fold_geo_metadata(geo_meta, meta).map_err(DecodeError::Write)?;
+                }
+            }
+            Ok(writer)
+        });
+        let walked = for_each_tile(&src, &header, &entries, options, Ok, |chunk| {
+            let mut full: Vec<Vec<Row>> = Vec::new();
+            for (tile, features) in chunk {
+                for (layer, feature) in features {
+                    let Some(geometry) = feature.geometry else {
+                        report.features_skipped += 1;
+                        continue;
+                    };
                     report.features_written += 1;
                     report.zoom_range = Some(match report.zoom_range {
                         Some((lo, hi)) => (lo.min(tile.z), hi.max(tile.z)),
                         None => (tile.z, tile.z),
                     });
-                    if batch.len() >= BATCH_SIZE {
-                        flush_batch(&mut batch, &schema, &mut encoder, &mut writer, &col_types)?;
+                    carry.push((tile.z, layer, feature.mvt_id, feature.props, geometry));
+                    if carry.len() == BATCH_SIZE {
+                        full.push(std::mem::replace(
+                            &mut carry,
+                            Vec::with_capacity(BATCH_SIZE),
+                        ));
                     }
                 }
-                None => report.features_skipped += 1,
             }
-        }
-    }
-    if batch.len() > 0 {
-        flush_batch(&mut batch, &schema, &mut encoder, &mut writer, &col_types)?;
-    }
+            let tx = tx.clone();
+            Ok(move || {
+                use rayon::prelude::*;
+                if !full.is_empty() {
+                    let encoded = full.into_par_iter().map(encode).collect::<Result<_, _>>()?;
+                    // A send fails only when the writer stopped on its own
+                    // error, which the join below returns ahead of this one.
+                    tx.send(encoded).map_err(|_| writer_stopped())?;
+                }
+                Ok(())
+            })
+        })
+        .and_then(|()| {
+            if !carry.is_empty() {
+                tx.send(vec![encode(std::mem::take(&mut carry))?])
+                    .map_err(|_| writer_stopped())?;
+            }
+            Ok(())
+        });
+        drop(tx);
+        let writer = write
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (walked, writer)
+    });
+    // A writer error is the cause of the walk's `writer_stopped`.
+    let mut writer = writer?;
+    walked?;
 
     // #508: the encoder's own `into_keyvalue()` serializes `geometry_types`
     // straight out of a `HashSet`, so two decodes of the same archive produce
@@ -433,8 +489,12 @@ pub fn decode_pmtiles(
     // deterministic serialization `overview::writer` uses.
     writer.append_key_value_metadata(KeyValue::new(
         "geo".to_string(),
-        geo_metadata_json_deterministic(&encoder.into_geoparquet_metadata())
-            .map_err(|e| DecodeError::Write(e.to_string()))?,
+        geo_metadata_json_deterministic(
+            geo_meta
+                .as_ref()
+                .ok_or_else(|| DecodeError::Write("no GeoParquet metadata".into()))?,
+        )
+        .map_err(|e| DecodeError::Write(e.to_string()))?,
     ));
     writer.close()?;
     #[cfg(test)]
@@ -627,6 +687,188 @@ fn tile_ref(
     }))
 }
 
+/// Compressed tile bytes per parallel chunk. The chunk's decoded features
+/// (gzip'd MVT inflated roughly 50x into `geo` geometries and owned
+/// properties) and the batches cut from them are what parallel decoding
+/// holds beyond the serial walk, so this bounds that in bytes. A tile larger
+/// than this is a chunk of its own. 2 MiB gives 16 threads several batches
+/// to encode per chunk; see [`DECODE_THREADS`] for the curve.
+const CHUNK_BYTES: usize = 2 << 20;
+
+/// Most threads that decode and encode. Each thread keeps its allocator
+/// high-water for the rest of the run, so peak RSS grows with the threads
+/// used, not the work (#817); 16 is where more threads stop buying wall.
+const DECODE_THREADS: usize = 16;
+
+/// Most tiles per chunk, whatever their bytes: a run of empty tile bodies
+/// would otherwise make one chunk of millions of tiles.
+const CHUNK_TILES: usize = 4096;
+
+/// Most decompressed tile bytes a chunk keeps decoded before [`for_each_tile`]
+/// hands them to its sink. A 2 MiB chunk of ordinary tiles inflates to tens
+/// of MiB; a crafted archive of highly compressible tiles (each capped at
+/// [`MAX_TILE_BYTES`] plain) could otherwise hold thousands of them decoded
+/// at once, where the serial walk held one.
+const CHUNK_DECODED_BYTES: usize = 256 << 20;
+
+#[cfg(test)]
+thread_local! {
+    /// Test override of [`CHUNK_DECODED_BYTES`].
+    static CHUNK_DECODED_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Chunks [`for_each_tile`] dispatched; a structural counter for tests.
+    static CHUNKS_DISPATCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test override of [`CHUNK_BYTES`].
+    static CHUNK_BYTES_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Decode every selected tile in chunks of about [`CHUNK_BYTES`] compressed
+/// bytes. One [`TileReader`] reads the bodies in tile order (#462: one
+/// positioned read per window), the pool decompresses and decodes them and
+/// runs `work` on each tile's features, and `sink` gets each chunk's results
+/// in tile order. The job `sink` returns runs on the pool beside the next
+/// chunk's decode. The output therefore does not depend on the thread count,
+/// and the first error in tile order wins.
+fn for_each_tile<S, T, W, K, J>(
+    src: &S,
+    header: &Header,
+    entries: &[DirEntry],
+    options: &DecodeOptions,
+    work: W,
+    mut sink: K,
+) -> Result<(), DecodeError>
+where
+    S: ArchiveBytes + ?Sized,
+    T: Send,
+    W: Fn(Vec<(String, DecodedFeature)>) -> Result<T, DecodeError> + Sync,
+    K: FnMut(Vec<(TileRef, T)>) -> Result<J, DecodeError>,
+    J: FnOnce() -> Result<(), DecodeError> + Send,
+{
+    use rayon::prelude::*;
+    let mut reader = TileReader::new(src);
+    let mut refs = tile_refs(entries, header, options);
+    let chunk_bytes = CHUNK_BYTES;
+    #[cfg(test)]
+    let chunk_bytes = CHUNK_BYTES_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or(chunk_bytes);
+    let decoded_cap = CHUNK_DECODED_BYTES;
+    #[cfg(test)]
+    let decoded_cap = CHUNK_DECODED_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or(decoded_cap);
+    let threads = rayon::current_num_threads().min(DECODE_THREADS);
+    let pool = (threads < rayon::current_num_threads())
+        .then(|| rayon::ThreadPoolBuilder::new().num_threads(threads).build())
+        .transpose()
+        .map_err(|e| DecodeError::Write(format!("decode thread pool: {e}")))?;
+    let mut job: Option<J> = None;
+    let run = |job: Option<J>| job.map_or(Ok(()), |job| job());
+    // Every job runs on the capped pool, the last one included.
+    let in_pool = |job: Option<J>| match &pool {
+        Some(pool) => pool.install(|| run(job)),
+        None => run(job),
+    };
+    // An unreadable tile ends the walk after the tiles before it, which
+    // may hold an earlier error.
+    let mut stop = None;
+    // A chunk's tiles from the first one left undecoded past `decoded_cap`:
+    // they start the next chunk, those already decoded with their result
+    // and decompressed size.
+    #[expect(
+        clippy::type_complexity,
+        reason = "one slot per tile; a named type would need the walk's generics"
+    )]
+    let mut carry: Vec<(TileRef, Vec<u8>, Option<(Result<T, DecodeError>, usize)>)> = Vec::new();
+    loop {
+        let mut chunk = std::mem::take(&mut carry);
+        let mut bytes: usize = chunk.iter().map(|(_, body, _)| body.len()).sum();
+        // Empty bodies weigh nothing, so the tile count is capped too.
+        while stop.is_none() && bytes < chunk_bytes && chunk.len() < CHUNK_TILES {
+            let body = match refs.next() {
+                None => break,
+                Some(tile) => tile.and_then(|tile| {
+                    let body = read_tile_body(&mut reader, &tile)?.into_owned();
+                    Ok((tile, body))
+                }),
+            };
+            match body {
+                Ok((tile, body)) => {
+                    bytes += body.len();
+                    chunk.push((tile, body, None));
+                }
+                Err(e) => {
+                    stop = Some(e);
+                    break;
+                }
+            }
+        }
+        if chunk.is_empty() {
+            in_pool(job)?;
+            return stop.map_or(Ok(()), Err);
+        }
+        #[cfg(test)]
+        CHUNKS_DISPATCHED.with(|c| c.set(c.get() + 1));
+        let prev = job.take();
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#817: a per-chunk count shared with its decode tasks"
+        )]
+        let decoded = std::sync::atomic::AtomicUsize::new(
+            chunk
+                .iter()
+                .filter_map(|(_, _, slot)| slot.as_ref().map(|(_, plain)| plain))
+                .sum(),
+        );
+        let step = || {
+            rayon::join(
+                || run(prev),
+                || {
+                    chunk
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(i, (tile, body, slot))| {
+                            // Past the cap, a tile waits for the next chunk;
+                            // the first always decodes, so the walk advances.
+                            if slot.is_some()
+                                || (i > 0 && decoded.load(Ordering::Relaxed) >= decoded_cap)
+                            {
+                                return;
+                            }
+                            *slot = Some(match decode_tile_features(body, header, tile, options) {
+                                Ok((features, plain)) => {
+                                    decoded.fetch_add(plain, Ordering::Relaxed);
+                                    (work(features), plain)
+                                }
+                                Err(e) => (Err(e), 0),
+                            });
+                        });
+                },
+            )
+        };
+        let (prev, ()) = match &pool {
+            Some(pool) => pool.install(step),
+            None => step(),
+        };
+        prev?;
+        let taken = chunk
+            .iter()
+            .take_while(|(_, _, slot)| slot.is_some())
+            .count();
+        carry = chunk.split_off(taken);
+        let done = chunk
+            .into_iter()
+            .filter_map(|(tile, _, slot)| slot.map(|(r, _)| r.map(|t| (tile, t))))
+            .collect::<Result<Vec<_>, DecodeError>>()?;
+        job = Some(sink(done)?);
+        if carry.is_empty() {
+            if let Some(e) = stop {
+                in_pool(job)?;
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// How much tile data [`TileReader`] reads at a time.
 const TILE_READ_WINDOW: usize = 1 << 20;
 
@@ -695,28 +937,16 @@ struct DecodedFeature {
     props: Vec<(String, PropValue)>,
 }
 
-/// Decompress and decode one tile into `(layer_name, feature)` pairs,
-/// applying the layer filter and the coordinate transform.
-fn decode_tile_features<S: ArchiveBytes + ?Sized>(
-    reader: &mut TileReader<'_, S>,
-    header: &Header,
+/// `tile`'s compressed body. The body is read by offset (#462), which
+/// allocates whatever length the directory claims, so the length is capped
+/// before the read (#510). A compressed body larger than the ceiling it
+/// decompresses under cannot be a legitimate tile.
+fn read_tile_body<'r, S: ArchiveBytes + ?Sized>(
+    reader: &'r mut TileReader<'_, S>,
     tile: &TileRef,
-    options: &DecodeOptions,
-) -> Result<Vec<(String, DecodedFeature)>, DecodeError> {
-    let fail = |source| DecodeError::TileDecompress {
-        z: tile.z,
-        x: tile.x,
-        y: tile.y,
-        offset: tile.start as u64,
-        length: tile.len as u64,
-        source,
-    };
-    // The body is read by offset (#462), which allocates whatever length the
-    // directory claims, so the length is capped before the read (#510). A
-    // compressed body larger than the ceiling it decompresses under cannot
-    // be a legitimate tile.
+) -> Result<std::borrow::Cow<'r, [u8]>, DecodeError> {
     if tile.len as u64 > MAX_TILE_BYTES {
-        return Err(fail(std::io::Error::new(
+        return Err(tile.decompress_error(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "compressed body of {} bytes exceeds the {MAX_TILE_BYTES}-byte tile ceiling",
@@ -724,8 +954,33 @@ fn decode_tile_features<S: ArchiveBytes + ?Sized>(
             ),
         )));
     }
-    let raw = reader.read(tile.start, tile.len)?;
-    let plain = decompress_capped(&raw, header.tile_compression, MAX_TILE_BYTES).map_err(fail)?;
+    reader.read(tile.start, tile.len)
+}
+
+impl TileRef {
+    fn decompress_error(&self, source: std::io::Error) -> DecodeError {
+        DecodeError::TileDecompress {
+            z: self.z,
+            x: self.x,
+            y: self.y,
+            offset: self.start as u64,
+            length: self.len as u64,
+            source,
+        }
+    }
+}
+
+/// Decompress and decode one tile's compressed `raw` body into
+/// `(layer_name, feature)` pairs, applying the layer filter and the
+/// coordinate transform.
+fn decode_tile_features(
+    raw: &[u8],
+    header: &Header,
+    tile: &TileRef,
+    options: &DecodeOptions,
+) -> Result<(Vec<(String, DecodedFeature)>, usize), DecodeError> {
+    let plain = decompress_capped(raw, header.tile_compression, MAX_TILE_BYTES)
+        .map_err(|e| tile.decompress_error(e))?;
     let decoded = Tile::decode(plain.as_slice()).map_err(|source| DecodeError::Mvt {
         z: tile.z,
         x: tile.x,
@@ -808,7 +1063,7 @@ fn decode_tile_features<S: ArchiveBytes + ?Sized>(
             ));
         }
     }
-    Ok(out)
+    Ok((out, plain.len()))
 }
 
 /// Fuzz hook (#424): decode one *uncompressed* MVT tile at `(z, x, y)`
@@ -841,12 +1096,7 @@ pub fn fuzz_decode_tile(
         start: 0,
         len: plain.len(),
     };
-    let decoded = decode_tile_features(
-        &mut TileReader::new(&plain),
-        &header,
-        &tile,
-        &DecodeOptions::default(),
-    )?;
+    let (decoded, _) = decode_tile_features(plain, &header, &tile, &DecodeOptions::default())?;
     let with_geometry = decoded.iter().filter(|(_, f)| f.geometry.is_some()).count();
     Ok((decoded.len(), with_geometry))
 }
@@ -877,7 +1127,8 @@ pub fn fuzz_decode_archive(bytes: &[u8]) -> Result<(usize, usize), DecodeError> 
     for tile in tile_refs(&entries, &header, &options) {
         let tile = tile?;
         tiles += 1;
-        for (_layer, feature) in decode_tile_features(&mut reader, &header, &tile, &options)? {
+        let body = read_tile_body(&mut reader, &tile)?;
+        for (_layer, feature) in decode_tile_features(&body, &header, &tile, &options)?.0 {
             features += 1;
             for (key, value) in &feature.props {
                 if RESERVED_COLUMNS.contains(&key.as_str()) {
@@ -1272,10 +1523,6 @@ impl RowBatch {
         }
     }
 
-    fn len(&self) -> usize {
-        self.geoms.len()
-    }
-
     fn push(
         &mut self,
         zoom: u8,
@@ -1299,14 +1546,43 @@ impl RowBatch {
     }
 }
 
-/// Convert the buffered rows into a `RecordBatch`, encode, and write it.
-fn flush_batch(
-    batch: &mut RowBatch,
+/// The GeoParquet encoding options of every decode encoder. Built per
+/// encoder: the options hold a CRS transform that is not `Sync`.
+fn gpq_options() -> geoparquet::writer::GeoParquetWriterOptions {
+    GeoParquetWriterOptionsBuilder::default()
+        .set_encoding(GeoParquetWriterEncoding::WKB)
+        .set_generate_covering(true)
+        .build()
+}
+
+/// One output row: zoom, layer, MVT id, properties, geometry.
+type Row = (
+    u8,
+    String,
+    Option<u64>,
+    Vec<(String, PropValue)>,
+    Geometry<f64>,
+);
+
+fn writer_stopped() -> DecodeError {
+    DecodeError::Write("the GeoParquet writer stopped".into())
+}
+
+/// An encoded batch and the GeoParquet metadata its encoder gathered.
+type EncodedBatch = (RecordBatch, GeoParquetMetadata);
+
+/// Build and encode one output batch. Each batch has its own encoder, so
+/// batches encode in parallel; [`fold_geo_metadata`] folds their metadata
+/// in batch order into what one encoder fed every batch would report.
+fn encode_rows(
+    rows: Vec<Row>,
     schema: &Arc<Schema>,
-    encoder: &mut GeoParquetRecordBatchEncoder,
-    writer: &mut ArrowWriter<std::fs::File>,
     col_types: &BTreeMap<String, ColType>,
-) -> Result<(), DecodeError> {
+) -> Result<EncodedBatch, DecodeError> {
+    let mut batch = RowBatch::new(col_types);
+    for (zoom, layer, mvt_id, props, geometry) in rows {
+        batch.push(zoom, &layer, mvt_id, &props, geometry);
+    }
     let mut geom_builder = GeometryBuilder::new(GeometryType::new(Default::default()));
     geom_builder.extend_from_iter(batch.geoms.iter().map(Some));
     let geom_arr = geom_builder.finish();
@@ -1322,13 +1598,12 @@ fn flush_batch(
     columns.push(geom_arr.to_array_ref());
 
     let record = RecordBatch::try_new(schema.clone(), columns)?;
+    let mut encoder = GeoParquetRecordBatchEncoder::try_new(schema, &gpq_options())
+        .map_err(|e| DecodeError::Write(e.to_string()))?;
     let encoded = encoder
         .encode_record_batch(&record)
         .map_err(|e| DecodeError::Write(e.to_string()))?;
-    writer.write(&encoded)?;
-
-    *batch = RowBatch::new(col_types);
-    Ok(())
+    Ok((encoded, encoder.into_geoparquet_metadata()))
 }
 
 // ============================================================================
@@ -1859,6 +2134,201 @@ mod tests {
         }
     }
 
+    /// roborev 344: the parallel walk keeps #462's read-ahead. One reader
+    /// walks the tiles in order however the chunks and threads fall, so 40
+    /// small clustered tiles cost one positioned read, not one window each.
+    #[test]
+    fn parallel_walk_reads_each_window_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::read(small_archive_of(dir.path(), 40)).unwrap();
+        let header = Header::from_bytes(&file[..HEADER_BYTES]).unwrap();
+        let entries = collect_entries(&file.as_slice(), &header).unwrap();
+        let src = CountingBytes {
+            bytes: &file,
+            reads: std::cell::Cell::new(0),
+        };
+        let tiles = {
+            CHUNK_BYTES_OVERRIDE.with(|c| c.set(Some(1)));
+            let mut tiles = 0;
+            for_each_tile(
+                &src,
+                &header,
+                &entries,
+                &DecodeOptions::default(),
+                |_| Ok(()),
+                |chunk| {
+                    tiles += chunk.len();
+                    Ok(|| Ok(()))
+                },
+            )
+            .unwrap();
+            CHUNK_BYTES_OVERRIDE.with(|c| c.set(None));
+            tiles
+        };
+        assert_eq!((tiles, src.reads.get()), (40, 1));
+    }
+
+    /// #817 review: a chunk closes on its decoded bytes too, so tiles that
+    /// inflate far beyond their compressed size are not all held decoded at
+    /// once. Past the cap the rest of the chunk waits for the next one; the
+    /// sink sees the same tiles in the same order.
+    #[test]
+    fn a_chunk_closes_on_its_decoded_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::read(small_archive_of(dir.path(), 40)).unwrap();
+        let header = Header::from_bytes(&file[..HEADER_BYTES]).unwrap();
+        let entries = collect_entries(&file.as_slice(), &header).unwrap();
+        let walk = |cap: Option<usize>| {
+            // One thread, so tiles decode in order and the split is exact.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                CHUNK_DECODED_OVERRIDE.with(|c| c.set(cap));
+                let mut chunks = Vec::new();
+                for_each_tile(
+                    &file.as_slice(),
+                    &header,
+                    &entries,
+                    &DecodeOptions::default(),
+                    |features| Ok(features.len()),
+                    |chunk| {
+                        chunks.push(
+                            chunk
+                                .into_iter()
+                                .map(|(t, n)| (t.z, t.x, t.y, n))
+                                .collect::<Vec<_>>(),
+                        );
+                        Ok(|| Ok(()))
+                    },
+                )
+                .unwrap();
+                CHUNK_DECODED_OVERRIDE.with(|c| c.set(None));
+                chunks
+            })
+        };
+        let whole = walk(None);
+        let split = walk(Some(1));
+        // On several threads a later tile can finish before an earlier one
+        // stops at the cap: it is carried decoded, never decoded again.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for _ in 0..20 {
+            let calls = std::sync::Mutex::new(0usize);
+            let tiles = pool.install(|| {
+                CHUNK_DECODED_OVERRIDE.with(|c| c.set(Some(1)));
+                let mut tiles = Vec::new();
+                for_each_tile(
+                    &file.as_slice(),
+                    &header,
+                    &entries,
+                    &DecodeOptions::default(),
+                    |features| {
+                        *calls.lock().unwrap() += 1;
+                        Ok(features.len())
+                    },
+                    |chunk| {
+                        tiles.extend(chunk.into_iter().map(|(t, n)| (t.z, t.x, t.y, n)));
+                        Ok(|| Ok(()))
+                    },
+                )
+                .unwrap();
+                CHUNK_DECODED_OVERRIDE.with(|c| c.set(None));
+                tiles
+            });
+            assert_eq!(tiles, whole.concat());
+            assert_eq!(
+                calls.into_inner().unwrap(),
+                tiles.len(),
+                "a tile decoded twice"
+            );
+        }
+        assert_eq!(whole.len(), 1, "the fixture fits one chunk by bytes");
+        assert!(
+            split.iter().all(|c| c.len() == 1),
+            "{:?}",
+            split.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert_eq!(split.concat(), whole.concat());
+    }
+
+    /// roborev 368: a run of empty tile bodies weighs no bytes, so the tile
+    /// count caps a chunk too; one entry for 10,000 empty tiles must not
+    /// become one 10,000-tile chunk.
+    #[test]
+    fn empty_bodies_still_split_into_bounded_chunks() {
+        let header = Header {
+            tile_compression: crate::compression::Compression::None,
+            ..Header::default()
+        };
+        let entries = [DirEntry {
+            tile_id: 0,
+            offset: 0,
+            length: 0,
+            run_length: 10_000,
+        }];
+        let (mut tiles, mut largest) = (0, 0);
+        for_each_tile(
+            &[0u8; 16].as_slice(),
+            &header,
+            &entries,
+            &DecodeOptions::default(),
+            |_| Ok(()),
+            |chunk| {
+                tiles += chunk.len();
+                largest = largest.max(chunk.len());
+                Ok(|| Ok(()))
+            },
+        )
+        .unwrap();
+        assert_eq!(tiles, 10_000);
+        assert!(largest <= CHUNK_TILES, "{largest}-tile chunk");
+    }
+
+    /// The batch metadata fold must report what main's single serial encoder
+    /// did, including for a batch whose geometries hold no coordinates (an
+    /// empty MultiPoint here): geoparquet's `BoundingRect::add_rect` adds
+    /// that batch's empty rect corner by corner.
+    #[test]
+    fn folded_batch_metadata_matches_one_serial_encoder() {
+        let schema = Arc::new(Schema::new(vec![GeometryBuilder::new(GeometryType::new(
+            Default::default(),
+        ))
+        .finish()
+        .data_type()
+        .to_field(crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN, true)]));
+        let batch = |geoms: Vec<Geometry<f64>>| {
+            let mut b = GeometryBuilder::new(GeometryType::new(Default::default()));
+            b.extend_from_iter(geoms.iter().map(Some));
+            RecordBatch::try_new(schema.clone(), vec![b.finish().to_array_ref()]).unwrap()
+        };
+        let batches = [
+            batch(vec![Geometry::Point(Point::new(1.0, 2.0))]),
+            batch(vec![Geometry::MultiPoint(MultiPoint::new(vec![]))]),
+            batch(vec![Geometry::Point(Point::new(-3.0, 0.5))]),
+        ];
+        let bbox = |m: &GeoParquetMetadata| {
+            m.columns[crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN]
+                .bbox
+                .clone()
+        };
+        let mut serial = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options()).unwrap();
+        let mut folded = None;
+        for b in &batches {
+            serial.encode_record_batch(b).unwrap();
+            let mut own = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options()).unwrap();
+            own.encode_record_batch(b).unwrap();
+            fold_geo_metadata(&mut folded, own.into_geoparquet_metadata()).unwrap();
+        }
+        assert_eq!(
+            bbox(&folded.unwrap()),
+            bbox(&serial.into_geoparquet_metadata())
+        );
+    }
+
     #[test]
     fn coltype_unify_lattice() {
         use ColType::*;
@@ -1886,14 +2356,18 @@ mod tests {
     ];
 
     fn small_archive(dir: &Path) -> std::path::PathBuf {
+        small_archive_of(dir, 4)
+    }
+
+    fn small_archive_of(dir: &Path, tiles: u32) -> std::path::PathBuf {
         use crate::pmtiles_writer::StreamingPmtilesWriter;
         let path = dir.join("in.pmtiles");
         let mut writer = StreamingPmtilesWriter::new(crate::Compression::Gzip).unwrap();
         writer.set_layer_name("t");
-        for i in 0..4u32 {
+        for i in 0..tiles {
             let mut tile = POINT_TILE.to_vec();
             tile[12] = 0x02 + 2 * (i as u8); // MoveTo x = 1 + i (zigzag)
-            writer.add_tile(5, i, 7, &tile).unwrap();
+            writer.add_tile(5, i % 32, 7 + i / 32, &tile).unwrap();
         }
         writer.finalize(&path).unwrap();
         path
@@ -1952,6 +2426,140 @@ mod tests {
         assert_eq!(
             dir_listing(dir.path()),
             vec!["decoded.parquet".to_string(), "in.pmtiles".to_string()]
+        );
+    }
+
+    /// Output is byte-identical at any thread count, and the tiles are
+    /// dispatched in chunks bounded by compressed bytes, not by tile or
+    /// thread count: a one-byte cap makes every tile its own chunk, the
+    /// default cap fits all 40 small tiles in one, on 1 and 4 threads alike.
+    #[test]
+    fn decode_is_thread_count_independent_and_chunked_by_bytes() {
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.pmtiles");
+        let mut writer = StreamingPmtilesWriter::new(crate::Compression::Gzip).unwrap();
+        writer.set_layer_name("t");
+        for i in 0..40u32 {
+            let mut tile = POINT_TILE.to_vec();
+            tile[12] = 0x02 + 2 * (i as u8 % 8);
+            writer.add_tile(6, i, 7, &tile).unwrap();
+        }
+        writer.finalize(&input).unwrap();
+
+        let run = |threads: usize, cap: Option<usize>| {
+            let out = dir.path().join(format!("out{threads}.parquet"));
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let chunks = pool.install(|| {
+                CHUNKS_DISPATCHED.with(|c| c.set(0));
+                CHUNK_BYTES_OVERRIDE.with(|c| c.set(cap));
+                decode_pmtiles(&input, &out, &DecodeOptions::default()).unwrap();
+                CHUNKS_DISPATCHED.with(|c| c.get())
+            });
+            (std::fs::read(&out).unwrap(), chunks)
+        };
+        let (one, c1) = run(1, None);
+        let (four, c4) = run(4, None);
+        let (tiny, ct) = run(4, Some(1));
+        assert_eq!(one, four);
+        assert_eq!(one, tiny);
+        assert_eq!((c1, c4, ct), (2, 2, 2 * 40), "40 tiles, two passes");
+    }
+
+    /// Rows cross [`BATCH_SIZE`] and chunk boundaries (the carry), with
+    /// points in the first batches and lines in the last, and a property
+    /// that unifies Int + Float + Str: the file is the same however the
+    /// tiles are chunked and threaded, and its footer reports every
+    /// geometry type and a bbox spanning every tile.
+    #[test]
+    fn batches_cut_across_chunks_match_any_chunking() {
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use crate::vector_tile::tile::{Feature, Layer, Value};
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.pmtiles");
+        let mut writer = StreamingPmtilesWriter::new(crate::Compression::Gzip).unwrap();
+        writer.set_layer_name("t");
+        for x in 0..5u32 {
+            let features = (0..4000u32)
+                .map(|i| Feature {
+                    id: Some(u64::from(x * 4000 + i)),
+                    tags: vec![0, i % 3],
+                    r#type: Some(if x < 3 {
+                        GeomType::Point as i32
+                    } else {
+                        GeomType::Linestring as i32
+                    }),
+                    geometry: if x < 3 {
+                        vec![9, zigzag_encode((i % 4000) as i32), 2]
+                    } else {
+                        vec![9, 2, 2, 10, zigzag_encode((i % 100) as i32 + 1), 2]
+                    },
+                })
+                .collect();
+            let tile = Tile {
+                layers: vec![Layer {
+                    version: 2,
+                    name: "t".into(),
+                    features,
+                    keys: vec!["k".into()],
+                    values: vec![
+                        Value {
+                            int_value: Some(1),
+                            ..Default::default()
+                        },
+                        Value {
+                            double_value: Some(0.5),
+                            ..Default::default()
+                        },
+                        Value {
+                            string_value: Some("s".into()),
+                            ..Default::default()
+                        },
+                    ],
+                    extent: Some(4096),
+                }],
+            };
+            writer.add_tile(6, x, 7, &tile.encode_to_vec()).unwrap();
+        }
+        writer.finalize(&input).unwrap();
+
+        let run = |threads: usize, cap: Option<usize>| {
+            let out = dir.path().join(format!("out{threads}-{cap:?}.parquet"));
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let report = pool.install(|| {
+                CHUNK_BYTES_OVERRIDE.with(|c| c.set(cap));
+                decode_pmtiles(&input, &out, &DecodeOptions::default()).unwrap()
+            });
+            assert_eq!(report.features_written, 20_000);
+            std::fs::read(&out).unwrap()
+        };
+        let one = run(1, None);
+        assert_eq!(one, run(4, Some(1)));
+        assert_eq!(one, run(3, Some(5000)));
+
+        let reader = tylertoo_io::open_parquet(
+            std::fs::File::open(dir.path().join("out1-None.parquet")).unwrap(),
+        )
+        .unwrap();
+        let meta = GeoParquetMetadata::from_parquet_meta(reader.metadata().file_metadata())
+            .unwrap()
+            .unwrap();
+        let col = &meta.columns[crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN];
+        let mut types: Vec<String> = col.geometry_types.iter().map(|t| t.to_string()).collect();
+        types.sort();
+        assert_eq!(types, ["LineString", "Point"]);
+        let bbox = col.bbox.as_ref().unwrap();
+        let west = tile_local_to_lonlat(6, 0, 7, 4096, 0, 1).0;
+        let east = tile_local_to_lonlat(6, 4, 7, 4096, 101, 1).0;
+        assert!(
+            (bbox[0] - west).abs() < 1e-9 && (bbox[2] - east).abs() < 1e-9,
+            "{bbox:?}"
         );
     }
 }

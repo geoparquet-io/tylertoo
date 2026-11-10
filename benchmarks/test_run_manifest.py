@@ -466,3 +466,21 @@ def test_a_resume_keeps_the_recorded_provenance(tmp_path, monkeypatch):
     saved = json.loads((tmp_path / "provenance.json").read_text())
     assert (saved["commit"], saved["date"]) == ("A", "then")
     assert [i["name"] for i in saved["inputs"]] == ["x", "y"]
+
+
+def _export_line(tmp_path: Path, share) -> Path:
+    ex = {"phase_walls": {"total": 1.0}, **({} if share is None else {"serial_share": share})}
+    p = tmp_path / "s.jsonl"
+    p.write_text(json.dumps({"phase": "export", "export": ex}) + "\n")
+    return p
+
+
+def test_profile_keeps_serial_share(tmp_path):
+    assert rm.read_profile(_export_line(tmp_path, 0.07))["export"]["serial_share"] == 0.07  # noqa: PLR2004
+    assert rm.read_profile(_export_line(tmp_path, None))["export"]["serial_share"] is None
+
+
+def test_summary_carries_a_serial_share_spread(tmp_path):
+    bins = [{"label": "a", "allocator": "glibc"}]
+    runs = [_ok("a", 2.0, 4.0, rm.read_profile(_export_line(tmp_path, s))) for s in (0.05, 0.09)]
+    assert rm.summarize(runs, bins)["a"]["serial_share"] == rm.spread([0.05, 0.09])

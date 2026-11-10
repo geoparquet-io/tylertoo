@@ -45,8 +45,10 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use super::assign::{gsd_to_coord_units, FeatureKind, FeatureTable};
-use super::level::Crs;
+use super::level::{Crs, MemoryProfile};
 use super::simplify::{
     dither_u01, export_zoom, level_tolerance, placeholder_side, CollapseMode, Representation,
 };
@@ -126,85 +128,23 @@ pub fn tiny_polygon_carriers(
     areas: &[f32],
     levels: &[AccumulateLevel],
     crs: Crs,
+    profile: MemoryProfile,
 ) -> Vec<Vec<usize>> {
     debug_assert_eq!(features.len(), min_levels.len());
     debug_assert_eq!(features.len(), areas.len());
-    let mut out: Vec<Vec<usize>> = vec![Vec::new(); levels.len()];
-    let mut floored_zooms: Vec<f64> = Vec::new();
-    for (li, level) in levels.iter().enumerate() {
-        if !level.enabled {
-            continue;
-        }
-        let gsd_units = gsd_to_coord_units(level.gsd_meters, crs);
-        let side = placeholder_side(level.gsd_meters, level.zoom, crs);
-        let floored = side > level_tolerance(level.gsd_meters, crs, 1.0);
-        if floored {
-            floored_zooms.push(export_zoom(level.gsd_meters, level.zoom));
-        }
-        let threshold = side * side;
-        let cell = ACCUMULATE_CELL_GSD * gsd_units;
-        // NaN / zero guards (a NaN compares false everywhere).
-        if threshold.is_nan() || threshold <= 0.0 || cell.is_nan() || cell <= 0.0 {
-            continue;
-        }
-        let mut acc: HashMap<(i64, i64), Patch> = HashMap::new();
-        for (pos, (&ml, &area)) in min_levels.iter().zip(areas).enumerate() {
-            if features.kind(pos) != FeatureKind::Polygon || usize::from(ml) <= li {
-                continue; // not a polygon, or already present at this level
-            }
-            if features.entry_level(pos).is_some() {
-                continue; // #364: the ladder decides where it first appears
-            }
-            let area = f64::from(area);
-            if area.is_nan() || area <= 0.0 {
-                continue;
-            }
-            // DIVERGENCE FROM TIPPECANOE: tippecanoe only accumulates rings
-            // with area <= pixel² and keeps larger rings as geometry, so its
-            // residual never exceeds one placeholder. Here a non-member is
-            // gone whatever its size (gate-failed polygons routinely sit in
-            // (T, 2T); thinning and budget losers are unbounded), so clamp
-            // the contribution instead: a polygon is worth at most one
-            // placeholder, and the residual invariant (< T per patch) holds.
-            let area = area.min(threshold);
-            // The patch key comes from the bbox centre. A polygon whose bbox
-            // spans the antimeridian (lng_min near -180, lng_max near 180)
-            // therefore lands in a patch near lng 0, far from where it
-            // sits. The rest of the pipeline has no wrap handling either
-            // (#342); this stays consistent with it until that lands.
-            let (cx, cy) = features.center(pos);
-            let key = ((cx / cell).floor() as i64, (cy / cell).floor() as i64);
-            let patch = acc.entry(key).or_default();
-            patch.total += area;
-            if patch.total >= threshold {
-                out[li].push(features.indices()[pos]);
-                patch.total -= threshold;
-            } else {
-                patch.last_free = Some((features.indices()[pos], cx, cy));
-            }
-        }
-        // A patch keeps less than one `T` unemitted. At a floored level `T`
-        // is up to several times one GSD², so that
-        // truncation would thin sparse patches noticeably (at `--gsd-base
-        // 8192`, ~12% of the z3 area in the #407 probe). There, dither the
-        // residual instead: the patch's last non-carrier contributor also
-        // becomes a carrier with probability `residual / T`, decided by the
-        // same anchor hash the `--collapse-square` dither uses, so expected
-        // placeholder area equals the clamped dropped area. Unfloored levels
-        // keep the plain truncation, byte-identical to before #407.
-        if floored {
-            for patch in acc.values() {
-                if let Some((index, cx, cy)) = patch.last_free {
-                    if dither_u01(cx, cy) < patch.total / threshold {
-                        out[li].push(index);
-                    }
-                }
-            }
-        }
-        // `features` is in input order and `index` is monotone in it, but
-        // sort anyway: the lookup is a binary search.
-        out[li].sort_unstable();
-    }
+    // Each level reads the shared inputs and writes only its own list, so
+    // the levels run concurrently (#817). Each level holds its own
+    // occupied-patch map; bounded holds one at a time.
+    let run = |(li, level): (usize, &AccumulateLevel)| {
+        level_carriers(features, min_levels, areas, li, level, crs)
+    };
+    let per_level: Vec<(Vec<usize>, Option<f64>)> = if profile == MemoryProfile::Bounded {
+        levels.iter().enumerate().map(run).collect()
+    } else {
+        levels.par_iter().enumerate().map(run).collect()
+    };
+    let floored_zooms: Vec<f64> = per_level.iter().filter_map(|(_, z)| *z).collect();
+    let out: Vec<Vec<usize>> = per_level.into_iter().map(|(c, _)| c).collect();
     if !floored_zooms.is_empty() {
         let zooms: Vec<String> = floored_zooms.iter().map(|z| format!("z{z}")).collect();
         log::info!(
@@ -214,6 +154,92 @@ pub fn tiny_polygon_carriers(
         );
     }
     out
+}
+
+/// One level of [`tiny_polygon_carriers`]: its sorted carrier rows, and its
+/// export zoom when the placeholder side is floored there.
+fn level_carriers(
+    features: &FeatureTable,
+    min_levels: &[u8],
+    areas: &[f32],
+    li: usize,
+    level: &AccumulateLevel,
+    crs: Crs,
+) -> (Vec<usize>, Option<f64>) {
+    let mut out = Vec::new();
+    if !level.enabled {
+        return (out, None);
+    }
+    #[cfg(test)]
+    super::testutil::rendezvous::arrive("accumulate level");
+    let gsd_units = gsd_to_coord_units(level.gsd_meters, crs);
+    let side = placeholder_side(level.gsd_meters, level.zoom, crs);
+    let floored = side > level_tolerance(level.gsd_meters, crs, 1.0);
+    let floored_zoom = floored.then(|| export_zoom(level.gsd_meters, level.zoom));
+    let threshold = side * side;
+    let cell = ACCUMULATE_CELL_GSD * gsd_units;
+    // NaN / zero guards (a NaN compares false everywhere).
+    if threshold.is_nan() || threshold <= 0.0 || cell.is_nan() || cell <= 0.0 {
+        return (out, floored_zoom);
+    }
+    let mut acc: HashMap<(i64, i64), Patch> = HashMap::new();
+    for (pos, (&ml, &area)) in min_levels.iter().zip(areas).enumerate() {
+        if features.kind(pos) != FeatureKind::Polygon || usize::from(ml) <= li {
+            continue; // not a polygon, or already present at this level
+        }
+        if features.entry_level(pos).is_some() {
+            continue; // #364: the ladder decides where it first appears
+        }
+        let area = f64::from(area);
+        if area.is_nan() || area <= 0.0 {
+            continue;
+        }
+        // DIVERGENCE FROM TIPPECANOE: tippecanoe only accumulates rings
+        // with area <= pixel² and keeps larger rings as geometry, so its
+        // residual never exceeds one placeholder. Here a non-member is
+        // gone whatever its size (gate-failed polygons routinely sit in
+        // (T, 2T); thinning and budget losers are unbounded), so clamp
+        // the contribution instead: a polygon is worth at most one
+        // placeholder, and the residual invariant (< T per patch) holds.
+        let area = area.min(threshold);
+        // The patch key comes from the bbox centre. A polygon whose bbox
+        // spans the antimeridian (lng_min near -180, lng_max near 180)
+        // therefore lands in a patch near lng 0, far from where it
+        // sits. The rest of the pipeline has no wrap handling either
+        // (#342); this stays consistent with it until that lands.
+        let (cx, cy) = features.center(pos);
+        let key = ((cx / cell).floor() as i64, (cy / cell).floor() as i64);
+        let patch = acc.entry(key).or_default();
+        patch.total += area;
+        if patch.total >= threshold {
+            out.push(features.indices()[pos]);
+            patch.total -= threshold;
+        } else {
+            patch.last_free = Some((features.indices()[pos], cx, cy));
+        }
+    }
+    // A patch keeps less than one `T` unemitted. At a floored level `T`
+    // is up to several times one GSD², so that
+    // truncation would thin sparse patches noticeably (at `--gsd-base
+    // 8192`, ~12% of the z3 area in the #407 probe). There, dither the
+    // residual instead: the patch's last non-carrier contributor also
+    // becomes a carrier with probability `residual / T`, decided by the
+    // same anchor hash the `--collapse-square` dither uses, so expected
+    // placeholder area equals the clamped dropped area. Unfloored levels
+    // keep the plain truncation, byte-identical to before #407.
+    if floored {
+        for patch in acc.values() {
+            if let Some((index, cx, cy)) = patch.last_free {
+                if dither_u01(cx, cy) < patch.total / threshold {
+                    out.push(index);
+                }
+            }
+        }
+    }
+    // `features` is in input order and `index` is monotone in it, but
+    // sort anyway: the lookup is a binary search.
+    out.sort_unstable();
+    (out, floored_zoom)
 }
 
 /// One accumulation patch's running state.
@@ -235,6 +261,7 @@ pub fn is_carrier(carriers: &[usize], g: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::assign::AssignFeature;
+    use super::super::testutil::rendezvous;
 
     /// Array-of-structs fixture → the column-major table the engine takes
     /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
@@ -264,6 +291,60 @@ mod tests {
         ]
     }
 
+    /// #817 A1: the levels are independent, so they run concurrently; a
+    /// serial level loop never has four levels in flight at once.
+    #[test]
+    fn levels_accumulate_concurrently() {
+        let feats: Vec<AssignFeature> = (0..10).map(|i| square(i, 10.0, 10.0, 400.0)).collect();
+        let min_levels = vec![4u8; 10];
+        let areas = vec![160_000.0f32; 10];
+        let levels: Vec<AccumulateLevel> = (0..4)
+            .map(|l| AccumulateLevel::new(1000.0 / f64::from(1u32 << l), None, true))
+            .collect();
+        let pool = rendezvous::pool(4);
+        let _guard = rendezvous::arm("accumulate level", 4);
+        let out = pool.install(|| {
+            tiny_polygon_carriers(
+                &table(&feats),
+                &min_levels,
+                &areas,
+                &levels,
+                Crs::Epsg3857,
+                MemoryProfile::Auto,
+            )
+        });
+        assert!(rendezvous::met(), "the 4 levels never ran at once");
+        assert_eq!(out.len(), 4);
+    }
+
+    /// #817 review: under bounded, one occupied-patch map at a time.
+    #[test]
+    fn bounded_accumulates_one_level_at_a_time() {
+        let feats: Vec<AssignFeature> = (0..10).map(|i| square(i, 10.0, 10.0, 400.0)).collect();
+        let min_levels = vec![4u8; 10];
+        let areas = vec![160_000.0f32; 10];
+        let levels: Vec<AccumulateLevel> = (0..4)
+            .map(|l| AccumulateLevel::new(1000.0 / f64::from(1u32 << l), None, true))
+            .collect();
+        let pool = rendezvous::pool(4);
+        let _guard = rendezvous::arm("accumulate level", 2);
+        let out = pool.install(|| {
+            tiny_polygon_carriers(
+                &table(&feats),
+                &min_levels,
+                &areas,
+                &levels,
+                Crs::Epsg3857,
+                MemoryProfile::Bounded,
+            )
+        });
+        assert!(
+            !rendezvous::met(),
+            "bounded must not hold two levels' maps at once"
+        );
+        assert_eq!(out.len(), 4);
+    }
+
     #[test]
     fn one_carrier_per_threshold_of_dropped_area() {
         // Ten 400×400 m fields (160,000 m² each) in one patch, none
@@ -274,8 +355,14 @@ mod tests {
             .collect();
         let min_levels = vec![1u8; 10];
         let areas = vec![160_000.0f32; 10];
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         assert_eq!(out[0], vec![6]);
         assert!(out[1].is_empty(), "disabled level accumulates nothing");
     }
@@ -287,8 +374,14 @@ mod tests {
         let mut min_levels = vec![1u8; 10];
         min_levels[0] = 0; // already a member of level 0
         let areas = vec![160_000.0f32; 10];
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         // 8 polygons accumulate (10 minus the member minus the point):
         // 1.28e6 ⇒ one carrier, and it is the 7th accumulated (index 8).
         assert_eq!(out[0], vec![8]);
@@ -306,13 +399,25 @@ mod tests {
         }
         let min_levels = vec![1u8; 10];
         let areas = vec![160_000.0f32; 10]; // 5 × 160k = 800k < 1e6 per cell
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         assert!(out[0].is_empty(), "{:?}", out[0]);
         // Bigger fields: 5 × 300k = 1.5e6 per cell ⇒ one carrier per cell.
         let areas = vec![300_000.0f32; 10];
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         assert_eq!(out[0].len(), 2);
         assert_eq!(out[0], vec![3, 8], "the 4th field of each cell crosses");
     }
@@ -330,8 +435,14 @@ mod tests {
         let min_levels = vec![1u8; 11];
         let mut areas = vec![1_400_000.0f32; 10];
         areas.push(500_000.0);
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         assert_eq!(
             out[0],
             (0..10).collect::<Vec<_>>(),
@@ -355,8 +466,14 @@ mod tests {
             areas.push((0.1 * t) as f32);
         }
         let min_levels = vec![1u8; feats.len()];
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         let expected: f64 = areas.iter().map(|&a| f64::from(a).min(t)).sum();
         let emitted = out[0].len() as f64 * t;
         assert!(
@@ -380,8 +497,14 @@ mod tests {
         }
         let min_levels = vec![3u8; 3];
         let areas = vec![25_000_000.0f32; 3]; // 25 T each
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         assert!(
             out[0].is_empty(),
             "laddered features became carriers: {:?}",
@@ -436,8 +559,15 @@ mod tests {
         let min_levels = vec![1u8; n];
         let run = |levels: &[AccumulateLevel], area: f64| {
             let areas = vec![area as f32; n];
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, levels, Crs::Epsg3857)
-                .swap_remove(0)
+            tiny_polygon_carriers(
+                &table(&feats),
+                &min_levels,
+                &areas,
+                levels,
+                Crs::Epsg3857,
+                MemoryProfile::Auto,
+            )
+            .swap_remove(0)
         };
         let floored = run(&floored_lv, 0.5 * side * side);
         let sd = (n as f64 * 0.25).sqrt();
@@ -502,8 +632,14 @@ mod tests {
             .collect();
         let min_levels = vec![1u8; 1000];
         let areas = vec![90_000.0f32; 1000];
-        let out =
-            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            MemoryProfile::Auto,
+        );
         let cells = 4; // 128 km / 32 km patches
         let n = out[0].len();
         assert!((90 - cells..=90).contains(&n), "{n} carriers");

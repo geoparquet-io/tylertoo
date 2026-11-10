@@ -461,9 +461,9 @@ How to read them:
 - **`effective_cores`** is the number of cores the phase kept busy. Compare
   it with `threads`: `utilization` near 1 means the phase is CPU-bound and
   parallel; a phase at ~1 core on a 64-thread run is serial, whatever its
-  stage timers say. This is the number the effective-cores gate watches;
-  serializing work (a 1-thread pool) drops it
-  (`effective_cores_drop_when_work_is_serialized`).
+  stage timers say. This is the number the effective-cores gate watches
+  (see "The effective-cores gate" below); serializing work (a 1-thread
+  pool) drops it (`effective_cores_drop_when_work_is_serialized`).
 - **`stage_secs`** is credited only where stage timers exist: `pass1 scan`
   gets the sum of `pass1.stage_secs`, `pass2 (output sink)` the sum of
   `pass2.stage_secs` plus `writer_busy_secs`, and each export phase the
@@ -489,11 +489,72 @@ Serial-path attribution:
   the single-threaded tile append, `writer.finalize`, and the time threads
   waited to lock a concurrent level group's ordered write (#647).
   **`export.serial_share`** is `(spool_write + finalize) / total`, the
-  critical-path share the showcase gate bounds at 10%.
+  critical-path share the nightly guard bounds at `floors.serial_share_max`
+  (10%) on the pinned host class.
 - **`export.per_zoom[].wave_width`** is the level's actual partitions per
   wave after the #311 memory narrowing (not `partition_wave_width`, the
   ceiling), and **`spill_bytes`** the level's members the member store
   wrote to disk (0 in RAM).
+
+#### The effective-cores gate (#817)
+
+`benchmarks/valve_guard.py` (the nightly Valve guard) runs every cell with a
+fresh `TYLERTOO_PROFILE_JSON` and records, per cell, the median whole-run
+`effective_cores`, the `convert/pass2 (output sink)` and `export/levels`
+phase cores (`moldova-tiles` runs both phases) and the export `serial_share`.
+Two checks, both exit 1:
+
+- **Drop** (part of the `baseline` line): on a host class with a baseline
+  entry, a phase median more than 15% (`CORES_DROP_MAX`) below the baseline's
+  fails. Effective cores alone is a weak signal (export levels shows 29-31
+  cores at 64 threads with a 16-to-64 wall speedup of about 1, because rayon
+  spin counts as busy), so the guard also runs `moldova-tiles` and `792-def`
+  (`SCALING_CELLS`) at `RAYON_NUM_THREADS=16` and fails when
+  `speedup_16_to_full` (wall at 16 threads over wall at full threads; whole
+  run, pass 2 on `moldova-tiles`, levels on both) falls more
+  than 15% below the baseline's (`SPEEDUP_DROP_MAX`), or a phase's CPU
+  core-seconds (`phase_cpu_s`) rise more than 25% (`CPU_RISE_MAX`) over the
+  baseline's. Core-seconds are compared only when the output sha256 equals
+  the baseline's. Another host class prints `baseline: NOT APPLICABLE`.
+  The 16-thread arm adds one run per round per scaling cell: `792-def`
+  takes 9.7 s at 64 threads on the pinned host, so at 16 threads expect
+  roughly 20-40 s per round, about 1-2 minutes over the default 3 rounds,
+  plus the quiet-host waits.
+- **Floors** (the `floors` line): only a baseline entry with a `floors`
+  section is checked. `whole_cores_frac` x CPUs is the minimum whole-run
+  effective cores and `serial_share_max` (0.10) the maximum serial share.
+  The floors are data in `benchmarks/baseline/valve_guard.json` under the host
+  class, so tighten them there as #813 lands; `record` seeds
+  `{"whole_cores_frac": 0.05, "serial_share_max": 0.10}` into a class with
+  none and keeps an existing section. A cell is exempt only through a
+  `[cores_floor.<cell>]` entry (reason, issue, measured) in
+  `ci/exemptions.toml`, with the count bumped in
+  `scripts/ci/tests/test_exemptions.py`.
+
+The guard sets `RAYON_NUM_THREADS` itself for every run (16 for the scaling
+arm, removed otherwise); `record` and `check` refuse to start when the parent
+environment sets it. `check --inject-threads N` is the one supported way to
+pin the full arm, for the failure demo; the verdict and `--json-out` say it was
+injected, and `record --inject-threads` is refused. A phase the cell measures
+(pass 2 and levels on `tiles`, levels on export; both thread arms on a scaling
+cell) missing from any round fails the check and makes `record` refuse to
+write. A matched baseline missing a field the gate compares (recorded before
+these fields), a cell, or `floors` fails on the pinned class (`PINNED_CLASS`,
+aarch64/0xd40/64, the `tylertoo-bench` runner) with the missing fields and the
+`record` command; on another recorded class it reports
+`baseline: NOT APPLICABLE (... run record)`. `record --cells X` merges into the host class entry (other
+cells and `floors` stay). A CPU core-seconds check that cannot run (baseline
+under 0.05 s, or the output changed) prints a `SKIP` line.
+
+On the pinned 64-core host (build both binaries first, see valve_guard.py):
+
+```bash
+G="uv run --no-project --python 3.12 python -I benchmarks/valve_guard.py"
+A="--mim target/release/tylertoo --glibc target/glibc/release/tylertoo --data ~/bench-data"
+$G record $A                                     # (i) baseline, seeds floors
+$G check  $A                                     # (ii) must pass
+$G check  $A --cells moldova-tiles --inject-threads 1   # (iii) demo: must fail, labelled INJECTED
+```
 
 All of this is collected only while `TYLERTOO_PROFILE_JSON` is set, and it
 never changes output bytes.

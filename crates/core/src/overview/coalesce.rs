@@ -71,8 +71,11 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use geo::{BoundingRect, Geometry, LineString};
+use rayon::prelude::*;
 
-use super::assign::{AssignConfig, AssignFeature, FeatureKind, Priority};
+use super::assign::{
+    sort_unstable_maybe_par, AssignConfig, AssignFeature, FeatureKind, Priority, SortDirection,
+};
 use super::level::Crs;
 
 /// Name of the merged-segment-count column written when coalescing is
@@ -188,15 +191,15 @@ pub struct CoalesceInput<'a> {
 
 /// One surviving coalesced chain at a level.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CoalescedLine {
+pub struct CoalescedLine<'a> {
     /// Index of the highest-priority member — the source row that donates
     /// the merged feature's attributes.
     pub rep: usize,
     /// Number of source segments merged into this chain (>= 1).
     pub count: i32,
     /// The merged geometry (a single `LineString` for merged chains; the
-    /// original geometry for singletons).
-    pub geom: Geometry<f64>,
+    /// original geometry for singletons, borrowed rather than copied).
+    pub geom: Cow<'a, Geometry<f64>>,
 }
 
 /// End discriminant of a chainable segment: 0 = first vertex, 1 = last.
@@ -259,38 +262,91 @@ pub fn coalesce_level_lines(
     crs: Crs,
     config: &AssignConfig,
     params: &CoalesceParams,
-) -> Vec<CoalescedLine> {
+) -> Vec<CoalescedLine<'static>> {
     if lines.is_empty() {
         return Vec::new();
     }
-    let budget = params.budget;
+    let exact = ExactChains::new(
+        lines.to_vec(),
+        params.junction_angle_deg,
+        config.sort_direction,
+    );
+    // One level only, so the chains take the exact join's runs instead of
+    // borrowing them: the owned result then copies input lines only.
+    let (chains, prio) = exact.into_chains(snap_tol(gsd_m, crs, params));
+    coalesce_chains(chains, lines, &prio, gsd_m, crs, config, params)
+        .into_iter()
+        .map(|c| CoalescedLine {
+            rep: c.rep,
+            count: c.count,
+            geom: Cow::Owned(c.geom.into_owned()),
+        })
+        .collect()
+}
+
+/// A level's snap tolerance: `snap_gsd_factor` GSDs, or none at a
+/// non-positive GSD.
+fn snap_tol(gsd_m: f64, crs: Crs, params: &CoalesceParams) -> f64 {
     let gsd_units = crs.meters_to_units(gsd_m);
-    let snap_tol = if gsd_units > 0.0 {
+    if gsd_units > 0.0 {
         params.snap_gsd_factor * gsd_units
     } else {
         0.0
-    };
+    }
+}
 
+/// [`coalesce_level_lines`] over an [`ExactChains`] already built with
+/// `params.junction_angle_deg`, so the levels of one ladder share it.
+///
+/// # Panics
+///
+/// Does not panic in practice: the chain builder never yields a chain without
+/// members.
+pub fn coalesce_level_lines_with<'e>(
+    exact: &'e ExactChains<'_>,
+    gsd_m: f64,
+    crs: Crs,
+    config: &AssignConfig,
+    params: &CoalesceParams,
+) -> Vec<CoalescedLine<'e>> {
+    debug_assert_eq!(
+        exact.junction_angle_deg.to_bits(),
+        params.junction_angle_deg.to_bits(),
+        "the exact join was built with another junction angle"
+    );
+    debug_assert_eq!(
+        exact.sort_direction, config.sort_direction,
+        "the lines were ranked under another sort direction"
+    );
+    if exact.lines.is_empty() {
+        return Vec::new();
+    }
     // --- 1+2. Build chains (grouped endpoint joins + junction continuation).
-    let chains = build_chains(lines, snap_tol, params.junction_angle_deg);
+    let chains = exact.chains(snap_tol(gsd_m, crs, params));
+    coalesce_chains(
+        chains,
+        &exact.lines,
+        &exact.prio,
+        gsd_m,
+        crs,
+        config,
+        params,
+    )
+}
 
-    // --- Priorities of the members (the cell-winner order, Q1). -------------
-    // Position-indexed, matching `RawChain::members`: two `HashMap`s with one
-    // entry per input line cost ~100 MiB at 1.5M lines, per level, in
-    // parallel across levels (#570). Sort keys are read straight off `lines`.
-    let prio: Vec<Priority> = lines
-        .iter()
-        .map(|l| {
-            let feat = AssignFeature {
-                index: l.index,
-                bbox: geom_bbox(l.geom),
-                kind: FeatureKind::Line,
-                sort_key: l.sort_key,
-                entry_level: None,
-            };
-            Priority::new(feat.row(), config.sort_direction)
-        })
-        .collect();
+/// Steps 3-4 of a level over its chains: merge, gate, thin, budget.
+/// `prio` holds each line's cell-winner priority (Q1), parallel to `lines`.
+fn coalesce_chains<'g>(
+    chains: Vec<RawChain<'g>>,
+    lines: &[CoalesceInput<'_>],
+    prio: &[Priority],
+    gsd_m: f64,
+    crs: Crs,
+    config: &AssignConfig,
+    params: &CoalesceParams,
+) -> Vec<CoalescedLine<'g>> {
+    let budget = params.budget;
+    let gsd_units = crs.meters_to_units(gsd_m);
 
     // --- 3. Merge geometry + inherit the best member's attributes. ----------
     // `rep_pos` (the winning member's position in `lines`) rides along so the
@@ -413,7 +469,7 @@ pub fn coalesce_level_lines(
         }
     }
 
-    let mut survivors: Vec<CoalescedLine> = survivors.into_iter().map(|(l, _)| l).collect();
+    let mut survivors: Vec<CoalescedLine<'g>> = survivors.into_iter().map(|(l, _)| l).collect();
     survivors.sort_by_key(|c| c.rep);
     survivors
 }
@@ -463,9 +519,9 @@ fn geom_bbox(g: &Geometry<f64>) -> [f64; 4] {
 /// [`CoalesceInput::index`] values: the caller's priority and sort-key
 /// tables are then plain position-indexed `Vec`s instead of two
 /// `HashMap<usize, _>`s with one entry per input line (#570).
-struct RawChain {
-    members: Vec<usize>,
-    geom: Geometry<f64>,
+struct RawChain<'a> {
+    members: Cow<'a, [usize]>,
+    geom: Cow<'a, Geometry<f64>>,
 }
 
 /// A joinable polyline piece during chaining: one or more already-merged
@@ -476,11 +532,21 @@ struct RawChain {
 /// before a single join happens (#570). Assembling a multi-piece walk
 /// allocates the merged run once, exactly as before.
 struct Piece<'a> {
-    /// Positions in the caller's `lines` slice, merged so far.
-    members: Vec<usize>,
+    /// Positions in the caller's `lines` slice, merged so far; a level's
+    /// snap pass borrows them from [`ExactChains`].
+    members: Cow<'a, [usize]>,
     coords: Cow<'a, [geo::Coord<f64>]>,
     group: u32,
+    /// The [`ExactChains`] geometry this piece still is, unmerged, in a
+    /// level's snap pass; [`MERGED`] otherwise.
+    src: usize,
 }
+
+/// [`Piece::src`] of a piece that is not one exact-join geometry as is.
+const MERGED: usize = usize::MAX;
+
+/// Fewest lines [`ExactChains::new`] ranks in parallel.
+const PAR_RANK_MIN_LINES: usize = 4096;
 
 /// Exact node key: coordinate bit pattern (phase 1).
 #[inline]
@@ -514,51 +580,220 @@ fn snap_key(group: u32, c: geo::Coord<f64>, tol: f64) -> NodeKey {
 /// Both phases join degree-2 nodes unconditionally and, when
 /// `junction_angle_deg > 0`, continue through junctions (degree >= 3) by
 /// repeatedly pairing the incident lines that best continue each other
-/// within that angular deviation (stroke building).
+/// within that angular deviation (stroke building). Production runs the two
+/// phases apart ([`ExactChains`]) so a ladder's levels share phase 1.
+#[cfg(test)]
 fn build_chains<'a>(
     lines: &[CoalesceInput<'a>],
     snap_tol: f64,
     junction_angle_deg: f64,
-) -> Vec<RawChain> {
-    // Chainable = plain LineString with >= 2 coordinates. Everything else
-    // (MultiLineString, Line, degenerate) is an unmerged singleton.
-    let mut pieces: Vec<Piece<'a>> = Vec::new();
-    let mut singles: Vec<usize> = Vec::new(); // positions in `lines`
-    for (pos, l) in lines.iter().enumerate() {
-        match l.geom {
-            Geometry::LineString(ls) if ls.0.len() >= 2 => pieces.push(Piece {
-                members: vec![pos],
-                coords: Cow::Borrowed(&ls.0[..]),
-                group: l.group,
-            }),
-            _ => singles.push(pos),
+) -> Vec<RawChain<'static>> {
+    ExactChains::new(lines.to_vec(), junction_angle_deg, SortDirection::Desc)
+        .chains(snap_tol)
+        .into_iter()
+        .map(|c| RawChain {
+            members: Cow::Owned(c.members.into_owned()),
+            geom: Cow::Owned(c.geom.into_owned()),
+        })
+        .collect()
+}
+
+/// Phase 1 of `build_chains`, the exact-endpoint join, over one set of
+/// candidate lines.
+///
+/// It depends on the lines and the junction angle only, not on the level's
+/// GSD, so one run serves every level of a ladder (#817: run per level it
+/// was 15 identical joins on a z0-z14 ladder, 0.75 s each on Oregon roads,
+/// and one copy of every merged coordinate run per concurrent level). Each
+/// level's `chains` call borrows the merged runs for its snap
+/// pass.
+pub struct ExactChains<'a> {
+    /// The candidate lines the join was built from.
+    lines: Vec<CoalesceInput<'a>>,
+    /// Per joined piece: its members (positions in `lines`) and group.
+    pieces: Vec<(Vec<usize>, u32)>,
+    /// Per joined piece, its geometry: the source line itself when the
+    /// join left it alone, else the merged run. Levels borrow these, so a
+    /// chain the snap pass does not merge is never copied.
+    geoms: Vec<Cow<'a, Geometry<f64>>>,
+    /// Non-chainable positions in `lines`: unmerged singletons.
+    singles: Vec<usize>,
+    /// Each line's cell-winner priority (Q1), parallel to `lines`: also
+    /// level-independent, and a bbox walk over every line to build.
+    prio: Vec<Priority>,
+    junction_angle_deg: f64,
+    sort_direction: SortDirection,
+}
+
+impl<'a> ExactChains<'a> {
+    /// Run the exact-endpoint join over `lines`, and rank them under
+    /// `sort_direction`.
+    pub fn new(
+        lines: Vec<CoalesceInput<'a>>,
+        junction_angle_deg: f64,
+        sort_direction: SortDirection,
+    ) -> Self {
+        // Chainable = plain LineString with >= 2 coordinates. Everything else
+        // (MultiLineString, Line, degenerate) is an unmerged singleton.
+        let mut pieces: Vec<Piece<'a>> = Vec::new();
+        let mut singles: Vec<usize> = Vec::new(); // positions in `lines`
+        for (pos, l) in lines.iter().enumerate() {
+            match l.geom {
+                Geometry::LineString(ls) if ls.0.len() >= 2 => pieces.push(Piece {
+                    members: Cow::Owned(vec![pos]),
+                    coords: Cow::Borrowed(&ls.0[..]),
+                    group: l.group,
+                    src: MERGED,
+                }),
+                _ => singles.push(pos),
+            }
+        }
+        #[cfg(test)]
+        EXACT_JOINS.with(|c| c.set(c.get() + 1));
+        // Position-indexed, matching `RawChain::members`: two `HashMap`s
+        // with one entry per input line cost ~100 MiB at 1.5M lines, per
+        // level, in parallel across levels (#570). Sort keys are read
+        // straight off `lines`.
+        let rank = |l: &CoalesceInput<'_>| {
+            let feat = AssignFeature {
+                index: l.index,
+                bbox: geom_bbox(l.geom),
+                kind: FeatureKind::Line,
+                sort_key: l.sort_key,
+                entry_level: None,
+            };
+            Priority::new(feat.row(), sort_direction)
+        };
+        // Entering the pool costs more than ranking a few lines.
+        let prio: Vec<Priority> = if lines.len() < PAR_RANK_MIN_LINES {
+            lines.iter().map(rank).collect()
+        } else {
+            lines.par_iter().map(rank).collect()
+        };
+        let (pieces, geoms) = join_pieces(pieces, exact_key, junction_angle_deg)
+            .into_iter()
+            .map(|p| {
+                // An unmerged piece is its source line, unchanged.
+                let geom = match p.coords {
+                    Cow::Borrowed(_) if p.members.len() == 1 => {
+                        Cow::Borrowed(lines[p.members[0]].geom)
+                    }
+                    coords => {
+                        Cow::Owned(Geometry::LineString(LineString::new(coords.into_owned())))
+                    }
+                };
+                ((p.members.into_owned(), p.group), geom)
+            })
+            .unzip();
+        Self {
+            pieces,
+            geoms,
+            lines,
+            singles,
+            prio,
+            junction_angle_deg,
+            sort_direction,
         }
     }
 
-    // Phase 1: exact endpoint matching; phase 2: snapped matching.
-    let pieces = join_pieces(pieces, exact_key, junction_angle_deg);
-    let pieces = if snap_tol > 0.0 {
-        join_pieces(pieces, |g, c| snap_key(g, c, snap_tol), junction_angle_deg)
-    } else {
-        pieces
-    };
-
-    let mut chains: Vec<RawChain> = pieces
-        .into_iter()
-        .map(|p| RawChain {
-            geom: Geometry::LineString(LineString::new(p.coords.into_owned())),
-            members: p.members,
-        })
-        .collect();
-
-    // Non-chainable singletons pass through unmerged (original geometry).
-    for pos in singles {
-        chains.push(RawChain {
-            members: vec![pos],
-            geom: lines[pos].geom.clone(),
-        });
+    /// The candidate lines, in the order the join was built from.
+    pub fn lines(&self) -> &[CoalesceInput<'a>] {
+        &self.lines
     }
-    chains
+
+    /// One level's snap pass (phase 2) over the exact join's pieces at
+    /// `snap_tol` (skipped when `snap_tol <= 0`): per chain, the exact-join
+    /// piece it still is (`Ok`), or the run the pass merged (`Err`).
+    fn snap(&self, snap_tol: f64) -> Vec<Result<usize, RawChain<'static>>> {
+        if snap_tol <= 0.0 {
+            return (0..self.pieces.len()).map(Ok).collect();
+        }
+        let pieces: Vec<Piece<'_>> = self
+            .pieces
+            .iter()
+            .zip(&self.geoms)
+            .enumerate()
+            .map(|(src, ((members, group), geom))| Piece {
+                members: Cow::Borrowed(members),
+                coords: match &**geom {
+                    Geometry::LineString(ls) => Cow::Borrowed(&ls.0[..]),
+                    _ => unreachable!("an exact-join piece is a LineString"),
+                },
+                group: *group,
+                src,
+            })
+            .collect();
+        join_pieces(
+            pieces,
+            |g, c| snap_key(g, c, snap_tol),
+            self.junction_angle_deg,
+        )
+        .into_iter()
+        .map(|p| {
+            if p.src == MERGED {
+                Err(RawChain {
+                    members: Cow::Owned(p.members.into_owned()),
+                    geom: Cow::Owned(Geometry::LineString(LineString::new(p.coords.into_owned()))),
+                })
+            } else {
+                Ok(p.src)
+            }
+        })
+        .collect()
+    }
+
+    /// One level's chains, borrowing the exact join's runs: the snap pass,
+    /// then the singletons.
+    fn chains(&self, snap_tol: f64) -> Vec<RawChain<'_>> {
+        let mut chains: Vec<RawChain<'_>> = self
+            .snap(snap_tol)
+            .into_iter()
+            .map(|c| match c {
+                Ok(src) => RawChain {
+                    members: Cow::Borrowed(&self.pieces[src].0),
+                    geom: Cow::Borrowed(&*self.geoms[src]),
+                },
+                Err(merged) => merged,
+            })
+            .collect();
+        chains.extend(self.singletons());
+        chains
+    }
+
+    /// [`chains`](Self::chains) for the one level of a join, taking its runs
+    /// rather than borrowing them; with the lines' priorities.
+    fn into_chains(mut self, snap_tol: f64) -> (Vec<RawChain<'a>>, Vec<Priority>) {
+        let snapped = self.snap(snap_tol);
+        let mut chains: Vec<RawChain<'a>> = Vec::with_capacity(snapped.len() + self.singles.len());
+        for c in snapped {
+            chains.push(match c {
+                Ok(src) => RawChain {
+                    members: Cow::Owned(std::mem::take(&mut self.pieces[src].0)),
+                    geom: std::mem::replace(
+                        &mut self.geoms[src],
+                        Cow::Owned(Geometry::LineString(LineString::new(Vec::new()))),
+                    ),
+                },
+                Err(merged) => merged,
+            });
+        }
+        chains.extend(self.singletons());
+        (chains, self.prio)
+    }
+
+    /// Non-chainable singletons: unmerged, original geometry.
+    fn singletons(&self) -> impl Iterator<Item = RawChain<'a>> + '_ {
+        self.singles.iter().map(|&pos| RawChain {
+            members: Cow::Owned(vec![pos]),
+            geom: Cow::Borrowed(self.lines[pos].geom),
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Exact-endpoint joins (phase 1) run on this thread (#817 A2).
+    pub(super) static EXACT_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -609,7 +844,9 @@ fn join_pieces<'a>(
         incidents.push((key(p.group, first), pi << 1));
         incidents.push((key(p.group, last), (pi << 1) | 1));
     }
-    incidents.sort_unstable();
+    // Unique keys (`piece << 1 | end` is unique), so the parallel sort's
+    // order is the serial one's.
+    sort_unstable_maybe_par(&mut incidents, Ord::cmp);
 
     // Joins: per piece, the (other piece, other end) connected at each end.
     let mut joins: Vec<[Option<(usize, End)>; 2]> = vec![[None, None]; pieces.len()];
@@ -715,8 +952,8 @@ fn join_pieces<'a>(
         let mut coords: Vec<geo::Coord<f64>> = Vec::new();
         let mut group = 0u32;
         for &(pi, seg_entry) in &walk {
-            let mut p = slots[pi].take().expect("piece consumed once");
-            members.append(&mut p.members);
+            let p = slots[pi].take().expect("piece consumed once");
+            members.extend_from_slice(&p.members);
             group = p.group;
             // Reversing in place and then appending forward is the same
             // sequence as appending in reverse — done this way so a
@@ -724,9 +961,10 @@ fn join_pieces<'a>(
             append_run(&mut coords, &p.coords, seg_entry == 1);
         }
         out.push(Piece {
-            members,
+            members: Cow::Owned(members),
             coords: Cow::Owned(coords),
             group,
+            src: MERGED,
         });
     }
     out
@@ -1166,7 +1404,7 @@ mod tests {
         }
     }
 
-    fn run<'a>(lines: &[CoalesceInput<'a>], gsd_m: f64) -> Vec<CoalescedLine> {
+    fn run<'a>(lines: &[CoalesceInput<'a>], gsd_m: f64) -> Vec<CoalescedLine<'static>> {
         coalesce_level_lines(
             lines,
             gsd_m,
@@ -1474,7 +1712,7 @@ mod tests {
         let out = run(&lines, TINY_GSD);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].count, 1);
-        assert_eq!(out[0].geom, ring);
+        assert_eq!(*out[0].geom, ring);
     }
 
     #[test]
@@ -1779,7 +2017,7 @@ mod golden_digest {
 
     /// One seeded case: returns the coalesced output and how many chains
     /// merged two or more lines.
-    fn run_case(seed: u64) -> (Vec<CoalescedLine>, usize) {
+    fn run_case(seed: u64) -> (Vec<CoalescedLine<'static>>, usize) {
         let mut r = Lcg(seed ^ 0x9E37_79B9_7F4A_7C15);
         let big = seed.is_multiple_of(97);
         let n = 1 + r.below(if big { 2000 } else { 150 }) as usize;
@@ -2020,7 +2258,7 @@ mod lazy_pairing_tests {
             .iter()
             .map(|c| {
                 (
-                    c.members.clone(),
+                    c.members.to_vec(),
                     c.geom
                         .coords_iter()
                         .map(|p| (p.x.to_bits(), p.y.to_bits()))

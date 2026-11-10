@@ -2037,7 +2037,7 @@ chose to keep the defaults, is in [`benchmarks/staging/RESULTS.md`](https://gith
 
 | Variable | Default | Bounds | Effect |
 |----------|---------|--------|--------|
-| `TYLERTOO_STAGING_CONCURRENCY` | 8 | 1–128 | Ceiling on range requests in flight per part |
+| `TYLERTOO_STAGING_CONCURRENCY` | unset | 1–128 | Range requests in flight at once, across parts, for pass 0 and for footer reads. Unset, it is as many as the staging budget holds at the largest request (or the first part's footer), from 8 up to 128 |
 | `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | When set, caps the requests in flight for every profile. Unset, `auto` and `speed` are sized by the run budget, and `bounded` by the 256 MiB default |
 | `TYLERTOO_STAGING_COALESCE_BYTES` | 0 (off) | 0–1 GiB, and ≤ the budget | Merge adjacent selected row groups into one request while the merged span fits the window. A pruned row group always splits a merge, so pruned bytes are never fetched |
 | `TYLERTOO_HTTP_<KEY>` | unset | see below | Sets `object_store` client option `<key>` on every remote store |

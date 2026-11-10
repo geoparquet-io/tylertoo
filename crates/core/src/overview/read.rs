@@ -293,6 +293,23 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     }
 }
 
+impl ReadShape {
+    /// This shape with its depth held to `max_depth` (never below
+    /// [`READ_AHEAD_MIN_BATCHES`]) and its segments to what that queue holds,
+    /// as [`resolve_read_shape`] sizes them.
+    fn capped(self, max_depth: Option<usize>, batch_size: usize) -> Self {
+        let Some(max) = max_depth else {
+            return self;
+        };
+        let depth = self.depth.min(max.max(READ_AHEAD_MIN_BATCHES));
+        Self {
+            depth,
+            segment_target_rows: depth.saturating_sub(1).max(1).saturating_mul(batch_size),
+            ..self
+        }
+    }
+}
+
 /// One worker's report on one segment.
 enum SegMsg {
     /// A batch as the worker's own reader produced it, with the time that
@@ -320,6 +337,12 @@ thread_local! {
     /// Reader threads the calling thread's last [`read_in_order`] used: 1
     /// for a sequential read (test counter, #544).
     static LAST_READ_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`LAST_READ_WORKERS`] on this thread (test seam for other modules).
+#[cfg(test)]
+pub(super) fn last_read_workers() -> usize {
+    LAST_READ_WORKERS.with(std::cell::Cell::get)
 }
 
 /// Deliver every selected input row to `on_batch`, in exact read order, in
@@ -362,13 +385,33 @@ pub(super) fn read_in_order<F>(
     row_groups: Option<&RowGroupSelection>,
     projection: Option<&[usize]>,
     tuning: ReadTuning,
+    on_batch: F,
+) -> Result<(), ConvertError>
+where
+    F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
+{
+    read_in_order_capped(source, row_groups, projection, tuning, None, on_batch)
+}
+
+/// [`read_in_order`] with each worker's read-ahead held to at most
+/// `max_depth` batches (never below [`READ_AHEAD_MIN_BATCHES`]), and its
+/// segments sized to fit that queue. For a consumer slower than its
+/// readers that needs only a few batches ahead (the PMTiles export's band
+/// reads, #817): the budget's depth would let the readers decode most of a
+/// band ahead of it. `None` is [`read_in_order`].
+pub(super) fn read_in_order_capped<F>(
+    source: &ConvertSource,
+    row_groups: Option<&RowGroupSelection>,
+    projection: Option<&[usize]>,
+    tuning: ReadTuning,
+    max_depth: Option<usize>,
     mut on_batch: F,
 ) -> Result<(), ConvertError>
 where
     F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
 {
     let batch_size = tuning.batch_size.max(1);
-    let shape = resolve_read_shape(tuning);
+    let shape = resolve_read_shape(tuning).capped(max_depth, batch_size);
     let parallel = reads_in_parallel(source, row_groups, projection, shape);
     if shape.workers > 1 && !parallel {
         log::info!(
@@ -1430,6 +1473,22 @@ mod read_tests {
     /// The read-ahead sizing is what makes the parallelism real: a segment
     /// must fit in its worker's queue, and the worker count must fall rather
     /// than the per-worker queue going below the useful floor.
+    /// #817: a capped read keeps each worker's queue at the cap and its
+    /// segments inside that queue; no cap is the budget's shape.
+    #[test]
+    fn a_capped_read_holds_its_queues_to_the_cap() {
+        let shape = ReadShape {
+            workers: 4,
+            depth: READ_AHEAD_MAX_BATCHES,
+            segment_target_rows: (READ_AHEAD_MAX_BATCHES - 1) * 100,
+        };
+        assert_eq!(shape.capped(None, 100), shape);
+        let capped = shape.capped(Some(6), 100);
+        assert_eq!((capped.workers, capped.depth), (4, 6));
+        assert_eq!(capped.segment_target_rows, 500);
+        assert_eq!(shape.capped(Some(1), 100).depth, READ_AHEAD_MIN_BATCHES);
+    }
+
     #[test]
     fn read_shape_keeps_segments_inside_the_queue() {
         let shape = resolve_read_shape(ReadTuning {

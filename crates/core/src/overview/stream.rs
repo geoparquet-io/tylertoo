@@ -45,7 +45,7 @@ use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
 use super::cluster::{ClusterEntry, ClusterTables};
-use super::coalesce::{collected_line_bytes, CoalesceInput};
+use super::coalesce::{collected_line_bytes, CoalesceInput, ExactChains};
 use super::config::ValidatedConfig;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
@@ -123,6 +123,10 @@ struct Pass2Inputs<'a> {
     geom_bytes: u64,
     /// What the footers say pass 2 decodes ([`footer_price`]).
     footer: Option<FooterPrice>,
+    /// The writer's row-group encode grant (#817 B1: the drain widens it).
+    encode: Grant,
+    /// What one more drain encode holds ([`encode_price`] at a WKB chunk).
+    drain_slot_bytes: u64,
 }
 
 struct AssignmentInputs<'a> {
@@ -1100,7 +1104,7 @@ fn build_writer_options_with_ceiling(
 /// relation in shard mode instead of an equality, and why the plan's
 /// row-indexed tables are then re-addressed onto the subset rather than
 /// re-derived over it.
-fn select_row_groups_streaming(
+pub(super) fn select_row_groups_streaming(
     source: &ConvertSource,
     bbox_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
@@ -1173,7 +1177,14 @@ fn build_carriers(
         return vec![Vec::new(); level_specs.len()];
     }
     let t = Instant::now();
-    let carriers = tiny_polygon_carriers(features, feat_min_levels, &areas, &acc_levels, crs);
+    let carriers = tiny_polygon_carriers(
+        features,
+        feat_min_levels,
+        &areas,
+        &acc_levels,
+        crs,
+        options.profile,
+    );
     let total: usize = carriers.iter().map(Vec::len).sum();
     log::info!(
         "[convert] tiny-polygon accumulator: {total} placeholder square(s) across {} \
@@ -1212,21 +1223,22 @@ fn build_pass2_coalesce_tables(
     options: &ConvertOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Vec<Option<CoalesceTable>> {
+    let verbatim =
+        |e: &EmitLevel| matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
     match coalesce_scratch {
-        Some(scratch) => {
+        // A ladder of verbatim levels has no chain table to build.
+        Some(scratch) if !emitted.iter().all(verbatim) => {
             log::info!(
                 "[convert] building coalesce chain tables for {} level(s)",
                 emitted.len()
             );
-            let inputs = scratch.inputs();
+            let lines = scratch.exact_chains(options);
             emitted
                 .par_iter()
                 .map(|e| {
-                    let verbatim =
-                        matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
-                    (!verbatim).then(|| {
+                    (!verbatim(e)).then(|| {
                         build_level_coalesce_table(
-                            &inputs,
+                            &lines,
                             e.orig as usize,
                             finest,
                             e.gsd,
@@ -1238,7 +1250,7 @@ fn build_pass2_coalesce_tables(
                 })
                 .collect()
         }
-        None => std::iter::repeat_with(|| None)
+        _ => std::iter::repeat_with(|| None)
             .take(emitted.len())
             .collect(),
     }
@@ -1552,6 +1564,8 @@ fn run_pass2_levels(
         num_rows,
         geom_bytes,
         footer,
+        encode,
+        drain_slot_bytes,
     } = inputs;
     let n = ctxs.len();
     // #626: filled in by the buffered engine. Stays at its default for the
@@ -1666,6 +1680,11 @@ fn run_pass2_levels(
                         backing,
                         out_schema,
                         spill_dir: options.spill_dir.as_deref(),
+                        drain: (
+                            encode,
+                            drain_slot_bytes,
+                            grants.read.bytes().saturating_add(grants.window.bytes()),
+                        ),
                     },
                 );
                 grants.release(&mut budget);
@@ -1861,6 +1880,10 @@ struct LevelWriter {
     /// parquet's row-group ceiling — see
     /// [`ConvertReport::effective_max_row_group_size`].
     effective_max_row_group_size: Option<usize>,
+    /// What `writer`'s encode concurrency was granted.
+    encode: Grant,
+    /// What one more pass-2 drain encode holds ([`encode_price`] at a WKB chunk).
+    drain_slot_bytes: u64,
 }
 
 /// #541: apply a convert-side zoom ceiling to the planned levels. Returns how
@@ -1984,8 +2007,9 @@ fn pass2_coalesce(
                             "[convert] coalesce level {} was not prebuilt; building it now",
                             e.orig
                         );
+                        let lines = scratch.exact_chains(options);
                         Some(build_level_coalesce_table(
-                            &scratch.inputs(),
+                            &lines,
                             e.orig as usize,
                             finest,
                             e.gsd,
@@ -2027,16 +2051,18 @@ fn coalesce_merged_anywhere(
     let Some(scratch) = scratch else {
         return false;
     };
-    if unmaterialized.is_empty() || matches!(options.mode, Mode::Partitioning) {
+    if unmaterialized.iter().all(|e| e.orig as usize == finest)
+        || matches!(options.mode, Mode::Partitioning)
+    {
         return false;
     }
-    let inputs = scratch.inputs();
+    let lines = scratch.exact_chains(options);
     unmaterialized
         .par_iter()
         .filter(|e| e.orig as usize != finest)
         .any(|e| {
             coalesce_table_merged(&build_level_coalesce_table(
-                &inputs,
+                &lines,
                 e.orig as usize,
                 finest,
                 e.gsd,
@@ -2096,8 +2122,15 @@ fn create_level_writer(
     let encodes = budget.encode_concurrency(
         options.profile,
         rayon::current_num_threads(),
-        encode_price(&writer_opts, &level_row_counts, row_bytes),
+        encode_price(&writer_opts, &level_row_counts, row_bytes, 1),
     );
+    let drain_slot_bytes = encode_price(
+        &writer_opts,
+        &level_row_counts,
+        row_bytes,
+        super::writer::WKB_ENCODE_CHUNK_ROWS as u64,
+    )
+    .bytes;
     log::info!(
         "[convert] writer: {} concurrent row-group encode(s) x {} B, {} B left",
         encodes.units,
@@ -2105,6 +2138,9 @@ fn create_level_writer(
         budget.remaining(),
     );
     writer_opts.encode_concurrency = encodes.units;
+    // #817 W1: a level's encodes run on under the next, holding up to two
+    // levels' row groups; `bounded` keeps its one-level envelope.
+    writer_opts.overlap_levels = !matches!(options.profile, super::level::MemoryProfile::Bounded);
 
     let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
@@ -2119,6 +2155,8 @@ fn create_level_writer(
         out_schema,
         non_geom_cols,
         effective_max_row_group_size,
+        encode: encodes,
+        drain_slot_bytes,
     })
 }
 
@@ -2136,11 +2174,14 @@ const ENCODE_COPIES: u64 = 5;
 /// the writer's own per-level split ([`super::writer::projected_row_groups`]);
 /// a row is priced at the footers' bytes per input row (an upper bound for
 /// a simplified level), or at [`MemoryBudget::estimate`]'s sink row without
-/// them.
+/// them. A group is priced at `min_rows` at least: a pass-2 drain slot (#817
+/// B1) also admits one WKB chunk of up to
+/// [`WKB_ENCODE_CHUNK_ROWS`](super::writer::WKB_ENCODE_CHUNK_ROWS) rows.
 fn encode_price(
     writer_opts: &OverviewWriterOptions,
     level_row_counts: &[usize],
     row_bytes: Option<u64>,
+    min_rows: u64,
 ) -> Price {
     let finest_zoom = writer_opts.levels.last().and_then(|l| l.zoom);
     let largest = writer_opts
@@ -2160,6 +2201,7 @@ fn encode_price(
         .max()
         .unwrap_or(0)
         .max(1) as u64;
+    let largest = largest.max(min_rows);
     match row_bytes {
         Some(row) => Price::new(
             largest
@@ -2328,7 +2370,11 @@ fn coalesce_level_counts_in_waves(
         wave,
     } = inputs;
     let num_levels = level_specs.len();
-    let inputs = scratch.inputs();
+    // Phase 1 of the chain stage, shared by every level (#817 A2); none
+    // when the canonical level is the only one.
+    let lines = (0..num_levels)
+        .any(|l| l != finest)
+        .then(|| scratch.exact_chains(options));
     let wave = wave.max(1);
     log::info!(
         "[convert] {} coalesce chains for {num_levels} level(s) ({} candidate line(s), \
@@ -2338,7 +2384,7 @@ fn coalesce_level_counts_in_waves(
         } else {
             "counting"
         },
-        inputs.len()
+        scratch.rows.len()
     );
     // One run per level, `wave` levels at a time. With `prebuild` it produces
     // BOTH the count the level plan needs and the table pass 2 needs.
@@ -2352,14 +2398,16 @@ fn coalesce_level_counts_in_waves(
                 return (scratch.rows.len(), None, false);
             }
             let gsd = level_specs[level].0;
+            let lines = lines
+                .as_ref()
+                .expect("a non-canonical level implies the exact join");
             if !prebuild {
-                let chains = super::convert::coalesce_level_chains(
-                    &inputs, level, finest, gsd, crs, options,
-                );
+                let chains =
+                    super::convert::coalesce_level_chains(lines, level, finest, gsd, crs, options);
                 return (chains.len(), None, false);
             }
             let (table, hint) = super::convert::build_level_coalesce_table_and_hint(
-                &inputs,
+                lines,
                 level,
                 finest,
                 gsd,
@@ -2598,6 +2646,16 @@ fn resolve_winner_tables(
         carriers,
         finest,
     })
+}
+
+/// Free `items` across the rayon pool (#817 T1): one thread freeing
+/// millions of geometries is a serial stretch in no phase. Export frees its
+/// spill buckets the same way.
+fn release_in_parallel<I>(items: I)
+where
+    I: IntoParallelIterator,
+{
+    items.into_par_iter().for_each(drop);
 }
 
 /// Footer-only preparation: everything the convert driver settles before the
@@ -3607,6 +3665,11 @@ pub(crate) fn run_stages(
         },
         diagnostics,
     );
+    // Pass 2 reads the chain tables, never the line scratch: free it now,
+    // across the pool, rather than holding it through pass 2 (#817 T1).
+    if let Some(scratch) = coalesce_scratch {
+        release_in_parallel(scratch.geoms);
+    }
 
     let spill_reservation = reserve_spill_cache(
         &mut budget,
@@ -3625,6 +3688,8 @@ pub(crate) fn run_stages(
         out_schema,
         non_geom_cols,
         effective_max_row_group_size,
+        encode,
+        drain_slot_bytes,
     } = create_level_writer(
         output_path,
         &descriptor,
@@ -3698,9 +3763,18 @@ pub(crate) fn run_stages(
             num_rows,
             geom_bytes,
             footer,
+            encode,
+            drain_slot_bytes,
         },
         strategy,
     )?;
+
+    // The chain tables hold every level's simplified strokes: free them
+    // across the pool, not serially at scope end (#817 T1).
+    drop(ctxs);
+    // Per table: flattening the maps into one Vec would add a copy of every
+    // entry at the end of the run.
+    release_in_parallel(coalesce_tables);
 
     let (mut level_reports, level_spill_bytes) =
         build_level_reports(emitted, level_stats, &mut skipped, diagnostics);
@@ -4926,6 +5000,15 @@ pub(super) struct CoalesceScratch {
 }
 
 impl CoalesceScratch {
+    /// The exact-endpoint join over these lines that every level shares.
+    fn exact_chains(&self, options: &ConvertOptions) -> ExactChains<'_> {
+        ExactChains::new(
+            self.inputs(),
+            options.coalesce_junction_angle,
+            options.assign.sort_direction,
+        )
+    }
+
     /// The per-level chaining inputs (borrowing the collected geometries).
     fn inputs(&self) -> Vec<CoalesceInput<'_>> {
         (0..self.rows.len())
@@ -7114,7 +7197,6 @@ pub(super) fn process_batch_cascade(
 
 #[cfg(test)]
 mod tests {
-
     /// Array-of-structs fixture → the column-major table the engine takes
     /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
     /// pipeline fills a [`FeatureTable`] directly from the scan, so this
@@ -9949,6 +10031,119 @@ mod tests {
         assert!(full_build.tables[finest].is_none());
         assert!(full_build.merged, "10-segment polylines merge");
         assert_eq!(full_counts[finest], scratch.rows.len());
+    }
+
+    /// #817 T1: convert's O(dataset) leftovers (the line scratch, the chain
+    /// tables) are freed across the pool, not by one thread at scope end.
+    #[test]
+    fn release_in_parallel_frees_on_several_threads() {
+        struct Arrive;
+        impl Drop for Arrive {
+            fn drop(&mut self) {
+                super::super::testutil::rendezvous::arrive("release");
+            }
+        }
+        let items: Vec<Arrive> = (0..4).map(|_| Arrive).collect();
+        let pool = super::super::testutil::rendezvous::pool(4);
+        let _guard = super::super::testutil::rendezvous::arm("release", 4);
+        pool.install(|| release_in_parallel(items));
+        assert!(
+            super::super::testutil::rendezvous::met(),
+            "the 4 drops never ran at once"
+        );
+    }
+
+    /// #817 B1 review: a widened drain slot also admits a WKB chunk of up to
+    /// 10,000 rows, so a ladder of 128-row groups must not price the slot
+    /// at 128 rows (the drain would hold far more than the read it reuses).
+    #[test]
+    fn drain_slot_is_priced_at_least_at_a_wkb_chunk() {
+        let mut opts = OverviewWriterOptions::new(Mode::Duplicating, three_levels());
+        opts.max_row_group_size = 128;
+        let counts = [1_000usize, 50_000, 200_000];
+        let row = Some(100u64);
+        let group = encode_price(&opts, &counts, row, 1).bytes;
+        let chunk = crate::overview::writer::WKB_ENCODE_CHUNK_ROWS as u64;
+        let slot = encode_price(&opts, &counts, row, chunk).bytes;
+        assert!(group < slot, "group {group} B vs slot {slot} B");
+        assert_eq!(slot, 10_000 * 100 * ENCODE_COPIES);
+    }
+
+    /// #817 A2: the exact-endpoint join (phase 1 of the chain stage) does
+    /// not depend on the level, so one run serves every level.
+    #[test]
+    fn chain_stage_runs_the_exact_join_once_for_all_levels() {
+        let scratch = chained_scratch(40);
+        let level_specs: Vec<(f64, Option<u8>)> = (0..6u8)
+            .map(|z| (20_000.0 / f64::from(1u32 << z), Some(z + 4)))
+            .collect();
+        let options = ConvertOptions::default();
+        // One pool thread: the counter is thread-local, and every level's
+        // stage runs on that thread.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let joins = pool.install(|| {
+            super::super::coalesce::EXACT_JOINS.with(|c| c.set(0));
+            for prebuild in [true, false] {
+                coalesce_level_counts(
+                    MemoryBudget::with_available(None),
+                    &scratch,
+                    &level_specs,
+                    Crs::Epsg4326,
+                    &options,
+                    prebuild,
+                    &crate::diagnostics::Diagnostics::default(),
+                );
+            }
+            super::super::coalesce::EXACT_JOINS.with(std::cell::Cell::get)
+        });
+        assert_eq!(joins, 2, "one exact join per chain stage, not per level");
+    }
+
+    /// #817 A2 review: a single-level ladder's only level is canonical and
+    /// verbatim, so no chain stage needs the exact join.
+    #[test]
+    fn single_level_ladder_skips_the_exact_join() {
+        let scratch = chained_scratch(40);
+        let level_specs = [(20_000.0, Some(4u8))];
+        let options = ConvertOptions::default();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let joins = pool.install(|| {
+            super::super::coalesce::EXACT_JOINS.with(|c| c.set(0));
+            for prebuild in [true, false] {
+                coalesce_level_counts(
+                    MemoryBudget::with_available(None),
+                    &scratch,
+                    &level_specs,
+                    Crs::Epsg4326,
+                    &options,
+                    prebuild,
+                    &crate::diagnostics::Diagnostics::default(),
+                );
+            }
+            let emitted = [EmitLevel {
+                orig: 0,
+                gsd: 20_000.0,
+                zoom: Some(4),
+                hint: 40,
+            }];
+            let tables = build_pass2_coalesce_tables(
+                Some(&scratch),
+                &emitted,
+                0,
+                Crs::Epsg4326,
+                &options,
+                &crate::diagnostics::Diagnostics::default(),
+            );
+            assert!(tables.iter().all(Option::is_none));
+            super::super::coalesce::EXACT_JOINS.with(std::cell::Cell::get)
+        });
+        assert_eq!(joins, 0, "no level coalesces, so no exact join");
     }
 
     /// How many levels' chain stages may run at once: the memory budget over

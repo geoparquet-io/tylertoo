@@ -6,63 +6,226 @@
         "cpu_model": "0xd40",
         "cpus": 64
       },
-      "hostname": "ip-10-0-8-10",
-      "measured": "2026-11-05",
+      "inputs": {
+        "792": "913b1dd8bae623c17df72299fdaed68fb9ad0096fd2b5ffa6b9e5d73315310ec",
+        "moldova": "06bddb7a42283812c1032d85a6b138daf198b1b46592ba96ad84cbe09a12e5f5"
+      },
+      "hostname": "ip-10-0-10-148",
+      "measured": "2026-11-10",
       "cells": {
         "792-def": {
-          "wall_s": 9.71,
-          "peak_rss_kib": 1849396,
-          "peak_rss_min_kib": 1811092,
-          "rounds": 3
+          "wall_s": 9.52,
+          "peak_rss_kib": 2040540,
+          "peak_rss_min_kib": 1995064,
+          "effective_cores": 20.88,
+          "phase_cores": {
+            "export/levels": 21.535
+          },
+          "phase_wall_s": {
+            "export/levels": 9.055769
+          },
+          "phase_cpu_s": {
+            "export/levels": 193.025861
+          },
+          "phase_rounds": {
+            "export/levels": 3
+          },
+          "serial_share": 0.019617781815188626,
+          "serial_share_rounds": 3,
+          "output_sha256": "e68ac33a24979a72106db2a5e3088905538bc606e5d5e0eb2185477c53aa51b9",
+          "rounds": 3,
+          "speedup_16_to_full": {
+            "whole": 1.064,
+            "export/levels": 1.067
+          },
+          "low_threads": 16,
+          "low_rounds": 3,
+          "low_phase_rounds": {
+            "export/levels": 3
+          }
         },
         "792-nocap": {
-          "wall_s": 8.99,
-          "peak_rss_kib": 1693936,
-          "peak_rss_min_kib": 1693320,
+          "wall_s": 8.26,
+          "peak_rss_kib": 1931080,
+          "peak_rss_min_kib": 1927444,
+          "effective_cores": 21.92,
+          "phase_cores": {
+            "export/levels": 22.821
+          },
+          "phase_wall_s": {
+            "export/levels": 7.778778
+          },
+          "phase_cpu_s": {
+            "export/levels": 179.268691
+          },
+          "phase_rounds": {
+            "export/levels": 3
+          },
+          "serial_share": 0.02213370414198935,
+          "serial_share_rounds": 3,
+          "output_sha256": "7d537294099d7c1aed058ce3b8af9771aa52fdc95e2e0b0c5f3e9bedaa83fd24",
           "rounds": 3
         },
         "792-drop": {
-          "wall_s": 6.04,
-          "peak_rss_kib": 1693148,
-          "peak_rss_min_kib": 1641180,
+          "wall_s": 5.76,
+          "peak_rss_kib": 1873160,
+          "peak_rss_min_kib": 1810816,
+          "effective_cores": 18.36,
+          "phase_cores": {
+            "export/levels": 19.17
+          },
+          "phase_wall_s": {
+            "export/levels": 5.330692
+          },
+          "phase_cpu_s": {
+            "export/levels": 102.184483
+          },
+          "phase_rounds": {
+            "export/levels": 3
+          },
+          "serial_share": 0.020616320883054748,
+          "serial_share_rounds": 3,
+          "output_sha256": "fc696ad29e4eedaeea66944f6726a912748676507ee661e62f466ffeea2d4e60",
           "rounds": 3
         },
         "792-dropnocap": {
-          "wall_s": 5.08,
-          "peak_rss_kib": 1633580,
-          "peak_rss_min_kib": 1615904,
+          "wall_s": 4.73,
+          "peak_rss_kib": 1882524,
+          "peak_rss_min_kib": 1815556,
+          "effective_cores": 20.19,
+          "phase_cores": {
+            "export/levels": 21.678
+          },
+          "phase_wall_s": {
+            "export/levels": 4.258702
+          },
+          "phase_cpu_s": {
+            "export/levels": 91.126765
+          },
+          "phase_rounds": {
+            "export/levels": 3
+          },
+          "serial_share": 0.04038366434641371,
+          "serial_share_rounds": 3,
+          "output_sha256": "e0609866eeba6dc61fb2e21dbfd71e9d797b618e5c3d754d022bf182350e33bd",
           "rounds": 3
         },
         "792-def-glibc": {
-          "wall_s": 10.91,
-          "peak_rss_kib": 1811788,
-          "peak_rss_min_kib": 1791192,
+          "wall_s": 11.92,
+          "peak_rss_kib": 1846900,
+          "peak_rss_min_kib": 1829892,
+          "effective_cores": 18.63,
+          "phase_cores": {
+            "export/levels": 19.34
+          },
+          "phase_wall_s": {
+            "export/levels": 11.30327
+          },
+          "phase_cpu_s": {
+            "export/levels": 219.454259
+          },
+          "phase_rounds": {
+            "export/levels": 3
+          },
+          "serial_share": 0.016034593907804442,
+          "serial_share_rounds": 3,
+          "output_sha256": "e68ac33a24979a72106db2a5e3088905538bc606e5d5e0eb2185477c53aa51b9",
           "rounds": 3
         },
         "792-drop-glibc": {
-          "wall_s": 7.36,
-          "peak_rss_kib": 1472396,
-          "peak_rss_min_kib": 1443512,
+          "wall_s": 7.46,
+          "peak_rss_kib": 1459496,
+          "peak_rss_min_kib": 1446524,
+          "effective_cores": 16.5,
+          "phase_cores": {
+            "export/levels": 17.306
+          },
+          "phase_wall_s": {
+            "export/levels": 6.935943
+          },
+          "phase_cpu_s": {
+            "export/levels": 119.773905
+          },
+          "phase_rounds": {
+            "export/levels": 3
+          },
+          "serial_share": 0.019762063138250685,
+          "serial_share_rounds": 3,
+          "output_sha256": "fc696ad29e4eedaeea66944f6726a912748676507ee661e62f466ffeea2d4e60",
           "rounds": 3
         },
         "moldova-f0": {
-          "wall_s": 14.02,
-          "peak_rss_kib": 4769312,
-          "peak_rss_min_kib": 4754636,
+          "wall_s": 9.42,
+          "peak_rss_kib": 5441548,
+          "peak_rss_min_kib": 4935144,
+          "effective_cores": 27.17,
+          "phase_cores": {
+            "export/levels": 28.25
+          },
+          "phase_wall_s": {
+            "export/levels": 9.014134
+          },
+          "phase_cpu_s": {
+            "export/levels": 254.646926
+          },
+          "phase_rounds": {
+            "export/levels": 3
+          },
+          "serial_share": 0.01588924440241384,
+          "serial_share_rounds": 3,
+          "output_sha256": "7fbae285a1666ba6314712e39ebaa2ad5a683e77477685c8651b17a079f9a2bd",
           "rounds": 3
         },
         "moldova-tiles": {
-          "wall_s": 4.46,
-          "peak_rss_kib": 3896264,
-          "peak_rss_min_kib": 3826504,
-          "rounds": 3
+          "wall_s": 3.36,
+          "peak_rss_kib": 3868192,
+          "peak_rss_min_kib": 3824904,
+          "effective_cores": 27.62,
+          "phase_cores": {
+            "convert/pass2 (output sink)": 23.423,
+            "export/levels": 35.455
+          },
+          "phase_wall_s": {
+            "convert/pass2 (output sink)": 0.711799,
+            "export/levels": 1.98379
+          },
+          "phase_cpu_s": {
+            "convert/pass2 (output sink)": 16.672426,
+            "export/levels": 70.704805
+          },
+          "phase_rounds": {
+            "convert/pass2 (output sink)": 3,
+            "export/levels": 3
+          },
+          "serial_share": 0.037827548592883085,
+          "serial_share_rounds": 3,
+          "output_sha256": "5e28169bc423d99919956705a376d9335d72f3ebc159c0bbf787f47b6f113a94",
+          "rounds": 3,
+          "speedup_16_to_full": {
+            "whole": 1.405,
+            "convert/pass2 (output sink)": 1.727,
+            "export/levels": 1.435
+          },
+          "low_threads": 16,
+          "low_rounds": 3,
+          "low_phase_rounds": {
+            "convert/pass2 (output sink)": 3,
+            "export/levels": 3
+          }
         }
       },
       "limits": {
-        "ratio_wall": 1.7,
+        "ratio_wall": 1.8,
         "ratio_rss": 1.5,
         "wall": 1.15,
-        "rss": 1.2
+        "rss": 1.2,
+        "cores_drop": 0.15,
+        "speedup_drop": 0.15,
+        "cpu_rise": 0.25
+      },
+      "floors": {
+        "whole_cores_frac": 0.4,
+        "serial_share_max": 0.1
       }
     }
   }

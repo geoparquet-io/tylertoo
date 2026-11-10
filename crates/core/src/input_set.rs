@@ -1341,50 +1341,60 @@ fn load_part_meta(source: &InputSource) -> Result<PartMeta, InputError> {
     })
 }
 
-/// Ceiling on concurrent footer loads in [`load_part_metas`]. A remote
-/// footer costs two range requests; loading hundreds of parts serially
-/// pays hundreds of sequential round-trips, while unbounded parallelism
-/// would open one connection per part. Eight in flight keeps a
-/// hundreds-of-parts prefix listing responsive without a connection storm.
-const FOOTER_LOAD_CONCURRENCY: usize = 8;
+/// Threads parsing footers in [`load_part_metas`]. Parsing is CPU work of a
+/// few milliseconds per footer; the network wait is overlapped separately
+/// ([`crate::input::prefetch_footers`]). Each thread's heap keeps the decoded
+/// footers it built, so a thread per request in flight fragmented memory
+/// (#817 R1: +0.5 GiB at 64 threads over 512 parts).
+const FOOTER_PARSE_THREADS: usize = 8;
 
-/// Load every part's footer, in order, with bounded concurrency. Results
-/// are written into per-index slots so the returned order always matches
-/// `parts` regardless of completion order; the first error (by part index)
-/// wins.
-#[expect(
-    clippy::disallowed_types,
-    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
-)]
+/// Load every part's footer, in order. Part 0 loads first: its decoded size
+/// prices one footer in flight, and the staging admission sets how many
+/// remote footers are fetched at once (#817 R1: each footer is two round
+/// trips, so a fixed few in flight leave a many-part prefix waiting). Each
+/// fetched footer is parsed as it lands, on [`FOOTER_PARSE_THREADS`]
+/// threads. Results are written into per-index slots so the order always
+/// matches `parts`; the first error (by part index) wins.
 fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let workers = FOOTER_LOAD_CONCURRENCY.min(parts.len());
-    if workers <= 1 {
-        return parts.iter().map(load_part_meta).collect();
-    }
-    let next = AtomicUsize::new(0);
-    let slots: Vec<std::sync::Mutex<Option<Result<PartMeta, InputError>>>> = (0..parts.len())
+    let Some((first, rest)) = parts.split_first() else {
+        return Ok(Vec::new());
+    };
+    let first = load_part_meta(first)?;
+    let first_bytes = first.parquet.memory_size() as u64;
+    let admission = crate::input::stage_admission();
+    let in_flight = admission.requests_for(first_bytes);
+    // A fetched footer holds its bytes until a parse thread takes it: at
+    // most what `in_flight` was priced at, or the staging budget.
+    let retain = admission
+        .mem_budget
+        .max(first_bytes.saturating_mul(in_flight as u64));
+    let slots: Vec<std::sync::Mutex<Option<Result<PartMeta, InputError>>>> = (0..rest.len())
         .map(|_| std::sync::Mutex::new(None))
         .collect();
+    let (ready, landed) = std::sync::mpsc::channel::<usize>();
+    let landed = std::sync::Mutex::new(landed);
     std::thread::scope(|scope| {
-        for _ in 0..workers {
+        for _ in 0..FOOTER_PARSE_THREADS.min(rest.len()) {
             scope.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= parts.len() {
+                let next = landed.lock().expect("footer queue lock").recv();
+                let Ok(i) = next else {
                     break;
-                }
-                let meta = load_part_meta(&parts[i]);
+                };
+                let meta = load_part_meta(&rest[i]);
                 *slots[i].lock().expect("footer slot lock") = Some(meta);
             });
         }
+        crate::input::prefetch_footers(rest, in_flight, retain, |i| {
+            let _ = ready.send(i);
+        });
+        drop(ready);
     });
-    slots
-        .into_iter()
-        .map(|slot| {
+    std::iter::once(Ok(first))
+        .chain(slots.into_iter().map(|slot| {
             slot.into_inner()
                 .expect("footer slot lock")
-                .expect("every slot filled by a worker")
-        })
+                .expect("every part's footer is parsed")
+        }))
         .collect()
 }
 
@@ -1392,11 +1402,10 @@ impl MultiSource {
     /// Build a multi source over already-constructed parts: load every
     /// part's footer and validate compatibility against part 0 (see the
     /// module docs). `parts` must be non-empty and already ordered.
-    /// Footer loads run with bounded concurrency
-    /// (`FOOTER_LOAD_CONCURRENCY`): a remote footer is two range
-    /// requests, so hundreds of parts would otherwise serialize hundreds
-    /// of round-trips — but must not open hundreds of connections at once
-    /// either.
+    /// Footer loads run with bounded concurrency (`load_part_metas`): a
+    /// remote footer is two range requests, so hundreds of parts would
+    /// otherwise serialize hundreds of round-trips — but must not open
+    /// hundreds of connections at once either.
     ///
     /// # Errors
     ///
@@ -1678,7 +1687,7 @@ fn has_glob_meta(input: &str) -> bool {
 /// Entry-resolution concurrency for explicit lists (`--files-from`
 /// manifests, Python input lists). Remote entries cost one connect (HEAD)
 /// each, so hundreds of manifest lines would otherwise serialize hundreds
-/// of round-trips; matches [`FOOTER_LOAD_CONCURRENCY`].
+/// of round-trips.
 const LIST_CONNECT_CONCURRENCY: usize = 8;
 
 /// Resolve every `(context, entry)` pair with `resolve` under bounded
@@ -3565,6 +3574,37 @@ mod staging_counter_tests {
             8,
             "all eight spans, across four parts, must be in flight together"
         );
+    }
+
+    /// #817 R1: with no `TYLERTOO_STAGING_CONCURRENCY`, small remote
+    /// requests go in flight as many as the staging byte budget holds, not
+    /// a fixed eight: 20 parts' footers, then their 40 small spans. Main
+    /// kept 8 of each in flight, so a 512-part prefix spent seconds on
+    /// footer round trips.
+    #[test]
+    fn small_remote_requests_fill_the_byte_budget_not_a_fixed_eight() {
+        if !run_in_child(
+            "small_remote_requests_fill_the_byte_budget_not_a_fixed_eight",
+            &[(COALESCE_VAR, "0")],
+        ) {
+            return;
+        }
+        let objects: Vec<(String, Vec<u8>)> = (0..20)
+            .map(|i| (format!("part-{i:02}.parquet"), three_column_parquet(500, 2)))
+            .collect();
+        let named: Vec<(&str, Vec<u8>)> = objects
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.clone()))
+            .collect();
+        let store = ProbeStore::new(&named, Duration::from_millis(50));
+        let parts = objects.iter().map(|(n, _)| store.source(n)).collect();
+        let src = ConvertSource::from_parts("memory://", parts).unwrap();
+        src.num_row_groups_total().unwrap();
+        // Part 0 prices a footer, then the other 19 load together.
+        assert_eq!(store.take_max_in_flight(), 19, "footers in flight");
+        let (requests, _, _) = counted(&src, || src.stage_selected(None).unwrap());
+        assert_eq!(requests, 40, "one span per row group");
+        assert_eq!(store.take_max_in_flight(), 40, "spans in flight");
     }
 
     /// #727 §1: one failed request costs only its own chunks. Part 0's GETs

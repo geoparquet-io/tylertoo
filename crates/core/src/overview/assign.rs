@@ -1563,7 +1563,7 @@ const PAR_SORT_MIN_LEN: usize = 64 * 1024;
 /// outright, and a serial build must not be made slower by a change that exists
 /// to speed up a parallel one. Every caller sorts by a strict total order, so
 /// the result is the same either way.
-fn sort_unstable_maybe_par<T, F>(v: &mut [T], cmp: F)
+pub(super) fn sort_unstable_maybe_par<T, F>(v: &mut [T], cmp: F)
 where
     T: Send,
     F: Fn(&T, &T) -> Ordering + Sync,
