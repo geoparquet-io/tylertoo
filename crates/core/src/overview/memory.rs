@@ -451,8 +451,8 @@ impl MemoryBudget {
     /// grants alone overstate it (bounded Moldova: 2.1 GB granted, a 1.94 GB
     /// pass-2 peak in all), and spending them raised the run's peak. It is
     /// also capped at `below_peak` (how far the process sits below its peak
-    /// RSS) less the `encode` grant itself, which the drain spends anyway, so
-    /// the whole drain fits under the peak.
+    /// RSS) less the `encode` grant's own slots, which the drain spends
+    /// anyway, so the whole drain fits under the peak.
     pub(super) fn drain_encodes(
         encode: Grant,
         slot_bytes: u64,
@@ -461,7 +461,8 @@ impl MemoryBudget {
         threads: usize,
     ) -> usize {
         let slot = slot_bytes.max(encode.unit_bytes).max(1);
-        let reused = reused.min(below_peak.saturating_sub(encode.bytes()));
+        let reused =
+            reused.min(below_peak.saturating_sub((encode.units as u64).saturating_mul(slot)));
         let extra = usize::try_from(reused / slot).unwrap_or(usize::MAX);
         encode
             .units
@@ -518,6 +519,15 @@ mod tests {
         // The whole drain, the grant's own 4 included, fits below the peak.
         assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 500, 64), 5);
         assert_eq!(MemoryBudget::drain_encodes(encode, 0, 1 << 40, 300, 64), 4);
+        // The grant's own slots also admit WKB chunks, so they cost `slot` too.
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 200, 1 << 40, 600, 64),
+            4
+        );
+        assert_eq!(
+            MemoryBudget::drain_encodes(encode, 200, 1 << 40, 1_000, 64),
+            5
+        );
         // Never below the writer's own grant, even on fewer threads.
         assert_eq!(
             MemoryBudget::drain_encodes(encode, 0, 1 << 40, u64::MAX, 2),
