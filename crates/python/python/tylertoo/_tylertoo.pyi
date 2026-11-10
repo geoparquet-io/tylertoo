@@ -114,7 +114,9 @@ def export_pmtiles(
     max_compressed_tile_size: int | Literal["auto"] | None = "auto",
     max_zoom_simplify_factor: float | None = None,
     min_zoom: int | None = None,
-    mlt_profile: Literal["web", "native", "min-size", "diffable", "fast-encoding"] = "web",
+    mlt_profile: Literal[
+        "web", "native", "min-size", "diffable", "fast-encoding"
+    ] = "web",
     name: str | None = None,
     partition_wave: int = 0,
     preset: Literal["tippecanoe"] | None = None,
@@ -145,7 +147,9 @@ def pyramid(
     include_properties: Sequence[str] | None = None,
     max_compressed_tile_size: int | Literal["auto"] | None = "auto",
     max_zoom_simplify_factor: float | None = None,
-    mlt_profile: Literal["web", "native", "min-size", "diffable", "fast-encoding"] = "web",
+    mlt_profile: Literal[
+        "web", "native", "min-size", "diffable", "fast-encoding"
+    ] = "web",
     name: str | None = None,
     partition_wave: int = 0,
     profile: Literal["auto", "speed", "bounded"] = "auto",
@@ -224,7 +228,9 @@ def convert(
     magnitude_ladder: str | None = None,
     max_compressed_tile_size: int | Literal["auto"] | None = "auto",
     max_zoom_simplify_factor: float | None = None,
-    mlt_profile: Literal["web", "native", "min-size", "diffable", "fast-encoding"] = "web",
+    mlt_profile: Literal[
+        "web", "native", "min-size", "diffable", "fast-encoding"
+    ] = "web",
     name: str | None = None,
     no_auto_rank: bool = False,
     no_collapse: bool = False,

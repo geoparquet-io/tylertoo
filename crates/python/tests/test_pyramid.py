@@ -139,7 +139,9 @@ class TestPyramidTileFormat:
                 tylertoo.decode(str(p), str(Path(tmpdir) / f"{p.stem}.parquet"))
                 for p in (mvt, mlt)
             ]
-        counts = [[(r["z"], r["layer"], r["feature_count"]) for r in s] for s in per_layer]
+        counts = [
+            [(r["z"], r["layer"], r["feature_count"]) for r in s] for s in per_layer
+        ]
         assert counts[0] == counts[1]
         assert decoded[0]["features_written"] == decoded[1]["features_written"] > 0
 
