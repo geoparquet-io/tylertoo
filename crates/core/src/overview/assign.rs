@@ -2610,10 +2610,9 @@ fn newcomer_allocs(
 /// then the index. The code puts the cells of one tile next to each other,
 /// as tippecanoe's quadkey index puts the features (#850), so
 /// [`newcomer_allocs`]'s running total carries a remainder across a tile's
-/// cells and finds a tile's cells in one run. The index
-/// keeps apart the cells the code clamps together, past 2^31 cells from the
-/// origin.
-type SuperCell = (u64, i64, i64);
+/// cells and finds a tile's cells in one run. The code is one-to-one, so
+/// the index only rides along for [`tile_of`].
+type SuperCell = (u128, i64, i64);
 
 /// Super-cells per tile side: a tile is `--gsd-base` GSDs, 1024 by default.
 const SUPERCELLS_PER_TILE: i64 = 1024 / SUPERCELL_GSD_FACTOR as i64;
@@ -2641,10 +2640,14 @@ fn super_cell(cx: f64, cy: f64, super_m: f64, crs: Crs) -> SuperCell {
         ((mx + HALF) / (2.0 * HALF) * n).floor() as i64,
         ((HALF - my) / (2.0 * HALF) * n).floor() as i64,
     );
-    // The offset is a multiple of a tile, so a tile's cells stay aligned.
-    let biased = |g: i64| g.saturating_add(1 << 31).clamp(0, i64::from(u32::MAX)) as u32;
-    let spread = super::auto_zoom::spread_bits;
-    (spread(biased(gx)) | (spread(biased(gy)) << 1), gx, gy)
+    // Flipping the sign bit maps i64 onto u64 in order, by a multiple of a
+    // tile, so a tile's cells stay aligned; 64 bits a side need a u128 code.
+    let spread = |g: i64| {
+        let g = (g as u64) ^ (1 << 63);
+        let half = |h: u64| u128::from(super::auto_zoom::spread_bits(h as u32));
+        (half(g >> 32) << 64) | half(g)
+    };
+    (spread(gx) | (spread(gy) << 1), gx, gy)
 }
 
 /// The tile a super-cell lies in, at the default `--gsd-base`.
@@ -4230,6 +4233,27 @@ mod tests {
         // the z4 tile row south of the equator, and anything north of it is not.
         let row = |y: f64| tile_of(&super_cell(100.0, y, side(4), Crs::Epsg3857)).1;
         assert_eq!((row(0.0), row(1e-3)), (8, 7));
+    }
+
+    /// At z29 a level has 2^32 cells a side, past a `u32` Morton half: the
+    /// cells of one tile must still sort next to each other, or the tile
+    /// floor counts one tile as two runs.
+    #[test]
+    fn deep_level_cells_keep_their_tiles_together() {
+        use crate::tile::WEBMERC_HALF_M as HALF;
+        let side = gsd(29) * SUPERCELL_GSD_FACTOR;
+        let n = (1u64 << 32) as f64;
+        let at = |g: i64| (g as f64 + 0.5) / n * 2.0 * HALF;
+        let g = 1i64 << 31;
+        let mut keys: Vec<SuperCell> = [(g, g), (g, g + 8), (g + 1, g), (g + 1, g + 8)]
+            .iter()
+            .map(|&(x, y)| super_cell(at(x) - HALF, HALF - at(y), side, Crs::Epsg3857))
+            .collect();
+        keys.sort_unstable();
+        let tiles: Vec<(i64, i64)> = keys.iter().map(tile_of).collect();
+        assert_eq!(tiles[0], tiles[1], "{tiles:?}");
+        assert_eq!(tiles[2], tiles[3], "{tiles:?}");
+        assert_ne!(tiles[1], tiles[2], "{tiles:?}");
     }
 
     /// #850: at gamma 1 (the tippecanoe preset's) an isolated group keeps

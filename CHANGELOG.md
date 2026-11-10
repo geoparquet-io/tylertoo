@@ -95,7 +95,7 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a Web Mercator grid, each counts what coarser levels kept, and a tile the
   budget would empty keeps one feature. On 1.05M Overture places,
   `--preset tippecanoe` missed 298 of tippecanoe's 1,645 z12 tiles and 1,022
-  of its 5,094 z13 tiles; it now misses 13 and 42, with the same per-zoom
+  of its 5,094 z13 tiles; it now misses 12 and 28, with the same per-zoom
   feature counts. Any budgeted output changes, the default included.
 - `--generate-variable-depth-tile-pyramid` takes `--max-tile-size 0`, and so
   `--preset tippecanoe`, which sets it (#849). It used to refuse them, naming
