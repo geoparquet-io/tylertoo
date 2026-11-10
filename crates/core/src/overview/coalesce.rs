@@ -998,6 +998,11 @@ fn join_pieces<'a>(
                 // borrowed run never has to be cloned just to be flipped.
                 append_run(&mut coords, &p.coords, seg_entry == 1);
             }
+            // Runs of repeated vertices dedupe away: give back an upper
+            // bound that overshot by more than one joint per piece.
+            if coords.capacity() - coords.len() > walk.len() {
+                coords.shrink_to_fit();
+            }
             Piece {
                 members: Cow::Owned(members),
                 coords: Cow::Owned(coords),
@@ -1488,6 +1493,36 @@ mod tests {
             vec![(0.0, 0.0), (100.0, 0.0), (200.0, 0.0)],
             "shared node vertex deduplicated"
         );
+    }
+
+    /// A run of repeated vertices dedupes away in the merge; the merged
+    /// coords must not keep the pre-dedupe length as spare capacity.
+    #[test]
+    fn a_merged_run_does_not_keep_deduped_vertices_as_capacity() {
+        let c = |x: f64| Coord { x, y: 0.0 };
+        let mut a = vec![c(0.0); 10_000];
+        a.push(c(100.0));
+        let pieces = vec![
+            Piece {
+                members: Cow::Owned(vec![0]),
+                coords: Cow::Owned(a),
+                group: 0,
+                src: MERGED,
+            },
+            Piece {
+                members: Cow::Owned(vec![1]),
+                coords: Cow::Owned(vec![c(100.0), c(200.0)]),
+                group: 0,
+                src: MERGED,
+            },
+        ];
+        let out = join_pieces(pieces, |g, p| (g, p.x as i64, p.y as i64), 180.0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].coords.len(), 3);
+        let Cow::Owned(coords) = &out[0].coords else {
+            panic!("a merge owns its coords")
+        };
+        assert!(coords.capacity() <= 3 + 2, "capacity {}", coords.capacity());
     }
 
     #[test]
@@ -2490,7 +2525,9 @@ mod chain_stage_cost_tests {
             drop(profiler);
             (peak, chains)
         });
-        let pieces = STRANDS * SEGMENTS / 2;
+        // Per strand, segments 0 and 9 stay single and 1-8 pair up: 6.
+        let pieces = exact.pieces.len();
+        assert_eq!(pieces, STRANDS * 6);
         eprintln!(
             "level chain stage peak: {peak} B, {} B per exact piece; {chains} chains",
             peak / pieces
@@ -2504,6 +2541,6 @@ mod chain_stage_cost_tests {
     }
 
     /// Bytes per exact-join piece one level's chain stage may hold at once.
-    /// Measured 196 B after #851 (284 B before it).
-    const PEAK_BYTES_PER_PIECE: usize = 210;
+    /// Measured 163 B after #851 (237 B before it).
+    const PEAK_BYTES_PER_PIECE: usize = 175;
 }
