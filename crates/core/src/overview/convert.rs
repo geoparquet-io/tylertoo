@@ -4242,7 +4242,7 @@ use crate::tile::WEBMERC_HALF_M;
 /// clamped to [`crate::tile::MAX_LATITUDE`], the edge of the square
 /// world extent (the projection itself diverges at the poles).
 #[inline]
-fn lnglat_to_webmerc(lng: f64, lat: f64) -> (f64, f64) {
+pub(crate) fn lnglat_to_webmerc(lng: f64, lat: f64) -> (f64, f64) {
     use crate::tile::MAX_LATITUDE;
     use std::f64::consts::{FRAC_PI_4, PI};
     let x = lng / 180.0 * WEBMERC_HALF_M;
