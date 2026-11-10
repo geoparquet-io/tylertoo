@@ -3642,12 +3642,16 @@ fn export_level_group(
                     .chunks(level.plan.wave.max(1))
                     .nth(w)
                     .unwrap_or_default();
-                // Admitted before a level's store fills, so the fill waits
-                // until the waves still encoding and this one fit the cap:
-                // the store's grant plus one wave, as in the serial loop.
+                let fills = w == 0 && multi_wave && store.is_none() && level.level_read.is_some();
+                if fills {
+                    // The store's grant is sized beside this level's widest
+                    // wave only, so it fills once every earlier wave is
+                    // encoded: the grant plus one wave, as in the serial loop.
+                    drop(in_flight.wait_for(|held| held == 0));
+                }
                 let held = in_flight.admit(wave.iter().map(|p| p.members).sum());
                 let start = Instant::now();
-                if w == 0 && multi_wave && store.is_none() {
+                if fills {
                     if let Some(read) = level.level_read {
                         let (backing, g) = level_read_backing(read, level.plan, budget);
                         grants = g;
