@@ -305,6 +305,12 @@ Tile bodies match a single-machine run byte for byte, as checked by
 directory layout and tile order, and lacks tilestats. Generate tilestats
 from it if a consumer needs them.
 
+One known exception: a line or polygon tile over its size cap, under the
+default `--size-valve merge`, can differ when a shard skips input row groups.
+The valve picks merge partners by each row's gap to the previous row of the
+overview, and a shard's overview holds fewer rows. Pass `--size-valve drop`
+to every job, or raise the caps, when the fleet must match exactly.
+
 ### A Slurm fleet
 
 Submit the coarse job, then the shards as an array job that waits for it:

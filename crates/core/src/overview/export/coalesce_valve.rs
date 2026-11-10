@@ -29,6 +29,11 @@
 //!   ([`GAP_NONE`]). Export reads whole row groups, but which row groups a
 //!   partition reads depends on the partition, so a predecessor across a
 //!   row-group boundary would make the output depend on partitioning.
+//!   shortcut: a data shard writes its own overview, holding only the rows
+//!   of the input groups it read, under prorated row-group sizes, so its
+//!   predecessors and the merges in an over-cap tile can differ from a
+//!   single-machine build; make the gap shard-independent (a dataset-global
+//!   predecessor) when sharded merge-valve output must match exactly.
 //!   Tippecanoe measures against the previous feature in its global index.
 //! - Members merge only within their own level band. In partitioning mode a
 //!   tile holds several bands, each in its own spatial order, so the row
