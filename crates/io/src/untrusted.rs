@@ -815,25 +815,178 @@ fn decoded_limit(offset_limit: u64) -> u64 {
     (64 << 20).min(offset_limit.saturating_mul(2))
 }
 
-/// Rows that can be joined without undoing a reader's memory/offset split.
+/// Rows the next delivered batch takes from the row stream `batches`: the
+/// most, up to `max_rows` and at least one, whose [`rows_bytes`] fit the
+/// byte bound.
 ///
-/// Buffer sizes deliberately overestimate slices and dictionaries. Returning
-/// the first batch unchanged always preserves the reader's existing bound.
+/// The one batch-cutting rule for every reader and the parallel read's
+/// regrouping (#858). It depends only on the rows, not on how they are split
+/// into `batches` or which representation holds them, so a part read by one
+/// reader or by several merged back is cut into the same batches.
 pub fn concat_prefix_rows<'a>(
     batches: impl IntoIterator<Item = &'a RecordBatch>,
+    max_rows: usize,
     limit: u64,
 ) -> usize {
-    let mut bytes = 0u64;
-    let mut rows = 0usize;
+    let bound = limit.min(decoded_limit(limit));
+    let max_rows = max_rows.max(1);
+    let (mut rows, mut bytes) = (0usize, 0u64);
     for batch in batches {
-        let next = bytes.saturating_add(batch.get_array_memory_size() as u64);
-        if rows > 0 && next > limit.min(decoded_limit(limit)) {
-            break;
+        let room = batch.num_rows().min(max_rows - rows);
+        let cost = |n: usize| {
+            batch.columns().iter().fold(bytes, |b, column| {
+                b.saturating_add(rows_bytes(column.as_ref(), 0, n))
+            })
+        };
+        let all = cost(room);
+        if all <= bound {
+            (rows, bytes) = (rows + room, all);
+            if rows == max_rows {
+                break;
+            }
+            continue;
         }
-        bytes = next;
-        rows = rows.saturating_add(batch.num_rows());
+        // Row costs are positive, so prefix costs are monotone.
+        let (mut lo, mut hi) = (0, room);
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if cost(mid) <= bound {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        rows += lo;
+        break;
     }
-    rows
+    rows.max(1)
+}
+
+/// Bytes rows `start..end` of `array` hold, summed row by row: byte payloads
+/// in full (as a dictionary would expand them), 16 bytes of view or offset
+/// per value, 8 per list and each fixed-width value's width (#858). The same
+/// rows cost the same in any batch, and in the decoded views a reader holds
+/// as in the input's own types after the cast back.
+fn rows_bytes(array: &dyn arrow_array::Array, start: usize, end: usize) -> u64 {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+    let n = (end - start) as u64;
+    let payload = |from: i64, to: i64| n.saturating_mul(16).saturating_add((to - from) as u64);
+    // A view's low 32 bits are its value's length.
+    let views = |v: &[u128]| {
+        v.iter().fold(n.saturating_mul(16), |b, v| {
+            b.saturating_add(u64::from(*v as u32))
+        })
+    };
+    match array.data_type() {
+        DataType::Utf8 => {
+            let o = array.as_string::<i32>().value_offsets();
+            payload(i64::from(o[start]), i64::from(o[end]))
+        }
+        DataType::Binary => {
+            let o = array.as_binary::<i32>().value_offsets();
+            payload(i64::from(o[start]), i64::from(o[end]))
+        }
+        DataType::LargeUtf8 => {
+            let o = array.as_string::<i64>().value_offsets();
+            payload(o[start], o[end])
+        }
+        DataType::LargeBinary => {
+            let o = array.as_binary::<i64>().value_offsets();
+            payload(o[start], o[end])
+        }
+        DataType::Utf8View => views(&array.as_string_view().views()[start..end]),
+        DataType::BinaryView => views(&array.as_binary_view().views()[start..end]),
+        DataType::List(_) => {
+            let a = array.as_list::<i32>();
+            let o = a.value_offsets();
+            n.saturating_mul(8).saturating_add(rows_bytes(
+                a.values().as_ref(),
+                o[start] as usize,
+                o[end] as usize,
+            ))
+        }
+        DataType::LargeList(_) => {
+            let a = array.as_list::<i64>();
+            let o = a.value_offsets();
+            n.saturating_mul(8).saturating_add(rows_bytes(
+                a.values().as_ref(),
+                o[start] as usize,
+                o[end] as usize,
+            ))
+        }
+        DataType::Map(_, _) => {
+            let a = array.as_map();
+            let o = a.value_offsets();
+            n.saturating_mul(8).saturating_add(rows_bytes(
+                a.entries(),
+                o[start] as usize,
+                o[end] as usize,
+            ))
+        }
+        DataType::FixedSizeList(_, k) => {
+            let k = *k as usize;
+            rows_bytes(
+                array.as_fixed_size_list().values().as_ref(),
+                start * k,
+                end * k,
+            )
+        }
+        DataType::Struct(_) => array.as_struct().columns().iter().fold(0, |b, c| {
+            b.saturating_add(rows_bytes(c.as_ref(), start, end))
+        }),
+        DataType::Dictionary(_, value) => {
+            let d = array.as_any_dictionary();
+            let keys = d.normalized_keys();
+            (start..end).fold(0, |b, i| {
+                b.saturating_add(if d.keys().is_null(i) {
+                    null_bytes(value)
+                } else {
+                    rows_bytes(d.values().as_ref(), keys[i], keys[i] + 1)
+                })
+            })
+        }
+        DataType::Union(_, _) => {
+            let u = array.as_union();
+            (start..end).fold(0, |b, i| {
+                let at = u.value_offset(i);
+                b.saturating_add(8).saturating_add(rows_bytes(
+                    u.child(u.type_id(i)).as_ref(),
+                    at,
+                    at + 1,
+                ))
+            })
+        }
+        DataType::Boolean => n,
+        DataType::Null => 0,
+        DataType::FixedSizeBinary(w) => n.saturating_mul(*w as u64),
+        other => n.saturating_mul(other.primitive_width().unwrap_or(16) as u64),
+    }
+}
+
+/// [`rows_bytes`] of one null value of `data_type`, as a decoded view holds
+/// it: what a null dictionary key expands to.
+fn null_bytes(data_type: &arrow_schema::DataType) -> u64 {
+    use arrow_schema::DataType;
+    match data_type {
+        DataType::Utf8
+        | DataType::Binary
+        | DataType::LargeUtf8
+        | DataType::LargeBinary
+        | DataType::Utf8View
+        | DataType::BinaryView => 16,
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => 8,
+        DataType::FixedSizeList(f, k) => null_bytes(f.data_type()).saturating_mul(*k as u64),
+        DataType::Struct(fields) => fields
+            .iter()
+            .fold(0, |b, f| b.saturating_add(null_bytes(f.data_type()))),
+        DataType::Dictionary(_, value) => null_bytes(value),
+        DataType::Union(_, _) => 8,
+        DataType::Boolean => 1,
+        DataType::Null => 0,
+        DataType::FixedSizeBinary(w) => *w as u64,
+        other => other.primitive_width().unwrap_or(16) as u64,
+    }
 }
 
 fn scaled_ceiling() -> Option<u64> {
@@ -1575,7 +1728,6 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
             page_eof,
             schema,
             done: false,
-            pending: None,
             joined: None,
             join_rows,
             limit,
@@ -1599,8 +1751,7 @@ pub struct UntrustedBatchReader {
     page_eof: Arc<AtomicBool>,
     done: bool,
     schema: SchemaRef,
-    pending: Option<RecordBatch>,
-    /// A decoded batch that did not fit the last join ([`join_decoded`]).
+    /// The decoded rows past the last cut, first in the next ([`join_decoded`]).
     joined: Option<RecordBatch>,
     /// Rows a yielded batch may join up to (#848).
     join_rows: usize,
@@ -1633,30 +1784,20 @@ impl Iterator for UntrustedBatchReader {
         let schema = self.schema.clone();
         let limit = self.limit;
         let item = guard("parquet page", || {
-            let from_pending = self.pending.is_some();
-            let batch = match self.pending.take() {
-                Some(batch) => batch,
-                None => {
-                    match join_decoded(&mut self.inner, &mut self.joined, self.join_rows, limit)? {
-                        Ok(batch) => batch,
-                        Err(_) if self.page_eof.load(Ordering::Relaxed) => {
-                            return Some(Err(ArrowError::ExternalError(Box::new(
-                                InputError::HostilePageHeader,
-                            ))));
-                        }
-                        Err(e) => return Some(Err(e)),
+            let (batch, compact) =
+                match join_decoded(&mut self.inner, &mut self.joined, self.join_rows, limit)? {
+                    Ok(cut) => cut,
+                    Err(_) if self.page_eof.load(Ordering::Relaxed) => {
+                        return Some(Err(ArrowError::ExternalError(Box::new(
+                            InputError::HostilePageHeader,
+                        ))));
                     }
-                }
-            };
-            let fits = |rows| {
-                let prefix = batch.slice(0, rows);
-                batch_overflow(&prefix, &schema, limit).is_none()
-                    && expanded_batch_bytes(&prefix) <= decoded_limit(limit)
-            };
-            let rows = if fits(batch.num_rows()) {
-                batch.num_rows()
-            } else {
-                if let Some((column, bytes)) = batch_overflow(&batch.slice(0, 1), &schema, limit) {
+                    Err(e) => return Some(Err(e)),
+                };
+            // The cut keeps every batch of two or more rows under both
+            // ceilings; a row that alone passes one is refused.
+            if batch.num_rows() == 1 {
+                if let Some((column, bytes)) = batch_overflow(&batch, &schema, limit) {
                     return Some(Err(ArrowError::ExternalError(Box::new(
                         InputError::ByteArrayRowTooLarge {
                             column,
@@ -1665,7 +1806,7 @@ impl Iterator for UntrustedBatchReader {
                         },
                     ))));
                 }
-                let bytes = expanded_batch_bytes(&batch.slice(0, 1));
+                let bytes = expanded_batch_bytes(&batch);
                 if bytes > decoded_limit(limit) {
                     return Some(Err(ArrowError::ExternalError(Box::new(
                         InputError::DecodedRowTooLarge {
@@ -1674,23 +1815,8 @@ impl Iterator for UntrustedBatchReader {
                         },
                     ))));
                 }
-                // Prefix byte counts are monotone, including addressed nested children.
-                let (mut lo, mut hi) = (1, batch.num_rows());
-                while lo + 1 < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    if fits(mid) {
-                        lo = mid;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                lo
-            };
-            let compact = from_pending || rows < batch.num_rows();
-            if rows < batch.num_rows() {
-                self.pending = Some(batch.slice(rows, batch.num_rows() - rows));
             }
-            let batch = batch.slice(0, rows);
+            let rows = batch.num_rows();
             // Compact addressed nested children before the bounded cast.
             // Views still share dictionary/page payloads at this point.
             let indices =
@@ -1717,22 +1843,25 @@ impl Iterator for UntrustedBatchReader {
     }
 }
 
-/// The inner reader's next decoded batch, joined with the ones after it up
-/// to `rows` rows while their expanded bytes stay under both ceilings (#848).
-/// A decode held to one row because a footer cannot place its list values
-/// must not reach the reader's split, cast and caller one row at a time.
-/// `carry` holds the batch that did not fit, first in the next join.
+/// The next batch of the decoded row stream, cut by [`concat_prefix_rows`]
+/// to at most `rows` rows (#848, #858), and whether it is a slice of a
+/// decoded batch. Batches are decoded until the cut is known: `rows` rows
+/// held, or the byte bound passed. The rows past the cut are carried to the
+/// next call in `carry`. A list-heavy file decoded one row at a time is thus
+/// yielded in full batches, and a part is cut into the same batches whatever
+/// the decode size or wherever a reader started in it.
 #[expect(
     clippy::disallowed_methods,
-    reason = "#848: joins decoded batches whose expanded bytes fit both ceilings"
+    reason = "#848: joins decoded batches up to concat_prefix_rows' cut"
 )]
 fn join_decoded(
     inner: &mut ParquetRecordBatchReader,
     carry: &mut Option<RecordBatch>,
     rows: usize,
     limit: u64,
-) -> Option<Result<RecordBatch, ArrowError>> {
+) -> Option<Result<(RecordBatch, bool), ArrowError>> {
     let bound = limit.min(decoded_limit(limit));
+    let carried = carry.is_some();
     let first = match carry.take() {
         Some(batch) => batch,
         None => match inner.next()? {
@@ -1740,46 +1869,55 @@ fn join_decoded(
             Err(e) => return Some(Err(e)),
         },
     };
+    let cost = |b: &RecordBatch| {
+        b.columns().iter().fold(0u64, |n, c| {
+            n.saturating_add(rows_bytes(c.as_ref(), 0, b.num_rows()))
+        })
+    };
     let schema = first.schema();
-    let (mut held, mut bytes) = (first.num_rows(), expanded_batch_bytes(&first));
-    // Joined JOIN_CHUNK at a time: an unjoined one-row batch holds the
-    // schema's whole fixed Arrow overhead.
-    let (mut chunks, mut parts) = (Vec::new(), vec![first]);
-    // A piece already at the bound is yielded alone, so the reader's split
-    // can refuse an oversized row before another one is decoded.
-    while held < rows && bytes < bound {
+    let (mut held, mut bytes) = (first.num_rows(), cost(&first));
+    let mut parts = vec![first];
+    // Past the bound the cut is known: the row after an oversized one is not
+    // decoded before the reader refuses it.
+    while held < rows && bytes <= bound {
         let batch = match inner.next() {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => return Some(Err(e)),
             None => break,
         };
-        // Fill exactly `rows`, as the parallel read's regrouping does, so
-        // both deliver the same batches; the rest of the piece is carried.
-        let room = batch.num_rows().min(rows - held);
-        let more = expanded_batch_bytes(&batch.slice(0, room));
-        if bytes.saturating_add(more) > bound {
-            *carry = Some(batch);
-            break;
-        }
-        if room < batch.num_rows() {
-            *carry = Some(batch.slice(room, batch.num_rows() - room));
-        }
-        held += room;
-        bytes = bytes.saturating_add(more);
-        parts.push(batch.slice(0, room));
-        if parts.len() == JOIN_CHUNK {
-            match arrow_select::concat::concat_batches(&schema, &parts) {
-                Ok(chunk) => chunks.push(chunk),
-                Err(e) => return Some(Err(e)),
-            }
-            parts.clear();
-        }
+        held += batch.num_rows();
+        bytes = bytes.saturating_add(cost(&batch));
+        parts.push(batch);
     }
-    chunks.append(&mut parts);
-    if chunks.len() == 1 {
-        return chunks.pop().map(Ok);
+    // Every part before the last fits, so the cut falls in the last.
+    let cut = concat_prefix_rows(&parts, rows, limit);
+    let last = parts.pop()?;
+    let keep = cut - (held - last.num_rows());
+    if keep < last.num_rows() {
+        *carry = Some(last.slice(keep, last.num_rows() - keep));
     }
-    Some(arrow_select::concat::concat_batches(&schema, &chunks))
+    if parts.is_empty() {
+        let sliced = carried || keep < last.num_rows();
+        return Some(Ok((last.slice(0, keep), sliced)));
+    }
+    parts.push(last.slice(0, keep));
+    // Joined JOIN_CHUNK at a time: an unjoined one-row batch holds the
+    // schema's whole fixed Arrow overhead.
+    let chunks = parts
+        .chunks(JOIN_CHUNK)
+        .map(|chunk| arrow_select::concat::concat_batches(&schema, chunk))
+        .collect::<Result<Vec<_>, _>>();
+    Some(chunks.and_then(|mut chunks| match chunks.pop() {
+        Some(only) if chunks.is_empty() => Ok((only, false)),
+        Some(tail) => {
+            chunks.push(tail);
+            Ok((
+                arrow_select::concat::concat_batches(&schema, &chunks)?,
+                false,
+            ))
+        }
+        None => Ok((RecordBatch::new_empty(schema.clone()), false)),
+    }))
 }
 
 /// Decoded batches [`join_decoded`] joins at once.
@@ -2133,8 +2271,13 @@ mod tests {
         let mut carry = None;
         let mut sizes = Vec::new();
         while let Some(batch) = join_decoded(&mut inner, &mut carry, 1_000, limit) {
-            let batch = batch.unwrap();
-            assert!(batch.num_rows() == 1 || expanded_batch_bytes(&batch) <= limit);
+            let (batch, _) = batch.unwrap();
+            let cost: u64 = batch
+                .columns()
+                .iter()
+                .map(|c| rows_bytes(c.as_ref(), 0, batch.num_rows()))
+                .sum();
+            assert!(batch.num_rows() == 1 || cost <= limit);
             if sizes.len() < 3 {
                 assert!(carry.is_none(), "decoded past an oversized row");
             }
@@ -2240,7 +2383,7 @@ mod tests {
         let mut ids = Vec::new();
         let mut sizes = Vec::new();
         while let Some(batch) = join_decoded(&mut inner, &mut carry, 8, 100_000) {
-            let batch = batch.unwrap();
+            let (batch, _) = batch.unwrap();
             sizes.push(batch.num_rows());
             ids.extend(
                 batch

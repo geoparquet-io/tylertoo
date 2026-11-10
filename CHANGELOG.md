@@ -93,6 +93,10 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one-row batch kept about 260 KB of Arrow overhead per buffered output row,
   so `tiles` on a 38 MB extract passed 118 GB and was OOM-killed. It now
   peaks at 1.5 GB in 23 s (#848).
+- A read whose batches hit the decode byte bound is cut into the same
+  batches by one reader or by several (`--read-workers`): one row-by-row
+  byte rule cuts both, so the intermediate overview file no longer depends
+  on the worker count there (#858).
 - A crafted Parquet footer with an overlong varint, or a page header that
   skips past the end of the file, is refused instead of allocating gigabytes
   or spinning for minutes (#789).

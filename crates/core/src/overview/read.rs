@@ -687,7 +687,9 @@ where
                     Ok(SegMsg::Batch(batch, read_dur)) => {
                         pending_read += read_dur;
                         regroup.push(batch);
-                        while regroup.rows >= batch_size || regroup.bounded_rows() < regroup.rows {
+                        while regroup.rows >= batch_size
+                            || regroup.bounded_rows(batch_size) < regroup.rows
+                        {
                             let out = regroup.take(batch_size.min(regroup.rows))?;
                             if matches!(
                                 deliver(out, &mut row_offset, &mut pending_read, on_batch)?,
@@ -801,8 +803,10 @@ impl Default for Regrouper {
 }
 
 impl Regrouper {
-    fn bounded_rows(&self) -> usize {
-        tylertoo_io::concat_prefix_rows(&self.queue, self.limit)
+    /// The I/O owner's cut of the queued rows (#858): the same rule the
+    /// sequential reader cuts by, so the merge delivers its batches.
+    fn bounded_rows(&self, max: usize) -> usize {
+        tylertoo_io::concat_prefix_rows(&self.queue, max, self.limit)
     }
     fn push(&mut self, batch: RecordBatch) {
         if batch.num_rows() > 0 {
@@ -819,7 +823,7 @@ impl Regrouper {
     )] // #779: seam joins (#494)
     fn take(&mut self, n: usize) -> Result<RecordBatch, ConvertError> {
         debug_assert!(n > 0 && n <= self.rows);
-        let n = n.min(self.bounded_rows());
+        let n = self.bounded_rows(n);
         let front = self
             .queue
             .front()
@@ -916,28 +920,22 @@ mod read_tests {
                 .unwrap(),
             );
         }
-        let batch = regroup.take(100).unwrap();
-        let array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert!(
-            *array.value_offsets().last().unwrap() <= 1000,
-            "parallel regrouping reconstructed an oversized column"
-        );
-        assert_eq!(batch.num_rows(), 50);
-        let tail = regroup.take_all().unwrap().unwrap();
-        assert_eq!(tail.num_rows(), 50);
-        assert_eq!(
-            tail.column(0)
+        // A 600-byte row costs 616 bytes and an empty one 16 under a
+        // 1000-byte bound: every cut holds 25 rows.
+        let mut sizes = Vec::new();
+        while let Some(batch) = regroup.take_all().unwrap() {
+            let array = batch
+                .column(0)
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(0),
-            "y".repeat(600)
-        );
-        assert!(regroup.take_all().unwrap().is_none());
+                .unwrap();
+            assert!(
+                *array.value_offsets().last().unwrap() <= 1000,
+                "parallel regrouping reconstructed an oversized column"
+            );
+            sizes.push(batch.num_rows());
+        }
+        assert_eq!(sizes, [25, 25, 25, 25]);
     }
 
     fn schema() -> Arc<Schema> {
@@ -1120,6 +1118,77 @@ mod read_tests {
         )
         .unwrap();
         (counts, ids, offsets)
+    }
+
+    /// #858: the contract once the byte bound cuts batches before the batch
+    /// size. List-heavy rows (25 Int64 values each, 1,000-row groups) decode
+    /// one row at a time and cost 216 bytes, so the 16 KiB scaled ceiling cuts
+    /// every batch near 75 rows of the 128 asked for. Sequential joins and the
+    /// parallel regrouping must cut the same rows. The ceiling is process
+    /// environment, so the read runs in a child.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn parallel_reads_reproduce_byte_cut_batches() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        const CHILD: &str = "TYLERTOO_858_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let (_, module) = module_path!().split_once("::").expect("crate::module path");
+            let name = format!("{module}::parallel_reads_reproduce_byte_cut_batches");
+            let out =
+                std::process::Command::new(std::env::current_exe().expect("test binary path"))
+                    .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                    .env(CHILD, "1")
+                    .env("TYLERTOO_BYTE_ARRAY_LIMIT_BYTES", "16384")
+                    .output()
+                    .expect("re-run the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{name} failed in its own process:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.parquet");
+        let rows = 6_000_i64;
+        let mut lists = ListBuilder::new(Int64Builder::new());
+        for i in 0..rows {
+            lists.values().append_slice(&[i; 25]);
+            lists.append(true);
+        }
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(0..rows)) as ArrayRef,
+            ),
+            ("tags", Arc::new(lists.finish()) as ArrayRef),
+        ])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1_000))
+            .build();
+        let mut w = ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+            .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        let reference = read_all(&source, 128, 1, None);
+        assert_eq!(reference.0.iter().sum::<usize>(), 6_000);
+        assert!(
+            reference.0.iter().all(|&n| n < 128),
+            "the byte bound must cut every batch: {:?}",
+            reference.0
+        );
+        for workers in [2usize, 3, 4] {
+            let got = read_all(&source, 128, workers, None);
+            assert!(last_read_workers() > 1, "the fixture must read in parallel");
+            assert_eq!(
+                got.0, reference.0,
+                "--read-workers {workers} must cut the same batches as a single reader"
+            );
+            assert_eq!(got, reference);
+        }
     }
 
     /// The whole contract in one assertion: for a batch size that does NOT
