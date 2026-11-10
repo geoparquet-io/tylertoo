@@ -9,7 +9,8 @@ use std::sync::Arc;
 /// Answers `HEAD` (size) and ranged/full `GET`
 /// exactly as `object_store`'s HTTP store expects, at any path. With
 /// `required_query` set, a request whose query string is not exactly that
-/// gets `403 Forbidden`, as a presigned or SAS URL's host does (#820).
+/// gets `403 Forbidden`, and so does any `HEAD`: an S3 or GCS presigned URL
+/// signs one method, GET, and its host refuses the rest (#820).
 ///
 /// Returns the base URL (`http://127.0.0.1:PORT`); the accept loop runs on a
 /// detached thread until the test process exits. Binding happens before
@@ -52,7 +53,7 @@ fn serve_connection(mut stream: std::net::TcpStream, body: &[u8], required: Opti
         }
         let query = parts.next().and_then(|t| t.split_once('?')).map(|(_, q)| q);
         let range = read_range_header(&mut reader, body.len() as u64);
-        let response = if required.is_some_and(|r| query != Some(r)) {
+        let response = if required.is_some_and(|r| query != Some(r) || method == "HEAD") {
             b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec()
         } else {
             respond(&method, range, body)

@@ -15173,6 +15173,9 @@ mod tests {
                 Some(query),
             );
 
+            // Unsigned first: it caches the host's plain store, which the
+            // signed URL must not reuse.
+            assert!(InputSource::from_str_input(&format!("{base}/in.parquet")).is_err());
             let source = InputSource::from_str_input(&format!("{base}/in.parquet?{query}"))
                 .expect("the HEAD must carry the query");
             assert!(!source.display_name().contains("SECRET820"));
