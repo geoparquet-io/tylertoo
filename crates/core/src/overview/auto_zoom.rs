@@ -547,17 +547,21 @@ impl GeoArrowVisitor for SampledBboxes<'_> {
                             index: i,
                             message: e.to_string(),
                         })?;
-                Ok(item.and_then(|g| {
-                    let mut acc = BboxAcc::new();
-                    acc.add_geometry(&g);
-                    let bbox = acc.finish()?;
-                    match self.mask {
-                        Some(m) if !m.may_hit(&bbox) => None,
-                        Some(m) => g
-                            .try_to_geometry()
+                Ok(item.and_then(|g| match self.mask {
+                    // Conversion's own row check, so a row it skips is
+                    // skipped here too.
+                    Some(m) => {
+                        let (_, bbox) = super::convert::scan_feature_traits(&g)?;
+                        m.may_hit(&bbox)
+                            .then(|| g.try_to_geometry())
+                            .flatten()
                             .filter(|geom| m.intersects(geom, &bbox))
-                            .map(|_| bbox),
-                        None => Some(bbox),
+                            .map(|_| bbox)
+                    }
+                    None => {
+                        let mut acc = BboxAcc::new();
+                        acc.add_geometry(&g);
+                        acc.finish()
                     }
                 }))
             })

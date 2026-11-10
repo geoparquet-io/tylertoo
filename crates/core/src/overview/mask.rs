@@ -137,9 +137,12 @@ fn read(source: &MaskSource) -> Result<LoadedMask, ConfigError> {
 /// unreadable file.
 pub(crate) fn content_hash(source: &MaskSource) -> Option<u64> {
     match source {
-        MaskSource::Path(p) => std::fs::read(p)
-            .ok()
-            .map(|b| xxhash_rust::xxh3::xxh3_64(&b)),
+        // Checked first: opening a pipe or a directory must not block or
+        // fail before `read` names the problem.
+        MaskSource::Path(p) if !p.is_file() => None,
+        MaskSource::Path(p) => std::fs::File::open(p)
+            .and_then(super::plan_state::hash_payload)
+            .ok(),
         MaskSource::Wkb(b) => Some(xxhash_rust::xxh3::xxh3_64(b)),
     }
 }
@@ -671,6 +674,32 @@ mod tests {
             let err = load(&MaskSource::Path(path)).unwrap_err().to_string();
             assert!(err.contains("empty or non-finite"), "{err}");
         }
+    }
+
+    /// The load cache keys on content: an edit that keeps the length and
+    /// the modification time is still seen.
+    #[test]
+    fn the_load_cache_sees_an_edit_that_keeps_size_and_mtime() {
+        let (_d, path) = write(
+            "m.geojson",
+            r#"{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}"#,
+        );
+        let source = MaskSource::Path(path.clone());
+        let first = load(&source).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(
+            &path,
+            r#"{"type":"Polygon","coordinates":[[[0,0],[2,0],[2,2],[0,0]]]}"#,
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let second = load(&source).unwrap();
+        assert_ne!(first.polygons, second.polygons);
     }
 
     #[test]
