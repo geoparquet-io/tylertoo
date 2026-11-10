@@ -3656,6 +3656,9 @@ pub(crate) fn run_stages(
         selected_row_groups.as_ref(),
         0..descriptor.schema().fields().len(),
     )?;
+    // Every output row also carries the generated category counts (#827).
+    let footer = footer
+        .map(|f| f.with_generated_int64_columns(cluster_categories.as_ref().map_or(0, Vec::len)));
     let row_bytes = footer.map(|f| f.row_bytes);
 
     // Planned levels with no winners are omitted (§7.3, #211 auto-clamp);

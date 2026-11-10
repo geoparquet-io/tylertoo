@@ -196,6 +196,23 @@ pub(super) struct FooterPrice {
     pub(super) group_rows: u64,
 }
 
+impl FooterPrice {
+    /// Add `n` INT64 columns the output generates rather than reads (the
+    /// `--cluster-categories` counts, #827): 8 value bytes per column per
+    /// row plus its validity bit. Pass 2 prices its window, encodes and
+    /// spill from this one figure, so they all see the generated columns.
+    pub(super) fn with_generated_int64_columns(self, n: usize) -> Self {
+        let n = n as u64;
+        Self {
+            row_bytes: self
+                .row_bytes
+                .saturating_add(n.saturating_mul(8))
+                .saturating_add(n.div_ceil(8)),
+            ..self
+        }
+    }
+}
+
 /// Decoded bytes per row over `columns` of the selected row groups, from the
 /// footers: each column's uncompressed size, or its unencoded byte-array
 /// size when larger ([`ConvertSource::selected_column_bytes`]), times
@@ -861,6 +878,23 @@ mod read_tests {
     use arrow_schema::{DataType, Field, Schema};
     use std::fs::File;
     use std::sync::Arc;
+
+    /// #846 review: the 101 `--cluster-categories` count columns cost 8 B
+    /// each plus a validity bit per output row, and the pass-2 window price
+    /// carries them.
+    #[test]
+    fn generated_count_columns_are_priced() {
+        let footer = FooterPrice {
+            row_bytes: 100,
+            group_rows: 1,
+        };
+        assert_eq!(footer.with_generated_int64_columns(0).row_bytes, 100);
+        let priced = footer.with_generated_int64_columns(101);
+        assert_eq!(priced.row_bytes, 100 + 101 * 8 + 13);
+        let budget = super::super::memory::MemoryBudget::with_available(None);
+        let window = budget.window_price(8192, Some(priced.row_bytes), 1.0, 13, None);
+        assert_eq!(window.bytes, 8192 * 2 * 921);
+    }
     use tylertoo_io::test_support::ArrowWriter;
     use tylertoo_io::test_support::WriterProperties;
 

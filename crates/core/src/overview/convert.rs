@@ -6152,8 +6152,8 @@ fn category_count_columns(
     global_indices: &[usize],
     table: Option<&HashMap<usize, ClusterEntry>>,
 ) -> Vec<Arc<dyn Array>> {
+    use arrow_array::builder::Int64Builder;
     use arrow_array::cast::AsArray;
-    use arrow_array::Int64Array;
 
     let prefix = format!("{}:", batch.schema().field(col).name());
     let slot_of: HashMap<&str, usize> = slot_fields
@@ -6174,25 +6174,39 @@ fn category_count_columns(
             _ => None,
         }
     };
-    let mut counts = vec![vec![None; global_indices.len()]; slot_fields.len()];
+    // One builder per slot, appended row by row: no `Option<i64>` staging
+    // copy of every column (review: 16 B/row/slot on top of the arrays).
+    let mut builders: Vec<Int64Builder> = slot_fields
+        .iter()
+        .map(|_| Int64Builder::with_capacity(global_indices.len()))
+        .collect();
+    let mut singleton = [(0u32, 1i64)];
     for (row, g) in global_indices.iter().enumerate() {
-        match table.and_then(|t| t.get(g)) {
-            Some(e) if !e.categories.as_slice().is_empty() => {
-                for &(slot, n) in e.categories.as_slice() {
-                    counts[slot as usize][row] = Some(n);
+        let counts: &[(u32, i64)] = match table.and_then(|t| t.get(g)) {
+            Some(e) if !e.categories.as_slice().is_empty() => e.categories.as_slice(),
+            _ => match value_at(row)
+                .and_then(|v| slot_of.get(v).copied())
+                .or(other)
+            {
+                Some(slot) => {
+                    singleton[0].0 = slot as u32;
+                    &singleton
                 }
-            }
-            _ => {
-                let slot = value_at(row).and_then(|v| slot_of.get(v).copied());
-                if let Some(slot) = slot.or(other) {
-                    counts[slot][row] = Some(1);
-                }
+                None => &[],
+            },
+        };
+        // `counts` is sorted by slot, so one pass pairs it with the builders.
+        let mut next = counts.iter().peekable();
+        for (slot, b) in builders.iter_mut().enumerate() {
+            match next.next_if(|&&(s, _)| s as usize == slot) {
+                Some(&(_, n)) => b.append_value(n),
+                None => b.append_null(),
             }
         }
     }
-    counts
+    builders
         .into_iter()
-        .map(|c| Arc::new(Int64Array::from(c)) as Arc<dyn Array>)
+        .map(|mut b| Arc::new(b.finish()) as Arc<dyn Array>)
         .collect()
 }
 

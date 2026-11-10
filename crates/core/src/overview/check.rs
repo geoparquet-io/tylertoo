@@ -866,9 +866,20 @@ fn category_sum_mismatch(
         .collect::<Result<Vec<_>, String>>()?;
     for row in 0..batch.num_rows() {
         let mut sum = 0i64;
-        for col in columns.iter().filter(|c| c.is_valid(row)) {
+        for (name, col) in category_columns.iter().zip(&columns) {
+            if !col.is_valid(row) {
+                continue;
+            }
+            let n = col.value(row);
+            // Counts are member tallies: a negative one could cancel another out.
+            if n < 0 {
+                return Ok(Some(format!(
+                    "level {}: a row's category count {name:?} is {n}, but counts are never negative",
+                    levels.value(row)
+                )));
+            }
             sum = sum
-                .checked_add(col.value(row))
+                .checked_add(n)
                 .ok_or("category counts overflow i64 (hostile counts)")?;
         }
         if sum != counts.value(row) {
@@ -2208,6 +2219,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(none.contains("sum to 0 but its point_count is 3"), "{none}");
+        // Review: negative counts that cancel out must not pass.
+        let cancel = RecordBatch::try_from_iter([
+            ("c:a", Arc::new(Int64Array::from(vec![2])) as _),
+            ("c:b", Arc::new(Int64Array::from(vec![-1])) as _),
+        ])
+        .unwrap();
+        let msg = super::category_sum_mismatch(
+            &cancel,
+            &cols,
+            &Int64Array::from(vec![1]),
+            &Int32Array::from(vec![0]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(msg.contains("\"c:b\" is -1"), "{msg}");
     }
 
     /// #827 review: cropping exempts a spatial subset from whole-source mass
