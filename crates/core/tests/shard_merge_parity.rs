@@ -145,11 +145,8 @@ fn convert_options(build: Build) -> ConvertOptions {
     };
     let read_workers = read_workers();
     match build.flavor {
-        // A chain is a new geometry spanning every row it merged, which no
-        // single row group's bbox bounds — so `--shard` refuses a plan that
-        // carries one. Turning it off keeps this flavor honest about what it
-        // is testing; `Flavor::Defaults` covers the on-by-default case, where
-        // a polygon input produces an empty-but-present section.
+        // `Flavor::Defaults` covers the on-by-default case: an empty section
+        // on polygon input, chains on line input (#546).
         Flavor::NoCoalesce => ConvertOptions::default()
             .with_levels(levels)
             .with_read_workers(read_workers)
@@ -648,15 +645,6 @@ fn assert_archive_metadata_matches(mono: &Path, merged: &Path, shards: usize) {
 /// group is a narrow, prunable vertical band, with a `bbox` struct declared as
 /// the GeoParquet 1.1 covering so the footers carry usable envelopes.
 fn write_point_grid(path: &Path) {
-    use std::sync::Arc;
-
-    use arrow_array::{
-        ArrayRef, BinaryArray, Float64Array, Int64Array, RecordBatch, StringArray, StructArray,
-    };
-    use arrow_schema::{DataType, Field, Fields, Schema};
-    use tylertoo_io::test_support::ArrowWriter;
-    use tylertoo_io::test_support::WriterProperties;
-
     const COLS: i64 = 60;
     const ROWS: i64 = 20;
     let (lon_min, lon_max) = (-175.0f64, 175.0f64);
@@ -688,6 +676,31 @@ fn write_point_grid(path: &Path) {
         out.extend_from_slice(&y.to_le_bytes());
         out
     };
+    let rows = rows
+        .into_iter()
+        .map(|(id, weight, x, y)| (id, weight, wkb(x, y), [x, y, x, y]))
+        .collect();
+    // 20 row groups over 3,600 points, matching the polygon grid's shape.
+    write_covered_grid(path, rows, "Point", 180);
+}
+
+/// Write `(cell_id, weight, WKB, bbox)` rows, in the order given, with a
+/// `bbox` struct declared as the GeoParquet 1.1 covering so the footers carry
+/// usable envelopes, `rows_per_group` rows to a row group.
+fn write_covered_grid(
+    path: &Path,
+    rows: Vec<(i64, f64, Vec<u8>, [f64; 4])>,
+    geometry_type: &str,
+    rows_per_group: usize,
+) {
+    use std::sync::Arc;
+
+    use arrow_array::{
+        ArrayRef, BinaryArray, Float64Array, Int64Array, RecordBatch, StringArray, StructArray,
+    };
+    use arrow_schema::{DataType, Field, Fields, Schema};
+    use tylertoo_io::test_support::ArrowWriter;
+    use tylertoo_io::test_support::WriterProperties;
 
     let bbox_fields: Fields = vec![
         Field::new("xmin", DataType::Float64, false),
@@ -717,37 +730,22 @@ fn write_point_grid(path: &Path) {
             .map(|r| (r.0 % 50 != 0).then(|| format!("c{}", r.0 % 120)))
             .collect::<Vec<_>>(),
     ));
-    let geoms: Vec<Vec<u8>> = rows.iter().map(|r| wkb(r.2, r.3)).collect();
     let geometry: ArrayRef = Arc::new(BinaryArray::from(
-        geoms.iter().map(|g| g.as_slice()).collect::<Vec<_>>(),
+        rows.iter().map(|r| r.2.as_slice()).collect::<Vec<_>>(),
     ));
-    let xs: Vec<f64> = rows.iter().map(|r| r.2).collect();
-    let ys: Vec<f64> = rows.iter().map(|r| r.3).collect();
-    let bbox: ArrayRef = Arc::new(StructArray::new(
-        bbox_fields,
-        vec![
-            Arc::new(Float64Array::from(xs.clone())) as ArrayRef,
-            Arc::new(Float64Array::from(ys.clone())),
-            Arc::new(Float64Array::from(xs.clone())),
-            Arc::new(Float64Array::from(ys.clone())),
-        ],
-        None,
-    ));
-
+    let corner = |k: usize| -> Vec<f64> { rows.iter().map(|r| r.3[k]).collect() };
+    let (xmin, ymin, xmax, ymax) = (corner(0), corner(1), corner(2), corner(3));
+    let lo = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = |v: &[f64]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let geo = serde_json::json!({
         "version": "1.1.0",
         "primary_column": "geometry",
         "columns": {
             "geometry": {
                 "encoding": "WKB",
-                "geometry_types": ["Point"],
+                "geometry_types": [geometry_type],
                 "crs": serde_json::Value::Null,
-                "bbox": [
-                    xs.iter().cloned().fold(f64::INFINITY, f64::min),
-                    ys.iter().cloned().fold(f64::INFINITY, f64::min),
-                    xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-                    ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-                ],
+                "bbox": [lo(&xmin), lo(&ymin), hi(&xmax), hi(&ymax)],
                 "covering": {"bbox": {
                     "xmin": ["bbox", "xmin"],
                     "ymin": ["bbox", "ymin"],
@@ -757,15 +755,22 @@ fn write_point_grid(path: &Path) {
             }
         }
     });
+    let bbox: ArrayRef = Arc::new(StructArray::new(
+        bbox_fields,
+        [xmin, ymin, xmax, ymax]
+            .into_iter()
+            .map(|v| Arc::new(Float64Array::from(v)) as ArrayRef)
+            .collect(),
+        None,
+    ));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![ids, weights, categories, geometry, bbox],
     )
-    .expect("point batch");
+    .expect("grid batch");
 
     let props = WriterProperties::builder()
-        // 20 row groups over 3,600 points, matching the polygon grid's shape.
-        .set_max_row_group_row_count(Some(180))
+        .set_max_row_group_row_count(Some(rows_per_group))
         // The `geo` key goes into the parquet footer explicitly rather than
         // by way of the arrow schema's metadata: whether arrow-rs propagates
         // schema metadata into the file's key-value metadata is its business,
@@ -778,10 +783,10 @@ fn write_point_grid(path: &Path) {
             geo.to_string(),
         )]))
         .build();
-    let file = std::fs::File::create(path).expect("create point fixture");
+    let file = std::fs::File::create(path).expect("create grid fixture");
     let mut w = ArrowWriter::try_new(file, schema, Some(props)).expect("arrow writer");
-    w.write(&batch).expect("write points");
-    w.close().expect("close point fixture");
+    w.write(&batch).expect("write grid");
+    w.close().expect("close grid fixture");
 }
 
 /// Madagascar admin-4: real, messy polygons, and seams that fall inside them.
@@ -946,6 +951,105 @@ fn sharded_build_matches_monolithic_with_clustered_points() {
     assert_sharded_build_matches_monolithic(&input, grid_build(3, Flavor::ClusteredPoints));
 }
 
+/// The largest `coalesced_count` an overview holds over `levels`, read from
+/// the data: a file spanning more than one count has no folded statistic
+/// (#399).
+fn coalesced_count_max(p: &Path, levels: impl Iterator<Item = usize>) -> i32 {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int32Type;
+    use tylertoo_core::internal::overview::reader::OverviewReader;
+
+    let reader = OverviewReader::open(p).expect("open overview");
+    levels
+        .flat_map(|k| reader.read_level(k, None).expect("read level"))
+        .map(|batch| {
+            let batch = batch.expect("batch");
+            let idx = batch
+                .schema()
+                .index_of("coalesced_count")
+                .expect("counter column");
+            batch
+                .column(idx)
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(1)
+        })
+        .max()
+        .unwrap_or(1)
+}
+
+/// Four world-spanning parallels, each cut into 340 one-degree segments that
+/// meet end to end, with covering statistics, written at test time (#546).
+///
+/// Sorted by longitude like the point grid, so each of the 20 row groups is a
+/// narrow vertical band holding a piece of every parallel. Coalescing merges
+/// each parallel into one chain wherever it is not verbatim, and a chain's
+/// attributes come from ONE member row (its rep): most shards reach the chain
+/// but not the row group holding its rep, which is the case #546 is about.
+fn write_line_grid(path: &Path) {
+    let segment = |x: f64, y: f64| -> Vec<u8> {
+        let mut out = Vec::with_capacity(41);
+        out.push(1u8); // little endian
+        out.extend_from_slice(&2u32.to_le_bytes()); // LineString
+        out.extend_from_slice(&2u32.to_le_bytes());
+        for px in [x, x + 1.0] {
+            out.extend_from_slice(&px.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+        }
+        out
+    };
+    let mut rows = Vec::new();
+    for (j, y) in [-45.0f64, -15.0, 15.0, 45.0].into_iter().enumerate() {
+        for i in 0..340i64 {
+            let x = -170.0 + i as f64;
+            let id = j as i64 * 340 + i;
+            rows.push((id, (id % 97) as f64, segment(x, y), [x, y, x + 1.0, y]));
+        }
+    }
+    rows.sort_by(|a, b| a.3[0].partial_cmp(&b.3[0]).unwrap().then(a.0.cmp(&b.0)));
+    write_covered_grid(path, rows, "LineString", 68);
+}
+
+/// #546: a fleet over **coalesced line chains**, coalescing on (the
+/// default), matches the monolithic build tile for tile.
+///
+/// A chain is a new geometry spanning every row it merged, and it carries
+/// its rep row's attributes, so a shard whose tiles a chain crosses must
+/// emit it even when the rep's row group lies outside its read window.
+#[test]
+fn sharded_build_matches_monolithic_with_coalesced_line_chains() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("lines.parquet");
+    write_line_grid(&input);
+    let build = Build {
+        min_zoom: 0,
+        max_zoom: 7,
+        pivot: 4,
+        shards: 4,
+        expect_row_group_pruning: true,
+        flavor: Flavor::Defaults,
+        coarse_level_ceiling: false,
+    };
+
+    // The premise: chains merge in the levels the shards build, or this
+    // proves nothing about them.
+    let mono = dir.path().join("premise.parquet");
+    convert_to_overviews(&input, &mono, &convert_options(build)).expect("monolithic convert");
+    let reader =
+        tylertoo_core::internal::overview::reader::OverviewReader::open(&mono).expect("open");
+    let (from, finest) = (reader.level_for_zoom(build.pivot), reader.num_levels() - 1);
+    assert!(
+        coalesced_count_max(&mono, from..finest) > 1,
+        "the chains must merge at or past the pivot z{}",
+        build.pivot
+    );
+
+    assert_sharded_build_matches_monolithic(&input, build);
+}
+
 /// Short connected line chains plus a few long lines, written at test time.
 ///
 /// Every chain is 30 end-to-end ~111 m segments: fine levels merge each into
@@ -1019,11 +1123,9 @@ fn write_line_chains(path: &Path) {
 /// #541 review (S1): the level-capped coarse job over **coalesced line
 /// chains**, coalescing on (the default).
 ///
-/// Only the coarse half: a data shard refuses a plan that carries coalesced
-/// chains (see `shard_with_coalesced_lines_in_the_plan_is_refused`), so no
-/// full fleet can be built over this input. But the coarse job itself runs
-/// with chains, and its tiles must still match the monolithic build's at
-/// every zoom it owns. They did not: the export decided whether to publish
+/// Only the coarse half (the whole fleet over chains is
+/// `sharded_build_matches_monolithic_with_coalesced_line_chains`): its tiles
+/// must match the monolithic build's at every zoom it owns. They did not: the export decided whether to publish
 /// `coalesced_count` from the file's own row-group statistics, and the
 /// chains here merge only finer than the pivot — so the capped file's
 /// counter never left 1, the column was withheld, and every coarse tile
@@ -1063,29 +1165,9 @@ fn level_capped_coarse_job_matches_monolithic_on_coalesced_line_chains() {
     // decision read from them would too. The monolithic file spans more
     // than one count, which the statistic fold refuses (#399), so its max
     // is read from the data.
-    let data_max = |p: &Path| -> i32 {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::Int32Type;
-        let reader = OverviewReader::open(p).expect("open overview");
-        (0..reader.num_levels())
-            .flat_map(|k| reader.read_level(k, None).expect("read level"))
-            .map(|batch| {
-                let batch = batch.expect("batch");
-                let idx = batch
-                    .schema()
-                    .index_of("coalesced_count")
-                    .expect("counter column");
-                batch
-                    .column(idx)
-                    .as_primitive::<Int32Type>()
-                    .values()
-                    .iter()
-                    .copied()
-                    .max()
-                    .unwrap_or(1)
-            })
-            .max()
-            .expect("at least one batch")
+    let data_max = |p: &Path| {
+        let levels = OverviewReader::open(p).expect("open overview").num_levels();
+        coalesced_count_max(p, 0..levels)
     };
     assert!(
         data_max(&mono_overview) > 1,

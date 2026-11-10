@@ -80,12 +80,32 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `stats` and `--shard` included, with the binary's output, stderr logging
   and exit codes. The Python API now installs its `logging` bridge on its
   first call instead of at import.
+- Sharded builds work with line coalescing, which is on by default (#546).
+  The convert plan carries the coalesce chains the coarse job built, so a
+  data shard runs no chain stage: it reads the row groups of the chains that
+  reach its tiles. Its memory follows its own share of the data (on 2.8M
+  Overture segments at 64 shards, about 1 GB per shard against 4 GB when
+  each shard rebuilt the chains). Plans saved by earlier builds must be
+  re-created with `--save-plan`. Tile bodies match a single-machine
+  build byte for byte, except for over-cap tiles under the default
+  `--size-valve merge` when a shard prunes row groups (#854; pass
+  `--size-valve drop` for an exact match). `--no-coalesce-lines` is no longer
+  needed, and `InvalidOption::ShardWithCoalescedLines` is gone.
 
 ### Fixed
 
 - An `https://` input keeps its query string, so presigned S3 and Azure SAS
   URLs work; the query is shown as `?<redacted>` in logs, errors, reports
   and saved plans (#820).
+- A data shard at the antimeridian reads the features from across it that
+  export draws into its edge tiles. Its read margin used to stop at ±180°
+  (#546 review).
+- `shard-plan` cuts an EPSG:3857 input by where its rows are. It used to
+  read the row-group statistics, which are metres, as degrees, and put every
+  row in the last shard (#546 review).
+- A data shard no longer warns that a level below its pivot "became empty
+  after simplification". It exports no such level, and its share of one is
+  often empty (#546 review).
 - Inputs with many list columns (Overture segments: 86 list leaves) are no
   longer handed out one row per batch. A decode no longer crosses a row
   group, so it is charged with one group's list values rather than two:

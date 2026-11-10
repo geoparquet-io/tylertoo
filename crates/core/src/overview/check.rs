@@ -549,9 +549,16 @@ fn check_count_conformance(
     } else {
         "Int64"
     };
+    // A partial overview (#541) ends at a simplified level, which may hold
+    // clusters and chains (#546); the singleton rule is the source level's.
+    let partial = meta
+        .generalization
+        .as_ref()
+        .is_some_and(|g| g.zoom_ceiling.is_some());
     let mut problems = Vec::new();
     for rg in 0..metadata.num_row_groups() {
-        let is_canonical = level_for_rg(meta, rg).map(|k| k as i64) == meta.canonical_level;
+        let is_canonical =
+            !partial && level_for_rg(meta, rg).map(|k| k as i64) == meta.canonical_level;
         let stats = metadata.row_group(rg).column(col_idx).statistics();
         let bounds = match stats {
             Some(Statistics::Int32(s)) if physical == PhysicalType::INT32 => Some((
@@ -1785,6 +1792,7 @@ mod tests {
         path: &std::path::Path,
         level_ids: &[Vec<i64>],
         coalesced_counts: Option<&[Vec<i32>]>,
+        zoom_ceiling: Option<u8>,
     ) {
         use crate::overview::level::{CoalescingProvenance, Generalization};
         use arrow_array::Int32Array as I32;
@@ -1831,7 +1839,7 @@ mod tests {
                 merged: None,
             }),
             renamed_columns: None,
-            zoom_ceiling: None,
+            zoom_ceiling,
         });
 
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
@@ -1866,6 +1874,7 @@ mod tests {
             tmp.path(),
             &[vec![0], vec![0, 1, 2]],
             Some(&[vec![3], vec![1, 1, 1]]),
+            None,
         );
         let report = validate_file(tmp.path()).unwrap();
         assert!(
@@ -1881,7 +1890,7 @@ mod tests {
     #[test]
     fn coalescing_metadata_without_column_fails() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        write_coalesce_fixture(tmp.path(), &[vec![0], vec![0, 1, 2]], None);
+        write_coalesce_fixture(tmp.path(), &[vec![0], vec![0, 1, 2]], None, None);
         let report = validate_file(tmp.path()).unwrap();
         assert!(!report.is_valid());
         assert_eq!(report.check_passed("coalesce_count_column"), Some(false));
@@ -1895,10 +1904,27 @@ mod tests {
             tmp.path(),
             &[vec![0], vec![0, 1, 2]],
             Some(&[vec![3], vec![1, 2, 1]]),
+            None,
         );
         let report = validate_file(tmp.path()).unwrap();
         assert!(!report.is_valid());
         assert_eq!(report.check_passed("coalesce_count_values"), Some(false));
+    }
+
+    #[test]
+    fn coalescing_partial_overview_finest_level_may_hold_chains() {
+        // #546: a sharded build's coarse job stops at a zoom ceiling, so its
+        // finest level is an ordinary coalesced one, not the canonical source.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_coalesce_fixture(
+            tmp.path(),
+            &[vec![0], vec![0, 1, 2]],
+            Some(&[vec![3], vec![1, 2, 1]]),
+            Some(4),
+        );
+        let report = validate_file(tmp.path()).unwrap();
+        assert_eq!(report.check_passed("coalesce_count_values"), Some(true));
+        assert_eq!(report.read_failures().count(), 0);
     }
 
     #[test]
@@ -1909,6 +1935,7 @@ mod tests {
             tmp.path(),
             &[vec![0], vec![0, 1, 2]],
             Some(&[vec![0], vec![1, 1, 1]]),
+            None,
         );
         let report = validate_file(tmp.path()).unwrap();
         assert!(!report.is_valid());

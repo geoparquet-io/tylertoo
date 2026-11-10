@@ -234,7 +234,7 @@ that gives each shard a few populated tiles. Zooms z4 to z8 suit most fleets.
 
 ```bash
 tylertoo tiles fields.parquet coarse.pmtiles \
-    --min-zoom 0 --max-zoom 14 --no-coalesce-lines \
+    --min-zoom 0 --max-zoom 14 \
     --shard coarse --shard-plan shards.json \
     --save-plan convert.plan
 ```
@@ -254,7 +254,7 @@ at z0 to z8 with polygons at z9 to z13. Set the pivot to the handover zoom
 
 ```bash
 tylertoo tiles fields.parquet \
-    --min-zoom 9 --max-zoom 13 --no-coalesce-lines \
+    --min-zoom 9 --max-zoom 13 \
     --shard coarse --shard-plan shards.json \
     --save-plan convert.plan \
     --plan-only
@@ -270,7 +270,7 @@ same memory.
 
 ```bash
 tylertoo tiles fields.parquet shard-$i.pmtiles \
-    --min-zoom 0 --max-zoom 14 --no-coalesce-lines \
+    --min-zoom 0 --max-zoom 14 \
     --shard $i/16 --shard-plan shards.json \
     --plan convert.plan
 ```
@@ -305,6 +305,13 @@ Tile bodies match a single-machine run byte for byte, as checked by
 directory layout and tile order, and lacks tilestats. Generate tilestats
 from it if a consumer needs them.
 
+One known exception: a line or polygon tile over its size cap, under the
+default `--size-valve merge`, can differ when a shard skips input row groups.
+The valve picks merge partners by each row's gap to the previous row of the
+overview, and a shard's overview holds fewer rows. Pass `--size-valve drop`
+to every job, or raise the caps, when the fleet must match exactly
+([#854](https://github.com/geoparquet-io/tylertoo/issues/854)).
+
 ### A Slurm fleet
 
 Submit the coarse job, then the shards as an array job that waits for it:
@@ -324,7 +331,7 @@ sbatch --dependency=afterok:$coarse shards.sh
 #SBATCH --time=08:00:00
 
 tylertoo tiles "$INPUT" "$OUT/shard-${SLURM_ARRAY_TASK_ID}.pmtiles" \
-    --min-zoom 0 --max-zoom 14 --no-coalesce-lines \
+    --min-zoom 0 --max-zoom 14 \
     --shard "${SLURM_ARRAY_TASK_ID}/16" \
     --shard-plan "$OUT/shards.json" \
     --plan "$OUT/convert.plan" \
@@ -336,10 +343,20 @@ Set `SPILL` to an existing directory on real disk. To rerun shard 7, submit
 
 ### Constraints
 
-- **No line coalescing.** Coalesced chains span row groups and can leave gaps
-  at shard boundaries. Pass `--no-coalesce-lines` to every job, including the
-  coarse job. tylertoo supports clustering, `--accumulate-attribute`, and
-  tiny-polygon carriers.
+- **Line coalescing follows each shard's share.** A coalesced chain joins
+  line segments from anywhere in the input and carries one segment's
+  attributes. The coarse job builds every chain and saves them in the plan.
+  Each data shard loads the chains of the zooms it exports, and also reads
+  the row group of the segment behind each chain that reaches its tiles. A
+  shard's memory therefore follows the rows it reads, as it does with
+  `--no-coalesce-lines`. On 2.8 million Overture road segments at z0 to z12,
+  cut into 64 shards at pivot 10 under a 12 GiB cap with 4 threads, the
+  single machine peaked at 5.0 GiB and the coarse job at 3.9 GiB. The shards
+  peaked at 0.75 to 3.4 GiB, median 0.96 GiB; with `--no-coalesce-lines`
+  they peaked at 0.6 to 4.8 GiB, median 1.0 GiB. The largest shards were the
+  ones whose range reached every row group. The plan holds the chains, 354 MB
+  for that input. Clustering, `--accumulate-attribute`, and tiny-polygon
+  carriers cost shards nothing extra.
 - **`--tile-buffer` must be at most 256 tile pixels**, the cap for every
   export. This fits inside the two pivot tiles (512 pixels) read around each
   shard's range.
