@@ -40,25 +40,6 @@ fn release_retained() {
     unsafe { libmimalloc_sys::mi_collect(true) }
 }
 
-/// #828: no transparent huge pages for mimalloc's arenas. On a `madvise`
-/// THP host they kept 0.5-1 GiB of freed 4 KiB pages resident inside
-/// 2 MiB pages (Moldova z12: 3.7 -> 3.0 GiB peak, same archive). Then
-/// install the phase-boundary release.
-#[cfg(all(
-    any(target_env = "musl", feature = "mimalloc"),
-    not(feature = "dhat-heap")
-))]
-fn configure_allocator() {
-    use tylertoo_core::internal::alloc_release::mimalloc_allow_thp_option;
-    // SAFETY: mi_version and mi_option_set take no pointers.
-    unsafe {
-        if let Some(option) = mimalloc_allow_thp_option(libmimalloc_sys::mi_version()) {
-            libmimalloc_sys::mi_option_set(option, 0);
-        }
-    }
-    tylertoo_core::internal::alloc_release::set_release_hook(release_retained);
-}
-
 fn main() -> std::process::ExitCode {
     // Initialize dhat profiler if feature is enabled
     // This must be at the very start of main() - the profiler outputs
@@ -75,7 +56,7 @@ fn main() -> std::process::ExitCode {
         any(target_env = "musl", feature = "mimalloc"),
         not(feature = "dhat-heap")
     ))]
-    configure_allocator();
+    tylertoo_core::internal::alloc_release::set_release_hook(release_retained);
 
     std::process::ExitCode::from(tylertoo_cli::run(std::env::args_os()))
 }
@@ -88,30 +69,15 @@ mod allocator_default {
     #[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
     const _: &mimalloc::MiMalloc = &super::GLOBAL;
 
-    /// #828: the linked mimalloc is one whose THP option index is known,
-    /// so the THP-off setting is not skipped.
-    #[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
+    /// #828: every libmimalloc-sys declaration builds without THP madvise.
     #[test]
-    fn bundled_mimalloc_has_a_known_thp_option() {
-        // SAFETY: mi_version takes no arguments.
-        let version = unsafe { libmimalloc_sys::mi_version() };
-        assert_eq!(
-            tylertoo_core::internal::alloc_release::mimalloc_allow_thp_option(version),
-            Some(43),
-            "mimalloc {version}"
-        );
-    }
-
-    #[test]
-    fn mimalloc_is_a_default_feature() {
+    fn mimalloc_is_built_without_thp() {
         let manifest = include_str!("../Cargo.toml");
-        let default = manifest
+        let decls: Vec<&str> = manifest
             .lines()
-            .find(|l| l.trim_start().starts_with("default ="))
-            .expect("crates/cli/Cargo.toml declares default features");
-        assert!(
-            default.contains("\"mimalloc\""),
-            "mimalloc must stay a default feature of the CLI: {default}"
-        );
+            .filter(|l| l.starts_with("libmimalloc-sys"))
+            .collect();
+        assert_eq!(decls.len(), 2, "the mimalloc and musl declarations");
+        assert!(decls.iter().all(|l| l.contains("\"no_thp\"")), "{decls:?}");
     }
 }

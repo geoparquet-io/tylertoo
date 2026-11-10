@@ -556,32 +556,13 @@ fn release_retained() {
     unsafe { libmimalloc_sys::mi_collect(true) }
 }
 
-/// #828: no transparent huge pages for mimalloc's arenas. On a `madvise`
-/// THP host they kept 0.5-1 GiB of freed 4 KiB pages resident inside
-/// 2 MiB pages (Moldova z12: 3.7 -> 3.0 GiB peak, same archive). Then
-/// install the phase-boundary release.
-#[cfg(all(
-    any(target_env = "musl", feature = "mimalloc"),
-    not(feature = "dhat-heap")
-))]
-fn configure_allocator() {
-    use tylertoo_core::internal::alloc_release::mimalloc_allow_thp_option;
-    // SAFETY: mi_version and mi_option_set take no pointers.
-    unsafe {
-        if let Some(option) = mimalloc_allow_thp_option(libmimalloc_sys::mi_version()) {
-            libmimalloc_sys::mi_option_set(option, 0);
-        }
-    }
-    tylertoo_core::internal::alloc_release::set_release_hook(release_retained);
-}
-
 #[pymodule]
 fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(all(
         any(target_env = "musl", feature = "mimalloc"),
         not(feature = "dhat-heap")
     ))]
-    configure_allocator();
+    tylertoo_core::internal::alloc_release::set_release_hook(release_retained);
     m.add("ConfigError", m.py().get_type::<ConfigError>())?;
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add_function(wrap_pyfunction!(overview, m)?)?;

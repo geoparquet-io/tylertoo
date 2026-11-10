@@ -66,7 +66,10 @@ clap-markdown = { version = "=0.1.5", optional = true }
 # `mimalloc` feature. The musl table below keeps it unconditional there.
 mimalloc = { version = "0.1", optional = true }
 # `mi_collect`, run on every pool thread when a phase ends (#828).
-libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
+# `extended`: mi_collect at phase boundaries. `no_thp`: no MADV_HUGEPAGE on
+# mimalloc's arenas; on a madvise-THP host freed 4 KiB pages stayed resident
+# inside 2 MiB pages, 0.5-1 GiB of peak (#828).
+libmimalloc-sys = { version = "0.1", optional = true, features = ["extended", "no_thp"] }
 
 # musl-only global allocator (#480). musl's mallocng fails small allocations
 # under heavy multi-threaded fragmentation long before memory is exhausted;
@@ -81,7 +84,7 @@ libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
 # release.yml.
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = "0.1"
-libmimalloc-sys = { version = "0.1", features = ["extended"] }
+libmimalloc-sys = { version = "0.1", features = ["extended", "no_thp"] }
 
 [dev-dependencies]
 serde_json = "1"

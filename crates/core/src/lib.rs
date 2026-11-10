@@ -215,7 +215,7 @@ pub use tile_format::{MltProfile, TileFormat};
 /// supported API is the crate root.
 pub mod internal {
     pub mod alloc_release {
-        pub use crate::alloc_release::{mimalloc_allow_thp_option, set_release_hook};
+        pub use crate::alloc_release::set_release_hook;
     }
     /// The MLT codec, for tests that decode MLT archives independently.
     #[cfg(feature = "mlt")]
