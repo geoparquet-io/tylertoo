@@ -716,22 +716,14 @@ pub(crate) fn estimate_with(
     let mask_index = mask.as_ref().map(|m| super::mask::MaskIndex::new(m, crs));
 
     // The conversion's footer-statistics pruning (#102 bbox, #315 filter).
-    let bbox_sel = bbox_query
-        .as_ref()
-        .map(|q| source.select_row_groups_any(q.boxes()))
-        .transpose()?;
-    let mask_sel = mask_query
-        .as_ref()
-        .map(|q| source.select_row_groups_any(q.boxes()))
-        .transpose()?;
-    let filter_sel = bound_filter
-        .as_ref()
-        .map(|f| source.select_row_groups_matching(f))
-        .transpose()?;
-    let selection = [bbox_sel, mask_sel, filter_sel]
-        .into_iter()
-        .flatten()
-        .reduce(|a, b| a.intersect(&b));
+    let selection = super::stream::select_row_groups_streaming(
+        source,
+        bbox_query.as_ref(),
+        mask_query.as_ref(),
+        bound_filter.as_ref(),
+        None,
+        crs,
+    )?;
     let rows_read = source.selected_row_count(selection.as_ref())?.max(0) as u64;
     if rows_read == 0 {
         return Err(ConvertError::NoData);

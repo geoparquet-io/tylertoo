@@ -71,6 +71,8 @@ pub(crate) struct LoadedMask {
 pub(crate) fn load(source: &MaskSource) -> Result<LoadedMask, ConfigError> {
     // Validation runs once per option check, several times a run: parse a
     // mask once and hand out copies while its bytes are unchanged.
+    // shortcut: holds the last mask until the process exits (one mask, a
+    // few MB); scope it to a run if long-lived callers load huge masks.
     type Key = (MaskSource, Option<u64>);
     static LAST: std::sync::Mutex<Option<(Key, LoadedMask)>> = std::sync::Mutex::new(None);
     let key = (source.clone(), content_hash(source));
