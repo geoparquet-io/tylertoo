@@ -8847,7 +8847,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn convert_peak_rss_includes_a_spike_between_boundaries() {
+        if !run_alone("convert_peak_rss_includes_a_spike_between_boundaries") {
+            return;
+        }
         let rss = RssTracker::new(true, "spike");
+        if !rss.hwm_reset {
+            return; // VmHWM not restartable here: only the sampler sees spikes.
+        }
         let before = super::super::procmem::read_proc_status()
             .and_then(|m| m.rss_kib)
             .expect("Linux reports RSS") as f64
@@ -8861,6 +8867,15 @@ mod tests {
             peak >= before + 200.0,
             "peak {peak} MiB misses a 256 MiB spike over {before} MiB"
         );
+    }
+
+    /// Without a reset of this run's `VmHWM`, convert's peak ignores it: the
+    /// process's earlier peak is not this conversion's.
+    #[test]
+    fn convert_peak_rss_ignores_a_vmhwm_it_did_not_reset() {
+        let mut rss = RssTracker::with_sampler(None);
+        rss.boundary_peak_mib = Some(1.0);
+        assert_eq!(finish_convert_rss(rss).0, Some(1.0));
     }
 
     /// #810: every phase gets its CPU and wall deltas from the boundaries,
