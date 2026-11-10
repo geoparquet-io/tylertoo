@@ -101,7 +101,7 @@
 //!    the super-cell partition/sort are element-wise over the dataset and go
 //!    wide. The admission **fold** itself does NOT: it threads a running
 //!    `kept_count` coarse→fine and stays strictly serial, as does
-//!    `water_fill`.
+//!    `newcomer_allocs`.
 //!
 //! Results are unaffected. The sharded winner build **preserves position
 //! order** per cell (chunks are collected in order, each chunk's shard group is
@@ -2408,7 +2408,7 @@ fn priority_order(features: &FeatureTable, dir: SortDirection, a: usize, b: usiz
 }
 
 /// Choose `available` survivors from `cands` for one level: partition into
-/// super-cells, fair-allocate the budget across them ([`water_fill`]) and keep
+/// super-cells, fair-allocate the budget across them ([`newcomer_allocs`]) and keep
 /// each cell's top-priority members. Deterministic (cells iterated in sorted
 /// key order; ties broken by [`Priority`]'s index tiebreak).
 /// `pub(super)` so the coalescing stage (`super::coalesce`) can apply the
@@ -2463,12 +2463,11 @@ pub(super) fn select_budget_survivors(
             (super_cell(cx, cy, super_m, crs), i)
         })
         .collect();
-    // Two sorts, not one combined `(cell, Priority)` sort. The cheap one groups
-    // the cells — a derived `Ord` on `(SuperCell, usize)`, no indirection — and
-    // the expensive one (`priority_order`, two random probes into `prio` per
-    // comparison) then runs only WITHIN a cell. That is `Σ mᵢ log mᵢ` expensive
-    // comparisons instead of `M log M`, the same total the hashmap-of-vecs
-    // version paid, and the per-cell sorts are themselves parallel.
+    // A sort, then a per-cell partition, not one combined `(cell, Priority)`
+    // sort. The cheap sort groups the cells — a derived `Ord` on
+    // `(SuperCell, usize)`, no indirection — and the expensive comparison
+    // (`priority_order`, random probes into the table) then runs only WITHIN
+    // a cell, as a linear selection, and in parallel.
     sort_unstable_maybe_par(&mut tagged, Ord::cmp);
 
     // Cells are now contiguous ascending runs.
@@ -2481,22 +2480,6 @@ pub(super) fn select_budget_survivors(
         }
         *pops.last_mut().expect("a run was started") += 1;
     }
-
-    // Sort each run best-first. The runs are disjoint subslices, so each is
-    // owned outright by the task that sorts it. `priority_order` is a strict
-    // total order, so each run's order — and therefore `chosen` — is unique:
-    // sorting in parallel cannot change it, and it matches what the
-    // hashmap-of-vecs version produced feature for feature.
-    let mut runs: Vec<&mut [(SuperCell, usize)]> = Vec::with_capacity(starts.len());
-    let mut rest = tagged.as_mut_slice();
-    for &pop in &pops {
-        let (run, tail) = rest.split_at_mut(pop);
-        runs.push(run);
-        rest = tail;
-    }
-    runs.par_iter_mut()
-        .for_each(|run| run.sort_unstable_by(|a, b| priority_order(features, dir, a.1, b.1)));
-    drop(runs);
 
     // validate_options refuses gamma < 1; the clamp keeps direct library callers
     // (apply_density_budget, CoalesceParams::budget) on their previous behavior.
@@ -2512,6 +2495,26 @@ pub(super) fn select_budget_survivors(
     let cells: Vec<SuperCell> = starts.iter().map(|&s| tagged[s].0).collect();
     let allocs = newcomer_allocs(&cells, &pops, &held_cells, available, alpha);
 
+    // Move each run's best `alloc` to its front. The runs are disjoint
+    // subslices, so each is owned outright by the task that partitions it.
+    // `priority_order` is a strict total order, so the best `alloc` of a run
+    // — and therefore the SET `chosen` — is unique: partitioning in parallel
+    // cannot change it. A run that keeps none or all is not compared at all,
+    // so a level with no room left (#850) costs no priority comparison.
+    let mut runs: Vec<(&mut [(SuperCell, usize)], usize)> = Vec::with_capacity(starts.len());
+    let mut rest = tagged.as_mut_slice();
+    for (&pop, &alloc) in pops.iter().zip(&allocs) {
+        let (run, tail) = rest.split_at_mut(pop);
+        runs.push((run, alloc));
+        rest = tail;
+    }
+    runs.par_iter_mut().for_each(|(run, alloc)| {
+        if *alloc > 0 && *alloc < run.len() {
+            run.select_nth_unstable_by(*alloc - 1, |a, b| priority_order(features, dir, a.1, b.1));
+        }
+    });
+    drop(runs);
+
     let mut chosen = Vec::with_capacity(available);
     for ((&start, &pop), alloc) in starts.iter().zip(&pops).zip(allocs) {
         chosen.extend(
@@ -2525,11 +2528,9 @@ pub(super) fn select_budget_survivors(
 
 /// Each candidate cell's allocation when the level keeps `held` already
 /// (sorted cells, one entry per feature) and admits `available` more: the
-/// level's whole budget is water-filled over every cell's total, and a cell's
-/// candidates get what its share leaves after its held features. A cell
-/// whose held features already pass its share keeps them and takes no
-/// more, and the rest of the budget is shared again without it, so the
-/// allocations sum to `available`.
+/// level's whole budget is shared over every cell's total ([`water_level`]),
+/// and a cell's candidates get what its share leaves after its held
+/// features. The allocations sum to `available`, plus the tile floor below.
 fn newcomer_allocs(
     cells: &[SuperCell],
     pops: &[usize],
@@ -2562,26 +2563,25 @@ fn newcomer_allocs(
         totals.push(total);
         held_in.push(h - start);
     }
-    // Each round settles every cell over its share; a settled cell weighs
-    // nothing (a zero total) and its held features leave the budget.
-    let mut budget = held.len() + available;
-    let quota = loop {
-        let quota = water_fill(&totals, budget, alpha);
-        let mut settled = false;
-        for t in 0..totals.len() {
-            if totals[t] > 0 && quota[t] < held_in[t] {
-                budget -= held_in[t];
-                totals[t] = 0;
-                settled = true;
-            }
-        }
-        if !settled {
-            break quota;
-        }
-    };
+    let quota = water_level(&held_in, &totals, held.len() + available, alpha);
+    // Round the running total of the newcomers' shares, in Z-order, and give
+    // each cell the step it adds. This is tippecanoe's `-g 0` carry from one
+    // feature to the next, at cell grain: cells whose shares are each under
+    // one still get one every `1/share` cells. Handing the leftover out by
+    // largest fractional part gave it all to the first cells of a tie, so
+    // equal small shares emptied every later sparse cell. A step is at most
+    // `ceil(share) <= pop`, and the steps sum to the rounded total.
+    let (mut cum, mut handed) = (0.0f64, 0usize);
     let mut allocs: Vec<usize> = cand_at
         .iter()
-        .map(|&t| quota[t].saturating_sub(held_in[t]))
+        .zip(pops)
+        .map(|(&t, &pop)| {
+            cum += quota[t] - held_in[t] as f64;
+            let upto = (cum.round().max(0.0) as usize).min(available);
+            let step = upto.saturating_sub(handed).min(pop);
+            handed += step;
+            step
+        })
         .collect();
     // tippecanoe keeps the first feature of every tile at every zoom,
     // whatever the drop rate ("the first feature in each tile is always
@@ -2609,8 +2609,8 @@ fn newcomer_allocs(
 /// A super-cell's sort key: the Z-order (Morton) code of its grid index,
 /// then the index. The code puts the cells of one tile next to each other,
 /// as tippecanoe's quadkey index puts the features (#850), so
-/// [`water_fill`]'s running total carries a remainder across a tile's
-/// cells and [`newcomer_allocs`] finds a tile's cells in one run. The index
+/// [`newcomer_allocs`]'s running total carries a remainder across a tile's
+/// cells and finds a tile's cells in one run. The index
 /// keeps apart the cells the code clamps together, past 2^31 cells from the
 /// origin.
 type SuperCell = (u64, i64, i64);
@@ -2625,7 +2625,11 @@ fn super_cell(cx: f64, cy: f64, super_m: f64, crs: Crs) -> SuperCell {
         Crs::Epsg3857 => (cx, cy),
         Crs::Epsg4326 => super::convert::lnglat_to_webmerc(cx, cy),
     };
-    let (gx, gy) = ((mx / super_m).floor() as i64, (my / super_m).floor() as i64);
+    // y grows south and a cell holds its north edge, as a tile does.
+    let (gx, gy) = (
+        (mx / super_m).floor() as i64,
+        (-my / super_m).floor() as i64,
+    );
     // The offset is a multiple of a tile, so a tile's cells stay aligned.
     let biased = |g: i64| g.saturating_add(1 << 31).clamp(0, i64::from(u32::MAX)) as u32;
     let spread = super::auto_zoom::spread_bits;
@@ -2640,69 +2644,46 @@ fn tile_of(cell: &SuperCell) -> (i64, i64) {
     )
 }
 
-/// Water-filling allocation of `budget` units across cells of the given
-/// populations, weighting each cell by `population^alpha`, never exceeding a
-/// cell's population, and redistributing any surplus to cells still under their
-/// cap. Returns per-cell allocations summing to `min(budget, Σ pops)`.
-fn water_fill(pops: &[usize], budget: usize, alpha: f64) -> Vec<usize> {
-    let n = pops.len();
-    let total_pop: usize = pops.iter().sum();
-    if budget >= total_pop {
-        return pops.to_vec();
+/// The water level's shares: cell `i` gets `λ · hiᵢ^alpha` clamped to
+/// `[loᵢ, hiᵢ]`, with `λ` set so the shares sum to `budget`. `lo` is what a
+/// cell keeps already and `hi` all it has, so a cell over its share keeps
+/// `lo` and the rest flows to the others, and no cell gets more than it has.
+/// The sum is piecewise linear in `λ`, so one sweep over the sorted points
+/// where a cell leaves `lo` or reaches `hi` finds it: `O(n log n)`, where
+/// settling cells one round at a time was quadratic (#850).
+fn water_level(lo: &[usize], hi: &[usize], budget: usize, alpha: f64) -> Vec<f64> {
+    let clamp_at = |lambda: f64| -> Vec<f64> {
+        lo.iter()
+            .zip(hi)
+            .map(|(&l, &h)| (lambda * (h as f64).powf(alpha)).clamp(l as f64, h as f64))
+            .collect()
+    };
+    let sum_lo: usize = lo.iter().sum();
+    if budget <= sum_lo {
+        return clamp_at(0.0);
     }
-    let mut alloc = vec![0usize; n];
-    let mut capped = vec![false; n];
-    let mut remaining = budget;
-
-    // Round 1..: cap any cell whose weighted share exceeds its population, then
-    // redistribute the freed budget across the rest. Terminates because each
-    // round with a cap removes at least one cell.
-    loop {
-        let sum_w: f64 = (0..n)
-            .filter(|&i| !capped[i])
-            .map(|i| (pops[i] as f64).powf(alpha))
-            .sum();
-        if sum_w <= 0.0 || remaining == 0 {
+    if budget >= hi.iter().sum::<usize>() {
+        return clamp_at(f64::INFINITY);
+    }
+    // (λ, slope change, constant change) where a cell turns linear or full.
+    let mut events: Vec<(f64, f64, f64)> = Vec::with_capacity(2 * hi.len());
+    for (&l, &h) in lo.iter().zip(hi).filter(|&(_, &h)| h > 0) {
+        let w = (h as f64).powf(alpha);
+        events.push((l as f64 / w, w, -(l as f64)));
+        events.push((h as f64 / w, -w, h as f64));
+    }
+    events.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    let (target, mut slope, mut constant) = (budget as f64, 0.0, sum_lo as f64);
+    let mut lambda = events.last().map_or(0.0, |e| e.0);
+    for &(x, d_slope, d_constant) in &events {
+        if slope > 0.0 && constant + slope * x >= target {
+            lambda = (target - constant) / slope;
             break;
         }
-        let mut newly_capped = false;
-        for i in 0..n {
-            if capped[i] {
-                continue;
-            }
-            let raw = remaining as f64 * (pops[i] as f64).powf(alpha) / sum_w;
-            if raw >= pops[i] as f64 {
-                alloc[i] = pops[i];
-                capped[i] = true;
-                newly_capped = true;
-            }
-        }
-        if newly_capped {
-            let capped_sum: usize = (0..n).filter(|&i| capped[i]).map(|i| alloc[i]).sum();
-            remaining = budget.saturating_sub(capped_sum);
-            continue;
-        }
-
-        // No cell caps this round: round the running total of the shares, in
-        // cell order (Z-order, see `SuperCell`), and give each cell the step
-        // it adds (#850). This is tippecanoe's `-g 0` carry from one feature
-        // to the next, at cell grain: a run of cells whose shares are each
-        // below one unit still gets one every `1/share` cells. Handing the
-        // leftover out by largest fractional part gave all of it to the
-        // first cells of a tie, so equal small shares emptied every later
-        // sparse cell. A step is at most `ceil(share) <= pop` (share < pop:
-        // uncapped), and the steps sum to the rounded total, `remaining`.
-        let mut cum = 0.0f64;
-        let mut handed = 0usize;
-        for i in (0..n).filter(|&i| !capped[i]) {
-            cum += remaining as f64 * (pops[i] as f64).powf(alpha) / sum_w;
-            let upto = (cum.round() as usize).min(remaining);
-            alloc[i] = (upto - handed).min(pops[i]);
-            handed += alloc[i];
-        }
-        break;
+        slope += d_slope;
+        constant += d_constant;
     }
-    alloc
+    clamp_at(lambda)
 }
 
 #[cfg(test)]
@@ -3618,7 +3599,7 @@ mod tests {
     /// this test's own single-thread output from then on; every other pool
     /// size and grid budget must still reproduce it.
     const ORACLE_CELL_WINNER_DIGEST: u64 = 0xc233_4757_b303_6e6c;
-    const ORACLE_BUDGET_DIGEST: u64 = 0xab6e_24e4_d317_df2b;
+    const ORACLE_BUDGET_DIGEST: u64 = 0x553c_a0b4_32be_07af;
 
     /// #534, the end-to-end oracle: the whole assignment phase (cell-winner
     /// passes + the density-budget fold) must reproduce the pre-#534 serial
@@ -4225,10 +4206,13 @@ mod tests {
             for (lng, lat) in [(-99.13, 19.43), (174.76, -36.85), (2.35, 48.86)] {
                 let t = crate::tile::lng_lat_to_tile(lng, lat, z);
                 let (bx, by) = tile_of(&super_cell(lng, lat, super_m, Crs::Epsg4326));
-                // The grid's y grows north, a tile's south.
-                assert_eq!((bx + half, half - 1 - by), (i64::from(t.x), i64::from(t.y)));
+                assert_eq!((bx + half, by + half), (i64::from(t.x), i64::from(t.y)));
             }
         }
+        // A cell holds its north edge, as a tile does: y = 0 is the top of
+        // the tile row south of the equator, and anything north of it is not.
+        let row = |y: f64| tile_of(&super_cell(100.0, y, 1000.0, Crs::Epsg3857)).1;
+        assert_eq!((row(0.0), row(1e-3)), (0, -1));
     }
 
     /// #850: at gamma 1 (the tippecanoe preset's) an isolated group keeps
@@ -4689,7 +4673,7 @@ mod tests {
     /// The reference is computed independently of the production path: a
     /// `BTreeMap` grouping (not the sort-based partition), a serial per-cell
     /// sort (not the parallel per-run one), and the table comparator (not the
-    /// derived one). Only [`water_fill`] is shared, which #565 does not touch.
+    /// derived one). Only the allocation is shared, which #565 does not touch.
     ///
     /// The per-cell sorts in the production path go through `runs.par_iter_mut`,
     /// which is unconditional, so at this size they really do run in parallel in
@@ -4712,7 +4696,7 @@ mod tests {
             state
         };
         // ~400 hot spots on a coarse lattice with a sub-super-cell jitter, so
-        // super-cell populations are very uneven and `water_fill` both caps and
+        // super-cell populations are very uneven and `water_level` both caps and
         // fractionally allocates.
         let feats: Vec<AssignFeature> = (0..40_000)
             .map(|i| {
@@ -4807,37 +4791,76 @@ mod tests {
             members.sort_unstable_by(|&a, &b| table_order(&prio, a, b));
             expected.extend(members.iter().take(alloc.min(members.len())).copied());
         }
+        // Only the set is defined: each run is partitioned, not sorted.
+        let (mut derived, mut expected) = (derived, expected);
+        derived.sort_unstable();
+        expected.sort_unstable();
         assert_eq!(
             derived, expected,
             "the derived-priority survivors differ from the table-order ones"
         );
     }
 
+    /// The keys of grid cells `(x, y)` with side `side` meters, sorted.
+    fn cell_keys(cells: &[(i64, i64)], side: f64) -> Vec<SuperCell> {
+        let mut keys: Vec<SuperCell> = cells
+            .iter()
+            .map(|&(x, y)| {
+                let (cx, cy) = ((x as f64 + 0.5) * side, (y as f64 + 0.5) * side);
+                super_cell(cx, cy, side, Crs::Epsg3857)
+            })
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
     /// #850: cells too small for a whole unit of their share still get one
-    /// at the share's rate, spread along the cell order, not handed to the
-    /// first cells in the order. Before, 200 units over 1000 one-feature
-    /// cells went to the first 200 cells, so every sparse cell past them
-    /// emptied at every thinned level.
+    /// at the share's rate, spread along the Z-order. Before, the leftover
+    /// went to the first cells of the tie, and every sparse cell past them
+    /// emptied.
     #[test]
-    fn water_fill_spreads_fractional_shares_along_the_cells() {
-        for alpha in [1.0, 1.0 / 1.5] {
-            let mut pops = vec![1usize; 1000];
-            pops[500] = 4000;
-            let allocs = water_fill(&pops, 1000, alpha);
-            assert_eq!(allocs.iter().sum::<usize>(), 1000, "alpha {alpha}");
-            assert!(allocs.iter().zip(&pops).all(|(a, p)| a <= p));
-            let kept: Vec<usize> = (0..pops.len())
-                .filter(|&i| i != 500 && allocs[i] > 0)
-                .collect();
-            let gaps = kept.windows(2).map(|w| w[1] - w[0]);
-            let worst = gaps.chain([kept[0], 999 - kept[kept.len() - 1]]).max();
-            let share = 1000.0 / (999.0 + 4000f64.powf(alpha));
-            assert!(
-                worst.unwrap() as f64 <= (1.0 / share).ceil() + 1.0,
-                "alpha {alpha}: {} one-feature cells kept, worst gap {worst:?}",
-                kept.len()
-            );
-        }
+    fn small_shares_are_spread_along_the_cells() {
+        // One tile of 64 one-feature cells, and a 4,000-feature cell in a
+        // tile of its own: each small cell's share is 1000 / 4064 ≈ 0.25.
+        let mut grid: Vec<(i64, i64)> = (0..64).map(|i| (i % 8, i / 8)).collect();
+        grid.push((800, 800));
+        let keys = cell_keys(&grid, 100.0);
+        let pops: Vec<usize> = keys
+            .iter()
+            .map(|k| if k.1 == 800 { 4000 } else { 1 })
+            .collect();
+        let allocs = newcomer_allocs(&keys, &pops, &[], 1000, 1.0);
+        assert_eq!(allocs.iter().sum::<usize>(), 1000);
+        let kept: Vec<usize> = (0..keys.len())
+            .filter(|&i| pops[i] == 1 && allocs[i] > 0)
+            .collect();
+        assert_eq!(kept.len(), 16, "{allocs:?}");
+        let worst = kept.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert!(worst <= 5, "worst gap {worst}: {kept:?}");
+    }
+
+    /// #850: cells whose earlier survivors pass their share keep them, and
+    /// the rest goes to the others, in one pass. Settling them a round at a
+    /// time was quadratic in this shape: many held one-feature cells and a
+    /// newcomer, with no room left.
+    #[test]
+    fn held_cells_over_their_share_settle_at_once() {
+        let n = 200_000i64;
+        let held = cell_keys(&(0..n).map(|i| (i, 0)).collect::<Vec<_>>(), 100.0);
+        let last = cell_keys(&[(n - 1, 0)], 100.0);
+        // No room, and the newcomer's tile holds a feature: no floor either.
+        assert_eq!(newcomer_allocs(&last, &[1], &held, 0, 1.0), vec![0]);
+        // Half the cells hold 3 of the 2.5 the budget would give each: they
+        // keep 3, and the others share what is left, 2 each.
+        let lo: Vec<usize> = (0..10).map(|i| if i % 2 == 0 { 3 } else { 0 }).collect();
+        let q = water_level(&lo, &[4; 10], 25, 1.0);
+        let want: Vec<f64> = (0..10)
+            .map(|i| if i % 2 == 0 { 3.0 } else { 2.0 })
+            .collect();
+        assert!(
+            q.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-9),
+            "{q:?}"
+        );
     }
 
     // ---- antimeridian-crossing bboxes (issue #188 behavior pins) -------------
