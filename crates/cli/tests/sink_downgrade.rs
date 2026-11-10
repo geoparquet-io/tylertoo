@@ -25,33 +25,29 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use tylertoo_io::test_support::ArrowWriter;
-use tylertoo_io::test_support::WriterProperties;
+use tylertoo_io::test_support::{EnabledStatistics, WriterProperties};
 
 /// Input rows. Small enough to run in a few seconds, and read in
 /// [`READ_BATCH_ROWS`]-row batches so the light head alone spans far more
 /// than the 64 output batches an earlier fixed-size sample window covered.
 const ROWS: usize = 40_000;
 /// Leading rows with an empty `name`: light enough that the rate measured
-/// over them projects the whole buffered set under the budget (an all-light
-/// input measures ~50 MB against the skewed run's ~108 MB budget).
+/// over them projects the whole buffered set under the budget.
 const LIGHT_HEAD_ROWS: usize = 16_000;
 /// Bytes of `name` on every row after the head: the whole skewed pass
-/// buffers ~195 MB, well past the budget.
+/// buffers ~108 MB, past the budget.
 const HEAVY_NAME_BYTES: usize = 4_096;
 /// Pass-2 read batch size, in rows.
 const READ_BATCH_ROWS: &str = "256";
 /// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` for the `auto` run. The sinks get what
-/// the run's allowance (60% of it) has left after the grants charged before
-/// pass 2 (#716, #788). For the skewed input that is the writer's encode
-/// floor: 4 row groups priced from the footers at ~250 MB each, ~1.0 GB. That
-/// leaves the sinks ~108 MB, between what the light head projects and the
-/// ~195 MB the heavy tail buffers. At the 180 MB this test used before #788,
-/// the encode floor alone exceeds the allowance, so `auto` spills before
-/// pass 2 starts and there is nothing left to downgrade.
+/// the run's allowance (60% of it) has left after the writer's encodes and
+/// the pass-2 read-ahead and window (#716, #788, #791): ~95 MB here, between
+/// what the light input projects (~49 MB) and the ~108 MB the skewed run
+/// buffers once its levels share each input batch's rows (#852).
 /// The margins assume 4 encode threads (`min(threads, 4)` grants), so
 /// `run_overview` pins `RAYON_NUM_THREADS=4`: a 3-core macOS runner would
 /// otherwise grant 3 and leave the sinks too much.
-const MEM_LIMIT_BYTES: &str = "1850000000";
+const MEM_LIMIT_BYTES: &str = "200000000";
 
 fn tylertoo_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tylertoo")
@@ -110,7 +106,12 @@ fn write_points(path: &Path, light_rows: usize) {
             "crs": serde_json::Value::Null,
         }},
     });
+    // Dictionary-encoded and without statistics, as pyarrow often writes:
+    // the footers then price the repeated heavy `name` at a few bytes a
+    // row, so only the sink's own measurement can see it (#852 prices the
+    // up-front estimate from the footers).
     let props = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::None)
         .set_max_row_group_row_count(Some(4_096))
         .set_key_value_metadata(Some(vec![tylertoo_io::KeyValue::new(
             "geo".to_string(),

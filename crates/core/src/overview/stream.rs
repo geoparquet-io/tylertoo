@@ -49,15 +49,15 @@ use super::coalesce::{collected_line_bytes, CoalesceInput, ExactChains};
 use super::config::ValidatedConfig;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
-    apply_coalesced_count, build_generalization, build_level_batch, build_source_schema,
-    class_ranking_provenance, cluster_category_column, coalesce_effective, coalesce_table_merged,
-    count_vertices, extract_class_ranks, extract_numeric_values, extract_sort_keys,
-    fill_level_bytes, mixed_geometry_field, overture_road_ranking, record_coalesce_merged,
-    record_level_outcome, resolve_pass_read_workers, resolve_reserved_column_collisions,
-    scan_feature_traits, validate_cluster_schema, validate_coalesce_schema,
-    warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking, CoalesceTable, ConvertError,
-    ConvertOptions, ConvertReport, GroupInterner, LevelReport, PlanLevelReport, PlanReport,
-    SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    apply_coalesced_count, build_generalization, build_geometry_column, build_level_batch,
+    build_source_schema, class_ranking_provenance, cluster_category_column, coalesce_effective,
+    coalesce_table_merged, coalesced_count_column, count_vertices, extract_class_ranks,
+    extract_numeric_values, extract_sort_keys, fill_level_bytes, mixed_geometry_field,
+    overture_road_ranking, record_coalesce_merged, record_level_outcome, resolve_pass_read_workers,
+    resolve_reserved_column_collisions, scan_feature_traits, validate_cluster_schema,
+    validate_coalesce_schema, warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking,
+    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
+    PlanLevelReport, PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{ClusterCategories, Crs, EntryZoomProvenance, Mode, RankingProvenance};
 use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
@@ -132,6 +132,8 @@ struct Pass2Inputs<'a> {
     encode: Grant,
     /// What one more drain encode holds ([`encode_price`] at a WKB chunk).
     drain_slot_bytes: u64,
+    /// Where the buffered levels go, decided once before pass 2.
+    backing: pipeline::SinkBacking,
 }
 
 struct AssignmentInputs<'a> {
@@ -839,6 +841,12 @@ pub(super) struct RssTracker {
 
 impl RssTracker {
     pub(super) fn new(profiling_on: bool, initial_phase: &str) -> Self {
+        if profiling_on {
+            // Restart the kernel's peak-RSS mark (VmHWM) for this run, so the
+            // profile's `peak_rss_mib` is the run's true peak, not a phase
+            // boundary's. Best effort: off Linux the boundary peak stands.
+            let _ = std::fs::write("/proc/self/clear_refs", "5");
+        }
         Self {
             boundary_peak_mib: None,
             sampler: RssSampler::start_if(profiling_on, initial_phase),
@@ -1374,11 +1382,18 @@ fn build_level_ctxs<'a>(
 /// directly — never buffered or spilled).
 type LevelStat = (LevelWriteOutcome, usize, usize, u64);
 
-/// Spilled bytes per Arrow byte the spill writer puts on disk: the spill
-/// codec's ratio. Owned by the spill (track C1, #715: LZ4 under `bounded`);
-/// 1.0 is today's uncompressed Arrow IPC until the sink exposes its own.
-fn spill_bytes_per_arrow_byte() -> f64 {
-    1.0
+/// Rows pass 2 buffers: every emitted level but a finest level it streams
+/// (verbatim: partitioning, or the canonical finest level). The same rule
+/// `run_pass2_levels` reads off the level contexts.
+fn buffered_rows(emitted: &[EmitLevel], finest: usize, options: &ConvertOptions) -> usize {
+    let streams_last = matches!(options.mode, Mode::Partitioning)
+        || emitted.last().is_some_and(|e| e.orig as usize == finest);
+    let buffered = if streams_last {
+        emitted.len().saturating_sub(1)
+    } else {
+        emitted.len()
+    };
+    emitted[..buffered].iter().map(|e| e.hint).sum()
 }
 
 /// What [`reserve_spill_cache`] sizes the spill from.
@@ -1441,34 +1456,23 @@ fn reserve_spill_cache(
         row_bytes,
         avg_geom_bytes,
     } = plan;
-    // The levels pass 2 buffers: all but a finest level it streams (the same
-    // rule `run_pass2_levels` reads off the level contexts).
-    let streams_last = matches!(options.mode, Mode::Partitioning)
-        || emitted.last().is_some_and(|e| e.orig as usize == finest);
-    let buffered = if streams_last {
-        emitted.len().saturating_sub(1)
-    } else {
-        emitted.len()
-    };
-    let buffered_rows: usize = emitted[..buffered].iter().map(|e| e.hint).sum();
+    let buffered_rows = buffered_rows(emitted, finest, options);
     let spills = matches!(
         pipeline::sink_backing(
             budget,
             options.profile,
             options.mode,
             buffered_rows,
-            avg_geom_bytes
+            avg_geom_bytes,
+            row_bytes,
         ),
         pipeline::SinkBacking::Spill
     );
     if !spills || buffered_rows == 0 {
         return skip("nothing spills");
     }
-    let arrow_bytes = row_bytes.map_or_else(
-        || budget.sink_estimate(options.mode, buffered_rows, avg_geom_bytes),
-        |row| (buffered_rows as u64).saturating_mul(row),
-    );
-    let estimate_bytes = (arrow_bytes as f64 * spill_bytes_per_arrow_byte()) as u64;
+    let arrow_bytes = budget.sink_estimate(options.mode, buffered_rows, avg_geom_bytes, row_bytes);
+    let estimate_bytes = (arrow_bytes as f64 * pipeline::SPILL_BYTES_PER_ARROW_BYTE) as u64;
     let reservation = if estimate_bytes <= budget.remaining() {
         SpillReservation {
             estimate_bytes,
@@ -1557,7 +1561,15 @@ fn run_pass2_levels(
     hints: &[usize],
     inputs: Pass2Inputs<'_>,
     strategy: Pass2Strategy,
-) -> Result<(Vec<LevelStat>, Pass2Timers, pipeline::SinkMeasurement), ConvertError> {
+) -> Result<
+    (
+        Vec<LevelStat>,
+        Pass2Timers,
+        pipeline::SinkMeasurement,
+        MemoryBudget,
+    ),
+    ConvertError,
+> {
     let Pass2Inputs {
         source,
         options,
@@ -1569,23 +1581,29 @@ fn run_pass2_levels(
         footer,
         encode,
         drain_slot_bytes,
+        backing,
     } = inputs;
     let n = ctxs.len();
     // #626: filled in by the buffered engine. Stays at its default for the
     // Serial reference path and for a ladder with nothing to buffer — neither
     // holds a sink, so there is nothing to have measured.
     let mut sink_measurement = pipeline::SinkMeasurement::default();
+    // The budget while pass 2's first read holds its grants: the ledger the
+    // profile JSON records.
+    let mut ledger = budget;
     // How pass 2 reads the input: the batch chunking (identical for every
     // worker count), the resolved reader-thread count (#494), and the footer
     // geometry weight pass 1 reports (#717), which is what sizes the
     // read-ahead against the memory budget.
-    let read_tuning = ReadTuning {
+    let mut read_tuning = ReadTuning {
         budget,
         batch_size: options.read_batch_size.max(1),
         workers: resolve_pass_read_workers(ReadPass::Build, options.read_workers),
         avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
         footer,
-        profile: options.profile,
+        // #815: once `auto` spills, its read and window are sized as
+        // `bounded`'s; more of them would not make the spill faster.
+        profile: pipeline::sizing_profile(options.profile, backing),
     };
     // Output rows per input row across `levels`, from the plan's per-level
     // winner counts: what one window batch fans out to (#716).
@@ -1638,19 +1656,6 @@ fn run_pass2_levels(
             // the whole job costs a single read instead of two.
             let stream_last = ctxs[n - 1].verbatim;
             let buffered = if stream_last { n - 1 } else { n };
-            let buffered_rows: usize = hints[..buffered].iter().sum();
-            // #305: the average encoded-geometry size per input row, from the
-            // footers (#717), sizes the RAM-vs-spill estimate (falls back to
-            // calibrated constants on an empty scan). Same decision timing as before —
-            // pass 1 has always completed by this point (the assign barrier).
-            let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
-            let backing = pipeline::resolve_backing(
-                budget,
-                options.profile,
-                options.mode,
-                buffered_rows,
-                avg_geom_bytes,
-            );
             log::info!(
                 "[convert] pass 2: building {n} overview level(s) from a single read{}",
                 if stream_last {
@@ -1667,6 +1672,7 @@ fn run_pass2_levels(
                     fanout(&hints[..buffered]),
                     buffered,
                 );
+                ledger = budget;
                 let result = pipeline::run_pass2_buffered(
                     writer,
                     &ctxs[..buffered],
@@ -1679,7 +1685,7 @@ fn run_pass2_levels(
                         window: grants.window.units,
                     },
                     BufferOptions {
-                        profile: options.profile,
+                        profile: read_tuning.profile,
                         backing,
                         out_schema,
                         spill_dir: options.spill_dir.as_deref(),
@@ -1688,11 +1694,17 @@ fn run_pass2_levels(
                             drain_slot_bytes,
                             grants.read.bytes().saturating_add(grants.window.bytes()),
                         ),
+                        budget,
                     },
                 );
                 grants.release(&mut budget);
                 let result = result?;
                 sink_measurement = result.sink;
+                if sink_measurement.downgraded {
+                    // #815: a downgraded `auto` reads its finest level as
+                    // `bounded` does.
+                    read_tuning.profile = super::level::MemoryProfile::Bounded;
+                }
                 (result.levels, result.timers)
             } else {
                 (Vec::new(), Pass2Timers::default())
@@ -1705,6 +1717,9 @@ fn run_pass2_levels(
                     fanout(&hints[n - 1..]),
                     1,
                 );
+                if buffered == 0 {
+                    ledger = budget;
+                }
                 let finest = write_level_streaming(
                     writer,
                     n - 1,
@@ -1732,7 +1747,7 @@ fn run_pass2_levels(
             (stats, engine_timers)
         }
     };
-    Ok((level_stats, engine_timers, sink_measurement))
+    Ok((level_stats, engine_timers, sink_measurement, ledger))
 }
 
 /// Fold every emitted level's [`LevelStat`] into the shared bookkeeping
@@ -2060,11 +2075,12 @@ fn create_level_writer(
     let encodes = budget.encode_concurrency(
         options.profile,
         rayon::current_num_threads(),
-        encode_price(&writer_opts, &level_row_counts, row_bytes, 1),
+        encode_price(&writer_opts, &level_row_counts, options.mode, row_bytes, 1),
     );
     let drain_slot_bytes = encode_price(
         &writer_opts,
         &level_row_counts,
+        options.mode,
         row_bytes,
         super::writer::WKB_ENCODE_CHUNK_ROWS as u64,
     )
@@ -2110,14 +2126,13 @@ const ENCODE_COPIES: u64 = 5;
 /// What one in-flight row-group encode holds (#545): [`ENCODE_COPIES`] of
 /// the level's largest row group. Row-group sizes follow
 /// the writer's own per-level split ([`super::writer::projected_row_groups`]);
-/// a row is priced at the footers' bytes per input row (an upper bound for
-/// a simplified level), or at [`MemoryBudget::estimate`]'s sink row without
-/// them. A group is priced at `min_rows` at least: a pass-2 drain slot (#817
+/// a row is priced as the sink prices it ([`MemoryBudget::output_row_bytes`]). A group is priced at `min_rows` at least: a pass-2 drain slot (#817
 /// B1) also admits one WKB chunk of up to
 /// [`WKB_ENCODE_CHUNK_ROWS`](super::writer::WKB_ENCODE_CHUNK_ROWS) rows.
 fn encode_price(
     writer_opts: &OverviewWriterOptions,
     level_row_counts: &[usize],
+    mode: Mode,
     row_bytes: Option<u64>,
     min_rows: u64,
 ) -> Price {
@@ -2140,20 +2155,14 @@ fn encode_price(
         .unwrap_or(0)
         .max(1) as u64;
     let largest = largest.max(min_rows);
-    match row_bytes {
-        Some(row) => Price::new(
-            largest
-                .saturating_mul(row)
-                .saturating_mul(ENCODE_COPIES)
-                .max(1),
-            PriceBasis::Footer,
-        ),
-        None => Price::model(
-            MemoryBudget::with_available(None)
-                .estimate(MemoryPhase::Write, largest, None)
-                .saturating_mul(ENCODE_COPIES)
-                .max(1),
-        ),
+    let bytes = largest
+        .saturating_mul(MemoryBudget::with_available(None).output_row_bytes(mode, None, row_bytes))
+        .saturating_mul(ENCODE_COPIES)
+        .max(1);
+    if row_bytes.is_some() {
+        Price::new(bytes, PriceBasis::Footer)
+    } else {
+        Price::model(bytes)
     }
 }
 
@@ -3508,13 +3517,28 @@ fn log_rss_true_peak_if_notable(boundary_peak_mib: Option<f64>, report: &Option<
 /// JSON. Pulled out of [`run_stages`] for clippy's
 /// function-length ceiling; called once, right after the last `log_phase`.
 fn finish_convert_rss(mut rss: RssTracker) -> (Option<f64>, Option<RssSamplerReport>) {
-    let peak_rss_mib = rss.boundary_peak_mib;
+    // The kernel's mark sees between the boundaries too; with profiling on,
+    // `RssTracker::new` restarted it for this run.
+    let hwm_mib = rss.sampler.as_ref().and_then(|_| {
+        super::procmem::read_proc_status()?
+            .hwm_kib
+            .map(|k| k as f64 / 1024.0)
+    });
+    let peak_rss_mib = [rss.boundary_peak_mib, hwm_mib]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max);
     log::info!(
         "[rss] convert peak: {}",
         peak_rss_mib.map_or_else(|| "unknown".to_string(), |v| format!("{v:.0} MiB"))
     );
     let rss_sampler_report = rss.finish_sampler();
     log_rss_true_peak_if_notable(peak_rss_mib, &rss_sampler_report);
+    // Never below what the sampler saw either.
+    let peak_rss_mib = peak_rss_mib
+        .into_iter()
+        .chain(rss_sampler_report.as_ref().map(|r| r.true_peak_mib))
+        .reduce(f64::max);
     (peak_rss_mib, rss_sampler_report)
 }
 
@@ -3667,7 +3691,7 @@ pub(crate) fn run_stages(
         out_schema,
         non_geom_cols,
         effective_max_row_group_size,
-        encode,
+        mut encode,
         drain_slot_bytes,
     } = create_level_writer(
         output_path,
@@ -3688,6 +3712,27 @@ pub(crate) fn run_stages(
         },
         diagnostics,
     )?;
+    // #305: the footers' geometry weight and row price size the RAM-vs-spill
+    // estimate. Decided after the writer's encode grant, as always.
+    let backing = pipeline::resolve_backing(
+        budget,
+        options.profile,
+        options.mode,
+        buffered_rows(emitted, finest, options),
+        (num_rows > 0).then(|| geom_bytes / num_rows as u64),
+        row_bytes,
+    );
+    let sizing = pipeline::sizing_profile(options.profile, backing);
+    if sizing != options.profile {
+        // #815: an `auto` run that spills encodes as `bounded` does.
+        budget.release(encode);
+        encode = budget.encode_concurrency(
+            sizing,
+            rayon::current_num_threads(),
+            Price::new(encode.unit_bytes, PriceBasis::Footer),
+        );
+        writer.set_encode_concurrency(encode.units)?;
+    }
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
     // Pass-1 O(N) scratch has been freed by here; this marks the memory floor
@@ -3733,7 +3778,7 @@ pub(crate) fn run_stages(
     // the caller left it at IN_FLIGHT_BATCHES_AUTO) and surface it (#264).
     let in_flight_batches = resolve_and_log_in_flight_batches("pass 2", options.in_flight_batches);
 
-    let (level_stats, pass2_engine_timers, sink_measurement) = run_pass2_levels(
+    let (level_stats, pass2_engine_timers, sink_measurement, pass2_ledger) = run_pass2_levels(
         budget,
         &mut writer,
         &ctxs,
@@ -3749,6 +3794,7 @@ pub(crate) fn run_stages(
             footer,
             encode,
             drain_slot_bytes,
+            backing,
         },
         strategy,
     )?;
@@ -3822,6 +3868,7 @@ pub(crate) fn run_stages(
             in_flight_batches,
             sink_measurement,
             spill_reservation,
+            pass2_ledger,
             pass1_memory: preflight_report,
             pass0,
         },
@@ -3931,6 +3978,8 @@ struct ProfileJsonContext<'a> {
     sink_measurement: pipeline::SinkMeasurement,
     /// #716: the spill page-cache reservation (`pass2.spill_reservation`).
     spill_reservation: SpillReservation,
+    /// The budget while pass 2's first read held its grants (`pass2.budget`).
+    pass2_ledger: MemoryBudget,
     /// #543 + #626 item 4: the pass-1 memory preflight's verdict.
     pass1_memory: super::convert::Pass1MemoryReport,
     /// #788: what pass 0 staged; `None` for local input.
@@ -3975,6 +4024,7 @@ fn emit_profile_json(ctx: ProfileJsonContext<'_>, diagnostics: &crate::diagnosti
             in_flight_batches: ctx.in_flight_batches,
             sink_measurement: ctx.sink_measurement,
             spill_reservation: ctx.spill_reservation,
+            pass2_ledger: ctx.pass2_ledger,
             pass1_memory: ctx.pass1_memory,
             pass0: ctx.pass0,
         },
@@ -4032,6 +4082,8 @@ struct ProfileJsonInputs<'a> {
     sink_measurement: pipeline::SinkMeasurement,
     /// #716: the spill page-cache reservation (`pass2.spill_reservation`).
     spill_reservation: SpillReservation,
+    /// The budget while pass 2's first read held its grants (`pass2.budget`).
+    pass2_ledger: MemoryBudget,
     /// #543 + #626 item 4: the pass-1 memory preflight's verdict
     /// (`pass1_memory_preflight` in the dump).
     pass1_memory: super::convert::Pass1MemoryReport,
@@ -4194,6 +4246,9 @@ fn write_profile_json(
             // #716: the spill's page cache, reserved from the budget before
             // any pass-2 grant when a cgroup charges it and the spill fits
             // the allowance; `reason` says why it was or was not.
+            // The memory ledger while pass 2's first read held its grants:
+            // every phase's reservation and grant, and the totals.
+            "budget": inputs.pass2_ledger.ledger_json(),
             "spill_reservation": {
                 "estimate_bytes": inputs.spill_reservation.estimate_bytes,
                 "reserved_bytes": inputs.spill_reservation.reserved_bytes,
@@ -7000,6 +7055,9 @@ fn assemble_level_batch(
     Ok(out_batch)
 }
 
+/// One level's kept batch rows, their geometries and vertex count.
+type LevelSelection = (Vec<usize>, Vec<Arc<Geometry<f64>>>, usize);
+
 /// One cascade-fold step's result, sharing (`Arc`) the kept geometry instead
 /// of owning a deep clone (#499).
 ///
@@ -7042,7 +7100,8 @@ pub(super) fn process_batch_cascade(
     row_offset: usize,
     ctxs: &[LevelStreamCtx<'_>],
     timers: &Pass2Timers,
-) -> Result<Vec<Option<(RecordBatch, usize)>>, ConvertError> {
+    share: bool,
+) -> Result<Vec<Option<(pipeline::LevelBatch, usize)>>, ConvertError> {
     let Some(finest) = ctxs.last() else {
         return Ok(Vec::new());
     };
@@ -7192,7 +7251,8 @@ pub(super) fn process_batch_cascade(
     // --- Assemble every level's batch, in the per-level selection's
     // ascending row order (chain reps interleaved by global row index).
     let t_build = Instant::now();
-    let results: Vec<Result<Option<(RecordBatch, usize)>, ConvertError>> = ctxs
+    // Per level: its kept batch rows, their geometries, and their vertices.
+    let selections: Vec<LevelSelection> = ctxs
         .par_iter()
         .enumerate()
         .map(|(li, ctx)| {
@@ -7234,11 +7294,60 @@ pub(super) fn process_batch_cascade(
                     }
                 }
             }
+            (kept_idx, kept_geoms, verts)
+        })
+        .collect();
+    // #852: the levels share their rows' properties, except where clustering
+    // rewrites the accumulate columns per level.
+    let shared = (share && !finest.cluster_enabled)
+        .then(|| {
+            pipeline::SharedRows::new(
+                batch,
+                finest.non_geom_cols,
+                selections.iter().map(|(kept, _, _)| kept.as_slice()),
+            )
+        })
+        .transpose()?
+        .map(Arc::new);
+    let results: Vec<Result<Option<(pipeline::LevelBatch, usize)>, ConvertError>> = selections
+        .into_par_iter()
+        .zip(ctxs)
+        .map(|((kept_idx, kept_geoms, verts), ctx)| {
             if kept_idx.is_empty() {
                 return Ok(None);
             }
-            let out_batch = assemble_level_batch(batch, row_offset, ctx, &kept_idx, &kept_geoms)?;
-            Ok(Some((out_batch, verts)))
+            let out = match &shared {
+                Some(rows) => {
+                    let mut own = vec![build_geometry_column(
+                        ctx.source_schema,
+                        ctx.geom_idx,
+                        &kept_geoms,
+                    )?];
+                    let schema = if ctx.coalesce_enabled {
+                        let globals: Vec<usize> =
+                            kept_idx.iter().map(|&i| row_offset + i).collect();
+                        own.push(coalesced_count_column(&globals, ctx.coalesce_table));
+                        ctx.out_schema
+                    } else {
+                        ctx.source_schema
+                    };
+                    pipeline::LevelBatch::shared(
+                        Arc::new(schema.clone()),
+                        rows,
+                        &kept_idx,
+                        ctx.geom_idx,
+                        own,
+                    )
+                }
+                None => pipeline::LevelBatch::Owned(assemble_level_batch(
+                    batch,
+                    row_offset,
+                    ctx,
+                    &kept_idx,
+                    &kept_geoms,
+                )?),
+            };
+            Ok(Some((out, verts)))
         })
         .collect();
     Pass2Timers::add(&timers.build, t_build);
@@ -10221,9 +10330,9 @@ mod tests {
         opts.max_row_group_size = 128;
         let counts = [1_000usize, 50_000, 200_000];
         let row = Some(100u64);
-        let group = encode_price(&opts, &counts, row, 1).bytes;
+        let group = encode_price(&opts, &counts, Mode::Duplicating, row, 1).bytes;
         let chunk = crate::overview::writer::WKB_ENCODE_CHUNK_ROWS as u64;
-        let slot = encode_price(&opts, &counts, row, chunk).bytes;
+        let slot = encode_price(&opts, &counts, Mode::Duplicating, row, chunk).bytes;
         assert!(group < slot, "group {group} B vs slot {slot} B");
         assert_eq!(slot, 10_000 * 100 * ENCODE_COPIES);
     }
@@ -10857,13 +10966,14 @@ mod tests {
             (r, budget.remaining())
         };
         // Two buffered levels (the finest streams) of 1,000 rows at 100 B:
-        // 200,000 B, which fits 0.6 × 1 MB.
+        // 200,000 Arrow bytes, 80,000 spilled at LZ4's 0.4 (#815), which fits
+        // 0.6 × 1 MB.
         let (fits, left) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &bounded, 100);
         assert_eq!(
             (fits.estimate_bytes, fits.reserved_bytes, fits.reason),
-            (200_000, 200_000, "fits the allowance")
+            (80_000, 80_000, "fits the allowance")
         );
-        assert_eq!(left, 480_000);
+        assert_eq!(left, 552_000);
         // A spill past the allowance reserves nothing: the cache cannot hold
         // it, and reserving it would only starve the grants.
         let (big, left) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &bounded, 1_000);
