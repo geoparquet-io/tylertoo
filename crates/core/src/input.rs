@@ -1113,7 +1113,10 @@ pub(crate) mod remote {
                     .with_url(origin)
                     .with_client_options(ClientOptions::new().with_allow_http(true));
                 let builder = match query {
-                    Some(q) => builder.with_http_connector(QueryConnector(q.into())),
+                    Some(q) => builder.with_http_connector(QueryConnector {
+                        origin: key.clone(),
+                        query: q.into(),
+                    }),
                     None => builder,
                 };
                 Arc::new(
@@ -1159,16 +1162,59 @@ pub(crate) mod remote {
     /// query is added below it, at the transport: `object_store` never holds
     /// the query, so none of its error messages (which quote the request URI)
     /// can leak it.
+    ///
+    /// The store is per URL, but the connection pool below it is per origin,
+    /// as for an unsigned URL's cached store: a client per URL held a socket
+    /// per input, and 1,500 signed URLs ran out of file descriptors.
     #[derive(Debug)]
-    struct QueryConnector(String);
+    struct QueryConnector {
+        origin: String,
+        query: String,
+    }
+
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+    )]
+    static HTTP_CLIENTS: OnceLock<Mutex<std::collections::HashMap<String, HttpClient>>> =
+        OnceLock::new();
 
     impl HttpConnector for QueryConnector {
         fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+            let mut clients = HTTP_CLIENTS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inner = match clients.get(&self.origin) {
+                Some(client) => client.clone(),
+                None => {
+                    let client = ReqwestConnector::default().connect(options)?;
+                    #[cfg(test)]
+                    CLIENTS_BUILT
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(self.origin.clone());
+                    clients.insert(self.origin.clone(), client.clone());
+                    client
+                }
+            };
             Ok(HttpClient::new(QueryService {
-                inner: ReqwestConnector::default().connect(options)?,
-                query: self.0.clone(),
+                inner,
+                query: self.query.clone(),
             }))
         }
+    }
+
+    #[cfg(test)]
+    static CLIENTS_BUILT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// How many connection pools signed URLs on `origin` have built.
+    #[cfg(test)]
+    pub(super) fn shared_http_clients_for(origin: &str) -> usize {
+        let built = CLIENTS_BUILT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        built.iter().filter(|o| *o == origin).count()
     }
 
     #[derive(Debug)]
@@ -4124,6 +4170,14 @@ pub(crate) mod remote {
                 assert!(store.to_string().starts_with("HttpStore"), "{url}: {store}");
                 assert_eq!(location.as_ref(), key, "{url}");
             }
+            // Each signed URL gets its own store, but one origin's share a
+            // connection pool: a client each held a socket per input, and a
+            // manifest of 1,500 signed URLs ran out of file descriptors.
+            for n in 0..3 {
+                store_and_location(&format!("https://pool820.test/{n}.parquet?sig=x{n}"))
+                    .expect("signed http URL");
+            }
+            assert_eq!(super::shared_http_clients_for("https://pool820.test"), 1);
             // An unsigned query keeps the cloud store and its credentials
             // (Azure's is not built in, so it stays refused).
             let err = store_and_location("https://acct.blob.core.windows.net/c/a.parquet?x-id=1")
