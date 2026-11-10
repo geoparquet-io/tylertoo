@@ -2128,10 +2128,7 @@ fn create_level_writer(
         budget.remaining(),
     );
     writer_opts.encode_concurrency = encodes.units;
-    // Overlapping levels holds up to two levels' row groups (#817): -15-20%
-    // wall on Madagascar adm4 but +25% peak RSS at 16 threads, over auto's
-    // 10% allowance, so only `speed` (no memory promise) takes it.
-    writer_opts.overlap_levels = matches!(options.profile, super::level::MemoryProfile::Speed);
+    writer_opts.overlap_levels = overlaps_levels(options.profile);
 
     let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
@@ -7171,8 +7168,24 @@ pub(super) fn process_batch_cascade(
 
 // ============================================================================
 
+/// Whether pass 2's writer lets the previous level's row-group encodes run
+/// on under the next level (#817 W1). It holds up to two levels' row groups:
+/// on Madagascar adm4 z12, -12-14% wall for +3% (64 threads) to +10% (16)
+/// peak RSS; deeper overlap bought 2-4% more for +9-23%. `bounded` keeps
+/// its one-level envelope.
+fn overlaps_levels(profile: super::level::MemoryProfile) -> bool {
+    !matches!(profile, super::level::MemoryProfile::Bounded)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auto_overlaps_level_encodes_bounded_does_not() {
+        use super::super::level::MemoryProfile;
+        assert!(super::overlaps_levels(MemoryProfile::Auto));
+        assert!(super::overlaps_levels(MemoryProfile::Speed));
+        assert!(!super::overlaps_levels(MemoryProfile::Bounded));
+    }
 
     /// Array-of-structs fixture → the column-major table the engine takes
     /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
