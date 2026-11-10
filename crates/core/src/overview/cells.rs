@@ -632,9 +632,10 @@ fn aggregate(
         rows += n;
         // Checked before the batch lands, so a cell map that would outgrow
         // the budget fails here, not by OOM kill: first for the batch's
-        // partial maps at worst (a new cell per row), then, once they are
-        // built, for them as they are and the shards they grow.
-        let per_row = cell_bytes(specs) + FIRST_COUNTS_BYTES;
+        // partial maps at worst (a new cell per row, in a table that may be
+        // mid-doubling: three slots a row), then, once they are built, for
+        // them as they are and the shards they grow.
+        let per_row = 3 * cell_bytes(specs) + FIRST_COUNTS_BYTES;
         budget.require(
             MemoryPhase::Scan,
             cells.bytes(specs, cat_bytes, &[]) + interner.heap_bytes() + n as u64 * per_row,
