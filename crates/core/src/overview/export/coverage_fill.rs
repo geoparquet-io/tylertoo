@@ -1440,13 +1440,16 @@ fn project_polygon(p: &geo::Polygon<f64>, proj: &crate::mvt::TileProjector) -> S
         .collect()
 }
 
+/// A run frame's stage: it is written to the run's file when full.
+const FRAME_STAGE_BYTES: usize = 8192;
+
 fn open_run(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().append(true).open(path)
 }
 
 /// A run frame's write buffer; see [`SpillBuckets::write_frame`].
 struct FrameStage<F> {
-    buf: [u8; 8192],
+    buf: [u8; FRAME_STAGE_BYTES],
     len: usize,
     /// Frame bytes freed so far, priced as [`shape_capacity_bytes`] does.
     freed: usize,
@@ -1562,7 +1565,7 @@ impl SpillBuckets {
         open: impl FnOnce(usize) -> Result<std::fs::File, super::ExportError>,
     ) -> Result<(), super::ExportError> {
         let mut out = FrameStage {
-            buf: [0; 8192],
+            buf: [0; FRAME_STAGE_BYTES],
             len: 0,
             freed: 0,
             file: None,
@@ -2311,32 +2314,7 @@ fn seed_batch(
         .saturating_add((buckets.tiles.len() + new_runs) * 512)
         .saturating_add(pending.len() * std::mem::size_of::<(&u64, &Bucket)>());
     if held.saturating_add(RUN_WRITER_BYTES) > buckets.budget {
-        // #830: each write is charged the buckets still waiting, its own
-        // bucket less what its encoding has freed, and the runs' nodes. The
-        // writes that free the most net of a new node go first, so the charge
-        // stays within the check above until only the runs' nodes are left;
-        // write order between tiles is immaterial.
-        let mut serial: Vec<(u64, Bucket, usize)> = pending
-            .into_iter()
-            .map(|(key, (shapes, credits))| {
-                let bytes = shape_capacity_bytes(&shapes)
-                    + credits.capacity() * std::mem::size_of::<Collapsed>();
-                (key, (shapes, credits), bytes)
-            })
-            .collect();
-        serial.sort_by_key(|&(key, _, bytes)| {
-            let node = if buckets.tiles.contains_key(&key) {
-                0
-            } else {
-                512
-            };
-            (std::cmp::Reverse(bytes + 512 - node), key)
-        });
-        let mut waiting = pending_bytes;
-        for (key, (mut shapes, mut credits), bytes) in serial {
-            buckets.append(key, &mut shapes, &mut credits, waiting)?;
-            waiting -= bytes;
-        }
+        seed_serial(buckets, pending, pending_bytes)?;
         return Ok(());
     }
     for key in pending.keys() {
@@ -2370,6 +2348,66 @@ fn seed_batch(
         write(&mut frames)?;
     }
     Ok(())
+}
+
+/// The serial seed (#830): each write is charged the buckets still waiting,
+/// its own bucket less what its encoding has freed, and the runs' nodes.
+/// Writes go in three passes, each in key order, with no workspace of their
+/// own: first the buckets that free at least a new run's node and whose
+/// frame fits the encoder's stage (freed before their run opens), then the
+/// other buckets that free at least a node, then the rest. The charge so
+/// stays within the window's pending check until only the runs' nodes,
+/// which main also required, are left. Write order between tiles is
+/// immaterial.
+fn seed_serial(
+    buckets: &mut SpillBuckets,
+    mut pending: SeedBuckets,
+    pending_bytes: usize,
+) -> Result<(), super::ExportError> {
+    let bytes = |(shapes, credits): &(Vec<Shape>, Vec<Collapsed>)| {
+        shape_capacity_bytes(shapes) + credits.capacity() * std::mem::size_of::<Collapsed>()
+    };
+    let frees_a_node = |tiles: &std::collections::BTreeMap<u64, tempfile::TempPath>,
+                        key: u64,
+                        bucket: &(Vec<Shape>, Vec<Collapsed>)| {
+        tiles.contains_key(&key) || bytes(bucket) >= 512
+    };
+    let mut waiting = pending_bytes;
+    for pass in 0..3 {
+        let mut after = None;
+        loop {
+            let tiles = &buckets.tiles;
+            let next = pending
+                .range((
+                    after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                    std::ops::Bound::Unbounded,
+                ))
+                .find(|&(&key, bucket)| match pass {
+                    0 => {
+                        frees_a_node(tiles, key, bucket) && frame_bytes(bucket) <= FRAME_STAGE_BYTES
+                    }
+                    1 => frees_a_node(tiles, key, bucket),
+                    _ => true,
+                })
+                .map(|(&key, _)| key);
+            let Some(key) = next else { break };
+            after = Some(key);
+            let mut bucket = pending.remove(&key).expect("found above");
+            let freed = bytes(&bucket);
+            buckets.append(key, &mut bucket.0, &mut bucket.1, waiting)?;
+            waiting -= freed;
+        }
+    }
+    Ok(())
+}
+
+/// The bytes [`SpillBuckets::write_frame`] encodes for a bucket.
+fn frame_bytes((shapes, credits): &(Vec<Shape>, Vec<Collapsed>)) -> usize {
+    16 + credits.len() * 24
+        + shapes
+            .iter()
+            .map(|shape| 8 + shape.iter().map(|ring| 8 + ring.len() * 16).sum::<usize>())
+            .sum::<usize>()
 }
 
 /// Build the [`FillMap`] for zooms `min_zoom..finest_zoom` from the level
@@ -3632,6 +3670,25 @@ pub(super) mod tests {
             "the serial seed held {} B against a {budget} B grant",
             counts.seed_serial_peak
         );
+    }
+
+    /// #830 review: a bucket whose first ring outgrows the encoder's stage
+    /// opens its run before freeing anything. A smaller bucket written first
+    /// frees room for that run's node in a grant of just the pending bytes.
+    #[test]
+    fn the_serial_seed_frees_room_before_a_ring_larger_than_the_stage() {
+        let opts = super::super::ExportOptions::default();
+        let ring = |n: u32| -> Ring { (0..n).map(|i| [f64::from(i), 0.0]).collect() };
+        let mut pending = SeedBuckets::new();
+        pending.insert(1, (vec![vec![ring(600)]], Vec::new()));
+        pending.insert(2, (vec![vec![ring(120)]], Vec::new()));
+        assert!(frame_bytes(&pending[&1]) > FRAME_STAGE_BYTES);
+        let bytes: usize = pending.values().map(|(s, _)| shape_capacity_bytes(s)).sum();
+        let mut buckets = SpillBuckets::new(&opts, bytes);
+        cost_probe::take();
+        seed_serial(&mut buckets, pending, bytes).expect("the small bucket makes room");
+        assert!(cost_probe::take().seed_serial_peak <= bytes);
+        assert_eq!(buckets.tiles.len(), 2);
     }
 
     /// #817 review: a tile built alone needs no more workspace than the
