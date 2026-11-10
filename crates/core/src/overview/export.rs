@@ -5596,7 +5596,14 @@ fn scan_all_levels_from(
             // time, level after level, kept the consumer to about one core.
             // Counts, unions and feature counts are sums and min/max, so the
             // scans are identical however rows are grouped.
-            let size_rows = SIZE_BBOXES_MIN_ROWS.saturating_mul(rayon::current_num_threads());
+            // `bounded` sizes batch by batch, as before #817: a pool's worth
+            // at once held the bounded scan's peak at 2.3x (Oregon, 80 -> 180 MiB).
+            let size_rows = match band.profile {
+                MemoryProfile::Bounded => EXPORT_BATCH_SIZE,
+                MemoryProfile::Auto | MemoryProfile::Speed => {
+                    SIZE_BBOXES_MIN_ROWS.saturating_mul(rayon::current_num_threads())
+                }
+            };
             let mut pending: Vec<Option<TileBounds>> = Vec::with_capacity(size_rows);
             let mut pending_band = 0;
             let mut size_pending = |j: usize, pending: &mut Vec<Option<TileBounds>>| {
@@ -12803,8 +12810,8 @@ mod tests {
     }
 
     /// The export scan reads a band of several row groups with the ordered
-    /// parallel reader under `auto`, and with one reader under `bounded`,
-    /// to the same scans (#817: one reader thread capped the scan at about
+    /// parallel reader and sizes it at once under `auto`, and with one
+    /// reader, batch by batch, under `bounded`, to the same scans (#817: one reader thread capped the scan at about
     /// one core).
     #[test]
     fn scan_reads_and_sizes_a_band_in_parallel() {
@@ -12855,8 +12862,9 @@ mod tests {
             flushes, 1,
             "64 threads size a 40,000-row band at once, not batch by batch"
         );
-        let (bounded, readers, _) = scan(MemoryProfile::Bounded);
+        let (bounded, readers, flushes) = pool.install(|| scan(MemoryProfile::Bounded));
         assert_eq!(readers, 1, "bounded keeps the one scan reader");
+        assert_eq!(flushes, 5, "bounded sizes batch by batch");
         assert_eq!(auto, bounded);
     }
 
