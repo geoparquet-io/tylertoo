@@ -282,13 +282,14 @@ impl<const FULL: bool> FromArgMatches for ConvertArgs<FULL> {
             (!FULL).then_some("overview_only"),
         )?;
         let matches = &complete;
-        let mut options = ConvertOptions::default();
+        let mut syntax = ConvertSyntax::default();
+        syntax.update_from_arg_matches(matches)?;
+        // Explicit flags overlay the preset's defaults (#822).
+        let mut options = super::Preset::convert(syntax.preset, ConvertOptions::default());
         options.update_from_arg_matches(matches)?;
         options.check_finite_numbers().map_err(|error| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, error.to_string())
         })?;
-        let mut syntax = ConvertSyntax::default();
-        syntax.update_from_arg_matches(matches)?;
         Ok(Self {
             options,
             syntax,
@@ -361,7 +362,7 @@ impl<const FULL: bool> ConvertArgs<FULL> {
         if self.syntax.representation.is_some() {
             options.representation = super::representation(self.syntax.representation.as_deref())?;
         }
-        options.with_generalization(&overrides, self.syntax.verbatim)
+        options.with_generalization_preset(&overrides, self.syntax.verbatim, self.syntax.preset)
     }
 }
 
@@ -530,6 +531,13 @@ pub struct ExportPmtilesArgs {
 
     #[command(flatten)]
     pub export: ExportArgs<true>,
+
+    /// Start from another tool's export defaults instead of tylertoo's;
+    /// options you pass still override them. `tippecanoe` sets its tile
+    /// buffer, size caps and size valve:
+    /// <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>.
+    #[arg(long, value_name = "tippecanoe", hide_possible_values = true)]
+    pub preset: Option<super::Preset>,
 
     /// Write the JSON export report, with per-zoom tile and feature counts,
     /// to this path.
@@ -778,9 +786,10 @@ pub fn tiles_options(args: &TilesArgs) -> Result<TilesOptions, TilesError> {
         .map_err(TilesError::Convert)?;
     // LOCKSTEP with the plan's placeholder zoom: see `keywords::convert`.
     convert.auto_max_zoom = args.max_zoom.is_auto();
-    let export = args
-        .export
-        .apply(TilesOptions::export_defaults(args.tuning.syntax.verbatim));
+    let export = args.export.apply(super::Preset::export(
+        args.tuning.syntax.preset,
+        TilesOptions::export_defaults(args.tuning.syntax.verbatim),
+    ));
     Ok(TilesOptions {
         convert,
         export: ExportOptions {
@@ -836,7 +845,9 @@ pub fn export_options(args: &ExportPmtilesArgs) -> Result<ExportOptions, ConfigE
     Ok(ExportOptions {
         properties: args.properties.clone(),
         metadata: args.publication.clone(),
-        ..args.export.apply(ExportOptions::default())
+        ..args
+            .export
+            .apply(super::Preset::export(args.preset, ExportOptions::default()))
     })
 }
 

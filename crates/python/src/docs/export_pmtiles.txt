@@ -5,6 +5,10 @@ Args:
     output: PMTiles archive to write.
     layer_name: MVT layer name.
     tile_buffer: Tile edge buffer in pixels, at most 256.
+    preset: `"tippecanoe"` starts from tippecanoe's tile buffer, size
+        limits and size valve instead of tylertoo's; an option you pass
+        still applies. See
+        [the tippecanoe preset](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset).
     extent: Tile resolution in MVT units.
     tile_size_limit: Maximum raw (uncompressed) tile size in
         bytes, a backstop behind `max_compressed_tile_size`;

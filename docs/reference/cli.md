@@ -181,6 +181,7 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 | `--tile-range <LO..HI>` | Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at one zoom, plus their descendants. Ranges that partition a zoom give disjoint archives, which `tylertoo merge` can join. |
 | `--zoom-ceiling <ZOOM>` | Emit only the tiles at or below this zoom, the coarse half of a sharded build. A partial overview kept from `tiles --shard coarse` needs a ceiling at or below its own. |
 | `--feature-id <COLUMN>` | Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. By default features have no id. |
+| `--preset <tippecanoe>` | Start from another tool's export defaults instead of tylertoo's; options you pass still override them. `tippecanoe` sets its tile buffer, size caps and size valve: <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>. Possible values: `tippecanoe`. |
 | `--report <PATH>` | Write the JSON export report, with per-zoom tile and feature counts, to this path. |
 | `-f`, `--force` | Overwrite the output if it exists. |
 
@@ -441,6 +442,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | Option | Description |
 | --- | --- |
 | `--bbox <XMIN,YMIN,XMAX,YMAX>` | Convert features whose bbox intersects this lon/lat box, or would one ±360° wrap away (0..360 data). Skips row groups outside the box. |
+| `--preset <tippecanoe>` | Start from another tool's defaults instead of tylertoo's; options you pass still override them. `tippecanoe` sets its drop rate, gamma and simplification, and with `tiles` its tile buffer, size caps and size valve: <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>. Possible values: `tippecanoe`. |
 
 ### Filtering
 

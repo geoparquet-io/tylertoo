@@ -127,11 +127,14 @@ fn pyramid_has_parity_with_export_flags() {
         // #803: refused; a variable-depth band's missing tiles mean "draw
         // the stored ancestor", which the band merge cannot keep.
         "generate-variable-depth-tile-pyramid",
+        // #822: bands tile verbatim and take no convert tuning, so a
+        // tippecanoe preset could set only half of itself.
+        "preset",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect();
-    assert_eq!(exemptions.len(), 7);
+    assert_eq!(exemptions.len(), 8);
     let missing: BTreeSet<_> = export.difference(&pyramid).cloned().collect();
     assert_eq!(missing, exemptions);
 }

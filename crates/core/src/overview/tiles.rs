@@ -2377,6 +2377,38 @@ mod tests {
         );
     }
 
+    /// #822: the tippecanoe preset reaches the archive. A point 6.5 tile
+    /// pixels east of the z1 seam sits inside the western tile's default
+    /// 8 px buffer but outside tippecanoe's 5 px one.
+    #[test]
+    fn tippecanoe_preset_narrows_the_tile_buffer_in_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("seam.parquet");
+        // One z1 tile spans 180 degrees, so a tile pixel is 180/256 degrees.
+        let lon = 6.5 * 180.0 / 256.0;
+        write_input(&input, &[Some(Point::new(lon, 10.0).into())], false, None);
+        let tiles_at_z1 = |keywords: serde_json::Value| {
+            let mut keywords = keywords.as_object().unwrap().clone();
+            keywords.insert("min_zoom".into(), 1.into());
+            keywords.insert("max_zoom".into(), 1.into());
+            let options = crate::overview::config::keywords::tiles(keywords).unwrap();
+            let output = dir.path().join("out.pmtiles");
+            let _ = std::fs::remove_file(&output);
+            let outcome =
+                convert_to_pmtiles(&TilesInput::Path(input.clone()), &output, &options).unwrap();
+            let TilesOutcome::Converted(report) = outcome else {
+                panic!("expected a full conversion, got {outcome:?}");
+            };
+            report.export.total_tile_features
+        };
+        assert_eq!(tiles_at_z1(serde_json::json!({})), 2, "default 8 px buffer");
+        assert_eq!(
+            tiles_at_z1(serde_json::json!({"preset": "tippecanoe"})),
+            1,
+            "tippecanoe's 5 px buffer"
+        );
+    }
+
     /// The derived layer name follows core's input rules for both shapes.
     #[test]
     fn derive_layer_name_follows_input_rules() {

@@ -696,6 +696,74 @@ mod config_parity {
         );
     }
 
+    /// #822: `--preset tippecanoe` and `preset="tippecanoe"` resolve to the
+    /// same options on every command that takes it, explicit values winning.
+    #[test]
+    fn preset_cli_python_core_configs_are_equal() {
+        use tylertoo_core::internal::overview::config::Preset;
+        let same = |cli: Value, python: Value, core: Value| {
+            assert_eq!(cli, core);
+            assert_eq!(python, core);
+        };
+        let tippecanoe = Some(Preset::Tippecanoe);
+
+        let args = cli::TilesArgs::parse_from([
+            "tiles",
+            "in",
+            "out",
+            "--preset",
+            "tippecanoe",
+            "--tile-buffer",
+            "3",
+            "--simplify-factor",
+            "0.5",
+        ]);
+        let python = tiles_config(native_keywords(
+            json!({"preset": "tippecanoe", "tile_buffer": 3, "simplify_factor": 0.5}),
+        ))
+        .unwrap();
+        let mut core = TilesOptions::default();
+        core.convert = Preset::convert(tippecanoe, core.convert);
+        core.convert.simplify.factor = 0.5;
+        core.export = Preset::export(tippecanoe, core.export);
+        core.export.tile_buffer = 3;
+        same(
+            serde_json::to_value(cli::tiles_options(&args).unwrap()).unwrap(),
+            serde_json::to_value(python).unwrap(),
+            serde_json::to_value(core).unwrap(),
+        );
+
+        let args =
+            cli::OverviewArgs::parse_from(["overview", "in", "out", "--preset", "tippecanoe"]);
+        let python = overview_config(native_keywords(json!({"preset": "tippecanoe"}))).unwrap();
+        same(
+            serde_json::to_value(cli::overview_options(&args).unwrap()).unwrap(),
+            serde_json::to_value(python).unwrap(),
+            serde_json::to_value(Preset::convert(tippecanoe, ConvertOptions::default())).unwrap(),
+        );
+
+        let args = cli::ExportPmtilesArgs::parse_from([
+            "export-pmtiles",
+            "in",
+            "out",
+            "--preset",
+            "tippecanoe",
+            "--size-valve",
+            "merge",
+        ]);
+        let python = export_config(native_keywords(
+            json!({"preset": "tippecanoe", "size_valve": "merge"}),
+        ))
+        .unwrap();
+        let mut core = Preset::export(tippecanoe, ExportOptions::default());
+        core.size_valve = tylertoo_core::SizeValve::Merge;
+        same(
+            serde_json::to_value(cli::export_options(&args).unwrap()).unwrap(),
+            serde_json::to_value(python).unwrap(),
+            serde_json::to_value(core).unwrap(),
+        );
+    }
+
     #[test]
     fn pyramid_cli_python_core_configs_are_equal() {
         let defaults =
