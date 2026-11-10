@@ -1799,7 +1799,7 @@ fn run_pass2_levels(
 /// parallel `spill_bytes` vector (same push/skip pattern, so the two stay the
 /// same length — the `TYLERTOO_PROFILE_JSON` per-level dump).
 fn build_level_reports(
-    emitted: &[EmitLevel],
+    (emitted, floor): (&[EmitLevel], Option<u8>),
     level_stats: Vec<LevelStat>,
     skipped: &mut Vec<SkippedLevelReport>,
     diagnostics: &crate::diagnostics::Diagnostics,
@@ -1810,11 +1810,14 @@ fn build_level_reports(
         let reports_before = level_reports.len();
         record_level_outcome(
             outcome,
-            SkippedLevelReport {
-                planned_level: e.orig as usize,
-                gsd: e.gsd,
-                zoom: e.zoom,
-            },
+            (
+                SkippedLevelReport {
+                    planned_level: e.orig as usize,
+                    gsd: e.gsd,
+                    zoom: e.zoom,
+                },
+                floor,
+            ),
             (e.hint, rows, vertices),
             &mut level_reports,
             skipped,
@@ -3945,8 +3948,12 @@ pub(crate) fn run_stages(
     // entry at the end of the run.
     release_in_parallel(coalesce_tables);
 
-    let (mut level_reports, level_spill_bytes) =
-        build_level_reports(emitted, level_stats, &mut skipped, diagnostics);
+    let (mut level_reports, level_spill_bytes) = build_level_reports(
+        (emitted, options.shard.map(|r| r.pivot_zoom())),
+        level_stats,
+        &mut skipped,
+        diagnostics,
+    );
     skipped.sort_by_key(|s| s.planned_level);
     if level_reports.is_empty() {
         // Every emitted level collapsed at write time: no valid overview file

@@ -1640,16 +1640,21 @@ pub(super) fn warn_plan_skipped_levels(
 /// [`LevelReport`] renumbered to the written count; an empty level (every
 /// candidate collapsed during simplification) warns and records `planned` in
 /// the skipped list instead.
+///
+/// A data shard does not warn about a level below its pivot (`floor`): it
+/// exports none, and its share of one is routinely empty.
 pub(super) fn record_level_outcome(
     outcome: LevelWriteOutcome,
-    planned: SkippedLevelReport,
+    (planned, floor): (SkippedLevelReport, Option<u8>),
     counts: (usize, usize, usize),
     level_reports: &mut Vec<LevelReport>,
     skipped: &mut Vec<SkippedLevelReport>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) {
     let (candidates, rows, vertices) = counts;
+    let owned = planned.zoom.zip(floor).is_none_or(|(z, f)| z >= f);
     match outcome {
+        LevelWriteOutcome::SkippedEmpty if !owned => skipped.push(planned),
         LevelWriteOutcome::SkippedEmpty => {
             diagnostics.warn(format!(
                 "level planned at GSD {:.2} m{} became empty after simplification \
@@ -14089,6 +14094,22 @@ mod tests {
             .count();
         assert!(chains > 0, "the shard must carry merged chains");
         assert_eq!(build(true), streaming);
+        // Levels below the pivot are not the shard's to export, so their
+        // emptiness is not the shard's to warn about.
+        let report = convert_to_overviews(&input, dir.path().join("s.parquet"), &shard).unwrap();
+        let empty: Vec<&String> = report
+            .diagnostics
+            .iter()
+            .filter_map(|d| match d {
+                crate::diagnostics::Diagnostic::Advisory { message, .. }
+                    if message.contains("became empty") =>
+                {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(empty.is_empty(), "{empty:#?}");
     }
 
     /// Read all ids from all levels of an overview file.

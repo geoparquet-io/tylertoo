@@ -99,6 +99,9 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `shard-plan` cuts an EPSG:3857 input by where its rows are. It used to
   read the row-group statistics, which are metres, as degrees, and put every
   row in the last shard (#546 review).
+- A data shard no longer warns that a level below its pivot "became empty
+  after simplification". It exports no such level, and its share of one is
+  often empty (#546 review).
 - A crafted Parquet footer with an overlong varint, or a page header that
   skips past the end of the file, is refused instead of allocating gigabytes
   or spinning for minutes (#789).
