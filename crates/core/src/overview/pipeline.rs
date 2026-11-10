@@ -960,6 +960,10 @@ struct ReadMsg {
 pub(super) struct SharedRows {
     /// The kept rows' columns, in the source schema's non-geometry order.
     columns: Vec<ArrayRef>,
+    /// Every distinct geometry the levels keep, encoded once: a level whose
+    /// cascade step left a feature unchanged shares the finer level's
+    /// geometry (#499), so per-level columns held it once per level.
+    geometry: ArrayRef,
     /// Each input row's position in `columns`; `u32::MAX` when no level
     /// keeps it.
     pos: Vec<u32>,
@@ -973,6 +977,7 @@ impl SharedRows {
         batch: &RecordBatch,
         non_geom_cols: &[usize],
         kept: impl Iterator<Item = &'a [usize]>,
+        geometry: ArrayRef,
     ) -> Result<Self, ConvertError> {
         let n = batch.num_rows();
         let mut pos = vec![u32::MAX; n];
@@ -1000,13 +1005,18 @@ impl SharedRows {
                 .map(|&c| arrow_select::take::take(batch.column(c).as_ref(), &rows, None))
                 .collect::<Result<_, _>>()?
         };
-        Ok(Self { columns, pos })
+        Ok(Self {
+            columns,
+            pos,
+            geometry,
+        })
     }
 
     /// What these columns hold in RAM.
     fn held_bytes(&self) -> u64 {
         self.columns
             .iter()
+            .chain([&self.geometry])
             .map(|c| c.get_array_memory_size() as u64)
             .sum()
     }
@@ -1023,10 +1033,12 @@ pub(super) enum LevelBatch {
         rows: Arc<SharedRows>,
         /// Positions in `rows` of this level's rows, in output order.
         index: UInt32Array,
+        /// Positions in `rows.geometry` of this level's geometries.
+        geometry: UInt32Array,
         /// Where the geometry column goes in the source schema.
         geom_idx: usize,
-        /// The geometry column, then any columns the level generates after
-        /// the source schema's (`coalesced_count`).
+        /// Any columns the level generates after the source schema's
+        /// (`coalesced_count`).
         own: Vec<ArrayRef>,
     },
 }
@@ -1038,6 +1050,7 @@ impl LevelBatch {
         schema: SchemaRef,
         rows: &Arc<SharedRows>,
         batch_rows: &[usize],
+        geometry: UInt32Array,
         geom_idx: usize,
         own: Vec<ArrayRef>,
     ) -> Self {
@@ -1046,6 +1059,7 @@ impl LevelBatch {
             schema,
             rows: Arc::clone(rows),
             index,
+            geometry,
             geom_idx,
             own,
         }
@@ -1063,11 +1077,18 @@ impl LevelBatch {
     fn held_bytes(&self) -> u64 {
         match self {
             Self::Owned(b) => b.get_array_memory_size() as u64,
-            Self::Shared { index, own, .. } => own
+            Self::Shared {
+                index,
+                geometry,
+                own,
+                ..
+            } => own
                 .iter()
                 .map(|c| c.get_array_memory_size() as u64)
                 .sum::<u64>()
-                .saturating_add(index.get_array_memory_size() as u64),
+                .saturating_add(
+                    (index.get_array_memory_size() + geometry.get_array_memory_size()) as u64,
+                ),
         }
     }
 
@@ -1079,26 +1100,19 @@ impl LevelBatch {
                 schema,
                 rows,
                 index,
+                geometry,
                 geom_idx,
                 own,
             } => {
-                let mut own = own.into_iter();
-                let mut columns = Vec::with_capacity(schema.fields().len());
-                for (i, column) in rows.columns.iter().enumerate() {
-                    if i == geom_idx {
-                        columns.push(
-                            own.next()
-                                .ok_or_else(|| internal("level batch without geometry"))?,
-                        );
-                    }
-                    columns.push(arrow_select::take::take(column.as_ref(), &index, None)?);
-                }
-                if geom_idx == rows.columns.len() {
-                    columns.push(
-                        own.next()
-                            .ok_or_else(|| internal("level batch without geometry"))?,
-                    );
-                }
+                let mut columns = rows
+                    .columns
+                    .iter()
+                    .map(|c| arrow_select::take::take(c.as_ref(), &index, None))
+                    .collect::<Result<Vec<_>, _>>()?;
+                columns.insert(
+                    geom_idx,
+                    arrow_select::take::take(rows.geometry.as_ref(), &geometry, None)?,
+                );
                 columns.extend(own);
                 Ok(RecordBatch::try_new(schema, columns)?)
             }
@@ -3003,15 +3017,25 @@ mod sink_sample_tests {
         let levels: Vec<Vec<usize>> = (0..4)
             .map(|l| (0..n).filter(|i| i % 10 >= l).collect())
             .collect();
-        let rows =
-            Arc::new(SharedRows::new(&input, &[0, 2], levels.iter().map(Vec::as_slice)).unwrap());
+        // Every level keeps each row's geometry unchanged: one pooled copy.
+        let pool: ArrayRef = Arc::new(Float64Array::from_iter_values(
+            (0..n).map(|i| i as f64 * 0.5),
+        ));
+        let rows = Arc::new(
+            SharedRows::new(
+                &input,
+                &[0, 2],
+                levels.iter().map(Vec::as_slice),
+                pool.clone(),
+            )
+            .unwrap(),
+        );
         let mut held = rows.held_bytes();
         let mut copied = 0u64;
         for kept in &levels {
-            let geometry: ArrayRef = Arc::new(Float64Array::from_iter_values(
-                kept.iter().map(|&i| i as f64 * 0.5),
-            ));
-            let level = LevelBatch::shared(schema.clone(), &rows, kept, 1, vec![geometry.clone()]);
+            let at = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
+            let geometry = arrow_select::take::take(pool.as_ref(), &at, None).unwrap();
+            let level = LevelBatch::shared(schema.clone(), &rows, kept, at, 1, Vec::new());
             held += level.held_bytes();
             let built = level.materialize().unwrap();
             let idx = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));

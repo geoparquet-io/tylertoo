@@ -7058,6 +7058,53 @@ fn assemble_level_batch(
 /// One level's kept batch rows, their geometries and vertex count.
 type LevelSelection = (Vec<usize>, Vec<Arc<Geometry<f64>>>, usize);
 
+/// The rows and geometries the levels built from `batch` share (#852), and
+/// each level's positions in the shared geometries. A geometry several
+/// levels keep (the same `Arc`, #499) is encoded once.
+fn share_rows(
+    batch: &RecordBatch,
+    ctxs: &[LevelStreamCtx<'_>],
+    selections: &[LevelSelection],
+) -> Result<(Arc<pipeline::SharedRows>, Vec<UInt32Array>), ConvertError> {
+    let finest = ctxs.last().expect("a cascade has levels");
+    // One geometry column serves every level, so they must type it alike.
+    debug_assert!(ctxs.iter().all(|c| c.geom_idx == finest.geom_idx
+        && c.source_schema.field(c.geom_idx) == finest.source_schema.field(finest.geom_idx)));
+    let (pool, positions) = geometry_pool(selections.iter().map(|(_, geoms, _)| geoms.as_slice()));
+    let geometry = build_geometry_column(finest.source_schema, finest.geom_idx, &pool)?;
+    let rows = pipeline::SharedRows::new(
+        batch,
+        finest.non_geom_cols,
+        selections.iter().map(|(kept, _, _)| kept.as_slice()),
+        geometry,
+    )?;
+    Ok((Arc::new(rows), positions))
+}
+
+/// Each distinct geometry (by allocation) the `levels` keep, in first-kept
+/// order, and each level's positions in it.
+fn geometry_pool<'a>(
+    levels: impl Iterator<Item = &'a [Arc<Geometry<f64>>]>,
+) -> (Vec<&'a Geometry<f64>>, Vec<UInt32Array>) {
+    let mut slot: std::collections::HashMap<*const Geometry<f64>, u32> =
+        std::collections::HashMap::new();
+    let mut pool: Vec<&Geometry<f64>> = Vec::new();
+    let positions = levels
+        .map(|geoms| {
+            geoms
+                .iter()
+                .map(|g| {
+                    *slot.entry(Arc::as_ptr(g)).or_insert_with(|| {
+                        pool.push(g);
+                        u32::try_from(pool.len() - 1).expect("batch geometries fit in u32")
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    (pool, positions)
+}
+
 /// One cascade-fold step's result, sharing (`Arc`) the kept geometry instead
 /// of owning a deep clone (#499).
 ///
@@ -7300,29 +7347,19 @@ pub(super) fn process_batch_cascade(
     // #852: the levels share their rows' properties, except where clustering
     // rewrites the accumulate columns per level.
     let shared = (share && !finest.cluster_enabled)
-        .then(|| {
-            pipeline::SharedRows::new(
-                batch,
-                finest.non_geom_cols,
-                selections.iter().map(|(kept, _, _)| kept.as_slice()),
-            )
-        })
-        .transpose()?
-        .map(Arc::new);
+        .then(|| share_rows(batch, ctxs, &selections))
+        .transpose()?;
     let results: Vec<Result<Option<(pipeline::LevelBatch, usize)>, ConvertError>> = selections
         .into_par_iter()
         .zip(ctxs)
-        .map(|((kept_idx, kept_geoms, verts), ctx)| {
+        .enumerate()
+        .map(|(li, ((kept_idx, kept_geoms, verts), ctx))| {
             if kept_idx.is_empty() {
                 return Ok(None);
             }
             let out = match &shared {
-                Some(rows) => {
-                    let mut own = vec![build_geometry_column(
-                        ctx.source_schema,
-                        ctx.geom_idx,
-                        &kept_geoms,
-                    )?];
+                Some((rows, geometry)) => {
+                    let mut own = Vec::new();
                     let schema = if ctx.coalesce_enabled {
                         let globals: Vec<usize> =
                             kept_idx.iter().map(|&i| row_offset + i).collect();
@@ -7335,6 +7372,7 @@ pub(super) fn process_batch_cascade(
                         Arc::new(schema.clone()),
                         rows,
                         &kept_idx,
+                        geometry[li].clone(),
                         ctx.geom_idx,
                         own,
                     )
@@ -7363,6 +7401,29 @@ pub(super) fn process_batch_cascade(
 
 #[cfg(test)]
 mod tests {
+    /// #852: a geometry several levels keep unchanged (one `Arc`, #499) is
+    /// pooled once, and each level indexes its own geometries in order.
+    #[test]
+    fn levels_pool_a_geometry_they_share_once() {
+        let pt = |x: f64| Arc::new(Geometry::Point(geo::Point::new(x, 0.0)));
+        let (a, b, c) = (pt(1.0), pt(2.0), pt(3.0));
+        // Finest keeps a, b; the next keeps a unchanged and a simplified b
+        // (equal value, its own allocation); the coarsest keeps a and c.
+        let b2 = pt(2.0);
+        let levels = [
+            vec![Arc::clone(&a), Arc::clone(&b)],
+            vec![Arc::clone(&a), Arc::clone(&b2)],
+            vec![Arc::clone(&a), Arc::clone(&c)],
+        ];
+        let (pool, positions) = geometry_pool(levels.iter().map(Vec::as_slice));
+        assert_eq!(pool.len(), 4, "a pooled once; b, b2, c each");
+        for (level, pos) in levels.iter().zip(&positions) {
+            let got: Vec<&Geometry<f64>> = pos.values().iter().map(|&p| pool[p as usize]).collect();
+            let want: Vec<&Geometry<f64>> = level.iter().map(AsRef::as_ref).collect();
+            assert_eq!(got, want);
+        }
+    }
+
     /// Array-of-structs fixture → the column-major table the engine takes
     /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
     /// pipeline fills a [`FeatureTable`] directly from the scan, so this
