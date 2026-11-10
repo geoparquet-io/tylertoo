@@ -255,17 +255,15 @@ impl Band {
     pub fn parse(spec: &str) -> Result<Self, BandSpecError> {
         use BandSpecError as E;
         // An error names the spec, minus a URL input's query (#820).
-        let owned = || match spec.find("://") {
-            Some(i) => {
-                // The URL starts where its scheme does.
-                let url_at = spec[..i]
-                    .trim_end_matches(|c: char| {
-                        c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
-                    })
-                    .len();
-                format!("{}{}", &spec[..url_at], redact_query(&spec[url_at..]))
+        // Everything from the first `?` after `://` goes, malformed spec or not.
+        let owned = || {
+            let query = spec
+                .find("://")
+                .and_then(|i| spec[i..].find('?').map(|q| i + q));
+            match query {
+                Some(q) => format!("{}?<redacted>", &spec[..q]),
+                None => spec.to_string(),
             }
-            None => spec.to_string(),
         };
         let (sep, at) = band_separator(spec).ok_or_else(|| E::NoZoomRange { spec: owned() })?;
         let (range, rest) = spec.split_at(at);
@@ -291,12 +289,17 @@ impl Band {
             });
         }
 
+        // A query's own `:` and `=` (`se=2026-11-11T12:00:00Z`,
+        // `token=a=b`) cannot be told from a layer separator, so a URL with a
+        // query is the whole input and takes its layer from its path (#820).
+        let queried_url = url_scheme(rest.trim()).is_some() && rest.contains('?');
         // A trailing separator is an empty layer name, not part of the path.
         // Falling through would silently keep it in the path.
-        if rest.trim_end().ends_with(sep) {
+        if !queried_url && rest.trim_end().ends_with(sep) {
             return Err(E::EmptyLayer { spec: owned() });
         }
         let (path, layer) = match sep {
+            _ if queried_url => (rest.trim(), None),
             ':' => split_colon_form(rest),
             _ => split_equals_form(rest),
         };
@@ -458,12 +461,6 @@ fn split_colon_form(rest: &str) -> (&str, Option<&str>) {
         // fallback) because slicing by byte offset here is clearer than
         // re-deriving the scheme boundary from the split fallback would be.
         let authority_and_path = &rest[scheme.len() + 3..];
-        // A query's colons (`se=2026-11-11T12:00:00Z`) cannot be told from a
-        // layer separator, so a URL with a query names its layer with
-        // `LO-HI=URL=LAYER` (#820).
-        if authority_and_path.contains('?') {
-            return (rest, None);
-        }
         return match authority_and_path.rsplit_once(':') {
             // `is_bare_layer_token` rejects a segment containing `/`, which is
             // what keeps a port (`host:8080/x.parquet`) and a colon inside the
@@ -489,7 +486,7 @@ fn split_colon_form(rest: &str) -> (&str, Option<&str>) {
 fn split_equals_form(rest: &str) -> (&str, Option<&str>) {
     let rest = rest.trim();
     match rest.rsplit_once('=') {
-        Some((p, l)) if is_bare_layer_token(l) && !p.trim().is_empty() && !cuts_query(p, l) => {
+        Some((p, l)) if is_bare_layer_token(l) && !p.trim().is_empty() => {
             (p.trim(), Some(l.trim()))
         }
         _ => (rest, None),
@@ -501,17 +498,6 @@ fn split_equals_form(rest: &str) -> (&str, Option<&str>) {
 fn is_bare_layer_token(s: &str) -> bool {
     let s = s.trim();
     !s.is_empty() && !s.contains(['/', '\\', ':'])
-}
-
-/// Whether an `=` split of a URL into `path` and `layer` would cut through
-/// its query (#820): the layer would hold a query tail (`&`), or the path's
-/// last parameter would lose its value (`?X-Amz-Signature=SECRET` is no
-/// layer).
-fn cuts_query(path: &str, layer: &str) -> bool {
-    url_scheme(path.trim()).is_some()
-        && path.split_once('?').is_some_and(|(_, q)| {
-            layer.contains('&') || !q.rsplit('&').next().unwrap_or(q).contains('=')
-        })
 }
 
 /// A single ASCII letter — i.e. a Windows drive designator, not a path.
@@ -2926,12 +2912,13 @@ mod tests {
         assert_eq!((bands[1].min_zoom, bands[1].max_zoom), (6, 9));
     }
 
-    /// #820: a presigned band URL keeps its query (the reader sends it) in
-    /// both spellings, and a band's label never shows it.
+    /// #820: a presigned band URL keeps its whole query (the reader sends
+    /// it) in both spellings, takes its layer from its path, and is never
+    /// shown with its query.
     #[test]
     fn a_presigned_band_url_keeps_its_query_but_never_shows_it() {
         let url = "https://h/a.parquet?X-Amz-Signature=SECRET&X-Amz-Expires=60";
-        for spec in [format!("0-5={url}=a"), format!("0-5:{url}")] {
+        for spec in [format!("0-5={url}"), format!("0-5:{url}")] {
             let bands = parse_bands(&[spec.as_str()]).unwrap();
             assert_eq!(
                 (bands[0].input.to_str(), bands[0].layer.as_str()),
@@ -2945,13 +2932,13 @@ mod tests {
             "0-5:https://h/a.parquet?st=00:00&sig=SECRET",
             "0-5:https://h/a.parquet?sv=1&se=2026-11-11T12:00:00Z&sig=SECRET",
             "0-5:https://h/a.parquet?sig=SECRET&se=2026-11-11T12:00:00Z",
+            "0-5=https://h/a.parquet?token=prefix=SECRET",
+            "0-5=https://h/a.parquet?X-Amz-Signature=SECRET=",
         ] {
             let bands = parse_bands(&[spec]).unwrap();
             assert_eq!(bands[0].layer, "a", "{spec}");
-            assert!(
-                bands[0].input.to_string_lossy().contains("SECRET"),
-                "{spec}"
-            );
+            let input = bands[0].input.to_string_lossy();
+            assert_eq!(input, spec[4..], "{spec}");
         }
         // An implicit layer comes from the URL's path, not its query.
         let bands = parse_bands(&["0-5:https://h/download?path=/dataset&sig=SECRET"]).unwrap();
@@ -2963,6 +2950,7 @@ mod tests {
             format!("9-5:{url}:a"),
             format!("9-5: {url}:a"),
             format!("9-5:\u{2003}{url}:a"),
+            format!("0-5{url}"),
         ] {
             let err = parse_bands(&[spec]).unwrap_err();
             assert!(

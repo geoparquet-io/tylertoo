@@ -20,6 +20,9 @@ command. Logs, errors, reports and saved plans show the query as
 object behind a freshly signed one. Query parameters other than the S3, GCS
 and Azure signing ones become a short hash, as in `?<redacted:1a2b3c4d>`, so
 URLs that pick different objects stay distinct.
+A signed URL as a `pyramid` band takes its layer name from the file name in
+its path: its query can contain `:` and `=`, so `LO-HI:URL:LAYER` cannot
+split a layer off it.
 
 An `s3://` or `gs://` prefix ending in `/` includes every `.parquet` object
 below it as one dataset. Local directories and globs work the same way.

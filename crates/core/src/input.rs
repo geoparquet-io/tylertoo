@@ -940,7 +940,7 @@ pub(crate) mod remote {
     use tylertoo_io::ReaderMetadata;
     use url::Url;
 
-    use super::{redact_query, FetchStats, InputError, InputReader};
+    use super::{param_name, redact_query, FetchStats, InputError, InputReader};
 
     /// Readahead for the *sequential* read path
     /// ([`tylertoo_io::ChunkReader::get_read`]). The page reader
@@ -1066,10 +1066,12 @@ pub(crate) mod remote {
         let interpret_err = |e: &dyn std::fmt::Display| {
             InputError::RemoteConfig(format!("cannot interpret URL {shown:?}: {e}"))
         };
-        // A query on an http(s) URL is its own credential (a presigned S3 or
-        // Azure SAS URL), so the URL is read as the web URL it is, even on an
-        // S3 or Azure host that `parse` would hand to a signing store.
-        let (scheme, location) = if url.query().is_some() && url.scheme().starts_with("http") {
+        // A signed query is the URL's own credential (a presigned S3/GCS or
+        // Azure SAS URL), so it is read as the web URL it is, even on a cloud
+        // host that `parse` would hand to a store signing with ambient
+        // credentials. An unsigned query (`?x-id=GetObject`) keeps that store.
+        let signed = url.scheme().starts_with("http") && url.query().is_some_and(query_is_signed);
+        let (scheme, location) = if signed {
             let path = ObjectPath::from_url_path(url.path()).map_err(|e| interpret_err(&e))?;
             (ObjectStoreScheme::Http, path)
         } else {
@@ -1138,6 +1140,16 @@ pub(crate) mod remote {
                 .insert(key, Arc::clone(&store));
         }
         Ok((store, location))
+    }
+
+    /// Whether a query carries a presigned S3/GCS or Azure SAS signature.
+    fn query_is_signed(query: &str) -> bool {
+        query.split('&').any(|p| {
+            matches!(
+                param_name(p).as_str(),
+                "x-amz-signature" | "x-goog-signature" | "sig"
+            )
+        })
     }
 
     /// Sends an http(s) input's query string (a presigned S3 or Azure SAS
@@ -4112,6 +4124,14 @@ pub(crate) mod remote {
                 assert!(store.to_string().starts_with("HttpStore"), "{url}: {store}");
                 assert_eq!(location.as_ref(), key, "{url}");
             }
+            // An unsigned query keeps the cloud store and its credentials
+            // (Azure's is not built in, so it stays refused).
+            let err = store_and_location("https://acct.blob.core.windows.net/c/a.parquet?x-id=1")
+                .expect_err("an unsigned Azure URL is not read over plain http");
+            assert!(
+                matches!(err, super::InputError::UnsupportedScheme { .. }),
+                "{err}"
+            );
         }
     }
 
