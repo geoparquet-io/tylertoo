@@ -460,7 +460,7 @@ fn stats(
     archive: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels();
+    refresh_log_levels(py);
     let values = keywords(kwargs)?;
     let mut defaults = config_keywords::command_defaults("stats");
     for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
