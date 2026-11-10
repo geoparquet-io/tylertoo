@@ -2640,6 +2640,14 @@ mod tests {
         }
         assert_eq!(sizes, [150, 50]);
         assert_eq!(firsts, (0..200).collect::<Vec<i64>>());
+        // A row limit carries across the seam.
+        let reader = open_parquet(two_list_groups())
+            .unwrap()
+            .with_limit(150)
+            .build()
+            .unwrap();
+        let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(rows, 150);
     }
 
     #[test]
