@@ -5682,7 +5682,15 @@ fn fanout_batch_members(
             .par_iter()
             .map(|g| {
                 ExportTimers::time(&timers.clip, || {
-                    shared_tile_members(g, finest, plan.zoom, opts, (0, u64::MAX), diagnostics)
+                    shared_tile_members(
+                        g,
+                        Some(g),
+                        finest,
+                        plan.zoom,
+                        opts,
+                        (0, u64::MAX),
+                        diagnostics,
+                    )
                 })
             })
             .collect();
@@ -7145,9 +7153,8 @@ type TileMembers = Vec<(u64, MemberGeom)>;
 struct ClippedGroup {
     batches: Vec<RecordBatch>,
     geom_idxs: Vec<usize>,
-    /// The decoded geometries, kept for the in-order gap walk; members that
-    /// hold a feature whole share them.
-    geoms: Vec<Vec<Arc<Geometry<f64>>>>,
+    /// The decoded geometries, kept for the in-order gap walk.
+    geoms: Vec<Vec<Geometry<f64>>>,
     /// Per batch, per row: the row's `(key, clipped geometry)` members.
     row_members: Vec<Vec<TileMembers>>,
 }
@@ -7167,13 +7174,10 @@ fn clip_group(
         .iter()
         .map(|b| batch_geometry_index(b, ctx.published.geometry.as_deref()))
         .collect::<Result<_, _>>()?;
-    let geoms: Vec<Vec<Arc<Geometry<f64>>>> = batches
+    let geoms: Vec<Vec<Geometry<f64>>> = batches
         .par_iter()
         .zip(&geom_idxs)
-        .map(|(b, &gi)| {
-            decode_batch_geometries(b, &b.schema(), gi, ctx.crs, timers, diagnostics)
-                .map(|geoms| geoms.into_iter().map(Arc::new).collect())
-        })
+        .map(|(b, &gi)| decode_batch_geometries(b, &b.schema(), gi, ctx.crs, timers, diagnostics))
         .collect::<Result<_, _>>()?;
     // The canonical level's own zoom, not `ctx.zoom`: a variable-depth probe
     // clips canonical geometry at an ancestor's zoom (#803).
@@ -7191,6 +7195,7 @@ fn clip_group(
                     ExportTimers::time(&timers.clip, || {
                         let mut members = shared_tile_members(
                             g,
+                            None,
                             finest_zoom,
                             ctx.zoom,
                             ctx.opts,
@@ -7565,12 +7570,16 @@ fn feature_tile_members(
 }
 
 /// `source`'s members at `zoom`, at its finest-zoom simplification when
-/// `finest` is set, as member geometries. Every tile that holds the feature
-/// whole shares one geometry, the decoded `source` itself unless simplified,
-/// instead of holding its own copy (manby holds each feature once; the copies
-/// were a third of a Moldova export's peak live heap).
+/// `finest` is set, as member geometries. Tiles that hold the feature whole
+/// share one geometry instead of each holding its own copy (manby holds each
+/// feature once): `shared`, the feature's decoded geometry that other levels
+/// share too, when the caller has one and it is not simplified, else a copy
+/// made once when two or more tiles hold it whole. A single whole tile holds
+/// its own exact copy, as an `Arc` would only add its block, and so does a
+/// point, which holds no coordinate heap.
 fn shared_tile_members(
-    source: &Arc<Geometry<f64>>,
+    source: &Geometry<f64>,
+    shared: Option<&Arc<Geometry<f64>>>,
     finest: Option<u8>,
     zoom: u8,
     opts: &ExportOptions,
@@ -7579,31 +7588,23 @@ fn shared_tile_members(
 ) -> Vec<(u64, MemberGeom)> {
     let g = finest_zoom_geometry(source, finest, opts, diagnostics);
     let pieces = feature_tile_pieces(&g, zoom, opts, key_lo, key_hi, diagnostics);
-    // A point holds no coordinate heap: sharing it would only add the
-    // `Arc`'s allocation.
-    if matches!(*g, Geometry::Point(_)) {
-        return pieces
-            .into_iter()
-            .map(|(key, piece)| match piece {
-                TilePiece::Whole => (key, MemberGeom::Owned(g.clone().into_owned())),
-                TilePiece::Clipped(g) => (key, MemberGeom::Owned(g)),
-            })
-            .collect();
-    }
-    let whole = pieces
+    let wholes = pieces
         .iter()
-        .any(|(_, piece)| matches!(piece, TilePiece::Whole))
-        .then(|| match g {
-            std::borrow::Cow::Borrowed(_) => Arc::clone(source),
-            std::borrow::Cow::Owned(g) => Arc::new(g),
-        });
+        .filter(|(_, piece)| matches!(piece, TilePiece::Whole))
+        .count();
+    let whole: Option<Arc<Geometry<f64>>> = match (&g, shared) {
+        _ if wholes == 0 || matches!(*g, Geometry::Point(_)) => None,
+        (std::borrow::Cow::Borrowed(_), Some(shared)) => Some(Arc::clone(shared)),
+        _ if wholes == 1 => None,
+        _ => Some(Arc::new(g.clone().into_owned())),
+    };
     pieces
         .into_iter()
         .map(|(key, piece)| match piece {
-            TilePiece::Whole => (
-                key,
-                MemberGeom::Shared(Arc::clone(whole.as_ref().expect("a whole piece"))),
-            ),
+            TilePiece::Whole => match &whole {
+                Some(whole) => (key, MemberGeom::Shared(Arc::clone(whole))),
+                None => (key, MemberGeom::Owned(g.clone().into_owned())),
+            },
             TilePiece::Clipped(g) => (key, MemberGeom::Owned(g)),
         })
         .collect()
@@ -14697,6 +14698,7 @@ mod tests {
         let source = Arc::new(square(1e-7, 10.0));
         let members = shared_tile_members(
             &source,
+            Some(&source),
             None,
             zoom,
             &opts,
@@ -14716,6 +14718,33 @@ mod tests {
             );
         }
 
+        // Without a geometry other levels share, two whole tiles share one
+        // copy, and a single whole tile holds its own.
+        let members = shared_tile_members(
+            &source,
+            None,
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let [(_, MemberGeom::Shared(a)), (_, MemberGeom::Shared(b))] = &members[..] else {
+            panic!("two whole tiles hold their own copies");
+        };
+        assert!(Arc::ptr_eq(a, b));
+        let inside = square(11.0, 10.0);
+        let members = shared_tile_members(
+            &inside,
+            None,
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert!(matches!(&members[..], [(_, MemberGeom::Owned(_))]));
+
         // A feature past the direct clip budget takes the cascade: the one
         // tile that holds it whole shares it too.
         let line: geo::LineString<f64> = (0..=DIRECT_CLIP_BUDGET)
@@ -14724,6 +14753,7 @@ mod tests {
         let source = Arc::new(Geometry::LineString(line));
         let members = shared_tile_members(
             &source,
+            Some(&source),
             None,
             zoom,
             &opts,
@@ -14742,6 +14772,7 @@ mod tests {
         let source = Arc::new(square(lng, 10.0));
         let members = shared_tile_members(
             &source,
+            Some(&source),
             None,
             zoom,
             &opts,
@@ -14756,6 +14787,7 @@ mod tests {
         let source = Arc::new(Geometry::Point(geo::Point::new(1e-6, 10.0)));
         let members = shared_tile_members(
             &source,
+            Some(&source),
             None,
             zoom,
             &opts,

@@ -191,19 +191,13 @@ impl RowGapCursor {
     /// `gap_to_rect` of the same predecessor centre, so the gaps are those
     /// of the row-by-row walk. Measured on the calling thread, they held the
     /// export's ordered collect stage, and with it the pool, to one core.
-    pub(super) fn batch<G>(&mut self, geoms: &[G]) -> Vec<(u64, u16)>
-    where
-        G: std::borrow::Borrow<Geometry<f64>> + Sync,
-    {
+    pub(super) fn batch(&mut self, geoms: &[Geometry<f64>]) -> Vec<(u64, u16)> {
         if !self.measure {
             return geoms.iter().map(|_| self.next_row(None)).collect();
         }
         #[cfg(test)]
         crate::valve_counter::note(|c| c.gap_rows += geoms.len());
-        let rects: Vec<Option<Rect<f64>>> = geoms
-            .par_iter()
-            .map(|g| g.borrow().bounding_rect())
-            .collect();
+        let rects: Vec<Option<Rect<f64>>> = geoms.par_iter().map(|g| g.bounding_rect()).collect();
         let centres: Vec<Option<(f64, f64)>> = rects
             .par_iter()
             .map(|r| r.as_ref().map(rect_center))
