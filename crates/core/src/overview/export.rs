@@ -181,6 +181,9 @@ struct TileTarget<'a> {
     key_hi: u64,
     assume_simple: bool,
     diagnostics: &'a crate::diagnostics::Diagnostics,
+    /// The geometry the clip started from: a piece that is still it is
+    /// [`TilePiece::Whole`].
+    source: &'a Geometry<f64>,
 }
 
 #[cfg(test)]
@@ -7497,12 +7500,15 @@ fn feature_tile_pieces(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source: geom,
             },
             &mut out,
         );
         return out;
     }
-    let mut by_key: BTreeMap<u64, Geometry<f64>> = BTreeMap::new();
+    // A piece of the stored copy (shift 0) that no other copy joins stays
+    // whole.
+    let mut by_key: BTreeMap<u64, TilePiece> = BTreeMap::new();
     for shift in wrap_shifts(&bbox, buffer) {
         let copy = shift_lng(geom, shift);
         copy_tile_members(
@@ -7515,24 +7521,29 @@ fn feature_tile_pieces(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source: &copy,
             },
             &mut out,
         );
+        let owned = |piece| match piece {
+            TilePiece::Whole => copy.clone().into_owned(),
+            TilePiece::Clipped(g) => g,
+        };
         for (key, piece) in out.drain(..) {
-            let piece = match piece {
-                TilePiece::Whole => copy.clone().into_owned(),
-                TilePiece::Clipped(g) => g,
+            let piece = match by_key.remove(&key) {
+                Some(TilePiece::Whole) => {
+                    TilePiece::Clipped(join_wrapped_pieces(geom.clone(), owned(piece)))
+                }
+                Some(TilePiece::Clipped(prev)) => {
+                    TilePiece::Clipped(join_wrapped_pieces(prev, owned(piece)))
+                }
+                None if shift == 0.0 => piece,
+                None => TilePiece::Clipped(owned(piece)),
             };
-            match by_key.remove(&key) {
-                Some(prev) => by_key.insert(key, join_wrapped_pieces(prev, piece)),
-                None => by_key.insert(key, piece),
-            };
+            by_key.insert(key, piece);
         }
     }
-    by_key
-        .into_iter()
-        .map(|(key, g)| (key, TilePiece::Clipped(g)))
-        .collect()
+    by_key.into_iter().collect()
 }
 
 /// [`feature_tile_pieces`] with each whole piece a copy of `geom`.
@@ -7707,6 +7718,7 @@ fn copy_tile_members(
         key_hi,
         assume_simple,
         diagnostics,
+        source,
     } = inputs;
     let bbox = *bbox;
     // Target leaf-tile ranges at `zoom` — the authority for which tiles this
@@ -7747,6 +7759,7 @@ fn copy_tile_members(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source,
             },
             &ranges,
             out,
@@ -7768,6 +7781,7 @@ fn copy_tile_members(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source,
             },
             &ranges,
             out,
@@ -7918,6 +7932,7 @@ fn feature_tile_members_direct(
         key_hi,
         assume_simple,
         diagnostics,
+        source: _,
     } = inputs;
     for tc in tiles_in_ranges(ranges, zoom) {
         let key = tile_key(tc.x, tc.y, zoom);
@@ -8022,6 +8037,7 @@ fn split_feature_into_tiles(
         key_hi,
         assume_simple,
         diagnostics,
+        source,
     } = inputs;
     // Prune: outside the feature's target tiles, or outside this partition.
     if !node_overlaps_ranges(node, zoom, ranges) || !node_key_overlaps(node, zoom, key_lo, key_hi) {
@@ -8044,7 +8060,12 @@ fn split_feature_into_tiles(
         // `geom.clone()` byte-for-byte, since every ancestor also fast-pathed
         // and `cur` is still the original geometry.
         if bbox_within_buffered(cur_bbox, &tb, buffer_deg) {
-            out.push((key, TilePiece::Clipped(cur.clone())));
+            let piece = if std::ptr::eq(cur, source) {
+                TilePiece::Whole
+            } else {
+                TilePiece::Clipped(cur.clone())
+            };
+            out.push((key, piece));
         } else if let Some(clipped) = clip_geometry_simple(
             cur,
             &tb,
@@ -8079,6 +8100,7 @@ fn split_feature_into_tiles(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source,
             },
             ranges,
             out,
@@ -8107,6 +8129,7 @@ fn split_feature_into_tiles(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source,
             },
             ranges,
             out,
@@ -8138,6 +8161,7 @@ fn fanout_children(
         key_hi,
         assume_simple,
         diagnostics,
+        source,
     } = inputs;
     // M1 (#817): each child clips the whole parent piece, so a huge piece
     // forks at any depth; the four subtrees' members are appended in child
@@ -8162,6 +8186,7 @@ fn fanout_children(
                         key_hi,
                         assume_simple,
                         diagnostics,
+                        source,
                     },
                     ranges,
                     &mut members,
@@ -8185,6 +8210,7 @@ fn fanout_children(
                     key_hi,
                     assume_simple,
                     diagnostics,
+                    source,
                 },
                 ranges,
                 out,
@@ -8221,6 +8247,7 @@ fn members_direct_vec(
             key_hi,
             assume_simple,
             diagnostics: &crate::diagnostics::Diagnostics::default(),
+            source: geom,
         },
         &ranges,
         &mut out,
@@ -8264,6 +8291,7 @@ fn members_recursive_vec(
             key_hi,
             assume_simple,
             diagnostics: &crate::diagnostics::Diagnostics::default(),
+            source: geom,
         },
         &ranges,
         &mut out,
@@ -14656,12 +14684,53 @@ mod tests {
             &crate::diagnostics::Diagnostics::default(),
         );
         assert_eq!(members.len(), 2);
-        for (key, geom) in &members {
-            let MemberGeom::Shared(g) = geom else {
-                panic!("tile {key} holds its own copy");
-            };
-            assert!(Arc::ptr_eq(g, &source));
+        let shared = |members: &[(u64, MemberGeom)], key: u64, source: &Arc<Geometry<f64>>| {
+            members.iter().any(|(k, g)| {
+                *k == key && matches!(g, MemberGeom::Shared(g) if Arc::ptr_eq(g, source))
+            })
+        };
+        for (key, _) in &members {
+            assert!(
+                shared(&members, *key, &source),
+                "tile {key} holds its own copy"
+            );
         }
+
+        // A feature past the direct clip budget takes the cascade: the one
+        // tile that holds it whole shares it too.
+        let line: geo::LineString<f64> = (0..=DIRECT_CLIP_BUDGET)
+            .map(|i| geo::coord! { x: 11.0 + i as f64 * 1e-6, y: 10.0 })
+            .collect();
+        let source = Arc::new(Geometry::LineString(line));
+        let members = shared_tile_members(
+            &source,
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(members.len(), 1);
+        assert!(
+            shared(&members, members[0].0, &source),
+            "the cascade copied it"
+        );
+
+        // On the world edge, the stored copy's tile shares it; the shifted
+        // copy in the far tile's buffer is its own.
+        let lng = 180.0 - 0.5 * buffer_deg_at_zoom(zoom, &opts);
+        let source = Arc::new(Geometry::Point(geo::Point::new(lng, 10.0)));
+        let members = shared_tile_members(
+            &source,
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let y = crate::tile::lng_lat_to_tile(lng, 10.0, zoom).y;
+        assert!(shared(&members, tile_key(15, y, zoom), &source));
+        assert!(!shared(&members, tile_key(0, y, zoom), &source));
     }
 
     /// Tile buffers continue across the antimeridian. A point just west of
