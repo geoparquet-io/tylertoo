@@ -90,7 +90,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 
 | Option | Description |
 | --- | --- |
-| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser zooms and the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
+| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
 
 ### Sharded builds
 
@@ -194,7 +194,7 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 
 | Option | Description |
 | --- | --- |
-| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser zooms and the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
+| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
 
 ### Memory & performance
 
@@ -317,7 +317,7 @@ tylertoo pyramid [OPTIONS] --band <LO-HI:INPUT[:LAYER]> <OUTPUT>
 
 | Option | Description |
 | --- | --- |
-| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser zooms and the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
+| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
 
 ## `tylertoo merge`
 

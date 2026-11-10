@@ -57,7 +57,9 @@ Args:
         levels. With the default GSD base, 1 GSD is 4 tile units at
         extent 4096. Features smaller than the tolerance keep their own
         geometry. Defaults to None (off). Changes the output; leaves
-        coarser zooms and the overview file unchanged. Comparable to
+        coarser levels unchanged, except that variable-depth stop tiles
+        carry the simplified finest-level features. Leaves the overview
+        file unchanged. Comparable to
         tippecanoe's `-S`, which uses tile units at every zoom:
         `-S 10` is about factor 2.5.
     coverage_fill: Experimental: under each tile's features, draw

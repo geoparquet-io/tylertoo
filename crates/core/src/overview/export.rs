@@ -424,14 +424,16 @@ pub struct ExportOptions {
     /// same rule `--simplify-factor` uses for coarser levels. With the default
     /// GSD base, 1 GSD is 4 tile units at extent 4096. A feature smaller than
     /// the tolerance keeps its own geometry. Default `None` (off).
-    /// Changes the output; leaves coarser zooms and the overview file unchanged.
+    /// Changes the output; leaves coarser levels unchanged, except that
+    /// variable-depth stop tiles carry the simplified finest-level features.
+    /// Leaves the overview file unchanged.
     /// Comparable to tippecanoe's `-S`, which uses tile units at every zoom:
     /// `-S 10` is about factor 2.5.
     #[cfg_attr(
         feature = "cli",
         arg(long, value_name = "FACTOR", help_heading = "Generalization")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser zooms and the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5", long_help = None))]
     pub max_zoom_simplify_factor: Option<f64>,
     /// Number of partitions processed per band read (the export concurrency
     /// knob). Default [`PARTITION_WAVE_AUTO`], which [`resolve_partition_wave`]
