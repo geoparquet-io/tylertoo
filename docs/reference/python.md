@@ -774,7 +774,7 @@ class ExportReport(TypedDict):
 ```
 
 * `oversized_tiles`: Tiles that exceeded a size limit and triggered size reduction.
-* `over_limit_tiles`: Tiles the size valve could not bring under the limit, including one-feature tiles; written as is. Unlike oversized_tiles, counts tiles still over the limit, not all tiles that triggered size reduction. The report prints one summary line for these tiles.
+* `over_limit_tiles`: Tiles the size valve could not bring under the limit, including one-feature tiles; written as is. Unlike `oversized_tiles`, counts tiles still over the limit, not all tiles that triggered size reduction. The report prints one summary line for these tiles.
 * `merged_features`: Tile features merged into a neighbor to fit a size limit (`size_valve="merge"`).
 * `valve_dropped_features`: Tile features dropped to fit a size limit.
 * `encode_dropped_features`: Features removed by clipping. A nonzero count logs a warning for lost content.
