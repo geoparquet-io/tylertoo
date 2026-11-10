@@ -83,8 +83,10 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Sharded builds work with line coalescing, which is on by default (#546).
   Every data shard rebuilds the chains from the plan and reads the row groups
   of the chains that reach its tiles. Tile bodies match a single-machine
-  build byte for byte. `--no-coalesce-lines` is no longer needed, and
-  `InvalidOption::ShardWithCoalescedLines` is gone.
+  build byte for byte, except for over-cap tiles under the default
+  `--size-valve merge` when a shard prunes row groups (#854; pass
+  `--size-valve drop` for an exact match). `--no-coalesce-lines` is no longer
+  needed, and `InvalidOption::ShardWithCoalescedLines` is gone.
 
 ### Fixed
 
