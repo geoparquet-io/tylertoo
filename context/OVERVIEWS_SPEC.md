@@ -1015,7 +1015,8 @@ only to files that opt in (i.e. files whose footer carries a
 Clustering applies to **point features only** (Point/MultiPoint rows;
 lines and polygons are unaffected) and to **`duplicating` mode only**
 (§12.5). It MUST be opt-in for producers, default off (consistent
-with the opt-in-collapse posture of §7.5 / Q4).
+with the opt-in-collapse posture of §7.5 / Q4); accounting and the sum
+invariant are scoped by §14.1 when aggregation is enabled.
 
 At each level, the generalization engine's per-cell survivor
 **absorbs** the point features that were thinned out of its cell at
@@ -1294,6 +1295,11 @@ only to files that opt in (i.e. files whose footer carries a
 
 Aggregation applies to **`duplicating` mode only** (§14.5). It MUST
 be opt-in for producers, default off, like point clustering (§12).
+
+Each level is either aggregated or unaggregated (§14.4 lists the
+aggregated levels): §12's accounting and sum invariant apply only to
+unaggregated levels; aggregated levels use §14.2's `aggregated_count`
+invariant instead.
 
 At each aggregated level, source features are grouped by the cell
 containing their **representative point** (the same point used for
