@@ -55,7 +55,7 @@ const PYTHON_LOSS_SHARE: f64 = 0.10;
 
 /// Fewest row groups a non-`speed` writer encodes at once, pool permitting:
 /// #545's A/B kept 4 as the point below which the drain serializes.
-const ENCODE_FLOOR: usize = 4;
+pub(super) const ENCODE_FLOOR: usize = 4;
 
 /// Fraction of the probed memory export's waves, level stores and tile
 /// encodes may hold (#303, #311, #788 E1), as export's own budget always
@@ -446,9 +446,10 @@ impl MemoryBudget {
     /// Row groups pass 2's buffered drain may encode at once (#817 B1): the
     /// writer's `encode` grant plus as many more slots of `slot_bytes` (at
     /// least the grant's own unit) as `reused` bytes hold, at most `threads`.
-    /// `reused` is what the finished read was granted (its read-ahead and
-    /// compute window are empty by the drain), so the drain spends bytes
-    /// pass 2 already holds and charges nothing new.
+    /// `reused` is what the finished read's read-ahead and compute window
+    /// actually held (empty by the drain), capped at their grants: the
+    /// grants alone overstate it (bounded Moldova: 2.1 GB granted, a 1.94 GB
+    /// pass-2 peak in all), and spending them raised the run's peak.
     pub(super) fn drain_encodes(
         encode: Grant,
         slot_bytes: u64,

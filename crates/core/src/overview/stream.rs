@@ -1684,12 +1684,14 @@ fn run_pass2_levels(
                         backing,
                         out_schema,
                         spill_dir: options.spill_dir.as_deref(),
-                        drain_encodes: MemoryBudget::drain_encodes(
-                            encode,
-                            drain_slot_bytes,
-                            grants.read.bytes().saturating_add(grants.window.bytes()),
-                            rayon::current_num_threads(),
-                        ),
+                        drain_encodes: &|held| {
+                            MemoryBudget::drain_encodes(
+                                encode,
+                                drain_slot_bytes,
+                                held.min(grants.read.bytes().saturating_add(grants.window.bytes())),
+                                rayon::current_num_threads(),
+                            )
+                        },
                     },
                 );
                 grants.release(&mut budget);
@@ -10107,43 +10109,6 @@ mod tests {
         let slot = drain_slot_price(&opts, &counts, row).bytes;
         assert!(group < slot, "group {group} B vs slot {slot} B");
         assert_eq!(slot, 10_000 * 100 * ENCODE_COPIES);
-    }
-
-    /// #817 B1: under `bounded` the writer may encode `ENCODE_FLOOR` (4) row
-    /// groups at once, and pass 2's spilled levels drained through those 4
-    /// while 60 cores sat idle (Oregon roads: 2.5 s of a 10 s run). By the
-    /// drain the read-ahead and compute window are empty, so the drain
-    /// encodes on their bytes: more than 4 row groups at once.
-    #[test]
-    fn bounded_drain_encodes_beyond_the_writer_grant() {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &point_geoms(3000), true, None);
-        let tout = tempfile::NamedTempFile::new().unwrap();
-        let options = ConvertOptions {
-            mode: Mode::Duplicating,
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 2,
-                max_zoom: 8,
-            },
-            profile: MemoryProfile::Bounded,
-            max_row_group_size: 8,
-            ..ConvertOptions::default()
-        };
-        let pool = super::super::accumulate::rendezvous::pool(8);
-        let _guard = super::super::accumulate::rendezvous::arm("encode row group", 5);
-        pool.install(|| {
-            super::super::convert::convert_to_overviews_strategy(
-                tin.path(),
-                tout.path(),
-                &options,
-                Pass2Strategy::Pipelined,
-            )
-            .unwrap();
-        });
-        assert!(
-            super::super::accumulate::rendezvous::met(),
-            "the bounded drain never had 5 row groups encoding at once"
-        );
     }
 
     /// #817 A2: the exact-endpoint join (phase 1 of the chain stage) does

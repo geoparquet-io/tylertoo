@@ -62,6 +62,8 @@ pub(super) struct ProcStatusMem {
     pub(super) shmem_kib: Option<u64>,
     /// `VmSwap`: anonymous pages evicted to swap (not resident, but ours).
     pub(super) swap_kib: Option<u64>,
+    /// `VmHWM`: the process's peak `VmRSS` so far.
+    pub(super) hwm_kib: Option<u64>,
 }
 
 impl ProcStatusMem {
@@ -87,6 +89,7 @@ pub(super) fn parse_proc_status(text: &str) -> Option<ProcStatusMem> {
             "RssFile" => &mut out.file_kib,
             "RssShmem" => &mut out.shmem_kib,
             "VmSwap" => &mut out.swap_kib,
+            "VmHWM" => &mut out.hwm_kib,
             _ => continue,
         };
         // `<whitespace><number> kB`: the first token must be a number; the
@@ -270,6 +273,7 @@ Threads:\t12
                 file_kib: Some(122_880),
                 shmem_kib: Some(8_192),
                 swap_kib: Some(1_024),
+                hwm_kib: Some(7_340_032),
             })
         );
     }
@@ -292,6 +296,7 @@ Threads:\t12
         let m = parse_proc_status("VmHWM:\t 999 kB\nVmPeak:\t 999 kB\nVmRSS:\t 512 kB\n")
             .expect("VmRSS alone is a result");
         assert_eq!(m.rss_kib, Some(512));
+        assert_eq!(m.hwm_kib, Some(999));
         assert_eq!(m.anon_kib, None);
         assert_eq!(m.file_kib, None);
         assert_eq!(m.shmem_kib, None);
