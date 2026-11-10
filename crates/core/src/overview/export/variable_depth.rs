@@ -1611,6 +1611,7 @@ mod tests {
 
     use super::super::super::cluster::{AccumulateOp, AccumulateSpec};
     use super::super::super::ladder::{EntryZoomKind, EntryZoomSpec};
+    use super::super::tests::{band_source, test_band};
     use super::super::Crs;
     use super::super::{resolve_level_zooms, scan_all_levels, tile_key, ExportTimers};
     use super::{VdPlan, VdScan};
@@ -1650,6 +1651,7 @@ mod tests {
         let mut scan = VdScan::new(&meta, reader.geo_metadata_json(), zooms).unwrap();
         let scans = scan_all_levels(
             &reader,
+            test_band(&band_source(&reader)),
             Crs::Epsg4326,
             &vd(),
             &ExportTimers::default(),
