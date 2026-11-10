@@ -980,8 +980,14 @@ fn join_pieces<'a>(
         let piece = if let [(pi, _)] = walk[..] {
             slots[pi].take().expect("piece consumed once")
         } else {
-            let mut members: Vec<usize> = Vec::new();
-            let mut coords: Vec<geo::Coord<f64>> = Vec::new();
+            // Sized up front: grown push by push, the runs carried up to
+            // half their bytes again as slack, per level (#851). The
+            // coordinate count is an upper bound (joints dedupe).
+            let piece = |pi: usize| slots[pi].as_ref().expect("piece consumed once");
+            let mut members: Vec<usize> =
+                Vec::with_capacity(walk.iter().map(|&(pi, _)| piece(pi).members.len()).sum());
+            let mut coords: Vec<geo::Coord<f64>> =
+                Vec::with_capacity(walk.iter().map(|&(pi, _)| piece(pi).coords.len()).sum());
             let mut group = 0u32;
             for &(pi, seg_entry) in &walk {
                 let p = slots[pi].take().expect("piece consumed once");
@@ -2498,6 +2504,6 @@ mod chain_stage_cost_tests {
     }
 
     /// Bytes per exact-join piece one level's chain stage may hold at once.
-    /// Measured 225 B after #851 (284 B before it).
-    const PEAK_BYTES_PER_PIECE: usize = 250;
+    /// Measured 196 B after #851 (284 B before it).
+    const PEAK_BYTES_PER_PIECE: usize = 210;
 }
