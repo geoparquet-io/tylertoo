@@ -1232,11 +1232,7 @@ fn build_pass2_coalesce_tables(
                 "[convert] building coalesce chain tables for {} level(s)",
                 emitted.len()
             );
-            let lines = ExactChains::new(
-                scratch.inputs(),
-                options.coalesce_junction_angle,
-                options.assign.sort_direction,
-            );
+            let lines = scratch.exact_chains(options);
             emitted
                 .par_iter()
                 .map(|e| {
@@ -2015,11 +2011,7 @@ fn pass2_coalesce(
                             "[convert] coalesce level {} was not prebuilt; building it now",
                             e.orig
                         );
-                        let lines = ExactChains::new(
-                            scratch.inputs(),
-                            options.coalesce_junction_angle,
-                            options.assign.sort_direction,
-                        );
+                        let lines = scratch.exact_chains(options);
                         Some(build_level_coalesce_table(
                             &lines,
                             e.orig as usize,
@@ -2068,11 +2060,7 @@ fn coalesce_merged_anywhere(
     {
         return false;
     }
-    let lines = ExactChains::new(
-        scratch.inputs(),
-        options.coalesce_junction_angle,
-        options.assign.sort_direction,
-    );
+    let lines = scratch.exact_chains(options);
     unmaterialized
         .par_iter()
         .filter(|e| e.orig as usize != finest)
@@ -2403,13 +2391,9 @@ fn coalesce_level_counts_in_waves(
     let num_levels = level_specs.len();
     // Phase 1 of the chain stage, shared by every level (#817 A2); none
     // when the canonical level is the only one.
-    let lines = (0..num_levels).any(|l| l != finest).then(|| {
-        ExactChains::new(
-            scratch.inputs(),
-            options.coalesce_junction_angle,
-            options.assign.sort_direction,
-        )
-    });
+    let lines = (0..num_levels)
+        .any(|l| l != finest)
+        .then(|| scratch.exact_chains(options));
     let wave = wave.max(1);
     log::info!(
         "[convert] {} coalesce chains for {num_levels} level(s) ({} candidate line(s), \
@@ -5035,6 +5019,15 @@ pub(super) struct CoalesceScratch {
 }
 
 impl CoalesceScratch {
+    /// The exact-endpoint join over these lines that every level shares.
+    fn exact_chains(&self, options: &ConvertOptions) -> ExactChains<'_> {
+        ExactChains::new(
+            self.inputs(),
+            options.coalesce_junction_angle,
+            options.assign.sort_direction,
+        )
+    }
+
     /// The per-level chaining inputs (borrowing the collected geometries).
     fn inputs(&self) -> Vec<CoalesceInput<'_>> {
         (0..self.rows.len())
