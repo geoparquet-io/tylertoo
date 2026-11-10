@@ -54,7 +54,7 @@ use super::convert::{
     count_vertices, extract_class_ranks, extract_numeric_values, extract_sort_keys,
     fill_level_bytes, mixed_geometry_field, overture_road_ranking, record_coalesce_merged,
     record_level_outcome, resolve_pass_read_workers, resolve_reserved_column_collisions,
-    scan_feature_traits, validate_cluster_schema, validate_coalesce_schema,
+    scan_feature_traits, take_chain_geometry, validate_cluster_schema, validate_coalesce_schema,
     warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking, CoalesceTable, ConvertError,
     ConvertOptions, ConvertReport, GroupInterner, LevelReport, PlanLevelReport, PlanReport,
     SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
@@ -1983,7 +1983,7 @@ fn pass2_coalesce(
         options,
     } = inputs;
     let Some(build) = prebuilt else {
-        return Ok((vec![None; kept], false));
+        return Ok(((0..kept).map(|_| None).collect(), false));
     };
     let mut by_level = build.tables;
     let tables = planned[..kept]
@@ -3753,8 +3753,16 @@ pub(crate) fn run_stages(
         strategy,
     )?;
 
-    // The chain tables hold every level's simplified strokes: free them
-    // across the pool, not serially at scope end (#817 T1).
+    // Pass 2 moved every chain's geometry out as it emitted the rep (#851);
+    // what is left is the reps' counts and the maps' slots.
+    debug_assert!(
+        coalesce_tables
+            .iter()
+            .flatten()
+            .flat_map(|t| t.values())
+            .all(|(g, _)| g.lock().is_ok_and(|g| g.is_none())),
+        "pass 2 left a chain rep unemitted"
+    );
     drop(ctxs);
     // Per table: flattening the maps into one Vec would add a copy of every
     // entry at the end of the run.
@@ -6902,9 +6910,11 @@ pub(super) fn process_level_batch(
             .par_iter()
             .zip(&selected)
             .map(|(g, &i)| {
-                if let Some((merged, _)) = ctx.coalesce_table.and_then(|t| t.get(&(row_offset + i)))
+                if let Some(merged) = ctx
+                    .coalesce_table
+                    .and_then(|t| take_chain_geometry(t, row_offset + i))
                 {
-                    Simplified::Keep(merged.clone())
+                    Simplified::Keep(merged)
                 } else if ctx.is_carrier_row(row_offset + i) {
                     // #384: a carrier stands in for its neighbourhood's
                     // dropped area as one placeholder square.
@@ -7204,10 +7214,10 @@ pub(super) fn process_batch_cascade(
                 let g = row_offset + i;
                 if let Some(table) = ctx.coalesce_table {
                     if ctx.kinds.expect("kinds present when coalescing")[g] == FeatureKind::Line {
-                        if let Some((merged, _)) = table.get(&g) {
-                            verts += count_vertices(merged);
+                        if let Some(merged) = take_chain_geometry(table, g) {
+                            verts += count_vertices(&merged);
                             kept_idx.push(i);
-                            kept_geoms.push(Arc::new(merged.clone()));
+                            kept_geoms.push(Arc::new(merged));
                         }
                         continue;
                     }
@@ -10106,6 +10116,31 @@ mod tests {
 
     // ---- #570: the chain tables are built once, in pass 1 -------------------
 
+    type PlainTable = std::collections::HashMap<usize, (Option<Geometry<f64>>, i32)>;
+
+    /// A chain table's entries without the take-once slots, for comparing.
+    fn plain_tables(tables: Vec<Option<CoalesceTable>>) -> Vec<Option<PlainTable>> {
+        tables
+            .into_iter()
+            .map(|t| {
+                t.map(|t| {
+                    t.into_iter()
+                        .map(|(k, (g, c))| (k, (g.into_inner().unwrap(), c)))
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
+    fn clone_table(t: &CoalesceTable) -> CoalesceTable {
+        t.iter()
+            .map(|(&k, (g, c))| {
+                let g = g.lock().unwrap().clone();
+                (k, (super::super::convert::ChainGeometry::new(g), *c))
+            })
+            .collect()
+    }
+
     /// A chain table no real build could produce, so its presence in pass 2's
     /// output proves the table was REUSED rather than rebuilt.
     fn sentinel_table(rep: usize) -> CoalesceTable {
@@ -10113,7 +10148,9 @@ mod tests {
         t.insert(
             rep,
             (
-                Geometry::LineString(LineString::from(vec![(0.0, 0.0), (1.0, 1.0)])),
+                super::super::convert::ChainGeometry::new(Some(Geometry::LineString(
+                    LineString::from(vec![(0.0, 0.0), (1.0, 1.0)]),
+                ))),
                 7,
             ),
         );
@@ -10328,8 +10365,35 @@ mod tests {
             let (counts, build) = run(wave);
             assert_eq!(counts, all_counts, "wave {wave}");
             assert_eq!(build.merged, all_build.merged, "wave {wave}");
-            assert_eq!(build.tables, all_build.tables, "wave {wave}");
+            assert_eq!(
+                plain_tables(build.tables),
+                plain_tables(
+                    all_build
+                        .tables
+                        .iter()
+                        .map(|t| t.as_ref().map(clone_table))
+                        .collect()
+                ),
+                "wave {wave}"
+            );
         }
+    }
+
+    /// #851: pass 2 moves a rep's merged geometry out of the table when it
+    /// emits the rep, so the table frees its chains as pass 2 advances; the
+    /// rep's count stays for the `coalesced_count` column.
+    #[test]
+    fn emitting_a_chain_rep_frees_its_geometry() {
+        let table = sentinel_table(100);
+        assert!(take_chain_geometry(&table, 7).is_none(), "not a rep");
+        let g = take_chain_geometry(&table, 100).expect("the rep's chain");
+        assert_eq!(count_vertices(&g), 2);
+        let (slot, count) = &table[&100];
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the table still holds the chain"
+        );
+        assert_eq!(*count, 7);
     }
 
     /// Pass 2 takes pass 1's prebuilt tables verbatim, level by level, and
