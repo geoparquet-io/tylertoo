@@ -83,6 +83,10 @@ BASELINE = HERE / "baseline" / "valve_guard.json"
 RATIO_WALL_MAX = 1.8
 RATIO_RSS_MAX = 1.5
 WALL_REGRESSION_MAX = 1.15
+# moldova-f0's wall swings 9.4-12.6 s between identical runs at flat CPU
+# core-seconds (levels cores 21-29, the valve tail's scheduling), so 1.15x trips
+# on noise; its CPU core-seconds check still catches added work.
+WALL_REGRESSION_MAX_BY_CELL = {"moldova-f0": 1.40}
 RSS_REGRESSION_MAX = 1.20
 CORES_DROP_MAX = 0.15  # a phase's median effective cores may fall 15% below the baseline's
 # Seeded into a recorded host class that has no `floors` yet; tighten them in
@@ -351,7 +355,7 @@ def baseline_failures(cells: dict, baseline: dict) -> tuple[list[str], list[str]
         # compared with the baseline's smallest.
         rss = now["peak_rss_min_kib"] / base["peak_rss_min_kib"]
         print(f"  {cell:16} wall {wall:.2f}x  rss {rss:.2f}x of baseline")
-        if wall > WALL_REGRESSION_MAX:
+        if wall > WALL_REGRESSION_MAX_BY_CELL.get(cell, WALL_REGRESSION_MAX):
             bad.append(f"{cell} wall {now['wall_s']} s is {wall:.2f}x its baseline {base['wall_s']} s")
         if rss > RSS_REGRESSION_MAX:
             bad.append(f"{cell} peak RSS is {rss:.2f}x its baseline")
