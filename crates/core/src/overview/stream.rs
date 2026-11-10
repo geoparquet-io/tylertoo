@@ -1680,15 +1680,11 @@ fn run_pass2_levels(
                         backing,
                         out_schema,
                         spill_dir: options.spill_dir.as_deref(),
-                        drain_encodes: &|held, below_peak| {
-                            MemoryBudget::drain_encodes(
-                                encode,
-                                drain_slot_bytes,
-                                held.min(grants.read.bytes().saturating_add(grants.window.bytes())),
-                                below_peak,
-                                rayon::current_num_threads(),
-                            )
-                        },
+                        drain: (
+                            encode,
+                            drain_slot_bytes,
+                            grants.read.bytes().saturating_add(grants.window.bytes()),
+                        ),
                     },
                 );
                 grants.release(&mut budget);

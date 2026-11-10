@@ -60,7 +60,7 @@ use tylertoo_io::IpcCompression;
 use tylertoo_io::IpcStreamReader as StreamReader;
 use tylertoo_io::IpcStreamWriter as StreamWriter;
 
-use super::memory::{MemoryBudget, SINK_ROW_ALLOC_OVERHEAD_BYTES};
+use super::memory::{Grant, MemoryBudget, SINK_ROW_ALLOC_OVERHEAD_BYTES};
 
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
@@ -76,10 +76,10 @@ pub(super) struct BufferOptions<'a> {
     pub(super) backing: SinkBacking,
     pub(super) out_schema: &'a Schema,
     pub(super) spill_dir: Option<&'a Path>,
-    /// Row groups the drain may encode at once, given the input bytes the
-    /// read actually held
-    /// ([`MemoryBudget::drain_encodes`](super::memory::MemoryBudget::drain_encodes)).
-    pub(super) drain_encodes: &'a dyn Fn(u64, u64) -> usize,
+    /// The writer's encode grant, what one more drain encode holds, and the
+    /// read's granted bytes that cap what the drain reuses
+    /// ([`MemoryBudget::drain_encodes`]).
+    pub(super) drain: (Grant, u64, u64),
 }
 
 /// How a level's buffered output is held until it is written.
@@ -1230,7 +1230,7 @@ pub(super) fn run_pass2_buffered(
         backing,
         out_schema,
         spill_dir,
-        drain_encodes,
+        drain: (encode, slot_bytes, read_granted),
     } = inputs;
     let num_levels = ctxs.len();
     debug_assert_eq!(num_levels, hints.len());
@@ -1406,7 +1406,13 @@ pub(super) fn run_pass2_buffered(
         .and_then(|m| Some(m.hwm_kib?.saturating_sub(m.rss_kib?) * 1024))
         .unwrap_or(0);
     let held = peak_batch.into_inner().saturating_mul(in_flight as u64);
-    let width = drain_encodes(held, below_peak);
+    let width = MemoryBudget::drain_encodes(
+        encode,
+        slot_bytes,
+        held.min(read_granted),
+        below_peak,
+        rayon::current_num_threads(),
+    );
     log::debug!(
         "[profile] pass 2 drain: {width} encode(s) on {held} B ({below_peak} B below peak RSS)"
     );
