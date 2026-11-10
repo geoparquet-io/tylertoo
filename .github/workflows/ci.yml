@@ -1273,21 +1273,23 @@ jobs:
       # still surfaced in review via api/tylertoo-core.txt diffs — they just
       # no longer force a version bump.
 
-      # Every feature but `mlt`, so the optional `remote` stack (object_store,
-      # aws-*) is covered too; that is where the MSRV floor actually comes
-      # from. `mlt` (#823) pulls mlt-core, whose rust-version is above ours:
-      # core keeps it optional, and only the CLI and wheel builds turn it on.
+      # The libraries (core, io) with every feature but `mlt`, so the
+      # optional `remote` stack (object_store, aws-*) is covered too; that is
+      # where the MSRV floor actually comes from. `mlt` (#823) pulls
+      # mlt-core, which needs 1.98: core keeps it optional, and the CLI and
+      # wheel, which turn it on, declare 1.98 (stable covers them).
       - name: Check on the declared MSRV
         if: ${{ !cancelled() && needs.plan.outputs.rust == 'true' }}
         env:
           MSRV: ${{ steps.msrv.outputs.version }}
         run: |
           features=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | .name as $p | .features | keys[]
+            | jq -r '.packages[] | select(.name == "tylertoo-core" or .name == "tylertoo-io")
+                     | .name as $p | .features | keys[]
                      | select(. != "default" and . != "mlt") | "\($p)/\(.)"' \
             | paste -sd, -)
-          cargo "+$MSRV" check --locked --workspace --all-targets \
-            --no-default-features --features "$features"
+          cargo "+$MSRV" check --locked -p tylertoo-core -p tylertoo-io \
+            --all-targets --features "$features"
 
       # Public API surface: fail when core's or io's exported API drifts from
       # the committed baseline. This is a REVIEW gate, not a ban on growth —

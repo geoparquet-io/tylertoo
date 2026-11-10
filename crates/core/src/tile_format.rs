@@ -232,25 +232,14 @@ fn doubles_for_gl_js(layer: mlt_core::TileLayer) -> mlt_core::MltResult<mlt_core
 pub(crate) fn mlt_to_mvt_layers(mlt: &[u8]) -> Result<Vec<(Vec<u8>, u64)>, String> {
     let (mut parser, mut decoder) = (mlt_core::Parser::default(), mlt_core::Decoder::default());
     let mut layers = Vec::new();
-    let mut rest = mlt;
-    while !rest.is_empty() {
-        // Each layer is varint(size) then `size` bytes (its tag included).
-        let mut body = rest;
-        let size = prost::encoding::decode_varint(&mut body).map_err(|e| e.to_string())?;
-        let len = usize::try_from(size)
-            .ok()
-            .and_then(|size| size.checked_add(rest.len() - body.len()))
-            .filter(|&len| len <= rest.len())
-            .ok_or("layer runs past the end of the tile")?;
-        let (record, tail) = rest.split_at(len);
-        for layer in parser.parse_layers(record).map_err(|e| e.to_string())? {
-            if let Some(layer) = layer.into_tile(&mut decoder).map_err(|e| e.to_string())? {
-                let mvt =
-                    mlt_core::mvt::tile_layers_to_mvt(vec![layer]).map_err(|e| e.to_string())?;
-                layers.push((mvt, len as u64));
-            }
+    for layer in parser.parse_layers(mlt).map_err(|e| e.to_string())? {
+        // The size varint holds tag + body; the wire length adds the varint.
+        let size = layer.bytes().map_or(0, |b| u64::from(b.size()));
+        let wire = size + prost::encoding::encoded_len_varint(size) as u64;
+        if let Some(layer) = layer.into_tile(&mut decoder).map_err(|e| e.to_string())? {
+            let mvt = mlt_core::mvt::tile_layers_to_mvt(vec![layer]).map_err(|e| e.to_string())?;
+            layers.push((mvt, wire));
         }
-        rest = tail;
     }
     Ok(layers)
 }

@@ -3,7 +3,9 @@ name = "tylertoo-python"
 description = "Python bindings for tylertoo"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# mlt-core (default `mlt` feature, #823) needs 1.98; the libraries keep the
+# workspace's 1.95.
+rust-version = "1.98"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

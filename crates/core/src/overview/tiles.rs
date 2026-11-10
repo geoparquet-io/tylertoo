@@ -2430,6 +2430,7 @@ mod tests {
     }
 
     /// The derived layer name follows core's input rules for both shapes.
+    #[cfg(feature = "mlt")]
     #[test]
     fn an_empty_mlt_layer_name_is_refused_before_any_io() {
         let options = TilesOptions {
