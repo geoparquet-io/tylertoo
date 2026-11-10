@@ -27,7 +27,7 @@ def tylertoo(*args: str, **kwargs) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "tylertoo", *args],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         timeout=120,
         env=env,
         check=False,
@@ -99,7 +99,7 @@ def test_a_panic_exits_101(tmp_path: Path) -> None:
             [sys.executable, "-m", "tylertoo", "stats", str(out)],
             stdout=write,
             stderr=subprocess.PIPE,
-            text=True,
+            encoding="utf-8",
             timeout=120,
             check=False,
         )
@@ -158,7 +158,7 @@ def test_the_console_script_runs_the_cli() -> None:
     result = subprocess.run(
         [str(script), "--version"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         timeout=60,
         check=False,
     )
