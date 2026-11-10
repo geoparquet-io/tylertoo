@@ -42,8 +42,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tylertoo_core::internal::error::{Classify, ErrorKind};
 use tylertoo_core::internal::overview::auto_zoom::MaxZoom;
 use tylertoo_core::internal::overview::config::cli::{
-    export_options, overview_options, pyramid_options, tiles_options, ExportPmtilesArgs,
-    OverviewArgs, PyramidArgs, TilesArgs,
+    export_options, overview_options, pyramid_options, tiles_export_defaults, tiles_options,
+    ExportPmtilesArgs, OverviewArgs, PyramidArgs, TilesArgs,
 };
 
 use tylertoo_core::internal::overview::config::{self, OutputKind};
@@ -804,8 +804,7 @@ fn resolve_tiles_job(
 /// names ([`TilesOptions::ignored_by_plan_only`]), then this CLI's own
 /// `--report` and `--force`.
 fn plan_only_ignored(args: &TilesArgs, options: &TilesOptions) -> Vec<&'static str> {
-    let mut ignored =
-        options.ignored_by_plan_only(&TilesOptions::export_defaults(args.tuning.syntax.verbatim));
+    let mut ignored = options.ignored_by_plan_only(&tiles_export_defaults(args));
     ignored.extend(
         [("--report", args.report.is_some()), ("--force", args.force)]
             .into_iter()
@@ -3619,6 +3618,9 @@ mod tests {
             ignored_export_options(&a),
             vec!["--layer-name", "--name", "--attribution", "--force"]
         );
+        // #822: a preset's export values are defaults, not ignored flags.
+        let a = parse_plan_only(&["--preset", "tippecanoe"]).unwrap();
+        assert!(ignored_export_options(&a).is_empty());
     }
 
     /// Too large for any archive's metadata: refused by the preflight, on a

@@ -64,6 +64,11 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `--preset tippecanoe` (Python `preset="tippecanoe"`) on `tiles`, `overview`
+  and `export-pmtiles` starts from tippecanoe's drop rate, gamma,
+  simplification, tile buffer, size caps and size valve (#822). Options you
+  pass still win. `docs/guides/tippecanoe.md` lists every value and what still
+  differs.
 - `--max-zoom auto:N` and Python `max_zoom="auto:N"` cap the automatic zoom
   pick at N (#793). Plain `auto` keeps its z16 ceiling. Rust callers that
   match `MaxZoom` exhaustively need the new `AutoCapped` arm.

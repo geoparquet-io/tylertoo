@@ -33,6 +33,7 @@ overview(
     class_ranks: dict[str, float] | None = None,
     class_rank_unknown: float | None = None,
     no_auto_rank: bool = False,
+    preset: Literal['tippecanoe'] | None = None,
     verbatim: bool = False,
     simplify_factor: float | None = None,
     collapse: bool = False,
@@ -100,6 +101,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `class_ranks`: Finite priority per class; higher values win.
 * `class_rank_unknown`: Priority of unlisted classes, or `None` to rank them last.
 * `no_auto_rank`: Skip automatic ranking of Overture roads and places.
+* `preset`: `"tippecanoe"` starts from tippecanoe's drop rate, gamma and simplification instead of tylertoo's; an option you pass still applies. Not with `verbatim`. See [the tippecanoe preset](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset).
 
 #### Geometry and thinning
 
@@ -185,6 +187,7 @@ export_pmtiles(
     *,
     layer_name: str = "overview",
     tile_buffer: int = 8,
+    preset: Literal['tippecanoe'] | None = None,
     extent: int = 4096,
     tile_size_limit: int | Literal['auto'] | None = "auto",
     simple_clip_fastpath: bool = True,
@@ -217,6 +220,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `output`: PMTiles archive to write.
 * `layer_name`: MVT layer name.
 * `tile_buffer`: Tile edge buffer in pixels, at most 256.
+* `preset`: `"tippecanoe"` starts from tippecanoe's tile buffer, size limits and size valve instead of tylertoo's; an option you pass still applies. See [the tippecanoe preset](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset).
 * `extent`: Tile resolution in MVT units.
 * `tile_size_limit`: Maximum raw (uncompressed) tile size in bytes, a backstop behind `max_compressed_tile_size`; `"auto"` is 2 MiB, and `0` or `None` is no limit.
 * `simple_clip_fastpath`: Use faster clipping for simple polygons. `False` gives byte-stable output.
@@ -461,6 +465,7 @@ convert(
     class_ranks: dict[str, float] | None = None,
     class_rank_unknown: float | None = None,
     no_auto_rank: bool = False,
+    preset: Literal['tippecanoe'] | None = None,
     verbatim: bool = False,
     simplify_factor: float | None = None,
     collapse: bool = False,
@@ -540,6 +545,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `class_ranks`: See `overview()`.
 * `class_rank_unknown`: See `overview()`.
 * `no_auto_rank`: See `overview()`.
+* `preset`: See `overview()`. `"tippecanoe"` also sets the `export_pmtiles()` defaults that `preset` sets there.
 * `verbatim`: See `overview()`. Also turns both tile size limits off unless you pass them.
 * `simplify_factor`: See `overview()`.
 * `collapse`: See `overview()`.

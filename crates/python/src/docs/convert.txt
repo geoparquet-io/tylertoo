@@ -54,6 +54,8 @@ Args:
     class_ranks: See `overview()`.
     class_rank_unknown: See `overview()`.
     no_auto_rank: See `overview()`.
+    preset: See `overview()`. `"tippecanoe"` also sets the
+        `export_pmtiles()` defaults that `preset` sets there.
     verbatim: See `overview()`. Also turns both tile size limits
         off unless you pass them.
     simplify_factor: See `overview()`.

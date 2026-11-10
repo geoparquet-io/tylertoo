@@ -143,6 +143,8 @@ pub fn convert(
     mut base: ConvertOptions,
 ) -> Result<ConvertOptions, ConvertError> {
     let verbatim = take::<bool>(&mut values, "verbatim")?;
+    let preset: Option<super::Preset> = take(&mut values, "preset")?;
+    base = super::Preset::convert(preset, base);
     if let Some(mode) = values.get("mode") {
         base.mode = serde_json::from_value(mode.clone()).map_err(|e| error("mode", e))?;
     }
@@ -164,7 +166,7 @@ pub fn convert(
     let overrides: GeneralizationOverrides =
         serde_path_to_error::deserialize(Value::Object(overrides))
             .map_err(|e| error("generalization", e))?;
-    base = base.with_generalization(&overrides, verbatim)?;
+    base = base.with_generalization_preset(&overrides, verbatim, preset)?;
 
     let collapse = take(&mut values, "collapse")?;
     let square = take(&mut values, "collapse_square")?;
@@ -245,6 +247,7 @@ pub fn export(
     mut values: Map<String, Value>,
     base: ExportOptions,
 ) -> Result<ExportOptions, ConfigError> {
+    let base = super::Preset::export(take(&mut values, "preset")?, base);
     for (key, default) in [
         ("tile_size_limit", base.tile_size_limit),
         ("max_compressed_tile_size", base.compressed_tile_size_limit),
@@ -340,6 +343,7 @@ pub fn command_defaults(command: &str) -> Map<String, Value> {
             let mut out = defaults(ExportOptions::default());
             out.insert("tile_size_limit".into(), "auto".into());
             out.insert("max_compressed_tile_size".into(), "auto".into());
+            out.insert("preset".into(), Value::Null);
             out
         }
         "convert" => {
@@ -375,6 +379,8 @@ pub fn command_defaults(command: &str) -> Map<String, Value> {
                 "spill_dir",
                 "profile",
                 "variable_depth",
+                // #822: bands tile verbatim, so a preset has no convert half.
+                "preset",
             ] {
                 out.remove(key);
             }
@@ -429,6 +435,14 @@ pub fn tiles(
         .get("verbatim")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // The preset feeds both halves; `convert` below takes the keyword.
+    let preset: Option<super::Preset> = values
+        .get("preset")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| error("preset", e))?
+        .flatten();
     let convert = convert(
         group(&mut values, command_defaults("overview")),
         base.convert,
@@ -452,7 +466,7 @@ pub fn tiles(
                 })
                 .collect(),
         ),
-        TilesOptions::export_defaults(verbatim),
+        super::Preset::export(preset, TilesOptions::export_defaults(verbatim)),
     )?;
     // The auto flag is not a keyword, so the serde round trip below drops
     // it; carried across by hand (see LOCKSTEP in `convert`).
@@ -507,6 +521,16 @@ pub fn pyramid(
 #[derive(Debug, Clone, serde::Serialize)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 pub struct ConvertSyntax {
+    /// Start from another tool's defaults instead of tylertoo's; options you
+    /// pass still override them. `tippecanoe` sets its drop rate, gamma and
+    /// simplification, and with `tiles` its tile buffer, size caps and size
+    /// valve:
+    /// <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>.
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "tippecanoe", hide_possible_values = true)
+    )]
+    pub preset: Option<super::Preset>,
     /// Disable thinning, simplification, and density reduction for
     /// pre-aggregated or pre-levelled input. Explicit tuning flags override
     /// these defaults.
@@ -589,6 +613,7 @@ pub struct ConvertSyntax {
 impl Default for ConvertSyntax {
     fn default() -> Self {
         Self {
+            preset: None,
             verbatim: false,
             magnitude_ladder: None,
             ladder_step: super::DEFAULT_LADDER_STEP,

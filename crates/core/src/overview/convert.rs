@@ -1219,10 +1219,31 @@ impl ConvertOptions {
     /// overridden verbatim run would otherwise put every point and line in
     /// the coarsest level.
     pub fn with_generalization(
-        mut self,
+        self,
         overrides: &GeneralizationOverrides,
         verbatim: bool,
     ) -> Result<Self, ConvertError> {
+        self.with_generalization_preset(overrides, verbatim, None)
+    }
+
+    /// [`Self::with_generalization`], with an unset knob falling back to
+    /// `preset`'s default instead of the core one (#822). A preset tunes
+    /// what verbatim turns off, so the two are refused together.
+    pub(crate) fn with_generalization_preset(
+        mut self,
+        overrides: &GeneralizationOverrides,
+        verbatim: bool,
+        preset: Option<super::config::Preset>,
+    ) -> Result<Self, ConvertError> {
+        if verbatim && preset.is_some() {
+            return Err(super::config::ConfigError::invalid_spec(
+                "--preset",
+                "--preset cannot be combined with --verbatim: verbatim turns off the \
+                 generalization a preset tunes"
+                    .into(),
+            )
+            .into());
+        }
         if verbatim && matches!(self.mode, Mode::Partitioning) {
             return Err(ConvertError::VerbatimPartitioningUnsupported);
         }
@@ -1232,7 +1253,7 @@ impl ConvertOptions {
         if overrides.coalesce_lines == Some(true) && matches!(self.mode, Mode::Partitioning) {
             return Err(super::config::ConfigError::CoalescePartitioningUnsupported.into());
         }
-        let defaults = Self::default();
+        let defaults = super::config::Preset::convert(preset, Self::default());
         let tuned = |explicit: Option<f64>, default: f64| {
             explicit.unwrap_or(if verbatim { 0.0 } else { default })
         };

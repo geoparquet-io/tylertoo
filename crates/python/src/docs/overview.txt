@@ -29,6 +29,10 @@ Args:
         rank them last.
     no_auto_rank: Skip automatic ranking of Overture roads and
         places.
+    preset: `"tippecanoe"` starts from tippecanoe's drop rate, gamma
+        and simplification instead of tylertoo's; an option you pass
+        still applies. Not with `verbatim`. See
+        [the tippecanoe preset](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset).
     verbatim: Turn off thinning, visibility gates, simplification,
         the density budget, and line coalescing, for pre-aggregated
         or pre-levelled input. Sets the defaults of the options

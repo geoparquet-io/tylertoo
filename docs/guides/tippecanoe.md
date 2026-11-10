@@ -15,6 +15,9 @@ tiles, tylertoo merges dense polygons into their neighbors, as
 For speed, memory, and archive size against tippecanoe, with methods and
 caveats, see [benchmarks](../benchmarks.md).
 
+To start from tippecanoe's defaults instead of tylertoo's, pass
+`--preset tippecanoe`; see [the tippecanoe preset](#the-tippecanoe-preset).
+
 ## Flag mapping
 
 | tippecanoe | tylertoo | Note |
@@ -40,6 +43,75 @@ caveats, see [benchmarks](../benchmarks.md).
 | `--use-attribute-for-id` | `--feature-id` | Accepts integer or `DECIMAL(p,0)` columns. Rejects string, float, null, and negative ids. Without this flag, features carry no id, as in tippecanoe. See [stable feature ids](../OVERVIEW_TUNING.md#stable-feature-ids-feature-id) |
 | `tile-join` to merge tilesets | `merge`, or `pyramid` bands sharing a zoom range | `merge` takes archives with disjoint tiles |
 | `tippecanoe-decode` | `decode` | Writes GeoParquet with one row per feature per tile, `zoom`, `layer`, and `mvt_id` columns, and simplified, clipped tile geometry |
+
+## The tippecanoe preset
+
+`--preset tippecanoe` (Python `preset="tippecanoe"`) replaces tylertoo's
+defaults with tippecanoe's wherever tylertoo has a matching option. Options
+you pass still win, so `--preset tippecanoe --tile-buffer 8` keeps an 8-pixel
+buffer.
+
+```bash
+tylertoo tiles parcels.parquet parcels.pmtiles --preset tippecanoe
+```
+
+```python
+import tylertoo  # notest: needs your own parcels.parquet
+
+tylertoo.convert("parcels.parquet", "parcels.pmtiles", preset="tippecanoe")
+```
+
+`tiles` and `convert()` take the whole preset. `overview` takes the convert
+rows below and `export-pmtiles` the export rows, so the two-step build matches
+the one-step build. `pyramid` does not take a preset: its bands are tiled
+verbatim, so they have no convert step to set. tippecanoe's counterpart,
+`tile-join`, does not re-tile either. The preset cannot be combined with
+`--verbatim`, which turns off what the preset tunes.
+
+Values are from tippecanoe v2.82.0 (`main.cpp`, `tile.cpp`, `geometry.cpp`).
+
+| Option | tylertoo default | With the preset | tippecanoe source |
+|---|---|---|---|
+| `--drop-rate` (convert) | 1.65 | 2.5 | `-r`, `droprate = 2.5` |
+| `--drop-gamma` (convert) | 1.5 | 1 | `-g`, `gamma = 0` ("no effect"). tylertoo's 1 also thins every neighborhood by the same share |
+| `--simplify-factor` (convert) | 1 | 0.25 | `-S`, `simplification = 1`: one tile unit at detail 12 (4096). A tile unit is a quarter GSD at the default `--gsd-base 1024` |
+| `--tile-buffer` (export) | 8 | 5 | `-b`, `buffer = 5` screen pixels, 1/256 of a tile |
+| `--max-compressed-tile-size` (export) | 500K (512,000 bytes) | 500,000 bytes | `-M`, `max_tile_size = 500000` |
+| `--max-tile-size` (export) | 2M | 0 (no cap) | tippecanoe does not cap the uncompressed tile |
+| `--size-valve` (export) | `merge` | `drop` | See below |
+
+tippecanoe has no default size valve. An oversized tile is retried at
+lower detail, down to `-m` 7. If it is still too big, the run fails with
+"Try using --drop-fraction-as-needed or --drop-densest-as-needed". tylertoo
+cannot fail a tile and has no detail ladder, so the preset picks the valve
+that the error message recommends: `drop`, which matches
+`--drop-densest-as-needed`.
+
+Differences the preset does not remove:
+
+- **Shared borders.** tylertoo simplifies each polygon on its own, so
+  slivers open along shared borders. tippecanoe's
+  `--detect-shared-borders` has no tylertoo option yet (#802). The preset sets
+  a factor of 0.25, which matches tippecanoe's coverage on dense parcels; see the
+  `-pn` row above.
+- **Line coalescing.** tylertoo joins touching same-class lines before its
+  line visibility gate (`--line-visibility`), so short road segments survive
+  coarse zooms as one line. tippecanoe coalesces only on request
+  (`--coalesce`). The preset leaves coalescing on, because turning it off
+  while the gate stays on drops those short segments. Pass
+  `--no-coalesce-lines` to turn it off.
+- **Point thinning.** tylertoo also thins points on a grid (`--point-thinning`,
+  4 GSDs) before the drop rate applies, and anchors the drop rate on the
+  whole canonical count rather than on each tile's base zoom. tippecanoe
+  thins by drop rate alone. Pass `--point-thinning 0` to rely on the drop
+  rate only.
+- **No default feature id (#443).** tippecanoe copies each GeoJSON
+  feature's `id`. GeoParquet has no feature id, and a preset cannot name a
+  column, so tiles carry an id only with `--feature-id COLUMN`.
+- **Simplification at the maximum zoom.** tippecanoe simplifies every zoom.
+  tylertoo does not simplify the maximum zoom.
+- **Feature count cap.** tippecanoe also caps a tile at 200,000 features
+  (`-O`). tylertoo has no feature count cap.
 
 ## What only tylertoo does
 
