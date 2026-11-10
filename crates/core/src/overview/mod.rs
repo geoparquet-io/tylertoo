@@ -14,6 +14,7 @@
 pub mod accumulate;
 pub mod assign;
 pub mod auto_zoom;
+pub(crate) mod cells;
 pub mod check;
 pub mod cluster;
 pub mod coalesce;

@@ -53,6 +53,10 @@ arrow-ord = "59"
 arrow-arith = "59"
 arrow-string = "59"
 geo = "0.33"
+# Discrete global grids for pyramid cell bands (#332).
+h3o = { version = "0.11", default-features = false, features = ["std"] }
+s2 = { version = "0.2", default-features = false }
+a5 = "1"
 geozero = { version = "0.15", features = ["with-wkb", "with-geo"] }
 # The WKB reader and writer geoarrow already uses for GeoParquet columns.
 wkb = "0.9.3"

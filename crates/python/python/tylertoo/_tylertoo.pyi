@@ -134,8 +134,11 @@ def pyramid(
     bands: Sequence[str],
     output: str,
     *,
+    accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
+    | None = None,
     allow_missing_zooms: bool = False,
     attribution: str | None = None,
+    cluster_categories: str | None = None,
     coverage_fill: bool = False,
     description: str | None = None,
     exclude_all_properties: bool = False,

@@ -144,6 +144,33 @@ impl core::marker::Unpin for tylertoo_core::BandSpecError
 impl core::marker::UnsafeUnpin for tylertoo_core::BandSpecError
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::BandSpecError
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::BandSpecError
+#[non_exhaustive] pub enum tylertoo_core::CellSystem
+pub tylertoo_core::CellSystem::A5
+pub tylertoo_core::CellSystem::Grid
+pub tylertoo_core::CellSystem::H3
+pub tylertoo_core::CellSystem::S2
+impl tylertoo_core::CellSystem
+pub const tylertoo_core::CellSystem::ALL: [Self; 4]
+pub fn tylertoo_core::CellSystem::from_name(&str) -> core::option::Option<Self>
+pub fn tylertoo_core::CellSystem::name(self) -> &'static str
+impl core::clone::Clone for tylertoo_core::CellSystem
+pub fn tylertoo_core::CellSystem::clone(&self) -> tylertoo_core::CellSystem
+impl core::cmp::Eq for tylertoo_core::CellSystem
+impl core::cmp::PartialEq for tylertoo_core::CellSystem
+pub fn tylertoo_core::CellSystem::eq(&self, &tylertoo_core::CellSystem) -> bool
+impl core::fmt::Debug for tylertoo_core::CellSystem
+pub fn tylertoo_core::CellSystem::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for tylertoo_core::CellSystem
+pub fn tylertoo_core::CellSystem::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for tylertoo_core::CellSystem
+impl core::marker::StructuralPartialEq for tylertoo_core::CellSystem
+impl core::marker::Freeze for tylertoo_core::CellSystem
+impl core::marker::Send for tylertoo_core::CellSystem
+impl core::marker::Sync for tylertoo_core::CellSystem
+impl core::marker::Unpin for tylertoo_core::CellSystem
+impl core::marker::UnsafeUnpin for tylertoo_core::CellSystem
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::CellSystem
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::CellSystem
 #[non_exhaustive] pub enum tylertoo_core::CheckError
 pub tylertoo_core::CheckError::Io(core::io::error::Error)
 impl core::convert::From<core::io::error::Error> for tylertoo_core::CheckError
@@ -2068,6 +2095,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::AssignConfig
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::AssignConfig
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::AssignConfig
 #[non_exhaustive] pub struct tylertoo_core::Band
+pub tylertoo_core::Band::cells: core::option::Option<tylertoo_core::CellSystem>
 pub tylertoo_core::Band::input: std::path::PathBuf
 pub tylertoo_core::Band::layer: alloc::string::String
 pub tylertoo_core::Band::max_zoom: u8
@@ -2075,6 +2103,7 @@ pub tylertoo_core::Band::min_zoom: u8
 impl tylertoo_core::Band
 pub fn tylertoo_core::Band::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<alloc::string::String>, u8, u8) -> Self
 pub fn tylertoo_core::Band::parse(&str) -> core::result::Result<Self, tylertoo_core::BandSpecError>
+pub fn tylertoo_core::Band::with_cells(self, tylertoo_core::CellSystem) -> Self
 impl core::clone::Clone for tylertoo_core::Band
 pub fn tylertoo_core::Band::clone(&self) -> tylertoo_core::Band
 impl core::fmt::Debug for tylertoo_core::Band
@@ -2786,7 +2815,9 @@ impl core::marker::UnsafeUnpin for tylertoo_core::PropertySelection
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::PropertySelection
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::PropertySelection
 #[non_exhaustive] pub struct tylertoo_core::PyramidOptions
+pub tylertoo_core::PyramidOptions::accumulate: alloc::vec::Vec<tylertoo_core::AccumulateSpec>
 pub tylertoo_core::PyramidOptions::allow_missing_zooms: bool
+pub tylertoo_core::PyramidOptions::cluster_categories: core::option::Option<alloc::string::String>
 pub tylertoo_core::PyramidOptions::convert: tylertoo_core::ConvertOptions
 pub tylertoo_core::PyramidOptions::export: tylertoo_core::ExportOptions
 pub tylertoo_core::PyramidOptions::metadata: tylertoo_core::TilesetMetadata
@@ -2794,7 +2825,9 @@ pub tylertoo_core::PyramidOptions::work_dir: core::option::Option<std::path::Pat
 impl tylertoo_core::PyramidOptions
 pub fn tylertoo_core::PyramidOptions::new(bool) -> Self
 impl tylertoo_core::PyramidOptions
+pub fn tylertoo_core::PyramidOptions::with_accumulate(self, alloc::vec::Vec<tylertoo_core::AccumulateSpec>) -> Self
 pub fn tylertoo_core::PyramidOptions::with_allow_missing_zooms(self, bool) -> Self
+pub fn tylertoo_core::PyramidOptions::with_cluster_categories(self, core::option::Option<alloc::string::String>) -> Self
 pub fn tylertoo_core::PyramidOptions::with_convert(self, tylertoo_core::ConvertOptions) -> Self
 pub fn tylertoo_core::PyramidOptions::with_export(self, tylertoo_core::ExportOptions) -> Self
 pub fn tylertoo_core::PyramidOptions::with_metadata(self, tylertoo_core::TilesetMetadata) -> Self

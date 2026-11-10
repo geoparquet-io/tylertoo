@@ -479,10 +479,14 @@ pub struct PyramidArgs {
 
     /// One zoom band as `LO-HI:INPUT[:LAYER]` (repeatable). `INPUT` is a
     /// GeoParquet source or PMTiles archive for zooms `LO` to `HI`, and
-    /// `LAYER` defaults to its file stem. The tuning guide covers the colon
+    /// `LAYER` defaults to its file stem. TODO(docs) The tuning guide covers the colon
     /// rules and the `LO-HI=INPUT[=LAYER]` form:
     /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
-    #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
+    #[arg(
+        long = "band",
+        required = true,
+        value_name = "LO-HI:[SYSTEM:]INPUT[:LAYER]"
+    )]
     pub bands: Vec<String>,
 
     /// Publication metadata for the output. An unset field is inherited from

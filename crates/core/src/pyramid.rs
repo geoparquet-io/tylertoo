@@ -29,6 +29,7 @@ use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::dedup::TileHasher;
 use crate::input::{redact_query, url_scheme};
+use crate::overview::cells::{CellRollup, CellSystem};
 use crate::overview::config::{check_ignored_export_fields, ExportField};
 use crate::overview::convert::{convert_to_overviews, ConvertError, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportError, ExportOptions};
@@ -192,6 +193,8 @@ pub struct Band {
     pub layer: String,
     pub min_zoom: u8,
     pub max_zoom: u8,
+    /// TODO(docs)
+    pub cells: Option<CellSystem>,
 }
 
 impl Band {
@@ -208,7 +211,15 @@ impl Band {
             layer: layer.into(),
             min_zoom,
             max_zoom,
+            cells: None,
         }
+    }
+
+    /// TODO(docs)
+    #[must_use]
+    pub fn with_cells(mut self, system: CellSystem) -> Self {
+        self.cells = Some(system);
+        self
     }
 
     /// Web Mercator zoom ceiling: the shared [`crate::tile::MAX_ZOOM`] (#371),
@@ -268,6 +279,16 @@ impl Band {
         let (sep, at) = band_separator(spec).ok_or_else(|| E::NoZoomRange { spec: owned() })?;
         let (range, rest) = spec.split_at(at);
         let rest = &rest[sep.len_utf8()..];
+        // `SYSTEM<sep>INPUT…` makes a cell band (#332).
+        let (cells, rest) = match rest.split_once(sep) {
+            Some((head, tail)) if !tail.trim().is_empty() => {
+                match CellSystem::from_name(head.trim()) {
+                    Some(system) => (Some(system), tail),
+                    None => (None, rest),
+                }
+            }
+            _ => (None, rest),
+        };
         let (lo, hi) = range
             .split_once('-')
             .ok_or_else(|| E::RangeNotLoHi { spec: owned() })?;
@@ -321,6 +342,7 @@ impl Band {
             layer,
             min_zoom,
             max_zoom,
+            cells,
         })
     }
 }
@@ -1893,6 +1915,18 @@ pub struct PyramidOptions {
     /// none on.
     #[cfg_attr(feature = "cli", arg(skip = Self::default().metadata))]
     pub metadata: TilesetMetadata,
+    /// TODO(docs)
+    #[serde(
+        rename = "accumulate_attributes",
+        with = "crate::overview::config::accumulation"
+    )]
+    #[cfg_attr(feature = "cli", arg(long = "accumulate-attribute", id = "accumulate_attributes", value_name = "COL:OP", value_parser = crate::overview::convert::parse_accumulate))]
+    #[cfg_attr(feature = "cli", arg(help = "TODO(docs)", long_help = None))]
+    pub accumulate: Vec<crate::overview::cluster::AccumulateSpec>,
+    /// TODO(docs)
+    #[cfg_attr(feature = "cli", arg(long, value_name = "COL"))]
+    #[cfg_attr(feature = "cli", arg(help = "TODO(docs)", long_help = None))]
+    pub cluster_categories: Option<String>,
 }
 
 with_setters!(PyramidOptions {
@@ -1901,6 +1935,8 @@ with_setters!(PyramidOptions {
     with_work_dir => work_dir: Option<PathBuf>,
     with_allow_missing_zooms => allow_missing_zooms: bool,
     with_metadata => metadata: TilesetMetadata,
+    with_accumulate => accumulate: Vec<crate::overview::cluster::AccumulateSpec>,
+    with_cluster_categories => cluster_categories: Option<String>,
 });
 
 impl Default for PyramidOptions {
@@ -1914,6 +1950,8 @@ impl Default for PyramidOptions {
             work_dir: None,
             allow_missing_zooms: false,
             metadata: TilesetMetadata::default(),
+            accumulate: Vec::new(),
+            cluster_categories: None,
         }
     }
 }
@@ -1994,6 +2032,24 @@ impl PyramidOptions {
         }
         self.export.validate()?;
         check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
+        // A cell table writes one column per spec, named after its source.
+        let mut seen = std::collections::HashSet::new();
+        for spec in &self.accumulate {
+            if !seen.insert(spec.column.as_str())
+                || spec.column == crate::overview::cells::CELL_COLUMN
+            {
+                return Err(crate::overview::config::ConfigError::invalid_spec(
+                    "--accumulate-attribute",
+                    format!(
+                        "column {:?} would name two columns of a cell band; \
+                         aggregate each column once and not one named {:?}",
+                        spec.column,
+                        crate::overview::cells::CELL_COLUMN
+                    ),
+                )
+                .into());
+            }
+        }
         Ok(())
     }
 }
@@ -2067,6 +2123,26 @@ fn build_pyramid_validated(
         .map(|(i, j)| (bands[i].layer.clone(), bands[j].layer.clone()))
         .collect();
     warn_pairs(&source_involved, diagnostics);
+
+    // #332: the rollups are a cell band's, and a cell band aggregates a
+    // GeoParquet source, never an archive.
+    if bands.iter().all(|b| b.cells.is_none())
+        && (!opts.accumulate.is_empty() || opts.cluster_categories.is_some())
+    {
+        return Err(PyramidError::Bands(
+            "--accumulate-attribute and --cluster-categories apply to cell bands \
+             (LO-HI:SYSTEM:INPUT[:LAYER]), and no band is one"
+                .to_string(),
+        ));
+    }
+    for (band, kind) in bands.iter().zip(&kinds) {
+        if band.cells.is_some() && *kind == BandSource::Archive {
+            return Err(PyramidError::Bands(format!(
+                "band {}: a cell band aggregates a GeoParquet source, not a PMTiles archive",
+                band_label(band)
+            )));
+        }
+    }
 
     // #514: validate every pre-tiled Archive band's declared zoom range now,
     // before any Source band below is tiled. The equivalent check inside
@@ -2167,62 +2243,62 @@ fn build_pyramid_validated(
                 error,
             })
         };
-
-        let overview = named(".parquet")?;
-        let archive = named(".pmtiles")?;
-
-        let convert = ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: band.min_zoom,
-                max_zoom: band.max_zoom,
-            },
-            // #801: one memory profile governs the band's convert and export.
-            profile: opts.export.profile,
-            ..opts.convert.clone()
+        let tile = |input: &Path, (lo, hi): (u8, u8), convert: &ConvertOptions| {
+            tile_source_band(
+                input,
+                &band.layer,
+                (lo, hi),
+                convert,
+                opts,
+                diagnostics,
+                &named,
+            )
         };
-        let report = convert_to_overviews(&band.input, &overview, &convert).map_err(|error| {
-            PyramidError::BandConvert {
-                layer: band.layer.clone(),
-                error,
-            }
-        })?;
-        diagnostics.extend(report.diagnostics);
 
-        let export = ExportOptions {
-            layer_name: band.layer.clone(),
-            // The band's own range, not a caller-wide value: a `min_zoom`
-            // set on `opts.export` would apply to every band alike, and be
-            // rejected by any band whose range starts finer (#380).
-            min_zoom: Some(band.min_zoom),
-            // #427: the band's export spill goes where its intermediates go,
-            // unless the caller placed it explicitly.
-            spill_dir: opts
-                .export
-                .spill_dir
-                .clone()
-                .or_else(|| opts.work_dir.clone()),
-            // The final archive's metadata is `opts.metadata`, applied by the
-            // merge; an intermediate archive passes nothing on.
-            metadata: TilesetMetadata::default(),
-            ..opts.export.clone()
+        let archive = match band.cells {
+            None => tile(&band.input, (band.min_zoom, band.max_zoom), &opts.convert)?,
+            Some(system) => {
+                // #332: one cell table per zoom, each tiled verbatim at its
+                // own zoom, then stitched into the band's one archive.
+                let tables = (band.min_zoom..=band.max_zoom)
+                    .map(|_| named(".parquet"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let paths: Vec<&Path> = tables.iter().map(|t| &**t).collect();
+                let rollup = CellRollup {
+                    accumulate: &opts.accumulate,
+                    categories: opts.cluster_categories.as_deref(),
+                };
+                crate::overview::cells::write_cell_tables(
+                    &band.input,
+                    system,
+                    (band.min_zoom, band.max_zoom),
+                    rollup,
+                    &paths,
+                    diagnostics,
+                )
+                .map_err(|error| PyramidError::band_convert(band.layer.clone(), error))?;
+                let verbatim = ConvertOptions::default().verbatim();
+                let mut zooms = Vec::with_capacity(tables.len());
+                for (z, table) in (band.min_zoom..=band.max_zoom).zip(&tables) {
+                    zooms.push((z, tile(table, (z, z), &verbatim)?));
+                }
+                drop(tables);
+                let parts: Vec<Band> = zooms
+                    .iter()
+                    .map(|(z, a)| Band::new(a.to_path_buf(), band.layer.clone(), *z, *z))
+                    .collect();
+                let archive = named(".pmtiles")?;
+                diagnostics.extend(merge_bands(&parts, &archive)?.diagnostics);
+                archive
+            }
         };
-        let report = export_pmtiles(&overview, &archive, &export).map_err(|error| {
-            PyramidError::BandExport {
-                layer: band.layer.clone(),
-                error,
-            }
-        })?;
-        diagnostics.extend(report.diagnostics);
-
-        tiled.push(Band {
-            input: archive.to_path_buf(),
-            layer: band.layer.clone(),
-            min_zoom: band.min_zoom,
-            max_zoom: band.max_zoom,
-        });
-        // The overview is only needed for the export above; the archive must
-        // outlive the merge.
-        drop(overview);
+        tiled.push(Band::new(
+            archive.to_path_buf(),
+            band.layer.clone(),
+            band.min_zoom,
+            band.max_zoom,
+        ));
+        // The archive must outlive the merge.
         scratch.push(archive);
     }
 
@@ -2237,6 +2313,67 @@ fn build_pyramid_validated(
     diagnostics.extend(report.diagnostics);
     report.diagnostics = diagnostics.snapshot();
     Ok(report)
+}
+
+/// Tile one GeoParquet `input` into `layer` across zooms `lo..=hi`: the
+/// ordinary convert → export chain, with intermediates from `named`. Returns
+/// the band's archive.
+fn tile_source_band(
+    input: &Path,
+    layer: &str,
+    (lo, hi): (u8, u8),
+    convert: &ConvertOptions,
+    opts: &PyramidOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
+    named: &dyn Fn(&str) -> Result<Reserved, PyramidError>,
+) -> Result<Reserved, PyramidError> {
+    let overview = named(".parquet")?;
+    let archive = named(".pmtiles")?;
+
+    let convert = ConvertOptions {
+        levels: LevelPlan::ZoomRange {
+            min_zoom: lo,
+            max_zoom: hi,
+        },
+        // #801: one memory profile governs the band's convert and export.
+        profile: opts.export.profile,
+        ..convert.clone()
+    };
+    let report = convert_to_overviews(input, &overview, &convert).map_err(|error| {
+        PyramidError::BandConvert {
+            layer: layer.to_string(),
+            error,
+        }
+    })?;
+    diagnostics.extend(report.diagnostics);
+
+    let export = ExportOptions {
+        layer_name: layer.to_string(),
+        // The band's own range, not a caller-wide value: a `min_zoom`
+        // set on `opts.export` would apply to every band alike, and be
+        // rejected by any band whose range starts finer (#380).
+        min_zoom: Some(lo),
+        // #427: the band's export spill goes where its intermediates go,
+        // unless the caller placed it explicitly.
+        spill_dir: opts
+            .export
+            .spill_dir
+            .clone()
+            .or_else(|| opts.work_dir.clone()),
+        // The final archive's metadata is `opts.metadata`, applied by the
+        // merge; an intermediate archive passes nothing on.
+        metadata: TilesetMetadata::default(),
+        ..opts.export.clone()
+    };
+    let report =
+        export_pmtiles(&overview, &archive, &export).map_err(|error| PyramidError::BandExport {
+            layer: layer.to_string(),
+            error,
+        })?;
+    diagnostics.extend(report.diagnostics);
+    // The overview is only needed for the export above.
+    drop(overview);
+    Ok(archive)
 }
 
 /// Add one band archive's publication metadata to `collector`, labelled
@@ -3067,12 +3204,14 @@ mod tests {
                 layer: "aggregate".to_string(),
                 min_zoom: 0,
                 max_zoom: 2,
+                cells: None,
             },
             Band {
                 input: fine.clone(),
                 layer: "aggregate".to_string(),
                 min_zoom: 3,
                 max_zoom: 4,
+                cells: None,
             },
         ];
         let report = build_pyramid(
@@ -3141,12 +3280,14 @@ mod tests {
                 layer: "2024".to_string(),
                 min_zoom: 0,
                 max_zoom: 3,
+                cells: None,
             },
             Band {
                 input: b,
                 layer: "2025".to_string(),
                 min_zoom: 0,
                 max_zoom: 3,
+                cells: None,
             },
         ];
         let report = build_pyramid(
@@ -3212,6 +3353,7 @@ mod tests {
                 layer: "aggregate".to_string(),
                 min_zoom: 0,
                 max_zoom: 1,
+                cells: None,
             }],
             &pre,
             &PyramidOptions {
@@ -3234,12 +3376,14 @@ mod tests {
                     layer: "aggregate".to_string(),
                     min_zoom: 0,
                     max_zoom: 1,
+                    cells: None,
                 },
                 Band {
                     input: fine,
                     layer: "features".to_string(),
                     min_zoom: 2,
                     max_zoom: 3,
+                    cells: None,
                 },
             ],
             &out,
@@ -3290,12 +3434,14 @@ mod tests {
                     layer: "a".to_string(),
                     min_zoom: 0,
                     max_zoom: 3,
+                    cells: None,
                 },
                 Band {
                     input: src,
                     layer: "a".to_string(),
                     min_zoom: 3,
                     max_zoom: 5,
+                    cells: None,
                 },
             ],
             &out,
@@ -3345,12 +3491,14 @@ mod tests {
                     layer: "fine".to_string(),
                     min_zoom: 6,
                     max_zoom: 7,
+                    cells: None,
                 },
                 Band {
                     input: archive,
                     layer: "pre".to_string(),
                     min_zoom: 8,
                     max_zoom: 10,
+                    cells: None,
                 },
             ],
             &out,
@@ -3404,6 +3552,7 @@ mod tests {
             layer: "wiggly".to_string(),
             min_zoom,
             max_zoom,
+            cells: None,
         };
         let bands = vec![
             band(wiggly("coarse.parquet", 0.03), 0, 2),
@@ -3502,6 +3651,220 @@ mod tests {
         zooms.sort_unstable();
         zooms.dedup();
         zooms
+    }
+
+    /// #332: `SYSTEM:` after the range makes a cell band, in both forms;
+    /// anything else is the plain band it always was.
+    #[test]
+    fn band_parses_a_cell_system() {
+        let b = Band::parse("0-7:h3:places.parquet:density").unwrap();
+        assert_eq!(b.cells, Some(CellSystem::H3));
+        assert_eq!(b.input, PathBuf::from("places.parquet"));
+        assert_eq!(
+            (b.layer.as_str(), b.min_zoom, b.max_zoom),
+            ("density", 0, 7)
+        );
+
+        let b = Band::parse("0-5:grid:s3://bucket/pts.parquet").unwrap();
+        assert_eq!(b.cells, Some(CellSystem::Grid));
+        assert_eq!(b.input, PathBuf::from("s3://bucket/pts.parquet"));
+        assert_eq!(b.layer, "pts");
+
+        let b = Band::parse("2-4=a5=data/x=1/p.parquet=cells").unwrap();
+        assert_eq!(b.cells, Some(CellSystem::A5));
+        assert_eq!(b.input, PathBuf::from("data/x=1/p.parquet"));
+        assert_eq!(b.layer, "cells");
+
+        let b = Band::parse("0-3:s2:pts.parquet").unwrap();
+        assert_eq!(b.cells, Some(CellSystem::S2));
+
+        for plain in [
+            "0-5:cells_r5.parquet:aggregate",
+            "0-5:h3.parquet:x",
+            "0-5:./h3:x",
+            "0-5:H3:x",
+        ] {
+            assert_eq!(Band::parse(plain).unwrap().cells, None, "{plain}");
+        }
+        assert!(matches!(
+            Band::parse("0-5:h3:"),
+            Err(BandSpecError::EmptyLayer { .. })
+        ));
+    }
+
+    /// Points on a 0.01° lattice, with an `id` and a `name` column.
+    fn write_points(path: &Path, n: usize) {
+        let geoms: Vec<Option<geo::Geometry<f64>>> = (0..n)
+            .map(|i| {
+                let (x, y) = (
+                    -74.0 + (i % 40) as f64 * 0.01,
+                    40.6 + (i / 40) as f64 * 0.01,
+                );
+                Some(geo::Geometry::Point(geo::Point::new(x, y)))
+            })
+            .collect();
+        crate::overview::testutil::write_input(path, &geoms, false, None);
+    }
+
+    /// Decoded `(zoom, cell) -> (point_count, id, name counts)` of a cell
+    /// band archive, one entry per cell however many tiles hold it.
+    fn decoded_cells(archive: &Path, dir: &Path) -> HashMap<(u8, String), (f64, f64, f64)> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Float64Type;
+        use arrow_array::Array;
+        let out = dir.join("decoded.parquet");
+        crate::decode::decode_pmtiles(archive, &out, &crate::decode::DecodeOptions::default())
+            .unwrap();
+        let source = crate::input_set::ConvertSource::resolve_path(&out).unwrap();
+        let plan = crate::input_set::ReadPlan {
+            batch_size: 1 << 16,
+            projection: None,
+            row_groups: None,
+        };
+        let mut cells = HashMap::new();
+        for batch in source.open_stream(&plan).unwrap() {
+            let batch = batch.unwrap();
+            let f64s = |name: &str| {
+                let col = batch.column(batch.schema().index_of(name).unwrap());
+                arrow_cast::cast(col, &arrow_schema::DataType::Float64).unwrap()
+            };
+            let zoom = f64s("zoom");
+            let count = f64s("point_count");
+            let id = f64s("id");
+            let names: Vec<_> = batch
+                .schema()
+                .fields()
+                .iter()
+                .filter(|f| f.name().starts_with("name:"))
+                .map(|f| f64s(f.name()))
+                .collect();
+            let cell = batch
+                .column(batch.schema().index_of("cell").unwrap())
+                .clone();
+            let cell = cell.as_string::<i32>();
+            for r in 0..batch.num_rows() {
+                let named: f64 = names
+                    .iter()
+                    .map(|c| c.as_primitive::<Float64Type>())
+                    .filter(|c| c.is_valid(r))
+                    .map(|c| c.value(r))
+                    .sum();
+                let row = (
+                    count.as_primitive::<Float64Type>().value(r),
+                    id.as_primitive::<Float64Type>().value(r),
+                    named,
+                );
+                let key = (
+                    zoom.as_primitive::<Float64Type>().value(r) as u8,
+                    cell.value(r).to_string(),
+                );
+                assert_eq!(
+                    *cells.entry(key).or_insert(row),
+                    row,
+                    "a cell differs between tiles"
+                );
+            }
+        }
+        cells
+    }
+
+    /// #332 end to end: every zoom of a cell band partitions the input, its
+    /// rollups add up, and finer zooms hold more cells.
+    #[test]
+    fn cell_bands_partition_the_input_at_every_zoom() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pts.parquet");
+        let n = 1000usize;
+        write_points(&src, n);
+        let id_sum = (0..n).sum::<usize>() as f64;
+        for system in CellSystem::ALL {
+            let out = dir.path().join(format!("{}.pmtiles", system.name()));
+            let band = Band::new(&src, "density", 2, 9).with_cells(system);
+            let report = build_pyramid(
+                &[band],
+                &out,
+                &PyramidOptions {
+                    work_dir: Some(dir.path().to_path_buf()),
+                    accumulate: vec![crate::overview::cluster::AccumulateSpec::new(
+                        "id",
+                        crate::overview::cluster::AccumulateOp::Sum,
+                    )],
+                    cluster_categories: Some("name".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(report.per_band_tiles.len(), 1, "{system:?}");
+            assert_eq!(
+                archive_zooms(&out),
+                (2..=9).collect::<Vec<u8>>(),
+                "{system:?}"
+            );
+            let cells = decoded_cells(&out, dir.path());
+            let mut per_zoom = vec![0usize; 10];
+            for z in 2..=9u8 {
+                let at: Vec<_> = cells
+                    .iter()
+                    .filter(|(k, _)| k.0 == z)
+                    .map(|(_, v)| *v)
+                    .collect();
+                per_zoom[usize::from(z)] = at.len();
+                assert_eq!(
+                    at.iter().map(|v| v.0).sum::<f64>(),
+                    n as f64,
+                    "{system:?} z{z}"
+                );
+                assert_eq!(
+                    at.iter().map(|v| v.1).sum::<f64>(),
+                    id_sum,
+                    "{system:?} z{z}"
+                );
+                for v in &at {
+                    assert_eq!(
+                        v.2, v.0,
+                        "{system:?} z{z}: category counts sum to point_count"
+                    );
+                }
+            }
+            assert!(per_zoom[9] > per_zoom[2], "{system:?}: {per_zoom:?}");
+        }
+    }
+
+    /// The rollups belong to cell bands, and a cell band needs a source.
+    #[test]
+    fn cell_band_rules_are_checked_before_tiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pts.parquet");
+        write_points(&src, 10);
+        let opts = PyramidOptions {
+            work_dir: Some(dir.path().to_path_buf()),
+            cluster_categories: Some("name".to_string()),
+            ..Default::default()
+        };
+        let out = dir.path().join("out.pmtiles");
+        let err = build_pyramid(&[Band::new(&src, "pts", 0, 3)], &out, &opts).unwrap_err();
+        assert!(err.to_string().contains("cell bands"), "{err}");
+
+        let fake = dir.path().join("a.pmtiles");
+        std::fs::write(&fake, b"PMTiles\x03rest-of-header").unwrap();
+        let band = Band::new(&fake, "pts", 0, 3).with_cells(CellSystem::Grid);
+        let err = build_pyramid(&[band], &out, &opts).unwrap_err();
+        assert!(err.to_string().contains("not a PMTiles archive"), "{err}");
+
+        let twice = PyramidOptions {
+            accumulate: vec![
+                crate::overview::cluster::AccumulateSpec::new(
+                    "id",
+                    crate::overview::cluster::AccumulateOp::Sum,
+                ),
+                crate::overview::cluster::AccumulateSpec::new(
+                    "id",
+                    crate::overview::cluster::AccumulateOp::Max,
+                ),
+            ],
+            ..Default::default()
+        };
+        assert!(twice.validate().is_err());
     }
 
     #[test]
@@ -4268,6 +4631,7 @@ mod tests {
             layer: r#"a"b\c"#.to_string(),
             min_zoom: 3,
             max_zoom: 3,
+            cells: None,
         };
         let out = dir.path().join("merged.pmtiles");
         merge_bands(&[band], &out).unwrap();
@@ -4626,6 +4990,7 @@ mod tests {
             layer: "agg".to_string(),
             min_zoom: lo,
             max_zoom: hi,
+            cells: None,
         };
         let fit = band_archive_range_fit;
 
@@ -5811,6 +6176,7 @@ mod tests {
             layer: layer.to_string(),
             min_zoom,
             max_zoom,
+            cells: None,
         }
     }
 

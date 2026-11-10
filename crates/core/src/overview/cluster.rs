@@ -152,7 +152,7 @@ impl CategoryCounts {
         self.add_n(slot, 1);
     }
 
-    fn add_n(&mut self, slot: u32, n: i64) {
+    pub(crate) fn add_n(&mut self, slot: u32, n: i64) {
         match self.0.binary_search_by_key(&slot, |e| e.0) {
             Ok(i) => self.0[i].1 += n,
             Err(i) => self.0.insert(i, (slot, n)),
@@ -211,6 +211,33 @@ pub fn category_slots(
     for &id in ids.iter().filter(|&&id| id != null_id) {
         freq[id as usize] += 1;
     }
+    let (slot_of, mut labels) = rank_categories(&freq, values, cap);
+    let other = labels.len() as u32;
+    let slots: Vec<u32> = ids
+        .iter()
+        .map(|&id| {
+            if id == null_id {
+                other
+            } else {
+                slot_of[id as usize]
+            }
+        })
+        .collect();
+    if slots.contains(&other) {
+        labels.push(OTHER_CATEGORY.to_string());
+    }
+    (slots, labels)
+}
+
+/// The ranking [`category_slots`] applies, from each value's frequency:
+/// each value's slot, and the labels of the ranked slots. A value past the
+/// `cap`, or never seen, or a literal `other`, gets slot `labels.len()`, the
+/// [`OTHER_CATEGORY`] slot, whose label the caller adds when it is used.
+pub(crate) fn rank_categories(
+    freq: &[u64],
+    values: &[String],
+    cap: usize,
+) -> (Vec<u32>, Vec<String>) {
     let mut ranked: Vec<usize> = (0..values.len())
         .filter(|&id| freq[id] > 0 && values[id] != OTHER_CATEGORY)
         .collect();
@@ -225,21 +252,8 @@ pub fn category_slots(
     for (slot, &id) in ranked.iter().enumerate() {
         slot_of[id] = slot as u32;
     }
-    let slots: Vec<u32> = ids
-        .iter()
-        .map(|&id| {
-            if id == null_id {
-                other
-            } else {
-                slot_of[id as usize]
-            }
-        })
-        .collect();
-    let mut labels: Vec<String> = ranked.iter().map(|&id| values[id].clone()).collect();
-    if slots.contains(&other) {
-        labels.push(OTHER_CATEGORY.to_string());
-    }
-    (slots, labels)
+    let labels = ranked.iter().map(|&id| values[id].clone()).collect();
+    (slot_of, labels)
 }
 
 /// What [`build_cluster_tables_summing`] adds up over each cluster's members.
@@ -274,7 +288,7 @@ pub type ClusterTables = Vec<HashMap<usize, ClusterEntry>>;
 
 /// Per-cluster running aggregate state for one [`AccumulateSpec`].
 #[derive(Debug, Clone, Copy)]
-struct AggState {
+pub(crate) struct AggState {
     sum: f64,
     min: f64,
     max: f64,
@@ -283,7 +297,7 @@ struct AggState {
 }
 
 impl AggState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             sum: 0.0,
             min: f64::INFINITY,
@@ -292,14 +306,23 @@ impl AggState {
         }
     }
 
-    fn add(&mut self, v: f64) {
+    pub(crate) fn add(&mut self, v: f64) {
         self.sum += v;
         self.min = self.min.min(v);
         self.max = self.max.max(v);
         self.count += 1;
     }
 
-    fn finalize(&self, op: AccumulateOp) -> Option<f64> {
+    /// Fold another partial state in: the result is the state of both
+    /// contributor sets, in either order.
+    pub(crate) fn merge(&mut self, other: &Self) {
+        self.sum += other.sum;
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.count += other.count;
+    }
+
+    pub(crate) fn finalize(&self, op: AccumulateOp) -> Option<f64> {
         if self.count == 0 {
             return None;
         }

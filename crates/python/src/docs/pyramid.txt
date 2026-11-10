@@ -11,7 +11,7 @@ Args:
         GeoParquet source or a PMTiles archive for zooms `LO` to
         `HI`; `LAYER` defaults to the input's file stem. See the
         [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
-        for the `LO-HI=INPUT=LAYER` form.
+        for the `LO-HI=INPUT=LAYER` form. TODO(docs)
     output: PMTiles archive to write.
     generalize: Generalize each GeoParquet band, as `overview()`
         does. By default each band is tiled verbatim, keeping every
@@ -24,6 +24,8 @@ Args:
         input order, with a warning.
     work_dir: Directory for temporary per-band files, deleted after
         the build, or `None` for the system temporary directory.
+    accumulate_attributes: TODO(docs)
+    cluster_categories: TODO(docs)
     allow_missing_zooms: Accept a pre-tiled band with fewer zooms
         than declared. Missing zooms render empty.
     name: The output's tileset name. Unset, the PMTiles bands'

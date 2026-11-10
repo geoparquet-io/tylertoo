@@ -130,6 +130,7 @@ skip = [
     { crate = "safe_arch@0.7.4", reason = "#779: wide 0.7 via fastpfor 0.9 (mlt-core)" },
     { crate = "wide@0.7.33", reason = "#779: fastpfor 0.9 (mlt-core uses wide 1)" },
     { crate = "syn@1.0.109", reason = "#779: derive-debug 0.1 (mlt-core)" },
+    { crate = "num-bigint@0.4.8", reason = "#332: bigdecimal 0.4 (s2); arrow is on 0.5" },
     { crate = "miniz_oxide@0.8.9", reason = "#779: backtrace 0.3 (dhat-heap); flate2 uses 0.9" },
     # syn 2 -> 3 and thiserror 1 -> 2 are ecosystem-wide migrations.
     { crate = "syn@2.0.119", reason = "#779: pyo3-macros, prost-derive, thiserror-impl 1 and others still on syn 2" },
