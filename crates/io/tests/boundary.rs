@@ -73,3 +73,41 @@ fn row_limit_is_applied_before_batch_decoding() {
     assert_eq!(reader.next().unwrap().unwrap(), batch.slice(0, 2));
     assert!(reader.next().is_none());
 }
+
+/// #829: the decode writer flushes a row group once it holds
+/// `BATCH_ROW_GROUP_BYTES`, not after the default 1M rows, so it never buffers
+/// ~0.75 GB of pages.
+#[test]
+fn batch_writer_bounds_row_groups_by_bytes() {
+    const ROW_BYTES: usize = 256;
+    const BATCH_ROWS: usize = 8192;
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Binary, false)]));
+    let mut file = tempfile::tempfile().unwrap();
+    let mut writer = tylertoo_io::batch_writer(&mut file, schema.clone()).unwrap();
+    // 640k distinct 256-byte rows: ~160 MB, past the cap but under 1M rows.
+    for b in 0..80usize {
+        let values: Vec<Vec<u8>> = (0..BATCH_ROWS)
+            .map(|i| {
+                let mut v = vec![0u8; ROW_BYTES];
+                v[..8].copy_from_slice(&((b * BATCH_ROWS + i) as u64).to_le_bytes());
+                v
+            })
+            .collect();
+        let array = BinaryArray::from_iter_values(values.iter());
+        writer
+            .write(&RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap())
+            .unwrap();
+    }
+    writer.close().unwrap();
+    let source = open_parquet(file).unwrap();
+    let metadata = source.metadata();
+    assert!(
+        metadata.num_row_groups() >= 2,
+        "one row group held every row"
+    );
+    for group in metadata.row_groups() {
+        assert!(group.total_byte_size() as usize <= tylertoo_io::BATCH_ROW_GROUP_BYTES + (4 << 20));
+    }
+    let rows: i64 = metadata.row_groups().iter().map(|g| g.num_rows()).sum();
+    assert_eq!(rows, 80 * BATCH_ROWS as i64);
+}

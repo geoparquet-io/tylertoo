@@ -23,7 +23,9 @@ pub use untrusted::{
     LargestByteArrayColumn, ParquetSource, ReaderMetadata, UntrustedBatchReader,
     UntrustedIpcReader, BYTE_ARRAY_BATCH_LIMIT, DEFAULT_BATCH_ROWS,
 };
-pub use writer::{batch_writer, overview_writer, BatchWriter, OverviewWriteOptions};
+pub use writer::{
+    batch_writer, overview_writer, BatchWriter, OverviewWriteOptions, BATCH_ROW_GROUP_BYTES,
+};
 
 /// Parallel overview encoding maps Arrow arrays to Parquet leaves with this function.
 pub use parquet::arrow::arrow_writer::compute_leaves;
