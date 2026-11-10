@@ -122,8 +122,6 @@ fn pyramid_has_parity_with_export_flags() {
         // Redundant with pyramid's --work-dir, which band export spill falls
         // back to (pyramid.rs, #427).
         "spill-dir",
-        // Real gap, not an intent: follow-up issue #801 (pyramid --profile)
-        "profile",
         // #803: refused; a variable-depth band's missing tiles mean "draw
         // the stored ancestor", which the band merge cannot keep.
         "generate-variable-depth-tile-pyramid",
@@ -134,7 +132,7 @@ fn pyramid_has_parity_with_export_flags() {
     .into_iter()
     .map(str::to_owned)
     .collect();
-    assert_eq!(exemptions.len(), 8);
+    assert_eq!(exemptions.len(), 7);
     let missing: BTreeSet<_> = export.difference(&pyramid).cloned().collect();
     assert_eq!(missing, exemptions);
 }

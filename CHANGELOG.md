@@ -106,6 +106,23 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A data shard no longer warns that a level below its pivot "became empty
   after simplification". It exports no such level, and its share of one is
   often empty (#546 review).
+- Inputs with many list columns (Overture segments: 86 list leaves) are no
+  longer handed out one row per batch. A decode no longer crosses a row
+  group, so it is charged with one group's list values rather than two:
+  Overture's 22k-row groups decode whole instead of a row at a time. A group
+  whose list values alone pass the bound still decodes a row at a time, and
+  the reader joins those rows back into batches within the byte bound. Each
+  one-row batch kept about 260 KB of Arrow overhead per buffered output row,
+  so `tiles` on a 38 MB extract passed 118 GB and was OOM-killed. It now
+  peaks at 1.5 GB in 23 s (#848).
+- A read whose batches hit the decode byte bound is cut into the same
+  batches by one reader or by several (`--read-workers`): one row-by-row
+  byte rule cuts both, so the intermediate overview file no longer depends
+  on the worker count there (#858).
+- A column with 8- or 16-bit dictionary keys is read in batches of no more
+  rows than its key indexes, so a batch spanning row groups no longer fails
+  with `DictionaryKeyOverflowError` (#857; a dictionary nested in a list
+  can still overflow).
 - A crafted Parquet footer with an overlong varint, or a page header that
   skips past the end of the file, is refused instead of allocating gigabytes
   or spinning for minutes (#789).

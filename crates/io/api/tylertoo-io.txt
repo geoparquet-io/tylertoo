@@ -242,7 +242,7 @@ pub const tylertoo_io::DEFAULT_BATCH_ROWS: usize
 pub fn tylertoo_io::batch_writer<W: core::io::write::Write + core::marker::Send>(W, arrow_schema::schema::SchemaRef) -> core::result::Result<tylertoo_io::BatchWriter<W>, parquet::errors::ParquetError>
 pub fn tylertoo_io::byte_array_limit() -> u64
 pub fn tylertoo_io::check_byte_array_ceiling(&arrow_array::record_batch::RecordBatch) -> core::result::Result<(), arrow_schema::error::ArrowError>
-pub fn tylertoo_io::concat_prefix_rows<'a>(impl core::iter::traits::collect::IntoIterator<Item = &'a arrow_array::record_batch::RecordBatch>, u64) -> usize
+pub fn tylertoo_io::concat_prefix_rows<'a>(impl core::iter::traits::collect::IntoIterator<Item = &'a arrow_array::record_batch::RecordBatch>, usize, u64) -> usize
 pub fn tylertoo_io::decode_footer(&[u8]) -> core::result::Result<parquet::file::metadata::ParquetMetaData, parquet::errors::ParquetError>
 pub fn tylertoo_io::decoded_batch_limit() -> u64
 pub fn tylertoo_io::decoded_input_bytes(&parquet::file::metadata::ParquetMetaData, core::option::Option<&[usize]>, impl core::ops::function::Fn(usize) -> bool) -> u64
@@ -254,7 +254,7 @@ pub fn tylertoo_io::open_parquet<R: parquet::file::reader::ChunkReader + 'static
 pub fn tylertoo_io::open_parquet_with_metadata<R: parquet::file::reader::ChunkReader + 'static>(R, tylertoo_io::ReaderMetadata) -> tylertoo_io::ParquetSource<R>
 pub fn tylertoo_io::overview_writer<W: core::io::write::Write + core::marker::Send>(W, arrow_schema::schema::SchemaRef, &arrow_schema::schema::Schema, &tylertoo_io::OverviewWriteOptions) -> core::result::Result<tylertoo_io::BatchWriter<W>, parquet::errors::ParquetError>
 pub fn tylertoo_io::precheck_footer(&[u8]) -> core::result::Result<(), tylertoo_io::Error>
-pub fn tylertoo_io::read_batch_plan(&parquet::file::metadata::ParquetMetaData, core::option::Option<&[usize]>, core::option::Option<&parquet::arrow::ProjectionMask>, usize, u64) -> usize
+pub fn tylertoo_io::read_batch_plan(&tylertoo_io::ReaderMetadata, core::option::Option<&[usize]>, core::option::Option<&parquet::arrow::ProjectionMask>, usize, u64) -> usize
 pub fn tylertoo_io::read_parquet_metadata<R: parquet::file::reader::ChunkReader>(&R) -> core::result::Result<alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>, parquet::errors::ParquetError>
 pub fn tylertoo_io::reader_metadata(alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>) -> core::result::Result<tylertoo_io::ReaderMetadata, parquet::errors::ParquetError>
 pub fn tylertoo_io::schema_without_metadata(&parquet::file::metadata::ParquetMetaData) -> core::result::Result<arrow_schema::schema::Schema, parquet::errors::ParquetError>

@@ -807,6 +807,8 @@ pub tylertoo_core::ExportError::LevelZoomsNotAscending::previous_gsd: f64
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::previous_level: usize
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::previous_zoom: u8
 pub tylertoo_core::ExportError::LevelZoomsNotAscending::zoom: u8
+pub tylertoo_core::ExportError::MltConversion
+pub tylertoo_core::ExportError::MltConversion::message: alloc::string::String
 #[non_exhaustive] pub tylertoo_core::ExportError::NoGeometryColumn
 pub tylertoo_core::ExportError::NoGeometryColumn::path: core::option::Option<alloc::string::String>
 pub tylertoo_core::ExportError::Output(tylertoo_core::OutputNotWritable)
@@ -1307,6 +1309,37 @@ impl core::marker::Unpin for tylertoo_core::MemoryProfile
 impl core::marker::UnsafeUnpin for tylertoo_core::MemoryProfile
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::MemoryProfile
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::MemoryProfile
+#[non_exhaustive] pub enum tylertoo_core::MltProfile
+pub tylertoo_core::MltProfile::Diffable
+pub tylertoo_core::MltProfile::FastEncoding
+pub tylertoo_core::MltProfile::MinSize
+pub tylertoo_core::MltProfile::Native
+pub tylertoo_core::MltProfile::Web
+impl tylertoo_core::MltProfile
+pub fn tylertoo_core::MltProfile::as_str(self) -> &'static str
+impl core::clone::Clone for tylertoo_core::MltProfile
+pub fn tylertoo_core::MltProfile::clone(&self) -> tylertoo_core::MltProfile
+impl core::cmp::Eq for tylertoo_core::MltProfile
+impl core::cmp::PartialEq for tylertoo_core::MltProfile
+pub fn tylertoo_core::MltProfile::eq(&self, &tylertoo_core::MltProfile) -> bool
+impl core::default::Default for tylertoo_core::MltProfile
+pub fn tylertoo_core::MltProfile::default() -> tylertoo_core::MltProfile
+impl core::fmt::Debug for tylertoo_core::MltProfile
+pub fn tylertoo_core::MltProfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::MltProfile
+pub fn tylertoo_core::MltProfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::MltProfile
+impl core::marker::StructuralPartialEq for tylertoo_core::MltProfile
+impl core::str::traits::FromStr for tylertoo_core::MltProfile
+pub type tylertoo_core::MltProfile::Err = alloc::string::String
+pub fn tylertoo_core::MltProfile::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl core::marker::Freeze for tylertoo_core::MltProfile
+impl core::marker::Send for tylertoo_core::MltProfile
+impl core::marker::Sync for tylertoo_core::MltProfile
+impl core::marker::Unpin for tylertoo_core::MltProfile
+impl core::marker::UnsafeUnpin for tylertoo_core::MltProfile
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::MltProfile
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::MltProfile
 #[non_exhaustive] pub enum tylertoo_core::Mode
 pub tylertoo_core::Mode::Duplicating
 pub tylertoo_core::Mode::Partitioning
@@ -1798,9 +1831,39 @@ impl core::marker::Unpin for tylertoo_core::SourceLossCause
 impl core::marker::UnsafeUnpin for tylertoo_core::SourceLossCause
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::SourceLossCause
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::SourceLossCause
+#[non_exhaustive] pub enum tylertoo_core::TileFormat
+pub tylertoo_core::TileFormat::Mlt
+pub tylertoo_core::TileFormat::Mvt
+impl tylertoo_core::TileFormat
+pub fn tylertoo_core::TileFormat::as_str(self) -> &'static str
+pub fn tylertoo_core::TileFormat::tile_type(self) -> tylertoo_core::TileType
+impl core::clone::Clone for tylertoo_core::TileFormat
+pub fn tylertoo_core::TileFormat::clone(&self) -> tylertoo_core::TileFormat
+impl core::cmp::Eq for tylertoo_core::TileFormat
+impl core::cmp::PartialEq for tylertoo_core::TileFormat
+pub fn tylertoo_core::TileFormat::eq(&self, &tylertoo_core::TileFormat) -> bool
+impl core::default::Default for tylertoo_core::TileFormat
+pub fn tylertoo_core::TileFormat::default() -> tylertoo_core::TileFormat
+impl core::fmt::Debug for tylertoo_core::TileFormat
+pub fn tylertoo_core::TileFormat::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::TileFormat
+pub fn tylertoo_core::TileFormat::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::TileFormat
+impl core::marker::StructuralPartialEq for tylertoo_core::TileFormat
+impl core::str::traits::FromStr for tylertoo_core::TileFormat
+pub type tylertoo_core::TileFormat::Err = alloc::string::String
+pub fn tylertoo_core::TileFormat::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl core::marker::Freeze for tylertoo_core::TileFormat
+impl core::marker::Send for tylertoo_core::TileFormat
+impl core::marker::Sync for tylertoo_core::TileFormat
+impl core::marker::Unpin for tylertoo_core::TileFormat
+impl core::marker::UnsafeUnpin for tylertoo_core::TileFormat
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TileFormat
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TileFormat
 #[non_exhaustive] #[repr(u8)] pub enum tylertoo_core::TileType
 pub tylertoo_core::TileType::Avif = 5
 pub tylertoo_core::TileType::Jpeg = 3
+pub tylertoo_core::TileType::Mlt = 6
 pub tylertoo_core::TileType::Mvt = 1
 pub tylertoo_core::TileType::Png = 2
 pub tylertoo_core::TileType::Unknown = 0
@@ -2386,6 +2449,7 @@ pub tylertoo_core::ExportOptions::layer_name: alloc::string::String
 pub tylertoo_core::ExportOptions::max_zoom_simplify_factor: core::option::Option<f64>
 pub tylertoo_core::ExportOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::ExportOptions::min_zoom: core::option::Option<u8>
+pub tylertoo_core::ExportOptions::mlt_profile: tylertoo_core::MltProfile
 pub tylertoo_core::ExportOptions::partition_wave: usize
 pub tylertoo_core::ExportOptions::profile: tylertoo_core::MemoryProfile
 pub tylertoo_core::ExportOptions::properties: tylertoo_core::PropertySelection
@@ -2393,6 +2457,7 @@ pub tylertoo_core::ExportOptions::simple_clip_fastpath: bool
 pub tylertoo_core::ExportOptions::size_valve: tylertoo_core::SizeValve
 pub tylertoo_core::ExportOptions::spill_dir: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::ExportOptions::tile_buffer: u32
+pub tylertoo_core::ExportOptions::tile_format: tylertoo_core::TileFormat
 pub tylertoo_core::ExportOptions::tile_range: core::option::Option<tylertoo_core::TileRange>
 pub tylertoo_core::ExportOptions::tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::ExportOptions::variable_depth: bool
@@ -2409,6 +2474,7 @@ pub fn tylertoo_core::ExportOptions::with_layer_name(self, alloc::string::String
 pub fn tylertoo_core::ExportOptions::with_max_zoom_simplify_factor(self, core::option::Option<f64>) -> Self
 pub fn tylertoo_core::ExportOptions::with_metadata(self, tylertoo_core::TilesetMetadata) -> Self
 pub fn tylertoo_core::ExportOptions::with_min_zoom(self, core::option::Option<u8>) -> Self
+pub fn tylertoo_core::ExportOptions::with_mlt_profile(self, tylertoo_core::MltProfile) -> Self
 pub fn tylertoo_core::ExportOptions::with_partition_wave(self, usize) -> Self
 pub fn tylertoo_core::ExportOptions::with_profile(self, tylertoo_core::MemoryProfile) -> Self
 pub fn tylertoo_core::ExportOptions::with_properties(self, tylertoo_core::PropertySelection) -> Self
@@ -2416,6 +2482,7 @@ pub fn tylertoo_core::ExportOptions::with_simple_clip_fastpath(self, bool) -> Se
 pub fn tylertoo_core::ExportOptions::with_size_valve(self, tylertoo_core::SizeValve) -> Self
 pub fn tylertoo_core::ExportOptions::with_spill_dir(self, core::option::Option<std::path::PathBuf>) -> Self
 pub fn tylertoo_core::ExportOptions::with_tile_buffer(self, u32) -> Self
+pub fn tylertoo_core::ExportOptions::with_tile_format(self, tylertoo_core::TileFormat) -> Self
 pub fn tylertoo_core::ExportOptions::with_tile_range(self, core::option::Option<tylertoo_core::TileRange>) -> Self
 pub fn tylertoo_core::ExportOptions::with_tile_size_limit(self, core::option::Option<usize>) -> Self
 pub fn tylertoo_core::ExportOptions::with_variable_depth(self, bool) -> Self

@@ -123,6 +123,13 @@ skip = [
     { crate = "i_shape@1.18.0", reason = "#779: i_overlay 4.x via geo 0.33" },
     { crate = "i_tree@0.18.0", reason = "#779: i_overlay 4.x via geo 0.33" },
     { crate = "itertools@0.14.0", reason = "#779: prost-build/prost-derive 0.14 (object_store is on 0.15)" },
+    # mlt-core 0.22 (#823): dhat-heap's dhat is on rustc-hash 1 (mlt-core
+    # and fsst-rs use 2); fastpfor 0.9 on wide 0.7 (mlt-core uses wide 1);
+    # derive-debug 0.1 on syn 1.
+    { crate = "rustc-hash@1.1.0", reason = "#779: dhat 0.3 (dhat-heap); mlt-core and fsst-rs use 2" },
+    { crate = "safe_arch@0.7.4", reason = "#779: wide 0.7 via fastpfor 0.9 (mlt-core)" },
+    { crate = "wide@0.7.33", reason = "#779: fastpfor 0.9 (mlt-core uses wide 1)" },
+    { crate = "syn@1.0.109", reason = "#779: derive-debug 0.1 (mlt-core)" },
     { crate = "miniz_oxide@0.8.9", reason = "#779: backtrace 0.3 (dhat-heap); flate2 uses 0.9" },
     # syn 2 -> 3 and thiserror 1 -> 2 are ecosystem-wide migrations.
     { crate = "syn@2.0.119", reason = "#779: pyo3-macros, prost-derive, thiserror-impl 1 and others still on syn 2" },

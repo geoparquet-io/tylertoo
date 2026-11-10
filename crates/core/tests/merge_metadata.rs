@@ -59,7 +59,15 @@ fn unparseable_metadata_warns_and_keeps_tiles_without_empty_shard_zooms() {
     writer.set_metadata(TilesetMetadata::new().with_attribution("discarded"));
     writer.add_tile(6, 0, 0, &[0x1a, 0x02, 0x08, 0x00]).unwrap();
     writer.finalize(&data).unwrap();
-    write_empty_archive(&empty, "parks", 0, 0, &TilesetMetadata::new()).unwrap();
+    write_empty_archive(
+        &empty,
+        "parks",
+        0,
+        0,
+        &TilesetMetadata::new(),
+        tylertoo_core::TileFormat::Mvt,
+    )
+    .unwrap();
 
     // Missing metadata and invalid JSON carry no fields, whether or not
     // the shard holds tiles. The tiles themselves are still copyable.

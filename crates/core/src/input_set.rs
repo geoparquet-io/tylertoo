@@ -989,25 +989,28 @@ impl ConvertSource {
     }
 
     /// Plan reads for all selected parts through the untrusted-reader owner.
+    /// `projection` indexes this source's schema, as in a [`ReadPlan`].
     pub(crate) fn read_batch_rows(
         &self,
         selected: Option<&RowGroupSelection>,
+        projection: Option<&[usize]>,
         requested: usize,
         limit: u64,
     ) -> Result<usize, InputError> {
+        let roots = self.file_roots(projection);
         Ok(self
             .metas()?
             .iter()
             .enumerate()
             .fold(requested, |rows, (pi, m)| {
-                let mask = self.column_projection().map(|roots| {
+                let mask = roots.as_deref().map(|roots| {
                     tylertoo_io::ProjectionMask::roots(
                         m.parquet.file_metadata().schema_descr(),
                         roots.iter().copied(),
                     )
                 });
                 tylertoo_io::read_batch_plan(
-                    &m.parquet,
+                    &m.reader,
                     selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice),
                     mask.as_ref(),
                     rows,
@@ -2504,7 +2507,7 @@ mod tests {
         let src = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
         src.restrict_columns(vec![0]).unwrap();
         assert_eq!(
-            src.read_batch_rows(None, 8192, tylertoo_io::byte_array_limit())
+            src.read_batch_rows(None, None, 8192, tylertoo_io::byte_array_limit())
                 .unwrap(),
             8192
         );

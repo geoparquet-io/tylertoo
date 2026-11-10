@@ -2777,6 +2777,7 @@ fn preflight_with_memory_limit(
     // ceiling against actual values before narrowing, including skewed rows.
     let read_batch_rows = source.read_batch_rows(
         selected_row_groups.as_ref(),
+        None,
         options.read_batch_size,
         tylertoo_io::byte_array_limit(),
     )?;
@@ -8392,6 +8393,95 @@ mod tests {
         let line: serde_json::Value =
             serde_json::from_str(contents.lines().next().expect("a convert line")).unwrap();
         assert_eq!(line["pass2"]["sink"]["spill_codec"], "lz4", "{line}");
+    }
+
+    /// #848: list properties whose row groups hold more repeated values than
+    /// one decoded batch may (Overture segments: 86 list leaves) must not
+    /// read pass 2 one row per batch. Each one-row output batch carries the
+    /// schema's whole fixed Arrow overhead, so a 38 MB input buffered 55 KB
+    /// per row (262 KB resident) and was OOM-killed at 118 GB. Dense
+    /// coalescing lines, the issue's shape; the decode ceiling is scaled
+    /// down (`TYLERTOO_BYTE_ARRAY_LIMIT_BYTES`) and the batches are counted
+    /// in the profile dump, both process environment, so the run happens in
+    /// a child.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn list_heavy_lines_are_not_buffered_one_row_per_batch() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        const CHILD: &str = "TYLERTOO_848_TEST_JSON";
+        let Some(json) = std::env::var_os(CHILD) else {
+            let dir = tempfile::tempdir().unwrap();
+            let (_, module) = module_path!().split_once("::").expect("crate::module path");
+            let name = format!("{module}::list_heavy_lines_are_not_buffered_one_row_per_batch");
+            let out =
+                std::process::Command::new(std::env::current_exe().expect("test binary path"))
+                    .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                    .env(CHILD, dir.path().join("profile.jsonl"))
+                    .env("TYLERTOO_PROFILE_JSON", dir.path().join("profile.jsonl"))
+                    .env("TYLERTOO_BYTE_ARRAY_LIMIT_BYTES", "16384")
+                    .output()
+                    .expect("re-run the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{name} failed in its own process:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        // 40 roads of 50 two-point segments end to end: every segment chains.
+        let geoms: Vec<Option<geo::Geometry<f64>>> = (0..40)
+            .flat_map(|road| {
+                (0..50).map(move |s| {
+                    let (x, y) = (f64::from(s) * 0.01, f64::from(road) * 0.1);
+                    Some(geo::Geometry::LineString(geo::LineString::from(vec![
+                        (x, y),
+                        (x + 0.01, y),
+                    ])))
+                })
+            })
+            .collect();
+        // 8 values per row: 144 KB of repeated values in the one row group,
+        // past the 32 KiB the scaled ceiling lets one batch decode.
+        let mut tags = ListBuilder::new(Int64Builder::new());
+        for i in 0..geoms.len() as i64 {
+            tags.values().append_slice(&[i; 8]);
+            tags.append(true);
+        }
+        let tags = tags.finish();
+        crate::overview::testutil::write_input_columns(
+            &input,
+            &geoms,
+            true,
+            vec![(
+                Field::new("tags", tags.data_type().clone(), true),
+                Arc::new(tags),
+            )],
+        );
+        crate::overview::convert::convert_to_overviews(
+            &input,
+            dir.path().join("out.parquet"),
+            &crate::overview::convert::ConvertOptions {
+                levels: crate::overview::convert::LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 14,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(json).expect("the profile dump");
+        let line: serde_json::Value =
+            serde_json::from_str(contents.lines().next().expect("a convert line")).unwrap();
+        // Decoded one row at a time, joined up to the scaled 16 KiB byte
+        // bound: 86 batches. Yielded one row per batch, it was 2,000.
+        let batches = line["pass2"]["windows"]["batches"].as_u64().unwrap();
+        assert!(
+            batches <= 200,
+            "{batches} pass-2 batches for 2,000 rows: {line}"
+        );
     }
 
     /// Runs the named test of this module alone in a child process. Returns

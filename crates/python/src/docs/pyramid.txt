@@ -50,6 +50,12 @@ Args:
         GeoParquet bands. `include_properties` overrides it.
     exclude_all_properties: Drop every property from the tiles of
         GeoParquet bands. `include_properties` overrides it.
+    profile: Memory profile, as for `convert()`, applied to every
+        GeoParquet band's convert and export. Changes memory use,
+        not output bytes.
+    tile_format: See `export_pmtiles()`. Every band must have this
+        format.
+    mlt_profile: See `export_pmtiles()`.
 
 Returns:
     Tile counts per band, with merge diagnostics and the metadata
