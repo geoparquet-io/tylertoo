@@ -1750,18 +1750,6 @@ fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Ra
     groups
 }
 
-/// The group cap [`plan_level_groups`] gets: none, unless `member_cap` is 0
-/// (the serial schedule). #817: [`InFlight`] bounds a group's members as
-/// they are collected and encoded, so the group's sum no longer has to, and
-/// a group boundary only idles the pool while the group's last level ends.
-fn unbounded_group_cap(member_cap: usize) -> usize {
-    if member_cap == 0 {
-        0
-    } else {
-        usize::MAX
-    }
-}
-
 /// The members a concurrent level group may hold collected but not yet
 /// encoded ([`InFlight`]): `member_cap` bounded by the largest wave of any
 /// level in `plans`, but never below [`PARTITION_WAVE_MIN`] partitions of
@@ -1777,7 +1765,9 @@ fn unbounded_group_cap(member_cap: usize) -> usize {
 /// below `main`'s. This bounds the members in flight, not the group: when
 /// the encodes keep up (Madagascar, NYC), every level of the group still
 /// overlaps, as on `main`. Bounding the group instead ran their levels one
-/// small group after another, +24% wall on Madagascar.
+/// small group after another, +24% wall on Madagascar. The group keeps
+/// `member_cap` on its sum, which also bounds the encoded tiles a group
+/// holds while a slow coarser level keeps them from being written.
 fn bound_group_cap<'p>(
     member_cap: usize,
     plans: impl IntoIterator<Item = &'p LevelPlan>,
@@ -2694,7 +2684,7 @@ fn export_pmtiles_validated(
             ..template
         })
         .collect();
-    let level_groups = plan_level_groups(&plans, unbounded_group_cap(group_cap));
+    let level_groups = plan_level_groups(&plans, group_cap);
     let in_flight_cap = bound_group_cap(group_cap, &plans, partition_target);
     let mem = LevelMemory {
         store: store.as_mut(),
