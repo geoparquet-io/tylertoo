@@ -1060,8 +1060,9 @@ fn projected_field(
     original.clone().with_data_type(target)
 }
 
-/// The fewest values a dictionary in `data_type` can index, when its keys
-/// are 8 or 16 bits wide.
+/// The most rows of `data_type` a batch can hold with no dictionary in it
+/// with 8- or 16-bit keys indexing past its key, when one is in it outside
+/// a variable-length list ([`listed_dictionary`]).
 fn dictionary_capacity(data_type: &arrow_schema::DataType) -> Option<usize> {
     use arrow_schema::DataType;
     match data_type {
@@ -1075,15 +1076,40 @@ fn dictionary_capacity(data_type: &arrow_schema::DataType) -> Option<usize> {
             };
             own.into_iter().chain(dictionary_capacity(value)).min()
         }
-        DataType::List(f)
-        | DataType::LargeList(f)
-        | DataType::FixedSizeList(f, _)
-        | DataType::Map(f, _) => dictionary_capacity(f.data_type()),
+        DataType::FixedSizeList(f, k) => {
+            dictionary_capacity(f.data_type()).map(|c| (c / (*k).max(1) as usize).max(1))
+        }
         DataType::Struct(fields) => fields
             .iter()
             .filter_map(|f| dictionary_capacity(f.data_type()))
             .min(),
         _ => None,
+    }
+}
+
+/// Whether `data_type` holds a dictionary with 8- or 16-bit keys in a
+/// variable-length list, whose values no row count bounds.
+fn listed_dictionary(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    match data_type {
+        DataType::List(f) | DataType::LargeList(f) | DataType::Map(f, _) => {
+            narrow_dictionary(f.data_type())
+        }
+        DataType::FixedSizeList(f, _) => listed_dictionary(f.data_type()),
+        DataType::Dictionary(_, value) => listed_dictionary(value),
+        DataType::Struct(fields) => fields.iter().any(|f| listed_dictionary(f.data_type())),
+        _ => false,
+    }
+}
+
+/// Whether `data_type` holds a dictionary with 8- or 16-bit keys anywhere.
+fn narrow_dictionary(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    match data_type {
+        DataType::List(f) | DataType::LargeList(f) | DataType::Map(f, _) => {
+            narrow_dictionary(f.data_type())
+        }
+        other => dictionary_capacity(other).is_some() || listed_dictionary(other),
     }
 }
 
@@ -1268,8 +1294,8 @@ pub fn read_batch_plan(
 /// A read column with 8- or 16-bit dictionary keys holds both to the rows
 /// its keys can index: a batch, here or in a caller's regrouping to the
 /// yield, can then hold no more distinct values than the key indexes, which
-/// the cast back would refuse (#857). Only a dictionary nested in a list can
-/// still pass it.
+/// the cast back would refuse (#857). A dictionary in a variable-length list
+/// is not joined past the decode, and can still pass it.
 fn batch_plan(
     reader: &ReaderMetadata,
     row_groups: Option<&[usize]>,
@@ -1371,7 +1397,7 @@ fn batch_plan(
     let decode = rows(decoded_limit(limit).saturating_sub(repeated), fixed).min(joined);
     // Only read roots count; a whole root is checked when any leaf is read.
     let descr = reader.parquet_schema();
-    let capacity = reader
+    let fields: Vec<_> = reader
         .schema()
         .fields()
         .iter()
@@ -1380,9 +1406,21 @@ fn batch_plan(
             (0..descr.num_columns())
                 .any(|leaf| descr.get_column_root_idx(leaf) == *root && read(&leaf))
         })
-        .filter_map(|(_, f)| dictionary_capacity(f.data_type()))
+        .map(|(_, f)| f.data_type())
+        .collect();
+    let capacity = fields
+        .iter()
+        .filter_map(|t| dictionary_capacity(t))
         .min()
         .unwrap_or(usize::MAX);
+    // shortcut: a listed dictionary only keeps its decode batches, as before
+    // #848, and a list's values can still overflow its key; upgrade when #857
+    // bounds the cut by distinct values.
+    let joined = if fields.iter().any(|t| listed_dictionary(t)) {
+        decode
+    } else {
+        joined
+    };
     // No more rows than the key indexes: however a batch is cut and joined,
     // it holds no more distinct values (#857).
     (decode.min(capacity), joined.min(capacity))
@@ -1834,8 +1872,9 @@ fn join_decoded(
         parts.push(batch);
         unjoined += 1;
         // Joined JOIN_CHUNK at a time while decoding: an unjoined one-row
-        // batch holds the schema's whole fixed Arrow overhead.
-        if unjoined == JOIN_CHUNK {
+        // batch holds the schema's whole fixed Arrow overhead. Not once the
+        // cut is known: a piece past the bound is never copied.
+        if unjoined == JOIN_CHUNK && held < rows && bytes <= bound {
             let chunk = parts.split_off(parts.len() - JOIN_CHUNK);
             match arrow_select::concat::concat_batches(&schema, &chunk) {
                 Ok(joined) => parts.push(joined),
@@ -2338,6 +2377,43 @@ mod tests {
         assert_eq!(ids, (0..20).collect::<Vec<_>>());
     }
 
+    /// #858 review: an oversized row decoded as the JOIN_CHUNK-th piece is
+    /// carried as decoded, not copied into a joined chunk first.
+    #[test]
+    fn an_oversized_piece_is_not_joined() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        use arrow_array::cast::AsArray;
+        use arrow_array::ArrayRef;
+        use parquet::arrow::ArrowWriter;
+        let mut lists = ListBuilder::new(Int64Builder::new());
+        for _ in 1..JOIN_CHUNK {
+            lists.values().append_value(1);
+            lists.append(true);
+        }
+        lists.values().append_slice(&vec![7; 12_000]);
+        lists.append(true);
+        let batch =
+            RecordBatch::try_from_iter([("lists", Arc::new(lists.finish()) as ArrayRef)]).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        #[expect(clippy::disallowed_methods, reason = "#858: a raw one-row decode")]
+        let mut inner = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .with_batch_size(1)
+            .build()
+            .unwrap();
+        let mut carry = None;
+        let (joined, _) = join_decoded(&mut inner, &mut carry, 1_000, 100_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(joined.num_rows(), JOIN_CHUNK - 1);
+        let carried = carry.expect("the oversized row is carried");
+        // A slice of a joined chunk would start past the other rows' values.
+        assert_eq!(carried.column(0).as_list::<i32>().value_offsets()[0], 0);
+    }
+
     /// #858 review: a row is refused by the measure that cuts batches, so it
     /// is refused alone and among other rows alike. 12,000 Int64 list values
     /// cost 204 KB, past the 200 KB decode limit of a 100 KB ceiling.
@@ -2411,6 +2487,20 @@ mod tests {
         reader.limit = 50_000;
         let rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
         assert_eq!(rows, 2_048);
+    }
+
+    #[test]
+    fn dictionary_capacity_counts_fixed_size_list_values() {
+        use arrow_schema::{DataType, Field};
+        let dict = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let item = Arc::new(Field::new("item", dict.clone(), true));
+        assert_eq!(dictionary_capacity(&dict), Some(128));
+        let pairs = DataType::FixedSizeList(item.clone(), 2);
+        assert_eq!(dictionary_capacity(&pairs), Some(64));
+        assert!(!listed_dictionary(&pairs));
+        let list = DataType::List(item);
+        assert_eq!(dictionary_capacity(&list), None);
+        assert!(listed_dictionary(&list));
     }
 
     #[test]
