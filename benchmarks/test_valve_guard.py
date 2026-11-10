@@ -57,7 +57,7 @@ def test_not_applicable_is_not_a_failure_but_is_not_a_pass_either():
 
 
 def test_no_baseline_file_is_not_applicable():
-    v = vg.verdict({"792-def": _cell(10.0), "792-drop": _cell(7.0)}, None, VM)
+    v = vg.verdict({"792-def": _cell(10.0), "792-drop": _cell(7.0)}, None, GH)
     assert v["baseline"]["status"] == "not applicable"
 
 
@@ -130,8 +130,11 @@ def test_an_exemption_suppresses_the_floor_for_that_cell_only():
     assert not [f for f in v["floors"]["failures"] if "moldova-tiles" in f]
 
 
-def test_no_floors_section_means_floors_not_applicable():
-    assert _check(_cores_cell(whole=1.0), floors=None)["floors"]["status"] == "not applicable"
+def test_no_floors_section_means_floors_not_applicable_off_the_pinned_class():
+    other = {**VM, "cpus": 32}
+    base = {"hosts": {vg.host_class_key(other): {"host": other, "cells": {"moldova-tiles": _cores_cell()}}}}
+    v = vg.verdict({"moldova-tiles": _cores_cell(whole=1.0)}, base, other)
+    assert v["floors"]["status"] == "not applicable"
 
 
 def test_serialized_levels_fail_the_gate():
@@ -215,8 +218,10 @@ def _vs(cell: dict, base_cell: dict | None = None, floors=FLOORS) -> dict:
     return vg.verdict({"moldova-tiles": cell}, {"hosts": {vg.host_class_key(VM): rec}}, VM)
 
 
-def test_a_baseline_without_the_new_fields_is_not_applicable_not_pass():
-    v = _vs(_cores_cell(), base_cell=_cell(10.0))
+def test_a_baseline_without_the_new_fields_is_not_applicable_off_the_pinned_class():
+    other = {**VM, "cpus": 32}  # a recorded class that is not the pinned one
+    rec = {"host": other, "cells": {"moldova-tiles": _cell(10.0)}, "floors": FLOORS}
+    v = vg.verdict({"moldova-tiles": _cores_cell()}, {"hosts": {vg.host_class_key(other): rec}}, other)
     assert v["baseline"]["status"] == "not applicable"
     assert "run record" in v["baseline"]["reason"] and vg.exit_status(v) == 0
     assert _vs(_cell(20.0), base_cell=_cell(10.0))["baseline"]["status"] == "fail"  # wall still gates
@@ -300,7 +305,8 @@ def test_a_baseline_missing_a_required_phase_is_stale_not_pass():
     holed = {**_cores_cell(), "speedup_16_to_full": {LEVELS: 3.0, "whole": 3.0},
              "low_phase_rounds": {LEVELS: 3}}
     v = _vs(_cores_cell(), base_cell=holed)
-    assert v["baseline"]["status"] == "not applicable" and "run record" in v["baseline"]["reason"]
+    assert v["baseline"]["status"] == "fail"  # on the pinned class (see the stale-baseline tests)
+    assert any(f"speedup_16_to_full[{PASS2}]" in f for f in v["baseline"]["failures"])
 
 
 def test_current_run_missing_a_required_low_thread_phase_fails():
@@ -327,3 +333,56 @@ def test_skipped_checks_are_printed_and_a_changed_output_says_so():
     lines = vg.report_lines(v)
     assert any(line.startswith("SKIP ") and "output differs" in line for line in lines)
     assert lines[-3].startswith("ratio:")
+
+
+# --- a stale baseline on the pinned class fails (#817, Codex integ r1 item 4) ---
+def test_the_pinned_class_is_the_self_hosted_vm():
+    assert vg.PINNED_CLASS == vg.host_class_key(VM)
+
+
+def test_pinned_class_with_a_pre_817_baseline_fails_naming_fields_and_the_command():
+    # the committed baseline's shape: wall and RSS only, no floors; the run has
+    # severely reduced parallelism that the missing fields would have caught
+    stale = {"hosts": {vg.PINNED_CLASS: {"host": VM, "cells": {"moldova-tiles": _cell(10.0)}}}}
+    v = vg.verdict({"moldova-tiles": _cores_cell(pass2=2.0, levels=2.0, whole=2.0)}, stale, VM)
+    assert vg.exit_status(v) == 1
+    assert v["baseline"]["status"] == "fail" and v["floors"]["status"] == "fail"
+    msg = " ".join(v["baseline"]["failures"])
+    for field in (f"phase_cores[{PASS2}]", "speedup_16_to_full[whole]", f"phase_cpu_s[{LEVELS}]"):
+        assert field in msg
+    assert "valve_guard.py record" in msg
+    assert any("floors" in f and "valve_guard.py record" in f for f in v["floors"]["failures"])
+
+
+def test_pinned_class_with_no_entry_or_no_cell_fails():
+    v = vg.verdict({"moldova-tiles": _cores_cell()}, None, VM)
+    assert vg.exit_status(v) == 1 and v["baseline"]["status"] == "fail"
+    v = vg.verdict({"moldova-tiles": _cores_cell(), "792-def": _cores_cell()}, _cores_baseline(), VM)
+    assert any("792-def" in f and "no baseline entry" in f for f in v["baseline"]["failures"])
+
+
+def test_other_class_with_the_same_stale_baseline_is_not_applicable():
+    stale = {"hosts": {vg.PINNED_CLASS: {"host": VM, "cells": {"moldova-tiles": _cell(10.0)}}}}
+    v = vg.verdict({"moldova-tiles": _cores_cell(pass2=2.0, levels=2.0, whole=2.0)}, stale, GH)
+    assert v["baseline"]["status"] == "not applicable" and v["floors"]["status"] == "not applicable"
+    assert vg.exit_status(v) == 0
+
+
+def test_a_complete_pinned_baseline_still_passes():
+    v = _check(_cores_cell())
+    assert v["baseline"]["status"] == "pass" and v["floors"]["status"] == "pass"
+
+
+def test_792_def_speedup_collapse_fails_on_the_pinned_class():
+    # export levels regressed most often; its effective cores hide spin, so 792-def is a scaling cell
+    base = {"hosts": {vg.PINNED_CLASS: {"host": VM, "floors": FLOORS,
+                                        "cells": {"792-def": _cores_cell(speed=3.0)}}}}
+    v = vg.verdict({"792-def": _cores_cell(speed=1.0)}, base, VM)
+    assert vg.exit_status(v) == 1
+    assert any("792-def" in f and LEVELS in f and "speedup" in f for f in v["baseline"]["failures"])
+    assert vg.verdict({"792-def": _cores_cell(speed=3.0)}, base, VM)["baseline"]["status"] == "pass"
+    # a 792-def baseline recorded without the 16-thread arm is stale
+    holed = {**_cores_cell(), "speedup_16_to_full": {}}
+    v = vg.verdict({"792-def": _cores_cell()}, {"hosts": {vg.PINNED_CLASS: {
+        "host": VM, "floors": FLOORS, "cells": {"792-def": holed}}}}, VM)
+    assert any(f"speedup_16_to_full[{LEVELS}]" in f for f in v["baseline"]["failures"])

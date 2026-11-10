@@ -41,7 +41,9 @@ Two kinds of failure, both exit status 1:
             hold `floors` {whole_cores_frac, serial_share_max}: whole-run
             cores under frac x CPUs, or export serial_share over the max,
             fail (`floors`). A cell is exempt only via `[cores_floor.<cell>]`
-            in ci/exemptions.toml.
+            in ci/exemptions.toml. On the pinned class (PINNED_CLASS) a
+            baseline lacking a field, cell or floor the gate checks fails;
+            elsewhere it is NOT APPLICABLE.
 
 Every check ends with FAIL lines, SKIP lines (a check that could not run,
 e.g. CPU core-seconds when the output changed), then three lines: `ratio: PASS|FAIL`,
@@ -89,10 +91,19 @@ DEFAULT_FLOORS = {"whole_cores_frac": 0.05, "serial_share_max": 0.10}
 SPEEDUP_DROP_MAX = 0.15  # 16-to-full-thread speedup may fall 15% below the baseline's
 CPU_RISE_MAX = 0.25      # a phase's CPU core-seconds may rise 25% over the baseline's (same output)
 LOW_THREADS = 16
-SCALING_CELLS = ("moldova-tiles",)  # the cells also run at RAYON_NUM_THREADS=LOW_THREADS
+# The cells also run at RAYON_NUM_THREADS=LOW_THREADS. 792-def: export levels is
+# where parallelism regressed most often, and its effective cores hide spin.
+SCALING_CELLS = ("moldova-tiles", "792-def")
 CPU_MIN_BASELINE_S = 0.05  # a shorter phase's core-seconds are noise: skipped, said so
 CORE_PHASES = ("convert/pass2 (output sink)", "export/levels")
 EXEMPTIONS = HERE.parent / "ci" / "exemptions.toml"
+# The self-hosted `tylertoo-bench` runner's class (valve-guard.yml). Here a
+# baseline lacking a field the gate checks fails instead of reading NOT
+# APPLICABLE, so a stale baseline cannot switch the #817 gate off.
+PINNED_CLASS = "aarch64/0xd40/64"
+RECORD_CMD = ("uv run --no-project --python 3.12 python -I benchmarks/valve_guard.py record "
+              "--mim <release tylertoo> --glibc <glibc tylertoo> --data ~/bench-data "
+              "(context/PROFILING.md, effective-cores gate)")
 
 SIZE_ARGS = ["--max-tile-size", "2000000", "--feature-order", "_size:desc"]
 OVERVIEW_792 = ["--max-zoom", "14", "--no-density-drop", "--polygon-visibility", "0",
@@ -296,6 +307,19 @@ def missing_telemetry(cell: str, s: dict) -> list[str]:
     return out
 
 
+def baseline_gaps(cell: str, base: dict) -> list[str]:
+    """The fields the gate compares that one baseline cell lacks."""
+    phases = CORE_PHASES if CELLS[cell][1] == "moldova" else ("export/levels",)
+    gaps = [f"{k}[{p}]" for k in ("phase_cores", "phase_cpu_s") for p in phases
+            if (base.get(k) or {}).get(p) is None]
+    if cell in SCALING_CELLS:
+        gaps += [f"speedup_16_to_full[{p}]" for p in ("whole", *phases)
+                 if (base.get("speedup_16_to_full") or {}).get(p) is None]
+    if not base.get("output_sha256"):
+        gaps.append("output_sha256")
+    return gaps or missing_telemetry(cell, base)
+
+
 def record_problems(cells: dict) -> list[str]:
     """Why these measurements must not become a baseline (empty when complete)."""
     out = [m for cell, s in cells.items() for m in missing_telemetry(cell, s)]
@@ -314,6 +338,7 @@ def baseline_failures(cells: dict, baseline: dict) -> tuple[list[str], list[str]
         base = baseline["cells"].get(cell)
         if not base:
             print(f"  {cell}: no baseline entry")
+            stale.append(f"{cell}: no baseline entry")
             continue
         wall = now["wall_s"] / base["wall_s"]
         # Peak RSS only ever noises upward (Moldova factor 0 swings 4.6 to
@@ -325,8 +350,8 @@ def baseline_failures(cells: dict, baseline: dict) -> tuple[list[str], list[str]
             bad.append(f"{cell} wall {now['wall_s']} s is {wall:.2f}x its baseline {base['wall_s']} s")
         if rss > RSS_REGRESSION_MAX:
             bad.append(f"{cell} peak RSS is {rss:.2f}x its baseline")
-        if missing_telemetry(cell, base):  # recorded before #817's fields, or incompletely
-            stale.append(cell)
+        if gaps := baseline_gaps(cell, base):  # recorded before #817's fields, or incompletely
+            stale.append(f"{cell}: {', '.join(gaps)}")
         bad += missing_telemetry(cell, now)
         for phase, was in (base.get("phase_cores") or {}).items():
             got = (now.get("phase_cores") or {}).get(phase)
@@ -395,24 +420,37 @@ def verdict(cells: dict, baseline_doc: dict | None, host: dict, exempt=frozenset
         out["injected_threads"] = injected_threads
     have = sorted((baseline_doc or {}).get("hosts", {}))
     base = (baseline_doc or {}).get("hosts", {}).get(host_class_key(host))
+    pinned = host_class_key(host) == PINNED_CLASS
     if base is None:
         reason = (f"no baseline for host class {host_class_key(host)}; recorded classes: "
                   f"{', '.join(have) or 'none'}")
-        out["baseline"] = {"status": "not applicable", "reason": reason, "failures": []}
-        out["floors"] = {"status": "not applicable", "reason": reason, "failures": []}
-    else:
-        bad, stale, skipped = baseline_failures(cells, base)
-        out["baseline"] = {"status": "fail" if bad else "pass", "failures": bad,
-                           "measured": base.get("measured"), "skipped": skipped}
-        if stale and not bad:
-            out["baseline"].update(status="not applicable", reason=(
-                f"baseline predates #817 fields for {', '.join(stale)}; run record"))
-        if base.get("floors"):
-            bad = floor_failures(cells, base["floors"], host["cpus"], exempt)
-            out["floors"] = {"status": "fail" if bad else "pass", "failures": bad}
+        if pinned:
+            bad = [f"{reason}; the pinned class must have one. Record it: {RECORD_CMD}"]
+            out["baseline"] = {"status": "fail", "failures": bad}
+            out["floors"] = {"status": "fail", "failures": bad}
         else:
-            out["floors"] = {"status": "not applicable", "failures": [],
-                             "reason": f"host class {host_class_key(host)} has no floors section"}
+            out["baseline"] = {"status": "not applicable", "reason": reason, "failures": []}
+            out["floors"] = {"status": "not applicable", "reason": reason, "failures": []}
+        return out
+    bad, stale, skipped = baseline_failures(cells, base)
+    if stale and pinned:
+        bad.append(f"the pinned class's baseline lacks fields the gate checks ({'; '.join(stale)}). "
+                   f"Record them: {RECORD_CMD}")
+    out["baseline"] = {"status": "fail" if bad else "pass", "failures": bad,
+                       "measured": base.get("measured"), "skipped": skipped}
+    if stale and not bad:
+        out["baseline"].update(status="not applicable", reason=(
+            f"baseline predates #817 fields ({'; '.join(stale)}); run record"))
+    no_floors = [f"floors.{k}" for k in DEFAULT_FLOORS if k not in (base.get("floors") or {})]
+    if not no_floors:
+        bad = floor_failures(cells, base["floors"], host["cpus"], exempt)
+        out["floors"] = {"status": "fail" if bad else "pass", "failures": bad}
+    elif pinned:
+        out["floors"] = {"status": "fail", "failures": [
+            f"the pinned class's baseline lacks {', '.join(no_floors)}. Record them: {RECORD_CMD}"]}
+    else:
+        out["floors"] = {"status": "not applicable", "failures": [],
+                         "reason": f"host class {host_class_key(host)} has no floors section"}
     return out
 
 
