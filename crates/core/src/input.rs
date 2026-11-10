@@ -2081,17 +2081,18 @@ pub(crate) mod remote {
         changed
     }
 
-    /// The environment a store is built from: the `AWS_*` and `GOOGLE_*`
-    /// variables the builders' `from_env` read, and the `TYLERTOO_HTTP_*`
+    /// The environment a store is built from: the `AWS_*`, `GOOGLE_*` and
+    /// `SERVICE_ACCOUNT` variables the builders' `from_env` read, and the `TYLERTOO_HTTP_*`
     /// client overrides. A cached store is reused only while this is
     /// unchanged (#804), so a changed region or credential builds a new one.
     fn store_env() -> StoreEnv {
         let mut vars: Vec<_> = std::env::vars_os()
             .filter(|(k, _)| {
                 let k = k.to_string_lossy();
-                ["AWS_", "GOOGLE_", CLIENT_VAR_PREFIX]
-                    .iter()
-                    .any(|p| k.starts_with(p))
+                k == "SERVICE_ACCOUNT"
+                    || ["AWS_", "GOOGLE_", CLIENT_VAR_PREFIX]
+                        .iter()
+                        .any(|p| k.starts_with(p))
             })
             .collect();
         vars.sort();
@@ -4239,6 +4240,12 @@ pub(crate) mod remote {
                 return;
             }
             let store = |url: &str| store_and_location(url).expect(url).0;
+            // GCS's `from_env` also reads this unprefixed credential file.
+            std::env::set_var("SERVICE_ACCOUNT", "/sa804.json");
+            assert!(super::store_env()
+                .iter()
+                .any(|(k, _)| k == "SERVICE_ACCOUNT"));
+            std::env::remove_var("SERVICE_ACCOUNT");
             // A signed URL's store is never cached, but its origin's
             // connection pool is, and must follow the client options too.
             let signed = || store("https://pool804.test/a.parquet?sig=x");
