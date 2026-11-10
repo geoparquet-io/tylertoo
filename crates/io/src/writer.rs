@@ -33,10 +33,10 @@ pub struct BatchWriter<W: Write + Send>(ArrowWriter<W>);
 /// Encoded bytes a [`batch_writer`] buffers before it flushes a row group.
 /// The default 1M-row group held ~0.75 GB of pages on a Moldova z12 decode
 /// (#829); 128 MiB is Parquet's usual block size.
-pub const BATCH_ROW_GROUP_BYTES: usize = 128 * 1024 * 1024;
+const BATCH_ROW_GROUP_BYTES: usize = 128 * 1024 * 1024;
 
 /// Construct a default Parquet writer (used by decoded-tile export), whose
-/// row groups end at [`BATCH_ROW_GROUP_BYTES`] or the default row count.
+/// row groups end at 128 MiB of encoded bytes or the default row count.
 ///
 /// # Errors
 ///

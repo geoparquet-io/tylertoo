@@ -75,7 +75,7 @@ fn row_limit_is_applied_before_batch_decoding() {
 }
 
 /// #829: the decode writer flushes a row group once it holds
-/// `BATCH_ROW_GROUP_BYTES`, not after the default 1M rows, so it never buffers
+/// 128 MiB (`writer.rs` `BATCH_ROW_GROUP_BYTES`), not after the default 1M rows, so it never buffers
 /// ~0.75 GB of pages.
 #[test]
 fn batch_writer_bounds_row_groups_by_bytes() {
@@ -106,7 +106,7 @@ fn batch_writer_bounds_row_groups_by_bytes() {
         "one row group held every row"
     );
     for group in metadata.row_groups() {
-        assert!(group.total_byte_size() as usize <= tylertoo_io::BATCH_ROW_GROUP_BYTES + (4 << 20));
+        assert!(group.total_byte_size() as usize <= (128 << 20) + (4 << 20));
     }
     let rows: i64 = metadata.row_groups().iter().map(|g| g.num_rows()).sum();
     assert_eq!(rows, 80 * BATCH_ROWS as i64);
