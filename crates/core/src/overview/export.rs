@@ -17075,6 +17075,80 @@ mod tests {
         }
     }
 
+    /// #814: a variable-depth stop draws canonical geometry at an ancestor's
+    /// zoom, simplified at the canonical zoom's tolerance, not the ancestor's.
+    /// The wiggle sits between the two tolerances (0.022° and 0.088°).
+    #[test]
+    fn variable_depth_stops_simplify_at_the_canonical_zoom() {
+        let ring: Vec<(f64, f64)> = (0..400)
+            .map(|k| {
+                let a = f64::from(k) / 400.0 * std::f64::consts::TAU;
+                let r = 5.0 + if k % 2 == 0 { 0.03 } else { -0.03 };
+                (r * a.cos(), 20.0 + r * a.sin())
+            })
+            .collect();
+        let poly = Geometry::Polygon(geo::Polygon::new(LineString::from(ring), vec![]));
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tin.path(),
+            &[(vec![0], vec![poly.clone()]), (vec![0], vec![poly])],
+        );
+        let vertices = |factor: Option<f64>| {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ExportOptions {
+                variable_depth: true,
+                max_zoom_simplify_factor: factor,
+                ..Default::default()
+            };
+            let report = export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
+            assert!(report.zooms[0].stopped_tiles > 0, "no tile stopped at z2");
+            stored_tiles(&std::fs::read(tout.path()).unwrap())
+                .values()
+                .map(|b| {
+                    let raw = compression::decompress(b, compression::Compression::Gzip).unwrap();
+                    decode_tile(&raw).layers[0]
+                        .features
+                        .iter()
+                        .map(|f| decode_coords(&f.geometry).len())
+                        .sum::<usize>()
+                })
+                .sum::<usize>()
+        };
+        let (kept, simplified) = (vertices(None), vertices(Some(1.0)));
+        assert!(
+            simplified > kept / 2,
+            "stopped tile lost the canonical detail: {simplified} of {kept} vertices"
+        );
+    }
+
+    /// #814: an empty carrier (every member quantized away) is not a written
+    /// tile, so it never counts as over the limit.
+    #[test]
+    fn an_all_quantized_tile_is_not_counted_over_the_limit() {
+        let speck = Geometry::Polygon(geo::Polygon::new(
+            LineString::from(vec![(0.0, 0.0), (1e-7, 0.0), (1e-7, 1e-7), (0.0, 0.0)]),
+            vec![],
+        ));
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tin.path(),
+            &[(vec![0], vec![speck.clone()]), (vec![0], vec![speck])],
+        );
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            tile_size_limit: Some(1),
+            ..Default::default()
+        };
+        let report = export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
+        assert!(report.encode_quantized_features > 0);
+        assert_eq!(report.total_tiles, 0);
+        assert_eq!(report.over_limit_tiles, 0);
+        assert!(!report
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, crate::diagnostics::Diagnostic::TilesOverLimit { .. })));
+    }
+
     #[test]
     fn max_zoom_simplify_factor_must_be_finite_and_non_negative() {
         let with = |f| ExportOptions {
