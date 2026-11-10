@@ -14009,18 +14009,14 @@ mod tests {
     /// Fixture writers shared with `overview::stream`'s tests (#422).
     use super::super::testutil::{write_multi_rg_input, write_multi_rg_input_with_crs};
 
-    /// #546 review: a data shard whose coalesced chains widen its read
-    /// selection must build the same overview from the eager (test-only)
-    /// input as from the stream. The chain's rep lies in a row group west of,
-    /// and before, the ones the shard's window selects.
-    #[test]
-    fn shard_chain_widening_matches_on_eager_and_streaming_input() {
+    /// One 1-degree segment per row group along lat 10, from lng -60 to 60
+    /// (one chain at the coarse levels, its rep far west of a z4 shard at
+    /// lng 22.5..45), and the plan a coarse job capped at z3 saves for it.
+    fn coarse_plan_over_one_chain() -> (tempfile::TempDir, PathBuf, LevelPlan, PathBuf) {
         use geo::{coord, LineString};
 
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.parquet");
-        // One 1-degree segment per row group along lat 10, from lng -60 to 60:
-        // one chain at the coarse levels, its rep far west of the shard.
         let segments: Vec<Geometry<f64>> = (-60..60)
             .map(|x| {
                 let x = f64::from(x);
@@ -14047,6 +14043,16 @@ mod tests {
             },
         )
         .unwrap();
+        (dir, input, levels, plan)
+    }
+
+    /// #546 review: a data shard whose coalesced chains widen its read
+    /// selection must build the same overview from the eager (test-only)
+    /// input as from the stream. The chain's rep lies in a row group west of,
+    /// and before, the ones the shard's window selects.
+    #[test]
+    fn shard_chain_widening_matches_on_eager_and_streaming_input() {
+        let (dir, input, levels, plan) = coarse_plan_over_one_chain();
         // The z4 tile over lng 22.5..45: its window (two pivot tiles of
         // margin) stops at lng -22.5.
         let id = crate::pmtiles_writer::tile_id(4, 9, 7);
@@ -14105,36 +14111,7 @@ mod tests {
     /// count planted in the plan comes out in the shard's output.
     #[test]
     fn shard_takes_its_chains_from_the_plan() {
-        use geo::{coord, LineString};
-
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("in.parquet");
-        let segments: Vec<Geometry<f64>> = (-60..60)
-            .map(|x| {
-                let x = f64::from(x);
-                Geometry::LineString(LineString::new(vec![
-                    coord! { x: x, y: 10.0 },
-                    coord! { x: x + 1.0, y: 10.0 },
-                ]))
-            })
-            .collect();
-        super::super::testutil::write_one_row_groups(&input, &segments, true, None);
-        let levels = LevelPlan::ZoomRange {
-            min_zoom: 0,
-            max_zoom: 6,
-        };
-        let plan_path = dir.path().join("convert.plan");
-        convert_to_overviews(
-            &input,
-            dir.path().join("coarse.parquet"),
-            &ConvertOptions {
-                levels: levels.clone(),
-                zoom_ceiling: Some(3),
-                save_plan: Some(plan_path.clone()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let (dir, input, levels, plan_path) = coarse_plan_over_one_chain();
         let mut plan = super::super::plan_state::ConvertPlan::load(&plan_path).unwrap();
         let chains = plan.chains.as_mut().expect("the plan carries the chains");
         assert!(

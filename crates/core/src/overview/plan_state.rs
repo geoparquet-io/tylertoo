@@ -83,11 +83,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BinaryBuilder, Float64Builder, Int32Builder, Int64Builder, LargeListBuilder, UInt32Builder,
-    UInt64Builder, UInt8Builder,
+    Float64Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, LargeListBuilder,
+    UInt32Builder, UInt64Builder, UInt8Builder,
 };
 use arrow_array::{
-    Array, BinaryArray, Float64Array, Int32Array, Int64Array, LargeListArray, RecordBatch,
+    Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeListArray, RecordBatch,
     UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, Field, Schema};
@@ -1063,7 +1063,9 @@ pub(super) struct SavedChain {
 pub(super) struct SavedChains {
     /// Sorted by `(level, rep)`.
     pub entries: Vec<SavedChain>,
-    wkb: BinaryArray,
+    /// 64-bit offsets: every level repeats its chains' geometry, so the
+    /// total can pass 2 GiB on an input the coalescing guard admits.
+    wkb: LargeBinaryArray,
     /// Whether any chain of any non-canonical level merged two or more
     /// segments ([`CoalesceBuild::merged`]).
     pub merged: bool,
@@ -1072,7 +1074,7 @@ pub(super) struct SavedChains {
 impl SavedChains {
     fn from_build(build: &CoalesceBuild) -> Result<Self, ConvertError> {
         let mut entries = Vec::new();
-        let mut wkb = BinaryBuilder::new();
+        let mut wkb = LargeBinaryBuilder::new();
         for (level, table) in build.tables.iter().enumerate() {
             let Some(table) = table else { continue };
             let mut reps: Vec<&usize> = table.keys().collect();
@@ -1320,7 +1322,7 @@ fn plan_schema(meta: String) -> Schema {
         list("chain_level", DataType::UInt32),
         list("chain_rep", DataType::UInt64),
         list("chain_count", DataType::Int32),
-        list("chain_wkb", DataType::Binary),
+        list("chain_wkb", DataType::LargeBinary),
     ];
     Schema::new(fields).with_metadata(HashMap::from([(PLAN_META_KEY.to_string(), meta)]))
 }
@@ -1513,9 +1515,9 @@ impl ConvertPlan {
                 }
             ),
             list_col!(
-                BinaryBuilder::new(),
+                LargeBinaryBuilder::new(),
                 self.chains.is_some(),
-                |b: &mut LargeListBuilder<BinaryBuilder>| {
+                |b: &mut LargeListBuilder<LargeBinaryBuilder>| {
                     if let Some(chains) = &self.chains {
                         for c in &chains.entries {
                             b.values().append_value(chains.wkb.value(c.at));
@@ -2114,11 +2116,11 @@ fn rebuild_chains(
     let reps = u64_section(batch, "chain_rep", path)?.unwrap_or_default();
     let counts = i32_section(batch, "chain_count", path)?.unwrap_or_default();
     let wkb = match section(batch, "chain_wkb", path)? {
-        None => BinaryBuilder::new().finish(),
+        None => LargeBinaryBuilder::new().finish(),
         Some(values) => {
             let a = values
                 .as_any()
-                .downcast_ref::<BinaryArray>()
+                .downcast_ref::<LargeBinaryArray>()
                 .ok_or_else(|| plan_err(path, "section \"chain_wkb\" has the wrong value type"))?;
             if a.null_count() > 0 {
                 return Err(plan_err(
@@ -2562,6 +2564,20 @@ mod tests {
             })
             .collect();
         assert_eq!(reps, vec![Some(vec![(1, 3), (8, 1)]), Some(vec![]), None]);
+    }
+
+    /// The chain WKB section has 64-bit offsets: with every level repeating
+    /// its chains' geometry it can pass the 2 GiB a `Binary` array holds
+    /// (#855 review).
+    #[test]
+    fn plan_stores_chain_wkb_with_64_bit_offsets() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        tiny_plan().save(f.path()).unwrap();
+        let (schema, _) = reopen(f.path());
+        assert_eq!(
+            schema.field_with_name("chain_wkb").unwrap().data_type(),
+            &DataType::LargeList(Arc::new(Field::new("item", DataType::LargeBinary, true)))
+        );
     }
 
     /// A chain at a level the plan does not have is refused, not indexed.
