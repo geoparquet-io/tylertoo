@@ -679,19 +679,19 @@ impl StageAdmission {
     /// requests are latency-bound, so a fixed count of small ones left the
     /// run waiting on round trips the byte budget could have overlapped.
     pub(crate) fn requests_for(&self, request_bytes: u64) -> usize {
-        self.requests_within(self.mem_budget, request_bytes, self.max_concurrency)
+        self.requests_within(request_bytes, self.max_concurrency)
     }
 
-    /// Requests of `request_bytes` that `budget` holds, at least `floor`
+    /// Requests of `request_bytes` that [`Self::mem_budget`] holds, at least `floor`
     /// and at most [`Self::concurrency_cap`] (or `floor`, if larger);
     /// exactly `TYLERTOO_STAGING_CONCURRENCY` when that is set. The one
     /// in-flight count: [`Self::requests_for`] and pass 0's fetch loop,
     /// which runs a granted budget down to one request.
-    pub(crate) fn requests_within(&self, budget: u64, request_bytes: u64, floor: usize) -> usize {
+    pub(crate) fn requests_within(&self, request_bytes: u64, floor: usize) -> usize {
         if self.concurrency_set {
             return self.max_concurrency;
         }
-        usize::try_from(budget / request_bytes.max(1))
+        usize::try_from(self.mem_budget / request_bytes.max(1))
             .unwrap_or(usize::MAX)
             .clamp(floor, self.concurrency_cap.max(floor))
     }
@@ -2458,7 +2458,7 @@ pub(crate) mod remote {
             .unwrap_or(0);
         // #817 R1: as many as the byte budget (a grant of whole largest
         // requests) holds, unless the env pins the count.
-        let max_in_flight = admission(tunables).requests_within(tunables.mem_budget, largest, 1);
+        let max_in_flight = admission(tunables).requests_within(largest, 1);
         log::debug!(
             "[stage] fetching {} span(s) over {} part(s), up to {} in flight \
              (largest span {largest} B, budget {} B)",
