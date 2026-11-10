@@ -2606,16 +2606,16 @@ fn newcomer_allocs(
     allocs
 }
 
-/// A super-cell's sort key: the Z-order (Morton) code of its grid index,
-/// then the index. The code puts the cells of one tile next to each other,
-/// as tippecanoe's quadkey index puts the features (#850), so
-/// [`newcomer_allocs`]'s running total carries a remainder across a tile's
-/// cells and finds a tile's cells in one run. The code is one-to-one, so
-/// the index only rides along for [`tile_of`].
-type SuperCell = (u128, i64, i64);
+/// A super-cell's sort key: the Z-order (Morton) code of its grid index.
+/// The code puts the cells of one tile next to each other, as tippecanoe's
+/// quadkey index puts the features (#850), so [`newcomer_allocs`]'s running
+/// total carries a remainder across a tile's cells and finds a tile's cells
+/// in one run.
+type SuperCell = u128;
 
-/// Super-cells per tile side: a tile is `--gsd-base` GSDs, 1024 by default.
-const SUPERCELLS_PER_TILE: i64 = 1024 / SUPERCELL_GSD_FACTOR as i64;
+/// Morton bits of a tile's cells: a tile is `--gsd-base` GSDs, 1024 by
+/// default, so 8 × 8 cells.
+const TILE_SHIFT: u32 = 2 * (1024 / SUPERCELL_GSD_FACTOR as u64).trailing_zeros();
 
 /// `super_m` is the cell's side in Web Mercator meters: the grid is laid in
 /// Mercator for either CRS, so its 8 × 8 blocks are the level's tiles.
@@ -2636,26 +2636,28 @@ fn super_cell(cx: f64, cy: f64, super_m: f64, crs: Crs) -> SuperCell {
     };
     // From the world's north-west corner, as tiles are counted: y grows
     // south, and a cell holds its west and north edges.
-    let (gx, gy) = (
+    morton(
         ((mx + HALF) / (2.0 * HALF) * n).floor() as i64,
         ((HALF - my) / (2.0 * HALF) * n).floor() as i64,
-    );
-    // Flipping the sign bit maps i64 onto u64 in order, by a multiple of a
-    // tile, so a tile's cells stay aligned; 64 bits a side need a u128 code.
+    )
+}
+
+/// The Morton code of grid index `(gx, gy)`. Flipping the sign bit maps i64
+/// onto u64 in order, by a multiple of a tile, so a tile's cells stay
+/// aligned; 64 bits a side need a u128 code.
+fn morton(gx: i64, gy: i64) -> SuperCell {
     let spread = |g: i64| {
         let g = (g as u64) ^ (1 << 63);
         let half = |h: u64| u128::from(super::auto_zoom::spread_bits(h as u32));
         (half(g >> 32) << 64) | half(g)
     };
-    (spread(gx) | (spread(gy) << 1), gx, gy)
+    spread(gx) | (spread(gy) << 1)
 }
 
-/// The tile a super-cell lies in, at the default `--gsd-base`.
-fn tile_of(cell: &SuperCell) -> (i64, i64) {
-    (
-        cell.1.div_euclid(SUPERCELLS_PER_TILE),
-        cell.2.div_euclid(SUPERCELLS_PER_TILE),
-    )
+/// The tile a super-cell lies in, at the default `--gsd-base`: its code
+/// without the cell's place in the tile.
+fn tile_of(cell: &SuperCell) -> u128 {
+    cell >> TILE_SHIFT
 }
 
 /// The water level's shares: cell `i` gets `λ · hiᵢ^alpha` clamped to
@@ -4215,6 +4217,7 @@ mod tests {
     #[test]
     fn super_cell_blocks_are_the_levels_tiles() {
         let side = |z: u8| gsd(u32::from(z)) * SUPERCELL_GSD_FACTOR;
+        let tile = |x: i64, y: i64| tile_of(&morton(8 * x, 8 * y));
         // 90° east is the west edge of z2 tile x = 3, exactly.
         let points = [
             (-99.13, 19.43),
@@ -4226,13 +4229,13 @@ mod tests {
             for (lng, lat) in points {
                 let t = crate::tile::lng_lat_to_tile(lng, lat, z);
                 let block = tile_of(&super_cell(lng, lat, side(z), Crs::Epsg4326));
-                assert_eq!(block, (i64::from(t.x), i64::from(t.y)), "z{z} {lng},{lat}");
+                assert_eq!(block, tile(t.x.into(), t.y.into()), "z{z} {lng},{lat}");
             }
         }
         // A cell holds its north edge, as a tile does: y = 0 is the top of
         // the z4 tile row south of the equator, and anything north of it is not.
-        let row = |y: f64| tile_of(&super_cell(100.0, y, side(4), Crs::Epsg3857)).1;
-        assert_eq!((row(0.0), row(1e-3)), (8, 7));
+        let at = |y: f64| tile_of(&super_cell(100.0, y, side(4), Crs::Epsg3857));
+        assert_eq!((at(0.0), at(1e-3)), (tile(8, 8), tile(8, 7)));
     }
 
     /// At z29 a level has 2^32 cells a side, past a `u32` Morton half: the
@@ -4250,7 +4253,7 @@ mod tests {
             .map(|&(x, y)| super_cell(at(x) - HALF, HALF - at(y), side, Crs::Epsg3857))
             .collect();
         keys.sort_unstable();
-        let tiles: Vec<(i64, i64)> = keys.iter().map(tile_of).collect();
+        let tiles: Vec<u128> = keys.iter().map(tile_of).collect();
         assert_eq!(tiles[0], tiles[1], "{tiles:?}");
         assert_eq!(tiles[2], tiles[3], "{tiles:?}");
         assert_ne!(tiles[1], tiles[2], "{tiles:?}");
