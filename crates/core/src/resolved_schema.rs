@@ -231,17 +231,7 @@ impl ResolvedSchema {
     }
     /// WKB geometry fields whose byte values need structural validation before encoding.
     pub(crate) fn wkb_columns(&self) -> Vec<(usize, String)> {
-        self.schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| {
-                f.metadata()
-                    .get("ARROW:extension:name")
-                    .is_some_and(|n| n == "geoarrow.wkb")
-            })
-            .map(|(i, f)| (i, f.name().clone()))
-            .collect()
+        wkb_columns(&self.schema)
     }
 
     /// Whether levels were independently cropped to a shard's spatial domain.
@@ -1133,6 +1123,22 @@ pub(crate) fn geometry_name_disagreement(schema: &Schema, geom_idx: usize) -> Op
             .is_some_and(|n| n.starts_with("geoarrow"))
     });
     (Some(by_name) != names.get(geom_idx).copied() && annotated).then_some(by_name)
+}
+
+/// WKB geometry fields of `schema` ([`ResolvedSchema::wkb_columns`]; also a
+/// staged Arrow stream's, #824).
+pub(crate) fn wkb_columns(schema: &Schema) -> Vec<(usize, String)> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            f.metadata()
+                .get("ARROW:extension:name")
+                .is_some_and(|n| n == "geoarrow.wkb")
+        })
+        .map(|(i, f)| (i, f.name().clone()))
+        .collect()
 }
 
 #[cfg(test)]

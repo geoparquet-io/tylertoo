@@ -171,9 +171,7 @@ pub fn stage_arrow_stream(
     // Schema-level metadata dropped: a stale `geo` key would sit beside ours.
     let schema = Arc::new(Schema::new(fields));
     // Every WKB column the encoder will parse, selected or not.
-    let wkb: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| schema.field(i).extension_type_name() == Some("geoarrow.wkb"))
-        .collect();
+    let wkb = crate::resolved_schema::wkb_columns(&schema);
 
     let options = GeoParquetWriterOptionsBuilder::default()
         .set_encoding(GeoParquetWriterEncoding::WKB)
@@ -208,13 +206,9 @@ pub fn stage_arrow_stream(
                 .map_err(ConvertError::Arrow)?;
             // The pinned WKB reader panics on some malformed values; refuse
             // them first, as the file readers do.
-            for &i in &wkb {
-                crate::wkb_column::check_wkb_column(columns[i].as_ref()).map_err(|(row, e)| {
-                    stream_error(format!(
-                        "geometry column {:?}, row {}: {e}",
-                        schema.field(i).name(),
-                        rows + row
-                    ))
+            for (i, name) in &wkb {
+                crate::wkb_column::check_wkb_column(columns[*i].as_ref()).map_err(|(row, e)| {
+                    stream_error(format!("geometry column {name:?}, row {}: {e}", rows + row))
                 })?;
             }
             rows += slice.num_rows();
