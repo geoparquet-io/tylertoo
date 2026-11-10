@@ -480,6 +480,16 @@ impl MemoryBudget {
             threads.min(ENCODE_FLOOR),
         )
     }
+    /// The encodes of a `units` grant a run re-sized as `profile` keeps:
+    /// `bounded` encodes from the floor [`Self::encode_concurrency`] grants
+    /// (#815: an `auto` run that downgraded to spill drains as `bounded`).
+    pub(super) fn encode_units_as(profile: MemoryProfile, units: usize) -> usize {
+        if matches!(profile, MemoryProfile::Bounded) {
+            units.min(ENCODE_FLOOR)
+        } else {
+            units
+        }
+    }
     /// Row groups pass 2's buffered drain may encode at once (#817 B1): the
     /// writer's `encode` grant plus as many more slots of `slot_bytes` (at
     /// least the grant's own unit) as `reused` bytes hold, at most `threads`.

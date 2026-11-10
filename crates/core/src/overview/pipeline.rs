@@ -896,14 +896,15 @@ impl SinkAutoTuner {
         )
     }
 
-    /// Encodes the drain may run: once downgraded to spill, at most
-    /// `bounded`'s floor (#815).
+    /// Encodes the drain may run: once downgraded to spill, as `bounded`
+    /// (#815).
     fn encode_cap(&self, units: usize) -> usize {
-        if self.downgraded {
-            units.min(super::memory::ENCODE_FLOOR)
+        let sized_as = if self.downgraded {
+            MemoryProfile::Bounded
         } else {
-            units
-        }
+            MemoryProfile::Auto
+        };
+        MemoryBudget::encode_units_as(sized_as, units)
     }
 
     /// Record that the downgrade happened (and disarm: it is one-way).
