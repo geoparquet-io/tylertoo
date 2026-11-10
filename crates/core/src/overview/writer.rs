@@ -245,7 +245,7 @@ pub struct OverviewWriterOptions {
     /// (#817): the previous level's may overlap the current one's, within
     /// `encode_concurrency`. Off, every level drains its own encodes before
     /// `write_level` returns, which holds at most one level's row groups
-    /// (the auto and bounded envelope). Convert sets it for `speed` only.
+    /// (the bounded envelope). Convert sets it for `auto` and `speed`.
     /// Default `false`.
     pub overlap_levels: bool,
 }
@@ -3517,7 +3517,7 @@ mod tests {
         );
     }
 
-    /// #817: without `overlap_levels` (auto and bounded) a level drains
+    /// #817: without `overlap_levels` (bounded) a level drains
     /// its own encodes, so its failure surfaces from its own call.
     #[test]
     fn without_overlap_a_level_drains_its_own_encodes() {
