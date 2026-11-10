@@ -1710,7 +1710,9 @@ fn join_decoded(
     // Joined JOIN_CHUNK at a time: an unjoined one-row batch holds the
     // schema's whole fixed Arrow overhead.
     let (mut chunks, mut parts) = (Vec::new(), vec![first]);
-    while held < rows {
+    // A piece already at the bound is yielded alone, so the reader's split
+    // can refuse an oversized row before another one is decoded.
+    while held < rows && bytes < bound {
         let batch = match inner.next() {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => return Some(Err(e)),
@@ -2056,9 +2058,9 @@ mod tests {
         );
     }
 
-    /// #848 review: joining must not undo the decode bound. Rows that each
-    /// hold most of the byte bound are yielded alone; the rest are joined up
-    /// to it, and every row comes through once.
+    /// #848 review: joining must not undo the decode bound. Rows past the
+    /// byte bound are yielded alone, without decoding the row after them;
+    /// the rest are joined up to it, and every row comes through once.
     #[test]
     fn decoded_batches_join_within_the_byte_bound() {
         use arrow_array::builder::{Int64Builder, ListBuilder};
@@ -2067,7 +2069,7 @@ mod tests {
         let n = 2_000;
         let mut lists = ListBuilder::new(Int64Builder::new());
         for i in 0..n {
-            let len = if i < 3 { 10_000 } else { 64 };
+            let len = if i < 3 { 20_000 } else { 64 };
             lists.values().append_slice(&vec![i; len]);
             lists.append(true);
         }
@@ -2092,6 +2094,9 @@ mod tests {
         while let Some(batch) = join_decoded(&mut inner, &mut carry, 1_000, limit) {
             let batch = batch.unwrap();
             assert!(batch.num_rows() == 1 || expanded_batch_bytes(&batch) <= limit);
+            if sizes.len() < 3 {
+                assert!(carry.is_none(), "decoded past an oversized row");
+            }
             sizes.push(batch.num_rows());
         }
         assert_eq!(sizes.iter().sum::<usize>(), n as usize);
