@@ -192,16 +192,17 @@ fn stage_columns(
     let selection = &convert.properties;
     let schema = source.file_schema()?;
     let column = schema.field(routing).name();
-    let mut layer = selection.clone();
-    if selection.is_identity() {
-        layer.exclude.push(column.clone());
-        return Ok(layer);
-    }
+    // Refused here, before the split, not by every layer after it.
     let geom = source.resolved_schema()?.geometry_index().ok_or_else(|| {
         ConvertError::NoGeometryColumn {
             input: source.display_name(),
         }
     })?;
+    let mut layer = selection.clone();
+    if selection.is_identity() {
+        layer.exclude.push(column.clone());
+        return Ok(layer);
+    }
     // A knob reading an excluded property is refused here, before anything
     // is staged, as convert refuses it. The filter is not one: it runs
     // before the split, on the columns it reads.
@@ -1302,6 +1303,37 @@ mod tests {
                 TilesError::Convert(ConvertError::Properties(
                     super::super::properties::PropertySelectionError::RequiredByKnob { .. }
                 ))
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// An input without a geometry column is refused before the split.
+    #[test]
+    fn an_input_without_geometry_is_refused_before_staging() {
+        use arrow_array::{RecordBatch, StringArray};
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("plain.parquet");
+        let batch = RecordBatch::try_from_iter([(
+            "crop",
+            Arc::new(StringArray::from(vec!["soy", "corn"])) as _,
+        )])
+        .unwrap();
+        let file = std::fs::File::create(&input).unwrap();
+        let mut writer =
+            tylertoo_io::test_support::ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let err = convert_to_pmtiles(
+            &TilesInput::Path(input),
+            &dir.path().join("o.pmtiles"),
+            &options("crop"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TilesError::Convert(ConvertError::NoGeometryColumn { .. })
             ),
             "{err:?}"
         );

@@ -273,7 +273,9 @@ mod tests {
     /// descriptors, and recording can resume after it.
     #[test]
     fn sealed_snapshots_read_back_and_hold_no_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
         let mut ledger = Accounting::default();
+        ledger.set_spill_dir(Some(dir.path()));
         // 4,000 rows outgrow RESIDENT_BYTES, so each zoom's ledger is on disk.
         for zoom in 0..4 {
             for row in 0..4000 {
@@ -289,13 +291,21 @@ mod tests {
                 .unwrap()
         };
         let before = ids(&snapshot);
+        // The descriptors open on the ledgers' directory: other tests in
+        // this process open and close files of their own meanwhile.
         #[cfg(target_os = "linux")]
-        let fds = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let fds = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+                .filter(|target| target.starts_with(dir.path()))
+                .count()
+        };
         #[cfg(target_os = "linux")]
-        let open = fds();
+        assert_eq!(fds(), 4, "one open ledger per zoom");
         snapshot.seal().unwrap();
         #[cfg(target_os = "linux")]
-        assert_eq!(fds() + 4, open, "one descriptor per zoom closed");
+        assert_eq!(fds(), 0, "sealed ledgers hold no descriptor");
         assert_eq!(ids(&snapshot), before);
 
         ledger
