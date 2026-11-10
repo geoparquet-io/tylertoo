@@ -6450,11 +6450,21 @@ pub(super) fn apply_coalesced_count(
 #[derive(Debug, Default)]
 pub(super) struct GroupInterner {
     map: HashMap<String, u32>,
+    /// Approximate heap held by `map`: key bytes plus a per-entry overhead.
+    heap_bytes: u64,
 }
 
 impl GroupInterner {
     /// Group id assigned to null/missing class values.
     pub(super) const NULL_GROUP: u32 = u32::MAX;
+    /// Per-entry cost beyond the key bytes: the `String` header, the id, and
+    /// the hash table's slot and control byte.
+    const ENTRY_OVERHEAD: usize = 48;
+
+    /// Approximate heap bytes held by the interned values.
+    pub(super) fn heap_bytes(&self) -> u64 {
+        self.heap_bytes
+    }
 
     /// Intern one column's values, appending a group id per row to `out`.
     /// Non-string columns intern every row as [`Self::NULL_GROUP`] (callers
@@ -6476,6 +6486,7 @@ impl GroupInterner {
                             Some(&id) => id,
                             None => {
                                 let id = self.map.len() as u32;
+                                self.heap_bytes += (value.len() + Self::ENTRY_OVERHEAD) as u64;
                                 self.map.insert(value.to_string(), id);
                                 id
                             }

@@ -614,15 +614,17 @@ pub(crate) fn check_cluster_sum_invariant(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) {
     // A malformed count/level type must be reported by the metadata validator,
-    // never passed into Arrow's infallible primitive casts. A partial file has
-    // no canonical source band against which to check the sum.
+    // never passed into Arrow's infallible primitive casts.
     if report.check_passed("cluster_point_count_column") != Some(true)
         || report.check_passed("level_column") != Some(true)
         || report.check_passed("overviews_structure") != Some(true)
-        || report.check_passed("complete_pyramid") == Some(false)
     {
         return;
     }
+    // A partial file has no canonical source band, and a spatial subset's
+    // levels are cropped independently: neither can check whole-source mass.
+    // The per-row category invariant (#827) still holds on both.
+    let partial = report.check_passed("complete_pyramid") == Some(false);
     // Prerequisites: parseable footer, enabled clustering, duplicating mode
     // with a valid canonical level, the named INT64 count column, the level
     // column, and a geometry column (needed to tell point rows apart).
@@ -646,8 +648,11 @@ pub(crate) fn check_cluster_sum_invariant(
         return; // mode_canonical already failed
     };
 
-    if descriptor.source_is_subset() {
-        report.pass("cluster_sum_invariant", "spatial subset: levels are independently cropped; whole-source mass equality is not applicable");
+    let subset = descriptor.source_is_subset();
+    if (partial || subset) && clustering.categories.is_none() {
+        if subset && !partial {
+            report.pass("cluster_sum_invariant", "spatial subset: levels are independently cropped; whole-source mass equality is not applicable");
+        }
         return;
     }
 
@@ -662,10 +667,17 @@ pub(crate) fn check_cluster_sum_invariant(
                 match category_problem {
                     None => report.pass(
                         "cluster_category_counts",
-                        "every row's category counts sum to its point_count (§12.1)",
+                        "every row's category counts sum to its point_count (§12.3.1)",
                     ),
                     Some(problem) => report.fail("cluster_category_counts", problem),
                 }
+            }
+            if partial {
+                return;
+            }
+            if subset {
+                report.pass("cluster_sum_invariant", "spatial subset: levels are independently cropped; whole-source mass equality is not applicable");
+                return;
             }
             let Some(&(_, expected)) = per_level.get(canonical as usize) else {
                 return; // canonical band outside levels: structure failed
@@ -1443,7 +1455,7 @@ mod tests {
         level_ids: &[Vec<i64>],
         point_counts: Option<&[Vec<i64>]>,
     ) {
-        write_cluster_fixture_with_subset(path, level_ids, point_counts, false);
+        write_cluster_fixture_with_subset(path, level_ids, point_counts, false, None);
     }
 
     fn write_cluster_fixture_with_subset(
@@ -1451,8 +1463,12 @@ mod tests {
         level_ids: &[Vec<i64>],
         point_counts: Option<&[Vec<i64>]>,
         source_is_subset: bool,
+        // #827: one `name:x` category count column per level row.
+        category_counts: Option<&[Vec<i64>]>,
     ) {
-        use crate::overview::level::{AccumulatedColumn, ClusteringProvenance, Generalization};
+        use crate::overview::level::{
+            AccumulatedColumn, ClusterCategories, ClusteringProvenance, Generalization,
+        };
         use arrow_array::Int64Array as I64;
 
         let mut fields = vec![
@@ -1462,6 +1478,9 @@ mod tests {
         ];
         if point_counts.is_some() {
             fields.push(Arc::new(Field::new("point_count", DataType::Int64, false)));
+        }
+        if category_counts.is_some() {
+            fields.push(Arc::new(Field::new("name:x", DataType::Int64, true)));
         }
         let schema = Arc::new(Schema::new(fields));
 
@@ -1491,7 +1510,10 @@ mod tests {
                     column: "id".to_string(),
                     op: "sum".to_string(),
                 }],
-                categories: None,
+                categories: category_counts.map(|_| ClusterCategories {
+                    column: "name".to_string(),
+                    values: vec!["x".to_string()],
+                }),
             }),
             coalescing: None,
             renamed_columns: None,
@@ -1510,6 +1532,9 @@ mod tests {
                 Arc::new(geom_array.to_array_ref()),
             ];
             if let Some(counts) = point_counts {
+                columns.push(Arc::new(I64::from(counts[k].clone())));
+            }
+            if let Some(counts) = category_counts {
                 columns.push(Arc::new(I64::from(counts[k].clone())));
             }
             let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
@@ -1541,6 +1566,7 @@ mod tests {
             &[vec![0], vec![0]],
             Some(&[vec![2], vec![1]]),
             true,
+            None,
         );
         assert!(validate_file(&current).unwrap().is_valid());
         OverviewReader::open(&current).unwrap();
@@ -2180,5 +2206,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(msg.contains("sum to 1 but its point_count is 2"), "{msg}");
+    }
+
+    /// #827 review: cropping exempts a spatial subset from whole-source mass
+    /// equality, but not from the per-row category invariant.
+    #[test]
+    fn subset_still_checks_category_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("ok.parquet");
+        let bad = dir.path().join("bad.parquet");
+        let levels = [vec![0], vec![0]];
+        let counts = [vec![2], vec![1]];
+        write_cluster_fixture_with_subset(&ok, &levels, Some(&counts), true, Some(&counts));
+        let vr = validate_file(&ok).unwrap();
+        assert_eq!(vr.check_passed("cluster_category_counts"), Some(true));
+
+        write_cluster_fixture_with_subset(
+            &bad,
+            &levels,
+            Some(&counts),
+            true,
+            Some(&[vec![1], vec![1]]),
+        );
+        let vr = validate_file(&bad).unwrap();
+        assert_eq!(vr.check_passed("cluster_category_counts"), Some(false));
     }
 }

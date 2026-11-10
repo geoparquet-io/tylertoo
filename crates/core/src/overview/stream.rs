@@ -98,6 +98,7 @@ struct Pass1Keys<'a> {
     ladder_values: &'a mut Vec<Option<f64>>,
     /// `--cluster-categories` (#827).
     category: Option<&'a mut RowCategories>,
+    budget: &'a MemoryBudget,
 }
 
 struct Pass1Accum<'a> {
@@ -5077,6 +5078,16 @@ impl RowCategories {
             rows: Vec::new(),
         }
     }
+
+    /// Fail with `BudgetExceeded` once the interned values and per-row ids
+    /// outgrow the memory budget: a high-cardinality column would otherwise
+    /// grow until the process is OOM-killed.
+    // shortcut: checked against the whole budget, not net of the feature
+    // table, so a run can still reach ~2x the budget; net it out if that bites.
+    fn require_fits(&self, budget: &MemoryBudget) -> Result<(), ConvertError> {
+        let row_bytes = (self.rows.len() * std::mem::size_of::<u32>()) as u64;
+        budget.require(MemoryPhase::Scan, self.values.heap_bytes() + row_bytes)
+    }
 }
 
 /// `(offset, len)` chunks of `chunk_rows` rows over `n` rows: contiguous,
@@ -5760,6 +5771,7 @@ fn extract_pass1_batch_keys(
         acc_values,
         ladder_values,
         category,
+        budget,
     } = inputs;
     match plan {
         RankPlan::ExplicitSort { idx, .. } => {
@@ -5800,6 +5812,7 @@ fn extract_pass1_batch_keys(
     if let Some(c) = category {
         c.values
             .extend(batch.column(proj(c.col)).as_ref(), &mut c.rows);
+        c.require_fits(budget)?;
     }
 
     // Entry-zoom ladder (#364): row-indexed, like the ranking keys above, but
@@ -6267,6 +6280,7 @@ fn run_pass1_with_chunk_rows(
                         acc_values: &mut acc_values,
                         ladder_values: &mut ladder_values,
                         category: category.as_mut(),
+                        budget: ctx.budget,
                     },
                 )?;
                 Pass1Timers::add(&timers_ref.keys, t_keys);
@@ -10815,5 +10829,29 @@ mod tests {
         };
         let (none, _) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &speed, 100);
         assert_eq!((none.reserved_bytes, none.reason), (0, "nothing spills"));
+    }
+
+    /// #827 review: the `--cluster-categories` interner grows with the
+    /// column's distinct values, so pass 1 charges it to the memory budget
+    /// and fails loudly instead of growing until the process is OOM-killed.
+    #[test]
+    fn category_interner_is_charged_to_the_memory_budget() {
+        let values: Vec<String> = (0..1000).map(|i| format!("value-{i:04}")).collect();
+        let col = arrow_array::StringArray::from(values);
+        let mut cats = RowCategories::new(0);
+        cats.values.extend(&col, &mut cats.rows);
+
+        cats.require_fits(&MemoryBudget::with_available(Some(1 << 30)))
+            .expect("1000 short values fit 1 GiB");
+        match cats.require_fits(&MemoryBudget::with_available(Some(1000))) {
+            Err(ConvertError::BudgetExceeded {
+                phase: "pass-1 scan",
+                needed,
+                available: 1000,
+            }) => {
+                assert!(needed > 10_000, "counts the strings and row ids: {needed}");
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
     }
 }
