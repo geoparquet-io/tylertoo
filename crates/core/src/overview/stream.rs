@@ -125,6 +125,8 @@ struct Pass2Inputs<'a> {
     footer: Option<FooterPrice>,
     /// The writer's row-group encode grant (#817 B1: the drain widens it).
     encode: Grant,
+    /// What one more drain encode holds ([`drain_slot_price`]).
+    drain_slot_bytes: u64,
 }
 
 struct AssignmentInputs<'a> {
@@ -1567,6 +1569,7 @@ fn run_pass2_levels(
         geom_bytes,
         footer,
         encode,
+        drain_slot_bytes,
     } = inputs;
     let n = ctxs.len();
     // #626: filled in by the buffered engine. Stays at its default for the
@@ -1683,6 +1686,7 @@ fn run_pass2_levels(
                         spill_dir: options.spill_dir.as_deref(),
                         drain_encodes: MemoryBudget::drain_encodes(
                             encode,
+                            drain_slot_bytes,
                             grants.read.bytes().saturating_add(grants.window.bytes()),
                             rayon::current_num_threads(),
                         ),
@@ -1883,6 +1887,8 @@ struct LevelWriter {
     effective_max_row_group_size: Option<usize>,
     /// What `writer`'s encode concurrency was granted.
     encode: Grant,
+    /// What one more pass-2 drain encode holds ([`drain_slot_price`]).
+    drain_slot_bytes: u64,
 }
 
 /// #541: apply a convert-side zoom ceiling to the planned levels. Returns how
@@ -2131,6 +2137,7 @@ fn create_level_writer(
         rayon::current_num_threads(),
         encode_price(&writer_opts, &level_row_counts, row_bytes),
     );
+    let drain_slot_bytes = drain_slot_price(&writer_opts, &level_row_counts, row_bytes).bytes;
     log::info!(
         "[convert] writer: {} concurrent row-group encode(s) x {} B, {} B left",
         encodes.units,
@@ -2157,6 +2164,7 @@ fn create_level_writer(
         non_geom_cols,
         effective_max_row_group_size,
         encode: encodes,
+        drain_slot_bytes,
     })
 }
 
@@ -2180,6 +2188,32 @@ fn encode_price(
     level_row_counts: &[usize],
     row_bytes: Option<u64>,
 ) -> Price {
+    encode_price_at_least(writer_opts, level_row_counts, row_bytes, 1)
+}
+
+/// What one encode slot holds once pass 2's drain widens the writer (#817
+/// B1): a slot also admits one WKB chunk of up to
+/// [`WKB_ENCODE_CHUNK_ROWS`](super::writer::WKB_ENCODE_CHUNK_ROWS) rows, so
+/// a level of small row groups is priced at the chunk, not the group.
+fn drain_slot_price(
+    writer_opts: &OverviewWriterOptions,
+    level_row_counts: &[usize],
+    row_bytes: Option<u64>,
+) -> Price {
+    encode_price_at_least(
+        writer_opts,
+        level_row_counts,
+        row_bytes,
+        super::writer::WKB_ENCODE_CHUNK_ROWS as u64,
+    )
+}
+
+fn encode_price_at_least(
+    writer_opts: &OverviewWriterOptions,
+    level_row_counts: &[usize],
+    row_bytes: Option<u64>,
+    min_rows: u64,
+) -> Price {
     let finest_zoom = writer_opts.levels.last().and_then(|l| l.zoom);
     let largest = writer_opts
         .levels
@@ -2198,6 +2232,7 @@ fn encode_price(
         .max()
         .unwrap_or(0)
         .max(1) as u64;
+    let largest = largest.max(min_rows);
     match row_bytes {
         Some(row) => Price::new(
             largest
@@ -3689,6 +3724,7 @@ pub(crate) fn run_stages(
         non_geom_cols,
         effective_max_row_group_size,
         encode,
+        drain_slot_bytes,
     } = create_level_writer(
         output_path,
         &descriptor,
@@ -3763,6 +3799,7 @@ pub(crate) fn run_stages(
             geom_bytes,
             footer,
             encode,
+            drain_slot_bytes,
         },
         strategy,
     )?;
@@ -10042,6 +10079,21 @@ mod tests {
             super::super::accumulate::rendezvous::met(),
             "the 4 drops never ran at once"
         );
+    }
+
+    /// #817 B1 review: a widened drain slot also admits a WKB chunk of up to
+    /// 10,000 rows, so a ladder of 128-row groups must not price the slot
+    /// at 128 rows (the drain would hold far more than the read it reuses).
+    #[test]
+    fn drain_slot_is_priced_at_least_at_a_wkb_chunk() {
+        let mut opts = OverviewWriterOptions::new(Mode::Duplicating, three_levels());
+        opts.max_row_group_size = 128;
+        let counts = [1_000usize, 50_000, 200_000];
+        let row = Some(100u64);
+        let group = encode_price(&opts, &counts, row).bytes;
+        let slot = drain_slot_price(&opts, &counts, row).bytes;
+        assert!(group < slot, "group {group} B vs slot {slot} B");
+        assert_eq!(slot, 10_000 * 100 * ENCODE_COPIES);
     }
 
     /// #817 B1: under `bounded` the writer may encode `ENCODE_FLOOR` (4) row
