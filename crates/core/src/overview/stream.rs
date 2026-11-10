@@ -7058,27 +7058,29 @@ fn assemble_level_batch(
 /// One level's kept batch rows, their geometries and vertex count.
 type LevelSelection = (Vec<usize>, Vec<Arc<Geometry<f64>>>, usize);
 
+/// One level's positions in the shared rows, and in the shared geometries.
+type LevelPositions = (UInt32Array, UInt32Array);
+
 /// The rows and geometries the levels built from `batch` share (#852), and
-/// each level's positions in the shared geometries. A geometry several
-/// levels keep (the same `Arc`, #499) is encoded once.
+/// each level's positions in the shared rows and in the shared geometries.
+/// A geometry several levels keep (the same `Arc`, #499) is encoded once.
 fn share_rows(
     batch: &RecordBatch,
     ctxs: &[LevelStreamCtx<'_>],
     selections: &[LevelSelection],
-) -> Result<(Arc<pipeline::SharedRows>, Vec<UInt32Array>), ConvertError> {
+) -> Result<(Arc<pipeline::SharedRows>, Vec<LevelPositions>), ConvertError> {
     let finest = ctxs.last().expect("a cascade has levels");
     // One geometry column serves every level, so they must type it alike.
     debug_assert!(ctxs.iter().all(|c| c.geom_idx == finest.geom_idx
         && c.source_schema.field(c.geom_idx) == finest.source_schema.field(finest.geom_idx)));
     let (pool, positions) = geometry_pool(selections.iter().map(|(_, geoms, _)| geoms.as_slice()));
     let geometry = build_geometry_column(finest.source_schema, finest.geom_idx, &pool)?;
-    let rows = pipeline::SharedRows::new(
-        batch,
-        finest.non_geom_cols,
-        selections.iter().map(|(kept, _, _)| kept.as_slice()),
-        geometry,
-    )?;
-    Ok((Arc::new(rows), positions))
+    let kept: Vec<&[usize]> = selections
+        .iter()
+        .map(|(kept, _, _)| kept.as_slice())
+        .collect();
+    let (rows, index) = pipeline::SharedRows::new(batch, finest.non_geom_cols, &kept, geometry)?;
+    Ok((Arc::new(rows), index.into_iter().zip(positions).collect()))
 }
 
 /// Each distinct geometry (by allocation) the `levels` keep, in first-kept
@@ -7371,8 +7373,8 @@ pub(super) fn process_batch_cascade(
                     pipeline::LevelBatch::shared(
                         Arc::new(schema.clone()),
                         rows,
-                        &kept_idx,
-                        geometry[li].clone(),
+                        geometry[li].0.clone(),
+                        geometry[li].1.clone(),
                         ctx.geom_idx,
                         own,
                     )

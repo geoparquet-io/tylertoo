@@ -964,25 +964,24 @@ pub(super) struct SharedRows {
     /// cascade step left a feature unchanged shares the finer level's
     /// geometry (#499), so per-level columns held it once per level.
     geometry: ArrayRef,
-    /// Each input row's position in `columns`; `u32::MAX` when no level
-    /// keeps it.
-    pos: Vec<u32>,
 }
 
 impl SharedRows {
     /// The rows of `batch` that any of `kept` (per level, ascending batch
-    /// row indices) keeps, over `non_geom_cols`. When every row is kept the
-    /// input's own columns are shared, with no copy.
-    pub(super) fn new<'a>(
+    /// row indices) keeps, over `non_geom_cols`, and each level's positions
+    /// in them. When every row is kept the input's own columns are shared,
+    /// with no copy.
+    pub(super) fn new(
         batch: &RecordBatch,
         non_geom_cols: &[usize],
-        kept: impl Iterator<Item = &'a [usize]>,
+        kept: &[&[usize]],
         geometry: ArrayRef,
-    ) -> Result<Self, ConvertError> {
+    ) -> Result<(Self, Vec<UInt32Array>), ConvertError> {
         let n = batch.num_rows();
+        // Input-batch sized, so dropped here rather than held to the drain.
         let mut pos = vec![u32::MAX; n];
         for rows in kept {
-            for &i in rows {
+            for &i in *rows {
                 pos[i] = 0;
             }
         }
@@ -1005,11 +1004,11 @@ impl SharedRows {
                 .map(|&c| arrow_select::take::take(batch.column(c).as_ref(), &rows, None))
                 .collect::<Result<_, _>>()?
         };
-        Ok(Self {
-            columns,
-            pos,
-            geometry,
-        })
+        let index = kept
+            .iter()
+            .map(|rows| rows.iter().map(|&i| pos[i]).collect())
+            .collect();
+        Ok((Self { columns, geometry }, index))
     }
 
     /// What these columns hold in RAM.
@@ -1044,17 +1043,16 @@ pub(super) enum LevelBatch {
 }
 
 impl LevelBatch {
-    /// A shared level batch over `batch_rows` (ascending input batch rows,
-    /// each kept by some level `rows` was built from).
+    /// A shared level batch: its rows at `index` in `rows` and its
+    /// geometries at `geometry` in the pool ([`SharedRows::new`]).
     pub(super) fn shared(
         schema: SchemaRef,
         rows: &Arc<SharedRows>,
-        batch_rows: &[usize],
+        index: UInt32Array,
         geometry: UInt32Array,
         geom_idx: usize,
         own: Vec<ArrayRef>,
     ) -> Self {
-        let index = batch_rows.iter().map(|&i| rows.pos[i]).collect();
         Self::Shared {
             schema,
             rows: Arc::clone(rows),
@@ -3021,21 +3019,15 @@ mod sink_sample_tests {
         let pool: ArrayRef = Arc::new(Float64Array::from_iter_values(
             (0..n).map(|i| i as f64 * 0.5),
         ));
-        let rows = Arc::new(
-            SharedRows::new(
-                &input,
-                &[0, 2],
-                levels.iter().map(Vec::as_slice),
-                pool.clone(),
-            )
-            .unwrap(),
-        );
+        let kept: Vec<&[usize]> = levels.iter().map(Vec::as_slice).collect();
+        let (rows, index) = SharedRows::new(&input, &[0, 2], &kept, pool.clone()).unwrap();
+        let rows = Arc::new(rows);
         let mut held = rows.held_bytes();
         let mut copied = 0u64;
-        for kept in &levels {
+        for (kept, index) in levels.iter().zip(index) {
             let at = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
             let geometry = arrow_select::take::take(pool.as_ref(), &at, None).unwrap();
-            let level = LevelBatch::shared(schema.clone(), &rows, kept, at, 1, Vec::new());
+            let level = LevelBatch::shared(schema.clone(), &rows, index, at, 1, Vec::new());
             held += level.held_bytes();
             let built = level.materialize().unwrap();
             let idx = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
