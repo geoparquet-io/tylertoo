@@ -2398,15 +2398,13 @@ fn seed_serial(
 }
 
 /// What [`SpillBuckets::write_frame`] frees of `bucket` before its run opens
-/// at the stage's first flush: all of it when its frame fits the stage,
-/// otherwise the rings, and their shapes, it encodes whole before then.
+/// at the stage's first flush. It replays the encoder: each header, ring and
+/// credit list is staged whole or flushes the stage, and each ring, shape,
+/// the shape list and the credits are freed once encoded.
 fn freed_before_open(bucket: &SeedBucket) -> usize {
     let (shapes, credits) = bucket;
-    if frame_bytes(bucket) <= FRAME_STAGE_BYTES {
-        return shape_capacity_bytes(shapes)
-            + credits.capacity() * std::mem::size_of::<Collapsed>();
-    }
-    let (mut staged, mut freed) = (8, 0);
+    let mut staged = 8;
+    let mut freed = 0;
     for shape in shapes {
         staged += 8;
         for ring in shape {
@@ -2418,10 +2416,16 @@ fn freed_before_open(bucket: &SeedBucket) -> usize {
         }
         freed += shape.capacity() * std::mem::size_of::<Ring>();
     }
-    freed
+    freed += shapes.capacity() * std::mem::size_of::<Shape>();
+    staged += 8 + credits.len() * 24;
+    if staged > FRAME_STAGE_BYTES {
+        return freed;
+    }
+    freed + credits.capacity() * std::mem::size_of::<Collapsed>()
 }
 
 /// The bytes [`SpillBuckets::write_frame`] encodes for a bucket.
+#[cfg(test)]
 fn frame_bytes((shapes, credits): &SeedBucket) -> usize {
     16 + credits.len() * 24
         + shapes
@@ -3770,6 +3774,24 @@ pub(super) mod tests {
         seed_serial(&mut buckets, pending, bytes).expect("the second bucket makes room");
         assert!(cost_probe::take().seed_serial_peak <= budget);
         assert_eq!(buckets.tiles.len(), 2);
+    }
+
+    /// #830 review: a bucket whose credits overflow the stage has freed its
+    /// shapes, and the list holding them, before its run opens.
+    #[test]
+    fn freed_before_open_counts_the_shapes_freed_before_the_credits() {
+        let shape: Shape = vec![vec![[0.0, 0.0]; 4]];
+        let shapes = vec![shape; 5];
+        let credits = vec![
+            Collapsed {
+                area: 1.0,
+                at: [0.0, 0.0]
+            };
+            400
+        ];
+        let bucket = (shapes, credits);
+        assert!(frame_bytes(&bucket) > FRAME_STAGE_BYTES);
+        assert_eq!(freed_before_open(&bucket), shape_capacity_bytes(&bucket.0));
     }
 
     /// #817 review: a tile built alone needs no more workspace than the
