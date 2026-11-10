@@ -2352,13 +2352,13 @@ fn seed_batch(
 
 /// The serial seed (#830): each write is charged the buckets still waiting,
 /// its own bucket less what its encoding has freed, and the runs' nodes.
-/// Writes go in three passes, each in key order, with no workspace of their
-/// own: first the buckets that free at least a new run's node and whose
-/// frame fits the encoder's stage (freed before their run opens), then the
-/// other buckets that free at least a node, then the rest. The charge so
-/// stays within the window's pending check until only the runs' nodes,
-/// which main also required, are left. Write order between tiles is
-/// immaterial.
+/// Writes go in four passes, each in key order, with no workspace of their
+/// own: buckets of runs that already exist (they add no node), then new
+/// runs' buckets that free at least their node and whose frame fits the
+/// encoder's stage (freed before their run opens), then the other new runs'
+/// buckets that free at least their node, then the rest. The charge so stays
+/// within the window's pending check until only the runs' nodes, which main
+/// also required, are left. Write order between tiles is immaterial.
 fn seed_serial(
     buckets: &mut SpillBuckets,
     mut pending: SeedBuckets,
@@ -2367,13 +2367,8 @@ fn seed_serial(
     let bytes = |(shapes, credits): &(Vec<Shape>, Vec<Collapsed>)| {
         shape_capacity_bytes(shapes) + credits.capacity() * std::mem::size_of::<Collapsed>()
     };
-    let frees_a_node = |tiles: &std::collections::BTreeMap<u64, tempfile::TempPath>,
-                        key: u64,
-                        bucket: &(Vec<Shape>, Vec<Collapsed>)| {
-        tiles.contains_key(&key) || bytes(bucket) >= 512
-    };
     let mut waiting = pending_bytes;
-    for pass in 0..3 {
+    for pass in 0..4 {
         let mut after = None;
         loop {
             let tiles = &buckets.tiles;
@@ -2383,10 +2378,9 @@ fn seed_serial(
                     std::ops::Bound::Unbounded,
                 ))
                 .find(|&(&key, bucket)| match pass {
-                    0 => {
-                        frees_a_node(tiles, key, bucket) && frame_bytes(bucket) <= FRAME_STAGE_BYTES
-                    }
-                    1 => frees_a_node(tiles, key, bucket),
+                    0 => tiles.contains_key(&key),
+                    1 => bytes(bucket) >= 512 && frame_bytes(bucket) <= FRAME_STAGE_BYTES,
+                    2 => bytes(bucket) >= 512,
                     _ => true,
                 })
                 .map(|(&key, _)| key);
@@ -3688,6 +3682,28 @@ pub(super) mod tests {
         cost_probe::take();
         seed_serial(&mut buckets, pending, bytes).expect("the small bucket makes room");
         assert!(cost_probe::take().seed_serial_peak <= bytes);
+        assert_eq!(buckets.tiles.len(), 2);
+    }
+
+    /// #830 review: a bucket of a run that already exists adds no node, so
+    /// it is written before a new run's large bucket, which opens its run
+    /// before freeing anything.
+    #[test]
+    fn the_serial_seed_writes_existing_runs_first() {
+        let opts = super::super::ExportOptions::default();
+        let ring = |n: u32| -> Ring { (0..n).map(|i| [f64::from(i), 0.0]).collect() };
+        let mut buckets = SpillBuckets::new(&opts, usize::MAX);
+        buckets
+            .append(2, &mut vec![vec![ring(3)]], &mut vec![], 0)
+            .unwrap();
+        let mut pending = SeedBuckets::new();
+        pending.insert(1, (vec![vec![ring(600)]], Vec::new()));
+        pending.insert(2, (vec![vec![ring(600)]], Vec::new()));
+        let bytes: usize = pending.values().map(|(s, _)| shape_capacity_bytes(s)).sum();
+        buckets.budget = bytes + 512;
+        cost_probe::take();
+        seed_serial(&mut buckets, pending, bytes).expect("the existing run makes room");
+        assert!(cost_probe::take().seed_serial_peak <= bytes + 512);
         assert_eq!(buckets.tiles.len(), 2);
     }
 
