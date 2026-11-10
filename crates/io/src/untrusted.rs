@@ -907,6 +907,25 @@ fn projected_field(
     original.clone().with_data_type(target)
 }
 
+/// Whether `data_type` holds a dictionary with 8- or 16-bit keys.
+fn narrow_dictionary(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    match data_type {
+        DataType::Dictionary(key, value) => {
+            matches!(
+                key.as_ref(),
+                DataType::Int8 | DataType::UInt8 | DataType::Int16 | DataType::UInt16
+            ) || narrow_dictionary(value)
+        }
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => narrow_dictionary(f.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| narrow_dictionary(f.data_type())),
+        _ => false,
+    }
+}
+
 fn wide_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
     use arrow_schema::DataType;
     match data_type {
@@ -1535,6 +1554,18 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
                 .collect::<Result<Vec<_>, _>>()?,
             original.metadata().clone(),
         ));
+        // A joined batch can hold more distinct values than a narrow
+        // dictionary key indexes, which the cast back refuses (#857). Such a
+        // schema keeps batches of the decoded size, as before #848.
+        let join_rows = if schema
+            .fields()
+            .iter()
+            .any(|f| narrow_dictionary(f.data_type()))
+        {
+            rows
+        } else {
+            join_rows
+        };
         Ok(UntrustedBatchReader {
             inner,
             page_eof,
@@ -2103,6 +2134,60 @@ mod tests {
         assert_eq!(sizes[..3], [1, 1, 1]);
         let joined = *sizes.iter().max().unwrap();
         assert!(joined > 64 && joined < 1_000, "{sizes:?}");
+    }
+
+    /// #848 review (#857): row groups of 100 rows with disjoint
+    /// `Dictionary(Int8, Utf8)` values, and lists heavy enough to decode one
+    /// row at a time. Joined, a batch would span groups and overflow the
+    /// Int8 key on the cast back; a narrow-key schema is not joined past its
+    /// decode size.
+    #[test]
+    fn narrow_dictionaries_are_not_joined_past_their_key() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        use arrow_array::types::Int8Type;
+        use arrow_array::{ArrayRef, DictionaryArray};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        let file = tempfile::tempfile().unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let mut writer = None;
+        for group in 0..13_i64 {
+            let names: Vec<String> = (0..100).map(|i| format!("v{}", group * 100 + i)).collect();
+            let names: DictionaryArray<Int8Type> = names.iter().map(String::as_str).collect();
+            let mut lists = ListBuilder::new(Int64Builder::new());
+            for _ in 0..100 {
+                lists.values().append_slice(&vec![group; 8_000]);
+                lists.append(true);
+            }
+            let batch = RecordBatch::try_from_iter([
+                ("name", Arc::new(names) as ArrayRef),
+                ("lists", Arc::new(lists.finish()) as ArrayRef),
+            ])
+            .unwrap();
+            let writer = writer.get_or_insert_with(|| {
+                ArrowWriter::try_new(
+                    file.try_clone().unwrap(),
+                    batch.schema(),
+                    Some(props.clone()),
+                )
+                .unwrap()
+            });
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.unwrap().close().unwrap();
+        let source = open_parquet(file).unwrap();
+        let limit = byte_array_limit();
+        let (decode, join) = batch_plan(source.metadata(), None, None, DEFAULT_BATCH_ROWS, limit);
+        assert!(decode < 100 && join > 256, "({decode}, {join})");
+        let rows: usize = source
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum();
+        assert_eq!(rows, 1_300);
     }
 
     #[test]
