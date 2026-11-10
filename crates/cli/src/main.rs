@@ -49,11 +49,13 @@ fn release_retained() {
     not(feature = "dhat-heap")
 ))]
 fn configure_allocator() {
-    /// `mi_option_allow_thp` in mimalloc v3's `mi_option_e` (mimalloc.h);
-    /// libmimalloc-sys 0.1 exports no constant for it.
-    const MI_OPTION_ALLOW_THP: libmimalloc_sys::mi_option_t = 43;
-    // SAFETY: sets one mimalloc option; no pointers are involved.
-    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_ALLOW_THP, 0) };
+    use tylertoo_core::internal::alloc_release::mimalloc_allow_thp_option;
+    // SAFETY: mi_version and mi_option_set take no pointers.
+    unsafe {
+        if let Some(option) = mimalloc_allow_thp_option(libmimalloc_sys::mi_version()) {
+            libmimalloc_sys::mi_option_set(option, 0);
+        }
+    }
     tylertoo_core::internal::alloc_release::set_release_hook(release_retained);
 }
 
@@ -85,6 +87,20 @@ fn main() -> std::process::ExitCode {
 mod allocator_default {
     #[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
     const _: &mimalloc::MiMalloc = &super::GLOBAL;
+
+    /// #828: the linked mimalloc is one whose THP option index is known,
+    /// so the THP-off setting is not skipped.
+    #[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
+    #[test]
+    fn bundled_mimalloc_has_a_known_thp_option() {
+        // SAFETY: mi_version takes no arguments.
+        let version = unsafe { libmimalloc_sys::mi_version() };
+        assert_eq!(
+            tylertoo_core::internal::alloc_release::mimalloc_allow_thp_option(version),
+            Some(43),
+            "mimalloc {version}"
+        );
+    }
 
     #[test]
     fn mimalloc_is_a_default_feature() {

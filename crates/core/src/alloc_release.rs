@@ -17,8 +17,39 @@ pub fn set_release_hook(hook: fn()) {
     let _ = HOOK.set(hook);
 }
 
+/// `mi_option_allow_thp`'s index in mimalloc v3's `mi_option_e`
+/// (mimalloc.h). libmimalloc-sys exports no constant for it, and v2 has it
+/// at 37, so it is only trusted for the v3 line.
+const MI3_OPTION_ALLOW_THP: i32 = 43;
+
+/// A `mi_version()` whose THP option was left alone, for one debug line
+/// once logging is up (the binary configures its allocator before that).
+static THP_SKIPPED: std::sync::Mutex<Option<i32>> = std::sync::Mutex::new(None);
+
+/// The `mi_option_t` that turns off transparent huge pages, if known.
+///
+/// `version` is `mi_version()` (major * 10000 + minor * 100 + patch).
+/// `None` when the index is not known for that version: a wrong index
+/// would silently set some other option.
+pub fn mimalloc_allow_thp_option(version: i32) -> Option<i32> {
+    let known = version / 10_000 == 3;
+    if !known {
+        *THP_SKIPPED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(version);
+    }
+    known.then_some(MI3_OPTION_ALLOW_THP)
+}
+
 /// Run the release hook on every rayon pool thread and on this one.
 pub(crate) fn release_retained() {
+    let skipped = THP_SKIPPED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(version) = skipped {
+        log::debug!("mimalloc {version} is not v3: transparent huge pages left as configured");
+    }
     if let Some(&hook) = HOOK.get() {
         rayon::broadcast(|_| hook());
         hook();
@@ -37,6 +68,14 @@ mod tests {
 
     fn count() {
         CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn thp_option_only_for_mimalloc_3() {
+        assert_eq!(super::mimalloc_allow_thp_option(30302), Some(43));
+        assert_eq!(super::mimalloc_allow_thp_option(30000), Some(43));
+        assert_eq!(super::mimalloc_allow_thp_option(20302), None);
+        assert_eq!(super::mimalloc_allow_thp_option(40000), None);
     }
 
     #[test]

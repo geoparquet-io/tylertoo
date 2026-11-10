@@ -565,11 +565,13 @@ fn release_retained() {
     not(feature = "dhat-heap")
 ))]
 fn configure_allocator() {
-    /// `mi_option_allow_thp` in mimalloc v3's `mi_option_e` (mimalloc.h);
-    /// libmimalloc-sys 0.1 exports no constant for it.
-    const MI_OPTION_ALLOW_THP: libmimalloc_sys::mi_option_t = 43;
-    // SAFETY: sets one mimalloc option; no pointers are involved.
-    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_ALLOW_THP, 0) };
+    use tylertoo_core::internal::alloc_release::mimalloc_allow_thp_option;
+    // SAFETY: mi_version and mi_option_set take no pointers.
+    unsafe {
+        if let Some(option) = mimalloc_allow_thp_option(libmimalloc_sys::mi_version()) {
+            libmimalloc_sys::mi_option_set(option, 0);
+        }
+    }
     tylertoo_core::internal::alloc_release::set_release_hook(release_retained);
 }
 
