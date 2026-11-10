@@ -497,6 +497,12 @@ const RSS_PER_PRICED_BYTE: u64 = 2;
 /// the first batch under 64 threads, 168 MB under 8.
 const THREAD_HEAP_BYTES: u64 = 5 << 20;
 
+/// What the pool's allocator heaps hold while `threads` aggregate batches
+/// of `batch_rows` rows: one [`THREAD_HEAP_BYTES`] per thread with a chunk.
+fn thread_heap_bytes(batch_rows: usize, threads: usize) -> u64 {
+    batch_rows.div_ceil(CHUNK_ROWS).min(threads) as u64 * THREAD_HEAP_BYTES
+}
+
 /// Heap bytes of a cell's first category count: a `Vec` grows from empty to
 /// four `(u32, i64)` slots.
 const FIRST_COUNTS_BYTES: u64 = 4 * std::mem::size_of::<(u32, i64)>() as u64;
@@ -642,8 +648,8 @@ fn aggregate(
     // Every reader's queue, plus the batch being aggregated.
     let read_ahead = grant_read_ahead(&mut budget, tuning, 1);
     // Checked before the readers start, so a budget too small for the pool
-    // fails here.
-    let threads = rayon::current_num_threads() as u64 * THREAD_HEAP_BYTES;
+    // fails here. Only as many threads work as a batch has chunks.
+    let threads = thread_heap_bytes(tuning.batch_size, rayon::current_num_threads());
     budget.require_allowance(read.profile, MemoryPhase::Scan, threads)?;
     let mut cells = Cells::new();
     let mut interner = GroupInterner::default();
@@ -1304,5 +1310,14 @@ mod tests {
             grown - still >= 2 * cap0 * cell_bytes(0),
             "{still} -> {grown}"
         );
+    }
+
+    /// A small input is priced for the threads it can keep busy, not the
+    /// whole pool.
+    #[test]
+    fn thread_heaps_follow_the_chunks() {
+        assert_eq!(thread_heap_bytes(1, 64), THREAD_HEAP_BYTES);
+        assert_eq!(thread_heap_bytes(3 * CHUNK_ROWS, 64), 3 * THREAD_HEAP_BYTES);
+        assert_eq!(thread_heap_bytes(READ_ROWS, 8), 8 * THREAD_HEAP_BYTES);
     }
 }
