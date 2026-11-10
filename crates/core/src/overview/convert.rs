@@ -6470,13 +6470,24 @@ impl GroupInterner {
     /// Non-string columns intern every row as [`Self::NULL_GROUP`] (callers
     /// only pass validated class-ranking columns, which are strings).
     pub(super) fn extend(&mut self, col: &dyn Array, out: &mut Vec<u32>) {
+        self.extend_kept(col, None, out);
+    }
+
+    /// [`Self::extend`], but rows whose `kept` entry is false map to
+    /// [`Self::NULL_GROUP`] without interning their value.
+    pub(super) fn extend_kept(
+        &mut self,
+        col: &dyn Array,
+        kept: Option<&[bool]>,
+        out: &mut Vec<u32>,
+    ) {
         use arrow_array::cast::AsArray;
 
         macro_rules! intern {
             ($arr:expr) => {{
                 let a = $arr;
                 for i in 0..a.len() {
-                    if a.is_null(i) {
+                    if a.is_null(i) || kept.is_some_and(|k| !k[i]) {
                         out.push(Self::NULL_GROUP);
                     } else {
                         // Look up first: only a value seen for the first

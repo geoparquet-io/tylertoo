@@ -98,7 +98,9 @@ struct Pass1Keys<'a> {
     ladder_values: &'a mut Vec<Option<f64>>,
     /// `--cluster-categories` (#827).
     category: Option<&'a mut RowCategories>,
-    budget: &'a MemoryBudget,
+    /// The budget the category interner is charged to, and the feature
+    /// table's bytes already resident.
+    budget: (&'a MemoryBudget, u64),
 }
 
 struct Pass1Accum<'a> {
@@ -5079,14 +5081,16 @@ impl RowCategories {
         }
     }
 
-    /// Fail with `BudgetExceeded` once the interned values and per-row ids
-    /// outgrow the memory budget: a high-cardinality column would otherwise
-    /// grow until the process is OOM-killed.
-    // shortcut: checked against the whole budget, not net of the feature
-    // table, so a run can still reach ~2x the budget; net it out if that bites.
-    fn require_fits(&self, budget: &MemoryBudget) -> Result<(), ConvertError> {
+    /// Fail with `BudgetExceeded` once the interned values and per-row ids,
+    /// on top of the `resident` scan state (the feature table), outgrow the
+    /// memory budget: a high-cardinality column would otherwise grow until
+    /// the process is OOM-killed.
+    fn require_fits(&self, budget: &MemoryBudget, resident: u64) -> Result<(), ConvertError> {
         let row_bytes = (self.rows.len() * std::mem::size_of::<u32>()) as u64;
-        budget.require(MemoryPhase::Scan, self.values.heap_bytes() + row_bytes)
+        budget.require(
+            MemoryPhase::Scan,
+            resident + self.values.heap_bytes() + row_bytes,
+        )
     }
 }
 
@@ -5810,9 +5814,12 @@ fn extract_pass1_batch_keys(
         acc_values[s].extend(extract_numeric_values(batch.column(proj(idx)).as_ref()));
     }
     if let Some(c) = category {
-        c.values
-            .extend(batch.column(proj(c.col)).as_ref(), &mut c.rows);
-        c.require_fits(budget)?;
+        c.values.extend_kept(
+            batch.column(proj(c.col)).as_ref(),
+            Some(kept_row),
+            &mut c.rows,
+        );
+        c.require_fits(budget.0, budget.1)?;
     }
 
     // Entry-zoom ladder (#364): row-indexed, like the ranking keys above, but
@@ -6280,7 +6287,7 @@ fn run_pass1_with_chunk_rows(
                         acc_values: &mut acc_values,
                         ladder_values: &mut ladder_values,
                         category: category.as_mut(),
-                        budget: ctx.budget,
+                        budget: (ctx.budget, features.heap_bytes()),
                     },
                 )?;
                 Pass1Timers::add(&timers_ref.keys, t_keys);
@@ -10841,9 +10848,12 @@ mod tests {
         let mut cats = RowCategories::new(0);
         cats.values.extend(&col, &mut cats.rows);
 
-        cats.require_fits(&MemoryBudget::with_available(Some(1 << 30)))
-            .expect("1000 short values fit 1 GiB");
-        match cats.require_fits(&MemoryBudget::with_available(Some(1000))) {
+        let budget = MemoryBudget::with_available(Some(100_000));
+        cats.require_fits(&budget, 0)
+            .expect("1000 short values fit 100 kB");
+        // The resident feature table counts against the same budget.
+        assert!(cats.require_fits(&budget, 50_000).is_err());
+        match cats.require_fits(&MemoryBudget::with_available(Some(1000)), 0) {
             Err(ConvertError::BudgetExceeded {
                 phase: "pass-1 scan",
                 needed,
@@ -10853,5 +10863,12 @@ mod tests {
             }
             other => panic!("expected BudgetExceeded, got {other:?}"),
         }
+
+        // Rejected rows keep their row slot but intern nothing.
+        let mut kept = RowCategories::new(0);
+        let mask: Vec<bool> = (0..1000).map(|i| i == 0).collect();
+        kept.values.extend_kept(&col, Some(&mask), &mut kept.rows);
+        assert_eq!(kept.rows.len(), 1000);
+        assert_eq!(kept.values.into_values(), ["value-0000"]);
     }
 }
