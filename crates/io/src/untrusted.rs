@@ -870,6 +870,7 @@ pub fn concat_prefix_rows<'a>(
 /// same in any batch, and in the decoded views a reader holds as in the
 /// input's own types after the cast back. Both the cut
 /// ([`concat_prefix_rows`]) and the refusal of an oversized row use it.
+/// [`null_bytes`] repeats these per-value costs and must change with them.
 fn rows_bytes(array: &dyn arrow_array::Array, start: usize, end: usize) -> u64 {
     use arrow_array::cast::AsArray;
     use arrow_schema::DataType;
@@ -1104,13 +1105,7 @@ fn listed_dictionary(data_type: &arrow_schema::DataType) -> bool {
 
 /// Whether `data_type` holds a dictionary with 8- or 16-bit keys anywhere.
 fn narrow_dictionary(data_type: &arrow_schema::DataType) -> bool {
-    use arrow_schema::DataType;
-    match data_type {
-        DataType::List(f) | DataType::LargeList(f) | DataType::Map(f, _) => {
-            narrow_dictionary(f.data_type())
-        }
-        other => dictionary_capacity(other).is_some() || listed_dictionary(other),
-    }
+    dictionary_capacity(data_type).is_some() || listed_dictionary(data_type)
 }
 
 fn wide_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
@@ -2221,6 +2216,8 @@ mod tests {
     #[test]
     fn decoded_batches_join_within_the_byte_bound() {
         use arrow_array::builder::{Int64Builder, ListBuilder};
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
         use arrow_array::ArrayRef;
         use parquet::arrow::ArrowWriter;
         let n = 2_000;
@@ -2247,7 +2244,7 @@ mod tests {
             .unwrap();
         let limit = 100_000;
         let mut carry = None;
-        let mut sizes = Vec::new();
+        let (mut sizes, mut firsts) = (Vec::new(), Vec::new());
         while let Some(batch) = join_decoded(&mut inner, &mut carry, 1_000, limit) {
             let (batch, _) = batch.unwrap();
             let cost: u64 = batch
@@ -2260,7 +2257,13 @@ mod tests {
                 assert!(carry.is_none(), "decoded past an oversized row");
             }
             sizes.push(batch.num_rows());
+            let lists = batch.column(0).as_list::<i32>();
+            firsts.extend(
+                (0..batch.num_rows()).map(|r| lists.value(r).as_primitive::<Int64Type>().value(0)),
+            );
         }
+        // Rows keep their order across the joined 64-piece chunks.
+        assert_eq!(firsts, (0..n).collect::<Vec<_>>());
         assert_eq!(sizes.iter().sum::<usize>(), n as usize);
         assert_eq!(sizes[..3], [1, 1, 1]);
         let joined = *sizes.iter().max().unwrap();
