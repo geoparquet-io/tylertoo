@@ -116,7 +116,8 @@ enum Command {
     /// ancestor, so variable-depth archives (`--generate-variable-depth-tile-pyramid`)
     /// show holes below stopped tiles; `serve` warns when it opens one.
     ///
-    /// An archive rewritten on disk is reopened on the next request for it.
+    /// An archive rewritten on disk is reopened on the next request for it;
+    /// if it does not reopen, requests for it return HTTP 503 until it does.
     Serve(ServeArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///

@@ -500,7 +500,7 @@ Print the server URL and block until Ctrl-C, which raises `KeyboardInterrupt`. T
 
 `serve` returns HTTP 204 for missing tiles without scaling up a stored ancestor, so variable-depth archives (`variable_depth=True`) show holes below stopped tiles; `serve` warns when it opens one.
 
-An archive rewritten on disk is reopened on the next request for it.
+An archive rewritten on disk is reopened on the next request for it; if it does not reopen, requests for it return HTTP 503 until it does.
 
 ### Parameters
 
@@ -514,8 +514,8 @@ An archive rewritten on disk is reopened on the next request for it.
 
 ### Raises
 
-* `ConfigError`: An unknown keyword or a bad option value.
-* `RuntimeError`: An archive could not be opened, file stems repeat, the address could not be bound, or the listening socket failed.
+* `ConfigError`: An unknown keyword, a bad option value, an empty archive list, a path without a UTF-8 file stem, repeated file stems, or an archive named `index`.
+* `RuntimeError`: An archive could not be opened, the address could not be bound, or the listening socket failed.
 * `KeyboardInterrupt`: Ctrl-C stops the server.
 
 ### Example
