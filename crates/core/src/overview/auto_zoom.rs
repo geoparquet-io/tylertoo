@@ -522,8 +522,8 @@ impl BboxAcc {
 /// The bbox of each row in `rows` (batch-local indices), read through the
 /// typed GeoArrow scalar without converting it to a `geo::Geometry`. `None`
 /// for a null, empty or non-finite geometry.
-struct SampledBboxes<'r> {
-    rows: &'r [usize],
+pub(super) struct SampledBboxes<'r> {
+    pub(super) rows: &'r [usize],
 }
 
 impl GeoArrowVisitor for SampledBboxes<'_> {

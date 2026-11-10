@@ -356,8 +356,9 @@ tylertoo tiles fields.parquet fields.pmtiles --layer-column year
   included.
 - The column decides the layer and is not written as a property. A knob
   that reads it per feature (`--sort-key`, `--feature-order`, `--feature-id`,
-  and the like) is refused. `--filter` runs once, before the split, so it
-  may read the column.
+  and the like) is refused. `--filter` and `--bbox` run once, before the
+  split, so the filter may read the column and the 64-layer limit counts
+  only the values they keep.
 - tylertoo reads the input once and splits its rows into one temporary
   GeoParquet file per layer, in the intermediate overview's directory
   (`--spill-dir`, then `$TMPDIR`, then the output's directory). Expect

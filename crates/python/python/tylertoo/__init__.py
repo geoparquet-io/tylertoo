@@ -408,8 +408,8 @@ Attributes:
     layers: One report per layer that has tiles, by layer name.
     empty_layers: Layers whose features all generalized or filtered
         away, left out of the archive.
-    filtered_rows: Input rows `filter` dropped before the split, in
-        no layer.
+    filtered_rows: Input rows `filter` or `bbox` dropped before the
+        split, in no layer.
     total_tiles: Distinct tiles in the merged archive.
     diagnostics: The merge's own diagnostics."""
 

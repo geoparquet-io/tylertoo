@@ -143,7 +143,8 @@ pub struct LayeredReport {
     /// Layers whose features all generalized or filtered away, with no
     /// tiles to merge.
     pub empty_layers: Vec<String>,
-    /// Input rows `--filter` dropped before the split, in no layer.
+    /// Input rows `--filter` or `--bbox` dropped before the split, in no
+    /// layer.
     pub filtered_rows: u64,
     /// Distinct tiles in the merged archive.
     pub total_tiles: usize,
@@ -257,9 +258,11 @@ struct Staged {
     rows: u64,
 }
 
-/// Read `source` once and write each layer's rows that `filter` keeps,
-/// every column included, to its own GeoParquet file in `dir`. Layers come
-/// back in name order, with the number of rows the filter dropped.
+/// Read `source` once and write each layer's rows that the filter and the
+/// bbox keep, every column included, to its own GeoParquet file in `dir`.
+/// Layers come back in name order, with the number of rows the two dropped.
+/// A row whose geometry has no envelope (null, empty) is kept, for its
+/// layer to account for.
 ///
 /// Every writer's buffered row group counts against the staging memory
 /// budget ([`crate::input::unbudgeted_stage_admission`]); past it, the
@@ -268,7 +271,10 @@ fn split(
     source: &ConvertSource,
     schema: &SchemaRef,
     idx: usize,
-    filter: Option<&super::filter::BoundFilter>,
+    (filter, bbox): (
+        Option<&super::filter::BoundFilter>,
+        Option<&super::convert::BboxQuery>,
+    ),
     dir: &Path,
     batch_size: usize,
 ) -> Result<(Vec<Staged>, u64), LayerColumnError> {
@@ -282,12 +288,27 @@ fn split(
         message: e.to_string(),
     };
 
+    // The bbox's geometry column, restated in the staged schema.
+    let geom = match bbox {
+        Some(_) => source
+            .resolved_schema()?
+            .geometry_name()
+            .and_then(|name| schema.index_of(name).ok()),
+        None => None,
+    };
+    let row_groups = bbox
+        .map(|q| source.select_row_groups_any(q.boxes()))
+        .transpose()?;
+
     let mut layers: BTreeMap<String, StagedWriter> = BTreeMap::new();
-    let mut filtered = 0u64;
+    // The rows of the row groups the bbox prunes count as dropped too.
+    let pruned =
+        source.selected_row_count(None)? - source.selected_row_count(row_groups.as_ref())?;
+    let mut filtered = u64::try_from(pruned).unwrap_or(0);
     let stream = source.open_stream(&ReadPlan {
         batch_size,
         projection: None,
-        row_groups: None,
+        row_groups: row_groups.as_ref(),
     })?;
     for batch in stream {
         let batch = batch?;
@@ -296,6 +317,12 @@ fn split(
         let batch = RecordBatch::try_new(Arc::clone(schema), batch.columns().to_vec())
             .map_err(|e| stage_err(column, &e))?;
         let keep = filter.map(|f| f.eval_mask(&batch, &|i| i));
+        let outside = match (bbox, geom) {
+            (Some(query), Some(g)) => {
+                outside_bbox(&batch, g, query).map_err(|e| stage_err(column, &e))?
+            }
+            _ => Vec::new(),
+        };
         let values = arrow_cast::cast(batch.column(idx), &DataType::Utf8)
             .map_err(|e| stage_err(column, &e))?;
         let values = values
@@ -305,7 +332,7 @@ fn split(
         let mut rows: BTreeMap<&str, Vec<u32>> = BTreeMap::new();
         for i in 0..values.len() {
             // SQL semantics: a row the filter cannot decide is dropped.
-            if keep.as_ref().is_some_and(|k| k[i] != Some(true)) {
+            if keep.as_ref().is_some_and(|k| k[i] != Some(true)) || outside.get(i) == Some(&true) {
                 filtered += 1;
                 continue;
             }
@@ -375,16 +402,40 @@ fn routing_column(schema: &arrow_schema::Schema, column: &str) -> Result<usize, 
     Ok(idx)
 }
 
+/// Per row of `batch`, whether its geometry (column `geom`) has an envelope
+/// that misses `query`: what convert drops as outside `--bbox`.
+fn outside_bbox(
+    batch: &RecordBatch,
+    geom: usize,
+    query: &super::convert::BboxQuery,
+) -> crate::Result<Vec<bool>> {
+    let rows: Vec<usize> = (0..batch.num_rows()).collect();
+    let field = batch.schema_ref().field(geom).clone();
+    let array = geoarrow::array::from_arrow_array(batch.column(geom).as_ref(), &field)
+        .map_err(|e| crate::GeoParquetReadError::decode("--layer-column bbox", e))?;
+    let envelopes = crate::batch_processor::visit_geoarrow_array(
+        array.as_ref(),
+        super::auto_zoom::SampledBboxes { rows: &rows },
+    )?;
+    Ok(envelopes
+        .iter()
+        .map(|b| b.is_some_and(|b| !query.intersects(&b)))
+        .collect())
+}
+
 /// The footer metadata of every staged file, so that it reads like the
 /// input: the input's own (the `geo` block above all), less the writer's
 /// Arrow schema and the input's schema descriptor, which a property
 /// selection makes stale (the reader derives one when it is absent).
 ///
-/// A CRS that only a native `GEOMETRY` type declares is restated in a `geo`
-/// block, since the staging writer cannot emit that type. Its identifier is
-/// copied verbatim: the reader parses a `geo` string `crs` the way it parses
-/// the native one, so the layers resolve, or refuse, the same CRS.
+/// A CRS that only a native `GEOMETRY` type declares (no `geo` key, or one
+/// without the geometry column) is restated in the `geo` block, since the
+/// staging writer cannot emit that type. Its identifier is copied verbatim:
+/// the reader parses a `geo` string `crs` the way it parses the native one,
+/// so the layers resolve, or refuse, the same CRS.
 fn staged_metadata(source: &ConvertSource) -> Result<Vec<tylertoo_io::KeyValue>, InputError> {
+    use serde_json::{json, Value};
+
     let mut metadata: Vec<_> = source
         .key_value_metadata()?
         .unwrap_or_default()
@@ -395,22 +446,36 @@ fn staged_metadata(source: &ConvertSource) -> Result<Vec<tylertoo_io::KeyValue>,
         .collect();
     let resolved = source.resolved_schema()?;
     let crs = resolved.crs_info();
-    let declared_natively =
-        !crs.assumed_wgs84 && !metadata.iter().any(|kv| kv.key.eq_ignore_ascii_case("geo"));
-    if let (true, Some(name)) = (declared_natively, resolved.geometry_name()) {
-        let mut column = serde_json::json!({ "encoding": "WKB", "geometry_types": [] });
-        if let Some(id) = &crs.identifier {
-            column["crs"] = id.as_str().into();
-        }
-        let geo = serde_json::json!({
-            "version": "1.1.0",
-            "primary_column": name,
-            "columns": { name: column },
-        });
-        metadata.push(tylertoo_io::KeyValue::new(
-            "geo".to_string(),
-            geo.to_string(),
-        ));
+    let Some(name) = resolved.geometry_name().filter(|_| !crs.assumed_wgs84) else {
+        return Ok(metadata);
+    };
+    let at = metadata
+        .iter()
+        .position(|kv| kv.key.eq_ignore_ascii_case("geo"));
+    let mut geo = match at.map(|i| metadata[i].value.as_deref().map(serde_json::from_str)) {
+        None => json!({ "version": "1.1.0" }),
+        Some(Some(Ok(geo @ Value::Object(_)))) => geo,
+        // Unreadable: the input's own read settled what it means.
+        Some(_) => return Ok(metadata),
+    };
+    if geo.get("columns").and_then(|c| c.get(name)).is_some() {
+        return Ok(metadata);
+    }
+    if !geo.get("columns").is_some_and(Value::is_object) {
+        geo["columns"] = json!({});
+    }
+    let mut column = json!({ "encoding": "WKB", "geometry_types": [] });
+    if let Some(id) = &crs.identifier {
+        column["crs"] = id.as_str().into();
+    }
+    geo["columns"][name] = column;
+    if geo.get("primary_column").is_none() {
+        geo["primary_column"] = name.into();
+    }
+    let geo = tylertoo_io::KeyValue::new("geo".to_string(), geo.to_string());
+    match at {
+        Some(i) => metadata[i] = geo,
+        None => metadata.push(geo),
     }
     Ok(metadata)
 }
@@ -501,12 +566,23 @@ pub(super) fn convert_by_layer(
     let filter = super::convert::bind_attribute_filter(&options.convert, &schema, &[])
         .map_err(TilesError::Convert)?;
 
+    // `--bbox` too, so the layer limit counts only the rows it keeps. The
+    // layers keep it, which re-tests rows that all pass.
+    let crs = source
+        .resolved_schema()
+        .map_err(|e| TilesError::Convert(e.into()))?
+        .crs();
+    let bbox = convert
+        .bbox
+        .zip(crs)
+        .map(|(b, crs)| super::convert::BboxQuery::new(&b, crs));
+
     let dir = super::tiles::intermediate_dir(options, output);
     let (staged, filtered_rows) = split(
         &source,
         &schema,
         idx,
-        filter.as_ref(),
+        (filter.as_ref(), bbox.as_ref()),
         &dir,
         options.convert.read_batch_size,
     )?;
@@ -892,6 +968,17 @@ mod tests {
             panic!("expected a layered outcome, got {outcome:?}");
         };
         assert_eq!(report.layers.len(), 1);
+
+        // And the layers `--bbox` keeps: v0..v4 lie at x = -30..-26.
+        let mut boxed = super::tests::options("crop");
+        boxed.convert.bbox = Some([-30.5, -1.0, -25.5, 1.0]);
+        let outcome = convert_to_pmtiles(&input, &dir.path().join("o.pmtiles"), &boxed).unwrap();
+        let TilesOutcome::Layered(report) = outcome else {
+            panic!("expected a layered outcome, got {outcome:?}");
+        };
+        let names: Vec<&str> = report.layers.iter().map(|l| l.layer.as_str()).collect();
+        assert_eq!(names, ["v0", "v1", "v2", "v3", "v4"]);
+        assert_eq!(report.filtered_rows, MAX_LAYERS as u64 + 1 - 5);
     }
 
     /// A property selection stages only what a layer can use: a filter may
@@ -922,15 +1009,15 @@ mod tests {
         }
     }
 
-    /// A GeoParquet 2.0 input: a native `GEOMETRY(crs)` column, no `geo`
-    /// key, and optionally a `tylertoo:resolved_schema` descriptor JSON.
+    /// A GeoParquet 2.0 input: a native `GEOMETRY(crs)` column and the
+    /// footer entries `metadata` (none: no `geo` key).
     /// Hand-assembled, since this workspace's `ArrowWriter` cannot emit the
     /// native type.
     fn write_native_input(
         path: &Path,
         crs: &str,
         rows: &[(f64, f64, &str)],
-        descriptor: Option<String>,
+        metadata: &[(&str, String)],
     ) {
         use arrow_array::{BinaryArray, RecordBatch, StringArray};
         use arrow_schema::{Field, Schema};
@@ -1006,17 +1093,18 @@ mod tests {
                 .unwrap();
         }
         row_group.close().unwrap();
-        if let Some(json) = descriptor {
+        for (key, value) in metadata {
             writer.append_key_value_metadata(tylertoo_io::KeyValue::new(
-                crate::resolved_schema::RESOLVED_SCHEMA_KEY.to_string(),
-                json,
+                key.to_string(),
+                value.clone(),
             ));
         }
         writer.close().unwrap();
     }
 
     /// A staged layer reads like its input: a CRS only the native type
-    /// declares survives staging, and the input's schema descriptor, which a
+    /// declares survives staging, whether the input has no `geo` key or one
+    /// without that column, and the input's schema descriptor, which a
     /// property selection makes stale, is not copied.
     #[test]
     fn staged_layers_keep_a_native_crs_and_drop_the_descriptor() {
@@ -1027,38 +1115,46 @@ mod tests {
             (1_113_194.9, 1_118_890.0, "soy"),
             (-2_226_389.8, 557_305.3, "corn"),
         ];
-        // Written twice: the descriptor describes the file as first written.
-        write_native_input(&input, "EPSG:3857", &rows, None);
-        let descriptor = TilesInput::Path(input.clone())
-            .source()
-            .unwrap()
-            .resolved_schema()
-            .unwrap()
-            .footer_json()
-            .unwrap();
-        write_native_input(&input, "EPSG:3857", &rows, Some(descriptor));
-        let out = dir.path().join("o.pmtiles");
-        let mut options = options("crop");
-        options.convert.properties.exclude_all = true;
-        let outcome = convert_to_pmtiles(&TilesInput::Path(input), &out, &options).unwrap();
-        let TilesOutcome::Layered(report) = outcome else {
-            panic!("expected a layered outcome, got {outcome:?}");
-        };
-        assert!(report.empty_layers.is_empty(), "{report:?}");
-        for layer in &report.layers {
+        let no_column = r#"{"version":"2.0.0","columns":{}}"#.to_string();
+        for geo in [None, Some(no_column)] {
+            let geo: Vec<(&str, String)> = geo.into_iter().map(|g| ("geo", g)).collect();
+            // Written twice: the descriptor describes the file as first written.
+            write_native_input(&input, "EPSG:3857", &rows, &geo);
+            let descriptor = TilesInput::Path(input.clone())
+                .source()
+                .unwrap()
+                .resolved_schema()
+                .unwrap()
+                .footer_json()
+                .unwrap();
+            let mut metadata = geo.clone();
+            metadata.push((crate::resolved_schema::RESOLVED_SCHEMA_KEY, descriptor));
+            write_native_input(&input, "EPSG:3857", &rows, &metadata);
+
+            let out = dir.path().join("o.pmtiles");
+            let mut options = options("crop");
+            options.convert.properties.exclude_all = true;
+            let outcome =
+                convert_to_pmtiles(&TilesInput::Path(input.clone()), &out, &options).unwrap();
+            let TilesOutcome::Layered(report) = outcome else {
+                panic!("expected a layered outcome, got {outcome:?}");
+            };
+            assert!(report.empty_layers.is_empty(), "{geo:?}: {report:?}");
+            for layer in &report.layers {
+                assert!(
+                    !layer.report.convert.crs_assumed_wgs84,
+                    "{geo:?}, {}: CRS assumed, not read",
+                    layer.layer
+                );
+            }
+            let at_z3 = layers_at(&out, 3);
+            assert_eq!(at_z3.keys().collect::<Vec<_>>(), ["corn", "soy"]);
+            // In metres read as degrees, both points would be off the map.
             assert!(
-                !layer.report.convert.crs_assumed_wgs84,
-                "{}: CRS assumed, not read",
-                layer.layer
+                at_z3.values().all(|features| features.len() == 1),
+                "{geo:?}: {at_z3:?}"
             );
         }
-        let at_z3 = layers_at(&out, 3);
-        assert_eq!(at_z3.keys().collect::<Vec<_>>(), ["corn", "soy"]);
-        // In metres read as degrees, both points would be off the map.
-        assert!(
-            at_z3.values().all(|features| features.len() == 1),
-            "{at_z3:?}"
-        );
     }
 
     #[test]

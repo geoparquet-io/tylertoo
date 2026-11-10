@@ -1216,7 +1216,7 @@ fn print_layered(report: &tylertoo_core::LayeredReport, input: &str, output: &st
     }
     if report.filtered_rows > 0 {
         say!(
-            "  {} rows dropped by --filter",
+            "  {} rows dropped by --filter or --bbox",
             format_number(report.filtered_rows)
         );
     }
