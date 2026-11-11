@@ -1457,7 +1457,12 @@ impl MultiSource {
                 offender: part.display_name(),
                 detail,
             };
-            validate_schema_shape(&metas[0].schema, &meta.schema).map_err(incompatible)?;
+            validate_schema_shape(
+                &metas[0].schema,
+                &meta.schema,
+                metas[0].resolved.geometry_name(),
+            )
+            .map_err(incompatible)?;
             if meta.resolved.geometry_name() != metas[0].resolved.geometry_name() {
                 return Err(incompatible(format!(
                     "primary geometry mismatch: {:?} versus {:?}",
@@ -1525,7 +1530,26 @@ impl MultiSource {
 /// order, and field (extension) metadata — everything except nullability,
 /// which the union schema absorbs. Returns a human-readable detail on the
 /// first difference.
-fn validate_schema_shape(first: &Schema, other: &Schema) -> Result<(), String> {
+/// `geometry`'s extension metadata may differ in its CRS: the CRS check
+/// below compares the parts' working CRSs, as each part is reprojected (#670).
+fn validate_schema_shape(
+    first: &Schema,
+    other: &Schema,
+    geometry: Option<&str>,
+) -> Result<(), String> {
+    let without_crs = |f: &Field| {
+        let mut md = f.metadata().clone();
+        if Some(f.name().as_str()) == geometry {
+            if let Some(v) = md.get_mut("ARROW:extension:metadata") {
+                if let Ok(serde_json::Value::Object(mut o)) = serde_json::from_str(v) {
+                    o.remove("crs");
+                    o.remove("crs_type");
+                    *v = serde_json::Value::Object(o).to_string();
+                }
+            }
+        }
+        md
+    };
     if first.fields().len() != other.fields().len() {
         return Err(format!(
             "column count differs: {} vs {} in the first partition",
@@ -1550,7 +1574,7 @@ fn validate_schema_shape(first: &Schema, other: &Schema) -> Result<(), String> {
                 f0.data_type()
             ));
         }
-        if f0.metadata() != fi.metadata() {
+        if without_crs(f0) != without_crs(fi) {
             return Err(format!(
                 "column {:?} carries different field (extension) metadata than \
                  the first partition ({}) — geometry encoding/CRS metadata must \
@@ -2238,6 +2262,30 @@ mod tests {
             }
             other => panic!("expected IncompatiblePartition, got {other:?}"),
         }
+    }
+
+    /// #670: parts whose geometry extension metadata differs only in its
+    /// CRS are compatible (each part is reprojected); other differences are not.
+    #[test]
+    fn geometry_crs_metadata_may_differ_between_parts() {
+        let schema = |meta: &str| {
+            let md = [
+                (
+                    "ARROW:extension:name".to_string(),
+                    "geoarrow.wkb".to_string(),
+                ),
+                ("ARROW:extension:metadata".to_string(), meta.to_string()),
+            ];
+            Schema::new(vec![
+                Field::new("geometry", DataType::Binary, true).with_metadata(md.into())
+            ])
+        };
+        let a = schema(r#"{"crs":"EPSG:28992","crs_type":"authority_code"}"#);
+        let b = schema(r#"{"crs":"EPSG:31370","crs_type":"authority_code"}"#);
+        let c = schema(r#"{"crs":"EPSG:31370","edges":"spherical"}"#);
+        assert!(validate_schema_shape(&a, &b, Some("geometry")).is_ok());
+        assert!(validate_schema_shape(&a, &b, None).is_err());
+        assert!(validate_schema_shape(&a, &c, Some("geometry")).is_err());
     }
 
     /// #708: a part that declares EPSG:4326 and a part that declares nothing

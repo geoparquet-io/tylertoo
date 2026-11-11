@@ -85,39 +85,70 @@ impl ToLonLat {
     /// A lon/lat box holding the image of a source-CRS box, for row-group
     /// pruning; `None` (keep the group) when the image crosses the
     /// antimeridian, holds a pole or leaves the projection's domain.
+    ///
+    /// Each edge is bisected until its image is straight to within ~1 cm, so
+    /// an extremum between samples is found; the box is padded by what is
+    /// left where the bisection stopped.
     pub(crate) fn bbox(&self, [xmin, ymin, xmax, ymax]: [f64; 4]) -> Option<[f64; 4]> {
-        const STEPS: usize = 32;
-        let mut out = [
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-        ];
-        for i in 0..=STEPS {
-            let t = i as f64 / STEPS as f64;
-            let (x, y) = (xmin + t * (xmax - xmin), ymin + t * (ymax - ymin));
-            for (px, py) in [(x, ymin), (x, ymax), (xmin, y), (xmax, y)] {
-                let (lon, lat) = self.point(px, py);
-                if !(lon.is_finite() && lat.is_finite()) {
-                    return None;
-                }
-                out = [
-                    out[0].min(lon),
-                    out[1].min(lat),
-                    out[2].max(lon),
-                    out[3].max(lat),
-                ];
-            }
+        let mut acc = Hull {
+            b: [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ],
+            slack: 0.0,
+        };
+        let corners = [(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)];
+        for k in 0..4 {
+            let (a, b) = (corners[k], corners[(k + 1) % 4]);
+            self.edge(
+                a,
+                self.point(a.0, a.1),
+                b,
+                self.point(b.0, b.1),
+                0,
+                &mut acc,
+            )?;
         }
-        if out[2] - out[0] > 180.0 {
+        let b = acc.b;
+        if b[2] - b[0] > 180.0 {
             return None;
         }
-        // The boundary is sampled, so pad for the curve between samples.
-        let (px, py) = (
-            (out[2] - out[0]) * 0.005 + 1e-9,
-            (out[3] - out[1]) * 0.005 + 1e-9,
-        );
-        Some([out[0] - px, out[1] - py, out[2] + px, out[3] + py])
+        let pad = acc.slack + 1e-9;
+        Some([b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad])
+    }
+
+    /// Add the image of the edge `a`..`b` (excluding `b`) to `acc`.
+    fn edge(
+        &self,
+        a: (f64, f64),
+        pa: (f64, f64),
+        b: (f64, f64),
+        pb: (f64, f64),
+        depth: u8,
+        acc: &mut Hull,
+    ) -> Option<()> {
+        if !(pa.0.is_finite() && pa.1.is_finite()) {
+            return None;
+        }
+        acc.b = [
+            acc.b[0].min(pa.0),
+            acc.b[1].min(pa.1),
+            acc.b[2].max(pa.0),
+            acc.b[3].max(pa.1),
+        ];
+        let m = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        let pm = self.point(m.0, m.1);
+        let off = (pm.0 - (pa.0 + pb.0) / 2.0)
+            .abs()
+            .max((pm.1 - (pa.1 + pb.1) / 2.0).abs());
+        if depth < 4 || (off > 1e-7 && depth < 12) || !off.is_finite() {
+            self.edge(a, pa, m, pm, depth + 1, acc)?;
+            return self.edge(m, pm, b, pb, depth + 1, acc);
+        }
+        acc.slack = acc.slack.max(2.0 * off);
+        Some(())
     }
 
     /// `batch` with its `column` geometries in lon/lat, in the same encoding.
@@ -247,6 +278,12 @@ impl ToLonLat {
         };
         d.into_builder().child_data(children).build()
     }
+}
+
+/// The bbox [`ToLonLat::bbox`] grows, and its padding.
+struct Hull {
+    b: [f64; 4],
+    slack: f64,
 }
 
 /// Walk one WKB geometry (ISO and EWKB flavours), recording where each

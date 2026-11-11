@@ -193,3 +193,32 @@ fn bbox_holds_the_image_and_refuses_a_pole() {
     // Antarctic polar stereographic around the pole.
     assert!(t("EPSG:3031").bbox([-1e5, -1e5, 1e5, 1e5]).is_none());
 }
+
+/// Every point of the box, on a fine grid, lands inside the pruning bbox.
+#[test]
+fn bbox_holds_every_interior_point() {
+    for (id, b) in [
+        (
+            "EPSG:3031",
+            [-312_500.0, 600_000.0, 19_687_500.0, 700_000.0],
+        ),
+        ("EPSG:3031", [-312_500.0, 600_000.0, 1_687_500.0, 700_000.0]),
+        ("EPSG:32633", [100_000.0, 0.0, 900_000.0, 9_000_000.0]),
+        ("EPSG:28992", [0.0, 300_000.0, 280_000.0, 620_000.0]),
+    ] {
+        let tr = t(id);
+        let Some(out) = tr.bbox(b) else { continue };
+        const N: usize = 400;
+        for i in 0..=N {
+            for j in 0..=N {
+                let x = b[0] + (b[2] - b[0]) * i as f64 / N as f64;
+                let y = b[1] + (b[3] - b[1]) * j as f64 / N as f64;
+                let (lon, lat) = tr.point(x, y);
+                assert!(
+                    out[0] <= lon && lon <= out[2] && out[1] <= lat && lat <= out[3],
+                    "{id} {b:?}: ({x}, {y}) -> ({lon}, {lat}) outside {out:?}"
+                );
+            }
+        }
+    }
+}
