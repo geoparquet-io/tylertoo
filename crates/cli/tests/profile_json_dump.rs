@@ -1367,13 +1367,13 @@ fn profile_json_reports_cascade_identical_steps() {
 }
 
 /// The CLI sizes the worker pool from core's `resolve_worker_threads`: the
-/// cores capped at 32 by default, an explicit `RAYON_NUM_THREADS` verbatim.
+/// cores capped at 40 by default, an explicit `RAYON_NUM_THREADS` verbatim.
 #[test]
 fn cli_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let threads = |env| run_tiles_with_profile(&fixture, "0", "2", env).2["threads"].as_u64();
-    assert_eq!(threads(None), Some(cores.min(32) as u64));
-    assert_eq!(threads(Some("40")), Some(40));
+    assert_eq!(threads(None), Some(cores.min(40) as u64));
+    assert_eq!(threads(Some("48")), Some(48));
 }
