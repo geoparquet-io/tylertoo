@@ -1,6 +1,7 @@
-//! A conversion in a custom pool must not need an idle global-pool worker,
-//! including when the writer fails. Own binary: the global pool is sized
-//! once per process, independently of the global-worker regression test.
+//! A conversion or a variable-depth export in a custom pool must not need an
+//! idle global-pool worker, including when the writer fails. Own binary: the
+//! global pool is sized once per process, independently of the global-worker
+//! regression test.
 
 use std::path::Path;
 use std::sync::mpsc;
@@ -23,7 +24,10 @@ fn global_pool() -> std::sync::MutexGuard<'static, ()> {
     // Plain cargo test shares a process; two tests must not each occupy
     // half the global pool while waiting for its other half to become busy.
     static TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let held = TEST.lock().expect("global-pool test lock");
+    // A test that panicked holding the lock must not fail the next one.
+    let held = TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         rayon::ThreadPoolBuilder::new()
