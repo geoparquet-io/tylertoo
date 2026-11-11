@@ -19,25 +19,23 @@ directory. The calculations below explain those limits.
 
 ### Measured peaks
 
-Benchmark results are pending. The arithmetic below is not a measurement.
-Run each input under both profiles with local spill disk and
-`TYLERTOO_PROFILE_JSON` enabled. Input features is `pass1.rows`.
-Peak RSS is the larger of conversion's `peak_rss_mib` and export's
-`export.peak_rss_mib` in the two JSON Lines (JSONL) records from `tiles`, converted from
-MiB to GiB. Pass-2 peak share is
-`100 × rss_sampler.phase_peaks_mib["pass2 (output sink)"] / peak RSS`,
-using MiB for both terms. This compares peaks without attributing memory
-to pass 2. The sampler polls every 250 ms and can miss short spikes.
-Fields of The World (FTW) supplies the Brazil MT input.
+Peak resident memory of `tylertoo tiles` on three inputs, measured with
+`/usr/bin/time -v` on a 64-core aarch64 host with 123 GB of RAM, each run
+inside a 24 GB cgroup (`systemd-run -p MemoryMax=24G`), median of three
+runs. Input features is the input's row count. These are measurements;
+the arithmetic below is not.
 
-| Input | Profile | Input features | Peak RSS (GiB) | Pass-2 peak share (%) | Host |
-| --- | --- | ---: | ---: | ---: | --- |
-| NZ parcels (z0–14) | `auto` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
-| NZ parcels (z0–14) | `bounded` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
-| FTW Brazil MT (z0–13) | `auto` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
-| FTW Brazil MT (z0–13) | `bounded` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
-| Overture segments full part (z0–14) | `auto` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
-| Overture segments full part (z0–14) | `bounded` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
+| Input | Profile | Input features | Peak RSS (GiB) |
+| --- | --- | ---: | ---: |
+| NZ parcels (z0–14) | `auto` | 4,343,547 | 7.7 |
+| NZ parcels (z0–14) | `bounded` | 4,343,547 | 2.5 |
+| Fields of The World (FTW) Brazil MT (z0–13) | `auto` | 4,579,024 | 6.5 |
+| FTW Brazil MT (z0–13) | `bounded` | 4,579,024 | 2.2 |
+| Overture segments, one full part (z0–14) | `auto` | 2,815,136 | 4.9 |
+| Overture segments, one full part (z0–14) | `bounded` | 2,815,136 | 2.5 |
+
+`auto` sizes itself to the memory it finds, so on a host with less memory
+its peak is lower; `bounded` stays near its floor.
 
 ### Budget and profiles
 

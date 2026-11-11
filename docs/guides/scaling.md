@@ -22,13 +22,12 @@ across machines. The coarse job still needs memory for the full input.
 
 ### How much memory
 
-Treat 32 GB with fast local spill disk as a starting point to evaluate for
-country-scale polygon builds, not a measured RAM requirement. Count features,
-vertices, properties, and emitted tiles before choosing RAM. A country
-boundary alone gives no memory bound. Use the
+Country-scale polygon builds of a few million features fit in 32 GB with
+fast local spill disk. On a 4.3 million parcel input, `--profile auto` peaked
+at 7.7 GiB and `--profile bounded` at 2.5 GiB. See the
 [measured peaks](https://github.com/geoparquet-io/tylertoo/blob/main/context/PROFILING.md#measured-peaks)
-table once filled to size comparable inputs. The Brazil run above is a
-historical example on a 54 GiB host, not a measurement on a 32 GB host.
+for more inputs. Features, vertices, properties, and emitted tiles all
+drive memory, so size from a comparable input, not from the area covered.
 
 Pass 1 keeps 33–42 bytes per retained feature before assignment workspace:
 300 million features need 9.9–12.6 GB for that table alone. At 1.58 billion features,
