@@ -437,6 +437,11 @@ fn quantize_ring(ring: &LineString, proj: &TileProjector) -> Option<TileRing> {
     }
     let first = out[0];
     out.push(first);
+    // A coarse zoom snaps most vertices together; the valve's
+    // `QuantizedPolygons` keeps every ring of the tile for all its passes.
+    if out.len() * 2 < out.capacity() {
+        out.shrink_to_fit();
+    }
     Some(out)
 }
 
@@ -4096,6 +4101,31 @@ mod tests {
     /// after the snap wherever it sits on the grid. A narrower one of side
     /// `s` survives at a fraction `s²` of grid offsets: the cleaner thins
     /// sub-unit squares, it does not drop them all.
+    /// A ring that snaps to a few tile units holds a few, not one slot per
+    /// source vertex: the merge valve keeps every quantized ring of a tile
+    /// for all its passes (dhat, par bounded: 440 MiB at the peak).
+    #[test]
+    fn a_collapsed_ring_holds_only_its_snapped_vertices() {
+        let proj = TileProjector::new(&unit_bounds(), 4096);
+        // 2,000 vertices on a 5-unit circle: a few dozen distinct units.
+        let ring = LineString::from(
+            (0..=2000)
+                .map(|i| {
+                    let t = f64::from(i) / 2000.0 * std::f64::consts::TAU;
+                    lnglat(100.0 + 5.0 * t.cos(), 100.0 + 5.0 * t.sin())
+                })
+                .collect::<Vec<_>>(),
+        );
+        let q = quantize_ring(&ring, &proj).unwrap();
+        assert!(q.len() < 100, "{} vertices", q.len());
+        assert!(
+            q.capacity() <= 2 * q.len(),
+            "capacity {} for {}",
+            q.capacity(),
+            q.len()
+        );
+    }
+
     #[test]
     fn a_square_of_the_minimum_side_survives_quantization() {
         // Squares placed in tile units, quantized by the production path.
