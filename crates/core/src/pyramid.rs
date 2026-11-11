@@ -1779,10 +1779,7 @@ fn parse_layers(
         })
         .unwrap_or_default();
     let chosen_id = chosen.and_then(|l| l.get("id")).and_then(Value::as_str);
-    let count = parsed["tilestats"]["layers"]
-        .as_array()
-        .and_then(|v| v.iter().find(|l| l["layer"].as_str() == chosen_id))
-        .and_then(|l| l["count"].as_u64());
+    let count = chosen_id.and_then(|id| tilestats_count(&parsed, id));
     Ok(ParsedLayers {
         fields,
         ids,
@@ -2945,6 +2942,39 @@ fn layer_stats(
         .collect()
 }
 
+/// A layer's `tilestats` feature count in an archive's metadata.
+pub(crate) fn tilestats_count(metadata: &Value, layer: &str) -> Option<u64> {
+    metadata["tilestats"]["layers"]
+        .as_array()?
+        .iter()
+        .find(|l| l["layer"].as_str() == Some(layer))?["count"]
+        .as_u64()
+}
+
+/// Write the merged `vector_layers` and `tilestats` of `layers`, for
+/// `pyramid` and `merge` alike.
+pub(crate) fn set_merged_layers(
+    writer: &mut StreamingPmtilesWriter,
+    layers: Vec<LayerMeta>,
+    skipped_total: usize,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
+    // Several bands may share a layer name (the aggregate bands do). Collapse
+    // them into one entry spanning their combined zooms, or a client sees the
+    // same layer declared twice with conflicting ranges.
+    let mut counts = std::collections::BTreeMap::<String, Option<u64>>::new();
+    for l in &layers {
+        let sum = counts.entry(l.id.clone()).or_insert(Some(0));
+        // Untrusted metadata: an overflowing sum writes no tilestats.
+        *sum = sum.zip(l.feature_count).and_then(|(a, b)| a.checked_add(b));
+    }
+    let vector_layers = vector_layers_json(layers, diagnostics);
+    if let Some(stats) = layer_stats(&vector_layers, &counts, skipped_total) {
+        writer.set_layer_stats(stats);
+    }
+    writer.set_vector_layers_json(vector_layers.to_string());
+}
+
 /// The tail shared by both merge paths: bounds, `vector_layers`, finalize.
 fn finish_merge(
     mut writer: StreamingPmtilesWriter,
@@ -2965,20 +2995,7 @@ fn finish_merge(
         ),
     }
 
-    // Several bands may share a layer name (the aggregate bands do). Collapse
-    // them into one entry spanning their combined zooms, or a client sees the
-    // same layer declared twice with conflicting ranges.
-    let mut counts = std::collections::BTreeMap::<String, Option<u64>>::new();
-    for l in &layers {
-        let sum = counts.entry(l.id.clone()).or_insert(Some(0));
-        // Untrusted metadata: an overflowing sum writes no tilestats.
-        *sum = sum.zip(l.feature_count).and_then(|(a, b)| a.checked_add(b));
-    }
-    let vector_layers = vector_layers_json(layers, diagnostics);
-    if let Some(stats) = layer_stats(&vector_layers, &counts, tally.skipped_total) {
-        writer.set_layer_stats(stats);
-    }
-    writer.set_vector_layers_json(vector_layers.to_string());
+    set_merged_layers(&mut writer, layers, tally.skipped_total, diagnostics);
     writer.finalize(output).map_err(|e| Error::at(output, e))?;
 
     let sink = diagnostics;

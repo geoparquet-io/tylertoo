@@ -61,7 +61,7 @@ use crate::compression::Compression;
 use crate::dedup::TileHasher;
 use crate::pmtiles_metadata::{MetadataCollector, Resolved};
 use crate::pmtiles_writer::{tile_id_to_zxy, StreamingPmtilesWriter, TileType, WriteError};
-use crate::pyramid::{declared_zoom_range, layer_zoom_range, vector_layers_json, LayerMeta};
+use crate::pyramid::{declared_zoom_range, layer_zoom_range, set_merged_layers, LayerMeta};
 use crate::tile::TileBounds;
 use crate::{Error, InvalidConfigError, Result, TilesetMetadata};
 
@@ -217,6 +217,7 @@ pub fn merge_shards(
         declared,
         publication,
         without_metadata: inputs_without_metadata,
+        uncounted,
     } = read_input_metadata(&indexes, &has_tiles, &options.metadata)?;
 
     let mut writer = match &options.work_dir {
@@ -285,8 +286,11 @@ pub fn merge_shards(
         // Only the metadata's `name`; `vector_layers` below is authoritative
         // for what a client actually reads.
         writer.set_layer_name(&first);
-        writer.set_vector_layers_json(
-            vector_layers_json(layers, &crate::diagnostics::Diagnostics::default()).to_string(),
+        set_merged_layers(
+            &mut writer,
+            layers,
+            uncounted,
+            &crate::diagnostics::Diagnostics::default(),
         );
     }
 
@@ -442,6 +446,9 @@ struct InputMetadata {
     publication: Resolved,
     /// Inputs whose metadata is absent or not valid JSON.
     without_metadata: Vec<String>,
+    /// Tile-holding inputs that declare no layer: their features are in no
+    /// layer's count, so the merge writes no `tilestats`.
+    uncounted: usize,
 }
 
 /// Every `vector_layers` entry every input declares, in input order (the
@@ -478,6 +485,7 @@ fn read_input_metadata(
     let mut layers = Vec::new();
     let mut declared: Option<(u8, u8)> = None;
     let mut without_metadata = Vec::new();
+    let mut uncounted = 0;
     for (idx, &tiles) in indexes.iter().zip(has_tiles) {
         let meta = idx.metadata_json();
         let label = idx.path().display().to_string();
@@ -498,6 +506,7 @@ fn read_input_metadata(
         }
         if tiles {
             let (found, zooms) = input_layers(idx, meta.as_ref());
+            uncounted += usize::from(found.is_empty());
             layers.extend(found);
             declared = Some(match declared {
                 Some((a, b)) => (a.min(zooms.0), b.max(zooms.1)),
@@ -514,6 +523,7 @@ fn read_input_metadata(
         declared,
         publication,
         without_metadata,
+        uncounted,
     })
 }
 
@@ -555,7 +565,7 @@ fn input_layers(idx: &ArchiveIndex, meta: Option<&Value>) -> (Vec<LayerMeta>, (u
                             .filter(|f| f.is_object())
                             .cloned()
                             .unwrap_or_else(|| Value::Object(Default::default())),
-                        feature_count: None,
+                        feature_count: crate::pyramid::tilestats_count(meta, id),
                     });
                 }
             }
@@ -691,6 +701,39 @@ mod tests {
         assert_eq!(report.inputs, 3);
         assert_eq!(report.per_zoom_tile_counts, BTreeMap::from([(6u8, 5u64)]));
         assert!(report.inputs_without_bounds.is_empty());
+    }
+
+    /// A sharded build's `tilestats` must survive the merge (#859): each
+    /// layer's count is the sum over the shards, as one machine would write.
+    /// An input without a count leaves no `tilestats`, not an undercount.
+    #[test]
+    fn merge_shards_sums_the_inputs_tilestats() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = |name: &str, tile: (u8, u32, u32), count: Option<u64>| {
+            let path = dir.path().join(name);
+            let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+            w.set_layer_name("l");
+            w.set_bounds(&TileBounds::new(0.0, 0.0, 1.0, 1.0));
+            if let Some(n) = count {
+                w.set_layer_stats(vec![("l".to_string(), n, 0)]);
+            }
+            w.add_tile(tile.0, tile.1, tile.2, &[0x1a, 0x02, 0x08, tile.1 as u8])
+                .unwrap();
+            w.finalize(&path).unwrap();
+            path
+        };
+        let a = shard("a.pmtiles", (6, 0, 0), Some(7));
+        let b = shard("b.pmtiles", (6, 1, 1), Some(5));
+        let out = dir.path().join("merged.pmtiles");
+        merge_shards(&[a.clone(), b], &out, &MergeOptions::default()).unwrap();
+        let stats = &metadata_of(&out)["tilestats"];
+        assert_eq!(stats["layers"][0]["layer"], "l", "{stats}");
+        assert_eq!(stats["layers"][0]["count"], 12, "{stats}");
+
+        let c = shard("c.pmtiles", (6, 2, 2), None);
+        let out = dir.path().join("partial.pmtiles");
+        merge_shards(&[a, c], &out, &MergeOptions::default()).unwrap();
+        assert!(metadata_of(&out).get("tilestats").is_none());
     }
 
     /// The check that exists so a mis-cut shard set fails rather than
