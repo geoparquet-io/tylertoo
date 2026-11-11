@@ -1,41 +1,37 @@
-// The Brazil tutorial's map: brazil.pmtiles (step 1) over an OpenFreeMap basemap.
-// One layer, "fields": A5 cells (with point_count) at z0-7, fields from z8.
+// The Brazil tutorial's map: step 1's brazil.pmtiles (all of Brazil, 5.9 GB)
+// on Source Cooperative, read by HTTP range requests, over an OpenFreeMap
+// basemap. One layer, "fields": A5 cells (with point_count) at z0-7, fields
+// from z8.
 (function () {
   const el = document.getElementById("brazil-map");
   if (!el || !window.maplibregl || !window.pmtiles) return;
   const protocol = new pmtiles.Protocol();
   maplibregl.addProtocol("pmtiles", protocol.tile);
-  const archive = new URL("../../assets/tutorials/brazil.pmtiles", document.baseURI).href;
-  // Fetch the small archive once and slice it here: `zensical serve` and
-  // some static hosts ignore HTTP Range requests, which pmtiles.js needs.
-  const bytes = fetch(archive).then((r) => r.arrayBuffer());
-  protocol.add(new pmtiles.PMTiles({
-    getKey: () => archive,
-    getBytes: async (offset, length) => ({ data: (await bytes).slice(offset, offset + length) }),
-  }));
+  const archive = "https://data.source.coop/nlebovits/tylertoo-brazil-demo/brazil.pmtiles";
   const map = new maplibregl.Map({
     container: el,
     style: "https://tiles.openfreemap.org/styles/positron",
-    center: [-55.55, -12.55],
-    zoom: 7.5,
+    center: [-53, -14],
+    zoom: 3.5,
     cooperativeGestures: true,
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }));
   map.on("load", () => {
     map.addSource("brazil", { type: "vector", url: "pmtiles://" + archive });
+    // Cell counts span 1 to over a million across z0-7: color by their log.
     map.addLayer({
       id: "density", type: "fill", source: "brazil", "source-layer": "fields", maxzoom: 8,
       filter: ["has", "point_count"],
       paint: {
-        "fill-color": ["interpolate", ["linear"], ["get", "point_count"],
-          1, "#fde0c5", 25, "#f59e5b", 100, "#e85017", 534, "#7a1f05"],
-        "fill-opacity": 0.65,
+        "fill-color": ["interpolate", ["linear"], ["ln", ["get", "point_count"]],
+          0, "#fde0c5", 4, "#f59e5b", 8, "#e85017", 12, "#7a1f05"],
+        "fill-opacity": 0.7,
       },
     });
     map.addLayer({
       id: "density-outline", type: "line", source: "brazil", "source-layer": "fields", maxzoom: 8,
       filter: ["has", "point_count"],
-      paint: { "line-color": "#7a1f05", "line-width": 1 },
+      paint: { "line-color": "#7a1f05", "line-width": 0.5, "line-opacity": 0.5 },
     });
     map.addLayer({
       id: "fields", type: "fill", source: "brazil", "source-layer": "fields", minzoom: 8,
