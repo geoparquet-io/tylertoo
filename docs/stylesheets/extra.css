@@ -104,7 +104,9 @@
 .tutorial-map .maplibregl-ctrl-attrib-button {
   width: 16px;
   height: 16px;
-  background-size: 12px;
+  background-size: 12px 12px;
+  background-repeat: no-repeat;
+  background-position: center;
   background-color: rgba(255, 255, 255, 0.6);
   border-radius: 8px;
   opacity: 0.6;
