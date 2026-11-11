@@ -1950,16 +1950,17 @@ pub(crate) mod remote {
         let env_region = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .ok();
-        match (&env_region, sdk_config.region()) {
-            (Some(r), _) => builder = builder.with_region(r.clone()),
-            (None, Some(r)) => builder = builder.with_region(r.as_ref()),
-            (None, None) => {
-                return Err(InputError::RemoteConfig(format!(
-                    "no AWS region configured for {url}: set AWS_REGION (e.g. \
-                     AWS_REGION=us-east-2) or add a region to your AWS profile"
-                )));
-            }
-        }
+        let Some(region) = s3_region(
+            env_region,
+            sdk_config.region().map(AsRef::as_ref),
+            custom_endpoint_configured(),
+        ) else {
+            return Err(InputError::RemoteConfig(format!(
+                "no AWS region configured for {url}: set AWS_REGION (e.g. \
+                 AWS_REGION=us-east-2) or add a region to your AWS profile"
+            )));
+        };
+        builder = builder.with_region(region);
 
         // Credentials: probe the chain once; if it resolves, install a
         // refreshing bridge provider (SSO/STS credentials expire), else go
@@ -1989,6 +1990,40 @@ pub(crate) mod remote {
         Ok(Arc::new(builder.build().map_err(|e| {
             InputError::RemoteConfig(format!("cannot configure S3 store for {url}: {e}"))
         })?))
+    }
+
+    /// The S3 signing region: `AWS_REGION`/`AWS_DEFAULT_REGION`, then the
+    /// profile/IMDS region. With a custom endpoint and neither, `us-east-1`,
+    /// as DuckDB and the AWS SDKs assume: S3-compatible hosts ignore it. On
+    /// AWS itself the region picks the server, so none means an error.
+    fn s3_region(env: Option<String>, sdk: Option<&str>, custom_endpoint: bool) -> Option<String> {
+        env.or_else(|| sdk.map(str::to_owned))
+            .or_else(|| custom_endpoint.then(|| "us-east-1".to_owned()))
+    }
+
+    #[cfg(test)]
+    mod region_tests {
+        use super::s3_region;
+
+        #[test]
+        fn env_region_wins_then_the_profile_region() {
+            assert_eq!(
+                s3_region(Some("eu-west-1".into()), Some("us-west-2"), false).as_deref(),
+                Some("eu-west-1")
+            );
+            assert_eq!(
+                s3_region(None, Some("us-west-2"), true).as_deref(),
+                Some("us-west-2")
+            );
+        }
+
+        #[test]
+        fn a_custom_endpoint_needs_no_region_but_aws_does() {
+            // Source Cooperative and other S3-compatible hosts ignore the
+            // region, so a user with no AWS profile must not be refused.
+            assert_eq!(s3_region(None, None, true).as_deref(), Some("us-east-1"));
+            assert_eq!(s3_region(None, None, false), None);
+        }
     }
 
     /// Prefix of the `object_store` client-option overrides (#290 dimension 4):
