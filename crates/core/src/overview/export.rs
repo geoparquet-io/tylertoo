@@ -1466,16 +1466,30 @@ const DEFAULT_PARTITION_TARGET: usize = 32_768;
 /// level's partitions at once the level takes several waves (#815). A wave
 /// keeps one partition per core, so its members shrink to this share while
 /// every core still encodes one. Such a level already spills every wave but
-/// the one it encodes, so smaller waves add wave barriers but no spill; a
-/// one-wave level keeps its partitions, as splitting it would spill what it
-/// holds. The archive does not depend on the target.
+/// the one it encodes, so smaller waves add no spill; a one-wave level keeps
+/// its partitions, as splitting it would spill what it holds. The archive
+/// does not depend on the target.
 ///
-/// Each extra wave barrier idles the pool on the wave's tail. A quarter
-/// doubled NZ parcels' waves (33 -> 67) and cost 9% of its wall; at three
-/// quarters (38 waves) wall matches the default target. Peak RSS, 5 runs
-/// on NZ / 3 on `BR_MT`, full target -> 75% -> 25%: NZ 3,863 -> 3,304 ->
-/// 2,898 MiB, `BR_MT` 4,730 -> 3,986 -> 2,515 MiB.
-const BOUNDED_MULTI_WAVE_TARGET_PERCENT: usize = 75;
+/// Smaller waves add wave barriers, where the pool idled on each wave's
+/// largest tile (one tile encodes on one thread): a quarter cost NZ parcels
+/// 9% of its wall in the serial wave loop. With the waves overlapped
+/// ([`BOUNDED_WAVE_SLACK_PERMILLE`]) the barrier is gone: NZ parcels
+/// bounded 3,993 -> 2,909 MiB peak RSS and 74.3 -> 71.3 s wall (medians
+/// of 4, quiet host).
+const BOUNDED_MULTI_WAVE_TARGET_PERCENT: usize = 25;
+
+/// How far past its largest wave, in permille, `bounded` lets a level
+/// group's members in flight run (#815), so the next wave is collected and
+/// starts encoding while the last partitions of the wave before it finish.
+/// A bounded multi-wave level is planned with this slack priced in
+/// ([`plan_level`]), so the overlap stays inside the collect grant. Slack
+/// 0, 12.5% and 50% gave the same NZ wall; this is the middle.
+const BOUNDED_WAVE_SLACK_PERMILLE: usize = 125;
+
+/// `members` plus the [`BOUNDED_WAVE_SLACK_PERMILLE`] slack on them.
+fn with_bounded_slack(members: usize) -> usize {
+    members.saturating_add(members.saturating_mul(BOUNDED_WAVE_SLACK_PERMILLE) / 1000)
+}
 
 /// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing.
 ///
@@ -1879,9 +1893,11 @@ fn plan_level_groups(
 /// the serial loop's. The cap bounds members in flight, not the group, so a
 /// group whose encodes keep up still overlaps every level.
 ///
-/// Under every profile but `bounded` a multi-wave level's waves overlap
-/// (#817); `bounded` keeps the serial wave loop, as the overlap is not in its
-/// budget. A `member_cap` of 0 is the serial schedule.
+/// A multi-wave level's waves overlap (#817). Under `bounded` the cap is
+/// the largest wave plus [`BOUNDED_WAVE_SLACK_PERMILLE`], which its plan
+/// priced in (#815): the next wave is admitted once the wave before it has
+/// at most the slack left, so its last tiles no longer idle the pool. A
+/// `member_cap` of 0 is the serial schedule.
 fn group_schedule(
     member_cap: usize,
     plans: &[LevelPlan],
@@ -1897,10 +1913,16 @@ fn group_schedule(
         })
         .max()
         .unwrap_or(0);
-    let cap = member_cap.min(largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN)));
+    let floor = largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN));
+    let cap = member_cap.min(match profile {
+        MemoryProfile::Bounded => {
+            floor.saturating_add(with_bounded_slack(largest_wave) - largest_wave)
+        }
+        _ => floor,
+    });
     let gate = GroupGate {
         cap,
-        waves: cap > 0 && profile != MemoryProfile::Bounded,
+        waves: cap > 0,
     };
     (plan_level_groups(plans, member_cap, gate.waves), gate)
 }
@@ -2224,7 +2246,7 @@ fn plan_level(
         ref budget,
         ..
     } = *inputs;
-    let plan = |target: usize| {
+    let plan = |target: usize, member_bytes: Option<u64>| {
         let partitions = plan_partitions(tile_counts, zoom, target);
         let wave = if auto_wave {
             memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, profile, budget)
@@ -2236,9 +2258,15 @@ fn plan_level(
     // Per-level memory guard (#311): on `auto`, the wave is narrowed from
     // THIS level's densest planned partition so a dense finest zoom does not
     // OOM the whole run. Explicit waves are honoured verbatim.
-    let (mut partitions, mut wave) = plan(partition_target);
+    let (mut partitions, mut wave) = plan(partition_target, member_bytes);
     if profile == MemoryProfile::Bounded && partitions.len() > wave {
-        (partitions, wave) = plan(partition_target * BOUNDED_MULTI_WAVE_TARGET_PERCENT / 100);
+        // The waves overlap by the slack ([`group_schedule`]): priced in,
+        // a wave and its slack fit the grant one wave did.
+        let slack_bytes = member_bytes.map(|b| with_bounded_slack(b as usize) as u64);
+        (partitions, wave) = plan(
+            partition_target * BOUNDED_MULTI_WAVE_TARGET_PERCENT / 100,
+            slack_bytes,
+        );
     }
     if wave < ceiling_wave {
         let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
@@ -3668,7 +3696,7 @@ fn injected_fault(
 /// (#647), encoding the group's levels, and their waves, concurrently.
 ///
 /// A group of one single-wave level, or of one multi-wave level when
-/// `gate.waves` is off (`bounded`, the serial oracle), is [`export_level`]
+/// `gate.waves` is off (the serial oracle), is [`export_level`]
 /// unchanged. Otherwise the calling thread collects every wave of every
 /// level in order, as the serial loop does: the single-read store's wave,
 /// a multi-wave level's one-level store (#740, filled as the level starts),
@@ -12229,6 +12257,55 @@ mod tests {
         assert_eq!(cap(0, &plans, 64), 0);
     }
 
+    /// #815: under `bounded` a multi-wave level's next wave is admitted
+    /// while the wave before it still encodes its last partitions, as long
+    /// as those hold at most the slack; members in flight never pass the
+    /// largest wave plus the slack.
+    #[test]
+    fn bounded_admits_the_next_wave_beside_the_last_partitions_of_the_one_before() {
+        // Two waves of eight 4-member partitions: waves of 32 members.
+        let plans = vec![plan_with_members(5, &[4; 16], 8)];
+        let (groups, gate) = group_schedule(1_000, &plans, 1, MemoryProfile::Bounded);
+        assert_eq!(groups, vec![0..1]);
+        assert!(
+            gate.waves,
+            "bounded runs its waves through the group pipeline"
+        );
+        assert_eq!(gate.cap, with_bounded_slack(32));
+        assert_eq!(gate.cap, 36);
+        let in_flight = InFlight::new(gate.cap);
+        let first = in_flight.admit(32);
+        std::thread::scope(|s| {
+            // Two partitions still encoding (8 members, past the slack of 4):
+            // the next wave waits.
+            first.release(24);
+            let next = s.spawn(|| {
+                let wave = in_flight.admit(32);
+                // Beside the last partition, at the cap and not past it.
+                assert_eq!(*in_flight.held.lock().unwrap(), 36);
+                drop(wave);
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!next.is_finished(), "admitted past the slack");
+            // One partition left (4 members): the next wave goes in beside it.
+            first.release(4);
+            next.join().unwrap();
+        });
+        // The last partition still holds its 4.
+        assert_eq!(*in_flight.held.lock().unwrap(), 4);
+        drop(first);
+        assert_eq!(*in_flight.held.lock().unwrap(), 0);
+        // Auto keeps its cap; a member cap below the wave still bounds it.
+        assert_eq!(
+            group_schedule(1_000, &plans, 1, MemoryProfile::Auto).1.cap,
+            32
+        );
+        assert_eq!(
+            group_schedule(30, &plans, 1, MemoryProfile::Bounded).1.cap,
+            30
+        );
+    }
+
     /// #817: the collect waits while the next level would take the members
     /// in flight past the cap, and goes on once an encode releases them. A
     /// level larger than the cap is admitted when nothing is in flight.
@@ -12288,11 +12365,11 @@ mod tests {
         assert_eq!(concurrent_bytes, serial_bytes);
     }
 
-    /// #817: under `auto` a multi-wave level joins the level group before
-    /// it and its waves run through the group's pipeline, so the next wave
-    /// is read while one encodes; `bounded` keeps the serial wave loop.
+    /// #817: a multi-wave level joins the level group before it and its
+    /// waves run through the group's pipeline, so the next wave is read
+    /// while one encodes; under `bounded` too since #815.
     #[test]
-    fn multi_wave_levels_overlap_their_waves_except_bounded() {
+    fn multi_wave_levels_overlap_their_waves() {
         let input = tempfile::NamedTempFile::new().unwrap();
         let pts = |n: usize, l: i64| -> (Vec<i64>, Vec<Geometry<f64>>) {
             let g = (0..n)
@@ -12329,8 +12406,8 @@ mod tests {
         assert_eq!(auto_bytes, serial_bytes);
         assert_eq!(auto.report.zooms, serial.report.zooms);
         let (bounded_bytes, bounded) = run(MemoryProfile::Bounded, true);
-        assert_eq!(bounded.level_groups, vec![0..1, 1..2]);
-        assert_eq!(bounded.work.group_waves, 0);
+        assert_eq!(bounded.level_groups, auto.level_groups);
+        assert_eq!(bounded.work.group_waves, 5);
         assert_eq!(bounded_bytes, serial_bytes);
     }
 
@@ -12455,51 +12532,58 @@ mod tests {
     /// for that write forever.
     #[test]
     fn level_group_write_panic_does_not_hang() {
-        let input = tempfile::NamedTempFile::new().unwrap();
-        equivalence_fixture(input.path());
-        let opts = ExportOptions {
-            layer_name: "ref".to_string(),
-            partition_wave: 1,
-            ..Default::default()
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let good = export_pmtiles_run(
-            input.path(),
-            dir.path().join("good.pmtiles"),
-            &opts,
-            1,
-            &knobs(false, None, true),
-        )
-        .unwrap();
-        let level = good
-            .report
-            .zooms
-            .iter()
-            .find(|z| z.tile_count >= 3)
-            .expect("the fixture must give a level three waves")
-            .level;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let out = dir.path().join("panics.pmtiles");
-        std::thread::spawn(move || {
-            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                export_pmtiles_run(
-                    input.path(),
-                    &out,
-                    &opts,
-                    1,
-                    &Pass2Knobs {
-                        panic_write_level: Some(level),
-                        ..knobs(false, None, true)
-                    },
-                )
-                .map(|_| ())
-            }));
-            let _ = tx.send(run.is_err());
-        });
-        let panicked = rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("a panicking group write hung the export");
-        assert!(panicked, "the write panic must reach the caller");
+        // #815: `bounded` runs its multi-wave levels through the group too.
+        for profile in [MemoryProfile::Auto, MemoryProfile::Bounded] {
+            let input = tempfile::NamedTempFile::new().unwrap();
+            equivalence_fixture(input.path());
+            let opts = ExportOptions {
+                layer_name: "ref".to_string(),
+                partition_wave: 1,
+                profile,
+                ..Default::default()
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let good = export_pmtiles_run(
+                input.path(),
+                dir.path().join("good.pmtiles"),
+                &opts,
+                1,
+                &knobs(false, None, true),
+            )
+            .unwrap();
+            let level = good
+                .report
+                .zooms
+                .iter()
+                .find(|z| z.tile_count >= 3)
+                .expect("the fixture must give a level three waves")
+                .level;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let out = dir.path().join("panics.pmtiles");
+            std::thread::spawn(move || {
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    export_pmtiles_run(
+                        input.path(),
+                        &out,
+                        &opts,
+                        1,
+                        &Pass2Knobs {
+                            panic_write_level: Some(level),
+                            ..knobs(false, None, true)
+                        },
+                    )
+                    .map(|_| ())
+                }));
+                let _ = tx.send(run.is_err());
+            });
+            let panicked = rx
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!("{profile:?}: a panicking group write hung the export"));
+            assert!(
+                panicked,
+                "{profile:?}: the write panic must reach the caller"
+            );
+        }
     }
 
     /// #740 (read amplification): a duplicating-mode level split into several
@@ -13190,49 +13274,55 @@ mod tests {
         for mode in [Mode::Duplicating, Mode::Partitioning] {
             let input = tempfile::NamedTempFile::new().unwrap();
             level_group_fixture(input.path(), mode);
-            let opts = ExportOptions {
-                layer_name: "groups".to_string(),
-                partition_wave: 6,
-                ..Default::default()
-            };
-            for (force_legacy_pass2, backing_override) in PASS2_PATHS {
-                let ctx = format!("{mode:?}, legacy {force_legacy_pass2}, {backing_override:?}");
-                let dir = tempfile::tempdir().unwrap();
-                let good = export_pmtiles_run(
-                    input.path(),
-                    dir.path().join("good.pmtiles"),
-                    &opts,
-                    DEFAULT_PARTITION_TARGET,
-                    &knobs(force_legacy_pass2, backing_override, true),
-                )
-                .unwrap();
-                assert_eq!(good.level_groups, ONE_GROUP_OF_FOUR, "{ctx}");
-                let coarse_tiles: usize = good.report.zooms[..3].iter().map(|z| z.tile_count).sum();
+            for profile in [MemoryProfile::Auto, MemoryProfile::Bounded] {
+                let opts = ExportOptions {
+                    layer_name: "groups".to_string(),
+                    partition_wave: 6,
+                    profile,
+                    ..Default::default()
+                };
+                for (force_legacy_pass2, backing_override) in PASS2_PATHS {
+                    let ctx = format!(
+                        "{mode:?}, {profile:?}, legacy {force_legacy_pass2}, {backing_override:?}"
+                    );
+                    let dir = tempfile::tempdir().unwrap();
+                    let good = export_pmtiles_run(
+                        input.path(),
+                        dir.path().join("good.pmtiles"),
+                        &opts,
+                        DEFAULT_PARTITION_TARGET,
+                        &knobs(force_legacy_pass2, backing_override, true),
+                    )
+                    .unwrap();
+                    assert_eq!(good.level_groups, ONE_GROUP_OF_FOUR, "{ctx}");
+                    let coarse_tiles: usize =
+                        good.report.zooms[..3].iter().map(|z| z.tile_count).sum();
 
-                let out = dir.path().join("failed.pmtiles");
-                let err = export_pmtiles_run(
-                    input.path(),
-                    &out,
-                    &opts,
-                    DEFAULT_PARTITION_TARGET,
-                    &Pass2Knobs {
-                        fail_level: Some(3),
-                        ..knobs(force_legacy_pass2, backing_override, true)
-                    },
-                )
-                .err()
-                .unwrap_or_else(|| panic!("{ctx}: the injected fault must fail the export"));
-                assert!(err.to_string().contains("injected"), "{ctx}: {err}");
-                let partial =
-                    std::fs::read(out.with_extension("pmtiles.partial")).unwrap_or_else(|e| {
-                        panic!("{ctx}: no salvage archive after a mid-group failure: {e}")
-                    });
-                let header = crate::pmtiles_writer::Header::from_bytes(&partial)
-                    .unwrap_or_else(|e| panic!("{ctx}: salvage archive is invalid: {e}"));
-                assert_eq!(
-                    header.addressed_tiles_count, coarse_tiles as u64,
-                    "{ctx}: the salvage archive must hold exactly z2–z6"
-                );
+                    let out = dir.path().join("failed.pmtiles");
+                    let err = export_pmtiles_run(
+                        input.path(),
+                        &out,
+                        &opts,
+                        DEFAULT_PARTITION_TARGET,
+                        &Pass2Knobs {
+                            fail_level: Some(3),
+                            ..knobs(force_legacy_pass2, backing_override, true)
+                        },
+                    )
+                    .err()
+                    .unwrap_or_else(|| panic!("{ctx}: the injected fault must fail the export"));
+                    assert!(err.to_string().contains("injected"), "{ctx}: {err}");
+                    let partial = std::fs::read(out.with_extension("pmtiles.partial"))
+                        .unwrap_or_else(|e| {
+                            panic!("{ctx}: no salvage archive after a mid-group failure: {e}")
+                        });
+                    let header = crate::pmtiles_writer::Header::from_bytes(&partial)
+                        .unwrap_or_else(|e| panic!("{ctx}: salvage archive is invalid: {e}"));
+                    assert_eq!(
+                        header.addressed_tiles_count, coarse_tiles as u64,
+                        "{ctx}: the salvage archive must hold exactly z2–z6"
+                    );
+                }
             }
         }
     }
@@ -18221,11 +18311,11 @@ mod tests {
         );
     }
 
-    /// #815: `bounded` plans a level that takes several waves in three
-    /// quarters of the partition target, so each wave holds three quarters
-    /// of the members; a one-wave level, and `auto`, keep the target.
+    /// #815: `bounded` plans a level that takes several waves in a quarter
+    /// of the partition target, so each wave holds a quarter of the members;
+    /// a one-wave level, and `auto`, keep the target.
     #[test]
-    fn bounded_multi_wave_levels_hold_three_quarters_of_the_members_per_wave() {
+    fn bounded_multi_wave_levels_hold_a_quarter_of_the_members_per_wave() {
         let plan = |tiles: u64, profile| {
             let counts: BTreeMap<u64, usize> = (0..tiles)
                 .map(|t| (tile_key(u32::try_from(t).unwrap(), 0, 10), 1_000))
@@ -18256,7 +18346,7 @@ mod tests {
         // 64 tiles of 1,000 members: 8 partitions, two waves of four.
         let auto = plan(64, MemoryProfile::Auto);
         assert_eq!(wave_members(&auto), 32_000);
-        assert_eq!(wave_members(&plan(64, MemoryProfile::Bounded)), 24_000);
+        assert_eq!(wave_members(&plan(64, MemoryProfile::Bounded)), 8_000);
         // 32 tiles: one wave, kept whole.
         assert_eq!(plan(32, MemoryProfile::Bounded).partitions.len(), 4);
     }
