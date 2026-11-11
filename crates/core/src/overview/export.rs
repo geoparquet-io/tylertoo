@@ -5764,8 +5764,16 @@ fn encode_wave_from_store(
 
 /// Route a wave's members to their partitions, one bucket per partition, as
 /// [`finish_group`] routes them.
+///
+/// Each bucket is sized to its members first: grown by pushes, the buckets
+/// held up to twice the wave's member structs beside the wave's own vector
+/// at the export's peak.
 fn bucket_members(members: Vec<Member>, wave: &[Partition]) -> Vec<Vec<Member>> {
-    let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
+    let mut counts = vec![0usize; wave.len()];
+    for m in &members {
+        counts[route_partition(wave, m.key)] += 1;
+    }
+    let mut buckets: Vec<Vec<Member>> = counts.into_iter().map(Vec::with_capacity).collect();
     for m in members {
         buckets[route_partition(wave, m.key)].push(m);
     }
@@ -17550,6 +17558,33 @@ mod tests {
             gap: GAP_NONE,
             band: 0,
         }
+    }
+
+    /// A wave's buckets hold exactly their members: grown by pushes they
+    /// held up to twice their member structs at the export's peak.
+    #[test]
+    fn wave_buckets_hold_exactly_their_members() {
+        let wave: Vec<Partition> = [(0, 9), (10, 19), (20, 29)]
+            .into_iter()
+            .map(|(key_lo, key_hi)| Partition {
+                key_lo,
+                key_hi,
+                bbox: PruneRegion::of(TileBounds::new(0.0, 0.0, 0.0, 0.0)),
+                members: 0,
+            })
+            .collect();
+        let members = (0..29)
+            .map(|i| Member {
+                key: i,
+                ..point_member(0.0, 0.0, i)
+            })
+            .collect();
+        let buckets = bucket_members(members, &wave);
+        assert_eq!(
+            buckets.iter().map(Vec::len).collect::<Vec<_>>(),
+            [10, 10, 9]
+        );
+        assert!(buckets.iter().all(|b| b.capacity() == b.len()));
     }
 
     // ========================================================================
