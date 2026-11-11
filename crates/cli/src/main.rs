@@ -29,17 +29,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// #828: return this thread's freed mimalloc pages to the OS now, rather
-/// than after the purge delay; core runs it when a phase ends.
-#[cfg(all(
-    any(target_env = "musl", feature = "mimalloc"),
-    not(feature = "dhat-heap")
-))]
-fn release_retained() {
-    // SAFETY: mi_collect takes no pointers and only touches mimalloc's state.
-    unsafe { libmimalloc_sys::mi_collect(true) }
-}
-
 fn main() -> std::process::ExitCode {
     // Initialize dhat profiler if feature is enabled
     // This must be at the very start of main() - the profiler outputs
@@ -52,12 +41,6 @@ fn main() -> std::process::ExitCode {
         != Some(std::ffi::OsStr::new("off")))
     .then(dhat::Profiler::new_heap);
 
-    #[cfg(all(
-        any(target_env = "musl", feature = "mimalloc"),
-        not(feature = "dhat-heap")
-    ))]
-    tylertoo_core::internal::alloc_release::set_release_hook(release_retained);
-
     std::process::ExitCode::from(tylertoo_cli::run(std::env::args_os()))
 }
 
@@ -69,15 +52,16 @@ mod allocator_default {
     #[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
     const _: &mimalloc::MiMalloc = &super::GLOBAL;
 
-    /// #828: every libmimalloc-sys declaration builds without THP madvise.
     #[test]
-    fn mimalloc_is_built_without_thp() {
+    fn mimalloc_is_a_default_feature() {
         let manifest = include_str!("../Cargo.toml");
-        let decls: Vec<&str> = manifest
+        let default = manifest
             .lines()
-            .filter(|l| l.starts_with("libmimalloc-sys"))
-            .collect();
-        assert_eq!(decls.len(), 2, "the mimalloc and musl declarations");
-        assert!(decls.iter().all(|l| l.contains("\"no_thp\"")), "{decls:?}");
+            .find(|l| l.trim_start().starts_with("default ="))
+            .expect("crates/cli/Cargo.toml declares default features");
+        assert!(
+            default.contains("\"mimalloc\""),
+            "mimalloc must stay a default feature of the CLI: {default}"
+        );
     }
 }

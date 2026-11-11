@@ -545,24 +545,8 @@ fn _run_cli(py: Python<'_>, argv: Vec<std::ffi::OsString>) -> u8 {
 /// prints. Records below DEBUG are never forwarded. Forwarding takes the GIL,
 /// so every core call here runs inside `py.detach`: a worker thread logging
 /// while this thread waited on it with the GIL held would deadlock.
-/// #828: return this thread's freed mimalloc pages to the OS now, as the
-/// CLI does; core runs it when a phase ends.
-#[cfg(all(
-    any(target_env = "musl", feature = "mimalloc"),
-    not(feature = "dhat-heap")
-))]
-fn release_retained() {
-    // SAFETY: mi_collect takes no pointers and only touches mimalloc's state.
-    unsafe { libmimalloc_sys::mi_collect(true) }
-}
-
 #[pymodule]
 fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    #[cfg(all(
-        any(target_env = "musl", feature = "mimalloc"),
-        not(feature = "dhat-heap")
-    ))]
-    tylertoo_core::internal::alloc_release::set_release_hook(release_retained);
     m.add("ConfigError", m.py().get_type::<ConfigError>())?;
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add_function(wrap_pyfunction!(overview, m)?)?;
