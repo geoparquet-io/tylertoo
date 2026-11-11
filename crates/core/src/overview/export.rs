@@ -3203,7 +3203,6 @@ impl ExportProgress {
     /// Attribute every sample the background sampler takes from now on to
     /// `phase`, until the next call. A no-op when profiling is off.
     fn enter_phase(&mut self, phase: &'static str) {
-        crate::alloc_release::release_retained();
         if let Some(sampler) = &self.rss_sampler {
             sampler.mark_phase(phase);
             self.close_stage_phase();

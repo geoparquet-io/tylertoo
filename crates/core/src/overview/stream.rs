@@ -872,7 +872,6 @@ impl RssTracker {
     /// is attributed to it, until the next call. A no-op when profiling is
     /// off (the sampler never started).
     pub(super) fn enter_phase(&self, phase: &str) {
-        crate::alloc_release::release_retained();
         if let Some(sampler) = &self.sampler {
             sampler.mark_phase(phase);
         }
@@ -883,7 +882,6 @@ impl RssTracker {
     /// The sample also goes to the background sampler, credited to the
     /// current phase, so `true_peak_mib` is never below `peak_rss_mib`.
     pub(super) fn log_phase(&mut self, phase: &str) {
-        crate::alloc_release::release_retained();
         let sample = log_phase_rss(phase, &mut self.boundary_peak_mib);
         if let (Some(sampler), Some(mib)) = (&self.sampler, sample) {
             sampler.record(mib);
