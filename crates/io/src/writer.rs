@@ -71,11 +71,16 @@ impl<W: Write + Send> BatchWriter<W> {
         self.0.write(batch)
     }
 
-    /// Close the buffered rows as a row group of their own.
+    /// Bytes buffered for the row group in progress, not yet flushed.
+    pub fn in_progress_size(&self) -> usize {
+        self.0.in_progress_size()
+    }
+
+    /// End the row group in progress, writing its buffered rows out.
     ///
     /// # Errors
     ///
-    /// Returns an encoding or I/O error.
+    /// Returns the underlying encoding or I/O error.
     pub fn flush(&mut self) -> Result<(), ParquetError> {
         self.0.flush()
     }

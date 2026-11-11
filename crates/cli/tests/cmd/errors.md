@@ -92,3 +92,17 @@ $ tylertoo overture-names.parquet out.pmtiles --class-rank names:a=nan
 Error: rank NaN for class "a" must be a finite number (NaN and infinity cannot be ordered against other classes)
 
 ```
+
+`--layer-column` names a column of the input whose values can name a
+layer: text, integers, or booleans.
+
+```console
+$ tylertoo overture-names.parquet out.pmtiles --layer-column nope
+? 1
+Error: --layer-column "nope" is not a column of the input (columns: id, names, sources, raw, geometry)
+
+$ tylertoo overture-names.parquet out.pmtiles --layer-column names
+? 1
+Error: --layer-column "names" is Struct("primary": Utf8, "common": Map("key_value": non-null Struct("key": non-null Utf8, "value": Utf8), unsorted)); a layer column must hold strings, integers or booleans
+
+```

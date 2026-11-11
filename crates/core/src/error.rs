@@ -61,6 +61,8 @@ pub fn kind_of(e: &(dyn StdError + 'static)) -> Option<ErrorKind> {
         crate::overview::convert::ClassRankingError,
         crate::pyramid::BandSpecError,
     );
+    #[cfg(feature = "serve")]
+    first_kind!(crate::serve::ServeError);
     None
 }
 

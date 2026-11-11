@@ -391,6 +391,12 @@ pub fn command_defaults(command: &str) -> Map<String, Value> {
             ("largest".into(), crate::stats::DEFAULT_LARGEST.into()),
             ("layers".into(), false.into()),
         ]),
+        // `serve` (#825): loopback only unless the caller names a host.
+        "serve" => Map::from_iter([
+            ("host".into(), "127.0.0.1".into()),
+            ("port".into(), 8080.into()),
+            ("cors".into(), Value::Array(Vec::new())),
+        ]),
         "decode" => Map::from_iter([
             ("min_zoom".into(), Value::Null),
             ("max_zoom".into(), Value::Null),

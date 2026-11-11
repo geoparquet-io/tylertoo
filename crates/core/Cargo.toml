@@ -33,6 +33,8 @@ fuzzing = []
 # mlt-core needs Rust 1.98, above this crate's rust-version; the CLI and the
 # Python wheel turn it on.
 mlt = ["dep:mlt-core"]
+# `tylertoo serve` (#825): a small blocking HTTP server, no async runtime.
+serve = ["dep:tiny_http", "dep:percent-encoding"]
 # Remote input support: read GeoParquet directly from s3://, https://,
 # and gs:// URLs via range requests (issue #210). Off by default to keep
 # the pure-local library build dependency-light; the CLI enables it.
@@ -71,6 +73,8 @@ a5 = { workspace = true }
 wkb = { workspace = true }
 prost = { workspace = true }
 mlt-core = { workspace = true, optional = true }
+tiny_http = { version = "0.12", optional = true }
+percent-encoding = { version = "2", optional = true }
 rayon = { workspace = true }
 crossbeam-channel = { workspace = true }
 thiserror = { workspace = true }

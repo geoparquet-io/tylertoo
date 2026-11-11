@@ -485,6 +485,53 @@ With `layers=True`, `per_layer` entries contain `z`, `layer`, `feature_count`, `
 'overview'
 ```
 
+## `serve`
+
+```python
+serve(
+    archive: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    cors: str | Sequence[str] = [],
+) -> None
+```
+
+Serve PMTiles archives over HTTP with a map viewer.
+
+Print the server URL and block until Ctrl-C, which raises `KeyboardInterrupt`. The viewer at `/` handles MVT and MLT archives. It loads MapLibre GL JS from unpkg.com and needs internet access.
+
+`/index.json` lists archive names. Each `{name}` is the archive's file stem. `/{name}.json` returns TileJSON. `/{name}/{z}/{x}/{y}` returns tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns archive metadata. `/{name}/stats.json` returns tile-size statistics. `/{name}.pmtiles` serves the archive with HTTP Range support. It honours `If-Match` and `If-Range` against its `ETag`. If a Range read detects the file being rewritten in place during the read, it returns HTTP 412 for requests with `If-Match` or `If-Range`, or HTTP 503 otherwise. A whole-file download caught by a rewrite is cut off before its `Content-Length`. Renaming another file over the path does not affect a download in progress.
+
+At most 64 responses can be in flight at once. Further requests get HTTP 503 with `Retry-After: 1`.
+
+`serve` returns HTTP 204 for missing tiles without scaling up a stored ancestor, so variable-depth archives (`variable_depth=True`) show holes below stopped tiles; `serve` warns when it opens one.
+
+An archive rewritten on disk is reopened on the next request for it; if it does not reopen, requests for it return HTTP 503 until it does.
+
+### Parameters
+
+* `archive`: One PMTiles path or a list of paths, with distinct file stems.
+* `host`: Address to bind. Defaults to `"127.0.0.1"` (local access only). Use `"0.0.0.0"` or another address to expose it to the network.
+* `port`: Port to listen on. Defaults to 8080. Use 0 to pick a free port.
+* `cors`: Allow pages from these origins to read responses. Use `cors="https://pmtiles.io"` for one exact origin, a list of origin strings for multiple origins, or `cors="*"` for any origin. With no `cors`, no Access-Control headers are sent, so pages on other origins cannot read the archives. The built-in viewer is same-origin and needs none.
+
+### Returns
+
+`None`: `None` when the server stops.
+
+### Raises
+
+* `ConfigError`: An unknown keyword, a bad option value, an empty archive list, a path without a UTF-8 file stem, repeated file stems, or an archive named `index`.
+* `RuntimeError`: An archive could not be opened, the address could not be bound, or the listening socket failed.
+* `KeyboardInterrupt`: Ctrl-C stops the server.
+
+### Example
+
+```python
+>>> serve("buildings.pmtiles", port=0)  # Blocks until Ctrl-C.
+```
+
 ## `convert`
 
 ```python
@@ -499,6 +546,7 @@ convert(
     feature_order: Literal['input'] | str = "input",
     spill_dir: str | os.PathLike[str] | None = None,
     *,
+    layer_column: str | None = None,
     include_properties: Sequence[str] | None = None,
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
@@ -565,7 +613,7 @@ convert(
     plan: str | os.PathLike[str] | None = None,
     tile_format: Literal['mvt', 'mlt'] = "mvt",
     mlt_profile: Literal['web', 'native', 'min-size', 'diffable', 'fast-encoding'] = "web",
-) -> ConvertReport
+) -> ConvertReport | LayeredConvertReport
 ```
 
 Convert GeoParquet to PMTiles in one call, like `tylertoo tiles`.
@@ -583,6 +631,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `simple_clip_fastpath`: See `export_pmtiles()`.
 * `feature_order`: See `export_pmtiles()`.
 * `spill_dir`: Scratch directory for the intermediate overview and the export's spill (the CLI's `--spill-dir`). The intermediate is at least input-sized; without this it goes to `$TMPDIR`, then the output's directory. Set it when `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised when the chosen volume looks too small, whether or not the run then fails.
+* `layer_column`: Put each feature in the layer named by its value in this column (the CLI's `--layer-column`), and null or blank values in `"_unknown"`. The column is not written as a property. Each layer is tiled on its own and the layers are merged, so thinning and the tile size limits apply per layer. Excludes `layer_name`, `keep_overview`, `save_plan`, `plan` and `variable_depth`. At most 64 layers.
 * `include_properties`: See `overview()`.
 * `exclude_properties`: See `overview()`.
 * `exclude_all_properties`: See `overview()`.
@@ -652,7 +701,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 
 ### Returns
 
-[`ConvertReport`](#convertreport): Both halves' reports, keyed `"convert"` and `"export"` like the CLI's `tiles --report` JSON.
+`ConvertReport | LayeredConvertReport`: Both halves' reports, keyed `"convert"` and `"export"` like the CLI's `tiles --report` JSON. With `layer_column`, a `LayeredConvertReport` holding one such report per layer.
 
 ### Raises
 
@@ -1011,6 +1060,44 @@ class ConvertReport(TypedDict):
     convert: OverviewReport
     export: ExportReport
 ```
+
+### `LayeredConvertReport`
+
+The report of a `convert(layer_column=...)` run.
+
+```python
+class LayeredConvertReport(TypedDict):
+    layer_column: str
+    layers: list[LayerReport]
+    empty_layers: list[str]
+    filtered_rows: int
+    total_tiles: int
+    diagnostics: list[Diagnostic]
+```
+
+* `layer_column`: The column the features were routed by.
+* `layers`: One report per layer that has tiles, by layer name.
+* `empty_layers`: Layers whose features all generalized or filtered away, left out of the archive.
+* `filtered_rows`: Input rows `filter` or `bbox` dropped before the split, in no layer.
+* `total_tiles`: Distinct tiles in the merged archive.
+* `diagnostics`: The merge's own diagnostics.
+
+### `LayerReport`
+
+One layer of a `convert(layer_column=...)` run.
+
+```python
+class LayerReport(TypedDict):
+    layer: str
+    input_rows: int
+    convert: OverviewReport
+    export: ExportReport
+```
+
+* `layer`: The MVT layer name: the column's trimmed value, or `"_unknown"` for null and blank values.
+* `input_rows`: Input rows routed to this layer, after `filter` and `bbox`. Row numbers in the layer's reports count these rows, in input order.
+* `convert`: The layer's overview conversion.
+* `export`: The layer's PMTiles export.
 
 ## Errors
 

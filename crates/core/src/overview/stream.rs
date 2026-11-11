@@ -282,6 +282,34 @@ pub(super) fn stage_granted(
     report
 }
 
+/// Before a read of `plan` opens: stage the chunks it will touch of a
+/// remote source, concurrently, which the read would otherwise fetch one at
+/// a time (#788: 52 serial requests for moldova's covering). Granted from a
+/// memory budget like pass 0's, and best-effort, since the read fetches
+/// whatever staging missed. Nothing for a local source; `what` names the
+/// read in the log.
+pub(super) fn stage_for_read(
+    source: &ConvertSource,
+    plan: &crate::input_set::ReadPlan<'_>,
+    profile: super::level::MemoryProfile,
+    what: &str,
+) {
+    if !source.is_remote() {
+        return;
+    }
+    let staged = source
+        .staging_plan_for(plan.row_groups, plan.projection)
+        .and_then(|staging| stage_granted(source, &staging, &mut MemoryBudget::probe(), profile));
+    match staged {
+        Ok(r) => log::debug!(
+            "[{what}] staged {} request(s), {} B",
+            r.requests,
+            r.bytes_fetched
+        ),
+        Err(e) => log::debug!("[{what}] staging failed ({e})"),
+    }
+}
+
 /// What pass 0 did (#788): the `pass0` record of the `TYLERTOO_PROFILE_JSON`
 /// dump.
 #[derive(Debug, Clone)]
