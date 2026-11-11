@@ -156,8 +156,10 @@ Differences the preset does not remove:
 ## What only tippecanoe does
 
 - Reads GeoJSON, line-delimited GeoJSON, FlatGeobuf, point CSV, and GeoJSON
-  on standard input. tylertoo reads GeoParquet in `EPSG:4326` or `EPSG:3857`.
-  Convert other formats with `gpio`.
+  on standard input. tylertoo reads GeoParquet in `EPSG:4326` or `EPSG:3857`
+  directly and reprojects other CRSs to `EPSG:4326` as it reads, when their
+  EPSG code has a usable proj4 definition. Convert other formats or
+  unsupported CRSs with `gpio` (`gpio convert reproject` for reprojection).
 - Joins attributes onto finished tiles with `tile-join`. In tylertoo, join
   before tiling so the new columns work with `--filter`, `--include-property`,
   and `--feature-id`. Restore Hilbert order and row-group layout after the join:

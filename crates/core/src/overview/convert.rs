@@ -759,14 +759,20 @@ pub struct ConvertOptions {
     pub bbox: Option<[f64; 4]>,
     /// Keep features whose geometry intersects this polygon or multipolygon
     /// mask; touching counts. Accepts a GeoJSON (`.geojson` or `.json`,
-    /// lon/lat per RFC 7946) or GeoParquet file. TODO(docs)
+    /// lon/lat per RFC 7946) or GeoParquet file.
+    /// A GeoParquet mask uses its declared CRS and the same reprojection
+    /// rules as input. EPSG:4326 masks are converted to EPSG:3857 for 3857
+    /// input and vice versa, vertex by vertex.
     /// The mask's bbox skips row groups like [`bbox`](Self::bbox).
     /// Combines with `bbox` and [`filter`](Self::filter) by AND.
     /// A feature also matches when its copy one world width away (±360°)
     /// intersects the mask, as with `bbox`. In Python, `mask=` also accepts
-    /// a shapely geometry (any object with `.wkb`), TODO(docs). Default `None` (no mask).
+    /// a shapely geometry (any object with `.wkb`).
+    /// WKB/shapely masks have no CRS: use EPSG:3857 for EPSG:3857 input,
+    /// otherwise lon/lat EPSG:4326, including for reprojected input.
+    /// Default `None` (no mask).
     #[cfg_attr(feature = "cli", arg(value_parser = super::mask::parse_mask, long, value_name = "PATH", help_heading = "Filtering"))]
-    #[cfg_attr(feature = "cli", arg(help = "Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (.geojson/.json, RFC 7946 lon/lat) or GeoParquet file; touching and copies one ±360° wrap away count. Skips row groups by the mask's bbox, combines with --bbox and --filter by AND. TODO(docs)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (.geojson/.json, RFC 7946 lon/lat) or GeoParquet file; touching and copies one ±360° wrap away count. Skips row groups by the mask's bbox, combines with --bbox and --filter by AND. A GeoParquet mask uses its declared CRS and the same reprojection rules as input. EPSG:4326 masks are converted to EPSG:3857 for 3857 input and vice versa, vertex by vertex. WKB/shapely masks have no CRS: use EPSG:3857 for EPSG:3857 input, otherwise lon/lat EPSG:4326, including for reprojected input.", long_help = None))]
     pub mask: Option<super::mask::MaskSource>,
     /// Attribute filter (#315): a SQL-WHERE-style predicate over the input's
     /// property columns (`--filter` / `--where`), e.g. `confidence > 0.8`,
@@ -3145,6 +3151,19 @@ pub(super) fn level_representations(
 /// [`ConvertOptions::shard`] range (whose plan would cover only that shard's
 /// rows).
 ///
+/// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
+/// reprojected to EPSG:4326 as they are read when they name an EPSG code
+/// (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4
+/// definition. Parts of a directory, list, or `--files-from` input may each
+/// use a different supported CRS. Otherwise the run is refused; the error
+/// points to `gpio convert reproject` to reproject the input first.
+///
+/// Reprojection uses no grid shifts. A datum change uses the definition's
+/// proj4 `towgs84` Helmert parameters, so results can differ from PROJ/pyproj
+/// by metres (around 100 m at the edge of EPSG:27700's area). Same-datum
+/// projections, such as UTM and ETRS89 LAEA (EPSG:3035), match to under a
+/// centimetre.
+///
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if the input cannot be resolved, if the options
@@ -4130,7 +4149,8 @@ pub(super) fn log_remote_fetch(source: &ConvertSource) -> Option<crate::input::F
 // ============================================================================
 
 /// Detect the input CRS from parsed parquet key-value metadata and map it to
-/// [`Crs`], rejecting anything that is not EPSG:4326 or EPSG:3857 (spec Q3).
+/// [`Crs`]. Supported EPSG codes read as EPSG:4326 after reprojection;
+/// other CRSs are rejected.
 /// Metadata-only so remote inputs (#210) pay no extra footer fetch.
 /// `input` names the file in the error (#452).
 #[cfg(any(test, feature = "fuzzing"))]

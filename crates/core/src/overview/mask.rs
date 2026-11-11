@@ -29,9 +29,14 @@ use crate::diagnostics::{Diagnostic, Diagnostics};
 #[non_exhaustive]
 pub enum MaskSource {
     /// Read a GeoJSON (`.geojson` or `.json`, lon/lat per RFC 7946) or
-    /// GeoParquet file. TODO(docs)
+    /// GeoParquet file.
+    /// A GeoParquet mask uses its declared CRS and the same reprojection
+    /// rules as input. EPSG:4326 masks are converted to EPSG:3857 for 3857
+    /// input and vice versa, vertex by vertex.
     Path(PathBuf),
-    /// Read WKB polygons or multipolygons TODO(docs).
+    /// Read WKB polygons or multipolygons.
+    /// WKB/shapely masks have no CRS: use EPSG:3857 for EPSG:3857 input,
+    /// otherwise lon/lat EPSG:4326, including for reprojected input.
     /// Python uses this for shapely geometries (any object with `.wkb`).
     Wkb(Vec<u8>),
 }
