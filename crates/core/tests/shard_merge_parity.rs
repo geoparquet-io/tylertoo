@@ -951,6 +951,16 @@ fn sharded_build_matches_monolithic_with_clustered_points() {
     assert_sharded_build_matches_monolithic(&input, grid_build(3, Flavor::ClusteredPoints));
 }
 
+/// #845: the level-capped coarse job's finest level is a clustered one, so the
+/// canonical singleton `point_count` rule must not refuse it at export.
+#[test]
+fn level_capped_coarse_job_matches_monolithic_with_clustered_points() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("points.parquet");
+    write_point_grid(&input);
+    assert_sharded_build_matches_monolithic(&input, capped(grid_build(3, Flavor::ClusteredPoints)));
+}
+
 /// The largest `coalesced_count` an overview holds over `levels`, read from
 /// the data: a file spanning more than one count has no folded statistic
 /// (#399).
