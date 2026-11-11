@@ -229,8 +229,8 @@ pub struct CoalescedLine<'a> {
 /// End discriminant of a chainable segment: 0 = first vertex, 1 = last.
 type End = u8;
 
-/// A free end in `join_pieces`' packed join table.
-const NO_JOIN: usize = usize::MAX;
+/// A free end in `join_walks`' packed join table.
+const NO_JOIN: u32 = u32::MAX;
 
 /// Quantized endpoint node key, namespaced by compatibility group.
 type NodeKey = (u32, i64, i64);
@@ -301,7 +301,8 @@ pub fn coalesce_level_lines(
     // One level only, so the chains take the exact join's runs instead of
     // borrowing them: the owned result then copies input lines only.
     let (chains, prio) = exact.into_chains(snap_tol(gsd_m, crs, params));
-    coalesce_chains(chains, lines, &prio, gsd_m, crs, config, params)
+    let count = chains.len();
+    coalesce_chains(chains, count, lines, &prio, gsd_m, crs, config, params)
         .into_iter()
         .map(|c| CoalescedLine {
             rep: c.rep,
@@ -349,9 +350,10 @@ pub fn coalesce_level_lines_with<'e>(
         return Vec::new();
     }
     // --- 1+2. Build chains (grouped endpoint joins + junction continuation).
-    let chains = exact.chains(snap_tol(gsd_m, crs, params));
+    let (count, chains) = exact.chains(snap_tol(gsd_m, crs, params));
     coalesce_chains(
         chains,
+        count,
         &exact.lines,
         &exact.prio,
         gsd_m,
@@ -361,10 +363,15 @@ pub fn coalesce_level_lines_with<'e>(
     )
 }
 
-/// Steps 3-4 of a level over its chains: merge, gate, thin, budget.
+/// Steps 3-4 of a level over its `count` chains: merge, gate, thin, budget.
 /// `prio` holds each line's cell-winner priority (Q1), parallel to `lines`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the level's chains, their count, and the level's inputs"
+)]
 fn coalesce_chains<'g>(
-    chains: Vec<RawChain<'g>>,
+    chains: impl IntoIterator<Item = RawChain<'g>>,
+    count: usize,
     lines: &[CoalesceInput<'_>],
     prio: &[Priority],
     gsd_m: f64,
@@ -375,32 +382,26 @@ fn coalesce_chains<'g>(
     let budget = params.budget;
     let gsd_units = crs.meters_to_units(gsd_m);
 
-    // --- 3. Merge geometry + inherit the best member's attributes. ----------
-    // `rep_pos` (the winning member's position in `lines`) rides along so the
-    // gate can read its sort key without a second lookup table.
-    let mut merged: Vec<(CoalescedLine, usize)> = Vec::with_capacity(chains.len());
+    // --- 3. Merge geometry + inherit the best member's attributes, and
+    // --- 4a. gate on the CHAIN's bbox diagonal, one chain at a time: no
+    // per-level `Vec` of chains or of merged lines between the steps (#851).
+    let gate = config.line_visibility * gsd_units;
+    let gate_sq = gate * gate;
+    let mut gated: Vec<(CoalescedLine, AssignFeature)> = Vec::with_capacity(count);
     for chain in chains {
+        // The winning member's position in `lines`: its sort key ranks the
+        // chain in thinning.
         let rep_pos = chain
             .members
             .iter()
             .copied()
             .reduce(|best, m| if prio[m].beats(&prio[best]) { m } else { best })
             .expect("chain has at least one member");
-        merged.push((
-            CoalescedLine {
-                rep: lines[rep_pos].index,
-                count: chain.members.len() as i32,
-                geom: chain.geom,
-            },
-            rep_pos,
-        ));
-    }
-
-    // --- 4a. Visibility gate on the CHAIN's bbox diagonal. -------------------
-    let gate = config.line_visibility * gsd_units;
-    let gate_sq = gate * gate;
-    let mut gated: Vec<(CoalescedLine, AssignFeature)> = Vec::with_capacity(merged.len());
-    for (line, rep_pos) in merged {
+        let line = CoalescedLine {
+            rep: lines[rep_pos].index,
+            count: chain.members.len() as i32,
+            geom: chain.geom,
+        };
         let bbox = geom_bbox(&line.geom);
         let (dx, dy) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
         if gate > 0.0 && dx * dx + dy * dy < gate_sq {
@@ -421,43 +422,37 @@ fn coalesce_chains<'g>(
 
     // --- 4b. Cell-winner thinning among the surviving chains. ----------------
     let cell_size = gsd_units * config.line_thinning;
-    let mut survivors: Vec<(CoalescedLine, AssignFeature)> =
-        if cell_size > 0.0 && !cell_size.is_nan() {
-            let chain_prio: Vec<Priority> = gated
-                .iter()
-                .map(|(_, f)| Priority::new(f.row(), config.sort_direction))
-                .collect();
-            // cell -> position of the best chain so far in `gated`.
-            let mut grid: HashMap<(i64, i64), usize> = HashMap::new();
-            for (pos, (_, feat)) in gated.iter().enumerate() {
-                let (cx, cy) = feat.center();
-                let key = (
-                    (cx / cell_size).floor() as i64,
-                    (cy / cell_size).floor() as i64,
-                );
-                grid.entry(key)
-                    .and_modify(|best| {
-                        if chain_prio[pos].beats(&chain_prio[*best]) {
-                            *best = pos;
-                        }
-                    })
-                    .or_insert(pos);
-            }
-            // Keep winners in ascending position order (stable, deterministic;
-            // O(n) — a per-winner `Vec::remove` here is quadratic on real data).
-            let mut keep = vec![false; gated.len()];
-            for pos in grid.into_values() {
-                keep[pos] = true;
-            }
-            gated
-                .into_iter()
-                .zip(&keep)
-                .filter(|(_, &k)| k)
-                .map(|(pair, _)| pair)
-                .collect()
-        } else {
-            gated
-        };
+    let mut survivors = gated;
+    if cell_size > 0.0 && !cell_size.is_nan() {
+        let gated = &survivors;
+        // Ranked as compared rather than held: a `Vec<Priority>` was
+        // 32 B per chain per level (#851).
+        let prio = |pos: usize| Priority::new(gated[pos].1.row(), config.sort_direction);
+        // cell -> position of the best chain so far in `gated`.
+        let mut grid: HashMap<(i64, i64), usize> = HashMap::new();
+        for (pos, (_, feat)) in gated.iter().enumerate() {
+            let (cx, cy) = feat.center();
+            let key = (
+                (cx / cell_size).floor() as i64,
+                (cy / cell_size).floor() as i64,
+            );
+            grid.entry(key)
+                .and_modify(|best| {
+                    if prio(pos).beats(&prio(*best)) {
+                        *best = pos;
+                    }
+                })
+                .or_insert(pos);
+        }
+        // Keep winners in ascending position order (stable, deterministic;
+        // O(n) — a per-winner `Vec::remove` here is quadratic on real data).
+        let mut keep = vec![false; gated.len()];
+        for pos in grid.into_values() {
+            keep[pos] = true;
+        }
+        let mut keep = keep.into_iter();
+        survivors.retain(|_| keep.next().expect("one flag per chain"));
+    }
 
     // --- 4c. Per-level density budget on chains (Q2 analog). -----------------
     if let Some((max_chains, gamma)) = budget {
@@ -488,12 +483,8 @@ fn coalesce_chains<'g>(
             for pos in chosen {
                 keep[pos] = true;
             }
-            survivors = survivors
-                .into_iter()
-                .zip(&keep)
-                .filter(|(_, &k)| k)
-                .map(|(pair, _)| pair)
-                .collect();
+            let mut keep = keep.into_iter();
+            survivors.retain(|_| keep.next().expect("one flag per chain"));
         }
     }
 
@@ -505,8 +496,7 @@ fn coalesce_chains<'g>(
 /// Unit direction of `p` at its `end`, pointing INTO the line away from
 /// the endpoint (toward the first distinct vertex). `None` when every
 /// vertex coincides (degenerate).
-fn piece_direction(p: &Piece, end: End) -> Option<(f64, f64)> {
-    let c = &p.coords;
+fn piece_direction(c: &[geo::Coord<f64>], end: End) -> Option<(f64, f64)> {
     let (anchor, inward) = if end == 0 {
         (c[0], c.iter().skip(1).find(|&&q| q != c[0]).copied())
     } else {
@@ -552,26 +542,52 @@ struct RawChain<'a> {
     geom: Cow<'a, Geometry<f64>>,
 }
 
-/// A joinable polyline piece during chaining: one or more already-merged
-/// source segments with an oriented coordinate run.
-///
-/// The run is a [`Cow`]: an unmerged piece BORROWS its source line's
-/// coordinates, so phase 1 no longer copies the whole input coordinate set
-/// before a single join happens (#570). Assembling a multi-piece walk
-/// allocates the merged run once, exactly as before.
-struct Piece<'a> {
-    /// Positions in the caller's `lines` slice, merged so far; a level's
-    /// snap pass borrows them from [`ExactChains`].
-    members: Cow<'a, [usize]>,
-    coords: Cow<'a, [geo::Coord<f64>]>,
-    group: u32,
-    /// The [`ExactChains`] geometry this piece still is, unmerged, in a
-    /// level's snap pass; [`MERGED`] otherwise.
-    src: usize,
+/// The walks one endpoint-join round makes over its pieces, flat: each step
+/// is `piece << 1 | entry end`, and walk `k` is
+/// `steps[ends[k - 1]..ends[k]]`. 8 B per piece, where a `Vec` of borrowed
+/// pieces was 64 B per piece per level (#851).
+struct Walks {
+    steps: Vec<u32>,
+    ends: Vec<u32>,
 }
 
-/// [`Piece::src`] of a piece that is not one exact-join geometry as is.
-const MERGED: usize = usize::MAX;
+impl Walks {
+    fn iter(&self) -> impl Iterator<Item = &[u32]> + '_ {
+        let mut start = 0usize;
+        self.ends.iter().map(move |&end| {
+            let walk = &self.steps[start..end as usize];
+            start = end as usize;
+            walk
+        })
+    }
+}
+
+/// One walk's merged members and coordinate run: each piece's members in
+/// walk order, its run reversed where the walk entered at the far end.
+fn assemble_walk<'c>(
+    walk: &[u32],
+    members: impl Fn(usize) -> &'c [usize],
+    coords: impl Fn(usize) -> &'c [geo::Coord<f64>],
+) -> (Vec<usize>, Vec<geo::Coord<f64>>) {
+    let pieces = || walk.iter().map(|&s| (s as usize >> 1, s & 1 == 1));
+    // Sized up front: grown push by push, the runs carried up to half their
+    // bytes again as slack, per level (#851). The coordinate count is an
+    // upper bound (joints dedupe).
+    let mut out_members: Vec<usize> =
+        Vec::with_capacity(pieces().map(|(pi, _)| members(pi).len()).sum());
+    let mut out_coords: Vec<geo::Coord<f64>> =
+        Vec::with_capacity(pieces().map(|(pi, _)| coords(pi).len()).sum());
+    for (pi, flip) in pieces() {
+        out_members.extend_from_slice(members(pi));
+        append_run(&mut out_coords, coords(pi), flip);
+    }
+    // Runs of repeated vertices dedupe away: give back an upper bound that
+    // overshot by more than one joint per piece.
+    if out_coords.capacity() - out_coords.len() > walk.len() {
+        out_coords.shrink_to_fit();
+    }
+    (out_members, out_coords)
+}
 
 /// Fewest lines [`ExactChains::new`] ranks in parallel.
 const PAR_RANK_MIN_LINES: usize = 4096;
@@ -618,7 +634,7 @@ fn build_chains<'a>(
 ) -> Vec<RawChain<'static>> {
     ExactChains::new(lines.to_vec(), junction_angle_deg, SortDirection::Desc)
         .chains(snap_tol)
-        .into_iter()
+        .1
         .map(|c| RawChain {
             members: Cow::Owned(c.members.into_owned()),
             geom: Cow::Owned(c.geom.into_owned()),
@@ -663,16 +679,11 @@ impl<'a> ExactChains<'a> {
     ) -> Self {
         // Chainable = plain LineString with >= 2 coordinates. Everything else
         // (MultiLineString, Line, degenerate) is an unmerged singleton.
-        let mut pieces: Vec<Piece<'a>> = Vec::new();
+        let mut chainable: Vec<usize> = Vec::new(); // positions in `lines`
         let mut singles: Vec<usize> = Vec::new(); // positions in `lines`
         for (pos, l) in lines.iter().enumerate() {
             match l.geom {
-                Geometry::LineString(ls) if ls.0.len() >= 2 => pieces.push(Piece {
-                    members: Cow::Owned(vec![pos]),
-                    coords: Cow::Borrowed(&ls.0[..]),
-                    group: l.group,
-                    src: MERGED,
-                }),
+                Geometry::LineString(ls) if ls.0.len() >= 2 => chainable.push(pos),
                 _ => singles.push(pos),
             }
         }
@@ -698,21 +709,36 @@ impl<'a> ExactChains<'a> {
         } else {
             lines.par_iter().map(rank).collect()
         };
-        let (pieces, geoms) = join_pieces(pieces, exact_key, junction_angle_deg)
-            .into_iter()
-            .map(|p| {
-                // An unmerged piece is its source line, unchanged.
-                let geom = match p.coords {
-                    Cow::Borrowed(_) if p.members.len() == 1 => {
-                        Cow::Borrowed(lines[p.members[0]].geom)
-                    }
-                    coords => {
-                        Cow::Owned(Geometry::LineString(LineString::new(coords.into_owned())))
-                    }
+        let run = |pi: usize| match lines[chainable[pi]].geom {
+            Geometry::LineString(ls) => &ls.0[..],
+            _ => unreachable!("chainable lines are LineStrings"),
+        };
+        let walks = join_walks(
+            chainable.len(),
+            run,
+            |pi| lines[chainable[pi]].group,
+            exact_key,
+            junction_angle_deg,
+        );
+        let (pieces, geoms) = walks
+            .iter()
+            .map(|walk| {
+                let (members, geom) = if let [step] = walk {
+                    // An unmerged piece is its source line, unchanged.
+                    let pos = chainable[*step as usize >> 1];
+                    (vec![pos], Cow::Borrowed(lines[pos].geom))
+                } else {
+                    let (members, coords) =
+                        assemble_walk(walk, |pi| std::slice::from_ref(&chainable[pi]), run);
+                    let geom = Geometry::LineString(LineString::new(coords));
+                    (members, Cow::Owned(geom))
                 };
-                ((p.members.into_owned(), p.group), geom)
+                let group = lines[members[0]].group;
+                ((members, group), geom)
             })
             .unzip();
+        drop(walks);
+        drop(chainable);
         Self {
             pieces,
             geoms,
@@ -729,53 +755,64 @@ impl<'a> ExactChains<'a> {
         &self.lines
     }
 
-    /// One level's snap pass (phase 2) over the exact join's pieces at
-    /// `snap_tol` (skipped when `snap_tol <= 0`): per chain, the exact-join
-    /// piece it still is (`Ok`), or the run the pass merged (`Err`).
-    fn snap(&self, snap_tol: f64) -> Vec<Result<usize, RawChain<'static>>> {
-        if snap_tol <= 0.0 {
-            return (0..self.pieces.len()).map(Ok).collect();
+    /// Exact-join piece `src`'s coordinate run.
+    fn run(&self, src: usize) -> &[geo::Coord<f64>] {
+        match &*self.geoms[src] {
+            Geometry::LineString(ls) => &ls.0[..],
+            _ => unreachable!("an exact-join piece is a LineString"),
         }
-        let pieces: Vec<Piece<'_>> = self
-            .pieces
-            .iter()
-            .zip(&self.geoms)
-            .enumerate()
-            .map(|(src, ((members, group), geom))| Piece {
-                members: Cow::Borrowed(members),
-                coords: match &**geom {
-                    Geometry::LineString(ls) => Cow::Borrowed(&ls.0[..]),
-                    _ => unreachable!("an exact-join piece is a LineString"),
-                },
-                group: *group,
-                src,
-            })
-            .collect();
-        join_pieces(
-            pieces,
-            |g, c| snap_key(g, c, snap_tol),
-            self.junction_angle_deg,
-        )
-        .into_iter()
-        .map(|p| {
-            if p.src == MERGED {
-                Err(RawChain {
-                    members: Cow::Owned(p.members.into_owned()),
-                    geom: Cow::Owned(Geometry::LineString(LineString::new(p.coords.into_owned()))),
-                })
+    }
+
+    /// One level's snap pass (phase 2) over the exact join's pieces at
+    /// `snap_tol` (skipped when `snap_tol <= 0`): the number of chains, and
+    /// per chain, in order, the exact-join piece it still is (`Ok`), or the
+    /// run the pass merged (`Err`), assembled as the caller takes it.
+    fn snap(
+        &self,
+        snap_tol: f64,
+    ) -> (
+        usize,
+        impl Iterator<Item = Result<usize, RawChain<'static>>> + '_,
+    ) {
+        let walks = (snap_tol > 0.0).then(|| {
+            join_walks(
+                self.pieces.len(),
+                |src| self.run(src),
+                |src| self.pieces[src].1,
+                |g, c| snap_key(g, c, snap_tol),
+                self.junction_angle_deg,
+            )
+        });
+        let len = walks.as_ref().map_or(self.pieces.len(), |w| w.ends.len());
+        let (mut k, mut start) = (0usize, 0usize);
+        let chains = std::iter::from_fn(move || {
+            let Some(walks) = &walks else {
+                k += 1;
+                return (k <= self.pieces.len()).then_some(Ok(k - 1));
+            };
+            let end = *walks.ends.get(k)? as usize;
+            let walk = &walks.steps[start..end];
+            (k, start) = (k + 1, end);
+            Some(if let [step] = walk {
+                Ok(*step as usize >> 1)
             } else {
-                Ok(p.src)
-            }
-        })
-        .collect()
+                let (members, coords) =
+                    assemble_walk(walk, |src| &self.pieces[src].0[..], |src| self.run(src));
+                Err(RawChain {
+                    members: Cow::Owned(members),
+                    geom: Cow::Owned(Geometry::LineString(LineString::new(coords))),
+                })
+            })
+        });
+        (len, chains)
     }
 
     /// One level's chains, borrowing the exact join's runs: the snap pass,
-    /// then the singletons.
-    fn chains(&self, snap_tol: f64) -> Vec<RawChain<'_>> {
-        let mut chains: Vec<RawChain<'_>> = self
-            .snap(snap_tol)
-            .into_iter()
+    /// then the singletons. With their count, so the caller consumes them as
+    /// they are assembled instead of holding a `Vec` of them (#851).
+    fn chains(&self, snap_tol: f64) -> (usize, impl Iterator<Item = RawChain<'_>> + '_) {
+        let (len, snapped) = self.snap(snap_tol);
+        let chains = snapped
             .map(|c| match c {
                 Ok(src) => RawChain {
                     members: Cow::Borrowed(&self.pieces[src].0),
@@ -783,15 +820,14 @@ impl<'a> ExactChains<'a> {
                 },
                 Err(merged) => merged,
             })
-            .collect();
-        chains.extend(self.singletons());
-        chains
+            .chain(self.singletons());
+        (len + self.singles.len(), chains)
     }
 
     /// [`chains`](Self::chains) for the one level of a join, taking its runs
     /// rather than borrowing them; with the lines' priorities.
     fn into_chains(mut self, snap_tol: f64) -> (Vec<RawChain<'a>>, Vec<Priority>) {
-        let snapped = self.snap(snap_tol);
+        let snapped: Vec<_> = self.snap(snap_tol).1.collect();
         let mut chains: Vec<RawChain<'a>> = Vec::with_capacity(snapped.len() + self.singles.len());
         for c in snapped {
             chains.push(match c {
@@ -831,8 +867,9 @@ thread_local! {
     static BASELINE_JUNCTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// One round of endpoint joining over `pieces`, with node keys produced by
-/// `key(group, endpoint)`.
+/// One round of endpoint joining over pieces `0..n` (piece `pi` is the run
+/// `coords(pi)` in group `group(pi)`), with node keys produced by
+/// `key(group, endpoint)`; the walks it makes, for the caller to assemble.
 ///
 /// - Nodes with exactly two incident endpoints from two DISTINCT pieces
 ///   join unconditionally (a degree-2 node is an unambiguous continuation).
@@ -846,11 +883,13 @@ thread_local! {
 /// Deterministic: components are walked in ascending piece index, starting
 /// from a free end (or the lowest-index piece of a cycle); junction pairs
 /// are ordered by (deviation, incident order).
-fn join_pieces<'a>(
-    pieces: Vec<Piece<'a>>,
+fn join_walks<'c>(
+    n: usize,
+    coords: impl Fn(usize) -> &'c [geo::Coord<f64>],
+    group: impl Fn(usize) -> u32,
     key: impl Fn(u32, geo::Coord<f64>) -> NodeKey,
     junction_angle_deg: f64,
-) -> Vec<Piece<'a>> {
+) -> Walks {
     // Endpoint incidences, grouped into per-node runs by sorting rather than
     // by a `HashMap<NodeKey, Vec<_>>` — which cost one heap `Vec` per node,
     // up to 2N of them (#570).
@@ -860,44 +899,45 @@ fn join_pieces<'a>(
     // every node's list was ordered `(piece asc, end asc)`. Packing the
     // incident as `piece << 1 | end` makes the sort tiebreaker exactly that
     // order, and each `(piece, end)` belongs to exactly one node, so the
-    // runs partition the same way. Node processing only reads `pieces` and
+    // runs partition the same way. Node processing only reads the runs and
     // writes this node's own `joins` slots, so the order the runs are
     // visited in cannot affect the result either (as before, when it was
     // hash order).
-    debug_assert!(pieces.len() <= usize::MAX >> 1);
-    let mut incidents: Vec<(NodeKey, usize)> = Vec::with_capacity(pieces.len() * 2);
-    for (pi, p) in pieces.iter().enumerate() {
-        let first = p.coords[0];
-        let last = p.coords[p.coords.len() - 1];
-        incidents.push((key(p.group, first), pi << 1));
-        incidents.push((key(p.group, last), (pi << 1) | 1));
+    assert!(
+        u32::try_from(n).is_ok_and(|n| n < NO_JOIN >> 1),
+        "{n} pieces overflow a packed u32 end"
+    );
+    let mut incidents: Vec<Incident> = Vec::with_capacity(n * 2);
+    for pi in 0..n {
+        let c = coords(pi);
+        let g = group(pi);
+        incidents.push(Incident::new(key(g, c[0]), (pi as u32) << 1));
+        incidents.push(Incident::new(key(g, c[c.len() - 1]), (pi as u32) << 1 | 1));
     }
     // Unique keys (`piece << 1 | end` is unique), so the parallel sort's
     // order is the serial one's.
     sort_unstable_maybe_par(&mut incidents, Ord::cmp);
 
     // Joins: per piece, the (other piece, other end) connected at each end,
-    // packed as `piece << 1 | end` ([`NO_JOIN`] for a free end): half the
-    // bytes of an `Option<(usize, End)>` pair, per piece per level.
-    let mut joins: Vec<[usize; 2]> = vec![[NO_JOIN; 2]; pieces.len()];
-    let unpack = |v: usize| (v != NO_JOIN).then_some((v >> 1, (v & 1) as End));
+    // packed as `piece << 1 | end` ([`NO_JOIN`] for a free end).
+    let mut joins: Vec<[u32; 2]> = vec![[NO_JOIN; 2]; n];
+    let unpack = |v: u32| (v != NO_JOIN).then_some((v as usize >> 1, (v & 1) as End));
     let mut run_start = 0usize;
     while run_start < incidents.len() {
         let mut run_end = run_start + 1;
-        while run_end < incidents.len() && incidents[run_end].0 == incidents[run_start].0 {
+        while run_end < incidents.len() && incidents[run_end].node() == incidents[run_start].node()
+        {
             run_end += 1;
         }
         let run = &incidents[run_start..run_end];
         run_start = run_end;
 
         // `(piece, end)` of the run's k-th incident, in the old map's order.
-        let inc = |k: usize| -> (usize, End) { (run[k].1 >> 1, (run[k].1 & 1) as End) };
+        let inc = |k: usize| -> (usize, End) { (run[k].at as usize >> 1, (run[k].at & 1) as End) };
         let d = run.len();
         if d == 2 && inc(0).0 != inc(1).0 {
-            let (a, a_end) = inc(0);
-            let (b, b_end) = inc(1);
-            joins[a][a_end as usize] = b << 1 | b_end as usize;
-            joins[b][b_end as usize] = a << 1 | a_end as usize;
+            joins[run[0].at as usize >> 1][(run[0].at & 1) as usize] = run[1].at;
+            joins[run[1].at as usize >> 1][(run[1].at & 1) as usize] = run[0].at;
         } else if d >= 3 && junction_angle_deg > 0.0 {
             // Junction continuation (stroke building): pair up incidents
             // that continue each other within the angular threshold,
@@ -907,30 +947,25 @@ fn join_pieces<'a>(
             let dirs: Vec<Option<(f64, f64)>> = (0..d)
                 .map(|k| {
                     let (pi, e) = inc(k);
-                    piece_direction(&pieces[pi], e)
+                    piece_direction(coords(pi), e)
                 })
                 .collect();
             let piece_ids: Vec<_> = (0..d).map(|k| inc(k).0).collect();
             for (i, j) in junction_pairs(&dirs, &piece_ids, junction_angle_deg) {
-                let (a, a_end) = inc(i);
-                let (b, b_end) = inc(j);
-                joins[a][a_end as usize] = b << 1 | b_end as usize;
-                joins[b][b_end as usize] = a << 1 | a_end as usize;
+                joins[run[i].at as usize >> 1][(run[i].at & 1) as usize] = run[j].at;
+                joins[run[j].at as usize >> 1][(run[j].at & 1) as usize] = run[i].at;
             }
         }
     }
     drop(incidents);
 
-    // Walk components deterministically (ascending piece index), assembling
-    // each walk's merged piece as soon as it is walked. The k-th walk's piece
-    // goes into slot k: walk k starts at a piece index >= k, and every piece
-    // below its start was consumed by an earlier walk, so slot k is already
-    // empty. No list of walks, and no second vector of pieces (#851).
-    let mut slots: Vec<Option<Piece<'a>>> = pieces.into_iter().map(Some).collect();
-    let mut visited = vec![false; slots.len()];
-    let mut walk: Vec<(usize, End)> = Vec::new();
-    let mut walks = 0usize;
-    for start in 0..slots.len() {
+    // Walk components deterministically (ascending piece index).
+    let mut visited = vec![false; n];
+    let mut walks = Walks {
+        steps: Vec::with_capacity(n),
+        ends: Vec::new(),
+    };
+    for start in 0..n {
         if visited[start] {
             continue;
         }
@@ -956,16 +991,14 @@ fn join_pieces<'a>(
 
         // Forward walk from the head, entering each piece at `entry` and
         // exiting at the opposite end.
-        let (head, head_entry) = (cur, cur_end);
-        walk.clear();
-        walk.push((head, head_entry));
-        visited[head] = true;
-        let (mut cur, mut entry) = (head, head_entry);
+        let (mut cur, mut entry) = (cur, cur_end);
+        walks.steps.push((cur as u32) << 1 | u32::from(entry));
+        visited[cur] = true;
         loop {
             let exit = 1 - entry;
             match unpack(joins[cur][exit as usize]) {
                 Some((next, next_end)) if !visited[next] => {
-                    walk.push((next, next_end));
+                    walks.steps.push((next as u32) << 1 | u32::from(next_end));
                     visited[next] = true;
                     cur = next;
                     entry = next_end;
@@ -973,55 +1006,30 @@ fn join_pieces<'a>(
                 _ => break, // free end, junction, or cycle closed
             }
         }
-
-        // Assemble the merged piece. Consume the inputs by index (each
-        // appears in exactly one walk), reversing where the walk entered at
-        // the far end.
-        let piece = if let [(pi, _)] = walk[..] {
-            slots[pi].take().expect("piece consumed once")
-        } else {
-            // Sized up front: grown push by push, the runs carried up to
-            // half their bytes again as slack, per level (#851). The
-            // coordinate count is an upper bound (joints dedupe).
-            let piece = |pi: usize| slots[pi].as_ref().expect("piece consumed once");
-            let mut members: Vec<usize> =
-                Vec::with_capacity(walk.iter().map(|&(pi, _)| piece(pi).members.len()).sum());
-            let mut coords: Vec<geo::Coord<f64>> =
-                Vec::with_capacity(walk.iter().map(|&(pi, _)| piece(pi).coords.len()).sum());
-            let mut group = 0u32;
-            for &(pi, seg_entry) in &walk {
-                let p = slots[pi].take().expect("piece consumed once");
-                members.extend_from_slice(&p.members);
-                group = p.group;
-                // Reversing in place and then appending forward is the same
-                // sequence as appending in reverse — done this way so a
-                // borrowed run never has to be cloned just to be flipped.
-                append_run(&mut coords, &p.coords, seg_entry == 1);
-            }
-            // Runs of repeated vertices dedupe away: give back an upper
-            // bound that overshot by more than one joint per piece.
-            if coords.capacity() - coords.len() > walk.len() {
-                coords.shrink_to_fit();
-            }
-            Piece {
-                members: Cow::Owned(members),
-                coords: Cow::Owned(coords),
-                group,
-                src: MERGED,
-            }
-        };
-        debug_assert!(
-            slots[walks].is_none(),
-            "walk {walks}'s slot still holds a piece"
-        );
-        slots[walks] = Some(piece);
-        walks += 1;
+        walks.ends.push(walks.steps.len() as u32);
     }
-    slots.truncate(walks);
-    slots
-        .into_iter()
-        .map(|p| p.expect("every walk filled its slot"))
-        .collect()
+    walks
+}
+
+/// One endpoint incidence in [`join_walks`]: its node key and
+/// `piece << 1 | end`. Ordered by (node, end) as the `(NodeKey, usize)`
+/// tuple it replaces, in 24 B instead of 32 (#851).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Incident {
+    group: u32,
+    x: i64,
+    y: i64,
+    at: u32,
+}
+
+impl Incident {
+    fn new((group, x, y): NodeKey, at: u32) -> Self {
+        Self { group, x, y, at }
+    }
+
+    fn node(&self) -> NodeKey {
+        (self.group, self.x, self.y)
+    }
 }
 
 /// Candidate keys reproduce the old lexicographic (deviation, i, j) sort.
@@ -1502,26 +1510,19 @@ mod tests {
         let c = |x: f64| Coord { x, y: 0.0 };
         let mut a = vec![c(0.0); 10_000];
         a.push(c(100.0));
-        let pieces = vec![
-            Piece {
-                members: Cow::Owned(vec![0]),
-                coords: Cow::Owned(a),
-                group: 0,
-                src: MERGED,
-            },
-            Piece {
-                members: Cow::Owned(vec![1]),
-                coords: Cow::Owned(vec![c(100.0), c(200.0)]),
-                group: 0,
-                src: MERGED,
-            },
-        ];
-        let out = join_pieces(pieces, |g, p| (g, p.x as i64, p.y as i64), 180.0);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].coords.len(), 3);
-        let Cow::Owned(coords) = &out[0].coords else {
-            panic!("a merge owns its coords")
-        };
+        let runs = [a, vec![c(100.0), c(200.0)]];
+        let members = [[0usize], [1]];
+        let walks = join_walks(
+            2,
+            |pi| &runs[pi][..],
+            |_| 0,
+            |g, p| (g, p.x as i64, p.y as i64),
+            180.0,
+        );
+        let walk: Vec<&[u32]> = walks.iter().collect();
+        assert_eq!(walk.len(), 1);
+        let (_, coords) = assemble_walk(walk[0], |pi| &members[pi][..], |pi| &runs[pi][..]);
+        assert_eq!(coords.len(), 3);
         assert!(coords.capacity() <= 3 + 2, "capacity {}", coords.capacity());
     }
 
@@ -2465,16 +2466,15 @@ mod lazy_pairing_tests {
 mod chain_stage_cost_tests {
     use super::*;
 
-    #[test]
-    fn level_chain_stage_peak_live_bytes_is_bounded() {
+    /// One level's chain-stage live peak over the fixture's exact pieces at
+    /// `gsd_m`, and the level's chain count; `None` outside nextest.
+    fn level_chain_stage_peak(gsd_m: f64) -> Option<(usize, usize, usize)> {
         if std::env::var_os("NEXTEST_EXECUTION_MODE").as_deref()
             != Some(std::ffi::OsStr::new("process-per-test"))
         {
             eprintln!("skipped: the dhat peak is only valid with one test per process (nextest)");
-            return;
+            return None;
         }
-        const STRANDS: usize = 20_000;
-        const SEGMENTS: usize = 10;
         // Every other joint is a 1 cm gap: the exact join merges segment
         // pairs, the level's snap pass merges the pairs into strands.
         let geoms: Vec<Geometry<f64>> = (0..STRANDS)
@@ -2515,7 +2515,7 @@ mod chain_stage_cost_tests {
             let base = dhat::HeapStats::get().curr_bytes;
             let chains = coalesce_level_lines_with(
                 &exact,
-                1.0,
+                gsd_m,
                 Crs::Epsg3857,
                 &AssignConfig::default(),
                 &params,
@@ -2529,9 +2529,17 @@ mod chain_stage_cost_tests {
         let pieces = exact.pieces.len();
         assert_eq!(pieces, STRANDS * 6);
         eprintln!(
-            "level chain stage peak: {peak} B, {} B per exact piece; {chains} chains",
+            "level chain stage peak at gsd {gsd_m}: {peak} B, {} B per exact piece; {chains} chains",
             peak / pieces
         );
+        Some((peak, pieces, chains))
+    }
+
+    #[test]
+    fn level_chain_stage_peak_live_bytes_is_bounded() {
+        let Some((peak, pieces, chains)) = level_chain_stage_peak(1.0) else {
+            return;
+        };
         assert_eq!(chains, STRANDS, "the snap pass joins each strand");
         assert!(
             peak <= pieces * PEAK_BYTES_PER_PIECE,
@@ -2540,7 +2548,31 @@ mod chain_stage_cost_tests {
         );
     }
 
+    /// A level whose snap tolerance closes no gap keeps every exact piece as
+    /// its own chain, so the level's chain list is as long as the join's.
+    #[test]
+    fn unsnapped_level_chain_stage_peak_live_bytes_is_bounded() {
+        let Some((peak, pieces, chains)) = level_chain_stage_peak(1e-6) else {
+            return;
+        };
+        assert_eq!(chains, pieces, "no gap closes at this tolerance");
+        assert!(
+            peak <= pieces * UNSNAPPED_PEAK_BYTES_PER_PIECE,
+            "level chain stage peak {peak} B over {} B per exact piece",
+            UNSNAPPED_PEAK_BYTES_PER_PIECE
+        );
+    }
+
+    const STRANDS: usize = 20_000;
+    const SEGMENTS: usize = 10;
+
+    /// Bytes per exact piece one level's chain stage may hold at once when
+    /// every piece stays its own chain. Measured 217 B with the chains
+    /// consumed as assembled and thinning ranking in place (249 B before).
+    const UNSNAPPED_PEAK_BYTES_PER_PIECE: usize = 230;
+
     /// Bytes per exact-join piece one level's chain stage may hold at once.
-    /// Measured 163 B after #851 (237 B before it).
-    const PEAK_BYTES_PER_PIECE: usize = 175;
+    /// Measured 109 B with flat walks and 24 B incidents (163 B before them,
+    /// 237 B before #851).
+    const PEAK_BYTES_PER_PIECE: usize = 115;
 }
