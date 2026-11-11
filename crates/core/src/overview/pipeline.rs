@@ -1225,6 +1225,12 @@ pub(super) fn spill_temp_file(spill_dir: Option<&Path>) -> std::io::Result<Named
         })
 }
 
+/// Shared level batches the RAM drain rebuilds at once (at most its encode
+/// width). Lines z0-13 auto, pass 2 / peak RSS by width: 1: 1.88 s / 2.74 GB,
+/// 4: 1.22 / 2.99, 8: 1.10 / 3.11, 16: 1.11 / 3.39, 64: 1.03 / 3.56 (base,
+/// before #852: 1.04 / 3.93). Past 8 the wall barely moves and the peak climbs.
+const DRAIN_REBUILD_AHEAD: usize = 8;
+
 /// Batches a level's spill-writer thread may hold ahead of the consumer.
 ///
 /// The queue exists to absorb write jitter (an fsync-adjacent stall, a
@@ -1672,7 +1678,7 @@ pub(super) fn run_pass2_buffered(
     for li in 0..num_levels {
         let sink = std::mem::replace(&mut sinks[li], LevelSink::Ram(Vec::new()));
         let t_drain_level = Instant::now();
-        let outcome = drain_sink(writer, li, hints[li], sink, &timers)?;
+        let outcome = drain_sink(writer, li, hints[li], sink, width, &timers)?;
         log::debug!(
             "[profile] level {li}: rows={} spill={:.2} MiB drain={:.2}s",
             rows[li],
@@ -1735,22 +1741,37 @@ fn drain_sink(
     level_idx: usize,
     hint: usize,
     sink: LevelSink,
+    width: usize,
     timers: &Pass2Timers,
 ) -> Result<LevelWriteOutcome, ConvertError> {
     let t_drain = Instant::now();
     let outcome = match sink {
         LevelSink::Ram(batches) => {
-            // Rebuilt on their own thread, as a spilled level decodes, so
-            // the writer's thread only feeds row groups.
+            // Rebuilt off the writer's thread, as a spilled level decodes,
+            // and several at a time, in order: one thread rebuilding every
+            // shared level batch (#852) left the drain's encodes waiting.
             scoped_pipe(
                 SPILL_QUEUE_DEPTH,
                 move |tx: &Sender<RecordBatch>| -> Result<(), ConvertError> {
-                    for batch in batches {
-                        if tx.send(batch.materialize()?).is_err() {
-                            break; // the writer failed; its error is reported
+                    let mut batches = batches.into_iter();
+                    loop {
+                        let chunk: Vec<LevelBatch> = batches
+                            .by_ref()
+                            .take(width.clamp(1, DRAIN_REBUILD_AHEAD))
+                            .collect();
+                        if chunk.is_empty() {
+                            return Ok(());
+                        }
+                        let built = chunk
+                            .into_par_iter()
+                            .map(LevelBatch::materialize)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        for batch in built {
+                            if tx.send(batch).is_err() {
+                                return Ok(()); // the writer failed; its error is reported
+                            }
                         }
                     }
-                    Ok(())
                 },
                 |rx: Receiver<RecordBatch>| {
                     Ok(writer.write_level(level_idx, Some(hint), rx.into_iter())?)
