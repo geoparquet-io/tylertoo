@@ -7,6 +7,10 @@ facade contract: surviving keyword arguments, removed-argument errors,
 end-to-end output validity, and temp-file cleanup.
 """
 
+import json
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -459,27 +463,31 @@ class TestConvertSpillDir:
 
 
 @pytest.mark.parametrize("env_threads", [None, "40"])
-def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(tmp_path, env_threads):
+def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(
+    tmp_path, env_threads
+):
     """Importing the module sizes the worker pool as the CLI does: the cores
     capped at 32, an explicit RAYON_NUM_THREADS verbatim. A subprocess, since
     the pool is process-wide and sized once."""
-    import json
-    import os
-    import subprocess
-    import sys
-
     fixture = FIXTURES_DIR / "streaming" / "multi-rowgroup-small.parquet"
     profile = tmp_path / "profile.jsonl"
     env = {k: v for k, v in os.environ.items() if k != "RAYON_NUM_THREADS"}
     env["TYLERTOO_PROFILE_JSON"] = str(profile)
     if env_threads:
         env["RAYON_NUM_THREADS"] = env_threads
-    code = "import sys, tylertoo; tylertoo.convert(input=sys.argv[1], output=sys.argv[2], max_zoom=2)"
+    code = (
+        "import sys, tylertoo; "
+        "tylertoo.convert(input=sys.argv[1], output=sys.argv[2], max_zoom=2)"
+    )
     subprocess.run(
         [sys.executable, "-c", code, str(fixture), str(tmp_path / "out.pmtiles")],
         env=env,
         check=True,
     )
     threads = json.loads(profile.read_text().splitlines()[0])["threads"]
-    expected = int(env_threads) if env_threads else min(os.cpu_count() or 1, 32)
-    assert threads == expected
+    if env_threads:
+        assert threads == int(env_threads)
+    else:
+        # Exact sizing is pinned in Rust; os.cpu_count() ignores affinity and
+        # cgroup quotas, which Rust's core count honours.
+        assert 1 <= threads <= 32
