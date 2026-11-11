@@ -248,6 +248,7 @@ impl Server {
     ///
     /// The listening socket failed.
     pub fn run(mut self, mut keep_going: impl FnMut() -> bool) -> Result<(), ServeError> {
+        let mut result = Ok(());
         while keep_going() {
             let ended: Vec<Done> = self.done.1.try_iter().collect();
             for (addr, counted) in ended {
@@ -262,7 +263,14 @@ impl Server {
                     }
                 }
             }
-            if let Some(req) = self.http.recv_timeout(Duration::from_millis(200))? {
+            let req = match self.http.recv_timeout(Duration::from_millis(200)) {
+                Ok(req) => req,
+                Err(e) => {
+                    result = Err(e.into());
+                    break;
+                }
+            };
+            if let Some(req) = req {
                 let addr = req.remote_addr().copied();
                 match addr.and_then(|a| self.sending.get_mut(&a)) {
                     Some(queue) => queue.push_back(req),
@@ -270,7 +278,12 @@ impl Server {
                 }
             }
         }
-        Ok(())
+        // A queued request answers 500 when dropped, after the response
+        // ahead of it: drop them off this thread, or a stalled download
+        // would hold up the stop.
+        let queued = std::mem::take(&mut self.sending);
+        std::thread::spawn(move || drop(queued));
+        result
     }
 
     /// Answer `req` on a thread of its own, so that a client which stops

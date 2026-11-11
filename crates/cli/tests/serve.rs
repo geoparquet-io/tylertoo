@@ -180,7 +180,7 @@ fn index_is_a_reserved_archive_name() {
 }
 
 /// A client stalled mid-download of a whole archive blocks neither other
-/// requests nor the server's stop poll.
+/// requests nor the server's stop.
 #[test]
 fn a_stalled_download_blocks_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -197,7 +197,14 @@ fn a_stalled_download_blocks_nothing() {
     let handle = std::thread::spawn(move || server.run(|| stopped.try_recv().is_err()));
 
     let mut stalled = TcpStream::connect(&addr).unwrap();
-    write!(stalled, "GET /big.pmtiles HTTP/1.0\r\nHost: {addr}\r\n\r\n").unwrap();
+    // The second request, pipelined, waits behind the stalled download;
+    // it must not hold up the stop either.
+    write!(
+        stalled,
+        "GET /big.pmtiles HTTP/1.1\r\nHost: {addr}\r\n\r\n\
+         GET /big/9/3/0.mvt HTTP/1.1\r\nHost: {addr}\r\n\r\n"
+    )
+    .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert_eq!(get(&addr, "/big/9/3/0.mvt", "").0, 200);
 
