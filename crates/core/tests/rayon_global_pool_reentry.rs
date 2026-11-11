@@ -7,6 +7,7 @@
 //! worker that could build them. Its own binary, because the global pool
 //! can be sized once per process.
 
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -34,7 +35,28 @@ fn convert_finishes_on_a_global_pool_worker_while_the_other_is_busy() {
     busy.recv().expect("one worker is busy");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let output = dir.path().join("overview.parquet");
+    let outcome = convert_on_the_pool(&input, &dir.path().join("overview.parquet"));
+    // A writer that fails mid-drain must report its error, not wait on a
+    // rebuild only this worker could run. Linux's `/dev/full` fails writes.
+    let failed =
+        cfg!(target_os = "linux").then(|| convert_on_the_pool(&input, Path::new("/dev/full")));
+    let _ = release.send(());
+    outcome
+        .expect("deadlocked on a global pool worker")
+        .expect("convert");
+    if let Some(failed) = failed {
+        failed
+            .expect("deadlocked on a global pool worker after a write error")
+            .expect_err("writes to /dev/full fail");
+    }
+}
+
+/// Convert on a global pool worker; `Err` when it does not finish.
+fn convert_on_the_pool(
+    input: &Path,
+    output: &Path,
+) -> Result<Result<(), String>, mpsc::RecvTimeoutError> {
+    let (input, output) = (input.to_owned(), output.to_owned());
     let (tx, rx) = mpsc::channel();
     rayon::spawn(move || {
         let result = convert_to_overviews(
@@ -47,9 +69,5 @@ fn convert_finishes_on_a_global_pool_worker_while_the_other_is_busy() {
         );
         let _ = tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
     });
-    let outcome = rx.recv_timeout(Duration::from_secs(60));
-    let _ = release.send(());
-    outcome
-        .expect("deadlocked on a global pool worker")
-        .expect("convert");
+    rx.recv_timeout(Duration::from_secs(60))
 }

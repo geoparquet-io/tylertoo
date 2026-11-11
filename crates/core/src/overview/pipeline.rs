@@ -1736,6 +1736,10 @@ pub(super) fn run_pass2_buffered(
 /// the spill path reuses the error-parking discipline of
 /// `write_level_streaming` because `write_level` consumes an infallible
 /// iterator but Arrow IPC read-back can fail.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: a per-call stop flag for the drain's rebuild helper, not process state"
+)]
 fn drain_sink(
     writer: &mut OverviewWriter<File>,
     level_idx: usize,
@@ -1744,17 +1748,20 @@ fn drain_sink(
     width: usize,
     timers: &Pass2Timers,
 ) -> Result<LevelWriteOutcome, ConvertError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let t_drain = Instant::now();
     let outcome = match sink {
         LevelSink::Ram(batches) => {
             // Rebuilt off the writer's thread, as a spilled level decodes,
             // and several at a time, in order: one thread rebuilding every
             // shared level batch (#852) left the drain's encodes waiting.
+            let stop = &AtomicBool::new(false);
             scoped_pipe(
                 SPILL_QUEUE_DEPTH,
                 move |tx: &Sender<RecordBatch>| -> Result<(), ConvertError> {
                     let mut batches = batches.into_iter();
-                    loop {
+                    while !stop.load(Ordering::Relaxed) {
                         let chunk: Vec<LevelBatch> = batches
                             .by_ref()
                             .take(width.clamp(1, DRAIN_REBUILD_AHEAD))
@@ -1772,11 +1779,22 @@ fn drain_sink(
                             }
                         }
                     }
+                    Ok(())
                 },
                 |rx: Receiver<RecordBatch>| {
                     // The rebuild runs on the global pool: a worker waiting
                     // here must help run it, or with the other workers busy
                     // nothing does (`tests/rayon_global_pool_reentry.rs`).
+                    // That holds on a writer error or panic too, before
+                    // `scoped_pipe` joins the producer.
+                    struct HelpUntilDone<'a>(&'a Receiver<RecordBatch>, &'a AtomicBool);
+                    impl Drop for HelpUntilDone<'_> {
+                        fn drop(&mut self) {
+                            self.1.store(true, Ordering::Relaxed);
+                            while recv_in_pool(self.0).is_ok() {}
+                        }
+                    }
+                    let _help = HelpUntilDone(&rx, stop);
                     let batches = std::iter::from_fn(|| recv_in_pool(&rx).ok());
                     Ok(writer.write_level(level_idx, Some(hint), batches)?)
                 },
