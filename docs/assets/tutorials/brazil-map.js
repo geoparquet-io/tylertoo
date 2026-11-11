@@ -6,6 +6,13 @@
   const protocol = new pmtiles.Protocol();
   maplibregl.addProtocol("pmtiles", protocol.tile);
   const archive = new URL("../../assets/tutorials/brazil.pmtiles", document.baseURI).href;
+  // Fetch the small archive once and slice it here: `zensical serve` and
+  // some static hosts ignore HTTP Range requests, which pmtiles.js needs.
+  const bytes = fetch(archive).then((r) => r.arrayBuffer());
+  protocol.add(new pmtiles.PMTiles({
+    getKey: () => archive,
+    getBytes: async (offset, length) => ({ data: (await bytes).slice(offset, offset + length) }),
+  }));
   const map = new maplibregl.Map({
     container: el,
     style: "https://tiles.openfreemap.org/styles/positron",
