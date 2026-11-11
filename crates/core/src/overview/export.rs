@@ -5693,10 +5693,12 @@ fn fanout_batch_members(
     // members at every level (as the legacy path does per wave).
     let cols = AttrColumns::new(&schema, geom_idx, published, feature_id);
     let mut attrs = cols.extract(batch);
-    let rows: Vec<(SharedProps, Option<u64>)> = (0..batch.num_rows())
-        .map(|row| attrs.row(row))
+    let ids: Vec<Option<u64>> = (0..batch.num_rows())
+        .map(|row| attrs.id(row))
         .collect::<Result<_, _>>()?;
-    for (row, (_, id)) in rows.iter().enumerate() {
+    // Built at a row's first member, so a memberless row allocates none.
+    let mut row_props: Vec<Option<SharedProps>> = vec![None; batch.num_rows()];
+    for (row, id) in ids.iter().enumerate() {
         if let Some(id) = *id {
             for &k in &targets {
                 diagnostics.source_member_loss(
@@ -5729,7 +5731,11 @@ fn fanout_batch_members(
             .collect();
         let t_level = Instant::now();
         for (row, items) in clipped.into_iter().enumerate() {
-            let (props, id) = &rows[row];
+            if items.is_empty() {
+                continue;
+            }
+            let props = &*row_props[row].get_or_insert_with(|| attrs.props(row));
+            let id = ids[row];
             let (gap, band) = row_gaps[row];
             for (key, geom) in items {
                 let pidx = route_partition(&plan.partitions, key);
@@ -5741,7 +5747,7 @@ fn fanout_batch_members(
                         seq: *seq + row as u64,
                         geom,
                         props: Arc::clone(props),
-                        id: *id,
+                        id,
                         gap,
                         band,
                     },
@@ -7456,13 +7462,14 @@ fn collect_member_chunk(
         let source_row = input.locator.global_row(input.first_read + row).ok_or(
             crate::Error::GeoParquetRead(crate::GeoParquetReadError::RowDomainExceeded),
         )?;
-        let (props, id) = attrs.row(i)?;
+        let id = attrs.id(i)?;
         if let Some(id) = id {
             out.losses.push((source_row, id));
         }
         if items.is_empty() {
             continue;
         }
+        let props = attrs.props(i);
         let (gap, band) = input.row_gaps[row];
         for (key, geom) in std::mem::take(items) {
             out.buckets[route_partition(input.wave, key)].push(Member {
@@ -10371,19 +10378,9 @@ struct BatchAttributes<'a> {
 }
 
 impl BatchAttributes<'_> {
-    /// Row `row`'s properties (shared across its members via `Arc`) and its
-    /// `--feature-id`, if one is set.
-    ///
-    /// Moves the row's values out of the extracted columns rather than
-    /// cloning them, so call it at most once per row. A second call would
-    /// return no properties; debug builds panic on it instead.
-    fn row(&mut self, row: usize) -> Result<(SharedProps, Option<u64>), ExportError> {
-        #[cfg(debug_assertions)]
-        assert!(
-            !std::mem::replace(&mut self.read[row], true),
-            "BatchAttributes::row({row}) read twice: its values were already moved out"
-        );
-        let id = match &self.ids {
+    /// Row `row`'s `--feature-id`, if one is set.
+    fn id(&self, row: usize) -> Result<Option<u64>, ExportError> {
+        Ok(match &self.ids {
             None => None,
             // `validate_feature_id_column` already vouched for every row of
             // the file, so this only fires if the file changed underneath
@@ -10395,14 +10392,38 @@ impl BatchAttributes<'_> {
                     fid.name
                 )))
             })?),
-        };
-        let props = self
-            .props
-            .iter_mut()
-            .filter_map(|(name, col)| col[row].take().map(|v| (Arc::clone(name), v)))
-            .collect();
-        Ok((Arc::new(props), id))
+        })
     }
+
+    /// Row `row`'s properties, shared across its members via `Arc`. Build
+    /// them only for a row that yields a member: a memberless row's would be
+    /// allocated for nothing.
+    ///
+    /// Moves the row's values out of the extracted columns rather than
+    /// cloning them, so call it at most once per row. A second call would
+    /// return no properties; debug builds panic on it instead.
+    fn props(&mut self, row: usize) -> SharedProps {
+        #[cfg(debug_assertions)]
+        assert!(
+            !std::mem::replace(&mut self.read[row], true),
+            "BatchAttributes::props({row}) read twice: its values were already moved out"
+        );
+        #[cfg(test)]
+        PROPS_BUILT.with(|n| n.set(n.get() + 1));
+        Arc::new(
+            self.props
+                .iter_mut()
+                .filter_map(|(name, col)| col[row].take().map(|v| (Arc::clone(name), v)))
+                .collect(),
+        )
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Rows whose properties [`BatchAttributes::props`] built on this thread
+    /// (test counter).
+    static PROPS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// MVT-encodable Arrow scalar types.
@@ -15894,7 +15915,7 @@ mod tests {
         let published = PublishedNames::identity();
         let cols = AttrColumns::new(&schema, 2, &published, None);
         let mut attrs = cols.extract(&batch);
-        let rows: Vec<SharedProps> = (0..3).map(|r| attrs.row(r).unwrap().0).collect();
+        let rows: Vec<SharedProps> = (0..3).map(|r| attrs.props(r)).collect();
 
         let pairs = |p: &SharedProps| -> Vec<(String, PropertyValue)> {
             p.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
@@ -15927,7 +15948,7 @@ mod tests {
         }
     }
 
-    /// #461: `BatchAttributes::row` moves values out, so a second read of
+    /// #461: `BatchAttributes::props` moves values out, so a second read of
     /// the same row would silently return no properties. Debug builds catch
     /// that misuse instead of dropping a feature's attributes.
     #[test]
@@ -15948,8 +15969,8 @@ mod tests {
         .unwrap();
         let published = PublishedNames::identity();
         let mut attrs = AttrColumns::new(&schema, 1, &published, None).extract(&batch);
-        attrs.row(0).unwrap();
-        let _ = attrs.row(0);
+        attrs.props(0);
+        let _ = attrs.props(0);
     }
 
     /// The selected-columns predicate and the extraction arms must agree: a
@@ -18356,29 +18377,14 @@ mod tests {
         assert_eq!(plan(32, MemoryProfile::Bounded).partitions.len(), 4);
     }
 
-    /// #815: in a partitioning fill a feature that no level clips is held
-    /// once. Every level's member of it shares the decoded geometry, where
-    /// each level held its own copy (the copies were most of a Moldova
-    /// partitioning export's peak heap).
-    #[test]
-    fn partitioning_fill_holds_an_unclipped_feature_once() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let square = |x: f64, y: f64| {
-            Geometry::Polygon(geo::Polygon::new(
-                LineString::from(vec![(x, y), (x + 0.1, y), (x + 0.1, y + 0.1), (x, y)]),
-                vec![],
-            ))
-        };
-        // Squares well inside one tile at every level's zoom (z2, z4, z6).
-        let meta = write_partitioning_fixture(
-            tmp.path(),
-            &[
-                (vec![0, 1], vec![square(-100.3, 40.3), square(10.3, 10.3)]),
-                (vec![2], vec![square(50.3, -20.3)]),
-                (vec![3], vec![square(-60.3, 5.3)]),
-            ],
-        );
-        let reader = OverviewReader::open(tmp.path()).unwrap();
+    /// Write a partitioning fixture of `level_geoms` to `path` and fill the
+    /// single-read member store from it, every level one wave.
+    fn fill_partitioning_fixture(
+        path: &Path,
+        level_geoms: &[(Vec<i64>, Vec<Geometry<f64>>)],
+    ) -> MemberStore {
+        let meta = write_partitioning_fixture(path, level_geoms);
+        let reader = OverviewReader::open(path).unwrap();
         let opts = ExportOptions::default();
         let diagnostics = crate::diagnostics::Diagnostics::default();
         let scans = scan_all_levels(
@@ -18405,7 +18411,7 @@ mod tests {
                 }
             })
             .collect();
-        let store = fill_member_store(
+        fill_member_store(
             &reader,
             &FanoutCtx {
                 crs: Crs::Epsg4326,
@@ -18422,7 +18428,57 @@ mod tests {
             },
             &diagnostics,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// A row of a partitioning fill that yields no member builds no
+    /// properties: only the rows with members do (Codex C2).
+    #[test]
+    fn partitioning_fill_builds_properties_only_for_rows_with_members() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let square = Geometry::Polygon(geo::Polygon::new(
+            LineString::from(vec![(10.3, 10.3), (10.4, 10.3), (10.4, 10.4), (10.3, 10.3)]),
+            vec![],
+        ));
+        let empty = Geometry::MultiPolygon(geo::MultiPolygon::new(vec![]));
+        let before = PROPS_BUILT.with(std::cell::Cell::get);
+        let store = fill_partitioning_fixture(
+            tmp.path(),
+            &[(vec![0, 1, 2], vec![empty.clone(), square, empty])],
+        );
+        let rows: HashSet<u64> = store
+            .buckets
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|m| m.seq)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(PROPS_BUILT.with(std::cell::Cell::get) - before, 1);
+    }
+
+    /// #815: in a partitioning fill a feature that no level clips is held
+    /// once. Every level's member of it shares the decoded geometry, where
+    /// each level held its own copy (the copies were most of a Moldova
+    /// partitioning export's peak heap).
+    #[test]
+    fn partitioning_fill_holds_an_unclipped_feature_once() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let square = |x: f64, y: f64| {
+            Geometry::Polygon(geo::Polygon::new(
+                LineString::from(vec![(x, y), (x + 0.1, y), (x + 0.1, y + 0.1), (x, y)]),
+                vec![],
+            ))
+        };
+        // Squares well inside one tile at every level's zoom (z2, z4, z6).
+        let store = fill_partitioning_fixture(
+            tmp.path(),
+            &[
+                (vec![0, 1], vec![square(-100.3, 40.3), square(10.3, 10.3)]),
+                (vec![2], vec![square(50.3, -20.3)]),
+                (vec![3], vec![square(-60.3, 5.3)]),
+            ],
+        );
         let members: Vec<&Member> = store.buckets.iter().flatten().flatten().collect();
         // At least one member per feature and level it renders at.
         assert!(members.len() >= 2 + 3 + 4, "{}", members.len());
@@ -20825,6 +20881,8 @@ mod tests {
         collect_member_chunk(&input, 0, &mut items).unwrap();
         collect_member_chunk(&input, 1, &mut items[1..]).unwrap();
         assert_eq!(work.lock().unwrap().serial_collect_rows, 5);
+        // Every row was memberless: none built its properties (Codex C2).
+        assert_eq!(PROPS_BUILT.with(std::cell::Cell::get), 0);
     }
 
     /// A flushed bucket is written as whole [`SPILL_SEGMENT_MEMBERS`]-member
