@@ -1431,6 +1431,10 @@ fn convert_with_cells(
     // cell read projects its own columns, so it finishes before the
     // feature run locks the source's columns.
     let source = open().map_err(TilesError::Convert)?;
+    // A footer check: before the cells read anything.
+    if let Some(job) = &options.shard {
+        job.verify_source(&source)?;
+    }
     source.set_spill_dir(options.convert.spill_dir.as_deref());
     let schema = source.schema().map_err(|e| TilesError::Convert(e.into()))?;
     let gates = super::layer_column::Gates::new(&source, &schema, &options.convert)
@@ -1457,6 +1461,8 @@ fn convert_with_cells(
     // Every archive stays reserved until the merge has read it.
     let mut archives: Vec<(Band, crate::atomic_output::Reserved)> = Vec::new();
     let mut cell_zooms = Vec::new();
+    // The host's memory budget, once: the feature run reports its own.
+    let mut budget = None;
     for band in &options.cell_bands {
         let in_band = |e| TilesError::CellBand {
             band: band.to_string(),
@@ -1499,13 +1505,13 @@ fn convert_with_cells(
             );
             // A table's convert repeats what the feature run reports about
             // the host (its memory budget); its export can lose cells.
-            diagnostics.extend(
-                report
-                    .export
-                    .diagnostics
-                    .into_iter()
-                    .filter(|d| !matches!(d, crate::diagnostics::Diagnostic::MemoryBudget { .. })),
-            );
+            for d in report.export.diagnostics {
+                if matches!(d, crate::diagnostics::Diagnostic::MemoryBudget { .. }) {
+                    budget.get_or_insert(d);
+                } else {
+                    diagnostics.extend([d]);
+                }
+            }
             cell_zooms.extend(report.export.zooms);
             archives.push((
                 Band::new(archive.to_path_buf(), layer.clone(), z, z),
@@ -1594,6 +1600,13 @@ fn convert_with_cells(
             info.min_zoom = bands.iter().map(|b| b.min_zoom).min().unwrap_or(0);
             info.max_zoom = bands.iter().map(|b| b.max_zoom).max().unwrap_or(0);
             diagnostics.extend(std::mem::take(&mut info.diagnostics));
+            if !diagnostics
+                .snapshot()
+                .iter()
+                .any(|d| matches!(d, crate::diagnostics::Diagnostic::MemoryBudget { .. }))
+            {
+                diagnostics.extend(budget);
+            }
             info.diagnostics = diagnostics.snapshot();
             return Ok(TilesOutcome::EmptyCoarse(info));
         }

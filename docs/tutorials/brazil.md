@@ -2,7 +2,7 @@
 
 ### The result
 
-The archive from step 4, served from this site. A5 density cells, colored by
+The archive from step 1, served from this site. A5 density cells, colored by
 `point_count`, cover z0–z7; zoom past z8 to see the field polygons. Click a
 feature to see its properties.
 
