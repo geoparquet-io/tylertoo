@@ -1016,9 +1016,14 @@ pub(super) struct SharedRows {
     columns: Vec<ArrayRef>,
     /// How many rows they hold.
     rows: usize,
-    /// Every distinct geometry the levels keep, encoded once: a level whose
-    /// cascade step left a feature unchanged shares the finer level's
+    /// The levels' geometries in one column. A pool of every distinct
+    /// geometry they keep, encoded once, when they share enough: a level
+    /// whose cascade step left a feature unchanged shares the finer level's
     /// geometry (#499), so per-level columns held it once per level.
+    /// Otherwise each level's geometries back to back
+    /// ([`LevelGeometry::Range`]): one allocation per input batch, not one
+    /// per level, which peak RSS needs (per-level columns built across the
+    /// pass-2 workers held 160–190 MiB more on Moldova, at the same live heap).
     geometry: ArrayRef,
 }
 
@@ -1085,6 +1090,24 @@ impl SharedRows {
     }
 }
 
+/// A shared level batch's geometries in [`SharedRows`]' geometry column.
+#[derive(Clone)]
+pub(super) enum LevelGeometry {
+    /// Positions in the column, a pool of the levels' distinct geometries.
+    Pool(UInt32Array),
+    /// The column's rows `start..start + len`.
+    Range(usize, usize),
+}
+
+impl LevelGeometry {
+    fn held_bytes(&self) -> usize {
+        match self {
+            Self::Pool(at) => at.get_array_memory_size(),
+            Self::Range(..) => 0,
+        }
+    }
+}
+
 /// One buffered output batch of one level.
 pub(super) enum LevelBatch {
     /// A level batch as built.
@@ -1096,8 +1119,8 @@ pub(super) enum LevelBatch {
         rows: Arc<SharedRows>,
         /// Positions in `rows` of this level's rows, in output order.
         index: UInt32Array,
-        /// Positions in `rows.geometry` of this level's geometries.
-        geometry: UInt32Array,
+        /// This level's geometries.
+        geometry: LevelGeometry,
         /// Where the geometry column goes in the source schema.
         geom_idx: usize,
         /// Any columns the level generates after the source schema's
@@ -1108,12 +1131,12 @@ pub(super) enum LevelBatch {
 
 impl LevelBatch {
     /// A shared level batch: its rows at `index` in `rows` and its
-    /// geometries at `geometry` in the pool ([`SharedRows::new`]).
+    /// geometries as `geometry` holds them ([`SharedRows::new`]).
     pub(super) fn shared(
         schema: SchemaRef,
         rows: &Arc<SharedRows>,
         index: UInt32Array,
-        geometry: UInt32Array,
+        geometry: LevelGeometry,
         geom_idx: usize,
         own: Vec<ArrayRef>,
     ) -> Self {
@@ -1148,14 +1171,14 @@ impl LevelBatch {
                 .iter()
                 .map(|c| c.get_array_memory_size() as u64)
                 .sum::<u64>()
-                .saturating_add(
-                    (index.get_array_memory_size() + geometry.get_array_memory_size()) as u64,
-                ),
+                .saturating_add((index.get_array_memory_size() + geometry.held_bytes()) as u64),
         }
     }
 
-    /// The level batch the writer takes.
-    pub(super) fn materialize(self) -> Result<RecordBatch, ConvertError> {
+    /// The level batch the writer takes. A ranged level's geometries are a
+    /// slice of the shared column unless `compact`: a spill writes every
+    /// value a sliced union's children hold, the whole input batch's.
+    pub(super) fn materialize(self, compact: bool) -> Result<RecordBatch, ConvertError> {
         match self {
             Self::Owned(b) => Ok(b),
             Self::Shared {
@@ -1171,10 +1194,20 @@ impl LevelBatch {
                     .iter()
                     .map(|c| arrow_select::take::take(c.as_ref(), &index, None))
                     .collect::<Result<Vec<_>, _>>()?;
-                columns.insert(
-                    geom_idx,
-                    arrow_select::take::take(rows.geometry.as_ref(), &geometry, None)?,
-                );
+                let geometry = match geometry {
+                    LevelGeometry::Pool(at) => {
+                        arrow_select::take::take(rows.geometry.as_ref(), &at, None)?
+                    }
+                    LevelGeometry::Range(start, len) if compact => {
+                        let at = UInt32Array::from_iter_values(
+                            (start..start + len)
+                                .map(|i| u32::try_from(i).expect("batch rows fit in u32")),
+                        );
+                        arrow_select::take::take(rows.geometry.as_ref(), &at, None)?
+                    }
+                    LevelGeometry::Range(start, len) => rows.geometry.slice(start, len),
+                };
+                columns.insert(geom_idx, geometry);
                 columns.extend(own);
                 Ok(RecordBatch::try_new(schema, columns)?)
             }
@@ -1225,7 +1258,7 @@ impl LevelSink {
                 v.push(batch);
                 Ok(0)
             }
-            LevelSink::Spill(s) => s.push(batch.materialize()?),
+            LevelSink::Spill(s) => s.push(batch.materialize(true)?),
         }
     }
 
@@ -1255,7 +1288,7 @@ impl LevelSink {
         };
         let mut bytes = 0u64;
         for batch in buffered {
-            bytes += state.push(batch.materialize()?)?;
+            bytes += state.push(batch.materialize(true)?)?;
         }
         *self = LevelSink::Spill(state);
         Ok(bytes)
@@ -1828,7 +1861,7 @@ fn drain_sink(
                 (!chunk.is_empty()).then(|| {
                     chunk
                         .into_par_iter()
-                        .map(LevelBatch::materialize)
+                        .map(|b| b.materialize(false))
                         .collect::<Vec<_>>()
                 })
             })
@@ -2927,7 +2960,7 @@ mod drain_tests {
             Arc::new(Schema::new(fields)),
             &Arc::new(rows),
             index.remove(0),
-            UInt32Array::from_iter_values(0..4),
+            LevelGeometry::Pool(UInt32Array::from_iter_values(0..4)),
             1,
             Vec::new(),
         );
@@ -3272,7 +3305,14 @@ mod sink_sample_tests {
             .zip(index)
             .map(|(kept, index)| {
                 let at = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
-                let level = LevelBatch::shared(schema.clone(), &rows, index, at, 1, Vec::new());
+                let level = LevelBatch::shared(
+                    schema.clone(),
+                    &rows,
+                    index,
+                    LevelGeometry::Pool(at),
+                    1,
+                    Vec::new(),
+                );
                 held += level.held_bytes();
                 Some((level, 0))
             })
@@ -3291,7 +3331,7 @@ mod sink_sample_tests {
         for (kept, (level, _)) in levels.iter().zip(per_level.into_iter().flatten()) {
             let at = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
             let geometry = arrow_select::take::take(pool.as_ref(), &at, None).unwrap();
-            let built = level.materialize().unwrap();
+            let built = level.materialize(true).unwrap();
             let idx = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
             let want = RecordBatch::try_new(
                 schema.clone(),
@@ -3310,6 +3350,224 @@ mod sink_sample_tests {
             held * 2 < copied,
             "shared levels hold {held} B against {copied} B of copies"
         );
+    }
+
+    /// A level batch whose input batch pooled no geometries (each level a
+    /// range of one column holding them back to back) rebuilds the batch a
+    /// pooled one does, compacted or as a slice, and holds nothing of its
+    /// geometry but the shared column, counted once.
+    #[test]
+    fn ranged_and_pooled_level_geometries_rebuild_the_same_batch() {
+        let n = 100usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("geometry", DataType::Float64, false),
+            Field::new("id", DataType::Float64, false),
+        ]));
+        let input = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::StringArray::from_iter_values(
+                    (0..n).map(|i| format!("row {i}")),
+                )),
+                Arc::new(Float64Array::from_iter_values((0..n).map(|i| -(i as f64)))),
+                Arc::new(Float64Array::from_iter_values((0..n).map(|i| i as f64))),
+            ],
+        )
+        .unwrap();
+        let levels: Vec<Vec<usize>> = (0..3)
+            .map(|l| (0..n).filter(|i| i % 4 >= l).collect())
+            .collect();
+        let kept: Vec<&[usize]> = levels.iter().map(Vec::as_slice).collect();
+        let geometry = |i: usize| i as f64 * 0.5;
+        let pool: ArrayRef = Arc::new(Float64Array::from_iter_values((0..n).map(geometry)));
+        // The same geometries, each level's back to back.
+        let column: ArrayRef = Arc::new(Float64Array::from_iter_values(
+            levels.iter().flatten().map(|&i| geometry(i)),
+        ));
+        let (pooled, pooled_index) = SharedRows::new(&input, &[0, 2], &kept, pool).unwrap();
+        let (ranged, ranged_index) =
+            SharedRows::new(&input, &[0, 2], &kept, column.clone()).unwrap();
+        let (pooled, ranged) = (Arc::new(pooled), Arc::new(ranged));
+        let mut held = ranged.held_bytes();
+        let mut start = 0;
+        let mut per_level = Vec::new();
+        let mut pooled_levels = Vec::new();
+        let ranged_level = |index: &UInt32Array, start: usize, len: usize| {
+            LevelBatch::shared(
+                schema.clone(),
+                &ranged,
+                index.clone(),
+                LevelGeometry::Range(start, len),
+                1,
+                Vec::new(),
+            )
+        };
+        let mut sliced = Vec::new();
+        for ((rows, pi), ri) in levels.iter().zip(pooled_index).zip(ranged_index) {
+            let level = ranged_level(&ri, start, rows.len());
+            sliced.push(ranged_level(&ri, start, rows.len()));
+            start += rows.len();
+            assert_eq!(level.held_bytes(), ri.get_array_memory_size() as u64);
+            held += level.held_bytes();
+            per_level.push(Some((level, 0)));
+            let at = UInt32Array::from_iter_values(rows.iter().map(|&i| i as u32));
+            pooled_levels.push(LevelBatch::shared(
+                schema.clone(),
+                &pooled,
+                pi,
+                LevelGeometry::Pool(at),
+                1,
+                Vec::new(),
+            ));
+        }
+        let mut tuner = SinkAutoTuner::with_budget(false, 0, 0);
+        tuner.observe_shared(&per_level);
+        for (level, _) in per_level.iter().flatten() {
+            tuner.observe(level);
+        }
+        assert_eq!(
+            tuner.projected_bytes(),
+            held + ranged.rows as u64 * SINK_ROW_ALLOC_OVERHEAD_BYTES
+        );
+        for (((level, _), sliced), pooled) in per_level
+            .into_iter()
+            .flatten()
+            .zip(sliced)
+            .zip(pooled_levels)
+        {
+            let want = pooled.materialize(true).unwrap();
+            let rows = want.num_rows();
+            let (sliced, compact) = (
+                sliced.materialize(false).unwrap(),
+                level.materialize(true).unwrap(),
+            );
+            assert_eq!(sliced, want);
+            assert_eq!(compact, want);
+            // The writer's slice reads the shared column in place; a spill's
+            // compacted copy owns only the level's geometries.
+            let within = |c: &RecordBatch| {
+                let at = c.column(1).to_data().buffers()[0].as_ptr() as usize;
+                let base = column.to_data().buffers()[0].as_ptr() as usize;
+                (base..base + column.len() * 8).contains(&at)
+            };
+            assert!(within(&sliced) && !within(&compact));
+            assert_eq!(compact.column(1).to_data().buffers()[0].len(), rows * 8);
+        }
+    }
+
+    /// Ranged levels of real geometry (#852) spill only their own rows,
+    /// pushed to a spilling sink or flushed by a Ram→Spill downgrade: each
+    /// level's spill is the size of its own batch's, not of every level's
+    /// geometries a slice of the shared column still reaches, and reads back
+    /// as that batch.
+    #[test]
+    fn ranged_levels_spill_only_their_own_geometries() {
+        use geoarrow::array::GeometryBuilder;
+        use geoarrow::datatypes::GeometryType;
+        use geoarrow_array::GeoArrowArray;
+        let column = |geoms: &[geo::Geometry]| {
+            let mut b = GeometryBuilder::new(GeometryType::new(Default::default()))
+                .with_prefer_multi(false);
+            b.extend_from_iter(geoms.iter().map(Some));
+            b.finish()
+        };
+        // A ring of `n` vertices around (x, y).
+        let polygon = |x: f64, y: f64, n: usize| {
+            let ring: Vec<(f64, f64)> = (0..n)
+                .map(|k| {
+                    let a = k as f64 / n as f64 * std::f64::consts::TAU;
+                    (x + a.cos(), y + a.sin())
+                })
+                .collect();
+            geo::Geometry::Polygon(geo::Polygon::new(ring.into(), vec![]))
+        };
+        let n = 200usize;
+        // Finest first; each coarser level keeps fewer rows, simplified more.
+        let levels: Vec<Vec<usize>> = (0..3)
+            .map(|l| (0..n).filter(|i| i % 3 >= l).collect())
+            .collect();
+        let level_geoms: Vec<Vec<geo::Geometry>> = levels
+            .iter()
+            .enumerate()
+            .map(|(l, rows)| {
+                rows.iter()
+                    .map(|&i| polygon(i as f64, 0.0, 64 >> (2 * l)))
+                    .collect()
+            })
+            .collect();
+        let field = column(&level_geoms[0])
+            .data_type()
+            .to_field("geometry", true);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            field,
+        ]));
+        let input = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from_iter_values(0..n as i64)),
+                column(
+                    &(0..n)
+                        .map(|i| polygon(i as f64, 0.0, 64))
+                        .collect::<Vec<_>>(),
+                )
+                .to_array_ref(),
+            ],
+        )
+        .unwrap();
+        let kept: Vec<&[usize]> = levels.iter().map(Vec::as_slice).collect();
+        let all: Vec<geo::Geometry> = level_geoms.iter().flatten().cloned().collect();
+        let (rows, index) =
+            SharedRows::new(&input, &[0], &kept, column(&all).to_array_ref()).unwrap();
+        let rows = Arc::new(rows);
+        let mut start = 0;
+        for ((kept, geoms), index) in levels.iter().zip(&level_geoms).zip(index) {
+            let at = start;
+            let ranged = || {
+                LevelBatch::shared(
+                    schema.clone(),
+                    &rows,
+                    index.clone(),
+                    LevelGeometry::Range(at, kept.len()),
+                    1,
+                    Vec::new(),
+                )
+            };
+            start += kept.len();
+            // The batch the level would have built on its own.
+            let own = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow_array::Int64Array::from_iter_values(
+                        kept.iter().map(|&i| i as i64),
+                    )),
+                    column(geoms).to_array_ref(),
+                ],
+            )
+            .unwrap();
+            let mut reference = LevelSink::new(SinkBacking::Spill, &schema, None).unwrap();
+            reference.push(LevelBatch::Owned(own.clone())).unwrap();
+            let mut pushed = LevelSink::new(SinkBacking::Spill, &schema, None).unwrap();
+            pushed.push(ranged()).unwrap();
+            let mut downgraded = LevelSink::new(SinkBacking::Ram, &schema, None).unwrap();
+            downgraded.push(ranged()).unwrap();
+            downgraded.downgrade_to_spill(&schema, None).unwrap();
+            let spilled = |sink: LevelSink| {
+                let LevelSink::Spill(state) = sink else {
+                    unreachable!("a spilling sink")
+                };
+                let (reader, temp) = state.into_reader(&Pass2Timers::default()).unwrap();
+                let batches: Vec<RecordBatch> = reader.map(Result::unwrap).collect();
+                (batches, temp.as_file().metadata().unwrap().len())
+            };
+            let (want, want_bytes) = spilled(reference);
+            for (how, sink) in [("pushed", pushed), ("downgraded", downgraded)] {
+                let (got, bytes) = spilled(sink);
+                assert_eq!(got, want, "{how}: reads back as the level's own batch");
+                assert_eq!(bytes, want_bytes, "{how}: spills only the level's own rows");
+            }
+        }
     }
 
     /// Downgrading an already-spilled sink is a no-op, so the one-way rule
