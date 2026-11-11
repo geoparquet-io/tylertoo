@@ -548,6 +548,9 @@ fn staged_metadata(source: &ConvertSource) -> Result<Vec<tylertoo_io::KeyValue>,
     let Some(name) = resolved.geometry_name().filter(|_| !crs.assumed_wgs84) else {
         return Ok(metadata);
     };
+    // #670: the staged rows are already lon/lat; the covering's boxes are
+    // still in the source CRS, so the staged file declares none.
+    let reprojected = reprojects(source)?;
     let at = metadata
         .iter()
         .position(|kv| kv.key.eq_ignore_ascii_case("geo"));
@@ -557,17 +560,23 @@ fn staged_metadata(source: &ConvertSource) -> Result<Vec<tylertoo_io::KeyValue>,
         // Unreadable: the input's own read settled what it means.
         Some(_) => return Ok(metadata),
     };
-    if geo.get("columns").and_then(|c| c.get(name)).is_some() {
-        return Ok(metadata);
+    if let Some(Value::Object(column)) = geo.get_mut("columns").and_then(|c| c.get_mut(name)) {
+        if !reprojected {
+            return Ok(metadata);
+        }
+        for key in ["crs", "covering", "bbox"] {
+            column.remove(key);
+        }
+    } else {
+        if !geo.get("columns").is_some_and(Value::is_object) {
+            geo["columns"] = json!({});
+        }
+        let mut column = json!({ "encoding": "WKB", "geometry_types": [] });
+        if let Some(id) = crs.identifier.as_ref().filter(|_| !reprojected) {
+            column["crs"] = id.as_str().into();
+        }
+        geo["columns"][name] = column;
     }
-    if !geo.get("columns").is_some_and(Value::is_object) {
-        geo["columns"] = json!({});
-    }
-    let mut column = json!({ "encoding": "WKB", "geometry_types": [] });
-    if let Some(id) = &crs.identifier {
-        column["crs"] = id.as_str().into();
-    }
-    geo["columns"][name] = column;
     if geo.get("primary_column").is_none() {
         geo["primary_column"] = name.into();
     }
@@ -577,6 +586,11 @@ fn staged_metadata(source: &ConvertSource) -> Result<Vec<tylertoo_io::KeyValue>,
         None => metadata.push(geo),
     }
     Ok(metadata)
+}
+
+/// Whether any part of `source` is reprojected as it is read (#670).
+fn reprojects(source: &ConvertSource) -> Result<bool, InputError> {
+    Ok(source.resolved_schemas()?.iter().any(|r| r.reprojects()))
 }
 
 /// Create one layer's staged file under `dir`.
@@ -1380,12 +1394,46 @@ mod tests {
         );
     }
 
+    /// #670: projected input is staged in lon/lat, once. Each layer reads
+    /// its staged file as EPSG:4326 and does not reproject it again, and
+    /// `--bbox` gates in degrees.
+    #[test]
+    fn projected_input_is_staged_in_lon_lat() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("utm.parquet");
+        // EPSG:32633: (15E, 49.65N) and (15E, 9.04S).
+        let rows = [
+            (500_000.0, 5_500_000.0, "soy"),
+            (500_000.0, -1_000_000.0, "corn"),
+        ];
+        let geo = r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":[],"crs":"EPSG:32633"}}}"#;
+        write_native_input(&input, "EPSG:32633", &rows, &[("geo", geo.to_string())]);
+        let out = dir.path().join("o.pmtiles");
+        let mut options = options("crop");
+        options.convert.bbox = Some([10.0, 40.0, 20.0, 55.0]);
+        let outcome = convert_to_pmtiles(&TilesInput::Path(input), &out, &options).unwrap();
+        let TilesOutcome::Layered(report) = outcome else {
+            panic!("expected a layered outcome, got {outcome:?}");
+        };
+        assert_eq!(report.filtered_rows, 1, "--bbox drops corn in degrees");
+        // z3 tile (4, 2) holds 15E 49.65N; reprojected twice it would land
+        // near the equator, in (4, 3).
+        let index = ArchiveIndex::open(&out).unwrap();
+        let tiles: Vec<(u32, u32)> = index
+            .tiles()
+            .map(|t| t.unwrap())
+            .filter(|t| t.z == 3)
+            .map(|t| (t.x, t.y))
+            .collect();
+        assert_eq!(tiles, [(4, 2)]);
+    }
+
     /// An unsupported CRS is refused from the footer, before the split.
     #[test]
     fn an_unsupported_crs_is_refused_before_staging() {
         let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("utm.parquet");
-        write_native_input(&input, "EPSG:32633", &[(500_000.0, 0.0, "soy")], &[]);
+        let input = dir.path().join("custom.parquet");
+        write_native_input(&input, "EPSG:999999", &[(500_000.0, 0.0, "soy")], &[]);
         let err = convert_to_pmtiles(
             &TilesInput::Path(input),
             &dir.path().join("o.pmtiles"),

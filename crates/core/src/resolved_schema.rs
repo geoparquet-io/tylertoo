@@ -289,6 +289,11 @@ impl ResolvedSchema {
             crate::quality::CrsKind::Unknown => None,
         }
     }
+    /// Whether this part's batches are reprojected to EPSG:4326 as they are
+    /// read, so its declared CRS and covering no longer describe them.
+    pub(crate) fn reprojects(&self) -> bool {
+        self.to_lonlat.is_some()
+    }
     /// This EPSG:3857 part, read in EPSG:4326 instead: for a set whose other
     /// parts are lon/lat (#670). Pruning bounds are recomputed in degrees.
     pub(crate) fn web_mercator_as_lonlat(&self, metadata: &ParquetMetaData) -> Self {

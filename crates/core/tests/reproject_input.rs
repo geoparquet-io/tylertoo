@@ -288,3 +288,38 @@ fn projected_input_converts_on_a_one_thread_global_pool() {
         .expect("deadlocked on the one-thread global pool");
     assert_eq!(features, Ok(1200));
 }
+
+/// `--layer-column` stages projected input in lon/lat (#670): `--bbox`
+/// gates in degrees, and no layer reads the source-CRS covering.
+#[test]
+fn layer_column_stages_projected_input_in_lon_lat() {
+    use tylertoo_core::internal::archive_index::ArchiveIndex;
+    use tylertoo_core::internal::overview::tiles::{
+        convert_to_pmtiles, TilesInput, TilesOptions, TilesOutcome,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("nl.parquet");
+    let nl = SQUARES[0].3;
+    let far = [nl[0] + 50_000.0, nl[1], nl[2] + 50_000.0, nl[3]];
+    write_input(&input, 28992, SQUARES[0].2, &[nl, far]);
+    let out = dir.path().join("o.pmtiles");
+    let mut tiles = TilesOptions::default();
+    tiles.layer_column = Some("id".into());
+    tiles.convert = options();
+    tiles.convert.bbox = Some([4.79, 51.449, 4.81, 51.46]);
+    let outcome = convert_to_pmtiles(&TilesInput::Path(input), &out, &tiles).unwrap();
+    let TilesOutcome::Layered(report) = outcome else {
+        panic!("expected a layered outcome, got {outcome:?}");
+    };
+    assert_eq!(report.filtered_rows, 1);
+    let layers: Vec<&str> = report.layers.iter().map(|l| l.layer.as_str()).collect();
+    assert_eq!(layers, ["nl-0"]);
+    let diagnostics = format!("{:?}", report.layers[0].report.convert.diagnostics);
+    assert!(!diagnostics.contains("Covering"), "{diagnostics}");
+    let meta = ArchiveIndex::open(&out).unwrap().metadata_json().unwrap();
+    assert!(
+        !meta.to_string().contains("xmin"),
+        "covering exported: {meta}"
+    );
+}
