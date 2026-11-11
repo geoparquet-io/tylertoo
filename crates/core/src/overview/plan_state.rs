@@ -964,6 +964,11 @@ fn options_digest(o: &ConvertOptions) -> BTreeMap<String, String> {
             .clone()
             .unwrap_or_else(|| NO_SHARD_PLAN.to_string()),
     );
+    // #332: recorded only when set, so a plan without cell bands keeps
+    // the fingerprint it always had.
+    if let Some(bands) = &o.cell_bands {
+        put("cell_bands", bands.clone());
+    }
     m
 }
 

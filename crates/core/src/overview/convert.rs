@@ -898,6 +898,14 @@ pub struct ConvertOptions {
     #[serde(skip)]
     #[cfg_attr(feature = "cli", arg(skip = Self::default().shard_plan_digest))]
     pub shard_plan_digest: Option<String>,
+    /// The `tiles` facade's cell bands (#332) as `--band` spells them,
+    /// set by the facade on the convert of its feature zooms. A saved
+    /// plan records them, so a fleet job given other cell bands is
+    /// refused like any other option mismatch. Default `None`.
+    #[doc(hidden)]
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().cell_bands))]
+    pub cell_bands: Option<String>,
     /// Materialize only the levels at or coarser than this zoom (#541): the
     /// **coarse job**'s half of a sharded build, on the convert side.
     ///
@@ -983,6 +991,7 @@ with_setters!(ConvertOptions {
     with_plan => plan: Option<PathBuf>,
     with_shard => shard: Option<TileRange>,
     with_shard_plan_digest => shard_plan_digest: Option<String>,
+    with_cell_bands => cell_bands: Option<String>,
     with_zoom_ceiling => zoom_ceiling: Option<u8>,
 });
 
@@ -1587,6 +1596,7 @@ impl Default for ConvertOptions {
             plan: None,
             shard: None,
             shard_plan_digest: None,
+            cell_bands: None,
             zoom_ceiling: None,
         }
     }

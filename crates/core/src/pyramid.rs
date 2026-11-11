@@ -2331,8 +2331,11 @@ fn build_pyramid_validated(
                     categories: opts.cluster_categories.as_deref(),
                 };
                 let resources = cell_resources(opts);
+                let source = crate::input_set::ConvertSource::resolve_path(&band.input)
+                    .map_err(|e| PyramidError::band_convert(band.layer.clone(), e.into()))?;
                 crate::overview::cells::write_cell_tables(
-                    &band.input,
+                    &source,
+                    None,
                     system,
                     (band.min_zoom, band.max_zoom),
                     rollup,

@@ -844,7 +844,11 @@ fn resolve_tiles_job(
         }
     };
     validate(options)?;
-    let max_zoom = args.max_zoom.plan_zoom();
+    // The options' zoom range: `--band` sets it in place of the flags.
+    let (min_zoom, max_zoom) = match options.convert.levels {
+        tylertoo_core::LevelPlan::ZoomRange { min_zoom, max_zoom } => (min_zoom, max_zoom),
+        _ => (args.min_zoom, args.max_zoom.plan_zoom()),
+    };
     let shard = resolve_shard_job(args.shard.as_deref(), args.shard_plan.as_deref(), max_zoom)?;
     if let Some(job) = &shard {
         // A plan cut for a different (or since-rewritten) input is refused
@@ -874,7 +878,12 @@ fn resolve_tiles_job(
                 job.pivot
             );
         } else {
-            log_shard_job(job, args.min_zoom, args.max_zoom);
+            let finest = if options.convert.auto_max_zoom {
+                args.max_zoom
+            } else {
+                MaxZoom::Fixed(max_zoom)
+            };
+            log_shard_job(job, min_zoom, finest);
         }
     }
     Ok(shard)

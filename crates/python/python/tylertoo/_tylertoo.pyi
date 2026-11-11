@@ -209,6 +209,7 @@ def convert(
     accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
     | None = None,
     attribution: str | None = None,
+    bands: Sequence[str] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     cascade: bool = True,
     class_rank_column: str | None = None,
@@ -293,6 +294,7 @@ def convert(
     accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
     | None = None,
     attribution: str | None = None,
+    bands: Sequence[str] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     cascade: bool = True,
     class_rank_column: str | None = None,

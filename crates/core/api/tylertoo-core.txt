@@ -270,6 +270,20 @@ impl core::marker::UnsafeUnpin for tylertoo_core::Compression
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::Compression
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::Compression
 #[non_exhaustive] pub enum tylertoo_core::ConfigError
+#[non_exhaustive] pub tylertoo_core::ConfigError::BandWithZoomOption
+pub tylertoo_core::ConfigError::BandWithZoomOption::option: &'static str
+#[non_exhaustive] pub tylertoo_core::ConfigError::BandsOverlap
+pub tylertoo_core::ConfigError::BandsOverlap::first: alloc::string::String
+pub tylertoo_core::ConfigError::BandsOverlap::second: alloc::string::String
+pub tylertoo_core::ConfigError::BandsOverlap::zoom: u8
+#[non_exhaustive] pub tylertoo_core::ConfigError::CellBandConflict
+pub tylertoo_core::ConfigError::CellBandConflict::band: alloc::string::String
+pub tylertoo_core::ConfigError::CellBandConflict::option: &'static str
+pub tylertoo_core::ConfigError::CellBandConflict::reason: &'static str
+#[non_exhaustive] pub tylertoo_core::ConfigError::CellBandPastPivot
+pub tylertoo_core::ConfigError::CellBandPastPivot::band: alloc::string::String
+pub tylertoo_core::ConfigError::CellBandPastPivot::max_zoom: u8
+pub tylertoo_core::ConfigError::CellBandPastPivot::pivot: u8
 pub tylertoo_core::ConfigError::ClassRankIncomplete
 #[non_exhaustive] pub tylertoo_core::ConfigError::ClassRankNotFinite
 pub tylertoo_core::ConfigError::ClassRankNotFinite::class: core::option::Option<alloc::string::String>
@@ -1979,6 +1993,9 @@ impl core::marker::UnsafeUnpin for tylertoo_core::TileType
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TileType
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TileType
 #[non_exhaustive] pub enum tylertoo_core::TilesError
+#[non_exhaustive] pub tylertoo_core::TilesError::CellBand
+pub tylertoo_core::TilesError::CellBand::band: alloc::string::String
+pub tylertoo_core::TilesError::CellBand::source: alloc::boxed::Box<tylertoo_core::TilesError>
 pub tylertoo_core::TilesError::Config(tylertoo_core::ConfigError)
 pub tylertoo_core::TilesError::Convert(tylertoo_core::ConvertError)
 pub tylertoo_core::TilesError::EmptyCoarseArchive(tylertoo_core::ExportError)
@@ -2248,6 +2265,32 @@ impl core::marker::Unpin for tylertoo_core::BudgetKinds
 impl core::marker::UnsafeUnpin for tylertoo_core::BudgetKinds
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::BudgetKinds
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::BudgetKinds
+#[non_exhaustive] pub struct tylertoo_core::CellBand
+pub tylertoo_core::CellBand::max_zoom: u8
+pub tylertoo_core::CellBand::min_zoom: u8
+pub tylertoo_core::CellBand::system: tylertoo_core::CellSystem
+impl tylertoo_core::CellBand
+pub fn tylertoo_core::CellBand::new(u8, u8, tylertoo_core::CellSystem) -> Self
+impl core::clone::Clone for tylertoo_core::CellBand
+pub fn tylertoo_core::CellBand::clone(&self) -> tylertoo_core::CellBand
+impl core::cmp::Eq for tylertoo_core::CellBand
+impl core::cmp::PartialEq for tylertoo_core::CellBand
+pub fn tylertoo_core::CellBand::eq(&self, &tylertoo_core::CellBand) -> bool
+impl core::fmt::Debug for tylertoo_core::CellBand
+pub fn tylertoo_core::CellBand::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::CellBand
+pub fn tylertoo_core::CellBand::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for tylertoo_core::CellBand
+pub fn tylertoo_core::CellBand::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for tylertoo_core::CellBand
+impl core::marker::StructuralPartialEq for tylertoo_core::CellBand
+impl core::marker::Freeze for tylertoo_core::CellBand
+impl core::marker::Send for tylertoo_core::CellBand
+impl core::marker::Sync for tylertoo_core::CellBand
+impl core::marker::Unpin for tylertoo_core::CellBand
+impl core::marker::UnsafeUnpin for tylertoo_core::CellBand
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::CellBand
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::CellBand
 #[non_exhaustive] pub struct tylertoo_core::CheckResult
 pub tylertoo_core::CheckResult::message: alloc::string::String
 pub tylertoo_core::CheckResult::name: alloc::string::String
@@ -2337,6 +2380,7 @@ pub fn tylertoo_core::ConvertOptions::with_accumulate(self, alloc::vec::Vec<tyle
 pub fn tylertoo_core::ConvertOptions::with_assign(self, tylertoo_core::AssignConfig) -> Self
 pub fn tylertoo_core::ConvertOptions::with_auto_max_zoom(self, bool) -> Self
 pub fn tylertoo_core::ConvertOptions::with_bbox(self, core::option::Option<[f64; 4]>) -> Self
+pub fn tylertoo_core::ConvertOptions::with_cell_bands(self, core::option::Option<alloc::string::String>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_class_ranking(self, core::option::Option<tylertoo_core::ClassRanking>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_cluster(self, bool) -> Self
 pub fn tylertoo_core::ConvertOptions::with_cluster_categories(self, core::option::Option<alloc::string::String>) -> Self
@@ -3303,6 +3347,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::TileRange
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TileRange
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TileRange
 #[non_exhaustive] pub struct tylertoo_core::TilesOptions
+pub tylertoo_core::TilesOptions::cell_bands: alloc::vec::Vec<tylertoo_core::CellBand>
 pub tylertoo_core::TilesOptions::convert: tylertoo_core::ConvertOptions
 pub tylertoo_core::TilesOptions::export: tylertoo_core::ExportOptions
 pub tylertoo_core::TilesOptions::keep_overview: core::option::Option<std::path::PathBuf>
@@ -3310,6 +3355,7 @@ pub tylertoo_core::TilesOptions::layer_column: core::option::Option<alloc::strin
 pub tylertoo_core::TilesOptions::layer_name: core::option::Option<alloc::string::String>
 pub tylertoo_core::TilesOptions::shard: core::option::Option<tylertoo_core::TilesShard>
 impl tylertoo_core::TilesOptions
+pub fn tylertoo_core::TilesOptions::with_cell_bands(self, alloc::vec::Vec<tylertoo_core::CellBand>) -> Self
 pub fn tylertoo_core::TilesOptions::with_convert(self, tylertoo_core::ConvertOptions) -> Self
 pub fn tylertoo_core::TilesOptions::with_export(self, tylertoo_core::ExportOptions) -> Self
 pub fn tylertoo_core::TilesOptions::with_keep_overview(self, core::option::Option<std::path::PathBuf>) -> Self

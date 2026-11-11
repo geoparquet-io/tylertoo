@@ -367,6 +367,8 @@ pub fn command_defaults(command: &str) -> Map<String, Value> {
                 },
             );
             out.extend(facade_defaults(tiles));
+            // #332: `--band`, as a list of specs.
+            out.insert("bands".into(), Value::Null);
             out
         }
         "pyramid" => {
@@ -440,6 +442,11 @@ pub fn tiles(
 ) -> Result<crate::overview::tiles::TilesOptions, crate::overview::tiles::TilesError> {
     use crate::overview::tiles::TilesOptions;
     let base = TilesOptions::default();
+    let bands: Vec<String> = take::<Option<Vec<String>>>(&mut values, "bands")?.unwrap_or_default();
+    let zoom_options: Vec<&'static str> = ["min_zoom", "max_zoom", "gsds", "representation"]
+        .into_iter()
+        .filter(|key| values.get(*key).is_some_and(|v| !v.is_null()))
+        .collect();
     let verbatim = values
         .get("verbatim")
         .and_then(Value::as_bool)
@@ -491,6 +498,7 @@ pub fn tiles(
     let mut options: TilesOptions =
         serde_json::from_value(Value::Object(values)).map_err(|e| error("convert", e))?;
     options.convert.auto_max_zoom = auto_max_zoom;
+    super::apply_bands(&mut options, &bands, &zoom_options)?;
     Ok(options)
 }
 

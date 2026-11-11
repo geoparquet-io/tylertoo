@@ -313,6 +313,51 @@ pub enum ConfigError {
         /// The accumulate op it carries.
         op: String,
     },
+    /// A zoom option beside `--band`, which sets the zoom range itself
+    /// (#332).
+    #[error("--band cannot be combined with {option}: the bands set the zoom range and each zoom's representation")]
+    #[non_exhaustive]
+    BandWithZoomOption {
+        /// The zoom option, as the caller spelled it.
+        option: &'static str,
+    },
+    /// An option a cell band cannot be combined with (#332).
+    #[error("a cell band ({band}) cannot be combined with {option}: {reason}")]
+    #[non_exhaustive]
+    CellBandConflict {
+        /// The cell band, as `--band` spells it.
+        band: String,
+        /// The other option.
+        option: &'static str,
+        /// Why not.
+        reason: &'static str,
+    },
+    /// Two bands share a zoom, which one layer cannot draw two ways (#332).
+    #[error("bands {first} and {second} overlap at z{zoom}: one layer holds one representation per zoom")]
+    #[non_exhaustive]
+    BandsOverlap {
+        /// The first band, as `--band` spells it.
+        first: String,
+        /// The second band.
+        second: String,
+        /// The first zoom they share.
+        zoom: u8,
+    },
+    /// A cell band at or past a sharded build's pivot (#332): the data
+    /// shards split those zooms by tile range, and a cell can straddle two
+    /// shards.
+    #[error(
+        "cell band {band} reaches the shard plan's pivot z{pivot}: data shards own z{pivot}          and finer by tile range, and a cell can straddle two shards. End the cell band          below z{pivot}, or cut the shard plan with a pivot above z{max_zoom}"
+    )]
+    #[non_exhaustive]
+    CellBandPastPivot {
+        /// The cell band, as `--band` spells it.
+        band: String,
+        /// Its finest zoom.
+        max_zoom: u8,
+        /// The pivot.
+        pivot: u8,
+    },
     /// An option `--layer-column` cannot be combined with (#821).
     #[error("--layer-column cannot be combined with {option}: {reason}")]
     #[non_exhaustive]
@@ -604,6 +649,108 @@ pub fn representation(spec: Option<&str>) -> Result<Vec<RepresentationBand>, Con
             message: format!("--representation: {e}"),
         })
     })
+}
+
+/// Apply `--band LO-HI:KIND` specs (#332) to `options`. A `geom`, `point`
+/// or `square` band is a feature zoom range: together they set
+/// `convert.levels`, and a `point` or `square` band also lands in
+/// `convert.representation`. A `grid`, `h3`, `s2` or `a5` band lands in
+/// [`TilesOptions::cell_bands`](super::tiles::TilesOptions::cell_bands).
+/// `zoom_options` names the zoom options the caller also set, which the
+/// bands replace. No specs leave `options` alone. How the cell bands sit
+/// beside the feature zooms is checked by
+/// [`TilesOptions::validate`](super::tiles::TilesOptions::validate).
+///
+/// # Errors
+///
+/// [`ConfigError::BandWithZoomOption`] for a zoom option beside a band;
+/// [`ConfigError::InvalidSpec`] for a malformed spec, no feature band,
+/// or feature bands that overlap or leave a gap.
+pub(crate) fn apply_bands(
+    options: &mut super::tiles::TilesOptions,
+    specs: &[String],
+    zoom_options: &[&'static str],
+) -> Result<(), ConfigError> {
+    use super::cells::{CellBand, CellSystem};
+    use super::simplify::Representation;
+    if specs.is_empty() {
+        return Ok(());
+    }
+    if let Some(option) = zoom_options.first() {
+        return Err(ConfigError::BandWithZoomOption { option });
+    }
+    let invalid = |message: String| ConfigError::InvalidSpec {
+        option: "--band",
+        message: format!("--band: {message}"),
+    };
+    let (mut features, mut cells) = (Vec::new(), Vec::new());
+    for spec in specs {
+        let (range, kind) = spec.split_once(':').ok_or_else(|| {
+            invalid(format!(
+                "{spec:?} must be LO-HI:KIND, such as 0-7:a5 or 8-14:geom"
+            ))
+        })?;
+        let (lo, hi) = range.split_once('-').unwrap_or((range, range));
+        let zoom = |s: &str| {
+            s.trim()
+                .parse::<u8>()
+                .map_err(|_| invalid(format!("invalid zoom {s:?} in {spec:?}")))
+        };
+        let (lo, hi) = (zoom(lo)?, zoom(hi)?);
+        if lo > hi {
+            return Err(invalid(format!("{spec:?} runs from z{lo} down to z{hi}")));
+        }
+        match kind.trim() {
+            "geom" => features.push(RepresentationBand::new(lo, hi, Representation::Geometry)),
+            "point" => features.push(RepresentationBand::new(lo, hi, Representation::Point)),
+            "square" => features.push(RepresentationBand::new(lo, hi, Representation::Square)),
+            other => match CellSystem::from_name(other) {
+                Some(system) => cells.push(CellBand::new(lo, hi, system)),
+                None => {
+                    return Err(invalid(format!(
+                        "unknown kind {other:?} in {spec:?} (expected geom, point, square,                          grid, h3, s2 or a5)"
+                    )))
+                }
+            },
+        }
+    }
+    features.sort_by_key(|b| b.min_zoom);
+    let (Some(first), Some(last)) = (features.first(), features.last()) else {
+        return Err(invalid(
+            "no geom, point or square band: the bands need a feature zoom range".into(),
+        ));
+    };
+    if let Some(w) = features
+        .windows(2)
+        .find(|w| w[1].min_zoom != w[0].max_zoom + 1)
+    {
+        return Err(invalid(format!(
+            "the feature bands must be contiguous: z{}-{} and z{}-{} {}",
+            w[0].min_zoom,
+            w[0].max_zoom,
+            w[1].min_zoom,
+            w[1].max_zoom,
+            if w[1].min_zoom <= w[0].max_zoom {
+                "overlap"
+            } else {
+                "leave a gap"
+            }
+        )));
+    }
+    options.convert.levels = super::convert::LevelPlan::ZoomRange {
+        min_zoom: first.min_zoom,
+        max_zoom: last.max_zoom,
+    };
+    options.convert.auto_max_zoom = false;
+    // All-`geom` bands are the default representation.
+    options.convert.representation = if features.iter().all(|b| b.repr == Representation::Geometry)
+    {
+        Vec::new()
+    } else {
+        features
+    };
+    options.cell_bands = cells;
+    Ok(())
 }
 
 /// The one message for a non-finite class rank (#428), shared by

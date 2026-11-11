@@ -648,6 +648,21 @@ pub struct TilesArgs {
     #[arg(long, value_name = "GSDS")]
     pub gsd: Option<String>,
 
+    /// Draw features or cells by zoom range. Repeat with LO-HI:KIND or
+    /// Z:KIND (inclusive). Use geom, point or square for features; grid,
+    /// h3, s2 or a5 for cells in the same layer. Requires contiguous
+    /// feature bands. No overlaps. Excludes --min-zoom, --max-zoom, --gsd
+    /// and --representation. See
+    /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
+    // Exclusive with the zoom flags: clap's rule here, core's
+    // (`ConfigError::BandWithZoomOption`) for Python's keywords.
+    #[arg(
+        long = "band",
+        value_name = "LO-HI:KIND",
+        conflicts_with_all = ["min_zoom", "max_zoom", "gsd", "representation"]
+    )]
+    pub band: Vec<String>,
+
     #[command(flatten)]
     pub publication: TilesetMetadataArgs,
 
@@ -810,7 +825,7 @@ pub fn tiles_options(args: &TilesArgs) -> Result<TilesOptions, TilesError> {
     // LOCKSTEP with the plan's placeholder zoom: see `keywords::convert`.
     convert.auto_max_zoom = args.max_zoom.is_auto();
     let export = args.export.apply(tiles_export_defaults(args));
-    Ok(TilesOptions {
+    let mut options = TilesOptions {
         convert,
         export: ExportOptions {
             metadata: args.publication.clone(),
@@ -818,7 +833,9 @@ pub fn tiles_options(args: &TilesArgs) -> Result<TilesOptions, TilesError> {
             ..export
         },
         ..args.facade.options.clone()
-    })
+    };
+    super::apply_bands(&mut options, &args.band, &[])?;
+    Ok(options)
 }
 
 ///

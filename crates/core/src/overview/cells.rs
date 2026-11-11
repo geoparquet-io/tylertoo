@@ -64,6 +64,47 @@ pub enum CellSystem {
     A5,
 }
 
+/// A `tiles` zoom range drawn as cells (#332): `--band LO-HI:SYSTEM`.
+///
+/// Each zoom holds one polygon per occupied cell of `system`, carrying
+/// `point_count` and the `--accumulate-attribute` and
+/// `--cluster-categories` rollups, in the tiles layer. See
+/// [`TilesOptions::cell_bands`](crate::TilesOptions::cell_bands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct CellBand {
+    /// Coarsest zoom (inclusive).
+    pub min_zoom: u8,
+    /// Finest zoom (inclusive).
+    pub max_zoom: u8,
+    /// The grid the features are counted in.
+    pub system: CellSystem,
+}
+
+impl CellBand {
+    /// `system` cells at zooms `min_zoom..=max_zoom`.
+    pub fn new(min_zoom: u8, max_zoom: u8, system: CellSystem) -> Self {
+        Self {
+            min_zoom,
+            max_zoom,
+            system,
+        }
+    }
+}
+
+/// The band as `--band` spells it: `LO-HI:SYSTEM`.
+impl std::fmt::Display for CellBand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}-{}:{}",
+            self.min_zoom,
+            self.max_zoom,
+            self.system.name()
+        )
+    }
+}
+
 /// Name of the cell id column every cell table carries.
 pub(crate) const CELL_COLUMN: &str = "cell";
 
@@ -518,15 +559,23 @@ fn cell_bytes(specs: usize) -> u64 {
 /// EPSG:4326, rows ordered by cell id.
 ///
 /// Each feature lands in the cell holding its centroid (a point is its own
-/// centroid). A feature with no usable geometry is skipped and counted on
+/// centroid). With `gates` (#332), only the rows `--filter`, `--bbox` and
+/// `--mask` keep are counted, each kept or dropped by its own geometry as
+/// conversion keeps it, and only the row groups they select are read.
+/// A feature with no usable geometry is skipped and counted on
 /// [`Diagnostic::UnusableGeometry`](crate::Diagnostic::UnusableGeometry).
 ///
 /// # Errors
 ///
 /// The input cannot be read, its CRS is unsupported, a rollup column is
 /// missing or of the wrong type, or the cell map outgrows the memory budget.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "#332: a cell band's input, gates, grid, zooms, rollups and outputs"
+)]
 pub(crate) fn write_cell_tables(
-    input: &Path,
+    source: &ConvertSource,
+    gates: Option<&super::layer_column::Gates>,
     system: CellSystem,
     (min_zoom, max_zoom): (u8, u8),
     rollup: CellRollup<'_>,
@@ -537,7 +586,7 @@ pub(crate) fn write_cell_tables(
     debug_assert_eq!(tables.len(), usize::from(max_zoom - min_zoom) + 1);
     let started = std::time::Instant::now();
     let (mut cells, labels, budget, mut cat_bytes) =
-        aggregate(input, system, max_zoom, rollup, read, diagnostics)?;
+        aggregate(source, gates, system, max_zoom, rollup, read, diagnostics)?;
     let specs = rollup.accumulate.len();
     log::info!(
         "[cells] {} aggregate: {} cell(s) at z{max_zoom} in {:.1}s, priced {} B",
@@ -585,25 +634,32 @@ pub(crate) fn write_cell_tables(
     Ok(())
 }
 
-/// Read `input` once into the cell map at `max_zoom`'s resolution. Returns
-/// the map, its category counts keyed by category slot, the slot labels,
-/// the budget it was charged to, and its category heap bytes.
+/// Read `source` once into the cell map at `max_zoom`'s resolution, the
+/// rows `gates` keep only. Returns the map, its category counts keyed by
+/// category slot, the slot labels, the budget it was charged to, and its
+/// category heap bytes.
 fn aggregate(
-    input: &Path,
+    source: &ConvertSource,
+    gates: Option<&super::layer_column::Gates>,
     system: CellSystem,
     max_zoom: u8,
     rollup: CellRollup<'_>,
     read: &ConvertOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(Cells, Vec<String>, MemoryBudget, u64), ConvertError> {
-    let source = ConvertSource::resolve_path(input)?;
     source.set_spill_dir(read.spill_dir.as_deref());
     let descriptor = source.resolved_schema()?;
     let (crs, assumed) =
         super::convert::crs_from_resolved(descriptor, &source.display_name(), diagnostics)?;
     if assumed {
-        super::convert::warn_assumed_wgs84(&source, diagnostics);
+        super::convert::warn_assumed_wgs84(source, diagnostics);
     }
+    let filter = gates.and_then(|g| g.filter.as_ref());
+    let (bbox, mask) = (
+        gates.and_then(|g| g.bbox.as_ref()),
+        gates.and_then(|g| g.mask.as_ref()),
+    );
+    let row_groups = gates.and_then(|g| g.row_groups.as_ref());
     let geom_idx = descriptor
         .geometry_index()
         .ok_or_else(|| ConvertError::NoGeometryColumn {
@@ -621,6 +677,7 @@ fn aggregate(
     let mut projection: Vec<usize> = std::iter::once(geom_idx)
         .chain(acc_idx.iter().copied())
         .chain(cat_idx)
+        .chain(filter.map_or(&[][..], |f| f.columns()).iter().copied())
         .collect();
     projection.sort_unstable();
     projection.dedup();
@@ -636,13 +693,13 @@ fn aggregate(
     let specs = rollup.accumulate.len();
     let mut budget = MemoryBudget::probe();
     // A small input is priced as the batches it can fill, not as full ones.
-    let total_rows = source.selected_row_count(None)?;
+    let total_rows = source.selected_row_count(row_groups)?;
     let tuning = ReadTuning {
         budget,
         batch_size: READ_ROWS.min(usize::try_from(total_rows).unwrap_or(READ_ROWS).max(1)),
         workers: super::convert::resolve_pass_read_workers(ReadPass::Scan, read.read_workers),
         avg_geom_bytes: None,
-        footer: footer_price(&source, None, projection.iter().copied())?,
+        footer: footer_price(source, row_groups, projection.iter().copied())?,
         profile: read.profile,
     };
     // Every reader's queue, plus the batch being aggregated.
@@ -654,102 +711,142 @@ fn aggregate(
     let mut cells = Cells::new();
     let mut interner = GroupInterner::default();
     let (mut rows, mut skipped, mut cat_bytes) = (0usize, 0usize, 0u64);
-    read_in_order(&source, None, Some(&projection), tuning, |batch, _, _| {
-        let n = batch.num_rows();
-        rows += n;
-        // Checked before the batch lands, so a cell map that would outgrow
-        // the budget fails here, not by OOM kill: first for the batch's
-        // partial maps at worst (a new cell per row, in a table that may be
-        // mid-doubling: three slots a row), then, once they are built, for
-        // them as they are and the shards they grow.
-        let per_row = 3 * cell_bytes(specs) + FIRST_COUNTS_BYTES;
-        budget.require_allowance(
+    if gates.is_some() {
+        super::stream::stage_for_read(
+            source,
+            &crate::input_set::ReadPlan {
+                batch_size: tuning.batch_size,
+                projection: Some(&projection),
+                row_groups,
+            },
             read.profile,
-            MemoryPhase::Scan,
-            threads
-                + cells.bytes(specs, cat_bytes, &[])
-                + interner.heap_bytes()
-                + n as u64 * per_row,
-        )?;
-        let bschema = batch.schema();
-        let col = |name: &str| bschema.index_of(name).map(|i| batch.column(i).clone());
-        let geom_i = bschema.index_of(&geom_name)?;
-        let geom_field = bschema.field(geom_i).clone();
-        let geom_col = batch.column(geom_i).clone();
-        let values: Vec<ArrayRef> = acc_names
-            .iter()
-            .map(|name| Ok(arrow_cast::cast(&col(name)?, &DataType::Float64)?))
-            .collect::<Result<_, ConvertError>>()?;
-        let mut ids: Vec<u32> = Vec::new();
-        if let Some(name) = &cat_name {
-            interner.extend(col(name)?.as_ref(), &mut ids);
-        }
-        let chunks: Vec<(Vec<CellMap>, usize)> = (0..n)
-            .step_by(CHUNK_ROWS)
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|off| {
-                let len = CHUNK_ROWS.min(n - off);
-                let garr = from_arrow_array(geom_col.slice(off, len).as_ref(), &geom_field)
-                    .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
-                let mut geoms = Vec::with_capacity(len);
-                crate::batch_processor::extract_geometries_opt_from_array(
-                    garr.as_ref(),
-                    &mut geoms,
-                    diagnostics,
-                )?;
-                let mut local: Vec<CellMap> = (0..SHARDS).map(|_| CellMap::new()).collect();
-                let mut bad = 0usize;
-                for (r, g) in geoms.iter().enumerate() {
-                    let Some(id) = g
-                        .as_ref()
-                        .and_then(representative_point)
-                        .and_then(|(x, y)| {
-                            let (lon, lat) = match crs {
-                                Crs::Epsg3857 => super::export::webmerc_to_lnglat(x, y),
-                                _ => (x, y),
-                            };
-                            system.cell(lon, lat, res)
-                        })
-                    else {
-                        bad += 1;
-                        continue;
-                    };
-                    let acc = local[shard_of(id)]
-                        .entry(id)
-                        .or_insert_with(|| CellAcc::new(specs));
-                    acc.count += 1;
-                    let row = off + r;
-                    for (state, v) in acc.aggs.iter_mut().zip(&values) {
-                        let v = v.as_primitive::<Float64Type>();
-                        // NaN is skipped, as `--cluster` skips it.
-                        if v.is_valid(row) && !v.value(row).is_nan() {
-                            state.add(v.value(row));
+            "cells",
+        );
+    }
+    read_in_order(
+        source,
+        row_groups,
+        Some(&projection),
+        tuning,
+        |batch, _, _| {
+            let n = batch.num_rows();
+            rows += n;
+            // Checked before the batch lands, so a cell map that would outgrow
+            // the budget fails here, not by OOM kill: first for the batch's
+            // partial maps at worst (a new cell per row, in a table that may be
+            // mid-doubling: three slots a row), then, once they are built, for
+            // them as they are and the shards they grow.
+            let per_row = 3 * cell_bytes(specs) + FIRST_COUNTS_BYTES;
+            budget.require_allowance(
+                read.profile,
+                MemoryPhase::Scan,
+                threads
+                    + cells.bytes(specs, cat_bytes, &[])
+                    + interner.heap_bytes()
+                    + n as u64 * per_row,
+            )?;
+            let bschema = batch.schema();
+            let col = |name: &str| bschema.index_of(name).map(|i| batch.column(i).clone());
+            let geom_i = bschema.index_of(&geom_name)?;
+            let geom_field = bschema.field(geom_i).clone();
+            let geom_col = batch.column(geom_i).clone();
+            // The batch holds the projected columns, in projection order. SQL
+            // semantics: a row the filter cannot decide is dropped.
+            let keep = filter.map(|f| {
+                f.eval_mask(&batch, &|i| {
+                    projection
+                        .binary_search(&i)
+                        .expect("the filter's columns are projected")
+                })
+            });
+            let outside = match (bbox, mask) {
+                (None, None) => Vec::new(),
+                _ => super::layer_column::outside_gates(&batch, geom_i, bbox, mask)?,
+            };
+            let gated = |row: usize| {
+                keep.as_ref().is_some_and(|k| k[row] != Some(true))
+                    || outside.get(row) == Some(&true)
+            };
+            let values: Vec<ArrayRef> = acc_names
+                .iter()
+                .map(|name| Ok(arrow_cast::cast(&col(name)?, &DataType::Float64)?))
+                .collect::<Result<_, ConvertError>>()?;
+            let mut ids: Vec<u32> = Vec::new();
+            if let Some(name) = &cat_name {
+                interner.extend(col(name)?.as_ref(), &mut ids);
+            }
+            let chunks: Vec<(Vec<CellMap>, usize)> = (0..n)
+                .step_by(CHUNK_ROWS)
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|off| {
+                    let len = CHUNK_ROWS.min(n - off);
+                    let garr = from_arrow_array(geom_col.slice(off, len).as_ref(), &geom_field)
+                        .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
+                    let mut geoms = Vec::with_capacity(len);
+                    crate::batch_processor::extract_geometries_opt_from_array(
+                        garr.as_ref(),
+                        &mut geoms,
+                        diagnostics,
+                    )?;
+                    let mut local: Vec<CellMap> = (0..SHARDS).map(|_| CellMap::new()).collect();
+                    let mut bad = 0usize;
+                    for (r, g) in geoms.iter().enumerate() {
+                        if gated(off + r) {
+                            continue;
+                        }
+                        let Some(id) =
+                            g.as_ref()
+                                .and_then(representative_point)
+                                .and_then(|(x, y)| {
+                                    let (lon, lat) = match crs {
+                                        Crs::Epsg3857 => super::export::webmerc_to_lnglat(x, y),
+                                        _ => (x, y),
+                                    };
+                                    system.cell(lon, lat, res)
+                                })
+                        else {
+                            bad += 1;
+                            continue;
+                        };
+                        let acc = local[shard_of(id)]
+                            .entry(id)
+                            .or_insert_with(|| CellAcc::new(specs));
+                        acc.count += 1;
+                        let row = off + r;
+                        for (state, v) in acc.aggs.iter_mut().zip(&values) {
+                            let v = v.as_primitive::<Float64Type>();
+                            // NaN is skipped, as `--cluster` skips it.
+                            if v.is_valid(row) && !v.value(row).is_nan() {
+                                state.add(v.value(row));
+                            }
+                        }
+                        if let Some(&id) = ids.get(row) {
+                            acc.cats.add(id);
                         }
                     }
-                    if let Some(&id) = ids.get(row) {
-                        acc.cats.add(id);
-                    }
+                    Ok((local, bad))
+                })
+                .collect::<Result<_, ConvertError>>()?;
+            skipped += chunks.iter().map(|c| c.1).sum::<usize>();
+            let mut incoming = vec![0usize; SHARDS];
+            let mut partial = 0u64;
+            for (maps, _) in &chunks {
+                for (s, m) in maps.iter().enumerate() {
+                    incoming[s] += m.len();
+                    partial += m.capacity() as u64 * cell_bytes(specs)
+                        + m.values().map(|c| c.cats.heap_bytes()).sum::<u64>();
                 }
-                Ok((local, bad))
-            })
-            .collect::<Result<_, ConvertError>>()?;
-        skipped += chunks.iter().map(|c| c.1).sum::<usize>();
-        let mut incoming = vec![0usize; SHARDS];
-        let mut partial = 0u64;
-        for (maps, _) in &chunks {
-            for (s, m) in maps.iter().enumerate() {
-                incoming[s] += m.len();
-                partial += m.capacity() as u64 * cell_bytes(specs)
-                    + m.values().map(|c| c.cats.heap_bytes()).sum::<u64>();
             }
-        }
-        let need =
-            threads + cells.bytes(specs, cat_bytes, &incoming) + interner.heap_bytes() + partial;
-        budget.require_allowance(read.profile, MemoryPhase::Scan, need)?;
-        cat_bytes += cells.absorb(chunks.into_iter().map(|c| c.0).collect());
-        Ok(ReadFlow::Continue)
-    })?;
+            let need = threads
+                + cells.bytes(specs, cat_bytes, &incoming)
+                + interner.heap_bytes()
+                + partial;
+            budget.require_allowance(read.profile, MemoryPhase::Scan, need)?;
+            cat_bytes += cells.absorb(chunks.into_iter().map(|c| c.0).collect());
+            Ok(ReadFlow::Continue)
+        },
+    )?;
     budget.release(read_ahead);
     if skipped > 0 {
         diagnostics.once(crate::diagnostics::Diagnostic::UnusableGeometry {
@@ -1130,7 +1227,8 @@ mod tests {
         };
         let diagnostics = crate::diagnostics::Diagnostics::default();
         write_cell_tables(
-            &src,
+            &ConvertSource::resolve_path(&src).unwrap(),
+            None,
             CellSystem::Grid,
             (12, 12),
             rollup,
@@ -1210,7 +1308,8 @@ mod tests {
             let diagnostics = crate::diagnostics::Diagnostics::default();
             pool.install(|| {
                 write_cell_tables(
-                    &src,
+                    &ConvertSource::resolve_path(&src).unwrap(),
+                    None,
                     CellSystem::S2,
                     (3, 3),
                     rollup,
@@ -1241,7 +1340,8 @@ mod tests {
         let diagnostics = crate::diagnostics::Diagnostics::default();
         let read = ConvertOptions::default();
         write_cell_tables(
-            &src,
+            &ConvertSource::resolve_path(&src).unwrap(),
+            None,
             CellSystem::S2,
             (3, 3),
             rollup,

@@ -181,7 +181,7 @@ pub use overview::tiles::{
 };
 pub use shard::{ShardError, ShardInput, ShardPlan, ShardRange, ShardRole, TileRange};
 // Pyramid: build or merge zoom bands into one archive.
-pub use overview::cells::CellSystem;
+pub use overview::cells::{CellBand, CellSystem};
 pub use pyramid::{
     build_pyramid, merge_bands, merge_bands_with_options, Band, BandMergeOptions, BandSpecError,
     PyramidError, PyramidOptions, PyramidReport,

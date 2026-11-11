@@ -266,13 +266,13 @@ struct Staged {
 }
 
 /// What decides, before the split, which input rows reach a layer.
-struct Gates {
-    filter: Option<super::filter::BoundFilter>,
-    bbox: Option<super::convert::BboxQuery>,
+pub(crate) struct Gates {
+    pub(super) filter: Option<super::filter::BoundFilter>,
+    pub(super) bbox: Option<super::convert::BboxQuery>,
     /// `--mask` (#826), tested per row as conversion tests it.
-    mask: Option<super::mask::MaskIndex>,
+    pub(super) mask: Option<super::mask::MaskIndex>,
     /// The row groups whose footer statistics let the gates through.
-    row_groups: Option<crate::input_set::RowGroupSelection>,
+    pub(super) row_groups: Option<crate::input_set::RowGroupSelection>,
 }
 
 impl Gates {
@@ -280,7 +280,7 @@ impl Gates {
     /// before the split, so the filter may read the routing column and the
     /// layer limit counts only the rows they keep. The layers keep the bbox,
     /// which then passes every row.
-    fn new(
+    pub(super) fn new(
         source: &ConvertSource,
         schema: &arrow_schema::Schema,
         options: &super::convert::ConvertOptions,
@@ -491,7 +491,7 @@ fn routing_column(schema: &arrow_schema::Schema, column: &str) -> Result<usize, 
 /// Per row of `batch`, whether its geometry (column `geom`) is one convert
 /// drops as outside `--bbox` (its envelope misses `bbox`) or `--mask` (it
 /// misses `mask`). A null or empty geometry is left for convert to count.
-fn outside_gates(
+pub(super) fn outside_gates(
     batch: &RecordBatch,
     geom: usize,
     bbox: Option<&super::convert::BboxQuery>,

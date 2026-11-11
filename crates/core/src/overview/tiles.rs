@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use super::cells::CellBand;
 use super::config::{check_ignored_export_fields, ConfigError, ExportField};
 use super::convert::{
     convert_to_overviews, convert_to_overviews_sources, write_convert_plan_sources, ConvertError,
@@ -320,6 +321,17 @@ pub struct TilesOptions {
     #[serde(skip)]
     #[cfg_attr(feature = "cli", arg(skip = Self::default().shard))]
     pub shard: Option<TilesShard>,
+    /// Zoom ranges drawn as cells instead of features (#332), in the same
+    /// layer: each zoom holds one polygon per occupied cell, with
+    /// `point_count` and the `convert.accumulate` and
+    /// `convert.cluster_categories` rollups of the features counted in it.
+    /// The cells count every row the filter, bbox and mask keep. A band
+    /// may not overlap another or `convert.levels`; a zoom no band covers
+    /// is left empty, with a warning. Without `convert.cluster` the rollups
+    /// apply to the cells alone. Default: none.
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().cell_bands))]
+    pub cell_bands: Vec<CellBand>,
 }
 
 with_setters!(TilesOptions {
@@ -329,6 +341,7 @@ with_setters!(TilesOptions {
     with_layer_column => layer_column: Option<String>,
     with_keep_overview => keep_overview: Option<PathBuf>,
     with_shard => shard: Option<TilesShard>,
+    with_cell_bands => cell_bands: Vec<CellBand>,
 });
 
 impl Default for TilesOptions {
@@ -346,6 +359,7 @@ impl Default for TilesOptions {
             layer_column: None,
             keep_overview: None,
             shard: None,
+            cell_bands: Vec::new(),
         }
     }
 }
@@ -489,6 +503,11 @@ impl TilesOptions {
     }
 
     fn validate_for(&self, run: Run) -> Result<(), TilesError> {
+        if !self.cell_bands.is_empty() {
+            self.check_cell_bands()?;
+            // The feature zooms are an ordinary run's, checked as one.
+            return self.features().validate_for(run);
+        }
         // The shard rules first: they name the precise misuse (a plan-only
         // data shard), where convert's own check would only say `--shard`
         // and `--save-plan` exclude each other.
@@ -558,6 +577,111 @@ impl TilesOptions {
 }
 
 impl TilesOptions {
+    /// The run of the feature zooms beside [`TilesOptions::cell_bands`]
+    /// (#332): no cell bands; the rollups only when `convert.cluster`
+    /// uses them too; and the cell bands in the convert's plan fingerprint,
+    /// so a fleet job given other cell bands is refused. These options
+    /// themselves without cell bands.
+    pub(super) fn features(&self) -> Cow<'_, TilesOptions> {
+        if self.cell_bands.is_empty() {
+            return Cow::Borrowed(self);
+        }
+        let mut features = self.clone();
+        features.cell_bands = Vec::new();
+        let convert = &mut features.convert;
+        if !convert.cluster {
+            convert.accumulate = Vec::new();
+            convert.cluster_categories = None;
+        }
+        convert.cell_bands = Some(
+            self.cell_bands
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        Cow::Owned(features)
+    }
+
+    /// The rules [`TilesOptions::cell_bands`] add (#332): what a cell band
+    /// cannot be combined with, and no two bands sharing a zoom.
+    fn check_cell_bands(&self) -> Result<(), ConfigError> {
+        let band = self.cell_bands[0].to_string();
+        let conflict = |option, reason| ConfigError::CellBandConflict {
+            band: band.clone(),
+            option,
+            reason,
+        };
+        if self.layer_column.is_some() {
+            return Err(conflict(
+                "--layer-column",
+                "the cells and the features share one layer",
+            ));
+        }
+        if self.export.variable_depth {
+            return Err(conflict(
+                "--generate-variable-depth-tile-pyramid",
+                "the cell zooms are joined to the feature zooms by a merge that needs every \
+                 tile at every zoom",
+            ));
+        }
+        if self.export.tile_range.is_some() {
+            return Err(conflict(
+                "--tile-range",
+                "a tile range splits the zooms by tile, and a cell can straddle two tiles",
+            ));
+        }
+        if self.convert.auto_max_zoom {
+            return Err(conflict("--max-zoom auto", "the bands set the zoom range"));
+        }
+        let LevelPlan::ZoomRange { min_zoom, max_zoom } = self.convert.levels else {
+            return Err(conflict("--gsd", "the bands set the zoom range"));
+        };
+        let mut bands: Vec<(u8, u8, String)> = self
+            .cell_bands
+            .iter()
+            .map(|b| (b.min_zoom, b.max_zoom, b.to_string()))
+            .chain([(
+                min_zoom,
+                max_zoom,
+                format!("{min_zoom}-{max_zoom} (the feature zooms)"),
+            )])
+            .collect();
+        bands.sort();
+        for (i, (lo, hi, label)) in bands.iter().enumerate() {
+            if lo > hi || *hi > crate::tile::MAX_ZOOM {
+                return Err(ConfigError::InvalidSpec {
+                    option: "--band",
+                    message: format!(
+                        "--band: {label} must run from a coarser to a finer zoom, at most z{}",
+                        crate::tile::MAX_ZOOM
+                    ),
+                });
+            }
+            if let Some((next, _, second)) = bands[i + 1..].iter().find(|b| b.0 <= *hi) {
+                return Err(ConfigError::BandsOverlap {
+                    first: label.clone(),
+                    second: second.clone(),
+                    zoom: *next,
+                });
+            }
+        }
+        if let Some(job) = &self.shard {
+            if let Some(b) = self
+                .cell_bands
+                .iter()
+                .find(|b| b.max_zoom >= job.pivot_zoom)
+            {
+                return Err(ConfigError::CellBandPastPivot {
+                    band: b.to_string(),
+                    max_zoom: b.max_zoom,
+                    pivot: job.pivot_zoom,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The options a [`TilesOptions::layer_column`] run (#821) cannot
     /// honour: each layer is its own convert and export.
     fn check_layer_column(&self, column: &str) -> Result<(), ConfigError> {
@@ -799,9 +923,19 @@ pub enum TilesError {
         /// Its failure.
         source: Box<TilesError>,
     },
-    /// Merging the layers of a [`TilesOptions::layer_column`] run failed.
+    /// Merging the layers of a [`TilesOptions::layer_column`] run, or the
+    /// cell and feature zooms of a [`TilesOptions::cell_bands`] run, failed.
     #[error("merging the layers failed: {0}")]
     Merge(crate::pyramid::PyramidError),
+    /// One of [`TilesOptions::cell_bands`] failed (#332).
+    #[error("cell band {band}: {source}")]
+    #[non_exhaustive]
+    CellBand {
+        /// The band, as `--band` spells it.
+        band: String,
+        /// Its failure.
+        source: Box<TilesError>,
+    },
 }
 
 /// `prefix`, unless the error is a refused option, which names no step.
@@ -821,7 +955,7 @@ impl crate::error::Classify for TilesError {
             TilesError::Convert(e) => e.kind(),
             TilesError::Export(e) => e.kind(),
             TilesError::LayerColumn(e) => e.kind(),
-            TilesError::Layer { source, .. } => source.kind(),
+            TilesError::Layer { source, .. } | TilesError::CellBand { source, .. } => source.kind(),
             TilesError::Merge(e) => e.kind(),
             _ => crate::error::fallback_kind(self),
         }
@@ -892,6 +1026,8 @@ fn check_knob_columns(
 /// and [`ConfigError::PlanOnlyWithoutSavePlan`], then the convert's.
 pub fn write_plan(input: &TilesInput, options: &TilesOptions) -> Result<PlanReport, TilesError> {
     options.validate_for(Run::PlanOnly)?;
+    // #332: the plan is the feature zooms'; cells keep no plan state.
+    let options = options.features();
     let convert = match &options.shard {
         Some(job) => {
             let mut convert = options.convert.clone();
@@ -971,6 +1107,9 @@ pub fn convert_to_pmtiles_observed(
     let config = options.validate()?;
     if let Some(column) = &options.layer_column {
         return super::layer_column::convert_by_layer(input, output, options, column);
+    }
+    if !options.cell_bands.is_empty() {
+        return convert_with_cells(input, || input.source(), output, options, observer);
     }
     convert_to_pmtiles_validated(input, || input.source(), output, &config, observer)
 }
@@ -1235,6 +1374,274 @@ pub(super) fn convert_to_pmtiles_validated(
         export: export_report,
         intermediate,
     })))
+}
+
+/// A run with [`TilesOptions::cell_bands`] (#332): one read of the input
+/// for the cells, then the feature zooms' ordinary run on the same source,
+/// then one merge into `output`. Each cell zoom is a table of cells tiled
+/// verbatim at its zoom. A data shard owns no zoom a cell band reaches, so
+/// it runs its feature zooms alone; the coarse job draws the cells.
+///
+/// `open` is [`convert_to_pmtiles_validated`]'s test seam.
+fn convert_with_cells(
+    input: &TilesInput,
+    open: impl FnOnce() -> Result<ConvertSource, ConvertError>,
+    output: &Path,
+    options: &TilesOptions,
+    observer: &mut dyn TilesObserver,
+) -> Result<TilesOutcome, TilesError> {
+    use crate::pyramid::{Band, BandMergeOptions};
+    let features = options.features();
+    let config = features.validate()?;
+    if options
+        .shard
+        .as_ref()
+        .is_some_and(|job| job.range.is_some())
+    {
+        return convert_to_pmtiles_validated(input, open, output, &config, observer);
+    }
+    crate::atomic_output::check_writable(output)?;
+    let layer = options
+        .layer_name
+        .clone()
+        .unwrap_or_else(|| input.derive_layer_name());
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    warn_band_gaps(options, &diagnostics);
+
+    // Opened once: the cells read it first, then the feature run, which
+    // finds the fetched chunks in the source's disk spill (#219). The
+    // cell read projects its own columns, so it finishes before the
+    // feature run locks the source's columns.
+    let source = open().map_err(TilesError::Convert)?;
+    source.set_spill_dir(options.convert.spill_dir.as_deref());
+    let schema = source.schema().map_err(|e| TilesError::Convert(e.into()))?;
+    let gates = super::layer_column::Gates::new(&source, &schema, &options.convert)
+        .map_err(TilesError::Convert)?;
+    let dir = intermediate_dir(options, output);
+    if let Some(msg) = space_preflight(
+        &source,
+        gates.row_groups.as_ref(),
+        output,
+        options,
+        CLI_REMEDIES,
+    ) {
+        log::warn!("{msg}");
+    }
+    let reserve = |prefix: &str, suffix: &str| {
+        crate::atomic_output::reserve_path(prefix, suffix, Some(&dir)).map_err(|source| {
+            TilesError::IntermediateCreate {
+                dir: dir.clone(),
+                source,
+            }
+        })
+    };
+
+    // Every archive stays reserved until the merge has read it.
+    let mut archives: Vec<(Band, crate::atomic_output::Reserved)> = Vec::new();
+    let mut cell_zooms = Vec::new();
+    for band in &options.cell_bands {
+        let in_band = |e| TilesError::CellBand {
+            band: band.to_string(),
+            source: Box::new(e),
+        };
+        let tables = (band.min_zoom..=band.max_zoom)
+            .map(|_| reserve(".tylertoo-cells-", ".parquet"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let paths: Vec<&Path> = tables.iter().map(|t| &**t).collect();
+        let c = &options.convert;
+        let read = ConvertOptions {
+            profile: c.profile,
+            in_flight_batches: c.in_flight_batches,
+            read_workers: c.read_workers,
+            spill_dir: c.spill_dir.clone(),
+            ..ConvertOptions::default()
+        };
+        log::info!("[tiles] cell band {band}: counting the features in each cell");
+        super::cells::write_cell_tables(
+            &source,
+            Some(&gates),
+            band.system,
+            (band.min_zoom, band.max_zoom),
+            super::cells::CellRollup {
+                accumulate: &c.accumulate,
+                categories: c.cluster_categories.as_deref(),
+            },
+            &paths,
+            &read,
+            &diagnostics,
+        )
+        .map_err(|e| in_band(TilesError::Convert(e)))?;
+        for (z, table) in (band.min_zoom..=band.max_zoom).zip(&tables) {
+            let archive = reserve(".tylertoo-cells-", ".pmtiles")?;
+            let report = tile_cell_table(table, z, &archive, &read, &options.export, &layer)
+                .map_err(in_band)?;
+            log::info!(
+                "[tiles] cell band {band}: z{z}: {} tile(s)",
+                report.export.total_tiles
+            );
+            // A table's convert repeats what the feature run reports about
+            // the host (its memory budget); its export can lose cells.
+            diagnostics.extend(report.export.diagnostics);
+            cell_zooms.extend(report.export.zooms);
+            archives.push((
+                Band::new(archive.to_path_buf(), layer.clone(), z, z),
+                archive,
+            ));
+        }
+    }
+
+    let archive = reserve(".tylertoo-features-", ".pmtiles")?;
+    let outcome = convert_to_pmtiles_validated(input, || Ok(source), &archive, &config, observer)?;
+    let report = match outcome {
+        TilesOutcome::Converted(report) => Some(report),
+        // A coarse job whose feature zooms hold nothing still has its cells.
+        TilesOutcome::EmptyCoarse(_) => None,
+        other => {
+            return Err(TilesError::Convert(ConvertError::Io(
+                std::io::Error::other(format!("unexpected outcome {other:?}")),
+            )))
+        }
+    };
+    if let Some(r) = &report {
+        archives.push((
+            Band::new(
+                archive.to_path_buf(),
+                layer.clone(),
+                r.export.min_zoom,
+                r.export.max_zoom,
+            ),
+            archive,
+        ));
+    }
+    let bands: Vec<Band> = archives.iter().map(|(band, _)| band.clone()).collect();
+    let merged = crate::pyramid::merge_bands_with_options(
+        &bands,
+        output,
+        &BandMergeOptions {
+            allow_missing_zooms: false,
+            metadata: options.export.metadata.clone(),
+            spill_dir: Some(dir.clone()),
+        },
+    )
+    .map_err(TilesError::Merge)?;
+    diagnostics.extend(merged.diagnostics);
+    let cell_features: usize = cell_zooms.iter().map(|z| z.tile_feature_count).sum();
+    let Some(mut report) = report else {
+        let min_zoom = bands.iter().map(|b| b.min_zoom).min().unwrap_or(0);
+        let max_zoom = bands.iter().map(|b| b.max_zoom).max().unwrap_or(0);
+        let job = options
+            .shard
+            .as_ref()
+            .expect("only a coarse job ends empty");
+        return Ok(TilesOutcome::EmptyCoarse(EmptyArchive {
+            total_tiles: merged.total_tiles,
+            total_tile_features: cell_features,
+            input_rows: 0,
+            source_row_ranges: Vec::new(),
+            diagnostics: diagnostics.snapshot(),
+            source_losses: crate::diagnostics::SourceLosses::default(),
+            role: job.role,
+            pivot_zoom: job.pivot_zoom,
+            min_zoom,
+            max_zoom,
+            why: "the feature zooms below the pivot hold nothing; the archive holds the cells"
+                .to_string(),
+        }));
+    };
+    // The report counts every zoom: the cells' first, then the features'.
+    let export = &mut report.export;
+    export.min_zoom = export.min_zoom.min(
+        options
+            .cell_bands
+            .iter()
+            .map(|b| b.min_zoom)
+            .min()
+            .unwrap_or(u8::MAX),
+    );
+    export.max_zoom = export.max_zoom.max(
+        options
+            .cell_bands
+            .iter()
+            .map(|b| b.max_zoom)
+            .max()
+            .unwrap_or(0),
+    );
+    cell_zooms.append(&mut export.zooms);
+    cell_zooms.sort_by_key(|z| z.zoom);
+    export.zooms = cell_zooms;
+    export.total_tiles = merged.total_tiles;
+    export.total_tile_features += cell_features;
+    export.diagnostics.extend(diagnostics.snapshot());
+    Ok(TilesOutcome::Converted(report))
+}
+
+/// Tile one zoom's cell `table` verbatim at zoom `z` into `archive`.
+fn tile_cell_table(
+    table: &Path,
+    z: u8,
+    archive: &Path,
+    read: &ConvertOptions,
+    export: &ExportOptions,
+    layer: &str,
+) -> Result<Box<TilesReport>, TilesError> {
+    let cells = TilesOptions {
+        convert: ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: z,
+                max_zoom: z,
+            },
+            ..read.clone()
+        }
+        .verbatim(),
+        // The cell tables carry only cells: no feature column to order or
+        // id by, and the merged archive's metadata is the merge's.
+        export: ExportOptions {
+            metadata: crate::pmtiles_metadata::TilesetMetadata::default(),
+            feature_order: FeatureOrder::default(),
+            feature_id: None,
+            ..export.clone()
+        }
+        .verbatim(),
+        layer_name: Some(layer.to_string()),
+        ..TilesOptions::default()
+    };
+    let input = TilesInput::Path(table.to_path_buf());
+    match convert_to_pmtiles_validated(
+        &input,
+        || input.source(),
+        archive,
+        &cells.validate()?,
+        &mut (),
+    )? {
+        TilesOutcome::Converted(report) => Ok(report),
+        other => Err(TilesError::Convert(ConvertError::Io(
+            std::io::Error::other(format!("unexpected outcome {other:?}")),
+        ))),
+    }
+}
+
+/// Warn about each zoom range between two bands that no band covers
+/// (#332): it holds no tiles, though the archive declares it.
+fn warn_band_gaps(options: &TilesOptions, diagnostics: &crate::diagnostics::Diagnostics) {
+    let mut ranges: Vec<(u8, u8)> = options
+        .cell_bands
+        .iter()
+        .map(|b| (b.min_zoom, b.max_zoom))
+        .collect();
+    if let LevelPlan::ZoomRange { min_zoom, max_zoom } = options.convert.levels {
+        ranges.push((min_zoom, max_zoom));
+    }
+    ranges.sort_unstable();
+    for w in ranges.windows(2) {
+        if w[1].0 > w[0].1 + 1 {
+            diagnostics.warn(format!(
+                "no band covers z{}-{}: those zooms hold no tiles, though the archive \
+                 declares them",
+                w[0].1 + 1,
+                w[1].0 - 1
+            ));
+        }
+    }
 }
 
 /// `true` when a convert failed only because it had nothing to write.
@@ -2548,6 +2955,602 @@ mod tests {
         assert_eq!(
             TilesInput::Manifest(PathBuf::from("/data/parts.txt")).derive_layer_name(),
             "parts"
+        );
+    }
+
+    // --- `--band` cell bands (#332) ---------------------------------------
+
+    use crate::overview::cells::{CellBand, CellSystem};
+    use crate::overview::cluster::{AccumulateOp, AccumulateSpec};
+    use arrow_array::Array as _;
+    use std::collections::BTreeMap;
+
+    /// Small squares on a 0.01° lattice off Manhattan, each with a
+    /// `metrics:area` of its row number + 1.
+    fn fields(path: &Path, n: usize) {
+        let geoms: Vec<Option<geo::Geometry<f64>>> = (0..n)
+            .map(|i| {
+                let (x, y) = (
+                    -74.0 + (i % 40) as f64 * 0.01,
+                    40.6 + (i / 40) as f64 * 0.01,
+                );
+                let rect = geo::Rect::new((x, y), (x + 0.004, y + 0.004));
+                Some(geo::Geometry::Polygon(rect.to_polygon()))
+            })
+            .collect();
+        let values: Vec<f64> = (1..=n).map(|v| v as f64).collect();
+        crate::overview::testutil::write_input_with_f64(path, &geoms, "metrics:area", &values);
+    }
+
+    /// `--band` specs applied to the default tiles options.
+    fn banded(specs: &[&str]) -> Result<TilesOptions, ConfigError> {
+        let mut options = TilesOptions::default();
+        let specs: Vec<String> = specs.iter().map(|s| (*s).to_string()).collect();
+        super::super::config::apply_bands(&mut options, &specs, &[])?;
+        Ok(options)
+    }
+
+    /// Per zoom of `archive`, the `point_count` sum and the `metrics:area`
+    /// sum over its cells (each counted once, however many tiles hold it),
+    /// and the feature count at the zooms without cells.
+    fn decoded_zooms(archive: &Path, dir: &Path) -> BTreeMap<u8, (f64, f64, usize)> {
+        use arrow_array::cast::AsArray;
+        let out = dir.join(format!(
+            "decoded-{}.parquet",
+            archive.file_stem().unwrap().to_string_lossy()
+        ));
+        crate::decode::decode_pmtiles(archive, &out, &crate::decode::DecodeOptions::default())
+            .unwrap();
+        let source = ConvertSource::resolve_path(&out).unwrap();
+        let plan = crate::input_set::ReadPlan {
+            batch_size: 1 << 16,
+            projection: None,
+            row_groups: None,
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut zooms: BTreeMap<u8, (f64, f64, usize)> = BTreeMap::new();
+        for batch in source.open_stream(&plan).unwrap() {
+            let batch = batch.unwrap();
+            let f64s = |name: &str| {
+                batch.schema().index_of(name).ok().map(|i| {
+                    arrow_cast::cast(batch.column(i), &arrow_schema::DataType::Float64).unwrap()
+                })
+            };
+            let zoom = f64s("zoom").unwrap();
+            let zoom = zoom.as_primitive::<arrow_array::types::Float64Type>();
+            let count = f64s("point_count");
+            let area = f64s("metrics:area").unwrap();
+            let area = area.as_primitive::<arrow_array::types::Float64Type>();
+            let cell = batch
+                .schema()
+                .index_of("cell")
+                .ok()
+                .map(|i| batch.column(i).clone());
+            for r in 0..batch.num_rows() {
+                let z = zoom.value(r) as u8;
+                let entry = zooms.entry(z).or_default();
+                let token = cell
+                    .as_ref()
+                    .map(|c| c.as_string::<i32>())
+                    .filter(|c| c.is_valid(r))
+                    .map(|c| c.value(r).to_string());
+                match (token, &count) {
+                    (Some(token), Some(count)) => {
+                        if seen.insert((z, token)) {
+                            entry.0 += count
+                                .as_primitive::<arrow_array::types::Float64Type>()
+                                .value(r);
+                            entry.1 += area.value(r);
+                        }
+                    }
+                    _ => entry.2 += 1,
+                }
+            }
+        }
+        zooms
+    }
+
+    #[test]
+    fn bands_set_the_zoom_range_representation_and_cells() {
+        let o = banded(&["0-7:a5", "8-14:geom"]).unwrap();
+        assert_eq!(
+            o.convert.levels,
+            LevelPlan::ZoomRange {
+                min_zoom: 8,
+                max_zoom: 14
+            }
+        );
+        assert!(o.convert.representation.is_empty());
+        assert_eq!(o.cell_bands, vec![CellBand::new(0, 7, CellSystem::A5)]);
+
+        let o = banded(&["8-14:geom", "0-7:point"]).unwrap();
+        assert_eq!(
+            o.convert.levels,
+            LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 14
+            }
+        );
+        assert_eq!(
+            o.convert.representation,
+            super::super::config::representation(Some("0-7:point,8-14:geom")).unwrap()
+        );
+        assert!(o.cell_bands.is_empty());
+
+        for (specs, needle) in [
+            (&["0-7:a5"][..], "no geom, point or square band"),
+            (&["0-7:hex", "8-14:geom"], "unknown kind \"hex\""),
+            (&["7-0:a5", "8-14:geom"], "runs from z7 down to z0"),
+            (&["0-6:point", "8-14:geom"], "leave a gap"),
+            (&["0-8:point", "8-14:geom"], "overlap"),
+            (&["0:a5", "x-14:geom"], "invalid zoom"),
+            (&["8-14"], "must be LO-HI:KIND"),
+        ] {
+            let err = banded(specs).unwrap_err().to_string();
+            assert!(err.contains(needle), "{specs:?}: {err}");
+        }
+        let mut options = TilesOptions::default();
+        let err = super::super::config::apply_bands(
+            &mut options,
+            &["0-7:a5".to_string(), "8-14:geom".to_string()],
+            &["min_zoom"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--band cannot be combined with min_zoom"),
+            "{err}"
+        );
+    }
+
+    /// Every cell-band refusal fires from the options alone: the input
+    /// does not exist, so a rule checked after a read would fail on it.
+    #[test]
+    fn cell_band_refusals_fire_before_any_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = TilesInput::Path(dir.path().join("missing.parquet"));
+        let out = dir.path().join("out.pmtiles");
+        let base = banded(&["0-7:a5", "8-14:geom"]).unwrap();
+        let shard = |pivot| TilesShard::new(ShardRole::Coarse, None, pivot, "deadbeef", None);
+        let cases: Vec<(TilesOptions, &str)> = vec![
+            (
+                TilesOptions {
+                    cell_bands: vec![CellBand::new(0, 8, CellSystem::A5)],
+                    ..base.clone()
+                },
+                "bands 0-8:a5 and 8-14 (the feature zooms) overlap at z8",
+            ),
+            (
+                TilesOptions {
+                    cell_bands: vec![
+                        CellBand::new(0, 4, CellSystem::H3),
+                        CellBand::new(3, 7, CellSystem::A5),
+                    ],
+                    ..base.clone()
+                },
+                "bands 0-4:h3 and 3-7:a5 overlap at z3",
+            ),
+            (
+                TilesOptions {
+                    layer_column: Some("crop".into()),
+                    ..base.clone()
+                },
+                "cannot be combined with --layer-column",
+            ),
+            (
+                TilesOptions {
+                    export: ExportOptions {
+                        variable_depth: true,
+                        ..ExportOptions::default()
+                    },
+                    ..base.clone()
+                },
+                "--generate-variable-depth-tile-pyramid",
+            ),
+            (
+                TilesOptions {
+                    export: ExportOptions {
+                        tile_range: Some(TileRange::parse("1..2").unwrap()),
+                        ..ExportOptions::default()
+                    },
+                    ..base.clone()
+                },
+                "--tile-range",
+            ),
+            (
+                TilesOptions {
+                    convert: ConvertOptions {
+                        auto_max_zoom: true,
+                        ..base.convert.clone()
+                    },
+                    ..base.clone()
+                },
+                "--max-zoom auto",
+            ),
+            (
+                TilesOptions {
+                    convert: ConvertOptions {
+                        levels: LevelPlan::Gsds(vec![100.0]),
+                        ..base.convert.clone()
+                    },
+                    ..base.clone()
+                },
+                "--gsd",
+            ),
+            (
+                TilesOptions {
+                    shard: Some(shard(7)),
+                    ..base.clone()
+                },
+                "cell band 0-7:a5 reaches the shard plan's pivot z7",
+            ),
+        ];
+        for (options, needle) in cases {
+            let err = convert_to_pmtiles(&input, &out, &options).unwrap_err();
+            assert!(matches!(err, TilesError::Config(_)), "{needle}: {err}");
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+        }
+        // The rollups need no --cluster with a cell band, and a pivot past
+        // the cells is a valid coarse job.
+        let ok = TilesOptions {
+            convert: ConvertOptions {
+                accumulate: vec![AccumulateSpec::new("metrics:area", AccumulateOp::Sum)],
+                ..base.convert.clone()
+            },
+            shard: Some(shard(10)),
+            ..base.clone()
+        };
+        ok.validate().unwrap();
+    }
+
+    /// `--band 0-3:point --band 4-6:geom` is the representation selector
+    /// over the same zooms, byte for byte.
+    #[test]
+    fn point_and_geom_bands_match_the_representation_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("fields.parquet");
+        fields(&src, 200);
+        let input = TilesInput::Path(src);
+        let banded_out = dir.path().join("banded.pmtiles");
+        convert_to_pmtiles(
+            &input,
+            &banded_out,
+            &banded(&["0-3:point", "4-6:geom"]).unwrap(),
+        )
+        .unwrap();
+        let selector_out = dir.path().join("selector.pmtiles");
+        let selector = TilesOptions {
+            convert: ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 6,
+                },
+                representation: super::super::config::representation(Some("0-3:point,4-6:geom"))
+                    .unwrap(),
+                ..TilesOptions::default().convert
+            },
+            ..TilesOptions::default()
+        };
+        convert_to_pmtiles(&input, &selector_out, &selector).unwrap();
+        assert!(
+            std::fs::read(&banded_out).unwrap() == std::fs::read(&selector_out).unwrap(),
+            "the archives differ"
+        );
+    }
+
+    /// The target shape: cells below, the fields above, in one layer. Every
+    /// cell zoom counts every field once and sums its area, the rollup
+    /// shares the property's name without a warning, and the feature zooms
+    /// keep each field's own area.
+    #[test]
+    fn cells_below_and_features_above_share_one_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("fields.parquet");
+        let n = 400;
+        fields(&src, n);
+        let out = dir.path().join("out.pmtiles");
+        let mut options = banded(&["0-5:a5", "6-8:geom"]).unwrap();
+        options.convert.accumulate = vec![AccumulateSpec::new("metrics:area", AccumulateOp::Sum)];
+        let TilesOutcome::Converted(report) =
+            convert_to_pmtiles(&TilesInput::Path(src), &out, &options).unwrap()
+        else {
+            panic!("expected a converted archive");
+        };
+        let diagnostics: Vec<String> = report
+            .convert
+            .diagnostics
+            .iter()
+            .chain(&report.export.diagnostics)
+            .map(ToString::to_string)
+            // The host's memory limit, reported under a cgroup.
+            .filter(|d| !d.starts_with("memory budget"))
+            .collect();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            report
+                .export
+                .zooms
+                .iter()
+                .map(|z| z.zoom)
+                .collect::<Vec<_>>(),
+            (0..=8).collect::<Vec<u8>>()
+        );
+        assert_eq!((report.export.min_zoom, report.export.max_zoom), (0, 8));
+        let area: f64 = (1..=n).map(|v| v as f64).sum();
+        let zooms = decoded_zooms(&out, dir.path());
+        for z in 0..=5u8 {
+            assert_eq!(zooms[&z].0, n as f64, "z{z} point_count");
+            assert_eq!(zooms[&z].1, area, "z{z} area");
+        }
+        for z in 6..=8u8 {
+            assert!(zooms[&z].2 > 0, "z{z} has fields: {zooms:?}");
+            assert_eq!(zooms[&z].0, 0.0, "z{z} has no cells");
+        }
+        let metadata = crate::archive_index::ArchiveIndex::open(&out)
+            .unwrap()
+            .metadata_json()
+            .unwrap();
+        let layers = metadata["vector_layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 1, "{layers:?}");
+        assert_eq!(
+            (layers[0]["minzoom"].as_u64(), layers[0]["maxzoom"].as_u64()),
+            (Some(0), Some(8))
+        );
+        for field in ["cell", "point_count", "metrics:area"] {
+            assert!(
+                layers[0]["fields"].get(field).is_some(),
+                "{field}: {layers:?}"
+            );
+        }
+    }
+
+    /// A zoom no band covers is allowed, empty, and warned about.
+    #[test]
+    fn a_gap_between_bands_is_empty_and_warned() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("fields.parquet");
+        fields(&src, 50);
+        let out = dir.path().join("out.pmtiles");
+        let TilesOutcome::Converted(report) = convert_to_pmtiles(
+            &TilesInput::Path(src),
+            &out,
+            &banded(&["0-2:grid", "5-6:geom"]).unwrap(),
+        )
+        .unwrap() else {
+            panic!("expected a converted archive");
+        };
+        let text: Vec<String> = report
+            .export
+            .diagnostics
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            text.iter().any(|d| d.contains("no band covers z3-4")),
+            "{text:?}"
+        );
+        let zooms = decoded_zooms(&out, dir.path());
+        assert_eq!(
+            zooms.keys().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2, 5, 6]
+        );
+    }
+
+    /// A field that crosses the bbox is kept by its geometry and counted in
+    /// the cell of its centroid, which lies outside the bbox; a field that
+    /// misses it is not counted.
+    #[test]
+    fn a_field_crossing_the_bbox_counts_in_its_centroid_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("fields.parquet");
+        let crossing = geo::Rect::new((0.5, 0.5), (3.5, 1.5)).to_polygon();
+        let outside = geo::Rect::new((20.0, 20.0), (21.0, 21.0)).to_polygon();
+        crate::overview::testutil::write_input_with_f64(
+            &src,
+            &[
+                Some(geo::Geometry::Polygon(crossing)),
+                Some(geo::Geometry::Polygon(outside)),
+            ],
+            "metrics:area",
+            &[1.0, 2.0],
+        );
+        let out = dir.path().join("out.pmtiles");
+        let mut options = banded(&["0-3:grid", "4-4:geom"]).unwrap();
+        options.convert.bbox = Some([0.0, 0.0, 1.0, 1.0]);
+        convert_to_pmtiles(&TilesInput::Path(src), &out, &options).unwrap();
+        let zooms = decoded_zooms(&out, dir.path());
+        for z in 0..=3u8 {
+            assert_eq!(zooms[&z].0, 1.0, "z{z}: only the crossing field");
+        }
+        // The z3 cell (grid z9) holding the centroid (2, 1), outside the bbox.
+        let decoded = dir.path().join("decoded-out.parquet");
+        let source = ConvertSource::resolve_path(&decoded).unwrap();
+        let schema = source.schema().unwrap();
+        let cell = schema.index_of("cell").unwrap();
+        let t = crate::tile::lng_lat_to_tile(2.0, 1.0, 9);
+        let want = format!("9/{}/{}", t.x, t.y);
+        let mut found = false;
+        let plan = crate::input_set::ReadPlan {
+            batch_size: 1 << 16,
+            projection: None,
+            row_groups: None,
+        };
+        for batch in source.open_stream(&plan).unwrap() {
+            use arrow_array::cast::AsArray;
+            let batch = batch.unwrap();
+            found |= batch
+                .column(cell)
+                .as_string::<i32>()
+                .iter()
+                .flatten()
+                .any(|c| c == want);
+        }
+        assert!(found, "no cell {want}");
+    }
+
+    /// A mask and a filter with SQL NULLs: the cells count exactly the rows
+    /// both keep. The filter's column sits at another index in the
+    /// projected batch than in the file.
+    #[test]
+    fn a_mask_and_a_null_filter_gate_the_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("fields.parquet");
+        let geoms: Vec<Option<geo::Geometry<f64>>> = (0..40)
+            .map(|i| {
+                let x = (i % 20) as f64 * 0.1;
+                let y = (i / 20) as f64 * 5.0;
+                Some(geo::Geometry::Point(geo::Point::new(x, y)))
+            })
+            .collect();
+        // Every third row is NULL, then alternately 1 and -1.
+        let values: Vec<Option<f64>> = (0..40)
+            .map(|i| (i % 3 != 0).then_some(if i % 2 == 0 { 1.0 } else { -1.0 }))
+            .collect();
+        let expect = (0..40)
+            .filter(|i| i % 3 != 0 && i % 2 == 0 && i / 20 == 0)
+            .count();
+        let geom_first = {
+            let ids = arrow_array::Float64Array::from(values.clone());
+            std::sync::Arc::new(ids) as std::sync::Arc<dyn arrow_array::Array>
+        };
+        crate::overview::testutil::write_input_with_column(&src, &geoms, "v", geom_first, None);
+        let mask = dir.path().join("mask.geojson");
+        std::fs::write(
+            &mask,
+            r#"{"type":"Polygon","coordinates":[[[-1,-1],[3,-1],[3,1],[-1,1],[-1,-1]]]}"#,
+        )
+        .unwrap();
+        let out = dir.path().join("out.pmtiles");
+        let mut options = banded(&["0-2:s2", "3-3:geom"]).unwrap();
+        options.convert.mask = Some(super::super::mask::MaskSource::Path(mask));
+        options.convert.filter = Some("v > 0".into());
+        options.convert.accumulate = vec![AccumulateSpec::new("v", AccumulateOp::Sum)];
+        convert_to_pmtiles(&TilesInput::Path(src), &out, &options).unwrap();
+        let zooms = decoded_cells_v(&out, dir.path());
+        for z in 0..=2u8 {
+            assert_eq!(zooms[&z], (expect as f64, expect as f64), "z{z}");
+        }
+    }
+
+    /// Per zoom, the `point_count` and `v` sums of the cells.
+    fn decoded_cells_v(archive: &Path, dir: &Path) -> BTreeMap<u8, (f64, f64)> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Float64Type;
+        let out = dir.join("decoded-v.parquet");
+        crate::decode::decode_pmtiles(archive, &out, &crate::decode::DecodeOptions::default())
+            .unwrap();
+        let source = ConvertSource::resolve_path(&out).unwrap();
+        let plan = crate::input_set::ReadPlan {
+            batch_size: 1 << 16,
+            projection: None,
+            row_groups: None,
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut zooms: BTreeMap<u8, (f64, f64)> = BTreeMap::new();
+        for batch in source.open_stream(&plan).unwrap() {
+            let batch = batch.unwrap();
+            let col = |name: &str| {
+                arrow_cast::cast(
+                    batch.column(batch.schema().index_of(name).unwrap()),
+                    &arrow_schema::DataType::Float64,
+                )
+                .unwrap()
+            };
+            let (zoom, count, v) = (col("zoom"), col("point_count"), col("v"));
+            let cell = batch
+                .column(batch.schema().index_of("cell").unwrap())
+                .clone();
+            for r in 0..batch.num_rows() {
+                if !cell.is_valid(r) {
+                    continue;
+                }
+                let z = zoom.as_primitive::<Float64Type>().value(r) as u8;
+                if seen.insert((z, cell.as_string::<i32>().value(r).to_string())) {
+                    let e = zooms.entry(z).or_default();
+                    e.0 += count.as_primitive::<Float64Type>().value(r);
+                    e.1 += v.as_primitive::<Float64Type>().value(r);
+                }
+            }
+        }
+        zooms
+    }
+
+    /// One read of a remote input: the cells' read and the feature run's
+    /// share the source's disk spill, so the cell band costs no more
+    /// network than the feature zooms alone plus the rollup column, even
+    /// with a chunk cache too small to keep a row group.
+    #[cfg(feature = "remote")]
+    #[test]
+    fn a_cell_band_reads_a_remote_input_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("fields.parquet");
+        let n = 3000;
+        let geoms: Vec<Option<geo::Geometry<f64>>> = (0..n)
+            .map(|i| {
+                let (x, y) = ((i % 60) as f64 * 0.01, (i / 60) as f64 * 0.01);
+                Some(geo::Geometry::Polygon(
+                    geo::Rect::new((x, y), (x + 0.004, y + 0.004)).to_polygon(),
+                ))
+            })
+            .collect();
+        let values: Vec<f64> = (0..n).map(|v| v as f64).collect();
+        crate::overview::testutil::write_input_with_f64_row_groups(
+            &src,
+            &geoms,
+            "metrics:area",
+            &values,
+            Some(500),
+        );
+        let bytes = std::fs::read(&src).unwrap();
+        let fetched = |options: &TilesOptions, name: &str| {
+            let part = crate::input::test_memory_source_with_cap(bytes.clone(), name, 64);
+            let config = options.features().into_owned();
+            let out = dir.path().join(format!("{name}.pmtiles"));
+            if options.cell_bands.is_empty() {
+                convert_to_pmtiles_validated(
+                    &TilesInput::Path(dir.path().join(name)),
+                    || Ok(ConvertSource::single(part.clone())),
+                    &out,
+                    &config.validate().unwrap(),
+                    &mut (),
+                )
+                .unwrap();
+            } else {
+                convert_with_cells(
+                    &TilesInput::Path(dir.path().join(name)),
+                    || Ok(ConvertSource::single(part.clone())),
+                    &out,
+                    options,
+                    &mut (),
+                )
+                .unwrap();
+            }
+            part.fetch_stats().unwrap().bytes_fetched
+        };
+        let mut cells = banded(&["0-5:a5", "6-8:geom"]).unwrap();
+        cells.convert.accumulate = vec![AccumulateSpec::new("metrics:area", AccumulateOp::Sum)];
+        let features = banded(&["6-8:geom"]).unwrap();
+        let with_cells = fetched(&cells, "cells.parquet");
+        let alone = fetched(&features, "alone.parquet");
+        let area_column: u64 = {
+            let meta =
+                tylertoo_io::read_parquet_metadata(&bytes::Bytes::from(bytes.clone())).unwrap();
+            meta.row_groups()
+                .iter()
+                .map(|rg| {
+                    let c = rg
+                        .columns()
+                        .iter()
+                        .find(|c| c.column_path().string() == "metrics:area")
+                        .unwrap();
+                    c.compressed_size() as u64
+                })
+                .sum()
+        };
+        assert!(
+            with_cells <= alone + area_column,
+            "the cell band fetched {with_cells} B, the feature zooms alone {alone} B, \
+             the rollup column is {area_column} B"
         );
     }
 }

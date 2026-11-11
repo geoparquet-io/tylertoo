@@ -35,6 +35,17 @@ Args:
         are merged, so thinning and the tile size limits apply per
         layer. Excludes `layer_name`, `keep_overview`, `save_plan`,
         `plan` and `variable_depth`. At most 64 layers.
+    bands: The CLI's `--band`, a list of "LO-HI:KIND" strings.
+        Ranges are inclusive; use "Z:KIND" for one zoom.
+        Kinds `geom`, `point` and `square` draw features;
+        `grid`, `h3`, `s2` and `a5` draw occupied grid cells.
+        Cells and features share one tiles layer. Cells carry `cell`
+        (the cell id), `point_count` (features counted by centroid)
+        and rollups. `accumulate_attributes` and `cluster_categories`
+        roll up into cells without `cluster`.
+        Requires at least one feature band, with contiguous ranges.
+        No overlaps. Uncovered zooms are empty, with a warning.
+        Excludes `min_zoom`, `max_zoom`, `gsds` and `representation`.
     include_properties: See `overview()`.
     exclude_properties: See `overview()`.
     exclude_all_properties: See `overview()`.
