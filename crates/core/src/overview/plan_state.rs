@@ -158,7 +158,7 @@ const PLAN_HEADER_LEN: usize = 16;
 /// Streamed through `io::copy` rather than slurped: the artifact is
 /// O(input rows), and a planet-scale plan must not be materialized twice
 /// just to be checksummed.
-fn hash_payload<R: Read>(mut r: R) -> std::io::Result<u64> {
+pub(super) fn hash_payload<R: Read>(mut r: R) -> std::io::Result<u64> {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
     std::io::copy(&mut r, &mut hasher)?;
     Ok(hasher.digest())
@@ -943,6 +943,11 @@ fn options_digest(o: &ConvertOptions) -> BTreeMap<String, String> {
         format!("{:?}", o.coalesce_junction_angle),
     );
     put("bbox", format!("{:?}", o.bbox));
+    // The mask's bytes, not its path: an edited mask file changes the plan.
+    put(
+        "mask",
+        format!("{:?}", o.mask.as_ref().map(super::mask::content_hash)),
+    );
     put("filter", format!("{:?}", o.filter));
     put("properties", format!("{:?}", o.properties));
     // Simplification runs in pass 2, but the level plan's omission decision

@@ -10,6 +10,7 @@ import inspect
 import json
 import struct
 import tempfile
+import types
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,9 @@ REALDATA_DIR = FIXTURES_DIR / "realdata"
 
 BUILDINGS = REALDATA_DIR / "open-buildings.parquet"
 ROADS = REALDATA_DIR / "road-detections.parquet"
+
+# A triangle over the western half of the buildings (#826).
+MASK_RING = ((1.6, 42.48), (1.79, 42.48), (1.6, 42.63), (1.6, 42.48))
 
 needs_buildings = pytest.mark.skipif(
     not BUILDINGS.exists(), reason="open-buildings.parquet fixture not available"
@@ -286,6 +290,28 @@ class TestOverviewIntegration:
         report = tylertoo.overview(str(BUILDINGS), str(out), **kwargs)
         assert out.exists()
         return out, report
+
+    def test_mask_path_and_geometry_keep_the_same_features(self):
+        # Shapely's duck type: an object with `wkb` bytes.
+        geometry = types.SimpleNamespace(
+            wkb=struct.pack("<BIII", 1, 3, 1, len(MASK_RING))
+            + b"".join(struct.pack("<dd", x, y) for x, y in MASK_RING)
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mask = Path(tmpdir) / "mask.geojson"
+            mask.write_text(json.dumps({"type": "Polygon", "coordinates": [MASK_RING]}))
+            _, by_path = self._overview(tmpdir, mask=mask)
+            _, by_geometry = self._overview(tmpdir, mask=geometry)
+            assert 0 < by_path["input_features"] < 1000
+            assert by_geometry["input_features"] == by_path["input_features"]
+
+    def test_mask_that_is_not_polygonal_is_a_config_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mask = Path(tmpdir) / "mask.geojson"
+            mask.write_text('{"type": "Point", "coordinates": [1.7, 42.5]}')
+            with pytest.raises(tylertoo.ConfigError, match="--mask"):
+                self._overview(tmpdir, mask=str(mask))
 
     def test_overview_defaults_and_report(self):
         with tempfile.TemporaryDirectory() as tmpdir:

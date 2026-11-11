@@ -124,7 +124,7 @@ impl crate::error::Classify for LayerColumnError {
 pub struct LayerReport {
     /// The MVT layer name.
     pub layer: String,
-    /// Input rows routed to this layer, after `--filter` and `--bbox`.
+    /// Input rows routed to this layer, after `--filter`, `--bbox` and `--mask`.
     pub input_rows: u64,
     /// The layer's convert and export.
     #[serde(flatten)]
@@ -143,7 +143,7 @@ pub struct LayeredReport {
     /// Layers whose features all generalized or filtered away, with no
     /// tiles to merge.
     pub empty_layers: Vec<String>,
-    /// Input rows `--filter` or `--bbox` dropped before the split, in no
+    /// Input rows `--filter`, `--bbox` or `--mask` dropped before the split, in no
     /// layer.
     pub filtered_rows: u64,
     /// Distinct tiles in the merged archive.
@@ -269,12 +269,14 @@ struct Staged {
 struct Gates {
     filter: Option<super::filter::BoundFilter>,
     bbox: Option<super::convert::BboxQuery>,
-    /// The row groups whose footer statistics let the two through.
+    /// `--mask` (#826), tested per row as conversion tests it.
+    mask: Option<super::mask::MaskIndex>,
+    /// The row groups whose footer statistics let the gates through.
     row_groups: Option<crate::input_set::RowGroupSelection>,
 }
 
 impl Gates {
-    /// `--filter` and `--bbox`, bound to the staged `schema`. They run once,
+    /// `--filter`, `--bbox` and `--mask`, bound to the staged `schema`. They run once,
     /// before the split, so the filter may read the routing column and the
     /// layer limit counts only the rows they keep. The layers keep the bbox,
     /// which then passes every row.
@@ -294,9 +296,18 @@ impl Gates {
         let bbox = options
             .bbox
             .map(|b| super::convert::BboxQuery::new(&b, crs));
+        let mask = options
+            .mask
+            .as_ref()
+            .map(|m| {
+                super::mask::load_for_input(m, crs, &crate::diagnostics::Diagnostics::silent())
+            })
+            .transpose()?;
+        let mask_query = super::mask::mask_query(mask.as_ref(), crs);
         let row_groups = super::stream::select_row_groups_streaming(
             source,
             bbox.as_ref(),
+            mask_query.as_ref(),
             filter.as_ref(),
             None,
             crs,
@@ -304,6 +315,7 @@ impl Gates {
         Ok(Self {
             filter,
             bbox,
+            mask: mask.map(|m| super::mask::MaskIndex::new(&m, crs)),
             row_groups,
         })
     }
@@ -360,14 +372,18 @@ fn split(
         message: e.to_string(),
     };
 
-    let (filter, bbox) = (gates.filter.as_ref(), gates.bbox.as_ref());
-    // The bbox's geometry column, restated in the staged schema.
-    let geom = match bbox {
-        Some(_) => source
+    let (filter, bbox, mask) = (
+        gates.filter.as_ref(),
+        gates.bbox.as_ref(),
+        gates.mask.as_ref(),
+    );
+    // The geometry column the bbox and mask test, restated in the staged schema.
+    let geom = match (bbox, mask) {
+        (None, None) => None,
+        _ => source
             .resolved_schema()?
             .geometry_name()
             .and_then(|name| schema.index_of(name).ok()),
-        None => None,
     };
     let row_groups = gates.row_groups.as_ref();
 
@@ -389,11 +405,9 @@ fn split(
         let batch = RecordBatch::try_new(Arc::clone(schema), batch.columns().to_vec())
             .map_err(|e| stage_err(column, &e))?;
         let keep = filter.map(|f| f.eval_mask(&batch, &|i| i));
-        let outside = match (bbox, geom) {
-            (Some(query), Some(g)) => {
-                outside_bbox(&batch, g, query).map_err(|e| stage_err(column, &e))?
-            }
-            _ => Vec::new(),
+        let outside = match geom {
+            Some(g) => outside_gates(&batch, g, bbox, mask).map_err(|e| stage_err(column, &e))?,
+            None => Vec::new(),
         };
         let values = arrow_cast::cast(batch.column(idx), &DataType::Utf8)
             .map_err(|e| stage_err(column, &e))?;
@@ -474,24 +488,37 @@ fn routing_column(schema: &arrow_schema::Schema, column: &str) -> Result<usize, 
     Ok(idx)
 }
 
-/// Per row of `batch`, whether its geometry (column `geom`) has an envelope
-/// that misses `query`: what convert drops as outside `--bbox`.
-fn outside_bbox(
+/// Per row of `batch`, whether its geometry (column `geom`) is one convert
+/// drops as outside `--bbox` (its envelope misses `bbox`) or `--mask` (it
+/// misses `mask`). A null or empty geometry is left for convert to count.
+fn outside_gates(
     batch: &RecordBatch,
     geom: usize,
-    query: &super::convert::BboxQuery,
+    bbox: Option<&super::convert::BboxQuery>,
+    mask: Option<&super::mask::MaskIndex>,
 ) -> crate::Result<Vec<bool>> {
     let rows: Vec<usize> = (0..batch.num_rows()).collect();
     let field = batch.schema_ref().field(geom).clone();
     let array = geoarrow::array::from_arrow_array(batch.column(geom).as_ref(), &field)
         .map_err(|e| crate::GeoParquetReadError::decode("--layer-column bbox", e))?;
-    let envelopes = crate::batch_processor::visit_geoarrow_array(
-        array.as_ref(),
-        super::auto_zoom::SampledBboxes { rows: &rows },
-    )?;
-    Ok(envelopes
+    let envelopes = |mask| {
+        crate::batch_processor::visit_geoarrow_array(
+            array.as_ref(),
+            super::auto_zoom::SampledBboxes { rows: &rows, mask },
+        )
+    };
+    let all = envelopes(None)?;
+    // With a mask, a row it misses reads `None` where `all` reads `Some`.
+    let kept = mask.map(|m| envelopes(Some(m))).transpose()?;
+    Ok(all
         .iter()
-        .map(|b| b.is_some_and(|b| !query.intersects(&b)))
+        .enumerate()
+        .map(|(i, b)| {
+            b.is_some_and(|b| {
+                bbox.is_some_and(|q| !q.intersects(&b))
+                    || kept.as_ref().is_some_and(|k| k[i].is_none())
+            })
+        })
         .collect())
 }
 
@@ -1056,6 +1083,20 @@ mod tests {
         let names: Vec<&str> = report.layers.iter().map(|l| l.layer.as_str()).collect();
         assert_eq!(names, ["v0", "v1", "v2", "v3", "v4"]);
         assert_eq!(report.filtered_rows, MAX_LAYERS as u64 + 1 - 5);
+
+        // And the layers `--mask` keeps (#826): v0..v2 lie at x = -30..-28.
+        let mask = geo::Rect::new((-30.5, -1.0), (-27.5, 1.0)).to_polygon();
+        let mut masked = super::tests::options("crop");
+        masked.convert.mask = Some(super::super::mask::MaskSource::Wkb(
+            crate::wkb::geometry_to_wkb(&mask.into()).unwrap(),
+        ));
+        let outcome = convert_to_pmtiles(&input, &dir.path().join("o.pmtiles"), &masked).unwrap();
+        let TilesOutcome::Layered(report) = outcome else {
+            panic!("expected a layered outcome, got {outcome:?}");
+        };
+        let names: Vec<&str> = report.layers.iter().map(|l| l.layer.as_str()).collect();
+        assert_eq!(names, ["v0", "v1", "v2"]);
+        assert_eq!(report.filtered_rows, MAX_LAYERS as u64 + 1 - 3);
     }
 
     /// A property selection stages only what a layer can use: a filter may

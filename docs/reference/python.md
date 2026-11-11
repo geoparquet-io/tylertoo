@@ -67,6 +67,7 @@ overview(
     full_column_stats: bool = False,
     read_batch_size: int = 8192,
     bbox: tuple[float, float, float, float] | None = None,
+    mask: str | os.PathLike[str] | _Geometry | None = None,
     filter: str | None = None,
     profile: Literal['auto', 'speed', 'bounded'] = "auto",
     in_flight_batches: int = 0,
@@ -151,6 +152,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `full_column_stats`: Keep Parquet statistics for every column.
 * `read_batch_size`: Rows per [read batch](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
 * `bbox`: Keep features that intersect this lon/lat box, also one ±360° wrap away, as for 0..360 data.
+* `mask`: Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (`.geojson` or `.json`, lon/lat per RFC 7946) or GeoParquet file, or a shapely geometry (any object with `.wkb`). Touching counts. A feature also matches when its copy one world width away (±360°) intersects the mask, as with `bbox`. The mask's bbox skips row groups like `bbox`. Combines with `bbox` and `filter` by AND. The mask must use the input's CRS; a mismatch is refused, so reproject the mask first. A shapely geometry is taken to be in the input's CRS.
 * `filter`: SQL-style predicate, such as `"confidence > 0.8"`.
 * `profile`: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles): `"speed"` holds everything in RAM, `"bounded"` uses disk and holds the least, and `"auto"` sizes to the machine's memory. Footprints compare for one allocator: wheels use mimalloc, which adds a fixed floor of about 600 MiB on small inputs. On a 1.4M polygon export it ran 8% faster and held 18% more peak memory than the system allocator; a non-musl source build can opt out with `maturin build --no-default-features` (musl always uses mimalloc).
 * `in_flight_batches`: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency), or `0` to size from the CPU count.
@@ -557,6 +559,7 @@ convert(
     variable_depth: bool = False,
     gsds: Sequence[float] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
+    mask: str | os.PathLike[str] | _Geometry | None = None,
     name: str | None = None,
     description: str | None = None,
     attribution: str | None = None,
@@ -642,6 +645,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `variable_depth`: See `export_pmtiles()`.
 * `gsds`: See `overview()`.
 * `bbox`: See `overview()`.
+* `mask`: See `overview()`.
 * `name`: See `export_pmtiles()`.
 * `description`: See `export_pmtiles()`.
 * `attribution`: See `export_pmtiles()`.

@@ -46,6 +46,7 @@ Args:
     variable_depth: See `export_pmtiles()`.
     gsds: See `overview()`.
     bbox: See `overview()`.
+    mask: See `overview()`.
     name: See `export_pmtiles()`.
     description: See `export_pmtiles()`.
     attribution: See `export_pmtiles()`.
