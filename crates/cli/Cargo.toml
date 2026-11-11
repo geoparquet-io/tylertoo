@@ -45,7 +45,7 @@ name = "tylertoo"
 path = "src/main.rs"
 
 [dependencies]
-tylertoo-core = { workspace = true, features = ["remote", "cli"] }
+tylertoo-core = { workspace = true, features = ["remote", "cli", "serve"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 env_logger = { workspace = true }

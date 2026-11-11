@@ -28,6 +28,7 @@ __all__ = [
     "export_pmtiles",
     "overview",
     "pyramid",
+    "serve",
     "stats",
     "validate",
 ]
@@ -175,6 +176,13 @@ def stats(
     largest: int = 10,
     layers: bool = False,
 ) -> dict[str, Any]: ...
+def serve(
+    archive: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    cors: str | Sequence[str] = [],
+) -> None: ...
 def validate(file: str) -> ValidationReport: ...
 @overload
 def convert(

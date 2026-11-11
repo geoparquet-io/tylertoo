@@ -130,6 +130,8 @@ mod pmtiles_writer;
 mod pyramid;
 mod quality;
 mod resolved_schema;
+#[cfg(feature = "serve")]
+mod serve;
 mod shard;
 mod stats;
 mod sutherland_hodgman;
@@ -219,6 +221,10 @@ pub mod internal {
     pub use mlt_core;
     pub mod archive_index {
         pub use crate::archive_index::*;
+    }
+    #[cfg(feature = "serve")]
+    pub mod serve {
+        pub use crate::serve::*;
     }
     pub mod atomic_output {
         pub use crate::atomic_output::*;

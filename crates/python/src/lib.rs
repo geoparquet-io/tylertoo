@@ -555,6 +555,49 @@ fn pyramid(
 }
 }
 
+signature_serve! {
+fn serve(
+    py: Python<'_>,
+    archive: &Bound<'_, PyAny>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<()> {
+    refresh_log_levels(py);
+    let values = keywords(kwargs)?;
+    let mut defaults = config_keywords::command_defaults("serve");
+    for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
+    defaults.extend(values);
+    let host: String = serde_json::from_value(defaults.remove("host").unwrap()).map_err(|e| config_err(format!("host: {e}")))?;
+    let port: u16 = serde_json::from_value(defaults.remove("port").unwrap()).map_err(|e| config_err(format!("port: {e}")))?;
+    // One origin, or a list of them, like the CLI's repeated `--cors`.
+    let cors: Vec<String> = match defaults.remove("cors").unwrap() {
+        serde_json::Value::String(origin) => vec![origin],
+        v => serde_json::from_value(v).map_err(|e| config_err(format!("cors: {e}")))?,
+    };
+    // One path, or a list of them, like the CLI's `ARCHIVE...`.
+    let archives: Vec<PathBuf> = match archive.extract::<PathBuf>() {
+        Ok(path) => vec![path],
+        Err(_) => archive.extract()?,
+    };
+    let server = py
+        .detach(|| tylertoo_core::internal::serve::Server::bind(&archives, &host, port, &cors))
+        .map_err(|e| to_py(e.kind(), e.to_string(), None))?;
+    let builtins = PyModule::import(py, "builtins")?;
+    builtins.getattr("print")?.call1((format!("Serving {} on {}", archives.len(), server.url()),))?;
+    // The loop polls Python's signal handlers, so Ctrl-C raises
+    // KeyboardInterrupt here, as it does in `http.server`.
+    let mut interrupted = None;
+    py.detach(|| {
+        server.run(|| {
+            Python::attach(|py| py.check_signals())
+                .map_err(|e| interrupted = Some(e))
+                .is_ok()
+        })
+    })
+    .map_err(|e| to_py(e.kind(), e.to_string(), None))?;
+    interrupted.map_or(Ok(()), Err)
+}
+}
+
 /// Native body of `tylertoo._defaults()`: every keyword default of every
 /// function, keyed `{function: {keyword: default}}`, built from the core
 /// `Default` impls (#779), also used to generate native signatures.
@@ -568,6 +611,7 @@ fn _defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
         "pyramid",
         "decode",
         "stats",
+        "serve",
     ] {
         out.set_item(
             name,
@@ -605,6 +649,7 @@ fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(pyramid, m)?)?;
     m.add_function(wrap_pyfunction!(stats, m)?)?;
+    m.add_function(wrap_pyfunction!(serve, m)?)?;
     m.add_function(wrap_pyfunction!(_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(_run_cli, m)?)?;
     Ok(())
