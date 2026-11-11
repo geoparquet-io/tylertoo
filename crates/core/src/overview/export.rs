@@ -1893,10 +1893,12 @@ fn plan_level_groups(
 /// the serial loop's. The cap bounds members in flight, not the group, so a
 /// group whose encodes keep up still overlaps every level.
 ///
-/// A multi-wave level's waves overlap (#817). Under `bounded` the cap is
-/// the largest wave plus [`BOUNDED_WAVE_SLACK_PERMILLE`], with no
-/// [`PARTITION_WAVE_MIN`] floor, which its plan priced in (#815): the next wave is admitted once the wave before it has
-/// at most the slack left, so its last tiles no longer idle the pool. A
+/// A multi-wave level's waves overlap (#817). Under `bounded` a group that
+/// holds one caps at the largest wave plus [`BOUNDED_WAVE_SLACK_PERMILLE`],
+/// with no [`PARTITION_WAVE_MIN`] floor, which its plan priced in (#815):
+/// the next wave is admitted once the wave before it has at most the slack
+/// left, so its last tiles no longer idle the pool. A group of single-wave
+/// levels keeps the floor, so a small export's levels still overlap. A
 /// `member_cap` of 0 is the serial schedule.
 fn group_schedule(
     member_cap: usize,
@@ -1913,14 +1915,17 @@ fn group_schedule(
         })
         .max()
         .unwrap_or(0);
-    // Bounded has no full-target floor: its multi-wave levels plan at a
-    // quarter target, and a guard-narrowed wave must stay what was priced.
-    let cap = member_cap.min(match profile {
-        MemoryProfile::Bounded => with_bounded_slack(largest_wave),
-        _ => largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN)),
-    });
+    let single_wave_cap =
+        member_cap.min(largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN)));
+    // Bounded's multi-wave levels plan at a quarter target, so the floor
+    // would let a guard-narrowed level's waves past what was priced.
+    let cap = match profile {
+        MemoryProfile::Bounded => member_cap.min(with_bounded_slack(largest_wave)),
+        _ => single_wave_cap,
+    };
     let gate = GroupGate {
         cap,
+        single_wave_cap,
         waves: cap > 0,
     };
     (plan_level_groups(plans, member_cap, gate.waves), gate)
@@ -3753,7 +3758,11 @@ fn export_level_group(
         reports: Vec::with_capacity(levels.len()),
         error: None,
     });
-    let in_flight = InFlight::new(gate.cap);
+    let in_flight = InFlight::new(if levels.iter().any(|level| level_waves(level.plan) > 1) {
+        gate.cap
+    } else {
+        gate.single_wave_cap
+    });
     let collected = rayon::in_place_scope(|scope| -> Result<(), (usize, ExportError)> {
         // The group's ordinal of the next wave to collect.
         let mut unit = 0;
@@ -3877,10 +3886,12 @@ fn export_level_group(
 }
 
 /// How a level group runs ([`export_level_group`]): the [`InFlight`] cap
-/// ([`group_schedule`]), and whether a multi-wave level's waves overlap.
+/// ([`group_schedule`]) of a group with a multi-wave level and of one with
+/// only single-wave levels, and whether a multi-wave level's waves overlap.
 #[derive(Clone, Copy)]
 struct GroupGate {
     cap: usize,
+    single_wave_cap: usize,
     waves: bool,
 }
 
@@ -12329,6 +12340,30 @@ mod tests {
         assert_eq!(
             group_schedule(30, &plans, 1, MemoryProfile::Bounded).1.cap,
             30
+        );
+    }
+
+    /// #815: under `bounded`, small single-wave levels share one group and
+    /// overlap under the full-target floor, as before the multi-wave slack
+    /// cap; only a group with a multi-wave level takes that cap.
+    #[test]
+    fn bounded_small_single_wave_levels_keep_the_floor() {
+        let plans = vec![
+            plan_with_members(3, &[10], 6),
+            plan_with_members(4, &[20], 6),
+            plan_with_members(5, &[30], 6),
+            plan_with_members(6, &[40], 6),
+        ];
+        let (groups, gate) = group_schedule(10_000, &plans, 64, MemoryProfile::Bounded);
+        assert_eq!(groups, vec![0..4]);
+        assert_eq!(gate.single_wave_cap, 64 * PARTITION_WAVE_MIN);
+        assert_eq!(gate.cap, with_bounded_slack(40));
+        // The budget still bounds it.
+        assert_eq!(
+            group_schedule(100, &plans, 64, MemoryProfile::Bounded)
+                .1
+                .single_wave_cap,
+            100
         );
     }
 
