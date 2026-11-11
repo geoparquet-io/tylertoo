@@ -3348,6 +3348,87 @@ mod sink_sample_tests {
         );
     }
 
+    /// A level batch whose input batch pooled no geometries (each level holds
+    /// its own column) rebuilds the batch a pooled one does, and is priced by
+    /// its own column: the shared rows hold no geometry, and their floor is
+    /// still paid once per shared row.
+    #[test]
+    fn own_and_pooled_level_geometries_rebuild_the_same_batch() {
+        let n = 100usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("geometry", DataType::Float64, false),
+            Field::new("id", DataType::Float64, false),
+        ]));
+        let input = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::StringArray::from_iter_values(
+                    (0..n).map(|i| format!("row {i}")),
+                )),
+                Arc::new(Float64Array::from_iter_values((0..n).map(|i| -(i as f64)))),
+                Arc::new(Float64Array::from_iter_values((0..n).map(|i| i as f64))),
+            ],
+        )
+        .unwrap();
+        let levels: Vec<Vec<usize>> = (0..3)
+            .map(|l| (0..n).filter(|i| i % 4 >= l).collect())
+            .collect();
+        let kept: Vec<&[usize]> = levels.iter().map(Vec::as_slice).collect();
+        let pool: ArrayRef = Arc::new(Float64Array::from_iter_values(
+            (0..n).map(|i| i as f64 * 0.5),
+        ));
+        let (pooled, pooled_index) =
+            SharedRows::new(&input, &[0, 2], &kept, Some(pool.clone())).unwrap();
+        let (own, own_index) = SharedRows::new(&input, &[0, 2], &kept, None).unwrap();
+        assert_eq!(
+            own.held_bytes() + pool.get_array_memory_size() as u64,
+            pooled.held_bytes()
+        );
+        let (pooled, own) = (Arc::new(pooled), Arc::new(own));
+        let mut held = own.held_bytes();
+        let mut per_level = Vec::new();
+        let mut pooled_levels = Vec::new();
+        for ((rows, pi), oi) in levels.iter().zip(pooled_index).zip(own_index) {
+            let at = UInt32Array::from_iter_values(rows.iter().map(|&i| i as u32));
+            let column = arrow_select::take::take(pool.as_ref(), &at, None).unwrap();
+            let level = LevelBatch::shared(
+                schema.clone(),
+                &own,
+                oi.clone(),
+                LevelGeometry::Own(column.clone()),
+                1,
+                Vec::new(),
+            );
+            assert_eq!(
+                level.held_bytes(),
+                (oi.get_array_memory_size() + column.get_array_memory_size()) as u64
+            );
+            held += level.held_bytes();
+            per_level.push(Some((level, 0)));
+            pooled_levels.push(LevelBatch::shared(
+                schema.clone(),
+                &pooled,
+                pi,
+                LevelGeometry::Pool(at),
+                1,
+                Vec::new(),
+            ));
+        }
+        let mut tuner = SinkAutoTuner::with_budget(false, 0, 0);
+        tuner.observe_shared(&per_level);
+        for (level, _) in per_level.iter().flatten() {
+            tuner.observe(level);
+        }
+        assert_eq!(
+            tuner.projected_bytes(),
+            held + own.rows as u64 * SINK_ROW_ALLOC_OVERHEAD_BYTES
+        );
+        for ((level, _), pooled) in per_level.into_iter().flatten().zip(pooled_levels) {
+            assert_eq!(level.materialize().unwrap(), pooled.materialize().unwrap());
+        }
+    }
+
     /// Downgrading an already-spilled sink is a no-op, so the one-way rule
     /// cannot be violated by a second call.
     #[test]

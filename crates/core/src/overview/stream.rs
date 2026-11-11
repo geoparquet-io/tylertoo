@@ -7223,30 +7223,34 @@ type LevelSelection = (Vec<usize>, Vec<Arc<Geometry<f64>>>, usize);
 /// when the batch pools them.
 type LevelPositions = (UInt32Array, Option<UInt32Array>);
 
-/// The rows and geometries the levels built from `batch` share (#852), and
-/// each level's positions in the shared rows and in the shared geometries.
-/// A geometry several levels keep (the same `Arc`, #499) is encoded once.
+/// The rows the levels built from `batch` share (#852), and each level's
+/// positions in them. With `pool`, the levels' geometries too: a geometry
+/// several levels keep (the same `Arc`, #499) is encoded once, and each level
+/// gets its positions in the pool.
 fn share_rows(
     batch: &RecordBatch,
     ctxs: &[LevelStreamCtx<'_>],
     selections: &[LevelSelection],
+    pool: bool,
 ) -> Result<(Arc<pipeline::SharedRows>, Vec<LevelPositions>), ConvertError> {
     let finest = ctxs.last().expect("a cascade has levels");
     // One geometry column serves every level, so they must type it alike.
     debug_assert!(ctxs.iter().all(|c| c.geom_idx == finest.geom_idx
         && c.source_schema.field(c.geom_idx) == finest.source_schema.field(finest.geom_idx)));
-    let (geometry, positions) =
-        match geometry_pool(selections.iter().map(|(_, geoms, _)| geoms.as_slice())) {
-            Some((pool, positions)) => (
-                Some(build_geometry_column(
-                    finest.source_schema,
-                    finest.geom_idx,
-                    &pool,
-                )?),
-                positions.into_iter().map(Some).collect(),
-            ),
-            None => (None, vec![None; selections.len()]),
-        };
+    let (geometry, positions) = if pool {
+        let (pool, positions) =
+            geometry_pool(selections.iter().map(|(_, geoms, _)| geoms.as_slice()));
+        (
+            Some(build_geometry_column(
+                finest.source_schema,
+                finest.geom_idx,
+                &pool,
+            )?),
+            positions.into_iter().map(Some).collect(),
+        )
+    } else {
+        (None, vec![None; selections.len()])
+    };
     let kept: Vec<&[usize]> = selections
         .iter()
         .map(|(kept, _, _)| kept.as_slice())
@@ -7255,29 +7259,33 @@ fn share_rows(
     Ok((Arc::new(rows), index.into_iter().zip(positions).collect()))
 }
 
-/// The least share of a batch's level geometries the levels must share (one
-/// allocation, #499) for a pool. Below it the pool's hash and the drain's
-/// rebuild of every pooled geometry cost more pass-2 time than the RAM it
-/// saves is worth, and each level builds its own column, in parallel.
-/// In thousandths.
-const POOL_MIN_SHARED: usize = 250;
+/// The least share of a batch's level geometries that must reuse another
+/// level's allocation (#499) for a pool, in thousandths. Below it the pool's
+/// hash and the drain's rebuild of every pooled geometry cost more pass-2
+/// time than the RAM it saves is worth, and each level builds its own
+/// column, in parallel (simplified polygons and lines: every level's
+/// geometry is its own allocation).
+const POOL_MIN_SHARED: u64 = 250;
+
+/// Whether a batch whose levels keep `kept` geometries, `reused` of them the
+/// finer level's allocation, pools them ([`POOL_MIN_SHARED`]).
+fn pool_pays(reused: u64, kept: usize) -> bool {
+    reused > 0 && reused * 1000 >= kept as u64 * POOL_MIN_SHARED
+}
+
+#[cfg(test)]
+thread_local! {
+    // Geometry pools hashed on this thread.
+    static POOL_BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 /// Each distinct geometry (by allocation) the `levels` keep, in first-kept
-/// order, and each level's positions in it; `None` when the levels share
-/// less than [`POOL_MIN_SHARED`] of their geometries.
+/// order, and each level's positions in it.
 fn geometry_pool<'a>(
-    levels: impl Iterator<Item = &'a [Arc<Geometry<f64>>]> + Clone,
-) -> Option<(Vec<&'a Geometry<f64>>, Vec<UInt32Array>)> {
-    let min_shared = std::env::var("XPOOL_MIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(POOL_MIN_SHARED);
-    // A geometry two levels keep has two references here, so with none
-    // shared the levels share nothing (lines: every level simplifies anew).
-    if levels.clone().flatten().all(|g| Arc::strong_count(g) == 1) {
-        return None;
-    }
-    let total: usize = levels.clone().map(<[_]>::len).sum();
+    levels: impl Iterator<Item = &'a [Arc<Geometry<f64>>]>,
+) -> (Vec<&'a Geometry<f64>>, Vec<UInt32Array>) {
+    #[cfg(test)]
+    POOL_BUILDS.with(|c| c.set(c.get() + 1));
     let mut slot: std::collections::HashMap<*const Geometry<f64>, u32> =
         std::collections::HashMap::new();
     let mut pool: Vec<&Geometry<f64>> = Vec::new();
@@ -7294,7 +7302,7 @@ fn geometry_pool<'a>(
                 .collect()
         })
         .collect();
-    ((total - pool.len()) * 1000 >= total * min_shared).then_some((pool, positions))
+    (pool, positions)
 }
 
 /// One cascade-fold step's result, sharing (`Arc`) the kept geometry instead
@@ -7429,17 +7437,18 @@ pub(super) fn process_batch_cascade(
     // this `zip` (an `IndexedParallelIterator`) preserves ascending `pos`
     // order exactly like the pre-#499 `Vec<Vec<Simplified>>` collect did —
     // load-bearing, since `folds[pos]` below is indexed by that position.
-    // The two per-feature counters (#499's `identical_steps` profile metric)
-    // are summed in a plain sequential pass after collecting, rather than
-    // via a rayon `fold`/`reduce` that could reorder `folds`.
-    let per_feature: Vec<(Vec<SharedStep>, u64, u64)> = geoms
+    // The per-feature counters (#499's `identical_steps` profile metric, and
+    // the steps that reuse the previous level's geometry, which decide the
+    // pool) are summed in a plain sequential pass after collecting, rather
+    // than via a rayon `fold`/`reduce` that could reorder `folds`.
+    let per_feature: Vec<(Vec<SharedStep>, u64, u64, u64)> = geoms
         .par_iter()
         .zip(&selected)
         .map(|(g, &i)| {
             let ml = finest.min_levels[row_offset + i];
             let mut out: Vec<SharedStep> = Vec::with_capacity(ctxs.len());
             let mut fold = CascadeFold::new();
-            let (mut shared, mut total) = (0u64, 0u64);
+            let (mut shared, mut total, mut reused) = (0u64, 0u64, 0u64);
             // #541: walk the unmaterialized fine steps first, so the finest
             // buffered ctx folds from the same working geometry a full run
             // would have handed it — the same `CascadeFold` steps
@@ -7468,21 +7477,29 @@ pub(super) fn process_batch_cascade(
                         if s {
                             shared += 1;
                         }
+                        // Not `s` alone: the first kept step shares the
+                        // decoded geometry, which no other level keeps.
+                        if matches!(out.last(), Some(SharedStep::Keep(p)) if Arc::ptr_eq(p, &geom))
+                        {
+                            reused += 1;
+                        }
                         out.push(SharedStep::Keep(geom));
                     }
                     FoldStep::Dropped => out.push(SharedStep::Dropped),
                 }
             }
-            (out, shared, total)
+            (out, shared, total, reused)
         })
         .collect();
     let mut folds: Vec<Vec<SharedStep>> = Vec::with_capacity(per_feature.len());
     let mut shared_count = 0u64;
     let mut total_count = 0u64;
-    for (out, s, t) in per_feature {
+    let mut reused_count = 0u64;
+    for (out, s, t, r) in per_feature {
         folds.push(out);
         shared_count += s;
         total_count += t;
+        reused_count += r;
     }
     timers.record_cascade_steps(shared_count, total_count);
     Pass2Timers::add(&timers.simplify, t_simplify);
@@ -7537,9 +7554,13 @@ pub(super) fn process_batch_cascade(
         })
         .collect();
     // #852: the levels share their rows' properties, except where clustering
-    // rewrites the accumulate columns per level.
+    // rewrites the accumulate columns per level, and their geometries when
+    // they reuse enough of one another's. Chain geometries and carrier
+    // squares are fresh allocations: kept, never reused.
+    let kept: usize = selections.iter().map(|(_, geoms, _)| geoms.len()).sum();
+    let pool = pool_pays(reused_count, kept);
     let shared = (share && !finest.cluster_enabled)
-        .then(|| share_rows(batch, ctxs, &selections))
+        .then(|| share_rows(batch, ctxs, &selections, pool))
         .transpose()?;
     let results: Vec<Result<Option<(pipeline::LevelBatch, usize)>, ConvertError>> = selections
         .into_par_iter()
@@ -7616,7 +7637,7 @@ mod tests {
             vec![Arc::clone(&a), Arc::clone(&b2)],
             vec![Arc::clone(&a), Arc::clone(&c)],
         ];
-        let (pool, positions) = geometry_pool(levels.iter().map(Vec::as_slice)).unwrap();
+        let (pool, positions) = geometry_pool(levels.iter().map(Vec::as_slice));
         assert_eq!(pool.len(), 4, "a pooled once; b, b2, c each");
         for (level, pos) in levels.iter().zip(&positions) {
             let got: Vec<&Geometry<f64>> = pos.values().iter().map(|&p| pool[p as usize]).collect();
@@ -7625,19 +7646,125 @@ mod tests {
         }
     }
 
-    /// Levels that share no geometry, or too few, build no pool: each holds
-    /// its own geometry column.
+    /// A pool takes a quarter of the batch's level geometries reusing the
+    /// finer level's, and at least one.
     #[test]
-    fn levels_that_share_too_few_geometries_build_no_pool() {
-        let pt = |x: f64| Arc::new(Geometry::Point(geo::Point::new(x, 0.0)));
-        let fresh = |n: usize| (0..n).map(|i| pt(i as f64)).collect::<Vec<_>>();
-        let none = [fresh(4), fresh(4), fresh(4)];
-        assert!(geometry_pool(none.iter().map(Vec::as_slice)).is_none());
-        // One of twelve shared: still too few.
-        let (mut a, b, c) = (fresh(4), fresh(4), fresh(4));
-        a[0] = Arc::clone(&b[0]);
-        let few = [a, b, c];
-        assert!(geometry_pool(few.iter().map(Vec::as_slice)).is_none());
+    fn a_pool_takes_a_quarter_of_the_geometries_reused() {
+        assert!(!pool_pays(0, 0));
+        assert!(!pool_pays(0, 12));
+        assert!(!pool_pays(2, 12));
+        assert!(pool_pays(3, 12));
+        assert!(pool_pays(1, 1));
+    }
+
+    /// The cascade over a two-level ladder of `geoms` (every row a member of
+    /// both), how many geometry pools it hashed, and how many steps shared
+    /// their input (#499's counter).
+    fn cascade_two_levels(
+        geoms: &[Geometry<f64>],
+        (fine, coarse): (f64, f64),
+    ) -> (Vec<Option<(pipeline::LevelBatch, usize)>>, u32, u64) {
+        use geoarrow::array::GeometryBuilder;
+        use geoarrow::datatypes::GeometryType;
+        use geoarrow_array::GeoArrowArray;
+        let mut builder =
+            GeometryBuilder::new(GeometryType::new(Default::default())).with_prefer_multi(false);
+        builder.extend_from_iter(geoms.iter().map(Some));
+        let geometry = builder.finish();
+        let schema = Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            geometry.data_type().to_field("geometry", true),
+        ]);
+        let n = geoms.len();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(arrow_array::Int64Array::from_iter_values(0..n as i64)),
+                geometry.to_array_ref(),
+            ],
+        )
+        .unwrap();
+        let min_levels = vec![0u8; n];
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let simplify = SimplifyOptions::default();
+        let chain = [CascadeStep::geom(fine), CascadeStep::geom(coarse)];
+        let level = |orig_level: u8, gsd_m: f64, cascade_chain| LevelStreamCtx {
+            diagnostics: &diagnostics,
+            source_schema: &schema,
+            cluster_schema: &schema,
+            out_schema: &schema,
+            non_geom_cols: &[0],
+            geom_idx: 1,
+            min_levels: &min_levels,
+            orig_level,
+            duplicating: true,
+            verbatim: false,
+            gsd_m,
+            zoom: None,
+            repr: Representation::Geometry,
+            crs: Crs::Epsg4326,
+            simplify: &simplify,
+            cluster_enabled: false,
+            cluster_table: None,
+            acc_cols: &[],
+            category_col: None,
+            coalesce_enabled: false,
+            kinds: None,
+            coalesce_table: None,
+            cascade_chain,
+            carriers: &[],
+        };
+        // Coarse→fine; each level's chain runs from the finest down to it.
+        let ctxs = [level(0, coarse, &chain[..]), level(1, fine, &chain[..1])];
+        let before = POOL_BUILDS.with(std::cell::Cell::get);
+        let timers = Pass2Timers::default();
+        let out = process_batch_cascade(&batch, 0, &ctxs, &timers, true).unwrap();
+        (
+            out,
+            POOL_BUILDS.with(std::cell::Cell::get) - before,
+            timers.cascade_steps_shared.load(Ordering::Relaxed),
+        )
+    }
+
+    /// #852: a batch pools its level geometries only when the levels reuse
+    /// one another's (#499); otherwise each level builds its own column, and
+    /// the batch hashes no pool at all.
+    #[test]
+    fn a_batch_pools_level_geometries_only_when_levels_reuse_them() {
+        let pooled = |out: &[Option<(pipeline::LevelBatch, usize)>]| -> Vec<bool> {
+            out.iter()
+                .map(|o| match o {
+                    Some((pipeline::LevelBatch::Shared { geometry, .. }, _)) => {
+                        matches!(geometry, pipeline::LevelGeometry::Pool(_))
+                    }
+                    other => panic!("a shared level batch, got {}", other.is_some()),
+                })
+                .collect()
+        };
+        // Points pass every step unchanged: both levels keep one allocation.
+        let points: Vec<Geometry<f64>> = (0..8)
+            .map(|i| Geometry::Point(geo::Point::new(f64::from(i), 0.0)))
+            .collect();
+        let (out, builds, _) = cascade_two_levels(&points, (10.0, 20_000.0));
+        assert_eq!(pooled(&out), [true, true]);
+        assert_eq!(builds, 1);
+        // Zigzag lines the fine step leaves alone (sharing the decoded
+        // geometry, #499's counter) and the coarse step straightens: no two
+        // levels share an allocation, so no pool, and no hash pass for one.
+        let lines: Vec<Geometry<f64>> = (0..8)
+            .map(|i| {
+                let y = f64::from(i);
+                Geometry::LineString(geo::LineString::from(
+                    (0..=20)
+                        .map(|k| (f64::from(k) * 0.05, y + if k % 2 == 0 { 0.0 } else { 0.01 }))
+                        .collect::<Vec<_>>(),
+                ))
+            })
+            .collect();
+        let (out, builds, shared) = cascade_two_levels(&lines, (10.0, 20_000.0));
+        assert_eq!(shared, 8, "the fine step leaves every line alone");
+        assert_eq!(pooled(&out), [false, false]);
+        assert_eq!(builds, 0, "no pool is hashed for levels that share nothing");
     }
 
     /// Array-of-structs fixture → the column-major table the engine takes
