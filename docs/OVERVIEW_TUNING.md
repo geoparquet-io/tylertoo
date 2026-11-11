@@ -339,6 +339,46 @@ with two independent layers over the same zooms.
 Bands tile verbatim by default to preserve their input resolution. Pass
 `--generalize` for raw features that need generalization across several zooms.
 
+### One input, one layer per value: `tiles --layer-column`
+
+When the layers come from one input, `tiles --layer-column COLUMN` (Python
+`layer_column="COLUMN"`) routes each feature to the layer named by its value
+in that column. This is tippecanoe's per-feature `tippecanoe.layer`, which
+geoparquet-io's `gpio pmtiles create --layer-by-column` sets.
+
+```bash
+tylertoo tiles fields.parquet fields.pmtiles --layer-column year
+```
+
+- Each value is trimmed and used as the layer name. A null or blank value
+  goes to the `_unknown` layer. Names may contain any character, `:`
+  included.
+- The column decides the layer and is not written as a property. A knob
+  that reads it per feature (`--sort-key`, `--feature-order`, `--feature-id`,
+  and the like) is refused. `--filter` and `--bbox` run once, before the
+  split, so the filter may read the column and the 64-layer limit counts
+  only the values they keep.
+- tylertoo reads the input once and splits its rows into one temporary
+  GeoParquet file per layer, in the intermediate overview's directory
+  (`--spill-dir`, then `$TMPDIR`, then the output's directory). Expect
+  about one input's size of extra disk. Each layer then runs the whole
+  `tiles` chain with your options, and the layers are merged as pyramid
+  bands that share zooms.
+- So each layer has its own ladder: the density budget, thinning and line
+  coalescing work per layer, as with separate tippecanoe inputs, and a
+  sparse layer is not thinned against a dense one. `--max-zoom auto` is
+  estimated once, over the whole input.
+- The size caps (`--max-tile-size`, `--max-compressed-tile-size`) apply to
+  each layer's tiles before they are combined, so a combined tile can be
+  over the cap. tippecanoe caps the combined tile (#838).
+- At most 64 layers. Each layer is a full convert and export, and a column
+  with more values is usually an id, not a category. Route by a coarser
+  column, or subset the input with `--filter`.
+- `--layer-name` names the one layer of a plain run, so it is refused.
+  `--shard`, `--save-plan`, `--plan` and `--keep-overview` are refused too,
+  because each layer runs its own convert (#839). So is
+  `--generate-variable-depth-tile-pyramid`.
+
 ### Band sources and syntax
 
 A band accepts GeoParquet or PMTiles via `--band LO-HI:PATH[:LAYER]`.

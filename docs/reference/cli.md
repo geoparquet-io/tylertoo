@@ -86,6 +86,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | `-v`, `--verbose` | Print per-level and per-zoom breakdowns. |
 | `-f`, `--force` | Overwrite the output if it exists. |
 | `--layer-name <LAYER_NAME>` | Layer name for the tiles. Defaults to the input's file stem. |
+| `--layer-column <COLUMN>` | Put each feature in the layer named by its value in COLUMN, and null or blank values in `_unknown`. The column is not written as a property. Each layer is tiled on its own, so the size caps apply per layer. |
 | `--keep-overview <PATH>` | Save the intermediate overview GeoParquet to PATH after export. Does not change the PMTiles output. |
 
 ### Generalization

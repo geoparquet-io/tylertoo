@@ -33,6 +33,8 @@ __all__ = [
     "DecodeReport",
     "Diagnostic",
     "ExportReport",
+    "LayerReport",
+    "LayeredConvertReport",
     "LevelReport",
     "OutOfRangeExemplar",
     "OverviewReport",
@@ -365,6 +367,51 @@ ConvertReport.__doc__ = """The combined report of a one-shot `convert()` run.
 
 Both halves of the chain, keyed like the CLI's `tiles --report`
 JSON: the overview conversion and the PMTiles export."""
+
+
+LayerReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
+    "LayerReport",
+    {
+        "layer": "str",
+        "input_rows": "int",
+        "convert": "OverviewReport",
+        "export": "ExportReport",
+    },
+)
+LayerReport.__doc__ = """One layer of a `convert(layer_column=...)` run.
+
+Attributes:
+    layer: The MVT layer name: the column's trimmed value, or
+        `"_unknown"` for null and blank values.
+    input_rows: Input rows routed to this layer, after `filter` and
+        `bbox`. Row numbers in the layer's reports count these rows, in
+        input order.
+    convert: The layer's overview conversion.
+    export: The layer's PMTiles export."""
+
+
+LayeredConvertReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
+    "LayeredConvertReport",
+    {
+        "layer_column": "str",
+        "layers": "list[LayerReport]",
+        "empty_layers": "list[str]",
+        "filtered_rows": "int",
+        "total_tiles": "int",
+        "diagnostics": "list[Diagnostic]",
+    },
+)
+LayeredConvertReport.__doc__ = """The report of a `convert(layer_column=...)` run.
+
+Attributes:
+    layer_column: The column the features were routed by.
+    layers: One report per layer that has tiles, by layer name.
+    empty_layers: Layers whose features all generalized or filtered
+        away, left out of the archive.
+    filtered_rows: Input rows `filter` or `bbox` dropped before the
+        split, in no layer.
+    total_tiles: Distinct tiles in the merged archive.
+    diagnostics: The merge's own diagnostics."""
 
 
 PyramidBandReport = TypedDict(  # noqa: UP013 - keys describe serialized report data

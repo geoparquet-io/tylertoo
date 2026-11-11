@@ -202,6 +202,23 @@ fn report_dict_with_losses(
     )],
 ) -> PyResult<Py<PyDict>> {
     let dict = report_dict(py, report)?;
+    attach_loss_paths(py, &dict, losses)?;
+    for (losses, _) in losses {
+        losses.publish_python();
+    }
+    Ok(dict)
+}
+
+/// Set each spilled `source_losses.path` in `dict` (under `section`, or at
+/// the top level), without publishing the spills yet.
+fn attach_loss_paths(
+    py: Python<'_>,
+    dict: &Py<PyDict>,
+    losses: &[(
+        &tylertoo_core::internal::diagnostics::SourceLosses,
+        Option<&str>,
+    )],
+) -> PyResult<()> {
     for (losses, section) in losses {
         if let Some(path) = losses.python_path() {
             let parent = if let Some(section) = section {
@@ -214,10 +231,7 @@ fn report_dict_with_losses(
             parent.get_item("source_losses")?.set_item("path", path)?;
         }
     }
-    for (losses, _) in losses {
-        losses.publish_python();
-    }
-    Ok(dict)
+    Ok(())
 }
 
 fn check_keywords(
@@ -318,6 +332,42 @@ fn convert(
                 (&report.convert.source_losses, Some("convert")),
                 (&report.export.source_losses, Some("export")),
             ])
+        },
+        // #821: one report per layer, each keyed like a plain run's.
+        TilesOutcome::Layered(mut report) => {
+            // The layers share one run's allowance for inline loss lists.
+            let parts = report.layers.len();
+            for layer in &mut report.layers {
+                let r = &mut layer.report;
+                r.convert.source_losses = r.convert.source_losses
+                    .for_python_shared(parts)
+                    .map_err(accounting_error_to_py)?;
+                r.export.source_losses = r.export.source_losses
+                    .for_python_shared(parts)
+                    .map_err(accounting_error_to_py)?;
+            }
+            let dict = report_dict(py, &*report)?;
+            fn spills(
+                layer: &tylertoo_core::LayerReport,
+            ) -> [(&tylertoo_core::internal::diagnostics::SourceLosses, Option<&'static str>); 2] {
+                [
+                    (&layer.report.convert.source_losses, Some("convert")),
+                    (&layer.report.export.source_losses, Some("export")),
+                ]
+            }
+            let layers = dict.bind(py).get_item("layers")?
+                .ok_or_else(|| PyRuntimeError::new_err("missing report section"))?;
+            for (i, layer) in report.layers.iter().enumerate() {
+                let entry = layers.get_item(i)?.cast_into::<PyDict>()?.unbind();
+                attach_loss_paths(py, &entry, &spills(layer))?;
+            }
+            // Only a complete result hands its spills to the caller.
+            for layer in &report.layers {
+                for (losses, _) in spills(layer) {
+                    losses.publish_python();
+                }
+            }
+            Ok(dict)
         },
         // Unreachable without a shard job, which this facade never sets.
         other => Err(PyRuntimeError::new_err(format!(
@@ -686,6 +736,45 @@ mod config_parity {
             serde_json::to_value(python.validate().unwrap().options()).unwrap(),
             core
         );
+    }
+
+    /// #821: `--layer-column` and `layer_column=` build the same options,
+    /// and both refuse it beside a layer name.
+    #[test]
+    fn tiles_layer_column_cli_python_core_configs_are_equal() {
+        let args = cli::TilesArgs::parse_from(["tiles", "in", "out", "--layer-column", "crop"]);
+        let cli = cli::tiles_options(&args).unwrap();
+        let python = tiles_config(native_keywords(json!({"layer_column": "crop"}))).unwrap();
+        let core = TilesOptions::default().with_layer_column(Some("crop".into()));
+        let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
+            core
+        );
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            core
+        );
+
+        assert!(cli::TilesArgs::try_parse_from([
+            "tiles",
+            "in",
+            "out",
+            "--layer-column",
+            "crop",
+            "--layer-name",
+            "x",
+        ])
+        .is_err());
+        let both = tiles_config(native_keywords(
+            json!({"layer_column": "crop", "layer_name": "x"}),
+        ))
+        .unwrap();
+        assert!(both
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("--layer-name"));
     }
 
     #[test]

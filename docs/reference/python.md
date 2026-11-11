@@ -495,6 +495,7 @@ convert(
     feature_order: Literal['input'] | str = "input",
     spill_dir: str | os.PathLike[str] | None = None,
     *,
+    layer_column: str | None = None,
     include_properties: Sequence[str] | None = None,
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
@@ -561,7 +562,7 @@ convert(
     plan: str | os.PathLike[str] | None = None,
     tile_format: Literal['mvt', 'mlt'] = "mvt",
     mlt_profile: Literal['web', 'native', 'min-size', 'diffable', 'fast-encoding'] = "web",
-) -> ConvertReport
+) -> ConvertReport | LayeredConvertReport
 ```
 
 Convert GeoParquet to PMTiles in one call, like `tylertoo tiles`.
@@ -579,6 +580,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `simple_clip_fastpath`: See `export_pmtiles()`.
 * `feature_order`: See `export_pmtiles()`.
 * `spill_dir`: Scratch directory for the intermediate overview and the export's spill (the CLI's `--spill-dir`). The intermediate is at least input-sized; without this it goes to `$TMPDIR`, then the output's directory. Set it when `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised when the chosen volume looks too small, whether or not the run then fails.
+* `layer_column`: Put each feature in the layer named by its value in this column (the CLI's `--layer-column`), and null or blank values in `"_unknown"`. The column is not written as a property. Each layer is tiled on its own and the layers are merged, so thinning and the tile size limits apply per layer. Excludes `layer_name`, `keep_overview`, `save_plan`, `plan` and `variable_depth`. At most 64 layers.
 * `include_properties`: See `overview()`.
 * `exclude_properties`: See `overview()`.
 * `exclude_all_properties`: See `overview()`.
@@ -648,7 +650,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 
 ### Returns
 
-[`ConvertReport`](#convertreport): Both halves' reports, keyed `"convert"` and `"export"` like the CLI's `tiles --report` JSON.
+`ConvertReport | LayeredConvertReport`: Both halves' reports, keyed `"convert"` and `"export"` like the CLI's `tiles --report` JSON. With `layer_column`, a `LayeredConvertReport` holding one such report per layer.
 
 ### Raises
 
@@ -1007,6 +1009,44 @@ class ConvertReport(TypedDict):
     convert: OverviewReport
     export: ExportReport
 ```
+
+### `LayeredConvertReport`
+
+The report of a `convert(layer_column=...)` run.
+
+```python
+class LayeredConvertReport(TypedDict):
+    layer_column: str
+    layers: list[LayerReport]
+    empty_layers: list[str]
+    filtered_rows: int
+    total_tiles: int
+    diagnostics: list[Diagnostic]
+```
+
+* `layer_column`: The column the features were routed by.
+* `layers`: One report per layer that has tiles, by layer name.
+* `empty_layers`: Layers whose features all generalized or filtered away, left out of the archive.
+* `filtered_rows`: Input rows `filter` or `bbox` dropped before the split, in no layer.
+* `total_tiles`: Distinct tiles in the merged archive.
+* `diagnostics`: The merge's own diagnostics.
+
+### `LayerReport`
+
+One layer of a `convert(layer_column=...)` run.
+
+```python
+class LayerReport(TypedDict):
+    layer: str
+    input_rows: int
+    convert: OverviewReport
+    export: ExportReport
+```
+
+* `layer`: The MVT layer name: the column's trimmed value, or `"_unknown"` for null and blank values.
+* `input_rows`: Input rows routed to this layer, after `filter` and `bbox`. Row numbers in the layer's reports count these rows, in input order.
+* `convert`: The layer's overview conversion.
+* `export`: The layer's PMTiles export.
 
 ## Errors
 

@@ -70,6 +70,8 @@ TYPE_ORDER = [
     "ValidationReport",
     "ValidationCheck",
     "ConvertReport",
+    "LayeredConvertReport",
+    "LayerReport",
 ]
 
 # Exception classes, after the report types.
@@ -128,19 +130,22 @@ def _annotations(name: str) -> dict[str, str]:
         Parameter and return annotations as source text.
     """
     source = Path(tylertoo.__file__).with_name("_tylertoo.pyi").read_text()
-    function = next(
-        node
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef) and node.name == name
-    )
-    notes = {
-        arg.arg: ast.unparse(arg.annotation)
-        for arg in [*function.args.args, *function.args.kwonlyargs]
-        if arg.annotation is not None
+    # An overloaded function shows its overloads' annotations, joined.
+    texts: dict[str, list[str]] = {}
+    for function in ast.parse(source).body:
+        if not isinstance(function, ast.FunctionDef) or function.name != name:
+            continue
+        args = [*function.args.args, *function.args.kwonlyargs]
+        pairs = [(arg.arg, arg.annotation) for arg in args]
+        pairs.append(("return", function.returns))
+        for key, annotation in pairs:
+            text = None if annotation is None else ast.unparse(annotation)
+            if text is not None and text not in texts.setdefault(key, []):
+                texts[key].append(text)
+    return {
+        key: " | ".join(sorted(alts, key=lambda t: t == "None"))
+        for key, alts in texts.items()
     }
-    if function.returns is not None:
-        notes["return"] = ast.unparse(function.returns)
-    return notes
 
 
 def _signature(name: str, func: Any) -> str:
