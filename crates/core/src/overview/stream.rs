@@ -6816,12 +6816,13 @@ fn write_level_streaming(
     let outcome = scoped_pipe(
         window.min(STREAMED_OUTPUT_DEPTH),
         // Producer: read + process, in order, until EOF or the writer
-        // hangs up. Returns the first stream/processing error, if any.
+        // hangs up. Its first stream/processing error goes to the writer in
+        // order, so the level ends unwritten.
         // Everything the closure touches (`source`, `ctx`, `&timers`,
         // `row_groups`, the `usize`s) is `Copy`, so the outer bindings —
         // notably `timers`, read back afterwards — stay valid.
-        |tx: &Sender<Processed>| -> Result<(), ConvertError> {
-            scoped_pipe(
+        |tx: &Sender<Result<Processed, ConvertError>>| -> Result<(), ConvertError> {
+            let produced = scoped_pipe(
                 read_depth,
                 // Reader: the raw input batches, in order.
                 |read_tx: &Sender<(RecordBatch, usize)>| -> Result<(), ConvertError> {
@@ -6871,7 +6872,7 @@ fn write_level_streaming(
                             // receiver): stop; the writer's error is reported
                             // by the caller.
                             Some((batch, verts)) => {
-                                Ok(if tx.send(Processed { batch, verts }).is_err() {
+                                Ok(if tx.send(Ok(Processed { batch, verts })).is_err() {
                                     ReadFlow::Stop
                                 } else {
                                     ReadFlow::Continue
@@ -6882,7 +6883,12 @@ fn write_level_streaming(
                     timers.record_windows(stats);
                     Ok(())
                 },
-            )
+            );
+            if let Err(e) = produced {
+                // The writer is gone when this fails; its error is reported.
+                let _ = tx.send(Err(e));
+            }
+            Ok(())
         },
         // Writer (this thread): drain processed batches in order. Dropping
         // the producer's sender (EOF, error, or writer-gone) fuses `recv`;
@@ -6890,23 +6896,18 @@ fn write_level_streaming(
         // dropped before the producer is joined (#362). The producer's
         // windows run on the global pool, so a pool worker waiting here helps
         // run them (`tests/rayon_global_pool_reentry.rs`).
-        |rx: Receiver<Processed>| -> Result<LevelWriteOutcome, ConvertError> {
+        |rx: Receiver<Result<Processed, ConvertError>>| -> Result<LevelWriteOutcome, ConvertError> {
             let batches = std::iter::from_fn(|| {
                 let t_wait = Instant::now();
-                match recv_in_pool(&rx) {
-                    Ok(msg) => {
-                        recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
-                        rows.set(rows.get() + msg.batch.num_rows());
-                        vertices.set(vertices.get() + msg.verts);
-                        Some(msg.batch)
-                    }
-                    Err(_) => {
-                        recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
-                        None
-                    }
-                }
+                let msg = recv_in_pool(&rx).ok();
+                recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
+                Some(msg?.map(|msg| {
+                    rows.set(rows.get() + msg.batch.num_rows());
+                    vertices.set(vertices.get() + msg.verts);
+                    msg.batch
+                }))
             });
-            Ok(writer.write_level(level_idx, Some(hint), batches)?)
+            writer.write_level_from(level_idx, Some(hint), batches)
         },
     )?;
     let total = t_level.elapsed().as_secs_f64();
@@ -9855,12 +9856,38 @@ mod tests {
     /// the consumer fails, the #362 deadlock shape. Returns the error message
     /// `write_level_streaming` surfaced.
     fn stream_level_into_faulty_writer(faults: EncodeFaults) -> String {
-        const ROWS: usize = 400;
         let tin = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &point_geoms(ROWS), true, None);
+        write_input(tin.path(), &point_geoms(STREAMED_ROWS), true, None);
+        match stream_level(tin.path(), faults).0 {
+            // The row-group stage reports its caught panic as a parquet
+            // error, the WKB stage as a geoparquet-encoder one; both are the
+            // writer's own typed error, which is the contract here.
+            Err(ConvertError::Writer(
+                e @ (WriterError::Parquet(_) | WriterError::GeoParquet(_)),
+            )) => e.to_string(),
+            Err(other) => panic!("expected the writer's typed error, got: {other}"),
+            Ok((outcome, rows, _, _)) => {
+                panic!("a failing writer must not report success ({outcome:?}, {rows} rows)")
+            }
+        }
+    }
+
+    const STREAMED_ROWS: usize = 400;
+
+    /// What [`write_level_streaming`] returns.
+    type Streamed = Result<(LevelWriteOutcome, usize, usize, Pass2Timers), ConvertError>;
+
+    /// [`write_level_streaming`] of `input`'s rows as one verbatim level, in
+    /// 8-row read batches, into a writer armed with `faults`; the result and
+    /// the writer.
+    fn stream_level(
+        input: &Path,
+        faults: EncodeFaults,
+    ) -> (Streamed, OverviewWriter<std::fs::File>) {
+        const ROWS: usize = STREAMED_ROWS;
         let tout = tempfile::NamedTempFile::new().unwrap();
 
-        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let source = ConvertSource::resolve_path(input).unwrap();
         let options = ConvertOptions {
             mode: Mode::Duplicating,
             // Plain columns only: no cluster / coalesce columns to append, so
@@ -9946,7 +9973,7 @@ mod tests {
             footer: None,
             profile: MemoryProfile::Speed,
         };
-        match write_level_streaming(
+        let streamed = write_level_streaming(
             &mut writer,
             0,
             ROWS,
@@ -9958,18 +9985,25 @@ mod tests {
                 row_groups: None,
             },
             &ctx,
-        ) {
-            // The row-group stage reports its caught panic as a parquet
-            // error, the WKB stage as a geoparquet-encoder one; both are the
-            // writer's own typed error, which is the contract here.
-            Err(ConvertError::Writer(
-                e @ (WriterError::Parquet(_) | WriterError::GeoParquet(_)),
-            )) => e.to_string(),
-            Err(other) => panic!("expected the writer's typed error, got: {other}"),
-            Ok((outcome, rows, _, _)) => {
-                panic!("a failing writer must not report success ({outcome:?}, {rows} rows)")
-            }
-        }
+        );
+        (streamed, writer)
+    }
+
+    /// Codex review of #852 F3: a producer failure on the streamed finest
+    /// level (a row that does not decode, behind rows that did) ends the
+    /// level unwritten. The writer used to finish the level with the rows
+    /// before the failure and stay usable, so the file could be finished.
+    #[test]
+    fn a_streamed_level_whose_producer_fails_is_not_finished() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_corrupt_wkb(tin.path(), STREAMED_ROWS, 200);
+        let (streamed, writer) = within("a_streamed_level_whose_producer_fails", move || {
+            let (streamed, writer) = stream_level(tin.path(), EncodeFaults::default());
+            (streamed.map(|_| ()).map_err(|e| e.to_string()), writer)
+        });
+        let err = streamed.expect_err("the level must fail");
+        assert!(!err.contains("poisoned"), "the producer's own error: {err}");
+        assert!(writer.finish().is_err(), "the short level was finished");
     }
 
     /// The finest-level stream (`write_level_streaming`): when the writer —
