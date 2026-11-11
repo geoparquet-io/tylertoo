@@ -1090,7 +1090,11 @@ impl SavedChains {
             let mut reps: Vec<&usize> = table.keys().collect();
             reps.sort_unstable();
             for &rep in reps {
-                let (geom, count) = &table[&rep];
+                let (slot, count) = &table[&rep];
+                let geom = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let geom = geom.as_deref().expect("pass 1's chain tables are whole");
                 let bytes = crate::wkb::geometry_to_wkb(geom).map_err(|e| {
                     super::convert::InvalidOption::save_plan(format!(
                         "--save-plan: encoding a coalesce chain failed: {e}"
@@ -1132,7 +1136,13 @@ impl SavedChains {
             let geom = self.geometry(c)?;
             // `level` was bounded at load; the canonical level has no table.
             if let Some(table) = tables.get_mut(c.level).and_then(Option::as_mut) {
-                table.insert(c.rep, (geom, c.count));
+                table.insert(
+                    c.rep,
+                    (
+                        super::convert::ChainGeometry::new(Some(Box::new(geom))),
+                        c.count,
+                    ),
+                );
             }
         }
         Ok(CoalesceBuild {
@@ -2385,7 +2395,22 @@ mod tests {
         };
         SavedChains::from_build(&CoalesceBuild {
             tables: vec![
-                Some(HashMap::from([(8, (line(2.0), 1)), (1, (line(-3.5), 3))])),
+                Some(HashMap::from([
+                    (
+                        8,
+                        (
+                            super::super::convert::ChainGeometry::new(Some(Box::new(line(2.0)))),
+                            1,
+                        ),
+                    ),
+                    (
+                        1,
+                        (
+                            super::super::convert::ChainGeometry::new(Some(Box::new(line(-3.5)))),
+                            3,
+                        ),
+                    ),
+                ])),
                 Some(HashMap::new()),
                 None,
             ],

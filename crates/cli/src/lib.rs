@@ -388,6 +388,8 @@ pub fn run<I>(argv: I) -> u8
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
+    // Already built only when a host (a test harness) ran `run` before.
+    let _ = tylertoo_core::internal::overview::convert::init_worker_pool();
     let status =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_cli(argv))).unwrap_or(101);
     // Outside a Rust binary nothing flushes stdout at exit.

@@ -192,12 +192,28 @@ impl RowGapCursor {
     /// of the row-by-row walk. Measured on the calling thread, they held the
     /// export's ordered collect stage, and with it the pool, to one core.
     pub(super) fn batch(&mut self, geoms: &[Geometry<f64>]) -> Vec<(u64, u16)> {
+        let rects = Self::rects(self.measure, geoms);
+        self.batch_rects(&rects)
+    }
+
+    /// The bounding rects [`Self::batch_rects`] needs for `geoms`: none
+    /// unless it `measure`s gaps ([`Self::measuring`]).
+    pub(super) fn rects(measure: bool, geoms: &[Geometry<f64>]) -> Vec<Option<Rect<f64>>> {
+        if measure {
+            geoms.par_iter().map(|g| g.bounding_rect()).collect()
+        } else {
+            vec![None; geoms.len()]
+        }
+    }
+
+    /// [`Self::batch`] over the rows' bounding rects ([`Self::rects`]), so
+    /// the geometries can be consumed before the ordered gap walk.
+    pub(super) fn batch_rects(&mut self, rects: &[Option<Rect<f64>>]) -> Vec<(u64, u16)> {
         if !self.measure {
-            return geoms.iter().map(|_| self.next_row(None)).collect();
+            return rects.iter().map(|_| self.next_row(None)).collect();
         }
         #[cfg(test)]
-        crate::valve_counter::note(|c| c.gap_rows += geoms.len());
-        let rects: Vec<Option<Rect<f64>>> = geoms.par_iter().map(|g| g.bounding_rect()).collect();
+        crate::valve_counter::note(|c| c.gap_rows += rects.len());
         let centres: Vec<Option<(f64, f64)>> = rects
             .par_iter()
             .map(|r| r.as_ref().map(rect_center))
@@ -293,7 +309,7 @@ impl Merged<'_> {
         }
         self.members
             .iter()
-            .map(|&i| match &self.ordered[i].geom {
+            .map(|&i| match &*self.ordered[i].geom {
                 Geometry::Rect(_) => 5,
                 Geometry::Triangle(_) => 4,
                 g => g.coords_count(),
@@ -461,7 +477,7 @@ mod tests {
         Member {
             key: 0,
             seq,
-            geom,
+            geom: geom.into(),
             props: Arc::new(vec![(Arc::from("n"), crate::mvt::PropertyValue::UInt(seq))]),
             id: Some(seq * 10),
             gap,
@@ -714,7 +730,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out
             .iter()
-            .all(|m| std::ptr::eq(m.geometry(), &m.target.geom)));
+            .all(|m| std::ptr::eq(m.geometry(), &*m.target.geom)));
     }
 
     #[test]

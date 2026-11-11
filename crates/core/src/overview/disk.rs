@@ -60,6 +60,7 @@ impl RawSinkSize {
             options.mode,
             usize::try_from(rows).unwrap_or(usize::MAX),
             avg_geometry,
+            None,
         );
         // Arrow's native geometry and property buffers can exceed their
         // encoded Parquet weights. Never size from compressed input bytes.

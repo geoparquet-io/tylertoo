@@ -34,6 +34,7 @@ use geo_traits::{
 };
 use geoarrow::array::GeometryBuilder;
 use geoarrow::datatypes::GeometryType;
+use geoarrow_array::capacity::GeometryCapacity;
 use geoarrow_array::GeoArrowArray;
 
 use crate::input::InputSource;
@@ -1060,6 +1061,59 @@ pub(super) fn resolve_in_flight_batches_with_cores(requested: usize, cores: usiz
     } else {
         requested
     }
+}
+
+/// Default ceiling on the worker pool a conversion runs on.
+///
+/// Measured by sweeping `RAYON_NUM_THREADS` (merged perf/memory-batch build,
+/// quiet host, archives byte-identical at every width). At 40 workers wall is
+/// flat on all 16 cells against 64, and RSS is 9-21% lower (Moldova auto
+/// 3103 -> 2747 MiB, 3.36 -> 3.44 s). 32 saved more (Moldova auto 2453 MiB)
+/// but cost Moldova auto 6-8% wall; at 16, wall rose 25-37% on Moldova and
+/// wideprops. Past 40 the extra workers only add allocator memory each keeps
+/// for itself.
+///
+/// shortcut: measured on one 64-core aarch64 host; re-sweep on other core
+/// counts and architectures before trusting the knee elsewhere.
+pub const WORKER_THREADS_MAX: usize = 40;
+
+/// Workers the global Rayon pool gets.
+///
+/// An explicit positive `RAYON_NUM_THREADS` wins, else the available cores
+/// capped at [`WORKER_THREADS_MAX`]. The CLI and the Python module size the pool with
+/// it ([`init_worker_pool`]). Only the pool: knobs that read
+/// `available_parallelism()` (read workers, in-flight batches, partition
+/// wave) keep the core count, as the sweep ran them.
+pub fn resolve_worker_threads() -> usize {
+    resolve_worker_threads_with(
+        std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    )
+}
+
+/// [`resolve_worker_threads`] on a given `RAYON_NUM_THREADS` value and core
+/// count (test seam).
+///
+/// A value Rayon would ignore (unset, `0`, not a number)
+/// leaves the default.
+pub(super) fn resolve_worker_threads_with(env: Option<&str>, cores: usize) -> usize {
+    match env.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) if n > 0 => n,
+        _ => cores.min(WORKER_THREADS_MAX),
+    }
+}
+
+/// Build the global Rayon pool at [`resolve_worker_threads`] workers, before
+/// any parallel work.
+///
+/// # Errors
+///
+/// When the pool was already built (a host process such as Python may own
+/// it); callers may ignore it.
+pub fn init_worker_pool() -> Result<(), rayon::ThreadPoolBuildError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(resolve_worker_threads())
+        .build_global()
 }
 
 /// Sentinel for [`ConvertOptions::read_workers`] requesting automatic sizing
@@ -5969,21 +6023,7 @@ pub(super) fn build_level_batch(
     let mut non_geom_iter = non_geom_cols.iter();
     for i in 0..source_schema.fields().len() {
         if i == geom_idx {
-            // Same extension metadata as the field it fills (which
-            // `mixed_geometry_field` already stamped), so the array and the
-            // schema can never disagree about the CRS (#519).
-            let typ = GeometryType::new(Arc::new(
-                geoarrow::datatypes::Metadata::try_from(source_schema.field(geom_idx))
-                    .unwrap_or_default(),
-            ));
-            let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
-            for g in geoms {
-                let g = g.borrow();
-                let flat = flatten_nested_collections(g);
-                b.push_geometry(Some(flat.as_ref().unwrap_or(g)))
-                    .map_err(|e| arrow_schema::ArrowError::InvalidArgumentError(e.to_string()))?;
-            }
-            columns.push(b.finish().to_array_ref());
+            columns.push(build_geometry_column(source_schema, geom_idx, geoms)?);
         } else {
             let src_col = *non_geom_iter.next().expect("non-geom column index");
             let taken = take(full.column(src_col).as_ref(), &take_idx, None)?;
@@ -5994,6 +6034,153 @@ pub(super) fn build_level_batch(
         Arc::new(source_schema.clone()),
         columns,
     )?)
+}
+
+/// One level batch's geometry column, typed as `source_schema`'s geometry
+/// field.
+pub(super) fn build_geometry_column(
+    source_schema: &Schema,
+    geom_idx: usize,
+    geoms: &[impl std::borrow::Borrow<Geometry<f64>>],
+) -> Result<Arc<dyn Array>, ConvertError> {
+    // Same extension metadata as the field it fills (which
+    // `mixed_geometry_field` already stamped), so the array and the
+    // schema can never disagree about the CRS (#519).
+    let typ = GeometryType::new(Arc::new(
+        geoarrow::datatypes::Metadata::try_from(source_schema.field(geom_idx)).unwrap_or_default(),
+    ));
+    let invalid =
+        |e: &dyn std::fmt::Display| arrow_schema::ArrowError::InvalidArgumentError(e.to_string());
+    // Sized up front, so the coordinate buffers never grow by doubling: this
+    // runs once per level batch and per shared geometry pool (#852). A nested
+    // collection is flattened once per pass and dropped after its row, so a
+    // batch of them never holds a second copy of its coordinates.
+    let mut capacity = GeometryCapacity::new_empty();
+    for g in geoms {
+        with_member(g.borrow(), |m| capacity.add_geometry(Some(m))).map_err(|e| invalid(&e))?;
+    }
+    let mut b = GeometryBuilder::with_capacity(typ, capacity).with_prefer_multi(false);
+    for g in geoms {
+        with_member(g.borrow(), |m| b.push_geometry(Some(m))).map_err(|e| invalid(&e))?;
+    }
+    Ok(b.finish().to_array_ref())
+}
+
+/// `f` over `g` as the geometry column holds it: a nested collection
+/// flattened ([`flatten_nested_collections`]) for the call only.
+fn with_member<R>(g: &Geometry<f64>, f: impl FnOnce(&Geometry<f64>) -> R) -> R {
+    match flatten_nested_collections(g) {
+        Some(flat) => {
+            #[cfg(test)]
+            let _live = geometry_column_tests::LiveFlat::enter();
+            f(&flat)
+        }
+        None => f(g),
+    }
+}
+
+#[cfg(test)]
+mod geometry_column_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Flattened collections alive now, and the most at once.
+        static LIVE_FLAT: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    /// Counts one flattened collection alive while it is held.
+    pub(super) struct LiveFlat;
+
+    impl LiveFlat {
+        pub(super) fn enter() -> Self {
+            LIVE_FLAT.with(|c| {
+                let (live, peak) = c.get();
+                c.set((live + 1, peak.max(live + 1)));
+            });
+            Self
+        }
+    }
+
+    impl Drop for LiveFlat {
+        fn drop(&mut self) {
+            LIVE_FLAT.with(|c| {
+                let (live, peak) = c.get();
+                c.set((live - 1, peak));
+            });
+        }
+    }
+
+    /// Codex review C1: a batch of nested collections is flattened one row
+    /// at a time, not held flattened while the whole column fills.
+    #[test]
+    fn a_batch_of_nested_collections_holds_one_flattened_row_at_a_time() {
+        let schema = Schema::new(vec![mixed_geometry_field("geometry", Default::default())]);
+        let p = |x: f64| Geometry::Point(geo::Point::new(x, 0.0));
+        let gc = |members| Geometry::GeometryCollection(geo::GeometryCollection::new_from(members));
+        let geoms: Vec<Geometry<f64>> = (0..100)
+            .map(|i| gc(vec![p(f64::from(i)), gc(vec![p(1.0), p(2.0)])]))
+            .collect();
+        LIVE_FLAT.with(|c| c.set((0, 0)));
+        build_geometry_column(&schema, 0, &geoms).unwrap();
+        assert_eq!(LIVE_FLAT.with(Cell::get), (0, 1));
+    }
+
+    /// The geometry column is sized from its geometries up front, so its
+    /// buffers never grow by doubling. A
+    /// level batch and the shared geometry pool (#852) both build here, once
+    /// per batch, and doubling was 4-30% of pass 2's allocation churn.
+    #[test]
+    fn the_geometry_column_holds_no_spare_capacity() {
+        let schema = Schema::new(vec![mixed_geometry_field("geometry", Default::default())]);
+        let geoms: Vec<Geometry<f64>> = (0..1000)
+            .map(|i| {
+                let x = f64::from(i);
+                match i % 3 {
+                    0 => Geometry::Point(geo::Point::new(x, 1.0)),
+                    1 => Geometry::LineString(geo::LineString::from(vec![
+                        (x, 0.0),
+                        (x + 1.0, 1.0),
+                        (x + 2.0, 0.5),
+                    ])),
+                    _ => Geometry::Polygon(geo::Polygon::new(
+                        geo::LineString::from(vec![
+                            (x, 0.0),
+                            (x + 1.0, 0.0),
+                            (x + 1.0, 1.0),
+                            (x, 0.0),
+                        ]),
+                        vec![],
+                    )),
+                }
+            })
+            .collect();
+        // A nested collection among them is flattened in place.
+        let mut geoms = geoms;
+        geoms[500] = Geometry::GeometryCollection(geo::GeometryCollection::new_from(vec![
+            Geometry::GeometryCollection(geo::GeometryCollection::new_from(vec![
+                Geometry::Point(geo::Point::new(1.0, 2.0)),
+                Geometry::Point(geo::Point::new(3.0, 4.0)),
+            ])),
+            Geometry::Point(geo::Point::new(5.0, 6.0)),
+        ]));
+        let column = build_geometry_column(&schema, 0, &geoms).unwrap();
+        let flat: Vec<Geometry<f64>> = geoms
+            .iter()
+            .map(|g| flatten_nested_collections(g).unwrap_or_else(|| g.clone()))
+            .collect();
+        let typ = GeometryType::new(Default::default());
+        let capacity = GeometryCapacity::from_geometries(flat.iter().map(Some)).unwrap();
+        let mut exact = GeometryBuilder::with_capacity(typ, capacity).with_prefer_multi(false);
+        exact.extend_from_iter(flat.iter().map(Some));
+        let exact = exact.finish().to_array_ref();
+        assert_eq!(column.as_ref(), exact.as_ref(), "the same geometries");
+        assert_eq!(
+            column.get_buffer_memory_size(),
+            exact.get_buffer_memory_size(),
+            "bytes held by the built column against one sized up front"
+        );
+    }
 }
 
 /// A GeometryCollection that contains other collections, flattened into one
@@ -6361,7 +6548,30 @@ fn overwrite_numeric_column(
 
 /// One level's coalescing result: rep source row → (simplified merged
 /// geometry, number of source segments merged).
-pub(super) type CoalesceTable = HashMap<usize, (Geometry<f64>, i32)>;
+///
+/// Pass 2 reads each rep row once per level, so it MOVES the geometry out
+/// ([`take_chain_geometry`]) instead of cloning it: a level's chains are freed
+/// as pass 2 emits them, not held until convert returns (#851).
+pub(super) type CoalesceTable = HashMap<usize, (ChainGeometry, i32)>;
+
+/// A chain table's geometry slot, emptied when pass 2 emits the rep. Boxed:
+/// the map's slots outlive the geometry until convert returns, and a boxed
+/// slot is 16 B where an inline `Geometry` is 64 B (#851).
+pub(super) type ChainGeometry = std::sync::Mutex<Option<Box<Geometry<f64>>>>;
+
+/// Move rep `row`'s merged geometry out of `table`; `None` when `row` is not
+/// a chain rep at this level.
+///
+/// # Panics
+/// When the rep's geometry was already taken: pass 2 emits each rep once.
+pub(super) fn take_chain_geometry(table: &CoalesceTable, row: usize) -> Option<Geometry<f64>> {
+    let (slot, _) = table.get(&row)?;
+    let geom = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    Some(*geom.expect("pass 2 emits each chain rep once per level"))
+}
 
 /// Validate the coalescing-related schema constraint: the input must not
 /// already carry a `coalesced_count` column (case-insensitive, mirroring the
@@ -6541,16 +6751,24 @@ pub(super) fn apply_coalesced_count(
     global_indices: &[usize],
     table: Option<&CoalesceTable>,
 ) -> Result<RecordBatch, ConvertError> {
-    use arrow_array::Int32Array;
-
     debug_assert_eq!(batch.num_rows(), global_indices.len());
     let mut columns: Vec<Arc<dyn Array>> = batch.columns().to_vec();
+    columns.push(coalesced_count_column(global_indices, table));
+    Ok(RecordBatch::try_new(Arc::new(out_schema.clone()), columns)?)
+}
+
+/// The `coalesced_count` column for rows `global_indices`: a chain rep's
+/// merged count, 1 for every other row.
+pub(super) fn coalesced_count_column(
+    global_indices: &[usize],
+    table: Option<&CoalesceTable>,
+) -> Arc<dyn Array> {
+    use arrow_array::Int32Array;
     let counts: Vec<i32> = global_indices
         .iter()
         .map(|g| table.and_then(|t| t.get(g)).map_or(1, |(_, c)| *c))
         .collect();
-    columns.push(Arc::new(Int32Array::from(counts)));
-    Ok(RecordBatch::try_new(Arc::new(out_schema.clone()), columns)?)
+    Arc::new(Int32Array::from(counts))
 }
 
 /// Incremental string→id interner for coalescing compatibility groups.
@@ -6724,7 +6942,10 @@ pub(super) fn build_level_coalesce_table_and_hint(
         .into_par_iter()
         .filter_map(|chain| {
             match simplify_for_level(&chain.geom, gsd_m, crs, &options.simplify, diagnostics) {
-                Simplified::Keep(g) => Some((chain.rep, (g, chain.count))),
+                Simplified::Keep(g) => Some((
+                    chain.rep,
+                    (ChainGeometry::new(Some(Box::new(g))), chain.count),
+                )),
                 Simplified::Dropped => None,
             }
         })
@@ -6751,6 +6972,16 @@ pub(super) fn coalesce_max_geom_bytes(options: &ConvertOptions) -> u64 {
     (options.coalesce_max_level_rows as u64).saturating_mul(COALESCE_NOMINAL_BYTES_PER_LINE)
 }
 
+/// The line-count limb of the coalescing memory guard:
+/// `coalesce_max_level_rows`, never above what one level's chaining can index
+/// ([`super::coalesce::MAX_CHAIN_LINES`]), so `usize::MAX` ("never guard")
+/// skips coalescing on a larger input instead of panicking in the join.
+pub(super) fn coalesce_max_rows(options: &ConvertOptions) -> usize {
+    options
+        .coalesce_max_level_rows
+        .min(super::coalesce::MAX_CHAIN_LINES)
+}
+
 /// Whether coalescing is effectively active for this conversion: enabled,
 /// and the candidate lines fit the memory guard — **both** limbs of it, the
 /// row count and the geometry bytes those rows retain
@@ -6773,14 +7004,12 @@ pub(super) fn coalesce_effective(
         return false;
     }
     let max_bytes = coalesce_max_geom_bytes(options);
-    let rows_over = num_lines > options.coalesce_max_level_rows;
+    let max_rows = coalesce_max_rows(options);
+    let rows_over = num_lines > max_rows;
     let bytes_over = line_bytes > max_bytes;
     if rows_over || bytes_over {
         diagnostics.warn(coalesce_skipped_message(
-            num_lines,
-            line_bytes,
-            options.coalesce_max_level_rows,
-            max_bytes,
+            num_lines, line_bytes, max_rows, max_bytes,
         ));
         return false;
     }
@@ -12632,6 +12861,18 @@ mod tests {
         }
     }
 
+    /// The worker pool defaults to the cores capped at 40; an explicit
+    /// `RAYON_NUM_THREADS` wins, and one Rayon ignores leaves the default.
+    #[test]
+    fn worker_threads_cap_the_cores_unless_rayon_num_threads_is_set() {
+        assert_eq!(resolve_worker_threads_with(None, 64), 40);
+        assert_eq!(resolve_worker_threads_with(None, 8), 8);
+        assert_eq!(resolve_worker_threads_with(Some("64"), 64), 64);
+        assert_eq!(resolve_worker_threads_with(Some("4"), 64), 4);
+        assert_eq!(resolve_worker_threads_with(Some("0"), 64), 40);
+        assert_eq!(resolve_worker_threads_with(Some("x"), 8), 8);
+    }
+
     #[test]
     fn resolve_in_flight_batches_auto_and_explicit() {
         // Auto (0) sizes from available parallelism, clamped to [MIN, MAX].
@@ -13954,6 +14195,23 @@ mod tests {
         }
         assert!(validate_file(t_tight.path()).unwrap().is_valid());
         assert_streaming_equivalent(tin.path(), &tight);
+    }
+
+    /// "Never guard" (`usize::MAX`) still skips coalescing on more lines than
+    /// one level's chaining can index, rather than reaching the join's u32
+    /// packing (#851 review). Totals only: no lines are built.
+    #[test]
+    fn coalesce_guard_caps_rows_at_what_chaining_can_index() {
+        let options = ConvertOptions {
+            coalesce_lines: true,
+            coalesce_max_level_rows: usize::MAX,
+            ..ConvertOptions::default()
+        };
+        let cap = super::super::coalesce::MAX_CHAIN_LINES;
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        assert_eq!(coalesce_max_rows(&options), cap);
+        assert!(coalesce_effective(&options, cap, 0, &diagnostics));
+        assert!(!coalesce_effective(&options, cap + 1, 0, &diagnostics));
     }
 
     /// #569 review: the skip warning names the limb that tripped and prints

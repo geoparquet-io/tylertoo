@@ -68,7 +68,7 @@ static LOG_RESET: pyo3::sync::PyOnceLock<Option<pyo3_log::ResetHandle>> =
 ///
 /// The cache is what lets a filtered-out record on a worker thread skip the
 /// GIL entirely; resetting it once per call keeps that, at the cost of one
-/// atomic store. Every entry point calls this first, and the first call
+/// atomic store. Every entry point calls this first ([`enter`]), and the first call
 /// installs the bridge: not at import, so that `python -m tylertoo` can
 /// give the CLI its own stderr logger (#819).
 fn refresh_log_levels(py: Python<'_>) {
@@ -81,6 +81,16 @@ fn refresh_log_levels(py: Python<'_>) {
     if let Some(handle) = handle {
         handle.reset();
     }
+}
+
+/// The start of every binding call: build the worker pool, then refresh
+/// the log bridge. The pool starts here, not at import: a process forked
+/// after `import tylertoo` would inherit a started pool without its threads
+/// and wait forever on its first parallel job. A host that already owns the
+/// global pool keeps its size.
+fn enter(py: Python<'_>) {
+    let _ = tylertoo_core::internal::overview::convert::init_worker_pool();
+    refresh_log_levels(py);
 }
 
 /// A keyword argument that does not translate (an unknown spelling), as
@@ -294,7 +304,7 @@ fn convert(
     args: &Bound<'_, pyo3::types::PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels(py);
+    enter(py);
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
 
@@ -391,7 +401,7 @@ fn overview(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels(py);
+    enter(py);
     let options = overview_config(keywords(kwargs)?)?;
     // #779: every rule that needs no input, before anything is read.
     options.validate().map_err(convert_error_to_py)?;
@@ -443,7 +453,7 @@ fn export_pmtiles(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels(py);
+    enter(py);
     let options = export_config(keywords(kwargs)?)?;
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
@@ -461,7 +471,7 @@ fn export_pmtiles(
 
 signature_validate! {
 fn validate(py: Python<'_>, file: &str) -> PyResult<Py<PyDict>> {
-    refresh_log_levels(py);
+    enter(py);
     let path = Path::new(file).to_path_buf();
     let report = py.detach(|| validate_file(&path)).map_err(|e| {
         let kind = tylertoo_core::internal::error::kind_of(&e).unwrap_or(ErrorKind::Runtime);
@@ -490,7 +500,7 @@ fn decode(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels(py);
+    enter(py);
     let values = keywords(kwargs)?;
     let mut defaults = config_keywords::command_defaults("decode");
     for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
@@ -517,7 +527,7 @@ fn stats(
     archive: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels(py);
+    enter(py);
     let values = keywords(kwargs)?;
     let mut defaults = config_keywords::command_defaults("stats");
     for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
@@ -546,7 +556,7 @@ fn pyramid(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    refresh_log_levels(py);
+    enter(py);
     // Spec grammar, band-set rules and the input-exists check are core's,
     // shared with the CLI's `--band` (#445).
     let options = pyramid_config(keywords(kwargs)?)?;
@@ -568,7 +578,7 @@ fn serve(
     archive: &Bound<'_, PyAny>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<()> {
-    refresh_log_levels(py);
+    enter(py);
     let values = keywords(kwargs)?;
     let mut defaults = config_keywords::command_defaults("serve");
     for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }

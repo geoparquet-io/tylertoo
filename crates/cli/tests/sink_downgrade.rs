@@ -25,33 +25,33 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use tylertoo_io::test_support::ArrowWriter;
-use tylertoo_io::test_support::WriterProperties;
+use tylertoo_io::test_support::{EnabledStatistics, WriterProperties};
+
+#[path = "../../../tests/support/fixture.rs"]
+mod fixture;
 
 /// Input rows. Small enough to run in a few seconds, and read in
 /// [`READ_BATCH_ROWS`]-row batches so the light head alone spans far more
 /// than the 64 output batches an earlier fixed-size sample window covered.
 const ROWS: usize = 40_000;
 /// Leading rows with an empty `name`: light enough that the rate measured
-/// over them projects the whole buffered set under the budget (an all-light
-/// input measures ~50 MB against the skewed run's ~108 MB budget).
+/// over them projects the whole buffered set under the budget.
 const LIGHT_HEAD_ROWS: usize = 16_000;
 /// Bytes of `name` on every row after the head: the whole skewed pass
-/// buffers ~195 MB, well past the budget.
+/// buffers ~81 MB, past the budget.
 const HEAVY_NAME_BYTES: usize = 4_096;
 /// Pass-2 read batch size, in rows.
 const READ_BATCH_ROWS: &str = "256";
 /// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` for the `auto` run. The sinks get what
-/// the run's allowance (60% of it) has left after the grants charged before
-/// pass 2 (#716, #788). For the skewed input that is the writer's encode
-/// floor: 4 row groups priced from the footers at ~250 MB each, ~1.0 GB. That
-/// leaves the sinks ~108 MB, between what the light head projects and the
-/// ~195 MB the heavy tail buffers. At the 180 MB this test used before #788,
-/// the encode floor alone exceeds the allowance, so `auto` spills before
-/// pass 2 starts and there is nothing left to downgrade.
+/// the run's allowance (60% of it) has left after the writer's encodes and
+/// the pass-2 read-ahead and window (#716, #788, #791): ~65 MB here, between
+/// what the light input projects (~22 MB) and the ~81 MB the skewed run
+/// buffers once its levels share each input batch's rows and geometries
+/// (#852).
 /// The margins assume 4 encode threads (`min(threads, 4)` grants), so
 /// `run_overview` pins `RAYON_NUM_THREADS=4`: a 3-core macOS runner would
 /// otherwise grant 3 and leave the sinks too much.
-const MEM_LIMIT_BYTES: &str = "1850000000";
+const MEM_LIMIT_BYTES: &str = "150000000";
 
 fn tylertoo_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tylertoo")
@@ -110,7 +110,12 @@ fn write_points(path: &Path, light_rows: usize) {
             "crs": serde_json::Value::Null,
         }},
     });
+    // Dictionary-encoded and without statistics, as pyarrow often writes:
+    // the footers then price the repeated heavy `name` at a few bytes a
+    // row, so only the sink's own measurement can see it (#852 prices the
+    // up-front estimate from the footers).
     let props = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::None)
         .set_max_row_group_row_count(Some(4_096))
         .set_key_value_metadata(Some(vec![tylertoo_io::KeyValue::new(
             "geo".to_string(),
@@ -226,5 +231,65 @@ fn auto_downgrades_to_spill_on_a_heavy_tail_and_matches_bounded() {
         "a mid-pass downgrade must not change output bytes ({} B auto vs {} B bounded)",
         auto_bytes.len(),
         bounded_bytes.len(),
+    );
+}
+
+/// #815: an `auto` run that spills up front keeps `auto`'s encode grant
+/// and spills raw. Sized as `bounded`'s (4 encodes, LZ4), its pass 2 ran
+/// 3-4 s slower on NZ parcels and Mato Grosso, and LZ4 cost 6-9 s more. Small
+/// row groups make an encode cheap enough for `auto` to grant more than
+/// `bounded`'s 4 under a limit its sinks do not fit.
+#[test]
+fn auto_spilling_up_front_keeps_its_encodes_and_spills_raw() {
+    let Some(input) = fixture::realdata("fieldmaps-madagascar-adm4.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let run = |profile: &str, limit: Option<&str>| {
+        let out = dir.path().join(format!("out-{profile}.parquet"));
+        let profile_json = dir.path().join(format!("profile-{profile}.jsonl"));
+        let mut cmd = Command::new(tylertoo_bin());
+        cmd.args([
+            "overview",
+            input.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--profile",
+            profile,
+            "--row-group-size",
+            "200",
+        ])
+        .env("RAYON_NUM_THREADS", "8")
+        .env("RUST_LOG", "info")
+        .env("TYLERTOO_PROFILE_JSON", &profile_json)
+        .env_remove("TYLERTOO_AUTO_MEM_LIMIT_BYTES");
+        if let Some(limit) = limit {
+            cmd.env("TYLERTOO_AUTO_MEM_LIMIT_BYTES", limit);
+        }
+        let output = cmd.output().expect("run tylertoo overview");
+        let log = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "overview --profile {profile}: {log}"
+        );
+        let line = std::fs::read_to_string(&profile_json).expect("read profile JSON");
+        let value: serde_json::Value =
+            serde_json::from_str(line.lines().next().expect("one profile line")).unwrap();
+        let encode = value["pass2"]["budget"]["granted"]["pass-2 encode"]
+            .as_u64()
+            .expect("an encode grant");
+        (value, encode, log)
+    };
+    let (auto, auto_encode, log) = run("auto", Some("250000000"));
+    assert!(
+        log.contains("→ Spill") && auto["pass2"]["sink"]["downgraded_to_spill"] == false,
+        "the fixture must make `auto` spill up front:\n{log}"
+    );
+    assert_eq!(auto["pass2"]["sink"]["spill_codec"], "raw", "{auto}");
+    let (bounded, bounded_encode, _) = run("bounded", None);
+    assert_eq!(bounded["pass2"]["sink"]["spill_codec"], "lz4", "{bounded}");
+    assert!(
+        auto_encode > bounded_encode,
+        "auto spilling up front granted {auto_encode} B of encodes, no more than \
+         bounded's {bounded_encode} B"
     );
 }

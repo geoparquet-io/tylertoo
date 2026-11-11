@@ -106,19 +106,65 @@ impl SingleSource {
 }
 
 /// Footer-derived metadata of one partition.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PartMeta {
     resolved: Arc<crate::resolved_schema::ResolvedSchema>,
     /// Arrow schema decoded from the part's footer.
     schema: SchemaRef,
-    /// Parsed parquet metadata (row groups, key-value metadata).
-    parquet: Arc<ParquetMetaData>,
-    /// The same footer in the shape the arrow reader wants, so opening a
+    /// The footer's row count and per-row-group row counts, kept when the
+    /// decoded footer is released: they address rows in every part.
+    num_rows: i64,
+    row_group_rows: Vec<i64>,
+    /// The decoded footer's size: what one footer in flight costs when the
+    /// released ones are re-parsed, without holding any of them.
+    decoded_bytes: u64,
+    /// The decoded footer in the shape the arrow reader wants, so opening a
     /// reader over this part never re-parses it ([`InputSource::open_with_metadata`]).
     /// Load-bearing for the pass-2 parallel read (#494), which opens one
     /// reader per segment: a 1084-segment run parsed the footer 1084 times,
-    /// twice per conversion.
-    reader: ReaderMetadata,
+    /// twice per conversion. `None` for every part but the first once a
+    /// multi-part source is resolved (#815: 512 S3 footers held ~2 GiB before
+    /// a bbox pruned all but a few); [`ConvertSource::metas_with_footers`]
+    /// re-reads the ones a selection reads.
+    footer: std::sync::Mutex<Option<ReaderMetadata>>,
+}
+
+impl PartMeta {
+    fn new(resolved: crate::resolved_schema::ResolvedSchema, reader: ReaderMetadata) -> Self {
+        let parquet = reader.metadata();
+        PartMeta {
+            resolved: Arc::new(resolved),
+            schema: reader.schema().clone(),
+            num_rows: parquet.file_metadata().num_rows(),
+            decoded_bytes: parquet.memory_size() as u64,
+            row_group_rows: parquet
+                .row_groups()
+                .iter()
+                .map(tylertoo_io::RowGroupMetaData::num_rows)
+                .collect(),
+            footer: std::sync::Mutex::new(Some(reader)),
+        }
+    }
+
+    /// The decoded footer, re-read from `source` if it was released.
+    fn footer(&self, source: &InputSource) -> Result<ReaderMetadata, InputError> {
+        let mut slot = self.footer.lock().expect("footer slot lock");
+        if let Some(reader) = slot.as_ref() {
+            return Ok(reader.clone());
+        }
+        log::debug!(
+            "re-reading the released footer of {}",
+            source.display_name()
+        );
+        let reader = source.open()?.reader_metadata().clone();
+        *slot = Some(reader.clone());
+        Ok(reader)
+    }
+
+    /// The parsed parquet metadata (row groups, key-value metadata).
+    fn parquet(&self, source: &InputSource) -> Result<Arc<ParquetMetaData>, InputError> {
+        Ok(self.footer(source)?.metadata().clone())
+    }
 }
 
 /// An ordered set of parquet partitions (local files and/or remote
@@ -365,7 +411,8 @@ pub struct SourceStream<'a> {
     parts: &'a [InputSource],
     /// Each part's already-parsed footer, parallel to `parts`, so opening a
     /// part's reader costs a `File::open` and nothing else (#494 follow-up).
-    metas: Vec<ReaderMetadata>,
+    /// `None` for a part the selection never opens.
+    metas: Vec<Option<ReaderMetadata>>,
     /// Each part's resolved schema, which reprojects its batches (#670).
     resolved: Vec<Arc<crate::resolved_schema::ResolvedSchema>>,
     projection: Option<Vec<usize>>,
@@ -708,12 +755,12 @@ impl ConvertSource {
         match self {
             ConvertSource::Single(s) => Ok(s
                 .meta()?
-                .parquet
+                .parquet(s.input())?
                 .file_metadata()
                 .key_value_metadata()
                 .cloned()),
             ConvertSource::Multi(m) => Ok(m.metas[0]
-                .parquet
+                .parquet(&m.parts[0])?
                 .file_metadata()
                 .key_value_metadata()
                 .cloned()),
@@ -749,11 +796,7 @@ impl ConvertSource {
     ///
     /// Returns an [`InputError`] if a part's footer cannot be read.
     pub fn num_row_groups_total(&self) -> Result<usize, InputError> {
-        Ok(self
-            .metas()?
-            .iter()
-            .map(|m| m.parquet.num_row_groups())
-            .sum())
+        Ok(self.metas()?.iter().map(|m| m.row_group_rows.len()).sum())
     }
 
     /// Per-part `(row count, row-group count)` straight from each part's
@@ -774,12 +817,7 @@ impl ConvertSource {
         Ok(self
             .metas()?
             .iter()
-            .map(|m| {
-                (
-                    m.parquet.file_metadata().num_rows(),
-                    m.parquet.num_row_groups(),
-                )
-            })
+            .map(|m| (m.num_rows, m.row_group_rows.len()))
             .collect())
     }
 
@@ -810,13 +848,12 @@ impl ConvertSource {
             .metas()?
             .iter()
             .enumerate()
-            .map(|(i, m)| {
-                crate::input::selected_groups(
-                    &m.parquet,
-                    selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice),
-                )
-                .map(tylertoo_io::RowGroupMetaData::num_rows)
-                .sum::<i64>()
+            .map(|(i, m)| match selected.and_then(|s| s.parts().get(i)) {
+                Some(picked) => picked
+                    .iter()
+                    .filter_map(|&g| m.row_group_rows.get(g))
+                    .sum::<i64>(),
+                None => m.row_group_rows.iter().sum(),
             })
             .sum())
     }
@@ -844,15 +881,17 @@ impl ConvertSource {
     ) -> Result<u64, InputError> {
         let root = self.column_projection().map_or(column, |p| p[column]);
         let mut total = 0u64;
-        for (i, m) in self.metas()?.iter().enumerate() {
-            let descr = m.parquet.file_metadata().schema_descr();
+        for (i, m) in self.metas_with_footers(selected)?.iter().enumerate() {
+            let picked = selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice);
+            if picked.is_some_and(<[usize]>::is_empty) {
+                continue;
+            }
+            let parquet = m.parquet(&self.parts()[i])?;
+            let descr = parquet.file_metadata().schema_descr();
             let leaves: Vec<usize> = (0..descr.num_columns())
                 .filter(|&leaf| descr.get_column_root_idx(leaf) == root)
                 .collect();
-            for rg in crate::input::selected_groups(
-                &m.parquet,
-                selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice),
-            ) {
+            for rg in crate::input::selected_groups(&parquet, picked) {
                 for &leaf in &leaves {
                     let col = rg.column(leaf);
                     let bytes = col
@@ -894,13 +933,7 @@ impl ConvertSource {
         Ok(self
             .metas()?
             .iter()
-            .map(|m| {
-                m.parquet
-                    .row_groups()
-                    .iter()
-                    .map(tylertoo_io::RowGroupMetaData::num_rows)
-                    .collect()
-            })
+            .map(|m| m.row_group_rows.clone())
             .collect())
     }
 
@@ -957,11 +990,29 @@ impl ConvertSource {
         &self,
         filter: &crate::overview::filter::BoundFilter,
     ) -> Result<RowGroupSelection, InputError> {
+        self.select_row_groups_matching_within(filter, None)
+    }
+
+    /// [`Self::select_row_groups_matching`] over the parts `within` reads
+    /// (`None` = all); a part it reads nothing of selects nothing, so its
+    /// footer is never re-read (#815).
+    pub(crate) fn select_row_groups_matching_within(
+        &self,
+        filter: &crate::overview::filter::BoundFilter,
+        within: Option<&RowGroupSelection>,
+    ) -> Result<RowGroupSelection, InputError> {
         let per_part = self
-            .metas()?
+            .metas_with_footers(within)?
             .iter()
-            .map(|m| filter.select_row_groups(&m.parquet))
-            .collect();
+            .zip(self.parts())
+            .enumerate()
+            .map(|(i, (m, part))| {
+                if within.is_some_and(|w| w.0[i].is_empty()) {
+                    return Ok(Vec::new());
+                }
+                Ok(filter.select_row_groups(m.parquet(part)?.as_ref()))
+            })
+            .collect::<Result<_, InputError>>()?;
         Ok(RowGroupSelection(per_part))
     }
 
@@ -977,21 +1028,21 @@ impl ConvertSource {
         &self,
         selection: Option<&RowGroupSelection>,
     ) -> Result<u64, InputError> {
-        let metas = self.metas()?;
+        let metas = self.metas_with_footers(selection)?;
         if let Some(sel) = selection {
             debug_assert_eq!(metas.len(), sel.0.len());
         }
-        Ok(metas
-            .iter()
-            .enumerate()
-            .map(|(pi, m)| {
-                crate::input::selected_compressed_bytes(
-                    &m.parquet,
-                    selection.map(|s| s.0[pi].as_slice()),
-                )
-            })
+        let mut total = 0u64;
+        for (pi, m) in metas.iter().enumerate() {
+            let picked = selection.map(|s| s.0[pi].as_slice());
+            if picked.is_some_and(<[usize]>::is_empty) {
+                continue;
+            }
+            let parquet = m.parquet(&self.parts()[pi])?;
             // Saturating: each part's figure is footer-declared (#686).
-            .fold(0, u64::saturating_add))
+            total = total.saturating_add(crate::input::selected_compressed_bytes(&parquet, picked));
+        }
+        Ok(total)
     }
 
     /// Plan reads for all selected parts through the untrusted-reader owner.
@@ -1004,25 +1055,23 @@ impl ConvertSource {
         limit: u64,
     ) -> Result<usize, InputError> {
         let roots = self.file_roots(projection);
-        Ok(self
-            .metas()?
-            .iter()
-            .enumerate()
-            .fold(requested, |rows, (pi, m)| {
-                let mask = roots.as_deref().map(|roots| {
-                    tylertoo_io::ProjectionMask::roots(
-                        m.parquet.file_metadata().schema_descr(),
-                        roots.iter().copied(),
-                    )
-                });
-                tylertoo_io::read_batch_plan(
-                    &m.reader,
-                    selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice),
-                    mask.as_ref(),
-                    rows,
-                    limit,
+        let mut rows = requested;
+        for (pi, m) in self.metas_with_footers(selected)?.iter().enumerate() {
+            let picked = selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice);
+            // A part this run never opens plans no batch.
+            if picked.is_some_and(<[usize]>::is_empty) {
+                continue;
+            }
+            let reader = m.footer(&self.parts()[pi])?;
+            let mask = roots.as_deref().map(|roots| {
+                tylertoo_io::ProjectionMask::roots(
+                    reader.metadata().file_metadata().schema_descr(),
+                    roots.iter().copied(),
                 )
-            }))
+            });
+            rows = tylertoo_io::read_batch_plan(&reader, picked, mask.as_ref(), rows, limit);
+        }
+        Ok(rows)
     }
 
     /// Fetch counters summed over remote parts (`None` when no part is
@@ -1067,6 +1116,9 @@ impl ConvertSource {
         selection: Option<&RowGroupSelection>,
         projection: Option<&[usize]>,
     ) -> Result<StagingPlan, InputError> {
+        // The remote plan reads each part's footer: re-read the released
+        // ones together rather than one round trip at a time.
+        self.metas_with_footers(selection)?;
         let roots = self.file_roots(projection);
         let roots = roots.as_deref();
         let parts = self.parts();
@@ -1190,11 +1242,21 @@ impl ConvertSource {
         // Footers are parsed once per source (lazily for `Single`, at
         // construction for `Multi`); every reader this stream opens reuses
         // them rather than re-decoding O(row_groups × columns) of thrift.
-        let part_metas = self.metas()?;
+        let part_metas = self.metas_with_footers(plan.row_groups)?;
         let metas = part_metas
             .iter()
-            .map(|m| m.reader.clone())
-            .collect::<Vec<_>>();
+            .zip(parts)
+            .enumerate()
+            .map(|(i, (m, part))| {
+                let picked = plan.row_groups.map(|s| s.0[i].as_slice());
+                // A part with an empty selection is never opened.
+                if picked.is_some_and(<[usize]>::is_empty) {
+                    Ok(None)
+                } else {
+                    m.footer(part).map(Some)
+                }
+            })
+            .collect::<Result<Vec<_>, InputError>>()?;
         let resolved = part_metas.iter().map(|m| m.resolved.clone()).collect();
         // #563: each part's reader caps the batch for its selected row
         // groups' widest byte-array column (`untrusted::ParquetSource::build`),
@@ -1257,11 +1319,11 @@ impl ConvertSource {
         for (part, meta) in metas.iter().enumerate() {
             let selected: Vec<usize> = match selection {
                 Some(sel) => sel.0[part].clone(),
-                None => (0..meta.parquet.num_row_groups()).collect(),
+                None => (0..meta.row_group_rows.len()).collect(),
             };
             let (mut run, mut run_rows) = (Vec::new(), 0usize);
             for rg in selected {
-                let rows = meta.parquet.row_group(rg).num_rows().max(0) as usize;
+                let rows = meta.row_group_rows[rg].max(0) as usize;
                 if !run.is_empty() && run_rows + rows > target_rows {
                     out.push(ReadSegment {
                         part,
@@ -1317,13 +1379,74 @@ impl ConvertSource {
 
     /// Footer metadata per part: borrowed for `Multi` (loaded at
     /// construction), loaded on demand for `Single`.
-    fn metas(&self) -> Result<std::borrow::Cow<'_, [PartMeta]>, InputError> {
+    fn metas(&self) -> Result<&[PartMeta], InputError> {
         match self {
-            ConvertSource::Single(s) => {
-                Ok(std::borrow::Cow::Borrowed(std::slice::from_ref(s.meta()?)))
-            }
-            ConvertSource::Multi(m) => Ok(std::borrow::Cow::Borrowed(&m.metas)),
+            ConvertSource::Single(s) => Ok(std::slice::from_ref(s.meta()?)),
+            ConvertSource::Multi(m) => Ok(&m.metas),
         }
+    }
+
+    /// [`Self::metas`] with the decoded footer of every part `selection`
+    /// reads (`None` = every part) in place. A multi-part source keeps only
+    /// part 0's footer once resolved (#815), so this re-reads the others it
+    /// needs together, footer fetches overlapped as at resolve.
+    fn metas_with_footers(
+        &self,
+        selection: Option<&RowGroupSelection>,
+    ) -> Result<&[PartMeta], InputError> {
+        let metas = self.metas()?;
+        let parts = self.parts();
+        let missing: Vec<usize> = (0..metas.len())
+            .filter(|&i| !selection.is_some_and(|s| s.0[i].is_empty()))
+            .filter(|&i| metas[i].footer.lock().expect("footer slot lock").is_none())
+            .collect();
+        if missing.is_empty() {
+            return Ok(metas);
+        }
+        let first_bytes = metas[0].decoded_bytes;
+        let subset: Vec<InputSource> = missing.iter().map(|&i| parts[i].clone()).collect();
+        let errors = std::sync::Mutex::new(Vec::new());
+        parse_footers(&subset, first_bytes, |j| {
+            match metas[missing[j]].footer(&subset[j]) {
+                Ok(_) => {}
+                Err(e) => errors.lock().expect("footer error lock").push((j, e)),
+            }
+        });
+        let mut errors = errors.into_inner().expect("footer error lock");
+        errors.sort_by_key(|(j, _)| *j);
+        match errors.into_iter().next() {
+            Some((_, e)) => Err(e),
+            None => Ok(metas),
+        }
+    }
+
+    /// Forget everything kept of the footers of the parts `selection` reads
+    /// nothing of (#815): their encoded tails, ~0.65 MiB per Overture part,
+    /// are only there for a cheap re-parse the run will not need.
+    /// A `--filter` with no spatial pruning has re-parsed every footer by
+    /// then; those of the parts it pruned are dropped here too.
+    pub(crate) fn release_unselected(
+        &self,
+        selection: &RowGroupSelection,
+    ) -> Result<(), InputError> {
+        let parts = self.metas()?.iter().zip(self.parts());
+        for ((meta, part), picked) in parts.zip(selection.parts()) {
+            if picked.is_empty() {
+                *meta.footer.lock().expect("footer slot lock") = None;
+                part.forget_footer();
+            }
+        }
+        Ok(())
+    }
+
+    /// Parts whose decoded footer is held.
+    #[cfg(test)]
+    fn resident_footers(&self) -> Result<usize, InputError> {
+        Ok(self
+            .metas()?
+            .iter()
+            .filter(|m| m.footer.lock().expect("footer slot lock").is_some())
+            .count())
     }
 }
 
@@ -1344,12 +1467,7 @@ fn load_part_meta(source: &InputSource) -> Result<PartMeta, InputError> {
                 source.display_name()
             )))
         })?;
-    Ok(PartMeta {
-        resolved: Arc::new(resolved),
-        schema: builder.schema().clone(),
-        parquet,
-        reader,
-    })
+    Ok(PartMeta::new(resolved, reader))
 }
 
 /// Threads parsing footers in [`load_part_metas`]. Parsing is CPU work of a
@@ -1365,40 +1483,25 @@ const FOOTER_PARSE_THREADS: usize = 8;
 /// trips, so a fixed few in flight leave a many-part prefix waiting). Each
 /// fetched footer is parsed as it lands, on [`FOOTER_PARSE_THREADS`]
 /// threads. Results are written into per-index slots so the order always
-/// matches `parts`; the first error (by part index) wins.
+/// matches `parts`; the first error (by part index) wins. Every footer but
+/// part 0's is dropped once parsed (#815).
 fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
     let Some((first, rest)) = parts.split_first() else {
         return Ok(Vec::new());
     };
     let first = load_part_meta(first)?;
-    let first_bytes = first.parquet.memory_size() as u64;
-    let admission = crate::input::stage_admission();
-    let in_flight = admission.requests_for(first_bytes);
-    // A fetched footer holds its bytes until a parse thread takes it: at
-    // most what `in_flight` was priced at, or the staging budget.
-    let retain = admission
-        .mem_budget
-        .max(first_bytes.saturating_mul(in_flight as u64));
+    let first_bytes = first.parquet(&parts[0])?.memory_size() as u64;
     let slots: Vec<std::sync::Mutex<Option<Result<PartMeta, InputError>>>> = (0..rest.len())
         .map(|_| std::sync::Mutex::new(None))
         .collect();
-    let (ready, landed) = std::sync::mpsc::channel::<usize>();
-    let landed = std::sync::Mutex::new(landed);
-    std::thread::scope(|scope| {
-        for _ in 0..FOOTER_PARSE_THREADS.min(rest.len()) {
-            scope.spawn(|| loop {
-                let next = landed.lock().expect("footer queue lock").recv();
-                let Ok(i) = next else {
-                    break;
-                };
-                let meta = load_part_meta(&rest[i]);
-                *slots[i].lock().expect("footer slot lock") = Some(meta);
-            });
-        }
-        crate::input::prefetch_footers(rest, in_flight, retain, |i| {
-            let _ = ready.send(i);
+    parse_footers(rest, first_bytes, |i| {
+        // #815: keep what validation, selection and row addressing need and
+        // drop the decoded footer; the parts a run reads re-read theirs.
+        let meta = load_part_meta(&rest[i]).inspect(|meta| {
+            *meta.footer.lock().expect("footer slot lock") = None;
+            rest[i].release_footer();
         });
-        drop(ready);
+        *slots[i].lock().expect("footer slot lock") = Some(meta);
     });
     std::iter::once(Ok(first))
         .chain(slots.into_iter().map(|slot| {
@@ -1407,6 +1510,38 @@ fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
                 .expect("every part's footer is parsed")
         }))
         .collect()
+}
+
+/// Run `parse(i)` for every part of `parts` as its footer lands, on
+/// [`FOOTER_PARSE_THREADS`] threads. `first_bytes` (one decoded footer)
+/// prices a footer in flight, and the staging admission sets how many
+/// remote footers are fetched at once (#817 R1: each footer is two round
+/// trips, so a fixed few in flight leave a many-part prefix waiting).
+fn parse_footers(parts: &[InputSource], first_bytes: u64, parse: impl Fn(usize) + Sync) {
+    let admission = crate::input::stage_admission();
+    let in_flight = admission.requests_for(first_bytes);
+    // A fetched footer holds its bytes until a parse thread takes it: at
+    // most what `in_flight` was priced at, or the staging budget.
+    let retain = admission
+        .mem_budget
+        .max(first_bytes.saturating_mul(in_flight as u64));
+    let (ready, landed) = std::sync::mpsc::channel::<usize>();
+    let landed = std::sync::Mutex::new(landed);
+    std::thread::scope(|scope| {
+        for _ in 0..FOOTER_PARSE_THREADS.min(parts.len()) {
+            scope.spawn(|| loop {
+                let next = landed.lock().expect("footer queue lock").recv();
+                let Ok(i) = next else {
+                    break;
+                };
+                parse(i);
+            });
+        }
+        crate::input::prefetch_footers(parts, in_flight, retain, |i| {
+            let _ = ready.send(i);
+        });
+        drop(ready);
+    });
 }
 
 impl MultiSource {
@@ -1438,9 +1573,10 @@ impl MultiSource {
         let has = |crs| metas.iter().any(|m| m.resolved.crs() == Some(crs));
         if has(crate::overview::level::Crs::Epsg3857) && has(crate::overview::level::Crs::Epsg4326)
         {
-            for m in &mut metas {
+            for (m, part) in metas.iter_mut().zip(&parts) {
                 if m.resolved.crs() == Some(crate::overview::level::Crs::Epsg3857) {
-                    m.resolved = Arc::new(m.resolved.web_mercator_as_lonlat(&m.parquet));
+                    let parquet = m.parquet(part)?;
+                    m.resolved = Arc::new(m.resolved.web_mercator_as_lonlat(&parquet));
                 }
             }
         }
@@ -1667,7 +1803,10 @@ impl SourceStream<'_> {
     /// selection / batch size. Schemas are identical across parts, so the
     /// root-column projection indices are valid for every part.
     fn open_part(&self, i: usize) -> Result<tylertoo_io::UntrustedBatchReader, InputError> {
-        let mut builder = self.parts[i].open_with_metadata(&self.metas[i])?;
+        let meta = self.metas[i]
+            .as_ref()
+            .expect("an opened part has a selection, so its footer");
+        let mut builder = self.parts[i].open_with_metadata(meta)?;
         if let Some(cols) = &self.projection {
             builder = builder.with_projection_roots(cols.iter().copied());
         }
@@ -2747,6 +2886,88 @@ mod tests {
         assert_eq!(src.selected_input_bytes(None).unwrap(), all_bytes);
     }
 
+    /// #815: a resolved multi-part source holds part 0's footer only; a
+    /// read re-reads the footers of the parts it selects, and nothing else.
+    #[test]
+    fn multi_source_rereads_only_the_selected_footers() {
+        let dir = tmpdir();
+        for (i, base) in [0i64, 10, 20].into_iter().enumerate() {
+            write_parquet(
+                &dir.path().join(format!("p{i}.parquet")),
+                vec![Field::new("id", DataType::Int64, false)],
+                vec![Arc::new(Int64Array::from(vec![
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                ]))],
+                Some(2),
+            );
+        }
+        let src = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(src.resident_footers().unwrap(), 1);
+        assert_eq!(src.part_row_counts().unwrap(), vec![(4, 2); 3]);
+        assert_eq!(src.num_row_groups_total().unwrap(), 6);
+        assert_eq!(src.resident_footers().unwrap(), 1);
+
+        let sel = RowGroupSelection::from_parts(vec![vec![], vec![1], vec![]]);
+        let plan = ReadPlan {
+            batch_size: 1024,
+            projection: None,
+            row_groups: Some(&sel),
+        };
+        assert_eq!(stream_ids(&src, &plan), vec![12, 13]);
+        assert_eq!(src.selected_row_count(Some(&sel)).unwrap(), 2);
+        assert_eq!(src.resident_footers().unwrap(), 2);
+        // A full read re-reads the rest.
+        let full = ReadPlan {
+            batch_size: 1024,
+            projection: None,
+            row_groups: None,
+        };
+        assert_eq!(stream_ids(&src, &full).len(), 12);
+        assert_eq!(src.resident_footers().unwrap(), 3);
+    }
+
+    /// #815 review: footers re-parsed for a selection (a `--filter` with no
+    /// bbox reads every part's statistics) are dropped for the parts the
+    /// selection then prunes; part 0 included.
+    #[test]
+    fn release_unselected_drops_reparsed_footers() {
+        let dir = tmpdir();
+        for i in 0..3 {
+            write_standard(&dir.path().join(format!("p{i}.parquet")), vec![i], false);
+        }
+        let src = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
+        src.selected_input_bytes(None).unwrap();
+        assert_eq!(src.resident_footers().unwrap(), 3);
+        let sel = RowGroupSelection::from_parts(vec![vec![], vec![0], vec![]]);
+        src.release_unselected(&sel).unwrap();
+        assert_eq!(src.resident_footers().unwrap(), 1);
+        assert_eq!(src.selected_row_count(Some(&sel)).unwrap(), 1);
+    }
+
+    /// #815 review: re-parsing the selected footers does not bring back a
+    /// pruned part 0's.
+    #[test]
+    fn reading_a_selection_leaves_pruned_part_0_released() {
+        let dir = tmpdir();
+        for i in 0..3 {
+            write_standard(&dir.path().join(format!("p{i}.parquet")), vec![i], false);
+        }
+        let src = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
+        let sel = RowGroupSelection::from_parts(vec![vec![], vec![0], vec![0]]);
+        src.release_unselected(&sel).unwrap();
+        assert_eq!(src.resident_footers().unwrap(), 0);
+        let plan = ReadPlan {
+            batch_size: 1024,
+            projection: None,
+            row_groups: Some(&sel),
+        };
+        assert_eq!(stream_ids(&src, &plan), vec![1, 2]);
+        assert_eq!(src.resident_footers().unwrap(), 2);
+    }
+
     #[test]
     fn stream_projection_applies_to_every_part() {
         let dir = tmpdir();
@@ -3532,7 +3753,7 @@ mod staging_counter_tests {
 
         let src = ConvertSource::single(crate::input::test_memory_source(bytes, "p.parquet"));
         src.restrict_columns(vec![0, 2]).unwrap();
-        src.num_row_groups_total().unwrap(); // footer first, so it is not counted
+        src.selected_input_bytes(None).unwrap(); // footer first, so it is not counted
 
         let (requests, fetched, ranges) = counted(&src, || src.stage_selected(None).unwrap());
         for r in &ranges {
@@ -3657,7 +3878,7 @@ mod staging_counter_tests {
 
         let src = ConvertSource::single(crate::input::test_memory_source(bytes, "w.parquet"));
         src.restrict_columns(vec![0, 2]).unwrap();
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
 
         let (requests, fetched, _) = counted(&src, || src.stage_selected(None).unwrap());
         assert_eq!(fetched, needed, "only the kept chunks' bytes");
@@ -3687,7 +3908,7 @@ mod staging_counter_tests {
         let store = ProbeStore::new(&named, Duration::from_millis(100));
         let parts = objects.iter().map(|(n, _)| store.source(n)).collect();
         let src = ConvertSource::from_parts("memory://", parts).unwrap();
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
         store.take_max_in_flight(); // footers do not count
 
         let (requests, _, _) = counted(&src, || src.stage_selected(None).unwrap());
@@ -3722,7 +3943,7 @@ mod staging_counter_tests {
         let store = ProbeStore::new(&named, Duration::from_millis(50));
         let parts = objects.iter().map(|(n, _)| store.source(n)).collect();
         let src = ConvertSource::from_parts("memory://", parts).unwrap();
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
         // Part 0 prices a footer, then the other 19 load together.
         assert_eq!(store.take_max_in_flight(), 19, "footers in flight");
         let (requests, _, _) = counted(&src, || src.stage_selected(None).unwrap());
@@ -3752,7 +3973,7 @@ mod staging_counter_tests {
         let store = ProbeStore::new(&named, Duration::ZERO);
         let parts = objects.iter().map(|(n, _)| store.source(n)).collect();
         let src = ConvertSource::from_parts("memory://", parts).unwrap();
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
         store.fail_next_gets("f-0.parquet", usize::MAX);
         let before: Vec<u64> = src
             .parts()
@@ -3808,7 +4029,7 @@ mod staging_counter_tests {
         let bytes = three_column_parquet(1000, 5);
         let store = ProbeStore::new(&[("r.parquet", bytes)], Duration::ZERO);
         let src = ConvertSource::single(store.source("r.parquet"));
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
         store.fail_next_gets("r.parquet", 1);
 
         let (requests, _, _) = counted(&src, || {
@@ -3834,7 +4055,7 @@ mod staging_counter_tests {
     fn staged_remote_rows_serve_concurrent_readers_without_the_network() {
         let bytes = three_column_parquet(1000, 4);
         let src = ConvertSource::single(crate::input::test_memory_source(bytes, "c.parquet"));
-        src.num_row_groups_total().unwrap();
+        src.selected_input_bytes(None).unwrap();
         src.stage_selected(None).unwrap();
         let (requests, _, _) = counted(&src, || {
             std::thread::scope(|s| {

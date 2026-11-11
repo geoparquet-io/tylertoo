@@ -30,7 +30,13 @@ pub struct OverviewWriteOptions {
 /// A Parquet batch writer constructed from this crate's encoding policy.
 pub struct BatchWriter<W: Write + Send>(ArrowWriter<W>);
 
-/// Construct a default Parquet writer (used by decoded-tile export).
+/// Encoded bytes a [`batch_writer`] buffers before it flushes a row group.
+/// The default 1M-row group held ~0.75 GB of pages on a Moldova z12 decode
+/// (#829); 128 MiB is Parquet's usual block size.
+const BATCH_ROW_GROUP_BYTES: usize = 128 * 1024 * 1024;
+
+/// Construct a default Parquet writer (used by decoded-tile export), whose
+/// row groups end at 128 MiB of encoded bytes or the default row count.
 ///
 /// # Errors
 ///
@@ -39,7 +45,10 @@ pub fn batch_writer<W: Write + Send>(
     sink: W,
     schema: SchemaRef,
 ) -> Result<BatchWriter<W>, ParquetError> {
-    ArrowWriter::try_new(sink, schema, None).map(BatchWriter)
+    let props = WriterProperties::builder()
+        .set_max_row_group_bytes(Some(BATCH_ROW_GROUP_BYTES))
+        .build();
+    ArrowWriter::try_new(sink, schema, Some(props)).map(BatchWriter)
 }
 
 /// Construct the overview writer: ZSTD, manual row-group boundaries, no

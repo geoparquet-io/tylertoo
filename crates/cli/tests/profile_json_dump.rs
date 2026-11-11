@@ -44,6 +44,7 @@ fn run_tiles_with_profile(
     fixture: &std::path::Path,
     min_zoom: &str,
     max_zoom: &str,
+    rayon_threads: Option<&str>,
 ) -> (
     tempfile::TempDir,
     serde_json::Value,
@@ -73,6 +74,8 @@ fn run_tiles_with_profile(
         // Set only in the child's environment: no in-process global state is
         // touched, so this test cannot race any other test in the suite.
         .env("TYLERTOO_PROFILE_JSON", &profile_json)
+        .env_remove("RAYON_NUM_THREADS")
+        .envs(rayon_threads.map(|t| ("RAYON_NUM_THREADS", t)))
         .output()
         .expect("run tylertoo tiles");
     assert!(
@@ -115,7 +118,7 @@ fn profile_json_written_and_parses() {
         return;
     };
 
-    let (dir, report, convert, export) = run_tiles_with_profile(&fixture, "0", "6");
+    let (dir, report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None);
 
     // --- Pairing: both lines of one `tiles` process share a `run_id` and
     // say which phase they are. ---
@@ -155,7 +158,7 @@ fn profile_json_written_and_parses() {
 fn profile_json_saturation_fields_on_a_committed_fixture() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
-    let (_dir, _report, convert, export) = run_tiles_with_profile(&fixture, "0", "6");
+    let (_dir, _report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None);
     check_saturation(&convert, &convert, &CONVERT_PHASES);
     assert!(
         convert["pass2"]["writer_busy_secs"]
@@ -506,8 +509,9 @@ const CONVERT_PHASES: [&str; 6] = [
 
 /// #571: the `rss_sampler` object inside `holder` (the convert line itself,
 /// or its `export` object). Every phase the run entered has an entry however
-/// short it was, `true_peak_mib` is the max over them, and it is never below
-/// the boundary-sampled `peak_rss_mib` it sits next to.
+/// short it was, and `true_peak_mib` is the max over them. Export's
+/// boundary-sampled `peak_rss_mib` never exceeds it; convert's is the run's
+/// peak (the kernel's `VmHWM` included), so it never falls below it.
 fn check_rss_sampler(line: &serde_json::Value, holder: &serde_json::Value, phases: &[&str]) {
     let sampler = &holder["rss_sampler"];
     assert_eq!(
@@ -540,11 +544,19 @@ fn check_rss_sampler(line: &serde_json::Value, holder: &serde_json::Value, phase
         true_peak, max_phase,
         "rss_sampler.true_peak_mib must be the max over phase_peaks_mib: {line}"
     );
-    assert!(
-        true_peak >= boundary,
-        "rss_sampler.true_peak_mib ({true_peak}) must not be below the \
-         boundary-sampled peak_rss_mib ({boundary}): {line}"
-    );
+    if holder["phase"] == "convert" {
+        assert!(
+            boundary >= true_peak,
+            "convert's peak_rss_mib ({boundary}) must not be below \
+             rss_sampler.true_peak_mib ({true_peak}): {line}"
+        );
+    } else {
+        assert!(
+            true_peak >= boundary,
+            "rss_sampler.true_peak_mib ({true_peak}) must not be below the \
+             boundary-sampled peak_rss_mib ({boundary}): {line}"
+        );
+    }
     check_627_breakdown(line, sampler, phases);
     check_saturation(line, holder, phases);
 }
@@ -1352,4 +1364,16 @@ fn profile_json_reports_cascade_identical_steps() {
         (ratio - expected).abs() < 1e-9,
         "pass2.identical_steps.ratio ({ratio}) must equal shared/total ({expected}): {value}"
     );
+}
+
+/// The CLI sizes the worker pool from core's `resolve_worker_threads`: the
+/// cores capped at 40 by default, an explicit `RAYON_NUM_THREADS` verbatim.
+#[test]
+fn cli_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let threads = |env| run_tiles_with_profile(&fixture, "0", "2", env).2["threads"].as_u64();
+    assert_eq!(threads(None), Some(cores.min(40) as u64));
+    assert_eq!(threads(Some("48")), Some(48));
 }

@@ -4,6 +4,298 @@ How to measure where time and memory go. The recorded performance
 history of the pipeline (what was measured, what was fixed) lives in
 [`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/PROFILE.md).
 
+## Memory envelope
+
+These are code-derived sizes for a 64-bit target. They are arithmetic
+allocation models, not measured peak RSS. GB means 10^9 bytes. GiB means
+2^30 bytes. Do not add peaks from separate phases.
+Within a phase, add the tables, active batches, workspace, and allocator
+headroom that overlap.
+
+Feature count, vertices, properties, and emitted tiles determine memory
+needs. A country boundary alone gives no memory bound. Planet scale needs
+larger RAM or sharding. Spilling pass 2 does not spill pass 1 or the archive
+directory. The calculations below explain those limits.
+
+### Measured peaks
+
+Peak resident memory of `tylertoo tiles` on three inputs, measured with
+`/usr/bin/time -v` on a 64-core aarch64 host with 123 GB of RAM, each run
+inside a 24 GB cgroup (`systemd-run -p MemoryMax=24G`), median of three
+runs. Input features is the input's row count. These are measurements;
+the arithmetic below is not.
+
+| Input | Profile | Input features | Peak RSS (GiB) |
+| --- | --- | ---: | ---: |
+| NZ parcels (z0–14) | `auto` | 4,343,547 | 7.7 |
+| NZ parcels (z0–14) | `bounded` | 4,343,547 | 2.5 |
+| Fields of The World (FTW) Brazil MT (z0–13) | `auto` | 4,579,024 | 6.5 |
+| FTW Brazil MT (z0–13) | `bounded` | 4,579,024 | 2.2 |
+| Overture segments, one full part (z0–14) | `auto` | 2,815,136 | 4.9 |
+| Overture segments, one full part (z0–14) | `bounded` | 2,815,136 | 2.5 |
+
+`auto` sizes itself to the memory it finds, so on a host with less memory
+its peak is lower; `bounded` stays near its floor.
+
+### Budget and profiles
+
+[`MemoryBudget`](../crates/core/src/overview/memory.rs) starts with a memory
+probe. On Linux it uses the smaller of `MemAvailable` and reclaim-adjusted
+cgroup headroom (`memory.max` and `memory.high`, or the v1 limit).
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides both. Let `M` be that probe,
+`R` the resident reservations, and `G` the grants already made:
+
+```
+remaining allowance = max(0, 0.60 × max(0, M − R) − G)
+```
+
+Without a probe, the allowance is 4 GiB. Read-ahead and the pass-2 compute
+window each get 10% of the remaining allowance when sized. Row-group
+encodes get 25%. Each grant reduces what later phases can use. With
+32 GiB available and no charges, the allowance starts at 19.2 GiB.
+The shares start at 1.92 GiB and 4.8 GiB; earlier grants reduce them.
+These are budget calculations, not a promise about total process memory.
+
+- `auto` sizes concurrency to the allowance and spills output when needed.
+- `bounded` spills output and caps readers at 4 and queues at 16 batches
+  per reader. Row-group encodes start with at most 4. The buffered drain can
+  add encodes using released batch memory, limited by headroom below the
+  prior RSS peak and the thread count.
+- `speed` takes the requested concurrency and keeps output in RAM.
+
+All profiles retain minimum working units. A read or compute window needs
+at least one batch. The writer needs up to 4 encodes, pool permitting.
+Export needs at least one partition, which contains whole tiles. These
+floors can exceed a small allowance. Pass-1 preflight prices the table at
+42 B per input row and warns when 3.3× that estimate exceeds probed memory.
+It fails only when the table alone exceeds a hard cgroup limit and no
+per-feature filter can reduce the row count. `TYLERTOO_SKIP_MEMORY_PREFLIGHT=1`
+downgrades that failure to a warning. Passing preflight does not prove the
+whole run fits.
+
+### Pass 1: scan and assignment
+
+[`FeatureTable`](../crates/core/src/overview/assign.rs) stores columns,
+not the old 64-byte `AssignFeature` structs. For `N` retained features:
+
+| Column | Bytes per feature | When allocated |
+| --- | ---: | --- |
+| Input row index (`usize`) | 8 | Always |
+| Center x, center y, squared diagonal (`f64`) | 24 | Always |
+| Geometry kind (`u8`) | 1 | Always |
+| Sort key (`f64`) | 8 | Once any finite key exists, including auto-ranking |
+| Entry level (`u8`) | 1 | Once any entry ladder value exists |
+| **Table total** | **33–42** | 41 with a sort key alone; 34 with a ladder alone |
+
+Thus 300 million features cost `300M × (33…42)` = 9.9–12.6 GB
+(9.22–11.73 GiB) for this table alone. At 1.58 billion features it is
+52.14–66.36 GB (48.56–61.80 GiB).
+
+Other live allocations in
+[`stream.rs`](../crates/core/src/overview/stream.rs) and `assign.rs` matter:
+
+- Ranking extraction holds 16 B per input row per candidate numeric key
+  (`Option<f64>`), including auto-detected road-class candidates and
+  confidence. Class groups add 4 B per row plus interned strings when
+  coalescing collects them. These scratch columns can overlap the final
+  sort-key column before scan assembly releases them.
+- An entry ladder adds 16 B per input row of source values. Resolution
+  also builds value/rung arrays and a 2 B/row `Option<u8>` result before
+  writing the table's 1-byte entry column.
+- Polygon areas add `4N` bytes when tiny-polygon accumulation is active.
+  Accumulation source values add 16 B per input row per requested numeric
+  attribute (`Option<f64>`). Cluster categories add 4 B per input row plus
+  interned values. Clustering also builds feature-indexed copies and
+  per-level cluster tables. Their size depends on the chosen options.
+- Cell assignment holds a 1 B/feature minimum-level vector. Its winner
+  lists use 8 B per winning position. The grid scheduler prices each
+  occupied cell at 96 B and packs levels into waves. The grid allowance is
+  the profile allowance less `42N`; at least one level still runs. Pending
+  placements target about 2 MiB per pool thread across a wave, with a
+  1 MiB floor per level. Grid estimates are not exact heap sizes.
+- `FeatureAssignment` is 16 B: an 8-byte index, a 1-byte level, and
+  alignment padding. The density fold retains that input assignment plus
+  `cw_min`, `admitted`, and `admitted_at` (1 B/feature each). Its kind mask
+  adds another 1 B/feature unless the budget covers all kinds. If there are no
+  features of a budgeted kind, it clones the assignment and returns.
+- During a binding density cut, `C` candidates and `H` already admitted
+  features need `8C + 8H` bytes of positions. Tagged candidates add `32C`
+  (`(u128, usize)` with padding); held super-cells add `16H`. Chosen
+  positions add `8K`. Cell lists and water-filling workspace add terms in
+  the number of occupied super-cells, including up to 48 B/cell for events.
+  Output assignment construction can overlap two 16 B/feature assignment
+  vectors. No 40 B/feature priority array remains: comparisons derive keys.
+
+Consider 300 million polygons. Area accumulation needs an extra column. Assume
+ranking and entry ladders are off, so the point budget has no points to thin.
+The feature table plus areas and two assignment vectors come to `300M × (33 + 4 + 16 + 16)` = 20.7 GB (19.28 GiB).
+This excludes grid peaks, batches, capacity slack, and retained allocator
+pages. It is a subtotal for that path, not a universal B/feature rate.
+For 1.58 billion rows the same subtotal is 109.02 GB (101.53 GiB), already
+beyond a 32 GB host. Changing `--profile` cannot spill those arrays.
+
+Before pass 2, the pipeline frees the feature table. The row-indexed minimum-level
+map remains at 1 B per input row, including skipped rows. Kinds add another
+1 B/row when coalescing or plan saving needs them. Carrier positions cost
+8 B each per level; cluster and coalescing tables remain when enabled.
+Vector capacity and scan chunks can add transient memory above element sizes.
+
+**Line exception.** Coalescing collects geometry in pass 1 by default.
+Its guard allows at most 2 million lines and `2M × 512` = 1.024 GB modeled
+geometry. The guard prices each line at `56 + 16 × vertices` bytes. The chain
+stage needs further workspace and keeps per-level results; the collection
+guard does not cap that peak. See
+[chain-stage memory](../docs/OVERVIEW_TUNING.md#chain-stage-memory).
+`--no-coalesce-lines` removes that work but changes generalization.
+`--coalesce-max-level-rows` changes both guard limits and can change output.
+
+### Pass 2: batches, sink, and spill
+
+[`read.rs`](../crates/core/src/overview/read.rs) prices a decoded input row
+as `p = 2 × ceil(selected column bytes / selected rows) + 8 × columns`.
+It uses uncompressed footer bytes, or larger raw byte-array sizes.
+Generated integer count columns add 8 B each plus validity bits. A read
+batch costs roughly `batch_rows × p`, capped at the reader's decoded-batch
+limit for admission. Each reader also holds its largest selected row group.
+The compute window prices a batch at `batch_rows × (1 + fanout) × p`.
+Here `fanout` counts planned output rows per input row across the active levels.
+
+Let `B` count buffered output rows, excluding a streamed canonical level,
+`g` the mean encoded geometry bytes, and `I` the source row count. In
+[`memory.rs`](../crates/core/src/overview/memory.rs), the model prices an unshared sink
+at `B × p` when footer prices exist. Otherwise the row model is
+`256 + 2g` bytes in duplicating mode or `256 + 4g` in partitioning mode;
+without a geometry size the fallbacks are 8192 and 16384 B/row.
+
+For shared RAM batches, let `J = min(B, I)`. The estimate becomes:
+
+```
+min(B × p, J × (p + 256) + (B − J) × g + 16 × B)
+```
+
+If `g` is unknown, that term uses `p`. Levels share properties once per source batch. Each level keeps geometry
+positions and counts.
+This path needs duplicating mode, cascading simplification, no clustering,
+and more than one buffered level. Each level still adds memory.
+For example, `B = 20M`, `I = 10M`, `p = 1000`, `g = 100` gives
+`min(20 GB, 12.56 + 1 + 0.32 GB)` = 13.88 GB (12.93 GiB).
+
+[`pipeline.rs`](../crates/core/src/overview/pipeline.rs) compares that
+estimate with the allowance left after grants. `auto` also spills
+partitioning output above 2 million buffered rows. During RAM buffering it measures
+Arrow bytes plus a 256 B floor per materialized row. The tuner counts shared source rows once; each level adds its own arrays. The tuner projects
+`held bytes + remaining planned rows × observed bytes/row` after each
+input batch and can switch once to spill. Arrow array accounting can
+count shared buffers more than once, so this remains a sizing estimate.
+
+`bounded` spills LZ4 IPC; an `auto` spill uses raw IPC. The cgroup page-cache
+reservation models spill at `0.4 × B × row price` for LZ4 and
+`1.0 × B × row price` for raw IPC. It reserves that cost before grants only
+when the spill fits the allowance. This ratio is a code constant, not a
+compression measurement for the current input. Each spilled level has a
+2-batch queue plus the batch its writer consumes. Those add roughly
+`3 × batch_rows × p × spilled_levels` bytes, plus the producer's current
+batch and IPC codec workspace. Put `--spill-dir` on real disk: tmpfs
+charges the spill itself to RAM.
+
+The initial row-group encode grant takes 25% of the remaining allowance,
+priced for Arrow rows and encoded chunks. One encode costs
+`5 × planned rows/group × output row price` in the model. A drain slot
+prices at least one WKB chunk of rows. During the buffered drain,
+`MemoryBudget::drain_encodes` can reuse memory the finished read and
+compute window held. Reuse stops at their grants or the RSS headroom
+below the prior peak. It adds only the slots that fit, up to the thread
+count. These are admission estimates, not measured peaks.
+
+### Export: tile counts and active members
+
+[`LevelScan`](../crates/core/src/overview/export.rs) keeps a
+`BTreeMap<u64, usize>` per level. Each occupied tile has 16 B of key/value
+payload on a 64-bit host, plus node headers, edges, unused slots, and
+allocator overhead. Counts are tile memberships, not distinct input rows.
+A feature crossing tiles contributes to each. Maps for all scanned levels
+can coexist. At 80 million occupied tiles, payload alone is
+`80M × 16` = 1.28 GB (1.19 GiB). This is arithmetic, not a measured map
+peak. The full map rate depends on occupancy and allocator overhead.
+Neither profile spills these maps.
+
+For active clipped members, the current admission model is
+`q = 2 × stored bytes/row + 224 + 208 × published properties`.
+The default merge valve adds 384 B/member to wave, group, and store sizing.
+For a 100-byte stored row with four properties, `q = 1256` B and the
+merge fit price is 1640 B/member. A million active members then price at
+1.64 GB (1.53 GiB), before separately charged caches and reader buffers.
+These constants model geometry and property values alongside encoding and
+valve workspace. They are not fixed struct widths or new measurements.
+
+Export collection and encoding use shares equivalent to half the probed
+memory without prior charges (`0.60 × 5/6 = 0.50`). Earlier grants
+reduce later ones. `auto` narrows waves and keeps only the level-store
+members that fit; `bounded` spills stores and uses its minimum wave shape.
+`speed` keeps members in RAM. Spill fill buffers start from a 128 MiB
+model and adjust to measured segment sizes. One tile is never split across
+partitions. The single-tile check uses a separate OOM probe. It checks
+`MemAvailable` and the hard cgroup limit, excluding `memory.high`. It refuses a tile above that
+headroom under every profile. An unknown price or limit skips the check.
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES` and `TYLERTOO_SKIP_MEMORY_PREFLIGHT` make
+this check warn instead of refusing. The size valve runs after collection.
+
+Lower `--read-batch-size`, `--read-workers`, `--in-flight-batches`, or
+`--partition-wave` to reduce active work. Profiles and these concurrency
+controls preserve tile bytes. Smaller input row groups prepared with `gpio`
+reduce each reader's resident decode. Property selection reduces row and
+member width but changes the published attributes. Changing zooms or
+generalization can reduce memory by changing which features reach the tiles.
+
+### Writer: entries and deduplication
+
+[`StreamingPmtilesWriter`](../crates/core/src/pmtiles_writer.rs) sends
+compressed bodies straight to disk but keeps metadata for every added tile.
+Let `T` count emitted tiles, `U` distinct stored bodies, and `D` directory
+entries after run-length encoding (`D <= T`):
+
+| Allocation | Bytes | Depends on |
+| --- | --- | --- |
+| `StreamingDirEntry` vector | `24 × capacity` | 8-byte id + 8-byte offset + 4-byte length + 4-byte padding |
+| Body hash table | 24 B key/value payload per bucket, plus control bytes and spare capacity | 8-byte hash + 16-byte padded `(offset, length)`; grows with `U` |
+| `DirEntry` vector during checkpoint/finalize | `24 × capacity` | 8-byte id + 8-byte offset + 4-byte length + 4-byte run length; grows with `D` |
+
+`estimated_memory_bytes()` uses `24T + 40U`, allowing roughly for hash
+occupancy. At `T = U = 100M`, that is 6.4 GB (5.96 GiB). An unmerged
+`D = 100M` directory adds at least 2.4 GB, bringing the subtotal to
+8.8 GB (8.20 GiB). Vector growth, sorting workspace, encoded directory
+buffers, compressed leaves, and allocator retention add more. Adjacent
+identical bodies reduce `D` and dedup reduces `U`, but each tile still has
+its streaming entry. Hash collisions also need overflow records. The writer verifies ordinary
+hash hits against stored bytes. Ascending export writes avoid
+the fallback clustered-offset hash map.
+
+No memory profile spills these writer tables. A slower disk cannot solve
+this ceiling. Lower `T` with a smaller zoom range, or split the export;
+merging all shards into one archive still needs the final writer state.
+The 100 million-tile example is arithmetic, not a measured writer peak.
+
+For capacity planning, take the largest phase subtotal and add measured
+batch/workspace peaks and headroom. At 1.58 billion input rows, even the scan
+floor alone needs 49–62 GiB. Plan a larger host for the full-input coarse
+job, then size the shards separately. Do not treat 64 GiB as a planet
+budget or the historical 192 GiB failure as a new measured requirement.
+The planet-scale figures here are arithmetic, not measured peaks.
+For scheduler cache accounting, see
+[the scaling guide](../docs/guides/scaling.md#reading-a-jobs-maxrss).
+
+### Design notes after 1.0
+
+- **Pass-1 table spill:** store scan columns and assignment scratch in
+  external runs. Keep winner ordering and canonical fidelity unchanged.
+- **A Bloom filter before dedup:** test whether a body hash might exist before a
+  disk-backed exact lookup. Verify positive hits against bytes; a Bloom
+  filter alone cannot decide tile identity.
+- **External merge for directories:** sort entry runs and stream directory
+  construction, so checkpoints and final archives need bounded RAM.
+
+These are design directions, not available profile options.
+
 ## Phase timing (built in)
 
 The overview pipeline keeps phase accumulators (pass 1 scan, assignment,
@@ -97,19 +389,18 @@ a write failure only logs — it never fails the conversion (see
                                     // run, or a single-level ladder
       "ratio": 0.0606
     },
-    "sink": {                       // #626: the MEASURED cost of a buffered
-      "bytes_per_row": 1872,        // output row — geometry + every kept
-                                    // property column — plus a 256 B
-                                    // allocator floor; null when nothing
-                                    // was buffered
+    "sink": {                       // #626, #852: accounted retained bytes
+      "bytes_per_row": 1872,        // per buffered output row; source rows
+                                    // shared across levels counted once,
+                                    // with a 256 B/materialized-row floor;
+                                    // null when nothing was buffered
       "sampled_rows": 65536,        // buffered rows measured: every one
                                     // of the pass
       "projected_bytes": 12275712,  // bytes buffered + rows still planned
                                     // x bytes_per_row; at the end of the
                                     // pass, what was actually buffered
-      "budget_bytes": 34359738368,  // AUTO_RAM_FRACTION x available RAM; 0
-                                    // under bounded/speed, which never
-                                    // probe it
+      "budget_bytes": 34359738368,  // allowance left after earlier grants;
+                                    // 0 unless auto starts with RAM sinks
       "downgraded_to_spill": false  // auto flipped the RAM sinks to spill
     },                              // mid-pass because the projection
                                     // passed the budget
@@ -203,9 +494,11 @@ this dump. `not_checked` means a
 `--plan` replay, which builds no feature table.
 
 `pass2.sink` is decided **during** pass 2, by measurement rather than model.
-`bytes_per_row` is the real retained cost of one buffered output row — the
-Arrow bytes of the geometry column plus every kept property column, averaged
-over every buffered row of the pass, plus a 256-byte allocator floor. Before
+`bytes_per_row` averages retained bytes over all buffered output rows.
+Owned batches contribute their Arrow array bytes plus a 256-byte floor
+per row. Shared batches count their source rows once, including that floor,
+and add each level's own geometry positions and count arrays.
+See the [sink model](#pass-2-batches-sink-and-spill) for the sharing conditions. Before
 #626 `auto` charged a flat 4 KiB/row for the property columns without ever
 looking at them. Now, after each input batch, `auto` projects the bytes
 already buffered plus the rows still to come at the rate so far; when that

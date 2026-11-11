@@ -45,23 +45,26 @@ use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
 use super::cluster::{ClusterEntry, ClusterTables};
-use super::coalesce::{collected_line_bytes, CoalesceInput, ExactChains};
+use super::coalesce::{
+    chain_stage_resident_bytes, collected_line_bytes, CoalesceInput, ExactChains,
+};
 use super::config::ValidatedConfig;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
-    apply_coalesced_count, build_generalization, build_level_batch, build_source_schema,
-    class_ranking_provenance, cluster_category_column, coalesce_effective, coalesce_table_merged,
-    count_vertices, extract_class_ranks, extract_numeric_values, extract_sort_keys,
-    fill_level_bytes, mixed_geometry_field, overture_road_ranking, record_coalesce_merged,
-    record_level_outcome, resolve_pass_read_workers, resolve_reserved_column_collisions,
-    scan_feature_traits, validate_cluster_schema, validate_coalesce_schema,
-    warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking, CoalesceTable, ConvertError,
-    ConvertOptions, ConvertReport, GroupInterner, LevelReport, PlanLevelReport, PlanReport,
-    SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    apply_coalesced_count, build_generalization, build_geometry_column, build_level_batch,
+    build_source_schema, class_ranking_provenance, cluster_category_column, coalesce_effective,
+    coalesce_table_merged, coalesced_count_column, count_vertices, extract_class_ranks,
+    extract_numeric_values, extract_sort_keys, fill_level_bytes, mixed_geometry_field,
+    overture_road_ranking, record_coalesce_merged, record_level_outcome, resolve_pass_read_workers,
+    resolve_reserved_column_collisions, scan_feature_traits, take_chain_geometry,
+    validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, BboxQuery,
+    BboxTallies, ClassRanking, CoalesceTable, ConvertError, ConvertOptions, ConvertReport,
+    GroupInterner, LevelReport, PlanLevelReport, PlanReport, SkippedLevelReport,
+    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{ClusterCategories, Crs, EntryZoomProvenance, Mode, RankingProvenance};
 use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
-use super::pipe::{for_each_window, scoped_pipe, split_in_flight, WindowStats};
+use super::pipe::{for_each_window_on_pool, scoped_pipe, split_in_flight, WindowStats};
 use super::pipeline;
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
 use super::procmem::{
@@ -80,7 +83,9 @@ use super::simplify::{
 use super::source::BatchSource;
 #[cfg(test)]
 use super::source::MemorySource;
-use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
+use super::writer::{
+    recv_in_pool, LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions,
+};
 use crate::resolved_schema::ResolvedSchema;
 
 struct ScanCollection {
@@ -132,6 +137,8 @@ struct Pass2Inputs<'a> {
     encode: Grant,
     /// What one more drain encode holds ([`encode_price`] at a WKB chunk).
     drain_slot_bytes: u64,
+    /// Where the buffered levels go, decided once before pass 2.
+    backing: pipeline::SinkBacking,
 }
 
 struct AssignmentInputs<'a> {
@@ -863,11 +870,19 @@ pub(super) struct RssTracker {
     /// `peak_rss_mib` in the profile JSON exactly as before.
     pub(super) boundary_peak_mib: Option<f64>,
     sampler: Option<RssSampler>,
+    /// Whether this run restarted the kernel's peak-RSS mark (VmHWM): only
+    /// then is it this run's peak rather than the process's.
+    hwm_reset: bool,
 }
 
 impl RssTracker {
     pub(super) fn new(profiling_on: bool, initial_phase: &str) -> Self {
+        // Restart the kernel's peak-RSS mark (VmHWM) for this run, so the
+        // profile's `peak_rss_mib` is the run's true peak, not a phase
+        // boundary's. Best effort: off Linux the boundary peak stands.
+        let hwm_reset = profiling_on && std::fs::write("/proc/self/clear_refs", "5").is_ok();
         Self {
+            hwm_reset,
             boundary_peak_mib: None,
             sampler: RssSampler::start_if(profiling_on, initial_phase),
         }
@@ -879,6 +894,7 @@ impl RssTracker {
         Self {
             boundary_peak_mib: None,
             sampler,
+            hwm_reset: false,
         }
     }
 
@@ -1202,10 +1218,6 @@ pub(super) fn select_row_groups_streaming(
         Some(q) => Some(source.select_row_groups_any(q.boxes())?),
         None => None,
     };
-    let filter_selection: Option<RowGroupSelection> = match filter {
-        Some(f) => Some(source.select_row_groups_matching(f)?),
-        None => None,
-    };
     // The shard's read bounds stop at ±180, but export draws a feature one
     // world width away at its wrapped position (#342), so a 0..360 row group
     // at lng 200 belongs to the shard covering -160: test the wrapped copies
@@ -1214,15 +1226,20 @@ pub(super) fn select_row_groups_streaming(
         Some(range) => Some(source.select_row_groups_any(shard_read_query(range, crs).boxes())?),
         None => None,
     };
-    Ok([
-        bbox_selection,
-        mask_selection,
-        filter_selection,
-        shard_selection,
-    ]
-    .into_iter()
-    .flatten()
-    .reduce(|a, b| a.intersect(&b)))
+    let spatial = [bbox_selection, mask_selection, shard_selection]
+        .into_iter()
+        .flatten()
+        .reduce(|a, b| a.intersect(&b));
+    // The filter reads column statistics from footers: only over the parts
+    // the spatial prunings left (#815), which the intersection keeps anyway.
+    let filter_selection: Option<RowGroupSelection> = match filter {
+        Some(f) => Some(source.select_row_groups_matching_within(f, spatial.as_ref())?),
+        None => None,
+    };
+    Ok([spatial, filter_selection]
+        .into_iter()
+        .flatten()
+        .reduce(|a, b| a.intersect(&b)))
 }
 
 /// Unsigned area of a polygonal geometry in CRS units², 0 for anything else
@@ -1414,17 +1431,53 @@ fn build_level_ctxs<'a>(
 /// directly — never buffered or spilled).
 type LevelStat = (LevelWriteOutcome, usize, usize, u64);
 
-/// Spilled bytes per Arrow byte the spill writer puts on disk: the spill
-/// codec's ratio. Owned by the spill (track C1, #715: LZ4 under `bounded`);
-/// 1.0 is today's uncompressed Arrow IPC until the sink exposes its own.
-fn spill_bytes_per_arrow_byte() -> f64 {
-    1.0
+/// Rows pass 2 buffers: every emitted level but a finest level it streams
+/// (verbatim: partitioning, or the canonical finest level). The same rule
+/// `run_pass2_levels` reads off the level contexts.
+fn buffered_rows(emitted: &[EmitLevel], finest: usize, options: &ConvertOptions) -> usize {
+    buffered_levels(emitted, finest, options)
+        .iter()
+        .map(|e| e.hint)
+        .sum()
+}
+
+/// The emitted levels pass 2 buffers ([`buffered_rows`]).
+fn buffered_levels<'a>(
+    emitted: &'a [EmitLevel],
+    finest: usize,
+    options: &ConvertOptions,
+) -> &'a [EmitLevel] {
+    let streams_last = matches!(options.mode, Mode::Partitioning)
+        || emitted.last().is_some_and(|e| e.orig as usize == finest);
+    let buffered = if streams_last {
+        emitted.len().saturating_sub(1)
+    } else {
+        emitted.len()
+    };
+    &emitted[..buffered]
+}
+
+/// The input rows a RAM sink's levels share their properties from (#852):
+/// the cascade's levels do when there are two or more of them, unless
+/// clustering rewrites columns per level. The same rule the engine's
+/// `share` applies.
+fn shared_sink_rows(
+    options: &ConvertOptions,
+    buffered: &[EmitLevel],
+    input_rows: usize,
+) -> Option<usize> {
+    (matches!(options.mode, Mode::Duplicating)
+        && options.simplify.cascade
+        && !options.cluster
+        && buffered.len() > 1)
+        .then_some(input_rows)
 }
 
 /// What [`reserve_spill_cache`] sizes the spill from.
 struct SpillPlan<'a> {
     emitted: &'a [EmitLevel],
     finest: usize,
+    input_rows: usize,
     row_bytes: Option<u64>,
     avg_geom_bytes: Option<u64>,
 }
@@ -1478,37 +1531,33 @@ fn reserve_spill_cache(
     let SpillPlan {
         emitted,
         finest,
+        input_rows,
         row_bytes,
         avg_geom_bytes,
     } = plan;
-    // The levels pass 2 buffers: all but a finest level it streams (the same
-    // rule `run_pass2_levels` reads off the level contexts).
-    let streams_last = matches!(options.mode, Mode::Partitioning)
-        || emitted.last().is_some_and(|e| e.orig as usize == finest);
-    let buffered = if streams_last {
-        emitted.len().saturating_sub(1)
-    } else {
-        emitted.len()
-    };
-    let buffered_rows: usize = emitted[..buffered].iter().map(|e| e.hint).sum();
+    let buffered_rows = buffered_rows(emitted, finest, options);
     let spills = matches!(
         pipeline::sink_backing(
             budget,
             options.profile,
             options.mode,
             buffered_rows,
-            avg_geom_bytes
+            shared_sink_rows(
+                options,
+                buffered_levels(emitted, finest, options),
+                input_rows
+            ),
+            avg_geom_bytes,
+            row_bytes,
         ),
         pipeline::SinkBacking::Spill
     );
     if !spills || buffered_rows == 0 {
         return skip("nothing spills");
     }
-    let arrow_bytes = row_bytes.map_or_else(
-        || budget.sink_estimate(options.mode, buffered_rows, avg_geom_bytes),
-        |row| (buffered_rows as u64).saturating_mul(row),
-    );
-    let estimate_bytes = (arrow_bytes as f64 * spill_bytes_per_arrow_byte()) as u64;
+    let arrow_bytes = budget.sink_estimate(options.mode, buffered_rows, avg_geom_bytes, row_bytes);
+    let codec = pipeline::spill_codec(options.profile);
+    let estimate_bytes = (arrow_bytes as f64 * pipeline::spill_bytes_per_arrow_byte(codec)) as u64;
     let reservation = if estimate_bytes <= budget.remaining() {
         SpillReservation {
             estimate_bytes,
@@ -1597,7 +1646,15 @@ fn run_pass2_levels(
     hints: &[usize],
     inputs: Pass2Inputs<'_>,
     strategy: Pass2Strategy,
-) -> Result<(Vec<LevelStat>, Pass2Timers, pipeline::SinkMeasurement), ConvertError> {
+) -> Result<
+    (
+        Vec<LevelStat>,
+        Pass2Timers,
+        pipeline::SinkMeasurement,
+        MemoryBudget,
+    ),
+    ConvertError,
+> {
     let Pass2Inputs {
         source,
         options,
@@ -1609,23 +1666,29 @@ fn run_pass2_levels(
         footer,
         encode,
         drain_slot_bytes,
+        backing,
     } = inputs;
     let n = ctxs.len();
     // #626: filled in by the buffered engine. Stays at its default for the
     // Serial reference path and for a ladder with nothing to buffer — neither
     // holds a sink, so there is nothing to have measured.
     let mut sink_measurement = pipeline::SinkMeasurement::default();
+    // The budget while pass 2's first read holds its grants: the ledger the
+    // profile JSON records.
+    let mut ledger = budget;
     // How pass 2 reads the input: the batch chunking (identical for every
     // worker count), the resolved reader-thread count (#494), and the footer
     // geometry weight pass 1 reports (#717), which is what sizes the
     // read-ahead against the memory budget.
-    let read_tuning = ReadTuning {
+    let mut read_tuning = ReadTuning {
         budget,
         batch_size: options.read_batch_size.max(1),
         workers: resolve_pass_read_workers(ReadPass::Build, options.read_workers),
         avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
         footer,
-        profile: options.profile,
+        // #815: once `auto` spills, its read and window are sized as
+        // `bounded`'s; more of them would not make the spill faster.
+        profile: pipeline::sizing_profile(options.profile, backing),
     };
     // Output rows per input row across `levels`, from the plan's per-level
     // winner counts: what one window batch fans out to (#716).
@@ -1678,19 +1741,6 @@ fn run_pass2_levels(
             // the whole job costs a single read instead of two.
             let stream_last = ctxs[n - 1].verbatim;
             let buffered = if stream_last { n - 1 } else { n };
-            let buffered_rows: usize = hints[..buffered].iter().sum();
-            // #305: the average encoded-geometry size per input row, from the
-            // footers (#717), sizes the RAM-vs-spill estimate (falls back to
-            // calibrated constants on an empty scan). Same decision timing as before —
-            // pass 1 has always completed by this point (the assign barrier).
-            let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
-            let backing = pipeline::resolve_backing(
-                budget,
-                options.profile,
-                options.mode,
-                buffered_rows,
-                avg_geom_bytes,
-            );
             log::info!(
                 "[convert] pass 2: building {n} overview level(s) from a single read{}",
                 if stream_last {
@@ -1707,6 +1757,7 @@ fn run_pass2_levels(
                     fanout(&hints[..buffered]),
                     buffered,
                 );
+                ledger = budget;
                 let result = pipeline::run_pass2_buffered(
                     writer,
                     &ctxs[..buffered],
@@ -1719,6 +1770,8 @@ fn run_pass2_levels(
                         window: grants.window.units,
                     },
                     BufferOptions {
+                        // The run's own profile: it picks the spill codec,
+                        // which an `auto` spill keeps raw (#815).
                         profile: options.profile,
                         backing,
                         out_schema,
@@ -1728,11 +1781,17 @@ fn run_pass2_levels(
                             drain_slot_bytes,
                             grants.read.bytes().saturating_add(grants.window.bytes()),
                         ),
+                        budget,
                     },
                 );
                 grants.release(&mut budget);
                 let result = result?;
                 sink_measurement = result.sink;
+                if sink_measurement.downgraded {
+                    // #815: a downgraded `auto` reads its finest level as
+                    // `bounded` does.
+                    read_tuning.profile = super::level::MemoryProfile::Bounded;
+                }
                 (result.levels, result.timers)
             } else {
                 (Vec::new(), Pass2Timers::default())
@@ -1745,6 +1804,9 @@ fn run_pass2_levels(
                     fanout(&hints[n - 1..]),
                     1,
                 );
+                if buffered == 0 {
+                    ledger = budget;
+                }
                 let finest = write_level_streaming(
                     writer,
                     n - 1,
@@ -1772,7 +1834,7 @@ fn run_pass2_levels(
             (stats, engine_timers)
         }
     };
-    Ok((level_stats, engine_timers, sink_measurement))
+    Ok((level_stats, engine_timers, sink_measurement, ledger))
 }
 
 /// Fold every emitted level's [`LevelStat`] into the shared bookkeeping
@@ -2023,7 +2085,7 @@ fn pass2_coalesce(
         options,
     } = inputs;
     let Some(build) = prebuilt else {
-        return Ok((vec![None; kept], false));
+        return Ok(((0..kept).map(|_| None).collect(), false));
     };
     let mut by_level = build.tables;
     let tables = planned[..kept]
@@ -2100,11 +2162,12 @@ fn create_level_writer(
     let encodes = budget.encode_concurrency(
         options.profile,
         rayon::current_num_threads(),
-        encode_price(&writer_opts, &level_row_counts, row_bytes, 1),
+        encode_price(&writer_opts, &level_row_counts, options.mode, row_bytes, 1),
     );
     let drain_slot_bytes = encode_price(
         &writer_opts,
         &level_row_counts,
+        options.mode,
         row_bytes,
         super::writer::WKB_ENCODE_CHUNK_ROWS as u64,
     )
@@ -2150,14 +2213,13 @@ const ENCODE_COPIES: u64 = 5;
 /// What one in-flight row-group encode holds (#545): [`ENCODE_COPIES`] of
 /// the level's largest row group. Row-group sizes follow
 /// the writer's own per-level split ([`super::writer::projected_row_groups`]);
-/// a row is priced at the footers' bytes per input row (an upper bound for
-/// a simplified level), or at [`MemoryBudget::estimate`]'s sink row without
-/// them. A group is priced at `min_rows` at least: a pass-2 drain slot (#817
+/// a row is priced as the sink prices it ([`MemoryBudget::output_row_bytes`]). A group is priced at `min_rows` at least: a pass-2 drain slot (#817
 /// B1) also admits one WKB chunk of up to
 /// [`WKB_ENCODE_CHUNK_ROWS`](super::writer::WKB_ENCODE_CHUNK_ROWS) rows.
 fn encode_price(
     writer_opts: &OverviewWriterOptions,
     level_row_counts: &[usize],
+    mode: Mode,
     row_bytes: Option<u64>,
     min_rows: u64,
 ) -> Price {
@@ -2180,20 +2242,14 @@ fn encode_price(
         .unwrap_or(0)
         .max(1) as u64;
     let largest = largest.max(min_rows);
-    match row_bytes {
-        Some(row) => Price::new(
-            largest
-                .saturating_mul(row)
-                .saturating_mul(ENCODE_COPIES)
-                .max(1),
-            PriceBasis::Footer,
-        ),
-        None => Price::model(
-            MemoryBudget::with_available(None)
-                .estimate(MemoryPhase::Write, largest, None)
-                .saturating_mul(ENCODE_COPIES)
-                .max(1),
-        ),
+    let bytes = largest
+        .saturating_mul(MemoryBudget::with_available(None).output_row_bytes(mode, None, row_bytes))
+        .saturating_mul(ENCODE_COPIES)
+        .max(1);
+    if row_bytes.is_some() {
+        Price::new(bytes, PriceBasis::Footer)
+    } else {
+        Price::model(bytes)
     }
 }
 
@@ -2283,7 +2339,7 @@ fn coalesce_level_counts(
     let finest = level_specs.len().saturating_sub(1);
     let line_bytes: u64 = scratch.geoms.iter().map(collected_line_bytes).sum();
     let budget = memory.allowance(options.profile);
-    let wave = chain_stage_wave(level_specs.len(), line_bytes, budget);
+    let wave = chain_stage_wave(level_specs.len(), scratch.rows.len(), line_bytes, budget);
     coalesce_level_counts_in_waves(
         scratch,
         CoalesceCountPlan {
@@ -2302,19 +2358,24 @@ fn coalesce_level_counts(
 /// pieces and sorted endpoint incidences, the merged chain runs, and the
 /// simplified table. Measured on 1.5M 7-vertex lines (240 MiB modelled):
 /// ≈310 MiB per concurrently running level, about 1.3×; 2 leaves headroom
-/// for longer merged strokes.
+/// for longer merged strokes. Since #851 one level holds about 0.8× on
+/// Overture segments. What every level shares (the scratch and the exact
+/// join, [`chain_stage_resident_bytes`]) comes off the budget first.
 const CHAIN_STAGE_TRANSIENT_FACTOR: u64 = 2;
 
 /// How many levels' chain stages [`coalesce_level_counts`] runs at once:
-/// `budget` over one level's modelled transient, clamped to `1..=levels`.
-/// No line bytes (or an unbounded `speed` budget) means no bound.
-fn chain_stage_wave(levels: usize, line_bytes: u64, budget: u64) -> usize {
+/// what `budget` holds beyond the stage's resident bytes
+/// ([`chain_stage_resident_bytes`] of `lines` lines, `line_bytes` modelled),
+/// over one level's modelled transient, clamped to `1..=levels`. No line
+/// bytes (or an unbounded `speed` budget) means no bound.
+fn chain_stage_wave(levels: usize, lines: usize, line_bytes: u64, budget: u64) -> usize {
     let levels = levels.max(1);
     let per_level = line_bytes.saturating_mul(CHAIN_STAGE_TRANSIENT_FACTOR);
     if per_level == 0 {
         return levels;
     }
-    usize::try_from(budget / per_level)
+    let free = budget.saturating_sub(chain_stage_resident_bytes(lines, line_bytes));
+    usize::try_from(free / per_level)
         .unwrap_or(usize::MAX)
         .clamp(1, levels)
 }
@@ -2816,6 +2877,9 @@ fn preflight_with_memory_limit(
         options.shard.as_ref(),
         crs,
     )?;
+    if let Some(selection) = &selected_row_groups {
+        source.release_unselected(selection)?;
+    }
     diagnostics.set_input_rows(source.stream_row_locator(selected_row_groups.as_ref())?);
     let row_groups_read = selected_row_groups
         .as_ref()
@@ -3575,13 +3639,31 @@ fn log_rss_true_peak_if_notable(boundary_peak_mib: Option<f64>, report: &Option<
 /// JSON. Pulled out of [`run_stages`] for clippy's
 /// function-length ceiling; called once, right after the last `log_phase`.
 fn finish_convert_rss(mut rss: RssTracker) -> (Option<f64>, Option<RssSamplerReport>) {
-    let peak_rss_mib = rss.boundary_peak_mib;
+    // The kernel's mark sees between the boundaries too, once
+    // `RssTracker::new` restarted it for this run.
+    let hwm_mib = rss
+        .hwm_reset
+        .then(|| {
+            super::procmem::read_proc_status()?
+                .hwm_kib
+                .map(|k| k as f64 / 1024.0)
+        })
+        .flatten();
+    let peak_rss_mib = [rss.boundary_peak_mib, hwm_mib]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max);
     log::info!(
         "[rss] convert peak: {}",
         peak_rss_mib.map_or_else(|| "unknown".to_string(), |v| format!("{v:.0} MiB"))
     );
     let rss_sampler_report = rss.finish_sampler();
     log_rss_true_peak_if_notable(peak_rss_mib, &rss_sampler_report);
+    // Never below what the sampler saw either.
+    let peak_rss_mib = peak_rss_mib
+        .into_iter()
+        .chain(rss_sampler_report.as_ref().map(|r| r.true_peak_mib))
+        .reduce(f64::max);
     (peak_rss_mib, rss_sampler_report)
 }
 
@@ -3724,6 +3806,7 @@ pub(crate) fn run_stages(
         SpillPlan {
             emitted,
             finest,
+            input_rows: num_rows,
             row_bytes,
             avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
         },
@@ -3756,6 +3839,17 @@ pub(crate) fn run_stages(
         },
         diagnostics,
     )?;
+    // #305: the footers' geometry weight and row price size the RAM-vs-spill
+    // estimate. Decided after the writer's encode grant, as always.
+    let backing = pipeline::resolve_backing(
+        budget,
+        options.profile,
+        options.mode,
+        buffered_rows(emitted, finest, options),
+        shared_sink_rows(options, buffered_levels(emitted, finest, options), num_rows),
+        (num_rows > 0).then(|| geom_bytes / num_rows as u64),
+        row_bytes,
+    );
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
     // Pass-1 O(N) scratch has been freed by here; this marks the memory floor
@@ -3801,7 +3895,7 @@ pub(crate) fn run_stages(
     // the caller left it at IN_FLIGHT_BATCHES_AUTO) and surface it (#264).
     let in_flight_batches = resolve_and_log_in_flight_batches("pass 2", options.in_flight_batches);
 
-    let (level_stats, pass2_engine_timers, sink_measurement) = run_pass2_levels(
+    let (level_stats, pass2_engine_timers, sink_measurement, pass2_ledger) = run_pass2_levels(
         budget,
         &mut writer,
         &ctxs,
@@ -3817,12 +3911,21 @@ pub(crate) fn run_stages(
             footer,
             encode,
             drain_slot_bytes,
+            backing,
         },
         strategy,
     )?;
 
-    // The chain tables hold every level's simplified strokes: free them
-    // across the pool, not serially at scope end (#817 T1).
+    // Pass 2 moved every chain's geometry out as it emitted the rep (#851);
+    // what is left is the reps' counts and the maps' slots.
+    debug_assert!(
+        coalesce_tables
+            .iter()
+            .flatten()
+            .flat_map(|t| t.values())
+            .all(|(g, _)| g.lock().is_ok_and(|g| g.is_none())),
+        "pass 2 left a chain rep unemitted"
+    );
     drop(ctxs);
     // Per table: flattening the maps into one Vec would add a copy of every
     // entry at the end of the run.
@@ -3890,6 +3993,7 @@ pub(crate) fn run_stages(
             in_flight_batches,
             sink_measurement,
             spill_reservation,
+            pass2_ledger,
             pass1_memory: preflight_report,
             pass0,
         },
@@ -3999,6 +4103,8 @@ struct ProfileJsonContext<'a> {
     sink_measurement: pipeline::SinkMeasurement,
     /// #716: the spill page-cache reservation (`pass2.spill_reservation`).
     spill_reservation: SpillReservation,
+    /// The budget while pass 2's first read held its grants (`pass2.budget`).
+    pass2_ledger: MemoryBudget,
     /// #543 + #626 item 4: the pass-1 memory preflight's verdict.
     pass1_memory: super::convert::Pass1MemoryReport,
     /// #788: what pass 0 staged; `None` for local input.
@@ -4043,6 +4149,7 @@ fn emit_profile_json(ctx: ProfileJsonContext<'_>, diagnostics: &crate::diagnosti
             in_flight_batches: ctx.in_flight_batches,
             sink_measurement: ctx.sink_measurement,
             spill_reservation: ctx.spill_reservation,
+            pass2_ledger: ctx.pass2_ledger,
             pass1_memory: ctx.pass1_memory,
             pass0: ctx.pass0,
         },
@@ -4100,6 +4207,8 @@ struct ProfileJsonInputs<'a> {
     sink_measurement: pipeline::SinkMeasurement,
     /// #716: the spill page-cache reservation (`pass2.spill_reservation`).
     spill_reservation: SpillReservation,
+    /// The budget while pass 2's first read held its grants (`pass2.budget`).
+    pass2_ledger: MemoryBudget,
     /// #543 + #626 item 4: the pass-1 memory preflight's verdict
     /// (`pass1_memory_preflight` in the dump).
     pass1_memory: super::convert::Pass1MemoryReport,
@@ -4262,6 +4371,9 @@ fn write_profile_json(
             // #716: the spill's page cache, reserved from the budget before
             // any pass-2 grant when a cgroup charges it and the spill fits
             // the allowance; `reason` says why it was or was not.
+            // The memory ledger while pass 2's first read held its grants:
+            // every phase's reservation and grant, and the totals.
+            "budget": inputs.pass2_ledger.ledger_json(),
             "spill_reservation": {
                 "estimate_bytes": inputs.spill_reservation.estimate_bytes,
                 "reserved_bytes": inputs.spill_reservation.reserved_bytes,
@@ -5931,7 +6043,7 @@ impl LineScratch {
             geoms: Vec::new(),
             lines: 0,
             bytes: 0,
-            max_rows: options.coalesce_max_level_rows,
+            max_rows: super::convert::coalesce_max_rows(options),
             max_bytes: super::convert::coalesce_max_geom_bytes(options),
         }
     }
@@ -6795,100 +6907,110 @@ fn write_level_streaming(
     // the borrow and leave `level_timers` owned here for the post-scope read
     // and the return value below.
     let (read_depth, _) = split_in_flight(in_flight);
-    let outcome = scoped_pipe(
-        window.min(STREAMED_OUTPUT_DEPTH),
-        // Producer: read + process, in order, until EOF or the writer
-        // hangs up. Returns the first stream/processing error, if any.
-        // Everything the closure touches (`source`, `ctx`, `&timers`,
-        // `row_groups`, the `usize`s) is `Copy`, so the outer bindings —
-        // notably `timers`, read back afterwards — stay valid.
-        |tx: &Sender<Processed>| -> Result<(), ConvertError> {
-            scoped_pipe(
-                read_depth,
-                // Reader: the raw input batches, in order.
-                |read_tx: &Sender<(RecordBatch, usize)>| -> Result<(), ConvertError> {
-                    // Heartbeat (#242): the finest level re-streams the whole
-                    // input; keep the operator informed on planet-scale files
-                    // (quiet on small ones).
-                    let mut last_progress = Instant::now();
-                    // Regional extract (#102): read the same per-part
-                    // bbox-selected row groups as pass 1, so the winner
-                    // tables' global row indices line up. One reader, or
-                    // several merged back into the identical batch sequence
-                    // (#494) — `read_tuning` decides, and the decision never
-                    // reaches the output.
-                    source.read(
-                        row_groups,
-                        None,
-                        read_tuning,
-                        &mut |batch, offset, read_dur| {
-                            if last_progress.elapsed().as_secs() >= 10 {
-                                last_progress = Instant::now();
-                                log::info!(
-                                    "[convert] level {level_idx}: {offset} input row(s) scanned"
-                                );
-                            }
-                            Pass2Timers::add_dur(&timers.read, read_dur);
-                            // Processor gone (it, or the writer behind it,
-                            // stopped): stop; its error is reported by the
-                            // caller.
-                            Ok(if read_tx.send((batch, offset)).is_err() {
-                                ReadFlow::Stop
-                            } else {
-                                ReadFlow::Continue
-                            })
-                        },
-                    )
-                },
-                // Processor: a window of batches at a time, emitted in order.
-                |read_rx: Receiver<(RecordBatch, usize)>| -> Result<(), ConvertError> {
-                    let stats = for_each_window(
-                        &read_rx,
-                        window,
-                        |(batch, offset)| process_level_batch(batch, *offset, ctx, timers),
-                        |_, out| match out {
-                            // No members of this level in the batch.
-                            None => Ok(ReadFlow::Continue),
-                            // Writer gone (it errored and dropped the
-                            // receiver): stop; the writer's error is reported
-                            // by the caller.
-                            Some((batch, verts)) => {
-                                Ok(if tx.send(Processed { batch, verts }).is_err() {
+    let process =
+        |(batch, offset): &(RecordBatch, usize)| process_level_batch(batch, *offset, ctx, timers);
+    // Capture the caller's pool before entering the standard helper thread.
+    // in_place_scope keeps the writer here even for a plain-thread caller.
+    let outcome = rayon::in_place_scope(|scope| {
+        scoped_pipe(
+            window.min(STREAMED_OUTPUT_DEPTH),
+            // Producer: read + process, in order, until EOF or the writer
+            // hangs up. Its first stream/processing error goes to the writer in
+            // order, so the level ends unwritten.
+            // Everything the closure touches (`source`, `ctx`, `&timers`,
+            // `row_groups`, the `usize`s) is `Copy`, so the outer bindings —
+            // notably `timers`, read back afterwards — stay valid.
+            |tx: &Sender<Result<Processed, ConvertError>>| -> Result<(), ConvertError> {
+                let produced = scoped_pipe(
+                    read_depth,
+                    // Reader: the raw input batches, in order.
+                    |read_tx: &Sender<(RecordBatch, usize)>| -> Result<(), ConvertError> {
+                        // Heartbeat (#242): the finest level re-streams the whole
+                        // input; keep the operator informed on planet-scale files
+                        // (quiet on small ones).
+                        let mut last_progress = Instant::now();
+                        // Regional extract (#102): read the same per-part
+                        // bbox-selected row groups as pass 1, so the winner
+                        // tables' global row indices line up. One reader, or
+                        // several merged back into the identical batch sequence
+                        // (#494) — `read_tuning` decides, and the decision never
+                        // reaches the output.
+                        source.read(
+                            row_groups,
+                            None,
+                            read_tuning,
+                            &mut |batch, offset, read_dur| {
+                                if last_progress.elapsed().as_secs() >= 10 {
+                                    last_progress = Instant::now();
+                                    log::info!(
+                                        "[convert] level {level_idx}: {offset} input row(s) scanned"
+                                    );
+                                }
+                                Pass2Timers::add_dur(&timers.read, read_dur);
+                                // Processor gone (it, or the writer behind it,
+                                // stopped): stop; its error is reported by the
+                                // caller.
+                                Ok(if read_tx.send((batch, offset)).is_err() {
                                     ReadFlow::Stop
                                 } else {
                                     ReadFlow::Continue
                                 })
-                            }
-                        },
-                    )?;
-                    timers.record_windows(stats);
-                    Ok(())
-                },
-            )
-        },
-        // Writer (this thread): drain processed batches in order. Dropping
-        // the producer's sender (EOF, error, or writer-gone) fuses `recv`;
-        // `scoped_pipe` owns the mirror-image guarantee that this receiver is
-        // dropped before the producer is joined (#362).
-        |rx: Receiver<Processed>| -> Result<LevelWriteOutcome, ConvertError> {
-            let batches = std::iter::from_fn(|| {
-                let t_wait = Instant::now();
-                match rx.recv() {
-                    Ok(msg) => {
-                        recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
+                            },
+                        )
+                    },
+                    // Processor: a window of batches at a time, emitted in order.
+                    |read_rx: Receiver<(RecordBatch, usize)>| -> Result<(), ConvertError> {
+                        let stats = for_each_window_on_pool(
+                            scope,
+                            &read_rx,
+                            window,
+                            &process,
+                            |_, out| match out {
+                                // No members of this level in the batch.
+                                None => Ok(ReadFlow::Continue),
+                                // Writer gone (it errored and dropped the
+                                // receiver): stop; the writer's error is reported
+                                // by the caller.
+                                Some((batch, verts)) => {
+                                    Ok(if tx.send(Ok(Processed { batch, verts })).is_err() {
+                                        ReadFlow::Stop
+                                    } else {
+                                        ReadFlow::Continue
+                                    })
+                                }
+                            },
+                        )?;
+                        timers.record_windows(stats);
+                        Ok(())
+                    },
+                );
+                if let Err(e) = produced {
+                    // The writer is gone when this fails; its error is reported.
+                    let _ = tx.send(Err(e));
+                }
+                Ok(())
+            },
+            // Writer (this thread): drain processed batches in order. Dropping
+            // the producer's sender (EOF, error, or writer-gone) fuses `recv`;
+            // `scoped_pipe` owns the mirror-image guarantee that this receiver is
+            // dropped before the producer is joined (#362). The producer's
+            // windows run on the caller's pool, so a pool worker waiting here helps
+            // run them (`tests/rayon_global_pool_reentry.rs`).
+            |rx: Receiver<Result<Processed, ConvertError>>| -> Result<LevelWriteOutcome, ConvertError> {
+                let batches = std::iter::from_fn(|| {
+                    let t_wait = Instant::now();
+                    let msg = recv_in_pool(&rx).ok();
+                    recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
+                    Some(msg?.map(|msg| {
                         rows.set(rows.get() + msg.batch.num_rows());
                         vertices.set(vertices.get() + msg.verts);
-                        Some(msg.batch)
-                    }
-                    Err(_) => {
-                        recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
-                        None
-                    }
-                }
-            });
-            Ok(writer.write_level(level_idx, Some(hint), batches)?)
-        },
-    )?;
+                        msg.batch
+                    }))
+                });
+                writer.write_level_from(level_idx, Some(hint), batches)
+            },
+        )
+    })?;
     let total = t_level.elapsed().as_secs_f64();
     let read_s = Pass2Timers::secs(&timers.read);
     let decode_s = Pass2Timers::secs(&timers.decode);
@@ -7001,9 +7123,11 @@ pub(super) fn process_level_batch(
             .par_iter()
             .zip(&selected)
             .map(|(g, &i)| {
-                if let Some((merged, _)) = ctx.coalesce_table.and_then(|t| t.get(&(row_offset + i)))
+                if let Some(merged) = ctx
+                    .coalesce_table
+                    .and_then(|t| take_chain_geometry(t, row_offset + i))
                 {
-                    Simplified::Keep(merged.clone())
+                    Simplified::Keep(merged)
                 } else if ctx.is_carrier_row(row_offset + i) {
                     // #384: a carrier stands in for its neighbourhood's
                     // dropped area as one placeholder square.
@@ -7099,6 +7223,108 @@ fn assemble_level_batch(
     Ok(out_batch)
 }
 
+/// One level's kept batch rows, their geometries and vertex count.
+type LevelSelection = (Vec<usize>, Vec<Arc<Geometry<f64>>>, usize);
+
+/// One level's positions in the shared rows, and its geometries in the
+/// shared geometry column.
+type LevelPositions = (UInt32Array, pipeline::LevelGeometry);
+
+/// The rows and geometries the levels built from `batch` share (#852), and
+/// each level's positions in them. With `pool`, a geometry several levels
+/// keep (the same `Arc`, #499) is encoded once and each level indexes the
+/// pool; otherwise the levels' geometries are encoded back to back, each
+/// level a range of them.
+fn share_rows(
+    batch: &RecordBatch,
+    ctxs: &[LevelStreamCtx<'_>],
+    selections: &[LevelSelection],
+    pool: bool,
+) -> Result<(Arc<pipeline::SharedRows>, Vec<LevelPositions>), ConvertError> {
+    let finest = ctxs.last().expect("a cascade has levels");
+    // One geometry column serves every level, so they must type it alike.
+    debug_assert!(ctxs.iter().all(|c| c.geom_idx == finest.geom_idx
+        && c.source_schema.field(c.geom_idx) == finest.source_schema.field(finest.geom_idx)));
+    let (geometries, positions): (Vec<&Geometry<f64>>, Vec<pipeline::LevelGeometry>) = if pool {
+        let (pool, positions) =
+            geometry_pool(selections.iter().map(|(_, geoms, _)| geoms.as_slice()));
+        (
+            pool,
+            positions
+                .into_iter()
+                .map(pipeline::LevelGeometry::Pool)
+                .collect(),
+        )
+    } else {
+        let mut start = 0;
+        let ranges = selections
+            .iter()
+            .map(|(_, geoms, _)| {
+                start += geoms.len();
+                pipeline::LevelGeometry::Range(start - geoms.len(), geoms.len())
+            })
+            .collect();
+        let all = selections
+            .iter()
+            .flat_map(|(_, geoms, _)| geoms.iter().map(AsRef::as_ref))
+            .collect();
+        (all, ranges)
+    };
+    let geometry = build_geometry_column(finest.source_schema, finest.geom_idx, &geometries)?;
+    let kept: Vec<&[usize]> = selections
+        .iter()
+        .map(|(kept, _, _)| kept.as_slice())
+        .collect();
+    let (rows, index) = pipeline::SharedRows::new(batch, finest.non_geom_cols, &kept, geometry)?;
+    Ok((Arc::new(rows), index.into_iter().zip(positions).collect()))
+}
+
+/// The least share of a batch's level geometries that must reuse another
+/// level's allocation (#499) for a pool, in thousandths. Below it the pool's
+/// hash and the drain's rebuild of every pooled geometry cost more pass-2
+/// time than the RAM it saves is worth (simplified polygons: every level's
+/// geometry is its own allocation), and the levels' geometries go back to
+/// back instead, each level written as a slice of them.
+const POOL_MIN_SHARED: u64 = 250;
+
+/// Whether a batch whose levels keep `kept` geometries, `reused` of them the
+/// finer level's allocation, pools them ([`POOL_MIN_SHARED`]).
+fn pool_pays(reused: u64, kept: usize) -> bool {
+    reused > 0 && reused * 1000 >= kept as u64 * POOL_MIN_SHARED
+}
+
+#[cfg(test)]
+thread_local! {
+    // Geometry pools hashed on this thread.
+    static POOL_BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Each distinct geometry (by allocation) the `levels` keep, in first-kept
+/// order, and each level's positions in it.
+fn geometry_pool<'a>(
+    levels: impl Iterator<Item = &'a [Arc<Geometry<f64>>]>,
+) -> (Vec<&'a Geometry<f64>>, Vec<UInt32Array>) {
+    #[cfg(test)]
+    POOL_BUILDS.with(|c| c.set(c.get() + 1));
+    let mut slot: std::collections::HashMap<*const Geometry<f64>, u32> =
+        std::collections::HashMap::new();
+    let mut pool: Vec<&Geometry<f64>> = Vec::new();
+    let positions = levels
+        .map(|geoms| {
+            geoms
+                .iter()
+                .map(|g| {
+                    *slot.entry(Arc::as_ptr(g)).or_insert_with(|| {
+                        pool.push(g);
+                        u32::try_from(pool.len() - 1).expect("batch geometries fit in u32")
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    (pool, positions)
+}
+
 /// One cascade-fold step's result, sharing (`Arc`) the kept geometry instead
 /// of owning a deep clone (#499).
 ///
@@ -7141,7 +7367,8 @@ pub(super) fn process_batch_cascade(
     row_offset: usize,
     ctxs: &[LevelStreamCtx<'_>],
     timers: &Pass2Timers,
-) -> Result<Vec<Option<(RecordBatch, usize)>>, ConvertError> {
+    share: bool,
+) -> Result<Vec<Option<(pipeline::LevelBatch, usize)>>, ConvertError> {
     let Some(finest) = ctxs.last() else {
         return Ok(Vec::new());
     };
@@ -7230,17 +7457,18 @@ pub(super) fn process_batch_cascade(
     // this `zip` (an `IndexedParallelIterator`) preserves ascending `pos`
     // order exactly like the pre-#499 `Vec<Vec<Simplified>>` collect did —
     // load-bearing, since `folds[pos]` below is indexed by that position.
-    // The two per-feature counters (#499's `identical_steps` profile metric)
-    // are summed in a plain sequential pass after collecting, rather than
-    // via a rayon `fold`/`reduce` that could reorder `folds`.
-    let per_feature: Vec<(Vec<SharedStep>, u64, u64)> = geoms
+    // The per-feature counters (#499's `identical_steps` profile metric, and
+    // the steps that reuse the previous level's geometry, which decide the
+    // pool) are summed in a plain sequential pass after collecting, rather
+    // than via a rayon `fold`/`reduce` that could reorder `folds`.
+    let per_feature: Vec<(Vec<SharedStep>, u64, u64, u64)> = geoms
         .par_iter()
         .zip(&selected)
         .map(|(g, &i)| {
             let ml = finest.min_levels[row_offset + i];
             let mut out: Vec<SharedStep> = Vec::with_capacity(ctxs.len());
             let mut fold = CascadeFold::new();
-            let (mut shared, mut total) = (0u64, 0u64);
+            let (mut shared, mut total, mut reused) = (0u64, 0u64, 0u64);
             // #541: walk the unmaterialized fine steps first, so the finest
             // buffered ctx folds from the same working geometry a full run
             // would have handed it — the same `CascadeFold` steps
@@ -7269,21 +7497,29 @@ pub(super) fn process_batch_cascade(
                         if s {
                             shared += 1;
                         }
+                        // Not `s` alone: the first kept step shares the
+                        // decoded geometry, which no other level keeps.
+                        if matches!(out.last(), Some(SharedStep::Keep(p)) if Arc::ptr_eq(p, &geom))
+                        {
+                            reused += 1;
+                        }
                         out.push(SharedStep::Keep(geom));
                     }
                     FoldStep::Dropped => out.push(SharedStep::Dropped),
                 }
             }
-            (out, shared, total)
+            (out, shared, total, reused)
         })
         .collect();
     let mut folds: Vec<Vec<SharedStep>> = Vec::with_capacity(per_feature.len());
     let mut shared_count = 0u64;
     let mut total_count = 0u64;
-    for (out, s, t) in per_feature {
+    let mut reused_count = 0u64;
+    for (out, s, t, r) in per_feature {
         folds.push(out);
         shared_count += s;
         total_count += t;
+        reused_count += r;
     }
     timers.record_cascade_steps(shared_count, total_count);
     Pass2Timers::add(&timers.simplify, t_simplify);
@@ -7291,7 +7527,8 @@ pub(super) fn process_batch_cascade(
     // --- Assemble every level's batch, in the per-level selection's
     // ascending row order (chain reps interleaved by global row index).
     let t_build = Instant::now();
-    let results: Vec<Result<Option<(RecordBatch, usize)>, ConvertError>> = ctxs
+    // Per level: its kept batch rows, their geometries, and their vertices.
+    let selections: Vec<LevelSelection> = ctxs
         .par_iter()
         .enumerate()
         .map(|(li, ctx)| {
@@ -7303,10 +7540,10 @@ pub(super) fn process_batch_cascade(
                 let g = row_offset + i;
                 if let Some(table) = ctx.coalesce_table {
                     if ctx.kinds.expect("kinds present when coalescing")[g] == FeatureKind::Line {
-                        if let Some((merged, _)) = table.get(&g) {
-                            verts += count_vertices(merged);
+                        if let Some(merged) = take_chain_geometry(table, g) {
+                            verts += count_vertices(&merged);
                             kept_idx.push(i);
-                            kept_geoms.push(Arc::new(merged.clone()));
+                            kept_geoms.push(Arc::new(merged));
                         }
                         continue;
                     }
@@ -7333,11 +7570,56 @@ pub(super) fn process_batch_cascade(
                     }
                 }
             }
+            (kept_idx, kept_geoms, verts)
+        })
+        .collect();
+    // #852: the levels share their rows' properties, except where clustering
+    // rewrites the accumulate columns per level, and their geometries when
+    // they reuse enough of one another's. Chain geometries and carrier
+    // squares are fresh allocations: kept, never reused.
+    let kept: usize = selections.iter().map(|(_, geoms, _)| geoms.len()).sum();
+    let pool = pool_pays(reused_count, kept);
+    let shared = (share && !finest.cluster_enabled)
+        .then(|| share_rows(batch, ctxs, &selections, pool))
+        .transpose()?;
+    let results: Vec<Result<Option<(pipeline::LevelBatch, usize)>, ConvertError>> = selections
+        .into_par_iter()
+        .zip(ctxs)
+        .enumerate()
+        .map(|(li, ((kept_idx, kept_geoms, verts), ctx))| {
             if kept_idx.is_empty() {
                 return Ok(None);
             }
-            let out_batch = assemble_level_batch(batch, row_offset, ctx, &kept_idx, &kept_geoms)?;
-            Ok(Some((out_batch, verts)))
+            let out = match &shared {
+                Some((rows, geometry)) => {
+                    let mut own = Vec::new();
+                    let schema = if ctx.coalesce_enabled {
+                        let globals: Vec<usize> =
+                            kept_idx.iter().map(|&i| row_offset + i).collect();
+                        own.push(coalesced_count_column(&globals, ctx.coalesce_table));
+                        ctx.out_schema
+                    } else {
+                        ctx.source_schema
+                    };
+                    let (index, geometry) = &geometry[li];
+                    pipeline::LevelBatch::shared(
+                        Arc::new(schema.clone()),
+                        rows,
+                        index.clone(),
+                        geometry.clone(),
+                        ctx.geom_idx,
+                        own,
+                    )
+                }
+                None => pipeline::LevelBatch::Owned(assemble_level_batch(
+                    batch,
+                    row_offset,
+                    ctx,
+                    &kept_idx,
+                    &kept_geoms,
+                )?),
+            };
+            Ok(Some((out, verts)))
         })
         .collect();
     Pass2Timers::add(&timers.build, t_build);
@@ -7353,6 +7635,155 @@ pub(super) fn process_batch_cascade(
 
 #[cfg(test)]
 mod tests {
+    /// #852: a geometry several levels keep unchanged (one `Arc`, #499) is
+    /// pooled once, and each level indexes its own geometries in order.
+    #[test]
+    fn levels_pool_a_geometry_they_share_once() {
+        let pt = |x: f64| Arc::new(Geometry::Point(geo::Point::new(x, 0.0)));
+        let (a, b, c) = (pt(1.0), pt(2.0), pt(3.0));
+        // Finest keeps a, b; the next keeps a unchanged and a simplified b
+        // (equal value, its own allocation); the coarsest keeps a and c.
+        let b2 = pt(2.0);
+        let levels = [
+            vec![Arc::clone(&a), Arc::clone(&b)],
+            vec![Arc::clone(&a), Arc::clone(&b2)],
+            vec![Arc::clone(&a), Arc::clone(&c)],
+        ];
+        let (pool, positions) = geometry_pool(levels.iter().map(Vec::as_slice));
+        assert_eq!(pool.len(), 4, "a pooled once; b, b2, c each");
+        for (level, pos) in levels.iter().zip(&positions) {
+            let got: Vec<&Geometry<f64>> = pos.values().iter().map(|&p| pool[p as usize]).collect();
+            let want: Vec<&Geometry<f64>> = level.iter().map(AsRef::as_ref).collect();
+            assert_eq!(got, want);
+        }
+    }
+
+    /// A pool takes a quarter of the batch's level geometries reusing the
+    /// finer level's, and at least one.
+    #[test]
+    fn a_pool_takes_a_quarter_of_the_geometries_reused() {
+        assert!(!pool_pays(0, 0));
+        assert!(!pool_pays(0, 12));
+        assert!(!pool_pays(2, 12));
+        assert!(pool_pays(3, 12));
+        assert!(pool_pays(1, 1));
+    }
+
+    /// The cascade over a two-level ladder of `geoms` (every row a member of
+    /// both), how many geometry pools it hashed, and how many steps shared
+    /// their input (#499's counter).
+    fn cascade_two_levels(
+        geoms: &[Geometry<f64>],
+        (fine, coarse): (f64, f64),
+    ) -> (Vec<Option<(pipeline::LevelBatch, usize)>>, u32, u64) {
+        use geoarrow::array::GeometryBuilder;
+        use geoarrow::datatypes::GeometryType;
+        use geoarrow_array::GeoArrowArray;
+        let mut builder =
+            GeometryBuilder::new(GeometryType::new(Default::default())).with_prefer_multi(false);
+        builder.extend_from_iter(geoms.iter().map(Some));
+        let geometry = builder.finish();
+        let schema = Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            geometry.data_type().to_field("geometry", true),
+        ]);
+        let n = geoms.len();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(arrow_array::Int64Array::from_iter_values(0..n as i64)),
+                geometry.to_array_ref(),
+            ],
+        )
+        .unwrap();
+        let min_levels = vec![0u8; n];
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let simplify = SimplifyOptions::default();
+        let chain = [CascadeStep::geom(fine), CascadeStep::geom(coarse)];
+        let level = |orig_level: u8, gsd_m: f64, cascade_chain| LevelStreamCtx {
+            diagnostics: &diagnostics,
+            source_schema: &schema,
+            cluster_schema: &schema,
+            out_schema: &schema,
+            non_geom_cols: &[0],
+            geom_idx: 1,
+            min_levels: &min_levels,
+            orig_level,
+            duplicating: true,
+            verbatim: false,
+            gsd_m,
+            zoom: None,
+            repr: Representation::Geometry,
+            crs: Crs::Epsg4326,
+            simplify: &simplify,
+            cluster_enabled: false,
+            cluster_table: None,
+            acc_cols: &[],
+            category_col: None,
+            coalesce_enabled: false,
+            kinds: None,
+            coalesce_table: None,
+            cascade_chain,
+            carriers: &[],
+        };
+        // Coarse→fine; each level's chain runs from the finest down to it.
+        let ctxs = [level(0, coarse, &chain[..]), level(1, fine, &chain[..1])];
+        let before = POOL_BUILDS.with(std::cell::Cell::get);
+        let timers = Pass2Timers::default();
+        let out = process_batch_cascade(&batch, 0, &ctxs, &timers, true).unwrap();
+        (
+            out,
+            POOL_BUILDS.with(std::cell::Cell::get) - before,
+            timers.cascade_steps_shared.load(Ordering::Relaxed),
+        )
+    }
+
+    /// #852: a batch pools its level geometries only when the levels reuse
+    /// one another's (#499); otherwise it holds them back to back in one
+    /// column, each level a range of it, and hashes no pool at all.
+    #[test]
+    fn a_batch_pools_level_geometries_only_when_levels_reuse_them() {
+        let pooled =
+            |out: &[Option<(pipeline::LevelBatch, usize)>]| -> Vec<Option<(usize, usize)>> {
+                out.iter()
+                    .map(|o| match o {
+                        Some((pipeline::LevelBatch::Shared { geometry, .. }, _)) => {
+                            match geometry {
+                                pipeline::LevelGeometry::Pool(_) => None,
+                                pipeline::LevelGeometry::Range(at, len) => Some((*at, *len)),
+                            }
+                        }
+                        other => panic!("a shared level batch, got {}", other.is_some()),
+                    })
+                    .collect()
+            };
+        // Points pass every step unchanged: both levels keep one allocation.
+        let points: Vec<Geometry<f64>> = (0..8)
+            .map(|i| Geometry::Point(geo::Point::new(f64::from(i), 0.0)))
+            .collect();
+        let (out, builds, _) = cascade_two_levels(&points, (10.0, 20_000.0));
+        assert_eq!(pooled(&out), [None, None]);
+        assert_eq!(builds, 1);
+        // Zigzag lines the fine step leaves alone (sharing the decoded
+        // geometry, #499's counter) and the coarse step straightens: no two
+        // levels share an allocation, so no pool, and no hash pass for one.
+        let lines: Vec<Geometry<f64>> = (0..8)
+            .map(|i| {
+                let y = f64::from(i);
+                Geometry::LineString(geo::LineString::from(
+                    (0..=20)
+                        .map(|k| (f64::from(k) * 0.05, y + if k % 2 == 0 { 0.0 } else { 0.01 }))
+                        .collect::<Vec<_>>(),
+                ))
+            })
+            .collect();
+        let (out, builds, shared) = cascade_two_levels(&lines, (10.0, 20_000.0));
+        assert_eq!(shared, 8, "the fine step leaves every line alone");
+        // Coarse level first, as the cascade orders them.
+        assert_eq!(pooled(&out), [Some((0, 8)), Some((8, 8))]);
+        assert_eq!(builds, 0, "no pool is hashed for levels that share nothing");
+    }
+
     /// Array-of-structs fixture → the column-major table the engine takes
     /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
     /// pipeline fills a [`FeatureTable`] directly from the scan, so this
@@ -8764,6 +9195,42 @@ mod tests {
             .1
     }
 
+    /// Convert's `peak_rss_mib` includes a spike that rises and falls
+    /// between two boundaries, which the boundary samples cannot see.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn convert_peak_rss_includes_a_spike_between_boundaries() {
+        if !run_alone("convert_peak_rss_includes_a_spike_between_boundaries") {
+            return;
+        }
+        let rss = RssTracker::new(true, "spike");
+        if !rss.hwm_reset {
+            return; // VmHWM not restartable here: only the sampler sees spikes.
+        }
+        let before = super::super::procmem::read_proc_status()
+            .and_then(|m| m.rss_kib)
+            .expect("Linux reports RSS") as f64
+            / 1024.0;
+        let spike = vec![1u8; 256 << 20];
+        std::hint::black_box(&spike);
+        drop(spike);
+        let (peak, _) = finish_convert_rss(rss);
+        let peak = peak.expect("Linux reports a peak");
+        assert!(
+            peak >= before + 200.0,
+            "peak {peak} MiB misses a 256 MiB spike over {before} MiB"
+        );
+    }
+
+    /// Without a reset of this run's `VmHWM`, convert's peak ignores it: the
+    /// process's earlier peak is not this conversion's.
+    #[test]
+    fn convert_peak_rss_ignores_a_vmhwm_it_did_not_reset() {
+        let mut rss = RssTracker::with_sampler(None);
+        rss.boundary_peak_mib = Some(1.0);
+        assert_eq!(finish_convert_rss(rss).0, Some(1.0));
+    }
+
     /// #810: every phase gets its CPU and wall deltas from the boundaries,
     /// in run order, and the tick records a timeline.
     #[test]
@@ -9681,12 +10148,41 @@ mod tests {
     /// the consumer fails, the #362 deadlock shape. Returns the error message
     /// `write_level_streaming` surfaced.
     fn stream_level_into_faulty_writer(faults: EncodeFaults) -> String {
-        const ROWS: usize = 400;
         let tin = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &point_geoms(ROWS), true, None);
+        write_input(tin.path(), &point_geoms(STREAMED_ROWS), true, None);
+        let (streamed, writer) = stream_level(tin.path(), faults);
+        let message = match streamed {
+            // The row-group stage reports its caught panic as a parquet
+            // error, the WKB stage as a geoparquet-encoder one; both are the
+            // writer's own typed error, which is the contract here.
+            Err(ConvertError::Writer(
+                e @ (WriterError::Parquet(_) | WriterError::GeoParquet(_)),
+            )) => e.to_string(),
+            Err(other) => panic!("expected the writer's typed error, got: {other}"),
+            Ok((outcome, rows, _, _)) => {
+                panic!("a failing writer must not report success ({outcome:?}, {rows} rows)")
+            }
+        };
+        assert!(writer.finish().is_err(), "the failed writer stayed usable");
+        message
+    }
+
+    const STREAMED_ROWS: usize = 400;
+
+    /// What [`write_level_streaming`] returns.
+    type Streamed = Result<(LevelWriteOutcome, usize, usize, Pass2Timers), ConvertError>;
+
+    /// [`write_level_streaming`] of `input`'s rows as one verbatim level, in
+    /// 8-row read batches, into a writer armed with `faults`; the result and
+    /// the writer.
+    fn stream_level(
+        input: &Path,
+        faults: EncodeFaults,
+    ) -> (Streamed, OverviewWriter<std::fs::File>) {
+        const ROWS: usize = STREAMED_ROWS;
         let tout = tempfile::NamedTempFile::new().unwrap();
 
-        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let source = ConvertSource::resolve_path(input).unwrap();
         let options = ConvertOptions {
             mode: Mode::Duplicating,
             // Plain columns only: no cluster / coalesce columns to append, so
@@ -9772,7 +10268,7 @@ mod tests {
             footer: None,
             profile: MemoryProfile::Speed,
         };
-        match write_level_streaming(
+        let streamed = write_level_streaming(
             &mut writer,
             0,
             ROWS,
@@ -9784,18 +10280,25 @@ mod tests {
                 row_groups: None,
             },
             &ctx,
-        ) {
-            // The row-group stage reports its caught panic as a parquet
-            // error, the WKB stage as a geoparquet-encoder one; both are the
-            // writer's own typed error, which is the contract here.
-            Err(ConvertError::Writer(
-                e @ (WriterError::Parquet(_) | WriterError::GeoParquet(_)),
-            )) => e.to_string(),
-            Err(other) => panic!("expected the writer's typed error, got: {other}"),
-            Ok((outcome, rows, _, _)) => {
-                panic!("a failing writer must not report success ({outcome:?}, {rows} rows)")
-            }
-        }
+        );
+        (streamed, writer)
+    }
+
+    /// Codex review of #852 F3: a producer failure on the streamed finest
+    /// level (a row that does not decode, behind rows that did) ends the
+    /// level unwritten. The writer used to finish the level with the rows
+    /// before the failure and stay usable, so the file could be finished.
+    #[test]
+    fn a_streamed_level_whose_producer_fails_is_not_finished() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_corrupt_wkb(tin.path(), STREAMED_ROWS, 200);
+        let (streamed, writer) = within("a_streamed_level_whose_producer_fails", move || {
+            let (streamed, writer) = stream_level(tin.path(), EncodeFaults::default());
+            (streamed.map(|_| ()).map_err(|e| e.to_string()), writer)
+        });
+        let err = streamed.expect_err("the level must fail");
+        assert!(!err.contains("poisoned"), "the producer's own error: {err}");
+        assert!(writer.finish().is_err(), "the short level was finished");
     }
 
     /// The finest-level stream (`write_level_streaming`): when the writer —
@@ -9825,14 +10328,26 @@ mod tests {
                 "injected WKB encode panic",
             ),
         ] {
-            let msg = within(
-                "writer_failure_mid_level_surfaces_typed_error_without_deadlock",
-                move || stream_level_into_faulty_writer(faults),
-            );
-            assert!(
-                msg.contains(expect),
-                "{stage}: the writer's own failure must be what surfaces, got: {msg}"
-            );
+            for on_pool in [false, true] {
+                let msg = within(
+                    "writer_failure_mid_level_surfaces_typed_error_without_deadlock",
+                    move || {
+                        if on_pool {
+                            rayon::ThreadPoolBuilder::new()
+                                .num_threads(1)
+                                .build()
+                                .unwrap()
+                                .install(|| stream_level_into_faulty_writer(faults))
+                        } else {
+                            stream_level_into_faulty_writer(faults)
+                        }
+                    },
+                );
+                assert!(
+                    msg.contains(expect),
+                    "{stage}: the writer's own failure must be what surfaces, got: {msg}"
+                );
+            }
         }
     }
 
@@ -10211,6 +10726,31 @@ mod tests {
 
     // ---- #570: the chain tables are built once, in pass 1 -------------------
 
+    type PlainTable = std::collections::HashMap<usize, (Option<Geometry<f64>>, i32)>;
+
+    /// A chain table's entries without the take-once slots, for comparing.
+    fn plain_tables(tables: Vec<Option<CoalesceTable>>) -> Vec<Option<PlainTable>> {
+        tables
+            .into_iter()
+            .map(|t| {
+                t.map(|t| {
+                    t.into_iter()
+                        .map(|(k, (g, c))| (k, (g.into_inner().unwrap().map(|g| *g), c)))
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
+    fn clone_table(t: &CoalesceTable) -> CoalesceTable {
+        t.iter()
+            .map(|(&k, (g, c))| {
+                let g = g.lock().unwrap().clone();
+                (k, (super::super::convert::ChainGeometry::new(g), *c))
+            })
+            .collect()
+    }
+
     /// A chain table no real build could produce, so its presence in pass 2's
     /// output proves the table was REUSED rather than rebuilt.
     fn sentinel_table(rep: usize) -> CoalesceTable {
@@ -10218,7 +10758,9 @@ mod tests {
         t.insert(
             rep,
             (
-                Geometry::LineString(LineString::from(vec![(0.0, 0.0), (1.0, 1.0)])),
+                super::super::convert::ChainGeometry::new(Some(Box::new(Geometry::LineString(
+                    LineString::from(vec![(0.0, 0.0), (1.0, 1.0)]),
+                )))),
                 7,
             ),
         );
@@ -10326,9 +10868,9 @@ mod tests {
         opts.max_row_group_size = 128;
         let counts = [1_000usize, 50_000, 200_000];
         let row = Some(100u64);
-        let group = encode_price(&opts, &counts, row, 1).bytes;
+        let group = encode_price(&opts, &counts, Mode::Duplicating, row, 1).bytes;
         let chunk = crate::overview::writer::WKB_ENCODE_CHUNK_ROWS as u64;
-        let slot = encode_price(&opts, &counts, row, chunk).bytes;
+        let slot = encode_price(&opts, &counts, Mode::Duplicating, row, chunk).bytes;
         assert!(group < slot, "group {group} B vs slot {slot} B");
         assert_eq!(slot, 10_000 * 100 * ENCODE_COPIES);
     }
@@ -10397,12 +10939,26 @@ mod tests {
     #[test]
     fn chain_stage_wave_is_bounded_by_the_budget() {
         let per_level = 100 * CHAIN_STAGE_TRANSIENT_FACTOR;
-        assert_eq!(chain_stage_wave(7, 100, u64::MAX), 7, "unbounded: all");
-        assert_eq!(chain_stage_wave(7, 100, per_level * 3), 3);
-        assert_eq!(chain_stage_wave(7, 100, per_level * 3 + 1), 3);
-        assert_eq!(chain_stage_wave(7, 100, 1), 1, "never below one level");
-        assert_eq!(chain_stage_wave(7, 0, 1), 7, "no line bytes: no bound");
-        assert_eq!(chain_stage_wave(0, 100, u64::MAX), 1);
+        // No lines: only the modelled bytes are resident.
+        let resident = chain_stage_resident_bytes(0, 100);
+        assert_eq!(chain_stage_wave(7, 0, 100, u64::MAX), 7, "unbounded: all");
+        assert_eq!(chain_stage_wave(7, 0, 100, resident + per_level * 3), 3);
+        assert_eq!(chain_stage_wave(7, 0, 100, resident + per_level * 3 + 1), 3);
+        assert_eq!(chain_stage_wave(7, 0, 100, 1), 1, "never below one level");
+        assert_eq!(chain_stage_wave(7, 0, 0, 1), 7, "no line bytes: no bound");
+        assert_eq!(chain_stage_wave(0, 0, 100, u64::MAX), 1);
+    }
+
+    /// The line scratch and the exact join are resident before any level
+    /// runs, so they come off the budget before it is split into levels
+    /// (#851): a budget holding them plus one level runs one level at a time.
+    #[test]
+    fn chain_stage_waves_leave_room_for_what_every_level_shares() {
+        let lines = 1_000_000;
+        let modelled = 200 * lines as u64;
+        let per_level = modelled * CHAIN_STAGE_TRANSIENT_FACTOR;
+        let budget = chain_stage_resident_bytes(lines, modelled) + per_level;
+        assert_eq!(chain_stage_wave(14, lines, modelled, budget), 1);
     }
 
     /// Running the levels in bounded waves changes the peak, never the result:
@@ -10433,8 +10989,48 @@ mod tests {
             let (counts, build) = run(wave);
             assert_eq!(counts, all_counts, "wave {wave}");
             assert_eq!(build.merged, all_build.merged, "wave {wave}");
-            assert_eq!(build.tables, all_build.tables, "wave {wave}");
+            assert_eq!(
+                plain_tables(build.tables),
+                plain_tables(
+                    all_build
+                        .tables
+                        .iter()
+                        .map(|t| t.as_ref().map(clone_table))
+                        .collect()
+                ),
+                "wave {wave}"
+            );
         }
+    }
+
+    /// #851: pass 2 moves a rep's merged geometry out of the table when it
+    /// emits the rep, so the table frees its chains as pass 2 advances; the
+    /// rep's count stays for the `coalesced_count` column.
+    #[test]
+    fn emitting_a_chain_rep_frees_its_geometry() {
+        let table = sentinel_table(100);
+        assert!(take_chain_geometry(&table, 7).is_none(), "not a rep");
+        let g = take_chain_geometry(&table, 100).expect("the rep's chain");
+        assert_eq!(count_vertices(&g), 2);
+        let (slot, count) = &table[&100];
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the table still holds the chain"
+        );
+        assert_eq!(*count, 7);
+    }
+
+    /// #851: a chain table's slots stay allocated until convert returns,
+    /// after pass 2 has moved every geometry out, so a slot must not carry
+    /// the geometry inline (it was 80 B with an inline `Geometry`). Compared
+    /// with a boxed byte, not a byte count: `Mutex` differs by platform.
+    #[test]
+    fn a_chain_table_slot_is_small() {
+        assert_eq!(
+            std::mem::size_of::<super::super::convert::ChainGeometry>(),
+            std::mem::size_of::<std::sync::Mutex<Option<Box<u8>>>>(),
+            "a chain slot holds its geometry behind one pointer"
+        );
     }
 
     /// Pass 2 takes pass 1's prebuilt tables verbatim, level by level, and
@@ -10929,6 +11525,34 @@ mod tests {
         }
     }
 
+    /// Codex review C3: the RAM sink is priced as shared only when the engine
+    /// shares, which takes two or more buffered levels of a duplicating
+    /// cascade without clustering.
+    #[test]
+    fn a_sink_is_priced_as_shared_only_when_its_levels_share() {
+        let levels: Vec<EmitLevel> = (0..3u8)
+            .map(|i| EmitLevel {
+                orig: i,
+                gsd: 1000.0 / f64::from(i + 1),
+                zoom: Some(i),
+                hint: 1_000,
+            })
+            .collect();
+        let options = ConvertOptions::default();
+        let shared = |emitted: &[EmitLevel], finest: usize, options: &ConvertOptions| {
+            shared_sink_rows(options, buffered_levels(emitted, finest, options), 5)
+        };
+        // Three levels, the finest streamed: two buffered levels share.
+        assert_eq!(shared(&levels, 2, &options), Some(5));
+        // Two levels, the finest streamed: one buffered level does not.
+        assert_eq!(shared(&levels[1..], 2, &options), None);
+        let clustered = ConvertOptions {
+            cluster: true,
+            ..ConvertOptions::default()
+        };
+        assert_eq!(shared(&levels, 2, &clustered), None);
+    }
+
     /// #716: the spill's page cache is reserved before the pass-2 grants only
     /// under a cgroup limit, only when the run spills, and only when the
     /// footer-priced spill fits the allowance; otherwise nothing is reserved
@@ -10956,6 +11580,7 @@ mod tests {
                 SpillPlan {
                     emitted: &levels,
                     finest: 2,
+                    input_rows: 3_000,
                     row_bytes: Some(row),
                     avg_geom_bytes: None,
                 },
@@ -10963,13 +11588,14 @@ mod tests {
             (r, budget.remaining())
         };
         // Two buffered levels (the finest streams) of 1,000 rows at 100 B:
-        // 200,000 B, which fits 0.6 × 1 MB.
+        // 200,000 Arrow bytes, 80,000 spilled at `bounded`'s LZ4 0.4, which fits
+        // 0.6 × 1 MB.
         let (fits, left) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &bounded, 100);
         assert_eq!(
             (fits.estimate_bytes, fits.reserved_bytes, fits.reason),
-            (200_000, 200_000, "fits the allowance")
+            (80_000, 80_000, "fits the allowance")
         );
-        assert_eq!(left, 480_000);
+        assert_eq!(left, 552_000);
         // A spill past the allowance reserves nothing: the cache cannot hold
         // it, and reserving it would only starve the grants.
         let (big, left) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &bounded, 1_000);
@@ -10978,6 +11604,16 @@ mod tests {
             (0, "exceeds the allowance")
         );
         assert_eq!(left, 600_000);
+        // `auto` spills raw, so its spill is priced at its Arrow bytes.
+        let auto = ConvertOptions {
+            profile: MemoryProfile::Auto,
+            ..ConvertOptions::default()
+        };
+        let (raw, _) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &auto, 1_000);
+        assert_eq!(
+            (raw.estimate_bytes, raw.reason),
+            (2_000_000, "exceeds the allowance")
+        );
         // Page cache is not charged to MemAvailable, and `speed` never spills.
         let (free, _) = reserve(1_000_000, MemoryLimitSource::MemAvailable, &bounded, 100);
         assert_eq!(free.reserved_bytes, 0);

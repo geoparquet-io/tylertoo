@@ -481,6 +481,26 @@ impl InputSource {
         }
     }
 
+    /// Drop a remote object's decoded footer (#815); a later open re-parses
+    /// it, from the kept encoded tail when there is one.
+    pub(crate) fn release_footer(&self) {
+        match self {
+            InputSource::Local(_) => {}
+            #[cfg(feature = "remote")]
+            InputSource::Remote(r) => r.release_footer(),
+        }
+    }
+
+    /// Drop a remote object's kept encoded footer tail too, for a part the
+    /// run never reads (#815); a later open re-fetches it.
+    pub(crate) fn forget_footer(&self) {
+        match self {
+            InputSource::Local(_) => {}
+            #[cfg(feature = "remote")]
+            InputSource::Remote(r) => r.forget_footer(),
+        }
+    }
+
     /// Stage the selected row groups to the local disk spill up front (pass
     /// 0, #286/#287), coalescing each row group into one parallel range
     /// request so the later passes read entirely from disk. No-op for local
@@ -522,6 +542,12 @@ impl InputSource {
         let _ = (selected, roots);
         match self {
             InputSource::Local(_) => Ok(PartStaging::default()),
+            // A part the run reads nothing of stages nothing, and needs no
+            // footer (#815 releases it).
+            #[cfg(feature = "remote")]
+            InputSource::Remote(_) if selected.is_some_and(<[usize]>::is_empty) => {
+                Ok(PartStaging::default())
+            }
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => {
                 let remote = r.plan_staging(selected, roots)?;
@@ -989,6 +1015,10 @@ pub(crate) mod remote {
         /// fetched ahead by [`prefetch_footers`]; served to the footer parse,
         /// then dropped with the prefetch admission's permits for its bytes.
         footer_tail: Mutex<Option<(u64, Bytes, tokio::sync::OwnedSemaphorePermit)>>,
+        /// A prefetched tail after its parse, kept (without permits) so the
+        /// re-parse of a released footer (#815) needs no network: the encoded
+        /// footer is ~1/5 of the decoded one. The re-parse drops it.
+        parsed_tail: Mutex<Option<(u64, Bytes)>>,
     }
 
     impl SharedState {
@@ -1025,11 +1055,9 @@ pub(crate) mod remote {
         location: ObjectPath,
         pub(super) object_meta: tylertoo_io::RemoteObjectMeta,
         shared: Arc<SharedState>,
-        #[expect(
-            clippy::disallowed_types,
-            reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
-        )]
-        metadata: OnceLock<ReaderMetadata>,
+        /// The parsed footer, shared by every clone; [`Self::release_footer`]
+        /// drops it for a part a run never reads (#815).
+        metadata: Arc<Mutex<Option<ReaderMetadata>>>,
         cache: Arc<Mutex<ChunkCache>>,
         /// On-disk overflow for fetched column chunks (issue #219), shared by
         /// every reader clone across the pipeline's passes so a chunk fetched
@@ -1463,11 +1491,7 @@ pub(crate) mod remote {
                 location: meta.location.clone(),
                 object_meta: meta.into(),
                 shared: Arc::new(SharedState::default()),
-                #[expect(
-                    clippy::disallowed_types,
-                    reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
-                )]
-                metadata: OnceLock::new(),
+                metadata: Arc::default(),
                 cache: Arc::new(Mutex::new(ChunkCache::new(cap_base))),
                 spill: Arc::new(Mutex::new(DiskSpill::default())),
                 cap_base,
@@ -1561,34 +1585,75 @@ pub(crate) mod remote {
         /// not depend on a builder open; the header phase has usually loaded
         /// it already, in which case this is a cheap clone with no fetch.
         fn load_footer(&self) -> Result<ReaderMetadata, InputError> {
-            if let Some(md) = self.metadata.get() {
+            if let Some(md) = self.cached_footer() {
                 // A tail prefetched while another open loaded the footer.
                 self.shared
                     .footer_tail
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
-                return Ok(md.clone());
+                return Ok(md);
             }
             let reader = InputReader::Remote(self.reader());
             // The owner (#779) runs the footer pre-check, the #430 chunk-range
             // check against the object size and the guarded schema decode,
             // exactly as it does for a local file.
             let md = tylertoo_io::load_reader_metadata(&reader);
-            // The prefetched tail (#817 R1) has served its one parse.
-            self.shared
+            // The prefetched tail (#817 R1) has served its parse: its permits
+            // go back. Its bytes stay for one re-parse (#815), unless this was
+            // that re-parse.
+            let fresh = self
+                .shared
                 .footer_tail
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+                .take()
+                .map(|(at, tail, _permits)| (at, tail));
+            {
+                let mut kept = self
+                    .shared
+                    .parsed_tail
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *kept = if kept.is_some() { None } else { fresh };
+            }
             let md = md.map_err(|error| InputError::Footer {
                 input: self.url.clone(),
                 error,
             })?;
             // A concurrent open may have won the race; either copy is
             // equivalent.
-            let _ = self.metadata.set(md.clone());
-            Ok(md)
+            Ok(self
+                .metadata
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert(md)
+                .clone())
+        }
+
+        fn cached_footer(&self) -> Option<ReaderMetadata> {
+            self.metadata
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        /// [`Self::release_footer`] and the kept encoded tail (#815).
+        pub(crate) fn forget_footer(&self) {
+            self.release_footer();
+            self.shared
+                .parsed_tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+
+        /// Drop the cached footer; the next open parses it again (#815).
+        pub(crate) fn release_footer(&self) {
+            self.metadata
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
         }
 
         /// Fetch the trailer, then the footer, exactly as the parse would
@@ -1599,7 +1664,13 @@ pub(crate) mod remote {
         /// permits stay with the tail until the parse drops it.
         async fn prefetch_footer(&self, retain: &Arc<tokio::sync::Semaphore>, cap: u32) {
             const TRAILER: u64 = 8;
-            if self.metadata.get().is_some() {
+            let kept = self
+                .shared
+                .parsed_tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            if kept || self.cached_footer().is_some() {
                 return;
             }
             let get = |range| {
@@ -3225,17 +3296,29 @@ pub(crate) mod remote {
             if length == 0 {
                 return Ok(Bytes::new());
             }
+            let tail_bytes = |at: u64, tail: &Bytes| {
+                let off = usize::try_from(start.checked_sub(at)?).ok()?;
+                let bytes = tail.get(off..off.checked_add(length)?)?;
+                Some(tail.slice_ref(bytes))
+            };
             if let Some((at, tail, _)) = &*self
                 .shared
                 .footer_tail
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
             {
-                if start >= *at {
-                    let off = usize::try_from(start - at).unwrap_or(usize::MAX);
-                    if let Some(bytes) = off.checked_add(length).and_then(|e| tail.get(off..e)) {
-                        return Ok(tail.slice_ref(bytes));
-                    }
+                if let Some(bytes) = tail_bytes(*at, tail) {
+                    return Ok(bytes);
+                }
+            }
+            if let Some((at, tail)) = &*self
+                .shared
+                .parsed_tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                if let Some(bytes) = tail_bytes(*at, tail) {
+                    return Ok(bytes);
                 }
             }
             // Page reads land inside a column chunk: serve them from the
