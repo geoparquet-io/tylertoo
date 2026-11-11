@@ -27,6 +27,9 @@ use super::level::{MemoryProfile, Mode};
 use super::pipeline::{probe_preflight_memory_limit, MemoryLimit};
 
 pub(super) const SINK_ROW_ALLOC_OVERHEAD_BYTES: u64 = 256;
+/// What a shared output row (#852) holds besides its geometry: its `u32`
+/// positions in the shared rows and geometries, and a `coalesced_count`.
+const SHARED_OUTPUT_ROW_BYTES: u64 = 16;
 
 /// Share of the probed memory a non-`speed` run may hold resident. The rest
 /// is headroom for what no phase prices: allocator retention, thread stacks,
@@ -339,6 +342,36 @@ impl MemoryBudget {
     ) -> u64 {
         (rows as u64).saturating_mul(self.output_row_bytes(mode, geometry, row_bytes))
     }
+    /// The buffered output of `rows` rows held in RAM. When its levels share
+    /// their rows' properties (#852) out of `shared_from` input rows, a kept
+    /// input row is held once, at the footers' row price plus the sink's
+    /// [`SINK_ROW_ALLOC_OVERHEAD_BYTES`] floor as the pass-2 measurement
+    /// charges it; every further output row adds only its geometry, and every
+    /// output row [`SHARED_OUTPUT_ROW_BYTES`] of positions and counts. Never
+    /// above [`Self::sink_estimate`]: the footer row already overstates a
+    /// decoded row, so that price held without a floor. Without footer bytes,
+    /// or for a sink that does not share, [`Self::sink_estimate`].
+    pub(super) fn ram_sink_estimate(
+        self,
+        mode: Mode,
+        rows: usize,
+        shared_from: Option<usize>,
+        geometry: Option<u64>,
+        row_bytes: Option<u64>,
+    ) -> u64 {
+        let per_row = self.sink_estimate(mode, rows, geometry, row_bytes);
+        match (shared_from, row_bytes.filter(|r| *r > 0)) {
+            (Some(input), Some(row)) => {
+                let kept = rows.min(input) as u64;
+                let further = rows as u64 - kept;
+                kept.saturating_mul(row.saturating_add(SINK_ROW_ALLOC_OVERHEAD_BYTES))
+                    .saturating_add(further.saturating_mul(geometry.unwrap_or(row)))
+                    .saturating_add((rows as u64).saturating_mul(SHARED_OUTPUT_ROW_BYTES))
+                    .min(per_row)
+            }
+            _ => per_row,
+        }
+    }
     /// Units of `price` that `phase` may hold under `profile`, at least 1. A
     /// query: it charges nothing. `speed` affords everything; `auto` and
     /// `bounded` what `phase`'s share of the current allowance holds
@@ -616,6 +649,33 @@ mod tests {
             assert_eq!(
                 budget.sink_estimate(mode, 1_000, Some(119), None),
                 budget.sink_estimate(mode, 1_000, Some(119), Some(0)),
+            );
+        }
+    }
+
+    /// #852 review F2: a shared RAM sink holds each kept input row once, at
+    /// the footer row plus the sink floor, and every output row its geometry
+    /// past those and its positions; never more than the per-row price.
+    #[test]
+    fn a_shared_ram_sink_prices_each_input_row_once() {
+        let budget = MemoryBudget::with_available(None);
+        let dup = Mode::Duplicating;
+        assert_eq!(
+            budget.ram_sink_estimate(dup, 4_000, Some(1_000), Some(100), Some(1_000)),
+            1_000 * (1_000 + SINK_ROW_ALLOC_OVERHEAD_BYTES)
+                + 3_000 * 100
+                + 4_000 * SHARED_OUTPUT_ROW_BYTES
+        );
+        // As many input rows as output rows: the per-row price is the lower.
+        assert_eq!(
+            budget.ram_sink_estimate(dup, 1_000, Some(5_000), Some(100), Some(1_000)),
+            budget.sink_estimate(dup, 1_000, Some(100), Some(1_000))
+        );
+        // A sink that does not share, or no footer price: the per-row price.
+        for (shared, row) in [(None, Some(1_000)), (Some(1_000), None)] {
+            assert_eq!(
+                budget.ram_sink_estimate(dup, 4_000, shared, Some(100), row),
+                budget.sink_estimate(dup, 4_000, Some(100), row)
             );
         }
     }

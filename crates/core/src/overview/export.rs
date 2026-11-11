@@ -3152,6 +3152,7 @@ fn fill_backing(
         profile,
         Mode::Partitioning,
         buffered_rows,
+        None,
         mean_member_bytes,
         None,
     );

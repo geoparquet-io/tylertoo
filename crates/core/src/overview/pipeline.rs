@@ -50,7 +50,11 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::time::{Duration, Instant};
 
-use std::collections::VecDeque;
+#[expect(
+    clippy::disallowed_types,
+    reason = "#817 B1, #852: pass 2's per-call measurement and sharing flag"
+)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array};
@@ -149,16 +153,19 @@ const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
 /// `memory`'s own [`MemoryProfile::Auto`] allowance, after every reservation
 /// and grant already charged to it — a function of `feature_count × level_count ×
 /// mode` (captured by `buffered_rows` and the per-mode byte estimate), NOT a
-/// mode-only rule. Partitioning additionally keeps its historical absolute
+/// mode-only rule. `shared_from` is the input row count when the RAM sink's
+/// levels share their rows' properties ([`MemoryBudget::ram_sink_estimate`]). Partitioning additionally keeps its historical absolute
 /// row ceiling, so it spills at least as often as before.
 pub(super) fn auto_backing(
     memory: &MemoryBudget,
     mode: Mode,
     buffered_rows: usize,
+    shared_from: Option<usize>,
     avg_geom_bytes: Option<u64>,
     row_bytes: Option<u64>,
 ) -> SinkBacking {
-    let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes, row_bytes);
+    let estimate =
+        memory.ram_sink_estimate(mode, buffered_rows, shared_from, avg_geom_bytes, row_bytes);
     let ram_gate_spill = estimate > memory.allowance(MemoryProfile::Auto);
     let abs_gate_spill =
         matches!(mode, Mode::Partitioning) && buffered_rows > PARTITIONING_SPILL_ROWS;
@@ -666,13 +673,21 @@ pub(super) fn sink_backing(
     profile: MemoryProfile,
     mode: Mode,
     buffered_rows: usize,
+    shared_from: Option<usize>,
     avg_geom_bytes: Option<u64>,
     row_bytes: Option<u64>,
 ) -> SinkBacking {
     match profile {
         MemoryProfile::Speed => SinkBacking::Ram,
         MemoryProfile::Bounded => SinkBacking::Spill,
-        MemoryProfile::Auto => auto_backing(memory, mode, buffered_rows, avg_geom_bytes, row_bytes),
+        MemoryProfile::Auto => auto_backing(
+            memory,
+            mode,
+            buffered_rows,
+            shared_from,
+            avg_geom_bytes,
+            row_bytes,
+        ),
     }
 }
 
@@ -690,6 +705,7 @@ pub(super) fn resolve_backing(
     profile: MemoryProfile,
     mode: Mode,
     buffered_rows: usize,
+    shared_from: Option<usize>,
     avg_geom_bytes: Option<u64>,
     row_bytes: Option<u64>,
 ) -> SinkBacking {
@@ -698,6 +714,7 @@ pub(super) fn resolve_backing(
         profile,
         mode,
         buffered_rows,
+        shared_from,
         avg_geom_bytes,
         row_bytes,
     );
@@ -707,14 +724,18 @@ pub(super) fn resolve_backing(
         );
         return backing;
     }
-    let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes, row_bytes);
+    let estimate =
+        memory.ram_sink_estimate(mode, buffered_rows, shared_from, avg_geom_bytes, row_bytes);
     let budget = memory.allowance(MemoryProfile::Auto);
     let avail_mib = memory.available().map_or_else(
         || "unknown".to_string(),
         |b| format!("{} MiB", b / (1024 * 1024)),
     );
     let geom = match (row_bytes, avg_geom_bytes.filter(|&b| b > 0)) {
-        (Some(row), _) => format!("footer row {row} B"),
+        (Some(row), _) => match shared_from {
+            Some(input) => format!("footer row {row} B shared from {input} input rows"),
+            None => format!("footer row {row} B"),
+        },
         (None, Some(b)) => format!("measured avg geom {b} B/row"),
         (None, None) => "unmeasured (calibrated constants)".to_string(),
     };
@@ -748,7 +769,8 @@ pub(super) struct SinkMeasurement {
     /// Measured retained bytes per buffered output row — the Arrow array
     /// bytes (geometry + every kept property column) of every batch handed to
     /// the sinks, averaged over the whole pass, plus
-    /// [`SINK_ROW_ALLOC_OVERHEAD_BYTES`]. `None` when nothing was buffered.
+    /// [`SINK_ROW_ALLOC_OVERHEAD_BYTES`] per materialized row (per shared row
+    /// of a shared batch, #852). `None` when nothing was buffered.
     pub(super) bytes_per_row: Option<u64>,
     /// Output rows the measurement covered: every buffered row of the pass.
     pub(super) sampled_rows: usize,
@@ -798,7 +820,9 @@ pub(super) struct SinkMeasurement {
 struct SinkAutoTuner {
     /// Output rows observed so far (every buffered row of the pass).
     rows: usize,
-    /// Arrow array bytes of those rows, floor excluded.
+    /// Arrow array bytes of those rows, plus [`SINK_ROW_ALLOC_OVERHEAD_BYTES`]
+    /// per row they materialize: per output row of an owned batch, per
+    /// shared row of a shared one (#852), whose output rows are positions.
     bytes: u64,
     /// Output rows the plan expects the buffered levels to hold in total.
     planned_rows: usize,
@@ -852,7 +876,14 @@ impl SinkAutoTuner {
     /// the measurement. Runs for every batch of the pass.
     fn observe(&mut self, batch: &LevelBatch) {
         self.rows += batch.num_rows();
-        self.bytes = self.bytes.saturating_add(batch.held_bytes());
+        let floor = match batch {
+            LevelBatch::Owned(b) => b.num_rows() as u64 * SINK_ROW_ALLOC_OVERHEAD_BYTES,
+            LevelBatch::Shared { .. } => 0,
+        };
+        self.bytes = self
+            .bytes
+            .saturating_add(batch.held_bytes())
+            .saturating_add(floor);
     }
 
     /// Fold in the rows one input batch's levels share, once.
@@ -861,15 +892,16 @@ impl SinkAutoTuner {
             Some((LevelBatch::Shared { rows, .. }, _)) => Some(rows),
             _ => None,
         }) {
-            self.bytes = self.bytes.saturating_add(rows.held_bytes());
+            self.bytes = self.bytes.saturating_add(
+                rows.held_bytes() + rows.rows as u64 * SINK_ROW_ALLOC_OVERHEAD_BYTES,
+            );
         }
     }
 
     /// Measured retained bytes per buffered output row, floor included.
     /// `None` until at least one row has been observed.
     fn bytes_per_row(&self) -> Option<u64> {
-        (self.rows > 0)
-            .then(|| SINK_ROW_ALLOC_OVERHEAD_BYTES.saturating_add(self.bytes / self.rows as u64))
+        (self.rows > 0).then(|| self.bytes / self.rows as u64)
     }
 
     /// What the whole buffered set costs in RAM: the bytes already buffered
@@ -878,11 +910,8 @@ impl SinkAutoTuner {
     /// under-counts the rows.
     fn projected_bytes(&self) -> u64 {
         self.bytes_per_row().map_or(0, |per_row| {
-            let held = self
-                .bytes
-                .saturating_add((self.rows as u64).saturating_mul(SINK_ROW_ALLOC_OVERHEAD_BYTES));
             let remaining = self.planned_rows.saturating_sub(self.rows) as u64;
-            held.saturating_add(remaining.saturating_mul(per_row))
+            self.bytes.saturating_add(remaining.saturating_mul(per_row))
         })
     }
 
@@ -936,18 +965,31 @@ impl SinkAutoTuner {
     }
 }
 
-/// Flush every still-Ram sink into a fresh spill file (#626), returning the
-/// bytes handed to the spill writers so the per-level spill accounting stays
-/// whole. Sinks that already spill are untouched.
-fn downgrade_sinks_to_spill(
+/// When `tuner` says the RAM sinks cannot hold the run (#626), flush every
+/// still-Ram sink into a fresh spill file, adding the bytes handed to the
+/// spill writers to `spill_bytes` so the per-level spill accounting stays
+/// whole, and stop the levels sharing rows (`share`), which only pays off in
+/// RAM. Sinks that already spill are untouched.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#852: the sharing flag the window's batches read"
+)]
+fn downgrade_if_due(
+    tuner: &mut SinkAutoTuner,
     sinks: &mut [LevelSink],
     spill_bytes: &mut [u64],
-    out_schema: &Schema,
-    spill_dir: Option<&Path>,
+    (out_schema, spill_dir): (&Schema, Option<&Path>),
+    (diagnostics, share): (&crate::diagnostics::Diagnostics, &AtomicBool),
 ) -> Result<(), ConvertError> {
+    if !tuner.should_downgrade() {
+        return Ok(());
+    }
+    diagnostics.warn(tuner.downgrade_warning(sinks.len()));
     for (li, sink) in sinks.iter_mut().enumerate() {
         spill_bytes[li] += sink.downgrade_to_spill(out_schema, spill_dir)?;
     }
+    tuner.mark_downgraded();
+    share.store(false, Relaxed);
     Ok(())
 }
 
@@ -972,6 +1014,8 @@ struct ReadMsg {
 pub(super) struct SharedRows {
     /// The kept rows' columns, in the source schema's non-geometry order.
     columns: Vec<ArrayRef>,
+    /// How many rows they hold.
+    rows: usize,
     /// Every distinct geometry the levels keep, encoded once: a level whose
     /// cascade step left a feature unchanged shares the finer level's
     /// geometry (#499), so per-level columns held it once per level.
@@ -1004,6 +1048,7 @@ impl SharedRows {
                 rows.push(u32::try_from(i).expect("batch rows fit in u32"));
             }
         }
+        let kept_rows = rows.len();
         let columns = if rows.len() == n {
             non_geom_cols
                 .iter()
@@ -1020,7 +1065,14 @@ impl SharedRows {
             .iter()
             .map(|rows| rows.iter().map(|&i| pos[i]).collect())
             .collect();
-        Ok((Self { columns, geometry }, index))
+        Ok((
+            Self {
+                columns,
+                rows: kept_rows,
+                geometry,
+            },
+            index,
+        ))
     }
 
     /// What these columns hold in RAM.
@@ -1533,9 +1585,6 @@ pub(super) fn run_pass2_buffered(
     let tuner_ref = &mut tuner;
     let timers_ref = &timers;
     let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
-    // Shared rows only pay off held in RAM: a spilled level writes its rows
-    // out at once, so it builds its own.
-    let share = matches!(backing, SinkBacking::Ram);
     // #494: `in_flight` is shared between the read-ahead channel and the
     // consumer's compute window, so the resident input stays about what one
     // channel of depth `in_flight` held before the window existed.
@@ -1543,12 +1592,17 @@ pub(super) fn run_pass2_buffered(
     // (`stream::grant_pass2_read`, #716).
     let (read_depth, _) = split_in_flight(in_flight);
     // #817 B1: the largest input batch read, so the drain reuses what the
-    // read-ahead and window really held, not what they were granted.
+    // read-ahead and window really held, not what they were granted. And
+    // whether the levels share rows: only held in RAM (#852), since a
+    // spilled level writes its rows out at once ([`downgrade_if_due`]).
     #[expect(
         clippy::disallowed_types,
-        reason = "#817 B1: a per-call measurement shared with the read thread"
+        reason = "#817 B1, #852: per-call state shared with the read thread and the window"
     )]
-    let peak_batch = std::sync::atomic::AtomicU64::new(0);
+    let (peak_batch, share) = (
+        AtomicU64::new(0),
+        AtomicBool::new(matches!(backing, SinkBacking::Ram)),
+    );
     let peak_batch_ref = &peak_batch;
     scoped_pipe(
         read_depth,
@@ -1565,10 +1619,7 @@ pub(super) fn run_pass2_buffered(
                 None,
                 read_tuning,
                 &mut |batch, row_offset, read_dur| {
-                    peak_batch_ref.fetch_max(
-                        batch.get_array_memory_size() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    peak_batch_ref.fetch_max(batch.get_array_memory_size() as u64, Relaxed);
                     Ok(
                         if tx
                             .send(ReadMsg {
@@ -1613,7 +1664,13 @@ pub(super) fn run_pass2_buffered(
                 |msg: &ReadMsg| -> Result<Vec<Option<(LevelBatch, usize)>>, ConvertError> {
                     let (batch, row_offset) = (&msg.batch, msg.row_offset);
                     if cascade {
-                        process_batch_cascade(batch, row_offset, ctxs, timers_ref, share)
+                        process_batch_cascade(
+                            batch,
+                            row_offset,
+                            ctxs,
+                            timers_ref,
+                            share.load(Relaxed),
+                        )
                     } else {
                         process_levels_apart(batch, row_offset, ctxs, timers_ref)
                     }
@@ -1629,18 +1686,13 @@ pub(super) fn run_pass2_buffered(
                                 buffer_batch(&mut sinks_ref[li], tuner_ref, out)?;
                         }
                     }
-                    if tuner_ref.should_downgrade() {
-                        ctxs[0]
-                            .diagnostics
-                            .warn(tuner_ref.downgrade_warning(num_levels));
-                        downgrade_sinks_to_spill(
-                            sinks_ref,
-                            spill_bytes_ref,
-                            out_schema,
-                            spill_dir,
-                        )?;
-                        tuner_ref.mark_downgraded();
-                    }
+                    downgrade_if_due(
+                        tuner_ref,
+                        sinks_ref,
+                        spill_bytes_ref,
+                        (out_schema, spill_dir),
+                        (ctxs[0].diagnostics, &share),
+                    )?;
                     if last_progress.elapsed().as_secs() >= 10 {
                         last_progress = Instant::now();
                         log::info!(
@@ -1763,31 +1815,22 @@ fn drain_sink(
             // every shared level batch (#852) left the drain's encodes
             // waiting. On this thread's own pool, so a pool worker helps
             // build what it waits for (`tests/rayon_global_pool_reentry.rs`).
-            let mut failed = None;
+            // A rebuild that fails ends the level unwritten.
             let mut pending = batches.into_iter();
-            let mut ready = VecDeque::new();
             let rebuilt = std::iter::from_fn(|| {
-                if ready.is_empty() && failed.is_none() {
-                    let chunk: Vec<LevelBatch> = pending
-                        .by_ref()
-                        .take(width.clamp(1, DRAIN_REBUILD_AHEAD))
-                        .collect();
-                    match chunk
+                let chunk: Vec<LevelBatch> = pending
+                    .by_ref()
+                    .take(width.clamp(1, DRAIN_REBUILD_AHEAD))
+                    .collect();
+                (!chunk.is_empty()).then(|| {
+                    chunk
                         .into_par_iter()
                         .map(LevelBatch::materialize)
-                        .collect::<Result<Vec<_>, _>>()
-                    {
-                        Ok(built) => ready.extend(built),
-                        Err(e) => failed = Some(e),
-                    }
-                }
-                ready.pop_front()
-            });
-            let written = writer.write_level(level_idx, Some(hint), rebuilt);
-            if let Some(e) = failed {
-                return Err(e); // the rebuild's error, ahead of the writer's
-            }
-            written?
+                        .collect::<Vec<_>>()
+                })
+            })
+            .flatten();
+            writer.write_level_from(level_idx, Some(hint), rebuilt)?
         }
         LevelSink::Spill(state) => {
             // `_temp` keeps the spill file on disk until the reader is drained.
@@ -1806,22 +1849,24 @@ fn drain_sink(
             let (reader, _temp) = state.into_reader(timers)?;
             // #817 B1: the spill decodes on its own thread, so the writer's
             // thread only feeds row groups (on Oregon roads the decode was
-            // most of what it did). A read error ends the stream and, as the
-            // producer's, takes precedence over the writer's.
+            // most of what it did).
             scoped_pipe(
                 SPILL_QUEUE_DEPTH,
-                move |tx: &Sender<RecordBatch>| -> Result<(), ConvertError> {
+                move |tx: &Sender<Result<RecordBatch, ConvertError>>| -> Result<(), ConvertError> {
                     for batch in reader {
                         #[cfg(test)]
                         spill_tests::note_decode();
-                        if tx.send(batch?).is_err() {
-                            break; // the writer failed; its error is reported
+                        // A read error goes to the writer in order and ends
+                        // the level unwritten.
+                        let failed = batch.is_err();
+                        if tx.send(batch.map_err(ConvertError::from)).is_err() || failed {
+                            break; // on a writer failure, its error is reported
                         }
                     }
                     Ok(())
                 },
-                |rx: Receiver<RecordBatch>| {
-                    Ok(writer.write_level(level_idx, Some(hint), rx.into_iter())?)
+                |rx: Receiver<Result<RecordBatch, ConvertError>>| {
+                    writer.write_level_from(level_idx, Some(hint), rx.into_iter())
                 },
             )?
         }
@@ -2409,6 +2454,7 @@ mod backing_tests {
                 Mode::Duplicating,
                 between,
                 None,
+                None,
                 None
             ),
             SinkBacking::Spill
@@ -2420,6 +2466,7 @@ mod backing_tests {
                 MemoryProfile::Auto,
                 Mode::Duplicating,
                 under,
+                None,
                 None,
                 None
             ),
@@ -2437,6 +2484,7 @@ mod backing_tests {
                 Mode::Duplicating,
                 10_000_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Ram
@@ -2448,7 +2496,36 @@ mod backing_tests {
                 Mode::Duplicating,
                 1,
                 None,
+                None,
                 None
+            ),
+            SinkBacking::Spill
+        ));
+    }
+
+    /// #852 review F2: levels that share their rows' properties hold each
+    /// kept input row once, so an input whose per-output-row price passes the
+    /// allowance stays in RAM when its shared price fits. Overture segments
+    /// (2.8M input rows, 10.7M buffered, 738 B footer row, 140 B geometry):
+    /// 7.4 GiB per output row, 3.8 GiB shared, against a 4 GiB allowance.
+    /// `bounded` still spills.
+    #[test]
+    fn auto_keeps_a_shared_sink_in_ram_that_per_row_pricing_would_spill() {
+        let memory = MemoryBudget::with_available(Some(4 * GIB * 10 / 6 + GIB / 10));
+        let (rows, input, geom, row) = (10_697_457, 2_815_136, Some(140), Some(738));
+        let auto =
+            |shared_from| auto_backing(&memory, Mode::Duplicating, rows, shared_from, geom, row);
+        assert!(matches!(auto(None), SinkBacking::Spill));
+        assert!(matches!(auto(Some(input)), SinkBacking::Ram));
+        assert!(matches!(
+            sink_backing(
+                &memory,
+                MemoryProfile::Bounded,
+                Mode::Duplicating,
+                rows,
+                Some(input),
+                geom,
+                row
             ),
             SinkBacking::Spill
         ));
@@ -2462,6 +2539,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(54 * GIB)),
                 Mode::Duplicating,
                 10_000,
+                None,
                 None,
                 None
             ),
@@ -2478,6 +2556,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(54 * GIB)),
                 Mode::Duplicating,
                 10_000_000,
+                None,
                 None,
                 None
             ),
@@ -2496,6 +2575,7 @@ mod backing_tests {
                     Mode::Duplicating,
                     rows,
                     None,
+                    None,
                     None
                 ),
                 SinkBacking::Spill
@@ -2508,6 +2588,7 @@ mod backing_tests {
                     &MemoryBudget::with_available(Some(256 * GIB)),
                     Mode::Duplicating,
                     rows,
+                    None,
                     None,
                     None
                 ),
@@ -2527,6 +2608,7 @@ mod backing_tests {
                 Mode::Partitioning,
                 3_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Spill
@@ -2536,6 +2618,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(54 * GIB)),
                 Mode::Partitioning,
                 100_000,
+                None,
                 None,
                 None
             ),
@@ -2552,6 +2635,7 @@ mod backing_tests {
                 Mode::Duplicating,
                 100_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Spill
@@ -2561,6 +2645,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(None),
                 Mode::Duplicating,
                 1_000,
+                None,
                 None,
                 None
             ),
@@ -2663,6 +2748,7 @@ mod backing_tests {
                 Mode::Duplicating,
                 5_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Spill
@@ -2672,6 +2758,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(54 * GIB)),
                 Mode::Duplicating,
                 5_000_000,
+                None,
                 Some(100),
                 None
             ),
@@ -2690,6 +2777,7 @@ mod backing_tests {
                 Mode::Duplicating,
                 1_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Ram
@@ -2699,6 +2787,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(25 * GIB)),
                 Mode::Duplicating,
                 1_000_000,
+                None,
                 Some(11_534),
                 None
             ),
@@ -2718,6 +2807,7 @@ mod backing_tests {
                 Mode::Partitioning,
                 1_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Spill
@@ -2727,6 +2817,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(20 * GIB)),
                 Mode::Partitioning,
                 1_000_000,
+                None,
                 Some(983),
                 None
             ),
@@ -2743,11 +2834,76 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(10_000 * GIB)),
                 Mode::Partitioning,
                 3_000_000,
+                None,
                 Some(8),
                 None
             ),
             SinkBacking::Spill
         ));
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::overview::level::gsd;
+    use crate::overview::writer::{LevelSpec, OverviewWriterOptions};
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field};
+    use geoarrow::array::GeometryBuilder;
+    use geoarrow::datatypes::GeometryType;
+    use geoarrow_array::GeoArrowArray;
+
+    /// #852 review F3: a level batch that fails to rebuild in the drain ends
+    /// its level unwritten. The level was finished short before, with the
+    /// rows rebuilt ahead of the failure, and the file could still be
+    /// finished.
+    #[test]
+    fn a_failed_rebuild_leaves_no_finished_level() {
+        let points: Vec<geo::Geometry> = (0..4)
+            .map(|i| geo::Geometry::Point(geo::Point::new(f64::from(i), 0.0)))
+            .collect();
+        let mut builder =
+            GeometryBuilder::new(GeometryType::new(Default::default())).with_prefer_multi(false);
+        builder.extend_from_iter(points.iter().map(Some));
+        let geometry = builder.finish();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            geometry.data_type().to_field("geometry", true),
+        ]));
+        let input = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..4)),
+                geometry.to_array_ref(),
+            ],
+        )
+        .unwrap();
+        // A shared batch whose schema has a column too many cannot rebuild.
+        let (rows, mut index) =
+            SharedRows::new(&input, &[0], &[&[0, 1, 2, 3]], input.column(1).clone()).unwrap();
+        let mut fields = schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, false)));
+        let broken = LevelBatch::shared(
+            Arc::new(Schema::new(fields)),
+            &Arc::new(rows),
+            index.remove(0),
+            UInt32Array::from_iter_values(0..4),
+            1,
+            Vec::new(),
+        );
+        let sink = LevelSink::Ram(vec![
+            LevelBatch::Owned(input.clone()),
+            broken,
+            LevelBatch::Owned(input),
+        ]);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let options =
+            OverviewWriterOptions::new(Mode::Duplicating, vec![LevelSpec::new(gsd(2), Some(2))]);
+        let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
+        let drained = drain_sink(&mut writer, 0, 12, sink, 1, &Pass2Timers::default());
+        assert!(drained.is_err());
+        assert!(writer.finish().is_err(), "the short level was finished");
     }
 }
 
@@ -2877,6 +3033,7 @@ mod sink_sample_tests {
                 MemoryProfile::Auto,
                 Mode::Duplicating,
                 59_689,
+                None,
                 Some(26),
                 None
             ),
@@ -3071,12 +3228,30 @@ mod sink_sample_tests {
         let (rows, index) = SharedRows::new(&input, &[0, 2], &kept, pool.clone()).unwrap();
         let rows = Arc::new(rows);
         let mut held = rows.held_bytes();
+        let per_level: Vec<Option<(LevelBatch, usize)>> = levels
+            .iter()
+            .zip(index)
+            .map(|(kept, index)| {
+                let at = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
+                let level = LevelBatch::shared(schema.clone(), &rows, index, at, 1, Vec::new());
+                held += level.held_bytes();
+                Some((level, 0))
+            })
+            .collect();
+        // The sink floor is paid once per shared row, not once per level.
+        let mut tuner = SinkAutoTuner::with_budget(false, 0, 0);
+        tuner.observe_shared(&per_level);
+        for (level, _) in per_level.iter().flatten() {
+            tuner.observe(level);
+        }
+        assert_eq!(
+            tuner.projected_bytes(),
+            held + n as u64 * SINK_ROW_ALLOC_OVERHEAD_BYTES
+        );
         let mut copied = 0u64;
-        for (kept, index) in levels.iter().zip(index) {
+        for (kept, (level, _)) in levels.iter().zip(per_level.into_iter().flatten()) {
             let at = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
             let geometry = arrow_select::take::take(pool.as_ref(), &at, None).unwrap();
-            let level = LevelBatch::shared(schema.clone(), &rows, index, at, 1, Vec::new());
-            held += level.held_bytes();
             let built = level.materialize().unwrap();
             let idx = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
             let want = RecordBatch::try_new(

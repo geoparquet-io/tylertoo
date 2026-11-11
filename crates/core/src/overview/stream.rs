@@ -1410,10 +1410,19 @@ fn buffered_rows(emitted: &[EmitLevel], finest: usize, options: &ConvertOptions)
     emitted[..buffered].iter().map(|e| e.hint).sum()
 }
 
+/// The input rows a RAM sink's levels share their properties from (#852):
+/// the cascade's levels do, unless clustering rewrites columns per level.
+/// The same rule the engine's `share` applies.
+fn shared_sink_rows(options: &ConvertOptions, input_rows: usize) -> Option<usize> {
+    (matches!(options.mode, Mode::Duplicating) && options.simplify.cascade && !options.cluster)
+        .then_some(input_rows)
+}
+
 /// What [`reserve_spill_cache`] sizes the spill from.
 struct SpillPlan<'a> {
     emitted: &'a [EmitLevel],
     finest: usize,
+    input_rows: usize,
     row_bytes: Option<u64>,
     avg_geom_bytes: Option<u64>,
 }
@@ -1467,6 +1476,7 @@ fn reserve_spill_cache(
     let SpillPlan {
         emitted,
         finest,
+        input_rows,
         row_bytes,
         avg_geom_bytes,
     } = plan;
@@ -1477,6 +1487,7 @@ fn reserve_spill_cache(
             options.profile,
             options.mode,
             buffered_rows,
+            shared_sink_rows(options, input_rows),
             avg_geom_bytes,
             row_bytes,
         ),
@@ -3708,6 +3719,7 @@ pub(crate) fn run_stages(
         SpillPlan {
             emitted,
             finest,
+            input_rows: num_rows,
             row_bytes,
             avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
         },
@@ -3747,6 +3759,7 @@ pub(crate) fn run_stages(
         options.profile,
         options.mode,
         buffered_rows(emitted, finest, options),
+        shared_sink_rows(options, num_rows),
         (num_rows > 0).then(|| geom_bytes / num_rows as u64),
         row_bytes,
     );
@@ -11168,6 +11181,7 @@ mod tests {
                 SpillPlan {
                     emitted: &levels,
                     finest: 2,
+                    input_rows: 3_000,
                     row_bytes: Some(row),
                     avg_geom_bytes: None,
                 },
