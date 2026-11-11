@@ -35,8 +35,12 @@
     center: [-53, -14],
     zoom: 3.5,
     cooperativeGestures: true,
+    attributionControl: false,
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }));
+  // A small "i" that opens the credits on click; the caption below the map
+  // carries them too. MapLibre opens a compact control on load: close it.
+  map.addControl(new maplibregl.AttributionControl({ compact: true }));
   map.addControl(new maplibregl.FullscreenControl());
 
   const legend = document.createElement("div");
@@ -79,6 +83,7 @@
       paint: { "line-color": "#05221d", "line-width": 1 },
     });
     drawLegend();
+    el.querySelector(".maplibregl-ctrl-attrib")?.classList.remove("maplibregl-compact-show");
   });
   map.on("zoomend", drawLegend);
   map.on("click", (e) => {

@@ -87,6 +87,31 @@
   margin-right: 0.3rem;
   vertical-align: middle;
 }
+/* The credits toggle: a small, faint "i" that opens on click. */
+.tutorial-map .maplibregl-ctrl-attrib.maplibregl-compact {
+  min-height: 16px;
+  margin: 0 4px 4px 0;
+  padding: 0 16px 0 0;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  font-size: 0.6rem;
+}
+.tutorial-map .maplibregl-ctrl-attrib.maplibregl-compact-show {
+  padding: 0 20px 0 6px;
+  background: rgba(255, 255, 255, 0.85);
+}
+.tutorial-map .maplibregl-ctrl-attrib-button {
+  width: 16px;
+  height: 16px;
+  background-size: 12px;
+  background-color: rgba(255, 255, 255, 0.6);
+  border-radius: 8px;
+  opacity: 0.6;
+}
+.tutorial-map .maplibregl-ctrl-attrib-button:hover {
+  opacity: 1;
+}
 .tutorial-map-caption {
   font-size: 0.7rem;
   color: var(--md-default-fg-color--light);
