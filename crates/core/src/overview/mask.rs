@@ -267,11 +267,19 @@ impl LoadedMask {
     // shortcut: refuses a CRS mismatch; reprojection (#670) replaces this check.
     pub(crate) fn into_input_crs(self, input: Crs) -> Result<MultiPolygon<f64>, ConvertError> {
         match self.crs {
-            Some(crs) if crs != input => Err(invalid(format!(
-                "the mask is in {crs:?} but the input is in {input:?}; reproject the mask \
-                 to the input's CRS"
-            ))
-            .into()),
+            Some(crs) if crs != input => {
+                let name = |c| match c {
+                    Crs::Epsg4326 => "EPSG:4326",
+                    Crs::Epsg3857 => "EPSG:3857",
+                };
+                Err(invalid(format!(
+                    "the mask is in {} but the input is in {}; reproject the mask to the \
+                     input's CRS",
+                    name(crs),
+                    name(input)
+                ))
+                .into())
+            }
             _ => Ok(self.polygons),
         }
     }
@@ -635,9 +643,13 @@ mod tests {
         let loaded = load(&MaskSource::Path(ok)).unwrap();
         assert_eq!(loaded.polygons.0.len(), 1);
         assert_eq!(loaded.crs, Some(Crs::Epsg4326));
+        let err = loaded
+            .into_input_crs(Crs::Epsg3857)
+            .unwrap_err()
+            .to_string();
         assert!(
-            loaded.into_input_crs(Crs::Epsg3857).is_err(),
-            "CRS mismatch"
+            err.contains("the mask is in EPSG:4326 but the input is in EPSG:3857"),
+            "{err}"
         );
 
         let (_d, line) = write(
