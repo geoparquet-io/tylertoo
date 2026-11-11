@@ -15,8 +15,8 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use geo::{BoundingRect, Geometry, Rect};
-use geoarrow::array::GeometryBuilder;
-use geoarrow::datatypes::GeometryType;
+use geoarrow::array::{GeometryBuilder, PolygonBuilder};
+use geoarrow::datatypes::{Dimension, GeometryType, PolygonType};
 use geoarrow_array::GeoArrowArray;
 use geoparquet::writer::{
     GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
@@ -56,6 +56,26 @@ const SQUARES: [(&str, u32, &str, [f64; 4]); 2] = [
 /// Write `rects` (one row group each) as WKB GeoParquet with a bbox covering
 /// and a PROJJSON CRS carrying `epsg` as its id.
 fn write_input(path: &Path, epsg: u32, name: &str, rects: &[[f64; 4]]) {
+    let groups: Vec<Vec<Option<Geometry>>> = rects
+        .iter()
+        .map(|r| {
+            vec![Some(Geometry::Polygon(
+                Rect::new((r[0], r[1]), (r[2], r[3])).to_polygon(),
+            ))]
+        })
+        .collect();
+    write_groups(path, epsg, name, GeoParquetWriterEncoding::WKB, &groups);
+}
+
+/// Write each of `groups` as one row group, in `encoding`, with ids
+/// `<stem>-<row>` counted across the file.
+fn write_groups(
+    path: &Path,
+    epsg: u32,
+    name: &str,
+    encoding: GeoParquetWriterEncoding,
+    groups: &[Vec<Option<Geometry>>],
+) {
     let projjson = serde_json::json!({
         "type": "ProjectedCRS",
         "name": name,
@@ -66,23 +86,36 @@ fn write_input(path: &Path, epsg: u32, name: &str, rects: &[[f64; 4]]) {
     let typ = GeometryType::new(Arc::new(md));
     let file = std::fs::File::create(path).unwrap();
     let options = GeoParquetWriterOptionsBuilder::default()
-        .set_encoding(GeoParquetWriterEncoding::WKB)
+        .set_encoding(encoding)
         .set_generate_covering(true)
         .build();
     let mut encoder = None;
     let mut writer = None;
-    for (i, r) in rects.iter().enumerate() {
-        let geom = Geometry::Polygon(Rect::new((r[0], r[1]), (r[2], r[3])).to_polygon());
-        let mut b = GeometryBuilder::new(typ.clone()).with_prefer_multi(false);
-        b.extend_from_iter(std::iter::once(Some(&geom)));
-        let arr = b.finish();
+    let mut row = 0;
+    for geoms in groups {
+        let arr: Arc<dyn GeoArrowArray> = if matches!(encoding, GeoParquetWriterEncoding::WKB) {
+            let mut b = GeometryBuilder::new(typ.clone()).with_prefer_multi(false);
+            b.extend_from_iter(geoms.iter().map(Option::as_ref));
+            Arc::new(b.finish())
+        } else {
+            // Native encoding needs one geometry type: polygons.
+            let polys: Vec<Option<geo::Polygon>> = geoms
+                .iter()
+                .map(|g| g.clone().map(|g| g.try_into().unwrap()))
+                .collect();
+            let ptyp = PolygonType::new(Dimension::XY, typ.metadata().clone());
+            Arc::new(PolygonBuilder::from_nullable_polygons(&polys, ptyp).finish())
+        };
         let schema = Arc::new(Schema::new(vec![
             Arc::new(Field::new("id", DataType::Utf8, false)),
             Arc::new(arr.data_type().to_field("geometry", true)),
         ]));
-        let id = format!("{}-{i}", path.file_stem().unwrap().to_string_lossy());
-        let columns: Vec<ArrayRef> =
-            vec![Arc::new(StringArray::from(vec![id])), arr.to_array_ref()];
+        let stem = path.file_stem().unwrap().to_string_lossy();
+        let ids: Vec<String> = (row..row + geoms.len())
+            .map(|i| format!("{stem}-{i}"))
+            .collect();
+        row += geoms.len();
+        let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(ids)), arr.to_array_ref()];
         let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
         let enc = encoder.get_or_insert_with(|| {
             GeoParquetRecordBatchEncoder::try_new(&schema, &options).unwrap()
@@ -322,4 +355,89 @@ fn layer_column_stages_projected_input_in_lon_lat() {
         !meta.to_string().contains("xmin"),
         "covering exported: {meta}"
     );
+}
+
+/// Native GeoArrow input takes the buffer rewrite, not the WKB one: a
+/// polygon with a hole (nested ring offsets), a null row, and batches the
+/// reader slices out of a multi-row row group must all come out in degrees.
+#[test]
+fn native_geoarrow_input_is_reprojected_end_to_end() {
+    use geo::{Contains, Polygon};
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("nl.parquet");
+    let nl = SQUARES[0].3;
+    let ring = |r: [f64; 4]| {
+        Rect::new((r[0], r[1]), (r[2], r[3]))
+            .to_polygon()
+            .exterior()
+            .clone()
+    };
+    let hole = [nl[0] + 250.0, nl[1] + 250.0, nl[2] - 250.0, nl[3] - 250.0];
+    let holed = Geometry::Polygon(Polygon::new(ring(nl), vec![ring(hole)]));
+    let east = [nl[0] + 2_000.0, nl[1], nl[2] + 2_000.0, nl[3]];
+    let plain = Geometry::Polygon(Rect::new((east[0], east[1]), (east[2], east[3])).to_polygon());
+    let groups = [vec![Some(holed), None, Some(plain)], vec![None]];
+    let wkb = dir.path().join("wkb");
+    std::fs::create_dir(&wkb).unwrap();
+    let wkb_input = wkb.join("nl.parquet");
+    for (path, encoding) in [
+        (&input, GeoParquetWriterEncoding::GeoArrow),
+        (&wkb_input, GeoParquetWriterEncoding::WKB),
+    ] {
+        write_groups(path, 28992, SQUARES[0].2, encoding, &groups);
+    }
+    let builder = tylertoo_io::open_parquet(std::fs::File::open(&input).unwrap()).unwrap();
+    let gtype = builder
+        .schema()
+        .field_with_name("geometry")
+        .unwrap()
+        .data_type()
+        .clone();
+    assert!(
+        !matches!(
+            gtype,
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+        ),
+        "fixture must be native GeoArrow, got {gtype:?}"
+    );
+
+    // Batches of one row make the reader slice the three-row row group.
+    let opts = options().with_read_batch_size(1);
+    let overview = dir.path().join("ov.parquet");
+    let report = convert_to_overviews(&input, &overview, &opts).unwrap();
+    assert_eq!(report.input_features, 2);
+    let (b, ids) = overview_bounds(&overview);
+    assert_eq!(ids, ["nl-0", "nl-2"]);
+    assert!(b[2] < 6.0 && b[3] < 52.0, "lon/lat output, got {b:?}");
+    // The WKB rewrite of the same rows is the oracle.
+    let wkb_overview = dir.path().join("wkb.parquet");
+    convert_to_overviews(&wkb_input, &wkb_overview, &opts).unwrap();
+    let (want, _) = overview_bounds(&wkb_overview);
+    for (got, want) in b.iter().zip(want) {
+        assert!((got - want).abs() < 1e-9, "native {b:?}, WKB {want:?}");
+    }
+
+    // The hole survives: its centre, in degrees, is inside no output polygon.
+    // The NL square spans about 0.0144° of longitude and 0.009° of latitude
+    // from its south-west corner, `b[0..2]`; the hole is its middle half.
+    let centre = geo::Point::new(b[0] + 0.0072, b[1] + 0.0045);
+    let rim = geo::Point::new(b[0] + 0.001, b[1] + 0.001);
+    let builder = tylertoo_io::open_parquet(std::fs::File::open(&overview).unwrap()).unwrap();
+    let gidx = builder.schema().index_of("geometry").unwrap();
+    let gfield = builder.schema().field(gidx).clone();
+    let mut geoms = Vec::new();
+    for batch in builder.build().unwrap() {
+        let arr = geoarrow::array::from_arrow_array(batch.unwrap().column(gidx).as_ref(), &gfield)
+            .unwrap();
+        tylertoo_core::internal::batch_processor::extract_geometries_from_array(
+            arr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::internal::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
+    }
+    assert!(!geoms.is_empty());
+    assert!(geoms.iter().any(|g| g.contains(&rim)), "square missing");
+    assert!(geoms.iter().all(|g| !g.contains(&centre)), "hole filled");
 }
