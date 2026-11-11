@@ -173,13 +173,6 @@ struct PartitionBudget {
     fit_limit: Option<MemoryLimit>,
 }
 
-struct FanoutRows<'a> {
-    plans: &'a [LevelPlan],
-    targets: &'a [usize],
-    per_level: Vec<RowMembers>,
-    row_gaps: &'a [(u64, u16)],
-}
-
 #[derive(Clone, Copy)]
 struct TileTarget<'a> {
     zoom: u8,
@@ -188,6 +181,9 @@ struct TileTarget<'a> {
     key_hi: u64,
     assume_simple: bool,
     diagnostics: &'a crate::diagnostics::Diagnostics,
+    /// The geometry the clip started from: a piece that is still it is
+    /// [`TilePiece::Whole`].
+    source: &'a Geometry<f64>,
 }
 
 #[cfg(test)]
@@ -1466,6 +1462,16 @@ pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> Result<u8, Expo
 /// memory.
 const DEFAULT_PARTITION_TARGET: usize = 32_768;
 
+/// How much smaller `bounded` plans a level's partitions once the level
+/// takes several waves (#815). A wave keeps one partition per core, so its
+/// members shrink by this factor while every core still encodes one. Such a
+/// level already spills every wave but the one it encodes, so smaller waves
+/// add wave barriers but no spill; a one-wave level keeps its partitions, as
+/// splitting it would spill what it holds. The archive does not depend on
+/// the target. NZ parcels 4,458 -> 2,742 MiB, `BR_MT` 4,423 -> 2,384 MiB
+/// export-only.
+const BOUNDED_MULTI_WAVE_SPLIT: usize = 4;
+
 /// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing.
 ///
 /// The size comes from the machine's available parallelism (see
@@ -2213,26 +2219,32 @@ fn plan_level(
         ref budget,
         ..
     } = *inputs;
-    let partitions = plan_partitions(tile_counts, zoom, partition_target);
-    // Per-level memory guard (#311): on `auto`, narrow the wave from THIS
-    // level's densest planned partition so a dense finest zoom does not OOM
-    // the whole run. Explicit waves are honoured verbatim.
-    let wave = if auto_wave {
-        let w = memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, profile, budget);
-        if w < ceiling_wave {
-            let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
-            log::info!(
-                "[export] {}: wave {ceiling_wave} → {w} (densest partition {densest} \
-                 members × ~{} B/member resident, {} MiB budget) — #311 density guard",
-                label(),
-                member_bytes.unwrap_or(0),
-                export_collect_bytes(profile, budget) / (1024 * 1024),
-            );
-        }
-        w
-    } else {
-        ceiling_wave
+    let plan = |target: usize| {
+        let partitions = plan_partitions(tile_counts, zoom, target);
+        let wave = if auto_wave {
+            memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, profile, budget)
+        } else {
+            ceiling_wave
+        };
+        (partitions, wave)
     };
+    // Per-level memory guard (#311): on `auto`, the wave is narrowed from
+    // THIS level's densest planned partition so a dense finest zoom does not
+    // OOM the whole run. Explicit waves are honoured verbatim.
+    let (mut partitions, mut wave) = plan(partition_target);
+    if profile == MemoryProfile::Bounded && partitions.len() > wave {
+        (partitions, wave) = plan(partition_target / BOUNDED_MULTI_WAVE_SPLIT);
+    }
+    if wave < ceiling_wave {
+        let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
+        log::info!(
+            "[export] {}: wave {ceiling_wave} → {wave} (densest partition {densest} \
+             members × ~{} B/member resident, {} MiB budget) — #311 density guard",
+            label(),
+            member_bytes.unwrap_or(0),
+            export_collect_bytes(profile, budget) / (1024 * 1024),
+        );
+    }
     LevelPlan {
         zoom,
         partitions,
@@ -4420,6 +4432,38 @@ fn key_to_xy(key: u64, zoom: u8) -> (u32, u32) {
     (x, y)
 }
 
+/// A member's geometry: its own, or the feature's decoded geometry shared by
+/// every level whose tile holds the feature unclipped (#815: the partitioning
+/// fill held one copy per level). Reads as a plain [`Geometry`].
+enum MemberGeom {
+    Owned(Geometry<f64>),
+    Shared(Arc<Geometry<f64>>),
+}
+
+impl std::ops::Deref for MemberGeom {
+    type Target = Geometry<f64>;
+
+    fn deref(&self) -> &Geometry<f64> {
+        match self {
+            MemberGeom::Owned(g) => g,
+            MemberGeom::Shared(g) => g,
+        }
+    }
+}
+
+/// A feature's share of one tile: the feature whole, when the tile's
+/// buffered bounds hold it, or its clip.
+enum TilePiece {
+    Whole,
+    Clipped(Geometry<f64>),
+}
+
+impl From<Geometry<f64>> for MemberGeom {
+    fn from(g: Geometry<f64>) -> Self {
+        MemberGeom::Owned(g)
+    }
+}
+
 /// One tile member: a feature's clipped geometry destined for the tile with
 /// key `key`, the feature's band-order sequence number (stable within-tile
 /// ordering), the feature's MVT properties (shared across the feature's tile
@@ -4429,7 +4473,7 @@ fn key_to_xy(key: u64, zoom: u8) -> (u32, u32) {
 struct Member {
     key: u64,
     seq: u64,
-    geom: Geometry<f64>,
+    geom: MemberGeom,
     props: SharedProps,
     /// `Some` on every member when [`ExportOptions::feature_id`] is set
     /// (every row of the file validated up front, #443); `None` when it is
@@ -5159,7 +5203,7 @@ fn decode_member(cur: &mut SpillCursor<'_>, names: &mut SpillNames) -> Result<Me
     Ok(Member {
         key,
         seq,
-        geom,
+        geom: geom.into(),
         props: Arc::new(props),
         id,
         gap,
@@ -5568,11 +5612,14 @@ fn fill_member_store(
     Ok(store)
 }
 
-/// Decode one band batch and fan its members out: clip every feature (in
-/// parallel) at each including level's zoom over the **full** key range, then
-/// route each member to its `(level, partition wave)` bucket. The legacy
-/// analogue is [`finish_group`]; see the section comment for why the
-/// results are byte-identical.
+/// Decode one band batch and fan its members out: per including level, clip
+/// every feature (in parallel) at the level's zoom over the **full** key
+/// range, then route each member to its `(level, partition wave)` bucket
+/// before the next level is clipped, so one level's clipped batch is held at
+/// a time. A member the clip left whole shares the feature's decoded
+/// geometry with every other level's (#815). The legacy analogue is
+/// [`finish_group`]; see the section comment for why the results are
+/// byte-identical.
 fn fanout_batch_members(
     batch: &RecordBatch,
     band: usize,
@@ -5595,6 +5642,7 @@ fn fanout_batch_members(
     let geoms = decode_batch_geometries(batch, &schema, geom_idx, crs, timers, diagnostics)?;
     let row_gaps = ExportTimers::time(&timers.decode, || gaps.batch(&geoms));
     debug_assert!(row_gaps.iter().all(|&(_, b)| usize::from(b) == band));
+    let geoms: Vec<Arc<Geometry<f64>>> = geoms.into_iter().map(Arc::new).collect();
 
     // Band `j` belongs to every level `k >= j`'s render set (partitioning
     // prefix). A level with no planned partitions sized no tiles, so no
@@ -5603,52 +5651,82 @@ fn fanout_batch_members(
     let targets: Vec<usize> = (band..plans.len())
         .filter(|&k| !plans[k].partitions.is_empty())
         .collect();
-    // `[target][row]` -> the row's `(key, clipped geometry)` members at that
-    // target level.
-    let per_level: Vec<RowMembers> = targets
-        .iter()
-        .map(|&k| {
-            geoms
-                .par_iter()
-                .map(|g| {
-                    ExportTimers::time(&timers.clip, || {
-                        let finest = (k + 1 == plans.len()).then_some(plans[k].zoom);
-                        let g = finest_zoom_geometry(g, finest, opts, diagnostics);
-                        feature_tile_members(&g, plans[k].zoom, opts, 0, u64::MAX, diagnostics)
-                    })
-                })
-                .collect()
-        })
-        .collect();
-    drop(geoms);
 
-    // #535: the rest (property extraction + routing into the store) is
-    // `decode`, minus any spill flush a `store.push` triggers, which the fill
-    // charges to `spill_write` instead.
+    // #535: property extraction and routing into the store are `decode`,
+    // minus any spill flush a `store.push` triggers, which the fill charges
+    // to `spill_write` instead.
     let t_route = Instant::now();
     let flushed_before = store.flush_time;
+    // Each row's properties, materialized once and shared via `Arc` by its
+    // members at every level (as the legacy path does per wave).
     let cols = AttrColumns::new(&schema, geom_idx, published, feature_id);
-    let routed = route_fanout_rows(
-        batch,
-        &cols,
-        FanoutRows {
-            plans,
-            targets: &targets,
-            per_level,
-            row_gaps: &row_gaps,
-        },
-        seq,
-        store,
-        diagnostics,
-    );
+    let mut attrs = cols.extract(batch);
+    let rows: Vec<(SharedProps, Option<u64>)> = (0..batch.num_rows())
+        .map(|row| attrs.row(row))
+        .collect::<Result<_, _>>()?;
+    for (row, (_, id)) in rows.iter().enumerate() {
+        if let Some(id) = *id {
+            for &k in &targets {
+                diagnostics.source_member_loss(
+                    *seq + row as u64,
+                    id,
+                    plans[k].zoom,
+                    crate::diagnostics::SourceLossCause::ClipDropped,
+                )?;
+            }
+        }
+    }
+    let mut routed = t_route.elapsed();
+    for &k in &targets {
+        let plan = &plans[k];
+        let finest = (k + 1 == plans.len()).then_some(plan.zoom);
+        let clipped: RowMembers = geoms
+            .par_iter()
+            .map(|g| {
+                ExportTimers::time(&timers.clip, || {
+                    shared_tile_members(
+                        MemberSource::Shared(g),
+                        finest,
+                        plan.zoom,
+                        opts,
+                        (0, u64::MAX),
+                        diagnostics,
+                    )
+                })
+            })
+            .collect();
+        let t_level = Instant::now();
+        for (row, items) in clipped.into_iter().enumerate() {
+            let (props, id) = &rows[row];
+            let (gap, band) = row_gaps[row];
+            for (key, geom) in items {
+                let pidx = route_partition(&plan.partitions, key);
+                store.push(
+                    k,
+                    pidx / plan.wave.max(1),
+                    Member {
+                        key,
+                        seq: *seq + row as u64,
+                        geom,
+                        props: Arc::clone(props),
+                        id: *id,
+                        gap,
+                        band,
+                    },
+                )?;
+            }
+        }
+        routed += t_level.elapsed();
+    }
+    *seq += batch.num_rows() as u64;
     let flushed = store.flush_time.saturating_sub(flushed_before);
-    add_nanos(&timers.decode, t_route.elapsed().saturating_sub(flushed));
-    routed
+    add_nanos(&timers.decode, routed.saturating_sub(flushed));
+    Ok(())
 }
 
 /// Per row of a batch, the row's `(key, clipped geometry)` members at one
 /// target level.
-type RowMembers = Vec<Vec<(u64, Geometry<f64>)>>;
+type RowMembers = Vec<TileMembers>;
 
 /// A feature's MVT properties, shared across its tile members.
 ///
@@ -5657,70 +5735,6 @@ type RowMembers = Vec<Vec<(u64, Geometry<f64>)>>;
 /// materializing a row costs a refcount bump per property, not a `String`
 /// allocation.
 type SharedProps = Arc<Vec<(Arc<str>, PropertyValue)>>;
-
-/// [`fanout_batch_members`]' second half: attach each member-producing row's
-/// properties (materialized once per row, shared via `Arc`) and push its
-/// members into their `(level, wave)` store buckets, in band order.
-fn route_fanout_rows(
-    batch: &RecordBatch,
-    cols: &AttrColumns<'_>,
-    inputs: FanoutRows<'_>,
-    seq: &mut u64,
-    store: &mut MemberStore,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<(), ExportError> {
-    let FanoutRows {
-        plans,
-        targets,
-        mut per_level,
-        row_gaps,
-    } = inputs;
-    // Extract property columns once per batch; materialize per-feature props
-    // only for rows that produced members at any level, shared across the
-    // row's members via `Arc` (as the legacy path does per wave).
-    let mut attrs = cols.extract(batch);
-    for row in 0..batch.num_rows() {
-        let (props, id) = attrs.row(row)?;
-        if let Some(id) = id {
-            for &k in targets {
-                diagnostics.source_member_loss(
-                    *seq,
-                    id,
-                    plans[k].zoom,
-                    crate::diagnostics::SourceLossCause::ClipDropped,
-                )?;
-            }
-        }
-        if per_level.iter().all(|rows| rows[row].is_empty()) {
-            *seq += 1;
-            continue;
-        }
-        let (gap, band) = row_gaps[row];
-        for (ti, &k) in targets.iter().enumerate() {
-            let items = std::mem::take(&mut per_level[ti][row]);
-            let plan = &plans[k];
-            for (key, geom) in items {
-                let pidx = route_partition(&plan.partitions, key);
-                let wave = pidx / plan.wave.max(1);
-                store.push(
-                    k,
-                    wave,
-                    Member {
-                        key,
-                        seq: *seq,
-                        geom,
-                        props: Arc::clone(&props),
-                        id,
-                        gap,
-                        band,
-                    },
-                )?;
-            }
-        }
-        *seq += 1;
-    }
-    Ok(())
-}
 
 /// Pass-2 drain for one wave under the single-read path: take the wave's
 /// buffered members, bucket them per partition (exactly as
@@ -7116,7 +7130,7 @@ fn finest_zoom_geometry<'g>(
 }
 
 /// One feature's clipped pieces, one per tile key.
-type TileMembers = Vec<(u64, Geometry<f64>)>;
+type TileMembers = Vec<(u64, MemberGeom)>;
 
 /// A group of consecutive read batches, decoded and clipped by
 /// [`clip_group`], waiting for [`finish_group`] to append their members to
@@ -7140,8 +7154,9 @@ type TileMembers = Vec<(u64, Geometry<f64>)>;
 struct ClippedGroup {
     batches: Vec<RecordBatch>,
     geom_idxs: Vec<usize>,
-    /// The decoded geometries, kept for the in-order gap walk.
-    geoms: Vec<Vec<Geometry<f64>>>,
+    /// The decoded geometries' bounding rects, kept for the in-order gap
+    /// walk; the geometries themselves went to their members.
+    rects: Vec<Vec<Option<geo::Rect<f64>>>>,
     /// Per batch, per row: the row's `(key, clipped geometry)` members.
     row_members: Vec<Vec<TileMembers>>,
 }
@@ -7173,20 +7188,24 @@ fn clip_group(
         .transpose()?;
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
     // range. #535: `clip` is timed per geometry inside the closure.
-    let row_members = geoms
+    let measure = valve_merges(ctx.opts);
+    let rects = geoms
         .par_iter()
+        .map(|geoms| RowGapCursor::rects(measure, geoms))
+        .collect();
+    let row_members = geoms
+        .into_par_iter()
         .map(|geoms| {
             geoms
-                .par_iter()
+                .into_par_iter()
                 .map(|g| {
                     ExportTimers::time(&timers.clip, || {
-                        let g = finest_zoom_geometry(g, finest_zoom, ctx.opts, diagnostics);
-                        let mut members = feature_tile_members(
-                            &g,
+                        let mut members = shared_tile_members(
+                            MemberSource::Owned(g),
+                            finest_zoom,
                             ctx.zoom,
                             ctx.opts,
-                            key_lo,
-                            key_hi,
+                            (key_lo, key_hi),
                             diagnostics,
                         );
                         if let Some(tiles) = ctx.tiles {
@@ -7201,7 +7220,7 @@ fn clip_group(
     Ok(ClippedGroup {
         batches,
         geom_idxs,
-        geoms,
+        rects,
         row_members,
     })
 }
@@ -7221,7 +7240,7 @@ fn finish_group(
     let ClippedGroup {
         batches,
         geom_idxs,
-        geoms,
+        rects,
         mut row_members,
     } = group;
     let batches = &batches;
@@ -7232,10 +7251,8 @@ fn finish_group(
         work.collect_groups += 1;
     }
     let row_gaps: Vec<Vec<(u64, u16)>> = ExportTimers::time(&timers.decode, || {
-        geoms.iter().map(|g| rows.gaps.batch(g)).collect()
+        rects.iter().map(|r| rows.gaps.batch_rects(r)).collect()
     });
-    // Freed in the pool (#740).
-    geoms.into_par_iter().flatten().for_each(drop);
 
     // Property extraction and member routing, per chunk in the pool. #535:
     // `decode`, timed per chunk and around the merge below.
@@ -7378,7 +7395,7 @@ struct ChunkMembers {
 fn collect_member_chunk(
     input: &ChunkInput<'_>,
     first: usize,
-    items: &mut [Vec<(u64, Geometry<f64>)>],
+    items: &mut [TileMembers],
 ) -> Result<ChunkMembers, ExportError> {
     #[cfg(test)]
     if rayon::current_thread_index().is_none() {
@@ -7464,14 +7481,14 @@ fn collect_member_chunk(
 /// 180°–181° part at -180°…-179° in the west-edge tile. Where two copies land
 /// in one tile (z0 holds the whole world), their pieces join into one
 /// multi-geometry, so a feature still emits at most one member per key.
-fn feature_tile_members(
+fn feature_tile_pieces(
     geom: &Geometry<f64>,
     zoom: u8,
     opts: &ExportOptions,
     key_lo: u64,
     key_hi: u64,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Vec<(u64, Geometry<f64>)> {
+) -> Vec<(u64, TilePiece)> {
     let Some(rect) = geom.bounding_rect() else {
         return Vec::new();
     };
@@ -7492,12 +7509,15 @@ fn feature_tile_members(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source: geom,
             },
             &mut out,
         );
         return out;
     }
-    let mut by_key: BTreeMap<u64, Geometry<f64>> = BTreeMap::new();
+    // A piece of the stored copy (shift 0) that no other copy joins stays
+    // whole.
+    let mut by_key: BTreeMap<u64, TilePiece> = BTreeMap::new();
     for shift in wrap_shifts(&bbox, buffer) {
         let copy = shift_lng(geom, shift);
         copy_tile_members(
@@ -7510,17 +7530,116 @@ fn feature_tile_members(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source: &copy,
             },
             &mut out,
         );
+        let owned = |piece| match piece {
+            TilePiece::Whole => copy.clone().into_owned(),
+            TilePiece::Clipped(g) => g,
+        };
         for (key, piece) in out.drain(..) {
-            match by_key.remove(&key) {
-                Some(prev) => by_key.insert(key, join_wrapped_pieces(prev, piece)),
-                None => by_key.insert(key, piece),
+            let piece = match by_key.remove(&key) {
+                Some(TilePiece::Whole) => {
+                    TilePiece::Clipped(join_wrapped_pieces(geom.clone(), owned(piece)))
+                }
+                Some(TilePiece::Clipped(prev)) => {
+                    TilePiece::Clipped(join_wrapped_pieces(prev, owned(piece)))
+                }
+                None if shift == 0.0 => piece,
+                None => TilePiece::Clipped(owned(piece)),
             };
+            by_key.insert(key, piece);
         }
     }
     by_key.into_iter().collect()
+}
+
+/// [`feature_tile_pieces`] with each whole piece a copy of `geom`.
+fn feature_tile_members(
+    geom: &Geometry<f64>,
+    zoom: u8,
+    opts: &ExportOptions,
+    key_lo: u64,
+    key_hi: u64,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<(u64, Geometry<f64>)> {
+    feature_tile_pieces(geom, zoom, opts, key_lo, key_hi, diagnostics)
+        .into_iter()
+        .map(|(key, piece)| match piece {
+            TilePiece::Whole => (key, geom.clone()),
+            TilePiece::Clipped(g) => (key, g),
+        })
+        .collect()
+}
+
+/// A feature's decoded geometry, as [`shared_tile_members`] takes it: its
+/// own, or shared with other levels (the partitioning fill, #815).
+enum MemberSource<'a> {
+    Owned(Geometry<f64>),
+    Shared(&'a Arc<Geometry<f64>>),
+}
+
+/// `source`'s members at `zoom`, at its finest-zoom simplification when
+/// `finest` is set, as member geometries. A tile that holds the feature
+/// whole takes the geometry instead of a copy (manby holds each feature
+/// once): an owned geometry moves into its one whole tile, or into one `Arc`
+/// that two or more share; a shared source is shared as it is. A point holds
+/// no coordinate heap, so its tiles hold it inline.
+fn shared_tile_members(
+    source: MemberSource<'_>,
+    finest: Option<u8>,
+    zoom: u8,
+    opts: &ExportOptions,
+    (key_lo, key_hi): (u64, u64),
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<(u64, MemberGeom)> {
+    let src: &Geometry<f64> = match &source {
+        MemberSource::Owned(g) => g,
+        MemberSource::Shared(g) => g,
+    };
+    let point = matches!(src, Geometry::Point(_));
+    let simplified = match finest_zoom_geometry(src, finest, opts, diagnostics) {
+        std::borrow::Cow::Owned(g) => Some(g),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    let pieces = feature_tile_pieces(
+        simplified.as_ref().unwrap_or(src),
+        zoom,
+        opts,
+        key_lo,
+        key_hi,
+        diagnostics,
+    );
+    let mut left = pieces
+        .iter()
+        .filter(|(_, piece)| matches!(piece, TilePiece::Whole))
+        .count();
+    let (shared, mut owned) = match (simplified, source) {
+        _ if left == 0 => (None, None),
+        (None, MemberSource::Shared(g)) if !point => (Some(Arc::clone(g)), None),
+        (None, MemberSource::Shared(g)) => (None, Some((**g).clone())),
+        (Some(g), _) | (None, MemberSource::Owned(g)) if left > 1 && !point => {
+            (Some(Arc::new(g)), None)
+        }
+        (Some(g), _) | (None, MemberSource::Owned(g)) => (None, Some(g)),
+    };
+    pieces
+        .into_iter()
+        .map(|(key, piece)| match piece {
+            TilePiece::Whole => {
+                left -= 1;
+                let geom = match &shared {
+                    Some(g) => MemberGeom::Shared(Arc::clone(g)),
+                    // The last whole tile takes it; earlier ones (points) copy.
+                    None if left == 0 => MemberGeom::Owned(owned.take().expect("whole geometry")),
+                    None => MemberGeom::Owned(owned.clone().expect("whole geometry")),
+                };
+                (key, geom)
+            }
+            TilePiece::Clipped(g) => (key, MemberGeom::Owned(g)),
+        })
+        .collect()
 }
 
 /// Longitude shift of each world copy of a feature with `bbox` that reaches
@@ -7634,7 +7753,7 @@ fn copy_tile_members(
     geom: &Geometry<f64>,
     bbox: &TileBounds,
     inputs: TileTarget<'_>,
-    out: &mut Vec<(u64, Geometry<f64>)>,
+    out: &mut Vec<(u64, TilePiece)>,
 ) {
     let TileTarget {
         zoom,
@@ -7643,6 +7762,7 @@ fn copy_tile_members(
         key_hi,
         assume_simple,
         diagnostics,
+        source,
     } = inputs;
     let bbox = *bbox;
     // Target leaf-tile ranges at `zoom` — the authority for which tiles this
@@ -7683,6 +7803,7 @@ fn copy_tile_members(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source,
             },
             &ranges,
             out,
@@ -7704,6 +7825,7 @@ fn copy_tile_members(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source,
             },
             &ranges,
             out,
@@ -7845,7 +7967,7 @@ fn feature_tile_members_direct(
     bbox: &TileBounds,
     inputs: TileTarget<'_>,
     ranges: &BboxTileRanges,
-    out: &mut Vec<(u64, Geometry<f64>)>,
+    out: &mut Vec<(u64, TilePiece)>,
 ) {
     let TileTarget {
         zoom,
@@ -7854,6 +7976,7 @@ fn feature_tile_members_direct(
         key_hi,
         assume_simple,
         diagnostics,
+        source: _,
     } = inputs;
     for tc in tiles_in_ranges(ranges, zoom) {
         let key = tile_key(tc.x, tc.y, zoom);
@@ -7863,7 +7986,7 @@ fn feature_tile_members_direct(
         let tb = tc.bounds();
         let buffer_deg = tb.width() * buffer_fraction(opts);
         if bbox_within_buffered(bbox, &tb, buffer_deg) {
-            out.push((key, geom.clone()));
+            out.push((key, TilePiece::Whole));
         } else if let Some(clipped) = clip_geometry_simple(
             geom,
             &tb,
@@ -7872,7 +7995,7 @@ fn feature_tile_members_direct(
             opts.simple_clip_fastpath,
             diagnostics,
         ) {
-            out.push((key, clipped));
+            out.push((key, TilePiece::Clipped(clipped)));
         }
     }
 }
@@ -7949,7 +8072,7 @@ fn split_feature_into_tiles(
     cur_bbox: &TileBounds,
     inputs: TileTarget<'_>,
     ranges: &BboxTileRanges,
-    out: &mut Vec<(u64, Geometry<f64>)>,
+    out: &mut Vec<(u64, TilePiece)>,
 ) {
     let TileTarget {
         zoom,
@@ -7958,6 +8081,7 @@ fn split_feature_into_tiles(
         key_hi,
         assume_simple,
         diagnostics,
+        source,
     } = inputs;
     // Prune: outside the feature's target tiles, or outside this partition.
     if !node_overlaps_ranges(node, zoom, ranges) || !node_key_overlaps(node, zoom, key_lo, key_hi) {
@@ -7980,7 +8104,12 @@ fn split_feature_into_tiles(
         // `geom.clone()` byte-for-byte, since every ancestor also fast-pathed
         // and `cur` is still the original geometry.
         if bbox_within_buffered(cur_bbox, &tb, buffer_deg) {
-            out.push((key, cur.clone()));
+            let piece = if std::ptr::eq(cur, source) {
+                TilePiece::Whole
+            } else {
+                TilePiece::Clipped(cur.clone())
+            };
+            out.push((key, piece));
         } else if let Some(clipped) = clip_geometry_simple(
             cur,
             &tb,
@@ -7989,7 +8118,7 @@ fn split_feature_into_tiles(
             opts.simple_clip_fastpath,
             diagnostics,
         ) {
-            out.push((key, clipped));
+            out.push((key, TilePiece::Clipped(clipped)));
         }
         return;
     }
@@ -8015,6 +8144,7 @@ fn split_feature_into_tiles(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source,
             },
             ranges,
             out,
@@ -8043,6 +8173,7 @@ fn split_feature_into_tiles(
                 key_hi,
                 assume_simple,
                 diagnostics,
+                source,
             },
             ranges,
             out,
@@ -8065,7 +8196,7 @@ fn fanout_children(
     child_bbox: &TileBounds,
     inputs: TileTarget<'_>,
     ranges: &BboxTileRanges,
-    out: &mut Vec<(u64, Geometry<f64>)>,
+    out: &mut Vec<(u64, TilePiece)>,
 ) {
     let TileTarget {
         zoom,
@@ -8074,6 +8205,7 @@ fn fanout_children(
         key_hi,
         assume_simple,
         diagnostics,
+        source,
     } = inputs;
     // M1 (#817): each child clips the whole parent piece, so a huge piece
     // forks at any depth; the four subtrees' members are appended in child
@@ -8083,7 +8215,7 @@ fn fanout_children(
     {
         #[cfg(test)]
         CASCADE_FORKS.with(|c| c.set(c.get() + 1));
-        let subtrees: Vec<Vec<(u64, Geometry<f64>)>> = children
+        let subtrees: Vec<Vec<(u64, TilePiece)>> = children
             .par_iter()
             .map(|&child| {
                 let mut members = Vec::new();
@@ -8098,6 +8230,7 @@ fn fanout_children(
                         key_hi,
                         assume_simple,
                         diagnostics,
+                        source,
                     },
                     ranges,
                     &mut members,
@@ -8121,6 +8254,7 @@ fn fanout_children(
                     key_hi,
                     assume_simple,
                     diagnostics,
+                    source,
                 },
                 ranges,
                 out,
@@ -8157,11 +8291,17 @@ fn members_direct_vec(
             key_hi,
             assume_simple,
             diagnostics: &crate::diagnostics::Diagnostics::default(),
+            source: geom,
         },
         &ranges,
         &mut out,
     );
-    out
+    out.into_iter()
+        .map(|(key, piece)| match piece {
+            TilePiece::Whole => (key, geom.clone()),
+            TilePiece::Clipped(g) => (key, g),
+        })
+        .collect()
 }
 
 /// Test helper: run the recursive cascade unconditionally (bypassing the
@@ -8195,11 +8335,17 @@ fn members_recursive_vec(
             key_hi,
             assume_simple,
             diagnostics: &crate::diagnostics::Diagnostics::default(),
+            source: geom,
         },
         &ranges,
         &mut out,
     );
-    out
+    out.into_iter()
+        .map(|(key, piece)| match piece {
+            TilePiece::Whole => (key, geom.clone()),
+            TilePiece::Clipped(g) => (key, g),
+        })
+        .collect()
 }
 
 /// Within-tile feature order (#361).
@@ -8736,7 +8882,8 @@ fn fill_features(
     let proj = crate::mvt::TileProjector::new(tb, opts.extent);
     // A polygon fill takes a polygon's tags when the tile has polygons: a
     // road's or a point's would colour it by the wrong attributes.
-    let polygonal = |m: &Member| matches!(m.geom, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
+    let polygonal =
+        |m: &Member| matches!(*m.geom, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
     let any_polygon = members.iter().any(polygonal);
     let hosts: Vec<[f64; 4]> = members
         .iter()
@@ -9215,7 +9362,7 @@ fn merge_to_fit(
         }
         let cached = quantized.get_or_insert_with(|| {
             crate::mvt::QuantizedPolygons::new(
-                ordered.iter().map(|m| (&m.geom, u64::from(m.band))),
+                ordered.iter().map(|m| (&*m.geom, u64::from(m.band))),
                 tb,
                 opts.extent,
             )
@@ -9599,7 +9746,7 @@ fn encode_level_tiles(
             members.push(Member {
                 key,
                 seq,
-                geom,
+                geom: geom.into(),
                 props: Arc::clone(&props),
                 id,
                 gap,
@@ -13086,7 +13233,7 @@ mod tests {
         let member = |geom: Geometry| Member {
             key: 0,
             seq: 0,
-            geom,
+            geom: geom.into(),
             props: Arc::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
@@ -13156,7 +13303,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: i as u64,
-                    geom,
+                    geom: geom.into(),
                     props: Arc::new(props),
                     id: None,
                     gap: GAP_NONE,
@@ -13788,7 +13935,7 @@ mod tests {
         let m = Member {
             key,
             seq: 0,
-            geom: geom.clone(),
+            geom: geom.clone().into(),
             props: Arc::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
@@ -13892,7 +14039,8 @@ mod tests {
                             geo::coord! { x: x + dx, y: y + dy },
                         )
                         .to_polygon(),
-                    ),
+                    )
+                    .into(),
                     props: Arc::new(vec![(Arc::from("n"), PropertyValue::UInt(i))]),
                     id: Some(i),
                     gap: if i == 0 { GAP_NONE } else { 10 },
@@ -14124,7 +14272,8 @@ mod tests {
                     geo::coord! { x: lng1, y: tb.lat_max },
                 )
                 .to_polygon(),
-            ),
+            )
+            .into(),
             props: Arc::new(vec![(
                 Arc::from("name"),
                 PropertyValue::String(name.to_string()),
@@ -14560,6 +14709,129 @@ mod tests {
             assert!((p.x() - -160.0).abs() < 1e-9, "z{zoom}: drawn at {p:?}");
             assert_eq!(members.len(), 1, "z{zoom}: one tile only: {members:?}");
         }
+    }
+
+    /// Every tile that holds a feature whole shares the decoded geometry
+    /// instead of holding its own copy (manby holds each feature once).
+    #[test]
+    fn tiles_holding_a_feature_whole_share_its_geometry() {
+        let opts = ExportOptions::default();
+        let zoom = 4;
+        let square = |x: f64, y: f64| {
+            Geometry::Polygon(
+                geo::Rect::new(
+                    geo::coord! { x: x, y: y },
+                    geo::coord! { x: x + 1e-6, y: y + 1e-6 },
+                )
+                .to_polygon(),
+            )
+        };
+        // On the x=7 | x=8 border: inside both tiles' buffers.
+        let source = Arc::new(square(1e-7, 10.0));
+        let members = shared_tile_members(
+            MemberSource::Shared(&source),
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(members.len(), 2);
+        let shared = |members: &[(u64, MemberGeom)], key: u64, source: &Arc<Geometry<f64>>| {
+            members.iter().any(|(k, g)| {
+                *k == key && matches!(g, MemberGeom::Shared(g) if Arc::ptr_eq(g, source))
+            })
+        };
+        for (key, _) in &members {
+            assert!(
+                shared(&members, *key, &source),
+                "tile {key} holds its own copy"
+            );
+        }
+
+        // Without a geometry other levels share, two whole tiles share one
+        // copy, and a single whole tile holds its own.
+        let members = shared_tile_members(
+            MemberSource::Owned((*source).clone()),
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let [(_, MemberGeom::Shared(a)), (_, MemberGeom::Shared(b))] = &members[..] else {
+            panic!("two whole tiles hold their own copies");
+        };
+        assert!(Arc::ptr_eq(a, b));
+        let inside = square(11.0, 10.0);
+        let coords = |g: &Geometry<f64>| match g {
+            Geometry::Polygon(p) => p.exterior().0.as_ptr(),
+            _ => unreachable!(),
+        };
+        let decoded = coords(&inside);
+        let members = shared_tile_members(
+            MemberSource::Owned(inside),
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let [(_, MemberGeom::Owned(g))] = &members[..] else {
+            panic!("one whole tile holds its own geometry");
+        };
+        assert_eq!(coords(g), decoded, "the tile copied the decoded geometry");
+
+        // A feature past the direct clip budget takes the cascade: the one
+        // tile that holds it whole shares it too.
+        let line: geo::LineString<f64> = (0..=DIRECT_CLIP_BUDGET)
+            .map(|i| geo::coord! { x: 11.0 + i as f64 * 1e-6, y: 10.0 })
+            .collect();
+        let source = Arc::new(Geometry::LineString(line));
+        let members = shared_tile_members(
+            MemberSource::Shared(&source),
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(members.len(), 1);
+        assert!(
+            shared(&members, members[0].0, &source),
+            "the cascade copied it"
+        );
+
+        // On the world edge, the stored copy's tile shares it; the shifted
+        // copy in the far tile's buffer is its own.
+        let lng = 180.0 - 0.5 * buffer_deg_at_zoom(zoom, &opts);
+        let source = Arc::new(square(lng, 10.0));
+        let members = shared_tile_members(
+            MemberSource::Shared(&source),
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let y = crate::tile::lng_lat_to_tile(lng, 10.0, zoom).y;
+        assert!(shared(&members, tile_key(15, y, zoom), &source));
+        assert!(!shared(&members, tile_key(0, y, zoom), &source));
+
+        // A point has no coordinates to share: each tile holds it inline.
+        let source = Arc::new(Geometry::Point(geo::Point::new(1e-6, 10.0)));
+        let members = shared_tile_members(
+            MemberSource::Shared(&source),
+            None,
+            zoom,
+            &opts,
+            (0, u64::MAX),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(members.len(), 2);
+        assert!(members
+            .iter()
+            .all(|(_, g)| matches!(g, MemberGeom::Owned(_))));
     }
 
     /// Tile buffers continue across the antimeridian. A point just west of
@@ -16598,7 +16870,7 @@ mod tests {
         let member = Member {
             key: tile_key(tiles[0].x, tiles[0].y, 4),
             seq: 0,
-            geom: poly.clone(),
+            geom: poly.clone().into(),
             props: Arc::new(vec![]),
             id: None,
             gap: GAP_NONE,
@@ -17001,7 +17273,7 @@ mod tests {
                 members.push(Member {
                     key,
                     seq: i as u64,
-                    geom,
+                    geom: geom.into(),
                     props: Arc::clone(&props),
                     id: None,
                     gap,
@@ -17273,7 +17545,7 @@ mod tests {
         Member {
             key: 0,
             seq,
-            geom: Geometry::Point(Point::new(x, y)),
+            geom: Geometry::Point(Point::new(x, y)).into(),
             props: Arc::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
@@ -17289,7 +17561,7 @@ mod tests {
         Member {
             key: 0,
             seq,
-            geom: Geometry::Point(Point::new(seq as f64 * 0.001, 0.0)),
+            geom: Geometry::Point(Point::new(seq as f64 * 0.001, 0.0)).into(),
             props: Arc::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
             gap: GAP_NONE,
@@ -17447,7 +17719,7 @@ mod tests {
         let mk = |key: u64, seq: u64, level: f64| Member {
             key,
             seq,
-            geom: Geometry::Point(Point::new(0.0, 0.0)),
+            geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
             props: Arc::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
             gap: GAP_NONE,
@@ -17479,7 +17751,7 @@ mod tests {
         let mk = |seq: u64, v: PropertyValue| Member {
             key: 0,
             seq,
-            geom: Geometry::Point(Point::new(0.0, 0.0)),
+            geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
             props: Arc::new(vec![("n".into(), v)]),
             id: None,
             gap: GAP_NONE,
@@ -17539,7 +17811,7 @@ mod tests {
         let kept = select_kept_members(&members, 5);
         let xs: Vec<f64> = kept
             .iter()
-            .map(|m| match &m.geom {
+            .map(|m| match &*m.geom {
                 Geometry::Point(p) => p.x(),
                 _ => unreachable!("built points"),
             })
@@ -17559,7 +17831,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: n as u64,
-                    geom: Geometry::LineString(LineString::from(coords)),
+                    geom: Geometry::LineString(LineString::from(coords)).into(),
                     props: Arc::new(Vec::new()),
                     id: None,
                     gap: GAP_NONE,
@@ -17668,7 +17940,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: i,
-                    geom: Geometry::LineString(coords.into_iter().collect()),
+                    geom: Geometry::LineString(coords.into_iter().collect()).into(),
                     props: Arc::new(vec![("level".into(), PropertyValue::Double(i as f64))]),
                     id: None,
                     gap: GAP_NONE,
@@ -17820,7 +18092,7 @@ mod tests {
             let m = Member {
                 key: tile_key(7, 11, 5) + i as u64,
                 seq: u64::MAX - i as u64,
-                geom: g,
+                geom: g.into(),
                 props: Arc::new(props.clone()),
                 id,
                 // #745: both the "no predecessor" sentinel and real values.
@@ -17910,6 +18182,123 @@ mod tests {
         );
     }
 
+    /// #815: `bounded` plans a level that takes several waves in a quarter
+    /// of the partition target, so each wave holds a quarter of the members;
+    /// a one-wave level, and `auto`, keep the target.
+    #[test]
+    fn bounded_multi_wave_levels_hold_a_quarter_of_the_members_per_wave() {
+        let plan = |tiles: u64, profile| {
+            let counts: BTreeMap<u64, usize> = (0..tiles)
+                .map(|t| (tile_key(u32::try_from(t).unwrap(), 0, 10), 1_000))
+                .collect();
+            plan_level(
+                &counts,
+                10,
+                &PartitionBudget {
+                    partition_target: 8_000,
+                    ceiling_wave: 4,
+                    auto_wave: false,
+                    member_bytes: None,
+                    fit_member_bytes: None,
+                    profile,
+                    budget: MemoryBudget::with_available(None),
+                    fit_limit: None,
+                },
+                String::new,
+            )
+        };
+        let wave_members = |p: &LevelPlan| {
+            p.partitions
+                .chunks(p.wave)
+                .map(|w| w.iter().map(|p| p.members).sum::<usize>())
+                .max()
+                .unwrap()
+        };
+        // 64 tiles of 1,000 members: 8 partitions, two waves of four.
+        let auto = plan(64, MemoryProfile::Auto);
+        assert_eq!(wave_members(&auto), 32_000);
+        assert_eq!(wave_members(&plan(64, MemoryProfile::Bounded)), 8_000);
+        // 32 tiles: one wave, kept whole.
+        assert_eq!(plan(32, MemoryProfile::Bounded).partitions.len(), 4);
+    }
+
+    /// #815: in a partitioning fill a feature that no level clips is held
+    /// once. Every level's member of it shares the decoded geometry, where
+    /// each level held its own copy (the copies were most of a Moldova
+    /// partitioning export's peak heap).
+    #[test]
+    fn partitioning_fill_holds_an_unclipped_feature_once() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let square = |x: f64, y: f64| {
+            Geometry::Polygon(geo::Polygon::new(
+                LineString::from(vec![(x, y), (x + 0.1, y), (x + 0.1, y + 0.1), (x, y)]),
+                vec![],
+            ))
+        };
+        // Squares well inside one tile at every level's zoom (z2, z4, z6).
+        let meta = write_partitioning_fixture(
+            tmp.path(),
+            &[
+                (vec![0, 1], vec![square(-100.3, 40.3), square(10.3, 10.3)]),
+                (vec![2], vec![square(50.3, -20.3)]),
+                (vec![3], vec![square(-60.3, 5.3)]),
+            ],
+        );
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        let opts = ExportOptions::default();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let scans = scan_all_levels(
+            &reader,
+            test_band(&band_source(&reader)),
+            Crs::Epsg4326,
+            &opts,
+            &ExportTimers::default(),
+            None,
+            &diagnostics,
+        )
+        .unwrap();
+        let plans: Vec<LevelPlan> = scans
+            .iter()
+            .enumerate()
+            .map(|(k, scan)| {
+                let zoom = zoom_for_level(&meta, k).unwrap();
+                let partitions = plan_partitions(&scan.tile_counts, zoom, DEFAULT_PARTITION_TARGET);
+                let wave = partitions.len().max(1);
+                LevelPlan {
+                    zoom,
+                    partitions,
+                    wave,
+                }
+            })
+            .collect();
+        let store = fill_member_store(
+            &reader,
+            &FanoutCtx {
+                crs: Crs::Epsg4326,
+                plans: &plans,
+                opts: &opts,
+                published: &PublishedNames::from_reader(&reader),
+                feature_id: None,
+                timers: &ExportTimers::default(),
+            },
+            StoreBacking {
+                backing: SinkBacking::Ram,
+                ram_budget: MEMBER_STORE_RAM_BUDGET,
+                resident: 0,
+            },
+            &diagnostics,
+        )
+        .unwrap();
+        let members: Vec<&Member> = store.buckets.iter().flatten().flatten().collect();
+        // At least one member per feature and level it renders at.
+        assert!(members.len() >= 2 + 3 + 4, "{}", members.len());
+        let held: HashSet<*const Geometry<f64>> = members
+            .iter()
+            .map(|m| std::ptr::from_ref::<Geometry<f64>>(&m.geom))
+            .collect();
+        assert_eq!(held.len(), 4, "one geometry per feature");
+    }
+
     /// The member store's spill path: bucket flushes append segments to one
     /// temp file; `take_wave` reads a wave's segments back in append order
     /// (plus any RAM remainder), returning exactly the members pushed to it.
@@ -17926,7 +18315,7 @@ mod tests {
         let mk = |key: u64, seq: u64| Member {
             key,
             seq,
-            geom: Geometry::Point(Point::new(seq as f64, -1.0)),
+            geom: Geometry::Point(Point::new(seq as f64, -1.0)).into(),
             props: Arc::new(vec![("id".into(), PropertyValue::Int(seq as i64))]),
             id: None,
             gap: GAP_NONE,
@@ -17957,7 +18346,7 @@ mod tests {
         let m = |props: Vec<(Arc<str>, PropertyValue)>| Member {
             key: 0,
             seq: 0,
-            geom: Geometry::LineString(LineString::from(vec![(0.0, 0.0), (1.0, 1.0)])),
+            geom: Geometry::LineString(LineString::from(vec![(0.0, 0.0), (1.0, 1.0)])).into(),
             props: Arc::new(props),
             id: None,
             gap: GAP_NONE,
@@ -17990,7 +18379,7 @@ mod tests {
         let mk = |seq: u64, props: Vec<(Arc<str>, PropertyValue)>| Member {
             key: 0,
             seq,
-            geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+            geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
             props: Arc::new(props),
             id: None,
             gap: GAP_NONE,
@@ -18044,7 +18433,7 @@ mod tests {
         let member = |seq: u64| Member {
             key: 0,
             seq,
-            geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+            geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
             props: Arc::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
@@ -18093,7 +18482,7 @@ mod tests {
                     Member {
                         key: 0,
                         seq,
-                        geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+                        geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
                         props: Arc::new(vec![(name, PropertyValue::UInt(seq))]),
                         id: None,
                         gap: GAP_NONE,
@@ -20297,7 +20686,7 @@ mod tests {
             locator: &locator,
             first_read: 0,
         };
-        let mut items: Vec<Vec<(u64, Geometry<f64>)>> = vec![Vec::new(); 3];
+        let mut items: Vec<TileMembers> = (0..3).map(|_| Vec::new()).collect();
         assert!(rayon::current_thread_index().is_none());
         collect_member_chunk(&input, 0, &mut items).unwrap();
         collect_member_chunk(&input, 1, &mut items[1..]).unwrap();
@@ -20326,7 +20715,7 @@ mod tests {
                     .map(|seq| Member {
                         key: 0,
                         seq,
-                        geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+                        geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
                         props: Arc::new(Vec::new()),
                         id: None,
                         gap: GAP_NONE,
@@ -20358,7 +20747,8 @@ mod tests {
                 geom: Geometry::Point(Point::new(
                     -170.0 + (i % 300) as f64 * 0.5,
                     10.0 + (i / 300) as f64 * 0.5,
-                )),
+                ))
+                .into(),
                 props: Arc::new(Vec::new()),
                 id: None,
                 gap: GAP_NONE,
@@ -20440,7 +20830,7 @@ mod diagnostic_row_alignment {
                 .map(|(row, geom)| Member {
                     key: 0,
                     seq: row as u64,
-                    geom,
+                    geom: geom.into(),
                     props: Arc::new(vec![]),
                     id: Some(100 + row as u64),
                     gap: if row == 0 { GAP_NONE } else { 1 },
@@ -20529,7 +20919,7 @@ mod diagnostic_row_alignment {
                 Member {
                     key: 0,
                     seq: row as u64,
-                    geom,
+                    geom: geom.into(),
                     id: Some(7),
                     props: Arc::new(vec![]),
                     gap: GAP_NONE,
@@ -20586,7 +20976,7 @@ mod diagnostic_row_alignment {
         let members = vec![Member {
             key: 0,
             seq: 0,
-            geom: triangle,
+            geom: triangle.into(),
             props: Arc::new(vec![]),
             id: Some(7),
             gap: GAP_NONE,

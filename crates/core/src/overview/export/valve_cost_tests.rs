@@ -111,7 +111,7 @@ fn vertex_heavy_members(rows: usize) -> Vec<Member> {
             })
             .collect();
         ring.push(ring[0]);
-        m.geom = Geometry::Polygon(Polygon::new(LineString::from(ring), Vec::new()));
+        m.geom = Geometry::Polygon(Polygon::new(LineString::from(ring), Vec::new())).into();
     }
     members
 }
@@ -313,7 +313,7 @@ fn square_members(rows: usize, overlapping: bool) -> Vec<Member> {
         .map(|(i, (geom, (gap, band)))| Member {
             key: tile_key(0, 0, 0),
             seq: i as u64,
-            geom,
+            geom: geom.into(),
             props: Arc::new(vec![
                 (Arc::clone(&parcel_key), PropertyValue::UInt(i as u64)),
                 (

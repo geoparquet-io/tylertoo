@@ -164,8 +164,13 @@ fn clip_ring(ring: &[Coord<f64>], bounds: &TileBounds) -> Vec<Coord<f64>> {
     // Close the ring if it has enough points
     if current.len() >= 3 {
         if current[0] != current[current.len() - 1] {
+            current.reserve_exact(1);
             current.push(current[0]);
         }
+        // Each pass sizes its output from its input, and a clipped ring keeps
+        // far fewer points than it was handed; it is held until its wave
+        // encodes, so it keeps only what it uses (about half its bytes).
+        current.shrink_to_fit();
         current
     } else {
         Vec::new()
@@ -855,6 +860,25 @@ mod tests {
         // Result may be None (degenerate) or Some with a tiny polygon.
         // Either is acceptable.
         let _ = clip_polygon_sh(&poly, &bounds);
+    }
+
+    /// A clipped ring holds no more than its points: the passes sized from
+    /// their input, and the closing point doubled a full ring.
+    #[test]
+    fn test_clipped_ring_holds_only_its_points() {
+        let bounds = unit_bounds();
+        let ring: Vec<Coord<f64>> = (0..64)
+            .map(|i| {
+                let t = f64::from(i) / 64.0 * std::f64::consts::TAU;
+                Coord {
+                    x: 0.5 + t.cos(),
+                    y: 0.5 + t.sin(),
+                }
+            })
+            .collect();
+        let clipped = clip_ring(&ring, &bounds);
+        assert!(clipped.len() >= 4);
+        assert_eq!(clipped.capacity(), clipped.len());
     }
 
     #[test]

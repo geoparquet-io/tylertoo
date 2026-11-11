@@ -6,7 +6,7 @@ fn point_member(x: u32, seq: u64) -> Member {
     Member {
         key: tile_key(x, 0, 1),
         seq,
-        geom: Geometry::Point(Point::new(-90.0 + x as f64 * 180.0, 40.0)),
+        geom: Geometry::Point(Point::new(-90.0 + x as f64 * 180.0, 40.0)).into(),
         props: Arc::new(Vec::new()),
         id: None,
         gap: GAP_NONE,
