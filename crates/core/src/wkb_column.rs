@@ -137,9 +137,25 @@ type CheckResult<T> = std::result::Result<T, WkbCheckError>;
 /// return the number of bytes the geometry occupies, which is where the
 /// reader stops too.
 pub(crate) fn check_wkb_value(buf: &[u8]) -> CheckResult<u64> {
-    let mut walk = Walk { buf, pos: 0 };
+    let mut walk = Walk {
+        buf,
+        pos: 0,
+        coords: None,
+    };
     walk.geometry(0)?;
     Ok(walk.pos as u64)
+}
+
+/// [`check_wkb_value`], also collecting where each coordinate's x starts
+/// and whether it is little-endian, for in-place reprojection (#670).
+pub(crate) fn wkb_coordinates(buf: &[u8], out: &mut Vec<(usize, bool)>) -> CheckResult<()> {
+    out.clear();
+    let mut walk = Walk {
+        buf,
+        pos: 0,
+        coords: Some(out),
+    };
+    walk.geometry(0)
 }
 
 /// Run [`check_wkb_value`] over every non-null value of a WKB column stored
@@ -178,9 +194,18 @@ struct Header {
 struct Walk<'a> {
     buf: &'a [u8],
     pos: usize,
+    coords: Option<&'a mut Vec<(usize, bool)>>,
 }
 
 impl Walk<'_> {
+    /// Record `n` coordinates `stride` bytes apart from `start`, once their
+    /// bytes are known to exist.
+    fn record(&mut self, start: usize, n: u64, stride: u64, little_endian: bool) {
+        if let Some(out) = self.coords.as_deref_mut() {
+            out.extend((0..n).map(|i| (start + (i * stride) as usize, little_endian)));
+        }
+    }
+
     fn remaining(&self) -> u64 {
         (self.buf.len() - self.pos) as u64
     }
@@ -306,7 +331,10 @@ impl Walk<'_> {
     /// is only a truncation.
     fn points(&mut self, header: Header) -> CheckResult<()> {
         let n = self.u32(header.little_endian)?;
-        self.skip(u64::from(n) * header.coord_bytes)
+        let start = self.pos;
+        self.skip(u64::from(n) * header.coord_bytes)?;
+        self.record(start, n.into(), header.coord_bytes, header.little_endian);
+        Ok(())
     }
 
     fn rings(&mut self, header: Header) -> CheckResult<()> {
@@ -321,7 +349,9 @@ impl Walk<'_> {
         // fixed member stride and allocates nothing.
         let n = self.u32(header.little_endian)?;
         let stride = HEADER_BYTES + header.coord_bytes;
+        let start = self.pos + HEADER_BYTES as usize;
         self.skip(u64::from(n) * stride)?;
+        self.record(start, n.into(), stride, header.little_endian);
         // Each member is read later from the start of its slot to the end of
         // the MultiPoint, and a member whose SRID flag is set needs four bytes
         // more than its slot. Every slot is at least 21 bytes, so only the
@@ -343,7 +373,12 @@ impl Walk<'_> {
     fn geometry(&mut self, depth: usize) -> CheckResult<()> {
         let (header, base_type) = self.full_header()?;
         match base_type {
-            1 => self.skip(header.coord_bytes),
+            1 => {
+                let start = self.pos;
+                self.skip(header.coord_bytes)?;
+                self.record(start, 1, header.coord_bytes, header.little_endian);
+                Ok(())
+            }
             2 => self.points(header),
             3 => self.rings(header),
             4 => self.multi_point(header),

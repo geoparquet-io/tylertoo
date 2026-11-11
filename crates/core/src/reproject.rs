@@ -211,13 +211,12 @@ impl ToLonLat {
         )
     }
 
-    /// Rewrite one WKB value's coordinates in place. A value this walker
-    /// cannot parse gets an invalid byte-order byte, so the reader rejects it
-    /// as malformed instead of reading its projected coordinates as degrees.
+    /// Rewrite one WKB value's coordinates in place. A value the shared
+    /// WKB walk rejects gets an invalid byte-order byte, so the reader
+    /// rejects it as malformed instead of reading projected coordinates as
+    /// degrees.
     fn wkb_value(&self, value: &mut [u8], coords: &mut Vec<(usize, bool)>) {
-        coords.clear();
-        let mut pos = 0;
-        if wkb_coords(value, &mut pos, coords, 0).is_none() {
+        if crate::wkb_column::wkb_coordinates(value, coords).is_err() {
             if let Some(b) = value.first_mut() {
                 *b = 0xFF;
             }
@@ -245,6 +244,11 @@ impl ToLonLat {
     fn native(&self, d: ArrayData) -> Result<ArrayData, ArrowError> {
         let children = match d.data_type() {
             DataType::FixedSizeList(f, n) if *f.data_type() == DataType::Float64 => {
+                if *n < 2 {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "a coordinate list of width {n} has no x and y"
+                    )));
+                }
                 let c = Float64Array::from(d.child_data()[0].clone());
                 let mut v = c.values().to_vec();
                 for xy in v.chunks_exact_mut(*n as usize) {
@@ -287,72 +291,6 @@ impl ToLonLat {
 struct Hull {
     b: [f64; 4],
     slack: f64,
-}
-
-/// Walk one WKB geometry (ISO and EWKB flavours), recording where each
-/// coordinate's x starts and its byte order. `None` on malformed input.
-fn wkb_coords(b: &[u8], pos: &mut usize, out: &mut Vec<(usize, bool)>, depth: u8) -> Option<()> {
-    if depth > 64 {
-        return None;
-    }
-    let le = match *b.get(*pos)? {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
-    *pos += 1;
-    let u32_at = |pos: &mut usize| -> Option<u32> {
-        let v: [u8; 4] = b.get(*pos..*pos + 4)?.try_into().ok()?;
-        *pos += 4;
-        Some(if le {
-            u32::from_le_bytes(v)
-        } else {
-            u32::from_be_bytes(v)
-        })
-    };
-    let raw = u32_at(pos)?;
-    let (mut z, mut m) = (raw & 0x8000_0000 != 0, raw & 0x4000_0000 != 0);
-    if raw & 0x2000_0000 != 0 {
-        u32_at(pos)?; // EWKB SRID
-    }
-    let code = raw & 0x0FFF_FFFF;
-    match code / 1000 {
-        0 => {}
-        1 => z = true,
-        2 => m = true,
-        3 => (z, m) = (true, true),
-        _ => return None,
-    }
-    let stride = 8 * (2 + usize::from(z) + usize::from(m));
-    let points = |pos: &mut usize, n: u32, out: &mut Vec<(usize, bool)>| -> Option<()> {
-        for _ in 0..n {
-            b.get(*pos..*pos + stride)?;
-            out.push((*pos, le));
-            *pos += stride;
-        }
-        Some(())
-    };
-    match code % 1000 {
-        1 => points(pos, 1, out),
-        2 => {
-            let n = u32_at(pos)?;
-            points(pos, n, out)
-        }
-        3 => {
-            for _ in 0..u32_at(pos)? {
-                let n = u32_at(pos)?;
-                points(pos, n, out)?;
-            }
-            Some(())
-        }
-        4..=7 => {
-            for _ in 0..u32_at(pos)? {
-                wkb_coords(b, pos, out, depth + 1)?;
-            }
-            Some(())
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]

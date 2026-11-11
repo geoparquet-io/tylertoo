@@ -147,6 +147,13 @@ fn native_coordinates_are_rewritten() {
         None,
     );
     let out = rd.array(&(Arc::new(interleaved) as ArrayRef)).unwrap();
+    let narrow = FixedSizeListArray::new(
+        Arc::new(Field::new("x", DataType::Float64, false)),
+        1,
+        Arc::new(Float64Array::from(vec![x])),
+        None,
+    );
+    assert!(rd.array(&(Arc::new(narrow) as ArrayRef)).is_err());
     let values = out
         .as_fixed_size_list()
         .values()
