@@ -1023,7 +1023,7 @@ pub(super) struct SharedRows {
     /// Otherwise each level's geometries back to back
     /// ([`LevelGeometry::Range`]): one allocation per input batch, not one
     /// per level, which peak RSS needs (per-level columns built across the
-    /// pass-2 workers held ~160 MiB more on Moldova, at the same live heap).
+    /// pass-2 workers held 160–190 MiB more on Moldova, at the same live heap).
     geometry: ArrayRef,
 }
 
