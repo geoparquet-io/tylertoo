@@ -7219,8 +7219,9 @@ fn assemble_level_batch(
 /// One level's kept batch rows, their geometries and vertex count.
 type LevelSelection = (Vec<usize>, Vec<Arc<Geometry<f64>>>, usize);
 
-/// One level's positions in the shared rows, and in the shared geometries.
-type LevelPositions = (UInt32Array, UInt32Array);
+/// One level's positions in the shared rows, and in the shared geometries
+/// when the batch pools them.
+type LevelPositions = (UInt32Array, Option<UInt32Array>);
 
 /// The rows and geometries the levels built from `batch` share (#852), and
 /// each level's positions in the shared rows and in the shared geometries.
@@ -7234,8 +7235,18 @@ fn share_rows(
     // One geometry column serves every level, so they must type it alike.
     debug_assert!(ctxs.iter().all(|c| c.geom_idx == finest.geom_idx
         && c.source_schema.field(c.geom_idx) == finest.source_schema.field(finest.geom_idx)));
-    let (pool, positions) = geometry_pool(selections.iter().map(|(_, geoms, _)| geoms.as_slice()));
-    let geometry = build_geometry_column(finest.source_schema, finest.geom_idx, &pool)?;
+    let (geometry, positions) =
+        match geometry_pool(selections.iter().map(|(_, geoms, _)| geoms.as_slice())) {
+            Some((pool, positions)) => (
+                Some(build_geometry_column(
+                    finest.source_schema,
+                    finest.geom_idx,
+                    &pool,
+                )?),
+                positions.into_iter().map(Some).collect(),
+            ),
+            None => (None, vec![None; selections.len()]),
+        };
     let kept: Vec<&[usize]> = selections
         .iter()
         .map(|(kept, _, _)| kept.as_slice())
@@ -7244,11 +7255,29 @@ fn share_rows(
     Ok((Arc::new(rows), index.into_iter().zip(positions).collect()))
 }
 
+/// The least share of a batch's level geometries the levels must share (one
+/// allocation, #499) for a pool. Below it the pool's hash and the drain's
+/// rebuild of every pooled geometry cost more pass-2 time than the RAM it
+/// saves is worth, and each level builds its own column, in parallel.
+/// In thousandths.
+const POOL_MIN_SHARED: usize = 250;
+
 /// Each distinct geometry (by allocation) the `levels` keep, in first-kept
-/// order, and each level's positions in it.
+/// order, and each level's positions in it; `None` when the levels share
+/// less than [`POOL_MIN_SHARED`] of their geometries.
 fn geometry_pool<'a>(
-    levels: impl Iterator<Item = &'a [Arc<Geometry<f64>>]>,
-) -> (Vec<&'a Geometry<f64>>, Vec<UInt32Array>) {
+    levels: impl Iterator<Item = &'a [Arc<Geometry<f64>>]> + Clone,
+) -> Option<(Vec<&'a Geometry<f64>>, Vec<UInt32Array>)> {
+    let min_shared = std::env::var("XPOOL_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(POOL_MIN_SHARED);
+    // A geometry two levels keep has two references here, so with none
+    // shared the levels share nothing (lines: every level simplifies anew).
+    if levels.clone().flatten().all(|g| Arc::strong_count(g) == 1) {
+        return None;
+    }
+    let total: usize = levels.clone().map(<[_]>::len).sum();
     let mut slot: std::collections::HashMap<*const Geometry<f64>, u32> =
         std::collections::HashMap::new();
     let mut pool: Vec<&Geometry<f64>> = Vec::new();
@@ -7265,7 +7294,7 @@ fn geometry_pool<'a>(
                 .collect()
         })
         .collect();
-    (pool, positions)
+    ((total - pool.len()) * 1000 >= total * min_shared).then_some((pool, positions))
 }
 
 /// One cascade-fold step's result, sharing (`Arc`) the kept geometry instead
@@ -7531,11 +7560,20 @@ pub(super) fn process_batch_cascade(
                     } else {
                         ctx.source_schema
                     };
+                    let (index, pooled) = &geometry[li];
+                    let geometry = match pooled {
+                        Some(at) => pipeline::LevelGeometry::Pool(at.clone()),
+                        None => pipeline::LevelGeometry::Own(build_geometry_column(
+                            ctx.source_schema,
+                            ctx.geom_idx,
+                            &kept_geoms,
+                        )?),
+                    };
                     pipeline::LevelBatch::shared(
                         Arc::new(schema.clone()),
                         rows,
-                        geometry[li].0.clone(),
-                        geometry[li].1.clone(),
+                        index.clone(),
+                        geometry,
                         ctx.geom_idx,
                         own,
                     )
@@ -7578,13 +7616,28 @@ mod tests {
             vec![Arc::clone(&a), Arc::clone(&b2)],
             vec![Arc::clone(&a), Arc::clone(&c)],
         ];
-        let (pool, positions) = geometry_pool(levels.iter().map(Vec::as_slice));
+        let (pool, positions) = geometry_pool(levels.iter().map(Vec::as_slice)).unwrap();
         assert_eq!(pool.len(), 4, "a pooled once; b, b2, c each");
         for (level, pos) in levels.iter().zip(&positions) {
             let got: Vec<&Geometry<f64>> = pos.values().iter().map(|&p| pool[p as usize]).collect();
             let want: Vec<&Geometry<f64>> = level.iter().map(AsRef::as_ref).collect();
             assert_eq!(got, want);
         }
+    }
+
+    /// Levels that share no geometry, or too few, build no pool: each holds
+    /// its own geometry column.
+    #[test]
+    fn levels_that_share_too_few_geometries_build_no_pool() {
+        let pt = |x: f64| Arc::new(Geometry::Point(geo::Point::new(x, 0.0)));
+        let fresh = |n: usize| (0..n).map(|i| pt(i as f64)).collect::<Vec<_>>();
+        let none = [fresh(4), fresh(4), fresh(4)];
+        assert!(geometry_pool(none.iter().map(Vec::as_slice)).is_none());
+        // One of twelve shared: still too few.
+        let (mut a, b, c) = (fresh(4), fresh(4), fresh(4));
+        a[0] = Arc::clone(&b[0]);
+        let few = [a, b, c];
+        assert!(geometry_pool(few.iter().map(Vec::as_slice)).is_none());
     }
 
     /// Array-of-structs fixture → the column-major table the engine takes

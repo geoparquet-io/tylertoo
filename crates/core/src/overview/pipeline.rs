@@ -1018,8 +1018,10 @@ pub(super) struct SharedRows {
     rows: usize,
     /// Every distinct geometry the levels keep, encoded once: a level whose
     /// cascade step left a feature unchanged shares the finer level's
-    /// geometry (#499), so per-level columns held it once per level.
-    geometry: ArrayRef,
+    /// geometry (#499), so per-level columns held it once per level. `None`
+    /// when the levels shared too few to pay for the pool; each level then
+    /// holds its own ([`LevelGeometry::Own`]).
+    geometry: Option<ArrayRef>,
 }
 
 impl SharedRows {
@@ -1031,7 +1033,7 @@ impl SharedRows {
         batch: &RecordBatch,
         non_geom_cols: &[usize],
         kept: &[&[usize]],
-        geometry: ArrayRef,
+        geometry: Option<ArrayRef>,
     ) -> Result<(Self, Vec<UInt32Array>), ConvertError> {
         let n = batch.num_rows();
         // Input-batch sized, so dropped here rather than held to the drain.
@@ -1079,9 +1081,26 @@ impl SharedRows {
     fn held_bytes(&self) -> u64 {
         self.columns
             .iter()
-            .chain([&self.geometry])
+            .chain(&self.geometry)
             .map(|c| c.get_array_memory_size() as u64)
             .sum()
+    }
+}
+
+/// A shared level batch's geometries.
+pub(super) enum LevelGeometry {
+    /// Positions in [`SharedRows`]' geometry pool.
+    Pool(UInt32Array),
+    /// The level's own geometry column, when its input batch has no pool.
+    Own(ArrayRef),
+}
+
+impl LevelGeometry {
+    fn held_bytes(&self) -> usize {
+        match self {
+            Self::Pool(at) => at.get_array_memory_size(),
+            Self::Own(column) => column.get_array_memory_size(),
+        }
     }
 }
 
@@ -1096,8 +1115,8 @@ pub(super) enum LevelBatch {
         rows: Arc<SharedRows>,
         /// Positions in `rows` of this level's rows, in output order.
         index: UInt32Array,
-        /// Positions in `rows.geometry` of this level's geometries.
-        geometry: UInt32Array,
+        /// This level's geometries.
+        geometry: LevelGeometry,
         /// Where the geometry column goes in the source schema.
         geom_idx: usize,
         /// Any columns the level generates after the source schema's
@@ -1108,12 +1127,12 @@ pub(super) enum LevelBatch {
 
 impl LevelBatch {
     /// A shared level batch: its rows at `index` in `rows` and its
-    /// geometries at `geometry` in the pool ([`SharedRows::new`]).
+    /// geometries as `geometry` holds them ([`SharedRows::new`]).
     pub(super) fn shared(
         schema: SchemaRef,
         rows: &Arc<SharedRows>,
         index: UInt32Array,
-        geometry: UInt32Array,
+        geometry: LevelGeometry,
         geom_idx: usize,
         own: Vec<ArrayRef>,
     ) -> Self {
@@ -1148,9 +1167,7 @@ impl LevelBatch {
                 .iter()
                 .map(|c| c.get_array_memory_size() as u64)
                 .sum::<u64>()
-                .saturating_add(
-                    (index.get_array_memory_size() + geometry.get_array_memory_size()) as u64,
-                ),
+                .saturating_add((index.get_array_memory_size() + geometry.held_bytes()) as u64),
         }
     }
 
@@ -1171,10 +1188,17 @@ impl LevelBatch {
                     .iter()
                     .map(|c| arrow_select::take::take(c.as_ref(), &index, None))
                     .collect::<Result<Vec<_>, _>>()?;
-                columns.insert(
-                    geom_idx,
-                    arrow_select::take::take(rows.geometry.as_ref(), &geometry, None)?,
-                );
+                let geometry = match geometry {
+                    LevelGeometry::Pool(at) => {
+                        let pool = rows
+                            .geometry
+                            .as_ref()
+                            .expect("a pooled level's rows hold the pool");
+                        arrow_select::take::take(pool.as_ref(), &at, None)?
+                    }
+                    LevelGeometry::Own(column) => column,
+                };
+                columns.insert(geom_idx, geometry);
                 columns.extend(own);
                 Ok(RecordBatch::try_new(schema, columns)?)
             }
@@ -2919,15 +2943,20 @@ mod drain_tests {
         )
         .unwrap();
         // A shared batch whose schema has a column too many cannot rebuild.
-        let (rows, mut index) =
-            SharedRows::new(&input, &[0], &[&[0, 1, 2, 3]], input.column(1).clone()).unwrap();
+        let (rows, mut index) = SharedRows::new(
+            &input,
+            &[0],
+            &[&[0, 1, 2, 3]],
+            Some(input.column(1).clone()),
+        )
+        .unwrap();
         let mut fields = schema.fields().to_vec();
         fields.push(Arc::new(Field::new("extra", DataType::Int64, false)));
         let broken = LevelBatch::shared(
             Arc::new(Schema::new(fields)),
             &Arc::new(rows),
             index.remove(0),
-            UInt32Array::from_iter_values(0..4),
+            LevelGeometry::Pool(UInt32Array::from_iter_values(0..4)),
             1,
             Vec::new(),
         );
@@ -3264,7 +3293,7 @@ mod sink_sample_tests {
             (0..n).map(|i| i as f64 * 0.5),
         ));
         let kept: Vec<&[usize]> = levels.iter().map(Vec::as_slice).collect();
-        let (rows, index) = SharedRows::new(&input, &[0, 2], &kept, pool.clone()).unwrap();
+        let (rows, index) = SharedRows::new(&input, &[0, 2], &kept, Some(pool.clone())).unwrap();
         let rows = Arc::new(rows);
         let mut held = rows.held_bytes();
         let per_level: Vec<Option<(LevelBatch, usize)>> = levels
@@ -3272,7 +3301,14 @@ mod sink_sample_tests {
             .zip(index)
             .map(|(kept, index)| {
                 let at = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
-                let level = LevelBatch::shared(schema.clone(), &rows, index, at, 1, Vec::new());
+                let level = LevelBatch::shared(
+                    schema.clone(),
+                    &rows,
+                    index,
+                    LevelGeometry::Pool(at),
+                    1,
+                    Vec::new(),
+                );
                 held += level.held_bytes();
                 Some((level, 0))
             })
