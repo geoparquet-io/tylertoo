@@ -1679,3 +1679,230 @@ fn max_zoom_auto_rechecks_the_shard_pivot_after_resolving() {
     assert!(out.contains("chose z0") && out.contains("pivot"), "{out}");
     assert!(!out.contains("panicked"), "{out}");
 }
+
+/// Every tile of `archive`, by zoom and tile id.
+fn tiles_of(archive: &Path) -> std::collections::BTreeMap<(u8, u64), Vec<u8>> {
+    let index =
+        tylertoo_core::internal::archive_index::ArchiveIndex::open(archive).expect("valid archive");
+    let refs: Vec<_> = index.tiles().map(|t| t.expect("tile entry")).collect();
+    refs.into_iter()
+        .map(|t| {
+            (
+                (t.z, t.id),
+                index.read_range(t.range.clone()).expect("tile body"),
+            )
+        })
+        .collect()
+}
+
+/// #332: a sharded `--band` build is the unsharded one. The coarse job draws
+/// the cells and the feature zooms below the pivot; the data shards draw
+/// the rest; their merge holds the same tiles, byte for byte.
+#[test]
+fn a_sharded_cell_band_build_matches_the_unsharded_one() {
+    // Pivot z4: the coarse job draws the cells and z2-z3. Pivot z3: the
+    // cells alone, plus the plan the shards share.
+    for (pivot, cells, features) in [("4", "0-1:grid", "2-5:geom"), ("3", "0-2:grid", "3-5:geom")] {
+        sharded_cell_band_build_matches(pivot, cells, features);
+    }
+}
+
+fn sharded_cell_band_build_matches(pivot: &str, cells: &str, features: &str) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = grid();
+    let input = input.to_str().unwrap();
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+    let bands = [
+        "--band",
+        cells,
+        "--band",
+        features,
+        "--layer-name",
+        "parity",
+    ];
+    let tiles = |out: &str, extra: &[&str]| {
+        let mut argv = vec!["tiles", input, out];
+        argv.extend(bands);
+        argv.extend(extra);
+        run(&argv)
+    };
+    let (ok, out) = tiles(&path("mono.pmtiles"), &[]);
+    assert!(ok, "unsharded: {out}");
+
+    let shards = cut_plan(dir.path(), "3", pivot);
+    let shards = shards.to_str().unwrap();
+    let plan = path("convert.plan");
+    let (ok, out) = tiles(
+        &path("coarse.pmtiles"),
+        &[
+            "--shard",
+            "coarse",
+            "--shard-plan",
+            shards,
+            "--save-plan",
+            &plan,
+        ],
+    );
+    assert!(ok, "coarse: {out}");
+    let mut merge = vec![
+        "merge".to_string(),
+        path("merged.pmtiles"),
+        path("coarse.pmtiles"),
+    ];
+    for i in 0..3 {
+        let out_path = path(&format!("shard-{i}.pmtiles"));
+        let role = format!("{i}/3");
+        let (ok, out) = tiles(
+            &out_path,
+            &["--shard", &role, "--shard-plan", shards, "--plan", &plan],
+        );
+        assert!(ok, "shard {role}: {out}");
+        merge.push(out_path);
+    }
+    let merge: Vec<&str> = merge.iter().map(String::as_str).collect();
+    let (ok, out) = run(&merge);
+    assert!(ok, "merge: {out}");
+
+    let mono = tiles_of(&dir.path().join("mono.pmtiles"));
+    let merged = tiles_of(&dir.path().join("merged.pmtiles"));
+    assert_eq!(
+        mono.keys().collect::<Vec<_>>(),
+        merged.keys().collect::<Vec<_>>(),
+        "the same tiles"
+    );
+    assert!(mono.keys().any(|k| k.0 == 0), "the cell zooms hold tiles");
+    for (key, body) in &mono {
+        assert!(merged[key] == *body, "tile {key:?} differs");
+    }
+}
+
+/// #332: a data shard must be given the coarse job's cell bands, as any
+/// other option the convert plan records; and a cell band may not reach
+/// the pivot, where the data shards split the zooms by tile range.
+#[test]
+fn cell_bands_are_bound_to_the_fleet_and_stay_below_the_pivot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = grid();
+    let input = input.to_str().unwrap();
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+    let shards = cut_plan(dir.path(), "2", "3");
+    let shards = shards.to_str().unwrap();
+    let plan = path("convert.plan");
+    let (ok, out) = run(&[
+        "tiles",
+        input,
+        &path("coarse.pmtiles"),
+        "--band",
+        "0-1:grid",
+        "--band",
+        "2-5:geom",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        shards,
+        "--save-plan",
+        &plan,
+    ]);
+    assert!(ok, "coarse: {out}");
+    let (ok, out) = run(&[
+        "tiles",
+        input,
+        &path("shard.pmtiles"),
+        "--min-zoom",
+        "2",
+        "--max-zoom",
+        "5",
+        "--shard",
+        "0/2",
+        "--shard-plan",
+        shards,
+        "--plan",
+        &plan,
+    ]);
+    assert!(!ok, "a shard without the cell bands must be refused: {out}");
+    assert!(out.contains("option cell_bands"), "{out}");
+
+    // A plan-only coarse job writes the plan its full run writes.
+    let only = path("only.plan");
+    let (ok, out) = run(&[
+        "tiles",
+        input,
+        "--band",
+        "0-1:grid",
+        "--band",
+        "2-5:geom",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        shards,
+        "--save-plan",
+        &only,
+        "--plan-only",
+    ]);
+    assert!(ok, "plan-only: {out}");
+    let (ok, out) = run(&[
+        "tiles",
+        input,
+        &path("shard.pmtiles"),
+        "--band",
+        "0-1:grid",
+        "--band",
+        "2-5:geom",
+        "--shard",
+        "0/2",
+        "--shard-plan",
+        shards,
+        "--plan",
+        &only,
+    ]);
+    assert!(ok, "a shard over the plan-only plan: {out}");
+
+    let (ok, out) = run(&[
+        "tiles",
+        input,
+        &path("past.pmtiles"),
+        "--band",
+        "0-3:grid",
+        "--band",
+        "4-5:geom",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        shards,
+        "--save-plan",
+        &path("past.plan"),
+    ]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("cell band 0-3:grid reaches the shard plan's pivot z3")
+            && out.contains("pivot above z3"),
+        "{out}"
+    );
+    assert!(
+        !dir.path().join("past.pmtiles").exists(),
+        "nothing is written"
+    );
+
+    // A coarse job that draws only cells has no feature zoom to replay a
+    // plan into: refused before any read.
+    let (ok, out) = run(&[
+        "tiles",
+        input,
+        &path("cells.pmtiles"),
+        "--band",
+        "0-2:grid",
+        "--band",
+        "3-5:geom",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        shards,
+        "--plan",
+        &only,
+    ]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("--plan") && out.contains("--save-plan"),
+        "{out}"
+    );
+}

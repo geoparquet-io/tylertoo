@@ -582,6 +582,31 @@ impl MemoryBudget {
         })
     }
 
+    /// [`require`](Self::require) against what a run under `profile` may
+    /// hold resident ([`allowance`](Self::allowance)), not the whole probed
+    /// figure: a phase that prices only its own structures leaves the rest
+    /// for allocator retention and thread stacks. `speed` keeps the hard
+    /// ceiling. Nothing when unprobed.
+    pub(super) fn require_allowance(
+        &self,
+        profile: MemoryProfile,
+        phase: MemoryPhase,
+        needed: u64,
+    ) -> Result<(), ConvertError> {
+        let Some(available) = self.available() else {
+            return Ok(());
+        };
+        let available = available.min(self.allowance(profile));
+        if needed > available {
+            return Err(ConvertError::BudgetExceeded {
+                phase: phase.name(),
+                needed,
+                available,
+            });
+        }
+        Ok(())
+    }
+
     /// Reserve up to `bytes` for `phase`, as much as is available, and never
     /// fail: a working set the run is better off holding than not (the
     /// spill's page cache under a cgroup limit). Nothing when unprobed.
@@ -597,6 +622,22 @@ impl MemoryBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A non-`speed` run is held to the allowance, leaving the probed rest
+    /// for what no phase prices; `speed` only to the probed figure.
+    #[test]
+    fn require_allowance_leaves_the_unpriced_headroom() {
+        let budget = MemoryBudget::with_available(Some(1000));
+        let check = |p, n| budget.require_allowance(p, MemoryPhase::Scan, n).is_ok();
+        assert!(check(MemoryProfile::Auto, 600));
+        assert!(!check(MemoryProfile::Auto, 601));
+        assert!(!check(MemoryProfile::Bounded, 601));
+        assert!(check(MemoryProfile::Speed, 1000));
+        assert!(!check(MemoryProfile::Speed, 1001));
+        assert!(MemoryBudget::with_available(None)
+            .require_allowance(MemoryProfile::Auto, MemoryPhase::Scan, u64::MAX)
+            .is_ok());
+    }
 
     #[test]
     fn drain_encodes_adds_what_the_reused_bytes_hold_up_to_the_threads() {

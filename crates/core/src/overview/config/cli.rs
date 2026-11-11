@@ -477,12 +477,16 @@ pub struct PyramidArgs {
     /// Output PMTiles archive.
     pub output: PathBuf,
 
-    /// One zoom band as `LO-HI:INPUT[:LAYER]` (repeatable). `INPUT` is a
-    /// GeoParquet source or PMTiles archive for zooms `LO` to `HI`, and
-    /// `LAYER` defaults to its file stem. The tuning guide covers the colon
-    /// rules and the `LO-HI=INPUT[=LAYER]` form:
+    /// One zoom band as `LO-HI:[SYSTEM:]INPUT[:LAYER]` or
+    /// `LO-HI=[SYSTEM=]INPUT[=LAYER]` (repeatable; layer defaults to file stem).
+    /// Omit SYSTEM to tile GeoParquet or reuse PMTiles; grid/h3/s2/a5 aggregate
+    /// GeoParquet centroids into cells:
     /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
-    #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
+    #[arg(
+        long = "band",
+        required = true,
+        value_name = "LO-HI:[SYSTEM:]INPUT[:LAYER]"
+    )]
     pub bands: Vec<String>,
 
     /// Publication metadata for the output. An unset field is inherited from
@@ -566,9 +570,22 @@ pub struct ExportPmtilesArgs {
 
 #[derive(Parser, Debug)]
 pub struct OverviewArgs {
-    /// Input GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
-    /// (`EPSG:3857`). Pass a file, directory, glob, URL, or `s3://` or
+    /// Input GeoParquet. Pass a file, directory, glob, URL, or `s3://` or
     /// `gs://` prefix, or omit it with `--files-from`.
+    ///
+    /// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
+    /// reprojected to EPSG:4326 as they are read when they name an EPSG code
+    /// (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4
+    /// definition. A directory, list, or `--files-from` input can mix these CRSs.
+    /// EPSG:3857 parts are reprojected to EPSG:4326 when mixed with other CRSs.
+    /// An all-EPSG:3857 input is read directly. Unsupported CRSs are refused;
+    /// the error points to `gpio convert reproject` to reproject the input first.
+    ///
+    /// Reprojection uses no grid shifts. A datum change uses the definition's
+    /// proj4 `towgs84` Helmert parameters, so results can differ from PROJ/pyproj
+    /// by metres (around 100 m at the edge of EPSG:27700's area). Same-datum
+    /// projections, such as UTM and ETRS89 LAEA (EPSG:3035), match to under a
+    /// centimetre.
     #[arg(value_name = "INPUT", required_unless_present = "files_from")]
     pub input: Option<PathBuf>,
 
@@ -610,9 +627,22 @@ pub struct OverviewArgs {
 
 #[derive(Parser, Debug)]
 pub struct TilesArgs {
-    /// Input GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
-    /// (`EPSG:3857`). Pass a file, directory, glob, URL, or `s3://` or
+    /// Input GeoParquet. Pass a file, directory, glob, URL, or `s3://` or
     /// `gs://` prefix, or omit it with `--files-from`.
+    ///
+    /// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
+    /// reprojected to EPSG:4326 as they are read when they name an EPSG code
+    /// (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4
+    /// definition. A directory, list, or `--files-from` input can mix these CRSs.
+    /// EPSG:3857 parts are reprojected to EPSG:4326 when mixed with other CRSs.
+    /// An all-EPSG:3857 input is read directly. Unsupported CRSs are refused;
+    /// the error points to `gpio convert reproject` to reproject the input first.
+    ///
+    /// Reprojection uses no grid shifts. A datum change uses the definition's
+    /// proj4 `towgs84` Helmert parameters, so results can differ from PROJ/pyproj
+    /// by metres (around 100 m at the edge of EPSG:27700's area). Same-datum
+    /// projections, such as UTM and ETRS89 LAEA (EPSG:3035), match to under a
+    /// centimetre.
     #[arg(value_name = "INPUT", required_unless_present = "files_from")]
     pub input: Option<PathBuf>,
 
@@ -643,6 +673,21 @@ pub struct TilesArgs {
     /// smaller than the last. Overrides `--min-zoom` and `--max-zoom`.
     #[arg(long, value_name = "GSDS")]
     pub gsd: Option<String>,
+
+    /// Draw features or cells by zoom range. Repeat with LO-HI:KIND or
+    /// Z:KIND (inclusive). Use geom, point or square for features; grid,
+    /// h3, s2 or a5 for cells in the same layer. Requires contiguous
+    /// feature bands. No overlaps. Excludes `--min-zoom`, `--max-zoom`,
+    /// `--gsd` and `--representation`. See
+    /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
+    // Exclusive with the zoom flags: clap's rule here, core's
+    // (`ConfigError::BandWithZoomOption`) for Python's keywords.
+    #[arg(
+        long = "band",
+        value_name = "LO-HI:KIND",
+        conflicts_with_all = ["min_zoom", "max_zoom", "gsd", "representation"]
+    )]
+    pub band: Vec<String>,
 
     #[command(flatten)]
     pub publication: TilesetMetadataArgs,
@@ -806,7 +851,7 @@ pub fn tiles_options(args: &TilesArgs) -> Result<TilesOptions, TilesError> {
     // LOCKSTEP with the plan's placeholder zoom: see `keywords::convert`.
     convert.auto_max_zoom = args.max_zoom.is_auto();
     let export = args.export.apply(tiles_export_defaults(args));
-    Ok(TilesOptions {
+    let mut options = TilesOptions {
         convert,
         export: ExportOptions {
             metadata: args.publication.clone(),
@@ -814,7 +859,9 @@ pub fn tiles_options(args: &TilesArgs) -> Result<TilesOptions, TilesError> {
             ..export
         },
         ..args.facade.options.clone()
-    })
+    };
+    super::apply_bands(&mut options, &args.band, &[])?;
+    Ok(options)
 }
 
 ///

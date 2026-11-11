@@ -84,7 +84,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 #### Input and levels
 
-* `input`: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator (`EPSG:3857`). Pass a file, directory, glob, `s3://`, `gs://`, or `https://` URL or prefix, or a list of files. First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas) to a GeoParquet file using `gpio` or DuckDB `COPY (... ORDER BY ST_Hilbert(...)) TO 'x.parquet'`.
+* `input`: GeoParquet: `EPSG:4326` and all-`EPSG:3857` inputs are read directly; `EPSG:3857` parts mixed with other CRSs are reprojected to `EPSG:4326`; other CRSs with an EPSG code and usable proj4 definition are reprojected to `EPSG:4326` as they are read, otherwise refused (use `gpio convert reproject` first). Reprojection uses no grid shifts: datum changes can differ from PROJ/pyproj by metres (around 100 m for EPSG:27700), while same-datum projections match to under a centimetre. Pass a file, directory, glob, `s3://`, `gs://`, or `https://` URL or prefix, or a list of files. First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas) to a GeoParquet file using `gpio` or DuckDB `COPY (... ORDER BY ST_Hilbert(...)) TO 'x.parquet'`.
 * `output`: Overview file to write.
 * `mode`: `"duplicating"` makes each level a complete map; `"partitioning"` stores each feature once.
 * `min_zoom`: Coarsest zoom.
@@ -152,7 +152,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `full_column_stats`: Keep Parquet statistics for every column.
 * `read_batch_size`: Rows per [read batch](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
 * `bbox`: Keep features that intersect this lon/lat box, also one ±360° wrap away, as for 0..360 data.
-* `mask`: Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (`.geojson` or `.json`, lon/lat per RFC 7946) or GeoParquet file, or a shapely geometry (any object with `.wkb`). Touching counts. A feature also matches when its copy one world width away (±360°) intersects the mask, as with `bbox`. The mask's bbox skips row groups like `bbox`. Combines with `bbox` and `filter` by AND. The mask must use the input's CRS; a mismatch is refused, so reproject the mask first. A shapely geometry is taken to be in the input's CRS.
+* `mask`: Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (`.geojson` or `.json`, lon/lat per RFC 7946) or GeoParquet file, or a shapely geometry (any object with `.wkb`). Touching counts. A feature also matches when its copy one world width away (±360°) intersects the mask, as with `bbox`. The mask's bbox skips row groups like `bbox`. Combines with `bbox` and `filter` by AND. A GeoParquet mask uses its declared CRS and the same reprojection rules as input. EPSG:4326 masks are converted to EPSG:3857 for 3857 input and vice versa, vertex by vertex. WKB/shapely masks have no CRS: use EPSG:3857 for EPSG:3857 input, otherwise lon/lat EPSG:4326, including for reprojected input.
 * `filter`: SQL-style predicate, such as `"confidence > 0.8"`.
 * `profile`: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles): `"speed"` holds everything in RAM, `"bounded"` uses disk and holds the least, and `"auto"` sizes to the machine's memory. Footprints compare for one allocator: wheels use mimalloc, which adds a fixed floor of about 600 MiB on small inputs. On a 1.4M polygon export it ran 8% faster and held 18% more peak memory than the system allocator; a non-musl source build can opt out with `maturin build --no-default-features` (musl always uses mimalloc).
 * `in_flight_batches`: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency), or `0` to size from the CPU count.
@@ -289,6 +289,8 @@ pyramid(
     tile_size_limit: int | Literal['auto'] | None = "auto",
     feature_order: Literal['input'] | str = "input",
     work_dir: str | os.PathLike[str] | None = None,
+    accumulate_attributes: dict[str, Literal['sum', 'max', 'min', 'mean']] | None = None,
+    cluster_categories: str | None = None,
     allow_missing_zooms: bool = False,
     name: str | None = None,
     description: str | None = None,
@@ -317,12 +319,14 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 
 ### Parameters
 
-* `bands`: Band specs as `"LO-HI:INPUT"` or `"LO-HI:INPUT:LAYER"`, such as `"0-7:countries.parquet:admin"`. `INPUT` is a GeoParquet source or a PMTiles archive for zooms `LO` to `HI`; `LAYER` defaults to the input's file stem. See the [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/) for the `LO-HI=INPUT=LAYER` form.
+* `bands`: Band specs as `"LO-HI:[SYSTEM:]INPUT[:LAYER]"`, such as `"0-7:countries.parquet:admin"`. `INPUT` is a GeoParquet source or a PMTiles archive for zooms `LO` to `HI`; `LAYER` defaults to the input's file stem. See the [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/) for the `LO-HI=[SYSTEM=]INPUT[=LAYER]` form. Omit `SYSTEM` to tile the input; `grid`, `h3`, `s2`, or `a5` aggregates GeoParquet features into cells per zoom, counting each feature at its centroid. An input named `grid`, `h3`, `s2`, or `a5` needs a path prefix, such as `./h3`. Cells cover about a 4x4-pixel block of a 256-pixel tile at the equator. Grid uses zoom + 6 (capped at 30); the other systems choose resolutions by equatorial cell area. Each feature counts in the cell holding its centroid at every zoom. Each row has a `cell` id token and `point_count`. Cell tables are tiled verbatim, even with `generalize=True`. Cell bands require GeoParquet, not PMTiles, and reject the convert filter and bbox options.
 * `output`: PMTiles archive to write.
 * `generalize`: Generalize each GeoParquet band, as `overview()` does. By default each band is tiled verbatim, keeping every feature, for input already made for its zooms.
 * `tile_size_limit`: Maximum raw tile size in bytes for bands tiled here; `"auto"`, `0` and `None` are no limit, so every feature is kept.
 * `feature_order`: Paint order within a tile for GeoParquet bands; see `export_pmtiles()`. A band without that column keeps input order, with a warning.
 * `work_dir`: Directory for temporary per-band files, deleted after the build, or `None` for the system temporary directory.
+* `accumulate_attributes`: Aggregation method for each numeric column, `sum`, `min`, `max`, or `mean`. Applies to every cell band and requires one. Each column's result is a Float64 column of the same name.
+* `cluster_categories`: Column to count by category in every cell band; requires a cell band. Writes `COL:label` count columns for the top categories plus `other`, ranked as in `tiles()`. Zero counts are null.
 * `allow_missing_zooms`: Accept a pre-tiled band with fewer zooms than declared. Missing zooms render empty.
 * `name`: The output's tileset name. Unset, the PMTiles bands' name is kept when they agree and left out when they don't.
 * `description`: Description for the output, inherited the same way.
@@ -545,6 +549,7 @@ convert(
     spill_dir: str | os.PathLike[str] | None = None,
     *,
     layer_column: str | None = None,
+    bands: Sequence[str] | None = None,
     include_properties: Sequence[str] | None = None,
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
@@ -631,6 +636,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `feature_order`: See `export_pmtiles()`.
 * `spill_dir`: Scratch directory for the intermediate overview and the export's spill (the CLI's `--spill-dir`). The intermediate is at least input-sized; without this it goes to `$TMPDIR`, then the output's directory. Set it when `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised when the chosen volume looks too small, whether or not the run then fails.
 * `layer_column`: Put each feature in the layer named by its value in this column (the CLI's `--layer-column`), and null or blank values in `"_unknown"`. The column is not written as a property. Each layer is tiled on its own and the layers are merged, so thinning and the tile size limits apply per layer. Excludes `layer_name`, `keep_overview`, `save_plan`, `plan` and `variable_depth`. At most 64 layers.
+* `bands`: The CLI's `--band`, a list of "LO-HI:KIND" strings. Ranges are inclusive; use "Z:KIND" for one zoom. Kinds `geom`, `point` and `square` draw features; `grid`, `h3`, `s2` and `a5` draw occupied grid cells. Cells and features share one tiles layer. Cells carry `cell` (the cell id), `point_count` (features counted by centroid) and per-cell totals. `accumulate_attributes` and `cluster_categories` total into cells without `cluster`. Requires at least one feature band, with contiguous ranges. No overlaps. Uncovered zooms are empty, with a warning. Excludes `min_zoom`, `max_zoom`, `gsds` and `representation`.
 * `include_properties`: See `overview()`.
 * `exclude_properties`: See `overview()`.
 * `exclude_all_properties`: See `overview()`.

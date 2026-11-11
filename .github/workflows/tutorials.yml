@@ -1,0 +1,91 @@
+# Nightly tutorials: run the tutorials that tile a whole country from the
+# network and check their output against the page (#859).
+#
+# Every pull request checks that these tutorials show their scripts verbatim
+# (crates/python/tests/docs/test_examples.py), but it does not run them:
+# the Brazil tutorial reads all 11 GB of Brazil's Fields of the World files
+# from Source Cooperative. This job runs them nightly, on main, with
+# TYLERTOO_DOCS_NIGHTLY=1, so a change that alters their output fails here
+# within a day.
+
+name: Tutorials (nightly)
+
+on:
+  schedule:
+    - cron: "41 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tutorials-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  brazil:
+    name: Brazil tutorial (live, whole country)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Step 1 alone peaks at about 21 GiB of disk (a 4-core, 16 GB
+      # simulation of this runner), and step 2 adds two more 6 GB archives.
+      # The root disk is too small; the runner's scratch disk at /mnt holds
+      # the working directories and spill instead.
+      - name: Use the scratch disk for temporary files
+        run: |
+          sudo mkdir -p /mnt/tmp
+          sudo chown "$USER" /mnt/tmp
+          echo "TMPDIR=/mnt/tmp" >> "$GITHUB_ENV"
+          df -h / /mnt
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tutorials-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --package tylertoo
+
+      # The docs tests stage this fixture for every tutorial's working
+      # directory, including the ones that do not read it.
+      - name: Download the Madagascar fixture
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ \
+            --pattern fieldmaps-madagascar-adm4.parquet --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Run the nightly tutorials and check their output
+        working-directory: crates/python
+        env:
+          TYLERTOO_DOCS_NIGHTLY: "1"
+          TYLERTOO_BIN: ${{ github.workspace }}/target/release/tylertoo
+        run: |
+          uv sync --locked --no-install-project
+          uv run --no-sync pytest -m docs tests/docs/test_examples.py -k brazil -v
+          df -h / /mnt

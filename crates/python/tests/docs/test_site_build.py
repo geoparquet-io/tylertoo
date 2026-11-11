@@ -42,7 +42,7 @@ def site() -> Path:
     [
         ("index.html", "Quickstart"),
         ("tutorials/madagascar/index.html", "02-preview.sh"),
-        ("tutorials/brazil/index.html", "03-shard.sh"),
+        ("tutorials/brazil/index.html", "02-shard.sh"),
         ("changelog/index.html", "Changelog"),
         ("reference/cli/index.html", "export-pmtiles"),
         ("reference/python/index.html", "export_pmtiles"),

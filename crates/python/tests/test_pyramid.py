@@ -3,6 +3,8 @@
 import tempfile
 from pathlib import Path
 
+import pyarrow.compute as pc  # type: ignore[import-untyped]
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 
 import tylertoo
@@ -50,7 +52,7 @@ class TestPyramidApi:
             tylertoo.pyramid(
                 [f"0-5:{STREAMING_SMALL}"],
                 "/tmp/out.pmtiles",
-                True,  # type: ignore[misc]
+                True,  # type: ignore[misc, arg-type]
             )
 
 
@@ -207,3 +209,53 @@ class TestPyramidMetadata:
             "description": None,
             "attribution": None,
         }
+
+
+BUILDINGS = FIXTURES_DIR / "realdata" / "open-buildings.parquet"
+
+
+class TestCellBands:
+    """`LO-HI:SYSTEM:INPUT[:LAYER]` cell bands and their rollups (#332)."""
+
+    @pytest.mark.parametrize("system", ["grid", "h3", "s2", "a5"])
+    def test_every_zoom_counts_every_feature_once(self, system: str) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "cells.pmtiles"
+            decoded = Path(tmpdir) / "cells.parquet"
+            report = tylertoo.pyramid(
+                [f"3-6:{system}:{BUILDINGS}:density"],
+                str(out),
+                accumulate_attributes={"area_in_meters": "sum"},
+                cluster_categories="bf_source",
+            )
+            tylertoo.decode(str(out), str(decoded))
+            table = pq.read_table(decoded)
+        assert [b["layer"] for b in report["bands"]] == ["density"]
+        rows = pq.read_metadata(BUILDINGS).num_rows
+        area = pc.sum(pq.read_table(BUILDINGS, columns=["area_in_meters"])[0]).as_py()
+        for zoom in range(3, 7):
+            at = table.filter(pc.equal(table["zoom"], zoom))
+            # A cell crossing a tile edge is in several tiles: count it once.
+            cells = {c: i for i, c in enumerate(at["cell"].to_pylist())}
+            counts = at["point_count"].to_pylist()
+            sums = at["area_in_meters"].to_pylist()
+            assert sum(counts[i] for i in cells.values()) == rows
+            assert sum(sums[i] for i in cells.values()) == pytest.approx(area)
+            by_source = [
+                at[name].to_pylist()
+                for name in at.column_names
+                if name.startswith("bf_source:")
+            ]
+            for i in cells.values():
+                assert sum(col[i] or 0 for col in by_source) == counts[i]
+
+    def test_rollups_need_a_cell_band(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="cell bands"),
+        ):
+            tylertoo.pyramid(
+                [f"3-6:{BUILDINGS}:b"],
+                str(Path(tmpdir) / "x.pmtiles"),
+                cluster_categories="bf_source",
+            )

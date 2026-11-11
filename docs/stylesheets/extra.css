@@ -61,3 +61,95 @@
 [data-md-color-scheme="slate"] .md-typeset h6 {
   color: #fefdf3;
 }
+
+/* The tutorial result maps (docs/assets/tutorials/*-map.js). */
+.tutorial-map {
+  height: 28rem;
+  max-width: 100%;
+  border-radius: 0.2rem;
+}
+.tutorial-map-legend {
+  position: absolute;
+  bottom: 0.5rem;
+  left: 0.5rem;
+  z-index: 2;
+  padding: 0.3rem 0.5rem;
+  border-radius: 0.2rem;
+  background: rgba(255, 255, 255, 0.9);
+  color: #05221d;
+  font-size: 0.65rem;
+  line-height: 1.4;
+}
+.tutorial-map-legend span {
+  display: inline-block;
+  width: 0.8rem;
+  height: 0.6rem;
+  margin-right: 0.3rem;
+  vertical-align: middle;
+}
+/* The credits toggle: a small, faint "i" that opens on click. MapLibre
+   builds it from <details>/<summary>, which the theme styles as a
+   collapsible admonition (icon, chevron, box); undo that inside the map. */
+.md-typeset .tutorial-map details.maplibregl-ctrl-attrib {
+  min-height: 16px;
+  margin: 0 4px 4px 0;
+  padding: 0 16px 0 0;
+  border: 0;
+  border-radius: 8px;
+  box-shadow: none;
+  background: transparent;
+  font-size: 0.6rem;
+  overflow: visible;
+}
+.md-typeset .tutorial-map details.maplibregl-ctrl-attrib[open] {
+  padding: 0 20px 0 6px;
+  background: rgba(255, 255, 255, 0.85);
+}
+.md-typeset .tutorial-map summary.maplibregl-ctrl-attrib-button {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background-color: rgba(255, 255, 255, 0.6);
+  background-size: 12px 12px;
+  background-repeat: no-repeat;
+  background-position: center;
+  opacity: 0.6;
+}
+.md-typeset .tutorial-map summary.maplibregl-ctrl-attrib-button::before,
+.md-typeset .tutorial-map summary.maplibregl-ctrl-attrib-button::after {
+  display: none;
+}
+.md-typeset .tutorial-map summary.maplibregl-ctrl-attrib-button:focus:not(:focus-visible) {
+  outline: none;
+  box-shadow: none;
+}
+.md-typeset .tutorial-map summary.maplibregl-ctrl-attrib-button:hover {
+  opacity: 1;
+}
+.md-typeset .tutorial-map .maplibregl-ctrl-attrib-inner {
+  margin: 0;
+  line-height: 16px;
+}
+.tutorial-map-caption {
+  font-size: 0.7rem;
+  color: var(--md-default-fg-color--light);
+}
+.maplibregl-popup-content {
+  color: #05221d;
+}
+.md-typeset .maplibregl-popup-content table:not([class]) {
+  display: table;
+  margin: 0.3rem 0 0;
+  border: 0;
+  font-size: 0.65rem;
+}
+.md-typeset .maplibregl-popup-content table:not([class]) :is(th, td) {
+  padding: 0.1rem 0.4rem;
+  white-space: nowrap;
+}

@@ -379,12 +379,59 @@ tylertoo tiles fields.parquet fields.pmtiles --layer-column year
   because each layer runs its own convert (#839). So is
   `--generate-variable-depth-tile-pyramid`.
 
+### Cells and features by zoom: `tiles --band`
+
+Repeat `--band LO-HI:KIND` to choose what each zoom range shows. Python
+`convert(bands=[...])` takes the same strings. Ranges are inclusive;
+`Z:KIND` selects one zoom. Cells and features share the tiles layer, named by
+`--layer-name`. Style by zoom or by whether `point_count` is present.
+
+```bash
+tylertoo tiles fields.parquet fields.pmtiles \
+  --band 0-7:a5 --band 8-14:geom \
+  --accumulate-attribute metrics:area:sum
+```
+
+This draws A5 cells at z0-7 with field counts and summed `metrics:area`, then
+fields at z8-14. A cell total may share a property's name: below z8, `metrics:area`
+is the cell's sum; from z8 it is each field's own value.
+
+- `geom`, `point`, and `square` draw features as `--representation` does:
+  geometry, representative points for polygons, or placeholder squares for
+  small polygons. Feature bands set the zoom range, must be contiguous, and at least one is required.
+  `--band 0-7:point --band 8-14:geom` writes
+  the same archive as `--representation 0-7:point,8-14:geom --min-zoom 0 --max-zoom 14`.
+- `grid`, `h3`, `s2`, and `a5` use the pyramid cell systems and sizes below,
+  about a 4x4 pixel block of a tile per cell. Each zoom has one polygon per
+  occupied cell with `cell` (id), `point_count` (features whose centroid is
+  in the cell), and the `--accumulate-attribute` and `--cluster-categories` totals.
+  These totals need no `--cluster`; they also enter clusters when it is set.
+- Cells count every feature that `--filter`, `--bbox`, and `--mask` keep.
+  Geometry decides whether it is kept, as at feature zooms. The centroid
+  only picks the cell, so a field crossing the bbox may count in a cell outside it.
+- tylertoo opens the input once, reads it for cells, then tiles feature zooms
+  from the same source. Remote byte ranges are reused from local spill, so
+  cells add little network traffic. Each cell zoom tiles verbatim, without size caps.
+- `--band` excludes `--min-zoom`, `--max-zoom`, `--gsd`, and `--representation`.
+  Bands cannot overlap: one layer holds one representation per zoom. Uncovered
+  zooms hold no tiles, with a warning. A cell band also excludes
+  `--layer-column`, `--generate-variable-depth-tile-pyramid`, and `--tile-range`.
+- In sharded builds, cell bands must end below the plan's pivot. The coarse
+  job draws cells and feature zooms below it; data shards skip cells.
+  Bands are saved in the convert plan; every job must get the same `--band` flags.
+  The merged fleet holds the same tiles as an unsharded run.
+- For cells from another input, use `tylertoo pyramid` bands (`LO-HI:SYSTEM:INPUT`) below.
+
 ### Band sources and syntax
 
-A band accepts GeoParquet or PMTiles via `--band LO-HI:PATH[:LAYER]`.
+A band accepts GeoParquet or PMTiles via `--band LO-HI:[SYSTEM:]PATH[:LAYER]`.
 tylertoo detects the format from the contents, tiles GeoParquet over the
-band's range, and merges an archive as-is. Mix formats to reuse a coarse
-archive while rebuilding a fine band.
+band's range when `SYSTEM` is omitted, and merges an archive as-is. Set
+`SYSTEM` to `grid`, `h3`, `s2`, or `a5` to aggregate GeoParquet features
+into cells per zoom; cell bands require GeoParquet and tile the cell
+tables verbatim. An input literally named `grid`, `h3`, `s2`, or `a5`
+needs a path prefix, such as `./h3`. Mix formats to reuse a coarse archive
+while rebuilding a fine band.
 
 A GeoParquet band may be remote:
 `--band 9-13:https://data.source.coop/…/features.parquet` streams with
@@ -401,7 +448,7 @@ drive-relative path such as `C:data.parquet` also stays whole: a single ASCII
 letter before the last colon counts as a drive letter.
 
 For an input ending in a bare colon segment, such as the Hive directory
-`admin:country_code=BR`, use `--band LO-HI=INPUT[=LAYER]`.
+`admin:country_code=BR`, use `--band LO-HI=[SYSTEM=]INPUT[=LAYER]`.
 tylertoo splits the range at
 the first `=` and the layer at the last. As before, it splits only when the
 text after it has no `/`, `\`, or `:`. That keeps `--band 0-13=admin:country_code=BR/part.parquet`
@@ -430,8 +477,9 @@ shares no zoom with its archive is always an error.
 `pyramid` takes the export flags `tiles` and `export-pmtiles` take
 (`--max-tile-size`, `--max-compressed-tile-size`, `--size-valve`,
 `--tile-buffer`, `--feature-order`, `--feature-id`, the property selection,
-and the rest), and applies them to every GeoParquet band alike, as
-`--generalize` does. Both size caps are off by default for pyramid bands,
+and the rest), and applies them to every GeoParquet band alike.
+`--generalize` applies only to bands without a cell system. Both size caps
+are off by default for pyramid bands,
 preserving every cell. When set, a cap applies to each band's tiles before
 tylertoo combines them. Every GeoParquet band needs the `--feature-id`
 column. A band that lacks the column exports in input order with a warning

@@ -9,6 +9,7 @@ run reproduces.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,15 @@ from doc_blocks import (
 
 EXAMPLES = sorted(p for p in EXAMPLES_DIR.glob("*/") if p.is_dir())
 STEPS = [(ex, step) for ex in EXAMPLES for step in example_steps(ex)]
+
+# Tutorials that tile a whole country from the network run nightly
+# (.github/workflows/tutorials.yml), not on every pull request. Their
+# scripts are still checked verbatim on every run.
+NIGHTLY = {"brazil-fields"}
+
+
+def _runs(example: Path) -> bool:
+    return example.name not in NIGHTLY or os.environ.get("TYLERTOO_DOCS_NIGHTLY") == "1"
 
 
 def _step_id(param: tuple[Path, Path]) -> str:
@@ -58,7 +68,7 @@ def step_outputs(
 ) -> dict[Path, str]:
     """Run every example's steps in order; map each step to its output."""
     outputs: dict[Path, str] = {}
-    for example in EXAMPLES:
+    for example in filter(_runs, EXAMPLES):
         workdir = tmp_path_factory.mktemp(example.name)
         stage_input(madagascar, workdir)
         for step in example_steps(example):
@@ -85,6 +95,8 @@ def test_step_output_matches_tutorial(
 ) -> None:
     """The output a tutorial shows is the output the step prints."""
     example, step = param
+    if not _runs(example):
+        pytest.skip(f"{example.name} runs nightly; set TYLERTOO_DOCS_NIGHTLY=1")
     tutorial = (example / "README.md").read_text(encoding="utf-8")
     shown = expected_output(tutorial, step)
     if shown is None:

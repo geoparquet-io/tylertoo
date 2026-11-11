@@ -413,6 +413,8 @@ pub struct SourceStream<'a> {
     /// part's reader costs a `File::open` and nothing else (#494 follow-up).
     /// `None` for a part the selection never opens.
     metas: Vec<Option<ReaderMetadata>>,
+    /// Each part's resolved schema, which reprojects its batches (#670).
+    resolved: Vec<Arc<crate::resolved_schema::ResolvedSchema>>,
     projection: Option<Vec<usize>>,
     row_groups: Option<Vec<Vec<usize>>>,
     batch_size: usize,
@@ -1240,8 +1242,8 @@ impl ConvertSource {
         // Footers are parsed once per source (lazily for `Single`, at
         // construction for `Multi`); every reader this stream opens reuses
         // them rather than re-decoding O(row_groups × columns) of thrift.
-        let metas = self
-            .metas_with_footers(plan.row_groups)?
+        let part_metas = self.metas_with_footers(plan.row_groups)?;
+        let metas = part_metas
             .iter()
             .zip(parts)
             .enumerate()
@@ -1255,6 +1257,7 @@ impl ConvertSource {
                 }
             })
             .collect::<Result<Vec<_>, InputError>>()?;
+        let resolved = part_metas.iter().map(|m| m.resolved.clone()).collect();
         // #563: each part's reader caps the batch for its selected row
         // groups' widest byte-array column (`untrusted::ParquetSource::build`),
         // so no batch can pass arrow's i32 offset ceiling. Output does not
@@ -1262,6 +1265,7 @@ impl ConvertSource {
         Ok(SourceStream {
             parts,
             metas,
+            resolved,
             projection,
             row_groups: plan.row_groups.map(|s| s.0.clone()),
             batch_size: plan.batch_size.max(1),
@@ -1563,7 +1567,19 @@ impl MultiSource {
     )]
     pub fn from_sources(root: String, parts: Vec<InputSource>) -> Result<Self, InputError> {
         assert!(!parts.is_empty(), "MultiSource requires at least one part");
-        let metas = load_part_metas(&parts)?;
+        let mut metas = load_part_metas(&parts)?;
+        // #670: in a set that mixes them, EPSG:3857 parts are read in lon/lat
+        // like any other projected part; an all-3857 set keeps its own path.
+        let has = |crs| metas.iter().any(|m| m.resolved.crs() == Some(crs));
+        if has(crate::overview::level::Crs::Epsg3857) && has(crate::overview::level::Crs::Epsg4326)
+        {
+            for (m, part) in metas.iter_mut().zip(&parts) {
+                if m.resolved.crs() == Some(crate::overview::level::Crs::Epsg3857) {
+                    let parquet = m.parquet(part)?;
+                    m.resolved = Arc::new(m.resolved.web_mercator_as_lonlat(&parquet));
+                }
+            }
+        }
 
         let first_name = parts[0].display_name();
         // The reference CRS: `Ok(crs)` per detect_crs_from_kv, `None` for an
@@ -1588,7 +1604,18 @@ impl MultiSource {
                 offender: part.display_name(),
                 detail,
             };
-            validate_schema_shape(&metas[0].schema, &meta.schema).map_err(incompatible)?;
+            // Only a declared CRS is one the reader reprojects from; an
+            // assumed one ignores the extension metadata, which must match.
+            let declared = |m: &PartMeta| !m.resolved.crs_info().assumed_wgs84;
+            validate_schema_shape(
+                &metas[0].schema,
+                &meta.schema,
+                metas[0]
+                    .resolved
+                    .geometry_name()
+                    .filter(|_| declared(&metas[0]) && declared(meta)),
+            )
+            .map_err(incompatible)?;
             if meta.resolved.geometry_name() != metas[0].resolved.geometry_name() {
                 return Err(incompatible(format!(
                     "primary geometry mismatch: {:?} versus {:?}",
@@ -1656,7 +1683,26 @@ impl MultiSource {
 /// order, and field (extension) metadata — everything except nullability,
 /// which the union schema absorbs. Returns a human-readable detail on the
 /// first difference.
-fn validate_schema_shape(first: &Schema, other: &Schema) -> Result<(), String> {
+/// `geometry`'s extension metadata may differ in its CRS: the CRS check
+/// below compares the parts' working CRSs, as each part is reprojected (#670).
+fn validate_schema_shape(
+    first: &Schema,
+    other: &Schema,
+    geometry: Option<&str>,
+) -> Result<(), String> {
+    let without_crs = |f: &Field| {
+        let mut md = f.metadata().clone();
+        if Some(f.name().as_str()) == geometry {
+            if let Some(v) = md.get_mut("ARROW:extension:metadata") {
+                if let Ok(serde_json::Value::Object(mut o)) = serde_json::from_str(v) {
+                    o.remove("crs");
+                    o.remove("crs_type");
+                    *v = serde_json::Value::Object(o).to_string();
+                }
+            }
+        }
+        md
+    };
     if first.fields().len() != other.fields().len() {
         return Err(format!(
             "column count differs: {} vs {} in the first partition",
@@ -1681,7 +1727,7 @@ fn validate_schema_shape(first: &Schema, other: &Schema) -> Result<(), String> {
                 f0.data_type()
             ));
         }
-        if f0.metadata() != fi.metadata() {
+        if without_crs(f0) != without_crs(fi) {
             return Err(format!(
                 "column {:?} carries different field (extension) metadata than \
                  the first partition ({}) — geometry encoding/CRS metadata must \
@@ -1781,7 +1827,13 @@ impl Iterator for SourceStream<'_> {
         loop {
             if let Some(reader) = &mut self.current {
                 match reader.next() {
-                    Some(Ok(batch)) => return Some(Ok(batch)),
+                    Some(Ok(batch)) => {
+                        return Some(
+                            self.resolved[self.part_idx]
+                                .in_working_crs(batch)
+                                .map_err(InputError::Arrow),
+                        )
+                    }
                     Some(Err(e)) => {
                         self.done = true;
                         return Some(Err(InputError::Arrow(e)));
@@ -2332,10 +2384,11 @@ mod tests {
         let dir = tmpdir();
         let geo = |epsg: u32| {
             format!(
-                r#"{{"version":"1.0.0","primary_column":"geometry","columns":{{"geometry":{{"crs":"EPSG:{epsg}"}}}}}}"#
+                r#"{{"version":"1.0.0","primary_column":"geometry","columns":{{"geometry":{{"crs":"ESRI:{epsg}"}}}}}}"#
             )
         };
-        for (file, epsg) in [("a.parquet", 32633u32), ("b.parquet", 32634u32)] {
+        // ESRI codes: no EPSG definition to reproject from (#670).
+        for (file, epsg) in [("a.parquet", 54009u32), ("b.parquet", 54030u32)] {
             let path = dir.path().join(file);
             let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
             let batch = RecordBatch::try_new(
@@ -2359,12 +2412,76 @@ mod tests {
             } => {
                 assert!(offender.ends_with("b.parquet"), "offender: {offender}");
                 assert!(
-                    detail.contains("32633") && detail.contains("32634"),
+                    detail.contains("54009") && detail.contains("54030"),
                     "detail must name both raw CRS values: {detail}"
                 );
             }
             other => panic!("expected IncompatiblePartition, got {other:?}"),
         }
+    }
+
+    /// #670: parts whose geometry extension metadata differs only in its
+    /// CRS are compatible (each part is reprojected); other differences are not.
+    #[test]
+    fn geometry_crs_metadata_may_differ_between_parts() {
+        let schema = |meta: &str| {
+            let md = [
+                (
+                    "ARROW:extension:name".to_string(),
+                    "geoarrow.wkb".to_string(),
+                ),
+                ("ARROW:extension:metadata".to_string(), meta.to_string()),
+            ];
+            Schema::new(vec![
+                Field::new("geometry", DataType::Binary, true).with_metadata(md.into())
+            ])
+        };
+        let a = schema(r#"{"crs":"EPSG:28992","crs_type":"authority_code"}"#);
+        let b = schema(r#"{"crs":"EPSG:31370","crs_type":"authority_code"}"#);
+        let c = schema(r#"{"crs":"EPSG:31370","edges":"spherical"}"#);
+        assert!(validate_schema_shape(&a, &b, Some("geometry")).is_ok());
+        assert!(validate_schema_shape(&a, &b, None).is_err());
+        assert!(validate_schema_shape(&a, &c, Some("geometry")).is_err());
+    }
+
+    /// #670: a CRS only in the extension metadata is not one the reader
+    /// reprojects from, so parts that differ there stay incompatible.
+    #[test]
+    fn extension_only_crs_difference_is_still_refused() {
+        let dir = tmpdir();
+        for (file, crs) in [("a.parquet", "EPSG:28992"), ("b.parquet", "EPSG:31370")] {
+            let md = [
+                (
+                    "ARROW:extension:name".to_string(),
+                    "geoarrow.wkb".to_string(),
+                ),
+                (
+                    "ARROW:extension:metadata".to_string(),
+                    format!(r#"{{"crs":"{crs}"}}"#),
+                ),
+            ];
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "geometry",
+                DataType::Binary,
+                true,
+            )
+            .with_metadata(md.into())]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::BinaryArray::from_vec(vec![b"".as_ref()])) as ArrayRef],
+            )
+            .unwrap();
+            let mut writer =
+                ArrowWriter::try_new(File::create(dir.path().join(file)).unwrap(), schema, None)
+                    .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let err = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, InputError::IncompatiblePartition { .. }),
+            "{err:?}"
+        );
     }
 
     /// #708: a part that declares EPSG:4326 and a part that declares nothing

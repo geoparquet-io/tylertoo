@@ -266,13 +266,13 @@ struct Staged {
 }
 
 /// What decides, before the split, which input rows reach a layer.
-struct Gates {
-    filter: Option<super::filter::BoundFilter>,
-    bbox: Option<super::convert::BboxQuery>,
+pub(crate) struct Gates {
+    pub(super) filter: Option<super::filter::BoundFilter>,
+    pub(super) bbox: Option<super::convert::BboxQuery>,
     /// `--mask` (#826), tested per row as conversion tests it.
-    mask: Option<super::mask::MaskIndex>,
+    pub(super) mask: Option<super::mask::MaskIndex>,
     /// The row groups whose footer statistics let the gates through.
-    row_groups: Option<crate::input_set::RowGroupSelection>,
+    pub(super) row_groups: Option<crate::input_set::RowGroupSelection>,
 }
 
 impl Gates {
@@ -280,7 +280,7 @@ impl Gates {
     /// before the split, so the filter may read the routing column and the
     /// layer limit counts only the rows they keep. The layers keep the bbox,
     /// which then passes every row.
-    fn new(
+    pub(super) fn new(
         source: &ConvertSource,
         schema: &arrow_schema::Schema,
         options: &super::convert::ConvertOptions,
@@ -372,6 +372,31 @@ fn split(
         message: e.to_string(),
     };
 
+    // A reprojected input's covering holds source-CRS boxes, and the
+    // staged file declares none (see `staged_metadata`): a dedicated
+    // covering column is not staged. One that is also a property stays.
+    let resolved = source.resolved_schema()?;
+    let reprojected = reprojects(source)?;
+    let covering = resolved
+        .covering()
+        .filter(|_| reprojected)
+        .and_then(|c| c.xmin_path.first())
+        .filter(|root| {
+            resolved
+                .schema()
+                .index_of(root)
+                .is_ok_and(|i| !resolved.properties().contains(&i))
+        })
+        .and_then(|root| schema.index_of(root).ok());
+    let kept: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| Some(i) != covering)
+        .collect();
+    let staged_schema = Arc::new(
+        schema
+            .project(&kept)
+            .map_err(|e| stage_err(field.name(), &e))?,
+    );
+
     let (filter, bbox, mask) = (
         gates.filter.as_ref(),
         gates.bbox.as_ref(),
@@ -434,11 +459,12 @@ fn split(
                     });
                 }
                 let staged =
-                    open_staged(dir, schema, &metadata).map_err(|e| stage_err(name, &e))?;
+                    open_staged(dir, &staged_schema, &metadata).map_err(|e| stage_err(name, &e))?;
                 layers.insert(name.to_string(), staged);
             }
             let staged = layers.get_mut(name).expect("inserted above");
             let part = arrow_select::take::take_record_batch(&batch, &UInt32Array::from(take))
+                .and_then(|p| p.project(&kept))
                 .map_err(|e| stage_err(name, &e))?;
             staged.rows += part.num_rows() as u64;
             staged
@@ -491,7 +517,7 @@ fn routing_column(schema: &arrow_schema::Schema, column: &str) -> Result<usize, 
 /// Per row of `batch`, whether its geometry (column `geom`) is one convert
 /// drops as outside `--bbox` (its envelope misses `bbox`) or `--mask` (it
 /// misses `mask`). A null or empty geometry is left for convert to count.
-fn outside_gates(
+pub(super) fn outside_gates(
     batch: &RecordBatch,
     geom: usize,
     bbox: Option<&super::convert::BboxQuery>,
@@ -548,6 +574,9 @@ fn staged_metadata(source: &ConvertSource) -> Result<Vec<tylertoo_io::KeyValue>,
     let Some(name) = resolved.geometry_name().filter(|_| !crs.assumed_wgs84) else {
         return Ok(metadata);
     };
+    // #670: the staged rows are already lon/lat; the covering's boxes are
+    // still in the source CRS, so the staged file declares none.
+    let reprojected = reprojects(source)?;
     let at = metadata
         .iter()
         .position(|kv| kv.key.eq_ignore_ascii_case("geo"));
@@ -557,17 +586,23 @@ fn staged_metadata(source: &ConvertSource) -> Result<Vec<tylertoo_io::KeyValue>,
         // Unreadable: the input's own read settled what it means.
         Some(_) => return Ok(metadata),
     };
-    if geo.get("columns").and_then(|c| c.get(name)).is_some() {
-        return Ok(metadata);
+    if let Some(Value::Object(column)) = geo.get_mut("columns").and_then(|c| c.get_mut(name)) {
+        if !reprojected {
+            return Ok(metadata);
+        }
+        for key in ["crs", "covering", "bbox"] {
+            column.remove(key);
+        }
+    } else {
+        if !geo.get("columns").is_some_and(Value::is_object) {
+            geo["columns"] = json!({});
+        }
+        let mut column = json!({ "encoding": "WKB", "geometry_types": [] });
+        if let Some(id) = crs.identifier.as_ref().filter(|_| !reprojected) {
+            column["crs"] = id.as_str().into();
+        }
+        geo["columns"][name] = column;
     }
-    if !geo.get("columns").is_some_and(Value::is_object) {
-        geo["columns"] = json!({});
-    }
-    let mut column = json!({ "encoding": "WKB", "geometry_types": [] });
-    if let Some(id) = &crs.identifier {
-        column["crs"] = id.as_str().into();
-    }
-    geo["columns"][name] = column;
     if geo.get("primary_column").is_none() {
         geo["primary_column"] = name.into();
     }
@@ -577,6 +612,11 @@ fn staged_metadata(source: &ConvertSource) -> Result<Vec<tylertoo_io::KeyValue>,
         None => metadata.push(geo),
     }
     Ok(metadata)
+}
+
+/// Whether any part of `source` is reprojected as it is read (#670).
+fn reprojects(source: &ConvertSource) -> Result<bool, InputError> {
+    Ok(source.resolved_schemas()?.iter().any(|r| r.reprojects()))
 }
 
 /// Create one layer's staged file under `dir`.
@@ -1380,12 +1420,124 @@ mod tests {
         );
     }
 
+    /// #670: projected input is staged in lon/lat, once. Each layer reads
+    /// its staged file as EPSG:4326 and does not reproject it again, and
+    /// `--bbox` gates in degrees.
+    #[test]
+    fn projected_input_is_staged_in_lon_lat() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("utm.parquet");
+        // EPSG:32633: (15E, 49.65N) and (15E, 9.04S).
+        let rows = [
+            (500_000.0, 5_500_000.0, "soy"),
+            (500_000.0, -1_000_000.0, "corn"),
+        ];
+        let geo = r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":[],"crs":"EPSG:32633"}}}"#;
+        write_native_input(&input, "EPSG:32633", &rows, &[("geo", geo.to_string())]);
+        let out = dir.path().join("o.pmtiles");
+        let mut options = options("crop");
+        options.convert.bbox = Some([10.0, 40.0, 20.0, 55.0]);
+        let outcome = convert_to_pmtiles(&TilesInput::Path(input), &out, &options).unwrap();
+        let TilesOutcome::Layered(report) = outcome else {
+            panic!("expected a layered outcome, got {outcome:?}");
+        };
+        assert_eq!(report.filtered_rows, 1, "--bbox drops corn in degrees");
+        // z3 tile (4, 2) holds 15E 49.65N; reprojected twice it would land
+        // near the equator, in (4, 3).
+        let index = ArchiveIndex::open(&out).unwrap();
+        let tiles: Vec<(u32, u32)> = index
+            .tiles()
+            .map(|t| t.unwrap())
+            .filter(|t| t.z == 3)
+            .map(|t| (t.x, t.y))
+            .collect();
+        assert_eq!(tiles, [(4, 2)]);
+    }
+
+    /// #670: a reprojected input's covering, under any name, holds
+    /// source-CRS boxes; a dedicated covering struct is not staged, so no
+    /// layer exports it. A struct that also holds other data stays a
+    /// property, and a malformed covering path is no crash.
+    #[test]
+    fn a_reprojected_input_s_covering_is_not_staged() {
+        use arrow_array::{
+            ArrayRef, BinaryArray, Int32Array, RecordBatch, StringArray, StructArray,
+        };
+        use arrow_schema::{Field, Fields, Schema};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (x, y) = (500_000.0_f64, 5_500_000.0_f64);
+        let wkb = [
+            &[1u8][..],
+            &1u32.to_le_bytes(),
+            &x.to_le_bytes(),
+            &y.to_le_bytes(),
+        ]
+        .concat();
+        // The z3 tag keys of the one feature, for an `extent` struct of
+        // `members` under a covering whose xmin path is `xmin`.
+        let keys = |members: &[&str], xmin: &str| -> Vec<String> {
+            let fields: Fields = members
+                .iter()
+                .map(|n| Field::new(*n, DataType::Int32, false))
+                .collect::<Vec<_>>()
+                .into();
+            let values: Vec<ArrayRef> = [x, y, x, y, 7.0][..members.len()]
+                .iter()
+                .map(|&v| Arc::new(Int32Array::from(vec![v as i32])) as ArrayRef)
+                .collect();
+            let geo = format!(
+                r#"{{"version":"1.1.0","primary_column":"geometry","columns":{{"geometry":
+                {{"encoding":"WKB","geometry_types":[],"crs":"EPSG:32633","covering":{{"bbox":{{
+                "xmin":{xmin},"ymin":["extent","ymin"],
+                "xmax":["extent","xmax"],"ymax":["extent","ymax"]}}}}}}}}}}"#
+            );
+            let schema = Arc::new(Schema::new_with_metadata(
+                vec![
+                    Field::new("geometry", DataType::Binary, false),
+                    Field::new("crop", DataType::Utf8, false),
+                    Field::new("extent", DataType::Struct(fields.clone()), false),
+                ],
+                [("geo".to_string(), geo)].into(),
+            ));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(BinaryArray::from_iter_values([wkb.clone()])),
+                    Arc::new(StringArray::from(vec!["soy"])),
+                    Arc::new(StructArray::new(fields, values, None)),
+                ],
+            )
+            .unwrap();
+            let input = dir.path().join("utm.parquet");
+            let mut writer = tylertoo_io::test_support::ArrowWriter::try_new(
+                std::fs::File::create(&input).unwrap(),
+                schema,
+                None,
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let out = dir.path().join("o.pmtiles");
+            convert_to_pmtiles(&TilesInput::Path(input), &out, &options("crop")).unwrap();
+            let mut at_z3 = layers_at(&out, 3);
+            assert_eq!(at_z3["soy"].len(), 1, "{at_z3:?}");
+            at_z3.remove("soy").unwrap().remove(0)
+        };
+        let corners = ["xmin", "ymin", "xmax", "ymax"];
+        let path = r#"["extent","xmin"]"#;
+        assert!(!keys(&corners, path).contains(&"extent".to_string()));
+        let shared = ["xmin", "ymin", "xmax", "ymax", "source_id"];
+        assert!(keys(&shared, path).contains(&"extent".to_string()));
+        keys(&corners, "[]");
+    }
+
     /// An unsupported CRS is refused from the footer, before the split.
     #[test]
     fn an_unsupported_crs_is_refused_before_staging() {
         let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("utm.parquet");
-        write_native_input(&input, "EPSG:32633", &[(500_000.0, 0.0, "soy")], &[]);
+        let input = dir.path().join("custom.parquet");
+        write_native_input(&input, "EPSG:999999", &[(500_000.0, 0.0, "soy")], &[]);
         let err = convert_to_pmtiles(
             &TilesInput::Path(input),
             &dir.path().join("o.pmtiles"),

@@ -1,299 +1,243 @@
-# Brazil fields: cloud data to a sharded, two-layer map
+<!-- --8<-- [start:build] -->
+# Brazil fields: a whole country from cloud data to tiles
 
-Build a PMTiles map of the soy belt around Sorriso, Mato Grosso, with field
-polygons up close and a density grid at low zooms. The source is
-[Fields of the World](https://fieldsofthe.world/) (FTW): about 3.2 billion
-field polygons on [Source Cooperative](https://source.coop/ftw/global-data),
-stored as one GeoParquet file per country subdivision. You only download
-the row groups needed for this area.
+Stream Brazil's 2025 field predictions from a cloud bucket into one PMTiles
+archive with one `tylertoo tiles` command. Then split the same build into
+independent jobs that can run at the same time on a cluster.
 
-This extends the
-[Madagascar tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/madagascar/)
-with:
-
-- remote reads with `--files-from`, `--bbox`, and `--filter`
-- DuckDB and the `tylertoo` Python package to derive a second layer
-- `shard-plan` and `merge` to split tiling into independent jobs
-- `pyramid` to combine layers with separate zoom ranges
+The input is the 45 GeoParquet files under Brazil's prefix on
+[Source Cooperative](https://source.coop/ftw/global-data): 11.6 GB with
+55,500,503 rows. The data holds predictions for 2024 and 2025, with about
+27.5 million rows per year. The `determination:datetime` column tells the
+years apart. Without the year in the filter, the map draws most fields
+twice, once per year. Keeping only 2025 fields of one hectare or more
+leaves 4,173,713 fields, or 7.5% of the rows, covering 103.3 million hectares.
+The map shows A5 density cells at z0-z7 and field polygons at z8-z14.
 
 Each step is a script in
 [`examples/brazil-fields/`](https://github.com/geoparquet-io/tylertoo/tree/main/examples/brazil-fields).
-CI runs the scripts against live data on each pull request and checks the
-code and output shown here.
 
 ## Before you begin
 
-| Tool | Install | Used for |
-| --- | --- | --- |
-| `tylertoo` | `cargo install tylertoo` | Overviews, sharded tiling, merging, pyramids |
-| `tylertoo` Python package and DuckDB | `pip install tylertoo duckdb` | Validation and the density layer |
-| `gpio` | `pip install geoparquet-io` | Row-group bounds for the shard plan |
+Install `tylertoo` with `cargo install tylertoo`. You don't need credentials:
+requests are anonymous, and `tylertoo` logs a warning. Run the steps in
+order in an empty working directory. Each step downloads the 11.6 GB.
 
-Run the steps in order in an empty working directory. Step 1 downloads
-about 120 MB; the remaining steps run locally in seconds.
+On a 4-core machine with 16 GB of memory, step 1 took about 20 minutes,
+peaked at 12 GB of memory, and needed about 21 GB of free disk for its
+temporary files and the 3.3 GB archive. The archive was byte-identical to
+the 64-core run. If the default disk is short on space, set `TMPDIR` to a
+roomier disk. Step 2 runs five jobs in sequence, so it takes longer on one
+machine.
 
-## 1. Extract a window from three remote files
+## 1. Tile all of Brazil straight from the bucket
 
-The Mato Grosso file is 1.1 GB; this window covers about 4% of it.
-tylertoo reads each file's Parquet footer, then fetches the row groups whose
-bounds intersect `--bbox`. FTW stores features in spatial order and records
-row-group bounds, allowing tylertoo to skip the rest.
+Point `AWS_ENDPOINT_URL` at Source Cooperative. The `--filter` keeps 2025
+fields of one hectare or more using `determination:datetime` and
+`metrics:area`, which stores square meters. The column names need double
+quotes in the filter, so the whole filter is in double quotes and the
+inner ones are escaped.
 
-`--files-from` treats a list of local paths or URLs as one dataset, in the
-listed order. Goiás and Mato Grosso do Sul lie outside the window, so each
-costs only a footer read. `--filter` uses `metrics:area` to drop fields
-smaller than one hectare. The output is an overview file whose finest
-level contains the extract.
+This run reads 875 of the 879 row groups and downloads all 11.6 GB once.
+Both years share row groups, so the year filter cannot skip downloads.
+The command counts the A5 cells first and then tiles the fields from the
+same downloaded bytes.
 
-File: `01-extract.sh`
+Use `--band 0-7:a5` to draw A5 cells at z0-z7. Each cell holds its ID in
+`cell` and the number of fields whose centroid falls in it in `point_count`.
+Add `--accumulate-attribute metrics:area:sum` to sum the field areas in
+`metrics:area`. At z8-z14, use `--band 8-14:geom` to draw field polygons,
+where `metrics:area` is each field's own area.
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
+Name the shared layer `fields` with `--layer-name`. Style by zoom or by
+whether `point_count` is present.
 
-# Fields of the World publishes one GeoParquet file per Brazilian state.
-# List three neighboring states; tylertoo reads them as one dataset.
-BASE=https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR
-printf '%s\n' "$BASE/BR_MT.parquet" "$BASE/BR_GO.parquet" "$BASE/BR_MS.parquet" > states.txt
+Choose another cell system by changing `a5` in `--band 0-7:a5`:
 
-# Keep fields of one hectare or more in a 20 km window near Sorriso,
-# Mato Grosso. Row groups outside the window are never downloaded.
-tylertoo overview --files-from states.txt \
-  --bbox=-55.65,-12.65,-55.45,-12.45 \
-  --filter '"metrics:area" >= 10000' \
-  --max-zoom 14 \
-  fields-ov.parquet
-```
+| System | Cells |
+| --- | --- |
+| `grid` | Squares aligned to the tile grid at each zoom |
+| `h3` | Hexagons |
+| `s2` | Quadrilaterals on a cube |
+| `a5` | Pentagons with equal areas |
 
-```text
-...
-bbox+attribute filter: reading 5/167 input row groups
-...
-remote input: 11 range requests, 119.46 MiB fetched of a 2988.72 MiB object (4.0%)
-...
-✓ Overview states.txt → fields-ov.parquet  (Duplicating mode)
-  534 input features → 4,477 rows across 13 levels in 1.65s
-  lvl        gsd(m)    features    vertices         bytes
-    0       9783.94           3          15  1.03 KiB
-...
-   12          2.39         534     172,653  504.61 KiB
-```
+In every system, cell resolution follows the zoom, and each field counts
+in the cell that holds its centroid. This keeps counts exact at every zoom.
 
-Five of 167 row groups matched: 4% of the three files' bytes. The download
-accounts for most of the run time. Expanding the window to a whole state
-requires more row-group reads; the footer count stays the same.
+Run the script to build the archive. `tylertoo stats` reports tile sizes
+per zoom.
 
-## 2. Derive the layers with Python and DuckDB
-
-`tylertoo.validate` checks the GeoParquet overview against the
-`geo:overviews` spec and returns a `dict`. DuckDB then exports its finest
-level as `fields-raw.parquet` for tiling in step 3, and builds a density
-grid for low zooms.
-
-At z5, a pixel spans about 5 km, so individual fields are too small to see.
-The grid uses 0.01° cells, each recording a field count and total area.
-
-File: `02_layers.py`
-
-```python
-"""Check the extract, then derive the two layers the map needs."""
-
-import duckdb
-
-import tylertoo
-
-OV = "fields-ov.parquet"
-
-result = tylertoo.validate(OV)
-print(f"valid={result['valid']}  checks={len(result['checks'])}")
-
-con = duckdb.connect()
-con.sql("INSTALL spatial; LOAD spatial;")
-finest = con.sql(f"SELECT max(level) FROM '{OV}'").fetchone()[0]
-
-# The finest level holds every field at full detail: it is the extract.
-con.sql(f"""
-    COPY (SELECT * EXCLUDE (level, coalesced_count) FROM '{OV}' WHERE level = {finest})
-    TO 'fields-raw.parquet' (FORMAT parquet)
-""")
-
-# Zoomed out, single fields are too small to see. Count them per
-# 0.01-degree cell (about 1 km) instead, and keep the cell as a square.
-con.sql(f"""
-    COPY (
-        SELECT count(*) AS fields,
-               round(sum("metrics:area") / 1e4, 1) AS hectares,
-               ST_MakeEnvelope(gx * 0.01, gy * 0.01, (gx + 1) * 0.01, (gy + 1) * 0.01)
-                   AS geometry
-        FROM (
-            SELECT "metrics:area",
-                   floor(ST_X(ST_Centroid(geometry)) / 0.01) AS gx,
-                   floor(ST_Y(ST_Centroid(geometry)) / 0.01) AS gy
-            FROM '{OV}' WHERE level = {finest}
-        )
-        GROUP BY gx, gy
-        ORDER BY gx, gy
-    ) TO 'density.parquet' (FORMAT parquet)
-""")
-
-con.sql("""
-    SELECT count(*) AS cells, sum(fields) AS fields,
-           max(fields) AS busiest_cell, round(sum(hectares)) AS hectares
-    FROM 'density.parquet'
-""").show()
-```
-
-```text
-valid=True  checks=12
-┌───────┬────────┬──────────────┬──────────┐
-│ cells │ fields │ busiest_cell │ hectares │
-│ int64 │ int128 │    int64     │  double  │
-├───────┼────────┼──────────────┼──────────┤
-│   266 │    534 │            9 │  36733.0 │
-└───────┴────────┴──────────────┴──────────┘
-```
-
-The 534 fields cover 36,733 ha, averaging 69 ha each: large, regular fields
-typical of Mato Grosso's soy farms.
-
-## 3. Tile the fields as a sharded build
-
-A sharded build splits fine zooms into jobs that can run concurrently on
-separate machines. This small window runs four shards sequentially in
-seconds, using the same commands you would run on a cluster:
-
-1. `gpio convert geoparquet` adds the row-group bounds and bbox covering
-   missing from DuckDB's export.
-2. `shard-plan` uses those bounds to divide tile space at z10, the pivot
-   zoom, into ranges with roughly equal row counts.
-3. The coarse job builds z8–z9, below the pivot, and saves `convert.plan`.
-   Every shard uses this plan to generalize the data consistently.
-4. Each shard builds z10–z14 for its range. `merge` copies the disjoint tiles
-   from all five archives into one archive without recomputing them.
-
-The window is centered on the corner of four z10 tiles, giving each shard
-some fields to tile.
-
-File: `03-shard.sh`
+File: `01-tiles.sh`
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Add a bbox covering and Hilbert order: shard-plan balances shards by
-# row-group bounds, which the DuckDB export does not record.
-gpio convert geoparquet fields-raw.parquet fields.parquet
+# Fields of the World on Source Cooperative, which serves the S3 API.
+export AWS_ENDPOINT_URL=https://data.source.coop
+
+# Brazil is one GeoParquet file per state under this prefix, with two
+# prediction years. Keep every 2025 field of one hectare or more in the
+# country: A5 cells that count them at z0-z7, the fields at z8-z14.
+tylertoo tiles s3://ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/ \
+  --filter "\"metrics:area\" >= 10000 AND \"determination:datetime\" >= '2025-01-01'" \
+  --band 0-7:a5 --band 8-14:geom \
+  --accumulate-attribute metrics:area:sum \
+  --layer-name fields \
+  brazil.pmtiles
+tylertoo stats brazil.pmtiles
+```
+```text
+✓ Converted admin:country_code=BR → brazil.pmtiles
+  857,315 tiles across z0..z14 in 174.16s
+...
+  3 tile(s) still over the size limit after the size valve, written as is
+...
+ z    tiles          total     mean      p50      p99      max
+ 0        1          1,663    1,663    1,663    1,663    1,663
+ 1        2          6,305    3,152    1,895    4,410    4,410
+ 2        2         13,775    6,887    2,539   11,236   11,236
+ 3        4         38,872    9,718    3,685   25,405   25,405
+ 4        8        119,085   14,885    3,849   59,644   59,644
+ 5       15        370,907   24,727    7,067   85,940   85,940
+ 6       40      1,176,585   29,414   13,815   80,543   80,543
+ 7      120      3,605,503   30,045   20,952   73,098   73,800
+ 8      408     88,559,434  217,057  151,525  510,604  560,436
+ 9    1,391    176,905,218  127,178   76,355  499,280  511,638
+10    4,725    248,244,053   52,538   32,908  296,306  509,116
+11   16,499    359,181,678   21,769   13,682  123,829  277,193
+12   57,165    558,874,935    9,776    6,240   53,571  118,290
+13  188,497    838,446,327    4,448    3,106   21,519   43,053
+14  588,438  1,043,813,089    1,773    1,344    7,163   13,556
+```
+
+The archive `brazil.pmtiles` holds 857,315 tiles across z0-z14 and is
+3.3 GB. On a 64-core machine, the run took 4 minutes 19 seconds. The
+intermediate overview file was 7.3 GiB and was removed after the export.
+
+Across z0-z7, the map has 185,261 A5 cells, including 129,558 at z7.
+At every cell zoom, `point_count` sums to 4,173,713.
+
+Tiles are heaviest at z8-z9, where whole fields are drawn over the dense
+soy belt. The size valve merges features to keep tiles under the 500 KB
+compressed cap. Three tiles remain over the cap and are written anyway;
+[issue #873](https://github.com/geoparquet-io/tylertoo/issues/873) tracks this.
+Drop `brazil.pmtiles` onto [pmtiles.io](https://pmtiles.io/) to inspect it.
+
+## 2. Split the same build into shard jobs
+
+To distribute the build across a cluster, use `shard-plan` to cut the z10
+tile space, the pivot, into four shards of about 13.9 million rows each.
+The plan counts rows before the filter. The coarse job reads the whole
+prefix and draws z0-z9: the cells and the z8-z9 fields. It saves the convert plan with `--save-plan`. Each shard
+loads that plan with `--plan` and draws z10-z14 for its slice.
+
+Give every job the same options through the `OPTIONS` array. The plan's
+fingerprint covers them, including `--band`, and `tylertoo` refuses a
+mismatched job. A cell band must end below the pivot.
+
+The script runs the four shard jobs in sequence. On a cluster, they run on
+separate machines at the same time. Once the jobs finish, `merge`
+concatenates the five archives.
+
+File: `02-shard.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+export AWS_ENDPOINT_URL=https://data.source.coop
+BR=s3://ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/
+OPTIONS=(
+  --filter "\"metrics:area\" >= 10000 AND \"determination:datetime\" >= '2025-01-01'"
+  --band 0-7:a5 --band 8-14:geom
+  --accumulate-attribute metrics:area:sum
+  --layer-name fields
+)
 
 # Cut the z10 tile space into four shards of about equal row count.
-tylertoo shard-plan fields.parquet --shards 4 --pivot 10 -o shards.json
+tylertoo shard-plan "$BR" --shards 4 --pivot 10 -o shards.json
 
-# The coarse job builds z8-z9, below the pivot, and saves the plan
-# every shard must share.
-tylertoo tiles fields.parquet coarse.pmtiles \
-  --min-zoom 8 --max-zoom 14 --layer-name fields \
+# The coarse job draws the cells and z8-z9, and saves the plan every
+# shard must share.
+tylertoo tiles "$BR" coarse.pmtiles "${OPTIONS[@]}" \
   --shard coarse --shard-plan shards.json --save-plan convert.plan
 
-# Each shard builds z10-z14 for its slice. On a cluster these jobs run
-# on separate machines at the same time.
+# Each shard draws z10-z14 for its slice. On a cluster these jobs run on
+# separate machines at the same time.
 for i in 0 1 2 3; do
-  tylertoo tiles fields.parquet "shard-$i.pmtiles" \
-    --min-zoom 8 --max-zoom 14 --layer-name fields \
+  tylertoo tiles "$BR" "shard-$i.pmtiles" "${OPTIONS[@]}" \
     --shard "$i/4" --shard-plan shards.json --plan convert.plan
 done
 
-# The shards are disjoint, so merging them is a concatenation.
-tylertoo merge fields.pmtiles coarse.pmtiles \
+# The jobs' tiles are disjoint, so merging them is a concatenation.
+tylertoo merge sharded.pmtiles coarse.pmtiles \
   shard-0.pmtiles shard-1.pmtiles shard-2.pmtiles shard-3.pmtiles
+tylertoo stats sharded.pmtiles
 ```
-
 ```text
+Cut 4 shard(s) at pivot z10 for s3://ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/
+  shard 0   tiles 349525..=855802  (506278 pivot tile(s), ~13881089 row(s), 25.0%)
+  shard 1   tiles 855803..=857616  ( 1814 pivot tile(s), ~13882073 row(s), 25.0%)
+  shard 2   tiles 857617..=858064  (  448 pivot tile(s), ~13899054 row(s), 25.0%)
+  shard 3   tiles 858065..=1398100  (540036 pivot tile(s), ~13838304 row(s), 24.9%)
 ...
-Cut 4 shard(s) at pivot z10 for fields.parquet
-  shard 0   tiles 349525..=855392  (505868 pivot tile(s), ~134 row(s), 25.1%)
-  shard 1   tiles 855393..=855393  (    1 pivot tile(s), ~134 row(s), 25.1%)
-  shard 2   tiles 855394..=855398  (    5 pivot tile(s), ~134 row(s), 25.1%)
-  shard 3   tiles 855399..=1398100  (542702 pivot tile(s), ~134 row(s), 25.1%)
+✓ Converted admin:country_code=BR → coarse.pmtiles
+  1,991 tiles across z0..z9 in 137.83s
 ...
-✓ Converted fields.parquet → coarse.pmtiles
-  6 tiles across z8..z9 in 0.09s
+✓ Converted admin:country_code=BR → shard-0.pmtiles
+  337,242 tiles across z10..z14 in 145.08s
 ...
-✓ Converted fields.parquet → shard-0.pmtiles
-  39 tiles across z10..z14 in 0.26s
+✓ Converted admin:country_code=BR → shard-1.pmtiles
+  273,749 tiles across z10..z14 in 119.98s
 ...
-✓ Converted fields.parquet → shard-3.pmtiles
-  46 tiles across z10..z14 in 0.27s
-Merging 5 archive(s) → fields.pmtiles
+✓ Converted admin:country_code=BR → shard-2.pmtiles
+  110,400 tiles across z10..z14 in 64.83s
 ...
-✓ 191 tiles (191 unique) from 5 archive(s), z8..z14 in 0.00s
-```
-
-Each shard gets about 134 of the 534 fields. "191 unique" confirms the jobs
-produced no duplicate tiles.
-
-## 4. Combine both layers with `pyramid`
-
-`pyramid` combines zoom bands into one archive. It tiles GeoParquet inputs
-and copies tiles from PMTiles inputs. Here, `density` covers z0–z7 and
-`fields` covers z8–z14. Style the map with filled density cells colored by
-their `fields` count and outlined field polygons.
-
-`tylertoo stats` reports tile sizes at each zoom.
-
-File: `04-pyramid.sh`
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-# One archive, two layers: density cells at z0-z7, fields at z8-z14.
-tylertoo pyramid brazil.pmtiles \
-  --band 0-7:density.parquet:density \
-  --band 8-14:fields.pmtiles:fields
-tylertoo stats brazil.pmtiles
-```
-
-```text
-  z0-7 -> layer "density": 8 tiles
-  z8-14 -> layer "fields": 191 tiles
-✓ Built 2 band(s) → brazil.pmtiles (199 tiles)
- z  tiles    total    mean     p50     p99     max
- 0      1      133     133     133     133     133
+✓ Converted admin:country_code=BR → shard-3.pmtiles
+  133,933 tiles across z10..z14 in 79.99s
 ...
- 7      1    2,577   2,577   2,577   2,577   2,577
- 8      2   29,109  14,554  13,919  15,190  15,190
+✓ 857,315 tiles (856,916 unique) from 5 archive(s), z0..z14 in 4.32s
 ...
-14    125  230,523   1,844   1,792   4,532   4,990
+10    4,725    248,244,039   52,538   32,908  296,306  509,140
 ...
 ```
 
-The density tiles stay around 3 KB or less, holding just 266 squares. Field
-tiles are heaviest at z11–z12, where each tile contains many whole fields,
-and shrink at higher zooms. Drop
-`brazil.pmtiles` onto [pmtiles.io](https://pmtiles.io/) to see both layers.
+On the same 64-core machine, the coarse job drew 1,991 tiles in 2 minutes
+18 seconds. The four shard jobs drew 337,242, 273,749, 110,400, and 133,933
+tiles, respectively, and took 1 to 2.5 minutes each. Merging took 4 seconds.
+The whole script took 10.5 minutes on that machine.
 
+The merged `sharded.pmtiles` has the same 857,315 tiles as step 1. All but
+4 are byte-identical. Those 4 are z10 tiles at the 500 KB cap, where the
+size valve cut slightly differently within a shard. That is why the z10
+total differs slightly from step 1.
+[Issue #854](https://github.com/geoparquet-io/tylertoo/issues/854) tracks this
+difference.
+
+<!-- --8<-- [end:build] -->
+<!-- --8<-- [start:run] -->
 ## Run the whole workflow
 
 ```bash
 git clone https://github.com/geoparquet-io/tylertoo.git
 mkdir brazil
 cd brazil
-for step in ../tylertoo/examples/brazil-fields/0*; do
-  case "$step" in
-    *.py) python "$step" ;;
-    *) bash "$step" ;;
-  esac
-done
+for step in ../tylertoo/examples/brazil-fields/0*.sh; do bash "$step"; done
 ```
 
 ## Next steps
 
-- To tile a whole state, remove `--bbox`, raise `--shards`, and run the shard
-  jobs on separate machines. The
-  [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds)
-  covers sizing the jobs and running them under a scheduler.
-- The [remote reads guide](https://geoparquet-io.github.io/tylertoo/guides/remote-reads/)
-  covers `--filter` syntax, `--files-from` manifests, and row-group pruning.
+- To tile a smaller area, add `--bbox`. The
+  [remote reads guide](https://geoparquet-io.github.io/tylertoo/guides/remote-reads/)
+  covers it, along with `--filter` syntax, `--files-from` manifests, and
+  row-group pruning.
+- To run shard jobs on a scheduler, see the
+  [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds).
 - The [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
-  explains every generalization knob.
+  explains every generalization setting, including `--band`.
+- Use `tylertoo pyramid` to combine bands from separate inputs or archives,
+  such as cells from another dataset. See the same tuning reference.
 - The [Python reference](https://geoparquet-io.github.io/tylertoo/reference/python/)
-  lists `overview`, `export_pmtiles`, and `validate`.
+  lists `convert`, which takes the same bands as `bands=[...]`.
+<!-- --8<-- [end:run] -->
