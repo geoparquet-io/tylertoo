@@ -648,6 +648,8 @@ fn _run_cli(py: Python<'_>, argv: Vec<std::ffi::OsString>) -> u8 {
 /// while this thread waited on it with the GIL held would deadlock.
 #[pymodule]
 fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // The host process may own the global pool already; then it keeps its size.
+    let _ = tylertoo_core::internal::overview::convert::init_worker_pool();
     m.add("ConfigError", m.py().get_type::<ConfigError>())?;
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add_function(wrap_pyfunction!(overview, m)?)?;

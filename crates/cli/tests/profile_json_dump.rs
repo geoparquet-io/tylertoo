@@ -44,6 +44,7 @@ fn run_tiles_with_profile(
     fixture: &std::path::Path,
     min_zoom: &str,
     max_zoom: &str,
+    rayon_threads: Option<&str>,
 ) -> (
     tempfile::TempDir,
     serde_json::Value,
@@ -73,6 +74,8 @@ fn run_tiles_with_profile(
         // Set only in the child's environment: no in-process global state is
         // touched, so this test cannot race any other test in the suite.
         .env("TYLERTOO_PROFILE_JSON", &profile_json)
+        .env_remove("RAYON_NUM_THREADS")
+        .envs(rayon_threads.map(|t| ("RAYON_NUM_THREADS", t)))
         .output()
         .expect("run tylertoo tiles");
     assert!(
@@ -115,7 +118,7 @@ fn profile_json_written_and_parses() {
         return;
     };
 
-    let (dir, report, convert, export) = run_tiles_with_profile(&fixture, "0", "6");
+    let (dir, report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None);
 
     // --- Pairing: both lines of one `tiles` process share a `run_id` and
     // say which phase they are. ---
@@ -155,7 +158,7 @@ fn profile_json_written_and_parses() {
 fn profile_json_saturation_fields_on_a_committed_fixture() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
-    let (_dir, _report, convert, export) = run_tiles_with_profile(&fixture, "0", "6");
+    let (_dir, _report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None);
     check_saturation(&convert, &convert, &CONVERT_PHASES);
     assert!(
         convert["pass2"]["writer_busy_secs"]
@@ -1361,4 +1364,16 @@ fn profile_json_reports_cascade_identical_steps() {
         (ratio - expected).abs() < 1e-9,
         "pass2.identical_steps.ratio ({ratio}) must equal shared/total ({expected}): {value}"
     );
+}
+
+/// The CLI sizes the worker pool from core's `resolve_worker_threads`: the
+/// cores capped at 32 by default, an explicit `RAYON_NUM_THREADS` verbatim.
+#[test]
+fn cli_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let threads = |env| run_tiles_with_profile(&fixture, "0", "2", env).2["threads"].as_u64();
+    assert_eq!(threads(None), Some(cores.min(32) as u64));
+    assert_eq!(threads(Some("40")), Some(40));
 }

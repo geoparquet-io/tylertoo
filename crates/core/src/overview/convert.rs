@@ -1050,6 +1050,60 @@ pub(super) fn resolve_in_flight_batches_with_cores(requested: usize, cores: usiz
     }
 }
 
+/// Default ceiling on the worker pool a conversion runs on.
+///
+/// Measured by sweeping `RAYON_NUM_THREADS` (merged perf/memory-batch build,
+/// quiet host, archives byte-identical at every width): from 64 to 32 workers
+/// small cells drop 5-24% RSS with flat wall (Moldova auto 3178 -> 2558 MiB,
+/// 3.42 -> 3.49 s; madagascar auto 1414 -> 1104 MiB, 0.93 -> 0.97 s) and big
+/// ones too (segfull bounded 3177 -> 2329 MiB, 54.2 -> 54.4 s; NZ bounded
+/// 2908 -> 2408 MiB, 74 s both), with 30-40% fewer CPU seconds. At 16, wall
+/// rose 25-37% on Moldova and wideprops. Past 32 the extra workers only add
+/// allocator memory each keeps for itself.
+///
+/// shortcut: measured on one 64-core aarch64 host; re-sweep on other core
+/// counts and architectures before trusting the knee elsewhere.
+pub const WORKER_THREADS_MAX: usize = 32;
+
+/// Workers the global Rayon pool gets.
+///
+/// An explicit positive `RAYON_NUM_THREADS` wins, else the available cores
+/// capped at [`WORKER_THREADS_MAX`]. The CLI and the Python module size the pool with
+/// it ([`init_worker_pool`]). Only the pool: knobs that read
+/// `available_parallelism()` (read workers, in-flight batches, partition
+/// wave) keep the core count, as the sweep ran them.
+pub fn resolve_worker_threads() -> usize {
+    resolve_worker_threads_with(
+        std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    )
+}
+
+/// [`resolve_worker_threads`] on a given `RAYON_NUM_THREADS` value and core
+/// count (test seam).
+///
+/// A value Rayon would ignore (unset, `0`, not a number)
+/// leaves the default.
+pub(super) fn resolve_worker_threads_with(env: Option<&str>, cores: usize) -> usize {
+    match env.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) if n > 0 => n,
+        _ => cores.min(WORKER_THREADS_MAX),
+    }
+}
+
+/// Build the global Rayon pool at [`resolve_worker_threads`] workers, before
+/// any parallel work.
+///
+/// # Errors
+///
+/// When the pool was already built (a host process such as Python may own
+/// it); callers may ignore it.
+pub fn init_worker_pool() -> Result<(), rayon::ThreadPoolBuildError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(resolve_worker_threads())
+        .build_global()
+}
+
 /// Sentinel for [`ConvertOptions::read_workers`] requesting automatic sizing
 /// (see [`resolve_read_workers`]). The library default.
 pub const READ_WORKERS_AUTO: usize = 0;
@@ -12731,6 +12785,18 @@ mod tests {
                 &format!("read_batch_size={rbs} in_flight_batches={ifb} read_workers={workers}"),
             );
         }
+    }
+
+    /// The worker pool defaults to the cores capped at 32; an explicit
+    /// `RAYON_NUM_THREADS` wins, and one Rayon ignores leaves the default.
+    #[test]
+    fn worker_threads_cap_the_cores_unless_rayon_num_threads_is_set() {
+        assert_eq!(resolve_worker_threads_with(None, 64), 32);
+        assert_eq!(resolve_worker_threads_with(None, 8), 8);
+        assert_eq!(resolve_worker_threads_with(Some("64"), 64), 64);
+        assert_eq!(resolve_worker_threads_with(Some("4"), 64), 4);
+        assert_eq!(resolve_worker_threads_with(Some("0"), 64), 32);
+        assert_eq!(resolve_worker_threads_with(Some("x"), 8), 8);
     }
 
     #[test]
