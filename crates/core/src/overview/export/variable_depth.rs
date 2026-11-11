@@ -20,7 +20,9 @@ use super::super::config::ConfigError;
 use super::super::convert::ConvertOptions;
 use super::super::ladder::EntryZoomLadder;
 use super::super::level::{Mode, OverviewsMeta};
+use super::super::pipe::{run_on_pool, scoped_pipe_unbounded};
 use super::super::reader::OverviewReader;
+use super::super::writer::recv_in_pool;
 use super::{
     account_sources, buffer_deg_at_zoom, build_mvt_within, collect_wave, encoded_tile,
     export_level_groups, for_each_member_key, geometry_lnglat_bbox, group_schedule, key_to_xy,
@@ -823,6 +825,7 @@ impl VdScan {
 // ============================================================================
 
 /// What the probe reads with: the export's own inputs.
+#[derive(Clone, Copy)]
 pub(super) struct Probe<'a> {
     pub(super) reader: &'a OverviewReader,
     pub(super) band: BandRead<'a>,
@@ -912,10 +915,11 @@ impl VdPlan {
     /// DIVERGENCE FROM TIPPECANOE: tippecanoe probes on its fixed world-30
     /// grid; this uses the canonical level's grid (world `M + 12` bits), so
     /// a stopped tile draws exactly what the canonical tiles would.
-    pub(super) fn probe(
+    pub(super) fn probe<'scope>(
         self,
-        p: &Probe<'_>,
-        diagnostics: &crate::diagnostics::Diagnostics,
+        scope: &rayon::Scope<'scope>,
+        p: Probe<'scope>,
+        diagnostics: &'scope crate::diagnostics::Diagnostics,
         mut each: impl FnMut(Probed) -> bool,
     ) -> Result<usize, ExportError> {
         let mut frontier = Frontier::new(self.zooms.len());
@@ -926,12 +930,11 @@ impl VdPlan {
         // warnings, which belong to canonical tiles that are not written,
         // are not reported. A stopped tile's encode events are staged per
         // tile and kept only when it stops.
-        let quiet = crate::diagnostics::Diagnostics::silent();
         let gzip_cache = Arc::new(TileGzipCache::new(
             crate::compression::tile_gzip::PAYLOAD_SLICE_BYTES,
         ));
         #[cfg(test)]
-        let work = std::sync::Mutex::default();
+        let work = Arc::new(std::sync::Mutex::default());
         // The probe's members are held beside the levels' own waves, which
         // the budget already sizes: a quarter of their width keeps the peak
         // where the levels alone put it.
@@ -952,38 +955,38 @@ impl VdPlan {
                 let plan = plan_level(&candidates, zoom, &budget, || {
                     format!("variable-depth probe z{zoom}")
                 });
-                let ctx = LevelCtx {
-                    reader: p.reader,
-                    band: p.band,
-                    level_idx: self.canonical,
-                    crs: p.crs,
+                let candidate_count = candidates.len();
+                let mut state = ProbeLevel {
+                    probe: p,
+                    canonical: self.canonical,
                     zoom,
-                    opts: &opts,
-                    gzip_cache: &gzip_cache,
-                    published: p.published,
-                    feature_id: p.feature_id,
-                    timers: p.timers,
-                    fills: None,
-                    tiles: Some(&candidates),
+                    opts,
+                    candidates,
+                    gzip_cache: Arc::clone(&gzip_cache),
+                    level,
                     #[cfg(test)]
-                    work: &work,
+                    work: Arc::clone(&work),
                 };
                 let t = std::time::Instant::now();
-                for wave in plan.partitions.chunks(plan.wave) {
-                    let members: Vec<Member> = collect_wave(&ctx, wave, &quiet)?
-                        .buckets
-                        .into_iter()
-                        .flatten()
-                        .collect();
-                    probe_wave(members, &ctx, &mut level, diagnostics)?;
+                let partitions = Arc::new(plan.partitions);
+                for start in (0..partitions.len()).step_by(plan.wave) {
+                    let partitions = Arc::clone(&partitions);
+                    let end = (start + plan.wave).min(partitions.len());
+                    // Collection also joins parallel decode/clip tasks. Both
+                    // it and the encode must use the caller's pool. Reads
+                    // retain their dedicated helpers, as in ordinary export.
+                    state = run_on_pool(scope, move || {
+                        state.wave(&partitions[start..end], diagnostics)
+                    })?;
                 }
+                level = state.level;
                 level
                     .terminals
                     .sort_unstable_by_key(|t| tile_key(t.x, t.y, zoom));
                 log::info!(
                     "[export] variable depth z{zoom}: {} of {} candidate(s) stopped, {:.2}s",
                     level.terminals.len(),
-                    candidates.len(),
+                    candidate_count,
                     t.elapsed().as_secs_f64(),
                 );
             }
@@ -995,6 +998,54 @@ impl VdPlan {
         }
         log::info!("[export] variable depth: probed {probed} tile(s), stopped {stops}");
         Ok(probed)
+    }
+}
+
+/// Owned wave state can cross the scope's task boundary and return intact;
+/// options, candidate maps and the accumulated stops are reused, not copied.
+struct ProbeLevel<'a> {
+    probe: Probe<'a>,
+    canonical: usize,
+    zoom: u8,
+    opts: ExportOptions,
+    candidates: BTreeMap<u64, usize>,
+    gzip_cache: Arc<TileGzipCache>,
+    level: Probed,
+    #[cfg(test)]
+    work: Arc<std::sync::Mutex<super::ExportWorkTally>>,
+}
+
+impl ProbeLevel<'_> {
+    fn wave(
+        mut self,
+        wave: &[super::Partition],
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) -> Result<Self, ExportError> {
+        let p = self.probe;
+        let ctx = LevelCtx {
+            reader: p.reader,
+            band: p.band,
+            level_idx: self.canonical,
+            crs: p.crs,
+            zoom: self.zoom,
+            opts: &self.opts,
+            gzip_cache: &self.gzip_cache,
+            published: p.published,
+            feature_id: p.feature_id,
+            timers: p.timers,
+            fills: None,
+            tiles: Some(&self.candidates),
+            #[cfg(test)]
+            work: &self.work,
+        };
+        let quiet = crate::diagnostics::Diagnostics::silent();
+        let members = collect_wave(&ctx, wave, &quiet)?
+            .buckets
+            .into_iter()
+            .flatten()
+            .collect();
+        probe_wave(members, &ctx, &mut self.level, diagnostics)?;
+        Ok(self)
     }
 }
 
@@ -1205,131 +1256,124 @@ pub(super) fn export_levels(
     let canonical = plan.canonical();
     let first = levels.len();
     let partition_budget = probe.budget;
-    std::thread::scope(|scope| {
+    let mut probe_stats = None;
+    let (reports, groups) = rayon::in_place_scope(|scope| {
         // shortcut: levels the probe finished but the writer has not drawn
         // yet wait here in RAM (each tile under the size cap); spool them to
         // the spill store if stopped output ever outgrows memory.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let prober = scope.spawn(move || {
-            let t = std::time::Instant::now();
-            let probed = plan.probe(&probe, diagnostics, |level| tx.send(level).is_ok());
-            (probed, t.elapsed().as_secs_f64())
-        });
-        let mut reports = export_level_groups(
-            writer,
-            LevelMemory {
-                store: store.as_deref_mut(),
-                budget: &mut *budget,
+        scoped_pipe_unbounded(
+            |tx| {
+                let t = std::time::Instant::now();
+                let probed =
+                    plan.probe(scope, probe, diagnostics, |level| tx.send(level).is_ok())?;
+                probe_stats = Some((probed, t.elapsed().as_secs_f64()));
+                Ok(())
             },
-            levels,
-            (&groups, gate),
-            ckpt,
-            progress,
-            diagnostics,
-        )?;
-        // The rest are drawn as the probe releases them: a level once it
-        // and every coarser one are probed, the canonical level last, each
-        // time with every level released so far as one run of groups.
-        let mut frontier = Frontier::new(zooms.len());
-        let mut terminals: Vec<Vec<EncodedTile>> = (0..zooms.len()).map(|_| Vec::new()).collect();
-        let (mut received, mut next, mut rest) = (0, first, rest);
-        while next <= canonical {
-            let ready = |received: usize| {
-                if next < canonical {
-                    received > next
-                } else {
-                    received == canonical
+            |rx| {
+                let mut reports = export_level_groups(
+                    writer,
+                    LevelMemory {
+                        store: store.as_deref_mut(),
+                        budget: &mut *budget,
+                    },
+                    levels,
+                    (&groups, gate),
+                    ckpt,
+                    progress,
+                    diagnostics,
+                )?;
+                // The rest are drawn as the probe releases them: a level once it
+                // and every coarser one are probed, the canonical level last, each
+                // time with every level released so far as one run of groups.
+                let mut frontier = Frontier::new(zooms.len());
+                let mut terminals: Vec<Vec<EncodedTile>> =
+                    (0..zooms.len()).map(|_| Vec::new()).collect();
+                let (mut received, mut next, mut rest) = (0, first, rest);
+                while next <= canonical {
+                    let ready = |received: usize| {
+                        if next < canonical {
+                            received > next
+                        } else {
+                            received == canonical
+                        }
+                    };
+                    while received < canonical {
+                        let level = if ready(received) {
+                            match rx.try_recv() {
+                                Ok(level) => level,
+                                Err(_) => break,
+                            }
+                        } else {
+                            match recv_in_pool(&rx) {
+                                Ok(level) => level,
+                                // The probe failed, or ended early.
+                                Err(_) => return Err(ExportError::Io(std::io::Error::other(
+                                    "the variable-depth probe ended before every level was decided",
+                                ))),
+                            }
+                        };
+                        frontier.add(&level);
+                        debug_assert!(level.terminals.is_empty() || level.level >= first);
+                        terminals[level.level] = level.terminals;
+                        received += 1;
+                    }
+                    let end = if received == canonical {
+                        canonical + 1
+                    } else {
+                        received
+                    };
+                    let (now, later) = std::mem::take(&mut rest).split_at_mut(end - next);
+                    rest = later;
+                    for (k, scan) in (next..).zip(now.iter_mut()) {
+                        frontier.restrict(k, scan, zooms);
+                    }
+                    let now: &[LevelScan] = now;
+                    let plans = plan_levels(now, &zooms[next..end], partition_budget)?;
+                    let now_levels: Vec<ExportLevelCtx<'_>> = plans
+                        .iter()
+                        .zip(now)
+                        .enumerate()
+                        .map(|(i, (plan, scan))| ExportLevelCtx {
+                            scan,
+                            plan,
+                            level_idx: next + i,
+                            terminals: &terminals[next + i],
+                            ..template
+                        })
+                        .collect();
+                    let (now_groups, gate) = group_schedule(
+                        group_cap,
+                        &plans,
+                        partition_budget.partition_target,
+                        template.options.profile,
+                    );
+                    reports.extend(export_level_groups(
+                        writer,
+                        LevelMemory {
+                            store: store.as_deref_mut(),
+                            budget: &mut *budget,
+                        },
+                        &now_levels,
+                        (&now_groups, gate),
+                        ckpt,
+                        progress,
+                        diagnostics,
+                    )?);
+                    groups.extend(now_groups.into_iter().map(|g| g.start + next..g.end + next));
+                    // Written: free these levels' stopped tiles now, not at the end.
+                    drop(now_levels);
+                    terminals[next..end]
+                        .iter_mut()
+                        .for_each(|t| *t = Vec::new());
+                    next = end;
                 }
-            };
-            while received < canonical {
-                let level = if ready(received) {
-                    match rx.try_recv() {
-                        Ok(level) => level,
-                        Err(_) => break,
-                    }
-                } else {
-                    match rx.recv() {
-                        Ok(level) => level,
-                        // The probe failed, or ended early.
-                        Err(_) => return Err(prober_error(prober)),
-                    }
-                };
-                frontier.add(&level);
-                debug_assert!(level.terminals.is_empty() || level.level >= first);
-                terminals[level.level] = level.terminals;
-                received += 1;
-            }
-            let end = if received == canonical {
-                canonical + 1
-            } else {
-                received
-            };
-            let (now, later) = std::mem::take(&mut rest).split_at_mut(end - next);
-            rest = later;
-            for (k, scan) in (next..).zip(now.iter_mut()) {
-                frontier.restrict(k, scan, zooms);
-            }
-            let now: &[LevelScan] = now;
-            let plans = plan_levels(now, &zooms[next..end], partition_budget)?;
-            let now_levels: Vec<ExportLevelCtx<'_>> = plans
-                .iter()
-                .zip(now)
-                .enumerate()
-                .map(|(i, (plan, scan))| ExportLevelCtx {
-                    scan,
-                    plan,
-                    level_idx: next + i,
-                    terminals: &terminals[next + i],
-                    ..template
-                })
-                .collect();
-            let (now_groups, gate) = group_schedule(
-                group_cap,
-                &plans,
-                partition_budget.partition_target,
-                template.options.profile,
-            );
-            reports.extend(export_level_groups(
-                writer,
-                LevelMemory {
-                    store: store.as_deref_mut(),
-                    budget: &mut *budget,
-                },
-                &now_levels,
-                (&now_groups, gate),
-                ckpt,
-                progress,
-                diagnostics,
-            )?);
-            groups.extend(now_groups.into_iter().map(|g| g.start + next..g.end + next));
-            // Written: free these levels' stopped tiles now, not at the end.
-            drop(now_levels);
-            terminals[next..end]
-                .iter_mut()
-                .for_each(|t| *t = Vec::new());
-            next = end;
-        }
-        drop(rx);
-        let (probed, secs) = prober
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        let probed = probed?;
-        progress.profile.walls.probe = secs;
-        Ok((reports, groups, probed))
-    })
-}
-
-/// The error a probe that stopped sending ended with.
-fn prober_error(
-    prober: std::thread::ScopedJoinHandle<'_, (Result<usize, ExportError>, f64)>,
-) -> ExportError {
-    match prober.join() {
-        Ok((Err(error), _)) => error,
-        Ok((Ok(_), _)) => ExportError::Io(std::io::Error::other(
-            "the variable-depth probe ended before every level was decided",
-        )),
-        Err(panic) => std::panic::resume_unwind(panic),
-    }
+                Ok((reports, groups))
+            },
+        )
+    })?;
+    let (probed, secs) = probe_stats.expect("a successful probe recorded its stats");
+    progress.profile.walls.probe = secs;
+    Ok((reports, groups, probed))
 }
 
 #[cfg(test)]

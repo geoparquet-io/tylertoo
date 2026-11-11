@@ -74,6 +74,33 @@ where
     C: FnOnce(Receiver<T>) -> Result<R, E>,
 {
     let (tx, rx) = bounded::<T>(depth.max(1));
+    scoped_pipe_with_channel(tx, rx, produce, consume)
+}
+
+/// The same liveness contract as [`scoped_pipe`], for a producer whose
+/// completed results already wait in an unbounded queue.
+pub(super) fn scoped_pipe_unbounded<T, E, R>(
+    produce: impl FnOnce(&Sender<T>) -> Result<(), E> + Send,
+    consume: impl FnOnce(Receiver<T>) -> Result<R, E>,
+) -> Result<R, E>
+where
+    T: Send,
+    E: Send,
+{
+    let (tx, rx) = crossbeam_channel::unbounded();
+    scoped_pipe_with_channel(tx, rx, produce, consume)
+}
+
+fn scoped_pipe_with_channel<T, E, R>(
+    tx: Sender<T>,
+    rx: Receiver<T>,
+    produce: impl FnOnce(&Sender<T>) -> Result<(), E> + Send,
+    consume: impl FnOnce(Receiver<T>) -> Result<R, E>,
+) -> Result<R, E>
+where
+    T: Send,
+    E: Send,
+{
     std::thread::scope(|scope| {
         // `move` transfers `tx` into the thread, so it is dropped when the
         // producer finishes — that disconnect is what fuses the consumer's
@@ -192,7 +219,8 @@ where
 /// A helper thread's windows compute on the pool captured by the caller's
 /// `in_place_scope`, rather than selecting the global pool on the helper.
 /// Only compute runs there: receives and bounded output sends stay on the
-/// helper, so they cannot park the sole worker needed by the writer.
+/// helper, so they cannot park the sole worker needed by the writer. Even
+/// one-item windows use the pool, rather than adding a helper compute thread.
 pub(super) fn for_each_window_on_pool<'scope, T, R, E>(
     scope: &rayon::Scope<'scope>,
     rx: &Receiver<T>,
@@ -209,24 +237,33 @@ where
         rx,
         window,
         |items| {
-            let (tx, done) = bounded(1);
-            scope.spawn(move |_| {
-                // Return panics to the helper too, so its channels close
-                // before scoped_pipe joins it, just as for inline compute.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let results = process_window(&items, process);
-                    (items, results)
-                }));
-                // One result, capacity one: this never waits on the helper.
-                let _ = tx.send(result);
-            });
-            match done.recv().expect("scoped window task disconnected") {
-                Ok(result) => result,
-                Err(payload) => std::panic::resume_unwind(payload),
-            }
+            run_on_pool(scope, move || {
+                let results = process_window(&items, process);
+                (items, results)
+            })
         },
         emit,
     )
+}
+
+/// Dispatch one task to the caller's captured pool, waiting on the helper
+/// thread. The caller must help that pool while receiving and joining (as
+/// [`scoped_pipe`] and `writer::recv_in_pool` do). Keep bounded sends out of
+/// the task: a single result fits in its capacity-one completion channel.
+/// Panics return to the helper so its channels close before it is joined.
+pub(super) fn run_on_pool<'scope, R: Send + 'scope>(
+    scope: &rayon::Scope<'scope>,
+    task: impl FnOnce() -> R + Send + 'scope,
+) -> R {
+    let (tx, done) = bounded(1);
+    scope.spawn(move |_| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+        let _ = tx.send(result);
+    });
+    match done.recv().expect("scoped pool task disconnected") {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 fn process_window<T: Sync, R: Send, E: Send>(

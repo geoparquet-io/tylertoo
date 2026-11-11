@@ -8,20 +8,38 @@ use std::time::Duration;
 
 use tylertoo_core::internal::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 
+mod rayon_support;
+
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;
 
 type Finished = Result<Result<(), String>, mpsc::RecvTimeoutError>;
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "initialize the process-wide test pool once"
+)]
+fn global_pool() -> std::sync::MutexGuard<'static, ()> {
+    // Plain cargo test shares a process; two tests must not each occupy
+    // half the global pool while waiting for its other half to become busy.
+    static TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let held = TEST.lock().expect("global-pool test lock");
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build_global()
+            .expect("size the global pool before anything uses it");
+    });
+    held
+}
 
 #[test]
 fn convert_in_a_custom_pool_finishes_with_every_global_worker_busy() {
     let Some(input) = fixture::realdata("ftw-moldova-z10.parquet") else {
         return;
     };
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build_global()
-        .expect("size the global pool before anything uses it");
+    let _global = global_pool();
     let dir = tempfile::tempdir().expect("tempdir");
     let output = dir.path().join("overview.parquet");
     let (release, held) = crossbeam_channel::unbounded::<()>();
@@ -41,24 +59,60 @@ fn convert_in_a_custom_pool_finishes_with_every_global_worker_busy() {
             .build()
             .expect("custom pool")
     });
-    let results = pools.each_ref().map(|custom| {
+    for custom in &pools {
         let converted = finishes(&input, &output, |job| custom.spawn(job));
+        if converted.is_err() {
+            drop(release);
+            panic!("deadlocked in a custom pool with every global worker busy: {converted:?}");
+        }
+        converted.unwrap().expect("convert");
         let failed = cfg!(target_os = "linux")
             .then(|| finishes(&input, Path::new("/dev/full"), |job| custom.spawn(job)));
-        (converted, failed)
-    });
-    // Release even on timeout, before asserting or dropping the custom pool.
-    drop(release);
-
-    for (converted, failed) in results {
-        converted
-            .expect("deadlocked in a custom pool with every global worker busy")
-            .expect("convert");
         if let Some(failed) = failed {
-            failed
-                .expect("deadlocked in a custom pool after a write error")
-                .expect_err("writes to /dev/full fail");
+            if failed.is_err() {
+                drop(release);
+                panic!("deadlocked in a custom pool after a write error: {failed:?}");
+            }
+            failed.unwrap().expect_err("writes to /dev/full fail");
         }
+    }
+}
+
+#[test]
+fn variable_depth_export_finishes_with_every_global_worker_busy() {
+    let _global = global_pool();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let overview = rayon_support::overview(dir.path());
+    let expected = rayon_support::export(&overview, &dir.path().join("expected.pmtiles"));
+    let (release, held) = crossbeam_channel::unbounded::<()>();
+    for _ in 0..2 {
+        let (busy_tx, busy) = mpsc::channel();
+        let held = held.clone();
+        rayon::spawn(move || {
+            busy_tx.send(()).expect("signal busy");
+            let _ = held.recv_timeout(Duration::from_secs(300));
+        });
+        busy.recv_timeout(Duration::from_secs(10))
+            .expect("global worker busy");
+    }
+    for threads in [1, 2] {
+        let custom = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let output = dir.path().join(format!("custom-{threads}.pmtiles"));
+        let (tx, rx) = mpsc::channel();
+        let overview = overview.clone();
+        custom.spawn(move || {
+            let _ = tx.send(rayon_support::export(&overview, &output));
+        });
+        let result = rx.recv_timeout(Duration::from_secs(30));
+        if result.is_err() {
+            // Release blockers before the assertion, and stop at the first timeout.
+            drop(release);
+            panic!("variable-depth export deadlocked in custom pool: {result:?}");
+        }
+        assert_eq!(result.unwrap(), expected, "tile bytes changed");
     }
 }
 
