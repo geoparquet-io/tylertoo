@@ -462,12 +462,12 @@ class TestConvertSpillDir:
             assert "nope" in str(exc_info.value), str(exc_info.value)
 
 
-@pytest.mark.parametrize("env_threads", [None, "40"])
+@pytest.mark.parametrize("env_threads", [None, "48"])
 def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(
     tmp_path, env_threads
 ):
     """Importing the module sizes the worker pool as the CLI does: the cores
-    capped at 32, an explicit RAYON_NUM_THREADS verbatim. A subprocess, since
+    capped at 40, an explicit RAYON_NUM_THREADS verbatim. A subprocess, since
     the pool is process-wide and sized once."""
     fixture = FIXTURES_DIR / "streaming" / "multi-rowgroup-small.parquet"
     profile = tmp_path / "profile.jsonl"
@@ -490,4 +490,4 @@ def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(
     else:
         # Exact sizing is pinned in Rust; os.cpu_count() ignores affinity and
         # cgroup quotas, which Rust's core count honours.
-        assert 1 <= threads <= 32
+        assert 1 <= threads <= 40
