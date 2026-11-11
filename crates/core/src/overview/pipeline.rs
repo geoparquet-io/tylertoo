@@ -3456,6 +3456,120 @@ mod sink_sample_tests {
         }
     }
 
+    /// Ranged levels of real geometry (#852) spill only their own rows,
+    /// pushed to a spilling sink or flushed by a Ram→Spill downgrade: each
+    /// level's spill is the size of its own batch's, not of every level's
+    /// geometries a slice of the shared column still reaches, and reads back
+    /// as that batch.
+    #[test]
+    fn ranged_levels_spill_only_their_own_geometries() {
+        use geoarrow::array::GeometryBuilder;
+        use geoarrow::datatypes::GeometryType;
+        use geoarrow_array::GeoArrowArray;
+        let column = |geoms: &[geo::Geometry]| {
+            let mut b = GeometryBuilder::new(GeometryType::new(Default::default()))
+                .with_prefer_multi(false);
+            b.extend_from_iter(geoms.iter().map(Some));
+            b.finish()
+        };
+        // A ring of `n` vertices around (x, y).
+        let polygon = |x: f64, y: f64, n: usize| {
+            let ring: Vec<(f64, f64)> = (0..n)
+                .map(|k| {
+                    let a = k as f64 / n as f64 * std::f64::consts::TAU;
+                    (x + a.cos(), y + a.sin())
+                })
+                .collect();
+            geo::Geometry::Polygon(geo::Polygon::new(ring.into(), vec![]))
+        };
+        let n = 200usize;
+        // Finest first; each coarser level keeps fewer rows, simplified more.
+        let levels: Vec<Vec<usize>> = (0..3)
+            .map(|l| (0..n).filter(|i| i % 3 >= l).collect())
+            .collect();
+        let level_geoms: Vec<Vec<geo::Geometry>> = levels
+            .iter()
+            .enumerate()
+            .map(|(l, rows)| {
+                rows.iter()
+                    .map(|&i| polygon(i as f64, 0.0, 64 >> (2 * l)))
+                    .collect()
+            })
+            .collect();
+        let field = column(&level_geoms[0])
+            .data_type()
+            .to_field("geometry", true);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            field,
+        ]));
+        let input = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from_iter_values(0..n as i64)),
+                column(
+                    &(0..n)
+                        .map(|i| polygon(i as f64, 0.0, 64))
+                        .collect::<Vec<_>>(),
+                )
+                .to_array_ref(),
+            ],
+        )
+        .unwrap();
+        let kept: Vec<&[usize]> = levels.iter().map(Vec::as_slice).collect();
+        let all: Vec<geo::Geometry> = level_geoms.iter().flatten().cloned().collect();
+        let (rows, index) =
+            SharedRows::new(&input, &[0], &kept, column(&all).to_array_ref()).unwrap();
+        let rows = Arc::new(rows);
+        let mut start = 0;
+        for ((kept, geoms), index) in levels.iter().zip(&level_geoms).zip(index) {
+            let at = start;
+            let ranged = || {
+                LevelBatch::shared(
+                    schema.clone(),
+                    &rows,
+                    index.clone(),
+                    LevelGeometry::Range(at, kept.len()),
+                    1,
+                    Vec::new(),
+                )
+            };
+            start += kept.len();
+            // The batch the level would have built on its own.
+            let own = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow_array::Int64Array::from_iter_values(
+                        kept.iter().map(|&i| i as i64),
+                    )),
+                    column(geoms).to_array_ref(),
+                ],
+            )
+            .unwrap();
+            let mut reference = LevelSink::new(SinkBacking::Spill, &schema, None).unwrap();
+            reference.push(LevelBatch::Owned(own.clone())).unwrap();
+            let mut pushed = LevelSink::new(SinkBacking::Spill, &schema, None).unwrap();
+            pushed.push(ranged()).unwrap();
+            let mut downgraded = LevelSink::new(SinkBacking::Ram, &schema, None).unwrap();
+            downgraded.push(ranged()).unwrap();
+            downgraded.downgrade_to_spill(&schema, None).unwrap();
+            let spilled = |sink: LevelSink| {
+                let LevelSink::Spill(state) = sink else {
+                    unreachable!("a spilling sink")
+                };
+                let (reader, temp) = state.into_reader(&Pass2Timers::default()).unwrap();
+                let batches: Vec<RecordBatch> = reader.map(Result::unwrap).collect();
+                (batches, temp.as_file().metadata().unwrap().len())
+            };
+            let (want, want_bytes) = spilled(reference);
+            for (how, sink) in [("pushed", pushed), ("downgraded", downgraded)] {
+                let (got, bytes) = spilled(sink);
+                assert_eq!(got, want, "{how}: reads back as the level's own batch");
+                assert_eq!(bytes, want_bytes, "{how}: spills only the level's own rows");
+            }
+        }
+    }
+
     /// Downgrading an already-spilled sink is a no-op, so the one-way rule
     /// cannot be violated by a second call.
     #[test]
