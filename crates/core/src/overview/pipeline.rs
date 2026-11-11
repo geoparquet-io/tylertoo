@@ -71,7 +71,7 @@ use super::read::{internal, ReadFlow};
 use super::stream::{
     process_batch_cascade, process_level_batch, LevelStreamCtx, Pass2Timers, StreamRead,
 };
-use super::writer::{LevelWriteOutcome, OverviewWriter};
+use super::writer::{recv_in_pool, LevelWriteOutcome, OverviewWriter};
 
 pub(super) struct BufferOptions<'a> {
     pub(super) profile: MemoryProfile,
@@ -1774,7 +1774,11 @@ fn drain_sink(
                     }
                 },
                 |rx: Receiver<RecordBatch>| {
-                    Ok(writer.write_level(level_idx, Some(hint), rx.into_iter())?)
+                    // The rebuild runs on the global pool: a worker waiting
+                    // here must help run it, or with the other workers busy
+                    // nothing does (`tests/rayon_global_pool_reentry.rs`).
+                    let batches = std::iter::from_fn(|| recv_in_pool(&rx).ok());
+                    Ok(writer.write_level(level_idx, Some(hint), batches)?)
                 },
             )?
         }
