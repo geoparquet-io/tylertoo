@@ -4,7 +4,7 @@ set -euo pipefail
 export AWS_ENDPOINT_URL=https://data.source.coop
 BR=s3://ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/
 OPTIONS=(
-  --filter '"metrics:area" >= 10000'
+  --filter "\"metrics:area\" >= 10000 AND \"determination:datetime\" >= '2025-01-01'"
   --band 0-7:a5 --band 8-14:geom
   --accumulate-attribute metrics:area:sum
   --layer-name fields

@@ -35,7 +35,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Step 1 alone peaks at about 41 GiB of disk (a 4-core, 16 GB
+      # Step 1 alone peaks at about 21 GiB of disk (a 4-core, 16 GB
       # simulation of this runner), and step 2 adds two more 6 GB archives.
       # The root disk is too small; the runner's scratch disk at /mnt holds
       # the working directories and spill instead.
