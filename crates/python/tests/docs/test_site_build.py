@@ -73,3 +73,30 @@ def test_absolute_site_links_resolve(site: Path) -> None:
             elif anchor and f'id="{anchor}"' not in target.read_text(encoding="utf-8"):
                 broken.append(f"{page.name}: {SITE_URL}{path}#{anchor} (no anchor)")
     assert not broken, "Broken links to the docs site:\n" + "\n".join(broken)
+
+
+def test_local_scripts_resolve(site: Path) -> None:
+    """Every local ``<script src>`` resolves, from its page, to a built file.
+
+    Strict builds do not check raw HTML: a tutorial map's script one ``../``
+    too deep resolved above the site's ``/tylertoo/`` root and 404ed.
+    """
+    broken = []
+    for html in site.rglob("*.html"):
+        for src in re.findall(r'<script[^>]*\bsrc="([^"]+)"', html.read_text()):
+            if re.match(r"(?:[a-z]+:)?//", src):
+                continue
+            url = src.split("?")[0]
+            if url.startswith("/"):
+                # Root-absolute: valid only under the site's /tylertoo/ path.
+                path = (
+                    site / src.removeprefix("/tylertoo/")
+                    if src.startswith("/tylertoo/")
+                    else Path("/")
+                )
+            else:
+                path = html.parent / url
+            path = path.resolve()
+            if not path.is_relative_to(site.resolve()) or not path.is_file():
+                broken.append(f"{html.relative_to(site)}: {src}")
+    assert not broken, broken
