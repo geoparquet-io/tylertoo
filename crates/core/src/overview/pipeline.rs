@@ -1593,16 +1593,19 @@ pub(super) fn run_pass2_buffered(
     let (read_depth, _) = split_in_flight(in_flight);
     // #817 B1: the largest input batch read, so the drain reuses what the
     // read-ahead and window really held, not what they were granted. And
-    // whether the levels share rows: only held in RAM (#852), since a
-    // spilled level writes its rows out at once ([`downgrade_if_due`]).
+    // whether the levels share rows (#852): only two or more of them, held
+    // in RAM, since a spilled level writes its rows out at once
+    // ([`downgrade_if_due`]) and one level would only copy them twice.
     #[expect(
         clippy::disallowed_types,
         reason = "#817 B1, #852: per-call state shared with the read thread and the window"
     )]
     let (peak_batch, share) = (
         AtomicU64::new(0),
-        AtomicBool::new(matches!(backing, SinkBacking::Ram)),
+        AtomicBool::new(matches!(backing, SinkBacking::Ram) && num_levels > 1),
     );
+    #[cfg(test)]
+    spill_tests::SHARING.with(|c| c.set(Some(share.load(Relaxed))));
     let peak_batch_ref = &peak_batch;
     scoped_pipe(
         read_depth,
@@ -1899,6 +1902,9 @@ mod spill_tests {
         /// the read was sized from, the read's grants, the armed budget.
         pub(super) static TUNER_ARMING: std::cell::Cell<(u64, u64, u64)> =
             const { std::cell::Cell::new((0, 0, 0)) };
+        /// Whether the last buffered pass 2 on this thread shared rows (#852).
+        pub(super) static SHARING: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
         /// Spilled batches decoded on this thread (#817 B1).
         static DECODED_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
@@ -1975,6 +1981,39 @@ mod spill_tests {
             crate::overview::memory::ENCODE_FLOOR,
             "drain width {width}"
         );
+    }
+
+    /// Codex review C3: one buffered level has no other level to share its
+    /// rows with, so it keeps owned batches: shared, the drain only copied
+    /// them a second time. Two or more share.
+    #[test]
+    fn only_two_or_more_buffered_levels_share_rows() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let geoms: Vec<_> = (0..2000)
+            .map(|i| {
+                Some(geo::Geometry::Point(geo::Point::new(
+                    f64::from(i % 50) * 0.01,
+                    f64::from(i / 50) * 0.01,
+                )))
+            })
+            .collect();
+        crate::overview::testutil::write_input(tin.path(), &geoms, true, None);
+        let sharing = |min_zoom, max_zoom| {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let options = crate::overview::convert::ConvertOptions {
+                mode: Mode::Duplicating,
+                levels: crate::overview::convert::LevelPlan::ZoomRange { min_zoom, max_zoom },
+                profile: MemoryProfile::Speed,
+                ..Default::default()
+            };
+            SHARING.with(|c| c.set(None));
+            let meta =
+                crate::overview::convert::convert_to_overviews(tin.path(), tout.path(), &options)
+                    .unwrap();
+            (meta.levels.len(), SHARING.with(std::cell::Cell::get))
+        };
+        assert_eq!(sharing(7, 8), (2, Some(false)));
+        assert_eq!(sharing(2, 8), (7, Some(true)));
     }
 
     /// #791 item 3: `auto`'s sink tuner arms from what the budget has left

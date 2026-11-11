@@ -5921,37 +5921,82 @@ pub(super) fn build_geometry_column(
     let typ = GeometryType::new(Arc::new(
         geoarrow::datatypes::Metadata::try_from(source_schema.field(geom_idx)).unwrap_or_default(),
     ));
-    // Only the (rare) nested collections, by position: empty, it allocates
-    // nothing.
-    let flat: Vec<(usize, Geometry<f64>)> = geoms
-        .iter()
-        .enumerate()
-        .filter_map(|(i, g)| flatten_nested_collections(g.borrow()).map(|f| (i, f)))
-        .collect();
-    let members = || {
-        let mut flat = flat.iter().peekable();
-        geoms.iter().enumerate().map(move |(i, g)| {
-            Some(match flat.next_if(|(at, _)| *at == i) {
-                Some((_, f)) => f,
-                None => g.borrow(),
-            })
-        })
-    };
     let invalid =
         |e: &dyn std::fmt::Display| arrow_schema::ArrowError::InvalidArgumentError(e.to_string());
     // Sized up front, so the coordinate buffers never grow by doubling: this
-    // runs once per level batch and per shared geometry pool (#852).
-    let capacity = GeometryCapacity::from_geometries(members()).map_err(|e| invalid(&e))?;
+    // runs once per level batch and per shared geometry pool (#852). A nested
+    // collection is flattened once per pass and dropped after its row, so a
+    // batch of them never holds a second copy of its coordinates.
+    let mut capacity = GeometryCapacity::new_empty();
+    for g in geoms {
+        with_member(g.borrow(), |m| capacity.add_geometry(Some(m))).map_err(|e| invalid(&e))?;
+    }
     let mut b = GeometryBuilder::with_capacity(typ, capacity).with_prefer_multi(false);
-    for g in members() {
-        b.push_geometry(g).map_err(|e| invalid(&e))?;
+    for g in geoms {
+        with_member(g.borrow(), |m| b.push_geometry(Some(m))).map_err(|e| invalid(&e))?;
     }
     Ok(b.finish().to_array_ref())
+}
+
+/// `f` over `g` as the geometry column holds it: a nested collection
+/// flattened ([`flatten_nested_collections`]) for the call only.
+fn with_member<R>(g: &Geometry<f64>, f: impl FnOnce(&Geometry<f64>) -> R) -> R {
+    match flatten_nested_collections(g) {
+        Some(flat) => {
+            #[cfg(test)]
+            let _live = geometry_column_tests::LiveFlat::enter();
+            f(&flat)
+        }
+        None => f(g),
+    }
 }
 
 #[cfg(test)]
 mod geometry_column_tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Flattened collections alive now, and the most at once.
+        static LIVE_FLAT: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    /// Counts one flattened collection alive while it is held.
+    pub(super) struct LiveFlat;
+
+    impl LiveFlat {
+        pub(super) fn enter() -> Self {
+            LIVE_FLAT.with(|c| {
+                let (live, peak) = c.get();
+                c.set((live + 1, peak.max(live + 1)));
+            });
+            Self
+        }
+    }
+
+    impl Drop for LiveFlat {
+        fn drop(&mut self) {
+            LIVE_FLAT.with(|c| {
+                let (live, peak) = c.get();
+                c.set((live - 1, peak));
+            });
+        }
+    }
+
+    /// Codex review C1: a batch of nested collections is flattened one row
+    /// at a time, not held flattened while the whole column fills.
+    #[test]
+    fn a_batch_of_nested_collections_holds_one_flattened_row_at_a_time() {
+        let schema = Schema::new(vec![mixed_geometry_field("geometry", Default::default())]);
+        let p = |x: f64| Geometry::Point(geo::Point::new(x, 0.0));
+        let gc = |members| Geometry::GeometryCollection(geo::GeometryCollection::new_from(members));
+        let geoms: Vec<Geometry<f64>> = (0..100)
+            .map(|i| gc(vec![p(f64::from(i)), gc(vec![p(1.0), p(2.0)])]))
+            .collect();
+        LIVE_FLAT.with(|c| c.set((0, 0)));
+        build_geometry_column(&schema, 0, &geoms).unwrap();
+        assert_eq!(LIVE_FLAT.with(Cell::get), (0, 1));
+    }
 
     /// The geometry column is sized from its geometries up front, so its
     /// buffers never grow by doubling. A
