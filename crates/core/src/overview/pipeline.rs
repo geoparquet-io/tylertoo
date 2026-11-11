@@ -50,6 +50,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::time::{Duration, Instant};
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array};
@@ -1747,36 +1748,35 @@ fn drain_sink(
     let t_drain = Instant::now();
     let outcome = match sink {
         LevelSink::Ram(batches) => {
-            // Rebuilt off the writer's thread, as a spilled level decodes,
-            // and several at a time, in order: one thread rebuilding every
-            // shared level batch (#852) left the drain's encodes waiting.
-            scoped_pipe(
-                SPILL_QUEUE_DEPTH,
-                move |tx: &Sender<RecordBatch>| -> Result<(), ConvertError> {
-                    let mut batches = batches.into_iter();
-                    loop {
-                        let chunk: Vec<LevelBatch> = batches
-                            .by_ref()
-                            .take(width.clamp(1, DRAIN_REBUILD_AHEAD))
-                            .collect();
-                        if chunk.is_empty() {
-                            return Ok(());
-                        }
-                        let built = chunk
-                            .into_par_iter()
-                            .map(LevelBatch::materialize)
-                            .collect::<Result<Vec<_>, _>>()?;
-                        for batch in built {
-                            if tx.send(batch).is_err() {
-                                return Ok(()); // the writer failed; its error is reported
-                            }
-                        }
+            // Rebuilt several at a time, in order: one thread rebuilding
+            // every shared level batch (#852) left the drain's encodes
+            // waiting. On this thread's own pool, so a pool worker helps
+            // build what it waits for (`tests/rayon_global_pool_reentry.rs`).
+            let mut failed = None;
+            let mut pending = batches.into_iter();
+            let mut ready = VecDeque::new();
+            let rebuilt = std::iter::from_fn(|| {
+                if ready.is_empty() && failed.is_none() {
+                    let chunk: Vec<LevelBatch> = pending
+                        .by_ref()
+                        .take(width.clamp(1, DRAIN_REBUILD_AHEAD))
+                        .collect();
+                    match chunk
+                        .into_par_iter()
+                        .map(LevelBatch::materialize)
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(built) => ready.extend(built),
+                        Err(e) => failed = Some(e),
                     }
-                },
-                |rx: Receiver<RecordBatch>| {
-                    Ok(writer.write_level(level_idx, Some(hint), rx.into_iter())?)
-                },
-            )?
+                }
+                ready.pop_front()
+            });
+            let written = writer.write_level(level_idx, Some(hint), rebuilt);
+            if let Some(e) = failed {
+                return Err(e); // the rebuild's error, ahead of the writer's
+            }
+            written?
         }
         LevelSink::Spill(state) => {
             // `_temp` keeps the spill file on disk until the reader is drained.
