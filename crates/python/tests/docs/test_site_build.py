@@ -55,21 +55,28 @@ def test_page_renders(site: Path, page: str, marker: str) -> None:
     assert "--8&lt;--" not in html, f"{page} shows an unexpanded include"
 
 
+def _link_problem(site: Path, path: str, anchor: str) -> str | None:
+    """Why `SITE_URL + path#anchor` does not resolve in the built site."""
+    target = site / path
+    if not path.endswith(".html"):
+        target = target / "index.html"
+    if not target.is_file():
+        return "no page"
+    if anchor and f'id="{anchor}"' not in target.read_text(encoding="utf-8"):
+        return "no anchor"
+    return None
+
+
 def test_absolute_site_links_resolve(site: Path) -> None:
     """Absolute links to the site (README, tutorials) point at real pages.
 
     The README renders on GitHub, crates.io, and PyPI, so it links to the
     site by full URL, which the strict build does not check.
     """
-    broken = []
-    for page in site_pages():
-        text = page.read_text(encoding="utf-8")
-        for path, anchor in SITE_LINK.findall(text):
-            target = site / path
-            if not path.endswith(".html"):
-                target = target / "index.html"
-            if not target.is_file():
-                broken.append(f"{page.name}: {SITE_URL}{path} (no page)")
-            elif anchor and f'id="{anchor}"' not in target.read_text(encoding="utf-8"):
-                broken.append(f"{page.name}: {SITE_URL}{path}#{anchor} (no anchor)")
+    broken = [
+        f"{page.name}: {SITE_URL}{path}{'#' + anchor if anchor else ''} ({problem})"
+        for page in site_pages()
+        for path, anchor in SITE_LINK.findall(page.read_text(encoding="utf-8"))
+        if (problem := _link_problem(site, path, anchor))
+    ]
     assert not broken, "Broken links to the docs site:\n" + "\n".join(broken)
