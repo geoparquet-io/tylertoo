@@ -167,10 +167,13 @@ fn clip_ring(ring: &[Coord<f64>], bounds: &TileBounds) -> Vec<Coord<f64>> {
             current.reserve_exact(1);
             current.push(current[0]);
         }
-        // Each pass sizes its output from its input, and a clipped ring keeps
-        // far fewer points than it was handed; it is held until its wave
-        // encodes, so it keeps only what it uses (about half its bytes).
-        current.shrink_to_fit();
+        // Each pass sizes its output from its input, so a ring that lost most
+        // of its points holds far more than it uses until its wave encodes.
+        // Shrink only then: a shrink copies the ring, and a ring that kept
+        // most of its points would pay that copy for little memory.
+        if current.capacity() > 2 * current.len() {
+            current.shrink_to_fit();
+        }
         current
     } else {
         Vec::new()
@@ -878,7 +881,7 @@ mod tests {
             .collect();
         let clipped = clip_ring(&ring, &bounds);
         assert!(clipped.len() >= 4);
-        assert_eq!(clipped.capacity(), clipped.len());
+        assert!(clipped.capacity() <= 2 * clipped.len());
     }
 
     #[test]
