@@ -68,6 +68,25 @@
   max-width: 100%;
   border-radius: 0.2rem;
 }
+.tutorial-map-legend {
+  position: absolute;
+  bottom: 0.5rem;
+  left: 0.5rem;
+  z-index: 2;
+  padding: 0.3rem 0.5rem;
+  border-radius: 0.2rem;
+  background: rgba(255, 255, 255, 0.9);
+  color: #05221d;
+  font-size: 0.65rem;
+  line-height: 1.4;
+}
+.tutorial-map-legend span {
+  display: inline-block;
+  width: 0.8rem;
+  height: 0.6rem;
+  margin-right: 0.3rem;
+  vertical-align: middle;
+}
 .tutorial-map-caption {
   font-size: 0.7rem;
   color: var(--md-default-fg-color--light);
