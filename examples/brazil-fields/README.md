@@ -1,7 +1,7 @@
 # Brazil fields: cloud data to a sharded, two-layer map
 
 Build a PMTiles map of the soy belt around Sorriso, Mato Grosso, with field
-polygons up close and a density grid at low zooms. The source is
+polygons up close and A5 density cells at low zooms. The source is
 [Fields of the World](https://fieldsofthe.world/) (FTW): about 3.2 billion
 field polygons on [Source Cooperative](https://source.coop/ftw/global-data),
 stored as one GeoParquet file per country subdivision. You only download
@@ -14,7 +14,7 @@ with:
 - remote reads with `--files-from`, `--bbox`, and `--filter`
 - DuckDB and the `tylertoo` Python package to derive a second layer
 - `shard-plan` and `merge` to split tiling into independent jobs
-- `pyramid` to combine layers with separate zoom ranges
+- `pyramid` to combine A5 density cells and field polygons with separate zoom ranges
 
 Each step is a script in
 [`examples/brazil-fields/`](https://github.com/geoparquet-io/tylertoo/tree/main/examples/brazil-fields).
@@ -91,7 +91,7 @@ level as `fields-raw.parquet` for tiling in step 3 and prints the field
 count and total hectares.
 
 At z5, a pixel spans about 5 km, so individual fields are too small to see.
-Step 4 builds a pyramid grid band for low zooms, counting fields at their
+Step 4 builds a pyramid A5 band for low zooms, counting fields at their
 centroids and summing their area.
 
 File: `02_layers.py`
@@ -214,10 +214,26 @@ produced no duplicate tiles.
 ## 4. Combine both layers with `pyramid`
 
 `pyramid` combines zoom bands into one archive. It tiles GeoParquet inputs
-and copies tiles from PMTiles inputs. Here, `density` covers z0–z7 and
-`fields` covers z8–z14. Style the map with filled density cells colored by
-their `point_count` and outlined field polygons; `metrics:area` holds each
-cell's total field area.
+and copies tiles from PMTiles inputs. Here, `density` uses A5 cells at
+z0–z7 and `fields` covers z8–z14. Each field is assigned to the cell
+containing its centroid. Each cell carries `point_count`, the number of
+fields, and `cell`, its id. `--accumulate-attribute metrics:area:sum`
+sums the field areas per cell in `metrics:area`. Style the map with filled
+density cells colored by `point_count` and outlined field polygons.
+
+Choose a cell system by changing only `SYSTEM` in
+`--band 0-7:SYSTEM:fields.parquet:density`:
+
+| System | Cells |
+| --- | --- |
+| `grid` | Squares aligned to the tile grid at each zoom |
+| `h3` | Hexagons |
+| `s2` | Quadrilaterals on a cube |
+| `a5` | Pentagons with equal areas |
+
+Cell resolution follows the zoom in every system. Grid and S2 cells nest
+exactly. H3 and A5 parents are approximate: a coarse cell does not exactly
+contain its children.
 
 `tylertoo stats` reports tile sizes at each zoom.
 
@@ -228,9 +244,10 @@ File: `04-pyramid.sh`
 set -euo pipefail
 
 # One archive, two layers: density cells at z0-z7, fields at z8-z14.
-# The grid band counts the fields in each cell and sums their area.
+# The a5 band counts the fields whose centroids fall in each A5 cell and
+# sums their area. grid, h3 and s2 are the other cell systems.
 tylertoo pyramid brazil.pmtiles \
-  --band 0-7:grid:fields.parquet:density \
+  --band 0-7:a5:fields.parquet:density \
   --accumulate-attribute metrics:area:sum \
   --band 8-14:fields.pmtiles:fields
 tylertoo stats brazil.pmtiles
@@ -241,16 +258,25 @@ tylertoo stats brazil.pmtiles
   z8-14 -> layer "fields": 191 tiles
 ✓ Built 2 band(s) → brazil.pmtiles (199 tiles)
  z  tiles    total    mean     p50     p99     max
- 0      1      125     125     125     125     125
-...
- 7      1      765     765     765     765     765
+ 0      1      169     169     169     169     169
+ 1      1      155     155     155     155     155
+ 2      1      135     135     135     135     135
+ 3      1      126     126     126     126     126
+ 4      1      167     167     167     167     167
+ 5      1      271     271     271     271     271
+ 6      1      409     409     409     409     409
+ 7      1      763     763     763     763     763
  8      2   29,109  14,554  13,919  15,190  15,190
 ...
 14    125  230,523   1,844   1,792   4,532   4,990
 ...
 ```
 
-The density grid uses cells sized for each zoom. Field tiles are heaviest
+This run has one A5 pentagon at each of z0–z3, two at z4, five at z5,
+nine at z6, and 23 at z7. At every zoom, `point_count` sums to 534 and
+`metrics:area` sums to 36,733 ha.
+
+Field tiles are heaviest
 at z11–z12, where each tile contains many whole fields,
 and shrink at higher zooms. Drop
 `brazil.pmtiles` onto [pmtiles.io](https://pmtiles.io/) to see both layers.
