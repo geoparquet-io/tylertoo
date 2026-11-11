@@ -199,6 +199,8 @@ fn bbox_holds_the_image_and_refuses_a_pole() {
     assert!(b[2] - b[0] < 0.02 && b[3] - b[1] < 0.02, "{b:?}");
     // A box leaving UTM's domain keeps its group rather than recursing.
     assert!(t("EPSG:3035").bbox([4e6, 3e6, 1e9, 3.1e6]).is_none());
+    // An inverted (antimeridian-wrapping) source box keeps its group.
+    assert!(t("EPSG:4258").bbox([10.0, -5.0, -10.0, 5.0]).is_none());
     // Antarctic polar stereographic around the pole.
     assert!(t("EPSG:3031").bbox([-1e5, -1e5, 1e5, 1e5]).is_none());
 }

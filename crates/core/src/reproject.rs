@@ -90,6 +90,10 @@ impl ToLonLat {
     /// an extremum between samples is found; the box is padded by what is
     /// left where the bisection stopped.
     pub(crate) fn bbox(&self, [xmin, ymin, xmax, ymax]: [f64; 4]) -> Option<[f64; 4]> {
+        // An inverted box wraps the antimeridian; this transform does not split it.
+        if xmin > xmax || ymin > ymax {
+            return None;
+        }
         let mut acc = Hull {
             b: [
                 f64::INFINITY,
