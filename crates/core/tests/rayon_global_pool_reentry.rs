@@ -3,15 +3,13 @@
 //! there instead of hanging.
 //!
 //! The RAM drain's rebuild of shared level batches (#852) and the streamed
-//! finest level's windows run parallel work on the global pool from a
-//! helper thread. A writer's worker that waited for them without helping
-//! left them queued behind itself. Its own binary, because the global pool
-//! can be sized once per process.
+//! finest level's windows use the caller's pool. A writer's worker must
+//! help run the work it waits for, including when joining a helper after
+//! an error. Its own binary, because the global pool can be sized once
+//! per process.
 //!
-//! shortcut: no custom-pool case. The streamed level's helper thread still
-//! queues on the global pool when the caller converts inside a custom pool,
-//! so with every global worker busy that run can hang; add the case once
-//! the helper runs on the caller's pool.
+//! `rayon_custom_pool_reentry.rs` covers custom pools with every global
+//! worker busy, including a custom pool with only one worker.
 
 use std::path::Path;
 use std::sync::mpsc;

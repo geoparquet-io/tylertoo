@@ -64,7 +64,7 @@ use super::convert::{
 };
 use super::level::{ClusterCategories, Crs, EntryZoomProvenance, Mode, RankingProvenance};
 use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
-use super::pipe::{for_each_window, scoped_pipe, split_in_flight, WindowStats};
+use super::pipe::{for_each_window_on_pool, scoped_pipe, split_in_flight, WindowStats};
 use super::pipeline;
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
 use super::procmem::{
@@ -6907,103 +6907,110 @@ fn write_level_streaming(
     // the borrow and leave `level_timers` owned here for the post-scope read
     // and the return value below.
     let (read_depth, _) = split_in_flight(in_flight);
-    let outcome = scoped_pipe(
-        window.min(STREAMED_OUTPUT_DEPTH),
-        // Producer: read + process, in order, until EOF or the writer
-        // hangs up. Its first stream/processing error goes to the writer in
-        // order, so the level ends unwritten.
-        // Everything the closure touches (`source`, `ctx`, `&timers`,
-        // `row_groups`, the `usize`s) is `Copy`, so the outer bindings —
-        // notably `timers`, read back afterwards — stay valid.
-        |tx: &Sender<Result<Processed, ConvertError>>| -> Result<(), ConvertError> {
-            let produced = scoped_pipe(
-                read_depth,
-                // Reader: the raw input batches, in order.
-                |read_tx: &Sender<(RecordBatch, usize)>| -> Result<(), ConvertError> {
-                    // Heartbeat (#242): the finest level re-streams the whole
-                    // input; keep the operator informed on planet-scale files
-                    // (quiet on small ones).
-                    let mut last_progress = Instant::now();
-                    // Regional extract (#102): read the same per-part
-                    // bbox-selected row groups as pass 1, so the winner
-                    // tables' global row indices line up. One reader, or
-                    // several merged back into the identical batch sequence
-                    // (#494) — `read_tuning` decides, and the decision never
-                    // reaches the output.
-                    source.read(
-                        row_groups,
-                        None,
-                        read_tuning,
-                        &mut |batch, offset, read_dur| {
-                            if last_progress.elapsed().as_secs() >= 10 {
-                                last_progress = Instant::now();
-                                log::info!(
-                                    "[convert] level {level_idx}: {offset} input row(s) scanned"
-                                );
-                            }
-                            Pass2Timers::add_dur(&timers.read, read_dur);
-                            // Processor gone (it, or the writer behind it,
-                            // stopped): stop; its error is reported by the
-                            // caller.
-                            Ok(if read_tx.send((batch, offset)).is_err() {
-                                ReadFlow::Stop
-                            } else {
-                                ReadFlow::Continue
-                            })
-                        },
-                    )
-                },
-                // Processor: a window of batches at a time, emitted in order.
-                |read_rx: Receiver<(RecordBatch, usize)>| -> Result<(), ConvertError> {
-                    let stats = for_each_window(
-                        &read_rx,
-                        window,
-                        |(batch, offset)| process_level_batch(batch, *offset, ctx, timers),
-                        |_, out| match out {
-                            // No members of this level in the batch.
-                            None => Ok(ReadFlow::Continue),
-                            // Writer gone (it errored and dropped the
-                            // receiver): stop; the writer's error is reported
-                            // by the caller.
-                            Some((batch, verts)) => {
-                                Ok(if tx.send(Ok(Processed { batch, verts })).is_err() {
+    let process =
+        |(batch, offset): &(RecordBatch, usize)| process_level_batch(batch, *offset, ctx, timers);
+    // Capture the caller's pool before entering the standard helper thread.
+    // in_place_scope keeps the writer here even for a plain-thread caller.
+    let outcome = rayon::in_place_scope(|scope| {
+        scoped_pipe(
+            window.min(STREAMED_OUTPUT_DEPTH),
+            // Producer: read + process, in order, until EOF or the writer
+            // hangs up. Its first stream/processing error goes to the writer in
+            // order, so the level ends unwritten.
+            // Everything the closure touches (`source`, `ctx`, `&timers`,
+            // `row_groups`, the `usize`s) is `Copy`, so the outer bindings —
+            // notably `timers`, read back afterwards — stay valid.
+            |tx: &Sender<Result<Processed, ConvertError>>| -> Result<(), ConvertError> {
+                let produced = scoped_pipe(
+                    read_depth,
+                    // Reader: the raw input batches, in order.
+                    |read_tx: &Sender<(RecordBatch, usize)>| -> Result<(), ConvertError> {
+                        // Heartbeat (#242): the finest level re-streams the whole
+                        // input; keep the operator informed on planet-scale files
+                        // (quiet on small ones).
+                        let mut last_progress = Instant::now();
+                        // Regional extract (#102): read the same per-part
+                        // bbox-selected row groups as pass 1, so the winner
+                        // tables' global row indices line up. One reader, or
+                        // several merged back into the identical batch sequence
+                        // (#494) — `read_tuning` decides, and the decision never
+                        // reaches the output.
+                        source.read(
+                            row_groups,
+                            None,
+                            read_tuning,
+                            &mut |batch, offset, read_dur| {
+                                if last_progress.elapsed().as_secs() >= 10 {
+                                    last_progress = Instant::now();
+                                    log::info!(
+                                        "[convert] level {level_idx}: {offset} input row(s) scanned"
+                                    );
+                                }
+                                Pass2Timers::add_dur(&timers.read, read_dur);
+                                // Processor gone (it, or the writer behind it,
+                                // stopped): stop; its error is reported by the
+                                // caller.
+                                Ok(if read_tx.send((batch, offset)).is_err() {
                                     ReadFlow::Stop
                                 } else {
                                     ReadFlow::Continue
                                 })
-                            }
-                        },
-                    )?;
-                    timers.record_windows(stats);
-                    Ok(())
-                },
-            );
-            if let Err(e) = produced {
-                // The writer is gone when this fails; its error is reported.
-                let _ = tx.send(Err(e));
-            }
-            Ok(())
-        },
-        // Writer (this thread): drain processed batches in order. Dropping
-        // the producer's sender (EOF, error, or writer-gone) fuses `recv`;
-        // `scoped_pipe` owns the mirror-image guarantee that this receiver is
-        // dropped before the producer is joined (#362). The producer's
-        // windows run on the global pool, so a pool worker waiting here helps
-        // run them (`tests/rayon_global_pool_reentry.rs`).
-        |rx: Receiver<Result<Processed, ConvertError>>| -> Result<LevelWriteOutcome, ConvertError> {
-            let batches = std::iter::from_fn(|| {
-                let t_wait = Instant::now();
-                let msg = recv_in_pool(&rx).ok();
-                recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
-                Some(msg?.map(|msg| {
-                    rows.set(rows.get() + msg.batch.num_rows());
-                    vertices.set(vertices.get() + msg.verts);
-                    msg.batch
-                }))
-            });
-            writer.write_level_from(level_idx, Some(hint), batches)
-        },
-    )?;
+                            },
+                        )
+                    },
+                    // Processor: a window of batches at a time, emitted in order.
+                    |read_rx: Receiver<(RecordBatch, usize)>| -> Result<(), ConvertError> {
+                        let stats = for_each_window_on_pool(
+                            scope,
+                            &read_rx,
+                            window,
+                            &process,
+                            |_, out| match out {
+                                // No members of this level in the batch.
+                                None => Ok(ReadFlow::Continue),
+                                // Writer gone (it errored and dropped the
+                                // receiver): stop; the writer's error is reported
+                                // by the caller.
+                                Some((batch, verts)) => {
+                                    Ok(if tx.send(Ok(Processed { batch, verts })).is_err() {
+                                        ReadFlow::Stop
+                                    } else {
+                                        ReadFlow::Continue
+                                    })
+                                }
+                            },
+                        )?;
+                        timers.record_windows(stats);
+                        Ok(())
+                    },
+                );
+                if let Err(e) = produced {
+                    // The writer is gone when this fails; its error is reported.
+                    let _ = tx.send(Err(e));
+                }
+                Ok(())
+            },
+            // Writer (this thread): drain processed batches in order. Dropping
+            // the producer's sender (EOF, error, or writer-gone) fuses `recv`;
+            // `scoped_pipe` owns the mirror-image guarantee that this receiver is
+            // dropped before the producer is joined (#362). The producer's
+            // windows run on the caller's pool, so a pool worker waiting here helps
+            // run them (`tests/rayon_global_pool_reentry.rs`).
+            |rx: Receiver<Result<Processed, ConvertError>>| -> Result<LevelWriteOutcome, ConvertError> {
+                let batches = std::iter::from_fn(|| {
+                    let t_wait = Instant::now();
+                    let msg = recv_in_pool(&rx).ok();
+                    recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
+                    Some(msg?.map(|msg| {
+                        rows.set(rows.get() + msg.batch.num_rows());
+                        vertices.set(vertices.get() + msg.verts);
+                        msg.batch
+                    }))
+                });
+                writer.write_level_from(level_idx, Some(hint), batches)
+            },
+        )
+    })?;
     let total = t_level.elapsed().as_secs_f64();
     let read_s = Pass2Timers::secs(&timers.read);
     let decode_s = Pass2Timers::secs(&timers.decode);
@@ -9953,7 +9960,8 @@ mod tests {
     fn stream_level_into_faulty_writer(faults: EncodeFaults) -> String {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_input(tin.path(), &point_geoms(STREAMED_ROWS), true, None);
-        match stream_level(tin.path(), faults).0 {
+        let (streamed, writer) = stream_level(tin.path(), faults);
+        let message = match streamed {
             // The row-group stage reports its caught panic as a parquet
             // error, the WKB stage as a geoparquet-encoder one; both are the
             // writer's own typed error, which is the contract here.
@@ -9964,7 +9972,9 @@ mod tests {
             Ok((outcome, rows, _, _)) => {
                 panic!("a failing writer must not report success ({outcome:?}, {rows} rows)")
             }
-        }
+        };
+        assert!(writer.finish().is_err(), "the failed writer stayed usable");
+        message
     }
 
     const STREAMED_ROWS: usize = 400;
@@ -10128,14 +10138,26 @@ mod tests {
                 "injected WKB encode panic",
             ),
         ] {
-            let msg = within(
-                "writer_failure_mid_level_surfaces_typed_error_without_deadlock",
-                move || stream_level_into_faulty_writer(faults),
-            );
-            assert!(
-                msg.contains(expect),
-                "{stage}: the writer's own failure must be what surfaces, got: {msg}"
-            );
+            for on_pool in [false, true] {
+                let msg = within(
+                    "writer_failure_mid_level_surfaces_typed_error_without_deadlock",
+                    move || {
+                        if on_pool {
+                            rayon::ThreadPoolBuilder::new()
+                                .num_threads(1)
+                                .build()
+                                .unwrap()
+                                .install(|| stream_level_into_faulty_writer(faults))
+                        } else {
+                            stream_level_into_faulty_writer(faults)
+                        }
+                    },
+                );
+                assert!(
+                    msg.contains(expect),
+                    "{stage}: the writer's own failure must be what surfaces, got: {msg}"
+                );
+            }
         }
     }
 
