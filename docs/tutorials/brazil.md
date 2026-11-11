@@ -2,9 +2,11 @@
 
 ### The result
 
-The archive from step 1, served from this site. A5 density cells, colored by
-`point_count`, cover z0–z7; zoom past z8 to see the field polygons. Click a
-feature to see its properties.
+The map shows step 1's archive for the whole country, read from
+[Source Cooperative](https://source.coop/nlebovits/tylertoo-brazil-demo)
+with HTTP range requests. It opens on all of Brazil, with A5 cells colored
+by `point_count` through z7. Zoom past z8 to see the field polygons, and
+click a feature to see its properties.
 
 <div id="brazil-map" class="tutorial-map" role="region" aria-label="Map of brazil.pmtiles"></div>
 <p class="tutorial-map-caption">Basemap © <a href="https://openfreemap.org">OpenFreeMap</a>, © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors. Fields © <a href="https://fieldsofthe.world/">Fields of the World</a>.</p>

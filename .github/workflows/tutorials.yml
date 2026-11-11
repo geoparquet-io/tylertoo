@@ -35,13 +35,16 @@ jobs:
         with:
           persist-credentials: false
 
-      # The run spills its intermediate files and writes two 6 GB archives;
-      # the runner's preinstalled SDKs leave too little disk for that.
-      - name: Free disk space
+      # Step 1 alone peaks at about 41 GiB of disk (a 4-core, 16 GB
+      # simulation of this runner), and step 2 adds two more 6 GB archives.
+      # The root disk is too small; the runner's scratch disk at /mnt holds
+      # the working directories and spill instead.
+      - name: Use the scratch disk for temporary files
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
-          df -h /
+          sudo mkdir -p /mnt/tmp
+          sudo chown "$USER" /mnt/tmp
+          echo "TMPDIR=/mnt/tmp" >> "$GITHUB_ENV"
+          df -h / /mnt
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
@@ -85,4 +88,4 @@ jobs:
         run: |
           uv sync --locked --no-install-project
           uv run --no-sync pytest -m docs tests/docs/test_examples.py -k brazil -v
-          df -h /
+          df -h / /mnt

@@ -20,7 +20,12 @@ Install `tylertoo` with `cargo install tylertoo`. You don't need credentials:
 requests are anonymous, and `tylertoo` logs a warning. Run the steps in
 order in an empty working directory. Each step downloads the 11.6 GB.
 
-TODO(disk/runtime on a 4-core, 16 GB machine)
+On a 4-core machine with 16 GB of memory, step 1 took about 36 minutes,
+peaked at 12 GB of memory, and needed about 41 GB of free disk for its
+temporary files and the 5.9 GB archive. The archive was byte-identical to
+the 64-core run. If the default disk is short on space, set `TMPDIR` to a
+roomier disk. Step 2 runs five jobs in sequence, so it takes longer on one
+machine.
 
 ## 1. Tile all of Brazil straight from the bucket
 
