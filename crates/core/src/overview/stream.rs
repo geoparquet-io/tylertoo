@@ -11022,14 +11022,14 @@ mod tests {
 
     /// #851: a chain table's slots stay allocated until convert returns,
     /// after pass 2 has moved every geometry out, so a slot must not carry
-    /// the geometry inline (it was 80 B with an inline `Geometry`).
+    /// the geometry inline (it was 80 B with an inline `Geometry`). Compared
+    /// with a boxed byte, not a byte count: `Mutex` differs by platform.
     #[test]
     fn a_chain_table_slot_is_small() {
-        type Slot = (usize, (super::super::convert::ChainGeometry, i32));
-        assert!(
-            std::mem::size_of::<Slot>() <= 32,
-            "{}",
-            std::mem::size_of::<Slot>()
+        assert_eq!(
+            std::mem::size_of::<super::super::convert::ChainGeometry>(),
+            std::mem::size_of::<std::sync::Mutex<Option<Box<u8>>>>(),
+            "a chain slot holds its geometry behind one pointer"
         );
     }
 
