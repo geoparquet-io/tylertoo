@@ -18,6 +18,51 @@ caveats, see [benchmarks](../benchmarks.md).
 To start from tippecanoe's defaults instead of tylertoo's, pass
 `--preset tippecanoe`; see [the tippecanoe preset](#the-tippecanoe-preset).
 
+## Why middle zooms can keep more features
+
+The two default pipelines use different thinning ladders. More features at
+a middle zoom do not by themselves show a clipping or encoding error.
+
+- **The budget starts from a different count.** tylertoo keeps all input
+  features at the canonical level. For kinds that the budget thins, level `L`
+  has a budget of `max(256, round(N / 1.65^(finest − L)))`, where `N` is
+  the full canonical count of those kinds. Tippecanoe's documented `-r`
+  default is 2.5. Its `-B` base zoom defaults to the maximum zoom (`-z`);
+  the base zoom anchors its drop ladder. See its
+  [documented defaults](https://github.com/felt/tippecanoe#dropping-a-fixed-fraction-of-features-by-zoom-level).
+  Matching zooms and passing the same rate do not make the selection
+  algorithms equivalent. tylertoo also keeps one candidate in tiles the
+  density budget would otherwise empty, which can exceed the budget.
+- **Cell selection comes first.** tylertoo chooses cell winners before
+  applying the budget. At middle zooms the cells can be small enough for
+  almost every eligible feature to win. The density budget then limits
+  points; lines and polygons are exempt unless you set `--drop-lines` or
+  `--drop-polygons`. Tippecanoe also exempts lines and polygons
+  from its default drop rate. Their count difference needs the visibility,
+  collapse, coalescing, and size-valve settings as well as the rate.
+- **Oversized tiles take different paths.** Tippecanoe defaults to
+  500,000 compressed bytes and 200,000 features per tile. See its
+  [tile limits](https://github.com/felt/tippecanoe#setting-or-disabling-tile-size-limits).
+  It retries at lower detail and can fail if a tile still exceeds its limits; dropping
+  or coalescing as needed takes extra flags. tylertoo defaults to 512,000
+  compressed bytes and 2 MiB uncompressed, with no feature-count cap. Its
+  default size valve merges dense lines and polygons. The limits do not
+  imply the tools will drop the same features.
+
+The [Portland sweep](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md#decision-2---drop-rate-165-q2-density-budget)
+found 2.89× and 3.57× tippecanoe's distinct-feature counts at z9 and z10
+with cell selection alone. A rate of 1.65 brought those ratios to 1.21×
+and 1.03×; 2.5 fell below tippecanoe. That historical line sweep predates
+the points-only default budget. It explains the rate choice, not a
+count guarantee for current inputs. Some zooms and datasets keep fewer
+features than tippecanoe.
+
+See the [density budget](../OVERVIEW_TUNING.md#density-budget-drop-rate-drop-gamma-no-density-drop)
+and [architecture divergences](https://github.com/geoparquet-io/tylertoo/blob/main/context/ARCHITECTURE.md#known-divergences-from-tippecanoe-overview-pipeline).
+`--preset tippecanoe` aligns matching options; the list below explains its
+remaining differences. Compare the same input, zoom range, and flags before
+attributing a count difference to one default.
+
 ## Flag mapping
 
 | tippecanoe | tylertoo | Note |

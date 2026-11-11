@@ -20,16 +20,41 @@ across machines. The coarse job still needs memory for the full input.
 
 ## One machine, bounded memory
 
+### How much memory
+
+A 32 GB machine with fast local spill disk is a starting point for
+country-scale polygon builds. Count features, vertices, properties, and
+emitted tiles before choosing RAM. A country boundary alone gives no
+memory bound. The Brazil run above is a historical example on a 54 GiB
+host, not a measurement of this branch on 32 GB.
+
+Pass 1 keeps 33–42 bytes per retained feature before assignment workspace:
+300M features need 9.9–12.6 GB for that table alone. At 1.58 billion features,
+the table alone needs 52–66 GB (49–62 GiB). Assignment, active row groups,
+and optional line coalescing add to it. Planet-scale input needs a larger
+host for the full-input coarse job, then shards sized to their own peaks.
+Spilling pass 2 cannot make that coarse job fit on 32 GB. Export also keeps tile-count maps and archive entries in RAM. At 100M
+tiles with distinct bodies, writer entries and dedup alone price at about
+6.4 GB before finalization.
+See the [memory envelope](https://github.com/geoparquet-io/tylertoo/blob/main/context/PROFILING.md#memory-envelope)
+for phase arithmetic and pending measurements on this branch.
+
+Start with `--profile auto`; use `--profile bounded` for a smaller footprint.
+Set `--spill-dir` to real disk. Reduce `--read-batch-size`,
+`--read-workers`, `--in-flight-batches`, or `--partition-wave` when active
+batches dominate. Keep only needed properties with `--include-property`.
+Prepare smaller row groups with `gpio`. These controls do not remove
+pass-1 or writer tables; measure a representative run before sizing a job.
+
 ### How streaming bounds memory
 
-Convert reads the input twice. Pass 1 records each feature's bounding box,
-geometry kind, and sort key. Level assignment produces a winner table of
+Convert reads the input twice. Pass 1 records each feature's center and
+squared diagonal, along with its kind and any sort key. Level assignment produces a winner table of
 about 1 byte per feature. Pass 2 simplifies and writes each level in batches.
 
-Peak memory is one read batch plus the per-feature tables. It depends on
-the largest row group and feature count: well under 1 GB on a 632k-polygon
-file that would otherwise need several GB. Choose the row-group size when
-preparing input with `gpio`. Pass 1 uses up to 42 bytes per row, reaching
+The largest row group affects memory alongside feature count and schema
+width. Active batches and phase workspace add to the per-feature tables.
+Choose the row-group size when preparing input with `gpio`. Pass 1 uses up to 42 bytes per row, reaching
 tens of GiB at a billion rows. See [sizing the coarse job's memory](#sizing-the-coarse-jobs-memory).
 
 - **`--read-batch-size <rows>`** sets the Arrow batch size for both passes
@@ -46,7 +71,7 @@ batches processed at once, and the row groups the writer encodes at once.
 | `--profile` | Output buffers | Everything else |
 | --- | --- | --- |
 | `speed` | RAM | No limit: every knob at its maximum |
-| `bounded` | Temporary Arrow Inter-Process Communication (IPC) files | Fixed caps that the allowance can only shrink: at most 4 readers, 16 batches each, 4 encodes. The smallest footprint |
+| `bounded` | Temporary Arrow Inter-Process Communication (IPC) files | Fixed initial caps: at most 4 readers, 16 batches each, and 4 encodes. The drain can reuse released batch memory for more encodes |
 | `auto` (default) | RAM when the estimate fits 60% of available RAM, otherwise spill. Measures buffered rows and switches to spilling mid-pass if they outgrow it | Sized to fit the same 60%, priced from the Parquet footers |
 
 `auto` is its own shape, not a switch between the other two: on a large
