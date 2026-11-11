@@ -80,6 +80,16 @@ where
         // `recv` loop.
         let producer = scope.spawn(move || produce(&tx));
         let consumed = consume(rx);
+        // A pool worker runs pool work until the producer is done: the
+        // producer may wait on work queued behind this worker, as when the
+        // consumer stopped early on an error.
+        if rayon::current_thread_index().is_some() {
+            while !producer.is_finished() {
+                if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
         match producer.join() {
             Ok(produced) => produced?,
             Err(payload) => std::panic::resume_unwind(payload),

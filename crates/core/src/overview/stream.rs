@@ -83,7 +83,9 @@ use super::simplify::{
 use super::source::BatchSource;
 #[cfg(test)]
 use super::source::MemorySource;
-use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
+use super::writer::{
+    recv_in_pool, LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions,
+};
 use crate::resolved_schema::ResolvedSchema;
 
 struct ScanCollection {
@@ -6848,11 +6850,13 @@ fn write_level_streaming(
         // Writer (this thread): drain processed batches in order. Dropping
         // the producer's sender (EOF, error, or writer-gone) fuses `recv`;
         // `scoped_pipe` owns the mirror-image guarantee that this receiver is
-        // dropped before the producer is joined (#362).
+        // dropped before the producer is joined (#362). The producer's
+        // windows run on the global pool, so a pool worker waiting here helps
+        // run them (`tests/rayon_global_pool_reentry.rs`).
         |rx: Receiver<Processed>| -> Result<LevelWriteOutcome, ConvertError> {
             let batches = std::iter::from_fn(|| {
                 let t_wait = Instant::now();
-                match rx.recv() {
+                match recv_in_pool(&rx) {
                     Ok(msg) => {
                         recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
                         rows.set(rows.get() + msg.batch.num_rows());
