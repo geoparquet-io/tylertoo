@@ -11,9 +11,66 @@ pub(super) const RECORD_BYTES: u64 = 10;
 const RESIDENT_BYTES: usize = 16 << 10;
 const PAGE_BYTES: usize = 1024 * RECORD_BYTES as usize;
 
+/// One zoom's ledger file.
+#[derive(Debug)]
+pub(super) enum LedgerFile {
+    /// Resident until it outgrows `RESIDENT_BYTES`, then an open temp file.
+    Open(tempfile::SpooledTempFile),
+    /// A finished ledger on disk, holding no file descriptor between reads
+    /// ([`super::SourceLosses::seal`]).
+    Sealed(tempfile::TempPath),
+}
+
+impl LedgerFile {
+    fn new(dir: Option<&std::path::Path>) -> Self {
+        Self::Open(dir.map_or_else(
+            || tempfile::spooled_tempfile(RESIDENT_BYTES),
+            |dir| tempfile::spooled_tempfile_in(RESIDENT_BYTES, dir),
+        ))
+    }
+
+    /// The file to write, reopening a sealed one (recording resumed).
+    fn open(&mut self) -> std::io::Result<&mut tempfile::SpooledTempFile> {
+        if let Self::Sealed(path) = self {
+            let mut file = tempfile::spooled_tempfile(RESIDENT_BYTES);
+            std::io::copy(&mut std::fs::File::open(&*path)?, &mut file)?;
+            *self = Self::Open(file);
+        }
+        match self {
+            Self::Open(file) => Ok(file),
+            Self::Sealed(_) => unreachable!("reopened above"),
+        }
+    }
+
+    /// Fill `buf` from `offset`.
+    pub(super) fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            Self::Open(file) => {
+                file.seek(SeekFrom::Start(offset))?;
+                file.read_exact(buf)
+            }
+            Self::Sealed(path) => {
+                let mut file = std::fs::File::open(&*path)?;
+                file.seek(SeekFrom::Start(offset))?;
+                file.read_exact(buf)
+            }
+        }
+    }
+
+    fn copy_to(&mut self, out: &mut impl Write) -> std::io::Result<u64> {
+        match self {
+            Self::Open(file) => {
+                file.rewind()?;
+                std::io::copy(file, out)
+            }
+            Self::Sealed(path) => std::io::copy(&mut std::fs::File::open(&*path)?, out),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Rows {
-    pub(super) file: tempfile::SpooledTempFile,
+    pub(super) file: LedgerFile,
     pub(super) len: u64,
     losses: u64,
     allocated: u64,
@@ -25,9 +82,25 @@ pub(super) struct Rows {
 impl Rows {
     fn flush(&mut self) -> std::io::Result<()> {
         if self.dirty {
-            self.file.seek(SeekFrom::Start(self.page_start.unwrap()))?;
-            self.file.write_all(self.page.as_slice())?;
+            let file = self.file.open()?;
+            file.seek(SeekFrom::Start(self.page_start.unwrap()))?;
+            file.write_all(self.page.as_slice())?;
             self.dirty = false;
+        }
+        Ok(())
+    }
+
+    /// Move a ledger that went to disk to a named file closed between reads.
+    pub(super) fn seal(&mut self, dir: Option<&std::path::Path>) -> std::io::Result<()> {
+        self.flush()?;
+        if matches!(&self.file, LedgerFile::Open(file) if file.is_rolled()) {
+            let mut sealed = dir.map_or_else(
+                tempfile::NamedTempFile::new,
+                tempfile::NamedTempFile::new_in,
+            )?;
+            self.file.copy_to(&mut sealed)?;
+            sealed.as_file().sync_data()?;
+            self.file = LedgerFile::Sealed(sealed.into_temp_path());
         }
         Ok(())
     }
@@ -37,14 +110,13 @@ impl Rows {
             self.flush()?;
             self.page.fill(0);
             if start < self.allocated {
-                self.file.seek(SeekFrom::Start(start))?;
-                self.file.read_exact(self.page.as_mut_slice())?;
+                self.file.read_at(start, self.page.as_mut_slice())?;
             } else {
                 // Sparse growth stays on spill, including distant row addresses.
                 let allocated = start.checked_add(PAGE_BYTES as u64).ok_or_else(|| {
                     std::io::Error::other("source accounting page address overflow")
                 })?;
-                self.file.set_len(allocated)?;
+                self.file.open()?.set_len(allocated)?;
                 self.allocated = allocated;
             }
             self.page_start = Some(start);
@@ -97,13 +169,9 @@ impl Accounting {
         if Arc::strong_count(&self.rows) != 1 {
             let mut copy = BTreeMap::new();
             for (&zoom, rows) in self.rows.lock().unwrap().iter_mut() {
-                let mut file = self.spill_dir.as_ref().map_or_else(
-                    || tempfile::spooled_tempfile(RESIDENT_BYTES),
-                    |dir| tempfile::spooled_tempfile_in(RESIDENT_BYTES, dir),
-                );
+                let mut file = LedgerFile::new(self.spill_dir.as_deref());
                 rows.flush()?;
-                rows.file.rewind()?;
-                std::io::copy(&mut rows.file, &mut file)?;
+                rows.file.copy_to(file.open()?)?;
                 copy.insert(
                     zoom,
                     Rows {
@@ -121,10 +189,7 @@ impl Accounting {
         }
         let mut ledger = self.rows.lock().unwrap();
         let rows = ledger.entry(zoom).or_insert_with(|| Rows {
-            file: self.spill_dir.as_ref().map_or_else(
-                || tempfile::spooled_tempfile(RESIDENT_BYTES),
-                |dir| tempfile::spooled_tempfile_in(RESIDENT_BYTES, dir),
-            ),
+            file: LedgerFile::new(self.spill_dir.as_deref()),
             len: 0,
             losses: 0,
             allocated: 0,
@@ -191,10 +256,9 @@ impl Accounting {
             .values()
             .map(|r| {
                 PAGE_BYTES
-                    + if r.file.is_rolled() {
-                        0
-                    } else {
-                        RESIDENT_BYTES
+                    + match &r.file {
+                        LedgerFile::Open(file) if !file.is_rolled() => RESIDENT_BYTES,
+                        _ => 0,
                     }
             })
             .sum()
@@ -204,6 +268,52 @@ impl Accounting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #821: sealing a snapshot keeps its losses and closes its ledgers'
+    /// descriptors, and recording can resume after it.
+    #[test]
+    fn sealed_snapshots_read_back_and_hold_no_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = Accounting::default();
+        ledger.set_spill_dir(Some(dir.path()));
+        // 4,000 rows outgrow RESIDENT_BYTES, so each zoom's ledger is on disk.
+        for zoom in 0..4 {
+            for row in 0..4000 {
+                let cause = (row % 3 == 0).then_some(SourceLossCause::ValveDropped);
+                ledger.record(row, None, Some(zoom), cause).unwrap();
+            }
+        }
+        let snapshot = ledger.losses().unwrap();
+        let ids = |s: &super::super::SourceLosses| -> Vec<(Option<u8>, u64)> {
+            s.iter()
+                .map(|l| l.map(|l| (l.zoom, l.id)))
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let before = ids(&snapshot);
+        // The descriptors open on the ledgers' directory: other tests in
+        // this process open and close files of their own meanwhile.
+        #[cfg(target_os = "linux")]
+        let fds = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+                .filter(|target| target.starts_with(dir.path()))
+                .count()
+        };
+        #[cfg(target_os = "linux")]
+        assert_eq!(fds(), 4, "one open ledger per zoom");
+        snapshot.seal().unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(fds(), 0, "sealed ledgers hold no descriptor");
+        assert_eq!(ids(&snapshot), before);
+
+        ledger
+            .record(5000, None, Some(0), Some(SourceLossCause::ValveDropped))
+            .unwrap();
+        assert_eq!(ledger.losses().unwrap().len(), before.len() + 1);
+        assert_eq!(ids(&snapshot), before, "the sealed snapshot is unchanged");
+    }
 
     #[test]
     fn spilled_pages_preserve_sparse_rows_causes_ids_and_survival() {

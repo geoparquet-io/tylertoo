@@ -149,5 +149,5 @@ class TestConvertPropertySelection:
                 True,
                 "input",
                 None,
-                ["id"],  # type: ignore[misc, arg-type]
+                ["id"],  # type: ignore[call-overload]
             )

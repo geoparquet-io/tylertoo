@@ -300,6 +300,17 @@ pub struct TilesOptions {
     #[cfg_attr(feature = "cli", arg(long))]
     #[cfg_attr(feature = "cli", arg(help = "Layer name for the tiles. Defaults to the input's file stem", long_help = None))]
     pub layer_name: Option<String>,
+    /// Route each feature to the MVT layer named by its value in this
+    /// column (#821, tippecanoe's per-feature `tippecanoe.layer`): one
+    /// layer per distinct value, `_unknown` for a null or blank one. The
+    /// column decides the layer and is not written as a property. Excludes
+    /// [`TilesOptions::layer_name`]; see [`super::layer_column`].
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "COLUMN", conflicts_with = "layer_name")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Put each feature in the layer named by its value in COLUMN, and null or blank values in `_unknown`. The column is not written as a property. Each layer is tiled on its own, so the size caps apply per layer", long_help = None))]
+    pub layer_column: Option<String>,
     /// Retain the intermediate overview at this path instead of a removed
     /// temp file (#314). Its parent directory must exist.
     #[cfg_attr(feature = "cli", arg(long, value_name = "PATH"))]
@@ -315,6 +326,7 @@ with_setters!(TilesOptions {
     with_convert => convert: ConvertOptions,
     with_export => export: ExportOptions,
     with_layer_name => layer_name: Option<String>,
+    with_layer_column => layer_column: Option<String>,
     with_keep_overview => keep_overview: Option<PathBuf>,
     with_shard => shard: Option<TilesShard>,
 });
@@ -331,6 +343,7 @@ impl Default for TilesOptions {
             },
             export: ExportOptions::default(),
             layer_name: None,
+            layer_column: None,
             keep_overview: None,
             shard: None,
         }
@@ -525,6 +538,9 @@ impl TilesOptions {
             super::export::variable_depth::check_convert(&self.convert, self.shard.is_some())?;
         }
         check_ignored_export_fields(&self.export, "tiles", &FACADE_OWNED_EXPORT_FIELDS)?;
+        if let Some(column) = &self.layer_column {
+            self.check_layer_column(column)?;
+        }
         check_keep_overview(self.keep_overview.as_deref())?;
         // #386/#443: the property selection is applied at convert, so an
         // excluded column is already gone from the intermediate before export
@@ -538,6 +554,45 @@ impl TilesOptions {
             return Err(ConfigError::PlanOnlyWithoutSavePlan.into());
         }
         Ok(())
+    }
+}
+
+impl TilesOptions {
+    /// The options a [`TilesOptions::layer_column`] run (#821) cannot
+    /// honour: each layer is its own convert and export.
+    fn check_layer_column(&self, column: &str) -> Result<(), ConfigError> {
+        let conflict = |option, reason| ConfigError::LayerColumnConflict { option, reason };
+        if self.layer_name.is_some() {
+            return Err(conflict(
+                "--layer-name",
+                "the column's values name the layers",
+            ));
+        }
+        if self.shard.is_some() {
+            return Err(conflict(
+                "--shard",
+                "a sharded build shares one convert plan, and each layer needs its own",
+            ));
+        }
+        if self.convert.save_plan.is_some() || self.convert.plan.is_some() {
+            return Err(conflict(
+                "--save-plan or --plan",
+                "a convert plan covers one convert, and each layer runs its own",
+            ));
+        }
+        if self.keep_overview.is_some() {
+            return Err(conflict(
+                "--keep-overview",
+                "each layer has its own intermediate overview",
+            ));
+        }
+        if self.export.variable_depth {
+            return Err(conflict(
+                "--generate-variable-depth-tile-pyramid",
+                "the layers are joined by a merge that needs every tile at every zoom",
+            ));
+        }
+        super::layer_column::check_knobs(&self.convert, &self.export, column, None)
     }
 }
 
@@ -667,6 +722,9 @@ pub enum TilesOutcome {
     /// The coarse job had nothing at or below its ceiling and wrote a valid
     /// empty archive over the zooms it owns (#541).
     EmptyCoarse(EmptyArchive),
+    /// A [`TilesOptions::layer_column`] run tiled each layer and merged
+    /// them into one archive (#821).
+    Layered(Box<super::layer_column::LayeredReport>),
 }
 
 /// Mid-run notifications from [`convert_to_pmtiles_observed`]. Every method
@@ -729,6 +787,21 @@ pub enum TilesError {
     /// cut for other parts, or a pivot finer than the resolved finest zoom.
     #[error(transparent)]
     Shard(crate::shard::ShardError),
+    /// The [`TilesOptions::layer_column`] split failed (#821).
+    #[error(transparent)]
+    LayerColumn(#[from] super::layer_column::LayerColumnError),
+    /// One layer of a [`TilesOptions::layer_column`] run failed.
+    #[error("layer {layer:?}: {source}")]
+    #[non_exhaustive]
+    Layer {
+        /// The layer.
+        layer: String,
+        /// Its failure.
+        source: Box<TilesError>,
+    },
+    /// Merging the layers of a [`TilesOptions::layer_column`] run failed.
+    #[error("merging the layers failed: {0}")]
+    Merge(crate::pyramid::PyramidError),
 }
 
 /// `prefix`, unless the error is a refused option, which names no step.
@@ -747,6 +820,9 @@ impl crate::error::Classify for TilesError {
             TilesError::Config(_) => crate::error::ErrorKind::Usage,
             TilesError::Convert(e) => e.kind(),
             TilesError::Export(e) => e.kind(),
+            TilesError::LayerColumn(e) => e.kind(),
+            TilesError::Layer { source, .. } => source.kind(),
+            TilesError::Merge(e) => e.kind(),
             _ => crate::error::fallback_kind(self),
         }
     }
@@ -834,7 +910,7 @@ pub fn write_plan(input: &TilesInput, options: &TilesOptions) -> Result<PlanRepo
 /// ([`super::auto_zoom::resolve_auto_max_zoom`], so the estimate and the
 /// conversion share one source and a remote sample is fetched once, #788),
 /// then check the shard pivot against the resolved finest zoom.
-fn resolve_on_source<'a>(
+pub(super) fn resolve_on_source<'a>(
     source: &ConvertSource,
     shard: Option<&TilesShard>,
     convert: Cow<'a, ConvertOptions>,
@@ -893,6 +969,9 @@ pub fn convert_to_pmtiles_observed(
     observer: &mut dyn TilesObserver,
 ) -> Result<TilesOutcome, TilesError> {
     let config = options.validate()?;
+    if let Some(column) = &options.layer_column {
+        return super::layer_column::convert_by_layer(input, output, options, column);
+    }
     convert_to_pmtiles_validated(input, || input.source(), output, &config, observer)
 }
 
@@ -1164,7 +1243,7 @@ pub(super) fn convert_to_pmtiles_validated(
 /// it noticed: `NoData` when no level has a winner, `AllLevelsEmpty` when
 /// every declared level turned out empty at write time. Both mean "zero rows
 /// reached the output", which for a data shard is not an error at all.
-fn convert_produced_nothing(e: &ConvertError) -> bool {
+pub(super) fn convert_produced_nothing(e: &ConvertError) -> bool {
     matches!(
         e,
         ConvertError::NoData | ConvertError::Writer(WriterError::AllLevelsEmpty { .. })
@@ -1179,7 +1258,7 @@ fn convert_produced_nothing(e: &ConvertError) -> bool {
 /// unit-testable.
 /// Where the facade puts the intermediate overview: `keep_overview`'s
 /// directory when retained, else [`resolve_intermediate_dir`]'s choice.
-fn intermediate_dir(options: &TilesOptions, output: &Path) -> PathBuf {
+pub(super) fn intermediate_dir(options: &TilesOptions, output: &Path) -> PathBuf {
     match &options.keep_overview {
         Some(path) => path
             .parent()
@@ -1227,16 +1306,34 @@ pub fn intermediate_space_preflight(
     options: &TilesOptions,
     remedies: SpaceRemedies<'_>,
 ) -> Option<String> {
-    let source = input.source().ok()?;
+    space_preflight(&input.source().ok()?, None, output, options, remedies)
+}
+
+/// [`intermediate_space_preflight`] on an open source, reading `selection`.
+/// A `--layer-column` run (#821) also stages its split copy of the input
+/// there, beside one layer's conversion at a time; the whole input's
+/// conversion bounds each layer's.
+pub(super) fn space_preflight(
+    source: &ConvertSource,
+    selection: Option<&crate::input_set::RowGroupSelection>,
+    output: &Path,
+    options: &TilesOptions,
+    remedies: SpaceRemedies<'_>,
+) -> Option<String> {
     let dir = intermediate_dir(options, output);
-    super::disk::DiskFootprint::conversion(
-        &source,
-        None,
+    let mut footprint = super::disk::DiskFootprint::conversion(
+        source,
+        selection,
         &options.convert,
         Some(&dir.join("overview.parquet")),
     )
-    .ok()?
-    .warning(remedies)
+    .ok()?;
+    if options.layer_column.is_some() {
+        footprint
+            .add_staged_layers(source, selection, &options.convert, &dir)
+            .ok()?;
+    }
+    footprint.warning(remedies)
 }
 
 fn resolve_intermediate_dir(

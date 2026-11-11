@@ -313,6 +313,28 @@ pub enum ConfigError {
         /// The accumulate op it carries.
         op: String,
     },
+    /// An option `--layer-column` cannot be combined with (#821).
+    #[error("--layer-column cannot be combined with {option}: {reason}")]
+    #[non_exhaustive]
+    LayerColumnConflict {
+        /// The other option.
+        option: &'static str,
+        /// Why not.
+        reason: &'static str,
+    },
+    /// A knob reads the `--layer-column` column, which no layer keeps
+    /// (#821).
+    #[error(
+        "--layer-column {name:?} decides each feature's layer and is not kept as a property, \
+         so {knob} cannot read it"
+    )]
+    #[non_exhaustive]
+    LayerColumnReadByKnob {
+        /// The column.
+        name: String,
+        /// The knob that reads it.
+        knob: String,
+    },
     /// An option set on a command that would ignore it (#600, #443): the
     /// command derives the value itself, or has no use for it.
     #[error("{option} has no effect on {command}: {reason}")]

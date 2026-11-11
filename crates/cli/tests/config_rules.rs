@@ -123,6 +123,12 @@ fn tiles_surfaces_every_core_rule() {
             ][..],
             "--polygon-thinning above 0",
         ),
+        // #821: what a per-layer run cannot honour. The CLI reads a
+        // --shard-plan before core sees it, so core's own test covers --shard.
+        (
+            &["--layer-column", "crop", "--keep-overview", "k.parquet"][..],
+            "--layer-column cannot be combined with --keep-overview",
+        ),
     ] {
         tiles_refuses(flags, needle);
     }

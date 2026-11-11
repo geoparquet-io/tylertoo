@@ -176,3 +176,38 @@ def test_report_carries_the_crs_assumption_and_geo_version(tmp_path):
         )
         assert report["crs_assumed_wgs84"] is assumed, name
         assert report["geo_version"] == expected, name
+
+
+def test_layered_losses_spill_per_layer_as_caller_owned_jsonl(tmp_path, spill):
+    """Each layer's spilled export losses reach the caller under its layer."""
+    spill_path, spill_dir = spill
+    metadata = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {
+            "geometry": {"encoding": "WKB", "geometry_types": ["Point", "Polygon"]}
+        },
+    }
+    source = tmp_path / "layered.parquet"
+    table = pa.table(
+        {
+            "geometry": [POINT] + [SLIVER] * (ROWS - 1),
+            "id": range(ROWS),
+            "kind": ["a"] * ROWS,
+        }
+    ).replace_schema_metadata({b"geo": json.dumps(metadata).encode()})
+    pq.write_table(table, source, row_group_size=ROWS)
+    report = tylertoo.convert(
+        str(source),
+        str(tmp_path / "layered.pmtiles"),
+        min_zoom=0,
+        max_zoom=0,
+        feature_id="id",
+        layer_column="kind",
+        spill_dir=spill_dir,
+    )
+    (layer,) = report["layers"]
+    losses = layer["export"]["source_losses"]
+    assert not isinstance(losses, list)
+    causes = {row["cause"] for row in _take_spilled(losses, spill_path)}
+    assert causes == {"quantized"}

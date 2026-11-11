@@ -46,7 +46,7 @@ class TestConvertFunction:
         """Test that convert() has expected default parameters."""
         # This will fail with TypeError if required args are missing
         with pytest.raises(TypeError) as exc_info:
-            tylertoo.convert()  # type: ignore[call-arg]
+            tylertoo.convert()  # type: ignore[call-overload]
 
         # Should complain about missing input/output, not other params
         error_msg = str(exc_info.value)

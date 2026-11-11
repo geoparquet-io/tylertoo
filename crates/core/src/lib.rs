@@ -131,6 +131,8 @@ mod pyramid;
 mod quality;
 mod reproject;
 mod resolved_schema;
+#[cfg(feature = "serve")]
+mod serve;
 mod shard;
 mod stats;
 mod sutherland_hodgman;
@@ -173,6 +175,7 @@ pub use overview::export::{
 // Check: validate an overview file against the spec.
 pub use overview::check::{validate_file, CheckError, CheckResult, ValidationReport};
 // Tiles: the one-shot GeoParquet -> PMTiles facade, and its sharded builds.
+pub use overview::layer_column::{LayerColumnError, LayerReport, LayeredReport};
 pub use overview::tiles::{
     convert_to_pmtiles, write_plan, EmptyArchive, IntermediateOverview, ShardBinding, TilesError,
     TilesInput, TilesOptions, TilesOutcome, TilesReport, TilesShard,
@@ -220,6 +223,10 @@ pub mod internal {
     pub use mlt_core;
     pub mod archive_index {
         pub use crate::archive_index::*;
+    }
+    #[cfg(feature = "serve")]
+    pub mod serve {
+        pub use crate::serve::*;
     }
     pub mod atomic_output {
         pub use crate::atomic_output::*;

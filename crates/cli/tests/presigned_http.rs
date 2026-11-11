@@ -130,3 +130,49 @@ fn a_flag_conflict_does_not_echo_a_presigned_url() {
     assert!(!ok && out.contains("--files-from conflicts"), "{out}");
     assert_no_signature("the conflict error", &out);
 }
+
+/// `--layer-column` (#821) reads a presigned URL the way `tiles` does, and
+/// neither its summary, its report, nor a refusal shows the query.
+#[test]
+fn layer_column_reads_a_presigned_url_without_leaking_it() {
+    let url = presigned_grid();
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+
+    let (ok, out) = run(&[
+        "tiles",
+        &url,
+        &path("out.pmtiles"),
+        "--max-zoom",
+        "4",
+        "--layer-column",
+        "cell_id",
+        "--filter",
+        "cell_id < 3",
+        "--report",
+        &path("report.json"),
+    ]);
+    assert!(ok, "tiles --layer-column failed: {out}");
+    assert_no_signature("tiles --layer-column output", &out);
+    assert!(out.contains("3 layers by \"cell_id\""), "{out}");
+    let report = std::fs::read_to_string(dir.path().join("report.json")).unwrap();
+    assert_no_signature("the layered report", &report);
+
+    for (column, refusal) in [
+        ("nope", "is not a column of the input"),
+        ("cell_id", "more than 64"),
+    ] {
+        let (ok, out) = run(&[
+            "tiles",
+            &url,
+            &path("refused.pmtiles"),
+            "--layer-column",
+            column,
+        ]);
+        assert!(
+            !ok && out.contains(refusal),
+            "--layer-column {column} should be refused: {out}"
+        );
+        assert_no_signature("a --layer-column refusal", &out);
+    }
+}

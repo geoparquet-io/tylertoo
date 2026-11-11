@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tylertoo serve</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@6.16.0/dist/maplibre-gl.css">
+<style>
+  html, body { margin: 0; height: 100%; font: 13px/1.4 system-ui, sans-serif; background: #f4f4f2; color: #222; }
+  #map { position: absolute; inset: 0 320px 0 0; }
+  #side { position: absolute; top: 0; right: 0; bottom: 0; width: 320px; overflow: auto; box-sizing: border-box; padding: 10px; border-left: 1px solid #ccc; background: #fff; }
+  h2 { font-size: 13px; margin: 14px 0 4px; }
+  select { width: 100%; }
+  label { display: block; }
+  .swatch { display: inline-block; width: 10px; height: 10px; margin-right: 4px; vertical-align: middle; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { text-align: right; padding: 1px 4px; font-variant-numeric: tabular-nums; }
+  td:first-child, th:first-child { text-align: left; }
+  #inspect { white-space: pre-wrap; word-break: break-all; font: 12px ui-monospace, monospace; }
+  @media (max-width: 700px) { #map { inset: 0 0 45% 0; } #side { top: 55%; width: 100%; border-left: 0; border-top: 1px solid #ccc; } }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="side">
+  <select id="archive" aria-label="Archive"></select>
+  <div id="info"></div>
+  <h2>Layers</h2><div id="layers"></div>
+  <h2>Tiles per zoom</h2><div id="stats"></div>
+  <h2>Feature (hover)</h2><div id="inspect">Hover a feature.</div>
+</div>
+<script type="module">
+import * as maplibre from "https://unpkg.com/maplibre-gl@6.16.0/dist/maplibre-gl.mjs";
+
+const COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#8c564b", "#e377c2"];
+const map = new maplibre.Map({ container: "map", style: { version: 8, sources: {}, layers: [
+  { id: "bg", type: "background", paint: { "background-color": "#f4f4f2" } }] }, center: [0, 0], zoom: 1, hash: true });
+map.addControl(new maplibre.NavigationControl());
+const $ = (id) => document.getElementById(id);
+const text = (s) => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
+let drawn = [], loading = 0;
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (r.status === 503) throw new Error("the archive changed on disk and does not open yet");
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+function clear() {
+  for (const id of drawn) map.removeLayer(id);
+  if (map.getSource("a")) map.removeSource("a");
+  drawn = [];
+  $("layers").innerHTML = "";
+  $("stats").innerHTML = "";
+}
+
+async function load(name, fit) {
+  // A newer selection wins: drop this one's results once it is stale.
+  const me = ++loading;
+  $("archive").value = name;
+  const base = `/${encodeURIComponent(name)}`;
+  let tj;
+  try {
+    tj = await getJSON(`${base}.json`);
+  } catch (e) {
+    if (me !== loading) return;
+    // The map shows nothing rather than the previous archive under this name.
+    clear();
+    $("info").innerHTML = `Could not load ${text(name)}: ${text(e.message)}. <button id="retry">Retry</button>`;
+    $("retry").onclick = () => load(name, fit);
+    return;
+  }
+  if (me !== loading) return;
+  clear();
+  $("info").innerHTML = `${text(tj.encoding.toUpperCase())} tiles, z${tj.minzoom}–z${tj.maxzoom}`;
+  if (tj.variable_depth) $("info").innerHTML += "<br>Variable-depth archive: areas below a stopped tile show as holes.";
+  if (tj.encoding === "raster") {
+    map.addSource("a", { type: "raster", tiles: tj.tiles, attribution: tj.attribution, minzoom: tj.minzoom, maxzoom: tj.maxzoom });
+    map.addLayer({ id: "raster", type: "raster", source: "a" });
+    drawn = ["raster"];
+  } else {
+    map.addSource("a", { type: "vector", tiles: tj.tiles, minzoom: tj.minzoom, maxzoom: tj.maxzoom,
+      bounds: tj.bounds, encoding: tj.encoding, attribution: tj.attribution });
+    const layers = (Array.isArray(tj.vector_layers) ? tj.vector_layers : [])
+      .filter((l) => l && typeof l.id === "string");
+    if (!layers.length) $("layers").textContent = "The archive metadata lists no vector layers, so there is nothing to draw.";
+    layers.forEach((l, i) => {
+      const c = COLORS[i % COLORS.length], s = { source: "a", "source-layer": l.id };
+      const ids = [`${l.id}-fill`, `${l.id}-line`, `${l.id}-point`];
+      map.addLayer({ ...s, id: ids[0], type: "fill", filter: ["==", ["geometry-type"], "Polygon"],
+        paint: { "fill-color": c, "fill-opacity": 0.25 } });
+      map.addLayer({ ...s, id: ids[1], type: "line", filter: ["!=", ["geometry-type"], "Point"],
+        paint: { "line-color": c, "line-width": 1 } });
+      map.addLayer({ ...s, id: ids[2], type: "circle", filter: ["==", ["geometry-type"], "Point"],
+        paint: { "circle-color": c, "circle-radius": 3 } });
+      drawn.push(...ids);
+      const box = document.createElement("label");
+      box.innerHTML = `<input type="checkbox" checked> <span class="swatch" style="background:${c}"></span>${text(l.id)}`;
+      box.firstChild.onchange = (e) => ids.forEach((id) =>
+        map.setLayoutProperty(id, "visibility", e.target.checked ? "visible" : "none"));
+      $("layers").append(box);
+    });
+  }
+  if (fit) map.fitBounds(tj.bounds, { animate: false, padding: 20 });
+  // Statistics are optional: the tiles show whether or not they load.
+  $("stats").textContent = "Loading…";
+  try {
+    const st = await getJSON(`${base}/stats.json`);
+    if (me !== loading) return;
+    $("stats").innerHTML = "<table><tr><th>z</th><th>tiles</th><th>bytes</th><th>max</th></tr>" +
+      st.per_zoom.map((r) => `<tr><td>${r.z}</td><td>${r.tile_count.toLocaleString()}</td>` +
+        `<td>${r.total_bytes.toLocaleString()}</td><td>${r.max_bytes.toLocaleString()}</td></tr>`).join("") + "</table>";
+  } catch (e) {
+    if (me === loading) $("stats").textContent = `Unavailable: ${e.message}.`;
+  }
+}
+
+map.on("mousemove", (e) => {
+  const f = map.queryRenderedFeatures(e.point, { layers: drawn.filter((id) => map.getLayer(id)) })[0];
+  map.getCanvas().style.cursor = f ? "pointer" : "";
+  if (f) $("inspect").textContent = `${f.sourceLayer} (${f.geometry.type})\n` + JSON.stringify(f.properties, null, 1);
+});
+
+map.on("load", async () => {
+  let names;
+  try {
+    names = await getJSON("/index.json");
+  } catch (e) {
+    $("info").textContent = `Could not list the archives: ${e.message}.`;
+    return;
+  }
+  for (const n of names) $("archive").add(new Option(n, n));
+  $("archive").onchange = (e) => load(e.target.value, true);
+  // A shared link's #zoom/lat/lng wins over the first archive's bounds.
+  await load(names[0], !location.hash);
+});
+</script>
+</body>
+</html>

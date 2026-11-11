@@ -71,6 +71,20 @@ impl<W: Write + Send> BatchWriter<W> {
         self.0.write(batch)
     }
 
+    /// Bytes buffered for the row group in progress, not yet flushed.
+    pub fn in_progress_size(&self) -> usize {
+        self.0.in_progress_size()
+    }
+
+    /// End the row group in progress, writing its buffered rows out.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying encoding or I/O error.
+    pub fn flush(&mut self) -> Result<(), ParquetError> {
+        self.0.flush()
+    }
+
     /// Add file metadata before closing the writer.
     pub fn append_key_value_metadata(&mut self, metadata: KeyValue) {
         self.0.append_key_value_metadata(metadata);
