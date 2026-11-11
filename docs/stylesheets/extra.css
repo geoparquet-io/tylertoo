@@ -61,3 +61,20 @@
 [data-md-color-scheme="slate"] .md-typeset h6 {
   color: #fefdf3;
 }
+
+/* The tutorial result maps (docs/assets/tutorials/*-map.js). */
+.tutorial-map {
+  height: 28rem;
+  max-width: 100%;
+  border-radius: 0.2rem;
+}
+.tutorial-map-caption {
+  font-size: 0.7rem;
+  color: var(--md-default-fg-color--light);
+}
+.maplibregl-popup-content {
+  color: #05221d;
+}
+.maplibregl-popup-content table {
+  font-size: 0.7rem;
+}

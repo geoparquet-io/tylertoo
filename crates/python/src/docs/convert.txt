@@ -41,8 +41,8 @@ Args:
         `grid`, `h3`, `s2` and `a5` draw occupied grid cells.
         Cells and features share one tiles layer. Cells carry `cell`
         (the cell id), `point_count` (features counted by centroid)
-        and rollups. `accumulate_attributes` and `cluster_categories`
-        roll up into cells without `cluster`.
+        and per-cell totals. `accumulate_attributes` and
+        `cluster_categories` total into cells without `cluster`.
         Requires at least one feature band, with contiguous ranges.
         No overlaps. Uncovered zooms are empty, with a warning.
         Excludes `min_zoom`, `max_zoom`, `gsds` and `representation`.

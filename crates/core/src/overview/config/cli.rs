@@ -651,8 +651,8 @@ pub struct TilesArgs {
     /// Draw features or cells by zoom range. Repeat with LO-HI:KIND or
     /// Z:KIND (inclusive). Use geom, point or square for features; grid,
     /// h3, s2 or a5 for cells in the same layer. Requires contiguous
-    /// feature bands. No overlaps. Excludes --min-zoom, --max-zoom, --gsd
-    /// and --representation. See
+    /// feature bands. No overlaps. Excludes `--min-zoom`, `--max-zoom`,
+    /// `--gsd` and `--representation`. See
     /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
     // Exclusive with the zoom flags: clap's rule here, core's
     // (`ConfigError::BandWithZoomOption`) for Python's keywords.

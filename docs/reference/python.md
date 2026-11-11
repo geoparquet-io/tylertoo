@@ -549,6 +549,7 @@ convert(
     spill_dir: str | os.PathLike[str] | None = None,
     *,
     layer_column: str | None = None,
+    bands: Sequence[str] | None = None,
     include_properties: Sequence[str] | None = None,
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
@@ -635,6 +636,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `feature_order`: See `export_pmtiles()`.
 * `spill_dir`: Scratch directory for the intermediate overview and the export's spill (the CLI's `--spill-dir`). The intermediate is at least input-sized; without this it goes to `$TMPDIR`, then the output's directory. Set it when `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised when the chosen volume looks too small, whether or not the run then fails.
 * `layer_column`: Put each feature in the layer named by its value in this column (the CLI's `--layer-column`), and null or blank values in `"_unknown"`. The column is not written as a property. Each layer is tiled on its own and the layers are merged, so thinning and the tile size limits apply per layer. Excludes `layer_name`, `keep_overview`, `save_plan`, `plan` and `variable_depth`. At most 64 layers.
+* `bands`: The CLI's `--band`, a list of "LO-HI:KIND" strings. Ranges are inclusive; use "Z:KIND" for one zoom. Kinds `geom`, `point` and `square` draw features; `grid`, `h3`, `s2` and `a5` draw occupied grid cells. Cells and features share one tiles layer. Cells carry `cell` (the cell id), `point_count` (features counted by centroid) and per-cell totals. `accumulate_attributes` and `cluster_categories` total into cells without `cluster`. Requires at least one feature band, with contiguous ranges. No overlaps. Uncovered zooms are empty, with a warning. Excludes `min_zoom`, `max_zoom`, `gsds` and `representation`.
 * `include_properties`: See `overview()`.
 * `exclude_properties`: See `overview()`.
 * `exclude_all_properties`: See `overview()`.

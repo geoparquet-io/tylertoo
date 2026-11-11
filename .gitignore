@@ -33,6 +33,7 @@ tests/fixtures/output/
 tests/fixtures/large/
 *.pmtiles
 !tests/fixtures/golden/*.pmtiles
+!docs/assets/tutorials/*.pmtiles
 *.mvt
 
 # Coverage

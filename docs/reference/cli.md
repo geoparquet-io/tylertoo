@@ -67,6 +67,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | `--min-zoom <MIN_ZOOM>` | Minimum (coarsest) Web Mercator zoom. Default: `0`. |
 | `--max-zoom <MAX_ZOOM>` | Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a sample of the input; `auto:14` caps the estimate at z14. Ignored with `--gsd`. Default: `14`. |
 | `--gsd <GSDS>` | Comma-separated ground sample distances (GSDs) in meters, each smaller than the last. Overrides `--min-zoom` and `--max-zoom`. |
+| `--band <LO-HI:KIND>` | Draw features or cells by zoom range. Repeat with LO-HI:KIND or Z:KIND (inclusive). Use geom, point or square for features; grid, h3, s2 or a5 for cells in the same layer. Requires contiguous feature bands. No overlaps. Excludes `--min-zoom`, `--max-zoom`, `--gsd` and `--representation`. See <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
 | `--name <TEXT>` | Human-readable name stored in the archive metadata. |
 | `--description <TEXT>` | Description stored in the archive metadata. |
 | `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |

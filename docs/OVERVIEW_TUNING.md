@@ -379,6 +379,49 @@ tylertoo tiles fields.parquet fields.pmtiles --layer-column year
   because each layer runs its own convert (#839). So is
   `--generate-variable-depth-tile-pyramid`.
 
+### Cells and features by zoom: `tiles --band`
+
+Repeat `--band LO-HI:KIND` to choose what each zoom range shows. Python
+`convert(bands=[...])` takes the same strings. Ranges are inclusive;
+`Z:KIND` selects one zoom. Cells and features share the tiles layer, named by
+`--layer-name`. Style by zoom or by whether `point_count` is present.
+
+```bash
+tylertoo tiles fields.parquet fields.pmtiles \
+  --band 0-7:a5 --band 8-14:geom \
+  --accumulate-attribute metrics:area:sum
+```
+
+This draws A5 cells at z0-7 with field counts and summed `metrics:area`, then
+fields at z8-14. A cell total may share a property's name: below z8, `metrics:area`
+is the cell's sum; from z8 it is each field's own value.
+
+- `geom`, `point`, and `square` draw features as `--representation` does:
+  geometry, representative points for polygons, or placeholder squares for
+  small polygons. Feature bands set the zoom range, must be contiguous, and at least one is required.
+  `--band 0-7:point --band 8-14:geom` writes
+  the same archive as `--representation 0-7:point,8-14:geom --min-zoom 0 --max-zoom 14`.
+- `grid`, `h3`, `s2`, and `a5` use the pyramid cell systems and sizes below,
+  about a 4x4 pixel block of a tile per cell. Each zoom has one polygon per
+  occupied cell with `cell` (id), `point_count` (features whose centroid is
+  in the cell), and the `--accumulate-attribute` and `--cluster-categories` totals.
+  These totals need no `--cluster`; they also enter clusters when it is set.
+- Cells count every feature that `--filter`, `--bbox`, and `--mask` keep.
+  Geometry decides whether it is kept, as at feature zooms. The centroid
+  only picks the cell, so a field crossing the bbox may count in a cell outside it.
+- tylertoo opens the input once, reads it for cells, then tiles feature zooms
+  from the same source. Remote byte ranges are reused from local spill, so
+  cells add little network traffic. Each cell zoom tiles verbatim, without size caps.
+- `--band` excludes `--min-zoom`, `--max-zoom`, `--gsd`, and `--representation`.
+  Bands cannot overlap: one layer holds one representation per zoom. Uncovered
+  zooms hold no tiles, with a warning. A cell band also excludes
+  `--layer-column`, `--generate-variable-depth-tile-pyramid`, and `--tile-range`.
+- In sharded builds, cell bands must end below the plan's pivot. The coarse
+  job draws cells and feature zooms below it; data shards skip cells.
+  Bands are saved in the convert plan; every job must get the same `--band` flags.
+  The merged fleet holds the same tiles as an unsharded run.
+- For cells from another input, use `tylertoo pyramid` bands (`LO-HI:SYSTEM:INPUT`) below.
+
 ### Band sources and syntax
 
 A band accepts GeoParquet or PMTiles via `--band LO-HI:[SYSTEM:]PATH[:LAYER]`.
