@@ -736,9 +736,10 @@ impl<W: Write + Send> OverviewWriter<W> {
         self.write_level_from(level_idx, level_row_hint, batches.map(Ok))
     }
 
-    /// [`Self::write_level`] from batches that can fail to arrive. The first
-    /// error ends the level unwritten and poisons the writer, so a level its
-    /// source failed partway through never reaches a finished file.
+    /// [`Self::write_level`] from batches that can fail to arrive. Once the
+    /// level has started, any error (its source's or the writer's own) ends
+    /// it unwritten and poisons the writer, so a level that failed partway
+    /// through never reaches a finished file, nor a retry its row groups.
     pub(crate) fn write_level_from<E: From<WriterError>>(
         &mut self,
         level_idx: usize,
@@ -755,7 +756,20 @@ impl<W: Write + Send> OverviewWriter<W> {
             }
             .into());
         }
+        let written = self.write_level_rows(level_idx, level_row_hint, batches);
+        if written.is_err() {
+            self.failed = true;
+        }
+        written
+    }
 
+    /// The body of [`Self::write_level_from`], once the level is in order.
+    fn write_level_rows<E: From<WriterError>>(
+        &mut self,
+        level_idx: usize,
+        level_row_hint: Option<usize>,
+        batches: impl Iterator<Item = Result<RecordBatch, E>>,
+    ) -> Result<LevelWriteOutcome, E> {
         // Only the previous level's encodes may still run alongside this
         // one's: an older level's row groups are appended first.
         while self
@@ -803,7 +817,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             // serial path.
             let mut wkb_inflight: VecDeque<Receiver<WkbEncodeResult>> = VecDeque::new();
             for batch in batches {
-                let batch = self.arrived(batch)?;
+                let batch = batch?;
                 // A zero-row batch moves no rows, no covering, and no
                 // row-group boundary — skip it. (The serial path feeds it to
                 // the shared encoder, where it is a covering no-op as well.)
@@ -831,7 +845,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             // Serial reference path: the shared encoder both encodes and
             // accumulates the file-level covering, in read order.
             for batch in batches {
-                let batch = self.arrived(batch)?;
+                let batch = batch?;
                 // Skip empty batches, exactly as the parallel path does. Beyond
                 // saving a no-op encode, this keeps the two paths' file-level
                 // `geo` bbox identical: the encoder folds each batch's bounds
@@ -881,15 +895,6 @@ impl<W: Write + Send> OverviewWriter<W> {
         self.written_spec_indices.push(level_idx);
         self.next_level_idx += 1;
         Ok(LevelWriteOutcome::Written)
-    }
-
-    /// A batch [`Self::write_level_from`] was handed, or its source's error,
-    /// which poisons the writer.
-    fn arrived<E>(&mut self, batch: Result<RecordBatch, E>) -> Result<RecordBatch, E> {
-        if batch.is_err() {
-            self.failed = true;
-        }
-        batch
     }
 
     /// Append the NOT NULL `level` column (§4.1) — set to the level's physical
@@ -2384,6 +2389,38 @@ mod tests {
         let sink: Vec<u8> = Vec::new();
         let result = OverviewWriter::try_new(sink, &schema, opts);
         assert!(matches!(result, Err(WriterError::LevelColumnExists)));
+    }
+
+    /// #852 review: an error after a level has started (here a batch that
+    /// does not fit the schema, behind one that did) poisons the writer, so
+    /// neither a retry of the level nor `finish` can keep its first rows.
+    #[test]
+    fn a_level_that_fails_partway_poisons_the_writer() {
+        let schema = Arc::new(source_schema());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut opts = duplicating_options();
+        opts.levels.truncate(1);
+        opts.max_row_group_size = 2;
+        let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+        let good = source_batch(&schema, &[0, 1]);
+        let mut columns = good.columns().to_vec();
+        columns[1] = Arc::new(Int64Array::from(vec![0, 1]));
+        let bad = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                schema.field(0).clone(),
+                Field::new("name", DataType::Int64, false),
+                schema.field(2).clone(),
+            ])),
+            columns,
+        )
+        .unwrap();
+        assert!(writer
+            .write_level(0, Some(4), [good.clone(), bad].into_iter())
+            .is_err());
+        assert!(writer
+            .write_level(0, Some(2), std::iter::once(good))
+            .is_err());
+        assert!(writer.finish().is_err());
     }
 
     #[test]
