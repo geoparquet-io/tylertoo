@@ -84,7 +84,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 #### Input and levels
 
-* `input`: GeoParquet: `EPSG:4326` and `EPSG:3857` are read directly; other CRSs with an EPSG code and usable proj4 definition are reprojected to `EPSG:4326` as they are read, otherwise refused (use `gpio convert reproject` first). Reprojection uses no grid shifts: datum changes can differ from PROJ/pyproj by metres (around 100 m for EPSG:27700), while same-datum projections match to under a centimetre. Pass a file, directory, glob, `s3://`, `gs://`, or `https://` URL or prefix, or a list of files. First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas) to a GeoParquet file using `gpio` or DuckDB `COPY (... ORDER BY ST_Hilbert(...)) TO 'x.parquet'`.
+* `input`: GeoParquet: `EPSG:4326` and all-`EPSG:3857` inputs are read directly; `EPSG:3857` parts mixed with other CRSs are reprojected to `EPSG:4326`; other CRSs with an EPSG code and usable proj4 definition are reprojected to `EPSG:4326` as they are read, otherwise refused (use `gpio convert reproject` first). Reprojection uses no grid shifts: datum changes can differ from PROJ/pyproj by metres (around 100 m for EPSG:27700), while same-datum projections match to under a centimetre. Pass a file, directory, glob, `s3://`, `gs://`, or `https://` URL or prefix, or a list of files. First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas) to a GeoParquet file using `gpio` or DuckDB `COPY (... ORDER BY ST_Hilbert(...)) TO 'x.parquet'`.
 * `output`: Overview file to write.
 * `mode`: `"duplicating"` makes each level a complete map; `"partitioning"` stores each feature once.
 * `min_zoom`: Coarsest zoom.
