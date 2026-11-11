@@ -56,7 +56,8 @@ fn points_match_pyproj() {
 #[test]
 fn unresolvable_crs_has_no_transform() {
     // No id, an unknown code, a geocentric CRS, and no declaration at all.
-    for id in ["Amersfoort / RD New", "EPSG:1", "EPSG:4978"] {
+    // EPSG:4807 counts its lon/lat in grads, which proj4 cannot say.
+    for id in ["Amersfoort / RD New", "EPSG:1", "EPSG:4978", "EPSG:4807"] {
         assert!(ToLonLat::for_crs(&crs(id)).is_none(), "{id}");
     }
     assert!(ToLonLat::for_crs(&CrsInfo::unknown()).is_none());

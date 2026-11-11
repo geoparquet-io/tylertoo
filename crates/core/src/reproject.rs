@@ -56,7 +56,11 @@ impl ToLonLat {
             .collect::<Vec<_>>()
             .join(" ");
         let src = Proj::from_proj_string(&proj4).ok()?;
-        if src.is_geocent() || !src.has_inverse() {
+        // shortcut: a geographic CRS off Greenwich is refused, as the Paris
+        // ones count grads and proj4 has no angular unit; read units from
+        // PROJJSON if one in degrees is needed.
+        let off_greenwich = src.is_latlong() && proj4.contains("+pm=");
+        if src.is_geocent() || !src.has_inverse() || off_greenwich {
             return None;
         }
         let dst = Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs").ok()?;
