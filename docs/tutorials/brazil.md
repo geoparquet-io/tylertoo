@@ -14,6 +14,6 @@ click a feature to see its properties.
 <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/pmtiles@3.2.1/dist/pmtiles.js"></script>
-<script src="../../assets/tutorials/brazil-map.js"></script>
+<script src="../assets/tutorials/brazil-map.js"></script>
 
 --8<-- "examples/brazil-fields/README.md:run"
