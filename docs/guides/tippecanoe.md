@@ -18,6 +18,55 @@ caveats, see [benchmarks](../benchmarks.md).
 To start from tippecanoe's defaults instead of tylertoo's, pass
 `--preset tippecanoe`; see [the tippecanoe preset](#the-tippecanoe-preset).
 
+## Why middle zooms can keep more features
+
+The two default pipelines use different thinning ladders. More features at
+a middle zoom do not by themselves show a clipping or encoding error.
+
+- **The default rate differs.** Both tools anchor their default drop
+  ladders at the finest zoom and keep all features there before tile size
+  limits apply. For kinds that tylertoo's budget thins, level `L`
+  has a budget of `max(256, round(N / 1.65^(finest − L)))`, where `N` is
+  the full canonical count of those kinds. Tippecanoe's documented `-r`
+  default is 2.5. Its `-B` base zoom defaults to the maximum zoom (`-z`).
+  The Portland sweep calibrated tylertoo's 1.65 with cell selection, which
+  already thins coarse zooms. See the sweep below and tippecanoe's
+  [documented defaults](https://github.com/felt/tippecanoe#dropping-a-fixed-fraction-of-features-by-zoom-level).
+  Matching zooms and passing the same rate do not make the selection
+  algorithms equivalent. tylertoo also keeps one candidate in tiles the
+  density budget would otherwise empty, which can exceed the budget.
+- **Cell selection comes first.** tylertoo chooses cell winners before
+  applying the budget as a ceiling. It does not add features if cell
+  selection keeps fewer than that ceiling. At middle zooms the cells can
+  be small enough for almost every eligible feature to win. The budget then
+  limits points. Lines and polygons are exempt unless you set `--drop-lines`
+  or `--drop-polygons`. Tippecanoe also exempts lines and polygons
+  from its default drop rate. Their count difference needs the visibility,
+  collapse, coalescing, and size-valve settings as well as the rate.
+- **Oversized tiles take different paths.** Tippecanoe defaults to
+  500,000 compressed bytes and 200,000 features per tile. See its
+  [tile limits](https://github.com/felt/tippecanoe#setting-or-disabling-tile-size-limits).
+  It retries at lower detail and can fail if a tile still exceeds its limits; dropping
+  or coalescing as needed takes extra flags. tylertoo defaults to 512,000
+  compressed bytes and 2 MiB uncompressed, with no feature-count cap. Its
+  default size valve merges dense lines and polygons. The limits do not
+  imply the tools will drop the same features.
+
+The [Portland sweep](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md#decision-2---drop-rate-165-q2-density-budget)
+found 2.89× and 3.57× tippecanoe's distinct-feature counts at z9 and z10
+with cell selection alone. A rate of 1.65 brought those ratios to 1.21×
+and 1.03×; 2.5 fell below tippecanoe. That historical line sweep predates
+the points-only default budget. It explains the rate choice, not a
+count guarantee for current inputs. Some zooms and datasets keep fewer
+features than tippecanoe.
+
+See the [density budget](../OVERVIEW_TUNING.md#density-budget-drop-rate-drop-gamma-no-density-drop)
+and [architecture divergences](https://github.com/geoparquet-io/tylertoo/blob/main/context/ARCHITECTURE.md#known-divergences-from-tippecanoe-overview-pipeline).
+`--preset tippecanoe` aligns matching options. See the
+[differences the preset does not remove](#the-tippecanoe-preset).
+Compare the same input, zoom range, and flags before
+attributing a count difference to one default.
+
 ## Flag mapping
 
 | tippecanoe | tylertoo | Note |
@@ -30,7 +79,7 @@ To start from tippecanoe's defaults instead of tylertoo's, pass
 | `-n` name / `-N` description / `-A` attribution | `--name` / `--description` / `--attribution` | An unset field is left out of the archive. tippecanoe names the tileset after the output file and copies the name into `description`. `merge` and `pyramid` keep every inherited credit; see [attribution](attribution.md) |
 | `-b` buffer (default 5) | `--tile-buffer` (default 8) | Tile-pixel seam buffer |
 | `-y` / `-x` / `-X` property selection | `--include-property` / `--exclude-property` / `--exclude-all-properties` | Applied during scans for `overview` / `tiles`, during export for `export-pmtiles`. In both tools, an include list overrides exclusions |
-| `-r` drop rate (default 2.5) | `--drop-rate` (default 1.65) | Same geometric ladder. tylertoo anchors on the full canonical count, so the default differs. Thins points only by default, as in tippecanoe |
+| `-r` drop rate (default 2.5) | `--drop-rate` (default 1.65) | Both default ladders anchor at the finest zoom. tylertoo applies its budget as a ceiling after cell selection. Thins points only by default, as in tippecanoe |
 | `--drop-lines` / `--drop-polygons` | `--drop-lines` / `--drop-polygons` | Apply the drop rate to lines and polygons too |
 | gamma dot-dropping | `--drop-gamma` | Applied per super-cell; per-level totals stay unchanged |
 | `-S` simplification | `--simplify-factor` | Ramer-Douglas-Peucker (RDP), cascading by default. `-S N` is N tile units; `--simplify-factor N/4` is about the same at z0 to max zoom − 1. tylertoo does not simplify the max zoom; tippecanoe does |
@@ -102,10 +151,8 @@ Differences the preset does not remove:
   while the gate stays on drops those short segments. Pass
   `--no-coalesce-lines` to turn it off.
 - **Point thinning.** tylertoo also thins points on a grid (`--point-thinning`,
-  4 GSDs) before the drop rate applies, and anchors the drop rate on the
-  whole canonical count rather than on each tile's base zoom. tippecanoe
-  thins by drop rate alone. Pass `--point-thinning 0` to rely on the drop
-  rate only.
+  4 GSDs) before applying the drop-rate budget as a ceiling. tippecanoe
+  thins by drop rate alone. Pass `--point-thinning 0` to turn off the grid.
 - **No default feature id (#443).** tippecanoe copies each GeoJSON
   feature's `id`. GeoParquet has no feature id, and a preset cannot name a
   column, so tiles carry an id only with `--feature-id COLUMN`.
@@ -140,8 +187,10 @@ Differences the preset does not remove:
   statistics cannot match. See [what gets skipped](remote-reads.md#what-gets-skipped).
 - **Bounds its memory.** Conversion streams the input in batches, so peak
   memory follows the largest row group and the feature count, not the file
-  size. `--profile bounded` spills buffered levels to disk for the smallest
-  footprint. See [one machine, bounded memory](scaling.md#one-machine-bounded-memory).
+  size. `--profile bounded` spills buffered levels to disk and starts with
+  fixed concurrency caps. The drain can add encodes using released batch
+  memory, within headroom below the prior RSS peak. See
+  [one machine, bounded memory](scaling.md#one-machine-bounded-memory).
 - **Uses every core.** Reading, generalization, and tile encoding run in
   parallel; on the benchmark host tylertoo kept 19–29 of 64 cores busy, to
   tippecanoe's 2–3. See [benchmarks](../benchmarks.md).
