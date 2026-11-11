@@ -1894,8 +1894,8 @@ fn plan_level_groups(
 /// group whose encodes keep up still overlaps every level.
 ///
 /// A multi-wave level's waves overlap (#817). Under `bounded` the cap is
-/// the largest wave plus [`BOUNDED_WAVE_SLACK_PERMILLE`], which its plan
-/// priced in (#815): the next wave is admitted once the wave before it has
+/// the largest wave plus [`BOUNDED_WAVE_SLACK_PERMILLE`], with no
+/// [`PARTITION_WAVE_MIN`] floor, which its plan priced in (#815): the next wave is admitted once the wave before it has
 /// at most the slack left, so its last tiles no longer idle the pool. A
 /// `member_cap` of 0 is the serial schedule.
 fn group_schedule(
@@ -1913,12 +1913,11 @@ fn group_schedule(
         })
         .max()
         .unwrap_or(0);
-    let floor = largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN));
+    // Bounded has no full-target floor: its multi-wave levels plan at a
+    // quarter target, and a guard-narrowed wave must stay what was priced.
     let cap = member_cap.min(match profile {
-        MemoryProfile::Bounded => {
-            floor.saturating_add(with_bounded_slack(largest_wave) - largest_wave)
-        }
-        _ => floor,
+        MemoryProfile::Bounded => with_bounded_slack(largest_wave),
+        _ => largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN)),
     });
     let gate = GroupGate {
         cap,
@@ -12295,6 +12294,11 @@ mod tests {
         assert_eq!(*in_flight.held.lock().unwrap(), 4);
         drop(first);
         assert_eq!(*in_flight.held.lock().unwrap(), 0);
+        // A level the density guard narrowed to two quarter-size partitions
+        // holds its wave plus the slack, not six full-target partitions.
+        let narrowed = vec![plan_with_members(5, &[4; 16], 2)];
+        let (_, gate) = group_schedule(1_000, &narrowed, 100, MemoryProfile::Bounded);
+        assert_eq!(gate.cap, with_bounded_slack(8));
         // Auto keeps its cap; a member cap below the wave still bounds it.
         assert_eq!(
             group_schedule(1_000, &plans, 1, MemoryProfile::Auto).1.cap,
