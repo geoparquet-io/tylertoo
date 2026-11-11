@@ -435,6 +435,7 @@ pub tylertoo_core::CoveringWarning::NoUsableSample
 pub tylertoo_core::CoveringWarning::NotFloat64
 pub tylertoo_core::CoveringWarning::OutOfCrsRange(usize)
 pub tylertoo_core::CoveringWarning::ReadFailed(alloc::string::String)
+pub tylertoo_core::CoveringWarning::Reprojected
 pub tylertoo_core::CoveringWarning::UnknownCrs
 pub tylertoo_core::CoveringWarning::UnsupportedPath
 impl core::clone::Clone for tylertoo_core::CoveringWarning
