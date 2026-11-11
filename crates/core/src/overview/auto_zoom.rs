@@ -752,7 +752,9 @@ pub(crate) fn estimate_with(
     // `--max-zoom auto` into a hard `AutoZoomNoSignal` whose message blames
     // "fewer than two distinct locations", naming neither the covering nor
     // the real cause, on a file whose geometries are perfectly fine.
-    let sample = |covering: Option<&(usize, [String; 4])>| -> Result<SampledSignals, ConvertError> {
+    let sample = |covering: Option<&(usize, [String; 4])>,
+                  stride: u64|
+     -> Result<SampledSignals, ConvertError> {
         let sample_idx = covering.map_or(geom_idx, |(idx, _)| *idx);
         let mut cols = vec![sample_idx];
         if let Some(f) = &bound_filter {
@@ -846,58 +848,77 @@ pub(crate) fn estimate_with(
         Ok(SampledSignals { diags_m, centers })
     };
 
-    let (
-        SampledSignals {
+    let estimate = |stride: u64| -> Result<AutoZoomEvidence, ConvertError> {
+        let (
+            SampledSignals {
+                diags_m,
+                mut centers,
+            },
+            used_covering,
+        ) = match declared.as_ref() {
+            None => (sample(None, stride)?, false),
+            Some(cv) => match sample(Some(cv), stride) {
+                Ok(got) if !got.centers.is_empty() => (got, true),
+                // The sample is capped at AUTO_ZOOM_SAMPLE_CAP rows either way,
+                // so the retry is bounded; and when the geometry path finds
+                // nothing either, the resulting AutoZoomNoSignal is the honest
+                // answer rather than an artifact of the sidecar.
+                Ok(_) => {
+                    diagnostics.once(Diagnostic::CoveringRejected {
+                        count: 1,
+                        reason: CoveringWarning::NoUsableSample,
+                    });
+                    (sample(None, stride)?, false)
+                }
+                Err(e) => {
+                    diagnostics.once(Diagnostic::CoveringRejected {
+                        count: 1,
+                        reason: CoveringWarning::ReadFailed(e.to_string()),
+                    });
+                    (sample(None, stride)?, false)
+                }
+            },
+        };
+
+        let sampled_count = centers.len();
+        centers.sort_by_key(|&(cx, cy)| morton_key(cx, cy, crs));
+        let gaps_m: Vec<f64> = centers
+            .windows(2)
+            .map(|w| {
+                let mid_y = (w[0].1 + w[1].1) * 0.5;
+                mercator_delta_m(w[1].0 - w[0].0, w[1].1 - w[0].1, mid_y, crs)
+            })
+            .collect();
+
+        let mut evidence = choose_auto_max_zoom(
+            rows_read,
+            sampled_count,
             diags_m,
-            mut centers,
-        },
-        used_covering,
-    ) = match declared.as_ref() {
-        None => (sample(None)?, false),
-        Some(cv) => match sample(Some(cv)) {
-            Ok(got) if !got.centers.is_empty() => (got, true),
-            // The sample is capped at AUTO_ZOOM_SAMPLE_CAP rows either way,
-            // so the retry is bounded; and when the geometry path finds
-            // nothing either, the resulting AutoZoomNoSignal is the honest
-            // answer rather than an artifact of the sidecar.
-            Ok(_) => {
-                diagnostics.once(Diagnostic::CoveringRejected {
-                    count: 1,
-                    reason: CoveringWarning::NoUsableSample,
-                });
-                (sample(None)?, false)
-            }
-            Err(e) => {
-                diagnostics.once(Diagnostic::CoveringRejected {
-                    count: 1,
-                    reason: CoveringWarning::ReadFailed(e.to_string()),
-                });
-                (sample(None)?, false)
-            }
-        },
+            gaps_m,
+            1.0 / stride as f64,
+            min_zoom,
+            ceiling,
+        )?;
+        evidence.sampled_from_covering = used_covering;
+        Ok(evidence)
     };
 
-    let sampled_count = centers.len();
-    centers.sort_by_key(|&(cx, cy)| morton_key(cx, cy, crs));
-    let gaps_m: Vec<f64> = centers
-        .windows(2)
-        .map(|w| {
-            let mid_y = (w[0].1 + w[1].1) * 0.5;
-            mercator_delta_m(w[1].0 - w[0].0, w[1].1 - w[0].1, mid_y, crs)
-        })
-        .collect();
-
-    let mut evidence = choose_auto_max_zoom(
-        rows_read,
-        sampled_count,
-        diags_m,
-        gaps_m,
-        1.0 / stride as f64,
-        min_zoom,
-        ceiling,
-    )?;
-    evidence.sampled_from_covering = used_covering;
-    Ok(evidence)
+    match estimate(stride) {
+        // The fixed-offset sample can miss every row a row-level test keeps
+        // (a small mask part in a broad mask bbox, a rare filter value):
+        // re-read the selected rows whole, once, as conversion will.
+        Err(ConvertError::AutoZoomNoSignal { .. })
+            if stride > 1
+                && (mask_index.is_some() || bound_filter.is_some() || bbox_query.is_some()) =>
+        {
+            log::debug!(
+                "[auto-zoom] stride-{stride} sample found no signal under --bbox/--mask/--filter; \
+                 re-sampling all {rows_read} selected rows"
+            );
+            estimate(1)
+        }
+        r => r,
+    }
 }
 
 #[cfg(test)]
@@ -1932,6 +1953,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(masked.sampled_count, 100);
+    }
+
+    /// #826: rows a mask or filter keeps can all sit between the stride's
+    /// fixed offsets; the estimate re-reads the selected rows whole instead
+    /// of failing with no signal on data that converts fine.
+    #[test]
+    fn a_mask_or_filter_between_stride_offsets_still_finds_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        // Stride 3 samples rows 0, 3, 6, ...; only rows 1 and 4 match.
+        let n = 2 * AUTO_ZOOM_SAMPLE_CAP + 1;
+        let geoms: Vec<Option<Geometry<f64>>> = (0..n)
+            .map(|i| {
+                let p = match i {
+                    1 => Point::new(10.0, 10.0),
+                    4 => Point::new(10.001, 10.001),
+                    _ => Point::new(50.0, 50.0),
+                };
+                Some(Geometry::Point(p))
+            })
+            .collect();
+        let source = write(&dir, "sparse.parquet", &geoms);
+        let mask = dir.path().join("mask.geojson");
+        std::fs::write(
+            &mask,
+            r#"{"type":"Polygon","coordinates":[[[9,9],[11,9],[11,11],[9,11],[9,9]]]}"#,
+        )
+        .unwrap();
+        let mask = super::super::mask::MaskSource::Path(mask);
+        for (filter, mask) in [(None, Some(&mask)), (Some("id = 1 OR id = 4"), None)] {
+            let got = estimate_with(
+                &source,
+                0,
+                AUTO_MAX_ZOOM_CEILING,
+                None,
+                filter,
+                mask,
+                MemoryProfile::default(),
+            )
+            .unwrap_or_else(|e| panic!("filter {filter:?}, mask {}: {e}", mask.is_some()));
+            assert_eq!(got.sampled_count, 2);
+        }
     }
 
     /// #643: a western-hemisphere bbox scopes the estimate over a 0..360
