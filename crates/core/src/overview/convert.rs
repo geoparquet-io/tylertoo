@@ -6785,6 +6785,16 @@ pub(super) fn coalesce_max_geom_bytes(options: &ConvertOptions) -> u64 {
     (options.coalesce_max_level_rows as u64).saturating_mul(COALESCE_NOMINAL_BYTES_PER_LINE)
 }
 
+/// The line-count limb of the coalescing memory guard:
+/// `coalesce_max_level_rows`, never above what one level's chaining can index
+/// ([`super::coalesce::MAX_CHAIN_LINES`]), so `usize::MAX` ("never guard")
+/// skips coalescing on a larger input instead of panicking in the join.
+pub(super) fn coalesce_max_rows(options: &ConvertOptions) -> usize {
+    options
+        .coalesce_max_level_rows
+        .min(super::coalesce::MAX_CHAIN_LINES)
+}
+
 /// Whether coalescing is effectively active for this conversion: enabled,
 /// and the candidate lines fit the memory guard — **both** limbs of it, the
 /// row count and the geometry bytes those rows retain
@@ -6807,14 +6817,12 @@ pub(super) fn coalesce_effective(
         return false;
     }
     let max_bytes = coalesce_max_geom_bytes(options);
-    let rows_over = num_lines > options.coalesce_max_level_rows;
+    let max_rows = coalesce_max_rows(options);
+    let rows_over = num_lines > max_rows;
     let bytes_over = line_bytes > max_bytes;
     if rows_over || bytes_over {
         diagnostics.warn(coalesce_skipped_message(
-            num_lines,
-            line_bytes,
-            options.coalesce_max_level_rows,
-            max_bytes,
+            num_lines, line_bytes, max_rows, max_bytes,
         ));
         return false;
     }
@@ -13972,6 +13980,23 @@ mod tests {
         }
         assert!(validate_file(t_tight.path()).unwrap().is_valid());
         assert_streaming_equivalent(tin.path(), &tight);
+    }
+
+    /// "Never guard" (`usize::MAX`) still skips coalescing on more lines than
+    /// one level's chaining can index, rather than reaching the join's u32
+    /// packing (#851 review). Totals only: no lines are built.
+    #[test]
+    fn coalesce_guard_caps_rows_at_what_chaining_can_index() {
+        let options = ConvertOptions {
+            coalesce_lines: true,
+            coalesce_max_level_rows: usize::MAX,
+            ..ConvertOptions::default()
+        };
+        let cap = super::super::coalesce::MAX_CHAIN_LINES;
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        assert_eq!(coalesce_max_rows(&options), cap);
+        assert!(coalesce_effective(&options, cap, 0, &diagnostics));
+        assert!(!coalesce_effective(&options, cap + 1, 0, &diagnostics));
     }
 
     /// #569 review: the skip warning names the limb that tripped and prints

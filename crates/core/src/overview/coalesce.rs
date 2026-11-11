@@ -232,6 +232,13 @@ type End = u8;
 /// A free end in `join_walks`' packed join table.
 const NO_JOIN: u32 = u32::MAX;
 
+/// Most candidate lines one level's chaining takes: [`join_walks`] packs a
+/// piece and an end into a `u32`, and a level has at most one piece per
+/// line. The pipeline's memory guard never admits more
+/// ([`super::convert::coalesce_max_rows`]), so the guard skips coalescing
+/// rather than `join_walks` panicking.
+pub(super) const MAX_CHAIN_LINES: usize = (NO_JOIN >> 1) as usize - 1;
+
 /// Quantized endpoint node key, namespaced by compatibility group.
 type NodeKey = (u32, i64, i64);
 
@@ -903,10 +910,7 @@ fn join_walks<'c>(
     // writes this node's own `joins` slots, so the order the runs are
     // visited in cannot affect the result either (as before, when it was
     // hash order).
-    assert!(
-        u32::try_from(n).is_ok_and(|n| n < NO_JOIN >> 1),
-        "{n} pieces overflow a packed u32 end"
-    );
+    assert!(n <= MAX_CHAIN_LINES, "{n} pieces overflow a packed u32 end");
     let mut incidents: Vec<Incident> = Vec::with_capacity(n * 2);
     for pi in 0..n {
         let c = coords(pi);

@@ -5925,7 +5925,7 @@ impl LineScratch {
             geoms: Vec::new(),
             lines: 0,
             bytes: 0,
-            max_rows: options.coalesce_max_level_rows,
+            max_rows: super::convert::coalesce_max_rows(options),
             max_bytes: super::convert::coalesce_max_geom_bytes(options),
         }
     }
