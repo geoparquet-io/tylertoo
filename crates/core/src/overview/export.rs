@@ -3108,6 +3108,7 @@ fn fill_backing(
         Mode::Partitioning,
         buffered_rows,
         mean_member_bytes,
+        None,
     );
     log::info!(
         "[export] pass2 single-read fan-out (#235): ~{buffered_rows} buffered \

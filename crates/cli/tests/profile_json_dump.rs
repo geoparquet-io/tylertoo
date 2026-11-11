@@ -506,8 +506,9 @@ const CONVERT_PHASES: [&str; 6] = [
 
 /// #571: the `rss_sampler` object inside `holder` (the convert line itself,
 /// or its `export` object). Every phase the run entered has an entry however
-/// short it was, `true_peak_mib` is the max over them, and it is never below
-/// the boundary-sampled `peak_rss_mib` it sits next to.
+/// short it was, and `true_peak_mib` is the max over them. Export's
+/// boundary-sampled `peak_rss_mib` never exceeds it; convert's is the run's
+/// peak (the kernel's `VmHWM` included), so it never falls below it.
 fn check_rss_sampler(line: &serde_json::Value, holder: &serde_json::Value, phases: &[&str]) {
     let sampler = &holder["rss_sampler"];
     assert_eq!(
@@ -540,11 +541,19 @@ fn check_rss_sampler(line: &serde_json::Value, holder: &serde_json::Value, phase
         true_peak, max_phase,
         "rss_sampler.true_peak_mib must be the max over phase_peaks_mib: {line}"
     );
-    assert!(
-        true_peak >= boundary,
-        "rss_sampler.true_peak_mib ({true_peak}) must not be below the \
-         boundary-sampled peak_rss_mib ({boundary}): {line}"
-    );
+    if holder["phase"] == "convert" {
+        assert!(
+            boundary >= true_peak,
+            "convert's peak_rss_mib ({boundary}) must not be below \
+             rss_sampler.true_peak_mib ({true_peak}): {line}"
+        );
+    } else {
+        assert!(
+            true_peak >= boundary,
+            "rss_sampler.true_peak_mib ({true_peak}) must not be below the \
+             boundary-sampled peak_rss_mib ({boundary}): {line}"
+        );
+    }
     check_627_breakdown(line, sampler, phases);
     check_saturation(line, holder, phases);
 }

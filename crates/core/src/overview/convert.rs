@@ -5894,21 +5894,7 @@ pub(super) fn build_level_batch(
     let mut non_geom_iter = non_geom_cols.iter();
     for i in 0..source_schema.fields().len() {
         if i == geom_idx {
-            // Same extension metadata as the field it fills (which
-            // `mixed_geometry_field` already stamped), so the array and the
-            // schema can never disagree about the CRS (#519).
-            let typ = GeometryType::new(Arc::new(
-                geoarrow::datatypes::Metadata::try_from(source_schema.field(geom_idx))
-                    .unwrap_or_default(),
-            ));
-            let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
-            for g in geoms {
-                let g = g.borrow();
-                let flat = flatten_nested_collections(g);
-                b.push_geometry(Some(flat.as_ref().unwrap_or(g)))
-                    .map_err(|e| arrow_schema::ArrowError::InvalidArgumentError(e.to_string()))?;
-            }
-            columns.push(b.finish().to_array_ref());
+            columns.push(build_geometry_column(source_schema, geom_idx, geoms)?);
         } else {
             let src_col = *non_geom_iter.next().expect("non-geom column index");
             let taken = take(full.column(src_col).as_ref(), &take_idx, None)?;
@@ -5919,6 +5905,29 @@ pub(super) fn build_level_batch(
         Arc::new(source_schema.clone()),
         columns,
     )?)
+}
+
+/// One level batch's geometry column, typed as `source_schema`'s geometry
+/// field.
+pub(super) fn build_geometry_column(
+    source_schema: &Schema,
+    geom_idx: usize,
+    geoms: &[impl std::borrow::Borrow<Geometry<f64>>],
+) -> Result<Arc<dyn Array>, ConvertError> {
+    // Same extension metadata as the field it fills (which
+    // `mixed_geometry_field` already stamped), so the array and the
+    // schema can never disagree about the CRS (#519).
+    let typ = GeometryType::new(Arc::new(
+        geoarrow::datatypes::Metadata::try_from(source_schema.field(geom_idx)).unwrap_or_default(),
+    ));
+    let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
+    for g in geoms {
+        let g = g.borrow();
+        let flat = flatten_nested_collections(g);
+        b.push_geometry(Some(flat.as_ref().unwrap_or(g)))
+            .map_err(|e| arrow_schema::ArrowError::InvalidArgumentError(e.to_string()))?;
+    }
+    Ok(b.finish().to_array_ref())
 }
 
 /// A GeometryCollection that contains other collections, flattened into one
@@ -6475,16 +6484,24 @@ pub(super) fn apply_coalesced_count(
     global_indices: &[usize],
     table: Option<&CoalesceTable>,
 ) -> Result<RecordBatch, ConvertError> {
-    use arrow_array::Int32Array;
-
     debug_assert_eq!(batch.num_rows(), global_indices.len());
     let mut columns: Vec<Arc<dyn Array>> = batch.columns().to_vec();
+    columns.push(coalesced_count_column(global_indices, table));
+    Ok(RecordBatch::try_new(Arc::new(out_schema.clone()), columns)?)
+}
+
+/// The `coalesced_count` column for rows `global_indices`: a chain rep's
+/// merged count, 1 for every other row.
+pub(super) fn coalesced_count_column(
+    global_indices: &[usize],
+    table: Option<&CoalesceTable>,
+) -> Arc<dyn Array> {
+    use arrow_array::Int32Array;
     let counts: Vec<i32> = global_indices
         .iter()
         .map(|g| table.and_then(|t| t.get(g)).map_or(1, |(_, c)| *c))
         .collect();
-    columns.push(Arc::new(Int32Array::from(counts)));
-    Ok(RecordBatch::try_new(Arc::new(out_schema.clone()), columns)?)
+    Arc::new(Int32Array::from(counts))
 }
 
 /// Incremental string→id interner for coalescing compatibility groups.

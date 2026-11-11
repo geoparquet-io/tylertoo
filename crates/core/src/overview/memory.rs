@@ -96,6 +96,19 @@ pub(super) enum MemoryPhase {
 impl MemoryPhase {
     /// Number of phases: the length of the per-phase ledger.
     const COUNT: usize = 11;
+    const ALL: [Self; Self::COUNT] = [
+        Self::Scan,
+        Self::Assign,
+        Self::Stage,
+        Self::Read,
+        Self::Compute,
+        Self::Encode,
+        Self::Write,
+        Self::Spill,
+        Self::ExportCollect,
+        Self::ExportEncode,
+        Self::Fill,
+    ];
 
     pub(super) fn name(self) -> &'static str {
         match self {
@@ -293,14 +306,38 @@ impl MemoryBudget {
         };
         rows.saturating_mul(per_row)
     }
-    pub(super) fn sink_estimate(self, mode: Mode, rows: usize, geometry: Option<u64>) -> u64 {
-        if matches!(mode, Mode::Duplicating) {
-            self.estimate(MemoryPhase::Write, rows as u64, geometry)
-        } else {
-            (rows as u64).saturating_mul(geometry.filter(|b| *b > 0).map_or(16384, |b| {
-                SINK_ROW_ALLOC_OVERHEAD_BYTES.saturating_add(b.saturating_mul(4))
-            }))
+    /// What one buffered pass-2 output row holds (#852): the footers'
+    /// decoded input row when known, since every level keeps the row's
+    /// properties and simplifying only shrinks its geometry; otherwise the
+    /// per-mode model from the geometry weight. The one price of an output
+    /// row: the sink decision, the spill reservation and the writer's
+    /// encodes all read it.
+    pub(super) fn output_row_bytes(
+        self,
+        mode: Mode,
+        geometry: Option<u64>,
+        row_bytes: Option<u64>,
+    ) -> u64 {
+        if let Some(row) = row_bytes.filter(|r| *r > 0) {
+            return row;
         }
+        if matches!(mode, Mode::Duplicating) {
+            self.estimate(MemoryPhase::Write, 1, geometry)
+        } else {
+            geometry.filter(|b| *b > 0).map_or(16384, |b| {
+                SINK_ROW_ALLOC_OVERHEAD_BYTES.saturating_add(b.saturating_mul(4))
+            })
+        }
+    }
+    /// The buffered output of `rows` rows ([`Self::output_row_bytes`]).
+    pub(super) fn sink_estimate(
+        self,
+        mode: Mode,
+        rows: usize,
+        geometry: Option<u64>,
+        row_bytes: Option<u64>,
+    ) -> u64 {
+        (rows as u64).saturating_mul(self.output_row_bytes(mode, geometry, row_bytes))
     }
     /// Units of `price` that `phase` may hold under `profile`, at least 1. A
     /// query: it charges nothing. `speed` affords everything; `auto` and
@@ -443,6 +480,16 @@ impl MemoryBudget {
             threads.min(ENCODE_FLOOR),
         )
     }
+    /// The encodes of a `units` grant a run re-sized as `profile` keeps:
+    /// `bounded` encodes from the floor [`Self::encode_concurrency`] grants
+    /// (#815: an `auto` run that downgraded to spill drains as `bounded`).
+    pub(super) fn encode_units_as(profile: MemoryProfile, units: usize) -> usize {
+        if matches!(profile, MemoryProfile::Bounded) {
+            units.min(ENCODE_FLOOR)
+        } else {
+            units
+        }
+    }
     /// Row groups pass 2's buffered drain may encode at once (#817 B1): the
     /// writer's `encode` grant plus as many more slots of `slot_bytes` (at
     /// least the grant's own unit) as `reused` bytes hold, at most `threads`.
@@ -479,6 +526,27 @@ impl MemoryBudget {
             }
         }
         Ok(())
+    }
+
+    /// The ledger as the profile JSON records it: the probed figure, and
+    /// every phase's reservation and grant still charged, by phase name.
+    pub(super) fn ledger_json(&self) -> serde_json::Value {
+        let by_phase = |ledger: &[u64; MemoryPhase::COUNT]| {
+            MemoryPhase::ALL
+                .iter()
+                .filter(|p| ledger[**p as usize] > 0)
+                .map(|p| (p.name().to_string(), ledger[*p as usize].into()))
+                .collect::<serde_json::Map<_, _>>()
+        };
+        serde_json::json!({
+            "limit_bytes": self.limit.map(|l| l.bytes),
+            "limit_source": self.limit.map(|l| l.source.describe()),
+            "reserved": by_phase(&self.reserved),
+            "granted": by_phase(&self.granted),
+            "total_reserved": sum(&self.reserved),
+            "total_granted": sum(&self.granted),
+            "remaining": self.remaining(),
+        })
     }
 
     /// Reserve up to `bytes` for `phase`, as much as is available, and never
@@ -532,6 +600,45 @@ mod tests {
             MemoryBudget::drain_encodes(encode, 0, 1 << 40, u64::MAX, 2),
             4
         );
+    }
+
+    /// #852: a buffered row is priced at the footers' decoded row when it is
+    /// known, not at its geometry alone (119 B/row on Overture segments,
+    /// where the sink measured 987 B/row and the footers said 988).
+    #[test]
+    fn a_footer_row_prices_the_sink_over_the_geometry_model() {
+        let budget = MemoryBudget::with_available(None);
+        for mode in [Mode::Duplicating, Mode::Partitioning] {
+            assert_eq!(
+                budget.sink_estimate(mode, 1_000, Some(119), Some(988)),
+                988_000
+            );
+            assert_eq!(
+                budget.sink_estimate(mode, 1_000, Some(119), None),
+                budget.sink_estimate(mode, 1_000, Some(119), Some(0)),
+            );
+        }
+    }
+
+    #[test]
+    fn the_ledger_json_lists_every_charged_phase_and_the_totals() {
+        let mut budget = MemoryBudget::with_available(Some(10_000));
+        let read = budget.fit(
+            MemoryProfile::Speed,
+            MemoryPhase::Read,
+            Price::model(100),
+            3,
+            1,
+        );
+        budget.reserve_up_to(MemoryPhase::Spill, 50);
+        let json = budget.ledger_json();
+        assert_eq!(json["granted"]["read-ahead"], 300);
+        assert_eq!(json["reserved"]["spill"], 50);
+        assert_eq!(json["total_granted"], 300);
+        assert_eq!(json["total_reserved"], 50);
+        assert!(json["granted"].get("writer").is_none());
+        budget.release(read);
+        assert_eq!(budget.ledger_json()["total_granted"], 0);
     }
 
     #[test]
