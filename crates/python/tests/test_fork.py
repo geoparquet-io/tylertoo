@@ -51,6 +51,7 @@ PARENT = textwrap.dedent(
 def test_a_child_forked_after_import_can_convert(tmp_path):
     result = subprocess.run(
         [sys.executable, "-c", PARENT, str(BUILDINGS), str(tmp_path / "out.parquet")],
+        check=False,
         capture_output=True,
         text=True,
         timeout=180,
