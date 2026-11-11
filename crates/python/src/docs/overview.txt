@@ -1,8 +1,15 @@
 Build a GeoParquet overview file: one generalized level per zoom.
 
 Args:
-    input: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
-        (`EPSG:3857`). Pass a file, directory, glob, `s3://`,
+    input: GeoParquet: `EPSG:4326` and all-`EPSG:3857` inputs are read directly;
+        `EPSG:3857` parts mixed with other CRSs are reprojected to `EPSG:4326`;
+        other CRSs with an EPSG code and usable proj4 definition are
+        reprojected to `EPSG:4326` as they are read, otherwise refused
+        (use `gpio convert reproject` first).
+        Reprojection uses no grid shifts: datum changes can differ from
+        PROJ/pyproj by metres (around 100 m for EPSG:27700), while
+        same-datum projections match to under a centimetre.
+        Pass a file, directory, glob, `s3://`,
         `gs://`, or `https://` URL or prefix, or a list of files.
         First write in-memory data (DuckDB, Polars, PyArrow, or GeoPandas)
         to a GeoParquet file using `gpio` or DuckDB
@@ -112,9 +119,12 @@ Args:
         with `.wkb`). Touching counts. A feature also matches when its
         copy one world width away (±360°) intersects the mask, as with
         `bbox`. The mask's bbox skips row groups like `bbox`.
-        Combines with `bbox` and `filter` by AND. The mask must
-        use the input's CRS; a mismatch is refused, so reproject the
-        mask first. A shapely geometry is taken to be in the input's CRS.
+        Combines with `bbox` and `filter` by AND.
+        A GeoParquet mask uses its declared CRS and the same reprojection
+        rules as input. EPSG:4326 masks are converted to EPSG:3857 for 3857
+        input and vice versa, vertex by vertex.
+        WKB/shapely masks have no CRS: use EPSG:3857 for EPSG:3857 input,
+        otherwise lon/lat EPSG:4326, including for reprojected input.
     filter: SQL-style predicate, such as `"confidence > 0.8"`.
     profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles):
         `"speed"` holds everything in RAM, `"bounded"` uses disk and

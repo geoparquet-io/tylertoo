@@ -239,7 +239,9 @@ fn native_logical_type_resolves_shape_and_crs_without_geo_key() {
         (None, Some(Crs::Epsg4326)),
         (Some("srid:0"), Some(Crs::Epsg4326)),
         (Some("EPSG:3857"), Some(Crs::Epsg3857)),
-        (Some("EPSG:32633"), None),
+        // #670: a CRS with an EPSG definition is reprojected to lon/lat.
+        (Some("EPSG:32633"), Some(Crs::Epsg4326)),
+        (Some("ESRI:54009"), None),
     ] {
         let descriptor = ResolvedSchema::from_metadata(&native_metadata(id)).unwrap();
         assert_eq!(descriptor.geometry_name(), Some("SHAPE"));

@@ -759,16 +759,20 @@ pub struct ConvertOptions {
     pub bbox: Option<[f64; 4]>,
     /// Keep features whose geometry intersects this polygon or multipolygon
     /// mask; touching counts. Accepts a GeoJSON (`.geojson` or `.json`,
-    /// lon/lat per RFC 7946) or GeoParquet file. The mask must use the input's
-    /// CRS; a mismatch is refused, so reproject the mask first.
+    /// lon/lat per RFC 7946) or GeoParquet file.
+    /// A GeoParquet mask uses its declared CRS and the same reprojection
+    /// rules as input. EPSG:4326 masks are converted to EPSG:3857 for 3857
+    /// input and vice versa, vertex by vertex.
     /// The mask's bbox skips row groups like [`bbox`](Self::bbox).
     /// Combines with `bbox` and [`filter`](Self::filter) by AND.
     /// A feature also matches when its copy one world width away (±360°)
     /// intersects the mask, as with `bbox`. In Python, `mask=` also accepts
-    /// a shapely geometry (any object with `.wkb`), taken to be in the
-    /// input's CRS. Default `None` (no mask).
+    /// a shapely geometry (any object with `.wkb`).
+    /// WKB/shapely masks have no CRS: use EPSG:3857 for EPSG:3857 input,
+    /// otherwise lon/lat EPSG:4326, including for reprojected input.
+    /// Default `None` (no mask).
     #[cfg_attr(feature = "cli", arg(value_parser = super::mask::parse_mask, long, value_name = "PATH", help_heading = "Filtering"))]
-    #[cfg_attr(feature = "cli", arg(help = "Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (.geojson/.json, RFC 7946 lon/lat) or GeoParquet file; touching and copies one ±360° wrap away count. Skips row groups by the mask's bbox, combines with --bbox and --filter by AND, and refuses a CRS mismatch: reproject the mask to the input's CRS first", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (.geojson/.json, RFC 7946 lon/lat) or GeoParquet file; touching and copies one ±360° wrap away count. Skips row groups by the mask's bbox, combines with --bbox and --filter by AND. A GeoParquet mask uses its declared CRS and the same reprojection rules as input. EPSG:4326 masks are converted to EPSG:3857 for 3857 input and vice versa, vertex by vertex. WKB/shapely masks have no CRS: use EPSG:3857 for EPSG:3857 input, otherwise lon/lat EPSG:4326, including for reprojected input.", long_help = None))]
     pub mask: Option<super::mask::MaskSource>,
     /// Attribute filter (#315): a SQL-WHERE-style predicate over the input's
     /// property columns (`--filter` / `--where`), e.g. `confidence > 0.8`,
@@ -1953,8 +1957,12 @@ pub enum ConvertError {
     /// The overview writer failed.
     #[error("writer error: {0}")]
     Writer(#[from] WriterError),
-    /// The input CRS is neither EPSG:4326 nor EPSG:3857 (spec Q3).
-    #[error("unsupported CRS {crs:?} in {input}: overviews require EPSG:4326 or EPSG:3857")]
+    /// The input CRS is neither EPSG:4326 nor EPSG:3857, and names no EPSG
+    /// code to reproject it from (#670).
+    #[error(
+        "unsupported CRS {crs:?} in {input}: tylertoo reprojects a CRS only from its EPSG code; \
+         reproject the input to EPSG:4326 with gpio first"
+    )]
     #[non_exhaustive]
     UnsupportedCrs {
         /// The rejected CRS identifier.
@@ -3143,6 +3151,20 @@ pub(super) fn level_representations(
 /// [`ConvertOptions::shard`] range (whose plan would cover only that shard's
 /// rows).
 ///
+/// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
+/// reprojected to EPSG:4326 as they are read when they name an EPSG code
+/// (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4
+/// definition. A directory, list, or `--files-from` input can mix these CRSs.
+/// EPSG:3857 parts are reprojected to EPSG:4326 when mixed with other CRSs.
+/// An all-EPSG:3857 input is read directly. Unsupported CRSs are refused;
+/// the error points to `gpio convert reproject` to reproject the input first.
+///
+/// Reprojection uses no grid shifts. A datum change uses the definition's
+/// proj4 `towgs84` Helmert parameters, so results can differ from PROJ/pyproj
+/// by metres (around 100 m at the edge of EPSG:27700's area). Same-datum
+/// projections, such as UTM and ETRS89 LAEA (EPSG:3035), match to under a
+/// centimetre.
+///
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if the input cannot be resolved, if the options
@@ -4128,7 +4150,8 @@ pub(super) fn log_remote_fetch(source: &ConvertSource) -> Option<crate::input::F
 // ============================================================================
 
 /// Detect the input CRS from parsed parquet key-value metadata and map it to
-/// [`Crs`], rejecting anything that is not EPSG:4326 or EPSG:3857 (spec Q3).
+/// [`Crs`]. Supported EPSG codes read as EPSG:4326 after reprojection;
+/// other CRSs are rejected.
 /// Metadata-only so remote inputs (#210) pay no extra footer fetch.
 /// `input` names the file in the error (#452).
 #[cfg(any(test, feature = "fuzzing"))]
@@ -4165,6 +4188,10 @@ pub(crate) fn detect_crs_from_kv_assumed(
     match crate::quality::classify_crs_info(&info) {
         CrsKind::Wgs84 => Ok((Crs::Epsg4326, info.assumed_wgs84)),
         CrsKind::WebMercator => Ok((Crs::Epsg3857, false)),
+        // As `ResolvedSchema::crs`: a reprojected CRS reads as lon/lat (#670).
+        CrsKind::Unknown if crate::reproject::ToLonLat::for_crs(&info).is_some() => {
+            Ok((Crs::Epsg4326, false))
+        }
         CrsKind::Unknown => Err(ConvertError::UnsupportedCrs {
             crs: info
                 .identifier
@@ -5835,7 +5862,16 @@ pub(super) fn geometry_field_metadata(
         }
     };
 
-    let projjson = declared_projjson().or_else(|| canonical_projjson(crs));
+    // A declaration of the CRS the input was reprojected from (#670) is dropped.
+    let projjson = declared_projjson()
+        .filter(|v| {
+            crate::quality::classify_crs_projjson(v)
+                == match crs {
+                    Crs::Epsg4326 => crate::quality::CrsKind::Wgs84,
+                    Crs::Epsg3857 => crate::quality::CrsKind::WebMercator,
+                }
+        })
+        .or_else(|| canonical_projjson(crs));
     let geo_crs = projjson.map(GeoCrs::from_projjson).unwrap_or_default();
     Arc::new(Metadata::new(geo_crs, None))
 }
@@ -9461,12 +9497,14 @@ mod tests {
         let parts = dir.path().join("parts");
         std::fs::create_dir(&parts).unwrap();
         write_input(&parts.join("a.parquet"), &geoms, false, None);
-        // EPSG:32633 in the second partition (also differs in geometry
-        // extension metadata — either check may fire; both name the file).
+        // A CRS the reader cannot reproject in the second partition (also
+        // differs in geometry extension metadata — either check may fire;
+        // both name the file). A reprojected CRS, EPSG:3857 included, would
+        // read as lon/lat and agree (#670).
         let projjson = serde_json::json!({
             "type": "ProjectedCRS",
-            "name": "UTM zone 33N",
-            "id": { "authority": "EPSG", "code": 32633 }
+            "name": "Somewhere / Custom",
+            "id": { "authority": "EPSG", "code": 999_999 }
         });
         let md = geoarrow::datatypes::Metadata::new(
             geoarrow::datatypes::Crs::from_projjson(projjson),
@@ -11066,14 +11104,12 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         let tout = tempfile::NamedTempFile::new().unwrap();
 
-        // EPSG:32633 (UTM 33N) PROJJSON: neither 4326 nor 3857. Its real
-        // EPSG name — "WGS 84 / UTM zone 33N" — used to make
-        // `is_wgs84_projjson` name-match it as WGS84 (#518 (3)); the
-        // structured id now settles it.
+        // ESRI:54009 (Mollweide): neither 4326 nor 3857, and no EPSG code
+        // to reproject it from (#670).
         let projjson = serde_json::json!({
             "type": "ProjectedCRS",
-            "name": "WGS 84 / UTM zone 33N",
-            "id": { "authority": "EPSG", "code": 32633 }
+            "name": "World_Mollweide",
+            "id": { "authority": "ESRI", "code": 54009 }
         });
         let md = geoarrow::datatypes::Metadata::new(
             geoarrow::datatypes::Crs::from_projjson(projjson),
@@ -11178,12 +11214,27 @@ mod tests {
             Crs::Epsg4326
         );
 
-        // A UTM zone — whose name also starts "WGS 84 /" — is rejected, not
-        // silently read as degrees.
+        // A UTM zone — whose name also starts "WGS 84 /" — is reprojected to
+        // lon/lat by the reader (#670), not read as degrees; a CRS with no
+        // EPSG code is rejected.
         let kv = kv_geo_with_crs(serde_json::json!({
             "type": "ProjectedCRS",
             "name": "WGS 84 / UTM zone 33N",
             "id": { "authority": "EPSG", "code": 32633 }
+        }));
+        assert_eq!(
+            detect_crs_from_kv(
+                Some(&kv),
+                "t.parquet",
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .unwrap(),
+            Crs::Epsg4326
+        );
+        let kv = kv_geo_with_crs(serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "World_Mollweide",
+            "id": { "authority": "ESRI", "code": 54009 }
         }));
         assert!(matches!(
             detect_crs_from_kv(
@@ -14462,9 +14513,9 @@ mod tests {
         assert_eq!(report.input_features, 1);
     }
 
-    /// #826: until reprojection (#670), a mask in another CRS is refused.
+    /// #670: a lon/lat mask on an EPSG:3857 input is converted to metres.
     #[test]
-    fn mask_in_another_crs_is_refused() {
+    fn mask_in_another_crs_is_converted() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.parquet");
         let md = geoarrow::datatypes::Metadata::new(
@@ -14483,9 +14534,9 @@ mod tests {
         );
         let mask = write_mask(
             &dir,
-            r#"{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}"#,
+            r#"{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}"#,
         );
-        let err = convert_to_overviews(
+        let report = convert_to_overviews(
             &input,
             dir.path().join("out.parquet"),
             &ConvertOptions {
@@ -14493,9 +14544,8 @@ mod tests {
                 ..Default::default()
             },
         )
-        .unwrap_err();
-        assert_eq!(crate::Classify::kind(&err), crate::ErrorKind::Usage);
-        assert!(err.to_string().contains("--mask"), "{err}");
+        .unwrap();
+        assert_eq!(report.input_features, 1);
     }
 
     /// #826: an unusable mask is refused by validation, before any input I/O.

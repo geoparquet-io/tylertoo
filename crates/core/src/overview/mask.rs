@@ -29,10 +29,14 @@ use crate::diagnostics::{Diagnostic, Diagnostics};
 #[non_exhaustive]
 pub enum MaskSource {
     /// Read a GeoJSON (`.geojson` or `.json`, lon/lat per RFC 7946) or
-    /// GeoParquet file. Its CRS must match the input's; a mismatch is
-    /// refused, so reproject the mask first.
+    /// GeoParquet file.
+    /// A GeoParquet mask uses its declared CRS and the same reprojection
+    /// rules as input. EPSG:4326 masks are converted to EPSG:3857 for 3857
+    /// input and vice versa, vertex by vertex.
     Path(PathBuf),
-    /// Read WKB polygons or multipolygons in the input's CRS.
+    /// Read WKB polygons or multipolygons.
+    /// WKB/shapely masks have no CRS: use EPSG:3857 for EPSG:3857 input,
+    /// otherwise lon/lat EPSG:4326, including for reprojected input.
     /// Python uses this for shapely geometries (any object with `.wkb`).
     Wkb(Vec<u8>),
 }
@@ -260,36 +264,27 @@ fn collect_polygons(g: Geometry<f64>, out: &mut Vec<Polygon<f64>>) -> Result<(),
 }
 
 impl LoadedMask {
-    /// The mask in the input's CRS.
-    ///
-    /// # Errors
-    /// Refuses a mask whose CRS differs from the input's.
-    // shortcut: refuses a CRS mismatch; reprojection (#670) replaces this check.
-    pub(crate) fn into_input_crs(self, input: Crs) -> Result<MultiPolygon<f64>, ConvertError> {
-        match self.crs {
-            Some(crs) if crs != input => {
-                let name = |c| match c {
-                    Crs::Epsg4326 => "EPSG:4326",
-                    Crs::Epsg3857 => "EPSG:3857",
-                };
-                Err(invalid(format!(
-                    "the mask is in {} but the input is in {}; reproject the mask to the \
-                     input's CRS",
-                    name(crs),
-                    name(input)
-                ))
-                .into())
-            }
-            _ => Ok(self.polygons),
-        }
+    /// The mask in the input's CRS: a mask in the other of EPSG:4326 and
+    /// EPSG:3857 is converted vertex by vertex (#670).
+    pub(crate) fn into_input_crs(self, input: Crs) -> MultiPolygon<f64> {
+        use geo::MapCoords;
+        let convert: fn(f64, f64) -> (f64, f64) = match (self.crs, input) {
+            (Some(Crs::Epsg4326), Crs::Epsg3857) => super::convert::lnglat_to_webmerc,
+            (Some(Crs::Epsg3857), Crs::Epsg4326) => super::export::webmerc_to_lnglat,
+            _ => return self.polygons,
+        };
+        self.polygons.map_coords(|c| {
+            let (x, y) = convert(c.x, c.y);
+            Coord { x, y }
+        })
     }
 }
 
-/// Load `source` for an input in `crs` (load, then the CRS check), naming
+/// Load `source` for an input in `crs` (load, then the CRS conversion), naming
 /// the mask in `diagnostics` when its CRS is an assumption (#451).
 ///
 /// # Errors
-/// As [`load`] and [`LoadedMask::into_input_crs`].
+/// As [`load`].
 pub(crate) fn load_for_input(
     source: &MaskSource,
     crs: Crs,
@@ -303,7 +298,7 @@ pub(crate) fn load_for_input(
             root: path.display().to_string(),
         });
     }
-    mask.into_input_crs(crs)
+    Ok(mask.into_input_crs(crs))
 }
 
 /// The mask's bbox as a query in `crs` units, with its copies one world
@@ -643,14 +638,10 @@ mod tests {
         let loaded = load(&MaskSource::Path(ok)).unwrap();
         assert_eq!(loaded.polygons.0.len(), 1);
         assert_eq!(loaded.crs, Some(Crs::Epsg4326));
-        let err = loaded
-            .into_input_crs(Crs::Epsg3857)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("the mask is in EPSG:4326 but the input is in EPSG:3857"),
-            "{err}"
-        );
+        // #670: a lon/lat mask on an EPSG:3857 input is converted.
+        let merc = loaded.into_input_crs(Crs::Epsg3857);
+        let (x, y) = super::super::convert::lnglat_to_webmerc(1.0, 1.0);
+        assert!(merc.0[0].exterior().0.contains(&Coord { x, y }));
 
         let (_d, line) = write(
             "l.geojson",
@@ -816,6 +807,7 @@ mod tests {
             crate::wkb::geometry_to_wkb(&wkt!(POLYGON((0.0 0.0,1.0 0.0,1.0 1.0,0.0 0.0))).into())
                 .unwrap();
         let loaded = load(&MaskSource::Wkb(wkb)).unwrap();
-        assert!(loaded.into_input_crs(Crs::Epsg3857).is_ok());
+        let polygons = loaded.polygons.clone();
+        assert_eq!(loaded.into_input_crs(Crs::Epsg3857), polygons);
     }
 }

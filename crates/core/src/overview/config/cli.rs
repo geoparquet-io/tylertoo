@@ -566,9 +566,22 @@ pub struct ExportPmtilesArgs {
 
 #[derive(Parser, Debug)]
 pub struct OverviewArgs {
-    /// Input GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
-    /// (`EPSG:3857`). Pass a file, directory, glob, URL, or `s3://` or
+    /// Input GeoParquet. Pass a file, directory, glob, URL, or `s3://` or
     /// `gs://` prefix, or omit it with `--files-from`.
+    ///
+    /// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
+    /// reprojected to EPSG:4326 as they are read when they name an EPSG code
+    /// (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4
+    /// definition. A directory, list, or `--files-from` input can mix these CRSs.
+    /// EPSG:3857 parts are reprojected to EPSG:4326 when mixed with other CRSs.
+    /// An all-EPSG:3857 input is read directly. Unsupported CRSs are refused;
+    /// the error points to `gpio convert reproject` to reproject the input first.
+    ///
+    /// Reprojection uses no grid shifts. A datum change uses the definition's
+    /// proj4 `towgs84` Helmert parameters, so results can differ from PROJ/pyproj
+    /// by metres (around 100 m at the edge of EPSG:27700's area). Same-datum
+    /// projections, such as UTM and ETRS89 LAEA (EPSG:3035), match to under a
+    /// centimetre.
     #[arg(value_name = "INPUT", required_unless_present = "files_from")]
     pub input: Option<PathBuf>,
 
@@ -610,9 +623,22 @@ pub struct OverviewArgs {
 
 #[derive(Parser, Debug)]
 pub struct TilesArgs {
-    /// Input GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
-    /// (`EPSG:3857`). Pass a file, directory, glob, URL, or `s3://` or
+    /// Input GeoParquet. Pass a file, directory, glob, URL, or `s3://` or
     /// `gs://` prefix, or omit it with `--files-from`.
+    ///
+    /// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
+    /// reprojected to EPSG:4326 as they are read when they name an EPSG code
+    /// (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4
+    /// definition. A directory, list, or `--files-from` input can mix these CRSs.
+    /// EPSG:3857 parts are reprojected to EPSG:4326 when mixed with other CRSs.
+    /// An all-EPSG:3857 input is read directly. Unsupported CRSs are refused;
+    /// the error points to `gpio convert reproject` to reproject the input first.
+    ///
+    /// Reprojection uses no grid shifts. A datum change uses the definition's
+    /// proj4 `towgs84` Helmert parameters, so results can differ from PROJ/pyproj
+    /// by metres (around 100 m at the edge of EPSG:27700's area). Same-datum
+    /// projections, such as UTM and ETRS89 LAEA (EPSG:3035), match to under a
+    /// centimetre.
     #[arg(value_name = "INPUT", required_unless_present = "files_from")]
     pub input: Option<PathBuf>,
 

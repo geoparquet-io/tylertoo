@@ -60,6 +60,9 @@ pub struct ResolvedSchema {
     bounds: Vec<Option<RowGroupBounds>>,
     diagnostics: Vec<Diagnostic>,
     auto_zoom_covering: std::result::Result<(usize, [String; 4]), CoveringWarning>,
+    /// Reprojection to lon/lat (#670): of a CRS other than EPSG:4326/3857, or
+    /// of EPSG:3857 in a set that mixes it with lon/lat parts.
+    to_lonlat: Option<Arc<crate::reproject::ToLonLat>>,
 }
 
 impl ResolvedSchema {
@@ -168,7 +171,12 @@ impl ResolvedSchema {
             bounds: Vec::new(),
             diagnostics: diagnostics.snapshot(),
             auto_zoom_covering: Err(CoveringWarning::NoFooterStatistics),
+            to_lonlat: None,
         };
+        if crate::quality::classify_crs_info(&result.facts.crs) == crate::quality::CrsKind::Unknown
+        {
+            result.to_lonlat = crate::reproject::ToLonLat::for_crs(&result.facts.crs).map(Arc::new);
+        }
         result.auto_zoom_covering = result.validate_auto_zoom_covering(metadata);
         if let Some(md) = metadata {
             result.bounds = result.read_bounds(md);
@@ -269,12 +277,41 @@ impl ResolvedSchema {
     pub fn crs_info(&self) -> &CrsInfo {
         &self.facts.crs
     }
-    /// Supported coordinate system, or `None` for unknown/unsupported declarations.
+    /// The coordinate system the part's batches arrive in: EPSG:4326 for a
+    /// CRS the reader reprojects (#670), `None` for one it cannot.
     pub fn crs(&self) -> Option<Crs> {
+        if self.to_lonlat.is_some() {
+            return Some(Crs::Epsg4326);
+        }
         match crate::quality::classify_crs_info(self.crs_info()) {
             crate::quality::CrsKind::Wgs84 => Some(Crs::Epsg4326),
             crate::quality::CrsKind::WebMercator => Some(Crs::Epsg3857),
             crate::quality::CrsKind::Unknown => None,
+        }
+    }
+    /// Whether this part's batches are reprojected to EPSG:4326 as they are
+    /// read, so its declared CRS and covering no longer describe them.
+    pub(crate) fn reprojects(&self) -> bool {
+        self.to_lonlat.is_some()
+    }
+    /// This EPSG:3857 part, read in EPSG:4326 instead: for a set whose other
+    /// parts are lon/lat (#670). Pruning bounds are recomputed in degrees.
+    pub(crate) fn web_mercator_as_lonlat(&self, metadata: &ParquetMetaData) -> Self {
+        let mut out = self.clone();
+        out.to_lonlat = crate::reproject::ToLonLat::for_code(3857).map(Arc::new);
+        out.auto_zoom_covering = out.validate_auto_zoom_covering(Some(metadata));
+        out.bounds = out.read_bounds(metadata);
+        out
+    }
+    /// `batch` from this part with its geometry in [`Self::crs`]: reprojected
+    /// when the part declares another CRS, untouched otherwise.
+    pub(crate) fn in_working_crs(
+        &self,
+        batch: arrow_array::RecordBatch,
+    ) -> std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError> {
+        match (&self.to_lonlat, self.geometry_name()) {
+            (Some(t), Some(name)) => t.batch(batch, name),
+            _ => Ok(batch),
         }
     }
     /// GeoParquet version, including native 2.0 without a geo key. `None`
@@ -373,6 +410,9 @@ impl ResolvedSchema {
     }
 
     fn f64_covering_shape(&self) -> std::result::Result<(usize, [String; 4]), CoveringWarning> {
+        if self.to_lonlat.is_some() {
+            return Err(CoveringWarning::Reprojected);
+        }
         let spec = self.covering().ok_or(CoveringWarning::NoCovering)?;
         let schema = self.schema();
         let paths = [
@@ -476,7 +516,9 @@ impl ResolvedSchema {
                     .ok_or(CoveringWarning::MissingStatistics(rg_idx))?;
                 if !value.is_finite() {
                     finite = false;
-                } else if value.abs() > if is_x { 3.0 * range.max_x } else { range.max_y } {
+                } else if self.to_lonlat.is_none()
+                    && value.abs() > if is_x { 3.0 * range.max_x } else { range.max_y }
+                {
                     return Err(CoveringWarning::OutOfCrsRange(rg_idx));
                 }
             }
@@ -555,6 +597,24 @@ impl ResolvedSchema {
 
     fn read_bounds(&self, md: &ParquetMetaData) -> Vec<Option<RowGroupBounds>> {
         let tier1 = crate::covering::bounds_from_resolved(md, self);
+        if let Some(t) = &self.to_lonlat {
+            // Covering statistics are in the source CRS; the native ones are
+            // skipped below, as their CRS is not the session's.
+            return tier1
+                .into_iter()
+                .map(|b| {
+                    let b = b?;
+                    let [xmin, ymin, xmax, ymax] = t.bbox([b.xmin, b.ymin, b.xmax, b.ymax])?;
+                    Some(RowGroupBounds {
+                        xmin,
+                        ymin,
+                        xmax,
+                        ymax,
+                        ..b
+                    })
+                })
+                .collect();
+        }
         let native = self
             .geometry_name()
             .and_then(|n| find_native_geometry_leaf_column(md, n))
