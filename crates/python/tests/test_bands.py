@@ -96,7 +96,9 @@ def test_bands_refuse_a_zoom_keyword(tmp_path: Path, keyword: dict[str, Any]) ->
     source = tmp_path / "points.parquet"
     _write_source(source)
     with pytest.raises(tylertoo.ConfigError, match="--band cannot be combined with"):
-        tylertoo.convert(str(source), str(tmp_path / "o.pmtiles"), bands=BANDS, **keyword)
+        tylertoo.convert(
+            str(source), str(tmp_path / "o.pmtiles"), bands=BANDS, **keyword
+        )
 
 
 def test_overlapping_bands_are_refused_before_reading(tmp_path: Path) -> None:
