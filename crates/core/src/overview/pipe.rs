@@ -79,23 +79,35 @@ where
         // producer finishes — that disconnect is what fuses the consumer's
         // `recv` loop.
         let producer = scope.spawn(move || produce(&tx));
+        let help = HelpUntilFinished(&producer);
         let consumed = consume(rx);
-        // A pool worker runs pool work until the producer is done: the
-        // producer may wait on work queued behind this worker, as when the
-        // consumer stopped early on an error.
-        if rayon::current_thread_index().is_some() {
-            while !producer.is_finished() {
-                if rayon::yield_now() != Some(rayon::Yield::Executed) {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
-        }
+        drop(help);
         match producer.join() {
             Ok(produced) => produced?,
             Err(payload) => std::panic::resume_unwind(payload),
         }
         consumed
     })
+}
+
+/// On a pool worker, runs pool work until the producer it holds is done,
+/// when dropped: the producer may wait on work queued behind this worker,
+/// as when the consumer stopped early on an error or a panic. Dropped
+/// after the consumer, so its receiver is gone and a producer in `send`
+/// stops.
+struct HelpUntilFinished<'a, 'scope, T>(&'a std::thread::ScopedJoinHandle<'scope, T>);
+
+impl<T> Drop for HelpUntilFinished<'_, '_, T> {
+    fn drop(&mut self) {
+        if rayon::current_thread_index().is_none() {
+            return;
+        }
+        while !self.0.is_finished() {
+            if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
 }
 
 /// Split a resolved `--in-flight-batches` depth into `(channel depth, compute
@@ -202,6 +214,46 @@ where
     reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
 )]
 mod tests {
+
+    /// A consumer that fails on a pool worker must not hang the join of a
+    /// producer that waits on that pool: the worker runs the producer's
+    /// queued work until it is done, on an error and on a panic alike.
+    #[test]
+    fn a_failing_consumer_on_the_only_worker_lets_the_producer_finish() {
+        for panics in [false, true] {
+            let (done_tx, done) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap();
+                let result = pool.install(|| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        scoped_pipe(
+                            1,
+                            |tx: &Sender<u32>| -> Result<(), &str> {
+                                let _ = tx.send(1);
+                                // Needs the pool's only worker, the consumer's.
+                                pool.install(|| ());
+                                Ok(())
+                            },
+                            |_rx: Receiver<u32>| -> Result<(), &str> {
+                                if panics {
+                                    panic!("consumer panicked");
+                                }
+                                Err("consumer failed")
+                            },
+                        )
+                    }))
+                });
+                let _ = done_tx.send(result.map_or("panic", |r| r.err().unwrap_or("ok")));
+            });
+            let outcome = done
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!("hung joining the producer (panics: {panics})"));
+            assert_eq!(outcome, if panics { "panic" } else { "consumer failed" });
+        }
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
