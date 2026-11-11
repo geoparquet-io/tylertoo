@@ -28,7 +28,7 @@ use crate::quality::CrsInfo;
 const PAR_ROWS: usize = 128;
 
 /// The pool batches are reprojected on, or `None` if its threads could not
-/// start (the rewrite then runs on the caller's pool). Its own: the reader
+/// start, which fails the read. Its own, not the caller's: the reader
 /// threads that call [`ToLonLat::batch`] feed a consumer that may hold every
 /// worker of the caller's pool while it waits on them, so work queued there
 /// could wait forever. Jobs here never block, so they always finish (#868).
@@ -203,10 +203,10 @@ impl ToLonLat {
             return Ok(batch);
         };
         let mut columns = batch.columns().to_vec();
-        columns[i] = match pool() {
-            Some(pool) => pool.install(|| self.array(&columns[i]))?,
-            None => self.array(&columns[i])?,
-        };
+        let pool = pool().ok_or_else(|| {
+            ArrowError::ComputeError("could not start the threads that reproject input".into())
+        })?;
+        columns[i] = pool.install(|| self.array(&columns[i]))?;
         RecordBatch::try_new(batch.schema(), columns)
     }
 
