@@ -202,6 +202,8 @@ pub enum CoveringWarning {
     InconsistentPartitions,
     NoUsableSample,
     ReadFailed(String),
+    /// The covering is in a CRS the reader reprojects (#670).
+    Reprojected,
 }
 
 impl fmt::Display for CoveringWarning {
@@ -225,6 +227,9 @@ impl fmt::Display for CoveringWarning {
                 "row group {rg} covering statistics exceed the declared CRS coordinate range"
             ),
             Self::UnknownCrs => f.write_str("the declared CRS coordinate range is unknown"),
+            Self::Reprojected => {
+                f.write_str("the covering is in the projected CRS the input is reprojected from")
+            }
             Self::InconsistentPartitions => {
                 f.write_str("partitions declare different covering columns")
             }
@@ -618,7 +623,8 @@ impl Diagnostics {
                             CoveringWarning::NoCovering
                             | CoveringWarning::UnsupportedPath
                             | CoveringWarning::NotFloat64
-                            | CoveringWarning::NoFooterStatistics,
+                            | CoveringWarning::NoFooterStatistics
+                            | CoveringWarning::Reprojected,
                         ..
                     } => log::debug!("{event}"),
                     _ => log::warn!("{event}"),

@@ -366,6 +366,8 @@ pub struct SourceStream<'a> {
     /// Each part's already-parsed footer, parallel to `parts`, so opening a
     /// part's reader costs a `File::open` and nothing else (#494 follow-up).
     metas: Vec<ReaderMetadata>,
+    /// Each part's resolved schema, which reprojects its batches (#670).
+    resolved: Vec<Arc<crate::resolved_schema::ResolvedSchema>>,
     projection: Option<Vec<usize>>,
     row_groups: Option<Vec<Vec<usize>>>,
     batch_size: usize,
@@ -1188,11 +1190,12 @@ impl ConvertSource {
         // Footers are parsed once per source (lazily for `Single`, at
         // construction for `Multi`); every reader this stream opens reuses
         // them rather than re-decoding O(row_groups × columns) of thrift.
-        let metas = self
-            .metas()?
+        let part_metas = self.metas()?;
+        let metas = part_metas
             .iter()
             .map(|m| m.reader.clone())
             .collect::<Vec<_>>();
+        let resolved = part_metas.iter().map(|m| m.resolved.clone()).collect();
         // #563: each part's reader caps the batch for its selected row
         // groups' widest byte-array column (`untrusted::ParquetSource::build`),
         // so no batch can pass arrow's i32 offset ceiling. Output does not
@@ -1200,6 +1203,7 @@ impl ConvertSource {
         Ok(SourceStream {
             parts,
             metas,
+            resolved,
             projection,
             row_groups: plan.row_groups.map(|s| s.0.clone()),
             batch_size: plan.batch_size.max(1),
@@ -1643,7 +1647,13 @@ impl Iterator for SourceStream<'_> {
         loop {
             if let Some(reader) = &mut self.current {
                 match reader.next() {
-                    Some(Ok(batch)) => return Some(Ok(batch)),
+                    Some(Ok(batch)) => {
+                        return Some(
+                            self.resolved[self.part_idx]
+                                .in_working_crs(batch)
+                                .map_err(InputError::Arrow),
+                        )
+                    }
                     Some(Err(e)) => {
                         self.done = true;
                         return Some(Err(InputError::Arrow(e)));
@@ -2194,10 +2204,11 @@ mod tests {
         let dir = tmpdir();
         let geo = |epsg: u32| {
             format!(
-                r#"{{"version":"1.0.0","primary_column":"geometry","columns":{{"geometry":{{"crs":"EPSG:{epsg}"}}}}}}"#
+                r#"{{"version":"1.0.0","primary_column":"geometry","columns":{{"geometry":{{"crs":"ESRI:{epsg}"}}}}}}"#
             )
         };
-        for (file, epsg) in [("a.parquet", 32633u32), ("b.parquet", 32634u32)] {
+        // ESRI codes: no EPSG definition to reproject from (#670).
+        for (file, epsg) in [("a.parquet", 54009u32), ("b.parquet", 54030u32)] {
             let path = dir.path().join(file);
             let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
             let batch = RecordBatch::try_new(
@@ -2221,7 +2232,7 @@ mod tests {
             } => {
                 assert!(offender.ends_with("b.parquet"), "offender: {offender}");
                 assert!(
-                    detail.contains("32633") && detail.contains("32634"),
+                    detail.contains("54009") && detail.contains("54030"),
                     "detail must name both raw CRS values: {detail}"
                 );
             }

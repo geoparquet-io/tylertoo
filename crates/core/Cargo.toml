@@ -64,8 +64,11 @@ arrow-ord = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-string = { workspace = true }
 arrow-buffer = { workspace = true }
+arrow-data = { workspace = true }
 geo = { workspace = true }
 wkb = { workspace = true }
+proj4rs = { workspace = true }
+crs-definitions = { workspace = true }
 prost = { workspace = true }
 mlt-core = { workspace = true, optional = true }
 rayon = { workspace = true }

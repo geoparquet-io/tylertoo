@@ -112,9 +112,7 @@ Args:
         with `.wkb`). Touching counts. A feature also matches when its
         copy one world width away (±360°) intersects the mask, as with
         `bbox`. The mask's bbox skips row groups like `bbox`.
-        Combines with `bbox` and `filter` by AND. The mask must
-        use the input's CRS; a mismatch is refused, so reproject the
-        mask first. A shapely geometry is taken to be in the input's CRS.
+        Combines with `bbox` and `filter` by AND. TODO(docs)
     filter: SQL-style predicate, such as `"confidence > 0.8"`.
     profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles):
         `"speed"` holds everything in RAM, `"bounded"` uses disk and

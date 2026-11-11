@@ -49,6 +49,7 @@ arrow-select = "59"
 arrow-ipc = "59"
 arrow-cast = "59"
 arrow-buffer = "59"
+arrow-data = "59"
 arrow-ord = "59"
 arrow-arith = "59"
 arrow-string = "59"
@@ -56,6 +57,10 @@ geo = "0.33"
 geozero = { version = "0.15", features = ["with-wkb", "with-geo"] }
 # The WKB reader and writer geoarrow already uses for GeoParquet columns.
 wkb = "0.9.3"
+# Reprojection of projected-CRS input (#670): pure Rust, no libproj, with the
+# EPSG proj4 definitions it reads (proj4 strings only, not the WKT table).
+proj4rs = { version = "0.3.0", default-features = false }
+crs-definitions = { version = "0.6.0", default-features = false, features = ["proj4"] }
 
 # MapLibre Tile (MLT) output (#823). Its rust-version (1.98) is above ours,
 # so core takes it behind the optional `mlt` feature.

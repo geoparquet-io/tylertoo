@@ -129,6 +129,7 @@ mod pmtiles_metadata;
 mod pmtiles_writer;
 mod pyramid;
 mod quality;
+mod reproject;
 mod resolved_schema;
 mod shard;
 mod stats;
