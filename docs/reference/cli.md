@@ -299,7 +299,7 @@ tylertoo pyramid [OPTIONS] --band <LO-HI:[SYSTEM:]INPUT[:LAYER]> <OUTPUT>
 
 | Option | Description |
 | --- | --- |
-| `--band <LO-HI:[SYSTEM:]INPUT[:LAYER]>` | One zoom band as `LO-HI:[SYSTEM:]INPUT[:LAYER]` or `LO-HI=[SYSTEM=]INPUT[=LAYER]` (repeatable; layer defaults to file stem). Omit SYSTEM to tile GeoParquet or reuse PMTiles; grid/h3/s2/a5 aggregate GeoParquet centroids into cells (H3/A5 parents are approximate): <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
+| `--band <LO-HI:[SYSTEM:]INPUT[:LAYER]>` | One zoom band as `LO-HI:[SYSTEM:]INPUT[:LAYER]` or `LO-HI=[SYSTEM=]INPUT[=LAYER]` (repeatable; layer defaults to file stem). Omit SYSTEM to tile GeoParquet or reuse PMTiles; grid/h3/s2/a5 aggregate GeoParquet centroids into cells: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
 | `--name <TEXT>` | Human-readable name stored in the archive metadata. |
 | `--description <TEXT>` | Description stored in the archive metadata. |
 | `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |

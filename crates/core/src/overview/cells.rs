@@ -8,15 +8,15 @@
 //! verbatim at its own zoom.
 //!
 //! Memory is bounded by occupied cells, not input rows: the input streams
-//! through [`read_in_order`] once, each batch folds into a per-cell map at
-//! the band's finest resolution, and every coarser zoom is built from the
-//! next finer zoom's cells by their parent id (a parent cell is a group-by
-//! on its key). The map is charged to the run's [`MemoryBudget`].
+//! through [`read_in_order`] once and each batch folds into a per-cell map.
+//! The map is charged to the run's [`MemoryBudget`].
 //!
-//! Parents are taken by id, so an H3 or A5 parent sums the cells its system
-//! lists as its children. Grid and S2 children tile their parent exactly;
-//! H3 and A5 children only approximate it, so a point near a parent's edge
-//! can count in the neighbouring coarse cell.
+//! Grid and S2 children tile their parent exactly, so the map holds the
+//! band's finest resolution and every coarser zoom is a group-by of the
+//! next finer zoom's cells on their parent id. H3 and A5 parents do not
+//! contain their children, so there each feature counts directly in the
+//! cell holding its point at every resolution the band draws; their ids
+//! carry their resolution, so one map holds them all.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -45,12 +45,10 @@ use crate::input_set::ConvertSource;
 
 /// A discrete global grid a cell band aggregates into.
 ///
-/// Each feature counts in the cell holding its centroid. Cells cover about
-/// a 4×4-pixel block of a 256-pixel tile at the equator; resolutions follow
-/// the tables in this module and stop at each system's resolution limit.
-/// Coarser zooms roll child cells up by parent id: exact for grid and S2,
-/// approximate for H3 and A5 because their children do not nest exactly
-/// inside their parents.
+/// Each feature counts in the cell holding its centroid, at every zoom.
+/// Cells cover about a 4×4-pixel block of a 256-pixel tile at the equator;
+/// resolutions follow the tables in this module and stop at each system's
+/// resolution limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CellSystem {
@@ -196,21 +194,33 @@ impl CellSystem {
         }
     }
 
-    /// The parent at `to` of cell `id` at `from` (`to <= from`).
+    /// Whether every cell tiles its parent exactly, so a coarse cell is the
+    /// sum of its children.
+    fn nests(self) -> bool {
+        matches!(self, Self::Grid | Self::S2)
+    }
+
+    /// The resolution an H3 or A5 id encodes; `None` for the others.
+    fn id_resolution(self, id: u64) -> Option<u8> {
+        match self {
+            Self::H3 => h3o::CellIndex::try_from(id)
+                .ok()
+                .map(|c| u8::from(c.resolution())),
+            Self::A5 => u8::try_from(a5::core::serialization::get_resolution(id)).ok(),
+            Self::Grid | Self::S2 => None,
+        }
+    }
+
+    /// The parent at `to` of cell `id` at `from` (`to <= from`), for a
+    /// system that [`nests`](Self::nests).
     fn parent(self, id: u64, from: u8, to: u8) -> u64 {
         match self {
             Self::Grid => {
                 let k = from - to;
                 (id >> 32 >> k) << 32 | (id & 0xFFFF_FFFF) >> k
             }
-            Self::H3 => h3o::CellIndex::try_from(id)
-                .ok()
-                .and_then(|c| c.parent(h3o::Resolution::try_from(to).ok()?))
-                .map_or(id, u64::from),
             Self::S2 => s2::cellid::CellID(id).parent(u64::from(to)).0,
-            Self::A5 => {
-                a5::core::serialization::cell_to_parent(id, Some(i32::from(to))).unwrap_or(id)
-            }
+            Self::H3 | Self::A5 => unreachable!("only nesting systems roll up"),
         }
     }
 
@@ -469,6 +479,31 @@ impl Cells {
         self.0.iter().map(HashMap::len).sum()
     }
 
+    /// The cells a table at `res` writes: all of them for a nesting
+    /// system, else those whose id is at `res`.
+    fn at(&self, system: CellSystem, res: u8) -> impl Iterator<Item = (u64, &CellAcc)> {
+        self.0
+            .iter()
+            .flat_map(HashMap::iter)
+            .filter_map(move |(&id, acc)| {
+                system
+                    .id_resolution(id)
+                    .is_none_or(|r| r == res)
+                    .then_some((id, acc))
+            })
+    }
+
+    fn len_at(&self, system: CellSystem, res: u8) -> usize {
+        self.at(system, res).count()
+    }
+
+    /// Drop the cells finer than `res`, once their table is written.
+    fn retain_at_most(&mut self, system: CellSystem, res: u8) {
+        self.0.par_iter_mut().for_each(|m| {
+            m.retain(|&id, _| system.id_resolution(id).is_none_or(|r| r <= res));
+        });
+    }
+
     /// Merge partial maps, each split by shard, into these cells: shard by
     /// shard in parallel, the parts in order, so the result is the same on
     /// every run. Returns the category heap bytes added.
@@ -621,11 +656,28 @@ pub(crate) fn write_cell_tables(
 ) -> Result<(), ConvertError> {
     debug_assert_eq!(tables.len(), usize::from(max_zoom - min_zoom) + 1);
     let started = std::time::Instant::now();
-    let (mut cells, labels, budget, mut cat_bytes) =
-        aggregate(source, gates, system, max_zoom, rollup, read, diagnostics)?;
+    // A nesting system aggregates at the finest resolution and rolls up;
+    // the others count each feature at every resolution the band draws.
+    let mut resolutions: Vec<u8> = if system.nests() {
+        vec![system.resolution(max_zoom)]
+    } else {
+        (min_zoom..=max_zoom)
+            .map(|z| system.resolution(z))
+            .collect()
+    };
+    resolutions.dedup();
+    let (mut cells, labels, budget, mut cat_bytes) = aggregate(
+        source,
+        gates,
+        system,
+        &resolutions,
+        rollup,
+        read,
+        diagnostics,
+    )?;
     let specs = rollup.accumulate.len();
     log::info!(
-        "[cells] {} aggregate: {} cell(s) at z{max_zoom} in {:.1}s, priced {} B",
+        "[cells] {} aggregate: {} cell(s) up to z{max_zoom} in {:.1}s, priced {} B",
         system.name(),
         cells.len(),
         started.elapsed().as_secs_f64(),
@@ -634,7 +686,12 @@ pub(crate) fn write_cell_tables(
     let mut res = system.resolution(max_zoom);
     for z in (min_zoom..=max_zoom).rev() {
         let to = system.resolution(z);
-        if to < res {
+        if to < res && !system.nests() {
+            // The finer cells are written; the coarser ones were counted.
+            cells.retain_at_most(system, to);
+            cat_bytes = cells.category_bytes();
+            res = to;
+        } else if to < res {
             // A rollup holds children and their parents at once; a parent
             // holds no more cells or category pairs than its children.
             budget.require_allowance(
@@ -662,7 +719,7 @@ pub(crate) fn write_cell_tables(
         )?;
         log::info!(
             "[cells] z{z}: {} cell(s), {} label(s), total {:.1}s, priced {priced} B",
-            cells.len(),
+            cells.len_at(system, res),
             labels.len(),
             started.elapsed().as_secs_f64()
         );
@@ -678,7 +735,7 @@ fn aggregate(
     source: &ConvertSource,
     gates: Option<&super::layer_column::Gates>,
     system: CellSystem,
-    max_zoom: u8,
+    resolutions: &[u8],
     rollup: CellRollup<'_>,
     read: &ConvertOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
@@ -725,7 +782,6 @@ fn aggregate(
         .collect();
     let cat_name = cat_idx.map(|i| schema.field(i).name().clone());
 
-    let res = system.resolution(max_zoom);
     let specs = rollup.accumulate.len();
     let mut budget = MemoryBudget::probe();
     // A small input is priced as the batches it can fill, not as full ones.
@@ -772,7 +828,7 @@ fn aggregate(
             // partial maps at worst (a new cell per row, in a table that may be
             // mid-doubling: three slots a row), then, once they are built, for
             // them as they are and the shards they grow.
-            let per_row = 3 * cell_bytes(specs) + FIRST_COUNTS_BYTES;
+            let per_row = resolutions.len() as u64 * (3 * cell_bytes(specs) + FIRST_COUNTS_BYTES);
             budget.require_allowance(
                 read.profile,
                 MemoryPhase::Scan,
@@ -831,34 +887,29 @@ fn aggregate(
                         if gated(off + r) {
                             continue;
                         }
-                        let Some(id) =
-                            g.as_ref()
-                                .and_then(representative_point)
-                                .and_then(|(x, y)| {
-                                    let (lon, lat) = match crs {
-                                        Crs::Epsg3857 => super::export::webmerc_to_lnglat(x, y),
-                                        _ => (x, y),
-                                    };
-                                    system.cell(lon, lat, res)
-                                })
+                        let Some(cells) = g
+                            .as_ref()
+                            .and_then(|g| cells_of(system, crs, g, resolutions))
                         else {
                             bad += 1;
                             continue;
                         };
-                        let acc = local[shard_of(id)]
-                            .entry(id)
-                            .or_insert_with(|| CellAcc::new(specs));
-                        acc.count += 1;
                         let row = off + r;
-                        for (state, v) in acc.aggs.iter_mut().zip(&values) {
-                            let v = v.as_primitive::<Float64Type>();
-                            // NaN is skipped, as `--cluster` skips it.
-                            if v.is_valid(row) && !v.value(row).is_nan() {
-                                state.add(v.value(row));
+                        for id in cells {
+                            let acc = local[shard_of(id)]
+                                .entry(id)
+                                .or_insert_with(|| CellAcc::new(specs));
+                            acc.count += 1;
+                            for (state, v) in acc.aggs.iter_mut().zip(&values) {
+                                let v = v.as_primitive::<Float64Type>();
+                                // NaN is skipped, as `--cluster` skips it.
+                                if v.is_valid(row) && !v.value(row).is_nan() {
+                                    state.add(v.value(row));
+                                }
                             }
-                        }
-                        if let Some(&id) = ids.get(row) {
-                            acc.cats.add(id);
+                            if let Some(&id) = ids.get(row) {
+                                acc.cats.add(id);
+                            }
                         }
                     }
                     Ok((local, bad))
@@ -898,6 +949,25 @@ fn aggregate(
         Vec::new()
     };
     Ok((cells, labels, budget, cat_bytes))
+}
+
+/// The cells at each of `resolutions` that hold `g`'s representative
+/// point, `None` when the system cannot place it.
+fn cells_of(
+    system: CellSystem,
+    crs: Crs,
+    g: &Geometry<f64>,
+    resolutions: &[u8],
+) -> Option<Vec<u64>> {
+    let (x, y) = representative_point(g)?;
+    let (lon, lat) = match crs {
+        Crs::Epsg3857 => super::export::webmerc_to_lnglat(x, y),
+        _ => (x, y),
+    };
+    resolutions
+        .iter()
+        .map(|&res| system.cell(lon, lat, res))
+        .collect()
 }
 
 /// The point a feature is counted at: its centroid, `None` when it has
@@ -993,10 +1063,7 @@ fn write_table(
     let (file, pending) = crate::atomic_output::create(path)?;
     let mut writer = tylertoo_io::batch_writer(file, encoder.target_schema())?;
 
-    let mut all: Vec<(u64, &CellAcc)> = Vec::with_capacity(cells.len());
-    for shard in &cells.0 {
-        all.extend(shard.iter().map(|(&id, acc)| (id, acc)));
-    }
+    let mut all: Vec<(u64, &CellAcc)> = cells.at(system, res).collect();
     all.par_sort_unstable_by_key(|c| c.0);
     for chunk in all.chunks(WRITE_ROWS) {
         let ids: Vec<u64> = chunk.iter().map(|c| c.0).collect();
@@ -1117,9 +1184,7 @@ mod tests {
         assert_eq!(CellSystem::from_name("hex"), None);
     }
 
-    /// The parent by id holds the point for the nesting systems. H3 and A5
-    /// parents are id parents, which can differ from the coarse cell holding
-    /// the point near an edge, so only their resolution is checked.
+    /// A nesting system's parent by id holds the point.
     #[test]
     fn parents_contain_their_children() {
         let pts = [
@@ -1128,21 +1193,13 @@ mod tests {
             (179.99, -16.5),
             (-0.0001, 0.0001),
         ];
-        for system in CellSystem::ALL {
+        for system in CellSystem::ALL.into_iter().filter(|s| s.nests()) {
             for &(lon, lat) in &pts {
                 let fine = system.resolution(14);
                 let coarse = system.resolution(3);
                 let id = system.cell(lon, lat, fine).unwrap();
                 let parent = system.parent(id, fine, coarse);
-                if system == CellSystem::H3 {
-                    let p = h3o::CellIndex::try_from(parent).unwrap();
-                    assert_eq!(u8::from(p.resolution()), coarse);
-                } else if system == CellSystem::A5 {
-                    let r = a5::core::serialization::get_resolution(parent);
-                    assert_eq!(r, i32::from(coarse));
-                } else {
-                    assert_eq!(parent, system.cell(lon, lat, coarse).unwrap(), "{system:?}");
-                }
+                assert_eq!(parent, system.cell(lon, lat, coarse).unwrap(), "{system:?}");
             }
         }
     }
@@ -1240,6 +1297,72 @@ mod tests {
             ab.aggs[0].finalize(super::super::cluster::AccumulateOp::Mean),
             Some(3.0)
         );
+    }
+
+    /// At every zoom of a band, each feature counts in the cell that holds
+    /// its point, for every system: H3 and A5 parents do not contain their
+    /// children, so a coarse cell cannot be a rollup of fine ones there.
+    #[test]
+    fn every_zoom_counts_each_point_in_the_cell_that_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pts.parquet");
+        // A 60x60 lattice over 6 degrees: plenty of points near coarse edges.
+        let pts: Vec<(f64, f64)> = (0..3600)
+            .map(|i| (-56.0 + (i % 60) as f64 * 0.1, -13.0 + (i / 60) as f64 * 0.1))
+            .collect();
+        let geoms: Vec<Option<Geometry<f64>>> = pts
+            .iter()
+            .map(|&(x, y)| Some(Geometry::Point(geo::Point::new(x, y))))
+            .collect();
+        crate::overview::testutil::write_input(&src, &geoms, false, None);
+        let rollup = CellRollup {
+            accumulate: &[],
+            categories: None,
+        };
+        let (lo, hi) = (0u8, 7u8);
+        for system in CellSystem::ALL {
+            let tables: Vec<_> = (lo..=hi)
+                .map(|z| dir.path().join(format!("{}-{z}.parquet", system.name())))
+                .collect();
+            let paths: Vec<&Path> = tables.iter().map(|t| t.as_path()).collect();
+            write_cell_tables(
+                &ConvertSource::resolve_path(&src).unwrap(),
+                None,
+                system,
+                (lo, hi),
+                rollup,
+                &paths,
+                &ConvertOptions::default(),
+                &crate::diagnostics::Diagnostics::default(),
+            )
+            .unwrap();
+            for (z, table) in (lo..=hi).zip(&tables) {
+                let res = system.resolution(z);
+                let mut want: HashMap<String, i64> = HashMap::new();
+                for &(lon, lat) in &pts {
+                    let id = system.cell(lon, lat, res).unwrap();
+                    *want.entry(system.token(id, res)).or_default() += 1;
+                }
+                let source = ConvertSource::resolve_path(table).unwrap();
+                let plan = crate::input_set::ReadPlan {
+                    batch_size: 1 << 20,
+                    projection: None,
+                    row_groups: None,
+                };
+                let mut got: HashMap<String, i64> = HashMap::new();
+                for batch in source.open_stream(&plan).unwrap() {
+                    let batch = batch.unwrap();
+                    let col =
+                        |name: &str| batch.column(batch.schema().index_of(name).unwrap()).clone();
+                    let counts = col(POINT_COUNT_COLUMN);
+                    let counts = counts.as_primitive::<arrow_array::types::Int64Type>();
+                    for (t, n) in col(CELL_COLUMN).as_string::<i32>().iter().zip(counts) {
+                        got.insert(t.unwrap().to_string(), n.unwrap());
+                    }
+                }
+                assert_eq!(got, want, "{system:?} z{z}");
+            }
+        }
     }
 
     /// A table longer than one written batch keeps every cell, once, in

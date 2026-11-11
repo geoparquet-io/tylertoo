@@ -218,7 +218,7 @@ impl Band {
     }
 
     /// Aggregate the GeoParquet input into cells per zoom before tiling.
-    /// See [`CellSystem`] for cell sizing and approximate H3/A5 parents.
+    /// See [`CellSystem`] for cell sizing.
     #[must_use]
     pub fn with_cells(mut self, system: CellSystem) -> Self {
         self.cells = Some(system);

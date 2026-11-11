@@ -61,9 +61,9 @@ Choose another cell system by changing `a5` in `--band 0-7:a5`:
 | `s2` | Quadrilaterals on a cube |
 | `a5` | Pentagons with equal areas |
 
-Cell resolution follows the zoom in every system. Grid and S2 cells nest
-exactly. H3 and A5 parents are approximate: a coarse cell does not exactly
-contain its children.
+Cell resolution follows the zoom in every system. At every zoom, each field
+counts in the cell that holds its centroid, so counts are exact in every
+system.
 
 Run the script to build the archive. `tylertoo stats` reports tile sizes
 per zoom.
@@ -93,13 +93,13 @@ tylertoo stats brazil.pmtiles
 ✓ Converted admin:country_code=BR → brazil.pmtiles
 ...
  z  tiles    total    mean     p50     p99     max
- 0      1      168     168     168     168     168
- 1      1      154     154     154     154     154
+ 0      1      166     166     166     166     166
+ 1      1      147     147     147     147     147
  2      1      134     134     134     134     134
  3      1      125     125     125     125     125
  4      1      166     166     166     166     166
- 5      1      270     270     270     270     270
- 6      1      408     408     408     408     408
+ 5      1      269     269     269     269     269
+ 6      1      375     375     375     375     375
  7      1      761     761     761     761     761
  8      2   29,194  14,597  13,950  15,244  15,244
  9      4   42,849  10,712  10,530  11,155  11,155
@@ -111,7 +111,7 @@ tylertoo stats brazil.pmtiles
 ```
 
 The run keeps 534 fields. There is one A5 pentagon at each of z0-z3,
-two at z4, five at z5, nine at z6, and 23 at z7. At every cell zoom,
+two at z4, five at z5, eight at z6, and 23 at z7. At every cell zoom,
 `point_count` sums to 534 and `metrics:area` sums to 36,733 ha.
 
 Field tiles are heaviest at z11-z12 and shrink at higher zooms. Drop
@@ -194,7 +194,7 @@ Merging 5 archive(s) → sharded.pmtiles
   z14        125 tiles
 ...
  z  tiles    total    mean     p50     p99     max
- 0      1      168     168     168     168     168
+ 0      1      166     166     166     166     166
 ...
 14    125  230,788   1,846   1,801   4,546   4,987
 ```

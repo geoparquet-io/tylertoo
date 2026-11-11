@@ -18,10 +18,9 @@ Args:
         needs a path prefix, such as `./h3`.
         Cells cover about a 4x4-pixel block of a 256-pixel tile at the
         equator. Grid uses zoom + 6 (capped at 30); the other systems
-        choose resolutions by equatorial cell area. Coarser zooms roll
-        child cells up by parent id: exact for grid and S2, approximate
-        for H3 and A5 because their children do not nest exactly inside
-        their parents. Each row has a `cell` id token and `point_count`.
+        choose resolutions by equatorial cell area. Each feature counts
+        in the cell holding its centroid at every zoom. Each row has a
+        `cell` id token and `point_count`.
         Cell tables are tiled verbatim, even with `generalize=True`.
         Cell bands require GeoParquet, not PMTiles, and reject the
         convert filter and bbox options.
