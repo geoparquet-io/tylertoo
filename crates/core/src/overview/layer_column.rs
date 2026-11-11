@@ -372,6 +372,21 @@ fn split(
         message: e.to_string(),
     };
 
+    // A reprojected input's covering holds source-CRS boxes, and the
+    // staged file declares none (see `staged_metadata`): not staged at all.
+    let covering = match source.resolved_schema()?.covering() {
+        Some(c) if reprojects(source)? => schema.index_of(&c.xmin_path[0]).ok(),
+        _ => None,
+    };
+    let kept: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| Some(i) != covering)
+        .collect();
+    let staged_schema = Arc::new(
+        schema
+            .project(&kept)
+            .map_err(|e| stage_err(field.name(), &e))?,
+    );
+
     let (filter, bbox, mask) = (
         gates.filter.as_ref(),
         gates.bbox.as_ref(),
@@ -434,11 +449,12 @@ fn split(
                     });
                 }
                 let staged =
-                    open_staged(dir, schema, &metadata).map_err(|e| stage_err(name, &e))?;
+                    open_staged(dir, &staged_schema, &metadata).map_err(|e| stage_err(name, &e))?;
                 layers.insert(name.to_string(), staged);
             }
             let staged = layers.get_mut(name).expect("inserted above");
             let part = arrow_select::take::take_record_batch(&batch, &UInt32Array::from(take))
+                .and_then(|p| p.project(&kept))
                 .map_err(|e| stage_err(name, &e))?;
             staged.rows += part.num_rows() as u64;
             staged
@@ -1426,6 +1442,72 @@ mod tests {
             .map(|t| (t.x, t.y))
             .collect();
         assert_eq!(tiles, [(4, 2)]);
+    }
+
+    /// #670: a reprojected input's covering, under any name, holds
+    /// source-CRS boxes; it is not staged, so no layer exports it as a
+    /// property.
+    #[test]
+    fn a_reprojected_input_s_covering_is_not_staged() {
+        use arrow_array::{BinaryArray, Int32Array, RecordBatch, StringArray, StructArray};
+        use arrow_schema::{Field, Fields, Schema};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("utm.parquet");
+        let (x, y) = (500_000.0_f64, 5_500_000.0_f64);
+        let wkb = [
+            &[1u8][..],
+            &1u32.to_le_bytes(),
+            &x.to_le_bytes(),
+            &y.to_le_bytes(),
+        ]
+        .concat();
+        let corners: Fields = ["xmin", "ymin", "xmax", "ymax"]
+            .map(|n| Field::new(n, DataType::Int32, false))
+            .to_vec()
+            .into();
+        let extent = StructArray::new(
+            corners.clone(),
+            [x, y, x, y]
+                .map(|v| Arc::new(Int32Array::from(vec![v as i32])) as arrow_array::ArrayRef)
+                .to_vec(),
+            None,
+        );
+        let geo = r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":
+            {"encoding":"WKB","geometry_types":[],"crs":"EPSG:32633","covering":{"bbox":{
+            "xmin":["extent","xmin"],"ymin":["extent","ymin"],
+            "xmax":["extent","xmax"],"ymax":["extent","ymax"]}}}}}"#;
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("geometry", DataType::Binary, false),
+                Field::new("crop", DataType::Utf8, false),
+                Field::new("extent", DataType::Struct(corners), false),
+            ],
+            [("geo".to_string(), geo.to_string())].into(),
+        ));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(BinaryArray::from_iter_values([wkb])),
+                Arc::new(StringArray::from(vec!["soy"])),
+                Arc::new(extent),
+            ],
+        )
+        .unwrap();
+        let mut writer = tylertoo_io::test_support::ArrowWriter::try_new(
+            std::fs::File::create(&input).unwrap(),
+            schema,
+            None,
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let out = dir.path().join("o.pmtiles");
+        convert_to_pmtiles(&TilesInput::Path(input), &out, &options("crop")).unwrap();
+        let at_z3 = layers_at(&out, 3);
+        assert_eq!(at_z3["soy"].len(), 1, "{at_z3:?}");
+        assert!(at_z3["soy"][0].iter().all(|k| k != "extent"), "{at_z3:?}");
     }
 
     /// An unsupported CRS is refused from the footer, before the split.
