@@ -34,6 +34,7 @@ Exit status:
 | [`pyramid`](#tylertoo-pyramid) | Build one archive from several inputs, each owning a zoom range |
 | [`merge`](#tylertoo-merge) | Combine PMTiles archives that hold disjoint tiles into one |
 | [`shard-plan`](#tylertoo-shard-plan) | Cut a dataset's tile space into N disjoint shards for a sharded build |
+| [`serve`](#tylertoo-serve) | Serve PMTiles archives over HTTP with a map viewer |
 
 ### Global options
 
@@ -86,6 +87,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | `-v`, `--verbose` | Print per-level and per-zoom breakdowns. |
 | `-f`, `--force` | Overwrite the output if it exists. |
 | `--layer-name <LAYER_NAME>` | Layer name for the tiles. Defaults to the input's file stem. |
+| `--layer-column <COLUMN>` | Put each feature in the layer named by its value in COLUMN, and null or blank values in `_unknown`. The column is not written as a property. Each layer is tiled on its own, so the size caps apply per layer. |
 | `--keep-overview <PATH>` | Save the intermediate overview GeoParquet to PATH after export. Does not change the PMTiles output. |
 
 ### Generalization
@@ -383,6 +385,38 @@ tylertoo shard-plan [OPTIONS] --output <PATH> --shards <N> [INPUT]
 | `--pivot <ZOOM>` | Pivot zoom: data shards cover this zoom through `--max-zoom`; the coarse job covers lower zooms. Choose a zoom with a few populated tiles per shard, usually z4 to z8. Default: `6`. |
 | `-f`, `--force` | Overwrite an existing plan at `--output`. |
 
+## `tylertoo serve`
+
+Serve PMTiles archives over HTTP with a map viewer.
+
+Run until Ctrl-C. The viewer at `/` handles MVT and MLT archives. It loads MapLibre GL JS from unpkg.com and needs internet access.
+
+`/index.json` lists archive names. Each `{name}` is the archive's file stem. `/{name}.json` returns TileJSON; `/{name}/{z}/{x}/{y}` returns tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns archive metadata; `/{name}/stats.json` returns tile-size statistics. `/{name}.pmtiles` serves the archive with HTTP Range support. It honours `If-Match` and `If-Range` against its `ETag`. If a Range read detects the file being rewritten in place during the read, it returns HTTP 412 for requests with `If-Match` or `If-Range`, or HTTP 503 otherwise. A whole-file download caught by a rewrite is cut off before its `Content-Length`. Renaming another file over the path does not affect a download in progress.
+
+At most 64 responses can be in flight at once. Further requests get HTTP 503 with `Retry-After: 1`.
+
+`serve` returns HTTP 204 for missing tiles without scaling up a stored ancestor, so variable-depth archives (`--generate-variable-depth-tile-pyramid`) show holes below stopped tiles; `serve` warns when it opens one.
+
+An archive rewritten on disk is reopened on the next request for it; if it does not reopen, requests for it return HTTP 503 until it does.
+
+```text
+tylertoo serve [OPTIONS] <ARCHIVE>...
+```
+
+### Arguments
+
+| Argument | Description |
+| --- | --- |
+| `<ARCHIVE>` | PMTiles archives to serve, each named by its file stem. |
+
+### Options
+
+| Option | Description |
+| --- | --- |
+| `--host <ADDR>` | Address to bind. The default allows local access only. Use `--host 0.0.0.0` or another address to expose it to the network. Default: `127.0.0.1`. |
+| `--port <N>` | Port to listen on. Use `--port 0` to pick a free port. Default: `8080`. |
+| `--cors <ORIGIN>` | Allow pages from ORIGIN to read responses. Repeat `--cors ORIGIN` for multiple origins. Each value is an exact origin such as `https://pmtiles.io`, or `*` for any origin. With no `--cors`, no Access-Control headers are sent, so pages on other origins cannot read the archives. The built-in viewer is same-origin and needs none. |
+
 ## Shared conversion options
 
 These options apply to both `tylertoo tiles` and `tylertoo overview`.
@@ -480,6 +514,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 
 | Option | Description |
 | --- | --- |
+| `--mask <PATH>` | Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (.geojson/.json, RFC 7946 lon/lat) or GeoParquet file; touching and copies one ±360° wrap away count. Skips row groups by the mask's bbox, combines with --bbox and --filter by AND, and refuses a CRS mismatch: reproject the mask to the input's CRS first. |
 | `--filter <EXPR>` [alias: `where`] | Filter property columns with a SQL `WHERE` predicate, such as `confidence > 0.8`. Skips row groups that cannot match. Grammar: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
 
 ### Properties

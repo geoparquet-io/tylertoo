@@ -361,7 +361,11 @@ impl RowGroupSelection {
             .0
             .iter()
             .zip(&other.0)
-            .map(|(a, b)| a.iter().copied().filter(|i| b.contains(i)).collect())
+            .map(|(a, b)| {
+                // A set, not `b.contains`: many kept groups made this quadratic.
+                let b: std::collections::HashSet<usize> = b.iter().copied().collect();
+                a.iter().copied().filter(|i| b.contains(i)).collect()
+            })
             .collect();
         RowGroupSelection(parts)
     }

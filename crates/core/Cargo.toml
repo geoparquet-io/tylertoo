@@ -33,6 +33,8 @@ fuzzing = []
 # mlt-core needs Rust 1.98, above this crate's rust-version; the CLI and the
 # Python wheel turn it on.
 mlt = ["dep:mlt-core"]
+# `tylertoo serve` (#825): a small blocking HTTP server, no async runtime.
+serve = ["dep:tiny_http", "dep:percent-encoding"]
 # Remote input support: read GeoParquet directly from s3://, https://,
 # and gs:// URLs via range requests (issue #210). Off by default to keep
 # the pure-local library build dependency-light; the CLI enables it.
@@ -68,6 +70,8 @@ geo = { workspace = true }
 wkb = { workspace = true }
 prost = { workspace = true }
 mlt-core = { workspace = true, optional = true }
+tiny_http = { version = "0.12", optional = true }
+percent-encoding = { version = "2", optional = true }
 rayon = { workspace = true }
 crossbeam-channel = { workspace = true }
 thiserror = { workspace = true }
@@ -86,6 +90,8 @@ fast_hilbert = "2.1"
 # Orphan-cell nearest lookup (overview/cluster.rs); 0.12 is the version geo
 # already pulls in.
 rstar = "0.12"
+# `--mask` GeoJSON (#826); the tests' WKB decoding already uses it.
+geozero = { workspace = true, features = ["with-geojson"] }
 serde = { workspace = true }
 serde_path_to_error = "0.1"
 # 1.0.129: Value::sort_all_objects (overview/writer.rs).
@@ -126,8 +132,6 @@ tylertoo-io = { workspace = true, features = ["test-support"] }
 criterion = { package = "codspeed-criterion-compat", version = "5", features = ["html_reports"] }
 serde_json = "1"
 proptest = { workspace = true }
-# Test and bench fixtures only: decoding WKB literals into geo types.
-geozero = { workspace = true }
 
 [[bench]]
 name = "clipping"

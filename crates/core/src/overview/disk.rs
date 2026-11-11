@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::input_set::{ConvertSource, RowGroupSelection};
 
-use super::convert::{BboxQuery, ConvertError, ConvertOptions};
+use super::convert::{ConvertError, ConvertOptions};
 use super::level::{MemoryProfile, Mode};
 use super::memory::MemoryBudget;
 use super::stream::select_row_groups_streaming;
@@ -112,13 +112,23 @@ impl DiskFootprint {
     ) -> Result<Self, ConvertError> {
         // The `tiles` facade sizes before the passes select (#817 R1): select
         // here as they will, or a `--bbox` is sized as the whole input.
-        let derived = if selection.is_none() && (options.bbox.is_some() || options.shard.is_some())
+        let derived = if selection.is_none()
+            && (options.bbox.is_some() || options.mask.is_some() || options.shard.is_some())
         {
             source.resolved_schema()?.crs().and_then(|crs| {
-                let bbox = options.bbox.map(|b| BboxQuery::new(&b, crs));
+                // An unusable mask fails the preflight later; size without it.
+                let mask = options.mask.as_ref().and_then(|m| {
+                    super::mask::load_for_input(m, crs, &crate::diagnostics::Diagnostics::silent())
+                        .ok()
+                });
+                let bbox = options
+                    .bbox
+                    .map(|b| super::convert::BboxQuery::new(&b, crs));
+                let mask = super::mask::mask_query(mask.as_ref(), crs);
                 select_row_groups_streaming(
                     source,
                     bbox.as_ref(),
+                    mask.as_ref(),
                     None,
                     options.shard.as_ref(),
                     crs,
@@ -172,6 +182,20 @@ impl DiskFootprint {
             );
         }
         Ok(footprint)
+    }
+
+    /// `tiles --layer-column` (#821): the split's uncompressed copy of the
+    /// selected input, staged in `dir`.
+    pub(super) fn add_staged_layers(
+        &mut self,
+        source: &ConvertSource,
+        selection: Option<&RowGroupSelection>,
+        options: &ConvertOptions,
+        dir: &Path,
+    ) -> Result<(), ConvertError> {
+        let raw = RawSinkSize::from_source(source, selection, options)?;
+        self.add(dir, "staged layers", raw.bytes(1, 1));
+        Ok(())
     }
 
     pub(super) fn add(&mut self, dir: &Path, name: &'static str, bytes: u64) {
@@ -324,6 +348,33 @@ mod tests {
         let whole = spill(None);
         let clipped = spill(Some([0.0, -1.0, 5.0, 1.0]));
         assert!(clipped > 0 && clipped * 3 < whole, "{clipped} vs {whole}");
+    }
+
+    /// #821: a `--layer-column` run's staged copy of the input is named in
+    /// the footprint, in the directory it is staged in.
+    #[test]
+    fn staged_layers_are_part_of_the_footprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        super::super::testutil::write_input(
+            &input,
+            &[Some(geo::Geometry::Point(geo::Point::new(1.0, 2.0)))],
+            false,
+            None,
+        );
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        let mut disk = DiskFootprint::default();
+        disk.add_staged_layers(
+            &source,
+            None,
+            &ConvertOptions::default(),
+            Path::new("/scratch"),
+        )
+        .unwrap();
+        let warning = disk
+            .warning_with(super::super::tiles::CLI_REMEDIES, |_| Some(("v".into(), 0)))
+            .unwrap();
+        assert!(warning.contains("staged layers in /scratch"), "{warning}");
     }
 
     #[test]

@@ -25,7 +25,9 @@ pub mod filter;
 #[cfg(test)]
 mod hostile;
 pub mod ladder;
+pub mod layer_column;
 pub mod level;
+pub mod mask;
 mod memory;
 mod pipe;
 mod pipeline;

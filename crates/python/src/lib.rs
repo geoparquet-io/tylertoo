@@ -120,6 +120,13 @@ fn keywords(
             let key = key.extract::<String>()?;
             let value = if !value.is_instance_of::<PyString>() && value.hasattr("__fspath__")? {
                 fspath.call1((value,))?
+            } else if key == "mask"
+                && !value.is_instance_of::<PyString>()
+                && value.hasattr("wkb")?
+            {
+                // A shapely geometry: core reads its own WKB (#826).
+                let wkb: Vec<u8> = value.getattr("wkb")?.extract()?;
+                pyo3::types::PyList::new(py, wkb)?.into_any()
             } else {
                 value
             };
@@ -202,6 +209,23 @@ fn report_dict_with_losses(
     )],
 ) -> PyResult<Py<PyDict>> {
     let dict = report_dict(py, report)?;
+    attach_loss_paths(py, &dict, losses)?;
+    for (losses, _) in losses {
+        losses.publish_python();
+    }
+    Ok(dict)
+}
+
+/// Set each spilled `source_losses.path` in `dict` (under `section`, or at
+/// the top level), without publishing the spills yet.
+fn attach_loss_paths(
+    py: Python<'_>,
+    dict: &Py<PyDict>,
+    losses: &[(
+        &tylertoo_core::internal::diagnostics::SourceLosses,
+        Option<&str>,
+    )],
+) -> PyResult<()> {
     for (losses, section) in losses {
         if let Some(path) = losses.python_path() {
             let parent = if let Some(section) = section {
@@ -214,10 +238,7 @@ fn report_dict_with_losses(
             parent.get_item("source_losses")?.set_item("path", path)?;
         }
     }
-    for (losses, _) in losses {
-        losses.publish_python();
-    }
-    Ok(dict)
+    Ok(())
 }
 
 fn check_keywords(
@@ -318,6 +339,42 @@ fn convert(
                 (&report.convert.source_losses, Some("convert")),
                 (&report.export.source_losses, Some("export")),
             ])
+        },
+        // #821: one report per layer, each keyed like a plain run's.
+        TilesOutcome::Layered(mut report) => {
+            // The layers share one run's allowance for inline loss lists.
+            let parts = report.layers.len();
+            for layer in &mut report.layers {
+                let r = &mut layer.report;
+                r.convert.source_losses = r.convert.source_losses
+                    .for_python_shared(parts)
+                    .map_err(accounting_error_to_py)?;
+                r.export.source_losses = r.export.source_losses
+                    .for_python_shared(parts)
+                    .map_err(accounting_error_to_py)?;
+            }
+            let dict = report_dict(py, &*report)?;
+            fn spills(
+                layer: &tylertoo_core::LayerReport,
+            ) -> [(&tylertoo_core::internal::diagnostics::SourceLosses, Option<&'static str>); 2] {
+                [
+                    (&layer.report.convert.source_losses, Some("convert")),
+                    (&layer.report.export.source_losses, Some("export")),
+                ]
+            }
+            let layers = dict.bind(py).get_item("layers")?
+                .ok_or_else(|| PyRuntimeError::new_err("missing report section"))?;
+            for (i, layer) in report.layers.iter().enumerate() {
+                let entry = layers.get_item(i)?.cast_into::<PyDict>()?.unbind();
+                attach_loss_paths(py, &entry, &spills(layer))?;
+            }
+            // Only a complete result hands its spills to the caller.
+            for layer in &report.layers {
+                for (losses, _) in spills(layer) {
+                    losses.publish_python();
+                }
+            }
+            Ok(dict)
         },
         // Unreachable without a shard job, which this facade never sets.
         other => Err(PyRuntimeError::new_err(format!(
@@ -505,6 +562,49 @@ fn pyramid(
 }
 }
 
+signature_serve! {
+fn serve(
+    py: Python<'_>,
+    archive: &Bound<'_, PyAny>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<()> {
+    refresh_log_levels(py);
+    let values = keywords(kwargs)?;
+    let mut defaults = config_keywords::command_defaults("serve");
+    for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
+    defaults.extend(values);
+    let host: String = serde_json::from_value(defaults.remove("host").unwrap()).map_err(|e| config_err(format!("host: {e}")))?;
+    let port: u16 = serde_json::from_value(defaults.remove("port").unwrap()).map_err(|e| config_err(format!("port: {e}")))?;
+    // One origin, or a list of them, like the CLI's repeated `--cors`.
+    let cors: Vec<String> = match defaults.remove("cors").unwrap() {
+        serde_json::Value::String(origin) => vec![origin],
+        v => serde_json::from_value(v).map_err(|e| config_err(format!("cors: {e}")))?,
+    };
+    // One path, or a list of them, like the CLI's `ARCHIVE...`.
+    let archives: Vec<PathBuf> = match archive.extract::<PathBuf>() {
+        Ok(path) => vec![path],
+        Err(_) => archive.extract()?,
+    };
+    let server = py
+        .detach(|| tylertoo_core::internal::serve::Server::bind(&archives, &host, port, &cors))
+        .map_err(|e| to_py(e.kind(), e.to_string(), None))?;
+    let builtins = PyModule::import(py, "builtins")?;
+    builtins.getattr("print")?.call1((format!("Serving {} on {}", archives.len(), server.url()),))?;
+    // The loop polls Python's signal handlers, so Ctrl-C raises
+    // KeyboardInterrupt here, as it does in `http.server`.
+    let mut interrupted = None;
+    py.detach(|| {
+        server.run(|| {
+            Python::attach(|py| py.check_signals())
+                .map_err(|e| interrupted = Some(e))
+                .is_ok()
+        })
+    })
+    .map_err(|e| to_py(e.kind(), e.to_string(), None))?;
+    interrupted.map_or(Ok(()), Err)
+}
+}
+
 /// Native body of `tylertoo._defaults()`: every keyword default of every
 /// function, keyed `{function: {keyword: default}}`, built from the core
 /// `Default` impls (#779), also used to generate native signatures.
@@ -518,6 +618,7 @@ fn _defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
         "pyramid",
         "decode",
         "stats",
+        "serve",
     ] {
         out.set_item(
             name,
@@ -555,6 +656,7 @@ fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(pyramid, m)?)?;
     m.add_function(wrap_pyfunction!(stats, m)?)?;
+    m.add_function(wrap_pyfunction!(serve, m)?)?;
     m.add_function(wrap_pyfunction!(_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(_run_cli, m)?)?;
     Ok(())
@@ -567,6 +669,20 @@ mod config_parity {
     use serde_json::{json, Value};
     use tylertoo_core::internal::overview::config::cli;
     use tylertoo_core::internal::overview::convert::LevelPlan;
+
+    /// A `--mask` file for the parity entries; validation reads it (#826).
+    fn mask_file(test: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "tylertoo-parity-mask-{test}-{}.geojson",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}"#,
+        )
+        .unwrap();
+        path.to_str().unwrap().to_owned()
+    }
 
     fn native_keywords(value: Value) -> serde_json::Map<String, Value> {
         Python::attach(|py| {
@@ -592,10 +708,13 @@ mod config_parity {
             serde_json::to_value(python.validate().unwrap().options()).unwrap(),
             expected
         );
+        let mask = mask_file("overview");
         let args = cli::OverviewArgs::parse_from([
             "overview",
             "in",
             "out",
+            "--mask",
+            &mask,
             "--min-zoom",
             "1",
             "--max-zoom",
@@ -610,7 +729,7 @@ mod config_parity {
             "id",
         ]);
         let cli = cli::overview_options(&args).unwrap();
-        let python = overview_config(native_keywords(json!({"min_zoom": 1, "max_zoom": 3, "row_group_size": 1234, "cascade": false, "drop_lines": true, "sort_direction": "asc", "include_properties": ["id"]}))).unwrap();
+        let python = overview_config(native_keywords(json!({"min_zoom": 1, "max_zoom": 3, "row_group_size": 1234, "cascade": false, "drop_lines": true, "sort_direction": "asc", "include_properties": ["id"], "mask": mask}))).unwrap();
         let mut core = ConvertOptions::default()
             .with_levels(LevelPlan::ZoomRange {
                 min_zoom: 1,
@@ -621,6 +740,7 @@ mod config_parity {
         core.density.kinds.lines = true;
         core.assign.sort_direction = tylertoo_core::internal::overview::assign::SortDirection::Asc;
         core.properties.include = Some(vec!["id".into()]);
+        core.mask = Some(std::path::PathBuf::from(&mask).into());
         let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
         assert_eq!(
             serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
@@ -654,10 +774,13 @@ mod config_parity {
             serde_json::to_value(python.validate().unwrap().options()).unwrap(),
             expected
         );
+        let mask = mask_file("tiles");
         let args = cli::TilesArgs::parse_from([
             "tiles",
             "in",
             "out",
+            "--mask",
+            &mask,
             "--verbatim",
             "--point-thinning",
             "2",
@@ -669,7 +792,7 @@ mod config_parity {
             "places",
         ]);
         let cli = cli::tiles_options(&args).unwrap();
-        let python = tiles_config(native_keywords(json!({"verbatim": true, "point_thinning": 2.0, "extent": 8192, "max_compressed_tile_size": 1048576, "layer_name": "places"}))).unwrap();
+        let python = tiles_config(native_keywords(json!({"verbatim": true, "point_thinning": 2.0, "extent": 8192, "max_compressed_tile_size": 1048576, "layer_name": "places", "mask": mask}))).unwrap();
         let mut core = TilesOptions::default();
         core.convert = core.convert.verbatim();
         core.convert.assign.point_thinning = 2.0;
@@ -677,6 +800,7 @@ mod config_parity {
         core.export.extent = 8192;
         core.export.compressed_tile_size_limit = Some(1048576);
         core.layer_name = Some("places".into());
+        core.convert.mask = Some(std::path::PathBuf::from(&mask).into());
         let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
         assert_eq!(
             serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
@@ -686,6 +810,45 @@ mod config_parity {
             serde_json::to_value(python.validate().unwrap().options()).unwrap(),
             core
         );
+    }
+
+    /// #821: `--layer-column` and `layer_column=` build the same options,
+    /// and both refuse it beside a layer name.
+    #[test]
+    fn tiles_layer_column_cli_python_core_configs_are_equal() {
+        let args = cli::TilesArgs::parse_from(["tiles", "in", "out", "--layer-column", "crop"]);
+        let cli = cli::tiles_options(&args).unwrap();
+        let python = tiles_config(native_keywords(json!({"layer_column": "crop"}))).unwrap();
+        let core = TilesOptions::default().with_layer_column(Some("crop".into()));
+        let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
+            core
+        );
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            core
+        );
+
+        assert!(cli::TilesArgs::try_parse_from([
+            "tiles",
+            "in",
+            "out",
+            "--layer-column",
+            "crop",
+            "--layer-name",
+            "x",
+        ])
+        .is_err());
+        let both = tiles_config(native_keywords(
+            json!({"layer_column": "crop", "layer_name": "x"}),
+        ))
+        .unwrap();
+        assert!(both
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("--layer-name"));
     }
 
     #[test]

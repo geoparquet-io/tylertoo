@@ -1,5 +1,5 @@
 //! Immutable, bounded views of the exact source-loss ledger.
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -71,8 +71,7 @@ impl SourceLosses {
                             std::io::Error::other("source loss snapshot lost its zoom")
                         })?;
                         rows.file
-                            .seek(SeekFrom::Start(row * accounting::RECORD_BYTES))?;
-                        rows.file.read_exact(&mut page[..n])
+                            .read_at(row * accounting::RECORD_BYTES, &mut page[..n])
                     })();
                     if let Err(e) = result {
                         failed = true;
@@ -142,6 +141,21 @@ impl SourceLosses {
         }
         Ok(())
     }
+    /// Close the file descriptors of a finished snapshot: each ledger that
+    /// went to disk moves to a named file opened only while it is read. A
+    /// `--layer-column` run (#821) keeps a report per layer, and their open
+    /// ledgers would otherwise exhaust the descriptor limit.
+    ///
+    /// # Errors
+    /// Returns an error if a ledger cannot be copied.
+    pub(crate) fn seal(&self) -> Result<(), AccountingError> {
+        let mut ledger = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+        for rows in ledger.values_mut() {
+            rows.seal(self.spill_dir.as_deref())?;
+        }
+        Ok(())
+    }
+
     #[doc(hidden)]
     /// Prepare a bounded Python dict. Large lists become `{count, path}`.
     /// The file is removed on drop until [`Self::publish_python`] transfers
@@ -151,9 +165,19 @@ impl SourceLosses {
     /// # Errors
     /// Returns an error if the spill cannot be read or written.
     pub fn for_python(&self) -> Result<Self, AccountingError> {
+        self.for_python_shared(1)
+    }
+
+    #[doc(hidden)]
+    /// [`Self::for_python`] for one of `parts` reports returned together
+    /// (a `--layer-column` run's layers, #821), which share one allowance.
+    ///
+    /// # Errors
+    /// Returns an error if the spill cannot be read or written.
+    pub fn for_python_shared(&self, parts: usize) -> Result<Self, AccountingError> {
         let mut out = self.clone();
         // Conservative allowance for Python dicts, strings, ints and list slots.
-        if self.len() > self.budget / 1024 && out.python_file.is_none() {
+        if self.len() > self.budget / 1024 / parts.max(1) && out.python_file.is_none() {
             let mut file = self.spill_dir.as_ref().map_or_else(
                 tempfile::NamedTempFile::new,
                 tempfile::NamedTempFile::new_in,
