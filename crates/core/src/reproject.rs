@@ -129,7 +129,7 @@ impl ToLonLat {
         depth: u8,
         acc: &mut Hull,
     ) -> Option<()> {
-        if !(pa.0.is_finite() && pa.1.is_finite()) {
+        if !(pa.0.is_finite() && pa.1.is_finite() && pb.0.is_finite() && pb.1.is_finite()) {
             return None;
         }
         acc.b = [
@@ -143,7 +143,10 @@ impl ToLonLat {
         let off = (pm.0 - (pa.0 + pb.0) / 2.0)
             .abs()
             .max((pm.1 - (pa.1 + pb.1) / 2.0).abs());
-        if depth < 4 || (off > 1e-7 && depth < 12) || !off.is_finite() {
+        if !off.is_finite() {
+            return None;
+        }
+        if depth < 4 || (off > 1e-7 && depth < 12) {
             self.edge(a, pa, m, pm, depth + 1, acc)?;
             return self.edge(m, pm, b, pb, depth + 1, acc);
         }

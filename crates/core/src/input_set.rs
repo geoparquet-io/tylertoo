@@ -1457,10 +1457,16 @@ impl MultiSource {
                 offender: part.display_name(),
                 detail,
             };
+            // Only a declared CRS is one the reader reprojects from; an
+            // assumed one ignores the extension metadata, which must match.
+            let declared = |m: &PartMeta| !m.resolved.crs_info().assumed_wgs84;
             validate_schema_shape(
                 &metas[0].schema,
                 &meta.schema,
-                metas[0].resolved.geometry_name(),
+                metas[0]
+                    .resolved
+                    .geometry_name()
+                    .filter(|_| declared(&metas[0]) && declared(meta)),
             )
             .map_err(incompatible)?;
             if meta.resolved.geometry_name() != metas[0].resolved.geometry_name() {
@@ -2286,6 +2292,46 @@ mod tests {
         assert!(validate_schema_shape(&a, &b, Some("geometry")).is_ok());
         assert!(validate_schema_shape(&a, &b, None).is_err());
         assert!(validate_schema_shape(&a, &c, Some("geometry")).is_err());
+    }
+
+    /// #670: a CRS only in the extension metadata is not one the reader
+    /// reprojects from, so parts that differ there stay incompatible.
+    #[test]
+    fn extension_only_crs_difference_is_still_refused() {
+        let dir = tmpdir();
+        for (file, crs) in [("a.parquet", "EPSG:28992"), ("b.parquet", "EPSG:31370")] {
+            let md = [
+                (
+                    "ARROW:extension:name".to_string(),
+                    "geoarrow.wkb".to_string(),
+                ),
+                (
+                    "ARROW:extension:metadata".to_string(),
+                    format!(r#"{{"crs":"{crs}"}}"#),
+                ),
+            ];
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "geometry",
+                DataType::Binary,
+                true,
+            )
+            .with_metadata(md.into())]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::BinaryArray::from_vec(vec![b"".as_ref()])) as ArrayRef],
+            )
+            .unwrap();
+            let mut writer =
+                ArrowWriter::try_new(File::create(dir.path().join(file)).unwrap(), schema, None)
+                    .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let err = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, InputError::IncompatiblePartition { .. }),
+            "{err:?}"
+        );
     }
 
     /// #708: a part that declares EPSG:4326 and a part that declares nothing
