@@ -154,6 +154,7 @@ use crate::input::InputError;
 use crate::input_set::{ConvertSource, RowGroupSelection};
 
 mod coalesce_valve;
+mod packed_geom;
 mod tile_data;
 use tile_data::TileData;
 
@@ -4436,12 +4437,27 @@ fn key_to_xy(key: u64, zoom: u8) -> (u32, u32) {
     (x, y)
 }
 
-/// A member's geometry: its own, or the feature's decoded geometry shared by
+/// A member's geometry: its own, the feature's decoded geometry shared by
 /// every level whose tile holds the feature unclipped (#815: the partitioning
-/// fill held one copy per level). Reads as a plain [`Geometry`].
+/// fill held one copy per level), or its own packed at rest in a
+/// [`MemberStore`] ([`packed_geom`]). Reads as a plain [`Geometry`] once
+/// [`Member::unpacked`] has decoded it for its tile.
 enum MemberGeom {
     Owned(Geometry<f64>),
     Shared(Arc<Geometry<f64>>),
+    Packed(Box<[u8]>),
+}
+
+impl MemberGeom {
+    /// Pack an owned geometry for rest; a shared one stays shared, and a
+    /// shape [`packed_geom::pack`] does not hold stays f64.
+    fn pack(&mut self) {
+        if let MemberGeom::Owned(g) = self {
+            if let Some(bytes) = packed_geom::pack(g) {
+                *self = MemberGeom::Packed(bytes);
+            }
+        }
+    }
 }
 
 impl std::ops::Deref for MemberGeom {
@@ -4451,6 +4467,9 @@ impl std::ops::Deref for MemberGeom {
         match self {
             MemberGeom::Owned(g) => g,
             MemberGeom::Shared(g) => g,
+            MemberGeom::Packed(_) => {
+                unreachable!("a packed member is decoded for its tile before its geometry is read")
+            }
         }
     }
 }
@@ -4493,6 +4512,30 @@ struct Member {
     /// The level band the row was read from. In partitioning mode a tile
     /// holds several bands, and the valve merges only within one.
     band: u16,
+}
+
+impl Member {
+    /// This member with its geometry decoded, for its tile's encode: a
+    /// packed geometry unpacks, a shared one is shared, an owned one is
+    /// cloned.
+    fn unpacked(&self) -> Result<Member, ExportError> {
+        let geom = match &self.geom {
+            MemberGeom::Packed(bytes) => {
+                MemberGeom::Owned(packed_geom::unpack(bytes).ok_or_else(spill_corrupt)?)
+            }
+            MemberGeom::Shared(g) => MemberGeom::Shared(Arc::clone(g)),
+            MemberGeom::Owned(g) => MemberGeom::Owned(g.clone()),
+        };
+        Ok(Member {
+            key: self.key,
+            seq: self.seq,
+            geom,
+            props: Arc::clone(&self.props),
+            id: self.id,
+            gap: self.gap,
+            band: self.band,
+        })
+    }
 }
 
 /// One level's result from the scan pass ([`scan_all_levels`]).
@@ -4982,7 +5025,22 @@ fn encode_member(buf: &mut Vec<u8>, m: &Member) {
             }
         }
     }
-    encode_geometry(buf, &m.geom);
+    match &m.geom {
+        MemberGeom::Packed(bytes) => put_packed(buf, bytes),
+        g => match packed_geom::pack(g) {
+            Some(bytes) => put_packed(buf, &bytes),
+            None => encode_geometry(buf, g),
+        },
+    }
+}
+
+/// The spill tag of a packed geometry, after [`encode_geometry`]'s.
+const SPILL_PACKED: u8 = 10;
+
+fn put_packed(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.push(SPILL_PACKED);
+    put_u32(buf, bytes.len() as u32);
+    buf.extend_from_slice(bytes);
 }
 
 /// The "spill decode failed" error: the temp file is written and read by this
@@ -5071,7 +5129,26 @@ impl<'a> SpillCursor<'a> {
 }
 
 fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportError> {
-    Ok(match cur.u8()? {
+    let tag = cur.u8()?;
+    decode_tagged_geometry(tag, cur)
+}
+
+/// A member's spilled geometry: packed bytes stay packed until its tile.
+fn decode_member_geom(cur: &mut SpillCursor<'_>) -> Result<MemberGeom, ExportError> {
+    match cur.u8()? {
+        SPILL_PACKED => {
+            let n = cur.u32()? as usize;
+            Ok(MemberGeom::Packed(cur.take(n)?.into()))
+        }
+        tag => decode_tagged_geometry(tag, cur).map(MemberGeom::Owned),
+    }
+}
+
+fn decode_tagged_geometry(
+    tag: u8,
+    cur: &mut SpillCursor<'_>,
+) -> Result<Geometry<f64>, ExportError> {
+    Ok(match tag {
         0 => Geometry::Point(geo::Point(cur.coord()?)),
         1 => Geometry::Line(geo::Line::new(cur.coord()?, cur.coord()?)),
         2 => Geometry::LineString(cur.line_string()?),
@@ -5203,11 +5280,11 @@ fn decode_member(cur: &mut SpillCursor<'_>, names: &mut SpillNames) -> Result<Me
         };
         props.push((name, value));
     }
-    let geom = decode_geometry(cur)?;
+    let geom = decode_member_geom(cur)?;
     Ok(Member {
         key,
         seq,
-        geom: geom.into(),
+        geom,
         props: Arc::new(props),
         id,
         gap,
@@ -5221,16 +5298,19 @@ fn decode_member(cur: &mut SpillCursor<'_>, names: &mut SpillNames) -> Result<Me
 /// costs only its 16 B `Arc<str>` handle: the text lives once in the
 /// per-schema table (#461).
 fn member_bytes_estimate(m: &Member) -> usize {
-    64 + m.geom.coords_count() * 16
-        + m.props
-            .iter()
-            .map(|(_, v)| {
-                16 + match v {
-                    PropertyValue::String(s) => s.len(),
-                    _ => 8,
-                }
-            })
-            .sum::<usize>()
+    64 + match &m.geom {
+        MemberGeom::Packed(bytes) => bytes.len(),
+        g => g.coords_count() * 16,
+    } + m
+        .props
+        .iter()
+        .map(|(_, v)| {
+            16 + match v {
+                PropertyValue::String(s) => s.len(),
+                _ => 8,
+            }
+        })
+        .sum::<usize>()
 }
 
 /// The single spill file behind a [`MemberStore`]: bucket flushes append
@@ -5368,7 +5448,8 @@ impl MemberStore {
         })
     }
 
-    fn push(&mut self, level: usize, wave: usize, m: Member) -> Result<(), ExportError> {
+    fn push(&mut self, level: usize, wave: usize, mut m: Member) -> Result<(), ExportError> {
+        m.geom.pack();
         let est = member_bytes_estimate(&m);
         self.buckets[level][wave].push(m);
         self.bucket_bytes[level][wave] += est;
@@ -8701,6 +8782,17 @@ fn encode_members(
     // #535: `encode` is timed per tile, inside this closure (core-seconds).
     let encode_group = |g: &[Member]| -> Option<Result<EncodedTile, ExportError>> {
         let _encode = ExportTimers::scope(&timers.encode);
+        // Members packed at rest decode for their tile only (#815).
+        let unpacked: Vec<Member>;
+        let g = if g.iter().any(|m| matches!(m.geom, MemberGeom::Packed(_))) {
+            match g.iter().map(Member::unpacked).collect() {
+                Ok(members) => unpacked = members,
+                Err(error) => return Some(Err(error)),
+            }
+            &unpacked[..]
+        } else {
+            g
+        };
         let (x, y) = key_to_xy(g[0].key, zoom);
         let tb = TileCoord::new(x, y, zoom).bounds();
         // #788: the tile's fill is owned for the encode and dropped once
@@ -18374,6 +18466,99 @@ mod tests {
         assert!(w0.iter().all(|m| m.key == 0));
         assert!(w1.iter().all(|m| m.key == 1));
         assert_eq!(w0[0].props[0].1, PropertyValue::Int(0));
+    }
+
+    /// #815: a member at rest in the store, in RAM or spilled, holds its
+    /// geometry packed at a few bytes per vertex where f64 took 16, and its
+    /// tile's encode decodes it.
+    #[test]
+    fn stored_members_hold_their_vertices_packed() {
+        let plans = vec![LevelPlan {
+            zoom: 14,
+            partitions: partitions_with_members(&[1, 1]),
+            wave: 1,
+        }];
+        let ring: Vec<(f64, f64)> = (0..=400)
+            .map(|i| {
+                let t = f64::from(i) / 400.0 * std::f64::consts::TAU;
+                let nano = |v: f64| (v * 1e9).round() / 1e9;
+                (
+                    nano(174.776 + 0.0002 * t.cos()),
+                    nano(-41.286 + 0.0002 * t.sin()),
+                )
+            })
+            .collect();
+        let mk = |key: u64| Member {
+            key,
+            seq: key,
+            geom: Geometry::Polygon(geo::Polygon::new(LineString::from(ring.clone()), vec![]))
+                .into(),
+            props: Arc::new(Vec::new()),
+            id: None,
+            gap: GAP_NONE,
+            band: 0,
+        };
+        for backing in [SinkBacking::Ram, SinkBacking::Spill] {
+            let mut store =
+                MemberStore::new(&plans, backing, MEMBER_STORE_RAM_BUDGET, None).unwrap();
+            store.push(0, 0, mk(0)).unwrap();
+            store.finish_fill().unwrap();
+            let members = store.take_wave(0, 0).unwrap();
+            let MemberGeom::Packed(bytes) = &members[0].geom else {
+                panic!("{backing:?}: the member's geometry is not packed at rest");
+            };
+            assert!(bytes.len() <= 6 * ring.len(), "{} bytes", bytes.len());
+            assert!(member_bytes_estimate(&members[0]) <= 64 + 6 * ring.len());
+            let decoded = members[0].unpacked().unwrap();
+            assert_eq!(decoded.geom.coords_count(), ring.len());
+        }
+    }
+
+    /// #815: a geometry the grid does not reproduce bit for bit (a clip
+    /// vertex) is stored f64, in RAM and spilled, and comes back bit-equal.
+    #[test]
+    fn stored_members_off_the_grid_stay_f64_bit_for_bit() {
+        let plans = vec![LevelPlan {
+            zoom: 14,
+            partitions: partitions_with_members(&[1]),
+            wave: 1,
+        }];
+        let line = Geometry::LineString(LineString::from(vec![
+            (174.7, -41.2),
+            (174.7 + 1.0 / 3.0, -41.2 - 1.0 / 7.0),
+        ]));
+        for backing in [SinkBacking::Ram, SinkBacking::Spill] {
+            let mut store =
+                MemberStore::new(&plans, backing, MEMBER_STORE_RAM_BUDGET, None).unwrap();
+            store
+                .push(
+                    0,
+                    0,
+                    Member {
+                        key: 0,
+                        seq: 0,
+                        geom: line.clone().into(),
+                        props: Arc::new(Vec::new()),
+                        id: None,
+                        gap: GAP_NONE,
+                        band: 0,
+                    },
+                )
+                .unwrap();
+            store.finish_fill().unwrap();
+            let members = store.take_wave(0, 0).unwrap();
+            assert!(
+                matches!(members[0].geom, MemberGeom::Owned(_)),
+                "{backing:?}"
+            );
+            let back = members[0].unpacked().unwrap();
+            let bits = |g: &Geometry<f64>| -> Vec<(u64, u64)> {
+                g.coords_iter()
+                    .map(|c| (c.x.to_bits(), c.y.to_bits()))
+                    .collect()
+            };
+            assert_eq!(bits(&back.geom), bits(&line), "{backing:?}");
+        }
     }
 
     /// The fill-phase budget's per-member cost: 48 B of headers, 16 B per
