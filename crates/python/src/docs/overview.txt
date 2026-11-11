@@ -1,7 +1,8 @@
 Build a GeoParquet overview file: one generalized level per zoom.
 
 Args:
-    input: GeoParquet: `EPSG:4326` and `EPSG:3857` are read directly;
+    input: GeoParquet: `EPSG:4326` and all-`EPSG:3857` inputs are read directly;
+        `EPSG:3857` parts mixed with other CRSs are reprojected to `EPSG:4326`;
         other CRSs with an EPSG code and usable proj4 definition are
         reprojected to `EPSG:4326` as they are read, otherwise refused
         (use `gpio convert reproject` first).

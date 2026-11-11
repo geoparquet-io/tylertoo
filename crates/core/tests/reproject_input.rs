@@ -213,3 +213,45 @@ fn a_projected_geoparquet_mask_is_reprojected_too() {
     assert_eq!(report.input_features, 1);
     assert_eq!(overview_bounds(&overview).1, ["nl-28992-0"]);
 }
+
+/// Web Mercator meters for a lon/lat point (the spherical EPSG:3857 formulas).
+fn mercator(lon: f64, lat: f64) -> (f64, f64) {
+    const R: f64 = 6_378_137.0;
+    let y = (std::f64::consts::FRAC_PI_4 + lat.to_radians() / 2.0)
+        .tan()
+        .ln();
+    (R * lon.to_radians(), R * y)
+}
+
+#[test]
+fn epsg_3857_parts_mixed_with_other_crss_are_reprojected() {
+    let dir = tempfile::tempdir().unwrap();
+    let inputs = dir.path().join("mixed");
+    std::fs::create_dir(&inputs).unwrap();
+    let (stem, epsg, name, rect) = SQUARES[0];
+    write_input(&inputs.join(format!("{stem}.parquet")), epsg, name, &[rect]);
+    let want = [4.795, 51.445, 4.8, 51.45];
+    let (x0, y0) = mercator(want[0], want[1]);
+    let (x1, y1) = mercator(want[2], want[3]);
+    let wm = inputs.join("wm-3857.parquet");
+    write_input(&wm, 3857, "WGS 84 / Pseudo-Mercator", &[[x0, y0, x1, y1]]);
+
+    let overview = dir.path().join("ov.parquet");
+    let report = convert_to_overviews(&inputs, &overview, &options())
+        .expect("an EPSG:3857 part must mix with an EPSG:28992 one");
+    assert_eq!(report.input_features, 2);
+    let (b, ids) = overview_bounds(&overview);
+    assert_eq!(ids, ["nl-28992-0", "wm-3857-0"]);
+    assert!(
+        b.iter().all(|v| v.abs() < 90.0),
+        "lon/lat output, got {b:?}"
+    );
+
+    // Alone, the EPSG:3857 part keeps its native path: output in meters.
+    let alone = dir.path().join("alone.parquet");
+    convert_to_overviews(&wm, &alone, &options()).unwrap();
+    let (b, _) = overview_bounds(&alone);
+    for (got, want) in b.iter().zip([x0, y0, x1, y1]) {
+        assert!((got - want).abs() < 1.0, "bounds {b:?}");
+    }
+}

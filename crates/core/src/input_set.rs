@@ -1432,7 +1432,18 @@ impl MultiSource {
     )]
     pub fn from_sources(root: String, parts: Vec<InputSource>) -> Result<Self, InputError> {
         assert!(!parts.is_empty(), "MultiSource requires at least one part");
-        let metas = load_part_metas(&parts)?;
+        let mut metas = load_part_metas(&parts)?;
+        // #670: in a set that mixes them, EPSG:3857 parts are read in lon/lat
+        // like any other projected part; an all-3857 set keeps its own path.
+        let has = |crs| metas.iter().any(|m| m.resolved.crs() == Some(crs));
+        if has(crate::overview::level::Crs::Epsg3857) && has(crate::overview::level::Crs::Epsg4326)
+        {
+            for m in &mut metas {
+                if m.resolved.crs() == Some(crate::overview::level::Crs::Epsg3857) {
+                    m.resolved = Arc::new(m.resolved.web_mercator_as_lonlat(&m.parquet));
+                }
+            }
+        }
 
         let first_name = parts[0].display_name();
         // The reference CRS: `Ok(crs)` per detect_crs_from_kv, `None` for an

@@ -60,7 +60,8 @@ pub struct ResolvedSchema {
     bounds: Vec<Option<RowGroupBounds>>,
     diagnostics: Vec<Diagnostic>,
     auto_zoom_covering: std::result::Result<(usize, [String; 4]), CoveringWarning>,
-    /// Reprojection of a CRS other than EPSG:4326/3857 to lon/lat (#670).
+    /// Reprojection to lon/lat (#670): of a CRS other than EPSG:4326/3857, or
+    /// of EPSG:3857 in a set that mixes it with lon/lat parts.
     to_lonlat: Option<Arc<crate::reproject::ToLonLat>>,
 }
 
@@ -279,11 +280,23 @@ impl ResolvedSchema {
     /// The coordinate system the part's batches arrive in: EPSG:4326 for a
     /// CRS the reader reprojects (#670), `None` for one it cannot.
     pub fn crs(&self) -> Option<Crs> {
+        if self.to_lonlat.is_some() {
+            return Some(Crs::Epsg4326);
+        }
         match crate::quality::classify_crs_info(self.crs_info()) {
             crate::quality::CrsKind::Wgs84 => Some(Crs::Epsg4326),
             crate::quality::CrsKind::WebMercator => Some(Crs::Epsg3857),
-            crate::quality::CrsKind::Unknown => self.to_lonlat.as_ref().map(|_| Crs::Epsg4326),
+            crate::quality::CrsKind::Unknown => None,
         }
+    }
+    /// This EPSG:3857 part, read in EPSG:4326 instead: for a set whose other
+    /// parts are lon/lat (#670). Pruning bounds are recomputed in degrees.
+    pub(crate) fn web_mercator_as_lonlat(&self, metadata: &ParquetMetaData) -> Self {
+        let mut out = self.clone();
+        out.to_lonlat = crate::reproject::ToLonLat::for_code(3857).map(Arc::new);
+        out.auto_zoom_covering = out.validate_auto_zoom_covering(Some(metadata));
+        out.bounds = out.read_bounds(metadata);
+        out
     }
     /// `batch` from this part with its geometry in [`Self::crs`]: reprojected
     /// when the part declares another CRS, untouched otherwise.

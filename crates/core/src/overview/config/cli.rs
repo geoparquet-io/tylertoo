@@ -572,10 +572,10 @@ pub struct OverviewArgs {
     /// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
     /// reprojected to EPSG:4326 as they are read when they name an EPSG code
     /// (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4
-    /// definition. Parts of a directory, list, or `--files-from` input can mix
-    /// EPSG:4326 and reprojected CRSs, but EPSG:3857 parts cannot mix with other
-    /// CRSs. Otherwise the run is refused; the error
-    /// points to `gpio convert reproject` to reproject the input first.
+    /// definition. A directory, list, or `--files-from` input can mix these CRSs.
+    /// EPSG:3857 parts are reprojected to EPSG:4326 when mixed with other CRSs.
+    /// An all-EPSG:3857 input is read directly. Unsupported CRSs are refused;
+    /// the error points to `gpio convert reproject` to reproject the input first.
     ///
     /// Reprojection uses no grid shifts. A datum change uses the definition's
     /// proj4 `towgs84` Helmert parameters, so results can differ from PROJ/pyproj
@@ -629,10 +629,10 @@ pub struct TilesArgs {
     /// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
     /// reprojected to EPSG:4326 as they are read when they name an EPSG code
     /// (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4
-    /// definition. Parts of a directory, list, or `--files-from` input can mix
-    /// EPSG:4326 and reprojected CRSs, but EPSG:3857 parts cannot mix with other
-    /// CRSs. Otherwise the run is refused; the error
-    /// points to `gpio convert reproject` to reproject the input first.
+    /// definition. A directory, list, or `--files-from` input can mix these CRSs.
+    /// EPSG:3857 parts are reprojected to EPSG:4326 when mixed with other CRSs.
+    /// An all-EPSG:3857 input is read directly. Unsupported CRSs are refused;
+    /// the error points to `gpio convert reproject` to reproject the input first.
     ///
     /// Reprojection uses no grid shifts. A datum change uses the definition's
     /// proj4 `towgs84` Helmert parameters, so results can differ from PROJ/pyproj
