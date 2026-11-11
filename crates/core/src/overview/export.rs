@@ -1462,15 +1462,20 @@ pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> Result<u8, Expo
 /// memory.
 const DEFAULT_PARTITION_TARGET: usize = 32_768;
 
-/// How much smaller `bounded` plans a level's partitions once the level
-/// takes several waves (#815). A wave keeps one partition per core, so its
-/// members shrink by this factor while every core still encodes one. Such a
-/// level already spills every wave but the one it encodes, so smaller waves
-/// add wave barriers but no spill; a one-wave level keeps its partitions, as
-/// splitting it would spill what it holds. The archive does not depend on
-/// the target. NZ parcels 4,458 -> 2,742 MiB, `BR_MT` 4,423 -> 2,384 MiB
-/// export-only.
-const BOUNDED_MULTI_WAVE_SPLIT: usize = 4;
+/// The share of the partition target, in percent, that `bounded` plans a
+/// level's partitions at once the level takes several waves (#815). A wave
+/// keeps one partition per core, so its members shrink to this share while
+/// every core still encodes one. Such a level already spills every wave but
+/// the one it encodes, so smaller waves add wave barriers but no spill; a
+/// one-wave level keeps its partitions, as splitting it would spill what it
+/// holds. The archive does not depend on the target.
+///
+/// Each extra wave barrier idles the pool on the wave's tail. A quarter
+/// doubled NZ parcels' waves (33 -> 67) and cost 9% of its wall; at three
+/// quarters (38 waves) wall matches the default target. Peak RSS, 5 runs
+/// on NZ / 3 on `BR_MT`, full target -> 75% -> 25%: NZ 3,863 -> 3,304 ->
+/// 2,898 MiB, `BR_MT` 4,730 -> 3,986 -> 2,515 MiB.
+const BOUNDED_MULTI_WAVE_TARGET_PERCENT: usize = 75;
 
 /// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing.
 ///
@@ -2233,7 +2238,7 @@ fn plan_level(
     // OOM the whole run. Explicit waves are honoured verbatim.
     let (mut partitions, mut wave) = plan(partition_target);
     if profile == MemoryProfile::Bounded && partitions.len() > wave {
-        (partitions, wave) = plan(partition_target / BOUNDED_MULTI_WAVE_SPLIT);
+        (partitions, wave) = plan(partition_target * BOUNDED_MULTI_WAVE_TARGET_PERCENT / 100);
     }
     if wave < ceiling_wave {
         let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
@@ -5764,8 +5769,16 @@ fn encode_wave_from_store(
 
 /// Route a wave's members to their partitions, one bucket per partition, as
 /// [`finish_group`] routes them.
+///
+/// Each bucket is sized to its members first: grown by pushes, the buckets
+/// held up to twice the wave's member structs beside the wave's own vector
+/// at the export's peak.
 fn bucket_members(members: Vec<Member>, wave: &[Partition]) -> Vec<Vec<Member>> {
-    let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
+    let mut counts = vec![0usize; wave.len()];
+    for m in &members {
+        counts[route_partition(wave, m.key)] += 1;
+    }
+    let mut buckets: Vec<Vec<Member>> = counts.into_iter().map(Vec::with_capacity).collect();
     for m in members {
         buckets[route_partition(wave, m.key)].push(m);
     }
@@ -17552,6 +17565,33 @@ mod tests {
         }
     }
 
+    /// A wave's buckets hold exactly their members: grown by pushes they
+    /// held up to twice their member structs at the export's peak.
+    #[test]
+    fn wave_buckets_hold_exactly_their_members() {
+        let wave: Vec<Partition> = [(0, 9), (10, 19), (20, 29)]
+            .into_iter()
+            .map(|(key_lo, key_hi)| Partition {
+                key_lo,
+                key_hi,
+                bbox: PruneRegion::of(TileBounds::new(0.0, 0.0, 0.0, 0.0)),
+                members: 0,
+            })
+            .collect();
+        let members = (0..29)
+            .map(|i| Member {
+                key: i,
+                ..point_member(0.0, 0.0, i)
+            })
+            .collect();
+        let buckets = bucket_members(members, &wave);
+        assert_eq!(
+            buckets.iter().map(Vec::len).collect::<Vec<_>>(),
+            [10, 10, 9]
+        );
+        assert!(buckets.iter().all(|b| b.capacity() == b.len()));
+    }
+
     // ========================================================================
     // Within-tile feature order (#361)
     // ========================================================================
@@ -18181,11 +18221,11 @@ mod tests {
         );
     }
 
-    /// #815: `bounded` plans a level that takes several waves in a quarter
-    /// of the partition target, so each wave holds a quarter of the members;
-    /// a one-wave level, and `auto`, keep the target.
+    /// #815: `bounded` plans a level that takes several waves in three
+    /// quarters of the partition target, so each wave holds three quarters
+    /// of the members; a one-wave level, and `auto`, keep the target.
     #[test]
-    fn bounded_multi_wave_levels_hold_a_quarter_of_the_members_per_wave() {
+    fn bounded_multi_wave_levels_hold_three_quarters_of_the_members_per_wave() {
         let plan = |tiles: u64, profile| {
             let counts: BTreeMap<u64, usize> = (0..tiles)
                 .map(|t| (tile_key(u32::try_from(t).unwrap(), 0, 10), 1_000))
@@ -18216,7 +18256,7 @@ mod tests {
         // 64 tiles of 1,000 members: 8 partitions, two waves of four.
         let auto = plan(64, MemoryProfile::Auto);
         assert_eq!(wave_members(&auto), 32_000);
-        assert_eq!(wave_members(&plan(64, MemoryProfile::Bounded)), 8_000);
+        assert_eq!(wave_members(&plan(64, MemoryProfile::Bounded)), 24_000);
         // 32 tiles: one wave, kept whole.
         assert_eq!(plan(32, MemoryProfile::Bounded).partitions.len(), 4);
     }
