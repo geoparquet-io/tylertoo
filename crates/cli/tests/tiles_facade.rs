@@ -643,3 +643,57 @@ fn quiet_and_verbose_are_a_usage_error() {
         "the usage line is the subcommand's: {stderr}"
     );
 }
+
+/// #821: `--layer-column` builds one layer per value and reports each.
+#[test]
+fn tiles_layer_column_reports_each_layer() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.pmtiles");
+    let report = dir.path().join("report.json");
+
+    let out = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            fixture.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--max-zoom",
+            "6",
+            "--layer-column",
+            "bf_source",
+            "--report",
+            report.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run tylertoo tiles");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("microsoft") && stdout.contains("osm"),
+        "{stdout}"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(report["layer_column"], "bf_source");
+    let rows: Vec<(&str, u64)> = report["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            (
+                l["layer"].as_str().unwrap(),
+                l["input_rows"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(rows, [("microsoft", 961), ("osm", 39)]);
+    assert!(report["layers"][0]["convert"].is_object());
+    assert!(report["layers"][0]["export"].is_object());
+}

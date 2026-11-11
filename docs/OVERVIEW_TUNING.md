@@ -339,6 +339,46 @@ with two independent layers over the same zooms.
 Bands tile verbatim by default to preserve their input resolution. Pass
 `--generalize` for raw features that need generalization across several zooms.
 
+### One input, one layer per value: `tiles --layer-column`
+
+When the layers come from one input, `tiles --layer-column COLUMN` (Python
+`layer_column="COLUMN"`) routes each feature to the layer named by its value
+in that column. This is tippecanoe's per-feature `tippecanoe.layer`, which
+geoparquet-io's `gpio pmtiles create --layer-by-column` sets.
+
+```bash
+tylertoo tiles fields.parquet fields.pmtiles --layer-column year
+```
+
+- Each value is trimmed and used as the layer name. A null or blank value
+  goes to the `_unknown` layer. Names may contain any character, `:`
+  included.
+- The column decides the layer and is not written as a property. A knob
+  that reads it per feature (`--sort-key`, `--feature-order`, `--feature-id`,
+  and the like) is refused. `--filter` and `--bbox` run once, before the
+  split, so the filter may read the column and the 64-layer limit counts
+  only the values they keep.
+- tylertoo reads the input once and splits its rows into one temporary
+  GeoParquet file per layer, in the intermediate overview's directory
+  (`--spill-dir`, then `$TMPDIR`, then the output's directory). Expect
+  about one input's size of extra disk. Each layer then runs the whole
+  `tiles` chain with your options, and the layers are merged as pyramid
+  bands that share zooms.
+- So each layer has its own ladder: the density budget, thinning and line
+  coalescing work per layer, as with separate tippecanoe inputs, and a
+  sparse layer is not thinned against a dense one. `--max-zoom auto` is
+  estimated once, over the whole input.
+- The size caps (`--max-tile-size`, `--max-compressed-tile-size`) apply to
+  each layer's tiles before they are combined, so a combined tile can be
+  over the cap. tippecanoe caps the combined tile (#838).
+- At most 64 layers. Each layer is a full convert and export, and a column
+  with more values is usually an id, not a category. Route by a coarser
+  column, or subset the input with `--filter`.
+- `--layer-name` names the one layer of a plain run, so it is refused.
+  `--shard`, `--save-plan`, `--plan` and `--keep-overview` are refused too,
+  because each layer runs its own convert (#839). So is
+  `--generate-variable-depth-tile-pyramid`.
+
 ### Band sources and syntax
 
 A band accepts GeoParquet or PMTiles via `--band LO-HI:PATH[:LAYER]`.
@@ -2134,19 +2174,23 @@ request in flight; S3 does not negotiate HTTP/2, so `HTTP2_ONLY` fails there.
 
 A negative or malformed value warns and keeps the default; a non-negative
 integer outside the bounds warns and clamps to the bound, including one too
-large for the underlying type. The values resolve once per process, at the
-first remote staging, so a long-lived library caller will not see a later change
-to the environment.
+large for the underlying type. Each conversion re-reads the `TYLERTOO_STAGING_*`
+and `TYLERTOO_HTTP_*` variables, so a long-lived caller sees changes between
+conversions. Cached remote stores are rebuilt when the `AWS_*`, `GOOGLE_*`
+or `TYLERTOO_HTTP_*` variables that built them change.
 
-Two lines are logged at staging start, at info when an override is set (so a
-sweep run records what it tested) and debug otherwise: the resolved ceiling,
-budget and window, and the **live** concurrency, which is what the run actually
-used. Watch the second one — the budget can cap the ceiling, so
+The resolved ceiling, budget and window are logged on first use and when they
+or their warnings change, at info when an override is set (so a sweep run
+records what it tested) and debug otherwise. When an override is set, each
+staging operation also logs the **live** concurrency at info, showing what the
+run actually used.
+Watch the live concurrency — the budget can cap the ceiling, so
 `TYLERTOO_STAGING_CONCURRENCY=16` and `=8` produce identical runs on an input
 whose row groups are large enough that `budget ÷ largest span` is the binding
-constraint. A third info line, `[remote] client options from
-TYLERTOO_HTTP_*`, lists the client overrides in force, with a `PROXY_URL`
-value shown as `<redacted>`.
+constraint. The info line `[remote] client options from TYLERTOO_HTTP_*`
+lists the client overrides in force, with a `PROXY_URL` value shown as
+`<redacted>`. The staging and client-option lines and their warnings
+do not repeat while their values stay unchanged.
 
 These warnings and lines go to the Rust log, which the CLI prints at its
 default `info` filter. Python receives them through `logging` under the

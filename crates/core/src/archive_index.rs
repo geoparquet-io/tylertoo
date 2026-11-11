@@ -430,7 +430,7 @@ impl ArchiveIndex {
 
     /// Whether the archive is variable-depth (#803): its tiles stop at
     /// different zooms, so it cannot be merged with another archive.
-    pub(crate) fn is_variable_depth(&self) -> bool {
+    pub fn is_variable_depth(&self) -> bool {
         self.metadata_json()
             .is_some_and(|m| m.get(crate::pmtiles_writer::VARIABLE_DEPTH_KEY).is_some())
     }
@@ -499,6 +499,55 @@ impl ArchiveIndex {
             .src
             .read_range(range.start, range.end - range.start)?
             .into_owned())
+    }
+
+    /// The absolute file range of `e`'s tile body, checked against the
+    /// tile-data section and the file.
+    fn entry_range(&self, e: &DirEntry) -> Result<Range<usize>> {
+        // Offsets, lengths and ids are archive-supplied: every add is checked
+        // so a corrupt directory reports rather than wraps.
+        let past_end = || Error::from(ArchiveError::TileDataPastEnd { path: None });
+        // Inside the declared tile-data section, not merely inside the
+        // file: an entry aimed at the directories would otherwise be
+        // handed to the MVT decoder as a tile (#417).
+        match e.offset.checked_add(u64::from(e.length)) {
+            Some(end) if end <= self.header.tile_data_length => {}
+            _ => return Err(past_end()),
+        }
+        let start = self
+            .header
+            .tile_data_offset
+            .checked_add(e.offset)
+            .and_then(|s| usize::try_from(s).ok())
+            .ok_or_else(past_end)?;
+        let end = start
+            .checked_add(e.length as usize)
+            .filter(|&x| x as u64 <= self.src.len)
+            .ok_or_else(past_end)?;
+        Ok(start..end)
+    }
+
+    /// The absolute file range of tile `z/x/y`'s still-compressed body, or
+    /// `None` when the archive does not address it: one binary search of the
+    /// directory, for a caller that wants single tiles (`serve`, #825).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the matching directory entry points outside the
+    /// tile-data section or the file.
+    pub fn find(&self, z: u8, x: u32, y: u32) -> Result<Option<Range<usize>>> {
+        if z > crate::pmtiles_writer::MAX_TILE_ID_ZOOM || x >> z != 0 || y >> z != 0 {
+            return Ok(None);
+        }
+        let id = crate::pmtiles_writer::tile_id(z, x, y);
+        let i = self.entries.partition_point(|e| e.tile_id <= id);
+        let Some(e) = i.checked_sub(1).map(|i| &self.entries[i]) else {
+            return Ok(None);
+        };
+        if id - e.tile_id >= u64::from(e.run_length.max(1)) {
+            return Ok(None);
+        }
+        self.entry_range(e).map(Some)
     }
 
     /// Every addressed tile, in ascending tile-id order, run lengths expanded.
@@ -625,10 +674,6 @@ impl Iterator for TileIter<'_> {
         if self.done {
             return None;
         }
-        // Offsets, lengths and ids are archive-supplied: every add is checked
-        // so a corrupt directory reports rather than wraps.
-        let past_end = || Error::from(ArchiveError::TileDataPastEnd { path: None });
-        let header = &self.archive.header;
 
         while self.run >= self.run_len {
             let Some(e) = self.archive.entries.get(self.entry) else {
@@ -636,29 +681,7 @@ impl Iterator for TileIter<'_> {
                 return None;
             };
             self.entry += 1;
-            // Inside the declared tile-data section, not merely inside the
-            // file: an entry aimed at the directories would otherwise be
-            // handed to the MVT decoder as a tile (#417).
-            match e.offset.checked_add(u64::from(e.length)) {
-                Some(end) if end <= header.tile_data_length => {}
-                _ => {
-                    self.done = true;
-                    return Some(Err(past_end()));
-                }
-            }
-            let resolved = (|| {
-                let start = header
-                    .tile_data_offset
-                    .checked_add(e.offset)
-                    .and_then(|s| usize::try_from(s).ok())
-                    .ok_or_else(past_end)?;
-                let end = start
-                    .checked_add(e.length as usize)
-                    .filter(|&x| x as u64 <= self.archive.src.len)
-                    .ok_or_else(past_end)?;
-                Ok(start..end)
-            })();
-            match resolved {
+            match self.archive.entry_range(e) {
                 Ok(r) => self.range = r,
                 Err(e) => {
                     self.done = true;
@@ -853,6 +876,36 @@ mod tests {
             w.add_tile(*z, *x, *y, &payload).unwrap();
         }
         w.finalize(path).unwrap();
+    }
+
+    /// #825: `find` is a point lookup that agrees with the full walk for
+    /// every stored tile, run members included, and misses absent ones.
+    #[test]
+    fn find_agrees_with_tiles_and_misses_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.pmtiles");
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name("l");
+        w.set_bounds(&TileBounds::new(-1.0, -1.0, 1.0, 1.0));
+        // Identical bodies on consecutive ids become one run entry.
+        for (z, x, y) in [(0, 0, 0), (1, 0, 0), (1, 0, 1), (1, 1, 1), (3, 5, 2)] {
+            let body = if z == 1 { vec![7u8; 32] } else { vec![z; 32] };
+            w.add_tile(z, x, y, &body).unwrap();
+        }
+        w.finalize(&path).unwrap();
+        let idx = ArchiveIndex::open(&path).unwrap();
+        assert!(idx.entries().iter().any(|e| e.run_length > 1), "want a run");
+        for t in idx.tiles() {
+            let t = t.unwrap();
+            assert_eq!(
+                idx.find(t.z, t.x, t.y).unwrap(),
+                Some(t.range.clone()),
+                "{t:?}"
+            );
+        }
+        for (z, x, y) in [(1, 1, 0), (2, 0, 0), (3, 5, 3), (20, 0, 0), (40, 0, 0)] {
+            assert_eq!(idx.find(z, x, y).unwrap(), None, "z{z}/{x}/{y}");
+        }
     }
 
     /// #438: a file that is not an archive is a read failure, named as one

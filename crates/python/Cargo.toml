@@ -34,7 +34,7 @@ mimalloc = ["dep:mimalloc"]
 dhat-heap = ["tylertoo-core/dhat-heap"]
 
 [dependencies]
-tylertoo-core = { workspace = true, features = ["remote"] }
+tylertoo-core = { workspace = true, features = ["remote", "serve"] }
 # abi3-py311: build against CPython's stable ABI so a single wheel per
 # platform covers every CPython >= 3.11 (matching `requires-python`).
 # This binding is a thin facade over tylertoo-core -- it only uses the

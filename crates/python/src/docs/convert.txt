@@ -28,6 +28,13 @@ Args:
         `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised
         when the chosen volume looks too small, whether or not the
         run then fails.
+    layer_column: Put each feature in the layer named by its value
+        in this column (the CLI's `--layer-column`), and null or
+        blank values in `"_unknown"`. The column is not written as
+        a property. Each layer is tiled on its own and the layers
+        are merged, so thinning and the tile size limits apply per
+        layer. Excludes `layer_name`, `keep_overview`, `save_plan`,
+        `plan` and `variable_depth`. At most 64 layers.
     include_properties: See `overview()`.
     exclude_properties: See `overview()`.
     exclude_all_properties: See `overview()`.
@@ -102,7 +109,8 @@ Args:
 
 Returns:
     Both halves' reports, keyed `"convert"` and `"export"` like the
-    CLI's `tiles --report` JSON.
+    CLI's `tiles --report` JSON. With `layer_column`, a
+    `LayeredConvertReport` holding one such report per layer.
 
 Raises:
     ConfigError: Invalid or conflicting options, refused before any

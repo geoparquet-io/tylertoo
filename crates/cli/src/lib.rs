@@ -100,6 +100,33 @@ enum Command {
     Merge(MergeArgs),
     /// Cut a dataset's tile space into N disjoint shards for a sharded build.
     ShardPlan(ShardPlanArgs),
+    /// Serve PMTiles archives over HTTP with a map viewer.
+    ///
+    /// Run until Ctrl-C. The viewer at `/` handles MVT and MLT archives.
+    /// It loads MapLibre GL JS from unpkg.com and needs internet access.
+    ///
+    /// `/index.json` lists archive names. Each `{name}` is the archive's file
+    /// stem. `/{name}.json` returns TileJSON; `/{name}/{z}/{x}/{y}` returns
+    /// tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns
+    /// archive metadata; `/{name}/stats.json` returns tile-size statistics.
+    /// `/{name}.pmtiles` serves the archive with HTTP Range support.
+    /// It honours `If-Match` and `If-Range` against its `ETag`.
+    /// If a Range read detects the file being rewritten in place during the
+    /// read, it returns HTTP 412 for requests with `If-Match` or `If-Range`,
+    /// or HTTP 503 otherwise. A whole-file download caught by a rewrite is
+    /// cut off before its `Content-Length`. Renaming another file over the
+    /// path does not affect a download in progress.
+    ///
+    /// At most 64 responses can be in flight at once. Further requests get
+    /// HTTP 503 with `Retry-After: 1`.
+    ///
+    /// `serve` returns HTTP 204 for missing tiles without scaling up a stored
+    /// ancestor, so variable-depth archives (`--generate-variable-depth-tile-pyramid`)
+    /// show holes below stopped tiles; `serve` warns when it opens one.
+    ///
+    /// An archive rewritten on disk is reopened on the next request for it;
+    /// if it does not reopen, requests for it return HTTP 503 until it does.
+    Serve(ServeArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///
     /// Compiled only under the `gen-docs` feature; used by CI to regenerate
@@ -324,6 +351,32 @@ struct StatsArgs {
     json: bool,
 }
 
+/// Arguments for `tylertoo serve`.
+#[derive(Parser, Debug)]
+struct ServeArgs {
+    /// PMTiles archives to serve, each named by its file stem.
+    #[arg(value_name = "ARCHIVE", required = true)]
+    archives: Vec<PathBuf>,
+
+    /// Address to bind. The default allows local access only.
+    /// Use `--host 0.0.0.0` or another address to expose it to the network.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port to listen on. Use `--port 0` to pick a free port.
+    #[arg(long, value_name = "N", default_value_t = 8080)]
+    port: u16,
+
+    /// Allow pages from ORIGIN to read responses. Repeat `--cors ORIGIN` for
+    /// multiple origins. Each value is an exact origin such as
+    /// `https://pmtiles.io`, or `*` for any origin.
+    /// With no `--cors`, no Access-Control headers are sent, so pages on
+    /// other origins cannot read the archives. The built-in viewer is
+    /// same-origin and needs none.
+    #[arg(long, value_name = "ORIGIN")]
+    cors: Vec<String>,
+}
+
 /// Run the CLI on `argv` (program name first) and return its exit status,
 /// one of those in [`EXIT_STATUS_HELP`].
 ///
@@ -391,6 +444,7 @@ where
         Command::Pyramid(args) => run_pyramid(*args),
         Command::Merge(args) => run_merge(args),
         Command::ShardPlan(args) => run_shard_plan(args),
+        Command::Serve(args) => run_serve(&args),
         Command::Tiles(args) => run_tiles(*args),
         #[cfg(feature = "gen-docs")]
         Command::GenReferenceDocs => {
@@ -1114,6 +1168,14 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
                 return Ok(());
             }
             TilesOutcome::Converted(report) => report,
+            TilesOutcome::Layered(report) => {
+                let name = output.file_name().unwrap_or_default().to_string_lossy();
+                print_layered(&report, &spec.label(), &name);
+                if let Some(report_path) = &args.report {
+                    write_report(report_path, &*report)?;
+                }
+                return Ok(());
+            }
             other => anyhow::bail!("unhandled tiles outcome: {other:?}"),
         };
     let (convert_report, export_report) = (&report.convert, &report.export);
@@ -1189,6 +1251,43 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The `tiles --layer-column` summary (#821): a line per layer, then totals.
+fn print_layered(report: &tylertoo_core::LayeredReport, input: &str, output: &str) {
+    for layer in &report.layers {
+        say!(
+            "  layer {:?}: {} rows → {} tiles across z{}..z{}",
+            layer.layer,
+            format_number(layer.input_rows),
+            format_number(layer.report.export.total_tiles as u64),
+            layer.report.export.min_zoom,
+            layer.report.export.max_zoom,
+        );
+    }
+    for layer in &report.empty_layers {
+        say!("  layer {layer:?}: nothing left to draw; left out");
+    }
+    if report.filtered_rows > 0 {
+        say!(
+            "  {} rows dropped by --filter or --bbox",
+            format_number(report.filtered_rows)
+        );
+    }
+    say!(
+        "✓ Converted {input} → {output} ({} layers by {:?})",
+        report.layers.len(),
+        report.layer_column,
+    );
+    say!("  {} tiles", format_number(report.total_tiles as u64));
+    print_diagnostics(report.layers.iter().flat_map(|l| {
+        l.report
+            .convert
+            .diagnostics
+            .iter()
+            .chain(&l.report.export.diagnostics)
+    }));
+    print_diagnostics(&report.diagnostics);
 }
 
 fn write_report(path: &Path, report: &impl serde::Serialize) -> Result<()> {
@@ -1767,6 +1866,18 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
         write_report(path, &report)?;
     }
     Ok(())
+}
+
+fn run_serve(args: &ServeArgs) -> Result<()> {
+    let server = tylertoo_core::internal::serve::Server::bind(
+        &args.archives,
+        &args.host,
+        args.port,
+        &args.cors,
+    )?;
+    // The URL is the result, so `--quiet` keeps it.
+    println!("Serving {} on {}", args.archives.len(), server.url());
+    Ok(server.run(|| true)?)
 }
 
 /// Run `tylertoo stats`: per-zoom tile-weight report over a PMTiles archive
@@ -3536,6 +3647,7 @@ mod tests {
             ("decode", DecodeArgs::command()),
             ("stats", StatsArgs::command()),
             ("shard-plan", ShardPlanArgs::command()),
+            ("serve", ServeArgs::command()),
         ] {
             assert_eq!(publication_flags_of(&cmd), [false; 3], "{label}");
         }
@@ -3564,6 +3676,30 @@ mod tests {
         let python: std::collections::BTreeMap<String, serde_json::Value> =
             command_defaults("stats").into_iter().collect();
         assert_eq!(cli, python);
+    }
+
+    /// `serve` and `tylertoo.serve()` take the same options with the same
+    /// defaults (#825), loopback by default in both.
+    #[test]
+    fn serve_flags_match_python_keywords() {
+        use clap::CommandFactory;
+        use tylertoo_core::internal::overview::config::keywords::command_defaults;
+        let cli: std::collections::BTreeMap<String, serde_json::Value> = ServeArgs::command()
+            .get_arguments()
+            .filter_map(|a| Some((a.get_long()?.to_owned(), a.get_default_values())))
+            .map(|(long, d)| {
+                // A repeatable flag with no default (`--cors`) is an empty list.
+                let v = d.first().map_or(serde_json::json!([]), |d| {
+                    let d = d.to_str().unwrap();
+                    serde_json::from_str(d).unwrap_or_else(|_| d.into())
+                });
+                (long, v)
+            })
+            .collect();
+        let python: std::collections::BTreeMap<String, serde_json::Value> =
+            command_defaults("serve").into_iter().collect();
+        assert_eq!(cli, python);
+        assert_eq!(python["host"], "127.0.0.1");
     }
 
     #[test]

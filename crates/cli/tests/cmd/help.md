@@ -19,6 +19,7 @@ Commands:
   pyramid         Build one archive from several inputs, each owning a zoom range
   merge           Combine PMTiles archives that hold disjoint tiles into one
   shard-plan      Cut a dataset's tile space into N disjoint shards for a sharded build
+  serve           Serve PMTiles archives over HTTP with a map viewer
   help            Print this message or the help of the given subcommand(s)
 
 Options:
