@@ -632,9 +632,52 @@ fn covering_bboxes(
 
 /// One sampling pass's signals: a mercator diagonal and a center per
 /// sampled feature, in sample order (the caller sorts the centers).
+///
+/// Keeps every `keep_every`-th accepted feature and halves itself when it
+/// passes `cap`, so a pass over every row (the stride-1 retry) stays
+/// within the sample cap without an RNG.
 struct SampledSignals {
     diags_m: Vec<f64>,
     centers: Vec<(f64, f64)>,
+    keep_every: u64,
+    accepted: u64,
+    cap: usize,
+}
+
+fn keep_even_positions<T>(v: &mut Vec<T>) {
+    let mut keep = false;
+    v.retain(|_| {
+        keep = !keep;
+        keep
+    });
+}
+
+impl SampledSignals {
+    fn new(cap: usize) -> Self {
+        Self {
+            diags_m: Vec::new(),
+            centers: Vec::new(),
+            keep_every: 1,
+            accepted: 0,
+            cap: cap.max(1),
+        }
+    }
+
+    fn push(&mut self, diag_m: f64, center: (f64, f64)) {
+        self.accepted += 1;
+        if !(self.accepted - 1).is_multiple_of(self.keep_every) {
+            return;
+        }
+        self.diags_m.push(diag_m);
+        self.centers.push(center);
+        if self.centers.len() > self.cap {
+            // Retained entries sit at accepted indices 0, k, 2k, ...; keeping
+            // the even positions leaves 0, 2k, 4k, ... as the new stride.
+            keep_even_positions(&mut self.diags_m);
+            keep_even_positions(&mut self.centers);
+            self.keep_every *= 2;
+        }
+    }
 }
 
 /// Estimate `--max-zoom auto` for a conversion of `source` under `options`.
@@ -800,8 +843,7 @@ pub(crate) fn estimate_with(
         }
         let stream = source.open_stream(&plan)?;
 
-        let mut diags_m: Vec<f64> = Vec::new();
-        let mut centers: Vec<(f64, f64)> = Vec::new();
+        let mut signals = SampledSignals::new(AUTO_ZOOM_SAMPLE_CAP);
         let mut row: u64 = 0;
         for batch in stream {
             let batch = batch?;
@@ -841,11 +883,13 @@ pub(crate) fn estimate_with(
                     continue;
                 }
                 let (cx, cy) = ((bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5);
-                diags_m.push(mercator_delta_m(bb[2] - bb[0], bb[3] - bb[1], cy, crs));
-                centers.push((cx, cy));
+                signals.push(
+                    mercator_delta_m(bb[2] - bb[0], bb[3] - bb[1], cy, crs),
+                    (cx, cy),
+                );
             }
         }
-        Ok(SampledSignals { diags_m, centers })
+        Ok(signals)
     };
 
     let estimate = |stride: u64| -> Result<AutoZoomEvidence, ConvertError> {
@@ -853,6 +897,8 @@ pub(crate) fn estimate_with(
             SampledSignals {
                 diags_m,
                 mut centers,
+                keep_every,
+                ..
             },
             used_covering,
         ) = match declared.as_ref() {
@@ -895,7 +941,7 @@ pub(crate) fn estimate_with(
             sampled_count,
             diags_m,
             gaps_m,
-            1.0 / stride as f64,
+            1.0 / (stride * keep_every) as f64,
             min_zoom,
             ceiling,
         )?;
@@ -1994,6 +2040,68 @@ mod tests {
             .unwrap_or_else(|e| panic!("filter {filter:?}, mask {}: {e}", mask.is_some()));
             assert_eq!(got.sampled_count, 2);
         }
+    }
+
+    /// The thinning keeps every k-th accepted feature and never holds more
+    /// than its cap.
+    #[test]
+    fn sampled_signals_thin_to_their_cap() {
+        let mut s = SampledSignals::new(4);
+        for i in 0..100u32 {
+            s.push(f64::from(i), (f64::from(i), 0.0));
+            assert!(s.centers.len() <= 4);
+        }
+        assert_eq!(s.keep_every, 32);
+        assert_eq!(s.diags_m, vec![0.0, 32.0, 64.0, 96.0]);
+        let mut small = SampledSignals::new(4);
+        for i in 0..3u32 {
+            small.push(f64::from(i), (0.0, 0.0));
+        }
+        assert_eq!((small.keep_every, small.centers.len()), (1, 3));
+    }
+
+    /// #826: the stride-1 retry stays within the sample cap when the mask
+    /// rejects exactly the stride offsets and accepts every row between.
+    #[test]
+    fn the_whole_row_retry_keeps_the_sample_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = 2 * AUTO_ZOOM_SAMPLE_CAP + 1; // stride 3
+        let geoms: Vec<Option<Geometry<f64>>> = (0..n)
+            .map(|i| {
+                let p = if i % 3 == 0 {
+                    Point::new(50.0, 50.0)
+                } else {
+                    Point::new(
+                        10.0 + (i % 1000) as f64 * 1e-4,
+                        10.0 + (i / 1000) as f64 * 1e-4,
+                    )
+                };
+                Some(Geometry::Point(p))
+            })
+            .collect();
+        let source = write(&dir, "dense.parquet", &geoms);
+        let mask = dir.path().join("mask.geojson");
+        std::fs::write(
+            &mask,
+            r#"{"type":"Polygon","coordinates":[[[9,9],[11,9],[11,11],[9,11],[9,9]]]}"#,
+        )
+        .unwrap();
+        let got = estimate_with(
+            &source,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            None,
+            None,
+            Some(&super::super::mask::MaskSource::Path(mask)),
+            MemoryProfile::default(),
+        )
+        .unwrap();
+        assert!(
+            got.sampled_count <= AUTO_ZOOM_SAMPLE_CAP,
+            "{}",
+            got.sampled_count
+        );
+        assert!(got.sampled_count > AUTO_ZOOM_SAMPLE_CAP / 2);
     }
 
     /// #643: a western-hemisphere bbox scopes the estimate over a 0..360
