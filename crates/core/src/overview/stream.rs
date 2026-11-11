@@ -7219,14 +7219,15 @@ fn assemble_level_batch(
 /// One level's kept batch rows, their geometries and vertex count.
 type LevelSelection = (Vec<usize>, Vec<Arc<Geometry<f64>>>, usize);
 
-/// One level's positions in the shared rows, and in the shared geometries
-/// when the batch pools them.
-type LevelPositions = (UInt32Array, Option<UInt32Array>);
+/// One level's positions in the shared rows, and its geometries in the
+/// shared geometry column.
+type LevelPositions = (UInt32Array, pipeline::LevelGeometry);
 
-/// The rows the levels built from `batch` share (#852), and each level's
-/// positions in them. With `pool`, the levels' geometries too: a geometry
-/// several levels keep (the same `Arc`, #499) is encoded once, and each level
-/// gets its positions in the pool.
+/// The rows and geometries the levels built from `batch` share (#852), and
+/// each level's positions in them. With `pool`, a geometry several levels
+/// keep (the same `Arc`, #499) is encoded once and each level indexes the
+/// pool; otherwise the levels' geometries are encoded back to back, each
+/// level a range of them.
 fn share_rows(
     batch: &RecordBatch,
     ctxs: &[LevelStreamCtx<'_>],
@@ -7237,20 +7238,32 @@ fn share_rows(
     // One geometry column serves every level, so they must type it alike.
     debug_assert!(ctxs.iter().all(|c| c.geom_idx == finest.geom_idx
         && c.source_schema.field(c.geom_idx) == finest.source_schema.field(finest.geom_idx)));
-    let (geometry, positions) = if pool {
+    let (geometries, positions): (Vec<&Geometry<f64>>, Vec<pipeline::LevelGeometry>) = if pool {
         let (pool, positions) =
             geometry_pool(selections.iter().map(|(_, geoms, _)| geoms.as_slice()));
         (
-            Some(build_geometry_column(
-                finest.source_schema,
-                finest.geom_idx,
-                &pool,
-            )?),
-            positions.into_iter().map(Some).collect(),
+            pool,
+            positions
+                .into_iter()
+                .map(pipeline::LevelGeometry::Pool)
+                .collect(),
         )
     } else {
-        (None, vec![None; selections.len()])
+        let mut start = 0;
+        let ranges = selections
+            .iter()
+            .map(|(_, geoms, _)| {
+                start += geoms.len();
+                pipeline::LevelGeometry::Range(start - geoms.len(), geoms.len())
+            })
+            .collect();
+        let all = selections
+            .iter()
+            .flat_map(|(_, geoms, _)| geoms.iter().map(AsRef::as_ref))
+            .collect();
+        (all, ranges)
     };
+    let geometry = build_geometry_column(finest.source_schema, finest.geom_idx, &geometries)?;
     let kept: Vec<&[usize]> = selections
         .iter()
         .map(|(kept, _, _)| kept.as_slice())
@@ -7262,9 +7275,9 @@ fn share_rows(
 /// The least share of a batch's level geometries that must reuse another
 /// level's allocation (#499) for a pool, in thousandths. Below it the pool's
 /// hash and the drain's rebuild of every pooled geometry cost more pass-2
-/// time than the RAM it saves is worth, and each level builds its own
-/// column, in parallel (simplified polygons and lines: every level's
-/// geometry is its own allocation).
+/// time than the RAM it saves is worth (simplified polygons: every level's
+/// geometry is its own allocation), and the levels' geometries go back to
+/// back instead, each level written as a slice of them.
 const POOL_MIN_SHARED: u64 = 250;
 
 /// Whether a batch whose levels keep `kept` geometries, `reused` of them the
@@ -7581,20 +7594,12 @@ pub(super) fn process_batch_cascade(
                     } else {
                         ctx.source_schema
                     };
-                    let (index, pooled) = &geometry[li];
-                    let geometry = match pooled {
-                        Some(at) => pipeline::LevelGeometry::Pool(at.clone()),
-                        None => pipeline::LevelGeometry::Own(build_geometry_column(
-                            ctx.source_schema,
-                            ctx.geom_idx,
-                            &kept_geoms,
-                        )?),
-                    };
+                    let (index, geometry) = &geometry[li];
                     pipeline::LevelBatch::shared(
                         Arc::new(schema.clone()),
                         rows,
                         index.clone(),
-                        geometry,
+                        geometry.clone(),
                         ctx.geom_idx,
                         own,
                     )
@@ -7727,26 +7732,30 @@ mod tests {
     }
 
     /// #852: a batch pools its level geometries only when the levels reuse
-    /// one another's (#499); otherwise each level builds its own column, and
-    /// the batch hashes no pool at all.
+    /// one another's (#499); otherwise it holds them back to back in one
+    /// column, each level a range of it, and hashes no pool at all.
     #[test]
     fn a_batch_pools_level_geometries_only_when_levels_reuse_them() {
-        let pooled = |out: &[Option<(pipeline::LevelBatch, usize)>]| -> Vec<bool> {
-            out.iter()
-                .map(|o| match o {
-                    Some((pipeline::LevelBatch::Shared { geometry, .. }, _)) => {
-                        matches!(geometry, pipeline::LevelGeometry::Pool(_))
-                    }
-                    other => panic!("a shared level batch, got {}", other.is_some()),
-                })
-                .collect()
-        };
+        let pooled =
+            |out: &[Option<(pipeline::LevelBatch, usize)>]| -> Vec<Option<(usize, usize)>> {
+                out.iter()
+                    .map(|o| match o {
+                        Some((pipeline::LevelBatch::Shared { geometry, .. }, _)) => {
+                            match geometry {
+                                pipeline::LevelGeometry::Pool(_) => None,
+                                pipeline::LevelGeometry::Range(at, len) => Some((*at, *len)),
+                            }
+                        }
+                        other => panic!("a shared level batch, got {}", other.is_some()),
+                    })
+                    .collect()
+            };
         // Points pass every step unchanged: both levels keep one allocation.
         let points: Vec<Geometry<f64>> = (0..8)
             .map(|i| Geometry::Point(geo::Point::new(f64::from(i), 0.0)))
             .collect();
         let (out, builds, _) = cascade_two_levels(&points, (10.0, 20_000.0));
-        assert_eq!(pooled(&out), [true, true]);
+        assert_eq!(pooled(&out), [None, None]);
         assert_eq!(builds, 1);
         // Zigzag lines the fine step leaves alone (sharing the decoded
         // geometry, #499's counter) and the coarse step straightens: no two
@@ -7763,7 +7772,8 @@ mod tests {
             .collect();
         let (out, builds, shared) = cascade_two_levels(&lines, (10.0, 20_000.0));
         assert_eq!(shared, 8, "the fine step leaves every line alone");
-        assert_eq!(pooled(&out), [false, false]);
+        // Coarse level first, as the cascade orders them.
+        assert_eq!(pooled(&out), [Some((0, 8)), Some((8, 8))]);
         assert_eq!(builds, 0, "no pool is hashed for levels that share nothing");
     }
 
