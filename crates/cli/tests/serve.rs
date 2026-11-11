@@ -386,9 +386,21 @@ fn responses_past_the_cap_are_refused() {
     write_big(&path);
     let addr = spawn(&path, &[]);
     let stalled: Vec<TcpStream> = (0..MAX_RESPONSES)
-        .map(|_| {
+        .map(|i| {
             let mut s = TcpStream::connect(&addr).unwrap();
-            write!(s, "GET /big.pmtiles HTTP/1.0\r\nHost: {addr}\r\n\r\n").unwrap();
+            if i + 1 == MAX_RESPONSES {
+                // A request pipelined behind a stalled download is past the
+                // cap, and its 503 cannot go out before the download's
+                // bytes: it must not hold up the server.
+                write!(
+                    s,
+                    "GET /big.pmtiles HTTP/1.1\r\nHost: {addr}\r\n\r\n\
+                     GET /big/9/3/0.mvt HTTP/1.1\r\nHost: {addr}\r\n\r\n"
+                )
+                .unwrap();
+            } else {
+                write!(s, "GET /big.pmtiles HTTP/1.0\r\nHost: {addr}\r\n\r\n").unwrap();
+            }
             s
         })
         .collect();
@@ -403,4 +415,44 @@ fn responses_past_the_cap_are_refused() {
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// Requests in sequence on one keep-alive connection, as a browser sends
+/// tile requests, are answered without waiting on the server's poll.
+#[test]
+fn keep_alive_requests_are_not_held_for_the_poll() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.pmtiles");
+    write_archive(&path, 1);
+    let addr = spawn(&path, &[]);
+    let s = TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    // `write!` sends a request in pieces; Nagle would hold them.
+    s.set_nodelay(true).unwrap();
+    let mut r = BufReader::new(s.try_clone().unwrap());
+    let mut s = s;
+    let start = std::time::Instant::now();
+    for _ in 0..50 {
+        write!(s, "GET /a/0/0/0.mvt HTTP/1.1\r\nHost: {addr}\r\n\r\n").unwrap();
+        let mut len = 0;
+        loop {
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                len = v.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; len];
+        r.read_exact(&mut body).unwrap();
+    }
+    // The poll is 200 ms: held for it, 50 requests take seconds.
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
 }

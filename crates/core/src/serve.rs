@@ -13,10 +13,13 @@ use crate::error::{Classify, ErrorKind};
 use crate::pmtiles_writer::TileType;
 use crate::stats::{compute_stats, DEFAULT_LARGEST};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 
@@ -151,14 +154,20 @@ fn warn_variable_depth(index: &ArchiveIndex) {
 
 /// A bound server: [`Server::bind`], then [`Server::run`].
 pub struct Server {
-    http: tiny_http::Server,
+    http: Arc<tiny_http::Server>,
     archives: Vec<Served>,
     cors: Vec<String>,
-    /// Responses being sent, at most [`MAX_RESPONSES`]; each response
-    /// thread reports on `done` when it ends.
+    /// Archive responses being sent, at most [`MAX_RESPONSES`].
     busy: usize,
-    done: (mpsc::Sender<()>, mpsc::Receiver<()>),
+    /// Connections with a response being sent, and the requests pipelined
+    /// behind it, which cannot be answered before it ends.
+    sending: HashMap<SocketAddr, VecDeque<Request>>,
+    /// Each response thread reports here when it ends: its connection, and
+    /// whether it counted in `busy`.
+    done: (Sender<Done>, Receiver<Done>),
 }
+
+type Done = (Option<SocketAddr>, bool);
 
 impl Server {
     /// Open every archive and bind `host:port` (port 0 picks a free port).
@@ -214,10 +223,11 @@ impl Server {
             error,
         })?;
         Ok(Server {
-            http,
+            http: Arc::new(http),
             archives: served,
             cors: cors.to_vec(),
             busy: 0,
+            sending: HashMap::new(),
             done: mpsc::channel(),
         })
     }
@@ -239,33 +249,64 @@ impl Server {
     /// The listening socket failed.
     pub fn run(mut self, mut keep_going: impl FnMut() -> bool) -> Result<(), ServeError> {
         while keep_going() {
-            let Some(req) = self.http.recv_timeout(Duration::from_millis(200))? else {
-                continue;
-            };
-            // Clients that stop reading hold their response thread, so the
-            // threads are capped; past the cap, an empty 503 goes out here.
-            self.busy -= self.done.1.try_iter().count();
-            if self.busy >= MAX_RESPONSES {
-                let _ = req.respond(status(503).with_header(header("Retry-After", "1")));
-                continue;
+            let ended: Vec<Done> = self.done.1.try_iter().collect();
+            for (addr, counted) in ended {
+                self.busy -= usize::from(counted);
+                let Some(addr) = addr else { continue };
+                // The connection is free: its next pipelined request goes.
+                let next = self.sending.get_mut(&addr).and_then(VecDeque::pop_front);
+                match next {
+                    Some(req) => self.send(req, Some(addr)),
+                    None => {
+                        self.sending.remove(&addr);
+                    }
+                }
             }
-            let host = request_header(&req, "Host").map(str::to_owned);
-            let mut res = self.respond(&req, host.as_deref());
-            for h in self.cors_headers(&req) {
-                res.add_header(h);
+            if let Some(req) = self.http.recv_timeout(Duration::from_millis(200))? {
+                let addr = req.remote_addr().copied();
+                match addr.and_then(|a| self.sending.get_mut(&a)) {
+                    Some(queue) => queue.push_back(req),
+                    None => self.send(req, addr),
+                }
             }
-            // Responses are built here (a lookup and a bounded read) and
-            // sent on their own thread, so a whole-archive download stalls
-            // neither the tiles nor the `keep_going` poll.
-            self.busy += 1;
-            let done = self.done.0.clone();
-            std::thread::spawn(move || {
-                // A client that hung up mid-response is not the server's error.
-                let _ = req.respond(res);
-                let _ = done.send(());
-            });
         }
         Ok(())
+    }
+
+    /// Answer `req` on a thread of its own, so that a client which stops
+    /// reading stalls neither other requests nor the `keep_going` poll.
+    /// Past [`MAX_RESPONSES`] archive responses the answer is an empty 503.
+    /// One thread per connection at most, as requests pipelined behind a
+    /// response wait in `sending` for it to end.
+    fn send(&mut self, req: Request, addr: Option<SocketAddr>) {
+        let counted = self.busy < MAX_RESPONSES;
+        let mut res = if counted {
+            let host = request_header(&req, "Host").map(str::to_owned);
+            self.respond(&req, host.as_deref())
+        } else {
+            status(503).with_header(header("Retry-After", "1"))
+        };
+        for h in self.cors_headers(&req) {
+            res.add_header(h);
+        }
+        self.busy += usize::from(counted);
+        if let Some(a) = addr {
+            self.sending.entry(a).or_default();
+        }
+        let done = self.done.0.clone();
+        // Weak: a stalled download must not keep the listener open after
+        // `run` returns.
+        let wake = Arc::downgrade(&self.http);
+        std::thread::spawn(move || {
+            // A client that hung up mid-response is not the server's error.
+            let _ = req.respond(res);
+            let _ = done.send((addr, counted));
+            // A keep-alive client's next request may already be waiting on
+            // this one; wake the loop rather than leave it to the poll.
+            if let Some(http) = wake.upgrade() {
+                http.unblock();
+            }
+        });
     }
 
     /// The CORS headers for `req`: none unless `--cors` allows its origin.
