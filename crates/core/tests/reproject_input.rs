@@ -255,3 +255,36 @@ fn epsg_3857_parts_mixed_with_other_crss_are_reprojected() {
         assert!((got - want).abs() < 1.0, "bounds {b:?}");
     }
 }
+
+/// The reader threads reproject on rayon. A caller whose conversion runs on
+/// the only worker of the global pool must still finish: that worker waits
+/// on the readers, so their work cannot be queued behind it (#868).
+#[test]
+fn projected_input_converts_on_a_one_thread_global_pool() {
+    // nextest runs every test in its own process, so this is the global pool.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build_global();
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("nl.parquet");
+    let nl = SQUARES[0].3;
+    // More rows than one rayon run, so a batch's rewrite is split.
+    let rects: Vec<[f64; 4]> = (0..1200)
+        .map(|i| {
+            let dx = 10.0 * f64::from(i);
+            [nl[0] + dx, nl[1], nl[2] + dx, nl[3]]
+        })
+        .collect();
+    write_input(&input, 28992, SQUARES[0].2, &rects);
+    let output = dir.path().join("ov.parquet");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let opts = options().with_read_workers(2);
+        let report = rayon::scope(|_| convert_to_overviews(&input, &output, &opts));
+        let _ = tx.send(report.map(|r| r.input_features).map_err(|e| e.to_string()));
+    });
+    let features = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("deadlocked on the one-thread global pool");
+    assert_eq!(features, Ok(1200));
+}

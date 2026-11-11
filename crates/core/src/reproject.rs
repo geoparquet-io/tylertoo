@@ -27,6 +27,27 @@ use crate::quality::CrsInfo;
 /// enough that one 8192-row read batch spreads over the pool (#868).
 const PAR_ROWS: usize = 128;
 
+/// The pool batches are reprojected on, or `None` if its threads could not
+/// start (the rewrite then runs on the caller's pool). Its own: the reader
+/// threads that call [`ToLonLat::batch`] feed a consumer that may hold every
+/// worker of the caller's pool while it waits on them, so work queued there
+/// could wait forever. Jobs here never block, so they always finish (#868).
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: a process-wide worker pool; no diagnostic globals"
+)]
+fn pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads())
+            .thread_name(|i| format!("tylertoo-reproject-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 /// The transform from one projected or geographic CRS to EPSG:4326 degrees.
 #[derive(Debug)]
 pub(crate) struct ToLonLat {
@@ -182,7 +203,10 @@ impl ToLonLat {
             return Ok(batch);
         };
         let mut columns = batch.columns().to_vec();
-        columns[i] = self.array(&columns[i])?;
+        columns[i] = match pool() {
+            Some(pool) => pool.install(|| self.array(&columns[i]))?,
+            None => self.array(&columns[i])?,
+        };
         RecordBatch::try_new(batch.schema(), columns)
     }
 
