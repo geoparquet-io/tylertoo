@@ -56,7 +56,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 
 | Argument | Description |
 | --- | --- |
-| `<INPUT>` | Input GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator (`EPSG:3857`). Pass a file, directory, glob, URL, or `s3://` or `gs://` prefix, or omit it with `--files-from`. |
+| `<INPUT>` | Input GeoParquet. Pass a file, directory, glob, URL, or `s3://` or `gs://` prefix, or omit it with `--files-from`. EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are reprojected to EPSG:4326 as they are read when they name an EPSG code (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4 definition. A directory, list, or `--files-from` input can mix these CRSs. EPSG:3857 parts are reprojected to EPSG:4326 when mixed with other CRSs. An all-EPSG:3857 input is read directly. Unsupported CRSs are refused; the error points to `gpio convert reproject` to reproject the input first. Reprojection uses no grid shifts. A datum change uses the definition's proj4 `towgs84` Helmert parameters, so results can differ from PROJ/pyproj by metres (around 100 m at the edge of EPSG:27700's area). Same-datum projections, such as UTM and ETRS89 LAEA (EPSG:3035), match to under a centimetre. |
 | `<OUTPUT>` | Output PMTiles file. Omit it with `--plan-only`, which writes no archive. |
 
 ### Options
@@ -120,7 +120,7 @@ tylertoo overview [OPTIONS] [INPUT] [OUTPUT]
 
 | Argument | Description |
 | --- | --- |
-| `<INPUT>` | Input GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator (`EPSG:3857`). Pass a file, directory, glob, URL, or `s3://` or `gs://` prefix, or omit it with `--files-from`. |
+| `<INPUT>` | Input GeoParquet. Pass a file, directory, glob, URL, or `s3://` or `gs://` prefix, or omit it with `--files-from`. EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are reprojected to EPSG:4326 as they are read when they name an EPSG code (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4 definition. A directory, list, or `--files-from` input can mix these CRSs. EPSG:3857 parts are reprojected to EPSG:4326 when mixed with other CRSs. An all-EPSG:3857 input is read directly. Unsupported CRSs are refused; the error points to `gpio convert reproject` to reproject the input first. Reprojection uses no grid shifts. A datum change uses the definition's proj4 `towgs84` Helmert parameters, so results can differ from PROJ/pyproj by metres (around 100 m at the edge of EPSG:27700's area). Same-datum projections, such as UTM and ETRS89 LAEA (EPSG:3035), match to under a centimetre. |
 | `<OUTPUT>` | Output overview GeoParquet file. |
 
 ### Options
@@ -517,7 +517,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 
 | Option | Description |
 | --- | --- |
-| `--mask <PATH>` | Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (.geojson/.json, RFC 7946 lon/lat) or GeoParquet file; touching and copies one ±360° wrap away count. Skips row groups by the mask's bbox, combines with --bbox and --filter by AND, and refuses a CRS mismatch: reproject the mask to the input's CRS first. |
+| `--mask <PATH>` | Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (.geojson/.json, RFC 7946 lon/lat) or GeoParquet file; touching and copies one ±360° wrap away count. Skips row groups by the mask's bbox, combines with --bbox and --filter by AND. A GeoParquet mask uses its declared CRS and the same reprojection rules as input. EPSG:4326 masks are converted to EPSG:3857 for 3857 input and vice versa, vertex by vertex. WKB/shapely masks have no CRS: use EPSG:3857 for EPSG:3857 input, otherwise lon/lat EPSG:4326, including for reprojected input. |
 | `--filter <EXPR>` [alias: `where`] | Filter property columns with a SQL `WHERE` predicate, such as `confidence > 0.8`. Skips row groups that cannot match. Grammar: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
 
 ### Properties

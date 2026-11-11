@@ -79,8 +79,8 @@ fn utf8(bytes: &[u8]) -> &str {
 
 #[test]
 fn geo_metadata_seeds() {
-    // EPSG:32633 is a real CRS tylertoo refuses (UTM), on purpose.
-    replay("geo_metadata", &["seed-utm.json"], |b| {
+    // EPSG:32633 (UTM) is reprojected to lon/lat (#670), so every seed passes.
+    replay("geo_metadata", &[], |b| {
         tylertoo_core::internal::overview::convert::fuzz_geo_metadata(utf8(b))
     });
 }

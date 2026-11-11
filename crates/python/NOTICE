@@ -49,6 +49,15 @@ the behavior of its mergeLineStrings. tylertoo contains no planetiler source
 code.
 
 
+EPSG Geodetic Parameter Dataset
+------------------------------
+
+tylertoo embeds EPSG-derived proj4 definitions through the crs-definitions
+crate to reproject input. These definitions are derived from the EPSG
+Geodetic Parameter Dataset, owned and maintained by IOGP (https://epsg.org).
+See https://epsg.org/terms-of-use.html for its terms of use.
+
+
 Test data
 ---------
 

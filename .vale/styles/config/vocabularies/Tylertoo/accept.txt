@@ -64,8 +64,8 @@ tilesets?
 choropleth
 viewports?
 renderers
-reprojects?
-reprojection
+reproject(s|ed)?
+[Rr]eprojection
 quantizes
 [Uu]nrankable
 unranked
@@ -159,7 +159,7 @@ Sul
 # Uppercase only: Vale.Terms enforces the casing written here.
 PRs?
 ASCII
-CRS
+CRSs?
 DGGS
 EPSG
 GERS
@@ -176,3 +176,4 @@ WKB
 [Ee]xtract
 [Jj]scpd
 NVMe
+Helmert
