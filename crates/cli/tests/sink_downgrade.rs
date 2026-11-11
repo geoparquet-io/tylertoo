@@ -27,6 +27,9 @@ use arrow_schema::{DataType, Field, Schema};
 use tylertoo_io::test_support::ArrowWriter;
 use tylertoo_io::test_support::{EnabledStatistics, WriterProperties};
 
+#[path = "../../../tests/support/fixture.rs"]
+mod fixture;
+
 /// Input rows. Small enough to run in a few seconds, and read in
 /// [`READ_BATCH_ROWS`]-row batches so the light head alone spans far more
 /// than the 64 output batches an earlier fixed-size sample window covered.
@@ -228,5 +231,65 @@ fn auto_downgrades_to_spill_on_a_heavy_tail_and_matches_bounded() {
         "a mid-pass downgrade must not change output bytes ({} B auto vs {} B bounded)",
         auto_bytes.len(),
         bounded_bytes.len(),
+    );
+}
+
+/// #815: an `auto` run that spills up front keeps `auto`'s encode grant
+/// and spills raw. Sized as `bounded`'s (4 encodes, LZ4), its pass 2 ran
+/// 3-4 s slower on NZ parcels and Mato Grosso, and LZ4 cost 6-9 s more. Small
+/// row groups make an encode cheap enough for `auto` to grant more than
+/// `bounded`'s 4 under a limit its sinks do not fit.
+#[test]
+fn auto_spilling_up_front_keeps_its_encodes_and_spills_raw() {
+    let Some(input) = fixture::realdata("fieldmaps-madagascar-adm4.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let run = |profile: &str, limit: Option<&str>| {
+        let out = dir.path().join(format!("out-{profile}.parquet"));
+        let profile_json = dir.path().join(format!("profile-{profile}.jsonl"));
+        let mut cmd = Command::new(tylertoo_bin());
+        cmd.args([
+            "overview",
+            input.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--profile",
+            profile,
+            "--row-group-size",
+            "200",
+        ])
+        .env("RAYON_NUM_THREADS", "8")
+        .env("RUST_LOG", "info")
+        .env("TYLERTOO_PROFILE_JSON", &profile_json)
+        .env_remove("TYLERTOO_AUTO_MEM_LIMIT_BYTES");
+        if let Some(limit) = limit {
+            cmd.env("TYLERTOO_AUTO_MEM_LIMIT_BYTES", limit);
+        }
+        let output = cmd.output().expect("run tylertoo overview");
+        let log = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "overview --profile {profile}: {log}"
+        );
+        let line = std::fs::read_to_string(&profile_json).expect("read profile JSON");
+        let value: serde_json::Value =
+            serde_json::from_str(line.lines().next().expect("one profile line")).unwrap();
+        let encode = value["pass2"]["budget"]["granted"]["pass-2 encode"]
+            .as_u64()
+            .expect("an encode grant");
+        (value, encode, log)
+    };
+    let (auto, auto_encode, log) = run("auto", Some("250000000"));
+    assert!(
+        log.contains("→ Spill") && auto["pass2"]["sink"]["downgraded_to_spill"] == false,
+        "the fixture must make `auto` spill up front:\n{log}"
+    );
+    assert_eq!(auto["pass2"]["sink"]["spill_codec"], "raw", "{auto}");
+    let (bounded, bounded_encode, _) = run("bounded", None);
+    assert_eq!(bounded["pass2"]["sink"]["spill_codec"], "lz4", "{bounded}");
+    assert!(
+        auto_encode > bounded_encode,
+        "auto spilling up front granted {auto_encode} B of encodes, no more than \
+         bounded's {bounded_encode} B"
     );
 }

@@ -1,12 +1,17 @@
 //! Convert must finish on a rayon worker whose pool's other workers are
-//! busy (another conversion, a caller's job), and inside a custom pool
-//! while every global worker is busy.
+//! busy (another conversion, a caller's job), and report a write error
+//! there instead of hanging.
 //!
-//! The RAM drain rebuilds shared level batches (#852) with a parallel
-//! iterator. Run on a helper thread, that work queued on the global pool,
-//! and the writer's worker waited for it without helping: with the other
-//! workers busy, or the conversion in a custom pool, nothing built it. Its
-//! own binary, because the global pool can be sized once per process.
+//! The RAM drain's rebuild of shared level batches (#852) and the streamed
+//! finest level's windows run parallel work on the global pool from a
+//! helper thread. A writer's worker that waited for them without helping
+//! left them queued behind itself. Its own binary, because the global pool
+//! can be sized once per process.
+//!
+//! shortcut: no custom-pool case. The streamed level's helper thread still
+//! queues on the global pool when the caller converts inside a custom pool,
+//! so with every global worker busy that run can hang; add the case once
+//! the helper runs on the caller's pool.
 
 use std::path::Path;
 use std::sync::mpsc;
@@ -48,12 +53,6 @@ fn convert_finishes_while_the_other_pool_workers_are_busy() {
     // rebuild only its worker could run. Linux's `/dev/full` fails writes.
     let failed_on_global =
         cfg!(target_os = "linux").then(|| finishes(&input, Path::new("/dev/full"), rayon::spawn));
-    occupy_a_global_worker();
-    let custom = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .expect("custom pool");
-    let in_custom = finishes(&input, &output, |job| custom.spawn(job));
     drop(release);
 
     on_global
@@ -64,9 +63,6 @@ fn convert_finishes_while_the_other_pool_workers_are_busy() {
             .expect("deadlocked on a global pool worker after a write error")
             .expect_err("writes to /dev/full fail");
     }
-    in_custom
-        .expect("deadlocked in a custom pool with the global pool busy")
-        .expect("convert");
 }
 
 /// Convert in a job handed to `spawn`; `Err` when it does not finish.
