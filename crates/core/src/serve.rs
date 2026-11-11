@@ -16,8 +16,12 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
+
+/// Responses in flight at once.
+pub const MAX_RESPONSES: usize = 64;
 
 const VIEWER: &str = include_str!("viewer.html");
 
@@ -96,6 +100,8 @@ struct Served {
     stamp: Stamp,
     /// The file changed and has not reopened since.
     broken: bool,
+    /// `/stats.json` for this version, computed on its first request.
+    stats: Option<Vec<u8>>,
 }
 
 impl Served {
@@ -118,6 +124,7 @@ impl Served {
                 self.index = index;
                 self.stamp = now;
                 self.broken = false;
+                self.stats = None;
                 true
             }
             Err(e) => {
@@ -146,16 +153,28 @@ fn warn_variable_depth(index: &ArchiveIndex) {
 pub struct Server {
     http: tiny_http::Server,
     archives: Vec<Served>,
+    cors: Vec<String>,
+    /// Responses being sent, at most [`MAX_RESPONSES`]; each response
+    /// thread reports on `done` when it ends.
+    busy: usize,
+    done: (mpsc::Sender<()>, mpsc::Receiver<()>),
 }
 
 impl Server {
     /// Open every archive and bind `host:port` (port 0 picks a free port).
+    /// `cors` lists the origins whose pages may read the responses (`*` for
+    /// any); empty, no other origin may.
     ///
     /// # Errors
     ///
     /// An archive that does not open, two archives with the same file stem,
     /// or an address that cannot be bound.
-    pub fn bind(archives: &[PathBuf], host: &str, port: u16) -> Result<Self, ServeError> {
+    pub fn bind(
+        archives: &[PathBuf],
+        host: &str,
+        port: u16,
+        cors: &[String],
+    ) -> Result<Self, ServeError> {
         if archives.is_empty() {
             return Err(ServeError::NoArchives);
         }
@@ -187,6 +206,7 @@ impl Server {
                 index,
                 stamp,
                 broken: false,
+                stats: None,
             });
         }
         let http = tiny_http::Server::http((host, port)).map_err(|error| ServeError::Bind {
@@ -196,6 +216,9 @@ impl Server {
         Ok(Server {
             http,
             archives: served,
+            cors: cors.to_vec(),
+            busy: 0,
+            done: mpsc::channel(),
         })
     }
 
@@ -216,42 +239,65 @@ impl Server {
     /// The listening socket failed.
     pub fn run(mut self, mut keep_going: impl FnMut() -> bool) -> Result<(), ServeError> {
         while keep_going() {
-            if let Some(req) = self.http.recv_timeout(Duration::from_millis(200))? {
-                let host = req
-                    .headers()
-                    .iter()
-                    .find(|h| h.field.equiv("Host"))
-                    .map(|h| h.value.to_string());
-                let res = self
-                    .respond(&req, host.as_deref())
-                    .with_header(header("Access-Control-Allow-Origin", "*"));
-                // Responses are built here (a lookup and a positioned read)
-                // and sent on their own thread, so a whole-archive download
-                // stalls neither the tiles nor the `keep_going` poll.
-                // shortcut: one thread per response, unbounded, as tiny_http
-                // already has one per connection; pool them if a shared
-                // deployment ever needs a cap.
-                std::thread::spawn(move || {
-                    // A client that hung up mid-response is not the server's error.
-                    let _ = req.respond(res);
-                });
+            let Some(req) = self.http.recv_timeout(Duration::from_millis(200))? else {
+                continue;
+            };
+            // Clients that stop reading hold their response thread, so the
+            // threads are capped; past the cap, an empty 503 goes out here.
+            self.busy -= self.done.1.try_iter().count();
+            if self.busy >= MAX_RESPONSES {
+                let _ = req.respond(status(503).with_header(header("Retry-After", "1")));
+                continue;
             }
+            let host = request_header(&req, "Host").map(str::to_owned);
+            let mut res = self.respond(&req, host.as_deref());
+            for h in self.cors_headers(&req) {
+                res.add_header(h);
+            }
+            // Responses are built here (a lookup and a bounded read) and
+            // sent on their own thread, so a whole-archive download stalls
+            // neither the tiles nor the `keep_going` poll.
+            self.busy += 1;
+            let done = self.done.0.clone();
+            std::thread::spawn(move || {
+                // A client that hung up mid-response is not the server's error.
+                let _ = req.respond(res);
+                let _ = done.send(());
+            });
         }
         Ok(())
+    }
+
+    /// The CORS headers for `req`: none unless `--cors` allows its origin.
+    fn cors_headers(&self, req: &Request) -> Vec<Header> {
+        let any = self.cors.iter().any(|c| c == "*");
+        let allow = if any {
+            Some("*")
+        } else {
+            request_header(req, "Origin").filter(|o| self.cors.iter().any(|c| c == o))
+        };
+        let mut out = Vec::new();
+        if !self.cors.is_empty() && !any {
+            out.push(header("Vary", "Origin"));
+        }
+        if let Some(origin) = allow {
+            out.extend([
+                header("Access-Control-Allow-Origin", origin),
+                header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"),
+                // A Range or conditional request from another origin is
+                // preflighted for these.
+                header("Access-Control-Allow-Headers", "Range, If-Match, If-Range"),
+                header("Access-Control-Expose-Headers", "ETag, Content-Range"),
+            ]);
+        }
+        out
     }
 
     fn respond(&mut self, req: &Request, host: Option<&str>) -> Response<Box<dyn Read + Send>> {
         match req.method() {
             Method::Get | Method::Head => {}
-            // The CORS preflight a browser sends before a Range or
-            // conditional request from another origin.
             Method::Options => {
-                return status(204)
-                    .with_header(header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"))
-                    .with_header(header(
-                        "Access-Control-Allow-Headers",
-                        "Range, If-Match, If-Range",
-                    ));
+                return status(204).with_header(header("Allow", "GET, HEAD, OPTIONS"));
             }
             _ => return status(405),
         }
@@ -285,10 +331,17 @@ impl Server {
                 Err(res) => res,
             },
             [name, "stats.json"] => match self.archive(name) {
-                Ok(a) => match compute_stats(&a.index, DEFAULT_LARGEST, false) {
-                    Ok(report) => json(&serde_json::json!(report)),
-                    Err(e) => error(&e),
-                },
+                Ok(a) => {
+                    if a.stats.is_none() {
+                        match compute_stats(&a.index, DEFAULT_LARGEST, false) {
+                            Ok(report) => {
+                                a.stats = Some(serde_json::json!(report).to_string().into_bytes());
+                            }
+                            Err(e) => return error(&e),
+                        }
+                    }
+                    body(a.stats.clone().unwrap_or_default(), "application/json")
+                }
                 Err(res) => res,
             },
             [name, z, x, y] => {
@@ -317,7 +370,7 @@ impl Server {
 
     /// The archive named `name`, or the response that replaces it: 404 for
     /// no such archive, 503 while a changed file does not reopen.
-    fn archive(&mut self, name: &str) -> Result<&Served, Response<Box<dyn Read + Send>>> {
+    fn archive(&mut self, name: &str) -> Result<&mut Served, Response<Box<dyn Read + Send>>> {
         let a = self
             .archives
             .iter_mut()
@@ -329,6 +382,13 @@ impl Server {
             Err(status(503))
         }
     }
+}
+
+fn request_header<'r>(req: &'r Request, name: &'static str) -> Option<&'r str> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().trim())
 }
 
 fn header(field: &str, value: &str) -> Header {
@@ -460,7 +520,7 @@ fn tilejson(a: &Served, host: &str) -> serde_json::Value {
 /// The archive file itself, honouring one `Range: bytes=` span, so a
 /// PMTiles client (pmtiles.io, the `pmtiles` JS library) can read it.
 fn raw(path: &Path, req: &Request) -> Response<Box<dyn Read + Send>> {
-    let (mut file, version) = match File::open(path).and_then(|f| {
+    let (file, version) = match File::open(path).and_then(|f| {
         let m = f.metadata()?;
         Ok((f, stamp(&m)))
     }) {
@@ -469,12 +529,7 @@ fn raw(path: &Path, req: &Request) -> Response<Box<dyn Read + Send>> {
     };
     let len = version.0;
     let tag = etag(version);
-    let get = |name: &'static str| {
-        req.headers()
-            .iter()
-            .find(|h| h.field.equiv(name))
-            .map(|h| h.value.as_str().trim())
-    };
+    let get = |name| request_header(req, name);
     // A client holding offsets from an older version must not get bytes
     // of this one: `If-Match` fails, and `If-Range` falls back to the whole
     // file (RFC 9110 13.1.1, 13.1.5).
@@ -491,15 +546,18 @@ fn raw(path: &Path, req: &Request) -> Response<Box<dyn Read + Send>> {
             return status(416).with_header(header("Content-Range", &format!("bytes */{len}")));
         }
     };
-    if let Err(e) = file.seek(SeekFrom::Start(start)) {
+    let n = end - start;
+    let mut reader = Unchanged {
+        file: file.take(n),
+        version,
+    };
+    if let Err(e) = reader.file.get_mut().seek(SeekFrom::Start(start)) {
         return error(&e);
     }
-    let n = end - start;
     let mut headers = vec![
         header("Content-Type", "application/vnd.pmtiles"),
         header("Accept-Ranges", "bytes"),
         header("ETag", &tag),
-        header("Access-Control-Expose-Headers", "ETag, Content-Range"),
     ];
     if code == 206 {
         headers.push(header(
@@ -510,13 +568,57 @@ fn raw(path: &Path, req: &Request) -> Response<Box<dyn Read + Send>> {
     let Ok(n_usize) = usize::try_from(n) else {
         return status(416);
     };
-    Response::new(
-        StatusCode(code),
-        headers,
-        Box::new(file.take(n)),
-        Some(n_usize),
-        None,
-    )
+    // A range (what a PMTiles client reads) is read whole before its status
+    // goes out, so a rewrite caught by the read is answered, not sent: 412
+    // to a conditional request, whose client refetches the header, else 503.
+    // A larger body streams, and a rewrite cuts it off short of its length.
+    let body: Box<dyn Read + Send> = if code == 206 && n <= MAX_TILE_BYTES {
+        let mut bytes = Vec::with_capacity(n_usize);
+        if let Err(e) = reader.read_to_end(&mut bytes) {
+            if !reader.unchanged() {
+                let conditional = get("If-Match").is_some() || get("If-Range").is_some();
+                return status(if conditional { 412 } else { 503 });
+            }
+            return error(&e);
+        }
+        Box::new(std::io::Cursor::new(bytes))
+    } else {
+        Box::new(reader)
+    };
+    Response::new(StatusCode(code), headers, body, Some(n_usize), None)
+}
+
+/// Bytes of the archive while it stays the version `version` names. Each
+/// read checks the file after it, so no byte of a later version is
+/// returned: a rename over the path leaves this handle on the old file,
+/// and an in-place rewrite fails the read.
+// shortcut: tiny_http cannot close a keep-alive connection from the
+// response side, so after a failed read an HTTP/1.1 client waits for the
+// missing bytes until it gives up; move to an HTTP layer that can abort a
+// connection if whole-file downloads of rewritten archives matter.
+struct Unchanged {
+    file: std::io::Take<File>,
+    version: Stamp,
+}
+
+impl Unchanged {
+    fn unchanged(&self) -> bool {
+        self.file
+            .get_ref()
+            .metadata()
+            .is_ok_and(|m| stamp(&m) == self.version)
+    }
+}
+
+impl Read for Unchanged {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        if self.unchanged() {
+            Ok(n)
+        } else {
+            Err(std::io::Error::other("the archive changed during the read"))
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]

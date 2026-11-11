@@ -111,6 +111,14 @@ enum Command {
     /// archive metadata; `/{name}/stats.json` returns tile-size statistics.
     /// `/{name}.pmtiles` serves the archive with HTTP Range support.
     /// It honours `If-Match` and `If-Range` against its `ETag`.
+    /// If a Range read detects the file being rewritten in place during the
+    /// read, it returns HTTP 412 for requests with `If-Match` or `If-Range`,
+    /// or HTTP 503 otherwise. A whole-file download caught by a rewrite is
+    /// cut off before its `Content-Length`. Renaming another file over the
+    /// path does not affect a download in progress.
+    ///
+    /// At most 64 responses can be in flight at once. Further requests get
+    /// HTTP 503 with `Retry-After: 1`.
     ///
     /// `serve` returns HTTP 204 for missing tiles without scaling up a stored
     /// ancestor, so variable-depth archives (`--generate-variable-depth-tile-pyramid`)
@@ -358,6 +366,15 @@ struct ServeArgs {
     /// Port to listen on. Use `--port 0` to pick a free port.
     #[arg(long, value_name = "N", default_value_t = 8080)]
     port: u16,
+
+    /// Allow pages from ORIGIN to read responses. Repeat `--cors ORIGIN` for
+    /// multiple origins. Each value is an exact origin such as
+    /// `https://pmtiles.io`, or `*` for any origin.
+    /// With no `--cors`, no Access-Control headers are sent, so pages on
+    /// other origins cannot read the archives. The built-in viewer is
+    /// same-origin and needs none.
+    #[arg(long, value_name = "ORIGIN")]
+    cors: Vec<String>,
 }
 
 /// Run the CLI on `argv` (program name first) and return its exit status,
@@ -1807,8 +1824,12 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
 }
 
 fn run_serve(args: &ServeArgs) -> Result<()> {
-    let server =
-        tylertoo_core::internal::serve::Server::bind(&args.archives, &args.host, args.port)?;
+    let server = tylertoo_core::internal::serve::Server::bind(
+        &args.archives,
+        &args.host,
+        args.port,
+        &args.cors,
+    )?;
     // The URL is the result, so `--quiet` keeps it.
     println!("Serving {} on {}", args.archives.len(), server.url());
     Ok(server.run(|| true)?)
@@ -3622,8 +3643,11 @@ mod tests {
             .get_arguments()
             .filter_map(|a| Some((a.get_long()?.to_owned(), a.get_default_values())))
             .map(|(long, d)| {
-                let d = d[0].to_str().unwrap();
-                let v = serde_json::from_str(d).unwrap_or_else(|_| d.into());
+                // A repeatable flag with no default (`--cors`) is an empty list.
+                let v = d.first().map_or(serde_json::json!([]), |d| {
+                    let d = d.to_str().unwrap();
+                    serde_json::from_str(d).unwrap_or_else(|_| d.into())
+                });
                 (long, v)
             })
             .collect();

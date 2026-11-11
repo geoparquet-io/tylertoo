@@ -66,6 +66,24 @@ class TestServe:
         assert head == ROADS_PMTILES.read_bytes()[:127]
         assert b"maplibre-gl" in fetch(f"{base}/")
 
+    def test_cors_is_opt_in(self) -> None:
+        port = free_port()
+        threading.Thread(
+            target=tylertoo.serve,
+            args=(ROADS_PMTILES,),
+            kwargs={"port": port, "cors": "https://pmtiles.io"},
+            daemon=True,
+        ).start()
+        url = f"http://127.0.0.1:{port}/index.json"
+        fetch(url)
+        for origin, allowed in [
+            ("https://pmtiles.io", True),
+            ("https://x.example", False),
+        ]:
+            req = urllib.request.Request(url, headers={"Origin": origin})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                assert (r.headers["Access-Control-Allow-Origin"] == origin) is allowed
+
     # Windows has no SIGINT to send to a child; a console Ctrl-C reaches
     # the same `check_signals` poll.
     @pytest.mark.skipif(sys.platform == "win32", reason="no SIGINT on Windows")

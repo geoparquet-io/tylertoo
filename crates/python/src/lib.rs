@@ -518,13 +518,18 @@ fn serve(
     defaults.extend(values);
     let host: String = serde_json::from_value(defaults.remove("host").unwrap()).map_err(|e| config_err(format!("host: {e}")))?;
     let port: u16 = serde_json::from_value(defaults.remove("port").unwrap()).map_err(|e| config_err(format!("port: {e}")))?;
+    // One origin, or a list of them, like the CLI's repeated `--cors`.
+    let cors: Vec<String> = match defaults.remove("cors").unwrap() {
+        serde_json::Value::String(origin) => vec![origin],
+        v => serde_json::from_value(v).map_err(|e| config_err(format!("cors: {e}")))?,
+    };
     // One path, or a list of them, like the CLI's `ARCHIVE...`.
     let archives: Vec<PathBuf> = match archive.extract::<PathBuf>() {
         Ok(path) => vec![path],
         Err(_) => archive.extract()?,
     };
     let server = py
-        .detach(|| tylertoo_core::internal::serve::Server::bind(&archives, &host, port))
+        .detach(|| tylertoo_core::internal::serve::Server::bind(&archives, &host, port, &cors))
         .map_err(|e| to_py(e.kind(), e.to_string(), None))?;
     let builtins = PyModule::import(py, "builtins")?;
     builtins.getattr("print")?.call1((format!("Serving {} on {}", archives.len(), server.url()),))?;

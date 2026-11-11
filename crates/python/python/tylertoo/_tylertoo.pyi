@@ -180,6 +180,7 @@ def serve(
     *,
     host: str = "127.0.0.1",
     port: int = 8080,
+    cors: str | Sequence[str] = [],
 ) -> None: ...
 def validate(file: str) -> ValidationReport: ...
 def convert(

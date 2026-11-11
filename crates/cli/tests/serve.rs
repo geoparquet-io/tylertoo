@@ -6,7 +6,7 @@ use std::net::TcpStream;
 use std::path::Path;
 use tylertoo_core::internal::archive_index::ArchiveIndex;
 use tylertoo_core::internal::pmtiles_writer::StreamingPmtilesWriter;
-use tylertoo_core::internal::serve::Server;
+use tylertoo_core::internal::serve::{Server, MAX_RESPONSES};
 use tylertoo_core::Compression;
 
 fn write_archive(path: &Path, tag: u8) {
@@ -19,6 +19,31 @@ fn write_archive(path: &Path, tag: u8) {
         w.add_tile(z, x, y, &[tag, i as u8, 1, 2, 3]).unwrap();
     }
     w.finalize(path).unwrap();
+}
+
+/// ~32 MiB of distinct tile bodies: far more than the socket buffers hold.
+fn write_big(path: &Path) {
+    let mut w = StreamingPmtilesWriter::new(Compression::None).unwrap();
+    w.set_layer_name("l");
+    for i in 0..512u32 {
+        let body: Vec<u8> = (0..65536u32)
+            .map(|j| (i ^ j.wrapping_mul(2654435761)) as u8)
+            .collect();
+        w.add_tile(9, i, 0, &body).unwrap();
+    }
+    w.finalize(path).unwrap();
+}
+
+/// Serve `path` on a free port, with `cors` origins, until the test ends.
+fn spawn(path: &Path, cors: &[String]) -> String {
+    let server = Server::bind(&[path.to_owned()], "127.0.0.1", 0, cors).unwrap();
+    let addr = server
+        .url()
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_owned();
+    std::thread::spawn(move || server.run(|| true));
+    addr
 }
 
 /// `GET path` with extra header lines: (status, headers, body).
@@ -55,7 +80,7 @@ fn serves_the_archives_own_bytes_and_reloads_a_rewrite() {
     let path = dir.path().join("my demo.pmtiles");
     write_archive(&path, 1);
 
-    let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0).unwrap();
+    let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0, &[]).unwrap();
     let url = server.url();
     let addr = url
         .trim_start_matches("http://")
@@ -77,13 +102,6 @@ fn serves_the_archives_own_bytes_and_reloads_a_rewrite() {
     }
     assert_eq!(get(&addr, "/my%20demo/2/0/0.mvt", "").0, 204);
     assert_eq!(get(&addr, "/nope/0/0/0.mvt", "").0, 404);
-    // The CORS preflight of a cross-origin Range request.
-    let (code, head, _) = request(&addr, "OPTIONS", "/my%20demo.pmtiles", "");
-    assert_eq!(code, 204);
-    assert!(
-        head.contains("access-control-allow-headers: range, if-match, if-range"),
-        "{head}"
-    );
 
     let file = std::fs::read(&path).unwrap();
     let (code, head, body) = get(&addr, "/my%20demo.pmtiles", "Range: bytes=0-126\r\n");
@@ -155,9 +173,9 @@ fn index_is_a_reserved_archive_name() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("index.pmtiles");
     write_archive(&path, 1);
-    let err = Server::bind(&[path], "127.0.0.1", 0).err().unwrap();
+    let err = Server::bind(&[path], "127.0.0.1", 0, &[]).err().unwrap();
     assert!(err.to_string().contains("reserved"), "{err}");
-    let err = Server::bind(&[], "127.0.0.1", 0).err().unwrap();
+    let err = Server::bind(&[], "127.0.0.1", 0, &[]).err().unwrap();
     assert!(err.to_string().contains("no archive"), "{err}");
 }
 
@@ -167,18 +185,9 @@ fn index_is_a_reserved_archive_name() {
 fn a_stalled_download_blocks_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("big.pmtiles");
-    let mut w = StreamingPmtilesWriter::new(Compression::None).unwrap();
-    w.set_layer_name("l");
-    // ~32 MiB of distinct bodies: far more than the socket buffers hold.
-    for i in 0..512u32 {
-        let body: Vec<u8> = (0..65536u32)
-            .map(|j| (i ^ j.wrapping_mul(2654435761)) as u8)
-            .collect();
-        w.add_tile(9, i, 0, &body).unwrap();
-    }
-    w.finalize(&path).unwrap();
+    write_big(&path);
 
-    let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0).unwrap();
+    let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0, &[]).unwrap();
     let addr = server
         .url()
         .trim_start_matches("http://")
@@ -236,7 +245,7 @@ fn an_oversized_tile_body_is_refused_before_the_read() {
         .set_len(out.len() as u64 + body_len)
         .unwrap();
 
-    let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0).unwrap();
+    let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0, &[]).unwrap();
     let addr = server
         .url()
         .trim_start_matches("http://")
@@ -255,7 +264,7 @@ fn a_broken_in_place_rewrite_is_refused_until_it_reopens() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("inplace.pmtiles");
     write_archive(&path, 1);
-    let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0).unwrap();
+    let server = Server::bind(std::slice::from_ref(&path), "127.0.0.1", 0, &[]).unwrap();
     let addr = server
         .url()
         .trim_start_matches("http://")
@@ -281,4 +290,117 @@ fn a_broken_in_place_rewrite_is_refused_until_it_reopens() {
     let r = index.find(0, 0, 0).unwrap().unwrap();
     let (code, _, body) = get(&addr, "/inplace/0/0/0.mvt", "");
     assert_eq!((code, body), (200, index.read_range(r).unwrap()));
+}
+
+/// Cross-origin reads are opt-in (`--cors`): by default no page on another
+/// origin can read a served archive.
+#[test]
+fn cross_origin_access_is_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.pmtiles");
+    write_archive(&path, 1);
+    let origin = "Origin: https://pmtiles.io\r\n";
+
+    let addr = spawn(&path, &[]);
+    for (method, target) in [
+        ("GET", "/a.pmtiles"),
+        ("OPTIONS", "/a.pmtiles"),
+        ("GET", "/index.json"),
+    ] {
+        let (_, head, _) = request(&addr, method, target, origin);
+        assert!(
+            !head.contains("access-control"),
+            "{method} {target}: {head}"
+        );
+    }
+
+    let addr = spawn(&path, &["https://pmtiles.io".into()]);
+    let (code, head, _) = request(&addr, "OPTIONS", "/a.pmtiles", origin);
+    assert_eq!(code, 204);
+    assert!(
+        head.contains("access-control-allow-origin: https://pmtiles.io\r\n"),
+        "{head}"
+    );
+    assert!(
+        head.contains("access-control-allow-headers: range, if-match, if-range"),
+        "{head}"
+    );
+    assert!(head.contains("vary: origin"), "{head}");
+    let (_, head, _) = get(&addr, "/a.pmtiles", origin);
+    assert!(
+        head.contains("access-control-expose-headers: etag, content-range"),
+        "{head}"
+    );
+    let (_, head, _) = get(&addr, "/a.pmtiles", "Origin: https://evil.example\r\n");
+    assert!(!head.contains("access-control-allow-origin"), "{head}");
+
+    let addr = spawn(&path, &["*".into()]);
+    let (_, head, _) = get(&addr, "/a.json", "Origin: https://evil.example\r\n");
+    assert!(
+        head.contains("access-control-allow-origin: *\r\n"),
+        "{head}"
+    );
+}
+
+/// An archive rewritten in place during a download ends the download
+/// short: the client never gets the new version's bytes under the old
+/// `ETag`.
+#[test]
+fn a_rewrite_during_a_download_cuts_it_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.pmtiles");
+    write_big(&path);
+    let old = std::fs::read(&path).unwrap();
+    let addr = spawn(&path, &[]);
+
+    let mut s = TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    write!(s, "GET /big.pmtiles HTTP/1.0\r\nHost: {addr}\r\n\r\n").unwrap();
+    let mut first = [0u8; 4096];
+    s.read_exact(&mut first).unwrap();
+    // The response stalls on full socket buffers; the tail changes under it.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    std::io::Seek::seek(&mut f, std::io::SeekFrom::End(-(1 << 20))).unwrap();
+    f.write_all(&vec![0xAB; 1 << 20]).unwrap();
+    drop(f);
+    let mut rest = Vec::new();
+    s.read_to_end(&mut rest).unwrap();
+    let mut got = first.to_vec();
+    got.extend_from_slice(&rest);
+    let body = &got[got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4..];
+    assert!(
+        body.len() < old.len(),
+        "the whole file went out after the rewrite"
+    );
+    assert_eq!(body, &old[..body.len()]);
+}
+
+/// Response threads are capped: past the cap a request gets 503 at once,
+/// and service resumes when the stalled clients go.
+#[test]
+fn responses_past_the_cap_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.pmtiles");
+    write_big(&path);
+    let addr = spawn(&path, &[]);
+    let stalled: Vec<TcpStream> = (0..MAX_RESPONSES)
+        .map(|_| {
+            let mut s = TcpStream::connect(&addr).unwrap();
+            write!(s, "GET /big.pmtiles HTTP/1.0\r\nHost: {addr}\r\n\r\n").unwrap();
+            s
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(get(&addr, "/big/9/3/0.mvt", "").0, 503);
+    drop(stalled);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while get(&addr, "/big/9/3/0.mvt", "").0 != 200 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "service did not resume"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }

@@ -489,6 +489,7 @@ serve(
     *,
     host: str = "127.0.0.1",
     port: int = 8080,
+    cors: str | Sequence[str] = [],
 ) -> None
 ```
 
@@ -496,7 +497,9 @@ Serve PMTiles archives over HTTP with a map viewer.
 
 Print the server URL and block until Ctrl-C, which raises `KeyboardInterrupt`. The viewer at `/` handles MVT and MLT archives. It loads MapLibre GL JS from unpkg.com and needs internet access.
 
-`/index.json` lists archive names. Each `{name}` is the archive's file stem. `/{name}.json` returns TileJSON. `/{name}/{z}/{x}/{y}` returns tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns archive metadata. `/{name}/stats.json` returns tile-size statistics. `/{name}.pmtiles` serves the archive with HTTP Range support. It honours `If-Match` and `If-Range` against its `ETag`.
+`/index.json` lists archive names. Each `{name}` is the archive's file stem. `/{name}.json` returns TileJSON. `/{name}/{z}/{x}/{y}` returns tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns archive metadata. `/{name}/stats.json` returns tile-size statistics. `/{name}.pmtiles` serves the archive with HTTP Range support. It honours `If-Match` and `If-Range` against its `ETag`. If a Range read detects the file being rewritten in place during the read, it returns HTTP 412 for requests with `If-Match` or `If-Range`, or HTTP 503 otherwise. A whole-file download caught by a rewrite is cut off before its `Content-Length`. Renaming another file over the path does not affect a download in progress.
+
+At most 64 responses can be in flight at once. Further requests get HTTP 503 with `Retry-After: 1`.
 
 `serve` returns HTTP 204 for missing tiles without scaling up a stored ancestor, so variable-depth archives (`variable_depth=True`) show holes below stopped tiles; `serve` warns when it opens one.
 
@@ -507,6 +510,7 @@ An archive rewritten on disk is reopened on the next request for it; if it does 
 * `archive`: One PMTiles path or a list of paths, with distinct file stems.
 * `host`: Address to bind. Defaults to `"127.0.0.1"` (local access only). Use `"0.0.0.0"` or another address to expose it to the network.
 * `port`: Port to listen on. Defaults to 8080. Use 0 to pick a free port.
+* `cors`: Allow pages from these origins to read responses. Use `cors="https://pmtiles.io"` for one exact origin, a list of origin strings for multiple origins, or `cors="*"` for any origin. With no `cors`, no Access-Control headers are sent, so pages on other origins cannot read the archives. The built-in viewer is same-origin and needs none.
 
 ### Returns
 

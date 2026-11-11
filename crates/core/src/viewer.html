@@ -40,16 +40,39 @@ const $ = (id) => document.getElementById(id);
 const text = (s) => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
 let drawn = [], loading = 0;
 
-async function load(name, fit) {
-  // A newer selection wins: drop this one's results once it is stale.
-  const me = ++loading;
-  const tj = await (await fetch(`/${encodeURIComponent(name)}.json`)).json();
-  const st = await (await fetch(`/${encodeURIComponent(name)}/stats.json`)).json();
-  if (me !== loading) return;
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (r.status === 503) throw new Error("the archive changed on disk and does not open yet");
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+function clear() {
   for (const id of drawn) map.removeLayer(id);
   if (map.getSource("a")) map.removeSource("a");
   drawn = [];
   $("layers").innerHTML = "";
+  $("stats").innerHTML = "";
+}
+
+async function load(name, fit) {
+  // A newer selection wins: drop this one's results once it is stale.
+  const me = ++loading;
+  $("archive").value = name;
+  const base = `/${encodeURIComponent(name)}`;
+  let tj;
+  try {
+    tj = await getJSON(`${base}.json`);
+  } catch (e) {
+    if (me !== loading) return;
+    // The map shows nothing rather than the previous archive under this name.
+    clear();
+    $("info").innerHTML = `Could not load ${text(name)}: ${text(e.message)}. <button id="retry">Retry</button>`;
+    $("retry").onclick = () => load(name, fit);
+    return;
+  }
+  if (me !== loading) return;
+  clear();
   $("info").innerHTML = `${text(tj.encoding.toUpperCase())} tiles, z${tj.minzoom}–z${tj.maxzoom}`;
   if (tj.variable_depth) $("info").innerHTML += "<br>Variable-depth archive: areas below a stopped tile show as holes.";
   if (tj.encoding === "raster") {
@@ -59,7 +82,10 @@ async function load(name, fit) {
   } else {
     map.addSource("a", { type: "vector", tiles: tj.tiles, minzoom: tj.minzoom, maxzoom: tj.maxzoom,
       bounds: tj.bounds, encoding: tj.encoding, attribution: tj.attribution });
-    tj.vector_layers.forEach((l, i) => {
+    const layers = (Array.isArray(tj.vector_layers) ? tj.vector_layers : [])
+      .filter((l) => l && typeof l.id === "string");
+    if (!layers.length) $("layers").textContent = "The archive metadata lists no vector layers, so there is nothing to draw.";
+    layers.forEach((l, i) => {
       const c = COLORS[i % COLORS.length], s = { source: "a", "source-layer": l.id };
       const ids = [`${l.id}-fill`, `${l.id}-line`, `${l.id}-point`];
       map.addLayer({ ...s, id: ids[0], type: "fill", filter: ["==", ["geometry-type"], "Polygon"],
@@ -77,9 +103,17 @@ async function load(name, fit) {
     });
   }
   if (fit) map.fitBounds(tj.bounds, { animate: false, padding: 20 });
-  $("stats").innerHTML = "<table><tr><th>z</th><th>tiles</th><th>bytes</th><th>max</th></tr>" +
-    st.per_zoom.map((r) => `<tr><td>${r.z}</td><td>${r.tile_count.toLocaleString()}</td>` +
-      `<td>${r.total_bytes.toLocaleString()}</td><td>${r.max_bytes.toLocaleString()}</td></tr>`).join("") + "</table>";
+  // Statistics are optional: the tiles show whether or not they load.
+  $("stats").textContent = "Loading…";
+  try {
+    const st = await getJSON(`${base}/stats.json`);
+    if (me !== loading) return;
+    $("stats").innerHTML = "<table><tr><th>z</th><th>tiles</th><th>bytes</th><th>max</th></tr>" +
+      st.per_zoom.map((r) => `<tr><td>${r.z}</td><td>${r.tile_count.toLocaleString()}</td>` +
+        `<td>${r.total_bytes.toLocaleString()}</td><td>${r.max_bytes.toLocaleString()}</td></tr>`).join("") + "</table>";
+  } catch (e) {
+    if (me === loading) $("stats").textContent = `Unavailable: ${e.message}.`;
+  }
 }
 
 map.on("mousemove", (e) => {
@@ -89,7 +123,13 @@ map.on("mousemove", (e) => {
 });
 
 map.on("load", async () => {
-  const names = await (await fetch("/index.json")).json();
+  let names;
+  try {
+    names = await getJSON("/index.json");
+  } catch (e) {
+    $("info").textContent = `Could not list the archives: ${e.message}.`;
+    return;
+  }
   for (const n of names) $("archive").add(new Option(n, n));
   $("archive").onchange = (e) => load(e.target.value, true);
   // A shared link's #zoom/lat/lng wins over the first archive's bounds.
