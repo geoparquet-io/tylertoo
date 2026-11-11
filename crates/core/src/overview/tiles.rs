@@ -672,6 +672,14 @@ impl TilesOptions {
                 });
             }
         }
+        if coarse_owns_no_feature_zoom(self) && self.convert.plan.is_some() {
+            return Err(ConfigError::CellBandConflict {
+                band: self.cell_bands[0].to_string(),
+                option: "--plan",
+                reason: "this coarse job draws only cells, so it has no feature zoom to replay \
+                         a plan into; give it --save-plan, or lower the shard plan's pivot",
+            });
+        }
         super::cells::check_rollup_columns(super::cells::CellRollup {
             accumulate: &self.convert.accumulate,
             categories: self.convert.cluster_categories.as_deref(),
@@ -1491,7 +1499,13 @@ fn convert_with_cells(
             );
             // A table's convert repeats what the feature run reports about
             // the host (its memory budget); its export can lose cells.
-            diagnostics.extend(report.export.diagnostics);
+            diagnostics.extend(
+                report
+                    .export
+                    .diagnostics
+                    .into_iter()
+                    .filter(|d| !matches!(d, crate::diagnostics::Diagnostic::MemoryBudget { .. })),
+            );
             cell_zooms.extend(report.export.zooms);
             archives.push((
                 Band::new(archive.to_path_buf(), layer.clone(), z, z),
@@ -1500,6 +1514,12 @@ fn convert_with_cells(
         }
     }
 
+    // The rows the cells read; they index no losses.
+    let cell_rows = source
+        .selected_row_count(gates.row_groups.as_ref())
+        .ok()
+        .and_then(|n| u64::try_from(n).ok())
+        .unwrap_or(0);
     // `Err` holds a coarse job's accounting when its feature zooms wrote
     // nothing: `None` when the pivot leaves it no feature zoom at all.
     let report: Result<Box<TilesReport>, Option<EmptyArchive>> = if let Some(job) = options
@@ -1507,11 +1527,12 @@ fn convert_with_cells(
         .as_ref()
         .filter(|_| coarse_owns_no_feature_zoom(options))
     {
-        // Only the plan the data shards share, from the same source.
-        if features.convert.save_plan.is_some() {
-            let mut convert = features.convert.clone();
-            job.apply_selection(&mut convert);
-            let convert = resolve_on_source(&source, Some(job), Cow::Owned(convert))?;
+        // Only the plan the data shards share, from the same source, which
+        // the shard binding verifies.
+        let mut convert = features.convert.clone();
+        job.apply_selection(&mut convert);
+        let convert = resolve_on_source(&source, Some(job), Cow::Owned(convert))?;
+        if convert.save_plan.is_some() {
             write_convert_plan_sources(&source, &convert).map_err(TilesError::Convert)?;
         }
         Err(None)
@@ -1567,22 +1588,7 @@ fn convert_with_cells(
                 .shard
                 .as_ref()
                 .expect("only a coarse job ends empty");
-            let mut info = info.unwrap_or_else(|| EmptyArchive {
-                total_tiles: 0,
-                total_tile_features: 0,
-                input_rows: 0,
-                source_row_ranges: Vec::new(),
-                diagnostics: Vec::new(),
-                source_losses: crate::diagnostics::SourceLosses::default(),
-                role: job.role,
-                pivot_zoom: job.pivot_zoom,
-                min_zoom: 0,
-                max_zoom: 0,
-                why: format!(
-                    "the pivot z{} leaves the coarse job no feature zoom",
-                    job.pivot_zoom
-                ),
-            });
+            let mut info = info.unwrap_or_else(|| cells_only_coarse(job, cell_rows));
             info.total_tiles = merged.total_tiles;
             info.total_tile_features += cell_features;
             info.min_zoom = bands.iter().map(|b| b.min_zoom).min().unwrap_or(0);
@@ -1605,6 +1611,27 @@ fn convert_with_cells(
     export.total_tile_features += cell_features;
     export.diagnostics.extend(diagnostics.snapshot());
     Ok(TilesOutcome::Converted(report))
+}
+
+/// The accounting of a coarse job that draws only cells: the rows its
+/// cells read, which index no losses (#332).
+fn cells_only_coarse(job: &TilesShard, input_rows: u64) -> EmptyArchive {
+    EmptyArchive {
+        total_tiles: 0,
+        total_tile_features: 0,
+        input_rows,
+        source_row_ranges: Vec::new(),
+        diagnostics: Vec::new(),
+        source_losses: crate::diagnostics::SourceLosses::default(),
+        role: job.role,
+        pivot_zoom: job.pivot_zoom,
+        min_zoom: 0,
+        max_zoom: 0,
+        why: format!(
+            "the pivot z{} leaves the coarse job no feature zoom",
+            job.pivot_zoom
+        ),
+    }
 }
 
 /// A coarse job whose pivot is at or below the feature zooms' minimum: it
@@ -3310,10 +3337,13 @@ mod tests {
             .iter()
             .chain(&report.export.diagnostics)
             .map(ToString::to_string)
-            // The host's memory limit, reported under a cgroup.
-            .filter(|d| !d.starts_with("memory budget"))
             .collect();
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        // The host's memory limit, reported under a cgroup: once, not per
+        // cell zoom.
+        let (budget, rest): (Vec<_>, Vec<_>) = diagnostics
+            .iter()
+            .partition(|d| d.starts_with("memory budget"));
+        assert!(budget.len() <= 1 && rest.is_empty(), "{diagnostics:?}");
         assert_eq!(
             report
                 .export

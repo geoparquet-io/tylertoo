@@ -1882,4 +1882,27 @@ fn cell_bands_are_bound_to_the_fleet_and_stay_below_the_pivot() {
         !dir.path().join("past.pmtiles").exists(),
         "nothing is written"
     );
+
+    // A coarse job that draws only cells has no feature zoom to replay a
+    // plan into: refused before any read.
+    let (ok, out) = run(&[
+        "tiles",
+        input,
+        &path("cells.pmtiles"),
+        "--band",
+        "0-2:grid",
+        "--band",
+        "3-5:geom",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        shards,
+        "--plan",
+        &only,
+    ]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("--plan") && out.contains("--save-plan"),
+        "{out}"
+    );
 }
