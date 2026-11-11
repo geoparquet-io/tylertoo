@@ -91,10 +91,15 @@
   map.on("click", (e) => {
     const f = map.queryRenderedFeatures(e.point, { layers: ["density", "fields"] })[0];
     if (!f) return;
-    const rows = Object.entries(f.properties)
-      .map(([k, v]) => `<tr><th>${k}</th><td>${typeof v === "number" ? v.toLocaleString() : v}</td></tr>`)
-      .join("");
-    new maplibregl.Popup().setLngLat(e.lngLat)
-      .setHTML(`<strong>${"point_count" in f.properties ? "A5 cell" : "field"}</strong><table>${rows}</table>`).addTo(map);
+    // Tile properties are remote data: build the popup with textContent, never HTML.
+    const node = (tag, text) => Object.assign(document.createElement(tag), { textContent: text ?? "" });
+    const box = document.createElement("div");
+    box.appendChild(node("strong", "point_count" in f.properties ? "A5 cell" : "field"));
+    const table = box.appendChild(document.createElement("table"));
+    for (const [k, v] of Object.entries(f.properties)) {
+      const tr = table.appendChild(document.createElement("tr"));
+      tr.append(node("th", k), node("td", typeof v === "number" ? v.toLocaleString() : String(v)));
+    }
+    new maplibregl.Popup({ maxWidth: "none" }).setLngLat(e.lngLat).setDOMContent(box).addTo(map);
   });
 })();

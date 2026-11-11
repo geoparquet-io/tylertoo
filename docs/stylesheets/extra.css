@@ -143,6 +143,13 @@
 .maplibregl-popup-content {
   color: #05221d;
 }
-.maplibregl-popup-content table {
-  font-size: 0.7rem;
+.md-typeset .maplibregl-popup-content table:not([class]) {
+  display: table;
+  margin: 0.3rem 0 0;
+  border: 0;
+  font-size: 0.65rem;
+}
+.md-typeset .maplibregl-popup-content table:not([class]) :is(th, td) {
+  padding: 0.1rem 0.4rem;
+  white-space: nowrap;
 }
