@@ -50,6 +50,11 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::time::{Duration, Instant};
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "#817 B1, #852: pass 2's per-call measurement and sharing flag"
+)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array};
@@ -960,18 +965,31 @@ impl SinkAutoTuner {
     }
 }
 
-/// Flush every still-Ram sink into a fresh spill file (#626), returning the
-/// bytes handed to the spill writers so the per-level spill accounting stays
-/// whole. Sinks that already spill are untouched.
-fn downgrade_sinks_to_spill(
+/// When `tuner` says the RAM sinks cannot hold the run (#626), flush every
+/// still-Ram sink into a fresh spill file, adding the bytes handed to the
+/// spill writers to `spill_bytes` so the per-level spill accounting stays
+/// whole, and stop the levels sharing rows (`share`), which only pays off in
+/// RAM. Sinks that already spill are untouched.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#852: the sharing flag the window's batches read"
+)]
+fn downgrade_if_due(
+    tuner: &mut SinkAutoTuner,
     sinks: &mut [LevelSink],
     spill_bytes: &mut [u64],
-    out_schema: &Schema,
-    spill_dir: Option<&Path>,
+    (out_schema, spill_dir): (&Schema, Option<&Path>),
+    (diagnostics, share): (&crate::diagnostics::Diagnostics, &AtomicBool),
 ) -> Result<(), ConvertError> {
+    if !tuner.should_downgrade() {
+        return Ok(());
+    }
+    diagnostics.warn(tuner.downgrade_warning(sinks.len()));
     for (li, sink) in sinks.iter_mut().enumerate() {
         spill_bytes[li] += sink.downgrade_to_spill(out_schema, spill_dir)?;
     }
+    tuner.mark_downgraded();
+    share.store(false, Relaxed);
     Ok(())
 }
 
@@ -1567,9 +1585,6 @@ pub(super) fn run_pass2_buffered(
     let tuner_ref = &mut tuner;
     let timers_ref = &timers;
     let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
-    // Shared rows only pay off held in RAM: a spilled level writes its rows
-    // out at once, so it builds its own.
-    let share = matches!(backing, SinkBacking::Ram);
     // #494: `in_flight` is shared between the read-ahead channel and the
     // consumer's compute window, so the resident input stays about what one
     // channel of depth `in_flight` held before the window existed.
@@ -1577,12 +1592,17 @@ pub(super) fn run_pass2_buffered(
     // (`stream::grant_pass2_read`, #716).
     let (read_depth, _) = split_in_flight(in_flight);
     // #817 B1: the largest input batch read, so the drain reuses what the
-    // read-ahead and window really held, not what they were granted.
+    // read-ahead and window really held, not what they were granted. And
+    // whether the levels share rows: only held in RAM (#852), since a
+    // spilled level writes its rows out at once ([`downgrade_if_due`]).
     #[expect(
         clippy::disallowed_types,
-        reason = "#817 B1: a per-call measurement shared with the read thread"
+        reason = "#817 B1, #852: per-call state shared with the read thread and the window"
     )]
-    let peak_batch = std::sync::atomic::AtomicU64::new(0);
+    let (peak_batch, share) = (
+        AtomicU64::new(0),
+        AtomicBool::new(matches!(backing, SinkBacking::Ram)),
+    );
     let peak_batch_ref = &peak_batch;
     scoped_pipe(
         read_depth,
@@ -1599,10 +1619,7 @@ pub(super) fn run_pass2_buffered(
                 None,
                 read_tuning,
                 &mut |batch, row_offset, read_dur| {
-                    peak_batch_ref.fetch_max(
-                        batch.get_array_memory_size() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    peak_batch_ref.fetch_max(batch.get_array_memory_size() as u64, Relaxed);
                     Ok(
                         if tx
                             .send(ReadMsg {
@@ -1647,7 +1664,13 @@ pub(super) fn run_pass2_buffered(
                 |msg: &ReadMsg| -> Result<Vec<Option<(LevelBatch, usize)>>, ConvertError> {
                     let (batch, row_offset) = (&msg.batch, msg.row_offset);
                     if cascade {
-                        process_batch_cascade(batch, row_offset, ctxs, timers_ref, share)
+                        process_batch_cascade(
+                            batch,
+                            row_offset,
+                            ctxs,
+                            timers_ref,
+                            share.load(Relaxed),
+                        )
                     } else {
                         process_levels_apart(batch, row_offset, ctxs, timers_ref)
                     }
@@ -1663,18 +1686,13 @@ pub(super) fn run_pass2_buffered(
                                 buffer_batch(&mut sinks_ref[li], tuner_ref, out)?;
                         }
                     }
-                    if tuner_ref.should_downgrade() {
-                        ctxs[0]
-                            .diagnostics
-                            .warn(tuner_ref.downgrade_warning(num_levels));
-                        downgrade_sinks_to_spill(
-                            sinks_ref,
-                            spill_bytes_ref,
-                            out_schema,
-                            spill_dir,
-                        )?;
-                        tuner_ref.mark_downgraded();
-                    }
+                    downgrade_if_due(
+                        tuner_ref,
+                        sinks_ref,
+                        spill_bytes_ref,
+                        (out_schema, spill_dir),
+                        (ctxs[0].diagnostics, &share),
+                    )?;
                     if last_progress.elapsed().as_secs() >= 10 {
                         last_progress = Instant::now();
                         log::info!(
