@@ -50,7 +50,6 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::time::{Duration, Instant};
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array};
@@ -1798,31 +1797,22 @@ fn drain_sink(
             // every shared level batch (#852) left the drain's encodes
             // waiting. On this thread's own pool, so a pool worker helps
             // build what it waits for (`tests/rayon_global_pool_reentry.rs`).
-            let mut failed = None;
+            // A rebuild that fails ends the level unwritten.
             let mut pending = batches.into_iter();
-            let mut ready = VecDeque::new();
             let rebuilt = std::iter::from_fn(|| {
-                if ready.is_empty() && failed.is_none() {
-                    let chunk: Vec<LevelBatch> = pending
-                        .by_ref()
-                        .take(width.clamp(1, DRAIN_REBUILD_AHEAD))
-                        .collect();
-                    match chunk
+                let chunk: Vec<LevelBatch> = pending
+                    .by_ref()
+                    .take(width.clamp(1, DRAIN_REBUILD_AHEAD))
+                    .collect();
+                (!chunk.is_empty()).then(|| {
+                    chunk
                         .into_par_iter()
                         .map(LevelBatch::materialize)
-                        .collect::<Result<Vec<_>, _>>()
-                    {
-                        Ok(built) => ready.extend(built),
-                        Err(e) => failed = Some(e),
-                    }
-                }
-                ready.pop_front()
-            });
-            let written = writer.write_level(level_idx, Some(hint), rebuilt);
-            if let Some(e) = failed {
-                return Err(e); // the rebuild's error, ahead of the writer's
-            }
-            written?
+                        .collect::<Vec<_>>()
+                })
+            })
+            .flatten();
+            writer.write_level_from(level_idx, Some(hint), rebuilt)?
         }
         LevelSink::Spill(state) => {
             // `_temp` keeps the spill file on disk until the reader is drained.
@@ -1841,22 +1831,24 @@ fn drain_sink(
             let (reader, _temp) = state.into_reader(timers)?;
             // #817 B1: the spill decodes on its own thread, so the writer's
             // thread only feeds row groups (on Oregon roads the decode was
-            // most of what it did). A read error ends the stream and, as the
-            // producer's, takes precedence over the writer's.
+            // most of what it did).
             scoped_pipe(
                 SPILL_QUEUE_DEPTH,
-                move |tx: &Sender<RecordBatch>| -> Result<(), ConvertError> {
+                move |tx: &Sender<Result<RecordBatch, ConvertError>>| -> Result<(), ConvertError> {
                     for batch in reader {
                         #[cfg(test)]
                         spill_tests::note_decode();
-                        if tx.send(batch?).is_err() {
-                            break; // the writer failed; its error is reported
+                        // A read error goes to the writer in order and ends
+                        // the level unwritten.
+                        let failed = batch.is_err();
+                        if tx.send(batch.map_err(ConvertError::from)).is_err() || failed {
+                            break; // on a writer failure, its error is reported
                         }
                     }
                     Ok(())
                 },
-                |rx: Receiver<RecordBatch>| {
-                    Ok(writer.write_level(level_idx, Some(hint), rx.into_iter())?)
+                |rx: Receiver<Result<RecordBatch, ConvertError>>| {
+                    writer.write_level_from(level_idx, Some(hint), rx.into_iter())
                 },
             )?
         }
@@ -2830,6 +2822,70 @@ mod backing_tests {
             ),
             SinkBacking::Spill
         ));
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::overview::level::gsd;
+    use crate::overview::writer::{LevelSpec, OverviewWriterOptions};
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field};
+    use geoarrow::array::GeometryBuilder;
+    use geoarrow::datatypes::GeometryType;
+    use geoarrow_array::GeoArrowArray;
+
+    /// #852 review F3: a level batch that fails to rebuild in the drain ends
+    /// its level unwritten. The level was finished short before, with the
+    /// rows rebuilt ahead of the failure, and the file could still be
+    /// finished.
+    #[test]
+    fn a_failed_rebuild_leaves_no_finished_level() {
+        let points: Vec<geo::Geometry> = (0..4)
+            .map(|i| geo::Geometry::Point(geo::Point::new(f64::from(i), 0.0)))
+            .collect();
+        let mut builder =
+            GeometryBuilder::new(GeometryType::new(Default::default())).with_prefer_multi(false);
+        builder.extend_from_iter(points.iter().map(Some));
+        let geometry = builder.finish();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            geometry.data_type().to_field("geometry", true),
+        ]));
+        let input = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..4)),
+                geometry.to_array_ref(),
+            ],
+        )
+        .unwrap();
+        // A shared batch whose schema has a column too many cannot rebuild.
+        let (rows, mut index) =
+            SharedRows::new(&input, &[0], &[&[0, 1, 2, 3]], input.column(1).clone()).unwrap();
+        let mut fields = schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, false)));
+        let broken = LevelBatch::shared(
+            Arc::new(Schema::new(fields)),
+            &Arc::new(rows),
+            index.remove(0),
+            UInt32Array::from_iter_values(0..4),
+            1,
+            Vec::new(),
+        );
+        let sink = LevelSink::Ram(vec![
+            LevelBatch::Owned(input.clone()),
+            broken,
+            LevelBatch::Owned(input),
+        ]);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let options =
+            OverviewWriterOptions::new(Mode::Duplicating, vec![LevelSpec::new(gsd(2), Some(2))]);
+        let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
+        let drained = drain_sink(&mut writer, 0, 12, sink, 1, &Pass2Timers::default());
+        assert!(drained.is_err());
+        assert!(writer.finish().is_err(), "the short level was finished");
     }
 }
 

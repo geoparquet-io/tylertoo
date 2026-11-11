@@ -733,14 +733,27 @@ impl<W: Write + Send> OverviewWriter<W> {
         level_row_hint: Option<usize>,
         batches: impl Iterator<Item = RecordBatch>,
     ) -> Result<LevelWriteOutcome, WriterError> {
+        self.write_level_from(level_idx, level_row_hint, batches.map(Ok))
+    }
+
+    /// [`Self::write_level`] from batches that can fail to arrive. The first
+    /// error ends the level unwritten and poisons the writer, so a level its
+    /// source failed partway through never reaches a finished file.
+    pub(crate) fn write_level_from<E: From<WriterError>>(
+        &mut self,
+        level_idx: usize,
+        level_row_hint: Option<usize>,
+        batches: impl Iterator<Item = Result<RecordBatch, E>>,
+    ) -> Result<LevelWriteOutcome, E> {
         if self.failed {
-            return Err(poisoned_writer_error());
+            return Err(poisoned_writer_error().into());
         }
         if level_idx != self.next_level_idx {
             return Err(WriterError::LevelOutOfOrder {
                 expected: self.next_level_idx,
                 got: level_idx,
-            });
+            }
+            .into());
         }
 
         // Only the previous level's encodes may still run alongside this
@@ -790,6 +803,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             // serial path.
             let mut wkb_inflight: VecDeque<Receiver<WkbEncodeResult>> = VecDeque::new();
             for batch in batches {
+                let batch = self.arrived(batch)?;
                 // A zero-row batch moves no rows, no covering, and no
                 // row-group boundary — skip it. (The serial path feeds it to
                 // the shared encoder, where it is a covering no-op as well.)
@@ -817,6 +831,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             // Serial reference path: the shared encoder both encodes and
             // accumulates the file-level covering, in read order.
             for batch in batches {
+                let batch = self.arrived(batch)?;
                 // Skip empty batches, exactly as the parallel path does. Beyond
                 // saving a no-op encode, this keeps the two paths' file-level
                 // `geo` bbox identical: the encoder folds each batch's bounds
@@ -866,6 +881,15 @@ impl<W: Write + Send> OverviewWriter<W> {
         self.written_spec_indices.push(level_idx);
         self.next_level_idx += 1;
         Ok(LevelWriteOutcome::Written)
+    }
+
+    /// A batch [`Self::write_level_from`] was handed, or its source's error,
+    /// which poisons the writer.
+    fn arrived<E>(&mut self, batch: Result<RecordBatch, E>) -> Result<RecordBatch, E> {
+        if batch.is_err() {
+            self.failed = true;
+        }
+        batch
     }
 
     /// Append the NOT NULL `level` column (§4.1) — set to the level's physical
