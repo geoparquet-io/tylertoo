@@ -149,16 +149,19 @@ const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
 /// `memory`'s own [`MemoryProfile::Auto`] allowance, after every reservation
 /// and grant already charged to it — a function of `feature_count × level_count ×
 /// mode` (captured by `buffered_rows` and the per-mode byte estimate), NOT a
-/// mode-only rule. Partitioning additionally keeps its historical absolute
+/// mode-only rule. `shared_from` is the input row count when the RAM sink's
+/// levels share their rows' properties ([`MemoryBudget::ram_sink_estimate`]). Partitioning additionally keeps its historical absolute
 /// row ceiling, so it spills at least as often as before.
 pub(super) fn auto_backing(
     memory: &MemoryBudget,
     mode: Mode,
     buffered_rows: usize,
+    shared_from: Option<usize>,
     avg_geom_bytes: Option<u64>,
     row_bytes: Option<u64>,
 ) -> SinkBacking {
-    let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes, row_bytes);
+    let estimate =
+        memory.ram_sink_estimate(mode, buffered_rows, shared_from, avg_geom_bytes, row_bytes);
     let ram_gate_spill = estimate > memory.allowance(MemoryProfile::Auto);
     let abs_gate_spill =
         matches!(mode, Mode::Partitioning) && buffered_rows > PARTITIONING_SPILL_ROWS;
@@ -666,13 +669,21 @@ pub(super) fn sink_backing(
     profile: MemoryProfile,
     mode: Mode,
     buffered_rows: usize,
+    shared_from: Option<usize>,
     avg_geom_bytes: Option<u64>,
     row_bytes: Option<u64>,
 ) -> SinkBacking {
     match profile {
         MemoryProfile::Speed => SinkBacking::Ram,
         MemoryProfile::Bounded => SinkBacking::Spill,
-        MemoryProfile::Auto => auto_backing(memory, mode, buffered_rows, avg_geom_bytes, row_bytes),
+        MemoryProfile::Auto => auto_backing(
+            memory,
+            mode,
+            buffered_rows,
+            shared_from,
+            avg_geom_bytes,
+            row_bytes,
+        ),
     }
 }
 
@@ -690,6 +701,7 @@ pub(super) fn resolve_backing(
     profile: MemoryProfile,
     mode: Mode,
     buffered_rows: usize,
+    shared_from: Option<usize>,
     avg_geom_bytes: Option<u64>,
     row_bytes: Option<u64>,
 ) -> SinkBacking {
@@ -698,6 +710,7 @@ pub(super) fn resolve_backing(
         profile,
         mode,
         buffered_rows,
+        shared_from,
         avg_geom_bytes,
         row_bytes,
     );
@@ -707,14 +720,18 @@ pub(super) fn resolve_backing(
         );
         return backing;
     }
-    let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes, row_bytes);
+    let estimate =
+        memory.ram_sink_estimate(mode, buffered_rows, shared_from, avg_geom_bytes, row_bytes);
     let budget = memory.allowance(MemoryProfile::Auto);
     let avail_mib = memory.available().map_or_else(
         || "unknown".to_string(),
         |b| format!("{} MiB", b / (1024 * 1024)),
     );
     let geom = match (row_bytes, avg_geom_bytes.filter(|&b| b > 0)) {
-        (Some(row), _) => format!("footer row {row} B"),
+        (Some(row), _) => match shared_from {
+            Some(input) => format!("footer row {row} B shared from {input} input rows"),
+            None => format!("footer row {row} B"),
+        },
         (None, Some(b)) => format!("measured avg geom {b} B/row"),
         (None, None) => "unmeasured (calibrated constants)".to_string(),
     };
@@ -748,7 +765,8 @@ pub(super) struct SinkMeasurement {
     /// Measured retained bytes per buffered output row — the Arrow array
     /// bytes (geometry + every kept property column) of every batch handed to
     /// the sinks, averaged over the whole pass, plus
-    /// [`SINK_ROW_ALLOC_OVERHEAD_BYTES`]. `None` when nothing was buffered.
+    /// [`SINK_ROW_ALLOC_OVERHEAD_BYTES`] per materialized row (per shared row
+    /// of a shared batch, #852). `None` when nothing was buffered.
     pub(super) bytes_per_row: Option<u64>,
     /// Output rows the measurement covered: every buffered row of the pass.
     pub(super) sampled_rows: usize,
@@ -798,7 +816,9 @@ pub(super) struct SinkMeasurement {
 struct SinkAutoTuner {
     /// Output rows observed so far (every buffered row of the pass).
     rows: usize,
-    /// Arrow array bytes of those rows, floor excluded.
+    /// Arrow array bytes of those rows, plus [`SINK_ROW_ALLOC_OVERHEAD_BYTES`]
+    /// per row they materialize: per output row of an owned batch, per
+    /// shared row of a shared one (#852), whose output rows are positions.
     bytes: u64,
     /// Output rows the plan expects the buffered levels to hold in total.
     planned_rows: usize,
@@ -852,7 +872,14 @@ impl SinkAutoTuner {
     /// the measurement. Runs for every batch of the pass.
     fn observe(&mut self, batch: &LevelBatch) {
         self.rows += batch.num_rows();
-        self.bytes = self.bytes.saturating_add(batch.held_bytes());
+        let floor = match batch {
+            LevelBatch::Owned(b) => b.num_rows() as u64 * SINK_ROW_ALLOC_OVERHEAD_BYTES,
+            LevelBatch::Shared { .. } => 0,
+        };
+        self.bytes = self
+            .bytes
+            .saturating_add(batch.held_bytes())
+            .saturating_add(floor);
     }
 
     /// Fold in the rows one input batch's levels share, once.
@@ -861,15 +888,16 @@ impl SinkAutoTuner {
             Some((LevelBatch::Shared { rows, .. }, _)) => Some(rows),
             _ => None,
         }) {
-            self.bytes = self.bytes.saturating_add(rows.held_bytes());
+            self.bytes = self.bytes.saturating_add(
+                rows.held_bytes() + rows.rows as u64 * SINK_ROW_ALLOC_OVERHEAD_BYTES,
+            );
         }
     }
 
     /// Measured retained bytes per buffered output row, floor included.
     /// `None` until at least one row has been observed.
     fn bytes_per_row(&self) -> Option<u64> {
-        (self.rows > 0)
-            .then(|| SINK_ROW_ALLOC_OVERHEAD_BYTES.saturating_add(self.bytes / self.rows as u64))
+        (self.rows > 0).then(|| self.bytes / self.rows as u64)
     }
 
     /// What the whole buffered set costs in RAM: the bytes already buffered
@@ -878,11 +906,8 @@ impl SinkAutoTuner {
     /// under-counts the rows.
     fn projected_bytes(&self) -> u64 {
         self.bytes_per_row().map_or(0, |per_row| {
-            let held = self
-                .bytes
-                .saturating_add((self.rows as u64).saturating_mul(SINK_ROW_ALLOC_OVERHEAD_BYTES));
             let remaining = self.planned_rows.saturating_sub(self.rows) as u64;
-            held.saturating_add(remaining.saturating_mul(per_row))
+            self.bytes.saturating_add(remaining.saturating_mul(per_row))
         })
     }
 
@@ -972,6 +997,8 @@ struct ReadMsg {
 pub(super) struct SharedRows {
     /// The kept rows' columns, in the source schema's non-geometry order.
     columns: Vec<ArrayRef>,
+    /// How many rows they hold.
+    rows: usize,
     /// Every distinct geometry the levels keep, encoded once: a level whose
     /// cascade step left a feature unchanged shares the finer level's
     /// geometry (#499), so per-level columns held it once per level.
@@ -1004,6 +1031,7 @@ impl SharedRows {
                 rows.push(u32::try_from(i).expect("batch rows fit in u32"));
             }
         }
+        let kept_rows = rows.len();
         let columns = if rows.len() == n {
             non_geom_cols
                 .iter()
@@ -1020,7 +1048,14 @@ impl SharedRows {
             .iter()
             .map(|rows| rows.iter().map(|&i| pos[i]).collect())
             .collect();
-        Ok((Self { columns, geometry }, index))
+        Ok((
+            Self {
+                columns,
+                rows: kept_rows,
+                geometry,
+            },
+            index,
+        ))
     }
 
     /// What these columns hold in RAM.
@@ -2409,6 +2444,7 @@ mod backing_tests {
                 Mode::Duplicating,
                 between,
                 None,
+                None,
                 None
             ),
             SinkBacking::Spill
@@ -2420,6 +2456,7 @@ mod backing_tests {
                 MemoryProfile::Auto,
                 Mode::Duplicating,
                 under,
+                None,
                 None,
                 None
             ),
@@ -2437,6 +2474,7 @@ mod backing_tests {
                 Mode::Duplicating,
                 10_000_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Ram
@@ -2448,7 +2486,36 @@ mod backing_tests {
                 Mode::Duplicating,
                 1,
                 None,
+                None,
                 None
+            ),
+            SinkBacking::Spill
+        ));
+    }
+
+    /// #852 review F2: levels that share their rows' properties hold each
+    /// kept input row once, so an input whose per-output-row price passes the
+    /// allowance stays in RAM when its shared price fits. Overture segments
+    /// (2.8M input rows, 10.7M buffered, 738 B footer row, 140 B geometry):
+    /// 7.4 GiB per output row, 3.8 GiB shared, against a 4 GiB allowance.
+    /// `bounded` still spills.
+    #[test]
+    fn auto_keeps_a_shared_sink_in_ram_that_per_row_pricing_would_spill() {
+        let memory = MemoryBudget::with_available(Some(4 * GIB * 10 / 6 + GIB / 10));
+        let (rows, input, geom, row) = (10_697_457, 2_815_136, Some(140), Some(738));
+        let auto =
+            |shared_from| auto_backing(&memory, Mode::Duplicating, rows, shared_from, geom, row);
+        assert!(matches!(auto(None), SinkBacking::Spill));
+        assert!(matches!(auto(Some(input)), SinkBacking::Ram));
+        assert!(matches!(
+            sink_backing(
+                &memory,
+                MemoryProfile::Bounded,
+                Mode::Duplicating,
+                rows,
+                Some(input),
+                geom,
+                row
             ),
             SinkBacking::Spill
         ));
@@ -2462,6 +2529,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(54 * GIB)),
                 Mode::Duplicating,
                 10_000,
+                None,
                 None,
                 None
             ),
@@ -2478,6 +2546,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(54 * GIB)),
                 Mode::Duplicating,
                 10_000_000,
+                None,
                 None,
                 None
             ),
@@ -2496,6 +2565,7 @@ mod backing_tests {
                     Mode::Duplicating,
                     rows,
                     None,
+                    None,
                     None
                 ),
                 SinkBacking::Spill
@@ -2508,6 +2578,7 @@ mod backing_tests {
                     &MemoryBudget::with_available(Some(256 * GIB)),
                     Mode::Duplicating,
                     rows,
+                    None,
                     None,
                     None
                 ),
@@ -2527,6 +2598,7 @@ mod backing_tests {
                 Mode::Partitioning,
                 3_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Spill
@@ -2536,6 +2608,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(54 * GIB)),
                 Mode::Partitioning,
                 100_000,
+                None,
                 None,
                 None
             ),
@@ -2552,6 +2625,7 @@ mod backing_tests {
                 Mode::Duplicating,
                 100_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Spill
@@ -2561,6 +2635,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(None),
                 Mode::Duplicating,
                 1_000,
+                None,
                 None,
                 None
             ),
@@ -2663,6 +2738,7 @@ mod backing_tests {
                 Mode::Duplicating,
                 5_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Spill
@@ -2672,6 +2748,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(54 * GIB)),
                 Mode::Duplicating,
                 5_000_000,
+                None,
                 Some(100),
                 None
             ),
@@ -2690,6 +2767,7 @@ mod backing_tests {
                 Mode::Duplicating,
                 1_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Ram
@@ -2699,6 +2777,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(25 * GIB)),
                 Mode::Duplicating,
                 1_000_000,
+                None,
                 Some(11_534),
                 None
             ),
@@ -2718,6 +2797,7 @@ mod backing_tests {
                 Mode::Partitioning,
                 1_000_000,
                 None,
+                None,
                 None
             ),
             SinkBacking::Spill
@@ -2727,6 +2807,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(20 * GIB)),
                 Mode::Partitioning,
                 1_000_000,
+                None,
                 Some(983),
                 None
             ),
@@ -2743,6 +2824,7 @@ mod backing_tests {
                 &MemoryBudget::with_available(Some(10_000 * GIB)),
                 Mode::Partitioning,
                 3_000_000,
+                None,
                 Some(8),
                 None
             ),
@@ -2877,6 +2959,7 @@ mod sink_sample_tests {
                 MemoryProfile::Auto,
                 Mode::Duplicating,
                 59_689,
+                None,
                 Some(26),
                 None
             ),
@@ -3071,12 +3154,30 @@ mod sink_sample_tests {
         let (rows, index) = SharedRows::new(&input, &[0, 2], &kept, pool.clone()).unwrap();
         let rows = Arc::new(rows);
         let mut held = rows.held_bytes();
+        let per_level: Vec<Option<(LevelBatch, usize)>> = levels
+            .iter()
+            .zip(index)
+            .map(|(kept, index)| {
+                let at = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
+                let level = LevelBatch::shared(schema.clone(), &rows, index, at, 1, Vec::new());
+                held += level.held_bytes();
+                Some((level, 0))
+            })
+            .collect();
+        // The sink floor is paid once per shared row, not once per level.
+        let mut tuner = SinkAutoTuner::with_budget(false, 0, 0);
+        tuner.observe_shared(&per_level);
+        for (level, _) in per_level.iter().flatten() {
+            tuner.observe(level);
+        }
+        assert_eq!(
+            tuner.projected_bytes(),
+            held + n as u64 * SINK_ROW_ALLOC_OVERHEAD_BYTES
+        );
         let mut copied = 0u64;
-        for (kept, index) in levels.iter().zip(index) {
+        for (kept, (level, _)) in levels.iter().zip(per_level.into_iter().flatten()) {
             let at = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
             let geometry = arrow_select::take::take(pool.as_ref(), &at, None).unwrap();
-            let level = LevelBatch::shared(schema.clone(), &rows, index, at, 1, Vec::new());
-            held += level.held_bytes();
             let built = level.materialize().unwrap();
             let idx = UInt32Array::from_iter_values(kept.iter().map(|&i| i as u32));
             let want = RecordBatch::try_new(
