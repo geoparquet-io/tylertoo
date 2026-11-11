@@ -2077,32 +2077,10 @@ impl PyramidOptions {
         }
         self.export.validate()?;
         check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
-        // A cell table writes one column per spec, named after its source,
-        // beside its own cell id, count and geometry columns.
-        let reserved = crate::overview::cells::RESERVED_COLUMNS;
-        let mut seen = std::collections::HashSet::new();
-        let category_prefix = self.cluster_categories.as_ref().map(|c| format!("{c}:"));
-        for spec in &self.accumulate {
-            let counted = category_prefix
-                .as_ref()
-                .is_some_and(|p| spec.column.starts_with(p.as_str()));
-            if !seen.insert(spec.column.as_str())
-                || reserved.contains(&spec.column.as_str())
-                || counted
-            {
-                return Err(crate::overview::config::ConfigError::invalid_spec(
-                    "--accumulate-attribute",
-                    format!(
-                        "column {:?} would name two columns of a cell band: aggregate \
-                         each column once, and none named {} or {}LABEL",
-                        spec.column,
-                        reserved.join(", "),
-                        category_prefix.as_deref().unwrap_or("CATEGORY:")
-                    ),
-                )
-                .into());
-            }
-        }
+        crate::overview::cells::check_rollup_columns(CellRollup {
+            accumulate: &self.accumulate,
+            categories: self.cluster_categories.as_deref(),
+        })?;
         Ok(())
     }
 }

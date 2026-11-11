@@ -505,8 +505,14 @@ impl TilesOptions {
     fn validate_for(&self, run: Run) -> Result<(), TilesError> {
         if !self.cell_bands.is_empty() {
             self.check_cell_bands()?;
-            // The feature zooms are an ordinary run's, checked as one.
-            return self.features().validate_for(run);
+            // The feature zooms are an ordinary run's, checked as one. A
+            // coarse job that owns only the cell zooms builds no feature
+            // zoom, which its shard rules would refuse.
+            let mut features = self.features().into_owned();
+            if run == Run::Tiles && coarse_owns_no_feature_zoom(self) {
+                features.shard = None;
+            }
+            return features.validate_for(run);
         }
         // The shard rules first: they name the precise misuse (a plan-only
         // data shard), where convert's own check would only say `--shard`
@@ -666,6 +672,10 @@ impl TilesOptions {
                 });
             }
         }
+        super::cells::check_rollup_columns(super::cells::CellRollup {
+            accumulate: &self.convert.accumulate,
+            categories: self.convert.cluster_categories.as_deref(),
+        })?;
         if let Some(job) = &self.shard {
             if let Some(b) = self
                 .cell_bands
@@ -1392,12 +1402,12 @@ fn convert_with_cells(
 ) -> Result<TilesOutcome, TilesError> {
     use crate::pyramid::{Band, BandMergeOptions};
     let features = options.features();
-    let config = features.validate()?;
     if options
         .shard
         .as_ref()
         .is_some_and(|job| job.range.is_some())
     {
+        let config = features.validate()?;
         return convert_to_pmtiles_validated(input, open, output, &config, observer);
     }
     crate::atomic_output::check_writable(output)?;
@@ -1490,29 +1500,53 @@ fn convert_with_cells(
         }
     }
 
-    let archive = reserve(".tylertoo-features-", ".pmtiles")?;
-    let outcome = convert_to_pmtiles_validated(input, || Ok(source), &archive, &config, observer)?;
-    let report = match outcome {
-        TilesOutcome::Converted(report) => Some(report),
-        // A coarse job whose feature zooms hold nothing still has its cells.
-        TilesOutcome::EmptyCoarse(_) => None,
-        other => {
-            return Err(TilesError::Convert(ConvertError::Io(
-                std::io::Error::other(format!("unexpected outcome {other:?}")),
-            )))
+    // `Err` holds a coarse job's accounting when its feature zooms wrote
+    // nothing: `None` when the pivot leaves it no feature zoom at all.
+    let report: Result<Box<TilesReport>, Option<EmptyArchive>> = if let Some(job) = options
+        .shard
+        .as_ref()
+        .filter(|_| coarse_owns_no_feature_zoom(options))
+    {
+        // Only the plan the data shards share, from the same source.
+        if features.convert.save_plan.is_some() {
+            let mut convert = features.convert.clone();
+            job.apply_selection(&mut convert);
+            let convert = resolve_on_source(&source, Some(job), Cow::Owned(convert))?;
+            write_convert_plan_sources(&source, &convert).map_err(TilesError::Convert)?;
+        }
+        Err(None)
+    } else {
+        let config = features.validate()?;
+        let archive = reserve(".tylertoo-features-", ".pmtiles")?;
+        match convert_to_pmtiles_validated(input, || Ok(source), &archive, &config, observer)? {
+            TilesOutcome::Converted(report) if report.export.total_tiles == 0 => {
+                diagnostics.warn(format!(
+                    "the feature zooms z{}-{} hold no tiles: every feature generalized away",
+                    report.export.min_zoom, report.export.max_zoom
+                ));
+                Ok(report)
+            }
+            TilesOutcome::Converted(report) => {
+                archives.push((
+                    Band::new(
+                        archive.to_path_buf(),
+                        layer.clone(),
+                        report.export.min_zoom,
+                        report.export.max_zoom,
+                    ),
+                    archive,
+                ));
+                Ok(report)
+            }
+            // A coarse job whose feature zooms hold nothing still has its cells.
+            TilesOutcome::EmptyCoarse(info) => Err(Some(info)),
+            other => {
+                return Err(TilesError::Convert(ConvertError::Io(
+                    std::io::Error::other(format!("unexpected outcome {other:?}")),
+                )))
+            }
         }
     };
-    if let Some(r) = &report {
-        archives.push((
-            Band::new(
-                archive.to_path_buf(),
-                layer.clone(),
-                r.export.min_zoom,
-                r.export.max_zoom,
-            ),
-            archive,
-        ));
-    }
     let bands: Vec<Band> = archives.iter().map(|(band, _)| band.clone()).collect();
     let merged = crate::pyramid::merge_bands_with_options(
         &bands,
@@ -1526,46 +1560,44 @@ fn convert_with_cells(
     .map_err(TilesError::Merge)?;
     diagnostics.extend(merged.diagnostics);
     let cell_features: usize = cell_zooms.iter().map(|z| z.tile_feature_count).sum();
-    let Some(mut report) = report else {
-        let min_zoom = bands.iter().map(|b| b.min_zoom).min().unwrap_or(0);
-        let max_zoom = bands.iter().map(|b| b.max_zoom).max().unwrap_or(0);
-        let job = options
-            .shard
-            .as_ref()
-            .expect("only a coarse job ends empty");
-        return Ok(TilesOutcome::EmptyCoarse(EmptyArchive {
-            total_tiles: merged.total_tiles,
-            total_tile_features: cell_features,
-            input_rows: 0,
-            source_row_ranges: Vec::new(),
-            diagnostics: diagnostics.snapshot(),
-            source_losses: crate::diagnostics::SourceLosses::default(),
-            role: job.role,
-            pivot_zoom: job.pivot_zoom,
-            min_zoom,
-            max_zoom,
-            why: "the feature zooms below the pivot hold nothing; the archive holds the cells"
-                .to_string(),
-        }));
+    let mut report = match report {
+        Ok(report) => report,
+        Err(info) => {
+            let job = options
+                .shard
+                .as_ref()
+                .expect("only a coarse job ends empty");
+            let mut info = info.unwrap_or_else(|| EmptyArchive {
+                total_tiles: 0,
+                total_tile_features: 0,
+                input_rows: 0,
+                source_row_ranges: Vec::new(),
+                diagnostics: Vec::new(),
+                source_losses: crate::diagnostics::SourceLosses::default(),
+                role: job.role,
+                pivot_zoom: job.pivot_zoom,
+                min_zoom: 0,
+                max_zoom: 0,
+                why: format!(
+                    "the pivot z{} leaves the coarse job no feature zoom",
+                    job.pivot_zoom
+                ),
+            });
+            info.total_tiles = merged.total_tiles;
+            info.total_tile_features += cell_features;
+            info.min_zoom = bands.iter().map(|b| b.min_zoom).min().unwrap_or(0);
+            info.max_zoom = bands.iter().map(|b| b.max_zoom).max().unwrap_or(0);
+            diagnostics.extend(std::mem::take(&mut info.diagnostics));
+            info.diagnostics = diagnostics.snapshot();
+            return Ok(TilesOutcome::EmptyCoarse(info));
+        }
     };
     // The report counts every zoom: the cells' first, then the features'.
     let export = &mut report.export;
-    export.min_zoom = export.min_zoom.min(
-        options
-            .cell_bands
-            .iter()
-            .map(|b| b.min_zoom)
-            .min()
-            .unwrap_or(u8::MAX),
-    );
-    export.max_zoom = export.max_zoom.max(
-        options
-            .cell_bands
-            .iter()
-            .map(|b| b.max_zoom)
-            .max()
-            .unwrap_or(0),
-    );
+    for b in &options.cell_bands {
+        export.min_zoom = export.min_zoom.min(b.min_zoom);
+        export.max_zoom = export.max_zoom.max(b.max_zoom);
+    }
     cell_zooms.append(&mut export.zooms);
     cell_zooms.sort_by_key(|z| z.zoom);
     export.zooms = cell_zooms;
@@ -1573,6 +1605,17 @@ fn convert_with_cells(
     export.total_tile_features += cell_features;
     export.diagnostics.extend(diagnostics.snapshot());
     Ok(TilesOutcome::Converted(report))
+}
+
+/// A coarse job whose pivot is at or below the feature zooms' minimum: it
+/// owns the cell zooms alone (#332).
+fn coarse_owns_no_feature_zoom(options: &TilesOptions) -> bool {
+    match (&options.shard, &options.convert.levels) {
+        (Some(job), LevelPlan::ZoomRange { min_zoom, .. }) => {
+            job.range.is_none() && job.pivot_zoom <= *min_zoom
+        }
+        _ => false,
+    }
 }
 
 /// Tile one zoom's cell `table` verbatim at zoom `z` into `archive`.
@@ -3085,6 +3128,7 @@ mod tests {
             (&["0-8:point", "8-14:geom"], "overlap"),
             (&["0:a5", "x-14:geom"], "invalid zoom"),
             (&["8-14"], "must be LO-HI:KIND"),
+            (&["0-255:geom", "1:geom"], "overlap"),
         ] {
             let err = banded(specs).unwrap_err().to_string();
             assert!(err.contains(needle), "{specs:?}: {err}");
@@ -3190,6 +3234,10 @@ mod tests {
             assert!(matches!(err, TilesError::Config(_)), "{needle}: {err}");
             assert!(err.to_string().contains(needle), "{needle}: {err}");
         }
+        let mut collides = base.clone();
+        collides.convert.accumulate = vec![AccumulateSpec::new("point_count", AccumulateOp::Sum)];
+        let err = convert_to_pmtiles(&input, &out, &collides).unwrap_err();
+        assert!(err.to_string().contains("would name two columns"), "{err}");
         // The rollups need no --cluster with a cell band, and a pivot past
         // the cells is a valid coarse job.
         let ok = TilesOptions {

@@ -722,7 +722,7 @@ pub(crate) fn apply_bands(
     };
     if let Some(w) = features
         .windows(2)
-        .find(|w| w[1].min_zoom != w[0].max_zoom + 1)
+        .find(|w| Some(w[1].min_zoom) != w[0].max_zoom.checked_add(1))
     {
         return Err(invalid(format!(
             "the feature bands must be contiguous: z{}-{} and z{}-{} {}",

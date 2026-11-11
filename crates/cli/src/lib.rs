@@ -1162,6 +1162,19 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
                 if let Some(report_path) = &args.report {
                     write_report(report_path, &info)?;
                 }
+                // #332: a coarse job's cell zooms, without feature tiles.
+                if info.total_tiles > 0 {
+                    say!(
+                        "✓ coarse job wrote {} cell tiles across z{}..z{} to {}; {}",
+                        format_number(info.total_tiles as u64),
+                        info.min_zoom,
+                        info.max_zoom,
+                        output.display(),
+                        info.why
+                    );
+                    print_diagnostics(&info.diagnostics);
+                    return Ok(());
+                }
                 say!(
                     "✓ coarse job has no features at z{}..z{}; wrote an empty archive at {}",
                     info.min_zoom,

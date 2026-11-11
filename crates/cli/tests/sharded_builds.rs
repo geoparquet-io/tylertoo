@@ -1700,15 +1700,23 @@ fn tiles_of(archive: &Path) -> std::collections::BTreeMap<(u8, u64), Vec<u8>> {
 /// the rest; their merge holds the same tiles, byte for byte.
 #[test]
 fn a_sharded_cell_band_build_matches_the_unsharded_one() {
+    // Pivot z4: the coarse job draws the cells and z2-z3. Pivot z3: the
+    // cells alone, plus the plan the shards share.
+    for (pivot, cells, features) in [("4", "0-1:grid", "2-5:geom"), ("3", "0-2:grid", "3-5:geom")] {
+        sharded_cell_band_build_matches(pivot, cells, features);
+    }
+}
+
+fn sharded_cell_band_build_matches(pivot: &str, cells: &str, features: &str) {
     let dir = tempfile::tempdir().expect("tempdir");
     let input = grid();
     let input = input.to_str().unwrap();
     let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
     let bands = [
         "--band",
-        "0-1:grid",
+        cells,
         "--band",
-        "2-5:geom",
+        features,
         "--layer-name",
         "parity",
     ];
@@ -1721,7 +1729,7 @@ fn a_sharded_cell_band_build_matches_the_unsharded_one() {
     let (ok, out) = tiles(&path("mono.pmtiles"), &[]);
     assert!(ok, "unsharded: {out}");
 
-    let shards = cut_plan(dir.path(), "3", "3");
+    let shards = cut_plan(dir.path(), "3", pivot);
     let shards = shards.to_str().unwrap();
     let plan = path("convert.plan");
     let (ok, out) = tiles(
@@ -1762,7 +1770,7 @@ fn a_sharded_cell_band_build_matches_the_unsharded_one() {
         merged.keys().collect::<Vec<_>>(),
         "the same tiles"
     );
-    assert!(mono.keys().any(|k| k.0 <= 1), "the cell zooms hold tiles");
+    assert!(mono.keys().any(|k| k.0 == 0), "the cell zooms hold tiles");
     for (key, body) in &mono {
         assert!(merged[key] == *body, "tile {key:?} differs");
     }

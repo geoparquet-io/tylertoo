@@ -377,6 +377,42 @@ pub(crate) struct CellRollup<'a> {
     pub categories: Option<&'a str>,
 }
 
+/// Refuse rollups that would name two columns of a cell table (#332): a
+/// table writes one column per spec, named after its source, beside its
+/// own cell id, count, geometry and category columns.
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidSpec`](super::config::ConfigError::InvalidSpec)
+/// naming the column.
+pub(crate) fn check_rollup_columns(
+    rollup: CellRollup<'_>,
+) -> Result<(), super::config::ConfigError> {
+    let mut seen = std::collections::HashSet::new();
+    let category_prefix = rollup.categories.map(|c| format!("{c}:"));
+    for spec in rollup.accumulate {
+        let counted = category_prefix
+            .as_ref()
+            .is_some_and(|p| spec.column.starts_with(p.as_str()));
+        if !seen.insert(spec.column.as_str())
+            || RESERVED_COLUMNS.contains(&spec.column.as_str())
+            || counted
+        {
+            return Err(super::config::ConfigError::invalid_spec(
+                "--accumulate-attribute",
+                format!(
+                    "column {:?} would name two columns of a cell band: aggregate \
+                     each column once, and none named {} or {}LABEL",
+                    spec.column,
+                    RESERVED_COLUMNS.join(", "),
+                    category_prefix.as_deref().unwrap_or("CATEGORY:")
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// One cell's partial aggregate. Merges in any order to the same totals.
 #[derive(Debug, Clone)]
 struct CellAcc {
