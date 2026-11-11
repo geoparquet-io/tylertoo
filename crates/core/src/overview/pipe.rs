@@ -171,13 +171,83 @@ pub(super) fn for_each_window<T, R, E>(
     rx: &Receiver<T>,
     window: usize,
     process: impl Fn(&T) -> Result<R, E> + Sync,
-    mut emit: impl FnMut(T, R) -> Result<ReadFlow, E>,
+    emit: impl FnMut(T, R) -> Result<ReadFlow, E>,
 ) -> Result<WindowStats, E>
 where
     T: Send + Sync,
     R: Send,
     E: Send,
 {
+    for_each_window_with(
+        rx,
+        window,
+        |items| {
+            let results = process_window(&items, &process);
+            (items, results)
+        },
+        emit,
+    )
+}
+
+/// A helper thread's windows compute on the pool captured by the caller's
+/// `in_place_scope`, rather than selecting the global pool on the helper.
+/// Only compute runs there: receives and bounded output sends stay on the
+/// helper, so they cannot park the sole worker needed by the writer.
+pub(super) fn for_each_window_on_pool<'scope, T, R, E>(
+    scope: &rayon::Scope<'scope>,
+    rx: &Receiver<T>,
+    window: usize,
+    process: &'scope (impl Fn(&T) -> Result<R, E> + Sync),
+    emit: impl FnMut(T, R) -> Result<ReadFlow, E>,
+) -> Result<WindowStats, E>
+where
+    T: Send + Sync + 'scope,
+    R: Send + 'scope,
+    E: Send + 'scope,
+{
+    for_each_window_with(
+        rx,
+        window,
+        |items| {
+            let (tx, done) = bounded(1);
+            scope.spawn(move |_| {
+                // Return panics to the helper too, so its channels close
+                // before scoped_pipe joins it, just as for inline compute.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let results = process_window(&items, process);
+                    (items, results)
+                }));
+                // One result, capacity one: this never waits on the helper.
+                let _ = tx.send(result);
+            });
+            match done.recv().expect("scoped window task disconnected") {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        },
+        emit,
+    )
+}
+
+fn process_window<T: Sync, R: Send, E: Send>(
+    items: &[T],
+    process: &(impl Fn(&T) -> Result<R, E> + Sync),
+) -> Vec<Result<R, E>> {
+    // A one-item window skips the parallel iterator; processing may still
+    // parallelize inside itself, so it must use the same pool either way.
+    if items.len() == 1 {
+        vec![process(&items[0])]
+    } else {
+        items.par_iter().map(process).collect()
+    }
+}
+
+fn for_each_window_with<T, R, E>(
+    rx: &Receiver<T>,
+    window: usize,
+    mut process: impl FnMut(Vec<T>) -> (Vec<T>, Vec<Result<R, E>>),
+    mut emit: impl FnMut(T, R) -> Result<ReadFlow, E>,
+) -> Result<WindowStats, E> {
     let window = window.max(1);
     let mut stats = WindowStats::default();
     let mut items: Vec<T> = Vec::with_capacity(window);
@@ -192,13 +262,8 @@ where
         stats.items += items.len() as u64;
         stats.windows += 1;
         stats.max_window = stats.max_window.max(items.len() as u64);
-        // A one-item window skips the pool round-trip; the item's own
-        // processing still parallelizes inside itself.
-        let results: Vec<Result<R, E>> = if items.len() == 1 {
-            vec![process(&items[0])]
-        } else {
-            items.par_iter().map(&process).collect()
-        };
+        let (processed, results) = process(std::mem::take(&mut items));
+        items = processed;
         for (item, result) in items.drain(..).zip(results) {
             if matches!(emit(item, result?)?, ReadFlow::Stop) {
                 return Ok(stats);
@@ -458,6 +523,116 @@ mod tests {
         assert_eq!(stats.items, 20);
         assert_eq!(stats.windows, 7, "20 items in windows of 3 is 6 full + 1");
         assert_eq!(stats.max_window, 3);
+    }
+
+    /// The helper may block on its output channel, but its compute must
+    /// stay on the caller's pool, even when that pool has only one worker.
+    #[test]
+    fn helper_windows_use_the_callers_pool_and_keep_order() {
+        for threads in [1, 2] {
+            let got = within(
+                "helper_windows_use_the_callers_pool_and_keep_order",
+                move || {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    let process = |&i: &usize| -> Result<usize, ()> {
+                        assert!(pool.current_thread_index().is_some(), "wrong pool");
+                        Ok(i * 10)
+                    };
+                    pool.install(|| {
+                        rayon::in_place_scope(|scope| {
+                            scoped_pipe(
+                                1,
+                                |tx| -> Result<(), ()> {
+                                    for_each_window_on_pool(
+                                        scope,
+                                        &prefilled(20),
+                                        3,
+                                        &process,
+                                        |i, r| {
+                                            Ok(if tx.send((i, r)).is_ok() {
+                                                ReadFlow::Continue
+                                            } else {
+                                                ReadFlow::Stop
+                                            })
+                                        },
+                                    )?;
+                                    Ok(())
+                                },
+                                |rx| {
+                                    let mut got = Vec::new();
+                                    while let Ok(item) = super::super::writer::recv_in_pool(&rx) {
+                                        got.push(item);
+                                    }
+                                    Ok(got)
+                                },
+                            )
+                            .unwrap()
+                        })
+                    })
+                },
+            );
+            assert_eq!(got, (0..20).map(|i| (i, i * 10)).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn helper_window_errors_and_panics_reach_the_caller() {
+        for panics in [false, true] {
+            let outcome = within(
+                "helper_window_errors_and_panics_reach_the_caller",
+                move || {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(1)
+                        .build()
+                        .unwrap();
+                    let process = |&i: &usize| -> Result<(), &str> {
+                        if i == 4 {
+                            assert!(!panics, "window panicked");
+                            return Err("window failed");
+                        }
+                        Ok(())
+                    };
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        pool.install(|| {
+                            rayon::in_place_scope(|scope| {
+                                scoped_pipe(
+                                    1,
+                                    |tx| {
+                                        for_each_window_on_pool(
+                                            scope,
+                                            &prefilled(20),
+                                            3,
+                                            &process,
+                                            |i, ()| {
+                                                Ok(if tx.send(i).is_ok() {
+                                                    ReadFlow::Continue
+                                                } else {
+                                                    ReadFlow::Stop
+                                                })
+                                            },
+                                        )?;
+                                        Ok(())
+                                    },
+                                    |rx| {
+                                        while super::super::writer::recv_in_pool(&rx).is_ok() {}
+                                        Ok(())
+                                    },
+                                )
+                            })
+                        })
+                    }))
+                },
+            );
+            if panics {
+                let payload = outcome.expect_err("the process panic must propagate");
+                assert_eq!(payload.downcast_ref::<&str>(), Some(&"window panicked"));
+            } else {
+                assert_eq!(outcome.unwrap(), Err("window failed"));
+            }
+        }
     }
 
     /// The point of the window: items in one window are processed at the same
