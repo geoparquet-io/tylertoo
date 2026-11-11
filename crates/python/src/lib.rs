@@ -1074,15 +1074,24 @@ mod config_parity {
             "--allow-missing-zooms",
             "--profile",
             "bounded",
+            "--accumulate-attribute",
+            "pop:sum",
+            "--cluster-categories",
+            "kind",
         ]);
         let cli = cli::pyramid_options(&args);
-        let python = pyramid_config(native_keywords(json!({"generalize": true, "tile_size_limit": 1048576, "extent": 8192, "name": "Bands", "allow_missing_zooms": true, "profile": "bounded"}))).unwrap();
+        let python = pyramid_config(native_keywords(json!({"generalize": true, "tile_size_limit": 1048576, "extent": 8192, "name": "Bands", "allow_missing_zooms": true, "profile": "bounded", "accumulate_attributes": ["pop:sum"], "cluster_categories": "kind"}))).unwrap();
         let mut core = tylertoo_core::internal::pyramid::PyramidOptions::new(true);
         core.export.profile = tylertoo_core::MemoryProfile::Bounded;
         core.export.tile_size_limit = Some(1048576);
         core.export.extent = 8192;
         core.metadata.name = Some("Bands".into());
         core.allow_missing_zooms = true;
+        core.accumulate = vec![tylertoo_core::AccumulateSpec::new(
+            "pop",
+            tylertoo_core::AccumulateOp::Sum,
+        )];
+        core.cluster_categories = Some("kind".into());
         let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
         assert_eq!(
             serde_json::to_value(cli.validate().unwrap().options()).unwrap(),

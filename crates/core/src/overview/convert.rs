@@ -902,6 +902,14 @@ pub struct ConvertOptions {
     #[serde(skip)]
     #[cfg_attr(feature = "cli", arg(skip = Self::default().shard_plan_digest))]
     pub shard_plan_digest: Option<String>,
+    /// The `tiles` facade's cell bands (#332) as `--band` spells them,
+    /// set by the facade on the convert of its feature zooms. A saved
+    /// plan records them, so a fleet job given other cell bands is
+    /// refused like any other option mismatch. Default `None`.
+    #[doc(hidden)]
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().cell_bands))]
+    pub cell_bands: Option<String>,
     /// Materialize only the levels at or coarser than this zoom (#541): the
     /// **coarse job**'s half of a sharded build, on the convert side.
     ///
@@ -987,6 +995,7 @@ with_setters!(ConvertOptions {
     with_plan => plan: Option<PathBuf>,
     with_shard => shard: Option<TileRange>,
     with_shard_plan_digest => shard_plan_digest: Option<String>,
+    with_cell_bands => cell_bands: Option<String>,
     with_zoom_ceiling => zoom_ceiling: Option<u8>,
 });
 
@@ -1591,6 +1600,7 @@ impl Default for ConvertOptions {
             plan: None,
             shard: None,
             shard_plan_digest: None,
+            cell_bands: None,
             zoom_ceiling: None,
         }
     }
@@ -6052,6 +6062,20 @@ pub(super) fn validate_cluster_schema(
     {
         return Err(ConvertError::PointCountColumnPresent);
     }
+    validate_rollup_columns(schema, options, true)
+}
+
+/// The rollup half of [`validate_cluster_schema`], which a pyramid cell band
+/// (#332) also runs: every accumulate column exists and is numeric, and the
+/// `--cluster-categories` column is a string. When `keeps_source_columns`,
+/// the output keeps the input's columns, so its `COL:<value>` count columns
+/// must not already be taken; a cell table drops them and skips that check.
+/// Returns the accumulate columns' indices.
+pub(super) fn validate_rollup_columns(
+    schema: &Schema,
+    options: &ConvertOptions,
+    keeps_source_columns: bool,
+) -> Result<Vec<usize>, ConvertError> {
     let mut indices = Vec::with_capacity(options.accumulate.len());
     for spec in &options.accumulate {
         let idx =
@@ -6087,7 +6111,7 @@ pub(super) fn validate_cluster_schema(
         if let Some(f) = schema
             .fields()
             .iter()
-            .find(|f| f.name().starts_with(&prefix))
+            .find(|f| keeps_source_columns && f.name().starts_with(&prefix))
         {
             return Err(problem(format!(
                 "would write {prefix}<value> count columns, but the input already has a \

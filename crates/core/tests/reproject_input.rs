@@ -441,3 +441,56 @@ fn native_geoarrow_input_is_reprojected_end_to_end() {
     assert!(geoms.iter().any(|g| g.contains(&rim)), "square missing");
     assert!(geoms.iter().all(|g| !g.contains(&centre)), "hole filled");
 }
+
+/// Cell bands count projected input in degrees: each row's cell is picked
+/// from its reprojected centroid, so both NL squares land in the grid cell
+/// that holds (4.80°, 51.45°), not in one picked from raw meters.
+#[test]
+fn cell_bands_count_projected_input_in_lon_lat() {
+    use arrow_array::{cast::AsArray, Array};
+    use tylertoo_core::internal::overview::tiles::{convert_to_pmtiles, TilesInput, TilesOptions};
+    use tylertoo_core::{decode_pmtiles, CellBand, CellSystem, DecodeOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("nl.parquet");
+    let nl = SQUARES[0].3;
+    let near = [nl[0] + 2_000.0, nl[1], nl[2] + 2_000.0, nl[3]];
+    write_input(&input, 28992, SQUARES[0].2, &[nl, near]);
+    let out = dir.path().join("o.pmtiles");
+    let mut tiles = TilesOptions::default();
+    tiles.convert = ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: 8,
+        max_zoom: 10,
+    });
+    tiles.cell_bands = vec![CellBand::new(0, 7, CellSystem::Grid)];
+    convert_to_pmtiles(&TilesInput::Path(input), &out, &tiles).unwrap();
+
+    let decoded = dir.path().join("decoded.parquet");
+    decode_pmtiles(&out, &decoded, &DecodeOptions::default()).unwrap();
+    let batch = {
+        let reader = tylertoo_io::open_parquet(std::fs::File::open(&decoded).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<_> = reader.map(Result::unwrap).collect();
+        arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap()
+    };
+    let col = |name: &str| batch.column(batch.schema().index_of(name).unwrap()).clone();
+    let zoom = arrow_cast::cast(&col("zoom"), &DataType::Float64).unwrap();
+    let zoom = zoom.as_primitive::<arrow_array::types::Float64Type>();
+    let count = arrow_cast::cast(&col("point_count"), &DataType::Float64).unwrap();
+    let count = count.as_primitive::<arrow_array::types::Float64Type>();
+    let cell = col("cell");
+    let cell = cell.as_string::<i32>();
+    // A z0 grid cell is a web-mercator tile at zoom 6 (the band's zoom + 6).
+    let (lon, lat) = (4.80_f64, 51.45_f64);
+    let n = 64.0_f64;
+    let x = ((lon + 180.0) / 360.0 * n).floor();
+    let y = ((1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n).floor();
+    let want = format!("6/{x}/{y}");
+    let z0: Vec<(String, f64)> = (0..batch.num_rows())
+        .filter(|&r| zoom.value(r) == 0.0 && cell.is_valid(r))
+        .map(|r| (cell.value(r).to_string(), count.value(r)))
+        .collect();
+    assert_eq!(z0, [(want, 2.0)], "z0 cells");
+}

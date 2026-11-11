@@ -143,8 +143,11 @@ def pyramid(
     bands: Sequence[str],
     output: str,
     *,
+    accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
+    | None = None,
     allow_missing_zooms: bool = False,
     attribution: str | None = None,
+    cluster_categories: str | None = None,
     coverage_fill: bool = False,
     description: str | None = None,
     exclude_all_properties: bool = False,
@@ -206,6 +209,7 @@ def convert(
     accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
     | None = None,
     attribution: str | None = None,
+    bands: Sequence[str] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     cascade: bool = True,
     class_rank_column: str | None = None,
@@ -290,6 +294,7 @@ def convert(
     accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
     | None = None,
     attribution: str | None = None,
+    bands: Sequence[str] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     cascade: bool = True,
     class_rank_column: str | None = None,

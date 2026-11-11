@@ -68,6 +68,9 @@ arrow-string = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-data = { workspace = true }
 geo = { workspace = true }
+h3o = { workspace = true }
+s2 = { workspace = true }
+a5 = { workspace = true }
 wkb = { workspace = true }
 proj4rs = { workspace = true }
 crs-definitions = { workspace = true }
