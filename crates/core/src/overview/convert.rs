@@ -34,6 +34,7 @@ use geo_traits::{
 };
 use geoarrow::array::GeometryBuilder;
 use geoarrow::datatypes::GeometryType;
+use geoarrow_array::capacity::GeometryCapacity;
 use geoarrow_array::GeoArrowArray;
 
 use crate::input::InputSource;
@@ -5920,14 +5921,93 @@ pub(super) fn build_geometry_column(
     let typ = GeometryType::new(Arc::new(
         geoarrow::datatypes::Metadata::try_from(source_schema.field(geom_idx)).unwrap_or_default(),
     ));
-    let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
-    for g in geoms {
-        let g = g.borrow();
-        let flat = flatten_nested_collections(g);
-        b.push_geometry(Some(flat.as_ref().unwrap_or(g)))
-            .map_err(|e| arrow_schema::ArrowError::InvalidArgumentError(e.to_string()))?;
+    // Only the (rare) nested collections, by position: empty, it allocates
+    // nothing.
+    let flat: Vec<(usize, Geometry<f64>)> = geoms
+        .iter()
+        .enumerate()
+        .filter_map(|(i, g)| flatten_nested_collections(g.borrow()).map(|f| (i, f)))
+        .collect();
+    let members = || {
+        let mut flat = flat.iter().peekable();
+        geoms.iter().enumerate().map(move |(i, g)| {
+            Some(match flat.next_if(|(at, _)| *at == i) {
+                Some((_, f)) => f,
+                None => g.borrow(),
+            })
+        })
+    };
+    let invalid =
+        |e: &dyn std::fmt::Display| arrow_schema::ArrowError::InvalidArgumentError(e.to_string());
+    // Sized up front, so the coordinate buffers never grow by doubling: this
+    // runs once per level batch and per shared geometry pool (#852).
+    let capacity = GeometryCapacity::from_geometries(members()).map_err(|e| invalid(&e))?;
+    let mut b = GeometryBuilder::with_capacity(typ, capacity).with_prefer_multi(false);
+    for g in members() {
+        b.push_geometry(g).map_err(|e| invalid(&e))?;
     }
     Ok(b.finish().to_array_ref())
+}
+
+#[cfg(test)]
+mod geometry_column_tests {
+    use super::*;
+
+    /// The geometry column is sized from its geometries up front, so its
+    /// buffers never grow by doubling. A
+    /// level batch and the shared geometry pool (#852) both build here, once
+    /// per batch, and doubling was 4-30% of pass 2's allocation churn.
+    #[test]
+    fn the_geometry_column_holds_no_spare_capacity() {
+        let schema = Schema::new(vec![mixed_geometry_field("geometry", Default::default())]);
+        let geoms: Vec<Geometry<f64>> = (0..1000)
+            .map(|i| {
+                let x = f64::from(i);
+                match i % 3 {
+                    0 => Geometry::Point(geo::Point::new(x, 1.0)),
+                    1 => Geometry::LineString(geo::LineString::from(vec![
+                        (x, 0.0),
+                        (x + 1.0, 1.0),
+                        (x + 2.0, 0.5),
+                    ])),
+                    _ => Geometry::Polygon(geo::Polygon::new(
+                        geo::LineString::from(vec![
+                            (x, 0.0),
+                            (x + 1.0, 0.0),
+                            (x + 1.0, 1.0),
+                            (x, 0.0),
+                        ]),
+                        vec![],
+                    )),
+                }
+            })
+            .collect();
+        // A nested collection among them is flattened in place.
+        let mut geoms = geoms;
+        geoms[500] = Geometry::GeometryCollection(geo::GeometryCollection::new_from(vec![
+            Geometry::GeometryCollection(geo::GeometryCollection::new_from(vec![
+                Geometry::Point(geo::Point::new(1.0, 2.0)),
+                Geometry::Point(geo::Point::new(3.0, 4.0)),
+            ])),
+            Geometry::Point(geo::Point::new(5.0, 6.0)),
+        ]));
+        let column = build_geometry_column(&schema, 0, &geoms).unwrap();
+        let flat: Vec<Geometry<f64>> = geoms
+            .iter()
+            .map(|g| flatten_nested_collections(g).unwrap_or_else(|| g.clone()))
+            .collect();
+        let typ = GeometryType::new(Default::default());
+        let capacity = GeometryCapacity::from_geometries(flat.iter().map(Some)).unwrap();
+        let mut exact = GeometryBuilder::with_capacity(typ, capacity).with_prefer_multi(false);
+        exact.extend_from_iter(flat.iter().map(Some));
+        let exact = exact.finish().to_array_ref();
+        assert_eq!(column.as_ref(), exact.as_ref(), "the same geometries");
+        assert_eq!(
+            column.get_buffer_memory_size(),
+            exact.get_buffer_memory_size(),
+            "bytes held by the built column against one sized up front"
+        );
+    }
 }
 
 /// A GeometryCollection that contains other collections, flattened into one
