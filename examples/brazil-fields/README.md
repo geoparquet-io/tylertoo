@@ -5,9 +5,9 @@ Build a PMTiles map of the soy belt around Sorriso, Mato Grosso, from
 [Fields of the World](https://fieldsofthe.world/) (FTW). It holds about
 3.2 billion field polygons on
 [Source Cooperative](https://source.coop/ftw/global-data), stored as one
-GeoParquet file per country subdivision. One command streams the remote
-files and writes one archive: A5 density cells at low zooms and field
-polygons up close. You only download the row groups needed for the area.
+GeoParquet file per country subdivision. With one command, you can stream
+the remote files into one archive with A5 density cells at low zooms and
+field polygons up close, downloading only the row groups needed for the area.
 
 This extends the
 [Madagascar tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/madagascar/)
@@ -31,25 +31,25 @@ about 120 MB. Step 2 runs five jobs that each download the same 120 MB.
 ## 1. Tile a window straight from the bucket
 
 Point `AWS_ENDPOINT_URL` at Source Cooperative, which serves the S3 API.
-You need no credentials. tylertoo falls back to anonymous requests and
-logs a warning about it.
+You don't need credentials: `tylertoo` falls back to anonymous requests and
+logs a warning.
 
-tylertoo reads the 45 files under Brazil's prefix as one dataset.
-tylertoo reads each file's footer, then fetches only row groups whose
-bounds intersect `--bbox`: about 120 MiB of the 11 GB under the prefix
-(1.1%). Use `--filter` to drop fields under one hectare. The `metrics:area`
-column stores square meters.
+The 45 files under Brazil's prefix form one dataset. After reading each
+file's footer, `tylertoo` fetches only row groups whose bounds intersect
+`--bbox`: about 120 MiB of the 11 GB under the prefix (1.1%). To drop fields
+under one hectare, use `--filter` with the `metrics:area` column, which
+stores square meters.
 
-Draw A5 cells at z0-z7 with `--band 0-7:a5`. Each cell holds `cell`, its id,
-and `point_count`, the number of fields whose centroid falls in it.
-`--accumulate-attribute metrics:area:sum` sums the field areas in
-`metrics:area`. Draw field polygons at z8-z14 with `--band 8-14:geom`.
-There, `metrics:area` is each field's own area.
+Use `--band 0-7:a5` to draw A5 cells at z0-z7. Each cell holds its ID in
+`cell` and the number of fields whose centroid falls in it in `point_count`.
+Add `--accumulate-attribute metrics:area:sum` to sum the field areas in
+`metrics:area`. At z8-z14, use `--band 8-14:geom` to draw field polygons,
+where `metrics:area` is each field's own area.
 
 Name the shared layer `fields` with `--layer-name`. Style by zoom or by
-whether `point_count` is present. tylertoo opens the input once. It counts
-the cells, then tiles the fields from the same fetched bytes. The cells
-add almost no download: a fields-only run with `--min-zoom 8 --max-zoom 14`
+whether `point_count` is present. With one input read, `tylertoo` counts
+the cells, then tiles the fields from the same fetched bytes. This means
+the cells add almost no download: a fields-only run with `--min-zoom 8 --max-zoom 14`
 fetches the same 120.64 MiB. The whole run takes about 4 seconds.
 
 Choose another cell system by changing `a5` in `--band 0-7:a5`:
@@ -61,9 +61,8 @@ Choose another cell system by changing `a5` in `--band 0-7:a5`:
 | `s2` | Quadrilaterals on a cube |
 | `a5` | Pentagons with equal areas |
 
-Cell resolution follows the zoom in every system. At every zoom, each field
-counts in the cell that holds its centroid, so counts are exact in every
-system.
+In every system, cell resolution follows the zoom, and each field counts
+in the cell that holds its centroid. This keeps counts exact at every zoom.
 
 Run the script to build the archive. `tylertoo stats` reports tile sizes
 per zoom.
@@ -110,7 +109,7 @@ tylertoo stats brazil.pmtiles
 14    125  230,788   1,846   1,801   4,546   4,987
 ```
 
-The run keeps 534 fields. There is one A5 pentagon at each of z0-z3,
+The run keeps 534 fields, with one A5 pentagon at each of z0-z3,
 two at z4, five at z5, eight at z6, and 23 at z7. At every cell zoom,
 `point_count` sums to 534 and `metrics:area` sums to 36,733 ha.
 
@@ -122,18 +121,19 @@ Field tiles are heaviest at z11-z12 and shrink at higher zooms. Drop
 Split the tiles into independent jobs when one machine is too slow for a
 whole country. `shard-plan` cuts the z10 tile space, the pivot, into four
 shards of about equal row count. The plan covers every row under the
-prefix, not just the window. Here, the window's fields all fall in shard 0.
-Shards 1-3 have nothing to draw. On a country-wide run, the shards balance.
+prefix, not just the window. In this example, all the window's fields fall
+in shard 0, so shards 1-3 have nothing to draw. On a country-wide run, the
+shards balance.
 
 Run the coarse job to draw the cells and field zooms below the pivot
-(z0-z9). Save the convert plan with `--save-plan`. Run each data shard to
-draw z10-z14 for its slice and load the plan with `--plan`. Data shards
-skip the cells.
+(z0-z9), saving the convert plan with `--save-plan`. Then run each data
+shard with `--plan` to load that plan and draw z10-z14 for its slice. These
+data shards skip the cells.
 
 Give every job the same options through the `OPTIONS` array. The plan's
-fingerprint covers them, including the `--band` flags. tylertoo refuses a
-mismatched job. A cell band must end below the pivot. tylertoo refuses one
-that reaches it before reading anything.
+fingerprint covers them, including the `--band` flags, so `tylertoo`
+refuses a mismatched job. A cell band must end below the pivot; if it
+reaches the pivot, `tylertoo` refuses it before reading anything.
 
 A shard with no rows writes an empty archive, which `merge` skips. The
 jobs' tiles are disjoint, so `merge` concatenates them.
@@ -200,7 +200,7 @@ Merging 5 archive(s) → sharded.pmtiles
 ```
 
 `sharded.pmtiles` holds the same 199 tiles as `brazil.pmtiles` from step 1,
-byte for byte. The final stats match step 1.
+byte for byte, and its final stats match step 1.
 
 <!-- --8<-- [end:build] -->
 <!-- --8<-- [start:run] -->
@@ -222,7 +222,7 @@ for step in ../tylertoo/examples/brazil-fields/0*.sh; do bash "$step"; done
 - The [remote reads guide](https://geoparquet-io.github.io/tylertoo/guides/remote-reads/)
   covers `--filter` syntax, `--files-from` manifests, and row-group pruning.
 - The [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
-  explains every generalization knob, including `--band`.
+  explains every generalization setting, including `--band`.
 - Use `tylertoo pyramid` to combine bands from separate inputs or archives,
   such as cells from another dataset. See the same tuning reference.
 - The [Python reference](https://geoparquet-io.github.io/tylertoo/reference/python/)
