@@ -1254,7 +1254,7 @@ fn poisoned_writer_error() -> WriterError {
 /// thread nothing ever ran it (`tests/rayon_pool_reentry.rs`). So the
 /// worker runs queued pool work while it waits, and naps briefly only when
 /// the pool has none (the task is running on another worker).
-pub(super) fn recv_in_pool<T>(rx: &Receiver<T>) -> Result<T, RecvError> {
+fn recv_in_pool<T>(rx: &Receiver<T>) -> Result<T, RecvError> {
     if rayon::current_thread_index().is_none() {
         return rx.recv();
     }
