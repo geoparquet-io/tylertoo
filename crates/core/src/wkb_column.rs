@@ -351,6 +351,18 @@ impl Walk<'_> {
         let stride = HEADER_BYTES + header.coord_bytes;
         let start = self.pos + HEADER_BYTES as usize;
         self.skip(u64::from(n) * stride)?;
+        if self.coords.is_some() {
+            // A member's SRID moves its coordinates out of its fixed slot,
+            // so the reader reads bytes no rewrite could place; refuse it.
+            for i in 0..u64::from(n) {
+                let slot = start - HEADER_BYTES as usize + (i * stride) as usize;
+                if self.u32_at(slot + 1, header.little_endian)? & EWKB_FLAG_SRID != 0 {
+                    return Err(WkbCheckError::Malformed(format!(
+                        "MultiPoint member {i} at byte {slot} carries an SRID"
+                    )));
+                }
+            }
+        }
         self.record(start, n.into(), stride, header.little_endian);
         // Each member is read later from the start of its slot to the end of
         // the MultiPoint, and a member whose SRID flag is set needs four bytes
@@ -712,6 +724,8 @@ mod tests {
         v.extend_from_slice(&point(1.0, 2.0));
         assert_agrees(&v);
         assert!(check_wkb_value(&v).is_ok());
+        // #670: no rewrite can place its coordinates, so reprojection refuses it.
+        assert!(wkb_coordinates(&v, &mut Vec::new()).is_err());
     }
 
     // ------------------------------------------------------------------
