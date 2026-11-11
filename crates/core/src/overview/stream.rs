@@ -1484,7 +1484,8 @@ fn reserve_spill_cache(
         return skip("nothing spills");
     }
     let arrow_bytes = budget.sink_estimate(options.mode, buffered_rows, avg_geom_bytes, row_bytes);
-    let estimate_bytes = (arrow_bytes as f64 * pipeline::SPILL_BYTES_PER_ARROW_BYTE) as u64;
+    let codec = pipeline::spill_codec(options.profile);
+    let estimate_bytes = (arrow_bytes as f64 * pipeline::spill_bytes_per_arrow_byte(codec)) as u64;
     let reservation = if estimate_bytes <= budget.remaining() {
         SpillReservation {
             estimate_bytes,
@@ -1697,7 +1698,9 @@ fn run_pass2_levels(
                         window: grants.window.units,
                     },
                     BufferOptions {
-                        profile: read_tuning.profile,
+                        // The run's own profile: it picks the spill codec,
+                        // which an `auto` spill keeps raw (#815).
+                        profile: options.profile,
                         backing,
                         out_schema,
                         spill_dir: options.spill_dir.as_deref(),
@@ -3714,7 +3717,7 @@ pub(crate) fn run_stages(
         out_schema,
         non_geom_cols,
         effective_max_row_group_size,
-        mut encode,
+        encode,
         drain_slot_bytes,
     } = create_level_writer(
         output_path,
@@ -3745,17 +3748,6 @@ pub(crate) fn run_stages(
         (num_rows > 0).then(|| geom_bytes / num_rows as u64),
         row_bytes,
     );
-    let sizing = pipeline::sizing_profile(options.profile, backing);
-    if sizing != options.profile {
-        // #815: an `auto` run that spills encodes as `bounded` does.
-        budget.release(encode);
-        encode = budget.encode_concurrency(
-            sizing,
-            rayon::current_num_threads(),
-            Price::new(encode.unit_bytes, PriceBasis::Footer),
-        );
-        writer.set_encode_concurrency(encode.units)?;
-    }
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
     // Pass-1 O(N) scratch has been freed by here; this marks the memory floor
@@ -11179,7 +11171,7 @@ mod tests {
             (r, budget.remaining())
         };
         // Two buffered levels (the finest streams) of 1,000 rows at 100 B:
-        // 200,000 Arrow bytes, 80,000 spilled at LZ4's 0.4 (#815), which fits
+        // 200,000 Arrow bytes, 80,000 spilled at `bounded`'s LZ4 0.4, which fits
         // 0.6 × 1 MB.
         let (fits, left) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &bounded, 100);
         assert_eq!(
@@ -11195,6 +11187,16 @@ mod tests {
             (0, "exceeds the allowance")
         );
         assert_eq!(left, 600_000);
+        // `auto` spills raw, so its spill is priced at its Arrow bytes.
+        let auto = ConvertOptions {
+            profile: MemoryProfile::Auto,
+            ..ConvertOptions::default()
+        };
+        let (raw, _) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &auto, 1_000);
+        assert_eq!(
+            (raw.estimate_bytes, raw.reason),
+            (2_000_000, "exceeds the allowance")
+        );
         // Page cache is not charged to MemAvailable, and `speed` never spills.
         let (free, _) = reserve(1_000_000, MemoryLimitSource::MemAvailable, &bounded, 100);
         assert_eq!(free.reserved_bytes, 0);

@@ -97,21 +97,31 @@ pub(super) enum SinkBacking {
     Spill,
 }
 
-/// Every pass-2 spill is LZ4 (#715 for `bounded`, #815 for `auto` once it
-/// spills, up front or by a mid-pass downgrade): a spill is the path that
-/// already gave up speed for memory, and LZ4 writes 2.5-3.9x fewer bytes
-/// for +2-12% instructions (#790).
-const SPILL_CODEC: IpcCompression = IpcCompression::Lz4;
+/// The pass-2 spill codec for `profile`. `bounded` spills LZ4 (#715), which
+/// writes 2.5-3.9x fewer bytes for +2-12% instructions (#790). `auto` and
+/// `speed` spill raw: LZ4 cost an `auto` spill 6-9 s of pass 2 on NZ parcels
+/// and Mato Grosso (#815), where raw matched the pre-#852 pass 2.
+pub(super) const fn spill_codec(profile: MemoryProfile) -> IpcCompression {
+    match profile {
+        MemoryProfile::Bounded => IpcCompression::Lz4,
+        MemoryProfile::Auto | MemoryProfile::Speed => IpcCompression::None,
+    }
+}
 
-/// Spilled bytes per Arrow byte under [`SPILL_CODEC`]: the least LZ4 saved
+/// Spilled bytes per Arrow byte under `codec`. LZ4's is the least it saved
 /// in #790's measurements (2.5x), so the page-cache reservation is not
 /// under-priced.
-pub(super) const SPILL_BYTES_PER_ARROW_BYTE: f64 = 0.4;
+pub(super) const fn spill_bytes_per_arrow_byte(codec: IpcCompression) -> f64 {
+    match codec {
+        IpcCompression::None => 1.0,
+        IpcCompression::Lz4 => 0.4,
+    }
+}
 
-/// The profile that sizes pass 2's other buffers (read-ahead, window,
-/// encodes) once the sink `backing` is known (#815): an `auto` run that
-/// spills sizes them as `bounded` does, since memory spent there buys no
-/// speed once the spill sets the pace.
+/// The profile that sizes pass 2's read-ahead and window once the sink
+/// `backing` is known (#815): an `auto` run that spills sizes them as
+/// `bounded` does. Its encodes keep `auto`'s grant: as `bounded`'s they
+/// cost NZ parcels and Mato Grosso 3-4 s of pass 2.
 pub(super) fn sizing_profile(profile: MemoryProfile, backing: SinkBacking) -> MemoryProfile {
     match (profile, backing) {
         (MemoryProfile::Auto, SinkBacking::Spill) => MemoryProfile::Bounded,
@@ -1278,10 +1288,11 @@ struct SpillWriterDone {
 }
 
 impl SpillState {
+    /// The spill a mid-pass downgrade opens, which only `auto` does.
     /// `spill_dir` is where the spill file goes (#427: `--spill-dir`, the one
     /// scratch knob); `None` is the process temp dir, as before.
     fn new(out_schema: &Schema, spill_dir: Option<&Path>) -> Result<Self, ConvertError> {
-        Self::with_codec(out_schema, spill_dir, SPILL_CODEC)
+        Self::with_codec(out_schema, spill_dir, spill_codec(MemoryProfile::Auto))
     }
 
     fn with_codec(
@@ -1497,7 +1508,7 @@ pub(super) fn run_pass2_buffered(
     let timers = Pass2Timers::default();
 
     let mut sinks = (0..num_levels)
-        .map(|_| LevelSink::with_codec(backing, out_schema, spill_dir, SPILL_CODEC))
+        .map(|_| LevelSink::with_codec(backing, out_schema, spill_dir, spill_codec(profile)))
         .collect::<Result<Vec<_>, _>>()?;
     let mut rows = vec![0usize; num_levels];
     let mut verts = vec![0usize; num_levels];
@@ -1722,7 +1733,7 @@ pub(super) fn run_pass2_buffered(
         timers,
         sink: SinkMeasurement {
             codec: if matches!(backing, SinkBacking::Spill) || tuner.downgraded {
-                SPILL_CODEC
+                spill_codec(profile)
             } else {
                 IpcCompression::None
             },
@@ -2030,7 +2041,9 @@ mod spill_tests {
     fn phase1_spill_bytes_per_level_are_below_raw_payload() {
         let dir = tempfile::tempdir().unwrap();
         let s = schema("id");
-        let mut sink = SpillState::with_codec(&s, Some(dir.path()), SPILL_CODEC).unwrap();
+        let mut sink =
+            SpillState::with_codec(&s, Some(dir.path()), spill_codec(MemoryProfile::Bounded))
+                .unwrap();
         const ROWS: usize = 65536;
         sink.push(batch(&s, vec![0; ROWS])).unwrap();
         let (reader, temp) = sink.into_reader(&Pass2Timers::default()).unwrap();
@@ -2043,10 +2056,18 @@ mod spill_tests {
         );
     }
 
-    /// #815: every spill is LZ4, including the one an `auto` run opens when
-    /// it downgrades its RAM sinks mid-pass ([`SpillState::new`]).
+    /// Only `bounded` spills LZ4 (#715); `auto` spills raw, up front or in
+    /// the mid-pass downgrade ([`SpillState::new`]), since LZ4 cost its
+    /// pass 2 6-9 s (#815). The reservation prices each codec's bytes.
     #[test]
-    fn a_downgrade_spill_is_lz4_like_every_other() {
+    fn only_bounded_spills_lz4() {
+        use MemoryProfile::{Auto, Bounded, Speed};
+        assert_eq!(spill_codec(Bounded), IpcCompression::Lz4);
+        assert_eq!(spill_codec(Auto), IpcCompression::None);
+        assert_eq!(spill_codec(Speed), IpcCompression::None);
+        assert_eq!(spill_bytes_per_arrow_byte(IpcCompression::None), 1.0);
+        assert!(spill_bytes_per_arrow_byte(IpcCompression::Lz4) < 1.0);
+
         let dir = tempfile::tempdir().unwrap();
         let schema = schema("id");
         let mut sink = SpillState::new(&schema, Some(dir.path())).unwrap();
@@ -2054,7 +2075,12 @@ mod spill_tests {
         sink.push(batch(&schema, vec![0; ROWS])).unwrap();
         let (reader, temp) = sink.into_reader(&Pass2Timers::default()).unwrap();
         assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), ROWS);
-        assert!(temp.as_file().metadata().unwrap().len() <= (ROWS * size_of::<i64>() / 2) as u64);
+        let disk_bytes = temp.as_file().metadata().unwrap().len();
+        assert!(
+            disk_bytes >= (ROWS * size_of::<i64>()) as u64,
+            "a downgrade spill is raw: {disk_bytes} disk bytes for {} raw bytes",
+            ROWS * size_of::<i64>()
+        );
     }
 
     /// #815: `auto` sizes its other buffers as `bounded` once it spills, and
