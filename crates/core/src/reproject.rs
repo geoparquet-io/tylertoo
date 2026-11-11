@@ -19,8 +19,13 @@ use arrow_buffer::Buffer;
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType};
 use proj4rs::Proj;
+use rayon::prelude::*;
 
 use crate::quality::CrsInfo;
+
+/// Rows (or coordinates) per rayon task when a batch is reprojected: small
+/// enough that one 8192-row read batch spreads over the pool (#868).
+const PAR_ROWS: usize = 128;
 
 /// The transform from one projected or geographic CRS to EPSG:4326 degrees.
 #[derive(Debug)]
@@ -46,7 +51,12 @@ impl ToLonLat {
     /// The transform for a declared CRS, or `None` when it names no EPSG
     /// code with a usable definition.
     pub(crate) fn for_crs(info: &CrsInfo) -> Option<Self> {
-        let def = crs_definitions::from_code(epsg_code(info.identifier.as_deref()?)?)?;
+        Self::for_code(epsg_code(info.identifier.as_deref()?)?)
+    }
+
+    /// The transform for an EPSG code, as [`Self::for_crs`].
+    pub(crate) fn for_code(code: u16) -> Option<Self> {
+        let def = crs_definitions::from_code(code)?;
         // GeoParquet coordinates are always x/y (easting or longitude first),
         // whatever axis order the CRS itself declares.
         let proj4: String = def
@@ -180,18 +190,21 @@ impl ToLonLat {
         Ok(match a.data_type() {
             DataType::Binary => Arc::new(self.wkb_array(a.as_binary::<i32>())),
             DataType::LargeBinary => Arc::new(self.wkb_array(a.as_binary::<i64>())),
-            DataType::BinaryView => Arc::new(
-                a.as_binary_view()
-                    .iter()
-                    .map(|v| {
-                        v.map(|v| {
-                            let mut v = v.to_vec();
+            DataType::BinaryView => {
+                let a = a.as_binary_view();
+                let values: Vec<Option<Vec<u8>>> = (0..a.len())
+                    .into_par_iter()
+                    .with_min_len(PAR_ROWS)
+                    .map(|i| {
+                        a.is_valid(i).then(|| {
+                            let mut v = a.value(i).to_vec();
                             self.wkb_value(&mut v, &mut Vec::new());
                             v
                         })
                     })
-                    .collect::<BinaryViewArray>(),
-            ),
+                    .collect();
+                Arc::new(BinaryViewArray::from_iter(values))
+            }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
                 return Err(ArrowError::NotYetImplemented(
                     "reprojecting a WKT geometry column; reproject the input to EPSG:4326 with \
@@ -203,17 +216,33 @@ impl ToLonLat {
         })
     }
 
+    /// Rewrite every value in place, [`PAR_ROWS`] rows per rayon task: the
+    /// reader threads that call this are few, the pool is not (#868).
     fn wkb_array<O: OffsetSizeTrait>(&self, a: &GenericBinaryArray<O>) -> GenericBinaryArray<O> {
+        let offsets = a.offsets();
+        let rows = offsets.len() - 1;
         let mut values = a.values().to_vec();
-        let mut coords = Vec::new();
-        for w in a.offsets().windows(2) {
-            let value = &mut values[w[0].as_usize()..w[1].as_usize()];
-            if !value.is_empty() {
-                self.wkb_value(value, &mut coords);
-            }
+        let mut runs = Vec::with_capacity(rows.div_ceil(PAR_ROWS));
+        let (mut rest, mut at) = (&mut values[..], 0);
+        for start in (0..rows).step_by(PAR_ROWS) {
+            let ends = &offsets[start..=(start + PAR_ROWS).min(rows)];
+            let (lo, hi) = (ends[0].as_usize(), ends[ends.len() - 1].as_usize());
+            let (run, tail) = std::mem::take(&mut rest)[lo - at..].split_at_mut(hi - lo);
+            (rest, at) = (tail, hi);
+            runs.push((run, ends));
         }
+        runs.into_par_iter().for_each(|(run, ends)| {
+            let lo = ends[0].as_usize();
+            let mut coords = Vec::new();
+            for w in ends.windows(2) {
+                let value = &mut run[w[0].as_usize() - lo..w[1].as_usize() - lo];
+                if !value.is_empty() {
+                    self.wkb_value(value, &mut coords);
+                }
+            }
+        });
         GenericBinaryArray::new(
-            a.offsets().clone(),
+            offsets.clone(),
             Buffer::from_vec(values),
             a.nulls().cloned(),
         )
@@ -259,9 +288,12 @@ impl ToLonLat {
                 }
                 let c = Float64Array::from(d.child_data()[0].clone());
                 let mut v = c.values().to_vec();
-                for xy in v.chunks_exact_mut(*n as usize) {
-                    (xy[0], xy[1]) = self.point(xy[0], xy[1]);
-                }
+                let n = *n as usize;
+                v.par_chunks_mut(n * PAR_ROWS).for_each(|run| {
+                    for xy in run.chunks_exact_mut(n) {
+                        (xy[0], xy[1]) = self.point(xy[0], xy[1]);
+                    }
+                });
                 vec![Float64Array::new(v.into(), c.nulls().cloned()).into_data()]
             }
             DataType::Struct(fs)
@@ -275,12 +307,14 @@ impl ToLonLat {
                     Float64Array::from(children[0].clone()),
                     Float64Array::from(children[1].clone()),
                 );
-                let (xs, ys): (Vec<f64>, Vec<f64>) = x
-                    .values()
-                    .iter()
-                    .zip(y.values().iter())
-                    .map(|(&x, &y)| self.point(x, y))
-                    .unzip();
+                let (mut xs, mut ys) = (x.values().to_vec(), y.values().to_vec());
+                xs.par_chunks_mut(PAR_ROWS)
+                    .zip(ys.par_chunks_mut(PAR_ROWS))
+                    .for_each(|(xr, yr)| {
+                        for (x, y) in xr.iter_mut().zip(yr) {
+                            (*x, *y) = self.point(*x, *y);
+                        }
+                    });
                 children[0] = Float64Array::new(xs.into(), x.nulls().cloned()).into_data();
                 children[1] = Float64Array::new(ys.into(), y.nulls().cloned()).into_data();
                 children

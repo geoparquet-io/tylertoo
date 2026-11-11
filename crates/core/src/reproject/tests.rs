@@ -234,3 +234,68 @@ fn bbox_holds_every_interior_point() {
         }
     }
 }
+
+/// The parallel runs give every value exactly what a one-value-at-a-time
+/// rewrite gives, across run seams, on a sliced array, with nulls and empty
+/// values in the mix.
+#[test]
+fn parallel_runs_match_value_by_value() {
+    let rd = t("EPSG:28992");
+    let rows = 3 * PAR_ROWS + 7;
+    let values: Vec<Option<Vec<u8>>> = (0..rows)
+        .map(|i| match i % 7 {
+            0 => None,
+            1 => Some(Vec::new()),
+            _ => Some(wkb_polygon(
+                i % 2 == 0,
+                &[
+                    (100_000.0 + i as f64, 400_000.0),
+                    (100_500.0, 400_000.0 + i as f64),
+                ],
+            )),
+        })
+        .collect();
+    let array = BinaryArray::from_iter(values.iter().map(|v| v.as_deref()));
+    let sliced = array.slice(5, rows - 9);
+    let out = rd.wkb_array(&sliced);
+    for i in 0..sliced.len() {
+        assert_eq!(out.is_null(i), sliced.is_null(i), "row {i}");
+        let mut want = sliced.value(i).to_vec();
+        if !want.is_empty() {
+            rd.wkb_value(&mut want, &mut Vec::new());
+        }
+        assert_eq!(out.value(i), &want[..], "row {i}");
+    }
+    let view = BinaryViewArray::from_iter(sliced.iter());
+    let out_view = rd.array(&(Arc::new(view) as ArrayRef)).unwrap();
+    let out_view = out_view.as_binary_view();
+    for i in 0..sliced.len() {
+        assert_eq!(out_view.is_null(i), out.is_null(i), "view row {i}");
+        assert!(
+            out.is_null(i) || out_view.value(i) == out.value(i),
+            "view row {i}"
+        );
+    }
+
+    let xy: Vec<f64> = (0..2 * (PAR_ROWS + 3))
+        .map(|i| 100_000.0 + 1_000.0 * i as f64)
+        .collect();
+    let list = FixedSizeListArray::new(
+        Arc::new(Field::new("xy", DataType::Float64, false)),
+        2,
+        Arc::new(Float64Array::from(xy.clone())),
+        None,
+    );
+    let out = rd.array(&(Arc::new(list) as ArrayRef)).unwrap();
+    let got = out
+        .as_fixed_size_list()
+        .values()
+        .as_primitive::<arrow_array::types::Float64Type>()
+        .clone();
+    for (i, p) in xy.as_chunks::<2>().0.iter().enumerate() {
+        assert_eq!(
+            (got.value(2 * i), got.value(2 * i + 1)),
+            rd.point(p[0], p[1])
+        );
+    }
+}
