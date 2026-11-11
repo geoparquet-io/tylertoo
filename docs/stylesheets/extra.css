@@ -87,32 +87,54 @@
   margin-right: 0.3rem;
   vertical-align: middle;
 }
-/* The credits toggle: a small, faint "i" that opens on click. */
-.tutorial-map .maplibregl-ctrl-attrib.maplibregl-compact {
+/* The credits toggle: a small, faint "i" that opens on click. MapLibre
+   builds it from <details>/<summary>, which the theme styles as a
+   collapsible admonition (icon, chevron, box); undo that inside the map. */
+.md-typeset .tutorial-map details.maplibregl-ctrl-attrib {
   min-height: 16px;
   margin: 0 4px 4px 0;
   padding: 0 16px 0 0;
+  border: 0;
   border-radius: 8px;
-  background: transparent;
   box-shadow: none;
+  background: transparent;
   font-size: 0.6rem;
+  overflow: visible;
 }
-.tutorial-map .maplibregl-ctrl-attrib.maplibregl-compact-show {
+.md-typeset .tutorial-map details.maplibregl-ctrl-attrib[open] {
   padding: 0 20px 0 6px;
   background: rgba(255, 255, 255, 0.85);
 }
-.tutorial-map .maplibregl-ctrl-attrib-button {
+.md-typeset .tutorial-map summary.maplibregl-ctrl-attrib-button {
+  position: absolute;
+  top: 0;
+  right: 0;
   width: 16px;
   height: 16px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background-color: rgba(255, 255, 255, 0.6);
   background-size: 12px 12px;
   background-repeat: no-repeat;
   background-position: center;
-  background-color: rgba(255, 255, 255, 0.6);
-  border-radius: 8px;
   opacity: 0.6;
 }
-.tutorial-map .maplibregl-ctrl-attrib-button:hover {
+.md-typeset .tutorial-map summary.maplibregl-ctrl-attrib-button::before,
+.md-typeset .tutorial-map summary.maplibregl-ctrl-attrib-button::after {
+  display: none;
+}
+.md-typeset .tutorial-map summary.maplibregl-ctrl-attrib-button:focus:not(:focus-visible) {
+  outline: none;
+  box-shadow: none;
+}
+.md-typeset .tutorial-map summary.maplibregl-ctrl-attrib-button:hover {
   opacity: 1;
+}
+.md-typeset .tutorial-map .maplibregl-ctrl-attrib-inner {
+  margin: 0;
+  line-height: 16px;
 }
 .tutorial-map-caption {
   font-size: 0.7rem;

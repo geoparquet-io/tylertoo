@@ -83,7 +83,9 @@
       paint: { "line-color": "#05221d", "line-width": 1 },
     });
     drawLegend();
-    el.querySelector(".maplibregl-ctrl-attrib")?.classList.remove("maplibregl-compact-show");
+    const attrib = el.querySelector(".maplibregl-ctrl-attrib");
+    attrib?.classList.remove("maplibregl-compact-show");
+    attrib?.removeAttribute("open");
   });
   map.on("zoomend", drawLegend);
   map.on("click", (e) => {
