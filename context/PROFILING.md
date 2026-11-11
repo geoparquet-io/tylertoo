@@ -6,17 +6,38 @@ history of the pipeline (what was measured, what was fixed) lives in
 
 ## Memory envelope
 
-These are code-derived sizes for a 64-bit target on `perf/memory-batch`
-(PR #871). They are allocation models, not measured peak RSS. GB means
-10^9 bytes; GiB means 2^30 bytes. Do not add peaks from separate phases.
+These are code-derived sizes for a 64-bit target. They are arithmetic
+allocation models, not measured peak RSS. GB means 10^9 bytes. GiB means
+2^30 bytes. Do not add peaks from separate phases.
 Within a phase, add the tables, active batches, workspace, and allocator
 headroom that overlap.
 
-Country-scale polygon builds are a reasonable starting workload for a
-32 GB machine with local spill disk. Feature count, vertices, properties,
-and emitted tiles matter more than the country boundary. Planet scale
-needs larger RAM or sharding; spilling pass 2 does not spill pass 1 or the
-archive directory. The calculations below explain those limits.
+Feature count, vertices, properties, and emitted tiles determine memory
+needs. A country boundary alone gives no memory bound. Planet scale needs
+larger RAM or sharding. Spilling pass 2 does not spill pass 1 or the archive
+directory. The calculations below explain those limits.
+
+### Measured peaks
+
+Benchmark results are pending. The arithmetic below is not a measurement.
+Run each input under both profiles with local spill disk and
+`TYLERTOO_PROFILE_JSON` enabled. Input features is `pass1.rows`.
+Peak RSS is the larger of conversion's `peak_rss_mib` and export's
+`export.peak_rss_mib` in the two JSON Lines (JSONL) records from `tiles`, converted from
+MiB to GiB. Pass-2 peak share is
+`100 × rss_sampler.phase_peaks_mib["pass2 (output sink)"] / peak RSS`,
+using MiB for both terms. This compares peaks without attributing memory
+to pass 2. The sampler polls every 250 ms and can miss short spikes.
+Fields of The World (FTW) supplies the Brazil MT input.
+
+| Input | Profile | Input features | Peak RSS (GiB) | Pass-2 peak share (%) | Host |
+| --- | --- | ---: | ---: | ---: | --- |
+| NZ parcels (z0–14) | `auto` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
+| NZ parcels (z0–14) | `bounded` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
+| FTW Brazil MT (z0–13) | `auto` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
+| FTW Brazil MT (z0–13) | `bounded` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
+| Overture segments full part (z0–14) | `auto` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
+| Overture segments full part (z0–14) | `bounded` | {{W2}} | {{W2}} | {{W2}} | 64-core aarch64, 123 GB RAM, 24 GB cgroup |
 
 ### Budget and profiles
 
@@ -38,15 +59,21 @@ The shares start at 1.92 GiB and 4.8 GiB; earlier grants reduce them.
 These are budget calculations, not a promise about total process memory.
 
 - `auto` sizes concurrency to the allowance and spills output when needed.
-- `bounded` spills output and also caps readers at 4, queues at 16 batches
-  per reader, and row-group encodes at 4 before drain reuse below.
+- `bounded` spills output and caps readers at 4 and queues at 16 batches
+  per reader. Row-group encodes start with at most 4. The buffered drain can
+  add encodes using released batch memory, limited by headroom below the
+  prior RSS peak and the thread count.
 - `speed` takes the requested concurrency and keeps output in RAM.
 
 All profiles retain minimum working units. A read or compute window needs
 at least one batch. The writer needs up to 4 encodes, pool permitting.
 Export needs at least one partition, which contains whole tiles. These
-floors can exceed a small allowance. Pass-1 preflight checks the table
-alone at 42 B per input row; passing it does not prove the whole run fits.
+floors can exceed a small allowance. Pass-1 preflight prices the table at
+42 B per input row and warns when 3.3× that estimate exceeds probed memory.
+It fails only when the table alone exceeds a hard cgroup limit and no
+per-feature filter can reduce the row count. `TYLERTOO_SKIP_MEMORY_PREFLIGHT=1`
+downgrades that failure to a warning. Passing preflight does not prove the
+whole run fits.
 
 ### Pass 1: scan and assignment
 
@@ -62,10 +89,9 @@ not the old 64-byte `AssignFeature` structs. For `N` retained features:
 | Entry level (`u8`) | 1 | Once any entry ladder value exists |
 | **Table total** | **33–42** | 41 with a sort key alone; 34 with a ladder alone |
 
-Thus 300M features cost `300M × (33…42)` = 9.9–12.6 GB
-(9.22–11.73 GiB) for this table alone. At 1.58B features it is
-52.14–66.36 GB (48.56–61.80 GiB). The old 30–40 GB at 300M estimate
-is not the current feature-table floor.
+Thus 300 million features cost `300M × (33…42)` = 9.9–12.6 GB
+(9.22–11.73 GiB) for this table alone. At 1.58 billion features it is
+52.14–66.36 GB (48.56–61.80 GiB).
 
 Other live allocations in
 [`stream.rs`](../crates/core/src/overview/stream.rs) and `assign.rs` matter:
@@ -102,12 +128,12 @@ Other live allocations in
   Output assignment construction can overlap two 16 B/feature assignment
   vectors. No 40 B/feature priority array remains: comparisons derive keys.
 
-Consider 300M polygons. Area accumulation needs an extra column. Assume
+Consider 300 million polygons. Area accumulation needs an extra column. Assume
 ranking and entry ladders are off, so the point budget has no points to thin.
 The feature table plus areas and two assignment vectors come to `300M × (33 + 4 + 16 + 16)` = 20.7 GB (19.28 GiB).
 This excludes grid peaks, batches, capacity slack, and retained allocator
 pages. It is a subtotal for that path, not a universal B/feature rate.
-For 1.58B rows the same subtotal is 109.02 GB (101.53 GiB), already
+For 1.58 billion rows the same subtotal is 109.02 GB (101.53 GiB), already
 beyond a 32 GB host. Changing `--profile` cannot spill those arrays.
 
 Before pass 2, the pipeline frees the feature table. The row-indexed minimum-level
@@ -117,7 +143,7 @@ map remains at 1 B per input row, including skipped rows. Kinds add another
 Vector capacity and scan chunks can add transient memory above element sizes.
 
 **Line exception.** Coalescing collects geometry in pass 1 by default.
-Its guard allows at most 2M lines and `2M × 512` = 1.024 GB modeled
+Its guard allows at most 2 million lines and `2M × 512` = 1.024 GB modeled
 geometry. The guard prices each line at `56 + 16 × vertices` bytes. The chain
 stage needs further workspace and keeps per-level results; the collection
 guard does not cap that peak. See
@@ -133,7 +159,7 @@ It uses uncompressed footer bytes, or larger raw byte-array sizes.
 Generated integer count columns add 8 B each plus validity bits. A read
 batch costs roughly `batch_rows × p`, capped at the reader's decoded-batch
 limit for admission. Each reader also holds its largest selected row group.
-The compute window prices a batch at `batch_rows × (1 + fanout) × p`,
+The compute window prices a batch at `batch_rows × (1 + fanout) × p`.
 Here `fanout` counts planned output rows per input row across the active levels.
 
 Let `B` count buffered output rows, excluding a streamed canonical level,
@@ -158,7 +184,7 @@ For example, `B = 20M`, `I = 10M`, `p = 1000`, `g = 100` gives
 
 [`pipeline.rs`](../crates/core/src/overview/pipeline.rs) compares that
 estimate with the allowance left after grants. `auto` also spills
-partitioning output above 2M buffered rows. During RAM buffering it measures
+partitioning output above 2 million buffered rows. During RAM buffering it measures
 Arrow bytes plus a 256 B floor per materialized row. The tuner counts shared source rows once; each level adds its own arrays. The tuner projects
 `held bytes + remaining planned rows × observed bytes/row` after each
 input batch and can switch once to spill. Arrow array accounting can
@@ -181,8 +207,7 @@ prices at least one WKB chunk of rows. During the buffered drain,
 `MemoryBudget::drain_encodes` can reuse memory the finished read and
 compute window held. Reuse stops at their grants or the RSS headroom
 below the prior peak. It adds only the slots that fit, up to the thread
-count. The shared sink and this reuse need measurement on this branch:
-`{{MEASURE: pass2.sink.bytes_per_row, spill bytes, encode width, and pass2 anonymous peak; cell: country-32g, auto and bounded, same polygon input and z0–14}}`.
+count. These are admission estimates, not measured peaks.
 
 ### Export: tile counts and active members
 
@@ -191,10 +216,9 @@ count. The shared sink and this reuse need measurement on this branch:
 payload on a 64-bit host, plus node headers, edges, unused slots, and
 allocator overhead. Counts are tile memberships, not distinct input rows.
 A feature crossing tiles contributes to each. Maps for all scanned levels
-can coexist. At 80M occupied tiles, payload alone is
-`80M × 16` = 1.28 GB (1.19 GiB). The old 4–6 GB figure is not a
-struct-size result. The full map rate depends on occupancy and allocator:
-`{{MEASURE: peak map bytes per occupied tile across all levels, plus scan RSS; cell: export-80m-tiles, same z14 coverage, auto and bounded}}`.
+can coexist. At 80 million occupied tiles, payload alone is
+`80M × 16` = 1.28 GB (1.19 GiB). This is arithmetic, not a measured map
+peak. The full map rate depends on occupancy and allocator overhead.
 Neither profile spills these maps.
 
 For active clipped members, the current admission model is
@@ -251,14 +275,14 @@ the fallback clustered-offset hash map.
 No memory profile spills these writer tables. A slower disk cannot solve
 this ceiling. Lower `T` with a smaller zoom range, or split the export;
 merging all shards into one archive still needs the final writer state.
-`{{MEASURE: entries capacity, dedup capacity, checkpoint/finalize anonymous peak, and bytes per emitted tile; cell: writer-100m-tiles, same archive under auto and bounded}}`.
+The 100 million-tile example is arithmetic, not a measured writer peak.
 
 For capacity planning, take the largest phase subtotal and add measured
-batch/workspace peaks and headroom. At 1.58B input rows, even the scan
+batch/workspace peaks and headroom. At 1.58 billion input rows, even the scan
 floor alone needs 49–62 GiB. Plan a larger host for the full-input coarse
 job, then size the shards separately. Do not treat 64 GiB as a planet
-budget or the historical 192 GiB failure as a new measured requirement:
-`{{MEASURE: total and per-phase anonymous peak, vertex/property widths, tile count, spill disk use; cell: planet-1.58b, bounded, full-input coarse plan and representative shard}}`.
+budget or the historical 192 GiB failure as a new measured requirement.
+The planet-scale figures here are arithmetic, not measured peaks.
 For scheduler cache accounting, see
 [the scaling guide](../docs/guides/scaling.md#reading-a-jobs-maxrss).
 
@@ -378,8 +402,7 @@ a write failure only logs — it never fails the conversion (see
                                     // x bytes_per_row; at the end of the
                                     // pass, what was actually buffered
       "budget_bytes": 34359738368,  // allowance left after earlier grants;
-                                    // 0 under bounded/speed, which never
-                                    // arm the RAM-to-spill tuner
+                                    // 0 unless auto starts with RAM sinks
       "downgraded_to_spill": false  // auto flipped the RAM sinks to spill
     },                              // mid-pass because the projection
                                     // passed the budget

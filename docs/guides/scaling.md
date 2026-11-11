@@ -22,22 +22,25 @@ across machines. The coarse job still needs memory for the full input.
 
 ### How much memory
 
-A 32 GB machine with fast local spill disk is a starting point for
-country-scale polygon builds. Count features, vertices, properties, and
-emitted tiles before choosing RAM. A country boundary alone gives no
-memory bound. The Brazil run above is a historical example on a 54 GiB
-host, not a measurement of this branch on 32 GB.
+Treat 32 GB with fast local spill disk as a starting point to evaluate for
+country-scale polygon builds, not a measured RAM requirement. Count features,
+vertices, properties, and emitted tiles before choosing RAM. A country
+boundary alone gives no memory bound. Use the
+[measured peaks](https://github.com/geoparquet-io/tylertoo/blob/main/context/PROFILING.md#measured-peaks)
+table once filled to size comparable inputs. The Brazil run above is a
+historical example on a 54 GiB host, not a measurement on a 32 GB host.
 
 Pass 1 keeps 33–42 bytes per retained feature before assignment workspace:
-300M features need 9.9–12.6 GB for that table alone. At 1.58 billion features,
+300 million features need 9.9–12.6 GB for that table alone. At 1.58 billion features,
 the table alone needs 52–66 GB (49–62 GiB). Assignment, active row groups,
 and optional line coalescing add to it. Planet-scale input needs a larger
 host for the full-input coarse job, then shards sized to their own peaks.
-Spilling pass 2 cannot make that coarse job fit on 32 GB. Export also keeps tile-count maps and archive entries in RAM. At 100M
-tiles with distinct bodies, writer entries and dedup alone price at about
+Spilling pass 2 cannot make that coarse job fit on 32 GB. Export also keeps
+tile-count maps and archive entries in RAM. At 100 million tiles with
+distinct bodies, writer entries and dedup alone price at about
 6.4 GB before finalization.
 See the [memory envelope](https://github.com/geoparquet-io/tylertoo/blob/main/context/PROFILING.md#memory-envelope)
-for phase arithmetic and pending measurements on this branch.
+for phase arithmetic and the allocations that spilling cannot remove.
 
 Start with `--profile auto`; use `--profile bounded` for a smaller footprint.
 Set `--spill-dir` to real disk. Reduce `--read-batch-size`,
@@ -95,11 +98,13 @@ when they fit the allowance and narrows the waves to fit it. One check holds
 under every profile: export refuses a tile that alone needs more than the
 machine's memory, because no profile can make one tile smaller.
 
-`bounded` keeps main's footprint for the same allocator. The release CLI
-uses mimalloc by default, which adds a fixed floor of about 600 MiB that
-shows on small inputs: under `bounded`, Madagascar (z0-12) peaks at 1,254 MiB
-against 685 MiB with the system allocator, and Moldova at 2,792 against
-2,509 MiB, while running faster (Madagascar 1.4 s against 3.0 s). The floor comes from transparent huge pages on
+The buffered drain can add encodes under `bounded` using released batch
+memory, limited by headroom below the prior RSS peak and the thread count.
+The release CLI uses mimalloc by default. It adds a fixed floor of about
+600 MiB on small inputs. Under `bounded`, Madagascar (z0-12) peaks at
+1,254 MiB against 685 MiB with the system allocator. Moldova peaks at 2,792
+against 2,509 MiB. mimalloc runs faster: Madagascar takes 1.4 s against 3.0 s.
+The floor comes from transparent huge pages on
 mimalloc's eagerly committed arenas and its 1 s delay before freed pages go
 back to the OS. `MIMALLOC_ALLOW_THP=0 MIMALLOC_PURGE_DELAY=10` in the
 environment removes it (Madagascar 566 MiB, Moldova 1,665 MiB) but gives back
