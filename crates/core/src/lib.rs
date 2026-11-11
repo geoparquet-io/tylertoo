@@ -160,6 +160,7 @@ pub use overview::{
     filter::FilterError,
     ladder::{EntryZoomKind, EntryZoomSpec},
     level::{Crs, MemoryProfile, Mode, OverviewValidationError, RankingProvenance},
+    mask::MaskSource,
     properties::{PropertySelection, PropertySelectionError},
     reader::ReaderError,
     simplify::{CollapseMode, Representation, SimplifyOptions},

@@ -514,6 +514,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 
 | Option | Description |
 | --- | --- |
+| `--mask <PATH>` | Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (.geojson/.json, RFC 7946 lon/lat) or GeoParquet file; touching and copies one ±360° wrap away count. Skips row groups by the mask's bbox, combines with --bbox and --filter by AND, and refuses a CRS mismatch: reproject the mask to the input's CRS first. |
 | `--filter <EXPR>` [alias: `where`] | Filter property columns with a SQL `WHERE` predicate, such as `confidence > 0.8`. Skips row groups that cannot match. Grammar: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
 
 ### Properties
