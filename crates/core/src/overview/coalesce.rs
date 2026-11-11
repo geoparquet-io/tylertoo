@@ -301,7 +301,8 @@ pub fn coalesce_level_lines(
     // One level only, so the chains take the exact join's runs instead of
     // borrowing them: the owned result then copies input lines only.
     let (chains, prio) = exact.into_chains(snap_tol(gsd_m, crs, params));
-    coalesce_chains(chains, lines, &prio, gsd_m, crs, config, params)
+    let count = chains.len();
+    coalesce_chains(chains, count, lines, &prio, gsd_m, crs, config, params)
         .into_iter()
         .map(|c| CoalescedLine {
             rep: c.rep,
@@ -349,9 +350,10 @@ pub fn coalesce_level_lines_with<'e>(
         return Vec::new();
     }
     // --- 1+2. Build chains (grouped endpoint joins + junction continuation).
-    let chains = exact.chains(snap_tol(gsd_m, crs, params));
+    let (count, chains) = exact.chains(snap_tol(gsd_m, crs, params));
     coalesce_chains(
         chains,
+        count,
         &exact.lines,
         &exact.prio,
         gsd_m,
@@ -361,10 +363,15 @@ pub fn coalesce_level_lines_with<'e>(
     )
 }
 
-/// Steps 3-4 of a level over its chains: merge, gate, thin, budget.
+/// Steps 3-4 of a level over its `count` chains: merge, gate, thin, budget.
 /// `prio` holds each line's cell-winner priority (Q1), parallel to `lines`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the level's chains, their count, and the level's inputs"
+)]
 fn coalesce_chains<'g>(
-    chains: Vec<RawChain<'g>>,
+    chains: impl IntoIterator<Item = RawChain<'g>>,
+    count: usize,
     lines: &[CoalesceInput<'_>],
     prio: &[Priority],
     gsd_m: f64,
@@ -375,32 +382,26 @@ fn coalesce_chains<'g>(
     let budget = params.budget;
     let gsd_units = crs.meters_to_units(gsd_m);
 
-    // --- 3. Merge geometry + inherit the best member's attributes. ----------
-    // `rep_pos` (the winning member's position in `lines`) rides along so the
-    // gate can read its sort key without a second lookup table.
-    let mut merged: Vec<(CoalescedLine, usize)> = Vec::with_capacity(chains.len());
+    // --- 3. Merge geometry + inherit the best member's attributes, and
+    // --- 4a. gate on the CHAIN's bbox diagonal, one chain at a time: no
+    // per-level `Vec` of chains or of merged lines between the steps (#851).
+    let gate = config.line_visibility * gsd_units;
+    let gate_sq = gate * gate;
+    let mut gated: Vec<(CoalescedLine, AssignFeature)> = Vec::with_capacity(count);
     for chain in chains {
+        // The winning member's position in `lines`: its sort key ranks the
+        // chain in thinning.
         let rep_pos = chain
             .members
             .iter()
             .copied()
             .reduce(|best, m| if prio[m].beats(&prio[best]) { m } else { best })
             .expect("chain has at least one member");
-        merged.push((
-            CoalescedLine {
-                rep: lines[rep_pos].index,
-                count: chain.members.len() as i32,
-                geom: chain.geom,
-            },
-            rep_pos,
-        ));
-    }
-
-    // --- 4a. Visibility gate on the CHAIN's bbox diagonal. -------------------
-    let gate = config.line_visibility * gsd_units;
-    let gate_sq = gate * gate;
-    let mut gated: Vec<(CoalescedLine, AssignFeature)> = Vec::with_capacity(merged.len());
-    for (line, rep_pos) in merged {
+        let line = CoalescedLine {
+            rep: lines[rep_pos].index,
+            count: chain.members.len() as i32,
+            geom: chain.geom,
+        };
         let bbox = geom_bbox(&line.geom);
         let (dx, dy) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
         if gate > 0.0 && dx * dx + dy * dy < gate_sq {
@@ -421,43 +422,37 @@ fn coalesce_chains<'g>(
 
     // --- 4b. Cell-winner thinning among the surviving chains. ----------------
     let cell_size = gsd_units * config.line_thinning;
-    let mut survivors: Vec<(CoalescedLine, AssignFeature)> =
-        if cell_size > 0.0 && !cell_size.is_nan() {
-            let chain_prio: Vec<Priority> = gated
-                .iter()
-                .map(|(_, f)| Priority::new(f.row(), config.sort_direction))
-                .collect();
-            // cell -> position of the best chain so far in `gated`.
-            let mut grid: HashMap<(i64, i64), usize> = HashMap::new();
-            for (pos, (_, feat)) in gated.iter().enumerate() {
-                let (cx, cy) = feat.center();
-                let key = (
-                    (cx / cell_size).floor() as i64,
-                    (cy / cell_size).floor() as i64,
-                );
-                grid.entry(key)
-                    .and_modify(|best| {
-                        if chain_prio[pos].beats(&chain_prio[*best]) {
-                            *best = pos;
-                        }
-                    })
-                    .or_insert(pos);
-            }
-            // Keep winners in ascending position order (stable, deterministic;
-            // O(n) — a per-winner `Vec::remove` here is quadratic on real data).
-            let mut keep = vec![false; gated.len()];
-            for pos in grid.into_values() {
-                keep[pos] = true;
-            }
-            gated
-                .into_iter()
-                .zip(&keep)
-                .filter(|(_, &k)| k)
-                .map(|(pair, _)| pair)
-                .collect()
-        } else {
-            gated
-        };
+    let mut survivors = gated;
+    if cell_size > 0.0 && !cell_size.is_nan() {
+        let gated = &survivors;
+        // Ranked as compared rather than held: a `Vec<Priority>` was
+        // 32 B per chain per level (#851).
+        let prio = |pos: usize| Priority::new(gated[pos].1.row(), config.sort_direction);
+        // cell -> position of the best chain so far in `gated`.
+        let mut grid: HashMap<(i64, i64), usize> = HashMap::new();
+        for (pos, (_, feat)) in gated.iter().enumerate() {
+            let (cx, cy) = feat.center();
+            let key = (
+                (cx / cell_size).floor() as i64,
+                (cy / cell_size).floor() as i64,
+            );
+            grid.entry(key)
+                .and_modify(|best| {
+                    if prio(pos).beats(&prio(*best)) {
+                        *best = pos;
+                    }
+                })
+                .or_insert(pos);
+        }
+        // Keep winners in ascending position order (stable, deterministic;
+        // O(n) — a per-winner `Vec::remove` here is quadratic on real data).
+        let mut keep = vec![false; gated.len()];
+        for pos in grid.into_values() {
+            keep[pos] = true;
+        }
+        let mut keep = keep.into_iter();
+        survivors.retain(|_| keep.next().expect("one flag per chain"));
+    }
 
     // --- 4c. Per-level density budget on chains (Q2 analog). -----------------
     if let Some((max_chains, gamma)) = budget {
@@ -488,12 +483,8 @@ fn coalesce_chains<'g>(
             for pos in chosen {
                 keep[pos] = true;
             }
-            survivors = survivors
-                .into_iter()
-                .zip(&keep)
-                .filter(|(_, &k)| k)
-                .map(|(pair, _)| pair)
-                .collect();
+            let mut keep = keep.into_iter();
+            survivors.retain(|_| keep.next().expect("one flag per chain"));
         }
     }
 
@@ -643,7 +634,7 @@ fn build_chains<'a>(
 ) -> Vec<RawChain<'static>> {
     ExactChains::new(lines.to_vec(), junction_angle_deg, SortDirection::Desc)
         .chains(snap_tol)
-        .into_iter()
+        .1
         .map(|c| RawChain {
             members: Cow::Owned(c.members.into_owned()),
             geom: Cow::Owned(c.geom.into_owned()),
@@ -817,19 +808,20 @@ impl<'a> ExactChains<'a> {
     }
 
     /// One level's chains, borrowing the exact join's runs: the snap pass,
-    /// then the singletons.
-    fn chains(&self, snap_tol: f64) -> Vec<RawChain<'_>> {
+    /// then the singletons. With their count, so the caller consumes them as
+    /// they are assembled instead of holding a `Vec` of them (#851).
+    fn chains(&self, snap_tol: f64) -> (usize, impl Iterator<Item = RawChain<'_>> + '_) {
         let (len, snapped) = self.snap(snap_tol);
-        let mut chains: Vec<RawChain<'_>> = Vec::with_capacity(len + self.singles.len());
-        chains.extend(snapped.map(|c| match c {
-            Ok(src) => RawChain {
-                members: Cow::Borrowed(&self.pieces[src].0),
-                geom: Cow::Borrowed(&*self.geoms[src]),
-            },
-            Err(merged) => merged,
-        }));
-        chains.extend(self.singletons());
-        chains
+        let chains = snapped
+            .map(|c| match c {
+                Ok(src) => RawChain {
+                    members: Cow::Borrowed(&self.pieces[src].0),
+                    geom: Cow::Borrowed(&*self.geoms[src]),
+                },
+                Err(merged) => merged,
+            })
+            .chain(self.singletons());
+        (len + self.singles.len(), chains)
     }
 
     /// [`chains`](Self::chains) for the one level of a join, taking its runs
@@ -2474,16 +2466,15 @@ mod lazy_pairing_tests {
 mod chain_stage_cost_tests {
     use super::*;
 
-    #[test]
-    fn level_chain_stage_peak_live_bytes_is_bounded() {
+    /// One level's chain-stage live peak over the fixture's exact pieces at
+    /// `gsd_m`, and the level's chain count; `None` outside nextest.
+    fn level_chain_stage_peak(gsd_m: f64) -> Option<(usize, usize, usize)> {
         if std::env::var_os("NEXTEST_EXECUTION_MODE").as_deref()
             != Some(std::ffi::OsStr::new("process-per-test"))
         {
             eprintln!("skipped: the dhat peak is only valid with one test per process (nextest)");
-            return;
+            return None;
         }
-        const STRANDS: usize = 20_000;
-        const SEGMENTS: usize = 10;
         // Every other joint is a 1 cm gap: the exact join merges segment
         // pairs, the level's snap pass merges the pairs into strands.
         let geoms: Vec<Geometry<f64>> = (0..STRANDS)
@@ -2524,7 +2515,7 @@ mod chain_stage_cost_tests {
             let base = dhat::HeapStats::get().curr_bytes;
             let chains = coalesce_level_lines_with(
                 &exact,
-                1.0,
+                gsd_m,
                 Crs::Epsg3857,
                 &AssignConfig::default(),
                 &params,
@@ -2538,9 +2529,17 @@ mod chain_stage_cost_tests {
         let pieces = exact.pieces.len();
         assert_eq!(pieces, STRANDS * 6);
         eprintln!(
-            "level chain stage peak: {peak} B, {} B per exact piece; {chains} chains",
+            "level chain stage peak at gsd {gsd_m}: {peak} B, {} B per exact piece; {chains} chains",
             peak / pieces
         );
+        Some((peak, pieces, chains))
+    }
+
+    #[test]
+    fn level_chain_stage_peak_live_bytes_is_bounded() {
+        let Some((peak, pieces, chains)) = level_chain_stage_peak(1.0) else {
+            return;
+        };
         assert_eq!(chains, STRANDS, "the snap pass joins each strand");
         assert!(
             peak <= pieces * PEAK_BYTES_PER_PIECE,
@@ -2548,6 +2547,29 @@ mod chain_stage_cost_tests {
             PEAK_BYTES_PER_PIECE
         );
     }
+
+    /// A level whose snap tolerance closes no gap keeps every exact piece as
+    /// its own chain, so the level's chain list is as long as the join's.
+    #[test]
+    fn unsnapped_level_chain_stage_peak_live_bytes_is_bounded() {
+        let Some((peak, pieces, chains)) = level_chain_stage_peak(1e-6) else {
+            return;
+        };
+        assert_eq!(chains, pieces, "no gap closes at this tolerance");
+        assert!(
+            peak <= pieces * UNSNAPPED_PEAK_BYTES_PER_PIECE,
+            "level chain stage peak {peak} B over {} B per exact piece",
+            UNSNAPPED_PEAK_BYTES_PER_PIECE
+        );
+    }
+
+    const STRANDS: usize = 20_000;
+    const SEGMENTS: usize = 10;
+
+    /// Bytes per exact piece one level's chain stage may hold at once when
+    /// every piece stays its own chain. Measured 217 B with the chains
+    /// consumed as assembled and thinning ranking in place (249 B before).
+    const UNSNAPPED_PEAK_BYTES_PER_PIECE: usize = 230;
 
     /// Bytes per exact-join piece one level's chain stage may hold at once.
     /// Measured 109 B with flat walks and 24 B incidents (163 B before them,
