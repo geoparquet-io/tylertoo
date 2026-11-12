@@ -1226,6 +1226,17 @@ enum LevelSink {
 }
 
 impl LevelSink {
+    fn largest_spill_batch(sinks: &[Self]) -> u64 {
+        sinks
+            .iter()
+            .map(|sink| match sink {
+                Self::Spill(state) => state.max_batch_bytes.unwrap_or(0),
+                Self::Ram(_) => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     #[cfg(test)]
     fn new(
         backing: SinkBacking,
@@ -1356,6 +1367,8 @@ struct SpillState {
     /// `None` once the stream has been closed — by [`SpillState::into_reader`],
     /// or by a `push` that joined the writer to report its error.
     tx: Option<Sender<RecordBatch>>,
+    /// Largest decoded batch: admission prices the indexed drain from this.
+    max_batch_bytes: Option<u64>,
     /// `None` once joined. The writer returns the temp file it finished plus
     /// the core-seconds it spent encoding and writing (folded into
     /// `Pass2Timers::spill_write` at join time, since the thread cannot borrow
@@ -1368,8 +1381,15 @@ struct SpillState {
 /// What a finished spill-writer thread hands back.
 struct SpillWriterDone {
     temp: NamedTempFile,
+    offsets: Option<Vec<u64>>,
     /// Core-seconds spent in Arrow IPC encode + write on the writer thread.
     write_time: Duration,
+}
+
+struct SpillReader {
+    reader: StreamReader<BufReader<File>>,
+    temp: NamedTempFile,
+    offsets: Option<Vec<u64>>,
 }
 
 impl SpillState {
@@ -1410,6 +1430,7 @@ impl SpillState {
         temp: NamedTempFile,
     ) -> Result<Self, ConvertError> {
         let (tx, rx) = crossbeam_channel::bounded::<RecordBatch>(SPILL_QUEUE_DEPTH);
+        let max_batch_bytes = writer.batch_offsets().map(|_| 0);
         let handle = std::thread::Builder::new()
             .name("tylertoo-spill".to_string())
             .spawn(move || -> Result<SpillWriterDone, ConvertError> {
@@ -1421,12 +1442,18 @@ impl SpillState {
                 }
                 let t = Instant::now();
                 writer.finish()?; // writes EOS + flushes the BufWriter
+                let offsets = writer.batch_offsets().map(<[u64]>::to_vec);
                 drop(writer); // close the write handle
                 write_time += t.elapsed();
-                Ok(SpillWriterDone { temp, write_time })
+                Ok(SpillWriterDone {
+                    temp,
+                    offsets,
+                    write_time,
+                })
             })?;
         Ok(SpillState {
             tx: Some(tx),
+            max_batch_bytes,
             handle: Some(handle),
             #[cfg(test)]
             materialized_rows: 0,
@@ -1444,6 +1471,9 @@ impl SpillState {
     /// never the symptom).
     fn push(&mut self, batch: RecordBatch) -> Result<u64, ConvertError> {
         let bytes = batch.get_array_memory_size() as u64;
+        if let Some(max_batch) = &mut self.max_batch_bytes {
+            *max_batch = (*max_batch).max(bytes);
+        }
         #[cfg(test)]
         let rows = batch.column_by_name("geometry").map_or(0, |geometry| {
             (geometry.len() - geometry.null_count()) as u64
@@ -1482,10 +1512,15 @@ impl SpillState {
     /// folding the writer's core-seconds into `timers`. The returned
     /// [`NamedTempFile`] must be held until the reader is exhausted so the file
     /// is not unlinked mid-read (and is cleaned up on drop afterwards).
+    #[cfg(test)]
     fn into_reader(
-        mut self,
+        self,
         timers: &Pass2Timers,
     ) -> Result<(StreamReader<BufReader<File>>, NamedTempFile), ConvertError> {
+        self.into_indexed_reader(timers).map(|r| (r.reader, r.temp))
+    }
+
+    fn into_indexed_reader(mut self, timers: &Pass2Timers) -> Result<SpillReader, ConvertError> {
         // Dropping the sender is what ends the writer's `rx.iter()`; without it
         // the join below would never return.
         self.tx = None;
@@ -1497,7 +1532,11 @@ impl SpillState {
         Pass2Timers::add_dur(timers.spill_write_cell(), done.write_time);
         let read_handle = done.temp.reopen()?;
         let reader = StreamReader::try_new(BufReader::new(read_handle), None)?;
-        Ok((reader, done.temp))
+        Ok(SpillReader {
+            reader,
+            temp: done.temp,
+            offsets: done.offsets,
+        })
     }
 }
 
@@ -1759,18 +1798,19 @@ pub(super) fn run_pass2_buffered(
         .and_then(|m| Some(m.hwm_kib?.saturating_sub(m.rss_kib?) * 1024))
         .unwrap_or(0);
     let held = peak_batch.into_inner().saturating_mul(in_flight as u64);
-    let width = MemoryBudget::drain_encodes(
+    let (width, decode_width, decode_bytes) = MemoryBudget::drain_widths(
         Grant {
             units: tuner.encode_cap(encode.units),
             ..encode
         },
         slot_bytes,
         held.min(read_granted),
+        LevelSink::largest_spill_batch(&sinks),
         below_peak,
         rayon::current_num_threads(),
     );
     log::debug!(
-        "[profile] pass 2 drain: {width} encode(s) on {held} B ({below_peak} B below peak RSS)"
+        "[profile] pass 2 drain: {width} encode(s), {decode_width} decoder(s) on {held} B ({decode_bytes} B charged to existing grants; {below_peak} B below peak RSS)"
     );
     #[cfg(test)]
     spill_tests::DRAIN_WIDTH.with(|c| c.set(width));
@@ -1778,7 +1818,7 @@ pub(super) fn run_pass2_buffered(
     for li in 0..num_levels {
         let sink = std::mem::replace(&mut sinks[li], LevelSink::Ram(Vec::new()));
         let t_drain_level = Instant::now();
-        let outcome = drain_sink(writer, li, hints[li], sink, width, &timers)?;
+        let outcome = drain_sink(writer, li, hints[li], sink, width, decode_width, &timers)?;
         log::debug!(
             "[profile] level {li}: rows={} spill={:.2} MiB drain={:.2}s",
             rows[li],
@@ -1842,6 +1882,7 @@ fn drain_sink(
     hint: usize,
     sink: LevelSink,
     width: usize,
+    decode_width: usize,
     timers: &Pass2Timers,
 ) -> Result<LevelWriteOutcome, ConvertError> {
     let t_drain = Instant::now();
@@ -1882,21 +1923,59 @@ fn drain_sink(
             // deliberately: excluding it would mean splitting the join out of
             // the drain timer and losing the (real) wall time the drain spends
             // waiting, which is the thing the drain counter exists to show.
-            let (reader, _temp) = state.into_reader(timers)?;
-            // #817 B1: the spill decodes on its own thread, so the writer's
-            // thread only feeds row groups (on Oregon roads the decode was
-            // most of what it did).
+            let SpillReader {
+                reader,
+                temp,
+                offsets,
+            } = state.into_indexed_reader(timers)?;
+            let indexed = decode_width > 1 && offsets.as_ref().is_some_and(|o| o.len() > 2);
+            // A single output queue plus the admitted decoding jobs, charged
+            // to existing grants before widening encodes.
+            let depth = if indexed { 1 } else { SPILL_QUEUE_DEPTH };
             scoped_pipe(
-                SPILL_QUEUE_DEPTH,
-                move |tx: &Sender<Result<RecordBatch, ConvertError>>| -> Result<(), ConvertError> {
-                    for batch in reader {
-                        #[cfg(test)]
-                        spill_tests::note_decode();
-                        // A read error goes to the writer in order and ends
-                        // the level unwritten.
-                        let failed = batch.is_err();
-                        if tx.send(batch.map_err(ConvertError::from)).is_err() || failed {
-                            break; // on a writer failure, its error is reported
+                depth,
+                move |tx: &Sender<Result<RecordBatch, ConvertError>>| {
+                    if let Some(offsets) = offsets.filter(|_| indexed) {
+                        drop(reader);
+                        // Independent of a caller's occupied global/custom pool.
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(decode_width)
+                            .stack_size(2 << 20)
+                            .build()
+                            .map_err(std::io::Error::other)?;
+                        for (wi, ends) in offsets[1..].chunks(decode_width).enumerate() {
+                            let first = wi * decode_width;
+                            let decoded: Vec<_> = pool.install(|| {
+                                ends.par_iter()
+                                    .enumerate()
+                                    .map(|(i, &end)| {
+                                        StreamReader::read_batch(
+                                            BufReader::new(temp.reopen()?),
+                                            BufReader::new(temp.reopen()?),
+                                            offsets[0],
+                                            offsets[first + i],
+                                            end,
+                                        )
+                                        .map_err(ConvertError::from)
+                                    })
+                                    .collect()
+                            });
+                            for batch in decoded {
+                                let failed = batch.is_err();
+                                if tx.send(batch).is_err() || failed {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    } else {
+                        // Dictionary-bearing streams keep their ordered context.
+                        for batch in reader {
+                            #[cfg(test)]
+                            spill_tests::note_decode();
+                            let failed = batch.is_err();
+                            if tx.send(batch.map_err(ConvertError::from)).is_err() || failed {
+                                break;
+                            }
                         }
                     }
                     Ok(())
@@ -2973,7 +3052,7 @@ mod drain_tests {
         let options =
             OverviewWriterOptions::new(Mode::Duplicating, vec![LevelSpec::new(gsd(2), Some(2))]);
         let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
-        let drained = drain_sink(&mut writer, 0, 12, sink, 1, &Pass2Timers::default());
+        let drained = drain_sink(&mut writer, 0, 12, sink, 1, 1, &Pass2Timers::default());
         assert!(drained.is_err());
         assert!(writer.finish().is_err(), "the short level was finished");
     }

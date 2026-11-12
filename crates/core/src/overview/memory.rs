@@ -548,6 +548,60 @@ impl MemoryBudget {
             .saturating_add(extra)
             .min(threads.max(encode.units))
     }
+    /// Share existing grants between indexed decoders and encodes. Prefer
+    /// the encode grant's slots above its floor, then the completed read's
+    /// still-held grants. Every borrowed byte leaves the encoder allowance.
+    pub(super) fn drain_widths(
+        encode: Grant,
+        slot_bytes: u64,
+        reused: u64,
+        max_batch: u64,
+        below_peak: u64,
+        threads: usize,
+    ) -> (usize, usize, u64) {
+        let encode_floor = (encode.units as u64).saturating_mul(slot_bytes.max(encode.unit_bytes));
+        if max_batch > 0 {
+            for decodes in [4, 2].into_iter().filter(|&n| n <= threads) {
+                // One queued batch plus each decoding batch, codec buffers,
+                // and explicitly sized 2 MiB stacks for the capped pool.
+                let bytes = max_batch
+                    .saturating_add(128 << 10)
+                    .saturating_mul(decodes as u64 + 1)
+                    .saturating_add((decodes as u64).saturating_mul(2 << 20));
+                let slots =
+                    usize::try_from(bytes.div_ceil(encode.unit_bytes.max(1))).unwrap_or(usize::MAX);
+                if slots <= encode.units.saturating_sub(ENCODE_FLOOR) {
+                    let encodes = Self::drain_encodes(
+                        Grant {
+                            units: encode.units - slots,
+                            ..encode
+                        },
+                        slot_bytes,
+                        reused,
+                        below_peak.saturating_sub(bytes),
+                        threads,
+                    );
+                    return (encodes, decodes, bytes);
+                }
+                if bytes <= reused.min(below_peak.saturating_sub(encode_floor)) {
+                    let encodes = Self::drain_encodes(
+                        encode,
+                        slot_bytes,
+                        reused - bytes,
+                        below_peak - bytes,
+                        threads,
+                    );
+                    return (encodes, decodes, bytes);
+                }
+            }
+        }
+        (
+            Self::drain_encodes(encode, slot_bytes, reused, below_peak, threads),
+            1,
+            0,
+        )
+    }
+
     pub(super) fn require(&self, phase: MemoryPhase, needed: u64) -> Result<(), ConvertError> {
         if let Some(available) = self.available() {
             if needed > available {
@@ -637,6 +691,66 @@ mod tests {
         assert!(MemoryBudget::with_available(None)
             .require_allowance(MemoryProfile::Auto, MemoryPhase::Scan, u64::MAX)
             .is_ok());
+    }
+
+    #[test]
+    fn drain_decoders_can_borrow_encode_slots_without_growing_the_grant() {
+        let mib = 1 << 20;
+        let encode = Grant {
+            phase: MemoryPhase::Encode,
+            units: 16,
+            unit_bytes: mib,
+        };
+        // An auto encode grant can already cover decode: no extra read bytes
+        // or RSS headroom are available. Keep at least the encode floor.
+        let (encodes, decodes, bytes) = MemoryBudget::drain_widths(encode, mib, 0, mib, 0, 64);
+        assert!(decodes > 1, "existing encode grant can fund two decoders");
+        assert!(encodes >= ENCODE_FLOOR);
+        assert!(encodes as u64 * mib + bytes <= encode.bytes());
+    }
+
+    #[test]
+    fn drain_decode_and_encode_cannot_spend_the_read_grant_twice() {
+        let mib = 1 << 20;
+        let encode = Grant {
+            phase: MemoryPhase::Encode,
+            units: 4,
+            unit_bytes: mib,
+        };
+        let reused = 10 * mib;
+        let peak = encode.bytes() + reused;
+        let (encodes, workers, decoded) =
+            MemoryBudget::drain_widths(encode, mib, reused, mib, peak, 64);
+        assert_eq!(workers, 2);
+        assert!(encodes as u64 * mib + decoded <= peak);
+        assert_eq!(
+            {
+                let (_, n, b) = MemoryBudget::drain_widths(encode, mib, decoded - 1, mib, peak, 64);
+                (n, b)
+            },
+            (1, 0)
+        );
+        assert_eq!(
+            {
+                let (_, n, b) = MemoryBudget::drain_widths(
+                    encode,
+                    mib,
+                    reused,
+                    mib,
+                    encode.bytes() + decoded - 1,
+                    64,
+                );
+                (n, b)
+            },
+            (1, 0)
+        );
+        assert_eq!(
+            {
+                let (_, n, b) = MemoryBudget::drain_widths(encode, mib, reused, mib, peak, 1);
+                (n, b)
+            },
+            (1, 0)
+        );
     }
 
     #[test]
