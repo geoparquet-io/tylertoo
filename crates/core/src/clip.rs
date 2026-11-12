@@ -153,9 +153,8 @@ fn has_self_intersecting_edges(coords: &[Coord<f64>]) -> bool {
 /// `hit` that implies the edges meet this equals testing every pair, but the
 /// exact predicates run only on the few pairs that can meet. Shared by the
 /// export clip's crossing test and the overview's polygon validity check
-/// (`overview::simplify`). Allocation-free up to 32 edges; above that, edges
-/// are sorted by min x and scanned until the next starts past the current
-/// one's max x.
+/// (`overview::simplify`). Allocation-free up to 32 edges; above that, the
+/// crate's one box-pair sweep ([`crate::box_pairs::any_box_pair`]).
 pub(crate) fn any_edge_pair(
     ring: &[Coord<f64>],
     mut hit: impl FnMut(Line<f64>, Line<f64>) -> bool,
@@ -164,14 +163,14 @@ pub(crate) fn any_edge_pair(
     let line = |i: usize| Line::new(ring[i], ring[i + 1]);
     let bbox = |i: usize| {
         let (a, b) = (ring[i], ring[i + 1]);
-        (a.x.min(b.x), a.x.max(b.x), a.y.min(b.y), a.y.max(b.y))
+        (a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y))
     };
     if n <= 32 {
         for i in 0..n {
             let a = bbox(i);
             for j in i + 1..n {
                 let b = bbox(j);
-                if a.1 < b.0 || b.1 < a.0 || a.3 < b.2 || b.3 < a.2 {
+                if a.2 < b.0 || b.2 < a.0 || a.3 < b.1 || b.3 < a.1 {
                     continue;
                 }
                 if hit(line(i), line(j)) {
@@ -181,22 +180,8 @@ pub(crate) fn any_edge_pair(
         }
         return false;
     }
-    let mut boxes: Vec<_> = (0..n).map(|i| (bbox(i), i)).collect();
-    boxes.sort_unstable_by(|a, b| a.0 .0.total_cmp(&b.0 .0));
-    for (k, &(a, i)) in boxes.iter().enumerate() {
-        for &(b, j) in &boxes[k + 1..] {
-            if b.0 > a.1 {
-                break;
-            }
-            if a.3 < b.2 || b.3 < a.2 {
-                continue;
-            }
-            if hit(line(i), line(j)) {
-                return true;
-            }
-        }
-    }
-    false
+    let boxes: Vec<_> = (0..n).map(bbox).collect();
+    crate::box_pairs::any_box_pair(&boxes, |i, j| hit(line(i), line(j)))
 }
 
 /// Check if two line segments intersect properly (crossing, not touching at endpoints).
@@ -1246,6 +1231,30 @@ mod tests {
         ring.push(ring[0]); // close
         assert!(ring.len() > 2_048);
         assert!(!has_self_intersecting_edges(&ring));
+    }
+
+    /// The crossing test pairs only edges whose boxes meet, through the
+    /// crate's one sweep: a simple 1,000-edge ring costs a few candidate
+    /// pairs per edge, not the ~500,000 of every pair (#832).
+    #[test]
+    fn self_intersection_pairs_only_edges_whose_boxes_meet() {
+        let mut ring: Vec<Coord<f64>> = (0..1000)
+            .map(|k| {
+                let t = f64::from(k) / 1000.0 * std::f64::consts::TAU;
+                Coord {
+                    x: t.cos(),
+                    y: t.sin(),
+                }
+            })
+            .collect();
+        ring.push(ring[0]);
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
+        assert!(!has_self_intersecting_edges(&ring));
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
+        assert!(
+            (1..=20_000).contains(&compared),
+            "{compared} box pairs compared"
+        );
     }
 
     /// The #241 implementation (geo's sweep, then the proper-crossing

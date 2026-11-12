@@ -37,10 +37,8 @@
 //! crossing lobes regardless of direction or starting vertex, rather than
 //! choosing one arbitrarily as a raw positive-fill union would.
 
-use super::{
-    any_box_pair, edge_box, ring_area2, ring_box, segments_cross_or_overlap, segments_meet,
-    strip_box_pairs, TileRing,
-};
+use super::{edge_box, ring_area2, ring_box, segments_cross_or_overlap, segments_meet, TileRing};
+use crate::box_pairs::{any_box_pair, strip_box_pairs};
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay::{ContourDirection, IntOverlayOptions, Overlay, ShapeType};
 use i_overlay::core::overlay_rule::OverlayRule;
@@ -918,9 +916,9 @@ mod tests {
     fn check_work_follows_meeting_pairs_not_shared_columns() {
         let parts = square_grid(20, 1000);
         let edges: u64 = 4 * 20 * 1000;
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         assert_eq!(check_polygons(&parts), Ok(()));
-        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
         assert!(
             compared < 16 * edges,
             "{compared} box comparisons for {edges} edges"
@@ -941,9 +939,9 @@ mod tests {
             })
             .collect();
         let edges: u64 = 4 * 20 * 1000;
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         assert_eq!(check_polygons(&parts), Ok(()));
-        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
         assert!(
             compared < 16 * edges,
             "{compared} box comparisons for {edges} edges"
@@ -969,12 +967,12 @@ mod tests {
             .iter()
             .flat_map(|p| p[0].windows(2).map(|w| edge_box(w[0], w[1])))
             .collect();
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         any_box_pair(&boxes, |_, _| false);
-        let swept = super::super::SWEEP_CANDIDATES.with(|c| c.get());
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        let swept = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         check_polygons(&parts).ok();
-        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
         assert!(
             compared <= 2 * swept,
             "{compared} comparisons, the x sweep makes {swept}"
@@ -1000,12 +998,12 @@ mod tests {
             .iter()
             .flat_map(|p| p[0].windows(2).map(|w| edge_box(w[0], w[1])))
             .collect();
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         any_box_pair(&boxes, |_, _| false);
-        let swept = super::super::SWEEP_CANDIDATES.with(|c| c.get());
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        let swept = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         check_polygons(&parts).ok();
-        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
         assert!(
             compared <= 2 * swept,
             "{compared} comparisons, the x sweep makes {swept}"

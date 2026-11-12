@@ -1244,17 +1244,29 @@ fn holes_valid(p: &Polygon<f64>) -> bool {
             (b.0.min(c.x), b.1.max(c.x), b.2.min(c.y), b.3.max(c.y))
         })
     };
-    // Whether some edge of `a` meets some edge of `b` (whose box is `b_box`).
+    // Whether some edge of `a` meets some edge of `b` (whose box is `b_box`):
+    // the edges of `a` that reach `b_box`, then all of `b`'s, paired across
+    // the two rings by the crate's one box-pair sweep.
     let touch = |a: &LineString<f64>, b: &LineString<f64>, b_box: Box| {
-        a.lines().any(|l| {
-            let lb = line_box(&l);
-            meet(lb, b_box)
-                && b.lines().any(|m| {
-                    meet(lb, line_box(&m)) && {
-                        count_validity_work(false);
-                        l.intersects(&m)
-                    }
-                })
+        let mut lines: Vec<Line<f64>> = a.lines().filter(|l| meet(line_box(l), b_box)).collect();
+        let from_a = lines.len();
+        if from_a == 0 {
+            return false;
+        }
+        lines.extend(b.lines());
+        let boxes: Vec<_> = lines
+            .iter()
+            .map(|l| {
+                let (x0, x1, y0, y1) = line_box(l);
+                (x0, y0, x1, y1)
+            })
+            .collect();
+        crate::box_pairs::any_box_pair(&boxes, |i, j| {
+            (i < from_a) != (j < from_a) && {
+                let (l, m) = if i < from_a { (i, j) } else { (j, i) };
+                count_validity_work(false);
+                lines[l].intersects(&lines[m])
+            }
         })
     };
     // Some vertex off the line through the first two: the ring has area.

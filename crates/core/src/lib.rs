@@ -108,6 +108,7 @@ mod vector_tile {
 mod archive_index;
 mod atomic_output;
 mod batch_processor;
+mod box_pairs;
 mod clip;
 mod compression;
 mod covering;
