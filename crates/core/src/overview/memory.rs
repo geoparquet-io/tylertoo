@@ -564,11 +564,14 @@ impl MemoryBudget {
             for decodes in [4, 2].into_iter().filter(|&n| n <= threads) {
                 // A full decoding window can overlap one queued batch and
                 // one in the writer from the previous window. Include codec
-                // buffers and explicitly sized 2 MiB stacks for the pool.
+                // buffers and the existing decode helper's explicit stacks.
                 let bytes = max_batch
-                    .saturating_add(128 << 10)
+                    .saturating_add(tylertoo_io::IPC_CODEC_SCRATCH_BYTES)
                     .saturating_mul(decodes as u64 + 2)
-                    .saturating_add((decodes as u64).saturating_mul(2 << 20));
+                    .saturating_add(
+                        (decodes as u64)
+                            .saturating_mul(crate::decode::DECODE_THREAD_STACK_BYTES as u64),
+                    );
                 let slots =
                     usize::try_from(bytes.div_ceil(encode.unit_bytes.max(1))).unwrap_or(usize::MAX);
                 if slots <= encode.units.saturating_sub(ENCODE_FLOOR) {

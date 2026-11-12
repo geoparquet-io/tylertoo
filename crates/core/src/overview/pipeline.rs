@@ -63,20 +63,20 @@ use crossbeam_channel::{Receiver, Sender};
 use rayon::prelude::*;
 use std::path::Path;
 use tempfile::NamedTempFile;
-use tylertoo_io::IpcCompression;
 use tylertoo_io::IpcStreamReader as StreamReader;
 use tylertoo_io::IpcStreamWriter as StreamWriter;
+use tylertoo_io::{IpcCompression, IpcIndexedReader};
 
 use super::memory::{Grant, MemoryBudget, SINK_ROW_ALLOC_OVERHEAD_BYTES};
 
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
-use super::pipe::{for_each_window, scoped_pipe, split_in_flight};
+use super::pipe::{for_each_window, process_window, run_on_pool, scoped_pipe, split_in_flight};
 use super::read::{internal, ReadFlow};
 use super::stream::{
     process_batch_cascade, process_level_batch, LevelStreamCtx, Pass2Timers, StreamRead,
 };
-use super::writer::{LevelWriteOutcome, OverviewWriter};
+use super::writer::{recv_in_pool, LevelWriteOutcome, OverviewWriter};
 
 pub(super) struct BufferOptions<'a> {
     pub(super) profile: MemoryProfile,
@@ -834,6 +834,26 @@ struct SinkAutoTuner {
 }
 
 impl SinkAutoTuner {
+    fn log_projection(&self) {
+        if let Some(per_row) = self.bytes_per_row() {
+            // #626: the number the up-front estimate could only guess at. Info
+            // level so a sizing regression is visible in an ordinary run log, not
+            // just in `TYLERTOO_PROFILE_JSON`.
+            log::info!(
+                "[convert] pass2 sink: measured {per_row} B per buffered row over {} buffered \
+                 row(s) → {:.1} GiB for {} planned buffered row(s){}",
+                self.rows,
+                gib(self.projected_bytes()),
+                self.planned_rows,
+                if self.downgraded {
+                    " (downgraded to spill mid-pass)"
+                } else {
+                    ""
+                },
+            );
+        }
+    }
+
     /// A downgrade can only apply to a [`MemoryProfile::Auto`] run that
     /// started in [`SinkBacking::Ram`], so only that case probes a budget.
     ///
@@ -1387,7 +1407,7 @@ struct SpillWriterDone {
 }
 
 struct SpillReader {
-    reader: StreamReader<BufReader<File>>,
+    file: File,
     temp: NamedTempFile,
     offsets: Option<Vec<u64>>,
 }
@@ -1517,7 +1537,8 @@ impl SpillState {
         self,
         timers: &Pass2Timers,
     ) -> Result<(StreamReader<BufReader<File>>, NamedTempFile), ConvertError> {
-        self.into_indexed_reader(timers).map(|r| (r.reader, r.temp))
+        self.into_indexed_reader(timers)
+            .and_then(|r| Ok((StreamReader::try_new(BufReader::new(r.file), None)?, r.temp)))
     }
 
     fn into_indexed_reader(mut self, timers: &Pass2Timers) -> Result<SpillReader, ConvertError> {
@@ -1531,9 +1552,8 @@ impl SpillState {
         spill_tests::record_spill(&done.temp, self.materialized_rows);
         Pass2Timers::add_dur(timers.spill_write_cell(), done.write_time);
         let read_handle = done.temp.reopen()?;
-        let reader = StreamReader::try_new(BufReader::new(read_handle), None)?;
         Ok(SpillReader {
-            reader,
+            file: read_handle,
             temp: done.temp,
             offsets: done.offsets,
         })
@@ -1794,11 +1814,9 @@ pub(super) fn run_pass2_buffered(
     // ...and only what the process gave back below its peak RSS: freed input
     // the allocator kept is not free for the drain (bounded Moldova still
     // peaked 114 MiB higher on the input bytes alone). None off Linux.
-    let below_peak = super::procmem::read_proc_status()
-        .and_then(|m| Some(m.hwm_kib?.saturating_sub(m.rss_kib?) * 1024))
-        .unwrap_or(0);
+    let below_peak = drain_headroom();
     let held = peak_batch.into_inner().saturating_mul(in_flight as u64);
-    let (width, decode_width, decode_bytes) = MemoryBudget::drain_widths(
+    let (width, mut decode_width, decode_bytes) = MemoryBudget::drain_widths(
         Grant {
             units: tuner.encode_cap(encode.units),
             ..encode
@@ -1809,6 +1827,12 @@ pub(super) fn run_pass2_buffered(
         below_peak,
         rayon::current_num_threads(),
     );
+    // One capped decode pool for all levels: caller-pool windows lost the
+    // measured gain (BRMT auto 2.94 s vs 2.17 s) and retained 427 MiB more RSS.
+    let decode_pool = crate::decode::decode_pool(decode_width).unwrap_or_else(|_| {
+        decode_width = 1;
+        None
+    });
     log::debug!(
         "[profile] pass 2 drain: {width} encode(s), {decode_width} decoder(s) on {held} B ({decode_bytes} B charged to existing grants; {below_peak} B below peak RSS)"
     );
@@ -1818,7 +1842,15 @@ pub(super) fn run_pass2_buffered(
     for li in 0..num_levels {
         let sink = std::mem::replace(&mut sinks[li], LevelSink::Ram(Vec::new()));
         let t_drain_level = Instant::now();
-        let outcome = drain_sink(writer, li, hints[li], sink, width, decode_width, &timers)?;
+        let outcome = drain_sink(
+            writer,
+            li,
+            hints[li],
+            sink,
+            width,
+            (decode_width, decode_pool.as_ref()),
+            &timers,
+        )?;
         log::debug!(
             "[profile] level {li}: rows={} spill={:.2} MiB drain={:.2}s",
             rows[li],
@@ -1831,23 +1863,7 @@ pub(super) fn run_pass2_buffered(
     // releases the read grants they were priced against.
     writer.set_encode_concurrency(tuner.encode_cap(writer_units))?;
 
-    if let Some(per_row) = tuner.bytes_per_row() {
-        // #626: the number the up-front estimate could only guess at. Info
-        // level so a sizing regression is visible in an ordinary run log, not
-        // just in `TYLERTOO_PROFILE_JSON`.
-        log::info!(
-            "[convert] pass2 sink: measured {per_row} B per buffered row over {} buffered \
-             row(s) → {:.1} GiB for {} planned buffered row(s){}",
-            tuner.rows,
-            gib(tuner.projected_bytes()),
-            tuner.planned_rows,
-            if tuner.downgraded {
-                " (downgraded to spill mid-pass)"
-            } else {
-                ""
-            },
-        );
-    }
+    tuner.log_projection();
     timers.log_engine_summary(t_engine.elapsed().as_secs_f64(), rows.iter().sum());
     let levels = outcomes
         .into_iter()
@@ -1870,6 +1886,17 @@ pub(super) fn run_pass2_buffered(
     })
 }
 
+fn drain_headroom() -> u64 {
+    let below_peak = super::procmem::read_proc_status()
+        .and_then(|m| Some(m.hwm_kib?.saturating_sub(m.rss_kib?) * 1024))
+        .unwrap_or(0);
+    #[cfg(test)]
+    let below_peak = spill_tests::DRAIN_HEADROOM
+        .with(|c| c.get())
+        .unwrap_or(below_peak);
+    below_peak
+}
+
 /// Drain one level's sink into `writer.write_level`, timing the call into
 /// `timers.drain` (previously invisible: this runs serially, one level at a
 /// time, after the parallel read loop finishes). The RAM path is infallible;
@@ -1882,9 +1909,10 @@ fn drain_sink(
     hint: usize,
     sink: LevelSink,
     width: usize,
-    decode_width: usize,
+    decode: (usize, Option<&rayon::ThreadPool>),
     timers: &Pass2Timers,
 ) -> Result<LevelWriteOutcome, ConvertError> {
+    let (decode_width, decode_pool) = decode;
     let t_drain = Instant::now();
     let outcome = match sink {
         LevelSink::Ram(batches) => {
@@ -1924,66 +1952,72 @@ fn drain_sink(
             // the drain timer and losing the (real) wall time the drain spends
             // waiting, which is the thing the drain counter exists to show.
             let SpillReader {
-                reader,
-                temp,
+                file,
+                temp: _temp,
                 offsets,
             } = state.into_indexed_reader(timers)?;
-            let indexed = decode_width > 1 && offsets.as_ref().is_some_and(|o| o.len() > 2);
+            let indexed = cfg!(any(unix, windows))
+                && decode_width > 1
+                && offsets.as_ref().is_some_and(|o| o.len() > 2);
             // A single output queue, the writer's batch and the admitted
             // decoding jobs, charged to existing grants before widening encodes.
             let depth = if indexed { 1 } else { SPILL_QUEUE_DEPTH };
-            scoped_pipe(
-                depth,
-                move |tx: &Sender<Result<RecordBatch, ConvertError>>| {
-                    if let Some(offsets) = offsets.filter(|_| indexed) {
-                        drop(reader);
-                        // Independent of a caller's occupied global/custom pool.
-                        let pool = rayon::ThreadPoolBuilder::new()
-                            .num_threads(decode_width)
-                            .stack_size(2 << 20)
-                            .build()
-                            .map_err(std::io::Error::other)?;
-                        for (wi, ends) in offsets[1..].chunks(decode_width).enumerate() {
-                            let first = wi * decode_width;
-                            let decoded: Vec<_> = pool.install(|| {
-                                ends.par_iter()
+            // Capture the caller's pool. The helper only waits and sends;
+            // both receive and join on a worker help run the queued decodes.
+            rayon::in_place_scope(|scope| {
+                scoped_pipe(
+                    depth,
+                    move |tx: &Sender<Result<RecordBatch, ConvertError>>| {
+                        if let Some(offsets) = offsets.filter(|_| indexed) {
+                            let reader = Arc::new(IpcIndexedReader::try_new(file, offsets[0])?);
+                            for (wi, ends) in offsets[1..].chunks(decode_width).enumerate() {
+                                let first = wi * decode_width;
+                                let ranges: Vec<_> = ends
+                                    .iter()
                                     .enumerate()
-                                    .map(|(i, &end)| {
-                                        StreamReader::read_batch(
-                                            BufReader::new(temp.reopen()?),
-                                            BufReader::new(temp.reopen()?),
-                                            offsets[0],
-                                            offsets[first + i],
-                                            end,
-                                        )
-                                        .map_err(ConvertError::from)
+                                    .map(|(i, &end)| (offsets[first + i], end))
+                                    .collect();
+                                let reader = Arc::clone(&reader);
+                                #[cfg(test)]
+                                let path = _temp.path().to_owned();
+                                let decode = move || {
+                                    process_window(&ranges, &|(start, end)| {
+                                        #[cfg(test)]
+                                        spill_tests::note_decode(&path, true);
+                                        reader.read_batch(*start, *end).map_err(ConvertError::from)
                                     })
-                                    .collect()
-                            });
-                            for batch in decoded {
+                                };
+                                let decoded = match decode_pool {
+                                    Some(pool) => pool.install(decode),
+                                    None => run_on_pool(scope, decode),
+                                };
+                                for batch in decoded {
+                                    let failed = batch.is_err();
+                                    if tx.send(batch).is_err() || failed {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        } else {
+                            // Dictionary-bearing streams keep their ordered context.
+                            let reader = StreamReader::try_new(BufReader::new(file), None)?;
+                            for batch in reader {
+                                #[cfg(test)]
+                                spill_tests::note_decode(_temp.path(), false);
                                 let failed = batch.is_err();
-                                if tx.send(batch).is_err() || failed {
-                                    return Ok(());
+                                if tx.send(batch.map_err(ConvertError::from)).is_err() || failed {
+                                    break;
                                 }
                             }
                         }
-                    } else {
-                        // Dictionary-bearing streams keep their ordered context.
-                        for batch in reader {
-                            #[cfg(test)]
-                            spill_tests::note_decode();
-                            let failed = batch.is_err();
-                            if tx.send(batch.map_err(ConvertError::from)).is_err() || failed {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(())
-                },
-                |rx: Receiver<Result<RecordBatch, ConvertError>>| {
-                    writer.write_level_from(level_idx, Some(hint), rx.into_iter())
-                },
-            )?
+                        Ok(())
+                    },
+                    |rx: Receiver<Result<RecordBatch, ConvertError>>| {
+                        let batches = std::iter::from_fn(|| recv_in_pool(&rx).ok());
+                        writer.write_level_from(level_idx, Some(hint), batches)
+                    },
+                )
+            })?
         }
     };
     Pass2Timers::add_dur(timers.drain_cell(), t_drain.elapsed());
@@ -2008,6 +2042,7 @@ mod spill_tests {
         std::sync::Mutex::new(std::collections::BTreeMap::new());
 
     thread_local! {
+        pub(super) static DRAIN_HEADROOM: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
         /// The last drain width set on this thread (#817 B1).
         pub(super) static DRAIN_WIDTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// The last tuner arming on this thread (#791 item 3): the budget
@@ -2021,25 +2056,51 @@ mod spill_tests {
         static DECODED_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    pub(super) fn note_decode() {
-        DECODED_HERE.with(|c| c.set(c.get() + 1));
+    #[derive(Default, Debug)]
+    struct DecodeObservations {
+        threads: std::collections::HashSet<std::thread::ThreadId>,
+        indexed: usize,
+        outside_pool: usize,
     }
 
-    /// #817 B1: a spilled level decodes on its own thread, not on the one
-    /// that feeds the writer (the drain's critical path: Oregon roads spent
-    /// 1.2 of its 1.5 core-seconds there decoding).
+    static DECODES: std::sync::Mutex<
+        std::collections::BTreeMap<std::path::PathBuf, DecodeObservations>,
+    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    pub(super) fn note_decode(path: &Path, indexed: bool) {
+        DECODED_HERE.with(|c| c.set(c.get() + 1));
+        if let Some(observed) = DECODES.lock().unwrap().get_mut(path.parent().unwrap()) {
+            observed.threads.insert(std::thread::current().id());
+            observed.indexed += usize::from(indexed);
+            observed.outside_pool += usize::from(!std::thread::current().name().is_some_and(|n| {
+                n.starts_with("spill-test-") || n.starts_with("tylertoo-decode-")
+            }));
+        }
+    }
+
+    /// Exercise real convert admission and the production drain call site.
+    /// Only RSS headroom is injected: process-global HWM is test-order dependent.
     #[test]
-    fn spill_decodes_off_the_draining_thread() {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let geoms: Vec<_> = (0..2000)
+    fn convert_spill_uses_multiple_decoders_and_serial_fallback() {
+        use arrow_array::StringArray;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        let output = dir.path().join("output.parquet");
+        let geoms: Vec<_> = (0..8192)
             .map(|i| {
-                let x = f64::from(i % 50) * 0.01;
-                let y = f64::from(i / 50) * 0.01;
-                Some(geo::Geometry::Point(geo::Point::new(x, y)))
+                Some(geo::Geometry::Point(geo::Point::new(
+                    f64::from(i % 128) * 0.01,
+                    f64::from(i / 128) * 0.01,
+                )))
             })
             .collect();
-        crate::overview::testutil::write_input(tin.path(), &geoms, true, None);
-        let tout = tempfile::NamedTempFile::new().unwrap();
+        let payload = Arc::new(StringArray::from(vec!["x".repeat(1024); geoms.len()]));
+        crate::overview::testutil::write_input_columns(
+            &input,
+            &geoms,
+            true,
+            vec![(Field::new("payload", DataType::Utf8, false), payload)],
+        );
         let options = crate::overview::convert::ConvertOptions {
             mode: Mode::Duplicating,
             levels: crate::overview::convert::LevelPlan::ZoomRange {
@@ -2047,11 +2108,182 @@ mod spill_tests {
                 max_zoom: 8,
             },
             profile: MemoryProfile::Bounded,
+            read_batch_size: 512,
+            in_flight_batches: 16,
+            spill_dir: Some(dir.path().to_owned()),
             ..Default::default()
         };
-        DECODED_HERE.with(|c| c.set(0));
-        crate::overview::convert::convert_to_overviews(tin.path(), tout.path(), &options).unwrap();
-        assert_eq!(DECODED_HERE.with(std::cell::Cell::get), 0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .thread_name(|i| format!("spill-test-{i}"))
+            .build()
+            .unwrap();
+        let mut parallel = None;
+        for fail_pool in [false, true] {
+            DECODES
+                .lock()
+                .unwrap()
+                .insert(dir.path().to_owned(), DecodeObservations::default());
+            pool.install(|| {
+                DRAIN_HEADROOM.with(|c| c.set(Some(1 << 30)));
+                crate::decode::FAIL_DECODE_POOL.with(|c| c.set(fail_pool));
+                let result =
+                    crate::overview::convert::convert_to_overviews(&input, &output, &options);
+                crate::decode::FAIL_DECODE_POOL.with(|c| c.set(false));
+                DRAIN_HEADROOM.with(|c| c.set(None));
+                result.unwrap();
+            });
+            let observed = DECODES.lock().unwrap().remove(dir.path()).unwrap();
+            eprintln!("real convert decoders (pool failure={fail_pool}): {observed:?}");
+            let bytes = std::fs::read(&output).unwrap();
+            if fail_pool {
+                assert_eq!(observed.indexed, 0, "failed pool must fall back to serial");
+                assert!(!observed.threads.is_empty(), "fallback must really decode");
+                assert_eq!(Some(bytes), parallel, "fallback changed output");
+            } else {
+                assert!(
+                    observed.indexed > 4,
+                    "multiple indexed windows must run: {observed:?}"
+                );
+                assert!(
+                    observed.threads.len() > 1,
+                    "more than one decoder must run: {observed:?}"
+                );
+                assert!(
+                    observed.threads.len() <= 4,
+                    "new decoder threads per level: {observed:?}"
+                );
+                assert_eq!(
+                    observed.outside_pool, 0,
+                    "decode escaped admitted pool: {observed:?}"
+                );
+                parallel = Some(bytes);
+            }
+        }
+    }
+
+    /// A one-worker caller must execute indexed jobs while waiting for
+    /// batches and while joining the producer after an error (#871).
+    #[test]
+    fn indexed_drain_reenters_one_worker_pool_on_success_and_error() {
+        use crate::overview::writer::{LevelSpec, OverviewWriterOptions};
+        use std::io::{Seek, SeekFrom, Write};
+        for threads in [1, 2] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("spill-test-{i}"))
+                .build()
+                .unwrap();
+            let (tx, done) = std::sync::mpsc::channel();
+            pool.spawn(move || {
+                let result = std::panic::catch_unwind(|| {
+                    for codec in [IpcCompression::None, IpcCompression::Lz4] {
+                        for corrupt in [false, true] {
+                            let dir = tempfile::tempdir().unwrap();
+                            let batches = super::drain_tests::indexed_batches();
+                            let schema = batches[0].schema();
+                            let mut state =
+                                SpillState::with_codec(&schema, Some(dir.path()), codec).unwrap();
+                            for batch in &batches {
+                                state.push(batch.clone()).unwrap();
+                            }
+                            if corrupt {
+                                state.tx = None;
+                                let mut spill = state.join().unwrap().unwrap();
+                                let offset = spill.offsets.as_ref().unwrap()[4];
+                                spill
+                                    .temp
+                                    .as_file_mut()
+                                    .seek(SeekFrom::Start(offset))
+                                    .unwrap();
+                                spill.temp.as_file_mut().write_all(&[0; 8]).unwrap();
+                                state.handle = Some(std::thread::spawn(move || Ok(spill)));
+                            }
+                            let output = dir.path().join("overview.parquet");
+                            let mut options = OverviewWriterOptions::new(
+                                Mode::Duplicating,
+                                vec![LevelSpec::new(super::super::level::gsd(2), Some(2))],
+                            );
+                            options.encode_concurrency = 1;
+                            options.max_row_group_size = 3;
+                            let mut writer =
+                                OverviewWriter::create(&output, &schema, options).unwrap();
+                            DECODES
+                                .lock()
+                                .unwrap()
+                                .insert(dir.path().to_owned(), DecodeObservations::default());
+                            // Force the indexed entry even with a one-worker caller.
+                            let result = drain_sink(
+                                &mut writer,
+                                0,
+                                14,
+                                LevelSink::Spill(state),
+                                1,
+                                (4, None),
+                                &Pass2Timers::default(),
+                            );
+                            assert_eq!(result.is_err(), corrupt, "{codec:?}");
+                            assert_eq!(writer.finish().is_err(), corrupt, "{codec:?}");
+                            let observed = DECODES.lock().unwrap().remove(dir.path()).unwrap();
+                            assert!(observed.indexed > 0, "indexed path was skipped");
+                            assert_eq!(observed.outside_pool, 0, "{observed:?}");
+                        }
+                    }
+                });
+                tx.send(result).unwrap();
+            });
+            done.recv_timeout(Duration::from_secs(10))
+                .expect("indexed drain deadlocked in caller's pool")
+                .unwrap();
+        }
+    }
+
+    /// Both serial and indexed decode stay off a plain draining thread.
+    /// Library callers already on a worker may help that same pool (#871).
+    #[test]
+    fn spill_decodes_off_the_draining_thread() {
+        use crate::overview::writer::{LevelSpec, OverviewWriterOptions};
+        for codec in [IpcCompression::None, IpcCompression::Lz4] {
+            for decode_width in [1, 4] {
+                let dir = tempfile::tempdir().unwrap();
+                let batches = super::drain_tests::indexed_batches();
+                let schema = batches[0].schema();
+                let mut state = SpillState::with_codec(&schema, Some(dir.path()), codec).unwrap();
+                for batch in &batches {
+                    state.push(batch.clone()).unwrap();
+                }
+                let options = OverviewWriterOptions::new(
+                    Mode::Duplicating,
+                    vec![LevelSpec::new(super::super::level::gsd(2), Some(2))],
+                );
+                let output = dir.path().join("overview.parquet");
+                let mut writer = OverviewWriter::create(&output, &schema, options).unwrap();
+                DECODES
+                    .lock()
+                    .unwrap()
+                    .insert(dir.path().to_owned(), DecodeObservations::default());
+                DECODED_HERE.with(|c| c.set(0));
+                let _ = drain_sink(
+                    &mut writer,
+                    0,
+                    14,
+                    LevelSink::Spill(state),
+                    1,
+                    (decode_width, None),
+                    &Pass2Timers::default(),
+                )
+                .unwrap();
+                writer.finish().unwrap();
+                let observed = DECODES.lock().unwrap().remove(dir.path()).unwrap();
+                assert!(!observed.threads.is_empty(), "decode counter must be live");
+                assert_eq!(observed.indexed > 0, decode_width > 1, "{codec:?}");
+                assert_eq!(
+                    DECODED_HERE.with(std::cell::Cell::get),
+                    0,
+                    "{codec:?}, {decode_width}"
+                );
+            }
+        }
     }
 
     /// #817 B1: the drain widens only on what the read held, not its grants,
@@ -3005,7 +3237,7 @@ mod drain_tests {
     use geoarrow::datatypes::GeometryType;
     use geoarrow_array::GeoArrowArray;
 
-    fn indexed_batches() -> Vec<RecordBatch> {
+    pub(super) fn indexed_batches() -> Vec<RecordBatch> {
         (0..7)
             .map(|i| {
                 let ids = [i * 2, i * 2 + 1];
@@ -3061,7 +3293,7 @@ mod drain_tests {
                     14,
                     sink,
                     2,
-                    decode_width,
+                    (decode_width, None),
                     &Pass2Timers::default(),
                 )
                 .unwrap();
@@ -3127,15 +3359,11 @@ mod drain_tests {
                     .set_len(offsets[5] + (offsets[6] - offsets[5]) / 2)
                     .unwrap();
                 let error_at = |index: usize| {
-                    StreamReader::read_batch(
-                        BufReader::new(done.temp.reopen().unwrap()),
-                        BufReader::new(done.temp.reopen().unwrap()),
-                        offsets[0],
-                        offsets[index],
-                        offsets[index + 1],
-                    )
-                    .unwrap_err()
-                    .to_string()
+                    IpcIndexedReader::try_new(done.temp.reopen().unwrap(), offsets[0])
+                        .unwrap()
+                        .read_batch(offsets[index], offsets[index + 1])
+                        .unwrap_err()
+                        .to_string()
                 };
                 let first = error_at(4);
                 let later = error_at(5);
@@ -3153,7 +3381,7 @@ mod drain_tests {
                     14,
                     LevelSink::Spill(state),
                     1,
-                    decode_width,
+                    (decode_width, None),
                     &Pass2Timers::default(),
                 )
                 .unwrap_err();
@@ -3213,7 +3441,15 @@ mod drain_tests {
         let options =
             OverviewWriterOptions::new(Mode::Duplicating, vec![LevelSpec::new(gsd(2), Some(2))]);
         let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
-        let drained = drain_sink(&mut writer, 0, 12, sink, 1, 1, &Pass2Timers::default());
+        let drained = drain_sink(
+            &mut writer,
+            0,
+            12,
+            sink,
+            1,
+            (1, None),
+            &Pass2Timers::default(),
+        );
         assert!(drained.is_err());
         assert!(writer.finish().is_err(), "the short level was finished");
     }
