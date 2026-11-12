@@ -1,7 +1,8 @@
 //! The one search for pairs of boxes that meet, shared by every validity
 //! and crossing check that needs edge or part pairs: the integer tile
 //! checks (`mvt`, `mvt::tile_polygon`) and the f64 ring checks (`clip`,
-//! `overview::simplify` through `clip::any_edge_pair`).
+//! `overview::simplify` through `clip::any_edge_pair`), and the coverage
+//! fill's grouping of touching shapes.
 
 use std::cmp::Ordering;
 
