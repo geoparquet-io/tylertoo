@@ -1680,6 +1680,8 @@ pub struct StreamingPmtilesWriter {
     /// The first background sync error, latched: every later assembly
     /// reports it again rather than publishing tiles it may have lost.
     writeback_failed: Option<(std::io::ErrorKind, String)>,
+    /// The writeback thread could not start; the run goes on without it.
+    writeback_unavailable: bool,
 }
 
 /// Spool bytes appended between two background syncs of a tail-layout
@@ -1947,7 +1949,7 @@ impl StreamingPmtilesWriter {
                 output_path: output_path.to_path_buf(),
             },
         );
-        writer.start_writeback()?;
+        writer.start_writeback();
         Ok(writer)
     }
 
@@ -1993,11 +1995,33 @@ impl StreamingPmtilesWriter {
             force_tail_root_overflow: false,
             writeback: None,
             writeback_failed: None,
+            writeback_unavailable: false,
         }
     }
 
-    /// Start the [`Writeback`] thread on a second handle to the spool.
-    fn start_writeback(&mut self) -> std::io::Result<()> {
+    /// Start the [`Writeback`] thread on a second handle to the spool, on
+    /// Linux only: elsewhere `sync_data` is a drive-cache flush (macOS
+    /// `F_FULLFSYNC`, Windows `FlushFileBuffers`), too costly every 8 MiB
+    /// and never measured. Writeback only saves time, so a thread that
+    /// cannot start is logged once and the run goes on without it.
+    fn start_writeback(&mut self) {
+        if self.writeback_unavailable || !cfg!(target_os = "linux") {
+            return;
+        }
+        if let Err(e) = self.try_start_writeback() {
+            self.writeback_unavailable = true;
+            log::warn!(
+                "[pmtiles] background writeback unavailable ({e}); the final sync \
+                 will write the whole archive"
+            );
+        }
+    }
+
+    fn try_start_writeback(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if tests::FAIL_WRITEBACK_START.with(std::cell::Cell::get) {
+            return Err(std::io::Error::other("injected writeback start failure"));
+        }
         let Some(spool) = &self.temp_file else {
             return Ok(());
         };
@@ -2633,8 +2657,7 @@ impl StreamingPmtilesWriter {
         self.variable_depth = variable_depth;
         // Assembly stopped the writeback thread; tiles keep coming.
         if written? == ArchiveWriteMode::Tail {
-            self.start_writeback()
-                .map_err(|e| WriteError::io("restart background writeback", e))?;
+            self.start_writeback();
         }
         Ok(())
     }
@@ -3372,6 +3395,7 @@ mod tests {
     /// the whole archive's dirty pages (0.47 s of a 4 s `lines` run). Pinned
     /// by the count of background syncs: one per [`WRITEBACK_CHUNK_BYTES`]
     /// flushed, coalesced while one is running, so at least one here.
+    #[cfg(target_os = "linux")]
     #[test]
     fn tail_layout_writes_back_while_tiles_append() {
         let dir = tempfile::tempdir().unwrap();
@@ -3388,6 +3412,56 @@ mod tests {
         assert!(w.stop_writeback().unwrap() >= 1, "no background sync ran");
         w.finalize(&out).unwrap();
         assert!(fs::metadata(&out).unwrap().len() > 3 * WRITEBACK_CHUNK_BYTES);
+    }
+
+    thread_local! {
+        /// Makes this thread's next writeback starts fail, as a failed
+        /// thread spawn or descriptor dup would.
+        pub(super) static FAIL_WRITEBACK_START: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// Export checkpoints every minute and each one stops the writeback
+    /// thread, so a checkpoint must restart it, or writeback would end
+    /// after the first minute of a long run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writeback_restarts_after_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("restart.pmtiles");
+        let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::None).unwrap();
+        w.add_tile(0, 0, 0, &tail_payload(0)).unwrap();
+        w.checkpoint(&out).unwrap();
+        let tile = 64 * 1024;
+        for i in 0..(3 * WRITEBACK_CHUNK_BYTES / tile) as u32 {
+            let mut body = vec![0u8; tile as usize];
+            body[..4].copy_from_slice(&i.to_le_bytes());
+            w.add_tile(14, i, 0, &body).unwrap();
+        }
+        assert!(
+            w.stop_writeback().unwrap() >= 1,
+            "no sync after the checkpoint"
+        );
+        w.finalize(&out).unwrap();
+    }
+
+    /// Writeback only saves time, so a writer whose thread cannot start
+    /// (spawn or descriptor dup failing) carries on without it, at creation
+    /// and at a checkpoint's restart alike.
+    #[test]
+    fn writeback_that_cannot_start_does_not_fail_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("nothread.pmtiles");
+        FAIL_WRITEBACK_START.with(|f| f.set(true));
+        let made = StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip);
+        let mut w = made.expect("a writer without writeback");
+        assert!(w.writeback.is_none());
+        w.add_tile(0, 0, 0, &tail_payload(0)).unwrap();
+        w.checkpoint(&out).expect("a checkpoint without writeback");
+        w.add_tile(1, 0, 0, &tail_payload(1)).unwrap();
+        FAIL_WRITEBACK_START.with(|f| f.set(false));
+        w.finalize(&out).unwrap();
+        assert_eq!(&fs::read(&out).unwrap()[..7], b"PMTiles");
     }
 
     /// A background sync that failed must fail the next checkpoint, not
