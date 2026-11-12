@@ -707,8 +707,10 @@ reproduce non-cascaded output byte-for-byte.
 
 A simplification candidate with more than 2,048
 total vertices skips the exact validity check and counts as valid. The check
-is O(V²) in ring size, and on continental-scale rings at fine GSDs it stalled
-conversion for tens of minutes per feature. A candidate that large means RDP
+once compared every edge pair, and on continental-scale rings at fine GSDs it
+stalled conversion for tens of minutes per feature. It now tests only edge
+pairs whose bounding boxes meet, and the cap stays only to keep output the
+same. A candidate that large means RDP
 removed few vertices from already-valid input, the case least likely to
 self-intersect. The overviews spec does not require valid geometry (§2).
 Candidates at or below the cap get the full check and repair. tylertoo logs a
@@ -2049,7 +2051,9 @@ processed at once, and how many row groups the writer encodes at once.
   which the allowance can only shrink: at most 4 readers, each at most
   16 batches deep. Row-group encodes start with at most 4. The buffered drain
   can add encodes using released batch memory, limited by headroom below
-  the prior RSS peak and the thread count. Remote staging holds at most
+  the prior RSS peak and the thread count. The drain can also decode up to 4 spilled batches at once, funded by
+  `MemoryBudget::drain_widths` from existing grants: the encode grant above
+  its floor, then the finished read's. Remote staging holds at most
   256 MiB of requests in flight, or
   `TYLERTOO_STAGING_MEM_BUDGET_BYTES` when set. The compute window takes
   what `--in-flight-batches` asks for, within the allowance. Pass-1 tables
