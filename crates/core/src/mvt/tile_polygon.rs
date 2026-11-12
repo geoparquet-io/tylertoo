@@ -64,21 +64,61 @@ pub(crate) fn finalize_polygons(
     parts: Vec<Vec<TileRing>>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Vec<Vec<TileRing>> {
+    match finalize(parts) {
+        Finalized::Valid(parts) => parts,
+        Finalized::Repaired(repair) => {
+            repair.record(diagnostics);
+            repair.parts
+        }
+    }
+}
+
+/// What [`finalize_polygons`] decided for a feature, so a caller that meets
+/// the same parts again (the merge valve's next pass, #758) can replay the
+/// verdict instead of checking and repairing them again.
+pub(crate) enum Finalized {
+    /// Already valid: the parts go out as they came.
+    Valid(Vec<Vec<TileRing>>),
+    Repaired(Repair),
+}
+
+/// A feature [`finalize`] repaired: its new parts, and what it reports.
+pub(crate) struct Repair {
+    pub(crate) parts: Vec<Vec<TileRing>>,
+    defect: Defect,
+    /// The repaired parts still fail the check.
+    still_invalid: bool,
+}
+
+impl Repair {
+    /// The diagnostics [`finalize_polygons`] records for this feature.
+    pub(crate) fn record(&self, diagnostics: &crate::diagnostics::Diagnostics) {
+        diagnostics.record(Diagnostic::PolygonRepaired {
+            count: 1,
+            kind: self.defect,
+        });
+        if self.still_invalid {
+            diagnostics.record(Diagnostic::InvalidAfterEncode { count: 1 });
+        }
+    }
+}
+
+/// [`finalize_polygons`] without recording anything: the verdict, and the
+/// repair when there was one.
+pub(crate) fn finalize(parts: Vec<Vec<TileRing>>) -> Finalized {
     if parts.is_empty() {
-        return parts;
+        return Finalized::Valid(parts);
     }
     let Err(defect) = check_polygons(&parts) else {
-        return parts;
+        return Finalized::Valid(parts);
     };
-    diagnostics.record(Diagnostic::PolygonRepaired {
-        count: 1,
-        kind: defect,
-    });
     let (repaired, passed) = repair_and_check(&parts);
-    if !passed && check_polygons(&repaired).is_err() {
-        diagnostics.record(Diagnostic::InvalidAfterEncode { count: 1 });
-    }
-    repaired
+    let still_invalid = !passed && check_polygons(&repaired).is_err();
+    Finalized::Repaired(Repair {
+        parts: repaired,
+        defect,
+        still_invalid,
+    })
 }
 
 /// Rebuild `parts` as a valid MultiPolygon on the same integer grid: a
@@ -244,7 +284,7 @@ fn bind_holes(shells: &mut [Vec<TileRing>], holes: Vec<TileRing>) {
 #[cfg(test)]
 thread_local! {
     /// [`check_polygons`] calls on this thread.
-    static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Hole/shell pairs [`bind_holes`] considered on this thread.
     static BIND_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
