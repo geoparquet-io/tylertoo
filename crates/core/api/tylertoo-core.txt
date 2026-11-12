@@ -2409,7 +2409,6 @@ pub fn tylertoo_core::ConvertOptions::with_read_workers(self, usize) -> Self
 pub fn tylertoo_core::ConvertOptions::with_representation(self, alloc::vec::Vec<tylertoo_core::RepresentationBand>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_row_group_size_policy(self, tylertoo_core::RowGroupSizePolicy) -> Self
 pub fn tylertoo_core::ConvertOptions::with_save_plan(self, core::option::Option<std::path::PathBuf>) -> Self
-pub fn tylertoo_core::ConvertOptions::with_scratch_overview(self, bool) -> Self
 pub fn tylertoo_core::ConvertOptions::with_shard(self, core::option::Option<tylertoo_core::TileRange>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_shard_plan_digest(self, core::option::Option<alloc::string::String>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_simplify(self, tylertoo_core::SimplifyOptions) -> Self
