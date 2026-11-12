@@ -1160,8 +1160,8 @@ fn capped_is_valid(
 
 #[cfg(test)]
 thread_local! {
-    /// Exact segment predicates and `relate` calls made by
-    /// [`polygon_is_valid`] on this thread, for the work-count tests.
+    /// Edge pairs handed to the exact segment test, and `relate` calls, made
+    /// by [`polygon_is_valid`] on this thread, for the work-count tests.
     static VALIDITY_WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
@@ -1177,15 +1177,16 @@ fn count_validity_work(relate: bool) {
     let _ = relate;
 }
 
-/// `p.is_valid()` (geo 0.33 `Validation for Polygon`), verdict for verdict,
-/// without its cost: geo runs its exact segment predicate on every
-/// ordered pair of edges in a ring (O(V²), 22% of convert cycles on FTW Mato
-/// Grosso) and a `relate` for each hole against the exterior and against
-/// every other hole. Here only edge pairs whose bounding boxes overlap reach
-/// the same predicate, and `relate` runs only for a hole whose boundary
-/// touches the other ring's (see [`holes_valid`]). Proven against geo by the
-/// differential tests below.
-fn polygon_is_valid(p: &Polygon<f64>) -> bool {
+/// `p.is_valid()` (geo 0.33 `Validation for Polygon`), verdict for verdict.
+///
+/// geo runs its exact segment predicate on every ordered pair of edges in a
+/// ring (O(V²), 22% of convert cycles on FTW Mato Grosso) and a `relate` for
+/// each hole against the exterior and against every other hole. Here only
+/// edge pairs whose bounding boxes overlap reach the same predicate, and
+/// `relate` runs only for a hole whose boundary touches the other ring's (see
+/// [`holes_valid`]). Proven against geo by the differential tests below and
+/// `hostile_geometry_eval::overview_polygon_is_valid_matches_geo_on_corpus`.
+pub fn polygon_is_valid(p: &Polygon<f64>) -> bool {
     use geo::Intersects;
     if p.exterior().0.is_empty() {
         return true;
@@ -1228,27 +1229,18 @@ fn holes_valid(p: &Polygon<f64>) -> bool {
     use geo::coordinate_position::{coord_pos_relative_to_ring, CoordPos};
     use geo::dimensions::Dimensions;
     use geo::kernels::{Kernel, Orientation, RobustKernel};
-    use geo::{Intersects, Line, PreparedGeometry, Relate};
-    type Box = (f64, f64, f64, f64);
+    use geo::{Intersects, PreparedGeometry, Relate};
     if p.interiors().iter().all(|r| r.0.is_empty()) {
         return true;
     }
-    let meet = |a: Box, b: Box| !(a.1 < b.0 || b.1 < a.0 || a.3 < b.2 || b.3 < a.2);
-    let line_box = |l: &Line<f64>| {
-        let (s, e) = (l.start, l.end);
-        (s.x.min(e.x), s.x.max(e.x), s.y.min(e.y), s.y.max(e.y))
-    };
-    let ring_box = |r: &LineString<f64>| {
-        let inf = f64::INFINITY;
-        r.0.iter().fold((inf, -inf, inf, -inf), |b, c| {
-            (b.0.min(c.x), b.1.max(c.x), b.2.min(c.y), b.3.max(c.y))
-        })
-    };
     // Whether some edge of `a` meets some edge of `b` (whose box is `b_box`):
     // the edges of `a` that reach `b_box`, then all of `b`'s, paired across
     // the two rings by the crate's one box-pair sweep.
-    let touch = |a: &LineString<f64>, b: &LineString<f64>, b_box: Box| {
-        let mut lines: Vec<Line<f64>> = a.lines().filter(|l| meet(line_box(l), b_box)).collect();
+    let touch = |a: &LineString<f64>, b: &LineString<f64>, b_box: Rect<f64>| {
+        let mut lines: Vec<geo::Line<f64>> = a
+            .lines()
+            .filter(|l| l.bounding_rect().intersects(&b_box))
+            .collect();
         let from_a = lines.len();
         if from_a == 0 {
             return false;
@@ -1257,8 +1249,8 @@ fn holes_valid(p: &Polygon<f64>) -> bool {
         let boxes: Vec<_> = lines
             .iter()
             .map(|l| {
-                let (x0, x1, y0, y1) = line_box(l);
-                (x0, y0, x1, y1)
+                let r = l.bounding_rect();
+                (r.min().x, r.min().y, r.max().x, r.max().y)
             })
             .collect();
         crate::box_pairs::any_box_pair(&boxes, |i, j| {
@@ -1275,16 +1267,17 @@ fn holes_valid(p: &Polygon<f64>) -> bool {
         c.iter()
             .any(|&q| RobustKernel::orient2d(c[0], c[1], q) != Orientation::Collinear)
     };
-    let boxes: Vec<Box> = p.interiors().iter().map(ring_box).collect();
+    let boxes: Vec<Option<Rect<f64>>> = p.interiors().iter().map(|r| r.bounding_rect()).collect();
     let exterior = Polygon::new(p.exterior().clone(), vec![]);
     let exterior_area = has_area(p.exterior());
     let mut prepared_exterior = None;
     for (i, hole) in p.interiors().iter().enumerate() {
-        if hole.0.is_empty() {
+        // `None` exactly for an empty ring, which geo skips.
+        let Some(hole_box) = boxes[i] else {
             continue;
-        }
+        };
         let hole_area = has_area(hole);
-        if exterior_area && hole_area && !touch(p.exterior(), hole, boxes[i]) {
+        if exterior_area && hole_area && !touch(p.exterior(), hole, hole_box) {
             if coord_pos_relative_to_ring(hole.0[0], p.exterior()) != CoordPos::Inside {
                 return false;
             }
@@ -1302,12 +1295,14 @@ fn holes_valid(p: &Polygon<f64>) -> bool {
         }
         let hole_polygon = Polygon::new(hole.clone(), vec![]);
         let mut prepared_hole = None;
-        for (j, other) in p.interiors().iter().enumerate().skip(i + 1) {
-            if other.0.is_empty()
-                || !meet(boxes[i], boxes[j])
+        for (other, other_box) in p.interiors().iter().zip(&boxes).skip(i + 1) {
+            let Some(other_box) = *other_box else {
+                continue;
+            };
+            if !hole_box.intersects(&other_box)
                 || (hole_area
                     && has_area(other)
-                    && !touch(hole, other, boxes[j])
+                    && !touch(hole, other, other_box)
                     && coord_pos_relative_to_ring(hole.0[0], other) == CoordPos::Outside
                     && coord_pos_relative_to_ring(other.0[0], hole) == CoordPos::Outside)
             {
@@ -3879,68 +3874,7 @@ mod validity_tests {
             .collect()
     }
 
-    /// Every polygon in the hostile-geometry corpus
-    /// (`tests/fixtures/geometry-test-data`), as stored and with each ring
-    /// reversed.
-    fn fixture_polygons() -> Vec<Polygon<f64>> {
-        fn polygon(rings: &serde_json::Value) -> Option<Polygon<f64>> {
-            let mut rings = rings.as_array()?.iter().map(|ring| {
-                let coords = ring.as_array()?.iter().map(|c| {
-                    Some(Coord {
-                        x: c.get(0)?.as_f64()?,
-                        y: c.get(1)?.as_f64()?,
-                    })
-                });
-                coords.collect::<Option<Vec<_>>>().map(LineString::new)
-            });
-            let exterior = rings.next()??;
-            Some(Polygon::new(exterior, rings.collect::<Option<_>>()?))
-        }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/geometry-test-data/examples");
-        let mut out = Vec::new();
-        for dir in std::fs::read_dir(&root).expect("run `git submodule update --init`") {
-            for file in std::fs::read_dir(dir.unwrap().path()).unwrap() {
-                let text = std::fs::read_to_string(file.unwrap().path()).unwrap();
-                let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-                    continue;
-                };
-                let features = json["features"].as_array().cloned().unwrap_or_default();
-                for g in features.iter().map(|f| &f["geometry"]) {
-                    let coords = &g["coordinates"];
-                    match g["type"].as_str() {
-                        Some("Polygon") => out.extend(polygon(coords)),
-                        Some("MultiPolygon") => {
-                            out.extend(coords.as_array().into_iter().flatten().filter_map(polygon))
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        let reversed: Vec<_> = out
-            .iter()
-            .map(|p| {
-                let rev =
-                    |r: &LineString<f64>| LineString::new(r.0.iter().rev().copied().collect());
-                Polygon::new(rev(p.exterior()), p.interiors().iter().map(rev).collect())
-            })
-            .collect();
-        out.extend(reversed);
-        out
-    }
-
-    #[test]
-    fn polygon_is_valid_matches_geo_on_hostile_fixtures() {
-        let polygons = fixture_polygons();
-        assert!(polygons.len() > 20, "fixtures missing: {}", polygons.len());
-        for p in &polygons {
-            let want = p.is_valid();
-            assert_eq!(polygon_is_valid(p), want, "{p:?}");
-        }
-    }
-
-    /// Validates `p`, returning the verdict and the (exact predicate,
+    /// Validates `p`, returning the verdict and the (edge pairs tested,
     /// `relate`) calls it took.
     fn validate_counted(p: &Polygon<f64>) -> (bool, (u64, u64)) {
         VALIDITY_WORK.with(|w| w.set((0, 0)));
@@ -3959,7 +3893,9 @@ mod validity_tests {
     }
 
     /// geo runs its exact segment predicate on all n(n-1) ordered edge
-    /// pairs: 4,000,000-odd for this ring. Only neighbours' boxes overlap.
+    /// pairs: 3,998,000 for this ring. Only neighbours' boxes overlap, so
+    /// exactly the n neighbouring pairs (the closing pair included) are
+    /// tested; zero would mean the scan was bypassed.
     #[test]
     fn ring_check_runs_exact_predicate_only_on_overlapping_boxes() {
         let n: u32 = 2_000;
@@ -3972,7 +3908,7 @@ mod validity_tests {
         let p = Polygon::new(LineString::from(ring), vec![]);
         let (valid, (exact, relates)) = validate_counted(&p);
         assert!(valid && p.is_valid());
-        assert!(exact <= 2 * u64::from(n), "{exact} exact predicate calls");
+        assert_eq!(exact, u64::from(n), "edge pairs tested");
         assert_eq!(relates, 0);
     }
 

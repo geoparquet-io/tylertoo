@@ -89,6 +89,7 @@ use tylertoo_core::internal::clip::{clip_geometry, clip_geometry_simple, geometr
 use tylertoo_core::internal::ioverlay_clip::{
     clip_multilinestring_ioverlay, clip_multipolygon_ioverlay, clip_polygon_ioverlay,
 };
+use tylertoo_core::internal::overview::simplify::polygon_is_valid;
 use tylertoo_core::internal::sutherland_hodgman::{clip_multipolygon_sh, clip_polygon_sh};
 use tylertoo_core::internal::tile::{tiles_for_bbox, TileBounds, TileCoord};
 
@@ -1930,6 +1931,30 @@ fn corpus_is_present_and_parsed() {
         skipped.keys().any(|k| k.starts_with("invalid_structure/")),
         "expected invalid_structure files among the skipped set: {skipped:?}"
     );
+}
+
+/// The overview's validity check gives geo's `is_valid` verdict on every
+/// corpus polygon, as stored and with each ring reversed: tiles and overview
+/// bytes depend on identical accept/reject decisions.
+#[test]
+fn overview_polygon_is_valid_matches_geo_on_corpus() {
+    let (fixtures, _) = load_corpus();
+    let polygons: Vec<Polygon<f64>> = fixtures
+        .into_iter()
+        .flat_map(|f| match f.geom {
+            Geometry::Polygon(p) => vec![p],
+            Geometry::MultiPolygon(mp) => mp.0,
+            _ => vec![],
+        })
+        .collect();
+    assert!(polygons.len() > 20, "corpus polygons: {}", polygons.len());
+    let rev = |r: &LineString<f64>| LineString::new(r.0.iter().rev().copied().collect());
+    for p in &polygons {
+        let reversed = Polygon::new(rev(p.exterior()), p.interiors().iter().map(rev).collect());
+        for q in [p, &reversed] {
+            assert_eq!(polygon_is_valid(q), q.is_valid(), "{q:?}");
+        }
+    }
 }
 
 /// Full tier (nextest slow set): everything the smoke test runs plus the
