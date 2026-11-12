@@ -168,9 +168,10 @@ impl<W: Write> IpcStreamWriter<W> {
     }
 
     /// Schema end followed by each independent batch end, or `None` when
-    /// dictionary state requires the serial stream reader.
+    /// dictionary state requires the serial stream reader, or on a platform
+    /// without the positional reads [`IpcIndexedReader`] needs.
     pub fn batch_offsets(&self) -> Option<&[u64]> {
-        self.offsets.as_deref()
+        self.offsets.as_deref().filter(|_| cfg!(any(unix, windows)))
     }
 
     /// Write end-of-stream and flush the sink.
@@ -229,6 +230,16 @@ impl<W: Write> FrameSink<W> {
     }
 }
 
+/// The LZ4 block size of every spill frame.
+const SPILL_BLOCK_SIZE: BlockSize = BlockSize::Max64KB;
+
+/// Decoder buffers for one [`SPILL_BLOCK_SIZE`] block, including its
+/// compressed input. Shared by spill admission and the codec owner.
+pub const IPC_CODEC_SCRATCH_BYTES: u64 = 2 * match SPILL_BLOCK_SIZE {
+    BlockSize::Max64KB => 64 << 10,
+    _ => panic!("price the spill block size"),
+};
+
 impl<W: Write> Write for FrameSink<W> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         if buffer.is_empty() {
@@ -239,7 +250,7 @@ impl<W: Write> Write for FrameSink<W> {
                 .sink
                 .take()
                 .ok_or_else(|| std::io::Error::other("closed LZ4 frame"))?;
-            let info = FrameInfo::new().block_size(BlockSize::Max64KB);
+            let info = FrameInfo::new().block_size(SPILL_BLOCK_SIZE);
             self.encoder = Some(Box::new(FrameEncoder::with_frame_info(info, sink)));
         }
         self.encoder
@@ -259,10 +270,6 @@ impl<W: Write> Write for FrameSink<W> {
         }
     }
 }
-
-/// Decoder buffers for a 64 KiB LZ4 block, including its compressed input.
-/// Shared by spill admission and the codec owner.
-pub const IPC_CODEC_SCRATCH_BYTES: u64 = 128 << 10;
 
 /// One open run-local, dictionary-free spill, with its schema decoded once.
 /// Independent positional reads let ordered windows share this handle.
