@@ -457,31 +457,6 @@ impl<R: Read> IpcStreamReader<R> {
     }
 }
 
-impl<R: Read + std::io::Seek> IpcStreamReader<R> {
-    /// Read one indexed dictionary-free batch without decoding its predecessors.
-    /// Both inputs must refer to the same completed run-local stream.
-    ///
-    /// # Errors
-    /// Returns an error for invalid offsets, I/O, or an invalid IPC batch.
-    pub fn read_batch(
-        mut schema: R,
-        mut batch: R,
-        schema_end: u64,
-        start: u64,
-        end: u64,
-    ) -> Result<RecordBatch, ArrowError> {
-        if start < schema_end || end < start {
-            return Err(ArrowError::ParseError("invalid spill batch offsets".into()));
-        }
-        schema.seek(std::io::SeekFrom::Start(0))?;
-        batch.seek(std::io::SeekFrom::Start(start))?;
-        let input = schema.take(schema_end).chain(batch.take(end - start));
-        IpcStreamReader::try_new(input, None)?
-            .next()
-            .ok_or_else(|| ArrowError::ParseError("missing indexed spill batch".into()))?
-    }
-}
-
 impl<R: Read> Iterator for IpcStreamReader<R> {
     type Item = Result<RecordBatch, ArrowError>;
 
@@ -531,36 +506,16 @@ mod tests {
         }
         assert!(sizes[1] < sizes[0] / 2, "{sizes:?}");
     }
-    /// Random access must not decompress any preceding record batch.
+    /// Random access must not decompress any preceding record batch:
+    /// zeroing every earlier batch's bytes must not affect the read.
     #[test]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "#779: this read counter belongs to one test, not process-global diagnostics"
-    )]
     fn indexed_spill_reads_only_requested_batch() {
-        use std::io::{Read, Seek, SeekFrom};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct CountRead {
-            inner: Cursor<Vec<u8>>,
-            bytes: Arc<AtomicUsize>,
-        }
-        impl Read for CountRead {
-            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-                let n = self.inner.read(b)?;
-                self.bytes.fetch_add(n, Ordering::Relaxed);
-                Ok(n)
-            }
-        }
-        impl Seek for CountRead {
-            fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
-                self.inner.seek(p)
-            }
-        }
+        use std::io::{Seek, SeekFrom};
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         for codec in [IpcCompression::None, IpcCompression::Lz4] {
-            let mut data = Vec::new();
+            let mut file = tempfile::tempfile().unwrap();
             let mut writer =
-                IpcStreamWriter::try_new_with_compression(&mut data, &schema, codec).unwrap();
+                IpcStreamWriter::try_new_with_compression(&mut file, &schema, codec).unwrap();
             let mut inputs = Vec::new();
             for i in 0..8 {
                 let values = (0..65536).map(|n| i * 65536 + n).collect::<Vec<i64>>();
@@ -573,22 +528,12 @@ mod tests {
             writer.finish().unwrap();
             let offsets = writer.batch_offsets().unwrap().to_vec();
             drop(writer);
-            let bytes = Arc::new(AtomicUsize::new(0));
-            let reader = || CountRead {
-                inner: Cursor::new(data.clone()),
-                bytes: bytes.clone(),
-            };
-            // Deliberately request the last batch first.
-            let last =
-                IpcStreamReader::read_batch(reader(), reader(), offsets[0], offsets[7], offsets[8])
-                    .unwrap();
-            assert_eq!(last, inputs[7]);
-            let read = bytes.load(Ordering::Relaxed) as u64;
-            assert!(
-                read <= offsets[0] + offsets[8] - offsets[7],
-                "read {read} bytes, including earlier batches"
-            );
-            assert!(read < data.len() as u64 / 4);
+            file.seek(SeekFrom::Start(offsets[0])).unwrap();
+            let zeros = usize::try_from(offsets[7] - offsets[0]).unwrap();
+            file.write_all(&vec![0; zeros]).unwrap();
+            let indexed = IpcIndexedReader::try_new(file, offsets[0]).unwrap();
+            let last = indexed.read_batch(offsets[7], offsets[8]).unwrap();
+            assert_eq!(last, inputs[7], "{codec:?}");
         }
     }
     /// The file and parsed schema belong to the level, not individual jobs.

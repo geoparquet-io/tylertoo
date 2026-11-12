@@ -105,8 +105,6 @@ impl core::marker::UnsafeUnpin for tylertoo_io::IpcIndexedReader
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::IpcIndexedReader
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::IpcIndexedReader
 pub struct tylertoo_io::IpcStreamReader<R: alloc::io::read::Read>
-impl<R: alloc::io::read::Read + core::io::seek::Seek> tylertoo_io::IpcStreamReader<R>
-pub fn tylertoo_io::IpcStreamReader<R>::read_batch(R, R, u64, u64, u64) -> core::result::Result<arrow_array::record_batch::RecordBatch, arrow_schema::error::ArrowError>
 impl<R: alloc::io::read::Read> tylertoo_io::IpcStreamReader<R>
 pub fn tylertoo_io::IpcStreamReader<R>::schema(&self) -> arrow_schema::schema::SchemaRef
 pub fn tylertoo_io::IpcStreamReader<R>::try_new(R, core::option::Option<alloc::vec::Vec<usize>>) -> core::result::Result<Self, arrow_schema::error::ArrowError>
