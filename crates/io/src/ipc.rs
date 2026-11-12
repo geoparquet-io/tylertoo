@@ -420,6 +420,10 @@ mod tests {
     }
     /// Random access must not decompress any preceding record batch.
     #[test]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: this read counter belongs to one test, not process-global diagnostics"
+    )]
     fn indexed_spill_reads_only_requested_batch() {
         use std::io::{Read, Seek, SeekFrom};
         use std::sync::atomic::{AtomicUsize, Ordering};

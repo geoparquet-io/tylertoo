@@ -1929,8 +1929,8 @@ fn drain_sink(
                 offsets,
             } = state.into_indexed_reader(timers)?;
             let indexed = decode_width > 1 && offsets.as_ref().is_some_and(|o| o.len() > 2);
-            // A single output queue plus the admitted decoding jobs, charged
-            // to existing grants before widening encodes.
+            // A single output queue, the writer's batch and the admitted
+            // decoding jobs, charged to existing grants before widening encodes.
             let depth = if indexed { 1 } else { SPILL_QUEUE_DEPTH };
             scoped_pipe(
                 depth,
@@ -3004,6 +3004,167 @@ mod drain_tests {
     use geoarrow::array::GeometryBuilder;
     use geoarrow::datatypes::GeometryType;
     use geoarrow_array::GeoArrowArray;
+
+    fn indexed_batches() -> Vec<RecordBatch> {
+        (0..7)
+            .map(|i| {
+                let ids = [i * 2, i * 2 + 1];
+                let points = ids.map(|id| geo::Geometry::Point(geo::Point::new(id as f64, 0.0)));
+                let mut builder = GeometryBuilder::new(GeometryType::new(Default::default()))
+                    .with_prefer_multi(false);
+                builder.extend_from_iter(points.iter().map(Some));
+                let geometry = builder.finish();
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Int64, false),
+                        geometry.data_type().to_field("geometry", true),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(ids.to_vec())),
+                        geometry.to_array_ref(),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn spilled_batches(batches: &[RecordBatch], codec: IpcCompression) -> SpillState {
+        let mut state = SpillState::with_codec(&batches[0].schema(), None, codec).unwrap();
+        for batch in batches {
+            state.push(batch.clone()).unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn indexed_drain_preserves_serial_order_across_partial_windows() {
+        let batches = indexed_batches();
+        let schema = batches[0].schema();
+        for codec in [IpcCompression::None, IpcCompression::Lz4] {
+            let mut serial = None;
+            for decode_width in [1, 2, 3, 4] {
+                // Seven batches exercise multiple windows and a partial tail
+                // at every parallel width, for both private spill codecs.
+                let sink = LevelSink::Spill(spilled_batches(&batches, codec));
+                let tmp = tempfile::NamedTempFile::new().unwrap();
+                let mut options = OverviewWriterOptions::new(
+                    Mode::Duplicating,
+                    vec![LevelSpec::new(gsd(2), Some(2))],
+                );
+                options.encode_concurrency = 2;
+                options.max_row_group_size = 3;
+                let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
+                let _ = drain_sink(
+                    &mut writer,
+                    0,
+                    14,
+                    sink,
+                    2,
+                    decode_width,
+                    &Pass2Timers::default(),
+                )
+                .unwrap();
+                writer.finish().unwrap();
+                let builder = tylertoo_io::open_parquet(File::open(tmp.path()).unwrap()).unwrap();
+                let layout: Vec<_> = builder
+                    .metadata()
+                    .row_groups()
+                    .iter()
+                    .map(|group| group.num_rows())
+                    .collect();
+                let reader = builder.build().unwrap();
+                let ids: Vec<i64> = reader
+                    .flat_map(|batch| {
+                        batch
+                            .unwrap()
+                            .column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                assert_eq!(
+                    ids,
+                    (0..14).collect::<Vec<_>>(),
+                    "{codec:?}, {decode_width}"
+                );
+                let actual = (layout, ids);
+                if let Some(serial) = &serial {
+                    assert_eq!(&actual, serial, "{codec:?}, {decode_width}");
+                } else {
+                    serial = Some(actual);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_drain_reports_first_corruption_before_later_truncation() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let batches = indexed_batches();
+        let schema = batches[0].schema();
+        for codec in [IpcCompression::None, IpcCompression::Lz4] {
+            for decode_width in [2, 3, 4] {
+                // Both failures are in the same window at every width. The
+                // second can finish decoding first, but must not win.
+                let mut state = spilled_batches(&batches, codec);
+                state.tx = None;
+                let mut done = state.join().unwrap().unwrap();
+                let offsets = done.offsets.as_ref().unwrap();
+                assert_eq!(offsets.len(), 8);
+                done.temp
+                    .as_file_mut()
+                    .seek(SeekFrom::Start(offsets[4]))
+                    .unwrap();
+                done.temp.as_file_mut().write_all(&[0; 8]).unwrap();
+                done.temp
+                    .as_file()
+                    .set_len(offsets[5] + (offsets[6] - offsets[5]) / 2)
+                    .unwrap();
+                let error_at = |index: usize| {
+                    StreamReader::read_batch(
+                        BufReader::new(done.temp.reopen().unwrap()),
+                        BufReader::new(done.temp.reopen().unwrap()),
+                        offsets[0],
+                        offsets[index],
+                        offsets[index + 1],
+                    )
+                    .unwrap_err()
+                    .to_string()
+                };
+                let first = error_at(4);
+                let later = error_at(5);
+                assert_ne!(first, later, "distinct faults make error order observable");
+                state.handle = Some(std::thread::spawn(move || Ok(done)));
+                let tmp = tempfile::NamedTempFile::new().unwrap();
+                let options = OverviewWriterOptions::new(
+                    Mode::Duplicating,
+                    vec![LevelSpec::new(gsd(2), Some(2))],
+                );
+                let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
+                let error = drain_sink(
+                    &mut writer,
+                    0,
+                    14,
+                    LevelSink::Spill(state),
+                    1,
+                    decode_width,
+                    &Pass2Timers::default(),
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains(&first),
+                    "{codec:?}, {decode_width}: {error}"
+                );
+                assert!(writer.finish().is_err(), "a failed level must not finish");
+            }
+        }
+    }
 
     /// #852 review F3: a level batch that fails to rebuild in the drain ends
     /// its level unwritten. The level was finished short before, with the

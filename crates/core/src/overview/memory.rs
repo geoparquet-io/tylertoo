@@ -562,11 +562,12 @@ impl MemoryBudget {
         let encode_floor = (encode.units as u64).saturating_mul(slot_bytes.max(encode.unit_bytes));
         if max_batch > 0 {
             for decodes in [4, 2].into_iter().filter(|&n| n <= threads) {
-                // One queued batch plus each decoding batch, codec buffers,
-                // and explicitly sized 2 MiB stacks for the capped pool.
+                // A full decoding window can overlap one queued batch and
+                // one in the writer from the previous window. Include codec
+                // buffers and explicitly sized 2 MiB stacks for the pool.
                 let bytes = max_batch
                     .saturating_add(128 << 10)
-                    .saturating_mul(decodes as u64 + 1)
+                    .saturating_mul(decodes as u64 + 2)
                     .saturating_add((decodes as u64).saturating_mul(2 << 20));
                 let slots =
                     usize::try_from(bytes.div_ceil(encode.unit_bytes.max(1))).unwrap_or(usize::MAX);
@@ -707,6 +708,27 @@ mod tests {
         assert!(decodes > 1, "existing encode grant can fund two decoders");
         assert!(encodes >= ENCODE_FLOOR);
         assert!(encodes as u64 * mib + bytes <= encode.bytes());
+    }
+
+    #[test]
+    fn drain_decode_admission_includes_queued_and_writer_batches() {
+        let mib = 1 << 20;
+        let encode = Grant {
+            phase: MemoryPhase::Encode,
+            units: 4,
+            unit_bytes: mib,
+        };
+        // Two decoders, their stacks and the depth-one queue fit in 8 MiB,
+        // but the writer can still hold a batch from the previous window.
+        let (_, decodes, bytes) =
+            MemoryBudget::drain_widths(encode, mib, 8 * mib, mib, 12 * mib, 64);
+        assert_eq!((decodes, bytes), (1, 0));
+        // With that batch funded too, the same two decoders are admitted.
+        let reused = 8 * mib + mib / 2;
+        assert_eq!(
+            MemoryBudget::drain_widths(encode, mib, reused, mib, encode.bytes() + reused, 64),
+            (4, 2, reused)
+        );
     }
 
     #[test]
