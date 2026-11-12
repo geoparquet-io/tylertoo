@@ -294,7 +294,8 @@ fn layer_stats(
     }
     // Offset order, so each rayon split reads a contiguous stretch of the file.
     let bodies: Vec<_> = bodies.into_iter().collect();
-    let pool = crate::decode::decode_pool().map_err(std::io::Error::other)?;
+    let pool =
+        crate::decode::decode_pool(crate::decode::DECODE_THREADS).map_err(std::io::Error::other)?;
     let work = || {
         bodies
             .par_iter()
@@ -805,14 +806,15 @@ mod tests {
             .num_threads(64)
             .build()
             .unwrap();
-        let capped = wide.install(|| crate::decode::decode_pool().unwrap());
+        let capped =
+            wide.install(|| crate::decode::decode_pool(crate::decode::DECODE_THREADS).unwrap());
         assert_eq!(capped.map(|p| p.current_num_threads()), Some(16));
         let narrow = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
             .unwrap();
         assert!(narrow
-            .install(|| crate::decode::decode_pool().unwrap())
+            .install(|| crate::decode::decode_pool(crate::decode::DECODE_THREADS).unwrap())
             .is_none());
     }
 

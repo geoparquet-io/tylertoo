@@ -91,7 +91,22 @@ impl<W> core::marker::Unpin for tylertoo_io::IpcFileWriter<W> where arrow_ipc::w
 impl<W> core::marker::UnsafeUnpin for tylertoo_io::IpcFileWriter<W> where arrow_ipc::writer::FileWriter<W>: core::marker::UnsafeUnpin
 impl<W> core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::IpcFileWriter<W> where arrow_ipc::writer::FileWriter<W>: core::panic::unwind_safe::RefUnwindSafe
 impl<W> core::panic::unwind_safe::UnwindSafe for tylertoo_io::IpcFileWriter<W> where arrow_ipc::writer::FileWriter<W>: core::panic::unwind_safe::UnwindSafe
+pub struct tylertoo_io::IpcIndexedReader
+impl tylertoo_io::IpcIndexedReader
+pub fn tylertoo_io::IpcIndexedReader::read_batch(&self, u64, u64) -> core::result::Result<arrow_array::record_batch::RecordBatch, arrow_schema::error::ArrowError>
+pub fn tylertoo_io::IpcIndexedReader::try_new(std::fs::File, u64) -> core::result::Result<Self, arrow_schema::error::ArrowError>
+impl core::fmt::Debug for tylertoo_io::IpcIndexedReader
+pub fn tylertoo_io::IpcIndexedReader::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_io::IpcIndexedReader
+impl core::marker::Send for tylertoo_io::IpcIndexedReader
+impl core::marker::Sync for tylertoo_io::IpcIndexedReader
+impl core::marker::Unpin for tylertoo_io::IpcIndexedReader
+impl core::marker::UnsafeUnpin for tylertoo_io::IpcIndexedReader
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::IpcIndexedReader
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::IpcIndexedReader
 pub struct tylertoo_io::IpcStreamReader<R: alloc::io::read::Read>
+impl<R: alloc::io::read::Read + core::io::seek::Seek> tylertoo_io::IpcStreamReader<R>
+pub fn tylertoo_io::IpcStreamReader<R>::read_batch(R, R, u64, u64, u64) -> core::result::Result<arrow_array::record_batch::RecordBatch, arrow_schema::error::ArrowError>
 impl<R: alloc::io::read::Read> tylertoo_io::IpcStreamReader<R>
 pub fn tylertoo_io::IpcStreamReader<R>::schema(&self) -> arrow_schema::schema::SchemaRef
 pub fn tylertoo_io::IpcStreamReader<R>::try_new(R, core::option::Option<alloc::vec::Vec<usize>>) -> core::result::Result<Self, arrow_schema::error::ArrowError>
@@ -109,6 +124,7 @@ impl<R> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::IpcStreamReade
 impl<R> !core::panic::unwind_safe::UnwindSafe for tylertoo_io::IpcStreamReader<R>
 pub struct tylertoo_io::IpcStreamWriter<W: core::io::write::Write>
 impl<W: core::io::write::Write> tylertoo_io::IpcStreamWriter<W>
+pub fn tylertoo_io::IpcStreamWriter<W>::batch_offsets(&self) -> core::option::Option<&[u64]>
 pub fn tylertoo_io::IpcStreamWriter<W>::bytes_written(&self) -> u64
 pub fn tylertoo_io::IpcStreamWriter<W>::finish(&mut self) -> core::result::Result<(), arrow_schema::error::ArrowError>
 pub fn tylertoo_io::IpcStreamWriter<W>::try_new(W, &arrow_schema::schema::Schema) -> core::result::Result<Self, arrow_schema::error::ArrowError>
@@ -242,6 +258,7 @@ impl<R> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::UntrustedIpcRe
 impl<R> !core::panic::unwind_safe::UnwindSafe for tylertoo_io::UntrustedIpcReader<R>
 pub const tylertoo_io::BYTE_ARRAY_BATCH_LIMIT: u64
 pub const tylertoo_io::DEFAULT_BATCH_ROWS: usize
+pub const tylertoo_io::IPC_CODEC_SCRATCH_BYTES: u64
 pub fn tylertoo_io::batch_writer<W: core::io::write::Write + core::marker::Send>(W, arrow_schema::schema::SchemaRef) -> core::result::Result<tylertoo_io::BatchWriter<W>, parquet::errors::ParquetError>
 pub fn tylertoo_io::byte_array_limit() -> u64
 pub fn tylertoo_io::check_byte_array_ceiling(&arrow_array::record_batch::RecordBatch) -> core::result::Result<(), arrow_schema::error::ArrowError>

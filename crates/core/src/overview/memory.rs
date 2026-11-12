@@ -548,6 +548,64 @@ impl MemoryBudget {
             .saturating_add(extra)
             .min(threads.max(encode.units))
     }
+    /// Share existing grants between indexed decoders and encodes. Prefer
+    /// the encode grant's slots above its floor, then the completed read's
+    /// still-held grants. Every borrowed byte leaves the encoder allowance.
+    pub(super) fn drain_widths(
+        encode: Grant,
+        slot_bytes: u64,
+        reused: u64,
+        max_batch: u64,
+        below_peak: u64,
+        threads: usize,
+    ) -> (usize, usize, u64) {
+        let encode_floor = (encode.units as u64).saturating_mul(slot_bytes.max(encode.unit_bytes));
+        if max_batch > 0 {
+            for decodes in [4, 2].into_iter().filter(|&n| n <= threads) {
+                // A full decoding window can overlap one queued batch and
+                // one in the writer from the previous window. Include codec
+                // buffers and the existing decode helper's explicit stacks.
+                let bytes = max_batch
+                    .saturating_add(tylertoo_io::IPC_CODEC_SCRATCH_BYTES)
+                    .saturating_mul(decodes as u64 + 2)
+                    .saturating_add(
+                        (decodes as u64)
+                            .saturating_mul(crate::decode::DECODE_THREAD_STACK_BYTES as u64),
+                    );
+                let slots =
+                    usize::try_from(bytes.div_ceil(encode.unit_bytes.max(1))).unwrap_or(usize::MAX);
+                if slots <= encode.units.saturating_sub(ENCODE_FLOOR) {
+                    let encodes = Self::drain_encodes(
+                        Grant {
+                            units: encode.units - slots,
+                            ..encode
+                        },
+                        slot_bytes,
+                        reused,
+                        below_peak.saturating_sub(bytes),
+                        threads,
+                    );
+                    return (encodes, decodes, bytes);
+                }
+                if bytes <= reused.min(below_peak.saturating_sub(encode_floor)) {
+                    let encodes = Self::drain_encodes(
+                        encode,
+                        slot_bytes,
+                        reused - bytes,
+                        below_peak - bytes,
+                        threads,
+                    );
+                    return (encodes, decodes, bytes);
+                }
+            }
+        }
+        (
+            Self::drain_encodes(encode, slot_bytes, reused, below_peak, threads),
+            1,
+            0,
+        )
+    }
+
     pub(super) fn require(&self, phase: MemoryPhase, needed: u64) -> Result<(), ConvertError> {
         if let Some(available) = self.available() {
             if needed > available {
@@ -637,6 +695,87 @@ mod tests {
         assert!(MemoryBudget::with_available(None)
             .require_allowance(MemoryProfile::Auto, MemoryPhase::Scan, u64::MAX)
             .is_ok());
+    }
+
+    #[test]
+    fn drain_decoders_can_borrow_encode_slots_without_growing_the_grant() {
+        let mib = 1 << 20;
+        let encode = Grant {
+            phase: MemoryPhase::Encode,
+            units: 16,
+            unit_bytes: mib,
+        };
+        // An auto encode grant can already cover decode: no extra read bytes
+        // or RSS headroom are available. Keep at least the encode floor.
+        let (encodes, decodes, bytes) = MemoryBudget::drain_widths(encode, mib, 0, mib, 0, 64);
+        assert!(decodes > 1, "existing encode grant can fund two decoders");
+        assert!(encodes >= ENCODE_FLOOR);
+        assert!(encodes as u64 * mib + bytes <= encode.bytes());
+    }
+
+    #[test]
+    fn drain_decode_admission_includes_queued_and_writer_batches() {
+        let mib = 1 << 20;
+        let encode = Grant {
+            phase: MemoryPhase::Encode,
+            units: 4,
+            unit_bytes: mib,
+        };
+        // Two decoders, their stacks and the depth-one queue fit in 8 MiB,
+        // but the writer can still hold a batch from the previous window.
+        let (_, decodes, bytes) =
+            MemoryBudget::drain_widths(encode, mib, 8 * mib, mib, 12 * mib, 64);
+        assert_eq!((decodes, bytes), (1, 0));
+        // With that batch funded too, the same two decoders are admitted.
+        let reused = 8 * mib + mib / 2;
+        assert_eq!(
+            MemoryBudget::drain_widths(encode, mib, reused, mib, encode.bytes() + reused, 64),
+            (4, 2, reused)
+        );
+    }
+
+    #[test]
+    fn drain_decode_and_encode_cannot_spend_the_read_grant_twice() {
+        let mib = 1 << 20;
+        let encode = Grant {
+            phase: MemoryPhase::Encode,
+            units: 4,
+            unit_bytes: mib,
+        };
+        let reused = 10 * mib;
+        let peak = encode.bytes() + reused;
+        let (encodes, workers, decoded) =
+            MemoryBudget::drain_widths(encode, mib, reused, mib, peak, 64);
+        assert_eq!(workers, 2);
+        assert!(encodes as u64 * mib + decoded <= peak);
+        assert_eq!(
+            {
+                let (_, n, b) = MemoryBudget::drain_widths(encode, mib, decoded - 1, mib, peak, 64);
+                (n, b)
+            },
+            (1, 0)
+        );
+        assert_eq!(
+            {
+                let (_, n, b) = MemoryBudget::drain_widths(
+                    encode,
+                    mib,
+                    reused,
+                    mib,
+                    encode.bytes() + decoded - 1,
+                    64,
+                );
+                (n, b)
+            },
+            (1, 0)
+        );
+        assert_eq!(
+            {
+                let (_, n, b) = MemoryBudget::drain_widths(encode, mib, reused, mib, peak, 1);
+                (n, b)
+            },
+            (1, 0)
+        );
     }
 
     #[test]
