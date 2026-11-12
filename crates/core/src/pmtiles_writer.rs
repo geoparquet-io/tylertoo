@@ -1675,8 +1675,11 @@ pub struct StreamingPmtilesWriter {
     /// covered.
     force_tail_root_overflow: bool,
     /// The tail layout's background writeback ([`Writeback`]); `None` for
-    /// the spooled layout and once stopped.
+    /// the spooled layout and while stopped.
     writeback: Option<Writeback>,
+    /// The first background sync error, latched: every later assembly
+    /// reports it again rather than publishing tiles it may have lost.
+    writeback_failed: Option<(std::io::ErrorKind, String)>,
 }
 
 /// Spool bytes appended between two background syncs of a tail-layout
@@ -1934,7 +1937,6 @@ impl StreamingPmtilesWriter {
         // zero-filled and the file never contains a sparse hole whose
         // contents depend on the filesystem.
         file.write_all(&vec![0u8; TAIL_LAYOUT_PREFIX_BYTES as usize])?;
-        let writeback = Writeback::start(file.try_clone()?)?;
         let temp_file = BufWriter::with_capacity(64 * 1024, file);
 
         let mut writer = Self::from_spool(
@@ -1945,7 +1947,7 @@ impl StreamingPmtilesWriter {
                 output_path: output_path.to_path_buf(),
             },
         );
-        writer.writeback = Some(writeback);
+        writer.start_writeback()?;
         Ok(writer)
     }
 
@@ -1990,7 +1992,19 @@ impl StreamingPmtilesWriter {
             tail_dirty: true,
             force_tail_root_overflow: false,
             writeback: None,
+            writeback_failed: None,
         }
+    }
+
+    /// Start the [`Writeback`] thread on a second handle to the spool.
+    fn start_writeback(&mut self) -> std::io::Result<()> {
+        let Some(spool) = &self.temp_file else {
+            return Ok(());
+        };
+        let mut writeback = Writeback::start(spool.get_ref().try_clone()?)?;
+        writeback.woken_at = self.current_offset - spool.buffer().len() as u64;
+        self.writeback = Some(writeback);
+        Ok(())
     }
 
     /// Wake the [`Writeback`] thread once another [`WRITEBACK_CHUNK_BYTES`]
@@ -2008,15 +2022,24 @@ impl StreamingPmtilesWriter {
     }
 
     /// Stop the [`Writeback`] thread after the sync it may be running, and
-    /// return how many syncs it ran, or the first one's error.
+    /// return how many syncs it ran, or the first sync error of the run.
+    /// Every archive assembly calls this first, so neither a checkpoint nor
+    /// `finalize` declares bytes durable that a background sync failed on.
     fn stop_writeback(&mut self) -> std::io::Result<u64> {
+        if let Some((kind, message)) = &self.writeback_failed {
+            return Err(std::io::Error::new(*kind, message.clone()));
+        }
         let Some(Writeback { wake, thread, .. }) = self.writeback.take() else {
             return Ok(0);
         };
         drop(wake);
-        thread
+        let syncs = thread
             .join()
-            .unwrap_or_else(|_| Err(std::io::Error::other("writeback thread panicked")))
+            .unwrap_or_else(|_| Err(std::io::Error::other("writeback thread panicked")));
+        if let Err(e) = &syncs {
+            self.writeback_failed = Some((e.kind(), e.to_string()));
+        }
+        syncs
     }
 
     /// Where a mid-run salvage archive can be found, for a writer created with
@@ -2537,8 +2560,6 @@ impl StreamingPmtilesWriter {
     /// Returns an error if assembling or writing the archive fails, or if
     /// `output_path` differs from the one a tail-layout writer was created for.
     pub fn finalize(mut self, output_path: &Path) -> Result<StreamingWriteStats> {
-        self.stop_writeback()
-            .map_err(|e| WriteError::io("background writeback", e))?;
         // Assemble the complete archive (byte-identical to the last checkpoint,
         // if any). This flushes the temp buffer in place but leaves the handle
         // open so we can close it deterministically below.
@@ -2610,7 +2631,12 @@ impl StreamingPmtilesWriter {
         let variable_depth = self.variable_depth.take();
         let written = self.write_archive(output_path);
         self.variable_depth = variable_depth;
-        written.map(drop)
+        // Assembly stopped the writeback thread; tiles keep coming.
+        if written? == ArchiveWriteMode::Tail {
+            self.start_writeback()
+                .map_err(|e| WriteError::io("restart background writeback", e))?;
+        }
+        Ok(())
     }
 
     /// Shared archive assembler backing both [`checkpoint`](Self::checkpoint)
@@ -2620,6 +2646,8 @@ impl StreamingPmtilesWriter {
     /// writer uses. Returns the layout actually used, which is what tells
     /// `finalize` whether publishing is a rename or already done.
     fn write_archive(&mut self, output_path: &Path) -> Result<ArchiveWriteMode> {
+        self.stop_writeback()
+            .map_err(|e| WriteError::io("background writeback", e))?;
         let sections = self.build_sections(output_path)?;
 
         // The tail layout is legal only while header + root fit the reserved
@@ -3360,6 +3388,41 @@ mod tests {
         assert!(w.stop_writeback().unwrap() >= 1, "no background sync ran");
         w.finalize(&out).unwrap();
         assert!(fs::metadata(&out).unwrap().len() > 3 * WRITEBACK_CHUNK_BYTES);
+    }
+
+    /// A background sync that failed must fail the next checkpoint, not
+    /// wait for `finalize`: the checkpoint's own sync runs on another
+    /// descriptor, which may not see a writeback error the worker's already
+    /// consumed, and would mark tile bytes salvageable that never reached
+    /// the disk. The error stays latched, so `finalize` fails too.
+    #[test]
+    fn a_failed_background_sync_fails_the_next_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("eio.pmtiles");
+        let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap();
+        w.add_tile(0, 0, 0, &tail_payload(0)).unwrap();
+        // Swap in a worker whose sync fails, as an EIO on writeback would.
+        w.stop_writeback().unwrap();
+        let (wake, woken) = std::sync::mpsc::sync_channel::<()>(1);
+        let thread = std::thread::spawn(move || {
+            let _ = woken.recv();
+            Err(std::io::Error::other("injected writeback failure"))
+        });
+        w.writeback = Some(Writeback {
+            wake,
+            thread,
+            woken_at: 0,
+        });
+
+        let err = w
+            .checkpoint(&out)
+            .expect_err("checkpoint hid the failed sync");
+        assert!(
+            err.to_string().contains("injected writeback failure"),
+            "{err}"
+        );
+        assert_eq!(w.tail_checkpoints, 0, "no salvageable checkpoint claimed");
+        assert!(w.finalize(&out).is_err(), "the error must stay latched");
     }
 
     /// The mid-run salvage artifact is `<output>.partial`, and it must be a
