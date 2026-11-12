@@ -1,15 +1,48 @@
 //! One first-encounter key/value index, shared by materialized and serialized layers.
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
+
+use xxhash_rust::xxh3::Xxh3Builder;
 
 use super::{PropertyValue, ScalarKey};
 
-#[derive(Default)]
 pub(super) struct TagIndex<'a> {
-    keys: HashMap<Cow<'a, str>, u32>,
-    strings: HashMap<Cow<'a, str>, u32>,
-    scalars: HashMap<ScalarKey, u32>,
+    keys: HashMap<Cow<'a, str>, u32, Xxh3Builder>,
+    strings: HashMap<Cow<'a, str>, u32, Xxh3Builder>,
+    scalars: HashMap<ScalarKey, u32, Xxh3Builder>,
     values: usize,
+}
+
+/// The tag maps' hasher: xxh3, which hashes long property strings several
+/// times faster than std's `SipHash` (`SipHash` was 15.6% of a wide-property
+/// export's cycles), keyed once per process with a secret drawn from
+/// `RandomState`, so values crafted to collide still need the key.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: a process-wide hash key; no diagnostic globals"
+)]
+fn tag_hasher() -> Xxh3Builder {
+    static KEYED: std::sync::OnceLock<Xxh3Builder> = std::sync::OnceLock::new();
+    *KEYED.get_or_init(|| {
+        let random = RandomState::new();
+        let mut secret = [0u8; 192];
+        for (i, word) in secret.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            *word = random.hash_one(i).to_le_bytes();
+        }
+        Xxh3Builder::new().with_secret(secret)
+    })
+}
+
+impl Default for TagIndex<'_> {
+    fn default() -> Self {
+        Self {
+            keys: HashMap::with_hasher(tag_hasher()),
+            strings: HashMap::with_hasher(tag_hasher()),
+            scalars: HashMap::with_hasher(tag_hasher()),
+            values: 0,
+        }
+    }
 }
 
 impl<'a> TagIndex<'a> {
@@ -62,5 +95,25 @@ impl<'a> TagIndex<'a> {
             tags.push(self.value(value, &store, &mut new_value));
         }
         tags
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tag interning hashes every key and string value of every feature of
+    /// every tile, so the maps share one hasher seeded once per process
+    /// (keyed, as `RandomState` is, so crafted values cannot collide on
+    /// purpose), not a fresh `SipHash` state per map.
+    #[test]
+    fn tag_maps_share_one_process_seeded_hasher() {
+        let (a, b) = (TagIndex::default(), TagIndex::default());
+        let v = "a property value";
+        assert_eq!(
+            a.strings.hasher().hash_one(v),
+            b.strings.hasher().hash_one(v)
+        );
+        assert_eq!(a.keys.hasher().hash_one(v), b.strings.hasher().hash_one(v));
     }
 }
