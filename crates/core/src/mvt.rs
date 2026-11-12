@@ -11,6 +11,7 @@
 //!
 //! Reference: <https://github.com/mapbox/vector-tile-spec>
 
+use crate::box_pairs::any_box_pair;
 use crate::tile::TileBounds;
 use crate::vector_tile::tile::{Feature, GeomType, Layer, Value};
 use crate::vector_tile::Tile;
@@ -514,161 +515,6 @@ fn edge_box(p: (i32, i32), q: (i32, i32)) -> (i32, i32, i32, i32) {
     (p.0.min(q.0), p.1.min(q.1), p.0.max(q.0), p.1.max(q.1))
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Box pairs a sweep compared, on this thread.
-    pub(crate) static SWEEP_CANDIDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// Visit every pair of boxes that meet, once, and stop at the first pair
-/// `hit` accepts. A plane sweep over x: boxes are sorted by their min x and
-/// each is paired with the following ones until their min x passes its max
-/// x, so the work is O(n log n + k) for k box-meeting pairs rather than
-/// O(n²). Which of a pair comes first in `hit(i, j)` follows the sort, not
-/// the input order.
-fn any_box_pair(boxes: &[(i32, i32, i32, i32)], mut hit: impl FnMut(usize, usize) -> bool) -> bool {
-    let mut order: Vec<u32> = (0..boxes.len() as u32).collect();
-    order.sort_unstable_by_key(|&i| boxes[i as usize].0);
-    for (p, &i) in order.iter().enumerate() {
-        let bi = boxes[i as usize];
-        for &j in &order[p + 1..] {
-            let bj = boxes[j as usize];
-            if bj.0 > bi.2 {
-                break;
-            }
-            #[cfg(test)]
-            SWEEP_CANDIDATES.with(|c| c.set(c.get() + 1));
-            if bj.1 <= bi.3 && bi.1 <= bj.3 && hit(i as usize, j as usize) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Boxes per horizontal strip in [`strip_box_pairs`].
-const STRIP_BOXES: usize = 256;
-
-/// Most strips [`strip_box_pairs`] cuts the boxes' y range into.
-const MAX_STRIPS: usize = 1024;
-
-/// Mean boxes sharing a box's x range below which [`strip_box_pairs`] keeps
-/// the x sweep.
-const X_SWEEP_DENSITY: i64 = 8;
-
-/// [`any_box_pair`] in horizontal strips: the same pairs, each with the same
-/// one first in `hit(i, j)`, but not in the same order. Each strip runs the
-/// x sweep over the boxes that reach it, and a pair is visited only in the
-/// strip holding the bottom of the two boxes' overlap; a box reaching more
-/// than two strips is paired by the x sweep instead. An x-only sweep pairs
-/// every box with all the boxes that share its x range, however far apart
-/// in y: on a merged feature spanning the tile (#772) that is about 170
-/// candidates per pair that meets.
-pub(crate) fn strip_box_pairs(
-    boxes: &[(i32, i32, i32, i32)],
-    mut hit: impl FnMut(usize, usize) -> bool,
-) -> bool {
-    if boxes.len() < 2 * STRIP_BOXES {
-        return any_box_pair(boxes, hit);
-    }
-    // About the boxes the x sweep pairs each box with, from every 16th box.
-    // Where that is few (a ring's edges: about two), the strips' sort and
-    // lists cost more than they save. shortcut: a uniform-x estimate, so
-    // boxes bunched in x with an outlier far off keep the x sweep and its
-    // cost; bucket min x if a profile shows that.
-    let (x0, x1, widths) =
-        boxes
-            .iter()
-            .step_by(16)
-            .fold((i32::MAX, i32::MIN, 0_i64), |(lo, hi, w), b| {
-                (
-                    lo.min(b.0),
-                    hi.max(b.2),
-                    // Inclusive: a vertical edge still shares its x.
-                    w + i64::from(b.2) - i64::from(b.0) + 1,
-                )
-            });
-    if 16 * widths < X_SWEEP_DENSITY * (i64::from(x1) - i64::from(x0) + 1) {
-        return any_box_pair(boxes, hit);
-    }
-    let (y0, y1) = boxes.iter().fold((i32::MAX, i32::MIN), |(lo, hi), b| {
-        (lo.min(b.1), hi.max(b.3))
-    });
-    let span = i64::from(y1) - i64::from(y0) + 1;
-    // Strips no lower than the mean box, so a box reaches about two.
-    let heights: i64 = boxes.iter().map(|b| i64::from(b.3) - i64::from(b.1)).sum();
-    let mean_height = (heights / boxes.len() as i64).max(1);
-    let strips = (boxes.len() / STRIP_BOXES)
-        .min(MAX_STRIPS)
-        .min(usize::try_from(span / mean_height).unwrap_or(usize::MAX));
-    if strips < 2 {
-        return any_box_pair(boxes, hit);
-    }
-    let strip_of = |y: i32| ((i64::from(y) - i64::from(y0)) * strips as i64 / span) as usize;
-    // `any_box_pair`'s order, so each strip is a subsequence of it.
-    let mut order: Vec<u32> = (0..boxes.len() as u32).collect();
-    order.sort_unstable_by_key(|&i| boxes[i as usize].0);
-    // Two boxes are compared in every strip they share, so a box reaching
-    // more than two strips is tall: its pairs are found once, in x order.
-    let mut members: Vec<Vec<u32>> = vec![Vec::new(); strips];
-    let mut tall: Vec<usize> = Vec::new();
-    for (p, &i) in order.iter().enumerate() {
-        let b = boxes[i as usize];
-        let (lo, hi) = (strip_of(b.1), strip_of(b.3));
-        if hi - lo > 1 {
-            tall.push(p);
-            continue;
-        }
-        for list in &mut members[lo..=hi] {
-            list.push(i);
-        }
-    }
-    // A tall box meets every box after it in the window; a short one only
-    // the tall boxes after it.
-    let mut next = 0;
-    for (p, &i) in order.iter().enumerate() {
-        let bi = boxes[i as usize];
-        let after: &mut dyn Iterator<Item = u32> = if tall.get(next) == Some(&p) {
-            next += 1;
-            &mut order[p + 1..].iter().copied()
-        } else {
-            &mut tall[next..].iter().map(|&q| order[q])
-        };
-        for j in after {
-            let bj = boxes[j as usize];
-            if bj.0 > bi.2 {
-                break;
-            }
-            #[cfg(test)]
-            SWEEP_CANDIDATES.with(|c| c.set(c.get() + 1));
-            if bj.1 <= bi.3 && bi.1 <= bj.3 && hit(i as usize, j as usize) {
-                return true;
-            }
-        }
-    }
-    for (s, list) in members.iter().enumerate() {
-        for (p, &i) in list.iter().enumerate() {
-            let bi = boxes[i as usize];
-            for &j in &list[p + 1..] {
-                let bj = boxes[j as usize];
-                if bj.0 > bi.2 {
-                    break;
-                }
-                #[cfg(test)]
-                SWEEP_CANDIDATES.with(|c| c.set(c.get() + 1));
-                if bj.1 <= bi.3
-                    && bi.1 <= bj.3
-                    && strip_of(bi.1.max(bj.1)) == s
-                    && hit(i as usize, j as usize)
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 /// Exact integer test: do closed segments `a` and `b` cross properly or
 /// overlap along a stretch? Touching at a single point — an endpoint on the
 /// other segment, or a shared endpoint — is NOT counted: two rings of one
@@ -854,6 +700,24 @@ pub(crate) struct QuantizedPolygons {
     /// those this pass used, and the previous pass's. Two generations, so
     /// a component no pass asks for again is dropped.
     unions: std::sync::Mutex<UnionCache>,
+    /// Per feature, the finalize verdict (#748) of the feature alone: 0 not
+    /// known, 1 valid, 2 repaired (the repair is in [`Self::verdicts`]). A
+    /// pass that encodes it alone again neither checks nor repairs it.
+    lone: Vec<std::sync::atomic::AtomicU8>,
+    /// By leading feature, the merged groups found valid and the lone
+    /// features' repairs, so the next pass replays them. Kept for the pass
+    /// that used them and the next, as [`Self::unions`] is.
+    verdicts: std::sync::Mutex<HashMap<u32, GroupVerdict>>,
+    /// Passes started ([`Self::next_pass`]).
+    pass: u32,
+}
+
+/// A merged group found valid, or a lone feature's repair.
+struct GroupVerdict {
+    group: Box<[u32]>,
+    /// The last pass that used it.
+    pass: u32,
+    repair: Option<std::sync::Arc<tile_polygon::Repair>>,
 }
 
 #[derive(Default)]
@@ -941,6 +805,7 @@ impl QuantizedPolygons {
                 }));
             }
         }
+        let features_len = features.len();
         drop(geometries);
         drop(feature_keys);
         // The box-meeting pairs that share a key; the exact test waits until
@@ -990,6 +855,11 @@ impl QuantizedPolygons {
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
             unions: std::sync::Mutex::default(),
+            lone: (0..features_len)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
+            verdicts: std::sync::Mutex::default(),
+            pass: 0,
         })
     }
 
@@ -1015,6 +885,12 @@ impl QuantizedPolygons {
     pub(crate) fn next_pass(&mut self) {
         let cache = self.unions.get_mut().expect("union cache");
         cache.previous = std::mem::take(&mut cache.current);
+        let last = self.pass;
+        self.verdicts
+            .get_mut()
+            .expect("verdicts")
+            .retain(|_, v| v.pass == last);
+        self.pass += 1;
     }
 
     /// Components served from the cache so far.
@@ -1074,6 +950,43 @@ impl QuantizedPolygons {
             .iter()
             .map(|&i| self.features[i].as_ref())
             .collect::<Option<_>>()?;
+        let encoded = |commands: Vec<u32>| {
+            if !commands.is_empty() {
+                EncodedFeatureGeometry::Parts(vec![(commands, GeomType::Polygon)])
+            } else if feats.iter().any(|f| f.has_coords) {
+                EncodedFeatureGeometry::Quantized
+            } else {
+                EncodedFeatureGeometry::Unencodable
+            }
+        };
+        use std::sync::atomic::Ordering::Relaxed;
+        // A group leads with its kept feature, which leads no other group
+        // in a pass.
+        let leader = group[0];
+        let lone = group.len() == 1;
+        let known = if lone && self.lone[leader].load(Relaxed) == 1 {
+            Some(None)
+        } else if !lone || self.lone[leader].load(Relaxed) == 2 {
+            let mut verdicts = self.verdicts.lock().expect("verdicts");
+            verdicts
+                .get_mut(&(leader as u32))
+                .filter(|v| {
+                    v.group
+                        .iter()
+                        .map(|&i| i as usize)
+                        .eq(group.iter().copied())
+                })
+                .map(|v| {
+                    v.pass = self.pass;
+                    v.repair.clone()
+                })
+        } else {
+            None
+        };
+        if let Some(Some(repair)) = &known {
+            repair.record(diagnostics);
+            return Some(encoded(encode_finalized(&repair.parts)));
+        }
         let globals: Vec<usize> = feats.iter().flat_map(|f| f.parts.clone()).collect();
         // Parts with different keys are never tested against each other, so
         // a group that mixed keys would leave their overlaps unresolved.
@@ -1102,14 +1015,41 @@ impl QuantizedPolygons {
         } else {
             polys
         };
-        let commands = encode_tile_polygons(polys, diagnostics);
-        Some(if !commands.is_empty() {
-            EncodedFeatureGeometry::Parts(vec![(commands, GeomType::Polygon)])
-        } else if feats.iter().any(|f| f.has_coords) {
-            EncodedFeatureGeometry::Quantized
-        } else {
-            EncodedFeatureGeometry::Unencodable
-        })
+        if known.is_some() {
+            // Valid when this group was last finalized.
+            return Some(encoded(encode_finalized(&polys)));
+        }
+        let (parts, repair) = match tile_polygon::finalize(polys) {
+            tile_polygon::Finalized::Valid(parts) => (parts, None),
+            tile_polygon::Finalized::Repaired(repair) => {
+                repair.record(diagnostics);
+                let repair = std::sync::Arc::new(repair);
+                (Vec::new(), Some(repair))
+            }
+        };
+        let commands = encode_finalized(repair.as_ref().map_or(&parts, |r| &r.parts));
+        if lone {
+            self.lone[leader].store(if repair.is_some() { 2 } else { 1 }, Relaxed);
+        }
+        // A merged feature's repair is not kept: it can be most of the tile,
+        // and the next pass usually merges it further. A lone feature's
+        // repair is small and stays until it is merged.
+        if lone == repair.is_some() {
+            self.verdicts.lock().expect("verdicts").insert(
+                leader as u32,
+                GroupVerdict {
+                    group: group.iter().map(|&i| i as u32).collect(),
+                    pass: self.pass,
+                    repair,
+                },
+            );
+        } else if !lone {
+            self.verdicts
+                .lock()
+                .expect("verdicts")
+                .remove(&(leader as u32));
+        }
+        Some(encoded(commands))
     }
 
     /// The interacting pairs among the parts `globals`, numbered by their
@@ -1211,7 +1151,12 @@ fn encode_tile_polygons(
     polys: Vec<Vec<TileRing>>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Vec<u32> {
-    let polys = tile_polygon::finalize_polygons(polys, diagnostics);
+    encode_finalized(&tile_polygon::finalize_polygons(polys, diagnostics))
+}
+
+/// [`encode_tile_polygons`] of parts that already passed
+/// [`tile_polygon::finalize_polygons`].
+fn encode_finalized(polys: &[Vec<TileRing>]) -> Vec<u32> {
     let total: usize = polys.iter().flatten().map(|r| 4 + r.len() * 2).sum();
     let mut out = Vec::with_capacity(total);
     let mut cursor = (0i32, 0i32);
@@ -1966,6 +1911,65 @@ mod tests {
             q.next_pass();
         }
         assert!(q.union_hits() > 0, "later passes reuse unions");
+    }
+
+    /// #758: a valve pass that encodes a group exactly as the pass before
+    /// did neither checks nor repairs it again: its verdict, repair and
+    /// diagnostics are replayed.
+    #[test]
+    fn quantized_polygons_do_not_recheck_an_unchanged_group() {
+        let bowtie: Polygon = polygon![
+            (x: 0.6, y: 0.1), (x: 0.8, y: 0.3), (x: 0.8, y: 0.1), (x: 0.6, y: 0.3)
+        ];
+        let geoms: Vec<Geometry> = vec![
+            square(0.1, 0.1, 0.1).into(), // 0 and 1 share an edge: unioned
+            square(0.2, 0.1, 0.1).into(),
+            square(0.5, 0.5, 0.1).into(),
+            bowtie.into(), // repaired
+            square(0.1, 0.6, 0.1).into(),
+            square(0.3, 0.6, 0.1).into(),
+        ];
+        let mut q = QuantizedPolygons::new(geoms.iter().map(|g| (g, 0)), &test_bounds(), 4096)
+            .expect("a few parts");
+        let groups = [vec![0, 1], vec![2], vec![3], vec![4, 5]];
+        let encode_all = |q: &QuantizedPolygons| {
+            let diagnostics = crate::diagnostics::Diagnostics::default();
+            tile_polygon::CHECKS.with(|c| c.set(0));
+            let got: Vec<_> = groups
+                .iter()
+                .map(|g| q.encode(g, &diagnostics).expect("polygonal"))
+                .collect();
+            (
+                got,
+                diagnostics.snapshot(),
+                tile_polygon::CHECKS.with(|c| c.get()),
+            )
+        };
+        let (first, reported, checks) = encode_all(&q);
+        assert!(checks > 0);
+        assert!(!reported.is_empty(), "the bowtie is repaired");
+        for (g, got) in groups.iter().zip(&first) {
+            assert_eq!(*got, merged_reference(&geoms, g), "group {g:?}");
+        }
+        // Kept: the merged groups found valid and the lone repair (the
+        // bowtie); a valid lone feature costs one byte, not an entry.
+        let mut kept: Vec<u32> = q.verdicts.lock().unwrap().keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [0, 3, 4]);
+        for pass in 1..3 {
+            q.next_pass();
+            let (again, reported_again, checks) = encode_all(&q);
+            assert_eq!(again, first, "pass {pass}");
+            assert_eq!(reported_again, reported, "pass {pass}");
+            assert_eq!(checks, 0, "pass {pass} checked an unchanged group");
+        }
+        // A changed group is checked afresh.
+        q.next_pass();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        tile_polygon::CHECKS.with(|c| c.set(0));
+        let merged = q.encode(&[2, 3], &diagnostics).expect("polygonal");
+        assert!(tile_polygon::CHECKS.with(|c| c.get()) > 0);
+        assert_eq!(merged, merged_reference(&geoms, &[2, 3]));
     }
 
     /// #758: a tile of heavily overlapping polygons has touching pairs in

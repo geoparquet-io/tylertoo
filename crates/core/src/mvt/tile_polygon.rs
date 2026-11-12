@@ -37,10 +37,8 @@
 //! crossing lobes regardless of direction or starting vertex, rather than
 //! choosing one arbitrarily as a raw positive-fill union would.
 
-use super::{
-    any_box_pair, edge_box, ring_area2, ring_box, segments_cross_or_overlap, segments_meet,
-    strip_box_pairs, TileRing,
-};
+use super::{edge_box, ring_area2, ring_box, segments_cross_or_overlap, segments_meet, TileRing};
+use crate::box_pairs::{any_box_pair, strip_box_pairs};
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay::{ContourDirection, IntOverlayOptions, Overlay, ShapeType};
 use i_overlay::core::overlay_rule::OverlayRule;
@@ -64,21 +62,61 @@ pub(crate) fn finalize_polygons(
     parts: Vec<Vec<TileRing>>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Vec<Vec<TileRing>> {
+    match finalize(parts) {
+        Finalized::Valid(parts) => parts,
+        Finalized::Repaired(repair) => {
+            repair.record(diagnostics);
+            repair.parts
+        }
+    }
+}
+
+/// What [`finalize_polygons`] decided for a feature, so a caller that meets
+/// the same parts again (the merge valve's next pass, #758) can replay the
+/// verdict instead of checking and repairing them again.
+pub(crate) enum Finalized {
+    /// Already valid: the parts go out as they came.
+    Valid(Vec<Vec<TileRing>>),
+    Repaired(Repair),
+}
+
+/// A feature [`finalize`] repaired: its new parts, and what it reports.
+pub(crate) struct Repair {
+    pub(crate) parts: Vec<Vec<TileRing>>,
+    defect: Defect,
+    /// The repaired parts still fail the check.
+    still_invalid: bool,
+}
+
+impl Repair {
+    /// The diagnostics [`finalize_polygons`] records for this feature.
+    pub(crate) fn record(&self, diagnostics: &crate::diagnostics::Diagnostics) {
+        diagnostics.record(Diagnostic::PolygonRepaired {
+            count: 1,
+            kind: self.defect,
+        });
+        if self.still_invalid {
+            diagnostics.record(Diagnostic::InvalidAfterEncode { count: 1 });
+        }
+    }
+}
+
+/// [`finalize_polygons`] without recording anything: the verdict, and the
+/// repair when there was one.
+pub(crate) fn finalize(parts: Vec<Vec<TileRing>>) -> Finalized {
     if parts.is_empty() {
-        return parts;
+        return Finalized::Valid(parts);
     }
     let Err(defect) = check_polygons(&parts) else {
-        return parts;
+        return Finalized::Valid(parts);
     };
-    diagnostics.record(Diagnostic::PolygonRepaired {
-        count: 1,
-        kind: defect,
-    });
     let (repaired, passed) = repair_and_check(&parts);
-    if !passed && check_polygons(&repaired).is_err() {
-        diagnostics.record(Diagnostic::InvalidAfterEncode { count: 1 });
-    }
-    repaired
+    let still_invalid = !passed && check_polygons(&repaired).is_err();
+    Finalized::Repaired(Repair {
+        parts: repaired,
+        defect,
+        still_invalid,
+    })
 }
 
 /// Rebuild `parts` as a valid MultiPolygon on the same integer grid: a
@@ -244,7 +282,7 @@ fn bind_holes(shells: &mut [Vec<TileRing>], holes: Vec<TileRing>) {
 #[cfg(test)]
 thread_local! {
     /// [`check_polygons`] calls on this thread.
-    static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Hole/shell pairs [`bind_holes`] considered on this thread.
     static BIND_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -878,9 +916,9 @@ mod tests {
     fn check_work_follows_meeting_pairs_not_shared_columns() {
         let parts = square_grid(20, 1000);
         let edges: u64 = 4 * 20 * 1000;
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         assert_eq!(check_polygons(&parts), Ok(()));
-        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
         assert!(
             compared < 16 * edges,
             "{compared} box comparisons for {edges} edges"
@@ -901,9 +939,9 @@ mod tests {
             })
             .collect();
         let edges: u64 = 4 * 20 * 1000;
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         assert_eq!(check_polygons(&parts), Ok(()));
-        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
         assert!(
             compared < 16 * edges,
             "{compared} box comparisons for {edges} edges"
@@ -929,12 +967,12 @@ mod tests {
             .iter()
             .flat_map(|p| p[0].windows(2).map(|w| edge_box(w[0], w[1])))
             .collect();
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         any_box_pair(&boxes, |_, _| false);
-        let swept = super::super::SWEEP_CANDIDATES.with(|c| c.get());
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        let swept = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         check_polygons(&parts).ok();
-        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
         assert!(
             compared <= 2 * swept,
             "{compared} comparisons, the x sweep makes {swept}"
@@ -960,12 +998,12 @@ mod tests {
             .iter()
             .flat_map(|p| p[0].windows(2).map(|w| edge_box(w[0], w[1])))
             .collect();
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         any_box_pair(&boxes, |_, _| false);
-        let swept = super::super::SWEEP_CANDIDATES.with(|c| c.get());
-        super::super::SWEEP_CANDIDATES.with(|c| c.set(0));
+        let swept = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
         check_polygons(&parts).ok();
-        let compared = super::super::SWEEP_CANDIDATES.with(|c| c.get());
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
         assert!(
             compared <= 2 * swept,
             "{compared} comparisons, the x sweep makes {swept}"

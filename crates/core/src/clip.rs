@@ -30,7 +30,7 @@
 //!
 //! See: <https://github.com/felt/tippecanoe> (clipping documentation)
 
-use geo::algorithm::sweep::Intersections;
+use geo::algorithm::line_intersection::line_intersection;
 use geo::{
     BoundingRect, Coord, Geometry, Line, LineString, MultiLineString, MultiPolygon, Point, Polygon,
     Rect,
@@ -112,52 +112,76 @@ fn has_structural_issues(poly: &Polygon<f64>, assume_simple: bool) -> bool {
 /// Check if a ring has self-intersecting edges (any two non-adjacent edges that
 /// *properly* cross).
 ///
-/// # Sweepline (issue #241)
+/// # Candidate pairs (issues #241, #832)
 ///
-/// This runs a Bentley–Ottmann sweep (`geo::algorithm::sweep::Intersections`) to
-/// enumerate candidate intersecting edge pairs in **O((n + m) log n)** — where
-/// `m` is the number of x-overlapping pairs — instead of the previous
-/// **O(n²)** pairwise scan. The sweep replaced a capped scan (issue #237 skipped
-/// rings above 2048 vertices to keep the export from stalling on continental
-/// admin rings); with the sweep the cap is gone, so even a genuinely
-/// self-intersecting giant ring is now detected and routed to `i_overlay` repair.
+/// Only edge pairs whose bounding boxes overlap are tested ([`any_edge_pair`]:
+/// a sort-by-x scan with a y check), instead of the O(n²) pairwise scan. This
+/// replaced geo's `sweep::Intersections` (#241), which ran the robust
+/// `line_intersection` on every x-overlapping pair, adjacent edges included;
+/// that was most of the export fill workers' time in partitioning mode (#832).
 ///
 /// ## Byte-identical decision
 ///
-/// The sweep only decides which pairs to *test*; the accept/reject decision is
-/// the unchanged [`edges_intersect_properly`] predicate applied to each
-/// candidate. A proper crossing meets at a point interior to both edges, so its
-/// two edges always overlap in x and are therefore always surfaced by the sweep
-/// — no proper crossing is missed. Adjacent edges (sharing a vertex) and
-/// collinear overlaps yield a zero cross-product and are rejected by the
-/// predicate exactly as before, so the boolean result matches the old scan on
-/// every real (simple) ring. Degenerate zero-length edges are dropped up front,
-/// matching the old scan's `continue`.
+/// A pair counts when it passes the [`edges_intersect_properly`] predicate and
+/// `line_intersection` finds a point, which is exactly the set the sweep
+/// yielded and then filtered: every pair that meets has overlapping boxes.
+/// Degenerate zero-length edges are skipped, matching the old scan's
+/// `continue`.
 fn has_self_intersecting_edges(coords: &[Coord<f64>]) -> bool {
     let n = coords.len();
     if n < 4 {
         return false;
     }
 
-    // Ring edges as sweep-line segments, dropping degenerate (zero-length)
-    // edges just as the previous pairwise scan skipped them.
-    let segments: Vec<Line<f64>> = coords
-        .windows(2)
-        .filter_map(|w| {
-            let (a, b) = (w[0], w[1]);
-            if (a.x - b.x).abs() < 1e-10 && (a.y - b.y).abs() < 1e-10 {
-                None
-            } else {
-                Some(Line::new(a, b))
-            }
-        })
-        .collect();
+    // Degenerate (zero-length) edges are skipped, as the old pairwise scan
+    // skipped them. The robust `line_intersection` check keeps the pair set
+    // the geo sweep used to test (#241), so the verdict is unchanged.
+    let degenerate =
+        |l: &Line<f64>| (l.start.x - l.end.x).abs() < 1e-10 && (l.start.y - l.end.y).abs() < 1e-10;
+    any_edge_pair(coords, |a, b| {
+        !degenerate(&a)
+            && !degenerate(&b)
+            && edges_intersect_properly(a.start, a.end, b.start, b.end)
+            && line_intersection(a, b).is_some()
+    })
+}
 
-    // The sweep yields every edge pair that overlaps in x and meets; re-apply
-    // the exact proper-crossing predicate to keep the result byte-identical to
-    // the old O(n²) scan (see the note above).
-    Intersections::from_iter(segments)
-        .any(|(a, b, _)| edges_intersect_properly(a.start, a.end, b.start, b.end))
+/// Whether `hit` holds for some pair of distinct ring edges (`windows(2)`)
+/// whose closed bounding boxes overlap.
+///
+/// Two closed segments that share a point have overlapping boxes, so for a
+/// `hit` that implies the edges meet this equals testing every pair, but the
+/// exact predicates run only on the few pairs that can meet. Shared by the
+/// export clip's crossing test and the overview's polygon validity check
+/// (`overview::simplify`). Allocation-free up to 32 edges; above that, the
+/// crate's one box-pair sweep ([`crate::box_pairs::any_box_pair`]).
+pub(crate) fn any_edge_pair(
+    ring: &[Coord<f64>],
+    mut hit: impl FnMut(Line<f64>, Line<f64>) -> bool,
+) -> bool {
+    let n = ring.len().saturating_sub(1);
+    let line = |i: usize| Line::new(ring[i], ring[i + 1]);
+    let bbox = |i: usize| {
+        let (a, b) = (ring[i], ring[i + 1]);
+        (a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y))
+    };
+    if n <= 32 {
+        for i in 0..n {
+            let a = bbox(i);
+            for j in i + 1..n {
+                let b = bbox(j);
+                if a.2 < b.0 || b.2 < a.0 || a.3 < b.1 || b.3 < a.1 {
+                    continue;
+                }
+                if hit(line(i), line(j)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    let boxes: Vec<_> = (0..n).map(bbox).collect();
+    crate::box_pairs::any_box_pair(&boxes, |i, j| hit(line(i), line(j)))
 }
 
 /// Check if two line segments intersect properly (crossing, not touching at endpoints).
@@ -1207,6 +1231,82 @@ mod tests {
         ring.push(ring[0]); // close
         assert!(ring.len() > 2_048);
         assert!(!has_self_intersecting_edges(&ring));
+    }
+
+    /// The crossing test pairs only edges whose boxes meet, through the
+    /// crate's one sweep: a simple 1,000-edge ring costs a few candidate
+    /// pairs per edge, not the ~500,000 of every pair (#832).
+    #[test]
+    fn self_intersection_pairs_only_edges_whose_boxes_meet() {
+        let mut ring: Vec<Coord<f64>> = (0..1000)
+            .map(|k| {
+                let t = f64::from(k) / 1000.0 * std::f64::consts::TAU;
+                Coord {
+                    x: t.cos(),
+                    y: t.sin(),
+                }
+            })
+            .collect();
+        ring.push(ring[0]);
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
+        assert!(!has_self_intersecting_edges(&ring));
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
+        assert!(
+            (1..=20_000).contains(&compared),
+            "{compared} box pairs compared"
+        );
+    }
+
+    /// The #241 implementation (geo's sweep, then the proper-crossing
+    /// predicate), kept as the oracle for the box-pruned scan.
+    fn sweep_self_intersecting(coords: &[Coord<f64>]) -> bool {
+        if coords.len() < 4 {
+            return false;
+        }
+        let segments: Vec<Line<f64>> = coords
+            .windows(2)
+            .filter(|w| (w[0].x - w[1].x).abs() >= 1e-10 || (w[0].y - w[1].y).abs() >= 1e-10)
+            .map(|w| Line::new(w[0], w[1]))
+            .collect();
+        geo::algorithm::sweep::Intersections::from_iter(segments)
+            .any(|(a, b, _)| edges_intersect_properly(a.start, a.end, b.start, b.end))
+    }
+
+    #[test]
+    fn self_intersection_matches_geo_sweep() {
+        // Small integer grid: collinear, repeated and touching edges abound;
+        // the fractional offset adds near-degenerate float crossings.
+        let mut seed = 0x5eed_u64;
+        let mut next = |m: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % m) as f64
+        };
+        let mut crossing = 0;
+        for case in 0..40_000 {
+            let n = next(80) as usize;
+            let scale = if case % 2 == 0 { 1.0 } else { 0.1 };
+            let mut ring: Vec<Coord<f64>> = (0..n)
+                .map(|_| Coord {
+                    x: next(15) * scale + 0.3,
+                    y: next(15) * scale,
+                })
+                .collect();
+            if let Some(&first) = ring.first() {
+                ring.push(first);
+            }
+            let want = sweep_self_intersecting(&ring);
+            crossing += usize::from(want);
+            assert_eq!(has_self_intersecting_edges(&ring), want, "{ring:?}");
+        }
+        for ring in [crossing_ring(64), crossing_ring(6_000)] {
+            assert_eq!(
+                has_self_intersecting_edges(&ring),
+                sweep_self_intersecting(&ring)
+            );
+        }
+        assert!(crossing > 1_000 && crossing < 39_000, "{crossing}");
     }
 
     #[test]
