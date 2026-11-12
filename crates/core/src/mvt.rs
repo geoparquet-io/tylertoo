@@ -854,17 +854,19 @@ pub(crate) struct QuantizedPolygons {
     /// those this pass used, and the previous pass's. Two generations, so
     /// a component no pass asks for again is dropped.
     unions: std::sync::Mutex<UnionCache>,
-    /// Per feature, the last verdict [`Self::encode`] reached for the group
-    /// it leads, so a pass that encodes the same group again neither checks
-    /// nor repairs it again. Kept for the pass that used it and the next,
-    /// as [`Self::unions`] is.
-    verdicts: Vec<std::sync::Mutex<Option<GroupVerdict>>>,
+    /// Per feature, the finalize verdict (#748) of the feature alone: 0 not
+    /// known, 1 valid, 2 repaired (the repair is in [`Self::verdicts`]). A
+    /// pass that encodes it alone again neither checks nor repairs it.
+    lone: Vec<std::sync::atomic::AtomicU8>,
+    /// By leading feature, the merged groups found valid and the lone
+    /// features' repairs, so the next pass replays them. Kept for the pass
+    /// that used them and the next, as [`Self::unions`] is.
+    verdicts: std::sync::Mutex<HashMap<u32, GroupVerdict>>,
     /// Passes started ([`Self::next_pass`]).
     pass: u32,
 }
 
-/// The finalize verdict of one group (#748), with the repaired parts only
-/// when it was repaired: a valid group's parts are rebuilt from the cache.
+/// A merged group found valid, or a lone feature's repair.
 struct GroupVerdict {
     group: Box<[u32]>,
     /// The last pass that used it.
@@ -1007,9 +1009,10 @@ impl QuantizedPolygons {
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
             unions: std::sync::Mutex::default(),
-            verdicts: (0..features_len)
-                .map(|_| std::sync::Mutex::new(None))
+            lone: (0..features_len)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
+            verdicts: std::sync::Mutex::default(),
             pass: 0,
         })
     }
@@ -1037,12 +1040,10 @@ impl QuantizedPolygons {
         let cache = self.unions.get_mut().expect("union cache");
         cache.previous = std::mem::take(&mut cache.current);
         let last = self.pass;
-        for slot in &mut self.verdicts {
-            let slot = slot.get_mut().expect("verdict slot");
-            if slot.as_ref().is_some_and(|v| v.pass != last) {
-                *slot = None;
-            }
-        }
+        self.verdicts
+            .get_mut()
+            .expect("verdicts")
+            .retain(|_, v| v.pass == last);
         self.pass += 1;
     }
 
@@ -1112,12 +1113,17 @@ impl QuantizedPolygons {
                 EncodedFeatureGeometry::Unencodable
             }
         };
+        use std::sync::atomic::Ordering::Relaxed;
         // A group leads with its kept feature, which leads no other group
-        // in a pass, so its slot is never contended.
-        let slot = &self.verdicts[group[0]];
-        let known = {
-            let mut slot = slot.lock().expect("verdict slot");
-            slot.as_mut()
+        // in a pass.
+        let leader = group[0];
+        let lone = group.len() == 1;
+        let known = if lone && self.lone[leader].load(Relaxed) == 1 {
+            Some(None)
+        } else if !lone || self.lone[leader].load(Relaxed) == 2 {
+            let mut verdicts = self.verdicts.lock().expect("verdicts");
+            verdicts
+                .get_mut(&(leader as u32))
                 .filter(|v| {
                     v.group
                         .iter()
@@ -1128,6 +1134,8 @@ impl QuantizedPolygons {
                     v.pass = self.pass;
                     v.repair.clone()
                 })
+        } else {
+            None
         };
         if let Some(Some(repair)) = &known {
             repair.record(diagnostics);
@@ -1174,15 +1182,27 @@ impl QuantizedPolygons {
             }
         };
         let commands = encode_finalized(repair.as_ref().map_or(&parts, |r| &r.parts));
-        // Keep a merged feature's repair no longer than this encode: it can
-        // be most of the tile, and the next pass usually merges it further.
-        // A lone feature's repair is small and stays until it is merged.
-        *slot.lock().expect("verdict slot") =
-            (repair.is_none() || group.len() == 1).then(|| GroupVerdict {
-                group: group.iter().map(|&i| i as u32).collect(),
-                pass: self.pass,
-                repair,
-            });
+        if lone {
+            self.lone[leader].store(if repair.is_some() { 2 } else { 1 }, Relaxed);
+        }
+        // A merged feature's repair is not kept: it can be most of the tile,
+        // and the next pass usually merges it further. A lone feature's
+        // repair is small and stays until it is merged.
+        if lone == repair.is_some() {
+            self.verdicts.lock().expect("verdicts").insert(
+                leader as u32,
+                GroupVerdict {
+                    group: group.iter().map(|&i| i as u32).collect(),
+                    pass: self.pass,
+                    repair,
+                },
+            );
+        } else if !lone {
+            self.verdicts
+                .lock()
+                .expect("verdicts")
+                .remove(&(leader as u32));
+        }
         Some(encoded(commands))
     }
 
@@ -2085,6 +2105,11 @@ mod tests {
         for (g, got) in groups.iter().zip(&first) {
             assert_eq!(*got, merged_reference(&geoms, g), "group {g:?}");
         }
+        // Kept: the merged groups found valid and the lone repair (the
+        // bowtie); a valid lone feature costs one byte, not an entry.
+        let mut kept: Vec<u32> = q.verdicts.lock().unwrap().keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [0, 3, 4]);
         for pass in 1..3 {
             q.next_pass();
             let (again, reported_again, checks) = encode_all(&q);
