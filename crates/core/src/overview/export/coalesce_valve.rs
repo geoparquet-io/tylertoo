@@ -200,7 +200,13 @@ impl RowGapCursor {
     /// unless it `measure`s gaps ([`Self::measuring`]).
     pub(super) fn rects(measure: bool, geoms: &[Geometry<f64>]) -> Vec<Option<Rect<f64>>> {
         if measure {
-            geoms.par_iter().map(|g| g.bounding_rect()).collect()
+            super::collect_chunks(geoms.len())
+                .flat_map_iter(|rows| {
+                    #[cfg(test)]
+                    crate::valve_counter::note(|c| c.gap_tasks += 1);
+                    geoms[rows].iter().map(|g| g.bounding_rect())
+                })
+                .collect()
         } else {
             vec![None; geoms.len()]
         }
@@ -214,9 +220,14 @@ impl RowGapCursor {
         }
         #[cfg(test)]
         crate::valve_counter::note(|c| c.gap_rows += rects.len());
-        let centres: Vec<Option<(f64, f64)>> = rects
-            .par_iter()
-            .map(|r| r.as_ref().map(rect_center))
+        // Per row chunk, not per row: a row's work is a few sums, which a
+        // Rayon task per row costs several times over.
+        let centres: Vec<Option<(f64, f64)>> = super::collect_chunks(rects.len())
+            .flat_map_iter(|rows| {
+                #[cfg(test)]
+                crate::valve_counter::note(|c| c.gap_tasks += 1);
+                rects[rows].iter().map(|r| r.as_ref().map(rect_center))
+            })
             .collect();
         // Each row's band and predecessor centre, in read order.
         let mut last = self.prev;
@@ -235,12 +246,17 @@ impl RowGapCursor {
             })
             .collect();
         self.prev = last;
-        rects
-            .par_iter()
-            .zip(walk)
-            .map(|(rect, (pred, band))| match (rect, pred) {
-                (Some(rect), Some(p)) => (gap_to_rect(p, rect), band),
-                _ => (GAP_NONE, band),
+        super::collect_chunks(rects.len())
+            .flat_map_iter(|rows| {
+                #[cfg(test)]
+                crate::valve_counter::note(|c| c.gap_tasks += 1);
+                rects[rows.clone()]
+                    .iter()
+                    .zip(&walk[rows])
+                    .map(|(rect, &(pred, band))| match (rect, pred) {
+                        (Some(rect), Some(p)) => (gap_to_rect(p, rect), band),
+                        _ => (GAP_NONE, band),
+                    })
             })
             .collect()
     }
@@ -673,6 +689,36 @@ mod tests {
             SERIAL_GAPS.with(std::cell::Cell::get),
             0,
             "gaps measured on the calling thread"
+        );
+    }
+
+    /// A batch's gaps are tiny per-row sums: as one Rayon task per row, the
+    /// splitting and stealing cost the export several times the gaps
+    /// themselves (moldova: 4.8% of export cycles in Rayon frames against
+    /// 1.5% of gap work). Each of the three passes runs as the batch's
+    /// collect chunks instead, one per pool thread.
+    #[test]
+    fn batch_gaps_run_as_collect_chunks_not_per_row_tasks() {
+        let geoms: Vec<Geometry<f64>> = (0..1000)
+            .map(|i| {
+                let x = f64::from(i % 97) * 0.37 - 170.0;
+                Geometry::Polygon(polygon![(x: x, y: 0.0), (x: x + 0.2, y: 0.0), (x: x, y: 0.3)])
+            })
+            .collect();
+        let (gaps, counts) = crate::valve_counter::measure(|| {
+            let chunks = geoms
+                .len()
+                .div_ceil(super::super::collect_chunk_rows(geoms.len()));
+            (RowGapCursor::new(vec![(0, 1000)]).batch(&geoms), chunks)
+        });
+        let (gaps, chunks) = gaps;
+        assert_eq!(gaps.len(), 1000);
+        assert_eq!(chunks, 2, "one chunk per thread of the 2-thread pool");
+        assert_eq!(counts.gap_rows, 1000);
+        assert_eq!(
+            counts.gap_tasks,
+            3 * chunks,
+            "rects, centres and gaps, per chunk"
         );
     }
 
