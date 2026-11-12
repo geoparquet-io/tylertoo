@@ -1674,6 +1674,53 @@ pub struct StreamingPmtilesWriter {
     /// produce such a root in practice, and the fallback must still be
     /// covered.
     force_tail_root_overflow: bool,
+    /// The tail layout's background writeback ([`Writeback`]); `None` for
+    /// the spooled layout and once stopped.
+    writeback: Option<Writeback>,
+}
+
+/// Spool bytes appended between two background syncs of a tail-layout
+/// archive.
+const WRITEBACK_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A thread that `fdatasync`s the tail-layout spool while tiles still append,
+/// so the kernel writes the archive during export instead of all at once in
+/// `finalize`, whose sync then finds little dirty data. On `wideprops` the
+/// final sync was 1.25 s of 6.1 s. Durability is unchanged:
+/// `write_tail_archive` still syncs the tail and then the prefix, after this
+/// thread stopped. A sync on the appending thread instead
+/// (`sync_file_range`) blocked it in block-layer throttling, 0.2-1.2 s of
+/// serial time; this thread costs the appender one `try_send` per chunk.
+struct Writeback {
+    /// One pending wake-up at most: a full channel means a sync is due anyway.
+    wake: std::sync::mpsc::SyncSender<()>,
+    /// Returns the number of syncs, or the first sync error.
+    thread: std::thread::JoinHandle<std::io::Result<u64>>,
+    /// Spool bytes on disk at the last wake-up.
+    woken_at: u64,
+}
+
+impl Writeback {
+    fn start(file: File) -> std::io::Result<Self> {
+        let (wake, woken) = std::sync::mpsc::sync_channel::<()>(1);
+        let thread = std::thread::Builder::new()
+            .name("pmtiles-writeback".into())
+            .spawn(move || {
+                let mut syncs = 0;
+                while woken.recv().is_ok() {
+                    // Returned, not dropped: an fd that saw a writeback error
+                    // consumes it, so the final sync might not report it.
+                    file.sync_data()?;
+                    syncs += 1;
+                }
+                Ok(syncs)
+            })?;
+        Ok(Self {
+            wake,
+            thread,
+            woken_at: 0,
+        })
+    }
 }
 
 /// Where a [`StreamingPmtilesWriter`]'s tile spool lives, and therefore what
@@ -1887,16 +1934,19 @@ impl StreamingPmtilesWriter {
         // zero-filled and the file never contains a sparse hole whose
         // contents depend on the filesystem.
         file.write_all(&vec![0u8; TAIL_LAYOUT_PREFIX_BYTES as usize])?;
+        let writeback = Writeback::start(file.try_clone()?)?;
         let temp_file = BufWriter::with_capacity(64 * 1024, file);
 
-        Ok(Self::from_spool(
+        let mut writer = Self::from_spool(
             temp_file,
             partial_path,
             compression,
             SpoolLayout::Tail {
                 output_path: output_path.to_path_buf(),
             },
-        ))
+        );
+        writer.writeback = Some(writeback);
+        Ok(writer)
     }
 
     fn from_spool(
@@ -1939,7 +1989,34 @@ impl StreamingPmtilesWriter {
             tail_fell_back: false,
             tail_dirty: true,
             force_tail_root_overflow: false,
+            writeback: None,
         }
+    }
+
+    /// Wake the [`Writeback`] thread once another [`WRITEBACK_CHUNK_BYTES`]
+    /// of tile data has left the spool's buffer for the file.
+    fn request_writeback(&mut self) {
+        let (Some(writeback), Some(spool)) = (&mut self.writeback, &self.temp_file) else {
+            return;
+        };
+        let on_disk = self.current_offset - spool.buffer().len() as u64;
+        if on_disk - writeback.woken_at >= WRITEBACK_CHUNK_BYTES {
+            writeback.woken_at = on_disk;
+            // Full: a sync is already due and will cover these bytes too.
+            let _ = writeback.wake.try_send(());
+        }
+    }
+
+    /// Stop the [`Writeback`] thread after the sync it may be running, and
+    /// return how many syncs it ran, or the first one's error.
+    fn stop_writeback(&mut self) -> std::io::Result<u64> {
+        let Some(Writeback { wake, thread, .. }) = self.writeback.take() else {
+            return Ok(0);
+        };
+        drop(wake);
+        thread
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("writeback thread panicked")))
     }
 
     /// Where a mid-run salvage archive can be found, for a writer created with
@@ -2355,6 +2432,7 @@ impl StreamingPmtilesWriter {
         self.current_offset += compressed_len as u64;
         self.stats.unique_tiles += 1;
         self.stats.bytes_written += compressed_len as u64;
+        self.request_writeback();
 
         Ok(())
     }
@@ -2459,6 +2537,8 @@ impl StreamingPmtilesWriter {
     /// Returns an error if assembling or writing the archive fails, or if
     /// `output_path` differs from the one a tail-layout writer was created for.
     pub fn finalize(mut self, output_path: &Path) -> Result<StreamingWriteStats> {
+        self.stop_writeback()
+            .map_err(|e| WriteError::io("background writeback", e))?;
         // Assemble the complete archive (byte-identical to the last checkpoint,
         // if any). This flushes the temp buffer in place but leaves the handle
         // open so we can close it deterministically below.
@@ -2990,6 +3070,8 @@ impl StreamingPmtilesWriter {
 
 impl Drop for StreamingPmtilesWriter {
     fn drop(&mut self) {
+        // Not left syncing a file this drop may remove.
+        let _ = self.stop_writeback();
         if self.finalized {
             return;
         }
@@ -3255,6 +3337,29 @@ mod tests {
         );
         // And the spool must be gone: `<output>.partial` is renamed into place.
         assert!(!with_ckpt.with_extension("pmtiles.partial").exists());
+    }
+
+    /// The tail layout hands appended tile bytes to background writeback as
+    /// they reach the file, so `finalize`'s `fdatasync` no longer waits on
+    /// the whole archive's dirty pages (0.47 s of a 4 s `lines` run). Pinned
+    /// by the count of background syncs: one per [`WRITEBACK_CHUNK_BYTES`]
+    /// flushed, coalesced while one is running, so at least one here.
+    #[test]
+    fn tail_layout_writes_back_while_tiles_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("wb.pmtiles");
+        let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::None).unwrap();
+        let tile = 64 * 1024;
+        let tiles = 3 * WRITEBACK_CHUNK_BYTES / tile;
+        for i in 0..tiles as u32 {
+            // Distinct bodies, so every tile is appended, none deduplicated.
+            let mut body = vec![0u8; tile as usize];
+            body[..4].copy_from_slice(&i.to_le_bytes());
+            w.add_tile(14, i, 0, &body).unwrap();
+        }
+        assert!(w.stop_writeback().unwrap() >= 1, "no background sync ran");
+        w.finalize(&out).unwrap();
+        assert!(fs::metadata(&out).unwrap().len() > 3 * WRITEBACK_CHUNK_BYTES);
     }
 
     /// The mid-run salvage artifact is `<output>.partial`, and it must be a

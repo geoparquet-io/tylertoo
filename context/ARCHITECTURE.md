@@ -1397,6 +1397,19 @@ magic before writing a byte, which is what keeps the salvage file either valid
 or *detectably* invalid rather than valid-looking and wrong (see the checkpoint
 section above). One `open`+`write` per checkpoint interval, not per tile.
 
+**Background writeback.** A tail-layout writer also runs one thread that
+`fdatasync`s `<output>.partial` each time another 8 MiB of tiles reaches the
+file, so the kernel writes the archive while export still computes. Without
+it, `finalize`'s sync waited on the whole archive's dirty pages at the end:
+0.47 s of a 4 s `lines` run, 1.25 s of 6.1 s on `wideprops`, 2-9 s on `brmt`.
+With it that sync takes about 0.01-0.1 s. Durability is unchanged: the
+thread stops before assembly, and the tail sync and then the prefix sync
+still run in that order. The thread returns its first sync error to
+`finalize`, because a writeback error reported to its descriptor might not
+reach the final sync's. A `sync_file_range` on the appending thread was
+measured too: it blocked that serial thread in block-layer throttling for
+0.2-1.2 s.
+
 Export's PMTiles v3 writer streams tile data to a temp file, builds the
 directory incrementally, and deduplicates tiles by XXH3 hash → file offset.
 A hash hit is a candidate only (#531). The writer compares the candidate's

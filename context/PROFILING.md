@@ -876,7 +876,9 @@ missing export line after a failed run is expected, not a profiling bug.
       "fill": 1.92,                // partitioning single-read fill; 0.0 in
                                    // duplicating mode (see below)
       "levels": 2.87,              // every level's wave loop + checkpoints
-      "finalize": 0.08,            // writer.finalize()
+      "finalize": 0.08,            // writer.finalize(): mostly the archive's
+                                   // last fdatasync, of what background
+                                   // writeback has not yet written
       "total": 4.95                // the whole export
     },
     "stage_secs": {                // CORE-SECONDS (see the callout below)
