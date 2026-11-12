@@ -132,7 +132,6 @@ pub(super) mod cost_probe {
         pub(crate) seed_serial_scans: usize,
         pub(crate) map_peak: usize,
         pub(crate) live_peak: usize,
-        pub(crate) box_comparisons: usize,
         pub(crate) host_entries: usize,
         pub(crate) host_occupied: usize,
         pub(crate) large_host_visits: usize,
@@ -492,7 +491,13 @@ fn union_within_workspace(
         .saturating_add(n.saturating_mul(256));
     let mut remaining = shapes.iter().map(shape_payload_bytes).sum::<usize>();
     require_fill_bytes(fixed.saturating_add(remaining), budget)?;
-    let mut boxes: Vec<[f64; 4]> = shapes.iter().map(bbox).collect();
+    let mut boxes: Vec<(f64, f64, f64, f64)> = shapes
+        .iter()
+        .map(|s| {
+            let [x0, y0, x1, y1] = bbox(s);
+            (x0, y0, x1, y1)
+        })
+        .collect();
     // If all x intervals overlap, the x sweep compares every pair. A y
     // sweep can only reduce that work. Otherwise keep the original axis;
     // an average-span heuristic increased comparisons on Moldova.
@@ -500,19 +505,15 @@ fn union_within_workspace(
     let shared_x = boxes
         .iter()
         .fold([f64::NEG_INFINITY, f64::INFINITY], |a, b| {
-            [a[0].max(b[0]), a[1].min(b[2])]
+            [a[0].max(b.0), a[1].min(b.2)]
         });
     if shared_x[0] <= shared_x[1] {
-        // Transpose only the broad-phase boxes. Keep the hot sweep's fixed
-        // indexes instead of paying dynamic axis lookup for every pair.
+        // Transpose only the broad-phase boxes, so the sweep runs on y.
         // The square tile's inside test is symmetric in x and y too.
         for b in &mut boxes {
-            b.swap(0, 1);
-            b.swap(2, 3);
+            *b = (b.1, b.0, b.3, b.2);
         }
     }
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_unstable_by(|&a, &b| boxes[a][0].total_cmp(&boxes[b][0]).then(a.cmp(&b)));
     let mut root: Vec<usize> = (0..n).collect();
     fn find(root: &mut [usize], mut i: usize) -> usize {
         while root[i] != i {
@@ -521,39 +522,25 @@ fn union_within_workspace(
         }
         i
     }
-    // Sweep on the chosen axis; touching boxes join one group.
-    let mut active: Vec<usize> = Vec::new();
-    #[cfg(test)]
-    let mut box_comparisons = 0usize;
-    for &i in &order {
-        let b = boxes[i];
-        active.retain(|&j| boxes[j][2] >= b[0]);
-        #[cfg(test)]
-        {
-            box_comparisons += active.len();
+    // Touching boxes join one group; components do not depend on the order
+    // the pairs are visited in.
+    crate::box_pairs::any_box_pair(&boxes, |i, j| {
+        let (ri, rj) = (find(&mut root, i), find(&mut root, j));
+        if ri != rj {
+            root[ri.max(rj)] = ri.min(rj);
         }
-        for &j in &active {
-            let c = boxes[j];
-            if c[1] <= b[3] && b[1] <= c[3] {
-                let (ri, rj) = (find(&mut root, i), find(&mut root, j));
-                if ri != rj {
-                    root[ri.max(rj)] = ri.min(rj);
-                }
-            }
-        }
-        active.push(i);
-    }
+        false
+    });
 
-    #[cfg(test)]
-    cost_probe::update(|c| c.box_comparisons += box_comparisons);
     // Groups in order of their lowest member, so the output is deterministic.
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n];
     for i in 0..n {
         let r = find(&mut root, i);
         groups[r].push(i);
     }
-    let inside =
-        |b: [f64; 4]| b[0] >= 0.0 && b[1] >= 0.0 && b[2] <= FILL_EXTENT && b[3] <= FILL_EXTENT;
+    let inside = |b: (f64, f64, f64, f64)| {
+        b.0 >= 0.0 && b.1 >= 0.0 && b.2 <= FILL_EXTENT && b.3 <= FILL_EXTENT
+    };
     let mut slots: Vec<Option<Shape>> = shapes.into_iter().map(Some).collect();
     let mut out = Vec::new();
     let mut output_bytes = 0usize;
@@ -3031,13 +3018,14 @@ pub(super) mod tests {
                 ]]
             })
             .collect();
-        cost_probe::take();
+        use crate::box_pairs::SWEEP_CANDIDATES;
+        SWEEP_CANDIDATES.with(|c| c.set(0));
         let result = union_touching(strips.clone());
-        let counts = cost_probe::take();
+        let candidates = SWEEP_CANDIDATES.with(std::cell::Cell::get);
         assert_eq!(result, strips, "disjoint strips retain their exact order");
         assert!(
-            counts.box_comparisons <= n * 32,
-            "wide-strip broad phase exceeded 32 comparisons per shape: {counts:?}"
+            candidates <= n as u64 * 32,
+            "wide-strip broad phase exceeded 32 comparisons per shape: {candidates}"
         );
     }
 

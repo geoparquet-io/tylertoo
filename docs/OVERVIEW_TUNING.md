@@ -707,8 +707,10 @@ reproduce non-cascaded output byte-for-byte.
 
 A simplification candidate with more than 2,048
 total vertices skips the exact validity check and counts as valid. The check
-is O(V²) in ring size, and on continental-scale rings at fine GSDs it stalled
-conversion for tens of minutes per feature. A candidate that large means RDP
+once compared every edge pair, and on continental-scale rings at fine GSDs it
+stalled conversion for tens of minutes per feature. It now tests only edge
+pairs whose bounding boxes meet, and the cap stays only to keep output the
+same. A candidate that large means RDP
 removed few vertices from already-valid input, the case least likely to
 self-intersect. The overviews spec does not require valid geometry (§2).
 Candidates at or below the cap get the full check and repair. tylertoo logs a
@@ -2049,7 +2051,9 @@ processed at once, and how many row groups the writer encodes at once.
   which the allowance can only shrink: at most 4 readers, each at most
   16 batches deep. Row-group encodes start with at most 4. The buffered drain
   can add encodes using released batch memory, limited by headroom below
-  the prior RSS peak and the thread count. Remote staging holds at most
+  the prior RSS peak and the thread count. The drain can also decode up to 4 spilled batches at once, funded by
+  `MemoryBudget::drain_widths` from existing grants: the encode grant above
+  its floor, then the finished read's. Remote staging holds at most
   256 MiB of requests in flight, or
   `TYLERTOO_STAGING_MEM_BUDGET_BYTES` when set. The compute window takes
   what `--in-flight-batches` asks for, within the allowance. Pass-1 tables
@@ -2116,10 +2120,15 @@ with `--no-default-features` uses the system allocator.
 `speed` keep raw IPC, including an `auto` downgrade to disk.
 `pass2.sink.spill_codec` records the selected codec.
 
-`tiles` writes its temporary intermediate overview with LZ4, since the
-export reads it once and then removes it. LZ4 takes less CPU to encode and
-decode than ZSTD, and the file is about 1.5 times larger. A
-`--keep-overview` file and the `overview` command's output use ZSTD.
+`--temp-compression lz4|zstd` (Python `temp_compression`) sets the codec
+of the temporary intermediate overview `tiles` writes. The default `lz4`
+suits a file the export reads once and then removes. Against `zstd` it
+takes 5–7% less user CPU and 3–8% less wall on Moldova and Overture
+segments, for a file 1.4–1.6 times larger: 2.0 GB grows to 3.1 GB on FTW
+Brazil MT. Pick `zstd` on a host short of temp disk or on a slow disk.
+The tiles are the same with either codec. A `--keep-overview` file and the
+`overview` command's output always use ZSTD, so the flag has no effect
+there.
 
 ### Automatic memory estimate
 

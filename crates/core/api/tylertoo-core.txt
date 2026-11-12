@@ -1498,6 +1498,29 @@ impl core::marker::Unpin for tylertoo_core::OutputKind
 impl core::marker::UnsafeUnpin for tylertoo_core::OutputKind
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::OutputKind
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::OutputKind
+pub enum tylertoo_core::OverviewCodec
+pub tylertoo_core::OverviewCodec::Lz4
+pub tylertoo_core::OverviewCodec::Zstd
+impl core::clone::Clone for tylertoo_core::OverviewCodec
+pub fn tylertoo_core::OverviewCodec::clone(&self) -> tylertoo_core::OverviewCodec
+impl core::cmp::Eq for tylertoo_core::OverviewCodec
+impl core::cmp::PartialEq for tylertoo_core::OverviewCodec
+pub fn tylertoo_core::OverviewCodec::eq(&self, &tylertoo_core::OverviewCodec) -> bool
+impl core::fmt::Debug for tylertoo_core::OverviewCodec
+pub fn tylertoo_core::OverviewCodec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::OverviewCodec
+impl core::marker::StructuralPartialEq for tylertoo_core::OverviewCodec
+impl serde_core::ser::Serialize for tylertoo_core::OverviewCodec
+pub fn tylertoo_core::OverviewCodec::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::OverviewCodec
+pub fn tylertoo_core::OverviewCodec::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::OverviewCodec
+impl core::marker::Send for tylertoo_core::OverviewCodec
+impl core::marker::Sync for tylertoo_core::OverviewCodec
+impl core::marker::Unpin for tylertoo_core::OverviewCodec
+impl core::marker::UnsafeUnpin for tylertoo_core::OverviewCodec
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::OverviewCodec
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::OverviewCodec
 #[non_exhaustive] pub enum tylertoo_core::OverviewValidationError
 #[non_exhaustive] pub tylertoo_core::OverviewValidationError::CanonicalLevelMismatch
 pub tylertoo_core::OverviewValidationError::CanonicalLevelMismatch::actual: core::option::Option<i64>
@@ -3355,6 +3378,7 @@ pub tylertoo_core::TilesOptions::keep_overview: core::option::Option<std::path::
 pub tylertoo_core::TilesOptions::layer_column: core::option::Option<alloc::string::String>
 pub tylertoo_core::TilesOptions::layer_name: core::option::Option<alloc::string::String>
 pub tylertoo_core::TilesOptions::shard: core::option::Option<tylertoo_core::TilesShard>
+pub tylertoo_core::TilesOptions::temp_compression: tylertoo_core::OverviewCodec
 impl tylertoo_core::TilesOptions
 pub fn tylertoo_core::TilesOptions::with_cell_bands(self, alloc::vec::Vec<tylertoo_core::CellBand>) -> Self
 pub fn tylertoo_core::TilesOptions::with_convert(self, tylertoo_core::ConvertOptions) -> Self
@@ -3363,6 +3387,7 @@ pub fn tylertoo_core::TilesOptions::with_keep_overview(self, core::option::Optio
 pub fn tylertoo_core::TilesOptions::with_layer_column(self, core::option::Option<alloc::string::String>) -> Self
 pub fn tylertoo_core::TilesOptions::with_layer_name(self, core::option::Option<alloc::string::String>) -> Self
 pub fn tylertoo_core::TilesOptions::with_shard(self, core::option::Option<tylertoo_core::TilesShard>) -> Self
+pub fn tylertoo_core::TilesOptions::with_temp_compression(self, tylertoo_core::OverviewCodec) -> Self
 impl core::clone::Clone for tylertoo_core::TilesOptions
 pub fn tylertoo_core::TilesOptions::clone(&self) -> tylertoo_core::TilesOptions
 impl core::default::Default for tylertoo_core::TilesOptions

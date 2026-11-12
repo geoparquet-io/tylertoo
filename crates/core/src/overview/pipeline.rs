@@ -1829,7 +1829,8 @@ pub(super) fn run_pass2_buffered(
     );
     // One capped decode pool for all levels: caller-pool windows lost the
     // measured gain (BRMT auto 2.94 s vs 2.17 s) and retained 427 MiB more RSS.
-    let decode_pool = crate::decode::decode_pool(decode_width).unwrap_or_else(|_| {
+    let decode_pool = crate::decode::decode_pool(decode_width).unwrap_or_else(|e| {
+        log::warn!("pass 2 drain: spill decode pool unavailable ({e}); decoding on one thread");
         decode_width = 1;
         None
     });
@@ -1956,9 +1957,7 @@ fn drain_sink(
                 temp: _temp,
                 offsets,
             } = state.into_indexed_reader(timers)?;
-            let indexed = cfg!(any(unix, windows))
-                && decode_width > 1
-                && offsets.as_ref().is_some_and(|o| o.len() > 2);
+            let indexed = decode_width > 1 && offsets.as_ref().is_some_and(|o| o.len() > 2);
             // A single output queue, the writer's batch and the admitted
             // decoding jobs, charged to existing grants before widening encodes.
             let depth = if indexed { 1 } else { SPILL_QUEUE_DEPTH };
@@ -1970,13 +1969,10 @@ fn drain_sink(
                     move |tx: &Sender<Result<RecordBatch, ConvertError>>| {
                         if let Some(offsets) = offsets.filter(|_| indexed) {
                             let reader = Arc::new(IpcIndexedReader::try_new(file, offsets[0])?);
-                            for (wi, ends) in offsets[1..].chunks(decode_width).enumerate() {
-                                let first = wi * decode_width;
-                                let ranges: Vec<_> = ends
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, &end)| (offsets[first + i], end))
-                                    .collect();
+                            let batches: Vec<_> =
+                                offsets.windows(2).map(|w| (w[0], w[1])).collect();
+                            for window in batches.chunks(decode_width) {
+                                let ranges = window.to_vec();
                                 let reader = Arc::clone(&reader);
                                 #[cfg(test)]
                                 let path = _temp.path().to_owned();

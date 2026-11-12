@@ -62,7 +62,7 @@ pub const DEFAULT_EXTENT: u32 = 4096;
 ///
 /// # `assume_simple` (issue #237, RC3)
 ///
-/// The self-intersecting-edges test (an O((n + m) log n) sweep, issue #241) runs
+/// The self-intersecting-edges test (the box-pair sweep, issues #241, #832) runs
 /// on every clip. When the caller has already established that the source
 /// feature's rings are simple (no self-intersections) — computed **once per
 /// feature** via [`geometry_is_simple`] — pass `assume_simple = true` to skip
@@ -221,8 +221,8 @@ fn geometry_has_structural_issues(geom: &Geometry<f64>, assume_simple: bool) -> 
 /// Whether a geometry's polygon exterior rings are **simple** (free of
 /// self-intersecting edges).
 ///
-/// This runs the same self-intersection sweep as `has_structural_issues` (an
-/// O((n + m) log n) Bentley–Ottmann pass, issue #241), but is meant to be called
+/// This runs the same self-intersection sweep as `has_structural_issues` (the
+/// box-pair sweep, issues #241, #832), but is meant to be called
 /// **once per feature** rather than once per clip. Threading the result into the
 /// clip pipeline as `assume_simple` lets the hot path skip that check on every
 /// tile the feature touches (issue #237, RC3): a continental admin polygon

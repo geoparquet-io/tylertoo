@@ -167,7 +167,7 @@ pub use overview::{
     properties::{PropertySelection, PropertySelectionError},
     reader::ReaderError,
     simplify::{CollapseMode, Representation, SimplifyOptions},
-    writer::{RowGroupSizePolicy, WriterError},
+    writer::{OverviewCodec, RowGroupSizePolicy, WriterError},
 };
 // Export: overview GeoParquet -> PMTiles.
 pub use overview::export::{
