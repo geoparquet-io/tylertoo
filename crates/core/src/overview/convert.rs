@@ -911,13 +911,13 @@ pub struct ConvertOptions {
     #[serde(skip)]
     #[cfg_attr(feature = "cli", arg(skip = Self::default().cell_bands))]
     pub cell_bands: Option<String>,
-    /// The output is the `tiles` facade's temp intermediate, which its
-    /// export reads once and removes, so it is written with a cheaper codec
-    /// ([`tylertoo_io::OverviewWriteOptions::scratch`]). Set only by the
-    /// facade; a kept overview is unaffected. Default `false`.
+    /// The overview's codec. The `tiles` facade sets
+    /// [`TilesOptions::temp_compression`](crate::TilesOptions::temp_compression)
+    /// here for its temp intermediate; a kept overview stays ZSTD. Default
+    /// [`OverviewCodec::Zstd`](crate::OverviewCodec::Zstd).
     #[serde(skip)]
-    #[cfg_attr(feature = "cli", arg(skip = false))]
-    pub(crate) scratch_overview: bool,
+    #[cfg_attr(feature = "cli", arg(skip = crate::OverviewCodec::Zstd))]
+    pub(crate) overview_codec: crate::OverviewCodec,
     /// Materialize only the levels at or coarser than this zoom (#541): the
     /// **coarse job**'s half of a sharded build, on the convert side.
     ///
@@ -1006,7 +1006,7 @@ with_setters!(ConvertOptions {
     with_cell_bands => cell_bands: Option<String>,
     with_zoom_ceiling => zoom_ceiling: Option<u8>,
 } internal {
-    scratch_overview,
+    overview_codec,
 });
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -1664,7 +1664,7 @@ impl Default for ConvertOptions {
             shard: None,
             shard_plan_digest: None,
             cell_bands: None,
-            scratch_overview: false,
+            overview_codec: crate::OverviewCodec::Zstd,
             zoom_ceiling: None,
         }
     }

@@ -36,7 +36,7 @@ use super::convert::{
 use super::export::{
     export_pmtiles, write_empty_archive, ExportError, ExportOptions, ExportReport, FeatureOrder,
 };
-use super::writer::WriterError;
+use super::writer::{OverviewCodec, WriterError};
 use crate::error::Classify;
 use crate::input_set::ConvertSource;
 use crate::shard::{ShardRole, TileRange};
@@ -317,6 +317,14 @@ pub struct TilesOptions {
     #[cfg_attr(feature = "cli", arg(long, value_name = "PATH"))]
     #[cfg_attr(feature = "cli", arg(help = "Save the intermediate overview GeoParquet to PATH after export. Does not change the PMTiles output", long_help = None))]
     pub keep_overview: Option<PathBuf>,
+    /// The codec of the temporary intermediate overview. Default
+    /// [`OverviewCodec::Lz4`]: 5-7% less user CPU than ZSTD for a file
+    /// 1.4-1.6x larger. [`OverviewCodec::Zstd`] suits a host short of temp
+    /// disk or on a slow disk. No effect with [`TilesOptions::keep_overview`],
+    /// whose file is always ZSTD.
+    #[cfg_attr(feature = "cli", arg(long, value_enum, value_name = "CODEC", default_value_t = OverviewCodec::Lz4))]
+    #[cfg_attr(feature = "cli", arg(help = "Compression of the temporary intermediate overview: `lz4` takes 5-7% less CPU, `zstd` writes a file about a third smaller, for a host short of temp disk or on a slow disk. No effect with --keep-overview, whose file is always ZSTD. Does not change the PMTiles output", long_help = None))]
+    pub temp_compression: OverviewCodec,
     /// The sharded-fleet job, if any (#498).
     #[serde(skip)]
     #[cfg_attr(feature = "cli", arg(skip = Self::default().shard))]
@@ -340,6 +348,7 @@ with_setters!(TilesOptions {
     with_layer_name => layer_name: Option<String>,
     with_layer_column => layer_column: Option<String>,
     with_keep_overview => keep_overview: Option<PathBuf>,
+    with_temp_compression => temp_compression: OverviewCodec,
     with_shard => shard: Option<TilesShard>,
     with_cell_bands => cell_bands: Vec<CellBand>,
 });
@@ -358,6 +367,7 @@ impl Default for TilesOptions {
             layer_name: None,
             layer_column: None,
             keep_overview: None,
+            temp_compression: OverviewCodec::Lz4,
             shard: None,
             cell_bands: Vec::new(),
         }
@@ -1217,11 +1227,11 @@ pub(super) fn convert_to_pmtiles_validated(
                 (tmp.to_path_buf(), Some(tmp))
             }
         };
-    // Read once by the export below and removed, so written for speed, not
-    // size (LZ4); a kept overview is a deliverable and keeps ZSTD.
+    // Read once by the export below and removed, so its codec is the
+    // caller's choice; a kept overview is a deliverable and keeps ZSTD.
     let mut convert_options = convert_options;
     if overview_tmp.is_some() {
-        convert_options.to_mut().scratch_overview = true;
+        convert_options.to_mut().overview_codec = options.temp_compression;
     }
 
     // Shared disk-footprint preflight: sum staging, pass-2 spill and the
@@ -2374,7 +2384,7 @@ mod tests {
     /// written LZ4, which is cheaper to encode and decode than ZSTD. A kept
     /// overview is a deliverable and stays ZSTD, byte-identical to before.
     #[test]
-    fn only_a_temp_intermediate_is_written_lz4() {
+    fn temp_intermediate_takes_the_chosen_codec_and_a_kept_one_zstd() {
         // Codec names as parquet's `Debug` spells them: core has no direct
         // parquet dependency to name the type.
         struct Codecs(Vec<(bool, String)>);
@@ -2393,29 +2403,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.parquet");
         points_input(&input);
-        let mut codecs = Codecs(Vec::new());
-        for keep in [None, Some(dir.path().join("kept.parquet"))] {
-            let options = TilesOptions {
+        let run = |temp_compression: Option<OverviewCodec>, keep: Option<PathBuf>| {
+            let mut options = TilesOptions {
                 keep_overview: keep,
                 ..zoomed_options(0, 2)
             };
-            let output = dir.path().join("out.pmtiles");
+            if let Some(codec) = temp_compression {
+                options.temp_compression = codec;
+            }
+            let mut codecs = Codecs(Vec::new());
             convert_to_pmtiles_observed(
                 &TilesInput::Path(input.clone()),
-                &output,
+                &dir.path().join("out.pmtiles"),
                 &options,
                 &mut codecs,
             )
             .expect("must convert");
+            assert!(!codecs.0.is_empty());
+            codecs.0
+        };
+        // Default: the temp intermediate is LZ4.
+        for (kept, codec) in run(None, None) {
+            assert!(!kept);
+            assert_eq!(codec, "LZ4_RAW", "default temp intermediate");
         }
-        assert!(codecs.0.iter().any(|(kept, _)| *kept));
-        assert!(codecs.0.iter().any(|(kept, _)| !*kept));
-        for (kept, codec) in codecs.0 {
-            if kept {
-                assert!(codec.starts_with("ZSTD"), "kept overview: {codec}");
-            } else {
-                assert_eq!(codec, "LZ4_RAW", "temp intermediate");
-            }
+        // `zstd`: main's temp intermediate.
+        for (kept, codec) in run(Some(OverviewCodec::Zstd), None) {
+            assert!(!kept);
+            assert!(codec.starts_with("ZSTD"), "zstd temp intermediate: {codec}");
+        }
+        // A kept overview is ZSTD whatever the temp codec.
+        let kept = dir.path().join("kept.parquet");
+        for (kept, codec) in run(Some(OverviewCodec::Lz4), Some(kept)) {
+            assert!(kept);
+            assert!(codec.starts_with("ZSTD"), "kept overview: {codec}");
         }
     }
 

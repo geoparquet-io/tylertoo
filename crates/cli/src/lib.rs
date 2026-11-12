@@ -2803,6 +2803,17 @@ mod tests {
         assert_eq!(a.keep_overview, Some(PathBuf::from("ov.parquet")));
     }
 
+    /// `--temp-compression` defaults to `lz4` and reaches the tiles options,
+    /// which hand it to the intermediate's writer.
+    #[test]
+    fn tiles_temp_compression_flag_parses() {
+        use tylertoo_core::OverviewCodec;
+        let codec = |flags: &[&str]| tiles_options(&parse_tiles(flags)).unwrap().temp_compression;
+        assert_eq!(codec(&[]), OverviewCodec::Lz4);
+        assert_eq!(codec(&["--temp-compression", "zstd"]), OverviewCodec::Zstd);
+        assert_eq!(codec(&["--temp-compression", "lz4"]), OverviewCodec::Lz4);
+    }
+
     /// #317 / #279: the representation selector and the square disposition
     /// are reachable on BOTH `overview` and the one-shot `tiles` facade, and
     /// they build the right core options.

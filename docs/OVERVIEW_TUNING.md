@@ -2120,10 +2120,15 @@ with `--no-default-features` uses the system allocator.
 `speed` keep raw IPC, including an `auto` downgrade to disk.
 `pass2.sink.spill_codec` records the selected codec.
 
-`tiles` writes its temporary intermediate overview with LZ4, since the
-export reads it once and then removes it. LZ4 takes less CPU to encode and
-decode than ZSTD, and the file is about 1.5 times larger. A
-`--keep-overview` file and the `overview` command's output use ZSTD.
+`--temp-compression lz4|zstd` (Python `temp_compression`) sets the codec
+of the temporary intermediate overview `tiles` writes. The default `lz4`
+suits a file the export reads once and then removes. Against `zstd` it
+takes 5–7% less user CPU and 3–8% less wall on Moldova and Overture
+segments, for a file 1.4–1.6 times larger: 2.0 GB grows to 3.1 GB on FTW
+Brazil MT. Pick `zstd` on a host short of temp disk or on a slow disk.
+The tiles are the same with either codec. A `--keep-overview` file and the
+`overview` command's output always use ZSTD, so the flag has no effect
+there.
 
 ### Automatic memory estimate
 

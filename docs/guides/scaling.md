@@ -161,6 +161,8 @@ The run fails before starting if the directory does not exist.
 - **`tiles` intermediate overview.** At least the input's size, with its own
   free-space check. It goes to `--spill-dir`, else `$TMPDIR`, else the output
   directory, and export deletes it when done. `--keep-overview PATH` retains it.
+  It is written with LZ4; `--temp-compression zstd` makes it about a third
+  smaller for 5–7% more CPU.
 - **Export spill file.** `export-pmtiles --spill-dir` (and `tiles --spill-dir`)
   backs the export's buffered tiles on disk when they would not
   fit the memory budget.
