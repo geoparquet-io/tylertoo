@@ -1217,6 +1217,12 @@ pub(super) fn convert_to_pmtiles_validated(
                 (tmp.to_path_buf(), Some(tmp))
             }
         };
+    // Read once by the export below and removed, so written for speed, not
+    // size (LZ4); a kept overview is a deliverable and keeps ZSTD.
+    let mut convert_options = convert_options;
+    if overview_tmp.is_some() {
+        convert_options.to_mut().scratch_overview = true;
+    }
 
     // Shared disk-footprint preflight: sum staging, pass-2 spill and the
     // intermediate on each destination volume. Warn before execution. Logged here
@@ -2362,6 +2368,55 @@ mod tests {
         assert!(report.intermediate.retained);
         assert_eq!(report.intermediate.path, kept);
         assert!(kept.exists(), "retained intermediate must survive");
+    }
+
+    /// The temp intermediate is read once by the export and removed, so it is
+    /// written LZ4, which is cheaper to encode and decode than ZSTD. A kept
+    /// overview is a deliverable and stays ZSTD, byte-identical to before.
+    #[test]
+    fn only_a_temp_intermediate_is_written_lz4() {
+        // Codec names as parquet's `Debug` spells them: core has no direct
+        // parquet dependency to name the type.
+        struct Codecs(Vec<(bool, String)>);
+        impl TilesObserver for Codecs {
+            fn overview_written(&mut self, i: &IntermediateOverview, _: &ConvertReport) {
+                let file = std::fs::File::open(&i.path).unwrap();
+                let source = tylertoo_io::open_parquet(file).unwrap();
+                for group in source.metadata().row_groups() {
+                    for column in group.columns() {
+                        self.0
+                            .push((i.retained, format!("{:?}", column.compression())));
+                    }
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        points_input(&input);
+        let mut codecs = Codecs(Vec::new());
+        for keep in [None, Some(dir.path().join("kept.parquet"))] {
+            let options = TilesOptions {
+                keep_overview: keep,
+                ..zoomed_options(0, 2)
+            };
+            let output = dir.path().join("out.pmtiles");
+            convert_to_pmtiles_observed(
+                &TilesInput::Path(input.clone()),
+                &output,
+                &options,
+                &mut codecs,
+            )
+            .expect("must convert");
+        }
+        assert!(codecs.0.iter().any(|(kept, _)| *kept));
+        assert!(codecs.0.iter().any(|(kept, _)| !*kept));
+        for (kept, codec) in codecs.0 {
+            if kept {
+                assert!(codec.starts_with("ZSTD"), "kept overview: {codec}");
+            } else {
+                assert_eq!(codec, "LZ4_RAW", "temp intermediate");
+            }
+        }
     }
 
     /// #433: a `keep_overview` into a missing directory is refused before

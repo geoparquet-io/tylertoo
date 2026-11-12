@@ -143,6 +143,7 @@ pub struct tylertoo_io::OverviewWriteOptions
 pub tylertoo_io::OverviewWriteOptions::covering_columns: alloc::vec::Vec<alloc::string::String>
 pub tylertoo_io::OverviewWriteOptions::full_column_stats: bool
 pub tylertoo_io::OverviewWriteOptions::geometry_columns: alloc::vec::Vec<alloc::string::String>
+pub tylertoo_io::OverviewWriteOptions::scratch: bool
 pub tylertoo_io::OverviewWriteOptions::zstd_level: i32
 impl core::clone::Clone for tylertoo_io::OverviewWriteOptions
 pub fn tylertoo_io::OverviewWriteOptions::clone(&self) -> tylertoo_io::OverviewWriteOptions

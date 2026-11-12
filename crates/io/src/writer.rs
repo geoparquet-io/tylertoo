@@ -18,7 +18,14 @@ use parquet::schema::types::ColumnPath;
 #[derive(Debug, Clone)]
 pub struct OverviewWriteOptions {
     /// ZSTD compression level, validated before writing the file header.
+    /// Unused for a [`scratch`](Self::scratch) file.
     pub zstd_level: i32,
+    /// The file is a scratch intermediate that this process reads once and
+    /// removes: it is written LZ4 (`LZ4_RAW`), not ZSTD. LZ4 costs less CPU
+    /// to encode and to decode (`tiles`: user CPU -5% on Moldova and `BR_MT`,
+    /// -7% on `lines`) for a file 1.4-1.6x larger. Uncompressed saved more
+    /// CPU, but its up to 4x larger file made `BR_MT`'s pass 2 disk-bound.
+    pub scratch: bool,
     /// Retain statistics on geometry and string/binary properties too.
     pub full_column_stats: bool,
     /// WKB geometry columns, whose dictionary encoding is disabled.
@@ -51,7 +58,7 @@ pub fn batch_writer<W: Write + Send>(
     ArrowWriter::try_new(sink, schema, Some(props)).map(BatchWriter)
 }
 
-/// Construct the overview writer: ZSTD, manual row-group boundaries, no
+/// Construct the overview writer: ZSTD (LZ4 for a scratch file), manual row-group boundaries, no
 /// geometry/bbox dictionaries, and statistics tuned for spatial pruning.
 ///
 /// `source_schema` describes properties before the GeoParquet encoder adds
@@ -126,8 +133,13 @@ fn overview_properties(
     options: &OverviewWriteOptions,
     source_schema: &Schema,
 ) -> Result<WriterProperties, ParquetError> {
+    let compression = if options.scratch {
+        Compression::LZ4_RAW
+    } else {
+        Compression::ZSTD(ZstdLevel::try_new(options.zstd_level)?)
+    };
     let mut builder = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(options.zstd_level)?))
+        .set_compression(compression)
         .set_max_row_group_row_count(Some(usize::MAX))
         .set_statistics_enabled(EnabledStatistics::Page);
 

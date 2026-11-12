@@ -248,6 +248,9 @@ pub struct OverviewWriterOptions {
     /// (the bounded envelope). Convert sets it for `auto` and `speed`.
     /// Default `false`.
     pub overlap_levels: bool,
+    /// The file is a scratch intermediate, read once and removed: see
+    /// [`tylertoo_io::OverviewWriteOptions::scratch`]. Default `false`.
+    pub scratch: bool,
 }
 
 impl OverviewWriterOptions {
@@ -268,6 +271,7 @@ impl OverviewWriterOptions {
             primary_column: None,
             source_is_subset: false,
             overlap_levels: false,
+            scratch: false,
         }
     }
 }
@@ -609,6 +613,7 @@ impl<W: Write + Send> OverviewWriter<W> {
 
         let io_options = tylertoo_io::OverviewWriteOptions {
             zstd_level: options.zstd_level,
+            scratch: options.scratch,
             full_column_stats: options.full_column_stats,
             geometry_columns: geometry_columns.clone(),
             covering_columns: geometry_columns
