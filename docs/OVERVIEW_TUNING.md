@@ -2116,6 +2116,11 @@ with `--no-default-features` uses the system allocator.
 `speed` keep raw IPC, including an `auto` downgrade to disk.
 `pass2.sink.spill_codec` records the selected codec.
 
+`tiles` writes its temporary intermediate overview with LZ4, since the
+export reads it once and then removes it. LZ4 takes less CPU to encode and
+decode than ZSTD, and the file is about 1.5 times larger. A
+`--keep-overview` file and the `overview` command's output use ZSTD.
+
 ### Automatic memory estimate
 
 `auto` estimates `buffered rows × per-row cost` from the average

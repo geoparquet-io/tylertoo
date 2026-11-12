@@ -911,6 +911,14 @@ pub struct ConvertOptions {
     #[serde(skip)]
     #[cfg_attr(feature = "cli", arg(skip = Self::default().cell_bands))]
     pub cell_bands: Option<String>,
+    /// The output is the `tiles` facade's temp intermediate, which its
+    /// export reads once and removes, so it is written with a cheaper codec
+    /// ([`tylertoo_io::OverviewWriteOptions::scratch`]). Set only by the
+    /// facade; a kept overview is unaffected. Default `false`.
+    #[doc(hidden)]
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = false))]
+    pub scratch_overview: bool,
     /// Materialize only the levels at or coarser than this zoom (#541): the
     /// **coarse job**'s half of a sharded build, on the convert side.
     ///
@@ -997,6 +1005,7 @@ with_setters!(ConvertOptions {
     with_shard => shard: Option<TileRange>,
     with_shard_plan_digest => shard_plan_digest: Option<String>,
     with_cell_bands => cell_bands: Option<String>,
+    with_scratch_overview => scratch_overview: bool,
     with_zoom_ceiling => zoom_ceiling: Option<u8>,
 });
 
@@ -1655,6 +1664,7 @@ impl Default for ConvertOptions {
             shard: None,
             shard_plan_digest: None,
             cell_bands: None,
+            scratch_overview: false,
             zoom_ceiling: None,
         }
     }

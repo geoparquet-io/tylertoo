@@ -172,6 +172,8 @@ impl DiskFootprint {
                     raw.bytes(copies(buffered), buffered),
                 );
             }
+            // Raw bytes: an upper bound for the LZ4 temp intermediate and a
+            // kept ZSTD overview alike.
             footprint.add(
                 output
                     .parent()

@@ -1079,6 +1079,7 @@ fn build_writer_options_with_ceiling(
     writer_opts.full_column_stats = options.full_column_stats;
     writer_opts.source_is_subset = options.shard.is_some();
     writer_opts.cogp_compat_key = options.cogp_compat_key;
+    writer_opts.scratch = options.scratch_overview;
     writer_opts.generalization = Some(build_generalization(
         emitted_gsds,
         crs,
