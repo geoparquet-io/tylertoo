@@ -1965,10 +1965,13 @@ fn drain_sink(
                     move |tx: &Sender<Result<RecordBatch, ConvertError>>| {
                         if let Some(offsets) = offsets.filter(|_| indexed) {
                             let reader = Arc::new(IpcIndexedReader::try_new(file, offsets[0])?);
-                            let batches: Vec<_> =
-                                offsets.windows(2).map(|w| (w[0], w[1])).collect();
-                            for window in batches.chunks(decode_width) {
-                                let ranges = window.to_vec();
+                            // At most `decode_width` ranges are held at once.
+                            for first in (0..offsets.len() - 1).step_by(decode_width) {
+                                let ranges: Vec<_> = offsets[first..]
+                                    .windows(2)
+                                    .take(decode_width)
+                                    .map(|w| (w[0], w[1]))
+                                    .collect();
                                 let reader = Arc::clone(&reader);
                                 #[cfg(test)]
                                 let path = _temp.path().to_owned();
