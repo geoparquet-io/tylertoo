@@ -123,6 +123,44 @@ def test_a_source_with_nothing_to_score_is_not_a_pass(archive, src, tmp_path, mo
         gate.gate_dataset(args, tol, {}, "d", {"path": "unused", "layer": "l"})
 
 
+def test_a_zoom_with_nothing_to_score_is_named(archive, src, tmp_path, monkeypatch, capsys):
+    import argparse
+
+    monkeypatch.setattr(gate.M, "read_source", lambda path, attr: src)
+    (tmp_path / "archive.pmtiles").write_bytes(archive.read_bytes())
+    monkeypatch.setattr(gate, "tippecanoe_dir", lambda *a: tmp_path)
+    monkeypatch.setattr(gate, "tylertoo_archive", lambda *a: archive)
+    scores = {str(Z): {"tiles": {"1/1": {"missing": 0.0}}}, "9": {"tiles": {}}}
+    monkeypatch.setattr(gate, "score", lambda *a: scores)
+    monkeypatch.setattr(gate, "cached_score", lambda *a: scores)
+    tol = {"gate": {"zoom_range": [Z, 9], "zooms": [Z, 9]}, "datasets": {}}
+    gate.gate_dataset(argparse.Namespace(work=tmp_path, zooms=None, cap=10), tol, {}, "d",
+                      {"path": "unused", "layer": "l"})
+    assert "z9" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("preset", [True, False])
+def test_the_exact_cluster_sum_is_checked_only_for_the_preset(archive, tmp_path, monkeypatch, preset):
+    """--cluster's exact sum is the preset's promise; other flags are measured, not held to it."""
+    import argparse
+
+    points = m.Source([world(Point(256 + 512 * i, 256)) for i in range(8)], list(range(8)))
+    monkeypatch.setattr(gate.M, "read_source", lambda path, attr: points)
+    (tmp_path / "archive.pmtiles").write_bytes(archive.read_bytes())
+    monkeypatch.setattr(gate, "tippecanoe_dir", lambda *a: tmp_path)
+    monkeypatch.setattr(gate, "tylertoo_archive", lambda *a, **k: archive)
+    scores = {str(Z): {"tiles": {f"{X}/{Y}": {"point_missing": 0.0}}}}
+    monkeypatch.setattr(gate, "score", lambda *a: scores)
+    monkeypatch.setattr(gate, "cached_score", lambda *a: scores)
+    monkeypatch.setattr(gate, "pair_score", lambda *a: {})
+    called = []
+    monkeypatch.setattr(gate, "cluster_rows", lambda *a: called.append(1) or [])
+    tol = {"gate": {"zoom_range": [Z, Z], "zooms": [Z]}, "datasets": {}}
+    gate.gate_dataset(argparse.Namespace(work=tmp_path, zooms=None, cap=10, preset=preset), tol, {}, "d",
+                      {"path": "unused", "layer": "l"})
+    assert called == ([1] if preset else [])
+
+
 def test_a_breach_png_is_written_once_per_run_over_an_old_one(archive, src, tmp_path, monkeypatch):
     """max, p99 and p95 share a tile: one PNG, and never the previous run's."""
     import argparse
@@ -240,6 +278,10 @@ def test_feature_and_byte_ratios_per_zoom(archive, tmp_path):
     assert "ratio" in gate.line(kept)
     banded = {"gate": {}, "datasets": {"d": {"zoom_bands": [{"zooms": [Z, Z], "features_ratio": [0.9, 1.1]}]}}}
     assert gate.compare("d", tiles, tiles, banded) == []  # not a band of the comparison against the source
+    # Reported, never gated: neither keeping more nor fewer is better, and gzip bytes vary by machine.
+    pair = gate.pair_score(fewer, archive, "polygon", None, tiles)
+    assert all(r["band"] is None and r["ok"] is None
+               for r in gate.pair_rows("d", pair, banded) if r["metric"].endswith("_ratio"))
     rows = gate.pair_rows("d", gate.pair_score(fewer, archive, "polygon", None, tiles), tol)
     assert gate.distance(rows)["d"]["features_ratio"] == 1 / len(DISCS)
 
@@ -254,6 +296,9 @@ def test_another_sample_size_is_measured_not_gated(monkeypatch, tmp_path, cap, s
     assert gate.main() == 0
     assert seen["args"].cap == sampled
     assert all("zoom_bands" not in d for d in seen["tol"]["datasets"].values())
+    # The self-test's bands are the preset's at the default sample: no other run of it means anything.
+    monkeypatch.setattr(sys, "argv", sys.argv + ["--self-test"])
+    assert gate.main() == 2
 
 
 def test_the_mean_counts_a_tile_by_what_is_drawn_in_it():

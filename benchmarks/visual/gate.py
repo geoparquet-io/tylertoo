@@ -6,23 +6,30 @@
 # ]
 # ///
 """
-gate.py — does tylertoo draw the source as well as tippecanoe does? (#869)
+gate.py — do tylertoo's tiles look like tippecanoe's? (#869)
 
 For each dataset it tiles the source with `tylertoo tiles --preset tippecanoe`
-and with the pinned tippecanoe, measures BOTH against the source on the same
-tiles (metrics.py), and takes the worst tiles of each zoom: the max, p99 and
-p95 of every error. The gated number is
+and with the pinned tippecanoe, and compares them on the same sampled tiles
+(metrics.py) in two ways:
 
-    d = tylertoo's error - tippecanoe's error
+  * directly, tile against tile: the pair_* cells (1 - IoU of the drawn
+    polygon area, line length apart, points unmatched; 0 = the same), and how
+    many features and tile bytes each tool keeps;
+  * each against the source: d = tylertoo's error - tippecanoe's error, on
+    the worst tiles of each zoom (max, p99, p95).
 
-against the band for that dataset, zoom and metric in visual_tolerances.toml.
-The two archives are never compared with each other: tylertoo keeping what
-tippecanoe drops is not an error.
+Each number is held to its band in visual_tolerances.toml. After a dataset
+the run prints its distance to tippecanoe and what tylertoo keeps over
+tippecanoe; --json holds both under `distance`.
 
     uv run benchmarks/visual/gate.py                    # every dataset
     uv run benchmarks/visual/gate.py --datasets open-buildings --zooms 12,14
     uv run benchmarks/visual/gate.py --dataset mine=/data/mine.parquet
     uv run benchmarks/visual/gate.py --self-test        # the gate's own test
+    uv run benchmarks/visual/gate.py --tylertoo-flags='--preset tippecanoe --simplify-factor 4'
+
+With --tylertoo-flags or a --cap other than the default the run measures
+and reports only: the bands are for the preset at the default sample.
 
 A breach prints one line with both values, d and the band; for a per-tile
 metric also the worst tile and a PNG of it (source | tylertoo | tippecanoe;
@@ -226,10 +233,9 @@ def pair_rows(did: str, pair: dict, tol: dict) -> list:
                              "ok": count_gate.in_band(mean, band), "tile": None, "error": metric})
         for what, (a, b) in rec.get("kept", {}).items():
             if b:  # what tylertoo keeps over what tippecanoe keeps, in the zoom's sampled tiles
-                name = f"{what}_ratio"
-                band = count_gate.zoom_band(tol, did, name, int(z))
-                rows.append({"dataset": did, "zoom": int(z), "metric": name, "tylertoo": a, "tippecanoe": b,
-                             "ratio": a / b, "d": a / b, "band": band, "ok": count_gate.in_band(a / b, band),
+                # Reported, never gated: neither direction is better, and gzip bytes vary by machine.
+                rows.append({"dataset": did, "zoom": int(z), "metric": f"{what}_ratio", "tylertoo": a,
+                             "tippecanoe": b, "ratio": a / b, "d": a / b, "band": None, "ok": None,
                              "tile": None})
     return rows
 
@@ -396,13 +402,17 @@ def gate_dataset(args, tol: dict, tip: dict, did: str, ds: dict) -> list:
     ty_archive = tylertoo_archive(args, did, ds, zr)
     ty_scores = score(ty_archive, src, attr, zooms, args.cap)
     rows = compare(did, ty_scores, cached_score(tip_dir, src, attr, zooms, args.cap), tol)
-    if not rows:  # every sampled tile is under its floor: no verdict, not a pass
+    empty = [z for z in zooms if not any(r["zoom"] == z for r in rows)]
+    if empty == list(zooms):  # every sampled tile is under its floor: no verdict, not a pass
         raise ValueError(f"{did}: nothing to score at zooms {zooms}: no sampled tile holds enough of the source")
+    if empty:
+        print("  not scored against the source (no sampled tile holds enough of it): "
+              + ", ".join(f"z{z}" for z in empty), flush=True)
     # The direct comparison needs no source, so it takes every sampled tile, also
     # those under the source floor (small polygons at low zooms).
     sampled = {str(z): {"tiles": [f"{x}/{y}" for _, x, y in M.sample_tiles(src, z, args.cap)]} for z in zooms}
     rows += pair_rows(did, pair_score(ty_archive, tip_dir / "archive.pmtiles", src.kind, attr, sampled), tol)
-    if src.kind == "point":
+    if src.kind == "point" and getattr(args, "preset", True):  # the exact sum is the preset's promise
         rows += cluster_rows(args, did, ds, src, zr, zooms)
     written = set()  # max, p99 and p95 of an error share its worst tile: one PNG, new each run
     for r in rows:
@@ -494,8 +504,12 @@ def main() -> int:
               "fixtures: gh release download fixtures-v1 --dir tests/fixtures/realdata/", file=sys.stderr)
         return 2
     tol = count_gate.load_tolerances(args.tolerances)
-    preset = args.tylertoo_flags == ["--preset", "tippecanoe"] and args.cap == CAP
+    args.preset = preset = args.tylertoo_flags == ["--preset", "tippecanoe"] and args.cap == CAP
     args.cap = args.cap or sys.maxsize
+    if args.self_test and not preset:
+        print("error: --self-test runs the preset at the default --cap; its bands are for nothing else",
+              file=sys.stderr)
+        return 2
     if not preset:
         tol["gate"].pop("default_band", None)
         for cfg in tol.get("datasets", {}).values():
@@ -548,8 +562,7 @@ def gate(args, tol: dict, tip: dict, datasets: dict) -> int:
             zooms = ",".join(str(z) for z in sorted({r["zoom"] for r in bad if r["dataset"] == did}))
             print(f"re-run only this: uv run benchmarks/visual/gate.py {which} --zooms {zooms}")
         return 1
-    preset = args.tylertoo_flags == ["--preset", "tippecanoe"] and args.cap == CAP
-    print("visual gate: every band holds" if preset else
+    print("visual gate: every band holds" if args.preset else
           f"measured with {' '.join(args.tylertoo_flags)}, {'all' if args.cap == sys.maxsize else args.cap} tiles per "
           f"zoom: the bands are for the preset at {CAP} tiles and were not applied")
     return 0

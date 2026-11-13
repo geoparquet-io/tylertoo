@@ -44,15 +44,20 @@ the others. The mean pools the zoom's tiles, each counted by how much is
 drawn in it, so a tile holding ten pixels of data does not weigh as much as
 a full one. The max and percentiles are per tile, over the tiles where the
 two tools draw at least 1% of the tile between them (16 pixels of line, 8
-points): with less, one pixel decides the share. The direct comparison takes every sampled tile, also those the
-comparison against the source skips for holding too little of it (small
-polygons at low zooms).
+points): with less, one pixel decides the share. The direct comparison
+takes every sampled tile, also those the comparison against the source skips
+for holding too little of it (small polygons at low zooms). A zoom where the
+comparison against the source skips every sampled tile is named in one line.
 
 Two more cells per zoom say how much each tool keeps in the sampled tiles:
 `features_ratio` and `bytes_ratio`, tylertoo's features and stored tile
 bytes over tippecanoe's. 1 means the same amount; above 1 tylertoo keeps
-more. Use them with the distance when tuning what tylertoo drops. After each dataset the run prints one line, the mean over its
-zooms of the mean tile:
+more. Use them with the distance when tuning what tylertoo drops. The two
+ratios have no band: they are reported, not gated, because neither more nor
+fewer features is better in itself, and gzip byte counts vary by machine.
+
+After each dataset the run prints two lines: the distance (the mean over its
+zooms of the mean tile) and what tylertoo keeps over tippecanoe:
 
 ```
 madagascar-adm4: 83 cells, 0 outside their band
@@ -206,7 +211,8 @@ a run pass.
 every geometry shifted 2 pixels, every geometry simplified at 4 pixels, one
 tile left out, and attributes swapped between neighbours. The unchanged copy
 must pass and each of the others must breach a band. It takes about five
-minutes.
+minutes. It uses the bands, so with `--tylertoo-flags` or another `--cap`
+it stops with exit 2.
 
 ## Handing it to an agent
 

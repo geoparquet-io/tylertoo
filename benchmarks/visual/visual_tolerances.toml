@@ -11,6 +11,8 @@
 # both draw with different attribute values), pair_apart (line length more
 # than a pixel from the other tool's) and pair_count (points not matched per
 # grid cell). 0 means the two tiles draw the same; the value is its own d.
+# features_ratio and bytes_ratio (what tylertoo keeps over tippecanoe) have no
+# band: they are reported for tuning, and neither direction is better.
 #
 # Each band is the measured d with 0.01 of headroom on both sides, and its
 # comment carries the measured values. It is a ratchet:
@@ -78,8 +80,6 @@ pair_iou_loss_p99  = [0.0254, 0.0454]  # measured 0.0354
 pair_iou_loss_p95  = [0.0254, 0.0454]  # measured 0.0354
 pair_attr_mean     = [0.0021, 0.0221]  # measured 0.0121
 pair_iou_loss_mean = [0.0205, 0.0405]  # measured 0.0305
-features_ratio     = [1.0802, 1.1002]  # measured ty 17837, tip 16361
-bytes_ratio        = [1.0602, 1.0802]  # measured ty 766563, tip 716258
 
 [[datasets."madagascar-adm4".zoom_bands]]
 zooms = [6, 6]
@@ -102,8 +102,6 @@ pair_iou_loss_p99  = [0.0000, 0.0125]  # measured 0.0025
 pair_iou_loss_p95  = [0.0000, 0.0125]  # measured 0.0025
 pair_attr_mean     = [0.0000, 0.0117]  # measured 0.0017
 pair_iou_loss_mean = [0.0000, 0.0119]  # measured 0.0019
-features_ratio     = [0.9799, 0.9999]  # measured ty 18335, tip 18522
-bytes_ratio        = [0.9846, 1.0046]  # measured ty 994742, tip 1.00015e+06
 
 [[datasets."madagascar-adm4".zoom_bands]]
 zooms = [8, 8]
@@ -126,8 +124,6 @@ pair_iou_loss_p99  = [0.0000, 0.0116]  # measured 0.0016
 pair_iou_loss_p95  = [0.0000, 0.0108]  # measured 0.0008
 pair_attr_mean     = [0.0000, 0.0104]  # measured 0.0004
 pair_iou_loss_mean = [0.0000, 0.0103]  # measured 0.0003
-features_ratio     = [0.9927, 1.0127]  # measured ty 20344, tip 20290
-bytes_ratio        = [0.9720, 0.9920]  # measured ty 1.56058e+06, tip 1.58912e+06
 
 [[datasets."madagascar-adm4".zoom_bands]]
 zooms = [10, 10]
@@ -150,8 +146,6 @@ pair_iou_loss_p99  = [0.0000, 0.0125]  # measured 0.0025
 pair_iou_loss_p95  = [0.0000, 0.0104]  # measured 0.0004
 pair_attr_mean     = [0.0000, 0.0102]  # measured 0.0002
 pair_iou_loss_mean = [0.0000, 0.0100]  # measured 0.0000
-features_ratio     = [0.9928, 1.0128]  # measured ty 4692, tip 4679
-bytes_ratio        = [0.9876, 1.0076]  # measured ty 574154, tip 575556
 
 [datasets."open-buildings"]
 color_attr = "geohash"
@@ -162,8 +156,6 @@ zooms = [12, 12]
 edge_gap           = [-0.0100, 0.0100]  # measured ty 0, tip 0
 pair_attr_mean     = [0.0000, 0.0100]  # measured 0.0000
 pair_iou_loss_mean = [0.0909, 0.1109]  # measured 0.1009
-features_ratio     = [0.7861, 0.8061]  # measured ty 824, tip 1035
-bytes_ratio        = [0.8358, 0.8558]  # measured ty 26193, tip 30970
 
 [[datasets."open-buildings".zoom_bands]]
 zooms = [14, 14]
@@ -186,8 +178,6 @@ pair_iou_loss_p99  = [0.0000, 0.0133]  # measured 0.0033
 pair_iou_loss_p95  = [0.0000, 0.0132]  # measured 0.0032
 pair_attr_mean     = [0.0000, 0.0102]  # measured 0.0002
 pair_iou_loss_mean = [0.0000, 0.0116]  # measured 0.0016
-features_ratio     = [0.9956, 1.0156]  # measured ty 1072, tip 1066
-bytes_ratio        = [1.0224, 1.0424]  # measured ty 44816, tip 43409
 
 [datasets."road-detections"]
 zooms = [10, 12, 14]
@@ -204,8 +194,6 @@ pair_apart_max    = [0.0000, 0.0103]  # measured 0.0003
 pair_apart_p99    = [0.0000, 0.0103]  # measured 0.0003
 pair_apart_p95    = [0.0000, 0.0103]  # measured 0.0003
 pair_apart_mean   = [0.0000, 0.0103]  # measured 0.0003
-features_ratio    = [0.6583, 0.6783]  # measured ty 671, tip 1004
-bytes_ratio       = [0.7995, 0.8195]  # measured ty 12258, tip 15143
 
 [[datasets."road-detections".zoom_bands]]
 zooms = [12, 12]
@@ -219,8 +207,6 @@ pair_apart_max    = [0.0000, 0.0101]  # measured 0.0001
 pair_apart_p99    = [0.0000, 0.0101]  # measured 0.0001
 pair_apart_p95    = [0.0000, 0.0101]  # measured 0.0001
 pair_apart_mean   = [0.0000, 0.0100]  # measured 0.0000
-features_ratio    = [0.9625, 0.9825]  # measured ty 1132, tip 1164
-bytes_ratio       = [0.9912, 1.0112]  # measured ty 22797, tip 22770
 
 [[datasets."road-detections".zoom_bands]]
 zooms = [14, 14]
@@ -234,8 +220,6 @@ pair_apart_max    = [0.0000, 0.0100]  # measured 0.0000
 pair_apart_p99    = [0.0000, 0.0100]  # measured 0.0000
 pair_apart_p95    = [0.0000, 0.0100]  # measured 0.0000
 pair_apart_mean   = [0.0000, 0.0100]  # measured 0.0000
-features_ratio    = [0.9957, 1.0157]  # measured ty 1243, tip 1236
-bytes_ratio       = [1.0330, 1.0530]  # measured ty 35442, tip 33980
 
 [datasets."ftw-moldova-z10"]
 zooms = [10, 12, 14]
@@ -253,8 +237,6 @@ pair_iou_loss_max  = [0.0090, 0.0290]  # measured 0.0190
 pair_iou_loss_p99  = [0.0090, 0.0290]  # measured 0.0190
 pair_iou_loss_p95  = [0.0087, 0.0287]  # measured 0.0187
 pair_iou_loss_mean = [0.0085, 0.0285]  # measured 0.0185
-features_ratio     = [0.7498, 0.7698]  # measured ty 8612, tip 11334
-bytes_ratio        = [0.7377, 0.7577]  # measured ty 346685, tip 463680
 
 [[datasets."ftw-moldova-z10".zoom_bands]]
 zooms = [12, 12]
@@ -269,8 +251,6 @@ pair_iou_loss_max  = [0.0000, 0.0143]  # measured 0.0043
 pair_iou_loss_p99  = [0.0000, 0.0142]  # measured 0.0042
 pair_iou_loss_p95  = [0.0000, 0.0139]  # measured 0.0039
 pair_iou_loss_mean = [0.0000, 0.0124]  # measured 0.0024
-features_ratio     = [1.0203, 1.0403]  # measured ty 13711, tip 13308
-bytes_ratio        = [0.9705, 0.9905]  # measured ty 619016, tip 631343
 
 [[datasets."ftw-moldova-z10".zoom_bands]]
 zooms = [14, 14]
@@ -285,8 +265,6 @@ pair_iou_loss_max  = [0.0000, 0.0103]  # measured 0.0003
 pair_iou_loss_p99  = [0.0000, 0.0103]  # measured 0.0003
 pair_iou_loss_p95  = [0.0000, 0.0102]  # measured 0.0002
 pair_iou_loss_mean = [0.0000, 0.0100]  # measured 0.0000
-features_ratio     = [1.0160, 1.0360]  # measured ty 4733, tip 4613
-bytes_ratio        = [0.9993, 1.0193]  # measured ty 207252, tip 205352
 
 [datasets."fieldmaps-boundaries"]
 color_attr = "fid"
@@ -297,16 +275,12 @@ zooms = [2, 2]
 edge_gap           = [-0.0100, 0.0100]  # measured ty 0, tip 0
 pair_attr_mean     = [0.0000, 0.0100]  # measured 0.0000
 pair_iou_loss_mean = [0.1567, 0.1767]  # measured 0.1667
-features_ratio     = [0.7043, 0.7243]  # measured ty 5, tip 7
-bytes_ratio        = [0.7297, 0.7497]  # measured ty 2097, tip 2835
 
 [[datasets."fieldmaps-boundaries".zoom_bands]]
 zooms = [4, 4]
 edge_gap           = [-0.0100, 0.0100]  # measured ty 0, tip 0
 pair_attr_mean     = [0.0000, 0.0100]  # measured 0.0000
 pair_iou_loss_mean = [0.0692, 0.0892]  # measured 0.0792
-features_ratio     = [0.9900, 1.0100]  # measured ty 7, tip 7
-bytes_ratio        = [1.0020, 1.0220]  # measured ty 4472, tip 4419
 
 [[datasets."fieldmaps-boundaries".zoom_bands]]
 zooms = [6, 6]
@@ -328,8 +302,6 @@ pair_iou_loss_p99  = [0.0000, 0.0142]  # measured 0.0042
 pair_iou_loss_p95  = [0.0000, 0.0142]  # measured 0.0042
 pair_attr_mean     = [0.0000, 0.0100]  # measured 0.0000
 pair_iou_loss_mean = [0.0000, 0.0176]  # measured 0.0076
-features_ratio     = [1.0900, 1.1100]  # measured ty 11, tip 10
-bytes_ratio        = [0.9626, 0.9826]  # measured ty 12300, tip 12647
 
 [[datasets."fieldmaps-boundaries".zoom_bands]]
 zooms = [8, 8]
@@ -352,8 +324,6 @@ pair_iou_loss_p99  = [0.0000, 0.0132]  # measured 0.0032
 pair_iou_loss_p95  = [0.0000, 0.0131]  # measured 0.0031
 pair_attr_mean     = [0.0000, 0.0100]  # measured 0.0000
 pair_iou_loss_mean = [0.0000, 0.0118]  # measured 0.0018
-features_ratio     = [0.9900, 1.0100]  # measured ty 29, tip 29
-bytes_ratio        = [0.9697, 0.9897]  # measured ty 38418, tip 39216
 
 [datasets."vd-points"]
 zooms = [8, 10, 12, 14]
@@ -367,8 +337,6 @@ pair_count_max  = [0.9900, 1.0100]  # measured 1.0000
 pair_count_p99  = [0.9887, 1.0087]  # measured 0.9987
 pair_count_p95  = [0.9833, 1.0033]  # measured 0.9933
 pair_count_mean = [0.8954, 0.9154]  # measured 0.9054
-features_ratio  = [6.5016, 6.5216]  # measured ty 280, tip 43
-bytes_ratio     = [4.2672, 4.2872]  # measured ty 2870, tip 671
 
 [[datasets."vd-points".zoom_bands]]
 zooms = [10, 10]
@@ -379,8 +347,6 @@ pair_count_max  = [0.9900, 1.0100]  # measured 1.0000
 pair_count_p99  = [0.9900, 1.0100]  # measured 1.0000
 pair_count_p95  = [0.9900, 1.0100]  # measured 1.0000
 pair_count_mean = [0.8991, 0.9191]  # measured 0.9091
-features_ratio  = [1.0309, 1.0509]  # measured ty 280, tip 269
-bytes_ratio     = [1.0983, 1.1183]  # measured ty 4422, tip 3990
 
 [[datasets."vd-points".zoom_bands]]
 zooms = [12, 12]
@@ -391,8 +357,6 @@ pair_count_max  = [0.9900, 1.0100]  # measured 1.0000
 pair_count_p99  = [0.9740, 0.9940]  # measured 0.9840
 pair_count_p95  = [0.9100, 0.9300]  # measured 0.9200
 pair_count_mean = [0.5417, 0.5617]  # measured 0.5517
-features_ratio  = [0.9874, 1.0074]  # measured ty 387, tip 388
-bytes_ratio     = [0.9852, 1.0052]  # measured ty 9185, tip 9229
 
 [[datasets."vd-points".zoom_bands]]
 zooms = [14, 14]
@@ -403,5 +367,3 @@ pair_count_max  = [0.0000, 0.0100]  # measured 0.0000
 pair_count_p99  = [0.0000, 0.0100]  # measured 0.0000
 pair_count_p95  = [0.0000, 0.0100]  # measured 0.0000
 pair_count_mean = [0.0000, 0.0100]  # measured 0.0000
-features_ratio  = [1.0089, 1.0289]  # measured ty 1509, tip 1481
-bytes_ratio     = [0.9186, 0.9386]  # measured ty 17908, tip 19284
