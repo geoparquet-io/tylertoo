@@ -242,7 +242,7 @@ missing from the list, or when this table is stale.
 | `bbox_containment` | `cpu` | yes | yes | Bounding-box containment fast paths |
 | `hostile_geometry` | `cpu` | no | no | Production clip, raw Sutherland-Hodgman and raw `i_overlay` on clean, invalid and pathological polygons (#205) |
 | `tile_compress_dedup` | `cpu` | yes | yes | Per-tile gzip and the XXH3 tile-content dedup cache |
-| `pipeline` | `syscall` | yes | no | `convert_to_overviews` then `export_pmtiles` on two small real fixtures, single-threaded: the production path end to end |
+| `pipeline` | `syscall` | yes | no | `convert_to_overviews` then `export_pmtiles` on two small real fixtures, single-threaded: the production path end to end, under `auto` and `--profile speed` (`-speed` ids), plus convert of a synthetic list-heavy and a 100-row-group input under both, read with 2 workers (#876) |
 | `coverage_fill` | `syscall` | yes | no | `export_pmtiles` with coverage fill off and on, over a 1,500-field Moldova prefix |
 | `assign_scaling` | `syscall` | no | no | Thread-count scaling of level assignment at dataset scale: a plain wall-clock harness, not Criterion |
 <!-- /generated -->
@@ -357,6 +357,14 @@ The gate runs in these cases:
 - On `workflow_dispatch`, with an optional `base` input. Without one, a
   run on `main` compares against the newest `v*` release tag, and a run
   on another branch against its merge-base with `origin/main`.
+
+The `pipeline` bench is where the gate times `--profile speed`: every
+input runs under `auto` (the bare id) and `speed` (the `-speed` id),
+including a list-heavy and a 100-row-group input that slowed under
+`speed` (#876). Those two read with 2 workers, and pass 2's column-split
+decode then starts at 16 cores (`MemoryBudget::read_decode_plan`), so on
+the 4-core runner they decode on one thread under either profile; run the
+bench on a larger machine to time the split.
 
 It used to run on every PR that touched `crates/core/`. In 62 runs it
 caught one real change and failed seven times on noise (#759), at about
