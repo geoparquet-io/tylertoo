@@ -14,6 +14,8 @@ pub(crate) struct Counts {
     pub draw_sorts: usize,
     pub draw_elements: usize,
     pub gap_rows: usize,
+    /// Parallel work items the gap measure ran: one per row chunk, not per row.
+    pub gap_tasks: usize,
     /// `to_finite_geometry` copies made by a specialized arm.
     pub finite_fast: usize,
     /// `to_finite_geometry` conversions that took the upstream fallback.
@@ -103,6 +105,7 @@ pub(crate) fn measure<T: Send>(f: impl FnOnce() -> T + Send) -> (T, Counts) {
         total.draw_sorts += c.draw_sorts;
         total.draw_elements += c.draw_elements;
         total.gap_rows += c.gap_rows;
+        total.gap_tasks += c.gap_tasks;
         total.finite_fast += c.finite_fast;
         total.finite_fallback += c.finite_fallback;
     }
