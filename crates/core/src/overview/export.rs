@@ -17187,7 +17187,11 @@ mod tests {
         // Another test in this binary may have installed a logger first;
         // then only the report half of this test is checkable.
         let logging = log::set_logger(&CountingLogger).is_ok();
-        log::set_max_level(log::LevelFilter::Warn);
+        // Only with our own logger: the level is process-global too, and
+        // lowering it under another test's logger drops that test's lines.
+        if logging {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
 
         // 6 rows x 2 levels at one row per row group: 12 row groups, and
         // every level's export re-extracts the columns per batch.
