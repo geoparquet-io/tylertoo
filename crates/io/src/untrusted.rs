@@ -1699,6 +1699,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
             &self.metadata,
             self.projection.as_ref(),
             self.decode_threads,
+            rows,
         );
         let projection = self.projection;
         let open: OpenGroups = Box::new(move |groups, limit| {
@@ -1761,14 +1762,21 @@ type OpenGroups = Box<
         + Send,
 >;
 
+/// The footer bytes one decode of a reader's columns must cover for them to
+/// split: below it, spawning the split threads costs more than they save.
+/// Overture's segments and places decode about 2.3 MB per 8,192 rows.
+const SPLIT_MIN_DECODE_BYTES: u64 = 256 << 10;
+
 /// Contiguous runs of `projection`'s leaves (every leaf when `None`), whole
 /// roots each, balanced by footer bytes into at most `splits` masks.
 /// Concatenating the masks' decoded columns in order gives the columns of
-/// one reader over `projection`. Empty when `splits < 2`.
+/// one reader over `projection`. Empty when `splits < 2`, or when a decode
+/// of `decode_rows` rows is under [`SPLIT_MIN_DECODE_BYTES`].
 fn column_splits(
     metadata: &ReaderMetadata,
     projection: Option<&ProjectionMask>,
     splits: usize,
+    decode_rows: usize,
 ) -> Vec<ProjectionMask> {
     let descr = metadata.parquet_schema();
     let leaves: Vec<usize> = (0..descr.num_columns())
@@ -1782,8 +1790,9 @@ fn column_splits(
             .metadata()
             .row_groups()
             .iter()
-            .map(|g| g.column(leaf).uncompressed_size().max(0) as u64)
-            .sum::<u64>()
+            .fold(0u64, |sum, g| {
+                sum.saturating_add(g.column(leaf).uncompressed_size().max(0) as u64)
+            })
             .max(1)
     };
     // Whole roots: a root's leaves decode into one array.
@@ -1793,22 +1802,27 @@ fn column_splits(
         match roots.last_mut() {
             Some((ls, b)) if descr.get_column_root_idx(ls[0]) == root => {
                 ls.push(leaf);
-                *b += bytes(leaf);
+                *b = b.saturating_add(bytes(leaf));
             }
             _ => roots.push((vec![leaf], bytes(leaf))),
         }
     }
-    let total: u64 = roots.iter().map(|r| r.1).sum();
+    // Footer sizes are untrusted: every sum saturates.
+    let total = roots.iter().fold(0u64, |sum, r| sum.saturating_add(r.1));
+    let rows = metadata.metadata().file_metadata().num_rows().max(1) as u64;
+    if (total / rows).saturating_mul(decode_rows as u64) < SPLIT_MIN_DECODE_BYTES {
+        return Vec::new();
+    }
     let target = total.div_ceil(splits as u64);
     let mut out: Vec<Vec<usize>> = vec![Vec::new()];
     let mut acc = 0u64;
     for (ls, b) in roots {
-        if acc > 0 && acc + b / 2 > target && out.len() < splits {
+        if acc > 0 && acc.saturating_add(b / 2) > target && out.len() < splits {
             out.push(Vec::new());
             acc = 0;
         }
         out.last_mut().unwrap().extend(ls);
-        acc += b;
+        acc = acc.saturating_add(b);
     }
     if out.len() < 2 {
         return Vec::new();
@@ -1825,11 +1839,15 @@ fn split_mismatch() -> ArrowError {
 }
 
 /// `f` over `0..counts.sum()`, the run of each count on its own thread
-/// (the first on this one), results in order.
-fn map_split<T: Send>(counts: &[usize], f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+/// (the first on this one), results in order. A spawned run is inside its
+/// own thread's panic boundary ([`guard`]); the caller's covers the first.
+fn map_split<T: Send>(
+    counts: &[usize],
+    f: impl Fn(usize) -> T + Sync,
+) -> Result<Vec<T>, InputError> {
     let total: usize = counts.iter().sum();
     if counts.len() < 2 {
-        return (0..total).map(&f).collect();
+        return Ok((0..total).map(&f).collect());
     }
     let mut starts = Vec::with_capacity(counts.len());
     let mut at = 0;
@@ -1842,16 +1860,16 @@ fn map_split<T: Send>(counts: &[usize], f: impl Fn(usize) -> T + Sync) -> Vec<T>
         let handles: Vec<_> = starts[1..]
             .iter()
             .cloned()
-            .map(|r| s.spawn(move || r.map(f).collect::<Vec<T>>()))
+            .map(|r| s.spawn(move || guard("parquet page", || r.map(f).collect::<Vec<T>>())))
             .collect();
         let mut out: Vec<T> = starts[0].clone().map(f).collect();
         for h in handles {
             match h.join() {
-                Ok(part) => out.extend(part),
+                Ok(part) => out.extend(part?),
                 Err(panic) => std::panic::resume_unwind(panic),
             }
         }
-        out
+        Ok(out)
     })
 }
 
@@ -1864,7 +1882,17 @@ fn next_split(
     let parts: Vec<Option<Result<RecordBatch, ArrowError>>> = match readers {
         [one] => return one.next(),
         [first, rest @ ..] => std::thread::scope(|s| {
-            let handles: Vec<_> = rest.iter_mut().map(|r| s.spawn(move || r.next())).collect();
+            // Each spawned split decodes inside its own thread's boundary.
+            let handles: Vec<_> = rest
+                .iter_mut()
+                .map(|r| {
+                    s.spawn(move || {
+                        guard("parquet page", || r.next()).unwrap_or_else(|panic| {
+                            Some(Err(ArrowError::ExternalError(Box::new(panic))))
+                        })
+                    })
+                })
+                .collect();
             let mut parts = vec![first.next()];
             for h in handles {
                 parts.push(match h.join() {
@@ -2069,8 +2097,8 @@ impl Iterator for UntrustedBatchReader {
                 .collect();
             Some(
                 map_split(&counts, cast)
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|panic| ArrowError::ExternalError(Box::new(panic)))
+                    .and_then(|columns| columns.into_iter().collect::<Result<Vec<_>, _>>())
                     .and_then(|columns| RecordBatch::try_new(schema.clone(), columns)),
             )
         })
@@ -2310,8 +2338,10 @@ mod tests {
             ("point", Arc::new(point) as ArrayRef),
             (
                 "note",
+                // Wide enough that a 128-row decode splits
+                // ([`SPLIT_MIN_DECODE_BYTES`]).
                 Arc::new(StringArray::from_iter_values(
-                    (0..n).map(|i| "n".repeat(i as usize % 9)),
+                    (0..n).map(|i| format!("{i}{}", "n".repeat(2_500 + i as usize % 9))),
                 )) as ArrayRef,
             ),
         ])
@@ -2344,12 +2374,164 @@ mod tests {
         for roots in [None, Some(vec![1, 2, 4])] {
             let one: Vec<RecordBatch> = read(1, roots.clone()).map(Result::unwrap).collect();
             let split = read(3, roots.clone());
-            assert_eq!(split.inner.current.len(), 3, "three column splits");
+            assert!(split.inner.current.len() > 1, "several column splits");
             assert_eq!(split.schema(), read(1, roots.clone()).schema());
             let split: Vec<RecordBatch> = split.map(Result::unwrap).collect();
             assert_eq!(split, one);
         }
         assert_eq!(read(1, None).inner.current.len(), 1);
+    }
+
+    /// Three Int64 columns over three row groups, every chunk's footer
+    /// declaring `uncompressed` bytes.
+    fn declaring_uncompressed(uncompressed: i64) -> Bytes {
+        use arrow_array::{ArrayRef, Int64Array};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::ParquetMetaDataWriter;
+        use parquet::file::properties::WriterProperties;
+        let column = || Arc::new(Int64Array::from_iter_values(0..30)) as ArrayRef;
+        let batch = RecordBatch::try_from_iter([("a", column()), ("b", column()), ("c", column())])
+            .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
+            .build();
+        let mut good = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut good, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let md = open_parquet(Bytes::from(good.clone())).unwrap().metadata;
+        let md = md.metadata().as_ref().clone();
+        let groups = md
+            .row_groups()
+            .iter()
+            .map(|g| {
+                let columns = g
+                    .columns()
+                    .iter()
+                    .map(|c| {
+                        c.clone()
+                            .into_builder()
+                            .set_total_uncompressed_size(uncompressed)
+                            .build()
+                            .unwrap()
+                    })
+                    .collect();
+                g.clone()
+                    .into_builder()
+                    .set_column_metadata(columns)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let md = md.into_builder().set_row_groups(groups).build();
+        let footer = u32::from_le_bytes(good[good.len() - 8..good.len() - 4].try_into().unwrap());
+        good.truncate(good.len() - 8 - footer as usize);
+        ParquetMetaDataWriter::new(&mut good, &md).finish().unwrap();
+        Bytes::from(good)
+    }
+
+    /// roborev on f44f9372: a decode too small to pay for its split threads
+    /// is not split. A list-heavy row group decodes one row at a time
+    /// ([`batch_plan`]), and splitting each row would spawn threads per row.
+    #[test]
+    fn a_decode_too_small_to_amortize_its_threads_is_not_split() {
+        // 300 footer bytes a row over three columns.
+        let md = open_parquet(declaring_uncompressed(1_000))
+            .unwrap()
+            .metadata;
+        assert_eq!(column_splits(&md, None, 4, 8192).len(), 3);
+        assert!(column_splits(&md, None, 4, 1).is_empty());
+    }
+
+    /// Bytes that panic on a read starting in `ranges`.
+    struct Tripwire {
+        bytes: Bytes,
+        ranges: Vec<std::ops::Range<u64>>,
+    }
+
+    impl Tripwire {
+        fn trip(&self, start: u64) {
+            if self.ranges.iter().any(|r| r.contains(&start)) {
+                panic!("tripwire");
+            }
+        }
+    }
+
+    impl parquet::file::reader::Length for Tripwire {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+    }
+
+    impl ChunkReader for Tripwire {
+        type T = <Bytes as ChunkReader>::T;
+
+        fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+            self.trip(start);
+            self.bytes.get_read(start)
+        }
+
+        fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+            self.trip(start);
+            self.bytes.get_bytes(start, length)
+        }
+    }
+
+    impl ConcurrentChunkReader for Tripwire {}
+
+    /// roborev on f44f9372: a decoder panic in a column split other than
+    /// the first, on a spawned thread, is caught by that thread's own panic
+    /// boundary and keeps its recorded location; it used to reach the
+    /// previous hook and come back as a bare message.
+    #[test]
+    fn a_panic_in_a_secondary_split_keeps_its_location() {
+        let bytes = declaring_uncompressed(1_000_000);
+        let md = open_parquet(bytes.clone()).unwrap().metadata;
+        // The last column's chunks, decoded by the last split.
+        let ranges = md
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|g| {
+                let (start, len) = g.column(2).byte_range();
+                start..start + len
+            })
+            .collect();
+        let mut reader = open_parquet(Tripwire { bytes, ranges })
+            .unwrap()
+            .with_decode_threads(3)
+            .build()
+            .unwrap();
+        assert_eq!(reader.inner.current.len(), 3);
+        let err = reader
+            .find_map(Result::err)
+            .expect("the tripwire fails the read")
+            .to_string();
+        assert!(err.contains("tripwire (at "), "{err}");
+        assert!(err.contains("untrusted.rs:"), "{err}");
+    }
+
+    /// The same for a cast run on a spawned thread ([`map_split`]).
+    #[test]
+    fn a_panic_in_a_secondary_cast_keeps_its_location() {
+        let err = map_split(&[1, 2], |i| assert!(i < 2, "cast tripwire"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cast tripwire (at "), "{err}");
+    }
+
+    /// roborev on f44f9372: a footer declaring column chunks near
+    /// `i64::MAX` bytes uncompressed must not overflow the column splits'
+    /// byte weights, which run outside the panic boundary: the reader still
+    /// builds and reads its rows.
+    #[test]
+    fn inflated_uncompressed_sizes_do_not_overflow_the_column_splits() {
+        let bytes = declaring_uncompressed(i64::MAX);
+        let source = open_parquet(bytes)
+            .expect("only the uncompressed sizes are inflated")
+            .with_decode_threads(4);
+        let rows: usize = source.build().unwrap().map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(rows, 30);
     }
 
     #[test]

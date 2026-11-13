@@ -1273,6 +1273,13 @@ mod read_tests {
                 "rank",
                 Arc::new(Int64Array::from_iter_values((0..rows).map(|i| i * 31 % 97))) as ArrayRef,
             ),
+            // Wide enough that a 256-row decode splits its columns.
+            (
+                "note",
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|i| format!("{i:01500}")),
+                )) as ArrayRef,
+            ),
         ])
         .unwrap();
         let props = WriterProperties::builder()
