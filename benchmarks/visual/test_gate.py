@@ -262,4 +262,5 @@ def test_the_mean_counts_a_tile_by_what_is_drawn_in_it():
                      "weights": {"1/1": {"pair_iou_loss": 990}, "2/2": {"pair_iou_loss": 10}}}}
     rows = {r["metric"]: r for r in gate.pair_rows("d", pair, {"gate": {}, "datasets": {}})}
     assert rows["pair_iou_loss_mean"]["pair"] == pytest.approx(0.01)
-    assert rows["pair_iou_loss_max"]["pair"] == 1.0 and rows["pair_iou_loss_max"]["tile"] == f"{Z}/2/2"
+    # ... and is not a worst tile: one pixel of difference would make it one.
+    assert rows["pair_iou_loss_max"]["pair"] == 0.0 and rows["pair_iou_loss_max"]["tile"] == f"{Z}/1/1"

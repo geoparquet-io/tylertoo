@@ -76,6 +76,10 @@ DATASETS = {
 TIPPECANOE_FLAGS = ["--drop-densest-as-needed", "--quiet"]
 STATS = {"max": 100, "p99": 99, "p95": 95}
 CAP = 100  # tiles sampled per zoom; the bands were measured with it
+# What two tiles must draw between them to be one of a zoom's worst tiles: with
+# less, a single pixel decides the share. The pooled mean takes every tile.
+PAIR_FLOOR = {"pair_iou_loss": M.COVER_FLOOR * M.PX * M.PX, "pair_attr": M.COVER_FLOOR * M.PX * M.PX,
+              "pair_apart": M.MIN_LENGTH_PX, "pair_count": M.MIN_POINTS}
 SEAM = ("edge_gap", "excess_change")
 
 
@@ -201,7 +205,10 @@ def pair_rows(did: str, pair: dict, tol: dict) -> list:
     between the tools, so it is its own d; without a band it is reported only."""
     rows = []
     for z, rec in pair.items():
-        for name, (value, worst, metric) in worst_tiles(rec).items():
+        weights = rec.get("weights", {})
+        enough = {t: {m: v for m, v in e.items() if weights.get(t, {}).get(m, PAIR_FLOOR[m]) >= PAIR_FLOOR[m]}
+                  for t, e in rec["tiles"].items()}
+        for name, (value, worst, metric) in worst_tiles({"tiles": enough}).items():
             band = count_gate.zoom_band(tol, did, name, int(z))
             rows.append({"dataset": did, "zoom": int(z), "metric": name, "pair": value, "d": value,
                          "band": band, "ok": count_gate.in_band(value, band), "tile": f"{z}/{worst}",

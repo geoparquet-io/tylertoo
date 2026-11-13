@@ -42,7 +42,9 @@ draw the same:
 Each has `_max`, `_p99`, `_p95` and `_mean` cells per zoom, with bands like
 the others. The mean pools the zoom's tiles, each counted by how much is
 drawn in it, so a tile holding ten pixels of data does not weigh as much as
-a full one; the max and percentiles are per tile and do show such tiles. The direct comparison takes every sampled tile, also those the
+a full one. The max and percentiles are per tile, over the tiles where the
+two tools draw at least 1% of the tile between them (16 pixels of line, 8
+points): with less, one pixel decides the share. The direct comparison takes every sampled tile, also those the
 comparison against the source skips for holding too little of it (small
 polygons at low zooms).
 
