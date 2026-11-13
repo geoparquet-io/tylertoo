@@ -641,6 +641,22 @@ the old schedule, with no slack for single-wave groups and the group's
 summed members within the cap: with the overlap its peak rose 36 MiB on
 lines.
 
+A level of several waves without the export-wide store reads its band once
+into a one-level store (#740). That fill used to wait until the group held
+no members, and then until all but the previous wave was written, so on
+brmt each of z10–z13 spent 1.5–2.4 s reading and clipping with no tile
+encoding. Under `auto` and `speed` the store now fills as soon as the
+collect reaches the level, while the coarser levels still encode
+(`GroupGate::early_fill`). The gate keeps the members still encoding and the
+new level's waves within its cap together, so the store's wave grant is the
+cap rather than the level's widest wave. Against 3b6796c9 (5 interleaved
+rounds, medians), brmt's levels wall fell from 15.2 to 13.8 s and its
+export wall from 17.9 to 15.1 s, for 74 MiB (1%) more peak RSS. Wideprops
+fell 9%, lines 3%, and moldova and moldova-f0 were within noise. `bounded`
+keeps the wait. A prefetch thread that filled the next level while this one
+drained measured no better: the fills, one after another, are then the
+critical path.
+
 `export_level_group` collects the levels' members on the calling thread, one
 level at a time and in level order, as the serial loop does. Each collected
 level then encodes in its own Rayon task while the next level is collected.
