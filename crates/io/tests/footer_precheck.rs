@@ -178,6 +178,8 @@ struct Junk {
     ty: u8,
     crafted: bool,
     seed: u64,
+    /// The value's exact bytes, in place of one drawn from `seed`.
+    raw: Option<&'static [u8]>,
 }
 
 fn junk() -> impl Strategy<Value = Junk> {
@@ -193,6 +195,7 @@ fn junk() -> impl Strategy<Value = Junk> {
             ty,
             crafted,
             seed,
+            raw: None,
         })
 }
 
@@ -254,6 +257,9 @@ const COLUMN_METADATA: Reads = |id| match id {
 
 fn put(out: &mut Vec<u8>, last: &mut i16, j: &Junk, reads: Reads) {
     header(out, last, j.id, j.ty, false, 0);
+    if let Some(raw) = j.raw {
+        return out.extend_from_slice(raw);
+    }
     match reads(j.id).filter(|_| j.crafted) {
         Some(Read::LogicalType) => logical_type(out, j.seed),
         Some(Read::Bytes(bytes)) => out.extend_from_slice(bytes),
@@ -554,4 +560,86 @@ fn a_wide_shallow_schema_passes() {
             .num_columns(),
         100
     );
+}
+
+/// Where [`every_retyped_known_field_is_refused`] puts a field.
+#[derive(Debug, Clone, Copy)]
+enum At {
+    File,
+    RowGroup,
+    ColumnMetaData,
+}
+
+/// Each list and struct field the pre-check reads by id, and a field of
+/// each struct it reads, written as another wire type than parquet-rs reads
+/// it as, is refused by name (#789). The property finds a deleted table
+/// entry only now and then; this finds one on every run.
+#[test]
+fn every_retyped_known_field_is_refused() {
+    use At::*;
+    // (where, id, wire type, value, the refused wire type, read as)
+    type Case = (At, i16, u8, &'static [u8], u8, u8);
+    let cases: [Case; 16] = [
+        (File, 5, 5, &[0x1C, 0x18, 1, b'k', 0], 5, 9),
+        (File, 5, 9, &[0x1C, 0x15, 0, 0], 5, 8), // KeyValue.key
+        (File, 7, 5, &[0x1C, 0x1C, 0, 0], 5, 9),
+        (File, 7, 9, &[0x1C, 0x15, 0, 0], 5, 12), // ColumnOrder.TYPE_ORDER
+        (RowGroup, 4, 5, &[0x1C, 0x15, 0, 0x12, 0x12, 0], 5, 9),
+        // SortingColumn.column_idx
+        (RowGroup, 4, 9, &[0x1C, 0x18, 0, 0x12, 0x12, 0], 8, 5),
+        (ColumnMetaData, 2, 5, &[0x15, 0], 5, 9),
+        (ColumnMetaData, 12, 5, &[0x36, 0, 0], 5, 12),
+        (ColumnMetaData, 12, 12, &[0x38, 0, 0], 8, 5), // Statistics.null_count
+        (
+            ColumnMetaData,
+            13,
+            5,
+            &[0x1C, 0x15, 0, 0x15, 0, 0x15, 0, 0],
+            5,
+            9,
+        ),
+        // PageEncodingStats.page_type
+        (
+            ColumnMetaData,
+            13,
+            9,
+            &[0x1C, 0x18, 0, 0x15, 0, 0x15, 0, 0],
+            8,
+            5,
+        ),
+        (ColumnMetaData, 16, 5, &[0x16, 0, 0], 5, 12),
+        // SizeStatistics.repetition_level_histogram
+        (ColumnMetaData, 16, 12, &[0x25, 0, 0], 5, 9),
+        (ColumnMetaData, 17, 5, &[0x29, 0x05, 0], 5, 12),
+        (ColumnMetaData, 17, 12, &[0x15, 0, 0], 5, 12), // GeospatialStatistics.bbox
+        (ColumnMetaData, 17, 12, &[0x1C, 0x15, 0, 0, 0], 5, 7), // BoundingBox.xmin
+    ];
+    for (at, id, ty, raw, refused, read_as) in cases {
+        let field = vec![Junk {
+            id,
+            ty,
+            crafted: false,
+            seed: 0,
+            raw: Some(raw),
+        }];
+        let (row_group, after) = match at {
+            File => (Default::default(), field),
+            RowGroup => ([field, vec![], vec![]], vec![]),
+            ColumnMetaData => ([vec![], vec![], field], vec![]),
+        };
+        let tail = Tail {
+            row_group: Some(row_group),
+            after,
+            second: None,
+        };
+        let footer = footer(&[], 9, &honest_schema(), &tail);
+        let want =
+            format!("a footer field of wire type {refused} is one parquet reads as type {read_as}");
+        match tylertoo_io::precheck_footer(&footer) {
+            Err(tylertoo_io::Error::HostileFooter(reason)) => {
+                assert_eq!(reason, want, "{at:?} field {id}");
+            }
+            other => panic!("{at:?} field {id}: {other:?}, not {want:?}"),
+        }
+    }
 }
