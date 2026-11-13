@@ -540,28 +540,35 @@ fn file_metadata(id: i16) -> Option<Known> {
     match id {
         1 | 3 => Some(VARINT),
         4 => Some(Known::List(&Known::Struct(row_group))),
-        5 => Some(Known::List(&Known::Struct(|id| {
-            matches!(id, 1 | 2).then_some(BINARY) // KeyValue
-        }))),
+        5 => Some(Known::List(&Known::Struct(key_value))),
         6 => Some(BINARY),
-        // ColumnOrder: a union of one empty struct.
-        7 => Some(Known::List(&Known::Struct(|id| {
-            (id == 1).then_some(Known::Struct(|_| None))
-        }))),
+        7 => Some(Known::List(&Known::Struct(column_order))),
         _ => None,
     }
+}
+
+fn key_value(id: i16) -> Option<Known> {
+    matches!(id, 1 | 2).then_some(BINARY)
+}
+
+/// A union of one empty struct.
+fn column_order(id: i16) -> Option<Known> {
+    (id == 1).then_some(Known::Struct(|_| None))
 }
 
 fn row_group(id: i16) -> Option<Known> {
     match id {
         1 => Some(Known::List(&Known::Struct(column_chunk))),
         2 | 3 | 5 | 7 => Some(VARINT),
-        // SortingColumn
-        4 => Some(Known::List(&Known::Struct(|id| match id {
-            1 => Some(VARINT),
-            2 | 3 => Some(BOOL),
-            _ => None,
-        }))),
+        4 => Some(Known::List(&Known::Struct(sorting_column))),
+        _ => None,
+    }
+}
+
+fn sorting_column(id: i16) -> Option<Known> {
+    match id {
+        1 => Some(VARINT),
+        2 | 3 => Some(BOOL),
         _ => None,
     }
 }
@@ -581,31 +588,42 @@ fn column_metadata(id: i16) -> Option<Known> {
     match id {
         1 | 4..=7 | 9..=11 | 14 | 15 => Some(VARINT),
         2 => Some(Known::List(&VARINT)),
-        // Statistics
-        12 => Some(Known::Struct(|id| match id {
-            1 | 2 | 5 | 6 => Some(BINARY),
-            3 | 4 => Some(VARINT),
-            7 | 8 => Some(BOOL),
-            _ => None,
+        12 => Some(Known::Struct(statistics)),
+        13 => Some(Known::List(&Known::Struct(page_encoding_stats))),
+        16 => Some(Known::Struct(size_statistics)),
+        17 => Some(Known::Struct(geospatial_statistics)),
+        _ => None,
+    }
+}
+
+fn statistics(id: i16) -> Option<Known> {
+    match id {
+        1 | 2 | 5 | 6 => Some(BINARY),
+        3 | 4 => Some(VARINT),
+        7 | 8 => Some(BOOL),
+        _ => None,
+    }
+}
+
+fn page_encoding_stats(id: i16) -> Option<Known> {
+    (1..=3).contains(&id).then_some(VARINT)
+}
+
+fn size_statistics(id: i16) -> Option<Known> {
+    match id {
+        1 => Some(VARINT),
+        2 | 3 => Some(Known::List(&VARINT)),
+        _ => None,
+    }
+}
+
+/// Its bounding box (1) holds doubles.
+fn geospatial_statistics(id: i16) -> Option<Known> {
+    match id {
+        1 => Some(Known::Struct(|id| {
+            (1..=8).contains(&id).then_some(Known::Wire(7))
         })),
-        // PageEncodingStats
-        13 => Some(Known::List(&Known::Struct(|id| {
-            (1..=3).contains(&id).then_some(VARINT)
-        }))),
-        // SizeStatistics
-        16 => Some(Known::Struct(|id| match id {
-            1 => Some(VARINT),
-            2 | 3 => Some(Known::List(&VARINT)),
-            _ => None,
-        })),
-        // GeospatialStatistics, its bounding box of doubles
-        17 => Some(Known::Struct(|id| match id {
-            1 => Some(Known::Struct(|id| {
-                (1..=8).contains(&id).then_some(Known::Wire(7))
-            })),
-            2 => Some(Known::List(&VARINT)),
-            _ => None,
-        })),
+        2 => Some(Known::List(&VARINT)),
         _ => None,
     }
 }
