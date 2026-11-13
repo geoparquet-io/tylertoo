@@ -699,8 +699,8 @@ fn tiles_layer_column_reports_each_layer() {
 }
 
 /// #873: tiles the size valve leaves over the cap are listed in the report,
-/// largest first and bounded, and only the merge valve's warning points at
-/// `--size-valve drop`, which drops the features merging never drops.
+/// largest first and bounded, and only tiles holding merged features point
+/// the warning at `--size-valve drop`, which drops what merging never drops.
 #[test]
 fn tiles_left_over_the_cap_are_listed_and_the_warning_names_the_drop_valve() {
     let Some(fixture) = fixture::realdata("ftw-moldova-z10.parquet") else {
@@ -770,7 +770,7 @@ fn tiles_left_over_the_cap_are_listed_and_the_warning_names_the_drop_valve() {
         let first = &listed[0];
         let warning = format!(
             "{} tile(s) still over the size limit after the size valve, written as is; \
-             largest: z{}/{}/{} ({} B)",
+             largest: z{}/{}/{} ({} B compressed)",
             expected.len(),
             first["z"],
             first["x"],
@@ -781,8 +781,20 @@ fn tiles_left_over_the_cap_are_listed_and_the_warning_names_the_drop_valve() {
             text.contains(&warning),
             "{valve}: {warning:?} not in\n{text}"
         );
-        let hint = "the merge valve never drops a merged feature; \
-                    pass --size-valve drop to enforce the cap";
-        assert_eq!(text.contains(hint), valve == "merge", "{valve}: {text}");
+        // Every tile here holds merged features under merge, none under drop.
+        let merged = over["merged_tiles"].as_u64().unwrap();
+        assert_eq!(
+            merged,
+            if valve == "merge" {
+                expected.len() as u64
+            } else {
+                0
+            }
+        );
+        let hint = format!(
+            "; {merged} of them hold merged features, which the merge valve never drops: \
+             pass --size-valve drop to enforce the cap by dropping features instead"
+        );
+        assert_eq!(text.contains(&hint), valve == "merge", "{valve}: {text}");
     }
 }

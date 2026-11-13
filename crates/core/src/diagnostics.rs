@@ -112,9 +112,10 @@ pub enum Diagnostic {
         /// them (#873).
         #[serde(default)]
         largest: Vec<crate::stats::LargestTile>,
-        /// The valve that left them over.
+        /// Those tiles that hold merged features, which the merge valve
+        /// never drops; 0 under the drop valve.
         #[serde(default)]
-        valve: crate::overview::export::SizeValve,
+        merged_tiles: usize,
     },
     #[non_exhaustive]
     PropertySkipped {
@@ -317,8 +318,20 @@ impl Diagnostic {
             (Self::UnusableGeometry { total: a, .. }, Self::UnusableGeometry { total: b, .. }) => {
                 *a = a.saturating_add(*b)
             }
-            (Self::TilesOverLimit { largest: a, .. }, Self::TilesOverLimit { largest: b, .. }) => {
+            (
+                Self::TilesOverLimit {
+                    largest: a,
+                    merged_tiles: m,
+                    ..
+                },
+                Self::TilesOverLimit {
+                    largest: b,
+                    merged_tiles: n,
+                    ..
+                },
+            ) => {
                 crate::stats::keep_largest(a, b.iter().copied());
+                *m = m.saturating_add(*n);
             }
             _ => {}
         }
@@ -364,7 +377,14 @@ impl Diagnostic {
                     c.max_abs = 0.0;
                 }
                 Diagnostic::UnusableGeometry { total, .. } => *total = 0,
-                Diagnostic::TilesOverLimit { largest, .. } => largest.clear(),
+                Diagnostic::TilesOverLimit {
+                    largest,
+                    merged_tiles,
+                    ..
+                } => {
+                    largest.clear();
+                    *merged_tiles = 0;
+                }
                 _ => {}
             }
             event
@@ -402,14 +422,14 @@ impl fmt::Display for Diagnostic {
             Self::ValidationSkipped {..} => write!(f, "{n} oversized RDP candidate(s) skipped exact validity checking and were assumed valid (#242)"),
             Self::Merged {..} => write!(f, "{n} tile feature(s) merged by the size valve"),
             Self::ValveDropped {..} => write!(f, "{n} tile feature(s) dropped by the size valve"),
-            Self::TilesOverLimit {largest,valve,..} => {
+            Self::TilesOverLimit {largest,merged_tiles,..} => {
                 write!(f, "{n} tile(s) still over the size limit after the size valve, written as is")?;
                 if !largest.is_empty() {
-                    let tiles: Vec<String> = largest.iter().map(|t| format!("z{}/{}/{} ({} B)", t.z, t.x, t.y, t.bytes)).collect();
+                    let tiles: Vec<String> = largest.iter().map(|t| format!("z{}/{}/{} ({} B compressed)", t.z, t.x, t.y, t.bytes)).collect();
                     write!(f, "; largest: {}", tiles.join(", "))?;
                 }
-                if *valve == crate::overview::export::SizeValve::Merge {
-                    f.write_str("; the merge valve never drops a merged feature; pass --size-valve drop to enforce the cap by dropping features instead")?;
+                if *merged_tiles > 0 {
+                    write!(f, "; {merged_tiles} of them hold merged features, which the merge valve never drops: pass --size-valve drop to enforce the cap by dropping features instead (a single feature over the cap stays over)")?;
                 }
                 Ok(())
             }
