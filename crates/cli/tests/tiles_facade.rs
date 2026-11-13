@@ -697,3 +697,92 @@ fn tiles_layer_column_reports_each_layer() {
     assert!(report["layers"][0]["convert"].is_object());
     assert!(report["layers"][0]["export"].is_object());
 }
+
+/// #873: tiles the size valve leaves over the cap are listed in the report,
+/// largest first and bounded, and only the merge valve's warning points at
+/// `--size-valve drop`, which drops the features merging never drops.
+#[test]
+fn tiles_left_over_the_cap_are_listed_and_the_warning_names_the_drop_valve() {
+    let Some(fixture) = fixture::realdata("ftw-moldova-z10.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let run = |valve: &str| {
+        let output = dir.path().join(format!("{valve}.pmtiles"));
+        let report = dir.path().join(format!("{valve}.json"));
+        let out = Command::new(tylertoo_bin())
+            .args([
+                "tiles",
+                fixture.to_str().unwrap(),
+                output.to_str().unwrap(),
+                "--max-zoom",
+                "10",
+                "--max-compressed-tile-size",
+                "100",
+                "--size-valve",
+                valve,
+                "--report",
+                report.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run tylertoo tiles");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        let stats = Command::new(tylertoo_bin())
+            .args(["stats", "--json", "--largest", "1000"])
+            .arg(&output)
+            .output()
+            .expect("run tylertoo stats");
+        assert!(stats.status.success());
+        let stats: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+        (text, report, stats)
+    };
+    for valve in ["merge", "drop"] {
+        let (text, report, stats) = run(valve);
+        let over = report["export"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["kind"] == "tiles_over_limit")
+            .unwrap_or_else(|| panic!("{valve}: no tiles_over_limit diagnostic"));
+        // Only the compressed cap binds here, so every tile over 100 stored
+        // bytes is one the valve left over it: the list is the archive's
+        // largest tiles, as `stats` ranks them, cut at ten.
+        let expected: Vec<&serde_json::Value> = stats["largest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["bytes"].as_u64().unwrap() > 100)
+            .collect();
+        assert_eq!(over["count"].as_u64().unwrap(), expected.len() as u64);
+        assert!(
+            expected.len() > 10,
+            "{valve}: the cap must leave >10 tiles over"
+        );
+        let listed: Vec<&serde_json::Value> = over["largest"].as_array().unwrap().iter().collect();
+        assert_eq!(listed, expected[..10], "{valve}");
+        let first = &listed[0];
+        let warning = format!(
+            "{} tile(s) still over the size limit after the size valve, written as is; \
+             largest: z{}/{}/{} ({} B)",
+            expected.len(),
+            first["z"],
+            first["x"],
+            first["y"],
+            first["bytes"]
+        );
+        assert!(
+            text.contains(&warning),
+            "{valve}: {warning:?} not in\n{text}"
+        );
+        let hint = "the merge valve never drops a merged feature; \
+                    pass --size-valve drop to enforce the cap";
+        assert_eq!(text.contains(hint), valve == "merge", "{valve}: {text}");
+    }
+}

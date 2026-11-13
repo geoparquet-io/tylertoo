@@ -687,6 +687,8 @@ pub tylertoo_core::Diagnostic::SavedPlan::count: usize
 pub tylertoo_core::Diagnostic::SavedPlan::diagnostics: alloc::vec::Vec<tylertoo_core::Diagnostic>
 #[non_exhaustive] pub tylertoo_core::Diagnostic::TilesOverLimit
 pub tylertoo_core::Diagnostic::TilesOverLimit::count: usize
+pub tylertoo_core::Diagnostic::TilesOverLimit::largest: alloc::vec::Vec<tylertoo_core::stats::LargestTile>
+pub tylertoo_core::Diagnostic::TilesOverLimit::valve: tylertoo_core::SizeValve
 #[non_exhaustive] pub tylertoo_core::Diagnostic::Unprojectable
 pub tylertoo_core::Diagnostic::Unprojectable::context: core::option::Option<tylertoo_core::RangeContext>
 pub tylertoo_core::Diagnostic::Unprojectable::count: usize
@@ -1895,6 +1897,10 @@ impl core::marker::StructuralPartialEq for tylertoo_core::SizeValve
 impl core::str::traits::FromStr for tylertoo_core::SizeValve
 pub type tylertoo_core::SizeValve::Err = alloc::string::String
 pub fn tylertoo_core::SizeValve::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl serde_core::ser::Serialize for tylertoo_core::SizeValve
+pub fn tylertoo_core::SizeValve::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::SizeValve
+pub fn tylertoo_core::SizeValve::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::SizeValve
 impl core::marker::Send for tylertoo_core::SizeValve
 impl core::marker::Sync for tylertoo_core::SizeValve

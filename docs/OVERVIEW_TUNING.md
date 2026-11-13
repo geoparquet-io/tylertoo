@@ -1626,8 +1626,13 @@ fits. `--size-valve` chooses how:
   everything it can in one step instead.
   If the tile still exceeds the cap after all possible merges, unmerged
   features are dropped, keeping the largest. Merged features are retained. A
-  tile that is still over after that is written as it is, with a warning.
+  tile that is still over after that is written as it is, with a warning
+  that names `--size-valve drop` as the way to enforce the cap (#873).
 - `drop` drops features, keeping the largest for polygons and lines.
+
+Under either valve, the warning about tiles still over the cap, and the
+`tiles_over_limit` diagnostic in `--report`, list the ten largest of them as
+`z/x/y` with their compressed size.
 
 What `merge` costs, measured on #792 (1.36M Bavarian building footprints, one
 z0-z14 overview, export with the default caps; median of 3 on a 64-core box):
