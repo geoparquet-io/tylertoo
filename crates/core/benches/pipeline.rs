@@ -22,7 +22,8 @@
 //! parallel read, so these two read with 2 workers, and it needs
 //! `available_parallelism() / 4 / workers >= 2`
 //! (`MemoryBudget::read_decode_plan`), so 16 cores: a 4-core runner times
-//! these cells without it.
+//! these cells without it, and bench-regression.yml's nightly leg on the
+//! 64-core host times them with it.
 //!
 //! Everything runs on one rayon thread: the global pool is built with one
 //! thread (as `RAYON_NUM_THREADS=1` does for the CLI), and `read_workers`

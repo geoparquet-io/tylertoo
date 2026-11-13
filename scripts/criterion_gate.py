@@ -29,8 +29,8 @@ compared nothing is a broken run, not a pass.
 Shared-runner timing is noisy (see ci_guard.py for why *that* guard stays
 structural), so this only ever compares two runs from one runner. It runs
 from .github/workflows/bench-regression.yml on a PR carrying the `benchmark`
-label, weekly on main, and on dispatch; see DEVELOPMENT.md's "Criterion
-regression gate".
+label, weekly on main, nightly (`pipeline` only) on the 64-core host, and on
+dispatch; see DEVELOPMENT.md's "Criterion regression gate".
 
 Usage:
   criterion_gate.py --check --criterion-dir target/criterion-compare --baseline base

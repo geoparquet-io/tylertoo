@@ -7,11 +7,29 @@
 # comparison shared runners support honestly; a baseline carried over from an
 # earlier run on a different VM is mostly measuring the VM (#393).
 #
+# Two hosts (one matrix leg each, as in valve-guard.yml):
+#   github  ubuntu-latest (4 cores): every gated bench.
+#   pinned  the maintainer's 64-core VM, a self-hosted runner labelled
+#           `tylertoo-bench`: the `pipeline` bench only, nightly. On 4 cores
+#           pass 2's column-split decode never runs (read_decode_plan grants
+#           cores / 4 / read workers threads), so the bench's list-heavy and
+#           small-row-groups cells, which slowed under `--profile speed` when
+#           the split did (#876), time only the one-thread path there. The
+#           leg exists only while the repository variable
+#           TYLERTOO_BENCH_RUNNER is "true". It never runs on pull_request
+#           (the matrix and `runs-on` both refuse it), so the self-hosted
+#           runner never runs code from a fork.
+# Each leg compares base and head on its own machine; the two hosts' numbers
+# are never compared with each other (separate artifacts, summaries and
+# issues).
+#
 # Base revision:
 #   pull_request        merge-base of the PR head and its base branch.
-#   schedule            the last main commit at least 7 days old: a
+#   schedule (weekly)   the last main commit at least 7 days old: a
 #                       week-over-week comparison, both sides on one VM. A
 #                       week with no new commits skips the run.
+#   schedule (nightly)  the last main commit at least 1 day old, on the
+#                       pinned host. A day with no new commits skips.
 #   workflow_dispatch   the `base` input if given; otherwise, on main, the
 #                       latest v* release tag before HEAD ("what changed since
 #                       the last release"); on any other branch, its merge-base
@@ -26,12 +44,19 @@
 #                       (codspeed.yml) is the per-PR signal; label a PR that
 #                       changes threading, I/O or memory behaviour, which
 #                       instruction counts can't see.
-#   schedule            Mondays, on main. The table goes to the pinned
-#                       "Weekly benchmark comparison" issue, one comment a
-#                       week, so the history stays readable in one place.
-#                       This replaced bench.yml's per-push criterion run, whose
-#                       numbers compared different VMs and which nothing read.
-#   workflow_dispatch   manual, with the optional `base` input.
+#   schedule            Mondays, on main, github leg. The table goes to the
+#                       pinned "Weekly benchmark comparison" issue, one
+#                       comment a week, so the history stays readable in one
+#                       place. This replaced bench.yml's per-push criterion
+#                       run, whose numbers compared different VMs and which
+#                       nothing read.
+#                       Nightly at 01:00 UTC, pinned leg: done long before
+#                       valve-guard.yml's 05:30 run on the same host, so the
+#                       two never share its cores. A failing night comments
+#                       its table on the "Nightly pipeline benchmark (64-core
+#                       host)" issue; a passing one only leaves its summary.
+#   workflow_dispatch   manual, with the optional `base` input: both legs
+#                       (the pinned one while TYLERTOO_BENCH_RUNNER is true).
 # The label is checked in the job's `if:` rather than with `on.pull_request`
 # filters, which can't select on labels.
 #
@@ -47,8 +72,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   schedule:
-    # Mondays at 04:00 UTC, before the 07:00 parity run.
+    # Mondays at 04:00 UTC, before the 07:00 parity run: the github leg.
+    # Keep both strings in step with the `github.event.schedule` checks below.
     - cron: '0 4 * * 1'
+    # Nightly at 01:00 UTC: the pinned leg. Its timeout ends it by 02:30, well
+    # before valve-guard.yml's 05:30 run on the same host.
+    - cron: '0 1 * * *'
   workflow_dispatch:
     inputs:
       base:
@@ -80,16 +109,20 @@ jobs:
     name: Resolve base revision
     # PR: only with the `benchmark` label. A `labeled` event runs it only
     # when that label is `benchmark` (any other label changes nothing worth
-    # re-benching).
+    # re-benching). The nightly schedule: only while the pinned host exists.
     if: >-
-      github.event_name != 'pull_request' ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * *'
+       && vars.TYLERTOO_BENCH_RUNNER == 'true') ||
+      (github.event_name == 'schedule' && github.event.schedule != '0 1 * * *') ||
+      github.event_name == 'workflow_dispatch' ||
       (github.event.action == 'labeled' && github.event.label.name == 'benchmark') ||
-      (github.event.action != 'labeled' &&
+      (github.event_name == 'pull_request' && github.event.action != 'labeled' &&
        contains(github.event.pull_request.labels.*.name, 'benchmark'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.base.outputs.sha }}
+      hosts: ${{ steps.base.outputs.hosts }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -101,13 +134,30 @@ jobs:
         id: base
         env:
           EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          PINNED: ${{ vars.TYLERTOO_BENCH_RUNNER == 'true' }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           INPUT_BASE: ${{ inputs.base }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # Which legs run: never the pinned one on a pull request.
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$SCHEDULE" = "0 1 * * *" ]; then
+            hosts='["pinned"]'
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$PINNED" = true ]; then
+            hosts='["github","pinned"]'
+          else
+            hosts='["github"]'
+          fi
+          echo "hosts=$hosts" >> "$GITHUB_OUTPUT"
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base=$(git merge-base "$PR_BASE_SHA" HEAD)
+          elif [ "$EVENT_NAME" = "schedule" ] && [ "$SCHEDULE" = "0 1 * * *" ]; then
+            base=$(git rev-list -1 --before='1 day ago' HEAD)
+            if [ -z "$base" ] || [ "$base" = "$(git rev-parse HEAD)" ]; then
+              echo "::notice::no commits on main in the last day; nothing to compare"
+              exit 0
+            fi
           elif [ "$EVENT_NAME" = "schedule" ]; then
             base=$(git rev-list -1 --before='7 days ago' HEAD)
             if [ -z "$base" ] || [ "$base" = "$(git rev-parse HEAD)" ]; then
@@ -130,14 +180,25 @@ jobs:
           echo "sha=$base" >> "$GITHUB_OUTPUT"
 
   criterion-regression:
-    name: Criterion regression gate
+    # The github leg keeps its old check name.
+    name: Criterion regression gate${{ matrix.host == 'pinned' && ' (pinned host)' || '' }}
     needs: base
     if: needs.base.outputs.sha != ''
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        host: ${{ fromJSON(needs.base.outputs.hosts) }}
+    # A second guard: whatever the matrix says, a pull request runs on
+    # ubuntu-latest, never on the self-hosted runner.
+    runs-on: >-
+      ${{ matrix.host == 'pinned' && github.event_name != 'pull_request'
+      && fromJSON('["self-hosted","tylertoo-bench"]') || 'ubuntu-latest' }}
     timeout-minutes: 90
     env:
       TYLERTOO_BENCH_REQUIRE_FIXTURES: "1"
       CRITERION_HOME: ${{ github.workspace }}/target/criterion-compare
+      # The pinned leg runs only `pipeline` (empty: the weekly list).
+      CRITERION_BENCHES: ${{ matrix.host == 'pinned' && 'pipeline' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -172,17 +233,36 @@ jobs:
         with:
           toolchain: stable
 
+      # The pinned host provides its own; sudo there may need a password.
       - name: Install protoc
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          command -v protoc >/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y protobuf-compiler
+          }
+
+      # The pinned leg exists to time the column-split decode, which needs
+      # read_decode_plan's cores / 4 / 2 read workers >= 2. The bench limits
+      # rayon to one thread but not available_parallelism(), which the plan
+      # reads; nothing here sets an affinity or RAYON_NUM_THREADS.
+      - name: Check the pinned host's cores
+        if: matrix.host == 'pinned'
+        run: |
+          cores=$(nproc)
+          echo "available cores: $cores"
+          if [ "$cores" -lt 16 ]; then
+            echo "::error::the pinned leg needs >= 16 cores for the split decode; found $cores"
+            exit 1
+          fi
 
       # Own key: this job builds two revisions into one target dir. The weekly
       # run saves it from main, where label runs on PRs can restore it.
       # Criterion output goes to CRITERION_HOME, which criterion_compare.sh
       # wipes before running, so a restored target/ can't leak old results
-      # into the comparison.
+      # into the comparison. Not on the pinned host: another architecture
+      # and machine, and its builds are fast.
       - name: Cache cargo
+        if: matrix.host == 'github'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -235,10 +315,11 @@ jobs:
         if: always()
         env:
           BASE_SHA: ${{ needs.base.outputs.sha }}
+          HOST: ${{ matrix.host == 'pinned' && ' on the 64-core pinned host' || ' on ubuntu-latest (4 cores)' }}
         run: |
           [ -f "$CRITERION_HOME/report.md" ] || exit 0
           {
-            echo "## Criterion: \`${BASE_SHA:0:10}\` → \`$(git rev-parse --short=10 HEAD)\`"
+            echo "## Criterion$HOST: \`${BASE_SHA:0:10}\` → \`$(git rev-parse --short=10 HEAD)\`"
             echo
             cat "$CRITERION_HOME/report.md"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -247,19 +328,22 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: criterion-regression-report
+          name: criterion-regression-report-${{ matrix.host }}
           path: target/criterion-compare/
 
   # Weekly run: one comment with the table on the pinned tracking issue, so
   # the history is in one place and nobody has to open job summaries.
   # Posted whether or not the gate failed; a failure is the interesting week.
+  # Nightly run (pinned host): the same comment on that host's own issue,
+  # only on a failing night, so the 4- and 64-core tables never share one.
   report:
-    name: Post the weekly table
+    name: Post the scheduled table
     needs: [base, criterion-regression]
     if: >-
       always() && github.event_name == 'schedule'
-      && (needs.criterion-regression.result == 'success'
-          || needs.criterion-regression.result == 'failure')
+      && (needs.criterion-regression.result == 'failure'
+          || (needs.criterion-regression.result == 'success'
+              && github.event.schedule != '0 1 * * *'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -272,7 +356,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
-          name: criterion-regression-report
+          name: criterion-regression-report-${{ github.event.schedule == '0 1 * * *' && 'pinned' || 'github' }}
           path: report
 
       - name: Comment on the tracking issue
@@ -283,6 +367,7 @@ jobs:
           BASE_SHA: ${{ needs.base.outputs.sha }}
           HEAD_SHA: ${{ github.sha }}
           RESULT: ${{ needs.criterion-regression.result }}
+          NIGHTLY: ${{ github.event.schedule == '0 1 * * *' }}
         run: |
           TITLE="Weekly benchmark comparison"
           BODY="Each Monday, bench-regression.yml runs the criterion benches at
@@ -296,6 +381,17 @@ jobs:
           ---
           _Managed by .github/workflows/bench-regression.yml; it comments,
           never edits this text._"
+          if [ "$NIGHTLY" = true ]; then
+            TITLE="Nightly pipeline benchmark (64-core host)"
+            BODY="Each night, bench-regression.yml runs the \`pipeline\` bench at
+          yesterday's main and at today's on the 64-core pinned host, and
+          comments the table here when the gate fails. Never compare these
+          numbers with the weekly 4-core table.
+
+          ---
+          _Managed by .github/workflows/bench-regression.yml; it comments,
+          never edits this text._"
+          fi
 
           if [ -f report/report.md ]; then
             TABLE=$(cat report/report.md)
@@ -316,11 +412,14 @@ jobs:
           if [ -z "$EXISTING" ]; then
             NEW_URL=$(gh issue create --title "$TITLE" --label benchmark --body "$BODY")
             EXISTING=${NEW_URL##*/}
-            # Pin it so it stays visible (best effort; needs no extra scope).
-            ISSUE_ID=$(gh api "repos/$GH_REPO/issues/$EXISTING" --jq .node_id)
-            # shellcheck disable=SC2016  # $id is a GraphQL variable, not shell
-            gh api graphql -f query='
-              mutation($id: ID!) { pinIssue(input: {issueId: $id}) { issue { number } } }' \
-              -f id="$ISSUE_ID" || true
+            # Pin the weekly issue so it stays visible (best effort; needs no
+            # extra scope). The nightly one opens only on failures: not pinned.
+            if [ "$NIGHTLY" != true ]; then
+              ISSUE_ID=$(gh api "repos/$GH_REPO/issues/$EXISTING" --jq .node_id)
+              # shellcheck disable=SC2016  # $id is a GraphQL variable, not shell
+              gh api graphql -f query='
+                mutation($id: ID!) { pinIssue(input: {issueId: $id}) { issue { number } } }' \
+                -f id="$ISSUE_ID" || true
+            fi
           fi
           gh issue comment "$EXISTING" --body "$COMMENT"
