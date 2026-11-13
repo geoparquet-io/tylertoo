@@ -895,6 +895,14 @@ unmaterialized levels' chain tables are built, checked and dropped,
 short-circuiting at the first merge) and the export prefers it, falling back
 to the statistic for older files. Data shards are unaffected in practice:
 they refuse any plan carrying coalesce rows, so no shard ever merges.
+Export also omits the counter from every feature drawn from the canonical
+(finest) level of a duplicating overview, where every value is 1 (§13.2).
+Coarser levels keep it on every line feature when any chain merged in the
+conversion. This canonical-level decision uses only the overview footer's
+`canonical_level`, coalescing provenance, and `zoom_ceiling`, so sharded and
+monolithic builds withhold it from the same tiles; a capped coarse job holds
+no canonical level. Naming the counter in `--include-property` keeps it at
+every level.
 
 **An empty data shard succeeds.** The cut must tile the pivot zoom with no
 gap, so a concentrated dataset leaves some ranges owning no rows. Those jobs

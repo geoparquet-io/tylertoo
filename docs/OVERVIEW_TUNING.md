@@ -1217,9 +1217,16 @@ duplicating level. Pass `--no-coalesce-lines` to disable it.
   in the same class-rank, size, and hash order as the cell-winner stage. The
   output gains a **`coalesced_count`** `INT32 NOT NULL` column: the number of
   source segments merged into the row. It is 1 for unmerged rows and for every
-  row at the canonical level, which never coalesces. Tiles omit the column
-  when it is 1 everywhere, since it then says nothing about the data. The
-  overview file keeps it.
+  row at the canonical (finest) level, which never coalesces (§13.2). PMTiles
+  export omits the property from every feature drawn from that level. If any
+  chain merged anywhere in the conversion, coarser levels keep it on every
+  line feature, including unmerged ones with value 1. If nothing merged,
+  every tile omits it (#379). The overview file keeps the column, and
+  `vector_layers` fields still advertise it when any level publishes it.
+  Naming it in `--include-property` keeps it at every level. In styles, treat a missing value as 1 at the canonical zoom (usually
+  the max zoom) and in `--variable-depth` stopped tiles drawn from the
+  canonical level. For example, use the MapLibre expression
+  `["coalesce", ["get", "coalesced_count"], 1]`.
 - Points and polygons stay untouched. MultiLineString rows pass through
   unmerged.
 
@@ -1362,7 +1369,7 @@ A colliding source name gains `_` suffixes until free:
 |---|---|---|
 | `level` | always | **no**: dropped from tile properties |
 | `point_count` | `--cluster` | yes |
-| `coalesced_count` | line coalescing (on by default) | yes, unless 1 on every row (then omitted from tiles, but kept in the overview file) |
+| `coalesced_count` | line coalescing (on by default) | yes at coarser levels if any chain merged in the conversion; omitted from canonical-level features and, if nothing merged, every tile. Naming it in `--include-property` keeps it at every level. The overview file always keeps it. |
 
 tylertoo logs a rename at `warn`:
 
@@ -2010,9 +2017,10 @@ no candidate left, ranking falls back to feature size.
 `export-pmtiles` applies the same flags to published tile property names,
 leaving the overview untouched. The `--feature-order` column must remain;
 `tiles` checks this before conversion too. At export, an explicit
-`--include-property coalesced_count` retains even an all-1 column. Include
-lists still override exclusions; an included property the file cannot
-export is an error.
+`--include-property coalesced_count` retains the counter at every level,
+including the all-1 canonical level, even when nothing merged in the
+conversion. Include lists still override
+exclusions; an included property the file cannot export is an error.
 
 ### Column types
 
