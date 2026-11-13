@@ -40,12 +40,22 @@ draw the same:
 | Points | `pair_count` | Share of points not matched per cell of a 16×16 grid; 1 means no cell in common |
 
 Each has `_max`, `_p99`, `_p95` and `_mean` cells per zoom, with bands like
-the others. After each dataset the run prints one line, the mean over its
+the others. The mean pools the zoom's tiles, each counted by how much is
+drawn in it, so a tile holding ten pixels of data does not weigh as much as
+a full one; the max and percentiles are per tile and do show such tiles. The direct comparison takes every sampled tile, also those the
+comparison against the source skips for holding too little of it (small
+polygons at low zooms).
+
+Two more cells per zoom say how much each tool keeps in the sampled tiles:
+`features_ratio` and `bytes_ratio`, tylertoo's features and stored tile
+bytes over tippecanoe's. 1 means the same amount; above 1 tylertoo keeps
+more. Use them with the distance when tuning what tylertoo drops. After each dataset the run prints one line, the mean over its
 zooms of the mean tile:
 
 ```
-madagascar-adm4: 75 cells, 0 outside their band
-  distance to tippecanoe (mean tile, 0 = same): pair_attr 0.0033, pair_iou_loss 0.0069  [IoU 0.9931]
+madagascar-adm4: 83 cells, 0 outside their band
+  distance to tippecanoe (mean tile, 0 = same): pair_attr 0.0036, pair_iou_loss 0.0082  [IoU 0.9918]
+  kept, tylertoo over tippecanoe (1 = same): features x1.02, tile bytes x1.00
 ```
 
 `--json` holds the same numbers under `distance`. To look for settings that
@@ -55,20 +65,30 @@ that line or that JSON key between runs: lower is closer. The flags replace
 With `--tylertoo-flags` the bands are not applied (they were measured for
 the preset); the run reports and exits 0.
 
-Measured for the preset (mean tile):
+`--cap N` sets how many tiles are sampled per zoom and dataset (default
+100, with a fixed seed); `--cap 0` takes every tile that holds source data.
+A larger sample sees more and takes longer. The bands were measured at the
+default, so with another `--cap` the run also only reports.
 
-| Fixture | Distance |
-|---|---|
-| madagascar-adm4 | IoU 0.9931, `pair_attr` 0.0033 |
-| open-buildings | IoU 0.9980, `pair_attr` 0.0000 |
-| ftw-moldova-z10 | IoU 0.9939 |
-| fieldmaps-boundaries | IoU 0.9971, `pair_attr` 0.0000 |
-| road-detections | `pair_apart` 0.0001 |
-| vd-points | `pair_count` 0.6456 |
+Measured for the preset, over the scored zooms:
+
+| Fixture | Distance | Features kept | Tile bytes |
+|---|---|---|---|
+| madagascar-adm4 | IoU 0.9918, `pair_attr` 0.0036 | ×1.02 | ×1.00 |
+| open-buildings | IoU 0.9487, `pair_attr` 0.0001 | ×0.90 | ×0.95 |
+| ftw-moldova-z10 | IoU 0.9930 | ×0.92 | ×0.90 |
+| fieldmaps-boundaries | IoU 0.9362, `pair_attr` 0.0000 | ×0.98 | ×0.97 |
+| road-detections | `pair_apart` 0.0001 | ×0.89 | ×0.98 |
+| vd-points | `pair_count` 0.5915 | ×1.13 | ×1.04 |
 
 The points are far apart at z8 to z12 (`pair_count` 1.0 on the worst tile):
 both tools thin the points there, and they keep different ones. At z14 both
 keep every point and the distance is 0.
+
+These fixtures are small. On dense data the tools differ much more where
+tippecanoe drops features: 1.36M buildings overlap at IoU 0.02 at z10 and
+0.49 at z12, because tylertoo keeps buildings tippecanoe drops. Run a
+larger source with `--dataset ID=PATH` to see that range.
 
 ## What it measures against the source
 

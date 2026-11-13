@@ -223,3 +223,12 @@ def test_pair_point_counts_per_cell():
     far = [Point(4000 - 10 * i, 20 * i) for i in range(1, 9)]
     assert m.pair_errors("point", tile(pts), tile(far), None) == {"pair_count": 1.0}
     assert m.pair_errors("point", tile([]), tile([]), None) is None
+
+
+def test_pair_weights_are_what_each_share_is_of():
+    w = {}
+    m.pair_errors("polygon", tile([LEFT, RIGHT], [{"a": 7}, {"a": 8}]), tile([LEFT], [{"a": 7}]), "a", w)
+    assert w == {"pair_iou_loss": m.PX * m.PX, "pair_attr": m.PX * m.PX // 2}
+    pts = [Point(10 * i, 20 * i) for i in range(1, 9)]
+    m.pair_errors("point", tile(pts), tile(pts[:6]), None, w)
+    assert w["pair_count"] == 14

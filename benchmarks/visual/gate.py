@@ -75,6 +75,7 @@ DATASETS = {
 # reading reorders features and the output stops being reproducible.
 TIPPECANOE_FLAGS = ["--drop-densest-as-needed", "--quiet"]
 STATS = {"max": 100, "p99": 99, "p95": 95}
+CAP = 100  # tiles sampled per zoom; the bands were measured with it
 SEAM = ("edge_gap", "excess_change")
 
 
@@ -175,18 +176,23 @@ def cached_score(d: Path, src: M.Source, attr, zooms: list, cap: int) -> dict:
 
 def pair_score(ty: Path, tip: Path, kind: str, attr: str | None, scored: dict) -> dict:
     """tylertoo's tiles against tippecanoe's, directly, on the tiles `scored`
-    holds (those scored against the source): {zoom: {"tiles": {"x/y": errors}}}."""
+    names: {zoom: {"tiles": {"x/y": errors}, "kept": {...}}}. `kept` sums the
+    features and the stored bytes of those tiles, per tool."""
     archives = [M.read_archive(p) for p in (ty, tip)]
     out = {}
     for z, rec in scored.items():
-        per = {}
+        per, weights, kept = {}, {}, {"features": [0, 0], "bytes": [0, 0]}
         for t in rec["tiles"]:
             k = (int(z), *(int(v) for v in t.split("/")))
             a, b = (M.decode(tiles[k], gz)[1] if k in tiles else {} for tiles, gz in archives)
-            errors = M.pair_errors(kind, a, b, attr)
+            for i, (decoded, (tiles, _)) in enumerate(zip((a, b), archives)):
+                kept["features"][i] += sum(len(layer["features"]) for layer in decoded.values())
+                kept["bytes"][i] += len(tiles.get(k, b""))
+            w = {}
+            errors = M.pair_errors(kind, a, b, attr, w)
             if errors is not None:
-                per[t] = errors
-        out[z] = {"tiles": per}
+                per[t], weights[t] = errors, w
+        out[z] = {"tiles": per, "weights": weights, "kept": kept}
     return out
 
 
@@ -201,13 +207,23 @@ def pair_rows(did: str, pair: dict, tol: dict) -> list:
                          "band": band, "ok": count_gate.in_band(value, band), "tile": f"{z}/{worst}",
                          "error": metric})
         for metric in sorted({m for e in rec["tiles"].values() for m in e}):
-            vals = [e[metric] for e in rec["tiles"].values() if e.get(metric) is not None]
-            if vals:  # the mean over the zoom's tiles: what distance() sums up
+            got = [(e[metric], rec.get("weights", {}).get(t, {}).get(metric, 1))
+                   for t, e in rec["tiles"].items() if e.get(metric) is not None]
+            if got and sum(w for _, w in got):
+                # The zoom's tiles pooled: each counts by how much is drawn in it, so a
+                # sliver of ten pixels does not outweigh a full tile. What distance() sums up.
+                mean = float(np.average([v for v, _ in got], weights=[w for _, w in got]))
                 name = f"{metric}_mean"
                 band = count_gate.zoom_band(tol, did, name, int(z))
-                rows.append({"dataset": did, "zoom": int(z), "metric": name, "pair": float(np.mean(vals)),
-                             "d": float(np.mean(vals)), "band": band,
-                             "ok": count_gate.in_band(float(np.mean(vals)), band), "tile": None, "error": metric})
+                rows.append({"dataset": did, "zoom": int(z), "metric": name, "pair": mean, "d": mean, "band": band,
+                             "ok": count_gate.in_band(mean, band), "tile": None, "error": metric})
+        for what, (a, b) in rec.get("kept", {}).items():
+            if b:  # what tylertoo keeps over what tippecanoe keeps, in the zoom's sampled tiles
+                name = f"{what}_ratio"
+                band = count_gate.zoom_band(tol, did, name, int(z))
+                rows.append({"dataset": did, "zoom": int(z), "metric": name, "tylertoo": a, "tippecanoe": b,
+                             "ratio": a / b, "d": a / b, "band": band, "ok": count_gate.in_band(a / b, band),
+                             "tile": None})
     return rows
 
 
@@ -215,11 +231,17 @@ def distance(rows: list) -> dict:
     """{dataset: {pair metric: mean over its zooms of the mean tile difference}}:
     how far tylertoo's tiles are from tippecanoe's, 0 when they draw the same.
     The number to drive down when choosing settings."""
-    acc = {}
+    acc, kept = {}, {}
     for r in rows:
         if "pair" in r and r["metric"].endswith("_mean"):
             acc.setdefault(r["dataset"], {}).setdefault(r["error"], []).append(r["pair"])
-    return {d: {m: float(np.mean(v)) for m, v in sorted(ms.items())} for d, ms in acc.items()}
+        if "ratio" in r:
+            sums = kept.setdefault(r["dataset"], {}).setdefault(r["metric"], [0, 0])
+            sums[0], sums[1] = sums[0] + r["tylertoo"], sums[1] + r["tippecanoe"]
+    out = {d: {m: float(np.mean(v)) for m, v in sorted(ms.items())} for d, ms in acc.items()}
+    for d, ms in kept.items():  # over all the zooms' sampled tiles: 1 when the tools keep the same amount
+        out.setdefault(d, {}).update({m: a / b for m, (a, b) in sorted(ms.items())})
+    return out
 
 
 def worst_tiles(zrec: dict) -> dict:
@@ -258,7 +280,7 @@ def compare(did: str, ty: dict, tip: dict, tol: dict) -> list:
                 rows += [{"dataset": did, "zoom": int(z), "metric": name, "d": None, "band": band,
                           "ok": False, "tile": None}
                          for name, band in entry.items()
-                         if name != "zooms" and not name.startswith("pair_")
+                         if name != "zooms" and not name.startswith("pair_") and not name.endswith("_ratio")
                          and not (name in a and name in b)]
     return rows
 
@@ -345,7 +367,9 @@ def line(r: dict) -> str:
         return (f"{r['dataset']} z{r['zoom']} {r['metric']}: has the band {r['band']} but no value: "
                 "one of the tools draws nothing this metric can compare")
     band = f"band [{r['band'][0]}, {r['band'][1]}]" if r["band"] else "no band"
-    if "pair" in r:
+    if "ratio" in r:
+        values = f"tylertoo {r['tylertoo']} tippecanoe {r['tippecanoe']} ratio {r['ratio']:.3f}"
+    elif "pair" in r:
         values = f"tylertoo vs tippecanoe {r['pair']:.4f}"
     else:
         other = f"tippecanoe {r['tippecanoe']:.4f}" if "tippecanoe" in r else f"source {r['source']}"
@@ -365,9 +389,12 @@ def gate_dataset(args, tol: dict, tip: dict, did: str, ds: dict) -> list:
     ty_archive = tylertoo_archive(args, did, ds, zr)
     ty_scores = score(ty_archive, src, attr, zooms, args.cap)
     rows = compare(did, ty_scores, cached_score(tip_dir, src, attr, zooms, args.cap), tol)
-    rows += pair_rows(did, pair_score(ty_archive, tip_dir / "archive.pmtiles", src.kind, attr, ty_scores), tol)
     if not rows:  # every sampled tile is under its floor: no verdict, not a pass
         raise ValueError(f"{did}: nothing to score at zooms {zooms}: no sampled tile holds enough of the source")
+    # The direct comparison needs no source, so it takes every sampled tile, also
+    # those under the source floor (small polygons at low zooms).
+    sampled = {str(z): {"tiles": [f"{x}/{y}" for _, x, y in M.sample_tiles(src, z, args.cap)]} for z in zooms}
+    rows += pair_rows(did, pair_score(ty_archive, tip_dir / "archive.pmtiles", src.kind, attr, sampled), tol)
     if src.kind == "point":
         rows += cluster_rows(args, did, ds, src, zr, zooms)
     written = set()  # max, p99 and p95 of an error share its worst tile: one PNG, new each run
@@ -420,7 +447,9 @@ def main() -> int:
     ap.add_argument("--dataset", action="append", default=[], metavar="ID=PATH",
                     help="score another GeoParquet file (repeatable)")
     ap.add_argument("--zooms", help="comma list, instead of each dataset's zooms")
-    ap.add_argument("--cap", type=int, default=100, help="sampled tiles per zoom")
+    ap.add_argument("--cap", type=int, default=CAP,
+                    help="tiles sampled per zoom and dataset (default: %(default)s; 0: every tile that holds "
+                    "source data). The bands were measured at the default, so another value only reports")
     ap.add_argument("--self-test", action="store_true",
                     help="inject known defects and check that each one breaches")
     ap.add_argument("--tylertoo", default=os.environ.get("TYLERTOO", str(REPO / "target" / "release" / "tylertoo")))
@@ -458,7 +487,9 @@ def main() -> int:
               "fixtures: gh release download fixtures-v1 --dir tests/fixtures/realdata/", file=sys.stderr)
         return 2
     tol = count_gate.load_tolerances(args.tolerances)
-    if args.tylertoo_flags != ["--preset", "tippecanoe"]:
+    preset = args.tylertoo_flags == ["--preset", "tippecanoe"] and args.cap == CAP
+    args.cap = args.cap or sys.maxsize
+    if not preset:
         tol["gate"].pop("default_band", None)
         for cfg in tol.get("datasets", {}).values():
             cfg.pop("zoom_bands", None)
@@ -488,8 +519,12 @@ def gate(args, tol: dict, tip: dict, datasets: dict) -> int:
                    else "no band ")
             print(f"  {tag} {line(r)}", flush=True)
         dist = distance(got).get(did, {})
-        print("  distance to tippecanoe (mean tile, 0 = same): " + ", ".join(f"{m} {v:.4f}" for m, v in dist.items())
+        print("  distance to tippecanoe (mean tile, 0 = same): "
+              + ", ".join(f"{m} {v:.4f}" for m, v in dist.items() if not m.endswith("_ratio"))
               + (f"  [IoU {1 - dist['pair_iou_loss']:.4f}]" if "pair_iou_loss" in dist else ""), flush=True)
+        if "features_ratio" in dist:
+            print(f"  kept, tylertoo over tippecanoe (1 = same): features x{dist['features_ratio']:.2f}, "
+                  f"tile bytes x{dist['bytes_ratio']:.2f}", flush=True)
         rows += got
     if args.json:
         args.json.write_text(json.dumps({"tippecanoe": tip, "tolerances": str(args.tolerances),
@@ -506,9 +541,10 @@ def gate(args, tol: dict, tip: dict, datasets: dict) -> int:
             zooms = ",".join(str(z) for z in sorted({r["zoom"] for r in bad if r["dataset"] == did}))
             print(f"re-run only this: uv run benchmarks/visual/gate.py {which} --zooms {zooms}")
         return 1
-    preset = args.tylertoo_flags == ["--preset", "tippecanoe"]
+    preset = args.tylertoo_flags == ["--preset", "tippecanoe"] and args.cap == CAP
     print("visual gate: every band holds" if preset else
-          f"measured with {' '.join(args.tylertoo_flags)}: the bands are for the preset and were not applied")
+          f"measured with {' '.join(args.tylertoo_flags)}, {'all' if args.cap == sys.maxsize else args.cap} tiles per "
+          f"zoom: the bands are for the preset at {CAP} tiles and were not applied")
     return 0
 
 

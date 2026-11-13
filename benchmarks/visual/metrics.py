@@ -405,8 +405,10 @@ ERRORS = {"polygon": polygon_errors, "line": line_errors, "point": point_errors}
 # --------------------------------------------------------------------------
 
 
-def pair_errors(kind: str, a: dict, b: dict, attr: str | None) -> dict | None:
+def pair_errors(kind: str, a: dict, b: dict, attr: str | None, weights: dict | None = None) -> dict | None:
     """How far two decoded tiles of one z/x/y differ, 0 when they draw the same.
+    `weights`, when given, receives what each share is a share of (pixels,
+    pixels of length, points), to pool the tiles of a zoom.
 
     polygon  pair_iou_loss: 1 - IoU of the two drawn areas (pixels only one
              of the two draws, over the pixels either draws). pair_attr: pixels both draw with different values
@@ -429,6 +431,8 @@ def pair_errors(kind: str, a: dict, b: dict, attr: str | None) -> dict | None:
         if attr:
             both = da & db
             out["pair_attr"] = float((both & (ra != rb)).sum() / both.sum()) if both.any() else None
+        if weights is not None:
+            weights.update(pair_iou_loss=int((da | db).sum()), pair_attr=int((da & db).sum()))
         return out
     if kind == "line":
         drawn = []
@@ -439,6 +443,8 @@ def pair_errors(kind: str, a: dict, b: dict, attr: str | None) -> dict | None:
         if not la.length + lb.length:
             return None
         apart = la.difference(lb.buffer(LINE_TOL_PX)).length + lb.difference(la.buffer(LINE_TOL_PX)).length
+        if weights is not None:
+            weights.update(pair_apart=float(la.length + lb.length))
         return {"pair_apart": float(apart / (la.length + lb.length))}
     counts = []
     for t in (a, b):
@@ -448,4 +454,6 @@ def pair_errors(kind: str, a: dict, b: dict, attr: str | None) -> dict | None:
     ca, cb = counts
     if not (ca + cb).sum():
         return None
+    if weights is not None:
+        weights.update(pair_count=int((ca + cb).sum()))
     return {"pair_count": float(np.abs(ca - cb).sum() / (ca + cb).sum())}

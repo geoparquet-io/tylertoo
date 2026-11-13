@@ -203,7 +203,8 @@ def test_distance_is_the_mean_tile_difference_per_dataset(archive, tmp_path):
     tol = {"gate": {}, "datasets": {}}
     same = gate.pair_rows("d", gate.pair_score(archive, archive, "polygon", "fid", tiles), tol)
     moved = gate.pair_rows("d", gate.pair_score(shifted, archive, "polygon", "fid", tiles), tol)
-    assert gate.distance(same) == {"d": {"pair_attr": 0.0, "pair_iou_loss": 0.0}}
+    assert gate.distance(same) == {"d": {"pair_attr": 0.0, "pair_iou_loss": 0.0,
+                                         "bytes_ratio": 1.0, "features_ratio": 1.0}}
     far = gate.distance(moved)["d"]
     assert far["pair_iou_loss"] > 0.01 and far["pair_attr"] == 0.0  # moved, still the same features
 
@@ -219,3 +220,46 @@ def test_other_settings_are_measured_not_gated(monkeypatch, tmp_path):
     assert seen["args"].tylertoo_flags == ["--simplify-factor", "2"]
     assert "default_band" not in seen["tol"]["gate"]
     assert all("zoom_bands" not in d for d in seen["tol"]["datasets"].values())
+
+
+def test_feature_and_byte_ratios_per_zoom(archive, tmp_path):
+    """How much each tool keeps: tylertoo's features and tile bytes over tippecanoe's, 1 when equal."""
+    fewer = write_archive(tmp_path / "fewer.pmtiles", DISCS[:1])
+    tiles = {str(Z): {"tiles": {f"{X}/{Y}": {}}}}
+    tol = {"gate": {}, "datasets": {}}
+
+    def ratios(a, b):
+        return {r["metric"]: r for r in gate.pair_rows("d", gate.pair_score(a, b, "polygon", None, tiles), tol)
+                if r["metric"].endswith("_ratio")}
+
+    same = ratios(archive, archive)
+    assert same["features_ratio"]["d"] == 1.0 and same["bytes_ratio"]["d"] == 1.0
+    kept = ratios(fewer, archive)["features_ratio"]
+    assert (kept["tylertoo"], kept["tippecanoe"], kept["d"]) == (1, len(DISCS), 1 / len(DISCS))
+    assert ratios(fewer, archive)["bytes_ratio"]["d"] < 1
+    assert "ratio" in gate.line(kept)
+    banded = {"gate": {}, "datasets": {"d": {"zoom_bands": [{"zooms": [Z, Z], "features_ratio": [0.9, 1.1]}]}}}
+    assert gate.compare("d", tiles, tiles, banded) == []  # not a band of the comparison against the source
+    rows = gate.pair_rows("d", gate.pair_score(fewer, archive, "polygon", None, tiles), tol)
+    assert gate.distance(rows)["d"]["features_ratio"] == 1 / len(DISCS)
+
+
+@pytest.mark.parametrize("cap,sampled", [("0", sys.maxsize), ("250", 250)])
+def test_another_sample_size_is_measured_not_gated(monkeypatch, tmp_path, cap, sampled):
+    """--cap sets the tiles sampled per zoom (0: all of them); the bands were measured at the default."""
+    seen = {}
+    monkeypatch.setattr(gate.run_e2e, "resolve_tippecanoe", lambda p: {"binary": "t", "version": "v"})
+    monkeypatch.setattr(gate, "gate", lambda args, tol, tip, datasets: seen.update(args=args, tol=tol) or 0)
+    monkeypatch.setattr(sys, "argv", ["gate.py", "--work", str(tmp_path), "--tylertoo", sys.executable, "--cap", cap])
+    assert gate.main() == 0
+    assert seen["args"].cap == sampled
+    assert all("zoom_bands" not in d for d in seen["tol"]["datasets"].values())
+
+
+def test_the_mean_counts_a_tile_by_what_is_drawn_in_it():
+    """A sliver tile of ten pixels that differs wholly must not outweigh a full tile that agrees."""
+    pair = {str(Z): {"tiles": {"1/1": {"pair_iou_loss": 0.0}, "2/2": {"pair_iou_loss": 1.0}},
+                     "weights": {"1/1": {"pair_iou_loss": 990}, "2/2": {"pair_iou_loss": 10}}}}
+    rows = {r["metric"]: r for r in gate.pair_rows("d", pair, {"gate": {}, "datasets": {}})}
+    assert rows["pair_iou_loss_mean"]["pair"] == pytest.approx(0.01)
+    assert rows["pair_iou_loss_max"]["pair"] == 1.0 and rows["pair_iou_loss_max"]["tile"] == f"{Z}/2/2"
