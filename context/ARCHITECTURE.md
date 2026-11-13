@@ -620,13 +620,26 @@ rather than clumped in one corner.
 another. A coarse level has one partition and at most a few hundred tiles, so
 on madagascar-adm4 z3–z10 ran at 1.1–1.7 of 4 cores, about a third of the
 export wall. `plan_level_groups` now joins consecutive levels that each fit
-in one wave into one group, while the group's summed members stay within
-`level_group_member_cap`. That cap is one full ceiling-width wave of
-target-sized partitions (`ceiling × partition_target`), which is the most a
-serial wave already holds. On `auto` it also narrows to what fits in the
-#311 RAM budget. The cap counts members only. A group can also hold the
-encoded tiles of a level that finished before a coarser one, and these are
-smaller than the members they come from.
+in one wave, and whose own members fit `level_group_member_cap`, into one
+group. That cap is one full ceiling-width wave of target-sized partitions
+(`ceiling × partition_target`), which is the most a serial wave already
+holds. On `auto` it also narrows to what fits in the #311 RAM budget. The
+cap counts members only. A group can also hold the encoded tiles of a level
+that finished before a coarser one, and these are smaller than the members
+they come from.
+
+Under `auto` and `speed` the group's in-flight gate (`InFlight`, #817),
+not its summed members, bounds what a group holds: a level is collected
+once the members still encoding plus its own fit the largest wave plus
+`WAVE_SLACK_PERMILLE` (12.5%), never past the member cap. So the finest
+level joins the coarser levels' group, and its collect starts while their
+last giant tiles still encode instead of after the whole group ends. That
+overlap costs memory. Against 8d1d3ae3 on the 64-core host (5 interleaved
+rounds, medians), levels wall fell 11% on moldova and wideprops, 7% on brmt
+and 3% on lines, for 59–116 MiB (at most 4%) more peak RSS. `bounded` keeps
+the old schedule, with no slack for single-wave groups and the group's
+summed members within the cap: with the overlap its peak rose 36 MiB on
+lines.
 
 `export_level_group` collects the levels' members on the calling thread, one
 level at a time and in level order, as the serial loop does. Each collected
