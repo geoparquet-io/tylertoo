@@ -405,16 +405,20 @@ def gate_dataset(args, tol: dict, tip: dict, did: str, ds: dict) -> list:
     rows = compare(did, ty_scores, cached_score(tip_dir, src, attr, zooms, args.cap), tol)
     # From the scored tiles, not the rows: a polygon's seam row comes without any tile over the floor.
     empty = [z for z in zooms if not ty_scores[str(z)]["tiles"]]
-    if empty == list(zooms):  # every sampled tile is under its floor: no verdict, not a pass
+    # The direct comparison needs no source, so it takes every sampled tile, also
+    # those under the source floor (small polygons at low zooms).
+    sampled = {str(z): {"tiles": [f"{x}/{y}" for _, x, y in M.sample_tiles(src, z, args.cap)]} for z in zooms}
+    pairs = pair_rows(did, pair_score(ty_archive, tip_dir / "archive.pmtiles", src.kind, attr, sampled), tol)
+    preset = getattr(args, "preset", True)
+    # No tile scored against the source and no direct cell banded (or, measuring
+    # other settings, none measured): no verdict, not a pass.
+    if empty == list(zooms) and not any("pair" in r and (r["ok"] is not None or not preset) for r in pairs):
         raise ValueError(f"{did}: nothing to score at zooms {zooms}: no sampled tile holds enough of the source")
     if empty:
         print(f"{did}: not scored against the source (no sampled tile holds enough of it): "
               + ", ".join(f"z{z}" for z in empty), flush=True)
-    # The direct comparison needs no source, so it takes every sampled tile, also
-    # those under the source floor (small polygons at low zooms).
-    sampled = {str(z): {"tiles": [f"{x}/{y}" for _, x, y in M.sample_tiles(src, z, args.cap)]} for z in zooms}
-    rows += pair_rows(did, pair_score(ty_archive, tip_dir / "archive.pmtiles", src.kind, attr, sampled), tol)
-    if src.kind == "point" and getattr(args, "preset", True):  # the exact sum is the preset's promise
+    rows += pairs
+    if src.kind == "point" and preset:  # the exact sum is the preset's promise
         rows += cluster_rows(args, did, ds, src, zr, zooms)
     written = set()  # max, p99 and p95 of an error share its worst tile: one PNG, new each run
     for r in rows:

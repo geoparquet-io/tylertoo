@@ -123,6 +123,14 @@ def test_a_source_with_nothing_to_score_is_not_a_pass(archive, src, tmp_path, mo
     args = argparse.Namespace(work=tmp_path, zooms=None, cap=10)
     with pytest.raises(ValueError, match="nothing to score"):
         gate.gate_dataset(args, tol, {}, "d", {"path": "unused", "layer": "l"})
+    # A banded direct cell is a verdict without the source (open-buildings z12, fieldmaps z2 and z4).
+    banded = {**tol, "datasets": {"d": {"zoom_bands": [{"zooms": [Z, Z], "pair_iou_loss_mean": [0.0, 0.01]}]}}}
+    rows = gate.gate_dataset(args, banded, {}, "d", {"path": "unused", "layer": "l"})
+    assert any(r["metric"] == "pair_iou_loss_mean" and r["ok"] for r in rows)
+    # Measuring other settings bands nothing: the direct cells are the measurement.
+    args.preset = False
+    assert any(r["metric"] == "pair_iou_loss_mean" for r in
+               gate.gate_dataset(args, tol, {}, "d", {"path": "unused", "layer": "l"}))
 
 
 def test_a_zoom_with_nothing_to_score_is_named(archive, src, tmp_path, monkeypatch, capsys):
