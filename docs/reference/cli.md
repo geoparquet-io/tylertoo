@@ -465,7 +465,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | Option | Description |
 | --- | --- |
 | `--no-density-drop` | Turn off the per-level density budget, leaving cell-winner thinning only. |
-| `--drop-rate <F>` | Density budget decay: each coarser level keeps 1/rate of the next finer level's feature budget. Larger values thin mid zooms more. Default: `1.65`. |
+| `--drop-rate <F>` | Density budget decay: each coarser level keeps 1/rate of the next finer level's feature budget. Larger values thin mid zooms more. Default: `2.5`. |
 | `--drop-gamma <F>` | Sparse-area protection, at least 1: 1 reduces every neighborhood equally; larger values protect sparse areas more. Smaller values are rejected. Default: `1.5`. |
 | `--drop-lines` | Apply the density budget to lines as well as points: smaller, faster tiles that drop line features at coarse zooms (tippecanoe's `--drop-lines`). |
 | `--drop-polygons` | Apply the density budget to polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the budget excludes polygons by default (tippecanoe's `--drop-polygons`). |

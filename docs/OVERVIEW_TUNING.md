@@ -760,10 +760,11 @@ For country-scale builds:
 On Overture Germany buildings (59M footprints, z0–14), every level populates:
 z0 holds 581 dots, z4 128,886, and z6 1,074,540
 ([`corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md),
-Decision 6). Levels z6–z13 land on the
+Decision 6). In that measurement, before #745, the budget also thinned
+polygons, as `--drop-polygons` does now. Levels z6–z13 landed on the
 [density budget](#density-budget-drop-rate-drop-gamma-no-density-drop) ladder
-`N / 1.65^(14−z)`, with dense areas such as the Ruhr and Berlin visibly denser
-and rural areas protected. The overview file grows 31% (11.9 → 15.6 GB), and
+`N / 1.65^(14−z)` at the then-default rate 1.65, with dense areas such as
+the Ruhr and Berlin visibly denser and rural areas protected. The overview file grows 31% (11.9 → 15.6 GB), and
 conversion takes 40% longer. On the Moldova field corpus the same recipe adds
 **0.3%** to file size.
 
@@ -1057,7 +1058,7 @@ so a level that 256 or fewer features reach is not thinned at all.
 
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
-| `--drop-rate F` | `1.65` | ratio (>1) | **bigger = sparser mid zooms** |
+| `--drop-rate F` | `2.5` | ratio (>1) | **bigger = sparser mid zooms** |
 | `--drop-gamma F` | `1.5` | exponent (≥1; smaller is rejected) | **bigger = more sparse-area protection** |
 | `--no-density-drop` | off | flag | disables the budget |
 | `--drop-lines` | off | flag | applies the budget to lines too |
@@ -1072,16 +1073,23 @@ the same names do; together they restore the budget before #745.
 ### Drop rate
 
 Each coarser level has `1/rate` of the next finer level's budget. Raise
-`--drop-rate` for sparser mid zooms and smaller files. The default `1.65`
-comes from Portland roads. It brings z9 to 1.21× and z10 to 1.03× tippecanoe's
-counts and puts z11 at 0.67×. It leaves z8 and the coarse zooms near their
-cell-winner counts
-([`corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md)).
+`--drop-rate` for sparser mid zooms and smaller files. The default `2.5`
+matches tippecanoe's `-r 2.5`. The earlier 1.65 was calibrated on Portland
+roads, before #745 made the budget points-only by default; that line
+measurement does not describe point thinning.
 
-tylertoo anchors its budget on the full canonical count `N`; tippecanoe's
-`-rate` uses a per-tile basezoom count. Equivalent thinning therefore needs
-a smaller rate here. At `2.5`, Portland's z9–z13 counts fall below
-tippecanoe's.
+On 882k Overture places around Mexico City, 1.65 kept 2-12x tippecanoe's
+distinct points at z0-z13 (12.1x at z6, 5.3x at z10, 2.3x at z12).
+Changing only the rate to 2.5 brings z6-z13 within 1% by distinct feature
+ids and shrinks the archive from 81.4 MB to 57.3 MB. On 26k places over
+Baja California (10x10 degrees), 2.5 keeps 0.92-1.08x tippecanoe's points
+at z9-z13. Below z9, the 256-feature floor protects sparse data, keeping
+about 256-335 points where tippecanoe keeps 1-124.
+
+The anchors still differ: tylertoo uses the full canonical count `N` of
+budgeted kinds, while tippecanoe uses a per-tile basezoom count. For the
+measurements and decision, see
+[Decision 11 in `corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md#decision-11---drop-rate-25-for-the-points-only-budget).
 
 ### Spatial fairness
 

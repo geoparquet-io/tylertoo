@@ -155,6 +155,8 @@ Mato
 Grosso
 Goiás
 Sul
+# Places in the drop-rate measurements (corpus/SWEEPS.md Decision 11)
+Baja
 # Standard acronyms and identifiers readers know without a definition.
 # Uppercase only: Vale.Terms enforces the casing written here.
 PRs?

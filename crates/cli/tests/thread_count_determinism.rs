@@ -499,9 +499,11 @@ fn multi_part_output_is_byte_identical_across_read_worker_counts() {
 /// winner grid at coarse levels, and `road-detections` is a line layer, which
 /// runs the line thinning grid and the coalesce tables.
 ///
-/// Each runs twice: at the default drop rate ([`DEFAULT_ARM`]), and at
-/// `--drop-rate 6` ([`BOUND_ARM`]), which makes the budget bind harder and at
-/// more levels (#565). Since #745 the defaults thin and budget points only,
+/// Each runs twice: at `--drop-rate 1.65` ([`DEFAULT_ARM`], the default until
+/// #882), and at `--drop-rate 6` ([`BOUND_ARM`]), which makes the budget bind
+/// harder and at more levels (#565). The first arm pins its rate: at the
+/// current default of 2.5 Madagascar's per-level counts equal the bound
+/// arm's, so the two arms would run the same budget state. Since #745 the defaults thin and budget points only,
 /// so both arms opt lines and polygons back in (`--drop-lines
 /// --drop-polygons --polygon-thinning 1`) to keep running the polygon winner
 /// grid and the budget on these fixtures. [`density_budget_binds_in_both_plan_arms`] checks that
@@ -640,7 +642,14 @@ const MADAGASCAR: (&str, u8) = ("fieldmaps-madagascar-adm4.parquet", 8);
 const ROADS: (&str, u8) = ("road-detections.parquet", 12);
 const DEFAULT_ARM: (&str, &[&str]) = (
     "default",
-    &["--drop-lines", "--drop-polygons", "--polygon-thinning", "1"],
+    &[
+        "--drop-lines",
+        "--drop-polygons",
+        "--polygon-thinning",
+        "1",
+        "--drop-rate",
+        "1.65",
+    ],
 );
 const BOUND_ARM: (&str, &[&str]) = (
     "bound",

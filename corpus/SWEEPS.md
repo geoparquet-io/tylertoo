@@ -50,6 +50,8 @@ Full tables: `context/archive/corpus/SWEEP_NOTES.md`.
 
 ## Decision 2: `--drop-rate 1.65` (Q2 density budget)
 
+Superseded by [Decision 11](#decision-11---drop-rate-25-for-the-points-only-budget).
+
 **Sweep:** `--drop-rate` ∈ {off, 1.55, 1.60, 1.65, 1.80, 2.50} on
 `lines-portland-medium` (duplicating, lt=1, auto-rank, z0–14);
 ratio = ours / tippecanoe distinct-feature count at matching zoom:
@@ -233,7 +235,8 @@ a 20 m building on a z4 map as a polygon. The documented recipe
 `--polygon-visibility 0 --collapse` (+ `--max-tile-size 500K` on export,
 + a circle layer in the style): every Germany level populates (z0 = 581
 dots, z4 = 128,886, z6 = 1.07M), z6–z13 land exactly on the budget
-ladder `N/1.65^(14−z)` with visible gamma-fair density structure
+ladder `N/1.65^(14−z)` at the then-default 1.65, with visible gamma-fair
+density structure
 (Ruhr/Berlin denser, rural protected), at +31 % overview bytes / +40 %
 convert wall on Germany and **+0.3 % bytes** on Moldova. Uncapped coarse
 dot tiles reach 12 MB (Germany z6) — hence the 500K cap in the recipe,
@@ -495,3 +498,34 @@ What shaped the cost and the coverage:
 The fill stays opt-in. The Moldova over-draw (#762) and the overview's
 inability to tell a dense coverage from scattered sub-pixel polygons keep it
 so.
+
+## Decision 11: `--drop-rate 2.5` for the points-only budget
+
+**Measurement (2026-11-13):** main @ `95cbd607` against tippecanoe 2.79.0,
+changing only the drop rate from 1.65 to 2.5:
+
+- On 882k Overture places around Mexico City, 1.65 kept 2-12x
+  tippecanoe's distinct points at z0-z13 (12.1x at z6, 5.3x at z10,
+  2.3x at z12). At 2.5, z6-z13 are within 1% of tippecanoe by distinct
+  feature ids, and the archive shrinks from 81.4 MB to 57.3 MB.
+- On 26k places over Baja California (10x10 degrees), 2.5 keeps
+  0.92-1.08x tippecanoe's points at z9-z13. Below z9, the existing
+  256-feature floor keeps about 256-335 points where tippecanoe keeps
+  1-124, protecting sparse data.
+- On the full 5.5M-place Overture file, one run each, wall time falls
+  from 23.9 s to 16.4 s, archive size from 2.40 GB to 1.79 GB, and
+  features the size valve dropped from 2.35M to 0.81M. Peak RSS is unchanged.
+- For lines, `--drop-lines --drop-rate 2.5` reproduces tippecanoe
+  `--drop-lines` almost exactly.
+
+**Decision (2026-11-13):** default to `--drop-rate 2.5` (Python
+`drop_rate`), matching tippecanoe's `-r 2.5`. Decision 2 calibrated 1.65
+on Portland roads, but since #745 the budget thins only points by default.
+Its claim that 2.5 over-thins came from lines anchored on the full canonical
+count; it does not hold for points.
+
+Gamma stays 1.5, and `MIN_DENSITY_LEVEL_FEATURES` stays 256. Lines and
+polygons remain exempt unless you set `--drop-lines` or `--drop-polygons`.
+`--preset tippecanoe` still sets 2.5 explicitly, now matching the default
+for this row; it still changes gamma to 1, simplify factor, buffer, caps,
+and the size valve.

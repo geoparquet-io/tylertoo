@@ -152,6 +152,10 @@ fn run_overview(
         profile,
         "--read-batch-size",
         READ_BATCH_ROWS,
+        // The row counts and memory limits here were sized at this rate, the
+        // default until #882; at 2.5 the tail no longer outgrows the budget.
+        "--drop-rate",
+        "1.65",
     ])
     .env("RAYON_NUM_THREADS", "4")
     .env("TYLERTOO_PROFILE_JSON", &profile_json)

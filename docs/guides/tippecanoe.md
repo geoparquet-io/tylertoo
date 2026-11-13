@@ -23,18 +23,17 @@ To start from tippecanoe's defaults instead of tylertoo's, pass
 The two default pipelines use different thinning ladders. More features at
 a middle zoom do not by themselves show a clipping or encoding error.
 
-- **The default rate differs.** Both tools anchor their default drop
-  ladders at the finest zoom and keep all features there before tile size
-  limits apply. For kinds that tylertoo's budget thins, level `L`
-  has a budget of `max(256, round(N / 1.65^(finest − L)))`, where `N` is
-  the full canonical count of those kinds. Tippecanoe's documented `-r`
-  default is 2.5. Its `-B` base zoom defaults to the maximum zoom (`-z`).
-  The Portland sweep calibrated tylertoo's 1.65 with cell selection, which
-  already thins coarse zooms. See the sweep below and tippecanoe's
+- **The rate matches, but the anchors differ.** Both tools default to 2.5
+  and anchor their default drop ladders at the finest zoom, keeping all
+  features there before tile size limits apply. For kinds that tylertoo's
+  budget thins, level `L` has a budget of
+  `max(256, round(N / 2.5^(finest − L)))`, where `N` is the full canonical
+  count of those kinds. Tippecanoe uses a per-tile basezoom count; its
+  `-B` base zoom defaults to the maximum zoom (`-z`). See its
   [documented defaults](https://github.com/felt/tippecanoe#dropping-a-fixed-fraction-of-features-by-zoom-level).
-  Matching zooms and passing the same rate do not make the selection
-  algorithms equivalent. tylertoo also keeps one candidate in tiles the
-  density budget would otherwise empty, which can exceed the budget.
+  Matching zooms and rates does not make the selection algorithms
+  equivalent. tylertoo also keeps one candidate in tiles the density
+  budget would otherwise empty, which can exceed the budget.
 - **Cell selection comes first.** tylertoo chooses cell winners before
   applying the budget as a ceiling. It does not add features if cell
   selection keeps fewer than that ceiling. At middle zooms the cells can
@@ -52,13 +51,12 @@ a middle zoom do not by themselves show a clipping or encoding error.
   default size valve merges dense lines and polygons. The limits do not
   imply the tools will drop the same features.
 
-The [Portland sweep](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md#decision-2---drop-rate-165-q2-density-budget)
-found 2.89× and 3.57× tippecanoe's distinct-feature counts at z9 and z10
-with cell selection alone. A rate of 1.65 brought those ratios to 1.21×
-and 1.03×; 2.5 fell below tippecanoe. That historical line sweep predates
-the points-only default budget. It explains the rate choice, not a
-count guarantee for current inputs. Some zooms and datasets keep fewer
-features than tippecanoe.
+The historical Portland roads sweep calibrated 1.65 before #745 made the
+budget points-only by default. Its finding that 2.5 over-thinned lines
+anchored on the full canonical count does not hold for points. The
+[new point measurements](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md#decision-11---drop-rate-25-for-the-points-only-budget)
+support the shared default of 2.5; the anchors and selection algorithms
+still differ, so this is not a count guarantee for every input.
 
 See the [density budget](../OVERVIEW_TUNING.md#density-budget-drop-rate-drop-gamma-no-density-drop)
 and [architecture divergences](https://github.com/geoparquet-io/tylertoo/blob/main/context/ARCHITECTURE.md#known-divergences-from-tippecanoe-overview-pipeline).
@@ -79,7 +77,7 @@ attributing a count difference to one default.
 | `-n` name / `-N` description / `-A` attribution | `--name` / `--description` / `--attribution` | An unset field is left out of the archive. tippecanoe names the tileset after the output file and copies the name into `description`. `merge` and `pyramid` keep every inherited credit; see [attribution](attribution.md) |
 | `-b` buffer (default 5) | `--tile-buffer` (default 8) | Tile-pixel seam buffer |
 | `-y` / `-x` / `-X` property selection | `--include-property` / `--exclude-property` / `--exclude-all-properties` | Applied during scans for `overview` / `tiles`, during export for `export-pmtiles`. In both tools, an include list overrides exclusions |
-| `-r` drop rate (default 2.5) | `--drop-rate` (default 1.65) | Both default ladders anchor at the finest zoom. tylertoo applies its budget as a ceiling after cell selection. Thins points only by default, as in tippecanoe |
+| `-r` drop rate (default 2.5) | `--drop-rate` (default 2.5) | Both default ladders anchor at the finest zoom. tylertoo applies its budget as a ceiling after cell selection. Thins points only by default, as in tippecanoe |
 | `--drop-lines` / `--drop-polygons` | `--drop-lines` / `--drop-polygons` | Apply the drop rate to lines and polygons too |
 | gamma dot-dropping | `--drop-gamma` | Applied per super-cell; per-level totals stay unchanged |
 | `-S` simplification | `--simplify-factor` | Ramer-Douglas-Peucker (RDP), cascading by default. `-S N` is N tile units; `--simplify-factor N/4` is about the same at z0 to max zoom − 1. tylertoo does not simplify the max zoom; tippecanoe does |
@@ -122,7 +120,7 @@ Values are from tippecanoe v2.82.0 (`main.cpp`, `tile.cpp`, `geometry.cpp`).
 
 | Option | tylertoo default | With the preset | tippecanoe source |
 |---|---|---|---|
-| `--drop-rate` (convert) | 1.65 | 2.5 | `-r`, `droprate = 2.5` |
+| `--drop-rate` (convert) | 2.5 | 2.5 (matches default) | `-r`, `droprate = 2.5` |
 | `--drop-gamma` (convert) | 1.5 | 1 | `-g`, `gamma = 0` ("no effect"). tylertoo's 1 also thins every neighborhood by the same share. In both tools a tile the drop rate would empty keeps one feature |
 | `--simplify-factor` (convert) | 1 | 0.25 | `-S`, `simplification = 1`: one tile unit at detail 12 (4096). A tile unit is a quarter GSD at the default `--gsd-base 1024` |
 | `--tile-buffer` (export) | 8 | 5 | `-b`, `buffer = 5` screen pixels, 1/256 of a tile |
