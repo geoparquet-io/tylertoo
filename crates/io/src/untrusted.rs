@@ -15,9 +15,10 @@
 //! What the owner guarantees, in one place:
 //!
 //! - **A footer pre-check** before parquet-rs decodes a footer (#690):
-//!   [`precheck_footer`] walks the thrift bytes and refuses any list, map or
-//!   schema child count larger than the bytes or elements that could follow
-//!   it, so no footer-declared count sizes an allocation.
+//!   [`precheck_footer`] walks the thrift bytes as parquet-rs reads them
+//!   (#789) and refuses any list, map or schema child count larger than the
+//!   bytes or elements that could follow it, so no footer-declared count
+//!   sizes an allocation.
 //! - **Column chunk ranges inside the file** (#430), for local and remote
 //!   inputs alike: parquet's own `byte_range()` asserts on a negative offset,
 //!   and every later `start + len` trusts these numbers.
@@ -346,10 +347,10 @@ impl Skim<'_> {
         Ok(())
     }
 
-    /// Skip `size` collection elements of compact type `elem`. A boolean
-    /// element is one byte in a collection, not a type nibble.
+    /// Skip `size` collection elements of compact type `elem`. parquet-rs
+    /// skips a boolean element as no bytes, though it is one on the wire, so
+    /// this does too: the walk must stay where parquet-rs is (#789).
     fn skip_elements(&mut self, elem: u8, size: usize, depth: u32) -> Result<(), SkimStop> {
-        let elem = if matches!(elem, 1 | 2) { 3 } else { elem };
         (0..size).try_for_each(|_| self.skip(elem, depth))
     }
 
@@ -357,8 +358,8 @@ impl Skim<'_> {
     fn skip(&mut self, ty: u8, depth: u32) -> Result<(), SkimStop> {
         Self::check_depth(depth)?;
         match ty {
-            // Booleans: the value is the type nibble of a field; in a
-            // collection it is one byte (handled by the caller passing 3).
+            // Booleans: the value is the type nibble of a field; parquet-rs
+            // skips a collection's as nothing too (`skip_elements`).
             1 | 2 => Ok(()),
             3 => self.advance(1),
             4..=6 => self.varint().map(drop),
@@ -373,6 +374,7 @@ impl Skim<'_> {
             }
             11 => self.skip_map(depth + 1),
             12 => self.fields(depth + 1, |s, _, ty| s.skip(ty, depth + 1)),
+            13 => self.advance(16),
             _ => Err(SkimStop::Confused),
         }
     }
@@ -390,7 +392,8 @@ impl Skim<'_> {
     }
 
     /// Walk one struct's fields, handing each `(field id, type)` to `field`,
-    /// which must consume the value.
+    /// which must consume the value. As in parquet-rs, any byte with a zero
+    /// type nibble ends the struct and a long-form id is truncated to i16.
     fn fields(
         &mut self,
         depth: u32,
@@ -400,18 +403,34 @@ impl Skim<'_> {
         let mut last: i16 = 0;
         loop {
             let b = self.byte()?;
-            if b == 0 {
+            let ty = b & 0x0f;
+            if ty == 0 {
                 return Ok(());
             }
-            let ty = b & 0x0f;
             let id = match b >> 4 {
-                0 => i16::try_from(self.zigzag()?).map_err(|_| SkimStop::Confused)?,
+                0 => self.zigzag()? as i16,
                 delta => last
                     .checked_add(i16::from(delta))
                     .ok_or(SkimStop::Confused)?,
             };
             last = id;
             field(self, id, ty)?;
+        }
+    }
+
+    /// One field's value of wire type `ty`: as parquet-rs reads it when it
+    /// knows the field, else skipped as parquet-rs skips it.
+    fn field(&mut self, ty: u8, known: Option<Known>, depth: u32) -> Result<(), SkimStop> {
+        match known {
+            None => self.skip(ty, depth),
+            Some(Known::Wire(want)) => {
+                read_as(ty, want)?;
+                self.skip(ty, depth)
+            }
+            Some(Known::Struct(spec)) => {
+                read_as(ty, 12)?;
+                self.fields(depth + 1, |s, id, ty| s.field(ty, spec(id), depth + 1))
+            }
         }
     }
 
@@ -425,7 +444,8 @@ impl Skim<'_> {
         for index in 0..size {
             let after = size - index - 1;
             self.fields(depth + 1, |s, id, ty| {
-                if id == 5 && ty == 5 {
+                if id == 5 {
+                    read_as(ty, 5)?;
                     // parquet-rs reads an i32 by truncating the zigzag i64, so
                     // an i64 that is negative here can be 1.7 billion there (#789).
                     let children = s.zigzag()? as i32;
@@ -437,12 +457,80 @@ impl Skim<'_> {
                     }
                     Ok(())
                 } else {
-                    s.skip(ty, depth + 2)
+                    s.field(ty, schema_element(id), depth + 2)
                 }
             })?;
         }
         Ok(())
     }
+}
+
+/// How parquet-rs reads a field it knows, by id: as this compact type, or
+/// as a struct whose fields it knows by this table, whatever wire type the
+/// field declares (#789).
+#[derive(Clone, Copy)]
+enum Known {
+    Wire(u8),
+    Struct(fn(i16) -> Option<Known>),
+}
+
+/// Refuse a known field whose wire type parquet-rs would read as `want`.
+/// The walk skips by wire type, so it would leave parquet-rs's position and
+/// miss the counts parquet-rs then reads. An honest writer never does this.
+fn read_as(ty: u8, want: u8) -> Result<(), SkimStop> {
+    // Same bytes on the wire: bools (none), zigzag varints, list headers.
+    let family = |t: u8| match t {
+        2 => 1,
+        4 | 6 => 5,
+        10 => 9,
+        t => t,
+    };
+    if family(ty) == family(want) {
+        Ok(())
+    } else {
+        Err(SkimStop::Hostile(format!(
+            "a footer field of wire type {ty} is one parquet reads as type {want}"
+        )))
+    }
+}
+
+/// `SchemaElement`'s fields, but `num_children` ([`Skim::schema`]).
+fn schema_element(id: i16) -> Option<Known> {
+    match id {
+        1..=3 | 6..=9 => Some(Known::Wire(5)),
+        4 => Some(Known::Wire(8)),
+        10 => Some(Known::Struct(logical_type)),
+        _ => None,
+    }
+}
+
+/// `LogicalType`'s variants, each a struct.
+fn logical_type(id: i16) -> Option<Known> {
+    let variant: fn(i16) -> Option<Known> = match id {
+        1..=4 | 6 | 11..=15 => |_| None,
+        5 => |id| matches!(id, 1 | 2).then_some(Known::Wire(5)),
+        7 | 8 => |id| match id {
+            1 => Some(Known::Wire(1)),
+            2 => Some(Known::Struct(|id| {
+                (1..=3).contains(&id).then_some(Known::Struct(|_| None))
+            })),
+            _ => None,
+        },
+        10 => |id| match id {
+            1 => Some(Known::Wire(3)),
+            2 => Some(Known::Wire(1)),
+            _ => None,
+        },
+        16 => |id| (id == 1).then_some(Known::Wire(3)),
+        17 => |id| (id == 1).then_some(Known::Wire(8)),
+        18 => |id| match id {
+            1 => Some(Known::Wire(8)),
+            2 => Some(Known::Wire(5)),
+            _ => None,
+        },
+        _ => return None,
+    };
+    Some(Known::Struct(variant))
 }
 
 /// Refuse a thrift `FileMetaData` footer whose declared counts could make
@@ -455,7 +543,14 @@ impl Skim<'_> {
 /// every list, set and map size against the bytes that remain, every schema
 /// element's child count against the elements that follow, and the nesting
 /// depth. Bytes it cannot make sense of are left to parquet-rs, which
-/// reports its own error: the pre-check only ever refuses a count.
+/// reports its own error.
+///
+/// The counts are the ones parquet-rs will read (#789). parquet-rs reads a
+/// field it knows by its id and its own type, whatever wire type the field
+/// declares, so up to the row groups the walk does too: it refuses a known
+/// field whose wire type would make the two read different bytes, and a
+/// field an honest writer puts after the row groups. It skips everything
+/// else as parquet-rs skips it.
 ///
 /// Each declared count is floored at its element type's smallest wire size
 /// (`min_wire_bytes`), not its decoded size. A struct element can be one
@@ -473,12 +568,29 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
         buf: thrift,
         pos: 0,
     };
-    let walked = skim.fields(0, |s, id, ty| {
-        if id == 2 && ty == 9 {
+    // parquet-rs reads `FileMetaData` by field id too, and reserves for the
+    // schema's children (2) and the row groups (4).
+    let mut row_groups = false;
+    let walked = skim.fields(0, |s, id, ty| match id {
+        1 | 3 => s.field(ty, Some(Known::Wire(5)), 1),
+        2 => {
+            read_as(ty, 9)?;
             s.schema(1)
-        } else {
-            s.skip(ty, 1)
         }
+        4 => {
+            row_groups = true;
+            s.field(ty, Some(Known::Wire(9)), 1)
+        }
+        // parquet-rs reads these by its own types; an honest writer puts
+        // them after the row groups.
+        5..=9 if !row_groups => Err(SkimStop::Hostile(format!(
+            "footer field {id} comes before the row groups"
+        ))),
+        // shortcut: row groups and later fields are skipped by wire type,
+        // though parquet-rs reads them by id, so a retyped field in them can
+        // hide a second row-group list's count from this walk; upgrade to
+        // `Known` tables for them if the fuzzer finds one.
+        _ => s.skip(ty, 1),
     });
     match walked {
         Err(SkimStop::Hostile(reason)) => Err(InputError::HostileFooter(reason)),
@@ -3506,8 +3618,8 @@ mod tests {
     /// ten doubles need 80 bytes, so 16 remaining bytes refuse it.
     #[test]
     fn a_list_of_doubles_needs_eight_bytes_each() {
-        // Field 1, type list; list of 10 doubles; 15 bytes; struct stop.
-        let mut footer = vec![0x19, 0xA7];
+        // Field 10 (unknown), type list; list of 10 doubles; 15 bytes; stop.
+        let mut footer = vec![0xA9, 0xA7];
         footer.extend_from_slice(&[0u8; 15]);
         footer.push(0);
         let err = super::precheck_footer(&footer).unwrap_err().to_string();

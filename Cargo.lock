@@ -4911,6 +4911,7 @@ dependencies = [
  "lz4_flex",
  "object_store",
  "parquet",
+ "proptest",
  "tempfile",
  "thiserror 2.0.21",
 ]
