@@ -822,7 +822,7 @@ Two checks, both exit 1:
   section is checked. `whole_cores_frac` x CPUs is the minimum whole-run
   effective cores and `serial_share_max` (0.10) the maximum serial share.
   The floors are data in `benchmarks/baseline/valve_guard.json` under the host
-  class, so tighten them there as #813 lands; `record` seeds
+  class, so tighten them there as core use rises (#876); `record` seeds
   `{"whole_cores_frac": 0.05, "serial_share_max": 0.10}` into a class with
   none and keeps an existing section. A cell is exempt only through a
   `[cores_floor.<cell>]` entry (reason, issue, measured) in
@@ -859,8 +859,39 @@ never changes output bytes.
 
 #### Accepted limits (#813)
 
-Measured on 2026-11-12 on the 64-core Neoverse-V1 host at origin/main
-a0916f04. These limits stay as they are:
+#813 found 64-core runs keeping 19–29 cores busy. Where each of its items
+ended (64-core Neoverse-V1 host, figures from the PR or commit named):
+
+- **Export levels: partly fixed; the rest is #876.** #818 pipelined level
+  groups, capped members in flight instead of the group, and read bands in
+  parallel: levels cores on Oregon roads 26.2 → 32.8, Moldova 30.3 → 39.0.
+  #881 let the last level join the open level group and fills a multi-wave
+  level's store while coarser levels encode. Whole-run wall: FTW Brazil (MT)
+  25.8 → 23.7 s, lines 3.28 → 2.93 s, Moldova 3.23 → 3.01 s, tiles
+  byte-identical. Two pieces remain, both measured in #876: a few giant
+  tiles hold the in-flight cap, so levels has work for only 2–16 cores for
+  most of its window; and the fixed default cap of 40 workers, past which
+  more workers added memory but no speed.
+- **Export finalize: fixed by #878.** The stall was one `fdatasync` of the
+  whole archive after export's compute (#813 saw 3.2 s on Oregon roads; #818
+  measured 0.22–0.25 s there and blamed a slow volume). A writer thread now
+  syncs the archive while export runs, on Linux (ea145e7c). Lines: finalize
+  0.477 → 0.072 s, wall 4.12 → 3.64 s. Wide-property places: finalize
+  1.50 → 0.29 s, wall 6.96 → 5.68 s.
+- **S3 reads: fixed by #818; now bandwidth-bound.** The cap was latency
+  times a fixed 8 requests in flight. Footer and staging requests now follow
+  the 256 MiB staging budget, up to 128 in flight (6a8cd509). Overture
+  buildings, Connecticut `--bbox`: wall 14.4 → 8.35 s, cores 11.9 → 20.4,
+  limited by the ~470 MB/s `aws s3 cp` gets on the same host. Nobody re-ran
+  the Netherlands run from #813. #878 and #881 did not change remote reads.
+- **Smaller serial pieces: accepted.** #818 made polygon `assignment+budget`
+  parallel (Moldova 0.21 s at 2.6 cores → 0.03 s at 16.9). `pre-pass2`
+  (≤0.2% of wall) and `writer.finish` (≤0.9%) stay serial, as do the
+  group-commit lock wait (≤1.5%) and process-exit teardown (under 2% each):
+  each sits below #818's 2% bar. Bounded pass 2's spill drain is #791.
+
+Measured on 2026-11-12 on the same host at origin/main a0916f04.
+These limits stay as they are:
 
 - Export `levels` is the top phase that does not scale, on every cell.
   Perfect scaling from 32 to 64 workers would save 22–28% of wall on the
@@ -880,8 +911,6 @@ a0916f04. These limits stay as they are:
   and with `MIMALLOC_PURGE_DELAY=0` pass 2's peak was lower than without the
   split. `MemoryBudget` charges it, and `bounded` keeps one thread per reader.
   The default worker cap of 40 stays.
-- Export finalize used to stall on one `fdatasync` of the whole archive. On
-  Linux the archive is now written back while export runs.
 
 ### Export phase (#535)
 
