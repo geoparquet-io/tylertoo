@@ -43,7 +43,8 @@ runs vulture. The Gate scripts job runs the `scripts/ci/tests` pytest step
 docs generator, and a check that `CI passed` needs every job in `ci.yml`), the
 benchmark harness tests (`benchmarks/test_run_manifest.py`,
 `benchmarks/test_valve_guard.py`, `benchmarks/coalesce/test_run.py`,
-`benchmarks/e2e/test_run_e2e.py`), and `scripts/gen_bench_docs.py --check`,
+`benchmarks/e2e/test_run_e2e.py`), the visual gate's unit tests
+(`benchmarks/visual`), and `scripts/gen_bench_docs.py --check`,
 which fails when a published benchmark number differs from
 `benchmarks/results/`.
 
@@ -70,6 +71,7 @@ pins the entry count, so a new exemption also changes that test.
 | Bench list, exemptions, `DEVELOPMENT.md` table | `scripts/bench_list.py check` (`scripts/bench_list.py docs` rewrites the table) |
 | Gate scripts tests | `uv run --no-project --with pytest==8.4.2 --with pmtiles==3.8.1 --with mapbox-vector-tile==2.2.0 --with shapely==2.2.0 --with pyarrow==26.0.0 --with pyyaml==6.0.3 pytest -q scripts/ci/tests` |
 | Harness tests | `uv run --no-project --python 3.12 --with pytest==8.4.2 pytest -q benchmarks/test_run_manifest.py benchmarks/test_valve_guard.py benchmarks/coalesce/test_run.py benchmarks/e2e/test_run_e2e.py` (needs GNU `time`) |
+| Visual gate tests | `uv run --no-project --python 3.12 --with pytest==8.4.2 --with hypothesis==6.170.14 --with numpy==2.5.4 --with rasterio==1.5.2 --with shapely==2.1.1 --with pyarrow==21.0.0 --with pmtiles==3.8.1 --with mapbox-vector-tile==2.2.0 --with pillow==13.0.0 pytest -q benchmarks/visual` |
 | Generated docs | `uv run --no-project python scripts/gen_bench_docs.py --check` |
 | Fixtures | `scripts/ci/verify_fixtures.sh tests/fixtures/realdata` |
 

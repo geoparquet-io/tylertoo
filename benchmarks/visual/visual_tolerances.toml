@@ -1,0 +1,369 @@
+# Bands of the visual gate (benchmarks/visual/gate.py, #869).
+#
+# The gated number is d = tylertoo's error - tippecanoe's error, each measured
+# against the source on the same tiles, for the worst tiles of a zoom (the
+# max, p99 and p95 over the sampled tiles) and for the seams. An error is a
+# share between 0 and 1, so d = +0.05 means tylertoo's worst tile loses five
+# percentage points more of the source than tippecanoe's.
+#
+# The pair_* cells compare the two archives directly, tile against tile, with
+# no source: pair_iou_loss (1 - IoU of the polygon area the tools draw), pair_attr (area
+# both draw with different attribute values), pair_apart (line length more
+# than a pixel from the other tool's) and pair_count (points not matched per
+# grid cell). 0 means the two tiles draw the same; the value is its own d.
+# features_ratio and bytes_ratio (what tylertoo keeps over tippecanoe) have no
+# band: they are reported for tuning, and neither direction is better.
+#
+# Each band is the measured d with 0.01 of headroom on both sides, and its
+# comment carries the measured values. It is a ratchet:
+#
+#   * d above the band: tylertoo draws worse than it did. Fix the code.
+#   * d below the band: tylertoo draws better than it did. Tighten the band
+#     in the same PR, with the new measurement in the comment.
+#
+# A band changes only in a PR that states the new measurement. It is never
+# widened to make a run pass.
+#
+# The measurements do not depend on the machine: both archives are
+# deterministic (tippecanoe runs without -P) and the metrics are rasters of
+# decoded tiles. Two full runs from scratch gave identical numbers.
+#
+# A zoom and metric without a band, or a dataset given with --dataset, takes
+# [gate].default_band: it fails when tylertoo is more than 0.02 worse and has
+# no lower side.
+#
+# What the numbers show where d is not about 0:
+#
+#   vd-points z8-z12  count_error is near 1 for both tools: both thin points
+#                     heavily at coarse zooms. tylertoo keeps a few more
+#                     (d < 0). pair_count is high there too: the two tools
+#                     keep different points. At z14 both keep every point and
+#                     pair_count is 0.
+
+schema_version = 1
+
+[gate]
+# Both tools tile this range; tippecanoe's dropping is anchored at its -z.
+zoom_range = [0, 14]
+# Scored zooms of a dataset that names none.
+zooms = [6, 10, 14]
+default_band = [-1.0, 0.02]
+
+# `gate.py --self-test` injects the defects of mutate.py here.
+[self_test]
+dataset = "madagascar-adm4"
+zooms = [6, 8, 10]
+
+# ---- bands (measured at 8d1d3ae3, tippecanoe 2.79.0) ----
+
+[datasets."madagascar-adm4"]
+color_attr = "fid"
+zooms = [4, 6, 8, 10]
+
+[[datasets."madagascar-adm4".zoom_bands]]
+zooms = [4, 4]
+added_max          = [-0.0100, 0.0100]  # measured ty 0.00140056, tip 0.00140056
+added_p99          = [-0.0100, 0.0100]  # measured ty 0.00139064, tip 0.00138611
+added_p95          = [-0.0100, 0.0100]  # measured ty 0.00135094, tip 0.00132833
+attr_mismatch_max  = [-0.0031, 0.0169]  # measured ty 0.0586592, tip 0.0517364
+attr_mismatch_p99  = [-0.0031, 0.0169]  # measured ty 0.0585897, tip 0.0516452
+attr_mismatch_p95  = [-0.0030, 0.0170]  # measured ty 0.0583117, tip 0.0512805
+missing_max        = [-0.0242, -0.0042]  # measured ty 0.0287135, tip 0.0429573
+missing_p99        = [-0.0241, -0.0041]  # measured ty 0.0286604, tip 0.0427659
+missing_p95        = [-0.0236, -0.0036]  # measured ty 0.0284481, tip 0.0420003
+edge_gap           = [-0.0115, 0.0085]  # measured ty 0.0118343, tip 0.0133136
+pair_attr_max      = [0.0071, 0.0271]  # measured 0.0171
+pair_attr_p99      = [0.0070, 0.0270]  # measured 0.0170
+pair_attr_p95      = [0.0066, 0.0266]  # measured 0.0166
+pair_iou_loss_max  = [0.0254, 0.0454]  # measured 0.0354
+pair_iou_loss_p99  = [0.0254, 0.0454]  # measured 0.0354
+pair_iou_loss_p95  = [0.0254, 0.0454]  # measured 0.0354
+pair_attr_mean     = [0.0021, 0.0221]  # measured 0.0121
+pair_iou_loss_mean = [0.0205, 0.0405]  # measured 0.0305
+
+[[datasets."madagascar-adm4".zoom_bands]]
+zooms = [6, 6]
+added_max          = [-0.0099, 0.0101]  # measured ty 0.000897044, tip 0.000815494
+added_p99          = [-0.0099, 0.0101]  # measured ty 0.000876707, tip 0.000798419
+added_p95          = [-0.0099, 0.0101]  # measured ty 0.000795358, tip 0.000730118
+attr_mismatch_max  = [-0.0094, 0.0106]  # measured ty 0.0138265, tip 0.0132607
+attr_mismatch_p99  = [-0.0094, 0.0106]  # measured ty 0.0137872, tip 0.0132092
+attr_mismatch_p95  = [-0.0094, 0.0106]  # measured ty 0.01363, tip 0.0130033
+missing_max        = [-0.0095, 0.0105]  # measured ty 0.00349752, tip 0.00300768
+missing_p99        = [-0.0095, 0.0105]  # measured ty 0.00348768, tip 0.00300524
+missing_p95        = [-0.0095, 0.0105]  # measured ty 0.00344829, tip 0.00299546
+edge_gap           = [-0.0111, 0.0089]  # measured ty 0.00163354, tip 0.00272257
+excess_change      = [-0.0044, 0.0156]  # measured ty -0.167553, tip -0.173202
+pair_attr_max      = [0.0000, 0.0122]  # measured 0.0022
+pair_attr_p99      = [0.0000, 0.0121]  # measured 0.0021
+pair_attr_p95      = [0.0000, 0.0120]  # measured 0.0020
+pair_iou_loss_max  = [0.0000, 0.0125]  # measured 0.0025
+pair_iou_loss_p99  = [0.0000, 0.0125]  # measured 0.0025
+pair_iou_loss_p95  = [0.0000, 0.0125]  # measured 0.0025
+pair_attr_mean     = [0.0000, 0.0117]  # measured 0.0017
+pair_iou_loss_mean = [0.0000, 0.0119]  # measured 0.0019
+
+[[datasets."madagascar-adm4".zoom_bands]]
+zooms = [8, 8]
+added_max          = [-0.0103, 0.0097]  # measured ty 0.00237883, tip 0.00267618
+added_p99          = [-0.0098, 0.0102]  # measured ty 0.00234712, tip 0.00216871
+added_p95          = [-0.0102, 0.0098]  # measured ty 0.00092742, tip 0.0011499
+attr_mismatch_max  = [-0.0099, 0.0101]  # measured ty 0.0056272, tip 0.00549618
+attr_mismatch_p99  = [-0.0097, 0.0103]  # measured ty 0.00559852, tip 0.00534605
+attr_mismatch_p95  = [-0.0099, 0.0101]  # measured ty 0.00521067, tip 0.00512079
+missing_max        = [-0.0101, 0.0099]  # measured ty 0.0023015, tip 0.00237883
+missing_p99        = [-0.0099, 0.0101]  # measured ty 0.00221129, tip 0.00211122
+missing_p95        = [-0.0103, 0.0097]  # measured ty 0.00133115, tip 0.00167272
+edge_gap           = [-0.0099, 0.0101]  # measured ty 0.000410795, tip 0.000303631
+excess_change      = [-0.0109, 0.0091]  # measured ty -0.00811267, tip -0.00725221
+pair_attr_max      = [0.0000, 0.0114]  # measured 0.0014
+pair_attr_p99      = [0.0000, 0.0112]  # measured 0.0012
+pair_attr_p95      = [0.0000, 0.0108]  # measured 0.0008
+pair_iou_loss_max  = [0.0000, 0.0120]  # measured 0.0020
+pair_iou_loss_p99  = [0.0000, 0.0116]  # measured 0.0016
+pair_iou_loss_p95  = [0.0000, 0.0108]  # measured 0.0008
+pair_attr_mean     = [0.0000, 0.0104]  # measured 0.0004
+pair_iou_loss_mean = [0.0000, 0.0103]  # measured 0.0003
+
+[[datasets."madagascar-adm4".zoom_bands]]
+zooms = [10, 10]
+added_max          = [-0.0088, 0.0112]  # measured ty 0.00623441, tip 0.00498753
+added_p99          = [-0.0091, 0.0109]  # measured ty 0.00470174, tip 0.00376139
+added_p95          = [-0.0099, 0.0101]  # measured ty 0.000343618, tip 0.000278727
+attr_mismatch_max  = [-0.0100, 0.0100]  # measured ty 0.00238949, tip 0.00239521
+attr_mismatch_p99  = [-0.0100, 0.0100]  # measured ty 0.00213461, tip 0.00210606
+attr_mismatch_p95  = [-0.0100, 0.0100]  # measured ty 0.00118641, tip 0.00123607
+missing_max        = [-0.0110, 0.0090]  # measured ty 0.00277264, tip 0.00374065
+missing_p99        = [-0.0111, 0.0089]  # measured ty 0.00250771, tip 0.00358799
+missing_p95        = [-0.0100, 0.0100]  # measured ty 0.000381155, tip 0.000344303
+edge_gap           = [-0.0100, 0.0100]  # measured ty 5.13939e-05, tip 3.42626e-05
+excess_change      = [-0.0103, 0.0097]  # measured ty 0.000841031, tip 0.00109107
+pair_attr_max      = [0.0000, 0.0106]  # measured 0.0006
+pair_attr_p99      = [0.0000, 0.0105]  # measured 0.0005
+pair_attr_p95      = [0.0000, 0.0104]  # measured 0.0004
+pair_iou_loss_max  = [0.0000, 0.0136]  # measured 0.0036
+pair_iou_loss_p99  = [0.0000, 0.0125]  # measured 0.0025
+pair_iou_loss_p95  = [0.0000, 0.0104]  # measured 0.0004
+pair_attr_mean     = [0.0000, 0.0102]  # measured 0.0002
+pair_iou_loss_mean = [0.0000, 0.0100]  # measured 0.0000
+
+[datasets."open-buildings"]
+color_attr = "geohash"
+zooms = [12, 14]
+
+[[datasets."open-buildings".zoom_bands]]
+zooms = [12, 12]
+edge_gap           = [-0.0100, 0.0100]  # measured ty 0, tip 0
+pair_attr_mean     = [0.0000, 0.0100]  # measured 0.0000
+pair_iou_loss_mean = [0.0909, 0.1109]  # measured 0.1009
+
+[[datasets."open-buildings".zoom_bands]]
+zooms = [14, 14]
+added_max          = [-0.0100, 0.0100]  # measured ty 0.0167598, tip 0.0167598
+added_p99          = [-0.0100, 0.0100]  # measured ty 0.0166086, tip 0.0165989
+added_p95          = [-0.0100, 0.0100]  # measured ty 0.0160039, tip 0.0159555
+attr_mismatch_max  = [-0.0100, 0.0100]  # measured ty 0, tip 0
+attr_mismatch_p99  = [-0.0100, 0.0100]  # measured ty 0, tip 0
+attr_mismatch_p95  = [-0.0100, 0.0100]  # measured ty 0, tip 0
+missing_max        = [-0.0111, 0.0089]  # measured ty 0.0134078, tip 0.0145251
+missing_p99        = [-0.0111, 0.0089]  # measured ty 0.013314, tip 0.0143993
+missing_p95        = [-0.0110, 0.0090]  # measured ty 0.0129387, tip 0.0138959
+edge_gap           = [-0.0100, 0.0100]  # measured ty 0, tip 0
+excess_change      = [-0.0100, 0.0100]  # measured ty 0, tip 0
+pair_attr_max      = [0.0000, 0.0100]  # measured 0.0000
+pair_attr_p99      = [0.0000, 0.0100]  # measured 0.0000
+pair_attr_p95      = [0.0000, 0.0100]  # measured 0.0000
+pair_iou_loss_max  = [0.0000, 0.0133]  # measured 0.0033
+pair_iou_loss_p99  = [0.0000, 0.0133]  # measured 0.0033
+pair_iou_loss_p95  = [0.0000, 0.0132]  # measured 0.0032
+pair_attr_mean     = [0.0000, 0.0102]  # measured 0.0002
+pair_iou_loss_mean = [0.0000, 0.0116]  # measured 0.0016
+
+[datasets."road-detections"]
+zooms = [10, 12, 14]
+
+[[datasets."road-detections".zoom_bands]]
+zooms = [10, 10]
+drawn_stray_max   = [-0.0100, 0.0100]  # measured ty 0, tip 0
+drawn_stray_p99   = [-0.0100, 0.0100]  # measured ty 0, tip 0
+drawn_stray_p95   = [-0.0100, 0.0100]  # measured ty 0, tip 0
+src_uncovered_max = [-0.0093, 0.0107]  # measured ty 0.000677541, tip 1.44904e-05
+src_uncovered_p99 = [-0.0093, 0.0107]  # measured ty 0.000670766, tip 1.43455e-05
+src_uncovered_p95 = [-0.0094, 0.0106]  # measured ty 0.000643664, tip 1.37658e-05
+pair_apart_max    = [0.0000, 0.0103]  # measured 0.0003
+pair_apart_p99    = [0.0000, 0.0103]  # measured 0.0003
+pair_apart_p95    = [0.0000, 0.0103]  # measured 0.0003
+pair_apart_mean   = [0.0000, 0.0103]  # measured 0.0003
+
+[[datasets."road-detections".zoom_bands]]
+zooms = [12, 12]
+drawn_stray_max   = [-0.0100, 0.0100]  # measured ty 0, tip 0
+drawn_stray_p99   = [-0.0100, 0.0100]  # measured ty 0, tip 0
+drawn_stray_p95   = [-0.0100, 0.0100]  # measured ty 0, tip 0
+src_uncovered_max = [-0.0098, 0.0102]  # measured ty 0.000225677, tip 0
+src_uncovered_p99 = [-0.0098, 0.0102]  # measured ty 0.000222017, tip 0
+src_uncovered_p95 = [-0.0098, 0.0102]  # measured ty 0.000207378, tip 0
+pair_apart_max    = [0.0000, 0.0101]  # measured 0.0001
+pair_apart_p99    = [0.0000, 0.0101]  # measured 0.0001
+pair_apart_p95    = [0.0000, 0.0101]  # measured 0.0001
+pair_apart_mean   = [0.0000, 0.0100]  # measured 0.0000
+
+[[datasets."road-detections".zoom_bands]]
+zooms = [14, 14]
+drawn_stray_max   = [-0.0100, 0.0100]  # measured ty 0, tip 0
+drawn_stray_p99   = [-0.0100, 0.0100]  # measured ty 0, tip 0
+drawn_stray_p95   = [-0.0100, 0.0100]  # measured ty 0, tip 0
+src_uncovered_max = [-0.0100, 0.0100]  # measured ty 0, tip 0
+src_uncovered_p99 = [-0.0100, 0.0100]  # measured ty 0, tip 0
+src_uncovered_p95 = [-0.0100, 0.0100]  # measured ty 0, tip 0
+pair_apart_max    = [0.0000, 0.0100]  # measured 0.0000
+pair_apart_p99    = [0.0000, 0.0100]  # measured 0.0000
+pair_apart_p95    = [0.0000, 0.0100]  # measured 0.0000
+pair_apart_mean   = [0.0000, 0.0100]  # measured 0.0000
+
+[datasets."ftw-moldova-z10"]
+zooms = [10, 12, 14]
+
+[[datasets."ftw-moldova-z10".zoom_bands]]
+zooms = [10, 10]
+added_max          = [-0.0087, 0.0113]  # measured ty 0.0211706, tip 0.0198443
+added_p99          = [-0.0088, 0.0112]  # measured ty 0.0209835, tip 0.019761
+added_p95          = [-0.0092, 0.0108]  # measured ty 0.020235, tip 0.0194277
+missing_max        = [-0.0100, 0.0100]  # measured ty 0.0114612, tip 0.0114862
+missing_p99        = [-0.0101, 0.0099]  # measured ty 0.0114004, tip 0.0114548
+missing_p95        = [-0.0102, 0.0098]  # measured ty 0.0111571, tip 0.011329
+edge_gap           = [-0.0090, 0.0110]  # measured ty 0.0119048, tip 0.0109127
+pair_iou_loss_max  = [0.0090, 0.0290]  # measured 0.0190
+pair_iou_loss_p99  = [0.0090, 0.0290]  # measured 0.0190
+pair_iou_loss_p95  = [0.0087, 0.0287]  # measured 0.0187
+pair_iou_loss_mean = [0.0085, 0.0285]  # measured 0.0185
+
+[[datasets."ftw-moldova-z10".zoom_bands]]
+zooms = [12, 12]
+added_max          = [-0.0096, 0.0104]  # measured ty 0.00724958, tip 0.00686647
+added_p99          = [-0.0097, 0.0103]  # measured ty 0.00703881, tip 0.00674654
+added_p95          = [-0.0100, 0.0100]  # measured ty 0.00641172, tip 0.00642673
+missing_max        = [-0.0104, 0.0096]  # measured ty 0.00613467, tip 0.00652886
+missing_p99        = [-0.0104, 0.0096]  # measured ty 0.00613314, tip 0.00649649
+missing_p95        = [-0.0098, 0.0102]  # measured ty 0.00610388, tip 0.0059434
+edge_gap           = [-0.0105, 0.0095]  # measured ty 0.00508334, tip 0.00559562
+pair_iou_loss_max  = [0.0000, 0.0143]  # measured 0.0043
+pair_iou_loss_p99  = [0.0000, 0.0142]  # measured 0.0042
+pair_iou_loss_p95  = [0.0000, 0.0139]  # measured 0.0039
+pair_iou_loss_mean = [0.0000, 0.0124]  # measured 0.0024
+
+[[datasets."ftw-moldova-z10".zoom_bands]]
+zooms = [14, 14]
+added_max          = [-0.0100, 0.0100]  # measured ty 0.0180367, tip 0.0180367
+added_p99          = [-0.0100, 0.0100]  # measured ty 0.0124598, tip 0.0124598
+added_p95          = [-0.0100, 0.0100]  # measured ty 0.00557165, tip 0.00557165
+missing_max        = [-0.0100, 0.0100]  # measured ty 0.0206978, tip 0.0206978
+missing_p99        = [-0.0100, 0.0100]  # measured ty 0.00894437, tip 0.00894437
+missing_p95        = [-0.0100, 0.0100]  # measured ty 0.00422304, tip 0.00422304
+edge_gap           = [-0.0100, 0.0100]  # measured ty 0.00110815, tip 0.00110815
+pair_iou_loss_max  = [0.0000, 0.0103]  # measured 0.0003
+pair_iou_loss_p99  = [0.0000, 0.0103]  # measured 0.0003
+pair_iou_loss_p95  = [0.0000, 0.0102]  # measured 0.0002
+pair_iou_loss_mean = [0.0000, 0.0100]  # measured 0.0000
+
+[datasets."fieldmaps-boundaries"]
+color_attr = "fid"
+zooms = [2, 4, 6, 8]
+
+[[datasets."fieldmaps-boundaries".zoom_bands]]
+zooms = [2, 2]
+edge_gap           = [-0.0100, 0.0100]  # measured ty 0, tip 0
+pair_attr_mean     = [0.0000, 0.0100]  # measured 0.0000
+pair_iou_loss_mean = [0.1567, 0.1767]  # measured 0.1667
+
+[[datasets."fieldmaps-boundaries".zoom_bands]]
+zooms = [4, 4]
+edge_gap           = [-0.0100, 0.0100]  # measured ty 0, tip 0
+pair_attr_mean     = [0.0000, 0.0100]  # measured 0.0000
+pair_iou_loss_mean = [0.0692, 0.0892]  # measured 0.0792
+
+[[datasets."fieldmaps-boundaries".zoom_bands]]
+zooms = [6, 6]
+added_max          = [-0.0100, 0.0100]  # measured ty 0.00420757, tip 0.00420757
+added_p99          = [-0.0100, 0.0100]  # measured ty 0.00420757, tip 0.00420757
+added_p95          = [-0.0100, 0.0100]  # measured ty 0.00420757, tip 0.00420757
+attr_mismatch_max  = [-0.0100, 0.0100]  # measured ty 0, tip 0
+attr_mismatch_p99  = [-0.0100, 0.0100]  # measured ty 0, tip 0
+attr_mismatch_p95  = [-0.0100, 0.0100]  # measured ty 0, tip 0
+missing_max        = [-0.0114, 0.0086]  # measured ty 0.00981767, tip 0.0112202
+missing_p99        = [-0.0114, 0.0086]  # measured ty 0.00981767, tip 0.0112202
+missing_p95        = [-0.0114, 0.0086]  # measured ty 0.00981767, tip 0.0112202
+edge_gap           = [-0.0100, 0.0100]  # measured ty 0, tip 0
+pair_attr_max      = [0.0000, 0.0100]  # measured 0.0000
+pair_attr_p99      = [0.0000, 0.0100]  # measured 0.0000
+pair_attr_p95      = [0.0000, 0.0100]  # measured 0.0000
+pair_iou_loss_max  = [0.0000, 0.0142]  # measured 0.0042
+pair_iou_loss_p99  = [0.0000, 0.0142]  # measured 0.0042
+pair_iou_loss_p95  = [0.0000, 0.0142]  # measured 0.0042
+pair_attr_mean     = [0.0000, 0.0100]  # measured 0.0000
+pair_iou_loss_mean = [0.0000, 0.0176]  # measured 0.0076
+
+[[datasets."fieldmaps-boundaries".zoom_bands]]
+zooms = [8, 8]
+added_max          = [-0.0100, 0.0100]  # measured ty 0.00520494, tip 0.00520494
+added_p99          = [-0.0100, 0.0100]  # measured ty 0.00517302, tip 0.00517302
+added_p95          = [-0.0100, 0.0100]  # measured ty 0.00504532, tip 0.00504532
+attr_mismatch_max  = [-0.0100, 0.0100]  # measured ty 0, tip 0
+attr_mismatch_p99  = [-0.0100, 0.0100]  # measured ty 0, tip 0
+attr_mismatch_p95  = [-0.0100, 0.0100]  # measured ty 0, tip 0
+missing_max        = [-0.0107, 0.0093]  # measured ty 0.00621118, tip 0.00690131
+missing_p99        = [-0.0106, 0.0094]  # measured ty 0.00618099, tip 0.0068309
+missing_p95        = [-0.0105, 0.0095]  # measured ty 0.00606024, tip 0.00654926
+edge_gap           = [-0.0100, 0.0100]  # measured ty 0.00360685, tip 0.00360685
+excess_change      = [-0.0100, 0.0100]  # measured ty 0, tip 0
+pair_attr_max      = [0.0000, 0.0100]  # measured 0.0000
+pair_attr_p99      = [0.0000, 0.0100]  # measured 0.0000
+pair_attr_p95      = [0.0000, 0.0100]  # measured 0.0000
+pair_iou_loss_max  = [0.0000, 0.0132]  # measured 0.0032
+pair_iou_loss_p99  = [0.0000, 0.0132]  # measured 0.0032
+pair_iou_loss_p95  = [0.0000, 0.0131]  # measured 0.0031
+pair_attr_mean     = [0.0000, 0.0100]  # measured 0.0000
+pair_iou_loss_mean = [0.0000, 0.0118]  # measured 0.0018
+
+[datasets."vd-points"]
+zooms = [8, 10, 12, 14]
+
+[[datasets."vd-points".zoom_bands]]
+zooms = [8, 8]
+count_error_max = [-0.0213, -0.0013]  # measured ty 0.988651, tip 1
+count_error_p99 = [-0.0239, -0.0039]  # measured ty 0.985979, tip 0.999877
+count_error_p95 = [-0.0341, -0.0141]  # measured ty 0.975295, tip 0.999383
+pair_count_max  = [0.9900, 1.0100]  # measured 1.0000
+pair_count_p99  = [0.9887, 1.0087]  # measured 0.9987
+pair_count_p95  = [0.9833, 1.0033]  # measured 0.9933
+pair_count_mean = [0.8954, 0.9154]  # measured 0.9054
+
+[[datasets."vd-points".zoom_bands]]
+zooms = [10, 10]
+count_error_max = [-0.0125, 0.0075]  # measured ty 0.997539, tip 1
+count_error_p99 = [-0.0265, -0.0065]  # measured ty 0.983501, tip 1
+count_error_p95 = [-0.0786, -0.0586]  # measured ty 0.9305, tip 0.999138
+pair_count_max  = [0.9900, 1.0100]  # measured 1.0000
+pair_count_p99  = [0.9900, 1.0100]  # measured 1.0000
+pair_count_p95  = [0.9900, 1.0100]  # measured 1.0000
+pair_count_mean = [0.8991, 0.9191]  # measured 0.9091
+
+[[datasets."vd-points".zoom_bands]]
+zooms = [12, 12]
+count_error_max = [-0.0211, -0.0011]  # measured ty 0.888889, tip 0.9
+count_error_p99 = [-0.0193, 0.0007]  # measured ty 0.884137, tip 0.893444
+count_error_p95 = [-0.0100, 0.0100]  # measured ty 0.875, tip 0.875
+pair_count_max  = [0.9900, 1.0100]  # measured 1.0000
+pair_count_p99  = [0.9740, 0.9940]  # measured 0.9840
+pair_count_p95  = [0.9100, 0.9300]  # measured 0.9200
+pair_count_mean = [0.5417, 0.5617]  # measured 0.5517
+
+[[datasets."vd-points".zoom_bands]]
+zooms = [14, 14]
+count_error_max = [-0.0100, 0.0100]  # measured ty 0, tip 0
+count_error_p99 = [-0.0100, 0.0100]  # measured ty 0, tip 0
+count_error_p95 = [-0.0100, 0.0100]  # measured ty 0, tip 0
+pair_count_max  = [0.0000, 0.0100]  # measured 0.0000
+pair_count_p99  = [0.0000, 0.0100]  # measured 0.0000
+pair_count_p95  = [0.0000, 0.0100]  # measured 0.0000
+pair_count_mean = [0.0000, 0.0100]  # measured 0.0000

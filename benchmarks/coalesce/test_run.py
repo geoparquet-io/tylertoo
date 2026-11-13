@@ -619,3 +619,16 @@ def test_verify_input_rejects_a_missing_or_changed_file(tmp_path):
     with pytest.raises(SystemExit, match="sha256"):
         run.verify_input(f, "0" * 64)
     run.verify_input(f, _sha(b"hello"))
+
+
+def test_a_scorer_key_covers_the_metrics_module(tmp_path, monkeypatch):
+    """tile_metrics.py and render_coverage.py measure with metrics.py: a
+    change there must change their keys, or old scores would be reused."""
+    before = {n: run.script_sha(n) for n in ("tile_metrics.py", "render_coverage.py", "render_maplibre.py")}
+    changed = tmp_path / "metrics.py"
+    changed.write_text("# changed\n")
+    monkeypatch.setattr(run, "METRICS_MODULE", changed)
+    after = {n: run.script_sha(n) for n in before}
+    assert after["tile_metrics.py"] != before["tile_metrics.py"]
+    assert after["render_coverage.py"] != before["render_coverage.py"]
+    assert after["render_maplibre.py"] == before["render_maplibre.py"]

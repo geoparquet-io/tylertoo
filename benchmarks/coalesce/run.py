@@ -202,9 +202,17 @@ def cell_key(*, binary_sha: str, input_sha: str, convert: list[str], valve: str,
     return digest(locals())[:16]
 
 
+METRICS_MODULE = HERE.parent / "visual" / "metrics.py"
+
+
 def script_sha(name: str) -> str:
-    """A benchmark script's content hash, for the keys of what it produces."""
-    return run_matrix.sha256(HERE / name)
+    """A benchmark script's content hash, for the keys of what it produces.
+    tile_metrics.py and render_coverage.py measure with metrics.py, so their
+    hash covers it: a change there must not reuse scores made before it."""
+    sha = run_matrix.sha256(HERE / name)
+    if name in ("tile_metrics.py", "render_coverage.py"):
+        sha = digest([sha, run_matrix.sha256(METRICS_MODULE)])
+    return sha
 
 
 def harness_sha() -> str:

@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "pmtiles>=3.4", "mapbox-vector-tile>=2.1", "shapely>=2.0", "rasterio>=1.4",
-#   "geopandas>=1.0", "pyarrow>=17", "numpy>=1.26", "pillow>=10",
+#   "pyarrow>=17", "numpy>=1.26", "pillow>=10",
 # ]
 # [tool.uv]
 # exclude-newer = "2026-10-22T00:00:00Z"
@@ -29,20 +29,17 @@ source polygons, unless `--center x,y` is given. Writes one PNG per input and
 from __future__ import annotations
 
 import argparse
-import gzip
 import json
 import sys
 from pathlib import Path
 
 import numpy as np
 
-WORLD = 20037508.342789244 * 2
+# benchmarks/visual/metrics.py owns the reading, decoding and rasterizing (#869).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "visual"))
+from metrics import POLYGON, WORLD, decode, is_gzip, read_source, shares, tile_xy  # noqa: E402
+
 PX = 256  # pixels per tile
-
-
-def tile_xy(xm: float, ym: float, z: int) -> tuple[int, int]:
-    n = 1 << z
-    return int((xm + WORLD / 2) / WORLD * n), int((WORLD / 2 - ym) / WORLD * n)
 
 
 def main() -> int:
@@ -57,28 +54,23 @@ def main() -> int:
                     help="fill only, for features smaller than a pixel")
     args = ap.parse_args()
 
-    import geopandas as gpd
-    import mapbox_vector_tile
     from affine import Affine
     from PIL import Image
     from pmtiles.reader import MmapSource, Reader
     from rasterio.features import rasterize
-    from shapely import STRtree
     from shapely.affinity import affine_transform
     from shapely.geometry import box, shape
 
     z = args.zoom
-    src = gpd.read_parquet(args.source)
-    if src.crs is None:
-        src = src.set_crs(4326)
-    src = src.to_crs(3857)
-    src = src[src.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
-    geoms = np.array(src.geometry.values)
+    src = read_source(args.source, types=POLYGON)
+    geoms, tree = src.geoms, src.tree
 
     if args.center:
         cx, cy = (int(v) for v in args.center.split(","))
     else:
-        cent = src.geometry.representative_point()
+        import shapely
+
+        cent = shapely.point_on_surface(geoms)
         keys, counts = np.unique([tile_xy(p.x, p.y, z) for p in cent], axis=0, return_counts=True)
         cx, cy = (int(v) for v in keys[counts.argmax()])
     half = args.span // 2
@@ -89,7 +81,6 @@ def main() -> int:
     world = Affine(w / PX, 0, left, 0, -w / PX, top)
     extent_box = box(left, top - args.span * w, left + args.span * w, top)
 
-    tree = STRtree(geoms)
     in_view = [geoms[i] for i in tree.query(extent_box)]
     src_fill = rasterize(((g, 1) for g in in_view), out_shape=(size, size), transform=world,
                          fill=0, dtype="uint8").astype(bool)
@@ -115,16 +106,14 @@ def main() -> int:
         name, _, path = spec.partition("=")
         f = open(path, "rb")
         reader = Reader(MmapSource(f))
-        gz = reader.header().get("tile_compression") in (2, "gzip") or str(
-            reader.header().get("tile_compression")).endswith("GZIP")
+        gz = is_gzip(reader.header())
         shapes, lines, features, invalid = [], [], 0, 0
         for dx in range(args.span):
             for dy in range(args.span):
                 data = reader.get(z, x0 + dx, y0 + dy)
                 if not data:
                     continue
-                raw = gzip.decompress(data) if gz else data
-                for layer in mapbox_vector_tile.decode(raw, default_options={"y_coord_down": True}).values():
+                for layer in decode(data, gz)[1].values():
                     ext = layer.get("extent", 4096)
                     s = PX / ext
                     # Tile coordinates to image pixels, then to the world
@@ -151,13 +140,13 @@ def main() -> int:
                          out_shape=(size, size), transform=world, fill=0, dtype="uint8",
                          all_touched=True).astype(bool) if shapes else np.zeros((size, size), bool)
         Image.fromarray(image(fill, line, src_fill)).save(args.out / f"{name}.png")
-        ref = src_fill.sum()
+        missing, added = shares(fill, src_fill)
         stats["images"][name] = {
             "archive": path,
             "features_in_view": features,
             "invalid_features": invalid,
-            "missing_share": float((src_fill & ~fill).sum() / ref) if ref else None,
-            "added_share": float((fill & ~src_fill).sum() / ref) if ref else None,
+            "missing_share": missing,
+            "added_share": added,
         }
         print(name, stats["images"][name], flush=True)
 

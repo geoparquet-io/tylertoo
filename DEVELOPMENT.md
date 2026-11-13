@@ -657,7 +657,7 @@ cargo build --release --package tylertoo
 # Needs a C++ toolchain and the sqlite3 and zlib headers
 benchmarks/e2e/setup_tippecanoe.sh
 
-# The gate: all three fixtures, ~75 s on 16 cores.
+# The gate: five fixtures, three of them with bands, ~75 s on 16 cores.
 # Exits 1 on a breach and names the cell
 uv run benchmarks/e2e/compare_tippecanoe.py
 
@@ -681,6 +681,38 @@ eval "$(benchmarks/e2e/setup_tippecanoe.sh \
 cargo test -p tylertoo-core --test decode_roundtrip \
   decode_golden -- --nocapture
 ```
+
+### Visual gate
+
+The parity gate compares counts and sizes, so a moved border or a hole
+at a tile seam passes it. `benchmarks/visual/gate.py` catches those
+defects. It tiles each fixture with
+`tylertoo tiles --preset tippecanoe` and with the pinned tippecanoe,
+compares the two archives tile against tile (IoU of the drawn area for
+polygons, and its counterparts for lines and points), and also measures
+both against the source. It fails when one of these numbers leaves its
+measured band. With `--tylertoo-flags` it reports the distance to
+tippecanoe for other settings.
+
+It is a local tool. CI runs only its unit tests. Run it after a change to
+generalization, the size valve, or the preset:
+
+```bash
+# Every fixture. Exits 1 on a breach and names the tile
+uv run benchmarks/visual/gate.py
+
+# One dataset at one zoom again
+uv run benchmarks/visual/gate.py \
+  --datasets madagascar-adm4 --zooms 8
+
+# The gate's own test: five copies with known defects
+# and one unchanged copy
+uv run benchmarks/visual/gate.py --self-test
+```
+
+A breach prints both values and the band. For a per-tile error it also
+prints the worst tile and the path of a PNG of that tile. `benchmarks/visual/README.md` defines each metric, shows
+how to read a breach, and has the rules for changing a band.
 
 ### Docs
 
