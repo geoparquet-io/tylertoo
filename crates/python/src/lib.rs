@@ -600,14 +600,21 @@ fn serve(
         .map_err(|e| to_py(e.kind(), e.to_string(), None))?;
     let builtins = PyModule::import(py, "builtins")?;
     builtins.getattr("print")?.call1((format!("Serving {} on {}", archives.len(), server.url()),))?;
-    // The loop polls Python's signal handlers, so Ctrl-C raises
-    // KeyboardInterrupt here, as it does in `http.server`.
+    // On the main thread the loop polls Python's signal handlers, so Ctrl-C
+    // raises KeyboardInterrupt here, as it does in `http.server`. Only the
+    // main thread runs them, so elsewhere the loop never attaches: a daemon
+    // thread that attaches while the interpreter exits crashes it.
+    let threading = PyModule::import(py, "threading")?;
+    let main = threading
+        .call_method0("current_thread")?
+        .is(threading.call_method0("main_thread")?);
     let mut interrupted = None;
     py.detach(|| {
         server.run(|| {
-            Python::attach(|py| py.check_signals())
-                .map_err(|e| interrupted = Some(e))
-                .is_ok()
+            !main
+                || Python::attach(|py| py.check_signals())
+                    .map_err(|e| interrupted = Some(e))
+                    .is_ok()
         })
     })
     .map_err(|e| to_py(e.kind(), e.to_string(), None))?;

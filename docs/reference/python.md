@@ -501,7 +501,7 @@ serve(
 
 Serve PMTiles archives over HTTP with a map viewer.
 
-Print the server URL and block until Ctrl-C, which raises `KeyboardInterrupt`. The viewer at `/` handles MVT and MLT archives. It loads MapLibre GL JS from unpkg.com and needs internet access.
+Print the server URL and block until Ctrl-C, which raises `KeyboardInterrupt`. On a background thread it serves instead until the interpreter exits. The viewer at `/` handles MVT and MLT archives. It loads MapLibre GL JS from unpkg.com and needs internet access.
 
 `/index.json` lists archive names. Each `{name}` is the archive's file stem. `/{name}.json` returns TileJSON. `/{name}/{z}/{x}/{y}` returns tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns archive metadata. `/{name}/stats.json` returns tile-size statistics. `/{name}.pmtiles` serves the archive with HTTP Range support. It honours `If-Match` and `If-Range` against its `ETag`. If a Range read detects the file being rewritten in place during the read, it returns HTTP 412 for requests with `If-Match` or `If-Range`, or HTTP 503 otherwise. A whole-file download caught by a rewrite is cut off before its `Content-Length`. Renaming another file over the path does not affect a download in progress.
 

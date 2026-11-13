@@ -1,6 +1,7 @@
 Serve PMTiles archives over HTTP with a map viewer.
 
 Print the server URL and block until Ctrl-C, which raises `KeyboardInterrupt`.
+On a background thread it serves instead until the interpreter exits.
 The viewer at `/` handles MVT and MLT archives. It loads MapLibre GL JS
 from unpkg.com and needs internet access.
 
