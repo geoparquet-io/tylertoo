@@ -1654,21 +1654,27 @@ original GeoParquet. An unmarked old file cannot safely distinguish spatial
 cropping from invalid cluster counts; legacy files with conserved sums
 remain readable.
 
-### Cascade square dithering and quality-matched parity (#749, #779)
+### Cascade square dithering (#749)
 
-The shared cascade planner records a dither policy on each step; serial and
-pipelined execution consume that same step. Density-reduced conversions use
-canonical source area/anchor for collapsed squares, retaining the #749 stopgap
-that prevents previous placeholder squares from inflating coarse-level area.
-When density reduction is disabled (including `--verbatim --simplify-factor 1`),
-the cascade keeps main's working-geometry dither for tippecanoe parity. Applying
-the source-area stopgap to that path reduced Madagascar's z0 overview count
-from 1,150 to 379 with z0–2 and left z1 unchanged at 1,568.
+Under the cascade, a polygon that collapses below a level's tolerance is
+dithered into a placeholder square on its **canonical** area and anchor, on
+every run. The previous level's square is not the input to the dither:
+re-dithering it gave `p = side_prev² / side² = 1/4` at every coarser step
+against a `u` keyed on the same anchor (the square's centroid is its
+center), so a square born with `u < 1/4` passed every later draw and
+survived to z0. On `open-buildings` with `--verbatim --simplify-factor 1`
+that kept 229 squares at z0 (19× the source area at z8); Madagascar adm4
+kept 1,150 at z0 against 379 with `--no-cascade`. With the canonical area
+the cascade keeps what `--no-cascade` keeps at the collapsed levels.
 
-DIVERGENCE FROM TIPPECANOE: density-reduced runs use deterministic source-area
-hash dithering rather than tippecanoe's serial tiny-polygon accumulator (the
-existing #279 divergence). Unreduced runs preserve the calibrated cascade
-behavior, including its coarse-level placeholder area inflation; fully fixing
-#749 there conflicts with the current parity bands. `--no-cascade` remains the
-workaround when source-based per-level simplification is desired. The strict
-Moldova `pv0` decay exemption remains until the stopgap satisfies that invariant.
+Until #749 only density-reduced runs dithered on the canonical geometry;
+density-disabled runs (`--verbatim` with a nonzero `--simplify-factor`,
+the quality-matched tippecanoe comparison) kept the working-geometry
+dither, whose inflated z0 counts the Madagascar parity floor pinned.
+
+This matches tippecanoe: it hands each feature's unsimplified geometry to
+the next zoom and reduces tiny polygons per zoom against the source area,
+so a placeholder never feeds the next zoom's reduction. The remaining
+divergence is the per-feature hash in place of tippecanoe's serial
+accumulator (#279, `dither_u01`). `pv0` runs were already density-reduced,
+so this does not touch the Moldova `pv0` decay exemption.

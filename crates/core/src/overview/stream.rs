@@ -1339,8 +1339,10 @@ fn build_cascade_chains(
             let mut chain: Vec<CascadeStep> = emitted
                 .iter()
                 .filter(|f| (f.orig as usize) < finest && f.orig >= e.orig)
-                .map(|f| {
-                    CascadeStep::for_level(f.gsd, f.zoom, repr_of(f.zoom), options.density.enabled)
+                .map(|f| CascadeStep {
+                    gsd_meters: f.gsd,
+                    repr: repr_of(f.zoom),
+                    zoom: f.zoom,
                 })
                 .collect();
             chain.reverse();

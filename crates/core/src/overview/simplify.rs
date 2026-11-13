@@ -519,10 +519,6 @@ pub struct CascadeStep {
     /// square is floored at (#407); `None` derives the zoom from the GSD the
     /// way the exporter does.
     pub zoom: Option<u8>,
-    // #749's source-area stopgap changes retention relative to tippecanoe
-    // parity. The conversion planner enables it for density-reduced runs;
-    // unreduced runs retain the established working-geometry dither.
-    source_area_dither: bool,
 }
 
 impl CascadeStep {
@@ -532,7 +528,6 @@ impl CascadeStep {
             gsd_meters,
             repr: Representation::Geometry,
             zoom: None,
-            source_area_dither: true,
         }
     }
 
@@ -542,7 +537,6 @@ impl CascadeStep {
             gsd_meters,
             repr: Representation::Point,
             zoom: None,
-            source_area_dither: true,
         }
     }
 
@@ -552,7 +546,6 @@ impl CascadeStep {
             gsd_meters,
             repr: Representation::Square,
             zoom: None,
-            source_area_dither: true,
         }
     }
 
@@ -560,22 +553,6 @@ impl CascadeStep {
     #[must_use]
     pub fn with_zoom(self, zoom: Option<u8>) -> Self {
         Self { zoom, ..self }
-    }
-
-    /// Plan the dither policy once for all engines. Density-disabled runs
-    /// include quality-matched (`--verbatim --simplify-factor 1`) parity.
-    pub(crate) fn for_level(
-        gsd_meters: f64,
-        zoom: Option<u8>,
-        repr: Representation,
-        density_reduced: bool,
-    ) -> Self {
-        Self {
-            gsd_meters,
-            zoom,
-            repr,
-            source_area_dither: density_reduced,
-        }
     }
 }
 
@@ -853,11 +830,10 @@ impl CascadeFold {
             opts,
             step.repr,
             diagnostics,
-            if step.source_area_dither {
-                canonical.as_ref()
-            } else {
-                base.as_ref()
-            },
+            // A collapsing square dithers on the canonical area and anchor
+            // (#749): the previous level's square would reset `p` to 1/4
+            // against an unchanged `u`, so it would never thin.
+            canonical.as_ref(),
         );
         match out {
             Simplified::Keep(s) => {
@@ -3670,80 +3646,53 @@ mod rdp_tests {
 mod source_area_regression {
     use super::*;
 
+    /// A square kept at a fine step must be re-dithered on the source's area
+    /// and anchor at the coarser one, exactly as if that level were
+    /// simplified from the source (#749). Covers the zoom-band square steps
+    /// and the plain geometry steps a quality-matched run
+    /// (`--verbatim --simplify-factor 1`) takes.
     #[test]
     fn cascade_square_dither_uses_source_area() {
-        let opts = SimplifyOptions {
-            collapse: CollapseMode::Square,
-            ..Default::default()
-        };
-        let fine = CascadeStep::for_level(2.0, None, Representation::Square, true);
-        let coarse = CascadeStep::for_level(8.0, None, Representation::Square, true);
-        let mut checked = 0;
-        for i in 0..2000 {
-            let anchor = Point::new(i as f64 * 10.0, 0.0);
-            let geom = Geometry::Polygon(placeholder_square(anchor, 1.0));
-            if matches!(
-                simplify_cascade(
-                    &geom,
-                    &[fine],
-                    Crs::Epsg3857,
-                    &opts,
-                    &crate::diagnostics::Diagnostics::default()
-                ),
-                Simplified::Keep(_)
-            ) {
+        for (repr, collapse) in [
+            (Representation::Square, CollapseMode::Square),
+            (
+                Representation::Geometry,
+                SimplifyOptions::default().collapse,
+            ),
+        ] {
+            let opts = SimplifyOptions {
+                collapse,
+                ..Default::default()
+            };
+            let diagnostics = crate::diagnostics::Diagnostics::default();
+            let fine = CascadeStep {
+                repr,
+                ..CascadeStep::geom(2.0)
+            };
+            let coarse = CascadeStep {
+                repr,
+                ..CascadeStep::geom(8.0)
+            };
+            let mut checked = 0;
+            for i in 0..2000 {
+                let anchor = Point::new(i as f64 * 10.0, 0.0);
+                let geom = Geometry::Polygon(placeholder_square(anchor, 1.0));
+                let Simplified::Keep(_) =
+                    simplify_cascade(&geom, &[fine], Crs::Epsg3857, &opts, &diagnostics)
+                else {
+                    continue;
+                };
                 checked += 1;
-                let cascaded = simplify_cascade(
-                    &geom,
-                    &[fine, coarse],
-                    Crs::Epsg3857,
-                    &opts,
-                    &crate::diagnostics::Diagnostics::default(),
-                );
-                let direct = simplify_cascade(
-                    &geom,
-                    &[coarse],
-                    Crs::Epsg3857,
-                    &opts,
-                    &crate::diagnostics::Diagnostics::default(),
-                );
+                let cascaded =
+                    simplify_cascade(&geom, &[fine, coarse], Crs::Epsg3857, &opts, &diagnostics);
+                let direct = simplify_cascade(&geom, &[coarse], Crs::Epsg3857, &opts, &diagnostics);
                 assert_eq!(
                     cascaded, direct,
-                    "cascade must dither on the original area, anchor {anchor:?}"
+                    "{repr:?}: cascade must dither on the original area, anchor {anchor:?}"
                 );
             }
+            assert!(checked > 20, "{repr:?}: only {checked} squares kept");
         }
-        assert!(checked > 20);
-    }
-
-    #[test]
-    fn unreduced_cascade_retains_working_geometry_dither() {
-        let opts = SimplifyOptions::default();
-        let diagnostics = crate::diagnostics::Diagnostics::default();
-        let fine = CascadeStep::for_level(2.0, None, Representation::Geometry, false);
-        let coarse = CascadeStep::for_level(8.0, None, Representation::Geometry, false);
-        let mut checked = 0;
-        let mut differs_from_source = 0;
-        for i in 0..2000 {
-            let geom = Geometry::Polygon(placeholder_square(Point::new(i as f64 * 10.0, 0.0), 1.0));
-            let Simplified::Keep(working) =
-                simplify_cascade(&geom, &[fine], Crs::Epsg3857, &opts, &diagnostics)
-            else {
-                continue;
-            };
-            checked += 1;
-            let cascaded =
-                simplify_cascade(&geom, &[fine, coarse], Crs::Epsg3857, &opts, &diagnostics);
-            let expected = simplify_for_level(&working, 8.0, Crs::Epsg3857, &opts, &diagnostics);
-            assert_eq!(cascaded, expected);
-            let source = simplify_for_level(&geom, 8.0, Crs::Epsg3857, &opts, &diagnostics);
-            differs_from_source += usize::from(cascaded != source);
-        }
-        assert!(checked > 20);
-        assert!(
-            differs_from_source > 0,
-            "the two retention policies conflict"
-        );
     }
 }
 
