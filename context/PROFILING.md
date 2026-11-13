@@ -887,7 +887,8 @@ ended (64-core Neoverse-V1 host, figures from the PR or commit named):
   limited by the ~470 MB/s `aws s3 cp` gets on the same host. Nobody re-ran
   the Netherlands run from #813. #878 and #881 did not change remote reads.
 - **Smaller serial pieces: accepted.** #818 made polygon `assignment+budget`
-  parallel (Moldova 0.21 s at 2.6 cores → 0.03 s at 16.9). `pre-pass2`
+  parallel (Moldova 0.21 s at 2.6 cores → 0.03 s at 16.9); `bounded` still
+  accumulates one level at a time to hold memory down (94ddbffe). `pre-pass2`
   (≤0.2% of wall) and `writer.finish` (≤0.9%) stay serial, as do the
   group-commit lock wait (≤1.5%) and process-exit teardown (under 2% each):
   each sits below #818's 2% bar. Bounded pass 2's spill drain is wider
