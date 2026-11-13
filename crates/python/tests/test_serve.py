@@ -1,12 +1,13 @@
 """Tests for `tylertoo.serve()`: the `tylertoo serve` server (#825)."""
 
+import contextlib
 import signal
 import socket
 import subprocess
 import sys
-import threading
 import time
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,26 @@ def fetch(url: str, headers: dict[str, str] | None = None) -> bytes:
     raise AssertionError(f"{url} never answered")
 
 
+@contextlib.contextmanager
+def serving(
+    archives: str | list[str], **kwargs: object
+) -> Iterator[subprocess.Popen[str]]:
+    """`tylertoo.serve` in a child process, killed on exit.
+
+    Not a daemon thread: `serve` polls Python's signal handlers, and a
+    thread still in that loop when the interpreter shuts down crashes it.
+    """
+    code = f"import tylertoo; tylertoo.serve({archives!r}, **{kwargs!r})"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code], stderr=subprocess.PIPE, text=True
+    )
+    try:
+        yield proc
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 class TestServe:
     def test_serve_is_exported(self) -> None:
         assert "serve" in tylertoo.__all__
@@ -55,54 +76,35 @@ class TestServe:
 
     def test_serves_the_archive_bytes(self) -> None:
         port = free_port()
-        threading.Thread(
-            target=tylertoo.serve,
-            args=([ROADS_PMTILES],),
-            kwargs={"port": port},
-            daemon=True,
-        ).start()
-        base = f"http://127.0.0.1:{port}"
-        head = fetch(f"{base}/road-detections.pmtiles", {"Range": "bytes=0-126"})
-        assert head == ROADS_PMTILES.read_bytes()[:127]
-        assert b"maplibre-gl" in fetch(f"{base}/")
+        with serving([str(ROADS_PMTILES)], port=port):
+            base = f"http://127.0.0.1:{port}"
+            head = fetch(f"{base}/road-detections.pmtiles", {"Range": "bytes=0-126"})
+            assert head == ROADS_PMTILES.read_bytes()[:127]
+            assert b"maplibre-gl" in fetch(f"{base}/")
 
     def test_cors_is_opt_in(self) -> None:
         port = free_port()
-        threading.Thread(
-            target=tylertoo.serve,
-            args=(ROADS_PMTILES,),
-            kwargs={"port": port, "cors": "https://pmtiles.io"},
-            daemon=True,
-        ).start()
-        url = f"http://127.0.0.1:{port}/index.json"
-        fetch(url)
-        for origin, allowed in [
-            ("https://pmtiles.io", True),
-            ("https://x.example", False),
-        ]:
-            req = urllib.request.Request(url, headers={"Origin": origin})
-            with urllib.request.urlopen(req, timeout=5) as r:
-                assert (r.headers["Access-Control-Allow-Origin"] == origin) is allowed
+        with serving(str(ROADS_PMTILES), port=port, cors="https://pmtiles.io"):
+            url = f"http://127.0.0.1:{port}/index.json"
+            fetch(url)
+            for origin, allowed in [
+                ("https://pmtiles.io", True),
+                ("https://x.example", False),
+            ]:
+                req = urllib.request.Request(url, headers={"Origin": origin})
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    assert (
+                        r.headers["Access-Control-Allow-Origin"] == origin
+                    ) is allowed
 
     # Windows has no SIGINT to send to a child; a console Ctrl-C reaches
     # the same `check_signals` poll.
     @pytest.mark.skipif(sys.platform == "win32", reason="no SIGINT on Windows")
     def test_ctrl_c_stops_the_server(self) -> None:
         port = free_port()
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                f"import tylertoo; tylertoo.serve({str(ROADS_PMTILES)!r}, port={port})",
-            ],
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        try:
+        with serving(str(ROADS_PMTILES), port=port) as proc:
             fetch(f"http://127.0.0.1:{port}/index.json")
             proc.send_signal(signal.SIGINT)
             _, err = proc.communicate(timeout=10)
-        finally:
-            proc.kill()
         assert proc.returncode != 0
         assert "KeyboardInterrupt" in err
