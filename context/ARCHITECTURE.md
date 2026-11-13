@@ -495,9 +495,9 @@ repaired in a single boolean-overlay pass. `--no-cascade` restores the
 non-cascaded path, where an invalid candidate instead retries at
 `eps/2, eps/4, eps/8` before falling back to the original geometry (counted,
 logged at debug level). Either way the validity check skips candidates over
-2048 vertices (#242). It now tests only edge pairs whose bounding boxes meet.
-The cap no longer guards an O(V²) stall and stays only to keep output the
-same. The canonical level is always verbatim.
+2048 vertices (#242). It now tests only edge pairs whose bounding boxes meet,
+which is fast on ordinary rings. A ring whose edges all share an x range
+still costs O(V²), so the cap also bounds that worst case. The canonical level is always verbatim.
 
 The chain builder itself (`overview/coalesce.rs`) is written against the same
 memory bound the #449 ceiling promises (#570): a piece BORROWS its source
