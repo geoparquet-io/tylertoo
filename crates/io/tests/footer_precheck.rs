@@ -579,7 +579,7 @@ fn every_retyped_known_field_is_refused() {
     use At::*;
     // (where, id, wire type, value, the refused wire type, read as)
     type Case = (At, i16, u8, &'static [u8], u8, u8);
-    let cases: [Case; 16] = [
+    let cases: [Case; 21] = [
         (File, 5, 5, &[0x1C, 0x18, 1, b'k', 0], 5, 9),
         (File, 5, 9, &[0x1C, 0x15, 0, 0], 5, 8), // KeyValue.key
         (File, 7, 5, &[0x1C, 0x1C, 0, 0], 5, 9),
@@ -587,9 +587,13 @@ fn every_retyped_known_field_is_refused() {
         (RowGroup, 4, 5, &[0x1C, 0x15, 0, 0x12, 0x12, 0], 5, 9),
         // SortingColumn.column_idx
         (RowGroup, 4, 9, &[0x1C, 0x18, 0, 0x12, 0x12, 0], 8, 5),
+        // SortingColumn.descending
+        (RowGroup, 4, 9, &[0x1C, 0x15, 0, 0x15, 0, 0x12, 0], 5, 1),
         (ColumnMetaData, 2, 5, &[0x15, 0], 5, 9),
         (ColumnMetaData, 12, 5, &[0x36, 0, 0], 5, 12),
         (ColumnMetaData, 12, 12, &[0x38, 0, 0], 8, 5), // Statistics.null_count
+        (ColumnMetaData, 12, 12, &[0x15, 0, 0], 5, 8), // Statistics.max
+        (ColumnMetaData, 12, 12, &[0x75, 0, 0], 5, 1), // Statistics.is_max_value_exact
         (
             ColumnMetaData,
             13,
@@ -608,11 +612,15 @@ fn every_retyped_known_field_is_refused() {
             5,
         ),
         (ColumnMetaData, 16, 5, &[0x16, 0, 0], 5, 12),
+        // SizeStatistics.unencoded_byte_array_data_bytes
+        (ColumnMetaData, 16, 12, &[0x18, 0, 0], 8, 5),
         // SizeStatistics.repetition_level_histogram
         (ColumnMetaData, 16, 12, &[0x25, 0, 0], 5, 9),
         (ColumnMetaData, 17, 5, &[0x29, 0x05, 0], 5, 12),
         (ColumnMetaData, 17, 12, &[0x15, 0, 0], 5, 12), // GeospatialStatistics.bbox
         (ColumnMetaData, 17, 12, &[0x1C, 0x15, 0, 0, 0], 5, 7), // BoundingBox.xmin
+        // GeospatialStatistics.geospatial_types
+        (ColumnMetaData, 17, 12, &[0x25, 0x05, 0], 5, 9),
     ];
     for (at, id, ty, raw, refused, read_as) in cases {
         let field = vec![Junk {
