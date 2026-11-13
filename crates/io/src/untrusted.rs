@@ -75,6 +75,13 @@ thread_local! {
     static CAUGHT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Threads this thread spawned for column splits ([`next_split`],
+    /// [`map_split`]), so a test can hold them to their bound.
+    static SPLIT_SPAWNS: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Install, once per process, a panic hook that records a panic raised
 /// inside a [`guard`] instead of printing it, and hands every other panic to
 /// the hook that was installed before it.
@@ -1774,6 +1781,17 @@ type OpenGroups = Box<
 /// An 8,192-row decode of Overture's segments is 877-1,282 KiB compressed
 /// (min-median over row groups), of places 987-1,033 KiB, so both split; a
 /// one-row decode of a list-heavy group, or a 100-row group, does not.
+///
+/// The floor also bounds the threads a file can make a reader spawn. A
+/// split reader spawns `threads - 1` threads per decode and as many per
+/// batch it yields, with `threads` capped by the memory budget's
+/// `read_decode_plan` (a quarter of the cores, shared among the readers).
+/// A group splits only when one decode of it covers this floor. So its
+/// decodes number at most `2 x b / SPLIT_MIN_DECODE_BYTES`, where `b` is
+/// its projected compressed bytes, and each of those bytes is a checked
+/// range of the file that the decode reads. Spawns therefore follow bytes
+/// read, never row or group counts. A list-heavy one-row decode, a limited
+/// read and a dictionary page are all priced by the same compressed bytes.
 const SPLIT_MIN_DECODE_BYTES: u64 = 128 << 10;
 
 /// The compressed bytes of `projection`'s columns (every column when
@@ -1896,6 +1914,8 @@ fn map_split<T: Send>(
         at += c;
     }
     let f = &f;
+    #[cfg(test)]
+    SPLIT_SPAWNS.with(|n| n.set(n.get() + starts.len() - 1));
     std::thread::scope(|s| {
         let handles: Vec<_> = starts[1..]
             .iter()
@@ -1922,6 +1942,8 @@ fn next_split(
     let parts: Vec<Option<Result<RecordBatch, ArrowError>>> = match readers {
         [one] => return one.next(),
         [first, rest @ ..] => std::thread::scope(|s| {
+            #[cfg(test)]
+            SPLIT_SPAWNS.with(|n| n.set(n.get() + rest.len()));
             // Each spawned split decodes inside its own thread's boundary.
             let handles: Vec<_> = rest
                 .iter_mut()
@@ -2426,6 +2448,11 @@ mod tests {
     /// group per entry of `lens`: the value length of each column. Values
     /// are pseudo-random, so the chunks hold real bytes of about that size.
     fn binary_groups(lens: &[[usize; 3]]) -> Bytes {
+        sized_binary_groups(&lens.iter().map(|l| (10, *l)).collect::<Vec<_>>())
+    }
+
+    /// [`binary_groups`] with each group's row count.
+    fn sized_binary_groups(groups: &[(usize, [usize; 3])]) -> Bytes {
         use arrow_array::{ArrayRef, BinaryArray};
         use parquet::arrow::ArrowWriter;
         use parquet::file::properties::WriterProperties;
@@ -2441,12 +2468,12 @@ mod tests {
                 .collect()
         };
         let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(10))
+            .set_max_row_group_row_count(Some(1024))
             .build();
         let mut writer = None;
-        for group in lens {
+        for &(rows, group) in groups {
             let mut column = |len: usize| {
-                let values: Vec<Vec<u8>> = (0..10).map(|_| value(len)).collect();
+                let values: Vec<Vec<u8>> = (0..rows).map(|_| value(len)).collect();
                 Arc::new(BinaryArray::from_iter_values(values)) as ArrayRef
             };
             let batch = RecordBatch::try_from_iter([
@@ -2612,6 +2639,90 @@ mod tests {
             split_columns(Bytes::from(bytes), vec![0]),
             [names(&["a"]), names(&["b", "c"])]
         );
+    }
+
+    /// Column splits that disagree on their rows are an input error, not a
+    /// silently short batch: a crafted footer points group 1's `c` at group
+    /// 0's five-row chunk while `a` and `b` hold ten rows. Decoded whole,
+    /// the splits yield 10 rows against 5; in five-row batches, the second
+    /// finds `c` exhausted.
+    #[test]
+    fn splits_that_disagree_on_their_rows_are_an_error() {
+        use parquet::file::metadata::ParquetMetaDataWriter;
+        let good = sized_binary_groups(&[(5, [16 << 10; 3]), (10, [16 << 10; 3])]);
+        let md = open_parquet(good.clone()).unwrap().metadata;
+        let md = md.metadata().as_ref().clone();
+        let mut groups = md.row_groups().to_vec();
+        let mut columns = groups[1].columns().to_vec();
+        columns[2] = groups[0].column(2).clone();
+        groups[1] = groups[1]
+            .clone()
+            .into_builder()
+            .set_column_metadata(columns)
+            .build()
+            .unwrap();
+        let md = md.into_builder().set_row_groups(groups).build();
+        let mut bytes = good.to_vec();
+        let footer =
+            u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap());
+        bytes.truncate(bytes.len() - 8 - footer as usize);
+        ParquetMetaDataWriter::new(&mut bytes, &md)
+            .finish()
+            .unwrap();
+        let bytes = Bytes::from(bytes);
+        for batch_rows in [8192, 5] {
+            let mut reader = open_parquet(bytes.clone())
+                .unwrap()
+                .with_row_groups(vec![1])
+                .with_batch_rows(batch_rows)
+                .with_decode_threads(3)
+                .build()
+                .unwrap();
+            assert_eq!(reader.inner.current.len(), 3);
+            let err = reader
+                .find_map(Result::err)
+                .expect("the splits disagree")
+                .to_string();
+            assert!(
+                err.contains("column splits decoded different rows"),
+                "{batch_rows}: {err}"
+            );
+        }
+    }
+
+    /// PR #881 review: split threads follow the compressed bytes read
+    /// ([`SPLIT_MIN_DECODE_BYTES`]): at most `threads - 1` per decode and per
+    /// yielded batch, and at most `2 x bytes / floor` decodes. The crafted
+    /// footer holds almost no real bytes, so it spawns none; real bytes
+    /// spawn some, within the bound.
+    #[test]
+    fn split_spawns_are_bounded_by_the_compressed_bytes_read() {
+        let threads = 3;
+        let spawns = |bytes: Bytes| {
+            let compressed: u64 = open_parquet(bytes.clone())
+                .unwrap()
+                .metadata
+                .metadata()
+                .row_groups()
+                .iter()
+                .flat_map(|g| g.columns())
+                .map(|c| c.compressed_size() as u64)
+                .sum();
+            SPLIT_SPAWNS.with(|n| n.set(0));
+            let rows: usize = open_parquet(bytes)
+                .unwrap()
+                .with_decode_threads(threads)
+                .build()
+                .unwrap()
+                .map(|b| b.unwrap().num_rows())
+                .sum();
+            assert_eq!(rows, 30);
+            let bound = 2 * (threads - 1) as u64 * (2 * compressed / SPLIT_MIN_DECODE_BYTES);
+            (SPLIT_SPAWNS.with(Cell::get) as u64, bound)
+        };
+        assert_eq!(spawns(declaring_uncompressed(i64::MAX)), (0, 0));
+        let (real, bound) = spawns(splitting_groups());
+        assert!(real > 0 && real <= bound, "{real} spawns, bound {bound}");
     }
 
     /// PR #881 review: the split decision trusts only bytes the file holds.
