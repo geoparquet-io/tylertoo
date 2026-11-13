@@ -1184,7 +1184,7 @@ fn count_validity_work(relate: bool) {
 /// each hole against the exterior and against every other hole. Here only
 /// edge pairs whose bounding boxes overlap reach the same predicate, and
 /// `relate` runs only for a hole whose boundary touches the other ring's (see
-/// [`holes_valid`]). Proven against geo by the differential tests below and
+/// `holes_valid`). Proven against geo by the differential tests below and
 /// `hostile_geometry_eval::overview_polygon_is_valid_matches_geo_on_corpus`.
 pub fn polygon_is_valid(p: &Polygon<f64>) -> bool {
     use geo::Intersects;
