@@ -1473,22 +1473,24 @@ const DEFAULT_PARTITION_TARGET: usize = 32_768;
 /// Smaller waves add wave barriers, where the pool idled on each wave's
 /// largest tile (one tile encodes on one thread): a quarter cost NZ parcels
 /// 9% of its wall in the serial wave loop. With the waves overlapped
-/// ([`BOUNDED_WAVE_SLACK_PERMILLE`]) the barrier is gone: NZ parcels
+/// ([`WAVE_SLACK_PERMILLE`]) the barrier is gone: NZ parcels
 /// bounded 3,993 -> 2,909 MiB peak RSS and 74.3 -> 71.3 s wall (medians
 /// of 4, quiet host).
 const BOUNDED_MULTI_WAVE_TARGET_PERCENT: usize = 25;
 
-/// How far past its largest wave, in permille, `bounded` lets a level
-/// group's members in flight run (#815), so the next wave is collected and
-/// starts encoding while the last partitions of the wave before it finish.
-/// A bounded multi-wave level is planned with this slack priced in
-/// ([`plan_level`]), so the overlap stays inside the collect grant. Slack
-/// 0, 12.5% and 50% gave the same NZ wall; this is the middle.
-const BOUNDED_WAVE_SLACK_PERMILLE: usize = 125;
+/// How far past its largest wave, in permille, a level group's members in
+/// flight may run, so the next wave or level is collected and starts
+/// encoding while the last partitions before it finish (#815). A bounded
+/// multi-wave level is planned with this slack priced in ([`plan_level`]),
+/// so the overlap stays inside the collect grant; under `auto` and `speed`
+/// every group takes it, within the members [`MemoryPhase::ExportCollect`]
+/// affords ([`level_group_member_cap`]). Slack 0, 12.5% and 50% gave the
+/// same NZ wall; this is the middle.
+const WAVE_SLACK_PERMILLE: usize = 125;
 
-/// `members` plus the [`BOUNDED_WAVE_SLACK_PERMILLE`] slack on them.
-fn with_bounded_slack(members: usize) -> usize {
-    members.saturating_add(members.saturating_mul(BOUNDED_WAVE_SLACK_PERMILLE) / 1000)
+/// `members` plus the [`WAVE_SLACK_PERMILLE`] slack on them.
+fn with_wave_slack(members: usize) -> usize {
+    members.saturating_add(members.saturating_mul(WAVE_SLACK_PERMILLE) / 1000)
 }
 
 /// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing.
@@ -1836,15 +1838,20 @@ fn check_levels_fit(
 /// below every id at `z + 1`, so the writer still sees ascending ids and the
 /// archive is byte-identical.
 ///
-/// A level joins the open group only if it fits in a single wave (empty
-/// levels count, with zero members) and the group's summed members stay
-/// within `member_cap`. A multi-wave level, or a level that alone exceeds
-/// the cap, is a group of one and exports through the unchanged wave loop.
-/// A `member_cap` of 0 is the serial schedule, one level per group.
+/// A level joins the open group if it fits in a single wave (empty levels
+/// count, with zero members) and its own members fit `member_cap`. With
+/// `overlap` that is all: the group's in-flight gate ([`group_schedule`]),
+/// not its sum, bounds the members held, so the finest level's collect
+/// overlaps the coarser levels' last encodes instead of waiting for the
+/// group to end. Without it (`bounded`) the group's summed members also stay
+/// within `member_cap`, so bounded's peak does not rise. A multi-wave level,
+/// or a level that alone exceeds the cap, is a group of one and exports
+/// through the unchanged wave loop. A `member_cap` of 0 is the serial
+/// schedule, one level per group.
 fn plan_level_groups(
     plans: &[LevelPlan],
     member_cap: usize,
-    waves: bool,
+    (waves, overlap): (bool, bool),
 ) -> Vec<std::ops::Range<usize>> {
     if member_cap == 0 {
         return (0..plans.len()).map(|i| i..i + 1).collect();
@@ -1864,7 +1871,9 @@ fn plan_level_groups(
             continue;
         }
         if let Some((range, sum)) = open.as_mut() {
-            if single_wave && sum.saturating_add(members) <= member_cap {
+            let fits =
+                members <= member_cap && (overlap || sum.saturating_add(members) <= member_cap);
+            if single_wave && fits {
                 range.end = i + 1;
                 *sum += members;
                 continue;
@@ -1888,18 +1897,26 @@ fn plan_level_groups(
 /// largest wave of any level but never below [`PARTITION_WAVE_MIN`]
 /// partitions of `partition_target` (the narrowest full wave the serial loop
 /// holds), so a small export's levels all overlap. Collected members wait,
-/// valve and MVT workspace included, until their level encodes, so more of
-/// them in flight than the largest wave would raise the export's peak above
-/// the serial loop's. The cap bounds members in flight, not the group, so a
-/// group whose encodes keep up still overlaps every level.
+/// valve and MVT workspace included, until their level encodes, so members
+/// in flight past the largest wave raise the export's peak above the serial
+/// loop's, here by at most the slack below. The cap bounds members in
+/// flight, not the group, so a group whose encodes keep up still overlaps
+/// every level.
+///
+/// Under `auto` and `speed` the cap adds [`WAVE_SLACK_PERMILLE`] to the
+/// largest wave, within `member_cap`: the next level is admitted once the
+/// members before it have at most the slack left, so their last tiles no
+/// longer idle the pool. With the finest level in the group
+/// ([`plan_level_groups`]) its collect overlaps the coarser levels' last
+/// encodes: 3–11% less levels wall for up to 4% (59–116 MiB) more peak
+/// RSS on moldova, lines, wideprops and brmt.
 ///
 /// A multi-wave level's waves overlap (#817). Under `bounded` a group that
-/// holds one caps at the largest wave plus [`BOUNDED_WAVE_SLACK_PERMILLE`],
-/// with no [`PARTITION_WAVE_MIN`] floor, which its plan priced in (#815):
-/// the next wave is admitted once the wave before it has at most the slack
-/// left, so its last tiles no longer idle the pool. A group of single-wave
-/// levels keeps the floor, so a small export's levels still overlap. A
-/// `member_cap` of 0 is the serial schedule.
+/// holds one caps at the largest wave plus the slack, with no
+/// [`PARTITION_WAVE_MIN`] floor, which its plan priced in (#815). A group of
+/// single-wave levels keeps the floor and no slack, so a small export's
+/// levels still overlap and bounded's peak does not rise. A `member_cap` of
+/// 0 is the serial schedule.
 fn group_schedule(
     member_cap: usize,
     plans: &[LevelPlan],
@@ -1915,12 +1932,19 @@ fn group_schedule(
         })
         .max()
         .unwrap_or(0);
-    let single_wave_cap =
-        member_cap.min(largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN)));
+    // Bounded keeps the serial loop's peak: no slack past its largest
+    // single-wave level and no group past the member cap.
+    let overlap = profile != MemoryProfile::Bounded;
+    let floored = largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN));
+    let single_wave_cap = member_cap.min(if overlap {
+        with_wave_slack(floored)
+    } else {
+        floored
+    });
     // Bounded's multi-wave levels plan at a quarter target, so the floor
     // would let a guard-narrowed level's waves past what was priced.
     let cap = match profile {
-        MemoryProfile::Bounded => member_cap.min(with_bounded_slack(largest_wave)),
+        MemoryProfile::Bounded => member_cap.min(with_wave_slack(largest_wave)),
         _ => single_wave_cap,
     };
     let gate = GroupGate {
@@ -1928,7 +1952,10 @@ fn group_schedule(
         single_wave_cap,
         waves: cap > 0,
     };
-    (plan_level_groups(plans, member_cap, gate.waves), gate)
+    (
+        plan_level_groups(plans, member_cap, (gate.waves, overlap)),
+        gate,
+    )
 }
 
 /// Resolve a requested partition-wave width to a concrete value.
@@ -2266,7 +2293,7 @@ fn plan_level(
     if profile == MemoryProfile::Bounded && partitions.len() > wave {
         // The waves overlap by the slack ([`group_schedule`]): priced in,
         // a wave and its slack fit the grant one wave did.
-        let slack_bytes = member_bytes.map(|b| with_bounded_slack(b as usize) as u64);
+        let slack_bytes = member_bytes.map(|b| with_wave_slack(b as usize) as u64);
         (partitions, wave) = plan(
             partition_target * BOUNDED_MULTI_WAVE_TARGET_PERCENT / 100,
             slack_bytes,
@@ -12209,8 +12236,9 @@ mod tests {
     }
 
     /// #647: consecutive single-wave levels coalesce into one group while
-    /// their summed members fit the cap; a multi-wave level, or a level that
-    /// alone overshoots the cap, runs on its own exactly as before.
+    /// their summed members fit the cap, or, overlapping, while each fits
+    /// it; a multi-wave level, or a level that alone overshoots the cap,
+    /// runs on its own exactly as before.
     #[test]
     fn plan_level_groups_coalesces_single_wave_levels_under_the_cap() {
         let plans = vec![
@@ -12224,12 +12252,12 @@ mod tests {
             plan_with_members(10, &[1], 6),
         ];
         assert_eq!(
-            plan_level_groups(&plans, 100, false),
+            plan_level_groups(&plans, 100, (false, false)),
             vec![0..4, 4..5, 5..6, 6..7, 7..8],
         );
         // A cap of 0 is the serial schedule.
         assert_eq!(
-            plan_level_groups(&plans, 0, false),
+            plan_level_groups(&plans, 0, (false, true)),
             (0..plans.len()).map(|i| i..i + 1).collect::<Vec<_>>(),
         );
         // A cap of 1 is not: an empty level still joins a 1-member level.
@@ -12238,7 +12266,11 @@ mod tests {
             plan_with_members(4, &[1], 6),
             plan_with_members(5, &[1], 6),
         ];
-        assert_eq!(plan_level_groups(&tiny, 1, false), vec![0..2, 2..3]);
+        assert_eq!(
+            plan_level_groups(&tiny, 1, (false, false)),
+            vec![0..2, 2..3]
+        );
+        assert_eq!(plan_level_groups(&tiny, 1, (false, true)), vec![0..3]);
         // A multi-wave level under the cap does not open a group for the
         // single-wave level after it.
         let multi_first = vec![
@@ -12246,23 +12278,59 @@ mod tests {
             plan_with_members(4, &[1], 6),
         ];
         assert_eq!(
-            plan_level_groups(&multi_first, 100, false),
+            plan_level_groups(&multi_first, 100, (false, true)),
             vec![0..1, 1..2]
         );
-        assert!(plan_level_groups(&[], 100, false).is_empty());
+        assert!(plan_level_groups(&[], 100, (false, true)).is_empty());
         // #817: with overlapping waves a multi-wave level joins the open
         // group, adding nothing to its sum; a level alone over the cap
         // still runs alone.
         assert_eq!(
-            plan_level_groups(&plans, 100, true),
+            plan_level_groups(&plans, 100, (true, false)),
             vec![0..4, 4..6, 6..7, 7..8],
         );
-        let joined = plan_level_groups(&multi_first, 100, true);
+        // Overlapping, a level joins whenever it alone fits.
+        assert_eq!(
+            plan_level_groups(&plans, 100, (false, true)),
+            vec![0..5, 5..6, 6..7, 7..8],
+        );
+        assert_eq!(
+            plan_level_groups(&plans, 100, (true, true)),
+            vec![0..6, 6..7, 7..8],
+        );
+        let joined = plan_level_groups(&multi_first, 100, (true, true));
         assert!(joined.len() == 1 && joined[0] == (0..2), "{joined:?}");
     }
 
+    /// A single-wave level joins the open group when it alone fits the
+    /// member cap, whatever the group already holds: the in-flight gate, not
+    /// the group's sum, bounds what is held, so the finest level's collect
+    /// overlaps the coarser levels' last encodes. A level over the cap still
+    /// runs alone.
+    #[test]
+    fn a_single_wave_level_joins_the_open_group_when_it_alone_fits_the_cap() {
+        let fits = vec![
+            plan_with_members(10, &[10], 6),
+            plan_with_members(11, &[20], 6),
+            plan_with_members(12, &[30], 6), // 10+20+30 > 40, 30 <= 40
+        ];
+        assert_eq!(plan_level_groups(&fits, 40, (true, true)), vec![0..3]);
+        // `bounded` keeps the group's sum within the cap.
+        assert_eq!(
+            plan_level_groups(&fits, 40, (true, false)),
+            vec![0..2, 2..3]
+        );
+        let over = vec![
+            plan_with_members(10, &[10], 6),
+            plan_with_members(11, &[20], 6),
+            plan_with_members(12, &[50], 6), // 50 > 40
+        ];
+        assert_eq!(plan_level_groups(&over, 40, (true, true)), vec![0..2, 2..3]);
+    }
+
     /// #817: a group's members in flight never exceed the export's largest
-    /// wave, or the narrowest wave of full partitions when that is larger.
+    /// wave, or the narrowest wave of full partitions when that is larger,
+    /// plus the slack, and never the member cap.
     #[test]
     fn the_in_flight_cap_is_the_largest_wave() {
         let plans = vec![
@@ -12275,17 +12343,21 @@ mod tests {
                 .1
                 .cap
         };
-        assert_eq!(cap(100, &plans, 1), 30);
+        assert_eq!(cap(100, &plans, 1), with_wave_slack(30));
+        assert_eq!(cap(31, &plans, 1), 31);
         // A multi-wave level's largest wave, not its whole band, is the bound.
         let multi = vec![
             plan_with_members(3, &[10], 6),
             plan_with_members(4, &[10], 6),
             plan_with_members(5, &[3; 12], 6),
         ];
-        assert_eq!(cap(100, &multi, 1), 18);
+        assert_eq!(cap(100, &multi, 1), with_wave_slack(18));
         // The narrowest wave of full partitions is the floor, and the serial
         // cap stays 0.
-        assert_eq!(cap(1_000, &plans, 64), 64 * PARTITION_WAVE_MIN);
+        assert_eq!(
+            cap(1_000, &plans, 64),
+            with_wave_slack(64 * PARTITION_WAVE_MIN)
+        );
         assert_eq!(cap(0, &plans, 64), 0);
     }
 
@@ -12303,7 +12375,7 @@ mod tests {
             gate.waves,
             "bounded runs its waves through the group pipeline"
         );
-        assert_eq!(gate.cap, with_bounded_slack(32));
+        assert_eq!(gate.cap, with_wave_slack(32));
         assert_eq!(gate.cap, 36);
         let in_flight = InFlight::new(gate.cap);
         let first = in_flight.admit(32);
@@ -12331,11 +12403,12 @@ mod tests {
         // holds its wave plus the slack, not six full-target partitions.
         let narrowed = vec![plan_with_members(5, &[4; 16], 2)];
         let (_, gate) = group_schedule(1_000, &narrowed, 100, MemoryProfile::Bounded);
-        assert_eq!(gate.cap, with_bounded_slack(8));
-        // Auto keeps its cap; a member cap below the wave still bounds it.
+        assert_eq!(gate.cap, with_wave_slack(8));
+        // Auto takes the same slack; a member cap below the wave still
+        // bounds it.
         assert_eq!(
             group_schedule(1_000, &plans, 1, MemoryProfile::Auto).1.cap,
-            32
+            36
         );
         assert_eq!(
             group_schedule(30, &plans, 1, MemoryProfile::Bounded).1.cap,
@@ -12357,7 +12430,7 @@ mod tests {
         let (groups, gate) = group_schedule(10_000, &plans, 64, MemoryProfile::Bounded);
         assert_eq!(groups, vec![0..4]);
         assert_eq!(gate.single_wave_cap, 64 * PARTITION_WAVE_MIN);
-        assert_eq!(gate.cap, with_bounded_slack(40));
+        assert_eq!(gate.cap, with_wave_slack(40));
         // The budget still bounds it.
         assert_eq!(
             group_schedule(100, &plans, 64, MemoryProfile::Bounded)
