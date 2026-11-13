@@ -196,34 +196,68 @@ fn junk() -> impl Strategy<Value = Junk> {
         })
 }
 
-/// The type parquet-rs reads a field of each struct the footer is built
-/// from as, by id (12: a `LogicalType`), for the varint and binary fields.
-type Reads = fn(i16) -> Option<u8>;
+/// How parquet-rs reads a field of a struct the footer is built from.
+#[derive(Clone, Copy)]
+enum Read {
+    /// A varint (5) or binary (8).
+    Wire(u8),
+    LogicalType,
+    /// A list or struct: a minimal value of it parquet-rs accepts, longer
+    /// than one byte so that skipping it by another wire type loses the
+    /// place.
+    Bytes(&'static [u8]),
+}
+
+/// How parquet-rs reads each field of a struct, by id.
+type Reads = fn(i16) -> Option<Read>;
 
 const FILE: Reads = |id| match id {
-    1 | 3 => Some(5),
-    6 => Some(8),
+    1 | 3 => Some(Read::Wire(5)),
+    // key_value_metadata: one KeyValue { key: "k" }.
+    5 => Some(Read::Bytes(&[0x1C, 0x18, 1, b'k', 0])),
+    6 => Some(Read::Wire(8)),
+    // column_orders: one TYPE_ORDER.
+    7 => Some(Read::Bytes(&[0x1C, 0x1C, 0, 0])),
     _ => None,
 };
 const SCHEMA_ELEMENT: Reads = |id| match id {
-    1..=3 | 5..=9 => Some(5),
-    4 => Some(8),
-    10 => Some(12),
+    1..=3 | 5..=9 => Some(Read::Wire(5)),
+    4 => Some(Read::Wire(8)),
+    10 => Some(Read::LogicalType),
     _ => None,
 };
-const ROW_GROUP: Reads = |id| matches!(id, 2 | 3 | 5 | 7).then_some(5);
+const ROW_GROUP: Reads = |id| match id {
+    2 | 3 | 5 | 7 => Some(Read::Wire(5)),
+    // sorting_columns: one SortingColumn { 0, false, false }.
+    4 => Some(Read::Bytes(&[0x1C, 0x15, 0, 0x12, 0x12, 0])),
+    _ => None,
+};
 const COLUMN_CHUNK: Reads = |id| match id {
-    1 => Some(8),
-    2 | 4..=7 => Some(5),
+    1 => Some(Read::Wire(8)),
+    2 | 4..=7 => Some(Read::Wire(5)),
     _ => None,
 };
-const COLUMN_METADATA: Reads = |id| matches!(id, 1 | 4..=7 | 9..=11 | 14 | 15).then_some(5);
+const COLUMN_METADATA: Reads = |id| match id {
+    1 | 4..=7 | 9..=11 | 14 | 15 => Some(Read::Wire(5)),
+    // encodings: [PLAIN].
+    2 => Some(Read::Bytes(&[0x15, 0])),
+    // statistics: { null_count: 0 }.
+    12 => Some(Read::Bytes(&[0x36, 0, 0])),
+    // encoding_stats: one PageEncodingStats { 0, 0, 0 }.
+    13 => Some(Read::Bytes(&[0x1C, 0x15, 0, 0x15, 0, 0x15, 0, 0])),
+    // size_statistics: { unencoded_byte_array_data_bytes: 0 }.
+    16 => Some(Read::Bytes(&[0x16, 0, 0])),
+    // geospatial_statistics: { geospatial_types: [] }.
+    17 => Some(Read::Bytes(&[0x29, 0x05, 0])),
+    _ => None,
+};
 
 fn put(out: &mut Vec<u8>, last: &mut i16, j: &Junk, reads: Reads) {
     header(out, last, j.id, j.ty, false, 0);
     match reads(j.id).filter(|_| j.crafted) {
-        Some(12) => logical_type(out, j.seed),
-        Some(ty) => value(out, ty, j.seed, 0),
+        Some(Read::LogicalType) => logical_type(out, j.seed),
+        Some(Read::Bytes(bytes)) => out.extend_from_slice(bytes),
+        Some(Read::Wire(ty)) => value(out, ty, j.seed, 0),
         None => value(out, j.ty, j.seed, 0),
     }
 }
@@ -487,4 +521,37 @@ fn a_schema_nested_past_the_cap_is_refused() {
         .join()
         .unwrap();
     assert_eq!(columns, 1);
+}
+
+/// The depth cap counts open groups, not groups: 100 sibling groups of one
+/// leaf each, two levels deep, pass and decode.
+#[test]
+fn a_wide_shallow_schema_passes() {
+    let mut out = vec![0x15, 4, 0x19, 0xFC];
+    varint(&mut out, 201);
+    // The root: name (4), 100 children (5).
+    out.extend_from_slice(&[0x48, 1, b'r', 0x15]);
+    varint(&mut out, zigzag(100));
+    out.push(0);
+    for _ in 0..100 {
+        // A group: repetition REQUIRED (3), name (4), one child (5).
+        out.extend_from_slice(&[0x35, 0, 0x18, 1, b'g', 0x15, 2, 0]);
+        // Its leaf: type INT32 (1), repetition REQUIRED (3), name (4).
+        out.extend_from_slice(&[0x15, 2, 0x25, 0, 0x18, 1, b'x', 0]);
+    }
+    out.extend_from_slice(&[0x16, 0, 0x19, 0x0C, 0]);
+    tylertoo_io::precheck_footer(&out).unwrap();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#789: a wide schema must decode unchecked too"
+    )]
+    let metadata = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(&out);
+    assert_eq!(
+        metadata
+            .unwrap()
+            .file_metadata()
+            .schema_descr()
+            .num_columns(),
+        100
+    );
 }
