@@ -115,8 +115,10 @@ def test_a_source_with_nothing_to_score_is_not_a_pass(archive, src, tmp_path, mo
     (tmp_path / "archive.pmtiles").write_bytes(archive.read_bytes())
     monkeypatch.setattr(gate, "tippecanoe_dir", lambda *a: tmp_path)
     monkeypatch.setattr(gate, "tylertoo_archive", lambda *a: archive)
-    monkeypatch.setattr(gate, "score", lambda *a: {str(Z): {"tiles": {}}})
-    monkeypatch.setattr(gate, "cached_score", lambda *a: {str(Z): {"tiles": {}}})
+    # A polygon source still yields a seam row: it is not a scored tile.
+    nothing = {str(Z): {"tiles": {}, "seams": {"edge_gap": 0.0}}}
+    monkeypatch.setattr(gate, "score", lambda *a: nothing)
+    monkeypatch.setattr(gate, "cached_score", lambda *a: nothing)
     tol = {"gate": {"default_band": [-1.0, 0.02], "zoom_range": [Z, Z], "zooms": [Z]}, "datasets": {}}
     args = argparse.Namespace(work=tmp_path, zooms=None, cap=10)
     with pytest.raises(ValueError, match="nothing to score"):
@@ -130,13 +132,13 @@ def test_a_zoom_with_nothing_to_score_is_named(archive, src, tmp_path, monkeypat
     (tmp_path / "archive.pmtiles").write_bytes(archive.read_bytes())
     monkeypatch.setattr(gate, "tippecanoe_dir", lambda *a: tmp_path)
     monkeypatch.setattr(gate, "tylertoo_archive", lambda *a: archive)
-    scores = {str(Z): {"tiles": {"1/1": {"missing": 0.0}}}, "9": {"tiles": {}}}
+    scores = {str(Z): {"tiles": {"1/1": {"missing": 0.0}}}, "9": {"tiles": {}, "seams": {"edge_gap": 0.0}}}
     monkeypatch.setattr(gate, "score", lambda *a: scores)
     monkeypatch.setattr(gate, "cached_score", lambda *a: scores)
     tol = {"gate": {"zoom_range": [Z, 9], "zooms": [Z, 9]}, "datasets": {}}
     gate.gate_dataset(argparse.Namespace(work=tmp_path, zooms=None, cap=10), tol, {}, "d",
                       {"path": "unused", "layer": "l"})
-    assert "z9" in capsys.readouterr().out
+    assert "d: not scored against the source (no sampled tile holds enough of it): z9" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("preset", [True, False])

@@ -18,7 +18,8 @@ and with the pinned tippecanoe, and compares them on the same sampled tiles
   * each against the source: d = tylertoo's error - tippecanoe's error, on
     the worst tiles of each zoom (max, p99, p95).
 
-Each number is held to its band in visual_tolerances.toml. After a dataset
+Each number but the two kept ratios is held to its band in
+visual_tolerances.toml; the ratios are reported only. After a dataset
 the run prints its distance to tippecanoe and what tylertoo keeps over
 tippecanoe; --json holds both under `distance`.
 
@@ -402,11 +403,12 @@ def gate_dataset(args, tol: dict, tip: dict, did: str, ds: dict) -> list:
     ty_archive = tylertoo_archive(args, did, ds, zr)
     ty_scores = score(ty_archive, src, attr, zooms, args.cap)
     rows = compare(did, ty_scores, cached_score(tip_dir, src, attr, zooms, args.cap), tol)
-    empty = [z for z in zooms if not any(r["zoom"] == z for r in rows)]
+    # From the scored tiles, not the rows: a polygon's seam row comes without any tile over the floor.
+    empty = [z for z in zooms if not ty_scores[str(z)]["tiles"]]
     if empty == list(zooms):  # every sampled tile is under its floor: no verdict, not a pass
         raise ValueError(f"{did}: nothing to score at zooms {zooms}: no sampled tile holds enough of the source")
     if empty:
-        print("  not scored against the source (no sampled tile holds enough of it): "
+        print(f"{did}: not scored against the source (no sampled tile holds enough of it): "
               + ", ".join(f"z{z}" for z in empty), flush=True)
     # The direct comparison needs no source, so it takes every sampled tile, also
     # those under the source floor (small polygons at low zooms).
