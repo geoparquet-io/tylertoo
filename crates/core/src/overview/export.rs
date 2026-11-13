@@ -3462,6 +3462,7 @@ fn resolve_export_columns(
         options,
         &mut published,
     )?;
+    published.withhold_counter_at_canonical(reader.meta(), &options.properties);
     if let Some(fid) = &feature_id {
         validate_feature_id_column(reader, fid, level_zooms)?;
     }
@@ -7617,7 +7618,10 @@ fn finish_group(
     let attrs: Vec<AttrColumns<'_>> = batches
         .iter()
         .zip(&geom_idxs)
-        .map(|(b, &gi)| AttrColumns::new(&b.schema(), gi, ctx.published, ctx.feature_id))
+        .map(|(b, &gi)| {
+            let published = ctx.published.at_level(ctx.level_idx);
+            AttrColumns::new(&b.schema(), gi, published, ctx.feature_id)
+        })
         .collect();
     let chunk_inputs: Vec<ChunkInput<'_>> = batches
         .iter()
@@ -10315,6 +10319,12 @@ struct PublishedNames {
     /// file schema for the batches read from it ([`batch_geometry_index`]).
     geometry: Option<String>,
     properties: Option<HashSet<usize>>,
+    /// The canonical level's index and its own view of the names, which also
+    /// withholds the `coalesced_count` counter: that level never coalesces,
+    /// so the counter is 1 on every one of its rows by construction (spec
+    /// §13.2). Decided from the footer alone, so every build (sharded or
+    /// not, at any thread count) withholds it from the same tiles.
+    canonical: Option<(usize, Box<PublishedNames>)>,
 }
 
 impl PublishedNames {
@@ -10347,6 +10357,7 @@ impl PublishedNames {
             covering: None,
             geometry: None,
             properties: None,
+            canonical: None,
         }
     }
 
@@ -10396,8 +10407,53 @@ impl PublishedNames {
                 .and_then(|c| c.xmin_path.first().cloned()),
             geometry: descriptor.geometry_name().map(str::to_owned),
             properties: Some(descriptor.properties().iter().copied().collect()),
+            canonical: None,
         };
         names
+    }
+
+    /// Withhold the converter's `coalesced_count` from the canonical level's
+    /// tiles, where it is 1 on every row (#379 scoped per level). The column
+    /// stays at the coarser levels whenever any chain merged. A caller who
+    /// names the counter in `--include-property` keeps it everywhere; a
+    /// `--feature-order` on it is unaffected, since a key missing from every
+    /// member of a tile ranks them all equal, as all-1 values did. A capped
+    /// coarse job's file (`zoom_ceiling`) holds no canonical level, so it
+    /// withholds nothing here.
+    fn withhold_counter_at_canonical(
+        &mut self,
+        meta: &OverviewsMeta,
+        selection: &PropertySelection,
+    ) {
+        let column = COALESCED_COUNT_COLUMN;
+        let coalesced = meta.generalization.as_ref().is_some_and(|g| {
+            g.zoom_ceiling.is_none()
+                && g.coalescing
+                    .as_ref()
+                    .is_some_and(|c| c.coalesced_count_column == column)
+        });
+        let Some(canonical) = meta.canonical_level.and_then(|c| usize::try_from(c).ok()) else {
+            return;
+        };
+        let published = self.publish(column);
+        let named = selection
+            .include
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|n| n == published));
+        if !coalesced || named || self.is_suppressed(column) {
+            return;
+        }
+        let mut view = self.clone();
+        view.suppress(column);
+        self.canonical = Some((canonical, Box::new(view)));
+    }
+
+    /// The names level `level_idx`'s features are published under.
+    fn at_level(&self, level_idx: usize) -> &Self {
+        match &self.canonical {
+            Some((canonical, view)) if *canonical == level_idx => view,
+            _ => self,
+        }
     }
 
     /// Apply a caller's property selection (#386) on top of the file-derived
@@ -19901,6 +19957,130 @@ mod tests {
         write_coalesced_fixture(tin.path(), &[vec![2, 1], vec![1, 1]]);
         let names = exported_property_names(tin.path());
         assert_eq!(names, vec!["coalesced_count", "id"]);
+    }
+
+    /// Every decoded feature as `(zoom, coalesced_count)`, `None` where the
+    /// feature does not carry the key.
+    fn decoded_coalesced_counts(pmtiles: &Path) -> Vec<(u8, Option<i64>)> {
+        use arrow_array::cast::AsArray;
+        let decoded = tempfile::NamedTempFile::new().unwrap();
+        crate::decode::decode_pmtiles(
+            pmtiles,
+            decoded.path(),
+            &crate::decode::DecodeOptions::default(),
+        )
+        .unwrap();
+        let file = std::fs::File::open(decoded.path()).unwrap();
+        let mut out = Vec::new();
+        for batch in tylertoo_io::open_parquet(file).unwrap().build().unwrap() {
+            let batch = batch.unwrap();
+            let zooms =
+                arrow_cast::cast(batch.column_by_name("zoom").unwrap(), &DataType::UInt8).unwrap();
+            let counts = batch
+                .column_by_name("coalesced_count")
+                .map(|c| arrow_cast::cast(c, &DataType::Int64).unwrap());
+            for row in 0..batch.num_rows() {
+                let count = counts.as_ref().and_then(|c| {
+                    let c = c.as_primitive::<arrow_array::types::Int64Type>();
+                    c.is_valid(row).then(|| c.value(row))
+                });
+                out.push((
+                    zooms
+                        .as_primitive::<arrow_array::types::UInt8Type>()
+                        .value(row),
+                    count,
+                ));
+            }
+        }
+        out
+    }
+
+    /// End to end on real lines: six chains of 30 touching ~111 m segments
+    /// and four long lines. The canonical (finest) level never coalesces, so
+    /// every count there is 1 by construction (spec §13.2) and its tiles
+    /// carry no `coalesced_count`, while a coarser level that merged the
+    /// chains keeps the counter with the merged count.
+    #[test]
+    fn coalesced_count_is_left_off_canonical_tiles_and_kept_where_chains_merged() {
+        use tylertoo_io::test_support::ArrowWriter;
+        let dir = tempfile::tempdir().unwrap();
+        let (input, overview, out) = (
+            dir.path().join("lines.parquet"),
+            dir.path().join("lines_overview.parquet"),
+            dir.path().join("lines.pmtiles"),
+        );
+        let line =
+            |pts: &[(f64, f64)]| geo::Geometry::LineString(geo::LineString::from(pts.to_vec()));
+        let mut geoms = Vec::new();
+        for c in 0..6 {
+            let (x0, y0) = (-50.0 + f64::from(c) * 17.0, -20.0 + f64::from(c) * 8.0);
+            for k in 0..30 {
+                let x = x0 + f64::from(k) * 0.001;
+                geoms.push(line(&[(x, y0), (x + 0.001, y0)]));
+            }
+        }
+        for l in 0..4 {
+            let y = -60.0 + f64::from(l) * 35.0;
+            geoms.push(line(&[(-120.0, y), (-60.0, y + 5.0), (0.0, y - 3.0)]));
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]));
+        let wkb: Vec<Vec<u8>> = geoms
+            .iter()
+            .map(|g| crate::wkb::geometry_to_wkb(g).unwrap())
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..wkb.len() as i64).collect::<Vec<_>>())),
+                Arc::new(arrow_array::BinaryArray::from(
+                    wkb.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let geo_meta = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["LineString"]}}
+        });
+        let props = tylertoo_io::test_support::WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![tylertoo_io::KeyValue::new(
+                "geo".to_string(),
+                geo_meta.to_string(),
+            )]))
+            .build();
+        let mut w =
+            ArrowWriter::try_new(std::fs::File::create(&input).unwrap(), schema, Some(props))
+                .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let opts = crate::overview::convert::ConvertOptions::default().with_levels(
+            crate::overview::convert::LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 12,
+            },
+        );
+        crate::overview::convert::convert_to_overviews(&input, &overview, &opts).unwrap();
+        export_pmtiles(&overview, &out, &ExportOptions::default()).unwrap();
+
+        let features = decoded_coalesced_counts(&out);
+        let canonical: Vec<_> = features.iter().filter(|(z, _)| *z == 12).collect();
+        assert!(
+            !canonical.is_empty(),
+            "the canonical zoom must hold features"
+        );
+        assert!(
+            canonical.iter().all(|(_, c)| c.is_none()),
+            "canonical-level tiles must not carry coalesced_count: {canonical:?}"
+        );
+        assert!(
+            features.iter().any(|&(z, c)| z < 12 && c == Some(30)),
+            "a merged chain must keep its count of 30 at a coarser zoom"
+        );
     }
 
     /// #379 must not undo #359: once the converter's own `coalesced_count` is
