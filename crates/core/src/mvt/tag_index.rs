@@ -1,45 +1,59 @@
 //! One first-encounter key/value index, shared by materialized and serialized layers.
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::hash::{BuildHasher, RandomState};
-
-use xxhash_rust::xxh3::Xxh3Builder;
+use std::hash::{BuildHasher, Hasher, RandomState};
 
 use super::{PropertyValue, ScalarKey};
 
 pub(super) struct TagIndex<'a> {
-    keys: HashMap<Cow<'a, str>, u32, Xxh3Builder>,
-    strings: HashMap<Cow<'a, str>, u32, Xxh3Builder>,
-    scalars: HashMap<ScalarKey, u32, Xxh3Builder>,
+    keys: HashMap<Cow<'a, str>, u32, TagHash>,
+    strings: HashMap<Cow<'a, str>, u32, TagHash>,
+    scalars: HashMap<ScalarKey, u32, TagHash>,
     values: usize,
 }
 
 /// The tag maps' hasher: xxh3, which hashes long property strings several
 /// times faster than std's `SipHash` (`SipHash` was 15.6% of a wide-property
-/// export's cycles), keyed once per process with a secret drawn from
-/// `RandomState`, so values crafted to collide still need the key.
-#[expect(
-    clippy::disallowed_types,
-    reason = "#779: a process-wide hash key; no diagnostic globals"
-)]
-fn tag_hasher() -> Xxh3Builder {
-    static KEYED: std::sync::OnceLock<Xxh3Builder> = std::sync::OnceLock::new();
-    *KEYED.get_or_init(|| {
-        let random = RandomState::new();
-        let mut secret = [0u8; 192];
-        for (i, word) in secret.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-            *word = random.hash_one(i).to_le_bytes();
-        }
-        Xxh3Builder::new().with_secret(secret)
-    })
+/// export's cycles), seeded once per process from `RandomState`, so values
+/// crafted to collide still need the seed. Each write is one seeded one-shot
+/// xxh3 chained on the hash so far: a lookup builds an 8-byte hasher, not
+/// xxhash-rust's streaming state with its secret and buffer.
+#[derive(Clone, Copy)]
+struct TagHash(u64);
+
+impl TagHash {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: a process-wide hash seed; no diagnostic globals"
+    )]
+    fn seeded() -> Self {
+        static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        Self(*SEED.get_or_init(|| RandomState::new().hash_one(0u8)))
+    }
+}
+
+impl BuildHasher for TagHash {
+    type Hasher = TagHash;
+    fn build_hasher(&self) -> TagHash {
+        *self
+    }
+}
+
+impl Hasher for TagHash {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = xxhash_rust::xxh3::xxh3_64_with_seed(bytes, self.0);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 impl Default for TagIndex<'_> {
     fn default() -> Self {
         Self {
-            keys: HashMap::with_hasher(tag_hasher()),
-            strings: HashMap::with_hasher(tag_hasher()),
-            scalars: HashMap::with_hasher(tag_hasher()),
+            keys: HashMap::with_hasher(TagHash::seeded()),
+            strings: HashMap::with_hasher(TagHash::seeded()),
+            scalars: HashMap::with_hasher(TagHash::seeded()),
             values: 0,
         }
     }
@@ -115,5 +129,15 @@ mod tests {
             b.strings.hasher().hash_one(v)
         );
         assert_eq!(a.keys.hasher().hash_one(v), b.strings.hasher().hash_one(v));
+    }
+
+    /// One lookup builds one hasher: a keyed xxh3 streaming state carries its
+    /// 192-byte secret and 256-byte buffer, copied per lookup, which cost
+    /// more than `SipHash` on short values (moldova task-clock +1.5%). The
+    /// hasher is a seed, nothing more.
+    #[test]
+    fn a_tag_lookup_builds_a_seed_sized_hasher() {
+        let index = TagIndex::default();
+        assert!(std::mem::size_of_val(&index.strings.hasher().build_hasher()) <= 8);
     }
 }
