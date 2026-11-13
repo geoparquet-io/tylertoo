@@ -136,7 +136,7 @@ the results file.
 | tile buffer | `--tile-buffer 8` | `-b 8` (tippecanoe default is 5) | **matched**, by moving tippecanoe to tylertoo's value |
 | per-tile byte cap | `--max-compressed-tile-size 500000 --max-tile-size 0` (tylertoo's own defaults: `500K` = 512,000 bytes compressed, 2M raw) | `--maximum-tile-bytes 500000` (tippecanoe's default, on the compressed tile) | **matched**: the same compressed cap on both, and no raw cap, as tippecanoe has none |
 | oversize-tile valve | single non-iterative drop pass (always on) | `--drop-fraction-as-needed` | **approximated** — see asymmetries |
-| drop rate | `--drop-rate 1.65` | *not passed* (tippecanoe default 2.5) | **not matched on purpose** — see asymmetries |
+| drop rate | *not passed* (default 2.5) | *not passed* (default 2.5) | **matched** |
 | gamma | `--drop-gamma 1.5` | *not passed* (tippecanoe default 0) | **not matched on purpose** |
 | simplification | `--simplify-factor 1.0` (× level GSD, metres) | *not passed* (tippecanoe `-S` default 1, tile units) | **not matched on purpose** |
 
@@ -144,13 +144,13 @@ The buffer is moved on tippecanoe's side rather than tylertoo's because the
 buffer changes output *size*: letting tippecanoe write thinner tiles from a
 smaller buffer would flatter tylertoo on the archive-size column.
 
-`-r`, `-g` and `-S` are deliberately left at each tool's own default. tylertoo's
-`--drop-rate 1.65` is anchored on the full canonical feature count (every
-feature exists at the finest level); tippecanoe's `-r 2.5` is anchored on a
-per-tile basezoom count. Passing `-r 1.65` to tippecanoe would look like
-parity and would in fact be cargo-culting a numeral across two different
-denominators. Same for gamma (per-super-cell in tylertoo, per-tile in
-tippecanoe) and simplification (metres-of-GSD vs tile units). These show up as
+The drop rate is left at 2.5 in both tools; neither is passed a rate flag.
+The anchors still differ: tylertoo uses the full canonical count of budgeted
+kinds, while tippecanoe uses a per-tile basezoom count. The gated e2e run
+uses `--verbatim`, so tylertoo's density budget is off there anyway.
+Gamma and simplification deliberately remain at each tool's own default:
+gamma works per super-cell in tylertoo and per tile in tippecanoe, while
+simplification uses metres-of-GSD versus tile units. These show up as
 output-shape differences instead, and RESULTS.md reports them.
 
 ## Asymmetries that flags cannot close

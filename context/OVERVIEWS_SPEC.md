@@ -486,7 +486,7 @@ earlier versions.)
         "visibility_gate_m": 0,    "geometry_types": ["Polygon"] }
     ],
     "ranking": { "mode": "size-fallback" },
-    "density_drop": { "drop_rate": 1.65, "gamma": 1.5,
+    "density_drop": { "drop_rate": 2.5, "gamma": 1.5,
                       "supercell_gsd_factor": 128.0 }
   }
 }
