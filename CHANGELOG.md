@@ -147,13 +147,16 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A column with 8- or 16-bit dictionary keys is read in batches of no more
   rows than its key indexes, and one nested in a list in batches of no more
   list values, so a batch no longer fails with `DictionaryKeyOverflowError`
-  (#857). The key type is unchanged.
+  (#857). A parallel read (`--read-workers`) joins such a column at a worker
+  seam as one reader does, so one under a fixed-size list no longer panics
+  there. The key type is unchanged.
 - A crafted Parquet footer with an overlong varint, or a page header that
   skips past the end of the file, is refused instead of allocating gigabytes
   or spinning for minutes (#789). So is a footer whose child or row-group
   count the pre-check read differently from parquet: through a field
   written as another wire type than parquet reads it as, or a schema child
-  count that parquet's i32 read makes large.
+  count that parquet's i32 read makes large, or a schema nested more than
+  64 levels deep, which overflowed the stack.
 - A WKT projected CRS (`PROJCRS`, `PROJCS`, …) that embeds EPSG:4326 as its
   base is no longer read as WGS84 (#708).
 - `TYLERTOO_AUTO_MEM_LIMIT_BYTES` set or changed after the first conversion

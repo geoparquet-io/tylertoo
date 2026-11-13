@@ -1098,6 +1098,64 @@ pub fn concat_prefix_rows<'a>(
     rows.max(1)
 }
 
+/// Join `parts`, delivered batches of `schema`, into one batch as a reader
+/// joins its decodes (#857).
+///
+/// The rows must be no more than [`concat_prefix_rows`] cuts. arrow's concat
+/// appends whole dictionaries where it does not merge them (under a
+/// fixed-size list, or of values other than bytes and primitives) and panics
+/// past the key, so a column with a dictionary of 8- or 16-bit keys is joined
+/// in its decoded views and cast back: the cut holds its values, so its
+/// distinct values, within the key.
+///
+/// # Errors
+///
+/// An error from arrow's concat or cast, as a reader's join returns one.
+pub fn concat_delivered(
+    schema: &SchemaRef,
+    parts: &[RecordBatch],
+) -> Result<RecordBatch, ArrowError> {
+    let columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let target = field.data_type();
+            let decoded = |part: &RecordBatch| match narrow_key(target) {
+                true => arrow_cast::cast(part.column(i), &wide_type(target)),
+                false => Ok(part.column(i).clone()),
+            };
+            let decoded = parts.iter().map(decoded).collect::<Result<Vec<_>, _>>()?;
+            let decoded: Vec<_> = decoded.iter().map(AsRef::as_ref).collect();
+            let joined = arrow_select::concat::concat(&decoded)?;
+            match narrow_key(target) {
+                true => arrow_cast::cast(&joined, target),
+                false => Ok(joined),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let rows = parts.iter().map(RecordBatch::num_rows).sum();
+    RecordBatch::try_new_with_options(
+        schema.clone(),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+}
+
+/// Whether `data_type` holds a dictionary with 8- or 16-bit keys.
+fn narrow_key(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    match data_type {
+        DataType::Dictionary(key, value) => key_capacity(key).is_some() || narrow_key(value),
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => narrow_key(f.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| narrow_key(f.data_type())),
+        _ => false,
+    }
+}
+
 /// Bytes rows `start..end` of `array` take once decoded, summed row by row
 /// (#858): byte payloads in full (as a dictionary would expand them) plus 17
 /// per value, each fixed-width value's width plus 9 (a dictionary cast may
@@ -3723,8 +3781,7 @@ mod tests {
                 b.slice(0, n)
             })
             .collect();
-        #[expect(clippy::disallowed_methods, reason = "#857: the regrouper's join")]
-        let joined = arrow_select::concat::concat_batches(&schema, &parts).unwrap();
+        let joined = concat_delivered(&schema, &parts).unwrap();
         assert_eq!(joined.num_rows(), 64);
     }
 
