@@ -911,10 +911,19 @@ class TestPublicationMetadata:
         assert meta["description"] == ""
         assert meta["attribution"] == self.HTML
 
-        def timeless(r):
-            return {k: v for k, v in r.items() if k != "duration_secs"}
+        # Two runs differ in their time and, under a cgroup memory limit, in
+        # the memory headroom the `memory_budget` diagnostic reports.
+        def run_independent(r):
+            out = {k: v for k, v in r.items() if k != "duration_secs"}
+            out["diagnostics"] = [
+                {k: v for k, v in d.items() if k not in ("machine", "limit")}
+                if d["kind"] == "memory_budget"
+                else d
+                for d in r["diagnostics"]
+            ]
+            return out
 
-        assert timeless(report) == timeless(base)
+        assert run_independent(report) == run_independent(base)
         assert self._tiles(pm) == self._tiles(plain)
 
     @needs_buildings

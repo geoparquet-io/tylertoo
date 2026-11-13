@@ -16,6 +16,10 @@ import tylertoo
 
 REPO = Path(__file__).parent.parent.parent.parent
 ROADS_PMTILES = REPO / "tests" / "fixtures" / "golden" / "road-detections.pmtiles"
+FIELDMAPS_PMTILES = (
+    REPO / "tests" / "fixtures" / "golden" / "fieldmaps-boundaries.pmtiles"
+)
+REPEATS = 5
 
 
 def free_port() -> int:
@@ -23,6 +27,15 @@ def free_port() -> int:
         s.bind(("127.0.0.1", 0))
         port: int = s.getsockname()[1]
         return port
+
+
+def free_ports(n: int) -> list[str]:
+    """`n` distinct free ports, held open together so none repeats."""
+    with contextlib.ExitStack() as stack:
+        socks = [stack.enter_context(socket.socket()) for _ in range(n)]
+        for s in socks:
+            s.bind(("127.0.0.1", 0))
+        return [str(s.getsockname()[1]) for s in socks]
 
 
 def fetch(url: str, headers: dict[str, str] | None = None) -> bytes:
@@ -44,8 +57,7 @@ def serving(
 ) -> Iterator[subprocess.Popen[str]]:
     """`tylertoo.serve` in a child process, killed on exit.
 
-    Not a daemon thread: `serve` polls Python's signal handlers, and a
-    thread still in that loop when the interpreter shuts down crashes it.
+    A child, not a thread: only the main thread can be stopped (Ctrl-C).
     """
     code = f"import tylertoo; tylertoo.serve({archives!r}, **{kwargs!r})"
     proc = subprocess.Popen(
@@ -108,3 +120,70 @@ class TestServe:
             _, err = proc.communicate(timeout=10)
         assert proc.returncode != 0
         assert "KeyboardInterrupt" in err
+
+
+# Starts `tylertoo.serve` on a daemon thread per port, fetches from each,
+# and lets the main thread end with the servers running. A server polls
+# Python's signal handlers on each request and 200 ms after it, so fetches
+# spaced across 200 ms spread the polls over the whole exit. pyarrow's
+# library finalizers, which run after the interpreter's, make the exit as
+# long as a real session's.
+DAEMON_SERVERS = """
+import sys, threading, time, urllib.request
+import pyarrow, pyarrow.parquet, pyarrow.compute, tylertoo
+
+archive, ports = sys.argv[1], [int(p) for p in sys.argv[2:]]
+for port in ports:
+    threading.Thread(
+        target=tylertoo.serve, args=(archive,), kwargs={"port": port}, daemon=True
+    ).start()
+for port in ports:
+    for _ in range(100):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/index.json").read()
+            break
+        except OSError:
+            time.sleep(0.05)
+    else:
+        sys.exit(f"port {port} never answered")
+    time.sleep(0.2 / len(ports))
+"""
+
+
+# 60 copies of the archive overfill the socket buffers both ends.
+PIPELINED_DOWNLOADS = """
+import pathlib, socket
+s = socket.create_connection(("127.0.0.1", ports[0]))
+get = f"GET /{pathlib.Path(archive).stem}.pmtiles HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n"
+s.sendall(get.encode() * 60)
+print(s.makefile("rb").readline().decode().strip())
+"""
+
+
+def run_child(code: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", code, *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+class TestServeOnADaemonThread:
+    def test_interpreter_exit_with_servers_running_is_clean(self) -> None:
+        # Each exit raced the servers' poll of Python's signal handlers;
+        # one that lost crashed the interpreter (SIGSEGV), in about 3 of 4
+        # of these children. Repeated so that the race, if it were back,
+        # would all but surely show.
+        for _ in range(REPEATS):
+            proc = run_child(DAEMON_SERVERS, str(ROADS_PMTILES), *free_ports(64))
+            assert (proc.returncode, proc.stderr) == (0, "")
+
+    def test_exit_while_a_response_is_being_sent_is_clean(self) -> None:
+        # Pipelined whole-archive requests the child never reads: a
+        # response is blocked mid-send and more wait behind it.
+        code = DAEMON_SERVERS + PIPELINED_DOWNLOADS
+        proc = run_child(code, str(FIELDMAPS_PMTILES), str(free_port()))
+        assert (proc.returncode, proc.stderr) == (0, "")
+        assert proc.stdout.endswith("HTTP/1.1 200 OK\n")

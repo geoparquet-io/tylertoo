@@ -33,6 +33,9 @@ fn cli_snapshots() {
         // dhat-heap.json into the working directory (crates/cli, for the
         // unsandboxed cases).
         .env("TYLERTOO_DHAT", "off")
+        // Pin the memory figure: the host's (under a cgroup limit, a
+        // `memory budget from cgroup limit` line) is not the CLI's output.
+        .env("TYLERTOO_AUTO_MEM_LIMIT_BYTES", "8589934592")
         .case("tests/cmd/*.md");
 }
 
