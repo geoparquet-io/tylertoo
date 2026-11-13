@@ -82,6 +82,17 @@ def test_absolute_site_links_resolve(site: Path) -> None:
     assert not broken, "Broken links to the docs site:\n" + "\n".join(broken)
 
 
+def _script_path(site: Path, html: Path, src: str) -> Path:
+    """Where a page's ``<script src>`` points, as a resolved filesystem path."""
+    url = src.split("?", maxsplit=1)[0]
+    if not url.startswith("/"):
+        return (html.parent / url).resolve()
+    # Root-absolute: valid only under the site's /tylertoo/ path.
+    if src.startswith("/tylertoo/"):
+        return (site / src.removeprefix("/tylertoo/")).resolve()
+    return Path("/").resolve()
+
+
 def test_local_scripts_resolve(site: Path) -> None:
     """Every local ``<script src>`` resolves, from its page, to a built file.
 
@@ -93,17 +104,7 @@ def test_local_scripts_resolve(site: Path) -> None:
         for src in re.findall(r'<script[^>]*\bsrc="([^"]+)"', html.read_text()):
             if re.match(r"(?:[a-z]+:)?//", src):
                 continue
-            url = src.split("?")[0]
-            if url.startswith("/"):
-                # Root-absolute: valid only under the site's /tylertoo/ path.
-                path = (
-                    site / src.removeprefix("/tylertoo/")
-                    if src.startswith("/tylertoo/")
-                    else Path("/")
-                )
-            else:
-                path = html.parent / url
-            path = path.resolve()
+            path = _script_path(site, html, src)
             if not path.is_relative_to(site.resolve()) or not path.is_file():
                 broken.append(f"{html.relative_to(site)}: {src}")
     assert not broken, broken
