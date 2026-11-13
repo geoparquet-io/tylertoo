@@ -919,6 +919,13 @@ empty coarse tiles). Closing a divergence in this table moves a ratio and
 therefore its band, in the same PR, with the new measurement in the comment.
 `corpus/METRICS.md` §2 defines what is compared.
 
+Counts do not show where a tile differs from the data. `benchmarks/visual/gate.py`
+(#869) measures that: it tiles the same inputs with `--preset tippecanoe` and
+with tippecanoe, scores each archive against the source (missing and added
+polygon area, attribute match, line and point coverage, seams) and bands the
+difference of the worst tiles in `benchmarks/visual/visual_tolerances.toml`.
+It is run by hand, not in CI; `benchmarks/visual/README.md` has the method.
+
 | Area | Our approach | Tippecanoe | Notes |
 |------|--------------|------------|-------|
 | Generalization space | World-space, per **level**, stored in the file | Tile-space, per tile, at encode time | The core format difference: levels are reusable, exact, SQL-queryable |

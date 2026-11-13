@@ -312,6 +312,7 @@ dataset. That is the path for cluster-scale runs.
 | `render_parity.py` | side-by-side PNG renders of two archives at chosen zooms, with distinct-feature counts |
 | `compare_tippecanoe.py` | the parity gate (#420): tiles both tools, decodes both archives, per-zoom ratios vs `tippecanoe_tolerances.toml`; exit 1 on a breach |
 | `tippecanoe_tolerances.toml` | the gate's bands, one comment per band with the measured ratio and the divergence behind it |
+| `../visual/gate.py` | the visual gate (#869): both tools against the source, per tile; see `../visual/README.md` |
 | `../results/e2e-fixtures.json` | the recorded fixture run behind RESULTS.md (provenance, argv, every repeat) |
 | `../results/e2e-corpus.json` | the recorded corpus run (#447) behind RESULTS.md's corpus section |
 | `RESULTS.md` | measured numbers, machine, caveats |

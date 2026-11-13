@@ -107,6 +107,8 @@ magenta marks missing area, orange marks added area.
 
 **Tile coverage and drawn share**: these checks rasterize decoded tiles at
 256 px (`render_coverage.py`) or 128 px (`tile_metrics.py`) per tile.
+Both scripts read, decode and rasterize through `benchmarks/visual/metrics.py`,
+which the visual gate (`benchmarks/visual/README.md`) also measures with.
 Both resolutions are coarse for small parcels, so use these numbers to compare
 settings, not as absolute values.
 
