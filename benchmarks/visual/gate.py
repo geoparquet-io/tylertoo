@@ -403,7 +403,7 @@ def main() -> int:
         args.run_dir = Path(run_dir)
         try:
             return gate(args, tol, tip, datasets)
-        except ValueError as e:  # a tool failed, or a source cannot be used
+        except (ValueError, OSError) as e:  # a tool failed, or a source or --work cannot be used
             print(f"error: {e}", file=sys.stderr)
             return 2
 

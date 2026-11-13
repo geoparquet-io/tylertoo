@@ -107,6 +107,29 @@ def test_a_band_without_a_value_is_a_failure():
     assert "no value" in gate.line(row)
 
 
+def test_a_breach_png_is_written_once_per_run_over_an_old_one(archive, src, tmp_path, monkeypatch):
+    """max, p99 and p95 share a tile: one PNG, and never the previous run's."""
+    import argparse
+
+    old = tmp_path / "png" / f"d_z{Z}_missing_{Z}-1-1.png"
+    old.parent.mkdir()
+    old.write_bytes(b"the previous build")
+    calls = []
+    real = gate.write_png
+    monkeypatch.setattr(gate, "write_png", lambda *a: (calls.append(a[0]), real(*a)))
+    monkeypatch.setattr(gate.M, "read_source", lambda path, attr: src)
+    (tmp_path / "archive.pmtiles").write_bytes(archive.read_bytes())
+    monkeypatch.setattr(gate, "tippecanoe_dir", lambda *a: tmp_path)
+    monkeypatch.setattr(gate, "tylertoo_archive", lambda *a: archive)
+    monkeypatch.setattr(gate, "score", lambda *a: zoom(0.9))
+    monkeypatch.setattr(gate, "cached_score", lambda *a: zoom(0.0))
+    tol = {"gate": {"default_band": [-1.0, 0.02], "zoom_range": [Z, Z], "zooms": [Z]}, "datasets": {}}
+    args = argparse.Namespace(work=tmp_path, zooms=None, cap=10)
+    rows = gate.gate_dataset(args, tol, {}, "d", {"path": "unused", "layer": "l"})
+    assert len([r for r in rows if r.get("png")]) == 3 and calls == [old]
+    assert old.read_bytes().startswith(b"\x89PNG")
+
+
 def test_the_png_marks_what_differs(archive, src, tmp_path):
     import numpy as np
     from PIL import Image
