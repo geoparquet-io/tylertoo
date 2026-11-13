@@ -1699,6 +1699,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
             &self.metadata,
             self.projection.as_ref(),
             self.decode_threads,
+            rows,
         );
         let projection = self.projection;
         let open: OpenGroups = Box::new(move |groups, limit| {
@@ -1761,14 +1762,21 @@ type OpenGroups = Box<
         + Send,
 >;
 
+/// The footer bytes one decode of a reader's columns must cover for them to
+/// split: below it, spawning the split threads costs more than they save.
+/// Overture's segments and places decode about 2.3 MB per 8,192 rows.
+const SPLIT_MIN_DECODE_BYTES: u64 = 256 << 10;
+
 /// Contiguous runs of `projection`'s leaves (every leaf when `None`), whole
 /// roots each, balanced by footer bytes into at most `splits` masks.
 /// Concatenating the masks' decoded columns in order gives the columns of
-/// one reader over `projection`. Empty when `splits < 2`.
+/// one reader over `projection`. Empty when `splits < 2`, or when a decode
+/// of `decode_rows` rows is under [`SPLIT_MIN_DECODE_BYTES`].
 fn column_splits(
     metadata: &ReaderMetadata,
     projection: Option<&ProjectionMask>,
     splits: usize,
+    decode_rows: usize,
 ) -> Vec<ProjectionMask> {
     let descr = metadata.parquet_schema();
     let leaves: Vec<usize> = (0..descr.num_columns())
@@ -1801,6 +1809,10 @@ fn column_splits(
     }
     // Footer sizes are untrusted: every sum saturates.
     let total = roots.iter().fold(0u64, |sum, r| sum.saturating_add(r.1));
+    let rows = metadata.metadata().file_metadata().num_rows().max(1) as u64;
+    if (total / rows).saturating_mul(decode_rows as u64) < SPLIT_MIN_DECODE_BYTES {
+        return Vec::new();
+    }
     let target = total.div_ceil(splits as u64);
     let mut out: Vec<Vec<usize>> = vec![Vec::new()];
     let mut acc = 0u64;
@@ -2312,8 +2324,10 @@ mod tests {
             ("point", Arc::new(point) as ArrayRef),
             (
                 "note",
+                // Wide enough that a 128-row decode splits
+                // ([`SPLIT_MIN_DECODE_BYTES`]).
                 Arc::new(StringArray::from_iter_values(
-                    (0..n).map(|i| "n".repeat(i as usize % 9)),
+                    (0..n).map(|i| format!("{i}{}", "n".repeat(2_500 + i as usize % 9))),
                 )) as ArrayRef,
             ),
         ])
@@ -2346,7 +2360,7 @@ mod tests {
         for roots in [None, Some(vec![1, 2, 4])] {
             let one: Vec<RecordBatch> = read(1, roots.clone()).map(Result::unwrap).collect();
             let split = read(3, roots.clone());
-            assert_eq!(split.inner.current.len(), 3, "three column splits");
+            assert!(split.inner.current.len() > 1, "several column splits");
             assert_eq!(split.schema(), read(1, roots.clone()).schema());
             let split: Vec<RecordBatch> = split.map(Result::unwrap).collect();
             assert_eq!(split, one);
@@ -2400,6 +2414,19 @@ mod tests {
         good.truncate(good.len() - 8 - footer as usize);
         ParquetMetaDataWriter::new(&mut good, &md).finish().unwrap();
         Bytes::from(good)
+    }
+
+    /// roborev on f44f9372: a decode too small to pay for its split threads
+    /// is not split. A list-heavy row group decodes one row at a time
+    /// ([`batch_plan`]), and splitting each row would spawn threads per row.
+    #[test]
+    fn a_decode_too_small_to_amortize_its_threads_is_not_split() {
+        // 300 footer bytes a row over three columns.
+        let md = open_parquet(declaring_uncompressed(1_000))
+            .unwrap()
+            .metadata;
+        assert_eq!(column_splits(&md, None, 4, 8192).len(), 3);
+        assert!(column_splits(&md, None, 4, 1).is_empty());
     }
 
     /// roborev on f44f9372: a footer declaring column chunks near
