@@ -865,10 +865,11 @@ ended (64-core Neoverse-V1 host, figures from the PR or commit named):
 - **Export levels: partly fixed; the rest is open in #876.** #818 pipelined
   level groups, capped members in flight instead of the group, and read
   bands in parallel: levels cores on Oregon roads 26.2 → 32.8, Moldova
-  30.3 → 39.0. #881 let the last level join the open level group and lets a
-  multi-wave level fill its store while coarser levels encode. Whole-run
-  wall: FTW Brazil (MT) 25.8 → 23.7 s, lines 3.28 → 2.93 s, Moldova
-  3.23 → 3.01 s, tiles byte-identical. Two pieces remain, both measured in #876: a few giant
+  30.3 → 39.0. Under `auto` and `speed` (not `bounded`), #881 let the last
+  level join the open level group and lets a multi-wave level fill its store
+  while coarser levels encode. Whole-run wall: FTW Brazil (MT)
+  25.8 → 23.7 s, lines 3.28 → 2.93 s, Moldova 3.23 → 3.01 s, tiles
+  byte-identical. Two pieces remain, both measured in #876: a few giant
   tiles hold the in-flight cap, so levels has work for only 2–16 cores for
   most of its window; and the fixed default cap of 40 workers, past which
   more workers added memory but no speed. Until #876 lands, both stay as
@@ -889,7 +890,9 @@ ended (64-core Neoverse-V1 host, figures from the PR or commit named):
   parallel (Moldova 0.21 s at 2.6 cores → 0.03 s at 16.9). `pre-pass2`
   (≤0.2% of wall) and `writer.finish` (≤0.9%) stay serial, as do the
   group-commit lock wait (≤1.5%) and process-exit teardown (under 2% each):
-  each sits below #818's 2% bar. Bounded pass 2's spill drain is #791.
+  each sits below #818's 2% bar. Bounded pass 2's spill drain is wider
+  (#818, 18c0e05f) and decodes up to 4 spilled batches at once (#878,
+  9928955e); the rest of the drain is #791.
 
 Measured on 2026-11-12 on the same host at origin/main a0916f04.
 These limits stay as they are:
