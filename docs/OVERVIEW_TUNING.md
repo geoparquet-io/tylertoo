@@ -1550,9 +1550,13 @@ tippecanoe's default `-S 1`. In Python, an
 explicit `None` selects the command's default, including these exceptions,
 as `"auto"` does for the size caps.
 
-Each feature is simplified once before clipping, in GSD units. The overview
-file and coarser levels stay unchanged, except that variable-depth stop
-tiles carry the finest level's features and get the same simplification.
+Each feature is simplified once before clipping, in GSD units. This only
+removes vertices: features, parts, and rings (including holes) that would
+collapse or be dropped under the tolerance keep their original geometry.
+If simplification still produces an invalid polygon after retries at smaller
+tolerances, the original polygon is kept. The overview file and coarser
+levels stay unchanged, except that variable-depth stop tiles carry the
+finest level's features and get the same simplification.
 
 On Portland and Guatemala roads, factor 0.25 reduced archive bytes by 6.7%
 and 2.6%, and z14 vertices by 31% and 14%. Worst displacement at z14 was
