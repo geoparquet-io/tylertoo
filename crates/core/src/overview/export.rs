@@ -2400,7 +2400,7 @@ struct Pass2Knobs {
     #[cfg(test)]
     panic_write_level: Option<usize>,
     /// Hold each level's last wave in a level group, before it encodes,
-    /// until the next level's own store has filled or 2 s pass, to
+    /// until the next level's own store starts to fill or 2 s pass, to
     /// test that the fill does not wait for the encode
     /// ([`ExportWorkTally::fills_beside_encode`]).
     #[cfg(test)]
@@ -3957,8 +3957,9 @@ fn export_level_group(
 }
 
 /// [`Pass2Knobs::hold_for_fill`]: wait up to 2 s for level `next`'s store
-/// to fill, and count it in [`ExportWorkTally::fills_beside_encode`] if it
-/// does.
+/// to start filling, and count it in
+/// [`ExportWorkTally::fills_beside_encode`] if it does. The start, not the
+/// end: the fill's Rayon work may need the worker this hold occupies.
 #[cfg(test)]
 fn hold_for_fill(work: &Mutex<ExportWorkTally>, next: usize) {
     let lock = || work.lock().unwrap_or_else(PoisonError::into_inner);
@@ -3968,7 +3969,7 @@ fn hold_for_fill(work: &Mutex<ExportWorkTally>, next: usize) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         let mut work = lock();
-        if work.filled_levels.contains(&next) {
+        if work.fills_started.contains(&next) {
             work.fills_beside_encode += 1;
             return;
         }
@@ -4743,10 +4744,10 @@ struct ExportWorkTally {
     group_waves: u64,
     /// [`Pass2Knobs::hold_for_fill`].
     hold_for_fill: bool,
-    /// Level indices whose one-level store has filled.
-    filled_levels: std::collections::BTreeSet<usize>,
-    /// Held last waves that saw the next level's store fill before they
-    /// encoded.
+    /// Level indices whose one-level store has started to fill.
+    fills_started: std::collections::BTreeSet<usize>,
+    /// Held last waves that saw the next level's store start to fill before
+    /// they encoded.
     fills_beside_encode: u64,
 }
 
@@ -6783,6 +6784,14 @@ fn fill_level_store(
     backing: StoreBacking,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<MemberStore, ExportError> {
+    // Marked before any Rayon work: a held encode that waits for it must
+    // not hold the only worker the fill needs.
+    #[cfg(test)]
+    ctx.work
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .fills_started
+        .insert(ctx.level_idx);
     let t_collect = Instant::now();
     let mut store = MemberStore::new(
         std::slice::from_ref(plan),
@@ -6806,7 +6815,6 @@ fn fill_level_store(
     {
         let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
         *work.level_spill_bytes.entry(ctx.level_idx).or_default() += store.spilled_bytes();
-        work.filled_levels.insert(ctx.level_idx);
     }
     log::debug!(
         "[profile]     z{} level read ({} partitions, {} waves): rows_read={rows_read} \
