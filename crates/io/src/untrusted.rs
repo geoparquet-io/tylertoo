@@ -658,8 +658,8 @@ fn logical_type(id: i16) -> Option<Known> {
 /// libFuzzer's). This walks the footer once, allocating nothing, and checks
 /// every list, set and map size against the bytes that remain, every schema
 /// element's child count against the elements that follow, and the nesting
-/// depth of the thrift and of the schema tree. Bytes it cannot make sense of are left to parquet-rs, which
-/// reports its own error.
+/// depth of the thrift and of the schema tree. Bytes it cannot make sense of
+/// are left to parquet-rs, which reports its own error.
 ///
 /// The counts are the ones parquet-rs will read (#789). parquet-rs reads a
 /// field it knows by its id and its own type, whatever wire type the field
@@ -3770,19 +3770,19 @@ mod tests {
         );
         // The parallel read regroups delivered batches (core's `Regrouper`)
         // by the same cut: 64 two-value rows, which join within the key.
-        let cut = concat_prefix_rows(&batches, &schema, 400, byte_array_limit());
+        // A seam mid-batch joins two delivered batches' dictionaries.
+        assert_eq!(batches[0].num_rows(), 64);
+        let parts = [batches[0].slice(32, 32), batches[1].clone()];
+        let cut = concat_prefix_rows(&parts, &schema, 400, byte_array_limit());
         assert_eq!(cut, 64);
-        let mut need = cut;
-        let parts: Vec<RecordBatch> = batches
-            .iter()
-            .map(|b| {
-                let n = b.num_rows().min(need);
-                need -= n;
-                b.slice(0, n)
-            })
-            .collect();
+        let parts = [parts[0].clone(), parts[1].slice(0, 32)];
         let joined = concat_delivered(&schema, &parts).unwrap();
-        assert_eq!(joined.num_rows(), 64);
+        assert_eq!(joined.schema(), schema);
+        let list = joined.column(0).as_list::<i32>();
+        let tags = arrow_cast::cast(list.values(), &arrow_schema::DataType::Utf8).unwrap();
+        let tags: Vec<&str> = tags.as_string::<i32>().iter().map(Option::unwrap).collect();
+        let want: Vec<String> = (64..192).map(|v| format!("v{v}")).collect();
+        assert_eq!(tags, want);
     }
 
     #[test]
