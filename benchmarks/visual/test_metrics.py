@@ -70,6 +70,12 @@ def test_attribute_values_compare_across_types():
     assert same["attr_mismatch"] == 0.0 and swapped["attr_mismatch"] == 1.0
 
 
+def test_null_attribute_matches_an_absent_property():
+    src = source([LEFT, RIGHT], [None, 8])
+    e = m.polygon_errors(tile([LEFT, RIGHT], [{}, {"a": 8}]), src, "a", Z, X, Y)
+    assert e["attr_mismatch"] == 0.0
+
+
 def test_sliver_tile_is_not_gated():
     assert m.polygon_errors(tile([]), source([box(0, 0, 40, 40)]), None, Z, X, Y) is None
 
@@ -93,6 +99,14 @@ def test_point_errors_ignore_buffer_copies():
     outside = [Point(-20, 100), Point(E, 100), Point(100, E + 5)]
     assert m.point_errors(tile(pts + outside), src, None, Z, X, Y) == {"count_error": 0.0}
     assert m.point_errors(tile([MultiPoint(pts)]), src, None, Z, X, Y) == {"count_error": 0.0}
+
+
+def test_point_rounding_is_not_an_error():
+    pts = [Point(255.6 + 256 * i, 100.4) for i in range(10)]  # just left of a cell edge
+    src = source(pts)
+    for snap in (round, int):
+        drawn = [Point(snap(p.x), snap(p.y)) for p in pts]
+        assert m.point_errors(tile(drawn), src, None, Z, X, Y) == {"count_error": 0.0}
 
 
 def test_cluster_sum_counts_each_point_once():

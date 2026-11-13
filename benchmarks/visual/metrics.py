@@ -106,10 +106,10 @@ class Source:
         self.values = values
         self.tree = STRtree(self.geoms)
         types = {g.geom_type for g in self.geoms}
+        # shortcut: one geometry kind per source, split a mixed source by type first
         self.kind = next((k for k, t in KINDS.items() if types & set(t)), None)
-
-    def colours(self):
-        return None if self.values is None else [colour_of(str(v)) for v in self.values]
+        self.colours = None if values is None else [colour_of(str(v)) for v in values]
+        self.rasters: dict = {}
 
 
 def read_source(path: Path, attr: str | None = None, types: tuple | None = None) -> Source:
@@ -125,12 +125,12 @@ def read_source(path: Path, attr: str | None = None, types: tuple | None = None)
     geo = json.loads(meta.get(b"geo", b"{}") or b"{}")
     col = geo.get("primary_column", "geometry")
     crs = geo.get("columns", {}).get(col, {}).get("crs")
-    code = (crs or {}).get("id", {}).get("code") if isinstance(crs, dict) else None
-    # shortcut: lon/lat sources only, add a reprojection when a fixture needs one
-    if code not in (None, 4326, "CRS84"):
-        raise SystemExit(f"{path}: source CRS {code} is not lon/lat")
+    code = crs.get("id", {}).get("code") if isinstance(crs, dict) else crs
+    # shortcut: lon/lat sources only (no crs means OGC:CRS84), add a reprojection when a fixture needs one
+    if crs is not None and code not in (4326, "CRS84"):
+        raise SystemExit(f"{path}: source CRS {code!r} is not known to be lon/lat")
     table = pq.read_table(path, columns=[col] + ([attr] if attr else []))
-    geoms = shapely.from_wkb(table.column(col).combine_chunks().to_numpy(zero_copy_only=False))
+    geoms = shapely.from_wkb(table.column(col).to_numpy(zero_copy_only=False))
     values = table.column(attr).to_pylist() if attr else None
     keep = ~shapely.is_missing(geoms)
     if types:
@@ -178,12 +178,13 @@ def features(decoded: dict, types: tuple):
 
 def tile_shapes(decoded: dict, color_attr: str | None, norm=None):
     """The tile's polygons, each with the colour of its attribute (or its id).
-    `norm` maps the value first, to compare it with a source value."""
+    `norm` maps the value first, to compare it with a source value: an absent
+    property then stands for the source's null, not for the feature id."""
     out = []
     extent = EXTENT_DEFAULT
     for geom, f, extent in features(decoded, POLYGON):
         key = f["properties"].get(color_attr) if color_attr else None
-        if key is None:
+        if key is None and not norm:
             key = f.get("id")
         out.append((geom, colour_of(norm(key) if norm else key)))
     return out, extent
@@ -293,7 +294,9 @@ def polygon_rasters(decoded: dict, src: Source, attr: str | None, z: int, x: int
     """(drawn colour raster, source raster) of one tile at PX; the source
     raster holds colours when the source has attribute values."""
     shapes, extent = tile_shapes(decoded, attr, norm=str)
-    return rasterize_tile(shapes, extent, PX), rasterize_source(src.tree, src.geoms, z, x, y, PX, src.colours())
+    if (z, x, y) not in src.rasters:  # the same for every archive scored against this source
+        src.rasters[(z, x, y)] = rasterize_source(src.tree, src.geoms, z, x, y, PX, src.colours)
+    return rasterize_tile(shapes, extent, PX), src.rasters[(z, x, y)]
 
 
 def polygon_errors(decoded: dict, src: Source, attr: str | None, z: int, x: int, y: int,
@@ -353,11 +356,14 @@ def point_errors(decoded: dict, src: Source, attr: str | None, z: int, x: int, y
         drawn_parts.append(geom)
     cell = box(*tile_bounds_3857(z, x, y))
     near = [_in_tile_units(src.geoms[i], z, x, y, extent) for i in src.tree.query(cell)]
-    ref = _cells(shapely.get_coordinates(near).reshape(-1, 2), extent)
-    if ref.sum() < MIN_POINTS:
+    xy = shapely.get_coordinates(near).reshape(-1, 2)
+    if _cells(xy, extent).sum() < MIN_POINTS:
         return None
     drawn = _cells(shapely.get_coordinates(drawn_parts).reshape(-1, 2), extent)
-    return {"count_error": float(np.abs(drawn - ref).sum() / ref.sum())}
+    # A tile holds integer coordinates: a tool that rounds and one that floors
+    # put a point next to a cell edge in different cells. Neither is an error.
+    return {"count_error": min(float(np.abs(drawn - ref).sum() / ref.sum())
+                               for ref in (_cells(np.floor(xy), extent), _cells(np.rint(xy), extent)))}
 
 
 def cluster_sum(decoded_tiles) -> int:
