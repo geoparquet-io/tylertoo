@@ -3832,6 +3832,15 @@ fn export_level_group(
                     let t_fill = Instant::now();
                     if let Some(read) = level.level_read {
                         let (backing, g) = level_read_backing(read, level.plan, budget, floor);
+                        #[cfg(test)]
+                        if let Some(wave) = g.first() {
+                            level
+                                .work
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .fill_grants
+                                .push((in_flight.held(), wave.units));
+                        }
                         grants = g;
                         let ctx = level.level_ctx(&timers);
                         level_store = Some(
@@ -3845,8 +3854,15 @@ fn export_level_group(
                 // levels before it still encode: the gate keeps their members
                 // and this level's waves within its cap together, so the
                 // store's wave grant is the cap, not this level's widest wave.
+                // A wave the gate let past the cap because nothing else was
+                // held can still be in flight: the grant then covers it, and
+                // no wave of this level is admitted until it is released.
                 let fill_start = Instant::now();
-                let fill_secs = if early { fill(gate.cap)? } else { 0.0 };
+                let fill_secs = if early {
+                    fill(gate.cap.max(in_flight.held()))?
+                } else {
+                    0.0
+                };
                 if multi_wave {
                     in_flight.wait_until(|| {
                         let c = lock_commit(&commit, &timers);
@@ -3987,7 +4003,8 @@ struct GroupGate {
     single_wave_cap: usize,
     waves: bool,
     /// Fill a multi-wave level's one-level store before waiting for the
-    /// levels before it (`auto`, `speed`), its wave grant sized at `cap`.
+    /// levels before it (`auto`, `speed`), its wave grant sized at `cap`, or
+    /// at the members still in flight when an oversized wave holds more.
     early_fill: bool,
 }
 
@@ -4075,6 +4092,11 @@ impl InFlight {
     /// calls [`Self::notify`]. `ready` runs under this gate's lock.
     fn wait_until(&self, mut ready: impl FnMut() -> bool) {
         drop(self.wait_for(|_| ready()));
+    }
+
+    /// The members admitted and not yet released.
+    fn held(&self) -> usize {
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn notify(&self) {
@@ -4749,6 +4771,9 @@ struct ExportWorkTally {
     /// Held last waves that saw the next level's store start to fill before
     /// they encoded.
     fills_beside_encode: u64,
+    /// Per one-level store fill: the members in flight and the units of the
+    /// wave grant sized for them.
+    fill_grants: Vec<(usize, usize)>,
 }
 
 struct LevelCtx<'a> {
@@ -12736,6 +12761,60 @@ mod tests {
             assert_eq!(run.level_groups, vec![0..3], "{profile:?}");
             assert_eq!(run.work.fills_beside_encode, beside, "{profile:?}");
             assert_eq!(bytes, serial_bytes, "{profile:?}");
+        }
+    }
+
+    /// An early fill's wave grant covers every member still in flight, even
+    /// a preceding wave the gate let past its cap because nothing else was
+    /// held.
+    #[test]
+    fn early_fill_grant_covers_an_oversized_preceding_wave() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        // Three 10-point clusters, one z2 tile each: waves of 20 and 10
+        // members against a cap of 2. Then 5 edge points: waves of 2.
+        let cluster: Vec<Geometry<f64>> = [-134.7, -44.7, 45.3]
+            .iter()
+            .flat_map(|&x| std::iter::repeat_n(Geometry::Point(Point::new(x, 30.3)), 10))
+            .collect();
+        let edge: Vec<Geometry<f64>> = (0..5)
+            .map(|k| Geometry::Point(Point::new(-150.3 + f64::from(k) * 70.0, -40.3)))
+            .collect();
+        write_mode_fixture(
+            input.path(),
+            &[((0..30).collect(), cluster), ((100..105).collect(), edge)],
+            Mode::Duplicating,
+            64,
+        );
+        for profile in [
+            MemoryProfile::Auto,
+            MemoryProfile::Speed,
+            MemoryProfile::Bounded,
+        ] {
+            let opts = ExportOptions {
+                layer_name: "waves".to_string(),
+                partition_wave: 2,
+                profile,
+                ..Default::default()
+            };
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &Pass2Knobs {
+                    hold_for_fill: true,
+                    ..knobs(false, None, true)
+                },
+            )
+            .unwrap();
+            assert_eq!(run.level_groups, vec![0..2], "{profile:?}");
+            let fills = &run.work.fill_grants;
+            assert_eq!(fills.len(), 2, "{profile:?}: {fills:?}");
+            assert!(
+                fills.iter().all(|&(held, units)| units >= held),
+                "{profile:?}: {fills:?}"
+            );
         }
     }
 

@@ -649,7 +649,10 @@ encoding. Under `auto` and `speed` the store now fills as soon as the
 collect reaches the level, while the coarser levels still encode
 (`GroupGate::early_fill`). The gate keeps the members still encoding and the
 new level's waves within its cap together, so the store's wave grant is the
-cap rather than the level's widest wave. Against 3b6796c9 (5 interleaved
+cap rather than the level's widest wave. The gate admits a wave past its cap
+when nothing else is held, so the grant is the members still in flight when
+those are more than the cap: no wave of the new level is admitted until they
+are released. Against 3b6796c9 (5 interleaved
 rounds, medians), brmt's levels wall fell from 15.2 to 13.8 s and its
 export wall from 17.9 to 15.1 s, for 74 MiB (1%) more peak RSS. Wideprops
 fell 9%, lines 3%, and moldova and moldova-f0 were within noise. `bounded`
