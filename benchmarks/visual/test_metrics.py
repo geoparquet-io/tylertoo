@@ -161,6 +161,19 @@ def test_read_source_without_geo_metadata(tmp_path):
     assert src.geoms[0].bounds[2] == pytest.approx(111319.49, abs=0.01)
 
 
+def test_a_source_reaching_the_pole_still_covers_its_tiles(tmp_path):
+    """Latitude 90 is infinite in Web Mercator. The tools clamp it to the map's
+    edge; unclamped, the source raster comes out empty and the tile is never scored."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import shapely
+
+    pq.write_table(pa.table({"geometry": [shapely.to_wkb(box(-180, -90, 180, -60))]}), tmp_path / "s.parquet")
+    src = m.read_source(tmp_path / "s.parquet")
+    assert np.isfinite(shapely.total_bounds(src.geoms)).all()
+    assert m.rasterize_source(src.tree, src.geoms, 2, 1, 3, m.PX).all()  # z2 row 3: lat -66.5 to -85.05
+
+
 @pytest.mark.parametrize("crs,loads", [
     ({"id": {"authority": "OGC", "code": "CRS84"}}, True),
     ({"id": {"authority": "EPSG", "code": 4326}}, True),

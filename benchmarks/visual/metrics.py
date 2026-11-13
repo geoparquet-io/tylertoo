@@ -150,7 +150,9 @@ def read_source(path: Path, attr: str | None = None, types: tuple | None = None)
 
     def mercator(c):
         x = c[:, 0] * (WORLD / 360)
-        y = np.log(np.tan(np.pi / 4 + np.radians(c[:, 1]) / 2)) * (WORLD / (2 * np.pi))
+        # The map's edge, as both tools clamp: at ±90 y is infinite and the source rasters empty.
+        lat = np.clip(c[:, 1], -85.0511287798066, 85.0511287798066)
+        y = np.log(np.tan(np.pi / 4 + np.radians(lat) / 2)) * (WORLD / (2 * np.pi))
         return np.column_stack([x, y])
 
     geoms = shapely.transform(geoms[keep], mercator)
