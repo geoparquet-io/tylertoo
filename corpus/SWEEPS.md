@@ -573,7 +573,9 @@ sub-pixel at z14, but pinholes under overzoom. That tradeoff keeps polygons
 off by default; shared-border-aware simplification is issue #802.
 
 An explicit factor still applies to lines and polygons alike. Set it to `0`
-to disable max-zoom simplification and restore the previous default output.
+to disable max-zoom simplification. To restore the previous default output,
+use `--tile-buffer 8 --max-zoom-simplify-factor 0`, since the buffer default
+also changed from 8 to 5 tile pixels.
 Verbatim tiles and pyramid bands default to `0`; an explicit factor still
 applies on top. The tippecanoe preset sets 0.25 for both kinds, because
 `-S 1` simplifies both at max zoom unless `-pS` /

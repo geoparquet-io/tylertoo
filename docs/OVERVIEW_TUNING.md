@@ -1541,10 +1541,12 @@ base. Polygons are not simplified at that zoom: simplifying each polygon
 on its own separates shared borders (#802).
 
 An explicit factor applies to lines and polygons alike. Use `0` to turn
-max-zoom simplification off for everything and restore the previous default
-output. `tiles --verbatim` and `pyramid` bands default to `0`; an explicit
-factor still applies on top. The tippecanoe preset sets `0.25` for both
-lines and polygons, matching tippecanoe's default `-S 1`. In Python, an
+max-zoom simplification off for everything. To restore the previous default
+output, use `--tile-buffer 8 --max-zoom-simplify-factor 0`, since the buffer
+default also changed from 8 to 5 tile pixels. `tiles --verbatim` and `pyramid`
+bands default to `0`; an explicit factor still applies on top. The
+tippecanoe preset sets `0.25` for both lines and polygons, matching
+tippecanoe's default `-S 1`. In Python, an
 explicit `None` selects the command's default, including these exceptions,
 as `"auto"` does for the size caps.
 

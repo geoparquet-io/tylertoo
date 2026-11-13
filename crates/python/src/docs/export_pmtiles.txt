@@ -59,8 +59,10 @@ Args:
         (canonical) level once, before clipping, with tolerance factor ×
         GSD at that level's zoom, like `simplify_factor` for coarser
         levels. With the default GSD base, 1 GSD is 4 tile units at
-        extent 4096. Features smaller than the tolerance keep their own
-        geometry. Defaults to `None`: lines use factor 0.25 and polygons
+        extent 4096. Features and individual MultiLineString or
+        MultiPolygon parts smaller than the tolerance keep their own
+        geometry, even when sibling parts survive simplification.
+        Defaults to `None`: lines use factor 0.25 and polygons
         are not simplified. An explicit factor applies to both; `0`
         disables it. Explicit `None` selects the command's default,
         like `"auto"` for size caps: no max-zoom simplification under
