@@ -862,16 +862,18 @@ never changes output bytes.
 #813 found 64-core runs keeping 19–29 cores busy. Where each of its items
 ended (64-core Neoverse-V1 host, figures from the PR or commit named):
 
-- **Export levels: partly fixed; the rest is #876.** #818 pipelined level
-  groups, capped members in flight instead of the group, and read bands in
-  parallel: levels cores on Oregon roads 26.2 → 32.8, Moldova 30.3 → 39.0.
+- **Export levels: partly fixed; the rest is open in #876.** #818 pipelined
+  level groups, capped members in flight instead of the group, and read
+  bands in parallel: levels cores on Oregon roads 26.2 → 32.8, Moldova
+  30.3 → 39.0.
   #881 let the last level join the open level group and fills a multi-wave
   level's store while coarser levels encode. Whole-run wall: FTW Brazil (MT)
   25.8 → 23.7 s, lines 3.28 → 2.93 s, Moldova 3.23 → 3.01 s, tiles
   byte-identical. Two pieces remain, both measured in #876: a few giant
   tiles hold the in-flight cap, so levels has work for only 2–16 cores for
   most of its window; and the fixed default cap of 40 workers, past which
-  more workers added memory but no speed.
+  more workers added memory but no speed. Until #876 lands, both stay as
+  the limits below.
 - **Export finalize: fixed by #878.** The stall was one `fdatasync` of the
   whole archive after export's compute (#813 saw 3.2 s on Oregon roads; #818
   measured 0.22–0.25 s there and blamed a slow volume). A writer thread now
