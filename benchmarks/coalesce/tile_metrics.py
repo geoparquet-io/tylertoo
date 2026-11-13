@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "pmtiles>=3.4", "mapbox-vector-tile>=2.1", "shapely>=2.0", "rasterio>=1.4",
-#   "geopandas>=1.0", "pyarrow>=17", "numpy>=1.26", "pillow>=10",
+#   "pyarrow>=17", "numpy>=1.26", "pillow>=10",
 # ]
 # [tool.uv]
 # exclude-newer = "2026-10-22T00:00:00Z"
@@ -48,99 +48,17 @@ from __future__ import annotations
 
 import argparse
 import gzip
-import hashlib
 import json
-import math
 import random
 import sys
 from pathlib import Path
 
 import numpy as np
 
-WORLD = 20037508.342789244 * 2
-EXTENT_DEFAULT = 4096
-
-
-def tile_bounds_3857(z: int, x: int, y: int) -> tuple[float, float, float, float]:
-    w = WORLD / (1 << z)
-    x0 = -WORLD / 2 + x * w
-    ytop = WORLD / 2 - y * w
-    return x0, ytop - w, x0 + w, ytop
-
-
-def colour_of(value) -> int:
-    h = hashlib.blake2b(repr(value).encode(), digest_size=4).digest()
-    return (int.from_bytes(h, "little") & 0x7FFFFFFF) or 1
-
-
-def read_archive(path: Path):
-    from pmtiles.reader import MmapSource, Reader, all_tiles
-
-    f = open(path, "rb")
-    src = MmapSource(f)
-    reader = Reader(src)
-    header = reader.header()
-    gz = header.get("tile_compression") in (2, "gzip") or str(header.get("tile_compression")).endswith("GZIP")
-    tiles = {}
-    for (z, x, y), data in all_tiles(src):
-        tiles[(z, x, y)] = data
-    return tiles, gz
-
-
-def decode(data: bytes, gz: bool):
-    import mapbox_vector_tile
-
-    raw = gzip.decompress(data) if gz else data
-    return raw, mapbox_vector_tile.decode(raw, default_options={"y_coord_down": True})
-
-
-def tile_shapes(decoded: dict, color_attr: str | None):
-    from shapely.geometry import shape
-
-    out = []
-    extent = EXTENT_DEFAULT
-    for layer in decoded.values():
-        extent = layer.get("extent", extent)
-        for f in layer["features"]:
-            g = f["geometry"]
-            if g["type"] not in ("Polygon", "MultiPolygon"):
-                continue
-            key = f["properties"].get(color_attr) if color_attr else None
-            if key is None:
-                key = f.get("id")
-            out.append((shape(g), colour_of(key)))
-    return out, extent
-
-
-def rasterize_tile(shapes, extent: int, px: int) -> np.ndarray:
-    from affine import Affine
-    from rasterio.features import rasterize
-
-    if not shapes:
-        return np.zeros((px, px), dtype=np.int32)
-    # Tile coordinates, y down: pixel (col, row) -> (col * s, row * s).
-    s = extent / px
-    return rasterize(shapes, out_shape=(px, px), transform=Affine(s, 0, 0, 0, s, 0),
-                     fill=0, dtype="int32")
-
-
-def rasterize_source(tree, geoms, z: int, x: int, y: int, px: int) -> np.ndarray:
-    from affine import Affine
-    from rasterio.features import rasterize
-    from shapely.geometry import box
-
-    b = tile_bounds_3857(z, x, y)
-    idx = tree.query(box(*b))
-    if len(idx) == 0:
-        return np.zeros((px, px), dtype=bool)
-    w = (b[2] - b[0]) / px
-    arr = rasterize(((geoms[i], 1) for i in idx), out_shape=(px, px),
-                    transform=Affine(w, 0, b[0], 0, -w, b[3]), fill=0, dtype="uint8")
-    return arr.astype(bool)
-
-
-def pct(vals, q):
-    return float(np.percentile(vals, q)) if len(vals) else None
+# benchmarks/visual/metrics.py owns the reading, decoding and rasterizing (#869).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "visual"))
+from metrics import (POLYGON, decode, pct, rasterize_source, rasterize_tile, read_archive,
+                     read_source, seams, tile_shapes)  # noqa: E402
 
 
 def main() -> int:
@@ -158,16 +76,8 @@ def main() -> int:
     ap.add_argument("--json", type=Path)
     args = ap.parse_args()
 
-    import geopandas as gpd
-    from shapely import STRtree
-
-    src = gpd.read_parquet(args.source)
-    if src.crs is None:
-        src = src.set_crs(4326)
-    src = src.to_crs(3857)
-    src = src[src.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
-    geoms = np.array(src.geometry.values)
-    tree = STRtree(geoms)
+    src = read_source(args.source, types=POLYGON)
+    geoms, tree = src.geoms, src.tree
 
     tiles, gz = read_archive(args.pmtiles)
     sizes = {"tiles": len(tiles), "max_raw": 0, "max_gz": 0, "over_raw": 0, "over_gz": 0}
@@ -219,41 +129,8 @@ def main() -> int:
                 if k in named:
                     report["named"]["/".join(map(str, k))] = share
 
-        edge_gap_num = edge_gap_den = 0
-        diff_edge = both_edge = diff_ctl = both_ctl = 0
-        worst = []
-        mid = args.px // 2
-        for (zz, x, y) in seeds:
-            a = (zz, x, y)
-            for b, axis in (((zz, x + 1, y), 1), ((zz, x, y + 1), 0)):
-                if b not in colour:
-                    continue
-                ca, cb = colour[a], colour[b]
-                ra, rb = ref[a], ref[b]
-                if axis == 1:  # a | b, vertical seam
-                    ea, eb = ca[:, -1], cb[:, 0]
-                    band_c = np.concatenate([ca[:, -2:], cb[:, :2]], axis=1)
-                    band_r = np.concatenate([ra[:, -2:], rb[:, :2]], axis=1)
-                    ctl_a, ctl_b = ca[:, mid - 1], ca[:, mid]
-                else:  # a over b, horizontal seam
-                    ea, eb = ca[-1, :], cb[0, :]
-                    band_c = np.concatenate([ca[-2:, :], cb[:2, :]], axis=0)
-                    band_r = np.concatenate([ra[-2:, :], rb[:2, :]], axis=0)
-                    ctl_a, ctl_b = ca[mid - 1, :], ca[mid, :]
-                edge_gap_num += int((band_r & (band_c == 0)).sum())
-                edge_gap_den += int(band_r.sum())
-                both = (ea > 0) & (eb > 0)
-                d = int((both & (ea != eb)).sum())
-                diff_edge += d
-                both_edge += int(both.sum())
-                bc = (ctl_a > 0) & (ctl_b > 0)
-                diff_ctl += int((bc & (ctl_a != ctl_b)).sum())
-                both_ctl += int(bc.sum())
-                if both.sum():
-                    worst.append((d / both.sum(), a, b))
-
-        cc = diff_edge / both_edge if both_edge else None
-        ctl = diff_ctl / both_ctl if both_ctl else None
+        seam = seams(seeds, colour, ref, args.px)
+        worst = seam.pop("worst")
         report["zooms"][str(z)] = {
             "tiles_total": len(at_z),
             "tiles_evaluated": len(evaluate),
@@ -262,10 +139,7 @@ def main() -> int:
                 "p1": pct(shares, 1), "p5": pct(shares, 5), "median": pct(shares, 50),
                 "mean": float(np.mean(shares)) if shares else None,
             },
-            "edge_gap": edge_gap_num / edge_gap_den if edge_gap_den else None,
-            "colour_change": cc,
-            "control_change": ctl,
-            "excess_change": cc - ctl if cc is not None and ctl is not None else None,
+            **seam,
         }
         worst.sort(reverse=True)
         renders += [(z, a, b, colour) for _, a, b in worst[:3]]
