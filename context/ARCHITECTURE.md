@@ -641,6 +641,16 @@ the old schedule, with no slack for single-wave groups and the group's
 summed members within the cap: with the overlap its peak rose 36 MiB on
 lines.
 
+Without the summed-member check, a coarse wave that stalls on a slow
+partition no longer bounds the finer levels behind it: they encode, release
+their admission, and their tiles wait in `GroupCommit` for the coarse wave's
+write, so queued output could grow with the group's depth. Under `auto` and
+`speed` each encoded partition therefore keeps a share of the cap in place
+of its members, in the same step that releases them, until its wave is
+written (`InFlight::queued_share`): the tiles' bytes at the member price the
+cap was sized at, or the partition's members when that price is unknown. The
+gate then bounds members in flight and queued output together.
+
 A level of several waves without the export-wide store reads its band once
 into a one-level store (#740). That fill used to wait until the group held
 no members, and then until all but the previous wave was written, so on
