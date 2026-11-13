@@ -67,10 +67,10 @@ Args:
     feature_id: See `export_pmtiles()`.
     keep_overview: Keep the intermediate overview file at this path
         instead of removing it. Its directory must exist.
-    temp_compression: Codec of the temporary intermediate overview,
-        "lz4" (default) or "zstd". "zstd" writes a file about a third
-        smaller for 5-7% more CPU. No effect with `keep_overview`,
-        whose file is always ZSTD.
+    temp_compression: Compression of the temporary intermediate
+        overview, `"lz4"` (default) or `"zstd"`. `"zstd"` writes a file
+        about a third smaller for 5-7% more CPU. No effect with
+        `keep_overview`, whose file is always ZSTD.
     tile_range: See `export_pmtiles()`.
     gsd_base: See `overview()`.
     sort_key: See `overview()`.
