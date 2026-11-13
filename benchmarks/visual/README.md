@@ -59,7 +59,10 @@ directly: no map renderer, so no anti-aliasing and no style.
 A defect is local, and a mean hides it. Per zoom the gate takes the worst
 tiles of each error: the `max`, `p99` and `p95` over the sampled tiles, as
 `missing_max`, `missing_p99`, and so on. One dataset, zoom and such a name
-is a cell, and each cell has its own band.
+is a cell, and each measured cell has its own band. A cell without one (a
+`--dataset ID=PATH` source, or a zoom outside the dataset's list) takes
+`default_band`: it fails when tylertoo is more than 0.02 worse than
+tippecanoe, and has no lower side.
 
 Limits:
 
@@ -68,8 +71,8 @@ Limits:
   tool does.
 - Up to 100 tiles per zoom are sampled, from the tiles that hold source
   vertices, with a fixed seed. A defect outside the sample is not seen;
-  `--cap` widens it. A tile wholly inside one polygon holds no vertex and is
-  never sampled. None of the fixtures has such a tile at its scored zooms
+  `--cap` widens it. A tile wholly inside one polygon holds no vertex, and
+  is sampled only when it holds that polygon's interior point. None of the fixtures has such a tile at its scored zooms
   (fieldmaps-boundaries would at z12).
 - `excess_change` needs a `color_attr`; a dataset without one has only
   `edge_gap` at its seams.
@@ -106,8 +109,12 @@ A band has two sides, and both exit 1:
   the band is stale until it is moved.
 
 A tile and a PNG come with a breach of a per-tile error. `edge_gap`,
-`excess_change` and `point_count_sum` are per zoom and have neither; for
-those, re-run the zoom with `--verbose` and read the per-tile cells. A band
+`excess_change` and `point_count_sum` are per zoom and have neither. For the
+first two, re-run the zoom with `--verbose` and read the per-tile cells. A
+`point_count_sum` line gives the sum and the source count; make its archive
+again with `tylertoo tiles --preset tippecanoe --cluster` on the source. The
+PNG is written anew on every run, and runs that share `--work` share the
+PNG folder. A band
 whose metric has no value any more (a tool draws nothing it can compare)
 also fails, and says so.
 

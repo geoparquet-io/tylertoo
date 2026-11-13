@@ -123,6 +123,8 @@ def tippecanoe_dir(args, tip: dict, did: str, ds: dict, zr: list) -> Path:
             part.rename(d)
         except OSError:  # another run got there first, with the same archive
             shutil.rmtree(part)
+            if not d.exists():
+                raise
     return d
 
 
@@ -310,11 +312,13 @@ def gate_dataset(args, tol: dict, tip: dict, did: str, ds: dict) -> list:
                    cached_score(tip_dir, src, attr, zooms, args.cap), tol)
     if src.kind == "point":
         rows += cluster_rows(args, did, ds, src, zr, zooms)
+    written = set()  # max, p99 and p95 of an error share its worst tile: one PNG, new each run
     for r in rows:
-        if worse(r) and r["tile"]:  # max, p99 and p95 of an error share its worst tile
+        if worse(r) and r["tile"]:
             png = args.work / "png" / f"{did}_z{r['zoom']}_{r['error']}_{r['tile'].replace('/', '-')}.png"
-            if not png.exists():
+            if png not in written:
                 write_png(png, src, attr, r["tile"], [ty_archive, tip_dir / "archive.pmtiles"])
+                written.add(png)
             r["png"] = str(png)
     return rows
 
@@ -426,7 +430,8 @@ def gate(args, tol: dict, tip: dict, datasets: dict) -> int:
             print("IMPROVED: d is below its band. Tighten the band in visual_tolerances.toml, "
                   "with the new measurement in its comment.")
         for did in sorted({r["dataset"] for r in bad}):
-            which = f"--datasets {did}" if did in DATASETS else f"--dataset {did}={datasets[did]['path']}"
+            which = (f"--datasets {did}" if datasets[did] is DATASETS.get(did)
+                     else f"--dataset {did}={datasets[did]['path']}")
             zooms = ",".join(str(z) for z in sorted({r["zoom"] for r in bad if r["dataset"] == did}))
             print(f"re-run only this: uv run benchmarks/visual/gate.py {which} --zooms {zooms}")
         return 1

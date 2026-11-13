@@ -169,8 +169,9 @@ def sample_tiles(src: Source, z: int, cap: int, seed: int = 869) -> list:
     ys = np.clip(((WORLD / 2 - c[:, 1]) / WORLD * n).astype(np.int64), 0, n - 1)
     tiles = sorted({(z, int(x), int(y)) for x, y in np.unique(np.column_stack([xs, ys]), axis=0)})
     # shortcut: a defect outside the sample is not seen. --cap widens the sample, but a
-    # tile wholly inside a polygon holds no vertex and is never a candidate: add the
-    # tiles whose centre the source covers when a fixture has such tiles at a scored zoom.
+    # tile wholly inside a polygon is a candidate only when it holds that polygon's
+    # interior point: add the tiles whose centre the source covers when a fixture has
+    # such tiles at a scored zoom.
     return sorted(random.Random(seed).sample(tiles, cap)) if len(tiles) > cap else tiles
 
 
