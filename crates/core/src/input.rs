@@ -4996,6 +4996,29 @@ mod tests {
         });
     }
 
+    /// #876: a local input truncated after its footer was checked (another
+    /// process rewrote it) reads short: an EOF error naming the shortfall,
+    /// never zero-filled bytes.
+    #[test]
+    fn a_local_read_past_a_truncated_end_is_an_eof_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bytes.bin");
+        std::fs::write(&path, vec![7u8; 4_096]).unwrap();
+        let reader = InputReader::Local(File::open(&path).unwrap());
+        assert_eq!(&reader.get_bytes(4_000, 96).unwrap()[..], &[7u8; 96][..]);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4_050)
+            .unwrap();
+        let err = reader.get_bytes(4_000, 96).unwrap_err().to_string();
+        assert!(
+            err.contains("Expected to read 96 bytes, read only 50"),
+            "{err}"
+        );
+    }
+
     /// #820: a URL's query (a presigned or SAS signature) never reaches a
     /// displayed or persisted copy of the input; a local path keeps its `?`.
     #[test]
