@@ -426,8 +426,10 @@ impl Skim<'_> {
             let after = size - index - 1;
             self.fields(depth + 1, |s, id, ty| {
                 if id == 5 && ty == 5 {
-                    let children = s.zigzag()?;
-                    if children > after as i64 {
+                    // parquet-rs reads an i32 by truncating the zigzag i64, so
+                    // an i64 that is negative here can be 1.7 billion there (#789).
+                    let children = s.zigzag()? as i32;
+                    if i64::from(children) > after as i64 {
                         return Err(SkimStop::Hostile(format!(
                             "schema element {index} declares {children} children, but only \
                              {after} schema elements follow it"
