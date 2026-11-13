@@ -13094,6 +13094,9 @@ mod tests {
                 1,
                 &Pass2Knobs {
                     hold_for_fill: true,
+                    // A fixed budget: macOS probes no memory, and a run
+                    // without a budget takes no grants.
+                    budget_available: Some(64 << 30),
                     ..knobs(false, None, true)
                 },
             )
