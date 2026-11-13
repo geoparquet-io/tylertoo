@@ -37,7 +37,7 @@ settings = "pv0"
 zoom = "*"
 invariant = "decay"
 issue = 749
-reason = "source-area dithering still fails strict decay: z8 has 71 distinct squares and z5 has 44 (more than half); #749 remains"
+reason = "squares of polygons a cascade repair split into MultiPolygons dither on their own parts, not the source: z8 has 71 distinct squares and z5 has 44 (more than half); #749 remains for split polygons"
 
 [[exemption]]
 fixture = "ftw-moldova-z10"

@@ -1676,5 +1676,14 @@ This matches tippecanoe: it hands each feature's unsimplified geometry to
 the next zoom and reduces tiny polygons per zoom against the source area,
 so a placeholder never feeds the next zoom's reduction. The remaining
 divergence is the per-feature hash in place of tippecanoe's serial
-accumulator (#279, `dither_u01`). `pv0` runs were already density-reduced,
-so this does not touch the Moldova `pv0` decay exemption.
+accumulator (#279, `dither_u01`).
+
+Still open under #749: a cascade repair can split a source Polygon into a
+MultiPolygon, and the MultiPolygon arm looks up source parts by position,
+so the parts of a split Polygon are dithered on themselves and their
+squares survive as before. On `ftw-moldova-z10` with
+`--polygon-visibility 0` that keeps 22 rows at z0 against 1 with
+`--no-cascade` (the Moldova `pv0` decay exemption). The same lookup pairs
+parts wrongly for a source MultiPolygon after a finer level dropped one of
+its parts. Fixing either changes default output, so it is left to its own
+change.

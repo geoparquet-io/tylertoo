@@ -27,20 +27,19 @@ fn rows_per_zoom(input: &std::path::Path, max_zoom: u8, cascade: bool) -> BTreeM
         .collect()
 }
 
-/// At every zoom both runs carry, the cascade keeps about as many rows as
-/// simplifying each level from the source does.
+/// At every zoom of the cascade run, it keeps about as many rows as
+/// simplifying each level from the source does (a level the source run does
+/// not emit holds no rows there).
 fn assert_cascade_matches_source(fixture: &str, max_zoom: u8) {
     let Some(input) = fixture::realdata(fixture) else {
         return;
     };
     let cascade = rows_per_zoom(&input, max_zoom, true);
     let source = rows_per_zoom(&input, max_zoom, false);
-    for (zoom, &from_source) in &source {
-        let Some(&cascaded) = cascade.get(zoom) else {
-            continue;
-        };
+    for (zoom, &cascaded) in &cascade {
+        let from_source = source.get(zoom).copied().unwrap_or(0);
         assert!(
-            cascaded <= from_source + from_source / 10 + 1,
+            cascaded.abs_diff(from_source) <= from_source / 10 + 1,
             "{fixture} z{zoom}: cascade keeps {cascaded} rows, --no-cascade {from_source}\n\
              cascade {cascade:?}\nsource {source:?}"
         );

@@ -255,9 +255,10 @@ nonzero `--simplify-factor`), placeholder squares survive every coarse level
 under the cascade: on `open-buildings` (1,000 buildings) 229–263 squares
 about 35 km across appear at z0–z9, drawing 19× the source area at z8. This
 bug also occurs on `main` with `--collapse-square`. The default gate of 2
-avoids it, and the docs no longer recommend a zero gate. Since fixed: the
+avoids it, and the docs no longer recommend a zero gate. Since then the
 cascade dithers each collapsed polygon on its source area, so the squares
-thin about 4× per zoom as they do with `--no-cascade`.
+thin about 4× per zoom as they do with `--no-cascade`, except for polygons
+a cascade repair splits into parts (#749).
 
 ## Rendered coverage at every zoom (MapLibre)
 
