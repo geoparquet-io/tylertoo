@@ -234,9 +234,10 @@ pub fn input_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&
 // Footer pre-check (#690)
 // ============================================================================
 
-/// Deepest struct/list nesting a footer may use. Real footers nest under
-/// ten levels (file → row group → column chunk → metadata → statistics);
-/// past this the bytes are an attack on a recursive decoder's stack.
+/// Deepest struct/list nesting a footer may use, and deepest schema tree.
+/// Real footers nest under ten levels (file → row group → column chunk →
+/// metadata → statistics), real schemas a few nested lists deep; past this
+/// the bytes are an attack on a recursive decoder's stack.
 const MAX_FOOTER_DEPTH: u32 = 64;
 
 /// Why [`Skim`] stopped.
@@ -446,20 +447,26 @@ impl Skim<'_> {
     }
 
     /// `FileMetaData.schema` (field 2): a list of `SchemaElement`s whose
-    /// `num_children` (field 5) each must fit in the elements after it.
+    /// `num_children` (field 5) each must fit in the elements after it, in a
+    /// tree no deeper than [`MAX_FOOTER_DEPTH`]: parquet-rs builds the tree
+    /// by recursion, one frame per level (#789).
     fn schema(&mut self, depth: u32) -> Result<(), SkimStop> {
         let (elem, size) = self.list_header()?;
         if elem != 12 {
             return self.skip_elements(elem, size, depth + 1);
         }
+        // The children still to come of each group the next element is in.
+        let mut open = [0i32; MAX_FOOTER_DEPTH as usize];
+        let mut nested = 0;
         for index in 0..size {
             let after = size - index - 1;
+            let mut children = 0;
             self.fields(depth + 1, |s, id, ty| {
                 if id == 5 {
                     read_as(ty, 5)?;
                     // parquet-rs reads an i32 by truncating the zigzag i64, so
                     // an i64 that is negative here can be 1.7 billion there (#789).
-                    let children = s.zigzag()? as i32;
+                    children = s.zigzag()? as i32;
                     if i64::from(children) > after as i64 {
                         return Err(SkimStop::Hostile(format!(
                             "schema element {index} declares {children} children, but only \
@@ -471,6 +478,21 @@ impl Skim<'_> {
                     s.field(ty, schema_element(id), depth + 2)
                 }
             })?;
+            if nested > 0 {
+                open[nested - 1] -= 1;
+            }
+            if children > 0 {
+                if nested == open.len() {
+                    return Err(SkimStop::Hostile(format!(
+                        "schema element {index} nests more than {MAX_FOOTER_DEPTH} groups deep"
+                    )));
+                }
+                open[nested] = children;
+                nested += 1;
+            }
+            while nested > 0 && open[nested - 1] == 0 {
+                nested -= 1;
+            }
         }
         Ok(())
     }
@@ -636,7 +658,7 @@ fn logical_type(id: i16) -> Option<Known> {
 /// libFuzzer's). This walks the footer once, allocating nothing, and checks
 /// every list, set and map size against the bytes that remain, every schema
 /// element's child count against the elements that follow, and the nesting
-/// depth. Bytes it cannot make sense of are left to parquet-rs, which
+/// depth of the thrift and of the schema tree. Bytes it cannot make sense of are left to parquet-rs, which
 /// reports its own error.
 ///
 /// The counts are the ones parquet-rs will read (#789). parquet-rs reads a

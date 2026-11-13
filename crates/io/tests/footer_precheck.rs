@@ -436,3 +436,55 @@ fn an_honest_footer_passes_and_decodes() {
     let metadata = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(&footer);
     assert_eq!(metadata.unwrap().num_row_groups(), 1);
 }
+
+/// A footer whose schema is `groups` groups, each holding the next, around
+/// one INT32 leaf, and no row groups.
+fn nested_schema(groups: usize) -> Vec<u8> {
+    let mut out = vec![0x15, 4, 0x19, 0xFC];
+    varint(&mut out, groups as u64 + 1);
+    // The root: name (field 4) and one child (field 5).
+    out.extend_from_slice(&[0x48, 1, b'r', 0x15, 2, 0]);
+    for _ in 1..groups {
+        // repetition REQUIRED (3), name (4), one child (5).
+        out.extend_from_slice(&[0x35, 0, 0x18, 1, b'g', 0x15, 2, 0]);
+    }
+    // The leaf: type INT32 (1), repetition REQUIRED (3), name (4).
+    out.extend_from_slice(&[0x15, 2, 0x25, 0, 0x18, 1, b'x', 0]);
+    // num_rows (3), an empty row-group list (4).
+    out.extend_from_slice(&[0x16, 0, 0x19, 0x0C, 0]);
+    out
+}
+
+/// parquet-rs builds the schema tree by recursion, one frame per level, so
+/// a few kilobytes of nested groups overflow a thread's stack (#789): the
+/// pre-check refuses a schema nested past 64 levels, and one nested to the
+/// cap decodes on a 2 MiB stack.
+#[test]
+fn a_schema_nested_past_the_cap_is_refused() {
+    let err = tylertoo_io::precheck_footer(&nested_schema(65)).unwrap_err();
+    assert!(
+        matches!(err, tylertoo_io::Error::HostileFooter(_)),
+        "{err:?}"
+    );
+
+    let footer = nested_schema(64);
+    tylertoo_io::precheck_footer(&footer).unwrap();
+    let columns = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "#789: a schema at the cap must decode unchecked"
+            )]
+            let metadata = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(&footer);
+            metadata
+                .unwrap()
+                .file_metadata()
+                .schema_descr()
+                .num_columns()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(columns, 1);
+}
