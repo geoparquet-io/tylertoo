@@ -364,7 +364,8 @@ fn row_group(out: &mut Vec<u8>, junk: &[Vec<Junk>; 3]) {
     out.push(0);
 }
 
-fn footer(top: &[Junk], schema_ty: u8, elements: &[Element], tail: &Tail) -> Vec<u8> {
+/// `schema`: the schema field's wire type and its list's element type.
+fn footer(top: &[Junk], schema: (u8, u8), elements: &[Element], tail: &Tail) -> Vec<u8> {
     let mut out = Vec::new();
     let mut last = 0;
     header(&mut out, &mut last, 1, 5, false, 0);
@@ -372,8 +373,8 @@ fn footer(top: &[Junk], schema_ty: u8, elements: &[Element], tail: &Tail) -> Vec
     for j in top {
         put(&mut out, &mut last, j, FILE);
     }
-    header(&mut out, &mut last, 2, schema_ty, false, 0);
-    out.push((elements.len() as u8) << 4 | 12);
+    header(&mut out, &mut last, 2, schema.0, false, 0);
+    out.push((elements.len() as u8) << 4 | schema.1);
     for (i, e) in elements.iter().enumerate() {
         let mut last = 0;
         if i > 0 {
@@ -439,14 +440,19 @@ proptest! {
     #[test]
     fn a_passed_footer_reserves_no_more_than_it_holds(
         top in prop::collection::vec(junk(), 0..2),
-        schema_ty in prop_oneof![3 => Just(9u8), 1 => 1u8..=13],
+        // parquet-rs refuses a schema list of other than structs before
+        // reading an element; the walk skips them by their type.
+        schema in (
+            prop_oneof![3 => Just(9u8), 1 => 1u8..=13],
+            prop_oneof![7 => Just(12u8), 1 => 1u8..=13],
+        ),
         elements in prop_oneof![
             2 => prop::collection::vec(element(), 1..4),
             1 => Just(honest_schema()),
         ],
         tail in tail(),
     ) {
-        let footer = footer(&top, schema_ty, &elements, &tail);
+        let footer = footer(&top, schema, &elements, &tail);
         if tylertoo_io::precheck_footer(&footer).is_ok() {
             // Decoded structs cost a few hundred bytes per footer byte at
             // most; the reservations this guards against are gigabytes.
@@ -467,7 +473,7 @@ fn an_honest_footer_passes_and_decodes() {
         row_group: Some(Default::default()),
         ..Tail::default()
     };
-    let footer = footer(&[], 9, &honest_schema(), &tail);
+    let footer = footer(&[], (9, 12), &honest_schema(), &tail);
     tylertoo_io::precheck_footer(&footer).unwrap();
     #[expect(
         clippy::disallowed_methods,
@@ -640,7 +646,7 @@ fn every_retyped_known_field_is_refused() {
             after,
             second: None,
         };
-        let footer = footer(&[], 9, &honest_schema(), &tail);
+        let footer = footer(&[], (9, 12), &honest_schema(), &tail);
         let want =
             format!("a footer field of wire type {refused} is one parquet reads as type {read_as}");
         match tylertoo_io::precheck_footer(&footer) {
