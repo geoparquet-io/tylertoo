@@ -112,6 +112,7 @@ def test_a_source_with_nothing_to_score_is_not_a_pass(archive, src, tmp_path, mo
     import argparse
 
     monkeypatch.setattr(gate.M, "read_source", lambda path, attr: src)
+    (tmp_path / "archive.pmtiles").write_bytes(archive.read_bytes())
     monkeypatch.setattr(gate, "tippecanoe_dir", lambda *a: tmp_path)
     monkeypatch.setattr(gate, "tylertoo_archive", lambda *a: archive)
     monkeypatch.setattr(gate, "score", lambda *a: {str(Z): {"tiles": {}}})
@@ -173,3 +174,48 @@ def test_a_cell_without_a_band_takes_the_default():
     assert row["band"] == [-1.0, 0.02] and row["ok"] is False
     row, = [r for r in gate.compare("other", zoom(0.1), zoom(0.5), TOL) if r["metric"] == "missing_max"]
     assert row["ok"] is True
+
+
+def test_pair_rows_gate_the_direct_difference(archive, tmp_path):
+    """tylertoo's tiles against tippecanoe's: identical archives differ by 0, a shifted one does not."""
+    shifted = tmp_path / "shift.pmtiles"
+    mutate.mutate(archive, shifted, "shift", [Z], "fid")
+    tiles = {str(Z): {"tiles": {f"{X}/{Y}": {}}}}
+    tol = {"gate": {}, "datasets": {"d": {"zoom_bands": [{"zooms": [Z, Z], "pair_iou_loss_max": [0.0, 0.01]}]}}}
+
+    def rows(a, b):
+        return {r["metric"]: r for r in gate.pair_rows("d", gate.pair_score(a, b, "polygon", "fid", tiles), tol)}
+
+    same = rows(archive, archive)
+    assert same["pair_iou_loss_max"]["d"] == 0.0 and same["pair_iou_loss_max"]["ok"] is True
+    assert same["pair_attr_max"]["ok"] is None  # measured, no band
+    row = rows(shifted, archive)["pair_iou_loss_max"]
+    assert row["d"] > 0.01 and row["ok"] is False and gate.worse(row) and row["tile"] == f"{Z}/{X}/{Y}"
+    assert "tylertoo vs tippecanoe" in gate.line(row)
+    # A pair band is not a "band without a value" of the comparison against the source.
+    assert gate.compare("d", tiles, tiles, tol) == []
+
+
+def test_distance_is_the_mean_tile_difference_per_dataset(archive, tmp_path):
+    shifted = tmp_path / "shift.pmtiles"
+    mutate.mutate(archive, shifted, "shift", [Z], "fid")
+    tiles = {str(Z): {"tiles": {f"{X}/{Y}": {}}}}
+    tol = {"gate": {}, "datasets": {}}
+    same = gate.pair_rows("d", gate.pair_score(archive, archive, "polygon", "fid", tiles), tol)
+    moved = gate.pair_rows("d", gate.pair_score(shifted, archive, "polygon", "fid", tiles), tol)
+    assert gate.distance(same) == {"d": {"pair_attr": 0.0, "pair_iou_loss": 0.0}}
+    far = gate.distance(moved)["d"]
+    assert far["pair_iou_loss"] > 0.01 and far["pair_attr"] == 0.0  # moved, still the same features
+
+
+def test_other_settings_are_measured_not_gated(monkeypatch, tmp_path):
+    """With --tylertoo-flags the bands, measured for the preset, do not apply."""
+    seen = {}
+    monkeypatch.setattr(gate.run_e2e, "resolve_tippecanoe", lambda p: {"binary": "t", "version": "v"})
+    monkeypatch.setattr(gate, "gate", lambda args, tol, tip, datasets: seen.update(args=args, tol=tol) or 0)
+    monkeypatch.setattr(sys, "argv", ["gate.py", "--work", str(tmp_path), "--tylertoo", sys.executable,
+                                      "--tylertoo-flags=--simplify-factor 2"])
+    assert gate.main() == 0
+    assert seen["args"].tylertoo_flags == ["--simplify-factor", "2"]
+    assert "default_band" not in seen["tol"]["gate"]
+    assert all("zoom_bands" not in d for d in seen["tol"]["datasets"].values())

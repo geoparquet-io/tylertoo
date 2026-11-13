@@ -184,3 +184,42 @@ def test_read_source_refuses_a_crs_it_does_not_know(tmp_path, crs, loads):
     else:
         with pytest.raises(ValueError, match="lon/lat"):
             m.read_source(tmp_path / "s.parquet")
+
+
+# ---- one tool's tile against the other's, no source ----
+
+
+def test_pair_of_identical_tiles_is_zero():
+    props = [{"a": 7}, {"a": 8}]
+    assert m.pair_errors("polygon", tile([LEFT, RIGHT], props), tile([LEFT, RIGHT], props), "a") == {
+        "pair_iou_loss": 0.0, "pair_attr": 0.0}
+    line = LineString([(100, 2000), (4000, 2000)])
+    assert m.pair_errors("line", tile([line]), tile([line]), None) == {"pair_apart": 0.0}
+    pts = [Point(10 * i, 20 * i) for i in range(1, 9)]
+    assert m.pair_errors("point", tile(pts), tile(pts), None) == {"pair_count": 0.0}
+
+
+def test_pair_polygon_cover_and_attribute():
+    # One draws both halves, the other the left half only: half the drawn area differs.
+    e = m.pair_errors("polygon", tile([LEFT, RIGHT]), tile([LEFT]), None)
+    assert e == {"pair_iou_loss": 0.5}
+    # Same shapes, the right half carries another feature's value.
+    e = m.pair_errors("polygon", tile([LEFT, RIGHT], [{"a": 7}, {"a": 8}]),
+                      tile([LEFT, RIGHT], [{"a": 7}, {"a": 9}]), "a")
+    assert e == {"pair_iou_loss": 0.0, "pair_attr": 0.5}
+
+
+def test_pair_line_within_a_pixel_agrees_and_beyond_does_not():
+    line = LineString([(100, 2000), (4000, 2000)])
+    px = E / m.PX
+    assert m.pair_errors("line", tile([line]), tile([translate(line, yoff=0.5 * px)]), None)["pair_apart"] == 0.0
+    assert m.pair_errors("line", tile([line]), tile([translate(line, yoff=4 * px)]), None)["pair_apart"] == 1.0
+    assert m.pair_errors("line", tile([line]), tile([]), None)["pair_apart"] == 1.0
+
+
+def test_pair_point_counts_per_cell():
+    pts = [Point(10 * i, 20 * i) for i in range(1, 9)]
+    assert m.pair_errors("point", tile(pts), tile(pts[:6]), None) == {"pair_count": 2 / 14}
+    far = [Point(4000 - 10 * i, 20 * i) for i in range(1, 9)]
+    assert m.pair_errors("point", tile(pts), tile(far), None) == {"pair_count": 1.0}
+    assert m.pair_errors("point", tile([]), tile([]), None) is None

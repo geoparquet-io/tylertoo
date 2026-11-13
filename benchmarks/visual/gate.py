@@ -42,6 +42,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -99,7 +100,7 @@ def run(argv: list, log: Path) -> None:
 
 def tylertoo_archive(args, did: str, ds: dict, zr: list, extra=()) -> Path:
     dst = args.run_dir / f"{did}{''.join(extra)}.pmtiles"
-    run([args.tylertoo, "tiles", ds["path"], dst, "--preset", "tippecanoe", "--min-zoom", zr[0],
+    run([args.tylertoo, "tiles", ds["path"], dst, *args.tylertoo_flags, "--min-zoom", zr[0],
          "--max-zoom", zr[1], "--layer-name", ds["layer"], "--force", *extra], dst.with_suffix(".log"))
     return dst
 
@@ -172,6 +173,55 @@ def cached_score(d: Path, src: M.Source, attr, zooms: list, cap: int) -> dict:
     return json.loads(f.read_text())
 
 
+def pair_score(ty: Path, tip: Path, kind: str, attr: str | None, scored: dict) -> dict:
+    """tylertoo's tiles against tippecanoe's, directly, on the tiles `scored`
+    holds (those scored against the source): {zoom: {"tiles": {"x/y": errors}}}."""
+    archives = [M.read_archive(p) for p in (ty, tip)]
+    out = {}
+    for z, rec in scored.items():
+        per = {}
+        for t in rec["tiles"]:
+            k = (int(z), *(int(v) for v in t.split("/")))
+            a, b = (M.decode(tiles[k], gz)[1] if k in tiles else {} for tiles, gz in archives)
+            errors = M.pair_errors(kind, a, b, attr)
+            if errors is not None:
+                per[t] = errors
+        out[z] = {"tiles": per}
+    return out
+
+
+def pair_rows(did: str, pair: dict, tol: dict) -> list:
+    """One row per zoom and pair metric. The value is itself the difference
+    between the tools, so it is its own d; without a band it is reported only."""
+    rows = []
+    for z, rec in pair.items():
+        for name, (value, worst, metric) in worst_tiles(rec).items():
+            band = count_gate.zoom_band(tol, did, name, int(z))
+            rows.append({"dataset": did, "zoom": int(z), "metric": name, "pair": value, "d": value,
+                         "band": band, "ok": count_gate.in_band(value, band), "tile": f"{z}/{worst}",
+                         "error": metric})
+        for metric in sorted({m for e in rec["tiles"].values() for m in e}):
+            vals = [e[metric] for e in rec["tiles"].values() if e.get(metric) is not None]
+            if vals:  # the mean over the zoom's tiles: what distance() sums up
+                name = f"{metric}_mean"
+                band = count_gate.zoom_band(tol, did, name, int(z))
+                rows.append({"dataset": did, "zoom": int(z), "metric": name, "pair": float(np.mean(vals)),
+                             "d": float(np.mean(vals)), "band": band,
+                             "ok": count_gate.in_band(float(np.mean(vals)), band), "tile": None, "error": metric})
+    return rows
+
+
+def distance(rows: list) -> dict:
+    """{dataset: {pair metric: mean over its zooms of the mean tile difference}}:
+    how far tylertoo's tiles are from tippecanoe's, 0 when they draw the same.
+    The number to drive down when choosing settings."""
+    acc = {}
+    for r in rows:
+        if "pair" in r and r["metric"].endswith("_mean"):
+            acc.setdefault(r["dataset"], {}).setdefault(r["error"], []).append(r["pair"])
+    return {d: {m: float(np.mean(v)) for m, v in sorted(ms.items())} for d, ms in acc.items()}
+
+
 def worst_tiles(zrec: dict) -> dict:
     """{metric_stat: (value, worst tile)} for one zoom of one archive."""
     out = {}
@@ -208,7 +258,8 @@ def compare(did: str, ty: dict, tip: dict, tol: dict) -> list:
                 rows += [{"dataset": did, "zoom": int(z), "metric": name, "d": None, "band": band,
                           "ok": False, "tile": None}
                          for name, band in entry.items()
-                         if name != "zooms" and not (name in a and name in b)]
+                         if name != "zooms" and not name.startswith("pair_")
+                         and not (name in a and name in b)]
     return rows
 
 
@@ -293,10 +344,14 @@ def line(r: dict) -> str:
     if r["d"] is None:
         return (f"{r['dataset']} z{r['zoom']} {r['metric']}: has the band {r['band']} but no value: "
                 "one of the tools draws nothing this metric can compare")
-    other = f"tippecanoe {r['tippecanoe']:.4f}" if "tippecanoe" in r else f"source {r['source']}"
     band = f"band [{r['band'][0]}, {r['band'][1]}]" if r["band"] else "no band"
-    return (f"{r['dataset']} z{r['zoom']} {r['metric']}: tylertoo {r['tylertoo']:.4f} {other} "
-            f"d {r['d']:+.4f} {band}" + (f" tile {r['tile']}" if r["tile"] else "")
+    if "pair" in r:
+        values = f"tylertoo vs tippecanoe {r['pair']:.4f}"
+    else:
+        other = f"tippecanoe {r['tippecanoe']:.4f}" if "tippecanoe" in r else f"source {r['source']}"
+        values = f"tylertoo {r['tylertoo']:.4f} {other} d {r['d']:+.4f}"
+    return (f"{r['dataset']} z{r['zoom']} {r['metric']}: {values} {band}"
+            + (f" tile {r['tile']}" if r["tile"] else "")
             + (f" png {r['png']}" if r.get("png") else ""))
 
 
@@ -308,8 +363,9 @@ def gate_dataset(args, tol: dict, tip: dict, did: str, ds: dict) -> list:
     src = M.read_source(Path(ds["path"]), attr)
     tip_dir = tippecanoe_dir(args, tip, did, ds, zr)
     ty_archive = tylertoo_archive(args, did, ds, zr)
-    rows = compare(did, score(ty_archive, src, attr, zooms, args.cap),
-                   cached_score(tip_dir, src, attr, zooms, args.cap), tol)
+    ty_scores = score(ty_archive, src, attr, zooms, args.cap)
+    rows = compare(did, ty_scores, cached_score(tip_dir, src, attr, zooms, args.cap), tol)
+    rows += pair_rows(did, pair_score(ty_archive, tip_dir / "archive.pmtiles", src.kind, attr, ty_scores), tol)
     if not rows:  # every sampled tile is under its floor: no verdict, not a pass
         raise ValueError(f"{did}: nothing to score at zooms {zooms}: no sampled tile holds enough of the source")
     if src.kind == "point":
@@ -368,6 +424,10 @@ def main() -> int:
     ap.add_argument("--self-test", action="store_true",
                     help="inject known defects and check that each one breaches")
     ap.add_argument("--tylertoo", default=os.environ.get("TYLERTOO", str(REPO / "target" / "release" / "tylertoo")))
+    ap.add_argument("--tylertoo-flags", type=shlex.split, default=["--preset", "tippecanoe"],
+                    metavar="'FLAGS'", help="tylertoo tiles settings to compare with tippecanoe, in place of "
+                    "--preset tippecanoe; the distances are reported and the bands, measured for the preset, "
+                    "are not applied (write it as --tylertoo-flags='--flag value')")
     ap.add_argument("--tippecanoe", default=os.environ.get("TIPPECANOE"))
     ap.add_argument("--tolerances", type=Path, default=TOLERANCES)
     ap.add_argument("--work", type=Path, default=Path.home() / "bench-data" / "visual",
@@ -398,6 +458,10 @@ def main() -> int:
               "fixtures: gh release download fixtures-v1 --dir tests/fixtures/realdata/", file=sys.stderr)
         return 2
     tol = count_gate.load_tolerances(args.tolerances)
+    if args.tylertoo_flags != ["--preset", "tippecanoe"]:
+        tol["gate"].pop("default_band", None)
+        for cfg in tol.get("datasets", {}).values():
+            cfg.pop("zoom_bands", None)
     args.work.mkdir(parents=True, exist_ok=True)
     # This run's tylertoo archives: its own directory, so that runs sharing
     # --work (agents in several worktrees) never score each other's binary.
@@ -423,9 +487,14 @@ def gate(args, tol: dict, tip: dict, datasets: dict) -> int:
             tag = ("ok      " if r["ok"] else "BREACH  " if worse(r) else "IMPROVED" if r["ok"] is False
                    else "no band ")
             print(f"  {tag} {line(r)}", flush=True)
+        dist = distance(got).get(did, {})
+        print("  distance to tippecanoe (mean tile, 0 = same): " + ", ".join(f"{m} {v:.4f}" for m, v in dist.items())
+              + (f"  [IoU {1 - dist['pair_iou_loss']:.4f}]" if "pair_iou_loss" in dist else ""), flush=True)
         rows += got
     if args.json:
-        args.json.write_text(json.dumps({"tippecanoe": tip, "tolerances": str(args.tolerances), "rows": rows}, indent=2))
+        args.json.write_text(json.dumps({"tippecanoe": tip, "tolerances": str(args.tolerances),
+                                         "tylertoo_flags": args.tylertoo_flags, "distance": distance(rows),
+                                         "rows": rows}, indent=2))
     bad = [r for r in rows if r["ok"] is False]
     if bad:
         if not all(map(worse, bad)):
@@ -437,7 +506,9 @@ def gate(args, tol: dict, tip: dict, datasets: dict) -> int:
             zooms = ",".join(str(z) for z in sorted({r["zoom"] for r in bad if r["dataset"] == did}))
             print(f"re-run only this: uv run benchmarks/visual/gate.py {which} --zooms {zooms}")
         return 1
-    print("visual gate: every band holds")
+    preset = args.tylertoo_flags == ["--preset", "tippecanoe"]
+    print("visual gate: every band holds" if preset else
+          f"measured with {' '.join(args.tylertoo_flags)}: the bands are for the preset and were not applied")
     return 0
 
 

@@ -688,9 +688,11 @@ The parity gate compares counts and sizes, so a moved border or a hole
 at a tile seam passes it. `benchmarks/visual/gate.py` catches those
 defects. It tiles each fixture with
 `tylertoo tiles --preset tippecanoe` and with the pinned tippecanoe,
-measures both archives against the source on the same tiles, and takes
-the difference of the two errors on the worst tiles of each zoom. It fails
-when that difference leaves its measured band.
+compares the two archives tile against tile (IoU of the drawn area for
+polygons, and its counterparts for lines and points), and also measures
+both against the source. It fails when one of these numbers leaves its
+measured band. With `--tylertoo-flags` it reports the distance to
+tippecanoe for other settings.
 
 It is a local tool. CI runs only its unit tests. Run it after a change to
 generalization, the size valve, or the preset:

@@ -1,4 +1,4 @@
-# Visual gate: does tylertoo draw the source as well as tippecanoe?
+# Visual gate: do tylertoo's tiles look like tippecanoe's?
 
 `compare_tippecanoe.py` gates counts and bytes. Those do not see a moved
 border, a hole at a seam, or a merge that carries the wrong attribute. This
@@ -15,6 +15,7 @@ uv run benchmarks/visual/gate.py            # every dataset, exit 0 or 1
 uv run benchmarks/visual/gate.py --datasets open-buildings --zooms 14
 uv run benchmarks/visual/gate.py --dataset mine=/data/mine.parquet
 uv run benchmarks/visual/gate.py --self-test
+uv run benchmarks/visual/gate.py --tylertoo-flags='--preset tippecanoe --simplify-factor 4'
 ```
 
 A run of all six fixtures takes about 2.5 minutes the first time and about
@@ -25,7 +26,51 @@ means the run could not be made (a missing or failing tool, an unknown
 dataset, an unusable source, or a source with no tile to score at the
 zooms asked for), not a breach.
 
-## What it measures
+## Distance to tippecanoe
+
+Every run compares tylertoo's tile with tippecanoe's tile of the same
+z/x/y directly, with no source, on the sampled tiles. 0 means the two tiles
+draw the same:
+
+| Source | Cell | Meaning |
+|---|---|---|
+| Polygons | `pair_iou_loss` | 1 − IoU of the area the two tools draw |
+| Polygons with a `color_attr` | `pair_attr` | Share of the area both draw where the attribute differs |
+| Lines | `pair_apart` | Share of the two tools' line length more than one pixel from the other's |
+| Points | `pair_count` | Share of points not matched per cell of a 16×16 grid; 1 means no cell in common |
+
+Each has `_max`, `_p99`, `_p95` and `_mean` cells per zoom, with bands like
+the others. After each dataset the run prints one line, the mean over its
+zooms of the mean tile:
+
+```
+madagascar-adm4: 75 cells, 0 outside their band
+  distance to tippecanoe (mean tile, 0 = same): pair_attr 0.0033, pair_iou_loss 0.0069  [IoU 0.9931]
+```
+
+`--json` holds the same numbers under `distance`. To look for settings that
+come closer to tippecanoe, pass them with `--tylertoo-flags` and compare
+that line or that JSON key between runs: lower is closer. The flags replace
+`--preset tippecanoe`, so repeat it when the settings build on the preset.
+With `--tylertoo-flags` the bands are not applied (they were measured for
+the preset); the run reports and exits 0.
+
+Measured for the preset (mean tile):
+
+| Fixture | Distance |
+|---|---|
+| madagascar-adm4 | IoU 0.9931, `pair_attr` 0.0033 |
+| open-buildings | IoU 0.9980, `pair_attr` 0.0000 |
+| ftw-moldova-z10 | IoU 0.9939 |
+| fieldmaps-boundaries | IoU 0.9971, `pair_attr` 0.0000 |
+| road-detections | `pair_apart` 0.0001 |
+| vd-points | `pair_count` 0.6456 |
+
+The points are far apart at z8 to z12 (`pair_count` 1.0 on the worst tile):
+both tools thin the points there, and they keep different ones. At z14 both
+keep every point and the distance is 0.
+
+## What it measures against the source
 
 Both tools tile the same source: tylertoo with `tiles --preset tippecanoe`,
 tippecanoe 2.79.0 with its defaults and `--drop-densest-as-needed`. Each

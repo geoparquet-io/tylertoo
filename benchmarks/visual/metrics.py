@@ -398,3 +398,54 @@ def cluster_sum(decoded_tiles) -> int:
 
 
 ERRORS = {"polygon": polygon_errors, "line": line_errors, "point": point_errors}
+
+
+# --------------------------------------------------------------------------
+# one tool's tile against the other's, no source
+# --------------------------------------------------------------------------
+
+
+def pair_errors(kind: str, a: dict, b: dict, attr: str | None) -> dict | None:
+    """How far two decoded tiles of one z/x/y differ, 0 when they draw the same.
+
+    polygon  pair_iou_loss: 1 - IoU of the two drawn areas (pixels only one
+             of the two draws, over the pixels either draws). pair_attr: pixels both draw with different values
+             of `attr`, over the pixels both draw.
+    line     pair_apart: length of each that is more than LINE_TOL_PX from
+             the other, over the length of both.
+    point    pair_count: per-cell count difference on the GRID, over the
+             points of both: 0 the same points per cell, 1 no cell in common.
+    """
+    import shapely
+    from shapely import unary_union
+    from shapely.geometry import box
+
+    if kind == "polygon":
+        ra, rb = (rasterize_tile(*tile_shapes(t, attr, norm=str), PX) for t in (a, b))
+        da, db = ra > 0, rb > 0
+        if not (da | db).any():
+            return None
+        out = {"pair_iou_loss": float((da ^ db).sum() / (da | db).sum())}
+        if attr:
+            both = da & db
+            out["pair_attr"] = float((both & (ra != rb)).sum() / both.sum()) if both.any() else None
+        return out
+    if kind == "line":
+        drawn = []
+        for t in (a, b):
+            parts = [shapely.transform(g, lambda c, s=PX / extent: c * s) for g, _, extent in features(t, LINE)]
+            drawn.append(unary_union(parts).intersection(box(0, 0, PX, PX)))
+        la, lb = drawn
+        if not la.length + lb.length:
+            return None
+        apart = la.difference(lb.buffer(LINE_TOL_PX)).length + lb.difference(la.buffer(LINE_TOL_PX)).length
+        return {"pair_apart": float(apart / (la.length + lb.length))}
+    counts = []
+    for t in (a, b):
+        feats = list(features(t, POINT))
+        extent = feats[0][2] if feats else EXTENT_DEFAULT
+        counts.append(_cells(shapely.get_coordinates([g for g, _, _ in feats]).reshape(-1, 2), extent))
+    ca, cb = counts
+    if not (ca + cb).sum():
+        return None
+    return {"pair_count": float(np.abs(ca - cb).sum() / (ca + cb).sum())}
