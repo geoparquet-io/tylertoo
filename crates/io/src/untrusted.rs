@@ -351,6 +351,9 @@ impl Skim<'_> {
     /// skips a boolean element as no bytes, though it is one on the wire, so
     /// this does too: the walk must stay where parquet-rs is (#789).
     fn skip_elements(&mut self, elem: u8, size: usize, depth: u32) -> Result<(), SkimStop> {
+        if matches!(elem, 1 | 2) {
+            return Ok(());
+        }
         (0..size).try_for_each(|_| self.skip(elem, depth))
     }
 
@@ -385,6 +388,9 @@ impl Skim<'_> {
         let size = self.varint()?;
         self.check_count(size, 2, "map")?;
         let kv = if size == 0 { 0 } else { self.byte()? };
+        if matches!(kv >> 4, 1 | 2) && matches!(kv & 0x0f, 1 | 2) {
+            return Ok(()); // no bytes per pair, as in `skip_elements`
+        }
         (0..size).try_for_each(|_| {
             self.skip_elements(kv >> 4, 1, depth)?;
             self.skip_elements(kv & 0x0f, 1, depth)
@@ -393,7 +399,9 @@ impl Skim<'_> {
 
     /// Walk one struct's fields, handing each `(field id, type)` to `field`,
     /// which must consume the value. As in parquet-rs, any byte with a zero
-    /// type nibble ends the struct and a long-form id is truncated to i16.
+    /// type nibble ends the struct and a long-form id is truncated to i16. A
+    /// delta past i16 wraps: parquet-rs refuses it in a struct it reads and
+    /// never sees it in one it skips, so walking on is the safe side.
     fn fields(
         &mut self,
         depth: u32,
@@ -409,9 +417,7 @@ impl Skim<'_> {
             }
             let id = match b >> 4 {
                 0 => self.zigzag()? as i16,
-                delta => last
-                    .checked_add(i16::from(delta))
-                    .ok_or(SkimStop::Confused)?,
+                delta => last.wrapping_add(i16::from(delta)),
             };
             last = id;
             field(self, id, ty)?;
@@ -430,6 +436,11 @@ impl Skim<'_> {
             Some(Known::Struct(spec)) => {
                 read_as(ty, 12)?;
                 self.fields(depth + 1, |s, id, ty| s.field(ty, spec(id), depth + 1))
+            }
+            Some(Known::List(elem)) => {
+                read_as(ty, 9)?;
+                let (ty, size) = self.list_header()?;
+                (0..size).try_for_each(|_| self.field(ty, Some(*elem), depth + 1))
             }
         }
     }
@@ -465,14 +476,21 @@ impl Skim<'_> {
     }
 }
 
-/// How parquet-rs reads a field it knows, by id: as this compact type, or
-/// as a struct whose fields it knows by this table, whatever wire type the
-/// field declares (#789).
+/// How parquet-rs reads a field it knows, by id: as this compact type, as
+/// a struct whose fields it knows by this table, or as a list of these,
+/// whatever wire type the field declares (#789). The tables mirror parquet
+/// 59's decoder (`file/metadata/thrift`), not the thrift spec: a field it
+/// skips is left out.
 #[derive(Clone, Copy)]
 enum Known {
     Wire(u8),
     Struct(fn(i16) -> Option<Known>),
+    List(&'static Known),
 }
+
+const VARINT: Known = Known::Wire(5);
+const BINARY: Known = Known::Wire(8);
+const BOOL: Known = Known::Wire(1);
 
 /// Refuse a known field whose wire type parquet-rs would read as `want`.
 /// The walk skips by wire type, so it would leave parquet-rs's position and
@@ -494,11 +512,87 @@ fn read_as(ty: u8, want: u8) -> Result<(), SkimStop> {
     }
 }
 
+/// `FileMetaData`'s fields, but the schema (2, [`Skim::schema`]). Without
+/// parquet's `encryption` feature, 8 and 9 are skipped.
+fn file_metadata(id: i16) -> Option<Known> {
+    match id {
+        1 | 3 => Some(VARINT),
+        4 => Some(Known::List(&Known::Struct(row_group))),
+        5 => Some(Known::List(&Known::Struct(|id| {
+            matches!(id, 1 | 2).then_some(BINARY) // KeyValue
+        }))),
+        6 => Some(BINARY),
+        // ColumnOrder: a union of one empty struct.
+        7 => Some(Known::List(&Known::Struct(|id| {
+            (id == 1).then_some(Known::Struct(|_| None))
+        }))),
+        _ => None,
+    }
+}
+
+fn row_group(id: i16) -> Option<Known> {
+    match id {
+        1 => Some(Known::List(&Known::Struct(column_chunk))),
+        2 | 3 | 5 | 7 => Some(VARINT),
+        // SortingColumn
+        4 => Some(Known::List(&Known::Struct(|id| match id {
+            1 => Some(VARINT),
+            2 | 3 => Some(BOOL),
+            _ => None,
+        }))),
+        _ => None,
+    }
+}
+
+/// `ColumnChunk`; 8 and 9 as in [`file_metadata`].
+fn column_chunk(id: i16) -> Option<Known> {
+    match id {
+        1 => Some(BINARY),
+        2 | 4..=7 => Some(VARINT),
+        3 => Some(Known::Struct(column_metadata)),
+        _ => None,
+    }
+}
+
+/// `ColumnMetaData`; parquet-rs skips 3 and 8.
+fn column_metadata(id: i16) -> Option<Known> {
+    match id {
+        1 | 4..=7 | 9..=11 | 14 | 15 => Some(VARINT),
+        2 => Some(Known::List(&VARINT)),
+        // Statistics
+        12 => Some(Known::Struct(|id| match id {
+            1 | 2 | 5 | 6 => Some(BINARY),
+            3 | 4 => Some(VARINT),
+            7 | 8 => Some(BOOL),
+            _ => None,
+        })),
+        // PageEncodingStats
+        13 => Some(Known::List(&Known::Struct(|id| {
+            (1..=3).contains(&id).then_some(VARINT)
+        }))),
+        // SizeStatistics
+        16 => Some(Known::Struct(|id| match id {
+            1 => Some(VARINT),
+            2 | 3 => Some(Known::List(&VARINT)),
+            _ => None,
+        })),
+        // GeospatialStatistics, its bounding box of doubles
+        17 => Some(Known::Struct(|id| match id {
+            1 => Some(Known::Struct(|id| {
+                (1..=8).contains(&id).then_some(Known::Wire(7))
+            })),
+            2 => Some(Known::List(&VARINT)),
+            _ => None,
+        })),
+        _ => None,
+    }
+}
+
 /// `SchemaElement`'s fields, but `num_children` ([`Skim::schema`]).
 fn schema_element(id: i16) -> Option<Known> {
     match id {
-        1..=3 | 6..=9 => Some(Known::Wire(5)),
-        4 => Some(Known::Wire(8)),
+        1..=3 | 6..=9 => Some(VARINT),
+        4 => Some(BINARY),
         10 => Some(Known::Struct(logical_type)),
         _ => None,
     }
@@ -508,9 +602,9 @@ fn schema_element(id: i16) -> Option<Known> {
 fn logical_type(id: i16) -> Option<Known> {
     let variant: fn(i16) -> Option<Known> = match id {
         1..=4 | 6 | 11..=15 => |_| None,
-        5 => |id| matches!(id, 1 | 2).then_some(Known::Wire(5)),
+        5 => |id| matches!(id, 1 | 2).then_some(VARINT),
         7 | 8 => |id| match id {
-            1 => Some(Known::Wire(1)),
+            1 => Some(BOOL),
             2 => Some(Known::Struct(|id| {
                 (1..=3).contains(&id).then_some(Known::Struct(|_| None))
             })),
@@ -518,14 +612,14 @@ fn logical_type(id: i16) -> Option<Known> {
         },
         10 => |id| match id {
             1 => Some(Known::Wire(3)),
-            2 => Some(Known::Wire(1)),
+            2 => Some(BOOL),
             _ => None,
         },
         16 => |id| (id == 1).then_some(Known::Wire(3)),
-        17 => |id| (id == 1).then_some(Known::Wire(8)),
+        17 => |id| (id == 1).then_some(BINARY),
         18 => |id| match id {
-            1 => Some(Known::Wire(8)),
-            2 => Some(Known::Wire(5)),
+            1 => Some(BINARY),
+            2 => Some(VARINT),
             _ => None,
         },
         _ => return None,
@@ -547,10 +641,9 @@ fn logical_type(id: i16) -> Option<Known> {
 ///
 /// The counts are the ones parquet-rs will read (#789). parquet-rs reads a
 /// field it knows by its id and its own type, whatever wire type the field
-/// declares, so up to the row groups the walk does too: it refuses a known
-/// field whose wire type would make the two read different bytes, and a
-/// field an honest writer puts after the row groups. It skips everything
-/// else as parquet-rs skips it.
+/// declares, so the walk does too ([`Known`]): it refuses a known field
+/// whose wire type would make the two read different bytes, and skips every
+/// other field as parquet-rs skips it.
 ///
 /// Each declared count is floored at its element type's smallest wire size
 /// (`min_wire_bytes`), not its decoded size. A struct element can be one
@@ -568,29 +661,13 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
         buf: thrift,
         pos: 0,
     };
-    // parquet-rs reads `FileMetaData` by field id too, and reserves for the
-    // schema's children (2) and the row groups (4).
-    let mut row_groups = false;
-    let walked = skim.fields(0, |s, id, ty| match id {
-        1 | 3 => s.field(ty, Some(Known::Wire(5)), 1),
-        2 => {
+    let walked = skim.fields(0, |s, id, ty| {
+        if id == 2 {
             read_as(ty, 9)?;
             s.schema(1)
+        } else {
+            s.field(ty, file_metadata(id), 1)
         }
-        4 => {
-            row_groups = true;
-            s.field(ty, Some(Known::Wire(9)), 1)
-        }
-        // parquet-rs reads these by its own types; an honest writer puts
-        // them after the row groups.
-        5..=9 if !row_groups => Err(SkimStop::Hostile(format!(
-            "footer field {id} comes before the row groups"
-        ))),
-        // shortcut: row groups and later fields are skipped by wire type,
-        // though parquet-rs reads them by id, so a retyped field in them can
-        // hide a second row-group list's count from this walk; upgrade to
-        // `Known` tables for them if the fuzzer finds one.
-        _ => s.skip(ty, 1),
     });
     match walked {
         Err(SkimStop::Hostile(reason)) => Err(InputError::HostileFooter(reason)),

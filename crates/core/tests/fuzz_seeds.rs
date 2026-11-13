@@ -165,6 +165,7 @@ fn parquet_footer_seeds() {
             "seed-issue-789-i32-children.thrift",
             "seed-issue-789-i64-typed-children.thrift",
             "seed-issue-789-oom.thrift",
+            "seed-issue-789-retyped-created-by.thrift",
             "seed-issue-789-set-typed-schema.thrift",
         ],
         tylertoo_core::internal::overview::check::fuzz_parquet_footer,
@@ -185,11 +186,13 @@ fn parquet_footer_seeds() {
     // input is a `num_children` that is negative as an i64 but 1.7 billion
     // once parquet-rs truncates it to i32: a 13.8 GB reservation. The same
     // count in an i64-typed field, or in a schema typed as a set, is read by
-    // parquet-rs by field id all the same.
+    // parquet-rs by field id all the same. A `created_by` typed as an i32
+    // hid a second row-group list of 2^31 from a walk by wire type.
     for seed in [
         "seed-issue-690-num-children.thrift",
         "seed-issue-789-i32-children.thrift",
         "seed-issue-789-i64-typed-children.thrift",
+        "seed-issue-789-retyped-created-by.thrift",
         "seed-issue-789-set-typed-schema.thrift",
     ] {
         let (_, bytes) = seeds("parquet_footer")
