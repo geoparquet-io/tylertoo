@@ -1839,11 +1839,15 @@ fn split_mismatch() -> ArrowError {
 }
 
 /// `f` over `0..counts.sum()`, the run of each count on its own thread
-/// (the first on this one), results in order.
-fn map_split<T: Send>(counts: &[usize], f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+/// (the first on this one), results in order. A spawned run is inside its
+/// own thread's panic boundary ([`guard`]); the caller's covers the first.
+fn map_split<T: Send>(
+    counts: &[usize],
+    f: impl Fn(usize) -> T + Sync,
+) -> Result<Vec<T>, InputError> {
     let total: usize = counts.iter().sum();
     if counts.len() < 2 {
-        return (0..total).map(&f).collect();
+        return Ok((0..total).map(&f).collect());
     }
     let mut starts = Vec::with_capacity(counts.len());
     let mut at = 0;
@@ -1856,16 +1860,16 @@ fn map_split<T: Send>(counts: &[usize], f: impl Fn(usize) -> T + Sync) -> Vec<T>
         let handles: Vec<_> = starts[1..]
             .iter()
             .cloned()
-            .map(|r| s.spawn(move || r.map(f).collect::<Vec<T>>()))
+            .map(|r| s.spawn(move || guard("parquet page", || r.map(f).collect::<Vec<T>>())))
             .collect();
         let mut out: Vec<T> = starts[0].clone().map(f).collect();
         for h in handles {
             match h.join() {
-                Ok(part) => out.extend(part),
+                Ok(part) => out.extend(part?),
                 Err(panic) => std::panic::resume_unwind(panic),
             }
         }
-        out
+        Ok(out)
     })
 }
 
@@ -1878,7 +1882,17 @@ fn next_split(
     let parts: Vec<Option<Result<RecordBatch, ArrowError>>> = match readers {
         [one] => return one.next(),
         [first, rest @ ..] => std::thread::scope(|s| {
-            let handles: Vec<_> = rest.iter_mut().map(|r| s.spawn(move || r.next())).collect();
+            // Each spawned split decodes inside its own thread's boundary.
+            let handles: Vec<_> = rest
+                .iter_mut()
+                .map(|r| {
+                    s.spawn(move || {
+                        guard("parquet page", || r.next()).unwrap_or_else(|panic| {
+                            Some(Err(ArrowError::ExternalError(Box::new(panic))))
+                        })
+                    })
+                })
+                .collect();
             let mut parts = vec![first.next()];
             for h in handles {
                 parts.push(match h.join() {
@@ -2083,8 +2097,8 @@ impl Iterator for UntrustedBatchReader {
                 .collect();
             Some(
                 map_split(&counts, cast)
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|panic| ArrowError::ExternalError(Box::new(panic)))
+                    .and_then(|columns| columns.into_iter().collect::<Result<Vec<_>, _>>())
                     .and_then(|columns| RecordBatch::try_new(schema.clone(), columns)),
             )
         })
@@ -2427,6 +2441,83 @@ mod tests {
             .metadata;
         assert_eq!(column_splits(&md, None, 4, 8192).len(), 3);
         assert!(column_splits(&md, None, 4, 1).is_empty());
+    }
+
+    /// Bytes that panic on a read starting in `ranges`.
+    struct Tripwire {
+        bytes: Bytes,
+        ranges: Vec<std::ops::Range<u64>>,
+    }
+
+    impl Tripwire {
+        fn trip(&self, start: u64) {
+            if self.ranges.iter().any(|r| r.contains(&start)) {
+                panic!("tripwire");
+            }
+        }
+    }
+
+    impl parquet::file::reader::Length for Tripwire {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+    }
+
+    impl ChunkReader for Tripwire {
+        type T = <Bytes as ChunkReader>::T;
+
+        fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+            self.trip(start);
+            self.bytes.get_read(start)
+        }
+
+        fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+            self.trip(start);
+            self.bytes.get_bytes(start, length)
+        }
+    }
+
+    impl ConcurrentChunkReader for Tripwire {}
+
+    /// roborev on f44f9372: a decoder panic in a column split other than
+    /// the first, on a spawned thread, is caught by that thread's own panic
+    /// boundary and keeps its recorded location; it used to reach the
+    /// previous hook and come back as a bare message.
+    #[test]
+    fn a_panic_in_a_secondary_split_keeps_its_location() {
+        let bytes = declaring_uncompressed(1_000_000);
+        let md = open_parquet(bytes.clone()).unwrap().metadata;
+        // The last column's chunks, decoded by the last split.
+        let ranges = md
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|g| {
+                let (start, len) = g.column(2).byte_range();
+                start..start + len
+            })
+            .collect();
+        let mut reader = open_parquet(Tripwire { bytes, ranges })
+            .unwrap()
+            .with_decode_threads(3)
+            .build()
+            .unwrap();
+        assert_eq!(reader.inner.current.len(), 3);
+        let err = reader
+            .find_map(Result::err)
+            .expect("the tripwire fails the read")
+            .to_string();
+        assert!(err.contains("tripwire (at "), "{err}");
+        assert!(err.contains("untrusted.rs:"), "{err}");
+    }
+
+    /// The same for a cast run on a spawned thread ([`map_split`]).
+    #[test]
+    fn a_panic_in_a_secondary_cast_keeps_its_location() {
+        let err = map_split(&[1, 2], |i| assert!(i < 2, "cast tripwire"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cast tripwire (at "), "{err}");
     }
 
     /// roborev on f44f9372: a footer declaring column chunks near
