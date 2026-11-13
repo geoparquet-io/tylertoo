@@ -853,7 +853,10 @@ impl Regrouper {
     /// The I/O owner's cut of the queued rows (#858): the same rule the
     /// sequential reader cuts by, so the merge delivers its batches.
     fn bounded_rows(&self, max: usize) -> usize {
-        tylertoo_io::concat_prefix_rows(&self.queue, max, self.limit)
+        // Queued batches are in the reader's output schema.
+        self.queue.front().map_or(1, |front| {
+            tylertoo_io::concat_prefix_rows(&self.queue, &front.schema(), max, self.limit)
+        })
     }
     fn push(&mut self, batch: RecordBatch) {
         if batch.num_rows() > 0 {

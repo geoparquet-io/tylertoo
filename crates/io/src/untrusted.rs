@@ -1019,21 +1019,31 @@ fn decoded_limit(offset_limit: u64) -> u64 {
 }
 
 /// Rows the next delivered batch takes from the row stream `batches`: the
-/// most, up to `max_rows` and at least one, whose [`rows_bytes`] fit the
-/// byte bound.
+/// most, up to `max_rows` and at least one, that fit the bounds.
+///
+/// Their [`rows_bytes`] fit the byte bound, and their values in each
+/// dictionary of `schema` with 8- or 16-bit keys inside a list fit its key
+/// ([`listed_values`], #857).
 ///
 /// The one batch-cutting rule for every reader and the parallel read's
 /// regrouping (#858). It depends only on the rows, not on how they are split
 /// into `batches` or which representation holds them, so a part read by one
-/// reader or by several merged back is cut into the same batches.
+/// reader or by several merged back is cut into the same batches. `schema`
+/// is the one the rows are delivered in.
+///
+/// Values are counted, not distinct values: the count is the same in decoded
+/// views and in dictionaries, and needs only list offsets. A list column of
+/// many repeated narrow-key values is therefore cut into small batches.
 pub fn concat_prefix_rows<'a>(
     batches: impl IntoIterator<Item = &'a RecordBatch>,
+    schema: &arrow_schema::Schema,
     max_rows: usize,
     limit: u64,
 ) -> usize {
     let bound = limit.min(decoded_limit(limit));
     let max_rows = max_rows.max(1);
     let (mut rows, mut bytes) = (0usize, 0u64);
+    let mut held = Vec::new();
     for batch in batches {
         let room = batch.num_rows().min(max_rows - rows);
         let cost = |n: usize| {
@@ -1041,19 +1051,20 @@ pub fn concat_prefix_rows<'a>(
                 b.saturating_add(rows_bytes(column.as_ref(), 0, n))
             })
         };
+        let values = |n: usize| add_listed_values(&held, batch, schema, n);
         let all = cost(room);
-        if all <= bound {
-            (rows, bytes) = (rows + room, all);
+        if let Some(sum) = values(room).filter(|_| all <= bound) {
+            (rows, bytes, held) = (rows + room, all, sum);
             if rows == max_rows {
                 break;
             }
             continue;
         }
-        // Row costs are positive, so prefix costs are monotone.
+        // Row costs and values are positive, so prefix sums are monotone.
         let (mut lo, mut hi) = (0, room);
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            if cost(mid) <= bound {
+            if cost(mid) <= bound && values(mid).is_some() {
                 lo = mid;
             } else {
                 hi = mid;
@@ -1264,22 +1275,28 @@ fn projected_field(
     original.clone().with_data_type(target)
 }
 
+/// The values an 8- or 16-bit dictionary key indexes.
+fn key_capacity(key: &arrow_schema::DataType) -> Option<usize> {
+    use arrow_schema::DataType;
+    match key {
+        DataType::Int8 => Some(1 << 7),
+        DataType::UInt8 => Some(1 << 8),
+        DataType::Int16 => Some(1 << 15),
+        DataType::UInt16 => Some(1 << 16),
+        _ => None,
+    }
+}
+
 /// The most rows of `data_type` a batch can hold with no dictionary in it
 /// with 8- or 16-bit keys indexing past its key, when one is in it outside
-/// a variable-length list ([`listed_dictionary`]).
+/// a variable-length list ([`listed_values`]).
 fn dictionary_capacity(data_type: &arrow_schema::DataType) -> Option<usize> {
     use arrow_schema::DataType;
     match data_type {
-        DataType::Dictionary(key, value) => {
-            let own = match key.as_ref() {
-                DataType::Int8 => Some(1 << 7),
-                DataType::UInt8 => Some(1 << 8),
-                DataType::Int16 => Some(1 << 15),
-                DataType::UInt16 => Some(1 << 16),
-                _ => None,
-            };
-            own.into_iter().chain(dictionary_capacity(value)).min()
-        }
+        DataType::Dictionary(key, value) => key_capacity(key)
+            .into_iter()
+            .chain(dictionary_capacity(value))
+            .min(),
         DataType::FixedSizeList(f, k) => {
             dictionary_capacity(f.data_type()).map(|c| (c / (*k).max(1) as usize).max(1))
         }
@@ -1291,24 +1308,97 @@ fn dictionary_capacity(data_type: &arrow_schema::DataType) -> Option<usize> {
     }
 }
 
-/// Whether `data_type` holds a dictionary with 8- or 16-bit keys in a
-/// variable-length list, whose values no row count bounds.
-fn listed_dictionary(data_type: &arrow_schema::DataType) -> bool {
+/// Push `(values, key capacity)` for each dictionary of `target` with 8- or
+/// 16-bit keys inside a variable-length list, in schema order: the values
+/// rows `start..end` of `array` hold in it. No row count bounds them (#857).
+/// `array` is of `target`'s types or the reader's decoded views; their
+/// offsets agree. A dictionary in another's values is not reached: arrow
+/// cannot cast to a dictionary of lists.
+fn listed_values(
+    array: &dyn arrow_array::Array,
+    target: &arrow_schema::DataType,
+    (start, end): (usize, usize),
+    listed: bool,
+    out: &mut Vec<(usize, usize)>,
+) {
+    use arrow_array::cast::AsArray;
     use arrow_schema::DataType;
-    match data_type {
-        DataType::List(f) | DataType::LargeList(f) | DataType::Map(f, _) => {
-            narrow_dictionary(f.data_type())
+    let range = |o: &[i32]| (o[start] as usize, o[end] as usize);
+    match target {
+        DataType::Dictionary(key, _) if listed => {
+            out.extend(key_capacity(key).map(|capacity| (end - start, capacity)));
         }
-        DataType::FixedSizeList(f, _) => listed_dictionary(f.data_type()),
-        DataType::Dictionary(_, value) => listed_dictionary(value),
-        DataType::Struct(fields) => fields.iter().any(|f| listed_dictionary(f.data_type())),
-        _ => false,
+        DataType::List(f) => {
+            let a = array.as_list::<i32>();
+            listed_values(
+                a.values().as_ref(),
+                f.data_type(),
+                range(a.value_offsets()),
+                true,
+                out,
+            );
+        }
+        DataType::LargeList(f) => {
+            let a = array.as_list::<i64>();
+            let o = a.value_offsets();
+            let range = (o[start] as usize, o[end] as usize);
+            listed_values(a.values().as_ref(), f.data_type(), range, true, out);
+        }
+        DataType::Map(f, _) => {
+            let a = array.as_map();
+            listed_values(
+                a.entries(),
+                f.data_type(),
+                range(a.value_offsets()),
+                true,
+                out,
+            );
+        }
+        DataType::FixedSizeList(f, k) => {
+            let k = *k as usize;
+            let values = array.as_fixed_size_list().values();
+            listed_values(
+                values.as_ref(),
+                f.data_type(),
+                (start * k, end * k),
+                listed,
+                out,
+            );
+        }
+        DataType::Struct(fields) => {
+            for (column, f) in array.as_struct().columns().iter().zip(fields) {
+                listed_values(column.as_ref(), f.data_type(), (start, end), listed, out);
+            }
+        }
+        _ => {}
     }
 }
 
-/// Whether `data_type` holds a dictionary with 8- or 16-bit keys anywhere.
-fn narrow_dictionary(data_type: &arrow_schema::DataType) -> bool {
-    dictionary_capacity(data_type).is_some() || listed_dictionary(data_type)
+/// `held` plus the [`listed_values`] of `batch`'s first `n` rows, or `None`
+/// when one would pass its key: the cast back to `schema`, or a concat that
+/// merges dictionaries, holds no more distinct values than that (#857).
+fn add_listed_values(
+    held: &[usize],
+    batch: &RecordBatch,
+    schema: &arrow_schema::Schema,
+    n: usize,
+) -> Option<Vec<usize>> {
+    let mut values = Vec::new();
+    for (column, field) in batch.columns().iter().zip(schema.fields()) {
+        listed_values(
+            column.as_ref(),
+            field.data_type(),
+            (0, n),
+            false,
+            &mut values,
+        );
+    }
+    let held = held.iter().chain(std::iter::repeat(&0));
+    values
+        .iter()
+        .zip(held)
+        .map(|(&(v, capacity), &h)| Some(h + v).filter(|&sum| sum <= capacity))
+        .collect()
 }
 
 fn wide_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
@@ -1493,7 +1583,7 @@ pub fn read_batch_plan(
 /// its keys can index: a batch, here or in a caller's regrouping to the
 /// yield, can then hold no more distinct values than the key indexes, which
 /// the cast back would refuse (#857). A dictionary in a variable-length list
-/// is not joined past the decode, and can still pass it.
+/// is bounded by its values instead, in the cut ([`concat_prefix_rows`]).
 fn batch_plan(
     reader: &ReaderMetadata,
     row_groups: Option<&[usize]>,
@@ -1602,14 +1692,6 @@ fn batch_plan(
         .filter_map(|t| dictionary_capacity(t))
         .min()
         .unwrap_or(usize::MAX);
-    // shortcut: a listed dictionary only keeps its decode batches, as before
-    // #848, and a list's values can still overflow its key; upgrade when #857
-    // bounds the cut by distinct values.
-    let joined = if fields.iter().any(|t| listed_dictionary(t)) {
-        decode
-    } else {
-        joined
-    };
     // No more rows than the key indexes: however a batch is cut and joined,
     // it holds no more distinct values (#857).
     (decode.min(capacity), joined.min(capacity))
@@ -2296,16 +2378,21 @@ impl Iterator for UntrustedBatchReader {
         let schema = self.schema.clone();
         let limit = self.limit;
         let item = guard("parquet page", || {
-            let (batch, compact) =
-                match join_decoded(&mut self.inner, &mut self.joined, self.join_rows, limit)? {
-                    Ok(cut) => cut,
-                    Err(_) if self.page_eof.load(Ordering::Relaxed) => {
-                        return Some(Err(ArrowError::ExternalError(Box::new(
-                            InputError::HostilePageHeader,
-                        ))));
-                    }
-                    Err(e) => return Some(Err(e)),
-                };
+            let (batch, compact) = match join_decoded(
+                &mut self.inner,
+                &mut self.joined,
+                &schema,
+                self.join_rows,
+                limit,
+            )? {
+                Ok(cut) => cut,
+                Err(_) if self.page_eof.load(Ordering::Relaxed) => {
+                    return Some(Err(ArrowError::ExternalError(Box::new(
+                        InputError::HostilePageHeader,
+                    ))));
+                }
+                Err(e) => return Some(Err(e)),
+            };
             // The cut keeps every batch of two or more rows under both
             // ceilings; a row that alone passes one is refused.
             if batch.num_rows() == 1 {
@@ -2375,6 +2462,7 @@ impl Iterator for UntrustedBatchReader {
 fn join_decoded(
     inner: &mut impl Iterator<Item = Result<RecordBatch, ArrowError>>,
     carry: &mut Option<RecordBatch>,
+    target: &arrow_schema::Schema,
     rows: usize,
     limit: u64,
 ) -> Option<Result<(RecordBatch, bool), ArrowError>> {
@@ -2389,10 +2477,11 @@ fn join_decoded(
     };
     let schema = first.schema();
     let (mut held, mut bytes) = (first.num_rows(), batch_bytes(&first));
+    let mut values = add_listed_values(&[], &first, target, first.num_rows());
     let (mut parts, mut unjoined) = (vec![first], 1);
-    // Past the bound the cut is known: the row after an oversized one is not
+    // Past a bound the cut is known: the row after an oversized one is not
     // decoded before the reader refuses it.
-    while held < rows && bytes <= bound {
+    while held < rows && bytes <= bound && values.is_some() {
         let batch = match inner.next() {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => return Some(Err(e)),
@@ -2400,12 +2489,13 @@ fn join_decoded(
         };
         held += batch.num_rows();
         bytes = bytes.saturating_add(batch_bytes(&batch));
+        values = values.and_then(|v| add_listed_values(&v, &batch, target, batch.num_rows()));
         parts.push(batch);
         unjoined += 1;
         // Joined JOIN_CHUNK at a time while decoding: an unjoined one-row
         // batch holds the schema's whole fixed Arrow overhead. Not once the
         // cut is known: a piece past the bound is never copied.
-        if unjoined == JOIN_CHUNK && held < rows && bytes <= bound {
+        if unjoined == JOIN_CHUNK && held < rows && bytes <= bound && values.is_some() {
             let chunk = parts.split_off(parts.len() - JOIN_CHUNK);
             match arrow_select::concat::concat_batches(&schema, &chunk) {
                 Ok(joined) => parts.push(joined),
@@ -2415,7 +2505,7 @@ fn join_decoded(
         }
     }
     // Every row before the last part fits, so the cut falls in the last.
-    let cut = concat_prefix_rows(&parts, rows, limit);
+    let cut = concat_prefix_rows(&parts, target, rows, limit);
     let last = parts.pop()?;
     let keep = cut - (held - last.num_rows());
     if keep < last.num_rows() {
@@ -3282,7 +3372,8 @@ mod tests {
         let limit = 100_000;
         let mut carry = None;
         let (mut sizes, mut firsts) = (Vec::new(), Vec::new());
-        while let Some(batch) = join_decoded(&mut inner, &mut carry, 1_000, limit) {
+        let schema = inner.schema();
+        while let Some(batch) = join_decoded(&mut inner, &mut carry, &schema, 1_000, limit) {
             let (batch, _) = batch.unwrap();
             let cost: u64 = batch
                 .columns()
@@ -3400,7 +3491,8 @@ mod tests {
         let mut carry = None;
         let mut ids = Vec::new();
         let mut sizes = Vec::new();
-        while let Some(batch) = join_decoded(&mut inner, &mut carry, 8, 100_000) {
+        let schema = inner.schema();
+        while let Some(batch) = join_decoded(&mut inner, &mut carry, &schema, 8, 100_000) {
             let (batch, _) = batch.unwrap();
             sizes.push(batch.num_rows());
             ids.extend(
@@ -3444,7 +3536,8 @@ mod tests {
             .build()
             .unwrap();
         let mut carry = None;
-        let (joined, _) = join_decoded(&mut inner, &mut carry, 1_000, 100_000)
+        let schema = inner.schema();
+        let (joined, _) = join_decoded(&mut inner, &mut carry, &schema, 1_000, 100_000)
             .unwrap()
             .unwrap();
         assert_eq!(joined.num_rows(), JOIN_CHUNK - 1);
@@ -3528,6 +3621,91 @@ mod tests {
         assert_eq!(rows, 2_048);
     }
 
+    /// #857: a `List<Dictionary(Int8, Utf8)>` column whose 100-row groups
+    /// each hold 200 distinct list values, written from 50-row batches of
+    /// 100 values (each fits the key). Rows do not bound list values, so a
+    /// row-count plan alone overflows the Int8 key on the cast back.
+    #[test]
+    fn listed_narrow_dictionaries_read_within_their_key() {
+        use arrow_array::builder::{ListBuilder, StringDictionaryBuilder};
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int8Type;
+        use arrow_array::ArrayRef;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        let file = tempfile::tempfile().unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let mut writer = None;
+        for part in 0..4 {
+            let mut tags = ListBuilder::new(StringDictionaryBuilder::<Int8Type>::new());
+            for value in 0..100 {
+                tags.values()
+                    .append_value(format!("v{}", part * 100 + value));
+                if value % 2 == 1 {
+                    tags.append(true);
+                }
+            }
+            let batch = RecordBatch::try_from_iter([("tags", Arc::new(tags.finish()) as ArrayRef)])
+                .unwrap();
+            writer
+                .get_or_insert_with(|| {
+                    ArrowWriter::try_new(
+                        file.try_clone().unwrap(),
+                        batch.schema(),
+                        Some(props.clone()),
+                    )
+                    .unwrap()
+                })
+                .write(&batch)
+                .unwrap();
+        }
+        writer.unwrap().close().unwrap();
+        let reader = open_parquet(file).unwrap().build().unwrap();
+        let schema = reader.schema();
+        let batches: Vec<RecordBatch> = reader.map(|batch| batch.unwrap()).collect();
+        // The key is not widened: callers see the schema the file declares.
+        assert!(matches!(
+            schema.field(0).data_type(),
+            arrow_schema::DataType::List(item) if matches!(
+                item.data_type(),
+                arrow_schema::DataType::Dictionary(key, _) if **key == arrow_schema::DataType::Int8
+            )
+        ));
+        let values: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let list = batch.column(0).as_list::<i32>();
+                let tags = arrow_cast::cast(list.values(), &arrow_schema::DataType::Utf8).unwrap();
+                tags.as_string::<i32>()
+                    .iter()
+                    .map(|v| v.unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            values,
+            (0..400).map(|v| format!("v{v}")).collect::<Vec<_>>()
+        );
+        // The parallel read regroups delivered batches (core's `Regrouper`)
+        // by the same cut: 64 two-value rows, which join within the key.
+        let cut = concat_prefix_rows(&batches, &schema, 400, byte_array_limit());
+        assert_eq!(cut, 64);
+        let mut need = cut;
+        let parts: Vec<RecordBatch> = batches
+            .iter()
+            .map(|b| {
+                let n = b.num_rows().min(need);
+                need -= n;
+                b.slice(0, n)
+            })
+            .collect();
+        #[expect(clippy::disallowed_methods, reason = "#857: the regrouper's join")]
+        let joined = arrow_select::concat::concat_batches(&schema, &parts).unwrap();
+        assert_eq!(joined.num_rows(), 64);
+    }
+
     #[test]
     fn dictionary_capacity_counts_fixed_size_list_values() {
         use arrow_schema::{DataType, Field};
@@ -3536,10 +3714,8 @@ mod tests {
         assert_eq!(dictionary_capacity(&dict), Some(128));
         let pairs = DataType::FixedSizeList(item.clone(), 2);
         assert_eq!(dictionary_capacity(&pairs), Some(64));
-        assert!(!listed_dictionary(&pairs));
         let list = DataType::List(item);
         assert_eq!(dictionary_capacity(&list), None);
-        assert!(listed_dictionary(&list));
     }
 
     /// Two 100-row groups of 120 Int64 list values per row: 108 KB of list
