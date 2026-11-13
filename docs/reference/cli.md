@@ -71,7 +71,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | `--name <TEXT>` | Human-readable name stored in the archive metadata. |
 | `--description <TEXT>` | Description stored in the archive metadata. |
 | `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
-| `--tile-buffer <TILE_BUFFER>` | Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width). Default: `8`. |
+| `--tile-buffer <TILE_BUFFER>` | Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width). Default: `5`. |
 | `--extent <EXTENT>` | MVT tile extent: the tile-local coordinate resolution. A power of two is recommended. Default: `4096`. |
 | `--max-tile-size <SIZE\|auto>` [alias: `tile-size-limit`] | Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap: a backstop behind `--max-compressed-tile-size`. `auto` is 2M, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile over a cap is merged or thinned until it fits; see `--size-valve`. Default: `auto`. |
 | `--max-compressed-tile-size <SIZE\|auto>` | Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap. `auto` is 500K, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile must fit both caps. Default: `auto`. |
@@ -96,7 +96,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 
 | Option | Description |
 | --- | --- |
-| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
+| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) line and polygon once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Unset, lines get 0.25 and polygons are not simplified, since each polygon is simplified on its own and shared borders would part; `0` simplifies nothing, as `tiles --verbatim` and `pyramid` bands do. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 1 is about factor 0.25. |
 
 ### Sharded builds
 
@@ -179,7 +179,7 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 | `--exclude-property <NAME>` | Drop these properties from the tiles (repeatable). `--include-property` overrides it. |
 | `--exclude-all-properties` | Drop every property, writing geometry-only tiles. `--include-property` overrides it. |
 | `--layer-name <LAYER_NAME>` | MVT layer name written into every tile. Default: `overview`. |
-| `--tile-buffer <TILE_BUFFER>` | Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width). Default: `8`. |
+| `--tile-buffer <TILE_BUFFER>` | Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width). Default: `5`. |
 | `--extent <EXTENT>` | MVT tile extent: the tile-local coordinate resolution. A power of two is recommended. Default: `4096`. |
 | `--max-tile-size <SIZE\|auto>` [alias: `tile-size-limit`] | Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap: a backstop behind `--max-compressed-tile-size`. `auto` is 2M, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile over a cap is merged or thinned until it fits; see `--size-valve`. Default: `auto`. |
 | `--max-compressed-tile-size <SIZE\|auto>` | Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap. `auto` is 500K, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile must fit both caps. Default: `auto`. |
@@ -195,7 +195,7 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 | `--tile-range <LO..HI>` | Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at one zoom, plus their descendants. Ranges that partition a zoom give disjoint archives, which `tylertoo merge` can join. |
 | `--zoom-ceiling <ZOOM>` | Emit only the tiles at or below this zoom, the coarse half of a sharded build. A partial overview kept from `tiles --shard coarse` needs a ceiling at or below its own. |
 | `--feature-id <COLUMN>` | Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. By default features have no id. |
-| `--preset <tippecanoe>` | Start from another tool's export defaults instead of tylertoo's; options you pass still override them. `tippecanoe` sets its tile buffer, size caps and size valve: <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>. Possible values: `tippecanoe`. |
+| `--preset <tippecanoe>` | Start from another tool's export defaults instead of tylertoo's; options you pass still override them. `tippecanoe` sets its tile buffer, size caps, size valve and max-zoom simplification: <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>. Possible values: `tippecanoe`. |
 | `--report <PATH>` | Write the JSON export report, with per-zoom tile and feature counts, to this path. |
 | `-f`, `--force` | Overwrite the output if it exists. |
 
@@ -203,7 +203,7 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 
 | Option | Description |
 | --- | --- |
-| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
+| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) line and polygon once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Unset, lines get 0.25 and polygons are not simplified, since each polygon is simplified on its own and shared borders would part; `0` simplifies nothing, as `tiles --verbatim` and `pyramid` bands do. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 1 is about factor 0.25. |
 
 ### Memory & performance
 
@@ -305,7 +305,7 @@ tylertoo pyramid [OPTIONS] --band <LO-HI:[SYSTEM:]INPUT[:LAYER]> <OUTPUT>
 | `--description <TEXT>` | Description stored in the archive metadata. |
 | `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
 | `--generalize` | Generalize each GeoParquet band instead of tiling it verbatim. Use for raw features spanning several zooms. |
-| `--tile-buffer <TILE_BUFFER>` | Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width). Default: `8`. |
+| `--tile-buffer <TILE_BUFFER>` | Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width). Default: `5`. |
 | `--extent <EXTENT>` | MVT tile extent: the tile-local coordinate resolution. A power of two is recommended. Default: `4096`. |
 | `--max-tile-size <SIZE\|auto>` [alias: `tile-size-limit`] | Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap: a backstop behind `--max-compressed-tile-size`. `auto` is 2M, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile over a cap is merged or thinned until it fits; see `--size-valve`. Default: `auto`. |
 | `--max-compressed-tile-size <SIZE\|auto>` | Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap. `auto` is 500K, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile must fit both caps. Default: `auto`. |
@@ -331,7 +331,7 @@ tylertoo pyramid [OPTIONS] --band <LO-HI:[SYSTEM:]INPUT[:LAYER]> <OUTPUT>
 
 | Option | Description |
 | --- | --- |
-| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5. |
+| `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) line and polygon once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Unset, lines get 0.25 and polygons are not simplified, since each polygon is simplified on its own and shared borders would part; `0` simplifies nothing, as `tiles --verbatim` and `pyramid` bands do. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 1 is about factor 0.25. |
 
 ### Memory & performance
 
@@ -512,7 +512,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | Option | Description |
 | --- | --- |
 | `--bbox <XMIN,YMIN,XMAX,YMAX>` | Convert features whose bbox intersects this lon/lat box, or would one ±360° wrap away (0..360 data). Skips row groups outside the box. |
-| `--preset <tippecanoe>` | Start from another tool's defaults instead of tylertoo's; options you pass still override them. `tippecanoe` sets its drop rate, gamma and simplification, and with `tiles` its tile buffer, size caps and size valve: <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>. Possible values: `tippecanoe`. |
+| `--preset <tippecanoe>` | Start from another tool's defaults instead of tylertoo's; options you pass still override them. `tippecanoe` sets its drop rate, gamma and simplification, and with `tiles` its tile buffer, size caps, size valve and max-zoom simplification: <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>. Possible values: `tippecanoe`. |
 
 ### Filtering
 
