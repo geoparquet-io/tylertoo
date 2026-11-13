@@ -793,7 +793,7 @@ fn tiles_left_over_the_cap_are_listed_and_the_warning_names_the_drop_valve() {
         );
         let hint = format!(
             "; {merged} of them hold merged features, which the merge valve never drops: \
-             pass --size-valve drop to enforce the cap by dropping features instead"
+             try --size-valve drop, which drops features to fit the cap"
         );
         assert_eq!(text.contains(&hint), valve == "merge", "{valve}: {text}");
     }

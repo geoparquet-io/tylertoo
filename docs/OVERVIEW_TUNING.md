@@ -1627,9 +1627,9 @@ fits. `--size-valve` chooses how:
   If the tile still exceeds the cap after all possible merges, unmerged
   features are dropped, keeping the largest. Merged features are retained. A
   tile that is still over after that is written as it is, with a warning.
-  When such tiles hold merged features, the warning names `--size-valve
-  drop` as the way to enforce the cap (#873); a single feature over the cap
-  stays over under either valve.
+  When such tiles hold merged features, the warning suggests `--size-valve
+  drop`, which drops features to fit the cap (#873). It cannot shrink a
+  single feature over the cap, and it gives up after eight passes.
 - `drop` drops features, keeping the largest for polygons and lines.
 
 Under either valve, the warning about tiles still over the cap, and the

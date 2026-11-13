@@ -18270,6 +18270,16 @@ mod tests {
             .collect();
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].count(), report.over_limit_tiles);
+        // #873: only the tiles holding merged features count toward the
+        // `--size-valve drop` hint; the lone line's tiles do not.
+        let crate::diagnostics::Diagnostic::TilesOverLimit { merged_tiles, .. } = summary[0] else {
+            unreachable!()
+        };
+        assert!(
+            (1..report.over_limit_tiles).contains(merged_tiles),
+            "{merged_tiles} of {}",
+            report.over_limit_tiles
+        );
     }
 
     /// #814: `max_zoom_simplify_factor` thins the finest zoom's tiles, keeps

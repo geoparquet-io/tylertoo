@@ -429,7 +429,7 @@ impl fmt::Display for Diagnostic {
                     write!(f, "; largest: {}", tiles.join(", "))?;
                 }
                 if *merged_tiles > 0 {
-                    write!(f, "; {merged_tiles} of them hold merged features, which the merge valve never drops: pass --size-valve drop to enforce the cap by dropping features instead (a single feature over the cap stays over)")?;
+                    write!(f, "; {merged_tiles} of them hold merged features, which the merge valve never drops: try --size-valve drop, which drops features to fit the cap")?;
                 }
                 Ok(())
             }
