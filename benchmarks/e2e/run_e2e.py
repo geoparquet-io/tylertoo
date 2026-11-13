@@ -588,7 +588,7 @@ INVARIANT_ONLY_DATASETS = {
 }
 # --tier pr: defaults plus the setting most likely to break, per dataset.
 INVARIANT_PR_TIER = {
-    "open-buildings": ["defaults", "pv0"],  # #749: squares survive the cascade
+    "open-buildings": ["defaults", "pv0"],  # #749: squares must decay
     "road-detections": ["defaults", "sf0"],  # lines only; #758 ran sf0
     "madagascar-adm4": ["defaults", "fill"],  # #750 coverage fill
     "ftw-moldova-z10": ["defaults", "fill"],  # #748 validity, #750/#762 fill

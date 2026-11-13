@@ -385,11 +385,11 @@ The measurements showed the following:
   29.3 MB at factor 0.25, 33.5 MB at factor 0. Table:
   `docs/OVERVIEW_TUNING.md` § Coverage and simplification; commands in
   `benchmarks/coalesce/RESULTS.md`.
-- `--polygon-visibility 0` with placeholder squares has a pre-existing bug
-  (#749): under the cascade, squares survive every coarse level, so small
-  features appear as very large squares at low zooms. The `C2` recipe was dropped
-  from the docs for that reason and because `--simplify-factor` closes more
-  of the gap at a lower cost.
+- `--polygon-visibility 0` with placeholder squares had a bug (#749, since
+  fixed): under the cascade, squares survived every coarse level, so small
+  features appeared as very large squares at low zooms. The `C2` recipe was
+  dropped from the docs for that reason and because `--simplify-factor`
+  closes more of the gap at a lower cost.
 
 - Polygon thinning: a thinning cell keeps one polygon by bbox center, so on
   NZ Parcels, a parcel inside a ring-shaped neighbor was removed from every

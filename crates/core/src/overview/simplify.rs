@@ -2800,9 +2800,10 @@ mod tests {
         }
     }
 
-    /// `Representation::Square` in a cascade: a square kept at the band's
-    /// finest level re-dithers deterministically at coarser steps (same
-    /// anchor ⇒ same u), so survival is monotone and engine-independent.
+    /// `Representation::Square` in a cascade: every step dithers the
+    /// collapsing polygon on its canonical area and anchor (#749), so `u` is
+    /// fixed while `p` shrinks, and survival is monotone and
+    /// engine-independent.
     #[test]
     fn test_square_step_and_cascade_consistency() {
         let opts = SimplifyOptions::default();
