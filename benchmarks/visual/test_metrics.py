@@ -162,16 +162,23 @@ def test_read_source_without_geo_metadata(tmp_path):
 
 
 def test_a_source_reaching_the_pole_still_covers_its_tiles(tmp_path):
-    """Latitude 90 is infinite in Web Mercator. The tools clamp it to the map's
-    edge; unclamped, the source raster comes out empty and the tile is never scored."""
+    """Latitude 90 is infinite in Web Mercator. Both tools clamp it to ±89.9 and
+    clip to the tile; unclamped, the source raster comes out empty and the tile
+    is never scored. A vertex between the map's edge and 89.9 keeps its place."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     import shapely
+    from shapely.geometry import Polygon
 
-    pq.write_table(pa.table({"geometry": [shapely.to_wkb(box(-180, -90, 180, -60))]}), tmp_path / "s.parquet")
+    slope = Polygon([(0, 80), (40, 88), (40, 80)])  # its edge leaves the map near lon 17.5
+    pq.write_table(pa.table({"geometry": [shapely.to_wkb(g) for g in (box(-180, -90, 180, -60), slope)]}),
+                   tmp_path / "s.parquet")
     src = m.read_source(tmp_path / "s.parquet")
     assert np.isfinite(shapely.total_bounds(src.geoms)).all()
     assert m.rasterize_source(src.tree, src.geoms, 2, 1, 3, m.PX).all()  # z2 row 3: lat -66.5 to -85.05
+    top = m.rasterize_source(src.tree, src.geoms, 2, 2, 0, m.PX)  # z2 2/0: lon 0 to 90, lat 66.5 to 85.05
+    col = lambda lon: int(lon / 90 * m.PX)  # noqa: E731
+    assert not top[0, col(10)] and top[0, col(30)]  # clamped at the map's edge, it would reach row 0 at lon 40
 
 
 @pytest.mark.parametrize("crs,loads", [
