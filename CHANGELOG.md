@@ -150,7 +150,10 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (#857). The key type is unchanged.
 - A crafted Parquet footer with an overlong varint, or a page header that
   skips past the end of the file, is refused instead of allocating gigabytes
-  or spinning for minutes (#789).
+  or spinning for minutes (#789). So is a footer whose child or row-group
+  count the pre-check read differently from parquet: through a field
+  written as another wire type than parquet reads it as, or a schema child
+  count that parquet's i32 read makes large.
 - A WKT projected CRS (`PROJCRS`, `PROJCS`, …) that embeds EPSG:4326 as its
   base is no longer read as WGS84 (#708).
 - `TYLERTOO_AUTO_MEM_LIMIT_BYTES` set or changed after the first conversion
