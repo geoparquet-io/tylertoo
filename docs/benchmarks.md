@@ -50,8 +50,8 @@ _Run: commit afb6b15, tylertoo 0.8.0, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
   125 to 1,000 MB/s; the bounded run had the fast disk throughout, which is
   part of why it is faster here. On Brazil, on the same fast disk, bounded
   is about a fifth slower than the default.
-- **Cores:** about 12–14 of 64 are busy on average; #813 tracks raising
-  that.
+- **Cores:** about 12–14 of 64 are busy on average. This run predates
+  the core-use work in #818, #878 and #881.
 - The bbox is a rectangle, so it also takes in the Middle East west of 52°E
   and southern Europe below 37.5°N.
 
