@@ -50,11 +50,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::time::{Duration, Instant};
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "#817 B1, #852: pass 2's per-call measurement and sharing flag"
-)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{self, Ordering::Relaxed};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array};
@@ -63,20 +59,20 @@ use crossbeam_channel::{Receiver, Sender};
 use rayon::prelude::*;
 use std::path::Path;
 use tempfile::NamedTempFile;
-use tylertoo_io::IpcCompression;
 use tylertoo_io::IpcStreamReader as StreamReader;
 use tylertoo_io::IpcStreamWriter as StreamWriter;
+use tylertoo_io::{IpcCompression, IpcIndexedReader};
 
 use super::memory::{Grant, MemoryBudget, SINK_ROW_ALLOC_OVERHEAD_BYTES};
 
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
-use super::pipe::{for_each_window, scoped_pipe, split_in_flight};
+use super::pipe::{for_each_window, process_window, run_on_pool, scoped_pipe, split_in_flight};
 use super::read::{internal, ReadFlow};
 use super::stream::{
     process_batch_cascade, process_level_batch, LevelStreamCtx, Pass2Timers, StreamRead,
 };
-use super::writer::{LevelWriteOutcome, OverviewWriter};
+use super::writer::{recv_in_pool, LevelWriteOutcome, OverviewWriter};
 
 pub(super) struct BufferOptions<'a> {
     pub(super) profile: MemoryProfile,
@@ -834,6 +830,26 @@ struct SinkAutoTuner {
 }
 
 impl SinkAutoTuner {
+    fn log_projection(&self) {
+        if let Some(per_row) = self.bytes_per_row() {
+            // #626: the number the up-front estimate could only guess at. Info
+            // level so a sizing regression is visible in an ordinary run log, not
+            // just in `TYLERTOO_PROFILE_JSON`.
+            log::info!(
+                "[convert] pass2 sink: measured {per_row} B per buffered row over {} buffered \
+                 row(s) → {:.1} GiB for {} planned buffered row(s){}",
+                self.rows,
+                gib(self.projected_bytes()),
+                self.planned_rows,
+                if self.downgraded {
+                    " (downgraded to spill mid-pass)"
+                } else {
+                    ""
+                },
+            );
+        }
+    }
+
     /// A downgrade can only apply to a [`MemoryProfile::Auto`] run that
     /// started in [`SinkBacking::Ram`], so only that case probes a budget.
     ///
@@ -979,7 +995,7 @@ fn downgrade_if_due(
     sinks: &mut [LevelSink],
     spill_bytes: &mut [u64],
     (out_schema, spill_dir): (&Schema, Option<&Path>),
-    (diagnostics, share): (&crate::diagnostics::Diagnostics, &AtomicBool),
+    (diagnostics, share): (&crate::diagnostics::Diagnostics, &atomic::AtomicBool),
 ) -> Result<(), ConvertError> {
     if !tuner.should_downgrade() {
         return Ok(());
@@ -1226,6 +1242,17 @@ enum LevelSink {
 }
 
 impl LevelSink {
+    fn largest_spill_batch(sinks: &[Self]) -> u64 {
+        sinks
+            .iter()
+            .map(|sink| match sink {
+                Self::Spill(state) => state.max_batch_bytes.unwrap_or(0),
+                Self::Ram(_) => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     #[cfg(test)]
     fn new(
         backing: SinkBacking,
@@ -1356,6 +1383,8 @@ struct SpillState {
     /// `None` once the stream has been closed — by [`SpillState::into_reader`],
     /// or by a `push` that joined the writer to report its error.
     tx: Option<Sender<RecordBatch>>,
+    /// Largest decoded batch: admission prices the indexed drain from this.
+    max_batch_bytes: Option<u64>,
     /// `None` once joined. The writer returns the temp file it finished plus
     /// the core-seconds it spent encoding and writing (folded into
     /// `Pass2Timers::spill_write` at join time, since the thread cannot borrow
@@ -1368,8 +1397,15 @@ struct SpillState {
 /// What a finished spill-writer thread hands back.
 struct SpillWriterDone {
     temp: NamedTempFile,
+    offsets: Option<Vec<u64>>,
     /// Core-seconds spent in Arrow IPC encode + write on the writer thread.
     write_time: Duration,
+}
+
+struct SpillReader {
+    file: File,
+    temp: NamedTempFile,
+    offsets: Option<Vec<u64>>,
 }
 
 impl SpillState {
@@ -1410,6 +1446,7 @@ impl SpillState {
         temp: NamedTempFile,
     ) -> Result<Self, ConvertError> {
         let (tx, rx) = crossbeam_channel::bounded::<RecordBatch>(SPILL_QUEUE_DEPTH);
+        let max_batch_bytes = writer.batch_offsets().map(|_| 0);
         let handle = std::thread::Builder::new()
             .name("tylertoo-spill".to_string())
             .spawn(move || -> Result<SpillWriterDone, ConvertError> {
@@ -1421,12 +1458,18 @@ impl SpillState {
                 }
                 let t = Instant::now();
                 writer.finish()?; // writes EOS + flushes the BufWriter
+                let offsets = writer.batch_offsets().map(<[u64]>::to_vec);
                 drop(writer); // close the write handle
                 write_time += t.elapsed();
-                Ok(SpillWriterDone { temp, write_time })
+                Ok(SpillWriterDone {
+                    temp,
+                    offsets,
+                    write_time,
+                })
             })?;
         Ok(SpillState {
             tx: Some(tx),
+            max_batch_bytes,
             handle: Some(handle),
             #[cfg(test)]
             materialized_rows: 0,
@@ -1444,6 +1487,9 @@ impl SpillState {
     /// never the symptom).
     fn push(&mut self, batch: RecordBatch) -> Result<u64, ConvertError> {
         let bytes = batch.get_array_memory_size() as u64;
+        if let Some(max_batch) = &mut self.max_batch_bytes {
+            *max_batch = (*max_batch).max(bytes);
+        }
         #[cfg(test)]
         let rows = batch.column_by_name("geometry").map_or(0, |geometry| {
             (geometry.len() - geometry.null_count()) as u64
@@ -1482,10 +1528,16 @@ impl SpillState {
     /// folding the writer's core-seconds into `timers`. The returned
     /// [`NamedTempFile`] must be held until the reader is exhausted so the file
     /// is not unlinked mid-read (and is cleaned up on drop afterwards).
+    #[cfg(test)]
     fn into_reader(
-        mut self,
+        self,
         timers: &Pass2Timers,
     ) -> Result<(StreamReader<BufReader<File>>, NamedTempFile), ConvertError> {
+        self.into_indexed_reader(timers)
+            .and_then(|r| Ok((StreamReader::try_new(BufReader::new(r.file), None)?, r.temp)))
+    }
+
+    fn into_indexed_reader(mut self, timers: &Pass2Timers) -> Result<SpillReader, ConvertError> {
         // Dropping the sender is what ends the writer's `rx.iter()`; without it
         // the join below would never return.
         self.tx = None;
@@ -1496,8 +1548,11 @@ impl SpillState {
         spill_tests::record_spill(&done.temp, self.materialized_rows);
         Pass2Timers::add_dur(timers.spill_write_cell(), done.write_time);
         let read_handle = done.temp.reopen()?;
-        let reader = StreamReader::try_new(BufReader::new(read_handle), None)?;
-        Ok((reader, done.temp))
+        Ok(SpillReader {
+            file: read_handle,
+            temp: done.temp,
+            offsets: done.offsets,
+        })
     }
 }
 
@@ -1634,8 +1689,8 @@ pub(super) fn run_pass2_buffered(
         reason = "#817 B1, #852: per-call state shared with the read thread and the window"
     )]
     let (peak_batch, share) = (
-        AtomicU64::new(0),
-        AtomicBool::new(matches!(backing, SinkBacking::Ram) && num_levels > 1),
+        atomic::AtomicU64::new(0),
+        atomic::AtomicBool::new(matches!(backing, SinkBacking::Ram) && num_levels > 1),
     );
     #[cfg(test)]
     spill_tests::SHARING.with(|c| c.set(Some(share.load(Relaxed))));
@@ -1755,22 +1810,28 @@ pub(super) fn run_pass2_buffered(
     // ...and only what the process gave back below its peak RSS: freed input
     // the allocator kept is not free for the drain (bounded Moldova still
     // peaked 114 MiB higher on the input bytes alone). None off Linux.
-    let below_peak = super::procmem::read_proc_status()
-        .and_then(|m| Some(m.hwm_kib?.saturating_sub(m.rss_kib?) * 1024))
-        .unwrap_or(0);
+    let below_peak = drain_headroom();
     let held = peak_batch.into_inner().saturating_mul(in_flight as u64);
-    let width = MemoryBudget::drain_encodes(
+    let (width, mut decode_width, decode_bytes) = MemoryBudget::drain_widths(
         Grant {
             units: tuner.encode_cap(encode.units),
             ..encode
         },
         slot_bytes,
         held.min(read_granted),
+        LevelSink::largest_spill_batch(&sinks),
         below_peak,
         rayon::current_num_threads(),
     );
+    // One capped decode pool for all levels: caller-pool windows lost the
+    // measured gain (BRMT auto 2.94 s vs 2.17 s) and retained 427 MiB more RSS.
+    let decode_pool = crate::decode::decode_pool(decode_width).unwrap_or_else(|e| {
+        log::warn!("pass 2 drain: spill decode pool unavailable ({e}); decoding on one thread");
+        decode_width = 1;
+        None
+    });
     log::debug!(
-        "[profile] pass 2 drain: {width} encode(s) on {held} B ({below_peak} B below peak RSS)"
+        "[profile] pass 2 drain: {width} encode(s), {decode_width} decoder(s) on {held} B ({decode_bytes} B charged to existing grants; {below_peak} B below peak RSS)"
     );
     #[cfg(test)]
     spill_tests::DRAIN_WIDTH.with(|c| c.set(width));
@@ -1778,7 +1839,15 @@ pub(super) fn run_pass2_buffered(
     for li in 0..num_levels {
         let sink = std::mem::replace(&mut sinks[li], LevelSink::Ram(Vec::new()));
         let t_drain_level = Instant::now();
-        let outcome = drain_sink(writer, li, hints[li], sink, width, &timers)?;
+        let outcome = drain_sink(
+            writer,
+            li,
+            hints[li],
+            sink,
+            width,
+            (decode_width, decode_pool.as_ref()),
+            &timers,
+        )?;
         log::debug!(
             "[profile] level {li}: rows={} spill={:.2} MiB drain={:.2}s",
             rows[li],
@@ -1791,23 +1860,7 @@ pub(super) fn run_pass2_buffered(
     // releases the read grants they were priced against.
     writer.set_encode_concurrency(tuner.encode_cap(writer_units))?;
 
-    if let Some(per_row) = tuner.bytes_per_row() {
-        // #626: the number the up-front estimate could only guess at. Info
-        // level so a sizing regression is visible in an ordinary run log, not
-        // just in `TYLERTOO_PROFILE_JSON`.
-        log::info!(
-            "[convert] pass2 sink: measured {per_row} B per buffered row over {} buffered \
-             row(s) → {:.1} GiB for {} planned buffered row(s){}",
-            tuner.rows,
-            gib(tuner.projected_bytes()),
-            tuner.planned_rows,
-            if tuner.downgraded {
-                " (downgraded to spill mid-pass)"
-            } else {
-                ""
-            },
-        );
-    }
+    tuner.log_projection();
     timers.log_engine_summary(t_engine.elapsed().as_secs_f64(), rows.iter().sum());
     let levels = outcomes
         .into_iter()
@@ -1830,6 +1883,17 @@ pub(super) fn run_pass2_buffered(
     })
 }
 
+fn drain_headroom() -> u64 {
+    let below_peak = super::procmem::read_proc_status()
+        .and_then(|m| Some(m.hwm_kib?.saturating_sub(m.rss_kib?) * 1024))
+        .unwrap_or(0);
+    #[cfg(test)]
+    let below_peak = spill_tests::DRAIN_HEADROOM
+        .with(|c| c.get())
+        .unwrap_or(below_peak);
+    below_peak
+}
+
 /// Drain one level's sink into `writer.write_level`, timing the call into
 /// `timers.drain` (previously invisible: this runs serially, one level at a
 /// time, after the parallel read loop finishes). The RAM path is infallible;
@@ -1842,8 +1906,10 @@ fn drain_sink(
     hint: usize,
     sink: LevelSink,
     width: usize,
+    decode: (usize, Option<&rayon::ThreadPool>),
     timers: &Pass2Timers,
 ) -> Result<LevelWriteOutcome, ConvertError> {
+    let (decode_width, decode_pool) = decode;
     let t_drain = Instant::now();
     let outcome = match sink {
         LevelSink::Ram(batches) => {
@@ -1882,29 +1948,71 @@ fn drain_sink(
             // deliberately: excluding it would mean splitting the join out of
             // the drain timer and losing the (real) wall time the drain spends
             // waiting, which is the thing the drain counter exists to show.
-            let (reader, _temp) = state.into_reader(timers)?;
-            // #817 B1: the spill decodes on its own thread, so the writer's
-            // thread only feeds row groups (on Oregon roads the decode was
-            // most of what it did).
-            scoped_pipe(
-                SPILL_QUEUE_DEPTH,
-                move |tx: &Sender<Result<RecordBatch, ConvertError>>| -> Result<(), ConvertError> {
-                    for batch in reader {
-                        #[cfg(test)]
-                        spill_tests::note_decode();
-                        // A read error goes to the writer in order and ends
-                        // the level unwritten.
-                        let failed = batch.is_err();
-                        if tx.send(batch.map_err(ConvertError::from)).is_err() || failed {
-                            break; // on a writer failure, its error is reported
+            let SpillReader {
+                file,
+                temp: _temp,
+                offsets,
+            } = state.into_indexed_reader(timers)?;
+            let indexed = decode_width > 1 && offsets.as_ref().is_some_and(|o| o.len() > 2);
+            // A single output queue, the writer's batch and the admitted
+            // decoding jobs, charged to existing grants before widening encodes.
+            let depth = if indexed { 1 } else { SPILL_QUEUE_DEPTH };
+            // Capture the caller's pool. The helper only waits and sends;
+            // both receive and join on a worker help run the queued decodes.
+            rayon::in_place_scope(|scope| {
+                scoped_pipe(
+                    depth,
+                    move |tx: &Sender<Result<RecordBatch, ConvertError>>| {
+                        if let Some(offsets) = offsets.filter(|_| indexed) {
+                            let reader = Arc::new(IpcIndexedReader::try_new(file, offsets[0])?);
+                            // At most `decode_width` ranges are held at once.
+                            for first in (0..offsets.len() - 1).step_by(decode_width) {
+                                let ranges: Vec<_> = offsets[first..]
+                                    .windows(2)
+                                    .take(decode_width)
+                                    .map(|w| (w[0], w[1]))
+                                    .collect();
+                                let reader = Arc::clone(&reader);
+                                #[cfg(test)]
+                                let path = _temp.path().to_owned();
+                                let decode = move || {
+                                    process_window(&ranges, &|(start, end)| {
+                                        #[cfg(test)]
+                                        spill_tests::note_decode(&path, true);
+                                        reader.read_batch(*start, *end).map_err(ConvertError::from)
+                                    })
+                                };
+                                let decoded = match decode_pool {
+                                    Some(pool) => pool.install(decode),
+                                    None => run_on_pool(scope, decode),
+                                };
+                                for batch in decoded {
+                                    let failed = batch.is_err();
+                                    if tx.send(batch).is_err() || failed {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        } else {
+                            // Dictionary-bearing streams keep their ordered context.
+                            let reader = StreamReader::try_new(BufReader::new(file), None)?;
+                            for batch in reader {
+                                #[cfg(test)]
+                                spill_tests::note_decode(_temp.path(), false);
+                                let failed = batch.is_err();
+                                if tx.send(batch.map_err(ConvertError::from)).is_err() || failed {
+                                    break;
+                                }
+                            }
                         }
-                    }
-                    Ok(())
-                },
-                |rx: Receiver<Result<RecordBatch, ConvertError>>| {
-                    writer.write_level_from(level_idx, Some(hint), rx.into_iter())
-                },
-            )?
+                        Ok(())
+                    },
+                    |rx: Receiver<Result<RecordBatch, ConvertError>>| {
+                        let batches = std::iter::from_fn(|| recv_in_pool(&rx).ok());
+                        writer.write_level_from(level_idx, Some(hint), batches)
+                    },
+                )
+            })?
         }
     };
     Pass2Timers::add_dur(timers.drain_cell(), t_drain.elapsed());
@@ -1929,6 +2037,7 @@ mod spill_tests {
         std::sync::Mutex::new(std::collections::BTreeMap::new());
 
     thread_local! {
+        pub(super) static DRAIN_HEADROOM: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
         /// The last drain width set on this thread (#817 B1).
         pub(super) static DRAIN_WIDTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// The last tuner arming on this thread (#791 item 3): the budget
@@ -1942,25 +2051,51 @@ mod spill_tests {
         static DECODED_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    pub(super) fn note_decode() {
-        DECODED_HERE.with(|c| c.set(c.get() + 1));
+    #[derive(Default, Debug)]
+    struct DecodeObservations {
+        threads: std::collections::HashSet<std::thread::ThreadId>,
+        indexed: usize,
+        outside_pool: usize,
     }
 
-    /// #817 B1: a spilled level decodes on its own thread, not on the one
-    /// that feeds the writer (the drain's critical path: Oregon roads spent
-    /// 1.2 of its 1.5 core-seconds there decoding).
+    static DECODES: std::sync::Mutex<
+        std::collections::BTreeMap<std::path::PathBuf, DecodeObservations>,
+    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    pub(super) fn note_decode(path: &Path, indexed: bool) {
+        DECODED_HERE.with(|c| c.set(c.get() + 1));
+        if let Some(observed) = DECODES.lock().unwrap().get_mut(path.parent().unwrap()) {
+            observed.threads.insert(std::thread::current().id());
+            observed.indexed += usize::from(indexed);
+            observed.outside_pool += usize::from(!std::thread::current().name().is_some_and(|n| {
+                n.starts_with("spill-test-") || n.starts_with("tylertoo-decode-")
+            }));
+        }
+    }
+
+    /// Exercise real convert admission and the production drain call site.
+    /// Only RSS headroom is injected: process-global HWM is test-order dependent.
     #[test]
-    fn spill_decodes_off_the_draining_thread() {
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        let geoms: Vec<_> = (0..2000)
+    fn convert_spill_uses_multiple_decoders_and_serial_fallback() {
+        use arrow_array::StringArray;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        let output = dir.path().join("output.parquet");
+        let geoms: Vec<_> = (0..8192)
             .map(|i| {
-                let x = f64::from(i % 50) * 0.01;
-                let y = f64::from(i / 50) * 0.01;
-                Some(geo::Geometry::Point(geo::Point::new(x, y)))
+                Some(geo::Geometry::Point(geo::Point::new(
+                    f64::from(i % 128) * 0.01,
+                    f64::from(i / 128) * 0.01,
+                )))
             })
             .collect();
-        crate::overview::testutil::write_input(tin.path(), &geoms, true, None);
-        let tout = tempfile::NamedTempFile::new().unwrap();
+        let payload = Arc::new(StringArray::from(vec!["x".repeat(1024); geoms.len()]));
+        crate::overview::testutil::write_input_columns(
+            &input,
+            &geoms,
+            true,
+            vec![(Field::new("payload", DataType::Utf8, false), payload)],
+        );
         let options = crate::overview::convert::ConvertOptions {
             mode: Mode::Duplicating,
             levels: crate::overview::convert::LevelPlan::ZoomRange {
@@ -1968,11 +2103,182 @@ mod spill_tests {
                 max_zoom: 8,
             },
             profile: MemoryProfile::Bounded,
+            read_batch_size: 512,
+            in_flight_batches: 16,
+            spill_dir: Some(dir.path().to_owned()),
             ..Default::default()
         };
-        DECODED_HERE.with(|c| c.set(0));
-        crate::overview::convert::convert_to_overviews(tin.path(), tout.path(), &options).unwrap();
-        assert_eq!(DECODED_HERE.with(std::cell::Cell::get), 0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .thread_name(|i| format!("spill-test-{i}"))
+            .build()
+            .unwrap();
+        let mut parallel = None;
+        for fail_pool in [false, true] {
+            DECODES
+                .lock()
+                .unwrap()
+                .insert(dir.path().to_owned(), DecodeObservations::default());
+            pool.install(|| {
+                DRAIN_HEADROOM.with(|c| c.set(Some(1 << 30)));
+                crate::decode::FAIL_DECODE_POOL.with(|c| c.set(fail_pool));
+                let result =
+                    crate::overview::convert::convert_to_overviews(&input, &output, &options);
+                crate::decode::FAIL_DECODE_POOL.with(|c| c.set(false));
+                DRAIN_HEADROOM.with(|c| c.set(None));
+                result.unwrap();
+            });
+            let observed = DECODES.lock().unwrap().remove(dir.path()).unwrap();
+            eprintln!("real convert decoders (pool failure={fail_pool}): {observed:?}");
+            let bytes = std::fs::read(&output).unwrap();
+            if fail_pool {
+                assert_eq!(observed.indexed, 0, "failed pool must fall back to serial");
+                assert!(!observed.threads.is_empty(), "fallback must really decode");
+                assert_eq!(Some(bytes), parallel, "fallback changed output");
+            } else {
+                assert!(
+                    observed.indexed > 4,
+                    "multiple indexed windows must run: {observed:?}"
+                );
+                assert!(
+                    observed.threads.len() > 1,
+                    "more than one decoder must run: {observed:?}"
+                );
+                assert!(
+                    observed.threads.len() <= 4,
+                    "new decoder threads per level: {observed:?}"
+                );
+                assert_eq!(
+                    observed.outside_pool, 0,
+                    "decode escaped admitted pool: {observed:?}"
+                );
+                parallel = Some(bytes);
+            }
+        }
+    }
+
+    /// A one-worker caller must execute indexed jobs while waiting for
+    /// batches and while joining the producer after an error (#871).
+    #[test]
+    fn indexed_drain_reenters_one_worker_pool_on_success_and_error() {
+        use crate::overview::writer::{LevelSpec, OverviewWriterOptions};
+        use std::io::{Seek, SeekFrom, Write};
+        for threads in [1, 2] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("spill-test-{i}"))
+                .build()
+                .unwrap();
+            let (tx, done) = std::sync::mpsc::channel();
+            pool.spawn(move || {
+                let result = std::panic::catch_unwind(|| {
+                    for codec in [IpcCompression::None, IpcCompression::Lz4] {
+                        for corrupt in [false, true] {
+                            let dir = tempfile::tempdir().unwrap();
+                            let batches = super::drain_tests::indexed_batches();
+                            let schema = batches[0].schema();
+                            let mut state =
+                                SpillState::with_codec(&schema, Some(dir.path()), codec).unwrap();
+                            for batch in &batches {
+                                state.push(batch.clone()).unwrap();
+                            }
+                            if corrupt {
+                                state.tx = None;
+                                let mut spill = state.join().unwrap().unwrap();
+                                let offset = spill.offsets.as_ref().unwrap()[4];
+                                spill
+                                    .temp
+                                    .as_file_mut()
+                                    .seek(SeekFrom::Start(offset))
+                                    .unwrap();
+                                spill.temp.as_file_mut().write_all(&[0; 8]).unwrap();
+                                state.handle = Some(std::thread::spawn(move || Ok(spill)));
+                            }
+                            let output = dir.path().join("overview.parquet");
+                            let mut options = OverviewWriterOptions::new(
+                                Mode::Duplicating,
+                                vec![LevelSpec::new(super::super::level::gsd(2), Some(2))],
+                            );
+                            options.encode_concurrency = 1;
+                            options.max_row_group_size = 3;
+                            let mut writer =
+                                OverviewWriter::create(&output, &schema, options).unwrap();
+                            DECODES
+                                .lock()
+                                .unwrap()
+                                .insert(dir.path().to_owned(), DecodeObservations::default());
+                            // Force the indexed entry even with a one-worker caller.
+                            let result = drain_sink(
+                                &mut writer,
+                                0,
+                                14,
+                                LevelSink::Spill(state),
+                                1,
+                                (4, None),
+                                &Pass2Timers::default(),
+                            );
+                            assert_eq!(result.is_err(), corrupt, "{codec:?}");
+                            assert_eq!(writer.finish().is_err(), corrupt, "{codec:?}");
+                            let observed = DECODES.lock().unwrap().remove(dir.path()).unwrap();
+                            assert!(observed.indexed > 0, "indexed path was skipped");
+                            assert_eq!(observed.outside_pool, 0, "{observed:?}");
+                        }
+                    }
+                });
+                tx.send(result).unwrap();
+            });
+            done.recv_timeout(Duration::from_secs(10))
+                .expect("indexed drain deadlocked in caller's pool")
+                .unwrap();
+        }
+    }
+
+    /// Both serial and indexed decode stay off a plain draining thread.
+    /// Library callers already on a worker may help that same pool (#871).
+    #[test]
+    fn spill_decodes_off_the_draining_thread() {
+        use crate::overview::writer::{LevelSpec, OverviewWriterOptions};
+        for codec in [IpcCompression::None, IpcCompression::Lz4] {
+            for decode_width in [1, 4] {
+                let dir = tempfile::tempdir().unwrap();
+                let batches = super::drain_tests::indexed_batches();
+                let schema = batches[0].schema();
+                let mut state = SpillState::with_codec(&schema, Some(dir.path()), codec).unwrap();
+                for batch in &batches {
+                    state.push(batch.clone()).unwrap();
+                }
+                let options = OverviewWriterOptions::new(
+                    Mode::Duplicating,
+                    vec![LevelSpec::new(super::super::level::gsd(2), Some(2))],
+                );
+                let output = dir.path().join("overview.parquet");
+                let mut writer = OverviewWriter::create(&output, &schema, options).unwrap();
+                DECODES
+                    .lock()
+                    .unwrap()
+                    .insert(dir.path().to_owned(), DecodeObservations::default());
+                DECODED_HERE.with(|c| c.set(0));
+                let _ = drain_sink(
+                    &mut writer,
+                    0,
+                    14,
+                    LevelSink::Spill(state),
+                    1,
+                    (decode_width, None),
+                    &Pass2Timers::default(),
+                )
+                .unwrap();
+                writer.finish().unwrap();
+                let observed = DECODES.lock().unwrap().remove(dir.path()).unwrap();
+                assert!(!observed.threads.is_empty(), "decode counter must be live");
+                assert_eq!(observed.indexed > 0, decode_width > 1, "{codec:?}");
+                assert_eq!(
+                    DECODED_HERE.with(std::cell::Cell::get),
+                    0,
+                    "{codec:?}, {decode_width}"
+                );
+            }
+        }
     }
 
     /// #817 B1: the drain widens only on what the read held, not its grants,
@@ -2926,6 +3232,163 @@ mod drain_tests {
     use geoarrow::datatypes::GeometryType;
     use geoarrow_array::GeoArrowArray;
 
+    pub(super) fn indexed_batches() -> Vec<RecordBatch> {
+        (0..7)
+            .map(|i| {
+                let ids = [i * 2, i * 2 + 1];
+                let points = ids.map(|id| geo::Geometry::Point(geo::Point::new(id as f64, 0.0)));
+                let mut builder = GeometryBuilder::new(GeometryType::new(Default::default()))
+                    .with_prefer_multi(false);
+                builder.extend_from_iter(points.iter().map(Some));
+                let geometry = builder.finish();
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Int64, false),
+                        geometry.data_type().to_field("geometry", true),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(ids.to_vec())),
+                        geometry.to_array_ref(),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn spilled_batches(batches: &[RecordBatch], codec: IpcCompression) -> SpillState {
+        let mut state = SpillState::with_codec(&batches[0].schema(), None, codec).unwrap();
+        for batch in batches {
+            state.push(batch.clone()).unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn indexed_drain_preserves_serial_order_across_partial_windows() {
+        let batches = indexed_batches();
+        let schema = batches[0].schema();
+        for codec in [IpcCompression::None, IpcCompression::Lz4] {
+            let mut serial = None;
+            for decode_width in [1, 2, 3, 4] {
+                // Seven batches exercise multiple windows and a partial tail
+                // at every parallel width, for both private spill codecs.
+                let sink = LevelSink::Spill(spilled_batches(&batches, codec));
+                let tmp = tempfile::NamedTempFile::new().unwrap();
+                let mut options = OverviewWriterOptions::new(
+                    Mode::Duplicating,
+                    vec![LevelSpec::new(gsd(2), Some(2))],
+                );
+                options.encode_concurrency = 2;
+                options.max_row_group_size = 3;
+                let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
+                let _ = drain_sink(
+                    &mut writer,
+                    0,
+                    14,
+                    sink,
+                    2,
+                    (decode_width, None),
+                    &Pass2Timers::default(),
+                )
+                .unwrap();
+                writer.finish().unwrap();
+                let builder = tylertoo_io::open_parquet(File::open(tmp.path()).unwrap()).unwrap();
+                let layout: Vec<_> = builder
+                    .metadata()
+                    .row_groups()
+                    .iter()
+                    .map(|group| group.num_rows())
+                    .collect();
+                let reader = builder.build().unwrap();
+                let ids: Vec<i64> = reader
+                    .flat_map(|batch| {
+                        batch
+                            .unwrap()
+                            .column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                assert_eq!(
+                    ids,
+                    (0..14).collect::<Vec<_>>(),
+                    "{codec:?}, {decode_width}"
+                );
+                let actual = (layout, ids);
+                if let Some(serial) = &serial {
+                    assert_eq!(&actual, serial, "{codec:?}, {decode_width}");
+                } else {
+                    serial = Some(actual);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_drain_reports_first_corruption_before_later_truncation() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let batches = indexed_batches();
+        let schema = batches[0].schema();
+        for codec in [IpcCompression::None, IpcCompression::Lz4] {
+            for decode_width in [2, 3, 4] {
+                // Both failures are in the same window at every width. The
+                // second can finish decoding first, but must not win.
+                let mut state = spilled_batches(&batches, codec);
+                state.tx = None;
+                let mut done = state.join().unwrap().unwrap();
+                let offsets = done.offsets.as_ref().unwrap();
+                assert_eq!(offsets.len(), 8);
+                done.temp
+                    .as_file_mut()
+                    .seek(SeekFrom::Start(offsets[4]))
+                    .unwrap();
+                done.temp.as_file_mut().write_all(&[0; 8]).unwrap();
+                done.temp
+                    .as_file()
+                    .set_len(offsets[5] + (offsets[6] - offsets[5]) / 2)
+                    .unwrap();
+                let error_at = |index: usize| {
+                    IpcIndexedReader::try_new(done.temp.reopen().unwrap(), offsets[0])
+                        .unwrap()
+                        .read_batch(offsets[index], offsets[index + 1])
+                        .unwrap_err()
+                        .to_string()
+                };
+                let first = error_at(4);
+                let later = error_at(5);
+                assert_ne!(first, later, "distinct faults make error order observable");
+                state.handle = Some(std::thread::spawn(move || Ok(done)));
+                let tmp = tempfile::NamedTempFile::new().unwrap();
+                let options = OverviewWriterOptions::new(
+                    Mode::Duplicating,
+                    vec![LevelSpec::new(gsd(2), Some(2))],
+                );
+                let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
+                let error = drain_sink(
+                    &mut writer,
+                    0,
+                    14,
+                    LevelSink::Spill(state),
+                    1,
+                    (decode_width, None),
+                    &Pass2Timers::default(),
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains(&first),
+                    "{codec:?}, {decode_width}: {error}"
+                );
+                assert!(writer.finish().is_err(), "a failed level must not finish");
+            }
+        }
+    }
+
     /// #852 review F3: a level batch that fails to rebuild in the drain ends
     /// its level unwritten. The level was finished short before, with the
     /// rows rebuilt ahead of the failure, and the file could still be
@@ -2973,7 +3436,15 @@ mod drain_tests {
         let options =
             OverviewWriterOptions::new(Mode::Duplicating, vec![LevelSpec::new(gsd(2), Some(2))]);
         let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
-        let drained = drain_sink(&mut writer, 0, 12, sink, 1, &Pass2Timers::default());
+        let drained = drain_sink(
+            &mut writer,
+            0,
+            12,
+            sink,
+            1,
+            (1, None),
+            &Pass2Timers::default(),
+        );
         assert!(drained.is_err());
         assert!(writer.finish().is_err(), "the short level was finished");
     }

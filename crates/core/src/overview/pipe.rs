@@ -266,7 +266,7 @@ pub(super) fn run_on_pool<'scope, R: Send + 'scope>(
     }
 }
 
-fn process_window<T: Sync, R: Send, E: Send>(
+pub(super) fn process_window<T: Sync, R: Send, E: Send>(
     items: &[T],
     process: &(impl Fn(&T) -> Result<R, E> + Sync),
 ) -> Vec<Result<R, E>> {

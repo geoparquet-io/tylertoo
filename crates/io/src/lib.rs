@@ -14,7 +14,10 @@ mod untrusted;
 mod writer;
 
 pub use input::RemoteObjectMeta;
-pub use ipc::{IpcCompression, IpcFileWriter, IpcStreamReader, IpcStreamWriter};
+pub use ipc::{
+    IpcCompression, IpcFileWriter, IpcIndexedReader, IpcStreamReader, IpcStreamWriter,
+    IPC_CODEC_SCRATCH_BYTES,
+};
 pub use untrusted::{
     byte_array_limit, check_byte_array_ceiling, concat_prefix_rows, decode_footer,
     decoded_batch_limit, decoded_input_bytes, input_error, largest_byte_array_column,
@@ -23,7 +26,9 @@ pub use untrusted::{
     LargestByteArrayColumn, ParquetSource, ReaderMetadata, UntrustedBatchReader,
     UntrustedIpcReader, BYTE_ARRAY_BATCH_LIMIT, DEFAULT_BATCH_ROWS,
 };
-pub use writer::{batch_writer, overview_writer, BatchWriter, OverviewWriteOptions};
+pub use writer::{
+    batch_writer, overview_writer, BatchWriter, OverviewCompression, OverviewWriteOptions,
+};
 
 /// Parallel overview encoding maps Arrow arrays to Parquet leaves with this function.
 pub use parquet::arrow::arrow_writer::compute_leaves;

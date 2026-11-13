@@ -81,9 +81,10 @@ use thiserror::Error;
 /// crate cannot build them with a struct literal; they start from
 /// `Default` and chain these setters. The `const` destructures the struct
 /// with every listed field, so a field added without a setter fails to
-/// compile.
+/// compile. A crate-private field is listed under `internal` instead: it is
+/// destructured too, but gets no public setter.
 macro_rules! with_setters {
-    ($ty:ident { $($setter:ident => $field:ident: $fty:ty,)* }) => {
+    ($ty:ident { $($setter:ident => $field:ident: $fty:ty,)* } $(internal { $($internal:ident,)* })?) => {
         impl $ty {
             $(
                 #[doc = concat!("Set [`", stringify!($field), "`](Self::", stringify!($field), ").")]
@@ -95,7 +96,7 @@ macro_rules! with_setters {
             )*
         }
         const _: fn($ty) = |options| {
-            let $ty { $($field: _,)* } = options;
+            let $ty { $($field: _,)* $($($internal: _,)*)? } = options;
         };
     };
 }
@@ -108,6 +109,7 @@ mod vector_tile {
 mod archive_index;
 mod atomic_output;
 mod batch_processor;
+mod box_pairs;
 mod clip;
 mod compression;
 mod covering;
@@ -165,7 +167,7 @@ pub use overview::{
     properties::{PropertySelection, PropertySelectionError},
     reader::ReaderError,
     simplify::{CollapseMode, Representation, SimplifyOptions},
-    writer::{RowGroupSizePolicy, WriterError},
+    writer::{OverviewCodec, RowGroupSizePolicy, WriterError},
 };
 // Export: overview GeoParquet -> PMTiles.
 pub use overview::export::{

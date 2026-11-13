@@ -172,6 +172,8 @@ impl DiskFootprint {
                     raw.bytes(copies(buffered), buffered),
                 );
             }
+            // Raw bytes: an upper bound for either temp codec and a kept
+            // ZSTD overview alike.
             footprint.add(
                 output
                     .parent()

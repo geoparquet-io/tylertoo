@@ -60,7 +60,9 @@ These are budget calculations, not a promise about total process memory.
 - `bounded` spills output and caps readers at 4 and queues at 16 batches
   per reader. Row-group encodes start with at most 4. The buffered drain can
   add encodes using released batch memory, limited by headroom below the
-  prior RSS peak and the thread count.
+  prior RSS peak and the thread count. The drain can also decode up to 4 spilled batches at once, funded by
+  `MemoryBudget::drain_widths` from existing grants: the encode grant above
+  its floor, then the finished read's.
 - `speed` takes the requested concurrency and keeps output in RAM.
 
 All profiles retain minimum working units. A read or compute window needs
@@ -205,7 +207,10 @@ prices at least one WKB chunk of rows. During the buffered drain,
 `MemoryBudget::drain_encodes` can reuse memory the finished read and
 compute window held. Reuse stops at their grants or the RSS headroom
 below the prior peak. It adds only the slots that fit, up to the thread
-count. These are admission estimates, not measured peaks.
+count. Before that, `MemoryBudget::drain_widths` funds up to 4 indexed
+spill decoders from the same grants. It prices each window at the largest
+spilled batch plus codec scratch, for the decoders and 2 more batches, plus
+the decoder stacks. These are admission estimates, not measured peaks.
 
 ### Export: tile counts and active members
 
@@ -852,6 +857,25 @@ $G check  $A --cells moldova-tiles --inject-threads 1   # (iii) demo: must fail,
 All of this is collected only while `TYLERTOO_PROFILE_JSON` is set, and it
 never changes output bytes.
 
+#### Accepted limits (#813)
+
+Measured on 2026-11-12 on the 64-core Neoverse-V1 host at origin/main
+a0916f04. These limits stay as they are:
+
+- Export `levels` is the top phase that does not scale, on every cell.
+  Perfect scaling from 32 to 64 workers would save 22–28% of wall on the
+  default cells.
+- At 64 workers Moldova runs 454 G instructions, against 380 G at 32. IPC
+  falls from 2.6 at 8 threads to 2.3 at 32 and 1.8 at 64.
+- Measured and ruled out: the `glibc` allocator instead of mimalloc, the
+  mimalloc purge delay, larger queues, eager rayon sleep (+14% wall), core
+  affinity, sibling hardware threads, and memory-node placement.
+- More pass-2 readers cut pass 2 by 16–20% on line and wide-property inputs,
+  but raise peak RSS by about 75–107 MiB. The reader count and the default
+  worker cap of 40 stay.
+- Export finalize used to stall on one `fdatasync` of the whole archive. On
+  Linux the archive is now written back while export runs.
+
 ### Export phase (#535)
 
 `export::export_pmtiles` (the `export-pmtiles` CLI subcommand, the second
@@ -876,7 +900,9 @@ missing export line after a failed run is expected, not a profiling bug.
       "fill": 1.92,                // partitioning single-read fill; 0.0 in
                                    // duplicating mode (see below)
       "levels": 2.87,              // every level's wave loop + checkpoints
-      "finalize": 0.08,            // writer.finalize()
+      "finalize": 0.08,            // writer.finalize(): mostly the archive's
+                                   // last fdatasync, of what background
+                                   // writeback has not yet written
       "total": 4.95                // the whole export
     },
     "stage_secs": {                // CORE-SECONDS (see the callout below)

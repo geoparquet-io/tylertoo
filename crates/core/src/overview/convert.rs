@@ -911,6 +911,13 @@ pub struct ConvertOptions {
     #[serde(skip)]
     #[cfg_attr(feature = "cli", arg(skip = Self::default().cell_bands))]
     pub cell_bands: Option<String>,
+    /// The overview's codec. The `tiles` facade sets
+    /// [`TilesOptions::temp_compression`](crate::TilesOptions::temp_compression)
+    /// here for its temp intermediate; a kept overview stays ZSTD. Default
+    /// [`OverviewCodec::Zstd`](crate::OverviewCodec::Zstd).
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = crate::OverviewCodec::Zstd))]
+    pub(crate) overview_codec: crate::OverviewCodec,
     /// Materialize only the levels at or coarser than this zoom (#541): the
     /// **coarse job**'s half of a sharded build, on the convert side.
     ///
@@ -998,6 +1005,8 @@ with_setters!(ConvertOptions {
     with_shard_plan_digest => shard_plan_digest: Option<String>,
     with_cell_bands => cell_bands: Option<String>,
     with_zoom_ceiling => zoom_ceiling: Option<u8>,
+} internal {
+    overview_codec,
 });
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -1655,6 +1664,7 @@ impl Default for ConvertOptions {
             shard: None,
             shard_plan_digest: None,
             cell_bands: None,
+            overview_codec: crate::OverviewCodec::Zstd,
             zoom_ceiling: None,
         }
     }
@@ -10065,12 +10075,12 @@ mod tests {
         // (3) Row for row, geometry for geometry.
         let full_rdr = OverviewReader::open(&full_out).unwrap();
         let capped_rdr = OverviewReader::open(&capped_out).unwrap();
-        for level in 0..capped.levels.len() {
+        for (level, spec) in capped.levels.iter().enumerate() {
             assert_eq!(
                 read_level_rows(&capped_rdr, level),
                 read_level_rows(&full_rdr, level),
                 "level {level} (z{:?}) differs between the capped and full runs",
-                capped.levels[level].zoom
+                spec.zoom
             );
         }
 

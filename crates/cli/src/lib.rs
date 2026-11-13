@@ -8,11 +8,7 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use indicatif::{HumanBytes, HumanCount};
 use std::path::{Path, PathBuf};
-#[expect(
-    clippy::disallowed_types,
-    reason = "#452: immutable CLI quiet setting shared by status output"
-)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{self, Ordering};
 use tylertoo_core::internal::error::{Classify, ErrorKind};
 use tylertoo_core::internal::input::redact_query;
 use tylertoo_core::internal::overview::auto_zoom::MaxZoom;
@@ -30,7 +26,7 @@ use tylertoo_core::TilesetMetadata as TilesetMetadataArgs;
     clippy::disallowed_types,
     reason = "#452: immutable CLI quiet setting shared by status output"
 )]
-static QUIET: AtomicBool = AtomicBool::new(false);
+static QUIET: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 /// `println!` for the status and summary lines of a subcommand that writes
 /// a file, which `--quiet` silences. What `stats` and `validate` print is
@@ -2801,6 +2797,17 @@ mod tests {
         assert!(parse_tiles(&[]).keep_overview.is_none());
         let a = parse_tiles(&["--keep-overview", "ov.parquet"]);
         assert_eq!(a.keep_overview, Some(PathBuf::from("ov.parquet")));
+    }
+
+    /// `--temp-compression` defaults to `lz4` and reaches the tiles options,
+    /// which hand it to the intermediate's writer.
+    #[test]
+    fn tiles_temp_compression_flag_parses() {
+        use tylertoo_core::OverviewCodec;
+        let codec = |flags: &[&str]| tiles_options(&parse_tiles(flags)).unwrap().temp_compression;
+        assert_eq!(codec(&[]), OverviewCodec::Lz4);
+        assert_eq!(codec(&["--temp-compression", "zstd"]), OverviewCodec::Zstd);
+        assert_eq!(codec(&["--temp-compression", "lz4"]), OverviewCodec::Lz4);
     }
 
     /// #317 / #279: the representation selector and the square disposition

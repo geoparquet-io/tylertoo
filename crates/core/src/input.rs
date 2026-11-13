@@ -936,16 +936,8 @@ pub(crate) mod remote {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::ops::Range;
     use std::path::{Path, PathBuf};
-    #[expect(
-        clippy::disallowed_types,
-        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
-    )]
-    use std::sync::atomic::{AtomicU64, Ordering};
-    #[expect(
-        clippy::disallowed_types,
-        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
-    )]
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
 
     use bytes::Bytes;
     use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential};
@@ -985,7 +977,7 @@ pub(crate) mod remote {
             clippy::disallowed_types,
             reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
         )]
-        static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         RT.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -1005,12 +997,12 @@ pub(crate) mod remote {
         reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
     )]
     struct SharedState {
-        requests: AtomicU64,
-        bytes: AtomicU64,
+        requests: std::sync::atomic::AtomicU64,
+        bytes: std::sync::atomic::AtomicU64,
         ranges: Mutex<Vec<Range<u64>>>,
         /// Byte ranges of every column chunk, sorted by start; populated
         /// from the parsed footer on first open.
-        chunk_ranges: OnceLock<Vec<Range<u64>>>,
+        chunk_ranges: std::sync::OnceLock<Vec<Range<u64>>>,
         /// The object's tail (footer + 8-byte trailer) and where it starts,
         /// fetched ahead by [`prefetch_footers`]; served to the footer parse,
         /// then dropped with the prefetch admission's permits for its bytes.
@@ -1086,7 +1078,7 @@ pub(crate) mod remote {
             clippy::disallowed_types,
             reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
         )]
-        static STORES: OnceLock<Mutex<StoreCache>> = OnceLock::new();
+        static STORES: std::sync::OnceLock<Mutex<StoreCache>> = std::sync::OnceLock::new();
 
         let shown = redact_query(url_str);
         let url = Url::parse(url_str)
@@ -1212,9 +1204,9 @@ pub(crate) mod remote {
         clippy::disallowed_types,
         reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
     )]
-    static HTTP_CLIENTS: OnceLock<
+    static HTTP_CLIENTS: std::sync::OnceLock<
         Mutex<std::collections::HashMap<String, (StoreEnv, HttpClient)>>,
-    > = OnceLock::new();
+    > = std::sync::OnceLock::new();
 
     impl HttpConnector for QueryConnector {
         fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
@@ -4812,17 +4804,13 @@ pub fn fuzz_remote_footer(bytes: &[u8]) -> Result<usize, InputError> {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::ObjectStoreExt;
-    #[expect(
-        clippy::disallowed_types,
-        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
-    )]
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     #[expect(
         clippy::disallowed_types,
         reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
     )]
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     let rt = RT.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
             .build()

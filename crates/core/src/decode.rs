@@ -699,17 +699,40 @@ const CHUNK_BYTES: usize = 2 << 20;
 /// Most threads that decode and encode. Each thread keeps its allocator
 /// high-water for the rest of the run, so peak RSS grows with the threads
 /// used, not the work (#817); 16 is where more threads stop buying wall.
-const DECODE_THREADS: usize = 16;
+pub(crate) const DECODE_THREADS: usize = 16;
 
-/// A pool of at most [`DECODE_THREADS`] workers for decoding tile bodies, or
-/// `None` when the current pool is already that small. `stats --layers`
-/// decodes on it too, so a crafted archive cannot inflate one 64 MiB body
-/// per core at once.
-pub(crate) fn decode_pool() -> Result<Option<rayon::ThreadPool>, rayon::ThreadPoolBuildError> {
-    let threads = rayon::current_num_threads().min(DECODE_THREADS);
-    (threads < rayon::current_num_threads())
-        .then(|| rayon::ThreadPoolBuilder::new().num_threads(threads).build())
-        .transpose()
+/// Explicit worker stack size, also charged by spill-drain admission.
+pub(crate) const DECODE_THREAD_STACK_BYTES: usize = 2 << 20;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_DECODE_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A decode pool capped by both `max_threads` and [`DECODE_THREADS`], or
+/// `None` when serial or the caller's pool is already small enough. Tile
+/// decode, layer stats and the entire buffered spill drain share this owner.
+pub(crate) fn decode_pool(
+    max_threads: usize,
+) -> Result<Option<rayon::ThreadPool>, rayon::ThreadPoolBuildError> {
+    let threads = rayon::current_num_threads().min(max_threads.clamp(1, DECODE_THREADS));
+    if threads <= 1 || threads == rayon::current_num_threads() {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    if FAIL_DECODE_POOL.with(std::cell::Cell::get) {
+        return rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .spawn_handler(|_| Err(std::io::Error::other("injected decode pool failure")))
+            .build()
+            .map(Some);
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .stack_size(DECODE_THREAD_STACK_BYTES)
+        .thread_name(|i| format!("tylertoo-decode-{i}"))
+        .build()
+        .map(Some)
 }
 
 /// Most tiles per chunk, whatever their bytes: a run of empty tile bodies
@@ -768,7 +791,8 @@ where
     let decoded_cap = CHUNK_DECODED_OVERRIDE
         .with(|c| c.get())
         .unwrap_or(decoded_cap);
-    let pool = decode_pool().map_err(|e| DecodeError::Write(format!("decode thread pool: {e}")))?;
+    let pool = decode_pool(DECODE_THREADS)
+        .map_err(|e| DecodeError::Write(format!("decode thread pool: {e}")))?;
     let mut job: Option<J> = None;
     let run = |job: Option<J>| job.map_or(Ok(()), |job| job());
     // Every job runs on the capped pool, the last one included.

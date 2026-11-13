@@ -27,11 +27,7 @@ use std::collections::BinaryHeap;
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-#[expect(
-    clippy::disallowed_types,
-    reason = "#779: per-archive byte accounting shared by positioned readers"
-)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{self, Ordering};
 
 use crate::compression::{self, MAX_INTERNAL_BYTES};
 use crate::pmtiles_writer::{
@@ -209,7 +205,7 @@ pub fn usable_bounds(header: &Header) -> Option<TileBounds> {
 pub(crate) struct FileBytes {
     file: File,
     len: u64,
-    bytes_read: AtomicU64,
+    bytes_read: atomic::AtomicU64,
 }
 
 impl FileBytes {
@@ -224,7 +220,7 @@ impl FileBytes {
         Ok(FileBytes {
             file,
             len,
-            bytes_read: AtomicU64::new(0),
+            bytes_read: atomic::AtomicU64::new(0),
         })
     }
 }

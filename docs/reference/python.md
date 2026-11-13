@@ -569,6 +569,7 @@ convert(
     partition_wave: int = 0,
     feature_id: str | None = None,
     keep_overview: str | os.PathLike[str] | None = None,
+    temp_compression: Literal['lz4', 'zstd'] = "lz4",
     tile_range: str | None = None,
     gsd_base: float = 1024.0,
     sort_key: str | None = None,
@@ -656,6 +657,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `partition_wave`: See `export_pmtiles()`.
 * `feature_id`: See `export_pmtiles()`.
 * `keep_overview`: Keep the intermediate overview file at this path instead of removing it. Its directory must exist.
+* `temp_compression`: Compression of the temporary intermediate overview, `"lz4"` (default) or `"zstd"`. `"zstd"` writes a file about a third smaller for 5-7% more CPU. No effect with `keep_overview`, whose file is always ZSTD.
 * `tile_range`: See `export_pmtiles()`.
 * `gsd_base`: See `overview()`.
 * `sort_key`: See `overview()`.

@@ -88,6 +88,20 @@ pub const LEVEL_COLUMN: &str = "level";
 /// Default ZSTD compression level (spec §4.5 recommends ZSTD).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
+/// The codec of an overview file's column chunks.
+///
+/// ZSTD at [`OverviewWriterOptions::zstd_level`], or LZ4 (`LZ4_RAW`) for a
+/// temporary intermediate (`tiles --temp-compression`). LZ4 saves 5-7% of a `tiles`
+/// run's user CPU for a file 1.4-1.6x larger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+pub enum OverviewCodec {
+    // No doc comments: clap would print them as per-value help.
+    Lz4,
+    Zstd,
+}
+
 /// Default maximum row-group size in rows (§4.5, configurable).
 pub const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 10_000;
 
@@ -248,6 +262,8 @@ pub struct OverviewWriterOptions {
     /// (the bounded envelope). Convert sets it for `auto` and `speed`.
     /// Default `false`.
     pub overlap_levels: bool,
+    /// The column chunks' codec. Default [`OverviewCodec::Zstd`].
+    pub codec: OverviewCodec,
 }
 
 impl OverviewWriterOptions {
@@ -268,6 +284,7 @@ impl OverviewWriterOptions {
             primary_column: None,
             source_is_subset: false,
             overlap_levels: false,
+            codec: OverviewCodec::Zstd,
         }
     }
 }
@@ -608,7 +625,10 @@ impl<W: Write + Send> OverviewWriter<W> {
         let target_schema = encoder.target_schema();
 
         let io_options = tylertoo_io::OverviewWriteOptions {
-            zstd_level: options.zstd_level,
+            compression: match options.codec {
+                OverviewCodec::Zstd => tylertoo_io::OverviewCompression::Zstd(options.zstd_level),
+                OverviewCodec::Lz4 => tylertoo_io::OverviewCompression::Lz4,
+            },
             full_column_stats: options.full_column_stats,
             geometry_columns: geometry_columns.clone(),
             covering_columns: geometry_columns

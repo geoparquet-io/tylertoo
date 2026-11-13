@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow_array::{BinaryArray, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use tylertoo_io::{open_parquet, overview_writer, OverviewWriteOptions};
+use tylertoo_io::{open_parquet, overview_writer, OverviewCompression, OverviewWriteOptions};
 
 #[test]
 fn overview_writer_preserves_pruning_statistics_and_manual_row_groups() {
@@ -22,7 +22,7 @@ fn overview_writer_preserves_pruning_statistics_and_manual_row_groups() {
     .unwrap();
     for full_column_stats in [false, true] {
         let options = OverviewWriteOptions {
-            zstd_level: 3,
+            compression: OverviewCompression::Zstd(3),
             full_column_stats,
             geometry_columns: vec!["shape".into()],
             covering_columns: vec!["shape_bbox".into()],
@@ -48,7 +48,7 @@ fn overview_writer_rejects_invalid_compression_before_writing() {
     let schema = Arc::new(Schema::empty());
     let mut bytes = Vec::new();
     let options = OverviewWriteOptions {
-        zstd_level: i32::MAX,
+        compression: OverviewCompression::Zstd(i32::MAX),
         full_column_stats: false,
         geometry_columns: vec![],
         covering_columns: vec![],
