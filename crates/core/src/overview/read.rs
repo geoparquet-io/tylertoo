@@ -97,6 +97,11 @@ struct ReadShape {
     workers: usize,
     depth: usize,
     segment_target_rows: usize,
+    /// Threads each worker decodes a batch's columns on
+    /// ([`MemoryBudget::read_decode_plan`]).
+    decode_threads: usize,
+    /// Read batches those threads are charged as.
+    decode_units: usize,
 }
 
 /// What one resident read batch costs (#716).
@@ -164,6 +169,7 @@ pub(super) fn grant_read_ahead(
     let batches = shape
         .workers
         .saturating_mul(shape.depth.saturating_add(reader_batches(tuning)))
+        .saturating_add(shape.decode_units)
         .saturating_add(channel);
     budget.fit(
         tuning.profile,
@@ -303,17 +309,28 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     let depth = (affordable / workers)
         .saturating_sub(reader)
         .clamp(READ_AHEAD_MIN_BATCHES, max_depth);
+    let decode = tuning.budget.read_decode_plan(
+        tuning.profile,
+        workers,
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        read_batch_price(tuning),
+        workers.saturating_mul(depth.saturating_add(reader)),
+    );
     ReadShape {
         workers,
         depth,
         segment_target_rows: depth.saturating_sub(1).max(1).saturating_mul(batch_size),
+        decode_threads: decode.threads,
+        decode_units: decode.units,
     }
 }
 
 impl ReadShape {
     /// This shape with its depth held to `max_depth` (never below
     /// [`READ_AHEAD_MIN_BATCHES`]) and its segments to what that queue holds,
-    /// as [`resolve_read_shape`] sizes them.
+    /// as [`resolve_read_shape`] sizes them. Its readers decode on one
+    /// thread each: a consumer slower than its readers gains nothing from
+    /// column-split decode (#876).
     fn capped(self, max_depth: Option<usize>, batch_size: usize) -> Self {
         let Some(max) = max_depth else {
             return self;
@@ -322,6 +339,8 @@ impl ReadShape {
         Self {
             depth,
             segment_target_rows: depth.saturating_sub(1).max(1).saturating_mul(batch_size),
+            decode_threads: 1,
+            decode_units: 0,
             ..self
         }
     }
@@ -354,6 +373,13 @@ thread_local! {
     /// Reader threads the calling thread's last [`read_in_order`] used: 1
     /// for a sequential read (test counter, #544).
     static LAST_READ_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Decode threads per reader the calling thread's last parallel
+    /// [`read_in_order`] used (test counter, #876).
+    static LAST_READ_DECODE_THREADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`LAST_READ_WORKERS`] on this thread (test seam for other modules).
@@ -459,6 +485,8 @@ where
     let workers = shape.workers.min(segments.len());
     #[cfg(test)]
     LAST_READ_WORKERS.with(|w| w.set(workers));
+    #[cfg(test)]
+    LAST_READ_DECODE_THREADS.with(|w| w.set(shape.decode_threads));
     log::info!(
         "[convert] read: {workers} reader thread(s) over {} segment(s) \
          (~{} row(s) each, {} read-ahead batch(es) per reader)",
@@ -487,7 +515,7 @@ where
         projection,
         batch_size,
         workers,
-        shape.depth,
+        shape,
         &mut on_batch,
     )
 }
@@ -612,12 +640,13 @@ fn read_in_parallel<F>(
     projection: Option<&[usize]>,
     batch_size: usize,
     workers: usize,
-    depth: usize,
+    shape: ReadShape,
     on_batch: &mut F,
 ) -> Result<(), ConvertError>
 where
     F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
 {
+    let (depth, decode_threads) = (shape.depth, shape.decode_threads);
     std::thread::scope(|scope| -> Result<(), ConvertError> {
         // Receivers live in THIS frame, so returning by any path — including
         // an unwind — drops them before the scope joins, releasing any worker
@@ -632,7 +661,13 @@ where
                 .name(format!("tylertoo-read-{w}"))
                 .spawn_scoped(scope, move || {
                     read_segments_for_worker(
-                        source, segments, projection, batch_size, workers, w, &tx,
+                        source,
+                        segments,
+                        projection,
+                        (batch_size, decode_threads),
+                        workers,
+                        w,
+                        &tx,
                     )
                 })?;
         }
@@ -735,14 +770,15 @@ fn read_segments_for_worker(
     source: &ConvertSource,
     segments: &[ReadSegment],
     projection: Option<&[usize]>,
-    batch_size: usize,
+    (batch_size, decode_threads): (usize, usize),
     workers: usize,
     w: usize,
     tx: &Sender<SegMsg>,
 ) {
     let mut seq = w;
     while seq < segments.len() {
-        let mut stream = match source.open_segment(&segments[seq], projection, batch_size) {
+        let opened = source.open_segment(&segments[seq], projection, batch_size, decode_threads);
+        let mut stream = match opened {
             Ok(s) => s,
             Err(e) => {
                 let _ = tx.send(SegMsg::Err(e.into()));
@@ -1203,6 +1239,75 @@ mod read_tests {
         }
     }
 
+    /// #876: a local segment decoded on three threads, column splits
+    /// reading one file handle at once, yields the batches one thread
+    /// does. Parquet's own `File` reader seeks the offset every clone of
+    /// the handle shares, so concurrent splits over it read wrong pages.
+    #[test]
+    fn a_local_segment_decodes_the_same_batches_on_several_threads() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use arrow_array::StringArray;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.parquet");
+        let rows = 3_000_i64;
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        for i in 0..rows {
+            for j in 0..i % 5 {
+                tags.values().append_value(format!("tag-{j}-{}", i % 11));
+            }
+            tags.append(true);
+        }
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(0..rows)) as ArrayRef,
+            ),
+            (
+                "name",
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|i| format!("name-{}", i * 7919 % 1_000)),
+                )) as ArrayRef,
+            ),
+            ("tags", Arc::new(tags.finish()) as ArrayRef),
+            (
+                "rank",
+                Arc::new(Int64Array::from_iter_values((0..rows).map(|i| i * 31 % 97))) as ArrayRef,
+            ),
+            // Wide enough that a 256-row decode splits its columns.
+            (
+                "note",
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|i| format!("{i:01500}")),
+                )) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(500))
+            .set_data_page_row_count_limit(64)
+            .set_write_batch_size(64)
+            .build();
+        let mut w = ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+            .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        let segments = source.read_segments(None, usize::MAX).unwrap();
+        assert_eq!(segments.len(), 1);
+        let read = |threads: usize| -> Vec<RecordBatch> {
+            source
+                .open_segment(&segments[0], None, 256, threads)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let one = read(1);
+        assert_eq!(one.iter().map(RecordBatch::num_rows).sum::<usize>(), 3_000);
+        for _ in 0..5 {
+            assert_eq!(read(3), one);
+        }
+    }
+
     /// #857: six 100-row groups, each with its own 100 `Dictionary(Int8, _)`
     /// values. The reader plans 128-row batches; a merge regrouping to the
     /// 8,192 rows asked for would join 600 distinct values and overflow.
@@ -1634,10 +1739,15 @@ mod read_tests {
             workers: 4,
             depth: READ_AHEAD_MAX_BATCHES,
             segment_target_rows: (READ_AHEAD_MAX_BATCHES - 1) * 100,
+            decode_threads: 4,
+            decode_units: 12,
         };
         assert_eq!(shape.capped(None, 100), shape);
         let capped = shape.capped(Some(6), 100);
         assert_eq!((capped.workers, capped.depth), (4, 6));
+        // #876: a consumer slower than its readers gains nothing from
+        // column-split decode, so a capped read decodes on one thread.
+        assert_eq!((capped.decode_threads, capped.decode_units), (1, 0));
         assert_eq!(capped.segment_target_rows, 500);
         assert_eq!(shape.capped(Some(1), 100).depth, READ_AHEAD_MIN_BATCHES);
     }
@@ -1793,11 +1903,16 @@ mod read_tests {
         let tight = bounded(8, 2 << 30);
         assert_eq!(
             tight,
-            resolve_read_shape(ReadTuning {
-                workers: 8,
-                profile: MemoryProfile::Auto,
-                ..small
-            }),
+            ReadShape {
+                // `bounded` decodes on one thread per reader (#876).
+                decode_threads: 1,
+                decode_units: 0,
+                ..resolve_read_shape(ReadTuning {
+                    workers: 8,
+                    profile: MemoryProfile::Auto,
+                    ..small
+                })
+            },
             "under a tight budget bounded reads no wider than auto"
         );
         let speed = resolve_read_shape(ReadTuning {

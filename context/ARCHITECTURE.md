@@ -358,7 +358,14 @@ verbatim (spec §2.4).
    sink side each level's `bounded`-profile spill is written by its own
    spill-writer thread behind a `bounded(2)` queue, so the consumer hands the
    batch over instead of encoding it. Output is byte-identical for every worker
-   count. A remote input reads sequentially (its parts share one chunk cache
+   count. Since #876 each worker also splits a batch's columns over several
+   threads: one Parquet reader per run of whole columns over the same row
+   groups and batch size, decoded concurrently and joined column-wise
+   (`tylertoo_io::ParquetSource::with_decode_threads`). The thread count and
+   its memory charge are `MemoryBudget::read_decode_plan`'s; a local input
+   reads positionally (`read_at`) because parquet's own `File` reader seeks an
+   offset shared by every clone of the handle. A remote input reads
+   sequentially (its parts share one chunk cache
    that concurrent fetching readers would evict) unless pass 0 staged every
    chunk the read touches to the disk spill. Then it fetches nothing and
    reads in parallel like a local file (#544, `ConvertSource::reads_locally`).
@@ -613,13 +620,55 @@ rather than clumped in one corner.
 another. A coarse level has one partition and at most a few hundred tiles, so
 on madagascar-adm4 z3–z10 ran at 1.1–1.7 of 4 cores, about a third of the
 export wall. `plan_level_groups` now joins consecutive levels that each fit
-in one wave into one group, while the group's summed members stay within
-`level_group_member_cap`. That cap is one full ceiling-width wave of
-target-sized partitions (`ceiling × partition_target`), which is the most a
-serial wave already holds. On `auto` it also narrows to what fits in the
-#311 RAM budget. The cap counts members only. A group can also hold the
-encoded tiles of a level that finished before a coarser one, and these are
-smaller than the members they come from.
+in one wave, and whose own members fit `level_group_member_cap`, into one
+group. That cap is one full ceiling-width wave of target-sized partitions
+(`ceiling × partition_target`), which is the most a serial wave already
+holds. On `auto` it also narrows to what fits in the #311 RAM budget. The
+cap counts members only. A group can also hold the encoded tiles of a level
+that finished before a coarser one, and these are smaller than the members
+they come from.
+
+Under `auto` and `speed` the group's in-flight gate (`InFlight`, #817),
+not its summed members, bounds what a group holds: a level is collected
+once the members still encoding plus its own fit the largest wave plus
+`WAVE_SLACK_PERMILLE` (12.5%), never past the member cap. So the finest
+level joins the coarser levels' group, and its collect starts while their
+last giant tiles still encode instead of after the whole group ends. That
+overlap costs memory. Against 8d1d3ae3 on the 64-core host (5 interleaved
+rounds, medians), levels wall fell 11% on moldova and wideprops, 7% on brmt
+and 3% on lines, for 59–116 MiB (at most 4%) more peak RSS. `bounded` keeps
+the old schedule, with no slack for single-wave groups and the group's
+summed members within the cap: with the overlap its peak rose 36 MiB on
+lines.
+
+Without the summed-member check, a coarse wave that stalls on a slow
+partition no longer bounds the finer levels behind it: they encode, release
+their admission, and their tiles wait in `GroupCommit` for the coarse wave's
+write, so queued output could grow with the group's depth. Under `auto` and
+`speed` each encoded partition therefore keeps a share of the cap in place
+of its members, in the same step that releases them, until its wave is
+written (`InFlight::queued_share`): the tiles' bytes at the member price the
+cap was sized at, or the partition's members when that price is unknown. The
+gate then bounds members in flight and queued output together.
+
+A level of several waves without the export-wide store reads its band once
+into a one-level store (#740). That fill used to wait until the group held
+no members, and then until all but the previous wave was written, so on
+brmt each of z10–z13 spent 1.5–2.4 s reading and clipping with no tile
+encoding. Under `auto` and `speed` the store now fills as soon as the
+collect reaches the level, while the coarser levels still encode
+(`GroupGate::early_fill`). The gate keeps the members still encoding and the
+new level's waves within its cap together, so the store's wave grant is the
+cap rather than the level's widest wave. The gate admits a wave past its cap
+when nothing else is held, so the grant is the members still in flight when
+those are more than the cap: no wave of the new level is admitted until they
+are released. Against 3b6796c9 (5 interleaved
+rounds, medians), brmt's levels wall fell from 15.2 to 13.8 s and its
+export wall from 17.9 to 15.1 s, for 74 MiB (1%) more peak RSS. Wideprops
+fell 9%, lines 3%, and moldova and moldova-f0 were within noise. `bounded`
+keeps the wait. A prefetch thread that filled the next level while this one
+drained measured no better: the fills, one after another, are then the
+critical path.
 
 `export_level_group` collects the levels' members on the calling thread, one
 level at a time and in level order, as the serial loop does. Each collected

@@ -1473,22 +1473,24 @@ const DEFAULT_PARTITION_TARGET: usize = 32_768;
 /// Smaller waves add wave barriers, where the pool idled on each wave's
 /// largest tile (one tile encodes on one thread): a quarter cost NZ parcels
 /// 9% of its wall in the serial wave loop. With the waves overlapped
-/// ([`BOUNDED_WAVE_SLACK_PERMILLE`]) the barrier is gone: NZ parcels
+/// ([`WAVE_SLACK_PERMILLE`]) the barrier is gone: NZ parcels
 /// bounded 3,993 -> 2,909 MiB peak RSS and 74.3 -> 71.3 s wall (medians
 /// of 4, quiet host).
 const BOUNDED_MULTI_WAVE_TARGET_PERCENT: usize = 25;
 
-/// How far past its largest wave, in permille, `bounded` lets a level
-/// group's members in flight run (#815), so the next wave is collected and
-/// starts encoding while the last partitions of the wave before it finish.
-/// A bounded multi-wave level is planned with this slack priced in
-/// ([`plan_level`]), so the overlap stays inside the collect grant. Slack
-/// 0, 12.5% and 50% gave the same NZ wall; this is the middle.
-const BOUNDED_WAVE_SLACK_PERMILLE: usize = 125;
+/// How far past its largest wave, in permille, a level group's members in
+/// flight may run, so the next wave or level is collected and starts
+/// encoding while the last partitions before it finish (#815). A bounded
+/// multi-wave level is planned with this slack priced in ([`plan_level`]),
+/// so the overlap stays inside the collect grant; under `auto` and `speed`
+/// every group takes it, within the members [`MemoryPhase::ExportCollect`]
+/// affords ([`level_group_member_cap`]). Slack 0, 12.5% and 50% gave the
+/// same NZ wall; this is the middle.
+const WAVE_SLACK_PERMILLE: usize = 125;
 
-/// `members` plus the [`BOUNDED_WAVE_SLACK_PERMILLE`] slack on them.
-fn with_bounded_slack(members: usize) -> usize {
-    members.saturating_add(members.saturating_mul(BOUNDED_WAVE_SLACK_PERMILLE) / 1000)
+/// `members` plus the [`WAVE_SLACK_PERMILLE`] slack on them.
+fn with_wave_slack(members: usize) -> usize {
+    members.saturating_add(members.saturating_mul(WAVE_SLACK_PERMILLE) / 1000)
 }
 
 /// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing.
@@ -1836,15 +1838,20 @@ fn check_levels_fit(
 /// below every id at `z + 1`, so the writer still sees ascending ids and the
 /// archive is byte-identical.
 ///
-/// A level joins the open group only if it fits in a single wave (empty
-/// levels count, with zero members) and the group's summed members stay
-/// within `member_cap`. A multi-wave level, or a level that alone exceeds
-/// the cap, is a group of one and exports through the unchanged wave loop.
-/// A `member_cap` of 0 is the serial schedule, one level per group.
+/// A level joins the open group if it fits in a single wave (empty levels
+/// count, with zero members) and its own members fit `member_cap`. With
+/// `overlap` that is all: the group's in-flight gate ([`group_schedule`]),
+/// not its sum, bounds the members held, so the finest level's collect
+/// overlaps the coarser levels' last encodes instead of waiting for the
+/// group to end. Without it (`bounded`) the group's summed members also stay
+/// within `member_cap`, so bounded's peak does not rise. A multi-wave level,
+/// or a level that alone exceeds the cap, is a group of one and exports
+/// through the unchanged wave loop. A `member_cap` of 0 is the serial
+/// schedule, one level per group.
 fn plan_level_groups(
     plans: &[LevelPlan],
     member_cap: usize,
-    waves: bool,
+    (waves, overlap): (bool, bool),
 ) -> Vec<std::ops::Range<usize>> {
     if member_cap == 0 {
         return (0..plans.len()).map(|i| i..i + 1).collect();
@@ -1864,7 +1871,9 @@ fn plan_level_groups(
             continue;
         }
         if let Some((range, sum)) = open.as_mut() {
-            if single_wave && sum.saturating_add(members) <= member_cap {
+            let fits =
+                members <= member_cap && (overlap || sum.saturating_add(members) <= member_cap);
+            if single_wave && fits {
                 range.end = i + 1;
                 *sum += members;
                 continue;
@@ -1888,18 +1897,26 @@ fn plan_level_groups(
 /// largest wave of any level but never below [`PARTITION_WAVE_MIN`]
 /// partitions of `partition_target` (the narrowest full wave the serial loop
 /// holds), so a small export's levels all overlap. Collected members wait,
-/// valve and MVT workspace included, until their level encodes, so more of
-/// them in flight than the largest wave would raise the export's peak above
-/// the serial loop's. The cap bounds members in flight, not the group, so a
-/// group whose encodes keep up still overlaps every level.
+/// valve and MVT workspace included, until their level encodes, so members
+/// in flight past the largest wave raise the export's peak above the serial
+/// loop's, here by at most the slack below. The cap bounds members in
+/// flight, not the group, so a group whose encodes keep up still overlaps
+/// every level.
+///
+/// Under `auto` and `speed` the cap adds [`WAVE_SLACK_PERMILLE`] to the
+/// largest wave, within `member_cap`: the next level is admitted once the
+/// members before it have at most the slack left, so their last tiles no
+/// longer idle the pool. With the finest level in the group
+/// ([`plan_level_groups`]) its collect overlaps the coarser levels' last
+/// encodes: 3–11% less levels wall for up to 4% (59–116 MiB) more peak
+/// RSS on moldova, lines, wideprops and brmt.
 ///
 /// A multi-wave level's waves overlap (#817). Under `bounded` a group that
-/// holds one caps at the largest wave plus [`BOUNDED_WAVE_SLACK_PERMILLE`],
-/// with no [`PARTITION_WAVE_MIN`] floor, which its plan priced in (#815):
-/// the next wave is admitted once the wave before it has at most the slack
-/// left, so its last tiles no longer idle the pool. A group of single-wave
-/// levels keeps the floor, so a small export's levels still overlap. A
-/// `member_cap` of 0 is the serial schedule.
+/// holds one caps at the largest wave plus the slack, with no
+/// [`PARTITION_WAVE_MIN`] floor, which its plan priced in (#815). A group of
+/// single-wave levels keeps the floor and no slack, so a small export's
+/// levels still overlap and bounded's peak does not rise. A `member_cap` of
+/// 0 is the serial schedule.
 fn group_schedule(
     member_cap: usize,
     plans: &[LevelPlan],
@@ -1915,20 +1932,31 @@ fn group_schedule(
         })
         .max()
         .unwrap_or(0);
-    let single_wave_cap =
-        member_cap.min(largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN)));
+    // Bounded keeps the serial loop's peak: no slack past its largest
+    // single-wave level and no group past the member cap.
+    let overlap = profile != MemoryProfile::Bounded;
+    let floored = largest_wave.max(partition_target.saturating_mul(PARTITION_WAVE_MIN));
+    let single_wave_cap = member_cap.min(if overlap {
+        with_wave_slack(floored)
+    } else {
+        floored
+    });
     // Bounded's multi-wave levels plan at a quarter target, so the floor
     // would let a guard-narrowed level's waves past what was priced.
     let cap = match profile {
-        MemoryProfile::Bounded => member_cap.min(with_bounded_slack(largest_wave)),
+        MemoryProfile::Bounded => member_cap.min(with_wave_slack(largest_wave)),
         _ => single_wave_cap,
     };
     let gate = GroupGate {
         cap,
         single_wave_cap,
         waves: cap > 0,
+        overlap,
     };
-    (plan_level_groups(plans, member_cap, gate.waves), gate)
+    (
+        plan_level_groups(plans, member_cap, (gate.waves, overlap)),
+        gate,
+    )
 }
 
 /// Resolve a requested partition-wave width to a concrete value.
@@ -2266,7 +2294,7 @@ fn plan_level(
     if profile == MemoryProfile::Bounded && partitions.len() > wave {
         // The waves overlap by the slack ([`group_schedule`]): priced in,
         // a wave and its slack fit the grant one wave did.
-        let slack_bytes = member_bytes.map(|b| with_bounded_slack(b as usize) as u64);
+        let slack_bytes = member_bytes.map(|b| with_wave_slack(b as usize) as u64);
         (partitions, wave) = plan(
             partition_target * BOUNDED_MULTI_WAVE_TARGET_PERCENT / 100,
             slack_bytes,
@@ -2343,6 +2371,10 @@ fn export_pmtiles_impl(
             fail_level: None,
             #[cfg(test)]
             panic_write_level: None,
+            #[cfg(test)]
+            hold_for_fill: false,
+            #[cfg(test)]
+            stall_first_wave: false,
             memory_limit: None,
             budget_available: None,
         },
@@ -2369,6 +2401,18 @@ struct Pass2Knobs {
     /// that a panicking write fails the group instead of hanging it.
     #[cfg(test)]
     panic_write_level: Option<usize>,
+    /// Hold each level's last wave in a level group, before it encodes,
+    /// until the next level's own store starts to fill or 2 s pass, to
+    /// test that the fill does not wait for the encode
+    /// ([`ExportWorkTally::fills_beside_encode`]).
+    #[cfg(test)]
+    hold_for_fill: bool,
+    /// Hold each level group's first wave, before it encodes, until every
+    /// later wave of the group waits to be written or 2 s pass, to test what
+    /// a stalled coarse wave lets queue behind it
+    /// ([`ExportWorkTally::peak_queued_waves`]).
+    #[cfg(test)]
+    stall_first_wave: bool,
     /// The memory figure for the #665 dense-tile refusal. `None` probes
     /// ([`probe_oom_memory_limit`]); tests inject one.
     memory_limit: Option<MemoryLimit>,
@@ -2805,7 +2849,11 @@ fn export_pmtiles_validated(
         profile: options.profile,
     });
     #[cfg(test)]
-    let work = Mutex::new(ExportWorkTally::default());
+    let work = Mutex::new(ExportWorkTally {
+        hold_for_fill: knobs.hold_for_fill,
+        stall_first_wave: knobs.stall_first_wave,
+        ..ExportWorkTally::default()
+    });
     let (head, rest) = scans.split_at_mut(planned);
     let unplanned = (
         LevelScan {
@@ -2843,6 +2891,7 @@ fn export_pmtiles_validated(
         fills: None,
         terminals: &[],
         level_read,
+        member_bytes,
         #[cfg(test)]
         work: &work,
     };
@@ -3459,6 +3508,9 @@ struct ExportLevelCtx<'a> {
     /// member store is filled: once, into a one-level [`MemberStore`]
     /// (#740), or, `None`, once per wave.
     level_read: Option<LevelRead>,
+    /// Resident bytes of one member, the price a level group's cap is sized
+    /// at ([`queued_members`]), when known.
+    member_bytes: Option<u64>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -3526,7 +3578,7 @@ fn export_level(
     let mut last_wave_log = Instant::now();
     let (mut level_store, level_grants) = match level.level_read {
         Some(read) if store.is_none() && total_waves > 1 => {
-            let (backing, grants) = level_read_backing(read, plan, budget);
+            let (backing, grants) = level_read_backing(read, plan, budget, 0);
             (
                 Some(fill_level_store(&ctx, plan, backing, diagnostics)?),
                 grants,
@@ -3710,10 +3762,18 @@ fn injected_fault(
 /// for the z2 tiles to finish, and a wave's valve tail no longer idles the
 /// pool until the next wave is read (#817).
 ///
-/// [`InFlight`] bounds the members collected and not yet encoded. A wave of
-/// a multi-wave level also waits until every wave but the one before it is
-/// written, so at most two of its waves' tiles wait on a slower coarser
-/// one; a group's single-wave levels are bounded by the group's sum.
+/// [`InFlight`] bounds the members collected and not yet encoded, and under
+/// `auto` and `speed` the encoded tiles still waiting to be written. A wave
+/// of a multi-wave level also waits until every wave but the one before it
+/// is written, so at most two of its waves' tiles wait on a slower coarser
+/// one; under `bounded` a group's single-wave levels are bounded by the
+/// group's sum.
+///
+/// A multi-wave level's one-level store fills as soon as the collect
+/// reaches the level under `auto` and `speed`, before those waits, so the
+/// level's band read and clip run while the coarser levels still encode
+/// ([`GroupGate::overlap`]). Under `bounded` it fills once the group
+/// holds no members, as the serial loop does.
 ///
 /// The collect stays on the calling thread because the legacy read blocks on
 /// a channel (see [`scoped_pipe`]). In a Rayon task it would park a worker,
@@ -3755,14 +3815,18 @@ fn export_level_group(
         written: 0,
         open: OpenLevel::default(),
         pending: BTreeMap::new(),
+        freed: 0,
         reports: Vec::with_capacity(levels.len()),
         error: None,
     });
-    let in_flight = InFlight::new(if levels.iter().any(|level| level_waves(level.plan) > 1) {
-        gate.cap
-    } else {
-        gate.single_wave_cap
-    });
+    let in_flight = InFlight {
+        queue: QueueCharge::new(gate.overlap, levels[0].member_bytes),
+        ..InFlight::new(if levels.iter().any(|level| level_waves(level.plan) > 1) {
+            gate.cap
+        } else {
+            gate.single_wave_cap
+        })
+    };
     let collected = rayon::in_place_scope(|scope| -> Result<(), (usize, ExportError)> {
         // The group's ordinal of the next wave to collect.
         let mut unit = 0;
@@ -3777,6 +3841,47 @@ fn export_level_group(
             let mut level_store = None;
             let mut grants = Vec::new();
             for w in 0..level_waves(level.plan) {
+                let wave = partitions
+                    .chunks(level.plan.wave.max(1))
+                    .nth(w)
+                    .unwrap_or_default();
+                let fills = w == 0 && multi_wave && store.is_none() && level.level_read.is_some();
+                let early = fills && gate.overlap;
+                let mut fill = |floor: usize| -> Result<f64, (usize, ExportError)> {
+                    let t_fill = Instant::now();
+                    if let Some(read) = level.level_read {
+                        let (backing, g) = level_read_backing(read, level.plan, budget, floor);
+                        #[cfg(test)]
+                        if let Some(wave) = g.first() {
+                            level
+                                .work
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .fill_grants
+                                .push((in_flight.held(), wave.units));
+                        }
+                        grants = g;
+                        let ctx = level.level_ctx(&timers);
+                        level_store = Some(
+                            fill_level_store(&ctx, level.plan, backing, diagnostics)
+                                .map_err(|e| (i, e))?,
+                        );
+                    }
+                    Ok(t_fill.elapsed().as_secs_f64())
+                };
+                // Under `auto` and `speed` the store fills at once, while the
+                // levels before it still encode: the gate keeps their members
+                // and this level's waves within its cap together, so the
+                // store's wave grant is the cap, not this level's widest wave.
+                // A wave the gate let past the cap because nothing else was
+                // held can still be in flight: the grant then covers it, and
+                // no wave of this level is admitted until it is released.
+                let fill_start = Instant::now();
+                let fill_secs = if early {
+                    fill(gate.cap.max(in_flight.held()))?
+                } else {
+                    0.0
+                };
                 if multi_wave {
                     in_flight.wait_until(|| {
                         let c = lock_commit(&commit, &timers);
@@ -3786,29 +3891,18 @@ fn export_level_group(
                         break 'levels;
                     }
                 }
-                let wave = partitions
-                    .chunks(level.plan.wave.max(1))
-                    .nth(w)
-                    .unwrap_or_default();
-                let fills = w == 0 && multi_wave && store.is_none() && level.level_read.is_some();
-                if fills {
+                if fills && !early {
                     // The store's grant is sized beside this level's widest
                     // wave only, so it fills once every earlier wave is
                     // encoded: the grant plus one wave, as in the serial loop.
                     drop(in_flight.wait_for(|held| held == 0));
                 }
                 let held = in_flight.admit(wave.iter().map(|p| p.members).sum());
-                let start = Instant::now();
-                if fills {
-                    if let Some(read) = level.level_read {
-                        let (backing, g) = level_read_backing(read, level.plan, budget);
-                        grants = g;
-                        let ctx = level.level_ctx(&timers);
-                        level_store = Some(
-                            fill_level_store(&ctx, level.plan, backing, diagnostics)
-                                .map_err(|e| (i, e))?,
-                        );
-                    }
+                // The level's wall starts with its fill.
+                let start = if early { fill_start } else { Instant::now() };
+                let t_collect = Instant::now();
+                if fills && !early {
+                    fill(0)?;
                 }
                 let spill_bytes = match (&level_store, &store) {
                     _ if w > 0 => 0,
@@ -3825,7 +3919,9 @@ fn export_level_group(
                     diagnostics,
                 )
                 .map_err(|e| (i, e))?;
-                let collect_secs = start.elapsed().as_secs_f64();
+                // The fill is timed on its own: an early one does not count
+                // the waits between it and the wave's admission.
+                let collect_secs = t_collect.elapsed().as_secs_f64() + fill_secs;
                 #[cfg(test)]
                 if multi_wave {
                     level
@@ -3834,8 +3930,22 @@ fn export_level_group(
                         .unwrap_or_else(PoisonError::into_inner)
                         .group_waves += 1;
                 }
+                #[cfg(test)]
+                let next_fill = (w + 1 == level_waves(level.plan))
+                    .then(|| levels.get(i + 1))
+                    .flatten()
+                    .filter(|next| level_waves(next.plan) > 1 && store.is_none())
+                    .map(|next| next.level_idx);
                 let (commit, timers, in_flight) = (&commit, &*timers, &in_flight);
                 scope.spawn(move |_| {
+                    #[cfg(test)]
+                    if let Some(next) = next_fill {
+                        hold_for_fill(level.work, next);
+                    }
+                    #[cfg(test)]
+                    if (i, w) == (0, 0) {
+                        stall_first_wave(level.work, commit, levels.len());
+                    }
                     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let t_encode = Instant::now();
                         let tiles = encode_buckets(
@@ -3847,6 +3957,9 @@ fn export_level_group(
                             timers,
                             diagnostics,
                         );
+                        // The tiles' share of the cap goes with them until
+                        // written; a failed wave's goes back with `held`.
+                        let queued = if tiles.is_ok() { held.take_queued() } else { 0 };
                         drop(held);
                         let encoded = tiles.map(|tiles| EncodedWave {
                             tiles,
@@ -3854,15 +3967,21 @@ fn export_level_group(
                             collect_secs,
                             encode_secs: t_encode.elapsed().as_secs_f64(),
                             spill_bytes,
+                            queued,
                         });
                         lock_commit(commit, timers).finish((i, w), encoded);
                     }));
-                    if run.is_err() {
-                        // The collect may wait on this wave's write: fail
-                        // the group so it stops, then let Rayon re-raise.
-                        let e = std::io::Error::other("a wave's encode or write panicked");
-                        lock_commit(commit, timers).fail(i, ExportError::Io(e));
-                    }
+                    let freed = {
+                        let mut c = lock_commit(commit, timers);
+                        if run.is_err() {
+                            // The collect may wait on this wave's write: fail
+                            // the group so it stops, then let Rayon re-raise.
+                            let e = std::io::Error::other("a wave's encode or write panicked");
+                            c.fail(i, ExportError::Io(e));
+                        }
+                        std::mem::take(&mut c.freed)
+                    };
+                    in_flight.release(freed);
                     in_flight.notify();
                     if let Err(panic) = run {
                         std::panic::resume_unwind(panic);
@@ -3885,6 +4004,55 @@ fn export_level_group(
     commit.into_reports()
 }
 
+/// [`Pass2Knobs::hold_for_fill`]: wait up to 2 s for level `next`'s store
+/// to start filling, and count it in
+/// [`ExportWorkTally::fills_beside_encode`] if it does. The start, not the
+/// end: the fill's Rayon work may need the worker this hold occupies.
+#[cfg(test)]
+fn hold_for_fill(work: &Mutex<ExportWorkTally>, next: usize) {
+    let lock = || work.lock().unwrap_or_else(PoisonError::into_inner);
+    if !lock().hold_for_fill {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let mut work = lock();
+        if work.fills_started.contains(&next) {
+            work.fills_beside_encode += 1;
+            return;
+        }
+        drop(work);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// [`Pass2Knobs::stall_first_wave`]: wait up to 2 s for every later wave of
+/// a group of `waves` single-wave levels to wait on this one.
+#[cfg(test)]
+fn stall_first_wave(work: &Mutex<ExportWorkTally>, commit: &Mutex<GroupCommit<'_>>, waves: usize) {
+    if !work
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .stall_first_wave
+    {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if commit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .len()
+            + 1
+            >= waves
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// How a level group runs ([`export_level_group`]): the [`InFlight`] cap
 /// ([`group_schedule`]) of a group with a multi-wave level and of one with
 /// only single-wave levels, and whether a multi-wave level's waves overlap.
@@ -3893,6 +4061,12 @@ struct GroupGate {
     cap: usize,
     single_wave_cap: usize,
     waves: bool,
+    /// `auto` and `speed`: fill a multi-wave level's one-level store before
+    /// waiting for the levels before it, its wave grant sized at `cap`, or at
+    /// the members still in flight when an oversized wave holds more; and
+    /// keep each encoded wave's share of the cap until it is written
+    /// ([`EncodedWave::queued`]).
+    overlap: bool,
 }
 
 /// The waves `plan` exports in, at least one: an empty level writes its
@@ -3905,31 +4079,75 @@ fn level_waves(plan: &LevelPlan) -> usize {
 /// (#817, see [`group_schedule`]). The collecting thread waits in
 /// [`Self::admit`] while the next level would take them past `cap`, unless
 /// none are in flight, so a level larger than the cap still runs.
+///
+/// Under `auto` and `speed` a finer level can finish while a coarser wave
+/// still encodes, and its tiles wait for that wave's write. Each encoded
+/// partition then keeps [`Self::queued_share`] of the cap in place of its
+/// members until [`GroupCommit`] writes it, so a stalled coarse wave bounds
+/// the output queued behind it as well as the members.
 struct InFlight {
     cap: usize,
     held: Mutex<usize>,
     freed: std::sync::Condvar,
+    /// What an encoded partition keeps of the cap until written.
+    queue: QueueCharge,
+}
+
+/// What an encoded partition keeps of a level group's [`InFlight`] cap until
+/// its wave is written ([`InFlight::queued_share`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueCharge {
+    /// `bounded`: nothing; its group's summed members bound the queue.
+    Off,
+    /// The partition's members: the member price is unknown.
+    Members,
+    /// The tiles' bytes at this many bytes a member, the price the cap was
+    /// sized at.
+    Bytes(u64),
+}
+
+impl QueueCharge {
+    fn new(overlap: bool, member_bytes: Option<u64>) -> Self {
+        match (overlap, member_bytes.filter(|&b| b > 0)) {
+            (false, _) => Self::Off,
+            (true, None) => Self::Members,
+            (true, Some(price)) => Self::Bytes(price),
+        }
+    }
 }
 
 /// A level's admitted members. Each partition's are released as it
-/// encodes ([`Self::release`]), so the next level's collect overlaps the
+/// encodes ([`Self::encoded`]), so the next level's collect overlaps the
 /// encode's tail; the rest when its encode task drops it, panicking or not.
 struct Admitted<'g> {
     gate: &'g InFlight,
     remaining: Mutex<usize>,
+    /// The encoded partitions' share of the cap, not yet taken by
+    /// [`Self::take_queued`].
+    queued: Mutex<usize>,
 }
 
 impl Admitted<'_> {
     /// Release up to `members` of the admitted members (a partition's
-    /// collected count can differ from its planned one).
-    fn release(&self, members: usize) {
+    /// collected count can differ from its planned one) once they encoded
+    /// to `tiles`, keeping their [`InFlight::queued_share`] of the cap in
+    /// the same step.
+    fn encoded(&self, members: usize, tiles: &[EncodedTile]) {
         let mut remaining = self
             .remaining
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let freed = members.min(*remaining);
         *remaining -= freed;
-        self.gate.release(freed);
+        let share = self.gate.queued_share(freed, tiles);
+        *self.queued.lock().unwrap_or_else(PoisonError::into_inner) += share;
+        self.gate.settle(freed, share);
+    }
+
+    /// The encoded partitions' share of the cap, which the caller now
+    /// releases once their tiles are written.
+    fn take_queued(&self) -> usize {
+        std::mem::take(&mut *self.queued.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
@@ -3939,6 +4157,27 @@ impl InFlight {
             cap,
             held: Mutex::new(0),
             freed: std::sync::Condvar::new(),
+            queue: QueueCharge::Off,
+        }
+    }
+
+    /// What a partition of `members` encoded to `tiles` keeps of the cap
+    /// until written: the tiles' bytes at the member price, or its members
+    /// when the price is unknown, since gzipped MVT bytes are much smaller
+    /// than the members they come from. Nothing for no tiles, or under
+    /// [`QueueCharge::Off`].
+    fn queued_share(&self, members: usize, tiles: &[EncodedTile]) -> usize {
+        match self.queue {
+            _ if tiles.is_empty() => 0,
+            QueueCharge::Off => 0,
+            QueueCharge::Members => members,
+            QueueCharge::Bytes(price) => {
+                let bytes: u64 = tiles
+                    .iter()
+                    .map(|t| (t.data.len() + std::mem::size_of::<EncodedTile>()) as u64)
+                    .sum();
+                usize::try_from(bytes.div_ceil(price)).unwrap_or(usize::MAX)
+            }
         }
     }
 
@@ -3972,6 +4211,7 @@ impl InFlight {
         Admitted {
             gate: self,
             remaining: Mutex::new(members),
+            queued: Mutex::new(0),
         }
     }
 
@@ -3981,25 +4221,38 @@ impl InFlight {
         drop(self.wait_for(|_| ready()));
     }
 
+    /// The members admitted and not yet released.
+    fn held(&self) -> usize {
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn notify(&self) {
         let _held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         self.freed.notify_all();
     }
 
     fn release(&self, members: usize) {
-        if members == 0 {
+        self.settle(members, 0);
+    }
+
+    /// Release `freed` members and take `kept` in one step, so a waiting
+    /// admission never sees the gate between the two.
+    fn settle(&self, freed: usize, kept: usize) {
+        if freed == kept {
             return;
         }
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        *held -= members;
+        *held = *held - freed + kept;
         self.freed.notify_all();
     }
 }
 
 impl Drop for Admitted<'_> {
     fn drop(&mut self) {
-        let remaining = self.remaining.get_mut().unwrap_or_else(|e| e.into_inner());
-        self.gate.release(*remaining);
+        let remaining = *self.remaining.get_mut().unwrap_or_else(|e| e.into_inner());
+        // A wave whose share was not taken never reaches the write.
+        let queued = *self.queued.get_mut().unwrap_or_else(|e| e.into_inner());
+        self.gate.release(remaining + queued);
     }
 }
 
@@ -4050,6 +4303,9 @@ struct EncodedWave {
     encode_secs: f64,
     /// #810: the level's spilled member bytes (on its first wave).
     spill_bytes: u64,
+    /// The members of the group's [`InFlight`] cap the encoded tiles keep
+    /// until they are written ([`InFlight::queued_share`]).
+    queued: usize,
 }
 
 /// The level [`GroupCommit`] is writing: its tally and times so far.
@@ -4078,6 +4334,9 @@ struct GroupCommit<'a> {
     open: OpenLevel,
     /// Encoded waves that wait for an earlier one.
     pending: BTreeMap<(usize, usize), EncodedWave>,
+    /// The [`EncodedWave::queued`] members of waves written or dropped
+    /// since an encode task last released them to the group's [`InFlight`].
+    freed: usize,
     reports: Vec<ZoomReport>,
     /// The failure at the lowest group index so far. No level at or after
     /// it is written.
@@ -4089,8 +4348,21 @@ impl GroupCommit<'_> {
     fn finish(&mut self, unit: (usize, usize), encoded: Result<EncodedWave, ExportError>) {
         match encoded {
             Ok(wave) => {
+                if self.error.as_ref().is_some_and(|(j, _)| unit.0 >= *j) {
+                    // Never written: its share of the gate goes back now.
+                    self.freed += wave.queued;
+                    return;
+                }
                 self.pending.insert(unit, wave);
                 self.write_ready();
+                #[cfg(test)]
+                {
+                    let mut work = self.levels[0]
+                        .work
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    work.peak_queued_waves = work.peak_queued_waves.max(self.pending.len());
+                }
             }
             Err(e) => self.fail(unit.0, e),
         }
@@ -4100,6 +4372,9 @@ impl GroupCommit<'_> {
     fn fail(&mut self, i: usize, e: ExportError) {
         if self.error.as_ref().is_none_or(|(j, _)| i < *j) {
             self.error = Some((i, e));
+            // No wave at or after it is written: free their share of the gate.
+            let dropped = self.pending.split_off(&(i, 0));
+            self.freed += dropped.values().map(|wave| wave.queued).sum::<usize>();
         }
     }
 
@@ -4108,6 +4383,7 @@ impl GroupCommit<'_> {
             let Some(wave) = self.pending.remove(&self.next) else {
                 return;
             };
+            self.freed += wave.queued;
             if let Err(e) = self.write_wave(wave) {
                 self.fail(self.next.0, e);
             }
@@ -4646,6 +4922,20 @@ struct ExportWorkTally {
     /// Waves of multi-wave levels a level group collected and encoded in
     /// its pipeline, not the serial wave loop (#817).
     group_waves: u64,
+    /// [`Pass2Knobs::hold_for_fill`].
+    hold_for_fill: bool,
+    /// Level indices whose one-level store has started to fill.
+    fills_started: std::collections::BTreeSet<usize>,
+    /// Held last waves that saw the next level's store start to fill before
+    /// they encoded.
+    fills_beside_encode: u64,
+    /// Per one-level store fill: the members in flight and the units of the
+    /// wave grant sized for them.
+    fill_grants: Vec<(usize, usize)>,
+    /// [`Pass2Knobs::stall_first_wave`].
+    stall_first_wave: bool,
+    /// The most encoded waves a level group held unwritten at once.
+    peak_queued_waves: usize,
 }
 
 struct LevelCtx<'a> {
@@ -4786,6 +5076,7 @@ fn level_read_backing(
     read: LevelRead,
     plan: &LevelPlan,
     budget: &mut MemoryBudget,
+    wave_floor: usize,
 ) -> (StoreBacking, Vec<Grant>) {
     let spill = StoreBacking {
         backing: SinkBacking::Spill,
@@ -4806,7 +5097,8 @@ fn level_read_backing(
         .chunks(plan.wave.max(1))
         .map(members)
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(wave_floor);
     // The wave the drain holds while it encodes, which the wave width was
     // sized to fit; the level's members share what is left.
     let wave = budget.fit(
@@ -5848,7 +6140,7 @@ fn encode_buckets(
             let n = members.len();
             let tiles = encode_members(gzip_cache, members, zoom, opts, fills, timers, diagnostics);
             if let Some(a) = admitted {
-                a.release(n);
+                a.encoded(n, tiles.as_deref().unwrap_or_default());
             }
             tiles
         })
@@ -6679,6 +6971,14 @@ fn fill_level_store(
     backing: StoreBacking,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<MemberStore, ExportError> {
+    // Marked before any Rayon work: a held encode that waits for it must
+    // not hold the only worker the fill needs.
+    #[cfg(test)]
+    ctx.work
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .fills_started
+        .insert(ctx.level_idx);
     let t_collect = Instant::now();
     let mut store = MemberStore::new(
         std::slice::from_ref(plan),
@@ -12208,9 +12508,144 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        /// The group gate's bookkeeping on random waves of encoded partitions,
+        /// member prices, write orders and one failed wave: the gate holds
+        /// exactly the members not yet encoded plus the queued share of every
+        /// encoded wave not yet written, a failed wave gives its share back,
+        /// and the gate ends empty. Without a member price a partition keeps
+        /// its members; under `bounded` (no overlap) it keeps nothing.
+        #[test]
+        fn in_flight_holds_queued_output_until_it_is_written(
+            waves in proptest::collection::vec(
+                proptest::collection::vec((0usize..60, 0usize..3, 0usize..6_000), 1..6),
+                1..6,
+            ),
+            (overlap, price) in (proptest::bool::ANY, proptest::option::of(0u64..5_000)),
+            order in proptest::collection::vec(proptest::num::usize::ANY, 6),
+            failed in proptest::num::usize::ANY,
+        ) {
+            let tile = |bytes: usize| EncodedTile {
+                x: 0,
+                y: 0,
+                data: vec![0; bytes],
+                hash: 0,
+                raw_len: bytes,
+                feature_count: 1,
+                encode_dropped: 0,
+                encode_quantized: 0,
+                oversized: false,
+                valve: ValveTally::default(),
+                fill: FillTally::default(),
+            };
+            let gate = InFlight {
+                queue: QueueCharge::new(overlap, price),
+                ..InFlight::new(usize::MAX)
+            };
+            let held = || *gate.held.lock().unwrap();
+            let failed = failed % waves.len();
+            let mut queued: Vec<usize> = Vec::new();
+            for (k, wave) in waves.iter().enumerate() {
+                let admitted = gate.admit(wave.iter().map(|p| p.0).sum());
+                let mut share = 0;
+                for &(members, tiles, bytes) in wave {
+                    let tiles: Vec<EncodedTile> = (0..tiles).map(|_| tile(bytes)).collect();
+                    let before = held();
+                    admitted.encoded(members, &tiles);
+                    let kept = gate.queued_share(members, &tiles);
+                    if overlap && price.unwrap_or(0) == 0 && !tiles.is_empty() {
+                        proptest::prop_assert_eq!(kept, members);
+                    }
+                    proptest::prop_assert_eq!(held(), before - members + kept);
+                    share += kept;
+                }
+                if !overlap {
+                    proptest::prop_assert_eq!(share, 0);
+                }
+                if k == failed {
+                    let before = held();
+                    drop(admitted);
+                    proptest::prop_assert_eq!(held(), before - share);
+                } else {
+                    queued.push(admitted.take_queued());
+                    proptest::prop_assert_eq!(*queued.last().unwrap(), share);
+                    drop(admitted);
+                }
+            }
+            proptest::prop_assert_eq!(held(), queued.iter().sum::<usize>());
+            for pick in order {
+                if queued.is_empty() {
+                    break;
+                }
+                let written = queued.swap_remove(pick % queued.len());
+                gate.release(written);
+                proptest::prop_assert_eq!(held(), queued.iter().sum::<usize>());
+            }
+            for written in queued {
+                gate.release(written);
+            }
+            proptest::prop_assert_eq!(held(), 0);
+        }
+
+        /// The level planner on random level sizes, waves and caps: every
+        /// level in exactly one group, in order; a single-wave level shares
+        /// a group only within the member cap, and under `bounded` (no
+        /// overlap) only while the group's single-wave members sum within
+        /// it; the gate never runs past the cap; `bounded` keeps today's
+        /// schedule: no overlap, no early store fill, its cap the largest
+        /// wave plus the slack.
+        #[test]
+        fn level_schedule_respects_the_member_cap(
+            levels in proptest::collection::vec(
+                (proptest::collection::vec(0usize..400, 0..9), 1usize..5),
+                0..10,
+            ),
+            member_cap in 0usize..1_500,
+            target in 1usize..200,
+        ) {
+            let plans: Vec<LevelPlan> = levels
+                .iter()
+                .enumerate()
+                .map(|(z, (counts, wave))| plan_with_members(z as u8, counts, *wave))
+                .collect();
+            let members = |p: &LevelPlan| p.partitions.iter().map(|q| q.members).sum::<usize>();
+            let single = |p: &LevelPlan| p.partitions.len() <= p.wave.max(1);
+            for profile in [MemoryProfile::Auto, MemoryProfile::Speed, MemoryProfile::Bounded] {
+                let (groups, gate) = group_schedule(member_cap, &plans, target, profile);
+                let flat: Vec<usize> = groups.iter().flat_map(Clone::clone).collect();
+                proptest::prop_assert_eq!(flat, (0..plans.len()).collect::<Vec<_>>());
+                proptest::prop_assert!(gate.cap <= member_cap && gate.single_wave_cap <= member_cap);
+                let overlap = profile != MemoryProfile::Bounded;
+                proptest::prop_assert_eq!(gate.overlap, overlap);
+                for g in groups.iter().filter(|g| g.len() > 1) {
+                    let singles: Vec<&LevelPlan> =
+                        plans[g.clone()].iter().filter(|p| single(p)).collect();
+                    proptest::prop_assert!(singles.iter().all(|p| members(p) <= member_cap));
+                    if !overlap {
+                        let sum: usize = singles.iter().map(|p| members(p)).sum();
+                        proptest::prop_assert!(sum <= member_cap, "{g:?}: {sum}");
+                    }
+                }
+                if !overlap {
+                    let largest_wave = plans
+                        .iter()
+                        .flat_map(|p| p.partitions.chunks(p.wave.max(1)).map(|w| w.iter().map(|q| q.members).sum::<usize>()))
+                        .max()
+                        .unwrap_or(0);
+                    proptest::prop_assert_eq!(gate.cap, member_cap.min(with_wave_slack(largest_wave)));
+                    proptest::prop_assert_eq!(
+                        &groups,
+                        &plan_level_groups(&plans, member_cap, (gate.waves, false))
+                    );
+                }
+            }
+        }
+    }
+
     /// #647: consecutive single-wave levels coalesce into one group while
-    /// their summed members fit the cap; a multi-wave level, or a level that
-    /// alone overshoots the cap, runs on its own exactly as before.
+    /// their summed members fit the cap, or, overlapping, while each fits
+    /// it; a multi-wave level, or a level that alone overshoots the cap,
+    /// runs on its own exactly as before.
     #[test]
     fn plan_level_groups_coalesces_single_wave_levels_under_the_cap() {
         let plans = vec![
@@ -12224,12 +12659,12 @@ mod tests {
             plan_with_members(10, &[1], 6),
         ];
         assert_eq!(
-            plan_level_groups(&plans, 100, false),
+            plan_level_groups(&plans, 100, (false, false)),
             vec![0..4, 4..5, 5..6, 6..7, 7..8],
         );
         // A cap of 0 is the serial schedule.
         assert_eq!(
-            plan_level_groups(&plans, 0, false),
+            plan_level_groups(&plans, 0, (false, true)),
             (0..plans.len()).map(|i| i..i + 1).collect::<Vec<_>>(),
         );
         // A cap of 1 is not: an empty level still joins a 1-member level.
@@ -12238,7 +12673,11 @@ mod tests {
             plan_with_members(4, &[1], 6),
             plan_with_members(5, &[1], 6),
         ];
-        assert_eq!(plan_level_groups(&tiny, 1, false), vec![0..2, 2..3]);
+        assert_eq!(
+            plan_level_groups(&tiny, 1, (false, false)),
+            vec![0..2, 2..3]
+        );
+        assert_eq!(plan_level_groups(&tiny, 1, (false, true)), vec![0..3]);
         // A multi-wave level under the cap does not open a group for the
         // single-wave level after it.
         let multi_first = vec![
@@ -12246,23 +12685,59 @@ mod tests {
             plan_with_members(4, &[1], 6),
         ];
         assert_eq!(
-            plan_level_groups(&multi_first, 100, false),
+            plan_level_groups(&multi_first, 100, (false, true)),
             vec![0..1, 1..2]
         );
-        assert!(plan_level_groups(&[], 100, false).is_empty());
+        assert!(plan_level_groups(&[], 100, (false, true)).is_empty());
         // #817: with overlapping waves a multi-wave level joins the open
         // group, adding nothing to its sum; a level alone over the cap
         // still runs alone.
         assert_eq!(
-            plan_level_groups(&plans, 100, true),
+            plan_level_groups(&plans, 100, (true, false)),
             vec![0..4, 4..6, 6..7, 7..8],
         );
-        let joined = plan_level_groups(&multi_first, 100, true);
+        // Overlapping, a level joins whenever it alone fits.
+        assert_eq!(
+            plan_level_groups(&plans, 100, (false, true)),
+            vec![0..5, 5..6, 6..7, 7..8],
+        );
+        assert_eq!(
+            plan_level_groups(&plans, 100, (true, true)),
+            vec![0..6, 6..7, 7..8],
+        );
+        let joined = plan_level_groups(&multi_first, 100, (true, true));
         assert!(joined.len() == 1 && joined[0] == (0..2), "{joined:?}");
     }
 
+    /// A single-wave level joins the open group when it alone fits the
+    /// member cap, whatever the group already holds: the in-flight gate, not
+    /// the group's sum, bounds what is held, so the finest level's collect
+    /// overlaps the coarser levels' last encodes. A level over the cap still
+    /// runs alone.
+    #[test]
+    fn a_single_wave_level_joins_the_open_group_when_it_alone_fits_the_cap() {
+        let fits = vec![
+            plan_with_members(10, &[10], 6),
+            plan_with_members(11, &[20], 6),
+            plan_with_members(12, &[30], 6), // 10+20+30 > 40, 30 <= 40
+        ];
+        assert_eq!(plan_level_groups(&fits, 40, (true, true)), vec![0..3]);
+        // `bounded` keeps the group's sum within the cap.
+        assert_eq!(
+            plan_level_groups(&fits, 40, (true, false)),
+            vec![0..2, 2..3]
+        );
+        let over = vec![
+            plan_with_members(10, &[10], 6),
+            plan_with_members(11, &[20], 6),
+            plan_with_members(12, &[50], 6), // 50 > 40
+        ];
+        assert_eq!(plan_level_groups(&over, 40, (true, true)), vec![0..2, 2..3]);
+    }
+
     /// #817: a group's members in flight never exceed the export's largest
-    /// wave, or the narrowest wave of full partitions when that is larger.
+    /// wave, or the narrowest wave of full partitions when that is larger,
+    /// plus the slack, and never the member cap.
     #[test]
     fn the_in_flight_cap_is_the_largest_wave() {
         let plans = vec![
@@ -12275,17 +12750,21 @@ mod tests {
                 .1
                 .cap
         };
-        assert_eq!(cap(100, &plans, 1), 30);
+        assert_eq!(cap(100, &plans, 1), with_wave_slack(30));
+        assert_eq!(cap(31, &plans, 1), 31);
         // A multi-wave level's largest wave, not its whole band, is the bound.
         let multi = vec![
             plan_with_members(3, &[10], 6),
             plan_with_members(4, &[10], 6),
             plan_with_members(5, &[3; 12], 6),
         ];
-        assert_eq!(cap(100, &multi, 1), 18);
+        assert_eq!(cap(100, &multi, 1), with_wave_slack(18));
         // The narrowest wave of full partitions is the floor, and the serial
         // cap stays 0.
-        assert_eq!(cap(1_000, &plans, 64), 64 * PARTITION_WAVE_MIN);
+        assert_eq!(
+            cap(1_000, &plans, 64),
+            with_wave_slack(64 * PARTITION_WAVE_MIN)
+        );
         assert_eq!(cap(0, &plans, 64), 0);
     }
 
@@ -12303,14 +12782,14 @@ mod tests {
             gate.waves,
             "bounded runs its waves through the group pipeline"
         );
-        assert_eq!(gate.cap, with_bounded_slack(32));
+        assert_eq!(gate.cap, with_wave_slack(32));
         assert_eq!(gate.cap, 36);
         let in_flight = InFlight::new(gate.cap);
         let first = in_flight.admit(32);
         std::thread::scope(|s| {
             // Two partitions still encoding (8 members, past the slack of 4):
             // the next wave waits.
-            first.release(24);
+            first.encoded(24, &[]);
             let next = s.spawn(|| {
                 let wave = in_flight.admit(32);
                 // Beside the last partition, at the cap and not past it.
@@ -12320,7 +12799,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             assert!(!next.is_finished(), "admitted past the slack");
             // One partition left (4 members): the next wave goes in beside it.
-            first.release(4);
+            first.encoded(4, &[]);
             next.join().unwrap();
         });
         // The last partition still holds its 4.
@@ -12331,11 +12810,12 @@ mod tests {
         // holds its wave plus the slack, not six full-target partitions.
         let narrowed = vec![plan_with_members(5, &[4; 16], 2)];
         let (_, gate) = group_schedule(1_000, &narrowed, 100, MemoryProfile::Bounded);
-        assert_eq!(gate.cap, with_bounded_slack(8));
-        // Auto keeps its cap; a member cap below the wave still bounds it.
+        assert_eq!(gate.cap, with_wave_slack(8));
+        // Auto takes the same slack; a member cap below the wave still
+        // bounds it.
         assert_eq!(
             group_schedule(1_000, &plans, 1, MemoryProfile::Auto).1.cap,
-            32
+            36
         );
         assert_eq!(
             group_schedule(30, &plans, 1, MemoryProfile::Bounded).1.cap,
@@ -12357,7 +12837,7 @@ mod tests {
         let (groups, gate) = group_schedule(10_000, &plans, 64, MemoryProfile::Bounded);
         assert_eq!(groups, vec![0..4]);
         assert_eq!(gate.single_wave_cap, 64 * PARTITION_WAVE_MIN);
-        assert_eq!(gate.cap, with_bounded_slack(40));
+        assert_eq!(gate.cap, with_wave_slack(40));
         // The budget still bounds it.
         assert_eq!(
             group_schedule(100, &plans, 64, MemoryProfile::Bounded)
@@ -12472,6 +12952,165 @@ mod tests {
         assert_eq!(bounded_bytes, serial_bytes);
     }
 
+    /// A multi-wave level's own store fills while the level before it still
+    /// encodes under `auto` and `speed`; under `bounded` it waits until the
+    /// group holds no members. The archive is the serial loop's either way.
+    #[test]
+    fn level_store_fills_beside_the_previous_level_encode() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let pts = |n: usize, l: i64| -> (Vec<i64>, Vec<Geometry<f64>>) {
+            let g = (0..n)
+                .map(|k| Geometry::Point(Point::new(-150.3 + k as f64 * 70.0, -40.3)))
+                .collect();
+            ((0..n as i64).map(|k| l * 10 + k).collect(), g)
+        };
+        write_mode_fixture(
+            input.path(),
+            &[pts(1, 0), pts(5, 1), pts(5, 2)],
+            Mode::Duplicating,
+            64,
+        );
+        let run = |profile: MemoryProfile, concurrent_levels: bool| {
+            let opts = ExportOptions {
+                layer_name: "waves".to_string(),
+                partition_wave: 2,
+                profile,
+                ..Default::default()
+            };
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &Pass2Knobs {
+                    hold_for_fill: true,
+                    ..knobs(false, None, concurrent_levels)
+                },
+            )
+            .unwrap();
+            (std::fs::read(out.path()).unwrap(), run)
+        };
+        let (serial_bytes, _) = run(MemoryProfile::Auto, false);
+        for (profile, beside) in [
+            (MemoryProfile::Auto, 2),
+            (MemoryProfile::Speed, 2),
+            (MemoryProfile::Bounded, 0),
+        ] {
+            let (bytes, run) = run(profile, true);
+            assert_eq!(run.level_groups, vec![0..3], "{profile:?}");
+            assert_eq!(run.work.fills_beside_encode, beside, "{profile:?}");
+            assert_eq!(bytes, serial_bytes, "{profile:?}");
+        }
+    }
+
+    /// A coarse wave that stalls does not let the finer levels' encoded
+    /// waves queue behind it past the group's cap: each queued wave keeps a
+    /// share of the cap until it is written.
+    #[test]
+    fn a_stalled_coarse_wave_bounds_the_encoded_waves_queued_behind_it() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        // Seven levels of one point in one tile: single-wave levels of one
+        // member under a cap of 2, all in one group.
+        let levels: Vec<(Vec<i64>, Vec<Geometry<f64>>)> = (0..7)
+            .map(|l| (vec![l], vec![Geometry::Point(Point::new(37.123, 23.456))]))
+            .collect();
+        write_mode_fixture(input.path(), &levels, Mode::Duplicating, 64);
+        let run = |profile: MemoryProfile, concurrent_levels: bool| {
+            let opts = ExportOptions {
+                layer_name: "stall".to_string(),
+                partition_wave: 2,
+                profile,
+                ..Default::default()
+            };
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &Pass2Knobs {
+                    stall_first_wave: true,
+                    ..knobs(false, None, concurrent_levels)
+                },
+            )
+            .unwrap();
+            (std::fs::read(out.path()).unwrap(), run)
+        };
+        let (serial_bytes, _) = run(MemoryProfile::Auto, false);
+        for profile in [MemoryProfile::Auto, MemoryProfile::Speed] {
+            let (bytes, run) = run(profile, true);
+            assert_eq!(run.level_groups, vec![0..7], "{profile:?}");
+            assert!(
+                run.report.zooms.iter().all(|z| z.tile_count == 1),
+                "{profile:?}"
+            );
+            // The stalled wave holds 1 of the cap's 2; one queued wave holds
+            // the other. With one worker the stalled encode holds it, so no
+            // finer level encodes and nothing queues.
+            let queued = usize::from(rayon::current_num_threads() > 1);
+            assert_eq!(run.work.peak_queued_waves, queued, "{profile:?}");
+            assert_eq!(bytes, serial_bytes, "{profile:?}");
+        }
+    }
+
+    /// An early fill's wave grant covers every member still in flight, even
+    /// a preceding wave the gate let past its cap because nothing else was
+    /// held.
+    #[test]
+    fn early_fill_grant_covers_an_oversized_preceding_wave() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        // Three 10-point clusters, one z2 tile each: waves of 20 and 10
+        // members against a cap of 2. Then 5 edge points: waves of 2.
+        let cluster: Vec<Geometry<f64>> = [-134.7, -44.7, 45.3]
+            .iter()
+            .flat_map(|&x| std::iter::repeat_n(Geometry::Point(Point::new(x, 30.3)), 10))
+            .collect();
+        let edge: Vec<Geometry<f64>> = (0..5)
+            .map(|k| Geometry::Point(Point::new(-150.3 + f64::from(k) * 70.0, -40.3)))
+            .collect();
+        write_mode_fixture(
+            input.path(),
+            &[((0..30).collect(), cluster), ((100..105).collect(), edge)],
+            Mode::Duplicating,
+            64,
+        );
+        for profile in [
+            MemoryProfile::Auto,
+            MemoryProfile::Speed,
+            MemoryProfile::Bounded,
+        ] {
+            let opts = ExportOptions {
+                layer_name: "waves".to_string(),
+                partition_wave: 2,
+                profile,
+                ..Default::default()
+            };
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &Pass2Knobs {
+                    hold_for_fill: true,
+                    // A fixed budget: macOS probes no memory, and a run
+                    // without a budget takes no grants.
+                    budget_available: Some(64 << 30),
+                    ..knobs(false, None, true)
+                },
+            )
+            .unwrap();
+            assert_eq!(run.level_groups, vec![0..2], "{profile:?}");
+            let fills = &run.work.fill_grants;
+            assert_eq!(fills.len(), 2, "{profile:?}: {fills:?}");
+            assert!(
+                fills.iter().all(|&(held, units)| units >= held),
+                "{profile:?}: {fills:?}"
+            );
+        }
+    }
+
     /// #647: the group cap is one full ceiling-width wave of target-sized
     /// partitions, narrowed by the same RAM budget the #311 per-level guard
     /// uses when the member size and RAM are both known.
@@ -12551,6 +13190,8 @@ mod tests {
             checkpoint_interval: Duration::ZERO,
             fail_level: None,
             panic_write_level: None,
+            hold_for_fill: false,
+            stall_first_wave: false,
             memory_limit: None,
             budget_available: None,
         }
@@ -16546,7 +17187,11 @@ mod tests {
         // Another test in this binary may have installed a logger first;
         // then only the report half of this test is checkable.
         let logging = log::set_logger(&CountingLogger).is_ok();
-        log::set_max_level(log::LevelFilter::Warn);
+        // Only with our own logger: the level is process-global too, and
+        // lowering it under another test's logger drops that test's lines.
+        if logging {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
 
         // 6 rows x 2 levels at one row per row group: 12 row groups, and
         // every level's export re-extracts the columns per batch.
@@ -20801,7 +21446,7 @@ mod tests {
             member_bytes: Some(100),
             profile: MemoryProfile::Bounded,
         };
-        let (backing, grants) = level_read_backing(read, &plan, &mut budget);
+        let (backing, grants) = level_read_backing(read, &plan, &mut budget, 0);
         assert!(matches!(
             backing,
             StoreBacking {
@@ -20831,7 +21476,7 @@ mod tests {
         // A 300 kB budget grants the 1,000-member wave and 666 of the
         // level's 2,000 members.
         let mut budget = MemoryBudget::with_available(Some(300_000));
-        let (backing, grants) = level_read_backing(read, &plan, &mut budget);
+        let (backing, grants) = level_read_backing(read, &plan, &mut budget, 0);
         assert!(matches!(
             backing,
             StoreBacking {
@@ -20859,7 +21504,7 @@ mod tests {
             profile: MemoryProfile::Auto,
         };
         let mut budget = MemoryBudget::with_available(Some(300_000));
-        let (backing, grants) = level_read_backing(read, &plan, &mut budget);
+        let (backing, grants) = level_read_backing(read, &plan, &mut budget, 0);
         assert!(matches!(
             backing,
             StoreBacking {

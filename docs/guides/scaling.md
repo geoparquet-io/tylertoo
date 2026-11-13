@@ -181,9 +181,13 @@ at start. Pass a smaller
 number on a shared machine, or a larger one to keep more cores busy.
 
 Coarse zooms are too small to fill the cores one at a time, so export runs
-consecutive small zooms together. The group holds at most as many features as
-one full wave, so `--partition-wave` also bounds it. The archive is the same
-byte for byte.
+consecutive single-wave zooms together, the finest one included, and starts
+collecting each zoom while the one before it finishes its last tiles. The
+zooms in flight hold at most one full wave of features plus 12.5%, so
+`--partition-wave` also bounds them. On the benchmark inputs this overlap
+cuts level-export time by 3–11% and costs up to 4% (60–120 MiB) more peak
+memory. `--profile bounded` skips it and keeps its peak. The archive is the
+same byte for byte.
 
 A partition always holds at least one whole tile, and export holds all of a
 tile's features at once, so no wave setting makes one dense tile smaller.

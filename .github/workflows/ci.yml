@@ -67,8 +67,8 @@
 # only on main against a moving toolchain, so they don't cache target/.
 #
 # Benchmarks run in codspeed.yml (per PR) and bench-regression.yml (label,
-# weekly); the tippecanoe parity gate (#420) runs in
-# tippecanoe-compare.yml (PRs, push to main, weekly).
+# weekly; nightly `pipeline` on the 64-core host); the tippecanoe parity
+# gate (#420) runs in tippecanoe-compare.yml (PRs, push to main, weekly).
 #
 # TOOLCHAIN POLICY: floating `stable` for all gates, with a `beta` lane in the
 # Test matrix as the early-warning system for upcoming rustc/clippy breakage
