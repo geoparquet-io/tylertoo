@@ -106,8 +106,8 @@ gate compares the two errors:
 
     d = tylertoo's error - tippecanoe's error
 
-The two archives are never compared with each other. Where tylertoo keeps
-features tippecanoe drops, a direct comparison would call that a difference;
+This view complements the direct comparison above. Where tylertoo keeps
+features tippecanoe drops, the direct comparison counts a difference;
 against the source it is a smaller error.
 
 Every per-tile error is a share from 0 (the tile draws what the source has)
