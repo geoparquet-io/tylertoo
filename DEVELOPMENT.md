@@ -670,35 +670,6 @@ uv run benchmarks/e2e/compare_tippecanoe.py \
 The comparison reads its per-zoom ratio bands from
 `benchmarks/e2e/tippecanoe_tolerances.toml`.
 
-### Visual gate
-
-The parity gate compares counts and sizes, so a moved border or a hole
-at a tile seam passes it. `benchmarks/visual/gate.py` catches those
-defects. It tiles each fixture with
-`tylertoo tiles --preset tippecanoe` and with the pinned tippecanoe,
-measures both archives against the source on the same tiles, and fails
-when the worst tylertoo tiles lose more of the source than the worst
-tippecanoe tiles do.
-
-It is a local tool. CI runs only its unit tests. Run it after a change to
-generalization, the size valve, or the preset:
-
-```bash
-# Every fixture. Exits 1 on a breach and names the tile
-uv run benchmarks/visual/gate.py
-
-# One failing cell again
-uv run benchmarks/visual/gate.py \
-  --datasets madagascar-adm4 --zooms 8
-
-# The gate's own test: six copies with known defects
-uv run benchmarks/visual/gate.py --self-test
-```
-
-A breach prints both values, the band, the worst tile, and the path of a
-PNG of that tile. `benchmarks/visual/README.md` defines each metric, shows
-how to read a breach, and has the rules for changing a band.
-
 The Test and Coverage jobs build the same pinned tippecanoe, so that
 `decode_golden_against_tippecanoe_decode` in `decode_roundtrip.rs` runs.
 On CI that test fails when `tippecanoe-decode` is missing, and locally it
@@ -710,6 +681,36 @@ eval "$(benchmarks/e2e/setup_tippecanoe.sh \
 cargo test -p tylertoo-core --test decode_roundtrip \
   decode_golden -- --nocapture
 ```
+
+### Visual gate
+
+The parity gate compares counts and sizes, so a moved border or a hole
+at a tile seam passes it. `benchmarks/visual/gate.py` catches those
+defects. It tiles each fixture with
+`tylertoo tiles --preset tippecanoe` and with the pinned tippecanoe,
+measures both archives against the source on the same tiles, and takes
+the difference of the two errors on the worst tiles of each zoom. It fails
+when that difference leaves its measured band.
+
+It is a local tool. CI runs only its unit tests. Run it after a change to
+generalization, the size valve, or the preset:
+
+```bash
+# Every fixture. Exits 1 on a breach and names the tile
+uv run benchmarks/visual/gate.py
+
+# One dataset at one zoom again
+uv run benchmarks/visual/gate.py \
+  --datasets madagascar-adm4 --zooms 8
+
+# The gate's own test: five copies with known defects
+# and one unchanged copy
+uv run benchmarks/visual/gate.py --self-test
+```
+
+A breach prints both values and the band. For a per-tile error it also
+prints the worst tile and the path of a PNG of that tile. `benchmarks/visual/README.md` defines each metric, shows
+how to read a breach, and has the rules for changing a band.
 
 ### Docs
 
