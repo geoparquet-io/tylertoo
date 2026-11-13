@@ -1,0 +1,397 @@
+# /// script
+# requires-python = ">=3.12,<3.14"
+# dependencies = [
+#   "pmtiles==3.8.1", "mapbox-vector-tile==2.2.0", "pyarrow==21.0.0", "shapely==2.1.1",
+#   "numpy==2.5.4", "rasterio==1.5.2", "pillow==13.0.0",
+# ]
+# ///
+"""
+gate.py — does tylertoo draw the source as well as tippecanoe does? (#869)
+
+For each dataset it tiles the source with `tylertoo tiles --preset tippecanoe`
+and with the pinned tippecanoe, measures BOTH against the source on the same
+tiles (metrics.py), and takes the worst tiles of each zoom: the max, p99 and
+p95 of every error. The gated number is
+
+    d = tylertoo's error - tippecanoe's error
+
+against the band for that dataset, zoom and metric in visual_tolerances.toml.
+The two archives are never compared with each other: tylertoo keeping what
+tippecanoe drops is not an error.
+
+    uv run benchmarks/visual/gate.py                    # every dataset
+    uv run benchmarks/visual/gate.py --datasets open-buildings --zooms 12,14
+    uv run benchmarks/visual/gate.py --dataset mine=/data/mine.parquet
+    uv run benchmarks/visual/gate.py --self-test        # the gate's own test
+
+A breach prints one line with both values, d, the band, the worst tile and a
+PNG of it (source | tylertoo | tippecanoe; red is source the tile does not
+draw, blue is drawn where the source has nothing, orange a wrong attribute).
+The tippecanoe side is cached under --work, so a re-run after a tylertoo
+change only tiles and scores tylertoo.
+
+Exit 0: every band holds. 1: a breach, or the self-test failed. 2: setup.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+sys.path.insert(0, str(HERE))
+# run_e2e.py owns the dataset registry and the pinned tippecanoe, and
+# compare_tippecanoe.py the tippecanoe input and the band lookup: the count
+# gate and this one must agree on all of them.
+sys.path.insert(0, str(REPO / "benchmarks" / "e2e"))
+import compare_tippecanoe as count_gate  # noqa: E402
+import metrics as M  # noqa: E402
+import mutate  # noqa: E402
+import run_e2e  # noqa: E402
+
+TOLERANCES = HERE / "visual_tolerances.toml"
+DATASETS = {
+    **run_e2e.DATASETS,
+    # Not in run_e2e.DATASETS, which would put it in the count gate too.
+    "vd-points": {"path": REPO / "tests" / "fixtures" / "variable-depth" / "points.parquet",
+                  "layer": "points"},
+}
+# What `--preset tippecanoe` stands for: tippecanoe's defaults and the size
+# valve the preset's `drop` matches (docs/guides/tippecanoe.md). No -P: parallel
+# reading reorders features and the output stops being reproducible.
+TIPPECANOE_FLAGS = ["--drop-densest-as-needed", "--quiet"]
+STATS = {"max": 100, "p99": 99, "p95": 95}
+SEAM = ("edge_gap", "excess_change")
+
+
+def digest(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def file_sha(path: Path) -> str:
+    return hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+
+
+def run(argv: list, log: Path) -> None:
+    with log.open("w") as f:
+        rc = subprocess.run([str(a) for a in argv], stdout=f, stderr=subprocess.STDOUT).returncode
+    if rc:
+        raise SystemExit(f"error: exit {rc}: {' '.join(map(str, argv))}\n{log.read_text()[-2000:]}")
+
+
+# --------------------------------------------------------------------------
+# archives
+# --------------------------------------------------------------------------
+
+
+def tylertoo_archive(args, did: str, ds: dict, zr: list, extra=()) -> Path:
+    out = args.work / "tylertoo"
+    out.mkdir(parents=True, exist_ok=True)
+    dst = out / f"{did}{''.join(extra)}.pmtiles"
+    run([args.tylertoo, "tiles", ds["path"], dst, "--preset", "tippecanoe", "--min-zoom", zr[0],
+         "--max-zoom", zr[1], "--layer-name", ds["layer"], "--force", *extra], dst.with_suffix(".log"))
+    return dst
+
+
+def tippecanoe_dir(args, tip: dict, did: str, ds: dict, zr: list) -> Path:
+    """The tippecanoe archive of a source: it depends on the source, the
+    binary and the flags only, so it is made once and kept."""
+    key = digest([file_sha(Path(ds["path"])), tip["version"], TIPPECANOE_FLAGS, zr, ds["layer"]])
+    d = args.work / "tippecanoe" / f"{did}-{key[:12]}"
+    if not (d / "archive.pmtiles").exists():
+        d.mkdir(parents=True, exist_ok=True)
+        geojson = count_gate.to_geojsonseq(Path(ds["path"]), d, did)
+        run([tip["binary"], "-o", d / "part.pmtiles", "-f", "-Z", zr[0], "-z", zr[1], "-l", ds["layer"],
+             *TIPPECANOE_FLAGS, geojson], d / "tippecanoe.log")
+        geojson.unlink()
+        (d / "part.pmtiles").rename(d / "archive.pmtiles")
+    return d
+
+
+# --------------------------------------------------------------------------
+# scoring
+# --------------------------------------------------------------------------
+
+
+def score(archive: Path, src: M.Source, attr: str | None, zooms: list, cap: int) -> dict:
+    """{zoom: {"tiles": {"x/y": errors}, "seams": {...}}} for the sampled
+    tiles that pass the source-cover floor."""
+    tiles, gz = M.read_archive(archive)
+    out = {}
+    for z in zooms:
+        seeds = M.sample_tiles(src, z, cap)
+        evaluate = set(seeds)
+        if src.kind == "polygon":  # a seam needs the right and the lower neighbour
+            evaluate |= {n for (_, x, y) in seeds for n in ((z, x + 1, y), (z, x, y + 1))}
+        per, colour, ref = {}, {}, {}
+        for k in sorted(evaluate):
+            decoded = M.decode(tiles[k], gz)[1] if k in tiles else {}
+            if src.kind == "polygon":
+                rasters = M.polygon_rasters(decoded, src, attr, *k)
+                colour[k], ref[k] = rasters[0], rasters[1] > 0
+                errors = M.polygon_errors(decoded, src, attr, *k, rasters=rasters)
+            else:
+                errors = M.ERRORS[src.kind](decoded, src, attr, *k)
+            if errors is not None and k in seeds:
+                per[f"{k[1]}/{k[2]}"] = errors
+        out[str(z)] = {"tiles": per}
+        if src.kind == "polygon":
+            seam = M.seams(seeds, colour, ref, M.PX)
+            out[str(z)]["seams"] = {m: seam[m] for m in SEAM}
+    return out
+
+
+def cached_score(d: Path, src: M.Source, attr, zooms: list, cap: int) -> dict:
+    key = digest([zooms, cap, attr, file_sha(HERE / "metrics.py")])
+    f = d / f"scores-{key[:12]}.json"
+    if not f.exists():
+        f.write_text(json.dumps(score(d / "archive.pmtiles", src, attr, zooms, cap)))
+    return json.loads(f.read_text())
+
+
+def worst_tiles(zrec: dict) -> dict:
+    """{metric_stat: (value, worst tile)} for one zoom of one archive."""
+    out = {}
+    for metric in sorted({m for e in zrec["tiles"].values() for m in e}):
+        vals = {t: e[metric] for t, e in zrec["tiles"].items() if e.get(metric) is not None}
+        if vals:
+            worst = max(vals, key=vals.get)
+            for stat, q in STATS.items():
+                out[f"{metric}_{stat}"] = (float(np.percentile(list(vals.values()), q)), worst)
+    for metric, v in zrec.get("seams", {}).items():
+        if v is not None:
+            out[metric] = (v, None)
+    return out
+
+
+def compare(did: str, ty: dict, tip: dict, tol: dict) -> list:
+    """One row per zoom and metric: both values, d, the band, and whether d is in it."""
+    rows = []
+    for z in ty:
+        a, b = worst_tiles(ty[z]), worst_tiles(tip[z])
+        for name in a:
+            if name not in b:
+                continue
+            d = a[name][0] - b[name][0]
+            band = count_gate.zoom_band(tol, did, name, int(z)) or tol["gate"].get("default_band")
+            rows.append({"dataset": did, "zoom": int(z), "metric": name, "tylertoo": a[name][0],
+                         "tippecanoe": b[name][0], "d": d, "band": band,
+                         "ok": count_gate.in_band(d, band), "tile": a[name][1] and f"{z}/{a[name][1]}"})
+    return rows
+
+
+def worse(r: dict) -> bool:
+    """Outside the band on the high side: tylertoo draws worse than the band
+    allows. Outside on the low side it draws better, and the band is stale."""
+    return r["ok"] is False and r["d"] > r["band"][1]
+
+
+def cluster_rows(args, did: str, ds: dict, src: M.Source, zr: list, zooms: list) -> list:
+    """With --cluster every source point must be counted exactly once per zoom."""
+    tiles, gz = M.read_archive(tylertoo_archive(args, did, ds, zr, extra=("--cluster",)))
+    rows = []
+    for z in zooms:
+        total = M.cluster_sum(M.decode(data, gz)[1] for k, data in tiles.items() if k[0] == z)
+        rows.append({"dataset": did, "zoom": z, "metric": "point_count_sum", "tylertoo": total,
+                     "source": len(src.geoms), "d": abs(total - len(src.geoms)), "band": [0, 0],
+                     "ok": total == len(src.geoms), "tile": None})
+    return rows
+
+
+# --------------------------------------------------------------------------
+# worst-tile images
+# --------------------------------------------------------------------------
+
+
+def masks(decoded: dict, src: M.Source, attr, z: int, x: int, y: int):
+    """(drawn, source, wrong attribute) pixel masks of one tile."""
+    if src.kind == "polygon":
+        drawn, ref = M.polygon_rasters(decoded, src, attr, z, x, y)
+        wrong = (drawn > 0) & (ref > 0) & (drawn != ref) if src.colours else np.zeros_like(drawn, bool)
+        return drawn > 0, ref > 0, wrong
+    from affine import Affine
+    from rasterio.features import rasterize
+    from shapely.geometry import box
+
+    def touched(shapes, transform):
+        shapes = [(g, 1) for g in shapes if not g.is_empty]
+        if not shapes:
+            return np.zeros((M.PX, M.PX), bool)
+        return rasterize(shapes, out_shape=(M.PX, M.PX), transform=transform, fill=0,
+                         dtype="uint8", all_touched=True).astype(bool)
+
+    feats = list(M.features(decoded, M.KINDS[src.kind]))
+    s = (feats[0][2] if feats else M.EXTENT_DEFAULT) / M.PX
+    b = M.tile_bounds_3857(z, x, y)
+    w = (b[2] - b[0]) / M.PX
+    drawn = touched([g for g, _, _ in feats], Affine(s, 0, 0, 0, s, 0))
+    ref = touched([src.geoms[i] for i in src.tree.query(box(*b))], Affine(w, 0, b[0], 0, -w, b[3]))
+    return drawn, ref, np.zeros_like(drawn)
+
+
+def write_png(path: Path, src: M.Source, attr, tile: str, archives: dict) -> None:
+    from PIL import Image
+
+    z, x, y = (int(v) for v in tile.split("/"))
+    panels = []
+    for archive in archives.values():
+        tiles, gz = M.read_archive(archive)
+        decoded = M.decode(tiles[(z, x, y)], gz)[1] if (z, x, y) in tiles else {}
+        drawn, ref, wrong = masks(decoded, src, attr, z, x, y)
+        if not panels:
+            img = np.full((M.PX, M.PX, 3), 255, np.uint8)
+            img[ref] = (200, 200, 200)
+            panels.append(img)
+        img = np.full((M.PX, M.PX, 3), 255, np.uint8)
+        img[drawn] = (200, 200, 200)
+        img[wrong] = (240, 150, 0)      # drawn, with another feature's attribute
+        img[ref & ~drawn] = (220, 30, 30)   # missing: source only
+        img[drawn & ~ref] = (30, 80, 220)   # added: tile only
+        panels.append(img)
+    gap = np.full((M.PX, 4, 3), 0, np.uint8)
+    row = np.concatenate([p for panel in panels for p in (panel, gap)][:-1], axis=1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(row).resize((row.shape[1] * 2, row.shape[0] * 2), Image.NEAREST).save(path)
+
+
+# --------------------------------------------------------------------------
+# report
+# --------------------------------------------------------------------------
+
+
+def line(r: dict) -> str:
+    other = f"tippecanoe {r['tippecanoe']:.4f}" if "tippecanoe" in r else f"source {r['source']}"
+    band = f"band [{r['band'][0]}, {r['band'][1]}]" if r["band"] else "no band"
+    return (f"{r['dataset']} z{r['zoom']} {r['metric']}: tylertoo {r['tylertoo']:.4f} {other} "
+            f"d {r['d']:+.4f} {band}" + (f" tile {r['tile']}" if r["tile"] else "")
+            + (f" png {r['png']}" if r.get("png") else ""))
+
+
+def gate_dataset(args, tol: dict, tip: dict, did: str, ds: dict) -> list:
+    cfg = tol.get("datasets", {}).get(did, {})
+    attr = cfg.get("color_attr")
+    zr = tol["gate"]["zoom_range"]
+    zooms = args.zooms or cfg.get("zooms") or tol["gate"]["zooms"]
+    src = M.read_source(Path(ds["path"]), attr)
+    tip_dir = tippecanoe_dir(args, tip, did, ds, zr)
+    ty_archive = tylertoo_archive(args, did, ds, zr)
+    rows = compare(did, score(ty_archive, src, attr, zooms, args.cap),
+                   cached_score(tip_dir, src, attr, zooms, args.cap), tol)
+    if src.kind == "point":
+        rows += cluster_rows(args, did, ds, src, zr, zooms)
+    for r in rows:
+        if worse(r) and r["tile"]:
+            r["png"] = str(args.png_dir / f"{did}_z{r['zoom']}_{r['metric']}.png")
+            write_png(Path(r["png"]), src, attr, r["tile"],
+                      {"tylertoo": ty_archive, "tippecanoe": tip_dir / "archive.pmtiles"})
+    return rows
+
+
+def self_test(args, tol: dict, tip: dict) -> bool:
+    """Every known defect must breach a band, and the unchanged copy must not."""
+    cfg = tol["self_test"]
+    did, zooms = cfg["dataset"], cfg["zooms"]
+    ds = DATASETS[did]
+    attr = tol["datasets"][did].get("color_attr")
+    zr = tol["gate"]["zoom_range"]
+    src = M.read_source(Path(ds["path"]), attr)
+    tip_scores = cached_score(tippecanoe_dir(args, tip, did, ds, zr), src, attr, zooms, args.cap)
+    original = tylertoo_archive(args, did, ds, zr)
+    base = score(original, src, attr, zooms, args.cap)
+    z = str(zooms[len(zooms) // 2])
+    gated = sorted(base[z]["tiles"])
+    empty = (int(z), *(int(v) for v in gated[len(gated) // 2].split("/")))
+    ok = True
+    for kind in mutate.MUTANTS:
+        copy = args.work / "tylertoo" / f"{did}.{kind}.pmtiles"
+        mutate.mutate(original, copy, kind, zooms, attr, empty)
+        rows = compare(did, score(copy, src, attr, zooms, args.cap), tip_scores, tol)
+        caught = sorted(filter(worse, rows), key=lambda r: r["band"][1] - r["d"])
+        failed = [r for r in rows if r["ok"] is False]
+        if kind == "control":
+            good = not failed
+            print(f"self-test control: {'passes' if good else 'BREACHES ' + line(failed[0])}")
+        else:
+            good = bool(caught)
+            print(f"self-test {kind}: " + (f"caught, {len(caught)} breaches, worst {line(caught[0])}"
+                                           if good else "NOT CAUGHT"))
+        ok &= good
+        copy.unlink()
+    return ok
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--datasets", help="comma list of dataset ids (default: all)")
+    ap.add_argument("--dataset", action="append", default=[], metavar="ID=PATH",
+                    help="score another GeoParquet file (repeatable)")
+    ap.add_argument("--zooms", help="comma list, instead of each dataset's zooms")
+    ap.add_argument("--cap", type=int, default=100, help="sampled tiles per zoom")
+    ap.add_argument("--self-test", action="store_true",
+                    help="inject known defects and check that each one breaches")
+    ap.add_argument("--tylertoo", default=os.environ.get("TYLERTOO", str(REPO / "target" / "release" / "tylertoo")))
+    ap.add_argument("--tippecanoe", default=os.environ.get("TIPPECANOE"))
+    ap.add_argument("--tolerances", type=Path, default=TOLERANCES)
+    ap.add_argument("--work", type=Path, default=Path.home() / "bench-data" / "visual")
+    ap.add_argument("--png-dir", type=Path, help="default: <work>/png")
+    ap.add_argument("--json", type=Path, help="write every row here")
+    ap.add_argument("--verbose", action="store_true", help="print every row, not only breaches")
+    args = ap.parse_args()
+    args.zooms = [int(z) for z in args.zooms.split(",")] if args.zooms else None
+    args.png_dir = args.png_dir or args.work / "png"
+
+    datasets = dict(DATASETS)
+    for spec in args.dataset:
+        did, _, path = spec.partition("=")
+        datasets[did] = {"path": Path(path), "layer": did}
+    only = args.datasets.split(",") if args.datasets else [d for d, _, _ in (s.partition("=") for s in args.dataset)]
+    datasets = {d: datasets[d] for d in only} if only else datasets
+    try:
+        tip = run_e2e.resolve_tippecanoe(args.tippecanoe)
+    except run_e2e.TippecanoeUnavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    missing = [str(p) for p in [Path(args.tylertoo), *(Path(d["path"]) for d in datasets.values())] if not p.exists()]
+    if missing:
+        print(f"error: not found: {', '.join(missing)}\n  build with `cargo build --release --package tylertoo`; "
+              "fixtures: gh release download fixtures-v1 --dir tests/fixtures/realdata/", file=sys.stderr)
+        return 2
+    tol = count_gate.load_tolerances(args.tolerances)
+
+    if args.self_test:
+        return 0 if self_test(args, tol, tip) else 1
+
+    rows = []
+    for did, ds in datasets.items():
+        got = gate_dataset(args, tol, tip, did, ds)
+        bad = [r for r in got if r["ok"] is False]
+        print(f"{did}: {len(got)} cells, {len(bad)} outside their band", flush=True)
+        for r in got if args.verbose else bad:
+            tag = "ok      " if r["ok"] else "BREACH  " if worse(r) else "IMPROVED" if r["ok"] is False else "no band "
+            print(f"  {tag} {line(r)}", flush=True)
+        rows += got
+    if args.json:
+        args.json.write_text(json.dumps({"tippecanoe": tip, "tolerances": str(args.tolerances), "rows": rows}, indent=2))
+    bad = [r for r in rows if r["ok"] is False]
+    if bad:
+        if not all(map(worse, bad)):
+            print("IMPROVED: d is below its band. Tighten the band in visual_tolerances.toml, "
+                  "with the new measurement in its comment.")
+        print("re-run only these: uv run benchmarks/visual/gate.py --datasets "
+              + ",".join(sorted({r["dataset"] for r in bad}))
+              + " --zooms " + ",".join(str(z) for z in sorted({r["zoom"] for r in bad})))
+        return 1
+    print("visual gate: every band holds")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
