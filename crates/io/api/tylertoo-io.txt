@@ -196,6 +196,7 @@ pub fn tylertoo_io::ParquetSource<R>::parquet_schema(&self) -> &parquet::schema:
 pub fn tylertoo_io::ParquetSource<R>::reader_metadata(&self) -> &tylertoo_io::ReaderMetadata
 pub fn tylertoo_io::ParquetSource<R>::schema(&self) -> &arrow_schema::schema::SchemaRef
 pub fn tylertoo_io::ParquetSource<R>::with_batch_rows(self, usize) -> Self
+pub fn tylertoo_io::ParquetSource<R>::with_decode_threads(self, usize) -> Self where R: tylertoo_io::ConcurrentChunkReader
 pub fn tylertoo_io::ParquetSource<R>::with_limit(self, usize) -> Self
 pub fn tylertoo_io::ParquetSource<R>::with_projection(self, parquet::arrow::ProjectionMask) -> Self
 pub fn tylertoo_io::ParquetSource<R>::with_projection_roots(self, impl core::iter::traits::collect::IntoIterator<Item = usize>) -> Self
@@ -275,6 +276,8 @@ impl<R> !core::panic::unwind_safe::UnwindSafe for tylertoo_io::UntrustedIpcReade
 pub const tylertoo_io::BYTE_ARRAY_BATCH_LIMIT: u64
 pub const tylertoo_io::DEFAULT_BATCH_ROWS: usize
 pub const tylertoo_io::IPC_CODEC_SCRATCH_BYTES: u64
+pub trait tylertoo_io::ConcurrentChunkReader: parquet::file::reader::ChunkReader
+impl tylertoo_io::ConcurrentChunkReader for bytes::bytes::Bytes
 pub fn tylertoo_io::batch_writer<W: core::io::write::Write + core::marker::Send>(W, arrow_schema::schema::SchemaRef) -> core::result::Result<tylertoo_io::BatchWriter<W>, parquet::errors::ParquetError>
 pub fn tylertoo_io::byte_array_limit() -> u64
 pub fn tylertoo_io::check_byte_array_ceiling(&arrow_array::record_batch::RecordBatch) -> core::result::Result<(), arrow_schema::error::ArrowError>

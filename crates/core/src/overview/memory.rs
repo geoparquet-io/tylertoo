@@ -44,6 +44,13 @@ const FALLBACK_ALLOWANCE_BYTES: u64 = 4 << 30;
 /// mostly for (#294).
 const READ_SHARE: f64 = 0.10;
 
+/// What each extra column-split decode thread adds to resident memory
+/// (#876), on top of the read-ahead: allocator retention, not decoded data.
+/// Measured on Overture places (53 columns, 4 readers x 3 extra threads):
+/// pass 2's peak rose 192-300 MiB with the split, about 20 MiB per thread,
+/// and fell below main's with `MIMALLOC_PURGE_DELAY=0`.
+const READ_DECODE_THREAD_BYTES: u64 = 24 << 20;
+
 /// Share of the allowance the pass-2 compute window may hold (#716).
 const COMPUTE_SHARE: f64 = 0.10;
 
@@ -172,6 +179,15 @@ pub(super) enum PriceBasis {
     Footer,
     /// A per-row model ([`MemoryBudget::estimate`]), not a measurement.
     Model,
+}
+
+/// How a parallel read decodes ([`MemoryBudget::read_decode_plan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DecodePlan {
+    /// Threads each reader decodes a batch's columns on.
+    pub(super) threads: usize,
+    /// Read batches the extra threads are charged as.
+    pub(super) units: usize,
 }
 
 /// The resident cost of one unit of a phase: one read batch, one window
@@ -395,6 +411,42 @@ impl MemoryBudget {
                     .max(1)
             }
         }
+    }
+    /// How each of `workers` parallel readers decodes (#876), given the
+    /// `held` units of `price` its queues and row groups already take.
+    ///
+    /// The quarter of `cores` the readers are sized from
+    /// (`convert::resolve_pass_read_workers`) is shared among them, so each
+    /// splits a batch's columns over that many threads. The split decodes
+    /// the same rows, so it adds no data in flight, only the allocator
+    /// retention of the extra threads ([`READ_DECODE_THREAD_BYTES`]),
+    /// charged here in read batches. When the read share does not hold that
+    /// charge on top of `held`, and always under `bounded` (memory over
+    /// speed), a reader decodes on one thread.
+    pub(super) fn read_decode_plan(
+        &self,
+        profile: MemoryProfile,
+        workers: usize,
+        cores: usize,
+        price: Price,
+        held: usize,
+    ) -> DecodePlan {
+        let one = DecodePlan {
+            threads: 1,
+            units: 0,
+        };
+        let threads = (cores / 4 / workers.max(1)).max(1);
+        if matches!(profile, MemoryProfile::Bounded) || threads == 1 {
+            return one;
+        }
+        let extra = (workers as u64)
+            .saturating_mul(threads as u64 - 1)
+            .saturating_mul(READ_DECODE_THREAD_BYTES);
+        let units = usize::try_from(extra.div_ceil(price.bytes.max(1))).unwrap_or(usize::MAX);
+        if held.saturating_add(units) > self.affordable(profile, MemoryPhase::Read, price) {
+            return one;
+        }
+        DecodePlan { threads, units }
     }
     /// Grant `phase` units of `price` under `profile`, never fewer than
     /// `floor` (a phase that cannot run below it): `auto` what its share of
@@ -680,6 +732,45 @@ impl MemoryBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #876: the readers' quarter of the cores is shared among them for
+    /// column-split decode, each extra thread charged its allocator
+    /// retention; `bounded`, a small machine, or a read share without room
+    /// for that charge keeps one thread.
+    #[test]
+    fn read_decode_plan_charges_its_threads_or_keeps_one() {
+        use MemoryProfile::{Auto, Bounded, Speed};
+        let price = Price::new(6 << 20, PriceBasis::Footer);
+        let rich = MemoryBudget::with_available(Some(256 << 30));
+        let charge = |workers: u64, threads: u64| {
+            (workers * (threads - 1) * READ_DECODE_THREAD_BYTES).div_ceil(6 << 20) as usize
+        };
+        let plan = rich.read_decode_plan(Auto, 4, 64, price, 132);
+        assert_eq!(
+            plan,
+            DecodePlan {
+                threads: 4,
+                units: charge(4, 4)
+            }
+        );
+        assert!(plan.units > 0, "extra decode threads are charged");
+        assert_eq!(rich.read_decode_plan(Speed, 2, 64, price, 66).threads, 8);
+        let one = DecodePlan {
+            threads: 1,
+            units: 0,
+        };
+        assert_eq!(rich.read_decode_plan(Bounded, 4, 64, price, 132), one);
+        assert_eq!(rich.read_decode_plan(Auto, 4, 8, price, 132), one);
+        assert_eq!(rich.read_decode_plan(Auto, 0, 1, price, 0), one);
+        // A read share that holds the read-ahead but not the charge on top.
+        let affordable = rich.affordable(Auto, MemoryPhase::Read, price);
+        let full = affordable - charge(4, 4) + 1;
+        assert_eq!(rich.read_decode_plan(Auto, 4, 64, price, full), one);
+        assert_eq!(
+            rich.read_decode_plan(Auto, 4, 64, price, full - 1).threads,
+            4
+        );
+    }
 
     /// A non-`speed` run is held to the allowance, leaving the probed rest
     /// for what no phase prices; `speed` only to the probed figure.

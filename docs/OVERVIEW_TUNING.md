@@ -2196,6 +2196,21 @@ makes the worker wait mid-run, and the reads serialize again. A
 `[convert] read:` debug line reports it. A single-row-group file
 always reads sequentially.
 
+Each worker also splits a batch's columns over several threads (#876): the
+read columns are cut into runs of whole columns balanced by footer bytes, each
+run decoded by its own Parquet reader over the same rows, and the runs joined
+back, so the batches are the ones one thread decodes. The workers share the
+quarter of the cores they are sized from (4 threads per worker on 64 cores, 1
+on 16 or fewer). There is no flag: the memory budget owns it. Under `auto` and
+`speed` each extra thread is charged 24 MiB of read-ahead, its measured
+allocator retention; when the read share cannot hold that charge, and always
+under `bounded`, a worker decodes on one thread. Export's band reads, which
+wait on their consumer, use one thread. On a 64-core host this took pass 2 on
+Overture lines (97 columns, 86 of them lists) from 0.980 to 0.744 s and on
+wide-property places (53 columns) from 1.324 to 1.004 s, for a median 18 MiB
+more peak RSS on places (73 MiB on lines, 88 MiB on FTW Brazil MT, five runs
+each). Inputs with few columns or one dominant geometry column gain little.
+
 For multi-GB partitioning inputs, `speed` can exhaust RAM: buffered output
 may approach input size. `auto` selects `bounded` for large partitioning
 and over-budget runs. Watch peak RSS if you explicitly choose `speed`.

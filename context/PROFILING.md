@@ -871,8 +871,15 @@ a0916f04. These limits stay as they are:
   mimalloc purge delay, larger queues, eager rayon sleep (+14% wall), core
   affinity, sibling hardware threads, and memory-node placement.
 - More pass-2 readers cut pass 2 by 16–20% on line and wide-property inputs,
-  but raise peak RSS by about 75–107 MiB. The reader count and the default
-  worker cap of 40 stay.
+  but raised peak RSS by about 75–107 MiB, so the reader count stays. The
+  readers instead split each batch's columns over several threads (#876),
+  which holds no more decoded rows: pass 2 on Overture lines went from 0.980
+  to 0.744 s and on wide-property places from 1.324 to 1.004 s. The cost is
+  allocator retention of the extra threads, not data in flight: wide-property
+  places' peak RSS rose a median 18 MiB (lines 73 MiB, FTW Brazil MT 88 MiB),
+  and with `MIMALLOC_PURGE_DELAY=0` pass 2's peak was lower than without the
+  split. `MemoryBudget` charges it, and `bounded` keeps one thread per reader.
+  The default worker cap of 40 stays.
 - Export finalize used to stall on one `fdatasync` of the whole archive. On
   Linux the archive is now written back while export runs.
 

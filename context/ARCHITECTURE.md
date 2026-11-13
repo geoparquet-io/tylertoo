@@ -358,7 +358,14 @@ verbatim (spec §2.4).
    sink side each level's `bounded`-profile spill is written by its own
    spill-writer thread behind a `bounded(2)` queue, so the consumer hands the
    batch over instead of encoding it. Output is byte-identical for every worker
-   count. A remote input reads sequentially (its parts share one chunk cache
+   count. Since #876 each worker also splits a batch's columns over several
+   threads: one Parquet reader per run of whole columns over the same row
+   groups and batch size, decoded concurrently and joined column-wise
+   (`tylertoo_io::ParquetSource::with_decode_threads`). The thread count and
+   its memory charge are `MemoryBudget::read_decode_plan`'s; a local input
+   reads positionally (`read_at`) because parquet's own `File` reader seeks an
+   offset shared by every clone of the handle. A remote input reads
+   sequentially (its parts share one chunk cache
    that concurrent fetching readers would evict) unless pass 0 staged every
    chunk the read touches to the disk spill. Then it fetches nothing and
    reads in parallel like a local file (#544, `ConvertSource::reads_locally`).

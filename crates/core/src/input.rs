@@ -913,7 +913,12 @@ impl ChunkReader for InputReader {
 
     fn get_read(&self, start: u64) -> Result<Self::T, ParquetError> {
         match self {
-            InputReader::Local(f) => Ok(Box::new(f.get_read(start)?)),
+            // Positional, not parquet's `File` reader, which seeks the
+            // offset every clone of the handle shares (#876).
+            InputReader::Local(f) => Ok(Box::new(std::io::BufReader::new(LocalRead {
+                file: f.try_clone()?,
+                pos: start,
+            }))),
             #[cfg(feature = "remote")]
             InputReader::Remote(r) => Ok(Box::new(r.sequential_reader(start))),
         }
@@ -921,11 +926,52 @@ impl ChunkReader for InputReader {
 
     fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes, ParquetError> {
         match self {
-            InputReader::Local(f) => f.get_bytes(start, length),
+            InputReader::Local(f) => {
+                let mut buf = vec![0; length];
+                let mut done = 0;
+                while done < length {
+                    match read_at(f, &mut buf[done..], start.saturating_add(done as u64))? {
+                        0 => {
+                            return Err(ParquetError::EOF(format!(
+                                "Expected to read {length} bytes, read only {done}"
+                            )))
+                        }
+                        n => done += n,
+                    }
+                }
+                Ok(buf.into())
+            }
             #[cfg(feature = "remote")]
             InputReader::Remote(r) => r.get_bytes_range(start, length),
         }
     }
+}
+
+/// Every read is positional (a local file's reads share no cursor, a
+/// remote one's are range requests), so column-split decode may read
+/// through one [`InputReader`] from several threads.
+impl tylertoo_io::ConcurrentChunkReader for InputReader {}
+
+/// A local file read forward from `pos` without its shared offset.
+struct LocalRead {
+    file: File,
+    pos: u64,
+}
+
+impl Read for LocalRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = read_at(&self.file, buf, self.pos)?;
+        self.pos = self.pos.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
+/// One positional read of `file` at `at`, leaving any file offset alone.
+fn read_at(file: &File, buf: &mut [u8], at: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    return std::os::unix::fs::FileExt::read_at(file, buf, at);
+    #[cfg(windows)]
+    return std::os::windows::fs::FileExt::seek_read(file, buf, at);
 }
 
 #[cfg(feature = "remote")]
@@ -4918,6 +4964,37 @@ pub(crate) fn test_memory_source_with_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #876: a local input reads positionally, so readers on several
+    /// threads sharing one handle each read their own bytes. Parquet's
+    /// `File` reader seeks the offset every clone of the handle shares.
+    #[test]
+    fn local_reads_from_several_threads_through_one_handle_get_their_own_bytes() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bytes.bin");
+        let data: Vec<u8> = (0..1u32 << 20)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        std::fs::write(&path, &data).unwrap();
+        let reader = InputReader::Local(File::open(&path).unwrap());
+        std::thread::scope(|s| {
+            for t in 0..8u64 {
+                let (reader, data) = (&reader, &data);
+                s.spawn(move || {
+                    for i in 0..2_000u64 {
+                        let at = (t * 7_919 + i * 104_729) % (data.len() as u64 - 4_096);
+                        let len = 1 + (i as usize * 37) % 4_096;
+                        let want = &data[at as usize..at as usize + len];
+                        assert_eq!(&reader.get_bytes(at, len).unwrap()[..], want);
+                        let mut got = vec![0; len];
+                        reader.get_read(at).unwrap().read_exact(&mut got).unwrap();
+                        assert_eq!(got, want);
+                    }
+                });
+            }
+        });
+    }
 
     /// #820: a URL's query (a presigned or SAS signature) never reaches a
     /// displayed or persisted copy of the input; a local path keeps its `?`.

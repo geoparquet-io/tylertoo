@@ -1523,6 +1523,13 @@ pub fn decoded_input_bytes(
 /// The parquet reader's default batch size, used when a caller sets none.
 pub const DEFAULT_BATCH_ROWS: usize = 1024;
 
+/// A [`ChunkReader`] whose reads share no cursor, so several readers may
+/// read through it at once ([`ParquetSource::with_decode_threads`]).
+/// Parquet's own `File` reader seeks a shared file offset, so it is not one.
+pub trait ConcurrentChunkReader: ChunkReader {}
+
+impl ConcurrentChunkReader for Bytes {}
+
 /// A checked Parquet file, ready to read: the footer has passed the
 /// pre-check and the chunk-range check, and the Arrow schema decoded inside
 /// the panic boundary.
@@ -1537,6 +1544,7 @@ pub struct ParquetSource<R: ChunkReader + 'static> {
     row_groups: Option<Vec<usize>>,
     batch_rows: usize,
     limit: Option<usize>,
+    decode_threads: usize,
 }
 
 impl<R: ChunkReader + 'static> std::fmt::Debug for ParquetSource<R> {
@@ -1574,6 +1582,7 @@ pub fn open_parquet_with_metadata<R: ChunkReader + 'static>(
         row_groups: None,
         batch_rows: DEFAULT_BATCH_ROWS,
         limit: None,
+        decode_threads: 1,
     }
 }
 
@@ -1630,6 +1639,20 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
         self
     }
 
+    /// Decode each batch's columns on up to `threads` threads (#876): the
+    /// read columns are cut into runs of whole roots balanced by footer
+    /// bytes, each run decoded by its own reader over the same rows, and
+    /// the runs joined column-wise. The batches are those of one reader,
+    /// and no more rows are decoded ahead; `1` (the default) is one reader.
+    #[must_use]
+    pub fn with_decode_threads(mut self, threads: usize) -> Self
+    where
+        R: ConcurrentChunkReader,
+    {
+        self.decode_threads = threads;
+        self
+    }
+
     /// Read at most `rows` rows, without decoding the remaining data pages.
     #[must_use]
     pub fn with_limit(mut self, rows: usize) -> Self {
@@ -1672,23 +1695,36 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
             reader: Arc::new(self.reader),
             hit: page_eof.clone(),
         };
+        let masks = column_splits(
+            &self.metadata,
+            self.projection.as_ref(),
+            self.decode_threads,
+        );
         let projection = self.projection;
         let open: OpenGroups = Box::new(move |groups, limit| {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "#779: reader owner reuses checked metadata and applies batch limits"
-            )]
-            let mut builder =
-                ParquetRecordBatchReaderBuilder::new_with_metadata(guard.clone(), metadata.clone())
-                    .with_batch_size(rows)
-                    .with_row_groups(groups);
-            if let Some(projection) = &projection {
-                builder = builder.with_projection(projection.clone());
+            let one = |mask: Option<&ProjectionMask>| {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "#779: reader owner reuses checked metadata and applies batch limits"
+                )]
+                let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    guard.clone(),
+                    metadata.clone(),
+                )
+                .with_batch_size(rows)
+                .with_row_groups(groups.clone());
+                if let Some(mask) = mask {
+                    builder = builder.with_projection(mask.clone());
+                }
+                if let Some(limit) = limit {
+                    builder = builder.with_limit(limit);
+                }
+                guard_parquet("parquet reader", || builder.build())
+            };
+            if masks.len() < 2 {
+                return Ok(vec![one(projection.as_ref())?]);
             }
-            if let Some(limit) = limit {
-                builder = builder.with_limit(limit);
-            }
-            guard_parquet("parquet reader", || builder.build())
+            masks.iter().map(|m| one(Some(m))).collect()
         });
         let groups = self
             .row_groups
@@ -1696,8 +1732,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
         let inner = GroupReaders::open(open, groups, self.limit)?;
         let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
             inner
-                .current
-                .schema()
+                .schema
                 .fields()
                 .iter()
                 .map(|f| {
@@ -1722,8 +1757,144 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
 
 /// Opens a Parquet reader over some row groups, reading at most some rows.
 type OpenGroups = Box<
-    dyn FnMut(Vec<usize>, Option<usize>) -> Result<ParquetRecordBatchReader, ParquetError> + Send,
+    dyn FnMut(Vec<usize>, Option<usize>) -> Result<Vec<ParquetRecordBatchReader>, ParquetError>
+        + Send,
 >;
+
+/// Contiguous runs of `projection`'s leaves (every leaf when `None`), whole
+/// roots each, balanced by footer bytes into at most `splits` masks.
+/// Concatenating the masks' decoded columns in order gives the columns of
+/// one reader over `projection`. Empty when `splits < 2`.
+fn column_splits(
+    metadata: &ReaderMetadata,
+    projection: Option<&ProjectionMask>,
+    splits: usize,
+) -> Vec<ProjectionMask> {
+    let descr = metadata.parquet_schema();
+    let leaves: Vec<usize> = (0..descr.num_columns())
+        .filter(|&l| projection.is_none_or(|m| m.leaf_included(l)))
+        .collect();
+    if splits < 2 || leaves.is_empty() {
+        return Vec::new();
+    }
+    let bytes = |leaf: usize| -> u64 {
+        metadata
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|g| g.column(leaf).uncompressed_size().max(0) as u64)
+            .sum::<u64>()
+            .max(1)
+    };
+    // Whole roots: a root's leaves decode into one array.
+    let mut roots: Vec<(Vec<usize>, u64)> = Vec::new();
+    for &leaf in &leaves {
+        let root = descr.get_column_root_idx(leaf);
+        match roots.last_mut() {
+            Some((ls, b)) if descr.get_column_root_idx(ls[0]) == root => {
+                ls.push(leaf);
+                *b += bytes(leaf);
+            }
+            _ => roots.push((vec![leaf], bytes(leaf))),
+        }
+    }
+    let total: u64 = roots.iter().map(|r| r.1).sum();
+    let target = total.div_ceil(splits as u64);
+    let mut out: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut acc = 0u64;
+    for (ls, b) in roots {
+        if acc > 0 && acc + b / 2 > target && out.len() < splits {
+            out.push(Vec::new());
+            acc = 0;
+        }
+        out.last_mut().unwrap().extend(ls);
+        acc += b;
+    }
+    if out.len() < 2 {
+        return Vec::new();
+    }
+    out.into_iter()
+        .map(|ls| ProjectionMask::leaves(descr, ls))
+        .collect()
+}
+
+/// Column splits of one read disagree on their rows: never from a file the
+/// footer check passed, since every split reads the same row groups.
+fn split_mismatch() -> ArrowError {
+    ArrowError::ParquetError("column splits decoded different rows".into())
+}
+
+/// `f` over `0..counts.sum()`, the run of each count on its own thread
+/// (the first on this one), results in order.
+fn map_split<T: Send>(counts: &[usize], f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let total: usize = counts.iter().sum();
+    if counts.len() < 2 {
+        return (0..total).map(&f).collect();
+    }
+    let mut starts = Vec::with_capacity(counts.len());
+    let mut at = 0;
+    for &c in counts {
+        starts.push(at..at + c);
+        at += c;
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = starts[1..]
+            .iter()
+            .cloned()
+            .map(|r| s.spawn(move || r.map(f).collect::<Vec<T>>()))
+            .collect();
+        let mut out: Vec<T> = starts[0].clone().map(f).collect();
+        for h in handles {
+            match h.join() {
+                Ok(part) => out.extend(part),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        out
+    })
+}
+
+/// The next batch of every split reader, decoded concurrently, joined
+/// column-wise into one batch of `schema`.
+fn next_split(
+    readers: &mut [ParquetRecordBatchReader],
+    schema: &SchemaRef,
+) -> Option<Result<RecordBatch, ArrowError>> {
+    let parts: Vec<Option<Result<RecordBatch, ArrowError>>> = match readers {
+        [one] => return one.next(),
+        [first, rest @ ..] => std::thread::scope(|s| {
+            let handles: Vec<_> = rest.iter_mut().map(|r| s.spawn(move || r.next())).collect();
+            let mut parts = vec![first.next()];
+            for h in handles {
+                parts.push(match h.join() {
+                    Ok(p) => p,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                });
+            }
+            parts
+        }),
+        [] => return None,
+    };
+    if parts.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut columns = Vec::new();
+    let mut rows = None;
+    for part in parts {
+        let batch = match part {
+            Some(Ok(batch)) => batch,
+            Some(Err(e)) => return Some(Err(e)),
+            None => return Some(Err(split_mismatch())),
+        };
+        if rows.is_some_and(|r| r != batch.num_rows()) {
+            return Some(Err(split_mismatch()));
+        }
+        rows = Some(batch.num_rows());
+        columns.extend(batch.columns().iter().cloned());
+    }
+    Some(RecordBatch::try_new(schema.clone(), columns))
+}
 
 /// The decoded row stream of some row groups, read one group at a time
 /// (#848): no decode crosses a group seam, so one holds at most one group's
@@ -1731,7 +1902,10 @@ type OpenGroups = Box<
 struct GroupReaders {
     open: OpenGroups,
     groups: std::vec::IntoIter<usize>,
-    current: ParquetRecordBatchReader,
+    /// One reader, or one per column split ([`column_splits`]).
+    current: Vec<ParquetRecordBatchReader>,
+    /// The joined schema of `current`.
+    schema: SchemaRef,
     /// Rows the reader's limit still allows.
     left: Option<usize>,
 }
@@ -1754,10 +1928,17 @@ impl GroupReaders {
     ) -> Result<Self, ParquetError> {
         let mut groups = groups.into_iter();
         let current = open(groups.next().into_iter().collect(), left)?;
+        let schema = Arc::new(arrow_schema::Schema::new(
+            current
+                .iter()
+                .flat_map(|r| r.schema().fields().iter().cloned().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+        ));
         Ok(Self {
             open,
             groups,
             current,
+            schema,
             left,
         })
     }
@@ -1771,7 +1952,7 @@ impl Iterator for GroupReaders {
             if self.left == Some(0) {
                 return None;
             }
-            if let Some(batch) = self.current.next() {
+            if let Some(batch) = next_split(&mut self.current, &self.schema) {
                 if let (Ok(batch), Some(left)) = (&batch, &mut self.left) {
                     *left = left.saturating_sub(batch.num_rows());
                 }
@@ -1871,20 +2052,26 @@ impl Iterator for UntrustedBatchReader {
             // Views still share dictionary/page payloads at this point.
             let indices =
                 compact.then(|| arrow_array::UInt64Array::from_iter_values(0..rows as u64));
+            let cast = |i: usize| {
+                let a = batch.column(i);
+                let compact = match &indices {
+                    Some(indices) => arrow_select::take::take(a.as_ref(), indices, None)?,
+                    None => a.clone(),
+                };
+                arrow_cast::cast(&compact, schema.field(i).data_type())
+            };
+            // Each split's columns cast on its own thread, as they decoded.
+            let counts: Vec<usize> = self
+                .inner
+                .current
+                .iter()
+                .map(|r| r.schema().fields().len())
+                .collect();
             Some(
-                batch
-                    .columns()
-                    .iter()
-                    .zip(schema.fields())
-                    .map(|(a, f)| {
-                        let compact = match &indices {
-                            Some(indices) => arrow_select::take::take(a.as_ref(), indices, None)?,
-                            None => a.clone(),
-                        };
-                        arrow_cast::cast(&compact, f.data_type())
-                    })
+                map_split(&counts, cast)
+                    .into_iter()
                     .collect::<Result<Vec<_>, _>>()
-                    .and_then(|columns| RecordBatch::try_new(schema, columns)),
+                    .and_then(|columns| RecordBatch::try_new(schema.clone(), columns)),
             )
         })
         .unwrap_or_else(|e| Some(Err(ArrowError::ExternalError(Box::new(e)))));
@@ -2077,6 +2264,93 @@ impl<R: Read + Seek> Iterator for UntrustedIpcReader<R> {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    /// #876/#813: `with_decode_threads(n)` decodes each batch's columns on
+    /// `n` readers over the same rows, joined back column-wise: the same
+    /// batches as one reader, with no more rows in flight.
+    #[test]
+    fn decode_threads_split_columns_and_yield_the_same_batches() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use arrow_array::{ArrayRef, Float64Array, Int64Array, StringArray, StructArray};
+        use arrow_schema::{DataType, Field};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        let n = 1000;
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        for i in 0..n {
+            for j in 0..i % 4 {
+                tags.values().append_value(format!("t{j}"));
+            }
+            tags.append(i % 7 != 0);
+        }
+        let point = StructArray::from(vec![
+            (
+                Arc::new(Field::new("x", DataType::Float64, false)),
+                Arc::new(Float64Array::from_iter_values((0..n).map(f64::from))) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("y", DataType::Float64, false)),
+                Arc::new(Float64Array::from_iter_values(
+                    (0..n).map(|i| f64::from(i) / 2.0),
+                )) as ArrayRef,
+            ),
+        ]);
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(0..i64::from(n))) as ArrayRef,
+            ),
+            (
+                "name",
+                Arc::new(StringArray::from_iter(
+                    (0..n).map(|i| (i % 5 != 0).then(|| format!("name-{}", i % 13))),
+                )) as ArrayRef,
+            ),
+            ("tags", Arc::new(tags.finish()) as ArrayRef),
+            ("point", Arc::new(point) as ArrayRef),
+            (
+                "note",
+                Arc::new(StringArray::from_iter_values(
+                    (0..n).map(|i| "n".repeat(i as usize % 9)),
+                )) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(300))
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let bytes = {
+            use std::io::{Read, Seek};
+            let mut buf = Vec::new();
+            file.rewind().unwrap();
+            file.read_to_end(&mut buf).unwrap();
+            Bytes::from(buf)
+        };
+        let read = |threads: usize, roots: Option<Vec<usize>>| {
+            let mut source = open_parquet(bytes.clone())
+                .unwrap()
+                .with_batch_rows(128)
+                .with_row_groups(vec![1, 2, 3])
+                .with_decode_threads(threads);
+            if let Some(roots) = roots {
+                source = source.with_projection_roots(roots);
+            }
+            source.build().unwrap()
+        };
+        for roots in [None, Some(vec![1, 2, 4])] {
+            let one: Vec<RecordBatch> = read(1, roots.clone()).map(Result::unwrap).collect();
+            let split = read(3, roots.clone());
+            assert_eq!(split.inner.current.len(), 3, "three column splits");
+            assert_eq!(split.schema(), read(1, roots.clone()).schema());
+            let split: Vec<RecordBatch> = split.map(Result::unwrap).collect();
+            assert_eq!(split, one);
+        }
+        assert_eq!(read(1, None).inner.current.len(), 1);
+    }
 
     #[test]
     fn dictionary_decode_does_not_expand_repeated_payload_before_splitting() {

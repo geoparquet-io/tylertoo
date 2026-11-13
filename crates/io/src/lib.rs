@@ -23,8 +23,8 @@ pub use untrusted::{
     decoded_batch_limit, decoded_input_bytes, input_error, largest_byte_array_column,
     load_reader_metadata, open_ipc, open_parquet, open_parquet_with_metadata, precheck_footer,
     read_batch_plan, read_parquet_metadata, reader_metadata, schema_without_metadata,
-    LargestByteArrayColumn, ParquetSource, ReaderMetadata, UntrustedBatchReader,
-    UntrustedIpcReader, BYTE_ARRAY_BATCH_LIMIT, DEFAULT_BATCH_ROWS,
+    ConcurrentChunkReader, LargestByteArrayColumn, ParquetSource, ReaderMetadata,
+    UntrustedBatchReader, UntrustedIpcReader, BYTE_ARRAY_BATCH_LIMIT, DEFAULT_BATCH_ROWS,
 };
 pub use writer::{
     batch_writer, overview_writer, BatchWriter, OverviewCompression, OverviewWriteOptions,

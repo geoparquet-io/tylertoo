@@ -418,6 +418,9 @@ pub struct SourceStream<'a> {
     projection: Option<Vec<usize>>,
     row_groups: Option<Vec<Vec<usize>>>,
     batch_size: usize,
+    /// Threads each local part's batches decode on
+    /// ([`tylertoo_io::ParquetSource::with_decode_threads`]); `1` by default.
+    decode_threads: usize,
     part_idx: usize,
     current: Option<tylertoo_io::UntrustedBatchReader>,
     done: bool,
@@ -1269,6 +1272,7 @@ impl ConvertSource {
             projection,
             row_groups: plan.row_groups.map(|s| s.0.clone()),
             batch_size: plan.batch_size.max(1),
+            decode_threads: 1,
             part_idx: 0,
             current: None,
             done: false,
@@ -1361,20 +1365,28 @@ impl ConvertSource {
     /// be local-only: `SourceStream` releases a part's in-memory read cache
     /// when it finishes that part, which is a no-op for a local file but would
     /// have concurrent remote readers evicting each other's fetched chunks.
+    ///
+    /// `decode_threads` decodes each batch's columns on that many threads
+    /// when the segment's part is local (#876): the same batches, no more
+    /// rows ahead. A remote part reads on one, so its requests stay as they
+    /// are.
     pub(crate) fn open_segment(
         &self,
         segment: &ReadSegment,
         projection: Option<&[usize]>,
         batch_size: usize,
+        decode_threads: usize,
     ) -> Result<SourceStream<'_>, InputError> {
         let mut per_part = vec![Vec::new(); self.parts().len()];
         per_part[segment.part].clone_from(&segment.row_groups);
         let selection = RowGroupSelection::from_parts(per_part);
-        self.open_stream(&ReadPlan {
+        let mut stream = self.open_stream(&ReadPlan {
             batch_size,
             projection,
             row_groups: Some(&selection),
-        })
+        })?;
+        stream.decode_threads = decode_threads;
+        Ok(stream)
     }
 
     /// Footer metadata per part: borrowed for `Multi` (loaded at
@@ -1812,6 +1824,9 @@ impl SourceStream<'_> {
         }
         if let Some(sel) = &self.row_groups {
             builder = builder.with_row_groups(sel[i].clone());
+        }
+        if !self.parts[i].is_remote() {
+            builder = builder.with_decode_threads(self.decode_threads);
         }
         Ok(builder.with_batch_rows(self.batch_size).build()?)
     }
