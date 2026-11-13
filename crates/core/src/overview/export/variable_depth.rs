@@ -2074,6 +2074,14 @@ mod tests {
         (inside.len(), inside.iter().sum())
     }
 
+    /// A float or double `Value` as the f64 it holds: a double the f32
+    /// holds exactly is written as a float.
+    fn number(v: &crate::vector_tile::tile::Value) -> f64 {
+        v.double_value
+            .or(v.float_value.map(f64::from))
+            .expect("a float or double")
+    }
+
     /// A tile's features' sum of the double property `name`.
     fn sum_of(tile: &Tile, name: &str) -> f64 {
         let layer = &tile.layers[0];
@@ -2085,7 +2093,7 @@ mod tests {
                 f.tags
                     .chunks(2)
                     .find(|kv| kv[0] == key)
-                    .map(|kv| layer.values[kv[1] as usize].double_value.unwrap())
+                    .map(|kv| number(&layer.values[kv[1] as usize]))
             })
             .sum()
     }
@@ -2156,7 +2164,7 @@ mod tests {
             .iter()
             .filter_map(|f| {
                 let kv = f.tags.chunks(2).find(|kv| kv[0] == key as u32)?;
-                layer.values[kv[1] as usize].double_value.map(f64::to_bits)
+                Some(number(&layer.values[kv[1] as usize]).to_bits())
             })
             .collect()
     }
