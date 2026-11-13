@@ -1513,8 +1513,8 @@ fn convert_with_cells(
         .map_err(|e| in_band(TilesError::Convert(e)))?;
         for (z, table) in (band.min_zoom..=band.max_zoom).zip(&tables) {
             let archive = reserve(".tylertoo-cells-", ".pmtiles")?;
-            let report = tile_cell_table(table, z, &archive, &read, &options.export, &layer)
-                .map_err(in_band)?;
+            let report =
+                tile_cell_table(table, z, &archive, &read, options, &layer).map_err(in_band)?;
             log::info!(
                 "[tiles] cell band {band}: z{z}: {} tile(s)",
                 report.export.total_tiles
@@ -1680,10 +1680,35 @@ fn tile_cell_table(
     z: u8,
     archive: &Path,
     read: &ConvertOptions,
-    export: &ExportOptions,
+    parent: &TilesOptions,
     layer: &str,
 ) -> Result<Box<TilesReport>, TilesError> {
-    let cells = TilesOptions {
+    let cells = cell_table_options(z, read, parent, layer);
+    let input = TilesInput::Path(table.to_path_buf());
+    match convert_to_pmtiles_validated(
+        &input,
+        || input.source(),
+        archive,
+        &cells.validate()?,
+        &mut (),
+    )? {
+        TilesOutcome::Converted(report) => Ok(report),
+        other => Err(TilesError::Convert(ConvertError::Io(
+            std::io::Error::other(format!("unexpected outcome {other:?}")),
+        ))),
+    }
+}
+
+/// The run that tiles one zoom's cell table: the parent's export and temp
+/// codec, verbatim at `z`.
+fn cell_table_options(
+    z: u8,
+    read: &ConvertOptions,
+    parent: &TilesOptions,
+    layer: &str,
+) -> TilesOptions {
+    let export = &parent.export;
+    TilesOptions {
         convert: ConvertOptions {
             levels: LevelPlan::ZoomRange {
                 min_zoom: z,
@@ -1702,20 +1727,8 @@ fn tile_cell_table(
         }
         .verbatim(),
         layer_name: Some(layer.to_string()),
+        temp_compression: parent.temp_compression,
         ..TilesOptions::default()
-    };
-    let input = TilesInput::Path(table.to_path_buf());
-    match convert_to_pmtiles_validated(
-        &input,
-        || input.source(),
-        archive,
-        &cells.validate()?,
-        &mut (),
-    )? {
-        TilesOutcome::Converted(report) => Ok(report),
-        other => Err(TilesError::Convert(ConvertError::Io(
-            std::io::Error::other(format!("unexpected outcome {other:?}")),
-        ))),
     }
 }
 
@@ -2383,6 +2396,18 @@ mod tests {
     /// The temp intermediate is read once by the export and removed, so it is
     /// written LZ4, which is cheaper to encode and decode than ZSTD. A kept
     /// overview is a deliverable and stays ZSTD, byte-identical to before.
+    #[test]
+    fn cell_band_tables_take_the_runs_temp_codec() {
+        for codec in [OverviewCodec::Lz4, OverviewCodec::Zstd] {
+            let parent = TilesOptions {
+                temp_compression: codec,
+                ..TilesOptions::default()
+            };
+            let cells = cell_table_options(3, &ConvertOptions::default(), &parent, "cells");
+            assert_eq!(cells.temp_compression, codec);
+        }
+    }
+
     #[test]
     fn temp_intermediate_takes_the_chosen_codec_and_a_kept_one_zstd() {
         // Codec names as parquet's `Debug` spells them: core has no direct

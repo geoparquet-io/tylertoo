@@ -709,8 +709,9 @@ A simplification candidate with more than 2,048
 total vertices skips the exact validity check and counts as valid. The check
 once compared every edge pair, and on continental-scale rings at fine GSDs it
 stalled conversion for tens of minutes per feature. It now tests only edge
-pairs whose bounding boxes meet, and the cap stays only to keep output the
-same. A candidate that large means RDP
+pairs whose bounding boxes meet, which is fast on ordinary rings. A ring
+whose edges all share an x range still costs O(V²), so the cap also bounds
+that worst case. A candidate that large means RDP
 removed few vertices from already-valid input, the case least likely to
 self-intersect. The overviews spec does not require valid geometry (§2).
 Candidates at or below the cap get the full check and repair. tylertoo logs a

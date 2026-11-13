@@ -99,14 +99,10 @@ fn has_structural_issues(poly: &Polygon<f64>, assume_simple: bool) -> bool {
         }
     }
 
-    // Check for self-intersecting edges (O((n + m) log n) sweepline). Skipped
-    // when the feature was pre-validated as simple — see the `assume_simple`
+    // Check for self-intersecting edges (the box-pair sweep). Skipped when
+    // the feature was pre-validated as simple — see the `assume_simple`
     // note above.
-    if !assume_simple && has_self_intersecting_edges(&ring.0) {
-        return true;
-    }
-
-    false
+    !assume_simple && has_self_intersecting_edges(&ring.0)
 }
 
 /// Check if a ring has self-intersecting edges (any two non-adjacent edges that

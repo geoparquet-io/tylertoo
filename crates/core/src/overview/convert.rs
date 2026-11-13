@@ -10075,12 +10075,12 @@ mod tests {
         // (3) Row for row, geometry for geometry.
         let full_rdr = OverviewReader::open(&full_out).unwrap();
         let capped_rdr = OverviewReader::open(&capped_out).unwrap();
-        for level in 0..capped.levels.len() {
+        for (level, spec) in capped.levels.iter().enumerate() {
             assert_eq!(
                 read_level_rows(&capped_rdr, level),
                 read_level_rows(&full_rdr, level),
                 "level {level} (z{:?}) differs between the capped and full runs",
-                capped.levels[level].zoom
+                spec.zoom
             );
         }
 

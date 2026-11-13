@@ -42,11 +42,7 @@
 use std::cell::{Cell, RefCell};
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{self, AssertUnwindSafe};
-#[expect(
-    clippy::disallowed_types,
-    reason = "#789: a per-reader flag, not process-global diagnostic state"
-)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{self, Ordering};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
@@ -500,7 +496,7 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
 )]
 struct PageGuard<R> {
     reader: Arc<R>,
-    hit: Arc<AtomicBool>,
+    hit: Arc<atomic::AtomicBool>,
 }
 
 impl<R> Clone for PageGuard<R> {
@@ -519,7 +515,7 @@ impl<R> Clone for PageGuard<R> {
 )]
 struct NoEof<T> {
     inner: T,
-    hit: Arc<AtomicBool>,
+    hit: Arc<atomic::AtomicBool>,
 }
 
 impl<T: Read> Read for NoEof<T> {
@@ -1671,7 +1667,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
             clippy::disallowed_types,
             reason = "#789: a per-reader flag, not process-global diagnostic state"
         )]
-        let page_eof = Arc::new(AtomicBool::new(false));
+        let page_eof = Arc::new(atomic::AtomicBool::new(false));
         let guard = PageGuard {
             reader: Arc::new(self.reader),
             hit: page_eof.clone(),
@@ -1802,7 +1798,7 @@ impl Iterator for GroupReaders {
 pub struct UntrustedBatchReader {
     inner: GroupReaders,
     /// Raised when a page read ran past the end of the file ([`PageGuard`]).
-    page_eof: Arc<AtomicBool>,
+    page_eof: Arc<atomic::AtomicBool>,
     done: bool,
     schema: SchemaRef,
     /// The decoded rows past the last cut, first in the next ([`join_decoded`]).

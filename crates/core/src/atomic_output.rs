@@ -352,16 +352,12 @@ fn not_writable(target: &Path, reason: String) -> Result<(), OutputNotWritable> 
 /// Create and remove a uniquely named file in `dir`. Not `tempfile`: its
 /// errors append the random probe name, which means nothing to a user.
 pub(crate) fn probe_directory(dir: &Path) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
     #[expect(
         clippy::disallowed_types,
         reason = "#427: unique temporary output names across concurrent writers"
     )]
-    use std::sync::atomic::{AtomicU64, Ordering};
-    #[expect(
-        clippy::disallowed_types,
-        reason = "#427: unique temporary output names across concurrent writers"
-    )]
-    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     loop {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let probe = dir.join(format!(".tylertoo-write-probe.{}.{n}", std::process::id()));

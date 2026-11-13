@@ -8,11 +8,7 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use indicatif::{HumanBytes, HumanCount};
 use std::path::{Path, PathBuf};
-#[expect(
-    clippy::disallowed_types,
-    reason = "#452: immutable CLI quiet setting shared by status output"
-)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{self, Ordering};
 use tylertoo_core::internal::error::{Classify, ErrorKind};
 use tylertoo_core::internal::input::redact_query;
 use tylertoo_core::internal::overview::auto_zoom::MaxZoom;
@@ -30,7 +26,7 @@ use tylertoo_core::TilesetMetadata as TilesetMetadataArgs;
     clippy::disallowed_types,
     reason = "#452: immutable CLI quiet setting shared by status output"
 )]
-static QUIET: AtomicBool = AtomicBool::new(false);
+static QUIET: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 /// `println!` for the status and summary lines of a subcommand that writes
 /// a file, which `--quiet` silences. What `stats` and `validate` print is
