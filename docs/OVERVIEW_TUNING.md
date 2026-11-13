@@ -1513,11 +1513,16 @@ and `export_pmtiles()` functions accept `feature_id`.
 
 ## Tile geometry knobs: `--tile-buffer`, `extent`
 
-Both settings apply at export.
+These settings apply at export.
+
+| Knob | Default | Effect |
+|------|---------|--------|
+| `--tile-buffer` | `5` | Tile-edge buffer in tile pixels, from 0 to 256 |
+| `--max-zoom-simplify-factor` | automatic | Lines at 0.25 × GSD; polygons off. An explicit factor applies to both; `0` disables it |
 
 ### Tile buffer
 
-`--tile-buffer` (default 8, maximum 256) extends geometry past tile edges
+`--tile-buffer` (default 5, maximum 256) extends geometry past tile edges
 to render seams continuously. Units are pixels of a nominal 256-pixel tile,
 matching tippecanoe's `--buffer` (default 5).
 
@@ -1526,6 +1531,31 @@ buffers would reach nonadjacent tiles and risk O(features × tiles) export,
 so tylertoo rejects them before conversion or export. Sharded builds read
 two pivot tiles (512 px) beyond their range, covering this margin. See
 [Scaling](guides/scaling.md#sharded-builds).
+
+### Max-zoom simplification
+
+When you leave `--max-zoom-simplify-factor` unset (Python:
+`max_zoom_simplify_factor=None`), lines at the finest zoom are simplified
+at 0.25 × GSD, about one tile unit at extent 4096 with the default GSD
+base. Polygons are not simplified at that zoom: simplifying each polygon
+on its own separates shared borders (#802).
+
+An explicit factor applies to lines and polygons alike. Use `0` to turn
+max-zoom simplification off for everything and restore the previous default
+output. `tiles --verbatim` and `pyramid` bands default to `0`; an explicit
+factor still applies on top. The tippecanoe preset sets `0.25` for both
+lines and polygons, matching tippecanoe's default `-S 1`. In Python, an
+explicit `None` selects the command's default, including these exceptions,
+as `"auto"` does for the size caps.
+
+Each feature is simplified once before clipping, in GSD units. The overview
+file and coarser levels stay unchanged, except that variable-depth stop
+tiles carry the finest level's features and get the same simplification.
+
+On Portland and Guatemala roads, factor 0.25 reduced archive bytes by 6.7%
+and 2.6%, and z14 vertices by 31% and 14%. Worst displacement at z14 was
+0.12 px, compared with 0.04 px without max-zoom simplification. The full
+measurements and polygon tradeoff are in `corpus/SWEEPS.md`, Decision 11.
 
 ### Tile extent
 

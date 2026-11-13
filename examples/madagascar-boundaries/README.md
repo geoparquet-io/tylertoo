@@ -207,30 +207,30 @@ Exporting madagascar-ov.parquet → madagascar.pmtiles
   mode=duplicating zooms z1..z10
   z1  (level 0):       1 tiles,      1558 features
 ...
-  z4  (level 3):       4 tiles,     16746 features, 1 oversized, 12 collapsed at extent
+  z5  (level 4):       4 tiles,     14959 features, 1 oversized, 12 collapsed at extent
 ...
-  z10 (level 9):     524 tiles,     26831 features, 8 collapsed at extent
+  z10 (level 9):     524 tiles,     25838 features, 12 collapsed at extent
 
-✓ 752 tiles, 162709 features, 2 oversized tiles in 1.49s
+✓ 751 tiles, 157756 features, 1 oversized tiles in 1.49s
 ...
  z  tiles      total     mean      p50      p99      max
  1      1     70,749   70,749   70,749   70,749   70,749
 ...
-10    524  3,997,749    7,629    6,021   27,771   86,717
+10    524  3,849,628    7,346    5,860   26,963   85,177
 
 Largest 10 tile(s):
 z   x   y    bytes
-6  40  35  414,119
+4  10   8  422,883
 ...
 ```
 
 Polygons crossing tile edges appear in every tile they touch, so tile
 features outnumber overview features. Clipped slivers that vanish on the
 tile's 4096-unit grid are omitted and counted as "collapsed at extent".
-The largest tile is 414 KB compressed, at z6. Two tiles, at z4 and z5,
-went over the default limit of 500 KB compressed (and 2 MB before
-compression). The size valve merged their densest polygons into neighbors
-until each fit; the export counts these as "oversized".
+The largest tile is 422,883 bytes (about 423 KB) compressed, at z4 (4/10/8).
+One tile, at z5, went over the default limit of 500 KB compressed (and 2 MB
+before compression). The size valve merged its densest polygons into
+neighbors until it fit; the export counts this tile as "oversized".
 
 View `madagascar.pmtiles` at [pmtiles.io](https://pmtiles.io/), or host it on
 any server that supports HTTP range requests. No tile server is needed.
@@ -255,7 +255,7 @@ tylertoo decode madagascar.pmtiles z8.parquet --zoom 8
 Decoding madagascar.pmtiles → z8.parquet
   zooms z8..z8, layers: boundaries
 
-✓ 21,191 features from 44 tiles (0 skipped as degenerate) in 0.44s
+✓ 20,350 features from 44 tiles (0 skipped as degenerate) in 0.44s
 ```
 
 Decoded geometry retains tile simplification and clipping; a feature spanning

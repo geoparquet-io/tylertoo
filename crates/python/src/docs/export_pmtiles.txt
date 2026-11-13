@@ -4,9 +4,9 @@ Args:
     input: Overview file from `overview()`.
     output: PMTiles archive to write.
     layer_name: MVT layer name.
-    tile_buffer: Tile edge buffer in pixels, at most 256.
-    preset: `"tippecanoe"` starts from tippecanoe's tile buffer, size
-        limits and size valve instead of tylertoo's; an option you pass
+    tile_buffer: Tile edge buffer in pixels, default 5, from 0 to 256.
+    preset: `"tippecanoe"` starts from tippecanoe's tile buffer, max-zoom
+        simplification, size limits and size valve instead of tylertoo's; an option you pass
         still applies. See
         [the tippecanoe preset](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset).
     extent: Tile resolution in MVT units.
@@ -60,7 +60,12 @@ Args:
         GSD at that level's zoom, like `simplify_factor` for coarser
         levels. With the default GSD base, 1 GSD is 4 tile units at
         extent 4096. Features smaller than the tolerance keep their own
-        geometry. Defaults to None (off). Changes the output; leaves
+        geometry. Defaults to `None`: lines use factor 0.25 and polygons
+        are not simplified. An explicit factor applies to both; `0`
+        disables it. Explicit `None` selects the command's default,
+        like `"auto"` for size caps: no max-zoom simplification under
+        verbatim or for pyramid bands, and 0.25 for both kinds under
+        the tippecanoe preset. Changes the output; leaves
         coarser levels unchanged, except that variable-depth stop tiles
         carry the simplified finest-level features. Leaves the overview
         file unchanged. Comparable to
