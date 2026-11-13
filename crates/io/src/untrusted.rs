@@ -1697,6 +1697,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
         };
         let masks = column_splits(
             &self.metadata,
+            self.row_groups.as_deref(),
             self.projection.as_ref(),
             self.decode_threads,
         );
@@ -1807,11 +1808,14 @@ fn decode_bytes(
 }
 
 /// Contiguous runs of `projection`'s leaves (every leaf when `None`), whole
-/// roots each, balanced by footer bytes into at most `splits` masks.
+/// roots each, balanced into at most `splits` masks by their footer bytes
+/// in the reader's `row_groups` (all when `None`): each reader weighs only
+/// its own groups, so a file read as many segments costs linear work.
 /// Concatenating the masks' decoded columns in order gives the columns of
 /// one reader over `projection`. Empty when `splits < 2`.
 fn column_splits(
     metadata: &ReaderMetadata,
+    row_groups: Option<&[usize]>,
     projection: Option<&ProjectionMask>,
     splits: usize,
 ) -> Vec<ProjectionMask> {
@@ -1822,10 +1826,13 @@ fn column_splits(
     if splits < 2 || leaves.is_empty() {
         return Vec::new();
     }
+    let all = metadata.metadata().row_groups();
+    let selected: Vec<_> = match row_groups {
+        Some(picked) => picked.iter().filter_map(|&g| all.get(g)).collect(),
+        None => all.iter().collect(),
+    };
     let bytes = |leaf: usize| -> u64 {
-        metadata
-            .metadata()
-            .row_groups()
+        selected
             .iter()
             .fold(0u64, |sum, g| {
                 sum.saturating_add(g.column(leaf).uncompressed_size().max(0) as u64)
@@ -2530,6 +2537,81 @@ mod tests {
         };
         assert_eq!(reader(declaring_uncompressed(640)).inner.current.len(), 1);
         assert_eq!(reader(splitting_groups()).inner.current.len(), 3);
+    }
+
+    /// The column names of each split of a reader over `groups` of `bytes`.
+    fn split_columns(bytes: Bytes, groups: Vec<usize>) -> Vec<Vec<String>> {
+        open_parquet(bytes)
+            .unwrap()
+            .with_row_groups(groups)
+            .with_decode_threads(2)
+            .build()
+            .unwrap()
+            .inner
+            .current
+            .iter()
+            .map(|r| {
+                r.schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// PR #881 review: the splits are weighed by the reader's own row
+    /// groups, not the whole file's (which was quadratic over a file's
+    /// segments). Group 0's bytes are in `a`, group 1's in `c`.
+    #[test]
+    fn each_selection_is_split_by_its_own_groups_bytes() {
+        let bytes = binary_groups(&[[16 << 10, 1, 1], [1, 1, 16 << 10]]);
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            split_columns(bytes.clone(), vec![0]),
+            [names(&["a"]), names(&["b", "c"])]
+        );
+        assert_eq!(
+            split_columns(bytes, vec![1]),
+            [names(&["a", "b"]), names(&["c"])]
+        );
+    }
+
+    /// The same: a group outside the selection weighs nothing, even one
+    /// whose footer declares `c` a hundred megabytes.
+    #[test]
+    fn split_weights_ignore_unselected_groups() {
+        use parquet::file::metadata::ParquetMetaDataWriter;
+        let good = binary_groups(&[[16 << 10, 1, 1], [16 << 10, 1, 1]]);
+        let md = open_parquet(good.clone()).unwrap().metadata;
+        let md = md.metadata().as_ref().clone();
+        let mut groups = md.row_groups().to_vec();
+        let mut columns = groups[1].columns().to_vec();
+        columns[2] = columns[2]
+            .clone()
+            .into_builder()
+            .set_total_uncompressed_size(100 << 20)
+            .build()
+            .unwrap();
+        groups[1] = groups[1]
+            .clone()
+            .into_builder()
+            .set_column_metadata(columns)
+            .build()
+            .unwrap();
+        let md = md.into_builder().set_row_groups(groups).build();
+        let mut bytes = good.to_vec();
+        let footer =
+            u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap());
+        bytes.truncate(bytes.len() - 8 - footer as usize);
+        ParquetMetaDataWriter::new(&mut bytes, &md)
+            .finish()
+            .unwrap();
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            split_columns(Bytes::from(bytes), vec![0]),
+            [names(&["a"]), names(&["b", "c"])]
+        );
     }
 
     /// PR #881 review: the split decision trusts only bytes the file holds.
