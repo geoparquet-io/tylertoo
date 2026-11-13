@@ -222,10 +222,11 @@ def corpus_datasets() -> dict:
 # iterative re-encode, tylertoo's is one non-iterative pass) and README.md
 # says so.
 #
-# Deliberately NOT passed: -r / -g / -S overrides. tylertoo's --drop-rate
-# 1.65 and --drop-gamma 1.5 are anchored on a full-canonical-count budget,
-# not tippecanoe's per-tile basezoom count; hand-matching the numerals would
-# be cargo-culting, not parity. Both tools run their own defaults and the
+# Deliberately NOT passed: -r / -g / -S overrides. Both tools default the
+# drop rate to 2.5; tylertoo's --drop-gamma 1.5 is per super-cell and its
+# budget is anchored on a full canonical count, not tippecanoe's per-tile
+# basezoom count, so hand-matching the other numerals would be
+# cargo-culting, not parity. Both tools run their own defaults and the
 # asymmetry is documented instead.
 # --------------------------------------------------------------------------
 DEFAULT_MIN_ZOOM = 0

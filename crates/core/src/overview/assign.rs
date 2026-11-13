@@ -2180,14 +2180,13 @@ impl Default for DensityBudgetConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // Calibrated on lines-portland-medium (duplicating, auto-rank): this
-            // brings z9 (1.21x) and z10 (1.03x) into the 1.0–1.3x tippecanoe band
-            // and z8 to ~1.0x, while the coarse zooms stay cell-winner-limited.
-            // See `corpus/SWEEPS.md`. Smaller than tippecanoe's nominal 2.5
-            // because our budget anchors on the full canonical count N (every
-            // feature is present at the finest level), not a per-tile basezoom
-            // count.
-            drop_rate: 1.65,
+            // tippecanoe's `-r 2.5`. The budget thins points only by default
+            // (#745), and on points 2.5 matches tippecanoe: 882k Overture places
+            // keep within 1% of tippecanoe 2.79.0's distinct points at z6-z13,
+            // where 1.65 kept 2-12x as many. The 256-feature floor protects
+            // sparse inputs. Supersedes the 1.65 calibrated on Portland roads
+            // (SWEEPS.md D2); see `corpus/SWEEPS.md`.
+            drop_rate: 2.5,
             gamma: 1.5,
             kinds: BudgetKinds::default(),
         }
@@ -3632,9 +3631,10 @@ mod tests {
         let gsds = oracle_gsds();
         let cfg = thinning_cfg();
         // The oracle was taken with the budget on every kind (#745 made
-        // points the default).
+        // points the default) and at the then-default rate 1.65 (2.5 since).
         let budget = DensityBudgetConfig {
             kinds: BudgetKinds::ALL,
+            drop_rate: 1.65,
             ..DensityBudgetConfig::default()
         };
 
@@ -4455,6 +4455,31 @@ mod tests {
             n,
             "canonical level must contain every feature"
         );
+    }
+
+    #[test]
+    fn default_budget_keeps_n_over_two_point_five_per_level_for_points() {
+        // The default rate is tippecanoe's `-r 2.5`: each coarser level keeps
+        // `N / 2.5^(finest - L)` points, floored at MIN_DENSITY_LEVEL_FEATURES.
+        let n = 10_000usize;
+        let num_levels = 5u8;
+        let feats: Vec<AssignFeature> = (0..n)
+            .map(|i| point(i, (i % 100) as f64 * 200.0, (i / 100) as f64 * 200.0))
+            .collect();
+        let gsds: Vec<f64> = (0..num_levels).map(|z| gsd(z as u32)).collect();
+        let out = apply_density_budget(
+            &all_at_level_zero(n, num_levels),
+            &table(&feats),
+            &gsds,
+            &AssignConfig::default(),
+            &DensityBudgetConfig::default(),
+            Crs::Epsg3857,
+        );
+        let counts: Vec<usize> = (0..num_levels)
+            .map(|l| out.duplicating_at_level(l).len())
+            .collect();
+        // 10000/2.5^4 = 256, /2.5^3 = 640, /2.5^2 = 1600, /2.5 = 4000.
+        assert_eq!(counts, vec![256, 640, 1600, 4000, n]);
     }
 
     #[test]
