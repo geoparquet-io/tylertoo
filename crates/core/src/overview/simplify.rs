@@ -700,8 +700,9 @@ pub(super) fn simplify_step_checked(
 /// Zoom-band representation (#317 / #279): at the first `Point` step (the
 /// band's finest level) a polygonal feature collapses to its representative
 /// point; coarser steps then pass the point through untouched, so every
-/// point-band level shares the same point. `Square` steps dither the
-/// below-tolerance survivors of the previous step into placeholder squares.
+/// point-band level shares the same point. `Square` steps turn the
+/// below-tolerance survivors of the previous step into placeholder squares,
+/// dithered on the canonical geometry's area and anchor (#749).
 ///
 /// Along a pure-geometry chain, dropping is monotone: tolerances grow while
 /// the working geometry's extent can only shrink (RDP keeps a vertex
@@ -1528,10 +1529,10 @@ fn polygon_anchor(poly: &Polygon<f64>) -> Option<Point<f64>> {
 /// so aggregate density stays truthful exactly like tippecanoe's
 /// accumulator in expectation — dense blocks emit many squares, isolated
 /// barns mostly none — while the decision is a pure function of the feature,
-/// independent of engine, ordering, and parallelism. A kept square's anchor
-/// is its own center, so re-dithering it at a coarser cascade step reuses
-/// the same `u` against a smaller `a/T` — survival is monotone fine→coarse,
-/// matching the cascade's drop monotonicity.
+/// independent of engine, ordering, and parallelism. The cascade dithers a
+/// collapsing polygon on its canonical area and anchor at every step (#749),
+/// so `u` stays fixed while `a/T` shrinks 4× per zoom — survival is
+/// monotone fine→coarse, matching the cascade's drop monotonicity.
 pub(super) fn dither_u01(x: f64, y: f64) -> f64 {
     let mut z = x.to_bits() ^ y.to_bits().rotate_left(32);
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
