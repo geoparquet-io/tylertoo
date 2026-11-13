@@ -22,7 +22,8 @@ A run of all six fixtures takes about 2.5 minutes the first time and about
 the PNGs, `--tolerances` reads another band file. Several runs can share one
 `--work`: each keeps its tylertoo archives in a directory of its own. Exit 2
 means the run could not be made (a missing or failing tool, an unknown
-dataset, an unusable source), not a breach.
+dataset, an unusable source, or a source with no tile to score at the
+zooms asked for), not a breach.
 
 ## What it measures
 

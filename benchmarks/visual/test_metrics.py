@@ -164,6 +164,7 @@ def test_read_source_without_geo_metadata(tmp_path):
 @pytest.mark.parametrize("crs,loads", [
     ({"id": {"authority": "OGC", "code": "CRS84"}}, True),
     ({"id": {"authority": "EPSG", "code": 4326}}, True),
+    ({"id": {"authority": "EPSG", "code": "4326"}}, True),
     ({"id": {"authority": "EPSG", "code": 3857}}, False),
     ({"type": "ProjectedCRS", "name": "no id"}, False),
     ("EPSG:3857", False)])

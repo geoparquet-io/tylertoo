@@ -139,7 +139,7 @@ def read_source(path: Path, attr: str | None = None, types: tuple | None = None)
     crs = geo.get("columns", {}).get(col, {}).get("crs")
     code = crs.get("id", {}).get("code") if isinstance(crs, dict) else crs
     # shortcut: lon/lat sources only (no crs means OGC:CRS84), add a reprojection when a fixture needs one
-    if crs is not None and code not in (4326, "CRS84"):
+    if crs is not None and str(code) not in ("4326", "CRS84"):  # the code may be a number or a string
         raise ValueError(f"{path}: source CRS {code!r} is not known to be lon/lat")
     table = pq.read_table(path, columns=[col] + ([attr] if attr else []))
     geoms = shapely.from_wkb(table.column(col).to_numpy(zero_copy_only=False))

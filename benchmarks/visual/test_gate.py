@@ -107,6 +107,21 @@ def test_a_band_without_a_value_is_a_failure():
     assert "no value" in gate.line(row)
 
 
+def test_a_source_with_nothing_to_score_is_not_a_pass(archive, src, tmp_path, monkeypatch):
+    """Every tile under its floor (a short line, a sliver): no cell, so no verdict."""
+    import argparse
+
+    monkeypatch.setattr(gate.M, "read_source", lambda path, attr: src)
+    monkeypatch.setattr(gate, "tippecanoe_dir", lambda *a: tmp_path)
+    monkeypatch.setattr(gate, "tylertoo_archive", lambda *a: archive)
+    monkeypatch.setattr(gate, "score", lambda *a: {str(Z): {"tiles": {}}})
+    monkeypatch.setattr(gate, "cached_score", lambda *a: {str(Z): {"tiles": {}}})
+    tol = {"gate": {"default_band": [-1.0, 0.02], "zoom_range": [Z, Z], "zooms": [Z]}, "datasets": {}}
+    args = argparse.Namespace(work=tmp_path, zooms=None, cap=10)
+    with pytest.raises(ValueError, match="nothing to score"):
+        gate.gate_dataset(args, tol, {}, "d", {"path": "unused", "layer": "l"})
+
+
 def test_a_breach_png_is_written_once_per_run_over_an_old_one(archive, src, tmp_path, monkeypatch):
     """max, p99 and p95 share a tile: one PNG, and never the previous run's."""
     import argparse

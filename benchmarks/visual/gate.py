@@ -310,6 +310,8 @@ def gate_dataset(args, tol: dict, tip: dict, did: str, ds: dict) -> list:
     ty_archive = tylertoo_archive(args, did, ds, zr)
     rows = compare(did, score(ty_archive, src, attr, zooms, args.cap),
                    cached_score(tip_dir, src, attr, zooms, args.cap), tol)
+    if not rows:  # every sampled tile is under its floor: no verdict, not a pass
+        raise ValueError(f"{did}: nothing to score at zooms {zooms}: no sampled tile holds enough of the source")
     if src.kind == "point":
         rows += cluster_rows(args, did, ds, src, zr, zooms)
     written = set()  # max, p99 and p95 of an error share its worst tile: one PNG, new each run
