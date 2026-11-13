@@ -1699,7 +1699,6 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
             &self.metadata,
             self.projection.as_ref(),
             self.decode_threads,
-            rows,
         );
         let projection = self.projection;
         let open: OpenGroups = Box::new(move |groups, limit| {
@@ -1722,7 +1721,10 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
                 }
                 guard_parquet("parquet reader", || builder.build())
             };
-            if masks.len() < 2 {
+            let footer = metadata.metadata();
+            if masks.len() < 2
+                || decode_bytes(footer, &groups, projection.as_ref(), rows) < SPLIT_MIN_DECODE_BYTES
+            {
                 return Ok(vec![one(projection.as_ref())?]);
             }
             masks.iter().map(|m| one(Some(m))).collect()
@@ -1767,16 +1769,44 @@ type OpenGroups = Box<
 /// Overture's segments and places decode about 2.3 MB per 8,192 rows.
 const SPLIT_MIN_DECODE_BYTES: u64 = 256 << 10;
 
+/// The footer bytes of `projection`'s columns (every column when `None`)
+/// in one decode of `rows` rows from `groups`: a decode never crosses a
+/// group ([`GroupReaders`]), so a small group caps it. The largest over
+/// `groups`; an index past the footer counts nothing.
+fn decode_bytes(
+    footer: &ParquetMetaData,
+    groups: &[usize],
+    projection: Option<&ProjectionMask>,
+    rows: usize,
+) -> u64 {
+    groups
+        .iter()
+        .filter_map(|&g| footer.row_groups().get(g))
+        .map(|group| {
+            // Footer sizes are untrusted: the sum saturates.
+            let bytes = group
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(leaf, _)| projection.is_none_or(|m| m.leaf_included(*leaf)))
+                .fold(0u64, |sum, (_, c)| {
+                    sum.saturating_add(c.uncompressed_size().max(0) as u64)
+                });
+            let group_rows = group.num_rows().max(1) as u64;
+            (bytes / group_rows).saturating_mul((rows as u64).min(group_rows))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Contiguous runs of `projection`'s leaves (every leaf when `None`), whole
 /// roots each, balanced by footer bytes into at most `splits` masks.
 /// Concatenating the masks' decoded columns in order gives the columns of
-/// one reader over `projection`. Empty when `splits < 2`, or when a decode
-/// of `decode_rows` rows is under [`SPLIT_MIN_DECODE_BYTES`].
+/// one reader over `projection`. Empty when `splits < 2`.
 fn column_splits(
     metadata: &ReaderMetadata,
     projection: Option<&ProjectionMask>,
     splits: usize,
-    decode_rows: usize,
 ) -> Vec<ProjectionMask> {
     let descr = metadata.parquet_schema();
     let leaves: Vec<usize> = (0..descr.num_columns())
@@ -1809,10 +1839,6 @@ fn column_splits(
     }
     // Footer sizes are untrusted: every sum saturates.
     let total = roots.iter().fold(0u64, |sum, r| sum.saturating_add(r.1));
-    let rows = metadata.metadata().file_metadata().num_rows().max(1) as u64;
-    if (total / rows).saturating_mul(decode_rows as u64) < SPLIT_MIN_DECODE_BYTES {
-        return Vec::new();
-    }
     let target = total.div_ceil(splits as u64);
     let mut out: Vec<Vec<usize>> = vec![Vec::new()];
     let mut acc = 0u64;
@@ -2430,17 +2456,42 @@ mod tests {
         Bytes::from(good)
     }
 
+    /// roborev on b46c6609: a reader decodes one row group at a time, so a
+    /// decode is no larger than its group. Ten-row groups of 192 footer
+    /// bytes a row are 1,920 bytes a decode however many rows are asked
+    /// for, too small to split; groups declaring 1 MB a column split.
+    #[test]
+    fn small_row_groups_are_not_split_whatever_the_batch_size() {
+        let reader = |uncompressed: i64| {
+            open_parquet(declaring_uncompressed(uncompressed))
+                .unwrap()
+                .with_batch_rows(8192)
+                .with_decode_threads(3)
+                .build()
+                .unwrap()
+        };
+        assert_eq!(reader(640).inner.current.len(), 1);
+        assert_eq!(reader(1_000_000).inner.current.len(), 3);
+    }
+
     /// roborev on f44f9372: a decode too small to pay for its split threads
     /// is not split. A list-heavy row group decodes one row at a time
     /// ([`batch_plan`]), and splitting each row would spawn threads per row.
     #[test]
     fn a_decode_too_small_to_amortize_its_threads_is_not_split() {
-        // 300 footer bytes a row over three columns.
-        let md = open_parquet(declaring_uncompressed(1_000))
+        // 300 footer bytes a row over three columns, ten rows a group.
+        let md = open_parquet(declaring_uncompressed(1_000_000))
             .unwrap()
             .metadata;
-        assert_eq!(column_splits(&md, None, 4, 8192).len(), 3);
-        assert!(column_splits(&md, None, 4, 1).is_empty());
+        let footer = md.metadata();
+        assert_eq!(decode_bytes(footer, &[0], None, 8192), 3_000_000);
+        assert_eq!(decode_bytes(footer, &[0], None, 1), 300_000);
+        assert_eq!(decode_bytes(footer, &[0], None, 0), 0);
+        assert_eq!(decode_bytes(footer, &[9], None, 8192), 0, "no such group");
+        let small = open_parquet(declaring_uncompressed(1_000))
+            .unwrap()
+            .metadata;
+        assert!(decode_bytes(small.metadata(), &[1], None, 8192) < SPLIT_MIN_DECODE_BYTES);
     }
 
     /// Bytes that panic on a read starting in `ranges`.
