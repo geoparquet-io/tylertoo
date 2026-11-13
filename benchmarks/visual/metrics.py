@@ -84,6 +84,16 @@ def read_archive(path: Path):
     return tiles, gz
 
 
+def read_tile(path: Path, z: int, x: int, y: int) -> dict:
+    """One decoded tile of the archive, {} when it has none there."""
+    from pmtiles.reader import MmapSource, Reader
+
+    with open(path, "rb") as f:
+        reader = Reader(MmapSource(f))
+        data = reader.get(z, x, y)
+        return decode(data, is_gzip(reader.header()))[1] if data else {}
+
+
 def decode(data: bytes, gz: bool):
     import mapbox_vector_tile
 
@@ -106,8 +116,10 @@ class Source:
         self.values = values
         self.tree = STRtree(self.geoms)
         types = {g.geom_type for g in self.geoms}
-        # shortcut: one geometry kind per source, split a mixed source by type first
-        self.kind = next((k for k, t in KINDS.items() if types & set(t)), None)
+        kinds = [k for k, t in KINDS.items() if types & set(t)]
+        if len(kinds) > 1:
+            raise ValueError(f"a source of one geometry kind is needed, this one has {kinds}")
+        self.kind = kinds[0] if kinds else None
         self.colours = None if values is None else [colour_of(str(v)) for v in values]
         self.rasters: dict = {}
 
@@ -128,7 +140,7 @@ def read_source(path: Path, attr: str | None = None, types: tuple | None = None)
     code = crs.get("id", {}).get("code") if isinstance(crs, dict) else crs
     # shortcut: lon/lat sources only (no crs means OGC:CRS84), add a reprojection when a fixture needs one
     if crs is not None and code not in (4326, "CRS84"):
-        raise SystemExit(f"{path}: source CRS {code!r} is not known to be lon/lat")
+        raise ValueError(f"{path}: source CRS {code!r} is not known to be lon/lat")
     table = pq.read_table(path, columns=[col] + ([attr] if attr else []))
     geoms = shapely.from_wkb(table.column(col).to_numpy(zero_copy_only=False))
     values = table.column(attr).to_pylist() if attr else None
@@ -156,7 +168,9 @@ def sample_tiles(src: Source, z: int, cap: int, seed: int = 869) -> list:
     xs = np.clip(((c[:, 0] + WORLD / 2) / WORLD * n).astype(np.int64), 0, n - 1)
     ys = np.clip(((WORLD / 2 - c[:, 1]) / WORLD * n).astype(np.int64), 0, n - 1)
     tiles = sorted({(z, int(x), int(y)) for x, y in np.unique(np.column_stack([xs, ys]), axis=0)})
-    # shortcut: a defect outside the sample is not seen, raise the cap for release checks
+    # shortcut: a defect outside the sample is not seen. --cap widens the sample, but a
+    # tile wholly inside a polygon holds no vertex and is never a candidate: add the
+    # tiles whose centre the source covers when a fixture has such tiles at a scored zoom.
     return sorted(random.Random(seed).sample(tiles, cap)) if len(tiles) > cap else tiles
 
 
@@ -215,7 +229,8 @@ def rasterize_source(tree, geoms, z: int, x: int, y: int, px: int, colours=None)
     if len(idx) == 0:
         return np.zeros((px, px), dtype=bool if colours is None else np.int32)
     w = (b[2] - b[0]) / px
-    arr = rasterize(((geoms[i], 1 if colours is None else colours[i]) for i in idx),
+    # In source order: where polygons overlap, the later one is on top, as in a tile.
+    arr = rasterize(((geoms[i], 1 if colours is None else colours[i]) for i in sorted(idx)),
                     out_shape=(px, px), transform=Affine(w, 0, b[0], 0, -w, b[3]), fill=0, dtype=dtype)
     return arr.astype(bool) if colours is None else arr
 
@@ -354,7 +369,10 @@ def point_errors(decoded: dict, src: Source, attr: str | None, z: int, x: int, y
     drawn_parts, extent = [], EXTENT_DEFAULT
     for geom, _, extent in features(decoded, POINT):
         drawn_parts.append(geom)
-    cell = box(*tile_bounds_3857(z, x, y))
+    # One tile unit wider than the tile: a point just outside it rounds onto its edge.
+    x0, y0, x1, y1 = tile_bounds_3857(z, x, y)
+    unit = (x1 - x0) / extent
+    cell = box(x0 - unit, y0 - unit, x1 + unit, y1 + unit)
     near = [_in_tile_units(src.geoms[i], z, x, y, extent) for i in src.tree.query(cell)]
     xy = shapely.get_coordinates(near).reshape(-1, 2)
     if _cells(xy, extent).sum() < MIN_POINTS:

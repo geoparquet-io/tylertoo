@@ -163,36 +163,33 @@ zooms = [10, 12, 14]
 
 [[datasets."ftw-moldova-z10".zoom_bands]]
 zooms = [10, 10]
-added_max     = [-0.0087, 0.0113]  # measured ty 0.0212, tip 0.0198
-added_p99     = [-0.0088, 0.0112]  # measured ty 0.0210, tip 0.0198
-added_p95     = [-0.0092, 0.0108]  # measured ty 0.0202, tip 0.0194
-missing_max   = [-0.0100, 0.0100]  # measured ty 0.0115, tip 0.0115
-missing_p99   = [-0.0101, 0.0099]  # measured ty 0.0114, tip 0.0115
-missing_p95   = [-0.0102, 0.0098]  # measured ty 0.0112, tip 0.0113
-edge_gap      = [-0.0090, 0.0110]  # measured ty 0.0119, tip 0.0109
-excess_change = [-0.0100, 0.0100]  # measured ty 0.0000, tip 0.0000
+added_max   = [-0.0087, 0.0113]  # measured ty 0.0212, tip 0.0198
+added_p99   = [-0.0088, 0.0112]  # measured ty 0.0210, tip 0.0198
+added_p95   = [-0.0092, 0.0108]  # measured ty 0.0202, tip 0.0194
+missing_max = [-0.0100, 0.0100]  # measured ty 0.0115, tip 0.0115
+missing_p99 = [-0.0101, 0.0099]  # measured ty 0.0114, tip 0.0115
+missing_p95 = [-0.0102, 0.0098]  # measured ty 0.0112, tip 0.0113
+edge_gap    = [-0.0090, 0.0110]  # measured ty 0.0119, tip 0.0109
 
 [[datasets."ftw-moldova-z10".zoom_bands]]
 zooms = [12, 12]
-added_max     = [-0.0096, 0.0104]  # measured ty 0.0072, tip 0.0069
-added_p99     = [-0.0097, 0.0103]  # measured ty 0.0070, tip 0.0067
-added_p95     = [-0.0100, 0.0100]  # measured ty 0.0064, tip 0.0064
-missing_max   = [-0.0104, 0.0096]  # measured ty 0.0061, tip 0.0065
-missing_p99   = [-0.0104, 0.0096]  # measured ty 0.0061, tip 0.0065
-missing_p95   = [-0.0098, 0.0102]  # measured ty 0.0061, tip 0.0059
-edge_gap      = [-0.0105, 0.0095]  # measured ty 0.0051, tip 0.0056
-excess_change = [-0.0100, 0.0100]  # measured ty 0.0000, tip 0.0000
+added_max   = [-0.0096, 0.0104]  # measured ty 0.0072, tip 0.0069
+added_p99   = [-0.0097, 0.0103]  # measured ty 0.0070, tip 0.0067
+added_p95   = [-0.0100, 0.0100]  # measured ty 0.0064, tip 0.0064
+missing_max = [-0.0104, 0.0096]  # measured ty 0.0061, tip 0.0065
+missing_p99 = [-0.0104, 0.0096]  # measured ty 0.0061, tip 0.0065
+missing_p95 = [-0.0098, 0.0102]  # measured ty 0.0061, tip 0.0059
+edge_gap    = [-0.0105, 0.0095]  # measured ty 0.0051, tip 0.0056
 
 [[datasets."ftw-moldova-z10".zoom_bands]]
 zooms = [14, 14]
-added_max     = [-0.0100, 0.0100]  # measured ty 0.0180, tip 0.0180
-added_p99     = [-0.0100, 0.0100]  # measured ty 0.0125, tip 0.0125
-added_p95     = [-0.0100, 0.0100]  # measured ty 0.0056, tip 0.0056
-missing_max   = [-0.0100, 0.0100]  # measured ty 0.0207, tip 0.0207
-missing_p99   = [-0.0100, 0.0100]  # measured ty 0.0089, tip 0.0089
-missing_p95   = [-0.0100, 0.0100]  # measured ty 0.0042, tip 0.0042
-edge_gap      = [-0.0100, 0.0100]  # measured ty 0.0011, tip 0.0011
-excess_change = [-0.0100, 0.0100]  # measured ty 0.0000, tip 0.0000
+added_max   = [-0.0100, 0.0100]  # measured ty 0.0180, tip 0.0180
+added_p99   = [-0.0100, 0.0100]  # measured ty 0.0125, tip 0.0125
+added_p95   = [-0.0100, 0.0100]  # measured ty 0.0056, tip 0.0056
+missing_max = [-0.0100, 0.0100]  # measured ty 0.0207, tip 0.0207
+missing_p99 = [-0.0100, 0.0100]  # measured ty 0.0089, tip 0.0089
+missing_p95 = [-0.0100, 0.0100]  # measured ty 0.0042, tip 0.0042
+edge_gap    = [-0.0100, 0.0100]  # measured ty 0.0011, tip 0.0011
 
 [datasets."fieldmaps-boundaries"]
 color_attr = "fid"

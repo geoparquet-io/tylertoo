@@ -1357,11 +1357,13 @@ jobs:
           pytest -q benchmarks/test_run_manifest.py benchmarks/test_valve_guard.py
           benchmarks/coalesce/test_run.py benchmarks/e2e/test_run_e2e.py
       # The visual gate (#869) is run by hand; its metrics and band rule are
-      # tested here on synthetic tiles, without tylertoo or tippecanoe.
+      # tested here on synthetic tiles (examples and Hypothesis properties),
+      # without tylertoo or tippecanoe.
       - name: Test the visual gate
         if: ${{ !cancelled() }}
         run: >-
-          uv run --no-project --python 3.12 --with pytest==8.4.2 --with numpy==2.5.4
+          uv run --no-project --python 3.12 --with pytest==8.4.2
+          --with hypothesis==6.170.14 --with numpy==2.5.4
           --with rasterio==1.5.2 --with shapely==2.1.1 --with pyarrow==21.0.0
           --with pmtiles==3.8.1 --with mapbox-vector-tile==2.2.0 --with pillow==13.0.0
           pytest -q benchmarks/visual

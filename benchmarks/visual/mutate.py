@@ -3,7 +3,8 @@ mutate.py — copies of an archive with one known defect each, to test the
 gate itself (#869): a gate that passes a broken archive is no gate.
 
     control    re-encoded, nothing changed: must still pass
-    drop       5% of the features removed, the same ones in every tile
+    drop       5% of the features removed (with an attribute, the same
+               features in every tile)
     shift      every geometry moved 2 pixels (of a 256-pixel tile) to the right
     simplify   every geometry simplified with a 4-pixel tolerance
     empty      one tile left out
@@ -65,6 +66,7 @@ def mutate(src: Path, dst: Path, kind: str, zooms, attr: str | None = None, empt
                 touched += 1
                 continue
             layers = []
+            options = {"y_coord_down": True, "on_invalid_geometry": on_invalid_geometry_make_valid}
             for name, layer in M.decode(tiles[key], gz)[1].items():
                 extent = layer.get("extent", M.EXTENT_DEFAULT)
                 px = extent / M.PX
@@ -87,8 +89,7 @@ def mutate(src: Path, dst: Path, kind: str, zooms, attr: str | None = None, empt
                 elif kind == "swap":
                     touched += _swap(feats, attr)
                 layers.append({"name": name, "features": [f for f in feats if not f["geometry"].is_empty]})
-                options = {"extents": extent, "y_coord_down": True,
-                           "on_invalid_geometry": on_invalid_geometry_make_valid}
+                options["extents"] = extent
             w.write_tile(zxy_to_tileid(*key), gzip.compress(
                 mapbox_vector_tile.encode(layers, default_options=options)))
         zs = [k[0] for k in keys]

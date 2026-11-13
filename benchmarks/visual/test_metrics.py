@@ -1,11 +1,13 @@
 """Unit tests of metrics.py on synthetic sources and hand-built decoded tiles.
 
-    uv run --no-project --python 3.12 --with pytest==8.4.2 --with numpy==2.5.4 \
+    uv run --no-project --python 3.12 --with pytest==8.4.2 \
+        --with hypothesis==6.170.14 --with numpy==2.5.4 \
         --with rasterio==1.5.2 --with shapely==2.1.1 --with pyarrow==21.0.0 \
         --with pmtiles==3.8.1 --with mapbox-vector-tile==2.2.0 --with pillow==13.0.0 \
         pytest -q benchmarks/visual
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -76,6 +78,11 @@ def test_null_attribute_matches_an_absent_property():
     assert e["attr_mismatch"] == 0.0
 
 
+def test_a_mixed_source_is_refused():
+    with pytest.raises(ValueError, match="one geometry kind"):
+        source([LEFT, Point(5, 5)])
+
+
 def test_sliver_tile_is_not_gated():
     assert m.polygon_errors(tile([]), source([box(0, 0, 40, 40)]), None, Z, X, Y) is None
 
@@ -102,9 +109,10 @@ def test_point_errors_ignore_buffer_copies():
 
 
 def test_point_rounding_is_not_an_error():
-    pts = [Point(255.6 + 256 * i, 100.4) for i in range(10)]  # just left of a cell edge
+    # Just left of a cell edge, and one just outside the tile's left edge.
+    pts = [Point(255.6 + 256 * i, 100.4) for i in range(10)] + [Point(-0.3, 100.4)]
     src = source(pts)
-    for snap in (round, int):
+    for snap in (round, math.floor):
         drawn = [Point(snap(p.x), snap(p.y)) for p in pts]
         assert m.point_errors(tile(drawn), src, None, Z, X, Y) == {"count_error": 0.0}
 
@@ -151,3 +159,27 @@ def test_read_source_without_geo_metadata(tmp_path):
     src = m.read_source(tmp_path / "s.parquet", "fid", ("Polygon", "MultiPolygon"))
     assert len(src.geoms) == 1 and src.values == [1] and src.kind == "polygon"
     assert src.geoms[0].bounds[2] == pytest.approx(111319.49, abs=0.01)
+
+
+@pytest.mark.parametrize("crs,loads", [
+    ({"id": {"authority": "OGC", "code": "CRS84"}}, True),
+    ({"id": {"authority": "EPSG", "code": 4326}}, True),
+    ({"id": {"authority": "EPSG", "code": 3857}}, False),
+    ({"type": "ProjectedCRS", "name": "no id"}, False),
+    ("EPSG:3857", False)])
+def test_read_source_refuses_a_crs_it_does_not_know(tmp_path, crs, loads):
+    import json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import shapely
+
+    geo = {"primary_column": "geometry", "columns": {"geometry": {"encoding": "WKB", "crs": crs}}}
+    table = pa.table({"geometry": [shapely.to_wkb(Point(1, 1))]}).replace_schema_metadata(
+        {"geo": json.dumps(geo)})
+    pq.write_table(table, tmp_path / "s.parquet")
+    if loads:
+        assert m.read_source(tmp_path / "s.parquet").kind == "point"
+    else:
+        with pytest.raises(ValueError, match="lon/lat"):
+            m.read_source(tmp_path / "s.parquet")

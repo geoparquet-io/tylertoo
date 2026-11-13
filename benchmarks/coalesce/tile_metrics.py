@@ -81,7 +81,6 @@ def main() -> int:
 
     tiles, gz = read_archive(args.pmtiles)
     sizes = {"tiles": len(tiles), "max_raw": 0, "max_gz": 0, "over_raw": 0, "over_gz": 0}
-    raw_cache: dict = {}
     for key, data in tiles.items():
         raw = gzip.decompress(data) if gz else data
         sizes["max_raw"] = max(sizes["max_raw"], len(raw))

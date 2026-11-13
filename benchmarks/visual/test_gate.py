@@ -28,10 +28,8 @@ def src():
     return m.Source([world(g) for g in DISCS], list(range(len(DISCS))))
 
 
-@pytest.fixture(scope="module")
-def archive(tmp_path_factory):
-    path = tmp_path_factory.mktemp("a") / "a.pmtiles"
-    feats = [{"geometry": g, "properties": {"fid": i}, "id": i + 1} for i, g in enumerate(DISCS)]
+def write_archive(path, geoms):
+    feats = [{"geometry": g, "properties": {"fid": i}, "id": i + 1} for i, g in enumerate(geoms)]
     data = mapbox_vector_tile.encode([{"name": "l", "features": feats}],
                                      default_options={"extents": E, "y_coord_down": True})
     with pm_write(str(path)) as w:
@@ -41,6 +39,11 @@ def archive(tmp_path_factory):
                     "max_lon_e7": 0, "max_lat_e7": 0, "center_zoom": Z,
                     "center_lon_e7": 0, "center_lat_e7": 0}, {})
     return path
+
+
+@pytest.fixture(scope="module")
+def archive(tmp_path_factory):
+    return write_archive(tmp_path_factory.mktemp("a") / "a.pmtiles", DISCS)
 
 
 def errors(path, src):
@@ -94,6 +97,37 @@ def test_worse_is_about_the_band_not_the_sign_of_d():
     row = {"ok": False, "d": -0.001, "band": [-0.03, -0.02]}
     assert gate.worse(row)  # still better than tippecanoe, but worse than it was
     assert not gate.worse({"ok": False, "d": 0.0, "band": [0.02, 0.03]})
+
+
+def test_a_band_without_a_value_is_a_failure():
+    """A metric one tool stops yielding (here: tippecanoe) must not drop out of the gate."""
+    rows = gate.compare("d", zoom(0.3), {str(Z): {"tiles": {}}}, TOL)
+    row, = rows
+    assert row["metric"] == "missing_max" and row["ok"] is False and gate.worse(row)
+    assert "no value" in gate.line(row)
+
+
+def test_the_png_marks_what_differs(archive, src, tmp_path):
+    import numpy as np
+    from PIL import Image
+    from shapely.geometry import LineString
+
+    def colours(png):
+        px = np.asarray(Image.open(png).convert("RGB")).reshape(-1, 3)
+        return {name: int((px == rgb).all(axis=1).sum())
+                for name, rgb in (("red", (220, 30, 30)), ("blue", (30, 80, 220)))}
+
+    shifted = tmp_path / "shift.pmtiles"
+    mutate.mutate(archive, shifted, "shift", [Z], "fid")
+    gate.write_png(tmp_path / "p.png", src, "fid", f"{Z}/{X}/{Y}", [shifted, archive])
+    seen = colours(tmp_path / "p.png")
+    assert seen["red"] > 1000 and seen["blue"] > 1000  # the shift, in the first panel
+
+    line = LineString([(100, 2000), (4000, 2000)])
+    nothing = write_archive(tmp_path / "none.pmtiles", [LineString([(100, 300), (4000, 300)])])
+    gate.write_png(tmp_path / "l.png", m.Source([world(line)]), None, f"{Z}/{X}/{Y}", [nothing])
+    seen = colours(tmp_path / "l.png")
+    assert seen["red"] > 400 and seen["blue"] > 400  # the source line missing, another drawn
 
 
 def test_a_cell_without_a_band_takes_the_default():

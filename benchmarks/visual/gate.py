@@ -24,13 +24,16 @@ tippecanoe drops is not an error.
     uv run benchmarks/visual/gate.py --dataset mine=/data/mine.parquet
     uv run benchmarks/visual/gate.py --self-test        # the gate's own test
 
-A breach prints one line with both values, d, the band, the worst tile and a
-PNG of it (source | tylertoo | tippecanoe; red is source the tile does not
-draw, blue is drawn where the source has nothing, orange a wrong attribute).
-The tippecanoe side is cached under --work, so a re-run after a tylertoo
-change only tiles and scores tylertoo.
+A breach prints one line with both values, d and the band; for a per-tile
+metric also the worst tile and a PNG of it (source | tylertoo | tippecanoe;
+red is source the tile does not draw, blue is drawn where the source has
+nothing, orange a wrong attribute). The tippecanoe side is cached under
+--work, so a re-run after a tylertoo change only tiles and scores tylertoo.
+Runs may share --work: each keeps its tylertoo archives in a directory of
+its own.
 
-Exit 0: every band holds. 1: a breach, or the self-test failed. 2: setup.
+Exit 0: every band holds. 1: a breach, or the self-test failed. 2: setup
+(a tool is missing or failed, an unknown dataset, an unusable source).
 """
 
 from __future__ import annotations
@@ -39,8 +42,10 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -84,7 +89,7 @@ def run(argv: list, log: Path) -> None:
     with log.open("w") as f:
         rc = subprocess.run([str(a) for a in argv], stdout=f, stderr=subprocess.STDOUT).returncode
     if rc:
-        raise SystemExit(f"error: exit {rc}: {' '.join(map(str, argv))}\n{log.read_text()[-2000:]}")
+        raise ValueError(f"exit {rc}: {' '.join(map(str, argv))}\n{log.read_text()[-2000:]}")
 
 
 # --------------------------------------------------------------------------
@@ -93,9 +98,7 @@ def run(argv: list, log: Path) -> None:
 
 
 def tylertoo_archive(args, did: str, ds: dict, zr: list, extra=()) -> Path:
-    out = args.work / "tylertoo"
-    out.mkdir(parents=True, exist_ok=True)
-    dst = out / f"{did}{''.join(extra)}.pmtiles"
+    dst = args.run_dir / f"{did}{''.join(extra)}.pmtiles"
     run([args.tylertoo, "tiles", ds["path"], dst, "--preset", "tippecanoe", "--min-zoom", zr[0],
          "--max-zoom", zr[1], "--layer-name", ds["layer"], "--force", *extra], dst.with_suffix(".log"))
     return dst
@@ -104,15 +107,22 @@ def tylertoo_archive(args, did: str, ds: dict, zr: list, extra=()) -> Path:
 def tippecanoe_dir(args, tip: dict, did: str, ds: dict, zr: list) -> Path:
     """The tippecanoe archive of a source: it depends on the source, the
     binary and the flags only, so it is made once and kept."""
-    key = digest([file_sha(Path(ds["path"])), tip["version"], TIPPECANOE_FLAGS, zr, ds["layer"]])
+    key = digest([file_sha(Path(ds["path"])), tip["version"], TIPPECANOE_FLAGS, zr, ds["layer"],
+                  file_sha(Path(count_gate.__file__))])  # which writes tippecanoe's input
     d = args.work / "tippecanoe" / f"{did}-{key[:12]}"
-    if not (d / "archive.pmtiles").exists():
-        d.mkdir(parents=True, exist_ok=True)
-        geojson = count_gate.to_geojsonseq(Path(ds["path"]), d, did)
-        run([tip["binary"], "-o", d / "part.pmtiles", "-f", "-Z", zr[0], "-z", zr[1], "-l", ds["layer"],
-             *TIPPECANOE_FLAGS, geojson], d / "tippecanoe.log")
+    if not d.exists():
+        # Built aside and moved into place whole, so a run beside this one
+        # never reads half an archive.
+        part = Path(tempfile.mkdtemp(prefix=f"{did}-", dir=args.run_dir))
+        geojson = count_gate.to_geojsonseq(Path(ds["path"]), part, did)
+        run([tip["binary"], "-o", part / "archive.pmtiles", "-f", "-Z", zr[0], "-z", zr[1], "-l", ds["layer"],
+             *TIPPECANOE_FLAGS, geojson], part / "tippecanoe.log")
         geojson.unlink()
-        (d / "part.pmtiles").rename(d / "archive.pmtiles")
+        d.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            part.rename(d)
+        except OSError:  # another run got there first, with the same archive
+            shutil.rmtree(part)
     return d
 
 
@@ -145,15 +155,18 @@ def score(archive: Path, src: M.Source, attr: str | None, zooms: list, cap: int)
         out[str(z)] = {"tiles": per}
         if src.kind == "polygon":
             seam = M.seams(seeds, colour, ref, M.PX)
-            out[str(z)]["seams"] = {m: seam[m] for m in SEAM}
+            # Without an attribute every feature has one colour: no change to measure.
+            out[str(z)]["seams"] = {m: seam[m] for m in SEAM if attr or m == "edge_gap"}
     return out
 
 
 def cached_score(d: Path, src: M.Source, attr, zooms: list, cap: int) -> dict:
-    key = digest([zooms, cap, attr, file_sha(HERE / "metrics.py")])
+    key = digest([zooms, cap, attr, file_sha(HERE / "metrics.py"), file_sha(Path(__file__))])
     f = d / f"scores-{key[:12]}.json"
     if not f.exists():
-        f.write_text(json.dumps(score(d / "archive.pmtiles", src, attr, zooms, cap)))
+        part = f.with_suffix(f".{os.getpid()}.part")
+        part.write_text(json.dumps(score(d / "archive.pmtiles", src, attr, zooms, cap)))
+        part.rename(f)
     return json.loads(f.read_text())
 
 
@@ -165,10 +178,10 @@ def worst_tiles(zrec: dict) -> dict:
         if vals:
             worst = max(vals, key=vals.get)
             for stat, q in STATS.items():
-                out[f"{metric}_{stat}"] = (float(np.percentile(list(vals.values()), q)), worst)
+                out[f"{metric}_{stat}"] = (float(np.percentile(list(vals.values()), q)), worst, metric)
     for metric, v in zrec.get("seams", {}).items():
         if v is not None:
-            out[metric] = (v, None)
+            out[metric] = (v, None, metric)
     return out
 
 
@@ -184,14 +197,23 @@ def compare(did: str, ty: dict, tip: dict, tol: dict) -> list:
             band = count_gate.zoom_band(tol, did, name, int(z)) or tol["gate"].get("default_band")
             rows.append({"dataset": did, "zoom": int(z), "metric": name, "tylertoo": a[name][0],
                          "tippecanoe": b[name][0], "d": d, "band": band,
-                         "ok": count_gate.in_band(d, band), "tile": a[name][1] and f"{z}/{a[name][1]}"})
+                         "ok": count_gate.in_band(d, band), "tile": a[name][1] and f"{z}/{a[name][1]}",
+                         "error": a[name][2]})
+        # A band whose metric one side no longer yields (nothing drawn to
+        # compare) must not stop gating in silence.
+        for entry in tol.get("datasets", {}).get(did, {}).get("zoom_bands", []):
+            if entry["zooms"][0] <= int(z) <= entry["zooms"][1]:
+                rows += [{"dataset": did, "zoom": int(z), "metric": name, "d": None, "band": band,
+                          "ok": False, "tile": None}
+                         for name, band in entry.items()
+                         if name != "zooms" and not (name in a and name in b)]
     return rows
 
 
 def worse(r: dict) -> bool:
     """Outside the band on the high side: tylertoo draws worse than the band
     allows. Outside on the low side it draws better, and the band is stale."""
-    return r["ok"] is False and r["d"] > r["band"][1]
+    return r["ok"] is False and (r["d"] is None or r["d"] > r["band"][1])
 
 
 def cluster_rows(args, did: str, ds: dict, src: M.Source, zr: list, zooms: list) -> list:
@@ -237,15 +259,13 @@ def masks(decoded: dict, src: M.Source, attr, z: int, x: int, y: int):
     return drawn, ref, np.zeros_like(drawn)
 
 
-def write_png(path: Path, src: M.Source, attr, tile: str, archives: dict) -> None:
+def write_png(path: Path, src: M.Source, attr, tile: str, archives: list) -> None:
     from PIL import Image
 
     z, x, y = (int(v) for v in tile.split("/"))
     panels = []
-    for archive in archives.values():
-        tiles, gz = M.read_archive(archive)
-        decoded = M.decode(tiles[(z, x, y)], gz)[1] if (z, x, y) in tiles else {}
-        drawn, ref, wrong = masks(decoded, src, attr, z, x, y)
+    for archive in archives:
+        drawn, ref, wrong = masks(M.read_tile(archive, z, x, y), src, attr, z, x, y)
         if not panels:
             img = np.full((M.PX, M.PX, 3), 255, np.uint8)
             img[ref] = (200, 200, 200)
@@ -268,6 +288,9 @@ def write_png(path: Path, src: M.Source, attr, tile: str, archives: dict) -> Non
 
 
 def line(r: dict) -> str:
+    if r["d"] is None:
+        return (f"{r['dataset']} z{r['zoom']} {r['metric']}: has the band {r['band']} but no value: "
+                "one of the tools draws nothing this metric can compare")
     other = f"tippecanoe {r['tippecanoe']:.4f}" if "tippecanoe" in r else f"source {r['source']}"
     band = f"band [{r['band'][0]}, {r['band'][1]}]" if r["band"] else "no band"
     return (f"{r['dataset']} z{r['zoom']} {r['metric']}: tylertoo {r['tylertoo']:.4f} {other} "
@@ -288,10 +311,11 @@ def gate_dataset(args, tol: dict, tip: dict, did: str, ds: dict) -> list:
     if src.kind == "point":
         rows += cluster_rows(args, did, ds, src, zr, zooms)
     for r in rows:
-        if worse(r) and r["tile"]:
-            r["png"] = str(args.png_dir / f"{did}_z{r['zoom']}_{r['metric']}.png")
-            write_png(Path(r["png"]), src, attr, r["tile"],
-                      {"tylertoo": ty_archive, "tippecanoe": tip_dir / "archive.pmtiles"})
+        if worse(r) and r["tile"]:  # max, p99 and p95 of an error share its worst tile
+            png = args.work / "png" / f"{did}_z{r['zoom']}_{r['error']}_{r['tile'].replace('/', '-')}.png"
+            if not png.exists():
+                write_png(png, src, attr, r["tile"], [ty_archive, tip_dir / "archive.pmtiles"])
+            r["png"] = str(png)
     return rows
 
 
@@ -311,10 +335,10 @@ def self_test(args, tol: dict, tip: dict) -> bool:
     empty = (int(z), *(int(v) for v in gated[len(gated) // 2].split("/")))
     ok = True
     for kind in mutate.MUTANTS:
-        copy = args.work / "tylertoo" / f"{did}.{kind}.pmtiles"
+        copy = args.run_dir / f"{did}.{kind}.pmtiles"
         mutate.mutate(original, copy, kind, zooms, attr, empty)
         rows = compare(did, score(copy, src, attr, zooms, args.cap), tip_scores, tol)
-        caught = sorted(filter(worse, rows), key=lambda r: r["band"][1] - r["d"])
+        caught = sorted(filter(worse, rows), key=lambda r: r["d"] is None or r["band"][1] - r["d"])
         failed = [r for r in rows if r["ok"] is False]
         if kind == "control":
             good = not failed
@@ -340,19 +364,22 @@ def main() -> int:
     ap.add_argument("--tylertoo", default=os.environ.get("TYLERTOO", str(REPO / "target" / "release" / "tylertoo")))
     ap.add_argument("--tippecanoe", default=os.environ.get("TIPPECANOE"))
     ap.add_argument("--tolerances", type=Path, default=TOLERANCES)
-    ap.add_argument("--work", type=Path, default=Path.home() / "bench-data" / "visual")
-    ap.add_argument("--png-dir", type=Path, help="default: <work>/png")
+    ap.add_argument("--work", type=Path, default=Path.home() / "bench-data" / "visual",
+                    help="the tippecanoe cache and the PNGs (default: %(default)s)")
     ap.add_argument("--json", type=Path, help="write every row here")
     ap.add_argument("--verbose", action="store_true", help="print every row, not only breaches")
     args = ap.parse_args()
     args.zooms = [int(z) for z in args.zooms.split(",")] if args.zooms else None
-    args.png_dir = args.png_dir or args.work / "png"
 
     datasets = dict(DATASETS)
     for spec in args.dataset:
         did, _, path = spec.partition("=")
         datasets[did] = {"path": Path(path), "layer": did}
     only = args.datasets.split(",") if args.datasets else [d for d, _, _ in (s.partition("=") for s in args.dataset)]
+    unknown = [d for d in only if d not in datasets]
+    if unknown:
+        print(f"error: unknown dataset(s) {', '.join(unknown)}; known: {', '.join(datasets)}", file=sys.stderr)
+        return 2
     datasets = {d: datasets[d] for d in only} if only else datasets
     try:
         tip = run_e2e.resolve_tippecanoe(args.tippecanoe)
@@ -365,7 +392,19 @@ def main() -> int:
               "fixtures: gh release download fixtures-v1 --dir tests/fixtures/realdata/", file=sys.stderr)
         return 2
     tol = count_gate.load_tolerances(args.tolerances)
+    args.work.mkdir(parents=True, exist_ok=True)
+    # This run's tylertoo archives: its own directory, so that runs sharing
+    # --work (agents in several worktrees) never score each other's binary.
+    with tempfile.TemporaryDirectory(prefix="run-", dir=args.work) as run_dir:
+        args.run_dir = Path(run_dir)
+        try:
+            return gate(args, tol, tip, datasets)
+        except ValueError as e:  # a tool failed, or a source cannot be used
+            print(f"error: {e}", file=sys.stderr)
+            return 2
 
+
+def gate(args, tol: dict, tip: dict, datasets: dict) -> int:
     if args.self_test:
         return 0 if self_test(args, tol, tip) else 1
 
@@ -375,7 +414,8 @@ def main() -> int:
         bad = [r for r in got if r["ok"] is False]
         print(f"{did}: {len(got)} cells, {len(bad)} outside their band", flush=True)
         for r in got if args.verbose else bad:
-            tag = "ok      " if r["ok"] else "BREACH  " if worse(r) else "IMPROVED" if r["ok"] is False else "no band "
+            tag = ("ok      " if r["ok"] else "BREACH  " if worse(r) else "IMPROVED" if r["ok"] is False
+                   else "no band ")
             print(f"  {tag} {line(r)}", flush=True)
         rows += got
     if args.json:
@@ -385,9 +425,10 @@ def main() -> int:
         if not all(map(worse, bad)):
             print("IMPROVED: d is below its band. Tighten the band in visual_tolerances.toml, "
                   "with the new measurement in its comment.")
-        print("re-run only these: uv run benchmarks/visual/gate.py --datasets "
-              + ",".join(sorted({r["dataset"] for r in bad}))
-              + " --zooms " + ",".join(str(z) for z in sorted({r["zoom"] for r in bad})))
+        for did in sorted({r["dataset"] for r in bad}):
+            which = f"--datasets {did}" if did in DATASETS else f"--dataset {did}={datasets[did]['path']}"
+            zooms = ",".join(str(z) for z in sorted({r["zoom"] for r in bad if r["dataset"] == did}))
+            print(f"re-run only this: uv run benchmarks/visual/gate.py {which} --zooms {zooms}")
         return 1
     print("visual gate: every band holds")
     return 0
