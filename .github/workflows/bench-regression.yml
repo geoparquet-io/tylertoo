@@ -7,9 +7,14 @@
 # comparison shared runners support honestly; a baseline carried over from an
 # earlier run on a different VM is mostly measuring the VM (#393).
 #
-# Two hosts (one matrix leg each, as in valve-guard.yml):
-#   github  ubuntu-latest (4 cores): every gated bench.
-#   pinned  the maintainer's 64-core VM, a self-hosted runner labelled
+# Two hosts, one job each with the same steps (a YAML anchor), as in
+# valve-guard.yml's two legs. Separate jobs rather than a matrix keep the
+# check names static: GitHub never renders a skipped matrix job's name.
+#   github  job `criterion-regression`, check "Criterion regression gate":
+#           ubuntu-latest (4 cores), every gated bench.
+#   pinned  job `criterion-regression-pinned`, check "Criterion regression
+#           gate (pinned host)": the maintainer's 64-core VM, a self-hosted
+#           runner labelled
 #           `tylertoo-bench`: the `pipeline` bench only, nightly. On 4 cores
 #           pass 2's column-split decode never runs (read_decode_plan grants
 #           cores / 4 / read workers threads), so the bench's list-heavy and
@@ -17,8 +22,8 @@
 #           the split did (#876), time only the one-thread path there. The
 #           leg exists only while the repository variable
 #           TYLERTOO_BENCH_RUNNER is "true". It never runs on pull_request
-#           (the matrix and `runs-on` both refuse it), so the self-hosted
-#           runner never runs code from a fork.
+#           (the base job's host list and the job's own `if:` both refuse
+#           it), so the self-hosted runner never runs code from a fork.
 # Each leg compares base and head on its own machine; the two hosts' numbers
 # are never compared with each other (separate artifacts, summaries and
 # issues).
@@ -179,27 +184,20 @@ jobs:
           echo "Comparing base $base -> head $(git rev-parse HEAD)"
           echo "sha=$base" >> "$GITHUB_OUTPUT"
 
+  # The github leg. Its static name is the check pull requests show, run or
+  # skipped (a name with an expression shows unrendered when skipped).
   criterion-regression:
-    # The github leg keeps its old check name.
-    name: Criterion regression gate${{ matrix.host == 'pinned' && ' (pinned host)' || '' }}
+    name: Criterion regression gate
     needs: base
-    if: needs.base.outputs.sha != ''
-    strategy:
-      fail-fast: false
-      matrix:
-        host: ${{ fromJSON(needs.base.outputs.hosts) }}
-    # A second guard: whatever the matrix says, a pull request runs on
-    # ubuntu-latest, never on the self-hosted runner.
-    runs-on: >-
-      ${{ matrix.host == 'pinned' && github.event_name != 'pull_request'
-      && fromJSON('["self-hosted","tylertoo-bench"]') || 'ubuntu-latest' }}
+    if: needs.base.outputs.sha != '' && contains(needs.base.outputs.hosts, 'github')
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       TYLERTOO_BENCH_REQUIRE_FIXTURES: "1"
       CRITERION_HOME: ${{ github.workspace }}/target/criterion-compare
-      # The pinned leg runs only `pipeline` (empty: the weekly list).
-      CRITERION_BENCHES: ${{ matrix.host == 'pinned' && 'pipeline' || '' }}
-    steps:
+      BENCH_HOST: github
+    # Shared with criterion-regression-pinned, which branches on BENCH_HOST.
+    steps: &gate-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -246,7 +244,7 @@ jobs:
       # rayon to one thread but not available_parallelism(), which the plan
       # reads; nothing here sets an affinity or RAYON_NUM_THREADS.
       - name: Check the pinned host's cores
-        if: matrix.host == 'pinned'
+        if: env.BENCH_HOST == 'pinned'
         run: |
           cores=$(nproc)
           echo "available cores: $cores"
@@ -262,7 +260,7 @@ jobs:
       # into the comparison. Not on the pinned host: another architecture
       # and machine, and its builds are fast.
       - name: Cache cargo
-        if: matrix.host == 'github'
+        if: env.BENCH_HOST == 'github'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -315,7 +313,7 @@ jobs:
         if: always()
         env:
           BASE_SHA: ${{ needs.base.outputs.sha }}
-          HOST: ${{ matrix.host == 'pinned' && ' on the 64-core pinned host' || ' on ubuntu-latest (4 cores)' }}
+          HOST: ${{ env.BENCH_HOST == 'pinned' && ' on the 64-core pinned host' || ' on ubuntu-latest (4 cores)' }}
         run: |
           [ -f "$CRITERION_HOME/report.md" ] || exit 0
           {
@@ -328,8 +326,26 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: criterion-regression-report-${{ matrix.host }}
+          name: criterion-regression-report-${{ env.BENCH_HOST }}
           path: target/criterion-compare/
+
+  # The pinned leg: the github leg's steps on the 64-core host, `pipeline`
+  # only. Never on a pull request, whatever the base job's host list says.
+  criterion-regression-pinned:
+    name: Criterion regression gate (pinned host)
+    needs: base
+    if: >-
+      needs.base.outputs.sha != '' && github.event_name != 'pull_request'
+      && contains(needs.base.outputs.hosts, 'pinned')
+    # As in valve-guard.yml: an expression, so actionlint takes the custom label.
+    runs-on: ${{ fromJSON('["self-hosted","tylertoo-bench"]') }}
+    timeout-minutes: 90
+    env:
+      TYLERTOO_BENCH_REQUIRE_FIXTURES: "1"
+      CRITERION_HOME: ${{ github.workspace }}/target/criterion-compare
+      BENCH_HOST: pinned
+      CRITERION_BENCHES: pipeline
+    steps: *gate-steps
 
   # Weekly run: one comment with the table on the pinned tracking issue, so
   # the history is in one place and nobody has to open job summaries.
@@ -338,12 +354,14 @@ jobs:
   # only on a failing night, so the 4- and 64-core tables never share one.
   report:
     name: Post the scheduled table
-    needs: [base, criterion-regression]
+    needs: [base, criterion-regression, criterion-regression-pinned]
     if: >-
       always() && github.event_name == 'schedule'
-      && (needs.criterion-regression.result == 'failure'
-          || (needs.criterion-regression.result == 'success'
-              && github.event.schedule != '0 1 * * *'))
+      && ((github.event.schedule == '0 1 * * *'
+           && needs.criterion-regression-pinned.result == 'failure')
+          || (github.event.schedule != '0 1 * * *'
+              && (needs.criterion-regression.result == 'success'
+                  || needs.criterion-regression.result == 'failure')))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -366,7 +384,10 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           BASE_SHA: ${{ needs.base.outputs.sha }}
           HEAD_SHA: ${{ github.sha }}
-          RESULT: ${{ needs.criterion-regression.result }}
+          RESULT: >-
+            ${{ github.event.schedule == '0 1 * * *'
+            && needs.criterion-regression-pinned.result
+            || needs.criterion-regression.result }}
           NIGHTLY: ${{ github.event.schedule == '0 1 * * *' }}
         run: |
           TITLE="Weekly benchmark comparison"
