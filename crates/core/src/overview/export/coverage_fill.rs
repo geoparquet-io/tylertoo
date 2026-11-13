@@ -2716,6 +2716,7 @@ pub(super) mod tests {
                 fail_level: None,
                 panic_write_level: None,
                 hold_for_fill: false,
+                stall_first_wave: false,
                 memory_limit: None,
                 // Pin the grant; this work counter must not depend on the
                 // host's available RAM or another test's memory pressure.

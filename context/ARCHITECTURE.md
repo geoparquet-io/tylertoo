@@ -641,6 +641,16 @@ the old schedule, with no slack for single-wave groups and the group's
 summed members within the cap: with the overlap its peak rose 36 MiB on
 lines.
 
+Without the summed-member check, a coarse wave that stalls on a slow
+partition no longer bounds the finer levels behind it: they encode, release
+their admission, and their tiles wait in `GroupCommit` for the coarse wave's
+write, so queued output could grow with the group's depth. Under `auto` and
+`speed` each encoded partition therefore keeps a share of the cap in place
+of its members, in the same step that releases them, until its wave is
+written (`InFlight::queued_share`): the tiles' bytes at the member price the
+cap was sized at, or the partition's members when that price is unknown. The
+gate then bounds members in flight and queued output together.
+
 A level of several waves without the export-wide store reads its band once
 into a one-level store (#740). That fill used to wait until the group held
 no members, and then until all but the previous wave was written, so on
@@ -649,7 +659,10 @@ encoding. Under `auto` and `speed` the store now fills as soon as the
 collect reaches the level, while the coarser levels still encode
 (`GroupGate::early_fill`). The gate keeps the members still encoding and the
 new level's waves within its cap together, so the store's wave grant is the
-cap rather than the level's widest wave. Against 3b6796c9 (5 interleaved
+cap rather than the level's widest wave. The gate admits a wave past its cap
+when nothing else is held, so the grant is the members still in flight when
+those are more than the cap: no wave of the new level is admitted until they
+are released. Against 3b6796c9 (5 interleaved
 rounds, medians), brmt's levels wall fell from 15.2 to 13.8 s and its
 export wall from 17.9 to 15.1 s, for 74 MiB (1%) more peak RSS. Wideprops
 fell 9%, lines 3%, and moldova and moldova-f0 were within noise. `bounded`
