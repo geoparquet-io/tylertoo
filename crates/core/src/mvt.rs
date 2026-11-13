@@ -696,35 +696,71 @@ pub(crate) struct QuantizedPolygons {
     /// 0 not tested yet, 1 no, 2 yes. Only pairs a pass puts in one feature
     /// are ever tested.
     interacts: Vec<std::sync::atomic::AtomicU8>,
-    /// Unioned components, keyed by their parts' indices in [`Self::parts`]:
-    /// those this pass used, and the previous pass's. Two generations, so
-    /// a component no pass asks for again is dropped.
+    /// Unioned components, keyed by their parts' indices in [`Self::parts`],
+    /// kept as long as a [`PassCache`] keeps them.
     unions: std::sync::Mutex<UnionCache>,
     /// Per feature, the finalize verdict (#748) of the feature alone: 0 not
     /// known, 1 valid, 2 repaired (the repair is in [`Self::verdicts`]). A
     /// pass that encodes it alone again neither checks nor repairs it.
     lone: Vec<std::sync::atomic::AtomicU8>,
     /// By leading feature, the merged groups found valid and the lone
-    /// features' repairs, so the next pass replays them. Kept for the pass
-    /// that used them and the next, as [`Self::unions`] is.
-    verdicts: std::sync::Mutex<HashMap<u32, GroupVerdict>>,
-    /// Passes started ([`Self::next_pass`]).
-    pass: u32,
+    /// features' repairs, so the next pass replays them.
+    verdicts: std::sync::Mutex<PassCache<u32, GroupVerdict>>,
 }
 
 /// A merged group found valid, or a lone feature's repair.
 struct GroupVerdict {
     group: Box<[u32]>,
-    /// The last pass that used it.
-    pass: u32,
     repair: Option<std::sync::Arc<tile_polygon::Repair>>,
 }
 
 #[derive(Default)]
 struct UnionCache {
-    current: HashMap<Vec<u32>, std::sync::Arc<Vec<Vec<TileRing>>>>,
-    previous: HashMap<Vec<u32>, std::sync::Arc<Vec<Vec<TileRing>>>>,
+    unions: PassCache<Vec<u32>, std::sync::Arc<Vec<Vec<TileRing>>>>,
     hits: usize,
+}
+
+/// The size valve's rule for what a pass may reuse (#758): an entry stays
+/// for the pass that last inserted or used it and the next, then is
+/// dropped, so a union or verdict no pass asks for again does not pile up.
+struct PassCache<K, V> {
+    /// Each entry with the pass that last inserted or used it.
+    entries: HashMap<K, (u32, V)>,
+    pass: u32,
+}
+
+impl<K, V> Default for PassCache<K, V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            pass: 0,
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V> PassCache<K, V> {
+    /// The entry under `key` when `fits` accepts it, which counts as a use.
+    fn get(&mut self, key: &K, fits: impl FnOnce(&V) -> bool) -> Option<&V> {
+        let pass = self.pass;
+        let (used, value) = self.entries.get_mut(key).filter(|(_, v)| fits(v))?;
+        *used = pass;
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        self.entries.insert(key, (self.pass, value));
+    }
+
+    fn remove(&mut self, key: &K) {
+        self.entries.remove(key);
+    }
+
+    /// Start a new pass: drop what the pass that just ended did not use.
+    fn next_pass(&mut self) {
+        let last = self.pass;
+        self.entries.retain(|_, (used, _)| *used == last);
+        self.pass += 1;
+    }
 }
 
 struct QuantizedFeature {
@@ -859,7 +895,6 @@ impl QuantizedPolygons {
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
             verdicts: std::sync::Mutex::default(),
-            pass: 0,
         })
     }
 
@@ -880,17 +915,12 @@ impl QuantizedPolygons {
         }
     }
 
-    /// Start a new pass: unions the last pass used stay available, older
-    /// ones are dropped.
+    /// Start a new pass: unions and verdicts the last pass used stay
+    /// available, older ones are dropped ([`PassCache`]).
     pub(crate) fn next_pass(&mut self) {
-        let cache = self.unions.get_mut().expect("union cache");
-        cache.previous = std::mem::take(&mut cache.current);
-        let last = self.pass;
-        self.verdicts
-            .get_mut()
-            .expect("verdicts")
-            .retain(|_, v| v.pass == last);
-        self.pass += 1;
+        let unions = self.unions.get_mut().expect("union cache");
+        unions.unions.next_pass();
+        self.verdicts.get_mut().expect("verdicts").next_pass();
     }
 
     /// Components served from the cache so far.
@@ -914,13 +944,9 @@ impl QuantizedPolygons {
         // be most of a tile, are copied outside it.
         let found = {
             let mut cache = self.unions.lock().expect("union cache");
-            let found = match cache.current.get(&key) {
-                Some(u) => Some(std::sync::Arc::clone(u)),
-                None => cache.previous.get(&key).cloned(),
-            };
-            if let Some(u) = &found {
+            let found = cache.unions.get(&key, |_| true).cloned();
+            if found.is_some() {
                 cache.hits += 1;
-                cache.current.insert(key.clone(), std::sync::Arc::clone(u));
             }
             found
         };
@@ -931,7 +957,7 @@ impl QuantizedPolygons {
         self.unions
             .lock()
             .expect("union cache")
-            .current
+            .unions
             .insert(key, std::sync::Arc::clone(&pieces));
         pieces.as_ref().clone()
     }
@@ -969,17 +995,13 @@ impl QuantizedPolygons {
         } else if !lone || self.lone[leader].load(Relaxed) == 2 {
             let mut verdicts = self.verdicts.lock().expect("verdicts");
             verdicts
-                .get_mut(&(leader as u32))
-                .filter(|v| {
+                .get(&(leader as u32), |v| {
                     v.group
                         .iter()
                         .map(|&i| i as usize)
                         .eq(group.iter().copied())
                 })
-                .map(|v| {
-                    v.pass = self.pass;
-                    v.repair.clone()
-                })
+                .map(|v| v.repair.clone())
         } else {
             None
         };
@@ -1039,7 +1061,6 @@ impl QuantizedPolygons {
                 leader as u32,
                 GroupVerdict {
                     group: group.iter().map(|&i| i as u32).collect(),
-                    pass: self.pass,
                     repair,
                 },
             );
@@ -1953,7 +1974,7 @@ mod tests {
         }
         // Kept: the merged groups found valid and the lone repair (the
         // bowtie); a valid lone feature costs one byte, not an entry.
-        let mut kept: Vec<u32> = q.verdicts.lock().unwrap().keys().copied().collect();
+        let mut kept: Vec<u32> = q.verdicts.lock().unwrap().entries.keys().copied().collect();
         kept.sort_unstable();
         assert_eq!(kept, [0, 3, 4]);
         for pass in 1..3 {
