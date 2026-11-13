@@ -90,7 +90,7 @@ covers = "Per-tile gzip and the XXH3 tile-content dedup cache"
 kind = "syscall"
 # convert + export end to end: any library source can move it (#759).
 paths = ['crates/core/src/.*']
-covers = "`convert_to_overviews` then `export_pmtiles` on two small real fixtures, single-threaded: the production path end to end"
+covers = "`convert_to_overviews` then `export_pmtiles` on two small real fixtures, single-threaded: the production path end to end, under `auto` and `--profile speed` (`-speed` ids), plus convert of a synthetic list-heavy and a 100-row-group input under both, read with 2 workers (#876)"
 
 [bench.coverage_fill]
 kind = "syscall"
