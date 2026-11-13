@@ -274,10 +274,27 @@ fn effective_available(machine: Option<u64>, cgroup: Option<u64>) -> Option<u64>
 
 /// Record the binding cgroup budget in this operation's channel.
 pub(super) fn memory_diagnostic(sink: &crate::diagnostics::Diagnostics) {
-    let machine = read_proc_mem_available();
-    if let Some(limit) =
-        cgroup_memory_limit_bytes().filter(|&limit| machine.is_none_or(|m| m > limit))
-    {
+    record_memory_budget(
+        sink,
+        auto_mem_limit_override(),
+        read_proc_mem_available(),
+        cgroup_memory_limit_bytes(),
+    );
+}
+
+/// [`memory_diagnostic`] over explicit figures. Under the
+/// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override the cgroup sets no budget
+/// ([`available_memory_bytes`]), so there is none to report.
+fn record_memory_budget(
+    sink: &crate::diagnostics::Diagnostics,
+    over: Option<u64>,
+    machine: Option<u64>,
+    cgroup: Option<u64>,
+) {
+    if over.is_some() {
+        return;
+    }
+    if let Some(limit) = cgroup.filter(|&limit| machine.is_none_or(|m| m > limit)) {
         sink.once(crate::diagnostics::Diagnostic::MemoryBudget {
             count: 1,
             machine,
@@ -4568,5 +4585,20 @@ mod cgroup_tests {
         assert_eq!(effective_available(Some(8 * GIB), None), Some(8 * GIB));
         assert_eq!(effective_available(None, Some(160 * GIB)), Some(160 * GIB));
         assert_eq!(effective_available(None, None), None);
+    }
+
+    #[test]
+    fn memory_budget_diagnostic_names_the_cgroup_only_when_it_binds() {
+        let budget = |over, machine, cgroup| {
+            let sink = crate::diagnostics::Diagnostics::default();
+            record_memory_budget(&sink, over, machine, cgroup);
+            sink.snapshot()
+        };
+        assert_eq!(budget(None, Some(8 * GIB), Some(GIB)).len(), 1);
+        assert!(budget(None, Some(GIB), Some(8 * GIB)).is_empty());
+        assert!(
+            budget(Some(4 * GIB), Some(8 * GIB), Some(GIB)).is_empty(),
+            "the TYLERTOO_AUTO_MEM_LIMIT_BYTES override, not the cgroup, sets the budget"
+        );
     }
 }
