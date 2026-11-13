@@ -451,7 +451,7 @@ pub struct ExportOptions {
     /// same rule `--simplify-factor` uses for coarser levels. With the default
     /// GSD base, 1 GSD is 4 tile units at extent 4096. A feature smaller than
     /// the tolerance keeps its own geometry. Default `None`: lines at
-    /// [`DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR`] (0.25) and polygons not at
+    /// 0.25 × GSD and polygons not at
     /// all, since each polygon is simplified on its own and shared borders
     /// would part (#802). `Some(factor)` applies to lines and polygons alike;
     /// `Some(0.0)` simplifies nothing, which [`Self::verbatim`] sets.
