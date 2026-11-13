@@ -50,11 +50,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::time::{Duration, Instant};
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "#817 B1, #852: pass 2's per-call measurement and sharing flag"
-)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{self, Ordering::Relaxed};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array};
@@ -999,7 +995,7 @@ fn downgrade_if_due(
     sinks: &mut [LevelSink],
     spill_bytes: &mut [u64],
     (out_schema, spill_dir): (&Schema, Option<&Path>),
-    (diagnostics, share): (&crate::diagnostics::Diagnostics, &AtomicBool),
+    (diagnostics, share): (&crate::diagnostics::Diagnostics, &atomic::AtomicBool),
 ) -> Result<(), ConvertError> {
     if !tuner.should_downgrade() {
         return Ok(());
@@ -1693,8 +1689,8 @@ pub(super) fn run_pass2_buffered(
         reason = "#817 B1, #852: per-call state shared with the read thread and the window"
     )]
     let (peak_batch, share) = (
-        AtomicU64::new(0),
-        AtomicBool::new(matches!(backing, SinkBacking::Ram) && num_levels > 1),
+        atomic::AtomicU64::new(0),
+        atomic::AtomicBool::new(matches!(backing, SinkBacking::Ram) && num_levels > 1),
     );
     #[cfg(test)]
     spill_tests::SHARING.with(|c| c.set(Some(share.load(Relaxed))));

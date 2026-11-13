@@ -72,11 +72,7 @@ use std::fs;
 use std::io::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-#[expect(
-    clippy::disallowed_types,
-    reason = "#205: counting test allocator tracks process-wide heap use"
-)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{self, Ordering};
 use std::time::Instant;
 
 use geo::winding_order::WindingOrder;
@@ -107,12 +103,12 @@ struct Counting;
     clippy::disallowed_types,
     reason = "#205: counting test allocator tracks process-wide heap use"
 )]
-static CURRENT: AtomicUsize = AtomicUsize::new(0);
+static CURRENT: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
 #[expect(
     clippy::disallowed_types,
     reason = "#205: counting test allocator tracks process-wide heap use"
 )]
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+static PEAK: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
 
 #[cfg(not(feature = "dhat-heap"))]
 unsafe impl GlobalAlloc for Counting {

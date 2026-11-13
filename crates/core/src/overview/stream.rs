@@ -15,11 +15,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
-#[expect(
-    clippy::disallowed_types,
-    reason = "#779: per-run profiling counters shared by scoped worker threads"
-)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{self, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -4607,7 +4603,7 @@ pub(super) fn profile_run_id() -> &'static str {
     clippy::disallowed_types,
     reason = "#779: per-run profiling counters shared by scoped worker threads"
 )]
-pub(super) fn add_nanos(cell: &AtomicU64, dur: Duration) {
+pub(super) fn add_nanos(cell: &atomic::AtomicU64, dur: Duration) {
     cell.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
 }
 
@@ -4616,7 +4612,7 @@ pub(super) fn add_nanos(cell: &AtomicU64, dur: Duration) {
     clippy::disallowed_types,
     reason = "#779: per-run profiling counters shared by scoped worker threads"
 )]
-fn nanos_secs(cell: &AtomicU64) -> f64 {
+fn nanos_secs(cell: &atomic::AtomicU64) -> f64 {
     Duration::from_nanos(cell.load(Ordering::Relaxed)).as_secs_f64()
 }
 
@@ -4650,7 +4646,7 @@ pub(super) struct ExportTimers {
     /// [`super::export::fill_member_store`] (partitioning mode, #235) — so it
     /// overlaps `decode`/`clip` in wall time. The producer's `tx.send` (which
     /// can block on the consumer) is excluded.
-    pub(super) band_read: AtomicU64,
+    pub(super) band_read: atomic::AtomicU64,
     /// Everything per batch around the clip that is not the clip: the
     /// geoarrow → `geo::Geometry` decode, the EPSG:3857 → 4326 reprojection
     /// (timed per geometry inside its `par_iter`), property-column
@@ -4660,61 +4656,61 @@ pub(super) struct ExportTimers {
     /// [`super::export::fanout_batch_members`]. A `MemberStore` spill flush
     /// triggered while routing is subtracted out and charged to
     /// `spill_write` instead.
-    pub(super) decode: AtomicU64,
+    pub(super) decode: atomic::AtomicU64,
     /// [`super::export::feature_tile_members`] (the recursive quadtree clip
     /// cascade), timed per geometry inside the `par_iter` that drives it.
-    pub(super) clip: AtomicU64,
+    pub(super) clip: atomic::AtomicU64,
     /// Per-tile MVT encode (including the oversized-tile valve) + content
     /// hash + gzip, timed per tile inside [`super::export::encode_members`]'s
     /// parallel section. The member sort that precedes it is not counted.
-    pub(super) encode: AtomicU64,
+    pub(super) encode: atomic::AtomicU64,
     /// Partitioning mode only: serializing + writing `MemberStore` spill
     /// segments (spill backing), during the fill and its final flush.
-    pub(super) spill_write: AtomicU64,
+    pub(super) spill_write: atomic::AtomicU64,
     /// Partitioning mode only: `MemberStore::take_wave` — reading and
     /// decoding a wave's spilled segments back (plus the trivial in-RAM
     /// remainder move; ~0 under RAM backing). Single-threaded, per wave.
-    pub(super) spill_read: AtomicU64,
+    pub(super) spill_read: atomic::AtomicU64,
     /// `writer.add_tile_precompressed` calls: the serial per-tile write loop
     /// in [`super::export::export_level`], folded in once per wave.
-    pub(super) spool_write: AtomicU64,
+    pub(super) spool_write: atomic::AtomicU64,
     /// `writer.checkpoint(...)` calls (throttled salvage snapshots,
     /// #229/#459). Not the final `writer.finalize(...)` — see
     /// `phase_walls.finalize`.
-    pub(super) checkpoint: AtomicU64,
+    pub(super) checkpoint: atomic::AtomicU64,
     /// The level scan's read (#730): opening each band's reader plus every
     /// `next()` on [`super::export::scan_all_levels`]'s producer thread, the
     /// scan's analogue of `band_read`. Single-threaded; overlaps
     /// `scan_decode` / `scan_size` in wall time.
-    pub(super) scan_read: AtomicU64,
+    pub(super) scan_read: atomic::AtomicU64,
     /// The level scan's per-batch bbox extraction (#730): reading the bbox
     /// covering, or decoding the geometry when the file has none. A WALL
     /// window on the scan's single consumer thread around each batch, so a
     /// rayon-parallel decode inside it counts once, not per core.
-    pub(super) scan_decode: AtomicU64,
+    pub(super) scan_decode: atomic::AtomicU64,
     /// The level scan's per-batch tile sizing (`size_bboxes`, #730): a wall
     /// window on the consumer thread, like `scan_decode`.
-    pub(super) scan_size: AtomicU64,
+    pub(super) scan_size: atomic::AtomicU64,
     /// #750 coverage fill, seed: decoding, clipping, projecting and
     /// simplifying the finest level, a wall window per batch on the
     /// consumer thread (its decode is not charged to `decode`).
-    pub(super) fill_seed: AtomicU64,
+    pub(super) fill_seed: atomic::AtomicU64,
     /// #750 coverage fill, pyramid: Douglas–Peucker with area credit,
     /// summed per tile across threads.
-    pub(super) fill_simplify: AtomicU64,
+    pub(super) fill_simplify: atomic::AtomicU64,
     /// #750 coverage fill, pyramid: `union_touching` (both passes), summed
     /// per tile.
-    pub(super) fill_union: AtomicU64,
+    pub(super) fill_union: atomic::AtomicU64,
     /// #750 coverage fill, pyramid: the placeholder-square accumulator,
     /// summed per tile.
-    pub(super) fill_squares: AtomicU64,
+    pub(super) fill_squares: atomic::AtomicU64,
     /// #750 coverage fill, encode: a tile's host assignment, budget and
     /// fill-feature encoding, summed per tile (part of `encode`'s window).
-    pub(super) fill_encode: AtomicU64,
+    pub(super) fill_encode: atomic::AtomicU64,
     /// #810: time spent waiting to lock a concurrent level group's
     /// `GroupCommit` (#647), summed over the collecting thread and every
     /// encode task. Waiting, not work: not a stage.
-    pub(super) group_commit_wait: AtomicU64,
+    pub(super) group_commit_wait: atomic::AtomicU64,
 }
 
 /// [`ExportTimers`] snapshotted in seconds for [`write_export_profile_json`].
@@ -4770,7 +4766,7 @@ impl ExportTimers {
     /// Run `f`, charging its duration to `cell`. The per-item form used
     /// inside rayon closures (one geometry, one tile): an `Instant` pair and a
     /// relaxed `fetch_add` is noise next to a clip or an MVT encode.
-    pub(super) fn time<T>(cell: &AtomicU64, f: impl FnOnce() -> T) -> T {
+    pub(super) fn time<T>(cell: &atomic::AtomicU64, f: impl FnOnce() -> T) -> T {
         let t = Instant::now();
         let out = f();
         add_nanos(cell, t.elapsed());
@@ -4779,7 +4775,7 @@ impl ExportTimers {
 
     /// Charge the rest of the enclosing scope to `cell` (drop-guard form of
     /// [`Self::time`], for spans with `?` early returns inside them).
-    pub(super) fn scope(cell: &AtomicU64) -> StageScope<'_> {
+    pub(super) fn scope(cell: &atomic::AtomicU64) -> StageScope<'_> {
         StageScope {
             cell,
             start: Instant::now(),
@@ -4816,7 +4812,7 @@ impl ExportTimers {
     reason = "#779: per-run profiling counters shared by scoped worker threads"
 )]
 pub(super) struct StageScope<'a> {
-    cell: &'a AtomicU64,
+    cell: &'a atomic::AtomicU64,
     start: Instant,
 }
 
@@ -5319,24 +5315,24 @@ struct Pass1Output {
 struct Pass1Timers {
     /// Parquet read + Arrow decode of the raw batch (`reader.next()`), timed
     /// on the reader thread — overlaps every other stage below.
-    read: AtomicU64,
+    read: atomic::AtomicU64,
     /// Geometry column read: `from_arrow_array`, then the [`ScanRows`]
     /// visitor, which does the in-place `scan_feature_traits` walk (bbox +
     /// kind) and the few conversions to `geo::Geometry` this pass keeps
     /// (#650). Summed across the batch's parallel `scan_chunk` rayon tasks.
-    decode: AtomicU64,
+    decode: atomic::AtomicU64,
     /// Per-row bookkeeping on the scanned rows: attribute-filter and
     /// regional-extract gates, line tally, areas, feature push. Summed
     /// across the batch's parallel `scan_chunk` rayon tasks.
-    scan: AtomicU64,
+    scan: atomic::AtomicU64,
     /// Ranking-key, accumulate-value, and entry-zoom-ladder column
     /// extraction — serial (order-dependent, `extract_pass1_batch_keys`),
     /// one measurement per batch.
-    keys: AtomicU64,
+    keys: atomic::AtomicU64,
     /// Post-scan assembly: ranking-tier resolution, sort-key stamping,
     /// entry-level stamping, coalesce-scratch assembly — serial, once for
     /// the whole pass (not per batch).
-    assemble: AtomicU64,
+    assemble: atomic::AtomicU64,
 }
 
 /// Pass-1 stage split, in **core-seconds** (summed across threads, not wall —
@@ -5367,15 +5363,15 @@ impl Pass1StageSecs {
     reason = "#779: per-run profiling counters shared by scoped worker threads"
 )]
 impl Pass1Timers {
-    fn add(cell: &AtomicU64, start: Instant) {
+    fn add(cell: &atomic::AtomicU64, start: Instant) {
         add_nanos(cell, start.elapsed());
     }
     /// Add a pre-measured duration (used by the reader thread for read time,
     /// mirroring [`Pass2Timers::add_dur`]).
-    fn add_dur(cell: &AtomicU64, dur: Duration) {
+    fn add_dur(cell: &atomic::AtomicU64, dur: Duration) {
         add_nanos(cell, dur);
     }
-    fn secs(cell: &AtomicU64) -> f64 {
+    fn secs(cell: &atomic::AtomicU64) -> f64 {
         nanos_secs(cell)
     }
     fn stage_secs(&self) -> Pass1StageSecs {
@@ -6538,47 +6534,47 @@ pub(super) struct Pass2Timers {
     /// seam, and the time the merge spends parked on `recv`) is deliberately
     /// NOT counted here: the splice is charged to nobody, and counting the
     /// `recv` wait would double-count time the workers are already reporting.
-    read: AtomicU64,
+    read: atomic::AtomicU64,
     /// Winner selection + geometry take/decode to `geo::Geometry`.
-    decode: AtomicU64,
+    decode: atomic::AtomicU64,
     /// Simplification (or verbatim vertex counting at the canonical level).
-    simplify: AtomicU64,
+    simplify: atomic::AtomicU64,
     /// Output batch assembly (`build_level_batch`).
-    build: AtomicU64,
+    build: atomic::AtomicU64,
     /// Draining a level's sink into `writer.write_level` (the serial parquet
     /// append). Previously invisible: it runs after the read loop finishes,
     /// one level at a time.
-    drain: AtomicU64,
+    drain: atomic::AtomicU64,
     /// The bounded-profile Arrow IPC spill write: encode + write on the
     /// per-level spill-writer thread (#494), folded in when that thread is
     /// joined (`SpillState::into_reader`), not as batches are pushed. So it is
     /// core-seconds off the consumer's critical path — it no longer runs in
     /// `SpillState::push` and no longer runs on the consumer thread.
-    spill_write: AtomicU64,
+    spill_write: atomic::AtomicU64,
     /// #810: the streamed finest level's writer thread, busy rather than
     /// waiting on the producer: its wall minus its `recv` waits. Emitted as
     /// `pass2.writer_busy_secs`.
-    writer_busy: AtomicU64,
+    writer_busy: atomic::AtomicU64,
     /// Cascade-fold steps ([`process_batch_cascade`], #499) that reused
     /// (`Arc::clone`) the previous step's geometry because simplification
     /// removed nothing, instead of retaining a fresh allocation. Wired into
     /// the `TYLERTOO_PROFILE_JSON` dump (`pass2.identical_steps`) so a run
     /// quantifies its own share-vs-clone ratio.
-    cascade_steps_shared: AtomicU64,
+    cascade_steps_shared: atomic::AtomicU64,
     /// Total cascade-fold `Keep` steps evaluated ([`process_batch_cascade`]);
     /// the denominator for `cascade_steps_shared`.
-    cascade_steps_total: AtomicU64,
+    cascade_steps_total: atomic::AtomicU64,
     /// Input batches the pass-2 consumers took through
     /// [`for_each_window`](super::pipe::for_each_window) (#494), summed over
     /// the buffered engine and the streamed finest level (each reads the
     /// input once, so a two-read run counts every batch twice).
-    window_batches: AtomicU64,
+    window_batches: atomic::AtomicU64,
     /// Windows those batches were processed in; `window_batches / windows` is
     /// the mean number of batches processed concurrently.
-    windows: AtomicU64,
+    windows: atomic::AtomicU64,
     /// The widest window either consumer ran. Stuck at 1 means pass 2 was
     /// reader-bound: the window never had a second batch queued to take.
-    max_window: AtomicU64,
+    max_window: atomic::AtomicU64,
 }
 
 /// Pass-2 engine stage wall-time split, in seconds — [`Pass2Timers`]
@@ -6613,23 +6609,23 @@ impl Pass2StageSecs {
     reason = "#779: per-run profiling counters shared by scoped worker threads"
 )]
 impl Pass2Timers {
-    fn add(cell: &AtomicU64, start: Instant) {
+    fn add(cell: &atomic::AtomicU64, start: Instant) {
         add_nanos(cell, start.elapsed());
     }
     /// Add a pre-measured duration (used by the reader thread for read time).
-    pub(super) fn add_dur(cell: &AtomicU64, dur: Duration) {
+    pub(super) fn add_dur(cell: &atomic::AtomicU64, dur: Duration) {
         add_nanos(cell, dur);
     }
-    fn secs(cell: &AtomicU64) -> f64 {
+    fn secs(cell: &atomic::AtomicU64) -> f64 {
         nanos_secs(cell)
     }
-    pub(super) fn read_cell(&self) -> &AtomicU64 {
+    pub(super) fn read_cell(&self) -> &atomic::AtomicU64 {
         &self.read
     }
-    pub(super) fn drain_cell(&self) -> &AtomicU64 {
+    pub(super) fn drain_cell(&self) -> &atomic::AtomicU64 {
         &self.drain
     }
-    pub(super) fn spill_write_cell(&self) -> &AtomicU64 {
+    pub(super) fn spill_write_cell(&self) -> &atomic::AtomicU64 {
         &self.spill_write
     }
     /// Record a batch's worth of cascade-fold `Keep` steps (#499): `shared`
