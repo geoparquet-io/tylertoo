@@ -1076,6 +1076,13 @@ pub fn fuzz_parquet_footer(thrift: &[u8]) -> Result<ValidationReport, tylertoo_i
     }
 
     let reader = tylertoo_io::reader_metadata(std::sync::Arc::new(md.clone())).ok();
+    if let Some(reader) = &reader {
+        // A reader's setup from the footer alone, column splits included
+        // (#876); with no file bytes, any page read fails.
+        let _ = tylertoo_io::open_parquet_with_metadata(bytes::Bytes::new(), reader.clone())
+            .with_decode_threads(4)
+            .build();
+    }
     let some: Vec<usize> = (0..n).step_by(2).collect();
     for selected in [None, Some(some.as_slice())] {
         let _ = crate::input::selected_compressed_bytes(&md, selected);

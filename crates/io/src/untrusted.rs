@@ -1782,8 +1782,9 @@ fn column_splits(
             .metadata()
             .row_groups()
             .iter()
-            .map(|g| g.column(leaf).uncompressed_size().max(0) as u64)
-            .sum::<u64>()
+            .fold(0u64, |sum, g| {
+                sum.saturating_add(g.column(leaf).uncompressed_size().max(0) as u64)
+            })
             .max(1)
     };
     // Whole roots: a root's leaves decode into one array.
@@ -1793,22 +1794,23 @@ fn column_splits(
         match roots.last_mut() {
             Some((ls, b)) if descr.get_column_root_idx(ls[0]) == root => {
                 ls.push(leaf);
-                *b += bytes(leaf);
+                *b = b.saturating_add(bytes(leaf));
             }
             _ => roots.push((vec![leaf], bytes(leaf))),
         }
     }
-    let total: u64 = roots.iter().map(|r| r.1).sum();
+    // Footer sizes are untrusted: every sum saturates.
+    let total = roots.iter().fold(0u64, |sum, r| sum.saturating_add(r.1));
     let target = total.div_ceil(splits as u64);
     let mut out: Vec<Vec<usize>> = vec![Vec::new()];
     let mut acc = 0u64;
     for (ls, b) in roots {
-        if acc > 0 && acc + b / 2 > target && out.len() < splits {
+        if acc > 0 && acc.saturating_add(b / 2) > target && out.len() < splits {
             out.push(Vec::new());
             acc = 0;
         }
         out.last_mut().unwrap().extend(ls);
-        acc += b;
+        acc = acc.saturating_add(b);
     }
     if out.len() < 2 {
         return Vec::new();
@@ -2350,6 +2352,68 @@ mod tests {
             assert_eq!(split, one);
         }
         assert_eq!(read(1, None).inner.current.len(), 1);
+    }
+
+    /// Three Int64 columns over three row groups, every chunk's footer
+    /// declaring `uncompressed` bytes.
+    fn declaring_uncompressed(uncompressed: i64) -> Bytes {
+        use arrow_array::{ArrayRef, Int64Array};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::ParquetMetaDataWriter;
+        use parquet::file::properties::WriterProperties;
+        let column = || Arc::new(Int64Array::from_iter_values(0..30)) as ArrayRef;
+        let batch = RecordBatch::try_from_iter([("a", column()), ("b", column()), ("c", column())])
+            .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
+            .build();
+        let mut good = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut good, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let md = open_parquet(Bytes::from(good.clone())).unwrap().metadata;
+        let md = md.metadata().as_ref().clone();
+        let groups = md
+            .row_groups()
+            .iter()
+            .map(|g| {
+                let columns = g
+                    .columns()
+                    .iter()
+                    .map(|c| {
+                        c.clone()
+                            .into_builder()
+                            .set_total_uncompressed_size(uncompressed)
+                            .build()
+                            .unwrap()
+                    })
+                    .collect();
+                g.clone()
+                    .into_builder()
+                    .set_column_metadata(columns)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let md = md.into_builder().set_row_groups(groups).build();
+        let footer = u32::from_le_bytes(good[good.len() - 8..good.len() - 4].try_into().unwrap());
+        good.truncate(good.len() - 8 - footer as usize);
+        ParquetMetaDataWriter::new(&mut good, &md).finish().unwrap();
+        Bytes::from(good)
+    }
+
+    /// roborev on f44f9372: a footer declaring column chunks near
+    /// `i64::MAX` bytes uncompressed must not overflow the column splits'
+    /// byte weights, which run outside the panic boundary: the reader still
+    /// builds and reads its rows.
+    #[test]
+    fn inflated_uncompressed_sizes_do_not_overflow_the_column_splits() {
+        let bytes = declaring_uncompressed(i64::MAX);
+        let source = open_parquet(bytes)
+            .expect("only the uncompressed sizes are inflated")
+            .with_decode_threads(4);
+        let rows: usize = source.build().unwrap().map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(rows, 30);
     }
 
     #[test]
