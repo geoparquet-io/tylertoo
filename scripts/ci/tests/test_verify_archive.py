@@ -35,7 +35,8 @@ def test_decay_fails_when_no_cohort_is_eligible():
     assert not result.ok
     assert result.detail == (
         "square cohort survivors: no cohort was eligible; requires at least 32 tiny-square ids "
-        "at a zoom with a level three zooms coarser; EPSG:3857 source at GSD base 1024 "
+        "at a zoom at least 3 above the archive's minimum zoom; "
+        "EPSG:3857 source at GSD base 1024 "
         "and extent 4096"
     )
 

@@ -837,7 +837,8 @@ def evaluate(
                 stuck.append(pair)
         detail = "square cohort survivors: " + ("; ".join(cohorts) or (
             f"no cohort was eligible; requires at least {DECAY_MIN_SQUARES} tiny-square ids "
-            "at a zoom with a level three zooms coarser; EPSG:3857 source at GSD base 1024 "
+            f"at a zoom at least {DECAY_WINDOW} above the archive's minimum zoom; "
+            "EPSG:3857 source at GSD base 1024 "
             "and extent 4096"
         ))
         if stuck:

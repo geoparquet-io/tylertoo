@@ -86,6 +86,7 @@ def test_decay_expectations_require_an_eligible_polygon_cohort(tmp_path, monkeyp
 
 def test_dataset_help_limits_decay_expectations_to_built_in_fixtures(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["run_e2e.py", "--help"])
+    monkeypatch.setenv("COLUMNS", "200")  # argparse wraps at hyphens; keep the phrase on one line
     with pytest.raises(SystemExit) as exc:
         run_e2e.main()
     assert exc.value.code == 0
