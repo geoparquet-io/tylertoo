@@ -19,9 +19,9 @@ const MARGIN_DENOM: u64 = 20;
 // intermediate is the smallest positive half-step covering all seven #872
 // peaks: I_est/peak GiB = Madagascar .257/.192, Moldova .85/.736,
 // Places 5.69/3.425, BR_MT filtered (auto/bounded) 4.2/2.965, all 9.4/4.91,
-// segments 7.3/6.15 (those peaks included export member spill, which is now
-// priced separately as "export member spill", so this allowance is
-// conservative). I_est already exceeds I_actual.
+// segments 7.3/6.15 (those peaks included export member spill: under bounded
+// it is now priced separately as "export member spill"; under auto this
+// allowance is what covers it). I_est already exceeds I_actual.
 const OUTPUT_PER_INTERMEDIATE: (u64, u64) = (1, 2);
 // shortcut: empirical, not derived from the member encoding. Export's member
 // spill holds the finest levels' full-detail rows, which the pass-2 row price
