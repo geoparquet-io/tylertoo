@@ -41,6 +41,8 @@ serve = ["dep:tiny_http", "dep:percent-encoding"]
 remote = [
     "tylertoo-io/remote",
     "dep:object_store",
+    "dep:reqwest",
+    "dep:humantime",
     "dep:tokio",
     "dep:aws-config",
     "dep:aws-credential-types",
@@ -105,6 +107,9 @@ serde_json = "1.0.129"
 i_overlay = "9"
 tempfile = "3"
 object_store = { version = "0.14", features = ["aws", "gcp", "http"], optional = true }
+# Match object_store's transport features; humantime preserves its timeout syntax.
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls", "stream"], optional = true }
+humantime = { version = "2", optional = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "sync"], optional = true }
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
