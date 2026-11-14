@@ -31,7 +31,9 @@ use crate::dedup::TileHasher;
 use crate::input::{redact_query, url_scheme};
 use crate::overview::cells::{CellRollup, CellSystem};
 use crate::overview::config::{check_ignored_export_fields, ExportField};
-use crate::overview::convert::{convert_to_overviews, ConvertError, ConvertOptions, LevelPlan};
+use crate::overview::convert::{
+    convert_to_overviews_for_archive, ConvertError, ConvertOptions, LevelPlan,
+};
 use crate::overview::export::{export_pmtiles, ExportError, ExportOptions};
 use crate::pmtiles_metadata::{MetadataCollector, Resolved};
 use crate::pmtiles_writer::{Header, StreamingPmtilesWriter, TileType, MAX_TILE_ID_ZOOM};
@@ -2400,12 +2402,12 @@ fn tile_source_band(
         profile: opts.export.profile,
         ..convert.clone()
     };
-    let report = convert_to_overviews(input, &overview, &convert).map_err(|error| {
-        PyramidError::BandConvert {
+    let report = convert_to_overviews_for_archive(input, &overview, &convert, &archive).map_err(
+        |error| PyramidError::BandConvert {
             layer: layer.to_string(),
             error,
-        }
-    })?;
+        },
+    )?;
     diagnostics.extend(report.diagnostics);
 
     let export = ExportOptions {
@@ -3719,6 +3721,46 @@ mod tests {
     }
 
     /// A grid of uniform cells: the shape of a DGGS aggregate band.
+    /// #872: a band exports its archive while its intermediate exists, so the
+    /// disk preflight prices the archive too.
+    #[test]
+    fn a_source_band_prices_its_archive_in_the_disk_preflight() {
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("band.parquet");
+        write_cell_source(&input, 40, 0.6);
+        let opts = PyramidOptions {
+            work_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let named = |suffix: &str| -> Result<Reserved, PyramidError> {
+            Ok(
+                crate::atomic_output::reserve_path("tylertoo-pyramid-", suffix, Some(dir.path()))
+                    .unwrap(),
+            )
+        };
+        crate::test_log::take_thread_lines();
+        tile_source_band(
+            &input,
+            "layer",
+            (0, 2),
+            &ConvertOptions::default(),
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+            &named,
+        )
+        .unwrap();
+        if logging {
+            let lines = crate::test_log::take_thread_lines();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("[disk] after pass 1") && l.contains("output archive")),
+                "{lines:#?}"
+            );
+        }
+    }
+
     fn write_cell_source(path: &Path, n: usize, size: f64) {
         use geo::{Geometry, LineString, Polygon};
 

@@ -4173,6 +4173,26 @@ pub(crate) fn convert_to_overviews_source_strategy(
     )
 }
 
+/// [`convert_to_overviews`] for a caller that exports the result to `archive`
+/// while the intermediate still exists (a pyramid band), so the disk preflight
+/// prices that archive.
+pub(crate) fn convert_to_overviews_for_archive(
+    input: &Path,
+    output_path: &Path,
+    options: &ConvertOptions,
+    archive: &Path,
+) -> Result<ConvertReport, ConvertError> {
+    options.validate()?;
+    convert_to_overviews_source_diagnostics(
+        &ConvertSource::resolve_path(input)?,
+        output_path,
+        options,
+        super::stream::Pass2Strategy::Pipelined,
+        &crate::diagnostics::Diagnostics::default(),
+        Some(archive),
+    )
+}
+
 pub(crate) fn convert_to_overviews_source_diagnostics(
     source: &ConvertSource,
     output_path: &Path,
