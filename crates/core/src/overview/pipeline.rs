@@ -837,6 +837,9 @@ struct SinkAutoTuner {
     /// per row they materialize: per output row of an owned batch, per
     /// shared row of a shared one (#852), whose output rows are positions.
     bytes: u64,
+    /// Materialized Arrow payload, without RAM allocation overhead and with
+    /// shared properties charged at every referencing level.
+    disk_bytes: u64,
     /// Output rows the plan expects the buffered levels to hold in total.
     planned_rows: usize,
     /// the `MemoryBudget` allowance, captured once.
@@ -899,6 +902,7 @@ impl SinkAutoTuner {
         Self {
             rows: 0,
             bytes: 0,
+            disk_bytes: 0,
             planned_rows,
             budget_bytes,
             armed,
@@ -911,6 +915,7 @@ impl SinkAutoTuner {
     /// the measurement. Runs for every batch of the pass.
     fn observe(&mut self, batch: &LevelBatch) {
         self.rows += batch.num_rows();
+        self.disk_bytes = self.disk_bytes.saturating_add(batch.disk_bytes());
         let floor = match batch {
             LevelBatch::Owned(b) => b.num_rows() as u64 * SINK_ROW_ALLOC_OVERHEAD_BYTES,
             LevelBatch::Shared { .. } => 0,
@@ -939,6 +944,10 @@ impl SinkAutoTuner {
         (self.rows > 0).then(|| self.bytes / self.rows as u64)
     }
 
+    fn disk_bytes_per_row(&self) -> Option<u64> {
+        (self.rows > 0).then(|| self.disk_bytes.div_ceil(self.rows as u64))
+    }
+
     /// Reprice disk once at the first decision-grade sample, after both
     /// shared bytes and the current output batch's rows were observed.
     fn check_disk(
@@ -947,7 +956,7 @@ impl SinkAutoTuner {
     ) -> Result<(), ConvertError> {
         if !self.disk_checked && self.rows >= SINK_SAMPLE_MIN_ROWS {
             self.disk_checked = true;
-            check(self.bytes_per_row().expect("sample has rows"))?;
+            check(self.disk_bytes_per_row().expect("sample has rows"))?;
         }
         Ok(())
     }
@@ -1138,6 +1147,17 @@ impl SharedRows {
     }
 }
 
+/// Initialized Arrow data, including validity, nested children, dictionaries,
+/// and view buffers. Retaining complete buffers conservatively covers sliced
+/// arrays (notably union children serialized by IPC), without spare capacity.
+fn array_data_bytes(data: &arrow_data::ArrayData) -> u64 {
+    data.buffers()
+        .iter()
+        .fold(0u64, |sum, buffer| sum.saturating_add(buffer.len() as u64))
+        .saturating_add(data.nulls().map_or(0, |nulls| nulls.buffer().len() as u64))
+        .saturating_add(data.child_data().iter().map(array_data_bytes).sum::<u64>())
+}
+
 /// A shared level batch's geometries in [`SharedRows`]' geometry column.
 #[derive(Clone)]
 pub(super) enum LevelGeometry {
@@ -1220,6 +1240,45 @@ impl LevelBatch {
                 .map(|c| c.get_array_memory_size() as u64)
                 .sum::<u64>()
                 .saturating_add((index.get_array_memory_size() + geometry.held_bytes()) as u64),
+        }
+    }
+
+    /// Disk payload uses initialized buffer lengths, not allocation capacity
+    /// or array structs. Shared properties are materialized at every level.
+    fn disk_bytes(&self) -> u64 {
+        let bytes = |array: &ArrayRef| array_data_bytes(&array.to_data());
+        match self {
+            Self::Owned(batch) => batch.columns().iter().map(bytes).sum(),
+            Self::Shared {
+                rows,
+                index,
+                geometry,
+                own,
+                ..
+            } => {
+                let count = index.len() as u64;
+                let properties = rows
+                    .columns
+                    .iter()
+                    .map(bytes)
+                    .sum::<u64>()
+                    .saturating_mul(count)
+                    .div_ceil(rows.rows.max(1) as u64);
+                // Ranges concatenate levels; pools hold distinct geometries.
+                // Price geometry by its own row count, not property row count.
+                let geometries = bytes(&rows.geometry)
+                    .saturating_mul(count)
+                    .div_ceil(rows.geometry.len().max(1) as u64);
+                let positions = match geometry {
+                    LevelGeometry::Pool(at) => array_data_bytes(&at.to_data()),
+                    LevelGeometry::Range(..) => 0,
+                };
+                properties
+                    .saturating_add(geometries)
+                    .saturating_add(array_data_bytes(&index.to_data()))
+                    .saturating_add(positions)
+                    .saturating_add(own.iter().map(bytes).sum::<u64>())
+            }
         }
     }
 
@@ -3541,6 +3600,142 @@ mod sink_sample_tests {
     const ROWS: usize = 4_096;
 
     #[test]
+    fn measured_disk_price_charges_shared_properties_at_every_level() {
+        let n = ROWS;
+        let input = RecordBatch::try_from_iter(vec![
+            (
+                "payload",
+                Arc::new(arrow_array::StringArray::from(vec!["x".repeat(2_048); n])) as ArrayRef,
+            ),
+            (
+                "geometry",
+                Arc::new(Float64Array::from(vec![1.; n])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        for level_count in [2, 4, 8] {
+            for pooled in [true, false] {
+                let kept: Vec<Vec<usize>> = (0..level_count)
+                    .map(|level| (0..n / (level + 1)).collect())
+                    .collect();
+                let total_rows: usize = kept.iter().map(Vec::len).sum();
+                let geometry_rows = if pooled { n } else { total_rows };
+                let geometry = Arc::new(Float64Array::from(vec![1.; geometry_rows]));
+                let selections: Vec<_> = kept.iter().map(Vec::as_slice).collect();
+                let (shared, indices) =
+                    SharedRows::new(&input, &[0], &selections, geometry).unwrap();
+                let shared = Arc::new(shared);
+                let mut start = 0;
+                let per_level: Vec<_> = indices
+                    .into_iter()
+                    .map(|index| {
+                        let len = index.len();
+                        let geometry = if pooled {
+                            LevelGeometry::Pool(index.clone())
+                        } else {
+                            LevelGeometry::Range(start, len)
+                        };
+                        start += len;
+                        Some((
+                            LevelBatch::shared(
+                                input.schema(),
+                                &shared,
+                                index,
+                                geometry,
+                                1,
+                                Vec::new(),
+                            ),
+                            0,
+                        ))
+                    })
+                    .collect();
+                let mut tuner = SinkAutoTuner::with_budget(false, total_rows, 0);
+                tuner.observe_shared(&per_level);
+                for (level, _) in per_level.iter().flatten() {
+                    tuner.observe(level);
+                }
+                let mut prices = Vec::new();
+                tuner
+                    .check_disk(&mut |price| {
+                        prices.push(price);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    prices,
+                    // 2048 string bytes + 4 offset + 8 geometry + 4 index
+                    // (+ 4 pool index), rounded up for the final string offset.
+                    [if pooled { 2_069 } else { 2_065 }],
+                    "{level_count} levels, pooled {pooled}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn measured_disk_price_for_narrow_rows_keeps_footer_price_without_rechecking() {
+        use super::super::disk::DiskRecheck;
+        use crate::input_set::ConvertSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("narrow.parquet");
+        super::super::testutil::write_input(
+            &input,
+            &[Some(geo::Geometry::Point(geo::Point::new(1., 2.)))],
+            false,
+            None,
+        );
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        let options = super::super::convert::ConvertOptions::default();
+        let output = dir.path().join("out.parquet");
+        let mut recheck = DiskRecheck {
+            source: &source,
+            selection: None,
+            options: &options,
+            overview: &output,
+            level_rows: &[ROWS, ROWS],
+            spilling_levels: 1,
+            price: 100,
+            warned: false,
+        };
+        // Plenty of spare capacity, but only three tiny values per row.
+        let mut builder = arrow_array::builder::StringBuilder::with_capacity(ROWS * 32, ROWS * 128);
+        for _ in 0..ROWS {
+            builder.append_value("x");
+        }
+        let batch = RecordBatch::try_from_iter(vec![
+            ("name", Arc::new(builder.finish()) as ArrayRef),
+            (
+                "x",
+                Arc::new(Float64Array::from(vec![1.; ROWS])) as ArrayRef,
+            ),
+            (
+                "y",
+                Arc::new(Float64Array::from(vec![2.; ROWS])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut tuner = SinkAutoTuner::with_budget(false, ROWS, 0);
+        tuner.observe(&LevelBatch::Owned(batch));
+        let mut probes = 0;
+        let mut warning = None;
+        tuner
+            .check_disk(&mut |price| {
+                // 1 string byte + 4 offset + two 8-byte values, rounded up.
+                assert_eq!(price, 22);
+                warning = recheck.check_with(price, |_| {
+                    probes += 1;
+                    Some("may not fit".into())
+                })?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(recheck.price, 100);
+        assert_eq!(probes, 0);
+        assert!(warning.is_none());
+    }
+
+    #[test]
     fn measured_disk_check_waits_for_sample_and_runs_once_for_every_profile() {
         for profile in [
             MemoryProfile::Auto,
@@ -3566,7 +3761,7 @@ mod sink_sample_tests {
             assert_eq!(calls.get(), 0);
             tuner.observe(&LevelBatch::Owned(batch.slice(SINK_SAMPLE_MIN_ROWS - 1, 1)));
             tuner.check_disk(&mut check).unwrap();
-            let first_price = tuner.bytes_per_row().unwrap();
+            let first_price = tuner.disk_bytes_per_row().unwrap();
             tuner.observe(&LevelBatch::Owned(sample_batch(200)));
             tuner.check_disk(&mut check).unwrap();
             assert_eq!(prices, [first_price]);
@@ -3664,7 +3859,7 @@ mod sink_sample_tests {
                 assert!(recheck.check_with(average, &mut warning).unwrap().is_none());
                 let mut tuner = SinkAutoTuner::with_budget(false, KEPT, 0);
                 tuner.observe(&LevelBatch::Owned(kept.clone()));
-                let measured = tuner.bytes_per_row().unwrap();
+                let measured = tuner.disk_bytes_per_row().unwrap();
                 assert!(
                     measured > average * 4,
                     "measured {measured}, average {average}"
