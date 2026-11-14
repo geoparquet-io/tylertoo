@@ -969,7 +969,26 @@ impl SinkAutoTuner {
         let sample = self
             .planned_rows
             .clamp(SINK_SAMPLE_MIN_ROWS, DISK_SAMPLE_ROWS);
-        if !self.disk_checked && self.rows >= sample {
+        if self.rows >= sample {
+            self.reprice_disk(check)?;
+        }
+        Ok(())
+    }
+
+    /// At the end of the read, reprice from whatever was buffered if the plan
+    /// over-counted (collapsed features) and the sample size was never reached.
+    fn check_disk_at_end(
+        &mut self,
+        check: &mut super::disk::DiskCheck<'_>,
+    ) -> Result<(), ConvertError> {
+        if self.rows >= SINK_SAMPLE_MIN_ROWS {
+            self.reprice_disk(check)?;
+        }
+        Ok(())
+    }
+
+    fn reprice_disk(&mut self, check: &mut super::disk::DiskCheck<'_>) -> Result<(), ConvertError> {
+        if !self.disk_checked {
             self.disk_checked = true;
             let prices: Vec<_> = (0..self.disk_levels.len())
                 .map(|li| self.disk_bytes_per_row(li))
@@ -2047,6 +2066,7 @@ pub(super) fn run_pass2_buffered(
             Ok(())
         },
     )?;
+    tuner.check_disk_at_end(disk_check)?;
 
     // Drain each level's sink into the writer, in level order. An empty
     // buffered level is skipped and renumbered by the writer (#211); the
@@ -4089,6 +4109,23 @@ mod sink_sample_tests {
                 .unwrap();
         }
         assert_eq!(batch_rows, DISK_SAMPLE_ROWS);
+    }
+
+    #[test]
+    fn measured_disk_check_fires_at_the_end_when_the_plan_over_counted() {
+        let mut tuner = SinkAutoTuner::with_budget(false, 4 * ROWS, 0);
+        tuner.disk_levels.resize(1, (0, 0));
+        tuner.observe(0, &LevelBatch::Owned(sample_batch(1)));
+        let calls = std::cell::Cell::new(0);
+        let mut check = |_: &[Option<u64>]| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        tuner.check_disk(&mut check).unwrap();
+        assert_eq!(calls.get(), 0);
+        tuner.check_disk_at_end(&mut check).unwrap();
+        tuner.check_disk_at_end(&mut check).unwrap();
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
