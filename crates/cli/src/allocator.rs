@@ -6,11 +6,12 @@ use tylertoo_core::MemoryProfile;
 /// the process-global setting unchanged, including after a Bounded Python call.
 /// Builds using the system allocator or dhat do nothing.
 pub fn apply_memory_profile_allocator(profile: MemoryProfile) {
+    let purge = purges_immediately(profile);
     #[cfg(all(
         any(target_env = "musl", feature = "mimalloc"),
         not(feature = "dhat-heap")
     ))]
-    if profile == MemoryProfile::Bounded {
+    if purge {
         // Retain mimalloc's native link edge in library consumers too.
         use mimalloc as _;
         extern "C" {
@@ -21,7 +22,25 @@ pub fn apply_memory_profile_allocator(profile: MemoryProfile) {
         // SAFETY: valid option id and delay in milliseconds; no pointers.
         unsafe { mi_option_set(15, 0) };
     }
-    let _ = profile;
+    let _ = purge;
+}
+
+/// The policy decision, compiled in every configuration so `--all-features`
+/// (dhat) CI still tests it.
+fn purges_immediately(profile: MemoryProfile) -> bool {
+    profile == MemoryProfile::Bounded
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn only_bounded_purges_immediately() {
+        assert!(purges_immediately(MemoryProfile::Bounded));
+        assert!(!purges_immediately(MemoryProfile::Auto));
+        assert!(!purges_immediately(MemoryProfile::Speed));
+    }
 }
 
 #[cfg(all(

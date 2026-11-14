@@ -623,10 +623,9 @@ pub struct ExportOptions {
     /// a tile that alone needs more than the machine's memory (#665): no
     /// profile makes one tile smaller. `tiles` passes its own `--profile`
     /// through. Changes speed and peak memory only; output is
-    /// byte-identical across profiles. The default mimalloc build also purges
-    /// freed pages immediately under `bounded` (at a speed cost); a
-    /// `--no-default-features` build uses the system allocator. See
-    /// [`MemoryProfile`]. Default [`MemoryProfile::Auto`].
+    /// byte-identical across profiles. The CLI and Python extension purge freed
+    /// mimalloc pages immediately under `bounded` (at a speed cost); core does
+    /// not configure the allocator. See [`MemoryProfile`]. Default [`MemoryProfile::Auto`].
     #[serde(with = "super::config::spelled")]
     #[cfg_attr(feature = "cli", arg(
         long,
