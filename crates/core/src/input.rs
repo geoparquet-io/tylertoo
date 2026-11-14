@@ -5404,11 +5404,22 @@ mod tests {
                 "http://{}/x.parquet?X-Amz-Signature=SIG843SECRET",
                 origin.local_addr().unwrap()
             );
+            let (target_addr, origin_addr) =
+                (target.local_addr().unwrap(), origin.local_addr().unwrap());
+            #[expect(
+                clippy::disallowed_types,
+                reason = "#779: test shutdown flag for local servers; not diagnostic state"
+            )]
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (tx, rx) = std::sync::mpsc::channel();
             let body = tiny_parquet();
-            std::thread::spawn(move || {
+            let target_stop = Arc::clone(&stop);
+            let target_thread = std::thread::spawn(move || {
                 for stream in target.incoming() {
                     let mut stream = stream.unwrap();
+                    if target_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut request = String::new();
                     reader.read_line(&mut request).unwrap();
@@ -5456,9 +5467,13 @@ mod tests {
                     }
                 }
             });
-            std::thread::spawn(move || {
+            let origin_stop = Arc::clone(&stop);
+            let origin_thread = std::thread::spawn(move || {
                 for stream in origin.incoming() {
                     let mut stream = stream.unwrap();
+                    if origin_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     loop {
                         let mut line = String::new();
@@ -5474,6 +5489,12 @@ mod tests {
             let reader = source.open().unwrap().build().unwrap();
             assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), 3);
             let requests: Vec<Vec<String>> = rx.try_iter().collect();
+            // Stop both servers: set the flag, wake each blocked accept, join.
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::net::TcpStream::connect(target_addr).unwrap();
+            std::net::TcpStream::connect(origin_addr).unwrap();
+            target_thread.join().unwrap();
+            origin_thread.join().unwrap();
             assert!(!requests.is_empty(), "redirect target received no requests");
             assert!(
                 requests
