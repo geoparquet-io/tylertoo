@@ -789,8 +789,8 @@ pub struct IntermediateOverview {
     /// `true` when [`TilesOptions::keep_overview`] retains it; `false` for a
     /// temp file removed after the export.
     pub retained: bool,
-    /// The #314 free-space preflight's warning, when the volume holding the
-    /// intermediate looked too small for it. Already logged (`log::warn`)
+    /// The free-space preflight's warning, when staging may not fit.
+    /// Already logged (`log::warn`)
     /// before the convert started; carried here too. `None` when the volume
     /// fits or either side of the comparison is unknowable. A caller that
     /// must surface it before the run calls [`intermediate_space_preflight`].
@@ -1234,8 +1234,8 @@ pub(super) fn convert_to_pmtiles_validated(
         convert_options.to_mut().overview_codec = options.temp_compression;
     }
 
-    // Shared disk-footprint preflight: sum staging, pass-2 spill and the
-    // intermediate on each destination volume. Warn before execution. Logged here
+    // Shared disk-footprint preflight: warn about staging on each destination
+    // volume; log spill and intermediate projections at info level. Logged here
     // and carried in the report; a caller that must surface it before the
     // run (#709: Python's `UserWarning`) calls `intermediate_space_preflight`.
     let diagnostics = crate::diagnostics::Diagnostics::default();
@@ -1257,6 +1257,7 @@ pub(super) fn convert_to_pmtiles_validated(
         &convert_options,
         super::stream::Pass2Strategy::Pipelined,
         &diagnostics,
+        Some(output),
     ) {
         Ok(report) => report,
         Err(e) => {
@@ -1812,9 +1813,10 @@ pub struct SpaceRemedies<'a> {
 ///
 /// The warning [`convert_to_pmtiles`] logs, for a caller that must surface
 /// it before the run, as Python's `UserWarning` does, in its own spelling
-/// of the remedies. Includes staging, raw pass-2 spill and the intermediate,
-/// grouped by destination volume. The facade keeps this compatibility entry
-/// point so Python can warn before releasing the GIL.
+/// of the remedies. Warns only about staged input and staged layers, grouped
+/// by destination volume. Spill and intermediate projections are info logs;
+/// their shortage warning follows pass 1's kept-row counts. The facade keeps
+/// this entry point so Python can warn before releasing the GIL.
 ///
 /// `None` when the volume fits, or when either side of the comparison is
 /// unknowable (an unreadable footer or an exotic filesystem) rather than crying
@@ -1915,6 +1917,41 @@ mod tests {
                 ..ConvertOptions::default()
             },
             ..TilesOptions::default()
+        }
+    }
+
+    #[test]
+    fn disk_preflight_uses_final_archive_directory() {
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        points_input(&input);
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let output = dir.path().join("out.pmtiles");
+        let mut options = zoomed_options(0, 2);
+        options.convert.spill_dir = Some(scratch.clone());
+        crate::test_log::take_thread_lines();
+        convert_to_pmtiles(&TilesInput::Path(input), &output, &options).unwrap();
+        if logging {
+            let lines = crate::test_log::take_thread_lines();
+            let footprint = lines
+                .iter()
+                .find(|line| line.starts_with("[disk] after pass 1 projected footprint:"))
+                .unwrap_or_else(|| panic!("{lines:#?}"));
+            let (conversion, archive) = footprint.split_once("output archive").unwrap();
+            assert!(
+                conversion.contains(&scratch.display().to_string()),
+                "{footprint}"
+            );
+            assert!(
+                archive.contains(&dir.path().display().to_string()),
+                "{footprint}"
+            );
+            assert!(
+                !archive.contains(&scratch.display().to_string()),
+                "{footprint}"
+            );
         }
     }
 

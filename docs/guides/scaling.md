@@ -153,14 +153,30 @@ Measure memory use if headroom is tight, or use `--read-workers 1`.
 
 `--spill-dir <path>` controls these temporary files and defaults to `$TMPDIR`.
 The run fails before starting if the directory does not exist.
+Before reading, disk-space warnings cover only staged remote input and the
+`--layer-column` staged layers copy. Projected pass-2 spill and intermediate
+overview sizes appear in info-level `[disk]` logs. After pass 1, a free-space
+recheck warns about those outputs using the kept rows at each emitted level,
+including attribute filtering, before pass 2 writes them, and reprices each
+level once from the first batch of rows pass 2 buffers. The estimate is the
+largest need on one volume at any phase: each level's spill file is deleted
+after it drains, so spill and intermediate are not counted at full size
+together, and the output archive is priced as half the intermediate while the
+whole intermediate exists. In Python, the recheck's shortage is logged at warning level and listed in
+the report as a `disk_shortage` diagnostic. `convert()` then raises it as a
+`UserWarning` once the run succeeds. Staged input and staged layers shortages raise
+their `UserWarning` before reading. Recheck remedies name both CLI flags and Python keywords. The
+intermediate payload uses the selected input's compressed/uncompressed footer ratio with a
+2x safety margin, capped at the raw estimate. Spill uses the profile's codec
+price (raw for `auto`, 0.4 times raw for `bounded`); framing stays raw for both.
 
 - **Remote stage file.** A remote convert copies the column chunks it touches
   to local disk, using about as much space as those chunks. Both passes read
   the staged data. Local inputs never stage. A free-space check warns of a
   shortfall, and a full `$TMPDIR` fails the run. Set `--spill-dir` on large remote runs.
-- **`tiles` intermediate overview.** At least the input's size, with its own
-  free-space check. It goes to `--spill-dir`, else `$TMPDIR`, else the output
-  directory, and export deletes it when done. `--keep-overview PATH` retains it.
+- **`tiles` intermediate overview.** It goes to `--spill-dir`, else `$TMPDIR`,
+  else the output directory, and export deletes it when done.
+  `--keep-overview PATH` retains it.
   It is written with LZ4; `--temp-compression zstd` makes it about a third
   smaller for 5–7% more CPU.
 - **Export spill file.** `export-pmtiles --spill-dir` (and `tiles --spill-dir`)

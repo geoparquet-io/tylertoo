@@ -22,12 +22,17 @@ Args:
     simple_clip_fastpath: See `export_pmtiles()`.
     feature_order: See `export_pmtiles()`.
     spill_dir: Scratch directory for the intermediate overview and
-        the export's spill (the CLI's `--spill-dir`). The
-        intermediate is at least input-sized; without this it goes
-        to `$TMPDIR`, then the output's directory. Set it when
-        `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised
-        when the chosen volume looks too small, whether or not the
-        run then fails.
+        the export's spill (the CLI's `--spill-dir`). Without this,
+        the intermediate goes to `$TMPDIR`, then the output's
+        directory. Set it when `$TMPDIR` is small or a tmpfs.
+        Before reading, a `UserWarning` reports space shortages for
+        staged input and staged layers only. After pass 1, space
+        shortages for the intermediate overview and pass-2 spill
+        are logged as warnings by `tylertoo_core` during the run
+        (with a recheck when pass 2 measures the selected
+        properties), appear in the report as `disk_shortage`
+        diagnostics, and are raised as a `UserWarning` once the run
+        succeeds.
     layer_column: Put each feature in the layer named by its value
         in this column (the CLI's `--layer-column`), and null or
         blank values in `"_unknown"`. The column is not written as

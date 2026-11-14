@@ -1479,6 +1479,8 @@ struct SpillPlan<'a> {
     input_rows: usize,
     row_bytes: Option<u64>,
     avg_geom_bytes: Option<u64>,
+    /// Shared with the post-pass-1 disk footprint.
+    output_row_bytes: u64,
 }
 
 /// What [`reserve_spill_cache`] reserved, and why (`TYLERTOO_PROFILE_JSON`
@@ -1533,6 +1535,7 @@ fn reserve_spill_cache(
         input_rows,
         row_bytes,
         avg_geom_bytes,
+        output_row_bytes,
     } = plan;
     let buffered_rows = buffered_rows(emitted, finest, options);
     let spills = matches!(
@@ -1554,7 +1557,7 @@ fn reserve_spill_cache(
     if !spills || buffered_rows == 0 {
         return skip("nothing spills");
     }
-    let arrow_bytes = budget.sink_estimate(options.mode, buffered_rows, avg_geom_bytes, row_bytes);
+    let arrow_bytes = (buffered_rows as u64).saturating_mul(output_row_bytes);
     let codec = pipeline::spill_codec(options.profile);
     let estimate_bytes = (arrow_bytes as f64 * pipeline::spill_bytes_per_arrow_byte(codec)) as u64;
     let reservation = if estimate_bytes <= budget.remaining() {
@@ -1645,6 +1648,7 @@ fn run_pass2_levels(
     hints: &[usize],
     inputs: Pass2Inputs<'_>,
     strategy: Pass2Strategy,
+    disk_check: &mut super::disk::DiskCheck<'_>,
 ) -> Result<
     (
         Vec<LevelStat>,
@@ -1782,6 +1786,7 @@ fn run_pass2_levels(
                         ),
                         budget,
                     },
+                    disk_check,
                 );
                 grants.release(&mut budget);
                 let result = result?;
@@ -2938,7 +2943,7 @@ fn preflight_with_memory_limit(
         options,
         overview,
     )?
-    .warning(super::tiles::CLI_REMEDIES)
+    .warning(super::disk::CORE_REMEDIES)
     {
         diagnostics.warn(message);
     }
@@ -3676,6 +3681,7 @@ pub(crate) fn run_stages(
     config: &super::config::ValidatedConfig<'_, ConvertOptions>,
     strategy: Pass2Strategy,
     diagnostics: &crate::diagnostics::Diagnostics,
+    archive: Option<&Path>,
 ) -> Result<ConvertReport, ConvertError> {
     let options = config.options();
     preflight_profile_json_path(diagnostics);
@@ -3799,6 +3805,8 @@ pub(crate) fn run_stages(
         },
     )?;
 
+    let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
+    let output_row_bytes = budget.output_row_bytes(options.mode, avg_geom_bytes, row_bytes);
     let spill_reservation = reserve_spill_cache(
         &mut budget,
         options,
@@ -3807,7 +3815,8 @@ pub(crate) fn run_stages(
             finest,
             input_rows: num_rows,
             row_bytes,
-            avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
+            avg_geom_bytes,
+            output_row_bytes,
         },
     );
     let LevelWriter {
@@ -3849,6 +3858,33 @@ pub(crate) fn run_stages(
         (num_rows > 0).then(|| geom_bytes / num_rows as u64),
         row_bytes,
     );
+    // shortcut: a mid-pass Auto Ram->Spill downgrade is not priced here; the
+    // downgrade re-measures at run time. Price it if a full disk is ever reported.
+    let spilling_levels = if matches!(backing, pipeline::SinkBacking::Spill) {
+        buffered_levels(emitted, finest, options).len()
+    } else {
+        0
+    };
+    let level_rows: Vec<_> = emitted.iter().map(|e| e.hint).collect();
+    let mut disk_recheck = super::disk::DiskRecheck {
+        source,
+        selection: selected_row_groups.as_ref(),
+        options,
+        overview: output_path,
+        archive,
+        level_rows: &level_rows,
+        spilling_levels,
+        price: output_row_bytes,
+        prices: Vec::new(),
+        warned: false,
+    };
+    let mut disk_check = |price: &[Option<u64>]| {
+        if let Some(message) = disk_recheck.check(price)? {
+            diagnostics.disk_shortage(message);
+        }
+        Ok(())
+    };
+    disk_check(&[])?;
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
     // Pass-1 O(N) scratch has been freed by here; this marks the memory floor
@@ -3913,6 +3949,7 @@ pub(crate) fn run_stages(
             backing,
         },
         strategy,
+        &mut disk_check,
     )?;
 
     // Pass 2 moved every chain's geometry out as it emitted the rep (#851);
@@ -11584,6 +11621,7 @@ mod tests {
                     input_rows: 3_000,
                     row_bytes: Some(row),
                     avg_geom_bytes: None,
+                    output_row_bytes: row,
                 },
             );
             (r, budget.remaining())

@@ -882,8 +882,32 @@ impl ConvertSource {
         selected: Option<&RowGroupSelection>,
         column: usize,
     ) -> Result<u64, InputError> {
+        self.selected_column_sizes(selected, column)
+            .map(|(priced, _, _)| priced)
+    }
+
+    /// Compressed and uncompressed footer bytes of a root column, over the
+    /// same projection and selection as [`Self::selected_column_bytes`].
+    /// Unlike that accessor's decode price, the denominator excludes any
+    /// larger unencoded byte-array weight: these totals describe the codec.
+    pub(crate) fn selected_column_compression_bytes(
+        &self,
+        selected: Option<&RowGroupSelection>,
+        column: usize,
+    ) -> Result<(u64, u64), InputError> {
+        self.selected_column_sizes(selected, column)
+            .map(|(_, compressed, uncompressed)| (compressed, uncompressed))
+    }
+
+    fn selected_column_sizes(
+        &self,
+        selected: Option<&RowGroupSelection>,
+        column: usize,
+    ) -> Result<(u64, u64, u64), InputError> {
         let root = self.column_projection().map_or(column, |p| p[column]);
         let mut total = 0u64;
+        let mut compressed = 0u64;
+        let mut uncompressed = 0u64;
         for (i, m) in self.metas_with_footers(selected)?.iter().enumerate() {
             let picked = selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice);
             if picked.is_some_and(<[usize]>::is_empty) {
@@ -902,10 +926,13 @@ impl ConvertSource {
                         .max(col.unencoded_byte_array_data_bytes().unwrap_or(0))
                         .max(0) as u64;
                     total = total.saturating_add(bytes);
+                    compressed = compressed.saturating_add(col.compressed_size().max(0) as u64);
+                    uncompressed =
+                        uncompressed.saturating_add(col.uncompressed_size().max(0) as u64);
                 }
             }
         }
-        Ok(total)
+        Ok((total, compressed, uncompressed))
     }
 
     /// Per-part, per-row-group bboxes straight from the footers — the input
@@ -2842,6 +2869,40 @@ mod tests {
         );
         let none = RowGroupSelection::from_parts(vec![Vec::new()]);
         assert_eq!(src.selected_column_bytes(Some(&none), 1).unwrap(), 0);
+
+        let compression_bytes = |g: usize| -> (u64, u64) {
+            let rg = meta.row_group(g);
+            (
+                (rg.column(1).compressed_size() + rg.column(2).compressed_size()) as u64,
+                rg_bytes(g),
+            )
+        };
+        let sum = |groups: &[usize]| {
+            groups
+                .iter()
+                .map(|&g| compression_bytes(g))
+                .fold((0, 0), |(c, u), (next_c, next_u)| (c + next_c, u + next_u))
+        };
+        assert_eq!(
+            src.selected_column_compression_bytes(None, 1).unwrap(),
+            sum(&[0, 1, 2, 3])
+        );
+        assert_eq!(
+            src.selected_column_compression_bytes(Some(&selection), 1)
+                .unwrap(),
+            sum(&[1, 3])
+        );
+        assert_eq!(
+            src.selected_column_compression_bytes(Some(&none), 1)
+                .unwrap(),
+            (0, 0)
+        );
+        src.restrict_columns(vec![1]).unwrap();
+        assert_eq!(
+            src.selected_column_compression_bytes(Some(&selection), 0)
+                .unwrap(),
+            sum(&[1, 3])
+        );
     }
 
     #[test]
