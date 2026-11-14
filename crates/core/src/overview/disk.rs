@@ -369,14 +369,15 @@ impl DiskFootprint {
             *phases.last_mut().unwrap() = bytes;
             phases
         };
-        // Export's member store spills under `bounded` and may under `auto`
-        // (bounded spills every level of a partitioning export; a multi-wave
-        // level otherwise), so under both the worst case is the members of
-        // all levels (partitioning) or of the largest level, at the raw
-        // intermediate row price. This is independent of the RAM probe:
-        // fewer cores or less free RAM only turn a RAM store into a spill.
-        // Priced per row, with [`MEMBER_SPILL_FACTOR`]; a feature split across
-        // partitions adds copies the row count does not see.
+        // `bounded` spills export's members: every level of a partitioning
+        // export, and any multi-wave level (fewer cores or less free RAM
+        // mean more waves) otherwise. Price the worst case: all levels'
+        // members (partitioning) or the largest level's, at the row price
+        // times [`MEMBER_SPILL_FACTOR`]; a feature split across partitions
+        // adds copies the row count does not see.
+        // shortcut: `auto` also spills when free RAM at export time is short,
+        // which the preflight cannot know; it is not priced. Upgrade with an
+        // export-time recheck.
         let member_levels: Vec<u64> = level_rows
             .iter()
             .zip(output_row_bytes)
@@ -386,7 +387,7 @@ impl DiskFootprint {
                     .saturating_mul(MEMBER_SPILL_FACTOR)
             })
             .collect();
-        let members = if matches!(options.profile, MemoryProfile::Speed) {
+        let members = if !matches!(options.profile, MemoryProfile::Bounded) {
             0
         } else if matches!(options.mode, Mode::Partitioning) {
             sum(&member_levels)
@@ -641,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn export_member_spill_is_priced_for_every_profile_that_can_spill() {
+    fn export_member_spill_is_priced_under_bounded_only() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.parquet");
         super::super::testutil::write_input(
@@ -679,9 +680,10 @@ mod tests {
             Some((41_000 * 1_600 * 3, 41_000 * 1_600 * 3, 0))
         );
         assert_eq!(
-            member_spill(Mode::Duplicating, MemoryProfile::Auto),
+            member_spill(Mode::Duplicating, MemoryProfile::Bounded),
             Some((40_000 * 1_600 * 3, 40_000 * 1_600 * 3, 0))
         );
+        assert_eq!(member_spill(Mode::Partitioning, MemoryProfile::Auto), None);
         assert_eq!(member_spill(Mode::Partitioning, MemoryProfile::Speed), None);
     }
 
@@ -882,7 +884,7 @@ mod tests {
         );
         let source = ConvertSource::resolve_path(&input).unwrap();
         let archive = dir.path().join("tiles/out.pmtiles");
-        let mut disk = DiskFootprint::post_pass1(
+        let disk = DiskFootprint::post_pass1(
             &source,
             None,
             &ConvertOptions::default(),
@@ -892,8 +894,6 @@ mod tests {
             &[1_600; 2],
         )
         .unwrap();
-        // These lifecycle tests isolate the conversion and archive phases.
-        disk.components.retain(|c| c.name != "export member spill");
         let intermediate = disk
             .components
             .iter()
