@@ -28,6 +28,14 @@ def test_decay_tracks_a_cohort_instead_of_newly_collapsed_polygons():
     assert "z8 76 -> z5 0" in result.detail
 
 
+def test_decay_fails_when_no_cohort_is_eligible():
+    cohort = set(range(31))
+    result = _decay({8: ZoomScan(ids=cohort, square_ids=cohort),
+                     5: ZoomScan(ids=set())})
+    assert not result.ok
+    assert "no cohort was eligible" in result.detail
+
+
 @pytest.mark.parametrize("coarse_is_square", [True, False])
 def test_decay_rejects_stuck_cohort_regardless_of_later_shape(coarse_is_square):
     # The #749 defect: a square keeps the same hash against p=1/4 forever.
@@ -74,12 +82,13 @@ def test_decay_does_not_classify_large_source_squares_as_placeholders():
     assert not is_placeholder_square("Polygon", square(50))
 
 
-def test_decay_excludes_features_with_non_square_instances_at_the_fine_zoom():
+def test_decay_excludes_features_with_large_instances_at_the_fine_zoom():
     cohort = set(range(64))
     # A tile can clip a small square from a much larger feature. Its other
     # tile instances reveal that the feature has not fully collapsed.
-    fine = ZoomScan(ids=cohort, square_ids=cohort, non_square_ids=cohort)
-    assert _decay({8: fine, 5: ZoomScan(ids=cohort)}).ok
+    fine = ZoomScan(ids=cohort, square_ids=cohort, large_ids=cohort)
+    result = _decay({8: fine, 5: ZoomScan(ids=cohort)})
+    assert "no cohort was eligible" in result.detail
 
 
 @pytest.mark.parametrize(
@@ -160,6 +169,50 @@ M = 3  # canonical (finest) zoom of the synthetic pyramids
 NOTE = {"tylertoo:variable_depth": {"enabled": True, "canonical_maxzoom": M}}
 
 
+def _polygon_tile(wkt, with_ids=True):
+    features = [{"geometry": wkt, "properties": {}, **({"id": i} if with_ids else {})}
+                for i in range(64)]
+    return mapbox_vector_tile.encode(
+        [{"name": "test", "features": features}],
+        default_options={"extents": 4096, "y_coord_down": True},
+    )
+
+
+def test_decay_rejects_real_mvt_with_omitted_ids():
+    from mapbox_vector_tile.Mapbox import vector_tile_pb2
+
+    raw = _polygon_tile("POLYGON((0 0,4 0,4 4,0 4,0 0))", with_ids=False)
+    tile = vector_tile_pb2.tile()
+    tile.ParseFromString(raw)
+    assert all(not f.HasField("id") for f in tile.layers[0].features)
+    scans = verify_archive.scan_chunk(
+        ([(z, 0, 0, raw) for z in [5, 8]], "test", Compression.NONE, (0, 0), True)
+    )
+    result = _decay(scans)
+    assert not result.ok, result.detail
+    assert "MVT ids on every feature" in result.detail
+    assert scans[8].no_id == 64
+
+
+def test_decay_keeps_a_placeholder_clipped_at_the_buffered_tile_edge():
+    # Buffer 5 at extent 4096 ends at x=4176. The same source square
+    # spans 4175..4179, clipped to 1x4 here and complete in the neighbour.
+    clipped = _polygon_tile("POLYGON((4175 20,4176 20,4176 24,4175 24,4175 20))")
+    whole = _polygon_tile("POLYGON((79 20,83 20,83 24,79 24,79 20))")
+    fine = verify_archive.scan_chunk(
+        ([(8, 0, 128, clipped)], "test", Compression.NONE, (0, 0), True)
+    )[8]
+    neighbour = verify_archive.scan_chunk(
+        ([(8, 1, 128, whole)], "test", Compression.NONE, (0, 0), True)
+    )[8]
+    fine.merge(neighbour)
+    result = _decay({8: fine, 5: ZoomScan(ids=set(range(64)))})
+    assert not result.ok, result.detail
+    assert "z8 64 -> z5 64" in result.detail
+    assert fine.square_ids == set(range(64))
+    assert not fine.large_ids
+
+
 def _tile(fid_xs, extent):
     """One MVT tile; each feature is a point whose id is its source id."""
     feats = [
@@ -217,10 +270,10 @@ def test_decay_scan_and_merge_exclude_a_clipped_square_from_a_larger_feature():
 
     tiny = scan("POLYGON((0 0,4 0,4 4,0 4,0 0))")
     large = scan("POLYGON((0 0,50 0,50 50,0 50,0 0))")
-    assert tiny.square_ids == {7} and not tiny.non_square_ids
-    assert not large.square_ids and large.non_square_ids == {7}
+    assert tiny.square_ids == {7} and not tiny.large_ids
+    assert not large.square_ids and large.large_ids == {7}
     tiny.merge(large)
-    assert not (tiny.square_ids - tiny.non_square_ids)
+    assert not (tiny.square_ids - tiny.large_ids)
 
 
 # z1 (0,0) is stopped: holds ids 0-3 at extent 4096<<2. z1 (1,0) continues to

@@ -57,6 +57,32 @@ def test_a_failing_required_leg_raises(tmp_path):
         run_e2e.run_rounds(legs, 1, tmp_path)
 
 
+@pytest.mark.parametrize("fixture,expected", [
+    ("madagascar-adm4", True), ("open-buildings", True),
+    ("road-detections", False), ("ftw-moldova-z10", True),
+    ("fieldmaps-boundaries", False),
+])
+def test_decay_expectations_require_an_eligible_polygon_cohort(tmp_path, monkeypatch, fixture, expected):
+    from types import SimpleNamespace
+
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(run_e2e.subprocess, "run", run)
+    monkeypatch.setattr(run_e2e.shutil, "which", lambda _: "uv")
+    monkeypatch.delenv("PMTILES_BIN", raising=False)
+    args = SimpleNamespace(
+        tylertoo=__file__, settings=["pv0"], tier="full", work=str(tmp_path),
+        min_zoom=0, max_zoom=14, exemptions=run_e2e.EXEMPTIONS,
+        keep=True, markdown=None, invariants_out=None,
+    )
+    assert run_e2e.run_invariants(args, {fixture: {"path": __file__, "layer": "test"}}) == 0
+    verifier = next(argv for argv in calls if "--strict" in argv)
+    assert ("--expect-decay" in verifier) is expected
+
+
 def test_after_warmup_hook_and_needs(tmp_path):
     src, stable = tmp_path / "a.fgb", tmp_path / "tip.fgb"
     legs = {"convert": {"argv": ["sh", "-c", f"echo x > {src}"], "unlink_first": src,

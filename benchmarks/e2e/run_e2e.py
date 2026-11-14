@@ -575,6 +575,13 @@ INVARIANT_SETTINGS = {
     "sf0": (["--simplify-factor", "0"], _DEFAULT_CAPS, False),
     "fill": (["--coverage-fill"], _DEFAULT_CAPS, False),
 }
+# These fixture/settings pairs cannot form the verifier's 32-feature
+# placeholder cohort. Keep the expectation explicit: an expected decay
+# check with no eligible cohort must fail, never pass vacuously.
+INVARIANT_NO_DECAY = {
+    ("road-detections", "pv0"): "LineStrings only; no polygon placeholders",
+    ("fieldmaps-boundaries", "pv0"): "only 3 source features, below the 32-feature minimum",
+}
 # Datasets only the invariant matrix runs (no tippecanoe benchmark value):
 # committed fixtures under crates/core/tests/fixtures/invariants/, from
 # make_fixtures.py there.
@@ -688,7 +695,7 @@ def run_invariants(args, datasets: dict) -> int:
                      "--exemptions", str(args.exemptions),
                      "--fixture", did, "--settings", sname,
                      "--json-out", str(out_json)]
-            if decay:
+            if decay and (did, sname) not in INVARIANT_NO_DECAY:
                 vargv.append("--expect-decay")
             t1 = time.monotonic()
             vp = subprocess.run(vargv)
