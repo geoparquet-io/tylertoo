@@ -2160,21 +2160,21 @@ tile-count maps and the writer's directory and dedup entries grow with tiles. Se
 for current bytes per feature and tile, the arithmetic, and the limits
 that spilling cannot remove.
 
-Release binaries use the mimalloc allocator, which is faster than the
-system allocator but can keep freed memory mapped, so a run's RSS can sit
-above its live heap. That gap is allocator retention, not a leak. `--profile bounded`
-remains the setting for memory-constrained machines.
+The release CLI and Python wheels use mimalloc by default. Under `bounded`,
+both set its purge delay to 0 before work starts (#851), so freed pages are
+purged immediately instead of waiting 1 s. This reduces peak RSS at a speed
+cost. The measured changes from the previous `bounded` behavior are:
 
-The release CLI uses mimalloc by default. It adds a fixed floor of about
-600 MiB on small inputs. Under `bounded`, Madagascar (z0-12) peaks at
-1,254 MiB against 685 MiB with the system allocator. Moldova peaks at 2,792
-against 2,509 MiB. mimalloc runs faster: Madagascar takes 1.4 s against 3.0 s.
-The floor comes from transparent huge pages on
-mimalloc's eagerly committed arenas and its 1 s delay before freed pages go
-back to the OS. `MIMALLOC_ALLOW_THP=0 MIMALLOC_PURGE_DELAY=10` in the
-environment removes it (Madagascar 566 MiB, Moldova 1,665 MiB) but gives back
-most of the speed (Madagascar 2.0 s, Moldova 12.4 s against 9.3 s). A build
-with `--no-default-features` uses the system allocator.
+| Workload | Peak RSS before → after | Wall time before → after |
+|----------|-------------------------|--------------------------|
+| Overture segments z0–14 | 3.5 → 2.8 GiB | 41 → 49 s |
+| Moldova z12 | 2.0 → 1.6 GiB | 4.3 → 5.8 s |
+| Bbox cell | 1.9 → 1.4 GiB | 5.7 → 6.7 s |
+
+`auto` and `speed` leave the allocator setting unchanged. In Python, the
+setting persists for the process after a `bounded` call. On non-musl targets,
+a build with `--no-default-features` uses the system allocator; musl always
+uses mimalloc.
 
 `bounded` uses LZ4 framing for its private IPC spill streams; `auto` and
 `speed` keep raw IPC, including an `auto` downgrade to disk.
