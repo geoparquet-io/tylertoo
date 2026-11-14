@@ -11796,7 +11796,10 @@ mod tests {
             // and metadata all hash the same as before. See the REPIN note
             // above this test for the full before/after evidence.
             // #443: default features no longer carry tile-local ids.
-            "caf04e1922c86b7b",
+            // RE-BLESSED: gzip moved from zlib-rs to libdeflate (level 6).
+            // The compressed bytes changed; the tiles under them did not
+            // (the same tree with zlib-rs still hashes caf04e1922c86b7b).
+            "6184eb9615bf50b8",
             "archive bytes diverged from the pre-refactor reference"
         );
 

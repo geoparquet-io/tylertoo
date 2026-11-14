@@ -86,6 +86,8 @@ memory-stats = { workspace = true }
 # Name zlib-rs, the backend parquet's feature unification already selects, so
 # tile gzip does not change if parquet's features do (#814).
 flate2 = { version = "1", features = ["zlib-rs"] }
+# Tile and directory gzip: smaller than zlib at level 6, and faster.
+libdeflater = "1.26"
 # brotli and zstd follow parquet's majors (8 / 0.13) so each compiles once (#435).
 # Renovate holds newer majors; move them only with parquet (#649).
 brotli = "8"
