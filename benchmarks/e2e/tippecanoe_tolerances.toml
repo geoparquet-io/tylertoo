@@ -108,7 +108,7 @@ zoom_range = [0, 14]
 tiles = [0.99, 1.01]          # measured 1.000 (153,053 / 153,047): same pyramid
 features = [0.97, 1.03]       # measured 0.999 (1.009 before #749; 0.922 with the raw cap)
 distinct_ids = [0.96, 1.01]   # measured 0.982 (1.012 before #749; 0.794 with the raw cap)
-vertices = [0.75, 0.82]       # measured 0.780: (B) at every zoom below z14
+vertices = [0.75, 0.82]       # measured 0.781: (B) at every zoom below z14
 bytes = [0.93, 1.02]          # measured 0.984 (archive size): (B) minus (C)
 
 # z1-z2: polygons collapse at a 10-20 km GSD (A). Since #745 a collapsed
@@ -146,7 +146,7 @@ bytes = [0.34, 0.52]          # measured z1 0.381, z2 0.471
 # drops where tylertoo merges. Re-measured 2026-10-23 (CI, #770); with the
 # raw cap features were 0.321, 0.451, 0.503, 0.470. #749 raised these a
 # little (a square dithered on its own area survives where the old 1/4 draw
-# on the previous square lost it). Re-measured 2026-11-13 (local).
+# on the previous square lost it). Re-measured 2026-11-14 (local).
 [[datasets."madagascar-adm4".zoom_bands]]
 zooms = [3, 6]
 tiles = [0.99, 1.01]          # measured 1.000 at every zoom (2/2, 4/4, 4/4, 7/7)
