@@ -114,6 +114,9 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as `disk_shortage` report diagnostics, and `convert()` raises each as a
   `UserWarning` once the run succeeds. Recheck remedies name both CLI flags and
   Python keywords (#872).
+- The CLI and Python extension immediately purge freed mimalloc pages under
+  `profile=bounded`, lowering peak RSS at a throughput cost (#851). Auto and
+  speed leave the allocator setting untouched.
 - An `https://` input keeps its query string, so presigned S3 and Azure SAS
   URLs work; the query is shown as `?<redacted>` in logs, errors, reports
   and saved plans (#820).

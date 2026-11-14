@@ -1024,7 +1024,7 @@ mod tests {
     /// read-ahead, the drain's encodes and the sink, so choosing it has to
     /// charge the run's budget; every phase sized after it must see what is
     /// left. On main each of those phases takes its own slice of the same
-    /// allowance and nothing sums them. Profiled (`.788/PROFILE-LOG.md`):
+    /// allowance and nothing sums them. Profiled pre-#851 (`.788/PROFILE-LOG.md`):
     /// Moldova `--profile bounded`, window 8 against window 1: +230 MiB live
     /// heap (dhat, 8 threads) and +421 MiB anonymous RSS (64 threads); NZ
     /// parcels under a 2 GiB budget peaked at 1,472 MiB anonymous against a

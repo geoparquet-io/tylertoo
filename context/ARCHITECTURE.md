@@ -114,26 +114,25 @@ fixed 16-partition fallback (`PARTITION_WAVE_FALLBACK_MAX`) is gone. The one
 check every profile keeps is #665's refusal of a tile that alone exceeds the
 machine's memory: a refusal, not a cap, since no profile makes a tile smaller.
 
-The release CLI links mimalloc as its global allocator on gnu targets by
-default (the `mimalloc` feature; `--no-default-features` opts out), and on
-musl unconditionally; the `dhat-heap` build excludes it. The Python wheel
-keeps the system allocator on glibc (an opt-in `mimalloc` feature until a
-wheel benchmark decides) and uses mimalloc on musllinux (#739, #480).
-Profile footprints therefore compare for one allocator: `bounded` keeps
-main's shape for the same allocator, and mimalloc adds a fixed floor of
-about 600 MiB that shows on small inputs (Madagascar `bounded` 685 → 1,254
-MiB peak RSS; Moldova 2,509 → 2,792). It is transparent huge pages on
-mimalloc v3's eagerly committed arenas plus its 1 s purge delay;
-`MIMALLOC_ALLOW_THP=0 MIMALLOC_PURGE_DELAY=10` removes it at a wall-time
-cost, so the default keeps mimalloc's settings and the docs name the
-opt-outs.
+The release CLI and Python extension use mimalloc as their global allocator
+by default (the `mimalloc` feature; a non-musl `--no-default-features` build
+uses the system allocator), and on musl unconditionally; `dhat-heap` excludes
+it. Under `bounded`, both frontends set mimalloc's purge delay to 0 before
+work starts (#851), purging freed pages immediately at a speed cost. The
+shared setting function lives in `tylertoo-cli`, where Python can call it;
+core does not configure the allocator. A guard holds the setting for the
+duration of each `bounded` call and restores it when the last live `bounded`
+call ends; overlapping calls on other threads share it meanwhile.
+Overture segments z0–14 peak RSS fell from 3.5 to 2.8 GiB while wall time
+rose from 41 to 49 s; Moldova z12 fell from 2.0 to 1.6 GiB while wall time
+rose from 4.3 to 5.8 s.
 
 `auto` is a third shape, not a router between the other two. Before #788 it
 copied `speed` for the read-ahead depth cap and the encode count. A first
 cut of #788 also sized `bounded` from the allowance, which on a 123 GiB box
-doubled Moldova's pass-2 peak (2.0 to 3.9 GiB). That was reverted: `bounded`
-promises the smallest footprint, and `auto` is the profile that uses the
-machine.
+doubled Moldova's pass-2 peak (2.0 to 3.9 GiB, measured pre-#851). That was
+reverted: `bounded` promises the smallest footprint, and `auto` is the
+profile that uses the machine.
 
 DIVERGENCE FROM TIPPECANOE: tippecanoe has no memory profile. It always
 writes its features to temporary files and sizes its in-memory sort from the
