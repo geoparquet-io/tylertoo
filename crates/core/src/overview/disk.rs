@@ -168,7 +168,8 @@ fn intermediate_bytes_per_arrow_byte(compressed: u64, uncompressed: u64) -> f64 
         return 1.0;
     }
     // A bare input ratio underprices BR_MT's filtered intermediate (0.335
-    // vs 0.358 of the raw estimate). Keep a 2x safety margin, capped at raw.
+    // vs 0.358 of the raw estimate). The 2x margin is empirical (a bare ratio missed BR_MT
+    // by 7%), not derived; capped at raw.
     (2.0 * compressed as f64 / uncompressed as f64).min(1.0)
 }
 

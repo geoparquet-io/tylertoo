@@ -160,8 +160,8 @@ recheck warns about those outputs using the kept rows at each emitted level,
 including attribute filtering, before pass 2 writes them, and rechecks when
 pass 2 measures the selected properties. In Python, the recheck's shortage is logged at warning level and listed in
 the report as a `disk_shortage` diagnostic. `convert()` then raises it as a
-`UserWarning` once the run succeeds. Staged input shortages raise their
-`UserWarning` before reading. Recheck remedies name both CLI flags and Python keywords. The
+`UserWarning` once the run succeeds. Staged input and staged layers shortages raise
+their `UserWarning` before reading. Recheck remedies name both CLI flags and Python keywords. The
 intermediate payload uses the selected input's compressed/uncompressed footer ratio with a
 2x safety margin, capped at the raw estimate. Spill uses the profile's codec
 price (raw for `auto`, 0.4 times raw for `bounded`); framing stays raw for both.
