@@ -915,7 +915,9 @@ impl SinkAutoTuner {
     /// the measurement. Runs for every batch of the pass.
     fn observe(&mut self, batch: &LevelBatch) {
         self.rows += batch.num_rows();
-        self.disk_bytes = self.disk_bytes.saturating_add(batch.disk_bytes());
+        if !self.disk_checked {
+            self.disk_bytes = self.disk_bytes.saturating_add(batch.disk_bytes());
+        }
         let floor = match batch {
             LevelBatch::Owned(b) => b.num_rows() as u64 * SINK_ROW_ALLOC_OVERHEAD_BYTES,
             LevelBatch::Shared { .. } => 0,
