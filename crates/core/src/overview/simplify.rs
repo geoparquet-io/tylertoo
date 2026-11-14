@@ -406,13 +406,21 @@ pub(super) fn simplify_for_level_checked(
             // Parts retain their canonical identity through drops and repair
             // splits. Tippecanoe reduces tiny outer rings individually
             // (clip.cpp, reduce_tiny_poly), rather than on the whole feature.
-            let source_index = |i: usize| part_sources.as_deref().map_or(i, |indices| indices[i]);
+            let source_index = |i: usize| {
+                part_sources
+                    .as_deref()
+                    .and_then(|indices| indices.get(i))
+                    .copied()
+                    .unwrap_or(i)
+            };
             let split_source = match source {
                 Geometry::Polygon(src) => Some(src),
                 _ => None,
             };
             let mut kept = Vec::with_capacity(mp.0.len());
-            let mut next_sources = Vec::with_capacity(mp.0.len());
+            let mut next_sources = part_sources
+                .as_ref()
+                .map(|_| Vec::with_capacity(mp.0.len()));
             let mut unchanged = true;
             let mut first = 0;
             while first < mp.0.len() {
@@ -427,7 +435,7 @@ pub(super) fn simplify_for_level_checked(
                 }
                 let original = match source {
                     Geometry::Polygon(src) => src,
-                    Geometry::MultiPolygon(parts) => &parts.0[index],
+                    Geometry::MultiPolygon(parts) => parts.0.get(index).unwrap_or(&mp.0[first]),
                     _ => &mp.0[first],
                 };
                 // A repaired source part can have several working fragments.
@@ -469,10 +477,12 @@ pub(super) fn simplify_for_level_checked(
                         kept.push(poly);
                     }
                 }
-                next_sources.extend(std::iter::repeat_n(index, kept.len() - before));
+                if let Some(indices) = &mut next_sources {
+                    indices.extend(std::iter::repeat_n(index, kept.len() - before));
+                }
                 first = end;
             }
-            if let Some(indices) = part_sources {
+            if let (Some(indices), Some(next_sources)) = (part_sources, next_sources) {
                 *indices = next_sources;
             }
             if !kept.is_empty() {
@@ -3889,6 +3899,133 @@ mod source_area_regression {
             }
         }
         assert!((5..100).contains(&kept), "kept {kept}");
+    }
+
+    #[test]
+    fn multipart_stale_source_indices_fall_back_to_working_part() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let opts = SimplifyOptions::default();
+        let working = Geometry::MultiPolygon(MultiPolygon::new(vec![
+            placeholder_square(Point::new(0.0, 0.0), 20.0),
+            placeholder_square(Point::new(100.0, 0.0), 20.0),
+        ]));
+        let source = Geometry::MultiPolygon(MultiPolygon::new(Vec::new()));
+        let expected = simplify_for_level(&working, 1.0, Crs::Epsg3857, &opts, &diagnostics);
+        for mut indices in [vec![], vec![99, 100]] {
+            let (actual, _) = simplify_for_level_checked(
+                &working,
+                1.0,
+                None,
+                Crs::Epsg3857,
+                &opts,
+                &diagnostics,
+                &source,
+                Some(&mut indices),
+            );
+            assert_eq!(actual, expected);
+            assert_eq!(indices.len(), 2);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dhat-heap")]
+    fn direct_multipart_does_not_allocate_cascade_provenance() {
+        if std::env::var_os("NEXTEST_EXECUTION_MODE").as_deref()
+            != Some(std::ffi::OsStr::new("process-per-test"))
+        {
+            eprintln!("skipped: dhat requires nextest process-per-test isolation");
+            return;
+        }
+        const PARTS: usize = 1024;
+        let source = Geometry::MultiPolygon(MultiPolygon::new(vec![Polygon::empty(); PARTS]));
+        let opts = SimplifyOptions {
+            collapse: CollapseMode::Drop,
+            ..Default::default()
+        };
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let profiler = dhat::Profiler::builder().testing().build();
+        let result = simplify_for_level(&source, 1.0, Crs::Epsg3857, &opts, &diagnostics);
+        let bytes = dhat::HeapStats::get().total_bytes;
+        drop(profiler);
+        assert_eq!(result, Simplified::Dropped);
+        // Empty parts need only the output polygon buffer: no per-part
+        // provenance should be allocated for a direct simplification.
+        assert!(
+            bytes <= (PARTS * std::mem::size_of::<Polygon<f64>>()) as u64,
+            "direct multipart allocated {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn cascade_multipart_point_step_and_canonical_revival_retain_sources() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let opts = SimplifyOptions {
+            collapse: CollapseMode::Drop,
+            ..Default::default()
+        };
+        let fine = CascadeStep::geom(1.0);
+        let drop_all = CascadeStep::geom(4.0);
+        let point = CascadeStep::point(8.0);
+        let coarse = CascadeStep::square(16.0);
+        for i in 0..20 {
+            let source = Geometry::MultiPolygon(MultiPolygon::new(vec![
+                placeholder_square(Point::new(i as f64 * 100.0, 0.0), 0.1),
+                placeholder_square(Point::new(i as f64 * 100.0, 20.0), 2.0),
+            ]));
+            let Simplified::Keep(working) =
+                simplify_cascade(&source, &[fine], Crs::Epsg3857, &opts, &diagnostics)
+            else {
+                panic!("large part must survive")
+            };
+            // A live point band keeps the point of the surviving part.
+            let direct = simplify_cascade(
+                &working,
+                &[point, coarse],
+                Crs::Epsg3857,
+                &opts,
+                &diagnostics,
+            );
+            let cascaded = simplify_cascade(
+                &source,
+                &[fine, point, coarse],
+                Crs::Epsg3857,
+                &opts,
+                &diagnostics,
+            );
+            assert_eq!(cascaded, direct);
+
+            // After the entire working geometry dies, the point band revives
+            // from canonical, including the part lost at the fine step.
+            let canonical = Arc::new(source.clone());
+            let mut fold = CascadeFold::new();
+            fold.step(&canonical, &fine, Crs::Epsg3857, &opts, &diagnostics);
+            assert_eq!(fold.part_sources, vec![1]);
+            assert!(matches!(
+                fold.step(&canonical, &drop_all, Crs::Epsg3857, &opts, &diagnostics),
+                FoldStep::Dropped
+            ));
+            fold.step(&canonical, &point, Crs::Epsg3857, &opts, &diagnostics);
+            assert_eq!(
+                fold.part_sources,
+                vec![0, 1],
+                "revival resets canonical provenance"
+            );
+            let direct = simplify_cascade(
+                &source,
+                &[point, coarse],
+                Crs::Epsg3857,
+                &opts,
+                &diagnostics,
+            );
+            let cascaded = simplify_cascade(
+                &source,
+                &[fine, drop_all, point, coarse],
+                Crs::Epsg3857,
+                &opts,
+                &diagnostics,
+            );
+            assert_eq!(cascaded, direct);
+        }
     }
 
     #[test]
