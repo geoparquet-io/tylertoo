@@ -1245,6 +1245,25 @@ pub(crate) mod remote {
         query: String,
     }
 
+    /// Warn, once per key, that a `TYLERTOO_HTTP_*` override does not reach the
+    /// signed client; returns whether this call warned.
+    pub(super) fn warn_unsupported_once(key: ClientConfigKey) -> bool {
+        static WARNED: Mutex<Vec<ClientConfigKey>> = Mutex::new(Vec::new());
+        let mut warned = WARNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if warned.contains(&key) {
+            return false;
+        }
+        warned.push(key);
+        drop(warned);
+        log::warn!(
+            "[remote] TYLERTOO_HTTP_{} is unsupported for signed HTTP inputs; ignoring it",
+            key.as_ref().to_ascii_uppercase()
+        );
+        true
+    }
+
     /// Mirror the reachable `ClientOptions` settings: `object_store`'s client
     /// builder is private and its redirect policy leaks signed queries (#843).
     fn signed_client(options: &ClientOptions) -> object_store::Result<HttpClient> {
@@ -1284,7 +1303,6 @@ pub(crate) mod remote {
             // DNS address shuffling is not reproduced (#843 review: low value here).
             let mut keys = vec![
                 AllowHttp,
-                AllowInvalidCertificates,
                 NoSystemCertificates,
                 Timeout,
                 ConnectTimeout,
@@ -1305,7 +1323,6 @@ pub(crate) mod remote {
                 );
                 builder = match key {
                     AllowHttp => builder.https_only(!enabled),
-                    AllowInvalidCertificates => builder.danger_accept_invalid_certs(enabled),
                     NoSystemCertificates if enabled => builder.tls_certs_only(std::iter::empty()),
                     NoSystemCertificates => builder,
                     UserAgent => builder.user_agent(value),
@@ -1329,16 +1346,10 @@ pub(crate) mod remote {
                     Http1Only | Http2Only => builder,
                     // Applied together above, as in ClientOptions::client.
                     ProxyUrl | ProxyCaCertificate | ProxyExcludes => builder,
+                    // Signed inputs always verify certificates, so
+                    // AllowInvalidCertificates is ignored like any other unmapped key.
                     _ => {
-                        static WARNED: Mutex<Vec<ClientConfigKey>> = Mutex::new(Vec::new());
-                        let mut warned = WARNED
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if !warned.contains(&key) {
-                            warned.push(key);
-                            drop(warned);
-                            log::warn!("[remote] TYLERTOO_HTTP_{} is unsupported for signed HTTP inputs; ignoring it", key.as_ref().to_ascii_uppercase());
-                        }
+                        warn_unsupported_once(key);
                         builder
                     }
                 };
@@ -5364,6 +5375,15 @@ mod tests {
             w.write(&batch).unwrap();
             w.close().unwrap();
             buf
+        }
+
+        /// #843: a signed input never skips certificate checks; the key is
+        /// reported as unsupported (once) like any unmapped override.
+        #[test]
+        fn signed_client_reports_allow_invalid_certificates_unsupported() {
+            let key = object_store::ClientConfigKey::AllowInvalidCertificates;
+            assert!(remote::warn_unsupported_once(key));
+            assert!(!remote::warn_unsupported_once(key));
         }
 
         #[test]

@@ -21,6 +21,7 @@ object behind a freshly signed one. Query parameters other than the S3, GCS
 and Azure signing ones become a short hash, as in `?<redacted:1a2b3c4d>`, so
 URLs that pick different objects stay distinct.
 A redirect never forwards a signed URL's query to the new host in a referrer header.
+Signed inputs always verify TLS certificates: `TYLERTOO_HTTP_ALLOW_INVALID_CERTIFICATES` is ignored for them, with a warning.
 A signed URL as a `pyramid` band takes its layer name from the file name in
 its path: its query can contain `:` and `=`, so `LO-HI:URL:LAYER` cannot
 split a layer off it.
