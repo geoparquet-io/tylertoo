@@ -7,7 +7,79 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from verify_archive import ZoomScan, evaluate
+from verify_archive import ZoomScan, evaluate, is_placeholder_square
+
+
+def _decay(scans, ids=True):
+    outcomes = evaluate(
+        scans, {"vector_layers": [{"id": "test", "fields": {}}]}, "test",
+        None, (0, 0), ids, True, None,
+    )
+    return next(o for o in outcomes if o.invariant == "decay")
+
+
+def test_decay_tracks_a_cohort_instead_of_newly_collapsed_polygons():
+    # Moldova's aggregate counts fail (76 -> 45), but these are NEW squares.
+    fine = set(range(76))
+    coarse = set(range(100, 145))
+    result = _decay({8: ZoomScan(ids=fine, square_ids=fine),
+                     5: ZoomScan(ids=coarse, square_ids=coarse)})
+    assert result.ok, result.detail
+    assert "z8 76 -> z5 0" in result.detail
+
+
+@pytest.mark.parametrize("coarse_is_square", [True, False])
+def test_decay_rejects_stuck_cohort_regardless_of_later_shape(coarse_is_square):
+    # The #749 defect: a square keeps the same hash against p=1/4 forever.
+    cohort = set(range(64))
+    result = _decay({8: ZoomScan(ids=cohort, square_ids=cohort),
+                     5: ZoomScan(ids=cohort, square_ids=cohort if coarse_is_square else set())})
+    assert not result.ok, result.detail
+    assert "z8 64 -> z5 64" in result.detail
+
+
+def test_decay_checks_cohorts_above_the_aggregate_peak_too():
+    fine = set(range(64))
+    coarse = set(range(100))
+    result = _decay({8: ZoomScan(ids=fine, square_ids=fine),
+                     5: ZoomScan(ids=coarse, square_ids=coarse)})
+    assert not result.ok, result.detail
+
+
+@pytest.mark.parametrize("ids,missing", [(False, 0), (True, 1)])
+def test_decay_requires_source_unique_ids(ids, missing):
+    result = _decay({8: ZoomScan(squares=76, no_id=missing),
+                     5: ZoomScan(squares=45)}, ids=ids)
+    assert not result.ok
+    assert "--ids" in result.detail
+
+
+@pytest.mark.parametrize("survivors,ok", [(31, True), (32, True), (33, False)])
+def test_decay_keeps_the_existing_halving_threshold(survivors, ok):
+    cohort = set(range(64))
+    result = _decay({8: ZoomScan(ids=cohort, square_ids=cohort),
+                     5: ZoomScan(ids=set(range(survivors)))})
+    assert result.ok is ok, result.detail
+
+
+def test_decay_does_not_classify_large_source_squares_as_placeholders():
+    # Moldova's canonical level has ~50-unit field squares. These have not
+    # collapsed and need not decay over three zooms. Default placeholders
+    # are 4 units across (one GSD at extent 4096 / GSD base 1024).
+    def square(side):
+        return [[[0, 0], [side, 0], [side, side], [0, side], [0, 0]]]
+
+    assert is_placeholder_square("Polygon", square(4))
+    assert is_placeholder_square("Polygon", [[[0, 0], [4, 0], [4, 5], [0, 5], [0, 0]]])
+    assert not is_placeholder_square("Polygon", square(50))
+
+
+def test_decay_excludes_features_with_non_square_instances_at_the_fine_zoom():
+    cohort = set(range(64))
+    # A tile can clip a small square from a much larger feature. Its other
+    # tile instances reveal that the feature has not fully collapsed.
+    fine = ZoomScan(ids=cohort, square_ids=cohort, non_square_ids=cohort)
+    assert _decay({8: fine, 5: ZoomScan(ids=cohort)}).ok
 
 
 @pytest.mark.parametrize(
@@ -131,6 +203,24 @@ def _verify(path, tmp_path, n_in=6):
     )
     outcomes, _ = verify_archive.verify_strict(path, args)
     return {o.invariant: o for o in outcomes if o.zoom is None}, outcomes
+
+
+def test_decay_scan_and_merge_exclude_a_clipped_square_from_a_larger_feature():
+    def scan(wkt):
+        raw = mapbox_vector_tile.encode(
+            [{"name": "t", "features": [{"id": 7, "properties": {}, "geometry": wkt}]}],
+            default_options={"extents": 4096, "y_coord_down": True},
+        )
+        return verify_archive.scan_chunk(
+            ([(8, 0, 0, gzip.compress(raw))], "t", Compression.GZIP, (0, 0), True)
+        )[8]
+
+    tiny = scan("POLYGON((0 0,4 0,4 4,0 4,0 0))")
+    large = scan("POLYGON((0 0,50 0,50 50,0 50,0 0))")
+    assert tiny.square_ids == {7} and not tiny.non_square_ids
+    assert not large.square_ids and large.non_square_ids == {7}
+    tiny.merge(large)
+    assert not (tiny.square_ids - tiny.non_square_ids)
 
 
 # z1 (0,0) is stopped: holds ids 0-3 at extent 4096<<2. z1 (1,0) continues to

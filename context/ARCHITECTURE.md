@@ -1694,10 +1694,30 @@ outer-ring reduction, rather than dithering on the whole MultiPolygon.
 The deterministic hash and placeholder sizing divergences documented above
 still apply.
 
-The Moldova archive-level `decay` exemption remains because its aggregate
-square-shape check still fails: z8 has 72 square ids and z5 has 44; even
-`--no-cascade` fails with 76 and 45. Neither run has a common square id
-between those zooms. This check counts newly square-shaped features as well
-as surviving placeholders, so matching the source run does not make that
-aggregate invariant pass. The exemption's reason records this separately
-from the repaired cascade defects; the verifier is unchanged here.
+The archive verifier (`scripts/verify_archive.py`, called by
+`benchmarks/e2e/run_e2e.py`) tracks **cohorts** of source-unique feature ids.
+Its old aggregate square-count check falsely failed Moldova: z8 had 72
+square ids and z5 had 44, but none were common; even `--no-cascade` failed
+with 76 and 45. Coarser zooms gain new squares as larger polygons collapse.
+The verifier now requires all observed instances of a cohort feature at
+the fine zoom to be tiny squares, then counts those same ids at the coarser
+zoom regardless of their later shape. The threshold is unchanged: at least
+32 features must halve over three zooms. Every eligible zoom is checked,
+including above the aggregate square-count peak.
+
+Archives do not mark placeholder provenance or canonical parts, so this is
+an observable feature-cohort check, not a proof of every part's dither.
+It requires source-unique ids and the e2e matrix's default GSD base 1024 /
+extent 4096: placeholders are four tile units across (five allowing
+quantization). Large source squares and features with non-square instances
+are ineligible. On the merged #883 defaults, Moldova's z8 cohort has 70 ids
+and only two survive at z5; its exemption is removed. The original defect
+still fails on `origin/main`: open-buildings with `--verbatim
+--simplify-factor 1` keeps 145 of its 148 z8 cohort ids at z5. The fixed
+branch passes (e.g. z10 130 → z7 0).
+
+The #883 export defaults remain independent of this conversion fix: buffer
+5, automatic max-zoom simplification at 0.25 GSD for lines only, polygons
+unchanged. The tippecanoe tolerance comparison explicitly pins buffer 8
+and its matched verbatim run disables max-zoom simplification; all five
+fixtures retain their pre-merge per-zoom matched measurements and bounds.

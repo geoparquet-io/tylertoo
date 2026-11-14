@@ -558,8 +558,10 @@ VERIFY_ARCHIVE = REPO / "scripts" / "verify_archive.py"
 # flags, whether placeholder squares must decay toward coarse zooms).
 #
 # Decay is checked only with the polygon gate at 0, where every small polygon
-# reaches the coarse levels as a dithered square, so the squares must thin
-# ~4x per zoom (#749). With the gate on, small polygons leave at assignment
+# reaches the coarse levels as a dithered square. The verifier tracks the
+# same tiny-square ids toward coarser zooms, excluding new collapses (#749).
+# These runs use its default GSD base 1024 / extent 4096 size assumption.
+# With the gate on, small polygons leave at assignment
 # and the #384 accumulator draws carrier squares at a density-budget rate,
 # which need not halve over three zooms; and the coverage fill draws
 # square child-tile cells by design.
