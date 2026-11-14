@@ -1483,28 +1483,6 @@ struct SpillPlan<'a> {
     output_row_bytes: u64,
 }
 
-impl SpillPlan<'_> {
-    fn sink_backing(
-        &self,
-        budget: &MemoryBudget,
-        options: &ConvertOptions,
-    ) -> pipeline::SinkBacking {
-        pipeline::sink_backing(
-            budget,
-            options.profile,
-            options.mode,
-            buffered_rows(self.emitted, self.finest, options),
-            shared_sink_rows(
-                options,
-                buffered_levels(self.emitted, self.finest, options),
-                self.input_rows,
-            ),
-            self.avg_geom_bytes,
-            self.row_bytes,
-        )
-    }
-}
-
 /// What [`reserve_spill_cache`] reserved, and why (`TYLERTOO_PROFILE_JSON`
 /// `pass2.spill_reservation`).
 #[derive(Clone, Copy, Debug, Default)]
@@ -1537,7 +1515,6 @@ fn reserve_spill_cache(
     budget: &mut MemoryBudget,
     options: &ConvertOptions,
     plan: SpillPlan<'_>,
-    backing: pipeline::SinkBacking,
 ) -> SpillReservation {
     let skip = |reason| SpillReservation {
         reason,
@@ -1555,11 +1532,28 @@ fn reserve_spill_cache(
     let SpillPlan {
         emitted,
         finest,
+        input_rows,
+        row_bytes,
+        avg_geom_bytes,
         output_row_bytes,
-        ..
     } = plan;
     let buffered_rows = buffered_rows(emitted, finest, options);
-    let spills = matches!(backing, pipeline::SinkBacking::Spill);
+    let spills = matches!(
+        pipeline::sink_backing(
+            budget,
+            options.profile,
+            options.mode,
+            buffered_rows,
+            shared_sink_rows(
+                options,
+                buffered_levels(emitted, finest, options),
+                input_rows
+            ),
+            avg_geom_bytes,
+            row_bytes,
+        ),
+        pipeline::SinkBacking::Spill
+    );
     if !spills || buffered_rows == 0 {
         return skip("nothing spills");
     }
@@ -3810,20 +3804,6 @@ pub(crate) fn run_stages(
 
     let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
     let output_row_bytes = budget.output_row_bytes(options.mode, avg_geom_bytes, row_bytes);
-    let spill_plan = SpillPlan {
-        emitted,
-        finest,
-        input_rows: num_rows,
-        row_bytes,
-        avg_geom_bytes,
-        output_row_bytes,
-    };
-    let backing = spill_plan.sink_backing(&budget, options);
-    let spilling_levels = if matches!(backing, pipeline::SinkBacking::Spill) {
-        buffered_levels(emitted, finest, options).len()
-    } else {
-        0
-    };
     let level_rows: Vec<_> = emitted.iter().map(|e| e.hint).collect();
     if let Some(message) = super::disk::DiskFootprint::post_pass1(
         source,
@@ -3831,14 +3811,25 @@ pub(crate) fn run_stages(
         options,
         output_path,
         &level_rows,
-        spilling_levels,
+        buffered_levels(emitted, finest, options).len(),
         output_row_bytes,
     )?
     .warning(super::tiles::CLI_REMEDIES)
     {
         diagnostics.warn(message);
     }
-    let spill_reservation = reserve_spill_cache(&mut budget, options, spill_plan, backing);
+    let spill_reservation = reserve_spill_cache(
+        &mut budget,
+        options,
+        SpillPlan {
+            emitted,
+            finest,
+            input_rows: num_rows,
+            row_bytes,
+            avg_geom_bytes,
+            output_row_bytes,
+        },
+    );
     let LevelWriter {
         mut writer,
         source_schema,
@@ -11602,16 +11593,18 @@ mod tests {
         };
         let reserve = |bytes: u64, source, options: &ConvertOptions, row: u64| {
             let mut budget = MemoryBudget::from_limit(Some(MemoryLimit { bytes, source }));
-            let plan = SpillPlan {
-                emitted: &levels,
-                finest: 2,
-                input_rows: 3_000,
-                row_bytes: Some(row),
-                avg_geom_bytes: None,
-                output_row_bytes: row,
-            };
-            let backing = plan.sink_backing(&budget, options);
-            let r = reserve_spill_cache(&mut budget, options, plan, backing);
+            let r = reserve_spill_cache(
+                &mut budget,
+                options,
+                SpillPlan {
+                    emitted: &levels,
+                    finest: 2,
+                    input_rows: 3_000,
+                    row_bytes: Some(row),
+                    avg_geom_bytes: None,
+                    output_row_bytes: row,
+                },
+            );
             (r, budget.remaining())
         };
         // Two buffered levels (the finest streams) of 1,000 rows at 100 B:
