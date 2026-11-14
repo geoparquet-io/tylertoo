@@ -335,7 +335,7 @@ pub(super) fn simplify_for_level_checked(
     opts: &SimplifyOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
     source: &Geometry<f64>,
-    part_sources: Option<&mut Vec<usize>>,
+    mut part_sources: Option<&mut Vec<usize>>,
 ) -> (Simplified, bool) {
     let tol = world_tolerance(gsd_meters, crs, opts);
     // The placeholder side only matters to the square disposition; skip the
@@ -406,13 +406,12 @@ pub(super) fn simplify_for_level_checked(
             // Parts retain their canonical identity through drops and repair
             // splits. Tippecanoe reduces tiny outer rings individually
             // (clip.cpp, reduce_tiny_poly), rather than on the whole feature.
-            let source_index = |i: usize| {
-                part_sources
-                    .as_deref()
-                    .and_then(|indices| indices.get(i))
-                    .copied()
-                    .unwrap_or(i)
-            };
+            if let Some(indices) = part_sources.as_deref_mut() {
+                if indices.len() != mp.0.len() {
+                    *indices = (0..mp.0.len()).collect();
+                }
+            }
+            let source_index = |i: usize| part_sources.as_deref().map_or(i, |indices| indices[i]);
             let split_source = match source {
                 Geometry::Polygon(src) => Some(src),
                 _ => None,
@@ -3911,7 +3910,11 @@ mod source_area_regression {
         ]));
         let source = Geometry::MultiPolygon(MultiPolygon::new(Vec::new()));
         let expected = simplify_for_level(&working, 1.0, Crs::Epsg3857, &opts, &diagnostics);
-        for mut indices in [vec![], vec![99, 100]] {
+        for (mut indices, expected_indices) in [
+            (vec![], vec![0, 1]),
+            (vec![1], vec![0, 1]),
+            (vec![99, 100], vec![99, 100]),
+        ] {
             let (actual, _) = simplify_for_level_checked(
                 &working,
                 1.0,
@@ -3923,7 +3926,7 @@ mod source_area_regression {
                 Some(&mut indices),
             );
             assert_eq!(actual, expected);
-            assert_eq!(indices.len(), 2);
+            assert_eq!(indices, expected_indices);
         }
     }
 
