@@ -591,3 +591,75 @@ tippecanoe also simplifies each polygon on its own. Python's explicit
 `None` selects the command's default, like `"auto"` for size caps.
 Variable-depth stop tiles carry the finest level's features, so they get
 the same simplification.
+
+## Decision 13: exact number narrowing and libdeflate gzip at level 6
+
+`PropertyValue::to_mvt_value` (`crates/core/src/mvt.rs`) now writes a double
+as a 4-byte float when it fits exactly, and a negative integer as a zigzag
+`sint`, matching tippecanoe (`mvt.cpp:719-724`). Whole-number doubles stay
+floats; tippecanoe writes them as integers. `compress_gzip`
+(`crates/core/src/compression.rs`) now compresses tiles and directories with
+libdeflate at level 6 instead of flate2's zlib-rs backend at level 6. Output
+is still plain gzip, and decompression stays on flate2. Nothing else in a
+tile changes: per-zoom feature counts are identical on all nine inputs;
+only size-valve merge counts move slightly where tiles near the 500K cap
+get smaller.
+
+Measured on main at `157e7a44`, with the default `tylertoo tiles IN OUT`
+on a 64-core host and interleaved runs. Wall time is the median:
+
+| Input | Archive change | Wall before -> after | Peak RSS before -> after |
+|---|---|---|---|
+| 302k Portland roads | -0.78% | 0.79 s -> 0.77 s | 1,579 MB -> 1,638 MB |
+| 476k Guatemala roads | -1.03% | 1.20 s -> 1.18 s | 1,910 MB -> 1,962 MB |
+| 882k Mexico City points | -2.95% | 0.87 s -> 0.87 s | 1,388 MB -> 1,400 MB |
+| 17k Madagascar admin polygons | -1.17% | 1.08 s -> 1.02 s | 1,275 MB -> 1,171 MB |
+| 632k Moldova fields | -1.78% | 4.31 s -> 4.27 s | 3,073 MB -> 3,098 MB |
+| 794k Auckland parcels | -1.04% | 5.10 s -> 5.06 s | 2,225 MB -> 2,294 MB |
+| 5.5M Overture places | -0.54% | 14.32 s -> 13.68 s | 11,954 MB -> 12,177 MB |
+| 2.8M Overture road segments | -2.80% | 17.25 s -> 16.84 s | 5,314 MB -> 5,563 MB |
+| 4.3M NZ parcels | -1.37% | 29.63 s -> 29.17 s | 8,538 MB -> 8,564 MB |
+
+User+sys CPU fell on every input (1-12%; for example, 317.6 s -> 302.4 s
+on the places and 296 s -> 281 s on the segments). Narrowing alone saved
+1.26% on the Mexico City points (a `confidence` column) and changed no wall
+time; libdeflate supplies the rest. In the Criterion microbenchmark, gzip
+of a 50-, 500- and 2000-feature tile got 23%, 31% and 38% faster.
+
+The accepted cost is higher peak RSS on very large inputs: about 2% on the
+5.5M places (three runs each: 11,940-11,956 MB before, 12,143-12,224 MB
+after) and about 5% on the 2.8M segments (5,202-5,322 MB before,
+5,499-5,654 MB after). On the 4.3M NZ parcels it stays inside the before
+range (8,418-8,596 MB before, 8,533-8,582 MB after), and on the smaller
+inputs it moves by about 100 MB or less, in both directions. This comes
+from the allocator keeping freed pages, rather than tylertoo's data: dhat
+measured the places' peak live heap at 11,244.7 MB with zlib and
+11,272.3 MB with libdeflate (+27.5 MB, 0.24%, which is libdeflate's
+per-thread compressor state). Mimalloc's own statistics show the same peak
+of pages in use, and with `MIMALLOC_PURGE_DELAY=0` the segments peak at
+4,405-4,439 MB before and 4,427-4,449 MB after. Reusing the compressor or
+the output buffer, leaving the buffer unzeroed, routing libdeflate's
+memory through mimalloc, and other compression levels all left the
+difference unchanged. Setting the purge delay to 0 is not a fix, because
+it adds about 20% wall time.
+
+Measured and rejected:
+
+- Sorting the layer's value table, as tippecanoe does: sorting single-use
+  strings saved 6% on the Mexico City points and 10% on the Overture
+  places, but grew the 2.8M Overture road segments by 4.2% (z14's largest
+  tiles by about 10%), because their per-feature id and JSON strings
+  compress better next to the same feature's other values. Sorting every
+  string also widened the tag varints of shared values on Madagascar,
+  which pushed z3-z5 tiles past the 2M raw cap and nearly doubled the
+  size-valve merges (6,007 -> 11,189). The sort also cost up to 4% more
+  CPU. The table keeps first-seen order.
+- Writing whole-number doubles as integers (tippecanoe does): a further
+  0.17% at most, on NZ parcels, and it changes a column's type for typed
+  readers.
+- Stronger gzip: measured against zlib-rs, libdeflate level 9 saved
+  0.9-2.2% at about 20-40% more CPU, and level 12 saved 1.6-4.1% at up to
+  three times the CPU.
+
+**Decision:** ship exact narrowing and libdeflate level 6 as the defaults;
+accept the higher peak RSS on very large inputs.

@@ -1391,7 +1391,14 @@ pub enum PropertyValue {
 }
 
 impl PropertyValue {
-    /// Convert to MVT Value type.
+    /// Convert to MVT Value type, each number in its shortest exact
+    /// encoding: a double the 4-byte float holds exactly as that float, a
+    /// negative integer as a zigzag `sint`. Readers get the same number.
+    ///
+    /// DIVERGENCE FROM TIPPECANOE: tippecanoe also writes a whole-number
+    /// double as an integer (mvt.cpp:712-755). We keep it a float: a typed
+    /// reader would see `1` where the column holds `1.0`, and one column
+    /// would carry integers in some features and floats in others.
     pub fn to_mvt_value(&self) -> Value {
         match self {
             PropertyValue::String(s) => Value {
@@ -1402,8 +1409,20 @@ impl PropertyValue {
                 float_value: Some(*f),
                 ..Default::default()
             },
-            PropertyValue::Double(d) => Value {
-                double_value: Some(*d),
+            PropertyValue::Double(d) => match exact_f32(*d) {
+                Some(f) => Value {
+                    float_value: Some(f),
+                    ..Default::default()
+                },
+                None => Value {
+                    double_value: Some(*d),
+                    ..Default::default()
+                },
+            },
+            // As a varint a negative int64 takes ten bytes; zigzag takes as
+            // few as its magnitude needs (tippecanoe mvt.cpp:719-724).
+            PropertyValue::Int(i) if *i < 0 => Value {
+                sint_value: Some(*i),
                 ..Default::default()
             },
             PropertyValue::Int(i) => Value {
@@ -1422,8 +1441,18 @@ impl PropertyValue {
     }
 }
 
-/// Deduplication key for a non-string [`PropertyValue`]: the variant plus the
-/// value's exact bits.
+/// `d` as an `f32` when the `f32` holds it exactly. Every NaN is the `f32`
+/// NaN: the value table keeps one NaN whatever its payload.
+fn exact_f32(d: f64) -> Option<f32> {
+    if d.is_nan() {
+        return Some(f32::NAN);
+    }
+    let f = d as f32;
+    (f64::from(f) == d).then_some(f)
+}
+
+/// Deduplication key for a non-string [`PropertyValue`]: the variant it is
+/// written as plus the value's exact bits.
 ///
 /// PERF (#461/#535): the layer's value table used to be keyed on
 /// `format!("{value:?}")`, which allocated and formatted a `String` for every
@@ -1437,7 +1466,9 @@ impl PropertyValue {
 /// floats, `Debug` prints the shortest string that round-trips, so two
 /// distinct bit patterns always printed differently — with one exception, NaN,
 /// whose every payload printed `NaN` and therefore deduplicated together. NaN
-/// is canonicalized to a single bit pattern here to keep that.
+/// is canonicalized to a single bit pattern here to keep that. A double that
+/// [`PropertyValue::to_mvt_value`] writes as a float is keyed as that float,
+/// so a float and a double of one number share one table entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ScalarKey {
     Float(u32),
@@ -1461,11 +1492,10 @@ impl ScalarKey {
             } else {
                 f.to_bits()
             }),
-            PropertyValue::Double(d) => Self::Double(if d.is_nan() {
-                f64::NAN.to_bits()
-            } else {
-                d.to_bits()
-            }),
+            PropertyValue::Double(d) => match exact_f32(*d) {
+                Some(f) => Self::of(&PropertyValue::Float(f)),
+                None => Self::Double(d.to_bits()),
+            },
             PropertyValue::Int(i) => Self::Int(*i),
             PropertyValue::UInt(u) => Self::UInt(*u),
             PropertyValue::Bool(b) => Self::Bool(*b),
@@ -3520,11 +3550,46 @@ mod tests {
         r
     }
 
-    /// The bit-keyed value dedup must assign exactly the indexes the pre-#535
-    /// `format!("{value:?}")` key did, for every value shape that could
-    /// plausibly alias: the two float widths carrying the same number, signed
-    /// vs unsigned integers at the same magnitude, `0.0` against `-0.0`,
-    /// several NaN payloads (which the `Debug` key deduplicated together, all
+    /// A double is written as a 4-byte float when the float holds it
+    /// exactly, and as a double otherwise; a negative integer as a zigzag
+    /// `sint`, which is as short as its magnitude, where `int` takes ten
+    /// bytes. Every value reads back equal.
+    #[test]
+    fn numbers_are_written_in_their_shortest_exact_encoding() {
+        use prost::Message;
+        let exact = [0.5, -1.25, 3.0, -0.0, 16_777_216.0, f64::INFINITY];
+        for d in exact {
+            let v = PropertyValue::Double(d).to_mvt_value();
+            assert_eq!(v.double_value, None, "{d}");
+            assert_eq!(
+                v.float_value.map(f64::from).map(f64::to_bits),
+                Some(d.to_bits())
+            );
+        }
+        let nan = PropertyValue::Double(f64::NAN).to_mvt_value();
+        assert!(nan.float_value.is_some_and(f32::is_nan));
+        for d in [0.1, 16_777_217.0, 1e300, f64::MIN_POSITIVE, -2.5e-60] {
+            let v = PropertyValue::Double(d).to_mvt_value();
+            assert_eq!((v.float_value, v.double_value), (None, Some(d)), "{d}");
+        }
+        for i in [-1, -300, i64::MIN] {
+            let v = PropertyValue::Int(i).to_mvt_value();
+            assert_eq!((v.int_value, v.sint_value), (None, Some(i)));
+        }
+        for i in [0, 1, i64::MAX] {
+            let v = PropertyValue::Int(i).to_mvt_value();
+            assert_eq!((v.int_value, v.sint_value), (Some(i), None));
+        }
+        assert_eq!(PropertyValue::Int(-1).to_mvt_value().encoded_len(), 2);
+    }
+
+    /// The bit-keyed value dedup must give two values one index exactly
+    /// when they encode to the same `Value`, keyed here, as before #535, on
+    /// its `Debug` string, for every value shape that could plausibly alias:
+    /// the two float widths carrying the same number (one entry, now that a
+    /// double the float holds exactly is written as that float), signed vs
+    /// unsigned integers at the same magnitude, `0.0` against `-0.0`, several
+    /// NaN payloads (which the `Debug` key deduplicates together, all
     /// printing `NaN`), infinities, and repeats in mixed order.
     #[test]
     fn value_dedup_indexes_match_the_debug_string_key() {
@@ -3559,13 +3624,14 @@ mod tests {
             "fixture must be a second, distinct NaN encoding"
         );
 
-        // Reference: the pre-#535 single `format!`-keyed map.
+        // Reference: a single `format!`-keyed map of the encoded values.
         let mut reference_index: HashMap<String, u32> = HashMap::new();
         let mut reference_next = 0u32;
         let expected: Vec<u32> = values
             .iter()
             .map(|v| {
-                *reference_index.entry(format!("{v:?}")).or_insert_with(|| {
+                let key = format!("{:?}", v.to_mvt_value());
+                *reference_index.entry(key).or_insert_with(|| {
                     let i = reference_next;
                     reference_next += 1;
                     i
