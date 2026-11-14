@@ -23,6 +23,12 @@ const MARGIN_DENOM: u64 = 20;
 // priced separately as "export member spill", so this allowance is
 // conservative). I_est already exceeds I_actual.
 const OUTPUT_PER_INTERMEDIATE: (u64, u64) = (1, 2);
+// shortcut: empirical, not derived from the member encoding. Export's member
+// spill holds the finest levels' full-detail rows, which the pass-2 row price
+// undercounts: measured/priced was 1.95x (BR_MT filtered, bounded, 16 cores:
+// 2.94 vs 1.51 GiB) and 1.40x (segments). 3x leaves 50% over the worst.
+// Upgrade by pricing `Partition::members` and the member codec at export.
+const MEMBER_SPILL_FACTOR: u64 = 3;
 
 /// One slot per buffered level; the separately streamed canonical is absent.
 pub(super) type DiskCheck<'a> = dyn FnMut(&[Option<u64>]) -> Result<(), ConvertError> + 'a;
@@ -369,12 +375,16 @@ impl DiskFootprint {
         // all levels (partitioning) or of the largest level, at the raw
         // intermediate row price. This is independent of the RAM probe:
         // fewer cores or less free RAM only turn a RAM store into a spill.
-        // shortcut: one member per row; a feature split across partitions
-        // adds copies. Upgrade by pricing `Partition::members` at export.
+        // Priced per row, with [`MEMBER_SPILL_FACTOR`]; a feature split across
+        // partitions adds copies the row count does not see.
         let member_levels: Vec<u64> = level_rows
             .iter()
             .zip(output_row_bytes)
-            .map(|(&rows, &price)| (rows as u64).saturating_mul(price))
+            .map(|(&rows, &price)| {
+                (rows as u64)
+                    .saturating_mul(price)
+                    .saturating_mul(MEMBER_SPILL_FACTOR)
+            })
             .collect();
         let members = if matches!(options.profile, MemoryProfile::Speed) {
             0
@@ -397,6 +407,7 @@ impl DiskFootprint {
             total,
             intermediate_phases,
         );
+        // A convert-only run never exports, so it has neither.
         if let Some(archive) = archive {
             footprint.add_phased(
                 parent_dir(archive),
@@ -404,13 +415,13 @@ impl DiskFootprint {
                 output,
                 export_only(output),
             );
+            footprint.add_phased(
+                &scratch,
+                "export member spill",
+                members,
+                export_only(members),
+            );
         }
-        footprint.add_phased(
-            &scratch,
-            "export member spill",
-            members,
-            export_only(members),
-        );
         footprint.log_projection();
         Ok(footprint)
     }
@@ -611,7 +622,10 @@ mod tests {
             &[1_600; 2],
         )
         .unwrap();
-        assert!(!disk.components.iter().any(|c| c.name == "output archive"));
+        assert!(!disk
+            .components
+            .iter()
+            .any(|c| matches!(c.name, "output archive" | "export member spill")));
         let warning = disk
             .warning_with(REMEDIES, |_| Some(("same".into(), 0)))
             .unwrap();
@@ -637,6 +651,7 @@ mod tests {
             None,
         );
         let source = ConvertSource::resolve_path(&input).unwrap();
+        let archive = dir.path().join("out.pmtiles");
         let member_spill = |mode, profile| {
             let options = ConvertOptions {
                 mode,
@@ -647,7 +662,7 @@ mod tests {
                 &source,
                 None,
                 &options,
-                (&dir.path().join("out.parquet"), None),
+                (&dir.path().join("out.parquet"), Some(&archive)),
                 &[1_000, 40_000],
                 1,
                 &[1_600; 2],
@@ -661,11 +676,11 @@ mod tests {
         // Partitioning spills every level's members; duplicating, the largest level's.
         assert_eq!(
             member_spill(Mode::Partitioning, MemoryProfile::Bounded),
-            Some((41_000 * 1_600, 41_000 * 1_600, 0))
+            Some((41_000 * 1_600 * 3, 41_000 * 1_600 * 3, 0))
         );
         assert_eq!(
             member_spill(Mode::Duplicating, MemoryProfile::Auto),
-            Some((40_000 * 1_600, 40_000 * 1_600, 0))
+            Some((40_000 * 1_600 * 3, 40_000 * 1_600 * 3, 0))
         );
         assert_eq!(member_spill(Mode::Partitioning, MemoryProfile::Speed), None);
     }
@@ -767,7 +782,7 @@ mod tests {
         let source = ConvertSource::resolve_path(&input).unwrap();
         let options = ConvertOptions::default();
         let raw = RawSinkSize::from_source(&source, None, &options).unwrap();
-        let mut disk = DiskFootprint::post_pass1(
+        let disk = DiskFootprint::post_pass1(
             &source,
             None,
             &options,
@@ -777,8 +792,6 @@ mod tests {
             &[1_600; 3],
         )
         .unwrap();
-        // These lifecycle tests isolate the conversion and archive phases.
-        disk.components.retain(|c| c.name != "export member spill");
         // The first drain dominates: both spills still exist when I_0 finishes.
         let peak = disk.spill_bytes()
             + (40_000.0 * 1_600.0 * raw.intermediate_factor).ceil() as u64
@@ -817,8 +830,6 @@ mod tests {
             &[1_600; 3],
         )
         .unwrap();
-        // These lifecycle tests isolate the conversion and archive phases.
-        disk.components.retain(|c| c.name != "export member spill");
         let intermediate = disk
             .components
             .iter()
