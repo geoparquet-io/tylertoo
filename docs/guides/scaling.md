@@ -104,8 +104,9 @@ set its purge delay to zero before starting work, returning freed pages to the
 OS immediately at a throughput cost: on Overture segments (z0-14) peak RSS
 falls from 3.5 to 2.8 GiB and the run takes 49 s against 41 s, and Moldova
 (z12) falls from 2.0 to 1.6 GiB in 5.8 s against 4.3 s. `auto` and `speed` leave the allocator
-setting untouched. This setting is process-global: in Python it remains zero
-after a `bounded` call. Eagerly committed arenas and transparent huge pages
+setting untouched. In Python the setting applies for the duration of each
+`bounded` call and is then restored; overlapping calls on other threads share
+it while any `bounded` call runs. Eagerly committed arenas and transparent huge pages
 can still add memory overhead. A build with `--no-default-features` uses the
 system allocator, except on musl targets, which always use mimalloc.
 
