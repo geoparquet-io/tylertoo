@@ -1252,8 +1252,11 @@ Key metrics:
 - **Peak bytes** — high-water mark (compare against `time -v` RSS)
 
 The CLI uses mimalloc by default (#739); dhat replaces it while profiling.
-RSS above dhat's peak in a mimalloc run, bounded runs included, is allocator
-retention, and `--profile bounded` remains the memory escape hatch.
+Under `--profile bounded`, the CLI and Python extension set mimalloc's purge
+delay to 0 before work starts (#851), purging freed pages immediately at a
+speed cost. RSS can still exceed the live heap because it includes allocator
+overhead and non-heap memory; dhat uses a different allocator, so its peak
+alone cannot measure mimalloc retention.
 - **At end bytes** — still allocated at exit (potential leaks)
 - **Allocation sites** — sorted by total bytes; expand call stacks
 

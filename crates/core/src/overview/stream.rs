@@ -9250,9 +9250,11 @@ mod tests {
         assert!(spun.wall_secs > 0.0 && slept.wall_secs >= 0.15);
         if cfg!(unix) {
             assert!(spun.cpu_secs().unwrap() > 0.0);
+            // Relative, not a fixed floor: a loaded CI runner can preempt the
+            // spinning thread for half the phase (macOS: 0.61 CPU s in 1.26 s).
             assert!(
-                spun.effective_cores().unwrap() > 0.5,
-                "a spinning thread is ~1 core busy: {spun:?}"
+                spun.effective_cores().unwrap() > slept.effective_cores().unwrap(),
+                "a spinning thread keeps more cores busy than a sleeping one: {spun:?} vs {slept:?}"
             );
             assert!(
                 slept.effective_cores().unwrap() < 0.5,
