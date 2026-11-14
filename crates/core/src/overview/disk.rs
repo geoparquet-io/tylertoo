@@ -190,6 +190,8 @@ impl DiskFootprint {
     /// Recheck after assignment using kept rows and the spill reservation's
     /// output-row price. Staged input already occupies disk, so the probe's
     /// free bytes account for it. Keep the raw framing bound for both codecs.
+    /// `buffered_levels` is zero when the resolved backing is RAM. An Auto
+    /// Ram→Spill downgrade mid-run is not covered: it re-measures at run time.
     pub(super) fn post_pass1(
         source: &ConvertSource,
         selection: Option<&RowGroupSelection>,
@@ -362,6 +364,45 @@ mod tests {
         spill_dir: "--spill-dir",
         keep_overview: "--keep-overview",
     };
+
+    #[test]
+    fn post_pass1_auto_ram_run_has_no_spill_component() {
+        use super::super::convert::{convert_to_overviews, LevelPlan};
+
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        let geoms = [
+            Some(geo::Geometry::Point(geo::Point::new(1.0, 2.0))),
+            Some(geo::Geometry::Point(geo::Point::new(10.0, 20.0))),
+        ];
+        super::super::testutil::write_input(&input, &geoms, true, None);
+        let options = ConvertOptions {
+            profile: MemoryProfile::Auto,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 2,
+            },
+            ..ConvertOptions::default()
+        };
+        crate::test_log::take_thread_lines();
+        convert_to_overviews(&input, dir.path().join("out.parquet"), &options).unwrap();
+        if logging {
+            let lines = crate::test_log::take_thread_lines();
+            assert!(
+                lines.iter().any(|line| {
+                    line.starts_with("[convert] pass2 auto") && line.contains("→ Ram")
+                }),
+                "{lines:#?}"
+            );
+            let footprint = lines
+                .iter()
+                .find(|line| line.starts_with("[disk] after pass 1 projected footprint:"))
+                .unwrap();
+            assert!(footprint.contains("intermediate overview"), "{footprint}");
+            assert!(!footprint.contains("pass-2 spill"), "{footprint}");
+        }
+    }
 
     #[test]
     fn post_pass1_uses_kept_level_rows_and_still_warns_on_a_small_volume() {
