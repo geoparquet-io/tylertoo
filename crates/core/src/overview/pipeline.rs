@@ -2534,28 +2534,33 @@ mod spill_tests {
         assert_eq!(sizing_profile(Bounded, SinkBacking::Spill), Bounded);
     }
 
-    /// The current preflight ignores even a measured pass-2 footprint for a
-    /// local source. The injected free-space probe avoids filling a volume.
+    /// Both the pre-read upper bound and post-pass-1 recheck cover a local
+    /// unfiltered spill. The injected probe avoids filling a volume.
     #[test]
     fn phase1_local_preflight_covers_actual_pass2_spill() {
         let dir = tempfile::tempdir().unwrap();
         let observations = measure_verbatim_spill(dir.path());
         let actual_bytes: u64 = observations.iter().map(|&(_, bytes)| bytes).sum();
         let available = actual_bytes / 2;
-        let disk = measured_disk_footprint(dir.path());
-        assert!(
-            disk.spill_bytes() >= actual_bytes,
-            "the pass-2 component must cover the measured spill"
-        );
-        let warning = disk.warning_with(super::super::tiles::CLI_REMEDIES, |_| {
-            Some(("one volume".into(), available))
-        });
-        assert!(warning.is_some(),
-            "local preflight returned no warning for {actual_bytes} measured spill bytes with only {available} bytes available");
+        for disk in measured_disk_footprints(dir.path(), &observations) {
+            assert!(
+                disk.spill_bytes() >= actual_bytes,
+                "the pass-2 component must cover the measured spill"
+            );
+            let warning = disk.warning_with(super::super::tiles::CLI_REMEDIES, |_| {
+                Some(("one volume".into(), available))
+            });
+            assert!(warning.is_some(),
+                "local preflight returned no warning for {actual_bytes} measured spill bytes with only {available} bytes available");
+        }
     }
 
-    fn measured_disk_footprint(dir: &Path) -> super::super::disk::DiskFootprint {
+    fn measured_disk_footprints(
+        dir: &Path,
+        observations: &[(u64, u64)],
+    ) -> [super::super::disk::DiskFootprint; 2] {
         use super::super::convert::{ConvertOptions, LevelPlan};
+        use super::super::disk::DiskFootprint;
         let source = ConvertSource::resolve_path(&dir.join("input.parquet")).unwrap();
         let options = ConvertOptions {
             levels: LevelPlan::ZoomRange {
@@ -2566,13 +2571,41 @@ mod spill_tests {
             spill_dir: Some(dir.to_path_buf()),
             ..Default::default()
         };
-        super::super::disk::DiskFootprint::conversion(
+        let before =
+            DiskFootprint::conversion(&source, None, &options, Some(&dir.join("output.parquet")))
+                .unwrap();
+        let row_bytes = super::super::read::footer_price(
+            &source,
+            None,
+            0..source.schema().unwrap().fields().len(),
+        )
+        .unwrap()
+        .unwrap()
+        .row_bytes;
+        // The verbatim fixture keeps every row at every level. Its four
+        // buffered levels spill; its fifth (finest) level streams.
+        let mut rows: Vec<_> = observations
+            .iter()
+            .map(|&(rows, _)| rows as usize)
+            .collect();
+        let buffered = rows.len();
+        assert_eq!(buffered, 4);
+        rows.push(128);
+        let after = DiskFootprint::post_pass1(
             &source,
             None,
             &options,
-            Some(&dir.join("output.parquet")),
+            &dir.join("output.parquet"),
+            &rows,
+            buffered,
+            MemoryBudget::with_available(None).output_row_bytes(
+                options.mode,
+                None,
+                Some(row_bytes),
+            ),
         )
-        .unwrap()
+        .unwrap();
+        [before, after]
     }
 
     /// Bound pessimism on the fixed workload even after encoding changes.
@@ -2583,13 +2616,15 @@ mod spill_tests {
         let dir = tempfile::tempdir().unwrap();
         let observations = measure_verbatim_spill(dir.path());
         let actual: u64 = observations.iter().map(|&(_, bytes)| bytes).sum();
-        let estimate = measured_disk_footprint(dir.path()).spill_bytes();
-        eprintln!("raw disk estimate={estimate}, actual spill={actual}");
-        assert!(estimate >= actual, "estimate {estimate} < actual {actual}");
-        assert!(
-            estimate <= actual.saturating_mul(32),
-            "estimate {estimate} > 32 × actual {actual}"
-        );
+        for disk in measured_disk_footprints(dir.path(), &observations) {
+            let estimate = disk.spill_bytes();
+            eprintln!("raw disk estimate={estimate}, actual spill={actual}");
+            assert!(estimate >= actual, "estimate {estimate} < actual {actual}");
+            assert!(
+                estimate <= actual.saturating_mul(32),
+                "estimate {estimate} > 32 × actual {actual}"
+            );
+        }
     }
 
     fn schema(name: &str) -> Schema {

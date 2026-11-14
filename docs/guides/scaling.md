@@ -153,14 +153,18 @@ Measure memory use if headroom is tight, or use `--read-workers 1`.
 
 `--spill-dir <path>` controls these temporary files and defaults to `$TMPDIR`.
 The run fails before starting if the directory does not exist.
+The pre-read disk warning says "need at most approximately" because it is an
+upper bound. Any filter is applied during the read, and the size is rechecked
+after pass 1 using the kept rows at each emitted level. The log reports the
+projected pass-2 spill and intermediate overview sizes in GiB.
 
 - **Remote stage file.** A remote convert copies the column chunks it touches
   to local disk, using about as much space as those chunks. Both passes read
   the staged data. Local inputs never stage. A free-space check warns of a
   shortfall, and a full `$TMPDIR` fails the run. Set `--spill-dir` on large remote runs.
-- **`tiles` intermediate overview.** At least the input's size, with its own
-  free-space check. It goes to `--spill-dir`, else `$TMPDIR`, else the output
-  directory, and export deletes it when done. `--keep-overview PATH` retains it.
+- **`tiles` intermediate overview.** It goes to `--spill-dir`, else `$TMPDIR`,
+  else the output directory, and export deletes it when done.
+  `--keep-overview PATH` retains it.
   It is written with LZ4; `--temp-compression zstd` makes it about a third
   smaller for 5–7% more CPU.
 - **Export spill file.** `export-pmtiles --spill-dir` (and `tiles --spill-dir`)

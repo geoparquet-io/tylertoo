@@ -1479,6 +1479,8 @@ struct SpillPlan<'a> {
     input_rows: usize,
     row_bytes: Option<u64>,
     avg_geom_bytes: Option<u64>,
+    /// Shared with the post-pass-1 disk footprint.
+    output_row_bytes: u64,
 }
 
 /// What [`reserve_spill_cache`] reserved, and why (`TYLERTOO_PROFILE_JSON`
@@ -1533,6 +1535,7 @@ fn reserve_spill_cache(
         input_rows,
         row_bytes,
         avg_geom_bytes,
+        output_row_bytes,
     } = plan;
     let buffered_rows = buffered_rows(emitted, finest, options);
     let spills = matches!(
@@ -1554,7 +1557,7 @@ fn reserve_spill_cache(
     if !spills || buffered_rows == 0 {
         return skip("nothing spills");
     }
-    let arrow_bytes = budget.sink_estimate(options.mode, buffered_rows, avg_geom_bytes, row_bytes);
+    let arrow_bytes = (buffered_rows as u64).saturating_mul(output_row_bytes);
     let codec = pipeline::spill_codec(options.profile);
     let estimate_bytes = (arrow_bytes as f64 * pipeline::spill_bytes_per_arrow_byte(codec)) as u64;
     let reservation = if estimate_bytes <= budget.remaining() {
@@ -3799,6 +3802,22 @@ pub(crate) fn run_stages(
         },
     )?;
 
+    let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
+    let output_row_bytes = budget.output_row_bytes(options.mode, avg_geom_bytes, row_bytes);
+    let level_rows: Vec<_> = emitted.iter().map(|e| e.hint).collect();
+    if let Some(message) = super::disk::DiskFootprint::post_pass1(
+        source,
+        selected_row_groups.as_ref(),
+        options,
+        output_path,
+        &level_rows,
+        buffered_levels(emitted, finest, options).len(),
+        output_row_bytes,
+    )?
+    .warning(super::tiles::CLI_REMEDIES)
+    {
+        diagnostics.warn(message);
+    }
     let spill_reservation = reserve_spill_cache(
         &mut budget,
         options,
@@ -3807,7 +3826,8 @@ pub(crate) fn run_stages(
             finest,
             input_rows: num_rows,
             row_bytes,
-            avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
+            avg_geom_bytes,
+            output_row_bytes,
         },
     );
     let LevelWriter {
@@ -11582,6 +11602,7 @@ mod tests {
                     input_rows: 3_000,
                     row_bytes: Some(row),
                     avg_geom_bytes: None,
+                    output_row_bytes: row,
                 },
             );
             (r, budget.remaining())

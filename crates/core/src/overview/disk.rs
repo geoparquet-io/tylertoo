@@ -16,6 +16,7 @@ const MARGIN_DENOM: u64 = 20;
 #[derive(Debug, Default)]
 pub(super) struct DiskFootprint {
     components: Vec<Component>,
+    post_pass1: bool,
 }
 
 #[derive(Debug)]
@@ -186,6 +187,65 @@ impl DiskFootprint {
         Ok(footprint)
     }
 
+    /// Recheck after assignment using kept rows and the spill reservation's
+    /// output-row price. Staged input already occupies disk, so the probe's
+    /// free bytes account for it. Keep the raw framing bound for both codecs.
+    pub(super) fn post_pass1(
+        source: &ConvertSource,
+        selection: Option<&RowGroupSelection>,
+        options: &ConvertOptions,
+        overview: &Path,
+        level_rows: &[usize],
+        buffered_levels: usize,
+        output_row_bytes: u64,
+    ) -> Result<Self, ConvertError> {
+        let raw = RawSinkSize::from_source(source, selection, options)?;
+        let bytes = |rows: &[usize]| {
+            RawSinkSize {
+                payload: rows
+                    .iter()
+                    .fold(0u64, |sum, &n| sum.saturating_add(n as u64))
+                    .saturating_mul(output_row_bytes),
+                framing: raw.framing,
+            }
+            .bytes(1, rows.len())
+        };
+        let mut footprint = Self {
+            post_pass1: true,
+            ..Self::default()
+        };
+        if !matches!(options.profile, MemoryProfile::Speed) {
+            footprint.add(
+                &options.spill_dir.clone().unwrap_or_else(std::env::temp_dir),
+                "pass-2 spill",
+                bytes(&level_rows[..buffered_levels]),
+            );
+        }
+        footprint.add(
+            overview
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+            "intermediate overview",
+            bytes(level_rows),
+        );
+        log::info!(
+            "[disk] after pass 1 projected footprint: {}",
+            footprint
+                .components
+                .iter()
+                .map(|c| format!(
+                    "{} {:.3} GiB in {}",
+                    c.name,
+                    c.bytes as f64 / (1u64 << 30) as f64,
+                    c.dir.display()
+                ))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        );
+        Ok(footprint)
+    }
+
     /// `tiles --layer-column` (#821): the split's uncompressed copy of the
     /// selected input, staged in `dir`.
     pub(super) fn add_staged_layers(
@@ -247,6 +307,12 @@ impl DiskFootprint {
                 .push(format!("{} in {}", component.name, component.dir.display()));
         }
         let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let phase = if self.post_pass1 { " after pass 1" } else { "" };
+        let recheck = if self.post_pass1 {
+            ""
+        } else {
+            " Any filter is applied during the read and the size is rechecked after pass 1."
+        };
         let warnings: Vec<_> =
             volumes
                 .into_values()
@@ -254,9 +320,9 @@ impl DiskFootprint {
                     let need = estimate.saturating_add(estimate / MARGIN_DENOM);
                     (available < need).then(|| {
                         format!(
-                "projected disk footprint may not fit: {} need approximately {:.1} GiB; \
+                "projected disk footprint{phase} may not fit: {} need at most approximately {:.1} GiB; \
                  their volume has {:.1} GiB free ({:.1} GiB short, including a 5% margin). \
-                 Point {} (or {}) at a roomier volume, or free up space first.",
+                 Point {} (or {}) at a roomier volume, or free up space first.{recheck}",
                 parts.join(" + "), gib(estimate), gib(available), gib(need - available),
                 remedies.spill_dir, remedies.keep_overview)
                     })
@@ -296,6 +362,69 @@ mod tests {
         spill_dir: "--spill-dir",
         keep_overview: "--keep-overview",
     };
+
+    #[test]
+    fn post_pass1_uses_kept_level_rows_and_still_warns_on_a_small_volume() {
+        use super::super::convert::LevelPlan;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        let geoms = vec![Some(geo::Geometry::Point(geo::Point::new(1.0, 2.0))); 10_000];
+        super::super::testutil::write_input(&input, &geoms, false, None);
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        let output = dir.path().join("out.parquet");
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 9,
+            },
+            spill_dir: Some(dir.path().join("scratch")),
+            filter: Some("id < 100".into()),
+            ..ConvertOptions::default()
+        };
+        let before = DiskFootprint::conversion(&source, None, &options, Some(&output)).unwrap();
+        // 1,000 emitted rows over ten levels, rather than 10,000 input rows
+        // copied to every level. The finest level streams without spilling.
+        let rows = [100; 10];
+        let row_bytes = 1_600;
+        let after =
+            DiskFootprint::post_pass1(&source, None, &options, &output, &rows, 9, row_bytes)
+                .unwrap();
+        let framing = RawSinkSize::from_source(&source, None, &options)
+            .unwrap()
+            .framing;
+        assert_eq!(after.spill_bytes(), 900 * row_bytes + 9 * framing);
+        let intermediate = after
+            .components
+            .iter()
+            .find(|c| c.name == "intermediate overview")
+            .unwrap();
+        assert_eq!(intermediate.bytes, 1_000 * row_bytes + 10 * framing);
+        assert_eq!(intermediate.dir, dir.path());
+        assert_eq!(
+            after.components[0].dir,
+            options.spill_dir.as_ref().unwrap().as_path()
+        );
+        assert!(after.spill_bytes() * 4 < before.spill_bytes());
+        assert!(after
+            .warning_with(REMEDIES, |_| Some(("one".into(), u64::MAX)))
+            .is_none());
+        let warning = after
+            .warning_with(REMEDIES, |_| Some(("one".into(), 1)))
+            .unwrap();
+        assert!(warning.contains("after pass 1"), "{warning}");
+        assert!(!warning.contains("is rechecked after pass 1"), "{warning}");
+        let speed = ConvertOptions {
+            profile: MemoryProfile::Speed,
+            ..options
+        };
+        assert_eq!(
+            DiskFootprint::post_pass1(&source, None, &speed, &output, &rows, 9, row_bytes,)
+                .unwrap()
+                .spill_bytes(),
+            0
+        );
+    }
 
     #[test]
     fn projected_geometry_uses_the_exposed_schema_index() {
@@ -413,10 +542,15 @@ mod tests {
             .unwrap();
         assert!(
             warning.contains(
-                "need approximately 10.0 GiB; their volume has 4.0 GiB free (6.5 GiB short"
+                "need at most approximately 10.0 GiB; their volume has 4.0 GiB free (6.5 GiB short"
             ),
             "{warning}"
         );
+        assert!(
+            warning.contains("filter is applied during the read"),
+            "{warning}"
+        );
+        assert!(warning.contains("is rechecked after pass 1"), "{warning}");
     }
 
     #[test]

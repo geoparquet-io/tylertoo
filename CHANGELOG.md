@@ -104,6 +104,9 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Conversion rechecks disk space after pass 1 using kept per-level row counts,
+  including attribute filtering. The pre-read warning labels its estimate as
+  an upper bound; the log reports the revised component sizes in GiB (#872).
 - An `https://` input keeps its query string, so presigned S3 and Azure SAS
   URLs work; the query is shown as `?<redacted>` in logs, errors, reports
   and saved plans (#820).
