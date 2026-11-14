@@ -109,9 +109,10 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pass 2 using kept per-level rows, including attribute filtering, the input's
   compression ratio with a 2x margin for the intermediate, and the profile's
   spill codec price. Framing stays raw. Python's up-front `UserWarning`
-  covers only staged input and staged layers; intermediate and spill shortages
-  are warnings through the `tylertoo_core` logger after pass 1 and when pass 2
-  measures the selected properties. Recheck remedies name both CLI flags and
+  covers staged input and staged layers; intermediate and spill shortages are
+  logged after pass 1 and when pass 2 measures the selected properties, appear
+  as `disk_shortage` report diagnostics, and `convert()` raises each as a
+  `UserWarning` once the run succeeds. Recheck remedies name both CLI flags and
   Python keywords (#872).
 - An `https://` input keeps its query string, so presigned S3 and Azure SAS
   URLs work; the query is shown as `?<redacted>` in logs, errors, reports

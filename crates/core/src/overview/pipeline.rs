@@ -847,6 +847,7 @@ struct SinkAutoTuner {
     /// A downgrade is still possible: `auto`, and the sinks are still Ram.
     armed: bool,
     downgraded: bool,
+    /// `disk_bytes` stops counting once this is set; read the price before.
     disk_checked: bool,
 }
 
