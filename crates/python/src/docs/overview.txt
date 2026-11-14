@@ -130,9 +130,10 @@ Args:
         `"speed"` holds everything in RAM, `"bounded"` uses disk and
         holds the least, and `"auto"` sizes to the machine's memory.
         Wheels use mimalloc. Under `"bounded"`, it purges freed pages
-        immediately to reduce peak memory at a speed cost. This setting
-        persists for the Python process; `"auto"` and `"speed"` leave it
-        unchanged. A non-musl source build uses the system allocator with
+        immediately to reduce peak memory at a speed cost. The setting
+        applies for the duration of each `"bounded"` call and is then
+        restored; overlapping calls on other threads share it while any
+        `"bounded"` call runs. A non-musl source build uses the system allocator with
         `maturin build --no-default-features` (musl always uses mimalloc).
     in_flight_batches: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),
         or `0` to size from the CPU count.
