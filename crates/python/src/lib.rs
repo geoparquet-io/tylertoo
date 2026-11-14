@@ -319,7 +319,7 @@ fn convert(
 
     values.extend(keywords(Some(&positional))?);
     let options = tiles_config(values)?;
-    tylertoo_cli::apply_memory_profile_allocator(options.convert.profile);
+    let _allocator = tylertoo_cli::apply_memory_profile_allocator(options.convert.profile);
     enter(py);
     // #709/#779: core's whole preflight, before anything is read; the
     // facade runs it again, then resolves `max_zoom="auto"` over the source
@@ -403,7 +403,7 @@ fn overview(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     let options = overview_config(keywords(kwargs)?)?;
-    tylertoo_cli::apply_memory_profile_allocator(options.profile);
+    let _allocator = tylertoo_cli::apply_memory_profile_allocator(options.profile);
     enter(py);
     // #779: every rule that needs no input, before anything is read.
     options.validate().map_err(convert_error_to_py)?;
@@ -456,7 +456,7 @@ fn export_pmtiles(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     let options = export_config(keywords(kwargs)?)?;
-    tylertoo_cli::apply_memory_profile_allocator(options.profile);
+    let _allocator = tylertoo_cli::apply_memory_profile_allocator(options.profile);
     enter(py);
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
@@ -562,7 +562,7 @@ fn pyramid(
     // Spec grammar, band-set rules and the input-exists check are core's,
     // shared with the CLI's `--band` (#445).
     let options = pyramid_config(keywords(kwargs)?)?;
-    tylertoo_cli::apply_memory_profile_allocator(options.export.profile);
+    let _allocator = tylertoo_cli::apply_memory_profile_allocator(options.export.profile);
     enter(py);
     options.validate().map_err(pyramid_error_to_py)?;
     let bands = parse_bands(&bands).map_err(config_err)?;

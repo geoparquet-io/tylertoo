@@ -2171,8 +2171,10 @@ cost. The measured changes from the previous `bounded` behavior are:
 | Moldova z12 | 2.0 → 1.6 GiB | 4.3 → 5.8 s |
 | Bbox cell | 1.9 → 1.4 GiB | 5.7 → 6.7 s |
 
-`auto` and `speed` leave the allocator setting unchanged. In Python, the
-setting persists for the process after a `bounded` call. On non-musl targets,
+The setting applies for the duration of each `bounded` call and is then
+restored, so a later `auto` call in the same Python process is not slowed.
+Overlapping calls on other threads share it while any `bounded` call runs.
+On non-musl targets,
 a build with `--no-default-features` uses the system allocator; musl always
 uses mimalloc.
 

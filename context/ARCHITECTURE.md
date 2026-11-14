@@ -120,8 +120,9 @@ uses the system allocator), and on musl unconditionally; `dhat-heap` excludes
 it. Under `bounded`, both frontends set mimalloc's purge delay to 0 before
 work starts (#851), purging freed pages immediately at a speed cost. The
 shared setting function lives in `tylertoo-cli`, where Python can call it;
-core does not configure the allocator. `auto` and `speed` leave the setting
-unchanged, so in Python it persists for the process after a `bounded` call.
+core does not configure the allocator. A guard holds the setting for the
+duration of each `bounded` call and restores it when the last live `bounded`
+call ends; overlapping calls on other threads share it meanwhile.
 Overture segments z0–14 peak RSS fell from 3.5 to 2.8 GiB while wall time
 rose from 41 to 49 s; Moldova z12 fell from 2.0 to 1.6 GiB while wall time
 rose from 4.3 to 5.8 s.

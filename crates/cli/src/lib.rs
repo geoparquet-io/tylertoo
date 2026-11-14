@@ -23,7 +23,7 @@ use tylertoo_core::MemoryProfile;
 use tylertoo_core::TilesetMetadata as TilesetMetadataArgs;
 
 mod allocator;
-pub use allocator::apply_memory_profile_allocator;
+pub use allocator::{apply_memory_profile_allocator, AllocatorGuard};
 
 /// `-q/--quiet` (#452), set once in [`run`] before dispatch.
 #[expect(
@@ -417,9 +417,7 @@ where
         Err(e) => return clap_exit(&e),
     };
 
-    if let Some(profile) = command_profile(&cli.command) {
-        apply_memory_profile_allocator(profile);
-    }
+    let _allocator = command_profile(&cli.command).map(apply_memory_profile_allocator);
     // Set the allocator policy before starting workers or pipeline work.
     let _ = tylertoo_core::internal::overview::convert::init_worker_pool();
 
