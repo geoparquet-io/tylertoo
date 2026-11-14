@@ -385,11 +385,11 @@ The measurements showed the following:
   29.3 MB at factor 0.25, 33.5 MB at factor 0. Table:
   `docs/OVERVIEW_TUNING.md` § Coverage and simplification; commands in
   `benchmarks/coalesce/RESULTS.md`.
-- `--polygon-visibility 0` with placeholder squares has a bug (#749):
-  under the cascade, squares survived every coarse level, so small
-  features appeared as very large squares at low zooms. It is fixed except
-  for polygons a cascade repair splits into parts. The `C2` recipe was
-  dropped from the docs for that reason and because `--simplify-factor`
+- `--polygon-visibility 0` once kept placeholder squares alive at every
+  coarse cascade level (#749), drawing small features as very large
+  squares. The cascade now dithers on canonical polygon parts, including
+  parts a repair splits or an earlier level drops. The `C2` recipe was
+  dropped from the docs because of that bug and because `--simplify-factor`
   closes more of the gap at a lower cost.
 
 - Polygon thinning: a thinning cell keeps one polygon by bbox center, so on

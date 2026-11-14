@@ -1678,12 +1678,25 @@ so a placeholder never feeds the next zoom's reduction. The remaining
 divergence is the per-feature hash in place of tippecanoe's serial
 accumulator (#279, `dither_u01`).
 
-Still open under #749: a cascade repair can split a source Polygon into a
-MultiPolygon, and the MultiPolygon arm looks up source parts by position,
-so the parts of a split Polygon are dithered on themselves and their
-squares survive as before. On `ftw-moldova-z10` with
-`--polygon-visibility 0` that keeps 22 rows at z0 against 1 with
-`--no-cascade` (the Moldova `pv0` decay exemption). The same lookup pairs
-parts wrongly for a source MultiPolygon after a finer level dropped one of
-its parts. Fixing either changes default output, so it is left to its own
-change.
+Cascade repairs can split one source Polygon into several working parts.
+Collapsed repair fragments are dropped; if none survive, the original
+Polygon is dithered once. Thus `ftw-moldova-z10 --polygon-visibility 0`
+keeps 1 row at z0, matching `--no-cascade`, instead of keeping 22 squares
+alive. Its rows match the source run at every zoom from z0 through z14.
+
+For a source MultiPolygon, the fold carries each working part's canonical
+part index. Dropping a part removes its index; repair fragments inherit the
+same index and are treated together when they collapse. A surviving part
+therefore uses its own source area and anchor even after an earlier part
+has disappeared. This follows tippecanoe 2.79.0's `clip.cpp::reduce_tiny_poly`
+outer-ring reduction, rather than dithering on the whole MultiPolygon.
+The deterministic hash and placeholder sizing divergences documented above
+still apply.
+
+The Moldova archive-level `decay` exemption remains because its aggregate
+square-shape check still fails: z8 has 72 square ids and z5 has 44; even
+`--no-cascade` fails with 76 and 45. Neither run has a common square id
+between those zooms. This check counts newly square-shaped features as well
+as surviving placeholders, so matching the source run does not make that
+aggregate invariant pass. The exemption's reason records this separately
+from the repaired cascade defects; the verifier is unchanged here.

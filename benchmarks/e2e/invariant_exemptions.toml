@@ -37,7 +37,7 @@ settings = "pv0"
 zoom = "*"
 invariant = "decay"
 issue = 749
-reason = "squares of polygons a cascade repair split into MultiPolygons dither on their own parts, not the source: z8 has 71 distinct squares and z5 has 44 (more than half); #749 remains for split polygons"
+reason = "canonical-part decay is fixed; the aggregate square-shape check still fails: cascade z8 72 -> z5 44, --no-cascade 76 -> 45, with zero common square ids between z8 and z5 in either run; retain until the archive invariant is resolved"
 
 [[exemption]]
 fixture = "ftw-moldova-z10"
