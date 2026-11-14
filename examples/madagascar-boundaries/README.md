@@ -214,20 +214,20 @@ Exporting madagascar-ov.parquet → madagascar.pmtiles
 ✓ 751 tiles, 157767 features, 1 oversized tiles in 1.49s
 ...
  z  tiles      total     mean      p50      p99      max
- 1      1     70,749   70,749   70,749   70,749   70,749
+ 1      1     69,972   69,972   69,972   69,972   69,972
 ...
-10    524  3,849,628    7,346    5,860   26,963   85,177
+10    524  3,799,853    7,251    5,819   26,534   84,168
 
 Largest 10 tile(s):
 z   x   y    bytes
-4  10   8  422,862
+4  10   8  402,253
 ...
 ```
 
 Polygons crossing tile edges appear in every tile they touch, so tile
 features outnumber overview features. Clipped slivers that vanish on the
 tile's 4096-unit grid are omitted and counted as "collapsed at extent".
-The largest tile is 422,862 bytes (about 423 KB) compressed, at z4 (4/10/8).
+The largest tile is 402,253 bytes (about 402 KB) compressed, at z4 (4/10/8).
 One tile, at z5, went over the default limit of 500 KB compressed (and 2 MB
 before compression). The size valve merged its densest polygons into
 neighbors until it fit; the export counts this tile as "oversized".
