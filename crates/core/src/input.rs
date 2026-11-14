@@ -988,8 +988,7 @@ pub(crate) mod remote {
     use bytes::Bytes;
     use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential};
     use object_store::client::{
-        HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse,
-        HttpService, ReqwestConnector,
+        HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpService,
     };
     use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
     use object_store::http::HttpBuilder;
@@ -1246,6 +1245,124 @@ pub(crate) mod remote {
         query: String,
     }
 
+    /// Warn, once per key, that a `TYLERTOO_HTTP_*` override does not reach the
+    /// signed client; returns whether this call warned.
+    pub(super) fn warn_unsupported_once(key: ClientConfigKey) -> bool {
+        static WARNED: Mutex<Vec<ClientConfigKey>> = Mutex::new(Vec::new());
+        let mut warned = WARNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if warned.contains(&key) {
+            return false;
+        }
+        warned.push(key);
+        drop(warned);
+        log::warn!(
+            "[remote] TYLERTOO_HTTP_{} is unsupported for signed HTTP inputs; ignoring it",
+            key.as_ref().to_ascii_uppercase()
+        );
+        true
+    }
+
+    /// Mirror the reachable `ClientOptions` settings: `object_store`'s client
+    /// builder is private and its redirect policy leaks signed queries (#843).
+    fn signed_client(options: &ClientOptions) -> object_store::Result<HttpClient> {
+        use ClientConfigKey::*;
+
+        let build = || -> Result<reqwest::Client, Box<dyn std::error::Error + Send + Sync>> {
+            let mut builder = reqwest::Client::builder()
+                .referer(false)
+                // Content-Length must describe the bytes we actually read.
+                .no_gzip()
+                .no_brotli()
+                .no_zstd()
+                .no_deflate()
+                .user_agent(concat!(
+                    env!("CARGO_PKG_NAME"),
+                    "/",
+                    env!("CARGO_PKG_VERSION")
+                ));
+            if let Some(headers) = options.get_default_headers() {
+                builder = builder.default_headers(headers.clone());
+            }
+            let value = |key| options.get_config_value(&key);
+            if let Some(url) = value(ProxyUrl) {
+                let mut proxy = reqwest::Proxy::all(url)?;
+                if let Some(pem) = value(ProxyCaCertificate) {
+                    builder = builder.tls_certs_merge(std::iter::once(
+                        reqwest::tls::Certificate::from_pem(pem.as_bytes())?,
+                    ));
+                }
+                if let Some(excludes) = value(ProxyExcludes) {
+                    proxy = proxy.no_proxy(reqwest::NoProxy::from_string(&excludes));
+                }
+                builder = builder.proxy(proxy);
+            }
+            // Defaults with transport effects, plus every user override. No
+            // custom root certificates are set by this path, and object_store's default
+            // DNS address shuffling is not reproduced (#843 review: low value here).
+            let mut keys = vec![
+                AllowHttp,
+                NoSystemCertificates,
+                Timeout,
+                ConnectTimeout,
+                Http1Only,
+                Http2Only,
+                UserAgent,
+            ];
+            keys.extend(effective_client_overrides().iter().map(|(key, _)| *key));
+            keys.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+            keys.dedup();
+            for key in keys {
+                let Some(value) = value(key) else { continue };
+                // Match object_store's boolean syntax (values have already
+                // been validated by client_overrides).
+                let enabled = matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes" | "y"
+                );
+                builder = match key {
+                    AllowHttp => builder.https_only(!enabled),
+                    NoSystemCertificates if enabled => builder.tls_certs_only(std::iter::empty()),
+                    NoSystemCertificates => builder,
+                    UserAgent => builder.user_agent(value),
+                    Timeout => builder.timeout(humantime::parse_duration(&value)?),
+                    ConnectTimeout => builder.connect_timeout(humantime::parse_duration(&value)?),
+                    ReadTimeout => builder.read_timeout(humantime::parse_duration(&value)?),
+                    PoolIdleTimeout => {
+                        builder.pool_idle_timeout(humantime::parse_duration(&value)?)
+                    }
+                    PoolMaxIdlePerHost => builder.pool_max_idle_per_host(value.parse()?),
+                    Http2KeepAliveInterval => {
+                        builder.http2_keep_alive_interval(humantime::parse_duration(&value)?)
+                    }
+                    Http2KeepAliveTimeout => {
+                        builder.http2_keep_alive_timeout(humantime::parse_duration(&value)?)
+                    }
+                    Http2KeepAliveWhileIdle => builder.http2_keep_alive_while_idle(enabled),
+                    Http2MaxFrameSize => builder.http2_max_frame_size(Some(value.parse()?)),
+                    Http1Only if enabled => builder.http1_only(),
+                    Http2Only if enabled => builder.http2_prior_knowledge(),
+                    Http1Only | Http2Only => builder,
+                    // Applied together above, as in ClientOptions::client.
+                    ProxyUrl | ProxyCaCertificate | ProxyExcludes => builder,
+                    // Signed inputs always verify certificates, so
+                    // AllowInvalidCertificates is ignored like any other unmapped key.
+                    _ => {
+                        warn_unsupported_once(key);
+                        builder
+                    }
+                };
+            }
+            Ok(builder.build()?)
+        };
+        let client = build().map_err(|source| object_store::Error::Generic {
+            store: "HTTP",
+            source,
+        })?;
+        Ok(HttpClient::new(client))
+    }
+
     #[expect(
         clippy::disallowed_types,
         reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
@@ -1269,7 +1386,7 @@ pub(crate) mod remote {
             {
                 Some((_, client)) => client.clone(),
                 None => {
-                    let client = ReqwestConnector::default().connect(options)?;
+                    let client = signed_client(options)?;
                     #[cfg(test)]
                     CLIENTS_BUILT
                         .lock()
@@ -5258,6 +5375,134 @@ mod tests {
             w.write(&batch).unwrap();
             w.close().unwrap();
             buf
+        }
+
+        /// #843: a signed input never skips certificate checks; the key is
+        /// reported as unsupported (once) like any unmapped override.
+        #[test]
+        fn signed_client_reports_allow_invalid_certificates_unsupported() {
+            let key = object_store::ClientConfigKey::AllowInvalidCertificates;
+            assert!(remote::warn_unsupported_once(key));
+            assert!(!remote::warn_unsupported_once(key));
+        }
+
+        #[test]
+        fn signed_http_redirect_does_not_leak_query_in_referer() {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpListener;
+
+            // Different host names exercise a cross-host redirect, with both
+            // servers bound before the client starts. Close each connection
+            // so the tiny servers need not implement keep-alive.
+            let target = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+            let location = format!(
+                "http://localhost:{}/x.parquet",
+                target.local_addr().unwrap().port()
+            );
+            let url = format!(
+                "http://{}/x.parquet?X-Amz-Signature=SIG843SECRET",
+                origin.local_addr().unwrap()
+            );
+            let (target_addr, origin_addr) =
+                (target.local_addr().unwrap(), origin.local_addr().unwrap());
+            #[expect(
+                clippy::disallowed_types,
+                reason = "#779: test shutdown flag for local servers; not diagnostic state"
+            )]
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let body = tiny_parquet();
+            let target_stop = Arc::clone(&stop);
+            let target_thread = std::thread::spawn(move || {
+                for stream in target.incoming() {
+                    let mut stream = stream.unwrap();
+                    if target_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request = String::new();
+                    reader.read_line(&mut request).unwrap();
+                    let mut referers = Vec::new();
+                    let mut range = None;
+                    loop {
+                        let mut header = String::new();
+                        if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                            break;
+                        }
+                        let (name, value) = header.split_once(':').unwrap();
+                        if name.eq_ignore_ascii_case("referer") {
+                            referers.push(value.trim().to_string());
+                        }
+                        if name.eq_ignore_ascii_case("range") {
+                            let (start, end) = value
+                                .trim()
+                                .strip_prefix("bytes=")
+                                .unwrap()
+                                .split_once('-')
+                                .unwrap();
+                            let size = body.len();
+                            range = Some(if start.is_empty() {
+                                (size.saturating_sub(end.parse().unwrap()), size - 1)
+                            } else {
+                                (
+                                    start.parse().unwrap(),
+                                    end.parse().unwrap_or(size - 1).min(size - 1),
+                                )
+                            });
+                        }
+                    }
+                    tx.send(referers).unwrap();
+                    let (status, extra, bytes) = match range {
+                        Some((start, end)) => (
+                            "206 Partial Content",
+                            format!("Content-Range: bytes {start}-{end}/{}\r\n", body.len()),
+                            &body[start..=end],
+                        ),
+                        None => ("200 OK", String::new(), body.as_slice()),
+                    };
+                    write!(stream, "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+                    if !request.starts_with("HEAD ") {
+                        stream.write_all(bytes).unwrap();
+                    }
+                }
+            });
+            let origin_stop = Arc::clone(&stop);
+            let origin_thread = std::thread::spawn(move || {
+                for stream in origin.incoming() {
+                    let mut stream = stream.unwrap();
+                    if origin_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    write!(stream, "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+            });
+
+            let source = InputSource::from_str_input(&url).unwrap();
+            let reader = source.open().unwrap().build().unwrap();
+            assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), 3);
+            let requests: Vec<Vec<String>> = rx.try_iter().collect();
+            // Stop both servers: set the flag, wake each blocked accept, join.
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::net::TcpStream::connect(target_addr).unwrap();
+            std::net::TcpStream::connect(origin_addr).unwrap();
+            target_thread.join().unwrap();
+            origin_thread.join().unwrap();
+            assert!(!requests.is_empty(), "redirect target received no requests");
+            assert!(
+                requests
+                    .iter()
+                    .flatten()
+                    .all(|r| !r.contains("SIG843SECRET")),
+                "redirect leaked the signed query in Referer: {requests:?}"
+            );
         }
 
         #[test]
