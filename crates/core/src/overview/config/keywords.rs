@@ -248,6 +248,14 @@ pub fn export(
     base: ExportOptions,
 ) -> Result<ExportOptions, ConfigError> {
     let base = super::Preset::export(take(&mut values, "preset")?, base);
+    // `None` is the command's own default (lines only, none under verbatim),
+    // as `auto` is for a cap.
+    if values
+        .get("max_zoom_simplify_factor")
+        .is_some_and(Value::is_null)
+    {
+        values.remove("max_zoom_simplify_factor");
+    }
     for (key, default) in [
         ("tile_size_limit", base.tile_size_limit),
         ("max_compressed_tile_size", base.compressed_tile_size_limit),
@@ -540,8 +548,8 @@ pub fn pyramid(
 pub struct ConvertSyntax {
     /// Start from another tool's defaults instead of tylertoo's; options you
     /// pass still override them. `tippecanoe` sets its drop rate, gamma and
-    /// simplification, and with `tiles` its tile buffer, size caps and size
-    /// valve:
+    /// simplification, and with `tiles` its tile buffer, size caps, size
+    /// valve and max-zoom simplification:
     /// <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>.
     #[cfg_attr(
         feature = "cli",

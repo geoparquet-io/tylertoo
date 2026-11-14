@@ -190,7 +190,7 @@ export_pmtiles(
     output: str,
     *,
     layer_name: str = "overview",
-    tile_buffer: int = 8,
+    tile_buffer: int = 5,
     preset: Literal['tippecanoe'] | None = None,
     extent: int = 4096,
     tile_size_limit: int | Literal['auto'] | None = "auto",
@@ -226,8 +226,8 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `input`: Overview file from `overview()`.
 * `output`: PMTiles archive to write.
 * `layer_name`: MVT layer name.
-* `tile_buffer`: Tile edge buffer in pixels, at most 256.
-* `preset`: `"tippecanoe"` starts from tippecanoe's tile buffer, size limits and size valve instead of tylertoo's; an option you pass still applies. See [the tippecanoe preset](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset).
+* `tile_buffer`: Tile edge buffer in pixels, default 5, from 0 to 256.
+* `preset`: `"tippecanoe"` starts from tippecanoe's tile buffer, max-zoom simplification, size limits and size valve instead of tylertoo's; an option you pass still applies. See [the tippecanoe preset](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset).
 * `extent`: Tile resolution in MVT units.
 * `tile_size_limit`: Maximum raw (uncompressed) tile size in bytes, a backstop behind `max_compressed_tile_size`; `"auto"` is 2 MiB, and `0` or `None` is no limit.
 * `simple_clip_fastpath`: Use faster clipping for simple polygons. `False` gives byte-stable output.
@@ -245,7 +245,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.
 * `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and `0` or `None` is no limit.
-* `max_zoom_simplify_factor`: Simplify each feature of the finest (canonical) level once, before clipping, with tolerance factor × GSD at that level's zoom, like `simplify_factor` for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Defaults to None (off). Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Comparable to tippecanoe's `-S`, which uses tile units at every zoom: `-S 10` is about factor 2.5.
+* `max_zoom_simplify_factor`: Simplify each feature of the finest (canonical) level once, before clipping, with tolerance factor × GSD at that level's zoom, like `simplify_factor` for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Only vertices are removed: features, individual MultiLineString or MultiPolygon parts, and polygon rings (including holes) that would collapse or be dropped under the tolerance keep their original geometry. Defaults to `None`: lines use factor 0.25 and polygons are not simplified. An explicit factor applies to both; `0` disables it. Explicit `None` selects the command's default, like `"auto"` for size caps: no max-zoom simplification under verbatim or for pyramid bands, and 0.25 for both kinds under the tippecanoe preset. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Comparable to tippecanoe's `-S`, which uses tile units at every zoom: `-S 10` is about factor 2.5.
 * `coverage_fill`: Experimental: under each tile's features, draw the area its child tiles cover, so a polygon coverage shows no holes at coarse zooms. Holds the finest level's geometry in memory. See `docs/OVERVIEW_TUNING.md`.
 * `variable_depth`: End each branch of the tile pyramid at the coarsest zoom whose tile holds all of that area's finest-level features within both size caps, like tippecanoe's `--generate-variable-depth-tile-pyramid`. The server must serve the nearest ancestor for a missing tile. See `docs/OVERVIEW_TUNING.md`.
 * `tile_range`: Export only the tiles in this tile-id range, `"LO..HI"`: one shard of a sharded build.
@@ -300,7 +300,7 @@ pyramid(
     coverage_fill: bool = False,
     max_zoom_simplify_factor: float | None = None,
     simple_clip_fastpath: bool = True,
-    tile_buffer: int = 8,
+    tile_buffer: int = 5,
     extent: int = 4096,
     partition_wave: int = 0,
     feature_id: str | None = None,
@@ -334,7 +334,7 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes for bands tiled here; `"auto"`, `0` and `None` are no limit.
 * `size_valve`: See `export_pmtiles()`.
 * `coverage_fill`: See `export_pmtiles()`.
-* `max_zoom_simplify_factor`: See `export_pmtiles()`.
+* `max_zoom_simplify_factor`: See `export_pmtiles()`. Bands default to `0`: nothing is simplified at the max zoom. `None` selects this default; an explicit factor applies to lines and polygons.
 * `simple_clip_fastpath`: See `export_pmtiles()`.
 * `tile_buffer`: See `export_pmtiles()`.
 * `extent`: See `export_pmtiles()`.
@@ -564,7 +564,7 @@ convert(
     name: str | None = None,
     description: str | None = None,
     attribution: str | None = None,
-    tile_buffer: int = 8,
+    tile_buffer: int = 5,
     extent: int = 4096,
     partition_wave: int = 0,
     feature_id: str | None = None,

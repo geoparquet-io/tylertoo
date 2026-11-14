@@ -530,3 +530,58 @@ polygons remain exempt unless you set `--drop-lines` or `--drop-polygons`.
 `--preset tippecanoe` still sets 2.5 explicitly, now matching the default
 for this row; it still changes gamma to 1, simplify factor, buffer, caps,
 and the size valve.
+
+## Decision 12: tile buffer 5 and line-only max-zoom simplification at 0.25
+
+The default export buffer is now 5 tile pixels, matching tippecanoe's
+`-b 5`, instead of 8. The automatic max-zoom simplification default is
+0.25 × GSD for lines, about one tile unit at extent 4096 with the default
+GSD base, matching tippecanoe's `-S 1`. Polygons stay unsimplified at the
+max zoom because simplifying each polygon on its own separates shared
+borders (#802).
+
+Measured on main at `95cbd607`: z12–z14 hold 73–91% of every archive's
+bytes, and z14 alone holds 28–64%. Reducing the buffer from 8 to 5 gave:
+
+| Input | Archive reduction |
+|---|---|
+| 882k points | 4.3% |
+| 302k-feature Portland roads | 4.8% |
+| 476k-feature Guatemala roads | 4.1% |
+| 632k Moldova fields | 4.7% |
+| 794k Auckland parcels | 3.4% |
+| Madagascar admin | 1.7% |
+
+Nothing inside the tile changes. Distinct features per zoom stay the same,
+except where the smaller buffer avoids a size-valve drop. Wall time and
+peak RSS are unchanged.
+
+Max-zoom simplification at 0.25 on lines gave:
+
+| Input | Archive reduction | z14 vertex reduction |
+|---|---|---|
+| Portland roads | 6.7% | 31% |
+| Guatemala roads | 2.6% | 14% |
+
+Worst displacement at z14 was 0.12 px, compared with 0.04 px without
+max-zoom simplification. Previously, these inputs had 1.20–1.49×
+tippecanoe's z14 vertices; at 0.25 they have 1.03×. Both default changes
+together reduce Portland roads by 11.2% and Guatemala roads by 6.6%.
+
+Polygons at 0.25 saved 0% on Moldova, 0.7% on Madagascar, and 6.8% on
+Auckland. Auckland parcels gained sliver gaps covering 0.13% of tile area:
+sub-pixel at z14, but pinholes under overzoom. That tradeoff keeps polygons
+off by default; shared-border-aware simplification is issue #802.
+
+An explicit factor still applies to lines and polygons alike. Set it to `0`
+to disable max-zoom simplification. To restore the previous default output,
+use `--tile-buffer 8 --max-zoom-simplify-factor 0`, since the buffer default
+also changed from 8 to 5 tile pixels.
+Verbatim tiles and pyramid bands default to `0`; an explicit factor still
+applies on top. The tippecanoe preset sets 0.25 for both kinds, because
+`-S 1` simplifies both at max zoom unless `-pS` /
+`--simplify-only-low-zooms` is set. Without `--detect-shared-borders`,
+tippecanoe also simplifies each polygon on its own. Python's explicit
+`None` selects the command's default, like `"auto"` for size caps.
+Variable-depth stop tiles carry the finest level's features, so they get
+the same simplification.

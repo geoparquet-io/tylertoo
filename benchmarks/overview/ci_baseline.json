@@ -83,10 +83,10 @@
       "total_vertices": 5483718
     },
     "export": {
-      "archive_bytes": 124224512,
-      "decoded_features_total": 596255,
-      "total_tile_features": 596255,
-      "total_tiles": 153053,
+      "archive_bytes": 122084043,
+      "decoded_features_total": 580949,
+      "total_tile_features": 580949,
+      "total_tiles": 152991,
       "zooms": [
         {
           "decoded_features": 410,
@@ -107,75 +107,75 @@
           "zoom": 2
         },
         {
-          "decoded_features": 13193,
+          "decoded_features": 12337,
           "tile_count": 2,
-          "tile_feature_count": 13193,
+          "tile_feature_count": 12337,
           "zoom": 3
         },
         {
-          "decoded_features": 16673,
+          "decoded_features": 15476,
           "tile_count": 4,
-          "tile_feature_count": 16673,
+          "tile_feature_count": 15476,
           "zoom": 4
         },
         {
-          "decoded_features": 15541,
+          "decoded_features": 14876,
           "tile_count": 4,
-          "tile_feature_count": 15541,
+          "tile_feature_count": 14876,
           "zoom": 5
         },
         {
-          "decoded_features": 18876,
-          "tile_count": 7,
-          "tile_feature_count": 18876,
+          "decoded_features": 18325,
+          "tile_count": 6,
+          "tile_feature_count": 18325,
           "zoom": 6
         },
         {
-          "decoded_features": 20732,
+          "decoded_features": 19791,
           "tile_count": 16,
-          "tile_feature_count": 20732,
+          "tile_feature_count": 19791,
           "zoom": 7
         },
         {
-          "decoded_features": 21191,
+          "decoded_features": 20350,
           "tile_count": 44,
-          "tile_feature_count": 21191,
+          "tile_feature_count": 20350,
           "zoom": 8
         },
         {
-          "decoded_features": 23270,
+          "decoded_features": 22210,
           "tile_count": 149,
-          "tile_feature_count": 23270,
+          "tile_feature_count": 22210,
           "zoom": 9
         },
         {
-          "decoded_features": 26830,
+          "decoded_features": 25838,
           "tile_count": 524,
-          "tile_feature_count": 26830,
+          "tile_feature_count": 25838,
           "zoom": 10
         },
         {
-          "decoded_features": 34896,
-          "tile_count": 1944,
-          "tile_feature_count": 34896,
+          "decoded_features": 33685,
+          "tile_count": 1942,
+          "tile_feature_count": 33685,
           "zoom": 11
         },
         {
-          "decoded_features": 53782,
-          "tile_count": 7441,
-          "tile_feature_count": 53782,
+          "decoded_features": 52276,
+          "tile_count": 7427,
+          "tile_feature_count": 52276,
           "zoom": 12
         },
         {
-          "decoded_features": 102222,
-          "tile_count": 28922,
-          "tile_feature_count": 102222,
+          "decoded_features": 100144,
+          "tile_count": 28908,
+          "tile_feature_count": 100144,
           "zoom": 13
         },
         {
-          "decoded_features": 242394,
-          "tile_count": 113993,
-          "tile_feature_count": 242394,
+          "decoded_features": 238986,
+          "tile_count": 113962,
+          "tile_feature_count": 238986,
           "zoom": 14
         }
       ]
@@ -240,10 +240,10 @@
       "total_vertices": 19838
     },
     "export": {
-      "archive_bytes": 145228,
-      "decoded_features_total": 6397,
-      "total_tile_features": 6397,
-      "total_tiles": 78,
+      "archive_bytes": 138509,
+      "decoded_features_total": 6059,
+      "total_tile_features": 6059,
+      "total_tiles": 74,
       "zooms": [
         {
           "decoded_features": 2,
@@ -258,51 +258,51 @@
           "zoom": 6
         },
         {
-          "decoded_features": 114,
+          "decoded_features": 101,
           "tile_count": 2,
-          "tile_feature_count": 114,
+          "tile_feature_count": 101,
           "zoom": 7
         },
         {
-          "decoded_features": 223,
+          "decoded_features": 219,
           "tile_count": 2,
-          "tile_feature_count": 223,
+          "tile_feature_count": 219,
           "zoom": 8
         },
         {
-          "decoded_features": 407,
+          "decoded_features": 394,
           "tile_count": 2,
-          "tile_feature_count": 407,
+          "tile_feature_count": 394,
           "zoom": 9
         },
         {
-          "decoded_features": 677,
+          "decoded_features": 671,
           "tile_count": 2,
-          "tile_feature_count": 677,
+          "tile_feature_count": 671,
           "zoom": 10
         },
         {
-          "decoded_features": 1228,
+          "decoded_features": 1125,
           "tile_count": 5,
-          "tile_feature_count": 1228,
+          "tile_feature_count": 1125,
           "zoom": 11
         },
         {
-          "decoded_features": 1199,
+          "decoded_features": 1132,
           "tile_count": 7,
-          "tile_feature_count": 1199,
+          "tile_feature_count": 1132,
           "zoom": 12
         },
         {
-          "decoded_features": 1207,
+          "decoded_features": 1151,
           "tile_count": 15,
-          "tile_feature_count": 1207,
+          "tile_feature_count": 1151,
           "zoom": 13
         },
         {
-          "decoded_features": 1320,
-          "tile_count": 41,
-          "tile_feature_count": 1320,
+          "decoded_features": 1244,
+          "tile_count": 37,
+          "tile_feature_count": 1244,
           "zoom": 14
         }
       ]
@@ -362,10 +362,10 @@
       "total_vertices": 20473
     },
     "export": {
-      "archive_bytes": 145268,
-      "decoded_features_total": 3941,
-      "total_tile_features": 3941,
-      "total_tiles": 87,
+      "archive_bytes": 141083,
+      "decoded_features_total": 3799,
+      "total_tile_features": 3799,
+      "total_tiles": 86,
       "zooms": [
         {
           "decoded_features": 1,
@@ -386,39 +386,39 @@
           "zoom": 8
         },
         {
-          "decoded_features": 93,
+          "decoded_features": 89,
           "tile_count": 2,
-          "tile_feature_count": 93,
+          "tile_feature_count": 89,
           "zoom": 9
         },
         {
-          "decoded_features": 269,
+          "decoded_features": 239,
           "tile_count": 2,
-          "tile_feature_count": 269,
+          "tile_feature_count": 239,
           "zoom": 10
         },
         {
-          "decoded_features": 555,
+          "decoded_features": 545,
           "tile_count": 2,
-          "tile_feature_count": 555,
+          "tile_feature_count": 545,
           "zoom": 11
         },
         {
-          "decoded_features": 843,
+          "decoded_features": 824,
           "tile_count": 6,
-          "tile_feature_count": 843,
+          "tile_feature_count": 824,
           "zoom": 12
         },
         {
-          "decoded_features": 1035,
+          "decoded_features": 1008,
           "tile_count": 20,
-          "tile_feature_count": 1035,
+          "tile_feature_count": 1008,
           "zoom": 13
         },
         {
-          "decoded_features": 1128,
-          "tile_count": 52,
-          "tile_feature_count": 1128,
+          "decoded_features": 1076,
+          "tile_count": 51,
+          "tile_feature_count": 1076,
           "zoom": 14
         }
       ]

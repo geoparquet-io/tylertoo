@@ -3678,7 +3678,10 @@ mod tests {
             build_pyramid(&bands, &out, &opts).unwrap();
             decoded_tiles(&out)
         };
-        let (plain, simplified) = (build(None, "plain.pmtiles"), build(Some(1.0), "s.pmtiles"));
+        let (plain, simplified) = (
+            build(Some(0.0), "plain.pmtiles"),
+            build(Some(1.0), "s.pmtiles"),
+        );
         assert_eq!(
             plain.keys().collect::<Vec<_>>(),
             simplified.keys().collect::<Vec<_>>()

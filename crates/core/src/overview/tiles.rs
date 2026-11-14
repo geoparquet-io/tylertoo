@@ -3086,8 +3086,8 @@ mod tests {
     }
 
     /// #822: the tippecanoe preset reaches the archive. A point 6.5 tile
-    /// pixels east of the z1 seam sits inside the western tile's default
-    /// 8 px buffer but outside tippecanoe's 5 px one.
+    /// pixels east of the z1 seam sits inside the western tile's 8 px buffer
+    /// but outside tippecanoe's 5 px one (now also the default).
     #[test]
     fn tippecanoe_preset_narrows_the_tile_buffer_in_the_archive() {
         let dir = tempfile::tempdir().unwrap();
@@ -3109,7 +3109,12 @@ mod tests {
             };
             report.export.total_tile_features
         };
-        assert_eq!(tiles_at_z1(serde_json::json!({})), 2, "default 8 px buffer");
+        assert_eq!(
+            tiles_at_z1(serde_json::json!({"tile_buffer": 8})),
+            2,
+            "8 px buffer"
+        );
+        assert_eq!(tiles_at_z1(serde_json::json!({})), 1, "default 5 px buffer");
         assert_eq!(
             tiles_at_z1(serde_json::json!({"preset": "tippecanoe"})),
             1,

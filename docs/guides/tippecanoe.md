@@ -75,12 +75,12 @@ attributing a count difference to one default.
 | `-L` one layer per input | `pyramid --band LO-HI:INPUT:LAYER …` with bands sharing a zoom range | Each band has its own ladder; tiles at shared zooms contain every layer |
 | per-feature `tippecanoe.layer` | `tiles --layer-column COLUMN` | One layer per value, `_unknown` for null or blank. Each layer has its own ladder, and the size caps apply per layer (#838) |
 | `-n` name / `-N` description / `-A` attribution | `--name` / `--description` / `--attribution` | An unset field is left out of the archive. tippecanoe names the tileset after the output file and copies the name into `description`. `merge` and `pyramid` keep every inherited credit; see [attribution](attribution.md) |
-| `-b` buffer (default 5) | `--tile-buffer` (default 8) | Tile-pixel seam buffer |
+| `-b` buffer (default 5) | `--tile-buffer` (default 5) | Tile-pixel seam buffer |
 | `-y` / `-x` / `-X` property selection | `--include-property` / `--exclude-property` / `--exclude-all-properties` | Applied during scans for `overview` / `tiles`, during export for `export-pmtiles`. In both tools, an include list overrides exclusions |
 | `-r` drop rate (default 2.5) | `--drop-rate` (default 2.5) | Both default ladders anchor at the finest zoom. tylertoo applies its budget as a ceiling after cell selection. Thins points only by default, as in tippecanoe |
 | `--drop-lines` / `--drop-polygons` | `--drop-lines` / `--drop-polygons` | Apply the drop rate to lines and polygons too |
 | gamma dot-dropping | `--drop-gamma` | Applied per super-cell; per-level totals stay unchanged |
-| `-S` simplification | `--simplify-factor` | Ramer-Douglas-Peucker (RDP), cascading by default. `-S N` is N tile units; `--simplify-factor N/4` is about the same at z0 to max zoom − 1. tylertoo does not simplify the max zoom; tippecanoe does |
+| `-S` simplification | `--simplify-factor` | Ramer-Douglas-Peucker (RDP), cascading by default. `-S N` is N tile units; `--simplify-factor N/4` is about the same at z0 to max zoom − 1. At the max zoom, tylertoo defaults to factor 0.25 for lines and no simplification for polygons; `--max-zoom-simplify-factor` overrides both. tippecanoe defaults to `-S 1` for both, unless `-pS` / `--simplify-only-low-zooms` is set |
 | `-pn` / `--no-simplification-of-shared-nodes` | none yet (#450) | Each polygon is simplified on its own, so thin slivers open along shared borders: on dense parcels about 2% of the area at z12 at the default factor. `--simplify-factor 0.25` reaches tippecanoe's coverage; `0` closes the slivers. On Madagascar admin-4 at z4–z8 residual missing coverage with `--coverage-fill` is 0.03–0.05%. See [coverage and simplification](../OVERVIEW_TUNING.md#coverage-and-simplification) |
 | tiny-polygon reduction | placeholder squares (the default; `--no-collapse` to drop) | Accumulates area per 32×GSD patch of the level, independent of tiles, with per-feature dithering for write-time collapses. The square is one pixel regardless of `--simplify-factor`. In dense blocks of sub-pixel polygons the squares overlap and leave gaps (#750) |
 | `-M` maximum tile bytes (default 500K) | `--max-compressed-tile-size` (default 500K), with `--max-tile-size` / `--tile-size-limit` (default 2M) | Both cap the gzip-compressed tile at 500K. tylertoo also caps the uncompressed MVT at 2M, which tippecanoe does not. 0 disables either |
@@ -96,8 +96,8 @@ attributing a count difference to one default.
 
 `--preset tippecanoe` (Python `preset="tippecanoe"`) replaces tylertoo's
 defaults with tippecanoe's wherever tylertoo has a matching option. Options
-you pass still win, so `--preset tippecanoe --tile-buffer 8` keeps an 8-pixel
-buffer.
+you pass still win, so `--preset tippecanoe --tile-buffer 8` explicitly
+overrides the 5-pixel default with an 8-pixel buffer.
 
 ```bash
 tylertoo tiles parcels.parquet parcels.pmtiles --preset tippecanoe
@@ -123,7 +123,8 @@ Values are from tippecanoe v2.82.0 (`main.cpp`, `tile.cpp`, `geometry.cpp`).
 | `--drop-rate` (convert) | 2.5 | 2.5 (matches default) | `-r`, `droprate = 2.5` |
 | `--drop-gamma` (convert) | 1.5 | 1 | `-g`, `gamma = 0` ("no effect"). tylertoo's 1 also thins every neighborhood by the same share. In both tools a tile the drop rate would empty keeps one feature |
 | `--simplify-factor` (convert) | 1 | 0.25 | `-S`, `simplification = 1`: one tile unit at detail 12 (4096). A tile unit is a quarter GSD at the default `--gsd-base 1024` |
-| `--tile-buffer` (export) | 8 | 5 | `-b`, `buffer = 5` screen pixels, 1/256 of a tile |
+| `--tile-buffer` (export) | 5 | 5 | `-b`, `buffer = 5` screen pixels, 1/256 of a tile |
+| `--max-zoom-simplify-factor` (export) | lines 0.25, polygons off | 0.25 for both | `-S 1` simplifies both at the max zoom; only `-pS` / `--simplify-only-low-zooms` turns that off |
 | `--max-compressed-tile-size` (export) | 500K (512,000 bytes) | 500,000 bytes | `-M`, `max_tile_size = 500000` |
 | `--max-tile-size` (export) | 2M | 0 (no cap) | tippecanoe does not cap the uncompressed tile. A variable-depth pyramid still ends no branch on a tile over 2M; that tile is drawn at the usual depth |
 | `--size-valve` (export) | `merge` | `drop` | See below |
@@ -154,8 +155,11 @@ Differences the preset does not remove:
 - **No default feature id (#443).** tippecanoe copies each GeoJSON
   feature's `id`. GeoParquet has no feature id, and a preset cannot name a
   column, so tiles carry an id only with `--feature-id COLUMN`.
-- **Simplification at the maximum zoom.** tippecanoe simplifies every zoom.
-  tylertoo does not simplify the maximum zoom.
+- **Simplification units and clipping.** By default, tylertoo simplifies
+  lines at the maximum zoom at factor 0.25 and leaves polygons unchanged;
+  the preset simplifies both. The remaining difference is where it happens:
+  tylertoo simplifies each feature once before clipping, in GSD units,
+  while tippecanoe simplifies each clipped tile geometry in tile units.
 - **Feature count cap.** tippecanoe also caps a tile at 200,000 features
   (`-O`). tylertoo has no feature count cap.
 - **Small inputs are not thinned.** The drop rate never cuts a zoom below

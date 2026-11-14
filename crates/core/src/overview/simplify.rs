@@ -1554,6 +1554,61 @@ fn simplify_polygon_impl_checked(
     (Simplified::Keep(Geometry::Polygon(poly.clone())), true)
 }
 
+/// The finest level's line simplification (#814): RDP, keeping the original
+/// line where [`simplify_for_level`] would drop it as under the tolerance or
+/// degenerate.
+pub(crate) fn simplify_line_vertices_only(ls: &LineString<f64>, tol: f64) -> LineString<f64> {
+    simplify_linestring_checked(ls, tol).map_or_else(|| ls.clone(), |(out, _)| out)
+}
+
+/// The finest level's simplification (#814, `--max-zoom-simplify-factor`):
+/// removes vertices and nothing else. A ring whose simplified form would
+/// collapse under the level gates (an exterior with too few points or under
+/// `tol²` of area, a hole under `tol` across) keeps its original ring, where
+/// [`simplify_for_level`] would drop it or collapse the polygon. A candidate
+/// still invalid after the epsilon retries (a ring crossing, a hole the
+/// simplified shell no longer holds) keeps the original polygon, where the
+/// cascade would repair it and could drop a lobe. Coarser levels keep
+/// [`simplify_for_level`]'s rules.
+pub(crate) fn simplify_polygon_vertices_only(
+    poly: &Polygon<f64>,
+    tol: f64,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Polygon<f64> {
+    let min_area = tol * tol;
+    let mut eps = tol;
+    for _ in 0..=INVALID_RETRY_HALVINGS {
+        let simplified = rdp_polygon(poly, eps);
+        let exterior = if simplified.exterior().0.len() < MIN_POLYGON_RING_POINTS
+            || Polygon::new(simplified.exterior().clone(), vec![]).unsigned_area() < min_area
+        {
+            poly.exterior().clone()
+        } else {
+            simplified.exterior().clone()
+        };
+        let interiors = simplified
+            .interiors()
+            .iter()
+            .zip(poly.interiors())
+            .map(|(ring, original)| {
+                if ring.0.len() < MIN_POLYGON_RING_POINTS || linestring_diag(ring) < tol {
+                    original.clone()
+                } else {
+                    ring.clone()
+                }
+            })
+            .collect();
+        let candidate = Polygon::new(exterior, interiors);
+        if polygon_unchanged(&candidate, poly) || capped_is_valid(&candidate, diagnostics) {
+            return candidate;
+        }
+        diagnostics.record(crate::diagnostics::Diagnostic::InvalidAfterSimplify { count: 1 });
+        eps *= 0.5;
+    }
+    diagnostics.record(crate::diagnostics::Diagnostic::FullResolutionFallback { count: 1 });
+    poly.clone()
+}
+
 /// Resolve an invalid RDP candidate's self-crossings into their valid
 /// even-odd interpretation, re-applying the level gates per repaired part
 /// (a bowtie lobe can fall below the visibility gate its parent passed).
@@ -1731,6 +1786,60 @@ mod tests {
     use super::*;
     use geo::Validation;
     use geo::{Coord, MultiPoint, Simplify};
+
+    /// #814: the max-zoom simplification only removes vertices. A hole in a
+    /// spike the tolerance would cut off keeps its ring, and the shell backs
+    /// off until it holds the hole again; a polygon under the tolerance keeps
+    /// its exterior instead of collapsing.
+    #[test]
+    fn vertices_only_never_drops_a_ring() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let mut shell: Vec<(f64, f64)> = (0..=10)
+            .map(|k| (f64::from(k), if k % 2 == 0 { 0.0 } else { 0.1 }))
+            .collect();
+        shell.extend([
+            (10.0, 10.0),
+            (4.4, 10.0),
+            (4.2, 10.4),
+            (4.0, 10.0),
+            (0.0, 10.0),
+            (0.0, 0.0),
+        ]);
+        let hole = LineString::from(vec![
+            (4.15, 10.05),
+            (4.25, 10.05),
+            (4.2, 10.2),
+            (4.15, 10.05),
+        ]);
+        let poly = Polygon::new(LineString::from(shell), vec![hole.clone()]);
+        assert!(poly.is_valid());
+        let out = simplify_polygon_vertices_only(&poly, 1.0, &diagnostics);
+        assert!(out.is_valid(), "{out:?}");
+        assert_eq!(out.interiors(), std::slice::from_ref(&hole));
+        assert!(out.exterior().0.len() < poly.exterior().0.len());
+        // The level rule drops that hole.
+        let level = simplify_polygon_impl(&poly, 1.0, CollapseMode::Drop, true);
+        assert!(
+            matches!(&level, Simplified::Keep(Geometry::Polygon(p)) if p.interiors().is_empty()),
+            "{level:?}"
+        );
+
+        let tiny = Polygon::new(
+            LineString::from(vec![
+                (0.0, 0.0),
+                (0.3, 0.0),
+                (0.3, 0.3),
+                (0.15, 0.31),
+                (0.0, 0.3),
+                (0.0, 0.0),
+            ]),
+            vec![],
+        );
+        assert_eq!(
+            simplify_polygon_vertices_only(&tiny, 1.0, &diagnostics),
+            tiny
+        );
+    }
 
     // ---- helpers -----------------------------------------------------------
 

@@ -2522,7 +2522,7 @@ mod tests {
         // A default typed explicitly is the same run as omitting it.
         let a = parse_plan_only(&[
             "--tile-buffer",
-            "8",
+            "5",
             "--partition-wave",
             "auto",
             "--feature-order",
