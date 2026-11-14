@@ -99,16 +99,15 @@ machine's memory, because no profile can make one tile smaller.
 
 The buffered drain can add encodes under `bounded` using released batch
 memory, limited by headroom below the prior RSS peak and the thread count.
-The release CLI uses mimalloc by default. It adds a fixed floor of about
-600 MiB on small inputs. Under `bounded`, Madagascar (z0-12) peaks at
-1,254 MiB against 685 MiB with the system allocator. Moldova peaks at 2,792
-against 2,509 MiB. mimalloc runs faster: Madagascar takes 1.4 s against 3.0 s.
-The floor comes from transparent huge pages on
-mimalloc's eagerly committed arenas and its 1 s delay before freed pages go
-back to the OS. `MIMALLOC_ALLOW_THP=0 MIMALLOC_PURGE_DELAY=10` in the
-environment removes it (Madagascar 566 MiB, Moldova 1,665 MiB) but gives back
-most of the speed (Madagascar 2.0 s, Moldova 12.4 s against 9.3 s). A build
-with `--no-default-features` uses the system allocator.
+The CLI and Python extension use mimalloc by default. Under `bounded`, they
+set its purge delay to zero before starting work, returning freed pages to the
+OS immediately at a throughput cost: on Overture segments (z0-14) peak RSS
+falls from 3.5 to 2.8 GiB and the run takes 49 s against 41 s, and Moldova
+(z12) falls from 2.0 to 1.6 GiB in 5.8 s against 4.3 s. `auto` and `speed` leave the allocator
+setting untouched. This setting is process-global: in Python it remains zero
+after a `bounded` call. Eagerly committed arenas and transparent huge pages
+can still add memory overhead. A build with `--no-default-features` uses the
+system allocator, except on musl targets, which always use mimalloc.
 
 tylertoo reads cgroup v2 `memory.max` and `memory.high` or the cgroup v1 limit,
 subtracting memory the cgroup cannot reclaim. Slurm, Docker, and Kubernetes

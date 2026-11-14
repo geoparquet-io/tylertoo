@@ -28,10 +28,10 @@ mlt = ["tylertoo-core/mlt"]
 # feature says. Only the extension's own
 # Rust allocations go through it: the interpreter's allocator is untouched,
 # and every Rust allocation is freed by Rust (data reaches Python as copies).
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "tylertoo/mimalloc"]
 # dhat owns the global allocator (installed in tylertoo-core), so mimalloc is
 # compiled out under it; rustc allows only one in the crate graph.
-dhat-heap = ["tylertoo-core/dhat-heap"]
+dhat-heap = ["tylertoo-core/dhat-heap", "tylertoo/dhat-heap"]
 
 [dependencies]
 tylertoo-core = { workspace = true, features = ["remote", "serve"] }
@@ -43,7 +43,8 @@ tylertoo-core = { workspace = true, features = ["remote", "serve"] }
 pyo3 = { workspace = true, features = ["abi3-py311"] }
 pyo3-log = { workspace = true }
 # The CLI itself, as a library: `python -m tylertoo` calls `tylertoo_cli::run`
-# (#819). No default features: the allocator lives in its binary, not here.
+# (#819). No default features: forward only the allocator policy features;
+# the extension installs the allocator itself.
 tylertoo = { path = "../cli", default-features = false }
 # Report structs (already serde::Serialize in core) to Python dicts.
 pythonize = "0.29"

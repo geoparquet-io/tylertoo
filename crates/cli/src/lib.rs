@@ -21,6 +21,9 @@ use tylertoo_core::internal::overview::config::{self, OutputKind};
 use tylertoo_core::internal::overview::tiles::TilesOptions;
 use tylertoo_core::TilesetMetadata as TilesetMetadataArgs;
 
+mod allocator;
+pub use allocator::apply_memory_profile_allocator;
+
 /// `-q/--quiet` (#452), set once in [`run`] before dispatch.
 #[expect(
     clippy::disallowed_types,
@@ -384,8 +387,6 @@ pub fn run<I>(argv: I) -> u8
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    // Already built only when a host (a test harness) ran `run` before.
-    let _ = tylertoo_core::internal::overview::convert::init_worker_pool();
     let status =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_cli(argv))).unwrap_or(101);
     // Outside a Rust binary nothing flushes stdout at exit.
@@ -404,6 +405,19 @@ where
         Ok(cli) => cli,
         Err(e) => return clap_exit(&e),
     };
+
+    let profile = match &cli.command {
+        Command::Tiles(args) => Some(args.tuning.profile),
+        Command::Overview(args) => Some(args.tuning.profile),
+        Command::ExportPmtiles(args) => Some(args.export.profile),
+        Command::Pyramid(args) => Some(args.profile),
+        _ => None,
+    };
+    if let Some(profile) = profile {
+        apply_memory_profile_allocator(profile);
+    }
+    // Set the allocator policy before starting workers or pipeline work.
+    let _ = tylertoo_core::internal::overview::convert::init_worker_pool();
 
     // Checked here, not with clap's `conflicts_with`: `quiet` is a global
     // arg that only `tiles` has a `verbose` to conflict with, and clap's

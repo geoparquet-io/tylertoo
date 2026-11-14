@@ -68,8 +68,8 @@ static LOG_RESET: pyo3::sync::PyOnceLock<Option<pyo3_log::ResetHandle>> =
 ///
 /// The cache is what lets a filtered-out record on a worker thread skip the
 /// GIL entirely; resetting it once per call keeps that, at the cost of one
-/// atomic store. Every entry point calls this first ([`enter`]), and the first call
-/// installs the bridge: not at import, so that `python -m tylertoo` can
+/// atomic store. Every entry point calls this before work ([`enter`]). The
+/// first call installs the bridge: not at import, so `python -m tylertoo` can
 /// give the CLI its own stderr logger (#819).
 fn refresh_log_levels(py: Python<'_>) {
     let handle = LOG_RESET.get_or_init(py, || {
@@ -83,7 +83,7 @@ fn refresh_log_levels(py: Python<'_>) {
     }
 }
 
-/// The start of every binding call: build the worker pool, then refresh
+/// Before each binding starts work: build the worker pool, then refresh
 /// the log bridge. The pool starts here, not at import: a process forked
 /// after `import tylertoo` would inherit a started pool without its threads
 /// and wait forever on its first parallel job. A host that already owns the
@@ -304,7 +304,6 @@ fn convert(
     args: &Bound<'_, pyo3::types::PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    enter(py);
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
 
@@ -320,6 +319,8 @@ fn convert(
 
     values.extend(keywords(Some(&positional))?);
     let options = tiles_config(values)?;
+    tylertoo_cli::apply_memory_profile_allocator(options.convert.profile);
+    enter(py);
     // #709/#779: core's whole preflight, before anything is read; the
     // facade runs it again, then resolves `max_zoom="auto"` over the source
     // it converts (#444, #788).
@@ -401,8 +402,9 @@ fn overview(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    enter(py);
     let options = overview_config(keywords(kwargs)?)?;
+    tylertoo_cli::apply_memory_profile_allocator(options.profile);
+    enter(py);
     // #779: every rule that needs no input, before anything is read.
     options.validate().map_err(convert_error_to_py)?;
 
@@ -453,8 +455,9 @@ fn export_pmtiles(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    enter(py);
     let options = export_config(keywords(kwargs)?)?;
+    tylertoo_cli::apply_memory_profile_allocator(options.profile);
+    enter(py);
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
 
@@ -556,10 +559,11 @@ fn pyramid(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    enter(py);
     // Spec grammar, band-set rules and the input-exists check are core's,
     // shared with the CLI's `--band` (#445).
     let options = pyramid_config(keywords(kwargs)?)?;
+    tylertoo_cli::apply_memory_profile_allocator(options.export.profile);
+    enter(py);
     options.validate().map_err(pyramid_error_to_py)?;
     let bands = parse_bands(&bands).map_err(config_err)?;
     let output_path = PathBuf::from(output);
