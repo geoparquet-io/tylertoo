@@ -372,6 +372,108 @@ mod tests {
         assert_eq!(mlt_column(&mvt, MltProfile::Web).0, PropKind::I64);
     }
 
+    /// tylertoo's MVT writes each number in its shortest exact encoding, so
+    /// one Float64 column can hold MVT floats and doubles, in either order,
+    /// and one int64 column `int` and `sint` values. Every profile must read
+    /// such a column back as the exact numbers written, a mixed float column
+    /// as F64 (a double widened from `0.1_f32` is not `0.1`).
+    #[test]
+    fn mixed_number_encodings_round_trip_exactly() {
+        use crate::mvt::{LayerBuilder, PropertyValue, TileBuilder};
+        use crate::tile::TileBounds;
+        use prost::Message;
+
+        let columns: [(&str, [PropertyValue; 2]); 5] = [
+            (
+                "float_first",
+                [PropertyValue::Double(1.5), PropertyValue::Double(0.1)],
+            ),
+            (
+                "double_first",
+                [PropertyValue::Double(0.1), PropertyValue::Double(1.5)],
+            ),
+            (
+                "all_float",
+                [PropertyValue::Double(1.5), PropertyValue::Double(-0.25)],
+            ),
+            (
+                "all_double",
+                [PropertyValue::Double(0.1), PropertyValue::Double(0.3)],
+            ),
+            ("signed", [PropertyValue::Int(-3), PropertyValue::Int(7)]),
+        ];
+        let bounds = TileBounds::new(0.0, 0.0, 1.0, 1.0);
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let mut layer = LayerBuilder::new("l");
+        for row in 0..2 {
+            let props: Vec<(String, PropertyValue)> = columns
+                .iter()
+                .map(|(name, values)| ((*name).to_owned(), values[row].clone()))
+                .collect();
+            let point = geo::Geometry::Point(geo::Point::new(0.25 + 0.5 * row as f64, 0.5));
+            layer.add_feature(Some(row as u64 + 1), &point, &props, &bounds, &diagnostics);
+        }
+        let mut tile = TileBuilder::new();
+        tile.add_layer(layer.build());
+        let mvt = tile.build().encode_to_vec();
+
+        for profile in [
+            MltProfile::Web,
+            MltProfile::Native,
+            MltProfile::MinSize,
+            MltProfile::Diffable,
+            MltProfile::FastEncoding,
+        ] {
+            let mlt = finish_tile(mvt.clone(), TileFormat::Mlt, profile).unwrap();
+            let (mut parser, mut decoder) =
+                (mlt_core::Parser::default(), mlt_core::Decoder::default());
+            let decoded = parser
+                .parse_layers(&mlt)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let decoded = decoded.into_tile(&mut decoder).unwrap().unwrap();
+            for (name, values) in &columns {
+                let col = decoded
+                    .property_names()
+                    .iter()
+                    .position(|n| n == name)
+                    .unwrap();
+                let kind = decoded.property_kinds()[col];
+                let got: Vec<f64> = decoded
+                    .features()
+                    .iter()
+                    .map(|f| match &f.properties()[col] {
+                        PropValue::F64(Some(v)) => *v,
+                        PropValue::F32(Some(v)) => f64::from(*v),
+                        #[expect(clippy::cast_precision_loss, reason = "small test integers")]
+                        PropValue::I64(Some(v)) => *v as f64,
+                        PropValue::I32(Some(v)) => f64::from(*v),
+                        other => panic!("{profile} {name}: unexpected {other:?}"),
+                    })
+                    .collect();
+                let want: Vec<f64> = values
+                    .iter()
+                    .map(|v| match v {
+                        PropertyValue::Double(d) => *d,
+                        #[expect(clippy::cast_precision_loss, reason = "small test integers")]
+                        PropertyValue::Int(i) => *i as f64,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                assert_eq!(
+                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{profile} {name} ({kind:?}): {got:?} != {want:?}"
+                );
+                if name.contains("first") || *name == "all_double" {
+                    assert_eq!(kind, PropKind::F64, "{profile} {name}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn layer_lengths_are_the_mlt_wire_lengths() {
         let a = mvt_with(&[PropValue::Bool(Some(true))]);

@@ -5498,9 +5498,9 @@ mod tests {
     #[test]
     fn test_large_archive_uses_leaf_directories() {
         // Create enough tiles to exceed 16KB root directory
-        // gzip compresses directory entries very well (~2-5 bytes/entry compressed)
-        // Need 10,000+ entries to reliably exceed the 16KB threshold
-        let num_tiles = 10_000;
+        // gzip compresses directory entries very well (~1-5 bytes/entry compressed)
+        // libdeflate fits 10,000 of these entries in 14 KB, so use 20,000
+        let num_tiles = 20_000;
 
         let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         writer.set_layer_name("test");
@@ -5541,7 +5541,7 @@ mod tests {
             MAX_ROOT_DIR_SIZE
         );
 
-        // With 10,000 tiles, we MUST have leaf directories
+        // With 20,000 tiles, we MUST have leaf directories
         assert!(
             leaf_dirs_offset > 0,
             "Large archive should have leaf directories (offset={})",

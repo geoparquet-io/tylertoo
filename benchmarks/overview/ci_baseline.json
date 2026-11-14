@@ -83,7 +83,7 @@
       "total_vertices": 5483988
     },
     "export": {
-      "archive_bytes": 122084765,
+      "archive_bytes": 120604957,
       "decoded_features_total": 580960,
       "total_tile_features": 580960,
       "total_tiles": 152991,
@@ -240,7 +240,7 @@
       "total_vertices": 19838
     },
     "export": {
-      "archive_bytes": 137644,
+      "archive_bytes": 137226,
       "decoded_features_total": 6059,
       "total_tile_features": 6059,
       "total_tiles": 74,
@@ -362,7 +362,7 @@
       "total_vertices": 20478
     },
     "export": {
-      "archive_bytes": 141103,
+      "archive_bytes": 136827,
       "decoded_features_total": 3800,
       "total_tile_features": 3800,
       "total_tiles": 86,

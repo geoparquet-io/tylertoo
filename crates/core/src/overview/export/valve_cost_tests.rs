@@ -12,7 +12,7 @@ fn valve_encode_peak_live_bytes_matches_price() {
     valve_encode_ledger(
         "squares",
         square_members(100_000, true),
-        (5_960_687_766_429_934_319, Some(14_479_824_291_116_707_907)),
+        (5_960_687_766_429_934_319, Some(9_520_880_044_975_794_392)),
     );
 }
 
@@ -22,7 +22,7 @@ fn valve_encode_peak_live_bytes_matches_price_vertex_heavy() {
     valve_encode_ledger(
         "vertex-heavy",
         vertex_heavy_members(100_000),
-        (12_545_578_015_038_857_891, Some(5_218_640_095_989_453_000)),
+        (14_617_291_466_410_147_389, Some(1_039_302_976_210_442_976)),
     );
 }
 
