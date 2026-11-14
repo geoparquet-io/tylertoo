@@ -3913,6 +3913,43 @@ mod sink_sample_tests {
     }
 
     #[test]
+    fn selected_bytes_keeps_whole_buffers_for_sparse_union_and_dictionary_geometry() {
+        use arrow_array::{types::Int8Type, DictionaryArray, Int32Array, UnionArray};
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::{DataType, Field, UnionFields};
+
+        let fields = UnionFields::try_new(
+            [0, 1],
+            [
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Float64, false),
+            ],
+        )
+        .unwrap();
+        let sparse: ArrayRef = Arc::new(
+            UnionArray::try_new(
+                fields,
+                ScalarBuffer::from(vec![0i8, 1, 0, 1]),
+                None,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+                    Arc::new(Float64Array::from(vec![1., 2., 3., 4.])) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+        );
+        let dictionary: ArrayRef =
+            Arc::new(DictionaryArray::<Int8Type>::from_iter(["x", "y", "x"]));
+        for array in [sparse, dictionary] {
+            // Layouts without a range rule must pay their complete buffers,
+            // never zero, however small the selected run.
+            let whole = array_data_bytes(&array.to_data());
+            assert!(whole > 0);
+            assert_eq!(selected_array_bytes(&array, &[(1, 1)]), whole);
+        }
+    }
+
+    #[test]
     fn measured_disk_price_charges_shared_properties_at_every_level() {
         let n = ROWS;
         let input = RecordBatch::try_from_iter(vec![
