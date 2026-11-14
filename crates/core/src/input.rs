@@ -1280,7 +1280,8 @@ pub(crate) mod remote {
                 builder = builder.proxy(proxy);
             }
             // Defaults with transport effects, plus every user override. No
-            // custom root certificates or DNS resolver are set by this path.
+            // custom root certificates are set by this path, and object_store's default
+            // DNS address shuffling is not reproduced (#843 review: low value here).
             let mut keys = vec![
                 AllowHttp,
                 AllowInvalidCertificates,
