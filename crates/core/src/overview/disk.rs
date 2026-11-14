@@ -20,6 +20,50 @@ pub(super) struct DiskFootprint {
     post_pass1: bool,
 }
 
+/// The same kept-row footprint, repriced when pass 2 first measures the
+/// selected properties. Both checks share one warning allowance.
+pub(super) struct DiskRecheck<'a> {
+    pub(super) source: &'a ConvertSource,
+    pub(super) selection: Option<&'a RowGroupSelection>,
+    pub(super) options: &'a ConvertOptions,
+    pub(super) overview: &'a Path,
+    pub(super) level_rows: &'a [usize],
+    pub(super) spilling_levels: usize,
+    pub(super) price: u64,
+    pub(super) warned: bool,
+}
+
+impl DiskRecheck<'_> {
+    pub(super) fn check(&mut self, price: u64) -> Result<Option<String>, ConvertError> {
+        self.check_with(price, |disk| disk.warning(super::tiles::CLI_REMEDIES))
+    }
+
+    pub(super) fn check_with(
+        &mut self,
+        price: u64,
+        warning: impl FnOnce(&DiskFootprint) -> Option<String>,
+    ) -> Result<Option<String>, ConvertError> {
+        if price <= self.price {
+            return Ok(None);
+        }
+        let footprint = DiskFootprint::post_pass1(
+            self.source,
+            self.selection,
+            self.options,
+            self.overview,
+            self.level_rows,
+            self.spilling_levels,
+            price,
+        )?;
+        self.price = price;
+        // Constructing the footprint still logs its [disk] info line, even
+        // when the earlier check already warned.
+        let message = (!self.warned).then(|| warning(&footprint)).flatten();
+        self.warned |= message.is_some();
+        Ok(message)
+    }
+}
+
 #[derive(Debug)]
 struct Component {
     dir: PathBuf,

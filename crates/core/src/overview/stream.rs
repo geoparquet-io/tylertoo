@@ -1648,6 +1648,7 @@ fn run_pass2_levels(
     hints: &[usize],
     inputs: Pass2Inputs<'_>,
     strategy: Pass2Strategy,
+    disk_check: &mut dyn FnMut(u64) -> Result<(), ConvertError>,
 ) -> Result<
     (
         Vec<LevelStat>,
@@ -1785,6 +1786,7 @@ fn run_pass2_levels(
                         ),
                         budget,
                     },
+                    disk_check,
                 );
                 grants.release(&mut budget);
                 let result = result?;
@@ -3863,19 +3865,23 @@ pub(crate) fn run_stages(
         0
     };
     let level_rows: Vec<_> = emitted.iter().map(|e| e.hint).collect();
-    if let Some(message) = super::disk::DiskFootprint::post_pass1(
+    let mut disk_recheck = super::disk::DiskRecheck {
         source,
-        selected_row_groups.as_ref(),
+        selection: selected_row_groups.as_ref(),
         options,
-        output_path,
-        &level_rows,
+        overview: output_path,
+        level_rows: &level_rows,
         spilling_levels,
-        output_row_bytes,
-    )?
-    .warning(super::tiles::CLI_REMEDIES)
-    {
-        diagnostics.warn(message);
-    }
+        price: 0,
+        warned: false,
+    };
+    let mut disk_check = |price| {
+        if let Some(message) = disk_recheck.check(price)? {
+            diagnostics.warn(message);
+        }
+        Ok(())
+    };
+    disk_check(output_row_bytes)?;
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
     // Pass-1 O(N) scratch has been freed by here; this marks the memory floor
@@ -3940,6 +3946,7 @@ pub(crate) fn run_stages(
             backing,
         },
         strategy,
+        &mut disk_check,
     )?;
 
     // Pass 2 moved every chain's geometry out as it emitted the rep (#851);

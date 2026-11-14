@@ -844,6 +844,7 @@ struct SinkAutoTuner {
     /// A downgrade is still possible: `auto`, and the sinks are still Ram.
     armed: bool,
     downgraded: bool,
+    disk_checked: bool,
 }
 
 impl SinkAutoTuner {
@@ -902,6 +903,7 @@ impl SinkAutoTuner {
             budget_bytes,
             armed,
             downgraded: false,
+            disk_checked: false,
         }
     }
 
@@ -935,6 +937,19 @@ impl SinkAutoTuner {
     /// `None` until at least one row has been observed.
     fn bytes_per_row(&self) -> Option<u64> {
         (self.rows > 0).then(|| self.bytes / self.rows as u64)
+    }
+
+    /// Reprice disk once at the first decision-grade sample, after both
+    /// shared bytes and the current output batch's rows were observed.
+    fn check_disk(
+        &mut self,
+        check: &mut dyn FnMut(u64) -> Result<(), ConvertError>,
+    ) -> Result<(), ConvertError> {
+        if !self.disk_checked && self.rows >= SINK_SAMPLE_MIN_ROWS {
+            self.disk_checked = true;
+            check(self.bytes_per_row().expect("sample has rows"))?;
+        }
+        Ok(())
     }
 
     /// What the whole buffered set costs in RAM: the bytes already buffered
@@ -1344,8 +1359,10 @@ fn buffer_batch(
     sink: &mut LevelSink,
     tuner: &mut SinkAutoTuner,
     batch: LevelBatch,
+    disk_check: &mut dyn FnMut(u64) -> Result<(), ConvertError>,
 ) -> Result<u64, ConvertError> {
     tuner.observe(&batch);
+    tuner.check_disk(disk_check)?;
     sink.push(batch)
 }
 
@@ -1642,6 +1659,7 @@ pub(super) fn run_pass2_buffered(
     hints: &[usize],
     read: StreamRead<'_>,
     inputs: BufferOptions<'_>,
+    disk_check: &mut dyn FnMut(u64) -> Result<(), ConvertError>,
 ) -> Result<Pass2EngineResult, ConvertError> {
     let StreamRead {
         source,
@@ -1791,7 +1809,7 @@ pub(super) fn run_pass2_buffered(
                             rows_ref[li] += out.num_rows();
                             verts_ref[li] += v;
                             spill_bytes_ref[li] +=
-                                buffer_batch(&mut sinks_ref[li], tuner_ref, out)?;
+                                buffer_batch(&mut sinks_ref[li], tuner_ref, out, disk_check)?;
                         }
                     }
                     downgrade_if_due(
@@ -3521,6 +3539,160 @@ mod sink_sample_tests {
     /// Rows per synthetic batch. Comfortably over [`SINK_SAMPLE_MIN_ROWS`], so
     /// one batch is already a decision-grade sample.
     const ROWS: usize = 4_096;
+
+    #[test]
+    fn measured_disk_check_waits_for_sample_and_runs_once_for_every_profile() {
+        for profile in [
+            MemoryProfile::Auto,
+            MemoryProfile::Bounded,
+            MemoryProfile::Speed,
+        ] {
+            let mut tuner = SinkAutoTuner::new(
+                profile,
+                SinkBacking::Ram,
+                ROWS,
+                MemoryBudget::with_available(Some(1 << 30)),
+            );
+            let batch = sample_batch(1);
+            let mut prices = Vec::new();
+            let calls = std::cell::Cell::new(0);
+            let mut check = |price| {
+                calls.set(calls.get() + 1);
+                prices.push(price);
+                Ok(())
+            };
+            tuner.observe(&LevelBatch::Owned(batch.slice(0, SINK_SAMPLE_MIN_ROWS - 1)));
+            tuner.check_disk(&mut check).unwrap();
+            assert_eq!(calls.get(), 0);
+            tuner.observe(&LevelBatch::Owned(batch.slice(SINK_SAMPLE_MIN_ROWS - 1, 1)));
+            tuner.check_disk(&mut check).unwrap();
+            let first_price = tuner.bytes_per_row().unwrap();
+            tuner.observe(&LevelBatch::Owned(sample_batch(200)));
+            tuner.check_disk(&mut check).unwrap();
+            assert_eq!(prices, [first_price]);
+        }
+    }
+
+    #[test]
+    fn measured_disk_check_catches_filtered_large_strings_and_warns_at_most_once() {
+        use super::super::convert::ConvertOptions;
+        use super::super::disk::DiskRecheck;
+        use crate::input_set::ConvertSource;
+        use arrow_array::StringArray;
+
+        const KEPT: usize = SINK_SAMPLE_MIN_ROWS;
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("skewed.parquet");
+        let output = dir.path().join("out.parquet");
+        let large = "x".repeat(16 * 1024);
+        let properties = StringArray::from_iter_values((0..KEPT * 100).map(|i| {
+            if i < KEPT {
+                large.as_str()
+            } else {
+                ""
+            }
+        }));
+        let geoms = vec![Some(geo::Geometry::Point(geo::Point::new(1., 2.))); KEPT * 100];
+        super::super::testutil::write_input_with_column(
+            &input,
+            &geoms,
+            "payload",
+            Arc::new(properties),
+            None,
+        );
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        let footer = super::super::read::footer_price(
+            &source,
+            None,
+            0..source.schema().unwrap().fields().len(),
+        )
+        .unwrap()
+        .unwrap();
+        let kept = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..KEPT).map(|_| large.as_str()),
+            ))],
+        )
+        .unwrap();
+        for profile in [
+            MemoryProfile::Auto,
+            MemoryProfile::Bounded,
+            MemoryProfile::Speed,
+        ] {
+            let options = ConvertOptions {
+                profile,
+                filter: Some(format!("id < {KEPT}")),
+                spill_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            };
+            let average = MemoryBudget::with_available(None).output_row_bytes(
+                options.mode,
+                None,
+                Some(footer.row_bytes),
+            );
+            for free in [8 * 1024 * 1024, 0] {
+                let mut recheck = DiskRecheck {
+                    source: &source,
+                    selection: None,
+                    options: &options,
+                    overview: &output,
+                    level_rows: &[KEPT, KEPT],
+                    spilling_levels: usize::from(!matches!(profile, MemoryProfile::Speed)),
+                    price: 0,
+                    warned: false,
+                };
+                let mut probes = 0;
+                let mut warning = |disk: &super::super::disk::DiskFootprint| {
+                    probes += 1;
+                    disk.warning_with(super::super::tiles::CLI_REMEDIES, |_| {
+                        Some(("one".into(), free))
+                    })
+                };
+                let initial = recheck.check_with(average, &mut warning).unwrap();
+                assert_eq!(
+                    initial.is_some(),
+                    free == 0,
+                    "average {average} B/row, {profile:?}"
+                );
+                // A lower price must neither recheck nor probe free space.
+                assert!(recheck.check_with(average, &mut warning).unwrap().is_none());
+                let mut tuner = SinkAutoTuner::with_budget(false, KEPT, 0);
+                tuner.observe(&LevelBatch::Owned(kept.clone()));
+                let measured = tuner.bytes_per_row().unwrap();
+                assert!(
+                    measured > average * 4,
+                    "measured {measured}, average {average}"
+                );
+                let mut warnings = usize::from(initial.is_some());
+                let mut check = |price| {
+                    warnings += usize::from(recheck.check_with(price, &mut warning)?.is_some());
+                    Ok(())
+                };
+                crate::test_log::take_thread_lines();
+                tuner.check_disk(&mut check).unwrap();
+                tuner.check_disk(&mut check).unwrap();
+                assert_eq!(warnings, 1, "{profile:?}, free {free}");
+                assert_eq!(recheck.price, measured);
+                assert_eq!(probes, if free == 0 { 1 } else { 2 });
+                if logging {
+                    let lines = crate::test_log::take_thread_lines();
+                    assert_eq!(
+                        lines
+                            .iter()
+                            .filter(|line| line.starts_with("[disk]"))
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
 
     /// A batch of `ROWS` rows: one WKB-ish geometry column of 8-byte values
     /// plus `props` `Float64` property columns — the shape a buffered output
