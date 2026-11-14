@@ -330,6 +330,25 @@ fn advisory_counts_are_queried_by_complete_message() {
 }
 
 #[test]
+fn disk_shortage_counts_are_queried_by_complete_message() {
+    let sink = Diagnostics::default();
+    let first = Diagnostic::DiskShortage {
+        count: 2,
+        message: "first volume may not fit".into(),
+    };
+    let second = Diagnostic::DiskShortage {
+        count: 3,
+        message: "second volume may not fit".into(),
+    };
+    sink.extend([first.clone(), second.clone()]);
+    sink.once(first.clone());
+    assert_eq!(sink.count(&first), 2);
+    assert_eq!(sink.count(&second), 3);
+    assert_eq!(sink.snapshot().len(), 2);
+    assert_eq!(first.to_string(), "first volume may not fit");
+}
+
+#[test]
 fn metadata_and_property_counters_preserve_the_query_key() {
     use crate::diagnostics::{CoveringWarning, CrsWarning};
 

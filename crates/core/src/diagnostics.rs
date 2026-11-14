@@ -57,6 +57,11 @@ pub enum Diagnostic {
     /// deduplicated by its complete message; never persisted in a plan.
     #[non_exhaustive]
     Advisory { count: usize, message: String },
+    /// A predicted disk shortage in this run. Deduplicated by its complete
+    /// message and never persisted in a plan; Python convert also raises a
+    /// `UserWarning` after success.
+    #[non_exhaustive]
+    DiskShortage { count: usize, message: String },
     #[non_exhaustive]
     OutOfRange {
         context: Option<RangeContext>,
@@ -280,6 +285,7 @@ macro_rules! event_count {
             | Self::EmptyLevels { count, .. }
             | Self::MemoryBudget { count, .. }
             | Self::Advisory { count, .. }
+            | Self::DiskShortage { count, .. }
             | Self::SavedPlan { count, .. }
             | Self::PyramidSharedTiles { count }
             | Self::PyramidSkippedTiles { count }
@@ -340,7 +346,10 @@ impl Diagnostic {
 
     fn same_counter_kind(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Advisory { message: a, .. }, Self::Advisory { message: b, .. }) => a == b,
+            (Self::Advisory { message: a, .. }, Self::Advisory { message: b, .. })
+            | (Self::DiskShortage { message: a, .. }, Self::DiskShortage { message: b, .. }) => {
+                a == b
+            }
             (Self::PolygonRepaired { kind: a, .. }, Self::PolygonRepaired { kind: b, .. }) => {
                 a == b
             }
@@ -446,7 +455,7 @@ impl fmt::Display for Diagnostic {
             Self::SavedPlan {diagnostics,..} => {
                 write!(f, "saved plan (whole input): {}", diagnostics.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
             }
-            Self::Advisory {message,..} => f.write_str(message),
+            Self::Advisory {message,..} | Self::DiskShortage {message,..} => f.write_str(message),
             Self::MemoryBudget {machine,limit,..} => write!(f, "memory budget from cgroup limit: {limit} bytes (machine available: {machine:?} bytes)"),
             Self::PyramidSharedTiles {..} => write!(f, "{n} tile(s) shared across bands; counted once in the merged archive"),
             Self::PyramidSkippedTiles {..} => write!(f, "{n} tile(s) outside their band's declared zoom range skipped"),
@@ -521,6 +530,10 @@ impl Default for Diagnostics {
 impl Diagnostics {
     pub(crate) fn warn(&self, message: String) {
         self.once(Diagnostic::Advisory { count: 1, message });
+    }
+
+    pub(crate) fn disk_shortage(&self, message: String) {
+        self.once(Diagnostic::DiskShortage { count: 1, message });
     }
 
     /// Defer metadata warnings until the input is used by an operation.
@@ -694,7 +707,9 @@ impl Diagnostics {
             .filter(|event| {
                 !matches!(
                     event,
-                    Diagnostic::MemoryBudget { .. } | Diagnostic::Advisory { .. }
+                    Diagnostic::MemoryBudget { .. }
+                        | Diagnostic::Advisory { .. }
+                        | Diagnostic::DiskShortage { .. }
                 )
             })
             .collect()

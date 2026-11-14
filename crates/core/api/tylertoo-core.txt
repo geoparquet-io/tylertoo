@@ -632,6 +632,9 @@ pub tylertoo_core::Diagnostic::CrsAssumed::root: alloc::string::String
 #[non_exhaustive] pub tylertoo_core::Diagnostic::CrsMetadata
 pub tylertoo_core::Diagnostic::CrsMetadata::count: usize
 pub tylertoo_core::Diagnostic::CrsMetadata::reason: tylertoo_core::CrsWarning
+#[non_exhaustive] pub tylertoo_core::Diagnostic::DiskShortage
+pub tylertoo_core::Diagnostic::DiskShortage::count: usize
+pub tylertoo_core::Diagnostic::DiskShortage::message: alloc::string::String
 #[non_exhaustive] pub tylertoo_core::Diagnostic::EmptyLevels
 pub tylertoo_core::Diagnostic::EmptyLevels::count: usize
 pub tylertoo_core::Diagnostic::EmptyLevels::first_written_gsd: f64

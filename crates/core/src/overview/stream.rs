@@ -2943,7 +2943,7 @@ fn preflight_with_memory_limit(
         options,
         overview,
     )?
-    .warning(super::disk::RECHECK_REMEDIES)
+    .warning(super::disk::CORE_REMEDIES)
     {
         diagnostics.warn(message);
     }
@@ -3877,7 +3877,7 @@ pub(crate) fn run_stages(
     };
     let mut disk_check = |price| {
         if let Some(message) = disk_recheck.check(price)? {
-            diagnostics.warn(message);
+            diagnostics.disk_shortage(message);
         }
         Ok(())
     };

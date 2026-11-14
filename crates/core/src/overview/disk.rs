@@ -14,8 +14,8 @@ use super::tiles::SpaceRemedies;
 
 const MARGIN_DENOM: u64 = 20;
 
-/// Rechecks run in core and reach both frontends through logging.
-pub(super) const RECHECK_REMEDIES: SpaceRemedies<'_> = SpaceRemedies {
+/// Warnings core emits through diagnostics reach both frontends.
+pub(super) const CORE_REMEDIES: SpaceRemedies<'_> = SpaceRemedies {
     spill_dir: "--spill-dir (CLI) or spill_dir (Python)",
     keep_overview: "--keep-overview (CLI) or keep_overview (Python)",
 };
@@ -41,7 +41,7 @@ pub(super) struct DiskRecheck<'a> {
 
 impl DiskRecheck<'_> {
     pub(super) fn check(&mut self, price: u64) -> Result<Option<String>, ConvertError> {
-        self.check_with(price, |disk| disk.warning(RECHECK_REMEDIES))
+        self.check_with(price, |disk| disk.warning(CORE_REMEDIES))
     }
 
     pub(super) fn check_with(
@@ -450,6 +450,9 @@ mod tests {
 
     #[test]
     fn recheck_warning_names_cli_and_python_remedies() {
+        use crate::diagnostics::{Diagnostic, Diagnostics};
+
+        let logging = crate::test_log::install();
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.parquet");
         super::super::testutil::write_input(
@@ -484,6 +487,32 @@ mod tests {
                 warning.contains("--keep-overview (CLI) or keep_overview (Python)"),
                 "{warning}"
             );
+            let diagnostics = Diagnostics::default();
+            crate::test_log::take_thread_lines();
+            diagnostics.disk_shortage(warning.clone());
+            diagnostics.disk_shortage(warning.clone());
+            assert!(recheck.check(u64::MAX / 2).unwrap().is_none());
+            assert_eq!(
+                diagnostics.snapshot(),
+                vec![Diagnostic::DiskShortage {
+                    count: 1,
+                    message: warning.clone(),
+                }]
+            );
+            assert!(diagnostics.snapshot_for_plan().is_empty());
+            assert_eq!(
+                serde_json::to_value(&diagnostics.snapshot()[0]).unwrap(),
+                serde_json::json!({"kind": "disk_shortage", "count": 1, "message": warning})
+            );
+            if logging {
+                assert_eq!(
+                    crate::test_log::take_thread_lines()
+                        .iter()
+                        .filter(|line| line.contains("may not fit"))
+                        .count(),
+                    1
+                );
+            }
         }
         assert!(!output.exists());
     }
