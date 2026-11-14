@@ -3681,6 +3681,7 @@ pub(crate) fn run_stages(
     config: &super::config::ValidatedConfig<'_, ConvertOptions>,
     strategy: Pass2Strategy,
     diagnostics: &crate::diagnostics::Diagnostics,
+    archive: Option<&Path>,
 ) -> Result<ConvertReport, ConvertError> {
     let options = config.options();
     preflight_profile_json_path(diagnostics);
@@ -3870,6 +3871,7 @@ pub(crate) fn run_stages(
         selection: selected_row_groups.as_ref(),
         options,
         overview: output_path,
+        archive,
         level_rows: &level_rows,
         spilling_levels,
         price: output_row_bytes,

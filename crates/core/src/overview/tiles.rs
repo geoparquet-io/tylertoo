@@ -1257,6 +1257,7 @@ pub(super) fn convert_to_pmtiles_validated(
         &convert_options,
         super::stream::Pass2Strategy::Pipelined,
         &diagnostics,
+        Some(output),
     ) {
         Ok(report) => report,
         Err(e) => {
@@ -1916,6 +1917,41 @@ mod tests {
                 ..ConvertOptions::default()
             },
             ..TilesOptions::default()
+        }
+    }
+
+    #[test]
+    fn disk_preflight_uses_final_archive_directory() {
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        points_input(&input);
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let output = dir.path().join("out.pmtiles");
+        let mut options = zoomed_options(0, 2);
+        options.convert.spill_dir = Some(scratch.clone());
+        crate::test_log::take_thread_lines();
+        convert_to_pmtiles(&TilesInput::Path(input), &output, &options).unwrap();
+        if logging {
+            let lines = crate::test_log::take_thread_lines();
+            let footprint = lines
+                .iter()
+                .find(|line| line.starts_with("[disk] after pass 1 projected footprint:"))
+                .unwrap_or_else(|| panic!("{lines:#?}"));
+            let (conversion, archive) = footprint.split_once("output archive").unwrap();
+            assert!(
+                conversion.contains(&scratch.display().to_string()),
+                "{footprint}"
+            );
+            assert!(
+                archive.contains(&dir.path().display().to_string()),
+                "{footprint}"
+            );
+            assert!(
+                !archive.contains(&scratch.display().to_string()),
+                "{footprint}"
+            );
         }
     }
 

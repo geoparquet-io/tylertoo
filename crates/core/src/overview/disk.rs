@@ -13,9 +13,9 @@ use super::stream::select_row_groups_streaming;
 use super::tiles::SpaceRemedies;
 
 const MARGIN_DENOM: u64 = 20;
-// shortcut: empirical export allowance on the intermediate volume, not a
-// fanout/codec bound; upgrade at the export owner if remeasurement underprices
-// archive/member spill or output on a different volume. Half an estimated
+// shortcut: empirical export allowance, not a fanout/codec bound; upgrade
+// at the export owner if remeasurement underprices archive/member spill.
+// Charge the archive destination while the intermediate remains. Half an estimated
 // intermediate is the smallest positive half-step covering all seven #872
 // peaks: I_est/peak GiB = Madagascar .257/.192, Moldova .85/.736,
 // Places 5.69/3.425, BR_MT filtered (auto/bounded) 4.2/2.965, all 9.4/4.91,
@@ -44,6 +44,7 @@ pub(super) struct DiskRecheck<'a> {
     pub(super) selection: Option<&'a RowGroupSelection>,
     pub(super) options: &'a ConvertOptions,
     pub(super) overview: &'a Path,
+    pub(super) archive: Option<&'a Path>,
     pub(super) level_rows: &'a [usize],
     pub(super) spilling_levels: usize,
     /// Original pass-1 whole-population price, retained for unseen levels.
@@ -89,7 +90,7 @@ impl DiskRecheck<'_> {
             self.source,
             self.selection,
             self.options,
-            self.overview,
+            (self.overview, self.archive),
             self.level_rows,
             self.spilling_levels,
             &prices,
@@ -302,7 +303,7 @@ impl DiskFootprint {
         source: &ConvertSource,
         selection: Option<&RowGroupSelection>,
         options: &ConvertOptions,
-        overview: &Path,
+        (overview, archive): (&Path, Option<&Path>),
         level_rows: &[usize],
         buffered_levels: usize,
         output_row_bytes: &[u64],
@@ -363,15 +364,17 @@ impl DiskFootprint {
         let output = total
             .div_ceil(OUTPUT_PER_INTERMEDIATE.1)
             .saturating_mul(OUTPUT_PER_INTERMEDIATE.0);
-        footprint.add(
-            overview
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new(".")),
-            "output archive",
-            output,
-            false,
-        );
+        if let Some(archive) = archive {
+            footprint.add(
+                archive
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new(".")),
+                "output archive",
+                output,
+                false,
+            );
+        }
         // run_pass2_buffered drains in order; drain_sink drops its NamedTempFile
         // before advancing. run_pass2_levels streams canonical after the drain.
         // Keep the current spill until its entire intermediate prefix is written.
@@ -406,7 +409,7 @@ impl DiskFootprint {
             "pre-read"
         };
         log::info!(
-            "[disk] {phase} projected footprint: {} (simultaneous peak {:.3} GiB)",
+            "[disk] {phase} projected footprint: {}",
             self.components
                 .iter()
                 .filter(|c| self.post_pass1 || c.projected)
@@ -418,8 +421,6 @@ impl DiskFootprint {
                 ))
                 .collect::<Vec<_>>()
                 .join(" + "),
-            self.peak_bytes(&self.components.iter().collect::<Vec<_>>()) as f64
-                / (1u64 << 30) as f64,
         );
     }
 
@@ -560,6 +561,65 @@ mod tests {
     };
 
     #[test]
+    fn convert_only_has_no_output_archive() {
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        super::super::testutil::write_input(
+            &input,
+            &[Some(geo::Geometry::Point(geo::Point::new(1., 2.)))],
+            false,
+            None,
+        );
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        crate::test_log::take_thread_lines();
+        let disk = DiskFootprint::post_pass1(
+            &source,
+            None,
+            &ConvertOptions::default(),
+            (&dir.path().join("out.parquet"), None),
+            &[1_000, 40_000],
+            1,
+            &[1_600; 2],
+        )
+        .unwrap();
+        assert!(!disk.components.iter().any(|c| c.name == "output archive"));
+        let warning = disk
+            .warning_with(REMEDIES, |_| Some(("same".into(), 0)))
+            .unwrap();
+        assert!(!warning.contains("output archive"), "{warning}");
+        if logging {
+            let lines = crate::test_log::take_thread_lines();
+            assert!(lines.iter().any(|line| line.starts_with("[disk]")));
+            assert!(
+                lines.iter().all(|line| !line.contains("output archive")),
+                "{lines:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn projection_log_does_not_claim_a_cross_volume_peak() {
+        let logging = crate::test_log::install();
+        let mut disk = DiskFootprint::default();
+        disk.add(Path::new("/scratch"), "pass-2 spill", 100, true);
+        disk.add(Path::new("/output"), "intermediate overview", 200, true);
+        disk.add(Path::new("/staging"), "staged input", 300, false);
+        crate::test_log::take_thread_lines();
+        disk.log_projection();
+        if logging {
+            let lines = crate::test_log::take_thread_lines();
+            let line = lines
+                .iter()
+                .find(|line| line.starts_with("[disk]"))
+                .unwrap();
+            assert!(line.contains("pass-2 spill") && line.contains("intermediate overview"));
+            assert!(!line.contains("staged input"), "{line}");
+            assert!(!line.contains("simultaneous peak"), "{line}");
+        }
+    }
+
+    #[test]
     fn measured_prices_weight_levels_and_protect_unseen_and_canonical_rows() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.parquet");
@@ -580,6 +640,7 @@ mod tests {
             selection: None,
             options: &options,
             overview: &output,
+            archive: None,
             level_rows: &[2, 3, 5, 7],
             spilling_levels: 3,
             price: 100,
@@ -634,17 +695,16 @@ mod tests {
         let source = ConvertSource::resolve_path(&input).unwrap();
         let options = ConvertOptions::default();
         let raw = RawSinkSize::from_source(&source, None, &options).unwrap();
-        let mut disk = DiskFootprint::post_pass1(
+        let disk = DiskFootprint::post_pass1(
             &source,
             None,
             &options,
-            &dir.path().join("out.parquet"),
+            (&dir.path().join("out.parquet"), None),
             &[40_000, 1_000, 1],
             2,
             &[1_600; 3],
         )
         .unwrap();
-        disk.components.retain(|c| c.name != "output archive");
         // The first drain dominates: both spills still exist when I_0 finishes.
         let peak = disk.spill_bytes()
             + (40_000.0 * 1_600.0 * raw.intermediate_factor).ceil() as u64
@@ -677,14 +737,12 @@ mod tests {
             &source,
             None,
             &options,
-            &dir.path().join("out.parquet"),
+            (&dir.path().join("out.parquet"), None),
             &[1_000, 2_000, 40_000],
             2,
             &[1_600; 3],
         )
         .unwrap();
-        // Isolate conversion from the separately tested export allowance.
-        disk.components.retain(|c| c.name != "output archive");
         let intermediate = disk
             .components
             .iter()
@@ -736,11 +794,12 @@ mod tests {
             None,
         );
         let source = ConvertSource::resolve_path(&input).unwrap();
+        let archive = dir.path().join("tiles/out.pmtiles");
         let disk = DiskFootprint::post_pass1(
             &source,
             None,
             &ConvertOptions::default(),
-            &dir.path().join("out.parquet"),
+            (&dir.path().join("out.parquet"), Some(archive.as_path())),
             &[1_000, 40_000],
             1,
             &[1_600; 2],
@@ -758,7 +817,34 @@ mod tests {
             .find(|c| c.name == "output archive")
             .expect("export needs space while the whole intermediate exists");
         assert_eq!(output.bytes, intermediate.div_ceil(2));
-        assert_eq!(output.dir, dir.path());
+        assert_eq!(output.dir, archive.parent().unwrap());
+        // Separate volumes each need only their own export-phase bytes.
+        let separate = |p: &Path| {
+            let bytes = if p == output.dir {
+                output.bytes
+            } else {
+                intermediate
+            };
+            Some((p.display().to_string(), bytes + bytes / MARGIN_DENOM))
+        };
+        assert!(disk.warning_with(REMEDIES, separate).is_none());
+        for (short_dir, component, absent) in [
+            (
+                output.dir.as_path(),
+                "output archive",
+                "intermediate overview",
+            ),
+            (dir.path(), "intermediate overview", "output archive"),
+        ] {
+            let warning = disk
+                .warning_with(REMEDIES, |p| {
+                    let (key, free) = separate(p).unwrap();
+                    Some((key, free - u64::from(p == short_dir)))
+                })
+                .unwrap();
+            assert!(warning.contains(component), "{warning}");
+            assert!(!warning.contains(absent), "{warning}");
+        }
         let peak = intermediate + output.bytes;
         assert!(disk
             .warning_with(REMEDIES, |_| Some(("same".into(), peak + peak / 20)))
@@ -792,6 +878,7 @@ mod tests {
                 selection: None,
                 options: &options,
                 overview: &output,
+                archive: None,
                 level_rows: &[1, 1],
                 spilling_levels: 1,
                 price,
@@ -889,9 +976,16 @@ mod tests {
             );
         }
         // The unfiltered run still gets a shortage warning before pass 2.
-        let after =
-            DiskFootprint::post_pass1(&source, None, &options, &output, &[1, 1], 1, &[1_600; 2])
-                .unwrap();
+        let after = DiskFootprint::post_pass1(
+            &source,
+            None,
+            &options,
+            (&output, None),
+            &[1, 1],
+            1,
+            &[1_600; 2],
+        )
+        .unwrap();
         let warning = after
             .warning_with(REMEDIES, |_| Some(("one".into(), 0)))
             .unwrap();
@@ -922,7 +1016,7 @@ mod tests {
                 &source,
                 None,
                 &options,
-                &output,
+                (&output, None),
                 &[1, 1],
                 buffered_levels,
                 &[1_600; 2],
@@ -965,7 +1059,7 @@ mod tests {
                 &source,
                 None,
                 &options,
-                &dir.path().join("out.parquet"),
+                (&dir.path().join("out.parquet"), None),
                 &[10, 20],
                 1,
                 &[1_600; 2],
@@ -1055,7 +1149,7 @@ mod tests {
             &source,
             Some(&selection),
             &options,
-            &dir.path().join("out.parquet"),
+            (&dir.path().join("out.parquet"), None),
             &[80, 90],
             1,
             &[1_600; 2],
@@ -1108,6 +1202,7 @@ mod tests {
             let footprint = &lines[recheck];
             assert!(footprint.contains("intermediate overview"), "{footprint}");
             assert!(!footprint.contains("pass-2 spill"), "{footprint}");
+            assert!(!footprint.contains("output archive"), "{footprint}");
             assert!(backing < recheck, "{lines:#?}");
         }
     }
@@ -1136,9 +1231,16 @@ mod tests {
         // copied to every level. The finest level streams without spilling.
         let rows = [100; 10];
         let row_bytes = 1_600;
-        let after =
-            DiskFootprint::post_pass1(&source, None, &options, &output, &rows, 9, &[row_bytes; 10])
-                .unwrap();
+        let after = DiskFootprint::post_pass1(
+            &source,
+            None,
+            &options,
+            (&output, None),
+            &rows,
+            9,
+            &[row_bytes; 10],
+        )
+        .unwrap();
         let framing = RawSinkSize::from_source(&source, None, &options)
             .unwrap()
             .framing;
@@ -1168,9 +1270,17 @@ mod tests {
             ..options
         };
         assert_eq!(
-            DiskFootprint::post_pass1(&source, None, &speed, &output, &rows, 9, &[row_bytes; 10],)
-                .unwrap()
-                .spill_bytes(),
+            DiskFootprint::post_pass1(
+                &source,
+                None,
+                &speed,
+                (&output, None),
+                &rows,
+                9,
+                &[row_bytes; 10],
+            )
+            .unwrap()
+            .spill_bytes(),
             0
         );
     }

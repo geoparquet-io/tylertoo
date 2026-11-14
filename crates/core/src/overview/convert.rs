@@ -4169,6 +4169,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         options,
         strategy,
         &crate::diagnostics::Diagnostics::default(),
+        None,
     )
 }
 
@@ -4178,12 +4179,20 @@ pub(crate) fn convert_to_overviews_source_diagnostics(
     options: &ConvertOptions,
     strategy: super::stream::Pass2Strategy,
     diagnostics: &crate::diagnostics::Diagnostics,
+    archive: Option<&Path>,
 ) -> Result<ConvertReport, ConvertError> {
     options.validate()?;
     let adjusted = normalize_convert_options(source, options, Some(output_path), diagnostics)?;
     let options = adjusted.as_ref().unwrap_or(options);
     let validated = options.validate()?;
-    convert_to_overviews_validated(source, output_path, &validated, strategy, diagnostics)
+    convert_to_overviews_validated(
+        source,
+        output_path,
+        &validated,
+        strategy,
+        diagnostics,
+        archive,
+    )
 }
 
 fn convert_to_overviews_validated(
@@ -4192,11 +4201,12 @@ fn convert_to_overviews_validated(
     config: &super::config::ValidatedConfig<'_, ConvertOptions>,
     strategy: super::stream::Pass2Strategy,
     diagnostics: &crate::diagnostics::Diagnostics,
+    archive: Option<&Path>,
 ) -> Result<ConvertReport, ConvertError> {
     source.record_diagnostics(diagnostics);
     crate::atomic_output::check_writable(output_path)?;
     warn_if_unsorted(source, diagnostics);
-    super::stream::run_stages(source, output_path, config, strategy, diagnostics)
+    super::stream::run_stages(source, output_path, config, strategy, diagnostics, archive)
 }
 
 /// Snapshot (and `log::info!`) the remote fetch counters at the end of a
