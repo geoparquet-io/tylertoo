@@ -853,7 +853,10 @@ impl Regrouper {
     /// The I/O owner's cut of the queued rows (#858): the same rule the
     /// sequential reader cuts by, so the merge delivers its batches.
     fn bounded_rows(&self, max: usize) -> usize {
-        tylertoo_io::concat_prefix_rows(&self.queue, max, self.limit)
+        // Queued batches are in the reader's output schema.
+        self.queue.front().map_or(1, |front| {
+            tylertoo_io::concat_prefix_rows(&self.queue, &front.schema(), max, self.limit)
+        })
     }
     fn push(&mut self, batch: RecordBatch) {
         if batch.num_rows() > 0 {
@@ -864,10 +867,6 @@ impl Regrouper {
 
     /// Remove at most `n` rows, without joining past the reader's bound.
     /// `n` must be positive and `<= self.rows`.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "#779: I/O owner bounds the prefix before a segment seam is concatenated"
-    )] // #779: seam joins (#494)
     fn take(&mut self, n: usize) -> Result<RecordBatch, ConvertError> {
         debug_assert!(n > 0 && n <= self.rows);
         let n = self.bounded_rows(n);
@@ -901,7 +900,7 @@ impl Regrouper {
             }
         }
         self.rows -= n;
-        Ok(arrow_select::concat::concat_batches(&schema, &parts)?)
+        Ok(tylertoo_io::concat_delivered(&schema, &parts)?)
     }
 
     /// Remove a bounded prefix of the remainder, or `None` when empty.
@@ -1344,6 +1343,76 @@ mod read_tests {
             assert!(last_read_workers() > 1, "the fixture must read in parallel");
             assert_eq!(got, reference, "--read-workers {workers}");
         }
+    }
+
+    /// Six 60-row groups of `column(start)`, each holding 120 values of its
+    /// own in an Int8 dictionary, read by 2 to 4 workers: the batches one
+    /// reader cuts, with worker seams mid-batch so the merge joins two
+    /// groups' dictionaries (#857).
+    fn assert_parallel_reads_join_narrow_dictionaries(column: impl Fn(i64) -> ArrayRef) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.parquet");
+        let group = |start: i64| {
+            RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(Int64Array::from_iter_values(start..start + 60)) as ArrayRef,
+                ),
+                ("name", column(start)),
+            ])
+            .unwrap()
+        };
+        let mut w =
+            ArrowWriter::try_new(File::create(&path).unwrap(), group(0).schema(), None).unwrap();
+        for start in (0..360).step_by(60) {
+            w.write(&group(start)).unwrap();
+            w.flush().unwrap();
+        }
+        w.close().unwrap();
+        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        let reference = read_all(&source, 8_192, 1, None);
+        for workers in [2usize, 3, 4] {
+            let got = read_all(&source, 8_192, workers, None);
+            assert!(last_read_workers() > 1, "the fixture must read in parallel");
+            assert_eq!(got, reference, "--read-workers {workers}");
+        }
+    }
+
+    /// Rows `start..start + 60`'s 120 values, `v{2 * row}` and the next.
+    fn narrow_dictionary(start: i64) -> ArrayRef {
+        use arrow_array::types::Int8Type;
+        use arrow_array::DictionaryArray;
+        let names: Vec<String> = (2 * start..2 * start + 120)
+            .map(|i| format!("v{i}"))
+            .collect();
+        let names: DictionaryArray<Int8Type> = names.iter().map(String::as_str).collect();
+        Arc::new(names)
+    }
+
+    fn pairs(values: ArrayRef) -> ArrayRef {
+        let field = Arc::new(Field::new_list_field(values.data_type().clone(), true));
+        Arc::new(arrow_array::FixedSizeListArray::new(field, 2, values, None))
+    }
+
+    fn listed(values: ArrayRef, each: usize) -> ArrayRef {
+        let field = Arc::new(Field::new_list_field(values.data_type().clone(), true));
+        let offsets = arrow_buffer::OffsetBuffer::from_lengths(std::iter::repeat_n(each, 60));
+        Arc::new(arrow_array::ListArray::new(field, offsets, values, None))
+    }
+
+    #[test]
+    fn parallel_reads_join_listed_narrow_dictionaries() {
+        assert_parallel_reads_join_narrow_dictionaries(|s| listed(narrow_dictionary(s), 2));
+    }
+
+    #[test]
+    fn parallel_reads_join_fixed_size_lists_of_narrow_dictionaries() {
+        assert_parallel_reads_join_narrow_dictionaries(|s| pairs(narrow_dictionary(s)));
+    }
+
+    #[test]
+    fn parallel_reads_join_listed_fixed_size_lists_of_narrow_dictionaries() {
+        assert_parallel_reads_join_narrow_dictionaries(|s| listed(pairs(narrow_dictionary(s)), 1));
     }
 
     /// The whole contract in one assertion: for a batch size that does NOT

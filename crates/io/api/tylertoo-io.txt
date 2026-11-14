@@ -281,7 +281,8 @@ impl tylertoo_io::ConcurrentChunkReader for bytes::bytes::Bytes
 pub fn tylertoo_io::batch_writer<W: core::io::write::Write + core::marker::Send>(W, arrow_schema::schema::SchemaRef) -> core::result::Result<tylertoo_io::BatchWriter<W>, parquet::errors::ParquetError>
 pub fn tylertoo_io::byte_array_limit() -> u64
 pub fn tylertoo_io::check_byte_array_ceiling(&arrow_array::record_batch::RecordBatch) -> core::result::Result<(), arrow_schema::error::ArrowError>
-pub fn tylertoo_io::concat_prefix_rows<'a>(impl core::iter::traits::collect::IntoIterator<Item = &'a arrow_array::record_batch::RecordBatch>, usize, u64) -> usize
+pub fn tylertoo_io::concat_delivered(&arrow_schema::schema::SchemaRef, &[arrow_array::record_batch::RecordBatch]) -> core::result::Result<arrow_array::record_batch::RecordBatch, arrow_schema::error::ArrowError>
+pub fn tylertoo_io::concat_prefix_rows<'a>(impl core::iter::traits::collect::IntoIterator<Item = &'a arrow_array::record_batch::RecordBatch>, &arrow_schema::schema::Schema, usize, u64) -> usize
 pub fn tylertoo_io::decode_footer(&[u8]) -> core::result::Result<parquet::file::metadata::ParquetMetaData, parquet::errors::ParquetError>
 pub fn tylertoo_io::decoded_batch_limit() -> u64
 pub fn tylertoo_io::decoded_input_bytes(&parquet::file::metadata::ParquetMetaData, core::option::Option<&[usize]>, impl core::ops::function::Fn(usize) -> bool) -> u64
