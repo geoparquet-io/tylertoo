@@ -162,7 +162,12 @@ fn parquet_footer_seeds() {
         "parquet_footer",
         &[
             "seed-issue-690-num-children.thrift",
+            "seed-issue-789-i32-children.thrift",
+            "seed-issue-789-i64-typed-children.thrift",
             "seed-issue-789-oom.thrift",
+            "seed-issue-789-retyped-created-by.thrift",
+            "seed-issue-789-retyped-encodings.thrift",
+            "seed-issue-789-set-typed-schema.thrift",
         ],
         tylertoo_core::internal::overview::check::fuzz_parquet_footer,
     );
@@ -178,19 +183,35 @@ fn parquet_footer_seeds() {
     ));
     // Not just "no crash": with overcommit, parquet-rs's 12 GB reservation
     // succeeds and the decode fails later on its own, so only the error's
-    // kind proves the pre-check refused the footer first.
-    let (_, bytes) = seeds("parquet_footer")
-        .into_iter()
-        .find(|(n, _)| n == "seed-issue-690-num-children.thrift")
-        .unwrap();
-    let err = tylertoo_core::internal::overview::check::fuzz_parquet_footer(&bytes).unwrap_err();
-    assert!(
-        matches!(
-            tylertoo_io::input_error(&err),
-            Some(tylertoo_io::Error::HostileFooter(_))
-        ),
-        "#690's seed must be refused by the footer pre-check: {err:?}"
-    );
+    // kind proves the pre-check refused the footer first. #789's second
+    // input is a `num_children` that is negative as an i64 but 1.7 billion
+    // once parquet-rs truncates it to i32: a 13.8 GB reservation. The same
+    // count in an i64-typed field, or in a schema typed as a set, is read by
+    // parquet-rs by field id all the same. A `created_by` typed as an i32
+    // hid a second row-group list of 2^31 from a walk by wire type. A
+    // nightly input's `encodings` typed as a binary is a list to parquet-rs.
+    for seed in [
+        "seed-issue-690-num-children.thrift",
+        "seed-issue-789-i32-children.thrift",
+        "seed-issue-789-i64-typed-children.thrift",
+        "seed-issue-789-retyped-created-by.thrift",
+        "seed-issue-789-retyped-encodings.thrift",
+        "seed-issue-789-set-typed-schema.thrift",
+    ] {
+        let (_, bytes) = seeds("parquet_footer")
+            .into_iter()
+            .find(|(n, _)| n == seed)
+            .unwrap();
+        let err =
+            tylertoo_core::internal::overview::check::fuzz_parquet_footer(&bytes).unwrap_err();
+        assert!(
+            matches!(
+                tylertoo_io::input_error(&err),
+                Some(tylertoo_io::Error::HostileFooter(_))
+            ),
+            "{seed} must be refused by the footer pre-check: {err:?}"
+        );
+    }
 }
 
 #[test]

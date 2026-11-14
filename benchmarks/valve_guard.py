@@ -90,7 +90,7 @@ WALL_REGRESSION_MAX_BY_CELL = {"moldova-f0": 1.40}
 RSS_REGRESSION_MAX = 1.20
 CORES_DROP_MAX = 0.15  # a phase's median effective cores may fall 15% below the baseline's
 # Seeded into a recorded host class that has no `floors` yet; tighten them in
-# the baseline file as #813 lands (they are data there, not constants here).
+# the baseline file as core use rises (#876); they are data there, not here.
 DEFAULT_FLOORS = {"whole_cores_frac": 0.05, "serial_share_max": 0.10}
 SPEEDUP_DROP_MAX = 0.15  # 16-to-full-thread speedup may fall 15% below the baseline's
 CPU_RISE_MAX = 0.25      # a phase's CPU core-seconds may rise 25% over the baseline's (same output)

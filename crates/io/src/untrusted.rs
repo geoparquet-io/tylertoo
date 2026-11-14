@@ -15,9 +15,10 @@
 //! What the owner guarantees, in one place:
 //!
 //! - **A footer pre-check** before parquet-rs decodes a footer (#690):
-//!   [`precheck_footer`] walks the thrift bytes and refuses any list, map or
-//!   schema child count larger than the bytes or elements that could follow
-//!   it, so no footer-declared count sizes an allocation.
+//!   [`precheck_footer`] walks the thrift bytes as parquet-rs reads them
+//!   (#789) and refuses any list, map or schema child count larger than the
+//!   bytes or elements that could follow it, so no footer-declared count
+//!   sizes an allocation.
 //! - **Column chunk ranges inside the file** (#430), for local and remote
 //!   inputs alike: parquet's own `byte_range()` asserts on a negative offset,
 //!   and every later `start + len` trusts these numbers.
@@ -233,9 +234,10 @@ pub fn input_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&
 // Footer pre-check (#690)
 // ============================================================================
 
-/// Deepest struct/list nesting a footer may use. Real footers nest under
-/// ten levels (file → row group → column chunk → metadata → statistics);
-/// past this the bytes are an attack on a recursive decoder's stack.
+/// Deepest struct/list nesting a footer may use, and deepest schema tree.
+/// Real footers nest under ten levels (file → row group → column chunk →
+/// metadata → statistics), real schemas a few nested lists deep; past this
+/// the bytes are an attack on a recursive decoder's stack.
 const MAX_FOOTER_DEPTH: u32 = 64;
 
 /// Why [`Skim`] stopped.
@@ -346,10 +348,13 @@ impl Skim<'_> {
         Ok(())
     }
 
-    /// Skip `size` collection elements of compact type `elem`. A boolean
-    /// element is one byte in a collection, not a type nibble.
+    /// Skip `size` collection elements of compact type `elem`. parquet-rs
+    /// skips a boolean element as no bytes, though it is one on the wire, so
+    /// this does too: the walk must stay where parquet-rs is (#789).
     fn skip_elements(&mut self, elem: u8, size: usize, depth: u32) -> Result<(), SkimStop> {
-        let elem = if matches!(elem, 1 | 2) { 3 } else { elem };
+        if matches!(elem, 1 | 2) {
+            return Ok(());
+        }
         (0..size).try_for_each(|_| self.skip(elem, depth))
     }
 
@@ -357,8 +362,8 @@ impl Skim<'_> {
     fn skip(&mut self, ty: u8, depth: u32) -> Result<(), SkimStop> {
         Self::check_depth(depth)?;
         match ty {
-            // Booleans: the value is the type nibble of a field; in a
-            // collection it is one byte (handled by the caller passing 3).
+            // Booleans: the value is the type nibble of a field; parquet-rs
+            // skips a collection's as nothing too (`skip_elements`).
             1 | 2 => Ok(()),
             3 => self.advance(1),
             4..=6 => self.varint().map(drop),
@@ -373,6 +378,7 @@ impl Skim<'_> {
             }
             11 => self.skip_map(depth + 1),
             12 => self.fields(depth + 1, |s, _, ty| s.skip(ty, depth + 1)),
+            13 => self.advance(16),
             _ => Err(SkimStop::Confused),
         }
     }
@@ -383,6 +389,9 @@ impl Skim<'_> {
         let size = self.varint()?;
         self.check_count(size, 2, "map")?;
         let kv = if size == 0 { 0 } else { self.byte()? };
+        if matches!(kv >> 4, 1 | 2) && matches!(kv & 0x0f, 1 | 2) {
+            return Ok(()); // no bytes per pair, as in `skip_elements`
+        }
         (0..size).try_for_each(|_| {
             self.skip_elements(kv >> 4, 1, depth)?;
             self.skip_elements(kv & 0x0f, 1, depth)
@@ -390,7 +399,10 @@ impl Skim<'_> {
     }
 
     /// Walk one struct's fields, handing each `(field id, type)` to `field`,
-    /// which must consume the value.
+    /// which must consume the value. As in parquet-rs, any byte with a zero
+    /// type nibble ends the struct and a long-form id is truncated to i16. A
+    /// delta past i16 wraps: parquet-rs refuses it in a struct it reads and
+    /// never sees it in one it skips, so walking on is the safe side.
     fn fields(
         &mut self,
         depth: u32,
@@ -400,34 +412,62 @@ impl Skim<'_> {
         let mut last: i16 = 0;
         loop {
             let b = self.byte()?;
-            if b == 0 {
+            let ty = b & 0x0f;
+            if ty == 0 {
                 return Ok(());
             }
-            let ty = b & 0x0f;
             let id = match b >> 4 {
-                0 => i16::try_from(self.zigzag()?).map_err(|_| SkimStop::Confused)?,
-                delta => last
-                    .checked_add(i16::from(delta))
-                    .ok_or(SkimStop::Confused)?,
+                0 => self.zigzag()? as i16,
+                delta => last.wrapping_add(i16::from(delta)),
             };
             last = id;
             field(self, id, ty)?;
         }
     }
 
+    /// One field's value of wire type `ty`: as parquet-rs reads it when it
+    /// knows the field, else skipped as parquet-rs skips it.
+    fn field(&mut self, ty: u8, known: Option<Known>, depth: u32) -> Result<(), SkimStop> {
+        match known {
+            None => self.skip(ty, depth),
+            Some(Known::Wire(want)) => {
+                read_as(ty, want)?;
+                self.skip(ty, depth)
+            }
+            Some(Known::Struct(spec)) => {
+                read_as(ty, 12)?;
+                self.fields(depth + 1, |s, id, ty| s.field(ty, spec(id), depth + 1))
+            }
+            Some(Known::List(elem)) => {
+                read_as(ty, 9)?;
+                let (ty, size) = self.list_header()?;
+                (0..size).try_for_each(|_| self.field(ty, Some(*elem), depth + 1))
+            }
+        }
+    }
+
     /// `FileMetaData.schema` (field 2): a list of `SchemaElement`s whose
-    /// `num_children` (field 5) each must fit in the elements after it.
+    /// `num_children` (field 5) each must fit in the elements after it, in a
+    /// tree no deeper than [`MAX_FOOTER_DEPTH`]: parquet-rs builds the tree
+    /// by recursion, one frame per level (#789).
     fn schema(&mut self, depth: u32) -> Result<(), SkimStop> {
         let (elem, size) = self.list_header()?;
         if elem != 12 {
             return self.skip_elements(elem, size, depth + 1);
         }
+        // The children still to come of each group the next element is in.
+        let mut open = [0i32; MAX_FOOTER_DEPTH as usize];
+        let mut nested = 0;
         for index in 0..size {
             let after = size - index - 1;
+            let mut children = 0;
             self.fields(depth + 1, |s, id, ty| {
-                if id == 5 && ty == 5 {
-                    let children = s.zigzag()?;
-                    if children > after as i64 {
+                if id == 5 {
+                    read_as(ty, 5)?;
+                    // parquet-rs reads an i32 by truncating the zigzag i64, so
+                    // an i64 that is negative here can be 1.7 billion there (#789).
+                    children = s.zigzag()? as i32;
+                    if i64::from(children) > after as i64 {
                         return Err(SkimStop::Hostile(format!(
                             "schema element {index} declares {children} children, but only \
                              {after} schema elements follow it"
@@ -435,12 +475,196 @@ impl Skim<'_> {
                     }
                     Ok(())
                 } else {
-                    s.skip(ty, depth + 2)
+                    s.field(ty, schema_element(id), depth + 2)
                 }
             })?;
+            if nested > 0 {
+                open[nested - 1] -= 1;
+            }
+            if children > 0 {
+                if nested == open.len() {
+                    return Err(SkimStop::Hostile(format!(
+                        "schema element {index} nests more than {MAX_FOOTER_DEPTH} groups deep"
+                    )));
+                }
+                open[nested] = children;
+                nested += 1;
+            }
+            while nested > 0 && open[nested - 1] == 0 {
+                nested -= 1;
+            }
         }
         Ok(())
     }
+}
+
+/// How parquet-rs reads a field it knows, by id: as this compact type, as
+/// a struct whose fields it knows by this table, or as a list of these,
+/// whatever wire type the field declares (#789). The tables mirror parquet
+/// 59's decoder (`file/metadata/thrift`), not the thrift spec: a field it
+/// skips is left out.
+#[derive(Clone, Copy)]
+enum Known {
+    Wire(u8),
+    Struct(fn(i16) -> Option<Known>),
+    List(&'static Known),
+}
+
+const VARINT: Known = Known::Wire(5);
+const BINARY: Known = Known::Wire(8);
+const BOOL: Known = Known::Wire(1);
+
+/// Refuse a known field whose wire type parquet-rs would read as `want`.
+/// The walk skips by wire type, so it would leave parquet-rs's position and
+/// miss the counts parquet-rs then reads. An honest writer never does this.
+fn read_as(ty: u8, want: u8) -> Result<(), SkimStop> {
+    // Same bytes on the wire: bools (none), zigzag varints, list headers.
+    let family = |t: u8| match t {
+        2 => 1,
+        4 | 6 => 5,
+        10 => 9,
+        t => t,
+    };
+    if family(ty) == family(want) {
+        Ok(())
+    } else {
+        Err(SkimStop::Hostile(format!(
+            "a footer field of wire type {ty} is one parquet reads as type {want}"
+        )))
+    }
+}
+
+/// `FileMetaData`'s fields, but the schema (2, [`Skim::schema`]). Without
+/// parquet's `encryption` feature, 8 and 9 are skipped.
+fn file_metadata(id: i16) -> Option<Known> {
+    match id {
+        1 | 3 => Some(VARINT),
+        4 => Some(Known::List(&Known::Struct(row_group))),
+        5 => Some(Known::List(&Known::Struct(key_value))),
+        6 => Some(BINARY),
+        7 => Some(Known::List(&Known::Struct(column_order))),
+        _ => None,
+    }
+}
+
+fn key_value(id: i16) -> Option<Known> {
+    matches!(id, 1 | 2).then_some(BINARY)
+}
+
+/// A union of one empty struct.
+fn column_order(id: i16) -> Option<Known> {
+    (id == 1).then_some(Known::Struct(|_| None))
+}
+
+fn row_group(id: i16) -> Option<Known> {
+    match id {
+        1 => Some(Known::List(&Known::Struct(column_chunk))),
+        2 | 3 | 5 | 7 => Some(VARINT),
+        4 => Some(Known::List(&Known::Struct(sorting_column))),
+        _ => None,
+    }
+}
+
+fn sorting_column(id: i16) -> Option<Known> {
+    match id {
+        1 => Some(VARINT),
+        2 | 3 => Some(BOOL),
+        _ => None,
+    }
+}
+
+/// `ColumnChunk`; 8 and 9 as in [`file_metadata`].
+fn column_chunk(id: i16) -> Option<Known> {
+    match id {
+        1 => Some(BINARY),
+        2 | 4..=7 => Some(VARINT),
+        3 => Some(Known::Struct(column_metadata)),
+        _ => None,
+    }
+}
+
+/// `ColumnMetaData`; parquet-rs skips 3 and 8.
+fn column_metadata(id: i16) -> Option<Known> {
+    match id {
+        1 | 4..=7 | 9..=11 | 14 | 15 => Some(VARINT),
+        2 => Some(Known::List(&VARINT)),
+        12 => Some(Known::Struct(statistics)),
+        13 => Some(Known::List(&Known::Struct(page_encoding_stats))),
+        16 => Some(Known::Struct(size_statistics)),
+        17 => Some(Known::Struct(geospatial_statistics)),
+        _ => None,
+    }
+}
+
+fn statistics(id: i16) -> Option<Known> {
+    match id {
+        1 | 2 | 5 | 6 => Some(BINARY),
+        3 | 4 => Some(VARINT),
+        7 | 8 => Some(BOOL),
+        _ => None,
+    }
+}
+
+fn page_encoding_stats(id: i16) -> Option<Known> {
+    (1..=3).contains(&id).then_some(VARINT)
+}
+
+fn size_statistics(id: i16) -> Option<Known> {
+    match id {
+        1 => Some(VARINT),
+        2 | 3 => Some(Known::List(&VARINT)),
+        _ => None,
+    }
+}
+
+/// Its bounding box (1) holds doubles.
+fn geospatial_statistics(id: i16) -> Option<Known> {
+    match id {
+        1 => Some(Known::Struct(|id| {
+            (1..=8).contains(&id).then_some(Known::Wire(7))
+        })),
+        2 => Some(Known::List(&VARINT)),
+        _ => None,
+    }
+}
+
+/// `SchemaElement`'s fields, but `num_children` ([`Skim::schema`]).
+fn schema_element(id: i16) -> Option<Known> {
+    match id {
+        1..=3 | 6..=9 => Some(VARINT),
+        4 => Some(BINARY),
+        10 => Some(Known::Struct(logical_type)),
+        _ => None,
+    }
+}
+
+/// `LogicalType`'s variants, each a struct.
+fn logical_type(id: i16) -> Option<Known> {
+    let variant: fn(i16) -> Option<Known> = match id {
+        1..=4 | 6 | 11..=15 => |_| None,
+        5 => |id| matches!(id, 1 | 2).then_some(VARINT),
+        7 | 8 => |id| match id {
+            1 => Some(BOOL),
+            2 => Some(Known::Struct(|id| {
+                (1..=3).contains(&id).then_some(Known::Struct(|_| None))
+            })),
+            _ => None,
+        },
+        10 => |id| match id {
+            1 => Some(Known::Wire(3)),
+            2 => Some(BOOL),
+            _ => None,
+        },
+        16 => |id| (id == 1).then_some(Known::Wire(3)),
+        17 => |id| (id == 1).then_some(BINARY),
+        18 => |id| match id {
+            1 => Some(BINARY),
+            2 => Some(VARINT),
+            _ => None,
+        },
+        _ => return None,
+    };
+    Some(Known::Struct(variant))
 }
 
 /// Refuse a thrift `FileMetaData` footer whose declared counts could make
@@ -452,8 +676,14 @@ impl Skim<'_> {
 /// libFuzzer's). This walks the footer once, allocating nothing, and checks
 /// every list, set and map size against the bytes that remain, every schema
 /// element's child count against the elements that follow, and the nesting
-/// depth. Bytes it cannot make sense of are left to parquet-rs, which
-/// reports its own error: the pre-check only ever refuses a count.
+/// depth of the thrift and of the schema tree. Bytes it cannot make sense of
+/// are left to parquet-rs, which reports its own error.
+///
+/// The counts are the ones parquet-rs will read (#789). parquet-rs reads a
+/// field it knows by its id and its own type, whatever wire type the field
+/// declares, so the walk does too ([`Known`]): it refuses a known field
+/// whose wire type would make the two read different bytes, and skips every
+/// other field as parquet-rs skips it.
 ///
 /// Each declared count is floored at its element type's smallest wire size
 /// (`min_wire_bytes`), not its decoded size. A struct element can be one
@@ -472,10 +702,11 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
         pos: 0,
     };
     let walked = skim.fields(0, |s, id, ty| {
-        if id == 2 && ty == 9 {
+        if id == 2 {
+            read_as(ty, 9)?;
             s.schema(1)
         } else {
-            s.skip(ty, 1)
+            s.field(ty, file_metadata(id), 1)
         }
     });
     match walked {
@@ -828,21 +1059,31 @@ fn decoded_limit(offset_limit: u64) -> u64 {
 }
 
 /// Rows the next delivered batch takes from the row stream `batches`: the
-/// most, up to `max_rows` and at least one, whose [`rows_bytes`] fit the
-/// byte bound.
+/// most, up to `max_rows` and at least one, that fit the bounds.
+///
+/// Their [`rows_bytes`] fit the byte bound, and their values in each
+/// dictionary of `schema` with 8- or 16-bit keys inside a list fit its key
+/// ([`listed_values`], #857).
 ///
 /// The one batch-cutting rule for every reader and the parallel read's
 /// regrouping (#858). It depends only on the rows, not on how they are split
 /// into `batches` or which representation holds them, so a part read by one
-/// reader or by several merged back is cut into the same batches.
+/// reader or by several merged back is cut into the same batches. `schema`
+/// is the one the rows are delivered in.
+///
+/// Values are counted, not distinct values: the count is the same in decoded
+/// views and in dictionaries, and needs only list offsets. A list column of
+/// many repeated narrow-key values is therefore cut into small batches.
 pub fn concat_prefix_rows<'a>(
     batches: impl IntoIterator<Item = &'a RecordBatch>,
+    schema: &arrow_schema::Schema,
     max_rows: usize,
     limit: u64,
 ) -> usize {
     let bound = limit.min(decoded_limit(limit));
     let max_rows = max_rows.max(1);
     let (mut rows, mut bytes) = (0usize, 0u64);
+    let mut held = Vec::new();
     for batch in batches {
         let room = batch.num_rows().min(max_rows - rows);
         let cost = |n: usize| {
@@ -850,19 +1091,20 @@ pub fn concat_prefix_rows<'a>(
                 b.saturating_add(rows_bytes(column.as_ref(), 0, n))
             })
         };
+        let values = |n: usize| add_listed_values(&held, batch, schema, n);
         let all = cost(room);
-        if all <= bound {
-            (rows, bytes) = (rows + room, all);
+        if let Some(sum) = values(room).filter(|_| all <= bound) {
+            (rows, bytes, held) = (rows + room, all, sum);
             if rows == max_rows {
                 break;
             }
             continue;
         }
-        // Row costs are positive, so prefix costs are monotone.
+        // Row costs and values are positive, so prefix sums are monotone.
         let (mut lo, mut hi) = (0, room);
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            if cost(mid) <= bound {
+            if cost(mid) <= bound && values(mid).is_some() {
                 lo = mid;
             } else {
                 hi = mid;
@@ -872,6 +1114,64 @@ pub fn concat_prefix_rows<'a>(
         break;
     }
     rows.max(1)
+}
+
+/// Join `parts`, delivered batches of `schema`, into one batch as a reader
+/// joins its decodes (#857).
+///
+/// The rows must be no more than [`concat_prefix_rows`] cuts. arrow's concat
+/// appends whole dictionaries where it does not merge them (under a
+/// fixed-size list, or of values other than bytes and primitives) and panics
+/// past the key, so a column with a dictionary of 8- or 16-bit keys is joined
+/// in its decoded views and cast back: the cut holds its values, so its
+/// distinct values, within the key.
+///
+/// # Errors
+///
+/// An error from arrow's concat or cast, as a reader's join returns one.
+pub fn concat_delivered(
+    schema: &SchemaRef,
+    parts: &[RecordBatch],
+) -> Result<RecordBatch, ArrowError> {
+    let columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let target = field.data_type();
+            let decoded = |part: &RecordBatch| match narrow_key(target) {
+                true => arrow_cast::cast(part.column(i), &wide_type(target)),
+                false => Ok(part.column(i).clone()),
+            };
+            let decoded = parts.iter().map(decoded).collect::<Result<Vec<_>, _>>()?;
+            let decoded: Vec<_> = decoded.iter().map(AsRef::as_ref).collect();
+            let joined = arrow_select::concat::concat(&decoded)?;
+            match narrow_key(target) {
+                true => arrow_cast::cast(&joined, target),
+                false => Ok(joined),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let rows = parts.iter().map(RecordBatch::num_rows).sum();
+    RecordBatch::try_new_with_options(
+        schema.clone(),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+}
+
+/// Whether `data_type` holds a dictionary with 8- or 16-bit keys.
+fn narrow_key(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    match data_type {
+        DataType::Dictionary(key, value) => key_capacity(key).is_some() || narrow_key(value),
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => narrow_key(f.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| narrow_key(f.data_type())),
+        _ => false,
+    }
 }
 
 /// Bytes rows `start..end` of `array` take once decoded, summed row by row
@@ -1073,22 +1373,28 @@ fn projected_field(
     original.clone().with_data_type(target)
 }
 
+/// The values an 8- or 16-bit dictionary key indexes.
+fn key_capacity(key: &arrow_schema::DataType) -> Option<usize> {
+    use arrow_schema::DataType;
+    match key {
+        DataType::Int8 => Some(1 << 7),
+        DataType::UInt8 => Some(1 << 8),
+        DataType::Int16 => Some(1 << 15),
+        DataType::UInt16 => Some(1 << 16),
+        _ => None,
+    }
+}
+
 /// The most rows of `data_type` a batch can hold with no dictionary in it
 /// with 8- or 16-bit keys indexing past its key, when one is in it outside
-/// a variable-length list ([`listed_dictionary`]).
+/// a variable-length list ([`listed_values`]).
 fn dictionary_capacity(data_type: &arrow_schema::DataType) -> Option<usize> {
     use arrow_schema::DataType;
     match data_type {
-        DataType::Dictionary(key, value) => {
-            let own = match key.as_ref() {
-                DataType::Int8 => Some(1 << 7),
-                DataType::UInt8 => Some(1 << 8),
-                DataType::Int16 => Some(1 << 15),
-                DataType::UInt16 => Some(1 << 16),
-                _ => None,
-            };
-            own.into_iter().chain(dictionary_capacity(value)).min()
-        }
+        DataType::Dictionary(key, value) => key_capacity(key)
+            .into_iter()
+            .chain(dictionary_capacity(value))
+            .min(),
         DataType::FixedSizeList(f, k) => {
             dictionary_capacity(f.data_type()).map(|c| (c / (*k).max(1) as usize).max(1))
         }
@@ -1100,24 +1406,97 @@ fn dictionary_capacity(data_type: &arrow_schema::DataType) -> Option<usize> {
     }
 }
 
-/// Whether `data_type` holds a dictionary with 8- or 16-bit keys in a
-/// variable-length list, whose values no row count bounds.
-fn listed_dictionary(data_type: &arrow_schema::DataType) -> bool {
+/// Push `(values, key capacity)` for each dictionary of `target` with 8- or
+/// 16-bit keys inside a variable-length list, in schema order: the values
+/// rows `start..end` of `array` hold in it. No row count bounds them (#857).
+/// `array` is of `target`'s types or the reader's decoded views; their
+/// offsets agree. A dictionary in another's values is not reached: arrow
+/// cannot cast to a dictionary of lists.
+fn listed_values(
+    array: &dyn arrow_array::Array,
+    target: &arrow_schema::DataType,
+    (start, end): (usize, usize),
+    listed: bool,
+    out: &mut Vec<(usize, usize)>,
+) {
+    use arrow_array::cast::AsArray;
     use arrow_schema::DataType;
-    match data_type {
-        DataType::List(f) | DataType::LargeList(f) | DataType::Map(f, _) => {
-            narrow_dictionary(f.data_type())
+    let range = |o: &[i32]| (o[start] as usize, o[end] as usize);
+    match target {
+        DataType::Dictionary(key, _) if listed => {
+            out.extend(key_capacity(key).map(|capacity| (end - start, capacity)));
         }
-        DataType::FixedSizeList(f, _) => listed_dictionary(f.data_type()),
-        DataType::Dictionary(_, value) => listed_dictionary(value),
-        DataType::Struct(fields) => fields.iter().any(|f| listed_dictionary(f.data_type())),
-        _ => false,
+        DataType::List(f) => {
+            let a = array.as_list::<i32>();
+            listed_values(
+                a.values().as_ref(),
+                f.data_type(),
+                range(a.value_offsets()),
+                true,
+                out,
+            );
+        }
+        DataType::LargeList(f) => {
+            let a = array.as_list::<i64>();
+            let o = a.value_offsets();
+            let range = (o[start] as usize, o[end] as usize);
+            listed_values(a.values().as_ref(), f.data_type(), range, true, out);
+        }
+        DataType::Map(f, _) => {
+            let a = array.as_map();
+            listed_values(
+                a.entries(),
+                f.data_type(),
+                range(a.value_offsets()),
+                true,
+                out,
+            );
+        }
+        DataType::FixedSizeList(f, k) => {
+            let k = *k as usize;
+            let values = array.as_fixed_size_list().values();
+            listed_values(
+                values.as_ref(),
+                f.data_type(),
+                (start * k, end * k),
+                listed,
+                out,
+            );
+        }
+        DataType::Struct(fields) => {
+            for (column, f) in array.as_struct().columns().iter().zip(fields) {
+                listed_values(column.as_ref(), f.data_type(), (start, end), listed, out);
+            }
+        }
+        _ => {}
     }
 }
 
-/// Whether `data_type` holds a dictionary with 8- or 16-bit keys anywhere.
-fn narrow_dictionary(data_type: &arrow_schema::DataType) -> bool {
-    dictionary_capacity(data_type).is_some() || listed_dictionary(data_type)
+/// `held` plus the [`listed_values`] of `batch`'s first `n` rows, or `None`
+/// when one would pass its key: the cast back to `schema`, or a concat that
+/// merges dictionaries, holds no more distinct values than that (#857).
+fn add_listed_values(
+    held: &[usize],
+    batch: &RecordBatch,
+    schema: &arrow_schema::Schema,
+    n: usize,
+) -> Option<Vec<usize>> {
+    let mut values = Vec::new();
+    for (column, field) in batch.columns().iter().zip(schema.fields()) {
+        listed_values(
+            column.as_ref(),
+            field.data_type(),
+            (0, n),
+            false,
+            &mut values,
+        );
+    }
+    let held = held.iter().chain(std::iter::repeat(&0));
+    values
+        .iter()
+        .zip(held)
+        .map(|(&(v, capacity), &h)| Some(h + v).filter(|&sum| sum <= capacity))
+        .collect()
 }
 
 fn wide_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
@@ -1302,7 +1681,7 @@ pub fn read_batch_plan(
 /// its keys can index: a batch, here or in a caller's regrouping to the
 /// yield, can then hold no more distinct values than the key indexes, which
 /// the cast back would refuse (#857). A dictionary in a variable-length list
-/// is not joined past the decode, and can still pass it.
+/// is bounded by its values instead, in the cut ([`concat_prefix_rows`]).
 fn batch_plan(
     reader: &ReaderMetadata,
     row_groups: Option<&[usize]>,
@@ -1411,14 +1790,6 @@ fn batch_plan(
         .filter_map(|t| dictionary_capacity(t))
         .min()
         .unwrap_or(usize::MAX);
-    // shortcut: a listed dictionary only keeps its decode batches, as before
-    // #848, and a list's values can still overflow its key; upgrade when #857
-    // bounds the cut by distinct values.
-    let joined = if fields.iter().any(|t| listed_dictionary(t)) {
-        decode
-    } else {
-        joined
-    };
     // No more rows than the key indexes: however a batch is cut and joined,
     // it holds no more distinct values (#857).
     (decode.min(capacity), joined.min(capacity))
@@ -2105,16 +2476,21 @@ impl Iterator for UntrustedBatchReader {
         let schema = self.schema.clone();
         let limit = self.limit;
         let item = guard("parquet page", || {
-            let (batch, compact) =
-                match join_decoded(&mut self.inner, &mut self.joined, self.join_rows, limit)? {
-                    Ok(cut) => cut,
-                    Err(_) if self.page_eof.load(Ordering::Relaxed) => {
-                        return Some(Err(ArrowError::ExternalError(Box::new(
-                            InputError::HostilePageHeader,
-                        ))));
-                    }
-                    Err(e) => return Some(Err(e)),
-                };
+            let (batch, compact) = match join_decoded(
+                &mut self.inner,
+                &mut self.joined,
+                &schema,
+                self.join_rows,
+                limit,
+            )? {
+                Ok(cut) => cut,
+                Err(_) if self.page_eof.load(Ordering::Relaxed) => {
+                    return Some(Err(ArrowError::ExternalError(Box::new(
+                        InputError::HostilePageHeader,
+                    ))));
+                }
+                Err(e) => return Some(Err(e)),
+            };
             // The cut keeps every batch of two or more rows under both
             // ceilings; a row that alone passes one is refused.
             if batch.num_rows() == 1 {
@@ -2184,6 +2560,7 @@ impl Iterator for UntrustedBatchReader {
 fn join_decoded(
     inner: &mut impl Iterator<Item = Result<RecordBatch, ArrowError>>,
     carry: &mut Option<RecordBatch>,
+    target: &arrow_schema::Schema,
     rows: usize,
     limit: u64,
 ) -> Option<Result<(RecordBatch, bool), ArrowError>> {
@@ -2198,10 +2575,11 @@ fn join_decoded(
     };
     let schema = first.schema();
     let (mut held, mut bytes) = (first.num_rows(), batch_bytes(&first));
+    let mut values = add_listed_values(&[], &first, target, first.num_rows());
     let (mut parts, mut unjoined) = (vec![first], 1);
-    // Past the bound the cut is known: the row after an oversized one is not
+    // Past a bound the cut is known: the row after an oversized one is not
     // decoded before the reader refuses it.
-    while held < rows && bytes <= bound {
+    while held < rows && bytes <= bound && values.is_some() {
         let batch = match inner.next() {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => return Some(Err(e)),
@@ -2209,12 +2587,13 @@ fn join_decoded(
         };
         held += batch.num_rows();
         bytes = bytes.saturating_add(batch_bytes(&batch));
+        values = values.and_then(|v| add_listed_values(&v, &batch, target, batch.num_rows()));
         parts.push(batch);
         unjoined += 1;
         // Joined JOIN_CHUNK at a time while decoding: an unjoined one-row
         // batch holds the schema's whole fixed Arrow overhead. Not once the
         // cut is known: a piece past the bound is never copied.
-        if unjoined == JOIN_CHUNK && held < rows && bytes <= bound {
+        if unjoined == JOIN_CHUNK && held < rows && bytes <= bound && values.is_some() {
             let chunk = parts.split_off(parts.len() - JOIN_CHUNK);
             match arrow_select::concat::concat_batches(&schema, &chunk) {
                 Ok(joined) => parts.push(joined),
@@ -2224,7 +2603,7 @@ fn join_decoded(
         }
     }
     // Every row before the last part fits, so the cut falls in the last.
-    let cut = concat_prefix_rows(&parts, rows, limit);
+    let cut = concat_prefix_rows(&parts, target, rows, limit);
     let last = parts.pop()?;
     let keep = cut - (held - last.num_rows());
     if keep < last.num_rows() {
@@ -3091,7 +3470,8 @@ mod tests {
         let limit = 100_000;
         let mut carry = None;
         let (mut sizes, mut firsts) = (Vec::new(), Vec::new());
-        while let Some(batch) = join_decoded(&mut inner, &mut carry, 1_000, limit) {
+        let schema = inner.schema();
+        while let Some(batch) = join_decoded(&mut inner, &mut carry, &schema, 1_000, limit) {
             let (batch, _) = batch.unwrap();
             let cost: u64 = batch
                 .columns()
@@ -3209,7 +3589,8 @@ mod tests {
         let mut carry = None;
         let mut ids = Vec::new();
         let mut sizes = Vec::new();
-        while let Some(batch) = join_decoded(&mut inner, &mut carry, 8, 100_000) {
+        let schema = inner.schema();
+        while let Some(batch) = join_decoded(&mut inner, &mut carry, &schema, 8, 100_000) {
             let (batch, _) = batch.unwrap();
             sizes.push(batch.num_rows());
             ids.extend(
@@ -3253,7 +3634,8 @@ mod tests {
             .build()
             .unwrap();
         let mut carry = None;
-        let (joined, _) = join_decoded(&mut inner, &mut carry, 1_000, 100_000)
+        let schema = inner.schema();
+        let (joined, _) = join_decoded(&mut inner, &mut carry, &schema, 1_000, 100_000)
             .unwrap()
             .unwrap();
         assert_eq!(joined.num_rows(), JOIN_CHUNK - 1);
@@ -3337,6 +3719,90 @@ mod tests {
         assert_eq!(rows, 2_048);
     }
 
+    /// #857: a `List<Dictionary(Int8, Utf8)>` column whose 100-row groups
+    /// each hold 200 distinct list values, written from 50-row batches of
+    /// 100 values (each fits the key). Rows do not bound list values, so a
+    /// row-count plan alone overflows the Int8 key on the cast back.
+    #[test]
+    fn listed_narrow_dictionaries_read_within_their_key() {
+        use arrow_array::builder::{ListBuilder, StringDictionaryBuilder};
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int8Type;
+        use arrow_array::ArrayRef;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        let file = tempfile::tempfile().unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let mut writer = None;
+        for part in 0..4 {
+            let mut tags = ListBuilder::new(StringDictionaryBuilder::<Int8Type>::new());
+            for value in 0..100 {
+                tags.values()
+                    .append_value(format!("v{}", part * 100 + value));
+                if value % 2 == 1 {
+                    tags.append(true);
+                }
+            }
+            let batch = RecordBatch::try_from_iter([("tags", Arc::new(tags.finish()) as ArrayRef)])
+                .unwrap();
+            writer
+                .get_or_insert_with(|| {
+                    ArrowWriter::try_new(
+                        file.try_clone().unwrap(),
+                        batch.schema(),
+                        Some(props.clone()),
+                    )
+                    .unwrap()
+                })
+                .write(&batch)
+                .unwrap();
+        }
+        writer.unwrap().close().unwrap();
+        let reader = open_parquet(file).unwrap().build().unwrap();
+        let schema = reader.schema();
+        let batches: Vec<RecordBatch> = reader.map(|batch| batch.unwrap()).collect();
+        // The key is not widened: callers see the schema the file declares.
+        assert!(matches!(
+            schema.field(0).data_type(),
+            arrow_schema::DataType::List(item) if matches!(
+                item.data_type(),
+                arrow_schema::DataType::Dictionary(key, _) if **key == arrow_schema::DataType::Int8
+            )
+        ));
+        let values: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let list = batch.column(0).as_list::<i32>();
+                let tags = arrow_cast::cast(list.values(), &arrow_schema::DataType::Utf8).unwrap();
+                tags.as_string::<i32>()
+                    .iter()
+                    .map(|v| v.unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            values,
+            (0..400).map(|v| format!("v{v}")).collect::<Vec<_>>()
+        );
+        // The parallel read regroups delivered batches (core's `Regrouper`)
+        // by the same cut: 64 two-value rows, which join within the key.
+        // A seam mid-batch joins two delivered batches' dictionaries.
+        assert_eq!(batches[0].num_rows(), 64);
+        let parts = [batches[0].slice(32, 32), batches[1].clone()];
+        let cut = concat_prefix_rows(&parts, &schema, 400, byte_array_limit());
+        assert_eq!(cut, 64);
+        let parts = [parts[0].clone(), parts[1].slice(0, 32)];
+        let joined = concat_delivered(&schema, &parts).unwrap();
+        assert_eq!(joined.schema(), schema);
+        let list = joined.column(0).as_list::<i32>();
+        let tags = arrow_cast::cast(list.values(), &arrow_schema::DataType::Utf8).unwrap();
+        let tags: Vec<&str> = tags.as_string::<i32>().iter().map(Option::unwrap).collect();
+        let want: Vec<String> = (64..192).map(|v| format!("v{v}")).collect();
+        assert_eq!(tags, want);
+    }
+
     #[test]
     fn dictionary_capacity_counts_fixed_size_list_values() {
         use arrow_schema::{DataType, Field};
@@ -3345,10 +3811,8 @@ mod tests {
         assert_eq!(dictionary_capacity(&dict), Some(128));
         let pairs = DataType::FixedSizeList(item.clone(), 2);
         assert_eq!(dictionary_capacity(&pairs), Some(64));
-        assert!(!listed_dictionary(&pairs));
         let list = DataType::List(item);
         assert_eq!(dictionary_capacity(&list), None);
-        assert!(listed_dictionary(&list));
     }
 
     /// Two 100-row groups of 120 Int64 list values per row: 108 KB of list
@@ -3504,8 +3968,8 @@ mod tests {
     /// ten doubles need 80 bytes, so 16 remaining bytes refuse it.
     #[test]
     fn a_list_of_doubles_needs_eight_bytes_each() {
-        // Field 1, type list; list of 10 doubles; 15 bytes; struct stop.
-        let mut footer = vec![0x19, 0xA7];
+        // Field 10 (unknown), type list; list of 10 doubles; 15 bytes; stop.
+        let mut footer = vec![0xA9, 0xA7];
         footer.extend_from_slice(&[0u8; 15]);
         footer.push(0);
         let err = super::precheck_footer(&footer).unwrap_err().to_string();

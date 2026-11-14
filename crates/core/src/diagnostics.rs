@@ -105,7 +105,18 @@ pub enum Diagnostic {
     #[non_exhaustive]
     ValveDropped { count: usize },
     #[non_exhaustive]
-    TilesOverLimit { count: usize },
+    TilesOverLimit {
+        count: usize,
+        /// The largest of those tiles by stored (compressed) size, at most
+        /// [`crate::stats::DEFAULT_LARGEST`], ranked as `tylertoo stats` ranks
+        /// them (#873).
+        #[serde(default)]
+        largest: Vec<crate::stats::LargestTile>,
+        /// Those tiles that hold merged features, which the merge valve
+        /// never drops; 0 under the drop valve.
+        #[serde(default)]
+        merged_tiles: usize,
+    },
     #[non_exhaustive]
     PropertySkipped {
         count: usize,
@@ -260,7 +271,7 @@ macro_rules! event_count {
             | Self::ValidationSkipped { count }
             | Self::Merged { count }
             | Self::ValveDropped { count }
-            | Self::TilesOverLimit { count }
+            | Self::TilesOverLimit { count, .. }
             | Self::PropertySkipped { count, .. }
             | Self::CrsMetadata { count, .. }
             | Self::CoveringRejected { count, .. }
@@ -307,6 +318,21 @@ impl Diagnostic {
             (Self::UnusableGeometry { total: a, .. }, Self::UnusableGeometry { total: b, .. }) => {
                 *a = a.saturating_add(*b)
             }
+            (
+                Self::TilesOverLimit {
+                    largest: a,
+                    merged_tiles: m,
+                    ..
+                },
+                Self::TilesOverLimit {
+                    largest: b,
+                    merged_tiles: n,
+                    ..
+                },
+            ) => {
+                crate::stats::keep_largest(a, b.iter().copied());
+                *m = m.saturating_add(*n);
+            }
             _ => {}
         }
         *self.count_mut() = count;
@@ -351,6 +377,14 @@ impl Diagnostic {
                     c.max_abs = 0.0;
                 }
                 Diagnostic::UnusableGeometry { total, .. } => *total = 0,
+                Diagnostic::TilesOverLimit {
+                    largest,
+                    merged_tiles,
+                    ..
+                } => {
+                    largest.clear();
+                    *merged_tiles = 0;
+                }
                 _ => {}
             }
             event
@@ -388,7 +422,17 @@ impl fmt::Display for Diagnostic {
             Self::ValidationSkipped {..} => write!(f, "{n} oversized RDP candidate(s) skipped exact validity checking and were assumed valid (#242)"),
             Self::Merged {..} => write!(f, "{n} tile feature(s) merged by the size valve"),
             Self::ValveDropped {..} => write!(f, "{n} tile feature(s) dropped by the size valve"),
-            Self::TilesOverLimit {..} => write!(f, "{n} tile(s) still over the size limit after the size valve, written as is"),
+            Self::TilesOverLimit {largest,merged_tiles,..} => {
+                write!(f, "{n} tile(s) still over the size limit after the size valve, written as is")?;
+                if !largest.is_empty() {
+                    let tiles: Vec<String> = largest.iter().map(|t| format!("z{}/{}/{} ({} B compressed)", t.z, t.x, t.y, t.bytes)).collect();
+                    write!(f, "; largest: {}", tiles.join(", "))?;
+                }
+                if *merged_tiles > 0 {
+                    write!(f, "; {merged_tiles} of them hold merged features, which the merge valve never drops: try --size-valve drop, which drops features to fit the cap")?;
+                }
+                Ok(())
+            }
             Self::PropertySkipped {name,data_type,..} => write!(f, "property {name:?} ({data_type}) skipped: no MVT encoding"),
             Self::CrsMetadata {reason,..} => reason.fmt(f),
             Self::CoveringRejected {reason,..} => write!(f, "bbox covering fast path declined: {reason}; reading the geometry column"),

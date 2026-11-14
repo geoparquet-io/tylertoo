@@ -189,6 +189,8 @@ pub use pyramid::{
     build_pyramid, merge_bands, merge_bands_with_options, Band, BandMergeOptions, BandSpecError,
     PyramidError, PyramidOptions, PyramidReport,
 };
+// The largest tiles a report lists (stats, and tiles left over the size cap).
+pub use stats::LargestTile;
 // Decode: PMTiles -> GeoParquet.
 pub use decode::{decode_pmtiles, DecodeError, DecodeOptions, DecodeReport};
 // Shared: option validation, diagnostics, errors and their classifier.
