@@ -2943,7 +2943,7 @@ fn preflight_with_memory_limit(
         options,
         overview,
     )?
-    .warning(super::tiles::CLI_REMEDIES)
+    .warning(super::disk::RECHECK_REMEDIES)
     {
         diagnostics.warn(message);
     }

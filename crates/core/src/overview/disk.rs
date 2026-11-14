@@ -15,7 +15,7 @@ use super::tiles::SpaceRemedies;
 const MARGIN_DENOM: u64 = 20;
 
 /// Rechecks run in core and reach both frontends through logging.
-const RECHECK_REMEDIES: SpaceRemedies<'_> = SpaceRemedies {
+pub(super) const RECHECK_REMEDIES: SpaceRemedies<'_> = SpaceRemedies {
     spill_dir: "--spill-dir (CLI) or spill_dir (Python)",
     keep_overview: "--keep-overview (CLI) or keep_overview (Python)",
 };
