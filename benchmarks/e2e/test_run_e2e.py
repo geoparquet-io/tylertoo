@@ -61,6 +61,7 @@ def test_a_failing_required_leg_raises(tmp_path):
     ("madagascar-adm4", True), ("open-buildings", True),
     ("road-detections", False), ("ftw-moldova-z10", True),
     ("fieldmaps-boundaries", False),
+    ("custom", False),
 ])
 def test_decay_expectations_require_an_eligible_polygon_cohort(tmp_path, monkeypatch, fixture, expected):
     from types import SimpleNamespace
@@ -81,6 +82,15 @@ def test_decay_expectations_require_an_eligible_polygon_cohort(tmp_path, monkeyp
     assert run_e2e.run_invariants(args, {fixture: {"path": __file__, "layer": "test"}}) == 0
     verifier = next(argv for argv in calls if "--strict" in argv)
     assert ("--expect-decay" in verifier) is expected
+
+
+def test_dataset_help_limits_decay_expectations_to_built_in_fixtures(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["run_e2e.py", "--help"])
+    with pytest.raises(SystemExit) as exc:
+        run_e2e.main()
+    assert exc.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "skips --expect-decay (only established for built-in fixtures)" in help_text
 
 
 def test_after_warmup_hook_and_needs(tmp_path):

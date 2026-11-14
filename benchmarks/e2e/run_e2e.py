@@ -695,7 +695,7 @@ def run_invariants(args, datasets: dict) -> int:
                      "--exemptions", str(args.exemptions),
                      "--fixture", did, "--settings", sname,
                      "--json-out", str(out_json)]
-            if decay and (did, sname) not in INVARIANT_NO_DECAY:
+            if decay and did in DATASETS and (did, sname) not in INVARIANT_NO_DECAY:
                 vargv.append("--expect-decay")
             t1 = time.monotonic()
             vp = subprocess.run(vargv)
@@ -744,7 +744,8 @@ def main() -> int:
                     help="restrict to these dataset ids (repeatable)")
     ap.add_argument("--dataset", action="append", default=[],
                     metavar="ID=PATH",
-                    help="register an extra GeoParquet dataset (cluster-scale runs)")
+                    help="register an extra GeoParquet dataset (cluster-scale runs); "
+                         "skips --expect-decay (only established for built-in fixtures)")
     ap.add_argument("--corpus", action="store_true",
                     help="also register every corpus/manifest.json dataset "
                          "(gpio-optimized copies; build them with "
