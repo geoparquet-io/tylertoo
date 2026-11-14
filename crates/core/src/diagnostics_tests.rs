@@ -460,3 +460,62 @@ fn streamed_reports_preserve_the_previous_output_on_serialization_error() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous report");
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
+
+/// #873: over-limit tiles from several runs (bands, cell zooms) fold into
+/// one diagnostic that keeps only the largest, ranked as `stats` ranks them.
+#[test]
+fn over_limit_tiles_merge_across_runs_and_stay_bounded() {
+    use crate::stats::{LargestTile, DEFAULT_LARGEST};
+    let tile = |x: u32, bytes: u64| LargestTile {
+        z: 9,
+        x,
+        y: 0,
+        bytes,
+    };
+    let event = |xs: std::ops::Range<u32>| Diagnostic::TilesOverLimit {
+        count: xs.len(),
+        merged_tiles: xs.len() / 2,
+        largest: xs.map(|x| tile(x, 1_000 + u64::from(x % 4))).collect(),
+    };
+    let sink = Diagnostics::default();
+    sink.extend([event(0..8), event(8..16)]);
+    let events = sink.snapshot();
+    assert_eq!(events.len(), 1);
+    let Diagnostic::TilesOverLimit {
+        count,
+        largest,
+        merged_tiles,
+    } = &events[0]
+    else {
+        panic!("{events:?}");
+    };
+    assert_eq!((*count, *merged_tiles), (16, 8));
+    // bytes descending, then tile id (here x) ascending.
+    let expected: Vec<_> = [3, 7, 11, 15, 2, 6, 10, 14, 1, 5]
+        .into_iter()
+        .map(|x| tile(x, 1_000 + u64::from(x % 4)))
+        .collect();
+    assert_eq!(largest.len(), DEFAULT_LARGEST);
+    assert_eq!(*largest, expected);
+    assert!(events[0]
+        .to_string()
+        .contains("; 8 of them hold merged features"));
+    // Tiles with nothing merged (the drop valve's, a report from before
+    // #873) get no pointer to `--size-valve drop`.
+    let legacy: Diagnostic =
+        serde_json::from_str(r#"{"kind":"tiles_over_limit","count":1}"#).unwrap();
+    assert_eq!(
+        legacy.to_string(),
+        "1 tile(s) still over the size limit after the size valve, written as is"
+    );
+    let unmerged = Diagnostic::TilesOverLimit {
+        count: 1,
+        largest: vec![tile(0, 600)],
+        merged_tiles: 0,
+    };
+    assert_eq!(
+        unmerged.to_string(),
+        "1 tile(s) still over the size limit after the size valve, written as is; \
+         largest: z9/0/0 (600 B compressed)"
+    );
+}

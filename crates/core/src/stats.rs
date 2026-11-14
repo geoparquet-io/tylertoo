@@ -63,13 +63,29 @@ pub struct ZoomStats {
 }
 
 /// One of the `--largest` biggest tiles in the archive, by stored size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct LargestTile {
     pub z: u8,
     pub x: u32,
     pub y: u32,
     pub bytes: u64,
+}
+
+/// Merge `more` into `list`, keeping the [`DEFAULT_LARGEST`] largest in
+/// [`StatsReport::largest`]'s order: bytes descending, ties by tile id.
+pub(crate) fn keep_largest(
+    list: &mut Vec<LargestTile>,
+    more: impl IntoIterator<Item = LargestTile>,
+) {
+    list.extend(more);
+    list.sort_unstable_by_key(|t| {
+        (
+            Reverse(t.bytes),
+            crate::pmtiles_writer::tile_id(t.z, t.x, t.y),
+        )
+    });
+    list.truncate(DEFAULT_LARGEST);
 }
 
 /// Per-zoom tile-weight report.

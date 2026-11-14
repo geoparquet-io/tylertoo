@@ -862,6 +862,13 @@ pub struct ZoomReport {
     /// hold every finest-level feature under them, with nothing stored
     /// below. 0 without [`ExportOptions::variable_depth`].
     pub stopped_tiles: usize,
+    /// The largest of `over_limit_tiles`, for the diagnostic that lists them
+    /// (#873).
+    #[serde(skip)]
+    over_limit_largest: Vec<crate::stats::LargestTile>,
+    /// How many of `over_limit_tiles` hold merged features (#873).
+    #[serde(skip)]
+    over_limit_merged: usize,
 }
 
 /// Result of an export, `Serialize` for the `--report` JSON.
@@ -3037,8 +3044,13 @@ impl ExportReport {
         sink.record(Diagnostic::ValveDropped {
             count: self.valve_dropped_features,
         });
+        let mut largest = Vec::new();
+        let tiles = self.zooms.iter().flat_map(|z| &z.over_limit_largest);
+        crate::stats::keep_largest(&mut largest, tiles.copied());
         sink.record(Diagnostic::TilesOverLimit {
             count: self.over_limit_tiles,
+            largest,
+            merged_tiles: self.zooms.iter().map(|z| z.over_limit_merged).sum(),
         });
         for column in &self.skipped_property_columns {
             sink.once(Diagnostic::PropertySkipped {
@@ -3053,7 +3065,11 @@ impl ExportReport {
         self.encode_quantized_features = sink.count(&Diagnostic::EncodeQuantized { count: 0 });
         self.merged_features = sink.count(&Diagnostic::Merged { count: 0 });
         self.valve_dropped_features = sink.count(&Diagnostic::ValveDropped { count: 0 });
-        self.over_limit_tiles = sink.count(&Diagnostic::TilesOverLimit { count: 0 });
+        self.over_limit_tiles = sink.count(&Diagnostic::TilesOverLimit {
+            count: 0,
+            largest: Vec::new(),
+            merged_tiles: 0,
+        });
         Ok(self)
     }
 
@@ -4538,6 +4554,10 @@ struct LevelTally {
     spill_bytes: u64,
     /// #803: the level's stopped tiles written so far.
     terminals: usize,
+    /// The largest tiles the valve left over the limit, and how many of
+    /// those tiles hold merged features (#873).
+    over_limit_largest: Vec<crate::stats::LargestTile>,
+    over_limit_merged: usize,
 }
 
 /// Append one wave's encoded tiles to the writer in order, and add them to
@@ -4612,6 +4632,16 @@ fn write_tile(
             tally.oversized += 1;
         }
         tally.valve.over_limit += t.valve.over_limit;
+        if t.valve.over_limit > 0 {
+            let tile = crate::stats::LargestTile {
+                z: zoom,
+                x: t.x,
+                y: t.y,
+                bytes: t.data.len() as u64,
+            };
+            crate::stats::keep_largest(&mut tally.over_limit_largest, [tile]);
+            tally.over_limit_merged += usize::from(t.valve.merged > 0);
+        }
         writer.add_tile_precompressed(
             crate::tile::TileCoord {
                 z: zoom,
@@ -4704,6 +4734,8 @@ fn finish_level(
         fill_vertices: tally.fill.vertices,
         fill_shed: tally.fill.shed,
         stopped_tiles: tally.terminals,
+        over_limit_largest: tally.over_limit_largest.clone(),
+        over_limit_merged: tally.over_limit_merged,
     }
 }
 
@@ -18238,6 +18270,16 @@ mod tests {
             .collect();
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].count(), report.over_limit_tiles);
+        // #873: only the tiles holding merged features count toward the
+        // `--size-valve drop` hint; the lone line's tiles do not.
+        let crate::diagnostics::Diagnostic::TilesOverLimit { merged_tiles, .. } = summary[0] else {
+            unreachable!()
+        };
+        assert!(
+            (1..report.over_limit_tiles).contains(merged_tiles),
+            "{merged_tiles} of {}",
+            report.over_limit_tiles
+        );
     }
 
     /// #814: `max_zoom_simplify_factor` thins the finest zoom's tiles, keeps
