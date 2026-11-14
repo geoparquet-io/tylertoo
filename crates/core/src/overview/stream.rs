@@ -3855,6 +3855,8 @@ pub(crate) fn run_stages(
         (num_rows > 0).then(|| geom_bytes / num_rows as u64),
         row_bytes,
     );
+    // shortcut: a mid-pass Auto Ram->Spill downgrade is not priced here; the
+    // downgrade re-measures at run time. Price it if a full disk is ever reported.
     let spilling_levels = if matches!(backing, pipeline::SinkBacking::Spill) {
         buffered_levels(emitted, finest, options).len()
     } else {
