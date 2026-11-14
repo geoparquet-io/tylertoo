@@ -837,9 +837,9 @@ struct SinkAutoTuner {
     /// per row they materialize: per output row of an owned batch, per
     /// shared row of a shared one (#852), whose output rows are positions.
     bytes: u64,
-    /// Materialized Arrow payload, without RAM allocation overhead and with
-    /// shared properties charged at every referencing level.
-    disk_bytes: u64,
+    /// Per-level (payload bytes, rows), without RAM allocation overhead.
+    /// Shared properties are charged at every referencing level.
+    disk_levels: Vec<(u64, u64)>,
     /// Output rows the plan expects the buffered levels to hold in total.
     planned_rows: usize,
     /// the `MemoryBudget` allowance, captured once.
@@ -847,7 +847,7 @@ struct SinkAutoTuner {
     /// A downgrade is still possible: `auto`, and the sinks are still Ram.
     armed: bool,
     downgraded: bool,
-    /// `disk_bytes` stops counting once this is set, so `disk_bytes_per_row` is
+    /// `disk_levels` stops counting once this is set, so `disk_bytes_per_row` is
     /// only meaningful up to the check.
     disk_checked: bool,
 }
@@ -882,7 +882,7 @@ impl SinkAutoTuner {
     fn new(
         profile: MemoryProfile,
         backing: SinkBacking,
-        planned_rows: usize,
+        planned_rows: &[usize],
         memory: MemoryBudget,
     ) -> Self {
         let armed = matches!(profile, MemoryProfile::Auto) && matches!(backing, SinkBacking::Ram);
@@ -891,7 +891,9 @@ impl SinkAutoTuner {
         } else {
             0
         };
-        Self::with_budget(armed, planned_rows, budget_bytes)
+        let mut tuner = Self::with_budget(armed, planned_rows.iter().sum(), budget_bytes);
+        tuner.disk_levels.resize(planned_rows.len(), (0, 0));
+        tuner
     }
 
     /// [`SinkAutoTuner::new`] with the RAM budget supplied instead of probed —
@@ -904,7 +906,7 @@ impl SinkAutoTuner {
         Self {
             rows: 0,
             bytes: 0,
-            disk_bytes: 0,
+            disk_levels: vec![(0, 0)],
             planned_rows,
             budget_bytes,
             armed,
@@ -915,10 +917,12 @@ impl SinkAutoTuner {
 
     /// Fold one output batch — the exact value about to be buffered — into
     /// the measurement. Runs for every batch of the pass.
-    fn observe(&mut self, batch: &LevelBatch) {
+    fn observe(&mut self, li: usize, batch: &LevelBatch) {
         self.rows += batch.num_rows();
         if !self.disk_checked {
-            self.disk_bytes = self.disk_bytes.saturating_add(batch.disk_bytes());
+            let (bytes, rows) = &mut self.disk_levels[li];
+            *bytes = bytes.saturating_add(batch.disk_bytes());
+            *rows = rows.saturating_add(batch.num_rows() as u64);
         }
         let floor = match batch {
             LevelBatch::Owned(b) => b.num_rows() as u64 * SINK_ROW_ALLOC_OVERHEAD_BYTES,
@@ -948,19 +952,20 @@ impl SinkAutoTuner {
         (self.rows > 0).then(|| self.bytes / self.rows as u64)
     }
 
-    fn disk_bytes_per_row(&self) -> Option<u64> {
-        (self.rows > 0).then(|| self.disk_bytes.div_ceil(self.rows as u64))
+    fn disk_bytes_per_row(&self, li: usize) -> Option<u64> {
+        let (bytes, rows) = self.disk_levels[li];
+        (rows > 0).then(|| bytes.div_ceil(rows))
     }
 
-    /// Reprice disk once at the first decision-grade sample, after both
-    /// shared bytes and the current output batch's rows were observed.
-    fn check_disk(
-        &mut self,
-        check: &mut dyn FnMut(u64) -> Result<(), ConvertError>,
-    ) -> Result<(), ConvertError> {
+    /// Reprice disk once at the first decision-grade sample, after all levels
+    /// from the current input batch have been observed.
+    fn check_disk(&mut self, check: &mut super::disk::DiskCheck<'_>) -> Result<(), ConvertError> {
         if !self.disk_checked && self.rows >= SINK_SAMPLE_MIN_ROWS {
             self.disk_checked = true;
-            check(self.disk_bytes_per_row().expect("sample has rows"))?;
+            let prices: Vec<_> = (0..self.disk_levels.len())
+                .map(|li| self.disk_bytes_per_row(li))
+                .collect();
+            check(&prices)?;
         }
         Ok(())
     }
@@ -1162,6 +1167,136 @@ fn array_data_bytes(data: &arrow_data::ArrayData) -> u64 {
         .saturating_add(data.child_data().iter().map(array_data_bytes).sum::<u64>())
 }
 
+/// Geometry payload covering a contiguous range, without materializing it. Offset
+/// boundaries trim variable buffers and nested geometry children. Unknown
+/// layouts retain their complete buffers. Union children use enclosing
+/// ranges, which can overprice interleaved child values but never average
+/// away the large ones. `framing` includes offset terminators, unused union
+/// children and whole-buffer fallbacks; selections pay those once, then
+/// measure each run's variable payload without traversing empty children.
+fn array_range_bytes(data: &arrow_data::ArrayData, start: usize, len: usize, framing: bool) -> u64 {
+    use arrow_schema::{DataType, UnionMode};
+    if len == 0 && !framing {
+        return 0;
+    }
+    let terminator = usize::from(framing);
+    let start = data.offset() + start;
+    let end = start + len;
+    let validity = data.nulls().map_or(0, |_| (len as u64).div_ceil(8));
+    if let Some(width) = data.data_type().primitive_width() {
+        return validity + (len * width) as u64;
+    }
+    let span32 = || {
+        let offsets = data.buffers()[0].typed_data::<i32>();
+        (
+            offsets[start] as usize,
+            (offsets[end] - offsets[start]) as usize,
+        )
+    };
+    let span64 = || {
+        let offsets = data.buffers()[0].typed_data::<i64>();
+        (
+            offsets[start] as usize,
+            (offsets[end] - offsets[start]) as usize,
+        )
+    };
+    validity
+        + match data.data_type() {
+            DataType::List(_) => {
+                let (at, count) = span32();
+                ((len + terminator) * 4) as u64
+                    + array_range_bytes(&data.child_data()[0], at, count, framing)
+            }
+            DataType::LargeList(_) => {
+                let (at, count) = span64();
+                ((len + terminator) * 8) as u64
+                    + array_range_bytes(&data.child_data()[0], at, count, framing)
+            }
+            DataType::FixedSizeList(_, width) => array_range_bytes(
+                &data.child_data()[0],
+                start * *width as usize,
+                len * *width as usize,
+                framing,
+            ),
+            DataType::Struct(_) => data
+                .child_data()
+                .iter()
+                .map(|child| array_range_bytes(child, start, len, framing))
+                .sum(),
+            DataType::Union(fields, UnionMode::Dense) => {
+                let types = data.buffers()[0].typed_data::<i8>();
+                let offsets = data.buffers()[1].typed_data::<i32>();
+                // Sparse pool selections commonly contain one point per run.
+                // Do not initialize a union-wide range table for one value.
+                if len == 1 && !framing {
+                    let child = fields
+                        .iter()
+                        .position(|(id, _)| id == types[start])
+                        .expect("a union value has a child");
+                    return validity
+                        + 5
+                        + array_range_bytes(
+                            &data.child_data()[child],
+                            offsets[start] as usize,
+                            1,
+                            false,
+                        );
+                }
+                let mut ranges = [(usize::MAX, 0); 256];
+                for row in start..end {
+                    let range = &mut ranges[types[row] as u8 as usize];
+                    range.0 = range.0.min(offsets[row] as usize);
+                    range.1 = range.1.max(offsets[row] as usize + 1);
+                }
+                (len * 5) as u64
+                    + fields
+                        .iter()
+                        .zip(data.child_data())
+                        .map(|((id, _), child)| {
+                            let (first, last) = ranges[id as u8 as usize];
+                            if first == usize::MAX {
+                                if framing {
+                                    array_range_bytes(child, 0, 0, true)
+                                } else {
+                                    0
+                                }
+                            } else {
+                                array_range_bytes(child, first, last - first, framing)
+                            }
+                        })
+                        .sum::<u64>()
+            }
+            _ => return if framing { array_data_bytes(data) } else { 0 },
+        }
+}
+
+/// Consecutive positions can be priced together. Keep disjoint runs separate
+/// so a coarse selection does not pay for large geometries in its gaps.
+fn selected_ranges(index: &UInt32Array) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for &at in index.values() {
+        let at = at as usize;
+        if let Some((start, len)) = ranges.last_mut() {
+            if *start + *len == at {
+                *len += 1;
+                continue;
+            }
+        }
+        ranges.push((at, 1));
+    }
+    ranges
+}
+
+fn selected_array_bytes(array: &ArrayRef, ranges: &[(usize, usize)]) -> u64 {
+    let data = array.to_data();
+    // Offset terminators, empty union children and unknown layouts'
+    // complete-buffer fallbacks are shared by the runs, not repeated.
+    let empty = array_range_bytes(&data, 0, 0, true);
+    ranges.iter().fold(empty, |sum, &(start, len)| {
+        sum.saturating_add(array_range_bytes(&data, start, len, false))
+    })
+}
+
 /// A shared level batch's geometries in [`SharedRows`]' geometry column.
 #[derive(Clone)]
 pub(super) enum LevelGeometry {
@@ -1268,11 +1403,16 @@ impl LevelBatch {
                     .sum::<u64>()
                     .saturating_mul(count)
                     .div_ceil(rows.rows.max(1) as u64);
-                // Ranges concatenate levels; pools hold distinct geometries.
-                // Price geometry by its own row count, not property row count.
-                let geometries = bytes(&rows.geometry)
-                    .saturating_mul(count)
-                    .div_ceil(rows.geometry.len().max(1) as u64);
+                // Only this level's geometry, not the pool-wide average:
+                // coarse simplified rows can be much smaller than fine ones.
+                let geometries = match geometry {
+                    LevelGeometry::Range(at, len) => {
+                        array_range_bytes(&rows.geometry.to_data(), *at, *len, true)
+                    }
+                    LevelGeometry::Pool(at) => {
+                        selected_array_bytes(&rows.geometry, &selected_ranges(at))
+                    }
+                };
                 let positions = match geometry {
                     LevelGeometry::Pool(at) => array_data_bytes(&at.to_data()),
                     LevelGeometry::Range(..) => 0,
@@ -1422,10 +1562,9 @@ fn buffer_batch(
     sink: &mut LevelSink,
     tuner: &mut SinkAutoTuner,
     batch: LevelBatch,
-    disk_check: &mut dyn FnMut(u64) -> Result<(), ConvertError>,
+    li: usize,
 ) -> Result<u64, ConvertError> {
-    tuner.observe(&batch);
-    tuner.check_disk(disk_check)?;
+    tuner.observe(li, &batch);
     sink.push(batch)
 }
 
@@ -1722,7 +1861,7 @@ pub(super) fn run_pass2_buffered(
     hints: &[usize],
     read: StreamRead<'_>,
     inputs: BufferOptions<'_>,
-    disk_check: &mut dyn FnMut(u64) -> Result<(), ConvertError>,
+    disk_check: &mut super::disk::DiskCheck<'_>,
 ) -> Result<Pass2EngineResult, ConvertError> {
     let StreamRead {
         source,
@@ -1755,7 +1894,7 @@ pub(super) fn run_pass2_buffered(
     let mut spill_bytes = vec![0u64; num_levels];
     // #626: measures what a buffered row really costs and, for `auto`, flips
     // the sinks to spill once if the measured rate projects past the budget.
-    let mut tuner = SinkAutoTuner::new(profile, backing, hints.iter().sum(), budget);
+    let mut tuner = SinkAutoTuner::new(profile, backing, hints, budget);
     #[cfg(test)]
     spill_tests::TUNER_ARMING.with(|c| {
         c.set((
@@ -1872,9 +2011,10 @@ pub(super) fn run_pass2_buffered(
                             rows_ref[li] += out.num_rows();
                             verts_ref[li] += v;
                             spill_bytes_ref[li] +=
-                                buffer_batch(&mut sinks_ref[li], tuner_ref, out, disk_check)?;
+                                buffer_batch(&mut sinks_ref[li], tuner_ref, out, li)?;
                         }
                     }
+                    tuner_ref.check_disk(disk_check)?;
                     downgrade_if_due(
                         tuner_ref,
                         sinks_ref,
@@ -2682,11 +2822,14 @@ mod spill_tests {
             &dir.join("output.parquet"),
             &rows,
             buffered,
-            MemoryBudget::with_available(None).output_row_bytes(
-                options.mode,
-                None,
-                Some(row_bytes),
-            ),
+            &vec![
+                MemoryBudget::with_available(None).output_row_bytes(
+                    options.mode,
+                    None,
+                    Some(row_bytes),
+                );
+                rows.len()
+            ],
         )
         .unwrap();
         [before, after]
@@ -3604,6 +3747,143 @@ mod sink_sample_tests {
     const ROWS: usize = 4_096;
 
     #[test]
+    fn measured_disk_check_waits_until_all_input_batch_levels_are_buffered() {
+        let mut tuner = SinkAutoTuner::with_budget(false, 2 * ROWS, 0);
+        tuner.disk_levels.resize(2, (0, 0));
+        let mut sinks = [LevelSink::Ram(Vec::new()), LevelSink::Ram(Vec::new())];
+        let mut checks = Vec::new();
+        for (li, sink) in sinks.iter_mut().enumerate() {
+            buffer_batch(sink, &mut tuner, LevelBatch::Owned(sample_batch(li)), li).unwrap();
+            assert!(
+                !tuner.disk_checked,
+                "disk check fired inside the per-level loop"
+            );
+        }
+        tuner
+            .check_disk(&mut |prices| {
+                checks.push(prices.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].iter().all(Option::is_some));
+        let measured = tuner.disk_levels.clone();
+        // Subsequent batches still update RAM sizing, but never disk sampling.
+        tuner.observe(0, &LevelBatch::Owned(sample_batch(200)));
+        tuner
+            .check_disk(&mut |_| panic!("only one recheck"))
+            .unwrap();
+        assert_eq!(tuner.disk_levels, measured);
+        assert_eq!(tuner.rows, 3 * ROWS);
+    }
+
+    fn assert_shared_geometry_sample(pooled: bool) {
+        use geoarrow::array::GeometryBuilder;
+        use geoarrow::datatypes::{CoordType, GeometryType};
+        use geoarrow_array::GeoArrowArray;
+
+        let tiny = geo::LineString::from(vec![(0., 0.), (1., 1.), (0., 0.)]);
+        let huge =
+            geo::LineString::from((0..10_000).map(|i| (f64::from(i), 0.)).collect::<Vec<_>>());
+        for polygon in [false, true] {
+            let geometry = |line| {
+                if polygon {
+                    geo::Geometry::Polygon(geo::Polygon::new(line, vec![]))
+                } else {
+                    geo::Geometry::LineString(line)
+                }
+            };
+            for coord_type in [CoordType::Interleaved, CoordType::Separated] {
+                let mut builder = GeometryBuilder::new(
+                    GeometryType::new(Default::default()).with_coord_type(coord_type),
+                )
+                .with_prefer_multi(false);
+                let mut geoms = [
+                    geometry(tiny.clone()),
+                    geometry(tiny.clone()),
+                    geometry(huge.clone()),
+                    geometry(tiny.clone()),
+                ];
+                if !pooled {
+                    geoms.swap(0, 2); // Also exercise a Range with a nonzero start.
+                }
+                builder.extend_from_iter(geoms.iter().map(Some));
+                let geometry = builder.finish().to_array_ref();
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "geometry",
+                    geometry.data_type().clone(),
+                    false,
+                )]));
+                let average = array_data_bytes(&geometry.to_data()) * 2 / 4;
+                let shared = Arc::new(SharedRows {
+                    columns: Vec::new(),
+                    rows: 2,
+                    geometry,
+                });
+                let index = UInt32Array::from(vec![0, 1]);
+                let selection = if pooled {
+                    LevelGeometry::Pool(UInt32Array::from(vec![0, 3]))
+                } else {
+                    LevelGeometry::Range(1, 2)
+                };
+                let positions = array_data_bytes(&index.to_data()) + if pooled { 8 } else { 0 };
+                let batch = LevelBatch::shared(schema, &shared, index, selection, 0, Vec::new());
+                let measured = batch.disk_bytes() - positions;
+                let materialized = batch.materialize(true).unwrap();
+                let actual = array_data_bytes(&materialized.column(0).to_data());
+                assert!(
+                    measured * 100 < average,
+                    "measured {measured}, pool average {average}"
+                );
+                // Offset terminators for empty union children are paid once;
+                // for these contiguous child ranges that matches Arrow take exactly.
+                assert_eq!(
+                    measured, actual,
+                    "pooled={pooled}, polygon={polygon}, {coord_type:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn measured_disk_geometry_range_excludes_the_huge_pool_member() {
+        assert_shared_geometry_sample(false);
+    }
+
+    #[test]
+    fn measured_disk_geometry_pool_excludes_the_huge_pool_member() {
+        assert_shared_geometry_sample(true);
+    }
+
+    #[test]
+    fn measured_disk_prices_keep_different_level_widths_separate() {
+        let cheap = LevelBatch::Owned(sample_batch(0));
+        let expensive = LevelBatch::Owned(sample_batch(200));
+        let cheap_price = cheap.disk_bytes().div_ceil(ROWS as u64);
+        let mut tuner = SinkAutoTuner::with_budget(false, 2 * ROWS, 0);
+        tuner.disk_levels.resize(3, (0, 0));
+        tuner.observe(0, &cheap);
+        tuner.observe(1, &expensive);
+        // A wide level must not raise the measured price of a narrow level.
+        let expensive_price = expensive.disk_bytes().div_ceil(ROWS as u64);
+        let mut checks = Vec::new();
+        tuner
+            .check_disk(&mut |prices| {
+                checks.push(prices.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        tuner.observe(0, &expensive);
+        tuner
+            .check_disk(&mut |_| panic!("only one recheck"))
+            .unwrap();
+        assert_eq!(
+            checks,
+            [vec![Some(cheap_price), Some(expensive_price), None]]
+        );
+    }
+
+    #[test]
     fn measured_disk_price_charges_shared_properties_at_every_level() {
         let n = ROWS;
         let input = RecordBatch::try_from_iter(vec![
@@ -3654,14 +3934,17 @@ mod sink_sample_tests {
                     })
                     .collect();
                 let mut tuner = SinkAutoTuner::with_budget(false, total_rows, 0);
+                tuner.disk_levels.resize(level_count, (0, 0));
                 tuner.observe_shared(&per_level);
-                for (level, _) in per_level.iter().flatten() {
-                    tuner.observe(level);
+                for (li, out) in per_level.iter().enumerate() {
+                    if let Some((level, _)) = out {
+                        tuner.observe(li, level);
+                    }
                 }
                 let mut prices = Vec::new();
                 tuner
                     .check_disk(&mut |price| {
-                        prices.push(price);
+                        prices.push(price.to_vec());
                         Ok(())
                     })
                     .unwrap();
@@ -3669,7 +3952,7 @@ mod sink_sample_tests {
                     prices,
                     // 2048 string bytes + 4 offset + 8 geometry + 4 index
                     // (+ 4 pool index), rounded up for the final string offset.
-                    [if pooled { 2_069 } else { 2_065 }],
+                    [vec![Some(if pooled { 2_069 } else { 2_065 }); level_count]],
                     "{level_count} levels, pooled {pooled}"
                 );
             }
@@ -3677,7 +3960,7 @@ mod sink_sample_tests {
     }
 
     #[test]
-    fn measured_disk_price_for_narrow_rows_keeps_footer_price_without_rechecking() {
+    fn measured_disk_price_for_narrow_rows_rechecks_at_the_lower_price() {
         use super::super::disk::DiskRecheck;
         use crate::input_set::ConvertSource;
 
@@ -3700,6 +3983,7 @@ mod sink_sample_tests {
             level_rows: &[ROWS, ROWS],
             spilling_levels: 1,
             price: 100,
+            prices: Vec::new(),
             warned: false,
         };
         // Plenty of spare capacity, but only three tiny values per row.
@@ -3720,13 +4004,13 @@ mod sink_sample_tests {
         ])
         .unwrap();
         let mut tuner = SinkAutoTuner::with_budget(false, ROWS, 0);
-        tuner.observe(&LevelBatch::Owned(batch));
+        tuner.observe(0, &LevelBatch::Owned(batch));
         let mut probes = 0;
         let mut warning = None;
         tuner
             .check_disk(&mut |price| {
                 // 1 string byte + 4 offset + two 8-byte values, rounded up.
-                assert_eq!(price, 22);
+                assert_eq!(price, &[Some(22)]);
                 warning = recheck.check_with(price, |_| {
                     probes += 1;
                     Some("may not fit".into())
@@ -3734,9 +4018,9 @@ mod sink_sample_tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(recheck.price, 100);
-        assert_eq!(probes, 0);
-        assert!(warning.is_none());
+        assert_eq!(recheck.prices, [22, 100]);
+        assert_eq!(probes, 1);
+        assert!(warning.is_some());
     }
 
     #[test]
@@ -3749,26 +4033,32 @@ mod sink_sample_tests {
             let mut tuner = SinkAutoTuner::new(
                 profile,
                 SinkBacking::Ram,
-                ROWS,
+                &[ROWS],
                 MemoryBudget::with_available(Some(1 << 30)),
             );
             let batch = sample_batch(1);
             let mut prices = Vec::new();
             let calls = std::cell::Cell::new(0);
-            let mut check = |price| {
+            let mut check = |price: &[Option<u64>]| {
                 calls.set(calls.get() + 1);
-                prices.push(price);
+                prices.push(price.to_vec());
                 Ok(())
             };
-            tuner.observe(&LevelBatch::Owned(batch.slice(0, SINK_SAMPLE_MIN_ROWS - 1)));
+            tuner.observe(
+                0,
+                &LevelBatch::Owned(batch.slice(0, SINK_SAMPLE_MIN_ROWS - 1)),
+            );
             tuner.check_disk(&mut check).unwrap();
             assert_eq!(calls.get(), 0);
-            tuner.observe(&LevelBatch::Owned(batch.slice(SINK_SAMPLE_MIN_ROWS - 1, 1)));
+            tuner.observe(
+                0,
+                &LevelBatch::Owned(batch.slice(SINK_SAMPLE_MIN_ROWS - 1, 1)),
+            );
             tuner.check_disk(&mut check).unwrap();
-            let first_price = tuner.disk_bytes_per_row().unwrap();
-            tuner.observe(&LevelBatch::Owned(sample_batch(200)));
+            let first_price = tuner.disk_bytes_per_row(0).unwrap();
+            tuner.observe(0, &LevelBatch::Owned(sample_batch(200)));
             tuner.check_disk(&mut check).unwrap();
-            assert_eq!(prices, [first_price]);
+            assert_eq!(prices, [vec![Some(first_price)]]);
         }
     }
 
@@ -3843,7 +4133,8 @@ mod sink_sample_tests {
                     overview: &output,
                     level_rows: &[KEPT, KEPT],
                     spilling_levels: usize::from(!matches!(profile, MemoryProfile::Speed)),
-                    price: 0,
+                    price: average,
+                    prices: Vec::new(),
                     warned: false,
                 };
                 let mut probes = 0;
@@ -3853,23 +4144,23 @@ mod sink_sample_tests {
                         Some(("one".into(), free))
                     })
                 };
-                let initial = recheck.check_with(average, &mut warning).unwrap();
+                let initial = recheck.check_with(&[], &mut warning).unwrap();
                 assert_eq!(
                     initial.is_some(),
                     free == 0,
                     "average {average} B/row, {profile:?}"
                 );
-                // A lower price must neither recheck nor probe free space.
-                assert!(recheck.check_with(average, &mut warning).unwrap().is_none());
+                // Unchanged prices must neither recheck nor probe free space.
+                assert!(recheck.check_with(&[], &mut warning).unwrap().is_none());
                 let mut tuner = SinkAutoTuner::with_budget(false, KEPT, 0);
-                tuner.observe(&LevelBatch::Owned(kept.clone()));
-                let measured = tuner.disk_bytes_per_row().unwrap();
+                tuner.observe(0, &LevelBatch::Owned(kept.clone()));
+                let measured = tuner.disk_bytes_per_row(0).unwrap();
                 assert!(
                     measured > average * 4,
                     "measured {measured}, average {average}"
                 );
                 let mut warnings = usize::from(initial.is_some());
-                let mut check = |price| {
+                let mut check = |price: &[Option<u64>]| {
                     warnings += usize::from(recheck.check_with(price, &mut warning)?.is_some());
                     Ok(())
                 };
@@ -3877,7 +4168,7 @@ mod sink_sample_tests {
                 tuner.check_disk(&mut check).unwrap();
                 tuner.check_disk(&mut check).unwrap();
                 assert_eq!(warnings, 1, "{profile:?}, free {free}");
-                assert_eq!(recheck.price, measured);
+                assert_eq!(recheck.prices, [measured, measured]);
                 assert_eq!(probes, if free == 0 { 1 } else { 2 });
                 if logging {
                     let lines = crate::test_log::take_thread_lines();
@@ -3915,7 +4206,7 @@ mod sink_sample_tests {
     /// compared on what the estimate used to guess at.
     fn measured_column_bytes_per_row(props: usize) -> u64 {
         let mut tuner = SinkAutoTuner::with_budget(false, ROWS, 0);
-        tuner.observe(&LevelBatch::Owned(sample_batch(props)));
+        tuner.observe(0, &LevelBatch::Owned(sample_batch(props)));
         tuner.bytes_per_row().unwrap() - SINK_ROW_ALLOC_OVERHEAD_BYTES
     }
 
@@ -3948,7 +4239,7 @@ mod sink_sample_tests {
             !tuner.should_downgrade(),
             "nothing sampled yet — a tuner must not decide on zero rows"
         );
-        tuner.observe(&LevelBatch::Owned(sample_batch(200)));
+        tuner.observe(0, &LevelBatch::Owned(sample_batch(200)));
         assert!(
             tuner.should_downgrade(),
             "measured {:?} B/row over {} planned rows projects {} B against a {budget} B budget",
@@ -3966,7 +4257,7 @@ mod sink_sample_tests {
         let budget = MemoryBudget::with_available(Some(64 * 1024 * 1024 * 1024))
             .allowance(MemoryProfile::Auto);
         let mut tuner = SinkAutoTuner::with_budget(true, 50_000_000, budget);
-        tuner.observe(&LevelBatch::Owned(sample_batch(2)));
+        tuner.observe(0, &LevelBatch::Owned(sample_batch(2)));
         assert!(
             !tuner.should_downgrade(),
             "measured {:?} B/row projects {} B — must fit the {budget} B budget",
@@ -4008,8 +4299,8 @@ mod sink_sample_tests {
             ),
             SinkBacking::Spill
         ));
-        let mut tuner = SinkAutoTuner::new(MemoryProfile::Auto, SinkBacking::Ram, ROWS, memory);
-        tuner.observe(&LevelBatch::Owned(sample_batch(0)));
+        let mut tuner = SinkAutoTuner::new(MemoryProfile::Auto, SinkBacking::Ram, &[ROWS], memory);
+        tuner.observe(0, &LevelBatch::Owned(sample_batch(0)));
         assert!(tuner.should_downgrade(), "a zero allowance must downgrade");
     }
 
@@ -4024,10 +4315,10 @@ mod sink_sample_tests {
             let mut tuner = SinkAutoTuner::new(
                 profile,
                 backing,
-                usize::MAX,
+                &[usize::MAX],
                 MemoryBudget::with_available(None),
             );
-            tuner.observe(&LevelBatch::Owned(sample_batch(200)));
+            tuner.observe(0, &LevelBatch::Owned(sample_batch(200)));
             assert!(
                 tuner.bytes_per_row().is_some(),
                 "{profile:?} must still be measured for the profile dump"
@@ -4045,10 +4336,10 @@ mod sink_sample_tests {
     fn the_rate_keeps_moving_for_the_whole_pass() {
         let mut tuner = SinkAutoTuner::with_budget(false, ROWS, 0);
         for _ in 0..1_000 {
-            tuner.observe(&LevelBatch::Owned(sample_batch(1)));
+            tuner.observe(0, &LevelBatch::Owned(sample_batch(1)));
         }
         let before = tuner.bytes_per_row().unwrap();
-        tuner.observe(&LevelBatch::Owned(sample_batch(200)));
+        tuner.observe(0, &LevelBatch::Owned(sample_batch(200)));
         assert!(
             tuner.bytes_per_row().unwrap() > before,
             "a heavy batch after 1000 light ones must raise the rate"
@@ -4069,7 +4360,7 @@ mod sink_sample_tests {
         let budget = 300_000_000;
         let mut tuner = SinkAutoTuner::with_budget(true, planned, budget);
         for _ in 0..HEAD {
-            tuner.observe(&LevelBatch::Owned(sample_batch(0)));
+            tuner.observe(0, &LevelBatch::Owned(sample_batch(0)));
             assert!(
                 !tuner.should_downgrade(),
                 "the light head projects {} B — under the {budget} B budget",
@@ -4078,7 +4369,7 @@ mod sink_sample_tests {
         }
         let mut fired = false;
         for _ in 0..TAIL {
-            tuner.observe(&LevelBatch::Owned(sample_batch(200)));
+            tuner.observe(0, &LevelBatch::Owned(sample_batch(200)));
             if tuner.should_downgrade() {
                 fired = true;
                 break;
@@ -4105,7 +4396,7 @@ mod sink_sample_tests {
         while observed <= budget {
             let b = sample_batch(200);
             observed += b.get_array_memory_size() as u64;
-            tuner.observe(&LevelBatch::Owned(b));
+            tuner.observe(0, &LevelBatch::Owned(b));
         }
         assert!(
             tuner.should_downgrade(),
@@ -4218,7 +4509,7 @@ mod sink_sample_tests {
         let mut tuner = SinkAutoTuner::with_budget(false, 0, 0);
         tuner.observe_shared(&per_level);
         for (level, _) in per_level.iter().flatten() {
-            tuner.observe(level);
+            tuner.observe(0, level);
         }
         assert_eq!(
             tuner.projected_bytes(),
@@ -4321,7 +4612,7 @@ mod sink_sample_tests {
         let mut tuner = SinkAutoTuner::with_budget(false, 0, 0);
         tuner.observe_shared(&per_level);
         for (level, _) in per_level.iter().flatten() {
-            tuner.observe(level);
+            tuner.observe(0, level);
         }
         assert_eq!(
             tuner.projected_bytes(),
@@ -4491,7 +4782,7 @@ mod sink_sample_tests {
             },
             "before any sample there is no rate and no verdict"
         );
-        tuner.observe(&LevelBatch::Owned(sample_batch(200)));
+        tuner.observe(0, &LevelBatch::Owned(sample_batch(200)));
         tuner.mark_downgraded();
         let report = tuner.report();
         assert_eq!(report.sampled_rows, ROWS);

@@ -1648,7 +1648,7 @@ fn run_pass2_levels(
     hints: &[usize],
     inputs: Pass2Inputs<'_>,
     strategy: Pass2Strategy,
-    disk_check: &mut dyn FnMut(u64) -> Result<(), ConvertError>,
+    disk_check: &mut super::disk::DiskCheck<'_>,
 ) -> Result<
     (
         Vec<LevelStat>,
@@ -3872,16 +3872,17 @@ pub(crate) fn run_stages(
         overview: output_path,
         level_rows: &level_rows,
         spilling_levels,
-        price: 0,
+        price: output_row_bytes,
+        prices: Vec::new(),
         warned: false,
     };
-    let mut disk_check = |price| {
+    let mut disk_check = |price: &[Option<u64>]| {
         if let Some(message) = disk_recheck.check(price)? {
             diagnostics.disk_shortage(message);
         }
         Ok(())
     };
-    disk_check(output_row_bytes)?;
+    disk_check(&[])?;
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
     // Pass-1 O(N) scratch has been freed by here; this marks the memory floor

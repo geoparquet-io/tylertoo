@@ -108,9 +108,12 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   spill and intermediate sizes are info logs. Conversion rechecks space before
   pass 2 using kept per-level rows, including attribute filtering, the input's
   compression ratio with a 2x margin for the intermediate, and the profile's
-  spill codec price. Framing stays raw. Python's up-front `UserWarning`
+  spill codec price. Framing stays raw. Pass 2 reprices each level once from
+  the bytes it actually buffers; the need is the largest on one volume at any
+  phase (each level's spill file is deleted after it drains), plus an output
+  archive allowance of half the intermediate. Python's up-front `UserWarning`
   covers staged input and staged layers; intermediate and spill shortages are
-  logged after pass 1 and when pass 2 measures the selected properties, appear
+  logged after pass 1 and when pass 2 measures its buffered levels, appear
   as `disk_shortage` report diagnostics, and `convert()` raises each as a
   `UserWarning` once the run succeeds. Recheck remedies name both CLI flags and
   Python keywords (#872).
