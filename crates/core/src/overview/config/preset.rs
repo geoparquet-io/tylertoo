@@ -53,6 +53,11 @@ impl Preset {
             // fails the tile, naming `--drop-densest-as-needed` (tile.cpp:2867);
             // tylertoo has no failing valve, so drop is the nearest.
             base.size_valve = SizeValve::Drop;
+            // `-S` 1 also simplifies lines and polygons at the max zoom
+            // (`-pS` / `--simplify-only-low-zooms` turns that off); 0.25 for
+            // the reason `convert` gives above. Polygons part at shared
+            // borders, as tippecanoe's do without `--detect-shared-borders`.
+            base.max_zoom_simplify_factor = Some(0.25);
         }
         base
     }
@@ -73,10 +78,19 @@ mod tests {
         keywords::tiles(map(value)).unwrap()
     }
 
-    /// The seven values the tippecanoe preset sets, in one tuple.
-    fn preset_fields(
-        o: &TilesOptions,
-    ) -> (f64, f64, f64, u32, Option<usize>, Option<usize>, SizeValve) {
+    /// The eight values the tippecanoe preset sets, in one tuple.
+    type PresetFields = (
+        f64,
+        f64,
+        f64,
+        u32,
+        Option<usize>,
+        Option<usize>,
+        SizeValve,
+        Option<f64>,
+    );
+
+    fn preset_fields(o: &TilesOptions) -> PresetFields {
         (
             o.convert.density.drop_rate,
             o.convert.density.gamma,
@@ -85,6 +99,7 @@ mod tests {
             o.export.compressed_tile_size_limit,
             o.export.tile_size_limit,
             o.export.size_valve,
+            o.export.max_zoom_simplify_factor,
         )
     }
 
@@ -93,7 +108,16 @@ mod tests {
         let preset = tiles(json!({"preset": "tippecanoe"}));
         assert_eq!(
             preset_fields(&preset),
-            (2.5, 1.0, 0.25, 5, Some(500_000), None, SizeValve::Drop)
+            (
+                2.5,
+                1.0,
+                0.25,
+                5,
+                Some(500_000),
+                None,
+                SizeValve::Drop,
+                Some(0.25)
+            )
         );
         let mut expected = tiles(json!({}));
         expected.convert.density.drop_rate = 2.5;
@@ -103,6 +127,7 @@ mod tests {
         expected.export.compressed_tile_size_limit = Some(500_000);
         expected.export.tile_size_limit = None;
         expected.export.size_valve = SizeValve::Drop;
+        expected.export.max_zoom_simplify_factor = Some(0.25);
         assert_eq!(
             serde_json::to_value(&preset).unwrap(),
             serde_json::to_value(&expected).unwrap()
@@ -130,6 +155,7 @@ mod tests {
             ("max_compressed_tile_size", json!(1_000_000)),
             ("tile_size_limit", json!(4_000_000)),
             ("size_valve", json!("merge")),
+            ("max_zoom_simplify_factor", json!(0.5)),
         ] {
             let mut keywords = map(json!({"preset": "tippecanoe"}));
             keywords.insert(key.into(), value);
@@ -142,7 +168,8 @@ mod tests {
                 "tile_buffer" => expected.3 = 12,
                 "max_compressed_tile_size" => expected.4 = Some(1_000_000),
                 "tile_size_limit" => expected.5 = Some(4_000_000),
-                _ => expected.6 = SizeValve::Merge,
+                "size_valve" => expected.6 = SizeValve::Merge,
+                _ => expected.7 = Some(0.5),
             }
             assert_eq!(got, expected, "{key}");
         }
@@ -158,6 +185,19 @@ mod tests {
         }));
         assert_eq!(got.export.compressed_tile_size_limit, Some(500_000));
         assert_eq!(got.export.tile_size_limit, None);
+    }
+
+    /// `max_zoom_simplify_factor=None` is the command's default, as `auto`
+    /// is for a cap: lines only, none under verbatim, both under the preset.
+    #[test]
+    fn a_null_max_zoom_simplify_factor_keeps_the_command_default() {
+        let factor = |mut v: Value| {
+            v["max_zoom_simplify_factor"] = Value::Null;
+            tiles(v).export.max_zoom_simplify_factor
+        };
+        assert_eq!(factor(json!({})), None);
+        assert_eq!(factor(json!({"verbatim": true})), Some(0.0));
+        assert_eq!(factor(json!({"preset": "tippecanoe"})), Some(0.25));
     }
 
     /// The two halves resolve the same way when run as separate commands.

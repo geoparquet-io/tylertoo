@@ -57,7 +57,9 @@ Args:
         limit.
     size_valve: See `export_pmtiles()`.
     coverage_fill: See `export_pmtiles()`.
-    max_zoom_simplify_factor: See `export_pmtiles()`.
+    max_zoom_simplify_factor: See `export_pmtiles()`. Bands default
+        to `0`: nothing is simplified at the max zoom. `None` selects
+        this default; an explicit factor applies to lines and polygons.
     simple_clip_fastpath: See `export_pmtiles()`.
     tile_buffer: See `export_pmtiles()`.
     extent: See `export_pmtiles()`.

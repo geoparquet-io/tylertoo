@@ -197,9 +197,15 @@ pub use feature_id::{FeatureIdColumnProblem, InvalidFeatureIdReason};
 /// Default MVT tile extent (matches [`crate::mvt::DEFAULT_EXTENT`]).
 pub(crate) const DEFAULT_EXTENT: u32 = 4096;
 
-/// Default per-tile edge buffer, in tile pixels (tippecanoe default is 5; we
-/// use 8 to match the tile pipeline's historical default).
-pub(crate) const DEFAULT_TILE_BUFFER_PX: u32 = 8;
+/// Default per-tile edge buffer, in tile pixels: tippecanoe's `-b 5`
+/// (`main.cpp:3193`). Was 8 until the 5 px buffer was measured 1.7-4.8%
+/// smaller with nothing inside the tile changed (`corpus/SWEEPS.md`).
+pub(crate) const DEFAULT_TILE_BUFFER_PX: u32 = 5;
+
+/// The finest-zoom simplification factor lines get when
+/// [`ExportOptions::max_zoom_simplify_factor`] is unset: a quarter GSD, one
+/// tile unit at extent 4096, tippecanoe's `-S 1`.
+pub(crate) const DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR: f64 = 0.25;
 
 /// The widest `--tile-buffer` any export accepts, in tile pixels (#433).
 ///
@@ -443,9 +449,15 @@ pub struct ExportOptions {
     /// Simplify each feature of the finest (canonical) level once, before
     /// clipping, with tolerance `factor × GSD` at that level's zoom, the
     /// same rule `--simplify-factor` uses for coarser levels. With the default
-    /// GSD base, 1 GSD is 4 tile units at extent 4096. A feature smaller than
-    /// the tolerance keeps its own geometry. Default `None` (off).
-    /// Changes the output; leaves coarser levels unchanged, except that
+    /// GSD base, 1 GSD is 4 tile units at extent 4096. It only removes
+    /// vertices: a feature, part or ring smaller than the tolerance keeps its
+    /// own geometry, and a polygon whose simplified rings would be invalid
+    /// keeps its own. Default `None`: lines at
+    /// 0.25 × GSD and polygons not at
+    /// all, since each polygon is simplified on its own and shared borders
+    /// would part (#802). `Some(factor)` applies to lines and polygons alike;
+    /// `Some(0.0)` simplifies nothing, which [`Self::verbatim`] sets.
+    /// Leaves coarser levels unchanged, except that
     /// variable-depth stop tiles carry the simplified finest-level features.
     /// Leaves the overview file unchanged.
     /// Comparable to tippecanoe's `-S`, which uses tile units at every zoom:
@@ -454,7 +466,7 @@ pub struct ExportOptions {
         feature = "cli",
         arg(long, value_name = "FACTOR", help_heading = "Generalization")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Simplify each finest-level (canonical) feature once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Features smaller than the tolerance keep their own geometry. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Off by default. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 10 is about factor 2.5", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Simplify each finest-level (canonical) line and polygon once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Only vertices are removed: features, parts and rings smaller than the tolerance keep their own geometry. Leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Unset, lines get 0.25 and polygons are not simplified, since each polygon is simplified on its own and shared borders would part; `0` simplifies nothing, as `tiles --verbatim` and `pyramid` bands do. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 1 is about factor 0.25", long_help = None))]
     pub max_zoom_simplify_factor: Option<f64>,
     /// Number of partitions processed per band read (the export concurrency
     /// knob). Default [`PARTITION_WAVE_AUTO`], which [`resolve_partition_wave`]
@@ -698,6 +710,8 @@ impl ExportOptions {
     pub fn verbatim(mut self) -> Self {
         self.tile_size_limit = None;
         self.compressed_tile_size_limit = None;
+        // Nor is simplifying the finest level's lines.
+        self.max_zoom_simplify_factor = Some(0.0);
         self
     }
 
@@ -7484,39 +7498,63 @@ fn decode_geometry_chunk(
 /// A feature of the finest level, simplified by
 /// [`ExportOptions::max_zoom_simplify_factor`] (#814): `factor × gsd(z)` at
 /// that level's zoom `finest_zoom`, the tolerance `--simplify-factor` gives
-/// every coarser level. Borrowed unchanged at other levels (`None`) and with
-/// the option off.
+/// every coarser level. Unset, only lines are simplified, at
+/// [`DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR`]. Borrowed unchanged at other
+/// levels (`None`) and at factor 0.
 ///
 /// DIVERGENCE FROM TIPPECANOE: tippecanoe's `-S` simplifies each tile's
 /// clipped geometry, at every zoom, in tile units (`tile.cpp`,
 /// `simplify_lines`). Coarser levels here are already simplified by convert,
 /// so this touches only the finest one, and simplifies each feature once,
-/// before clipping, so neighbouring tiles agree at their seam. A feature
-/// under the tolerance keeps its own geometry rather than being dropped.
+/// before clipping, so neighbouring tiles agree at their seam. It only
+/// removes vertices: a feature, part or ring under the tolerance keeps its
+/// own geometry rather than being dropped, and a polygon with no valid
+/// candidate keeps its own (no repair).
+/// Coarser levels keep `simplify_for_level`'s rules.
+///
+/// DIVERGENCE FROM TIPPECANOE: tippecanoe's default `-S 1` simplifies
+/// polygons at the max zoom too. The default here leaves them alone, since
+/// each polygon is simplified on its own and shared borders part into
+/// slivers (#802); `--max-zoom-simplify-factor 0.25` or `--preset
+/// tippecanoe` simplifies both.
 fn finest_zoom_geometry<'g>(
     geom: &'g Geometry<f64>,
     finest_zoom: Option<u8>,
     opts: &ExportOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> std::borrow::Cow<'g, Geometry<f64>> {
-    use super::simplify::{simplify_for_level, CollapseMode, Simplified, SimplifyOptions};
-    let (Some(factor), Some(zoom)) = (opts.max_zoom_simplify_factor, finest_zoom) else {
+    use super::simplify::{
+        level_tolerance, simplify_line_vertices_only, simplify_polygon_vertices_only,
+    };
+    let line = matches!(geom, Geometry::LineString(_) | Geometry::MultiLineString(_));
+    let factor = match opts.max_zoom_simplify_factor {
+        Some(factor) => factor,
+        None if line => DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR,
+        None => 0.0,
+    };
+    let Some(zoom) = finest_zoom.filter(|_| factor > 0.0) else {
         return std::borrow::Cow::Borrowed(geom);
     };
-    let simplify = SimplifyOptions::default()
-        .with_factor(factor)
-        .with_collapse(CollapseMode::Drop);
     // Export geometry is lon/lat whatever the file's CRS (`decode_geometry_chunk`).
-    match simplify_for_level(
-        geom,
-        super::level::gsd(zoom),
-        Crs::Epsg4326,
-        &simplify,
-        diagnostics,
-    ) {
-        Simplified::Keep(g) => std::borrow::Cow::Owned(g),
-        Simplified::Dropped => std::borrow::Cow::Borrowed(geom),
-    }
+    let tol = level_tolerance(super::level::gsd(zoom), Crs::Epsg4326, factor);
+    // Part by part and ring by ring, so nothing but vertices goes: a part or
+    // ring under the tolerance keeps its own geometry, as a whole feature
+    // does, since at the finest level it can still span tile units.
+    let line = |ls| simplify_line_vertices_only(ls, tol);
+    let polygon = |p| simplify_polygon_vertices_only(p, tol, diagnostics);
+    let out = match geom {
+        Geometry::LineString(ls) => Geometry::LineString(line(ls)),
+        Geometry::MultiLineString(m) => {
+            Geometry::MultiLineString(geo::MultiLineString::new(m.0.iter().map(line).collect()))
+        }
+        Geometry::Polygon(p) => Geometry::Polygon(polygon(p)),
+        Geometry::MultiPolygon(m) => {
+            Geometry::MultiPolygon(geo::MultiPolygon::new(m.0.iter().map(polygon).collect()))
+        }
+        // Points have nothing to simplify; a collection keeps its members.
+        _ => return std::borrow::Cow::Borrowed(geom),
+    };
+    std::borrow::Cow::Owned(out)
 }
 
 /// One feature's clipped pieces, one per tile key.
@@ -11737,6 +11775,10 @@ mod tests {
         let tout = tempfile::NamedTempFile::new().unwrap();
         let opts = ExportOptions {
             layer_name: "ref".to_string(),
+            // The defaults this reference was blessed at: an 8 px buffer and
+            // no max-zoom simplification of its lines.
+            tile_buffer: 8,
+            max_zoom_simplify_factor: Some(0.0),
             ..Default::default()
         };
         let report = export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
@@ -13012,6 +13054,8 @@ mod tests {
                 layer_name: "waves".to_string(),
                 partition_wave: 2,
                 profile,
+                // The 8 px buffer puts each edge point in both of its tiles.
+                tile_buffer: 8,
                 ..Default::default()
             };
             let out = tempfile::NamedTempFile::new().unwrap();
@@ -15357,18 +15401,19 @@ mod tests {
     /// a knob that has nothing to do with it: raising `extent` narrowed the
     /// buffer.
     ///
-    /// Pinned in MVT units so the expected value is legible: 8 px of a nominal
-    /// 256 px tile is 1/32 of the tile, which at extent 4096 is 128 units.
+    /// Pinned in MVT units so the expected value is legible: the default 5 px
+    /// (tippecanoe's `-b 5`) of a nominal 256 px tile is 80 units at extent
+    /// 4096.
     #[test]
     fn tile_buffer_is_tile_pixels_not_extent_units() {
         let opts = ExportOptions::default();
-        assert_eq!(opts.tile_buffer, 8);
+        assert_eq!(opts.tile_buffer, 5);
         assert_eq!(opts.extent, 4096);
 
         let in_mvt_units = buffer_fraction(&opts) * f64::from(opts.extent);
         assert!(
-            (in_mvt_units - 128.0).abs() < 1e-9,
-            "8 tile pixels must be 128 MVT units at extent 4096, got {in_mvt_units}"
+            (in_mvt_units - 80.0).abs() < 1e-9,
+            "5 tile pixels must be 80 MVT units at extent 4096, got {in_mvt_units}"
         );
 
         // Raising the extent must not change how wide the buffer is on the
@@ -18340,6 +18385,154 @@ mod tests {
             }
             assert!(thinned > 0, "{mode:?}: no finest-zoom tile was thinned");
         }
+    }
+
+    /// Max-zoom simplification only removes vertices: a hole under the
+    /// tolerance keeps its original ring, in a polygon and in a
+    /// multipolygon part, while the exterior still simplifies.
+    #[test]
+    fn max_zoom_simplify_keeps_holes_under_the_tolerance() {
+        use geo::{CoordsIter, MultiPolygon};
+        let mut ring: Vec<(f64, f64)> = (0..200)
+            .map(|k| (f64::from(k) * 1e-5, if k % 2 == 0 { 1e-6 } else { -1e-6 }))
+            .collect();
+        ring.extend([(2e-3, 1e-3), (0.0, 1e-3), (0.0, 1e-6)]);
+        // A 0.3 m hole, under a quarter GSD at z14 (about 0.6 m).
+        let hole = LineString::from(vec![
+            (1e-3, 5e-4),
+            (1e-3 + 2e-6, 5e-4),
+            (1e-3 + 2e-6, 5e-4 + 2e-6),
+            (1e-3, 5e-4 + 2e-6),
+            (1e-3, 5e-4),
+        ]);
+        let poly = geo::Polygon::new(LineString::from(ring), vec![hole.clone()]);
+        let explicit = ExportOptions {
+            max_zoom_simplify_factor: Some(0.25),
+            ..Default::default()
+        };
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let check = |out: &geo::Polygon<f64>| {
+            assert!(
+                out.exterior().0.len() < poly.exterior().0.len(),
+                "the exterior simplifies"
+            );
+            assert_eq!(out.interiors(), std::slice::from_ref(&hole));
+        };
+        let single = Geometry::Polygon(poly.clone());
+        let out = finest_zoom_geometry(&single, Some(14), &explicit, &diagnostics);
+        let Geometry::Polygon(p) = out.as_ref() else {
+            panic!("{out:?}")
+        };
+        check(p);
+        let multi = Geometry::MultiPolygon(MultiPolygon::new(vec![poly.clone()]));
+        let out = finest_zoom_geometry(&multi, Some(14), &explicit, &diagnostics);
+        let Geometry::MultiPolygon(m) = out.as_ref() else {
+            panic!("{out:?}")
+        };
+        assert_eq!(m.0.len(), 1);
+        check(&m.0[0]);
+        assert!(out.coords_count() < multi.coords_count());
+    }
+
+    /// A part under the tolerance keeps its own geometry, as a whole feature
+    /// under it does: dropping it would lose a piece that can still span
+    /// distinct tile coordinates. Lines under the default, and polygon parts
+    /// under an explicit factor.
+    #[test]
+    fn max_zoom_simplify_keeps_parts_under_the_tolerance() {
+        use geo::{CoordsIter, MultiLineString, MultiPolygon};
+        // A 0.1 m zigzag that simplifies, beside a 0.3 m part, both under a
+        // quarter GSD at z14 (about 0.6 m).
+        let zig: Vec<(f64, f64)> = (0..200)
+            .map(|k| (f64::from(k) * 1e-5, if k % 2 == 0 { 1e-6 } else { -1e-6 }))
+            .collect();
+        let short = LineString::from(vec![(0.01, 0.01), (0.01 + 3e-6, 0.01)]);
+        let lines = Geometry::MultiLineString(MultiLineString::new(vec![
+            LineString::from(zig.clone()),
+            short.clone(),
+        ]));
+        let mut ring = zig;
+        ring.extend([(2e-3, 1e-3), (0.0, 1e-3), (0.0, 1e-6)]);
+        let tiny = geo::Polygon::new(
+            LineString::from(vec![
+                (0.01, 0.01),
+                (0.01 + 2e-6, 0.01),
+                (0.01, 0.01 + 2e-6),
+                (0.01, 0.01),
+            ]),
+            vec![],
+        );
+        let polys = Geometry::MultiPolygon(MultiPolygon::new(vec![
+            geo::Polygon::new(LineString::from(ring), vec![]),
+            tiny.clone(),
+        ]));
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let out = finest_zoom_geometry(&lines, Some(14), &ExportOptions::default(), &diagnostics);
+        let Geometry::MultiLineString(m) = out.as_ref() else {
+            panic!("{out:?}")
+        };
+        assert!(
+            out.coords_count() < lines.coords_count(),
+            "the zigzag simplifies"
+        );
+        assert_eq!(m.0.len(), 2);
+        assert_eq!(m.0[1], short);
+        let explicit = ExportOptions {
+            max_zoom_simplify_factor: Some(0.25),
+            ..Default::default()
+        };
+        let out = finest_zoom_geometry(&polys, Some(14), &explicit, &diagnostics);
+        let Geometry::MultiPolygon(m) = out.as_ref() else {
+            panic!("{out:?}")
+        };
+        assert!(
+            out.coords_count() < polys.coords_count(),
+            "the zigzag simplifies"
+        );
+        assert_eq!(m.0.len(), 2);
+        assert_eq!(m.0[1], tiny);
+    }
+
+    /// Unset, `max_zoom_simplify_factor` simplifies lines at the finest zoom
+    /// at [`DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR`] and leaves polygons alone;
+    /// an explicit factor applies to both, `0` to neither, and so does
+    /// [`ExportOptions::verbatim`].
+    #[test]
+    fn max_zoom_simplify_defaults_to_lines_only() {
+        use geo::CoordsIter;
+        // A 0.1 m zigzag, under a quarter GSD at z14 (about 0.6 m).
+        let zig: Vec<(f64, f64)> = (0..200)
+            .map(|k| (f64::from(k) * 1e-5, if k % 2 == 0 { 1e-6 } else { -1e-6 }))
+            .collect();
+        let line = Geometry::LineString(LineString::from(zig.clone()));
+        let mut ring = zig;
+        ring.extend([(2e-3, 1e-3), (0.0, 1e-3), (0.0, 1e-6)]);
+        let poly = Geometry::Polygon(geo::Polygon::new(LineString::from(ring), vec![]));
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let kept = |g: &Geometry<f64>, opts: &ExportOptions| {
+            let out = finest_zoom_geometry(g, Some(14), opts, &diagnostics);
+            out.coords_count() == g.coords_count()
+        };
+        let with = |f| ExportOptions {
+            max_zoom_simplify_factor: f,
+            ..Default::default()
+        };
+        assert!(!kept(&line, &ExportOptions::default()), "default line");
+        assert!(kept(&poly, &ExportOptions::default()), "default polygon");
+        assert_eq!(
+            finest_zoom_geometry(&line, Some(14), &ExportOptions::default(), &diagnostics),
+            finest_zoom_geometry(&line, Some(14), &with(Some(0.25)), &diagnostics),
+            "the default line factor is 0.25"
+        );
+        assert!(!kept(&line, &with(Some(0.25))) && !kept(&poly, &with(Some(0.25))));
+        assert!(kept(&line, &with(Some(0.0))) && kept(&poly, &with(Some(0.0))));
+        let verbatim = ExportOptions::default().verbatim();
+        assert!(kept(&line, &verbatim) && kept(&poly, &verbatim));
+        // Coarser levels are convert's to simplify.
+        assert!(matches!(
+            finest_zoom_geometry(&line, None, &ExportOptions::default(), &diagnostics),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     /// #814: a variable-depth stop draws canonical geometry at an ancestor's

@@ -60,12 +60,12 @@ Exporting ov.parquet → out.pmtiles
   z0  (level 0):       1 tiles,         1 features
   z1  (level 1):       1 tiles,         2 features
   z2  (level 2):       1 tiles,         3 features
-  z3  (level 3):       2 tiles,         6 features
+  z3  (level 3):       2 tiles,         4 features
   z4  (level 4):       1 tiles,         5 features
   z5  (level 5):       1 tiles,         7 features
   z6  (level 6):       1 tiles,        20 features
 
-✓ 8 tiles, 44 features, 0 oversized tiles in [..]s
+✓ 8 tiles, 42 features, 0 oversized tiles in [..]s
   property "raw" (Binary) skipped: no MVT encoding
 
 ```
@@ -76,7 +76,7 @@ z  tiles  total  mean  p50  p99  max
 0      1    159   159  159  159  159
 1      1    193   193  193  193  193
 2      1    215   215  215  215  215
-3      2    427   213  213  214  214
+3      2    372   186  159  213  213
 4      1    266   266  266  266  266
 5      1    312   312  312  312  312
 6      1    560   560  560  560  560
@@ -87,10 +87,10 @@ z   x   y  bytes
 5   5  12    312
 4   2   6    266
 2   0   1    215
-3   1   2    214
 3   1   3    213
 1   0   0    193
 0   0   0    159
+3   1   2    159
 
 ```
 
@@ -133,7 +133,7 @@ z  tiles  total  mean  p50  p99  max
 0      1    159   159  159  159  159
 1      1    193   193  193  193  193
 2      1    215   215  215  215  215
-3      2    427   213  213  214  214
+3      2    372   186  159  213  213
 4      1    266   266  266  266  266
 5      1    312   312  312  312  312
 6      1    560   560  560  560  560
@@ -144,9 +144,9 @@ z   x   y  bytes
 5   5  12    312
 4   2   6    266
 2   0   1    215
-3   1   2    214
 3   1   3    213
 1   0   0    193
 0   0   0    159
+3   1   2    159
 
 ```

@@ -86,7 +86,9 @@ class TestDecodeIntegration:
             pm = Path(tmpdir) / "out.pmtiles"
             out = Path(tmpdir) / "decoded.parquet"
             tylertoo.overview(str(STREAMING_SMALL), str(ovr), max_zoom=10)
-            tylertoo.export_pmtiles(str(ovr), str(pm))
+            # The 8 px buffer's seam copies outnumber the tiny buildings
+            # that quantize away at z10, which the count below relies on.
+            tylertoo.export_pmtiles(str(ovr), str(pm), tile_buffer=8)
             report = tylertoo.decode(str(pm), str(out), min_zoom=10, max_zoom=10)
         assert report["layers"] == ["overview"]
         assert report["zoom_range"] == (10, 10)
