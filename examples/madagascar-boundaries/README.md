@@ -108,11 +108,11 @@ tylertoo overview prepared.parquet preview-ov.parquet \
     1      19567.88           6          30  5.08 KiB
     2       9783.94          24         120  7.27 KiB
     3       4891.97          99         494  15.50 KiB
-    4       2445.98         345       1,704  40.14 KiB
-    5       1222.99         668       3,125  72.95 KiB
-    6        611.50         856       4,224  94.02 KiB
-    7        305.75         929       5,607  110.19 KiB
-    8        152.87         942       7,538  126.13 KiB
+    4       2445.98         345       1,699  40.09 KiB
+    5       1222.99         668       3,120  72.90 KiB
+    6        611.50         856       4,219  93.98 KiB
+    7        305.75         929       5,602  110.15 KiB
+    8        152.87         942       7,533  126.08 KiB
     9         76.44         943      10,088  145.42 KiB
    10         38.22         943      13,262  169.75 KiB
    11         19.11         943      17,266  201.00 KiB
@@ -154,16 +154,16 @@ tylertoo validate madagascar-ov.parquet
 
 ```text
 ✓ Overview prepared.parquet → madagascar-ov.parquet  (Duplicating mode)
-  17,465 input features → 134,705 rows across 10 levels in 0.66s
+  17,465 input features → 134,717 rows across 10 levels in 0.66s
   lvl        gsd(m)    features    vertices         bytes
     0      19567.88       1,558       7,763  182.57 KiB
-    1       9783.94       4,687      22,909  526.92 KiB
-    2       4891.97      10,096      48,741  1.09 MiB
-    3       2445.98      14,835      73,457  1.62 MiB
-    4       1222.99      16,571      96,002  1.90 MiB
-    5        611.50      17,174     130,154  2.21 MiB
-    6        305.75      17,393     177,519  2.61 MiB
-    7        152.87      17,461     239,546  3.14 MiB
+    1       9783.94       4,691      22,924  527.22 KiB
+    2       4891.97      10,102      48,691  1.09 MiB
+    3       2445.98      14,836      73,412  1.62 MiB
+    4       1222.99      16,572      96,022  1.90 MiB
+    5        611.50      17,174     130,279  2.21 MiB
+    6        305.75      17,393     177,644  2.61 MiB
+    7        152.87      17,461     239,621  3.15 MiB
     8         76.44      17,465     322,984  3.86 MiB
     9         38.22      17,465   1,749,880  17.45 MiB
 Validating madagascar-ov.parquet
@@ -207,11 +207,11 @@ Exporting madagascar-ov.parquet → madagascar.pmtiles
   mode=duplicating zooms z1..z10
   z1  (level 0):       1 tiles,      1558 features
 ...
-  z5  (level 4):       4 tiles,     14959 features, 1 oversized, 12 collapsed at extent
+  z5  (level 4):       4 tiles,     14958 features, 1 oversized, 12 collapsed at extent
 ...
   z10 (level 9):     524 tiles,     25838 features, 12 collapsed at extent
 
-✓ 751 tiles, 157756 features, 1 oversized tiles in 1.49s
+✓ 751 tiles, 157767 features, 1 oversized tiles in 1.49s
 ...
  z  tiles      total     mean      p50      p99      max
  1      1     70,749   70,749   70,749   70,749   70,749
@@ -220,14 +220,14 @@ Exporting madagascar-ov.parquet → madagascar.pmtiles
 
 Largest 10 tile(s):
 z   x   y    bytes
-4  10   8  422,883
+4  10   8  422,862
 ...
 ```
 
 Polygons crossing tile edges appear in every tile they touch, so tile
 features outnumber overview features. Clipped slivers that vanish on the
 tile's 4096-unit grid are omitted and counted as "collapsed at extent".
-The largest tile is 422,883 bytes (about 423 KB) compressed, at z4 (4/10/8).
+The largest tile is 422,862 bytes (about 423 KB) compressed, at z4 (4/10/8).
 One tile, at z5, went over the default limit of 500 KB compressed (and 2 MB
 before compression). The size valve merged its densest polygons into
 neighbors until it fit; the export counts this tile as "oversized".
