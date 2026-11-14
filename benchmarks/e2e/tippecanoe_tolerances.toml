@@ -30,15 +30,25 @@
 # 0.486 ... z14 1.095 -> 1.020 (-7% to -16%, largest where tiles are
 # smallest). Tile, feature, vertex and tile-median ratios are unchanged.
 #
-# 2026-11-14 (#749 split/pairing follow-up): re-measured all five fixtures
-# offline against the pinned 2.79.0, z0-z14, with compare_tippecanoe.py.
+# 2026-11-14 (#749, merged tree c5f16603 including #883): re-measured all
+# five fixtures offline against pinned 2.79.0, z0-z14, compare_tippecanoe.py.
+# This comparison explicitly pins buffer 8, even though the command default
+# is now 5. Matched runs use --verbatim, so max-zoom simplification stays off.
+# Every matched per-zoom measurement is identical to the pre-merge run.
 # Canonical part identity recovers Madagascar's 21 multipart feature-level
 # misses; split Polygon placeholders also decay. Madagascar totals are now
 # features 0.999333, ids 0.981976, vertices 0.780507, bytes 0.984144;
-# open-buildings features 0.774583, vertices 0.713599, bytes 0.895449.
+# open-buildings features 0.774583, vertices 0.713599, bytes 0.895417;
+# road-detections features 0.663046, vertices 0.636072, bytes 0.825498;
+# Moldova features 0.867780, vertices 0.525430, bytes 0.698952;
+# fieldmaps-boundaries features 0.998992, vertices 0.672147, bytes 0.923144.
+# Reference archive sizes vary by 4-7 B with the recorded command path;
+# their stored tile bytes are unchanged. In the informational defaults run,
+# #883 changes only road-detections z14: 6,773 -> 6,639 vertices and
+# 36,888 -> 36,657 stored bytes; features stay 1,320 (line-only simplify).
 # Every existing band still passes, so their bounds are unchanged. Updated
 # affected measurements below. Moldova and fieldmaps-boundaries remain
-# informational; road-detections is unchanged.
+# informational.
 #
 # The recurring divergences behind the bands, all in context/ARCHITECTURE.md
 # "Known Divergences from Tippecanoe":
@@ -250,7 +260,7 @@ tile_features_median = [0.99, 1.01]  # measured 1.000 over 52 shared tiles
 tiles = [0.93, 0.99]          # measured 0.963 (79 / 82): z0-z3 are tippecanoe-only (D)
 features = [0.63, 0.70]       # measured 0.663: (A) at z4-z10
 vertices = [0.60, 0.68]       # measured 0.636
-bytes = [0.79, 0.86]          # measured 0.826 (archive size; 0.921 before #443)
+bytes = [0.79, 0.86]          # measured 0.825498 (archive size; 0.921 before #443)
 
 # z0-z3: tippecanoe emits one tile per zoom with 34-213 line instances;
 # tylertoo emits no tile (D). Not gated.
