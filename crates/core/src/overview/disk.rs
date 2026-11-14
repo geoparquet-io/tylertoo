@@ -14,6 +14,12 @@ use super::tiles::SpaceRemedies;
 
 const MARGIN_DENOM: u64 = 20;
 
+/// Rechecks run in core and reach both frontends through logging.
+const RECHECK_REMEDIES: SpaceRemedies<'_> = SpaceRemedies {
+    spill_dir: "--spill-dir (CLI) or spill_dir (Python)",
+    keep_overview: "--keep-overview (CLI) or keep_overview (Python)",
+};
+
 #[derive(Debug, Default)]
 pub(super) struct DiskFootprint {
     components: Vec<Component>,
@@ -35,7 +41,7 @@ pub(super) struct DiskRecheck<'a> {
 
 impl DiskRecheck<'_> {
     pub(super) fn check(&mut self, price: u64) -> Result<Option<String>, ConvertError> {
-        self.check_with(price, |disk| disk.warning(super::tiles::CLI_REMEDIES))
+        self.check_with(price, |disk| disk.warning(RECHECK_REMEDIES))
     }
 
     pub(super) fn check_with(
@@ -441,6 +447,46 @@ mod tests {
         spill_dir: "--spill-dir",
         keep_overview: "--keep-overview",
     };
+
+    #[test]
+    fn recheck_warning_names_cli_and_python_remedies() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        super::super::testutil::write_input(
+            &input,
+            &[Some(geo::Geometry::Point(geo::Point::new(1.0, 2.0)))],
+            false,
+            None,
+        );
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        let options = ConvertOptions::default();
+        let output = dir.path().join("out.parquet");
+        // Exercise both the initial and measured-price rechecks. A huge
+        // synthetic row price forces a warning without writing any output.
+        for price in [0, 1_600] {
+            let mut recheck = DiskRecheck {
+                source: &source,
+                selection: None,
+                options: &options,
+                overview: &output,
+                level_rows: &[1, 1],
+                spilling_levels: 1,
+                price,
+                warned: false,
+            };
+            let warning = recheck.check(u64::MAX / 4).unwrap().unwrap();
+            assert!(warning.contains("after pass 1"), "{warning}");
+            assert!(
+                warning.contains("--spill-dir (CLI) or spill_dir (Python)"),
+                "{warning}"
+            );
+            assert!(
+                warning.contains("--keep-overview (CLI) or keep_overview (Python)"),
+                "{warning}"
+            );
+        }
+        assert!(!output.exists());
+    }
 
     #[test]
     fn unfiltered_local_input_warns_only_after_pass1() {

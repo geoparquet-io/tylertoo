@@ -157,8 +157,12 @@ Before reading, disk-space warnings cover only staged remote input and the
 `--layer-column` staged layers copy. Projected pass-2 spill and intermediate
 overview sizes appear in info-level `[disk]` logs. After pass 1, a free-space
 recheck warns about those outputs using the kept rows at each emitted level,
-including attribute filtering, before pass 2 writes them. The intermediate
-payload uses the selected input's compressed/uncompressed footer ratio with a
+including attribute filtering, before pass 2 writes them, and rechecks when
+pass 2 measures the selected properties. In Python, only the staged input and
+staged layers shortages raise an up-front `UserWarning`; the recheck reports
+intermediate and spill shortages through the `tylertoo_core` logger at warning
+level. Recheck remedies name both CLI flags and Python keywords. The
+intermediate payload uses the selected input's compressed/uncompressed footer ratio with a
 2x safety margin, capped at the raw estimate. Spill uses the profile's codec
 price (raw for `auto`, 0.4 times raw for `bounded`); framing stays raw for both.
 
