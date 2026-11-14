@@ -835,7 +835,11 @@ def evaluate(
             cohorts.append(pair)
             if survivors > DECAY_MAX_RATIO * len(cohort):
                 stuck.append(pair)
-        detail = "square cohort survivors: " + ("; ".join(cohorts) or "no cohort was eligible")
+        detail = "square cohort survivors: " + ("; ".join(cohorts) or (
+            f"no cohort was eligible; requires at least {DECAY_MIN_SQUARES} tiny-square ids "
+            "at a zoom with a level three zooms coarser; EPSG:3857 source at GSD base 1024 "
+            "and extent 4096"
+        ))
         if stuck:
             more = f" (+{len(stuck) - 3} more)" if len(stuck) > 3 else ""
             detail += (
@@ -1057,7 +1061,8 @@ def main() -> int:
     st.add_argument("--feature-id", help="the --feature-id column (not a property)")
     st.add_argument(
         "--expect-decay", action="store_true",
-        help="check tiny-square cohort decay (requires --ids, GSD base 1024, extent 4096)",
+        help="check tiny-square cohort decay (requires --ids, EPSG:3857 source, "
+        "GSD base 1024, extent 4096); fails if no cohort is eligible",
     )
     st.add_argument("--exemptions", type=Path, help="invariant_exemptions.toml")
     st.add_argument("--fixture", help="fixture label, for exemption matching")

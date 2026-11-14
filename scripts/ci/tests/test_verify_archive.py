@@ -33,7 +33,21 @@ def test_decay_fails_when_no_cohort_is_eligible():
     result = _decay({8: ZoomScan(ids=cohort, square_ids=cohort),
                      5: ZoomScan(ids=set())})
     assert not result.ok
-    assert "no cohort was eligible" in result.detail
+    assert result.detail == (
+        "square cohort survivors: no cohort was eligible; requires at least 32 tiny-square ids "
+        "at a zoom with a level three zooms coarser; EPSG:3857 source at GSD base 1024 "
+        "and extent 4096"
+    )
+
+
+def test_expect_decay_help_names_source_crs_and_no_cohort_failure(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["verify_archive.py", "--help"])
+    with pytest.raises(SystemExit) as exc:
+        verify_archive.main()
+    assert exc.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "requires --ids, EPSG:3857 source, GSD base 1024, extent 4096" in help_text
+    assert "fails if no cohort is eligible" in help_text
 
 
 @pytest.mark.parametrize("coarse_is_square", [True, False])
