@@ -19,6 +19,7 @@ use tylertoo_core::internal::overview::config::cli::{
 
 use tylertoo_core::internal::overview::config::{self, OutputKind};
 use tylertoo_core::internal::overview::tiles::TilesOptions;
+use tylertoo_core::MemoryProfile;
 use tylertoo_core::TilesetMetadata as TilesetMetadataArgs;
 
 mod allocator;
@@ -394,6 +395,16 @@ where
     status
 }
 
+fn command_profile(command: &Command) -> Option<MemoryProfile> {
+    match command {
+        Command::Tiles(args) => Some(args.tuning.profile),
+        Command::Overview(args) => Some(args.tuning.profile),
+        Command::ExportPmtiles(args) => Some(args.export.profile),
+        Command::Pyramid(args) => Some(args.profile),
+        _ => None,
+    }
+}
+
 fn run_cli<I>(argv: I) -> u8
 where
     I: IntoIterator<Item = std::ffi::OsString>,
@@ -406,14 +417,7 @@ where
         Err(e) => return clap_exit(&e),
     };
 
-    let profile = match &cli.command {
-        Command::Tiles(args) => Some(args.tuning.profile),
-        Command::Overview(args) => Some(args.tuning.profile),
-        Command::ExportPmtiles(args) => Some(args.export.profile),
-        Command::Pyramid(args) => Some(args.profile),
-        _ => None,
-    };
-    if let Some(profile) = profile {
+    if let Some(profile) = command_profile(&cli.command) {
         apply_memory_profile_allocator(profile);
     }
     // Set the allocator policy before starting workers or pipeline work.
@@ -2068,7 +2072,6 @@ mod tests {
     use tylertoo_core::internal::overview::config::SizeCap;
     use tylertoo_core::internal::overview::export::ExportOptions;
     use tylertoo_core::internal::overview::export::FeatureOrder;
-    use tylertoo_core::internal::overview::level::MemoryProfile;
 
     /// #498: a sharded `tiles` job names the slice of the tile space it
     /// owns before any work, so a fleet's logs say what each task was for.
@@ -2454,6 +2457,39 @@ mod tests {
         Cli::try_parse_from(argv)
             .expect("command args should parse")
             .command
+    }
+
+    #[test]
+    fn command_profile_covers_profile_commands() {
+        let profiled: &[&[&str]] = &[
+            &["tylertoo", "tiles", "in.parquet", "out.pmtiles"],
+            &["tylertoo", "overview", "in.parquet", "out.parquet"],
+            &["tylertoo", "export-pmtiles", "in.parquet", "out.pmtiles"],
+            &[
+                "tylertoo",
+                "pyramid",
+                "out.pmtiles",
+                "--band",
+                "0-5:in.parquet",
+            ],
+        ];
+        for base in profiled {
+            let command = parse_command(base, &["--profile", "bounded"]);
+            assert_eq!(
+                command_profile(&command),
+                Some(MemoryProfile::Bounded),
+                "{base:?}"
+            );
+        }
+
+        let unprofiled: &[&[&str]] = &[
+            &["tylertoo", "merge", "out.pmtiles", "a.pmtiles", "b.pmtiles"],
+            &["tylertoo", "serve", "a.pmtiles"],
+        ];
+        for base in unprofiled {
+            let command = parse_command(base, &[]);
+            assert_eq!(command_profile(&command), None, "{base:?}");
+        }
     }
 
     /// Parse a `tiles` invocation and return its args (INPUT/OUTPUT are dummies).
