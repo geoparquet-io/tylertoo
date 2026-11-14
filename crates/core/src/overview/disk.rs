@@ -8,6 +8,7 @@ use crate::input_set::{ConvertSource, RowGroupSelection};
 use super::convert::{ConvertError, ConvertOptions};
 use super::level::{MemoryProfile, Mode};
 use super::memory::MemoryBudget;
+use super::pipeline::{spill_bytes_per_arrow_byte, spill_codec};
 use super::stream::select_row_groups_streaming;
 use super::tiles::SpaceRemedies;
 
@@ -24,16 +25,18 @@ struct Component {
     dir: PathBuf,
     name: &'static str,
     bytes: u64,
+    projected: bool,
 }
 
-/// Raw estimates never assume a compression ratio. The payload model shares
-/// `MemoryBudget`'s sink sizing, augmented by every selected property column's
-/// footer weight and IPC schema/batch framing. Simplification may remove rows
-/// and coordinates; the preflight conservatively retains all selected rows.
+/// Raw payload and framing bounds. Only the post-pass-1 intermediate payload
+/// uses the input's compression ratio; staging and pre-read projections stay
+/// raw. The payload shares `MemoryBudget`'s sink sizing, augmented by every
+/// selected property column's footer weight and IPC schema/batch framing.
 #[derive(Debug, Clone, Copy)]
 struct RawSinkSize {
     payload: u64,
     framing: u64,
+    intermediate_factor: f64,
 }
 
 impl RawSinkSize {
@@ -45,8 +48,13 @@ impl RawSinkSize {
         let schema = source.schema()?;
         let rows = source.selected_row_count(selection)?.max(0) as u64;
         let mut columns = 0u64;
+        let mut compressed = 0u64;
+        let mut uncompressed = 0u64;
         for column in 0..schema.fields().len() {
             columns = columns.saturating_add(source.selected_column_bytes(selection, column)?);
+            let (c, u) = source.selected_column_compression_bytes(selection, column)?;
+            compressed = compressed.saturating_add(c);
+            uncompressed = uncompressed.saturating_add(u);
         }
         let geometry = source
             .resolved_schema()?
@@ -94,6 +102,7 @@ impl RawSinkSize {
         Ok(Self {
             payload,
             framing: schema_bytes.saturating_add(batches.saturating_mul(4096)),
+            intermediate_factor: intermediate_bytes_per_arrow_byte(compressed, uncompressed),
         })
     }
 
@@ -102,6 +111,15 @@ impl RawSinkSize {
             .saturating_mul(copies as u64)
             .saturating_add(self.framing.saturating_mul(levels as u64))
     }
+}
+
+fn intermediate_bytes_per_arrow_byte(compressed: u64, uncompressed: u64) -> f64 {
+    if uncompressed == 0 {
+        return 1.0;
+    }
+    // A bare input ratio underprices BR_MT's filtered intermediate (0.335
+    // vs 0.358 of the raw estimate). Keep a 2x safety margin, capped at raw.
+    (2.0 * compressed as f64 / uncompressed as f64).min(1.0)
 }
 
 impl DiskFootprint {
@@ -145,7 +163,7 @@ impl DiskFootprint {
         let scratch = options.spill_dir.clone().unwrap_or_else(std::env::temp_dir);
         // The staging owner accounts for projected columns and selected row groups.
         let staged = source.bytes_to_stage(selection)?;
-        footprint.add(&scratch, "staged input", staged);
+        footprint.add(&scratch, "staged input", staged, false);
         if let Some(output) = overview {
             let levels = options.levels.resolve(options.gsd_base)?;
             let retained: Vec<_> = levels
@@ -171,6 +189,7 @@ impl DiskFootprint {
                     &scratch,
                     "pass-2 spill",
                     raw.bytes(copies(buffered), buffered),
+                    true,
                 );
             }
             // Raw bytes: an upper bound for either temp codec and a kept
@@ -182,8 +201,10 @@ impl DiskFootprint {
                     .unwrap_or(Path::new(".")),
                 "intermediate overview",
                 raw.bytes(copies(retained.len()), retained.len()),
+                true,
             );
         }
+        footprint.log_projection();
         Ok(footprint)
     }
 
@@ -200,13 +221,15 @@ impl DiskFootprint {
         output_row_bytes: u64,
     ) -> Result<Self, ConvertError> {
         let raw = RawSinkSize::from_source(source, selection, options)?;
-        let bytes = |rows: &[usize]| {
+        let bytes = |rows: &[usize], factor: f64| {
             RawSinkSize {
-                payload: rows
+                payload: (rows
                     .iter()
                     .fold(0u64, |sum, &n| sum.saturating_add(n as u64))
-                    .saturating_mul(output_row_bytes),
-                framing: raw.framing,
+                    .saturating_mul(output_row_bytes) as f64
+                    * factor)
+                    .ceil() as u64,
+                ..raw
             }
             .bytes(1, rows.len())
         };
@@ -218,7 +241,11 @@ impl DiskFootprint {
             footprint.add(
                 &options.spill_dir.clone().unwrap_or_else(std::env::temp_dir),
                 "pass-2 spill",
-                bytes(&level_rows[..buffered_levels]),
+                bytes(
+                    &level_rows[..buffered_levels],
+                    spill_bytes_per_arrow_byte(spill_codec(options.profile)),
+                ),
+                false,
             );
         }
         footprint.add(
@@ -227,13 +254,24 @@ impl DiskFootprint {
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new(".")),
             "intermediate overview",
-            bytes(level_rows),
+            bytes(level_rows, raw.intermediate_factor),
+            false,
         );
+        footprint.log_projection();
+        Ok(footprint)
+    }
+
+    fn log_projection(&self) {
+        let phase = if self.post_pass1 {
+            "after pass 1"
+        } else {
+            "pre-read"
+        };
         log::info!(
-            "[disk] after pass 1 projected footprint: {}",
-            footprint
-                .components
+            "[disk] {phase} projected footprint: {}",
+            self.components
                 .iter()
+                .filter(|c| self.post_pass1 || c.projected)
                 .map(|c| format!(
                     "{} {:.3} GiB in {}",
                     c.name,
@@ -243,7 +281,6 @@ impl DiskFootprint {
                 .collect::<Vec<_>>()
                 .join(" + ")
         );
-        Ok(footprint)
     }
 
     /// `tiles --layer-column` (#821): the split's uncompressed copy of the
@@ -256,16 +293,17 @@ impl DiskFootprint {
         dir: &Path,
     ) -> Result<(), ConvertError> {
         let raw = RawSinkSize::from_source(source, selection, options)?;
-        self.add(dir, "staged layers", raw.bytes(1, 1));
+        self.add(dir, "staged layers", raw.bytes(1, 1), false);
         Ok(())
     }
 
-    pub(super) fn add(&mut self, dir: &Path, name: &'static str, bytes: u64) {
+    fn add(&mut self, dir: &Path, name: &'static str, bytes: u64, projected: bool) {
         if bytes > 0 {
             self.components.push(Component {
                 dir: dir.to_path_buf(),
                 name,
                 bytes,
+                projected,
             });
         }
     }
@@ -294,6 +332,9 @@ impl DiskFootprint {
     ) -> Option<String> {
         let mut volumes: BTreeMap<String, (u64, u64, Vec<String>)> = BTreeMap::new();
         for component in &self.components {
+            if component.projected && !self.post_pass1 {
+                continue;
+            }
             let Some((volume, available)) = probe(&component.dir) else {
                 continue;
             };
@@ -308,26 +349,20 @@ impl DiskFootprint {
         }
         let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         let phase = if self.post_pass1 { " after pass 1" } else { "" };
-        let recheck = if self.post_pass1 {
-            ""
-        } else {
-            " Any filter is applied during the read and the size is rechecked after pass 1."
-        };
-        let warnings: Vec<_> =
-            volumes
-                .into_values()
-                .filter_map(|(estimate, available, parts)| {
-                    let need = estimate.saturating_add(estimate / MARGIN_DENOM);
-                    (available < need).then(|| {
-                        format!(
-                "projected disk footprint{phase} may not fit: {} need at most approximately {:.1} GiB; \
+        let warnings: Vec<_> = volumes
+            .into_values()
+            .filter_map(|(estimate, available, parts)| {
+                let need = estimate.saturating_add(estimate / MARGIN_DENOM);
+                (available < need).then(|| {
+                    format!(
+                "projected disk footprint{phase} may not fit: {} need approximately {:.1} GiB; \
                  their volume has {:.1} GiB free ({:.1} GiB short, including a 5% margin). \
-                 Point {} (or {}) at a roomier volume, or free up space first.{recheck}",
+                 Point {} (or {}) at a roomier volume, or free up space first.",
                 parts.join(" + "), gib(estimate), gib(available), gib(need - available),
                 remedies.spill_dir, remedies.keep_overview)
-                    })
                 })
-                .collect();
+            })
+            .collect();
         (!warnings.is_empty()).then(|| warnings.join("\n"))
     }
 }
@@ -362,6 +397,68 @@ mod tests {
         spill_dir: "--spill-dir",
         keep_overview: "--keep-overview",
     };
+
+    #[test]
+    fn unfiltered_local_input_warns_only_after_pass1() {
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        super::super::testutil::write_input(
+            &input,
+            &[Some(geo::Geometry::Point(geo::Point::new(1.0, 2.0)))],
+            false,
+            None,
+        );
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        let options = ConvertOptions::default();
+        let output = dir.path().join("out.parquet");
+        crate::test_log::take_thread_lines();
+        let mut before = DiskFootprint::conversion(&source, None, &options, Some(&output)).unwrap();
+        assert!(before
+            .warning_with(REMEDIES, |_| Some(("one".into(), 0)))
+            .is_none());
+        if logging {
+            let lines = crate::test_log::take_thread_lines();
+            assert!(
+                lines.iter().any(|line| line.starts_with("[disk]")
+                    && line.contains("pass-2 spill")
+                    && line.contains("intermediate overview")),
+                "{lines:#?}"
+            );
+        }
+        // Staging must still warn, without including either projection on
+        // the same volume, for both CLI and Python spellings of the remedies.
+        before.add(dir.path(), "staged input", 100, false);
+        before
+            .add_staged_layers(&source, None, &options, dir.path())
+            .unwrap();
+        for remedies in [
+            REMEDIES,
+            SpaceRemedies {
+                spill_dir: "spill_dir",
+                keep_overview: "keep_overview",
+            },
+        ] {
+            let warning = before
+                .warning_with(remedies, |_| Some(("one".into(), 0)))
+                .unwrap();
+            assert!(warning.contains("staged input") && warning.contains("staged layers"));
+            assert!(warning.contains(remedies.spill_dir));
+            assert!(
+                !warning.contains("pass-2 spill") && !warning.contains("intermediate overview")
+            );
+        }
+        // The unfiltered run still gets a shortage warning before pass 2.
+        let after =
+            DiskFootprint::post_pass1(&source, None, &options, &output, &[1, 1], 1, 1_600).unwrap();
+        let warning = after
+            .warning_with(REMEDIES, |_| Some(("one".into(), 0)))
+            .unwrap();
+        assert!(warning.contains("after pass 1"), "{warning}");
+        assert!(warning.contains("pass-2 spill") && warning.contains("intermediate overview"));
+        assert!(warning.contains("need approximately"), "{warning}");
+        assert!(!output.exists(), "the recheck precedes pass-2 output");
+    }
 
     #[test]
     fn post_pass1_counts_only_spilling_levels() {
@@ -402,6 +499,137 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "intermediate overview"));
         }
+    }
+
+    #[test]
+    fn post_pass1_spill_uses_the_shared_codec_price_and_raw_framing() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        super::super::testutil::write_input(
+            &input,
+            &[Some(geo::Geometry::Point(geo::Point::new(1.0, 2.0)))],
+            false,
+            None,
+        );
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        for profile in [MemoryProfile::Auto, MemoryProfile::Bounded] {
+            let options = ConvertOptions {
+                profile,
+                ..ConvertOptions::default()
+            };
+            let framing = RawSinkSize::from_source(&source, None, &options)
+                .unwrap()
+                .framing;
+            let footprint = DiskFootprint::post_pass1(
+                &source,
+                None,
+                &options,
+                &dir.path().join("out.parquet"),
+                &[10, 20],
+                1,
+                1_600,
+            )
+            .unwrap();
+            let factor = super::super::pipeline::spill_bytes_per_arrow_byte(
+                super::super::pipeline::spill_codec(profile),
+            );
+            assert_eq!(
+                footprint.spill_bytes(),
+                (16_000.0 * factor) as u64 + framing
+            );
+        }
+    }
+
+    #[test]
+    fn intermediate_compression_has_a_twofold_margin_capped_at_raw() {
+        for (compressed, uncompressed, expected, actual) in [
+            (335, 1_000, 0.670, 0.358), // BR_MT filtered (unfiltered: 0.110)
+            (593, 1_000, 1.000, 0.105), // Madagascar
+            (163, 1_000, 0.326, 0.083), // Moldova
+            (2_000, 1_000, 1.000, 0.0),
+            (0, 0, 1.000, 0.0), // no footer payload: retain the raw bound
+        ] {
+            let factor = intermediate_bytes_per_arrow_byte(compressed, uncompressed);
+            assert!((factor - expected).abs() < 1e-12, "{factor} vs {expected}");
+            assert!(factor >= actual, "{factor} must cover measured {actual}");
+        }
+    }
+
+    #[test]
+    fn post_pass1_intermediate_prices_selected_compressed_payload() {
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use std::sync::Arc;
+        use tylertoo_io::{OverviewCompression, OverviewWriteOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "dropped",
+                Arc::new(Int64Array::from_iter_values(0..100)) as ArrayRef,
+            ),
+            (
+                "kept",
+                Arc::new(StringArray::from(vec!["x".repeat(1_000); 100])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut writer = tylertoo_io::overview_writer(
+            std::fs::File::create(&input).unwrap(),
+            batch.schema(),
+            &batch.schema(),
+            &OverviewWriteOptions {
+                compression: OverviewCompression::Zstd(1),
+                full_column_stats: true,
+                geometry_columns: vec![],
+                covering_columns: vec![],
+            },
+        )
+        .unwrap();
+        for (offset, len) in [(0, 10), (10, 90)] {
+            writer.write(&batch.slice(offset, len)).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        source.restrict_columns(vec![1]).unwrap();
+        let selection = RowGroupSelection::from_parts(vec![vec![1]]);
+        let meta =
+            tylertoo_io::read_parquet_metadata(&std::fs::File::open(&input).unwrap()).unwrap();
+        let column = meta.row_group(1).column(1);
+        let compressed = column.compressed_size() as u64;
+        let uncompressed = column.uncompressed_size() as u64;
+        assert!(compressed * 2 < uncompressed);
+        assert_eq!(
+            source
+                .selected_column_compression_bytes(Some(&selection), 0)
+                .unwrap(),
+            (compressed, uncompressed)
+        );
+        // Dictionary expansion is part of the row price, never the codec ratio.
+        assert!(source.selected_column_bytes(Some(&selection), 0).unwrap() > uncompressed);
+        let options = ConvertOptions::default();
+        let raw = RawSinkSize::from_source(&source, Some(&selection), &options).unwrap();
+        let footprint = DiskFootprint::post_pass1(
+            &source,
+            Some(&selection),
+            &options,
+            &dir.path().join("out.parquet"),
+            &[80, 90],
+            1,
+            1_600,
+        )
+        .unwrap();
+        let intermediate = footprint
+            .components
+            .iter()
+            .find(|c| c.name == "intermediate overview")
+            .unwrap();
+        let factor = (2.0 * compressed as f64 / uncompressed as f64).min(1.0);
+        assert_eq!(
+            intermediate.bytes,
+            (170.0 * 1_600.0 * factor).ceil() as u64 + 2 * raw.framing
+        );
     }
 
     #[test]
@@ -591,9 +819,9 @@ mod tests {
     #[test]
     fn same_volume_components_share_one_margin() {
         let mut disk = DiskFootprint::default();
-        disk.add(Path::new("/scratch"), "staged input", 100);
-        disk.add(Path::new("/scratch"), "pass-2 spill", 200);
-        disk.add(Path::new("/output"), "intermediate overview", 300);
+        disk.add(Path::new("/scratch"), "staged input", 100, false);
+        disk.add(Path::new("/scratch"), "pass-2 spill", 200, false);
+        disk.add(Path::new("/output"), "intermediate overview", 300, false);
         assert!(disk
             .warning_with(REMEDIES, |_| Some(("one".into(), 630)))
             .is_none());
@@ -616,33 +844,32 @@ mod tests {
     fn the_warning_states_its_sizes_in_gib() {
         const GIB: u64 = 1 << 30;
         let mut disk = DiskFootprint::default();
-        disk.add(Path::new("/scratch"), "pass-2 spill", 10 * GIB);
+        disk.add(Path::new("/scratch"), "pass-2 spill", 10 * GIB, false);
         let warning = disk
             .warning_with(REMEDIES, |_| Some(("one".into(), 4 * GIB)))
             .unwrap();
         assert!(
             warning.contains(
-                "need at most approximately 10.0 GiB; their volume has 4.0 GiB free (6.5 GiB short"
+                "need approximately 10.0 GiB; their volume has 4.0 GiB free (6.5 GiB short"
             ),
             "{warning}"
         );
         assert!(
-            warning.contains("filter is applied during the read"),
+            !warning.contains("filter is applied during the read"),
             "{warning}"
         );
-        assert!(warning.contains("is rechecked after pass 1"), "{warning}");
     }
 
     #[test]
     fn separate_volumes_are_not_summed_and_unknown_probe_is_quiet() {
         let mut disk = DiskFootprint::default();
-        disk.add(Path::new("/scratch"), "pass-2 spill", 200);
-        disk.add(Path::new("/output"), "intermediate overview", 300);
+        disk.add(Path::new("/scratch"), "pass-2 spill", 200, false);
+        disk.add(Path::new("/output"), "intermediate overview", 300, false);
         assert!(disk
             .warning_with(REMEDIES, |p| Some((p.display().to_string(), 315)))
             .is_none());
         assert!(disk.warning_with(REMEDIES, |_| None).is_none());
-        disk.add(Path::new("/scratch"), "staged input", u64::MAX);
+        disk.add(Path::new("/scratch"), "staged input", u64::MAX, false);
         assert!(disk
             .warning_with(REMEDIES, |_| Some(("one".into(), u64::MAX - 1)))
             .is_some());

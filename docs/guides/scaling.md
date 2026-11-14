@@ -153,10 +153,14 @@ Measure memory use if headroom is tight, or use `--read-workers 1`.
 
 `--spill-dir <path>` controls these temporary files and defaults to `$TMPDIR`.
 The run fails before starting if the directory does not exist.
-The pre-read disk warning says "need at most approximately" because it is an
-upper bound. Any filter is applied during the read, and the size is rechecked
-after pass 1 using the kept rows at each emitted level. The log reports the
-projected pass-2 spill and intermediate overview sizes in GiB.
+Before reading, disk-space warnings cover only staged remote input and the
+`--layer-column` staged layers copy. Projected pass-2 spill and intermediate
+overview sizes appear in info-level `[disk]` logs. After pass 1, a free-space
+recheck warns about those outputs using the kept rows at each emitted level,
+including attribute filtering, before pass 2 writes them. The intermediate
+payload uses the selected input's compressed/uncompressed footer ratio with a
+2x safety margin, capped at the raw estimate. Spill uses the profile's codec
+price (raw for `auto`, 0.4 times raw for `bounded`); framing stays raw for both.
 
 - **Remote stage file.** A remote convert copies the column chunks it touches
   to local disk, using about as much space as those chunks. Both passes read

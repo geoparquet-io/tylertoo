@@ -2534,15 +2534,18 @@ mod spill_tests {
         assert_eq!(sizing_profile(Bounded, SinkBacking::Spill), Bounded);
     }
 
-    /// Both the pre-read upper bound and post-pass-1 recheck cover a local
-    /// unfiltered spill. The injected probe avoids filling a volume.
+    /// A local unfiltered spill warns only at the post-pass-1 recheck.
+    /// The injected probe avoids filling a volume.
     #[test]
-    fn phase1_local_preflight_covers_actual_pass2_spill() {
+    fn local_unfiltered_shortage_warns_only_after_pass1() {
         let dir = tempfile::tempdir().unwrap();
         let observations = measure_verbatim_spill(dir.path());
         let actual_bytes: u64 = observations.iter().map(|&(_, bytes)| bytes).sum();
         let available = actual_bytes / 2;
-        for disk in measured_disk_footprints(dir.path(), &observations) {
+        for (phase, disk) in measured_disk_footprints(dir.path(), &observations)
+            .into_iter()
+            .enumerate()
+        {
             assert!(
                 disk.spill_bytes() >= actual_bytes,
                 "the pass-2 component must cover the measured spill"
@@ -2550,8 +2553,8 @@ mod spill_tests {
             let warning = disk.warning_with(super::super::tiles::CLI_REMEDIES, |_| {
                 Some(("one volume".into(), available))
             });
-            assert!(warning.is_some(),
-                "local preflight returned no warning for {actual_bytes} measured spill bytes with only {available} bytes available");
+            assert_eq!(warning.is_some(), phase == 1,
+                "phase {phase}: {actual_bytes} measured spill bytes with only {available} bytes available");
         }
     }
 
@@ -2609,8 +2612,8 @@ mod spill_tests {
     }
 
     /// Bound pessimism on the fixed workload even after encoding changes.
-    /// The estimate uses raw sizing and must cover actual bytes without a
-    /// compression assumption. Its permitted overestimate is at most 32x.
+    /// The raw projection and codec-priced recheck must cover actual bytes.
+    /// Their permitted overestimate is at most 32x.
     #[test]
     fn disk_estimate_covers_fixed_spill_within_factor_32() {
         let dir = tempfile::tempdir().unwrap();

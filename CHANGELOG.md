@@ -104,9 +104,11 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Conversion rechecks disk space after pass 1 using kept per-level row counts,
-  including attribute filtering. The pre-read warning labels its estimate as
-  an upper bound; the log reports the revised component sizes in GiB (#872).
+- Pre-read disk warnings cover only staged input and staged layers; projected
+  spill and intermediate sizes are info logs. Conversion rechecks space before
+  pass 2 using kept per-level rows, including attribute filtering, the input's
+  compression ratio with a 2x margin for the intermediate, and the profile's
+  spill codec price. Framing stays raw (#872).
 - An `https://` input keeps its query string, so presigned S3 and Azure SAS
   URLs work; the query is shown as `?<redacted>` in logs, errors, reports
   and saved plans (#820).
