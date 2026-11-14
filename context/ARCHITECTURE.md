@@ -1655,21 +1655,80 @@ original GeoParquet. An unmarked old file cannot safely distinguish spatial
 cropping from invalid cluster counts; legacy files with conserved sums
 remain readable.
 
-### Cascade square dithering and quality-matched parity (#749, #779)
+### Cascade square dithering (#749)
 
-The shared cascade planner records a dither policy on each step; serial and
-pipelined execution consume that same step. Density-reduced conversions use
-canonical source area/anchor for collapsed squares, retaining the #749 stopgap
-that prevents previous placeholder squares from inflating coarse-level area.
-When density reduction is disabled (including `--verbatim --simplify-factor 1`),
-the cascade keeps main's working-geometry dither for tippecanoe parity. Applying
-the source-area stopgap to that path reduced Madagascar's z0 overview count
-from 1,150 to 379 with z0–2 and left z1 unchanged at 1,568.
+Under the cascade, a polygon that collapses below a level's tolerance is
+dithered into a placeholder square on its **canonical** area and anchor, on
+every run. The previous level's square is not the input to the dither:
+re-dithering it gave `p = side_prev² / side² = 1/4` at every coarser step
+against a `u` keyed on the same anchor (the square's centroid is its
+center), so a square born with `u < 1/4` passed every later draw and
+survived to z0. On `open-buildings` with `--verbatim --simplify-factor 1`
+that kept 229 squares at z0 (19× the source area at z8); Madagascar adm4
+kept 1,150 at z0 against 379 with `--no-cascade`. With the canonical area
+the cascade keeps what `--no-cascade` keeps at the collapsed levels.
 
-DIVERGENCE FROM TIPPECANOE: density-reduced runs use deterministic source-area
-hash dithering rather than tippecanoe's serial tiny-polygon accumulator (the
-existing #279 divergence). Unreduced runs preserve the calibrated cascade
-behavior, including its coarse-level placeholder area inflation; fully fixing
-#749 there conflicts with the current parity bands. `--no-cascade` remains the
-workaround when source-based per-level simplification is desired. The strict
-Moldova `pv0` decay exemption remains until the stopgap satisfies that invariant.
+Until #749 only density-reduced runs dithered on the canonical geometry;
+density-disabled runs (`--verbatim` with a nonzero `--simplify-factor`,
+the quality-matched tippecanoe comparison) kept the working-geometry
+dither, whose inflated z0 counts the Madagascar parity floor pinned.
+
+This matches tippecanoe: it hands each feature's unsimplified geometry to
+the next zoom and reduces tiny polygons per zoom against the source area,
+so a placeholder never feeds the next zoom's reduction. The remaining
+divergence is the per-feature hash in place of tippecanoe's serial
+accumulator (#279, `dither_u01`).
+
+Cascade repairs can split one source Polygon into several working parts.
+Collapsed repair fragments are dropped; if none survive, the original
+Polygon is dithered once. Thus `ftw-moldova-z10 --polygon-visibility 0`
+keeps 1 row at z0, matching `--no-cascade`, instead of keeping 22 squares
+alive. Its rows match the source run at every zoom from z0 through z14.
+
+For a source MultiPolygon, the fold carries each working part's canonical
+part index. Dropping a part removes its index; repair fragments inherit the
+same index and are treated together when they collapse. A surviving part
+therefore uses its own source area and anchor even after an earlier part
+has disappeared. This follows tippecanoe 2.79.0's `clip.cpp::reduce_tiny_poly`
+outer-ring reduction, rather than dithering on the whole MultiPolygon.
+The deterministic hash and placeholder sizing divergences documented above
+still apply.
+
+The archive verifier (`scripts/verify_archive.py`, called by
+`benchmarks/e2e/run_e2e.py`) tracks **cohorts** of source-unique feature ids.
+Its old aggregate square-count check falsely failed Moldova: z8 had 72
+square ids and z5 had 44, but none were common; even `--no-cascade` failed
+with 76 and 45. Coarser zooms gain new squares as larger polygons collapse.
+The verifier now requires a tiny-square instance of a cohort feature at
+the fine zoom and no instance larger than a placeholder. Clipped rectangles
+within the placeholder size limit do not exclude the feature. It counts
+those same ids at the coarser
+zoom regardless of their later shape. The threshold is unchanged: at least
+32 features must halve over three zooms. Every eligible zoom is checked,
+including above the aggregate square-count peak.
+
+Archives do not mark placeholder provenance or canonical parts, so this is
+an observable feature-cohort check, not a proof of every part's dither.
+It requires source-unique ids. With EPSG:3857 source geometry and the e2e
+matrix's default GSD base 1024 / extent 4096, placeholders are four tile
+units across (five allowing quantization). Those settings alone do not
+suffice for geographic source CRS: placeholders are square in source
+units, so EPSG:4326 squares at latitude 60 project to about 4x8 tile units
+and are rejected by the square classifier. Tile latitude alone cannot
+resolve this because the archive does not identify the source CRS. The
+decay classifier supports projected EPSG:3857 placeholders; it does not
+verify geographic placeholders at such latitudes. Large source squares
+and features with larger instances are ineligible. An expected decay check
+fails if no cohort reaches 32 features with a three-zoom comparison,
+including when CRS or extent/GSD settings make placeholders unrecognizable.
+On the merged #883 defaults, Moldova's z8 cohort has 70 ids
+and only two survive at z5; its exemption is removed. The original defect
+still fails on `origin/main`: open-buildings with `--verbatim
+--simplify-factor 1` keeps 145 of its 148 z8 cohort ids at z5. The fixed
+branch passes (e.g. z10 130 → z7 0).
+
+The #883 export defaults remain independent of this conversion fix: buffer
+5, automatic max-zoom simplification at 0.25 GSD for lines only, polygons
+unchanged. The tippecanoe tolerance comparison explicitly pins buffer 8
+and its matched verbatim run disables max-zoom simplification; all five
+fixtures retain their pre-merge per-zoom matched measurements and bounds.

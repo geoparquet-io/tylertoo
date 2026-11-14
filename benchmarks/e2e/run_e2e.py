@@ -558,8 +558,10 @@ VERIFY_ARCHIVE = REPO / "scripts" / "verify_archive.py"
 # flags, whether placeholder squares must decay toward coarse zooms).
 #
 # Decay is checked only with the polygon gate at 0, where every small polygon
-# reaches the coarse levels as a dithered square, so the squares must thin
-# ~4x per zoom (#749). With the gate on, small polygons leave at assignment
+# reaches the coarse levels as a dithered square. The verifier tracks the
+# same tiny-square ids toward coarser zooms, excluding new collapses (#749).
+# These runs use its default GSD base 1024 / extent 4096 size assumption.
+# With the gate on, small polygons leave at assignment
 # and the #384 accumulator draws carrier squares at a density-budget rate,
 # which need not halve over three zooms; and the coverage fill draws
 # square child-tile cells by design.
@@ -572,6 +574,13 @@ INVARIANT_SETTINGS = {
     "pv0": (["--polygon-visibility", "0"], _DEFAULT_CAPS, True),
     "sf0": (["--simplify-factor", "0"], _DEFAULT_CAPS, False),
     "fill": (["--coverage-fill"], _DEFAULT_CAPS, False),
+}
+# These fixture/settings pairs cannot form the verifier's 32-feature
+# placeholder cohort. Keep the expectation explicit: an expected decay
+# check with no eligible cohort must fail, never pass vacuously.
+INVARIANT_NO_DECAY = {
+    ("road-detections", "pv0"): "LineStrings only; no polygon placeholders",
+    ("fieldmaps-boundaries", "pv0"): "only 3 source features, below the 32-feature minimum",
 }
 # Datasets only the invariant matrix runs (no tippecanoe benchmark value):
 # committed fixtures under crates/core/tests/fixtures/invariants/, from
@@ -588,7 +597,7 @@ INVARIANT_ONLY_DATASETS = {
 }
 # --tier pr: defaults plus the setting most likely to break, per dataset.
 INVARIANT_PR_TIER = {
-    "open-buildings": ["defaults", "pv0"],  # #749: squares survive the cascade
+    "open-buildings": ["defaults", "pv0"],  # #749: squares must decay
     "road-detections": ["defaults", "sf0"],  # lines only; #758 ran sf0
     "madagascar-adm4": ["defaults", "fill"],  # #750 coverage fill
     "ftw-moldova-z10": ["defaults", "fill"],  # #748 validity, #750/#762 fill
@@ -686,7 +695,7 @@ def run_invariants(args, datasets: dict) -> int:
                      "--exemptions", str(args.exemptions),
                      "--fixture", did, "--settings", sname,
                      "--json-out", str(out_json)]
-            if decay:
+            if decay and did in DATASETS and (did, sname) not in INVARIANT_NO_DECAY:
                 vargv.append("--expect-decay")
             t1 = time.monotonic()
             vp = subprocess.run(vargv)
@@ -735,7 +744,8 @@ def main() -> int:
                     help="restrict to these dataset ids (repeatable)")
     ap.add_argument("--dataset", action="append", default=[],
                     metavar="ID=PATH",
-                    help="register an extra GeoParquet dataset (cluster-scale runs)")
+                    help="register an extra GeoParquet dataset (cluster-scale runs); "
+                         "skips --expect-decay (only established for built-in fixtures)")
     ap.add_argument("--corpus", action="store_true",
                     help="also register every corpus/manifest.json dataset "
                          "(gpio-optimized copies; build them with "

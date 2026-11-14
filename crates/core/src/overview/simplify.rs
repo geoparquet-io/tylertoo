@@ -301,7 +301,7 @@ pub fn simplify_for_level(
     opts: &SimplifyOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Simplified {
-    simplify_for_level_checked(geom, gsd_meters, None, crs, opts, diagnostics, geom).0
+    simplify_for_level_checked(geom, gsd_meters, None, crs, opts, diagnostics, geom, None).0
 }
 
 /// Like [`simplify_for_level`], but also reports whether the returned
@@ -318,6 +318,15 @@ pub fn simplify_for_level(
 /// they fed in — for FTW-like small polygons at minimum vertex count,
 /// adjacent ladder levels often produce identical output, so this turns an
 /// O(levels) chain of deep clones into O(1) allocations plus refcount bumps.
+///
+/// `part_sources`, when supplied by the fold, maps each working
+/// MultiPolygon part to its canonical part and is updated with the result.
+/// `None` is for direct simplification, where working and source parts have
+/// the same order. Repair fragments inherit their parent's index.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "#749: carry canonical geometry and multipart provenance through the cascade"
+)]
 pub(super) fn simplify_for_level_checked(
     geom: &Geometry<f64>,
     gsd_meters: f64,
@@ -326,6 +335,7 @@ pub(super) fn simplify_for_level_checked(
     opts: &SimplifyOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
     source: &Geometry<f64>,
+    mut part_sources: Option<&mut Vec<usize>>,
 ) -> (Simplified, bool) {
     let tol = world_tolerance(gsd_meters, crs, opts);
     // The placeholder side only matters to the square disposition; skip the
@@ -393,51 +403,88 @@ pub(super) fn simplify_for_level_checked(
         }
 
         Geometry::MultiPolygon(mp) => {
-            // Per-part disposition: a collapsed *part* is dropped (never
-            // turned into a Point — a MultiPolygon cannot hold one; whole-
-            // feature Point collapse is decided after), EXCEPT under
-            // `CollapseMode::Square` (#279), where each collapsed part is
-            // area-dithered into its own placeholder square — matching
-            // tippecanoe, which reduces tiny polygons ring-by-ring, so a
-            // dense multipolygon block keeps per-part density instead of
-            // collapsing to a single square. A repaired part (cascade path)
-            // may itself be a MultiPolygon; its parts are flattened in.
-            let part_mode = match opts.collapse.resolved() {
-                CollapseMode::Square => CollapseMode::Square,
-                _ => CollapseMode::Drop,
-            };
-            let mut kept: Vec<Polygon<f64>> = Vec::with_capacity(mp.0.len());
-            let mut unchanged = true;
-            for (part_index, p) in mp.0.iter().enumerate() {
-                let original = match source {
-                    Geometry::MultiPolygon(parts) => parts.0.get(part_index).unwrap_or(p),
-                    _ => p,
-                };
-                match simplify_polygon_impl_checked(
-                    p,
-                    tol,
-                    side,
-                    part_mode,
-                    opts.cascade,
-                    diagnostics,
-                    original,
-                ) {
-                    (Simplified::Keep(Geometry::Polygon(poly)), part_unchanged) => {
-                        unchanged &= part_unchanged;
-                        kept.push(poly);
-                    }
-                    (Simplified::Keep(Geometry::MultiPolygon(parts)), _) => {
-                        // A repaired part expanding into several — always a
-                        // structural change even if some sub-parts, taken in
-                        // isolation, would compare unchanged.
-                        unchanged = false;
-                        kept.extend(parts.0);
-                    }
-                    (Simplified::Keep(_) | Simplified::Dropped, _) => unchanged = false,
+            // Parts retain their canonical identity through drops and repair
+            // splits. Tippecanoe reduces tiny outer rings individually
+            // (clip.cpp, reduce_tiny_poly), rather than on the whole feature.
+            if let Some(indices) = part_sources.as_deref_mut() {
+                if indices.len() != mp.0.len() {
+                    *indices = (0..mp.0.len()).collect();
                 }
             }
+            let source_index = |i: usize| part_sources.as_deref().map_or(i, |indices| indices[i]);
+            let split_source = match source {
+                Geometry::Polygon(src) => Some(src),
+                _ => None,
+            };
+            let mut kept = Vec::with_capacity(mp.0.len());
+            let mut next_sources = part_sources
+                .as_ref()
+                .map(|_| Vec::with_capacity(mp.0.len()));
+            let mut unchanged = true;
+            let mut first = 0;
+            while first < mp.0.len() {
+                let index = if split_source.is_some() {
+                    0
+                } else {
+                    source_index(first)
+                };
+                let mut end = first + 1;
+                while end < mp.0.len() && (split_source.is_some() || source_index(end) == index) {
+                    end += 1;
+                }
+                let original = match source {
+                    Geometry::Polygon(src) => src,
+                    Geometry::MultiPolygon(parts) => parts.0.get(index).unwrap_or(&mp.0[first]),
+                    _ => &mp.0[first],
+                };
+                // A repaired source part can have several working fragments.
+                // Drop collapsed fragments, then dither their source once if
+                // none survive. An earlier square must never feed the dither.
+                let split = split_source.is_some() || end - first > 1;
+                let part_mode = match opts.collapse.resolved() {
+                    CollapseMode::Square if !split => CollapseMode::Square,
+                    _ => CollapseMode::Drop,
+                };
+                let before = kept.len();
+                for p in &mp.0[first..end] {
+                    match simplify_polygon_impl_checked(
+                        p,
+                        tol,
+                        side,
+                        part_mode,
+                        opts.cascade,
+                        diagnostics,
+                        original,
+                    ) {
+                        (Simplified::Keep(Geometry::Polygon(poly)), part_unchanged) => {
+                            unchanged &= part_unchanged;
+                            kept.push(poly);
+                        }
+                        (Simplified::Keep(Geometry::MultiPolygon(parts)), _) => {
+                            unchanged = false;
+                            kept.extend(parts.0);
+                        }
+                        (Simplified::Keep(_) | Simplified::Dropped, _) => unchanged = false,
+                    }
+                }
+                if split && kept.len() == before && opts.collapse.is_square() {
+                    let square = squarify_polygon(original, side);
+                    if split_source.is_some() {
+                        return (square, false);
+                    }
+                    if let Simplified::Keep(Geometry::Polygon(poly)) = square {
+                        kept.push(poly);
+                    }
+                }
+                if let Some(indices) = &mut next_sources {
+                    indices.extend(std::iter::repeat_n(index, kept.len() - before));
+                }
+                first = end;
+            }
+            if let (Some(indices), Some(next_sources)) = (part_sources, next_sources) {
+                *indices = next_sources;
+            }
             if !kept.is_empty() {
-                // defensive: already implied by the arms above
                 unchanged &= kept.len() == mp.0.len();
                 (
                     Simplified::Keep(Geometry::MultiPolygon(MultiPolygon::new(kept))),
@@ -445,7 +492,6 @@ pub(super) fn simplify_for_level_checked(
                 )
             } else {
                 match opts.collapse.resolved() {
-                    // Every part had its own dither under Square; nothing more.
                     CollapseMode::Drop | CollapseMode::Square | CollapseMode::Auto => {
                         (Simplified::Dropped, false)
                     }
@@ -519,10 +565,6 @@ pub struct CascadeStep {
     /// square is floored at (#407); `None` derives the zoom from the GSD the
     /// way the exporter does.
     pub zoom: Option<u8>,
-    // #749's source-area stopgap changes retention relative to tippecanoe
-    // parity. The conversion planner enables it for density-reduced runs;
-    // unreduced runs retain the established working-geometry dither.
-    source_area_dither: bool,
 }
 
 impl CascadeStep {
@@ -532,7 +574,6 @@ impl CascadeStep {
             gsd_meters,
             repr: Representation::Geometry,
             zoom: None,
-            source_area_dither: true,
         }
     }
 
@@ -542,7 +583,6 @@ impl CascadeStep {
             gsd_meters,
             repr: Representation::Point,
             zoom: None,
-            source_area_dither: true,
         }
     }
 
@@ -552,7 +592,6 @@ impl CascadeStep {
             gsd_meters,
             repr: Representation::Square,
             zoom: None,
-            source_area_dither: true,
         }
     }
 
@@ -560,22 +599,6 @@ impl CascadeStep {
     #[must_use]
     pub fn with_zoom(self, zoom: Option<u8>) -> Self {
         Self { zoom, ..self }
-    }
-
-    /// Plan the dither policy once for all engines. Density-disabled runs
-    /// include quality-matched (`--verbatim --simplify-factor 1`) parity.
-    pub(crate) fn for_level(
-        gsd_meters: f64,
-        zoom: Option<u8>,
-        repr: Representation,
-        density_reduced: bool,
-    ) -> Self {
-        Self {
-            gsd_meters,
-            zoom,
-            repr,
-            source_area_dither: density_reduced,
-        }
     }
 }
 
@@ -658,7 +681,18 @@ pub(crate) fn simplify_step_at(
     repr: Representation,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Simplified {
-    simplify_step_checked(geom, gsd_meters, zoom, crs, opts, repr, diagnostics, geom).0
+    simplify_step_checked(
+        geom,
+        gsd_meters,
+        zoom,
+        crs,
+        opts,
+        repr,
+        diagnostics,
+        geom,
+        None,
+    )
+    .0
 }
 
 /// Like [`simplify_step`], but also reports whether the output is
@@ -684,16 +718,33 @@ pub(super) fn simplify_step_checked(
     repr: Representation,
     diagnostics: &crate::diagnostics::Diagnostics,
     source: &Geometry<f64>,
+    part_sources: Option<&mut Vec<usize>>,
 ) -> (Simplified, bool) {
     match repr {
-        Representation::Geometry => {
-            simplify_for_level_checked(geom, gsd_meters, zoom, crs, opts, diagnostics, source)
-        }
+        Representation::Geometry => simplify_for_level_checked(
+            geom,
+            gsd_meters,
+            zoom,
+            crs,
+            opts,
+            diagnostics,
+            source,
+            part_sources,
+        ),
         Representation::Point => {
             if let Some(out) = polygonal_representative_point(geom) {
                 return (out, false);
             }
-            simplify_for_level_checked(geom, gsd_meters, zoom, crs, opts, diagnostics, source)
+            simplify_for_level_checked(
+                geom,
+                gsd_meters,
+                zoom,
+                crs,
+                opts,
+                diagnostics,
+                source,
+                part_sources,
+            )
         }
         // Square (#279): normal simplification with the below-tolerance
         // disposition forced to area-dithered placeholder squares at this
@@ -703,7 +754,16 @@ pub(super) fn simplify_step_checked(
                 collapse: CollapseMode::Square,
                 ..*opts
             };
-            simplify_for_level_checked(geom, gsd_meters, zoom, crs, &opts, diagnostics, source)
+            simplify_for_level_checked(
+                geom,
+                gsd_meters,
+                zoom,
+                crs,
+                &opts,
+                diagnostics,
+                source,
+                part_sources,
+            )
         }
     }
 }
@@ -723,8 +783,11 @@ pub(super) fn simplify_step_checked(
 /// Zoom-band representation (#317 / #279): at the first `Point` step (the
 /// band's finest level) a polygonal feature collapses to its representative
 /// point; coarser steps then pass the point through untouched, so every
-/// point-band level shares the same point. `Square` steps dither the
-/// below-tolerance survivors of the previous step into placeholder squares.
+/// point-band level shares the same point. `Square` steps turn the
+/// below-tolerance survivors of the previous step into placeholder squares,
+/// dithered on the canonical polygon part's area and anchor (#749).
+/// Repair fragments of one source part collapse together: a single source
+/// dither replaces them only when none survive.
 ///
 /// Along a pure-geometry chain, dropping is monotone: tolerances grow while
 /// the working geometry's extent can only shrink (RDP keeps a vertex
@@ -794,6 +857,9 @@ pub fn simplify_cascade(
 pub(crate) struct CascadeFold {
     current: Option<Arc<Geometry<f64>>>,
     alive: bool,
+    /// Canonical part index for each working MultiPolygon part. Repair
+    /// duplicates an index; dropping a part removes it, never renumbers it.
+    part_sources: Vec<usize>,
 }
 
 /// One [`CascadeFold::step`]'s result.
@@ -816,6 +882,7 @@ impl CascadeFold {
         Self {
             current: None,
             alive: true,
+            part_sources: Vec::new(),
         }
     }
 
@@ -845,6 +912,11 @@ impl CascadeFold {
         } else {
             canonical
         };
+        if self.current.is_none() || !self.alive {
+            if let Geometry::MultiPolygon(parts) = canonical.as_ref() {
+                self.part_sources = (0..parts.0.len()).collect();
+            }
+        }
         let (out, unchanged) = simplify_step_checked(
             base.as_ref(),
             step.gsd_meters,
@@ -853,11 +925,11 @@ impl CascadeFold {
             opts,
             step.repr,
             diagnostics,
-            if step.source_area_dither {
-                canonical.as_ref()
-            } else {
-                base.as_ref()
-            },
+            // A collapsing square dithers on the canonical area and anchor
+            // (#749): the previous level's square would reset `p` to 1/4
+            // against an unchanged `u`, so it would never thin.
+            canonical.as_ref(),
+            Some(&mut self.part_sources),
         );
         match out {
             Simplified::Keep(s) => {
@@ -1607,10 +1679,11 @@ fn polygon_anchor(poly: &Polygon<f64>) -> Option<Point<f64>> {
 /// so aggregate density stays truthful exactly like tippecanoe's
 /// accumulator in expectation — dense blocks emit many squares, isolated
 /// barns mostly none — while the decision is a pure function of the feature,
-/// independent of engine, ordering, and parallelism. A kept square's anchor
-/// is its own center, so re-dithering it at a coarser cascade step reuses
-/// the same `u` against a smaller `a/T` — survival is monotone fine→coarse,
-/// matching the cascade's drop monotonicity.
+/// independent of engine, ordering, and parallelism. The cascade dithers a
+/// collapsing polygon on its canonical part's area and anchor at every step
+/// (#749), grouping repair fragments by their source part,
+/// so `u` stays fixed while `a/T` shrinks 4× per zoom — survival is
+/// monotone fine→coarse, matching the cascade's drop monotonicity.
 pub(super) fn dither_u01(x: f64, y: f64) -> f64 {
     let mut z = x.to_bits() ^ y.to_bits().rotate_left(32);
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -2932,9 +3005,10 @@ mod tests {
         }
     }
 
-    /// `Representation::Square` in a cascade: a square kept at the band's
-    /// finest level re-dithers deterministically at coarser steps (same
-    /// anchor ⇒ same u), so survival is monotone and engine-independent.
+    /// `Representation::Square` in a cascade: every step dithers the
+    /// collapsing polygon on its canonical area and anchor (#749), so `u` is
+    /// fixed while `p` shrinks, and survival is monotone and
+    /// engine-independent.
     #[test]
     fn test_square_step_and_cascade_consistency() {
         let opts = SimplifyOptions::default();
@@ -3187,6 +3261,7 @@ mod tests {
             Representation::Geometry,
             &crate::diagnostics::Diagnostics::default(),
             &poly,
+            None,
         );
         assert!(unchanged, "minimal ring should report no removal");
         match out {
@@ -3210,6 +3285,7 @@ mod tests {
             Representation::Geometry,
             &crate::diagnostics::Diagnostics::default(),
             &line,
+            None,
         );
         assert!(!unchanged, "coarse GSD should remove vertices");
         assert!(line_len(&out) < 200);
@@ -3230,6 +3306,7 @@ mod tests {
             Representation::Geometry,
             &crate::diagnostics::Diagnostics::default(),
             &line,
+            None,
         );
         assert!(unchanged);
         assert_eq!(line_len(&out), 200);
@@ -3253,6 +3330,7 @@ mod tests {
             Representation::Point,
             &crate::diagnostics::Diagnostics::default(),
             &poly,
+            None,
         );
         assert!(
             !first_unchanged,
@@ -3270,6 +3348,7 @@ mod tests {
             Representation::Point,
             &crate::diagnostics::Diagnostics::default(),
             &point_geom,
+            None,
         );
         assert!(
             second_unchanged,
@@ -3779,80 +3858,304 @@ mod rdp_tests {
 mod source_area_regression {
     use super::*;
 
+    /// A repaired canonical part can occupy multiple working slots after an
+    /// earlier part has disappeared. Collapse those fragments together, then
+    /// retain the source identity for the next step too.
+    #[test]
+    fn multipart_repair_fragments_dither_once_on_their_source_part() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let opts = SimplifyOptions::default();
+        let mut kept = 0;
+        for i in 0..2000 {
+            let anchor = Point::new(i as f64 * 10.0, 0.0);
+            let source = Arc::new(Geometry::MultiPolygon(MultiPolygon::new(vec![
+                Polygon::empty(),
+                placeholder_square(anchor, 1.0),
+            ])));
+            let working = Geometry::MultiPolygon(MultiPolygon::new(vec![
+                placeholder_square(anchor, 4.0),
+                placeholder_square(Point::new(anchor.x() + 5.0, 0.0), 4.0),
+            ]));
+            let mut fold = CascadeFold {
+                current: Some(Arc::new(working)),
+                alive: true,
+                part_sources: vec![1, 1],
+            };
+            for side in [8.0, 16.0] {
+                let actual = match fold.step(
+                    &source,
+                    &CascadeStep::geom(side),
+                    Crs::Epsg3857,
+                    &opts,
+                    &diagnostics,
+                ) {
+                    FoldStep::Keep { geom, .. } => Simplified::Keep((*geom).clone()),
+                    FoldStep::Dropped => Simplified::Dropped,
+                };
+                let direct = simplify_for_level(&source, side, Crs::Epsg3857, &opts, &diagnostics);
+                kept += usize::from(matches!(direct, Simplified::Keep(_)));
+                assert_eq!(actual, direct, "anchor {anchor:?}, side {side}");
+            }
+        }
+        assert!((5..100).contains(&kept), "kept {kept}");
+    }
+
+    #[test]
+    fn multipart_stale_source_indices_fall_back_to_working_part() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let opts = SimplifyOptions::default();
+        let working = Geometry::MultiPolygon(MultiPolygon::new(vec![
+            placeholder_square(Point::new(0.0, 0.0), 20.0),
+            placeholder_square(Point::new(100.0, 0.0), 20.0),
+        ]));
+        let source = Geometry::MultiPolygon(MultiPolygon::new(Vec::new()));
+        let expected = simplify_for_level(&working, 1.0, Crs::Epsg3857, &opts, &diagnostics);
+        for (mut indices, expected_indices) in [
+            (vec![], vec![0, 1]),
+            (vec![1], vec![0, 1]),
+            (vec![99, 100], vec![99, 100]),
+        ] {
+            let (actual, _) = simplify_for_level_checked(
+                &working,
+                1.0,
+                None,
+                Crs::Epsg3857,
+                &opts,
+                &diagnostics,
+                &source,
+                Some(&mut indices),
+            );
+            assert_eq!(actual, expected);
+            assert_eq!(indices, expected_indices);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dhat-heap")]
+    fn direct_multipart_does_not_allocate_cascade_provenance() {
+        if std::env::var_os("NEXTEST_EXECUTION_MODE").as_deref()
+            != Some(std::ffi::OsStr::new("process-per-test"))
+        {
+            eprintln!("skipped: dhat requires nextest process-per-test isolation");
+            return;
+        }
+        const PARTS: usize = 1024;
+        let source = Geometry::MultiPolygon(MultiPolygon::new(vec![Polygon::empty(); PARTS]));
+        let opts = SimplifyOptions {
+            collapse: CollapseMode::Drop,
+            ..Default::default()
+        };
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let profiler = dhat::Profiler::builder().testing().build();
+        let result = simplify_for_level(&source, 1.0, Crs::Epsg3857, &opts, &diagnostics);
+        let bytes = dhat::HeapStats::get().total_bytes;
+        drop(profiler);
+        assert_eq!(result, Simplified::Dropped);
+        // Empty parts need only the output polygon buffer: no per-part
+        // provenance should be allocated for a direct simplification.
+        assert!(
+            bytes <= (PARTS * std::mem::size_of::<Polygon<f64>>()) as u64,
+            "direct multipart allocated {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn cascade_multipart_point_step_and_canonical_revival_retain_sources() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let opts = SimplifyOptions {
+            collapse: CollapseMode::Drop,
+            ..Default::default()
+        };
+        let fine = CascadeStep::geom(1.0);
+        let drop_all = CascadeStep::geom(4.0);
+        let point = CascadeStep::point(8.0);
+        let coarse = CascadeStep::square(16.0);
+        for i in 0..20 {
+            let source = Geometry::MultiPolygon(MultiPolygon::new(vec![
+                placeholder_square(Point::new(i as f64 * 100.0, 0.0), 0.1),
+                placeholder_square(Point::new(i as f64 * 100.0, 20.0), 2.0),
+            ]));
+            let Simplified::Keep(working) =
+                simplify_cascade(&source, &[fine], Crs::Epsg3857, &opts, &diagnostics)
+            else {
+                panic!("large part must survive")
+            };
+            // A live point band keeps the point of the surviving part.
+            let direct = simplify_cascade(
+                &working,
+                &[point, coarse],
+                Crs::Epsg3857,
+                &opts,
+                &diagnostics,
+            );
+            let cascaded = simplify_cascade(
+                &source,
+                &[fine, point, coarse],
+                Crs::Epsg3857,
+                &opts,
+                &diagnostics,
+            );
+            assert_eq!(cascaded, direct);
+
+            // After the entire working geometry dies, the point band revives
+            // from canonical, including the part lost at the fine step.
+            let canonical = Arc::new(source.clone());
+            let mut fold = CascadeFold::new();
+            fold.step(&canonical, &fine, Crs::Epsg3857, &opts, &diagnostics);
+            assert_eq!(fold.part_sources, vec![1]);
+            assert!(matches!(
+                fold.step(&canonical, &drop_all, Crs::Epsg3857, &opts, &diagnostics),
+                FoldStep::Dropped
+            ));
+            fold.step(&canonical, &point, Crs::Epsg3857, &opts, &diagnostics);
+            assert_eq!(
+                fold.part_sources,
+                vec![0, 1],
+                "revival resets canonical provenance"
+            );
+            let direct = simplify_cascade(
+                &source,
+                &[point, coarse],
+                Crs::Epsg3857,
+                &opts,
+                &diagnostics,
+            );
+            let cascaded = simplify_cascade(
+                &source,
+                &[fine, drop_all, point, coarse],
+                Crs::Epsg3857,
+                &opts,
+                &diagnostics,
+            );
+            assert_eq!(cascaded, direct);
+        }
+    }
+
+    #[test]
+    fn cascade_multipart_dither_retains_source_part_after_a_drop() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let opts = SimplifyOptions::default();
+        for repr in [Representation::Geometry, Representation::Square] {
+            let fine = CascadeStep {
+                repr,
+                ..CascadeStep::geom(1.0)
+            };
+            let coarse = CascadeStep {
+                repr,
+                ..CascadeStep::geom(4.0)
+            };
+            let mut checked = 0;
+            for i in 0..2000 {
+                let source = Geometry::MultiPolygon(MultiPolygon::new(vec![
+                    placeholder_square(Point::new(i as f64 * 100.0, 0.0), 0.1),
+                    placeholder_square(Point::new(i as f64 * 100.0, 20.0), 2.0),
+                ]));
+                let Simplified::Keep(Geometry::MultiPolygon(out)) =
+                    simplify_cascade(&source, &[fine], Crs::Epsg3857, &opts, &diagnostics)
+                else {
+                    panic!("large part must survive");
+                };
+                if out.0.len() != 1 {
+                    continue;
+                }
+                checked += 1;
+                let direct =
+                    simplify_cascade(&source, &[coarse], Crs::Epsg3857, &opts, &diagnostics);
+                let cascaded =
+                    simplify_cascade(&source, &[fine, coarse], Crs::Epsg3857, &opts, &diagnostics);
+                assert_eq!(cascaded, direct, "{repr:?}, source {source:?}");
+            }
+            assert!(
+                checked > 1900,
+                "only {checked} cases dropped the first part"
+            );
+        }
+    }
+
+    /// A square kept at a fine step must be re-dithered on the source's area
+    /// and anchor at the coarser one, exactly as if that level were
+    /// simplified from the source (#749). Covers the zoom-band square steps
+    /// and the plain geometry steps a quality-matched run
+    /// (`--verbatim --simplify-factor 1`) takes.
     #[test]
     fn cascade_square_dither_uses_source_area() {
+        for (repr, collapse) in [
+            (Representation::Square, CollapseMode::Square),
+            (
+                Representation::Geometry,
+                SimplifyOptions::default().collapse,
+            ),
+        ] {
+            let opts = SimplifyOptions {
+                collapse,
+                ..Default::default()
+            };
+            let diagnostics = crate::diagnostics::Diagnostics::default();
+            let fine = CascadeStep {
+                repr,
+                ..CascadeStep::geom(2.0)
+            };
+            let coarse = CascadeStep {
+                repr,
+                ..CascadeStep::geom(8.0)
+            };
+            let mut checked = 0;
+            for i in 0..2000 {
+                let anchor = Point::new(i as f64 * 10.0, 0.0);
+                let geom = Geometry::Polygon(placeholder_square(anchor, 1.0));
+                let Simplified::Keep(_) =
+                    simplify_cascade(&geom, &[fine], Crs::Epsg3857, &opts, &diagnostics)
+                else {
+                    continue;
+                };
+                checked += 1;
+                let cascaded =
+                    simplify_cascade(&geom, &[fine, coarse], Crs::Epsg3857, &opts, &diagnostics);
+                let direct = simplify_cascade(&geom, &[coarse], Crs::Epsg3857, &opts, &diagnostics);
+                assert_eq!(
+                    cascaded, direct,
+                    "{repr:?}: cascade must dither on the original area, anchor {anchor:?}"
+                );
+            }
+            assert!(checked > 20, "{repr:?}: only {checked} squares kept");
+        }
+    }
+    /// A repair can split a source Polygon into a MultiPolygon at a fine
+    /// cascade step. When its parts collapse at a coarser step, the feature
+    /// must be dithered once on the source polygon, as `--no-cascade` does,
+    /// not each part on itself: a part that is already a square would keep
+    /// `p` at 1/4 and survive to z0 (#749, `ftw-moldova-z10` with
+    /// `--polygon-visibility 0`).
+    #[test]
+    fn split_source_polygon_dithers_on_the_source() {
         let opts = SimplifyOptions {
             collapse: CollapseMode::Square,
             ..Default::default()
         };
-        let fine = CascadeStep::for_level(2.0, None, Representation::Square, true);
-        let coarse = CascadeStep::for_level(8.0, None, Representation::Square, true);
-        let mut checked = 0;
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let mut kept = 0;
         for i in 0..2000 {
             let anchor = Point::new(i as f64 * 10.0, 0.0);
-            let geom = Geometry::Polygon(placeholder_square(anchor, 1.0));
-            if matches!(
-                simplify_cascade(
-                    &geom,
-                    &[fine],
-                    Crs::Epsg3857,
-                    &opts,
-                    &crate::diagnostics::Diagnostics::default()
-                ),
-                Simplified::Keep(_)
-            ) {
-                checked += 1;
-                let cascaded = simplify_cascade(
-                    &geom,
-                    &[fine, coarse],
-                    Crs::Epsg3857,
-                    &opts,
-                    &crate::diagnostics::Diagnostics::default(),
-                );
-                let direct = simplify_cascade(
-                    &geom,
-                    &[coarse],
-                    Crs::Epsg3857,
-                    &opts,
-                    &crate::diagnostics::Diagnostics::default(),
-                );
-                assert_eq!(
-                    cascaded, direct,
-                    "cascade must dither on the original area, anchor {anchor:?}"
-                );
-            }
+            let source = Geometry::Polygon(placeholder_square(anchor, 1.0));
+            // The previous level's square, held as a one-part MultiPolygon.
+            let working =
+                Geometry::MultiPolygon(MultiPolygon::new(vec![placeholder_square(anchor, 4.0)]));
+            let (cascaded, _) = simplify_for_level_checked(
+                &working,
+                8.0,
+                None,
+                Crs::Epsg3857,
+                &opts,
+                &diagnostics,
+                &source,
+                None,
+            );
+            let direct = simplify_for_level(&source, 8.0, Crs::Epsg3857, &opts, &diagnostics);
+            kept += usize::from(matches!(direct, Simplified::Keep(_)));
+            assert_eq!(cascaded, direct, "anchor {anchor:?}");
         }
-        assert!(checked > 20);
-    }
-
-    #[test]
-    fn unreduced_cascade_retains_working_geometry_dither() {
-        let opts = SimplifyOptions::default();
-        let diagnostics = crate::diagnostics::Diagnostics::default();
-        let fine = CascadeStep::for_level(2.0, None, Representation::Geometry, false);
-        let coarse = CascadeStep::for_level(8.0, None, Representation::Geometry, false);
-        let mut checked = 0;
-        let mut differs_from_source = 0;
-        for i in 0..2000 {
-            let geom = Geometry::Polygon(placeholder_square(Point::new(i as f64 * 10.0, 0.0), 1.0));
-            let Simplified::Keep(working) =
-                simplify_cascade(&geom, &[fine], Crs::Epsg3857, &opts, &diagnostics)
-            else {
-                continue;
-            };
-            checked += 1;
-            let cascaded =
-                simplify_cascade(&geom, &[fine, coarse], Crs::Epsg3857, &opts, &diagnostics);
-            let expected = simplify_for_level(&working, 8.0, Crs::Epsg3857, &opts, &diagnostics);
-            assert_eq!(cascaded, expected);
-            let source = simplify_for_level(&geom, 8.0, Crs::Epsg3857, &opts, &diagnostics);
-            differs_from_source += usize::from(cascaded != source);
-        }
-        assert!(checked > 20);
-        assert!(
-            differs_from_source > 0,
-            "the two retention policies conflict"
-        );
+        // About 2000 / 64 keep a square; the old per-part dither kept ~500.
+        assert!((5..100).contains(&kept), "kept {kept}");
     }
 }
 

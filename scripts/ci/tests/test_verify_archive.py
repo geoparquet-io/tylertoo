@@ -7,7 +7,103 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from verify_archive import ZoomScan, evaluate
+from verify_archive import ZoomScan, evaluate, is_placeholder_square
+
+
+def _decay(scans, ids=True):
+    outcomes = evaluate(
+        scans, {"vector_layers": [{"id": "test", "fields": {}}]}, "test",
+        None, (0, 0), ids, True, None,
+    )
+    return next(o for o in outcomes if o.invariant == "decay")
+
+
+def test_decay_tracks_a_cohort_instead_of_newly_collapsed_polygons():
+    # Moldova's aggregate counts fail (76 -> 45), but these are NEW squares.
+    fine = set(range(76))
+    coarse = set(range(100, 145))
+    result = _decay({8: ZoomScan(ids=fine, square_ids=fine),
+                     5: ZoomScan(ids=coarse, square_ids=coarse)})
+    assert result.ok, result.detail
+    assert "z8 76 -> z5 0" in result.detail
+
+
+def test_decay_fails_when_no_cohort_is_eligible():
+    cohort = set(range(31))
+    result = _decay({8: ZoomScan(ids=cohort, square_ids=cohort),
+                     5: ZoomScan(ids=set())})
+    assert not result.ok
+    assert result.detail == (
+        "square cohort survivors: no cohort was eligible; requires at least 32 tiny-square ids "
+        "at a zoom at least 3 above the archive's minimum zoom; "
+        "EPSG:3857 source at GSD base 1024 "
+        "and extent 4096"
+    )
+
+
+def test_expect_decay_help_names_source_crs_and_no_cohort_failure(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["verify_archive.py", "--help"])
+    with pytest.raises(SystemExit) as exc:
+        verify_archive.main()
+    assert exc.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "requires --ids, EPSG:3857 source, GSD base 1024, extent 4096" in help_text
+    assert "fails if no cohort is eligible" in help_text
+
+
+@pytest.mark.parametrize("coarse_is_square", [True, False])
+def test_decay_rejects_stuck_cohort_regardless_of_later_shape(coarse_is_square):
+    # The #749 defect: a square keeps the same hash against p=1/4 forever.
+    cohort = set(range(64))
+    result = _decay({8: ZoomScan(ids=cohort, square_ids=cohort),
+                     5: ZoomScan(ids=cohort, square_ids=cohort if coarse_is_square else set())})
+    assert not result.ok, result.detail
+    assert "z8 64 -> z5 64" in result.detail
+
+
+def test_decay_checks_cohorts_above_the_aggregate_peak_too():
+    fine = set(range(64))
+    coarse = set(range(100))
+    result = _decay({8: ZoomScan(ids=fine, square_ids=fine),
+                     5: ZoomScan(ids=coarse, square_ids=coarse)})
+    assert not result.ok, result.detail
+
+
+@pytest.mark.parametrize("ids,missing", [(False, 0), (True, 1)])
+def test_decay_requires_source_unique_ids(ids, missing):
+    result = _decay({8: ZoomScan(squares=76, no_id=missing),
+                     5: ZoomScan(squares=45)}, ids=ids)
+    assert not result.ok
+    assert "--ids" in result.detail
+
+
+@pytest.mark.parametrize("survivors,ok", [(31, True), (32, True), (33, False)])
+def test_decay_keeps_the_existing_halving_threshold(survivors, ok):
+    cohort = set(range(64))
+    result = _decay({8: ZoomScan(ids=cohort, square_ids=cohort),
+                     5: ZoomScan(ids=set(range(survivors)))})
+    assert result.ok is ok, result.detail
+
+
+def test_decay_does_not_classify_large_source_squares_as_placeholders():
+    # Moldova's canonical level has ~50-unit field squares. These have not
+    # collapsed and need not decay over three zooms. Default placeholders
+    # are 4 units across (one GSD at extent 4096 / GSD base 1024).
+    def square(side):
+        return [[[0, 0], [side, 0], [side, side], [0, side], [0, 0]]]
+
+    assert is_placeholder_square("Polygon", square(4))
+    assert is_placeholder_square("Polygon", [[[0, 0], [4, 0], [4, 5], [0, 5], [0, 0]]])
+    assert not is_placeholder_square("Polygon", square(50))
+
+
+def test_decay_excludes_features_with_large_instances_at_the_fine_zoom():
+    cohort = set(range(64))
+    # A tile can clip a small square from a much larger feature. Its other
+    # tile instances reveal that the feature has not fully collapsed.
+    fine = ZoomScan(ids=cohort, square_ids=cohort, large_ids=cohort)
+    result = _decay({8: fine, 5: ZoomScan(ids=cohort)})
+    assert "no cohort was eligible" in result.detail
 
 
 @pytest.mark.parametrize(
@@ -88,6 +184,50 @@ M = 3  # canonical (finest) zoom of the synthetic pyramids
 NOTE = {"tylertoo:variable_depth": {"enabled": True, "canonical_maxzoom": M}}
 
 
+def _polygon_tile(wkt, with_ids=True):
+    features = [{"geometry": wkt, "properties": {}, **({"id": i} if with_ids else {})}
+                for i in range(64)]
+    return mapbox_vector_tile.encode(
+        [{"name": "test", "features": features}],
+        default_options={"extents": 4096, "y_coord_down": True},
+    )
+
+
+def test_decay_rejects_real_mvt_with_omitted_ids():
+    from mapbox_vector_tile.Mapbox import vector_tile_pb2
+
+    raw = _polygon_tile("POLYGON((0 0,4 0,4 4,0 4,0 0))", with_ids=False)
+    tile = vector_tile_pb2.tile()
+    tile.ParseFromString(raw)
+    assert all(not f.HasField("id") for f in tile.layers[0].features)
+    scans = verify_archive.scan_chunk(
+        ([(z, 0, 0, raw) for z in [5, 8]], "test", Compression.NONE, (0, 0), True)
+    )
+    result = _decay(scans)
+    assert not result.ok, result.detail
+    assert "MVT ids on every feature" in result.detail
+    assert scans[8].no_id == 64
+
+
+def test_decay_keeps_a_placeholder_clipped_at_the_buffered_tile_edge():
+    # Buffer 5 at extent 4096 ends at x=4176. The same source square
+    # spans 4175..4179, clipped to 1x4 here and complete in the neighbour.
+    clipped = _polygon_tile("POLYGON((4175 20,4176 20,4176 24,4175 24,4175 20))")
+    whole = _polygon_tile("POLYGON((79 20,83 20,83 24,79 24,79 20))")
+    fine = verify_archive.scan_chunk(
+        ([(8, 0, 128, clipped)], "test", Compression.NONE, (0, 0), True)
+    )[8]
+    neighbour = verify_archive.scan_chunk(
+        ([(8, 1, 128, whole)], "test", Compression.NONE, (0, 0), True)
+    )[8]
+    fine.merge(neighbour)
+    result = _decay({8: fine, 5: ZoomScan(ids=set(range(64)))})
+    assert not result.ok, result.detail
+    assert "z8 64 -> z5 64" in result.detail
+    assert fine.square_ids == set(range(64))
+    assert not fine.large_ids
+
+
 def _tile(fid_xs, extent):
     """One MVT tile; each feature is a point whose id is its source id."""
     feats = [
@@ -131,6 +271,24 @@ def _verify(path, tmp_path, n_in=6):
     )
     outcomes, _ = verify_archive.verify_strict(path, args)
     return {o.invariant: o for o in outcomes if o.zoom is None}, outcomes
+
+
+def test_decay_scan_and_merge_exclude_a_clipped_square_from_a_larger_feature():
+    def scan(wkt):
+        raw = mapbox_vector_tile.encode(
+            [{"name": "t", "features": [{"id": 7, "properties": {}, "geometry": wkt}]}],
+            default_options={"extents": 4096, "y_coord_down": True},
+        )
+        return verify_archive.scan_chunk(
+            ([(8, 0, 0, gzip.compress(raw))], "t", Compression.GZIP, (0, 0), True)
+        )[8]
+
+    tiny = scan("POLYGON((0 0,4 0,4 4,0 4,0 0))")
+    large = scan("POLYGON((0 0,50 0,50 50,0 50,0 0))")
+    assert tiny.square_ids == {7} and not tiny.large_ids
+    assert not large.square_ids and large.large_ids == {7}
+    tiny.merge(large)
+    assert not (tiny.square_ids - tiny.large_ids)
 
 
 # z1 (0,0) is stopped: holds ids 0-3 at extent 4096<<2. z1 (1,0) continues to

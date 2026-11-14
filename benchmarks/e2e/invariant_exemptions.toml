@@ -33,14 +33,6 @@ reason = "the per-tile merge valve thins z5 below z4; C2 valve design removes th
 
 [[exemption]]
 fixture = "ftw-moldova-z10"
-settings = "pv0"
-zoom = "*"
-invariant = "decay"
-issue = 749
-reason = "source-area dithering still fails strict decay: z8 has 71 distinct squares and z5 has 44 (more than half); #749 remains"
-
-[[exemption]]
-fixture = "ftw-moldova-z10"
 settings = "sf0"
 zoom = 9
 invariant = "monotone"

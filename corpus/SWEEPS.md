@@ -385,11 +385,18 @@ The measurements showed the following:
   29.3 MB at factor 0.25, 33.5 MB at factor 0. Table:
   `docs/OVERVIEW_TUNING.md` § Coverage and simplification; commands in
   `benchmarks/coalesce/RESULTS.md`.
-- `--polygon-visibility 0` with placeholder squares has a pre-existing bug
-  (#749): under the cascade, squares survive every coarse level, so small
-  features appear as very large squares at low zooms. The `C2` recipe was dropped
-  from the docs for that reason and because `--simplify-factor` closes more
-  of the gap at a lower cost.
+- `--polygon-visibility 0` once kept placeholder squares alive at every
+  coarse cascade level (#749), drawing small features as very large
+  squares. The cascade now dithers on canonical polygon parts, retaining
+  their identity through repair splits and earlier part drops. The `C2`
+  recipe was dropped from the docs because of that bug and because `--simplify-factor`
+  closes more of the gap at a lower cost.
+
+  The archive decay check now follows the same tiny-square feature ids
+  across zooms, excluding newly collapsed polygons and large source squares.
+  Moldova `pv0` passes without an exemption (z8 cohort 70 → z5 2), while
+  main's open-buildings verbatim defect still fails (148 → 145). This does
+  not change the sweep measurements or Decision 12's export defaults.
 
 - Polygon thinning: a thinning cell keeps one polygon by bbox center, so on
   NZ Parcels, a parcel inside a ring-shaped neighbor was removed from every

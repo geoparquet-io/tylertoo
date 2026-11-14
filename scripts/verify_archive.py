@@ -48,8 +48,8 @@ properties that must hold across the whole archive, not just its framing:
                        is a silent drop (#707: the clip guard has no counter)
   monotone             (d) distinct features at zoom z-1 <= at zoom z (needs
                        --ids)
-  decay                (d) with --expect-decay: under thinning, placeholder
-                       squares (a sub-pixel polygon drawn as a square) decay
+  decay                (d) with --expect-decay and --ids: under thinning,
+                       cohorts of square-shaped features decay
                        toward coarse zooms instead of surviving every level
                        (#749)
   property_accounting  (e) every input property column (--input) is either a
@@ -100,7 +100,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import mapbox_vector_tile
+from mapbox_vector_tile.decoder import TileData
 from pmtiles.reader import MmapSource, all_tiles
 from pmtiles.tile import (
     Compression,
@@ -163,11 +163,17 @@ PER_ZOOM_INVARIANTS = frozenset({"tile_size", "polygon_valid", "monotone"})
 # Placeholder-square decay (#749). Under the dither, a square standing in for
 # a polygon of area A at a level of side s survives with probability A / s^2,
 # and the side doubles per coarser zoom, so the squares should fall ~4x per
-# zoom. Over DECAY_WINDOW zooms they must at least halve, once there are
-# enough of them for the ratio to mean something.
+# zoom. Over DECAY_WINDOW zooms the SAME cohort must at least halve, once
+# there are enough of them for the ratio to mean something. Coarser levels
+# gain new squares as larger polygons collapse; those are not survivors.
 DECAY_WINDOW = 3
 DECAY_MAX_RATIO = 0.5
 DECAY_MIN_SQUARES = 32
+# The e2e decay runs use GSD base 1024 and extent 4096: one-GSD
+# EPSG:3857 placeholders are four tile units across, plus one unit of
+# quantization. Geographic source CRS squares need not project to squares.
+# Large source squares have not collapsed and owe no placeholder decay.
+DECAY_MAX_SIDE = 5
 
 INVALID_EXEMPLARS = 3
 
@@ -301,9 +307,8 @@ def decode_features(
     `empty_polygons_ok` (strict mode) a polygon with no coordinates is
     returned for the polygon_valid check to count, not raised."""
     try:
-        decoded = mapbox_vector_tile.decode(
-            raw, default_options={"geojson": True, "y_coord_down": True}
-        )
+        decoder = TileData(raw, default_options={"geojson": True, "y_coord_down": True})
+        decoded = decoder.get_message()
     except Exception as e:  # any decoder error is a failure
         raise VerifyError(f"z{z}/{x}/{y}: mapbox-vector-tile failed: {e}") from e
     if layer not in decoded:
@@ -311,6 +316,12 @@ def decode_features(
             f"z{z}/{x}/{y}: layer {layer!r} missing (found {sorted(decoded)})"
         )
     features = decoded[layer].get("features", [])
+    # The pinned decoder returns 0 for an absent optional protobuf id.
+    # Preserve presence before that default can masquerade as a source id.
+    encoded_layer = next(lv for lv in reversed(decoder.tile.layers) if lv.name == layer)
+    for feature, encoded in zip(features, encoded_layer.features):
+        if not encoded.HasField("id"):
+            feature.pop("id", None)
     if info is not None:
         info["extent"] = decoded[layer].get("extent", NORMAL_EXTENT)
     for i, feature in enumerate(features):
@@ -380,6 +391,7 @@ class ZoomScan:
     invalid_exemplars: list = field(default_factory=list)
     squares: int = 0  # (square, tile) pairs
     square_ids: set = field(default_factory=set)
+    large_ids: set = field(default_factory=set)  # an instance exceeds placeholder size
     over_compressed: list = field(default_factory=list)  # (z/x/y, bytes)
     over_raw: list = field(default_factory=list)
     max_compressed: int = 0
@@ -402,6 +414,7 @@ class ZoomScan:
         self.invalid_exemplars.extend(other.invalid_exemplars[: max(room, 0)])
         self.squares += other.squares
         self.square_ids |= other.square_ids
+        self.large_ids |= other.large_ids
         self.over_compressed.extend(other.over_compressed)
         self.over_raw.extend(other.over_raw)
         self.max_compressed = max(self.max_compressed, other.max_compressed)
@@ -415,7 +428,10 @@ class ZoomScan:
 def is_placeholder_square(gtype: str, coords) -> bool:
     """A one-ring axis-aligned square: the shape tylertoo draws in place of a
     polygon too small for its level (`--collapse-square`, the default since
-    #745). Tile-coordinate quantization may shift a side by one unit."""
+    #745), for EPSG:3857 source geometry at the e2e runs' default GSD base
+    1024 / extent 4096. Geographic source squares may project to rectangles.
+    Tile-coordinate quantization may shift a side by one unit. Large source
+    squares are not placeholders."""
     if gtype != "Polygon" or len(coords) != 1:
         return False
     ring = coords[0]
@@ -427,7 +443,7 @@ def is_placeholder_square(gtype: str, coords) -> bool:
     if len(xs) != 2 or len(ys) != 2:
         return False
     w, h = xs[1] - xs[0], ys[1] - ys[0]
-    return w > 0 and h > 0 and abs(w - h) <= 1
+    return w > 0 and h > 0 and abs(w - h) <= 1 and max(w, h) <= DECAY_MAX_SIDE
 
 
 def scan_chunk(args) -> dict[int, ZoomScan]:
@@ -465,6 +481,7 @@ def scan_chunk(args) -> dict[int, ZoomScan]:
                     s.ids.add(fid)
                     (s.stopped_ids if stopped else s.normal_ids).add(fid)
             geom = feat["geometry"]
+            square = is_placeholder_square(geom["type"], geom["coordinates"])
             if geom["type"] not in POLYGON_TYPES:
                 continue
             s.polygons += 1
@@ -476,12 +493,20 @@ def scan_chunk(args) -> dict[int, ZoomScan]:
                         f"{geom['type']} with no coordinates"
                     )
                 continue
-            if is_placeholder_square(geom["type"], geom["coordinates"]):
+            if square:
                 s.squares += 1
                 if ids and feat.get("id") is not None:
                     s.square_ids.add(feat["id"])
             try:
                 shp = shapely.geometry.shape(geom)
+                # Clipping can turn a placeholder into a thin rectangle.
+                # Only a larger instance proves this is source geometry.
+                xmin, ymin, xmax, ymax = shp.bounds
+                if (
+                    ids and feat.get("id") is not None
+                    and max(xmax - xmin, ymax - ymin) > DECAY_MAX_SIDE
+                ):
+                    s.large_ids.add(feat["id"])
                 valid = shp.is_valid
             except Exception as e:  # unbuildable rings are invalid too
                 valid, shp = False, None
@@ -788,28 +813,43 @@ def evaluate(
 
     # (d) decay of placeholder squares under thinning (#749)
     if expect_decay:
-        # Squares first RISE toward coarse zooms (more polygons fall below a
-        # pixel), so decay is only owed from the zoom holding the most of
-        # them down. A zoom with no tiles holds none.
-        # Distinct squares when ids are source-unique; (square, tile) pairs
-        # otherwise, which a zoom split over more tiles inflates.
-        sq = {z: len(scans[z].square_ids) if ids else scans[z].squares for z in zooms}
-        peak = max(zooms, key=lambda z: (sq[z], z))
+        # Track each fine level's square ids into the coarser level. Counting
+        # ALL squares there confounds survival with new collapses (#749,
+        # Moldova: z8 76 -> z5 45 squares, but no shared square ids).
+        # Count surviving ids regardless of their later shape: a stuck
+        # placeholder must not evade the check through clipping/quantization.
+        # This needs source-unique ids; tile-instance counts cannot identify
+        # a cohort. Check every eligible level, including above the aggregate
+        # square-count peak. A missing level within the archive counts as 0.
         stuck = []
+        cohorts = []
         for z in zooms:
             lo = z - DECAY_WINDOW
-            if z > peak or sq[z] < DECAY_MIN_SQUARES or lo < 0:
+            # A tiny square is eligible unless a larger instance reveals
+            # source geometry. Small clipped rectangles do not exclude it.
+            cohort = scans[z].square_ids - scans[z].large_ids
+            if len(cohort) < DECAY_MIN_SQUARES or lo < min(zooms):
                 continue
-            if sq.get(lo, 0) > DECAY_MAX_RATIO * sq[z]:
-                stuck.append(f"z{z} {sq[z]} -> z{lo} {sq.get(lo, 0)}")
-        series = " ".join(f"z{z}:{sq[z]}" for z in zooms if sq[z])
-        detail = f"placeholder squares {series or 'none'}"
+            survivors = len(cohort & scans[lo].ids) if lo in scans else 0
+            pair = f"z{z} {len(cohort)} -> z{lo} {survivors}"
+            cohorts.append(pair)
+            if survivors > DECAY_MAX_RATIO * len(cohort):
+                stuck.append(pair)
+        detail = "square cohort survivors: " + ("; ".join(cohorts) or (
+            f"no cohort was eligible; requires at least {DECAY_MIN_SQUARES} tiny-square ids "
+            f"at a zoom at least {DECAY_WINDOW} above the archive's minimum zoom; "
+            "EPSG:3857 source at GSD base 1024 "
+            "and extent 4096"
+        ))
         if stuck:
             more = f" (+{len(stuck) - 3} more)" if len(stuck) > 3 else ""
             detail += (
                 f"; not halving over {DECAY_WINDOW} zooms: " + ", ".join(stuck[:3]) + more
             )
-        out.append(Outcome("decay", None, not stuck, detail))
+        have_ids = ids and not any(s.no_id for s in scans.values())
+        if not have_ids:
+            detail = "decay requires --ids with source-unique MVT ids on every feature"
+        out.append(Outcome("decay", None, have_ids and bool(cohorts) and not stuck, detail))
 
     # (e) property-column accounting (#434)
     if input_info is not None:
@@ -1020,7 +1060,11 @@ def main() -> int:
         "feature_accounting and monotone",
     )
     st.add_argument("--feature-id", help="the --feature-id column (not a property)")
-    st.add_argument("--expect-decay", action="store_true", help="check placeholder decay")
+    st.add_argument(
+        "--expect-decay", action="store_true",
+        help="check tiny-square cohort decay (requires --ids, EPSG:3857 source, "
+        "GSD base 1024, extent 4096); fails if no cohort is eligible",
+    )
     st.add_argument("--exemptions", type=Path, help="invariant_exemptions.toml")
     st.add_argument("--fixture", help="fixture label, for exemption matching")
     st.add_argument("--settings", help="settings label, for exemption matching")

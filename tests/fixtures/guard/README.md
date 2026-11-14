@@ -64,8 +64,8 @@ repo, so that is optional future work.
 
 ### Zoom coverage
 
-The build requests z0–z13, but this fixture emits **no tiles at z0–z2** — the
-golden starts at `3/3/4`. A change confined to z0–z2 is invisible to this guard.
+The build requests z0–z13, but this fixture emits **no tiles at z0–z1** — the
+golden starts at `2/1/2`. A change confined to z0–z1 is invisible to this guard.
 
 ### Extraction
 

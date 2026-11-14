@@ -14,54 +14,54 @@
           "vertex_count": 7763
         },
         {
-          "feature_count": 4687,
+          "feature_count": 4691,
           "level": 2,
-          "vertex_count": 22909
+          "vertex_count": 22924
         },
         {
-          "feature_count": 10096,
+          "feature_count": 10102,
           "level": 3,
-          "vertex_count": 48750
+          "vertex_count": 48690
         },
         {
-          "feature_count": 14835,
+          "feature_count": 14836,
           "level": 4,
-          "vertex_count": 73463
+          "vertex_count": 73408
         },
         {
-          "feature_count": 16571,
+          "feature_count": 16572,
           "level": 5,
-          "vertex_count": 96006
+          "vertex_count": 96021
         },
         {
           "feature_count": 17174,
           "level": 6,
-          "vertex_count": 130163
+          "vertex_count": 130283
         },
         {
           "feature_count": 17393,
           "level": 7,
-          "vertex_count": 177535
+          "vertex_count": 177640
         },
         {
           "feature_count": 17461,
           "level": 8,
-          "vertex_count": 239572
+          "vertex_count": 239622
         },
         {
           "feature_count": 17465,
           "level": 9,
-          "vertex_count": 322478
+          "vertex_count": 322538
         },
         {
           "feature_count": 17465,
           "level": 10,
-          "vertex_count": 433185
+          "vertex_count": 433210
         },
         {
           "feature_count": 17465,
           "level": 11,
-          "vertex_count": 573457
+          "vertex_count": 573452
         },
         {
           "feature_count": 17465,
@@ -79,13 +79,13 @@
           "vertex_count": 1749880
         }
       ],
-      "total_rows": 204975,
-      "total_vertices": 5483718
+      "total_rows": 204987,
+      "total_vertices": 5483988
     },
     "export": {
-      "archive_bytes": 122084043,
-      "decoded_features_total": 580949,
-      "total_tile_features": 580949,
+      "archive_bytes": 122084765,
+      "decoded_features_total": 580960,
+      "total_tile_features": 580960,
       "total_tiles": 152991,
       "zooms": [
         {
@@ -101,27 +101,27 @@
           "zoom": 1
         },
         {
-          "decoded_features": 4687,
+          "decoded_features": 4691,
           "tile_count": 1,
-          "tile_feature_count": 4687,
+          "tile_feature_count": 4691,
           "zoom": 2
         },
         {
-          "decoded_features": 12337,
+          "decoded_features": 12343,
           "tile_count": 2,
-          "tile_feature_count": 12337,
+          "tile_feature_count": 12343,
           "zoom": 3
         },
         {
-          "decoded_features": 15476,
+          "decoded_features": 15478,
           "tile_count": 4,
-          "tile_feature_count": 15476,
+          "tile_feature_count": 15478,
           "zoom": 4
         },
         {
-          "decoded_features": 14876,
+          "decoded_features": 14875,
           "tile_count": 4,
-          "tile_feature_count": 14876,
+          "tile_feature_count": 14875,
           "zoom": 5
         },
         {
@@ -240,7 +240,7 @@
       "total_vertices": 19838
     },
     "export": {
-      "archive_bytes": 138509,
+      "archive_bytes": 137644,
       "decoded_features_total": 6059,
       "total_tile_features": 6059,
       "total_tiles": 74,
@@ -333,9 +333,9 @@
           "vertex_count": 324
         },
         {
-          "feature_count": 226,
+          "feature_count": 227,
           "level": 4,
-          "vertex_count": 1121
+          "vertex_count": 1126
         },
         {
           "feature_count": 544,
@@ -358,13 +358,13 @@
           "vertex_count": 6945
         }
       ],
-      "total_rows": 3615,
-      "total_vertices": 20473
+      "total_rows": 3616,
+      "total_vertices": 20478
     },
     "export": {
-      "archive_bytes": 141083,
-      "decoded_features_total": 3799,
-      "total_tile_features": 3799,
+      "archive_bytes": 141103,
+      "decoded_features_total": 3800,
+      "total_tile_features": 3800,
       "total_tiles": 86,
       "zooms": [
         {
@@ -392,9 +392,9 @@
           "zoom": 9
         },
         {
-          "decoded_features": 239,
+          "decoded_features": 240,
           "tile_count": 2,
-          "tile_feature_count": 239,
+          "tile_feature_count": 240,
           "zoom": 10
         },
         {

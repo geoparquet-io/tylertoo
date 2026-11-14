@@ -54,8 +54,8 @@
 //! sites would harden it; the source extract is not in the repo, so that is
 //! optional future work.
 //!
-//! The build requests z0–z13, but this fixture emits **no tiles at z0–z2**
-//! (the golden starts at `3/3/4`), so a change confined to z0–z2 is invisible
+//! The build requests z0–z13, but this fixture emits **no tiles at z0–z1**
+//! (the current golden starts at `2/1/2`), so a change confined to z0–z1 is invisible
 //! to this guard.
 //!
 //! # The two cases
@@ -116,7 +116,7 @@ const GOLDEN: &str = "br-clip-divergence.golden.txt";
 const LAYER: &str = "guard";
 
 /// Zoom depth of the guarded build: the same z0–z13 the #558 A/B ran at.
-/// (z0–z2 produce no tiles for this fixture; the golden starts at z3.)
+/// (z0–z1 produce no tiles for this fixture; the golden starts at z2.)
 ///
 /// It is not just about covering the zooms that diverged there (z5–z8). A
 /// clipper is only exercised where a tile edge cuts a feature, and the three
