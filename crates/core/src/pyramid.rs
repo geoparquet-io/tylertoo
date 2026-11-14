@@ -3720,7 +3720,6 @@ mod tests {
         out
     }
 
-    /// A grid of uniform cells: the shape of a DGGS aggregate band.
     /// #872: a band exports its archive while its intermediate exists, so the
     /// disk preflight prices the archive too.
     #[test]
@@ -3761,6 +3760,7 @@ mod tests {
         }
     }
 
+    /// A grid of uniform cells: the shape of a DGGS aggregate band.
     fn write_cell_source(path: &Path, n: usize, size: f64) {
         use geo::{Geometry, LineString, Polygon};
 

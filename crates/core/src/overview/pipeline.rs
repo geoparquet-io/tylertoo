@@ -772,6 +772,12 @@ pub(super) fn resolve_backing(
 /// stops a handful of rows from a leading sparse batch deciding the run.
 const SINK_SAMPLE_MIN_ROWS: usize = 1_024;
 
+/// Rows the one disk recheck samples (or the whole plan, if smaller). The
+/// first batches of a spatially sorted input are not typical: `BR_MT`'s first
+/// 1,975 filtered rows priced the finest level at 5,779 B/row and raised the
+/// projection by 50%.
+const DISK_SAMPLE_ROWS: usize = 65_536;
+
 /// What the pass-2 sink actually cost per buffered row, and what `auto` did
 /// about it. Reported into `TYLERTOO_PROFILE_JSON` (#626 item 4) so a sizing
 /// regression is visible without an RSS trace.
@@ -960,7 +966,10 @@ impl SinkAutoTuner {
     /// Reprice disk once at the first decision-grade sample, after all levels
     /// from the current input batch have been observed.
     fn check_disk(&mut self, check: &mut super::disk::DiskCheck<'_>) -> Result<(), ConvertError> {
-        if !self.disk_checked && self.rows >= SINK_SAMPLE_MIN_ROWS {
+        let sample = self
+            .planned_rows
+            .clamp(SINK_SAMPLE_MIN_ROWS, DISK_SAMPLE_ROWS);
+        if !self.disk_checked && self.rows >= sample {
             self.disk_checked = true;
             let prices: Vec<_> = (0..self.disk_levels.len())
                 .map(|li| self.disk_bytes_per_row(li))
@@ -4034,7 +4043,7 @@ mod sink_sample_tests {
             let mut tuner = SinkAutoTuner::new(
                 profile,
                 SinkBacking::Ram,
-                &[ROWS],
+                &[SINK_SAMPLE_MIN_ROWS],
                 MemoryBudget::with_available(Some(1 << 30)),
             );
             let batch = sample_batch(1);
@@ -4061,6 +4070,25 @@ mod sink_sample_tests {
             tuner.check_disk(&mut check).unwrap();
             assert_eq!(prices, [vec![Some(first_price)]]);
         }
+    }
+
+    #[test]
+    fn measured_disk_check_samples_a_large_plan_for_65536_rows() {
+        let mut tuner = SinkAutoTuner::with_budget(false, usize::MAX / 2, 0);
+        tuner.disk_levels.resize(1, (0, 0));
+        let mut calls = 0;
+        let mut batch_rows = 0;
+        while calls == 0 {
+            tuner.observe(0, &LevelBatch::Owned(sample_batch(1)));
+            batch_rows += ROWS;
+            tuner
+                .check_disk(&mut |_| {
+                    calls += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(batch_rows, DISK_SAMPLE_ROWS);
     }
 
     #[test]
