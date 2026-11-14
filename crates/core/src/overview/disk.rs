@@ -364,6 +364,86 @@ mod tests {
     };
 
     #[test]
+    fn post_pass1_counts_only_spilling_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        super::super::testutil::write_input(
+            &input,
+            &[Some(geo::Geometry::Point(geo::Point::new(1.0, 2.0)))],
+            false,
+            None,
+        );
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        let options = ConvertOptions {
+            profile: MemoryProfile::Auto,
+            ..ConvertOptions::default()
+        };
+        let output = dir.path().join("out.parquet");
+        for buffered_levels in [0, 1] {
+            let footprint = DiskFootprint::post_pass1(
+                &source,
+                None,
+                &options,
+                &output,
+                &[1, 1],
+                buffered_levels,
+                1_600,
+            )
+            .unwrap();
+            assert_eq!(
+                footprint
+                    .components
+                    .iter()
+                    .any(|c| c.name == "pass-2 spill"),
+                buffered_levels > 0
+            );
+            assert!(footprint
+                .components
+                .iter()
+                .any(|c| c.name == "intermediate overview"));
+        }
+    }
+
+    #[test]
+    fn post_pass1_auto_ram_run_has_no_spill_component() {
+        use super::super::convert::{convert_to_overviews, LevelPlan};
+
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        let geoms = [
+            Some(geo::Geometry::Point(geo::Point::new(1.0, 2.0))),
+            Some(geo::Geometry::Point(geo::Point::new(10.0, 20.0))),
+        ];
+        super::super::testutil::write_input(&input, &geoms, true, None);
+        let options = ConvertOptions {
+            profile: MemoryProfile::Auto,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 2,
+            },
+            ..ConvertOptions::default()
+        };
+        crate::test_log::take_thread_lines();
+        convert_to_overviews(&input, dir.path().join("out.parquet"), &options).unwrap();
+        if logging {
+            let lines = crate::test_log::take_thread_lines();
+            let backing = lines
+                .iter()
+                .position(|line| line.starts_with("[convert] pass2 auto") && line.contains("→ Ram"))
+                .unwrap_or_else(|| panic!("{lines:#?}"));
+            let recheck = lines
+                .iter()
+                .position(|line| line.starts_with("[disk] after pass 1 projected footprint:"))
+                .unwrap();
+            let footprint = &lines[recheck];
+            assert!(footprint.contains("intermediate overview"), "{footprint}");
+            assert!(!footprint.contains("pass-2 spill"), "{footprint}");
+            assert!(backing < recheck, "{lines:#?}");
+        }
+    }
+
+    #[test]
     fn post_pass1_uses_kept_level_rows_and_still_warns_on_a_small_volume() {
         use super::super::convert::LevelPlan;
 

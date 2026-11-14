@@ -3804,20 +3804,6 @@ pub(crate) fn run_stages(
 
     let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
     let output_row_bytes = budget.output_row_bytes(options.mode, avg_geom_bytes, row_bytes);
-    let level_rows: Vec<_> = emitted.iter().map(|e| e.hint).collect();
-    if let Some(message) = super::disk::DiskFootprint::post_pass1(
-        source,
-        selected_row_groups.as_ref(),
-        options,
-        output_path,
-        &level_rows,
-        buffered_levels(emitted, finest, options).len(),
-        output_row_bytes,
-    )?
-    .warning(super::tiles::CLI_REMEDIES)
-    {
-        diagnostics.warn(message);
-    }
     let spill_reservation = reserve_spill_cache(
         &mut budget,
         options,
@@ -3869,6 +3855,25 @@ pub(crate) fn run_stages(
         (num_rows > 0).then(|| geom_bytes / num_rows as u64),
         row_bytes,
     );
+    let spilling_levels = if matches!(backing, pipeline::SinkBacking::Spill) {
+        buffered_levels(emitted, finest, options).len()
+    } else {
+        0
+    };
+    let level_rows: Vec<_> = emitted.iter().map(|e| e.hint).collect();
+    if let Some(message) = super::disk::DiskFootprint::post_pass1(
+        source,
+        selected_row_groups.as_ref(),
+        options,
+        output_path,
+        &level_rows,
+        spilling_levels,
+        output_row_bytes,
+    )?
+    .warning(super::tiles::CLI_REMEDIES)
+    {
+        diagnostics.warn(message);
+    }
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
     // Pass-1 O(N) scratch has been freed by here; this marks the memory floor
