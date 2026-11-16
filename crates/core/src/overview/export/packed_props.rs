@@ -1,7 +1,10 @@
 //! Process-private packed property rows.
+pub(super) mod arrow;
 use std::sync::Arc;
 
-use crate::mvt::{PropertyRef, PropertyValue};
+use crate::mvt::PropertyRef;
+#[cfg(test)]
+use crate::mvt::PropertyValue;
 
 /// Names are shared across the export; only `data` is allocated per row.
 /// Each schema column has a tag (0 = absent). Text lengths are fixed u32s; numeric payloads preserve their exact little-endian bits.
@@ -12,6 +15,7 @@ pub(super) struct PackedProps {
 }
 
 impl PackedProps {
+    #[cfg(test)]
     pub(super) fn pack(
         names: Arc<[Arc<str>]>,
         values: impl IntoIterator<Item = Option<PropertyValue>>,
@@ -240,7 +244,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::mvt::{PropertyRef, PropertyValue};
+    use crate::mvt::PropertyRef;
+    #[cfg(test)]
+    use crate::mvt::PropertyValue;
 
     #[test]
     fn packed_rows_keep_null_positions_and_borrow_text() {

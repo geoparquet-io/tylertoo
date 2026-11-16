@@ -98,14 +98,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow_array::{
-    cast::AsArray,
-    types::{
-        Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
-    },
-    Array, RecordBatch,
+#[cfg(test)]
+use crate::mvt::PropertyValue;
+#[cfg(test)]
+use arrow_array::types::{
+    Decimal128Type, Float32Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
+    UInt64Type, UInt8Type,
 };
+use arrow_array::{cast::AsArray, types::Float64Type, Array, RecordBatch};
+#[cfg(test)]
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType, Schema};
 use crossbeam_channel::{Receiver, Sender};
@@ -153,7 +154,7 @@ use crate::{
     dedup::TileHasher,
     input::InputError,
     input_set::{ConvertSource, RowGroupSelection},
-    mvt::{EncodedFeatureGeometry, PropertyRef, PropertyValue},
+    mvt::{EncodedFeatureGeometry, PropertyRef},
     pmtiles_writer::StreamingPmtilesWriter,
     tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord, MAX_ZOOM},
     vector_tile::tile::GeomType,
@@ -10744,15 +10745,16 @@ impl<'a> AttrColumns<'a> {
     /// Extract every column of one batch once, for per-row materialization.
     ///
     /// Packed rows share the whole schema table, so there is no per-property
-    /// name refcount traffic (#803). This spike still stages owned values.
+    /// name refcount traffic (#803). Values are written directly into rows.
     fn extract(&self, batch: &RecordBatch) -> BatchAttributes<'a> {
         BatchAttributes {
             names: self.names.clone(),
-            props: self
-                .props
-                .iter()
-                .map(|(idx, name)| (name.clone(), extract_property_column(batch.column(*idx))))
-                .collect(),
+            rows: packed_props::arrow::extract(
+                self.props
+                    .iter()
+                    .map(|(idx, _)| batch.column(*idx).as_ref()),
+                batch.num_rows(),
+            ),
             ids: self.feature_id.map(|fid| {
                 let ids = feature_id_values(batch.column(fid.idx))
                     .map(|v| v.into_iter().map(Result::ok).collect())
@@ -10768,7 +10770,7 @@ impl<'a> AttrColumns<'a> {
 /// One batch's extracted [`AttrColumns`].
 struct BatchAttributes<'a> {
     names: PropertyNames,
-    props: Vec<(Arc<str>, Vec<Option<PropertyValue>>)>,
+    rows: Vec<packed_props::arrow::Row>,
     /// The `--feature-id` column and its per-row ids (`None` = invalid).
     ids: Option<(&'a ResolvedFeatureId, Vec<Option<u64>>)>,
     /// Rows [`Self::row`] has already moved out (debug builds only).
@@ -10798,9 +10800,8 @@ impl BatchAttributes<'_> {
     /// them only for a row that yields a member: a memberless row's would be
     /// allocated for nothing.
     ///
-    /// Moves the row's values out of the extracted columns rather than
-    /// cloning them, so call it at most once per row. A second call would
-    /// return no properties; debug builds panic on it instead.
+    /// Moves the completed row buffer into immutable shared storage. Call
+    /// once per row; debug builds catch a second call.
     fn props(&mut self, row: usize) -> SharedProps {
         #[cfg(debug_assertions)]
         assert!(
@@ -10809,10 +10810,7 @@ impl BatchAttributes<'_> {
         );
         #[cfg(test)]
         PROPS_BUILT.with(|n| n.set(n.get() + 1));
-        SharedProps::pack(
-            self.names.clone(),
-            self.props.iter_mut().map(|(_, col)| col[row].take()),
-        )
+        std::mem::take(&mut self.rows[row]).finish(self.names.clone())
     }
 }
 
@@ -10830,7 +10828,7 @@ thread_local! {
 /// a dropped column is silent data loss, and a time column is usually the axis
 /// the map is read along. Temporal types render as ISO 8601 strings (the
 /// tippecanoe convention) and decimals as doubles; see
-/// [`extract_property_column`].
+/// [`packed_props::arrow`].
 fn is_supported_scalar(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -10857,7 +10855,7 @@ fn is_supported_scalar(dt: &DataType) -> bool {
 /// any object or array into an `mvt_string` holding its `json_stringify`
 /// text -- and it is what the Overture `names` struct and `sources` list
 /// need to survive the export at all. The nested leaves are rendered by
-/// [`extract_property_column`]'s own scalar rules; a leaf type without one
+/// the direct Arrow writer's scalar rules; a leaf type without one
 /// (binary, an unrenderable timezone) renders as JSON `null` rather than
 /// dropping the whole column.
 /// Whether a (possibly dictionary-encoded) type renders as a JSON string,
@@ -10885,7 +10883,7 @@ fn is_json_encoded(dt: &DataType) -> bool {
 /// ([`is_supported_scalar`]), a JSON-encoded nested type
 /// ([`is_json_encoded`]), or a dictionary over either (unwrapped on
 /// extraction). [`property_columns`], [`field_metadata`] and
-/// [`extract_property_column`] all gate on this one predicate, so a column
+/// the direct Arrow writer all gate on this one predicate, so a column
 /// advertised in `vector_layers.fields` is always one the tiles can fill.
 fn is_exportable(dt: &DataType) -> bool {
     match dt {
@@ -10979,6 +10977,7 @@ fn field_metadata(
 
 /// Extract one Arrow column into per-row optional [`PropertyValue`]s. Null cells
 /// and unsupported types yield `None`.
+#[cfg(test)]
 fn extract_property_column(col: &dyn arrow_array::Array) -> Vec<Option<PropertyValue>> {
     let n = col.len();
     macro_rules! prim {
@@ -11174,6 +11173,7 @@ fn extract_property_column(col: &dyn arrow_array::Array) -> Vec<Option<PropertyV
 /// straight into one reusable byte buffer. So the per-row cost is the write
 /// itself: no intermediate `serde_json::Value` tree, no per-value
 /// formatter, and exactly one `String` allocation per non-null row.
+#[cfg(test)]
 fn json_property_column(col: &dyn Array) -> Vec<Option<PropertyValue>> {
     let node = JsonNode::resolve(col);
     let mut buf = Vec::with_capacity(64);
@@ -11197,6 +11197,7 @@ fn json_property_column(col: &dyn Array) -> Vec<Option<PropertyValue>> {
 /// span of its child values its rows address. A sliced column (#740's
 /// per-chunk extraction) keeps its whole child array, so resolving only the
 /// span keeps a chunk's work proportional to its own rows.
+#[cfg(test)]
 fn rebased_offsets<O: arrow_array::OffsetSizeTrait>(
     offsets: &[O],
 ) -> (Vec<usize>, std::ops::Range<usize>) {
@@ -11209,6 +11210,7 @@ fn rebased_offsets<O: arrow_array::OffsetSizeTrait>(
 }
 
 /// One nested Arrow array, ready to be written row by row as JSON.
+#[cfg(test)]
 enum JsonNode {
     /// A scalar leaf, already extracted for the whole array. An unsupported
     /// leaf type extracts to all-`None`, which renders as `null` per value.
@@ -11239,6 +11241,7 @@ enum JsonNode {
     },
 }
 
+#[cfg(test)]
 impl JsonNode {
     fn resolve(col: &dyn Array) -> Self {
         match col.data_type() {
@@ -11399,6 +11402,7 @@ impl JsonNode {
 }
 
 /// Write one scalar as JSON.
+#[cfg(test)]
 fn write_json_scalar(out: &mut Vec<u8>, value: &PropertyValue) {
     // `serde_json::to_writer` into a `Vec` cannot fail: the writer is
     // infallible and every variant here is serializable.
@@ -16715,7 +16719,7 @@ mod tests {
         );
 
         // The names are refcounted handles to the batch's table, not copies.
-        let (name_key, rank_key) = (&attrs.props[0].0, &attrs.props[1].0);
+        let (name_key, rank_key) = (&attrs.names[0], &attrs.names[1]);
         assert!(Arc::ptr_eq(&rows[0].names[0], name_key));
         assert!(Arc::ptr_eq(&rows[2].names[0], name_key));
         for row in &rows {
@@ -19224,6 +19228,32 @@ mod tests {
             encode_member(&mut buf2, &back, &names);
             assert_eq!(buf, buf2, "re-encoded member bytes differ (geometry {i})");
         }
+    }
+
+    #[test]
+    fn member_spill_rejects_invalid_utf8() {
+        let member = Member {
+            key: 0,
+            seq: 0,
+            geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
+            props: SharedProps::new(vec![(
+                "text".into(),
+                PropertyValue::String("utf8-marker".into()),
+            )]),
+            id: None,
+            gap: GAP_NONE,
+            band: 0,
+        };
+        let mut names = SpillNames::default();
+        names.register(&member.props.names);
+        let mut bytes = Vec::new();
+        encode_member(&mut bytes, &member, &names);
+        let offset = bytes
+            .windows(b"utf8-marker".len())
+            .position(|w| w == b"utf8-marker")
+            .unwrap();
+        bytes[offset] = 0xff;
+        assert!(decode_member(&mut SpillCursor::new(&bytes), &names).is_err());
     }
 
     /// #427: a `spill_dir` that is not an existing directory fails the
