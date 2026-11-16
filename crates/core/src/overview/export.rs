@@ -1592,19 +1592,19 @@ const MEMBER_MEMORY_INFLATION: u64 = 2;
 ///
 /// | shape | stored | properties | measured | estimate |
 /// |---|---|---|---|---|
-/// | Overture-shaped, four properties | 115 | 4 | 632 | 917 |
-/// | the same, `--exclude-all-properties` | 115 | 0 | 464 | 453 |
+/// | Overture-shaped, four properties | 115 | 4 | 632 | 934 |
+/// | the same, `--exclude-all-properties` | 115 | 0 | 464 | 454 |
 /// | geometry only | 57 | 0 | 445 | 338 |
 /// | four numeric | 96 | 4 | 886 | 896 |
 /// | sixteen numeric | 213 | 16 | 2,337 | 2,570 |
-/// | four strings, one a 32-character id | 107 | 4 | 663 | 917 |
+/// | four strings, one a 32-character id | 107 | 4 | 663 | 918 |
 ///
 /// [`MEMBER_PROPERTY_BYTES`] is the smallest round value that covers every
 /// row with properties: four numeric sets it. Before packed rows the same
 /// shapes measured 843, 483, 448, 1,061, 2,857 and 815 on this host, and
 /// the price was 208. This constant is unchanged from the old layout and
 /// does not cover the two property-less rows on this host: the old layout
-/// missed them too (483 and 448 against 453 and 338). Raising it to 336
+/// missed them too (483 and 448 against 454 and 338). Raising it to 336
 /// would cover them and would narrow dense property-less levels' waves.
 const MEMBER_BASE_BYTES: u64 = 224;
 
@@ -10750,11 +10750,14 @@ impl<'a> AttrColumns<'a> {
 
     /// Extract every column of one batch once, for per-row materialization.
     ///
-    /// Packed rows share the whole schema table, so there is no per-property
-    /// name refcount traffic (#803). Values are written directly into rows.
+    /// PERF (#803): the batch gets its own copy of the schema table. Cloning
+    /// the process-wide `Arc` per row and member would make every pool thread
+    /// bump one refcount cache line (~5% more cycles at equal instructions,
+    /// #874). `SpillNames` dedupes copies by content. Values are written
+    /// directly into rows.
     fn extract(&self, batch: &RecordBatch) -> Result<BatchAttributes<'a>, ExportError> {
         Ok(BatchAttributes {
-            names: self.names.clone(),
+            names: self.names.iter().cloned().collect::<Vec<_>>().into(),
             rows: packed_props::arrow::extract(
                 self.props
                     .iter()
@@ -10802,12 +10805,10 @@ impl BatchAttributes<'_> {
         })
     }
 
-    /// Row `row`'s properties, shared across its members via `Arc`. Build
-    /// them only for a row that yields a member: a memberless row's would be
-    /// allocated for nothing.
+    /// Row `row`'s properties, shared across its members via `Arc`.
     ///
-    /// Moves the completed row buffer into immutable shared storage. Call
-    /// once per row; debug builds catch a second call.
+    /// Moves the already-filled row buffer into immutable shared storage.
+    /// Call once per row; debug builds catch a second call.
     fn props(&mut self, row: usize) -> SharedProps {
         #[cfg(debug_assertions)]
         assert!(
@@ -12272,20 +12273,25 @@ mod tests {
     /// measured B/member); see [`MEMBER_BASE_BYTES`].
     #[test]
     fn member_resident_bytes_covers_the_665_calibration() {
-        for (stored, properties, measured) in [
-            // The two property-less shapes (464 and 445 B measured) sit
-            // above the base price on the aarch64 host; see
-            // [`MEMBER_BASE_BYTES`].
-            (115, 4, 632),
-            (96, 4, 886),
-            (213, 16, 2_337),
-            (107, 4, 663),
-        ] {
+        for (stored, properties, measured) in
+            [(115, 4, 632), (96, 4, 886), (213, 16, 2_337), (107, 4, 663)]
+        {
             let estimate = member_resident_bytes(stored, properties);
             assert!(
                 (measured..=measured * 31 / 20).contains(&estimate),
                 "({stored} B, {properties} properties): {estimate} B/member must cover the \
                  measured {measured} B, within 55%"
+            );
+        }
+        // The two property-less shapes (464 and 445 B measured) sit above
+        // the base price on the aarch64 host (see [`MEMBER_BASE_BYTES`]):
+        // pin the known gap so it cannot grow past a third.
+        for (stored, measured) in [(115, 464), (57, 445)] {
+            let estimate = member_resident_bytes(stored, 0);
+            assert!(
+                estimate >= measured * 3 / 4,
+                "({stored} B, 0 properties): {estimate} B/member under-covers {measured} B by \
+                 more than the known 25-32%"
             );
         }
         assert_eq!(member_resident_bytes(u64::MAX, usize::MAX), u64::MAX);
