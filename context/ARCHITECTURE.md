@@ -579,7 +579,7 @@ member counts and the header bounds move.
 **Property rows are packed bytes (#874).** Each source row's properties
 live in one immutable byte buffer, `PackedProps` in
 `overview/export/packed_props.rs`. Every tile copy of the row shares the
-buffer and one schema table of published names, so a member holds two
+buffer and its batch's schema table of published names, so a member holds two
 handles and no per-property allocation. The buffer has one entry per table
 column, in schema order: a tag byte (0 absent, 1 string, 2 float, 3 double,
 4 int, 5 uint, 6 bool) followed by the payload. A string payload is a 4-byte
@@ -589,9 +589,9 @@ only source of names, so nulls cost one byte and the scan skips them.
 
 `packed_props/arrow.rs` writes a row straight from the Arrow columns, with
 no owned `PropertyValue` between them, and the tile encoder reads the
-buffer through `PropertyRef` borrows. `PublishedNames` caches one table per
-distinct published column set. The cache is behind a mutex that each batch
-takes once, and clones of the names (the canonical-level view) share it.
+buffer through `PropertyRef` borrows. Each batch gets its own
+schema table. The spill deduplicates tables by content, and reload copies
+each table once per spill segment.
 
 The scan trusts the buffer: it borrows strings with `from_utf8_unchecked`.
 The proof is the construction boundary. Only the typed writers in
