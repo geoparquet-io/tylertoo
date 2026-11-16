@@ -5867,7 +5867,13 @@ impl MemberStore {
         }
         let bytes = std::mem::take(&mut self.bucket_bytes[level][wave]);
         self.buffered_bytes -= bytes;
-        out.append(&mut self.buckets[level][wave]);
+        // Move a RAM wave's allocation into the drain. `append` on the
+        // stored bucket would retain it while the drain builds its buckets.
+        let mut members = std::mem::take(&mut self.buckets[level][wave]);
+        if out.is_empty() {
+            return Ok(members);
+        }
+        out.append(&mut members);
         Ok(out)
     }
 }
@@ -19602,6 +19608,44 @@ mod tests {
         assert_eq!(held.len(), 4, "one geometry per feature");
     }
 
+    #[test]
+    fn member_store_ram_wave_reuses_its_allocation() {
+        let plans = vec![LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[10]),
+            wave: 1,
+        }];
+        for backing in [SinkBacking::Ram, SinkBacking::Spill] {
+            let mut store =
+                MemberStore::new(&plans, backing, MEMBER_STORE_RAM_BUDGET, None).unwrap();
+            for seq in 0..3 {
+                store
+                    .push(
+                        0,
+                        0,
+                        Member {
+                            key: 0,
+                            seq,
+                            geom: Geometry::Point(Point::new(seq as f64, -1.0)).into(),
+                            props: SharedProps::new(vec![]),
+                            id: None,
+                            gap: GAP_NONE,
+                            band: 0,
+                        },
+                    )
+                    .unwrap();
+            }
+            let allocation = store.buckets[0][0].as_ptr();
+            let members = store.take_wave(0, 0).unwrap();
+            assert_eq!(store.buckets[0][0].capacity(), 0, "drained bucket released");
+            assert_eq!(members.as_ptr(), allocation, "no second wave allocation");
+            assert_eq!(members.iter().map(|m| m.seq).collect::<Vec<_>>(), [0, 1, 2]);
+            assert_eq!(store.buffered_bytes, 0);
+            assert_eq!(store.bucket_bytes[0][0], 0);
+            assert!(store.take_wave(0, 0).unwrap().is_empty());
+        }
+    }
+
     /// The member store's spill path: bucket flushes append segments to one
     /// temp file; `take_wave` reads a wave's segments back in append order
     /// (plus any RAM remainder), returning exactly the members pushed to it.
@@ -19630,11 +19674,15 @@ mod tests {
         store.flush_bucket(0, 0).unwrap();
         store.push(0, 0, mk(0, 2)).unwrap();
         store.finish_fill().unwrap();
+        // Also exercise a RAM remainder after the completed spill segments.
+        store.push(0, 0, mk(0, 3)).unwrap();
 
         let w0 = store.take_wave(0, 0).unwrap();
         let w1 = store.take_wave(0, 1).unwrap();
-        assert_eq!(w0.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(w0.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 2, 3]);
         assert_eq!(w1.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1]);
+        assert!(store.buckets[0].iter().all(|bucket| bucket.capacity() == 0));
+        assert_eq!(store.buffered_bytes, 0);
         assert!(w0.iter().all(|m| m.key == 0));
         assert!(w1.iter().all(|m| m.key == 1));
         assert_eq!(

@@ -724,6 +724,9 @@ fn clip_multipolygon(
     if clipped_polys.is_empty() {
         None
     } else {
+        // Clipping may split or discard parts, so the output count is only
+        // known now. These slots live with the export's buffered members.
+        clipped_polys.shrink_to_fit();
         Some(MultiPolygon::new(clipped_polys))
     }
 }
@@ -1014,6 +1017,11 @@ mod tests {
         )
         .expect("clip must not drop a genuinely-overlapping feature");
         assert_eq!(clipped.0.len(), 2, "both prong pieces must survive");
+        assert_eq!(
+            clipped.0.capacity(),
+            clipped.0.len(),
+            "no polygon slot slack"
+        );
         // Same through the public geometry entry point, simple-path flavor.
         let via_public = clip_geometry_simple(
             &Geometry::MultiPolygon(mp),

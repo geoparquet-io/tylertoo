@@ -316,12 +316,13 @@ fn to_finite_geometry(
                     .collect(),
             ))
         }
-        GeometryType::MultiPolygon(polygons) => Geometry::MultiPolygon(geo::MultiPolygon::new(
-            polygons
-                .polygons()
-                .map(|poly| polygon(&poly, &mut finite))
-                .collect(),
-        )),
+        GeometryType::MultiPolygon(polygons) => {
+            // The trait iterator has no exact size hint. Reserve its known
+            // count so a single polygon does not allocate four slots.
+            let mut converted = Vec::with_capacity(polygons.num_polygons());
+            converted.extend(polygons.polygons().map(|poly| polygon(&poly, &mut finite)));
+            Geometry::MultiPolygon(geo::MultiPolygon::new(converted))
+        }
         _ => {
             #[cfg(test)]
             crate::valve_counter::note(|c| c.finite_fallback += 1);
@@ -414,6 +415,26 @@ impl GeoArrowVisitor for ExtractGeometries<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finite_multipolygon_has_no_polygon_capacity_slack() {
+        for n in [0, 1, 5] {
+            let polygons = (0..n)
+                .map(|i| {
+                    let x = f64::from(i);
+                    geo::Rect::new((x, 0.0), (x + 0.5, 0.5)).to_polygon()
+                })
+                .collect();
+            let original = Geometry::MultiPolygon(geo::MultiPolygon::new(polygons));
+            let converted =
+                to_finite_geometry(&original, &crate::diagnostics::Diagnostics::default()).unwrap();
+            assert_eq!(converted, original);
+            let Geometry::MultiPolygon(converted) = converted else {
+                panic!("expected MultiPolygon");
+            };
+            assert_eq!(converted.0.capacity(), converted.0.len());
+        }
+    }
 
     /// Deleting a specialized arm of `to_finite_geometry` still yields equal
     /// geometry through the fallback, so the result cannot show it: count the
