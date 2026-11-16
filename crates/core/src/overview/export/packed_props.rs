@@ -414,4 +414,164 @@ mod tests {
         assert_eq!(iter.next(), Some(("n", PropertyRef::UInt(u64::MAX))));
         assert_eq!(iter.next(), None);
     }
+
+    #[test]
+    fn wide_sparse_schema_yields_only_present_columns_in_order() {
+        let names: Arc<[Arc<str>]> = (0..2000).map(|i| Arc::from(format!("c{i}"))).collect();
+        let mut values: Vec<Option<PropertyValue>> = vec![None; 2000];
+        values[0] = Some(PropertyValue::Int(1));
+        values[1234] = Some(PropertyValue::String("mid".into()));
+        values[1999] = Some(PropertyValue::Bool(true));
+        let row = PackedProps::pack(names.clone(), values);
+        assert_eq!(row.bytes().len(), 2000 + 8 + (4 + 3) + 1);
+        let back = PackedProps::from_spill(names, Arc::from(row.bytes())).unwrap();
+        assert_eq!(
+            back.iter().collect::<Vec<_>>(),
+            vec![
+                ("c0", PropertyRef::Int(1)),
+                ("c1234", PropertyRef::String("mid")),
+                ("c1999", PropertyRef::Bool(true)),
+            ]
+        );
+        let empty = PackedProps::pack(Arc::from(Vec::<Arc<str>>::new()), []);
+        assert!(empty.bytes().is_empty() && empty.iter().next().is_none());
+    }
+
+    #[test]
+    fn non_finite_floats_empty_text_and_extremes_keep_their_bits() {
+        let names: Arc<[Arc<str>]> = ["e", "f0", "fi", "fn", "d0", "di", "dn", "i", "u"]
+            .into_iter()
+            .map(Arc::from)
+            .collect();
+        let nan32 = f32::from_bits(0x7fc0_1234);
+        let nan64 = f64::from_bits(0xfff8_0000_dead_beef);
+        let row = PackedProps::pack(
+            names.clone(),
+            [
+                Some(PropertyValue::String(String::new())),
+                Some(PropertyValue::Float(-0.0)),
+                Some(PropertyValue::Float(f32::INFINITY)),
+                Some(PropertyValue::Float(nan32)),
+                Some(PropertyValue::Double(-0.0)),
+                Some(PropertyValue::Double(f64::NEG_INFINITY)),
+                Some(PropertyValue::Double(nan64)),
+                Some(PropertyValue::Int(i64::MIN)),
+                Some(PropertyValue::UInt(u64::MAX)),
+            ],
+        );
+        let back = PackedProps::from_spill(names, Arc::from(row.bytes())).unwrap();
+        let got: Vec<_> = back.iter().map(|(_, v)| v).collect();
+        assert_eq!(got[0], PropertyRef::String(""));
+        let bits = |v: &PropertyRef<'_>| match *v {
+            PropertyRef::Float(f) => u64::from(f.to_bits()),
+            PropertyRef::Double(d) => d.to_bits(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            got[1..7].iter().map(bits).collect::<Vec<_>>(),
+            [
+                (-0.0f32).to_bits() as u64,
+                f32::INFINITY.to_bits() as u64,
+                nan32.to_bits() as u64,
+                (-0.0f64).to_bits(),
+                f64::NEG_INFINITY.to_bits(),
+                nan64.to_bits(),
+            ]
+        );
+        assert_eq!(got[7], PropertyRef::Int(i64::MIN));
+        assert_eq!(got[8], PropertyRef::UInt(u64::MAX));
+    }
+
+    /// Every single-byte alteration of a row is an error or a valid row whose
+    /// scan stays in bounds; a table of another width never validates
+    /// bytes written for this one.
+    #[test]
+    fn altered_spill_rows_never_panic_and_other_tables_are_rejected() {
+        let names: Arc<[Arc<str>]> = ["a", "b", "c", "d", "e"]
+            .into_iter()
+            .map(Arc::from)
+            .collect();
+        let row = PackedProps::pack(
+            names.clone(),
+            [
+                Some(PropertyValue::String("héllo".into())),
+                None,
+                Some(PropertyValue::Double(1.5)),
+                Some(PropertyValue::Bool(true)),
+                Some(PropertyValue::Int(-1)),
+            ],
+        );
+        for at in 0..row.bytes().len() {
+            for value in 0..=255u8 {
+                let mut bad = row.bytes().to_vec();
+                bad[at] = value;
+                if let Ok(ok) = PackedProps::from_spill(names.clone(), bad.into()) {
+                    for (_, v) in ok.iter() {
+                        if let PropertyRef::String(s) = v {
+                            assert!(s.chars().count() <= s.len());
+                        }
+                    }
+                }
+            }
+        }
+        for width in [0, 1, 4, 6, 9] {
+            let other: Arc<[Arc<str>]> = (0..width).map(|i| Arc::from(format!("n{i}"))).collect();
+            assert!(
+                PackedProps::from_spill(other, Arc::from(row.bytes())).is_err(),
+                "a table of {width} accepted a row written for 5"
+            );
+        }
+    }
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn value() -> impl Strategy<Value = Option<PropertyValue>> {
+            prop_oneof![
+                Just(None),
+                ".{0,40}".prop_map(|s| Some(PropertyValue::String(s))),
+                any::<u32>().prop_map(|b| Some(PropertyValue::Float(f32::from_bits(b)))),
+                any::<u64>().prop_map(|b| Some(PropertyValue::Double(f64::from_bits(b)))),
+                any::<i64>().prop_map(|v| Some(PropertyValue::Int(v))),
+                any::<u64>().prop_map(|v| Some(PropertyValue::UInt(v))),
+                any::<bool>().prop_map(|v| Some(PropertyValue::Bool(v))),
+            ]
+        }
+
+        /// The packed codec reproduces any row bit for bit, in schema order,
+        /// through the spill's validating constructor.
+        fn same(a: &PropertyRef<'_>, b: &PropertyValue) -> bool {
+            match (a, b) {
+                (PropertyRef::String(x), PropertyValue::String(y)) => *x == y,
+                (PropertyRef::Float(x), PropertyValue::Float(y)) => x.to_bits() == y.to_bits(),
+                (PropertyRef::Double(x), PropertyValue::Double(y)) => x.to_bits() == y.to_bits(),
+                (PropertyRef::Int(x), PropertyValue::Int(y)) => x == y,
+                (PropertyRef::UInt(x), PropertyValue::UInt(y)) => x == y,
+                (PropertyRef::Bool(x), PropertyValue::Bool(y)) => x == y,
+                _ => false,
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn packed_rows_round_trip(values in proptest::collection::vec(value(), 0..60)) {
+                let names: Arc<[Arc<str>]> =
+                    (0..values.len()).map(|i| Arc::from(format!("c{i}"))).collect();
+                let row = PackedProps::pack(names.clone(), values.clone());
+                let back = PackedProps::from_spill(names, Arc::from(row.bytes())).unwrap();
+                let want: Vec<_> = values
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| v.as_ref().map(|v| (format!("c{i}"), v)))
+                    .collect();
+                let got: Vec<_> = back.iter().collect();
+                prop_assert_eq!(got.len(), want.len());
+                for ((gn, gv), (wn, wv)) in got.iter().zip(&want) {
+                    prop_assert_eq!(*gn, wn.as_str());
+                    prop_assert!(same(gv, wv));
+                }
+            }
+        }
+    }
 }

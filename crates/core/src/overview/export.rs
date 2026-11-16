@@ -10733,7 +10733,10 @@ impl<'a> AttrColumns<'a> {
             .map(|(_, n)| n.clone())
             .collect::<Vec<_>>()
             .into();
-        let mut tables = published.packed_names.lock().unwrap();
+        let mut tables = published
+            .packed_names
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let names = tables
             .iter()
             .find(|n| ***n == *candidate)
@@ -16732,6 +16735,91 @@ mod tests {
         for row in &rows {
             assert!(Arc::ptr_eq(row.names().last().unwrap(), rank_key));
         }
+    }
+
+    /// One schema table per distinct published column set, shared by every
+    /// batch, thread and level view of an export; a different set gets its
+    /// own table.
+    #[test]
+    fn schema_tables_are_shared_per_published_column_set() {
+        let schema = |extra: bool| {
+            let mut fields = vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("geometry", DataType::Binary, true),
+            ];
+            if extra {
+                fields.push(Field::new("rank", DataType::Int64, true));
+            }
+            Schema::new(fields)
+        };
+        let published = PublishedNames::identity();
+        let narrow = schema(false);
+        let wide = schema(true);
+        let tables: Vec<PropertyNames> = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..16)
+                .map(|i| {
+                    let (published, schema) =
+                        (&published, if i % 2 == 0 { &narrow } else { &wide });
+                    scope.spawn(move || AttrColumns::new(schema, 1, published, None).names)
+                })
+                .collect();
+            jobs.into_iter().map(|j| j.join().unwrap()).collect()
+        });
+        for (i, table) in tables.iter().enumerate() {
+            assert!(Arc::ptr_eq(table, &tables[i % 2]), "thread {i}");
+        }
+        assert!(!Arc::ptr_eq(&tables[0], &tables[1]));
+        assert_eq!(tables[0].len(), 1);
+        assert_eq!(tables[1].len(), 2);
+        // A level view cloned from the same names shares the cache.
+        let again = AttrColumns::new(&narrow, 1, &published.clone(), None).names;
+        assert!(Arc::ptr_eq(&again, &tables[0]));
+    }
+
+    /// A spilled member read back with every byte truncated or altered is
+    /// an error or a valid member, never a panic or an unchecked string.
+    #[test]
+    fn member_codec_survives_truncation_and_byte_flips() {
+        let member = Member {
+            key: 9,
+            seq: 3,
+            geom: Geometry::Point(Point::new(1.5, -2.5)).into(),
+            props: SharedProps::new(vec![
+                ("empty".into(), PropertyValue::String(String::new())),
+                ("s".into(), PropertyValue::String("héllo".into())),
+                ("f".into(), PropertyValue::Float(f32::NEG_INFINITY)),
+                ("d".into(), PropertyValue::Double(f64::NAN)),
+                ("i".into(), PropertyValue::Int(i64::MIN)),
+                ("u".into(), PropertyValue::UInt(u64::MAX)),
+                ("b".into(), PropertyValue::Bool(false)),
+            ]),
+            id: Some(7),
+            gap: GAP_NONE,
+            band: 2,
+        };
+        let mut names = SpillNames::default();
+        names.register(member.props.names());
+        let mut bytes = Vec::new();
+        encode_member(&mut bytes, &member, &names);
+        for end in 0..bytes.len() {
+            assert!(
+                decode_member(&mut SpillCursor::new(&bytes[..end]), &names).is_err(),
+                "accepted truncation at {end}"
+            );
+        }
+        let mut ok = 0usize;
+        for at in 0..bytes.len() {
+            for value in 0..=255u8 {
+                let mut bad = bytes.clone();
+                bad[at] = value;
+                if let Ok(m) = decode_member(&mut SpillCursor::new(&bad), &names) {
+                    ok += 1;
+                    // Whatever decoded must iterate without panicking.
+                    m.props.iter().for_each(drop);
+                }
+            }
+        }
+        assert!(ok > 0, "the unaltered bytes always decode");
     }
 
     /// #461: `BatchAttributes::props` moves values out, so a second read of
