@@ -122,7 +122,7 @@ fn ioverlay_to_geometry(shapes: IOverlayShapes) -> Option<Geometry<f64>> {
         return None;
     }
 
-    let polygons: Vec<Polygon<f64>> = valid_shapes
+    let mut polygons: Vec<Polygon<f64>> = valid_shapes
         .into_iter()
         .filter_map(ioverlay_shape_to_polygon)
         .collect();
@@ -130,7 +130,11 @@ fn ioverlay_to_geometry(shapes: IOverlayShapes) -> Option<Geometry<f64>> {
     match polygons.len() {
         0 => None,
         1 => Some(Geometry::Polygon(polygons.into_iter().next().unwrap())),
-        _ => Some(Geometry::MultiPolygon(MultiPolygon::new(polygons))),
+        _ => {
+            // `collect` leaves up to half the slots empty; pieces live in buffered members.
+            polygons.shrink_to_fit();
+            Some(Geometry::MultiPolygon(MultiPolygon::new(polygons)))
+        }
     }
 }
 
