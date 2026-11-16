@@ -5833,9 +5833,12 @@ impl MemberStore {
         let mut out = Vec::new();
         if let Some(spill) = self.spill.as_mut() {
             let segments = std::mem::take(&mut spill.segments[level][wave]);
-            out.reserve_exact(
-                segments.iter().map(|s| s.members).sum::<usize>() + self.buckets[level][wave].len(),
-            );
+            if !segments.is_empty() {
+                out.reserve_exact(
+                    segments.iter().map(|s| s.members).sum::<usize>()
+                        + self.buckets[level][wave].len(),
+                );
+            }
             let mut rest = segments.as_slice();
             while !rest.is_empty() {
                 let mut group_bytes = 0u64;
