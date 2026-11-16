@@ -379,7 +379,8 @@ impl<'a> JsonNode<'a> {
             Self::Owned { array, read } => write_scalar(out, read(array.as_ref(), i)),
             Self::Dictionary(array) => {
                 let options = FormatOptions::default();
-                JsonNode::resolve(array.as_ref(), &options).write(out, i);
+                // Resolve only this value: resolving the whole array per value is quadratic.
+                JsonNode::resolve(array.slice(i, 1).as_ref(), &options).write(out, 0);
             }
             Self::Struct { fields, .. } => {
                 out.push(b'{');
@@ -824,5 +825,19 @@ mod tests {
         )
         .unwrap();
         assert_column(&dictionary);
+    }
+
+    #[test]
+    fn large_dictionary_over_struct_with_utc_leaf_is_not_quadratic() {
+        let n = 10_000_i64;
+        let times = TimestampSecondArray::from((0..n).collect::<Vec<_>>()).with_timezone("utc");
+        let field = Arc::new(Field::new("t", times.data_type().clone(), true));
+        let structure = StructArray::new(vec![field].into(), vec![Arc::new(times)], None);
+        let keys = Int32Array::from((0..n as i32).collect::<Vec<_>>());
+        let dictionary = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(structure)).unwrap();
+        let start = std::time::Instant::now();
+        assert_column(&dictionary);
+        // Per-value resolves of the whole array took minutes here; this bound is generous.
+        assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
     }
 }
