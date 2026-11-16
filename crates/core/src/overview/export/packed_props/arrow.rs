@@ -8,8 +8,9 @@ use arrow_schema::DataType;
 use super::super::{
     formattable_temporal_type, is_json_encoded, is_string_type, is_temporal_scalar, write_json_str,
 };
-use super::{append_value, PackedProps};
+use super::{append_value, wire_len, PackedProps};
 use crate::mvt::PropertyRef;
+use crate::overview::export::ExportError;
 
 /// Only this module can write its bytes. Every text writer below writes &str,
 /// Arrow's UTF-8 Display, or `serde_json`'s UTF-8 output. This carries the proof
@@ -17,40 +18,58 @@ use crate::mvt::PropertyRef;
 #[derive(Default)]
 pub(in crate::overview::export) struct Row {
     bytes: Vec<u8>,
+    /// Entries written: one per schema column.
+    columns: usize,
 }
 
 impl Row {
     pub(in crate::overview::export) fn finish(self, names: Arc<[Arc<str>]>) -> PackedProps {
+        // The trusted scan reads one tag per name; a table of another width
+        // would misparse the bytes into an unvalidated UTF-8 view.
+        assert_eq!(
+            self.columns,
+            names.len(),
+            "row written for {} columns finished under a schema table of {}",
+            self.columns,
+            names.len()
+        );
         PackedProps {
             names,
             data: self.bytes.into(),
         }
     }
 
-    fn value(&mut self, value: Option<PropertyRef<'_>>) {
-        append_value(&mut self.bytes, value);
+    fn value(&mut self, value: Option<PropertyRef<'_>>) -> Result<(), ExportError> {
+        self.columns += 1;
+        append_value(&mut self.bytes, value)
     }
 
     /// Callers are only the typed JSON/Display writers in this module.
-    fn text(&mut self, write: impl FnOnce(&mut Vec<u8>)) {
+    fn text(&mut self, write: impl FnOnce(&mut Vec<u8>)) -> Result<(), ExportError> {
+        self.columns += 1;
         self.bytes.push(1);
         let length = self.bytes.len();
         self.bytes.extend_from_slice(&[0; 4]);
         write(&mut self.bytes);
-        let len = u32::try_from(self.bytes.len() - length - 4).expect("packed text exceeds u32");
+        let len = wire_len(self.bytes.len() - length - 4)?;
         self.bytes[length..length + 4].copy_from_slice(&len.to_le_bytes());
+        Ok(())
     }
 }
 
 pub(in crate::overview::export) fn extract<'a>(
     columns: impl Iterator<Item = &'a dyn Array>,
     rows: usize,
-) -> Vec<Row> {
+) -> Result<Vec<Row>, ExportError> {
     let mut out: Vec<Row> = (0..rows).map(|_| Row::default()).collect();
     for col in columns {
-        append_column(col, &mut out);
+        append_column(col, &mut out)?;
     }
-    out
+    // The spill frames a row with a u32 length.
+    for row in &out {
+        wire_len(row.bytes.len())?;
+    }
+    Ok(out)
 }
 
 type ScalarReader = for<'a> fn(&'a dyn Array, usize) -> Option<PropertyRef<'a>>;
@@ -126,12 +145,12 @@ fn normalized_temporal(col: &dyn Array) -> Option<ArrayRef> {
         .flatten()
 }
 
-fn append_column(col: &dyn Array, rows: &mut [Row]) {
+fn append_column(col: &dyn Array, rows: &mut [Row]) -> Result<(), ExportError> {
     if let Some(read) = scalar_reader(col.data_type()) {
         for (i, row) in rows.iter_mut().enumerate() {
-            row.value(read(col, i));
+            row.value(read(col, i))?;
         }
-        return;
+        return Ok(());
     }
     let options = FormatOptions::default();
     if is_temporal_scalar(col.data_type()) || matches!(col.data_type(), DataType::Decimal256(_, _))
@@ -154,24 +173,23 @@ fn append_column(col: &dyn Array, rows: &mut [Row]) {
         let mut scratch = String::new();
         for (i, row) in rows.iter_mut().enumerate() {
             let Some(fmt) = fmt.as_ref().filter(|_| !col.is_null(i)) else {
-                row.value(None);
+                row.value(None)?;
                 continue;
             };
             if number {
                 scratch.clear();
                 write!(&mut scratch, "{}", fmt.value(i)).unwrap();
-                row.value(scratch.parse().ok().map(PropertyRef::Double));
+                row.value(scratch.parse().ok().map(PropertyRef::Double))?;
             } else {
-                row.text(|out| write!(out, "{}", fmt.value(i)).unwrap());
+                row.text(|out| write!(out, "{}", fmt.value(i)).unwrap())?;
             }
         }
-        return;
+        return Ok(());
     }
     if let DataType::Dictionary(_, value) = col.data_type() {
         match arrow_cast::cast(col, value) {
             Ok(flat) => {
-                append_column(flat.as_ref(), rows);
-                return;
+                return append_column(flat.as_ref(), rows);
             }
             Err(e) => log::warn!(
                 "cannot unwrap {:?} column, dropping it: {e}",
@@ -182,16 +200,17 @@ fn append_column(col: &dyn Array, rows: &mut [Row]) {
         let node = JsonNode::resolve(col, &options);
         for (i, row) in rows.iter_mut().enumerate() {
             if col.is_null(i) {
-                row.value(None);
+                row.value(None)?;
             } else {
-                row.text(|out| node.write(out, i));
+                row.text(|out| node.write(out, i))?;
             }
         }
-        return;
+        return Ok(());
     }
     for row in rows {
-        row.value(None);
+        row.value(None)?;
     }
+    Ok(())
 }
 
 /// Borrowed Arrow tree: it resolves structure once but never materializes leaf
@@ -463,9 +482,27 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use std::sync::Arc;
 
+    #[test]
+    #[should_panic(expected = "schema table")]
+    fn finishing_a_row_under_a_table_of_another_width_panics() {
+        // The trusted scan walks one tag per table name; a table of another
+        // width would misparse the bytes.
+        let mut row = super::Row::default();
+        row.value(Some(crate::mvt::PropertyRef::Int(1))).unwrap();
+        let names: Arc<[Arc<str>]> = Arc::from(vec![Arc::from("a"), Arc::from("b")]);
+        row.finish(names);
+    }
+
+    #[test]
+    fn text_over_the_u32_wire_limit_is_an_error_not_a_panic() {
+        assert_eq!(super::super::wire_len(5).unwrap(), 5);
+        assert_eq!(super::super::wire_len(u32::MAX as usize).unwrap(), u32::MAX);
+        assert!(super::super::wire_len(u32::MAX as usize + 1).is_err());
+    }
+
     fn assert_column(col: &dyn Array) {
         let names: Arc<[Arc<str>]> = Arc::from(vec![Arc::from("property")]);
-        let packed = extract(std::iter::once(col), col.len());
+        let packed = extract(std::iter::once(col), col.len()).unwrap();
         for (i, (row, value)) in packed
             .into_iter()
             .zip(extract_property_column(col))
@@ -485,7 +522,7 @@ mod tests {
         }
         if col.len() > 1 {
             let sliced = col.slice(1, col.len() - 1);
-            let rows = extract(std::iter::once(sliced.as_ref()), sliced.len());
+            let rows = extract(std::iter::once(sliced.as_ref()), sliced.len()).unwrap();
             for (row, value) in rows
                 .into_iter()
                 .zip(extract_property_column(sliced.as_ref()))

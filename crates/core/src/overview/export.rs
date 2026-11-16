@@ -5336,8 +5336,12 @@ fn encode_member(buf: &mut Vec<u8>, m: &Member, names: &SpillNames) {
         }
         None => buf.push(0),
     }
-    put_u32(buf, names.id(&m.props.names));
-    put_u32(buf, m.props.bytes().len() as u32);
+    put_u32(buf, names.id(m.props.names()));
+    // `packed_props::arrow::extract` rejects a row the u32 cannot frame.
+    put_u32(
+        buf,
+        u32::try_from(m.props.bytes().len()).expect("row length checked at extraction"),
+    );
     buf.extend_from_slice(m.props.bytes());
     encode_geometry(buf, &m.geom);
 }
@@ -5377,6 +5381,14 @@ impl<'a> SpillCursor<'a> {
         Ok(out)
     }
 
+    /// `count` items of at least `min_item` bytes each, as an allocation
+    /// size: never more than the bytes left could hold, so a corrupt count
+    /// cannot ask for more memory than the segment is long.
+    fn bounded(&self, count: u64, min_item: usize) -> usize {
+        let room = (self.buf.len() - self.pos) / min_item;
+        usize::try_from(count).map_or(room, |c| c.min(room))
+    }
+
     fn u8(&mut self) -> Result<u8, ExportError> {
         Ok(self.take(1)?[0])
     }
@@ -5397,7 +5409,7 @@ impl<'a> SpillCursor<'a> {
 
     fn line_string(&mut self) -> Result<geo::LineString<f64>, ExportError> {
         let n = self.u32()? as usize;
-        let mut coords = Vec::with_capacity(n);
+        let mut coords = Vec::with_capacity(self.bounded(n as u64, 16));
         for _ in 0..n {
             coords.push(self.coord()?);
         }
@@ -5410,7 +5422,7 @@ impl<'a> SpillCursor<'a> {
             return Err(spill_corrupt());
         }
         let exterior = self.line_string()?;
-        let mut interiors = Vec::with_capacity(rings - 1);
+        let mut interiors = Vec::with_capacity(self.bounded(rings as u64 - 1, 4));
         for _ in 1..rings {
             interiors.push(self.line_string()?);
         }
@@ -5426,7 +5438,7 @@ fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportErr
         3 => Geometry::Polygon(cur.polygon()?),
         4 => {
             let n = cur.u32()? as usize;
-            let mut pts = Vec::with_capacity(n);
+            let mut pts = Vec::with_capacity(cur.bounded(n as u64, 16));
             for _ in 0..n {
                 pts.push(geo::Point(cur.coord()?));
             }
@@ -5434,7 +5446,7 @@ fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportErr
         }
         5 => {
             let n = cur.u32()? as usize;
-            let mut lines = Vec::with_capacity(n);
+            let mut lines = Vec::with_capacity(cur.bounded(n as u64, 4));
             for _ in 0..n {
                 lines.push(cur.line_string()?);
             }
@@ -5442,7 +5454,7 @@ fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportErr
         }
         6 => {
             let n = cur.u32()? as usize;
-            let mut polys = Vec::with_capacity(n);
+            let mut polys = Vec::with_capacity(cur.bounded(n as u64, 8));
             for _ in 0..n {
                 polys.push(cur.polygon()?);
             }
@@ -5450,7 +5462,7 @@ fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportErr
         }
         7 => {
             let n = cur.u32()? as usize;
-            let mut geoms = Vec::with_capacity(n);
+            let mut geoms = Vec::with_capacity(cur.bounded(n as u64, 1));
             for _ in 0..n {
                 geoms.push(decode_geometry(cur)?);
             }
@@ -5467,30 +5479,19 @@ fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportErr
 #[derive(Default)]
 struct SpillNames {
     tables: Vec<PropertyNames>,
-    names: HashSet<Arc<str>>,
 }
 
 impl SpillNames {
+    /// Keeps the caller's own handle, so [`Self::id`] hits on pointer
+    /// identity before it falls back to comparing names.
     fn register(&mut self, table: &PropertyNames) {
-        if self
+        if !self
             .tables
             .iter()
             .any(|t| Arc::ptr_eq(t, table) || t == table)
         {
-            return;
+            self.tables.push(table.clone());
         }
-        let shared = table
-            .iter()
-            .map(|name| {
-                if let Some(n) = self.names.get(name) {
-                    return n.clone();
-                }
-                self.names.insert(name.clone());
-                name.clone()
-            })
-            .collect::<Vec<_>>()
-            .into();
-        self.tables.push(shared);
     }
 
     fn id(&self, table: &PropertyNames) -> u32 {
@@ -5501,10 +5502,16 @@ impl SpillNames {
     }
 }
 
+/// Smallest encoded member: its fixed header, before any property or geometry
+/// byte (key, seq, gap, band, id flag, schema id, row length).
+const MEMBER_WIRE_MIN: usize = 37;
+
 fn decode_segment(buf: &[u8], names: &SpillNames) -> Result<Vec<Member>, ExportError> {
     let mut cur = SpillCursor::new(buf);
-    let n = cur.u64()? as usize;
-    let mut members = Vec::with_capacity(n);
+    let n = cur.u64()?;
+    // A member is never smaller than its fixed header, so a count the buffer
+    // cannot hold is corrupt; never trust it for an allocation.
+    let mut members = Vec::with_capacity(cur.bounded(n, MEMBER_WIRE_MIN));
     for _ in 0..n {
         members.push(decode_member(&mut cur, names)?);
     }
@@ -5755,7 +5762,7 @@ impl MemberStore {
             .as_mut()
             .expect("flush_bucket requires spill backing");
         for m in &members {
-            spill.names.register(&m.props.names);
+            spill.names.register(m.props.names());
         }
         // A few segments per pool thread at a time, at most 16, so the
         // encoded bytes held before their write stay a small, bounded
@@ -5991,7 +5998,7 @@ fn fanout_batch_members(
     // Each row's properties, materialized once and shared via `Arc` by its
     // members at every level (as the legacy path does per wave).
     let cols = AttrColumns::new(&schema, geom_idx, published, feature_id);
-    let mut attrs = cols.extract(batch);
+    let mut attrs = cols.extract(batch)?;
     let ids: Vec<Option<u64>> = (0..batch.num_rows())
         .map(|row| attrs.id(row))
         .collect::<Result<_, _>>()?;
@@ -7786,7 +7793,7 @@ fn collect_member_chunk(
             .serial_collect_rows += items.len() as u64;
     }
     let columns = input.batch.slice(first, items.len());
-    let mut attrs = input.attrs.extract(&columns);
+    let mut attrs = input.attrs.extract(&columns)?;
     let mut out = ChunkMembers {
         buckets: (0..input.wave.len()).map(|_| Vec::new()).collect(),
         losses: Vec::new(),
@@ -10746,15 +10753,15 @@ impl<'a> AttrColumns<'a> {
     ///
     /// Packed rows share the whole schema table, so there is no per-property
     /// name refcount traffic (#803). Values are written directly into rows.
-    fn extract(&self, batch: &RecordBatch) -> BatchAttributes<'a> {
-        BatchAttributes {
+    fn extract(&self, batch: &RecordBatch) -> Result<BatchAttributes<'a>, ExportError> {
+        Ok(BatchAttributes {
             names: self.names.clone(),
             rows: packed_props::arrow::extract(
                 self.props
                     .iter()
                     .map(|(idx, _)| batch.column(*idx).as_ref()),
                 batch.num_rows(),
-            ),
+            )?,
             ids: self.feature_id.map(|fid| {
                 let ids = feature_id_values(batch.column(fid.idx))
                     .map(|v| v.into_iter().map(Result::ok).collect())
@@ -10763,7 +10770,7 @@ impl<'a> AttrColumns<'a> {
             }),
             #[cfg(debug_assertions)]
             read: vec![false; batch.num_rows()],
-        }
+        })
     }
 }
 
@@ -16691,7 +16698,7 @@ mod tests {
         .unwrap();
         let published = PublishedNames::identity();
         let cols = AttrColumns::new(&schema, 2, &published, None);
-        let mut attrs = cols.extract(&batch);
+        let mut attrs = cols.extract(&batch).unwrap();
         let rows: Vec<SharedProps> = (0..3).map(|r| attrs.props(r)).collect();
 
         let pairs = |p: &SharedProps| -> Vec<(String, PropertyValue)> {
@@ -16720,10 +16727,10 @@ mod tests {
 
         // The names are refcounted handles to the batch's table, not copies.
         let (name_key, rank_key) = (&attrs.names[0], &attrs.names[1]);
-        assert!(Arc::ptr_eq(&rows[0].names[0], name_key));
-        assert!(Arc::ptr_eq(&rows[2].names[0], name_key));
+        assert!(Arc::ptr_eq(&rows[0].names()[0], name_key));
+        assert!(Arc::ptr_eq(&rows[2].names()[0], name_key));
         for row in &rows {
-            assert!(Arc::ptr_eq(row.names.last().unwrap(), rank_key));
+            assert!(Arc::ptr_eq(row.names().last().unwrap(), rank_key));
         }
     }
 
@@ -16747,7 +16754,9 @@ mod tests {
         )
         .unwrap();
         let published = PublishedNames::identity();
-        let mut attrs = AttrColumns::new(&schema, 1, &published, None).extract(&batch);
+        let mut attrs = AttrColumns::new(&schema, 1, &published, None)
+            .extract(&batch)
+            .unwrap();
         attrs.props(0);
         let _ = attrs.props(0);
     }
@@ -19211,7 +19220,7 @@ mod tests {
             };
             let mut buf = Vec::new();
             let mut names = SpillNames::default();
-            names.register(&m.props.names);
+            names.register(m.props.names());
             encode_member(&mut buf, &m, &names);
             let mut cur = SpillCursor::new(&buf);
             let back = decode_member(&mut cur, &names).unwrap();
@@ -19245,7 +19254,7 @@ mod tests {
             band: 0,
         };
         let mut names = SpillNames::default();
-        names.register(&member.props.names);
+        names.register(member.props.names());
         let mut bytes = Vec::new();
         encode_member(&mut bytes, &member, &names);
         let offset = bytes
@@ -19254,6 +19263,40 @@ mod tests {
             .unwrap();
         bytes[offset] = 0xff;
         assert!(decode_member(&mut SpillCursor::new(&bytes), &names).is_err());
+    }
+
+    #[test]
+    fn spill_names_keep_the_registered_table_handle() {
+        // `id` runs once per spilled member: a hit on the caller's own
+        // `Arc` must not fall back to comparing every name.
+        let table: PropertyNames = Arc::from(vec![Arc::<str>::from("a"), Arc::from("b")]);
+        let mut names = SpillNames::default();
+        names.register(&table);
+        names.register(&table);
+        assert_eq!(names.tables.len(), 1);
+        assert!(Arc::ptr_eq(&names.tables[0], &table));
+        let equal: PropertyNames = Arc::from(vec![Arc::<str>::from("a"), Arc::from("b")]);
+        assert_eq!(names.id(&equal), 0, "equal content shares the id");
+    }
+
+    #[test]
+    fn spill_segment_with_hostile_counts_is_an_error() {
+        let names = SpillNames::default();
+        // A member count no buffer could hold must fail, not allocate or panic.
+        for count in [u64::MAX, 1 << 40, 3] {
+            let buf = count.to_le_bytes();
+            assert!(decode_segment(&buf, &names).is_err(), "count {count}");
+        }
+        // A property table id that was never registered.
+        let mut cur = Vec::new();
+        for v in [0u64, 0, 0] {
+            cur.extend_from_slice(&v.to_le_bytes());
+        }
+        cur.extend_from_slice(&0u32.to_le_bytes()); // band
+        cur.push(0); // no feature id
+        cur.extend_from_slice(&7u32.to_le_bytes());
+        cur.extend_from_slice(&0u32.to_le_bytes());
+        assert!(decode_member(&mut SpillCursor::new(&cur), &names).is_err());
     }
 
     /// #427: a `spill_dir` that is not an existing directory fails the
@@ -19535,12 +19578,11 @@ mod tests {
         );
     }
 
-    /// #461: a wave read back from the spill shares one `Arc<str>` per
-    /// distinct property name, across members and across segments, instead
-    /// of allocating a name per property per member. Members whose nulls
-    /// shift the name positions still resolve to the shared handle.
+    /// #461: a wave read back from the spill shares one schema table per
+    /// distinct column set, across members and across segments, instead of
+    /// allocating names per member.
     #[test]
-    fn member_store_spill_reload_interns_property_names() {
+    fn member_store_spill_reload_shares_schema_tables() {
         let plans = vec![LevelPlan {
             zoom: 4,
             partitions: partitions_with_members(&[10]),
@@ -19577,11 +19619,17 @@ mod tests {
 
         let w = store.take_wave(0, 0).unwrap();
         assert_eq!(w.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 1, 2]);
-        let (name, rank) = (&w[0].props.names[0], &w[0].props.names[1]);
-        assert_eq!((&**name, &**rank), ("name", "rank"));
-        assert!(Arc::ptr_eq(&w[1].props.names[0], rank), "null-shifted name");
-        assert!(Arc::ptr_eq(&w[2].props.names[0], name), "second segment");
-        assert!(Arc::ptr_eq(&w[2].props.names[1], rank), "second segment");
+        let names: Vec<_> = w[0].props.names().iter().map(|n| &**n).collect();
+        assert_eq!(names, ["name", "rank"]);
+        assert_eq!(
+            w[1].props.names().len(),
+            1,
+            "the null-shifted row's own table"
+        );
+        assert!(
+            Arc::ptr_eq(w[0].props.names(), w[2].props.names()),
+            "equal tables share one handle across segments"
+        );
         assert_eq!(
             w[2].props.iter().next().unwrap().1.to_owned(),
             PropertyValue::String("f2".into())
@@ -19676,8 +19724,8 @@ mod tests {
         assert!(w.iter().enumerate().all(|(i, m)| m.seq == i as u64
             && m.props.iter().next().unwrap().1.to_owned() == PropertyValue::UInt(i as u64)));
         for m in &w[3..] {
-            let first = &w[(m.seq % 3) as usize].props.names[0];
-            assert!(Arc::ptr_eq(&m.props.names[0], first), "seq {}", m.seq);
+            let first = &w[(m.seq % 3) as usize].props.names()[0];
+            assert!(Arc::ptr_eq(&m.props.names()[0], first), "seq {}", m.seq);
         }
     }
 

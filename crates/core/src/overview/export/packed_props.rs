@@ -10,7 +10,9 @@ use crate::mvt::PropertyValue;
 /// Each schema column has a tag (0 = absent). Text lengths are fixed u32s; numeric payloads preserve their exact little-endian bits.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct PackedProps {
-    pub(super) names: Arc<[Arc<str>]>,
+    // Private: the trusted scan walks one tag per name, so a row must never
+    // be re-paired with a table of another width.
+    names: Arc<[Arc<str>]>,
     data: Arc<[u8]>,
 }
 
@@ -22,7 +24,7 @@ impl PackedProps {
     ) -> Self {
         let mut data = Vec::new();
         for value in values {
-            append_value(&mut data, value.as_ref().map(PropertyValue::as_ref));
+            append_value(&mut data, value.as_ref().map(PropertyValue::as_ref)).unwrap();
         }
         Self {
             names,
@@ -32,6 +34,10 @@ impl PackedProps {
 
     pub(super) fn bytes(&self) -> &[u8] {
         &self.data
+    }
+
+    pub(super) fn names(&self) -> &Arc<[Arc<str>]> {
+        &self.names
     }
 
     /// The only constructor for bytes read from the process-private spill.
@@ -185,16 +191,16 @@ impl<'a> Iterator for PackedIter<'a> {
 }
 
 /// Shared typed wire writer; strings enter as valid UTF-8.
-fn append_value(data: &mut Vec<u8>, value: Option<PropertyRef<'_>>) {
+fn append_value(
+    data: &mut Vec<u8>,
+    value: Option<PropertyRef<'_>>,
+) -> Result<(), super::ExportError> {
     match value {
         None => data.push(0),
         Some(PropertyRef::String(s)) => {
+            let len = wire_len(s.len())?;
             data.push(1);
-            data.extend_from_slice(
-                &u32::try_from(s.len())
-                    .expect("packed text exceeds u32")
-                    .to_le_bytes(),
-            );
+            data.extend_from_slice(&len.to_le_bytes());
             data.extend_from_slice(s.as_bytes());
         }
         Some(PropertyRef::Float(v)) => {
@@ -218,6 +224,18 @@ fn append_value(data: &mut Vec<u8>, value: Option<PropertyRef<'_>>) {
             data.push(u8::from(v));
         }
     }
+    Ok(())
+}
+
+/// A text or row length as the u32 the wire carries. A longer value is
+/// reachable only from a multi-gigabyte `LargeUtf8` cell or nested value, and
+/// must fail the export rather than panic or wrap.
+pub(super) fn wire_len(len: usize) -> Result<u32, super::ExportError> {
+    u32::try_from(len).map_err(|_| {
+        super::ExportError::Arrow(arrow_schema::ArrowError::InvalidArgumentError(format!(
+            "a property value of {len} bytes exceeds the 4 GiB the export can carry"
+        )))
+    })
 }
 
 /// Borrow text from an immutable row after its construction boundary checked it.
