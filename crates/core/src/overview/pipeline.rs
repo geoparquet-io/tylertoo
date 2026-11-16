@@ -2418,9 +2418,14 @@ mod spill_tests {
     /// the decode pool cannot be built.
     #[test]
     fn convert_spill_uses_multiple_decoders_and_serial_fallback() {
-        // A 128 MiB allowance makes `auto` spill this fixture. Env is
-        // process-global; nextest runs each test in its own process.
-        std::env::set_var("TYLERTOO_AUTO_MEM_LIMIT_BYTES", "134217728");
+        // A 128 MiB allowance makes `auto` spill this fixture.
+        if !crate::test_env::run_in_child(
+            module_path!(),
+            "convert_spill_uses_multiple_decoders_and_serial_fallback",
+            &[("TYLERTOO_AUTO_MEM_LIMIT_BYTES", "134217728")],
+        ) {
+            return;
+        }
         let (observed, failed, wide) = convert_spilled(MemoryProfile::Auto, false);
         assert_eq!(failed, 0);
         assert!(
@@ -2440,7 +2445,6 @@ mod spill_tests {
             "decode escaped admitted pool: {observed:?}"
         );
         let (observed, failed, serial) = convert_spilled(MemoryProfile::Auto, true);
-        std::env::remove_var("TYLERTOO_AUTO_MEM_LIMIT_BYTES");
         assert!(failed > 0, "the injected pool failure must fire");
         assert_eq!(observed.indexed, 0, "failed pool must fall back to serial");
         assert!(!observed.threads.is_empty(), "fallback must really decode");
