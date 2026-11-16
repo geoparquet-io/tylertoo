@@ -38,7 +38,7 @@ pub(super) struct ReadTuning {
     pub(super) footer: Option<FooterPrice>,
     /// The run's memory profile, which decides the shape the way
     /// [`MemoryBudget::fit`] does for every phase: `auto` reads with what the
-    /// read share affords; `bounded` the same within main's caps
+    /// read share affords; `bounded` the same within its caps
     /// ([`READ_WORKERS_BOUNDED_MAX`] workers, [`READ_AHEAD_BOUNDED_MAX_BATCHES`]
     /// deep); `speed` with every requested worker at the full depth.
     pub(super) profile: MemoryProfile,
@@ -63,9 +63,9 @@ pub(super) enum ReadFlow {
     Stop,
 }
 
-/// Ceiling on a worker's read-ahead under `bounded`: main's cap (#788,
-/// `bounded` keeps main's caps per phase; the allowance can only shrink
-/// them). The caller asked for memory over speed, so a rich machine does not
+/// Ceiling on a worker's read-ahead under `bounded`: 4 batches (#788,
+/// `bounded` caps each phase at or below main's; the allowance can only
+/// shrink the caps). The caller asked for memory over speed, so a rich machine does not
 /// get to build the full [`READ_AHEAD_MAX_BATCHES`] queue per worker.
 ///
 /// This caps the *generous* end and nothing else. Halving the budget slice
@@ -1958,7 +1958,7 @@ mod read_tests {
         let mut budget = large.budget;
         let grant = grant_read_ahead(&mut budget, large, 3);
         assert_eq!(grant.units, shape.workers * (shape.depth + 8) + 3);
-        // `bounded` keeps main's caps, which the budget can only shrink;
+        // `bounded` caps at or below main's, which the budget can only shrink;
         // `speed` reads at its maximum whatever the budget affords (#788).
         let bounded = |workers, available| {
             resolve_read_shape(ReadTuning {

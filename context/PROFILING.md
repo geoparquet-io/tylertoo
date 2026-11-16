@@ -57,8 +57,8 @@ The shares start at 1.92 GiB and 4.8 GiB; earlier grants reduce them.
 These are budget calculations, not a promise about total process memory.
 
 - `auto` sizes concurrency to the allowance and spills output when needed.
-- `bounded` spills output and caps readers at 4 and queues at 16 batches
-  per reader. Row-group encodes start with at most 4. The buffered drain can
+- `bounded` spills output and caps readers at 4 and queues at 4 batches
+  per reader, and holds at most 4 batches in flight through pass 2. Row-group encodes start with at most 4. The buffered drain can
   add encodes using released batch memory, limited by headroom below the
   prior RSS peak and the thread count. The drain can also decode up to 4 spilled batches at once, funded by
   `MemoryBudget::drain_widths` from existing grants: the encode grant above

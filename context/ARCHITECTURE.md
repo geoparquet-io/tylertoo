@@ -91,11 +91,11 @@ confirmed this decision:
 | Profile | Grant | Meaning |
 | --- | --- | --- |
 | `speed` | `want` | No limit: everything in RAM, every knob at its maximum |
-| `bounded` | `auto`'s grant, cut to main's cap for the phase | Smallest footprint: always spill, and keep main's caps per phase, which the allowance can only shrink. That means at most 4 readers 16 deep, the requested window, 4 encodes, and export and fill at their floors (main held no store there). Never above main's peak |
+| `bounded` | `auto`'s grant, cut to main's cap for the phase | Smallest footprint: always spill, and cap each phase at or below main's, which the allowance can only shrink: at most 4 readers 4 batches deep, at most 4 batches in flight through pass 2 whatever `--in-flight-batches` asks for, 4 encodes, and export and fill at their floors (main held no store there). Never above main's peak |
 | `auto` (default) | what the phase's share affords, within `[floor, want]` | Sized to the machine: every decision fits the allowance, spilling when the output does not, re-checked at runtime (#626) |
 
-In one sentence: **`bounded` keeps main's caps per phase; the allowance can
-only shrink them** (`MemoryPhase::bounded_cap`, which also holds remote
+In one sentence: **`bounded` caps each phase at or below main's; the allowance can
+only shrink the caps** (`MemoryPhase::bounded_cap`, which also holds remote
 staging to main's 256 MiB in-flight budget through
 `MemoryBudget::stage_requests`, plus the read shape's worker and depth caps
 in `read.rs`). A cut that granted `bounded` only each phase's

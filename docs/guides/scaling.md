@@ -73,7 +73,7 @@ batches processed at once, and the row groups the writer encodes at once.
 | `--profile` | Output buffers | Everything else |
 | --- | --- | --- |
 | `speed` | RAM | No limit: every knob at its maximum |
-| `bounded` | Temporary Arrow Inter-Process Communication (IPC) files | Fixed initial caps: at most 4 readers, 16 batches each, and 4 encodes. The drain can reuse released batch memory for more encodes |
+| `bounded` | Temporary Arrow Inter-Process Communication (IPC) files | Fixed initial caps: at most 4 readers 4 batches deep, at most 4 batches in flight through pass 2 whatever `--in-flight-batches` asks for, and 4 encodes. The drain can reuse released batch memory for more encodes |
 | `auto` (default) | RAM when the estimate fits 60% of available RAM, otherwise spill. Measures buffered rows and switches to spilling mid-pass if they outgrow it | Sized to fit the same 60%, priced from the Parquet footers |
 
 `auto` is its own shape, not a switch between the other two: on a large
@@ -141,8 +141,7 @@ is tmpfs and uses RAM charged to the same cgroup. Point `TMPDIR` or
 Resident batches include those in flight, each worker's read-ahead queue,
 and, when spilling, up to three per level in spill writers. Under `auto` and
 `bounded`, read-ahead gets 10% of the allowance, so smaller machines get
-fewer workers; `bounded` also caps each queue at 16 batches, half of
-`auto`'s. `speed` reads with every requested worker at the full depth. A decoded row is priced at twice its
+fewer workers; `bounded` also caps each queue at 4 batches. `speed` reads with every requested worker at the full depth. A decoded row is priced at twice its
 uncompressed bytes in the Parquet footer plus 8 bytes per column, and each
 worker is also charged for the largest row group its reader decodes. Unlike
 the pass-2 buffers, tylertoo sizes the read-ahead before a pass reads a row,

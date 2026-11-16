@@ -178,8 +178,9 @@ pub enum MemoryProfile {
     Speed,
     /// The smallest footprint: spill each output level's rows to a temporary
     /// Arrow IPC file and stream them back at write time. Every other phase
-    /// keeps `bounded`'s fixed caps (at most 4 readers 16 batches deep, at
-    /// most 4 encodes), which the memory allowance can only shrink.
+    /// is capped at or below main's: at most 4 readers 4 batches deep, at most
+    /// 4 batches in flight through pass 2 whatever `in_flight_batches` asks
+    /// for, and 4 encodes. The memory allowance can only shrink the caps.
     Bounded,
 }
 

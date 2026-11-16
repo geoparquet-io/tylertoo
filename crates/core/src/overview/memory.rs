@@ -13,8 +13,8 @@
 //! The [`MemoryProfile`] decides what `fit` grants, the same way for every
 //! phase:
 //!
-//! - `bounded` keeps main's caps per phase; the allowance can only shrink
-//!   them ([`MemoryPhase::bounded_cap`], #788).
+//! - `bounded` caps each phase at or below main's; the allowance can only shrink
+//!   the caps ([`MemoryPhase::bounded_cap`], #788).
 //! - `auto` takes what the phase's share of the allowance affords, clamped
 //!   to the phase's floor and what it wants.
 //! - `speed` takes what it wants.
@@ -144,9 +144,10 @@ impl MemoryPhase {
 
     /// Main's `bounded` cap for this phase, out of `want` units with `floor`
     /// at the least: what a `bounded` grant may never exceed (#788). The
-    /// read-ahead and the compute window wanted what the caller asked for
-    /// and were cut by the allowance, as now, so their cap is `want` (the
-    /// read shape applies main's per-worker caps itself, `read.rs`). The
+    /// read-ahead wanted what the caller asked for and was cut by the
+    /// allowance, so its cap is `want` (the read shape applies the
+    /// per-worker caps itself, `read.rs`); the compute window's in-flight
+    /// depth is capped at 4 on top ([`MemoryBudget::pass2_in_flight`]). The
     /// writer encoded at most [`ENCODE_FLOOR`] row groups, which is the
     /// encode floor. Export and fill held no store under `bounded`: their
     /// floor is main's shape. Remote staging held at most main's staging
