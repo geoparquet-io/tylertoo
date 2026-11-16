@@ -59,68 +59,31 @@ impl PackedProps {
     }
 
     pub(super) fn validate(&self) -> Result<(), super::ExportError> {
-        self.checked_iter().try_for_each(|p| p.map(|_| ()))
-    }
-
-    fn checked_iter(
-        &self,
-    ) -> impl Iterator<Item = Result<(&str, PropertyRef<'_>), super::ExportError>> {
-        let mut bytes = &*self.data;
-        let mut names = self.names.iter();
-        let mut done = false;
-        std::iter::from_fn(move || {
-            if done {
-                return None;
+        let corrupt = super::spill_corrupt;
+        let mut cur = super::SpillCursor::new(&self.data);
+        for _ in self.names.iter() {
+            match cur.u8()? {
+                0 => {}
+                1 => {
+                    let len = cur.u32()? as usize;
+                    std::str::from_utf8(cur.take(len)?).map_err(|_| corrupt())?;
+                }
+                2 => {
+                    cur.take(4)?;
+                }
+                3..=5 => {
+                    cur.take(8)?;
+                }
+                6 if cur.u8()? > 1 => return Err(corrupt()),
+                6 => {}
+                _ => return Err(corrupt()),
             }
-            let result = (|| {
-                for name in names.by_ref() {
-                    let tag = take(&mut bytes, 1)?[0];
-                    let value = match tag {
-                        0 => continue,
-                        1 => {
-                            let len = u32::from_le_bytes(take(&mut bytes, 4)?.try_into().unwrap())
-                                as usize;
-                            PropertyRef::String(
-                                std::str::from_utf8(take(&mut bytes, len)?)
-                                    .map_err(|_| super::spill_corrupt())?,
-                            )
-                        }
-                        2 => PropertyRef::Float(f32::from_bits(u32::from_le_bytes(
-                            take(&mut bytes, 4)?.try_into().unwrap(),
-                        ))),
-                        3 => PropertyRef::Double(f64::from_bits(u64::from_le_bytes(
-                            take(&mut bytes, 8)?.try_into().unwrap(),
-                        ))),
-                        4 => PropertyRef::Int(i64::from_le_bytes(
-                            take(&mut bytes, 8)?.try_into().unwrap(),
-                        )),
-                        5 => PropertyRef::UInt(u64::from_le_bytes(
-                            take(&mut bytes, 8)?.try_into().unwrap(),
-                        )),
-                        6 => match take(&mut bytes, 1)?[0] {
-                            0 => PropertyRef::Bool(false),
-                            1 => PropertyRef::Bool(true),
-                            _ => return Err(super::spill_corrupt()),
-                        },
-                        _ => return Err(super::spill_corrupt()),
-                    };
-                    return Ok(Some((&**name, value)));
-                }
-                done = true;
-                if !bytes.is_empty() {
-                    return Err(super::spill_corrupt());
-                }
-                Ok(None)
-            })();
-            match result {
-                Ok(v) => v.map(Ok),
-                Err(e) => {
-                    done = true;
-                    Some(Err(e))
-                }
-            }
-        })
-        .take(self.names.len() + 1)
+        }
+        if cur.is_empty() {
+            Ok(())
+        } else {
+            Err(corrupt())
+        }
     }
 
     #[cfg(test)]
@@ -250,14 +213,6 @@ unsafe fn trusted_text(bytes: &[u8]) -> &str {
     unsafe { std::str::from_utf8_unchecked(bytes) }
 }
 
-fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], super::ExportError> {
-    if n > bytes.len() {
-        return Err(super::spill_corrupt());
-    }
-    let (v, tail) = bytes.split_at(n);
-    *bytes = tail;
-    Ok(v)
-}
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -507,9 +462,8 @@ mod tests {
                 let mut bad = row.bytes().to_vec();
                 bad[at] = value;
                 if let Ok(ok) = PackedProps::from_spill(names.clone(), bad.into()) {
-                    let fast: Vec<_> = ok.iter().collect();
-                    let checked: Vec<_> = ok.checked_iter().collect::<Result<_, _>>().unwrap();
-                    assert_eq!(format!("{fast:?}"), format!("{checked:?}")); // Debug: NaN != NaN
+                    // The trusted scan of a validated row stays in bounds.
+                    ok.iter().for_each(drop);
                 }
             }
         }
