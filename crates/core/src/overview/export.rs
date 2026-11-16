@@ -1584,7 +1584,7 @@ const MEMBER_MEMORY_INFLATION: u64 = 2;
 /// and its share of the full-tile MVT build in [`build_mvt`].
 ///
 /// The stored-bytes term alone under-counted points about 5×. Measured
-/// (2026-11, release build, aarch64, `export-pmtiles` of a z0 overview
+/// (2026-11-16, release build, aarch64, `export-pmtiles` of a z0 overview
 /// holding every one of 200k and 2M world-spread points, no tile caps, peak
 /// RSS slope between the two sizes), in bytes per row stored in the overview
 /// and per member resident. Properties are packed row buffers (#874), so
@@ -1592,19 +1592,19 @@ const MEMBER_MEMORY_INFLATION: u64 = 2;
 ///
 /// | shape | stored | properties | measured | estimate |
 /// |---|---|---|---|---|
-/// | Overture-shaped, four properties | 115 | 4 | 632 | 934 |
-/// | the same, `--exclude-all-properties` | 115 | 0 | 464 | 454 |
-/// | geometry only | 57 | 0 | 445 | 338 |
-/// | four numeric | 96 | 4 | 886 | 896 |
-/// | sixteen numeric | 213 | 16 | 2,337 | 2,570 |
-/// | four strings, one a 32-character id | 107 | 4 | 663 | 918 |
+/// | Overture-shaped, four properties | 115 | 4 | 618 | 934 |
+/// | the same, `--exclude-all-properties` | 115 | 0 | 460 | 454 |
+/// | geometry only | 57 | 0 | 432 | 338 |
+/// | four numeric | 96 | 4 | 879 | 896 |
+/// | sixteen numeric | 213 | 16 | 2,334 | 2,570 |
+/// | four strings, one a 32-character id | 107 | 4 | 647 | 918 |
 ///
 /// [`MEMBER_PROPERTY_BYTES`] is the smallest round value that covers every
 /// row with properties: four numeric sets it. Before packed rows the same
 /// shapes measured 843, 483, 448, 1,061, 2,857 and 815 on this host, and
 /// the price was 208. This constant is unchanged from the old layout and
 /// does not cover the two property-less rows on this host: the old layout
-/// missed them too (483 and 448 against 454 and 338). Raising it to 336
+/// missed them too (483 and 448 against 460 and 432). Raising it to 336
 /// would cover them and would narrow dense property-less levels' waves.
 const MEMBER_BASE_BYTES: u64 = 224;
 
@@ -12283,7 +12283,7 @@ mod tests {
     #[test]
     fn member_resident_bytes_covers_the_665_calibration() {
         for (stored, properties, measured) in
-            [(115, 4, 632), (96, 4, 886), (213, 16, 2_337), (107, 4, 663)]
+            [(115, 4, 618), (96, 4, 879), (213, 16, 2_334), (107, 4, 647)]
         {
             let estimate = member_resident_bytes(stored, properties);
             assert!(
@@ -12292,10 +12292,10 @@ mod tests {
                  measured {measured} B, within 55%"
             );
         }
-        // The two property-less shapes (464 and 445 B measured) sit above
+        // The two property-less shapes (460 and 432 B measured) sit above
         // the base price on the aarch64 host (see [`MEMBER_BASE_BYTES`]):
         // pin the known gap so it cannot grow past a third.
-        for (stored, measured) in [(115, 464), (57, 445)] {
+        for (stored, measured) in [(115, 460), (57, 432)] {
             let estimate = member_resident_bytes(stored, 0);
             assert!(
                 estimate >= measured * 3 / 4,
