@@ -226,10 +226,10 @@ enum JsonNode<'a> {
         number: bool,
         scratch: RefCell<String>,
     },
-    OwnedFormatted {
+    /// An array this node owns (a cast result), read like `Scalar`.
+    Owned {
         array: ArrayRef,
-        number: bool,
-        scratch: RefCell<String>,
+        read: ScalarReader,
     },
     Struct {
         array: &'a arrow_array::StructArray,
@@ -316,17 +316,25 @@ impl<'a> JsonNode<'a> {
                     values: Box::new(Self::resolve(a.values().as_ref(), options)),
                 }
             }
-            DataType::Dictionary(_, value) => arrow_cast::cast(col, value)
-                .map(Self::Dictionary)
-                .unwrap_or(Self::Null),
+            DataType::Dictionary(_, value) => match arrow_cast::cast(col, value) {
+                Ok(flat) => match scalar_reader(flat.data_type()) {
+                    Some(read) => Self::Owned { array: flat, read },
+                    // A struct, list, map or temporal under a dictionary is rare:
+                    // it resolves per value.
+                    None => Self::Dictionary(flat),
+                },
+                Err(_) => Self::Null,
+            },
             dt if is_temporal_scalar(dt) || matches!(dt, DataType::Decimal256(_, _)) => {
                 let number = matches!(dt, DataType::Decimal256(_, _));
                 if let Some(array) = normalized_temporal(col) {
-                    return Self::OwnedFormatted {
-                        array,
-                        number,
-                        scratch: RefCell::new(String::new()),
-                    };
+                    // Cast-to-text formats with the same default `FormatOptions`.
+                    return arrow_cast::cast(&array, &DataType::Utf8)
+                        .map(|array| Self::Owned {
+                            array,
+                            read: scalar_reader(&DataType::Utf8).unwrap(),
+                        })
+                        .unwrap_or(Self::Null);
                 }
                 match ArrayFormatter::try_new(col, options) {
                     Ok(fmt) => Self::Formatted {
@@ -348,7 +356,7 @@ impl<'a> JsonNode<'a> {
             Self::Scalar { array, .. }
             | Self::Formatted { array, .. }
             | Self::List { array, .. } => array.is_null(i),
-            Self::OwnedFormatted { array, .. } | Self::Dictionary(array) => array.is_null(i),
+            Self::Owned { array, .. } | Self::Dictionary(array) => array.is_null(i),
             Self::Struct { array, .. } => array.is_null(i),
             Self::Map { array, .. } => array.is_null(i),
         }
@@ -368,17 +376,7 @@ impl<'a> JsonNode<'a> {
                 scratch,
                 ..
             } => formatted_json(out, fmt, i, *number, &mut scratch.borrow_mut()),
-            Self::OwnedFormatted {
-                array,
-                number,
-                scratch,
-            } => {
-                let options = FormatOptions::default();
-                match ArrayFormatter::try_new(array.as_ref(), &options) {
-                    Ok(fmt) => formatted_json(out, &fmt, i, *number, &mut scratch.borrow_mut()),
-                    Err(_) => out.extend_from_slice(b"null"),
-                }
-            }
+            Self::Owned { array, read } => write_scalar(out, read(array.as_ref(), i)),
             Self::Dictionary(array) => {
                 let options = FormatOptions::default();
                 JsonNode::resolve(array.as_ref(), &options).write(out, i);
@@ -472,11 +470,49 @@ fn write_scalar(out: &mut Vec<u8>, value: Option<PropertyRef<'_>>) {
     };
 }
 
+/// Differential check: the production writer against the owned oracle, on the
+/// whole column and on a slice. Returns the oracle's values.
+#[cfg(test)]
+pub(in crate::overview::export) fn packed_column(
+    col: &dyn Array,
+) -> Vec<Option<crate::mvt::PropertyValue>> {
+    use super::super::extract_property_column;
+    let names: Arc<[Arc<str>]> = Arc::from(vec![Arc::from("property")]);
+    let packed = extract(std::iter::once(col), col.len()).unwrap();
+    let oracle = extract_property_column(col);
+    for (i, (row, value)) in packed.into_iter().zip(oracle.clone()).enumerate() {
+        let expected = PackedProps::pack(names.clone(), [value]);
+        let actual = row.finish(names.clone());
+        assert_eq!(
+            actual.bytes(),
+            expected.bytes(),
+            "{:?}, row {i}",
+            col.data_type()
+        );
+        actual.validate().unwrap();
+        let reload = PackedProps::from_spill(names.clone(), Arc::from(actual.bytes())).unwrap();
+        assert_eq!(reload.bytes(), expected.bytes());
+    }
+    if col.len() > 1 {
+        let sliced = col.slice(1, col.len() - 1);
+        let rows = extract(std::iter::once(sliced.as_ref()), sliced.len()).unwrap();
+        for (row, value) in rows
+            .into_iter()
+            .zip(extract_property_column(sliced.as_ref()))
+        {
+            assert_eq!(
+                row.finish(names.clone()).bytes(),
+                PackedProps::pack(names.clone(), [value]).bytes(),
+                "slice {:?}",
+                col.data_type()
+            );
+        }
+    }
+    oracle
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::super::extract_property_column;
-    use super::super::PackedProps;
-    use super::extract;
     use arrow_array::{builder::*, types::*, *};
     use arrow_buffer::i256;
     use arrow_schema::{DataType, Field};
@@ -500,41 +536,10 @@ mod tests {
         assert!(super::super::wire_len(u32::MAX as usize + 1).is_err());
     }
 
+    use super::packed_column;
+
     fn assert_column(col: &dyn Array) {
-        let names: Arc<[Arc<str>]> = Arc::from(vec![Arc::from("property")]);
-        let packed = extract(std::iter::once(col), col.len()).unwrap();
-        for (i, (row, value)) in packed
-            .into_iter()
-            .zip(extract_property_column(col))
-            .enumerate()
-        {
-            let expected = PackedProps::pack(names.clone(), [value]);
-            let actual = row.finish(names.clone());
-            assert_eq!(
-                actual.bytes(),
-                expected.bytes(),
-                "{:?}, row {i}",
-                col.data_type()
-            );
-            actual.validate().unwrap();
-            let reload = PackedProps::from_spill(names.clone(), Arc::from(actual.bytes())).unwrap();
-            assert_eq!(reload.bytes(), expected.bytes());
-        }
-        if col.len() > 1 {
-            let sliced = col.slice(1, col.len() - 1);
-            let rows = extract(std::iter::once(sliced.as_ref()), sliced.len()).unwrap();
-            for (row, value) in rows
-                .into_iter()
-                .zip(extract_property_column(sliced.as_ref()))
-            {
-                assert_eq!(
-                    row.finish(names.clone()).bytes(),
-                    PackedProps::pack(names.clone(), [value]).bytes(),
-                    "slice {:?}",
-                    col.data_type()
-                );
-            }
-        }
+        packed_column(col);
     }
 
     #[test]
@@ -725,5 +730,99 @@ mod tests {
         numeric_map.append(false).unwrap();
         numeric_map.append(true).unwrap();
         assert_column(&numeric_map.finish());
+    }
+
+    #[test]
+    fn nested_dictionary_temporal_and_decimal_leaves_match_owned_oracle() {
+        // list<dictionary<utf8>>: the dictionary sits inside a list.
+        let mut dict_list = ListBuilder::new(StringDictionaryBuilder::<Int8Type>::new());
+        dict_list.values().append_value("a");
+        dict_list.values().append_null();
+        dict_list.values().append_value("a");
+        dict_list.append(true);
+        dict_list.append(false);
+        dict_list.values().append_value("b");
+        dict_list.append(true);
+        assert_column(&dict_list.finish());
+
+        // struct{d: date32, n: naive timestamp, x: decimal256, u: UTC timestamps}
+        let mut fields = vec![
+            Arc::new(Field::new("d", DataType::Date32, true)),
+            Arc::new(Field::new(
+                "n",
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                true,
+            )),
+            Arc::new(Field::new("x", DataType::Decimal256(50, 2), true)),
+        ];
+        let mut cols: Vec<ArrayRef> = vec![
+            Arc::new(Date32Array::from(vec![Some(20710), None, Some(0)])),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                Some(1_789_389_296_123),
+                None,
+                Some(0),
+            ])),
+            Arc::new(
+                Decimal256Array::from(vec![
+                    Some(i256::from_i128(150)),
+                    None,
+                    Some(i256::from_i128(-990)),
+                ])
+                .with_precision_and_scale(50, 2)
+                .unwrap(),
+            ),
+        ];
+        // UTC timestamps in every unit and several UTC spellings, with nulls.
+        let values = [Some(1_789_389_296i64), None, Some(0)];
+        let times: Vec<(&str, ArrayRef)> = vec![
+            (
+                "s",
+                Arc::new(TimestampSecondArray::from(values.to_vec()).with_timezone("UTC")),
+            ),
+            (
+                "ms",
+                Arc::new(
+                    TimestampMillisecondArray::from(
+                        values.map(|v| v.map(|v| v * 1000 + 7)).to_vec(),
+                    )
+                    .with_timezone("+00:00"),
+                ),
+            ),
+            (
+                "us",
+                Arc::new(
+                    TimestampMicrosecondArray::from(
+                        values.map(|v| v.map(|v| v * 1_000_000 + 7)).to_vec(),
+                    )
+                    .with_timezone("Z"),
+                ),
+            ),
+            (
+                "ns",
+                Arc::new(
+                    TimestampNanosecondArray::from(
+                        values.map(|v| v.map(|v| v * 1_000_000_000 + 7)).to_vec(),
+                    )
+                    .with_timezone("utc"),
+                ),
+            ),
+        ];
+        for (name, col) in times {
+            fields.push(Arc::new(Field::new(name, col.data_type().clone(), true)));
+            cols.push(col);
+        }
+        let structure = StructArray::new(fields.into(), cols, None);
+        assert_column(&structure);
+        // The same struct inside a list, and under a dictionary.
+        let offsets = arrow_buffer::OffsetBuffer::new(vec![0, 2, 2, 3].into());
+        let item = Arc::new(Field::new("item", structure.data_type().clone(), true));
+        let list = ListArray::new(item, offsets, Arc::new(structure.clone()), None);
+        assert_column(&list);
+        let dictionary = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![Some(0), None, Some(2), Some(0)]),
+            Arc::new(structure),
+        )
+        .unwrap();
+        assert_column(&dictionary);
     }
 }
