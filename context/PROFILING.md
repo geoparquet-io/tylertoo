@@ -233,8 +233,9 @@ merge fit price is 1288 B/member. A million active members then price at
 These constants model geometry and property values alongside encoding and
 valve workspace. They are not fixed struct widths. The property price was
 208 B before packed rows (#874); a row's properties are now one shared byte
-buffer, and the 120 B is the measured slope of peak RSS over members
-(four numeric properties set it), not the buffer's size.
+buffer, and each property measured 80–110 B; 120 B is the smallest round value
+that covers every measured shape with properties (four numeric set it), not
+the buffer's size.
 
 The spill fill buffer charges a member its struct, 16 B per coordinate, and
 its packed row's bytes. Each spilled member carries its row bytes verbatim

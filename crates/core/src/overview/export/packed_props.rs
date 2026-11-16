@@ -506,11 +506,9 @@ mod tests {
                 let mut bad = row.bytes().to_vec();
                 bad[at] = value;
                 if let Ok(ok) = PackedProps::from_spill(names.clone(), bad.into()) {
-                    for (_, v) in ok.iter() {
-                        if let PropertyRef::String(s) = v {
-                            assert!(s.chars().count() <= s.len());
-                        }
-                    }
+                    let fast: Vec<_> = ok.iter().collect();
+                    let checked: Vec<_> = ok.checked_iter().collect::<Result<_, _>>().unwrap();
+                    assert_eq!(format!("{fast:?}"), format!("{checked:?}")); // Debug: NaN != NaN
                 }
             }
         }

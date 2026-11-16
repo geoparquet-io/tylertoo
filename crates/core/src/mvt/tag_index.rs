@@ -5,7 +5,7 @@ use std::{
     hash::{BuildHasher, Hasher, RandomState},
 };
 
-use super::{PropertyRef, PropertyValue, ScalarKey};
+use super::{PropertyRef, ScalarKey};
 
 pub(super) struct TagIndex<'a> {
     keys: HashMap<Cow<'a, str>, u32, TagHash>,
@@ -87,21 +87,6 @@ impl<'a> TagIndex<'a> {
             }
         }
         index
-    }
-
-    pub(super) fn tags<'p, K: AsRef<str>>(
-        &mut self,
-        properties: &'p [(K, PropertyValue)],
-        store: impl Fn(&'p str) -> Cow<'a, str>,
-        new_key: impl FnMut(&str),
-        mut new_value: impl FnMut(&PropertyValue),
-    ) -> Vec<u32> {
-        self.tags_ref(
-            properties.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
-            store,
-            new_key,
-            |v| new_value(&v.to_owned()),
-        )
     }
 
     pub(super) fn tags_ref<'p>(

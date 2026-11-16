@@ -596,8 +596,8 @@ takes once, and clones of the names (the canonical-level view) share it.
 The scan trusts the buffer: it borrows strings with `from_utf8_unchecked`.
 The proof is the construction boundary. Only the typed writers in
 `packed_props.rs` and `arrow.rs` produce bytes, each from a `&str`, Arrow's
-UTF-8 `Display` or `serde_json` output, and `Row::finish` rejects a table
-whose width differs from the columns written. The one constructor for
+UTF-8 `Display` or `serde_json` output, and `Row::finish` asserts (panics on) a table
+whose width differs from the columns written, an internal invariant. The one constructor for
 arbitrary bytes, `PackedProps::from_spill`, validates every tag, length,
 bool and UTF-8 run, and rejects trailing bytes. A value or row over 4 GiB
 fails the export with an error, since the lengths are `u32`.

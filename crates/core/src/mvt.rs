@@ -1736,8 +1736,8 @@ impl LayerBuilder {
 
     /// Encode tags as `[key_idx, value_idx, key_idx, value_idx, ...]`.
     fn encode_tags<K: AsRef<str>>(&mut self, properties: &[(K, PropertyValue)]) -> Vec<u32> {
-        self.index.tags(
-            properties,
+        self.index.tags_ref(
+            properties.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
             |s| std::borrow::Cow::Owned(s.to_owned()),
             |key| self.keys.push(key.to_owned()),
             |v| self.values.push(v.to_mvt_value()),
