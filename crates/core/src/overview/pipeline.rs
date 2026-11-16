@@ -2340,10 +2340,14 @@ mod spill_tests {
         }
     }
 
-    /// Exercise real convert admission and the production drain call site.
-    /// Only RSS headroom is injected: process-global HWM is test-order dependent.
-    #[test]
-    fn convert_spill_serial_fallback_matches_bounded_drain() {
+    /// Convert the fixture with `profile`, optionally failing the decode pool;
+    /// returns what the drain's decoders did, the pools that failed, and the
+    /// output bytes. Only RSS headroom is injected: process-global HWM is
+    /// test-order dependent.
+    fn convert_spilled(
+        profile: MemoryProfile,
+        fail_pool: bool,
+    ) -> (DecodeObservations, usize, Vec<u8>) {
         use arrow_array::StringArray;
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.parquet");
@@ -2369,7 +2373,7 @@ mod spill_tests {
                 min_zoom: 2,
                 max_zoom: 8,
             },
-            profile: MemoryProfile::Bounded,
+            profile,
             read_batch_size: 512,
             in_flight_batches: 16,
             spill_dir: Some(dir.path().to_owned()),
@@ -2380,38 +2384,67 @@ mod spill_tests {
             .thread_name(|i| format!("spill-test-{i}"))
             .build()
             .unwrap();
-        let mut parallel = None;
-        for fail_pool in [false, true] {
-            DECODES
-                .lock()
-                .unwrap()
-                .insert(dir.path().to_owned(), DecodeObservations::default());
-            pool.install(|| {
-                DRAIN_HEADROOM.with(|c| c.set(Some(1 << 30)));
-                crate::decode::FAIL_DECODE_POOL.with(|c| c.set(fail_pool));
-                let result =
-                    crate::overview::convert::convert_to_overviews(&input, &output, &options);
-                crate::decode::FAIL_DECODE_POOL.with(|c| c.set(false));
-                DRAIN_HEADROOM.with(|c| c.set(None));
-                result.unwrap();
-            });
-            let observed = DECODES.lock().unwrap().remove(dir.path()).unwrap();
-            eprintln!("real convert decoders (pool failure={fail_pool}): {observed:?}");
-            let bytes = std::fs::read(&output).unwrap();
-            if fail_pool {
-                assert_eq!(observed.indexed, 0, "failed pool must fall back to serial");
-                assert!(!observed.threads.is_empty(), "fallback must really decode");
-                assert_eq!(Some(bytes), parallel, "fallback changed output");
-            } else {
-                // #874 RA: `bounded` holds 4 batches in flight, so the drain
-                // has no read bytes to fund indexed decoders: it decodes
-                // serially on the read workers. `drain_tests` covers indexed
-                // decode directly.
-                assert_eq!(observed.indexed, 0, "bounded drain decodes serially");
-                assert!(!observed.threads.is_empty(), "the drain must decode");
-                parallel = Some(bytes);
-            }
-        }
+        DECODES
+            .lock()
+            .unwrap()
+            .insert(dir.path().to_owned(), DecodeObservations::default());
+        let failed = pool.install(|| {
+            DRAIN_HEADROOM.with(|c| c.set(Some(1 << 30)));
+            crate::decode::FAIL_DECODE_POOL.with(|c| c.set(fail_pool));
+            let before = crate::decode::FAILED_DECODE_POOLS.with(std::cell::Cell::get);
+            let result = crate::overview::convert::convert_to_overviews(&input, &output, &options);
+            let failed = crate::decode::FAILED_DECODE_POOLS.with(std::cell::Cell::get) - before;
+            crate::decode::FAIL_DECODE_POOL.with(|c| c.set(false));
+            DRAIN_HEADROOM.with(|c| c.set(None));
+            result.unwrap();
+            failed
+        });
+        let observed = DECODES.lock().unwrap().remove(dir.path()).unwrap();
+        eprintln!("real convert decoders ({profile:?}, pool failure={fail_pool}): {observed:?}");
+        (observed, failed, std::fs::read(&output).unwrap())
+    }
+
+    /// `bounded` holds 4 batches in flight, so the drain has no read bytes to
+    /// fund indexed decoders: it decodes serially on the read workers.
+    #[test]
+    fn convert_spill_bounded_drain_decodes_serially() {
+        let (observed, _, _) = convert_spilled(MemoryProfile::Bounded, false);
+        assert_eq!(observed.indexed, 0, "bounded drain decodes serially");
+        assert!(!observed.threads.is_empty(), "the drain must decode");
+    }
+
+    /// An `auto` run that spills on a small allowance gets a funded decode
+    /// width; exercise real convert admission, and the serial fallback when
+    /// the decode pool cannot be built.
+    #[test]
+    fn convert_spill_uses_multiple_decoders_and_serial_fallback() {
+        // A 128 MiB allowance makes `auto` spill this fixture. Env is
+        // process-global; nextest runs each test in its own process.
+        std::env::set_var("TYLERTOO_AUTO_MEM_LIMIT_BYTES", "134217728");
+        let (observed, failed, wide) = convert_spilled(MemoryProfile::Auto, false);
+        assert_eq!(failed, 0);
+        assert!(
+            observed.indexed > 4,
+            "multiple indexed windows must run: {observed:?}"
+        );
+        assert!(
+            observed.threads.len() > 1,
+            "more than one decoder must run: {observed:?}"
+        );
+        assert!(
+            observed.threads.len() <= 4,
+            "new decoder threads per level: {observed:?}"
+        );
+        assert_eq!(
+            observed.outside_pool, 0,
+            "decode escaped admitted pool: {observed:?}"
+        );
+        let (observed, failed, serial) = convert_spilled(MemoryProfile::Auto, true);
+        std::env::remove_var("TYLERTOO_AUTO_MEM_LIMIT_BYTES");
+        assert!(failed > 0, "the injected pool failure must fire");
+        assert_eq!(observed.indexed, 0, "failed pool must fall back to serial");
+        assert!(!observed.threads.is_empty(), "fallback must really decode");
+        assert_eq!(serial, wide, "fallback changed output");
     }
 
     /// A one-worker caller must execute indexed jobs while waiting for

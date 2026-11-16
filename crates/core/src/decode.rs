@@ -707,6 +707,9 @@ pub(crate) const DECODE_THREAD_STACK_BYTES: usize = 2 << 20;
 #[cfg(test)]
 thread_local! {
     pub(crate) static FAIL_DECODE_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Pools [`FAIL_DECODE_POOL`] made fail on this thread, so a test can
+    /// prove the injected failure ran.
+    pub(crate) static FAILED_DECODE_POOLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A decode pool capped by both `max_threads` and [`DECODE_THREADS`], or
@@ -721,6 +724,7 @@ pub(crate) fn decode_pool(
     }
     #[cfg(test)]
     if FAIL_DECODE_POOL.with(std::cell::Cell::get) {
+        FAILED_DECODE_POOLS.with(|c| c.set(c.get() + 1));
         return rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .spawn_handler(|_| Err(std::io::Error::other("injected decode pool failure")))
