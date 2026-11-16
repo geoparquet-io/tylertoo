@@ -16458,7 +16458,7 @@ mod tests {
 
         // 2026-09-14 = 20710 days after the Unix epoch.
         let dates = Date32Array::from(vec![Some(20710), None]);
-        let got = extract_property_column(&dates);
+        let got = packed_props::arrow::packed_column(&dates);
         assert_eq!(
             got[0],
             Some(PropertyValue::String("2026-09-14".to_string())),
@@ -16468,7 +16468,7 @@ mod tests {
 
         // 2026-09-14T12:34:56Z in microseconds.
         let ts = TimestampMicrosecondArray::from(vec![Some(1_789_389_296_000_000), None]);
-        let got = extract_property_column(&ts);
+        let got = packed_props::arrow::packed_column(&ts);
         let rendered = match &got[0] {
             Some(PropertyValue::String(s)) => s.clone(),
             other => panic!("TIMESTAMP must render as a string, got {other:?}"),
@@ -16483,7 +16483,7 @@ mod tests {
         let dec = Decimal128Array::from(vec![Some(150_i128), None])
             .with_precision_and_scale(4, 2)
             .unwrap();
-        let got = extract_property_column(&dec);
+        let got = packed_props::arrow::packed_column(&dec);
         match got[0] {
             Some(PropertyValue::Double(v)) => assert!(
                 (v - 1.5).abs() < 1e-9,
@@ -16512,7 +16512,7 @@ mod tests {
         let ts = TimestampMicrosecondArray::from(vec![Some(1_789_389_296_000_000), None])
             .with_data_type(dt.clone());
 
-        let got = extract_property_column(&ts);
+        let got = packed_props::arrow::packed_column(&ts);
         let rendered = match &got[0] {
             Some(PropertyValue::String(s)) => s.clone(),
             other => panic!("UTC-stamped TIMESTAMP must render as a string, got {other:?}"),
@@ -16921,7 +16921,7 @@ mod tests {
         let dec = Decimal128Array::from(vec![Some(id), None])
             .with_precision_and_scale(38, 0)
             .unwrap();
-        let got = extract_property_column(&dec);
+        let got = packed_props::arrow::packed_column(&dec);
         assert_eq!(
             got[0],
             Some(PropertyValue::Int(9_007_199_254_740_993)),
@@ -16935,7 +16935,7 @@ mod tests {
             .with_precision_and_scale(10, -3)
             .unwrap();
         assert_eq!(
-            extract_property_column(&neg)[0],
+            packed_props::arrow::packed_column(&neg)[0],
             Some(PropertyValue::Int(150_000))
         );
 
@@ -16944,7 +16944,7 @@ mod tests {
             .with_precision_and_scale(38, 0)
             .unwrap();
         assert!(matches!(
-            extract_property_column(&huge)[0],
+            packed_props::arrow::packed_column(&huge)[0],
             Some(PropertyValue::Double(_))
         ));
     }
@@ -16958,7 +16958,7 @@ mod tests {
         let dec = Decimal256Array::from(vec![Some(i256::from_i128(150)), None])
             .with_precision_and_scale(40, 2)
             .unwrap();
-        let got = extract_property_column(&dec);
+        let got = packed_props::arrow::packed_column(&dec);
         match got[0] {
             Some(PropertyValue::Double(v)) => {
                 assert!(
@@ -16979,7 +16979,7 @@ mod tests {
         // 2026-09-14T00:00:00 in milliseconds.
         let d64 = Date64Array::from(vec![Some(1_789_344_000_000)]);
         assert_eq!(
-            extract_property_column(&d64)[0],
+            packed_props::arrow::packed_column(&d64)[0],
             Some(PropertyValue::String("2026-09-14T00:00:00".to_string())),
             "Date64 keeps arrow's datetime rendering -- truncating would discard \
              a time component the type may legitimately carry"
@@ -16987,12 +16987,12 @@ mod tests {
 
         let t32 = Time32SecondArray::from(vec![Some(45_296)]);
         assert_eq!(
-            extract_property_column(&t32)[0],
+            packed_props::arrow::packed_column(&t32)[0],
             Some(PropertyValue::String("12:34:56".to_string()))
         );
 
         let t64 = Time64MicrosecondArray::from(vec![Some(45_296_000_000)]);
-        match &extract_property_column(&t64)[0] {
+        match &packed_props::arrow::packed_column(&t64)[0] {
             Some(PropertyValue::String(s)) => assert!(s.starts_with("12:34:56"), "got {s:?}"),
             other => panic!("Time64 must render as a string, got {other:?}"),
         }
@@ -17471,7 +17471,7 @@ mod tests {
         m.append(true).unwrap();
         m.append(true).unwrap(); // empty map
         let m = m.finish();
-        let got = extract_property_column(&m);
+        let got = packed_props::arrow::packed_column(&m);
         let rendered: Vec<&str> = got
             .iter()
             .map(|v| match v {
@@ -17487,7 +17487,7 @@ mod tests {
         // does not depend on which keys a batch happens to hold.
         let empty_only = m.slice(1, 1);
         assert_eq!(
-            extract_property_column(&empty_only)[0],
+            packed_props::arrow::packed_column(&empty_only)[0],
             Some(PropertyValue::String("[]".to_string()))
         );
     }
@@ -17518,7 +17518,7 @@ mod tests {
             Arc::new(dict),
             None,
         );
-        let got = extract_property_column(&list);
+        let got = packed_props::arrow::packed_column(&list);
         assert_eq!(
             got[0],
             Some(PropertyValue::String(
@@ -17569,7 +17569,7 @@ mod tests {
                 Arc::new(tags) as ArrayRef,
             ),
         ]);
-        let got = extract_property_column(&st);
+        let got = packed_props::arrow::packed_column(&st);
         let strings: Vec<Option<&str>> = got
             .iter()
             .map(|v| match v {
@@ -17601,7 +17601,7 @@ mod tests {
         m.append(true).unwrap();
         let m = m.finish();
         assert_eq!(
-            extract_property_column(&m)[0],
+            packed_props::arrow::packed_column(&m)[0],
             Some(PropertyValue::String(r#"[[1,"one"],[2,null]]"#.to_string()))
         );
 
@@ -17612,7 +17612,7 @@ mod tests {
         fsl.append(true);
         let fsl = fsl.finish();
         assert_eq!(
-            extract_property_column(&fsl)[0],
+            packed_props::arrow::packed_column(&fsl)[0],
             Some(PropertyValue::String("[1,2]".to_string()))
         );
         let mut ll = LargeListBuilder::new(StringBuilder::new());
@@ -17620,7 +17620,7 @@ mod tests {
         ll.append(true);
         let ll = ll.finish();
         assert_eq!(
-            extract_property_column(&ll)[0],
+            packed_props::arrow::packed_column(&ll)[0],
             Some(PropertyValue::String(r#"["say \"hi\""]"#.to_string()))
         );
 
@@ -17628,7 +17628,7 @@ mod tests {
         let dict: DictionaryArray<Int8Type> =
             vec![Some("a"), None, Some("b")].into_iter().collect();
         assert_eq!(
-            extract_property_column(&dict),
+            packed_props::arrow::packed_column(&dict),
             vec![
                 Some(PropertyValue::String("a".to_string())),
                 None,
@@ -17704,12 +17704,12 @@ mod tests {
             Arc::new(nested),
         ];
         for column in &columns {
-            let whole = extract_property_column(column.as_ref());
+            let whole = packed_props::arrow::packed_column(column.as_ref());
             assert!(whole.iter().any(Option::is_some));
             for offset in 0..column.len() {
                 for len in 0..=column.len() - offset {
                     assert_eq!(
-                        extract_property_column(column.slice(offset, len).as_ref()),
+                        packed_props::arrow::packed_column(column.slice(offset, len).as_ref()),
                         whole[offset..offset + len],
                         "{:?} rows {offset}..{}",
                         column.data_type(),
