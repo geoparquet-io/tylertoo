@@ -5336,8 +5336,8 @@ fn encode_member(buf: &mut Vec<u8>, m: &Member, names: &SpillNames) {
         None => buf.push(0),
     }
     put_u32(buf, names.id(&m.props.names));
-    put_u32(buf, m.props.data.len() as u32);
-    buf.extend_from_slice(&m.props.data);
+    put_u32(buf, m.props.bytes().len() as u32);
+    buf.extend_from_slice(m.props.bytes());
     encode_geometry(buf, &m.geom);
 }
 
@@ -5526,11 +5526,7 @@ fn decode_member(cur: &mut SpillCursor<'_>, names: &SpillNames) -> Result<Member
     let schema = cur.u32()? as usize;
     let names = names.tables.get(schema).ok_or_else(spill_corrupt)?.clone();
     let len = cur.u32()? as usize;
-    let props = SharedProps {
-        names,
-        data: Arc::from(cur.take(len)?),
-    };
-    props.validate()?;
+    let props = SharedProps::from_spill(names, Arc::from(cur.take(len)?))?;
     let geom = decode_geometry(cur)?;
     Ok(Member {
         key,

@@ -9,7 +9,7 @@ use crate::mvt::{PropertyRef, PropertyValue};
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct PackedProps {
     pub(super) names: Arc<[Arc<str>]>,
-    pub(super) data: Arc<[u8]>,
+    data: Arc<[u8]>,
 }
 
 impl PackedProps {
@@ -54,16 +54,30 @@ impl PackedProps {
         }
     }
 
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// The only constructor for bytes read from the process-private spill.
+    pub(super) fn from_spill(
+        names: Arc<[Arc<str>]>,
+        data: Arc<[u8]>,
+    ) -> Result<Self, super::ExportError> {
+        let row = Self { names, data };
+        row.validate()?;
+        Ok(row)
+    }
+
     pub(super) fn iter(&self) -> impl Iterator<Item = (&str, PropertyRef<'_>)> {
-        self.checked_iter()
+        self.checked_iter::<true>()
             .map(|p| p.expect("validated packed row"))
     }
 
     pub(super) fn validate(&self) -> Result<(), super::ExportError> {
-        self.checked_iter().try_for_each(|p| p.map(|_| ()))
+        self.checked_iter::<false>().try_for_each(|p| p.map(|_| ()))
     }
 
-    fn checked_iter(
+    fn checked_iter<const TRUSTED: bool>(
         &self,
     ) -> impl Iterator<Item = Result<(&str, PropertyRef<'_>), super::ExportError>> {
         let mut bytes = &*self.data;
@@ -82,10 +96,15 @@ impl PackedProps {
                             let len = prost::encoding::decode_varint(&mut bytes)
                                 .map_err(|_| super::spill_corrupt())?;
                             let len = usize::try_from(len).map_err(|_| super::spill_corrupt())?;
-                            PropertyRef::String(
-                                std::str::from_utf8(take(&mut bytes, len)?)
-                                    .map_err(|_| super::spill_corrupt())?,
-                            )
+                            let text = take(&mut bytes, len)?;
+                            PropertyRef::String(if TRUSTED {
+                                // SAFETY: private immutable data is constructed only by
+                                // pack (from &str) or from_spill (checked below). Parsing
+                                // uses the same tags and lengths as that validation.
+                                unsafe { trusted_text(text) }
+                            } else {
+                                std::str::from_utf8(text).map_err(|_| super::spill_corrupt())?
+                            })
                         }
                         2 => PropertyRef::Float(f32::from_bits(u32::from_le_bytes(
                             take(&mut bytes, 4)?.try_into().unwrap(),
@@ -141,6 +160,17 @@ impl PackedProps {
             .map(|(k, v)| (Arc::from(k), v.to_owned()))
             .collect()
     }
+}
+
+/// Borrow text from an immutable row after its construction boundary checked it.
+///
+/// # Safety
+/// `bytes` must be exactly a string payload written from a valid `&str`, or
+/// checked by `PackedProps::from_spill`, and must not have changed since.
+#[inline]
+unsafe fn trusted_text(bytes: &[u8]) -> &str {
+    // SAFETY: the caller carries the row's UTF-8 construction/validation proof.
+    unsafe { std::str::from_utf8_unchecked(bytes) }
 }
 
 fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], super::ExportError> {
@@ -272,5 +302,16 @@ mod tests {
         let mut tile = TileBuilder::new();
         tile.add_layer(materialized.build());
         assert_eq!(streaming.build(), tile.build().encode_to_vec());
+    }
+    #[test]
+    fn spill_reload_validates_utf8_before_trusted_iteration() {
+        let names: Arc<[Arc<str>]> = Arc::from(vec![Arc::from("s")]);
+        assert!(PackedProps::from_spill(names.clone(), Arc::from([1u8, 1, 0xff])).is_err());
+        let row = PackedProps::pack(names.clone(), [Some(PropertyValue::String("héllo".into()))]);
+        let back = PackedProps::from_spill(names, row.data.clone()).unwrap();
+        assert_eq!(
+            back.iter().collect::<Vec<_>>(),
+            vec![("s", PropertyRef::String("héllo"))]
+        );
     }
 }
