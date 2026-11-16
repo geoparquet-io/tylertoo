@@ -1584,7 +1584,7 @@ const MEMBER_MEMORY_INFLATION: u64 = 2;
 /// and its share of the full-tile MVT build in [`build_mvt`].
 ///
 /// The stored-bytes term alone under-counted points about 5×. Measured
-/// (2026-11, release build, aarch64, `export-pmtiles` of a z0 overview
+/// (2026-11-16, release build, aarch64, `export-pmtiles` of a z0 overview
 /// holding every one of 200k and 2M world-spread points, no tile caps, peak
 /// RSS slope between the two sizes), in bytes per row stored in the overview
 /// and per member resident. Properties are packed row buffers (#874), so
@@ -1592,19 +1592,19 @@ const MEMBER_MEMORY_INFLATION: u64 = 2;
 ///
 /// | shape | stored | properties | measured | estimate |
 /// |---|---|---|---|---|
-/// | Overture-shaped, four properties | 115 | 4 | 632 | 934 |
-/// | the same, `--exclude-all-properties` | 115 | 0 | 464 | 454 |
-/// | geometry only | 57 | 0 | 445 | 338 |
-/// | four numeric | 96 | 4 | 886 | 896 |
-/// | sixteen numeric | 213 | 16 | 2,337 | 2,570 |
-/// | four strings, one a 32-character id | 107 | 4 | 663 | 918 |
+/// | Overture-shaped, four properties | 115 | 4 | 618 | 934 |
+/// | the same, `--exclude-all-properties` | 115 | 0 | 460 | 454 |
+/// | geometry only | 57 | 0 | 432 | 338 |
+/// | four numeric | 96 | 4 | 879 | 896 |
+/// | sixteen numeric | 213 | 16 | 2,334 | 2,570 |
+/// | four strings, one a 32-character id | 107 | 4 | 647 | 918 |
 ///
 /// [`MEMBER_PROPERTY_BYTES`] is the smallest round value that covers every
 /// row with properties: four numeric sets it. Before packed rows the same
 /// shapes measured 843, 483, 448, 1,061, 2,857 and 815 on this host, and
 /// the price was 208. This constant is unchanged from the old layout and
 /// does not cover the two property-less rows on this host: the old layout
-/// missed them too (483 and 448 against 454 and 338). Raising it to 336
+/// missed them too (483 and 448 against 460 and 432). Raising it to 336
 /// would cover them and would narrow dense property-less levels' waves.
 const MEMBER_BASE_BYTES: u64 = 224;
 
@@ -1646,7 +1646,7 @@ fn export_member_resident_bytes(resident: u64, opts: &ExportOptions) -> u64 {
 /// level's mean stored bytes per row times [`MEMBER_MEMORY_INFLATION`], plus
 /// [`MEMBER_BASE_BYTES`] and [`MEMBER_PROPERTY_BYTES`] per published
 /// property. Biased high: it covers every measured shape with properties, by up
-/// to 55%; property-less members run up to 24% over (see [`MEMBER_BASE_BYTES`]).
+/// to 55%; property-less members run up to 22% over (see [`MEMBER_BASE_BYTES`]).
 fn member_resident_bytes(mean_stored_bytes: u64, properties: usize) -> u64 {
     mean_stored_bytes
         .saturating_mul(MEMBER_MEMORY_INFLATION)
@@ -5843,9 +5843,12 @@ impl MemberStore {
         let mut out = Vec::new();
         if let Some(spill) = self.spill.as_mut() {
             let segments = std::mem::take(&mut spill.segments[level][wave]);
-            out.reserve_exact(
-                segments.iter().map(|s| s.members).sum::<usize>() + self.buckets[level][wave].len(),
-            );
+            if !segments.is_empty() {
+                out.reserve_exact(
+                    segments.iter().map(|s| s.members).sum::<usize>()
+                        + self.buckets[level][wave].len(),
+                );
+            }
             let mut rest = segments.as_slice();
             while !rest.is_empty() {
                 let mut group_bytes = 0u64;
@@ -5877,7 +5880,13 @@ impl MemberStore {
         }
         let bytes = std::mem::take(&mut self.bucket_bytes[level][wave]);
         self.buffered_bytes -= bytes;
-        out.append(&mut self.buckets[level][wave]);
+        // Move a RAM wave's allocation into the drain. `append` on the
+        // stored bucket would retain it while the drain builds its buckets.
+        let mut members = std::mem::take(&mut self.buckets[level][wave]);
+        if out.is_empty() {
+            return Ok(members);
+        }
+        out.append(&mut members);
         Ok(out)
     }
 }
@@ -12269,7 +12278,7 @@ mod tests {
     #[test]
     fn member_resident_bytes_covers_the_665_calibration() {
         for (stored, properties, measured) in
-            [(115, 4, 632), (96, 4, 886), (213, 16, 2_337), (107, 4, 663)]
+            [(115, 4, 618), (96, 4, 879), (213, 16, 2_334), (107, 4, 647)]
         {
             let estimate = member_resident_bytes(stored, properties);
             assert!(
@@ -12278,16 +12287,16 @@ mod tests {
                  measured {measured} B, within 55%"
             );
         }
-        // The two property-less shapes (464 and 445 B measured) sit above
+        // The two property-less shapes (460 and 432 B measured) sit above
         // the base price on the aarch64 host (see [`MEMBER_BASE_BYTES`]):
-        // pin the known gaps (about 2% and 24%): the estimate may under-cover
+        // pin the known gaps (about 1% and 22%): the estimate may under-cover
         // the measured value by at most 25%.
-        for (stored, measured) in [(115, 464), (57, 445)] {
+        for (stored, measured) in [(115, 460), (57, 432)] {
             let estimate = member_resident_bytes(stored, 0);
             assert!(
                 estimate >= measured * 3 / 4,
                 "({stored} B, 0 properties): {estimate} B/member under-covers {measured} B by \
-                 more than 25% (known gaps: about 2% and 24%)"
+                 more than 25% (known gaps: about 1% and 22%)"
             );
         }
         assert_eq!(member_resident_bytes(u64::MAX, usize::MAX), u64::MAX);
@@ -19559,6 +19568,44 @@ mod tests {
         assert_eq!(held.len(), 4, "one geometry per feature");
     }
 
+    #[test]
+    fn member_store_ram_wave_reuses_its_allocation() {
+        let plans = vec![LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[10]),
+            wave: 1,
+        }];
+        for backing in [SinkBacking::Ram, SinkBacking::Spill] {
+            let mut store =
+                MemberStore::new(&plans, backing, MEMBER_STORE_RAM_BUDGET, None).unwrap();
+            for seq in 0..3 {
+                store
+                    .push(
+                        0,
+                        0,
+                        Member {
+                            key: 0,
+                            seq,
+                            geom: Geometry::Point(Point::new(seq as f64, -1.0)).into(),
+                            props: SharedProps::new(vec![]),
+                            id: None,
+                            gap: GAP_NONE,
+                            band: 0,
+                        },
+                    )
+                    .unwrap();
+            }
+            let allocation = store.buckets[0][0].as_ptr();
+            let members = store.take_wave(0, 0).unwrap();
+            assert_eq!(store.buckets[0][0].capacity(), 0, "drained bucket released");
+            assert_eq!(members.as_ptr(), allocation, "no second wave allocation");
+            assert_eq!(members.iter().map(|m| m.seq).collect::<Vec<_>>(), [0, 1, 2]);
+            assert_eq!(store.buffered_bytes, 0);
+            assert_eq!(store.bucket_bytes[0][0], 0);
+            assert!(store.take_wave(0, 0).unwrap().is_empty());
+        }
+    }
+
     /// The member store's spill path: bucket flushes append segments to one
     /// temp file; `take_wave` reads a wave's segments back in append order
     /// (plus any RAM remainder), returning exactly the members pushed to it.
@@ -19587,11 +19634,15 @@ mod tests {
         store.flush_bucket(0, 0).unwrap();
         store.push(0, 0, mk(0, 2)).unwrap();
         store.finish_fill().unwrap();
+        // Also exercise a RAM remainder after the completed spill segments.
+        store.push(0, 0, mk(0, 3)).unwrap();
 
         let w0 = store.take_wave(0, 0).unwrap();
         let w1 = store.take_wave(0, 1).unwrap();
-        assert_eq!(w0.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(w0.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 2, 3]);
         assert_eq!(w1.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1]);
+        assert!(store.buckets[0].iter().all(|bucket| bucket.capacity() == 0));
+        assert_eq!(store.buffered_bytes, 0);
         assert!(w0.iter().all(|m| m.key == 0));
         assert!(w1.iter().all(|m| m.key == 1));
         assert_eq!(
