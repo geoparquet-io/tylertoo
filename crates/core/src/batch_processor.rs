@@ -297,10 +297,10 @@ fn to_finite_geometry(
             .exterior()
             .map(|ring| line_string(&ring, finite))
             .unwrap_or_else(|| geo::LineString::new(vec![]));
-        let interiors = polygon
-            .interiors()
-            .map(|ring| line_string(&ring, finite))
-            .collect();
+        // `collect` allocates at least four slots for a non-TrustedLen
+        // iterator; reserve the known count instead.
+        let mut interiors = Vec::with_capacity(polygon.num_interiors());
+        interiors.extend(polygon.interiors().map(|ring| line_string(&ring, finite)));
         geo::Polygon::new(exterior, interiors)
     }
 
@@ -309,16 +309,16 @@ fn to_finite_geometry(
         GeometryType::LineString(line) => Geometry::LineString(line_string(line, &mut finite)),
         GeometryType::Polygon(poly) => Geometry::Polygon(polygon(poly, &mut finite)),
         GeometryType::MultiLineString(lines) => {
-            Geometry::MultiLineString(geo::MultiLineString::new(
+            let mut converted = Vec::with_capacity(lines.num_line_strings());
+            converted.extend(
                 lines
                     .line_strings()
-                    .map(|line| line_string(&line, &mut finite))
-                    .collect(),
-            ))
+                    .map(|line| line_string(&line, &mut finite)),
+            );
+            Geometry::MultiLineString(geo::MultiLineString::new(converted))
         }
         GeometryType::MultiPolygon(polygons) => {
-            // The trait iterator has no exact size hint. Reserve its known
-            // count so a single polygon does not allocate four slots.
+            // Reserve the known count: `collect` would allocate four slots.
             let mut converted = Vec::with_capacity(polygons.num_polygons());
             converted.extend(polygons.polygons().map(|poly| polygon(&poly, &mut finite)));
             Geometry::MultiPolygon(geo::MultiPolygon::new(converted))
@@ -417,22 +417,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finite_multipolygon_has_no_polygon_capacity_slack() {
-        for n in [0, 1, 5] {
-            let polygons = (0..n)
-                .map(|i| {
-                    let x = f64::from(i);
-                    geo::Rect::new((x, 0.0), (x + 0.5, 0.5)).to_polygon()
-                })
+    fn finite_geometry_has_no_vec_capacity_slack() {
+        let ring = |x: f64| {
+            geo::Rect::new((x, 0.0), (x + 0.5, 0.5))
+                .to_polygon()
+                .exterior()
+                .clone()
+        };
+        for n in [0, 1, 3] {
+            let x = |i: usize| i as f64;
+            let polygons: Vec<_> = (0..n)
+                .map(|i| geo::Rect::new((x(i), 0.0), (x(i) + 0.5, 0.5)).to_polygon())
                 .collect();
-            let original = Geometry::MultiPolygon(geo::MultiPolygon::new(polygons));
-            let converted =
-                to_finite_geometry(&original, &crate::diagnostics::Diagnostics::default()).unwrap();
-            assert_eq!(converted, original);
-            let Geometry::MultiPolygon(converted) = converted else {
-                panic!("expected MultiPolygon");
-            };
-            assert_eq!(converted.0.capacity(), converted.0.len());
+            let holed = geo::Polygon::new(ring(0.0), (0..n).map(|i| ring(x(i) + 10.0)).collect());
+            let lines: Vec<_> = (0..n).map(|i| ring(x(i))).collect();
+            let originals = [
+                Geometry::MultiPolygon(geo::MultiPolygon::new(polygons)),
+                Geometry::Polygon(holed),
+                Geometry::MultiLineString(geo::MultiLineString::new(lines)),
+            ];
+            for original in originals {
+                let converted =
+                    to_finite_geometry(&original, &crate::diagnostics::Diagnostics::default())
+                        .unwrap();
+                assert_eq!(converted, original);
+                let (cap, len) = match converted {
+                    Geometry::MultiPolygon(m) => (m.0.capacity(), m.0.len()),
+                    Geometry::Polygon(p) => {
+                        let v = p.into_inner().1;
+                        (v.capacity(), v.len())
+                    }
+                    Geometry::MultiLineString(m) => (m.0.capacity(), m.0.len()),
+                    _ => unreachable!(),
+                };
+                assert_eq!(cap, len);
+            }
         }
     }
 
