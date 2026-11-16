@@ -1645,7 +1645,8 @@ fn export_member_resident_bytes(resident: u64, opts: &ExportOptions) -> u64 {
 /// Estimated resident bytes of one clipped member (#311, #665): the finest
 /// level's mean stored bytes per row times [`MEMBER_MEMORY_INFLATION`], plus
 /// [`MEMBER_BASE_BYTES`] and [`MEMBER_PROPERTY_BYTES`] per published
-/// property. Biased high: it covers every measured shape, by up to 55%.
+/// property. Biased high: it covers every measured shape with properties, by up
+/// to 55%; property-less members run up to 24% over (see [`MEMBER_BASE_BYTES`]).
 fn member_resident_bytes(mean_stored_bytes: u64, properties: usize) -> u64 {
     mean_stored_bytes
         .saturating_mul(MEMBER_MEMORY_INFLATION)
@@ -5518,8 +5519,17 @@ fn decode_segment(buf: &[u8], names: &SpillNames) -> Result<Vec<Member>, ExportE
     // A member is never smaller than its fixed header, so a count the buffer
     // cannot hold is corrupt; never trust it for an allocation.
     let mut members = Vec::with_capacity(cur.bounded(n, MEMBER_WIRE_MIN));
+    // PERF (#803): one copy of each table per segment, so the pool threads
+    // decoding segments do not share one table's refcount.
+    let local = SpillNames {
+        tables: names
+            .tables
+            .iter()
+            .map(|t| t.iter().cloned().collect::<Vec<_>>().into())
+            .collect(),
+    };
     for _ in 0..n {
-        members.push(decode_member(&mut cur, names)?);
+        members.push(decode_member(&mut cur, &local)?);
     }
     if !cur.is_empty() {
         return Err(spill_corrupt());
@@ -19618,8 +19628,9 @@ mod tests {
     }
 
     /// #461: a wave read back from the spill shares one schema table per
-    /// distinct column set, across members and across segments, instead of
-    /// allocating names per member.
+    /// distinct column set within a segment, instead of allocating names per
+    /// member. Each segment gets its own copy, so the threads decoding
+    /// segments do not share one refcount (#803).
     #[test]
     fn member_store_spill_reload_shares_schema_tables() {
         let plans = vec![LevelPlan {
@@ -19652,12 +19663,16 @@ mod tests {
         store
             .push(0, 0, mk(1, vec![("rank".into(), PropertyValue::Int(1))]))
             .unwrap();
-        store.flush_bucket(0, 0).unwrap();
         store.push(0, 0, full(2)).unwrap();
+        store.flush_bucket(0, 0).unwrap();
+        store.push(0, 0, full(3)).unwrap();
         store.finish_fill().unwrap();
 
         let w = store.take_wave(0, 0).unwrap();
-        assert_eq!(w.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            w.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
         let names: Vec<_> = w[0].props.names().iter().map(|n| &**n).collect();
         assert_eq!(names, ["name", "rank"]);
         assert_eq!(
@@ -19667,11 +19682,16 @@ mod tests {
         );
         assert!(
             Arc::ptr_eq(w[0].props.names(), w[2].props.names()),
-            "equal tables share one handle across segments"
+            "equal tables share one handle within a segment"
         );
+        assert!(
+            !Arc::ptr_eq(w[0].props.names(), w[3].props.names()),
+            "each segment copies its tables"
+        );
+        assert_eq!(w[0].props.names(), w[3].props.names());
         assert_eq!(
-            w[2].props.iter().next().unwrap().1.to_owned(),
-            PropertyValue::String("f2".into())
+            w[3].props.iter().next().unwrap().1.to_owned(),
+            PropertyValue::String("f3".into())
         );
     }
 
