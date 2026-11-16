@@ -197,7 +197,7 @@ fn append_column(col: &dyn Array, rows: &mut [Row]) -> Result<(), ExportError> {
             ),
         }
     } else if is_json_encoded(col.data_type()) {
-        let node = JsonNode::resolve(col, &options);
+        let node = JsonNode::resolve(col, 0..col.len(), &options);
         for (i, row) in rows.iter_mut().enumerate() {
             if col.is_null(i) {
                 row.value(None)?;
@@ -214,7 +214,8 @@ fn append_column(col: &dyn Array, rows: &mut [Row]) -> Result<(), ExportError> {
 }
 
 /// Borrowed Arrow tree: it resolves structure once but never materializes leaf
-/// values. Offsets address the original children, so sliced lists remain cheap.
+/// values. Offsets address the original children, so sliced lists remain cheap;
+/// a node that does materialize (a cast) covers only the rows this slice reads.
 enum JsonNode<'a> {
     Scalar {
         array: &'a dyn Array,
@@ -226,10 +227,11 @@ enum JsonNode<'a> {
         number: bool,
         scratch: RefCell<String>,
     },
-    /// An array this node owns (a cast result), read like `Scalar`.
+    /// An array this node owns (a cast of rows `base..`), read like `Scalar`.
     Owned {
         array: ArrayRef,
         read: ScalarReader,
+        base: usize,
     },
     Struct {
         array: &'a arrow_array::StructArray,
@@ -246,7 +248,11 @@ enum JsonNode<'a> {
         keys: Box<JsonNode<'a>>,
         values: Box<JsonNode<'a>>,
     },
-    Dictionary(ArrayRef),
+    /// A flattened dictionary of rows `base..`, resolved per value.
+    Dictionary {
+        array: ArrayRef,
+        base: usize,
+    },
     Null,
 }
 
@@ -256,6 +262,13 @@ enum Offsets<'a> {
     Fixed(usize),
 }
 impl Offsets<'_> {
+    /// The child rows that `rows` of the parent reach.
+    fn span(&self, rows: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+        if rows.is_empty() {
+            return 0..0;
+        }
+        self.range(rows.start).start..self.range(rows.end - 1).end
+    }
     fn range(&self, i: usize) -> std::ops::Range<usize> {
         match self {
             Self::Small(o) => o[i] as usize..o[i + 1] as usize,
@@ -266,7 +279,14 @@ impl Offsets<'_> {
 }
 
 impl<'a> JsonNode<'a> {
-    fn resolve(col: &'a dyn Array, options: &'a FormatOptions<'a>) -> Self {
+    /// `rows` is the range of `col` that will be written. A sliced list or map
+    /// keeps its whole child array, so the casts below are restricted to the
+    /// rows the slice's offsets reach, not the batch's whole child.
+    fn resolve(
+        col: &'a dyn Array,
+        rows: std::ops::Range<usize>,
+        options: &'a FormatOptions<'a>,
+    ) -> Self {
         if let Some(read) = scalar_reader(col.data_type()) {
             return Self::Scalar { array: col, read };
         }
@@ -279,60 +299,81 @@ impl<'a> JsonNode<'a> {
                         .fields()
                         .iter()
                         .zip(a.columns())
-                        .map(|(f, c)| (f.name().as_str(), Self::resolve(c.as_ref(), options)))
+                        .map(|(f, c)| {
+                            (
+                                f.name().as_str(),
+                                Self::resolve(c.as_ref(), rows.clone(), options),
+                            )
+                        })
                         .collect(),
                 }
             }
             DataType::List(_) => {
                 let a = col.as_list::<i32>();
+                let offsets = Offsets::Small(a.value_offsets());
+                let child = offsets.span(&rows);
                 Self::List {
                     array: col,
-                    offsets: Offsets::Small(a.value_offsets()),
-                    values: Box::new(Self::resolve(a.values().as_ref(), options)),
+                    offsets,
+                    values: Box::new(Self::resolve(a.values().as_ref(), child, options)),
                 }
             }
             DataType::LargeList(_) => {
                 let a = col.as_list::<i64>();
+                let offsets = Offsets::Large(a.value_offsets());
+                let child = offsets.span(&rows);
                 Self::List {
                     array: col,
-                    offsets: Offsets::Large(a.value_offsets()),
-                    values: Box::new(Self::resolve(a.values().as_ref(), options)),
+                    offsets,
+                    values: Box::new(Self::resolve(a.values().as_ref(), child, options)),
                 }
             }
             DataType::FixedSizeList(_, _) => {
                 let a = col.as_fixed_size_list();
+                let offsets = Offsets::Fixed(a.value_length() as usize);
+                let child = offsets.span(&rows);
                 Self::List {
                     array: col,
-                    offsets: Offsets::Fixed(a.value_length() as usize),
-                    values: Box::new(Self::resolve(a.values().as_ref(), options)),
+                    offsets,
+                    values: Box::new(Self::resolve(a.values().as_ref(), child, options)),
                 }
             }
             DataType::Map(_, _) => {
                 let a = col.as_map();
+                let child = Offsets::Small(a.value_offsets()).span(&rows);
                 Self::Map {
                     array: a,
                     string_keys: is_string_type(a.keys().data_type()),
-                    keys: Box::new(Self::resolve(a.keys().as_ref(), options)),
-                    values: Box::new(Self::resolve(a.values().as_ref(), options)),
+                    keys: Box::new(Self::resolve(a.keys().as_ref(), child.clone(), options)),
+                    values: Box::new(Self::resolve(a.values().as_ref(), child, options)),
                 }
             }
-            DataType::Dictionary(_, value) => match arrow_cast::cast(col, value) {
-                Ok(flat) => match scalar_reader(flat.data_type()) {
-                    Some(read) => Self::Owned { array: flat, read },
-                    // A struct, list, map or temporal under a dictionary is rare:
-                    // it resolves per value.
-                    None => Self::Dictionary(flat),
-                },
-                Err(_) => Self::Null,
-            },
+            DataType::Dictionary(_, value) => {
+                let base = rows.start;
+                match arrow_cast::cast(&col.slice(base, rows.len()), value) {
+                    Ok(flat) => match scalar_reader(flat.data_type()) {
+                        Some(read) => Self::Owned {
+                            array: flat,
+                            read,
+                            base,
+                        },
+                        // A struct, list, map or temporal under a dictionary is
+                        // rare: it resolves per value.
+                        None => Self::Dictionary { array: flat, base },
+                    },
+                    Err(_) => Self::Null,
+                }
+            }
             dt if is_temporal_scalar(dt) || matches!(dt, DataType::Decimal256(_, _)) => {
                 let number = matches!(dt, DataType::Decimal256(_, _));
                 if let Some(array) = normalized_temporal(col) {
                     // Cast-to-text formats with the same default `FormatOptions`.
-                    return arrow_cast::cast(&array, &DataType::Utf8)
+                    let base = rows.start;
+                    return arrow_cast::cast(&array.slice(base, rows.len()), &DataType::Utf8)
                         .map(|array| Self::Owned {
                             array,
                             read: scalar_reader(&DataType::Utf8).unwrap(),
+                            base,
                         })
                         .unwrap_or(Self::Null);
                 }
@@ -356,7 +397,9 @@ impl<'a> JsonNode<'a> {
             Self::Scalar { array, .. }
             | Self::Formatted { array, .. }
             | Self::List { array, .. } => array.is_null(i),
-            Self::Owned { array, .. } | Self::Dictionary(array) => array.is_null(i),
+            Self::Owned { array, base, .. } | Self::Dictionary { array, base } => {
+                array.is_null(i - base)
+            }
             Self::Struct { array, .. } => array.is_null(i),
             Self::Map { array, .. } => array.is_null(i),
         }
@@ -376,11 +419,11 @@ impl<'a> JsonNode<'a> {
                 scratch,
                 ..
             } => formatted_json(out, fmt, i, *number, &mut scratch.borrow_mut()),
-            Self::Owned { array, read } => write_scalar(out, read(array.as_ref(), i)),
-            Self::Dictionary(array) => {
+            Self::Owned { array, read, base } => write_scalar(out, read(array.as_ref(), i - base)),
+            Self::Dictionary { array, base } => {
                 let options = FormatOptions::default();
                 // Resolve only this value: resolving the whole array per value is quadratic.
-                JsonNode::resolve(array.slice(i, 1).as_ref(), &options).write(out, 0);
+                JsonNode::resolve(array.slice(i - base, 1).as_ref(), 0..1, &options).write(out, 0);
             }
             Self::Struct { fields, .. } => {
                 out.push(b'{');
@@ -839,5 +882,50 @@ mod tests {
         assert_column(&dictionary);
         // Per-value resolves of the whole array took minutes here; this bound is generous.
         assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
+    }
+
+    /// A sliced list keeps its whole child array: the UTC cast and the
+    /// dictionary cast under it must cover only the child rows the slice
+    /// reaches, or every export chunk formats the batch's whole child.
+    #[test]
+    fn sliced_list_casts_only_the_child_rows_it_reaches() {
+        use super::{JsonNode, Offsets};
+        use arrow_cast::display::FormatOptions;
+        let rows = 1_000;
+        let time =
+            TimestampMillisecondArray::from_iter_values((0..2 * rows as i64).map(|v| v * 1_000))
+                .with_timezone("UTC");
+        let keys = Int32Array::from_iter_values((0..2 * rows as i32).map(|v| v % 7));
+        let words: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..7).map(|v| format!("w{v}")),
+        ));
+        let dictionary = DictionaryArray::<Int32Type>::try_new(keys, words).unwrap();
+        let offsets = arrow_buffer::OffsetBuffer::from_lengths(std::iter::repeat_n(2, rows));
+        let list = |values: ArrayRef| {
+            ListArray::new(
+                Arc::new(Field::new("item", values.data_type().clone(), true)),
+                offsets.clone(),
+                values,
+                None,
+            )
+        };
+        for column in [list(Arc::new(time)), list(Arc::new(dictionary))] {
+            let sliced = column.slice(500, 3);
+            let options = FormatOptions::default();
+            let node = JsonNode::resolve(&sliced, 0..sliced.len(), &options);
+            let JsonNode::List {
+                offsets: Offsets::Small(_),
+                values,
+                ..
+            } = node
+            else {
+                panic!("{:?} resolved to a non-list", column.data_type());
+            };
+            let JsonNode::Owned { array, base, .. } = *values else {
+                panic!("{:?} child did not cast", column.data_type());
+            };
+            assert_eq!((base, array.len()), (1_000, 6), "{:?}", column.data_type());
+            assert_column(&column);
+        }
     }
 }
