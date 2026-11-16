@@ -146,8 +146,9 @@ impl MemoryPhase {
     /// at the least: what a `bounded` grant may never exceed (#788). The
     /// read-ahead wanted what the caller asked for and was cut by the
     /// allowance, so its cap is `want` (the read shape applies the
-    /// per-worker caps itself, `read.rs`); the compute window's in-flight
-    /// depth is capped at 4 on top ([`MemoryBudget::pass2_in_flight`]). The
+    /// per-worker caps itself, `read.rs`); pass 2's total in-flight
+    /// depth (read-ahead channel plus compute window) is capped at 4
+    /// ([`MemoryBudget::pass2_in_flight`]). The
     /// writer encoded at most [`ENCODE_FLOOR`] row groups, which is the
     /// encode floor. Export and fill held no store under `bounded`: their
     /// floor is main's shape. Remote staging held at most main's staging
