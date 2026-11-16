@@ -1580,33 +1580,39 @@ const PARTITION_SLOT_TRANSIENT_BYTES: u64 = 64 * 1024 * 1024;
 const MEMBER_MEMORY_INFLATION: u64 = 2;
 
 /// Resident bytes of one clipped member beyond its inflated stored bytes,
-/// before any property (#665): the `Member` struct (96 B), allocator slack,
+/// before any property (#665): the `Member` struct (128 B), allocator slack,
 /// and its share of the full-tile MVT build in [`build_mvt`].
 ///
 /// The stored-bytes term alone under-counted points about 5×. Measured
-/// (2026-10, release build, one z0 `--verbatim` tile of world-spread points,
-/// peak RSS slope between 200k and 2M members), in bytes per row stored and
-/// per member resident:
+/// (2026-11, release build, aarch64, `export-pmtiles` of a z0 overview
+/// holding every one of 200k and 2M world-spread points, no tile caps, peak
+/// RSS slope between the two sizes), in bytes per row stored in the overview
+/// and per member resident. Properties are packed row buffers (#874), so
+/// they cost their bytes, not a slot, a string and tag entries each:
 ///
 /// | shape | stored | properties | measured | estimate |
 /// |---|---|---|---|---|
-/// | Overture-shaped, four properties | 105 | 4 | 1,044 | 1,266 |
-/// | the same, `--exclude-all-properties` | 105 | 0 | ~320 | 434 |
-/// | geometry only | 57 | 0 | 325 | 338 |
-/// | four numeric | 87 | 4 | 916 | 1,230 |
-/// | sixteen numeric | 213 | 16 | 3,960 | 3,978 |
-/// | four strings, one a 32-character id | 112 | 4 | 1,197 | 1,280 |
+/// | Overture-shaped, four properties | 115 | 4 | 632 | 917 |
+/// | the same, `--exclude-all-properties` | 115 | 0 | 464 | 453 |
+/// | geometry only | 57 | 0 | 445 | 338 |
+/// | four numeric | 96 | 4 | 886 | 896 |
+/// | sixteen numeric | 213 | 16 | 2,337 | 2,570 |
+/// | four strings, one a 32-character id | 107 | 4 | 663 | 917 |
 ///
-/// The two constants are the smallest round values that cover every row:
-/// geometry only sets this one, sixteen numeric properties set
-/// [`MEMBER_PROPERTY_BYTES`].
+/// [`MEMBER_PROPERTY_BYTES`] is the smallest round value that covers every
+/// row with properties: four numeric sets it. Before packed rows the same
+/// shapes measured 843, 483, 448, 1,061, 2,857 and 815 on this host, and
+/// the price was 208. This constant is unchanged from the old layout and
+/// does not cover the two property-less rows on this host: the old layout
+/// missed them too (483 and 448 against 453 and 338). Raising it to 336
+/// would cover them and would narrow dense property-less levels' waves.
 const MEMBER_BASE_BYTES: u64 = 224;
 
-/// Resident bytes each published property adds to one member (#665): the
-/// `(Arc<str>, PropertyValue)` slot, any owned `String`, and the MVT tag
-/// entries. Measured at 130–230 B each, numeric or string; see
-/// [`MEMBER_BASE_BYTES`] for the fit.
-const MEMBER_PROPERTY_BYTES: u64 = 208;
+/// Resident bytes each published property adds to one member (#665, #874):
+/// its tag, length and payload in the packed row, plus the MVT tag entries.
+/// Measured at 80–110 B each, numeric or string; see [`MEMBER_BASE_BYTES`]
+/// for the fit.
+const MEMBER_PROPERTY_BYTES: u64 = 120;
 
 /// Extra transient bytes per member when the size valve can merge: grouping,
 /// quantized polygons, interactions and union work alongside collected members.
@@ -1639,7 +1645,7 @@ fn export_member_resident_bytes(resident: u64, opts: &ExportOptions) -> u64 {
 /// Estimated resident bytes of one clipped member (#311, #665): the finest
 /// level's mean stored bytes per row times [`MEMBER_MEMORY_INFLATION`], plus
 /// [`MEMBER_BASE_BYTES`] and [`MEMBER_PROPERTY_BYTES`] per published
-/// property. Biased high: it covers every measured shape, by up to 40%.
+/// property. Biased high: it covers every measured shape, by up to 55%.
 fn member_resident_bytes(mean_stored_bytes: u64, properties: usize) -> u64 {
     mean_stored_bytes
         .saturating_mul(MEMBER_MEMORY_INFLATION)
@@ -5548,21 +5554,11 @@ fn decode_member(cur: &mut SpillCursor<'_>, names: &SpillNames) -> Result<Member
 }
 
 /// Rough in-RAM cost of one buffered member, for the fill-phase budget only
-/// (never output-bound): struct + `Vec` headers, 16 B per coordinate, and the
-/// property payload (spilled per member, so counted per member). Keep the
-/// historical 16 B name-handle charge in this prototype to preserve fill
-/// decisions while measuring the representation alone.
+/// (never output-bound): the struct, 16 B per coordinate, and the packed
+/// property row (spilled per member, so counted per member). The row's
+/// schema table is shared and not charged (#461).
 fn member_bytes_estimate(m: &Member) -> usize {
-    64 + m.geom.coords_count() * 16
-        + m.props
-            .iter()
-            .map(|(_, v)| {
-                16 + match v {
-                    PropertyRef::String(s) => s.len(),
-                    _ => 8,
-                }
-            })
-            .sum::<usize>()
+    std::mem::size_of::<Member>() + m.geom.coords_count() * 16 + m.props.bytes().len()
 }
 
 /// The single spill file behind a [`MemberStore`]: bucket flushes append
@@ -12272,23 +12268,24 @@ mod tests {
     }
 
     /// #665: the resident model covers every shape it was calibrated on,
-    /// by at most 40%. Rows are (stored B/row, published properties,
+    /// by at most 55%. Rows are (stored B/row, published properties,
     /// measured B/member); see [`MEMBER_BASE_BYTES`].
     #[test]
     fn member_resident_bytes_covers_the_665_calibration() {
         for (stored, properties, measured) in [
-            (105, 4, 1_044),
-            (105, 0, 320),
-            (57, 0, 325),
-            (87, 4, 916),
-            (213, 16, 3_960),
-            (112, 4, 1_197),
+            // The two property-less shapes (464 and 445 B measured) sit
+            // above the base price on the aarch64 host; see
+            // [`MEMBER_BASE_BYTES`].
+            (115, 4, 632),
+            (96, 4, 886),
+            (213, 16, 2_337),
+            (107, 4, 663),
         ] {
             let estimate = member_resident_bytes(stored, properties);
             assert!(
-                (measured..=measured * 7 / 5).contains(&estimate),
+                (measured..=measured * 31 / 20).contains(&estimate),
                 "({stored} B, {properties} properties): {estimate} B/member must cover the \
-                 measured {measured} B, within 40%"
+                 measured {measured} B, within 55%"
             );
         }
         assert_eq!(member_resident_bytes(u64::MAX, usize::MAX), u64::MAX);
@@ -19640,10 +19637,10 @@ mod tests {
         );
     }
 
-    /// The fill-phase budget's per-member cost: 48 B of headers, 16 B per
-    /// coordinate, and per property a 16 B name handle plus the value
-    /// payload (string bytes, else 8 B). The name text is not charged: it
-    /// lives once in the per-schema table (#461).
+    /// The fill-phase budget's per-member cost: the `Member` struct, 16 B per
+    /// coordinate, and the packed row's bytes (a tag per column, a 4 B length
+    /// and the text for a string, else the 1-8 B payload). The schema table
+    /// is shared and not charged (#461).
     #[test]
     fn member_bytes_estimate_charges_handles_and_payloads() {
         let m = |props: Vec<(Arc<str>, PropertyValue)>| Member {
@@ -19655,14 +19652,15 @@ mod tests {
             gap: GAP_NONE,
             band: 0,
         };
-        assert_eq!(member_bytes_estimate(&m(vec![])), 64 + 2 * 16);
+        let base = std::mem::size_of::<Member>() + 2 * 16;
+        assert_eq!(member_bytes_estimate(&m(vec![])), base);
         let long_name: Arc<str> = "a_very_long_property_name".into();
         assert_eq!(
             member_bytes_estimate(&m(vec![
                 (long_name, PropertyValue::String("hello world!".into())),
                 ("rank".into(), PropertyValue::Int(7)),
             ])),
-            64 + 2 * 16 + (16 + 12) + (16 + 8)
+            base + (1 + 4 + 12) + (1 + 8)
         );
     }
 
