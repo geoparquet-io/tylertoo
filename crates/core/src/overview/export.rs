@@ -1645,8 +1645,9 @@ fn export_member_resident_bytes(resident: u64, opts: &ExportOptions) -> u64 {
 /// Estimated resident bytes of one clipped member (#311, #665): the finest
 /// level's mean stored bytes per row times [`MEMBER_MEMORY_INFLATION`], plus
 /// [`MEMBER_BASE_BYTES`] and [`MEMBER_PROPERTY_BYTES`] per published
-/// property. Biased high: it covers every measured shape with properties, by up
-/// to 55%; property-less members run up to 22% over (see [`MEMBER_BASE_BYTES`]).
+/// property. It over-estimates every measured shape with properties, by up
+/// to 51%; for property-less members it falls short by up to 22% (they measure
+/// up to 28% above it; see [`MEMBER_BASE_BYTES`]).
 fn member_resident_bytes(mean_stored_bytes: u64, properties: usize) -> u64 {
     mean_stored_bytes
         .saturating_mul(MEMBER_MEMORY_INFLATION)
@@ -5836,8 +5837,8 @@ impl MemberStore {
     /// the output — `encode_members` sorts by the unique `(key, seq)`.
     ///
     /// Segments are read in groups of about [`SPILL_READ_GROUP_BYTES`] and
-    /// each group's segments decoded in parallel (#740), borrowing schema
-    /// tables retained beside the spill for the lifetime of this store.
+    /// each group's segments decoded in parallel (#740). Each segment copies the
+    /// schema tables retained beside the spill once, and its members share that copy.
     fn take_wave(&mut self, level: usize, wave: usize) -> Result<Vec<Member>, ExportError> {
         use std::io::{Read, Seek, SeekFrom};
         let mut out = Vec::new();
