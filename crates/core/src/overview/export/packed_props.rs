@@ -6,7 +6,8 @@ use crate::mvt::PropertyRef;
 #[cfg(test)]
 use crate::mvt::PropertyValue;
 
-/// Names are shared across the export; only `data` is allocated per row.
+/// Each chunk has its own name table (deduplicated by content in the spill);
+/// only `data` is allocated per row.
 /// Each schema column has a tag (0 = absent). Text lengths are fixed u32s; numeric payloads preserve their exact little-endian bits.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct PackedProps {

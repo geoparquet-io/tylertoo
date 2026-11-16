@@ -10326,7 +10326,6 @@ fn batch_geometry_index(batch: &RecordBatch, geometry: Option<&str>) -> Result<u
 /// a source column that was moved aside from it.
 #[derive(Debug, Clone, Default)]
 struct PublishedNames {
-    packed_names: Arc<std::sync::Mutex<Vec<PropertyNames>>>,
     /// Schema field name → published key, for the columns that differ.
     /// Empty for the identity mapping, which is the overwhelmingly common
     /// case (nothing collided, or the file predates the provenance).
@@ -10381,7 +10380,6 @@ impl PublishedNames {
             geometry: None,
             properties: None,
             canonical: None,
-            packed_names: Default::default(),
         }
     }
 
@@ -10432,7 +10430,6 @@ impl PublishedNames {
             geometry: descriptor.geometry_name().map(str::to_owned),
             properties: Some(descriptor.properties().iter().copied().collect()),
             canonical: None,
-            packed_names: Default::default(),
         };
         names
     }
@@ -10724,23 +10721,11 @@ impl<'a> AttrColumns<'a> {
             .into_iter()
             .map(|(idx, name)| (idx, Arc::<str>::from(name)))
             .collect();
-        let candidate: PropertyNames = props
+        let names: PropertyNames = props
             .iter()
             .map(|(_, n)| n.clone())
             .collect::<Vec<_>>()
             .into();
-        let mut tables = published
-            .packed_names
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let names = tables
-            .iter()
-            .find(|n| ***n == *candidate)
-            .cloned()
-            .unwrap_or_else(|| {
-                tables.push(candidate.clone());
-                candidate
-            });
         Self {
             props,
             names,
@@ -12285,13 +12270,14 @@ mod tests {
         }
         // The two property-less shapes (464 and 445 B measured) sit above
         // the base price on the aarch64 host (see [`MEMBER_BASE_BYTES`]):
-        // pin the known gap so it cannot grow past a third.
+        // pin the known gaps (about 2% and 24%): the estimate may under-cover
+        // the measured value by at most 25%.
         for (stored, measured) in [(115, 464), (57, 445)] {
             let estimate = member_resident_bytes(stored, 0);
             assert!(
                 estimate >= measured * 3 / 4,
                 "({stored} B, 0 properties): {estimate} B/member under-covers {measured} B by \
-                 more than the known 25-32%"
+                 more than 25% (known gaps: about 2% and 24%)"
             );
         }
         assert_eq!(member_resident_bytes(u64::MAX, usize::MAX), u64::MAX);
@@ -16738,45 +16724,6 @@ mod tests {
         for row in &rows {
             assert!(Arc::ptr_eq(row.names().last().unwrap(), rank_key));
         }
-    }
-
-    /// One schema table per distinct published column set, shared by every
-    /// batch, thread and level view of an export; a different set gets its
-    /// own table.
-    #[test]
-    fn schema_tables_are_shared_per_published_column_set() {
-        let schema = |extra: bool| {
-            let mut fields = vec![
-                Field::new("name", DataType::Utf8, true),
-                Field::new("geometry", DataType::Binary, true),
-            ];
-            if extra {
-                fields.push(Field::new("rank", DataType::Int64, true));
-            }
-            Schema::new(fields)
-        };
-        let published = PublishedNames::identity();
-        let narrow = schema(false);
-        let wide = schema(true);
-        let tables: Vec<PropertyNames> = std::thread::scope(|scope| {
-            let jobs: Vec<_> = (0..16)
-                .map(|i| {
-                    let (published, schema) =
-                        (&published, if i % 2 == 0 { &narrow } else { &wide });
-                    scope.spawn(move || AttrColumns::new(schema, 1, published, None).names)
-                })
-                .collect();
-            jobs.into_iter().map(|j| j.join().unwrap()).collect()
-        });
-        for (i, table) in tables.iter().enumerate() {
-            assert!(Arc::ptr_eq(table, &tables[i % 2]), "thread {i}");
-        }
-        assert!(!Arc::ptr_eq(&tables[0], &tables[1]));
-        assert_eq!(tables[0].len(), 1);
-        assert_eq!(tables[1].len(), 2);
-        // A level view cloned from the same names shares the cache.
-        let again = AttrColumns::new(&narrow, 1, &published.clone(), None).names;
-        assert!(Arc::ptr_eq(&again, &tables[0]));
     }
 
     /// A spilled member read back with every byte truncated or altered is
