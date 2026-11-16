@@ -139,6 +139,8 @@ mod shard;
 mod stats;
 mod sutherland_hodgman;
 #[cfg(test)]
+pub(crate) mod test_env;
+#[cfg(test)]
 pub(crate) mod test_log;
 mod tile;
 mod tile_format;

@@ -3693,31 +3693,8 @@ mod staging_counter_tests {
     const COALESCE_VAR: &str = "TYLERTOO_STAGING_COALESCE_BYTES";
     const CONCURRENCY_VAR: &str = "TYLERTOO_STAGING_CONCURRENCY";
 
-    /// Runs the named test of this module alone in a child process with
-    /// `vars` set, so the process-wide staging tunables (read once from the
-    /// environment) are exactly these. Returns `true` inside that child,
-    /// where the caller runs its body, and `false` in the parent once the
-    /// child has passed. Same shape as `run_in_child` in `input::remote`.
     fn run_in_child(test: &str, vars: &[(&str, &str)]) -> bool {
-        const CHILD: &str = "TYLERTOO_ENV_TEST_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            return true;
-        }
-        let (_, module) = module_path!().split_once("::").expect("crate::module path");
-        let name = format!("{module}::{test}");
-        let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
-            .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
-            .env(CHILD, "1")
-            .envs(vars.iter().copied())
-            .output()
-            .expect("re-run the test binary");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "{name} failed in its own process:\n{stdout}\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        false
+        crate::test_env::run_in_child(module_path!(), test, vars)
     }
 
     /// `groups` row groups of `rows` rows, columns `a: Int64`, `b: Utf8`,

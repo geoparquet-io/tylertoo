@@ -345,9 +345,15 @@ fn pass0_json(record: Option<&Pass0Record>) -> serde_json::Value {
 /// chosen depth alongside the detected core count, so core utilization is
 /// observable rather than a mystery (#264; shared by pass 1 and pass 2 as of
 /// #460, since both now run a dedicated reader thread ahead of a bounded
-/// channel — `phase` names which one in the log line, e.g. `"pass 1"`).
-fn resolve_and_log_in_flight_batches(phase: &str, requested: usize) -> usize {
-    let in_flight = super::convert::resolve_in_flight_batches(requested);
+/// channel — `phase` names which one in the log line, e.g. `"pass 1"`). `cap`
+/// is the owner's ceiling (`MemoryBudget`), applied before the log so the
+/// logged depth is the one used.
+fn resolve_and_log_in_flight_batches(
+    phase: &str,
+    requested: usize,
+    cap: impl FnOnce(usize) -> usize,
+) -> usize {
+    let in_flight = cap(super::convert::resolve_in_flight_batches(requested));
     log::info!(
         "[convert] {phase} parallelism: {in_flight} read batch(es) in flight ({} core(s) detected)",
         std::thread::available_parallelism()
@@ -3928,7 +3934,10 @@ pub(crate) fn run_stages(
     // every candidate collapsed during simplification (#211).
     // Resolve the in-flight depth once (auto-sizes from available cores when
     // the caller left it at IN_FLIGHT_BATCHES_AUTO) and surface it (#264).
-    let in_flight_batches = resolve_and_log_in_flight_batches("pass 2", options.in_flight_batches);
+    let in_flight_batches =
+        resolve_and_log_in_flight_batches("pass 2", options.in_flight_batches, |n| {
+            MemoryBudget::pass2_in_flight(options.profile, n)
+        });
 
     let (level_stats, pass2_engine_timers, sink_measurement, pass2_ledger) = run_pass2_levels(
         budget,
@@ -6318,7 +6327,7 @@ fn run_pass1_with_chunk_rows(
     let t_pass1_fn = Instant::now();
     let pass1_timers = Pass1Timers::default();
     let timers_ref = &pass1_timers;
-    let in_flight = resolve_and_log_in_flight_batches("pass 1", options.in_flight_batches);
+    let in_flight = resolve_and_log_in_flight_batches("pass 1", options.in_flight_batches, |n| n);
     log::debug!("[profile] pass1 chunk_rows={chunk_rows}");
 
     let mut features = FeatureTable::new();
@@ -10072,7 +10081,7 @@ mod tests {
         for phase in ["pass 1", "pass 2"] {
             for (name, requested, expected) in cases {
                 assert_eq!(
-                    resolve_and_log_in_flight_batches(phase, requested),
+                    resolve_and_log_in_flight_batches(phase, requested, |n| n),
                     expected,
                     "{phase}: {name} (requested {requested})"
                 );
@@ -10080,7 +10089,7 @@ mod tests {
         }
         // The auto depth is never outside the clamps, whatever the box, and
         // tracks the core count exactly when that count lies inside them.
-        let auto = resolve_and_log_in_flight_batches("pass 1", IN_FLIGHT_BATCHES_AUTO);
+        let auto = resolve_and_log_in_flight_batches("pass 1", IN_FLIGHT_BATCHES_AUTO, |n| n);
         assert!(
             (IN_FLIGHT_BATCHES_MIN..=IN_FLIGHT_BATCHES_MAX).contains(&auto),
             "auto depth {auto} outside [{IN_FLIGHT_BATCHES_MIN}, {IN_FLIGHT_BATCHES_MAX}]"
@@ -10094,7 +10103,7 @@ mod tests {
         // Auto and an explicit request for the same depth resolve identically:
         // the sentinel adds nothing a caller could not have asked for.
         assert_eq!(
-            resolve_and_log_in_flight_batches("pass 2", auto),
+            resolve_and_log_in_flight_batches("pass 2", auto, |n| n),
             auto,
             "an explicit request for the auto depth must resolve to itself"
         );
@@ -10160,7 +10169,7 @@ mod tests {
             .unwrap_or(IN_FLIGHT_BATCHES_MIN);
         assert_eq!(
             resolve(IN_FLIGHT_BATCHES_AUTO, cores),
-            resolve_and_log_in_flight_batches("pass 1", IN_FLIGHT_BATCHES_AUTO)
+            resolve_and_log_in_flight_batches("pass 1", IN_FLIGHT_BATCHES_AUTO, |n| n)
         );
     }
 
