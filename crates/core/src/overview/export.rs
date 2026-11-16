@@ -89,22 +89,23 @@
 //! `>=` the overview level's feature count, the excess being border
 //! duplication.
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
-
-use super::config::ConfigError;
-use arrow_array::cast::AsArray;
-use arrow_array::types::{
-    Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::File,
+    io::BufWriter,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant},
 };
-use arrow_array::{Array, RecordBatch};
+
+use arrow_array::{
+    cast::AsArray,
+    types::{
+        Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    },
+    Array, RecordBatch,
+};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType, Schema};
 use crossbeam_channel::{Receiver, Sender};
@@ -117,41 +118,47 @@ use rayon::prelude::*;
 use serde::Serialize;
 use tempfile::NamedTempFile;
 
-use crate::batch_processor::extract_geometries_from_array;
-use crate::clip::{clip_geometry_simple, geometry_is_simple};
+use super::{
+    coalesce::COALESCED_COUNT_COLUMN,
+    config::ConfigError,
+    convert::{
+        human_bytes, resolve_pass_read_workers, skip_memory_preflight_from_env, ConvertError,
+        READ_WORKERS_AUTO, SKIP_MEMORY_PREFLIGHT_ENV,
+    },
+    level::{zoom_for_gsd, Crs, MemoryProfile, Mode, OverviewsMeta},
+    memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis},
+    pipe::scoped_pipe,
+    pipeline::{
+        available_memory_bytes, probe_oom_memory_limit, sink_backing, MemoryLimit,
+        MemoryLimitSource, SinkBacking,
+    },
+    properties::PropertySelection,
+    read::{footer_price, read_in_order_capped, ReadFlow, ReadPass, ReadTuning},
+    reader::{OverviewReader, ReaderError},
+    stream::{
+        add_nanos, preflight_profile_json_path, profile_json_target, sample_rss_peak,
+        write_export_profile_json, ExportPhaseWalls, ExportProfileJsonInputs, ExportTimers,
+        ExportZoomProfile, RssSampler, RssSamplerReport,
+    },
+    writer::LEVEL_COLUMN,
+};
 #[cfg(test)]
 use crate::compression;
-use crate::compression::{Compression, TileGzipCache};
-use crate::dedup::TileHasher;
-use crate::mvt::{EncodedFeatureGeometry, PropertyValue};
 #[cfg(test)]
 use crate::mvt::{LayerBuilder, TileBuilder};
-use crate::pmtiles_writer::StreamingPmtilesWriter;
-use crate::tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord, MAX_ZOOM};
-use crate::vector_tile::tile::GeomType;
-use crate::TilesetMetadata;
-
-use super::coalesce::COALESCED_COUNT_COLUMN;
-use super::convert::{human_bytes, skip_memory_preflight_from_env, SKIP_MEMORY_PREFLIGHT_ENV};
-use super::convert::{resolve_pass_read_workers, ConvertError, READ_WORKERS_AUTO};
-use super::level::{zoom_for_gsd, Crs, MemoryProfile, Mode, OverviewsMeta};
-use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
-use super::pipe::scoped_pipe;
-use super::pipeline::{
-    available_memory_bytes, probe_oom_memory_limit, sink_backing, MemoryLimit, MemoryLimitSource,
-    SinkBacking,
+use crate::{
+    batch_processor::extract_geometries_from_array,
+    clip::{clip_geometry_simple, geometry_is_simple},
+    compression::{Compression, TileGzipCache},
+    dedup::TileHasher,
+    input::InputError,
+    input_set::{ConvertSource, RowGroupSelection},
+    mvt::{EncodedFeatureGeometry, PropertyRef, PropertyValue},
+    pmtiles_writer::StreamingPmtilesWriter,
+    tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord, MAX_ZOOM},
+    vector_tile::tile::GeomType,
+    TilesetMetadata,
 };
-use super::properties::PropertySelection;
-use super::read::{footer_price, read_in_order_capped, ReadFlow, ReadPass, ReadTuning};
-use super::reader::{OverviewReader, ReaderError};
-use super::stream::{
-    add_nanos, preflight_profile_json_path, profile_json_target, sample_rss_peak,
-    write_export_profile_json, ExportPhaseWalls, ExportProfileJsonInputs, ExportTimers,
-    ExportZoomProfile, RssSampler, RssSamplerReport,
-};
-use super::writer::LEVEL_COLUMN;
-use crate::input::InputError;
-use crate::input_set::{ConvertSource, RowGroupSelection};
 
 mod coalesce_valve;
 mod tile_data;
@@ -5316,7 +5323,7 @@ fn encode_geometry(buf: &mut Vec<u8>, g: &Geometry<f64>) {
 /// geometry.
 /// Property floats spill as bit patterns for the same exactness guarantee as
 /// coordinates.
-fn encode_member(buf: &mut Vec<u8>, m: &Member) {
+fn encode_member(buf: &mut Vec<u8>, m: &Member, names: &SpillNames) {
     put_u64(buf, m.key);
     put_u64(buf, m.seq);
     put_u64(buf, m.gap);
@@ -5328,38 +5335,9 @@ fn encode_member(buf: &mut Vec<u8>, m: &Member) {
         }
         None => buf.push(0),
     }
-    put_u32(buf, m.props.len() as u32);
-    for (name, v) in m.props.iter() {
-        put_u32(buf, name.len() as u32);
-        buf.extend_from_slice(name.as_bytes());
-        match v {
-            PropertyValue::String(s) => {
-                buf.push(0);
-                put_u32(buf, s.len() as u32);
-                buf.extend_from_slice(s.as_bytes());
-            }
-            PropertyValue::Float(f) => {
-                buf.push(1);
-                put_u32(buf, f.to_bits());
-            }
-            PropertyValue::Double(d) => {
-                buf.push(2);
-                put_u64(buf, d.to_bits());
-            }
-            PropertyValue::Int(i) => {
-                buf.push(3);
-                put_u64(buf, *i as u64);
-            }
-            PropertyValue::UInt(u) => {
-                buf.push(4);
-                put_u64(buf, *u);
-            }
-            PropertyValue::Bool(b) => {
-                buf.push(5);
-                buf.push(*b as u8);
-            }
-        }
-    }
+    put_u32(buf, names.id(&m.props.names));
+    put_u32(buf, m.props.data.len() as u32);
+    buf.extend_from_slice(&m.props.data);
     encode_geometry(buf, &m.geom);
 }
 
@@ -5437,15 +5415,6 @@ impl<'a> SpillCursor<'a> {
         }
         Ok(geo::Polygon::new(exterior, interiors))
     }
-
-    fn string(&mut self) -> Result<String, ExportError> {
-        self.str().map(str::to_owned)
-    }
-
-    fn str(&mut self) -> Result<&'a str, ExportError> {
-        let n = self.u32()? as usize;
-        std::str::from_utf8(self.take(n)?).map_err(|_| spill_corrupt())
-    }
 }
 
 fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportError> {
@@ -5492,71 +5461,59 @@ fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportErr
     })
 }
 
-/// Spill-reload name interning (#461). Property names repeat on every member
-/// of a wave, so the decode hands out one shared `Arc<str>` per distinct name
-/// instead of allocating a name per property per member. Keyed by content,
-/// not position: omitted nulls shift a name's position within a member.
+/// Schema tables retained beside the process-private spill. No names or
+/// values are reconstructed per member when a segment is reloaded.
 #[derive(Default)]
-struct SpillNames(HashSet<Arc<str>>);
+struct SpillNames {
+    tables: Vec<PropertyNames>,
+    names: HashSet<Arc<str>>,
+}
 
 impl SpillNames {
-    /// Fold a segment's own name table into this one: a name this table
-    /// already holds replaces the segment's handle in `members`, and a new
-    /// one is adopted as is.
-    fn fold(&mut self, local: SpillNames, members: &mut [Member]) {
-        let remap: Vec<(Arc<str>, Arc<str>)> = local
-            .0
-            .into_iter()
-            .filter_map(|name| match self.0.get(&*name) {
-                Some(shared) => Some((name, Arc::clone(shared))),
-                None => {
-                    self.0.insert(name);
-                    None
-                }
-            })
-            .collect();
-        if remap.is_empty() {
+    fn register(&mut self, table: &PropertyNames) {
+        if self
+            .tables
+            .iter()
+            .any(|t| Arc::ptr_eq(t, table) || t == table)
+        {
             return;
         }
-        members.par_iter_mut().for_each(|m| {
-            // Freshly decoded, so the props are not shared yet.
-            if let Some(props) = Arc::get_mut(&mut m.props) {
-                for (name, _) in props.iter_mut() {
-                    if let Some((_, shared)) = remap.iter().find(|(l, _)| Arc::ptr_eq(l, name)) {
-                        *name = Arc::clone(shared);
-                    }
+        let shared = table
+            .iter()
+            .map(|name| {
+                if let Some(n) = self.names.get(name) {
+                    return n.clone();
                 }
-            }
-        });
+                self.names.insert(name.clone());
+                name.clone()
+            })
+            .collect::<Vec<_>>()
+            .into();
+        self.tables.push(shared);
     }
 
-    fn intern(&mut self, name: &str) -> Arc<str> {
-        if let Some(shared) = self.0.get(name) {
-            return Arc::clone(shared);
-        }
-        let shared: Arc<str> = Arc::from(name);
-        self.0.insert(Arc::clone(&shared));
-        shared
+    fn id(&self, table: &PropertyNames) -> u32 {
+        self.tables
+            .iter()
+            .position(|t| Arc::ptr_eq(t, table) || t == table)
+            .expect("registered spill schema") as u32
     }
 }
 
-/// Decode one spill segment, interning its property names in a table of its
-/// own.
-fn decode_segment(buf: &[u8]) -> Result<(Vec<Member>, SpillNames), ExportError> {
-    let mut names = SpillNames::default();
+fn decode_segment(buf: &[u8], names: &SpillNames) -> Result<Vec<Member>, ExportError> {
     let mut cur = SpillCursor::new(buf);
     let n = cur.u64()? as usize;
     let mut members = Vec::with_capacity(n);
     for _ in 0..n {
-        members.push(decode_member(&mut cur, &mut names)?);
+        members.push(decode_member(&mut cur, names)?);
     }
     if !cur.is_empty() {
         return Err(spill_corrupt());
     }
-    Ok((members, names))
+    Ok(members)
 }
 
-fn decode_member(cur: &mut SpillCursor<'_>, names: &mut SpillNames) -> Result<Member, ExportError> {
+fn decode_member(cur: &mut SpillCursor<'_>, names: &SpillNames) -> Result<Member, ExportError> {
     let key = cur.u64()?;
     let seq = cur.u64()?;
     let gap = cur.u64()?;
@@ -5566,27 +5523,20 @@ fn decode_member(cur: &mut SpillCursor<'_>, names: &mut SpillNames) -> Result<Me
         1 => Some(cur.u64()?),
         _ => return Err(spill_corrupt()),
     };
-    let n_props = cur.u32()? as usize;
-    let mut props = Vec::with_capacity(n_props);
-    for _ in 0..n_props {
-        let name = names.intern(cur.str()?);
-        let value = match cur.u8()? {
-            0 => PropertyValue::String(cur.string()?),
-            1 => PropertyValue::Float(f32::from_bits(cur.u32()?)),
-            2 => PropertyValue::Double(f64::from_bits(cur.u64()?)),
-            3 => PropertyValue::Int(cur.u64()? as i64),
-            4 => PropertyValue::UInt(cur.u64()?),
-            5 => PropertyValue::Bool(cur.u8()? != 0),
-            _ => return Err(spill_corrupt()),
-        };
-        props.push((name, value));
-    }
+    let schema = cur.u32()? as usize;
+    let names = names.tables.get(schema).ok_or_else(spill_corrupt)?.clone();
+    let len = cur.u32()? as usize;
+    let props = SharedProps {
+        names,
+        data: Arc::from(cur.take(len)?),
+    };
+    props.validate()?;
     let geom = decode_geometry(cur)?;
     Ok(Member {
         key,
         seq,
         geom: geom.into(),
-        props: Arc::new(props),
+        props,
         id,
         gap,
         band,
@@ -5595,16 +5545,16 @@ fn decode_member(cur: &mut SpillCursor<'_>, names: &mut SpillNames) -> Result<Me
 
 /// Rough in-RAM cost of one buffered member, for the fill-phase budget only
 /// (never output-bound): struct + `Vec` headers, 16 B per coordinate, and the
-/// property payload (spilled per member, so counted per member). A name
-/// costs only its 16 B `Arc<str>` handle: the text lives once in the
-/// per-schema table (#461).
+/// property payload (spilled per member, so counted per member). Keep the
+/// historical 16 B name-handle charge in this prototype to preserve fill
+/// decisions while measuring the representation alone.
 fn member_bytes_estimate(m: &Member) -> usize {
     64 + m.geom.coords_count() * 16
         + m.props
             .iter()
             .map(|(_, v)| {
                 16 + match v {
-                    PropertyValue::String(s) => s.len(),
+                    PropertyRef::String(s) => s.len(),
                     _ => 8,
                 }
             })
@@ -5615,6 +5565,7 @@ fn member_bytes_estimate(m: &Member) -> usize {
 /// length-indexed segments; `segments[level][wave]` records each segment in
 /// append order.
 struct MemberSpill {
+    names: SpillNames,
     writer: BufWriter<File>,
     read: File,
     /// Keeps the anonymous temp file alive (unlinked on drop).
@@ -5703,6 +5654,7 @@ impl MemberStore {
                 let writer = BufWriter::new(temp.reopen()?);
                 let read = temp.reopen()?;
                 Some(MemberSpill {
+                    names: SpillNames::default(),
                     writer,
                     read,
                     _temp: temp,
@@ -5805,6 +5757,9 @@ impl MemberStore {
             .spill
             .as_mut()
             .expect("flush_bucket requires spill backing");
+        for m in &members {
+            spill.names.register(&m.props.names);
+        }
         // A few segments per pool thread at a time, at most 16, so the
         // encoded bytes held before their write stay a small, bounded
         // transient next to the bucket (dhat: encoding a whole bucket into
@@ -5817,7 +5772,7 @@ impl MemberStore {
                     let mut buf = Vec::new();
                     put_u64(&mut buf, chunk.len() as u64);
                     for m in chunk {
-                        encode_member(&mut buf, m);
+                        encode_member(&mut buf, m, &spill.names);
                     }
                     (buf, chunk.len())
                 })
@@ -5871,9 +5826,8 @@ impl MemberStore {
     /// the output — `encode_members` sorts by the unique `(key, seq)`.
     ///
     /// Segments are read in groups of about [`SPILL_READ_GROUP_BYTES`] and
-    /// each group's segments decoded in parallel (#740), each with its own
-    /// name table; the tables are then folded into one, so the wave shares
-    /// one `Arc<str>` per property name as a serial decode did (#461).
+    /// each group's segments decoded in parallel (#740), borrowing schema
+    /// tables retained beside the spill for the lifetime of this store.
     fn take_wave(&mut self, level: usize, wave: usize) -> Result<Vec<Member>, ExportError> {
         use std::io::{Read, Seek, SeekFrom};
         let mut out = Vec::new();
@@ -5882,7 +5836,6 @@ impl MemberStore {
             out.reserve_exact(
                 segments.iter().map(|s| s.members).sum::<usize>() + self.buckets[level][wave].len(),
             );
-            let mut names = SpillNames::default();
             let mut rest = segments.as_slice();
             while !rest.is_empty() {
                 let mut group_bytes = 0u64;
@@ -5903,12 +5856,11 @@ impl MemberStore {
                     spill.read.read_exact(&mut buf)?;
                     bufs.push(buf);
                 }
-                let decoded: Vec<(Vec<Member>, SpillNames)> = bufs
+                let decoded: Vec<Vec<Member>> = bufs
                     .into_par_iter()
-                    .map(|buf| decode_segment(&buf))
+                    .map(|buf| decode_segment(&buf, &spill.names))
                     .collect::<Result<_, _>>()?;
-                for (mut members, local) in decoded {
-                    names.fold(local, &mut members);
+                for mut members in decoded {
                     out.append(&mut members);
                 }
             }
@@ -6084,7 +6036,7 @@ fn fanout_batch_members(
             if items.is_empty() {
                 continue;
             }
-            let props = &*row_props[row].get_or_insert_with(|| attrs.props(row));
+            let props = row_props[row].get_or_insert_with(|| attrs.props(row));
             let id = ids[row];
             let (gap, band) = row_gaps[row];
             for (key, geom) in items {
@@ -6096,7 +6048,7 @@ fn fanout_batch_members(
                         key,
                         seq: *seq + row as u64,
                         geom,
-                        props: Arc::clone(props),
+                        props: props.clone(),
                         id,
                         gap,
                         band,
@@ -6118,11 +6070,11 @@ type RowMembers = Vec<TileMembers>;
 
 /// A feature's MVT properties, shared across its tile members.
 ///
-/// Each name is a refcounted handle to the per-schema name table built once
-/// in [`AttrColumns::new`] (#461): column names are a per-schema constant, so
-/// materializing a row costs a refcount bump per property, not a `String`
-/// allocation.
-type SharedProps = Arc<Vec<(Arc<str>, PropertyValue)>>;
+/// One byte buffer per row, with names shared through a schema table.
+/// The encoder borrows strings directly from this buffer.
+type PropertyNames = Arc<[Arc<str>]>;
+type SharedProps = packed_props::PackedProps;
+mod packed_props;
 
 /// Pass-2 drain for one wave under the single-read path: take the wave's
 /// buffered members, bucket them per partition (exactly as
@@ -7861,7 +7813,7 @@ fn collect_member_chunk(
                 key,
                 seq: source_row,
                 geom,
-                props: Arc::clone(&props),
+                props: props.clone(),
                 id,
                 gap,
                 band,
@@ -8878,16 +8830,16 @@ enum OrderKey<'a> {
 
 impl<'a> OrderKey<'a> {
     fn of(m: &'a Member, name: &str) -> Self {
-        let Some((_, v)) = m.props.iter().find(|(k, _)| &**k == name) else {
+        let Some((_, v)) = m.props.iter().find(|(k, _)| *k == name) else {
             return Self::Missing;
         };
         match v {
-            PropertyValue::String(s) => Self::Text(s),
-            PropertyValue::Float(f) => Self::number(*f as f64),
-            PropertyValue::Double(d) => Self::number(*d),
-            PropertyValue::Int(i) => Self::number(*i as f64),
-            PropertyValue::UInt(u) => Self::number(*u as f64),
-            PropertyValue::Bool(b) => Self::number(*b as u8 as f64),
+            PropertyRef::String(s) => Self::Text(s),
+            PropertyRef::Float(f) => Self::number(f as f64),
+            PropertyRef::Double(d) => Self::number(d),
+            PropertyRef::Int(i) => Self::number(i as f64),
+            PropertyRef::UInt(u) => Self::number(u as f64),
+            PropertyRef::Bool(b) => Self::number(b as u8 as f64),
         }
     }
 
@@ -10071,7 +10023,7 @@ fn build_mvt_within<M: TileFeature>(
     for f in fill {
         let geom = EncodedFeatureGeometry::Parts(vec![(f.cmds.clone(), GeomType::Polygon)]);
         track(f.id.map(|_| f.source_row), &geom);
-        layer.add_encoded_feature(f.id, geom, &f.props);
+        layer.add_borrowed_feature(f.id, geom, f.props.iter());
     }
     if encode_in_parallel(members) {
         // Bound the geometry staging buffer as well as the serialized layer.
@@ -10082,7 +10034,7 @@ fn build_mvt_within<M: TileFeature>(
             let encoded: Vec<EncodedFeatureGeometry> = chunk.par_iter().map(&encode).collect();
             for (m, geom) in chunk.iter().zip(encoded) {
                 track(m.feature_id().map(|_| m.source_row()), &geom);
-                layer.add_encoded_feature(m.feature_id(), geom, m.properties());
+                layer.add_borrowed_feature(m.feature_id(), geom, m.properties().iter());
             }
             if layer.encoded_len() > raw_limit {
                 return None;
@@ -10092,7 +10044,7 @@ fn build_mvt_within<M: TileFeature>(
         for m in members {
             let geom = encode(m);
             track(m.feature_id().map(|_| m.source_row()), &geom);
-            layer.add_encoded_feature(m.feature_id(), geom, m.properties());
+            layer.add_borrowed_feature(m.feature_id(), geom, m.properties().iter());
             if layer.encoded_len() > raw_limit {
                 return None;
             }
@@ -10158,7 +10110,7 @@ fn encode_level_tiles(
                 seq,
             )?),
         };
-        let props: SharedProps = Arc::new(
+        let props: SharedProps = SharedProps::new(
             f.props
                 .iter()
                 .filter(|(n, _)| opts.feature_id.as_ref() != Some(n))
@@ -10179,7 +10131,7 @@ fn encode_level_tiles(
                 key,
                 seq,
                 geom: geom.into(),
-                props: Arc::clone(&props),
+                props: props.clone(),
                 id,
                 gap,
                 band,
@@ -10374,6 +10326,7 @@ fn batch_geometry_index(batch: &RecordBatch, geometry: Option<&str>) -> Result<u
 /// a source column that was moved aside from it.
 #[derive(Debug, Clone, Default)]
 struct PublishedNames {
+    packed_names: Arc<std::sync::Mutex<Vec<PropertyNames>>>,
     /// Schema field name → published key, for the columns that differ.
     /// Empty for the identity mapping, which is the overwhelmingly common
     /// case (nothing collided, or the file predates the provenance).
@@ -10428,6 +10381,7 @@ impl PublishedNames {
             geometry: None,
             properties: None,
             canonical: None,
+            packed_names: Default::default(),
         }
     }
 
@@ -10478,6 +10432,7 @@ impl PublishedNames {
             geometry: descriptor.geometry_name().map(str::to_owned),
             properties: Some(descriptor.properties().iter().copied().collect()),
             canonical: None,
+            packed_names: Default::default(),
         };
         names
     }
@@ -10752,8 +10707,8 @@ fn candidate_columns<'a>(
 /// The columns pass 2 attaches to each member: the exportable properties
 /// ([`property_columns`]) and the resolved `--feature-id` column (#443).
 struct AttrColumns<'a> {
-    /// `(column index, published name)`; each [`Self::extract`] copies the
-    /// names once, for every row of its batch to share (#461).
+    names: PropertyNames,
+    /// `(column index, published name)` in schema order.
     props: Vec<(usize, Arc<str>)>,
     feature_id: Option<&'a ResolvedFeatureId>,
 }
@@ -10765,32 +10720,42 @@ impl<'a> AttrColumns<'a> {
         published: &PublishedNames,
         feature_id: Option<&'a ResolvedFeatureId>,
     ) -> Self {
+        let props: Vec<_> = property_columns(schema, geom_idx, published)
+            .into_iter()
+            .map(|(idx, name)| (idx, Arc::<str>::from(name)))
+            .collect();
+        let candidate: PropertyNames = props
+            .iter()
+            .map(|(_, n)| n.clone())
+            .collect::<Vec<_>>()
+            .into();
+        let mut tables = published.packed_names.lock().unwrap();
+        let names = tables
+            .iter()
+            .find(|n| ***n == *candidate)
+            .cloned()
+            .unwrap_or_else(|| {
+                tables.push(candidate.clone());
+                candidate
+            });
         Self {
-            props: property_columns(schema, geom_idx, published)
-                .into_iter()
-                .map(|(idx, name)| (idx, Arc::from(name)))
-                .collect(),
+            props,
+            names,
             feature_id,
         }
     }
 
     /// Extract every column of one batch once, for per-row materialization.
     ///
-    /// PERF (#803): each call gets its own copy of every name, shared by its
-    /// rows only. Cloning the schema table's handles made every pool thread
-    /// bump the same refcounts once per row and column (and drop them once
-    /// per member), about 10% of an export's cycles in contended atomics.
+    /// Packed rows share the whole schema table, so there is no per-property
+    /// name refcount traffic (#803). This spike still stages owned values.
     fn extract(&self, batch: &RecordBatch) -> BatchAttributes<'a> {
         BatchAttributes {
+            names: self.names.clone(),
             props: self
                 .props
                 .iter()
-                .map(|(idx, name)| {
-                    (
-                        Arc::from(&**name),
-                        extract_property_column(batch.column(*idx)),
-                    )
-                })
+                .map(|(idx, name)| (name.clone(), extract_property_column(batch.column(*idx))))
                 .collect(),
             ids: self.feature_id.map(|fid| {
                 let ids = feature_id_values(batch.column(fid.idx))
@@ -10806,6 +10771,7 @@ impl<'a> AttrColumns<'a> {
 
 /// One batch's extracted [`AttrColumns`].
 struct BatchAttributes<'a> {
+    names: PropertyNames,
     props: Vec<(Arc<str>, Vec<Option<PropertyValue>>)>,
     /// The `--feature-id` column and its per-row ids (`None` = invalid).
     ids: Option<(&'a ResolvedFeatureId, Vec<Option<u64>>)>,
@@ -10847,11 +10813,9 @@ impl BatchAttributes<'_> {
         );
         #[cfg(test)]
         PROPS_BUILT.with(|n| n.set(n.get() + 1));
-        Arc::new(
-            self.props
-                .iter_mut()
-                .filter_map(|(name, col)| col[row].take().map(|v| (Arc::clone(name), v)))
-                .collect(),
+        SharedProps::pack(
+            self.names.clone(),
+            self.props.iter_mut().map(|(_, col)| col[row].take()),
         )
     }
 }
@@ -11529,21 +11493,20 @@ fn reproject_3857_to_4326(g: &Geometry<f64>) -> Geometry<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::mvt::{command_decode, zigzag_decode};
-    use crate::overview::level::{
-        gsd, ClusteringProvenance, CoalescingProvenance, Generalization, Level, Mode,
-    };
-    use crate::overview::writer::{
-        LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions,
-    };
-    use crate::vector_tile::tile::GeomType;
-    use crate::vector_tile::Tile;
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{Field, Schema};
     use geo::{Geometry, LineString, Point};
-    use geoarrow::array::GeometryBuilder;
-    use geoarrow::datatypes::GeometryType;
+    use geoarrow::{array::GeometryBuilder, datatypes::GeometryType};
+
+    use super::*;
+    use crate::{
+        mvt::{command_decode, zigzag_decode},
+        overview::{
+            level::{gsd, ClusteringProvenance, CoalescingProvenance, Generalization, Level, Mode},
+            writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions},
+        },
+        vector_tile::{tile::GeomType, Tile},
+    };
 
     // --- fixture builders ----------------------------------------------------
 
@@ -11807,8 +11770,10 @@ mod tests {
         // not merely different: each counted tile must really be in the archive
         // and carry at least one feature, so the extra tile is genuine seam
         // overlap rather than an empty one conjured by over-wide membership.
-        use crate::compression;
-        use crate::pmtiles_writer::{decode_directory, tile_id_to_zxy, Header};
+        use crate::{
+            compression,
+            pmtiles_writer::{decode_directory, tile_id_to_zxy, Header},
+        };
         let header = Header::from_bytes(&bytes).unwrap();
         let root = compression::decompress_capped(
             &bytes[header.root_dir_offset as usize
@@ -11886,10 +11851,12 @@ mod tests {
         };
         export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
 
-        use crate::compression;
-        use crate::pmtiles_writer::{
-            decode_directory, offsets_are_clustered, tile_id_to_zxy, verify_clustered, DirEntry,
-            Header,
+        use crate::{
+            compression,
+            pmtiles_writer::{
+                decode_directory, offsets_are_clustered, tile_id_to_zxy, verify_clustered,
+                DirEntry, Header,
+            },
         };
         let bytes = std::fs::read(tout.path()).unwrap();
         let header = Header::from_bytes(&bytes).unwrap();
@@ -14173,7 +14140,7 @@ mod tests {
             key: 0,
             seq: 0,
             geom: geom.into(),
-            props: Arc::new(Vec::new()),
+            props: SharedProps::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
             band: 0,
@@ -14243,7 +14210,7 @@ mod tests {
                     key: 0,
                     seq: i as u64,
                     geom: geom.into(),
-                    props: Arc::new(props),
+                    props: SharedProps::new(props),
                     id: None,
                     gap: GAP_NONE,
                     band: 0,
@@ -14263,7 +14230,7 @@ mod tests {
                 let props: Vec<(String, PropertyValue)> = m
                     .props
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .map(|(k, v)| (k.to_string(), v.to_owned()))
                     .collect();
                 serial.add_feature(
                     m.feature_id(),
@@ -14314,9 +14281,7 @@ mod tests {
     /// ([`rewrite_with_float32_covering`]).
     fn rewrite_overview(src: &Path, dst: &Path, bad_row: Option<usize>, float32_covering: bool) {
         use arrow_array::{Array, BinaryArray};
-
-        use tylertoo_io::test_support::ArrowWriter;
-        use tylertoo_io::KeyValue;
+        use tylertoo_io::{test_support::ArrowWriter, KeyValue};
 
         let probe = tylertoo_io::open_parquet(File::open(src).unwrap()).unwrap();
         let in_schema = probe.schema().clone();
@@ -14875,7 +14840,7 @@ mod tests {
             key,
             seq: 0,
             geom: geom.clone().into(),
-            props: Arc::new(Vec::new()),
+            props: SharedProps::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
             band: 0,
@@ -14946,7 +14911,7 @@ mod tests {
         FillFeature::encode_fill(
             Some(id),
             id,
-            Arc::new(Vec::new()),
+            SharedProps::new(Vec::new()),
             &[&vec![vec![
                 (x, y),
                 (x + side, y),
@@ -14980,7 +14945,7 @@ mod tests {
                         .to_polygon(),
                     )
                     .into(),
-                    props: Arc::new(vec![(Arc::from("n"), PropertyValue::UInt(i))]),
+                    props: SharedProps::new(vec![(Arc::from("n"), PropertyValue::UInt(i))]),
                     id: Some(i),
                     gap: if i == 0 { GAP_NONE } else { 10 },
                     band: 0,
@@ -15213,7 +15178,7 @@ mod tests {
                 .to_polygon(),
             )
             .into(),
-            props: Arc::new(vec![(
+            props: SharedProps::new(vec![(
                 Arc::from("name"),
                 PropertyValue::String(name.to_string()),
             )]),
@@ -15246,8 +15211,8 @@ mod tests {
         );
         let tagged: Vec<(Option<u64>, String)> = fill
             .iter()
-            .map(|f| match &f.props[0].1 {
-                PropertyValue::String(s) => (f.id, s.clone()),
+            .map(|f| match f.props.iter().next().unwrap().1 {
+                PropertyRef::String(s) => (f.id, s.to_owned()),
                 other => panic!("unexpected tag {other:?}"),
             })
             .collect();
@@ -16730,7 +16695,9 @@ mod tests {
         let rows: Vec<SharedProps> = (0..3).map(|r| attrs.props(r)).collect();
 
         let pairs = |p: &SharedProps| -> Vec<(String, PropertyValue)> {
-            p.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+            p.iter()
+                .map(|(k, v)| (k.to_string(), v.to_owned()))
+                .collect()
         };
         assert_eq!(
             pairs(&rows[0]),
@@ -16753,10 +16720,10 @@ mod tests {
 
         // The names are refcounted handles to the batch's table, not copies.
         let (name_key, rank_key) = (&attrs.props[0].0, &attrs.props[1].0);
-        assert!(Arc::ptr_eq(&rows[0][0].0, name_key));
-        assert!(Arc::ptr_eq(&rows[2][0].0, name_key));
+        assert!(Arc::ptr_eq(&rows[0].names[0], name_key));
+        assert!(Arc::ptr_eq(&rows[2].names[0], name_key));
         for row in &rows {
-            assert!(Arc::ptr_eq(&row.last().unwrap().0, rank_key));
+            assert!(Arc::ptr_eq(row.names.last().unwrap(), rank_key));
         }
     }
 
@@ -17081,8 +17048,10 @@ mod tests {
     /// row groups. Row `null_row` (when given) has null `names` and
     /// `sources`.
     fn write_overture_fixture(path: &Path, n: usize, null_row: Option<usize>, binary: &str) {
-        use arrow_array::builder::{ListBuilder, MapBuilder, StringBuilder};
-        use arrow_array::{BinaryArray, StructArray};
+        use arrow_array::{
+            builder::{ListBuilder, MapBuilder, StringBuilder},
+            BinaryArray, StructArray,
+        };
 
         let primary = StringArray::from(
             (0..n)
@@ -17481,8 +17450,9 @@ mod tests {
     /// embedded as a string literal (double-encoded).
     #[test]
     fn dictionary_encoded_struct_inside_a_list_is_not_double_encoded() {
-        use arrow_array::types::Int8Type;
-        use arrow_array::{DictionaryArray, Int32Array, Int8Array, ListArray, StructArray};
+        use arrow_array::{
+            types::Int8Type, DictionaryArray, Int32Array, Int8Array, ListArray, StructArray,
+        };
         use arrow_buffer::OffsetBuffer;
 
         let values = StructArray::from(vec![(
@@ -17519,12 +17489,14 @@ mod tests {
     /// dictionary-encoded column is unwrapped to its value type.
     #[test]
     fn json_property_rendering_covers_every_nested_kind() {
-        use arrow_array::builder::{
-            FixedSizeListBuilder, Int32Builder, LargeListBuilder, ListBuilder, MapBuilder,
-            StringBuilder,
+        use arrow_array::{
+            builder::{
+                FixedSizeListBuilder, Int32Builder, LargeListBuilder, ListBuilder, MapBuilder,
+                StringBuilder,
+            },
+            types::Int8Type,
+            DictionaryArray, Float64Array, Int32Array, StructArray,
         };
-        use arrow_array::types::Int8Type;
-        use arrow_array::{DictionaryArray, Float64Array, Int32Array, StructArray};
 
         // struct { n: Int32?, x: Float64?, tags: List<Int32>? }
         let n = Int32Array::from(vec![Some(1), None, Some(3)]);
@@ -17640,11 +17612,13 @@ mod tests {
     /// rendering rebases onto the slice.
     #[test]
     fn sliced_nested_columns_render_like_the_whole_column() {
-        use arrow_array::builder::{
-            FixedSizeListBuilder, Int32Builder, LargeListBuilder, ListBuilder, MapBuilder,
-            StringBuilder,
+        use arrow_array::{
+            builder::{
+                FixedSizeListBuilder, Int32Builder, LargeListBuilder, ListBuilder, MapBuilder,
+                StringBuilder,
+            },
+            StructArray,
         };
-        use arrow_array::StructArray;
 
         let mut list = ListBuilder::new(Int32Builder::new());
         let mut large = LargeListBuilder::new(StringBuilder::new());
@@ -17815,7 +17789,7 @@ mod tests {
             key: tile_key(tiles[0].x, tiles[0].y, 4),
             seq: 0,
             geom: poly.clone().into(),
-            props: Arc::new(vec![]),
+            props: SharedProps::new(vec![]),
             id: None,
             gap: GAP_NONE,
             band: 0,
@@ -18200,7 +18174,7 @@ mod tests {
         let mut gaps = RowGapCursor::new(vec![(0, feats.len() as u64)]);
         for (i, f) in feats.iter().enumerate() {
             let (gap, band) = gaps.next_row(f.geom.bounding_rect());
-            let props: SharedProps = Arc::new(
+            let props: SharedProps = SharedProps::new(
                 f.props
                     .iter()
                     .map(|(n, v)| (Arc::from(n.as_str()), v.clone()))
@@ -18218,7 +18192,7 @@ mod tests {
                     key,
                     seq: i as u64,
                     geom: geom.into(),
-                    props: Arc::clone(&props),
+                    props: props.clone(),
                     id: None,
                     gap,
                     band,
@@ -18648,7 +18622,7 @@ mod tests {
             key: 0,
             seq,
             geom: Geometry::Point(Point::new(x, y)).into(),
-            props: Arc::new(Vec::new()),
+            props: SharedProps::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
             band: 0,
@@ -18691,7 +18665,7 @@ mod tests {
             key: 0,
             seq,
             geom: Geometry::Point(Point::new(seq as f64 * 0.001, 0.0)).into(),
-            props: Arc::new(vec![("level".into(), PropertyValue::Double(level))]),
+            props: SharedProps::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
             gap: GAP_NONE,
             band: 0,
@@ -18773,7 +18747,7 @@ mod tests {
     #[test]
     fn features_missing_the_order_column_sort_first() {
         let mut bare = ordered_member(0, 0.0);
-        bare.props = Arc::new(Vec::new());
+        bare.props = SharedProps::new(Vec::new());
         let members = vec![ordered_member(1, 0.5), bare, ordered_member(2, 0.2)];
         let order = FeatureOrder::Column {
             name: "level".to_string(),
@@ -18849,7 +18823,7 @@ mod tests {
             key,
             seq,
             geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
-            props: Arc::new(vec![("level".into(), PropertyValue::Double(level))]),
+            props: SharedProps::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
             gap: GAP_NONE,
             band: 0,
@@ -18881,7 +18855,7 @@ mod tests {
             key: 0,
             seq,
             geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
-            props: Arc::new(vec![("n".into(), v)]),
+            props: SharedProps::new(vec![("n".into(), v)]),
             id: None,
             gap: GAP_NONE,
             band: 0,
@@ -18961,7 +18935,7 @@ mod tests {
                     key: 0,
                     seq: n as u64,
                     geom: Geometry::LineString(LineString::from(coords)).into(),
-                    props: Arc::new(Vec::new()),
+                    props: SharedProps::new(Vec::new()),
                     id: None,
                     gap: GAP_NONE,
                     band: 0,
@@ -19070,7 +19044,10 @@ mod tests {
                     key: 0,
                     seq: i,
                     geom: Geometry::LineString(coords.into_iter().collect()).into(),
-                    props: Arc::new(vec![("level".into(), PropertyValue::Double(i as f64))]),
+                    props: SharedProps::new(vec![(
+                        "level".into(),
+                        PropertyValue::Double(i as f64),
+                    )]),
                     id: None,
                     gap: GAP_NONE,
                     band: 0,
@@ -19222,7 +19199,7 @@ mod tests {
                 key: tile_key(7, 11, 5) + i as u64,
                 seq: u64::MAX - i as u64,
                 geom: g.into(),
-                props: Arc::new(props.clone()),
+                props: SharedProps::new(props.clone()),
                 id,
                 // #745: both the "no predecessor" sentinel and real values.
                 gap: if i % 3 == 0 {
@@ -19233,9 +19210,11 @@ mod tests {
                 band: i as u16,
             };
             let mut buf = Vec::new();
-            encode_member(&mut buf, &m);
+            let mut names = SpillNames::default();
+            names.register(&m.props.names);
+            encode_member(&mut buf, &m, &names);
             let mut cur = SpillCursor::new(&buf);
-            let back = decode_member(&mut cur, &mut SpillNames::default()).unwrap();
+            let back = decode_member(&mut cur, &names).unwrap();
             assert!(cur.is_empty(), "trailing bytes after decode (geometry {i})");
             assert_eq!(back.key, m.key);
             assert_eq!(back.seq, m.seq);
@@ -19244,9 +19223,9 @@ mod tests {
                 back.id, m.id,
                 "feature id must survive the spill (geometry {i})"
             );
-            assert_eq!(*back.props, *m.props);
+            assert_eq!(back.props, m.props);
             let mut buf2 = Vec::new();
-            encode_member(&mut buf2, &back);
+            encode_member(&mut buf2, &back, &names);
             assert_eq!(buf, buf2, "re-encoded member bytes differ (geometry {i})");
         }
     }
@@ -19480,7 +19459,7 @@ mod tests {
             key,
             seq,
             geom: Geometry::Point(Point::new(seq as f64, -1.0)).into(),
-            props: Arc::new(vec![("id".into(), PropertyValue::Int(seq as i64))]),
+            props: SharedProps::new(vec![("id".into(), PropertyValue::Int(seq as i64))]),
             id: None,
             gap: GAP_NONE,
             band: 0,
@@ -19498,7 +19477,10 @@ mod tests {
         assert_eq!(w1.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1]);
         assert!(w0.iter().all(|m| m.key == 0));
         assert!(w1.iter().all(|m| m.key == 1));
-        assert_eq!(w0[0].props[0].1, PropertyValue::Int(0));
+        assert_eq!(
+            w0[0].props.iter().next().unwrap().1.to_owned(),
+            PropertyValue::Int(0)
+        );
     }
 
     /// The fill-phase budget's per-member cost: 48 B of headers, 16 B per
@@ -19511,7 +19493,7 @@ mod tests {
             key: 0,
             seq: 0,
             geom: Geometry::LineString(LineString::from(vec![(0.0, 0.0), (1.0, 1.0)])).into(),
-            props: Arc::new(props),
+            props: SharedProps::new(props),
             id: None,
             gap: GAP_NONE,
             band: 0,
@@ -19544,7 +19526,7 @@ mod tests {
             key: 0,
             seq,
             geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
-            props: Arc::new(props),
+            props: SharedProps::new(props),
             id: None,
             gap: GAP_NONE,
             band: 0,
@@ -19569,12 +19551,15 @@ mod tests {
 
         let w = store.take_wave(0, 0).unwrap();
         assert_eq!(w.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 1, 2]);
-        let (name, rank) = (&w[0].props[0].0, &w[0].props[1].0);
+        let (name, rank) = (&w[0].props.names[0], &w[0].props.names[1]);
         assert_eq!((&**name, &**rank), ("name", "rank"));
-        assert!(Arc::ptr_eq(&w[1].props[0].0, rank), "null-shifted name");
-        assert!(Arc::ptr_eq(&w[2].props[0].0, name), "second segment");
-        assert!(Arc::ptr_eq(&w[2].props[1].0, rank), "second segment");
-        assert_eq!(w[2].props[0].1, PropertyValue::String("f2".into()));
+        assert!(Arc::ptr_eq(&w[1].props.names[0], rank), "null-shifted name");
+        assert!(Arc::ptr_eq(&w[2].props.names[0], name), "second segment");
+        assert!(Arc::ptr_eq(&w[2].props.names[1], rank), "second segment");
+        assert_eq!(
+            w[2].props.iter().next().unwrap().1.to_owned(),
+            PropertyValue::String("f2".into())
+        );
     }
 
     /// #740: a flushed bucket larger than [`SPILL_SEGMENT_MEMBERS`] is cut
@@ -19598,7 +19583,7 @@ mod tests {
             key: 0,
             seq,
             geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
-            props: Arc::new(Vec::new()),
+            props: SharedProps::new(Vec::new()),
             id: None,
             gap: GAP_NONE,
             band: 0,
@@ -19647,7 +19632,7 @@ mod tests {
                         key: 0,
                         seq,
                         geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
-                        props: Arc::new(vec![(name, PropertyValue::UInt(seq))]),
+                        props: SharedProps::new(vec![(name, PropertyValue::UInt(seq))]),
                         id: None,
                         gap: GAP_NONE,
                         band: 0,
@@ -19662,13 +19647,11 @@ mod tests {
         );
         let w = store.take_wave(0, 0).unwrap();
         assert_eq!((w.len(), w.capacity()), (n, n));
-        assert!(w
-            .iter()
-            .enumerate()
-            .all(|(i, m)| m.seq == i as u64 && m.props[0].1 == PropertyValue::UInt(i as u64)));
+        assert!(w.iter().enumerate().all(|(i, m)| m.seq == i as u64
+            && m.props.iter().next().unwrap().1.to_owned() == PropertyValue::UInt(i as u64)));
         for m in &w[3..] {
-            let first = &w[(m.seq % 3) as usize].props[0].0;
-            assert!(Arc::ptr_eq(&m.props[0].0, first), "seq {}", m.seq);
+            let first = &w[(m.seq % 3) as usize].props.names[0];
+            assert!(Arc::ptr_eq(&m.props.names[0], first), "seq {}", m.seq);
         }
     }
 
@@ -22006,7 +21989,7 @@ mod tests {
                         key: 0,
                         seq,
                         geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
-                        props: Arc::new(Vec::new()),
+                        props: SharedProps::new(Vec::new()),
                         id: None,
                         gap: GAP_NONE,
                         band: 0,
@@ -22039,7 +22022,7 @@ mod tests {
                     10.0 + (i / 300) as f64 * 0.5,
                 ))
                 .into(),
-                props: Arc::new(Vec::new()),
+                props: SharedProps::new(Vec::new()),
                 id: None,
                 gap: GAP_NONE,
                 band: 0,
@@ -22121,7 +22104,7 @@ mod diagnostic_row_alignment {
                     key: 0,
                     seq: row as u64,
                     geom: geom.into(),
-                    props: Arc::new(vec![]),
+                    props: SharedProps::new(vec![]),
                     id: Some(100 + row as u64),
                     gap: if row == 0 { GAP_NONE } else { 1 },
                     band: 0,
@@ -22211,7 +22194,7 @@ mod diagnostic_row_alignment {
                     seq: row as u64,
                     geom: geom.into(),
                     id: Some(7),
-                    props: Arc::new(vec![]),
+                    props: SharedProps::new(vec![]),
                     gap: GAP_NONE,
                     band: 0,
                 }
@@ -22267,7 +22250,7 @@ mod diagnostic_row_alignment {
             key: 0,
             seq: 0,
             geom: triangle.into(),
-            props: Arc::new(vec![]),
+            props: SharedProps::new(vec![]),
             id: Some(7),
             gap: GAP_NONE,
             band: 0,

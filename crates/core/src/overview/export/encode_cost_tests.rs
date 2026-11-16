@@ -1,13 +1,14 @@
+use geo::Point;
+
 use super::*;
 use crate::compression::gzip_counter;
-use geo::Point;
 
 fn point_member(x: u32, seq: u64) -> Member {
     Member {
         key: tile_key(x, 0, 1),
         seq,
         geom: Geometry::Point(Point::new(-90.0 + x as f64 * 180.0, 40.0)).into(),
-        props: Arc::new(Vec::new()),
+        props: SharedProps::new(Vec::new()),
         id: None,
         gap: GAP_NONE,
         band: 0,
@@ -125,7 +126,7 @@ fn dense_capped_tile_encode_peak_live_bytes_is_bounded() {
     let members: Vec<_> = (0..ROWS)
         .map(|i| {
             let mut m = point_member(0, i as u64);
-            m.props = Arc::new(vec![
+            m.props = SharedProps::new(vec![
                 (
                     Arc::clone(&keys[0]),
                     PropertyValue::String(format!("place-{i:016x}")),

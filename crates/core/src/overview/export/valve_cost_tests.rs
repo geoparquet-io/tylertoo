@@ -1,8 +1,10 @@
 //! Coarse-tile work guards for sparse and heavily overlapping polygons.
+use std::time::Instant;
+
+use geo::{LineString, Polygon};
+
 use super::*;
 use crate::valve_counter::{self, Counts};
-use geo::{LineString, Polygon};
-use std::time::Instant;
 
 /// Inputs and worker threads belong to the collector, outside this encode
 /// ledger. Like `encode_cost_tests`, dhat requires nextest process isolation.
@@ -314,7 +316,7 @@ fn square_members(rows: usize, overlapping: bool) -> Vec<Member> {
             key: tile_key(0, 0, 0),
             seq: i as u64,
             geom: geom.into(),
-            props: Arc::new(vec![
+            props: SharedProps::new(vec![
                 (Arc::clone(&parcel_key), PropertyValue::UInt(i as u64)),
                 (
                     Arc::clone(&class_key),
@@ -474,8 +476,9 @@ fn valve_work_draw_rank_matches_stable_sorts() {
             let mut members = dense_members(400);
             for (i, m) in members.iter_mut().enumerate() {
                 if i % 7 != 0 {
-                    Arc::make_mut(&mut m.props)
-                        .push((Arc::from("order"), PropertyValue::UInt((i % 5) as u64)));
+                    let mut props = m.props.owned();
+                    props.push((Arc::from("order"), PropertyValue::UInt((i % 5) as u64)));
+                    m.props = SharedProps::new(props);
                 }
                 if drop_only {
                     m.gap = GAP_NONE;

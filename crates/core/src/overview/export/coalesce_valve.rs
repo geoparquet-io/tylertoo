@@ -485,16 +485,18 @@ pub(super) fn next_mingap(gaps: &mut [u64], keep_fraction: f64, current: u64) ->
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use geo::{coord, line_string, point, polygon};
     use std::sync::Arc;
+
+    use geo::{coord, line_string, point, polygon};
+
+    use super::*;
 
     fn member(seq: u64, geom: Geometry<f64>, gap: u64, band: u16) -> Member {
         Member {
             key: 0,
             seq,
             geom: geom.into(),
-            props: Arc::new(vec![(Arc::from("n"), crate::mvt::PropertyValue::UInt(seq))]),
+            props: SharedProps::new(vec![(Arc::from("n"), crate::mvt::PropertyValue::UInt(seq))]),
             id: Some(seq * 10),
             gap,
             band,
@@ -762,7 +764,10 @@ mod tests {
         assert_eq!(out[1].absorbed, 1);
         // The kept member's id and attributes win.
         assert_eq!(out[0].target.id, Some(0));
-        assert_eq!(out[0].props()[0].1, crate::mvt::PropertyValue::UInt(0));
+        assert_eq!(
+            out[0].props().iter().next().unwrap().1.to_owned(),
+            crate::mvt::PropertyValue::UInt(0)
+        );
     }
 
     #[test]

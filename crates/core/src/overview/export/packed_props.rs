@@ -1,0 +1,276 @@
+//! Process-private packed property rows.
+use std::sync::Arc;
+
+use crate::mvt::{PropertyRef, PropertyValue};
+
+/// Names are shared across the export; only `data` is allocated per row.
+/// Each schema column has a tag (0 = absent). Text lengths are unsigned
+/// varints; numeric payloads preserve their exact little-endian bits.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct PackedProps {
+    pub(super) names: Arc<[Arc<str>]>,
+    pub(super) data: Arc<[u8]>,
+}
+
+impl PackedProps {
+    pub(super) fn pack(
+        names: Arc<[Arc<str>]>,
+        values: impl IntoIterator<Item = Option<PropertyValue>>,
+    ) -> Self {
+        let mut data = Vec::new();
+        for value in values {
+            match value {
+                None => data.push(0),
+                Some(PropertyValue::String(s)) => {
+                    data.push(1);
+                    prost::encoding::encode_varint(s.len() as u64, &mut data);
+                    data.extend_from_slice(s.as_bytes());
+                }
+                Some(PropertyValue::Float(v)) => {
+                    data.push(2);
+                    data.extend_from_slice(&v.to_bits().to_le_bytes());
+                }
+                Some(PropertyValue::Double(v)) => {
+                    data.push(3);
+                    data.extend_from_slice(&v.to_bits().to_le_bytes());
+                }
+                Some(PropertyValue::Int(v)) => {
+                    data.push(4);
+                    data.extend_from_slice(&v.to_le_bytes());
+                }
+                Some(PropertyValue::UInt(v)) => {
+                    data.push(5);
+                    data.extend_from_slice(&v.to_le_bytes());
+                }
+                Some(PropertyValue::Bool(v)) => {
+                    data.push(6);
+                    data.push(u8::from(v));
+                }
+            }
+        }
+        Self {
+            names,
+            data: data.into(),
+        }
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&str, PropertyRef<'_>)> {
+        self.checked_iter()
+            .map(|p| p.expect("validated packed row"))
+    }
+
+    pub(super) fn validate(&self) -> Result<(), super::ExportError> {
+        self.checked_iter().try_for_each(|p| p.map(|_| ()))
+    }
+
+    fn checked_iter(
+        &self,
+    ) -> impl Iterator<Item = Result<(&str, PropertyRef<'_>), super::ExportError>> {
+        let mut bytes = &*self.data;
+        let mut names = self.names.iter();
+        let mut done = false;
+        std::iter::from_fn(move || {
+            if done {
+                return None;
+            }
+            let result = (|| {
+                for name in names.by_ref() {
+                    let tag = take(&mut bytes, 1)?[0];
+                    let value = match tag {
+                        0 => continue,
+                        1 => {
+                            let len = prost::encoding::decode_varint(&mut bytes)
+                                .map_err(|_| super::spill_corrupt())?;
+                            let len = usize::try_from(len).map_err(|_| super::spill_corrupt())?;
+                            PropertyRef::String(
+                                std::str::from_utf8(take(&mut bytes, len)?)
+                                    .map_err(|_| super::spill_corrupt())?,
+                            )
+                        }
+                        2 => PropertyRef::Float(f32::from_bits(u32::from_le_bytes(
+                            take(&mut bytes, 4)?.try_into().unwrap(),
+                        ))),
+                        3 => PropertyRef::Double(f64::from_bits(u64::from_le_bytes(
+                            take(&mut bytes, 8)?.try_into().unwrap(),
+                        ))),
+                        4 => PropertyRef::Int(i64::from_le_bytes(
+                            take(&mut bytes, 8)?.try_into().unwrap(),
+                        )),
+                        5 => PropertyRef::UInt(u64::from_le_bytes(
+                            take(&mut bytes, 8)?.try_into().unwrap(),
+                        )),
+                        6 => match take(&mut bytes, 1)?[0] {
+                            0 => PropertyRef::Bool(false),
+                            1 => PropertyRef::Bool(true),
+                            _ => return Err(super::spill_corrupt()),
+                        },
+                        _ => return Err(super::spill_corrupt()),
+                    };
+                    return Ok(Some((&**name, value)));
+                }
+                done = true;
+                if !bytes.is_empty() {
+                    return Err(super::spill_corrupt());
+                }
+                Ok(None)
+            })();
+            match result {
+                Ok(v) => v.map(Ok),
+                Err(e) => {
+                    done = true;
+                    Some(Err(e))
+                }
+            }
+        })
+        .take(self.names.len() + 1)
+    }
+
+    #[cfg(test)]
+    pub(super) fn new(props: Vec<(Arc<str>, PropertyValue)>) -> Self {
+        let names = props
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>()
+            .into();
+        Self::pack(names, props.into_iter().map(|(_, v)| Some(v)))
+    }
+
+    #[cfg(test)]
+    pub(super) fn owned(&self) -> Vec<(Arc<str>, PropertyValue)> {
+        self.iter()
+            .map(|(k, v)| (Arc::from(k), v.to_owned()))
+            .collect()
+    }
+}
+
+fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], super::ExportError> {
+    if n > bytes.len() {
+        return Err(super::spill_corrupt());
+    }
+    let (v, tail) = bytes.split_at(n);
+    *bytes = tail;
+    Ok(v)
+}
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::mvt::{PropertyRef, PropertyValue};
+
+    #[test]
+    fn packed_rows_keep_null_positions_and_borrow_text() {
+        let names = Arc::from(vec![
+            Arc::from("missing"),
+            Arc::from("text"),
+            Arc::from("n"),
+        ]);
+        let row = PackedProps::pack(
+            names,
+            [
+                None,
+                Some(PropertyValue::String("héllo".into())),
+                Some(PropertyValue::Int(-42)),
+            ],
+        );
+        let got: Vec<_> = row.iter().collect();
+        assert_eq!(
+            got,
+            vec![
+                ("text", PropertyRef::String("héllo")),
+                ("n", PropertyRef::Int(-42))
+            ]
+        );
+        let PropertyRef::String(s) = got[0].1 else {
+            panic!()
+        };
+        let start = row.data.as_ptr() as usize;
+        assert!((start..start + row.data.len()).contains(&(s.as_ptr() as usize)));
+        assert!(row.data.len() < 2 * 40 + "héllo".len());
+    }
+    #[test]
+    fn packed_validation_rejects_truncation_tags_utf8_and_trailing_bytes() {
+        let row = PackedProps::new(vec![
+            ("s".into(), PropertyValue::String("x".repeat(128))),
+            ("f".into(), PropertyValue::Float(-0.0)),
+            (
+                "d".into(),
+                PropertyValue::Double(f64::from_bits(0x7ff8_0000_0000_0042)),
+            ),
+            ("i".into(), PropertyValue::Int(i64::MIN)),
+            ("u".into(), PropertyValue::UInt(u64::MAX)),
+            ("b".into(), PropertyValue::Bool(true)),
+        ]);
+        row.validate().unwrap();
+        for end in 0..row.data.len() {
+            let truncated = PackedProps {
+                names: row.names.clone(),
+                data: Arc::from(&row.data[..end]),
+            };
+            assert!(
+                truncated.validate().is_err(),
+                "accepted truncation at {end}"
+            );
+        }
+        for bytes in [
+            vec![7],
+            vec![1, 1, 0xff],
+            vec![1, 0xff],
+            vec![6, 2],
+            vec![0, 0],
+        ] {
+            let bad = PackedProps {
+                names: Arc::from(vec![Arc::from("s")]),
+                data: bytes.into(),
+            };
+            assert!(bad.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn packed_encoder_keeps_first_seen_keys_values_and_float_bits() {
+        use crate::mvt::{
+            EncodedFeatureGeometry, LayerBuilder, StreamingLayerBuilder, TileBuilder,
+        };
+        use crate::vector_tile::tile::GeomType;
+        use prost::Message;
+        let names: Arc<[Arc<str>]> =
+            Arc::from(vec![Arc::from("a"), Arc::from("b"), Arc::from("c")]);
+        let values = [
+            vec![
+                None,
+                Some(PropertyValue::String("héllo".into())),
+                Some(PropertyValue::Double(-0.0)),
+            ],
+            vec![
+                Some(PropertyValue::String("héllo".into())),
+                None,
+                Some(PropertyValue::Float(0.0)),
+            ],
+            vec![
+                Some(PropertyValue::Double(f64::NAN)),
+                Some(PropertyValue::Float(f32::NAN)),
+                Some(PropertyValue::UInt(u64::MAX)),
+            ],
+        ];
+        let packed: Vec<_> = values
+            .iter()
+            .map(|v| PackedProps::pack(names.clone(), v.clone()))
+            .collect();
+        let mut materialized = LayerBuilder::new("test");
+        let mut streaming = StreamingLayerBuilder::new("test", 4096);
+        for (i, row) in packed.iter().enumerate() {
+            let geometry = || EncodedFeatureGeometry::Parts(vec![(vec![9, 2, 2], GeomType::Point)]);
+            let props: Vec<_> = names
+                .iter()
+                .zip(&values[i])
+                .filter_map(|(n, v)| v.clone().map(|v| (n.clone(), v)))
+                .collect();
+            materialized.add_encoded_feature(Some(i as u64), geometry(), &props);
+            streaming.add_borrowed_feature(Some(i as u64), geometry(), row.iter());
+        }
+        let mut tile = TileBuilder::new();
+        tile.add_layer(materialized.build());
+        assert_eq!(streaming.build(), tile.build().encode_to_vec());
+    }
+}

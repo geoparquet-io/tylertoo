@@ -4,8 +4,9 @@ use std::borrow::Cow;
 
 use prost::encoding::{encode_key, encode_varint, encoded_len_varint, message, uint32, WireType};
 
-use super::tag_index::TagIndex;
-use super::{EncodedFeatureGeometry, Feature, PropertyValue};
+#[cfg(test)]
+use super::PropertyValue;
+use super::{tag_index::TagIndex, EncodedFeatureGeometry, Feature, PropertyRef};
 
 pub(crate) struct StreamingLayerBuilder<'a> {
     name: &'a str,
@@ -40,15 +41,29 @@ impl<'a> StreamingLayerBuilder<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn add_encoded_feature<K: AsRef<str>>(
         &mut self,
         id: Option<u64>,
         geometry: EncodedFeatureGeometry,
         properties: &'a [(K, PropertyValue)],
     ) {
+        self.add_borrowed_feature(
+            id,
+            geometry,
+            properties.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
+        );
+    }
+
+    pub(crate) fn add_borrowed_feature(
+        &mut self,
+        id: Option<u64>,
+        geometry: EncodedFeatureGeometry,
+        properties: impl IntoIterator<Item = (&'a str, PropertyRef<'a>)>,
+    ) {
         match geometry {
             EncodedFeatureGeometry::Parts(parts) => {
-                let tags = self.index.tags(
+                let tags = self.index.tags_ref(
                     properties,
                     Cow::Borrowed,
                     |key| bytes_field(3, key.as_bytes(), &mut self.keys),
@@ -123,10 +138,13 @@ impl<'a> StreamingLayerBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::mvt::{LayerBuilder, TileBuilder};
-    use crate::vector_tile::tile::GeomType;
     use prost::Message;
+
+    use super::*;
+    use crate::{
+        mvt::{LayerBuilder, TileBuilder},
+        vector_tile::tile::GeomType,
+    };
 
     #[test]
     fn serialized_layer_is_byte_identical_to_materialized_layer() {

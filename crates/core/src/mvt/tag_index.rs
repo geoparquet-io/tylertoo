@@ -1,9 +1,11 @@
 //! One first-encounter key/value index, shared by materialized and serialized layers.
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::hash::{BuildHasher, Hasher, RandomState};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    hash::{BuildHasher, Hasher, RandomState},
+};
 
-use super::{PropertyValue, ScalarKey};
+use super::{PropertyRef, PropertyValue, ScalarKey};
 
 pub(super) struct TagIndex<'a> {
     keys: HashMap<Cow<'a, str>, u32, TagHash>,
@@ -60,15 +62,15 @@ impl Default for TagIndex<'_> {
 }
 
 impl<'a> TagIndex<'a> {
-    pub(super) fn value<'p>(
+    pub(super) fn value_ref<'p>(
         &mut self,
-        value: &'p PropertyValue,
+        value: PropertyRef<'p>,
         store: &impl Fn(&'p str) -> Cow<'a, str>,
-        inserted: impl FnOnce(&PropertyValue),
+        inserted: impl FnOnce(PropertyRef<'p>),
     ) -> u32 {
         let existing = match value {
-            PropertyValue::String(s) => self.strings.get(s.as_str()),
-            _ => self.scalars.get(&ScalarKey::of(value)),
+            PropertyRef::String(s) => self.strings.get(s),
+            _ => self.scalars.get(&ScalarKey::of(&value.to_owned())),
         };
         if let Some(&index) = existing {
             return index;
@@ -77,11 +79,11 @@ impl<'a> TagIndex<'a> {
         self.values += 1;
         inserted(value);
         match value {
-            PropertyValue::String(s) => {
+            PropertyRef::String(s) => {
                 self.strings.insert(store(s), index);
             }
             _ => {
-                self.scalars.insert(ScalarKey::of(value), index);
+                self.scalars.insert(ScalarKey::of(&value.to_owned()), index);
             }
         }
         index
@@ -91,12 +93,27 @@ impl<'a> TagIndex<'a> {
         &mut self,
         properties: &'p [(K, PropertyValue)],
         store: impl Fn(&'p str) -> Cow<'a, str>,
-        mut new_key: impl FnMut(&str),
+        new_key: impl FnMut(&str),
         mut new_value: impl FnMut(&PropertyValue),
     ) -> Vec<u32> {
-        let mut tags = Vec::with_capacity(properties.len() * 2);
+        self.tags_ref(
+            properties.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
+            store,
+            new_key,
+            |v| new_value(&v.to_owned()),
+        )
+    }
+
+    pub(super) fn tags_ref<'p>(
+        &mut self,
+        properties: impl IntoIterator<Item = (&'p str, PropertyRef<'p>)>,
+        store: impl Fn(&'p str) -> Cow<'a, str>,
+        mut new_key: impl FnMut(&str),
+        mut new_value: impl FnMut(PropertyRef<'p>),
+    ) -> Vec<u32> {
+        let properties = properties.into_iter();
+        let mut tags = Vec::with_capacity(properties.size_hint().1.unwrap_or(0) * 2);
         for (key, value) in properties {
-            let key = key.as_ref();
             let key_index = if let Some(&i) = self.keys.get(key) {
                 i
             } else {
@@ -106,7 +123,7 @@ impl<'a> TagIndex<'a> {
                 i
             };
             tags.push(key_index);
-            tags.push(self.value(value, &store, &mut new_value));
+            tags.push(self.value_ref(value, &store, &mut new_value));
         }
         tags
     }
