@@ -57,8 +57,8 @@ The shares start at 1.92 GiB and 4.8 GiB; earlier grants reduce them.
 These are budget calculations, not a promise about total process memory.
 
 - `auto` sizes concurrency to the allowance and spills output when needed.
-- `bounded` spills output and caps readers at 4 and queues at 16 batches
-  per reader. Row-group encodes start with at most 4. The buffered drain can
+- `bounded` spills output and caps readers at 4 and queues at 4 batches
+  per reader, and holds at most 4 batches in flight through pass 2. Row-group encodes start with at most 4. The buffered drain can
   add encodes using released batch memory, limited by headroom below the
   prior RSS peak and the thread count. The drain can also decode up to 4 spilled batches at once, funded by
   `MemoryBudget::drain_widths` from existing grants: the encode grant above
@@ -225,13 +225,22 @@ peak. The full map rate depends on occupancy and allocator overhead.
 Neither profile spills these maps.
 
 For active clipped members, the current admission model is
-`q = 2 × stored bytes/row + 224 + 208 × published properties`.
+`q = 2 × stored bytes/row + 224 + 120 × published properties`.
 The default merge valve adds 384 B/member to wave, group, and store sizing.
-For a 100-byte stored row with four properties, `q = 1256` B and the
-merge fit price is 1640 B/member. A million active members then price at
-1.64 GB (1.53 GiB), before separately charged caches and reader buffers.
+For a 100-byte stored row with four properties, `q = 904` B and the
+merge fit price is 1288 B/member. A million active members then price at
+1.29 GB (1.20 GiB), before separately charged caches and reader buffers.
 These constants model geometry and property values alongside encoding and
-valve workspace. They are not fixed struct widths or new measurements.
+valve workspace. They are not fixed struct widths. The property price was
+208 B before packed rows (#874); a row's properties are now one shared byte
+buffer, and each property measured 80–110 B; 120 B is the smallest round value
+that covers every measured shape with properties (four numeric set it), not
+the buffer's size.
+
+The spill fill buffer charges a member its struct, 16 B per coordinate, and
+its packed row's bytes. Each spilled member carries its row bytes verbatim
+and a table index; the schema tables stay in RAM beside the file and are
+small (one per distinct published column set).
 
 Export collection and encoding use shares equivalent to half the probed
 memory without prior charges (`0.60 × 5/6 = 0.50`). Earlier grants

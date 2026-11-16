@@ -611,7 +611,8 @@ pub struct ConvertOptions {
     /// well as read-ahead. Default [`IN_FLIGHT_BATCHES_AUTO`], which
     /// [`resolve_in_flight_batches`] expands to the machine's available
     /// parallelism (clamped to `[IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX]`)
-    /// at pass-2 setup; any explicit positive value is honoured verbatim.
+    /// at pass-2 setup; any explicit positive value is honoured verbatim, except that pass 2
+    /// under `bounded` holds at most 4 in flight.
     /// Higher improves core utilization at proportionally more peak memory
     /// (`in_flight_batches × read_batch_size` input rows resident, plus the
     /// window's output batches). 1 or 2 processes one batch at a time. Output
@@ -1043,7 +1044,7 @@ pub const IN_FLIGHT_BATCHES_MAX: usize = 16;
 /// [`std::thread::available_parallelism`], clamped to
 /// `[IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX]`; any explicit positive
 /// value is honoured verbatim (uncapped — the caller opted in to the memory
-/// cost). Output is byte-identical for every value: in-flight depth only sets
+/// cost), except that pass 2 under `bounded` holds at most 4 in flight. Output is byte-identical for every value: in-flight depth only sets
 /// read/compute overlap, never level assignment or write order (see the
 /// `pipelined_in_flight_matches_reference` equivalence test).
 pub fn resolve_in_flight_batches(requested: usize) -> usize {

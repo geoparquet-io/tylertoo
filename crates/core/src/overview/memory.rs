@@ -13,8 +13,8 @@
 //! The [`MemoryProfile`] decides what `fit` grants, the same way for every
 //! phase:
 //!
-//! - `bounded` keeps main's caps per phase; the allowance can only shrink
-//!   them ([`MemoryPhase::bounded_cap`], #788).
+//! - `bounded` caps each phase at or below main's; the allowance can only shrink
+//!   the caps ([`MemoryPhase::bounded_cap`], #788).
 //! - `auto` takes what the phase's share of the allowance affords, clamped
 //!   to the phase's floor and what it wants.
 //! - `speed` takes what it wants.
@@ -50,6 +50,12 @@ const READ_SHARE: f64 = 0.10;
 /// pass 2's peak rose 192-300 MiB with the split, about 20 MiB per thread,
 /// and fell below main's with `MIMALLOC_PURGE_DELAY=0`.
 const READ_DECODE_THREAD_BYTES: u64 = 24 << 20;
+
+/// Most batches `bounded` keeps in flight through pass 2's read channel and
+/// compute window (#874 RA sweep): with the read-ahead at its floor, 16 -> 4
+/// took Moldova's convert peak 868 -> 697 MiB and Overture places' 1069 -> 903
+/// for 3-5% wall, the knee before one reader (+38% wall on places).
+const BOUNDED_IN_FLIGHT_BATCHES: usize = 4;
 
 /// Share of the allowance the pass-2 compute window may hold (#716).
 const COMPUTE_SHARE: f64 = 0.10;
@@ -138,9 +144,11 @@ impl MemoryPhase {
 
     /// Main's `bounded` cap for this phase, out of `want` units with `floor`
     /// at the least: what a `bounded` grant may never exceed (#788). The
-    /// read-ahead and the compute window wanted what the caller asked for
-    /// and were cut by the allowance, as now, so their cap is `want` (the
-    /// read shape applies main's per-worker caps itself, `read.rs`). The
+    /// read-ahead wanted what the caller asked for and was cut by the
+    /// allowance, so its cap is `want` (the read shape applies the
+    /// per-worker caps itself, `read.rs`); pass 2's total in-flight
+    /// depth (read-ahead channel plus compute window) is capped at 4
+    /// ([`MemoryBudget::pass2_in_flight`]). The
     /// writer encoded at most [`ENCODE_FLOOR`] row groups, which is the
     /// encode floor. Export and fill held no store under `bounded`: their
     /// floor is main's shape. Remote staging held at most main's staging
@@ -518,6 +526,14 @@ impl MemoryBudget {
             ),
         }
     }
+    /// Batches pass 2 keeps in flight: `requested`, held to
+    /// [`BOUNDED_IN_FLIGHT_BATCHES`] under `bounded`.
+    pub(super) fn pass2_in_flight(profile: MemoryProfile, requested: usize) -> usize {
+        match profile {
+            MemoryProfile::Bounded => requested.min(BOUNDED_IN_FLIGHT_BATCHES),
+            MemoryProfile::Auto | MemoryProfile::Speed => requested,
+        }
+    }
     /// The pass-2 compute window (#494, #716): `requested` batches of
     /// `price` wanted, one at the floor, granted per [`fit`](Self::fit).
     pub(super) fn compute_window(
@@ -732,6 +748,19 @@ impl MemoryBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_holds_pass2_in_flight_to_its_cap_and_others_do_not() {
+        for requested in [1, BOUNDED_IN_FLIGHT_BATCHES, 16, 64] {
+            assert_eq!(
+                MemoryBudget::pass2_in_flight(MemoryProfile::Bounded, requested),
+                requested.min(BOUNDED_IN_FLIGHT_BATCHES)
+            );
+            for p in [MemoryProfile::Auto, MemoryProfile::Speed] {
+                assert_eq!(MemoryBudget::pass2_in_flight(p, requested), requested);
+            }
+        }
+    }
 
     /// #876: the readers' quarter of the cores is shared among them for
     /// column-split decode, each extra thread charged its allocator

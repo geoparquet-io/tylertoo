@@ -11,14 +11,21 @@
 //!
 //! Reference: <https://github.com/mapbox/vector-tile-spec>
 
-use crate::box_pairs::any_box_pair;
-use crate::tile::TileBounds;
-use crate::vector_tile::tile::{Feature, GeomType, Layer, Value};
-use crate::vector_tile::Tile;
-use geo::orient::{Direction, Orient};
-use geo::CoordsIter;
-use geo::{Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use std::collections::HashMap;
+
+use geo::{
+    orient::{Direction, Orient},
+    CoordsIter, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
+};
+
+use crate::{
+    box_pairs::any_box_pair,
+    tile::TileBounds,
+    vector_tile::{
+        tile::{Feature, GeomType, Layer, Value},
+        Tile,
+    },
+};
 
 mod streaming_layer;
 mod tag_index;
@@ -1390,7 +1397,52 @@ pub enum PropertyValue {
     Bool(bool),
 }
 
+/// Borrowed view used while decoding packed export rows. Strings stay in the row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PropertyRef<'a> {
+    String(&'a str),
+    Float(f32),
+    Double(f64),
+    Int(i64),
+    UInt(u64),
+    Bool(bool),
+}
+
+impl PropertyRef<'_> {
+    pub(crate) fn to_owned(self) -> PropertyValue {
+        match self {
+            Self::String(s) => PropertyValue::String(s.to_owned()),
+            Self::Float(v) => PropertyValue::Float(v),
+            Self::Double(v) => PropertyValue::Double(v),
+            Self::Int(v) => PropertyValue::Int(v),
+            Self::UInt(v) => PropertyValue::UInt(v),
+            Self::Bool(v) => PropertyValue::Bool(v),
+        }
+    }
+
+    pub(crate) fn to_mvt_value(self) -> Value {
+        match self {
+            Self::String(s) => Value {
+                string_value: Some(s.to_owned()),
+                ..Default::default()
+            },
+            _ => self.to_owned().to_mvt_value(),
+        }
+    }
+}
+
 impl PropertyValue {
+    pub(crate) fn as_ref(&self) -> PropertyRef<'_> {
+        match self {
+            Self::String(s) => PropertyRef::String(s),
+            Self::Float(v) => PropertyRef::Float(*v),
+            Self::Double(v) => PropertyRef::Double(*v),
+            Self::Int(v) => PropertyRef::Int(*v),
+            Self::UInt(v) => PropertyRef::UInt(*v),
+            Self::Bool(v) => PropertyRef::Bool(*v),
+        }
+    }
+
     /// Convert to MVT Value type, each number in its shortest exact
     /// encoding: a double the 4-byte float holds exactly as that float, a
     /// negative integer as a zigzag `sint`. Readers get the same number.
@@ -1684,8 +1736,8 @@ impl LayerBuilder {
 
     /// Encode tags as `[key_idx, value_idx, key_idx, value_idx, ...]`.
     fn encode_tags<K: AsRef<str>>(&mut self, properties: &[(K, PropertyValue)]) -> Vec<u32> {
-        self.index.tags(
-            properties,
+        self.index.tags_ref(
+            properties.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
             |s| std::borrow::Cow::Owned(s.to_owned()),
             |key| self.keys.push(key.to_owned()),
             |v| self.values.push(v.to_mvt_value()),
@@ -1741,9 +1793,10 @@ impl Default for TileBuilder {
 
 #[cfg(test)]
 mod tests {
+    use geo::{line_string, point, polygon};
+
     use super::*;
     use crate::tile::TileCoord;
-    use geo::{line_string, point, polygon};
 
     // ------------------------------------------------------------------------
     // Zigzag Encoding Tests
@@ -3644,9 +3697,11 @@ mod tests {
         let got: Vec<u32> = values
             .iter()
             .map(|v| {
-                index.value(v, &|s| std::borrow::Cow::Owned(s.to_owned()), |v| {
-                    interned.push(v.to_mvt_value())
-                })
+                index.value_ref(
+                    v.as_ref(),
+                    &|s| std::borrow::Cow::Owned(s.to_owned()),
+                    |v| interned.push(v.to_mvt_value()),
+                )
             })
             .collect();
         assert_eq!(got, expected, "value indexes diverged from the Debug key");
@@ -4569,8 +4624,9 @@ mod tile_space_validity_748 {
     //! before #748: each is encoded through the production entry point,
     //! decoded, and checked with `geo`'s validator and the GEOS rules of
     //! [`tile_polygon::check_polygons`].
-    use super::*;
     use geo::Validation;
+
+    use super::*;
 
     fn unit_bounds() -> TileBounds {
         TileBounds::new(0.0, 0.0, 1.0, 1.0)

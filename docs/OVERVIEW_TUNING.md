@@ -2107,16 +2107,16 @@ processed at once, and how many row groups the writer encodes at once.
   the least wall time with no temp I/O, but peak RAM grows with total
   *output* size.
 - **`bounded`** spills each level's rows to temporary Arrow IPC files and
-  streams them back at write time. Pass 1 and the read keep fixed caps,
-  which the allowance can only shrink: at most 4 readers, each at most
-  16 batches deep. Row-group encodes start with at most 4. The buffered drain
+  streams them back at write time. Each phase is capped at or below
+  main's, and the allowance can only shrink the caps: at most 4 readers
+  4 batches deep, at most 4 batches in flight through pass 2 whatever
+  `--in-flight-batches` asks for, and 4 encodes (row-group encodes start with at most 4). The buffered drain
   can add encodes using released batch memory, limited by headroom below
   the prior RSS peak and the thread count. The drain can also decode up to 4 spilled batches at once, funded by
   `MemoryBudget::drain_widths` from existing grants: the encode grant above
   its floor, then the finished read's. Remote staging holds at most
   256 MiB of requests in flight, or
-  `TYLERTOO_STAGING_MEM_BUDGET_BYTES` when set. The compute window takes
-  what `--in-flight-batches` asks for, within the allowance. Pass-1 tables
+  `TYLERTOO_STAGING_MEM_BUDGET_BYTES` when set. Pass-1 tables
   and the writer's tile entries still need resident memory.
 - **`auto`**, the default, sizes the run to the machine. Every phase fits
   inside one allowance: 60% of available memory, or of
