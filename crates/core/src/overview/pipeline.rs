@@ -2343,7 +2343,7 @@ mod spill_tests {
     /// Exercise real convert admission and the production drain call site.
     /// Only RSS headroom is injected: process-global HWM is test-order dependent.
     #[test]
-    fn convert_spill_uses_multiple_decoders_and_serial_fallback() {
+    fn convert_spill_serial_fallback_matches_bounded_drain() {
         use arrow_array::StringArray;
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.parquet");
@@ -2403,22 +2403,12 @@ mod spill_tests {
                 assert!(!observed.threads.is_empty(), "fallback must really decode");
                 assert_eq!(Some(bytes), parallel, "fallback changed output");
             } else {
-                assert!(
-                    observed.indexed > 4,
-                    "multiple indexed windows must run: {observed:?}"
-                );
-                assert!(
-                    observed.threads.len() > 1,
-                    "more than one decoder must run: {observed:?}"
-                );
-                assert!(
-                    observed.threads.len() <= 4,
-                    "new decoder threads per level: {observed:?}"
-                );
-                assert_eq!(
-                    observed.outside_pool, 0,
-                    "decode escaped admitted pool: {observed:?}"
-                );
+                // #874 RA: `bounded` holds 4 batches in flight, so the drain
+                // has no read bytes to fund indexed decoders: it decodes
+                // serially on the read workers. `drain_tests` covers indexed
+                // decode directly.
+                assert_eq!(observed.indexed, 0, "bounded drain decodes serially");
+                assert!(!observed.threads.is_empty(), "the drain must decode");
                 parallel = Some(bytes);
             }
         }
