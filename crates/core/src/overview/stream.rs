@@ -3928,7 +3928,10 @@ pub(crate) fn run_stages(
     // every candidate collapsed during simplification (#211).
     // Resolve the in-flight depth once (auto-sizes from available cores when
     // the caller left it at IN_FLIGHT_BATCHES_AUTO) and surface it (#264).
-    let in_flight_batches = resolve_and_log_in_flight_batches("pass 2", options.in_flight_batches);
+    let in_flight_batches = MemoryBudget::pass2_in_flight(
+        options.profile,
+        resolve_and_log_in_flight_batches("pass 2", options.in_flight_batches),
+    );
 
     let (level_stats, pass2_engine_timers, sink_measurement, pass2_ledger) = run_pass2_levels(
         budget,

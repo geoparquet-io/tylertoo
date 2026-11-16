@@ -74,7 +74,11 @@ pub(super) enum ReadFlow {
 /// parallel read exists to speed up (#494's Brazil measurement is a
 /// `--profile bounded` run). A ceiling on depth never costs a worker, and it
 /// only binds when `affordable / workers` was already above it.
-const READ_AHEAD_BOUNDED_MAX_BATCHES: usize = READ_AHEAD_MAX_BATCHES / 2;
+///
+/// 4, the floor (#874 RA sweep): peak RSS fell with every step down from 16
+/// (Moldova -18%, Overture places -13%) at 0-9% wall, and the floor is as low
+/// as a worker may go.
+const READ_AHEAD_BOUNDED_MAX_BATCHES: usize = READ_AHEAD_MIN_BATCHES;
 
 /// Most read workers under `bounded`: main's cap, its auto reader count's
 /// ceiling (`convert::READ_WORKERS_MAX`), applied to an explicit
