@@ -29,10 +29,13 @@ def mercator_square(u0, v0, u1, v1):
     return shapely.box(x0 + u0 * s, ytop - v1 * s, x0 + u1 * s, ytop - v0 * s)
 
 
-def decoded(*rects):
-    feats = [{"geometry": {"type": "Polygon", "coordinates": [list(shapely.box(*r).exterior.coords)]},
+def decoded(*rects, extent=4096):
+    """One layer of `rects`, given at extent 4096 and stored at `extent`."""
+    k = extent / 4096
+    feats = [{"geometry": {"type": "Polygon", "coordinates": [
+                 list(shapely.box(*(v * k for v in r)).exterior.coords)]},
               "properties": {}, "id": i} for i, r in enumerate(rects)]
-    return {"l": {"extent": 4096, "features": feats}}
+    return {"l": {"extent": extent, "features": feats}}
 
 
 SRC = Source([mercator_square(1000, 1000, 2000, 2000), mercator_square(2000, 1000, 3000, 2000)])
@@ -66,3 +69,17 @@ def test_overlap_the_source_has_is_not_new():
                    Z, X, Y, 16)
     assert r["overlap"] == pytest.approx(1)
     assert r["overlap_new"] == pytest.approx(0, abs=1e-9)
+
+
+def test_three_stacked_features_overlap_once():
+    square = mercator_square(1000, 1000, 2000, 2000)
+    r = score_tile(Source([square]), decoded(*[(1000, 1000, 2000, 2000)] * 3), Z, X, Y, 16)
+    assert r["overlap"] == pytest.approx(1)
+
+
+def test_layers_at_other_extents_are_rescaled():
+    tiles = {**decoded((1000, 1000, 2000, 2000)),
+             "m": decoded((2000, 1000, 3000, 2000), extent=8192)["l"]}
+    r = score_tile(SRC, tiles, Z, X, Y, 16)
+    assert r["drawn"] == pytest.approx(1)
+    assert r["overlap"] == pytest.approx(0, abs=1e-9)

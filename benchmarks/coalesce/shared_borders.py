@@ -110,11 +110,12 @@ def stacked(geoms: list):
 
 def score_tile(src, decoded: dict, z: int, x: int, y: int, band: float) -> dict | None:
     import shapely
+    from shapely.affinity import scale
     from shapely.geometry import box
 
-    # Both in tile units at the decoded layers' extent, y down.
-    extent = next((layer.get("extent", EXTENT_DEFAULT) for layer in decoded.values()),
-                  EXTENT_DEFAULT)
+    # Everything in tile units at EXTENT_DEFAULT, y down; features rescale
+    # from their own layer's extent.
+    extent = EXTENT_DEFAULT
     tile_box = box(0, 0, extent, extent)
     idx = src.tree.query(box(*tile_bounds_3857(z, x, y)))
     parts = [shapely.make_valid(_in_tile_units(g, z, x, y, extent)) for g in src.geoms[idx]]
@@ -128,10 +129,12 @@ def score_tile(src, decoded: dict, z: int, x: int, y: int, band: float) -> dict 
         return None
     source = shapely.union_all(parts)
     area = source.area
-    drawn = [shapely.make_valid(g).intersection(tile_box) for g, _, _ in features(decoded, POLYGON)]
+    drawn = [shapely.make_valid(scale(g, extent / e, extent / e, origin=(0, 0))).intersection(tile_box)
+             for g, _, e in features(decoded, POLYGON)]
     drawn = [g for g in drawn if g.area > 0]
     union = shapely.union_all(drawn) if drawn else shapely.Polygon()
     gaps = source.difference(union)
+    drawn_stacked = stacked(drawn) if drawn else shapely.Polygon()
     # The outline less the tile edge: the coverage's own edge, where outline
     # simplification moves the border with no neighbour involved.
     outline = source.boundary.difference(tile_box.exterior.buffer(1e-6)).buffer(band)
@@ -139,10 +142,10 @@ def score_tile(src, decoded: dict, z: int, x: int, y: int, band: float) -> dict 
         "drawn": source.intersection(union).area / area,
         "missing": gaps.area / area,
         "missing_inner": gaps.difference(outline).area / area,
-        "overlap": (sum(g.area for g in drawn) - union.area) / area,
+        "overlap": drawn_stacked.area / area,
         # Sources overlap themselves (NZ parcels stack unit titles): only
         # overlap where the source has none is the tiler's.
-        "overlap_new": stacked(drawn).difference(src_stacked).area / area,
+        "overlap_new": drawn_stacked.difference(src_stacked).area / area,
         "source_cover": area / (extent * extent),
     }
 
@@ -213,15 +216,17 @@ def cmd_run(args) -> int:
             print(name, setting, json.dumps(cells[setting]["score"]["mean"]), flush=True)
         if args.tippecanoe:
             fgb = work / f"{name}.fgb"
-            if not fgb.exists():
+            if not fgb.exists() and not args.score_only:
                 subprocess.run(["uvx", "--from", "geoparquet-io==1.7.0", "gpio", "convert",
                                 "flatgeobuf", str(source), str(fgb)], check=True)
             for key, flags in TIPPECANOE.items():
                 pm = work / f"{name}-{key}.pmtiles"
-                if not pm.exists() or args.rerun_tippecanoe:
-                    cells[key] = build_tippecanoe(args.tippecanoe_bin, fgb, pm, ds, flags)
-                else:
+                if args.score_only and not pm.exists():
+                    raise SystemExit(f"--score-only: {pm} is missing")
+                if args.score_only or (pm.exists() and not args.rerun_tippecanoe):
                     cells[key] = {"cached": True, "pmtiles_bytes": pm.stat().st_size}
+                else:
+                    cells[key] = build_tippecanoe(args.tippecanoe_bin, fgb, pm, ds, flags)
                 cells[key]["score"] = score(pm, src, tiles, args.band)
                 print(name, key, json.dumps(cells[key]["score"]["mean"]), flush=True)
         report["datasets"][name] = {"source": str(source), "tiles": [f"{z}/{x}/{y}" for z, x, y in tiles],
@@ -284,6 +289,8 @@ def main() -> int:
     s.add_argument("--densest", type=int, default=5)
     s.add_argument("--json", type=Path)
     args = ap.parse_args()
+    if args.cmd == "run" and args.score_only and args.rerun_tippecanoe:
+        ap.error("--score-only builds nothing: drop --rerun-tippecanoe")
     return cmd_run(args) if args.cmd == "run" else cmd_score(args)
 
 
