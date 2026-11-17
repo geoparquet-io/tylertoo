@@ -103,8 +103,10 @@ pub enum Error {
     #[error("refusing a malformed Arrow IPC footer: {0}")]
     HostileIpcFooter(String),
     /// A page header reads past the end of the file (#789): no honest one
-    /// does, and a crafted one costs minutes of CPU there.
-    #[error("unexpected end of file")]
+    /// does, and a crafted one costs minutes of CPU there. Or a dictionary
+    /// page declares more values than its bytes hold (#894), which
+    /// parquet-rs would allocate before decoding one.
+    #[error("refusing a malformed Parquet page header")]
     HostilePageHeader,
 }
 

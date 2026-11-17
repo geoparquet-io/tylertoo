@@ -219,8 +219,27 @@ fn overview_file_seeds() {
     // #683's crash input: a crafted ARROW:schema key, refused (#779).
     replay(
         "overview_file",
-        &["seed-issue-683-arrow-schema.parquet"],
+        &[
+            "seed-issue-683-arrow-schema.parquet",
+            "seed-issue-894-dictionary-count.parquet",
+        ],
         tylertoo_core::internal::overview::reader::fuzz_overview_file,
+    );
+    // #894: a dictionary page claiming 1.4 billion INT64 values in a few
+    // bytes. parquet-rs sizes the dictionary (11 GB) before decoding it;
+    // with overcommit that can pass here, so only the error's kind proves the
+    // page guard refused the header first.
+    let (_, bytes) = seeds("overview_file")
+        .into_iter()
+        .find(|(n, _)| n == "seed-issue-894-dictionary-count.parquet")
+        .unwrap();
+    let err = tylertoo_core::internal::overview::reader::fuzz_overview_file(&bytes).unwrap_err();
+    assert!(
+        matches!(
+            tylertoo_io::input_error(&err),
+            Some(tylertoo_io::Error::HostilePageHeader)
+        ),
+        "{err:?}"
     );
 }
 
