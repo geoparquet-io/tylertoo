@@ -1255,6 +1255,30 @@ fn polygon_area_f32(g: &Geometry<f64>) -> f32 {
     }
 }
 
+/// The accumulator's per-level settings: enabled on every planned level but
+/// the finest where the collapse mode and the level's representation draw
+/// placeholder squares.
+fn accumulate_levels(
+    options: &ConvertOptions,
+    level_specs: &[(f64, Option<u8>)],
+    level_reprs: &[Representation],
+) -> Vec<AccumulateLevel> {
+    let finest_planned = level_specs.len().saturating_sub(1);
+    level_specs
+        .iter()
+        .enumerate()
+        .map(|(l, &(gsd, zoom))| {
+            AccumulateLevel::new(
+                gsd,
+                zoom,
+                l != finest_planned
+                    && accumulator_requested(options)
+                    && level_accumulates(options.simplify.collapse, level_reprs[l]),
+            )
+        })
+        .collect()
+}
+
 /// Run the tiny-polygon accumulator (#384) for the streaming path: per
 /// planned level, the sorted row indices of its carriers; empty per level
 /// unless the accumulator applies there. `cell_winner_levels` are the levels
@@ -1269,20 +1293,7 @@ fn build_carriers(
     level_reprs: &[Representation],
     crs: Crs,
 ) -> Vec<Vec<usize>> {
-    let finest_planned = level_specs.len().saturating_sub(1);
-    let acc_levels: Vec<AccumulateLevel> = level_specs
-        .iter()
-        .enumerate()
-        .map(|(l, &(gsd, zoom))| {
-            AccumulateLevel::new(
-                gsd,
-                zoom,
-                l != finest_planned
-                    && accumulator_requested(options)
-                    && level_accumulates(options.simplify.collapse, level_reprs[l]),
-            )
-        })
-        .collect();
+    let acc_levels = accumulate_levels(options, level_specs, level_reprs);
     if !acc_levels.iter().any(|l| l.enabled) {
         return vec![Vec::new(); level_specs.len()];
     }
@@ -2514,10 +2525,13 @@ fn resolve_winner_tables(
     // instead of keeping the cell-winner table, and only when the budget can
     // move a polygon (it leaves unbudgeted kinds at their cell-winner level)
     // and the accumulator will read it.
-    let cell_winner_levels: Option<Vec<u8>> = (options.density.enabled
+    let snapshot = options.density.enabled
         && options.density.kinds.polygons
-        && accumulator_requested(options))
-    .then(|| assignment.assignments.iter().map(|a| a.min_level).collect());
+        && accumulate_levels(options, &level_specs, &level_reprs)
+            .iter()
+            .any(|l| l.enabled);
+    let cell_winner_levels: Option<Vec<u8>> =
+        snapshot.then(|| assignment.assignments.iter().map(|a| a.min_level).collect());
     if options.density.enabled {
         assignment = apply_density_budget(
             &assignment,
