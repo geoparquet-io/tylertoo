@@ -2605,8 +2605,10 @@ fn gzip_plain_bound(raw: &[u8]) -> u64 {
 }
 
 impl MergeTileGroup {
-    fn combine(&self, bands: &[Band]) -> Result<(Vec<u8>, Vec<u8>), PyramidError> {
-        combine_joined_tile(&self.raw, &self.refs, self.coord, bands, true)
+    fn combine(&self, bands: &[Band]) -> Result<JoinedBytes, PyramidError> {
+        let mut buf = Vec::new();
+        let gz = combine_joined_tile(&self.raw, &self.refs, self.coord, bands, true, &mut buf)?;
+        Ok((buf, gz))
     }
 
     fn memory_bound(&self) -> usize {
@@ -2677,11 +2679,33 @@ struct MergeAppend<'a> {
     shared_zooms: &'a [u8],
     retry: JoinedTileRetry<'a>,
     diagnostics: &'a crate::diagnostics::Diagnostics,
+    /// The joined tile; one buffer reused across a serial merge, so bounded
+    /// runs do not re-fault a fresh allocation per tile.
+    buf: Vec<u8>,
 }
 
 impl MergeAppend<'_> {
+    /// Combine a run's joins on `pool`, in tile-id order so errors are
+    /// returned by tile id, not worker completion order. A join the retry
+    /// will replace is skipped. Without a pool (bounded) nothing is combined
+    /// here: `append` combines each join into its reused buffer.
+    fn combine_run(
+        &self,
+        pool: Option<&rayon::ThreadPool>,
+        run: &[MergeTileGroup],
+    ) -> Vec<Option<Result<JoinedBytes, PyramidError>>> {
+        let combine = |tile: &MergeTileGroup| {
+            (tile.raw.len() > 1 && !self.retry.will_replace(tile.coord.z, tile.id))
+                .then(|| tile.combine(self.bands))
+        };
+        pool.map_or_else(Vec::new, |pool| {
+            pool.install(|| run.par_iter().map(combine).collect())
+        })
+    }
+
     /// Append one gathered tile; `false` for a join the joint valve emptied,
-    /// which is omitted (#814).
+    /// which is omitted (#814). A join without a `combined` result from a
+    /// parallel run is combined here, into the reused buffer.
     fn append(
         &mut self,
         writer: &mut StreamingPmtilesWriter,
@@ -2689,7 +2713,7 @@ impl MergeAppend<'_> {
         combined: Option<Result<JoinedBytes, PyramidError>>,
     ) -> Result<bool, PyramidError> {
         let (coord, refs, joint) = (tile.coord, tile.refs.as_slice(), self.joint);
-        let Some(combined) = combined else {
+        if tile.raw.len() == 1 {
             let from_source =
                 joint.is_some_and(|(_, sources)| has_joint_sources(refs, coord.z, sources));
             let export = joint
@@ -2706,7 +2730,7 @@ impl MergeAppend<'_> {
                 self.diagnostics,
             )?;
             return Ok(true);
-        };
+        }
         // Over-cap source joins are refitted one wave at a time, in id order.
         self.retry.start_chunk(coord.z, tile.id, self.diagnostics)?;
         if let Some(fitted) = self.retry.replacements.remove(&tile.id) {
@@ -2714,10 +2738,17 @@ impl MergeAppend<'_> {
         }
         // A gzip trailer is only a hint: retry serially with the original cap
         // for trailing data, corrupt trailers and the original error messages.
-        let (mut buf, gz) =
-            combined.or_else(|_| combine_joined_tile(&tile.raw, refs, coord, self.bands, false))?;
+        let gz = match combined {
+            Some(Ok((buf, gz))) => {
+                self.buf = buf;
+                gz
+            }
+            Some(Err(_)) | None => {
+                combine_joined_tile(&tile.raw, refs, coord, self.bands, false, &mut self.buf)?
+            }
+        };
         let gz = cap_joined_tile(
-            &mut buf,
+            &mut self.buf,
             gz,
             refs,
             coord,
@@ -2725,7 +2756,7 @@ impl MergeAppend<'_> {
             joint,
             self.diagnostics,
         )?;
-        append_compressed_tile(writer, coord, &gz, buf.len())?;
+        append_compressed_tile(writer, coord, &gz, self.buf.len())?;
         Ok(true)
     }
 }
@@ -2773,15 +2804,25 @@ fn gather_merge_tile(
     Ok(())
 }
 
+/// Band inputs of every combined join, so a test can see what was combined.
+#[cfg(test)]
+static COMBINED_INPUTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 fn combine_joined_tile(
     raw: &[Vec<u8>],
     refs: &[(usize, std::ops::Range<usize>)],
     coord: crate::tile::TileCoord,
     bands: &[Band],
     bounded: bool,
-) -> Result<(Vec<u8>, Vec<u8>), PyramidError> {
+    buf: &mut Vec<u8>,
+) -> Result<Vec<u8>, PyramidError> {
+    #[cfg(test)]
+    COMBINED_INPUTS
+        .lock()
+        .unwrap()
+        .extend(refs.iter().map(|(bi, _)| bands[*bi].input.clone()));
     let crate::tile::TileCoord { z, x, y } = coord;
-    let mut buf = Vec::new();
+    buf.clear();
     for (raw, (bi, _)) in raw.iter().zip(refs) {
         let limit = if bounded {
             gzip_plain_bound(raw)
@@ -2801,9 +2842,12 @@ fn combine_joined_tile(
         buf.extend_from_slice(&plain);
     }
     // Keep one compressed-byte dedup keyspace for joined and copied tiles (#403).
-    let gz = compression::compress(&buf, Compression::Gzip)
-        .map_err(|error| PyramidError::TileCompress { z, x, y, error })?;
-    Ok((buf, gz))
+    compression::compress(buf, Compression::Gzip).map_err(|error| PyramidError::TileCompress {
+        z,
+        x,
+        y,
+        error,
+    })
 }
 
 /// [`merge_bands`] with [`BandMergeOptions`]: a band's declared zoom range
@@ -3178,6 +3222,15 @@ impl<'a> JoinedTileRetry<'a> {
         })
     }
 
+    /// Whether the merge will append a fitted replacement for this id.
+    fn will_replace(&self, zoom: u8, id: u64) -> bool {
+        self.replacements.contains_key(&id)
+            || self
+                .pending
+                .get(&zoom)
+                .is_some_and(|p| p.tiles.contains(&id))
+    }
+
     fn start_chunk(
         &mut self,
         zoom: u8,
@@ -3518,6 +3571,7 @@ fn merge_prepared_bands(
             shared_zooms: &shared_zooms,
             retry: JoinedTileRetry::new(bands, &archives, joint)?,
             diagnostics,
+            buf: Vec::new(),
         };
         // One cached (range, bytes) per band, for the same reason
         // `for_each_tile` caches: a run-length entry gives every id of the run
@@ -3533,15 +3587,10 @@ fn merge_prepared_bands(
         let mut combine_pool: Option<rayon::ThreadPool> = None;
         let mut flush = |run: &mut Vec<MergeTileGroup>| -> Result<(), PyramidError> {
             prepare_combine_pool(&mut combine_pool, options.profile, run)?;
-            let combine = |tile: &MergeTileGroup| (tile.raw.len() > 1).then(|| tile.combine(bands));
-            // Collect every result so errors are returned by tile id, not worker completion order.
-            let results: Vec<_> = match &combine_pool {
-                Some(pool) => pool.install(|| run.par_iter().map(combine).collect()),
-                None => run.iter().map(combine).collect(),
-            };
-            for (tile, result) in run.drain(..).zip(results) {
-                let joined = result.is_some();
-                if append.append(&mut writer, tile, result)? {
+            let mut results = append.combine_run(combine_pool.as_ref(), run).into_iter();
+            for tile in run.drain(..) {
+                let joined = tile.raw.len() > 1;
+                if append.append(&mut writer, tile, results.next().flatten())? {
                     total += 1;
                     combined += usize::from(joined);
                 }
@@ -6456,6 +6505,16 @@ mod tests {
         assert!(
             stored(&bands, Some(parts)) <= parts,
             "the join was refitted"
+        );
+    }
+
+    #[test]
+    fn joined_retry_skips_combining_a_replaced_tile() {
+        let (dir, _) = emptied_join(None);
+        let combined = COMBINED_INPUTS.lock().unwrap();
+        assert!(
+            !combined.iter().any(|input| input.starts_with(dir.path())),
+            "the refitted join is not combined only to be thrown away"
         );
     }
 
