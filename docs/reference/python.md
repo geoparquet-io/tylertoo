@@ -123,7 +123,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `drop_gamma`: How strongly the budget spares sparse areas.
 * `density_drop`: Apply the per-level feature budget, or `None` for on (off with `verbatim`). It thins points only unless `drop_lines` or `drop_polygons` is set.
 * `drop_lines`: Apply the feature budget to lines too.
-* `drop_polygons`: Apply the feature budget to polygons too, which leaves holes in a polygon coverage.
+* `drop_polygons`: Apply the feature budget to polygons too, which leaves holes in a polygon coverage. Polygons too small to see (outside `square` representation bands), or removed by `polygon_thinning`, still become placeholder squares; `no_collapse=True` removes them outside `square` bands.
 
 #### Clustering
 

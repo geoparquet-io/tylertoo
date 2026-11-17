@@ -1255,20 +1255,16 @@ fn polygon_area_f32(g: &Geometry<f64>) -> f32 {
     }
 }
 
-/// Run the tiny-polygon accumulator (#384) for the streaming path: per
-/// planned level, the sorted row indices of its carriers; empty per level
-/// unless the accumulator applies there.
-fn build_carriers(
+/// The accumulator's per-level settings: enabled on every planned level but
+/// the finest where the collapse mode and the level's representation draw
+/// placeholder squares.
+fn accumulate_levels(
     options: &ConvertOptions,
-    features: &FeatureTable,
-    feat_min_levels: &[u8],
-    areas: Vec<f32>,
     level_specs: &[(f64, Option<u8>)],
     level_reprs: &[Representation],
-    crs: Crs,
-) -> Vec<Vec<usize>> {
+) -> Vec<AccumulateLevel> {
     let finest_planned = level_specs.len().saturating_sub(1);
-    let acc_levels: Vec<AccumulateLevel> = level_specs
+    level_specs
         .iter()
         .enumerate()
         .map(|(l, &(gsd, zoom))| {
@@ -1280,14 +1276,31 @@ fn build_carriers(
                     && level_accumulates(options.simplify.collapse, level_reprs[l]),
             )
         })
-        .collect();
+        .collect()
+}
+
+/// Run the tiny-polygon accumulator (#384) for the streaming path: per
+/// planned level, the sorted row indices of its carriers; empty per level
+/// unless the accumulator applies there. `cell_winner_levels` are the levels
+/// before the density budget: only gate/thinning losers contribute, never
+/// polygons the rate dropped (#875).
+fn build_carriers(
+    options: &ConvertOptions,
+    features: &FeatureTable,
+    cell_winner_levels: &[u8],
+    areas: Vec<f32>,
+    level_specs: &[(f64, Option<u8>)],
+    level_reprs: &[Representation],
+    crs: Crs,
+) -> Vec<Vec<usize>> {
+    let acc_levels = accumulate_levels(options, level_specs, level_reprs);
     if !acc_levels.iter().any(|l| l.enabled) {
         return vec![Vec::new(); level_specs.len()];
     }
     let t = Instant::now();
     let carriers = tiny_polygon_carriers(
         features,
-        feat_min_levels,
+        cell_winner_levels,
         &areas,
         &acc_levels,
         crs,
@@ -1296,7 +1309,7 @@ fn build_carriers(
     let total: usize = carriers.iter().map(Vec::len).sum();
     log::info!(
         "[convert] tiny-polygon accumulator: {total} placeholder square(s) across {} \
-         level(s) stand in for the polygons those levels dropped ({:.2}s)",
+         level(s) stand in for gate/thinning losers ({:.2}s)",
         acc_levels.iter().filter(|l| l.enabled).count(),
         t.elapsed().as_secs_f64()
     );
@@ -2491,7 +2504,7 @@ fn resolve_winner_tables(
     // Zoom-band representation selector (#317 / #279): per-level
     // representations, parallel to the plan.
     let level_reprs = super::convert::level_representations(&level_specs, &options.representation);
-    let assignment = assign_levels_bounded(
+    let mut assignment = assign_levels_bounded(
         features,
         &level_gsds,
         &options.assign,
@@ -2507,18 +2520,28 @@ fn resolve_winner_tables(
     );
     let assign_secs = t_assign.elapsed().as_secs_f64();
     let t_budget = Instant::now();
-    let assignment = if options.density.enabled {
-        apply_density_budget(
+    // #875: the accumulator reads the levels from before the budget, so a
+    // polygon the rate drops never returns as a square. One byte per feature
+    // instead of keeping the cell-winner table, and only when the budget can
+    // move a polygon (it leaves unbudgeted kinds at their cell-winner level)
+    // and the accumulator will read it.
+    let snapshot = options.density.enabled
+        && options.density.kinds.polygons
+        && accumulate_levels(options, &level_specs, &level_reprs)
+            .iter()
+            .any(|l| l.enabled);
+    let cell_winner_levels: Option<Vec<u8>> =
+        snapshot.then(|| assignment.assignments.iter().map(|a| a.min_level).collect());
+    if options.density.enabled {
+        assignment = apply_density_budget(
             &assignment,
             features,
             &level_gsds,
             &options.assign,
             &options.density,
             crs,
-        )
-    } else {
-        assignment
-    };
+        );
+    }
     log::debug!(
         "[profile] assignment+budget: {:.2}s (assign {:.2}s + budget {:.2}s)",
         t_assign.elapsed().as_secs_f64(),
@@ -2545,12 +2568,13 @@ fn resolve_winner_tables(
     let carriers = build_carriers(
         options,
         features,
-        &feat_min_levels,
+        cell_winner_levels.as_deref().unwrap_or(&feat_min_levels),
         areas,
         &level_specs,
         &level_reprs,
         crs,
     );
+    drop(cell_winner_levels);
 
     // Cluster tables (Q4): built from the pass-1 features + final winner
     // table, before the O(N) scratch is freed. Memory afterwards is
@@ -2621,6 +2645,12 @@ fn resolve_winner_tables(
     for (&row, &ml) in features.indices().iter().zip(&feat_min_levels) {
         min_levels[row] = ml;
     }
+    // The budget only defers cell winners, so every pre-budget carrier is
+    // still a non-member: pass 2's is_carrier_row requires min_level > level.
+    debug_assert!(carriers
+        .iter()
+        .enumerate()
+        .all(|(li, rows)| rows.iter().all(|&row| usize::from(min_levels[row]) > li)));
 
     // Per-level winner counts (exact row counts in partitioning mode; in
     // duplicating mode exact up to simplification drops — used as the writer's
@@ -10768,6 +10798,161 @@ mod tests {
                 at_default,
                 "factor {factor} changed the carriers"
             );
+        }
+    }
+
+    fn carrier_winner_tables(
+        features: &mut FeatureTable,
+        areas: Vec<f32>,
+        options: &ConvertOptions,
+    ) -> WinnerTables {
+        let (_input, source, _) = preflight_fixture();
+        let config = options.validate().unwrap();
+        let budget = MemoryBudget::with_available(None);
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let ctx = Pass1Ctx {
+            source: &source,
+            reader: &source,
+            descriptor: source.resolved_schema().unwrap(),
+            config: &config,
+            budget: &budget,
+            diagnostics: &diagnostics,
+            acc_cols: &[],
+            selected_row_groups: None,
+            bbox_query: None,
+            mask: None,
+            bound_filter: None,
+            crs: Crs::Epsg3857,
+        };
+        let num_rows = features.len();
+        resolve_winner_tables(
+            &ctx,
+            AssignmentInputs {
+                features,
+                areas,
+                acc_values: Vec::new(),
+                categories: None,
+                coalesce_scratch: None,
+                line_tally: (0, 0),
+                num_rows,
+            },
+            &mut RssTracker::new(false, "test"),
+        )
+        .unwrap()
+    }
+
+    /// #875: a square band bypasses the gate. With thinning off every polygon
+    /// is a cell winner, so rate losers must vanish without any area credit.
+    #[test]
+    fn carrier_square_band_excludes_polygon_budget_losers() {
+        let mut options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 10,
+            },
+            representation: vec![super::super::convert::RepresentationBand::new(
+                0,
+                9,
+                Representation::Square,
+            )],
+            ..Default::default()
+        };
+        options.density.kinds.polygons = true;
+        let gsd = options.levels.resolve(options.gsd_base).unwrap()[0].0;
+        let mut features = table(
+            &(0..600)
+                .map(|i| AssignFeature {
+                    index: i,
+                    bbox: [i as f64, 0.0, i as f64 + gsd * 0.4, gsd * 0.4],
+                    kind: FeatureKind::Polygon,
+                    sort_key: None,
+                    entry_level: None,
+                })
+                .collect::<Vec<_>>(),
+        );
+        let tables = carrier_winner_tables(
+            &mut features,
+            vec![(gsd * 0.4).powi(2) as f32; 600],
+            &options,
+        );
+        assert!(tables.min_levels.iter().any(|&ml| ml > 0), "budget binds");
+        assert!(tables.carriers.iter().all(Vec::is_empty));
+    }
+
+    /// #875: without --drop-polygons, including with polygon thinning,
+    /// carriers must equal those built from the old, post-budget levels.
+    #[test]
+    fn carriers_without_drop_polygons_match_post_budget_levels() {
+        let (mut feats, _, mut areas) = ten_dropped_fields();
+        // Visible polygons competing for thinning cells, alongside the tiny
+        // fields: both the gate and thinning must contribute carriers.
+        for i in 10..610 {
+            feats.push(AssignFeature {
+                index: i,
+                bbox: [i as f64, 0.0, i as f64 + 2000.0, 2000.0],
+                kind: FeatureKind::Polygon,
+                sort_key: None,
+                entry_level: None,
+            });
+            areas.push(4_000_000.0);
+        }
+        // Make the budget bind on points, so the non-budgeted polygon path
+        // is exercised rather than apply_density_budget's empty-kind return.
+        for i in 610..1210 {
+            feats.push(AssignFeature {
+                index: i,
+                bbox: [i as f64, 0.0, i as f64, 0.0],
+                kind: FeatureKind::Point,
+                sort_key: None,
+                entry_level: None,
+            });
+            areas.push(0.0);
+        }
+        for thinning in [0.0, 1.0] {
+            let mut options = ConvertOptions {
+                levels: LevelPlan::Gsds(vec![1000.0, 10.0]),
+                ..Default::default()
+            };
+            options.assign.polygon_thinning = thinning;
+            options.assign.point_thinning = 0.0;
+            let mut features = table(&feats);
+            let gsds = [1000.0, 10.0];
+            let reprs = [Representation::Geometry; 2];
+            let cw = assign_levels_bounded(
+                &features,
+                &gsds,
+                &options.assign,
+                Crs::Epsg3857,
+                u64::MAX,
+                &reprs,
+            );
+            let budgeted = apply_density_budget(
+                &cw,
+                &features,
+                &gsds,
+                &options.assign,
+                &options.density,
+                Crs::Epsg3857,
+            );
+            assert_eq!(&cw.assignments[..610], &budgeted.assignments[..610]);
+            assert_ne!(&cw.assignments[610..], &budgeted.assignments[610..]);
+            let levels: Vec<u8> = budgeted.assignments.iter().map(|a| a.min_level).collect();
+            let expected = build_carriers(
+                &options,
+                &features,
+                &levels,
+                areas.clone(),
+                &[(1000.0, None), (10.0, None)],
+                &reprs,
+                Crs::Epsg3857,
+            );
+            assert!(!expected[0].is_empty(), "the accumulator is active");
+            if thinning > 0.0 {
+                assert!(expected[0].len() > 500, "thinning losers keep squares");
+            }
+            let tables = carrier_winner_tables(&mut features, areas.clone(), &options);
+            assert_eq!(tables.carriers, expected, "polygon_thinning={thinning}");
+            assert_eq!(tables.min_levels, levels);
         }
     }
 

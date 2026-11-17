@@ -23,11 +23,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use prost::Message;
+use rayon::prelude::*;
 use serde_json::{json, Value};
 
 use crate::atomic_output::Reserved;
 
-use crate::archive_index::{ArchiveIndex, MergedTiles};
+use crate::archive_index::{ArchiveIndex, MergedTiles, TileRef};
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::dedup::TileHasher;
 use crate::input::{redact_query, url_scheme};
@@ -42,7 +43,7 @@ use crate::overview::export::{
 use crate::pmtiles_metadata::{MetadataCollector, Resolved};
 use crate::pmtiles_writer::{Header, StreamingPmtilesWriter, TileType, MAX_TILE_ID_ZOOM};
 use crate::tile::TileBounds;
-use crate::{Error, TilesetMetadata};
+use crate::{Error, MemoryProfile, TilesetMetadata};
 
 /// Why a pyramid build or band merge failed (#438).
 ///
@@ -1919,12 +1920,16 @@ pub struct BandMergeOptions {
     /// Where the merge spools tile bytes before writing the archive.
     /// `None` is the system temporary directory.
     pub spill_dir: Option<PathBuf>,
+    /// Shared-zoom combine concurrency: every rayon worker for Speed, at most
+    /// eight for Auto, and sequentially on the calling thread for Bounded.
+    pub profile: MemoryProfile,
 }
 
 with_setters!(BandMergeOptions {
     with_allow_missing_zooms => allow_missing_zooms: bool,
     with_metadata => metadata: TilesetMetadata,
     with_spill_dir => spill_dir: Option<PathBuf>,
+    with_profile => profile: MemoryProfile,
 });
 
 /// How the one-shot pyramid tiles each GeoParquet band.
@@ -2373,17 +2378,9 @@ fn build_pyramid_validated(
             band.min_zoom,
             band.max_zoom,
         ));
-        joint_sources.push(
-            retained
-                .iter()
-                .map(|(path, source)| {
-                    let mut source = source.clone();
-                    source.path = path.to_path_buf();
-                    source
-                })
-                .collect(),
-        );
-        scratch.extend(retained.into_iter().map(|(path, _)| path));
+        let (paths, sources): (Vec<_>, Vec<_>) = retained.into_iter().unzip();
+        joint_sources.push(sources);
+        scratch.extend(paths);
         // The archive and its overviews must outlive the merge.
         scratch.push(archive);
     }
@@ -2393,6 +2390,7 @@ fn build_pyramid_validated(
         output,
         &BandMergeOptions {
             allow_missing_zooms: opts.allow_missing_zooms,
+            profile: opts.export.profile,
             metadata: opts.metadata.clone(),
             spill_dir: opts
                 .export
@@ -2593,6 +2591,221 @@ fn append_compressed_tile(
         .map_err(|e| crate::pmtiles_writer::WriteError::io("add tile", e).into())
 }
 
+struct MergeTileGroup {
+    id: u64,
+    coord: crate::tile::TileCoord,
+    refs: Vec<(usize, std::ops::Range<usize>)>,
+    raw: Vec<Vec<u8>>,
+}
+
+fn gzip_plain_bound(raw: &[u8]) -> u64 {
+    raw.last_chunk::<4>()
+        .map(|bytes| u64::from(u32::from_le_bytes(*bytes)).min(MAX_TILE_BYTES))
+        .unwrap_or(0)
+}
+
+impl MergeTileGroup {
+    fn combine(&self, bands: &[Band]) -> Result<(Vec<u8>, Vec<u8>), PyramidError> {
+        combine_joined_tile(&self.raw, &self.refs, self.coord, bands, true)
+    }
+
+    fn memory_bound(&self) -> usize {
+        self.raw
+            .iter()
+            .map(|raw| {
+                raw.len()
+                    + if self.raw.len() > 1 {
+                        // Cover joined buf/gzip allocation, growth and the per-copy decode scratch.
+                        6 * gzip_plain_bound(raw) as usize + 256
+                    } else {
+                        0
+                    }
+            })
+            .sum()
+    }
+}
+
+/// Bytes a shared-zoom merge run may hold: feeds many cores while bounding raw + joined bytes,
+/// plus one oversized group.
+const RUN_BYTES: usize = 128 * 1024 * 1024;
+
+/// Tile groups per shared-zoom merge run. Bounded combines serially, so a longer run would
+/// only hold tiles the serial merge never held.
+fn merge_run_groups(profile: MemoryProfile) -> usize {
+    if profile == MemoryProfile::Bounded {
+        1
+    } else {
+        1024
+    }
+}
+
+fn prepare_combine_pool(
+    pool: &mut Option<rayon::ThreadPool>,
+    profile: MemoryProfile,
+    run: &[MergeTileGroup],
+) -> Result<(), PyramidError> {
+    if profile != MemoryProfile::Bounded
+        && pool.is_none()
+        && run.iter().any(|tile| tile.raw.len() > 1)
+    {
+        // Combine RSS was 393/666/1800 MB at 8/16/64 workers (~25 MB each), so Auto caps at eight.
+        let cap = if profile == MemoryProfile::Speed {
+            usize::MAX
+        } else {
+            8
+        };
+        *pool = Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(rayon::current_num_threads().min(cap))
+                .build()
+                .map_err(std::io::Error::other)?,
+        );
+    }
+    Ok(())
+}
+
+/// A combined join: its plain MVT bytes and their gzip.
+type JoinedBytes = (Vec<u8>, Vec<u8>);
+
+/// The shared-zoom merge's serial append step, in tile-id order: a single
+/// band's tile is copied still compressed, and a join is refitted from the
+/// source overviews or capped at merge (#838).
+struct MergeAppend<'a> {
+    bands: &'a [Band],
+    tile_type: TileType,
+    joint: Option<(&'a ExportOptions, &'a [Vec<JointSource>])>,
+    shared_zooms: &'a [u8],
+    retry: JoinedTileRetry<'a>,
+    diagnostics: &'a crate::diagnostics::Diagnostics,
+}
+
+impl MergeAppend<'_> {
+    /// Append one gathered tile; `false` for a join the joint valve emptied,
+    /// which is omitted (#814).
+    fn append(
+        &mut self,
+        writer: &mut StreamingPmtilesWriter,
+        tile: MergeTileGroup,
+        combined: Option<Result<JoinedBytes, PyramidError>>,
+    ) -> Result<bool, PyramidError> {
+        let (coord, refs, joint) = (tile.coord, tile.refs.as_slice(), self.joint);
+        let Some(combined) = combined else {
+            let from_source =
+                joint.is_some_and(|(_, sources)| has_joint_sources(refs, coord.z, sources));
+            let export = joint
+                .filter(|_| self.shared_zooms.contains(&coord.z))
+                .map(|(export, _)| export);
+            let band = &self.bands[refs[0].0];
+            append_band_copy(
+                writer,
+                coord,
+                band,
+                &tile.raw[0],
+                from_source,
+                export,
+                self.diagnostics,
+            )?;
+            return Ok(true);
+        };
+        // Over-cap source joins are refitted one wave at a time, in id order.
+        self.retry.start_chunk(coord.z, tile.id, self.diagnostics)?;
+        if let Some(fitted) = self.retry.replacements.remove(&tile.id) {
+            return append_fitted_tile(writer, coord, fitted, joint, self.diagnostics);
+        }
+        // A gzip trailer is only a hint: retry serially with the original cap
+        // for trailing data, corrupt trailers and the original error messages.
+        let (mut buf, gz) =
+            combined.or_else(|_| combine_joined_tile(&tile.raw, refs, coord, self.bands, false))?;
+        let gz = cap_joined_tile(
+            &mut buf,
+            gz,
+            refs,
+            coord,
+            self.tile_type,
+            joint,
+            self.diagnostics,
+        )?;
+        append_compressed_tile(writer, coord, &gz, buf.len())?;
+        Ok(true)
+    }
+}
+
+fn gather_merge_tile(
+    bands: &[Band],
+    merged: &mut std::iter::Peekable<impl Iterator<Item = (usize, crate::Result<TileRef>)>>,
+    (first_band, t): (usize, TileRef),
+    group: &mut Vec<(usize, std::ops::Range<usize>)>,
+    counts: &mut [usize],
+    skipped: &mut [usize],
+) -> Result<(), PyramidError> {
+    let (id, z, x, y) = (t.id, t.z, t.x, t.y);
+    // A peeked error is left for the next turn of the outer loop to return.
+    group.clear();
+    let mut prev_band = None;
+    let mut next = Some((first_band, t.range));
+    while let Some((bi, range)) = next.take() {
+        let band = &bands[bi];
+        // The merge emits (id, band) ascending, so a band repeating
+        // an id inside its own directory shows up right after itself.
+        if prev_band.replace(bi) == Some(bi) {
+            return Err(out_of_order(band, id, id));
+        }
+        if z < band.min_zoom || z > band.max_zoom {
+            skipped[bi] += 1;
+        } else {
+            if let Some((prev, _)) = group.iter().find(|(p, _)| bands[*p].layer == band.layer) {
+                return Err(PyramidError::BandMismatch(format!(
+                    "tile {z}/{x}/{y} claimed twice for layer {:?} (bands {} and {})",
+                    band.layer,
+                    bands[*prev].input.display(),
+                    band.input.display()
+                )));
+            }
+            group.push((bi, range));
+            counts[bi] += 1;
+        }
+        if let Some((bi, Ok(n))) =
+            merged.next_if(|(_, peeked)| matches!(peeked, Ok(n) if n.id == id))
+        {
+            next = Some((bi, n.range));
+        }
+    }
+    Ok(())
+}
+
+fn combine_joined_tile(
+    raw: &[Vec<u8>],
+    refs: &[(usize, std::ops::Range<usize>)],
+    coord: crate::tile::TileCoord,
+    bands: &[Band],
+    bounded: bool,
+) -> Result<(Vec<u8>, Vec<u8>), PyramidError> {
+    let crate::tile::TileCoord { z, x, y } = coord;
+    let mut buf = Vec::new();
+    for (raw, (bi, _)) in raw.iter().zip(refs) {
+        let limit = if bounded {
+            gzip_plain_bound(raw)
+        } else {
+            MAX_TILE_BYTES
+        };
+        let plain =
+            compression::decompress_capped(raw, Compression::Gzip, limit).map_err(|error| {
+                PyramidError::TileDecompress {
+                    z,
+                    x,
+                    y,
+                    layer: bands[*bi].layer.clone(),
+                    error,
+                }
+            })?;
+        buf.extend_from_slice(&plain);
+    }
+    // Keep one compressed-byte dedup keyspace for joined and copied tiles (#403).
+    let gz = compression::compress(&buf, Compression::Gzip)
+        .map_err(|error| PyramidError::TileCompress { z, x, y, error })?;
+    Ok((buf, gz))
+}
+
 /// [`merge_bands`] with [`BandMergeOptions`]: a band's declared zoom range
 /// may overshoot its archive, and the merged archive's publication metadata
 /// can be set.
@@ -2676,21 +2889,13 @@ fn merge_cap_zooms(
 /// Source joins are retried one wave at a time during the streaming write.
 fn cap_joined_tile(
     raw: &mut Vec<u8>,
+    mut gzip: Vec<u8>,
     refs: &[(usize, std::ops::Range<usize>)],
     coord: crate::tile::TileCoord,
     tile_type: TileType,
     joint: Option<(&ExportOptions, &[Vec<JointSource>])>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<u8>, PyramidError> {
-    let compress = |raw: &[u8]| {
-        compression::compress(raw, Compression::Gzip).map_err(|error| PyramidError::TileCompress {
-            z: coord.z,
-            x: coord.x,
-            y: coord.y,
-            error,
-        })
-    };
-    let mut gzip = compress(raw)?;
     let Some((export, sources)) = joint else {
         return Ok(gzip);
     };
@@ -2747,11 +2952,11 @@ fn append_fitted_tile(
     tile: JoinedTile,
     joint: Option<(&ExportOptions, &[Vec<JointSource>])>,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<(), PyramidError> {
+) -> Result<bool, PyramidError> {
     // #814: a joint valve that quantized every feature away leaves an empty
     // carrier, which the export writer omits; so does the merge.
     if tile.data.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     if let Some((export, _)) = joint {
         report_joined_limit(
@@ -2763,7 +2968,8 @@ fn append_fitted_tile(
             diagnostics,
         );
     }
-    append_compressed_tile(writer, coord, &tile.data, tile.raw_len)
+    append_compressed_tile(writer, coord, &tile.data, tile.raw_len)?;
+    Ok(true)
 }
 
 fn has_joint_sources(
@@ -3282,9 +3488,9 @@ fn merge_prepared_bands(
         // message whose only field is a repeated `layers`, so byte
         // concatenation IS layer concatenation), and recompressed. Each
         // band's index is held for the duration — header, directories and
-        // metadata — plus one look-ahead tile per band. The merge used to
-        // build a map entry per tile id of every band before writing one,
-        // which is O(tiles) where this is O(bands).
+        // metadata — plus one look-ahead tile per band and a bounded run.
+        // The old map entry per tile id of every band was O(tiles), where
+        // this is O(bands + run bound).
         let (archives, fits) = open_merge_archives(bands, allow_missing_zooms, diagnostics)?;
         // validate_bands only sees the labels, not what is actually inside
         // each archive's tiles; this is the check that catches the mismatch.
@@ -3303,13 +3509,18 @@ fn merge_prepared_bands(
         let tile_type = tile_type.expect("archives agreed on tile type");
         let mut counts = vec![0usize; bands.len()];
         let mut skipped = vec![0usize; bands.len()];
-        let mut total = 0usize;
-        let mut combined = 0usize;
+        let (mut total, mut combined) = (0usize, 0usize);
         // Every in-range band copy of the current id, in band order.
         let mut group: Vec<(usize, std::ops::Range<usize>)> = Vec::with_capacity(bands.len());
         let mut last_id: Option<u64> = None;
-        let mut retry = JoinedTileRetry::new(bands, &archives, joint)?;
-        let mut buf = Vec::new();
+        let mut append = MergeAppend {
+            bands,
+            tile_type,
+            joint,
+            shared_zooms: &shared_zooms,
+            retry: JoinedTileRetry::new(bands, &archives, joint)?,
+            diagnostics,
+        };
         // One cached (range, bytes) per band, for the same reason
         // `for_each_tile` caches: a run-length entry gives every id of the run
         // the same byte range, and those ids are adjacent in the merge, so
@@ -3318,87 +3529,74 @@ fn merge_prepared_bands(
         let mut merged =
             MergedTiles::new(archives.iter().map(|a| a.index.tiles()).collect()).peekable();
 
-        while let Some((first_band, tile)) = merged.next() {
-            let t = tile.map_err(|e| in_band(&bands[first_band].input, e))?;
-            let (id, z, x, y) = (t.id, t.z, t.x, t.y);
-            let coord = crate::tile::TileCoord { z, x, y };
-            ensure_ascending(&mut last_id, id, &bands[first_band])?;
-
-            retry.start_chunk(z, id, diagnostics)?;
-
-            // Gather every band's copy of `id`. A peeked error is left for
-            // the next turn of the outer loop to return.
-            group.clear();
-            let mut prev_band = None;
-            let mut next = Some((first_band, t.range));
-            while let Some((bi, range)) = next.take() {
-                let band = &bands[bi];
-                // The merge emits (id, band) ascending, so a band repeating
-                // an id inside its own directory shows up right after itself.
-                if prev_band.replace(bi) == Some(bi) {
-                    return Err(out_of_order(band, id, id));
-                }
-                if z < band.min_zoom || z > band.max_zoom {
-                    skipped[bi] += 1;
-                } else {
-                    if let Some((prev, _)) =
-                        group.iter().find(|(p, _)| bands[*p].layer == band.layer)
-                    {
-                        return Err(PyramidError::BandMismatch(format!(
-                            "tile {z}/{x}/{y} claimed twice for layer {:?} (bands {} and {})",
-                            band.layer,
-                            bands[*prev].input.display(),
-                            band.input.display()
-                        )));
-                    }
-                    group.push((bi, range));
-                    counts[bi] += 1;
-                }
-                if let Some((bi, Ok(n))) =
-                    merged.next_if(|(_, peeked)| matches!(peeked, Ok(n) if n.id == id))
-                {
-                    next = Some((bi, n.range));
+        let run_groups = merge_run_groups(options.profile);
+        let mut run = Vec::<MergeTileGroup>::new();
+        let mut run_bytes = 0;
+        let mut combine_pool: Option<rayon::ThreadPool> = None;
+        let mut flush = |run: &mut Vec<MergeTileGroup>| -> Result<(), PyramidError> {
+            prepare_combine_pool(&mut combine_pool, options.profile, run)?;
+            let combine = |tile: &MergeTileGroup| (tile.raw.len() > 1).then(|| tile.combine(bands));
+            // Collect every result so errors are returned by tile id, not worker completion order.
+            let results: Vec<_> = match &combine_pool {
+                Some(pool) => pool.install(|| run.par_iter().map(combine).collect()),
+                None => run.iter().map(combine).collect(),
+            };
+            for (tile, result) in run.drain(..).zip(results) {
+                let joined = result.is_some();
+                if append.append(&mut writer, tile, result)? {
+                    total += 1;
+                    combined += usize::from(joined);
                 }
             }
+            Ok(())
+        };
 
-            match group.as_slice() {
-                // Every band's copy fell outside that band's range.
-                [] => continue,
-                [(bi, range)] => {
-                    let data = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
-                    let from_source =
-                        joint.is_some_and(|(_, sources)| has_joint_sources(&group, z, sources));
-                    append_band_copy(
-                        &mut writer,
-                        coord,
-                        &bands[*bi],
-                        &data,
-                        from_source,
-                        joint
-                            .filter(|_| shared_zooms.contains(&z))
-                            .map(|(export, _)| export),
-                        diagnostics,
-                    )?;
+        let gathered = (|| -> Result<(), PyramidError> {
+            while let Some((first_band, tile)) = merged.next() {
+                let t = tile.map_err(|e| in_band(&bands[first_band].input, e))?;
+                let (id, z, x, y) = (t.id, t.z, t.x, t.y);
+                let coord = crate::tile::TileCoord { z, x, y };
+                ensure_ascending(&mut last_id, id, &bands[first_band])?;
+
+                gather_merge_tile(
+                    bands,
+                    &mut merged,
+                    (first_band, t),
+                    &mut group,
+                    &mut counts,
+                    &mut skipped,
+                )?;
+
+                if group.is_empty() {
+                    continue;
                 }
-                refs => {
-                    if let Some(tile) = retry.replacements.remove(&id) {
-                        append_fitted_tile(&mut writer, coord, tile, joint, diagnostics)?;
-                    } else {
-                        join_band_tiles(bands, &archives, &mut cache, refs, coord, &mut buf)?;
-                        // Compressed here and keyed on the COMPRESSED bytes, like
-                        // a tile copied through above, not handed to `add_tile`
-                        // (which keys on the uncompressed bytes): one writer, one
-                        // dedup keyspace (#403). Compression is deterministic, so
-                        // equal combined tiles still collapse to one body.
-                        let gz =
-                            cap_joined_tile(&mut buf, refs, coord, tile_type, joint, diagnostics)?;
-                        append_compressed_tile(&mut writer, coord, &gz, buf.len())?;
-                    }
-                    combined += 1;
+                let raw = group
+                    .iter()
+                    .map(|(bi, range)| read_cached(&archives[*bi], &mut cache[*bi], range.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let tile = MergeTileGroup {
+                    id,
+                    coord,
+                    refs: group.clone(),
+                    raw,
+                };
+                let tile_bytes = tile.memory_bound();
+                if !run.is_empty() && run_bytes + tile_bytes > RUN_BYTES {
+                    flush(&mut run)?;
+                    run_bytes = 0;
+                }
+                run_bytes += tile_bytes;
+                run.push(tile);
+                if run_bytes >= RUN_BYTES || run.len() >= run_groups {
+                    flush(&mut run)?;
+                    run_bytes = 0;
                 }
             }
-            total += 1;
-        }
+            Ok(())
+        })();
+        // An earlier queued decode failure must precede a later directory/read failure.
+        flush(&mut run)?;
+        gathered?;
         log::info!(
             "[pyramid] {} tile id(s) shared by several layers were merged; {} tile(s) copied as-is",
             combined,
@@ -5046,8 +5244,10 @@ mod tests {
         export: &ExportOptions,
     ) -> Result<usize, PyramidError> {
         let diagnostics = crate::diagnostics::Diagnostics::default();
+        let joined = compression::compress(raw, Compression::Gzip).unwrap();
         *gzip = cap_joined_tile(
             raw,
+            joined,
             &[(0, 0..0), (1, 0..0)],
             crate::tile::TileCoord { z: 0, x: 0, y: 0 },
             tile_type,
@@ -5409,6 +5609,183 @@ mod tests {
     }
 
     #[test]
+    fn shared_zoom_merge_matches_serial_archive_in_one_and_eight_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        let names = ["a", "b", "c"];
+        let mut expected = std::collections::BTreeMap::<_, Vec<u8>>::new();
+        let bands: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(bi, name)| {
+                let tiles: Vec<_> = (0..1536)
+                    .filter(|i| bi == 0 || (bi == 1 && i % 4 != 0) || i % 4 >= 2)
+                    .map(|i| {
+                        let coord = tile_id_to_zxy(1365 + i).unwrap();
+                        let payload = layer_tile(&format!("{name}-{}", i / 8));
+                        expected.entry(1365 + i).or_default().extend(&payload);
+                        (coord, payload)
+                    })
+                    .collect();
+                let path = dir.path().join(format!("{name}.pmtiles"));
+                write_band_tiles(&path, name, &tiles);
+                Band::new(path, *name, 6, 6)
+            })
+            .collect();
+
+        let reference = dir.path().join("serial.pmtiles");
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_expect_clustered(true);
+        writer.set_metadata(TilesetMetadata::default());
+        writer.set_bounds(&bounds);
+        set_merged_layers(
+            &mut writer,
+            names
+                .iter()
+                .map(|name| LayerMeta {
+                    id: (*name).to_string(),
+                    minzoom: 6,
+                    maxzoom: 6,
+                    fields: json!({}),
+                    feature_count: None,
+                })
+                .collect(),
+            0,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        for (id, buf) in &expected {
+            let (z, x, y) = tile_id_to_zxy(*id).unwrap();
+            let gz = compression::compress(buf, Compression::Gzip).unwrap();
+            append_compressed_tile(
+                &mut writer,
+                crate::tile::TileCoord { z, x, y },
+                &gz,
+                buf.len(),
+            )
+            .unwrap();
+        }
+        writer.finalize(&reference).unwrap();
+        let reference = std::fs::read(reference).unwrap();
+        for threads in [1, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for profile in [
+                crate::MemoryProfile::Auto,
+                crate::MemoryProfile::Speed,
+                crate::MemoryProfile::Bounded,
+            ] {
+                let output = dir
+                    .path()
+                    .join(format!("merged-{threads}-{profile:?}.pmtiles"));
+                let options = BandMergeOptions::default().with_profile(profile);
+                let report = pool
+                    .install(|| merge_bands_with_options(&bands, &output, &options))
+                    .unwrap();
+                assert_eq!(report.total_tiles, expected.len());
+                assert_eq!(
+                    std::fs::read(output).unwrap(),
+                    reference,
+                    "{threads} threads, {profile:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_zoom_merge_accepts_trailing_gzip_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        let bands: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|layer| {
+                let path = dir.path().join(format!("{layer}.pmtiles"));
+                let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+                writer.set_layer_name(layer);
+                let plain = layer_tile(layer).repeat(4096);
+                expected.extend_from_slice(&plain);
+                let mut gz = compression::compress(&plain, Compression::Gzip).unwrap();
+                gz.extend_from_slice(&[0; 4]);
+                append_compressed_tile(
+                    &mut writer,
+                    crate::tile::TileCoord { z: 3, x: 0, y: 0 },
+                    &gz,
+                    plain.len(),
+                )
+                .unwrap();
+                writer.finalize(&path).unwrap();
+                Band::new(path, layer, 3, 3)
+            })
+            .collect();
+        let output = dir.path().join("joined.pmtiles");
+        merge_bands(&bands, &output).unwrap();
+        assert_eq!(
+            decoded_tiles(&output).into_values().collect::<Vec<_>>(),
+            [expected]
+        );
+    }
+
+    #[test]
+    fn shared_zoom_merge_returns_first_tile_error_before_later_directory_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = vec![0; 24];
+        let bands: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|layer| {
+                let path = dir.path().join(format!("{layer}.pmtiles"));
+                let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+                writer.set_layer_name(layer);
+                for id in 21..24 {
+                    let (z, x, y) = tile_id_to_zxy(id).unwrap();
+                    let good =
+                        compression::compress(&layer_tile(layer), Compression::Gzip).unwrap();
+                    let gz = if layer == "b" && id > 21 { &bad } else { &good };
+                    append_compressed_tile(&mut writer, crate::tile::TileCoord { z, x, y }, gz, 0)
+                        .unwrap();
+                }
+                writer.finalize(&path).unwrap();
+                Band::new(path, layer, 3, 3)
+            })
+            .collect();
+        let expected_error =
+            compression::decompress_capped(&bad, Compression::Gzip, MAX_TILE_BYTES)
+                .unwrap_err()
+                .to_string();
+        for later_directory_error in [false, true] {
+            if later_directory_error {
+                let mut entry = ArchiveIndex::open(&bands[0].input).unwrap().entries()[0].clone();
+                entry.run_length = 3;
+                let mut repeated = entry.clone();
+                repeated.tile_id = 23;
+                repeated.run_length = 1;
+                rewrite_directories(&bands[0].input, &[entry, repeated], &[]);
+            }
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(8)
+                .build()
+                .unwrap();
+            let err = pool
+                .install(|| merge_bands(&bands, &dir.path().join("out.pmtiles")))
+                .unwrap_err();
+            match err {
+                PyramidError::TileDecompress {
+                    z,
+                    x,
+                    y,
+                    layer,
+                    error,
+                } => {
+                    assert_eq!((z, x, y), tile_id_to_zxy(22).unwrap());
+                    assert_eq!(layer, "b");
+                    assert_eq!(error.to_string(), expected_error);
+                }
+                other => panic!("expected first tile's decompression error, got {other}"),
+            }
+        }
+    }
+
+    #[test]
     fn merge_bands_drop_prunes_dictionaries_and_remaps_tag_pairs() {
         use std::collections::BTreeSet;
 
@@ -5663,8 +6040,10 @@ mod tests {
             vec![],
         ];
         let diagnostics = crate::diagnostics::Diagnostics::default();
+        let joined = compression::compress(&raw, Compression::Gzip).unwrap();
         let gzip = cap_joined_tile(
             &mut raw,
+            joined,
             &[(0, 0..0), (1, 0..0)],
             crate::tile::TileCoord { z: 0, x: 0, y: 0 },
             TileType::Mvt,
@@ -6009,9 +6388,10 @@ mod tests {
 
     #[test]
     fn joined_valve_that_empties_a_tile_writes_no_tile() {
-        let (dir, _) = emptied_join(None);
+        let (dir, report) = emptied_join(None);
         // #814: an emptied tile is omitted, never written as a zero-byte body.
         assert!(!decoded_tiles(&dir.path().join("out.pmtiles")).contains_key(&0));
+        assert_eq!(report.total_tiles, 0, "an omitted tile is not counted");
     }
 
     #[test]
