@@ -204,6 +204,7 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 | Option | Description |
 | --- | --- |
 | `--max-zoom-simplify-factor <FACTOR>` | Simplify each finest-level (canonical) line and polygon once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Only vertices are removed: features, parts and rings smaller than the tolerance keep their own geometry. Leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Unset, lines get 0.25 and polygons are not simplified, since each polygon is simplified on its own and shared borders would part; `0` simplifies nothing, as `tiles --verbatim` and `pyramid` bands do. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 1 is about factor 0.25. |
+| `--no-simplification-of-shared-nodes` | With --max-zoom-simplify-factor, keep the vertices where shared polygon borders meet, end, or branch at the finest level, and simplify every shared stretch between them the same way in each polygon. Like tippecanoe's -pn. |
 
 ### Memory & performance
 
@@ -454,6 +455,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | --- | --- |
 | `--simplify-factor <SIMPLIFY_FACTOR>` | Simplification tolerance in multiples of each level's GSD (default 1.0, duplicating mode only). Lower values keep more vertices. |
 | `--no-cascade` | Simplify each level from the source instead of from the next finer level. Slower, but each level stays within its own tolerance of the source. |
+| `--no-simplification-of-shared-nodes` | Keep the vertices where shared polygon borders meet, end, or branch, and simplify every shared stretch between them the same way in each polygon, so neighbours share their simplified borders instead of opening slivers. Costs time, memory and archive bytes on dense coverages. Like tippecanoe's -pn. |
 | `--gsd-base <F>` | Base of the zoom-to-GSD mapping, `gsd(z) = 40075016.69 / base / 2^z`: a larger base keeps more detail at every level. No effect with `--gsd`. Default: `1024`. |
 | `--collapse` | Replace polygons too small for a level with a point instead of the default placeholder square. Fill styles ignore points; add a circle layer. |
 | `--collapse-square` | Replace polygons too small for a level, and those thinned out at coarse levels, with small placeholder squares marking their area. This is the default in duplicating mode; output remains Polygon. |

@@ -97,6 +97,9 @@ Args:
     collapse: See `overview()`.
     collapse_square: See `overview()`.
     no_collapse: See `overview()`.
+    no_simplification_of_shared_nodes: See `overview()`.
+        `convert()` also keeps the pins at the finest zoom when
+        `max_zoom_simplify_factor` simplifies polygons.
     representation: See `overview()`.
     cascade: See `overview()`.
     point_thinning: See `overview()`.

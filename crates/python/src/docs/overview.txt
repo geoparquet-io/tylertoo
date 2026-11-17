@@ -57,6 +57,9 @@ Args:
     no_collapse: Drop small polygons instead of using placeholders.
         This was the default before #745. Output is smaller, but
         polygon coverages have holes at coarse zooms.
+    no_simplification_of_shared_nodes: Set `True` to keep junction pins
+        and simplify shared polygon borders identically in duplicating
+        mode with `simplify_factor` above 0. Defaults to `False`.
     representation: Geometry kind per zoom band, such as
         `"0-7:point,8-14:geom"`.
     cascade: Speed up simplification by deriving each level from

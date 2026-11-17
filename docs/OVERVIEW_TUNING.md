@@ -43,16 +43,17 @@ Use these settings to balance coverage, build time, and file size:
 | Goal | Settings | Cost and effect |
 |---|---|---|
 | No holes where small polygons are dense (parcels, small admin units) | `export-pmtiles --coverage-fill` | Each tile also draws, under its own features, the area its child tiles cover, so placeholder squares no longer leave gaps between them: Auckland parcels at z8 go from 28.5% of the area missing to none. 1.10–1.17× the build time and 4% larger archives on Madagascar admin-4 and NZ parcels. On scattered polygons smaller than a pixel (FTW fields) it also draws area between them. See [coverage fill](#coverage-fill-coverage-fill). |
-| Fewer slivers between neighbors | `--simplify-factor 0.25` | About tippecanoe's coverage on dense parcels. See [coverage and simplification](#coverage-and-simplification). |
-| No slivers at all | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbors meet without gaps. The overview file grows about 2.7×, and dense small polygons build up to 10× slower. |
+| Neighbors share their simplified borders | `--no-simplification-of-shared-nodes` | Keeps simplification on without growing the overview file. See [coverage and simplification](#coverage-and-simplification) for costs. |
+| Fewer slivers by lowering the tolerance | `--simplify-factor 0.25` | About tippecanoe's coverage on dense parcels. See [coverage and simplification](#coverage-and-simplification). |
+| No simplification slivers | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbors meet without gaps. The overview file grows about 2.7×, and dense small polygons build up to 10× slower. |
 | Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. This valve keeps the chosen extent. `--drop-polygons` alone removes the polygons the rate drops and keeps squares for polygons too small to see: Moldova fields (632k polygons) 153 → 111 MB and 4.2 → 2.9 s, NZ parcels (4.3M) 1,042 → 767 MB and 28 → 14 s (#875). See [the density budget](#density-budget-drop-rate-drop-gamma-no-density-drop). |
 | Preserve each retained feature's attributes and grid | `--size-valve drop` | An oversized tile drops features instead of merging them, so it shows holes, but no feature takes on the geometry of another. |
 
 ### Coverage and simplification
 
-Each polygon is simplified on its own, so neighbors that share a border can
-end up with slightly different edges: thin gaps (slivers) open along shared
-borders. At the default tolerance they are mostly narrower than a pixel at
+By default, each polygon is simplified on its own, so neighbors that share
+a border can end up with slightly different edges: thin gaps (slivers) and
+overlaps open along shared borders. At the default tolerance they are mostly narrower than a pixel at
 the zoom they are drawn at, and visible only as faint lines in a solid fill
 of dense polygons. Tippecanoe does the same by default, at a finer
 tolerance (1 tile unit, about a quarter of tylertoo's), so its slivers are
@@ -108,6 +109,73 @@ area at z4–z8 at the defaults. The tile counts are small because Madagascar
 is small and this is one country; they are nearly every tile at each zoom.
 The archive grows from 26.9 MB (default) to 29.3 MB (`0.25`) and 33.5 MB
 (`0`).
+
+#### Keep shared borders shared
+
+Use `--no-simplification-of-shared-nodes` for coverages such as parcels,
+administrative units, and land cover. Like tippecanoe's `-pn`, it is opt-in;
+`--preset tippecanoe` leaves it off. Without the flag, output is byte-identical
+to the previous release, with no extra run cost. It applies in duplicating
+mode (the default), with `--simplify-factor` above 0.
+
+During the input scan, `tiles` and `overview` find junction vertices where a
+shared border ends, meets a third polygon, or branches. These vertices,
+each ring's start, and the two vertices farthest from it become pins kept
+at every level. Each ring is cut at its pins, and each stretch between pins
+is simplified in one canonical direction, so neighbors keep the same border.
+Unlike `--simplify-factor 0`, this keeps simplification on, so the overview
+file does not grow. Archives grow 1.5–5.7% because pins keep vertices
+on straight edges where a neighbor's corner meets the middle of an edge.
+
+The following costs are medians of five interleaved `tiles` runs on a Linux
+arm64 host, comparing the same build without and with the flag:
+
+| Data | Build time | Peak memory | Archive |
+|---|---|---|---|
+| NZ parcels around Auckland (about 400,000 parcels, z0–z14) | 4.10 → 4.73 s (+15%) | 2.03 → 2.09 GiB (+3%) | 132.5 → 139.0 MB (+4.9%) |
+| Madagascar admin-4 (17,465 polygons, z0–z12) | 0.61 → 0.65 s (+7%) | 0.93 → 0.97 GiB (+4%) | 25.3 → 25.7 MB (+1.5%) |
+| FTW Moldova fields (632,000 polygons, z0–z14) | 4.20 → 5.47 s (+30%) | 2.94 → 3.71 GiB (+27%) | 171.0 → 180.8 MB (+5.7%) |
+
+An independent vector decoder measured Auckland's three densest z12 tiles:
+the share of source area drawn rose from 97.6% to 99.97%, and the area where
+features newly overlap fell from 1.15% to 0.31%. For Madagascar admin-4,
+the mean missing share over the five densest tiles per zoom fell as follows.
+This metric differs from the Madagascar table above.
+
+| Zoom | Without the flag | With the flag |
+|---|---|---|
+| z4 | 12.1% | 0.8% |
+| z5 | 4.8% | 0.2% |
+| z6 | 1.7% | 0.1% |
+| z7 | 0.7% | 0.01% |
+| z8 | 0.35% | 0.00% |
+
+Moldova fields rarely share borders, so the flag buys nothing there: at z12,
+the area drawn fell from 96.7% to 96.3% because extra vertices make the size
+valve merge more features. For comparison, tippecanoe's `-pn` adds 12–22%
+build time on the same data and about 4.6% to its Auckland archive.
+
+The remaining Auckland overlap (about 0.3% at z12, versus about 0.2% without
+simplification) comes mostly from stacked source parcels: NZ unit titles
+whose outlines nearly coincide but share no vertices. Some also comes from
+parcels narrower than the tolerance, whose sides can cross when simplified.
+Adding `--simplify-factor 0.25` reduces overlap to 0.21%.
+
+The scan holds about 16 bytes per polygon vertex record until it ends, then
+keeps only the pins (8 bytes each, plus a lookup directory). If the records
+would exceed the memory budget, you get a warning beginning “the shared-border
+pins outgrew the memory budget ...”, and the run falls back to simplifying
+each polygon on its own.
+
+On `export-pmtiles`, the flag acts only at the finest zoom, together with an
+explicit `--max-zoom-simplify-factor` above 0: export rebuilds the pins from
+that level and keeps them. `tiles` passes the flag to both steps. In Python,
+use `no_simplification_of_shared_nodes=True` on `overview()`, `convert()`, or
+`export_pmtiles()`.
+
+Saved plans (`--save-plan` / `--plan`) carry the pins for sharded builds too.
+The plan format is now version 9; re-create plans saved by older versions,
+whether or not you use the flag.
 
 ### What merging does to attributes
 
@@ -1576,7 +1644,9 @@ When you leave `--max-zoom-simplify-factor` unset (Python:
 `max_zoom_simplify_factor=None`), lines at the finest zoom are simplified
 at 0.25 × GSD, about one tile unit at extent 4096 with the default GSD
 base. Polygons are not simplified at that zoom: simplifying each polygon
-on its own separates shared borders (#802).
+on its own separates shared borders. With an explicit factor above 0,
+`--no-simplification-of-shared-nodes` keeps shared borders shared at the
+finest zoom too.
 
 An explicit factor applies to lines and polygons alike. Use `0` to turn
 max-zoom simplification off for everything. To restore the previous default
