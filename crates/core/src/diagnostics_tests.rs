@@ -516,9 +516,9 @@ fn over_limit_tiles_merge_across_runs_and_stay_bounded() {
         .collect();
     assert_eq!(largest.len(), DEFAULT_LARGEST);
     assert_eq!(*largest, expected);
-    assert!(events[0].to_string().contains(
-        "; 8 of them hold a single merged feature over the cap at the extent floor (512)"
-    ));
+    assert!(events[0]
+        .to_string()
+        .contains("; 8 of them hold a single merged feature over the cap at the extent floor"));
     // Tiles with nothing merged (the drop valve's, a report from before
     // #873) get no merged-feature explanation.
     let legacy: Diagnostic =

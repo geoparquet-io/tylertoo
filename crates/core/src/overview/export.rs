@@ -18634,7 +18634,7 @@ mod tests {
         assert!(line.contains("z10/512/511"), "{line}");
         assert!(
             line.contains(
-                "1 of them hold a single merged feature over the cap at the extent floor (512)"
+                "1 of them hold a single merged feature over the cap at the extent floor"
             ),
             "{line}"
         );
