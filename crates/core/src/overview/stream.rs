@@ -3805,6 +3805,11 @@ pub(crate) fn run_stages(
                                                         // #716/#545: footer bytes per input row over every column pass 2 reads;
                                                         // they price the writer's encodes, the read-ahead and the window.
     let mut budget = budget;
+    // #802: the pins stay resident through pass 2, from pass 1 or a plan.
+    let pin_bytes = junctions
+        .as_ref()
+        .map_or(0, |j| size_of_val(j.keys()) as u64);
+    budget.reserve_up_to(MemoryPhase::Compute, pin_bytes);
     let footer = footer_price(
         source,
         selected_row_groups.as_ref(),
