@@ -1899,8 +1899,8 @@ pub struct BandMergeOptions {
     /// Where the merge spools tile bytes before writing the archive.
     /// `None` is the system temporary directory.
     pub spill_dir: Option<PathBuf>,
-    /// Shared-zoom combine concurrency: at most eight workers for Auto/Speed,
-    /// or sequentially on the calling thread for Bounded.
+    /// Shared-zoom combine concurrency: every rayon worker for Speed, at most
+    /// eight for Auto, and sequentially on the calling thread for Bounded.
     pub profile: MemoryProfile,
 }
 
@@ -2571,10 +2571,15 @@ fn prepare_combine_pool(
         && pool.is_none()
         && run.iter().any(|tile| tile.raw.len() > 1)
     {
-        // Combine RSS was 393/666/1800 MB at 8/16/64 workers (~25 MB each), so cap at eight.
+        // Combine RSS was 393/666/1800 MB at 8/16/64 workers (~25 MB each), so Auto caps at eight.
+        let cap = if profile == MemoryProfile::Speed {
+            usize::MAX
+        } else {
+            8
+        };
         *pool = Some(
             rayon::ThreadPoolBuilder::new()
-                .num_threads(rayon::current_num_threads().min(8))
+                .num_threads(rayon::current_num_threads().min(cap))
                 .build()
                 .map_err(std::io::Error::other)?,
         );
