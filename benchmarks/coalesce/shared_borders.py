@@ -62,6 +62,7 @@ from metrics import (
     WORLD,
     _in_tile_units,
     features,
+    iter_source,
     read_source,
     read_tile,
     tile_bounds_3857,
@@ -85,16 +86,24 @@ TIPPECANOE = {"tippecanoe": [], "tippecanoe-dsb": ["--detect-shared-borders"],
 KEYS = ("drawn", "missing", "missing_inner", "overlap", "overlap_new")
 
 
-def densest(src, zoom: int, n: int) -> list[tuple[int, int, int]]:
-    """The `n` tiles at `zoom` holding the most source vertices."""
+def densest(path: Path, zooms: list[int], n: int) -> list[tuple[int, int, int]]:
+    """The `n` tiles at each of `zooms` holding the most source vertices,
+    counted a batch at a time so the whole source is never held."""
     import shapely
+    from collections import Counter
 
-    c = shapely.get_coordinates(src.geoms)
-    k = 1 << zoom
-    xs = np.clip(((c[:, 0] + WORLD / 2) / WORLD * k).astype(np.int64), 0, k - 1)
-    ys = np.clip(((WORLD / 2 - c[:, 1]) / WORLD * k).astype(np.int64), 0, k - 1)
-    cells, counts = np.unique(np.column_stack([xs, ys]), axis=0, return_counts=True)
-    return [(zoom, int(x), int(y)) for x, y in cells[np.argsort(-counts)[:n]]]
+    counts = {z: Counter() for z in zooms}
+    for g, _ in iter_source(path, types=POLYGON):
+        c = shapely.get_coordinates(g)
+        for z in zooms:
+            k = 1 << z
+            xs = np.clip(((c[:, 0] + WORLD / 2) / WORLD * k).astype(np.int64), 0, k - 1)
+            ys = np.clip(((WORLD / 2 - c[:, 1]) / WORLD * k).astype(np.int64), 0, k - 1)
+            cells, cnt = np.unique(np.column_stack([xs, ys]), axis=0, return_counts=True)
+            counts[z].update({(int(x), int(y)): int(m) for (x, y), m in zip(cells, cnt)})
+    # ties broken by cell so the choice is deterministic
+    return [(z, x, y) for z in zooms for (x, y), _ in sorted(counts[z].items(), key=lambda kv: (-kv[1], kv[0]))[:n]]
+
 
 
 def stacked(geoms: list):
@@ -167,11 +176,16 @@ def parse_tiles(s: str) -> list[tuple[int, int, int]]:
     return [tuple(int(v) for v in t.split("/")) for t in s.split(",") if t]
 
 
-def tiles_for(name: str, src) -> list:
+def tiles_for(name: str, source: Path) -> list:
     ds = DATASETS[name]
     if "tiles" in ds:
         return parse_tiles(ds["tiles"])
-    return [t for z in ds["zooms"] for t in densest(src, z, ds["densest"])]
+    return densest(source, ds["zooms"], ds["densest"])
+
+
+def read_for(source: Path, tiles: list):
+    """The source polygons touching `tiles`, nothing else."""
+    return read_source(source, types=POLYGON, windows=[tile_bounds_3857(*t) for t in tiles])
 
 
 def build_tylertoo(binary: Path, source: Path, out: Path, ds: dict, flags: list[str]) -> dict:
@@ -207,8 +221,8 @@ def cmd_run(args) -> int:
                     raise SystemExit(f"--score-only: {sub} is missing")
                 subset(source, ds["bbox"], sub)
             source = sub
-        src = read_source(source, types=POLYGON)
-        tiles = tiles_for(name, src)
+        tiles = tiles_for(name, source)
+        src = read_for(source, tiles)
         cells = {}
         for setting in args.settings.split(","):
             pm = work / f"{name}-{setting}.pmtiles"
@@ -255,10 +269,10 @@ def print_table(report: dict) -> None:
 
 
 def cmd_score(args) -> int:
-    src = read_source(args.source, types=POLYGON)
     tiles = parse_tiles(args.tiles) if args.tiles else []
-    for z in [int(v) for v in args.zooms.split(",")] if args.zooms else []:
-        tiles += densest(src, z, args.densest)
+    if args.zooms:
+        tiles += densest(args.source, [int(v) for v in args.zooms.split(",")], args.densest)
+    src = read_for(args.source, tiles)
     out = score(args.archive, src, tiles, args.band)
     print(json.dumps(out["mean"], indent=2))
     if args.json:
