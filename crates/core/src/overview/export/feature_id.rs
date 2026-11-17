@@ -47,8 +47,8 @@ use super::super::level::OverviewsMeta;
 use super::super::reader::OverviewReader;
 use super::super::writer::LEVEL_COLUMN;
 use super::{
-    is_supported_scalar, ExportError, ExportOptions, FeatureOrder, PublishedNames,
-    EXPORT_BATCH_SIZE,
+    is_supported_scalar, read_overview, BandRead, ExportError, ExportOptions, FeatureOrder,
+    PublishedNames, ReadFlow, ReadPass, BAND_READ_AHEAD_BATCHES,
 };
 
 /// Why a `--feature-id` column cannot be used at all (#443); carried by
@@ -356,7 +356,7 @@ struct Span {
 /// overview-file row index (0-based, the file's own row order -- not the
 /// source file's, which the convert reordered) and the level that owns it.
 pub(super) fn validate_feature_id_column(
-    reader: &OverviewReader,
+    (reader, band): (&OverviewReader, BandRead<'_>),
     fid: &ResolvedFeatureId,
     level_zooms: &[u8],
 ) -> Result<(), ExportError> {
@@ -393,42 +393,43 @@ pub(super) fn validate_feature_id_column(
         return Ok(());
     }
 
-    let batches = reader.read_row_groups_projected(
-        spans.iter().map(|s| s.rg).collect(),
-        EXPORT_BATCH_SIZE,
-        &[fid.idx],
-    )?;
     let (mut span, mut in_span) = (0usize, 0u64);
-    for batch in batches {
-        let batch = batch?;
-        let values = feature_id_values(batch.column(0)).ok_or_else(|| {
-            column_error(
-                &fid.name,
-                FeatureIdColumnProblem::NotInteger {
-                    data_type: format!("{:?}", batch.column(0).data_type()),
-                },
-            )
-        })?;
-        for value in values {
-            // Batches may straddle row groups; step to the span holding this row.
-            while in_span == spans[span].rows {
-                span += 1;
-                in_span = 0;
+    read_overview(
+        band,
+        spans.iter().map(|s| s.rg).collect(),
+        Some(&[fid.idx]),
+        ReadPass::Scan,
+        BAND_READ_AHEAD_BATCHES,
+        |batch, _| {
+            let values = feature_id_values(batch.column(0)).ok_or_else(|| {
+                column_error(
+                    &fid.name,
+                    FeatureIdColumnProblem::NotInteger {
+                        data_type: format!("{:?}", batch.column(0).data_type()),
+                    },
+                )
+            })?;
+            for value in values {
+                // Batches may straddle row groups; step to the span holding this row.
+                while in_span == spans[span].rows {
+                    span += 1;
+                    in_span = 0;
+                }
+                if let Err(reason) = value {
+                    let s = &spans[span];
+                    return Err(ExportError::InvalidFeatureId {
+                        column: fid.name.clone(),
+                        level: s.level,
+                        zoom: level_zooms[s.level],
+                        row: s.first_row + in_span,
+                        reason,
+                    });
+                }
+                in_span += 1;
             }
-            if let Err(reason) = value {
-                let s = &spans[span];
-                return Err(ExportError::InvalidFeatureId {
-                    column: fid.name.clone(),
-                    level: s.level,
-                    zoom: level_zooms[s.level],
-                    row: s.first_row + in_span,
-                    reason,
-                });
-            }
-            in_span += 1;
-        }
-    }
-    Ok(())
+            Ok(ReadFlow::Continue)
+        },
+    )
 }
 
 /// Whether a row group's column statistics alone prove every value is a

@@ -2498,22 +2498,22 @@ pub(super) fn build_fill_map(
         |tx: &super::Sender<super::RecordBatch>| -> Result<(), super::ExportError> {
             // Only the geometry is needed: project the read to it, over the
             // level's whole render set (its prefix in partitioning mode).
-            let batches = match reader.resolved_schema().geometry_index() {
-                Some(root) => reader.read_row_groups_projected(
-                    reader.selected_row_groups(level_idx, None)?,
-                    super::EXPORT_BATCH_SIZE,
-                    &[root],
-                )?,
-                None => reader.read_level_batched(level_idx, None, super::EXPORT_BATCH_SIZE)?,
-            };
-            for batch in batches {
-                let batch =
-                    batch.map_err(|e| crate::GeoParquetReadError::decode("fill seed read", e))?;
-                if tx.send(batch).is_err() {
-                    return Ok(()); // the consumer stopped (error path)
-                }
-            }
-            Ok(())
+            let root = reader.resolved_schema().geometry_index();
+            super::read_overview(
+                level.band,
+                reader.selected_row_groups(level_idx, None)?,
+                root.as_ref().map(std::slice::from_ref),
+                super::ReadPass::Build,
+                super::BAND_READ_AHEAD_BATCHES,
+                |batch, _| {
+                    // A closed channel is the consumer's error: stop cleanly.
+                    Ok(if tx.send(batch).is_ok() {
+                        super::ReadFlow::Continue
+                    } else {
+                        super::ReadFlow::Stop
+                    })
+                },
+            )
         },
         |rx: super::Receiver<super::RecordBatch>| -> Result<(), super::ExportError> {
             for batch in rx.iter() {

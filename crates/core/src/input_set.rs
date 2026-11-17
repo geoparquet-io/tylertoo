@@ -432,6 +432,19 @@ impl ConvertSource {
         ConvertSource::Single(SingleSource::new(source))
     }
 
+    /// [`Self::single`] over a footer the caller already opened through
+    /// [`tylertoo_io`] and resolved, so the source never parses it again
+    /// (#833: the overview reader's open is the export's one footer parse).
+    pub(crate) fn single_parsed(
+        source: InputSource,
+        resolved: crate::resolved_schema::ResolvedSchema,
+        footer: ReaderMetadata,
+    ) -> Self {
+        let single = SingleSource::new(source);
+        single.meta.get_or_init(|| PartMeta::new(resolved, footer));
+        ConvertSource::Single(single)
+    }
+
     /// Resolve a CLI-style input string:
     ///
     /// - existing local file → `Single` (byte-identical behavior to today);
