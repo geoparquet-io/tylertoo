@@ -248,7 +248,7 @@ enum SkimStop {
     /// parquet-rs decodes the footer and reports its own error.
     Confused,
     /// The bytes ran out mid-value: a truncated footer, or a page header
-    /// longer than the bytes read ahead of it ([`PageGuard::peek`]).
+    /// that runs past its column chunk ([`StreamWire`]).
     Short,
 }
 
@@ -263,30 +263,53 @@ fn min_wire_bytes(ty: u8) -> u64 {
     }
 }
 
-/// A forward-only reader of thrift compact-protocol bytes that skips values
-/// without allocating, checking every declared count against what remains.
-struct Skim<'a> {
-    buf: &'a [u8],
-    pos: usize,
+/// Where a [`Skim`] reads: a footer in memory, or a page header off the
+/// stream parquet-rs reads it from ([`StreamWire`]).
+trait Wire {
+    /// The bytes left that a declared count may claim.
+    fn remaining(&self) -> u64;
+    fn byte(&mut self) -> Result<u8, SkimStop>;
+    fn advance(&mut self, n: u64) -> Result<(), SkimStop>;
 }
 
-impl Skim<'_> {
-    fn remaining(&self) -> usize {
-        self.buf.len() - self.pos
+impl Wire for &[u8] {
+    fn remaining(&self) -> u64 {
+        self.len() as u64
     }
 
     fn byte(&mut self) -> Result<u8, SkimStop> {
-        let b = *self.buf.get(self.pos).ok_or(SkimStop::Short)?;
-        self.pos += 1;
+        let (&b, rest) = self.split_first().ok_or(SkimStop::Short)?;
+        *self = rest;
         Ok(b)
     }
 
-    fn advance(&mut self, n: usize) -> Result<(), SkimStop> {
-        if n > self.remaining() {
-            return Err(SkimStop::Short);
-        }
-        self.pos += n;
+    fn advance(&mut self, n: u64) -> Result<(), SkimStop> {
+        let n = usize::try_from(n)
+            .ok()
+            .filter(|n| *n <= self.len())
+            .ok_or(SkimStop::Short)?;
+        *self = &self[n..];
         Ok(())
+    }
+}
+
+/// A forward-only reader of thrift compact-protocol bytes that skips values
+/// without allocating, checking every declared count against what remains.
+struct Skim<W> {
+    wire: W,
+}
+
+impl<W: Wire> Skim<W> {
+    fn remaining(&self) -> u64 {
+        self.wire.remaining()
+    }
+
+    fn byte(&mut self) -> Result<u8, SkimStop> {
+        self.wire.byte()
+    }
+
+    fn advance(&mut self, n: u64) -> Result<(), SkimStop> {
+        self.wire.advance(n)
     }
 
     /// A varint. parquet-rs reads past 10 bytes by wrapping the shift, so an
@@ -331,7 +354,7 @@ impl Skim<'_> {
     /// Refuse `size` elements of at least `each` bytes apiece when fewer
     /// bytes than that remain.
     fn check_count(&self, size: u64, each: u64, what: &str) -> Result<(), SkimStop> {
-        if size.saturating_mul(each) > self.remaining() as u64 {
+        if size.saturating_mul(each) > self.remaining() {
             return Err(SkimStop::Hostile(format!(
                 "a {what} in the footer declares {size} elements of at least {each} byte(s), \
                  but only {} bytes follow it",
@@ -373,7 +396,7 @@ impl Skim<'_> {
             7 => self.advance(8),
             8 => {
                 let len = self.varint()?;
-                self.advance(usize::try_from(len).map_err(|_| SkimStop::Confused)?)
+                self.advance(len)
             }
             9 | 10 => {
                 let (elem, size) = self.list_header()?;
@@ -700,10 +723,7 @@ fn logical_type(id: i16) -> Option<Known> {
 ///
 /// Returns [`InputError::HostileFooter`] naming the offending count.
 pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
-    let mut skim = Skim {
-        buf: thrift,
-        pos: 0,
-    };
+    let mut skim = Skim { wire: thrift };
     let walked = skim.fields(0, |s, id, ty| {
         if id == 2 {
             read_as(ty, 9)?;
@@ -719,8 +739,8 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
 }
 
 /// A [`ChunkReader`] whose streams fail at end of input instead of
-/// returning 0 bytes (#789), and that refuses a dictionary page declaring
-/// more values than its bytes hold (#894).
+/// returning 0 bytes (#789), and refuse a dictionary page declaring more
+/// values than its bytes hold (#894).
 ///
 /// parquet-rs reads a page header off `get_read`'s stream, and skips an
 /// unknown field's `uuid` or `double` with `io::copy(take(n))`, which
@@ -732,9 +752,12 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
 /// parquet-rs also sizes a dictionary from its page header's `num_values`
 /// before decoding a value (`DictDecoder::set_dict`, the byte-view
 /// decoder's `ViewBuffer::with_capacity`): a few bytes claiming 1.4 billion
-/// `INT64`s ask for 11 GB. So `get_read` first reads the header bytes
-/// itself ([`check_header`]) and refuses a dictionary whose values cannot
-/// fit its page, then serves those bytes to parquet-rs.
+/// `INT64`s ask for 11 GB. So before the first byte of a stream reaches
+/// parquet-rs, the guard walks the header there on a stream of its own, as
+/// parquet-rs will ([`check_header`]), and refuses a dictionary whose values
+/// cannot fit its page. parquet-rs opens a stream at a page's data, too,
+/// when it has the header already; it reads nothing from that one, so
+/// nothing is walked there.
 ///
 /// parquet-rs turns either error into a string on its way out, so the
 /// guard also raises `hit`, which [`UntrustedBatchReader`] turns back into
@@ -826,165 +849,152 @@ fn chunk_spans(metadata: &ParquetMetaData, groups: Option<&[usize]>) -> Arc<[Chu
     spans.into()
 }
 
-/// Header bytes read ahead of parquet-rs: what its buffered reader fetches
-/// anyway. A longer header is read again in a window 16 times wider, up to
-/// [`PAGE_HEADER_CAP`].
-const PAGE_PEEK: u64 = 8 << 10;
-
-/// The longest page header [`PageGuard`] reads ahead, and accepts. Honest
-/// headers are a few hundred bytes: writers truncate or drop page statistics
-/// past a few KB (parquet-rs at 64 bytes, Arrow C++ and parquet-mr at 4 KB),
-/// and a dictionary page has none. Unread, the rest of a longer one could
-/// turn it into a dictionary page (parquet-rs keeps a field's last value).
-const PAGE_HEADER_CAP: u64 = 1 << 20;
-
-/// What a page header declares, as parquet-rs reads it, so far as the bytes
-/// read ahead go. A field of an unexpected wire type is skipped: parquet-rs
-/// refuses it.
-#[derive(Default)]
-struct PageClaim {
-    /// The page type, and how many times the header declares one.
-    ty: Option<i32>,
-    types: u32,
-    uncompressed: i32,
-    compressed: i32,
-    /// The dictionary page header's `num_values`.
-    values: Option<i32>,
+/// A page header's bytes off a stream, as parquet-rs reads them: a skipped
+/// value is copied to nowhere, so a header of any length is walked in
+/// constant memory. `left` is what is left of the column chunk.
+struct StreamWire<T> {
+    inner: T,
+    left: u64,
 }
 
-fn page_claim(header: &[u8]) -> (PageClaim, Result<(), SkimStop>) {
-    let mut s = Skim {
-        buf: header,
-        pos: 0,
-    };
-    let mut claim = PageClaim::default();
-    // parquet-rs reads an i32 by truncating the zigzag i64 (#789).
-    let int = |s: &mut Skim<'_>| s.zigzag().map(|v| v as i32);
-    let walked = s.fields(0, |s, id, wire| match (id, wire) {
-        (1, 5) => int(s).map(|v| {
-            claim.ty = Some(v);
-            claim.types += 1;
-        }),
-        (2, 5) => int(s).map(|v| claim.uncompressed = v),
-        (3, 5) => int(s).map(|v| claim.compressed = v),
-        (7, 12) => s.fields(1, |s, id, wire| match (id, wire) {
-            (1, 5) => int(s).map(|v| claim.values = Some(v)),
-            _ => s.skip(wire, 2),
-        }),
-        _ => s.skip(wire, 1),
-    });
-    (claim, walked)
-}
-
-/// What [`check_header`] makes of the header bytes read so far.
-enum Peeked {
-    /// Not a dictionary page, or one whose values fit its bytes.
-    Pass,
-    /// The header runs past the bytes read.
-    More,
-    Refuse(String),
-}
-
-/// Refuse a dictionary page whose declared values cannot fit its bytes.
-fn check_header(span: &ChunkSpan, header: &[u8]) -> Peeked {
-    const DICTIONARY_PAGE: i32 = 2;
-    let (claim, walked) = page_claim(header);
-    // parquet-rs keeps the last, which may lie past the bytes read.
-    if claim.types > 1 {
-        return Peeked::Refuse("a page header declares its type twice".into());
+impl<T: Read> Wire for StreamWire<T> {
+    fn remaining(&self) -> u64 {
+        self.left
     }
+
+    fn byte(&mut self) -> Result<u8, SkimStop> {
+        let mut b = [0];
+        if self.left == 0 || self.inner.read_exact(&mut b).is_err() {
+            return Err(SkimStop::Short);
+        }
+        self.left -= 1;
+        Ok(b[0])
+    }
+
+    fn advance(&mut self, n: u64) -> Result<(), SkimStop> {
+        let copied = std::io::copy(&mut (&mut self.inner).take(n), &mut std::io::sink());
+        if n > self.left || copied.ok() != Some(n) {
+            return Err(SkimStop::Short);
+        }
+        self.left -= n;
+        Ok(())
+    }
+}
+
+/// `PageHeader`'s fields as parquet-rs 59 reads them without page
+/// statistics (`read_thrift_without_stats`): by id, whatever their wire
+/// type. Type and sizes (1–3) and the dictionary header (7) are read by
+/// [`check_header`].
+fn page_header(id: i16) -> Option<Known> {
+    match id {
+        4 => Some(VARINT),
+        5 => Some(Known::Struct(|id| (1..=4).contains(&id).then_some(VARINT))),
+        6 => Some(Known::Struct(|_| None)),
+        8 => Some(Known::Struct(|id| match id {
+            1..=6 => Some(VARINT),
+            7 => Some(BOOL),
+            _ => None,
+        })),
+        _ => None,
+    }
+}
+
+/// Why the dictionary page header `s` is about to hand parquet-rs must be
+/// refused, if it must: it declares more values than its page holds at
+/// `span`'s smallest plain width, or it is read differently by parquet-rs
+/// than by this walk. A header this walk cannot follow (an unknown type,
+/// the end of its chunk) is left to parquet-rs, which stops there too.
+fn check_header<W: Wire>(span: &ChunkSpan, s: &mut Skim<W>) -> Option<String> {
+    const DICTIONARY_PAGE: i32 = 2;
+    let (mut ty, mut uncompressed, mut compressed, mut values) = (None, -1, -1, None);
+    // parquet-rs reads an i32 by truncating the zigzag i64 (#789).
+    let int = |s: &mut Skim<W>, wire: u8| -> Result<i32, SkimStop> {
+        read_as(wire, 5)?;
+        s.zigzag().map(|v| v as i32)
+    };
+    let walked = s.fields(0, |s, id, wire| match id {
+        1 => int(s, wire).map(|v| ty = Some(v)),
+        2 => int(s, wire).map(|v| uncompressed = v),
+        3 => int(s, wire).map(|v| compressed = v),
+        7 => {
+            read_as(wire, 12)?;
+            s.fields(1, |s, id, wire| match id {
+                1 => int(s, wire).map(|v| values = Some(v)),
+                2 => s.field(wire, Some(VARINT), 2),
+                3 => s.field(wire, Some(BOOL), 2),
+                _ => s.skip(wire, 2),
+            })
+        }
+        _ => s.field(wire, page_header(id), 1),
+    });
     match walked {
-        Err(SkimStop::Short) => return Peeked::More,
-        // No honest header has a list or an overlong varint, and the rest
-        // of this one is unread.
-        Err(SkimStop::Hostile(reason)) => return Peeked::Refuse(reason),
-        // An unknown wire type: parquet-rs stops at it too.
-        Err(SkimStop::Confused) => return Peeked::Pass,
+        Err(SkimStop::Hostile(reason)) => return Some(reason),
+        Err(SkimStop::Confused | SkimStop::Short) => return None,
         Ok(()) => {}
     }
-    let (Some(values), Some(DICTIONARY_PAGE)) = (claim.values, claim.ty) else {
-        return Peeked::Pass;
+    let (Some(values), Some(DICTIONARY_PAGE)) = (values, ty) else {
+        return None;
     };
-    let bytes = if span.raw {
-        claim.compressed
-    } else {
-        claim.uncompressed
-    };
+    let bytes = if span.raw { compressed } else { uncompressed };
     // Negative counts and sizes are parquet-rs's to refuse.
     let (Ok(values), Ok(bytes)) = (u64::try_from(values), u64::try_from(bytes)) else {
-        return Peeked::Pass;
+        return None;
     };
     // Booleans pack eight to a byte; the last byte may be partial.
-    if values.saturating_mul(span.value_bits) > bytes * 8 + 7 {
-        return Peeked::Refuse(format!(
+    (values.saturating_mul(span.value_bits) > bytes * 8 + 7).then(|| {
+        format!(
             "a dictionary page declares {values} values of {} bits, but holds {bytes} bytes",
             span.value_bits
-        ));
-    }
-    Peeked::Pass
+        )
+    })
 }
 
-impl<R: ChunkReader> PageGuard<R> {
-    /// The header bytes at `start`, checked when `start` is in a chunk
-    /// being read.
-    fn peek(&self, start: u64) -> Result<Bytes, ParquetError> {
-        let i = self.chunks.partition_point(|s| s.start <= start);
-        let Some(span) = i.checked_sub(1).map(|i| &self.chunks[i]) else {
-            return Ok(Bytes::new());
-        };
-        if start >= span.end {
-            return Ok(Bytes::new());
-        }
-        let left = span.end - start;
-        let cap = left.min(PAGE_HEADER_CAP);
-        let mut window = PAGE_PEEK.min(cap);
-        loop {
-            let bytes = self.reader.get_bytes(start, window as usize)?;
-            let reason = match check_header(span, &bytes) {
-                Peeked::Pass => return Ok(bytes),
-                Peeked::More if window < cap => {
-                    window = (window * 16).min(cap);
-                    continue;
-                }
-                // The chunk ends inside the header: parquet-rs refuses a
-                // header longer than its chunk before decoding the page.
-                Peeked::More if window == left => return Ok(bytes),
-                Peeked::More => format!("a page header runs past {PAGE_HEADER_CAP} bytes"),
-                Peeked::Refuse(reason) => reason,
-            };
-            self.hit.store(true, Ordering::Relaxed);
-            return Err(ParquetError::General(reason));
-        }
-    }
-}
-
-/// [`PageGuard::get_read`]'s stream: the peeked header bytes, then the
-/// file from where they end.
+/// [`PageGuard::get_read`]'s stream: the file from `start`, its page
+/// header checked before the first read when `start` is in a chunk.
 #[expect(
     clippy::disallowed_types,
     reason = "#789: a per-reader flag, not process-global diagnostic state"
 )]
 struct NoEof<R: ChunkReader> {
-    peeked: Bytes,
     reader: Arc<R>,
-    /// File offset just past `peeked`, where `inner` starts.
-    next: u64,
+    start: u64,
+    /// The chunk `start` is in, until its header is checked.
+    unchecked: Option<ChunkSpan>,
     inner: Option<R::T>,
     hit: Arc<atomic::AtomicBool>,
 }
 
+impl<R: ChunkReader> NoEof<R> {
+    /// Refuse the header at `start`, walked on a stream of its own.
+    fn check(&self, span: &ChunkSpan) -> std::io::Result<()> {
+        let inner = self
+            .reader
+            .get_read(self.start)
+            .map_err(std::io::Error::other)?;
+        let left = span.end - self.start;
+        let mut s = Skim {
+            wire: StreamWire { inner, left },
+        };
+        match check_header(span, &mut s) {
+            Some(reason) => {
+                self.hit.store(true, Ordering::Relaxed);
+                Err(std::io::Error::other(reason))
+            }
+            None => Ok(()),
+        }
+    }
+}
+
 impl<R: ChunkReader> Read for NoEof<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if !self.peeked.is_empty() {
-            let n = buf.len().min(self.peeked.len());
-            buf[..n].copy_from_slice(&self.peeked.split_to(n));
-            return Ok(n);
+        if let Some(span) = self.unchecked.take() {
+            self.check(&span)?;
         }
         let inner = match &mut self.inner {
             Some(inner) => inner,
             None => self.inner.insert(
                 self.reader
-                    .get_read(self.next)
+                    .get_read(self.start)
                     .map_err(std::io::Error::other)?,
             ),
         };
@@ -1008,11 +1018,15 @@ impl<R: ChunkReader> ChunkReader for PageGuard<R> {
     type T = NoEof<R>;
 
     fn get_read(&self, start: u64) -> Result<Self::T, ParquetError> {
-        let peeked = self.peek(start)?;
+        let i = self.chunks.partition_point(|s| s.start <= start);
+        let unchecked = i
+            .checked_sub(1)
+            .map(|i| self.chunks[i])
+            .filter(|span| start < span.end);
         Ok(NoEof {
-            next: start + peeked.len() as u64,
-            peeked,
             reader: self.reader.clone(),
+            start,
+            unchecked,
             inner: None,
             hit: self.hit.clone(),
         })
@@ -2292,11 +2306,20 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
             original.fields().iter().map(wide_field).collect::<Vec<_>>(),
             original.metadata().clone(),
         ));
+        // With an offset index parquet-rs reads each page, header and all,
+        // by `get_bytes`, past the page guard's header walk (#894). The
+        // footers read here carry none; one a caller loaded is dropped.
+        let mut footer = self.metadata.metadata().clone();
+        if footer.offset_index().is_some() {
+            footer = Arc::new(
+                ParquetMetaData::clone(&footer)
+                    .into_builder()
+                    .set_offset_index(None)
+                    .build(),
+            );
+        }
         let metadata = guard_parquet("wide-offset schema", || {
-            ArrowReaderMetadata::try_new(
-                self.metadata.metadata().clone(),
-                ArrowReaderOptions::new().with_schema(wide),
-            )
+            ArrowReaderMetadata::try_new(footer, ArrowReaderOptions::new().with_schema(wide))
         })?;
         #[expect(
             clippy::disallowed_types,
@@ -4235,52 +4258,79 @@ mod tests {
             .position(|w| w == [0x4c, 0x15, 0xc8, 0x01])
             .expect("the dictionary page header");
         file[at + 2..at + 4].copy_from_slice(&[0xfe, 0x7f]);
-        let err = read(file).unwrap_err();
+        let err = read(file.clone()).unwrap_err();
+        assert!(
+            matches!(input_error(&err), Some(InputError::HostilePageHeader)),
+            "{err:?}"
+        );
+
+        // Codex on #894: a caller's footer with an offset index, which would
+        // have parquet-rs read the header by `get_bytes`, is refused too.
+        let file = Bytes::from(file);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#894: a footer with its page indexes, as a caller could load one"
+        )]
+        let indexed = ParquetMetaDataReader::new()
+            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required)
+            .parse_and_finish(&file)
+            .unwrap();
+        assert!(indexed.offset_index().is_some());
+        let metadata = reader_metadata(Arc::new(indexed)).unwrap();
+        let err = open_parquet_with_metadata(file, metadata)
+            .build()
+            .unwrap()
+            .find_map(Result::err)
+            .expect("the dictionary is refused");
         assert!(
             matches!(input_error(&err), Some(InputError::HostilePageHeader)),
             "{err:?}"
         );
     }
 
-    /// What #894's header check makes of a few crafted headers.
+    /// What #894's header walk makes of a few dictionary page headers.
     #[test]
-    fn page_headers_are_read_ahead_until_they_end() {
+    fn the_header_walk_reads_fields_as_parquet_rs_does() {
         let span = ChunkSpan {
             start: 0,
             end: u64::MAX,
             value_bits: 64,
             raw: true,
         };
-        // `1: type = DATA_PAGE`, then an unknown binary of 2 MB: a second
-        // type could follow it, so the header is read on.
-        assert!(matches!(
-            check_header(&span, &[0x15, 0x00, 0x88, 0x80, 0x80, 0x80, 0x01]),
-            Peeked::More
-        ));
-        // An unknown wire type cannot be fixed by reading further.
-        assert!(matches!(check_header(&span, &[0x1e]), Peeked::Pass));
-        // A second type (long-form field id 1) parquet-rs would keep.
-        assert!(matches!(
-            check_header(&span, &[0x15, 0x00, 0x05, 0x02, 0x04, 0x00]),
-            Peeked::Refuse(_)
-        ));
+        let refused = |header: &[u8]| check_header(&span, &mut Skim { wire: header }).is_some();
+        // `1: DICTIONARY_PAGE, 2: 800, 3: 800, 7: { 1: values, 2: PLAIN }`.
+        let dictionary = |values: &[u8]| {
+            let mut h = vec![0x15, 0x04, 0x15, 0xc0, 0x0c, 0x15, 0xc0, 0x0c, 0x4c];
+            h.extend(values);
+            h.extend([0x15, 0x00, 0x00, 0x00]);
+            h
+        };
+        // 100 values (zigzag 200) of 8 bytes fit 800 bytes; 101 do not.
+        assert!(!refused(&dictionary(&[0x15, 0xc8, 0x01])));
+        assert!(refused(&dictionary(&[0x15, 0xca, 0x01])));
+        // parquet-rs reads the count by id whatever its wire type: an i64
+        // is the same varint, a binary is refused.
+        assert!(refused(&dictionary(&[0x16, 0xca, 0x01])));
+        assert!(refused(&dictionary(&[0x18, 0x01, 0x00])));
+        // A type parquet-rs reads twice keeps the last.
+        assert!(refused(&[
+            0x15, 0x00, 0x15, 0xc0, 0x0c, 0x15, 0xc0, 0x0c, 0x05, 0x02, 0x04, 0x0c, 0x0e, 0x15,
+            0xca, 0x01, 0x00, 0x00
+        ]));
+        // An unknown wire type on an unknown field, or the end of the bytes:
+        // parquet-rs stops there too.
+        assert!(!refused(&[0x9e]));
+        assert!(!refused(&[0x15, 0x04, 0x15]));
     }
 
-    /// Roborev on #894: a `DATA_PAGE` header whose second type, a
-    /// dictionary's, lies past the read-ahead cap is refused, not passed on.
+    /// A stream parquet-rs never reads from is never walked: it opens one at
+    /// a page's data when it has the header already (`peek_next_page`), and
+    /// data bytes are not a header. Real Overture data read as a hostile
+    /// header there.
     #[test]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "#789: the page guard's own per-reader flag"
-    )]
-    fn a_page_header_past_the_cap_is_refused() {
-        let pad = 3 << 19; // 1.5 MiB
-                           // `1: type = DATA_PAGE`, an unknown binary of `pad` bytes, then
-                           // `1: type = DICTIONARY_PAGE`.
-        let mut bytes = vec![0x15, 0x00, 0x98, 0x80, 0x80, 0x60];
-        bytes.extend(std::iter::repeat_n(0, pad));
-        bytes.extend([0x05, 0x02, 0x04, 0x00]);
-        bytes.extend([0; 64]);
+    fn a_page_header_is_walked_on_the_first_read_only() {
+        // A list of 2^28 elements in four bytes, were it a header.
+        let bytes = Bytes::from_static(&[0x19, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00]);
         let guard = PageGuard {
             chunks: Arc::from([ChunkSpan {
                 start: 0,
@@ -4288,80 +4338,25 @@ mod tests {
                 value_bits: 64,
                 raw: true,
             }]),
-            reader: Arc::new(Bytes::from(bytes)),
-            hit: Arc::new(atomic::AtomicBool::new(false)),
+            reader: Arc::new(bytes),
+            hit: Arc::default(),
         };
-        let err = guard.peek(0).unwrap_err().to_string();
-        assert!(err.contains("runs past"), "{err}");
+        let unread = guard.get_read(0).unwrap();
+        drop(unread);
+        assert!(!guard.hit.load(Ordering::Relaxed));
+        assert!(guard.get_read(0).unwrap().read(&mut [0; 4]).is_err());
         assert!(guard.hit.load(Ordering::Relaxed));
     }
 
-    /// Roborev on #894: a header that is malformed from its first byte is
-    /// not read ahead past the first window, however long its chunk.
+    /// Codex on #894: a page header of any length is walked in constant
+    /// memory, so a long honest one (page statistics of two untruncated
+    /// 600 KB strings) reads.
     #[test]
-    fn a_malformed_page_header_is_not_read_to_the_end_of_its_chunk() {
-        use arrow_array::{ArrayRef, Int64Array};
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
-
-        /// Bytes that record the longest read starting at `at`.
-        struct Longest {
-            bytes: Bytes,
-            at: u64,
-            longest: Arc<std::sync::Mutex<usize>>,
-        }
-        impl Length for Longest {
-            fn len(&self) -> u64 {
-                self.bytes.len() as u64
-            }
-        }
-        impl ChunkReader for Longest {
-            type T = <Bytes as ChunkReader>::T;
-            fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
-                self.bytes.get_read(start)
-            }
-            fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
-                if start == self.at {
-                    let mut longest = self.longest.lock().unwrap();
-                    *longest = (*longest).max(length);
-                }
-                self.bytes.get_bytes(start, length)
-            }
-        }
-
-        let values = Int64Array::from_iter_values(0..300_000);
-        let batch = RecordBatch::try_from_iter([("v", Arc::new(values) as ArrayRef)]).unwrap();
-        let props = WriterProperties::builder()
-            .set_dictionary_enabled(false)
-            .build();
-        let mut file = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        let source = open_parquet(Bytes::from(file.clone())).unwrap();
-        let (at, len) = source.metadata().row_group(0).column(0).byte_range();
-        assert!(len > 16 * PAGE_PEEK, "{len}");
-        file[at as usize] = 0x1e;
-        let longest = Arc::new(std::sync::Mutex::new(0));
-        let source = open_parquet(Longest {
-            bytes: Bytes::from(file),
-            at,
-            longest: longest.clone(),
-        })
-        .unwrap();
-        assert!(source.build().unwrap().any(|b| b.is_err()));
-        assert_eq!(*longest.lock().unwrap(), PAGE_PEEK as usize);
-    }
-
-    /// A page header longer than the first read-ahead window (here page
-    /// statistics of untruncated 20 KB strings) is read in a wider one and
-    /// served whole to parquet-rs.
-    #[test]
-    fn a_page_header_longer_than_the_first_window_reads() {
+    fn a_long_page_header_reads() {
         use arrow_array::{ArrayRef, StringArray};
         use parquet::arrow::ArrowWriter;
         use parquet::file::properties::{EnabledStatistics, WriterProperties};
-        let big = |c: char| c.to_string().repeat(20_000);
+        let big = |c: char| c.to_string().repeat(600_000);
         let strings = StringArray::from_iter_values([big('a'), big('b')]);
         let batch = RecordBatch::try_from_iter([("s", Arc::new(strings) as ArrayRef)]).unwrap();
         let props = WriterProperties::builder()
@@ -4374,21 +4369,6 @@ mod tests {
         let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
-        let at = open_parquet(Bytes::from(file.clone()))
-            .unwrap()
-            .metadata()
-            .row_group(0)
-            .column(0)
-            .byte_range()
-            .0 as usize;
-        let span = ChunkSpan {
-            start: 0,
-            end: u64::MAX,
-            value_bits: 32,
-            raw: true,
-        };
-        let first = &file[at..at + PAGE_PEEK as usize];
-        assert!(matches!(check_header(&span, first), Peeked::More));
         let read: usize = open_parquet(Bytes::from(file))
             .unwrap()
             .build()
