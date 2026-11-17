@@ -2511,10 +2511,10 @@ fn resolve_winner_tables(
     let t_budget = Instant::now();
     // #875: the accumulator reads the levels from before the budget, so a
     // polygon the rate drops never returns as a square. One byte per feature
-    // instead of keeping the cell-winner table.
-    let cell_winner_levels: Option<Vec<u8>> = options
-        .density
-        .enabled
+    // instead of keeping the cell-winner table, and only when the budget can
+    // move a polygon: it leaves unbudgeted kinds at their cell-winner level.
+    let cell_winner_levels: Option<Vec<u8>> = (options.density.enabled
+        && options.density.kinds.polygons)
         .then(|| assignment.assignments.iter().map(|a| a.min_level).collect());
     if options.density.enabled {
         assignment = apply_density_budget(
