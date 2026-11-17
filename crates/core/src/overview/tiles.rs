@@ -310,7 +310,7 @@ pub struct TilesOptions {
         feature = "cli",
         arg(long, value_name = "COLUMN", conflicts_with = "layer_name")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Put each feature in the layer named by its value in COLUMN, and null or blank values in `_unknown`. The column is not written as a property. Each layer is tiled on its own, so the size caps apply per layer", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Put each feature in the layer named by its value in COLUMN, and null or blank values in `_unknown`. The column is not written as a property. Each layer is tiled on its own. The size caps also apply to the combined tile", long_help = None))]
     pub layer_column: Option<String>,
     /// Retain the intermediate overview at this path instead of a removed
     /// temp file (#314). Its parent directory must exist.
@@ -1153,6 +1153,19 @@ pub(super) fn convert_to_pmtiles_validated(
     config: &super::config::ValidatedConfig<'_, TilesOptions>,
     observer: &mut dyn TilesObserver,
 ) -> Result<TilesOutcome, TilesError> {
+    convert_to_pmtiles_retaining_overview(input, open, output, config, observer, None)
+}
+
+/// The layered path retains its temporary overview through the join without
+/// changing the temporary codec or the public `keep_overview` contract.
+pub(super) fn convert_to_pmtiles_retaining_overview(
+    input: &TilesInput,
+    open: impl FnOnce() -> Result<ConvertSource, ConvertError>,
+    output: &Path,
+    config: &super::config::ValidatedConfig<'_, TilesOptions>,
+    observer: &mut dyn TilesObserver,
+    retained: Option<(&Path, &mut Option<ExportOptions>)>,
+) -> Result<TilesOutcome, TilesError> {
     let options = config.options();
     // #452: before the intermediate is created — which would otherwise be
     // the first thing to trip over a missing output directory, with a
@@ -1210,9 +1223,13 @@ pub(super) fn convert_to_pmtiles_validated(
     // an open NamedTempFile: convert publishes by renaming a sibling over
     // this path, which Windows refuses while a handle to it is open (#678).
     let (overview_path, overview_tmp): (PathBuf, Option<crate::atomic_output::Reserved>) =
-        match &options.keep_overview {
+        match options
+            .keep_overview
+            .as_deref()
+            .or(retained.as_ref().map(|(path, _)| *path))
+        {
             // Its directory was checked above.
-            Some(path) => (path.clone(), None),
+            Some(path) => (path.to_path_buf(), None),
             None => {
                 let dir = intermediate_dir(options, output);
                 let tmp = crate::atomic_output::reserve_path(
@@ -1230,7 +1247,7 @@ pub(super) fn convert_to_pmtiles_validated(
     // Read once by the export below and removed, so its codec is the
     // caller's choice; a kept overview is a deliverable and keeps ZSTD.
     let mut convert_options = convert_options;
-    if overview_tmp.is_some() {
+    if options.keep_overview.is_none() {
         convert_options.to_mut().overview_codec = options.temp_compression;
     }
 
@@ -1362,7 +1379,7 @@ pub(super) fn convert_to_pmtiles_validated(
     let intermediate = IntermediateOverview {
         path: overview_path.clone(),
         bytes: overview_bytes,
-        retained: overview_tmp.is_none(),
+        retained: overview_tmp.is_none() && retained.is_none(),
         space_warning,
     };
     observer.overview_written(&intermediate, &convert_report);
@@ -1403,6 +1420,9 @@ pub(super) fn convert_to_pmtiles_validated(
     };
     let export_report =
         export_pmtiles(&overview_path, output, &export_opts).map_err(TilesError::Export)?;
+    if let Some((_, retained_options)) = retained {
+        *retained_options = Some(export_opts);
+    }
 
     Ok(TilesOutcome::Converted(Box::new(TilesReport {
         convert: convert_report,
@@ -1832,8 +1852,8 @@ pub fn intermediate_space_preflight(
 
 /// [`intermediate_space_preflight`] on an open source, reading `selection`.
 /// A `--layer-column` run (#821) also stages its split copy of the input
-/// there, beside one layer's conversion at a time; the whole input's
-/// conversion bounds each layer's.
+/// there and retains all layer overviews through the join. The whole input's
+/// conversion bounds the sum of those overviews.
 pub(super) fn space_preflight(
     source: &ConvertSource,
     selection: Option<&crate::input_set::RowGroupSelection>,

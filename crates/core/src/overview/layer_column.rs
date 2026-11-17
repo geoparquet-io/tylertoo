@@ -7,8 +7,8 @@
 //! GeoParquet files. Each file then runs the ordinary `tiles` chain with the
 //! caller's options, and [`crate::pyramid::merge_bands_with_options`]
 //! concatenates the layers tile by tile. So each layer has its own ladder:
-//! the density budget, thinning, coalescing and the per-tile size valve run
-//! per layer, as for separate tippecanoe inputs. Each layer is generalized
+//! the density budget, thinning and coalescing run per layer, as for
+//! separate tippecanoe inputs. Oversized joined tiles run one joint size valve. Each layer is generalized
 //! independently, so the overview spec's one-dataset-per-file rule holds.
 //!
 //! - A null value, or one that is blank after trimming, goes to
@@ -16,9 +16,10 @@
 //!   This matches gpio's tippecanoe pipeline.
 //! - The column decides the layer and is not written as a property;
 //!   tippecanoe does not write `tippecanoe.layer` either.
-//! - DIVERGENCE FROM TIPPECANOE: the tile size caps apply to each layer
-//!   before the layers are joined, not to the combined tile. The merge
-//!   concatenates encoded layers and has no features left to shed.
+//! - The size caps apply to the combined tile. Only oversized joins reread
+//!   retained overviews and run the size valve across all layers.
+//! - DIVERGENCE FROM TIPPECANOE: density gaps retain each overview row
+//!   group's predecessor rather than one global stream across layers.
 //! - At most [`MAX_LAYERS`] layers.
 
 use std::collections::BTreeMap;
@@ -733,9 +734,17 @@ pub(super) fn convert_by_layer(
     let mut layers = Vec::new();
     let mut empty_layers = Vec::new();
     let mut archives: Vec<(Band, Reserved)> = Vec::new();
+    let mut overviews = Vec::new();
+    let mut joint_sources = Vec::new();
     for layer in staged {
         let archive =
             crate::atomic_output::reserve_path(".tylertoo-layer-", ".pmtiles", Some(&dir))
+                .map_err(|source| TilesError::IntermediateCreate {
+                    dir: dir.clone(),
+                    source,
+                })?;
+        let overview =
+            crate::atomic_output::reserve_path(".tylertoo-layer-overview-", ".parquet", Some(&dir))
                 .map_err(|source| TilesError::IntermediateCreate {
                     dir: dir.clone(),
                     source,
@@ -757,12 +766,14 @@ pub(super) fn convert_by_layer(
             layer: layer.name.clone(),
             source: Box::new(e),
         };
-        let mut report = match super::tiles::convert_to_pmtiles_validated(
+        let mut retained_export = None;
+        let mut report = match super::tiles::convert_to_pmtiles_retaining_overview(
             &staged_input,
             || staged_input.source(),
             &archive,
             &config,
             &mut (),
+            Some((&overview, &mut retained_export)),
         ) {
             Ok(TilesOutcome::Converted(report)) => report,
             Err(TilesError::Convert(e)) if super::tiles::convert_produced_nothing(&e) => {
@@ -787,6 +798,13 @@ pub(super) fn convert_by_layer(
             empty_layers.push(layer.name);
             continue;
         }
+        joint_sources.push(vec![super::export::JointSource {
+            path: overview.to_path_buf(),
+            options: retained_export.expect("an exported layer has export options"),
+            min_zoom: report.export.min_zoom,
+            max_zoom: report.export.max_zoom,
+        }]);
+        overviews.push(overview);
         archives.push((
             Band::new(
                 archive.to_path_buf(),
@@ -814,7 +832,7 @@ pub(super) fn convert_by_layer(
         return Err(TilesError::Convert(ConvertError::NoData));
     }
     let bands: Vec<Band> = archives.iter().map(|(band, _)| band.clone()).collect();
-    let merged = crate::pyramid::merge_bands_with_options(
+    let merged = crate::pyramid::merge_bands_with_sources(
         &bands,
         output,
         &BandMergeOptions {
@@ -823,6 +841,8 @@ pub(super) fn convert_by_layer(
             // The layers' archives are spooled there already.
             spill_dir: Some(dir.clone()),
         },
+        &options.export,
+        &joint_sources,
     )
     .map_err(TilesError::Merge)?;
     Ok(TilesOutcome::Layered(Box::new(LayeredReport {
@@ -1638,6 +1658,22 @@ mod tests {
         };
         let cap = cap_between(&run(None));
         assert_fits(&run(Some(cap)), cap);
+        // The compressed cap is measured on the whole join as well.
+        let free = run(None);
+        let index = ArchiveIndex::open(&free).unwrap();
+        let tile = index.tiles().next().unwrap().unwrap();
+        let gzip_cap = tile.range.len() * 3 / 4;
+        let out = dir.path().join("gzip.pmtiles");
+        let mut o = options("kind");
+        o.convert.levels = LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 0,
+        };
+        o.export.tile_size_limit = None;
+        o.export.compressed_tile_size_limit = Some(gzip_cap);
+        convert_to_pmtiles(&TilesInput::Path(input), &out, &o).unwrap();
+        let index = ArchiveIndex::open(&out).unwrap();
+        assert!(index.tiles().next().unwrap().unwrap().range.len() <= gzip_cap);
     }
 
     /// #838: `pyramid` bands of two layers that share a zoom get the cap on
@@ -1678,6 +1714,83 @@ mod tests {
         };
         let cap = cap_between(&run(None));
         assert_fits(&run(Some(cap)), cap);
+    }
+
+    #[test]
+    fn joined_archive_caps_warn_and_fitting_tiles_are_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (geoms, _) = two_kinds(8);
+        let bands: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|name| {
+                let input = dir.path().join(format!("{name}.parquet"));
+                crate::overview::testutil::write_input_with_column(
+                    &input,
+                    &geoms,
+                    "kind",
+                    Arc::new(StringArray::from(vec![name; 8])),
+                    None,
+                );
+                let archive = dir.path().join(format!("{name}.pmtiles"));
+                let mut opts = options("kind");
+                opts.layer_column = None;
+                opts.layer_name = Some(name.into());
+                opts.convert.levels = LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 0,
+                };
+                opts.export.tile_size_limit = None;
+                opts.export.compressed_tile_size_limit = None;
+                convert_to_pmtiles(&TilesInput::Path(input), &archive, &opts).unwrap();
+                Band::new(archive, name, 0, 0)
+            })
+            .collect();
+        let free = dir.path().join("free.pmtiles");
+        crate::pyramid::merge_bands(&bands, &free).unwrap();
+        let mut opts = crate::pyramid::PyramidOptions::default();
+        opts.export.tile_size_limit = Some(1);
+        let over = dir.path().join("over.pmtiles");
+        let report = crate::pyramid::build_pyramid(&bands, &over, &opts).unwrap();
+        assert!(report.diagnostics.iter().any(|d| matches!(d,
+            crate::diagnostics::Diagnostic::TilesOverLimit { count: 1, largest, .. }
+                if largest.len() == 1 && largest[0].z == 0
+        )));
+        assert_eq!(std::fs::read(&free).unwrap(), std::fs::read(&over).unwrap());
+
+        opts.export.tile_size_limit = Some(1 << 20);
+        opts.export.compressed_tile_size_limit = Some(1 << 20);
+        // A fitting join must never try to open these missing overviews.
+        let sources: Vec<_> = bands
+            .iter()
+            .map(|b| {
+                vec![super::super::export::JointSource {
+                    path: dir.path().join("must-not-be-opened.parquet"),
+                    options: super::super::export::ExportOptions {
+                        layer_name: b.layer.clone(),
+                        ..opts.export.clone()
+                    },
+                    min_zoom: 0,
+                    max_zoom: 0,
+                }]
+            })
+            .collect();
+        let fitting = dir.path().join("fitting.pmtiles");
+        let report = crate::pyramid::merge_bands_with_sources(
+            &bands,
+            &fitting,
+            &BandMergeOptions::default(),
+            &opts.export,
+            &sources,
+        )
+        .unwrap();
+        assert!(!report
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, crate::diagnostics::Diagnostic::TilesOverLimit { .. })));
+        assert_eq!(
+            std::fs::read(&free).unwrap(),
+            std::fs::read(&fitting).unwrap()
+        );
     }
 
     #[test]

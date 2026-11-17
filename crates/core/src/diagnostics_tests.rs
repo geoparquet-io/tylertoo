@@ -525,7 +525,7 @@ fn over_limit_tiles_merge_across_runs_and_stay_bounded() {
         serde_json::from_str(r#"{"kind":"tiles_over_limit","count":1}"#).unwrap();
     assert_eq!(
         legacy.to_string(),
-        "1 tile(s) still over the size limit after the size valve, written as is"
+        "1 tile(s) still over the size limit, written as is"
     );
     let unmerged = Diagnostic::TilesOverLimit {
         count: 1,
@@ -534,7 +534,7 @@ fn over_limit_tiles_merge_across_runs_and_stay_bounded() {
     };
     assert_eq!(
         unmerged.to_string(),
-        "1 tile(s) still over the size limit after the size valve, written as is; \
+        "1 tile(s) still over the size limit, written as is; \
          largest: z9/0/0 (600 B compressed)"
     );
 }

@@ -432,7 +432,7 @@ impl fmt::Display for Diagnostic {
             Self::Merged {..} => write!(f, "{n} tile feature(s) merged by the size valve"),
             Self::ValveDropped {..} => write!(f, "{n} tile feature(s) dropped by the size valve"),
             Self::TilesOverLimit {largest,merged_tiles,..} => {
-                write!(f, "{n} tile(s) still over the size limit after the size valve, written as is")?;
+                write!(f, "{n} tile(s) still over the size limit, written as is")?;
                 if !largest.is_empty() {
                     let tiles: Vec<String> = largest.iter().map(|t| format!("z{}/{}/{} ({} B compressed)", t.z, t.x, t.y, t.bytes)).collect();
                     write!(f, "; largest: {}", tiles.join(", "))?;

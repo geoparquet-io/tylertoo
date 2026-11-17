@@ -34,7 +34,7 @@ use crate::overview::config::{check_ignored_export_fields, ExportField};
 use crate::overview::convert::{
     convert_to_overviews_for_archive, ConvertError, ConvertOptions, LevelPlan,
 };
-use crate::overview::export::{export_pmtiles, ExportError, ExportOptions};
+use crate::overview::export::{export_pmtiles, ExportError, ExportOptions, JointSource};
 use crate::pmtiles_metadata::{MetadataCollector, Resolved};
 use crate::pmtiles_writer::{Header, StreamingPmtilesWriter, TileType, MAX_TILE_ID_ZOOM};
 use crate::tile::TileBounds;
@@ -2244,6 +2244,7 @@ fn build_pyramid_validated(
     // the path, which Windows refuses while a handle to it is open (#678).
     let mut scratch: Vec<Reserved> = Vec::new();
     let mut tiled: Vec<Band> = Vec::with_capacity(bands.len());
+    let mut joint_sources = Vec::with_capacity(bands.len());
 
     for (band, kind) in bands.iter().zip(&kinds) {
         if *kind == BandSource::Archive {
@@ -2255,6 +2256,7 @@ fn build_pyramid_validated(
                 band.input.display(),
             );
             tiled.push(band.clone());
+            joint_sources.push(Vec::new());
             continue;
         }
 
@@ -2294,7 +2296,7 @@ fn build_pyramid_validated(
             )
         };
 
-        let archive = match band.cells {
+        let (archive, retained) = match band.cells {
             None => tile(&band.input, (band.min_zoom, band.max_zoom), &opts.convert)?,
             Some(system) => {
                 // #332: one cell table per zoom, each tiled verbatim at its
@@ -2329,11 +2331,15 @@ fn build_pyramid_validated(
                 drop(tables);
                 let parts: Vec<Band> = zooms
                     .iter()
-                    .map(|(z, a)| Band::new(a.to_path_buf(), band.layer.clone(), *z, *z))
+                    .map(|(z, (a, _))| Band::new(a.to_path_buf(), band.layer.clone(), *z, *z))
                     .collect();
                 let archive = named(".pmtiles")?;
                 diagnostics.extend(merge_bands(&parts, &archive)?.diagnostics);
-                archive
+                let retained = zooms
+                    .into_iter()
+                    .flat_map(|(_, (_, retained))| retained)
+                    .collect();
+                (archive, retained)
             }
         };
         tiled.push(Band::new(
@@ -2342,11 +2348,22 @@ fn build_pyramid_validated(
             band.min_zoom,
             band.max_zoom,
         ));
-        // The archive must outlive the merge.
+        joint_sources.push(
+            retained
+                .iter()
+                .map(|(path, source)| {
+                    let mut source = source.clone();
+                    source.path = path.to_path_buf();
+                    source
+                })
+                .collect(),
+        );
+        scratch.extend(retained.into_iter().map(|(path, _)| path));
+        // The archive and its overviews must outlive the merge.
         scratch.push(archive);
     }
 
-    let mut report = merge_bands_with_options(
+    let mut report = merge_bands_with_sources(
         &tiled,
         output,
         &BandMergeOptions {
@@ -2358,6 +2375,8 @@ fn build_pyramid_validated(
                 .clone()
                 .or_else(|| opts.work_dir.clone()),
         },
+        &opts.export,
+        &joint_sources,
     )?;
     diagnostics.extend(report.diagnostics);
     report.diagnostics = diagnostics.snapshot();
@@ -2381,6 +2400,8 @@ fn cell_resources(opts: &PyramidOptions) -> ConvertOptions {
     }
 }
 
+type TiledSourceBand = (Reserved, Vec<(Reserved, JointSource)>);
+
 fn tile_source_band(
     input: &Path,
     layer: &str,
@@ -2389,7 +2410,7 @@ fn tile_source_band(
     opts: &PyramidOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
     named: &dyn Fn(&str) -> Result<Reserved, PyramidError>,
-) -> Result<Reserved, PyramidError> {
+) -> Result<TiledSourceBand, PyramidError> {
     let overview = named(".parquet")?;
     let archive = named(".pmtiles")?;
 
@@ -2434,9 +2455,13 @@ fn tile_source_band(
             error,
         })?;
     diagnostics.extend(report.diagnostics);
-    // The overview is only needed for the export above.
-    drop(overview);
-    Ok(archive)
+    let source = JointSource {
+        path: overview.to_path_buf(),
+        options: export,
+        min_zoom: lo,
+        max_zoom: hi,
+    };
+    Ok((archive, vec![(overview, source)]))
 }
 
 /// Add one band archive's publication metadata to `collector`, labelled
@@ -2546,7 +2571,93 @@ pub fn merge_bands_with_options(
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     validate_bands_with_diagnostics(bands, diagnostics)?;
     crate::atomic_output::check_writable(output)?;
-    merge_prepared_bands(bands, output, options, diagnostics)
+    merge_prepared_bands(bands, output, options, diagnostics, None)
+}
+
+/// Shared owner for joined-tile caps, used by both layered facades.
+pub(crate) fn merge_bands_with_sources(
+    bands: &[Band],
+    output: &Path,
+    options: &BandMergeOptions,
+    export: &ExportOptions,
+    sources: &[Vec<JointSource>],
+) -> Result<PyramidReport, PyramidError> {
+    let diagnostics = &crate::diagnostics::Diagnostics::default();
+    validate_bands_with_diagnostics(bands, diagnostics)?;
+    crate::atomic_output::check_writable(output)?;
+    merge_prepared_bands(bands, output, options, diagnostics, Some((export, sources)))
+}
+
+fn joined_over_limit(raw: usize, gzip: usize, opts: &ExportOptions) -> bool {
+    opts.tile_size_limit.is_some_and(|cap| cap > 0 && raw > cap)
+        || opts
+            .compressed_tile_size_limit
+            .is_some_and(|cap| cap > 0 && gzip > cap)
+}
+
+/// The only joined-tile cap check and retry. A fitting tile takes two size
+/// comparisons; none of its overview members are read or decoded.
+fn cap_joined_tile(
+    raw: &mut Vec<u8>,
+    gzip: &mut Vec<u8>,
+    refs: &[(usize, std::ops::Range<usize>)],
+    coord: crate::tile::TileCoord,
+    joint: Option<(&ExportOptions, &[Vec<JointSource>])>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<(), PyramidError> {
+    let Some((export, sources)) = joint else {
+        return Ok(());
+    };
+    if !joined_over_limit(raw.len(), gzip.len(), export) {
+        return Ok(());
+    }
+    let mut inputs = Vec::new();
+    let can_retry = refs.iter().all(|(bi, _)| {
+        let selected: Vec<_> = sources[*bi]
+            .iter()
+            .filter(|s| s.min_zoom <= coord.z && coord.z <= s.max_zoom)
+            .collect();
+        let found = !selected.is_empty();
+        inputs.extend(selected);
+        found
+    });
+    let mut merged = false;
+    if can_retry {
+        if let Some((replacement, has_merged)) =
+            crate::overview::export::fit_joined_tile(&inputs, coord, export, diagnostics).map_err(
+                |error| PyramidError::BandExport {
+                    layer: "joined tile".to_string(),
+                    error,
+                },
+            )?
+        {
+            *raw = replacement;
+            merged = has_merged;
+            *gzip = compression::compress(raw, Compression::Gzip).map_err(|error| {
+                PyramidError::TileCompress {
+                    z: coord.z,
+                    x: coord.x,
+                    y: coord.y,
+                    error,
+                }
+            })?;
+        }
+    }
+    // DIVERGENCE FROM TIPPECANOE: tile-join.cpp:884 skips oversized archive
+    // joins. With no overview members (or an exhausted valve), keep and warn.
+    if joined_over_limit(raw.len(), gzip.len(), export) {
+        diagnostics.record(crate::diagnostics::Diagnostic::TilesOverLimit {
+            count: 1,
+            largest: vec![crate::stats::LargestTile {
+                z: coord.z,
+                x: coord.x,
+                y: coord.y,
+                bytes: gzip.len() as u64,
+            }],
+            merged_tiles: usize::from(merged),
+        });
+    }
+    Ok(())
 }
 
 fn merge_prepared_bands(
@@ -2554,6 +2665,7 @@ fn merge_prepared_bands(
     output: &Path,
     options: &BandMergeOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
+    joint: Option<(&ExportOptions, &[Vec<JointSource>])>,
 ) -> Result<PyramidReport, PyramidError> {
     let allow_missing_zooms = options.allow_missing_zooms;
     // The single call site for this warning: a direct library caller of this
@@ -2725,8 +2837,9 @@ fn merge_prepared_bands(
                     // (which keys on the uncompressed bytes): one writer, one
                     // dedup keyspace (#403). Compression is deterministic, so
                     // equal combined tiles still collapse to one body.
-                    let gz = compression::compress(&buf, Compression::Gzip)
+                    let mut gz = compression::compress(&buf, Compression::Gzip)
                         .map_err(|error| PyramidError::TileCompress { z, x, y, error })?;
+                    cap_joined_tile(&mut buf, &mut gz, refs, coord, joint, diagnostics)?;
                     append_compressed_tile(&mut writer, coord, &gz, buf.len())?;
                     combined += 1;
                 }
