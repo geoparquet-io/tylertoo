@@ -3289,7 +3289,7 @@ fn drop_joined_tile(
     gzip: &mut Vec<u8>,
     opts: &ExportOptions,
 ) -> Result<usize, std::io::Error> {
-    let Ok(mut tile) = crate::vector_tile::Tile::decode(raw.as_slice()) else {
+    let Ok(tile) = crate::vector_tile::Tile::decode(raw.as_slice()) else {
         return Ok(0);
     };
     // Bad tag pairs are not safe to remap, even if protobuf decoding succeeded.
@@ -3304,66 +3304,15 @@ fn drop_joined_tile(
     }) {
         return Ok(0);
     }
-    let mut remaining: usize = tile.layers.iter().map(|l| l.features.len()).sum();
-    let mut fit = joined_tile_fit(raw.len(), gzip.len(), opts);
-    if fit >= 1.0 || remaining <= 1 {
+    let total: usize = tile.layers.iter().map(|l| l.features.len()).sum();
+    let fit = joined_tile_fit(raw.len(), gzip.len(), opts);
+    if fit >= 1.0 || total <= 1 {
         return Ok(0);
     }
     let Ok(fields) = joined_mvt_fields(raw) else {
         return Ok(0);
     };
-    let mut raw_bytes = raw.len();
     let original = std::mem::take(raw);
-    let mut changed = vec![false; tile.layers.len()];
-    let mut dropped = 0;
-    while fit < 1.0 && remaining > 1 {
-        let selected = select_joined_features(&tile, raw_bytes, fit);
-        let keep = selected.iter().filter(|&&keep| keep).count();
-        let mut index = 0;
-        for (layer, changed) in tile.layers.iter_mut().zip(&mut changed) {
-            let before = layer.features.len();
-            layer.features.retain(|_| {
-                let keep = selected[index];
-                index += 1;
-                keep
-            });
-            if layer.features.len() != before {
-                *changed = true;
-                prune_joined_layer(layer);
-            }
-        }
-        dropped += remaining - keep;
-        remaining = keep;
-        raw.clear();
-        let mut layer_index = 0;
-        for (tag, range) in &fields {
-            if *tag == 3 {
-                if changed[layer_index] {
-                    prost::encoding::message::encode(3, &tile.layers[layer_index], raw);
-                } else {
-                    raw.extend_from_slice(&original[range.clone()]);
-                }
-                layer_index += 1;
-            } else {
-                raw.extend_from_slice(&original[range.clone()]);
-            }
-        }
-        *gzip = compression::compress(raw, Compression::Gzip)?;
-        #[cfg(test)]
-        tests::JOINED_DROP_PASSES.with(|passes| passes.set(passes.get() + 1));
-        raw_bytes = raw.len();
-        fit = joined_tile_fit(raw.len(), gzip.len(), opts);
-    }
-    Ok(dropped)
-}
-
-/// Budget the ranked prefix by encoded bytes. The fixed fraction guarantees
-/// logarithmic re-encodes when large survivors alone exceed the cap.
-fn select_joined_features(
-    tile: &crate::vector_tile::Tile,
-    raw_bytes: usize,
-    fit: f64,
-) -> Vec<bool> {
     let features: Vec<_> = tile
         .layers
         .iter()
@@ -3373,12 +3322,99 @@ fn select_joined_features(
     let point_like = features.iter().all(|(_, f)| {
         f.r#type == Some(crate::vector_tile::tile::GeomType::Point as i32) && f.geometry.len() <= 3
     });
-    let mut ranked = crate::overview::export::select_kept_by_size(
-        &features,
-        features.len(),
-        point_like,
-        |(_, f)| f.geometry.len(),
-    );
+    // Rank once; every keep count below selects from this ranking.
+    let ranked =
+        crate::overview::export::select_kept_by_size(&features, total, point_like, |(_, f)| {
+            f.geometry.len()
+        });
+    let encode = |keep: usize, raw: &mut Vec<u8>| -> Result<Vec<u8>, std::io::Error> {
+        let kept = if point_like {
+            crate::overview::export::select_kept_by_size(&features, keep, true, |_| 0)
+        } else {
+            ranked[..keep].to_vec()
+        };
+        let mut selected = vec![false; total];
+        for (index, _) in kept {
+            selected[*index] = true;
+        }
+        raw.clear();
+        let (mut layer_index, mut offset) = (0, 0);
+        for (tag, range) in &fields {
+            if *tag != 3 {
+                raw.extend_from_slice(&original[range.clone()]);
+                continue;
+            }
+            let layer = &tile.layers[layer_index];
+            let mask = &selected[offset..offset + layer.features.len()];
+            if mask.iter().all(|&keep| keep) {
+                raw.extend_from_slice(&original[range.clone()]);
+            } else {
+                let mut kept = crate::vector_tile::tile::Layer {
+                    version: layer.version,
+                    name: layer.name.clone(),
+                    features: (layer.features.iter().zip(mask))
+                        .filter(|&(_, &keep)| keep)
+                        .map(|(f, _)| f.clone())
+                        .collect(),
+                    keys: layer.keys.clone(),
+                    values: layer.values.clone(),
+                    extent: layer.extent,
+                };
+                prune_joined_layer(&mut kept);
+                prost::encoding::message::encode(3, &kept, raw);
+            }
+            offset += layer.features.len();
+            layer_index += 1;
+        }
+        #[cfg(test)]
+        tests::JOINED_DROP_PASSES.with(|passes| passes.set(passes.get() + 1));
+        compression::compress(raw, Compression::Gzip)
+    };
+    // The byte budget picks the first keep count. When that misses, search
+    // the ranked prefix below it: one probe scaled by the measured overshoot,
+    // then bisection until the largest fit is within 1/16 of the smallest
+    // miss. A crafted tile costs at most 2 + ceil(log2(first)) encode and
+    // gzip passes.
+    let first = joined_budget_keep(&tile, &ranked, original.len(), fit);
+    *gzip = encode(first, raw)?;
+    let mut kept = first;
+    if joined_over_limit(raw.len(), gzip.len(), opts) {
+        // low fits (0: no fit yet, one feature is the floor); high misses.
+        let (mut low, mut high) = (0, first);
+        let mut scaled = (first as f64 * joined_tile_fit(raw.len(), gzip.len(), opts)) as usize;
+        let mut best: Option<(Vec<u8>, Vec<u8>)> = None;
+        while high - low > 1 && (low == 0 || high - low > high / 16) {
+            let keep = if low < scaled && scaled < high {
+                scaled
+            } else {
+                low + (high - low) / 2
+            };
+            scaled = 0;
+            *gzip = encode(keep, raw)?;
+            kept = keep;
+            if joined_over_limit(raw.len(), gzip.len(), opts) {
+                high = keep;
+            } else {
+                best = Some((std::mem::take(raw), std::mem::take(gzip)));
+                low = keep;
+            }
+        }
+        // Without a fit, the last probe was the one-feature floor.
+        if let Some((best_raw, best_gzip)) = best {
+            (kept, *raw, *gzip) = (low, best_raw, best_gzip);
+        }
+    }
+    Ok(total - kept)
+}
+
+/// Budget the ranked prefix by encoded bytes. At most 3/4 survive, so the
+/// first pass always drops features.
+fn joined_budget_keep(
+    tile: &crate::vector_tile::Tile,
+    ranked: &[&(usize, &crate::vector_tile::tile::Feature)],
+    raw_bytes: usize,
+    fit: f64,
+) -> usize {
     let feature_bytes = |f: &crate::vector_tile::tile::Feature| {
         let len = f.encoded_len();
         1 + prost::length_delimiter_len(len) + len
@@ -3387,7 +3423,7 @@ fn select_joined_features(
     // raw * fit converts the gzip cap using this tile's measured
     // gzip/raw ratio, and also respects an enabled raw cap.
     // Dictionaries can disappear with the dropped features. Reserve only
-    // the other framing here; the next measurement includes the kept tags.
+    // the other framing here; the search below measures the kept tags.
     let dictionaries: usize = tile
         .layers
         .iter()
@@ -3410,27 +3446,14 @@ fn select_joined_features(
     let budget = (raw_bytes as f64 * fit).floor() as usize;
     let budget = budget.saturating_sub(overhead);
     let mut used = 0;
-    let keep = ranked
+    ranked
         .iter()
         .take_while(|(_, f)| {
             used += feature_bytes(f);
             used <= budget
         })
         .count()
-        .clamp(1, (features.len() * 3 / 4).max(1));
-    let kept = if point_like {
-        crate::overview::export::select_kept_by_size(&features, keep, true, |(_, f)| {
-            f.geometry.len()
-        })
-    } else {
-        ranked.truncate(keep);
-        ranked
-    };
-    let mut selected = vec![false; features.len()];
-    for (index, _) in kept {
-        selected[*index] = true;
-    }
-    selected
+        .clamp(1, (ranked.len() * 3 / 4).max(1))
 }
 
 /// Preserve untouched layers (including unknown fields and field ordering),
@@ -5952,7 +5975,55 @@ mod tests {
         assert_eq!(result.layers[0], original.layers[0]);
         assert!(result.layers[1].features.is_empty());
         assert!(raw.len() > cap, "the last feature cannot fit");
-        JOINED_DROP_PASSES.with(|passes| assert!(passes.get() <= 12, "{} passes", passes.get()));
+        JOINED_DROP_PASSES.with(|passes| {
+            assert!(
+                passes.get() <= 31_usize.ilog2() as usize + 2,
+                "{} passes",
+                passes.get()
+            )
+        });
+    }
+
+    #[test]
+    fn merge_bands_drop_pass_budget_holds_when_dictionaries_dominate() {
+        // Each feature owns a large dictionary value, which the byte budget
+        // cannot reserve, so a re-ranking loop only sheds a quarter per pass.
+        let n = 2_000;
+        let mut layer = feature_layer("b", Vec::new());
+        layer.values = (0..n)
+            .map(|i| crate::vector_tile::tile::Value {
+                string_value: Some(format!("{i:04000}")),
+                ..Default::default()
+            })
+            .collect();
+        layer.features = (0..n)
+            .map(|i| crate::vector_tile::tile::Feature {
+                tags: vec![0, i as u32],
+                ..line_feature(i as u64, 2)
+            })
+            .collect();
+        let tile = crate::vector_tile::Tile {
+            layers: vec![layer],
+        };
+        let cap = 4_200;
+        let mut raw = tile.encode_to_vec();
+        let mut gzip = compression::compress(&raw, Compression::Gzip).unwrap();
+        JOINED_DROP_PASSES.with(|passes| passes.set(0));
+        let dropped = drop_joined_tile(
+            &mut raw,
+            &mut gzip,
+            &ExportOptions {
+                tile_size_limit: Some(cap),
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(dropped, n - 1);
+        assert!(raw.len() <= cap, "{} > {cap}", raw.len());
+        let budget = (n as u32).ilog2() as usize + 3;
+        JOINED_DROP_PASSES
+            .with(|passes| assert!(passes.get() <= budget, "{} passes", passes.get()));
     }
 
     thread_local! {
@@ -6028,8 +6099,10 @@ mod tests {
             // At most floor(3n/4) survive each pass, even when a cap is
             // only one byte below the original tile's size.
             assert!(50_001 - dropped <= 50_001 * 3 / 4);
+            // One budgeted pass, one scaled probe, then bisection.
+            let budget = 50_001_usize.ilog2() as usize + 3;
             JOINED_DROP_PASSES
-                .with(|passes| assert!(passes.get() <= 40, "{} passes", passes.get()));
+                .with(|passes| assert!(passes.get() <= budget, "{} passes", passes.get()));
             if cap == tile.layers[0].encoded_len() - 1 {
                 assert_eq!(dropped, 50_000);
                 assert!(raw.len() > cap);
