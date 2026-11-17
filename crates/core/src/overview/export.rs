@@ -10507,13 +10507,20 @@ fn build_tile_layers_with<M: TileFeature>(
             grouped[index].1.push(member);
         }
     }
-    for (name, selected) in grouped {
-        let layer_opts = ExportOptions {
-            layer_name: name.clone(),
-            tile_format: TileFormat::Mvt,
-            ..opts.clone()
-        };
-        let layer = build_mvt_with(cache, &selected, &layer_opts, &[], |m| encode(*m));
+    // Layers encode independently; the joint valve re-encodes all of them on
+    // every pass, so build them in parallel and join in layer order.
+    let built: Vec<TileMvt> = grouped
+        .into_par_iter()
+        .map(|(name, selected)| {
+            let layer_opts = ExportOptions {
+                layer_name: name.clone(),
+                tile_format: TileFormat::Mvt,
+                ..opts.clone()
+            };
+            build_mvt_with(cache, &selected, &layer_opts, &[], |m| encode(*m))
+        })
+        .collect();
+    for layer in built {
         bytes.extend_from_slice(&layer.data);
         out.features += layer.features;
         out.unencodable += layer.unencodable;
