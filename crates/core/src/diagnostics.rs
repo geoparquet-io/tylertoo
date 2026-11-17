@@ -109,6 +109,17 @@ pub enum Diagnostic {
     Merged { count: usize },
     #[non_exhaustive]
     ValveDropped { count: usize },
+    /// Whole merged features removed at the extent floor, and the sources
+    /// they carried. Sources also count in `ValveDropped`.
+    #[non_exhaustive]
+    MergedDropped { count: usize, sources: usize },
+    /// Written tiles at a coarser grid, grouped by zoom.
+    #[non_exhaustive]
+    ExtentReduced {
+        count: usize,
+        zoom: u8,
+        min_extent: u32,
+    },
     #[non_exhaustive]
     TilesOverLimit {
         count: usize,
@@ -117,8 +128,7 @@ pub enum Diagnostic {
         /// them (#873).
         #[serde(default)]
         largest: Vec<crate::stats::LargestTile>,
-        /// Those tiles that hold merged features, which the merge valve
-        /// never drops; 0 under the drop valve.
+        /// Those tiles whose remaining feature is merged; 0 under drop.
         #[serde(default)]
         merged_tiles: usize,
     },
@@ -276,6 +286,8 @@ macro_rules! event_count {
             | Self::ValidationSkipped { count }
             | Self::Merged { count }
             | Self::ValveDropped { count }
+            | Self::MergedDropped { count, .. }
+            | Self::ExtentReduced { count, .. }
             | Self::TilesOverLimit { count, .. }
             | Self::PropertySkipped { count, .. }
             | Self::CrsMetadata { count, .. }
@@ -309,6 +321,15 @@ impl Diagnostic {
         // identity (including CRS). Only the counts and totals merge here.
         let count = self.count().saturating_add(event.count());
         match (&mut *self, event) {
+            (Self::MergedDropped { sources: a, .. }, Self::MergedDropped { sources: b, .. }) => {
+                *a = a.saturating_add(*b);
+            }
+            (
+                Self::ExtentReduced { min_extent: a, .. },
+                Self::ExtentReduced { min_extent: b, .. },
+            ) => {
+                *a = (*a).min(*b);
+            }
             (Self::OutOfRange { context: a, .. }, Self::OutOfRange { context: b, .. })
             | (Self::Unprojectable { context: a, .. }, Self::Unprojectable { context: b, .. })
             | (Self::Wrapped { context: a, .. }, Self::Wrapped { context: b, .. }) => {
@@ -386,6 +407,8 @@ impl Diagnostic {
                     c.max_abs = 0.0;
                 }
                 Diagnostic::UnusableGeometry { total, .. } => *total = 0,
+                Diagnostic::MergedDropped { sources, .. } => *sources = 0,
+                Diagnostic::ExtentReduced { min_extent, .. } => *min_extent = 0,
                 Diagnostic::TilesOverLimit {
                     largest,
                     merged_tiles,
@@ -431,6 +454,8 @@ impl fmt::Display for Diagnostic {
             Self::ValidationSkipped {..} => write!(f, "{n} oversized RDP candidate(s) skipped exact validity checking and were assumed valid (#242)"),
             Self::Merged {..} => write!(f, "{n} tile feature(s) merged by the size valve"),
             Self::ValveDropped {..} => write!(f, "{n} tile feature(s) dropped by the size valve"),
+            Self::MergedDropped {sources,..} => write!(f, "{n} merged feature(s) carrying {sources} source feature(s) dropped by the size valve"),
+            Self::ExtentReduced {zoom,min_extent,..} => write!(f, "{n} tile(s) at z{zoom} written at reduced extent; smallest extent {min_extent}"),
             Self::TilesOverLimit {largest,merged_tiles,..} => {
                 write!(f, "{n} tile(s) still over the size limit after the size valve, written as is")?;
                 if !largest.is_empty() {
@@ -438,7 +463,7 @@ impl fmt::Display for Diagnostic {
                     write!(f, "; largest: {}", tiles.join(", "))?;
                 }
                 if *merged_tiles > 0 {
-                    write!(f, "; {merged_tiles} of them hold merged features, which the merge valve never drops: try --size-valve drop, which drops features to fit the cap")?;
+                    write!(f, "; {merged_tiles} of them hold a single merged feature over the cap at the extent floor")?;
                 }
                 Ok(())
             }
