@@ -5711,6 +5711,75 @@ mod tests {
         assert_eq!(over, 1, "the one output tile over the cap is counted once");
     }
 
+    /// #838 + #873: the merge valve's last fallback (coarser extent) keeps
+    /// each band's features in that band's layer of the joined tile.
+    #[test]
+    fn joined_valve_extent_fallback_keeps_each_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        // Dense detailed rings per band: the merge valve runs out of gaps
+        // and the extent fallback re-encodes the tile.
+        let ring = |cx: f64, cy: f64| {
+            let pts: Vec<(f64, f64)> = (0..200)
+                .map(|i| {
+                    let a = i as f64 / 200.0 * std::f64::consts::TAU;
+                    let r = 2.0 + 0.3 * (a * 17.0).sin();
+                    (cx + r * a.cos(), cy + r * 0.8 * a.sin())
+                })
+                .collect();
+            Some(geo::Geometry::Polygon(geo::Polygon::new(
+                pts.into(),
+                vec![],
+            )))
+        };
+        let grid = |dx: f64| {
+            (0..60)
+                .map(|i| {
+                    ring(
+                        (i % 10) as f64 * 9.0 - 45.0 + dx,
+                        (i / 10) as f64 * 9.0 - 27.0,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let bands = [("a", 0.0), ("b", 4.5)]
+            .into_iter()
+            .map(|(name, dx)| {
+                let input = dir.path().join(format!("{name}.parquet"));
+                crate::overview::testutil::write_input(&input, &grid(dx), false, None);
+                Band::new(input, name, 0, 0)
+            })
+            .collect::<Vec<_>>();
+        let run = |cap: Option<usize>| {
+            let output = dir.path().join(format!("out-{cap:?}.pmtiles"));
+            build_pyramid(
+                &bands,
+                &output,
+                &PyramidOptions {
+                    export: ExportOptions {
+                        tile_size_limit: cap,
+                        ..Default::default()
+                    },
+                    work_dir: Some(dir.path().to_path_buf()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            decoded_tiles(&output)[&0].clone()
+        };
+        let free = run(None);
+        let capped = run(Some(free.len() / 3));
+        assert!(capped.len() <= free.len() / 3, "the valve fits");
+        let tile = crate::vector_tile::Tile::decode(capped.as_slice()).unwrap();
+        let mut names: Vec<_> = tile
+            .layers
+            .iter()
+            .filter(|l| !l.features.is_empty())
+            .map(|l| l.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["a", "b"], "each band keeps its own layer");
+    }
+
     #[test]
     fn joined_archive_does_not_bypass_the_source_valve() {
         let dir = tempfile::tempdir().unwrap();

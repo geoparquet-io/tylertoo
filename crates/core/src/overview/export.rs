@@ -10418,7 +10418,7 @@ fn merge_to_fit(
                 gzip_cache,
                 &mut kept,
                 tb,
-                opts,
+                (opts, opts.layers),
                 diagnostics,
                 out,
                 &mut tally,
@@ -10458,7 +10458,7 @@ fn reduce_merged_to_fit(
     gzip_cache: &Arc<TileGzipCache>,
     kept: &mut Vec<&coalesce_valve::Merged<'_>>,
     tb: &TileBounds,
-    opts: &ExportOptions,
+    (opts, layers): (&ExportOptions, &[(u16, String)]),
     diagnostics: &crate::diagnostics::Diagnostics,
     mut out: TileMvt,
     tally: &mut ValveTally,
@@ -10481,7 +10481,7 @@ fn reduce_merged_to_fit(
         drop(out);
         // Plain encode quantizes, unions and cleans geometry on this grid.
         // Never reuse the original grid's QuantizedPolygons or fill.
-        out = build_mvt(gzip_cache, kept, tb, &reduced, &[], diagnostics);
+        out = build_tile_layers(gzip_cache, layers, kept, tb, &reduced, &[], diagnostics);
         fit = tile_fit(&mut out, &reduced).unwrap_or(f64::INFINITY);
     }
     while fit < 1.0 && kept.len() > 1 {
@@ -10507,7 +10507,7 @@ fn reduce_merged_to_fit(
         });
         tally.passes += 1;
         drop(out);
-        out = build_mvt(gzip_cache, kept, tb, &reduced, &[], diagnostics);
+        out = build_tile_layers(gzip_cache, layers, kept, tb, &reduced, &[], diagnostics);
         fit = tile_fit(&mut out, &reduced).unwrap_or(f64::INFINITY);
     }
     tally.over_limit = usize::from(fit < 1.0);
