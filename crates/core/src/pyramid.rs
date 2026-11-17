@@ -35,7 +35,7 @@ use crate::overview::config::{check_ignored_export_fields, ExportField};
 use crate::overview::convert::{
     convert_to_overviews_for_archive, ConvertError, ConvertOptions, LevelPlan,
 };
-use crate::overview::export::{export_pmtiles, ExportError, ExportOptions, JointSource};
+use crate::overview::export::{ExportError, ExportOptions, JointSource};
 use crate::pmtiles_metadata::{MetadataCollector, Resolved};
 use crate::pmtiles_writer::{Header, StreamingPmtilesWriter, TileType, MAX_TILE_ID_ZOOM};
 use crate::tile::TileBounds;
@@ -851,6 +851,25 @@ fn bands_share_zooms(bands: &[Band]) -> bool {
             .iter()
             .any(|b| a.min_zoom <= b.max_zoom && b.min_zoom <= a.max_zoom)
     })
+}
+
+/// Zooms whose cap decisions belong to the final merge.
+pub(crate) fn shared_cap_zooms(bands: &[Band], export: &ExportOptions) -> Vec<u8> {
+    if !export.tile_size_limit.is_some_and(|cap| cap > 0)
+        && !export.compressed_tile_size_limit.is_some_and(|cap| cap > 0)
+    {
+        return Vec::new();
+    }
+    (0..=crate::tile::MAX_ZOOM)
+        .filter(|z| {
+            bands
+                .iter()
+                .filter(|b| b.min_zoom <= *z && *z <= b.max_zoom)
+                .take(2)
+                .count()
+                == 2
+        })
+        .collect()
 }
 
 /// Whether a band's layer name is simply its input's file stem — i.e. the
@@ -2246,6 +2265,7 @@ fn build_pyramid_validated(
     let mut scratch: Vec<Reserved> = Vec::new();
     let mut tiled: Vec<Band> = Vec::with_capacity(bands.len());
     let mut joint_sources = Vec::with_capacity(bands.len());
+    let shared_zooms = shared_cap_zooms(bands, &opts.export);
 
     for (band, kind) in bands.iter().zip(&kinds) {
         if *kind == BandSource::Archive {
@@ -2293,7 +2313,10 @@ fn build_pyramid_validated(
                 convert,
                 opts,
                 diagnostics,
-                &named,
+                &SourceBandWork {
+                    named: &named,
+                    shared_zooms: &shared_zooms,
+                },
             )
         };
 
@@ -2379,6 +2402,7 @@ fn build_pyramid_validated(
         &opts.export,
         &joint_sources,
     )?;
+    drop(scratch);
     diagnostics.extend(report.diagnostics);
     report.diagnostics = diagnostics.snapshot();
     Ok(report)
@@ -2403,6 +2427,11 @@ fn cell_resources(opts: &PyramidOptions) -> ConvertOptions {
 
 type TiledSourceBand = (Reserved, Vec<(Reserved, JointSource)>);
 
+struct SourceBandWork<'a> {
+    named: &'a dyn Fn(&str) -> Result<Reserved, PyramidError>,
+    shared_zooms: &'a [u8],
+}
+
 fn tile_source_band(
     input: &Path,
     layer: &str,
@@ -2410,8 +2439,12 @@ fn tile_source_band(
     convert: &ConvertOptions,
     opts: &PyramidOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
-    named: &dyn Fn(&str) -> Result<Reserved, PyramidError>,
+    work: &SourceBandWork<'_>,
 ) -> Result<TiledSourceBand, PyramidError> {
+    let SourceBandWork {
+        named,
+        shared_zooms,
+    } = *work;
     let overview = named(".parquet")?;
     let archive = named(".pmtiles")?;
 
@@ -2450,17 +2483,26 @@ fn tile_source_band(
         metadata: TilesetMetadata::default(),
         ..opts.export.clone()
     };
-    let report =
-        export_pmtiles(&overview, &archive, &export).map_err(|error| PyramidError::BandExport {
-            layer: layer.to_string(),
-            error,
-        })?;
+    let report = crate::overview::export::export_pmtiles_for_join(
+        &overview,
+        &archive,
+        &export,
+        shared_zooms,
+    )
+    .map_err(|error| PyramidError::BandExport {
+        layer: layer.to_string(),
+        error,
+    })?;
     diagnostics.extend(report.diagnostics);
+    if !shared_zooms.iter().any(|&z| lo <= z && z <= hi) {
+        return Ok((archive, Vec::new()));
+    }
     let source = JointSource {
         path: overview.to_path_buf(),
         options: export,
         min_zoom: lo,
         max_zoom: hi,
+        deferred_caps: shared_zooms.to_vec(),
     };
     Ok((archive, vec![(overview, source)]))
 }
@@ -2549,6 +2591,28 @@ fn append_compressed_tile(
         .map_err(|e| crate::pmtiles_writer::WriteError::io("add tile", e).into())
 }
 
+/// Source intermediates can exceed the foreign-tile ceiling while their
+/// valve is deferred. These bytes came from our exporter in this run; this
+/// step only concatenates them, without decoding their protobuf geometry.
+fn decompress_band_tile(
+    data: &[u8],
+    compression: Compression,
+    zoom: u8,
+    band: usize,
+    joint: Option<(&ExportOptions, &[Vec<JointSource>])>,
+) -> Result<Vec<u8>, std::io::Error> {
+    let deferred = joint.is_some_and(|(_, sources)| {
+        sources[band]
+            .iter()
+            .any(|s| s.deferred_caps.contains(&zoom))
+    });
+    compression::decompress_capped(
+        data,
+        compression,
+        if deferred { u64::MAX } else { MAX_TILE_BYTES },
+    )
+}
+
 /// [`merge_bands`] with [`BandMergeOptions`]: a band's declared zoom range
 /// may overshoot its archive, and the merged archive's publication metadata
 /// can be set.
@@ -2605,6 +2669,21 @@ fn joined_tile_fit(raw: usize, gzip: usize, opts: &ExportOptions) -> f64 {
         fit = fit.min(cap as f64 / gzip as f64);
     }
     fit
+}
+
+fn merge_cap_zooms(
+    bands: &[Band],
+    joint: Option<(&ExportOptions, &[Vec<JointSource>])>,
+) -> Vec<u8> {
+    joint.map_or_else(Vec::new, |(export, sources)| {
+        // Keep the original ownership when another layer exports nothing
+        // at a zoom, or leaves the whole merge with one nonempty layer.
+        let mut zooms = shared_cap_zooms(bands, export);
+        zooms.extend(sources.iter().flatten().flat_map(|s| &s.deferred_caps));
+        zooms.sort_unstable();
+        zooms.dedup();
+        zooms
+    })
 }
 
 /// The only joined-tile cap check and retry. A fitting tile takes two size
@@ -2718,29 +2797,13 @@ fn drop_joined_tile(
     let Ok(fields) = joined_mvt_fields(raw) else {
         return Ok(0);
     };
+    let mut raw_bytes = raw.len();
     let original = std::mem::take(raw);
     let mut changed = vec![false; tile.layers.len()];
     let mut dropped = 0;
     while fit < 1.0 && remaining > 1 {
-        let features: Vec<_> = tile
-            .layers
-            .iter()
-            .flat_map(|l| &l.features)
-            .enumerate()
-            .collect();
-        let keep = ((remaining as f64 * fit).floor() as usize).clamp(1, remaining - 1);
-        let point_like = features.iter().all(|(_, f)| {
-            f.r#type == Some(crate::vector_tile::tile::GeomType::Point as i32)
-                && f.geometry.len() <= 3
-        });
-        let kept =
-            crate::overview::export::select_kept_by_size(&features, keep, point_like, |(_, f)| {
-                f.geometry.len()
-            });
-        let mut selected = vec![false; remaining];
-        for (index, _) in kept {
-            selected[*index] = true;
-        }
+        let selected = select_joined_features(&tile, raw_bytes, fit);
+        let keep = selected.iter().filter(|&&keep| keep).count();
         let mut index = 0;
         for (layer, changed) in tile.layers.iter_mut().zip(&mut changed) {
             let before = layer.features.len();
@@ -2771,9 +2834,88 @@ fn drop_joined_tile(
             }
         }
         *gzip = compression::compress(raw, Compression::Gzip)?;
+        #[cfg(test)]
+        tests::JOINED_DROP_PASSES.with(|passes| passes.set(passes.get() + 1));
+        raw_bytes = raw.len();
         fit = joined_tile_fit(raw.len(), gzip.len(), opts);
     }
     Ok(dropped)
+}
+
+/// Budget the ranked prefix by encoded bytes. The fixed fraction guarantees
+/// logarithmic re-encodes when large survivors alone exceed the cap.
+fn select_joined_features(
+    tile: &crate::vector_tile::Tile,
+    raw_bytes: usize,
+    fit: f64,
+) -> Vec<bool> {
+    let features: Vec<_> = tile
+        .layers
+        .iter()
+        .flat_map(|l| &l.features)
+        .enumerate()
+        .collect();
+    let point_like = features.iter().all(|(_, f)| {
+        f.r#type == Some(crate::vector_tile::tile::GeomType::Point as i32) && f.geometry.len() <= 3
+    });
+    let mut ranked = crate::overview::export::select_kept_by_size(
+        &features,
+        features.len(),
+        point_like,
+        |(_, f)| f.geometry.len(),
+    );
+    let feature_bytes = |f: &crate::vector_tile::tile::Feature| {
+        let len = f.encoded_len();
+        1 + prost::length_delimiter_len(len) + len
+    };
+    let payload: usize = ranked.iter().map(|(_, f)| feature_bytes(f)).sum();
+    // raw * fit converts the gzip cap using this tile's measured
+    // gzip/raw ratio, and also respects an enabled raw cap.
+    // Dictionaries can disappear with the dropped features. Reserve only
+    // the other framing here; the next measurement includes the kept tags.
+    let dictionaries: usize = tile
+        .layers
+        .iter()
+        .map(|layer| {
+            layer
+                .keys
+                .iter()
+                .map(|key| prost::encoding::string::encoded_len(3, key))
+                .sum::<usize>()
+                + layer
+                    .values
+                    .iter()
+                    .map(|value| prost::encoding::message::encoded_len(4, value))
+                    .sum::<usize>()
+        })
+        .sum();
+    let overhead = raw_bytes
+        .saturating_sub(payload)
+        .saturating_sub(dictionaries);
+    let budget = (raw_bytes as f64 * fit).floor() as usize;
+    let budget = budget.saturating_sub(overhead);
+    let mut used = 0;
+    let keep = ranked
+        .iter()
+        .take_while(|(_, f)| {
+            used += feature_bytes(f);
+            used <= budget
+        })
+        .count()
+        .clamp(1, (features.len() * 3 / 4).max(1));
+    let kept = if point_like {
+        crate::overview::export::select_kept_by_size(&features, keep, true, |(_, f)| {
+            f.geometry.len()
+        })
+    } else {
+        ranked.truncate(keep);
+        ranked
+    };
+    let mut selected = vec![false; features.len()];
+    for (index, _) in kept {
+        selected[*index] = true;
+    }
+    selected
 }
 
 /// Preserve untouched layers (including unknown fields and field ordering),
@@ -2886,7 +3028,8 @@ fn merge_prepared_bands(
     let mut bands_without_bounds: Vec<String> = Vec::new();
     let mut tile_type = None;
 
-    if bands_share_zooms(bands) {
+    let shared_zooms = merge_cap_zooms(bands, joint);
+    if bands_share_zooms(bands) || !shared_zooms.is_empty() {
         // #385: bands in different layers share zooms, so one tile id can
         // come from several bands. A k-way merge over the bands' directories
         // (#403) emits each id once, in ascending order: a tile only one band
@@ -2975,7 +3118,7 @@ fn merge_prepared_bands(
             match group.as_slice() {
                 // Every band's copy fell outside that band's range.
                 [] => continue,
-                [(bi, range)] => {
+                [(bi, range)] if !shared_zooms.contains(&z) => {
                     let data = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
                     append_compressed_tile(&mut writer, coord, &data, data.len())?;
                 }
@@ -2983,10 +3126,12 @@ fn merge_prepared_bands(
                     buf.clear();
                     for (bi, range) in refs {
                         let raw = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
-                        let plain = compression::decompress_capped(
+                        let plain = decompress_band_tile(
                             &raw,
                             archives[*bi].header().tile_compression,
-                            MAX_TILE_BYTES,
+                            z,
+                            *bi,
+                            joint,
                         )
                         .map_err(|error| PyramidError::TileDecompress {
                             z,
@@ -3004,7 +3149,7 @@ fn merge_prepared_bands(
                     // equal combined tiles still collapse to one body.
                     let gz = cap_joined_tile(&mut buf, refs, coord, tile_type, joint, diagnostics)?;
                     append_compressed_tile(&mut writer, coord, &gz, buf.len())?;
-                    combined += 1;
+                    combined += usize::from(refs.len() > 1);
                 }
             }
             total += 1;
@@ -3997,6 +4142,75 @@ mod tests {
         out
     }
 
+    #[test]
+    fn pyramid_retains_overviews_only_for_shared_capped_zooms() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        write_cell_source(&input, 10, 0.6);
+        for (cap, other_min, expected) in [
+            (None, 0, 0),
+            (Some(0), 0, 0),
+            (Some(1000), 3, 0),
+            (Some(1000), 0, 1),
+        ] {
+            let opts = PyramidOptions {
+                export: ExportOptions {
+                    tile_size_limit: cap,
+                    compressed_tile_size_limit: None,
+                    ..Default::default()
+                },
+                work_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            };
+            let bands = [
+                Band::new(&input, "a", 0, 2),
+                Band::new(&input, "b", other_min, 3),
+            ];
+            let shared_zooms = shared_cap_zooms(&bands, &opts.export);
+            let named = |suffix: &str| {
+                crate::atomic_output::reserve_path("retained-", suffix, Some(dir.path())).map_err(
+                    |error| PyramidError::BandWorkFile {
+                        layer: "a".into(),
+                        error,
+                    },
+                )
+            };
+            let (archive, overviews) = tile_source_band(
+                &input,
+                "a",
+                (0, 2),
+                &opts.convert,
+                &opts,
+                &crate::diagnostics::Diagnostics::default(),
+                &SourceBandWork {
+                    named: &named,
+                    shared_zooms: &shared_zooms,
+                },
+            )
+            .unwrap();
+            assert_eq!(overviews.len(), expected);
+            assert!(overviews.iter().all(|(path, _)| path.exists()));
+            if expected > 0 {
+                // Another layer can have no tiles at a deferred zoom.
+                // Its shorter actual range must not transfer ownership.
+                let actual = [Band::new(&input, "a", 0, 2), Band::new(&input, "b", 3, 3)];
+                let sources = [
+                    overviews.iter().map(|(_, s)| s.clone()).collect(),
+                    Vec::new(),
+                ];
+                assert_eq!(
+                    merge_cap_zooms(&actual, Some((&opts.export, &sources))),
+                    shared_zooms
+                );
+            }
+            // Input plus the archive's private directory and any retained
+            // overview directories. No other overview remains on disk.
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), expected + 2);
+            drop((archive, overviews));
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
     /// #872: a band exports its archive while its intermediate exists, so the
     /// disk preflight prices the archive too.
     #[test]
@@ -4023,7 +4237,10 @@ mod tests {
             &ConvertOptions::default(),
             &opts,
             &crate::diagnostics::Diagnostics::default(),
-            &named,
+            &SourceBandWork {
+                named: &named,
+                shared_zooms: &[],
+            },
         )
         .unwrap();
         if logging {
@@ -4910,6 +5127,7 @@ mod tests {
 
     #[test]
     fn merge_bands_drop_converges_beyond_eight_passes_to_one_feature() {
+        JOINED_DROP_PASSES.with(|passes| passes.set(0));
         let original = crate::vector_tile::Tile {
             layers: vec![
                 feature_layer("a", vec![line_feature(0, 10_000)]),
@@ -4936,6 +5154,76 @@ mod tests {
         assert_eq!(result.layers[0], original.layers[0]);
         assert!(result.layers[1].features.is_empty());
         assert!(raw.len() > cap, "the last feature cannot fit");
+        JOINED_DROP_PASSES.with(|passes| assert!(passes.get() <= 12, "{} passes", passes.get()));
+    }
+
+    thread_local! {
+        pub(super) static JOINED_DROP_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn joined_deferred_source_tiles_can_exceed_the_foreign_tile_ceiling() {
+        let raw = vec![0; MAX_TILE_BYTES as usize + 1];
+        let gzip = compression::compress(&raw, Compression::Gzip).unwrap();
+        let export = ExportOptions::default();
+        let sources = [vec![JointSource {
+            path: "unused.parquet".into(),
+            options: export.clone(),
+            min_zoom: 0,
+            max_zoom: 1,
+            deferred_caps: vec![0],
+        }]];
+        assert_eq!(
+            decompress_band_tile(&gzip, Compression::Gzip, 0, 0, Some((&export, &sources)))
+                .unwrap(),
+            raw
+        );
+        // The same archive at a zoom whose valve was not deferred keeps
+        // the ordinary guard, as does every pre-tiled archive band.
+        assert!(
+            decompress_band_tile(&gzip, Compression::Gzip, 1, 0, Some((&export, &sources)))
+                .is_err()
+        );
+        assert!(decompress_band_tile(&gzip, Compression::Gzip, 0, 0, None).is_err());
+    }
+
+    #[test]
+    fn merge_bands_drop_large_join_has_logarithmic_passes() {
+        let tile = crate::vector_tile::Tile {
+            layers: vec![
+                feature_layer("large", vec![line_feature(0, 100_000)]),
+                feature_layer(
+                    "small",
+                    (1..=50_000).map(|id| line_feature(id, 2)).collect(),
+                ),
+            ],
+        };
+        for cap in [tile.layers[0].encoded_len() - 1, tile.encoded_len() - 1] {
+            let mut raw = tile.encode_to_vec();
+            let mut gzip = compression::compress(&raw, Compression::Gzip).unwrap();
+            JOINED_DROP_PASSES.with(|passes| passes.set(0));
+            let dropped = drop_joined_tile(
+                &mut raw,
+                &mut gzip,
+                &ExportOptions {
+                    tile_size_limit: Some(cap),
+                    compressed_tile_size_limit: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // At most floor(3n/4) survive each pass, even when a cap is
+            // only one byte below the original tile's size.
+            assert!(50_001 - dropped <= 50_001 * 3 / 4);
+            JOINED_DROP_PASSES
+                .with(|passes| assert!(passes.get() <= 40, "{} passes", passes.get()));
+            if cap == tile.layers[0].encoded_len() - 1 {
+                assert_eq!(dropped, 50_000);
+                assert!(raw.len() > cap);
+            } else {
+                assert!(raw.len() <= cap);
+            }
+        }
     }
 
     #[test]
@@ -4992,6 +5280,7 @@ mod tests {
                 options: export.clone(),
                 min_zoom: 0,
                 max_zoom: 0,
+                deferred_caps: Vec::new(),
             }],
             vec![],
         ];
@@ -5052,6 +5341,18 @@ mod tests {
         let tile = crate::vector_tile::Tile::decode(decoded_tiles(&output)[&0].as_slice()).unwrap();
         assert_eq!(tile.layers.len(), 2);
         assert!(tile.layers.iter().all(|l| l.features.len() == 1));
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter_map(|d| match d {
+                    crate::diagnostics::Diagnostic::Merged { count } => Some(count),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            6,
+            "eight source features become two output features"
+        );
         assert!(report.diagnostics.iter().any(|d| matches!(d,
             crate::diagnostics::Diagnostic::TilesOverLimit { merged_tiles, .. } if *merged_tiles > 0
         )));

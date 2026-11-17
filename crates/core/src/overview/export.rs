@@ -373,7 +373,7 @@ pub struct ExportOptions {
         default_value = "auto",
         value_parser = super::config::cli::parse_size_auto
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap: a backstop behind `--max-compressed-tile-size`. `auto` is 2M, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile over a cap is merged or thinned until it fits; see `--size-valve`", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap: a backstop behind `--max-compressed-tile-size`. `auto` is 2M, or no cap with `tiles --verbatim` and for `pyramid`. Caps apply to the joined tile. Source layers share one size valve; joins with pre-tiled archive bands drop features at merge. Tiles still over a cap are kept with a warning and counted in the report; see `--size-valve`", long_help = None))]
     pub tile_size_limit: Option<usize>,
     /// Per-tile limit on the **gzip-compressed** tile size, in bytes:
     /// tippecanoe's `-M` / `--maximum-tile-bytes` (#745). Checked alongside
@@ -386,7 +386,7 @@ pub struct ExportOptions {
         default_value = "auto",
         value_parser = super::config::cli::parse_size_auto
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap. `auto` is 500K, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile must fit both caps", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the gzip-compressed joined tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap. `auto` is 500K, or no cap with `tiles --verbatim` and for `pyramid`. A tile must fit both caps. Source layers share one size valve; joins with pre-tiled archive bands drop features at merge. Tiles still over a cap are kept with a warning and counted in the report", long_help = None))]
     pub compressed_tile_size_limit: Option<usize>,
     /// How a tile over a size limit is brought back under it (#745). Default
     /// [`SizeValve::Merge`].
@@ -2114,6 +2114,27 @@ pub fn export_pmtiles(
     export_pmtiles_with_partition_target(input_path, output_path, options, DEFAULT_PARTITION_TARGET)
 }
 
+/// Intermediate archives leave shared zooms' caps and valve counts to the
+/// merge. Other zooms use the ordinary export path.
+pub(crate) fn export_pmtiles_for_join(
+    input: &Path,
+    output: &Path,
+    options: &ExportOptions,
+    shared_zooms: &[u8],
+) -> Result<ExportReport, ExportError> {
+    let config = options.validate()?;
+    export_pmtiles_validated(
+        input,
+        output,
+        &config,
+        DEFAULT_PARTITION_TARGET,
+        &Pass2Knobs::production(false, None),
+        &mut export_budget(),
+        shared_zooms,
+    )
+    .map(|run| run.report)
+}
+
 /// Implementation of [`export_pmtiles`] with an explicit partition-size target,
 /// exposed separately so tests can force many tiny partitions and verify the
 /// archive is byte-identical regardless of partitioning.
@@ -2400,7 +2421,14 @@ fn export_pmtiles_impl(
         output_path,
         options,
         partition_target,
-        &Pass2Knobs {
+        &Pass2Knobs::production(force_legacy_pass2, backing_override),
+    )
+    .map(|run| run.report)
+}
+
+impl Pass2Knobs {
+    fn production(force_legacy_pass2: bool, backing_override: Option<SinkBacking>) -> Self {
+        Self {
             force_legacy_pass2,
             backing_override,
             concurrent_levels: true,
@@ -2414,9 +2442,8 @@ fn export_pmtiles_impl(
             stall_first_wave: false,
             memory_limit: None,
             budget_available: None,
-        },
-    )
-    .map(|run| run.report)
+        }
+    }
 }
 
 /// The pass-2 test knobs [`export_pmtiles_impl`] forwards, plus #647's.
@@ -2503,6 +2530,7 @@ fn export_pmtiles_run(
         partition_target,
         knobs,
         &mut budget,
+        &[],
     )
 }
 
@@ -2517,6 +2545,7 @@ fn export_pmtiles_validated(
     partition_target: usize,
     knobs: &Pass2Knobs,
     budget: &mut MemoryBudget,
+    shared_zooms: &[u8],
 ) -> Result<Pass2Run, ExportError> {
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     super::pipeline::memory_diagnostic(diagnostics);
@@ -2932,6 +2961,11 @@ fn export_pmtiles_validated(
         #[cfg(test)]
         work: &work,
     };
+    let uncapped = ExportOptions {
+        tile_size_limit: None,
+        compressed_tile_size_limit: None,
+        ..options.clone()
+    };
     let levels: Vec<ExportLevelCtx<'_>> = plans
         .iter()
         .zip(head.iter())
@@ -2940,6 +2974,16 @@ fn export_pmtiles_validated(
             scan,
             plan,
             level_idx,
+            // Fill and variable-depth plans cannot be reconstructed by a
+            // joint retry. Keep their valve here; only the merge warns.
+            options: if shared_zooms.contains(&plan.zoom)
+                && !options.coverage_fill
+                && !options.variable_depth
+            {
+                &uncapped
+            } else {
+                options
+            },
             ..template
         })
         .collect();
@@ -3029,6 +3073,13 @@ fn export_pmtiles_validated(
 
     #[cfg(test)]
     let work = work.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    for zoom in &mut zooms {
+        if shared_zooms.contains(&zoom.zoom) {
+            zoom.over_limit_tiles = 0;
+            zoom.over_limit_largest.clear();
+            zoom.over_limit_merged = 0;
+        }
+    }
     Ok(Pass2Run {
         report: ExportReport::from_zooms(
             mode,
@@ -9486,6 +9537,8 @@ pub(crate) struct JointSource {
     pub options: ExportOptions,
     pub min_zoom: u8,
     pub max_zoom: u8,
+    /// Cap ownership survives a layer that exports no tiles at a zoom.
+    pub deferred_caps: Vec<u8>,
 }
 
 /// Re-read exactly one oversized joined tile through the ordinary export's
@@ -9506,6 +9559,9 @@ pub(crate) fn fit_joined_tile(
     {
         return Ok(None);
     }
+    // Clipping and encoding diagnostics already belong to the first
+    // export. Replaying a tile must not count those features again.
+    let replay = &crate::diagnostics::Diagnostics::silent();
     let key = tile_key(coord.x, coord.y, coord.z);
     let tiles = BTreeMap::from([(key, 1)]);
     let mut bbox = PruneRegion::of(coord.bounds());
@@ -9538,7 +9594,7 @@ pub(crate) fn fit_joined_tile(
                 profile: source.options.profile,
             },
             level_idx,
-            crs: crs_from_descriptor(reader.resolved_schema(), &source.path, diagnostics)?,
+            crs: crs_from_descriptor(reader.resolved_schema(), &source.path, replay)?,
             zoom: coord.z,
             opts: &source.options,
             gzip_cache: &cache,
@@ -9550,7 +9606,7 @@ pub(crate) fn fit_joined_tile(
             #[cfg(test)]
             work: &Mutex::new(ExportWorkTally::default()),
         };
-        let mut collected = collect_wave(&ctx, &wave, diagnostics)?.buckets.remove(0);
+        let mut collected = collect_wave(&ctx, &wave, replay)?.buckets.remove(0);
         sort_members_for_encode(&mut collected, &source.options.feature_order);
         let mut bands = BTreeMap::new();
         let mut next_seq = seq_base;
@@ -9583,7 +9639,7 @@ pub(crate) fn fit_joined_tile(
         },
         &[],
         &mut FillTally::default(),
-        diagnostics,
+        replay,
     );
     check_mlt(&tile)?;
     diagnostics.record(crate::diagnostics::Diagnostic::Merged {

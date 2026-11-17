@@ -720,6 +720,17 @@ pub(super) fn convert_by_layer(
     }
     let (staged, filtered_rows) = split(&source, &schema, idx, &gates, &dir, &options.convert)?;
     drop(source);
+    let retain_overviews = staged.len() > 1
+        && (options.export.tile_size_limit.is_some_and(|cap| cap > 0)
+            || options
+                .export
+                .compressed_tile_size_limit
+                .is_some_and(|cap| cap > 0));
+    let shared_zooms: Vec<_> = if retain_overviews {
+        (0..=crate::tile::MAX_ZOOM).collect()
+    } else {
+        Vec::new()
+    };
     log::info!(
         "[tiles] --layer-column {column:?}: {} layer(s): {}",
         staged.len(),
@@ -773,7 +784,7 @@ pub(super) fn convert_by_layer(
             &archive,
             &config,
             &mut (),
-            Some((&overview, &mut retained_export)),
+            retain_overviews.then_some((&overview, &mut retained_export, shared_zooms.as_slice())),
         ) {
             Ok(TilesOutcome::Converted(report)) => report,
             Err(TilesError::Convert(e)) if super::tiles::convert_produced_nothing(&e) => {
@@ -798,13 +809,20 @@ pub(super) fn convert_by_layer(
             empty_layers.push(layer.name);
             continue;
         }
-        joint_sources.push(vec![super::export::JointSource {
-            path: overview.to_path_buf(),
-            options: retained_export.expect("an exported layer has export options"),
-            min_zoom: report.export.min_zoom,
-            max_zoom: report.export.max_zoom,
-        }]);
-        overviews.push(overview);
+        joint_sources.push(if retain_overviews {
+            vec![super::export::JointSource {
+                path: overview.to_path_buf(),
+                options: retained_export.expect("an exported layer has export options"),
+                min_zoom: report.export.min_zoom,
+                max_zoom: report.export.max_zoom,
+                deferred_caps: shared_zooms.clone(),
+            }]
+        } else {
+            Vec::new()
+        });
+        if retain_overviews {
+            overviews.push(overview);
+        }
         archives.push((
             Band::new(
                 archive.to_path_buf(),
@@ -845,6 +863,7 @@ pub(super) fn convert_by_layer(
         &joint_sources,
     )
     .map_err(TilesError::Merge)?;
+    drop(overviews);
     Ok(TilesOutcome::Layered(Box::new(LayeredReport {
         layer_column: column.to_string(),
         layers,
@@ -1717,6 +1736,118 @@ mod tests {
     }
 
     #[test]
+    fn joined_reports_count_output_tiles_and_valve_once() {
+        use crate::diagnostics::Diagnostic;
+        let dir = tempfile::tempdir().unwrap();
+        let (geoms, kinds) = two_kinds(800);
+        let input = dir.path().join("kinds.parquet");
+        crate::overview::testutil::write_input_with_column(
+            &input,
+            &geoms,
+            "kind",
+            Arc::new(StringArray::from(kinds)),
+            None,
+        );
+        let bands: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|name| {
+                let path = dir.path().join(format!("{name}.parquet"));
+                crate::overview::testutil::write_input_with_column(
+                    &path,
+                    &geoms[..400],
+                    "kind",
+                    Arc::new(StringArray::from(vec![name; 400])),
+                    None,
+                );
+                Band::new(path, name, 0, 0)
+            })
+            .collect();
+        for pyramid in [false, true] {
+            for cap in [1, 2000] {
+                let output = dir.path().join(format!("report-{pyramid}-{cap}.pmtiles"));
+                let mut opts = options("kind");
+                opts.convert.levels = LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 0,
+                };
+                opts.export.tile_size_limit = Some(cap);
+                opts.export.compressed_tile_size_limit = None;
+                opts.export.size_valve = super::super::export::SizeValve::Drop;
+                let events = if pyramid {
+                    crate::pyramid::build_pyramid(
+                        &bands,
+                        &output,
+                        &crate::pyramid::PyramidOptions {
+                            convert: opts.convert.clone(),
+                            export: opts.export.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                    .diagnostics
+                } else {
+                    let TilesOutcome::Layered(report) =
+                        convert_to_pmtiles(&TilesInput::Path(input.clone()), &output, &opts)
+                            .unwrap()
+                    else {
+                        panic!("layered report")
+                    };
+                    report
+                        .diagnostics
+                        .into_iter()
+                        .chain(
+                            report
+                                .layers
+                                .into_iter()
+                                .flat_map(|l| l.report.export.diagnostics),
+                        )
+                        .collect()
+                };
+                let index = ArchiveIndex::open(&output).unwrap();
+                let mut over = 0;
+                let mut remaining = 0;
+                for tile in index.tiles() {
+                    let tile = tile.unwrap();
+                    let bytes = index.read_range(tile.range).unwrap();
+                    let raw =
+                        compression::decompress_capped(&bytes, Compression::Gzip, 1 << 26).unwrap();
+                    over += usize::from(raw.len() > cap);
+                    remaining += crate::vector_tile::Tile::decode(raw.as_slice())
+                        .unwrap()
+                        .layers
+                        .iter()
+                        .map(|l| l.features.len())
+                        .sum::<usize>();
+                }
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter_map(|d| if let Diagnostic::TilesOverLimit { count, .. } = d {
+                            Some(count)
+                        } else {
+                            None
+                        })
+                        .sum::<usize>(),
+                    over,
+                    "pyramid={pyramid}, cap={cap}"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter_map(|d| if let Diagnostic::ValveDropped { count } = d {
+                            Some(count)
+                        } else {
+                            None
+                        })
+                        .sum::<usize>(),
+                    800 - remaining,
+                    "pyramid={pyramid}, cap={cap}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn joined_archive_caps_warn_and_fitting_tiles_are_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let (geoms, _) = two_kinds(8);
@@ -1775,6 +1906,7 @@ mod tests {
                     },
                     min_zoom: 0,
                     max_zoom: 0,
+                    deferred_caps: Vec::new(),
                 }]
             })
             .collect();

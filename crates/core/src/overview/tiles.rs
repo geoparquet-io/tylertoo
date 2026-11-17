@@ -33,9 +33,7 @@ use super::convert::{
     convert_to_overviews, convert_to_overviews_sources, write_convert_plan_sources, ConvertError,
     ConvertOptions, ConvertReport, LevelPlan, PlanReport,
 };
-use super::export::{
-    export_pmtiles, write_empty_archive, ExportError, ExportOptions, ExportReport, FeatureOrder,
-};
+use super::export::{write_empty_archive, ExportError, ExportOptions, ExportReport, FeatureOrder};
 use super::writer::{OverviewCodec, WriterError};
 use crate::error::Classify;
 use crate::input_set::ConvertSource;
@@ -310,7 +308,7 @@ pub struct TilesOptions {
         feature = "cli",
         arg(long, value_name = "COLUMN", conflicts_with = "layer_name")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Put each feature in the layer named by its value in COLUMN, and null or blank values in `_unknown`. The column is not written as a property. Each layer is tiled on its own. The size caps also apply to the combined tile", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Put each feature in the layer named by its value in COLUMN, and null or blank values in `_unknown`. The column is not written as a property. Each layer has its own overview. The size caps apply to the joined tile, with one size valve across source layers. Tiles still over a cap are kept with a warning and counted in the report", long_help = None))]
     pub layer_column: Option<String>,
     /// Retain the intermediate overview at this path instead of a removed
     /// temp file (#314). Its parent directory must exist.
@@ -1164,7 +1162,7 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
     output: &Path,
     config: &super::config::ValidatedConfig<'_, TilesOptions>,
     observer: &mut dyn TilesObserver,
-    retained: Option<(&Path, &mut Option<ExportOptions>)>,
+    retained: Option<(&Path, &mut Option<ExportOptions>, &[u8])>,
 ) -> Result<TilesOutcome, TilesError> {
     let options = config.options();
     // #452: before the intermediate is created — which would otherwise be
@@ -1226,7 +1224,7 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
         match options
             .keep_overview
             .as_deref()
-            .or(retained.as_ref().map(|(path, _)| *path))
+            .or(retained.as_ref().map(|(path, _, _)| *path))
         {
             // Its directory was checked above.
             Some(path) => (path.to_path_buf(), None),
@@ -1418,9 +1416,14 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
         profile: options.convert.profile,
         ..options.export.clone()
     };
-    let export_report =
-        export_pmtiles(&overview_path, output, &export_opts).map_err(TilesError::Export)?;
-    if let Some((_, retained_options)) = retained {
+    let export_report = super::export::export_pmtiles_for_join(
+        &overview_path,
+        output,
+        &export_opts,
+        retained.as_ref().map_or(&[], |(_, _, zooms)| *zooms),
+    )
+    .map_err(TilesError::Export)?;
+    if let Some((_, retained_options, _)) = retained {
         *retained_options = Some(export_opts);
     }
 
