@@ -388,6 +388,8 @@ pub fn command_defaults(command: &str) -> Map<String, Value> {
                 "zoom_ceiling",
                 "spill_dir",
                 "variable_depth",
+                // #802: an `export-pmtiles` flag, which bands do not take.
+                "no_simplification_of_shared_nodes",
                 // #822: bands tile verbatim, so a preset has no convert half.
                 "preset",
             ] {

@@ -695,6 +695,8 @@ pub tylertoo_core::Diagnostic::RowGroupAutoscaled::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::SavedPlan
 pub tylertoo_core::Diagnostic::SavedPlan::count: usize
 pub tylertoo_core::Diagnostic::SavedPlan::diagnostics: alloc::vec::Vec<tylertoo_core::Diagnostic>
+#[non_exhaustive] pub tylertoo_core::Diagnostic::SharedBordersUnpinned
+pub tylertoo_core::Diagnostic::SharedBordersUnpinned::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::TilesOverLimit
 pub tylertoo_core::Diagnostic::TilesOverLimit::count: usize
 pub tylertoo_core::Diagnostic::TilesOverLimit::largest: alloc::vec::Vec<tylertoo_core::LargestTile>
@@ -2643,6 +2645,7 @@ pub tylertoo_core::ExportOptions::mlt_profile: tylertoo_core::MltProfile
 pub tylertoo_core::ExportOptions::partition_wave: usize
 pub tylertoo_core::ExportOptions::profile: tylertoo_core::MemoryProfile
 pub tylertoo_core::ExportOptions::properties: tylertoo_core::PropertySelection
+pub tylertoo_core::ExportOptions::shared_nodes: bool
 pub tylertoo_core::ExportOptions::simple_clip_fastpath: bool
 pub tylertoo_core::ExportOptions::size_valve: tylertoo_core::SizeValve
 pub tylertoo_core::ExportOptions::spill_dir: core::option::Option<std::path::PathBuf>
@@ -2668,6 +2671,7 @@ pub fn tylertoo_core::ExportOptions::with_mlt_profile(self, tylertoo_core::MltPr
 pub fn tylertoo_core::ExportOptions::with_partition_wave(self, usize) -> Self
 pub fn tylertoo_core::ExportOptions::with_profile(self, tylertoo_core::MemoryProfile) -> Self
 pub fn tylertoo_core::ExportOptions::with_properties(self, tylertoo_core::PropertySelection) -> Self
+pub fn tylertoo_core::ExportOptions::with_shared_nodes(self, bool) -> Self
 pub fn tylertoo_core::ExportOptions::with_simple_clip_fastpath(self, bool) -> Self
 pub fn tylertoo_core::ExportOptions::with_size_valve(self, tylertoo_core::SizeValve) -> Self
 pub fn tylertoo_core::ExportOptions::with_spill_dir(self, core::option::Option<std::path::PathBuf>) -> Self
@@ -3266,10 +3270,12 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ShardRange
 pub tylertoo_core::SimplifyOptions::cascade: bool
 pub tylertoo_core::SimplifyOptions::collapse: tylertoo_core::CollapseMode
 pub tylertoo_core::SimplifyOptions::factor: f64
+pub tylertoo_core::SimplifyOptions::shared_nodes: bool
 impl tylertoo_core::SimplifyOptions
 pub fn tylertoo_core::SimplifyOptions::with_cascade(self, bool) -> Self
 pub fn tylertoo_core::SimplifyOptions::with_collapse(self, tylertoo_core::CollapseMode) -> Self
 pub fn tylertoo_core::SimplifyOptions::with_factor(self, f64) -> Self
+pub fn tylertoo_core::SimplifyOptions::with_shared_nodes(self, bool) -> Self
 impl core::clone::Clone for tylertoo_core::SimplifyOptions
 pub fn tylertoo_core::SimplifyOptions::clone(&self) -> tylertoo_core::SimplifyOptions
 impl core::cmp::PartialEq for tylertoo_core::SimplifyOptions
