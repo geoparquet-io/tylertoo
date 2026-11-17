@@ -375,7 +375,6 @@ impl Diagnostic {
                 a == b
             }
             (Self::CrsMetadata { reason: a, .. }, Self::CrsMetadata { reason: b, .. }) => a == b,
-            (Self::ExtentReduced { zoom: a, .. }, Self::ExtentReduced { zoom: b, .. }) => a == b,
             (
                 Self::CoveringRejected { reason: a, .. },
                 Self::CoveringRejected { reason: b, .. },
