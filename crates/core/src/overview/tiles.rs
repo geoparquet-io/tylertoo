@@ -1597,6 +1597,7 @@ fn convert_with_cells(
         output,
         &BandMergeOptions {
             allow_missing_zooms: false,
+            profile: options.convert.profile,
             metadata: options.export.metadata.clone(),
             spill_dir: Some(dir.clone()),
         },

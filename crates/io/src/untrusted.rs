@@ -1905,6 +1905,11 @@ fn check_batch_under(batch: &RecordBatch, limit: u64) -> Result<(), ArrowError> 
 /// statistics. The reader decodes fewer when list values could crowd one
 /// decode, and joins what it decoded back up to this many (#848).
 ///
+/// A decode stays within one group. Each row contributes at least one level
+/// entry per leaf. Only entries beyond the group's row count can crowd a
+/// decode, so it reserves their bytes plus the fixed bytes of its rows.
+/// This is safe even when all extra entries belong to the decoded rows.
+///
 /// Fixed-width values and byte views are bounded before decode. Statistics
 /// refine the size; [`UntrustedBatchReader`] checks actual expanded bytes
 /// before casting views, so dictionary expansion and skew cannot defeat it.
@@ -1927,15 +1932,18 @@ pub fn read_batch_plan(
 ///
 /// `decode` bounds what one decode holds before the reader splits it. A
 /// decode never crosses a row-group seam ([`GroupReaders`]), so it holds at
-/// most the largest group's repeated values, however they are spread over
-/// its rows. A file with a group whose repeated values alone exceed the
-/// decode limit decodes one row at a time.
+/// most `N * fixed + excess` bytes for `N` rows. Each read leaf adds its
+/// width plus one to `fixed`. Every row contributes at least one level
+/// entry per leaf, including null and empty lists. Each repeated leaf adds
+/// `(width + 1) * max(0, num_values - group_rows)` to
+/// `excess`. All extra entries may belong to the decoded rows. Take the
+/// smallest `(decoded_limit - excess) / fixed` across selected groups,
+/// with at least one row even when the excess exceeds the limit.
 ///
 /// `yield` is what the reader hands out (#848): it joins decoded batches up to
 /// that many rows, priced at every leaf's width plus its group's repeated
-/// values per row. Overture segments' 86 list leaves decode one row at a
-/// time, and one-row batches held ~260 KB of fixed Arrow overhead per
-/// buffered row in pass 2.
+/// values per row. One-row decodes of Overture segments' 86 list leaves
+/// held ~260 KB of fixed Arrow overhead per buffered row in pass 2.
 ///
 /// A read column with 8- or 16-bit dictionary keys holds both to the rows
 /// its keys can index: a batch, here or in a caller's regrouping to the
@@ -1977,14 +1985,13 @@ fn batch_plan(
         })
         .max()
         .unwrap_or(0);
-    // Per picked group: (bytes every row pays, bytes of all repeated values).
-    let groups: Vec<(u64, u64, i64)> = metadata
+    let groups: Vec<(u64, u64, i64, u64)> = metadata
         .row_groups()
         .iter()
         .enumerate()
         .filter(|(i, _)| row_groups.is_none_or(|picked| picked.contains(i)))
         .map(|(_, group)| {
-            let (row, repeated) = group
+            let (row, repeated, excess) = group
                 .columns()
                 .iter()
                 .enumerate()
@@ -2002,21 +2009,29 @@ fn batch_plan(
                         }
                     };
                     let value = width.saturating_add(1);
-                    let repeated = if column.column_descr().max_rep_level() > 0 {
-                        value.saturating_mul(column.num_values().max(0) as u64)
+                    let (repeated, excess) = if column.column_descr().max_rep_level() > 0 {
+                        let values = column.num_values().max(0) as u64;
+                        (
+                            value.saturating_mul(values),
+                            value.saturating_mul(
+                                values.saturating_sub(group.num_rows().max(0) as u64),
+                            ),
+                        )
                     } else {
-                        0
+                        (0, 0)
                     };
-                    (value, repeated)
+                    (value, repeated, excess)
                 })
-                .fold((0u64, 0u64), |(r, v), (a, b)| {
-                    (r.saturating_add(a), v.saturating_add(b))
+                .fold((0u64, 0u64, 0u64), |(r, v, e), (a, b, c)| {
+                    (
+                        r.saturating_add(a),
+                        v.saturating_add(b),
+                        e.saturating_add(c),
+                    )
                 });
-            (row, repeated, group.num_rows())
+            (row, repeated, group.num_rows(), excess)
         })
         .collect();
-    let fixed = groups.iter().map(|g| g.0).max().unwrap_or(1).max(1);
-    let repeated = groups.iter().map(|g| g.1).max().unwrap_or(0);
     let per_row = groups
         .iter()
         .map(|g| g.0.saturating_add(g.1.div_ceil(g.2.max(1) as u64)))
@@ -2031,7 +2046,12 @@ fn batch_plan(
         )
     };
     let joined = rows(decoded_limit(limit), per_row);
-    let decode = rows(decoded_limit(limit).saturating_sub(repeated), fixed).min(joined);
+    let decode = groups
+        .iter()
+        .map(|g| rows(decoded_limit(limit).saturating_sub(g.3), g.0.max(1)))
+        .min()
+        .unwrap_or(joined)
+        .min(joined);
     // Only read roots count; a whole root is checked when any leaf is read.
     let descr = reader.parquet_schema();
     let fields: Vec<_> = reader
@@ -3663,6 +3683,65 @@ mod tests {
         // Small groups: a batch spans many of them, and still fits.
         let small = write(100_000, 1_000);
         assert_eq!(read_batch_plan(&small, None, None, 8192, limit), 8192);
+    }
+
+    fn list_plan_metadata(lengths: impl IntoIterator<Item = usize>) -> ReaderMetadata {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        use arrow_array::ArrayRef;
+        use parquet::arrow::ArrowWriter;
+        let mut lists = ListBuilder::new(Int64Builder::new());
+        for len in lengths {
+            lists.values().append_slice(&vec![0; len]);
+            lists.append(true);
+        }
+        let batch =
+            RecordBatch::try_from_iter([("lists", Arc::new(lists.finish()) as ArrayRef)]).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2_048))
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        open_parquet(file).unwrap().metadata
+    }
+
+    #[test]
+    fn sparse_lists_decode_from_group_excess() {
+        let md = list_plan_metadata((0..2_048).map(|i| if i < 40 { 4 } else { i % 2 }));
+        let group = md.metadata().row_group(0);
+        assert_eq!(group.num_rows(), 2_048);
+        assert_eq!(group.column(0).num_values(), 2_048 + 120);
+        let limit = 1_000;
+        let fixed = 9;
+        let excess = 120 * fixed;
+        let (decode, joined) = batch_plan(&md, None, None, 8192, limit);
+        assert_eq!(decode, ((decoded_limit(limit) - excess) / fixed) as usize);
+        assert_eq!(joined, 2_000 / (9 + 10));
+    }
+
+    #[test]
+    fn skewed_lists_past_decode_limit_still_decode_singly() {
+        let md = list_plan_metadata((0..2_048).map(|i| if i < 2 { 256 } else { 0 }));
+        let group = md.metadata().row_group(0);
+        assert_eq!(group.num_rows(), 2_048);
+        assert_eq!(group.column(0).num_values(), 2_048 + 510);
+        let limit = 1_000;
+        assert!(510 * 9 > decoded_limit(limit));
+        assert_eq!(batch_plan(&md, None, None, 8192, limit).0, 1);
+    }
+
+    #[test]
+    fn decode_takes_the_heaviest_selected_groups_excess() {
+        // Group 0 has 120 extra entries, group 1 has 150: 102 and 72 rows fit.
+        let light = (0..2_048).map(|i| if i < 40 { 4 } else { i % 2 });
+        let heavy = (0..2_048).map(|i| if i < 150 { 2 } else { 0 });
+        let md = list_plan_metadata(light.chain(heavy));
+        assert_eq!(md.metadata().num_row_groups(), 2);
+        let limit = 1_000;
+        let rows = |excess: u64| ((decoded_limit(limit) - excess * 9) / 9) as usize;
+        assert_eq!(batch_plan(&md, None, None, 8192, limit).0, rows(150));
+        assert_eq!(batch_plan(&md, Some(&[0]), None, 8192, limit).0, rows(120));
     }
 
     /// #848: Overture segments carry 86 list leaves, about 87 MB of repeated

@@ -2246,10 +2246,12 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::Band
 #[non_exhaustive] pub struct tylertoo_core::BandMergeOptions
 pub tylertoo_core::BandMergeOptions::allow_missing_zooms: bool
 pub tylertoo_core::BandMergeOptions::metadata: tylertoo_core::TilesetMetadata
+pub tylertoo_core::BandMergeOptions::profile: tylertoo_core::MemoryProfile
 pub tylertoo_core::BandMergeOptions::spill_dir: core::option::Option<std::path::PathBuf>
 impl tylertoo_core::BandMergeOptions
 pub fn tylertoo_core::BandMergeOptions::with_allow_missing_zooms(self, bool) -> Self
 pub fn tylertoo_core::BandMergeOptions::with_metadata(self, tylertoo_core::TilesetMetadata) -> Self
+pub fn tylertoo_core::BandMergeOptions::with_profile(self, tylertoo_core::MemoryProfile) -> Self
 pub fn tylertoo_core::BandMergeOptions::with_spill_dir(self, core::option::Option<std::path::PathBuf>) -> Self
 impl core::clone::Clone for tylertoo_core::BandMergeOptions
 pub fn tylertoo_core::BandMergeOptions::clone(&self) -> tylertoo_core::BandMergeOptions
