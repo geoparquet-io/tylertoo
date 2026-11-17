@@ -1077,8 +1077,10 @@ to see at a level, or removed by `--polygon-thinning`, still become [placeholder
 with or without the flag. On dense small polygons, such as fields or parcels,
 coarse zooms can therefore hold more features than the budget: Moldova's
 632k fields keep 56k features at z8 against a budget of 2,588. Add
-`--no-collapse` to remove the squares too, except in a `square`
-[representation band](#zoom-band-representation-and-placeholder-squares). tippecanoe also thins the small
+`--no-collapse` to remove the squares too. A `square`
+[representation band](#zoom-band-representation-and-placeholder-squares) is
+different: no polygon there is too small to draw, so the budget counts
+every polygon and `--drop-polygons` thins the squares themselves. tippecanoe also thins the small
 polygons by the rate before it makes squares; tylertoo does not, because
 the thinned squares leave coarse zooms blank on such data.
 
