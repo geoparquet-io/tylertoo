@@ -28,8 +28,11 @@
 //! hashed `(vertex, neighbour pair)` record, sorts in memory, and stores the
 //! pins as a sorted `u64` array probed by binary search. A vertex-key
 //! collision can only add a pin (two vertices look like one whose pairs share
-//! a neighbour); missing one takes two pairs whose 32-bit neighbour tags
-//! both collide.
+//! a neighbour). Neighbours are 32-bit tags, so pairs `{a, b}` and `{a, c}`
+//! whose `b` and `c` tags collide read as one pair and miss a junction:
+//! about 2^-32 a junction, under one expected miss in a thousand runs of
+//! 2M junctions. shortcut: 32-bit tags keep a record at 16 bytes; carry full
+//! neighbour keys (24 bytes) if a miss ever shows.
 
 use geo::Coord;
 use geo_traits::{
@@ -64,8 +67,8 @@ pub(crate) fn vertex_key(x: f64, y: f64) -> u64 {
 }
 
 /// The unordered neighbour pair as two 32-bit neighbour tags, smaller one
-/// high, so [`shares_neighbour`] can see a common neighbour. A tag
-/// collision can only show a shared neighbour that isn't, adding a pin.
+/// high, so [`shares_neighbour`] can see a common neighbour (see the module
+/// note on tag collisions).
 #[inline]
 fn pair_key(a: u64, b: u64) -> u64 {
     let (a, b) = (a >> 32, b >> 32);
@@ -170,10 +173,27 @@ impl JunctionNodes {
 /// stray common vertex (Moldova: 3.76M pins against 2.07M under this rule)
 /// and keeps them at every level.
 fn is_pin(g: &[Occurrence]) -> bool {
-    g.iter().any(|o| o.1 >= PIN)
-        || g.iter()
+    if g.iter().any(|o| o.1 >= PIN) {
+        return true;
+    }
+    if g.len() <= 16 {
+        return g
+            .iter()
             .enumerate()
-            .any(|(i, p)| g[i + 1..].iter().any(|q| shares_neighbour(p.1, q.1)))
+            .any(|(i, p)| g[i + 1..].iter().any(|q| shares_neighbour(p.1, q.1)));
+    }
+    // Many records (a vertex of stacked copies, kept apart across chunks):
+    // a tag in two distinct pairs, found by sorting, not every pair of pairs.
+    let mut tags: Vec<(u64, u64)> = Vec::with_capacity(2 * g.len());
+    for w in g.chunk_by(|a, b| a.1 == b.1) {
+        let p = w[0].1;
+        tags.push((p >> 32, p));
+        if p >> 32 != p as u32 as u64 {
+            tags.push((p as u32 as u64, p));
+        }
+    }
+    tags.sort_unstable();
+    tags.windows(2).any(|t| t[0].0 == t[1].0)
 }
 
 /// Sort and shrink one chunk's occurrences: duplicates go (both sides of a
@@ -375,6 +395,26 @@ mod tests {
         assert_eq!(nodes.keys(), &[w]);
         compact(&mut occ);
         assert_eq!(JunctionNodes::from_occurrences(occ), nodes);
+
+        // Past 16 records the sorted-tag path decides alike, duplicates
+        // (stacked copies kept apart across chunks) included.
+        let many: Vec<_> = (0..40)
+            .map(|i| {
+                (
+                    v,
+                    pair_key(
+                        k(f64::from(2 * (i % 20) + 1)),
+                        k(f64::from(2 * (i % 20) + 2)),
+                    ),
+                )
+            })
+            .collect();
+        let mut occ = many.clone();
+        occ.sort_unstable();
+        assert!(!is_pin(&occ));
+        occ.push((v, pair_key(k(1.0), k(100.0))));
+        occ.sort_unstable();
+        assert!(is_pin(&occ));
     }
 
     /// The bucket directory finds exactly the keys a binary search would.
