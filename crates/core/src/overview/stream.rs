@@ -88,6 +88,8 @@ use crate::resolved_schema::ResolvedSchema;
 struct ScanCollection {
     collect_lines: LineCollect,
     want_areas: bool,
+    /// #802: collect polygon vertex occurrences for the junction pins.
+    junctions: bool,
 }
 
 struct Pass1Keys<'a> {
@@ -5427,8 +5429,8 @@ struct Pass1Timers {
     /// entry-level stamping, coalesce-scratch assembly — serial, once for
     /// the whole pass (not per batch).
     assemble: atomic::AtomicU64,
-    /// #802: sorting the polygon vertex occurrences into junction pins,
-    /// per chunk and once at the end.
+    /// #802: sorting each chunk's polygon vertex occurrences (the final
+    /// reduction to pins counts under `assemble`).
     junctions: atomic::AtomicU64,
 }
 
@@ -5752,14 +5754,15 @@ struct ScanRows<'m> {
     mask: Option<&'m super::mask::MaskIndex>,
     line_geoms: bool,
     all_geoms: bool,
-    /// #802: every polygon row's vertex occurrences, for the junction pins.
-    junctions: &'m mut Vec<Occurrence>,
+    /// #802: every polygon row's vertex occurrences, for the junction pins;
+    /// `None` once they outgrew the budget.
+    junctions: Option<&'m mut Vec<Occurrence>>,
 }
 
 impl GeoArrowVisitor for ScanRows<'_> {
     type Output = Vec<Option<ScannedRow>>;
 
-    fn visit<'a, A>(self, accessor: &'a A) -> crate::Result<Self::Output>
+    fn visit<'a, A>(mut self, accessor: &'a A) -> crate::Result<Self::Output>
     where
         A: GeoArrowArrayAccessor<'a>,
         A::Item: ToGeoGeometry<f64>,
@@ -5809,8 +5812,8 @@ impl GeoArrowVisitor for ScanRows<'_> {
                 out.push(None);
                 continue;
             };
-            if kind == FeatureKind::Polygon {
-                super::junction::push_geometry(&g, &mut ring_buf, self.junctions);
+            if let (FeatureKind::Polygon, Some(occ)) = (kind, self.junctions.as_deref_mut()) {
+                super::junction::push_geometry(&g, &mut ring_buf, occ);
             }
             let keep_geom = self.all_geoms || (self.line_geoms && kind == FeatureKind::Line);
             if let Some(mask) = self.mask {
@@ -5869,6 +5872,7 @@ fn scan_chunk(
     let ScanCollection {
         collect_lines,
         want_areas,
+        junctions: want_junctions,
     } = inputs;
     let bbox_query = ctx.bbox_query;
     let crs = ctx.crs;
@@ -5896,7 +5900,7 @@ fn scan_chunk(
             mask: ctx.mask,
             line_geoms: collect_lines != LineCollect::Off,
             all_geoms: want_areas,
-            junctions: &mut junctions,
+            junctions: want_junctions.then_some(&mut junctions),
         },
     )
     .map_err(|e| decode_error_at_rows(diag_row_base, chunk_len, e))?;
@@ -6308,6 +6312,27 @@ fn merge_pass1_chunks(
     Ok(kept_row)
 }
 
+/// #802: whether the junction occurrences, which live until the scan ends,
+/// still fit the budget beside the feature table. Past it they are dropped
+/// with a warning and the run simplifies without pins.
+fn junctions_fit(ctx: &Pass1Ctx<'_>, features: u64, junctions: &mut Vec<Occurrence>) -> bool {
+    let bytes = (junctions.capacity() * size_of::<Occurrence>()) as u64;
+    if ctx
+        .budget
+        .require(MemoryPhase::Scan, features + bytes)
+        .is_ok()
+    {
+        return true;
+    }
+    ctx.diagnostics.warn(format!(
+        "shared-border pins dropped: {} polygon vertices outgrew the memory budget; \
+         neighbouring polygons simplify independently (#802)",
+        junctions.len()
+    ));
+    *junctions = Vec::new();
+    false
+}
+
 /// [`run_pass1`], with the within-batch scan chunk size as an explicit
 /// parameter (production always calls it via [`run_pass1`] with
 /// [`PASS1_CHUNK_ROWS`]; tests use this directly to compare a heavily-chunked
@@ -6417,7 +6442,7 @@ fn run_pass1_with_chunk_rows(
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
     let want_areas = accumulator_requested(options);
     let mut areas: Vec<f32> = Vec::new();
-    let mut junctions: Vec<Occurrence> = Vec::new();
+    let (mut junctions, mut collect_junctions) = (Vec::<Occurrence>::new(), true);
     let mut num_rows = 0usize;
     let mut skipped_rows = 0usize;
     let mut point_count = 0usize;
@@ -6508,6 +6533,7 @@ fn run_pass1_with_chunk_rows(
                             ScanCollection {
                                 collect_lines,
                                 want_areas,
+                                junctions: collect_junctions,
                             },
                             timers_ref,
                         )
@@ -6541,6 +6567,8 @@ fn run_pass1_with_chunk_rows(
                     );
                 }
                 num_rows += n;
+                collect_junctions = collect_junctions
+                    && junctions_fit(ctx, features.allocated_bytes(), &mut junctions);
 
                 let t_keys = Instant::now();
                 extract_pass1_batch_keys(
@@ -6608,11 +6636,8 @@ fn run_pass1_with_chunk_rows(
     // in `line_tally`, so the guard still logs the exact totals downstream.
     let line_tally = (lines.lines, lines.bytes);
     let coalesce = lines.finish(&features, all_groups);
-    Pass1Timers::add(&pass1_timers.assemble, t_assemble);
-
-    let t_junctions = Instant::now();
     let junctions = JunctionNodes::from_occurrences(junctions);
-    Pass1Timers::add(&pass1_timers.junctions, t_junctions);
+    Pass1Timers::add(&pass1_timers.assemble, t_assemble);
 
     pass1_timers.log_pass1_summary(t_pass1_fn.elapsed().as_secs_f64(), num_rows);
 
@@ -11554,6 +11579,7 @@ mod tests {
             ScanCollection {
                 collect_lines: collect,
                 want_areas: areas,
+                junctions: false,
             },
             timers,
         )
