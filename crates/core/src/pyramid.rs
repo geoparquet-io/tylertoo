@@ -5778,6 +5778,10 @@ mod tests {
             .collect();
         names.sort_unstable();
         assert_eq!(names, ["a", "b"], "each band keeps its own layer");
+        assert!(
+            tile.layers.iter().all(|l| l.extent < Some(4096)),
+            "the extent fallback re-encoded the tile"
+        );
     }
 
     #[test]
