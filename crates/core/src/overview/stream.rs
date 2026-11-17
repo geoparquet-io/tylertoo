@@ -8301,14 +8301,19 @@ mod tests {
     }
 
     /// #802: past the scan budget the pins are dropped with a typed warning,
-    /// and the scan itself goes on.
+    /// once, and the scan itself goes on. One row per batch, so the batches
+    /// after the first find collection off.
     #[test]
     fn junction_pins_fall_back_under_a_tiny_budget() {
         let file = tempfile::NamedTempFile::new().unwrap();
         two_squares(file.path());
         let source = ConvertSource::resolve_path(file.path()).unwrap();
         let diagnostics = crate::diagnostics::Diagnostics::default();
-        let mut pre = preflight(&source, &ConvertOptions::default(), &diagnostics, None).unwrap();
+        let options = ConvertOptions {
+            read_batch_size: 1,
+            ..Default::default()
+        };
+        let mut pre = preflight(&source, &options, &diagnostics, None).unwrap();
         let roomy = scan_fixture(&source, &pre, 1, &diagnostics).unwrap();
         // Room for the feature table, not for one batch of occurrences.
         pre.budget = MemoryBudget::with_available(Some(roomy.features.allocated_bytes()));

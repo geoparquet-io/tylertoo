@@ -1688,48 +1688,44 @@ pub(crate) fn simplify_line_vertices_only(ls: &LineString<f64>, tol: f64) -> Lin
 
 /// The finest level's simplification (#814, `--max-zoom-simplify-factor`):
 /// removes vertices and nothing else. A ring whose simplified form would
-/// collapse under the level gates (an exterior with too few points or under
-/// `tol²` of area, a hole under `tol` across) keeps its original ring, where
+/// collapse (too few points, or under `tol²` of area) keeps its original
+/// ring, where
 /// [`simplify_for_level`] would drop it or collapse the polygon. A candidate
 /// still invalid after the epsilon retries (a ring crossing, a hole the
 /// simplified shell no longer holds) keeps the original polygon, where the
 /// cascade would repair it and could drop a lobe. Coarser levels keep
 /// [`simplify_for_level`]'s rules. Under `pins` (#802) the rings are cut at
-/// them and the first candidate is kept, as in the cascade.
+/// them; a polygon that falls back keeps its own border, not its
+/// neighbours'.
 pub(crate) fn simplify_polygon_vertices_only(
     poly: &Polygon<f64>,
     tol: f64,
     pins: Option<&JunctionNodes>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Polygon<f64> {
-    let min_area = tol * tol;
+    // One gate for shells and holes, so an island and the hole it fills
+    // (the same ring under pins) keep or thin it alike.
+    let thinned = |ring: &LineString<f64>, original: &LineString<f64>| {
+        if ring.0.len() < MIN_POLYGON_RING_POINTS
+            || Polygon::new(ring.clone(), vec![]).unsigned_area() < tol * tol
+        {
+            original.clone()
+        } else {
+            ring.clone()
+        }
+    };
     let mut eps = tol;
     for _ in 0..=INVALID_RETRY_HALVINGS {
         let simplified = rdp_polygon(poly, eps, pins);
-        let exterior = if simplified.exterior().0.len() < MIN_POLYGON_RING_POINTS
-            || Polygon::new(simplified.exterior().clone(), vec![]).unsigned_area() < min_area
-        {
-            poly.exterior().clone()
-        } else {
-            simplified.exterior().clone()
-        };
+        let exterior = thinned(simplified.exterior(), poly.exterior());
         let interiors = simplified
             .interiors()
             .iter()
             .zip(poly.interiors())
-            .map(|(ring, original)| {
-                if ring.0.len() < MIN_POLYGON_RING_POINTS || linestring_diag(ring) < tol {
-                    original.clone()
-                } else {
-                    ring.clone()
-                }
-            })
+            .map(|(ring, original)| thinned(ring, original))
             .collect();
         let candidate = Polygon::new(exterior, interiors);
-        if polygon_unchanged(&candidate, poly)
-            || pins.is_some()
-            || capped_is_valid(&candidate, diagnostics)
-        {
+        if polygon_unchanged(&candidate, poly) || capped_is_valid(&candidate, diagnostics) {
             return candidate;
         }
         diagnostics.record(crate::diagnostics::Diagnostic::InvalidAfterSimplify { count: 1 });

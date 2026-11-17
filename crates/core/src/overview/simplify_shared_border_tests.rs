@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::overview::junction::push_ring;
-use geo::{Coord, CoordsIter};
+use geo::{Coord, CoordsIter, Validation};
 use std::collections::BTreeSet;
 
 /// A jagged border from (1000, 0) to (1000, 1000), deterministic.
@@ -224,4 +224,67 @@ fn invalid_candidate_keeps_the_shared_border() {
         );
     }
     assert!(invalid, "the fixture must produce an invalid candidate");
+}
+
+/// Max-zoom thinning (`simplify_polygon_vertices_only`) under pins: a thin
+/// island whose thinned ring falls under `tol²` keeps its source ring, and so
+/// does the hole it fills, since one rule now gates both kinds of ring.
+#[test]
+fn vertices_only_keeps_an_island_and_its_hole_alike() {
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    // A sliver 40 long and 0.02 wide (area under tol²), jagged on both sides.
+    let mut ring: Vec<Coord<f64>> = (0..=40)
+        .map(|i| Coord {
+            x: f64::from(i),
+            y: 0.005 * f64::from(i % 2),
+        })
+        .collect();
+    ring.extend((0..40).rev().map(|i| Coord {
+        x: f64::from(i),
+        y: 0.02 + 0.005 * f64::from(i % 2),
+    }));
+    ring.push(ring[0]);
+    let outer = LineString::from(vec![
+        (-10.0, -10.0),
+        (50.0, -10.0),
+        (50.0, 10.0),
+        (-10.0, 10.0),
+    ]);
+    let donut = Polygon::new(outer, vec![LineString::new(ring.clone())]);
+    let island = Polygon::new(LineString::new(ring), vec![]);
+    let pins = pins_of(&[&donut, &island]);
+    let tol = 1.0;
+    let donut = simplify_polygon_vertices_only(&donut, tol, Some(&pins), &diagnostics);
+    let island = simplify_polygon_vertices_only(&island, tol, Some(&pins), &diagnostics);
+    assert_eq!(&donut.interiors()[0], island.exterior());
+}
+
+/// Under pins the spike-and-hole fixture of `vertices_only_never_drops_a_ring`
+/// still keeps its hole inside the shell: an invalid candidate falls back,
+/// never reaches export as an orphaned hole.
+#[test]
+fn vertices_only_under_pins_never_orphans_a_hole() {
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    let mut shell: Vec<(f64, f64)> = (0..=10)
+        .map(|k| (f64::from(k), if k % 2 == 0 { 0.0 } else { 0.1 }))
+        .collect();
+    shell.extend([
+        (10.0, 10.0),
+        (4.4, 10.0),
+        (4.2, 10.4),
+        (4.0, 10.0),
+        (0.0, 10.0),
+        (0.0, 0.0),
+    ]);
+    let hole = LineString::from(vec![
+        (4.15, 10.05),
+        (4.25, 10.05),
+        (4.2, 10.2),
+        (4.15, 10.05),
+    ]);
+    let poly = Polygon::new(LineString::from(shell), vec![hole.clone()]);
+    let pins = pins_of(&[&poly]);
+    let out = simplify_polygon_vertices_only(&poly, 1.0, Some(&pins), &diagnostics);
+    assert!(out.is_valid(), "{out:?}");
+    assert_eq!(out.interiors(), std::slice::from_ref(&hole));
 }

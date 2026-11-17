@@ -110,7 +110,8 @@ impl JunctionNodes {
 }
 
 /// Append a batch's occurrences (one `Vec` per chunk) to `acc` if `fits`
-/// the bytes `acc` would then hold, priced before it grows. Otherwise drop
+/// the bytes `acc` would then hold, priced before it grows, plus the key
+/// vector [`JunctionNodes::from_occurrences`] collects beside it. Otherwise drop
 /// them all, record [`Diagnostic::SharedBordersUnpinned`] and return
 /// `false`: the run simplifies without pins rather than run out of memory.
 ///
@@ -132,7 +133,8 @@ pub(crate) fn absorb(
     } else {
         acc.capacity()
     };
-    if fits((cap * size_of::<Occurrence>()) as u64) {
+    let reduction = need * size_of::<u64>();
+    if fits((cap * size_of::<Occurrence>() + reduction) as u64) {
         acc.reserve_exact(cap - acc.len());
         batch.drain(..).for_each(|chunk| acc.extend(chunk));
         return true;
