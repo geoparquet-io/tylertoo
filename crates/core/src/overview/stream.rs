@@ -3807,9 +3807,7 @@ pub(crate) fn run_stages(
                                                         // they price the writer's encodes, the read-ahead and the window.
     let mut budget = budget;
     // #802: the pins stay resident through pass 2, from pass 1 or a plan.
-    let pin_bytes = junctions
-        .as_ref()
-        .map_or(0, |j| size_of_val(j.keys()) as u64);
+    let pin_bytes = junctions.as_ref().map_or(0, JunctionNodes::resident_bytes);
     budget.reserve_up_to(MemoryPhase::Compute, pin_bytes);
     let footer = footer_price(
         source,

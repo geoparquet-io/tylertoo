@@ -7718,7 +7718,7 @@ fn finest_level_pins(
         .then(|| JunctionNodes::from_occurrences(occ))
         .filter(|p| !p.keys().is_empty());
     if let Some(p) = &pins {
-        budget.reserve_up_to(MemoryPhase::ExportCollect, size_of_val(p.keys()) as u64);
+        budget.reserve_up_to(MemoryPhase::ExportCollect, p.resident_bytes());
     }
     Ok(pins)
 }

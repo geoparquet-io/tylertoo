@@ -33,7 +33,7 @@ use geo_traits::{
     CoordTrait, GeometryCollectionTrait, GeometryTrait, GeometryType, LineStringTrait,
     MultiPolygonTrait, PolygonTrait,
 };
-use rayon::slice::ParallelSliceMut;
+use rayon::prelude::*;
 
 /// One vertex occurrence: `(vertex key, neighbour-pair key)`.
 pub(crate) type Occurrence = (u64, u64);
@@ -67,17 +67,21 @@ fn pair_key(a: u64, b: u64) -> u64 {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct JunctionNodes {
     keys: Vec<u64>,
+    /// `keys[dir[b]..dir[b + 1]]` are the keys whose top bits are `b`, about
+    /// four a bucket: a lookup reads two cache lines, not a binary search's
+    /// twenty-odd (the keys are hashes, so the buckets stay even).
+    dir: Vec<u32>,
+    shift: u32,
 }
 
 impl JunctionNodes {
     /// Reduce the occurrences of every polygon ring to the pin set.
     pub(crate) fn from_occurrences(mut occ: Vec<Occurrence>) -> Self {
         occ.par_sort_unstable();
-        occ.dedup();
-        // After dedup, two records for one vertex are two distinct pairs.
+        // Two different records for one vertex are two distinct pairs.
         let mut keys: Vec<u64> = occ
-            .windows(2)
-            .filter(|w| w[0].0 == w[1].0)
+            .par_windows(2)
+            .filter(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1)
             .map(|w| w[0].0)
             .collect();
         keys.dedup();
@@ -87,14 +91,31 @@ impl JunctionNodes {
             occ.len(),
             keys.len()
         );
-        Self { keys }
+        Self::indexed(keys)
     }
 
     /// Rebuild from a saved plan's keys; `None` unless strictly ascending.
     pub(crate) fn from_sorted(keys: Vec<u64>) -> Option<Self> {
-        keys.windows(2)
-            .all(|w| w[0] < w[1])
-            .then_some(Self { keys })
+        (u32::try_from(keys.len()).is_ok() && keys.windows(2).all(|w| w[0] < w[1]))
+            .then(|| Self::indexed(keys))
+    }
+
+    fn indexed(keys: Vec<u64>) -> Self {
+        let bits = (keys.len() / 4).max(2).next_power_of_two().trailing_zeros();
+        let shift = 64 - bits;
+        let mut dir = vec![0u32; (1 << bits) + 1];
+        for &k in &keys {
+            dir[(k >> shift) as usize + 1] += 1;
+        }
+        for b in 1..dir.len() {
+            dir[b] += dir[b - 1];
+        }
+        Self { keys, dir, shift }
+    }
+
+    /// The bytes the pins hold resident.
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        (size_of_val(self.keys.as_slice()) + size_of_val(self.dir.as_slice())) as u64
     }
 
     /// The sorted keys (the plan artifact's section).
@@ -105,7 +126,9 @@ impl JunctionNodes {
     /// Whether `c` is a pin.
     #[inline]
     pub(crate) fn contains(&self, c: Coord<f64>) -> bool {
-        self.keys.binary_search(&vertex_key(c.x, c.y)).is_ok()
+        let k = vertex_key(c.x, c.y);
+        let b = (k >> self.shift) as usize;
+        self.keys[self.dir[b] as usize..self.dir[b + 1] as usize].contains(&k)
     }
 }
 
@@ -148,7 +171,6 @@ pub(crate) fn absorb(
 /// The occurrences of `geoms`' polygons, one sorted, deduplicated `Vec` per
 /// chunk of rows, built in parallel.
 pub(crate) fn occurrences_of(geoms: &[geo::Geometry<f64>]) -> Vec<Vec<Occurrence>> {
-    use rayon::prelude::*;
     geoms
         .par_chunks(1024)
         .map(|chunk| {
@@ -265,5 +287,28 @@ mod tests {
             JunctionNodes::from_sorted(nodes.keys().to_vec()),
             Some(nodes)
         );
+    }
+
+    /// The bucket directory finds exactly the keys a binary search would.
+    #[test]
+    fn directory_lookup_matches_the_sorted_keys() {
+        let coords: Vec<Coord<f64>> = (0..5000)
+            .map(|i| Coord {
+                x: f64::from(i % 97),
+                y: f64::from(i / 97),
+            })
+            .collect();
+        let mut keys: Vec<u64> = coords
+            .iter()
+            .step_by(3)
+            .map(|c| vertex_key(c.x, c.y))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let nodes = JunctionNodes::from_sorted(keys.clone()).unwrap();
+        for c in &coords {
+            let k = vertex_key(c.x, c.y);
+            assert_eq!(nodes.contains(*c), keys.binary_search(&k).is_ok());
+        }
     }
 }
