@@ -247,7 +247,6 @@ fn jagged_pair() -> (Polygon<f64>, Polygon<f64>) {
 
 /// (a) Two polygons share a jagged border ([`jagged_pair`]).
 #[test]
-#[ignore = "red until #802"]
 fn two_polygons_share_a_jagged_border() {
     let (a, b) = jagged_pair();
     let dir = tempfile::tempdir().unwrap();
@@ -270,7 +269,6 @@ fn unsimplified_shared_border_has_no_slivers() {
 /// of A's lower side. A must keep J, as B and C do: per-feature RDP can
 /// drop it from A, where it is a bump of 3 units (under the tolerance).
 #[test]
-#[ignore = "red until #802"]
 fn three_polygons_keep_their_junction() {
     let j = (2000, 2003);
     let left = jagged((1000, 2000), j, 11);
@@ -322,7 +320,6 @@ fn three_polygons_keep_their_junction() {
 /// (c) A hole filled exactly by another polygon, whose ring starts at a
 /// different vertex than the hole's.
 #[test]
-#[ignore = "red until #802"]
 fn polygon_fills_a_hole_exactly() {
     let hole = ring(&[
         jagged((1500, 1500), (2500, 1500), 21),
@@ -346,7 +343,6 @@ fn polygon_fills_a_hole_exactly() {
 /// (d) A shared border that crosses the tile edge at x = 4096: each tile
 /// clips both copies, and neither tile may show a sliver.
 #[test]
-#[ignore = "red until #802"]
 fn shared_border_across_a_tile_edge() {
     let border = jagged((3000, 2000), (5200, 2000), 41);
     let a = Polygon::new(
