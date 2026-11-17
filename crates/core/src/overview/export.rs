@@ -10095,15 +10095,28 @@ fn shed_to_fit<'a>(members: &'a [Member], keep: usize, opts: &ExportOptions) -> 
 ///
 /// `keep` is clamped to `1..=members.len()`.
 fn select_kept_members<M: TileFeature>(members: &[M], keep: usize) -> Vec<&M> {
+    select_kept_by_size(members, keep, is_point_like(members), |m| {
+        m.geometry().coords_count()
+    })
+}
+
+/// Shared drop ranking for overview members and decoded joined-tile features.
+/// The latter have geometry commands rather than source coordinates.
+pub(crate) fn select_kept_by_size<M>(
+    members: &[M],
+    keep: usize,
+    point_like: bool,
+    size: impl Fn(&M) -> usize,
+) -> Vec<&M> {
     let n = members.len();
     let keep = keep.clamp(1, n);
-    if is_point_like(members) {
+    if point_like {
         // Evenly spaced indices 0, n/keep, 2n/keep, … — strictly increasing and
         // in-bounds because keep ≤ n.
         (0..keep).map(|i| &members[i * n / keep]).collect()
     } else {
         let mut ranked: Vec<&M> = members.iter().collect();
-        ranked.sort_by_key(|m| std::cmp::Reverse(m.geometry().coords_count()));
+        ranked.sort_by_key(|m| std::cmp::Reverse(size(m)));
         ranked.truncate(keep);
         ranked
     }

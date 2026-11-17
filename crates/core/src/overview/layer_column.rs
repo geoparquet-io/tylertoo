@@ -1755,7 +1755,11 @@ mod tests {
             crate::diagnostics::Diagnostic::TilesOverLimit { count: 1, largest, .. }
                 if largest.len() == 1 && largest[0].z == 0
         )));
-        assert_eq!(std::fs::read(&free).unwrap(), std::fs::read(&over).unwrap());
+        assert_ne!(std::fs::read(&free).unwrap(), std::fs::read(&over).unwrap());
+        assert!(report.diagnostics.iter().any(|d| matches!(
+            d,
+            crate::diagnostics::Diagnostic::ValveDropped { count: 15 }
+        )));
 
         opts.export.tile_size_limit = Some(1 << 20);
         opts.export.compressed_tile_size_limit = Some(1 << 20);
