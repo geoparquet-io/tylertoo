@@ -152,9 +152,8 @@ This metric differs from the Madagascar table above.
 | z7 | 0.7% | 0.01% |
 | z8 | 0.35% | 0.00% |
 
-Moldova fields rarely share borders, so the flag buys nothing there: at z12,
-the area drawn fell from 96.7% to 96.3% because extra vertices make the size
-valve merge more features. For comparison, tippecanoe's `-pn` adds 12–22%
+Moldova fields rarely share borders, so the flag buys nothing there; at z12,
+the area drawn was 96.7% without it and 96.3% with it. For comparison, tippecanoe's `-pn` adds 12–22%
 build time on the same data and about 4.6% to its Auckland archive.
 
 The remaining new overlap in Auckland (about 0.3% at z12, versus about 0.2%
