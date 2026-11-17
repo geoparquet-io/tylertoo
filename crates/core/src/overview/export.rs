@@ -9988,7 +9988,7 @@ fn merge_to_fit(
         let mut out = mvt;
         let mut fit = fit;
         if !single.is_empty() {
-            // Drop unmerged features, keeping the largest, until it fits.
+            // Drop unmerged features, smallest first, until it fits.
             // With merged features in the tile, every single may go before
             // merged coverage is touched; alone, the largest single stays.
             let min_keep = usize::from(whole.is_empty());
