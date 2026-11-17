@@ -280,9 +280,10 @@ pub const DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize = 500 * 1024;
 /// the densest lines and polygons are merged into the feature kept just
 /// before them. Merging keeps the coverage's area, and the tile is measured
 /// again. If still over after all merges, the fallback can lose precision
-/// and features. Merged features are never split into their sources. Only a
-/// lone feature still over the cap at the extent floor is written over
-/// it, with a warning. As in tippecanoe, a merged feature
+/// and features. Merged features are never split into their sources. In a
+/// tile of lines or polygons, only a lone feature still over the cap at the
+/// extent floor is written over it, with a warning. As in tippecanoe, a
+/// merged feature
 /// keeps the attributes of the feature it was merged into; the absorbed
 /// features' attributes are not carried. Points are never merged; a tile of
 /// points always takes the stride of [`SizeValve::Drop`]. See
@@ -292,9 +293,10 @@ pub const DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize = 500 * 1024;
 pub enum SizeValve {
     /// Merge the densest lines and polygons, re-measure, and repeat until
     /// the tile fits (the default). If merging exhausts its gaps, drop singles,
-    /// halve the extent to 512, then drop whole features if needed. Only a
-    /// lone feature still over the cap at that floor is written over it,
-    /// with a warning. Merged features are never split into their sources.
+    /// halve the extent to 512, then drop whole features if needed. In a
+    /// tile of lines or polygons, only a lone feature still over the cap at
+    /// that floor is written over it, with a warning. Merged features are
+    /// never split into their sources.
     #[default]
     Merge,
     /// Drop features until the tile fits: the largest sized geometries
@@ -402,7 +404,7 @@ pub struct ExportOptions {
         value_name = "merge|drop",
         default_value_t = ExportOptions::default().size_valve
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile over its cap: `merge` merges dense lines and polygons, drops singles, halves the extent down to 512, then drops whole features if needed. Merges keep the target's attributes and are never split into their sources. Only a lone feature still over the cap at the extent floor is written over it, with a warning. `drop` removes features and keeps each survivor's attributes. Point tiles use dropping in both modes", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile over its cap: `merge` merges dense lines and polygons, drops singles, halves the extent down to 512, then drops whole features if needed. Merges keep the target's attributes and are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `drop` removes features and keeps each survivor's attributes. Point tiles use dropping in both modes", long_help = None))]
     pub size_valve: SizeValve,
     /// Tile encoding, MVT by default. Each finished MVT tile is converted
     /// to MLT with mlt-core before gzip and both size caps, so the caps

@@ -52,8 +52,9 @@ Args:
         neighbor, which keeps its own attributes. If still over, drop
         unmerged features, halve the tile extent to 512, then drop whole
         features if needed. Merged features are never split into their
-        sources. Only a lone feature still over the cap at the extent
-        floor is written over it, with a warning.
+        sources. In a tile of lines or polygons, only a lone feature
+        still over the cap at the extent floor is written over it, with
+        a warning.
         `"drop"` removes
         features, leaving holes. Point tiles use feature dropping in
         both modes.

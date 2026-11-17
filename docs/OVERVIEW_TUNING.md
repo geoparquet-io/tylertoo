@@ -1669,9 +1669,11 @@ fits. `--size-valve` chooses how:
   fill. If the tile still exceeds the cap,
   the valve drops whole features, fewest vertices first. This can leave holes.
   These tiles also shed fill, so it cannot redraw a dropped merge's source.
-  Merged features are never split into their sources. Only a lone feature
-  that still exceeds the cap at the extent floor (512, or `--extent` when
-  smaller) is written over it, with a warning.
+  Merged features are never split into their sources. In a tile of lines
+  or polygons, only a lone feature that still exceeds the cap at the extent
+  floor (512, or `--extent` when smaller) is written over it, with a
+  warning. A tile of points takes the drop valve, which can still end over
+  the cap after its eight encodes.
   The report counts dropped merges and their source features. It also counts
   tiles at a reduced extent per zoom, with the smallest extent used.
 - `drop` drops features, keeping the largest for polygons and lines. It keeps
