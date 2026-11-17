@@ -3027,7 +3027,8 @@ fn has_joint_sources(
 }
 
 /// Gzip ISIZE, without decompressing. Exported tiles are single gzip members
-/// below 4 GiB; archive inputs retain the ordinary bounded decompression guard.
+/// below 4 GiB. For archive inputs it only feeds a copy's raw-cap warning;
+/// archive joins still take the bounded decode.
 fn gzip_raw_len(data: &[u8]) -> usize {
     data.last_chunk::<4>()
         .map_or(0, |bytes| u32::from_le_bytes(*bytes) as usize)
@@ -3049,8 +3050,9 @@ fn decompress_band_tile(
     })
 }
 
-/// Archive writer accounting uses stored bytes; ISIZE is valid solely for
-/// in-run exports.
+/// ISIZE sets the writer's raw length only for in-run exports; archive copies
+/// use stored bytes, and ISIZE only for the raw-cap warning, which a crafted
+/// or multi-member trailer can hide or fake.
 fn append_band_copy(
     writer: &mut StreamingPmtilesWriter,
     coord: crate::tile::TileCoord,
