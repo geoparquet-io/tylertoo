@@ -371,11 +371,14 @@ tylertoo tiles fields.parquet fields.pmtiles --layer-column year
   sparse layer is not thinned against a dense one. `--max-zoom auto` is
   estimated once, over the whole input.
 - The size caps (`--max-tile-size`, `--max-compressed-tile-size`) apply to
-  the combined tile. An oversized join rereads the retained overviews and
-  runs one size valve across all layers. Gaps keep each row group's
+  the combined tile. Each source export first runs its ordinary valve. An
+  oversized join rereads the retained overviews in batches by zoom and runs
+  one size valve across all layers. Gaps keep each row group's
   predecessor. A join with a pre-tiled archive band drops features at merge.
   A tile that still exceeds a cap is kept with a warning and counted once
-  in the report. This also applies to `pyramid` with explicit size caps.
+  in the report. Valve counts describe the original source exports and
+  archive-join drops, excluding joint retries. This also applies to `pyramid`
+  with explicit size caps.
 - At most 64 layers. Each layer is a full convert and export, and a column
   with more values is usually an id, not a category. Route by a coarser
   column, or subset the input with `--filter`.

@@ -815,7 +815,7 @@ pub(super) fn convert_by_layer(
                 options: retained_export.expect("an exported layer has export options"),
                 min_zoom: report.export.min_zoom,
                 max_zoom: report.export.max_zoom,
-                deferred_caps: shared_zooms.clone(),
+                report_zooms: shared_zooms.clone(),
             }]
         } else {
             Vec::new()
@@ -1736,6 +1736,84 @@ mod tests {
     }
 
     #[test]
+    fn joined_retry_fits_several_tiles_at_one_and_two_zooms() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut geoms = Vec::new();
+        let mut kinds = Vec::new();
+        for (x, y) in [
+            (-100.0, -30.0),
+            (-100.0, 30.0),
+            (100.0, -30.0),
+            (100.0, 30.0),
+        ] {
+            for i in 0..200 {
+                geoms.push(Some(geo::Geometry::Point(geo::Point::new(
+                    x + (i % 20) as f64 * 0.1,
+                    y + (i / 20) as f64 * 0.1,
+                ))));
+                kinds.push(if i % 2 == 0 { "a" } else { "b" });
+            }
+        }
+        let input = dir.path().join("clusters.parquet");
+        crate::overview::testutil::write_input_with_column(
+            &input,
+            &geoms,
+            "kind",
+            Arc::new(StringArray::from(kinds)),
+            None,
+        );
+        for max_zoom in [2, 3] {
+            let run = |cap| {
+                let output = dir.path().join(format!("batch-{max_zoom}-{cap:?}.pmtiles"));
+                let mut opts = options("kind");
+                opts.convert.levels = LevelPlan::ZoomRange {
+                    min_zoom: 2,
+                    max_zoom,
+                };
+                opts.convert = opts.convert.verbatim();
+                opts.export.tile_size_limit = cap;
+                opts.export.compressed_tile_size_limit = None;
+                // Exercise several waves as well as parallel tiles within a wave.
+                opts.export.partition_wave = 2;
+                convert_to_pmtiles(&TilesInput::Path(input.clone()), &output, &opts).unwrap();
+                let index = ArchiveIndex::open(&output).unwrap();
+                index
+                    .tiles()
+                    .map(|tile| {
+                        let tile = tile.unwrap();
+                        let data = index.read_range(tile.range).unwrap();
+                        let raw = compression::decompress(&data, Compression::Gzip).unwrap();
+                        let decoded = crate::vector_tile::Tile::decode(raw.as_slice()).unwrap();
+                        (
+                            tile.id,
+                            (
+                                raw.len(),
+                                decoded
+                                    .layers
+                                    .iter()
+                                    .map(|l| l.features.len())
+                                    .sum::<usize>(),
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let free = run(None);
+            assert_eq!(free.len(), 4 * usize::from(max_zoom - 1));
+            let cap = free.values().map(|(bytes, _)| bytes).min().unwrap() * 3 / 4;
+            let fitted = run(Some(cap));
+            assert_eq!(
+                fitted.keys().collect::<Vec<_>>(),
+                free.keys().collect::<Vec<_>>()
+            );
+            for (id, (bytes, features)) in fitted {
+                assert!(bytes <= cap, "tile {id}: {bytes} > {cap}");
+                assert!(features < free[&id].1, "tile {id} was not fitted");
+            }
+        }
+    }
+
+    #[test]
     fn joined_reports_count_output_tiles_and_valve_once() {
         use crate::diagnostics::Diagnostic;
         let dir = tempfile::tempdir().unwrap();
@@ -1773,7 +1851,29 @@ mod tests {
                 opts.export.tile_size_limit = Some(cap);
                 opts.export.compressed_tile_size_limit = None;
                 opts.export.size_valve = super::super::export::SizeValve::Drop;
+                let mut source_dropped = 0;
                 let events = if pyramid {
+                    // Standalone bands price only their original export valve.
+                    for (i, band) in bands.iter().enumerate() {
+                        let baseline = crate::pyramid::build_pyramid(
+                            std::slice::from_ref(band),
+                            &dir.path().join(format!("baseline-{cap}-{i}.pmtiles")),
+                            &crate::pyramid::PyramidOptions {
+                                convert: opts.convert.clone(),
+                                export: opts.export.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                        source_dropped += baseline
+                            .diagnostics
+                            .iter()
+                            .filter_map(|d| match d {
+                                Diagnostic::ValveDropped { count } => Some(count),
+                                _ => None,
+                            })
+                            .sum::<usize>();
+                    }
                     crate::pyramid::build_pyramid(
                         &bands,
                         &output,
@@ -1792,6 +1892,18 @@ mod tests {
                     else {
                         panic!("layered report")
                     };
+                    source_dropped = report
+                        .layers
+                        .iter()
+                        .map(|l| l.report.export.valve_dropped_features)
+                        .sum();
+                    assert!(
+                        !report
+                            .diagnostics
+                            .iter()
+                            .any(|d| matches!(d, Diagnostic::ValveDropped { .. })),
+                        "joint retry counts must stay silent"
+                    );
                     report
                         .diagnostics
                         .into_iter()
@@ -1840,8 +1952,12 @@ mod tests {
                             None
                         })
                         .sum::<usize>(),
-                    800 - remaining,
+                    source_dropped,
                     "pyramid={pyramid}, cap={cap}"
+                );
+                assert!(
+                    remaining < 800 - source_dropped,
+                    "the joint retry also drops features"
                 );
             }
         }
@@ -1906,7 +2022,7 @@ mod tests {
                     },
                     min_zoom: 0,
                     max_zoom: 0,
-                    deferred_caps: Vec::new(),
+                    report_zooms: Vec::new(),
                 }]
             })
             .collect();

@@ -2114,8 +2114,8 @@ pub fn export_pmtiles(
     export_pmtiles_with_partition_target(input_path, output_path, options, DEFAULT_PARTITION_TARGET)
 }
 
-/// Intermediate archives leave shared zooms' caps and valve counts to the
-/// merge. Other zooms use the ordinary export path.
+/// Intermediate archives run their ordinary valves; only over-limit tile
+/// reporting at shared zooms belongs to the merge.
 pub(crate) fn export_pmtiles_for_join(
     input: &Path,
     output: &Path,
@@ -2961,11 +2961,6 @@ fn export_pmtiles_validated(
         #[cfg(test)]
         work: &work,
     };
-    let uncapped = ExportOptions {
-        tile_size_limit: None,
-        compressed_tile_size_limit: None,
-        ..options.clone()
-    };
     let levels: Vec<ExportLevelCtx<'_>> = plans
         .iter()
         .zip(head.iter())
@@ -2974,16 +2969,6 @@ fn export_pmtiles_validated(
             scan,
             plan,
             level_idx,
-            // Fill and variable-depth plans cannot be reconstructed by a
-            // joint retry. Keep their valve here; only the merge warns.
-            options: if shared_zooms.contains(&plan.zoom)
-                && !options.coverage_fill
-                && !options.variable_depth
-            {
-                &uncapped
-            } else {
-                options
-            },
             ..template
         })
         .collect();
@@ -6204,11 +6189,35 @@ fn encode_buckets(
     timers: &ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
+    encode_layer_buckets(
+        gzip_cache,
+        (buckets, admitted),
+        zoom,
+        &TileEncoding {
+            options: opts,
+            layers: &[],
+        },
+        fills,
+        timers,
+        diagnostics,
+    )
+}
+
+fn encode_layer_buckets(
+    gzip_cache: &Arc<TileGzipCache>,
+    (buckets, admitted): (Vec<Vec<Member>>, Option<&Admitted<'_>>),
+    zoom: u8,
+    opts: &TileEncoding<'_>,
+    fills: Option<&coverage_fill::FillMap>,
+    timers: &ExportTimers,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
     buckets
         .into_par_iter()
         .map(|members| {
             let n = members.len();
-            let tiles = encode_members(gzip_cache, members, zoom, opts, fills, timers, diagnostics);
+            let tiles =
+                encode_layer_members(gzip_cache, members, zoom, opts, fills, timers, diagnostics);
             if let Some(a) = admitted {
                 a.encoded(n, tiles.as_deref().unwrap_or_default());
             }
@@ -9122,16 +9131,45 @@ fn encoded_tile(x: u32, y: u32, mvt: TileMvt, fill: FillTally) -> Result<Encoded
     })
 }
 
+#[cfg(test)]
 fn encode_members(
     gzip_cache: &Arc<TileGzipCache>,
-    mut members: Vec<Member>,
+    members: Vec<Member>,
     zoom: u8,
     opts: &ExportOptions,
     fills: Option<&coverage_fill::FillMap>,
     timers: &ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<EncodedTile>, ExportError> {
-    sort_members_for_encode(&mut members, &opts.feature_order);
+    encode_layer_members(
+        gzip_cache,
+        members,
+        zoom,
+        &TileEncoding {
+            options: opts,
+            layers: &[],
+        },
+        fills,
+        timers,
+        diagnostics,
+    )
+}
+
+fn encode_layer_members(
+    gzip_cache: &Arc<TileGzipCache>,
+    mut members: Vec<Member>,
+    zoom: u8,
+    opts: &TileEncoding<'_>,
+    fills: Option<&coverage_fill::FillMap>,
+    timers: &ExportTimers,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<Vec<EncodedTile>, ExportError> {
+    if opts.layers.is_empty() {
+        sort_members_for_encode(&mut members, &opts.feature_order);
+    } else {
+        // Joint reads already ordered each layer; preserve their concatenation.
+        members.sort_by_key(|m| m.key);
+    }
 
     // Runs of equal key. `members` is sorted by key above, so consecutive
     // grouping is total grouping.
@@ -9159,7 +9197,7 @@ fn encode_members(
             Ok(fill) => fill.flatten().unwrap_or_default(),
             Err(error) => return Some(Err(error)),
         };
-        let mvt = encode_tile(
+        let mvt = encode_tile_layers(
             gzip_cache,
             g,
             &tb,
@@ -9491,6 +9529,7 @@ impl std::ops::Deref for TileEncoding<'_> {
 /// fill; the fill then takes only the room they leave ([`with_fill`]), so
 /// it never makes the valve merge or drop a real feature. `fill_tally`
 /// counts what of the fill is drawn and shed.
+#[cfg(test)]
 fn encode_tile(
     gzip_cache: &Arc<TileGzipCache>,
     members: &[Member],
@@ -9538,120 +9577,122 @@ pub(crate) struct JointSource {
     pub min_zoom: u8,
     pub max_zoom: u8,
     /// Cap ownership survives a layer that exports no tiles at a zoom.
-    pub deferred_caps: Vec<u8>,
+    pub report_zooms: Vec<u8>,
 }
 
-/// Re-read exactly one oversized joined tile through the ordinary export's
-/// column resolution, row-group pruning, clipping and member ordering.
-/// Returns raw tile bytes; unsupported inputs remain unchanged and are warned
-/// about by the merge owner.
-pub(crate) fn fit_joined_tile(
+/// Fit a zoom's oversized joins through the export's restricted wave reads and
+/// parallel partition/tile encoder. Each overview is opened once per zoom;
+/// members live for only one wave. Replayed diagnostics and valve counts are
+/// silent: the report's valve counts describe the original source exports.
+pub(crate) fn fit_joined_tiles(
     sources: &[&JointSource],
-    coord: TileCoord,
+    zoom: u8,
+    tiles: &BTreeMap<u64, usize>,
     opts: &ExportOptions,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<Option<(Vec<u8>, bool)>, ExportError> {
-    // The coverage fill and variable-depth plans belong to the first export.
-    // A retry cannot reconstruct those plans from a single tile's members.
-    if sources
-        .iter()
-        .any(|s| s.options.coverage_fill || s.options.variable_depth)
-    {
-        return Ok(None);
-    }
-    // Clipping and encoding diagnostics already belong to the first
-    // export. Replaying a tile must not count those features again.
+) -> Result<BTreeMap<u64, JoinedTile>, ExportError> {
     let replay = &crate::diagnostics::Diagnostics::silent();
-    let key = tile_key(coord.x, coord.y, coord.z);
-    let tiles = BTreeMap::from([(key, 1)]);
-    let mut bbox = PruneRegion::of(coord.bounds());
-    bbox.grow(360.0 / 2f64.powi(i32::from(coord.z)));
-    let wave = [Partition {
-        key_lo: key,
-        key_hi: key,
-        bbox,
-        members: 0,
-    }];
     let cache = Arc::new(TileGzipCache::new(8 * 1024 * 1024));
     let timers = ExportTimers::default();
-    let mut members = Vec::new();
-    let mut layers = Vec::new();
-    let mut seq_base = 0;
-    for source in sources {
-        let reader = OverviewReader::open(&source.path)?;
-        let zooms = resolve_level_zooms(reader.meta(), reader.num_levels())?;
-        let Some(level_idx) = zooms.iter().position(|z| *z == coord.z) else {
-            return Ok(None);
-        };
-        let columns = resolve_export_columns(&reader, &source.options, &zooms)?;
-        let band_source =
-            ConvertSource::single(crate::input::InputSource::Local(source.path.clone()));
-        let ctx = LevelCtx {
-            reader: &reader,
-            band: BandRead {
-                source: &band_source,
-                budget: export_budget(),
-                profile: source.options.profile,
-            },
-            level_idx,
-            crs: crs_from_descriptor(reader.resolved_schema(), &source.path, replay)?,
-            zoom: coord.z,
-            opts: &source.options,
-            gzip_cache: &cache,
-            published: &columns.published,
-            feature_id: columns.feature_id.as_ref(),
-            timers: &timers,
-            fills: None,
-            tiles: Some(&tiles),
-            #[cfg(test)]
-            work: &Mutex::new(ExportWorkTally::default()),
-        };
-        let mut collected = collect_wave(&ctx, &wave, replay)?.buckets.remove(0);
-        sort_members_for_encode(&mut collected, &source.options.feature_order);
-        let mut bands = BTreeMap::new();
-        let mut next_seq = seq_base;
-        for m in &mut collected {
-            let next_band = u16::try_from(layers.len()).map_err(|_| {
-                ExportError::Io(std::io::Error::other("too many joint valve bands"))
-            })?;
-            m.band = *bands.entry(m.band).or_insert_with(|| {
-                layers.push((next_band, source.options.layer_name.clone()));
-                next_band
-            });
-            m.seq += seq_base;
-            next_seq = next_seq.max(m.seq + 1);
+    let opened = sources
+        .iter()
+        .map(|source| {
+            let reader = OverviewReader::open(&source.path)?;
+            let zooms = resolve_level_zooms(reader.meta(), reader.num_levels())?;
+            let columns = resolve_export_columns(&reader, &source.options, &zooms)?;
+            let crs = crs_from_descriptor(reader.resolved_schema(), &source.path, replay)?;
+            let level = zooms.iter().position(|&z| z == zoom);
+            Ok((reader, columns, crs, level))
+        })
+        .collect::<Result<Vec<_>, ExportError>>()?;
+    // A partition per requested tile gives the existing encoder parallel
+    // valve chains, while a wave reads each layer only once. The tile-set
+    // restriction also prunes disjoint bboxes and prevents clipping holes
+    // between requested ids, as in variable-depth and shard exports.
+    let partitions = plan_partitions(tiles, zoom, 1);
+    let width = resolve_partition_wave_under(opts.partition_wave, opts.profile, &export_budget());
+    let mut replacements = BTreeMap::new();
+    for wave in partitions.chunks(width) {
+        let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
+        let mut layers = Vec::new();
+        let mut seq_base = 0;
+        for (source, (reader, columns, crs, level)) in sources.iter().zip(&opened) {
+            let Some(level_idx) = *level else { continue };
+            let band_source =
+                ConvertSource::single(crate::input::InputSource::Local(source.path.clone()));
+            let ctx = LevelCtx {
+                reader,
+                band: BandRead {
+                    source: &band_source,
+                    budget: export_budget(),
+                    profile: source.options.profile,
+                },
+                level_idx,
+                crs: *crs,
+                zoom,
+                opts: &source.options,
+                gzip_cache: &cache,
+                published: &columns.published,
+                feature_id: columns.feature_id.as_ref(),
+                timers: &timers,
+                fills: None,
+                tiles: Some(tiles),
+                #[cfg(test)]
+                work: &Mutex::new(ExportWorkTally::default()),
+            };
+            let collected = collect_wave(&ctx, wave, replay)?.buckets;
+            let mut bands = BTreeMap::new();
+            let mut next_seq = seq_base;
+            for (bucket, mut members) in buckets.iter_mut().zip(collected) {
+                sort_members_for_encode(&mut members, &source.options.feature_order);
+                for m in &mut members {
+                    let next_band = u16::try_from(layers.len()).map_err(|_| {
+                        ExportError::Io(std::io::Error::other("too many joint valve bands"))
+                    })?;
+                    m.band = *bands.entry(m.band).or_insert_with(|| {
+                        layers.push((next_band, source.options.layer_name.clone()));
+                        next_band
+                    });
+                    m.seq += seq_base;
+                    next_seq = next_seq.max(m.seq + 1);
+                }
+                bucket.extend(members);
+            }
+            seq_base = next_seq;
         }
-        seq_base = next_seq;
-        members.extend(collected);
+        // DIVERGENCE FROM TIPPECANOE: gaps and predecessors remain local to
+        // each overview row group, with concatenated layer sequences rather
+        // than one global spatial stream (tile.cpp:1176-1195, 2016-2050).
+        let encoded = encode_layer_buckets(
+            &cache,
+            (buckets, None),
+            zoom,
+            &TileEncoding {
+                options: opts,
+                layers: &layers,
+            },
+            None,
+            &timers,
+            replay,
+        )?;
+        for tile in encoded.into_iter().flatten() {
+            replacements.insert(
+                tile_key(tile.x, tile.y, zoom),
+                JoinedTile {
+                    data: tile.data,
+                    raw_len: tile.raw_len,
+                    merged: tile.valve.merged > 0,
+                },
+            );
+        }
     }
-    // DIVERGENCE FROM TIPPECANOE: gaps and predecessors remain local to each
-    // overview row group. Member order concatenates layer streams, including
-    // the joint point stride, instead of one global spatial stream. One
-    // threshold and drop ranking still measure the whole multi-layer tile
-    // (tippecanoe tile.cpp:1176-1195, 2016-2050, 2879-2945).
-    let mut tile = encode_tile_layers(
-        &cache,
-        &members,
-        &coord.bounds(),
-        &TileEncoding {
-            options: opts,
-            layers: &layers,
-        },
-        &[],
-        &mut FillTally::default(),
-        replay,
-    );
-    check_mlt(&tile)?;
-    diagnostics.record(crate::diagnostics::Diagnostic::Merged {
-        count: tile.valve.merged,
-    });
-    diagnostics.record(crate::diagnostics::Diagnostic::ValveDropped {
-        count: tile.valve.dropped,
-    });
-    Ok(Some((
-        std::mem::take(&mut *tile.data),
-        tile.valve.merged > 0,
-    )))
+    Ok(replacements)
+}
+
+/// A fitted join, already gzipped by the parallel export encoder.
+pub(crate) struct JoinedTile {
+    pub data: Vec<u8>,
+    pub raw_len: usize,
+    pub merged: bool,
 }
 
 /// Encodes [`with_fill`] may take to fit a #750 fill into a tile's slack
