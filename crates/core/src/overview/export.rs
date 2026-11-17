@@ -897,12 +897,16 @@ pub struct ZoomReport {
     /// How many of `over_limit_tiles` hold merged features (#873).
     #[serde(skip)]
     over_limit_merged: usize,
-    /// Written tiles at a reduced extent and their smallest grid.
-    reduced_extent_tiles: usize,
-    min_reduced_extent: Option<u32>,
-    /// Merged features dropped, and all sources carried by them.
-    dropped_merged_features: usize,
-    dropped_merged_sources: usize,
+    /// #873 tiles at this zoom that the merge valve re-encoded at a reduced
+    /// extent (halved down to 512) to fit their cap.
+    pub reduced_extent_tiles: usize,
+    /// The smallest extent among those tiles; `None` when there are none.
+    pub min_reduced_extent: Option<u32>,
+    /// #873 merged features the merge valve dropped at the extent floor.
+    pub dropped_merged_features: usize,
+    /// The source features those dropped merged features carried, also
+    /// counted in `valve_dropped_features`.
+    pub dropped_merged_sources: usize,
 }
 
 /// Result of an export, `Serialize` for the `--report` JSON.
@@ -10021,6 +10025,8 @@ fn reduce_merged_to_fit(
                 return true;
             }
             tally.dropped += m.members.len();
+            // Its absorbed sources are lost, not merged: count each once.
+            tally.merged -= m.absorbed;
             if m.absorbed > 0 {
                 tally.dropped_merged += 1;
                 tally.dropped_merged_sources += m.members.len();
@@ -18695,7 +18701,8 @@ mod tests {
             props: vec![],
         });
         let report = export_valve_fixture(&feats, 1);
-        assert!(report.merged_features > 0);
+        // The only merge was dropped: its sources count as dropped, not merged.
+        assert_eq!(report.merged_features, 0);
         assert_eq!(report.over_limit_tiles, 1);
         assert_eq!(report.zooms[0].tile_feature_count, 1);
         assert!(report.zooms[0].dropped_merged_features > 0);
