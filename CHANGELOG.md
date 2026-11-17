@@ -80,8 +80,10 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that match `TilesOutcome` or `TilesError` get new `Layered`,
   `LayerColumn`, `Layer` and `Merge` arms.
 - `pyramid` archives whose bands share a zoom now carry a `tilestats` entry
-  per layer. The size caps apply to a shared zoom's merged tile: an over-cap
-  join loses features when a band is a pre-tiled archive (#838).
+  per layer. The size caps apply to a shared zoom's merged tile: a join of
+  GeoParquet bands is refitted across layers, and a join with a pre-tiled
+  archive band loses features. A join that cannot shrink, or is too big to
+  refit in memory, stays over the cap with a warning (#838).
 - `--max-zoom auto:N` and Python `max_zoom="auto:N"` cap the automatic zoom
   pick at N (#793). Plain `auto` keeps its z16 ceiling. Rust callers that
   match `MaxZoom` exhaustively need the new `AutoCapped` arm.

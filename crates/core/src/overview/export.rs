@@ -9261,10 +9261,7 @@ fn encode_members(
         gzip_cache,
         members,
         zoom,
-        &TileEncoding {
-            options: opts,
-            layers: &[],
-        },
+        &TileEncoding::single(opts),
         fills,
         timers,
         diagnostics,
@@ -9684,10 +9681,7 @@ fn encode_tile(
         gzip_cache,
         members,
         tb,
-        &TileEncoding {
-            options: opts,
-            layers: &[],
-        },
+        &TileEncoding::single(opts),
         fill,
         fill_tally,
         diagnostics,

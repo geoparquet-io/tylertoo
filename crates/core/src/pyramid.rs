@@ -3282,8 +3282,8 @@ fn joined_export_error(error: ExportError) -> PyramidError {
     }
 }
 
-/// Fit an archive join with no overview to retry. Each pass strictly reduces
-/// the current feature count, stopping only at a fit or one remaining feature.
+/// Fit an archive join with no overview to retry: keep the largest ranked
+/// prefix that fits (within 1/16), with one feature as the floor.
 fn drop_joined_tile(
     raw: &mut Vec<u8>,
     gzip: &mut Vec<u8>,
