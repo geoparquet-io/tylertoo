@@ -9523,6 +9523,8 @@ trait TileFeature: Sync {
 
 impl TileFeature for Member {
     fn band(&self) -> u16 {
+        #[cfg(test)]
+        JOINT_BAND_READS.with(|n| n.set(n.get() + 1));
         self.band
     }
     fn geometry(&self) -> &Geometry<f64> {
@@ -9537,6 +9539,11 @@ impl TileFeature for Member {
     fn source_row(&self) -> u64 {
         self.seq
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static JOINT_BAND_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl TileFeature for coalesce_valve::Merged<'_> {
@@ -9652,117 +9659,175 @@ pub(crate) struct JointSource {
     pub report_zooms: Vec<u8>,
 }
 
-/// Fit a zoom's oversized joins through the export's restricted wave reads and
-/// parallel partition/tile encoder. Each overview is opened once per zoom;
-/// members live for only one wave. Replayed diagnostics and valve counts are
-/// silent: the report's valve counts describe the original source exports.
-pub(crate) fn fit_joined_tiles(
-    sources: &[&JointSource],
-    zoom: u8,
-    tiles: &BTreeMap<u64, usize>,
-    opts: &ExportOptions,
-) -> Result<BTreeMap<u64, JoinedTile>, ExportError> {
-    let replay = &crate::diagnostics::Diagnostics::silent();
-    let cache = Arc::new(TileGzipCache::new(8 * 1024 * 1024));
-    let timers = ExportTimers::default();
-    let opened = sources
-        .iter()
-        .map(|source| {
-            let reader = OverviewReader::open(&source.path)?;
-            let zooms = resolve_level_zooms(reader.meta(), reader.num_levels())?;
-            let band = BandRead {
-                source: reader.source(),
-                budget: export_budget(),
-                profile: source.options.profile,
-            };
-            let columns = resolve_export_columns((&reader, band), &source.options, &zooms)?;
-            let crs = crs_from_descriptor(reader.resolved_schema(), &source.path, replay)?;
-            let level = zooms.iter().position(|&z| z == zoom);
-            Ok((reader, columns, crs, level))
-        })
-        .collect::<Result<Vec<_>, ExportError>>()?;
-    // A partition per requested tile gives the existing encoder parallel
-    // valve chains, while a wave reads each layer only once. The tile-set
-    // restriction also prunes disjoint bboxes and prevents clipping holes
-    // between requested ids, as in variable-depth and shard exports.
-    let partitions = plan_partitions(tiles, zoom, 1);
-    let width = resolve_partition_wave_under(opts.partition_wave, opts.profile, &export_budget());
-    let mut replacements = BTreeMap::new();
-    for wave in partitions.chunks(width) {
-        let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
-        let mut layers = Vec::new();
-        let mut seq_base = 0;
-        for (source, (reader, columns, crs, level)) in sources.iter().zip(&opened) {
-            let Some(level_idx) = *level else { continue };
-            let band_source =
-                ConvertSource::single(crate::input::InputSource::Local(source.path.clone()));
-            let ctx = LevelCtx {
-                reader,
-                band: BandRead {
-                    source: &band_source,
+/// A merge's retained overview plans. Footers, columns, CRS and zoom ladders
+/// are resolved once, then reused by every zoom's restricted wave reads.
+pub(crate) struct JoinedTileFitter<'a> {
+    sources: Vec<OpenedJointSource<'a>>,
+}
+
+struct OpenedJointSource<'a> {
+    source: &'a JointSource,
+    reader: OverviewReader,
+    columns: ResolvedColumns,
+    crs: Crs,
+    zooms: Vec<u8>,
+}
+
+impl<'a> JoinedTileFitter<'a> {
+    pub(crate) fn open(
+        sources: impl IntoIterator<Item = &'a JointSource>,
+    ) -> Result<Self, ExportError> {
+        let started = Instant::now();
+        let replay = &crate::diagnostics::Diagnostics::silent();
+        let sources = sources
+            .into_iter()
+            .map(|source| {
+                let reader = OverviewReader::open(&source.path)?;
+                let zooms = resolve_level_zooms(reader.meta(), reader.num_levels())?;
+                let band = BandRead {
+                    source: reader.source(),
                     budget: export_budget(),
                     profile: source.options.profile,
-                },
-                level_idx,
-                crs: *crs,
-                zoom,
-                opts: &source.options,
-                gzip_cache: &cache,
-                published: &columns.published,
-                feature_id: columns.feature_id.as_ref(),
-                timers: &timers,
-                fills: None,
-                tiles: Some(tiles),
-                #[cfg(test)]
-                work: &Mutex::new(ExportWorkTally::default()),
-            };
-            let collected = collect_wave(&ctx, wave, replay)?.buckets;
-            let mut bands = BTreeMap::new();
-            let mut next_seq = seq_base;
-            for (bucket, mut members) in buckets.iter_mut().zip(collected) {
-                sort_members_for_encode(&mut members, &source.options.feature_order);
-                for m in &mut members {
-                    let next_band = u16::try_from(layers.len()).map_err(|_| {
-                        ExportError::Io(std::io::Error::other("too many joint valve bands"))
-                    })?;
-                    m.band = *bands.entry(m.band).or_insert_with(|| {
-                        layers.push((next_band, source.options.layer_name.clone()));
-                        next_band
-                    });
-                    m.seq += seq_base;
-                    next_seq = next_seq.max(m.seq + 1);
-                }
-                bucket.extend(members);
-            }
-            seq_base = next_seq;
-        }
-        // DIVERGENCE FROM TIPPECANOE: gaps and predecessors remain local to
-        // each overview row group, with concatenated layer sequences rather
-        // than one global spatial stream (tile.cpp:1176-1195, 2016-2050).
-        let encoded = encode_layer_buckets(
-            &cache,
-            (buckets, None),
-            zoom,
-            &TileEncoding {
-                options: opts,
-                layers: &layers,
-            },
-            None,
-            &timers,
-            replay,
-        )?;
-        for tile in encoded.into_iter().flatten() {
-            replacements.insert(
-                tile_key(tile.x, tile.y, zoom),
-                JoinedTile {
-                    data: tile.data,
-                    raw_len: tile.raw_len,
-                    merged: tile.valve.merged > 0,
-                },
-            );
-        }
+                };
+                let columns = resolve_export_columns((&reader, band), &source.options, &zooms)?;
+                let crs = crs_from_descriptor(reader.resolved_schema(), &source.path, replay)?;
+                Ok(OpenedJointSource {
+                    source,
+                    reader,
+                    columns,
+                    crs,
+                    zooms,
+                })
+            })
+            .collect::<Result<Vec<_>, ExportError>>()?;
+        log::debug!(
+            "[profile] joined plans: {} overview(s), {:.3}s",
+            sources.len(),
+            started.elapsed().as_secs_f64()
+        );
+        Ok(Self { sources })
     }
-    Ok(replacements)
+
+    /// Fit only this zoom's joins. Members live for one wave; the merge
+    /// consumes and releases the replacements before fitting the next zoom.
+    /// Replayed diagnostics and valve counts stay silent.
+    pub(crate) fn fit_joined_tiles(
+        &self,
+        zoom: u8,
+        tiles: &BTreeMap<u64, usize>,
+        opts: &ExportOptions,
+    ) -> Result<BTreeMap<u64, JoinedTile>, ExportError> {
+        let started = Instant::now();
+        let replay = &crate::diagnostics::Diagnostics::silent();
+        let cache = Arc::new(TileGzipCache::new(8 * 1024 * 1024));
+        let timers = ExportTimers::default();
+        // A partition per requested tile gives the existing encoder parallel
+        // valve chains, while a wave reads each layer only once. The tile-set
+        // restriction also prunes disjoint bboxes and prevents clipping holes
+        // between requested ids, as in variable-depth and shard exports.
+        let partitions = plan_partitions(tiles, zoom, 1);
+        let width =
+            resolve_partition_wave_under(opts.partition_wave, opts.profile, &export_budget());
+        let mut replacements = BTreeMap::new();
+        for wave in partitions.chunks(width) {
+            let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
+            let mut layers = Vec::new();
+            let mut seq_base = 0;
+            for OpenedJointSource {
+                source,
+                reader,
+                columns,
+                crs,
+                zooms,
+            } in &self.sources
+            {
+                if zoom < source.min_zoom || zoom > source.max_zoom {
+                    continue;
+                }
+                let Some(level_idx) = zooms.iter().position(|&z| z == zoom) else {
+                    continue;
+                };
+                let ctx = LevelCtx {
+                    reader,
+                    band: BandRead {
+                        source: reader.source(),
+                        budget: export_budget(),
+                        profile: source.options.profile,
+                    },
+                    level_idx,
+                    crs: *crs,
+                    zoom,
+                    opts: &source.options,
+                    gzip_cache: &cache,
+                    published: &columns.published,
+                    feature_id: columns.feature_id.as_ref(),
+                    timers: &timers,
+                    fills: None,
+                    tiles: Some(tiles),
+                    #[cfg(test)]
+                    work: &Mutex::new(ExportWorkTally::default()),
+                };
+                let collected = collect_wave(&ctx, wave, replay)?.buckets;
+                let mut bands = BTreeMap::new();
+                let mut next_seq = seq_base;
+                for (bucket, mut members) in buckets.iter_mut().zip(collected) {
+                    sort_members_for_encode(&mut members, &source.options.feature_order);
+                    for m in &mut members {
+                        let next_band = u16::try_from(layers.len()).map_err(|_| {
+                            ExportError::Io(std::io::Error::other("too many joint valve bands"))
+                        })?;
+                        m.band = *bands.entry(m.band).or_insert_with(|| {
+                            layers.push((next_band, source.options.layer_name.clone()));
+                            next_band
+                        });
+                        m.seq += seq_base;
+                        next_seq = next_seq.max(m.seq + 1);
+                    }
+                    bucket.extend(members);
+                }
+                seq_base = next_seq;
+            }
+            // DIVERGENCE FROM TIPPECANOE: gaps and predecessors remain local to
+            // each overview row group, with concatenated layer sequences rather
+            // than one global spatial stream (tile.cpp:1176-1195, 2016-2050).
+            let encoded = encode_layer_buckets(
+                &cache,
+                (buckets, None),
+                zoom,
+                &TileEncoding {
+                    options: opts,
+                    layers: &layers,
+                },
+                None,
+                &timers,
+                replay,
+            )?;
+            for tile in encoded.into_iter().flatten() {
+                replacements.insert(
+                    tile_key(tile.x, tile.y, zoom),
+                    JoinedTile {
+                        data: tile.data,
+                        raw_len: tile.raw_len,
+                        merged: tile.valve.merged > 0,
+                        #[cfg(test)]
+                        _live: joined_tile_probe::LiveTile::new(),
+                    },
+                );
+            }
+        }
+        let stages = timers.stage_secs();
+        log::debug!(
+            "[profile] joined z{zoom}: {} tile(s), wall={:.3}s; \
+             core-seconds read={:.3} decode={:.3} clip={:.3} encode={:.3}",
+            tiles.len(),
+            started.elapsed().as_secs_f64(),
+            stages.band_read,
+            stages.decode,
+            stages.clip,
+            stages.encode,
+        );
+        Ok(replacements)
+    }
 }
 
 /// A fitted join, already gzipped by the parallel export encoder.
@@ -9770,6 +9835,48 @@ pub(crate) struct JoinedTile {
     pub data: Vec<u8>,
     pub raw_len: usize,
     pub merged: bool,
+    #[cfg(test)]
+    _live: joined_tile_probe::LiveTile,
+}
+
+/// Observe actual replacement lifetimes on the merge's thread, including
+/// unwritten replacements retained across calls to the fitter.
+#[cfg(test)]
+pub(super) mod joined_tile_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(crate) fn reset() {
+        COUNTS.with(|counts| counts.set((0, 0)));
+    }
+
+    pub(crate) fn counts() -> (usize, usize) {
+        COUNTS.with(Cell::get)
+    }
+
+    pub(super) struct LiveTile;
+
+    impl LiveTile {
+        pub(super) fn new() -> Self {
+            COUNTS.with(|counts| {
+                let (live, peak) = counts.get();
+                counts.set((live + 1, peak.max(live + 1)));
+            });
+            Self
+        }
+    }
+
+    impl Drop for LiveTile {
+        fn drop(&mut self) {
+            COUNTS.with(|counts| {
+                let (live, peak) = counts.get();
+                counts.set((live - 1, peak));
+            });
+        }
+    }
 }
 
 /// Encodes [`with_fill`] may take to fit a #750 fill into a tile's slack
@@ -10379,20 +10486,28 @@ fn build_tile_layers_with<M: TileFeature>(
     debug_assert!(fill.is_empty());
     let mut out = build_mvt_with(cache, &[] as &[M], opts, &[], &encode);
     let mut bytes = Vec::new();
-    let mut names = Vec::new();
-    for (_, name) in layers {
-        if names.contains(&name) {
-            continue;
-        }
-        names.push(name);
-        let selected: Vec<&M> = members
+    // Group in one member walk, preserving both the first occurrence of
+    // each layer and the draw order within it. Rescanning all members for
+    // every layer, with a band-list search per member, was quadratic in
+    // the number of layers on every valve pass.
+    let mut grouped: Vec<(&String, Vec<&M>)> = Vec::new();
+    let mut bands = BTreeMap::new();
+    for (band, name) in layers {
+        let index = grouped
             .iter()
-            .filter(|m| {
-                layers
-                    .iter()
-                    .any(|(band, n)| *band == m.band() && n == name)
-            })
-            .collect();
+            .position(|(n, _)| *n == name)
+            .unwrap_or_else(|| {
+                grouped.push((name, Vec::new()));
+                grouped.len() - 1
+            });
+        bands.insert(*band, index);
+    }
+    for member in members {
+        if let Some(&index) = bands.get(&member.band()) {
+            grouped[index].1.push(member);
+        }
+    }
+    for (name, selected) in grouped {
         let layer_opts = ExportOptions {
             layer_name: name.clone(),
             tile_format: TileFormat::Mvt,
@@ -19113,6 +19228,47 @@ mod tests {
             gap: GAP_NONE,
             band: 0,
         }
+    }
+
+    #[test]
+    fn joined_layer_encoder_groups_members_once() {
+        let members: Vec<_> = (0..32)
+            .map(|i| Member {
+                band: (i % 4) as u16,
+                id: Some(i),
+                ..point_member(i as f64, 0.0, i)
+            })
+            .collect();
+        let layers = [
+            (0, "a".into()),
+            (1, "b".into()),
+            (2, "a".into()),
+            (3, "b".into()),
+        ];
+        let cache = test_gzip_cache();
+        let opts = ExportOptions::default();
+        let bounds = TileCoord::new(0, 0, 0).bounds();
+        let diagnostics = crate::diagnostics::Diagnostics::silent();
+        JOINT_BAND_READS.with(|n| n.set(0));
+        let actual =
+            build_tile_layers(&cache, &layers, &members, &bounds, &opts, &[], &diagnostics);
+        assert_eq!(JOINT_BAND_READS.with(std::cell::Cell::get), members.len());
+        let mut expected = Vec::new();
+        for (band, name) in [(0, "a"), (1, "b")] {
+            let selected: Vec<_> = members.iter().filter(|m| m.band % 2 == band).collect();
+            let opts = ExportOptions {
+                layer_name: name.into(),
+                ..opts.clone()
+            };
+            expected.extend_from_slice(
+                &build_mvt(&cache, &selected, &bounds, &opts, &[], &diagnostics).data,
+            );
+        }
+        assert_eq!(
+            &*actual.data,
+            expected.as_slice(),
+            "preserve layer and feature order"
+        );
     }
 
     /// A wave's buckets hold exactly their members: grown by pushes they

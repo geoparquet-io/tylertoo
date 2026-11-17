@@ -1801,7 +1801,13 @@ mod tests {
             let free = run(None);
             assert_eq!(free.len(), 4 * usize::from(max_zoom - 1));
             let cap = free.values().map(|(bytes, _)| bytes).min().unwrap() * 3 / 4;
+            crate::overview::export::joined_tile_probe::reset();
             let fitted = run(Some(cap));
+            assert_eq!(
+                crate::overview::export::joined_tile_probe::counts(),
+                (0, 4),
+                "only one zoom's four fitted replacements may be live"
+            );
             assert_eq!(
                 fitted.keys().collect::<Vec<_>>(),
                 free.keys().collect::<Vec<_>>()

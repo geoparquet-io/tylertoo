@@ -36,7 +36,9 @@ use crate::overview::config::{check_ignored_export_fields, ExportField};
 use crate::overview::convert::{
     convert_to_overviews_for_archive, ConvertError, ConvertOptions, LevelPlan,
 };
-use crate::overview::export::{ExportError, ExportOptions, JoinedTile, JointSource};
+use crate::overview::export::{
+    ExportError, ExportOptions, JoinedTile, JoinedTileFitter, JointSource,
+};
 use crate::pmtiles_metadata::{MetadataCollector, Resolved};
 use crate::pmtiles_writer::{Header, StreamingPmtilesWriter, TileType, MAX_TILE_ID_ZOOM};
 use crate::tile::TileBounds;
@@ -2666,7 +2668,7 @@ fn merge_cap_zooms(
 }
 
 /// Check a join without a fitted replacement, dropping only archive joins.
-/// Source joins are retried in batches before the streaming write.
+/// Source joins are retried one zoom at a time during the streaming write.
 fn cap_joined_tile(
     raw: &mut Vec<u8>,
     refs: &[(usize, std::ops::Range<usize>)],
@@ -2773,6 +2775,49 @@ fn gzip_raw_len(data: &[u8]) -> usize {
         .map_or(0, |bytes| u32::from_le_bytes(*bytes) as usize)
 }
 
+fn decompress_band_tile(
+    data: &[u8],
+    coord: crate::tile::TileCoord,
+    band: &Band,
+) -> Result<Vec<u8>, PyramidError> {
+    compression::decompress_capped(data, Compression::Gzip, MAX_TILE_BYTES).map_err(|error| {
+        PyramidError::TileDecompress {
+            z: coord.z,
+            x: coord.x,
+            y: coord.y,
+            layer: band.layer.clone(),
+            error,
+        }
+    })
+}
+
+/// Archive writer accounting uses stored bytes; only an active raw cap
+/// requires decoding a copy. ISIZE is valid solely for in-run exports.
+fn append_band_copy(
+    writer: &mut StreamingPmtilesWriter,
+    coord: crate::tile::TileCoord,
+    band: &Band,
+    data: &[u8],
+    from_source: bool,
+    export: Option<&ExportOptions>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<(), PyramidError> {
+    let raw_len = if from_source {
+        gzip_raw_len(data)
+    } else {
+        data.len()
+    };
+    if let Some(export) = export {
+        let measured = if !from_source && export.tile_size_limit.is_some_and(|cap| cap > 0) {
+            decompress_band_tile(data, coord, band)?.len()
+        } else {
+            raw_len
+        };
+        report_joined_limit(measured, data.len(), coord, false, export, diagnostics);
+    }
+    append_compressed_tile(writer, coord, data, raw_len)
+}
+
 /// Concatenate only the current id's band tiles, keeping the merge streaming.
 fn join_band_tiles(
     bands: &[Band],
@@ -2785,14 +2830,7 @@ fn join_band_tiles(
     joined.clear();
     for (bi, range) in refs {
         let data = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
-        let plain = compression::decompress_capped(&data, Compression::Gzip, MAX_TILE_BYTES)
-            .map_err(|error| PyramidError::TileDecompress {
-                z: coord.z,
-                x: coord.x,
-                y: coord.y,
-                layer: bands[*bi].layer.clone(),
-                error,
-            })?;
+        let plain = decompress_band_tile(&data, coord, &bands[*bi])?;
         joined.extend_from_slice(&plain);
     }
     Ok(())
@@ -2800,11 +2838,11 @@ fn join_band_tiles(
 
 /// Screen with directory lengths and gzip trailers. Only candidates are
 /// joined and measured exactly. Retain ids alone, then fit one batch per zoom.
-fn retry_joined_tiles(
+fn screen_joined_tiles(
     bands: &[Band],
     archives: &[BandArchive],
     joint: Option<(&ExportOptions, &[Vec<JointSource>])>,
-) -> Result<BTreeMap<u64, JoinedTile>, PyramidError> {
+) -> Result<BTreeMap<u8, BTreeMap<u64, usize>>, PyramidError> {
     let Some((export, sources)) = joint else {
         return Ok(BTreeMap::new());
     };
@@ -2845,6 +2883,8 @@ fn retry_joined_tiles(
         }) {
             continue;
         }
+        // has_joint_sources above excludes archive inputs: only our own
+        // single-member exports can be screened with ISIZE.
         let stored = refs.iter().map(|(_, r)| r.len()).sum();
         let raw_len = if export.tile_size_limit.is_some_and(|cap| cap > 0) {
             refs.iter().try_fold(0, |sum, (bi, r)| {
@@ -2872,32 +2912,76 @@ fn retry_joined_tiles(
             pending.entry(coord.z).or_default().insert(id, 1);
         }
     }
-    let mut replacements = BTreeMap::new();
-    for (zoom, tiles) in pending {
-        let inputs: Vec<_> = sources
-            .iter()
-            .flatten()
-            .filter(|s| {
-                s.min_zoom <= zoom
-                    && zoom <= s.max_zoom
-                    && !s.options.coverage_fill
+    Ok(pending)
+}
+
+/// Keep the reusable input plans for the merge, but fitted bytes for only
+/// its current zoom. Advancing drops the old map before starting another fit.
+struct JoinedTileRetry<'a> {
+    pending: BTreeMap<u8, BTreeMap<u64, usize>>,
+    fitter: Option<JoinedTileFitter<'a>>,
+    export: Option<&'a ExportOptions>,
+    zoom: Option<u8>,
+    replacements: BTreeMap<u64, JoinedTile>,
+}
+
+impl<'a> JoinedTileRetry<'a> {
+    fn new(
+        bands: &[Band],
+        archives: &[BandArchive],
+        joint: Option<(&'a ExportOptions, &'a [Vec<JointSource>])>,
+    ) -> Result<Self, PyramidError> {
+        let pending = screen_joined_tiles(bands, archives, joint)?;
+        let fitter = if let Some((_, sources)) = joint.filter(|_| !pending.is_empty()) {
+            let inputs = sources.iter().flatten().filter(|s| {
+                !s.options.coverage_fill
                     && !s.options.variable_depth
-            })
-            .collect();
-        log::info!(
-            "[pyramid] fitting {} joined tile(s) at z{zoom}",
-            tiles.len()
-        );
-        replacements.extend(
-            crate::overview::export::fit_joined_tiles(&inputs, zoom, &tiles, export).map_err(
-                |error| PyramidError::BandExport {
-                    layer: "joined tiles".into(),
-                    error,
-                },
-            )?,
-        );
+                    && pending.keys().any(|&z| s.min_zoom <= z && z <= s.max_zoom)
+            });
+            Some(JoinedTileFitter::open(inputs).map_err(joined_export_error)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            pending,
+            fitter,
+            export: joint.map(|(export, _)| export),
+            zoom: None,
+            replacements: BTreeMap::new(),
+        })
     }
-    Ok(replacements)
+
+    fn start_zoom(&mut self, zoom: u8) -> Result<(), PyramidError> {
+        if self.zoom.replace(zoom) == Some(zoom) {
+            return Ok(());
+        }
+        // Tile ids are zoom-major. All prior replacements must be consumed.
+        debug_assert!(
+            self.replacements.is_empty(),
+            "unconsumed joined replacements"
+        );
+        self.replacements.clear();
+        if let Some(tiles) = self.pending.remove(&zoom) {
+            log::info!(
+                "[pyramid] fitting {} joined tile(s) at z{zoom}",
+                tiles.len()
+            );
+            self.replacements = self
+                .fitter
+                .as_ref()
+                .expect("pending joins have a fitter")
+                .fit_joined_tiles(zoom, &tiles, self.export.expect("pending joins have caps"))
+                .map_err(joined_export_error)?;
+        }
+        Ok(())
+    }
+}
+
+fn joined_export_error(error: ExportError) -> PyramidError {
+    PyramidError::BandExport {
+        layer: "joined tiles".into(),
+        error,
+    }
 }
 
 /// Fit an archive join with no overview to retry. Each pass strictly reduces
@@ -3198,7 +3282,7 @@ fn merge_prepared_bands(
         // Every in-range band copy of the current id, in band order.
         let mut group: Vec<(usize, std::ops::Range<usize>)> = Vec::with_capacity(bands.len());
         let mut last_id: Option<u64> = None;
-        let mut replacements = retry_joined_tiles(bands, &archives, joint)?;
+        let mut retry = JoinedTileRetry::new(bands, &archives, joint)?;
         let mut buf = Vec::new();
         // One cached (range, bytes) per band, for the same reason
         // `for_each_tile` caches: a run-length entry gives every id of the run
@@ -3213,6 +3297,8 @@ fn merge_prepared_bands(
             let (id, z, x, y) = (t.id, t.z, t.x, t.y);
             let coord = crate::tile::TileCoord { z, x, y };
             ensure_ascending(&mut last_id, id, &bands[first_band])?;
+
+            retry.start_zoom(z)?;
 
             // Gather every band's copy of `id`. A peeked error is left for
             // the next turn of the outer loop to return.
@@ -3254,23 +3340,22 @@ fn merge_prepared_bands(
                 [] => continue,
                 [(bi, range)] => {
                     let data = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
-                    let raw_len = gzip_raw_len(&data);
-                    if shared_zooms.contains(&z) {
-                        if let Some((export, _)) = joint {
-                            report_joined_limit(
-                                raw_len,
-                                data.len(),
-                                coord,
-                                false,
-                                export,
-                                diagnostics,
-                            );
-                        }
-                    }
-                    append_compressed_tile(&mut writer, coord, &data, raw_len)?;
+                    let from_source =
+                        joint.is_some_and(|(_, sources)| has_joint_sources(&group, z, sources));
+                    append_band_copy(
+                        &mut writer,
+                        coord,
+                        &bands[*bi],
+                        &data,
+                        from_source,
+                        joint
+                            .filter(|_| shared_zooms.contains(&z))
+                            .map(|(export, _)| export),
+                        diagnostics,
+                    )?;
                 }
                 refs => {
-                    if let Some(tile) = replacements.remove(&id) {
+                    if let Some(tile) = retry.replacements.remove(&id) {
                         append_fitted_tile(&mut writer, coord, tile, joint, diagnostics)?;
                     } else {
                         join_band_tiles(bands, &archives, &mut cache, refs, coord, &mut buf)?;
@@ -4808,6 +4893,58 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn joined_archive_single_copy_does_not_trust_isize() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("a.pmtiles");
+        let raw = layer_tile("a");
+        let mut gzip = compression::compress(&raw, Compression::Gzip).unwrap();
+        let end = gzip.len();
+        gzip[end - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("a");
+        append_compressed_tile(
+            &mut writer,
+            crate::tile::TileCoord::new(0, 0, 2),
+            &gzip,
+            raw.len(),
+        )
+        .unwrap();
+        writer.finalize(&input).unwrap();
+        let other = dir.path().join("b.pmtiles");
+        write_band_tiles(&other, "b", &[((2, 1, 0), layer_tile("b"))]);
+        let bands = [Band::new(input, "a", 2, 2), Band::new(other, "b", 2, 2)];
+        let output = dir.path().join("out.pmtiles");
+        // Without a raw cap, archive copies need no decompression and preserve
+        // even an invalid trailer. It must not become a purported raw length.
+        merge_archives_capped(
+            &bands,
+            &output,
+            &ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: Some(1024),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let index = ArchiveIndex::open(&output).unwrap();
+        let tile = index.tiles().next().unwrap().unwrap();
+        assert_eq!(index.read_range(tile.range).unwrap(), gzip);
+        // A shared-zoom raw cap requires a bounded decode, which rejects the
+        // corrupt stream instead of silently counting a 4 GiB tile.
+        let error = merge_archives_capped(
+            &bands,
+            &output,
+            &ExportOptions {
+                tile_size_limit: Some(1024),
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, PyramidError::TileDecompress { .. }));
     }
 
     #[test]
