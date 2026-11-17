@@ -576,8 +576,8 @@ impl OverviewReader {
 ///
 /// [`OverviewReader::open`] (footer, `geo:overviews` parse and `validate`,
 /// batch-size cap), then for every level its band, a zoom and gsd lookup, a
-/// bbox-pruned selection, the column-statistic queries, and a full read of
-/// the level ([`OverviewReader::read_level`], the export's read engine);
+/// bbox-pruned selection, the column-statistic queries, and one read of
+/// the band through the file's source (the export's read engine);
 /// then [`super::check::validate_file`]. The file goes through a
 /// temp file because both readers open a path. Returns the rows read. Only
 /// the `fuzz/` crate calls this; the `fuzzing` feature is never on in a
@@ -603,7 +603,14 @@ pub fn fuzz_overview_file(bytes: &[u8]) -> Result<usize, Box<dyn std::error::Err
         let _ = reader.level_for_gsd(reader.meta().levels[k].gsd);
         let _ = reader.row_groups_for_level(k)?;
         let _ = reader.selected_row_groups(k, Some([-180.0, -90.0, 180.0, 90.0]))?;
-        for batch in reader.read_level(k, None)? {
+        // Each band once: a partitioning level's prefix would reread the
+        // coarser bands for every level.
+        let band = RowGroupSelection::from_parts(vec![reader.band(k)?]);
+        for batch in reader.source().open_stream(&ReadPlan {
+            batch_size: 256,
+            projection: None,
+            row_groups: Some(&band),
+        })? {
             rows += batch?.num_rows();
         }
     }
