@@ -18133,6 +18133,119 @@ mod tests {
         );
     }
 
+    /// Disjoint polygons, `n` of them on a 20-wide grid inside tile
+    /// 10/512/511, each a ring of `sides` vertices: they never dissolve, so
+    /// merging saves only their tags.
+    fn disjoint_rings(n: i64, sides: u32) -> Vec<Feature> {
+        (0..n)
+            .map(|i| {
+                let (cx, cy) = (0.1 + (i % 20) as f64 * 0.01, 0.1 + (i / 20) as f64 * 0.01);
+                let ring: Vec<(f64, f64)> = (0..=sides)
+                    .map(|k| {
+                        let a = std::f64::consts::TAU * f64::from(k % sides) / f64::from(sides);
+                        (cx + 0.003 * a.cos(), cy + 0.003 * a.sin())
+                    })
+                    .collect();
+                Feature {
+                    geom: Geometry::Polygon(geo::Polygon::new(LineString::from(ring), vec![])),
+                    props: vec![("n".to_string(), PropertyValue::Int(i))],
+                }
+            })
+            .collect()
+    }
+
+    /// #873: a tile whose merged features alone exceed the raw cap must
+    /// still come out under it. The merge valve used to write it over the
+    /// cap, since it never drops a merged feature.
+    #[test]
+    fn merge_valve_fits_a_tile_whose_merged_features_exceed_the_raw_cap() {
+        let feats = disjoint_rings(400, 4);
+        let full = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let limit = full[0].data.len() / 20;
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: Some(limit),
+                compressed_tile_size_limit: None,
+                size_valve: SizeValve::Merge,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 1);
+        let (bytes, area, _, features) = tile_area_stats(&tiles[0]);
+        let v = tiles[0].valve;
+        assert!(v.merged > 0, "the valve should merge first: {v:?}");
+        assert!(
+            bytes <= limit,
+            "written over the cap: {bytes} > {limit}: {v:?}"
+        );
+        assert_eq!(v.over_limit, 0, "{v:?}");
+        assert!(
+            features >= 1 && area > 0.0,
+            "the tile must still draw: {v:?}"
+        );
+    }
+
+    /// #873, the shape of the FTW Brazil z8 and Overture São Paulo z12
+    /// tiles: detailed disjoint polygons under the default compressed cap
+    /// alone. Fully merged, their vertices still exceed the cap.
+    #[test]
+    fn merge_valve_fits_detailed_polygons_under_the_compressed_cap() {
+        let feats = disjoint_rings(200, 240);
+        let gz = |t: &EncodedTile| {
+            crate::compression::compress(&t.data, Compression::Gzip)
+                .unwrap()
+                .len()
+        };
+        let full = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let limit = gz(&full[0]) / 4;
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: Some(limit),
+                size_valve: SizeValve::Merge,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 1);
+        let (_, area, _, features) = tile_area_stats(&tiles[0]);
+        let v = tiles[0].valve;
+        let bytes = gz(&tiles[0]);
+        assert!(v.merged > 0, "the valve should merge first: {v:?}");
+        assert!(
+            bytes <= limit,
+            "written over the cap: {bytes} > {limit}: {v:?}"
+        );
+        assert_eq!(v.over_limit, 0, "{v:?}");
+        assert!(
+            features >= 1 && area > 0.0,
+            "the tile must still draw: {v:?}"
+        );
+    }
+
     /// #758: merging features that do not touch saves only their tags, so
     /// on a tile of detailed, disjoint polygons each pass barely shrinks the
     /// tile. Once a pass shows the tile cannot fit within a few more at that
