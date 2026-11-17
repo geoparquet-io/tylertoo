@@ -49,8 +49,11 @@ Args:
         Each value is stored as given, and `""` is kept as `""`.
     size_valve: How to reduce a tile that exceeds its limit:
         `"merge"` merges the densest lines and polygons into a
-        neighbor, which keeps its own attributes. If still over, halve
-        the tile extent to 512, then drop merged features if needed.
+        neighbor, which keeps its own attributes. If still over, drop
+        unmerged features, halve the tile extent to 512, then drop whole
+        features if needed. Merged features are never split into their
+        sources. Only a lone feature still over the cap at the extent
+        floor (512) is written over it, with a warning.
         `"drop"` removes
         features, leaving holes. Point tiles use feature dropping in
         both modes.

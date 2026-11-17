@@ -792,7 +792,7 @@ fn tiles_left_over_the_cap_are_listed_and_the_warning_explains_the_floor() {
             }
         );
         let hint = format!(
-            "; {merged} of them hold a single merged feature that exceeds the cap even at the extent floor"
+            "; {merged} of them hold a single merged feature over the cap at the extent floor (512)"
         );
         assert_eq!(text.contains(&hint), valve == "merge", "{valve}: {text}");
     }

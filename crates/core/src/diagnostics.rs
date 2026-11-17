@@ -464,7 +464,7 @@ impl fmt::Display for Diagnostic {
                     write!(f, "; largest: {}", tiles.join(", "))?;
                 }
                 if *merged_tiles > 0 {
-                    write!(f, "; {merged_tiles} of them hold a single merged feature that exceeds the cap even at the extent floor")?;
+                    write!(f, "; {merged_tiles} of them hold a single merged feature over the cap at the extent floor (512)")?;
                 }
                 Ok(())
             }

@@ -33,7 +33,7 @@ coarse and middle zooms. Three defaults work together:
   dense areas stay filled.
 - When a tile goes over the [size cap](#tile-size-cap), the valve first merges
   its densest lines and polygons into a neighbor. If merging cannot fit the
-  tile, it drops singles, reduces the extent, then drops merged features if needed.
+  tile, it drops singles, reduces the extent, then drops whole features if needed.
 
 These defaults cost time. A build took about 1.3× as long as with the
 defaults before #745 on 632k FTW field polygons (z0–z12), and 1.3× on 4.6M,
@@ -1664,9 +1664,11 @@ fits. `--size-valve` chooses how:
   drops unmerged features and keeps the largest. If still over, it halves
   the tile extent down to 512. The encoder cleans the same geometry at each
   grid. These tiles shed their fill. If the tile still exceeds the cap,
-  the valve drops merged features, fewest vertices first. This can leave holes.
+  the valve drops whole features, fewest vertices first. This can leave holes.
   These tiles also shed fill, so it cannot redraw a dropped merge's source.
-  A single remaining feature can still exceed the cap; it gets a warning.
+  Merged features are never split into their sources. Only a lone feature
+  that still exceeds the cap at the extent floor (512) is written over it,
+  with a warning.
   The report counts dropped merges and their source features. It also counts
   tiles at a reduced extent per zoom, with the smallest extent used.
 - `drop` drops features, keeping the largest for polygons and lines. It keeps
