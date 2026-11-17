@@ -717,6 +717,11 @@ impl Default for ExportOptions {
 }
 
 impl ExportOptions {
+    pub(crate) fn has_tile_size_cap(&self) -> bool {
+        self.tile_size_limit.is_some_and(|cap| cap > 0)
+            || self.compressed_tile_size_limit.is_some_and(|cap| cap > 0)
+    }
+
     /// The export half of a verbatim run (#761): no per-tile size cap, raw
     /// or compressed, since a valve that sheds features to fit a byte budget
     /// is not verbatim either. Everything else is left alone, so an explicit
@@ -9707,8 +9712,6 @@ pub(crate) struct JointSource {
     pub options: ExportOptions,
     pub min_zoom: u8,
     pub max_zoom: u8,
-    /// Cap ownership survives a layer that exports no tiles at a zoom.
-    pub report_zooms: Vec<u8>,
 }
 
 /// A merge's retained overview plans. Footers, columns, CRS and zoom ladders
@@ -9760,15 +9763,17 @@ impl<'a> JoinedTileFitter<'a> {
         Ok(Self { sources })
     }
 
-    /// Fit only this zoom's joins. Members live for one wave; the merge
-    /// consumes and releases the replacements before fitting the next zoom.
-    /// Replayed diagnostics and valve counts stay silent.
+    /// Fit one wave of joins. The merge releases its replacements before
+    /// requesting another wave. Only valve counts from replay are published.
     pub(crate) fn fit_joined_tiles(
         &self,
         zoom: u8,
         tiles: &BTreeMap<u64, usize>,
         opts: &ExportOptions,
+        diagnostics: &crate::diagnostics::Diagnostics,
     ) -> Result<BTreeMap<u64, JoinedTile>, ExportError> {
+        #[cfg(test)]
+        joined_tile_probe::ZOOMS.with(|zooms| zooms.set(zooms.get() | (1 << zoom)));
         let started = Instant::now();
         let replay = &crate::diagnostics::Diagnostics::silent();
         let cache = Arc::new(TileGzipCache::new(8 * 1024 * 1024));
@@ -9778,8 +9783,7 @@ impl<'a> JoinedTileFitter<'a> {
         // restriction also prunes disjoint bboxes and prevents clipping holes
         // between requested ids, as in variable-depth and shard exports.
         let partitions = plan_partitions(tiles, zoom, 1);
-        let width =
-            resolve_partition_wave_under(opts.partition_wave, opts.profile, &export_budget());
+        let width = joined_tile_wave(tiles, opts);
         let mut replacements = BTreeMap::new();
         for wave in partitions.chunks(width) {
             let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
@@ -9855,6 +9859,12 @@ impl<'a> JoinedTileFitter<'a> {
                 replay,
             )?;
             for tile in encoded.into_iter().flatten() {
+                diagnostics.record(crate::diagnostics::Diagnostic::Merged {
+                    count: tile.valve.merged,
+                });
+                diagnostics.record(crate::diagnostics::Diagnostic::ValveDropped {
+                    count: tile.valve.dropped,
+                });
                 replacements.insert(
                     tile_key(tile.x, tile.y, zoom),
                     JoinedTile {
@@ -9882,6 +9892,31 @@ impl<'a> JoinedTileFitter<'a> {
     }
 }
 
+/// Price the densest confirmed join with the export's resident-byte model,
+/// then let the ordinary level-wave guard narrow even an explicit width.
+pub(crate) fn joined_tile_wave(tiles: &BTreeMap<u64, usize>, opts: &ExportOptions) -> usize {
+    #[cfg(test)]
+    joined_tile_probe::PROFILE.with(|profile| profile.set(Some(opts.profile)));
+    joined_tile_wave_under(tiles, opts, &export_budget())
+}
+
+fn joined_tile_wave_under(
+    tiles: &BTreeMap<u64, usize>,
+    opts: &ExportOptions,
+    budget: &MemoryBudget,
+) -> usize {
+    // Each tile is one partition. Use the screen's largest joined raw size
+    // and the existing resident model, then the same allowance owner as
+    // memory_safe_level_wave; no flat-slot floor can bypass the dense guard.
+    let raw = tiles.values().copied().max().unwrap_or(0) as u64;
+    let resident = export_member_resident_bytes(member_resident_bytes(raw, 0), opts);
+    resolve_partition_wave_under(opts.partition_wave, opts.profile, budget).min(budget.affordable(
+        opts.profile,
+        MemoryPhase::ExportCollect,
+        Price::model(resident),
+    ))
+}
+
 /// A fitted join, already gzipped by the parallel export encoder.
 pub(crate) struct JoinedTile {
     pub data: Vec<u8>,
@@ -9894,19 +9929,31 @@ pub(crate) struct JoinedTile {
 /// Observe actual replacement lifetimes on the merge's thread, including
 /// unwritten replacements retained across calls to the fitter.
 #[cfg(test)]
-pub(super) mod joined_tile_probe {
+pub(crate) mod joined_tile_probe {
     use std::cell::Cell;
 
     thread_local! {
         static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+        pub(super) static PROFILE: Cell<Option<super::MemoryProfile>> = const { Cell::new(None) };
+        pub(super) static ZOOMS: Cell<u32> = const { Cell::new(0) };
     }
 
     pub(crate) fn reset() {
         COUNTS.with(|counts| counts.set((0, 0)));
+        PROFILE.with(|profile| profile.set(None));
+        ZOOMS.with(|zooms| zooms.set(0));
     }
 
     pub(crate) fn counts() -> (usize, usize) {
         COUNTS.with(Cell::get)
+    }
+
+    pub(crate) fn profile() -> Option<super::MemoryProfile> {
+        PROFILE.with(Cell::get)
+    }
+
+    pub(crate) fn zooms() -> u32 {
+        ZOOMS.with(Cell::get)
     }
 
     pub(super) struct LiveTile;
@@ -10052,9 +10099,7 @@ fn with_fill(
 /// size limit in force. Otherwise no gap is ever compared, and the read
 /// skips measuring them (#745).
 fn valve_merges(opts: &ExportOptions) -> bool {
-    opts.size_valve == SizeValve::Merge
-        && (opts.tile_size_limit.is_some_and(|l| l > 0)
-            || opts.compressed_tile_size_limit.is_some_and(|l| l > 0))
+    opts.size_valve == SizeValve::Merge && opts.has_tile_size_cap()
 }
 
 /// Whether every member has at most one coordinate: a tile of points (or of
@@ -10718,6 +10763,7 @@ fn build_tile_layers_with<M: TileFeature>(
             grouped[index].1.push(member);
         }
     }
+    grouped.retain(|(_, members)| !members.is_empty());
     // Layers encode independently; the joint valve re-encodes all of them on
     // every pass, so build them in parallel and join in layer order.
     let built: Vec<TileMvt> = grouped
@@ -20065,6 +20111,27 @@ mod tests {
     }
 
     #[test]
+    fn joined_wave_uses_the_densest_tile_and_run_profile() {
+        let budget = MemoryBudget::with_available(Some(256 << 20));
+        let mut opts = ExportOptions {
+            partition_wave: 8,
+            ..Default::default()
+        };
+        let small = BTreeMap::from([(1, 100), (2, 100)]);
+        let dense = BTreeMap::from([(1, 100), (2, 128 << 20)]);
+        for profile in [MemoryProfile::Auto, MemoryProfile::Bounded] {
+            opts.profile = profile;
+            assert_eq!(joined_tile_wave_under(&small, &opts, &budget), 8);
+            assert_eq!(joined_tile_wave_under(&dense, &opts, &budget), 1);
+        }
+        opts.profile = MemoryProfile::Speed;
+        assert_eq!(joined_tile_wave_under(&dense, &opts, &budget), 8);
+        opts.profile = MemoryProfile::Auto;
+        opts.partition_wave = PARTITION_WAVE_AUTO;
+        assert_eq!(joined_tile_wave_under(&dense, &opts, &budget), 1);
+    }
+
+    #[test]
     fn joined_layer_encoder_groups_members_once() {
         let members: Vec<_> = (0..32)
             .map(|i| Member {
@@ -20078,6 +20145,7 @@ mod tests {
             (1, "b".into()),
             (2, "a".into()),
             (3, "b".into()),
+            (4, "empty".into()),
         ];
         let cache = test_gzip_cache();
         let opts = ExportOptions::default();

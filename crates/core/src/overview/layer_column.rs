@@ -720,12 +720,7 @@ pub(super) fn convert_by_layer(
     }
     let (staged, filtered_rows) = split(&source, &schema, idx, &gates, &dir, &options.convert)?;
     drop(source);
-    let retain_overviews = staged.len() > 1
-        && (options.export.tile_size_limit.is_some_and(|cap| cap > 0)
-            || options
-                .export
-                .compressed_tile_size_limit
-                .is_some_and(|cap| cap > 0));
+    let retain_overviews = staged.len() > 1 && options.export.has_tile_size_cap();
     let shared_zooms: Vec<_> = if retain_overviews {
         (0..=crate::tile::MAX_ZOOM).collect()
     } else {
@@ -815,7 +810,6 @@ pub(super) fn convert_by_layer(
                 options: retained_export.expect("an exported layer has export options"),
                 min_zoom: report.export.min_zoom,
                 max_zoom: report.export.max_zoom,
-                report_zooms: shared_zooms.clone(),
             }]
         } else {
             Vec::new()
@@ -859,8 +853,12 @@ pub(super) fn convert_by_layer(
             // The layers' archives are spooled there already.
             spill_dir: Some(dir.clone()),
         },
-        &options.export,
+        &super::export::ExportOptions {
+            profile: options.convert.profile,
+            ..options.export.clone()
+        },
         &joint_sources,
+        &shared_zooms,
     )
     .map_err(TilesError::Merge)?;
     drop(overviews);
@@ -1672,7 +1670,24 @@ mod tests {
             };
             o.export.tile_size_limit = cap;
             o.export.compressed_tile_size_limit = None;
-            convert_to_pmtiles(&TilesInput::Path(input.clone()), &out, &o).unwrap();
+            let TilesOutcome::Layered(report) =
+                convert_to_pmtiles(&TilesInput::Path(input.clone()), &out, &o).unwrap()
+            else {
+                panic!("layered report")
+            };
+            if cap.is_some() {
+                assert!(
+                    report
+                        .layers
+                        .iter()
+                        .all(|l| l.report.export.valve_dropped_features == 0
+                            && l.report.export.merged_features == 0),
+                    "each layer alone fits"
+                );
+                assert!(report.diagnostics.iter().any(|d| matches!(d,
+                    crate::diagnostics::Diagnostic::ValveDropped { count } | crate::diagnostics::Diagnostic::Merged { count } if *count > 0
+                )), "loss in the joint valve must be reported");
+            }
             out
         };
         let cap = cap_between(&run(None));
@@ -1736,6 +1751,80 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mlt")]
+    fn joined_mlt_fit_converts_layers_and_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("kinds.parquet");
+        let geoms = (0..200)
+            .map(|i| {
+                Some(geo::Geometry::Point(geo::Point::new(
+                    -150.0 + (i % 40) as f64 * 7.0,
+                    -50.0 + (i / 40) as f64 * 20.0,
+                )))
+            })
+            .collect::<Vec<_>>();
+        let kinds = (0..200)
+            .map(|i| if i % 2 == 0 { "a" } else { "b" })
+            .collect::<Vec<_>>();
+        crate::overview::testutil::write_input_with_column(
+            &input,
+            &geoms,
+            "kind",
+            Arc::new(StringArray::from(kinds)),
+            None,
+        );
+        let run = |cap| {
+            let output = dir.path().join(format!("mlt-{cap:?}.pmtiles"));
+            let mut opts = options("kind");
+            opts.convert.levels = LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 0,
+            };
+            opts.convert = opts.convert.verbatim();
+            opts.export.tile_format = crate::tile_format::TileFormat::Mlt;
+            opts.export.size_valve = super::super::export::SizeValve::Drop;
+            opts.export.tile_size_limit = cap;
+            opts.export.compressed_tile_size_limit = None;
+            convert_to_pmtiles(&TilesInput::Path(input.clone()), &output, &opts).unwrap();
+            let index = ArchiveIndex::open(&output).unwrap();
+            assert_eq!(
+                index.header().tile_type,
+                crate::pmtiles_writer::TileType::Mlt
+            );
+            let tile = index.tiles().next().unwrap().unwrap();
+            let raw =
+                compression::decompress(&index.read_range(tile.range).unwrap(), Compression::Gzip)
+                    .unwrap();
+            let mvt = crate::tile_format::mlt_to_mvt(&raw).unwrap();
+            (
+                raw.len(),
+                crate::vector_tile::Tile::decode(mvt.as_slice()).unwrap(),
+            )
+        };
+        let (free_bytes, free) = run(None);
+        let cap = free_bytes * 3 / 4;
+        crate::overview::export::joined_tile_probe::reset();
+        let (bytes, fitted) = run(Some(cap));
+        assert!(
+            crate::overview::export::joined_tile_probe::counts().1 > 0,
+            "must reach joint fitter"
+        );
+        assert!(bytes <= cap, "{bytes} > {cap}");
+        assert_eq!(
+            fitted.layers.iter().map(|l| &*l.name).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(
+            fitted
+                .layers
+                .iter()
+                .map(|l| l.features.len())
+                .sum::<usize>()
+                < free.layers.iter().map(|l| l.features.len()).sum::<usize>()
+        );
+    }
+
+    #[test]
     fn joined_retry_fits_several_tiles_at_one_and_two_zooms() {
         let dir = tempfile::tempdir().unwrap();
         let mut geoms = Vec::new();
@@ -1771,6 +1860,7 @@ mod tests {
                     max_zoom,
                 };
                 opts.convert = opts.convert.verbatim();
+                opts.convert.profile = crate::overview::level::MemoryProfile::Bounded;
                 opts.export.tile_size_limit = cap;
                 opts.export.compressed_tile_size_limit = None;
                 // Exercise several waves as well as parallel tiles within a wave.
@@ -1804,9 +1894,14 @@ mod tests {
             crate::overview::export::joined_tile_probe::reset();
             let fitted = run(Some(cap));
             assert_eq!(
+                crate::overview::export::joined_tile_probe::profile(),
+                Some(crate::overview::level::MemoryProfile::Bounded),
+                "the joint valve must use the run's conversion profile"
+            );
+            assert_eq!(
                 crate::overview::export::joined_tile_probe::counts(),
-                (0, 4),
-                "only one zoom's four fitted replacements may be live"
+                (0, 2),
+                "only one wave's two fitted replacements may be live"
             );
             assert_eq!(
                 fitted.keys().collect::<Vec<_>>(),
@@ -1903,13 +1998,6 @@ mod tests {
                         .iter()
                         .map(|l| l.report.export.valve_dropped_features)
                         .sum();
-                    assert!(
-                        !report
-                            .diagnostics
-                            .iter()
-                            .any(|d| matches!(d, Diagnostic::ValveDropped { .. })),
-                        "joint retry counts must stay silent"
-                    );
                     report
                         .diagnostics
                         .into_iter()
@@ -1949,6 +2037,20 @@ mod tests {
                     over,
                     "pyramid={pyramid}, cap={cap}"
                 );
+                if cap == 1 {
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter_map(|d| match d {
+                                Diagnostic::TilesOverLimit { merged_tiles, .. } =>
+                                    Some(merged_tiles),
+                                _ => None,
+                            })
+                            .sum::<usize>(),
+                        0,
+                        "the fitted drop survivor is not a merge"
+                    );
+                }
                 assert_eq!(
                     events
                         .iter()
@@ -1958,7 +2060,9 @@ mod tests {
                             None
                         })
                         .sum::<usize>(),
-                    source_dropped,
+                    // The joint valve reconstructs the original overview
+                    // members; its counts are additional to the source valves.
+                    source_dropped + 800 - remaining,
                     "pyramid={pyramid}, cap={cap}"
                 );
                 assert!(
@@ -2028,7 +2132,6 @@ mod tests {
                     },
                     min_zoom: 0,
                     max_zoom: 0,
-                    report_zooms: Vec::new(),
                 }]
             })
             .collect();
@@ -2039,6 +2142,7 @@ mod tests {
             &BandMergeOptions::default(),
             &opts.export,
             &sources,
+            &[],
         )
         .unwrap();
         assert!(!report
