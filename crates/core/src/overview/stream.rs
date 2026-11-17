@@ -5910,9 +5910,7 @@ fn scan_chunk(
     .map_err(|e| decode_error_at_rows(diag_row_base, chunk_len, e))?;
     Pass1Timers::add(&timers.decode, t_decode);
     let t_junctions = Instant::now();
-    // Both sides of a border in one chunk are one record after this.
-    junctions.sort_unstable();
-    junctions.dedup();
+    super::junction::compact(&mut junctions);
     Pass1Timers::add(&timers.junctions, t_junctions);
 
     let t_scan = Instant::now();

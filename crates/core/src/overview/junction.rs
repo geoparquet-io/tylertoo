@@ -28,7 +28,7 @@
 //! only add a pin (the two vertices look like one vertex with two neighbour
 //! pairs), which keeps a vertex and never opens a gap.
 
-use geo::{Coord, Distance, Euclidean, Line};
+use geo::Coord;
 use geo_traits::{
     CoordTrait, GeometryCollectionTrait, GeometryTrait, GeometryType, LineStringTrait,
     MultiPolygonTrait, PolygonTrait,
@@ -41,6 +41,9 @@ pub(crate) type Occurrence = (u64, u64);
 /// The neighbour-pair key of a forced pin (ring start and far points). Any
 /// second record for the same vertex then makes it a pin.
 const FORCED: u64 = u64::MAX;
+
+/// The neighbour-pair key of a vertex already known to be a pin.
+const PIN: u64 = u64::MAX - 1;
 
 /// splitmix64's finalizer.
 #[inline]
@@ -78,11 +81,10 @@ impl JunctionNodes {
     /// Reduce the occurrences of every polygon ring to the pin set.
     pub(crate) fn from_occurrences(mut occ: Vec<Occurrence>) -> Self {
         occ.par_sort_unstable();
-        // Two different records for one vertex are two distinct pairs.
-        let mut keys: Vec<u64> = occ
-            .par_windows(2)
-            .filter(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1)
-            .map(|w| w[0].0)
+        let mut keys: Vec<u64> = (0..occ.len())
+            .into_par_iter()
+            .filter(|&i| is_pin(&occ, i))
+            .map(|i| occ[i].0)
             .collect();
         keys.dedup();
         keys.shrink_to_fit(); // resident through pass 2, priced by length
@@ -96,11 +98,20 @@ impl JunctionNodes {
 
     /// Rebuild from a saved plan's keys; `None` unless strictly ascending.
     pub(crate) fn from_sorted(keys: Vec<u64>) -> Option<Self> {
-        (u32::try_from(keys.len()).is_ok() && keys.windows(2).all(|w| w[0] < w[1]))
+        keys.windows(2)
+            .all(|w| w[0] < w[1])
             .then(|| Self::indexed(keys))
     }
 
     fn indexed(keys: Vec<u64>) -> Self {
+        if u32::try_from(keys.len()).is_err() {
+            // Past u32 offsets: no directory, `contains` binary-searches.
+            return Self {
+                keys,
+                dir: Vec::new(),
+                shift: 0,
+            };
+        }
         let bits = (keys.len() / 4).max(2).next_power_of_two().trailing_zeros();
         let shift = 64 - bits;
         let mut dir = vec![0u32; (1 << bits) + 1];
@@ -127,9 +138,36 @@ impl JunctionNodes {
     #[inline]
     pub(crate) fn contains(&self, c: Coord<f64>) -> bool {
         let k = vertex_key(c.x, c.y);
+        if self.dir.is_empty() {
+            return self.keys.binary_search(&k).is_ok();
+        }
         let b = (k >> self.shift) as usize;
         self.keys[self.dir[b] as usize..self.dir[b + 1] as usize].contains(&k)
     }
+}
+
+/// Whether sorted `occ[i]` shows its vertex is a pin: a [`PIN`] record, or
+/// a second, different neighbour pair.
+fn is_pin(occ: &[Occurrence], i: usize) -> bool {
+    occ[i].1 == PIN || (i > 0 && occ[i - 1].0 == occ[i].0 && occ[i - 1].1 != occ[i].1)
+}
+
+/// Sort and shrink one chunk's occurrences: duplicates go (both sides of a
+/// border in the chunk), and a vertex the chunk already shows is a pin keeps
+/// one [`PIN`] record.
+pub(crate) fn compact(occ: &mut Vec<Occurrence>) {
+    occ.sort_unstable();
+    occ.dedup();
+    *occ = occ
+        .chunk_by(|a, b| a.0 == b.0)
+        .map(|run| {
+            if run.len() > 1 {
+                (run[0].0, PIN)
+            } else {
+                run[0]
+            }
+        })
+        .collect();
 }
 
 /// Append a batch's occurrences (one `Vec` per chunk) to `acc` if `fits`
@@ -178,8 +216,7 @@ pub(crate) fn occurrences_of(geoms: &[geo::Geometry<f64>]) -> Vec<Vec<Occurrence
             for g in chunk {
                 push_geometry(g, &mut buf, &mut out);
             }
-            out.sort_unstable();
-            out.dedup();
+            compact(&mut out);
             out
         })
         .collect()
@@ -230,6 +267,7 @@ pub(crate) fn push_ring(coords: &[Coord<f64>], out: &mut Vec<Occurrence>) {
         return;
     }
     let c = &coords[..n];
+    out.reserve(n + 3);
     let key = |i: usize| vertex_key(c[i].x, c[i].y);
     let (mut prev, mut mid) = (key(n - 1), key(0));
     for i in 0..n {
@@ -237,25 +275,28 @@ pub(crate) fn push_ring(coords: &[Coord<f64>], out: &mut Vec<Occurrence>) {
         out.push((mid, pair_key(prev, next)));
         (prev, mid) = (mid, next);
     }
-    // The start and two far points, as tippecanoe's serial.cpp picks them;
-    // distance ties go to the lexicographically smaller vertex.
-    let smaller = |a: Coord<f64>, b: Coord<f64>| (a.x, a.y) < (b.x, b.y);
-    let farthest = |dist: &dyn Fn(Coord<f64>) -> f64| {
-        let (mut best, mut far) = (0, 0.0);
-        for (i, &p) in c.iter().enumerate().skip(1) {
-            let d = dist(p);
-            if d > far || (d == far && smaller(p, c[best])) {
-                (best, far) = (i, d);
-            }
-        }
-        best
-    };
-    let far = farthest(&|p| (p.x - c[0].x).powi(2) + (p.y - c[0].y).powi(2));
-    let chord = Line::new(c[0], c[far]);
-    let far2 = farthest(&|p| Euclidean.distance(p, &chord));
+    // The start and two far points, as tippecanoe's serial.cpp picks them.
+    let o = c[0];
+    let far = farthest(c, |p| (p.x - o.x).powi(2) + (p.y - o.y).powi(2));
+    // Off the chord's line: twice the triangle's area, its length a constant.
+    let (dx, dy) = (c[far].x - o.x, c[far].y - o.y);
+    let far2 = farthest(c, |p| (dx * (p.y - o.y) - dy * (p.x - o.x)).abs());
     for i in [0, far, far2] {
         out.push((key(i), FORCED));
     }
+}
+
+/// The vertex of `c` after the first farthest by `dist`; ties go to the
+/// lexicographically smaller vertex.
+fn farthest(c: &[Coord<f64>], dist: impl Fn(Coord<f64>) -> f64) -> usize {
+    let (mut best, mut far) = (0, 0.0);
+    for (i, &p) in c.iter().enumerate().skip(1) {
+        let d = dist(p);
+        if d > far || (d == far && (p.x, p.y) < (c[best].x, c[best].y)) {
+            (best, far) = (i, d);
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -309,6 +350,46 @@ mod tests {
         for c in &coords {
             let k = vertex_key(c.x, c.y);
             assert_eq!(nodes.contains(*c), keys.binary_search(&k).is_ok());
+        }
+    }
+
+    /// Compacting chunks first gives the same pins as reducing every record.
+    #[test]
+    fn compacted_chunks_keep_the_pins() {
+        // A 6 x 6 grid of unit squares, each split in its own chunk or not.
+        let mut rings = Vec::new();
+        for x in 0..6 {
+            for y in 0..6 {
+                let (x, y) = (f64::from(x), f64::from(y));
+                rings.push(ring(&[
+                    (x, y),
+                    (x + 1., y),
+                    (x + 1., y + 1.),
+                    (x, y + 1.),
+                    (x, y),
+                ]));
+            }
+        }
+        let mut all = Vec::new();
+        for r in &rings {
+            push_ring(r, &mut all);
+        }
+        let whole = JunctionNodes::from_occurrences(all);
+        for per_chunk in [1, 5, 36] {
+            let mut occ = Vec::new();
+            for chunk in rings.chunks(per_chunk) {
+                let mut c = Vec::new();
+                for r in chunk {
+                    push_ring(r, &mut c);
+                }
+                compact(&mut c);
+                occ.extend(c);
+            }
+            assert_eq!(
+                JunctionNodes::from_occurrences(occ),
+                whole,
+                "{per_chunk} a chunk"
+            );
         }
     }
 }
