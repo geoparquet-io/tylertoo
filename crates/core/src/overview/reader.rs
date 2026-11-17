@@ -8,27 +8,27 @@
 //!
 //! ## Byte source
 //!
-//! v0.1 targets **local files**. The design keeps the byte source swappable: the
-//! footer is parsed once in [`OverviewReader::open`], and each
-//! [`OverviewReader::read_level`] re-opens the backing path to build a
-//! row-group-scoped reader (mirroring `batch_processor`'s read path). A future
-//! `object_store`/HTTP variant swaps only the open + row-group fetch — the level
+//! v0.1 targets **local files**. The footer is parsed once in
+//! [`OverviewReader::open`] and handed to the reader's
+//! [`ConvertSource`](crate::input_set::ConvertSource) (#833), so every read of
+//! the file, the export's and [`OverviewReader::read_level`], goes through the
+//! input set's one read engine with no second footer parse. The level
 //! selection and pruning logic ([`OverviewReader::level_for_gsd`],
-//! [`OverviewReader::selected_row_groups`]) operate purely on parsed metadata and
-//! carry over unchanged.
+//! [`OverviewReader::selected_row_groups`]) operate purely on parsed metadata.
 
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use tylertoo_io::ParquetMetaData;
-use tylertoo_io::ReaderMetadata;
 
+use crate::input::InputError;
+use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
 use crate::resolved_schema::ResolvedSchema;
 use crate::tile::TileBounds;
-use tylertoo_io::{ParquetSource, UntrustedBatchReader};
 
 use super::level::{gsd, Mode, OverviewsMeta, OVERVIEWS_KEY};
 
@@ -102,13 +102,6 @@ pub enum ReaderError {
     },
 }
 
-#[doc(hidden)]
-impl From<tylertoo_io::ParquetError> for ReaderError {
-    fn from(e: tylertoo_io::ParquetError) -> Self {
-        ReaderError::Parquet(e)
-    }
-}
-
 /// A reader over a local GeoParquet overview file.
 ///
 /// Constructed with [`OverviewReader::open`], which parses the footer once.
@@ -119,13 +112,13 @@ pub struct OverviewReader {
     metadata: Arc<ParquetMetaData>,
     schema: SchemaRef,
     meta: OverviewsMeta,
-    /// The footer and schema [`Self::open`] checked and decoded
-    /// ([`tylertoo_io`]): every read reopens the file with them rather
-    /// than parsing the footer again. Each read's batch is capped there for
-    /// its row groups' widest byte-array column (#563): an overview level
+    /// The file as an input source over the footer [`Self::open`] checked
+    /// and decoded ([`tylertoo_io`]): every read of the file goes through it
+    /// (#833), with no second footer parse. Each read's batch is capped there
+    /// for its row groups' widest byte-array column (#563): an overview level
     /// keeps its source geometries, so a batch of very large ones would pass
     /// arrow's i32 byte-array offset ceiling.
-    reader_metadata: ReaderMetadata,
+    source: Arc<ConvertSource>,
 }
 
 impl OverviewReader {
@@ -191,9 +184,14 @@ impl OverviewReader {
                     .join("; ")
             )));
         }
+        let source = Arc::new(ConvertSource::single_parsed(
+            crate::input::InputSource::Local(path.clone()),
+            resolved.clone(),
+            builder.reader_metadata().clone(),
+        ));
         Ok(Self {
             resolved,
-            reader_metadata: builder.reader_metadata().clone(),
+            source,
             path,
             metadata,
             schema,
@@ -204,6 +202,11 @@ impl OverviewReader {
     /// The file this reader opened, as given.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The file as the input source every read goes through (#833).
+    pub(crate) fn source(&self) -> &ConvertSource {
+        &self.source
     }
 
     /// The parsed `geo:overviews` footer metadata.
@@ -489,95 +492,31 @@ impl OverviewReader {
     }
 
     /// Read a level, optionally pruned by a viewport `bbox`, as an iterator of
-    /// `Result<RecordBatch, ArrowError>`. Reads **only** the selected row groups
-    /// ([`Self::selected_row_groups`]).
+    /// record batches. Reads **only** the selected row groups
+    /// ([`Self::selected_row_groups`]), sequentially, through the same
+    /// [`ConvertSource`] the export reads with; an error opening the read is
+    /// the iterator's first item.
     ///
     /// # Errors
     ///
-    /// Returns a [`ReaderError`] if `level_idx` is not a level of the file or
-    /// the Parquet reader cannot be built.
+    /// Returns [`ReaderError::LevelOutOfRange`] if `level_idx` is not a level
+    /// of the file.
     pub fn read_level(
         &self,
         level_idx: usize,
         bbox: Option<[f64; 4]>,
-    ) -> Result<UntrustedBatchReader, ReaderError> {
-        self.read_level_batched(level_idx, bbox, tylertoo_io::DEFAULT_BATCH_ROWS)
-    }
-
-    /// [`Self::read_level`] with an explicit Arrow batch size (the builder
-    /// default is 1024 rows). Larger batches amortize per-batch overhead for
-    /// consumers that do parallel per-row work on each batch (PMTiles export).
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ReaderError`] if `level_idx` is not a level of the file or
-    /// the Parquet reader cannot be built.
-    pub fn read_level_batched(
-        &self,
-        level_idx: usize,
-        bbox: Option<[f64; 4]>,
-        batch_size: usize,
-    ) -> Result<UntrustedBatchReader, ReaderError> {
-        self.read_level_any_bbox_batched(
-            level_idx,
-            bbox.as_ref().map(std::slice::from_ref),
-            batch_size,
-        )
-    }
-
-    /// [`Self::read_level_batched`] pruned by the union of several
-    /// bboxes. The PMTiles export reads a wave this way so a feature stored
-    /// one world width from the wave's tiles, which the export draws there
-    /// wrapped (#342), is not pruned away.
-    pub(crate) fn read_level_any_bbox_batched(
-        &self,
-        level_idx: usize,
-        bboxes: Option<&[[f64; 4]]>,
-        batch_size: usize,
-    ) -> Result<UntrustedBatchReader, ReaderError> {
-        let selected = self.selected_row_groups_any(level_idx, bboxes)?;
-        Ok(self.rows(selected, batch_size)?.build()?)
-    }
-
-    /// Read exactly `level_idx`'s **own** row-group band (`start..=end`, the
-    /// §3.3 span), unpruned and independent of mode, with an explicit Arrow
-    /// batch size.
-    ///
-    /// Unlike [`Self::read_level_batched`] — which in partitioning mode
-    /// reads the accumulating prefix `0..=end` — this reads only the band that
-    /// *belongs to* the level. It is the unit of work for a single-read,
-    /// fan-out scan of the whole file (issue #233): reading each band once
-    /// (`Σ_j |band_j|` = every row group exactly once) instead of re-reading a
-    /// coarse band from every finer level's prefix (`Σ_k |prefix_k|`).
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ReaderError`] if `level_idx` is not a level of the file or
-    /// the Parquet reader cannot be built.
-    pub fn read_band_batched(
-        &self,
-        level_idx: usize,
-        batch_size: usize,
-    ) -> Result<UntrustedBatchReader, ReaderError> {
-        Ok(self.rows(self.band(level_idx)?, batch_size)?.build()?)
-    }
-
-    /// Read exactly the row groups `row_groups` (ascending, file order),
-    /// projected to the top-level columns `roots`, with an explicit batch
-    /// size. Batches may straddle row-group boundaries.
-    ///
-    /// For the export's up-front `--feature-id` check (#443), which reads one
-    /// column of every row group its statistics cannot vouch for.
-    pub(crate) fn read_row_groups_projected(
-        &self,
-        row_groups: Vec<usize>,
-        batch_size: usize,
-        roots: &[usize],
-    ) -> Result<UntrustedBatchReader, ReaderError> {
-        Ok(self
-            .rows(row_groups, batch_size)?
-            .with_projection_roots(roots.iter().copied())
-            .build()?)
+    ) -> Result<impl Iterator<Item = Result<RecordBatch, InputError>> + '_, ReaderError> {
+        let selection =
+            RowGroupSelection::from_parts(vec![self.selected_row_groups(level_idx, bbox)?]);
+        let stream = self.source.open_stream(&ReadPlan {
+            batch_size: tylertoo_io::DEFAULT_BATCH_ROWS,
+            projection: None,
+            row_groups: Some(&selection),
+        });
+        Ok(match stream {
+            Ok(stream) => Box::new(stream) as Box<dyn Iterator<Item = _>>,
+            Err(e) => Box::new(std::iter::once(Err(e))),
+        })
     }
 
     /// The parsed Parquet footer (row-group sizes and column statistics).
@@ -622,22 +561,6 @@ impl OverviewReader {
         let (start, end) = self.level_band(level_idx)?;
         Ok((start..=end).collect())
     }
-
-    /// A reader over `row_groups` in batches of `batch_size` rows: the file
-    /// reopened through the owner with the footer [`Self::open`] already
-    /// checked, so no second footer parse and the same batch cap.
-    fn rows(
-        &self,
-        row_groups: Vec<usize>,
-        batch_size: usize,
-    ) -> Result<ParquetSource<File>, ReaderError> {
-        let file = File::open(&self.path)?;
-        Ok(
-            tylertoo_io::open_parquet_with_metadata(file, self.reader_metadata.clone())
-                .with_row_groups(row_groups)
-                .with_batch_rows(batch_size),
-        )
-    }
 }
 
 /// Fuzz hook (#633): treat `bytes` as an overview file handed to `tylertoo
@@ -646,13 +569,14 @@ impl OverviewReader {
 /// [`OverviewReader::open`] (footer, `geo:overviews` parse and `validate`,
 /// batch-size cap), then for every level its band, a zoom and gsd lookup, a
 /// bbox-pruned selection, the column-statistic queries, and a full read of
-/// the band; then [`super::check::validate_file`]. The file goes through a
+/// the level ([`OverviewReader::read_level`], the export's read engine);
+/// then [`super::check::validate_file`]. The file goes through a
 /// temp file because both readers open a path. Returns the rows read. Only
 /// the `fuzz/` crate calls this; the `fuzzing` feature is never on in a
 /// normal build.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
-pub fn fuzz_overview_file(bytes: &[u8]) -> Result<usize, ReaderError> {
+pub fn fuzz_overview_file(bytes: &[u8]) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     use std::io::Write as _;
     let mut file = tempfile::NamedTempFile::new()?;
     file.write_all(bytes)?;
@@ -671,8 +595,8 @@ pub fn fuzz_overview_file(bytes: &[u8]) -> Result<usize, ReaderError> {
         let _ = reader.level_for_gsd(reader.meta().levels[k].gsd);
         let _ = reader.row_groups_for_level(k)?;
         let _ = reader.selected_row_groups(k, Some([-180.0, -90.0, 180.0, 90.0]))?;
-        for batch in reader.read_band_batched(k, 256)? {
-            rows += batch.map_err(tylertoo_io::ParquetError::from)?.num_rows();
+        for batch in reader.read_level(k, None)? {
+            rows += batch?.num_rows();
         }
     }
     Ok(rows)
@@ -781,7 +705,7 @@ mod tests {
     }
 
     /// Read the `id` column across a level reader.
-    fn read_ids(reader: tylertoo_io::UntrustedBatchReader) -> Vec<i64> {
+    fn read_ids(reader: impl Iterator<Item = Result<RecordBatch, InputError>>) -> Vec<i64> {
         let mut out = Vec::new();
         for batch in reader {
             let batch = batch.unwrap();
