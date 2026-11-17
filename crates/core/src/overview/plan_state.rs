@@ -2525,6 +2525,7 @@ mod tests {
                 geom_bytes: 4096,
                 diagnostics: vec![
                     crate::diagnostics::Diagnostic::AntimeridianSuspect { count: 1 },
+                    crate::diagnostics::Diagnostic::SharedBordersUnpinned { count: 1 },
                     crate::diagnostics::Diagnostic::Unprojectable {
                         context: None,
                         count: 2,

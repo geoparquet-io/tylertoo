@@ -88,7 +88,8 @@ use crate::resolved_schema::ResolvedSchema;
 struct ScanCollection {
     collect_lines: LineCollect,
     want_areas: bool,
-    /// #802: collect polygon vertex occurrences for the junction pins.
+    /// #802: collect polygon vertex occurrences for the junction pins (only
+    /// when polygons simplify: duplicating mode, `--simplify-factor` > 0).
     junctions: bool,
 }
 
@@ -114,8 +115,8 @@ struct Pass1Accum<'a> {
     lines: &'a mut LineScratch,
     point_count: &'a mut usize,
     skipped_rows: &'a mut usize,
-    /// #802: polygon vertex occurrences for the junction pins.
-    junctions: &'a mut Vec<Occurrence>,
+    /// #802: each chunk's polygon vertex occurrences, for the junction pins.
+    junctions: &'a mut Vec<Vec<Occurrence>>,
 }
 
 struct WriterProvenance<'a> {
@@ -6302,7 +6303,7 @@ fn merge_pass1_chunks(
         // Empty unless the #384 accumulator is on, so no `want_areas` gate is
         // needed here — an empty `extend` is a no-op.
         areas.extend(chunk.areas);
-        junctions.extend(chunk.junctions);
+        junctions.push(chunk.junctions);
         let feat_offset = features.len();
         lines.absorb(
             chunk.lines,
@@ -6317,24 +6318,39 @@ fn merge_pass1_chunks(
     Ok(kept_row)
 }
 
-/// #802: whether the junction occurrences, which live until the scan ends,
-/// still fit the budget beside the feature table. Past it they are dropped
-/// with a warning and the run simplifies without pins.
-fn junctions_fit(ctx: &Pass1Ctx<'_>, features: u64, junctions: &mut Vec<Occurrence>) -> bool {
-    let bytes = (junctions.capacity() * size_of::<Occurrence>()) as u64;
+/// #802: append a batch's junction occurrences, which live until the scan
+/// ends, if the grown buffer still fits the budget beside the feature table.
+/// Past it they are dropped and the run simplifies without pins.
+fn absorb_junctions(
+    ctx: &Pass1Ctx<'_>,
+    features: &FeatureTable,
+    acc: &mut Vec<Occurrence>,
+    batch: &mut Vec<Vec<Occurrence>>,
+) -> bool {
+    let need = acc.len() + batch.iter().map(Vec::len).sum::<usize>();
+    if need == 0 {
+        batch.clear();
+        return true; // nothing collected: collection is off, or no polygons yet
+    }
+    // Priced before growing, at the capacity amortized growth would allocate.
+    let cap = if need > acc.capacity() {
+        need.max(2 * acc.capacity())
+    } else {
+        acc.capacity()
+    };
+    let bytes = (cap * size_of::<Occurrence>()) as u64;
     if ctx
         .budget
-        .require(MemoryPhase::Scan, features + bytes)
+        .require(MemoryPhase::Scan, features.allocated_bytes() + bytes)
         .is_ok()
     {
+        acc.reserve_exact(cap - acc.len());
+        batch.drain(..).for_each(|chunk| acc.extend(chunk));
         return true;
     }
-    ctx.diagnostics.warn(format!(
-        "shared-border pins dropped: {} polygon vertices outgrew the memory budget; \
-         neighbouring polygons simplify independently (#802)",
-        junctions.len()
-    ));
-    *junctions = Vec::new();
+    ctx.diagnostics
+        .record(crate::diagnostics::Diagnostic::SharedBordersUnpinned { count: 1 });
+    *acc = Vec::new();
     false
 }
 
@@ -6447,7 +6463,8 @@ fn run_pass1_with_chunk_rows(
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
     let want_areas = accumulator_requested(options);
     let mut areas: Vec<f32> = Vec::new();
-    let (mut junctions, mut collect_junctions) = (Vec::<Occurrence>::new(), true);
+    let mut collect_junctions = options.simplify.factor > 0.0 && options.mode == Mode::Duplicating;
+    let (mut occ, mut chunk_occ) = (Vec::new(), Vec::new());
     let mut num_rows = 0usize;
     let mut skipped_rows = 0usize;
     let mut point_count = 0usize;
@@ -6561,7 +6578,7 @@ fn run_pass1_with_chunk_rows(
                         lines: &mut lines,
                         point_count: &mut point_count,
                         skipped_rows: &mut skipped_rows,
-                        junctions: &mut junctions,
+                        junctions: &mut chunk_occ,
                     },
                 )?;
                 if collect_lines == LineCollect::Collect && lines.mode != LineCollect::Collect {
@@ -6572,8 +6589,7 @@ fn run_pass1_with_chunk_rows(
                     );
                 }
                 num_rows += n;
-                collect_junctions = collect_junctions
-                    && junctions_fit(ctx, features.allocated_bytes(), &mut junctions);
+                collect_junctions &= absorb_junctions(ctx, &features, &mut occ, &mut chunk_occ);
 
                 let t_keys = Instant::now();
                 extract_pass1_batch_keys(
@@ -6641,7 +6657,7 @@ fn run_pass1_with_chunk_rows(
     // in `line_tally`, so the guard still logs the exact totals downstream.
     let line_tally = (lines.lines, lines.bytes);
     let coalesce = lines.finish(&features, all_groups);
-    let junctions = JunctionNodes::from_occurrences(junctions);
+    let junctions = JunctionNodes::from_occurrences(occ);
     Pass1Timers::add(&pass1_timers.assemble, t_assemble);
 
     pass1_timers.log_pass1_summary(t_pass1_fn.elapsed().as_secs_f64(), num_rows);
@@ -8272,6 +8288,57 @@ mod tests {
         let diagnostics = crate::diagnostics::Diagnostics::default();
         let pre = preflight(&source, options, &diagnostics, None).unwrap();
         scan_fixture(&source, &pre, chunk_rows, &diagnostics).unwrap()
+    }
+
+    /// Two unit squares sharing the edge x = 1 (#802).
+    fn two_squares(path: &Path) {
+        use geo::polygon;
+        let a = polygon![(x: 0., y: 0.), (x: 1., y: 0.), (x: 1., y: 1.), (x: 0., y: 1.)];
+        let b = polygon![(x: 1., y: 0.), (x: 2., y: 0.), (x: 2., y: 1.), (x: 1., y: 1.)];
+        let geoms = [Some(Geometry::Polygon(a)), Some(Geometry::Polygon(b))];
+        write_input_with_f64(path, &geoms, "rank", &[1.0, 2.0]);
+    }
+
+    /// #802: pass 1 collects the junction pins only when polygons simplify.
+    #[test]
+    fn pass1_collects_junctions_only_when_polygons_simplify() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        two_squares(file.path());
+        let pins = |options: ConvertOptions| {
+            run_pass1_for_test(file.path(), &options, 1)
+                .junctions
+                .keys()
+                .len()
+        };
+        assert!(pins(ConvertOptions::default()) > 0);
+        let partitioning = ConvertOptions {
+            mode: Mode::Partitioning,
+            ..Default::default()
+        };
+        assert_eq!(pins(partitioning), 0);
+        let mut unsimplified = ConvertOptions::default();
+        unsimplified.simplify.factor = 0.0;
+        assert_eq!(pins(unsimplified), 0);
+    }
+
+    /// #802: past the scan budget the pins are dropped with a typed warning,
+    /// and the scan itself goes on.
+    #[test]
+    fn junction_pins_fall_back_under_a_tiny_budget() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        two_squares(file.path());
+        let source = ConvertSource::resolve_path(file.path()).unwrap();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let mut pre = preflight(&source, &ConvertOptions::default(), &diagnostics, None).unwrap();
+        let roomy = scan_fixture(&source, &pre, 1, &diagnostics).unwrap();
+        // Room for the feature table, not for one batch of occurrences.
+        pre.budget = MemoryBudget::with_available(Some(roomy.features.allocated_bytes()));
+        let scan = scan_fixture(&source, &pre, 1, &diagnostics).unwrap();
+        assert_eq!(scan.features.len(), 2);
+        assert!(scan.junctions.keys().is_empty());
+        let unpinned = crate::diagnostics::Diagnostic::SharedBordersUnpinned { count: 1 };
+        assert_eq!(diagnostics.count(&unpinned), 1);
+        assert!(diagnostics.snapshot_for_plan().contains(&unpinned));
     }
 
     #[test]
