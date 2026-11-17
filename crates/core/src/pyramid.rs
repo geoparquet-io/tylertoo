@@ -3034,22 +3034,6 @@ fn gzip_raw_len(data: &[u8]) -> usize {
         .map_or(0, |bytes| u32::from_le_bytes(*bytes) as usize)
 }
 
-fn decompress_band_tile(
-    data: &[u8],
-    coord: crate::tile::TileCoord,
-    band: &Band,
-) -> Result<Vec<u8>, PyramidError> {
-    compression::decompress_capped(data, Compression::Gzip, MAX_TILE_BYTES).map_err(|error| {
-        PyramidError::TileDecompress {
-            z: coord.z,
-            x: coord.x,
-            y: coord.y,
-            layer: band.layer.clone(),
-            error,
-        }
-    })
-}
-
 /// ISIZE sets the writer's raw length only for in-run exports; archive copies
 /// use stored bytes, and ISIZE only for the raw-cap warning, which a crafted
 /// or multi-member trailer can hide or fake.
@@ -3082,24 +3066,6 @@ fn append_band_copy(
     append_compressed_tile(writer, coord, data, raw_len)
 }
 
-/// Concatenate only the current id's band tiles, keeping the merge streaming.
-fn join_band_tiles(
-    bands: &[Band],
-    archives: &[BandArchive],
-    cache: &mut [Option<(std::ops::Range<usize>, Vec<u8>)>],
-    refs: &[(usize, std::ops::Range<usize>)],
-    coord: crate::tile::TileCoord,
-    joined: &mut Vec<u8>,
-) -> Result<(), PyramidError> {
-    joined.clear();
-    for (bi, range) in refs {
-        let data = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
-        let plain = decompress_band_tile(&data, coord, &bands[*bi])?;
-        joined.extend_from_slice(&plain);
-    }
-    Ok(())
-}
-
 /// Screen with gzip trailers: a join whose summed raw size cannot deflate
 /// past a cap is skipped. Only candidates are joined and measured exactly.
 /// Retain over-cap ids; the merge fits one wave at a time.
@@ -3107,6 +3073,7 @@ fn screen_joined_tiles(
     bands: &[Band],
     archives: &[BandArchive],
     joint: Option<(&ExportOptions, &[Vec<JointSource>])>,
+    profile: MemoryProfile,
 ) -> Result<BTreeMap<u8, BTreeSet<u64>>, PyramidError> {
     let Some((export, sources)) = joint else {
         return Ok(BTreeMap::new());
@@ -3117,64 +3084,105 @@ fn screen_joined_tiles(
     let mut pending: BTreeMap<u8, BTreeSet<u64>> = BTreeMap::new();
     let mut cache = vec![None; bands.len()];
     let mut refs = Vec::with_capacity(bands.len());
-    let mut raw = Vec::new();
+    // Candidates are joined and measured in bounded parallel runs, like the
+    // merge's combine (#902): serial under bounded.
+    let (mut run, mut run_bytes, mut pool) = (Vec::<MergeTileGroup>::new(), 0, None);
+    let mut measure = |run: &mut Vec<MergeTileGroup>,
+                       pending: &mut BTreeMap<u8, BTreeSet<u64>>|
+     -> Result<(), PyramidError> {
+        prepare_combine_pool(&mut pool, profile, run)?;
+        let over = |tile: &MergeTileGroup| {
+            let mut raw = Vec::new();
+            let (raw_parts, refs, coord) = (&tile.raw, &tile.refs, tile.coord);
+            let gzip = combine_joined_tile(raw_parts, refs, coord, bands, true, &mut raw)
+                .or_else(|_| combine_joined_tile(raw_parts, refs, coord, bands, false, &mut raw))?;
+            Ok::<_, PyramidError>(joined_over_limit(raw.len(), gzip.len(), export))
+        };
+        // Collected in id order, so the first error is the lowest id's.
+        let results: Vec<_> = match &pool {
+            Some(pool) => pool.install(|| run.par_iter().map(over).collect()),
+            None => run.iter().map(over).collect(),
+        };
+        for (tile, over) in run.drain(..).zip(results) {
+            if over? {
+                pending.entry(tile.coord.z).or_default().insert(tile.id);
+            }
+        }
+        Ok(())
+    };
     let mut merged =
         MergedTiles::new(archives.iter().map(|a| a.index.tiles()).collect()).peekable();
-    while let Some((bi, tile)) = merged.next() {
-        let tile = tile.map_err(|e| in_band(&bands[bi].input, e))?;
-        let coord = crate::tile::TileCoord::new(tile.x, tile.y, tile.z);
-        let id = tile.id;
-        refs.clear();
-        let mut next = Some((bi, tile.range));
-        while let Some((bi, range)) = next.take() {
-            if bands[bi].min_zoom <= coord.z && coord.z <= bands[bi].max_zoom {
-                refs.push((bi, range));
+    let gathered = (|| -> Result<(), PyramidError> {
+        while let Some((bi, tile)) = merged.next() {
+            let tile = tile.map_err(|e| in_band(&bands[bi].input, e))?;
+            let coord = crate::tile::TileCoord::new(tile.x, tile.y, tile.z);
+            let id = tile.id;
+            refs.clear();
+            let mut next = Some((bi, tile.range));
+            while let Some((bi, range)) = next.take() {
+                if bands[bi].min_zoom <= coord.z && coord.z <= bands[bi].max_zoom {
+                    refs.push((bi, range));
+                }
+                if let Some((bi, Ok(t))) = merged.next_if(|(_, t)| matches!(t, Ok(t) if t.id == id))
+                {
+                    next = Some((bi, t.range));
+                }
             }
-            if let Some((bi, Ok(t))) = merged.next_if(|(_, t)| matches!(t, Ok(t) if t.id == id)) {
-                next = Some((bi, t.range));
+            if refs.len() < 2 || !has_joint_sources(&refs, coord.z, sources) {
+                continue;
+            }
+            // These plans cannot be reconstructed by the retry. Keep the source
+            // valve's result, with the existing warning if it still exceeds a cap.
+            if refs.iter().any(|(bi, _)| {
+                sources[*bi].iter().any(|s| {
+                    s.min_zoom <= coord.z
+                        && coord.z <= s.max_zoom
+                        && (s.options.coverage_fill || s.options.variable_depth)
+                })
+            }) {
+                continue;
+            }
+            // has_joint_sources above excludes archive inputs: only our own
+            // single-member exports can be screened with ISIZE.
+            let raw_len = refs.iter().try_fold(0, |sum, (bi, r)| {
+                let trailer = archives[*bi]
+                    .index
+                    .read_range(r.end.saturating_sub(4).max(r.start)..r.end)?;
+                Ok::<_, PyramidError>(sum + gzip_raw_len(&trailer))
+            })?;
+            // The parts' gzip sizes do not bound the join's: one deflate block
+            // then codes both layers' symbols (+20% in the test below).
+            let gzip_bound = compression::gzip_size_bound(raw_len);
+            if !joined_over_limit(raw_len, gzip_bound, export) {
+                continue;
+            }
+            let raw = refs
+                .iter()
+                .map(|(bi, r)| read_cached(&archives[*bi], &mut cache[*bi], r.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let tile = MergeTileGroup {
+                id,
+                coord,
+                refs: refs.clone(),
+                raw,
+            };
+            let tile_bytes = tile.memory_bound();
+            if !run.is_empty() && run_bytes + tile_bytes > RUN_BYTES {
+                measure(&mut run, &mut pending)?;
+                run_bytes = 0;
+            }
+            run_bytes += tile_bytes;
+            run.push(tile);
+            if run_bytes >= RUN_BYTES || run.len() >= merge_run_groups(profile) {
+                measure(&mut run, &mut pending)?;
+                run_bytes = 0;
             }
         }
-        if refs.len() < 2 || !has_joint_sources(&refs, coord.z, sources) {
-            continue;
-        }
-        // These plans cannot be reconstructed by the retry. Keep the source
-        // valve's result, with the existing warning if it still exceeds a cap.
-        if refs.iter().any(|(bi, _)| {
-            sources[*bi].iter().any(|s| {
-                s.min_zoom <= coord.z
-                    && coord.z <= s.max_zoom
-                    && (s.options.coverage_fill || s.options.variable_depth)
-            })
-        }) {
-            continue;
-        }
-        // has_joint_sources above excludes archive inputs: only our own
-        // single-member exports can be screened with ISIZE.
-        let raw_len = refs.iter().try_fold(0, |sum, (bi, r)| {
-            let trailer = archives[*bi]
-                .index
-                .read_range(r.end.saturating_sub(4).max(r.start)..r.end)?;
-            Ok::<_, PyramidError>(sum + gzip_raw_len(&trailer))
-        })?;
-        // The parts' gzip sizes do not bound the join's: one deflate block
-        // then codes both layers' symbols (+20% in the test below). Stored
-        // deflate does: 5 bytes per 64 KiB block plus the gzip frame.
-        if !joined_over_limit(raw_len, raw_len + raw_len / 1024 + 64, export) {
-            continue;
-        }
-        join_band_tiles(bands, archives, &mut cache, &refs, coord, &mut raw)?;
-        let gzip = compression::compress(&raw, Compression::Gzip).map_err(|error| {
-            PyramidError::TileCompress {
-                z: coord.z,
-                x: coord.x,
-                y: coord.y,
-                error,
-            }
-        })?;
-        if joined_over_limit(raw.len(), gzip.len(), export) {
-            pending.entry(coord.z).or_default().insert(id);
-        }
-    }
+        Ok(())
+    })();
+    // An earlier queued decode failure must precede a later directory/read failure.
+    measure(&mut run, &mut pending)?;
+    gathered?;
     Ok(pending)
 }
 
@@ -3197,8 +3205,9 @@ impl<'a> JoinedTileRetry<'a> {
         bands: &[Band],
         archives: &[BandArchive],
         joint: Option<(&'a ExportOptions, &'a [Vec<JointSource>])>,
+        profile: MemoryProfile,
     ) -> Result<Self, PyramidError> {
-        let pending = screen_joined_tiles(bands, archives, joint)?;
+        let pending = screen_joined_tiles(bands, archives, joint, profile)?;
         let fitter = if let Some((_, sources)) = joint.filter(|_| !pending.is_empty()) {
             let inputs = sources.iter().flatten().filter(|s| {
                 !s.options.coverage_fill
@@ -3573,7 +3582,7 @@ fn merge_prepared_bands(
             tile_type,
             joint,
             shared_zooms: &shared_zooms,
-            retry: JoinedTileRetry::new(bands, &archives, joint)?,
+            retry: JoinedTileRetry::new(bands, &archives, joint, options.profile)?,
             diagnostics,
             buf: Vec::new(),
         };
@@ -6162,7 +6171,13 @@ mod tests {
                     .unwrap()
                 })
                 .collect::<Vec<_>>();
-            let retry = JoinedTileRetry::new(&bands, &archives, Some((&export, &sources))).unwrap();
+            let retry = JoinedTileRetry::new(
+                &bands,
+                &archives,
+                Some((&export, &sources)),
+                MemoryProfile::Bounded,
+            )
+            .unwrap();
             assert!(retry.pending.is_empty());
             assert!(retry.fitter.is_none());
             let output = dir.path().join(format!("skip-{coverage_fill}.pmtiles"));
@@ -6510,11 +6525,13 @@ mod tests {
     #[test]
     fn joined_retry_skips_combining_a_replaced_tile() {
         let (dir, _) = emptied_join(None);
-        let combined = COMBINED_INPUTS.lock().unwrap();
-        assert!(
-            !combined.iter().any(|input| input.starts_with(dir.path())),
-            "the refitted join is not combined only to be thrown away"
-        );
+        let combined = COMBINED_INPUTS.lock().unwrap().clone();
+        // Two bands, joined once by the screen to measure it; the merge does
+        // not combine it again only to throw it away.
+        let ours = combined
+            .iter()
+            .filter(|input| input.starts_with(dir.path()));
+        assert_eq!(ours.count(), 2);
     }
 
     #[test]
