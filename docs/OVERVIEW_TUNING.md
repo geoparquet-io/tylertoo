@@ -1661,8 +1661,9 @@ fits. `--size-valve` chooses how:
   passes, which happens when the merged features do not touch, merges
   everything it can in one step instead.
   If the tile still exceeds the cap after all possible merges, the valve
-  drops unmerged features, smallest first. It can drop all of them when the
-  tile holds merged features; otherwise the largest stays. If still over, it
+  drops unmerged features, fewest vertices first (points are thinned
+  evenly). It can drop all of them when the tile holds merged features;
+  otherwise the largest stays. If still over, it
   halves the tile extent down to 512. A tile of points skips this step. The
   encoder cleans the same geometry at each grid. These tiles shed their
   fill. If the tile still exceeds the cap,
