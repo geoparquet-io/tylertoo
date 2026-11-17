@@ -36,9 +36,7 @@ use crate::batch_processor::{
 };
 use crate::input_set::{ConvertSource, RowGroupSelection};
 
-use super::accumulate::{
-    is_carrier, level_accumulates, tiny_polygon_carriers_with_levels, AccumulateLevel,
-};
+use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
@@ -1259,13 +1257,13 @@ fn polygon_area_f32(g: &Geometry<f64>) -> f32 {
 
 /// Run the tiny-polygon accumulator (#384) for the streaming path: per
 /// planned level, the sorted row indices of its carriers; empty per level
-/// unless the accumulator applies there. Read pre-budget cell-winner levels:
-/// only gate/thinning losers contribute, never polygons deferred by the rate.
-/// Consumes the area scratch so it is freed before the density budget.
+/// unless the accumulator applies there. `cell_winner_levels` are the levels
+/// before the density budget: only gate/thinning losers contribute, never
+/// polygons the rate dropped (#875).
 fn build_carriers(
     options: &ConvertOptions,
     features: &FeatureTable,
-    cell_winner_level: impl Fn(usize) -> u8 + Sync,
+    cell_winner_levels: &[u8],
     areas: Vec<f32>,
     level_specs: &[(f64, Option<u8>)],
     level_reprs: &[Representation],
@@ -1289,9 +1287,9 @@ fn build_carriers(
         return vec![Vec::new(); level_specs.len()];
     }
     let t = Instant::now();
-    let carriers = tiny_polygon_carriers_with_levels(
+    let carriers = tiny_polygon_carriers(
         features,
-        cell_winner_level,
+        cell_winner_levels,
         &areas,
         &acc_levels,
         crs,
@@ -2510,20 +2508,14 @@ fn resolve_winner_tables(
         &level_reprs,
     );
     let assign_secs = t_assign.elapsed().as_secs_f64();
-    // #875: build carriers from gate/thinning losers BEFORE the budget.
-    // Budget-only losers must not return as squares or contribute area.
-    let t_carriers = Instant::now();
-    let carriers = build_carriers(
-        options,
-        features,
-        |pos| assignment.assignments[pos].min_level,
-        areas,
-        &level_specs,
-        &level_reprs,
-        crs,
-    );
-    let carrier_secs = t_carriers.elapsed().as_secs_f64();
     let t_budget = Instant::now();
+    // #875: the accumulator reads the levels from before the budget, so a
+    // polygon the rate drops never returns as a square. One byte per feature
+    // instead of keeping the cell-winner table.
+    let cell_winner_levels: Option<Vec<u8>> = options
+        .density
+        .enabled
+        .then(|| assignment.assignments.iter().map(|a| a.min_level).collect());
     if options.density.enabled {
         assignment = apply_density_budget(
             &assignment,
@@ -2535,11 +2527,9 @@ fn resolve_winner_tables(
         );
     }
     log::debug!(
-        "[profile] assignment+carriers+budget: {:.2}s \
-         (assign {:.2}s + carriers {:.2}s + budget {:.2}s)",
+        "[profile] assignment+budget: {:.2}s (assign {:.2}s + budget {:.2}s)",
         t_assign.elapsed().as_secs_f64(),
         assign_secs,
-        carrier_secs,
         t_budget.elapsed().as_secs_f64()
     );
     log::info!(
@@ -2555,6 +2545,20 @@ fn resolve_winner_tables(
     // `features` order) feeds the cluster stage and the per-level counts.
     let feat_min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
     drop(assignment);
+
+    // #384: tiny-polygon accumulator — per level, the carriers that stand in
+    // for the sub-visible polygons the level dropped. Row-indexed like the
+    // winner table; empty per level unless the accumulator applies there.
+    let carriers = build_carriers(
+        options,
+        features,
+        cell_winner_levels.as_deref().unwrap_or(&feat_min_levels),
+        areas,
+        &level_specs,
+        &level_reprs,
+        crs,
+    );
+    drop(cell_winner_levels);
 
     // Cluster tables (Q4): built from the pass-1 features + final winner
     // table, before the O(N) scratch is freed. Memory afterwards is
@@ -10739,7 +10743,7 @@ mod tests {
         build_carriers(
             &options,
             &table(&feats),
-            |pos| min_levels[pos],
+            &min_levels,
             areas,
             &[(1000.0, None), (10.0, None)],
             &[Representation::Geometry, Representation::Geometry],
@@ -10920,7 +10924,7 @@ mod tests {
             let expected = build_carriers(
                 &options,
                 &features,
-                |pos| levels[pos],
+                &levels,
                 areas.clone(),
                 &[(1000.0, None), (10.0, None)],
                 &reprs,

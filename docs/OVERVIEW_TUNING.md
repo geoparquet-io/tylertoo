@@ -858,8 +858,8 @@ floored at one tile unit of the level's zoom (see the divergences below).
 #### Area accumulation and dithering
 
 The accumulator covers polygons removed by the visibility gate or
-thinning. It runs after assignment and before the density budget, so a
-polygon that `--drop-polygons` drops leaves no square (#875). Each covered
+thinning. It reads each polygon's level from before the density budget, so
+a polygon that `--drop-polygons` drops leaves no square (#875). Each covered
 polygon adds its area, clamped to `T`, to its patch's running total in
 input order. A
 patch is a 32 × GSD square, 1/32 of a 1024-px tile. Each time a patch's total

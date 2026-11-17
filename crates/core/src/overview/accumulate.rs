@@ -11,7 +11,7 @@
 //! placeholder area tracks the dropped area: a polygon contributes at most
 //! one placeholder of area, and a patch keeps less than one `T` unemitted.
 //!
-//! We run the accumulator once per level after cell-winner assignment and
+//! We run the accumulator once per level on the cell-winner levels from
 //! before the density budget, over polygons excluded by the visibility gate
 //! or thinning. Polygons deferred only by the budget contribute no area.
 //! Contributions are bucketed into [`ACCUMULATE_CELL_GSD`]-wide patches —
@@ -138,26 +138,12 @@ pub fn tiny_polygon_carriers(
     profile: MemoryProfile,
 ) -> Vec<Vec<usize>> {
     debug_assert_eq!(features.len(), min_levels.len());
-    tiny_polygon_carriers_with_levels(features, |pos| min_levels[pos], areas, levels, crs, profile)
-}
-
-/// Read cell-winner levels directly from the assignment table in pass 1,
-/// without allocating another dataset-sized vector. The slice API above
-/// uses the same accumulator.
-pub(super) fn tiny_polygon_carriers_with_levels(
-    features: &FeatureTable,
-    min_level: impl Fn(usize) -> u8 + Sync,
-    areas: &[f32],
-    levels: &[AccumulateLevel],
-    crs: Crs,
-    profile: MemoryProfile,
-) -> Vec<Vec<usize>> {
     debug_assert_eq!(features.len(), areas.len());
     // Each level reads the shared inputs and writes only its own list, so
     // the levels run concurrently (#817). Each level holds its own
     // occupied-patch map; bounded holds one at a time.
     let run = |(li, level): (usize, &AccumulateLevel)| {
-        level_carriers(features, &min_level, areas, li, level, crs)
+        level_carriers(features, min_levels, areas, li, level, crs)
     };
     let per_level: Vec<(Vec<usize>, Option<f64>)> = if profile == MemoryProfile::Bounded {
         levels.iter().enumerate().map(run).collect()
@@ -181,7 +167,7 @@ pub(super) fn tiny_polygon_carriers_with_levels(
 /// export zoom when the placeholder side is floored there.
 fn level_carriers(
     features: &FeatureTable,
-    min_level: &(impl Fn(usize) -> u8 + Sync),
+    min_levels: &[u8],
     areas: &[f32],
     li: usize,
     level: &AccumulateLevel,
@@ -204,8 +190,7 @@ fn level_carriers(
         return (out, floored_zoom);
     }
     let mut acc: HashMap<(i64, i64), Patch> = HashMap::new();
-    for (pos, &area) in areas.iter().enumerate() {
-        let ml = min_level(pos);
+    for (pos, (&ml, &area)) in min_levels.iter().zip(areas).enumerate() {
         if features.kind(pos) != FeatureKind::Polygon || usize::from(ml) <= li {
             continue; // not a polygon, or already present at this level
         }
