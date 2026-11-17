@@ -126,6 +126,7 @@ use super::{
         human_bytes, resolve_pass_read_workers, skip_memory_preflight_from_env, ConvertError,
         READ_WORKERS_AUTO, SKIP_MEMORY_PREFLIGHT_ENV,
     },
+    junction::{self, JunctionNodes},
     level::{zoom_for_gsd, Crs, MemoryProfile, Mode, OverviewsMeta},
     memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis},
     pipe::scoped_pipe,
@@ -2768,6 +2769,20 @@ fn export_pmtiles_validated(
     // out-of-range tile is never planned, so it is never clipped, encoded,
     // hashed or read for.
     restrict_scans_to_range(&mut scans, &level_zooms, options);
+    let pins = finest_level_pins(
+        (
+            &reader,
+            BandRead {
+                source: reader.source(),
+                budget: *budget,
+                profile: options.profile,
+            },
+        ),
+        crs,
+        options,
+        budget,
+        diagnostics,
+    )?;
     // #803: rule A′'s blocked tiles, once every band is counted.
     let vd_plan = vd_scan.map(|vd| vd.finish(&scans, options));
 
@@ -2915,6 +2930,7 @@ fn export_pmtiles_validated(
                 published: &published,
                 feature_id: feature_id.as_ref(),
                 timers: &progress.profile.timers,
+                pins: pins.as_ref(),
             },
             StoreBacking {
                 backing,
@@ -2999,6 +3015,7 @@ fn export_pmtiles_validated(
         terminals: &[],
         level_read,
         member_bytes,
+        pins: pins.as_ref(),
         #[cfg(test)]
         work: &work,
     };
@@ -3055,6 +3072,7 @@ fn export_pmtiles_validated(
                         options,
                         budget: &partition_budget,
                         timers: &probe_timers,
+                        pins: pins.as_ref(),
                     },
                     planned: (&levels, level_groups, gate),
                     rest,
@@ -3665,6 +3683,8 @@ struct ExportLevelCtx<'a> {
     /// Resident bytes of one member, the price a level group's cap is sized
     /// at ([`queued_members`]), when known.
     member_bytes: Option<u64>,
+    /// #802: the finest level's junction pins ([`finest_level_pins`]).
+    pins: Option<&'a JunctionNodes>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -3689,6 +3709,7 @@ impl<'a> ExportLevelCtx<'a> {
                 .options
                 .variable_depth
                 .then_some(&self.scan.tile_counts),
+            pins: self.pins,
             #[cfg(test)]
             work: self.work,
         }
@@ -5141,6 +5162,8 @@ struct LevelCtx<'a> {
     /// a stopped tile, whose members must not be drawn again. `None` draws
     /// every tile in the range, which then holds only planned tiles.
     tiles: Option<&'a BTreeMap<u64, usize>>,
+    /// #802: the finest level's junction pins ([`finest_level_pins`]).
+    pins: Option<&'a JunctionNodes>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -5163,6 +5186,8 @@ struct FanoutCtx<'a> {
     feature_id: Option<&'a ResolvedFeatureId>,
     /// Profiling stage timers (#535); diagnostics only.
     timers: &'a ExportTimers,
+    /// #802: the finest level's junction pins ([`finest_level_pins`]).
+    pins: Option<&'a JunctionNodes>,
 }
 
 /// One level's precomputed pass-2 plan: its Web Mercator zoom, its planned
@@ -6157,7 +6182,7 @@ fn fanout_batch_members(
     let mut routed = t_route.elapsed();
     for &k in &targets {
         let plan = &plans[k];
-        let finest = (k + 1 == plans.len()).then_some(plan.zoom);
+        let finest = (k + 1 == plans.len()).then_some((plan.zoom, ctx.pins));
         let clipped: RowMembers = geoms
             .par_iter()
             .map(|g| {
@@ -7641,6 +7666,61 @@ fn decode_geometry_chunk(
         .collect())
 }
 
+/// The finest level's zoom and junction pins (#802), at which
+/// [`finest_zoom_geometry`] thins; `None` at every other level.
+type Finest<'p> = Option<(u8, Option<&'p JunctionNodes>)>;
+
+/// #802: the junction pins of the finest level's polygons, which
+/// [`finest_zoom_geometry`] keeps so that neighbours thin a shared border
+/// alike. Convert's pins key the source's coordinates, which export may see
+/// reprojected, so they are rebuilt here from the level itself. `None`
+/// unless max-zoom simplification thins polygons, or when the pins outgrow
+/// the budget (which records [`Diagnostic::SharedBordersUnpinned`]); the
+/// pins are then charged to the budget.
+///
+/// [`Diagnostic::SharedBordersUnpinned`]: crate::diagnostics::Diagnostic::SharedBordersUnpinned
+fn finest_level_pins(
+    (reader, band): (&OverviewReader, BandRead<'_>),
+    crs: Crs,
+    opts: &ExportOptions,
+    budget: &mut MemoryBudget,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<Option<JunctionNodes>, ExportError> {
+    let (Some(geometry), true) = (
+        reader.resolved_schema().geometry_index(),
+        opts.max_zoom_simplify_factor.is_some_and(|f| f > 0.0),
+    ) else {
+        return Ok(None);
+    };
+    let selected = reader.row_groups_for_level(reader.num_levels() - 1)?;
+    let timers = ExportTimers::default();
+    let (mut occ, mut fits) = (Vec::new(), true);
+    read_overview(
+        band,
+        selected,
+        Some(&[geometry]),
+        ReadPass::Scan,
+        BAND_READ_AHEAD_BATCHES,
+        |batch, _| {
+            let geoms =
+                decode_batch_geometries(&batch, &batch.schema(), 0, crs, &timers, diagnostics)?;
+            let mut chunks = junction::occurrences_of(&geoms);
+            let fit = |bytes| budget.require(MemoryPhase::ExportCollect, bytes).is_ok();
+            fits = junction::absorb(&mut occ, &mut chunks, fit, diagnostics);
+            Ok(if fits {
+                ReadFlow::Continue
+            } else {
+                ReadFlow::Stop
+            })
+        },
+    )?;
+    let pins = fits.then(|| JunctionNodes::from_occurrences(occ));
+    if let Some(p) = &pins {
+        budget.reserve_up_to(MemoryPhase::ExportCollect, size_of_val(p.keys()) as u64);
+    }
+    Ok(pins)
+}
+
 /// A feature of the finest level, simplified by
 /// [`ExportOptions::max_zoom_simplify_factor`] (#814): `factor × gsd(z)` at
 /// that level's zoom `finest_zoom`, the tolerance `--simplify-factor` gives
@@ -7665,7 +7745,7 @@ fn decode_geometry_chunk(
 /// tippecanoe` simplifies both.
 fn finest_zoom_geometry<'g>(
     geom: &'g Geometry<f64>,
-    finest_zoom: Option<u8>,
+    finest: Finest<'_>,
     opts: &ExportOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> std::borrow::Cow<'g, Geometry<f64>> {
@@ -7678,7 +7758,7 @@ fn finest_zoom_geometry<'g>(
         None if line => DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR,
         None => 0.0,
     };
-    let Some(zoom) = finest_zoom.filter(|_| factor > 0.0) else {
+    let Some((zoom, pins)) = finest.filter(|_| factor > 0.0) else {
         return std::borrow::Cow::Borrowed(geom);
     };
     // Export geometry is lon/lat whatever the file's CRS (`decode_geometry_chunk`).
@@ -7687,7 +7767,7 @@ fn finest_zoom_geometry<'g>(
     // ring under the tolerance keeps its own geometry, as a whole feature
     // does, since at the finest level it can still span tile units.
     let line = |ls| simplify_line_vertices_only(ls, tol);
-    let polygon = |p| simplify_polygon_vertices_only(p, tol, diagnostics);
+    let polygon = |p| simplify_polygon_vertices_only(p, tol, pins, diagnostics);
     let out = match geom {
         Geometry::LineString(ls) => Geometry::LineString(line(ls)),
         Geometry::MultiLineString(m) => {
@@ -7758,7 +7838,7 @@ fn clip_group(
     // The canonical level's own zoom, not `ctx.zoom`: a variable-depth probe
     // clips canonical geometry at an ancestor's zoom (#803).
     let finest_zoom = (ctx.level_idx + 1 == ctx.reader.num_levels())
-        .then(|| zoom_for_level(ctx.reader.meta(), ctx.level_idx))
+        .then(|| zoom_for_level(ctx.reader.meta(), ctx.level_idx).map(|z| (z, ctx.pins)))
         .transpose()?;
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
     // range. #535: `clip` is timed per geometry inside the closure.
@@ -8166,7 +8246,7 @@ enum MemberSource<'a> {
 /// no coordinate heap, so its tiles hold it inline.
 fn shared_tile_members(
     source: MemberSource<'_>,
-    finest: Option<u8>,
+    finest: Finest<'_>,
     zoom: u8,
     opts: &ExportOptions,
     (key_lo, key_hi): (u64, u64),
@@ -19987,13 +20067,13 @@ mod tests {
             assert_eq!(out.interiors(), std::slice::from_ref(&hole));
         };
         let single = Geometry::Polygon(poly.clone());
-        let out = finest_zoom_geometry(&single, Some(14), &explicit, &diagnostics);
+        let out = finest_zoom_geometry(&single, Some((14, None)), &explicit, &diagnostics);
         let Geometry::Polygon(p) = out.as_ref() else {
             panic!("{out:?}")
         };
         check(p);
         let multi = Geometry::MultiPolygon(MultiPolygon::new(vec![poly.clone()]));
-        let out = finest_zoom_geometry(&multi, Some(14), &explicit, &diagnostics);
+        let out = finest_zoom_geometry(&multi, Some((14, None)), &explicit, &diagnostics);
         let Geometry::MultiPolygon(m) = out.as_ref() else {
             panic!("{out:?}")
         };
@@ -20035,7 +20115,12 @@ mod tests {
             tiny.clone(),
         ]));
         let diagnostics = crate::diagnostics::Diagnostics::default();
-        let out = finest_zoom_geometry(&lines, Some(14), &ExportOptions::default(), &diagnostics);
+        let out = finest_zoom_geometry(
+            &lines,
+            Some((14, None)),
+            &ExportOptions::default(),
+            &diagnostics,
+        );
         let Geometry::MultiLineString(m) = out.as_ref() else {
             panic!("{out:?}")
         };
@@ -20049,7 +20134,7 @@ mod tests {
             max_zoom_simplify_factor: Some(0.25),
             ..Default::default()
         };
-        let out = finest_zoom_geometry(&polys, Some(14), &explicit, &diagnostics);
+        let out = finest_zoom_geometry(&polys, Some((14, None)), &explicit, &diagnostics);
         let Geometry::MultiPolygon(m) = out.as_ref() else {
             panic!("{out:?}")
         };
@@ -20078,7 +20163,7 @@ mod tests {
         let poly = Geometry::Polygon(geo::Polygon::new(LineString::from(ring), vec![]));
         let diagnostics = crate::diagnostics::Diagnostics::default();
         let kept = |g: &Geometry<f64>, opts: &ExportOptions| {
-            let out = finest_zoom_geometry(g, Some(14), opts, &diagnostics);
+            let out = finest_zoom_geometry(g, Some((14, None)), opts, &diagnostics);
             out.coords_count() == g.coords_count()
         };
         let with = |f| ExportOptions {
@@ -20088,8 +20173,13 @@ mod tests {
         assert!(!kept(&line, &ExportOptions::default()), "default line");
         assert!(kept(&poly, &ExportOptions::default()), "default polygon");
         assert_eq!(
-            finest_zoom_geometry(&line, Some(14), &ExportOptions::default(), &diagnostics),
-            finest_zoom_geometry(&line, Some(14), &with(Some(0.25)), &diagnostics),
+            finest_zoom_geometry(
+                &line,
+                Some((14, None)),
+                &ExportOptions::default(),
+                &diagnostics
+            ),
+            finest_zoom_geometry(&line, Some((14, None)), &with(Some(0.25)), &diagnostics),
             "the default line factor is 0.25"
         );
         assert!(!kept(&line, &with(Some(0.25))) && !kept(&poly, &with(Some(0.25))));
@@ -21223,6 +21313,7 @@ mod tests {
                 published: &PublishedNames::from_reader(&reader),
                 feature_id: None,
                 timers: &ExportTimers::default(),
+                pins: None,
             },
             StoreBacking {
                 backing: SinkBacking::Ram,

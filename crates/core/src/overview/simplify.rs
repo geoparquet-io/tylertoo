@@ -1690,16 +1690,18 @@ pub(crate) fn simplify_line_vertices_only(ls: &LineString<f64>, tol: f64) -> Lin
 /// still invalid after the epsilon retries (a ring crossing, a hole the
 /// simplified shell no longer holds) keeps the original polygon, where the
 /// cascade would repair it and could drop a lobe. Coarser levels keep
-/// [`simplify_for_level`]'s rules.
+/// [`simplify_for_level`]'s rules. Under `pins` (#802) the rings are cut at
+/// them and the first candidate is kept, as in the cascade.
 pub(crate) fn simplify_polygon_vertices_only(
     poly: &Polygon<f64>,
     tol: f64,
+    pins: Option<&JunctionNodes>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Polygon<f64> {
     let min_area = tol * tol;
     let mut eps = tol;
     for _ in 0..=INVALID_RETRY_HALVINGS {
-        let simplified = rdp_polygon(poly, eps, None);
+        let simplified = rdp_polygon(poly, eps, pins);
         let exterior = if simplified.exterior().0.len() < MIN_POLYGON_RING_POINTS
             || Polygon::new(simplified.exterior().clone(), vec![]).unsigned_area() < min_area
         {
@@ -1720,7 +1722,10 @@ pub(crate) fn simplify_polygon_vertices_only(
             })
             .collect();
         let candidate = Polygon::new(exterior, interiors);
-        if polygon_unchanged(&candidate, poly) || capped_is_valid(&candidate, diagnostics) {
+        if polygon_unchanged(&candidate, poly)
+            || pins.is_some()
+            || capped_is_valid(&candidate, diagnostics)
+        {
             return candidate;
         }
         diagnostics.record(crate::diagnostics::Diagnostic::InvalidAfterSimplify { count: 1 });
@@ -1934,7 +1939,7 @@ mod tests {
         ]);
         let poly = Polygon::new(LineString::from(shell), vec![hole.clone()]);
         assert!(poly.is_valid());
-        let out = simplify_polygon_vertices_only(&poly, 1.0, &diagnostics);
+        let out = simplify_polygon_vertices_only(&poly, 1.0, None, &diagnostics);
         assert!(out.is_valid(), "{out:?}");
         assert_eq!(out.interiors(), std::slice::from_ref(&hole));
         assert!(out.exterior().0.len() < poly.exterior().0.len());
@@ -1957,7 +1962,7 @@ mod tests {
             vec![],
         );
         assert_eq!(
-            simplify_polygon_vertices_only(&tiny, 1.0, &diagnostics),
+            simplify_polygon_vertices_only(&tiny, 1.0, None, &diagnostics),
             tiny
         );
     }

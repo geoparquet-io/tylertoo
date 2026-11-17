@@ -6318,40 +6318,19 @@ fn merge_pass1_chunks(
     Ok(kept_row)
 }
 
-/// #802: append a batch's junction occurrences, which live until the scan
-/// ends, if the grown buffer still fits the budget beside the feature table.
-/// Past it they are dropped and the run simplifies without pins.
+/// #802: [`super::junction::absorb`] beside the feature table, in the
+/// scan's budget.
 fn absorb_junctions(
     ctx: &Pass1Ctx<'_>,
     features: &FeatureTable,
     acc: &mut Vec<Occurrence>,
     batch: &mut Vec<Vec<Occurrence>>,
 ) -> bool {
-    let need = acc.len() + batch.iter().map(Vec::len).sum::<usize>();
-    if need == 0 {
-        batch.clear();
-        return true; // nothing collected: collection is off, or no polygons yet
-    }
-    // Priced before growing, at the capacity amortized growth would allocate.
-    let cap = if need > acc.capacity() {
-        need.max(2 * acc.capacity())
-    } else {
-        acc.capacity()
+    let fits = |bytes| {
+        let bytes = features.allocated_bytes() + bytes;
+        ctx.budget.require(MemoryPhase::Scan, bytes).is_ok()
     };
-    let bytes = (cap * size_of::<Occurrence>()) as u64;
-    if ctx
-        .budget
-        .require(MemoryPhase::Scan, features.allocated_bytes() + bytes)
-        .is_ok()
-    {
-        acc.reserve_exact(cap - acc.len());
-        batch.drain(..).for_each(|chunk| acc.extend(chunk));
-        return true;
-    }
-    ctx.diagnostics
-        .record(crate::diagnostics::Diagnostic::SharedBordersUnpinned { count: 1 });
-    *acc = Vec::new();
-    false
+    super::junction::absorb(acc, batch, fits, ctx.diagnostics)
 }
 
 /// [`run_pass1`], with the within-batch scan chunk size as an explicit

@@ -1,8 +1,8 @@
 //! Polygons that share a border still share it after simplification (#802).
 //!
-//! Each polygon is simplified on its own today, so the two copies of a
-//! shared border lose different vertices and open gaps and overlaps between
-//! neighbours at coarse zooms. tippecanoe keeps shared borders identical
+//! A polygon simplified on its own would lose different vertices from its
+//! neighbour's copy of a shared border, opening gaps and overlaps between
+//! them at coarse zooms. tippecanoe keeps shared borders identical
 //! (`--detect-shared-borders`, `-pn`). These tests run tiny coverages
 //! through convert and export and check one zoom's tiles with an MVT
 //! decoder of their own: the polygons must not overlap, and their union
@@ -10,8 +10,6 @@
 //!
 //! Every coordinate is an integer tile unit at [`Z`], so the tile grid
 //! itself moves no vertex: anything off is simplification.
-//!
-//! Red until #802 lands; run with `--ignored` to see them fail.
 
 use std::path::Path;
 
@@ -137,6 +135,17 @@ fn tile(
     factor: f64,
     dir: &Path,
 ) -> std::collections::HashMap<(u32, u32), Vec<MultiPolygon<f64>>> {
+    tile_to(polys, factor, 14, &ExportOptions::default(), dir)
+}
+
+/// [`tile`] to `max_zoom`, exported with `export`.
+fn tile_to(
+    polys: &[Polygon<f64>],
+    factor: f64,
+    max_zoom: u8,
+    export: &ExportOptions,
+    dir: &Path,
+) -> std::collections::HashMap<(u32, u32), Vec<MultiPolygon<f64>>> {
     let geoms: Vec<Option<Geometry<f64>>> = polys
         .iter()
         .map(|p| {
@@ -156,11 +165,11 @@ fn tile(
         &overview,
         &options.with_levels(LevelPlan::ZoomRange {
             min_zoom: 0,
-            max_zoom: 14,
+            max_zoom,
         }),
     )
     .expect("convert");
-    export_pmtiles(&overview, &archive, &ExportOptions::default()).expect("export");
+    export_pmtiles(&overview, &archive, export).expect("export");
     let tile_box = Rect::new(pt(0, 0), pt(4096, 4096)).to_polygon();
     raw_tiles(&archive, Z)
         .into_iter()
@@ -252,6 +261,17 @@ fn two_polygons_share_a_jagged_border() {
     let dir = tempfile::tempdir().unwrap();
     let tiles = tile(&[a.clone(), b.clone()], 1.0, dir.path());
     assert_no_slivers("jagged border", &tiles[&TILE], &[a, b], 1000.0);
+}
+
+/// Export's max-zoom simplification (#814) keeps the shared border too: at
+/// the finest zoom it thins each feature on its own, so it needs the pins.
+#[test]
+fn max_zoom_simplification_shares_a_jagged_border() {
+    let (a, b) = jagged_pair();
+    let dir = tempfile::tempdir().unwrap();
+    let export = ExportOptions::default().with_max_zoom_simplify_factor(Some(1.0));
+    let tiles = tile_to(&[a.clone(), b.clone()], 1.0, Z, &export, dir.path());
+    assert_no_slivers("max-zoom jagged border", &tiles[&TILE], &[a, b], 1000.0);
 }
 
 /// The control: without simplification the same input shows no sliver, so

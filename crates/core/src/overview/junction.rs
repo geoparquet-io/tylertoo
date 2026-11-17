@@ -109,6 +109,58 @@ impl JunctionNodes {
     }
 }
 
+/// Append a batch's occurrences (one `Vec` per chunk) to `acc` if `fits`
+/// the bytes `acc` would then hold, priced before it grows. Otherwise drop
+/// them all, record [`Diagnostic::SharedBordersUnpinned`] and return
+/// `false`: the run simplifies without pins rather than run out of memory.
+///
+/// [`Diagnostic::SharedBordersUnpinned`]: crate::diagnostics::Diagnostic::SharedBordersUnpinned
+pub(crate) fn absorb(
+    acc: &mut Vec<Occurrence>,
+    batch: &mut Vec<Vec<Occurrence>>,
+    fits: impl FnOnce(u64) -> bool,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> bool {
+    let need = acc.len() + batch.iter().map(Vec::len).sum::<usize>();
+    if need == 0 {
+        batch.clear();
+        return true;
+    }
+    // The capacity amortized growth would allocate.
+    let cap = if need > acc.capacity() {
+        need.max(2 * acc.capacity())
+    } else {
+        acc.capacity()
+    };
+    if fits((cap * size_of::<Occurrence>()) as u64) {
+        acc.reserve_exact(cap - acc.len());
+        batch.drain(..).for_each(|chunk| acc.extend(chunk));
+        return true;
+    }
+    diagnostics.record(crate::diagnostics::Diagnostic::SharedBordersUnpinned { count: 1 });
+    *acc = Vec::new();
+    batch.clear();
+    false
+}
+
+/// The occurrences of `geoms`' polygons, one sorted, deduplicated `Vec` per
+/// chunk of rows, built in parallel.
+pub(crate) fn occurrences_of(geoms: &[geo::Geometry<f64>]) -> Vec<Vec<Occurrence>> {
+    use rayon::prelude::*;
+    geoms
+        .par_chunks(1024)
+        .map(|chunk| {
+            let (mut buf, mut out) = (Vec::new(), Vec::new());
+            for g in chunk {
+                push_geometry(g, &mut buf, &mut out);
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        })
+        .collect()
+}
+
 /// Append the occurrence records of every polygon ring in `g`. `buf` is
 /// scratch reused across rings.
 pub(crate) fn push_geometry<G: GeometryTrait<T = f64>>(
