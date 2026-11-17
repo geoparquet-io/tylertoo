@@ -1721,12 +1721,16 @@ pub(crate) fn simplify_polygon_vertices_only(
     pins: Option<&JunctionNodes>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Polygon<f64> {
-    // One gate for shells and holes, so an island and the hole it fills
-    // (the same ring under pins) keep or thin it alike.
-    let thinned = |ring: &LineString<f64>, original: &LineString<f64>| {
-        if ring.0.len() < MIN_POLYGON_RING_POINTS
-            || Polygon::new(ring.clone(), vec![]).unsigned_area() < tol * tol
-        {
+    // Shells keep their source ring under `tol²` of area. Under pins holes
+    // share that gate, so an island and the hole it fills (the same ring)
+    // keep or thin it alike; without pins a hole keeps main's diagonal gate.
+    let thinned = |ring: &LineString<f64>, original: &LineString<f64>, hole: bool| {
+        let collapsed = if hole && pins.is_none() {
+            linestring_diag(ring) < tol
+        } else {
+            Polygon::new(ring.clone(), vec![]).unsigned_area() < tol * tol
+        };
+        if ring.0.len() < MIN_POLYGON_RING_POINTS || collapsed {
             original.clone()
         } else {
             ring.clone()
@@ -1735,12 +1739,12 @@ pub(crate) fn simplify_polygon_vertices_only(
     let mut eps = tol;
     for _ in 0..=INVALID_RETRY_HALVINGS {
         let simplified = rdp_polygon(poly, eps, pins);
-        let exterior = thinned(simplified.exterior(), poly.exterior());
+        let exterior = thinned(simplified.exterior(), poly.exterior(), false);
         let interiors = simplified
             .interiors()
             .iter()
             .zip(poly.interiors())
-            .map(|(ring, original)| thinned(ring, original))
+            .map(|(ring, original)| thinned(ring, original, true))
             .collect();
         let candidate = Polygon::new(exterior, interiors);
         if polygon_unchanged(&candidate, poly) || capped_is_valid(&candidate, diagnostics) {

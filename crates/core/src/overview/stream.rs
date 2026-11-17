@@ -5909,9 +5909,11 @@ fn scan_chunk(
     )
     .map_err(|e| decode_error_at_rows(diag_row_base, chunk_len, e))?;
     Pass1Timers::add(&timers.decode, t_decode);
-    let t_junctions = Instant::now();
-    super::junction::compact(&mut junctions);
-    Pass1Timers::add(&timers.junctions, t_junctions);
+    if want_junctions {
+        let t_junctions = Instant::now();
+        super::junction::compact(&mut junctions);
+        Pass1Timers::add(&timers.junctions, t_junctions);
+    }
 
     let t_scan = Instant::now();
     // Upper bounds: every chunk row could become a feature (or a line, or an

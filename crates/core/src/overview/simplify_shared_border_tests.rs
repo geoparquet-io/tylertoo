@@ -259,6 +259,38 @@ fn vertices_only_keeps_an_island_and_its_hole_alike() {
     assert_eq!(&donut.interiors()[0], island.exterior());
 }
 
+/// Without pins the sliver hole above is thinned as before #802: a hole
+/// keeps its source ring only when its thinned diagonal is under `tol`, so
+/// default max-zoom output (`--preset tippecanoe`) stays main's.
+#[test]
+fn vertices_only_without_pins_keeps_the_hole_diagonal_gate() {
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    let mut ring: Vec<Coord<f64>> = (0..=40)
+        .map(|i| Coord {
+            x: f64::from(i),
+            y: 0.005 * f64::from(i % 2),
+        })
+        .collect();
+    ring.extend((0..40).rev().map(|i| Coord {
+        x: f64::from(i),
+        y: 0.02 + 0.005 * f64::from(i % 2),
+    }));
+    ring.push(ring[0]);
+    let outer = LineString::from(vec![
+        (-10.0, -10.0),
+        (50.0, -10.0),
+        (50.0, 10.0),
+        (-10.0, 10.0),
+    ]);
+    let hole = LineString::new(ring);
+    let donut = Polygon::new(outer, vec![hole.clone()]);
+    let out = simplify_polygon_vertices_only(&donut, 1.0, None, &diagnostics);
+    assert!(
+        out.interiors()[0].0.len() < hole.0.len(),
+        "the hole is thinned"
+    );
+}
+
 /// Under pins the spike-and-hole fixture of `vertices_only_never_drops_a_ring`
 /// still keeps its hole inside the shell: an invalid candidate falls back,
 /// never reaches export as an orphaned hole.
