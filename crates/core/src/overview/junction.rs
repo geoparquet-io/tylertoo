@@ -158,16 +158,14 @@ fn is_pin(occ: &[Occurrence], i: usize) -> bool {
 pub(crate) fn compact(occ: &mut Vec<Occurrence>) {
     occ.sort_unstable();
     occ.dedup();
-    *occ = occ
-        .chunk_by(|a, b| a.0 == b.0)
-        .map(|run| {
-            if run.len() > 1 {
-                (run[0].0, PIN)
-            } else {
-                run[0]
-            }
-        })
-        .collect();
+    // In place: a later record of a kept vertex marks it a pin.
+    occ.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            kept.1 = PIN;
+        }
+        same
+    });
 }
 
 /// Append a batch's occurrences (one `Vec` per chunk) to `acc` if `fits`
