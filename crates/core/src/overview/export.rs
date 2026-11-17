@@ -278,8 +278,12 @@ pub const DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize = 500 * 1024;
 ///
 /// [`SizeValve::Merge`] follows tippecanoe's `--coalesce-densest-as-needed`:
 /// the densest lines and polygons are merged into the feature kept just
-/// before them, so a polygon coverage keeps drawing its whole area, and the
-/// tile is re-measured until it fits. As in tippecanoe, a merged feature
+/// before them. Merging keeps the coverage's area, and the tile is measured
+/// again. If still over after all merges, the fallback can lose precision
+/// and features. Merged features are never split into their sources. In a
+/// tile of lines or polygons, only a lone feature still over the cap at the
+/// extent floor is written over it, with a warning. As in tippecanoe, a
+/// merged feature
 /// keeps the attributes of the feature it was merged into; the absorbed
 /// features' attributes are not carried. Points are never merged; a tile of
 /// points always takes the stride of [`SizeValve::Drop`]. See
@@ -288,7 +292,11 @@ pub const DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize = 500 * 1024;
 #[non_exhaustive]
 pub enum SizeValve {
     /// Merge the densest lines and polygons, re-measure, and repeat until
-    /// the tile fits (the default).
+    /// the tile fits (the default). If merging exhausts its gaps, drop singles,
+    /// halve the extent to 512, then drop whole features if needed. In a
+    /// tile of lines or polygons, only a lone feature still over the cap at
+    /// that floor is written over it, with a warning. Merged features are
+    /// never split into their sources.
     #[default]
     Merge,
     /// Drop features until the tile fits: the largest sized geometries
@@ -373,7 +381,7 @@ pub struct ExportOptions {
         default_value = "auto",
         value_parser = super::config::cli::parse_size_auto
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap: a backstop behind `--max-compressed-tile-size`. `auto` is 2M, or no cap with `tiles --verbatim` and for `pyramid`. Caps apply to the joined tile. Source layers share one size valve; joins with pre-tiled archive bands drop features at merge. Tiles still over a cap are kept with a warning and counted in the report; see `--size-valve`", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap: a backstop behind `--max-compressed-tile-size`. `auto` is 2M, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile over a cap goes through `--size-valve`. With several layers the caps apply to the joined tile", long_help = None))]
     pub tile_size_limit: Option<usize>,
     /// Per-tile limit on the **gzip-compressed** tile size, in bytes:
     /// tippecanoe's `-M` / `--maximum-tile-bytes` (#745). Checked alongside
@@ -386,7 +394,7 @@ pub struct ExportOptions {
         default_value = "auto",
         value_parser = super::config::cli::parse_size_auto
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the gzip-compressed joined tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap. `auto` is 500K, or no cap with `tiles --verbatim` and for `pyramid`. A tile must fit both caps. Source layers share one size valve; joins with pre-tiled archive bands drop features at merge. Tiles still over a cap are kept with a warning and counted in the report", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap. `auto` is 500K, or no cap with `tiles --verbatim` and for `pyramid` bands. Both caps apply, to the joined tile when there are several layers", long_help = None))]
     pub compressed_tile_size_limit: Option<usize>,
     /// How a tile over a size limit is brought back under it (#745). Default
     /// [`SizeValve::Merge`].
@@ -396,7 +404,7 @@ pub struct ExportOptions {
         value_name = "merge|drop",
         default_value_t = ExportOptions::default().size_valve
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile that exceeds its cap: `merge` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `drop` removes features, leaving holes while preserving each retained feature's attributes. Point tiles use feature dropping in both modes", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile over its cap: `merge` merges dense lines and polygons, drops singles, halves the extent down to 512, then drops whole features if needed. Merges keep the target's attributes and are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `drop` removes features and keeps each survivor's attributes. Point tiles use dropping in both modes", long_help = None))]
     pub size_valve: SizeValve,
     /// Tile encoding, MVT by default. Each finished MVT tile is converted
     /// to MLT with mlt-core before gzip and both size caps, so the caps
@@ -891,6 +899,16 @@ pub struct ZoomReport {
     /// How many of `over_limit_tiles` hold merged features (#873).
     #[serde(skip)]
     over_limit_merged: usize,
+    /// #873 tiles at this zoom that the merge valve re-encoded at a reduced
+    /// extent (halved down to 512) to fit their cap.
+    pub reduced_extent_tiles: usize,
+    /// The smallest extent among those tiles; `None` when there are none.
+    pub min_reduced_extent: Option<u32>,
+    /// #873 merged features the merge valve dropped at the extent floor.
+    pub dropped_merged_features: usize,
+    /// The source features those dropped merged features carried, also
+    /// counted in `valve_dropped_features`.
+    pub dropped_merged_sources: usize,
 }
 
 /// Result of an export, `Serialize` for the `--report` JSON.
@@ -3127,6 +3145,19 @@ impl ExportReport {
         sink.record(Diagnostic::ValveDropped {
             count: self.valve_dropped_features,
         });
+        sink.record(Diagnostic::MergedDropped {
+            count: self.zooms.iter().map(|z| z.dropped_merged_features).sum(),
+            sources: self.zooms.iter().map(|z| z.dropped_merged_sources).sum(),
+        });
+        for z in &self.zooms {
+            if let Some(min_extent) = z.min_reduced_extent {
+                sink.record(Diagnostic::ExtentReduced {
+                    count: z.reduced_extent_tiles,
+                    zoom: z.zoom,
+                    min_extent,
+                });
+            }
+        }
         let mut largest = Vec::new();
         let tiles = self.zooms.iter().flat_map(|z| &z.over_limit_largest);
         crate::stats::keep_largest(&mut largest, tiles.copied());
@@ -4701,6 +4732,8 @@ fn write_tile(
     tally.encode_quantized += t.encode_quantized;
     tally.valve.merged += t.valve.merged;
     tally.valve.dropped += t.valve.dropped;
+    tally.valve.dropped_merged += t.valve.dropped_merged;
+    tally.valve.dropped_merged_sources += t.valve.dropped_merged_sources;
     tally.valve.passes = tally.valve.passes.max(t.valve.passes);
     tally.valve_passes += u64::from(t.valve.passes);
     tally.fill.polygons += t.fill.polygons;
@@ -4708,6 +4741,11 @@ fn write_tile(
     tally.fill.shed += t.fill.shed;
     tally.valve.mingap = tally.valve.mingap.max(t.valve.mingap);
     if t.feature_count > 0 {
+        if let Some(extent) = t.valve.reduced_extent {
+            tally.valve.reduced_tiles += 1;
+            tally.valve.reduced_extent =
+                Some(tally.valve.reduced_extent.map_or(extent, |e| e.min(extent)));
+        }
         // #431: an all-dropped tile is a tally carrier, not a tile.
         tally.tile_feature_count += t.feature_count;
         tally.bytes_written += t.data.len() as u64;
@@ -4723,7 +4761,7 @@ fn write_tile(
                 bytes: t.data.len() as u64,
             };
             crate::stats::keep_largest(&mut tally.over_limit_largest, [tile]);
-            tally.over_limit_merged += usize::from(t.valve.merged > 0);
+            tally.over_limit_merged += usize::from(t.valve.over_limit_merged);
         }
         writer.add_tile_precompressed(
             crate::tile::TileCoord {
@@ -4819,6 +4857,10 @@ fn finish_level(
         stopped_tiles: tally.terminals,
         over_limit_largest: tally.over_limit_largest.clone(),
         over_limit_merged: tally.over_limit_merged,
+        reduced_extent_tiles: tally.valve.reduced_tiles,
+        min_reduced_extent: tally.valve.reduced_extent,
+        dropped_merged_features: tally.valve.dropped_merged,
+        dropped_merged_sources: tally.valve.dropped_merged_sources,
     }
 }
 
@@ -9146,6 +9188,8 @@ fn account_sources(
         SourceLossCause::EncodeDropped
     };
     let surviving: std::collections::BTreeSet<u64> = mvt.source_ids.iter().copied().collect();
+    // The merge valve owns per-source causes, including kept merges on a
+    // tile that also dropped singles. Prefer those to the tile-wide default.
     let losses: std::collections::BTreeMap<u64, _> = mvt.source_losses.iter().copied().collect();
     for member in members {
         if let Some(id) = member.id {
@@ -9364,6 +9408,12 @@ struct ValveTally {
     /// Members dropped: by the drop valve, or by the merge valve's fallback
     /// when merging alone could not make the tile fit.
     dropped: usize,
+    /// Whole merged features dropped, and their source-member count.
+    dropped_merged: usize,
+    dropped_merged_sources: usize,
+    /// Reduced grid of the tile; per-zoom aggregate keeps the minimum.
+    reduced_extent: Option<u32>,
+    reduced_tiles: usize,
     /// Encodes the tile took, the first included: 1 for a tile that fit at
     /// once, under either valve.
     passes: u32,
@@ -9371,6 +9421,8 @@ struct ValveTally {
     mingap: u64,
     /// Tiles the valve left over the limit: 0 or 1 per tile, summed (#814).
     over_limit: usize,
+    /// The over-cap tile's lone survivor absorbed another source feature.
+    over_limit_merged: bool,
 }
 
 /// One #750 coverage-fill feature of a tile: the fill polygons that joined
@@ -9889,7 +9941,8 @@ const MAX_FILL_PASSES: u32 = 4;
 /// merged tile is not encoded the slow way again): all of it if the tile still
 /// fits, else the largest fill features whose bytes fit the slack, else
 /// none. A tile the valve could not fit gets no fill. Each extra encode
-/// counts as a valve pass.
+/// counts as a valve pass. A reduced grid or a dropped merge also sheds
+/// fill: its old commands must not redraw a dropped merge's source.
 fn with_fill(
     mut fitted: TileMvt,
     opts: &ExportOptions,
@@ -9924,7 +9977,10 @@ fn with_fill(
         tally.vertices = 0;
         fitted
     };
-    if tile_fit(&mut fitted, opts).unwrap_or(f64::INFINITY) < 1.0 {
+    if fitted.valve.reduced_extent.is_some()
+        || fitted.valve.dropped_merged > 0
+        || tile_fit(&mut fitted, opts).unwrap_or(f64::INFINITY) < 1.0
+    {
         #[cfg(test)]
         note_gzip(base_gzip_before, &fitted);
         return no_fill(tally, fitted);
@@ -10041,6 +10097,20 @@ fn check_mlt(mvt: &TileMvt) -> Result<(), ExportError> {
 /// tile needing more than a few is pathological.
 const MAX_DROP_PASSES: u32 = 8;
 
+/// How many of `keep` features the drop loops keep on cut `cut` (0-based)
+/// of a tile at `fit`: the share that fits, with tippecanoe's 0.8 margin
+/// from the second cut on. Without it a tile just over its cap shed a
+/// sliver per pass and ran out of passes still over (#873).
+fn drop_keep(keep: usize, fit: f64, cut: u32) -> usize {
+    // DIVERGENCE FROM TIPPECANOE: tile.cpp applies its 0.8 margin on the
+    // first cut too. We keep the first cut as before, so a tile that fit
+    // after one cut is byte-identical.
+    (keep as f64 * fit * if cut == 0 { 1.0 } else { 0.8 }).floor() as usize
+}
+
+/// One grid unit per pixel on a 512-pixel tile before losing whole features.
+const MIN_VALVE_EXTENT: u32 = 512;
+
 /// The drop valve: while the tile is over its limit, keep a proportional
 /// count of members and re-encode. `select_kept_members` decides which
 /// survive.
@@ -10082,7 +10152,7 @@ fn drop_to_fit(
     let mut passes = 1u32;
     loop {
         passes += 1;
-        keep = ((keep as f64 * fit).floor() as usize).clamp(1, keep.saturating_sub(1).max(1));
+        keep = drop_keep(keep, fit, passes - 2).clamp(1, keep.saturating_sub(1).max(1));
         let kept = shed_to_fit(members, keep, opts);
         let mut shed = build_tile_layers(gzip_cache, layers, &kept, tb, opts, &[], diagnostics);
         fit = tile_fit(&mut shed, opts).unwrap_or(f64::INFINITY);
@@ -10138,11 +10208,9 @@ fn stalled(prev_fit: f64, fit: f64) -> bool {
 ///
 /// A tile under its limit is encoded exactly as [`drop_to_fit`] would. When
 /// the threshold cannot rise any further and the tile is still over, the
-/// unmerged features are dropped, smallest first; a merged feature is never
-/// dropped, since it carries every feature merged into it and dropping it
-/// would open a hole the size of all of them. If the tile is still over
-/// with only merged features left, it is written over its limit, with a
-/// warning.
+/// unmerged features are dropped, smallest first. Then halve the extent to
+/// 512 before dropping merged features, smallest first. Only a lone feature
+/// that still exceeds the cap can be written over it, with a warning.
 fn merge_to_fit(
     gzip_cache: &Arc<TileGzipCache>,
     members: &[Member],
@@ -10252,14 +10320,20 @@ fn merge_to_fit(
             passes,
             mingap,
             over_limit: usize::from(fit < 1.0),
+            ..ValveTally::default()
         };
-        if fit >= 1.0 || feats.len() <= 1 {
+        if fit >= 1.0 {
             let fitted = TileMvt {
                 oversized: passes > 1,
                 valve: tally,
                 ..mvt
             };
-            return with_fill(fitted, opts, fill, fill_tally, |f| build(&feats, passes, f));
+            let mut fitted =
+                with_fill(fitted, opts, fill, fill_tally, |f| build(&feats, passes, f));
+            if absorbed > 0 && opts.feature_id.is_some() {
+                account_merged_sources(&merged, &feats, &ordered, &mut fitted);
+            }
+            return fitted;
         }
         // tippecanoe's `mingap_fraction`: aim for the share of features
         // that would fit, with a 20% margin, never keeping more than 80%.
@@ -10288,18 +10362,28 @@ fn merge_to_fit(
         // Merged as far as the gaps allow and still over.
         // DIVERGENCE FROM TIPPECANOE: tippecanoe exits ("Can't increase
         // feature gap threshold further"); we finish the tile.
-        let (whole, single): (Vec<_>, Vec<_>) = feats.into_iter().partition(|m| m.absorbed > 0);
-        let mut kept = whole.clone();
+        let (whole, single): (Vec<_>, Vec<_>) = feats.iter().copied().partition(|m| m.absorbed > 0);
+        let mut kept = feats;
         let mut dropped = 0;
         let mut out = mvt;
         let mut fit = fit;
         if !single.is_empty() {
-            // Drop unmerged features, keeping the largest, until it fits.
+            // Drop unmerged features until it fits: fewest vertices first,
+            // points thinned evenly (`select_kept_members`).
+            // With merged features in the tile, every single may go before
+            // merged coverage is touched; alone, the largest single stays.
+            let min_keep = usize::from(whole.is_empty());
             let mut keep = single.len();
-            for _ in 0..MAX_DROP_PASSES {
-                keep = ((keep as f64 * fit).floor() as usize).min(keep.saturating_sub(1));
+            for cut in 0..MAX_DROP_PASSES {
+                // Nothing left to drop: go straight to the backstop.
+                if keep <= min_keep {
+                    break;
+                }
+                keep = drop_keep(keep, fit, cut).min(keep - 1).max(min_keep);
                 kept = whole.clone();
-                kept.extend(select_kept_members(&single, keep));
+                if keep > 0 {
+                    kept.extend(select_kept_members(&single, keep).into_iter().copied());
+                }
                 draw_order(&mut kept);
                 passes += 1;
                 // The previous bytes cannot be returned after dropping more
@@ -10311,29 +10395,156 @@ fn merge_to_fit(
                     break;
                 }
             }
+            // The cuts ran out with singles left beside merged features: the
+            // rest go too, before the extent drops or a merge is touched.
+            if fit < 1.0 && !whole.is_empty() && kept.len() > whole.len() {
+                kept = whole.clone();
+                draw_order(&mut kept);
+                passes += 1;
+                drop(out);
+                out = build(&kept, passes, &[]);
+                fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
+            }
             dropped = single.len() - (kept.len() - whole.len());
         }
+        let mut tally = ValveTally {
+            dropped,
+            passes,
+            over_limit: usize::from(fit < 1.0),
+            ..tally
+        };
+        if fit < 1.0 {
+            out = reduce_merged_to_fit(
+                gzip_cache,
+                &mut kept,
+                tb,
+                opts,
+                diagnostics,
+                out,
+                &mut tally,
+            );
+        }
         log::debug!(
-            "oversized tile: merged {absorbed} of {} features and dropped {dropped} unmerged \
-             ones{}",
+            "oversized tile: merged {absorbed} of {} features and dropped {} sources \
+             ({} merged features carrying {} sources){}",
             members.len(),
-            if fit < 1.0 {
-                "; still over the limit, written as is (merged features are never dropped)"
+            tally.dropped,
+            tally.dropped_merged,
+            tally.dropped_merged_sources,
+            if tally.over_limit > 0 {
+                "; single remaining feature still over the limit, written as is"
             } else {
                 ""
             },
         );
         let fitted = TileMvt {
             oversized: true,
-            valve: ValveTally {
-                dropped,
-                passes,
-                over_limit: usize::from(fit < 1.0),
-                ..tally
-            },
+            valve: tally,
             ..out
         };
-        return with_fill(fitted, opts, fill, fill_tally, |f| build(&kept, passes, f));
+        let mut fitted = with_fill(fitted, opts, fill, fill_tally, |f| {
+            build(&kept, tally.passes, f)
+        });
+        if opts.feature_id.is_some() {
+            account_merged_sources(&merged, &kept, &ordered, &mut fitted);
+        }
+        return fitted;
+    }
+}
+
+/// Re-encode the exhausted merge valve's survivors on coarser grids, then
+/// drop whole features at the floor. Only a lone feature may stay over.
+fn reduce_merged_to_fit(
+    gzip_cache: &Arc<TileGzipCache>,
+    kept: &mut Vec<&coalesce_valve::Merged<'_>>,
+    tb: &TileBounds,
+    opts: &ExportOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
+    mut out: TileMvt,
+    tally: &mut ValveTally,
+) -> TileMvt {
+    // DIVERGENCE FROM TIPPECANOE: tile.cpp:2946 exits when coalescing
+    // exhausts gaps. Its detail loop (3031) runs only without an as-needed
+    // strategy and reaches 128. We reduce detail after merging, to 512,
+    // then drop whole features. A lone feature still over the cap at that
+    // floor is kept with a warning, without splitting it into its sources.
+    let mut reduced = opts.clone();
+    let mut fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
+    // A coarser grid only moves points; a point tile is dropped as the drop
+    // valve drops it.
+    let points_only = kept
+        .iter()
+        .all(|m| matches!(m.geometry(), Geometry::Point(_) | Geometry::MultiPoint(_)));
+    while fit < 1.0 && reduced.extent > MIN_VALVE_EXTENT && !points_only {
+        reduced.extent = (reduced.extent >> 1).max(MIN_VALVE_EXTENT);
+        tally.passes += 1;
+        drop(out);
+        // Plain encode quantizes, unions and cleans geometry on this grid.
+        // Never reuse the original grid's QuantizedPolygons or fill.
+        out = build_mvt(gzip_cache, kept, tb, &reduced, &[], diagnostics);
+        fit = tile_fit(&mut out, &reduced).unwrap_or(f64::INFINITY);
+    }
+    while fit < 1.0 && kept.len() > 1 {
+        let keep = drop_keep(kept.len(), fit, 1).clamp(1, kept.len() - 1);
+        let selected: HashSet<_> = select_kept_members(kept, keep)
+            .iter()
+            .map(|m| m.members[0])
+            .collect();
+        // Restrict the existing draw_order to its survivors, including
+        // feature-order columns, on every encode used to measure the cap.
+        kept.retain(|m| {
+            if selected.contains(&m.members[0]) {
+                return true;
+            }
+            tally.dropped += m.members.len();
+            // Its absorbed sources are lost, not merged: count each once.
+            tally.merged -= m.absorbed;
+            if m.absorbed > 0 {
+                tally.dropped_merged += 1;
+                tally.dropped_merged_sources += m.members.len();
+            }
+            false
+        });
+        tally.passes += 1;
+        drop(out);
+        out = build_mvt(gzip_cache, kept, tb, &reduced, &[], diagnostics);
+        fit = tile_fit(&mut out, &reduced).unwrap_or(f64::INFINITY);
+    }
+    tally.over_limit = usize::from(fit < 1.0);
+    tally.over_limit_merged = fit < 1.0 && kept.len() == 1 && kept[0].absorbed > 0;
+    tally.reduced_extent = (reduced.extent < opts.extent).then_some(reduced.extent);
+    if let Some(extent) = tally.reduced_extent {
+        log::debug!("tile bounds {tb:?} written at extent {extent}");
+    }
+    out
+}
+
+/// The merge valve's per-source loss owner, after the final encode (including
+/// fill). The encoder tracks targets; propagate their encode losses to absorbed
+/// sources, otherwise classify kept merges as merged and dropped features'
+/// sources as valve-dropped, whether or not the backstop ran.
+fn account_merged_sources(
+    merged: &[coalesce_valve::Merged<'_>],
+    kept: &[&coalesce_valve::Merged<'_>],
+    ordered: &[&Member],
+    out: &mut TileMvt,
+) {
+    use crate::diagnostics::SourceLossCause;
+    let retained: HashSet<_> = kept.iter().map(|m| m.members[0]).collect();
+    let losses: HashMap<_, _> = out.source_losses.iter().copied().collect();
+    for m in merged {
+        let retained = retained.contains(&m.members[0]);
+        let cause = if retained {
+            losses
+                .get(&m.target.seq)
+                .copied()
+                .unwrap_or(SourceLossCause::Merged)
+        } else {
+            SourceLossCause::ValveDropped
+        };
+        for &i in &m.members[usize::from(retained)..] {
+            out.source_losses.push((ordered[i].seq, cause));
+        }
     }
 }
 
@@ -18616,35 +18827,11 @@ mod tests {
         }
     }
 
-    /// #745: when merging alone cannot fit a tile, the valve drops only
-    /// unmerged features and never a merged one, which would open a hole the
-    /// size of every feature merged into it. Disjoint squares cannot
-    /// dissolve, so with a tiny limit the tile stays over even fully merged:
-    /// every square must still be drawn.
+    /// #873: lower the extent before shedding merged geometry. Compare
+    /// area on the same grid, with room for half a coarse unit per axis.
     #[test]
-    fn merge_fallback_never_drops_a_merged_feature() {
-        let d = 0.005;
-        let feats: Vec<Feature> = (0..400)
-            .map(|i| {
-                let (x, y) = (
-                    0.1 + (i % 20) as f64 * 2.0 * d,
-                    0.1 + (i / 20) as f64 * 2.0 * d,
-                );
-                Feature {
-                    geom: Geometry::Polygon(geo::Polygon::new(
-                        LineString::from(vec![
-                            (x, y),
-                            (x + d, y),
-                            (x + d, y + d),
-                            (x, y + d),
-                            (x, y),
-                        ]),
-                        vec![],
-                    )),
-                    props: vec![("n".to_string(), PropertyValue::Int(i))],
-                }
-            })
-            .collect();
+    fn merge_fallback_reduces_extent_before_dropping_merged_features() {
+        let feats = disjoint_rings(200, 240);
         let full = encode_level_tiles(
             &feats,
             10,
@@ -18655,22 +18842,628 @@ mod tests {
             },
         )
         .unwrap();
-        let (full_bytes, full_area, _, _) = tile_area_stats(&full[0]);
+        let gzip_size = crate::compression::compress(&full[0].data, Compression::Gzip)
+            .unwrap()
+            .len();
         let tiles = encode_level_tiles(
             &feats,
             10,
             &ExportOptions {
-                tile_size_limit: Some(full_bytes / 20),
+                tile_size_limit: None,
+                compressed_tile_size_limit: Some(gzip_size / 4),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let extent = decode_tile(&tiles[0].data).layers[0].extent.unwrap();
+        let (_, area, _, _) = tile_area_stats(&tiles[0]);
+        let (_, full_area, _, _) = tile_area_stats(&full[0]);
+        assert!((MIN_VALVE_EXTENT..4096).contains(&extent));
+        assert_eq!(tiles[0].valve.reduced_extent, Some(extent));
+        assert_eq!(tiles[0].valve.dropped, 0);
+        assert_eq!(tiles[0].valve.over_limit, 0);
+        let normalized = area * (4096.0 / f64::from(extent)).powi(2);
+        // The fine-grid radius is about 35 units. Moving its boundary by
+        // half a coarse diagonal bounds the area error by perimeter * d.
+        let d = std::f64::consts::FRAC_1_SQRT_2 * (4096.0 / f64::from(extent) + 1.0);
+        let tolerance = 200.0 * (std::f64::consts::TAU * 36.0 * d + std::f64::consts::PI * d * d);
+        assert!(
+            (normalized - full_area).abs() <= tolerance,
+            "{normalized} vs {full_area}, tolerance {tolerance}"
+        );
+    }
+
+    /// Disjoint polygons, `n` of them on a 20-wide grid inside tile
+    /// 10/512/511, each a ring of `sides` vertices: they never dissolve, so
+    /// merging saves only their tags.
+    fn disjoint_rings(n: i64, sides: u32) -> Vec<Feature> {
+        (0..n)
+            .map(|i| {
+                let (cx, cy) = (0.1 + (i % 20) as f64 * 0.01, 0.1 + (i / 20) as f64 * 0.01);
+                let ring: Vec<(f64, f64)> = (0..=sides)
+                    .map(|k| {
+                        let a = std::f64::consts::TAU * f64::from(k % sides) / f64::from(sides);
+                        (cx + 0.003 * a.cos(), cy + 0.003 * a.sin())
+                    })
+                    .collect();
+                Feature {
+                    geom: Geometry::Polygon(geo::Polygon::new(LineString::from(ring), vec![])),
+                    props: vec![("n".to_string(), PropertyValue::Int(i))],
+                }
+            })
+            .collect()
+    }
+
+    /// A shared dictionary dominates the tile. Proportional cuts alone
+    /// approach the cap too slowly to finish within eight encodes.
+    /// #873: a drop-valve tile just over its cap used to shed a sliver per
+    /// pass and end over the cap after 8 passes; the 0.8 margin finishes it.
+    #[test]
+    fn drop_to_fit_margin_finishes_a_stalling_tile() {
+        let mut feats = disjoint_rings(400, 4);
+        for f in &mut feats {
+            f.props = vec![("shared".into(), PropertyValue::String("x".repeat(20_000)))];
+        }
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                size_valve: SizeValve::Drop,
+                tile_size_limit: Some(21_000),
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 1);
+        assert!(
+            tiles[0].data.len() <= 21_000,
+            "{}: {:?}",
+            tiles[0].data.len(),
+            tiles[0].valve
+        );
+        assert_eq!(tiles[0].valve.over_limit, 0);
+    }
+
+    /// The merge itself fits; a shared dictionary makes single-drop cuts
+    /// shrink slowly. The margin must finish before the extent backstop.
+    #[test]
+    fn merge_valve_single_drop_margin_finishes_a_stalling_tile() {
+        let members: Vec<_> = disjoint_rings(400, 4)
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| Member {
+                key: tile_key(512, 511, 10),
+                seq: i as u64,
+                geom: f.geom.into(),
+                props: SharedProps::new(if i < 2 {
+                    vec![]
+                } else {
+                    vec![("shared".into(), PropertyValue::String("x".repeat(20_000)))]
+                }),
+                id: None,
+                gap: if i == 1 { 1 } else { GAP_NONE },
+                band: 0,
+            })
+            .collect();
+        let opts = ExportOptions {
+            size_valve: SizeValve::Merge,
+            tile_size_limit: Some(21_000),
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let mvt = encode_tile(
+            &test_gzip_cache(),
+            &members,
+            &TileCoord::new(512, 511, 10).bounds(),
+            &opts,
+            &[],
+            &mut FillTally::default(),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let v = mvt.valve;
+        assert_eq!(v.merged, 1, "{v:?}");
+        assert!(v.dropped > 0, "{v:?}");
+        assert_eq!(v.over_limit, 0, "{v:?}");
+        assert!(mvt.data.len() <= 21_000, "{v:?}");
+        assert_eq!(v.reduced_extent, None, "single-drop cuts must fit: {v:?}");
+        assert_eq!(v.dropped_merged, 0, "{v:?}");
+    }
+
+    /// #873: the margin starts on the second cut, so a tile that fits on
+    /// its first cut is byte-identical to before.
+    #[test]
+    fn drop_to_fit_first_cut_stays_byte_identical() {
+        let feats = disjoint_rings(400, 4);
+        let opts = ExportOptions {
+            size_valve: SizeValve::Drop,
+            tile_size_limit: None,
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let full = encode_level_tiles(&feats, 10, &opts).unwrap();
+        let limit = full[0].data.len() * 3 / 4;
+        let keep = (feats.len() as f64 * limit as f64 / full[0].data.len() as f64).floor() as usize;
+        let first = encode_level_tiles(&feats[..keep], 10, &opts).unwrap();
+        assert!(
+            first[0].data.len() <= limit,
+            "fixture must fit on its first cut"
+        );
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: Some(limit),
+                ..opts
+            },
+        )
+        .unwrap();
+        assert_eq!(tiles[0].valve.passes, 2);
+        assert_eq!(tiles[0].data, first[0].data);
+    }
+
+    /// Distinct bands leave multiple merged features at the floor, so the
+    /// final backstop can shed whole merges. Fill uses the old grid.
+    #[test]
+    fn merge_valve_floor_then_drop_accounts_for_sources_and_fill() {
+        use crate::diagnostics::{Diagnostics, SourceLossCause};
+        let members: Vec<_> = disjoint_rings(80, 4)
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| Member {
+                key: tile_key(512, 511, 10),
+                seq: i as u64,
+                geom: f.geom.into(),
+                props: SharedProps::new(vec![]),
+                id: Some(i as u64),
+                gap: if i % 2 == 0 { GAP_NONE } else { 1 },
+                band: (i / 2) as u16,
+            })
+            .collect();
+        for extent in [4096, MIN_VALVE_EXTENT] {
+            let opts = ExportOptions {
+                extent,
+                feature_id: Some("id".into()),
+                tile_size_limit: Some(300),
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            };
+            let diagnostics = Diagnostics::default();
+            let mut fill = FillTally::default();
+            let mvt = encode_tile(
+                &test_gzip_cache(),
+                &members,
+                &TileCoord::new(512, 511, 10).bounds(),
+                &opts,
+                &[fill_square(78, 0, 0, 100)],
+                &mut fill,
+                &diagnostics,
+            );
+            assert!(mvt.data.len() <= 300, "{:?}", mvt.valve);
+            assert_eq!(
+                mvt.valve.reduced_extent,
+                (extent > MIN_VALVE_EXTENT).then_some(MIN_VALVE_EXTENT)
+            );
+            assert!(mvt.valve.dropped_merged > 0);
+            assert_eq!(
+                mvt.valve.dropped_merged_sources,
+                2 * mvt.valve.dropped_merged
+            );
+            assert_eq!(mvt.valve.dropped, mvt.valve.dropped_merged_sources);
+            assert_eq!(fill.shed, 1);
+            assert_eq!(fill.polygons, 0);
+            let tile = decode_tile(&mvt.data);
+            assert_eq!(tile.layers[0].extent, Some(MIN_VALVE_EXTENT));
+            let ids: Vec<_> = tile.layers[0]
+                .features
+                .iter()
+                .map(|f| f.id.unwrap())
+                .collect();
+            assert!(ids.windows(2).all(|w| w[0] < w[1]), "draw order: {ids:?}");
+            account_sources(&members, &mvt, 10, &opts, &diagnostics).unwrap();
+            let losses = diagnostics.source_losses().unwrap();
+            let dropped = losses
+                .iter()
+                .map(Result::unwrap)
+                .filter(|l| l.cause == SourceLossCause::ValveDropped)
+                .count();
+            assert_eq!(dropped, mvt.valve.dropped_merged_sources);
+        }
+    }
+
+    /// Read disjoint exterior rings for the reduced-grid property test.
+    fn valve_test_polygons(commands: &[u32]) -> geo::MultiPolygon<f64> {
+        let mut out = Vec::new();
+        let mut ring = Vec::new();
+        let (mut x, mut y) = (0i32, 0i32);
+        let mut i = 0;
+        while i < commands.len() {
+            let (cmd, count) = command_decode(commands[i]);
+            i += 1;
+            if cmd == 7 {
+                ring.push(ring[0]);
+                out.push(geo::Polygon::new(
+                    LineString::from(std::mem::take(&mut ring)),
+                    vec![],
+                ));
+                continue;
+            }
+            assert!(cmd == 1 || cmd == 2);
+            for _ in 0..count {
+                x += zigzag_decode(commands[i]);
+                y += zigzag_decode(commands[i + 1]);
+                i += 2;
+                ring.push((f64::from(x), f64::from(y)));
+            }
+        }
+        geo::MultiPolygon(out)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(32))]
+        #[test]
+        fn merge_valve_reduced_extent_preserves_valid_polygon_area(
+            sides in 120u32..260,
+            dx in -0.0005f64..0.0005,
+            dy in -0.0005f64..0.0005,
+        ) {
+            use geo::{Area, MapCoords, Validation};
+            let mut feats = disjoint_rings(120, sides);
+            for f in &mut feats {
+                f.geom = f.geom.map_coords(|c| geo::Coord { x: c.x + dx, y: c.y + dy });
+            }
+            let opts = ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            };
+            let full = encode_level_tiles(&feats, 10, &opts).unwrap();
+            let limit = crate::compression::compress(&full[0].data, Compression::Gzip).unwrap().len() / 2;
+            let tiles = encode_level_tiles(&feats, 10, &ExportOptions {
+                compressed_tile_size_limit: Some(limit), ..opts
+            }).unwrap();
+            let layer = &decode_tile(&tiles[0].data).layers[0];
+            let extent = layer.extent.unwrap();
+            proptest::prop_assert!(extent < 4096);
+            proptest::prop_assert_eq!(tiles[0].valve.dropped, 0);
+            proptest::prop_assert_eq!(tiles[0].valve.over_limit, 0);
+            let mut area = 0.0;
+            for f in &layer.features {
+                let polygons = valve_test_polygons(&f.geometry);
+                proptest::prop_assert!(polygons.is_valid(), "{:?}", polygons.validation_errors());
+                area += polygons.unsigned_area();
+            }
+            let full_area = tile_area_stats(&full[0]).1;
+            let scale = 4096.0 / f64::from(extent);
+            // Two independent roundings, each within half a grid diagonal.
+            let d = std::f64::consts::FRAC_1_SQRT_2 * (scale + 1.0);
+            let tolerance = 120.0 * (std::f64::consts::TAU * 36.0 * d + std::f64::consts::PI * d * d);
+            proptest::prop_assert!((area * scale * scale - full_area).abs() <= tolerance);
+        }
+    }
+
+    /// #873: a lone merged feature is kept over the cap at the extent floor.
+    /// #873 review: the merge fallback drops every unmerged feature before it
+    /// lowers the extent or drops merged coverage. Keeping the last single
+    /// (here a line with a huge tag) made the backstop drop the merged
+    /// squares, which were tiny, and write the line alone.
+    #[test]
+    fn merge_valve_drops_the_last_unmerged_feature_before_merged_coverage() {
+        let mut feats = disjoint_rings(2, 4);
+        feats.push(Feature {
+            geom: Geometry::LineString(LineString::from(
+                (0..100)
+                    .map(|k| (0.1 + k as f64 * 0.001, 0.2 + (k % 2) as f64 * 0.001))
+                    .collect::<Vec<_>>(),
+            )),
+            props: vec![("big".to_string(), PropertyValue::String("x".repeat(20_000)))],
+        });
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: Some(1_000),
+                compressed_tile_size_limit: None,
                 size_valve: SizeValve::Merge,
                 ..Default::default()
             },
         )
         .unwrap();
-        let (_, area, _, _) = tile_area_stats(&tiles[0]);
-        assert!(tiles[0].valve.merged > 0, "{:?}", tiles[0].valve);
+        assert_eq!(tiles.len(), 1);
+        let (bytes, area, _, features) = tile_area_stats(&tiles[0]);
+        let v = tiles[0].valve;
+        assert!(bytes <= 1_000, "{bytes}: {v:?}");
+        assert_eq!(v.over_limit, 0, "{v:?}");
+        assert!(features >= 1 && area > 0.0, "the squares must stay: {v:?}");
+        assert_eq!(v.dropped_merged, 0, "{v:?}");
+        assert_eq!(v.reduced_extent, None, "{v:?}");
+    }
+
+    /// #873 review: when the eight proportional cuts leave unmerged features
+    /// in a tile that holds merged ones, the rest go too before the extent
+    /// drops or merged coverage is touched. 400 multipoints sharing a 20 KB tag
+    /// used to outlast the cuts and outrank the merged squares by vertices.
+    #[test]
+    fn merge_valve_drops_singles_left_after_the_cuts_before_merged_coverage() {
+        let mut feats = disjoint_rings(2, 4);
+        let big = "x".repeat(20_000);
+        feats.extend((0..400).map(|_| {
+            Feature {
+                geom: Geometry::MultiPoint(geo::MultiPoint(
+                    (0..12)
+                        .map(|k| geo::Point::new(0.1 + k as f64 * 0.001, 0.2))
+                        .collect(),
+                )),
+                props: vec![("big".to_string(), PropertyValue::String(big.clone()))],
+            }
+        }));
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: Some(19_900),
+                compressed_tile_size_limit: None,
+                size_valve: SizeValve::Merge,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let v = tiles[0].valve;
+        let (bytes, area, _, _) = tile_area_stats(&tiles[0]);
+        assert!(bytes <= 19_900, "{bytes}: {v:?}");
+        assert_eq!(v.over_limit, 0, "{v:?}");
+        assert_eq!(v.dropped_merged, 0, "{v:?}");
+        assert_eq!(v.reduced_extent, None, "{v:?}");
+        assert!(area > 0.0, "the squares must stay: {v:?}");
+    }
+
+    /// #873 review: a tile of points (a MultiPoint has many coordinates, so
+    /// it reaches the merge valve) is never re-encoded at a coarser extent:
+    /// that moves points and saves almost nothing. It is handled as the drop
+    /// valve handles it.
+    #[test]
+    fn merge_valve_never_lowers_the_extent_of_a_point_tile() {
+        let feats = vec![Feature {
+            geom: Geometry::MultiPoint(geo::MultiPoint(
+                (0..3_000)
+                    .map(|k| {
+                        geo::Point::new(
+                            0.1 + (k % 60) as f64 * 0.003,
+                            0.1 + (k / 60) as f64 * 0.003,
+                        )
+                    })
+                    .collect(),
+            )),
+            props: vec![],
+        }];
+        let encode = |size_valve| {
+            encode_level_tiles(
+                &feats,
+                10,
+                &ExportOptions {
+                    tile_size_limit: Some(1_000),
+                    compressed_tile_size_limit: None,
+                    size_valve,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let (merge, drop) = (encode(SizeValve::Merge), encode(SizeValve::Drop));
+        assert_eq!(merge[0].valve.reduced_extent, None, "{:?}", merge[0].valve);
+        assert_eq!(merge[0].data, drop[0].data);
+    }
+
+    #[test]
+    fn merge_valve_writes_a_lone_merged_feature_over_the_floor_and_warns() {
+        let feats = disjoint_rings(400, 4);
+        let full = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let limit = full[0].data.len() / 20;
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: Some(limit),
+                compressed_tile_size_limit: None,
+                size_valve: SizeValve::Merge,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 1);
+        let (bytes, area, _, features) = tile_area_stats(&tiles[0]);
+        let v = tiles[0].valve;
+        assert!(v.merged > 0, "the valve should merge first: {v:?}");
+        assert!(bytes > limit, "fixture must exceed the cap: {v:?}");
+        assert_eq!(v.over_limit, 1, "{v:?}");
+        assert!(v.over_limit_merged, "{v:?}");
+        assert_eq!(v.reduced_extent, Some(MIN_VALVE_EXTENT));
+        assert_eq!(decode_tile(&tiles[0].data).layers[0].extent, Some(512));
+        assert_eq!(features, 1);
+        assert!(area > 0.0, "the tile must still draw: {v:?}");
+
+        let report = export_valve_fixture(&feats, limit);
+        assert_eq!(report.over_limit_tiles, 1);
+        let warning = report
+            .diagnostics
+            .iter()
+            .find(|d| matches!(d, crate::diagnostics::Diagnostic::TilesOverLimit { .. }))
+            .unwrap();
+        let crate::diagnostics::Diagnostic::TilesOverLimit {
+            count,
+            largest,
+            merged_tiles,
+        } = warning
+        else {
+            unreachable!()
+        };
+        assert_eq!(*count, 1);
+        assert_eq!(*merged_tiles, 1);
+        assert_eq!(largest.len(), 1);
+        assert_eq!((largest[0].z, largest[0].x, largest[0].y), (10, 512, 511));
+        let line = warning.to_string();
+        assert!(line.contains("z10/512/511"), "{line}");
         assert!(
-            (area - full_area).abs() <= 1e-6 * full_area,
-            "merged features were dropped: drew {area} of {full_area}"
+            line.contains(
+                "1 of them hold a single merged feature over the cap at the extent floor"
+            ),
+            "{line}"
+        );
+    }
+
+    /// Run the real writer/report/diagnostics path on one valve tile at z10.
+    fn export_valve_fixture(feats: &[Feature], limit: usize) -> ExportReport {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let schema = Arc::new(source_schema());
+        let mut writer = OverviewWriter::create(
+            tin.path(),
+            &schema,
+            OverviewWriterOptions::new(Mode::Duplicating, vec![LevelSpec::new(gsd(10), Some(10))]),
+        )
+        .unwrap();
+        let ids: Vec<_> = (0..feats.len() as i64).collect();
+        let geoms: Vec<_> = feats.iter().map(|f| f.geom.clone()).collect();
+        assert_eq!(
+            writer
+                .write_level(
+                    0,
+                    Some(feats.len()),
+                    std::iter::once(batch(&schema, &ids, &geoms))
+                )
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
+        writer.finish().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(
+            tin.path(),
+            tout.path(),
+            &ExportOptions {
+                size_valve: SizeValve::Merge,
+                tile_size_limit: Some(limit),
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// The unmerged line goes before the merged squares (#873 review), so the
+    /// lone survivor over the cap is the merge, and the warning counts it as one.
+    /// The opposite case, a lone unmerged survivor, is
+    /// `merge_valve_lone_unmerged_feature_skips_single_drop_encode`.
+    #[test]
+    fn merge_valve_over_limit_keeps_the_merged_survivor_over_a_single() {
+        let mut feats = disjoint_rings(2, 4);
+        feats.push(Feature {
+            geom: Geometry::LineString(LineString::from(
+                (0..200)
+                    .map(|k| {
+                        (
+                            0.1 + k as f64 * 0.001,
+                            0.25 + if k % 2 == 0 { 0.01 } else { 0.0 },
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            props: vec![],
+        });
+        let report = export_valve_fixture(&feats, 1);
+        assert!(report.merged_features > 0);
+        assert_eq!(report.valve_dropped_features, 1, "the line is dropped");
+        assert_eq!(report.over_limit_tiles, 1);
+        assert_eq!(report.zooms[0].tile_feature_count, 1);
+        assert_eq!(report.zooms[0].dropped_merged_features, 0);
+        let warning = report
+            .diagnostics
+            .iter()
+            .find(|d| matches!(d, crate::diagnostics::Diagnostic::TilesOverLimit { .. }))
+            .unwrap();
+        let crate::diagnostics::Diagnostic::TilesOverLimit { merged_tiles, .. } = warning else {
+            unreachable!()
+        };
+        assert_eq!(*merged_tiles, 1, "{warning}");
+        assert!(warning.to_string().contains("single merged feature"));
+    }
+
+    #[test]
+    fn merge_valve_lone_unmerged_feature_skips_single_drop_encode() {
+        let tiles = encode_level_tiles(
+            &disjoint_rings(1, 4),
+            10,
+            &ExportOptions {
+                size_valve: SizeValve::Merge,
+                tile_size_limit: Some(1),
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let v = tiles[0].valve;
+        assert_eq!(v.merged, 0);
+        assert_eq!(v.dropped, 0);
+        assert_eq!(v.over_limit, 1);
+        assert!(!v.over_limit_merged);
+        assert_eq!(v.reduced_extent, Some(512));
+        // Initial encode, then 2048, 1024, 512; no unchanged single-drop encode.
+        assert_eq!(v.passes, 4, "{v:?}");
+    }
+
+    /// #873, the shape of the FTW Brazil z8 and Overture São Paulo z12
+    /// tiles: detailed disjoint polygons under the default compressed cap
+    /// alone. Fully merged, their vertices still exceed the cap.
+    #[test]
+    fn merge_valve_fits_detailed_polygons_under_the_compressed_cap() {
+        let feats = disjoint_rings(200, 240);
+        let gz = |t: &EncodedTile| {
+            crate::compression::compress(&t.data, Compression::Gzip)
+                .unwrap()
+                .len()
+        };
+        let full = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let limit = gz(&full[0]) / 4;
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: Some(limit),
+                size_valve: SizeValve::Merge,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 1);
+        let (_, area, _, features) = tile_area_stats(&tiles[0]);
+        let v = tiles[0].valve;
+        let bytes = gz(&tiles[0]);
+        assert!(v.merged > 0, "the valve should merge first: {v:?}");
+        assert!(
+            bytes <= limit,
+            "written over the cap: {bytes} > {limit}: {v:?}"
+        );
+        assert_eq!(v.over_limit, 0, "{v:?}");
+        assert!(
+            features >= 1 && area > 0.0,
+            "the tile must still draw: {v:?}"
         );
     }
 
@@ -18721,11 +19514,19 @@ mod tests {
         let (_, area, _, features) = tile_area_stats(&tiles[0]);
         let v = tiles[0].valve;
         // Two passes that barely shrink it, then one that merges everything.
-        assert!(v.passes <= 4, "the valve should stop inching: {v:?}");
-        assert_eq!((features, v.merged), (1, 199), "everything merges: {v:?}");
+        let extent = decode_tile(&tiles[0].data).layers[0].extent.unwrap();
+        let detail_passes = 4096u32.ilog2() - extent.ilog2();
         assert!(
-            (area - full_area).abs() <= 1e-6 * full_area,
-            "drew {area} of {full_area}"
+            v.passes - detail_passes <= 4,
+            "the merge should stop inching: {v:?}"
+        );
+        assert_eq!((features, v.merged), (1, 199), "everything merges: {v:?}");
+        let scale = 4096.0 / f64::from(extent);
+        let d = std::f64::consts::FRAC_1_SQRT_2 * (scale + 1.0);
+        let tolerance = 200.0 * (std::f64::consts::TAU * 36.0 * d + std::f64::consts::PI * d * d);
+        assert!(
+            (area * scale * scale - full_area).abs() <= tolerance,
+            "drew {area} at extent {extent}, fine area {full_area}"
         );
     }
 
@@ -18748,6 +19549,8 @@ mod tests {
         let (drop, tile) = (encode(SizeValve::Drop), encode(SizeValve::Merge));
         assert_eq!(drop[0].data, tile[0].data);
         assert_eq!(tile[0].valve.merged, 0);
+        assert_eq!(decode_tile(&tile[0].data).layers[0].extent, Some(4096));
+        assert_eq!(tile[0].valve.reduced_extent, None);
         // Both valves count the one encode a fitting tile took.
         assert_eq!(tile[0].valve.passes, 1);
         assert_eq!(drop[0].valve, tile[0].valve);
@@ -18885,13 +19688,13 @@ mod tests {
         );
         let tout = tempfile::NamedTempFile::new().unwrap();
         let opts = ExportOptions {
-            tile_size_limit: Some(64),
+            tile_size_limit: Some(1),
             ..Default::default()
         };
         let report = export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
         assert_eq!(
             report.over_limit_tiles, report.total_tiles,
-            "no tile with a feature fits in 64 bytes"
+            "no tile with a feature fits in one byte"
         );
         let summary: Vec<_> = report
             .diagnostics
@@ -18900,8 +19703,8 @@ mod tests {
             .collect();
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].count(), report.over_limit_tiles);
-        // #873: only the tiles holding merged features count toward the
-        // `--size-valve drop` hint; the lone line's tiles do not.
+        // #873: only tiles with a remaining merged feature count toward
+        // that explanation in the warning; the lone line's tiles do not.
         let crate::diagnostics::Diagnostic::TilesOverLimit { merged_tiles, .. } = summary[0] else {
             unreachable!()
         };
@@ -18909,6 +19712,30 @@ mod tests {
             (1..report.over_limit_tiles).contains(merged_tiles),
             "{merged_tiles} of {}",
             report.over_limit_tiles
+        );
+        let reduced: usize = report
+            .diagnostics
+            .iter()
+            .filter_map(|d| {
+                if let crate::diagnostics::Diagnostic::ExtentReduced {
+                    count, min_extent, ..
+                } = d
+                {
+                    assert_eq!(*min_extent, MIN_VALVE_EXTENT);
+                    Some(*count)
+                } else {
+                    None
+                }
+            })
+            .sum();
+        assert!(reduced > 0);
+        assert_eq!(
+            reduced,
+            report
+                .zooms
+                .iter()
+                .map(|z| z.reduced_extent_tiles)
+                .sum::<usize>()
         );
     }
 
@@ -22871,6 +23698,99 @@ mod tests {
 mod diagnostic_row_alignment {
     use super::*;
 
+    /// A kept merge's absorbed rows have the same cause whether dropping
+    /// singles fits the tile or the extent backstop must finish it.
+    #[test]
+    fn merge_valve_source_causes_do_not_depend_on_extent_backstop() {
+        use crate::diagnostics::{Diagnostics, SourceLossCause};
+
+        let members: Vec<_> = [
+            Geometry::LineString(geo::LineString::from(vec![(-10., 0.), (10., 0.)])),
+            Geometry::LineString(geo::LineString::from(vec![(-10., 0.), (10., 0.)])),
+            Geometry::Point(geo::Point::new(0., 0.)),
+            Geometry::Point(geo::Point::new(0., 0.)),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(row, geom)| Member {
+            key: 0,
+            seq: row as u64,
+            geom: geom.into(),
+            props: SharedProps::new(vec![]),
+            id: Some(100 + row as u64),
+            gap: if row == 0 { GAP_NONE } else { 1 },
+            band: 0,
+        })
+        .collect();
+        let mut opts = ExportOptions {
+            feature_id: Some("id".into()),
+            size_valve: SizeValve::Merge,
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let cache = test_gzip_cache();
+        let tb = TileCoord::new(0, 0, 0).bounds();
+        let ordered: Vec<_> = members.iter().collect();
+        let merged = coalesce_valve::coalesce_members(&ordered, 2);
+        // Exactly enough room for the merged lines and one unmerged point.
+        let singles_limit = build_mvt(
+            &cache,
+            &merged[..2],
+            &tb,
+            &opts,
+            &[],
+            &Diagnostics::default(),
+        )
+        .data
+        .len();
+        let merged_limit = build_mvt(&cache, &merged, &tb, &opts, &[], &Diagnostics::default())
+            .data
+            .len();
+        for (limit, dropped, backstop) in [
+            (merged_limit, 0, false),
+            (1, 2, true),
+            (singles_limit, 1, false),
+        ] {
+            opts.tile_size_limit = Some(limit);
+            let diagnostics = Diagnostics::default();
+            let mvt = encode_tile(
+                &cache,
+                &members,
+                &tb,
+                &opts,
+                &[],
+                &mut FillTally::default(),
+                &diagnostics,
+            );
+            assert_eq!(mvt.valve.reduced_extent.is_some(), backstop);
+            assert_eq!(mvt.valve.merged, 1);
+            assert_eq!(mvt.valve.dropped, dropped);
+            assert!(mvt.source_ids.contains(&0), "merged feature is kept");
+            account_sources(&members, &mvt, 0, &opts, &diagnostics).unwrap();
+            let losses = diagnostics.source_losses().unwrap();
+            let actual: Vec<_> = losses
+                .iter()
+                .map(|loss| {
+                    let loss = loss.unwrap();
+                    assert_eq!(loss.feature_id, Some(100 + loss.id));
+                    (loss.id, loss.cause)
+                })
+                .collect();
+            let mut expected = vec![(1, SourceLossCause::Merged)];
+            if dropped == 2 {
+                expected.push((2, SourceLossCause::ValveDropped));
+            }
+            if dropped > 0 {
+                expected.push((3, SourceLossCause::ValveDropped));
+            }
+            assert_eq!(actual, expected, "backstop={backstop}");
+            assert_eq!(
+                mvt.source_losses, expected,
+                "valve records each source's cause"
+            );
+        }
+    }
+
     #[test]
     fn mutation_regression_source_loss_valve_causes() {
         use crate::diagnostics::{Diagnostics, SourceLossCause};
@@ -22910,10 +23830,11 @@ mod diagnostic_row_alignment {
                 vec![line(), line(), point(), point()],
                 SizeValve::Merge,
                 Some(1),
-                1,
+                2,
                 1,
                 vec![
-                    (1, SourceLossCause::ValveDropped),
+                    (1, SourceLossCause::Merged),
+                    (2, SourceLossCause::ValveDropped),
                     (3, SourceLossCause::ValveDropped),
                 ],
             ),

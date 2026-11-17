@@ -2697,8 +2697,8 @@ fn cap_joined_tile(
         // DIVERGENCE FROM TIPPECANOE: tile-join.cpp:884 skips oversized
         // joined tiles. Without every band's overview, we drop features
         // across layers, copying geometry commands without re-clipping.
-        // A join retried by the source valve must keep its merged features
-        // even when it still exceeds a cap (#873).
+        // A join retried by the source valve is left to that valve, whose
+        // own fallbacks (#873) decide what still exceeds a cap.
         let count = drop_joined_tile(raw, &mut gzip, export).map_err(|error| {
             PyramidError::TileCompress {
                 z: coord.z,
@@ -5661,7 +5661,7 @@ mod tests {
     }
 
     #[test]
-    fn pyramid_joined_source_valve_keeps_merged_features_over_cap() {
+    fn pyramid_joined_source_valve_leaves_one_feature_over_an_unreachable_cap() {
         let dir = tempfile::tempdir().unwrap();
         let geoms = (0..4)
             .map(|i| {
@@ -5693,28 +5693,22 @@ mod tests {
             },
         )
         .unwrap();
+        // One valve across both layers (#873's fallbacks included): an
+        // unreachable cap leaves a lone feature in the whole joined tile.
         let tile = crate::vector_tile::Tile::decode(decoded_tiles(&output)[&0].as_slice()).unwrap();
-        assert_eq!(tile.layers.len(), 2);
-        assert!(tile.layers.iter().all(|l| l.features.len() == 1));
         assert_eq!(
-            report
-                .diagnostics
-                .iter()
-                .filter_map(|d| match d {
-                    crate::diagnostics::Diagnostic::Merged { count } => Some(count),
-                    _ => None,
-                })
-                .sum::<usize>(),
-            6,
-            "eight source features become two output features"
+            tile.layers.iter().map(|l| l.features.len()).sum::<usize>(),
+            1
         );
-        assert!(report.diagnostics.iter().any(|d| matches!(d,
-            crate::diagnostics::Diagnostic::TilesOverLimit { merged_tiles, .. } if *merged_tiles > 0
-        )));
-        assert!(!report
+        let over: usize = report
             .diagnostics
             .iter()
-            .any(|d| matches!(d, crate::diagnostics::Diagnostic::ValveDropped { .. })));
+            .filter_map(|d| match d {
+                crate::diagnostics::Diagnostic::TilesOverLimit { count, .. } => Some(*count),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(over, 1, "the one output tile over the cap is counted once");
     }
 
     #[test]

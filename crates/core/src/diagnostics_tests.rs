@@ -518,9 +518,9 @@ fn over_limit_tiles_merge_across_runs_and_stay_bounded() {
     assert_eq!(*largest, expected);
     assert!(events[0]
         .to_string()
-        .contains("; 8 of them hold merged features"));
+        .contains("; 8 of them hold a single merged feature over the cap at the extent floor"));
     // Tiles with nothing merged (the drop valve's, a report from before
-    // #873) get no pointer to `--size-valve drop`.
+    // #873) get no merged-feature explanation.
     let legacy: Diagnostic =
         serde_json::from_str(r#"{"kind":"tiles_over_limit","count":1}"#).unwrap();
     assert_eq!(
@@ -536,5 +536,56 @@ fn over_limit_tiles_merge_across_runs_and_stay_bounded() {
         unmerged.to_string(),
         "1 tile(s) still over the size limit, written as is; \
          largest: z9/0/0 (600 B compressed)"
+    );
+}
+
+#[test]
+fn valve_losses_and_reduced_extents_aggregate_by_zoom() {
+    let sink = Diagnostics::default();
+    sink.extend([
+        Diagnostic::MergedDropped {
+            count: 2,
+            sources: 20,
+        },
+        Diagnostic::MergedDropped {
+            count: 1,
+            sources: 30,
+        },
+        Diagnostic::ExtentReduced {
+            count: 2,
+            zoom: 8,
+            min_extent: 2048,
+        },
+        Diagnostic::ExtentReduced {
+            count: 3,
+            zoom: 8,
+            min_extent: 512,
+        },
+        Diagnostic::ExtentReduced {
+            count: 1,
+            zoom: 9,
+            min_extent: 1024,
+        },
+    ]);
+    let events = sink.snapshot();
+    assert_eq!(events.len(), 3);
+    assert!(events.contains(&Diagnostic::MergedDropped {
+        count: 3,
+        sources: 50
+    }));
+    assert!(events.contains(&Diagnostic::ExtentReduced {
+        count: 5,
+        zoom: 8,
+        min_extent: 512
+    }));
+    assert!(events.contains(&Diagnostic::ExtentReduced {
+        count: 1,
+        zoom: 9,
+        min_extent: 1024
+    }));
+    let json = serde_json::to_string(&events).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<Diagnostic>>(&json).unwrap(),
+        events
     );
 }
