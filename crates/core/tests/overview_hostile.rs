@@ -37,6 +37,7 @@ use tylertoo_io::open_parquet;
 use tylertoo_io::test_support::ArrowWriter;
 use tylertoo_io::KeyValue;
 
+use tylertoo_core::internal::overview::assign::MIN_DENSITY_LEVEL_FEATURES;
 use tylertoo_core::internal::overview::check::validate_file;
 use tylertoo_core::internal::overview::convert::{
     convert_to_overviews, ConvertError, ConvertOptions, InvalidOption, LevelPlan,
@@ -2900,7 +2901,7 @@ fn visible_squares_and_tiny_fields(big: usize) -> Vec<Option<Geometry<f64>>> {
 /// The level's density budget for `n` budgeted features, `steps` levels
 /// above the canonical one (`apply_density_budget`'s `effective_budget`).
 fn level_budget(n: usize, drop_rate: f64, steps: i32) -> usize {
-    ((n as f64 / drop_rate.powi(steps)).round() as usize).max(256)
+    ((n as f64 / drop_rate.powi(steps)).round() as usize).max(MIN_DENSITY_LEVEL_FEATURES)
 }
 
 /// Convert [`visible_squares_and_tiny_fields`] at z8..z12 with
