@@ -872,8 +872,12 @@ impl<T: Read> Wire for StreamWire<T> {
     }
 
     fn advance(&mut self, n: u64) -> Result<(), SkimStop> {
+        // Never read past the chunk: a remote one's neighbours may be pruned.
+        if n > self.left {
+            return Err(SkimStop::Short);
+        }
         let copied = std::io::copy(&mut (&mut self.inner).take(n), &mut std::io::sink());
-        if n > self.left || copied.ok() != Some(n) {
+        if copied.ok() != Some(n) {
             return Err(SkimStop::Short);
         }
         self.left -= n;
@@ -4320,6 +4324,16 @@ mod tests {
         // An unknown wire type on an unknown field, or the end of the bytes:
         // parquet-rs stops there too.
         assert!(!refused(&[0x9e]));
+        // A 2 MB binary in a 16-byte chunk stops the walk before it is read.
+        let file = [0x98, 0x80, 0x80, 0x80, 0x01].chain(std::io::repeat(0));
+        let mut s = Skim {
+            wire: StreamWire {
+                inner: file.take(1 << 30),
+                left: 16,
+            },
+        };
+        assert!(check_header(&span, &mut s).is_none());
+        assert_eq!(s.wire.inner.limit(), (1 << 30) - 5);
         assert!(!refused(&[0x15, 0x04, 0x15]));
     }
 
