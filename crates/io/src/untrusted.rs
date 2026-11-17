@@ -4353,6 +4353,51 @@ mod tests {
         assert_eq!(*longest.lock().unwrap(), PAGE_PEEK as usize);
     }
 
+    /// A page header longer than the first read-ahead window (here page
+    /// statistics of untruncated 20 KB strings) is read in a wider one and
+    /// served whole to parquet-rs.
+    #[test]
+    fn a_page_header_longer_than_the_first_window_reads() {
+        use arrow_array::{ArrayRef, StringArray};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+        let big = |c: char| c.to_string().repeat(20_000);
+        let strings = StringArray::from_iter_values([big('a'), big('b')]);
+        let batch = RecordBatch::try_from_iter([("s", Arc::new(strings) as ArrayRef)]).unwrap();
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_statistics_truncate_length(None)
+            .set_write_page_header_statistics(true)
+            .build();
+        let mut file = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let at = open_parquet(Bytes::from(file.clone()))
+            .unwrap()
+            .metadata()
+            .row_group(0)
+            .column(0)
+            .byte_range()
+            .0 as usize;
+        let span = ChunkSpan {
+            start: 0,
+            end: u64::MAX,
+            value_bits: 32,
+            raw: true,
+        };
+        let first = &file[at..at + PAGE_PEEK as usize];
+        assert!(matches!(check_header(&span, first), Peeked::More));
+        let read: usize = open_parquet(Bytes::from(file))
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(read, 2);
+    }
+
     /// #894's page guard passes honest dictionaries at their smallest plain
     /// width (an `INT32`, an empty string's 4-byte length), compressed or
     /// not.
