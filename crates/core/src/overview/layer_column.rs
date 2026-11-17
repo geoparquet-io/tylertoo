@@ -839,6 +839,7 @@ pub(super) fn convert_by_layer(
         output,
         &BandMergeOptions {
             allow_missing_zooms: false,
+            profile: options.convert.profile,
             metadata: options.export.metadata.clone(),
             // The layers' archives are spooled there already.
             spill_dir: Some(dir.clone()),

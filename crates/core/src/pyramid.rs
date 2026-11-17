@@ -39,7 +39,7 @@ use crate::overview::export::{export_pmtiles, ExportError, ExportOptions};
 use crate::pmtiles_metadata::{MetadataCollector, Resolved};
 use crate::pmtiles_writer::{Header, StreamingPmtilesWriter, TileType, MAX_TILE_ID_ZOOM};
 use crate::tile::TileBounds;
-use crate::{Error, TilesetMetadata};
+use crate::{Error, MemoryProfile, TilesetMetadata};
 
 /// Why a pyramid build or band merge failed (#438).
 ///
@@ -1899,12 +1899,16 @@ pub struct BandMergeOptions {
     /// Where the merge spools tile bytes before writing the archive.
     /// `None` is the system temporary directory.
     pub spill_dir: Option<PathBuf>,
+    /// Shared-zoom combine concurrency: at most eight workers for Auto/Speed,
+    /// or sequentially on the calling thread for Bounded.
+    pub profile: MemoryProfile,
 }
 
 with_setters!(BandMergeOptions {
     with_allow_missing_zooms => allow_missing_zooms: bool,
     with_metadata => metadata: TilesetMetadata,
     with_spill_dir => spill_dir: Option<PathBuf>,
+    with_profile => profile: MemoryProfile,
 });
 
 /// How the one-shot pyramid tiles each GeoParquet band.
@@ -2352,6 +2356,7 @@ fn build_pyramid_validated(
         output,
         &BandMergeOptions {
             allow_missing_zooms: opts.allow_missing_zooms,
+            profile: opts.export.profile,
             metadata: opts.metadata.clone(),
             spill_dir: opts
                 .export
@@ -2537,6 +2542,10 @@ fn gzip_plain_bound(raw: &[u8]) -> u64 {
 }
 
 impl MergeTileGroup {
+    fn combine(&self, bands: &[Band]) -> Result<(Vec<u8>, Vec<u8>), PyramidError> {
+        combine_joined_tile(&self.raw, &self.refs, self.coord, bands, true)
+    }
+
     fn memory_bound(&self) -> usize {
         self.raw
             .iter()
@@ -2551,6 +2560,26 @@ impl MergeTileGroup {
             })
             .sum()
     }
+}
+
+fn prepare_combine_pool(
+    pool: &mut Option<rayon::ThreadPool>,
+    profile: MemoryProfile,
+    run: &[MergeTileGroup],
+) -> Result<(), PyramidError> {
+    if profile != MemoryProfile::Bounded
+        && pool.is_none()
+        && run.iter().any(|tile| tile.raw.len() > 1)
+    {
+        // Combine RSS was 393/666/1800 MB at 8/16/64 workers (~25 MB each), so cap at eight.
+        *pool = Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(rayon::current_num_threads().min(8))
+                .build()
+                .map_err(std::io::Error::other)?,
+        );
+    }
+    Ok(())
 }
 
 fn gather_merge_tile(
@@ -2763,16 +2792,15 @@ fn merge_prepared_bands(
         const RUN_GROUPS: usize = 1024;
         let mut run = Vec::<MergeTileGroup>::new();
         let mut run_bytes = 0;
+        let mut combine_pool: Option<rayon::ThreadPool> = None;
         let mut flush = |run: &mut Vec<MergeTileGroup>| -> Result<(), PyramidError> {
+            prepare_combine_pool(&mut combine_pool, options.profile, run)?;
+            let combine = |tile: &MergeTileGroup| (tile.raw.len() > 1).then(|| tile.combine(bands));
             // Collect every result so errors are returned by tile id, not worker completion order.
-            let results: Vec<_> = run
-                .par_iter()
-                .map(|tile| {
-                    (tile.raw.len() > 1).then(|| {
-                        combine_joined_tile(&tile.raw, &tile.refs, tile.coord, bands, true)
-                    })
-                })
-                .collect();
+            let results: Vec<_> = match &combine_pool {
+                Some(pool) => pool.install(|| run.par_iter().map(combine).collect()),
+                None => run.iter().map(combine).collect(),
+            };
             for (tile, result) in run.drain(..).zip(results) {
                 let coord = tile.coord;
                 match result {
@@ -4336,14 +4364,25 @@ mod tests {
                 .num_threads(threads)
                 .build()
                 .unwrap();
-            let output = dir.path().join(format!("merged-{threads}.pmtiles"));
-            let report = pool.install(|| merge_bands(&bands, &output)).unwrap();
-            assert_eq!(report.total_tiles, expected.len());
-            assert_eq!(
-                std::fs::read(output).unwrap(),
-                reference,
-                "{threads} threads"
-            );
+            for profile in [
+                crate::MemoryProfile::Auto,
+                crate::MemoryProfile::Speed,
+                crate::MemoryProfile::Bounded,
+            ] {
+                let output = dir
+                    .path()
+                    .join(format!("merged-{threads}-{profile:?}.pmtiles"));
+                let options = BandMergeOptions::default().with_profile(profile);
+                let report = pool
+                    .install(|| merge_bands_with_options(&bands, &output, &options))
+                    .unwrap();
+                assert_eq!(report.total_tiles, expected.len());
+                assert_eq!(
+                    std::fs::read(output).unwrap(),
+                    reference,
+                    "{threads} threads, {profile:?}"
+                );
+            }
         }
     }
 
