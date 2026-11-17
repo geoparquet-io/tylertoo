@@ -3052,9 +3052,9 @@ fn join_band_tiles(
     Ok(())
 }
 
-/// Screen with directory lengths and gzip trailers. Only candidates are
-/// joined and measured exactly. Retain over-cap ids; the merge
-/// fits one wave at a time.
+/// Screen with gzip trailers: a join whose summed raw size cannot deflate
+/// past a cap is skipped. Only candidates are joined and measured exactly.
+/// Retain over-cap ids; the merge fits one wave at a time.
 fn screen_joined_tiles(
     bands: &[Band],
     archives: &[BandArchive],
@@ -3102,18 +3102,16 @@ fn screen_joined_tiles(
         }
         // has_joint_sources above excludes archive inputs: only our own
         // single-member exports can be screened with ISIZE.
-        let stored = refs.iter().map(|(_, r)| r.len()).sum();
-        let raw_len = if export.tile_size_limit.is_some_and(|cap| cap > 0) {
-            refs.iter().try_fold(0, |sum, (bi, r)| {
-                let trailer = archives[*bi]
-                    .index
-                    .read_range(r.end.saturating_sub(4).max(r.start)..r.end)?;
-                Ok::<_, PyramidError>(sum + gzip_raw_len(&trailer))
-            })?
-        } else {
-            0
-        };
-        if !joined_over_limit(raw_len, stored, export) {
+        let raw_len = refs.iter().try_fold(0, |sum, (bi, r)| {
+            let trailer = archives[*bi]
+                .index
+                .read_range(r.end.saturating_sub(4).max(r.start)..r.end)?;
+            Ok::<_, PyramidError>(sum + gzip_raw_len(&trailer))
+        })?;
+        // The parts' gzip sizes do not bound the join's: one deflate block
+        // then codes both layers' symbols (+20% in the test below). Stored
+        // deflate does: 5 bytes per 64 KiB block plus the gzip frame.
+        if !joined_over_limit(raw_len, raw_len + raw_len / 1024 + 64, export) {
             continue;
         }
         join_band_tiles(bands, archives, &mut cache, &refs, coord, &mut raw)?;
@@ -6384,6 +6382,81 @@ mod tests {
         )
         .unwrap();
         (dir, report)
+    }
+
+    #[test]
+    fn joined_screen_measures_joins_near_the_gzip_cap() {
+        // A join can deflate worse than the sum of its separately compressed
+        // parts, so the screen cannot skip it on the parts' sizes.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut text = |base: u8| {
+            (0..10_000)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1);
+                    char::from(base + (state >> 59) as u8 % 26)
+                })
+                .collect::<String>()
+        };
+        // Disjoint alphabets: one deflate block spanning both layers needs a
+        // larger code than either part.
+        let bands = [("a", b'a'), ("b", b'A')].map(|(name, base)| {
+            let input = dir.path().join(format!("{name}.parquet"));
+            let geoms = (0..4)
+                .map(|i| {
+                    let x = -40.0 + f64::from(i) * 20.0;
+                    Some(
+                        geo::Rect::new((x, 0.0), (x + 10.0, 10.0))
+                            .to_polygon()
+                            .into(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let values =
+                arrow_array::StringArray::from((0..4).map(|_| text(base)).collect::<Vec<_>>());
+            crate::overview::testutil::write_input_with_column(
+                &input,
+                &geoms,
+                "s",
+                std::sync::Arc::new(values),
+                None,
+            );
+            Band::new(input, name, 0, 0)
+        });
+        let stored = |bands: &[Band], cap: Option<usize>| {
+            let output = dir
+                .path()
+                .join(format!("out-{}-{cap:?}.pmtiles", bands.len()));
+            build_pyramid(
+                bands,
+                &output,
+                &PyramidOptions {
+                    export: ExportOptions {
+                        tile_size_limit: None,
+                        compressed_tile_size_limit: cap,
+                        ..Default::default()
+                    },
+                    work_dir: Some(dir.path().to_path_buf()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let bytes = std::fs::read(&output).unwrap();
+            let header = Header::from_bytes(&bytes[..127]).unwrap();
+            crate::pmtiles_writer::read_all_entries(&bytes, &header).unwrap()[0].length as usize
+        };
+        let parts = stored(&bands[..1], None) + stored(&bands[1..], None);
+        let joined = stored(&bands, None);
+        assert!(
+            joined > parts,
+            "the fixture's join deflates worse: {joined} vs {parts}"
+        );
+        assert!(
+            stored(&bands, Some(parts)) <= parts,
+            "the join was refitted"
+        );
     }
 
     #[test]
