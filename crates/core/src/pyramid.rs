@@ -3209,6 +3209,7 @@ impl<'a> JoinedTileRetry<'a> {
         archives: &[BandArchive],
         joint: Option<(&'a ExportOptions, &'a [Vec<JointSource>])>,
         profile: MemoryProfile,
+        diagnostics: &crate::diagnostics::Diagnostics,
     ) -> Result<Self, PyramidError> {
         let pending = screen_joined_tiles(bands, archives, joint, profile)?;
         let fitter = if let Some((_, sources)) = joint.filter(|_| !pending.is_empty()) {
@@ -3224,12 +3225,11 @@ impl<'a> JoinedTileRetry<'a> {
         Ok(Self {
             pending: pending
                 .into_iter()
-                .map(|(zoom, tiles)| {
-                    let width = fitter
-                        .as_ref()
-                        .expect("pending joins have a fitter")
-                        .tile_wave(&tiles, joint.expect("pending joins have caps").0);
-                    (zoom, PendingJoinedTiles { tiles, width })
+                .filter_map(|(zoom, tiles)| {
+                    let fitter = fitter.as_ref().expect("pending joins have a fitter");
+                    let tiles = fitter.within_memory(tiles, diagnostics);
+                    let width = fitter.tile_wave(&tiles, joint.expect("pending joins have caps").0);
+                    (!tiles.is_empty()).then_some((zoom, PendingJoinedTiles { tiles, width }))
                 })
                 .collect(),
             fitter,
@@ -3585,7 +3585,7 @@ fn merge_prepared_bands(
             tile_type,
             joint,
             shared_zooms: &shared_zooms,
-            retry: JoinedTileRetry::new(bands, &archives, joint, options.profile)?,
+            retry: JoinedTileRetry::new(bands, &archives, joint, options.profile, diagnostics)?,
             diagnostics,
             buf: Vec::new(),
         };
@@ -6179,6 +6179,7 @@ mod tests {
                 &archives,
                 Some((&export, &sources)),
                 MemoryProfile::Bounded,
+                &crate::diagnostics::Diagnostics::default(),
             )
             .unwrap();
             assert!(retry.pending.is_empty());
@@ -6579,13 +6580,21 @@ mod tests {
         let b = run(&bands[1..], None, "b.pmtiles").unwrap();
         // Each layer fits alone; the join does not, so the retry runs.
         let cap = a.max(b) + a.min(b) / 2;
-        let tmpdir = std::env::var_os("TMPDIR");
+        // Restored on drop, even if the run panics. nextest runs each test in
+        // its own process; under plain `cargo test` run this one alone.
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(previous) => std::env::set_var("TMPDIR", previous),
+                    None => std::env::remove_var("TMPDIR"),
+                }
+            }
+        }
+        let restore = Restore(std::env::var_os("TMPDIR"));
         std::env::set_var("TMPDIR", dir.path().join("missing"));
         let joined = run(&bands, Some(cap), "out.pmtiles");
-        match tmpdir {
-            Some(previous) => std::env::set_var("TMPDIR", previous),
-            None => std::env::remove_var("TMPDIR"),
-        }
+        drop(restore);
         assert!(joined.unwrap() <= cap);
     }
 

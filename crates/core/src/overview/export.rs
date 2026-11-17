@@ -9777,6 +9777,36 @@ impl<'a> JoinedTileFitter<'a> {
         )
     }
 
+    /// The joins this fitter may refit; the rest are reported and left to
+    /// the source valves (see [`joined_tiles_within`]).
+    pub(crate) fn within_memory(
+        &self,
+        tiles: BTreeSet<u64>,
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) -> BTreeSet<u64> {
+        let limit = probe_oom_memory_limit().filter(|limit| {
+            limit.source != MemoryLimitSource::Override && !skip_memory_preflight_from_env()
+        });
+        let Some(limit) = limit else {
+            return tiles;
+        };
+        let fit = joined_tiles_within(
+            &tiles,
+            self.sources.iter().map(|s| &s.source.members),
+            limit,
+        );
+        if let Some(first) = tiles.difference(&fit).next() {
+            diagnostics.warn(format!(
+                "{} joined tile(s) over a size cap (first id {first}) were not refitted: \
+                 their members across layers exceed the {} of {} bytes",
+                tiles.len() - fit.len(),
+                limit.source.describe(),
+                limit.bytes
+            ));
+        }
+        fit
+    }
+
     pub(crate) fn open(
         sources: impl IntoIterator<Item = &'a JointSource>,
     ) -> Result<Self, ExportError> {
@@ -9823,14 +9853,6 @@ impl<'a> JoinedTileFitter<'a> {
         #[cfg(test)]
         joined_tile_probe::ZOOMS.with(|zooms| zooms.set(zooms.get() | (1 << zoom)));
         let started = Instant::now();
-        let tiles = &joined_tiles_within(
-            tiles,
-            self.sources.iter().map(|s| &s.source.members),
-            opts,
-            probe_oom_memory_limit().filter(|limit| {
-                limit.source != MemoryLimitSource::Override && !skip_memory_preflight_from_env()
-            }),
-        );
         let replay = &crate::diagnostics::Diagnostics::silent();
         // The replay's discarded loss ledger still spills; keep it where the
         // source exports spilled, never the system temp directory.
@@ -10001,32 +10023,27 @@ fn joined_tile_resident<'a>(
     })
 }
 
-/// The joins whose members fit `limit` together. An export refuses a tile
-/// that cannot (#665), but each source export already wrote its part, so a
-/// join that cannot is not refitted: it keeps the source valves' result and
-/// the over-cap warning instead of risking an OOM kill.
+/// The joins whose members fit `limit` together, priced as [`check_levels_fit`]
+/// prices a tile. An export refuses a tile that cannot (#665), but each source
+/// export already wrote its part, so a join that cannot is not refitted: it
+/// keeps the source valves' result and the over-cap warning instead of
+/// risking an OOM kill.
 fn joined_tiles_within<'a>(
     tiles: &BTreeSet<u64>,
     sources: impl Iterator<Item = &'a JointMembers> + Clone,
-    opts: &ExportOptions,
-    limit: Option<MemoryLimit>,
+    limit: MemoryLimit,
 ) -> BTreeSet<u64> {
-    let Some(limit) = limit else {
-        return tiles.clone();
-    };
-    let (fit, unfit): (BTreeSet<u64>, BTreeSet<u64>) = tiles
+    tiles
         .iter()
-        .partition(|&&id| joined_tile_resident(id, sources.clone(), opts) <= limit.bytes);
-    if let Some(first) = unfit.first() {
-        log::warn!(
-            "[export] {} joined tile(s) over a size cap (first id {first}) are not refitted: \
-             their members across layers exceed the {} of {} bytes",
-            unfit.len(),
-            limit.source.describe(),
-            limit.bytes
-        );
-    }
-    fit
+        .copied()
+        .filter(|id| {
+            let resident = sources.clone().fold(0u64, |total, source| {
+                let count = source.tile_counts.get(id).copied().unwrap_or(0) as u64;
+                total.saturating_add(count.saturating_mul(source.member_bytes.unwrap_or(0)))
+            });
+            resident <= limit.bytes
+        })
+        .collect()
 }
 
 /// A fitted join, already gzipped by the parallel export encoder.
@@ -20271,7 +20288,6 @@ mod tests {
 
     #[test]
     fn joined_refit_skips_a_join_whose_members_exceed_memory() {
-        let opts = ExportOptions::default();
         let per_member = member_resident_bytes(600, 4);
         let layer = JointMembers {
             tile_counts: BTreeMap::from([(1, 100), (2, 1_000_000)]),
@@ -20279,15 +20295,15 @@ mod tests {
         };
         let pending = BTreeSet::from([1, 2]);
         let both = [&layer, &layer];
-        let one_dense = 1_000_000 * export_member_resident_bytes(per_member, &opts);
         // Each layer's share of tile 2 fits; the two together do not.
-        let ram = limit(one_dense + one_dense / 2, MemoryLimitSource::MemAvailable);
+        let ram = limit(1_500_000 * per_member, MemoryLimitSource::MemAvailable);
         assert_eq!(
-            joined_tiles_within(&pending, both.into_iter(), &opts, Some(ram)),
+            joined_tiles_within(&pending, both.into_iter(), ram),
             BTreeSet::from([1])
         );
+        let roomy = limit(2_000_000 * per_member, MemoryLimitSource::MemAvailable);
         assert_eq!(
-            joined_tiles_within(&pending, both.into_iter(), &opts, None),
+            joined_tiles_within(&pending, both.into_iter(), roomy),
             pending
         );
     }
