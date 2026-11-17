@@ -81,8 +81,9 @@ Args:
         tippecanoe's `-S`, which uses tile units at every zoom:
         `-S 10` is about factor 2.5.
     no_simplification_of_shared_nodes: Set `True` to rebuild and keep
-        shared-border pins at the finest zoom. Acts only with an explicit
-        `max_zoom_simplify_factor` above 0. Defaults to `False`.
+        shared-border pins at the finest zoom. Acts only when you set
+        `max_zoom_simplify_factor` above 0 or use `preset="tippecanoe"`,
+        which sets it to 0.25. Defaults to `False`.
     coverage_fill: Experimental: under each tile's features, draw
         the area its child tiles cover, so a polygon coverage shows
         no holes at coarse zooms. Holds the finest level's geometry
