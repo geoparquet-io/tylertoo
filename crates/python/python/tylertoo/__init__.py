@@ -273,11 +273,19 @@ ZoomReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
         "fill_vertices": "int",
         "fill_shed": "int",
         "stopped_tiles": "int",
+        "reduced_extent_tiles": "int",
+        "min_reduced_extent": "int | None",
+        "dropped_merged_features": "int",
+        "dropped_merged_sources": "int",
     },
 )
 ZoomReport.__doc__ = """Tile and feature counts for one exported zoom.
 
 Attributes:
+    reduced_extent_tiles: Tiles written at a coarser grid by the merge valve.
+    min_reduced_extent: Smallest grid used for those tiles; None otherwise.
+    dropped_merged_features: Whole merged features shed at the extent floor.
+    dropped_merged_sources: Source features carried by those dropped merges.
     stopped_tiles: Tiles at this zoom that end their branch, with
         nothing stored below (`variable_depth=True`); 0 otherwise."""
 
@@ -347,8 +355,11 @@ Attributes:
         tiles that triggered size reduction. The report prints one
         summary line for these tiles; its `tiles_over_limit` diagnostic
         lists the largest ten (`z`, `x`, `y`, compressed `bytes`) under
-        `largest`, and counts those holding merged features under
-        `merged_tiles`.
+        `largest`. Under `size_valve="merge"`, in a tile of lines or
+        polygons, only a lone feature still over the cap at the extent
+        floor is written over it, with a warning. Merged features are
+        never split into their sources.
+        `merged_tiles` counts tiles whose lone survivor is merged.
     merged_features: Tile features merged into a neighbor to fit a
         size limit (`size_valve="merge"`).
     valve_dropped_features: Tile features dropped to fit a size
