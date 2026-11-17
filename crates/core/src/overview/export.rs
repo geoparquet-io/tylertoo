@@ -10250,7 +10250,7 @@ fn check_mlt(mvt: &TileMvt) -> Result<(), ExportError> {
 /// Encodes the drop valve may take before it gives up and writes the tile
 /// over its limit. Each pass keeps the share of the last that fit, so a
 /// tile needing more than a few is pathological.
-const MAX_DROP_PASSES: u32 = 8;
+pub(crate) const MAX_DROP_PASSES: u32 = 8;
 
 /// How many of `keep` features the drop loops keep on cut `cut` (0-based)
 /// of a tile at `fit`: the share that fits, with tippecanoe's 0.8 margin

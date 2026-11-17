@@ -3327,12 +3327,18 @@ fn drop_joined_tile(
         crate::overview::export::select_kept_by_size(&features, total, point_like, |(_, f)| {
             f.geometry.len()
         });
-    let encode = |keep: usize, raw: &mut Vec<u8>| -> Result<Vec<u8>, std::io::Error> {
-        let kept = if point_like {
-            crate::overview::export::select_kept_by_size(&features, keep, true, |_| 0)
-        } else {
-            ranked[..keep].to_vec()
-        };
+    // The search needs nested selections, and point strides do not nest:
+    // order points by bit-reversed index, so each prefix spreads evenly.
+    let points = point_like.then(|| {
+        let bits = usize::BITS - (total - 1).leading_zeros();
+        let mut order = ranked.clone();
+        order.sort_by_key(|(index, _)| index.reverse_bits() >> (usize::BITS - bits));
+        order
+    });
+    let nested = points.as_deref().unwrap_or(&ranked);
+    let encode = |kept: &[&(usize, &crate::vector_tile::tile::Feature)],
+                  raw: &mut Vec<u8>|
+     -> Result<Vec<u8>, std::io::Error> {
         let mut selected = vec![false; total];
         for (index, _) in kept {
             selected[*index] = true;
@@ -3349,19 +3355,7 @@ fn drop_joined_tile(
             if mask.iter().all(|&keep| keep) {
                 raw.extend_from_slice(&original[range.clone()]);
             } else {
-                let mut kept = crate::vector_tile::tile::Layer {
-                    version: layer.version,
-                    name: layer.name.clone(),
-                    features: (layer.features.iter().zip(mask))
-                        .filter(|&(_, &keep)| keep)
-                        .map(|(f, _)| f.clone())
-                        .collect(),
-                    keys: layer.keys.clone(),
-                    values: layer.values.clone(),
-                    extent: layer.extent,
-                };
-                prune_joined_layer(&mut kept);
-                prost::encoding::message::encode(3, &kept, raw);
+                prost::encoding::message::encode(3, &joined_layer_subset(layer, mask), raw);
             }
             offset += layer.features.len();
             layer_index += 1;
@@ -3373,24 +3367,40 @@ fn drop_joined_tile(
     // The byte budget picks the first keep count. When that misses, search
     // the ranked prefix below it: one probe scaled by the measured overshoot,
     // then bisection until the largest fit is within 1/16 of the smallest
-    // miss. A crafted tile costs at most 2 + ceil(log2(first)) encode and
-    // gzip passes.
+    // miss. Like the export valve, a tile gets at most MAX_DROP_PASSES encode
+    // and gzip passes; the last one falls to the one-feature floor when
+    // nothing has fit yet.
+    let passes = crate::overview::export::MAX_DROP_PASSES as usize;
     let first = joined_budget_keep(&tile, &ranked, original.len(), fit);
-    *gzip = encode(first, raw)?;
+    let stride;
+    *gzip = encode(
+        if point_like {
+            stride = crate::overview::export::select_kept_by_size(&features, first, true, |_| 0);
+            &stride
+        } else {
+            &ranked[..first]
+        },
+        raw,
+    )?;
     let mut kept = first;
     if joined_over_limit(raw.len(), gzip.len(), opts) {
         // low fits (0: no fit yet, one feature is the floor); high misses.
         let (mut low, mut high) = (0, first);
         let mut scaled = (first as f64 * joined_tile_fit(raw.len(), gzip.len(), opts)) as usize;
         let mut best: Option<(Vec<u8>, Vec<u8>)> = None;
-        while high - low > 1 && (low == 0 || high - low > high / 16) {
-            let keep = if low < scaled && scaled < high {
+        for pass in 2..=passes {
+            if high - low <= 1 || (low > 0 && high - low <= high / 16) {
+                break;
+            }
+            let keep = if low == 0 && pass == passes {
+                1
+            } else if low < scaled && scaled < high {
                 scaled
             } else {
                 low + (high - low) / 2
             };
             scaled = 0;
-            *gzip = encode(keep, raw)?;
+            *gzip = encode(&nested[..keep], raw)?;
             kept = keep;
             if joined_over_limit(raw.len(), gzip.len(), opts) {
                 high = keep;
@@ -3471,36 +3481,51 @@ fn joined_mvt_fields(raw: &[u8]) -> Result<Vec<(u32, std::ops::Range<usize>)>, p
     Ok(fields)
 }
 
-fn prune_joined_layer(layer: &mut crate::vector_tile::tile::Layer) {
-    // Mark used entries, then compact in dictionary order and remap tag pairs.
-    fn compact<T>(entries: &mut Vec<T>, remap: &mut [u32]) {
-        let mut old = 0;
-        let mut next = 0;
-        entries.retain(|_| {
-            let keep = remap[old] != u32::MAX;
-            if keep {
-                remap[old] = next;
-                next += 1;
+/// The layer with only the masked features. It copies only the dictionary
+/// entries they use, in dictionary order, and remaps their tag pairs.
+fn joined_layer_subset(
+    layer: &crate::vector_tile::tile::Layer,
+    mask: &[bool],
+) -> crate::vector_tile::tile::Layer {
+    fn used<T: Clone>(entries: &[T], remap: &mut [u32]) -> Vec<T> {
+        let mut kept = Vec::new();
+        for (entry, slot) in entries.iter().zip(remap) {
+            if *slot != u32::MAX {
+                *slot = kept.len() as u32;
+                kept.push(entry.clone());
             }
-            old += 1;
-            keep
-        });
+        }
+        kept
     }
+    let mut features: Vec<_> = (layer.features.iter().zip(mask))
+        .filter(|&(_, &keep)| keep)
+        .map(|(f, _)| f.clone())
+        .collect();
     let mut keys = vec![u32::MAX; layer.keys.len()];
     let mut values = vec![u32::MAX; layer.values.len()];
-    for feature in &layer.features {
+    for feature in &features {
         for pair in feature.tags.as_chunks::<2>().0 {
             keys[pair[0] as usize] = 0;
             values[pair[1] as usize] = 0;
         }
     }
-    compact(&mut layer.keys, &mut keys);
-    compact(&mut layer.values, &mut values);
-    for feature in &mut layer.features {
+    let (kept_keys, kept_values) = (
+        used(&layer.keys, &mut keys),
+        used(&layer.values, &mut values),
+    );
+    for feature in &mut features {
         for pair in feature.tags.as_chunks_mut::<2>().0 {
             pair[0] = keys[pair[0] as usize];
             pair[1] = values[pair[1] as usize];
         }
+    }
+    crate::vector_tile::tile::Layer {
+        version: layer.version,
+        name: layer.name.clone(),
+        features,
+        keys: kept_keys,
+        values: kept_values,
+        extent: layer.extent,
     }
 }
 
@@ -5947,7 +5972,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_bands_drop_converges_beyond_eight_passes_to_one_feature() {
+    fn merge_bands_drop_reaches_one_feature_within_the_pass_budget() {
         JOINED_DROP_PASSES.with(|passes| passes.set(0));
         let original = crate::vector_tile::Tile {
             layers: vec![
@@ -5977,7 +6002,7 @@ mod tests {
         assert!(raw.len() > cap, "the last feature cannot fit");
         JOINED_DROP_PASSES.with(|passes| {
             assert!(
-                passes.get() <= 31_usize.ilog2() as usize + 2,
+                passes.get() <= crate::overview::export::MAX_DROP_PASSES as usize,
                 "{} passes",
                 passes.get()
             )
@@ -5987,7 +6012,8 @@ mod tests {
     #[test]
     fn merge_bands_drop_pass_budget_holds_when_dictionaries_dominate() {
         // Each feature owns a large dictionary value, which the byte budget
-        // cannot reserve, so a re-ranking loop only sheds a quarter per pass.
+        // cannot reserve: a re-ranking loop sheds only a quarter per pass, and
+        // an unbounded bisection runs log2 n passes.
         let n = 2_000;
         let mut layer = feature_layer("b", Vec::new());
         layer.values = (0..n)
@@ -6021,9 +6047,49 @@ mod tests {
         .unwrap();
         assert_eq!(dropped, n - 1);
         assert!(raw.len() <= cap, "{} > {cap}", raw.len());
-        let budget = (n as u32).ilog2() as usize + 3;
+        let budget = crate::overview::export::MAX_DROP_PASSES as usize;
         JOINED_DROP_PASSES
             .with(|passes| assert!(passes.get() <= budget, "{} passes", passes.get()));
+    }
+
+    #[test]
+    fn merge_bands_drop_search_keeps_nested_point_selections() {
+        // One point owns a large property. Strides of different counts pick
+        // different points, so a stride search would see a miss at a count
+        // above a fit, and bisection would throw the fit away.
+        let mut layer = feature_layer("points", Vec::new());
+        layer.values = ["small".to_string(), "x".repeat(10_000)]
+            .map(|value| crate::vector_tile::tile::Value {
+                string_value: Some(value),
+                ..Default::default()
+            })
+            .to_vec();
+        layer.features = (0..100_u32)
+            .map(|i| crate::vector_tile::tile::Feature {
+                id: Some(u64::from(i)),
+                r#type: Some(crate::vector_tile::tile::GeomType::Point as i32),
+                geometry: vec![9, i * 2, i * 2],
+                tags: vec![0, u32::from(i == 37)],
+            })
+            .collect();
+        let tile = crate::vector_tile::Tile {
+            layers: vec![layer],
+        };
+        let cap = 1_200;
+        let mut raw = tile.encode_to_vec();
+        let mut gzip = compression::compress(&raw, Compression::Gzip).unwrap();
+        let dropped = drop_joined_tile(
+            &mut raw,
+            &mut gzip,
+            &ExportOptions {
+                tile_size_limit: Some(cap),
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(raw.len() <= cap, "{} > {cap}", raw.len());
+        assert!(dropped <= 45, "kept only {} points", 100 - dropped);
     }
 
     thread_local! {
@@ -6072,7 +6138,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_bands_drop_large_join_has_logarithmic_passes() {
+    fn merge_bands_drop_large_join_stays_within_the_pass_budget() {
         let tile = crate::vector_tile::Tile {
             layers: vec![
                 feature_layer("large", vec![line_feature(0, 100_000)]),
@@ -6099,8 +6165,7 @@ mod tests {
             // At most floor(3n/4) survive each pass, even when a cap is
             // only one byte below the original tile's size.
             assert!(50_001 - dropped <= 50_001 * 3 / 4);
-            // One budgeted pass, one scaled probe, then bisection.
-            let budget = 50_001_usize.ilog2() as usize + 3;
+            let budget = crate::overview::export::MAX_DROP_PASSES as usize;
             JOINED_DROP_PASSES
                 .with(|passes| assert!(passes.get() <= budget, "{} passes", passes.get()));
             if cap == tile.layers[0].encoded_len() - 1 {
