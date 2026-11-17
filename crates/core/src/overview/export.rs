@@ -9989,16 +9989,20 @@ fn merge_to_fit(
         let mut fit = fit;
         if !single.is_empty() {
             // Drop unmerged features, keeping the largest, until it fits.
+            // With merged features in the tile, every single may go before
+            // merged coverage is touched; alone, the largest single stays.
+            let min_keep = usize::from(whole.is_empty());
             let mut keep = single.len();
             for cut in 0..MAX_DROP_PASSES {
-                // The selector always keeps at least one single. Re-encoding
-                // it unchanged cannot help; go straight to the backstop.
-                if keep <= 1 {
+                // Nothing left to drop: go straight to the backstop.
+                if keep <= min_keep {
                     break;
                 }
-                keep = drop_keep(keep, fit, cut).min(keep.saturating_sub(1));
+                keep = drop_keep(keep, fit, cut).min(keep - 1).max(min_keep);
                 kept = whole.clone();
-                kept.extend(select_kept_members(&single, keep).into_iter().copied());
+                if keep > 0 {
+                    kept.extend(select_kept_members(&single, keep).into_iter().copied());
+                }
                 draw_order(&mut kept);
                 passes += 1;
                 // The previous bytes cannot be returned after dropping more
@@ -10075,7 +10079,12 @@ fn reduce_merged_to_fit(
     // floor is kept with a warning, without splitting it into its sources.
     let mut reduced = opts.clone();
     let mut fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
-    while fit < 1.0 && reduced.extent > MIN_VALVE_EXTENT {
+    // A coarser grid only moves points; a point tile is dropped as the drop
+    // valve drops it.
+    let points_only = kept
+        .iter()
+        .all(|m| matches!(m.geometry(), Geometry::Point(_) | Geometry::MultiPoint(_)));
+    while fit < 1.0 && reduced.extent > MIN_VALVE_EXTENT && !points_only {
         reduced.extent = (reduced.extent >> 1).max(MIN_VALVE_EXTENT);
         tally.passes += 1;
         drop(out);
@@ -18645,6 +18654,79 @@ mod tests {
     }
 
     /// #873: a lone merged feature is kept over the cap at the extent floor.
+    /// #873 review: the merge fallback drops every unmerged feature before it
+    /// lowers the extent or drops merged coverage. Keeping the last single
+    /// (here a line with a huge tag) made the backstop drop the merged
+    /// squares, which were tiny, and write the line alone.
+    #[test]
+    fn merge_valve_drops_the_last_unmerged_feature_before_merged_coverage() {
+        let mut feats = disjoint_rings(2, 4);
+        feats.push(Feature {
+            geom: Geometry::LineString(LineString::from(
+                (0..100)
+                    .map(|k| (0.1 + k as f64 * 0.001, 0.2 + (k % 2) as f64 * 0.001))
+                    .collect::<Vec<_>>(),
+            )),
+            props: vec![("big".to_string(), PropertyValue::String("x".repeat(20_000)))],
+        });
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: Some(1_000),
+                compressed_tile_size_limit: None,
+                size_valve: SizeValve::Merge,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 1);
+        let (bytes, area, _, features) = tile_area_stats(&tiles[0]);
+        let v = tiles[0].valve;
+        assert!(bytes <= 1_000, "{bytes}: {v:?}");
+        assert_eq!(v.over_limit, 0, "{v:?}");
+        assert!(features >= 1 && area > 0.0, "the squares must stay: {v:?}");
+        assert_eq!(v.dropped_merged, 0, "{v:?}");
+        assert_eq!(v.reduced_extent, None, "{v:?}");
+    }
+
+    /// #873 review: a tile of points (a MultiPoint has many coordinates, so
+    /// it reaches the merge valve) is never re-encoded at a coarser extent:
+    /// that moves points and saves almost nothing. It is handled as the drop
+    /// valve handles it.
+    #[test]
+    fn merge_valve_never_lowers_the_extent_of_a_point_tile() {
+        let feats = vec![Feature {
+            geom: Geometry::MultiPoint(geo::MultiPoint(
+                (0..3_000)
+                    .map(|k| {
+                        geo::Point::new(
+                            0.1 + (k % 60) as f64 * 0.003,
+                            0.1 + (k / 60) as f64 * 0.003,
+                        )
+                    })
+                    .collect(),
+            )),
+            props: vec![],
+        }];
+        let encode = |size_valve| {
+            encode_level_tiles(
+                &feats,
+                10,
+                &ExportOptions {
+                    tile_size_limit: Some(1_000),
+                    compressed_tile_size_limit: None,
+                    size_valve,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let (merge, drop) = (encode(SizeValve::Merge), encode(SizeValve::Drop));
+        assert_eq!(merge[0].valve.reduced_extent, None, "{:?}", merge[0].valve);
+        assert_eq!(merge[0].data, drop[0].data);
+    }
+
     #[test]
     fn merge_valve_writes_a_lone_merged_feature_over_the_floor_and_warns() {
         let feats = disjoint_rings(400, 4);
@@ -18748,9 +18830,12 @@ mod tests {
         .unwrap()
     }
 
-    /// Earlier merges do not make a surviving unmerged line a merged feature.
+    /// The unmerged line goes before the merged squares (#873 review), so the
+    /// lone survivor over the cap is the merge, and the warning counts it as one.
+    /// The opposite case, a lone unmerged survivor, is
+    /// `merge_valve_lone_unmerged_feature_skips_single_drop_encode`.
     #[test]
-    fn merge_valve_over_limit_unmerged_survivor_is_not_counted_as_merged() {
+    fn merge_valve_over_limit_keeps_the_merged_survivor_over_a_single() {
         let mut feats = disjoint_rings(2, 4);
         feats.push(Feature {
             geom: Geometry::LineString(LineString::from(
@@ -18766,11 +18851,11 @@ mod tests {
             props: vec![],
         });
         let report = export_valve_fixture(&feats, 1);
-        // The only merge was dropped: its sources count as dropped, not merged.
-        assert_eq!(report.merged_features, 0);
+        assert!(report.merged_features > 0);
+        assert_eq!(report.valve_dropped_features, 1, "the line is dropped");
         assert_eq!(report.over_limit_tiles, 1);
         assert_eq!(report.zooms[0].tile_feature_count, 1);
-        assert!(report.zooms[0].dropped_merged_features > 0);
+        assert_eq!(report.zooms[0].dropped_merged_features, 0);
         let warning = report
             .diagnostics
             .iter()
@@ -18779,8 +18864,8 @@ mod tests {
         let crate::diagnostics::Diagnostic::TilesOverLimit { merged_tiles, .. } = warning else {
             unreachable!()
         };
-        assert_eq!(*merged_tiles, 0, "{warning}");
-        assert!(!warning.to_string().contains("single merged feature"));
+        assert_eq!(*merged_tiles, 1, "{warning}");
+        assert!(warning.to_string().contains("single merged feature"));
     }
 
     #[test]
