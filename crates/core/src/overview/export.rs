@@ -9593,6 +9593,17 @@ fn check_mlt(mvt: &TileMvt) -> Result<(), ExportError> {
 /// tile needing more than a few is pathological.
 const MAX_DROP_PASSES: u32 = 8;
 
+/// How many of `keep` features the drop loops keep on cut `cut` (0-based)
+/// of a tile at `fit`: the share that fits, with tippecanoe's 0.8 margin
+/// from the second cut on. Without it a tile just over its cap shed a
+/// sliver per pass and ran out of passes still over (#873).
+fn drop_keep(keep: usize, fit: f64, cut: u32) -> usize {
+    // DIVERGENCE FROM TIPPECANOE: tile.cpp applies its 0.8 margin on the
+    // first cut too. We keep the first cut as before, so a tile that fit
+    // after one cut is byte-identical.
+    (keep as f64 * fit * if cut == 0 { 1.0 } else { 0.8 }).floor() as usize
+}
+
 /// The drop valve: while the tile is over its limit, keep a proportional
 /// count of members and re-encode. `select_kept_members` decides which
 /// survive.
@@ -9633,7 +9644,7 @@ fn drop_to_fit(
     let mut passes = 1u32;
     loop {
         passes += 1;
-        keep = ((keep as f64 * fit).floor() as usize).clamp(1, keep.saturating_sub(1).max(1));
+        keep = drop_keep(keep, fit, passes - 2).clamp(1, keep.saturating_sub(1).max(1));
         let kept = shed_to_fit(members, keep, opts);
         let mut shed = build_mvt(gzip_cache, &kept, tb, opts, &[], diagnostics);
         fit = tile_fit(&mut shed, opts).unwrap_or(f64::INFINITY);
@@ -9846,8 +9857,8 @@ fn merge_to_fit(
         if !single.is_empty() {
             // Drop unmerged features, keeping the largest, until it fits.
             let mut keep = single.len();
-            for _ in 0..MAX_DROP_PASSES {
-                keep = ((keep as f64 * fit).floor() as usize).min(keep.saturating_sub(1));
+            for cut in 0..MAX_DROP_PASSES {
+                keep = drop_keep(keep, fit, cut).min(keep.saturating_sub(1));
                 kept = whole.clone();
                 kept.extend(select_kept_members(&single, keep));
                 draw_order(&mut kept);
@@ -18152,6 +18163,67 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// #873: a drop-valve tile just over its cap used to shed a sliver per
+    /// pass and end over the cap after 8 passes; the 0.8 margin finishes it.
+    #[test]
+    fn drop_to_fit_margin_finishes_a_stalling_tile() {
+        let mut feats = disjoint_rings(400, 4);
+        for f in &mut feats {
+            f.props = vec![("shared".into(), PropertyValue::String("x".repeat(20_000)))];
+        }
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                size_valve: SizeValve::Drop,
+                tile_size_limit: Some(21_000),
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 1);
+        assert!(
+            tiles[0].data.len() <= 21_000,
+            "{}: {:?}",
+            tiles[0].data.len(),
+            tiles[0].valve
+        );
+        assert_eq!(tiles[0].valve.over_limit, 0);
+    }
+
+    /// #873: the margin starts on the second cut, so a tile that fits on
+    /// its first cut is byte-identical to before.
+    #[test]
+    fn drop_to_fit_first_cut_stays_byte_identical() {
+        let feats = disjoint_rings(400, 4);
+        let opts = ExportOptions {
+            size_valve: SizeValve::Drop,
+            tile_size_limit: None,
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let full = encode_level_tiles(&feats, 10, &opts).unwrap();
+        let limit = full[0].data.len() * 3 / 4;
+        let keep = (feats.len() as f64 * limit as f64 / full[0].data.len() as f64).floor() as usize;
+        let first = encode_level_tiles(&feats[..keep], 10, &opts).unwrap();
+        assert!(
+            first[0].data.len() <= limit,
+            "fixture must fit on its first cut"
+        );
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: Some(limit),
+                ..opts
+            },
+        )
+        .unwrap();
+        assert_eq!(tiles[0].valve.passes, 2);
+        assert_eq!(tiles[0].data, first[0].data);
     }
 
     /// #873: a tile whose merged features alone exceed the raw cap must
