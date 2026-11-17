@@ -2109,7 +2109,7 @@ pub struct BudgetKinds {
             help_heading = "Density budget"
         )
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Apply the density budget to polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the budget excludes polygons by default (tippecanoe's `--drop-polygons`)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Apply the density budget to polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the budget excludes polygons by default (tippecanoe's `--drop-polygons`). Polygons too small to see still become placeholder squares, so coarse zooms can hold more features than the budget; `--no-collapse` removes them", long_help = None))]
     pub polygons: bool,
 }
 

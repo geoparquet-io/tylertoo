@@ -857,9 +857,11 @@ floored at one tile unit of the level's zoom (see the divergences below).
 
 #### Area accumulation and dithering
 
-The accumulator covers polygons removed by the visibility gate, thinning,
-or density budget. After assignment, each adds its area, clamped to `T`, to
-its patch's running total in input order. A
+The accumulator covers polygons removed by the visibility gate or
+thinning. It runs after assignment and before the density budget, so a
+polygon that `--drop-polygons` drops leaves no square (#875). Each covered
+polygon adds its area, clamped to `T`, to its patch's running total in
+input order. A
 patch is a 32 × GSD square, 1/32 of a 1024-px tile. Each time a patch's total
 crosses `T`, the polygon that crossed it becomes the level's *carrier*.
 tylertoo emits it as a `T`-area square at its representative point, with its
@@ -867,7 +869,7 @@ own attributes.
 
 A polygon contributes at most one placeholder's area. Gate failures may be
 larger than `T` because the gate is `--polygon-visibility` pixels wide;
-thinning and budget losers can be any size. Each patch retains less than
+thinning losers can be any size. Each patch retains less than
 `T` in unemitted area. This keeps 25 m fields visible as farmland at z0.
 On a 368k-field sample, z1–z6
 carry about 98% of the input area, against 1.5–7% with the dither alone. An
@@ -1069,6 +1071,15 @@ a point leaves no hole, while removing a polygon from a coverage does. `N`
 then counts only the features the budget thins. `--drop-lines` and
 `--drop-polygons` apply the budget to lines and polygons, as tippecanoe's flags of
 the same names do; together they restore the budget before #745.
+
+`--drop-polygons` removes the polygons the rate drops. Polygons too small
+to see at a level still become [placeholder squares](#area-accumulation-and-dithering),
+with or without the flag. On dense small polygons, such as fields or parcels,
+coarse zooms can therefore hold more features than the budget: Moldova's
+632k fields keep 56k features at z8 against a budget of 2,588. Add
+`--no-collapse` to remove the squares too. tippecanoe also thins the small
+polygons by the rate before it makes squares; tylertoo does not, because
+the thinned squares leave coarse zooms blank on such data.
 
 ### Drop rate
 
