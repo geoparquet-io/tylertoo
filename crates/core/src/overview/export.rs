@@ -4106,7 +4106,7 @@ fn export_level_group(
                             level.gzip_cache,
                             (buckets, Some(&held)),
                             level.plan.zoom,
-                            level.options,
+                            &TileEncoding::single(level.options),
                             level.fills,
                             timers,
                             diagnostics,
@@ -6238,7 +6238,7 @@ fn encode_wave_from_store(
         ctx.gzip_cache,
         (bucket_members(members, wave), None),
         ctx.zoom,
-        ctx.opts,
+        &TileEncoding::single(ctx.opts),
         ctx.fills,
         ctx.timers,
         diagnostics,
@@ -6267,29 +6267,6 @@ fn bucket_members(members: Vec<Member>, wave: &[Partition]) -> Vec<Vec<Member>> 
 /// ascending partition order. Each bucket's members are released from
 /// `admitted`, when given, as the bucket is encoded ([`InFlight`]).
 fn encode_buckets(
-    gzip_cache: &Arc<TileGzipCache>,
-    (buckets, admitted): (Vec<Vec<Member>>, Option<&Admitted<'_>>),
-    zoom: u8,
-    opts: &ExportOptions,
-    fills: Option<&coverage_fill::FillMap>,
-    timers: &ExportTimers,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
-    encode_layer_buckets(
-        gzip_cache,
-        (buckets, admitted),
-        zoom,
-        &TileEncoding {
-            options: opts,
-            layers: &[],
-        },
-        fills,
-        timers,
-        diagnostics,
-    )
-}
-
-fn encode_layer_buckets(
     gzip_cache: &Arc<TileGzipCache>,
     (buckets, admitted): (Vec<Vec<Member>>, Option<&Admitted<'_>>),
     zoom: u8,
@@ -7043,7 +7020,7 @@ fn process_wave(
         ctx.gzip_cache,
         (buckets, None),
         ctx.zoom,
-        ctx.opts,
+        &TileEncoding::single(ctx.opts),
         ctx.fills,
         ctx.timers,
         diagnostics,
@@ -9670,6 +9647,16 @@ struct TileEncoding<'a> {
     layers: &'a [(u16, String)],
 }
 
+impl<'a> TileEncoding<'a> {
+    /// One layer named by the options, the ordinary export.
+    fn single(options: &'a ExportOptions) -> Self {
+        Self {
+            options,
+            layers: &[],
+        }
+    }
+}
+
 impl std::ops::Deref for TileEncoding<'_> {
     type Target = ExportOptions;
     fn deref(&self) -> &Self::Target {
@@ -9932,7 +9919,7 @@ impl<'a> JoinedTileFitter<'a> {
             // DIVERGENCE FROM TIPPECANOE: gaps and predecessors remain local to
             // each overview row group, with concatenated layer sequences rather
             // than one global spatial stream (tile.cpp:1176-1195, 2016-2050).
-            let encoded = encode_layer_buckets(
+            let encoded = encode_buckets(
                 &cache,
                 (buckets, None),
                 zoom,
