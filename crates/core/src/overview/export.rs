@@ -10015,6 +10015,16 @@ fn merge_to_fit(
                     break;
                 }
             }
+            // The cuts ran out with singles left beside merged features: the
+            // rest go too, before the extent drops or a merge is touched.
+            if fit < 1.0 && !whole.is_empty() && kept.len() > whole.len() {
+                kept = whole.clone();
+                draw_order(&mut kept);
+                passes += 1;
+                drop(out);
+                out = build(&kept, passes, &[]);
+                fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
+            }
             dropped = single.len() - (kept.len() - whole.len());
         }
         let mut tally = ValveTally {
@@ -18689,6 +18699,44 @@ mod tests {
         assert!(features >= 1 && area > 0.0, "the squares must stay: {v:?}");
         assert_eq!(v.dropped_merged, 0, "{v:?}");
         assert_eq!(v.reduced_extent, None, "{v:?}");
+    }
+
+    /// #873 review: when the eight proportional cuts leave unmerged features
+    /// in a tile that holds merged ones, the rest go too before the extent
+    /// drops or merged coverage is touched. 400 multipoints sharing a 20 KB tag
+    /// used to outlast the cuts and outrank the merged squares by vertices.
+    #[test]
+    fn merge_valve_drops_singles_left_after_the_cuts_before_merged_coverage() {
+        let mut feats = disjoint_rings(2, 4);
+        let big = "x".repeat(20_000);
+        feats.extend((0..400).map(|_| {
+            Feature {
+                geom: Geometry::MultiPoint(geo::MultiPoint(
+                    (0..12)
+                        .map(|k| geo::Point::new(0.1 + k as f64 * 0.001, 0.2))
+                        .collect(),
+                )),
+                props: vec![("big".to_string(), PropertyValue::String(big.clone()))],
+            }
+        }));
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: Some(19_900),
+                compressed_tile_size_limit: None,
+                size_valve: SizeValve::Merge,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let v = tiles[0].valve;
+        let (bytes, area, _, _) = tile_area_stats(&tiles[0]);
+        assert!(bytes <= 19_900, "{bytes}: {v:?}");
+        assert_eq!(v.over_limit, 0, "{v:?}");
+        assert_eq!(v.dropped_merged, 0, "{v:?}");
+        assert_eq!(v.reduced_extent, None, "{v:?}");
+        assert!(area > 0.0, "the squares must stay: {v:?}");
     }
 
     /// #873 review: a tile of points (a MultiPoint has many coordinates, so
