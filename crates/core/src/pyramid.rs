@@ -6538,6 +6538,58 @@ mod tests {
     }
 
     #[test]
+    fn joined_retry_spills_source_accounting_in_the_spill_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bands = [("a", 0.0), ("b", 0.5)].map(|(name, dy)| {
+            let input = dir.path().join(format!("{name}.parquet"));
+            let geoms = (0..2000)
+                .map(|i| {
+                    let (x, y) = (
+                        f64::from(i % 50) * 3.0 - 75.0,
+                        f64::from(i / 50) * 3.0 - 60.0,
+                    );
+                    Some(geo::Point::new(x, y + dy).into())
+                })
+                .collect::<Vec<_>>();
+            crate::overview::testutil::write_input(&input, &geoms, false, None);
+            Band::new(input, name, 0, 0)
+        });
+        let spill = dir.path().join("spill");
+        std::fs::create_dir(&spill).unwrap();
+        let run = |bands: &[Band], cap: Option<usize>, name: &str| {
+            let output = dir.path().join(name);
+            let options = PyramidOptions {
+                export: ExportOptions {
+                    tile_size_limit: cap,
+                    compressed_tile_size_limit: None,
+                    feature_id: Some("id".into()),
+                    spill_dir: Some(spill.clone()),
+                    ..Default::default()
+                },
+                convert: crate::ConvertOptions {
+                    spill_dir: Some(spill.clone()),
+                    ..Default::default()
+                },
+                work_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            };
+            build_pyramid(bands, &output, &options).map(|_| decoded_tiles(&output)[&0].len())
+        };
+        let a = run(&bands[..1], None, "a.pmtiles").unwrap();
+        let b = run(&bands[1..], None, "b.pmtiles").unwrap();
+        // Each layer fits alone; the join does not, so the retry runs.
+        let cap = a.max(b) + a.min(b) / 2;
+        let tmpdir = std::env::var_os("TMPDIR");
+        std::env::set_var("TMPDIR", dir.path().join("missing"));
+        let joined = run(&bands, Some(cap), "out.pmtiles");
+        match tmpdir {
+            Some(previous) => std::env::set_var("TMPDIR", previous),
+            None => std::env::remove_var("TMPDIR"),
+        }
+        assert!(joined.unwrap() <= cap);
+    }
+
+    #[test]
     fn joined_valve_that_empties_a_tile_writes_no_tile() {
         let (dir, report) = emptied_join(None);
         // #814: an emptied tile is omitted, never written as a zero-byte body.
