@@ -73,7 +73,9 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   each feature in the layer named by its value in COLUMN, and null or blank
   values in `_unknown` (#821). This is tippecanoe's `tippecanoe.layer`. The
   column is not written as a property. Each layer is tiled on its own ladder
-  and the layers are merged, so the size caps apply per layer (#838).
+  and the layers are merged. The size caps apply to the merged tile: an
+  over-cap join is refitted across layers, or loses features when a band is
+  a pre-tiled archive (#838).
   `--shard` and `--keep-overview` are refused with it (#839). Rust callers
   that match `TilesOutcome` or `TilesError` get new `Layered`,
   `LayerColumn`, `Layer` and `Merge` arms.
