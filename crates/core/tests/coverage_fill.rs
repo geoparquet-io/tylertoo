@@ -7,70 +7,15 @@
 //! the visibility gate and their placeholder squares overlap one another. With
 //! the fill, z4 draws what z8 draws, where every polygon is present.
 
-use std::io::Read;
 use std::path::Path;
 
-use geo::{Area, BooleanOps, Coord, LineString, Polygon, Rect};
-use prost::Message;
-use tylertoo_core::internal::archive_index::ArchiveIndex;
-use tylertoo_core::internal::vector_tile::Tile;
+use geo::{Area, BooleanOps, Coord, Rect};
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;
+mod mvt_support;
 
-const EXTENT: f64 = 4096.0;
-
-/// A tile's polygons in tile units: exterior rings (positive area) start a
-/// polygon, holes (negative area) follow it.
-fn tile_polygons(raw: &[u8]) -> Vec<Polygon<f64>> {
-    let tile = Tile::decode(raw).expect("mvt");
-    let mut out = Vec::new();
-    for layer in &tile.layers {
-        let s = EXTENT / f64::from(layer.extent.unwrap_or(4096));
-        for f in layer.features.iter().filter(|f| f.r#type == Some(3)) {
-            let (mut x, mut y, mut i) = (0i64, 0i64, 0usize);
-            let mut rings: Vec<Vec<Coord<f64>>> = Vec::new();
-            let g = &f.geometry;
-            while i < g.len() {
-                let (id, count) = (g[i] & 7, g[i] >> 3);
-                i += 1;
-                if id == 7 {
-                    continue;
-                }
-                for _ in 0..count {
-                    let zz = |v: u32| i64::from((v >> 1) as i32 ^ -((v & 1) as i32));
-                    x += zz(g[i]);
-                    y += zz(g[i + 1]);
-                    i += 2;
-                    if id == 1 {
-                        rings.push(Vec::new());
-                    }
-                    rings.last_mut().unwrap().push(Coord {
-                        x: x as f64 * s,
-                        y: y as f64 * s,
-                    });
-                }
-            }
-            let mut exterior: Option<(LineString<f64>, Vec<LineString<f64>>)> = None;
-            for r in rings.into_iter().filter(|r| r.len() >= 3) {
-                let ls = LineString::new(r);
-                let signed = Polygon::new(ls.clone(), vec![]).signed_area();
-                if signed > 0.0 {
-                    if let Some((e, holes)) = exterior.take() {
-                        out.push(Polygon::new(e, holes));
-                    }
-                    exterior = Some((ls, Vec::new()));
-                } else if let Some((_, holes)) = exterior.as_mut() {
-                    holes.push(ls);
-                }
-            }
-            if let Some((e, holes)) = exterior {
-                out.push(Polygon::new(e, holes));
-            }
-        }
-    }
-    out
-}
+use mvt_support::{raw_tiles, tile_features, EXTENT};
 
 /// Each tile an archive draws at `zoom`: the union of its polygons clipped
 /// to the tile, in tile units, keyed by (x, y).
@@ -78,7 +23,6 @@ fn drawn_tiles(
     archive: &Path,
     zoom: u8,
 ) -> std::collections::HashMap<(u32, u32), geo::MultiPolygon<f64>> {
-    let index = ArchiveIndex::open(archive).expect("open archive");
     let tile_box = Rect::new(
         Coord { x: 0.0, y: 0.0 },
         Coord {
@@ -87,21 +31,15 @@ fn drawn_tiles(
         },
     )
     .to_polygon();
-    let mut out = std::collections::HashMap::new();
-    for t in index.tiles() {
-        let t = t.expect("tile entry");
-        if t.z != zoom {
-            continue;
-        }
-        let bytes = index.read_range(t.range.clone()).expect("read tile");
-        let mut raw = Vec::new();
-        flate2::read::GzDecoder::new(bytes.as_slice())
-            .read_to_end(&mut raw)
-            .expect("gunzip");
-        let union = geo::unary_union(&tile_polygons(&raw));
-        out.insert((t.x, t.y), union.intersection(&tile_box));
-    }
-    out
+    raw_tiles(archive, zoom)
+        .into_iter()
+        .map(|(xy, raw)| {
+            (
+                xy,
+                geo::unary_union(tile_features(&raw).iter().flatten()).intersection(&tile_box),
+            )
+        })
+        .collect()
 }
 
 /// Where a coarse zoom draws against a fine one, tile by tile: each fine
@@ -143,30 +81,10 @@ fn local_coverage(archive: &Path, coarse: u8, fine: u8) -> (f64, f64) {
 /// the union of its polygons clipped to the tile, so overlaps and the tile
 /// buffer count once.
 fn drawn_area(archive: &Path, zoom: u8) -> f64 {
-    let index = ArchiveIndex::open(archive).expect("open archive");
-    let tile_box = Rect::new(
-        Coord { x: 0.0, y: 0.0 },
-        Coord {
-            x: EXTENT,
-            y: EXTENT,
-        },
-    )
-    .to_polygon();
-    let mut total = 0.0;
-    for t in index.tiles() {
-        let t = t.expect("tile entry");
-        if t.z != zoom {
-            continue;
-        }
-        let bytes = index.read_range(t.range.clone()).expect("read tile");
-        let mut raw = Vec::new();
-        flate2::read::GzDecoder::new(bytes.as_slice())
-            .read_to_end(&mut raw)
-            .expect("gunzip");
-        let polys = tile_polygons(&raw);
-        let union = geo::unary_union(&polys);
-        total += union.intersection(&tile_box).unsigned_area();
-    }
+    let total: f64 = drawn_tiles(archive, zoom)
+        .values()
+        .map(|m| m.unsigned_area())
+        .sum();
     total / (EXTENT * EXTENT) / 4f64.powi(i32::from(zoom))
 }
 
