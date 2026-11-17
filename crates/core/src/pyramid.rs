@@ -2719,11 +2719,9 @@ impl MergeAppend<'_> {
             let export = joint
                 .filter(|_| self.shared_zooms.contains(&coord.z))
                 .map(|(export, _)| export);
-            let band = &self.bands[refs[0].0];
             append_band_copy(
                 writer,
                 coord,
-                band,
                 &tile.raw[0],
                 from_source,
                 export,
@@ -3051,12 +3049,11 @@ fn decompress_band_tile(
     })
 }
 
-/// Archive writer accounting uses stored bytes; only an active raw cap
-/// requires decoding a copy. ISIZE is valid solely for in-run exports.
+/// Archive writer accounting uses stored bytes; ISIZE is valid solely for
+/// in-run exports.
 fn append_band_copy(
     writer: &mut StreamingPmtilesWriter,
     coord: crate::tile::TileCoord,
-    band: &Band,
     data: &[u8],
     from_source: bool,
     export: Option<&ExportOptions>,
@@ -3068,12 +3065,17 @@ fn append_band_copy(
         data.len()
     };
     if let Some(export) = export {
-        let measured = if !from_source && export.tile_size_limit.is_some_and(|cap| cap > 0) {
-            decompress_band_tile(data, coord, band)?.len()
-        } else {
-            raw_len
-        };
-        report_joined_limit(measured, data.len(), coord, false, export, diagnostics);
+        // A copy is only reported, never changed, so the gzip trailer's size
+        // is enough: decoding every archive copy cost a bounded pyramid ~1 s.
+        // A crafted trailer can hide this warning but not alter the output.
+        report_joined_limit(
+            gzip_raw_len(data),
+            data.len(),
+            coord,
+            false,
+            export,
+            diagnostics,
+        );
     }
     append_compressed_tile(writer, coord, data, raw_len)
 }
@@ -5163,7 +5165,7 @@ mod tests {
     }
 
     #[test]
-    fn joined_archive_single_copy_does_not_trust_isize() {
+    fn joined_archive_single_copy_is_copied_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("a.pmtiles");
         let raw = layer_tile("a");
@@ -5184,34 +5186,29 @@ mod tests {
         write_band_tiles(&other, "b", &[((2, 1, 0), layer_tile("b"))]);
         let bands = [Band::new(input, "a", 2, 2), Band::new(other, "b", 2, 2)];
         let output = dir.path().join("out.pmtiles");
-        // Without a raw cap, archive copies need no decompression and preserve
-        // even an invalid trailer. It must not become a purported raw length.
-        merge_archives_capped(
-            &bands,
-            &output,
-            &ExportOptions {
-                tile_size_limit: None,
-                compressed_tile_size_limit: Some(1024),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let index = ArchiveIndex::open(&output).unwrap();
-        let tile = index.tiles().next().unwrap().unwrap();
-        assert_eq!(index.read_range(tile.range).unwrap(), gzip);
-        // A shared-zoom raw cap requires a bounded decode, which rejects the
-        // corrupt stream instead of silently counting a 4 GiB tile.
-        let error = merge_archives_capped(
-            &bands,
-            &output,
-            &ExportOptions {
-                tile_size_limit: Some(1024),
-                compressed_tile_size_limit: None,
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(error, PyramidError::TileDecompress { .. }));
+        // An archive copy is never decoded, so even an invalid trailer is
+        // preserved, with or without a raw cap. It is not the writer's raw
+        // length either; at most it reports the copy over a raw cap.
+        for (raw_cap, warned) in [(None, false), (Some(1024), true)] {
+            let report = merge_archives_capped(
+                &bands,
+                &output,
+                &ExportOptions {
+                    tile_size_limit: raw_cap,
+                    compressed_tile_size_limit: Some(1024),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let index = ArchiveIndex::open(&output).unwrap();
+            let tile = index.tiles().next().unwrap().unwrap();
+            assert_eq!(index.read_range(tile.range).unwrap(), gzip);
+            let over = report
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, crate::diagnostics::Diagnostic::TilesOverLimit { .. }));
+            assert_eq!(over, warned);
+        }
     }
 
     #[test]
