@@ -81,6 +81,7 @@ impl JunctionNodes {
             .map(|w| w[0].0)
             .collect();
         keys.dedup();
+        keys.shrink_to_fit(); // resident through pass 2, priced by length
         log::debug!(
             "[profile] junction pins: {} occurrence(s) -> {} pin(s)",
             occ.len(),
