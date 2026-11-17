@@ -3087,21 +3087,24 @@ fn screen_joined_tiles(
     // Candidates are joined and measured in bounded parallel runs, like the
     // merge's combine (#902): serial under bounded.
     let (mut run, mut run_bytes, mut pool) = (Vec::<MergeTileGroup>::new(), 0, None);
+    // Serial (bounded) runs reuse one joined buffer, as the merge does.
+    let mut scratch = Vec::new();
     let mut measure = |run: &mut Vec<MergeTileGroup>,
                        pending: &mut BTreeMap<u8, BTreeSet<u64>>|
      -> Result<(), PyramidError> {
         prepare_combine_pool(&mut pool, profile, run)?;
-        let over = |tile: &MergeTileGroup| {
-            let mut raw = Vec::new();
+        let over = |tile: &MergeTileGroup, raw: &mut Vec<u8>| {
             let (raw_parts, refs, coord) = (&tile.raw, &tile.refs, tile.coord);
-            let gzip = combine_joined_tile(raw_parts, refs, coord, bands, true, &mut raw)
-                .or_else(|_| combine_joined_tile(raw_parts, refs, coord, bands, false, &mut raw))?;
+            let gzip = combine_joined_tile(raw_parts, refs, coord, bands, true, raw)
+                .or_else(|_| combine_joined_tile(raw_parts, refs, coord, bands, false, raw))?;
             Ok::<_, PyramidError>(joined_over_limit(raw.len(), gzip.len(), export))
         };
         // Collected in id order, so the first error is the lowest id's.
         let results: Vec<_> = match &pool {
-            Some(pool) => pool.install(|| run.par_iter().map(over).collect()),
-            None => run.iter().map(over).collect(),
+            Some(pool) => {
+                pool.install(|| run.par_iter().map(|t| over(t, &mut Vec::new())).collect())
+            }
+            None => run.iter().map(|t| over(t, &mut scratch)).collect(),
         };
         for (tile, over) in run.drain(..).zip(results) {
             if over? {
