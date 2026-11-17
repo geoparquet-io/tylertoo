@@ -831,10 +831,11 @@ fn chunk_spans(metadata: &ParquetMetaData, groups: Option<&[usize]>) -> Arc<[Chu
 /// [`PAGE_HEADER_CAP`].
 const PAGE_PEEK: u64 = 8 << 10;
 
-/// The longest page header [`PageGuard`] reads ahead. Honest headers are a
-/// few hundred bytes (writers cap page statistics at a few KB, and a
-/// dictionary page has none). Past it, any other page passes on to
-/// parquet-rs unchecked, and a dictionary page is refused.
+/// The longest page header [`PageGuard`] reads ahead, and accepts. Honest
+/// headers are a few hundred bytes: writers truncate or drop page statistics
+/// past a few KB (parquet-rs at 64 bytes, Arrow C++ and parquet-mr at 4 KB),
+/// and a dictionary page has none. Unread, the rest of a longer one could
+/// turn it into a dictionary page (parquet-rs keeps a field's last value).
 const PAGE_HEADER_CAP: u64 = 1 << 20;
 
 /// What a page header declares, as parquet-rs reads it, so far as the bytes
@@ -879,11 +880,8 @@ fn page_claim(header: &[u8]) -> (PageClaim, Result<(), SkimStop>) {
 enum Peeked {
     /// Not a dictionary page, or one whose values fit its bytes.
     Pass,
-    /// The header runs past the bytes read; `dictionary` unless it already
-    /// declared another page type.
-    More {
-        dictionary: bool,
-    },
+    /// The header runs past the bytes read.
+    More,
     Refuse(String),
 }
 
@@ -895,12 +893,13 @@ fn check_header(span: &ChunkSpan, header: &[u8]) -> Peeked {
     if claim.types > 1 {
         return Peeked::Refuse("a page header declares its type twice".into());
     }
-    let dictionary = claim.ty.is_none_or(|t| t == DICTIONARY_PAGE);
     match walked {
-        Err(SkimStop::Short) => return Peeked::More { dictionary },
-        Err(SkimStop::Hostile(reason)) if dictionary => return Peeked::Refuse(reason),
-        // Malformed, or not a dictionary page: parquet-rs's to judge.
-        Err(_) => return Peeked::Pass,
+        Err(SkimStop::Short) => return Peeked::More,
+        // No honest header has a list or an overlong varint, and the rest
+        // of this one is unread.
+        Err(SkimStop::Hostile(reason)) => return Peeked::Refuse(reason),
+        // An unknown wire type: parquet-rs stops at it too.
+        Err(SkimStop::Confused) => return Peeked::Pass,
         Ok(()) => {}
     }
     let (Some(values), Some(DICTIONARY_PAGE)) = (claim.values, claim.ty) else {
@@ -943,16 +942,14 @@ impl<R: ChunkReader> PageGuard<R> {
             let bytes = self.reader.get_bytes(start, window as usize)?;
             let reason = match check_header(span, &bytes) {
                 Peeked::Pass => return Ok(bytes),
-                Peeked::More { .. } if window < cap => {
+                Peeked::More if window < cap => {
                     window = (window * 16).min(cap);
                     continue;
                 }
-                // The chunk ends inside the header: parquet-rs refuses it.
-                Peeked::More { .. } if window == left => return Ok(bytes),
-                Peeked::More { dictionary: false } => return Ok(bytes),
-                Peeked::More { dictionary: true } => {
-                    format!("a dictionary page header runs past {PAGE_HEADER_CAP} bytes")
-                }
+                // The chunk ends inside the header: parquet-rs refuses a
+                // header longer than its chunk before decoding the page.
+                Peeked::More if window == left => return Ok(bytes),
+                Peeked::More => format!("a page header runs past {PAGE_HEADER_CAP} bytes"),
                 Peeked::Refuse(reason) => reason,
             };
             self.hit.store(true, Ordering::Relaxed);
@@ -4247,27 +4244,19 @@ mod tests {
 
     /// What #894's header check makes of a few crafted headers.
     #[test]
-    fn page_headers_read_ahead_only_while_they_could_be_a_dictionary() {
+    fn page_headers_are_read_ahead_until_they_end() {
         let span = ChunkSpan {
             start: 0,
             end: u64::MAX,
             value_bits: 64,
             raw: true,
         };
-        let more = |h: &[u8]| match check_header(&span, h) {
-            Peeked::More { dictionary } => Some(dictionary),
-            _ => None,
-        };
-        // `1: type = DICTIONARY_PAGE`, then an unknown binary of 2 MB.
-        assert_eq!(
-            more(&[0x15, 0x04, 0x88, 0x80, 0x80, 0x80, 0x01]),
-            Some(true)
-        );
-        // `1: type = DATA_PAGE`, the same binary: read on, but no dictionary.
-        assert_eq!(
-            more(&[0x15, 0x00, 0x88, 0x80, 0x80, 0x80, 0x01]),
-            Some(false)
-        );
+        // `1: type = DATA_PAGE`, then an unknown binary of 2 MB: a second
+        // type could follow it, so the header is read on.
+        assert!(matches!(
+            check_header(&span, &[0x15, 0x00, 0x88, 0x80, 0x80, 0x80, 0x01]),
+            Peeked::More
+        ));
         // An unknown wire type cannot be fixed by reading further.
         assert!(matches!(check_header(&span, &[0x1e]), Peeked::Pass));
         // A second type (long-form field id 1) parquet-rs would keep.
@@ -4275,6 +4264,36 @@ mod tests {
             check_header(&span, &[0x15, 0x00, 0x05, 0x02, 0x04, 0x00]),
             Peeked::Refuse(_)
         ));
+    }
+
+    /// Roborev on #894: a `DATA_PAGE` header whose second type, a
+    /// dictionary's, lies past the read-ahead cap is refused, not passed on.
+    #[test]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#789: the page guard's own per-reader flag"
+    )]
+    fn a_page_header_past_the_cap_is_refused() {
+        let pad = 3 << 19; // 1.5 MiB
+                           // `1: type = DATA_PAGE`, an unknown binary of `pad` bytes, then
+                           // `1: type = DICTIONARY_PAGE`.
+        let mut bytes = vec![0x15, 0x00, 0x98, 0x80, 0x80, 0x60];
+        bytes.extend(std::iter::repeat_n(0, pad));
+        bytes.extend([0x05, 0x02, 0x04, 0x00]);
+        bytes.extend([0; 64]);
+        let guard = PageGuard {
+            chunks: Arc::from([ChunkSpan {
+                start: 0,
+                end: bytes.len() as u64,
+                value_bits: 64,
+                raw: true,
+            }]),
+            reader: Arc::new(Bytes::from(bytes)),
+            hit: Arc::new(atomic::AtomicBool::new(false)),
+        };
+        let err = guard.peek(0).unwrap_err().to_string();
+        assert!(err.contains("runs past"), "{err}");
+        assert!(guard.hit.load(Ordering::Relaxed));
     }
 
     /// Roborev on #894: a header that is malformed from its first byte is
