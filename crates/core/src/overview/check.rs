@@ -151,7 +151,13 @@ pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckE
         }
     };
     let mut report = validate_resolved_metadata(&metadata, &descriptor);
-    check_cluster_sum_invariant(path, &metadata, &descriptor, &mut report, diagnostics);
+    let source = crate::input_set::ConvertSource::single_parsed(
+        crate::input::InputSource::Local(path.to_path_buf()),
+        descriptor.clone(),
+        reader,
+    );
+    // A read failure is in the report; `validate` reports, it does not fail.
+    let _ = check_cluster_sum_invariant(&source, &metadata, &descriptor, &mut report, diagnostics);
     Ok(report)
 }
 
@@ -614,19 +620,19 @@ fn check_count_conformance(
 /// Skipped (no report entry) when the prerequisites are missing — the
 /// structural checks of [`validate_metadata`] already fail those files.
 pub(crate) fn check_cluster_sum_invariant(
-    path: &Path,
+    source: &crate::input_set::ConvertSource,
     metadata: &ParquetMetaData,
     descriptor: &ResolvedSchema,
     report: &mut ValidationReport,
     diagnostics: &crate::diagnostics::Diagnostics,
-) {
+) -> Option<crate::input::InputError> {
     // A malformed count/level type must be reported by the metadata validator,
     // never passed into Arrow's infallible primitive casts.
     if report.check_passed("cluster_point_count_column") != Some(true)
         || report.check_passed("level_column") != Some(true)
         || report.check_passed("overviews_structure") != Some(true)
     {
-        return;
+        return None;
     }
     // A partial file has no canonical source band, and a spatial subset's
     // levels are cropped independently: neither can check whole-source mass.
@@ -635,24 +641,18 @@ pub(crate) fn check_cluster_sum_invariant(
     // Prerequisites: parseable footer, enabled clustering, duplicating mode
     // with a valid canonical level, the named INT64 count column, the level
     // column, and a geometry column (needed to tell point rows apart).
-    let Some(meta) =
-        footer_value(metadata, OVERVIEWS_KEY).and_then(|j| OverviewsMeta::from_json(&j).ok())
-    else {
-        return;
-    };
-    let Some(clustering) = meta
+    let meta =
+        footer_value(metadata, OVERVIEWS_KEY).and_then(|j| OverviewsMeta::from_json(&j).ok())?;
+    let clustering = meta
         .generalization
         .as_ref()
         .and_then(|g| g.clustering.as_ref())
-        .filter(|c| c.enabled)
-    else {
-        return;
-    };
+        .filter(|c| c.enabled)?;
     if meta.mode != Some(Mode::Duplicating) {
-        return; // cluster_mode already failed
+        return None; // cluster_mode already failed
     }
     let Some(canonical) = meta.canonical_level.filter(|&c| c >= 0) else {
-        return; // mode_canonical already failed
+        return None; // mode_canonical already failed
     };
 
     let subset = descriptor.source_is_subset();
@@ -660,11 +660,18 @@ pub(crate) fn check_cluster_sum_invariant(
         if subset && !partial {
             report.pass("cluster_sum_invariant", "spatial subset: levels are independently cropped; whole-source mass equality is not applicable");
         }
-        return;
+        return None;
     }
 
-    match cluster_sum_by_level(path, &meta, clustering, descriptor, diagnostics) {
-        Err(e) => report.fail(
+    match cluster_sum_by_level(source, &meta, clustering, descriptor, diagnostics) {
+        Err(ClusterSumError::Read(e)) => {
+            report.fail(
+                "cluster_sum_invariant",
+                format!("could not read cluster columns: {e}"),
+            );
+            return Some(e);
+        }
+        Err(ClusterSumError::Invalid(e)) => report.fail(
             "cluster_sum_invariant",
             format!("could not read cluster columns: {e}"),
         ),
@@ -680,14 +687,14 @@ pub(crate) fn check_cluster_sum_invariant(
                 }
             }
             if partial {
-                return;
+                return None;
             }
             if subset {
                 report.pass("cluster_sum_invariant", "spatial subset: levels are independently cropped; whole-source mass equality is not applicable");
-                return;
+                return None;
             }
             let Some(&(_, expected)) = per_level.get(canonical as usize) else {
-                return; // canonical band outside levels: structure failed
+                return None; // canonical band outside levels: structure failed
             };
             let mut problems: Vec<String> = Vec::new();
             for (level, &(point_rows, sum)) in per_level.iter().enumerate() {
@@ -728,6 +735,20 @@ pub(crate) fn check_cluster_sum_invariant(
             }
         }
     }
+    None
+}
+
+/// Why [`cluster_sum_by_level`] gave no sums: the read failed, keeping its
+/// typed cause (#833), or the file's cluster columns are invalid.
+enum ClusterSumError {
+    Read(crate::input::InputError),
+    Invalid(String),
+}
+
+impl From<String> for ClusterSumError {
+    fn from(e: String) -> Self {
+        ClusterSumError::Invalid(e)
+    }
 }
 
 /// Per level `(point rows, Σ point_count)`, then the first category-count
@@ -742,21 +763,19 @@ type LevelSums = (Vec<(usize, i64)>, Option<String>);
 /// count columns and returns the first row whose counts do not sum to its
 /// `point_count`.
 fn cluster_sum_by_level(
-    path: &Path,
+    source: &crate::input_set::ConvertSource,
     meta: &OverviewsMeta,
     clustering: &crate::overview::level::ClusteringProvenance,
     descriptor: &ResolvedSchema,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<Option<LevelSums>, String> {
+) -> Result<Option<LevelSums>, ClusterSumError> {
     use super::convert::feature_kind;
     use crate::batch_processor::extract_geometries_opt_from_array;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type};
     use geoarrow::array::from_arrow_array;
 
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let builder = tylertoo_io::open_parquet(file).map_err(|e| e.to_string())?;
-    let schema = builder.schema().clone();
+    let schema = source.schema().map_err(ClusterSumError::Read)?;
 
     let Some(geom_idx) = descriptor.geometry_index() else {
         return Ok(None);
@@ -779,7 +798,7 @@ fn cluster_sum_by_level(
             .index_of(name)
             .map_err(|_| format!("category count column {name:?} is missing"))?;
         if schema.field(idx).data_type() != &arrow_schema::DataType::Int64 {
-            return Err(format!("category count column {name:?} is not INT64"));
+            return Err(format!("category count column {name:?} is not INT64").into());
         }
         roots.push(idx);
     }
@@ -787,15 +806,18 @@ fn cluster_sum_by_level(
 
     // The reader's default batch, capped by the owner (#607) so one batch of
     // the widest byte-array column stays under arrow's 2 GiB offset limit.
-    let reader = builder
-        .with_projection_roots(roots)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let reader = source
+        .open_stream(&crate::input_set::ReadPlan {
+            batch_size: tylertoo_io::DEFAULT_BATCH_ROWS,
+            projection: Some(&roots),
+            row_groups: None,
+        })
+        .map_err(ClusterSumError::Read)?;
 
     let mut per_level: Vec<(usize, i64)> = vec![(0, 0); meta.levels.len()];
     let mut geoms: Vec<Option<geo::Geometry<f64>>> = Vec::new();
     for batch in reader {
-        let batch = batch.map_err(|e| e.to_string())?;
+        let batch = batch.map_err(ClusterSumError::Read)?;
         let bschema = batch.schema();
         let g = batch.column(
             bschema
@@ -836,7 +858,7 @@ fn cluster_sum_by_level(
             }
             let level = levels.value(i);
             if level < 0 || level as usize >= per_level.len() {
-                return Err(format!("row carries out-of-range level {level}"));
+                return Err(format!("row carries out-of-range level {level}").into());
             }
             let entry = &mut per_level[level as usize];
             entry.0 += 1;
