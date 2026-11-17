@@ -805,12 +805,7 @@ pub(super) fn convert_by_layer(
             continue;
         }
         joint_sources.push(if retain_overviews {
-            vec![super::export::JointSource {
-                path: overview.to_path_buf(),
-                options: retained_export.expect("an exported layer has export options"),
-                min_zoom: report.export.min_zoom,
-                max_zoom: report.export.max_zoom,
-            }]
+            vec![retained_export.expect("an exported layer has a retained source")]
         } else {
             Vec::new()
         });
@@ -2125,6 +2120,7 @@ mod tests {
             .iter()
             .map(|b| {
                 vec![super::super::export::JointSource {
+                    members: Default::default(),
                     path: dir.path().join("must-not-be-opened.parquet"),
                     options: super::super::export::ExportOptions {
                         layer_name: b.layer.clone(),

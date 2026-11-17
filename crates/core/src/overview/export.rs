@@ -90,7 +90,7 @@
 //! duplication.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::File,
     io::BufWriter,
     path::{Path, PathBuf},
@@ -2144,7 +2144,7 @@ pub(crate) fn export_pmtiles_for_join(
     output: &Path,
     options: &ExportOptions,
     shared_zooms: &[u8],
-) -> Result<ExportReport, ExportError> {
+) -> Result<(ExportReport, JointMembers), ExportError> {
     let config = options.validate()?;
     export_pmtiles_validated(
         input,
@@ -2155,7 +2155,7 @@ pub(crate) fn export_pmtiles_for_join(
         &mut export_budget(),
         shared_zooms,
     )
-    .map(|run| run.report)
+    .map(|run| (run.report, run.joint_members))
 }
 
 /// Implementation of [`export_pmtiles`] with an explicit partition-size target,
@@ -2512,6 +2512,7 @@ struct Pass2Knobs {
 /// and checkpoints the tests check.
 struct Pass2Run {
     report: ExportReport,
+    joint_members: JointMembers,
     /// The [`plan_level_groups`] schedule the levels ran in.
     #[cfg(test)]
     level_groups: Vec<std::ops::Range<usize>>,
@@ -3106,6 +3107,23 @@ fn export_pmtiles_validated(
         }
     }
     Ok(Pass2Run {
+        // Move the existing scan counts, retaining only zooms the join can
+        // retry. No additional overview scan or count-map copy is needed.
+        joint_members: JointMembers {
+            member_bytes: fit_member_bytes,
+            tile_counts: scans
+                .into_iter()
+                .zip(&level_zooms)
+                .filter(|(_, z)| {
+                    shared_zooms.contains(z)
+                        && coarsest_zoom <= **z
+                        && **z <= max_zoom
+                        && !options.coverage_fill
+                        && !options.variable_depth
+                })
+                .flat_map(|(scan, _)| scan.tile_counts)
+                .collect(),
+        },
         report: ExportReport::from_zooms(
             mode,
             (min_zoom, max_zoom),
@@ -9712,6 +9730,15 @@ pub(crate) struct JointSource {
     pub options: ExportOptions,
     pub min_zoom: u8,
     pub max_zoom: u8,
+    pub members: JointMembers,
+}
+
+/// The source export's scan counts and resident member price, before valves
+/// shed or merge members. Tile ids already include the zoom.
+#[derive(Clone, Default)]
+pub(crate) struct JointMembers {
+    tile_counts: BTreeMap<u64, usize>,
+    member_bytes: Option<u64>,
 }
 
 /// A merge's retained overview plans. Footers, columns, CRS and zoom ladders
@@ -9729,6 +9756,27 @@ struct OpenedJointSource<'a> {
 }
 
 impl<'a> JoinedTileFitter<'a> {
+    /// Resolve once per pending zoom, before the merge sizes its chunks.
+    pub(crate) fn tile_wave(&self, tiles: &BTreeSet<u64>, opts: &ExportOptions) -> usize {
+        #[cfg(test)]
+        joined_tile_probe::PROFILE.with(|profile| profile.set(Some(opts.profile)));
+        self.tile_wave_under(tiles, opts, &export_budget())
+    }
+
+    fn tile_wave_under(
+        &self,
+        tiles: &BTreeSet<u64>,
+        opts: &ExportOptions,
+        budget: &MemoryBudget,
+    ) -> usize {
+        joined_tile_wave_under(
+            tiles,
+            self.sources.iter().map(|s| &s.source.members),
+            opts,
+            budget,
+        )
+    }
+
     pub(crate) fn open(
         sources: impl IntoIterator<Item = &'a JointSource>,
     ) -> Result<Self, ExportError> {
@@ -9768,7 +9816,7 @@ impl<'a> JoinedTileFitter<'a> {
     pub(crate) fn fit_joined_tiles(
         &self,
         zoom: u8,
-        tiles: &BTreeMap<u64, usize>,
+        tiles: &BTreeSet<u64>,
         opts: &ExportOptions,
         diagnostics: &crate::diagnostics::Diagnostics,
     ) -> Result<BTreeMap<u64, JoinedTile>, ExportError> {
@@ -9782,8 +9830,9 @@ impl<'a> JoinedTileFitter<'a> {
         // valve chains, while a wave reads each layer only once. The tile-set
         // restriction also prunes disjoint bboxes and prevents clipping holes
         // between requested ids, as in variable-depth and shard exports.
-        let partitions = plan_partitions(tiles, zoom, 1);
-        let width = joined_tile_wave(tiles, opts);
+        let tile_counts = tiles.iter().map(|&id| (id, 1)).collect();
+        let partitions = plan_partitions(&tile_counts, zoom, 1);
+        let width = self.tile_wave(tiles, opts);
         let mut replacements = BTreeMap::new();
         for wave in partitions.chunks(width) {
             let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
@@ -9819,7 +9868,7 @@ impl<'a> JoinedTileFitter<'a> {
                     feature_id: columns.feature_id.as_ref(),
                     timers: &timers,
                     fills: None,
-                    tiles: Some(tiles),
+                    tiles: Some(&tile_counts),
                     #[cfg(test)]
                     work: &Mutex::new(ExportWorkTally::default()),
                 };
@@ -9892,28 +9941,31 @@ impl<'a> JoinedTileFitter<'a> {
     }
 }
 
-/// Price the densest confirmed join with the export's resident-byte model,
-/// then let the ordinary level-wave guard narrow even an explicit width.
-pub(crate) fn joined_tile_wave(tiles: &BTreeMap<u64, usize>, opts: &ExportOptions) -> usize {
-    #[cfg(test)]
-    joined_tile_probe::PROFILE.with(|profile| profile.set(Some(opts.profile)));
-    joined_tile_wave_under(tiles, opts, &export_budget())
-}
-
-fn joined_tile_wave_under(
-    tiles: &BTreeMap<u64, usize>,
+/// Price the densest pending tile from original overview members, summed
+/// across sources, using the same resident model and budget as level waves.
+fn joined_tile_wave_under<'a>(
+    tiles: &BTreeSet<u64>,
+    sources: impl Iterator<Item = &'a JointMembers> + Clone,
     opts: &ExportOptions,
     budget: &MemoryBudget,
 ) -> usize {
-    // Each tile is one partition. Use the screen's largest joined raw size
-    // and the existing resident model, then the same allowance owner as
-    // memory_safe_level_wave; no flat-slot floor can bypass the dense guard.
-    let raw = tiles.values().copied().max().unwrap_or(0) as u64;
-    let resident = export_member_resident_bytes(member_resident_bytes(raw, 0), opts);
+    let resident = tiles
+        .iter()
+        .map(|id| {
+            sources.clone().fold(0u64, |total, source| {
+                let per_member = source
+                    .member_bytes
+                    .map_or(0, |bytes| export_member_resident_bytes(bytes, opts));
+                let count = source.tile_counts.get(id).copied().unwrap_or(0) as u64;
+                total.saturating_add(count.saturating_mul(per_member))
+            })
+        })
+        .max()
+        .unwrap_or(0);
     resolve_partition_wave_under(opts.partition_wave, opts.profile, budget).min(budget.affordable(
         opts.profile,
         MemoryPhase::ExportCollect,
-        Price::model(resident),
+        Price::new(resident, PriceBasis::Footer),
     ))
 }
 
@@ -20111,24 +20163,127 @@ mod tests {
     }
 
     #[test]
+    fn joined_wave_prices_original_members_even_when_source_valve_output_is_small() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let points = vec![Geometry::Point(Point::new(0.0, 0.0)); 4096];
+        write_fixture(input.path(), &[(vec![0; points.len()], points)]);
+        let opts = ExportOptions {
+            partition_wave: 8,
+            tile_size_limit: Some(1),
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let (_, members) =
+            export_pmtiles_for_join(input.path(), output.path(), &opts, &[2]).unwrap();
+        let tiles = stored_tiles(&std::fs::read(output.path()).unwrap());
+        let raw = compression::decompress(
+            tiles.values().next().unwrap(),
+            compression::Compression::Gzip,
+        )
+        .unwrap();
+        let joined = [raw.as_slice(), raw.as_slice()].concat();
+        assert!(joined.len() < 1024, "the source valves leave a tiny join");
+        assert_eq!(decode_tile(&joined).layers.len(), 2);
+        let source = JointSource {
+            members,
+            path: input.path().to_path_buf(),
+            options: opts.clone(),
+            min_zoom: 2,
+            max_zoom: 2,
+        };
+        let fitter = JoinedTileFitter::open([&source, &source]).unwrap();
+        let pending = BTreeSet::from([*tiles.keys().next().unwrap()]);
+        assert_eq!(
+            source.members.tile_counts[tiles.keys().next().unwrap()],
+            4096
+        );
+        assert_eq!(
+            fitter.tile_wave_under(
+                &pending,
+                &opts,
+                &MemoryBudget::with_available(Some(4 << 20))
+            ),
+            1,
+            "price the original overview members collected by the retry"
+        );
+    }
+
+    #[test]
     fn joined_wave_uses_the_densest_tile_and_run_profile() {
         let budget = MemoryBudget::with_available(Some(256 << 20));
         let mut opts = ExportOptions {
             partition_wave: 8,
             ..Default::default()
         };
-        let small = BTreeMap::from([(1, 100), (2, 100)]);
-        let dense = BTreeMap::from([(1, 100), (2, 128 << 20)]);
+        let pending = BTreeSet::from([1, 2]);
+        let small = JointMembers {
+            tile_counts: BTreeMap::from([(1, 100), (2, 100), (3, 6_500_000)]),
+            member_bytes: Some(member_resident_bytes(600, 4)),
+        };
+        let dense = JointMembers {
+            tile_counts: BTreeMap::from([(1, 100), (2, 6_500_000)]),
+            ..small.clone()
+        };
         for profile in [MemoryProfile::Auto, MemoryProfile::Bounded] {
             opts.profile = profile;
-            assert_eq!(joined_tile_wave_under(&small, &opts, &budget), 8);
-            assert_eq!(joined_tile_wave_under(&dense, &opts, &budget), 1);
+            assert_eq!(
+                joined_tile_wave_under(&pending, [&small].into_iter(), &opts, &budget),
+                8
+            );
+            assert_eq!(
+                joined_tile_wave_under(&pending, [&dense].into_iter(), &opts, &budget),
+                1
+            );
         }
         opts.profile = MemoryProfile::Speed;
-        assert_eq!(joined_tile_wave_under(&dense, &opts, &budget), 8);
+        assert_eq!(
+            joined_tile_wave_under(&pending, [&dense].into_iter(), &opts, &budget),
+            8
+        );
         opts.profile = MemoryProfile::Auto;
         opts.partition_wave = PARTITION_WAVE_AUTO;
-        assert_eq!(joined_tile_wave_under(&dense, &opts, &budget), 1);
+        assert_eq!(
+            joined_tile_wave_under(&pending, [&dense].into_iter(), &opts, &budget),
+            1
+        );
+    }
+
+    #[test]
+    fn joined_wave_sums_layers_for_each_pending_tile() {
+        let budget = MemoryBudget::with_available(Some(256 << 20));
+        let opts = ExportOptions {
+            partition_wave: 8,
+            ..Default::default()
+        };
+        let members = JointMembers {
+            tile_counts: BTreeMap::from([(1, 20_000), (2, 100)]),
+            member_bytes: Some(member_resident_bytes(600, 4)),
+        };
+        let pending = BTreeSet::from([1, 2]);
+        let one = joined_tile_wave_under(&pending, [&members].into_iter(), &opts, &budget);
+        assert!(one > 1, "one source fits concurrent tiles");
+        assert_eq!(
+            joined_tile_wave_under(&pending, [&members, &members].into_iter(), &opts, &budget),
+            1
+        );
+        let disjoint = JointMembers {
+            tile_counts: BTreeMap::from([(2, 20_000)]),
+            ..members.clone()
+        };
+        assert_eq!(
+            joined_tile_wave_under(&pending, [&members, &disjoint].into_iter(), &opts, &budget),
+            one,
+            "sum sources within a tile, not the whole zoom"
+        );
+        let overflow = JointMembers {
+            tile_counts: BTreeMap::from([(1, usize::MAX)]),
+            member_bytes: Some(u64::MAX),
+        };
+        assert_eq!(
+            joined_tile_wave_under(&pending, [&overflow, &overflow].into_iter(), &opts, &budget),
+            1
+        );
     }
 
     #[test]

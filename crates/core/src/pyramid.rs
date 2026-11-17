@@ -19,7 +19,7 @@
 //!
 //! See issues #345 and #385.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use prost::Message;
@@ -2485,7 +2485,7 @@ fn tile_source_band(
         metadata: TilesetMetadata::default(),
         ..opts.export.clone()
     };
-    let report = crate::overview::export::export_pmtiles_for_join(
+    let (report, members) = crate::overview::export::export_pmtiles_for_join(
         &overview,
         &archive,
         &export,
@@ -2500,6 +2500,7 @@ fn tile_source_band(
         return Ok((archive, Vec::new()));
     }
     let source = JointSource {
+        members,
         path: overview.to_path_buf(),
         options: export,
         min_zoom: lo,
@@ -2841,20 +2842,20 @@ fn join_band_tiles(
 }
 
 /// Screen with directory lengths and gzip trailers. Only candidates are
-/// joined and measured exactly. Retain over-cap ids and raw sizes; the merge
+/// joined and measured exactly. Retain over-cap ids; the merge
 /// fits one wave at a time.
 fn screen_joined_tiles(
     bands: &[Band],
     archives: &[BandArchive],
     joint: Option<(&ExportOptions, &[Vec<JointSource>])>,
-) -> Result<BTreeMap<u8, BTreeMap<u64, usize>>, PyramidError> {
+) -> Result<BTreeMap<u8, BTreeSet<u64>>, PyramidError> {
     let Some((export, sources)) = joint else {
         return Ok(BTreeMap::new());
     };
     if shared_cap_zooms(bands, export).is_empty() || sources.iter().all(Vec::is_empty) {
         return Ok(BTreeMap::new());
     }
-    let mut pending: BTreeMap<u8, BTreeMap<u64, usize>> = BTreeMap::new();
+    let mut pending: BTreeMap<u8, BTreeSet<u64>> = BTreeMap::new();
     let mut cache = vec![None; bands.len()];
     let mut refs = Vec::with_capacity(bands.len());
     let mut raw = Vec::new();
@@ -2914,7 +2915,7 @@ fn screen_joined_tiles(
             }
         })?;
         if joined_over_limit(raw.len(), gzip.len(), export) {
-            pending.entry(coord.z).or_default().insert(id, raw.len());
+            pending.entry(coord.z).or_default().insert(id);
         }
     }
     Ok(pending)
@@ -2930,7 +2931,7 @@ struct JoinedTileRetry<'a> {
 }
 
 struct PendingJoinedTiles {
-    tiles: BTreeMap<u64, usize>,
+    tiles: BTreeSet<u64>,
     width: usize,
 }
 
@@ -2955,10 +2956,10 @@ impl<'a> JoinedTileRetry<'a> {
             pending: pending
                 .into_iter()
                 .map(|(zoom, tiles)| {
-                    let width = crate::overview::export::joined_tile_wave(
-                        &tiles,
-                        joint.expect("pending joins have caps").0,
-                    );
+                    let width = fitter
+                        .as_ref()
+                        .expect("pending joins have a fitter")
+                        .tile_wave(&tiles, joint.expect("pending joins have caps").0);
                     (zoom, PendingJoinedTiles { tiles, width })
                 })
                 .collect(),
@@ -2977,10 +2978,7 @@ impl<'a> JoinedTileRetry<'a> {
         let Some(PendingJoinedTiles { tiles, width }) = self.pending.get_mut(&zoom) else {
             return Ok(());
         };
-        if tiles
-            .first_key_value()
-            .is_none_or(|(&first, _)| first != id)
-        {
+        if tiles.first().is_none_or(|&first| first != id) {
             return Ok(());
         }
         debug_assert!(
@@ -5542,6 +5540,7 @@ mod tests {
             .iter()
             .map(|_| {
                 vec![JointSource {
+                    members: Default::default(),
                     path: dir.path().join("must-not-be-opened.parquet"),
                     options: export.clone(),
                     min_zoom: 0,
@@ -5650,6 +5649,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sources = [
             vec![JointSource {
+                members: Default::default(),
                 path: dir.path().join("must-not-be-opened.parquet"),
                 options: export.clone(),
                 min_zoom: 0,
@@ -5703,6 +5703,7 @@ mod tests {
         for coverage_fill in [false, true] {
             let sources = [
                 vec![JointSource {
+                    members: Default::default(),
                     path: dir.path().join("must-not-open.parquet"),
                     options: ExportOptions {
                         coverage_fill,
@@ -5713,6 +5714,7 @@ mod tests {
                     max_zoom: 0,
                 }],
                 vec![JointSource {
+                    members: Default::default(),
                     path: dir.path().join("also-must-not-open.parquet"),
                     options: export.clone(),
                     min_zoom: 0,

@@ -1162,7 +1162,7 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
     output: &Path,
     config: &super::config::ValidatedConfig<'_, TilesOptions>,
     observer: &mut dyn TilesObserver,
-    retained: Option<(&Path, &mut Option<ExportOptions>, &[u8])>,
+    retained: Option<(&Path, &mut Option<super::export::JointSource>, &[u8])>,
 ) -> Result<TilesOutcome, TilesError> {
     let options = config.options();
     // #452: before the intermediate is created — which would otherwise be
@@ -1416,15 +1416,21 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
         profile: options.convert.profile,
         ..options.export.clone()
     };
-    let export_report = super::export::export_pmtiles_for_join(
+    let (export_report, members) = super::export::export_pmtiles_for_join(
         &overview_path,
         output,
         &export_opts,
         retained.as_ref().map_or(&[], |(_, _, zooms)| *zooms),
     )
     .map_err(TilesError::Export)?;
-    if let Some((_, retained_options, _)) = retained {
-        *retained_options = Some(export_opts);
+    if let Some((_, retained_source, _)) = retained {
+        *retained_source = Some(super::export::JointSource {
+            path: overview_path,
+            options: export_opts,
+            min_zoom: export_report.min_zoom,
+            max_zoom: export_report.max_zoom,
+            members,
+        });
     }
 
     Ok(TilesOutcome::Converted(Box::new(TilesReport {
