@@ -102,6 +102,12 @@ pub enum ReaderError {
     },
 }
 
+/// A failed read of the file as a [`ReaderError`] that keeps its typed
+/// cause, so a hostile page is the input's fault, not a failed run (#833).
+fn read_failure(e: InputError) -> ReaderError {
+    ReaderError::Parquet(tylertoo_io::ParquetError::External(Box::new(e)))
+}
+
 /// A reader over a local GeoParquet overview file.
 ///
 /// Constructed with [`OverviewReader::open`], which parses the footer once.
@@ -165,14 +171,21 @@ impl OverviewReader {
 
         let resolved = ResolvedSchema::from_parquet(&schema, &metadata)
             .map_err(|e| ReaderError::Conformance(format!("{}: {e}", shown())))?;
+        let source = Arc::new(ConvertSource::single_parsed(
+            crate::input::InputSource::Local(path.clone()),
+            resolved.clone(),
+            builder.reader_metadata().clone(),
+        ));
         let mut report = super::check::validate_resolved_metadata(&metadata, &resolved);
-        super::check::check_cluster_sum_invariant(
-            &path,
+        if let Some(e) = super::check::check_cluster_sum_invariant(
+            &source,
             &metadata,
             &resolved,
             &mut report,
             &crate::diagnostics::Diagnostics::default(),
-        );
+        ) {
+            return Err(read_failure(e));
+        }
         if report.read_failures().next().is_some() {
             return Err(ReaderError::Conformance(format!(
                 "{}: {}",
@@ -184,11 +197,6 @@ impl OverviewReader {
                     .join("; ")
             )));
         }
-        let source = Arc::new(ConvertSource::single_parsed(
-            crate::input::InputSource::Local(path.clone()),
-            resolved.clone(),
-            builder.reader_metadata().clone(),
-        ));
         Ok(Self {
             resolved,
             source,
@@ -722,6 +730,20 @@ mod tests {
     }
 
     // --- tests ---------------------------------------------------------------
+
+    /// #833: a failed read in `open` (the cluster-sum check) keeps its
+    /// class: a hostile page header is the input's fault.
+    #[test]
+    fn open_read_failures_keep_their_class() {
+        use crate::error::{Classify, ErrorKind};
+        // The shape a batch read yields it in ([`crate::input_set::SourceStream`]).
+        let e = crate::overview::export::ExportError::from(read_failure(InputError::Arrow(
+            arrow_schema::ArrowError::ExternalError(Box::new(
+                tylertoo_io::Error::HostilePageHeader,
+            )),
+        )));
+        assert_eq!(e.kind(), ErrorKind::Input, "{e}");
+    }
 
     #[test]
     fn open_parses_meta_and_band_ranges() {
