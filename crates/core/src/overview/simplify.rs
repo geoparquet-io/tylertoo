@@ -1184,6 +1184,10 @@ fn rdp_polygon(poly: &Polygon<f64>, epsilon: f64, pins: Option<&JunctionNodes>) 
 /// its smaller endpoint and breaks distance ties toward the smaller vertex.
 /// Orienting the whole span once gives the same symmetry: every subproblem
 /// is then the same in both rings.
+///
+/// DIVERGENCE FROM TIPPECANOE: tippecanoe rounds each distance to 1/16 of a
+/// tile unit so that both directions agree; one orientation runs the same
+/// f64 arithmetic in both rings, so exact distances already agree.
 fn rdp_span_canonical(span: &[geo::Coord<f64>], epsilon: f64) -> Vec<geo::Coord<f64>> {
     let n = span.len();
     let reversed_smaller = (0..n / 2)

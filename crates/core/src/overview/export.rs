@@ -7725,7 +7725,7 @@ fn finest_level_pins(
 
 /// A feature of the finest level, simplified by
 /// [`ExportOptions::max_zoom_simplify_factor`] (#814): `factor × gsd(z)` at
-/// that level's zoom `finest_zoom`, the tolerance `--simplify-factor` gives
+/// that level's zoom (`finest`), the tolerance `--simplify-factor` gives
 /// every coarser level. Unset, only lines are simplified, at
 /// [`DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR`]. Borrowed unchanged at other
 /// levels (`None`) and at factor 0.
@@ -7737,14 +7737,15 @@ fn finest_level_pins(
 /// before clipping, so neighbouring tiles agree at their seam. It only
 /// removes vertices: a feature, part or ring under the tolerance keeps its
 /// own geometry rather than being dropped, and a polygon with no valid
-/// candidate keeps its own (no repair).
+/// candidate keeps its own (no repair), or, under pins, the candidate, which
+/// the tile-space repair resolves.
 /// Coarser levels keep `simplify_for_level`'s rules.
 ///
 /// DIVERGENCE FROM TIPPECANOE: tippecanoe's default `-S 1` simplifies
-/// polygons at the max zoom too. The default here leaves them alone, since
-/// each polygon is simplified on its own and shared borders part into
-/// slivers (#802); `--max-zoom-simplify-factor 0.25` or `--preset
-/// tippecanoe` simplifies both.
+/// polygons at the max zoom too. The default here leaves them alone, so
+/// the finest zoom draws the source as is; `--max-zoom-simplify-factor 0.25`
+/// or `--preset tippecanoe` simplifies both, polygons cut at `finest`'s
+/// junction pins ([`finest_level_pins`], #802).
 fn finest_zoom_geometry<'g>(
     geom: &'g Geometry<f64>,
     finest: Finest<'_>,
