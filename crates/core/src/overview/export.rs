@@ -2551,9 +2551,6 @@ fn export_pmtiles_validated(
     let input_path = input_path.as_ref();
 
     let reader = OverviewReader::open(input_path)?;
-    let band_source = ConvertSource::single(crate::input::InputSource::Local(
-        reader.path().to_path_buf(),
-    ));
     let meta = reader.meta().clone();
     if options.variable_depth {
         variable_depth::check_file(&meta, reader.mode())?;
@@ -2643,7 +2640,18 @@ fn export_pmtiles_validated(
         published,
         feature_id,
         skipped: skipped_property_columns,
-    } = resolve_export_columns(&reader, options, &level_zooms)?;
+    } = resolve_export_columns(
+        (
+            &reader,
+            BandRead {
+                source: reader.source(),
+                budget: *budget,
+                profile: options.profile,
+            },
+        ),
+        options,
+        &level_zooms,
+    )?;
     let fit_member_bytes = export_member_bytes(&reader, &published, mean_member_bytes);
     let member_bytes = fit_member_bytes.map(|bytes| export_member_resident_bytes(bytes, options));
 
@@ -2705,7 +2713,7 @@ fn export_pmtiles_validated(
     let mut scans = scan_all_levels(
         &reader,
         BandRead {
-            source: &band_source,
+            source: reader.source(),
             budget: *budget,
             profile: options.profile,
         },
@@ -2855,6 +2863,15 @@ fn export_pmtiles_validated(
         let store = fill_member_store(
             &reader,
             &FanoutCtx {
+                // shortcut: like the levels' band reads below, the fill's
+                // read-ahead (at most `BAND_READ_AHEAD_BATCHES` per reader)
+                // is not charged to the budget; charge a `grant_read_ahead`
+                // if a profile shows the fill's peak RSS growing.
+                band: BandRead {
+                    source: reader.source(),
+                    budget: *budget,
+                    profile: options.profile,
+                },
                 crs,
                 plans: &plans,
                 opts: options,
@@ -2923,7 +2940,7 @@ fn export_pmtiles_validated(
     let template = ExportLevelCtx {
         reader: &reader,
         band: BandRead {
-            source: &band_source,
+            source: reader.source(),
             // shortcut: the read-ahead is sized from the budget as the levels
             // start and is not charged to it (the old one-thread pipe was not
             // either); charge a `grant_read_ahead` per band read if a profile
@@ -3489,7 +3506,7 @@ impl ExportProfile {
 /// seconds with its true overview-file row, not after the coarser levels
 /// export.
 fn resolve_export_columns(
-    reader: &OverviewReader,
+    (reader, band): (&OverviewReader, BandRead<'_>),
     options: &ExportOptions,
     level_zooms: &[u8],
 ) -> Result<ResolvedColumns, ExportError> {
@@ -3539,7 +3556,7 @@ fn resolve_export_columns(
     )?;
     published.withhold_counter_at_canonical(reader.meta(), &options.properties);
     if let Some(fid) = &feature_id {
-        validate_feature_id_column(reader, fid, level_zooms)?;
+        validate_feature_id_column((reader, band), fid, level_zooms)?;
     }
     Ok(ResolvedColumns {
         published,
@@ -5075,6 +5092,8 @@ struct LevelCtx<'a> {
 /// [`LevelCtx`] for the legacy per-wave path.
 #[derive(Clone, Copy)]
 struct FanoutCtx<'a> {
+    /// How the bands are read ([`send_bands`]).
+    band: BandRead<'a>,
     crs: Crs,
     plans: &'a [LevelPlan],
     opts: &'a ExportOptions,
@@ -5932,11 +5951,12 @@ impl MemberStore {
     }
 }
 
-/// The single-read fill (#235): a dedicated reader thread streams every band
-/// once, in band order, over a bounded channel (mirroring
-/// `overview/pipeline.rs`); the consumer decodes each batch once and fans its
-/// clipped members to every level whose render set includes the band — in
-/// partitioning mode, band `j` feeds levels `{j..N}`.
+/// The single-read fill (#235): a producer thread streams every band once,
+/// in band order, over a bounded channel (mirroring `overview/pipeline.rs`),
+/// each band through the ordered parallel reader ([`send_bands`], #833); the
+/// consumer decodes each batch once and fans its clipped members to every
+/// level whose render set includes the band — in partitioning mode, band `j`
+/// feeds levels `{j..N}`.
 fn fill_member_store(
     reader: &OverviewReader,
     ctx: &FanoutCtx<'_>,
@@ -5962,26 +5982,24 @@ fn fill_member_store(
     let store_ref = &mut store;
     let seq_ref = &mut seq;
     let gaps_ref = &mut gaps;
+    #[cfg(test)]
+    let mut readers = 0;
+    #[cfg(test)]
+    let readers_ref = &mut readers;
     scoped_pipe(
         SINGLE_READ_IN_FLIGHT,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
-            for band in 0..num_levels {
-                // #535: `band_read` is this producer thread's own time — the
-                // reader open plus each Parquet read + Arrow decode, excluding
-                // the `tx.send` below (a bounded-channel send that can block
-                // on the consumer, which must not be charged to reading).
-                let mut band_reader = ExportTimers::time(&timers.band_read, || {
-                    reader.read_band_batched(band, EXPORT_BATCH_SIZE)
-                })?;
-                loop {
-                    let next = ExportTimers::time(&timers.band_read, || band_reader.next());
-                    let Some(batch) = next else { break };
-                    if tx.send((band, batch?)).is_err() {
-                        return Ok(()); // consumer dropped the receiver (error path)
-                    }
-                }
-            }
-            Ok(())
+            // #535: `band_read` is the readers' time, not the `tx.send`
+            // (a bounded-channel send that can block on the consumer).
+            send_bands(
+                (reader, ctx.band),
+                None,
+                ReadPass::Build,
+                |read| add_nanos(&timers.band_read, read),
+                tx,
+                #[cfg(test)]
+                readers_ref,
+            )
         },
         // Consumer: batches arrive in band order (bands are contiguous
         // ascending row groups), so the running `seq` is the global file row
@@ -5994,6 +6012,8 @@ fn fill_member_store(
             Ok(())
         },
     )?;
+    #[cfg(test)]
+    BAND_READ_WORKERS.with(|w| w.set(readers));
     store.finish_fill()?;
     // Every spill flush (during routing and the final one) → `spill_write`;
     // `fanout_batch_members` already kept its share out of `decode`.
@@ -6030,6 +6050,7 @@ fn fanout_batch_members(
         published,
         feature_id,
         timers,
+        ..
     } = *ctx;
     let schema = batch.schema();
     let geom_idx = batch_geometry_index(batch, published.geometry.as_deref())?;
@@ -6214,7 +6235,7 @@ fn encode_buckets(
 /// `k >= j` whose prefix includes it: `Σ_k |prefix_k|` row-group decodes.
 ///
 /// This reads each level's **own band once** (`Σ_j |band_j|` = every row group
-/// exactly once via [`OverviewReader::read_band_batched`]) and *fans*
+/// exactly once via [`send_bands`]) and *fans*
 /// every decoded feature to the accumulators of every level whose render set
 /// includes its band — level `j`'s features contribute to levels `{j}`
 /// (duplicating, self-contained bands) or `{j..N}` (partitioning prefix).
@@ -6360,7 +6381,7 @@ fn scan_all_levels_from(
     // struct, else the geometry — and the pipe is the shallow
     // [`WAVE_READ_IN_FLIGHT`]: this runs before any wave preflight, so its
     // in-flight batches are unbudgeted (shortcut: under `auto` up to four
-    // readers each hold [`SCAN_READ_AHEAD_BATCHES`] of them too; charge a
+    // readers each hold [`BAND_READ_AHEAD_BATCHES`] of them too; charge a
     // `grant_read_ahead` if a geometry-column scan shows in peak RSS). Projection keeps every row and the
     // column's field (name and metadata), so the bboxes — and the scan — are
     // unchanged. With no recognizable geometry column the read stays
@@ -6401,36 +6422,15 @@ fn scan_all_levels_from(
     scoped_pipe(
         WAVE_READ_IN_FLIGHT,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
-            for j in 0..num_levels {
-                let selection = RowGroupSelection::from_parts(vec![reader.band(j)?]);
-                let tuning = band_tuning(band, &selection, roots.as_deref(), ReadPass::Scan)?;
-                let mut hung_up = false;
-                read_in_order_capped(
-                    band.source,
-                    Some(&selection),
-                    roots.as_deref(),
-                    tuning,
-                    Some(SCAN_READ_AHEAD_BATCHES),
-                    |batch, _, read| {
-                        add_nanos(&timers.scan_read, read);
-                        hung_up = tx.send((j, batch)).is_err();
-                        Ok(if hung_up {
-                            ReadFlow::Stop
-                        } else {
-                            ReadFlow::Continue
-                        })
-                    },
-                )
-                .map_err(read_error)?;
+            send_bands(
+                (reader, band),
+                roots.as_deref(),
+                ReadPass::Scan,
+                |read| add_nanos(&timers.scan_read, read),
+                tx,
                 #[cfg(test)]
-                {
-                    *readers_ref = (*readers_ref).max(super::read::last_read_workers());
-                }
-                if hung_up {
-                    return Ok(()); // consumer dropped the receiver
-                }
-            }
-            Ok(())
+                readers_ref,
+            )
         },
         |rx: Receiver<(usize, RecordBatch)>| -> Result<(), ExportError> {
             // PERF (#817): one band's bboxes are sized a pool's worth at a
@@ -6553,19 +6553,20 @@ fn scan_all_levels_from(
         },
     )?;
     #[cfg(test)]
-    SCAN_READ_WORKERS.with(|w| w.set(readers));
+    BAND_READ_WORKERS.with(|w| w.set(readers));
     Ok((!abandoned).then_some(scans))
 }
 
-/// Read-ahead per scan reader, in batches: the scan's projected batches are
-/// small and its consumer keeps up, so the floor is enough.
-const SCAN_READ_AHEAD_BATCHES: usize = 4;
+/// Read-ahead per reader of [`send_bands`], in batches: the scan's
+/// projected batches are small and its consumer keeps up, and the fill's
+/// consumer takes one batch at a time, so the floor is enough.
+const BAND_READ_AHEAD_BATCHES: usize = 4;
 
 #[cfg(test)]
 thread_local! {
-    /// Most reader threads one band read of this thread's last scan used
-    /// (test counter, #817).
-    static SCAN_READ_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Most reader threads one band read of this thread's last scan or
+    /// single-read fill used (test counter, #817, #833).
+    static BAND_READ_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Sizing passes this thread's scans ran, summed (test counter, #817).
     static SCAN_SIZE_FLUSHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -6834,7 +6835,7 @@ fn ranges_contain(ranges: &BboxTileRanges, tc: TileCoord) -> bool {
 }
 
 /// Per-level scan oracle: reads level `level_idx`'s full render set (the
-/// mode-dependent prefix, via [`OverviewReader::read_level_batched`])
+/// mode-dependent prefix, via [`OverviewReader::read_level`])
 /// and sizes it at `zoom`. This is the pre-#233 independent-per-level read path,
 /// retained as the byte-identity oracle for [`scan_all_levels`] — a genuinely
 /// different read (one prefix vs a fan of per-band reads) that must yield the
@@ -6847,7 +6848,7 @@ fn scan_level(
     zoom: u8,
     opts: &ExportOptions,
 ) -> Result<LevelScan, ExportError> {
-    let batch_reader = reader.read_level_batched(level_idx, None, EXPORT_BATCH_SIZE)?;
+    let batch_reader = reader.read_level(level_idx, None)?;
     let mut scan = LevelScan {
         feature_count: 0,
         bounds: None,
@@ -6855,7 +6856,7 @@ fn scan_level(
     };
     for batch in batch_reader {
         let bboxes = decode_batch_bboxes(
-            &batch?,
+            &batch.map_err(|e| read_error(e.into()))?,
             geometry_name(reader),
             crs,
             &crate::diagnostics::Diagnostics::default(),
@@ -7292,8 +7293,6 @@ fn read_band(
     #[cfg(test)] work: &Mutex<ExportWorkTally>,
     mut on_batch: impl FnMut(RecordBatch) -> Result<(), ExportError>,
 ) -> Result<(), ExportError> {
-    let selection = RowGroupSelection::from_parts(vec![selected.to_vec()]);
-    let tuning = band_tuning(band, &selection, None, ReadPass::Build)?;
     // The collect takes a group at a time, so each reader needs about one
     // group queued, not the budget's depth: concurrent levels each read.
     let ahead = collect_group_rows(band.profile).div_ceil(EXPORT_BATCH_SIZE);
@@ -7305,13 +7304,13 @@ fn read_band(
     scoped_pipe(
         SINGLE_READ_IN_FLIGHT,
         |tx: &Sender<RecordBatch>| -> Result<(), ExportError> {
-            read_in_order_capped(
-                band.source,
-                Some(&selection),
+            read_overview(
+                band,
+                selected.to_vec(),
                 None,
-                tuning,
-                Some(ahead),
-                |batch, _, read| {
+                ReadPass::Build,
+                ahead,
+                |batch, read| {
                     add_nanos(&timers.band_read, read);
                     #[cfg(test)]
                     if std::thread::current().id() == consumer {
@@ -7327,10 +7326,83 @@ fn read_band(
                     })
                 },
             )
-            .map_err(read_error)
         },
         |rx| rx.into_iter().try_for_each(&mut on_batch),
     )
+}
+
+/// Read the row groups `selected` of the overview in file order through
+/// the ordered reader ([`read_in_order_capped`]), projected to `roots`
+/// (`None`: every column), each reader at most `ahead` batches ahead, and
+/// hand each batch and its read time to `on_batch` on this thread. Every
+/// read of the overview file the export makes goes through here (#833).
+fn read_overview(
+    band: BandRead<'_>,
+    selected: Vec<usize>,
+    roots: Option<&[usize]>,
+    pass: ReadPass,
+    ahead: usize,
+    mut on_batch: impl FnMut(RecordBatch, Duration) -> Result<ReadFlow, ExportError>,
+) -> Result<(), ExportError> {
+    let selection = RowGroupSelection::from_parts(vec![selected]);
+    let tuning = band_tuning(band, &selection, roots, pass)?;
+    let mut failed = None;
+    read_in_order_capped(
+        band.source,
+        Some(&selection),
+        roots,
+        tuning,
+        Some(ahead),
+        |batch, _, read| {
+            on_batch(batch, read).or_else(|e| {
+                failed = Some(e);
+                Ok(ReadFlow::Stop)
+            })
+        },
+    )
+    .map_err(read_error)?;
+    failed.map_or(Ok(()), Err)
+}
+
+/// Read every band of the overview, in band order, through
+/// [`read_overview`] and send each batch down `tx` tagged with its band:
+/// the scan's and the single-read fill's producer. Stops cleanly when the
+/// consumer hangs up.
+fn send_bands(
+    (reader, band): (&OverviewReader, BandRead<'_>),
+    roots: Option<&[usize]>,
+    pass: ReadPass,
+    mut charge_read: impl FnMut(Duration),
+    tx: &Sender<(usize, RecordBatch)>,
+    #[cfg(test)] readers: &mut usize,
+) -> Result<(), ExportError> {
+    for j in 0..reader.num_levels() {
+        let mut hung_up = false;
+        read_overview(
+            band,
+            reader.band(j)?,
+            roots,
+            pass,
+            BAND_READ_AHEAD_BATCHES,
+            |batch, read| {
+                charge_read(read);
+                hung_up = tx.send((j, batch)).is_err();
+                Ok(if hung_up {
+                    ReadFlow::Stop
+                } else {
+                    ReadFlow::Continue
+                })
+            },
+        )?;
+        #[cfg(test)]
+        {
+            *readers = (*readers).max(super::read::last_read_workers());
+        }
+        if hung_up {
+            return Ok(()); // consumer dropped the receiver
+        }
+    }
+    Ok(())
 }
 
 /// How [`read_in_order_capped`] reads `selection` of the overview for
@@ -10395,7 +10467,7 @@ fn read_level_features(
     let batch_reader = reader.read_level(level_idx, None)?;
     let mut out = Vec::new();
     for batch in batch_reader {
-        let batch = batch?;
+        let batch = batch.map_err(|e| read_error(e.into()))?;
         decode_batch(&batch, geometry_name(reader), crs, &mut out)?;
     }
     Ok(out)
@@ -14714,13 +14786,6 @@ mod tests {
         ]
     }
 
-    /// The overview at `reader`'s path as a band source.
-    pub(super) fn band_source(reader: &OverviewReader) -> ConvertSource {
-        ConvertSource::single(crate::input::InputSource::Local(
-            reader.path().to_path_buf(),
-        ))
-    }
-
     /// An `auto` band read of `source` with no memory limit.
     pub(super) fn test_band(source: &ConvertSource) -> BandRead<'_> {
         BandRead {
@@ -14748,14 +14813,14 @@ mod tests {
             .collect();
         write_fixture(input.path(), &[((0..40_000).collect(), points)]);
         let reader = OverviewReader::open(input.path()).unwrap();
-        let source = band_source(&reader);
+        let source = reader.source();
         let scan = |profile| {
             let flushes = SCAN_SIZE_FLUSHES.with(std::cell::Cell::get);
             let scans = scan_all_levels(
                 &reader,
                 BandRead {
                     profile,
-                    ..test_band(&source)
+                    ..test_band(source)
                 },
                 Crs::Epsg4326,
                 &ExportOptions::default(),
@@ -14765,7 +14830,7 @@ mod tests {
             )
             .unwrap();
             let flushes = SCAN_SIZE_FLUSHES.with(std::cell::Cell::get) - flushes;
-            (scans, SCAN_READ_WORKERS.with(std::cell::Cell::get), flushes)
+            (scans, BAND_READ_WORKERS.with(std::cell::Cell::get), flushes)
         };
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(64)
@@ -14800,7 +14865,7 @@ mod tests {
         let timers = ExportTimers::default();
         let opts = ExportOptions::default();
         let covering = scan_all_levels_from(
-            (&reader, test_band(&band_source(&reader))),
+            (&reader, test_band(reader.source())),
             crs,
             &opts,
             &timers,
@@ -14810,7 +14875,7 @@ mod tests {
         )
         .unwrap();
         let geometry = scan_all_levels_from(
-            (&reader, test_band(&band_source(&reader))),
+            (&reader, test_band(reader.source())),
             crs,
             &opts,
             &timers,
@@ -14887,7 +14952,7 @@ mod tests {
         let reader = OverviewReader::open(tmp.path()).unwrap();
         let scans = scan_all_levels(
             &reader,
-            test_band(&band_source(&reader)),
+            test_band(reader.source()),
             Crs::Epsg4326,
             &ExportOptions::default(),
             &ExportTimers::default(),
@@ -16627,7 +16692,7 @@ mod tests {
         let opts = ExportOptions::default();
         let scans = scan_all_levels(
             &reader,
-            test_band(&band_source(&reader)),
+            test_band(reader.source()),
             Crs::Epsg4326,
             &opts,
             &ExportTimers::default(),
@@ -20154,13 +20219,20 @@ mod tests {
         path: &Path,
         level_geoms: &[(Vec<i64>, Vec<Geometry<f64>>)],
     ) -> MemberStore {
-        let meta = write_partitioning_fixture(path, level_geoms);
+        write_partitioning_fixture(path, level_geoms);
+        fill_store(path, MemoryProfile::Auto)
+    }
+
+    /// Fill the single-read member store from the overview at `path` under
+    /// `profile`, every level one wave.
+    fn fill_store(path: &Path, profile: MemoryProfile) -> MemberStore {
         let reader = OverviewReader::open(path).unwrap();
+        let meta = reader.meta().clone();
         let opts = ExportOptions::default();
         let diagnostics = crate::diagnostics::Diagnostics::default();
         let scans = scan_all_levels(
             &reader,
-            test_band(&band_source(&reader)),
+            test_band(reader.source()),
             Crs::Epsg4326,
             &opts,
             &ExportTimers::default(),
@@ -20185,6 +20257,10 @@ mod tests {
         fill_member_store(
             &reader,
             &FanoutCtx {
+                band: BandRead {
+                    profile,
+                    ..test_band(reader.source())
+                },
                 crs: Crs::Epsg4326,
                 plans: &plans,
                 opts: &opts,
@@ -20200,6 +20276,49 @@ mod tests {
             &diagnostics,
         )
         .unwrap()
+    }
+
+    /// The single-read fill reads each band with the ordered parallel reader
+    /// under `auto` and with one reader under `bounded` (#833: it read
+    /// through a second, serial reader).
+    #[test]
+    fn fill_reads_bands_with_the_ordered_reader() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let points: Vec<Geometry<f64>> = (0..40_000)
+            .map(|i| {
+                let f = f64::from(i);
+                Geometry::Point(Point::new(
+                    -170.0 + (f * 0.0171) % 340.0,
+                    -60.0 + (f * 0.0067) % 120.0,
+                ))
+            })
+            .collect();
+        write_mode_fixture(
+            input.path(),
+            &[((0..40_000).collect(), points)],
+            Mode::Partitioning,
+            10_000,
+        );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(64)
+            .build()
+            .unwrap();
+        let readers = |profile| {
+            pool.install(|| {
+                BAND_READ_WORKERS.with(|w| w.set(0));
+                fill_store(input.path(), profile);
+                BAND_READ_WORKERS.with(std::cell::Cell::get)
+            })
+        };
+        // The auto reader count follows the host's cores: one on one CPU.
+        let several = resolve_pass_read_workers(ReadPass::Build, READ_WORKERS_AUTO) > 1;
+        let auto = readers(MemoryProfile::Auto);
+        assert_eq!(auto > 1, several, "auto filled with {auto} reader(s)");
+        assert_eq!(
+            readers(MemoryProfile::Bounded),
+            1,
+            "bounded keeps one reader"
+        );
     }
 
     /// A row of a partitioning fill that yields no member builds no
