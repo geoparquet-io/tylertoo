@@ -3697,7 +3697,10 @@ mod tests {
         let batch =
             RecordBatch::try_from_iter([("lists", Arc::new(lists.finish()) as ArrayRef)]).unwrap();
         let mut file = tempfile::tempfile().unwrap();
-        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2_048))
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         open_parquet(file).unwrap().metadata
@@ -3726,6 +3729,19 @@ mod tests {
         let limit = 1_000;
         assert!(510 * 9 > decoded_limit(limit));
         assert_eq!(batch_plan(&md, None, None, 8192, limit).0, 1);
+    }
+
+    #[test]
+    fn decode_takes_the_heaviest_selected_groups_excess() {
+        // Group 0 has 120 extra entries, group 1 has 150: 102 and 72 rows fit.
+        let light = (0..2_048).map(|i| if i < 40 { 4 } else { i % 2 });
+        let heavy = (0..2_048).map(|i| if i < 150 { 2 } else { 0 });
+        let md = list_plan_metadata(light.chain(heavy));
+        assert_eq!(md.metadata().num_row_groups(), 2);
+        let limit = 1_000;
+        let rows = |excess: u64| ((decoded_limit(limit) - excess * 9) / 9) as usize;
+        assert_eq!(batch_plan(&md, None, None, 8192, limit).0, rows(150));
+        assert_eq!(batch_plan(&md, Some(&[0]), None, 8192, limit).0, rows(120));
     }
 
     /// #848: Overture segments carry 86 list leaves, about 87 MB of repeated
