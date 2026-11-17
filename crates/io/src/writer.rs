@@ -9,7 +9,9 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::KeyValue;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::file::properties::{
+    EnabledStatistics, WriterProperties, DEFAULT_MAX_ROW_GROUP_ROW_COUNT,
+};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::ColumnPath;
 
@@ -58,8 +60,26 @@ pub fn batch_writer<W: Write + Send>(
     sink: W,
     schema: SchemaRef,
 ) -> Result<BatchWriter<W>, ParquetError> {
+    batch_writer_with_row_cap(sink, schema, DEFAULT_MAX_ROW_GROUP_ROW_COUNT)
+}
+
+/// Construct a [`batch_writer`] with a possibly smaller row-group row limit.
+///
+/// # Errors
+///
+/// Returns an error if the schema or sink cannot be written.
+///
+/// # Panics
+///
+/// Panics if `max_rows` is zero.
+pub fn batch_writer_with_row_cap<W: Write + Send>(
+    sink: W,
+    schema: SchemaRef,
+    max_rows: usize,
+) -> Result<BatchWriter<W>, ParquetError> {
     let props = WriterProperties::builder()
         .set_max_row_group_bytes(Some(BATCH_ROW_GROUP_BYTES))
+        .set_max_row_group_row_count(Some(max_rows.min(DEFAULT_MAX_ROW_GROUP_ROW_COUNT)))
         .build();
     ArrowWriter::try_new(sink, schema, Some(props)).map(BatchWriter)
 }

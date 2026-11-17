@@ -411,6 +411,25 @@ fn split(
             .and_then(|name| schema.index_of(name).ok()),
     };
     let row_groups = gates.row_groups.as_ref();
+    // Staged groups no longer than the source's: past the decode limit on list values
+    // the reader decodes one row at a time (`batch_plan`), 34x slower on Overture segments.
+    // shortcut: assumes a layer's rows hold about the source's list values per row; if a
+    // list-heavier layer crosses the limit, price staged groups with batch_plan's rule.
+    let max_rows = source
+        .part_row_group_row_counts()?
+        .iter()
+        .enumerate()
+        .filter_map(
+            |(part, counts)| match row_groups.and_then(|s| s.parts().get(part)) {
+                Some(picked) => picked.iter().filter_map(|&g| counts.get(g)).max(),
+                None => counts.iter().max(),
+            },
+        )
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let max_rows = usize::try_from(max_rows).unwrap_or(usize::MAX);
 
     let mut layers: BTreeMap<String, StagedWriter> = BTreeMap::new();
     // The rows of the row groups the gates prune count as dropped too.
@@ -458,8 +477,8 @@ fn split(
                         limit: MAX_LAYERS,
                     });
                 }
-                let staged =
-                    open_staged(dir, &staged_schema, &metadata).map_err(|e| stage_err(name, &e))?;
+                let staged = open_staged(dir, &staged_schema, &metadata, max_rows)
+                    .map_err(|e| stage_err(name, &e))?;
                 layers.insert(name.to_string(), staged);
             }
             let staged = layers.get_mut(name).expect("inserted above");
@@ -624,10 +643,11 @@ fn open_staged(
     dir: &Path,
     schema: &SchemaRef,
     metadata: &[tylertoo_io::KeyValue],
+    max_rows: usize,
 ) -> Result<StagedWriter, Box<dyn std::error::Error>> {
     let path = crate::atomic_output::reserve_path(".tylertoo-layer-", ".parquet", Some(dir))?;
     let (file, pending) = crate::atomic_output::create(&path)?;
-    let mut writer = tylertoo_io::batch_writer(file, Arc::clone(schema))?;
+    let mut writer = tylertoo_io::batch_writer_with_row_cap(file, Arc::clone(schema), max_rows)?;
     for kv in metadata {
         writer.append_key_value_metadata(kv.clone());
     }
