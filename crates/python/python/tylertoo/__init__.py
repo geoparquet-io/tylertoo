@@ -357,7 +357,8 @@ Attributes:
         lists the largest ten (`z`, `x`, `y`, compressed `bytes`) under
         `largest`. Under `size_valve="merge"`, in a tile of lines or
         polygons, only a lone feature still over the cap at the extent
-        floor is written over it, with a warning. Merged features are never split into their sources.
+        floor is written over it, with a warning. Merged features are
+        never split into their sources.
         `merged_tiles` counts tiles whose lone survivor is merged.
     merged_features: Tile features merged into a neighbor to fit a
         size limit (`size_valve="merge"`).
