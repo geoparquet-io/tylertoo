@@ -2867,6 +2867,101 @@ fn tiny_polygon_accumulator_is_inert_in_partitioning_mode() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// #875: `--drop-polygons` in the default square (fill) mode
+// ---------------------------------------------------------------------------
+
+/// `big` ~600 m squares on a 900 m grid near 10°E 45°N, each visible at
+/// z8..z12, followed by a 63×63 block of 10 m fields that stay sub-visible
+/// at every coarse level. Ids `0..big` are the big squares.
+fn visible_squares_and_tiny_fields(big: usize) -> Vec<Option<Geometry<f64>>> {
+    let deg = |m: f64| m / 111_320.0;
+    let square = |x: f64, y: f64, s: f64| {
+        Some(Geometry::Polygon(Polygon::new(
+            LineString::from(vec![(x, y), (x + s, y), (x + s, y + s), (x, y + s), (x, y)]),
+            vec![],
+        )))
+    };
+    let mut out: Vec<_> = (0..big)
+        .map(|i| {
+            let (r, c) = ((i / 50) as f64, (i % 50) as f64);
+            square(10.0 + c * deg(900.0), 45.0 + r * deg(900.0), deg(600.0))
+        })
+        .collect();
+    for r in 0..63 {
+        for c in 0..63 {
+            let (x, y) = (10.6 + c as f64 * deg(15.0), 45.0 + r as f64 * deg(15.0));
+            out.push(square(x, y, deg(10.0)));
+        }
+    }
+    out
+}
+
+/// The level's density budget for `n` budgeted features, `steps` levels
+/// above the canonical one (`apply_density_budget`'s `effective_budget`).
+fn level_budget(n: usize, drop_rate: f64, steps: i32) -> usize {
+    ((n as f64 / drop_rate.powi(steps)).round() as usize).max(256)
+}
+
+/// Convert [`visible_squares_and_tiny_fields`] at z8..z12 with
+/// `--drop-polygons`; per coarse level, (zoom, rows of visible squares,
+/// rows of tiny fields, budget).
+fn drop_polygons_rows(big: usize) -> Vec<(Option<u8>, usize, usize, usize)> {
+    let geoms = visible_squares_and_tiny_fields(big);
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &geoms, true, None);
+    let mut o = ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+        min_zoom: 8,
+        max_zoom: 12,
+    });
+    o.density.kinds.polygons = true;
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+    let finest = report.levels.len() - 1;
+    (0..finest)
+        .map(|li| {
+            let rows = read_level_ids_geoms(tout.path(), li);
+            let big_rows = rows.iter().filter(|(id, _)| (*id as usize) < big).count();
+            let budget = level_budget(geoms.len(), o.density.drop_rate, (finest - li) as i32);
+            (
+                report.levels[li].zoom,
+                big_rows,
+                rows.len() - big_rows,
+                budget,
+            )
+        })
+        .collect()
+}
+
+/// #875: with `--drop-polygons`, a polygon the budget drops from a level
+/// must not come back there as a placeholder square. tippecanoe drops such
+/// a feature before `reduce_tiny_poly` (tile.cpp, `dropped_by_rate`), so
+/// only polygons too small to see accumulate. On main every rate-dropped
+/// visible square is re-added as a carrier, so each coarse level holds all
+/// of them whatever the budget.
+#[test]
+fn drop_polygons_does_not_square_rate_dropped_polygons() {
+    for (zoom, big_rows, _, budget) in drop_polygons_rows(2_000) {
+        assert!(
+            big_rows <= budget,
+            "z{zoom:?}: {big_rows} rows of visible squares against a budget of {budget}"
+        );
+    }
+}
+
+/// #875 guard: `--drop-polygons` still squares the polygons too small for a
+/// level (tippecanoe's tiny-polygon reduction runs whatever the drop rate),
+/// so a fix must not switch the accumulator off.
+#[test]
+fn drop_polygons_still_squares_sub_visible_polygons() {
+    for (zoom, _, tiny_rows, _) in drop_polygons_rows(2_000) {
+        assert!(
+            tiny_rows > 0,
+            "z{zoom:?}: no placeholder squares for the sub-visible fields"
+        );
+    }
+}
+
 // ============================================================================
 // Class 13: input that cannot be tiled (#429)
 //
