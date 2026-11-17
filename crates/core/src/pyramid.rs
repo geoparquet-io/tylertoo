@@ -6678,6 +6678,15 @@ mod tests {
 
     #[test]
     fn joined_retry_spills_source_accounting_in_the_spill_dir() {
+        // It points TMPDIR at a missing directory, so it runs in its own
+        // process even under plain `cargo test`.
+        if !crate::test_env::run_in_child(
+            module_path!(),
+            "joined_retry_spills_source_accounting_in_the_spill_dir",
+            &[],
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let bands = [("a", 0.0), ("b", 0.5)].map(|(name, dy)| {
             let input = dir.path().join(format!("{name}.parquet"));
@@ -6718,22 +6727,8 @@ mod tests {
         let b = run(&bands[1..], None, "b.pmtiles").unwrap();
         // Each layer fits alone; the join does not, so the retry runs.
         let cap = a.max(b) + a.min(b) / 2;
-        // Restored on drop, even if the run panics. nextest runs each test in
-        // its own process; under plain `cargo test` run this one alone.
-        struct Restore(Option<std::ffi::OsString>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(previous) => std::env::set_var("TMPDIR", previous),
-                    None => std::env::remove_var("TMPDIR"),
-                }
-            }
-        }
-        let restore = Restore(std::env::var_os("TMPDIR"));
         std::env::set_var("TMPDIR", dir.path().join("missing"));
-        let joined = run(&bands, Some(cap), "out.pmtiles");
-        drop(restore);
-        assert!(joined.unwrap() <= cap);
+        assert!(run(&bands, Some(cap), "out.pmtiles").unwrap() <= cap);
     }
 
     #[test]
