@@ -156,11 +156,14 @@ fn pyramid_has_parity_with_export_flags() {
         // #822: bands tile verbatim and take no convert tuning, so a
         // tippecanoe preset could set only half of itself.
         "preset",
+        // #802: bands tile verbatim (max-zoom factor 0), so there is no
+        // max-zoom polygon simplification for shared-border pins to steer.
+        "no-simplification-of-shared-nodes",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect();
-    assert_eq!(exemptions.len(), 7);
+    assert_eq!(exemptions.len(), 8);
     let missing: BTreeSet<_> = export.difference(&pyramid).cloned().collect();
     assert_eq!(missing, exemptions);
 }
