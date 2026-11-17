@@ -239,7 +239,7 @@ fn overview_file_seeds() {
     let err = tylertoo_core::internal::overview::reader::fuzz_overview_file(&bytes).unwrap_err();
     assert!(
         matches!(
-            tylertoo_io::input_error(&err),
+            tylertoo_io::input_error(err.as_ref()),
             Some(tylertoo_io::Error::HostilePageHeader)
         ),
         "{err:?}"
