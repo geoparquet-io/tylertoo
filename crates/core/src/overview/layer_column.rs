@@ -1553,6 +1553,133 @@ mod tests {
         );
     }
 
+    /// `n` small squares spread over the world, labelled `a` and `b` in turn,
+    /// so both layers crowd the one z0 tile.
+    fn two_kinds(n: usize) -> (Vec<Option<geo::Geometry<f64>>>, Vec<&'static str>) {
+        let geoms = (0..n)
+            .map(|i| {
+                let (x, y) = ((i % 40) as f64 * 8.0 - 160.0, (i / 40) as f64 * 6.0 - 70.0);
+                Some(
+                    geo::Rect::new((x, y), (x + 3.0, y + 2.0))
+                        .to_polygon()
+                        .into(),
+                )
+            })
+            .collect();
+        let kinds = (0..n).map(|i| if i % 2 == 0 { "a" } else { "b" }).collect();
+        (geoms, kinds)
+    }
+
+    /// The raw bytes of `layer` in tile 0/0/0 of `path` (its encoded layer
+    /// message), or of the whole tile when `layer` is `None`.
+    fn z0_raw_bytes(path: &Path, layer: Option<&str>) -> usize {
+        let index = ArchiveIndex::open(path).unwrap();
+        let tile = index
+            .tiles()
+            .map(Result::unwrap)
+            .find(|t| t.z == 0)
+            .unwrap();
+        let raw = index.read_range(tile.range).unwrap();
+        let plain = compression::decompress_capped(&raw, Compression::Gzip, 1 << 26).unwrap();
+        match layer {
+            None => plain.len(),
+            Some(name) => crate::vector_tile::Tile::decode(plain.as_slice())
+                .unwrap()
+                .layers
+                .into_iter()
+                .find(|l| l.name == name)
+                .map_or(0, |l| l.encoded_len()),
+        }
+    }
+
+    /// The raw cap that each of `free`'s z0 layers fits alone but their join
+    /// does not: three quarters of the two layers' bytes.
+    fn cap_between(free: &Path) -> usize {
+        let (a, b) = (z0_raw_bytes(free, Some("a")), z0_raw_bytes(free, Some("b")));
+        let cap = (a + b) * 3 / 4;
+        assert!(a < cap && b < cap, "each layer alone fits: {a} {b} {cap}");
+        cap
+    }
+
+    fn assert_fits(capped: &Path, cap: usize) {
+        let joined = z0_raw_bytes(capped, None);
+        assert!(
+            joined <= cap,
+            "merged tile is {joined} raw bytes, over the {cap}-byte cap"
+        );
+    }
+
+    /// #838: `--layer-column` applies the size cap to the merged tile, as
+    /// tippecanoe does. Each layer alone fits the cap, so each layer's valve
+    /// leaves it be; joined, the tile is over the cap.
+    #[test]
+    fn layer_column_caps_the_merged_tile() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("kinds.parquet");
+        let (geoms, kinds) = two_kinds(800);
+        crate::overview::testutil::write_input_with_column(
+            &input,
+            &geoms,
+            "kind",
+            Arc::new(StringArray::from(kinds)),
+            None,
+        );
+        let run = |cap: Option<usize>| {
+            let out = dir.path().join(format!("o-{cap:?}.pmtiles"));
+            let mut o = options("kind");
+            o.convert.levels = LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 0,
+            };
+            o.export.tile_size_limit = cap;
+            o.export.compressed_tile_size_limit = None;
+            convert_to_pmtiles(&TilesInput::Path(input.clone()), &out, &o).unwrap();
+            out
+        };
+        let cap = cap_between(&run(None));
+        assert_fits(&run(Some(cap)), cap);
+    }
+
+    /// #838: `pyramid` bands of two layers that share a zoom get the cap on
+    /// the merged tile, as `--layer-column` does.
+    #[test]
+    fn pyramid_shared_zoom_caps_the_merged_tile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (geoms, kinds) = two_kinds(800);
+        let bands: Vec<Band> = ["a", "b"]
+            .into_iter()
+            .map(|kind| {
+                let path = dir.path().join(format!("{kind}.parquet"));
+                let (g, k): (Vec<_>, Vec<_>) = geoms
+                    .iter()
+                    .zip(&kinds)
+                    .filter(|(_, k)| **k == kind)
+                    .map(|(g, k)| (g.clone(), *k))
+                    .unzip();
+                crate::overview::testutil::write_input_with_column(
+                    &path,
+                    &g,
+                    "kind",
+                    Arc::new(StringArray::from(k)),
+                    None,
+                );
+                Band::new(path, kind.to_string(), 0, 0)
+            })
+            .collect();
+        let run = |cap: Option<usize>| {
+            let out = dir.path().join(format!("p-{cap:?}.pmtiles"));
+            let mut opts = crate::pyramid::PyramidOptions {
+                work_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            };
+            opts.export.tile_size_limit = cap;
+            crate::pyramid::build_pyramid(&bands, &out, &opts).unwrap();
+            out
+        };
+        let cap = cap_between(&run(None));
+        assert_fits(&run(Some(cap)), cap);
+    }
+
     #[test]
     fn layer_names_trim_and_bucket_blanks() {
         assert!(
