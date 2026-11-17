@@ -887,18 +887,13 @@ impl<T: Read> Wire for StreamWire<T> {
 
 /// `PageHeader`'s fields as parquet-rs 59 reads them without page
 /// statistics (`read_thrift_without_stats`): by id, whatever their wire
-/// type. Type and sizes (1–3) and the dictionary header (7) are read by
-/// [`check_header`].
+/// type. Type and sizes (1–3), the dictionary header (7) and the V2 data
+/// page header (8) are read by [`check_header`].
 fn page_header(id: i16) -> Option<Known> {
     match id {
         4 => Some(VARINT),
         5 => Some(Known::Struct(|id| (1..=4).contains(&id).then_some(VARINT))),
         6 => Some(Known::Struct(|_| None)),
-        8 => Some(Known::Struct(|id| match id {
-            1..=6 => Some(VARINT),
-            7 => Some(BOOL),
-            _ => None,
-        })),
         _ => None,
     }
 }
@@ -911,6 +906,9 @@ fn page_header(id: i16) -> Option<Known> {
 fn check_header<W: Wire>(span: &ChunkSpan, s: &mut Skim<W>) -> Option<String> {
     const DICTIONARY_PAGE: i32 = 2;
     let (mut ty, mut uncompressed, mut compressed, mut values) = (None, -1, -1, None);
+    // A V2 header's `is_compressed = false` skips decompression on any page
+    // type in parquet-rs (`decode_page`), a dictionary's too.
+    let mut stored = span.raw;
     // parquet-rs reads an i32 by truncating the zigzag i64 (#789).
     let int = |s: &mut Skim<W>, wire: u8| -> Result<i32, SkimStop> {
         read_as(wire, 5)?;
@@ -929,6 +927,16 @@ fn check_header<W: Wire>(span: &ChunkSpan, s: &mut Skim<W>) -> Option<String> {
                 _ => s.skip(wire, 2),
             })
         }
+        8 => {
+            read_as(wire, 12)?;
+            stored = span.raw;
+            s.fields(1, |s, id, wire| match id {
+                1..=6 => s.field(wire, Some(VARINT), 2),
+                // A compact bool is its field's type: 2 is false.
+                7 => read_as(wire, 1).map(|()| stored = span.raw || wire == 2),
+                _ => s.skip(wire, 2),
+            })
+        }
         _ => s.field(wire, page_header(id), 1),
     });
     match walked {
@@ -939,7 +947,7 @@ fn check_header<W: Wire>(span: &ChunkSpan, s: &mut Skim<W>) -> Option<String> {
     let (Some(values), Some(DICTIONARY_PAGE)) = (values, ty) else {
         return None;
     };
-    let bytes = if span.raw { compressed } else { uncompressed };
+    let bytes = if stored { compressed } else { uncompressed };
     // Negative counts and sizes are parquet-rs's to refuse.
     let (Ok(values), Ok(bytes)) = (u64::try_from(values), u64::try_from(bytes)) else {
         return None;
@@ -4316,6 +4324,24 @@ mod tests {
         // is the same varint, a binary is refused.
         assert!(refused(&dictionary(&[0x16, 0xca, 0x01])));
         assert!(refused(&dictionary(&[0x18, 0x01, 0x00])));
+        // An uncompressed V2 header on a compressed chunk's dictionary page:
+        // parquet-rs skips decompression, so 800 bytes is the stored size.
+        let v2 = |stored_bytes: &[u8]| {
+            let mut h = vec![0x15, 0x04, 0x15, 0xc0, 0x0c, 0x15];
+            h.extend(stored_bytes);
+            h.push(0x4c);
+            h.extend([0x15, 0xc8, 0x01, 0x15, 0x00, 0x00]);
+            // `8: { 1..6: 0, 7: false }`.
+            h.extend([
+                0x1c, 0x15, 0x00, 0x15, 0x00, 0x15, 0x00, 0x15, 0x00, 0x15, 0x00,
+            ]);
+            h.extend([0x15, 0x00, 0x12, 0x00, 0x00]);
+            h
+        };
+        let compressed = ChunkSpan { raw: false, ..span };
+        let check = |h: &[u8]| check_header(&compressed, &mut Skim { wire: h }).is_some();
+        assert!(!check(&v2(&[0xc0, 0x0c])));
+        assert!(check(&v2(&[0x10])));
         // A type parquet-rs reads twice keeps the last.
         assert!(refused(&[
             0x15, 0x00, 0x15, 0xc0, 0x0c, 0x15, 0xc0, 0x0c, 0x05, 0x02, 0x04, 0x0c, 0x0e, 0x15,
