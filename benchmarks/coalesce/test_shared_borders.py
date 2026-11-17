@@ -83,3 +83,22 @@ def test_layers_at_other_extents_are_rescaled():
     r = score_tile(SRC, tiles, Z, X, Y, 16)
     assert r["drawn"] == pytest.approx(1)
     assert r["overlap"] == pytest.approx(0, abs=1e-9)
+
+
+def test_score_only_builds_nothing(tmp_path, monkeypatch):
+    import argparse
+
+    import shared_borders as sb
+
+    def boom(*a, **k):
+        raise AssertionError("--score-only must build nothing")
+
+    for name in ("subset", "build_tylertoo", "build_tippecanoe"):
+        monkeypatch.setattr(sb, name, boom)
+    monkeypatch.setattr(sb.subprocess, "run", boom)
+    args = argparse.Namespace(work=tmp_path, bin=Path("tylertoo"), band=16.0, nz=tmp_path / "nz.parquet",
+                              madagascar=None, settings="default", tippecanoe=True,
+                              tippecanoe_bin="tippecanoe", rerun_tippecanoe=False, score_only=True,
+                              json=None)
+    with pytest.raises(SystemExit, match="score-only"):
+        sb.cmd_run(args)

@@ -203,6 +203,8 @@ def cmd_run(args) -> int:
         if "bbox" in ds:
             sub = work / f"{name}-subset.parquet"
             if not sub.exists():
+                if args.score_only:
+                    raise SystemExit(f"--score-only: {sub} is missing")
                 subset(source, ds["bbox"], sub)
             source = sub
         src = read_source(source, types=POLYGON)
