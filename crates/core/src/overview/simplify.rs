@@ -62,6 +62,7 @@ use geo::{
     Point, Polygon, Rect,
 };
 
+use super::junction::JunctionNodes;
 use super::level::{zoom_for_gsd, WEBMERC_CIRCUMFERENCE_M};
 pub use super::level::{Crs, METERS_PER_DEGREE};
 use crate::mvt::{DEFAULT_EXTENT, MIN_SURVIVING_SQUARE_SIDE};
@@ -301,7 +302,18 @@ pub fn simplify_for_level(
     opts: &SimplifyOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Simplified {
-    simplify_for_level_checked(geom, gsd_meters, None, crs, opts, diagnostics, geom, None).0
+    simplify_for_level_checked(
+        geom,
+        gsd_meters,
+        None,
+        crs,
+        opts,
+        diagnostics,
+        geom,
+        None,
+        None,
+    )
+    .0
 }
 
 /// Like [`simplify_for_level`], but also reports whether the returned
@@ -336,6 +348,7 @@ pub(super) fn simplify_for_level_checked(
     diagnostics: &crate::diagnostics::Diagnostics,
     source: &Geometry<f64>,
     mut part_sources: Option<&mut Vec<usize>>,
+    pins: Option<&JunctionNodes>,
 ) -> (Simplified, bool) {
     let tol = world_tolerance(gsd_meters, crs, opts);
     // The placeholder side only matters to the square disposition; skip the
@@ -399,6 +412,7 @@ pub(super) fn simplify_for_level_checked(
                 opts.cascade,
                 diagnostics,
                 original,
+                pins,
             )
         }
 
@@ -455,6 +469,7 @@ pub(super) fn simplify_for_level_checked(
                         opts.cascade,
                         diagnostics,
                         original,
+                        pins,
                     ) {
                         (Simplified::Keep(Geometry::Polygon(poly)), part_unchanged) => {
                             unchanged &= part_unchanged;
@@ -666,12 +681,16 @@ pub fn simplify_step(
     repr: Representation,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Simplified {
-    simplify_step_at(geom, gsd_meters, None, crs, opts, repr, diagnostics)
+    simplify_step_at(geom, gsd_meters, None, crs, opts, repr, diagnostics, None)
 }
 
 /// [`simplify_step`] for a level whose recorded zoom is known: the engines'
 /// entry point, so the placeholder square is floored at the tile unit of
 /// the zoom the level is exported at (#407).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "#802: the junction pins ride with the level parameters"
+)]
 pub(crate) fn simplify_step_at(
     geom: &Geometry<f64>,
     gsd_meters: f64,
@@ -680,6 +699,7 @@ pub(crate) fn simplify_step_at(
     opts: &SimplifyOptions,
     repr: Representation,
     diagnostics: &crate::diagnostics::Diagnostics,
+    pins: Option<&JunctionNodes>,
 ) -> Simplified {
     simplify_step_checked(
         geom,
@@ -691,6 +711,7 @@ pub(crate) fn simplify_step_at(
         diagnostics,
         geom,
         None,
+        pins,
     )
     .0
 }
@@ -719,6 +740,7 @@ pub(super) fn simplify_step_checked(
     diagnostics: &crate::diagnostics::Diagnostics,
     source: &Geometry<f64>,
     part_sources: Option<&mut Vec<usize>>,
+    pins: Option<&JunctionNodes>,
 ) -> (Simplified, bool) {
     match repr {
         Representation::Geometry => simplify_for_level_checked(
@@ -730,6 +752,7 @@ pub(super) fn simplify_step_checked(
             diagnostics,
             source,
             part_sources,
+            pins,
         ),
         Representation::Point => {
             if let Some(out) = polygonal_representative_point(geom) {
@@ -744,6 +767,7 @@ pub(super) fn simplify_step_checked(
                 diagnostics,
                 source,
                 part_sources,
+                pins,
             )
         }
         // Square (#279): normal simplification with the below-tolerance
@@ -763,6 +787,7 @@ pub(super) fn simplify_step_checked(
                 diagnostics,
                 source,
                 part_sources,
+                pins,
             )
         }
     }
@@ -818,11 +843,23 @@ pub fn simplify_cascade(
     opts: &SimplifyOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Simplified {
+    simplify_cascade_pinned(geom, steps_fine_to_coarse, crs, opts, diagnostics, None)
+}
+
+/// [`simplify_cascade`] that keeps the dataset's junction pins (#802).
+pub(crate) fn simplify_cascade_pinned(
+    geom: &Geometry<f64>,
+    steps_fine_to_coarse: &[CascadeStep],
+    crs: Crs,
+    opts: &SimplifyOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
+    pins: Option<&JunctionNodes>,
+) -> Simplified {
     if steps_fine_to_coarse.is_empty() {
         return Simplified::Keep(geom.clone());
     }
     let canonical = Arc::new(geom.clone());
-    let mut fold = CascadeFold::new();
+    let mut fold = CascadeFold::new(pins);
     let mut last = FoldStep::Dropped;
     for step in steps_fine_to_coarse {
         last = fold.step(&canonical, step, crs, opts, diagnostics);
@@ -854,8 +891,10 @@ pub fn simplify_cascade(
 /// - a kept result that the step left value-identical to its input
 ///   (`unchanged`, #499) shares the input's allocation instead of the fresh
 ///   copy — same value, one fewer geometry resident.
-pub(crate) struct CascadeFold {
+pub(crate) struct CascadeFold<'p> {
     current: Option<Arc<Geometry<f64>>>,
+    /// The dataset's junction pins (#802), kept at every step.
+    pins: Option<&'p JunctionNodes>,
     alive: bool,
     /// Canonical part index for each working MultiPolygon part. Repair
     /// duplicates an index; dropping a part removes it, never renumbers it.
@@ -876,11 +915,12 @@ pub(crate) enum FoldStep {
     Dropped,
 }
 
-impl CascadeFold {
+impl<'p> CascadeFold<'p> {
     /// A fresh fold: alive, working geometry = canonical.
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(pins: Option<&'p JunctionNodes>) -> Self {
         Self {
             current: None,
+            pins,
             alive: true,
             part_sources: Vec::new(),
         }
@@ -930,6 +970,7 @@ impl CascadeFold {
             // against an unchanged `u`, so it would never thin.
             canonical.as_ref(),
             Some(&mut self.part_sources),
+            self.pins,
         );
         match out {
             Simplified::Keep(s) => {
@@ -1119,15 +1160,76 @@ fn rdp_linestring(ls: &LineString<f64>, epsilon: f64) -> LineString<f64> {
 }
 
 /// [`rdp_coords`] over every ring — the drop-in for `geo`'s
-/// `Polygon::simplify` (which uses the ring floor, not the line one).
-fn rdp_polygon(poly: &Polygon<f64>, epsilon: f64) -> Polygon<f64> {
+/// `Polygon::simplify` (which uses the ring floor, not the line one) —
+/// or, under `pins`, [`rdp_ring_pinned`].
+fn rdp_polygon(poly: &Polygon<f64>, epsilon: f64, pins: Option<&JunctionNodes>) -> Polygon<f64> {
+    let ring = |r: &LineString<f64>| {
+        LineString::new(match pins {
+            Some(pins) => rdp_ring_pinned(&r.0, epsilon, pins),
+            None => rdp_coords(&r.0, epsilon, RDP_MIN_RING),
+        })
+    };
     Polygon::new(
-        LineString::new(rdp_coords(&poly.exterior().0, epsilon, RDP_MIN_RING)),
-        poly.interiors()
-            .iter()
-            .map(|r| LineString::new(rdp_coords(&r.0, epsilon, RDP_MIN_RING)))
-            .collect(),
+        ring(poly.exterior()),
+        poly.interiors().iter().map(ring).collect(),
     )
+}
+
+/// RDP over an open span whose endpoints are kept, run in the span's
+/// canonical direction (#802): the one whose coordinate sequence is
+/// lexicographically smaller. A span two rings share in opposite windings
+/// is then the same input, so it comes out bit-identical in both.
+///
+/// Tippecanoe's `douglas_peucker` (clip.cpp) orients each subproblem from
+/// its smaller endpoint and breaks distance ties toward the smaller vertex.
+/// Orienting the whole span once gives the same symmetry: every subproblem
+/// is then the same in both rings.
+fn rdp_span_canonical(span: &[geo::Coord<f64>], epsilon: f64) -> Vec<geo::Coord<f64>> {
+    let n = span.len();
+    let reversed_smaller = (0..n / 2)
+        .map(|i| {
+            let (a, b) = (span[i], span[n - 1 - i]);
+            a.x.partial_cmp(&b.x)
+                .and_then(|o| Some(o.then(a.y.partial_cmp(&b.y)?)))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .find(|o| o.is_ne())
+        .is_some_and(|o| o.is_gt());
+    if !reversed_smaller {
+        return rdp_coords(span, epsilon, RDP_MIN_LINE);
+    }
+    let reversed: Vec<_> = span.iter().rev().copied().collect();
+    let mut out = rdp_coords(&reversed, epsilon, RDP_MIN_LINE);
+    out.reverse();
+    out
+}
+
+/// A closed ring simplified span by span between its pins (#802), each span
+/// by [`rdp_span_canonical`]. The pins are kept, so the ring's floor is the
+/// pins pass 1 forced (start and two far points), not [`RDP_MIN_RING`]. A
+/// ring with no pin (none of its vertices reached pass 1) falls back to
+/// [`rdp_coords`].
+fn rdp_ring_pinned(
+    ring: &[geo::Coord<f64>],
+    epsilon: f64,
+    pins: &JunctionNodes,
+) -> Vec<geo::Coord<f64>> {
+    let n = ring.len().saturating_sub(1); // distinct vertices of the closed ring
+    let pinned: Vec<usize> = (0..n).filter(|&i| pins.contains(ring[i])).collect();
+    if epsilon <= 0.0 || n < 3 || pinned.is_empty() {
+        return rdp_coords(ring, epsilon, RDP_MIN_RING);
+    }
+    let mut out = Vec::with_capacity(ring.len());
+    let mut span = Vec::new();
+    for (w, &a) in pinned.iter().enumerate() {
+        let b = pinned.get(w + 1).copied().unwrap_or(pinned[0] + n);
+        span.clear();
+        span.extend((a..=b).map(|i| ring[i % n]));
+        let kept = rdp_span_canonical(&span, epsilon);
+        out.extend_from_slice(&kept[..kept.len() - 1]);
+    }
+    out.push(out[0]);
+    out
 }
 
 /// Bounding-box diagonal of a LineString (`0.0` if empty / a single point).
@@ -1460,6 +1562,7 @@ fn simplify_polygon_impl(
         repair,
         &crate::diagnostics::Diagnostics::default(),
         poly,
+        None,
     )
     .0
 }
@@ -1475,6 +1578,10 @@ fn simplify_polygon_impl(
 /// `side` is the placeholder side a collapse under
 /// [`CollapseMode::Square`] emits ([`placeholder_side`]); the RDP epsilon and
 /// the gates stay at `tol`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "#802: the junction pins ride with the level parameters"
+)]
 fn simplify_polygon_impl_checked(
     poly: &Polygon<f64>,
     tol: f64,
@@ -1483,6 +1590,7 @@ fn simplify_polygon_impl_checked(
     repair: bool,
     diagnostics: &crate::diagnostics::Diagnostics,
     source: &Polygon<f64>,
+    pins: Option<&JunctionNodes>,
 ) -> (Simplified, bool) {
     if polygon_diag(poly) < tol {
         return (
@@ -1503,7 +1611,7 @@ fn simplify_polygon_impl_checked(
     let mut eps = tol;
     let mut invalid_candidate: Option<Polygon<f64>> = None;
     for _ in 0..attempts {
-        let simplified = rdp_polygon(poly, eps);
+        let simplified = rdp_polygon(poly, eps, pins);
 
         // Drop interior rings that collapsed below the gate.
         let interiors: Vec<LineString<f64>> = simplified
@@ -1528,7 +1636,11 @@ fn simplify_polygon_impl_checked(
         }
 
         let unchanged = polygon_unchanged(&candidate, poly);
-        if unchanged || capped_is_valid(&candidate, diagnostics) {
+        // #802: under pins the candidate is kept as is. A retry at a smaller
+        // epsilon or an even-odd repair would move this polygon's side of a
+        // shared border and not its neighbour's; the tile-space repair
+        // (`mvt::tile_polygon`) resolves any crossing after quantization.
+        if unchanged || pins.is_some() || capped_is_valid(&candidate, diagnostics) {
             return (Simplified::Keep(Geometry::Polygon(candidate)), unchanged);
         }
         diagnostics.record(crate::diagnostics::Diagnostic::InvalidAfterSimplify { count: 1 });
@@ -1587,7 +1699,7 @@ pub(crate) fn simplify_polygon_vertices_only(
     let min_area = tol * tol;
     let mut eps = tol;
     for _ in 0..=INVALID_RETRY_HALVINGS {
-        let simplified = rdp_polygon(poly, eps);
+        let simplified = rdp_polygon(poly, eps, None);
         let exterior = if simplified.exterior().0.len() < MIN_POLYGON_RING_POINTS
             || Polygon::new(simplified.exterior().clone(), vec![]).unsigned_area() < min_area
         {
@@ -1967,6 +2079,7 @@ mod tests {
                 &opts,
                 Representation::Geometry,
                 &crate::diagnostics::Diagnostics::default(),
+                None,
             ) {
                 let r = g.bounding_rect().unwrap();
                 assert!(
@@ -1997,6 +2110,7 @@ mod tests {
             &opts,
             Representation::Geometry,
             &crate::diagnostics::Diagnostics::default(),
+            None,
         ) {
             assert!((g.bounding_rect().unwrap().width() - side).abs() < 1e-6);
         }
@@ -3262,6 +3376,7 @@ mod tests {
             &crate::diagnostics::Diagnostics::default(),
             &poly,
             None,
+            None,
         );
         assert!(unchanged, "minimal ring should report no removal");
         match out {
@@ -3286,6 +3401,7 @@ mod tests {
             &crate::diagnostics::Diagnostics::default(),
             &line,
             None,
+            None,
         );
         assert!(!unchanged, "coarse GSD should remove vertices");
         assert!(line_len(&out) < 200);
@@ -3306,6 +3422,7 @@ mod tests {
             Representation::Geometry,
             &crate::diagnostics::Diagnostics::default(),
             &line,
+            None,
             None,
         );
         assert!(unchanged);
@@ -3331,6 +3448,7 @@ mod tests {
             &crate::diagnostics::Diagnostics::default(),
             &poly,
             None,
+            None,
         );
         assert!(
             !first_unchanged,
@@ -3348,6 +3466,7 @@ mod tests {
             Representation::Point,
             &crate::diagnostics::Diagnostics::default(),
             &point_geom,
+            None,
             None,
         );
         assert!(
@@ -3506,7 +3625,7 @@ mod rdp_tests {
         for (c, poly) in cases.iter().enumerate() {
             for &tol in &[0.0, 1e-9, 0.01, 0.04, 0.05, 0.06, 0.5, 2.0, 100.0] {
                 assert_eq!(
-                    rdp_polygon(poly, tol),
+                    rdp_polygon(poly, tol, None),
                     poly.simplify(tol),
                     "polygon case {c} diverged from geo at tol {tol}"
                 );
@@ -3641,7 +3760,7 @@ mod rdp_tests {
             }
         }
         let poly = Polygon::new(ls.clone(), vec![]);
-        let ours = outcome(|| rdp_polygon(&poly, tol).exterior().0.clone());
+        let ours = outcome(|| rdp_polygon(&poly, tol, None).exterior().0.clone());
         let geo_out = outcome(|| poly.simplify(tol).exterior().0.clone());
         match (&ours, &geo_out) {
             (Some(a), Some(b)) if same_bits(a, b) => Ok(()),
@@ -3878,6 +3997,7 @@ mod source_area_regression {
             ]));
             let mut fold = CascadeFold {
                 current: Some(Arc::new(working)),
+                pins: None,
                 alive: true,
                 part_sources: vec![1, 1],
             };
@@ -3924,6 +4044,7 @@ mod source_area_regression {
                 &diagnostics,
                 &source,
                 Some(&mut indices),
+                None,
             );
             assert_eq!(actual, expected);
             assert_eq!(indices, expected_indices);
@@ -4000,7 +4121,7 @@ mod source_area_regression {
             // After the entire working geometry dies, the point band revives
             // from canonical, including the part lost at the fine step.
             let canonical = Arc::new(source.clone());
-            let mut fold = CascadeFold::new();
+            let mut fold = CascadeFold::new(None);
             fold.step(&canonical, &fine, Crs::Epsg3857, &opts, &diagnostics);
             assert_eq!(fold.part_sources, vec![1]);
             assert!(matches!(
@@ -4148,6 +4269,7 @@ mod source_area_regression {
                 &opts,
                 &diagnostics,
                 &source,
+                None,
                 None,
             );
             let direct = simplify_for_level(&source, 8.0, Crs::Epsg3857, &opts, &diagnostics);
@@ -4363,3 +4485,7 @@ mod validity_tests {
         assert!(valid[0] > 1_000 && valid[1] > 1_000, "{valid:?}");
     }
 }
+
+#[cfg(test)]
+#[path = "simplify_shared_border_tests.rs"]
+mod shared_border_tests;

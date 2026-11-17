@@ -100,6 +100,7 @@ use super::assign::FeatureKind;
 use super::cluster::{CategoryCounts, ClusterEntry, ClusterTables};
 use super::convert::CoalesceTable;
 use super::convert::{ConvertError, ConvertOptions};
+use super::junction::JunctionNodes;
 use super::ladder::EntryZoomSpec;
 use super::level::{EntryZoomProvenance, RankingProvenance};
 use super::stream::{CoalesceBuild, WinnerTables};
@@ -121,7 +122,7 @@ pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
 /// v7 adds the `--cluster-categories` labels and per-entry counts (#827).
 /// v8 replaces the coalesce line scratch with the chain tables built from it
 /// (#546).
-pub(super) const PLAN_FORMAT_VERSION: u32 = 8;
+pub(super) const PLAN_FORMAT_VERSION: u32 = 9;
 
 /// The first bytes of every plan artifact, ahead of the Arrow IPC payload.
 ///
@@ -130,7 +131,7 @@ pub(super) const PLAN_FORMAT_VERSION: u32 = 8;
 /// not a plan" and "this plan is damaged" *before* handing a single byte to
 /// an Arrow decoder — a byte-flip sweep over a real 10.5 KB artifact panicked
 /// inside arrow's buffer/IPC decoders at 11 of 203 positions (#512).
-pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x08";
+pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x09";
 
 /// The format-independent part of [`PLAN_MAGIC`]: everything but the trailing
 /// version byte.
@@ -1192,6 +1193,9 @@ pub(super) struct ConvertPlan {
     pub entry_zoom: Option<EntryZoomProvenance>,
     /// Dataset-wide tallies.
     pub totals: PlanTotals,
+    /// #802: the junction pins every pass-2 shard keeps; `None` without
+    /// polygons. Not row-indexed, so a shard keeps the whole set.
+    pub junctions: Option<JunctionNodes>,
 }
 
 impl ConvertPlan {
@@ -1230,6 +1234,7 @@ impl ConvertPlan {
             }),
             entry_zoom: entry_zoom.cloned(),
             totals,
+            junctions: tables.junctions.clone(),
         })
     }
 
@@ -1251,6 +1256,7 @@ impl ConvertPlan {
             counts: self.counts,
             carriers: self.carriers,
             finest: self.finest,
+            junctions: self.junctions,
         })
     }
 }
@@ -1343,6 +1349,7 @@ fn plan_schema(meta: String) -> Schema {
         list("chain_rep", DataType::UInt64),
         list("chain_count", DataType::Int32),
         list("chain_wkb", DataType::LargeBinary),
+        list("junctions", DataType::UInt64),
     ];
     Schema::new(fields).with_metadata(HashMap::from([(PLAN_META_KEY.to_string(), meta)]))
 }
@@ -1542,6 +1549,15 @@ impl ConvertPlan {
                         for c in &chains.entries {
                             b.values().append_value(chains.wkb.value(c.at));
                         }
+                    }
+                }
+            ),
+            list_col!(
+                UInt64Builder::new(),
+                self.junctions.is_some(),
+                |b: &mut LargeListBuilder<UInt64Builder>| {
+                    if let Some(j) = &self.junctions {
+                        b.values().append_slice(j.keys());
                     }
                 }
             ),
@@ -1756,6 +1772,12 @@ impl ConvertPlan {
         } else {
             None
         };
+        let junctions = u64_section(&batch, "junctions", path)?
+            .map(|keys| {
+                JunctionNodes::from_sorted(keys)
+                    .ok_or_else(|| plan_err(path, "holds junction pins out of order"))
+            })
+            .transpose()?;
 
         Ok(ConvertPlan {
             version: meta.version,
@@ -1774,6 +1796,7 @@ impl ConvertPlan {
             ladder: meta.ladder,
             entry_zoom: meta.entry_zoom,
             totals: meta.totals,
+            junctions,
         })
     }
 }
@@ -2514,6 +2537,7 @@ mod tests {
                 ],
                 source_losses: Default::default(),
             },
+            junctions: JunctionNodes::from_sorted(vec![3, 9, 42]),
         }
     }
 
