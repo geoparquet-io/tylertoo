@@ -378,8 +378,10 @@ tylertoo tiles fields.parquet fields.pmtiles --layer-column year
   A tile that still exceeds a cap is kept with a warning and counted once
   in the report. Valve counts include the original source exports, joint
   retries and archive-join drops. Other repeated work in a joint retry is
-  counted only in the original exports. This also applies to `pyramid`
-  with explicit size caps.
+  counted only in the original exports. With `--feature-id`, the source
+  losses come from each layer's own export and miss the drops of a joint
+  retry. The run warns when that happens. This also applies to `pyramid` with
+  explicit size caps.
 - At most 64 layers. Each layer is a full convert and export, and a column
   with more values is usually an id, not a category. Route by a coarser
   column, or subset the input with `--filter`.

@@ -9937,6 +9937,16 @@ impl<'a> JoinedTileFitter<'a> {
             stages.clip,
             stages.encode,
         );
+        if opts.feature_id.is_some() && !replacements.is_empty() {
+            // shortcut: the per-layer loss ledgers are sealed before the merge,
+            // so a joint refit's drops are not in them; feed them in if needed.
+            diagnostics.warn(
+                "--feature-id: joined tiles over a size cap were refitted across layers; \
+                 the source losses list each layer's own export and miss the joint \
+                 valve's merges and drops"
+                    .to_string(),
+            );
+        }
         Ok(replacements)
     }
 }

@@ -2748,6 +2748,11 @@ fn append_fitted_tile(
     joint: Option<(&ExportOptions, &[Vec<JointSource>])>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), PyramidError> {
+    // #814: a joint valve that quantized every feature away leaves an empty
+    // carrier, which the export writer omits; so does the merge.
+    if tile.data.is_empty() {
+        return Ok(());
+    }
     if let Some((export, _)) = joint {
         report_joined_limit(
             tile.raw_len,
@@ -5966,6 +5971,57 @@ mod tests {
             tile.layers.iter().all(|l| l.extent < Some(4096)),
             "the extent fallback re-encoded the tile"
         );
+    }
+
+    /// Two bands whose z0 tiles each fit a 100-byte raw cap alone; the join
+    /// does not, and the joint valve's extent fallback quantizes every
+    /// feature away.
+    fn emptied_join(feature_id: Option<&str>) -> (tempfile::TempDir, PyramidReport) {
+        let dir = tempfile::tempdir().unwrap();
+        let bands = ["a", "b"].map(|name| {
+            let input = dir.path().join(format!("{name}.parquet"));
+            let geoms = (0..2)
+                .map(|i| {
+                    let x = 0.3 + f64::from(i) * 0.3;
+                    Some(geo::Rect::new((x, 0.3), (x + 0.2, 0.5)).to_polygon().into())
+                })
+                .collect::<Vec<_>>();
+            crate::overview::testutil::write_input(&input, &geoms, false, None);
+            Band::new(input, name, 0, 0)
+        });
+        let report = build_pyramid(
+            &bands,
+            &dir.path().join("out.pmtiles"),
+            &PyramidOptions {
+                export: ExportOptions {
+                    tile_size_limit: Some(100),
+                    compressed_tile_size_limit: None,
+                    feature_id: feature_id.map(str::to_string),
+                    ..Default::default()
+                },
+                work_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (dir, report)
+    }
+
+    #[test]
+    fn joined_valve_that_empties_a_tile_writes_no_tile() {
+        let (dir, _) = emptied_join(None);
+        // #814: an emptied tile is omitted, never written as a zero-byte body.
+        assert!(!decoded_tiles(&dir.path().join("out.pmtiles")).contains_key(&0));
+    }
+
+    #[test]
+    fn joined_valve_warns_that_source_losses_miss_its_drops() {
+        let (_, report) = emptied_join(Some("id"));
+        assert!(report.diagnostics.iter().any(|d| matches!(
+            d,
+            crate::diagnostics::Diagnostic::Advisory { message, .. }
+                if message.contains("source losses")
+        )));
     }
 
     #[test]
