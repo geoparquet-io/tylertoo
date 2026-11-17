@@ -4,16 +4,18 @@
 //! their thinning cell and vanish. Each one is invisible on its own, but
 //! together they are the map: a country of 25 m fields is 90% farmland at
 //! z0, and a level that shows none of it is wrong, not merely sparse.
-//! tippecanoe answers this with its tiny-polygon reduction — every dropped
-//! polygon's area goes into a running total, and each time the total crosses
+//! tippecanoe answers this with its tiny-polygon reduction — surviving tiny
+//! rings contribute area to a running total, and each time the total crosses
 //! one placeholder's worth a placeholder square is emitted where the
 //! polygon that crossed it sits. Dense regions read as dense, and the
 //! placeholder area tracks the dropped area: a polygon contributes at most
 //! one placeholder of area, and a patch keeps less than one `T` unemitted.
 //!
-//! This is the same accumulator, run once per level after assignment, over
-//! every polygon that is *not* a member of that level, bucketed into
-//! [`ACCUMULATE_CELL_GSD`]-wide patches — 1/32 of a level's 1024-pixel
+//! We run the accumulator once per level after cell-winner assignment and
+//! before the density budget, over polygons excluded by the visibility gate
+//! or thinning. Polygons deferred only by the budget contribute no area.
+//! Contributions are bucketed into [`ACCUMULATE_CELL_GSD`]-wide patches —
+//! 1/32 of a level's 1024-pixel
 //! tile, so a patch holds ~1,000 placeholders' worth of area and a region
 //! that is 40% fields yields ~400 squares per patch rather than none (an
 //! accumulation scope the size of one placeholder would need 100% coverage
@@ -21,10 +23,11 @@
 //! becomes that level's **carrier**: it is added to the level and rendered
 //! as a threshold-area square at its representative point, carrying its own
 //! attributes — exactly as tippecanoe's placeholder does. The threshold is
-//! the level's simplification tolerance squared, the same `T` the
-//! per-feature `--collapse-square` dither uses, so the two agree on what a
+//! the level's placeholder side squared (one GSD, floored at one tile unit),
+//! the same `T` the per-feature `--collapse-square` dither uses, so the two
+//! agree on what a
 //! placeholder is worth; the difference is that the dither only ever saw
-//! polygons that survived assignment, while this sees all of them.
+//! polygons that survived assignment, while this sees gate and thinning losers.
 //!
 //! Deterministic: input order and integer cell keys, no randomness — and
 //! computed once on the pass-1 feature table, so every engine reads the
@@ -39,9 +42,12 @@
 //! places the placeholder at the ring's first vertex with side
 //! `tiny_polygon_size` (default 2 px), whereas ours sits at the polygon's
 //! representative point with side one GSD, whatever the simplify factor
-//! (#745). Features placed by an
-//! entry-zoom ladder (#364) are never accumulated: the ladder decides where
-//! they first appear.
+//! (#745); (c) tippecanoe rate-thins before tiny-polygon reduction (tile.cpp),
+//! so its tiny-square density falls with the rate. We keep every
+//! tiny-polygon square whatever the rate: thinning them leaves coarse zooms
+//! blank on dense small-polygon data (#875).
+//! Features placed by an entry-zoom ladder (#364) are never accumulated:
+//! the ladder decides where they first appear.
 
 use std::collections::HashMap;
 
@@ -108,8 +114,9 @@ pub fn level_accumulates(collapse: CollapseMode, repr: Representation) -> bool {
 /// members of the level (`min_level > level`) but must be emitted there as a
 /// placeholder square.
 ///
-/// `features`, `min_levels` and `areas` are parallel; `areas` holds each
-/// feature's unsigned area in CRS units² (anything for non-polygons).
+/// `features`, `min_levels` and `areas` are parallel; `min_levels` must be
+/// cell-winner levels, before the density budget. `areas` holds each feature's
+/// unsigned area in CRS units² (anything for non-polygons).
 ///
 /// The threshold is `side²`, `side` being the level's `placeholder_side`:
 /// one GSD, floored at one tile unit at the level's export zoom (#407,
@@ -131,12 +138,26 @@ pub fn tiny_polygon_carriers(
     profile: MemoryProfile,
 ) -> Vec<Vec<usize>> {
     debug_assert_eq!(features.len(), min_levels.len());
+    tiny_polygon_carriers_with_levels(features, |pos| min_levels[pos], areas, levels, crs, profile)
+}
+
+/// Read cell-winner levels directly from the assignment table in pass 1,
+/// without allocating another dataset-sized vector. The slice API above
+/// uses the same accumulator.
+pub(super) fn tiny_polygon_carriers_with_levels(
+    features: &FeatureTable,
+    min_level: impl Fn(usize) -> u8 + Sync,
+    areas: &[f32],
+    levels: &[AccumulateLevel],
+    crs: Crs,
+    profile: MemoryProfile,
+) -> Vec<Vec<usize>> {
     debug_assert_eq!(features.len(), areas.len());
     // Each level reads the shared inputs and writes only its own list, so
     // the levels run concurrently (#817). Each level holds its own
     // occupied-patch map; bounded holds one at a time.
     let run = |(li, level): (usize, &AccumulateLevel)| {
-        level_carriers(features, min_levels, areas, li, level, crs)
+        level_carriers(features, &min_level, areas, li, level, crs)
     };
     let per_level: Vec<(Vec<usize>, Option<f64>)> = if profile == MemoryProfile::Bounded {
         levels.iter().enumerate().map(run).collect()
@@ -160,7 +181,7 @@ pub fn tiny_polygon_carriers(
 /// export zoom when the placeholder side is floored there.
 fn level_carriers(
     features: &FeatureTable,
-    min_levels: &[u8],
+    min_level: &(impl Fn(usize) -> u8 + Sync),
     areas: &[f32],
     li: usize,
     level: &AccumulateLevel,
@@ -183,7 +204,8 @@ fn level_carriers(
         return (out, floored_zoom);
     }
     let mut acc: HashMap<(i64, i64), Patch> = HashMap::new();
-    for (pos, (&ml, &area)) in min_levels.iter().zip(areas).enumerate() {
+    for (pos, &area) in areas.iter().enumerate() {
+        let ml = min_level(pos);
         if features.kind(pos) != FeatureKind::Polygon || usize::from(ml) <= li {
             continue; // not a polygon, or already present at this level
         }
@@ -198,9 +220,14 @@ fn level_carriers(
         // with area <= pixel² and keeps larger rings as geometry, so its
         // residual never exceeds one placeholder. Here a non-member is
         // gone whatever its size (gate-failed polygons routinely sit in
-        // (T, 2T); thinning and budget losers are unbounded), so clamp
+        // (T, 2T); thinning losers are unbounded), so clamp
         // the contribution instead: a polygon is worth at most one
         // placeholder, and the residual invariant (< T per patch) holds.
+        // DIVERGENCE FROM TIPPECANOE: tippecanoe thins tiny polygons by the
+        // rate before `reduce_tiny_poly` (tile.cpp:1966-1972, 2156-2163). We
+        // keep every tiny-polygon square, because the thinned result leaves
+        // coarse zooms blank on dense small-polygon data (#875). Polygons
+        // only the budget dropped never contribute area, as there.
         let area = area.min(threshold);
         // The patch key comes from the bbox centre. A polygon whose bbox
         // spans the antimeridian (lng_min near -180, lng_max near 180)
