@@ -184,16 +184,16 @@ fn is_pin(g: &[Occurrence]) -> bool {
     }
     // Many records (a vertex of stacked copies, kept apart across chunks):
     // a tag in two distinct pairs, found by sorting, not every pair of pairs.
-    let mut tags: Vec<(u64, u64)> = Vec::with_capacity(2 * g.len());
+    let mut tags: Vec<u32> = Vec::with_capacity(2 * g.len());
     for w in g.chunk_by(|a, b| a.1 == b.1) {
-        let p = w[0].1;
-        tags.push((p >> 32, p));
-        if p >> 32 != p as u32 as u64 {
-            tags.push((p as u32 as u64, p));
+        let (hi, lo) = ((w[0].1 >> 32) as u32, w[0].1 as u32);
+        tags.push(hi);
+        if hi != lo {
+            tags.push(lo);
         }
     }
     tags.sort_unstable();
-    tags.windows(2).any(|t| t[0].0 == t[1].0)
+    tags.windows(2).any(|t| t[0] == t[1])
 }
 
 /// Sort and shrink one chunk's occurrences: duplicates go (both sides of a
