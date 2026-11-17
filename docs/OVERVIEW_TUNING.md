@@ -31,9 +31,9 @@ coarse and middle zooms. Three defaults work together:
   [placeholder square](#-collapse-square-tippecanoe-tiny-polygon-squares-as-the-global-disposition),
   and the polygons that thinning removes are represented by squares too, so
   dense areas stay filled.
-- When a tile goes over the [size cap](#tile-size-cap), its densest lines and
-  polygons are merged into a neighbor instead of being dropped, and the tile
-  is measured again until it fits.
+- When a tile goes over the [size cap](#tile-size-cap), the valve first merges
+  its densest lines and polygons into a neighbor. If merging cannot fit the
+  tile, it drops singles, reduces the extent, then drops whole features if needed.
 
 These defaults cost time. A build took about 1.3× as long as with the
 defaults before #745 on 632k FTW field polygons (z0–z12), and 1.3× on 4.6M,
@@ -45,8 +45,8 @@ Use these settings to balance coverage, build time, and file size:
 | No holes where small polygons are dense (parcels, small admin units) | `export-pmtiles --coverage-fill` | Each tile also draws, under its own features, the area its child tiles cover, so placeholder squares no longer leave gaps between them: Auckland parcels at z8 go from 28.5% of the area missing to none. 1.10–1.17× the build time and 4% larger archives on Madagascar admin-4 and NZ parcels. On scattered polygons smaller than a pixel (FTW fields) it also draws area between them. See [coverage fill](#coverage-fill-coverage-fill). |
 | Fewer slivers between neighbors | `--simplify-factor 0.25` | About tippecanoe's coverage on dense parcels. See [coverage and simplification](#coverage-and-simplification). |
 | No slivers at all | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbors meet without gaps. The overview file grows about 2.7×, and dense small polygons build up to 10× slower. |
-| Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. |
-| Preserve each retained feature's attributes | `--size-valve drop` | An oversized tile drops features instead of merging them, so it shows holes, but no feature takes on the geometry of another. |
+| Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. This valve keeps the chosen extent. |
+| Preserve each retained feature's attributes and grid | `--size-valve drop` | An oversized tile drops features instead of merging them, so it shows holes, but no feature takes on the geometry of another. |
 
 ### Coverage and simplification
 
@@ -1675,13 +1675,25 @@ fits. `--size-valve` chooses how:
   A tile that twice in a row shrinks too slowly to fit within a few more
   passes, which happens when the merged features do not touch, merges
   everything it can in one step instead.
-  If the tile still exceeds the cap after all possible merges, unmerged
-  features are dropped, keeping the largest. Merged features are retained. A
-  tile that is still over after that is written as it is, with a warning.
-  When such tiles hold merged features, the warning suggests `--size-valve
-  drop`, which drops features to fit the cap (#873). It cannot shrink a
-  single feature over the cap, and it gives up after eight passes.
-- `drop` drops features, keeping the largest for polygons and lines.
+  If the tile still exceeds the cap after all possible merges, the valve
+  drops unmerged features, fewest vertices first (points are thinned
+  evenly). It can drop all of them when the tile holds merged features;
+  otherwise the largest stays. If still over, it
+  halves the tile extent down to 512. A tile of points skips this step. The
+  encoder cleans the same geometry at each grid. These tiles shed their
+  fill. If the tile still exceeds the cap,
+  the valve drops whole features, fewest vertices first. This can leave holes.
+  These tiles also shed fill, so it cannot redraw a dropped merge's source.
+  Merged features are never split into their sources. In a tile of lines
+  or polygons, only a lone feature that still exceeds the cap at the extent
+  floor (512, or `--extent` when smaller) is written over it, with a
+  warning. A tile of points takes the drop valve, which can still end over
+  the cap after its eight encodes.
+  The report counts dropped merges and their source features. It also counts
+  tiles at a reduced extent per zoom, with the smallest extent used.
+- `drop` drops features, keeping the largest for polygons and lines. It keeps
+  the chosen extent and takes at most eight encodes. Both valves keep their
+  first drop cut unchanged. Later cuts use a 20% margin to finish sooner.
 
 Under either valve, the warning about tiles still over the cap, and the
 `tiles_over_limit` diagnostic in `--report`, list the ten largest of them as
