@@ -53,7 +53,7 @@ Args:
         unmerged features, halve the tile extent to 512, then drop whole
         features if needed. Merged features are never split into their
         sources. Only a lone feature still over the cap at the extent
-        floor (512) is written over it, with a warning.
+        floor is written over it, with a warning.
         `"drop"` removes
         features, leaving holes. Point tiles use feature dropping in
         both modes.

@@ -281,7 +281,7 @@ pub const DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize = 500 * 1024;
 /// before them. Merging keeps the coverage's area, and the tile is measured
 /// again. If still over after all merges, the fallback can lose precision
 /// and features. Merged features are never split into their sources. Only a
-/// lone feature still over the cap at the extent floor (512) is written over
+/// lone feature still over the cap at the extent floor is written over
 /// it, with a warning. As in tippecanoe, a merged feature
 /// keeps the attributes of the feature it was merged into; the absorbed
 /// features' attributes are not carried. Points are never merged; a tile of
@@ -402,7 +402,7 @@ pub struct ExportOptions {
         value_name = "merge|drop",
         default_value_t = ExportOptions::default().size_valve
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile over its cap: `merge` merges dense lines and polygons, drops singles, halves the extent down to 512, then drops whole features if needed. Merges keep the target's attributes and are never split into their sources. Only a lone feature still over the cap at the extent floor (512) is written over it, with a warning. `drop` removes features and keeps each survivor's attributes. Point tiles use dropping in both modes", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile over its cap: `merge` merges dense lines and polygons, drops singles, halves the extent down to 512, then drops whole features if needed. Merges keep the target's attributes and are never split into their sources. Only a lone feature still over the cap at the extent floor is written over it, with a warning. `drop` removes features and keeps each survivor's attributes. Point tiles use dropping in both modes", long_help = None))]
     pub size_valve: SizeValve,
     /// Tile encoding, MVT by default. Each finished MVT tile is converted
     /// to MLT with mlt-core before gzip and both size caps, so the caps
