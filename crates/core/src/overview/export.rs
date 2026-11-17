@@ -9860,7 +9860,7 @@ impl<'a> JoinedTileFitter<'a> {
                     JoinedTile {
                         data: tile.data,
                         raw_len: tile.raw_len,
-                        merged: tile.valve.merged > 0,
+                        merged: tile.valve.over_limit_merged,
                         #[cfg(test)]
                         _live: joined_tile_probe::LiveTile::new(),
                     },

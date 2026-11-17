@@ -91,7 +91,7 @@ tylertoo stats brazil.pmtiles
 ✓ Converted admin:country_code=BR → brazil.pmtiles
   857,315 tiles across z0..z14 in 174.16s
 ...
-  3 tile(s) still over the size limit after the size valve, written as is
+  3 tile(s) still over the size limit, written as is
 ...
  z    tiles          total     mean      p50      p99      max
  0        1          1,663    1,663    1,663    1,663    1,663
