@@ -468,7 +468,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | `--drop-rate <F>` | Density budget decay: each coarser level keeps 1/rate of the next finer level's feature budget. Larger values thin mid zooms more. Default: `2.5`. |
 | `--drop-gamma <F>` | Sparse-area protection, at least 1: 1 reduces every neighborhood equally; larger values protect sparse areas more. Smaller values are rejected. Default: `1.5`. |
 | `--drop-lines` | Apply the density budget to lines as well as points: smaller, faster tiles that drop line features at coarse zooms (tippecanoe's `--drop-lines`). |
-| `--drop-polygons` | Apply the density budget to polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the budget excludes polygons by default (tippecanoe's `--drop-polygons`). Polygons too small to see still become placeholder squares, so coarse zooms can hold more features than the budget; `--no-collapse` removes them. |
+| `--drop-polygons` | Apply the density budget to polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the budget excludes polygons by default (tippecanoe's `--drop-polygons`). Polygons too small to see, or removed by `--polygon-thinning`, still become placeholder squares, so coarse zooms can hold more features than the budget; `--no-collapse` removes them outside `square` representation bands. |
 
 ### Output layout
 

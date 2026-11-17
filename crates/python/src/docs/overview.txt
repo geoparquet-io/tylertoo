@@ -78,9 +78,10 @@ Args:
         `drop_lines` or `drop_polygons` is set.
     drop_lines: Apply the feature budget to lines too.
     drop_polygons: Apply the feature budget to polygons too, which
-        leaves holes in a polygon coverage. Polygons too small to see
-        still become placeholder squares; `no_collapse=True`
-        removes them.
+        leaves holes in a polygon coverage. Polygons too small to see,
+        or removed by `polygon_thinning`, still become placeholder
+        squares; `no_collapse=True` removes them outside `square`
+        representation bands.
     cluster: Merge each cell's points and add `point_count`.
     accumulate_attributes: Aggregation method for each column in
         a cluster.
