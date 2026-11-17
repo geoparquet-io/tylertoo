@@ -30,16 +30,14 @@ tylertoo reads outside data and the target that covers it.
 | `decompress` | `fuzz::fuzz_decompress` → `compression::decompress_capped` — every directory, metadata block and tile body of an input archive; the first byte picks the codec. Panics if the output passes the 1 MiB cap | a small JSON body under each codec |
 | `cli_args` | `fuzz::fuzz_cli_args` — the core parsers behind CLI and Python flags, and the public `covering::parse_bounds`: `parse_representation_spec`, `parse_entry_zoom`, `parse_class_rank`, `parse_accumulate` (the three moved into core by #439), `pyramid::Band::parse`, `TileRange::parse`, `ShardRole::parse`, `MaxZoom` and `FeatureOrder` `FromStr`, `input::url_scheme` | one valid value per parser, and #681's overflow input |
 
-† Not in the nightly matrix yet: each finds an upstream panic within a
-minute, and a target that crashes every night finds nothing else.
-`overview_file` and `remote_footer` wait on #683 (arrow-ipc panics on a
-crafted `ARROW:schema` footer key; fixed in arrow 60, which geoarrow 0.9
-blocks), `remote_footer` also on #687 (parquet-rs panics decoding a crafted
-page's definition levels), `plan_file` on #684 (arrow-ipc panics on a
-crafted IPC buffer offset), `parquet_footer` on #690 (parquet-rs reserves
-memory for a crafted schema's child count, about 12 GB from a 162-byte
-footer, which libFuzzer's malloc limit reports as an OOM). Their seeds still
-replay on every PR, and they run locally as usual. Re-add each to `.github/workflows/fuzz.yml` when its issue closes.
+† Held out of the nightly matrix until #779 F5 (#784): each found an
+upstream panic within a minute. `overview_file` and `remote_footer` hit #683
+(arrow-ipc panics on a crafted `ARROW:schema` footer key), `remote_footer`
+also #687 (parquet-rs panics decoding a crafted page's definition levels),
+`plan_file` #684 (arrow-ipc panics on a crafted IPC buffer offset), and
+`parquet_footer` #690 (parquet-rs reserves memory for a crafted schema's
+child count). `tylertoo_io` now refuses those inputs or turns the panic into
+an error, and all four run nightly.
 
 Most targets call a `#[doc(hidden)]` hook in core gated on the `fuzzing`
 cargo feature (`crates/core/Cargo.toml`). Hooks next to a private parser

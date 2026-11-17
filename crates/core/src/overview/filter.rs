@@ -1317,9 +1317,9 @@ fn eval_expr(expr: &BoundExpr, batch: &RecordBatch, proj: &dyn Fn(usize) -> usiz
 /// range (|v| >= 2^53) rounding-to-nearest could tighten the interval, so the
 /// bound is pushed outward by 2 ulp-equivalents before pruning.
 fn widen_i64(v: i64, is_min: bool) -> f64 {
-    const EXACT: i64 = 1 << 53;
+    const EXACT: u64 = 1 << 53;
     let f = v as f64;
-    if v.abs() < EXACT {
+    if v.unsigned_abs() < EXACT {
         f
     } else if is_min {
         f - 2.0 * f.abs() * f64::EPSILON
@@ -2669,5 +2669,13 @@ mod tests {
         assert!(widen_i64(big, false) > big as f64);
         assert_eq!(widen_i64(42, true), 42.0);
         assert_eq!(widen_i64(-42, false), -42.0);
+    }
+
+    /// #894: a footer statistic of `i64::MIN` overflowed `abs()` (the nightly
+    /// `parquet_footer` crash).
+    #[test]
+    fn widen_i64_takes_i64_min() {
+        assert!(widen_i64(i64::MIN, true) < i64::MIN as f64);
+        assert!(widen_i64(i64::MIN, false) > i64::MIN as f64);
     }
 }
