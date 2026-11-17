@@ -17,7 +17,7 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent / "visual")]
 
 from metrics import Source, tile_bounds_3857
-from shared_borders import score_tile
+from shared_borders import densest, score_tile
 
 Z, X, Y = 10, 512, 511
 
@@ -102,3 +102,16 @@ def test_score_only_builds_nothing(tmp_path, monkeypatch):
                               json=None)
     with pytest.raises(SystemExit, match="score-only"):
         sb.cmd_run(args)
+
+
+def test_densest_sums_counts_across_batches(tmp_path, monkeypatch):
+    """A tile that wins only once two batches' counts are added."""
+    import numpy as np
+    import shared_borders
+
+    a = mercator_square(0, 0, 10, 10)
+    b, c = (shapely.box(x, 1e6, x + 10, 1e6 + 10) for x in (1e6, 2e6))
+    # a loses each batch (to b, then c) but leads their sum.
+    batches = [(np.array([a, a, b, b, b]), None), (np.array([a, a, c, c, c]), None)]
+    monkeypatch.setattr(shared_borders, "iter_source", lambda *_, **__: iter(batches))
+    assert densest(tmp_path / "unused.parquet", [Z], 1) == [(Z, X, Y)]

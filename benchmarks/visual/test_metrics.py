@@ -161,6 +161,25 @@ def test_read_source_without_geo_metadata(tmp_path):
     assert src.geoms[0].bounds[2] == pytest.approx(111319.49, abs=0.01)
 
 
+def test_windowed_read_keeps_geometries_and_values_aligned_across_batches(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import shapely
+
+    # More rows than one 65536-row batch; the window takes rows from both.
+    n = 70_000
+    xs = np.linspace(-170, 170, n)
+    geoms = shapely.box(xs, 0, xs + 1e-4, 1e-4)
+    pq.write_table(pa.table({"geometry": shapely.to_wkb(geoms), "fid": np.arange(n)}), tmp_path / "s.parquet")
+    want = [10, 65_540]
+    full = m.read_source(tmp_path / "s.parquet", "fid")
+    windows = [tuple(full.geoms[i].bounds) for i in want]
+    src = m.read_source(tmp_path / "s.parquet", "fid", windows=windows)
+    assert src.values == want
+    for g, v in zip(src.geoms, src.values):
+        assert shapely.equals(g, full.geoms[v])
+
+
 def test_a_source_reaching_the_pole_still_covers_its_tiles(tmp_path):
     """Latitude 90 is infinite in Web Mercator. Both tools clamp it to ±89.9 and
     clip to the tile; unclamped, the source raster comes out empty and the tile
