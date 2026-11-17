@@ -699,10 +699,10 @@ fn tiles_layer_column_reports_each_layer() {
 }
 
 /// #873: tiles the size valve leaves over the cap are listed in the report,
-/// largest first and bounded, and only tiles holding merged features point
-/// the warning at `--size-valve drop`, which drops what merging never drops.
+/// largest first and bounded. A remaining merged feature over the cap is
+/// reported after extent reduction and the drop backstop.
 #[test]
-fn tiles_left_over_the_cap_are_listed_and_the_warning_names_the_drop_valve() {
+fn tiles_left_over_the_cap_are_listed_and_the_warning_explains_the_floor() {
     let Some(fixture) = fixture::realdata("ftw-moldova-z10.parquet") else {
         return;
     };
@@ -792,8 +792,7 @@ fn tiles_left_over_the_cap_are_listed_and_the_warning_names_the_drop_valve() {
             }
         );
         let hint = format!(
-            "; {merged} of them hold merged features, which the merge valve never drops: \
-             try --size-valve drop, which drops features to fit the cap"
+            "; {merged} of them hold a single merged feature that exceeds the cap even at the extent floor"
         );
         assert_eq!(text.contains(&hint), valve == "merge", "{valve}: {text}");
     }

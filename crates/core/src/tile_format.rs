@@ -283,6 +283,26 @@ mod tests {
         tile_layers_to_mvt(vec![b.finish()]).unwrap()
     }
 
+    #[test]
+    fn mlt_roundtrip_keeps_each_layers_reduced_extent() {
+        let mut mvt = Vec::new();
+        for extent in [4096, 2048, 1024, 512] {
+            let mut layer = TileLayer::builder(format!("extent_{extent}"), extent).unwrap();
+            layer
+                .feature(Geometry::Point(Point::new(7, 11)))
+                .finish()
+                .unwrap();
+            mvt.extend(tile_layers_to_mvt(vec![layer.finish()]).unwrap());
+        }
+        let mlt = finish_tile(mvt, TileFormat::Mlt, MltProfile::Web).unwrap();
+        let roundtrip = mlt_to_mvt(&mlt).unwrap();
+        let layers = mvt_to_tile_layers(&roundtrip).unwrap();
+        assert_eq!(
+            layers.iter().map(|l| l.extent().get()).collect::<Vec<_>>(),
+            [4096, 2048, 1024, 512]
+        );
+    }
+
     fn mlt_column(mvt: &[u8], profile: MltProfile) -> (PropKind, Vec<PropValue>) {
         let mlt = finish_tile(mvt.to_vec(), TileFormat::Mlt, profile).unwrap();
         let back = mvt_to_tile_layers(mlt_to_mvt(&mlt).unwrap()).unwrap();

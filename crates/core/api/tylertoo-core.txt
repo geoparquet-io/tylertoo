@@ -647,6 +647,10 @@ pub tylertoo_core::Diagnostic::EmptyLevels::levels: alloc::vec::Vec<usize>
 pub tylertoo_core::Diagnostic::EncodeDropped::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::EncodeQuantized
 pub tylertoo_core::Diagnostic::EncodeQuantized::count: usize
+#[non_exhaustive] pub tylertoo_core::Diagnostic::ExtentReduced
+pub tylertoo_core::Diagnostic::ExtentReduced::count: usize
+pub tylertoo_core::Diagnostic::ExtentReduced::min_extent: u32
+pub tylertoo_core::Diagnostic::ExtentReduced::zoom: u8
 #[non_exhaustive] pub tylertoo_core::Diagnostic::FullResolutionFallback
 pub tylertoo_core::Diagnostic::FullResolutionFallback::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::InvalidAfterEncode
@@ -659,6 +663,9 @@ pub tylertoo_core::Diagnostic::MemoryBudget::limit: u64
 pub tylertoo_core::Diagnostic::MemoryBudget::machine: core::option::Option<u64>
 #[non_exhaustive] pub tylertoo_core::Diagnostic::Merged
 pub tylertoo_core::Diagnostic::Merged::count: usize
+#[non_exhaustive] pub tylertoo_core::Diagnostic::MergedDropped
+pub tylertoo_core::Diagnostic::MergedDropped::count: usize
+pub tylertoo_core::Diagnostic::MergedDropped::sources: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::NonFiniteGeometry
 pub tylertoo_core::Diagnostic::NonFiniteGeometry::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::OutOfRange
