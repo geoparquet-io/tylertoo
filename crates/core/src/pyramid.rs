@@ -2562,6 +2562,20 @@ impl MergeTileGroup {
     }
 }
 
+/// Bytes a shared-zoom merge run may hold: feeds many cores while bounding raw + joined bytes,
+/// plus one oversized group.
+const RUN_BYTES: usize = 128 * 1024 * 1024;
+
+/// Tile groups per shared-zoom merge run. Bounded combines serially, so a longer run would
+/// only hold tiles the serial merge never held.
+fn merge_run_groups(profile: MemoryProfile) -> usize {
+    if profile == MemoryProfile::Bounded {
+        1
+    } else {
+        1024
+    }
+}
+
 fn prepare_combine_pool(
     pool: &mut Option<rayon::ThreadPool>,
     profile: MemoryProfile,
@@ -2792,9 +2806,7 @@ fn merge_prepared_bands(
         let mut merged =
             MergedTiles::new(archives.iter().map(|a| a.index.tiles()).collect()).peekable();
 
-        // 128 MiB / 1024 groups feeds many cores while bounding raw + joined bytes, plus one oversized group.
-        const RUN_BYTES: usize = 128 * 1024 * 1024;
-        const RUN_GROUPS: usize = 1024;
+        let run_groups = merge_run_groups(options.profile);
         let mut run = Vec::<MergeTileGroup>::new();
         let mut run_bytes = 0;
         let mut combine_pool: Option<rayon::ThreadPool> = None;
@@ -2864,7 +2876,7 @@ fn merge_prepared_bands(
                 }
                 run_bytes += tile_bytes;
                 run.push(tile);
-                if run_bytes >= RUN_BYTES || run.len() >= RUN_GROUPS {
+                if run_bytes >= RUN_BYTES || run.len() >= run_groups {
                     flush(&mut run)?;
                     run_bytes = 0;
                 }
