@@ -74,13 +74,14 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   values in `_unknown` (#821). This is tippecanoe's `tippecanoe.layer`. The
   column is not written as a property. Each layer is tiled on its own ladder
   and the layers are merged. The size caps apply to the merged tile: an
-  over-cap join is refitted across layers, or loses features when a band is
-  a pre-tiled archive (#838).
+  over-cap join is refitted across layers. A join too big to refit in
+  memory stays over the cap, with a warning (#838).
   `--shard` and `--keep-overview` are refused with it (#839). Rust callers
   that match `TilesOutcome` or `TilesError` get new `Layered`,
   `LayerColumn`, `Layer` and `Merge` arms.
 - `pyramid` archives whose bands share a zoom now carry a `tilestats` entry
-  per layer.
+  per layer. The size caps apply to a shared zoom's merged tile: an over-cap
+  join loses features when a band is a pre-tiled archive (#838).
 - `--max-zoom auto:N` and Python `max_zoom="auto:N"` cap the automatic zoom
   pick at N (#793). Plain `auto` keeps its z16 ceiling. Rust callers that
   match `MaxZoom` exhaustively need the new `AutoCapped` arm.
