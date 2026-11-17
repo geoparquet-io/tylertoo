@@ -168,12 +168,29 @@ pub struct SimplifyOptions {
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().cascade, action = clap::ArgAction::SetFalse, long = "no-cascade", help_heading = "Generalization"))]
     #[cfg_attr(feature = "cli", arg(help = "Simplify each level from the source instead of from the next finer level. Slower, but each level stays within its own tolerance of the source", long_help = None))]
     pub cascade: bool,
+    /// Shared-border pins (#802, default **off**): pass 1 collects the
+    /// dataset's junction vertices and every level cuts each polygon ring at
+    /// them, simplifying each stretch between two in one canonical
+    /// direction, so a border two polygons share comes out the same in both.
+    /// Only in duplicating mode with a factor above 0. tippecanoe's `-pn`
+    /// (`--no-simplification-of-shared-nodes`), also opt-in there.
+    #[serde(rename = "no_simplification_of_shared_nodes")]
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long = "no-simplification-of-shared-nodes",
+            help_heading = "Generalization"
+        )
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Keep the vertices where shared polygon borders meet, end, or branch, and simplify every shared stretch between them the same way in each polygon, so neighbours share their simplified borders instead of opening slivers. Costs time, memory and archive bytes on dense coverages. Like tippecanoe's -pn", long_help = None))]
+    pub shared_nodes: bool,
 }
 
 with_setters!(SimplifyOptions {
     with_factor => factor: f64,
     with_collapse => collapse: CollapseMode,
     with_cascade => cascade: bool,
+    with_shared_nodes => shared_nodes: bool,
 });
 
 impl Default for SimplifyOptions {
@@ -182,6 +199,7 @@ impl Default for SimplifyOptions {
             factor: DEFAULT_SIMPLIFY_FACTOR,
             collapse: CollapseMode::Auto,
             cascade: true,
+            shared_nodes: false,
         }
     }
 }

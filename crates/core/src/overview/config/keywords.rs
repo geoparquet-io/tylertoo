@@ -485,6 +485,8 @@ pub fn tiles(
                         "include_properties",
                         "exclude_properties",
                         "exclude_all_properties",
+                        // One keyword for both halves, set from convert's.
+                        "no_simplification_of_shared_nodes",
                     ]
                     .contains(&key.as_str())
                 })
@@ -506,6 +508,7 @@ pub fn tiles(
     let mut options: TilesOptions =
         serde_json::from_value(Value::Object(values)).map_err(|e| error("convert", e))?;
     options.convert.auto_max_zoom = auto_max_zoom;
+    options.export.shared_nodes = options.convert.simplify.shared_nodes;
     super::apply_bands(&mut options, &bands, &zoom_options)?;
     Ok(options)
 }

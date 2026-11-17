@@ -485,6 +485,22 @@ pub struct ExportOptions {
     )]
     #[cfg_attr(feature = "cli", arg(help = "Simplify each finest-level (canonical) line and polygon once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Only vertices are removed: features, parts and rings smaller than the tolerance keep their own geometry. Leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Unset, lines get 0.25 and polygons are not simplified, since each polygon is simplified on its own and shared borders would part; `0` simplifies nothing, as `tiles --verbatim` and `pyramid` bands do. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 1 is about factor 0.25", long_help = None))]
     pub max_zoom_simplify_factor: Option<f64>,
+    /// Shared-border pins at the finest level (#802, default **off**): when
+    /// [`Self::max_zoom_simplify_factor`] simplifies polygons, rebuild the
+    /// level's junction pins and keep them, as
+    /// [`SimplifyOptions::shared_nodes`](crate::overview::simplify::SimplifyOptions::shared_nodes)
+    /// does for coarser levels. `tiles` sets it from that option.
+    #[serde(rename = "no_simplification_of_shared_nodes")]
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long = "no-simplification-of-shared-nodes",
+            help_heading = "Generalization"
+        )
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "With --max-zoom-simplify-factor, keep the vertices where shared polygon borders meet, end, or branch at the finest level, and simplify every shared stretch between them the same way in each polygon. Like tippecanoe's -pn", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "export_only"))]
+    pub shared_nodes: bool,
     /// Number of partitions processed per band read (the export concurrency
     /// knob). Default [`PARTITION_WAVE_AUTO`], which [`resolve_partition_wave`]
     /// expands at export start via the memory-budget preflight (#303): the
@@ -675,6 +691,7 @@ with_setters!(ExportOptions {
     with_coverage_fill => coverage_fill: bool,
     with_simple_clip_fastpath => simple_clip_fastpath: bool,
     with_max_zoom_simplify_factor => max_zoom_simplify_factor: Option<f64>,
+    with_shared_nodes => shared_nodes: bool,
     with_partition_wave => partition_wave: usize,
     with_feature_order => feature_order: FeatureOrder,
     with_min_zoom => min_zoom: Option<u8>,
@@ -703,6 +720,7 @@ impl Default for ExportOptions {
             variable_depth: false,
             simple_clip_fastpath: true,
             max_zoom_simplify_factor: None,
+            shared_nodes: false,
             partition_wave: PARTITION_WAVE_AUTO,
             feature_order: FeatureOrder::default(),
             min_zoom: None,
@@ -7688,7 +7706,7 @@ fn finest_level_pins(
 ) -> Result<Option<JunctionNodes>, ExportError> {
     let (Some(geometry), true) = (
         reader.resolved_schema().geometry_index(),
-        opts.max_zoom_simplify_factor.is_some_and(|f| f > 0.0),
+        opts.shared_nodes && opts.max_zoom_simplify_factor.is_some_and(|f| f > 0.0),
     ) else {
         return Ok(None);
     };

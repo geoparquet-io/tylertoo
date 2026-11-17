@@ -3,8 +3,9 @@
 //! A polygon simplified on its own would lose different vertices from its
 //! neighbour's copy of a shared border, opening gaps and overlaps between
 //! them at coarse zooms. tippecanoe keeps shared borders identical
-//! (`--detect-shared-borders`, `-pn`). These tests run tiny coverages
-//! through convert and export and check one zoom's tiles with an MVT
+//! (`--detect-shared-borders`, `-pn`), both opt-in, as is
+//! `--no-simplification-of-shared-nodes` here. These tests turn it on, run
+//! tiny coverages through convert and export and check one zoom's tiles with an MVT
 //! decoder of their own: the polygons must not overlap, and their union
 //! must cover the source's union.
 //!
@@ -128,14 +129,20 @@ fn rotate(ls: &LineString<f64>, k: usize) -> LineString<f64> {
 }
 
 /// Tiles `polys` (tile units at [`Z`]) to z0–14 at the default settings,
-/// with `--simplify-factor` `factor`, and returns each [`Z`] tile's polygon
+/// with `--simplify-factor` `factor` and shared-border pins, and returns each [`Z`] tile's polygon
 /// features, in tile units.
 fn tile(
     polys: &[Polygon<f64>],
     factor: f64,
     dir: &Path,
 ) -> std::collections::HashMap<(u32, u32), Vec<MultiPolygon<f64>>> {
-    tile_to(polys, factor, 14, &ExportOptions::default(), dir)
+    tile_to(
+        polys,
+        factor,
+        14,
+        &ExportOptions::default().with_shared_nodes(true),
+        dir,
+    )
 }
 
 /// [`tile`] to `max_zoom`, exported with `export`.
@@ -160,6 +167,7 @@ fn tile_to(
     testutil::write_input(&input, &geoms, true, None);
     let mut options = ConvertOptions::default();
     options.simplify.factor = factor;
+    options.simplify.shared_nodes = true;
     convert_to_overviews(
         &input,
         &overview,
@@ -269,7 +277,9 @@ fn two_polygons_share_a_jagged_border() {
 fn max_zoom_simplification_shares_a_jagged_border() {
     let (a, b) = jagged_pair();
     let dir = tempfile::tempdir().unwrap();
-    let export = ExportOptions::default().with_max_zoom_simplify_factor(Some(1.0));
+    let export = ExportOptions::default()
+        .with_max_zoom_simplify_factor(Some(1.0))
+        .with_shared_nodes(true);
     let tiles = tile_to(&[a.clone(), b.clone()], 1.0, Z, &export, dir.path());
     assert_no_slivers("max-zoom jagged border", &tiles[&TILE], &[a, b], 1000.0);
 }

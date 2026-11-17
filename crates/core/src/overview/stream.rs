@@ -6314,6 +6314,13 @@ fn merge_pass1_chunks(
     Ok(kept_row)
 }
 
+/// #802: whether pass 1 collects the shared-border pins: asked for, and
+/// polygons simplify (duplicating mode, `--simplify-factor` > 0).
+fn wants_pins(options: &ConvertOptions) -> bool {
+    let s = &options.simplify;
+    s.shared_nodes && s.factor > 0.0 && options.mode == Mode::Duplicating
+}
+
 /// #802: [`super::junction::absorb`] beside the feature table, in the
 /// scan's budget.
 fn absorb_junctions(
@@ -6438,7 +6445,7 @@ fn run_pass1_with_chunk_rows(
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
     let want_areas = accumulator_requested(options);
     let mut areas: Vec<f32> = Vec::new();
-    let mut collect_junctions = options.simplify.factor > 0.0 && options.mode == Mode::Duplicating;
+    let mut collect_junctions = wants_pins(options);
     let (mut occ, mut chunk_occ) = (Vec::new(), Vec::new());
     let mut num_rows = 0usize;
     let mut skipped_rows = 0usize;
@@ -8285,13 +8292,16 @@ mod tests {
                 .keys()
                 .len()
         };
-        assert!(pins(ConvertOptions::default()) > 0);
+        let mut pinned = ConvertOptions::default();
+        pinned.simplify.shared_nodes = true;
+        assert!(pins(pinned.clone()) > 0);
+        assert_eq!(pins(ConvertOptions::default()), 0, "off by default");
         let partitioning = ConvertOptions {
             mode: Mode::Partitioning,
-            ..Default::default()
+            ..pinned.clone()
         };
         assert_eq!(pins(partitioning), 0);
-        let mut unsimplified = ConvertOptions::default();
+        let mut unsimplified = pinned;
         unsimplified.simplify.factor = 0.0;
         assert_eq!(pins(unsimplified), 0);
     }
@@ -8305,10 +8315,11 @@ mod tests {
         two_squares(file.path());
         let source = ConvertSource::resolve_path(file.path()).unwrap();
         let diagnostics = crate::diagnostics::Diagnostics::default();
-        let options = ConvertOptions {
+        let mut options = ConvertOptions {
             read_batch_size: 1,
             ..Default::default()
         };
+        options.simplify.shared_nodes = true;
         let mut pre = preflight(&source, &options, &diagnostics, None).unwrap();
         let roomy = scan_fixture(&source, &pre, 1, &diagnostics).unwrap();
         // Room for the feature table, not for one batch of occurrences.

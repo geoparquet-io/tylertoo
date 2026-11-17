@@ -1010,6 +1010,45 @@ mod config_parity {
         );
     }
 
+    /// #802: `--no-simplification-of-shared-nodes` and
+    /// `no_simplification_of_shared_nodes=True` turn the shared-border pins
+    /// on alike; `tiles` hands it to both halves.
+    #[test]
+    fn shared_nodes_cli_python_core_configs_are_equal() {
+        let flag = "--no-simplification-of-shared-nodes";
+        let keywords = || native_keywords(json!({"no_simplification_of_shared_nodes": true}));
+        let same = |cli: Value, python: Value, core: Value| {
+            assert_eq!(cli, core);
+            assert_eq!(python, core);
+        };
+
+        let args = cli::OverviewArgs::parse_from(["overview", "in", "out", flag]);
+        let mut core = ConvertOptions::default();
+        core.simplify.shared_nodes = true;
+        same(
+            serde_json::to_value(cli::overview_options(&args).unwrap()).unwrap(),
+            serde_json::to_value(overview_config(keywords()).unwrap()).unwrap(),
+            serde_json::to_value(core).unwrap(),
+        );
+
+        let args = cli::TilesArgs::parse_from(["tiles", "in", "out", flag]);
+        let mut core = TilesOptions::default();
+        core.convert.simplify.shared_nodes = true;
+        core.export.shared_nodes = true;
+        same(
+            serde_json::to_value(cli::tiles_options(&args).unwrap()).unwrap(),
+            serde_json::to_value(tiles_config(keywords()).unwrap()).unwrap(),
+            serde_json::to_value(core).unwrap(),
+        );
+
+        let args = cli::ExportPmtilesArgs::parse_from(["export-pmtiles", "in", "out", flag]);
+        same(
+            serde_json::to_value(cli::export_options(&args).unwrap()).unwrap(),
+            serde_json::to_value(export_config(keywords()).unwrap()).unwrap(),
+            serde_json::to_value(ExportOptions::default().with_shared_nodes(true)).unwrap(),
+        );
+    }
+
     /// #822: `--preset tippecanoe` and `preset="tippecanoe"` resolve to the
     /// same options on every command that takes it, explicit values winning.
     #[test]

@@ -852,12 +852,13 @@ pub fn tiles_options(args: &TilesArgs) -> Result<TilesOptions, TilesError> {
     convert.auto_max_zoom = args.max_zoom.is_auto();
     let export = args.export.apply(tiles_export_defaults(args));
     let mut options = TilesOptions {
-        convert,
         export: ExportOptions {
             metadata: args.publication.clone(),
             tile_range: parse_tile_range(args.tile_range.as_deref())?,
+            shared_nodes: convert.simplify.shared_nodes,
             ..export
         },
+        convert,
         ..args.facade.options.clone()
     };
     super::apply_bands(&mut options, &args.band, &[])?;
