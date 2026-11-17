@@ -9,9 +9,10 @@
 //! same in both.
 //!
 //! A vertex is a pin when it is
-//! - a **junction**: it occurs with two or more distinct unordered neighbour
-//!   pairs `{prev, next}` across all polygon rings (where a shared border
-//!   meets a third polygon, ends, or branches), or
+//! - a **junction**: two of its distinct unordered neighbour pairs
+//!   `{prev, next}` across all polygon rings have a neighbour in common,
+//!   so a run of edges two rings share starts or ends there (where a shared
+//!   border meets a third polygon, ends, or branches), or
 //! - a ring's start, its farthest vertex from the start, or the vertex
 //!   farthest from that chord. These keep every ring at three vertices or
 //!   more, and, because the set is global, a neighbour sharing the vertex
@@ -19,14 +20,16 @@
 //!   but both rings then cut at the same pins.
 //!
 //! This is tippecanoe's `-pn` node set (`serial.cpp`, `main.cpp`), keyed on
-//! exact `f64` coordinates instead of 32-bit world coordinates.
+//! exact `f64` coordinates instead of 32-bit world coordinates, with
+//! `-ab`'s shared-edge rule for which vertex is a junction ([`is_pin`]).
 //!
 //! DIVERGENCE FROM TIPPECANOE: tippecanoe external-sorts the vertex triples
 //! and probes a bloom filter at encode time. This keeps each vertex as a
 //! hashed `(vertex, neighbour pair)` record, sorts in memory, and stores the
-//! pins as a sorted `u64` array probed by binary search. A hash collision can
-//! only add a pin (the two vertices look like one vertex with two neighbour
-//! pairs), which keeps a vertex and never opens a gap.
+//! pins as a sorted `u64` array probed by binary search. A vertex-key
+//! collision can only add a pin (two vertices look like one whose pairs share
+//! a neighbour); missing one takes two pairs whose 32-bit neighbour tags
+//! both collide.
 
 use geo::Coord;
 use geo_traits::{
@@ -60,10 +63,21 @@ pub(crate) fn vertex_key(x: f64, y: f64) -> u64 {
     mix((x + 0.0).to_bits() ^ mix((y + 0.0).to_bits()))
 }
 
+/// The unordered neighbour pair as two 32-bit neighbour tags, smaller one
+/// high, so [`shares_neighbour`] can see a common neighbour. A tag
+/// collision can only show a shared neighbour that isn't, adding a pin.
 #[inline]
 fn pair_key(a: u64, b: u64) -> u64 {
-    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    mix(lo ^ mix(hi).rotate_left(17))
+    let (a, b) = (a >> 32, b >> 32);
+    (a.min(b) << 32) | a.max(b)
+}
+
+/// Whether two different neighbour pairs of one vertex have a neighbour in
+/// common: one ring's edge to it is shared and its other edge is not.
+#[inline]
+fn shares_neighbour(p: u64, q: u64) -> bool {
+    let (p0, p1, q0, q1) = (p >> 32, p as u32 as u64, q >> 32, q as u32 as u64);
+    p != q && (p0 == q0 || p0 == q1 || p1 == q0 || p1 == q1)
 }
 
 /// The dataset's pins, sorted and unique.
@@ -81,12 +95,11 @@ impl JunctionNodes {
     /// Reduce the occurrences of every polygon ring to the pin set.
     pub(crate) fn from_occurrences(mut occ: Vec<Occurrence>) -> Self {
         occ.par_sort_unstable();
-        let mut keys: Vec<u64> = (0..occ.len())
-            .into_par_iter()
-            .filter(|&i| is_pin(&occ, i))
-            .map(|i| occ[i].0)
+        let mut keys: Vec<u64> = occ
+            .par_chunk_by(|a, b| a.0 == b.0)
+            .filter(|g| is_pin(g))
+            .map(|g| g[0].0)
             .collect();
-        keys.dedup();
         keys.shrink_to_fit(); // resident through pass 2, priced by length
         log::debug!(
             "[profile] junction pins: {} occurrence(s) -> {} pin(s)",
@@ -146,10 +159,21 @@ impl JunctionNodes {
     }
 }
 
-/// Whether sorted `occ[i]` shows its vertex is a pin: a [`PIN`] record, or
-/// a second, different neighbour pair.
-fn is_pin(occ: &[Occurrence], i: usize) -> bool {
-    occ[i].1 == PIN || (i > 0 && occ[i - 1].0 == occ[i].0 && occ[i - 1].1 != occ[i].1)
+/// Whether one vertex's records `g` show it is a pin: a [`PIN`] or
+/// [`FORCED`] record, or two neighbour pairs with a neighbour in common,
+/// where a run of edges two rings share starts or ends (tippecanoe `-ab`'s
+/// rule). Pairs with nothing in common are rings that only pass through
+/// the vertex: no span both hold ends there, so pinning it buys nothing.
+///
+/// DIVERGENCE FROM TIPPECANOE: `-pn` pins any vertex with two different
+/// pairs. On field coverages whose borders almost coincide that pins every
+/// stray common vertex (Moldova: 3.76M pins against 2.07M under this rule)
+/// and keeps them at every level.
+fn is_pin(g: &[Occurrence]) -> bool {
+    g.iter().any(|o| o.1 >= PIN)
+        || g.iter()
+            .enumerate()
+            .any(|(i, p)| g[i + 1..].iter().any(|q| shares_neighbour(p.1, q.1)))
 }
 
 /// Sort and shrink one chunk's occurrences: duplicates go (both sides of a
@@ -158,14 +182,20 @@ fn is_pin(occ: &[Occurrence], i: usize) -> bool {
 pub(crate) fn compact(occ: &mut Vec<Occurrence>) {
     occ.sort_unstable();
     occ.dedup();
-    // In place: a later record of a kept vertex marks it a pin.
-    occ.dedup_by(|later, kept| {
-        let same = later.0 == kept.0;
-        if same {
-            kept.1 = PIN;
+    // In place: a pin keeps one record, any other vertex all of its pairs.
+    let (mut w, mut i) = (0, 0);
+    while i < occ.len() {
+        let n = occ[i..].partition_point(|o| o.0 == occ[i].0);
+        if is_pin(&occ[i..i + n]) {
+            occ[w] = (occ[i].0, PIN);
+            w += 1;
+        } else {
+            occ.copy_within(i..i + n, w);
+            w += n;
         }
-        same
-    });
+        i += n;
+    }
+    occ.truncate(w);
 }
 
 /// Append a batch's occurrences (one `Vec` per chunk) to `acc` if `fits`
@@ -326,6 +356,25 @@ mod tests {
             JunctionNodes::from_sorted(nodes.keys().to_vec()),
             Some(nodes)
         );
+    }
+
+    /// Two rings that only pass through a vertex, sharing no edge there, do
+    /// not make it a pin: no span both rings hold starts or ends at it
+    /// (tippecanoe `-ab`'s rule, not `-pn`'s).
+    #[test]
+    fn only_a_shared_edge_ending_makes_a_pin() {
+        let k = |x: f64| vertex_key(x, 0.0);
+        let (v, w) = (k(0.0), k(9.0));
+        let mut occ = vec![
+            (v, pair_key(k(1.0), k(2.0))),
+            (v, pair_key(k(3.0), k(4.0))),
+            (w, pair_key(k(1.0), k(2.0))),
+            (w, pair_key(k(2.0), k(5.0))),
+        ];
+        let nodes = JunctionNodes::from_occurrences(occ.clone());
+        assert_eq!(nodes.keys(), &[w]);
+        compact(&mut occ);
+        assert_eq!(JunctionNodes::from_occurrences(occ), nodes);
     }
 
     /// The bucket directory finds exactly the keys a binary search would.
