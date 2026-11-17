@@ -3282,8 +3282,9 @@ fn joined_export_error(error: ExportError) -> PyramidError {
     }
 }
 
-/// Fit an archive join with no overview to retry: keep the largest ranked
-/// prefix that fits (within 1/16), with one feature as the floor.
+/// Fit an archive join with no overview to retry: search the ranked prefix
+/// (points in bit-reversed order) for the largest fit, within
+/// `MAX_DROP_PASSES` encodes, with one feature as the floor.
 fn drop_joined_tile(
     raw: &mut Vec<u8>,
     gzip: &mut Vec<u8>,
