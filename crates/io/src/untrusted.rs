@@ -244,9 +244,12 @@ const MAX_FOOTER_DEPTH: u32 = 64;
 enum SkimStop {
     /// A declared count no honest footer could hold: refuse the footer.
     Hostile(String),
-    /// The bytes stopped making sense (truncated, unknown type). Not ours to
-    /// judge: parquet-rs decodes the footer and reports its own error.
+    /// The bytes stopped making sense (an unknown type). Not ours to judge:
+    /// parquet-rs decodes the footer and reports its own error.
     Confused,
+    /// The bytes ran out mid-value: a truncated footer, or a page header
+    /// longer than the bytes read ahead of it ([`PageGuard::peek`]).
+    Short,
 }
 
 /// The fewest bytes one collection element of compact type `ty` takes on
@@ -273,14 +276,14 @@ impl Skim<'_> {
     }
 
     fn byte(&mut self) -> Result<u8, SkimStop> {
-        let b = *self.buf.get(self.pos).ok_or(SkimStop::Confused)?;
+        let b = *self.buf.get(self.pos).ok_or(SkimStop::Short)?;
         self.pos += 1;
         Ok(b)
     }
 
     fn advance(&mut self, n: usize) -> Result<(), SkimStop> {
         if n > self.remaining() {
-            return Err(SkimStop::Confused);
+            return Err(SkimStop::Short);
         }
         self.pos += n;
         Ok(())
@@ -711,7 +714,7 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
     });
     match walked {
         Err(SkimStop::Hostile(reason)) => Err(InputError::HostileFooter(reason)),
-        Ok(()) | Err(SkimStop::Confused) => Ok(()),
+        Ok(()) | Err(SkimStop::Confused | SkimStop::Short) => Ok(()),
     }
 }
 
@@ -730,7 +733,7 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
 /// before decoding a value (`DictDecoder::set_dict`, the byte-view
 /// decoder's `ViewBuffer::with_capacity`): a few bytes claiming 1.4 billion
 /// `INT64`s ask for 11 GB. So `get_read` first reads the header bytes
-/// itself ([`page_claim`]) and refuses a dictionary whose values cannot
+/// itself ([`check_header`]) and refuses a dictionary whose values cannot
 /// fit its page, then serves those bytes to parquet-rs.
 ///
 /// parquet-rs turns either error into a string on its way out, so the
@@ -781,9 +784,15 @@ fn chunk_spans(metadata: &ParquetMetaData, groups: Option<&[usize]>) -> Arc<[Chu
     let mut spans: Vec<ChunkSpan> = selected
         .into_iter()
         .flat_map(|rg| rg.columns())
-        .map(|col| {
-            // Checked non-negative and inside the file by `validate_chunk_ranges`.
-            let (start, len) = col.byte_range();
+        .filter_map(|col| {
+            // `byte_range()` without its assert: a footer handed to
+            // `reader_metadata` may not have been through `validate_chunk_ranges`.
+            // parquet-rs cannot read a negative range either, so it needs no span.
+            let start = col
+                .dictionary_page_offset()
+                .unwrap_or_else(|| col.data_page_offset());
+            let start = u64::try_from(start).ok()?;
+            let len = u64::try_from(col.compressed_size()).ok()?;
             let value_bits = match col.column_type() {
                 Type::BOOLEAN => 1,
                 // A byte array's plain value starts with a 4-byte length.
@@ -794,12 +803,12 @@ fn chunk_spans(metadata: &ParquetMetaData, groups: Option<&[usize]>) -> Arc<[Chu
                     8 * u64::try_from(col.column_descr().type_length()).unwrap_or(0)
                 }
             };
-            ChunkSpan {
+            Some(ChunkSpan {
                 start,
                 end: start.saturating_add(len),
                 value_bits,
                 raw: col.compression() == Compression::UNCOMPRESSED,
-            }
+            })
         })
         .collect();
     spans.sort_unstable_by_key(|s| s.start);
@@ -818,53 +827,102 @@ fn chunk_spans(metadata: &ParquetMetaData, groups: Option<&[usize]>) -> Arc<[Chu
 }
 
 /// Header bytes read ahead of parquet-rs: what its buffered reader fetches
-/// anyway. A longer header is read again in a window 16 times wider.
+/// anyway. A longer header is read again in a window 16 times wider, up to
+/// [`PAGE_HEADER_CAP`].
 const PAGE_PEEK: u64 = 8 << 10;
 
-/// What a page header declares, as parquet-rs reads it: `(page type,
-/// uncompressed_page_size, compressed_page_size, dictionary num_values)`.
-/// A field of an unexpected wire type is skipped: parquet-rs refuses it.
-fn page_claim(header: &[u8]) -> Result<(i32, i32, i32, Option<i32>), SkimStop> {
+/// The longest page header [`PageGuard`] reads ahead. Honest headers are a
+/// few hundred bytes (writers cap page statistics at a few KB, and a
+/// dictionary page has none). Past it, any other page passes on to
+/// parquet-rs unchecked, and a dictionary page is refused.
+const PAGE_HEADER_CAP: u64 = 1 << 20;
+
+/// What a page header declares, as parquet-rs reads it, so far as the bytes
+/// read ahead go. A field of an unexpected wire type is skipped: parquet-rs
+/// refuses it.
+#[derive(Default)]
+struct PageClaim {
+    /// The page type, and how many times the header declares one.
+    ty: Option<i32>,
+    types: u32,
+    uncompressed: i32,
+    compressed: i32,
+    /// The dictionary page header's `num_values`.
+    values: Option<i32>,
+}
+
+fn page_claim(header: &[u8]) -> (PageClaim, Result<(), SkimStop>) {
     let mut s = Skim {
         buf: header,
         pos: 0,
     };
-    let (mut ty, mut uncompressed, mut compressed, mut values) = (-1, -1, -1, None);
+    let mut claim = PageClaim::default();
     // parquet-rs reads an i32 by truncating the zigzag i64 (#789).
     let int = |s: &mut Skim<'_>| s.zigzag().map(|v| v as i32);
-    s.fields(0, |s, id, wire| match (id, wire) {
-        (1, 5) => int(s).map(|v| ty = v),
-        (2, 5) => int(s).map(|v| uncompressed = v),
-        (3, 5) => int(s).map(|v| compressed = v),
+    let walked = s.fields(0, |s, id, wire| match (id, wire) {
+        (1, 5) => int(s).map(|v| {
+            claim.ty = Some(v);
+            claim.types += 1;
+        }),
+        (2, 5) => int(s).map(|v| claim.uncompressed = v),
+        (3, 5) => int(s).map(|v| claim.compressed = v),
         (7, 12) => s.fields(1, |s, id, wire| match (id, wire) {
-            (1, 5) => int(s).map(|v| values = Some(v)),
+            (1, 5) => int(s).map(|v| claim.values = Some(v)),
             _ => s.skip(wire, 2),
         }),
         _ => s.skip(wire, 1),
-    })?;
-    Ok((ty, uncompressed, compressed, values))
+    });
+    (claim, walked)
+}
+
+/// What [`check_header`] makes of the header bytes read so far.
+enum Peeked {
+    /// Not a dictionary page, or one whose values fit its bytes.
+    Pass,
+    /// The header runs past the bytes read; `dictionary` unless it already
+    /// declared another page type.
+    More {
+        dictionary: bool,
+    },
+    Refuse(String),
 }
 
 /// Refuse a dictionary page whose declared values cannot fit its bytes.
-fn check_dictionary(span: &ChunkSpan, header: &[u8]) -> Result<(), SkimStop> {
+fn check_header(span: &ChunkSpan, header: &[u8]) -> Peeked {
     const DICTIONARY_PAGE: i32 = 2;
-    let (ty, uncompressed, compressed, values) = page_claim(header)?;
-    let (Some(values), DICTIONARY_PAGE) = (values, ty) else {
-        return Ok(());
+    let (claim, walked) = page_claim(header);
+    // parquet-rs keeps the last, which may lie past the bytes read.
+    if claim.types > 1 {
+        return Peeked::Refuse("a page header declares its type twice".into());
+    }
+    let dictionary = claim.ty.is_none_or(|t| t == DICTIONARY_PAGE);
+    match walked {
+        Err(SkimStop::Short) => return Peeked::More { dictionary },
+        Err(SkimStop::Hostile(reason)) if dictionary => return Peeked::Refuse(reason),
+        // Malformed, or not a dictionary page: parquet-rs's to judge.
+        Err(_) => return Peeked::Pass,
+        Ok(()) => {}
+    }
+    let (Some(values), Some(DICTIONARY_PAGE)) = (claim.values, claim.ty) else {
+        return Peeked::Pass;
     };
-    let bytes = if span.raw { compressed } else { uncompressed };
+    let bytes = if span.raw {
+        claim.compressed
+    } else {
+        claim.uncompressed
+    };
     // Negative counts and sizes are parquet-rs's to refuse.
     let (Ok(values), Ok(bytes)) = (u64::try_from(values), u64::try_from(bytes)) else {
-        return Ok(());
+        return Peeked::Pass;
     };
     // Booleans pack eight to a byte; the last byte may be partial.
     if values.saturating_mul(span.value_bits) > bytes * 8 + 7 {
-        return Err(SkimStop::Hostile(format!(
+        return Peeked::Refuse(format!(
             "a dictionary page declares {values} values of {} bits, but holds {bytes} bytes",
             span.value_bits
-        )));
+        ));
     }
-    Ok(())
+    Peeked::Pass
 }
 
 impl<R: ChunkReader> PageGuard<R> {
@@ -879,17 +937,26 @@ impl<R: ChunkReader> PageGuard<R> {
             return Ok(Bytes::new());
         }
         let left = span.end - start;
-        let mut window = PAGE_PEEK.min(left);
+        let cap = left.min(PAGE_HEADER_CAP);
+        let mut window = PAGE_PEEK.min(cap);
         loop {
             let bytes = self.reader.get_bytes(start, window as usize)?;
-            match check_dictionary(span, &bytes) {
-                Err(SkimStop::Confused) if window < left => window = (window * 16).min(left),
-                Err(SkimStop::Hostile(reason)) => {
-                    self.hit.store(true, Ordering::Relaxed);
-                    return Err(ParquetError::General(reason));
+            let reason = match check_header(span, &bytes) {
+                Peeked::Pass => return Ok(bytes),
+                Peeked::More { .. } if window < cap => {
+                    window = (window * 16).min(cap);
+                    continue;
                 }
-                Ok(()) | Err(SkimStop::Confused) => return Ok(bytes),
-            }
+                // The chunk ends inside the header: parquet-rs refuses it.
+                Peeked::More { .. } if window == left => return Ok(bytes),
+                Peeked::More { dictionary: false } => return Ok(bytes),
+                Peeked::More { dictionary: true } => {
+                    format!("a dictionary page header runs past {PAGE_HEADER_CAP} bytes")
+                }
+                Peeked::Refuse(reason) => reason,
+            };
+            self.hit.store(true, Ordering::Relaxed);
+            return Err(ParquetError::General(reason));
         }
     }
 }
@@ -4176,6 +4243,95 @@ mod tests {
             matches!(input_error(&err), Some(InputError::HostilePageHeader)),
             "{err:?}"
         );
+    }
+
+    /// What #894's header check makes of a few crafted headers.
+    #[test]
+    fn page_headers_read_ahead_only_while_they_could_be_a_dictionary() {
+        let span = ChunkSpan {
+            start: 0,
+            end: u64::MAX,
+            value_bits: 64,
+            raw: true,
+        };
+        let more = |h: &[u8]| match check_header(&span, h) {
+            Peeked::More { dictionary } => Some(dictionary),
+            _ => None,
+        };
+        // `1: type = DICTIONARY_PAGE`, then an unknown binary of 2 MB.
+        assert_eq!(
+            more(&[0x15, 0x04, 0x88, 0x80, 0x80, 0x80, 0x01]),
+            Some(true)
+        );
+        // `1: type = DATA_PAGE`, the same binary: read on, but no dictionary.
+        assert_eq!(
+            more(&[0x15, 0x00, 0x88, 0x80, 0x80, 0x80, 0x01]),
+            Some(false)
+        );
+        // An unknown wire type cannot be fixed by reading further.
+        assert!(matches!(check_header(&span, &[0x1e]), Peeked::Pass));
+        // A second type (long-form field id 1) parquet-rs would keep.
+        assert!(matches!(
+            check_header(&span, &[0x15, 0x00, 0x05, 0x02, 0x04, 0x00]),
+            Peeked::Refuse(_)
+        ));
+    }
+
+    /// Roborev on #894: a header that is malformed from its first byte is
+    /// not read ahead past the first window, however long its chunk.
+    #[test]
+    fn a_malformed_page_header_is_not_read_to_the_end_of_its_chunk() {
+        use arrow_array::{ArrayRef, Int64Array};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        /// Bytes that record the longest read starting at `at`.
+        struct Longest {
+            bytes: Bytes,
+            at: u64,
+            longest: Arc<std::sync::Mutex<usize>>,
+        }
+        impl Length for Longest {
+            fn len(&self) -> u64 {
+                self.bytes.len() as u64
+            }
+        }
+        impl ChunkReader for Longest {
+            type T = <Bytes as ChunkReader>::T;
+            fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+                self.bytes.get_read(start)
+            }
+            fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+                if start == self.at {
+                    let mut longest = self.longest.lock().unwrap();
+                    *longest = (*longest).max(length);
+                }
+                self.bytes.get_bytes(start, length)
+            }
+        }
+
+        let values = Int64Array::from_iter_values(0..300_000);
+        let batch = RecordBatch::try_from_iter([("v", Arc::new(values) as ArrayRef)]).unwrap();
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .build();
+        let mut file = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let source = open_parquet(Bytes::from(file.clone())).unwrap();
+        let (at, len) = source.metadata().row_group(0).column(0).byte_range();
+        assert!(len > 16 * PAGE_PEEK, "{len}");
+        file[at as usize] = 0x1e;
+        let longest = Arc::new(std::sync::Mutex::new(0));
+        let source = open_parquet(Longest {
+            bytes: Bytes::from(file),
+            at,
+            longest: longest.clone(),
+        })
+        .unwrap();
+        assert!(source.build().unwrap().any(|b| b.is_err()));
+        assert_eq!(*longest.lock().unwrap(), PAGE_PEEK as usize);
     }
 
     /// #894's page guard passes honest dictionaries at their smallest plain

@@ -168,6 +168,9 @@ fn parquet_footer_seeds() {
             "seed-issue-789-retyped-created-by.thrift",
             "seed-issue-789-retyped-encodings.thrift",
             "seed-issue-789-set-typed-schema.thrift",
+            // #894: an i64 column statistic of i64::MIN, which overflowed
+            // `abs()` in `--filter` pushdown.
+            "seed-issue-894-i64-min-statistic.thrift",
         ],
         tylertoo_core::internal::overview::check::fuzz_parquet_footer,
     );
