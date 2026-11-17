@@ -45,7 +45,7 @@ Use these settings to balance coverage, build time, and file size:
 | No holes where small polygons are dense (parcels, small admin units) | `export-pmtiles --coverage-fill` | Each tile also draws, under its own features, the area its child tiles cover, so placeholder squares no longer leave gaps between them: Auckland parcels at z8 go from 28.5% of the area missing to none. 1.10–1.17× the build time and 4% larger archives on Madagascar admin-4 and NZ parcels. On scattered polygons smaller than a pixel (FTW fields) it also draws area between them. See [coverage fill](#coverage-fill-coverage-fill). |
 | Fewer slivers between neighbors | `--simplify-factor 0.25` | About tippecanoe's coverage on dense parcels. See [coverage and simplification](#coverage-and-simplification). |
 | No slivers at all | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbors meet without gaps. The overview file grows about 2.7×, and dense small polygons build up to 10× slower. |
-| Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. This valve keeps the chosen extent. |
+| Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. This valve keeps the chosen extent. `--drop-polygons` alone removes the polygons the rate drops and keeps squares for polygons too small to see: Moldova fields (632k polygons) 153 → 111 MB and 4.2 → 2.9 s, NZ parcels (4.3M) 1,042 → 767 MB and 28 → 14 s (#875). See [the density budget](#density-budget-drop-rate-drop-gamma-no-density-drop). |
 | Preserve each retained feature's attributes and grid | `--size-valve drop` | An oversized tile drops features instead of merging them, so it shows holes, but no feature takes on the geometry of another. |
 
 ### Coverage and simplification
@@ -1072,7 +1072,12 @@ then counts only the features the budget thins. `--drop-lines` and
 `--drop-polygons` apply the budget to lines and polygons, as tippecanoe's flags of
 the same names do; together they restore the budget before #745.
 
-`--drop-polygons` removes the polygons the rate drops. Polygons too small
+`--drop-polygons` removes the polygons the rate drops. Before #875 the
+accumulator turned each of them back into a placeholder square, so the flag
+barely changed the output. Now, at `--drop-rate 2.5`, Moldova's 632k fields
+build in 2.9 s instead of 4.2 s, into a 111 MB archive instead of 153 MB
+(1.58M tile rows instead of 3.46M), and the 4.3M NZ parcels in 14 s instead
+of 28 s (767 MB instead of 1,042 MB). Polygons too small
 to see at a level, or removed by `--polygon-thinning`, still become [placeholder squares](#area-accumulation-and-dithering),
 with or without the flag. On dense small polygons, such as fields or parcels,
 coarse zooms can therefore hold more features than the budget: Moldova's
