@@ -28,8 +28,7 @@ pub use untrusted::{
     BYTE_ARRAY_BATCH_LIMIT, DEFAULT_BATCH_ROWS,
 };
 pub use writer::{
-    batch_writer, batch_writer_with_row_cap, overview_writer, BatchWriter, OverviewCompression,
-    OverviewWriteOptions,
+    batch_writer, overview_writer, BatchWriter, OverviewCompression, OverviewWriteOptions,
 };
 
 /// Parallel overview encoding maps Arrow arrays to Parquet leaves with this function.

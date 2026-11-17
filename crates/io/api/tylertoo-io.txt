@@ -279,7 +279,6 @@ pub const tylertoo_io::IPC_CODEC_SCRATCH_BYTES: u64
 pub trait tylertoo_io::ConcurrentChunkReader: parquet::file::reader::ChunkReader
 impl tylertoo_io::ConcurrentChunkReader for bytes::bytes::Bytes
 pub fn tylertoo_io::batch_writer<W: core::io::write::Write + core::marker::Send>(W, arrow_schema::schema::SchemaRef) -> core::result::Result<tylertoo_io::BatchWriter<W>, parquet::errors::ParquetError>
-pub fn tylertoo_io::batch_writer_with_row_cap<W: core::io::write::Write + core::marker::Send>(W, arrow_schema::schema::SchemaRef, usize) -> core::result::Result<tylertoo_io::BatchWriter<W>, parquet::errors::ParquetError>
 pub fn tylertoo_io::byte_array_limit() -> u64
 pub fn tylertoo_io::check_byte_array_ceiling(&arrow_array::record_batch::RecordBatch) -> core::result::Result<(), arrow_schema::error::ArrowError>
 pub fn tylertoo_io::concat_delivered(&arrow_schema::schema::SchemaRef, &[arrow_array::record_batch::RecordBatch]) -> core::result::Result<arrow_array::record_batch::RecordBatch, arrow_schema::error::ArrowError>
