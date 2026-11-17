@@ -9046,6 +9046,8 @@ fn account_sources(
         SourceLossCause::EncodeDropped
     };
     let surviving: std::collections::BTreeSet<u64> = mvt.source_ids.iter().copied().collect();
+    // The merge valve owns per-source causes, including kept merges on a
+    // tile that also dropped singles. Prefer those to the tile-wide default.
     let losses: std::collections::BTreeMap<u64, _> = mvt.source_losses.iter().copied().collect();
     for member in members {
         if let Some(id) = member.id {
@@ -9864,7 +9866,12 @@ fn merge_to_fit(
                 valve: tally,
                 ..mvt
             };
-            return with_fill(fitted, opts, fill, fill_tally, |f| build(&feats, passes, f));
+            let mut fitted =
+                with_fill(fitted, opts, fill, fill_tally, |f| build(&feats, passes, f));
+            if absorbed > 0 && opts.feature_id.is_some() {
+                account_merged_sources(&merged, &feats, &ordered, &mut fitted);
+            }
+            return fitted;
         }
         // tippecanoe's `mingap_fraction`: aim for the share of features
         // that would fit, with a 20% margin, never keeping more than 80%.
@@ -9924,8 +9931,7 @@ fn merge_to_fit(
             over_limit: usize::from(fit < 1.0),
             ..tally
         };
-        let used_backstop = fit < 1.0;
-        if used_backstop {
+        if fit < 1.0 {
             out = reduce_merged_to_fit(
                 gzip_cache,
                 &mut kept,
@@ -9957,7 +9963,7 @@ fn merge_to_fit(
         let mut fitted = with_fill(fitted, opts, fill, fill_tally, |f| {
             build(&kept, tally.passes, f)
         });
-        if used_backstop && opts.feature_id.is_some() {
+        if opts.feature_id.is_some() {
             account_merged_sources(&merged, &kept, &ordered, &mut fitted);
         }
         return fitted;
@@ -10022,8 +10028,10 @@ fn reduce_merged_to_fit(
     out
 }
 
-/// The encoder tracks targets. Classify their absorbed sources too, including
-/// every source of a merged feature removed by the backstop.
+/// The merge valve's per-source loss owner, after the final encode (including
+/// fill). The encoder tracks targets; propagate their encode losses to absorbed
+/// sources, otherwise classify kept merges as merged and dropped features'
+/// sources as valve-dropped, whether or not the backstop ran.
 fn account_merged_sources(
     merged: &[coalesce_valve::Merged<'_>],
     kept: &[&coalesce_valve::Merged<'_>],
@@ -22734,6 +22742,99 @@ mod tests {
 #[cfg(test)]
 mod diagnostic_row_alignment {
     use super::*;
+
+    /// A kept merge's absorbed rows have the same cause whether dropping
+    /// singles fits the tile or the extent backstop must finish it.
+    #[test]
+    fn merge_valve_source_causes_do_not_depend_on_extent_backstop() {
+        use crate::diagnostics::{Diagnostics, SourceLossCause};
+
+        let members: Vec<_> = [
+            Geometry::LineString(geo::LineString::from(vec![(-10., 0.), (10., 0.)])),
+            Geometry::LineString(geo::LineString::from(vec![(-10., 0.), (10., 0.)])),
+            Geometry::Point(geo::Point::new(0., 0.)),
+            Geometry::Point(geo::Point::new(0., 0.)),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(row, geom)| Member {
+            key: 0,
+            seq: row as u64,
+            geom: geom.into(),
+            props: SharedProps::new(vec![]),
+            id: Some(100 + row as u64),
+            gap: if row == 0 { GAP_NONE } else { 1 },
+            band: 0,
+        })
+        .collect();
+        let mut opts = ExportOptions {
+            feature_id: Some("id".into()),
+            size_valve: SizeValve::Merge,
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let cache = test_gzip_cache();
+        let tb = TileCoord::new(0, 0, 0).bounds();
+        let ordered: Vec<_> = members.iter().collect();
+        let merged = coalesce_valve::coalesce_members(&ordered, 2);
+        // Exactly enough room for the merged lines and one unmerged point.
+        let singles_limit = build_mvt(
+            &cache,
+            &merged[..2],
+            &tb,
+            &opts,
+            &[],
+            &Diagnostics::default(),
+        )
+        .data
+        .len();
+        let merged_limit = build_mvt(&cache, &merged, &tb, &opts, &[], &Diagnostics::default())
+            .data
+            .len();
+        for (limit, dropped, backstop) in [
+            (merged_limit, 0, false),
+            (1, 2, true),
+            (singles_limit, 1, false),
+        ] {
+            opts.tile_size_limit = Some(limit);
+            let diagnostics = Diagnostics::default();
+            let mvt = encode_tile(
+                &cache,
+                &members,
+                &tb,
+                &opts,
+                &[],
+                &mut FillTally::default(),
+                &diagnostics,
+            );
+            assert_eq!(mvt.valve.reduced_extent.is_some(), backstop);
+            assert_eq!(mvt.valve.merged, 1);
+            assert_eq!(mvt.valve.dropped, dropped);
+            assert!(mvt.source_ids.contains(&0), "merged feature is kept");
+            account_sources(&members, &mvt, 0, &opts, &diagnostics).unwrap();
+            let losses = diagnostics.source_losses().unwrap();
+            let actual: Vec<_> = losses
+                .iter()
+                .map(|loss| {
+                    let loss = loss.unwrap();
+                    assert_eq!(loss.feature_id, Some(100 + loss.id));
+                    (loss.id, loss.cause)
+                })
+                .collect();
+            let mut expected = vec![(1, SourceLossCause::Merged)];
+            if dropped == 2 {
+                expected.push((2, SourceLossCause::ValveDropped));
+            }
+            if dropped > 0 {
+                expected.push((3, SourceLossCause::ValveDropped));
+            }
+            assert_eq!(actual, expected, "backstop={backstop}");
+            assert_eq!(
+                mvt.source_losses, expected,
+                "valve records each source's cause"
+            );
+        }
+    }
 
     #[test]
     fn mutation_regression_source_loss_valve_causes() {
