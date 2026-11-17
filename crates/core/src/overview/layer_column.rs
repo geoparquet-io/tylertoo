@@ -908,6 +908,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn staged_row_groups_do_not_exceed_source_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("crops.parquet");
+        write_multi_rg_attr_input(&input, &rows());
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        let counts = source.part_row_group_row_counts().unwrap();
+        assert!(counts[0].len() > 1);
+        let max_rows = *counts.iter().flatten().max().unwrap();
+        let schema = source.schema().unwrap();
+        let idx = routing_column(&schema, "crop").unwrap();
+        let convert = options("crop").convert;
+        let gates = Gates::new(&source, &schema, &convert).unwrap();
+
+        let (staged, filtered) =
+            split(&source, &schema, idx, &gates, dir.path(), &convert).unwrap();
+        assert_eq!(filtered, 0);
+        assert_eq!(staged.len(), 4);
+        assert_eq!(staged.iter().map(|s| s.rows).sum::<u64>(), 6);
+        for layer in staged {
+            let file = std::fs::File::open(&layer.path).unwrap();
+            let footer = tylertoo_io::read_parquet_metadata(&file).unwrap();
+            for group in footer.row_groups() {
+                assert!(
+                    group.num_rows() <= max_rows,
+                    "layer {:?}: staged row group has {} rows, source maximum is {max_rows}",
+                    layer.name,
+                    group.num_rows()
+                );
+            }
+        }
+    }
+
     /// #821: each value lands in its own layer, null and blank in
     /// `_unknown`, the routing column is not a property, and the metadata
     /// lists every layer.
