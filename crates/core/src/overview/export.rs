@@ -9835,6 +9835,9 @@ struct OpenedJointSource<'a> {
     columns: ResolvedColumns,
     crs: Crs,
     zooms: Vec<u8>,
+    /// #802: the finest level's pins, as the source export built them, so a
+    /// refitted max-zoom tile keeps the borders its source export kept.
+    pins: Option<JunctionNodes>,
 }
 
 impl<'a> JoinedTileFitter<'a> {
@@ -9906,12 +9909,20 @@ impl<'a> JoinedTileFitter<'a> {
                 };
                 let columns = resolve_export_columns((&reader, band), &source.options, &zooms)?;
                 let crs = crs_from_descriptor(reader.resolved_schema(), &source.path, replay)?;
+                let pins = finest_level_pins(
+                    (&reader, band),
+                    crs,
+                    &source.options,
+                    &mut export_budget(),
+                    replay,
+                )?;
                 Ok(OpenedJointSource {
                     source,
                     reader,
                     columns,
                     crs,
                     zooms,
+                    pins,
                 })
             })
             .collect::<Result<Vec<_>, ExportError>>()?;
@@ -9963,6 +9974,7 @@ impl<'a> JoinedTileFitter<'a> {
                 columns,
                 crs,
                 zooms,
+                pins,
             } in &self.sources
             {
                 if zoom < source.min_zoom || zoom > source.max_zoom {
@@ -9988,6 +10000,7 @@ impl<'a> JoinedTileFitter<'a> {
                     timers: &timers,
                     fills: None,
                     tiles: Some(&tile_counts),
+                    pins: pins.as_ref(),
                     #[cfg(test)]
                     work: &Mutex::new(ExportWorkTally::default()),
                 };
@@ -20376,6 +20389,48 @@ mod tests {
             1,
             "price the original overview members collected by the retry"
         );
+    }
+
+    #[test]
+    fn joined_refit_keeps_the_source_exports_shared_border_pins() {
+        // Two squares sharing a jagged border: its inner vertices are pins.
+        let border = [(1.0, 0.0), (1.1, 0.25), (0.9, 0.5), (1.1, 0.75), (1.0, 1.0)];
+        let left: Vec<_> = [(0.0, 0.0)]
+            .into_iter()
+            .chain(border)
+            .chain([(0.0, 1.0), (0.0, 0.0)])
+            .collect();
+        let right: Vec<_> = border
+            .into_iter()
+            .chain([(2.0, 1.0), (2.0, 0.0), (1.0, 0.0)])
+            .collect();
+        let squares: Vec<Geometry<f64>> = [left, right]
+            .into_iter()
+            .map(|ring| Geometry::Polygon(geo::Polygon::new(geo::LineString::from(ring), vec![])))
+            .collect();
+        let input = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(input.path(), &[(vec![0; squares.len()], squares)]);
+        let source = |shared_nodes| JointSource {
+            members: JointMembers {
+                tile_counts: BTreeMap::new(),
+                member_bytes: None,
+            },
+            path: input.path().to_path_buf(),
+            options: ExportOptions {
+                max_zoom_simplify_factor: Some(1.0),
+                ..Default::default()
+            }
+            .with_shared_nodes(shared_nodes),
+            min_zoom: 0,
+            max_zoom: 0,
+        };
+        let (on, off) = (source(true), source(false));
+        let fitter = JoinedTileFitter::open([&on, &off]).unwrap();
+        assert!(
+            fitter.sources[0].pins.is_some(),
+            "the flag's pins reach the refit"
+        );
+        assert!(fitter.sources[1].pins.is_none(), "no pins without the flag");
     }
 
     #[test]
