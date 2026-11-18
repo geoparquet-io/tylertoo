@@ -58,6 +58,7 @@ use super::convert::{
     GroupInterner, LevelReport, PlanLevelReport, PlanReport, SkippedLevelReport,
     KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
+use super::junction::{JunctionNodes, Occurrence};
 use super::level::{ClusterCategories, Crs, EntryZoomProvenance, Mode, RankingProvenance};
 use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
 use super::pipe::{for_each_window_on_pool, scoped_pipe, split_in_flight, WindowStats};
@@ -73,7 +74,7 @@ use super::read::{footer_price, grant_read_ahead, FooterPrice, ReadFlow, ReadPas
 #[cfg(test)]
 use super::simplify::CollapseMode;
 use super::simplify::{
-    carrier_square, simplify_cascade, simplify_step_at, CascadeFold, CascadeStep, FoldStep,
+    carrier_square, simplify_cascade_pinned, simplify_step_at, CascadeFold, CascadeStep, FoldStep,
     Representation, Simplified, SimplifyOptions,
 };
 use super::source::BatchSource;
@@ -87,6 +88,9 @@ use crate::resolved_schema::ResolvedSchema;
 struct ScanCollection {
     collect_lines: LineCollect,
     want_areas: bool,
+    /// #802: collect polygon vertex occurrences for the junction pins (only
+    /// when polygons simplify: duplicating mode, `--simplify-factor` > 0).
+    junctions: bool,
 }
 
 struct Pass1Keys<'a> {
@@ -111,6 +115,8 @@ struct Pass1Accum<'a> {
     lines: &'a mut LineScratch,
     point_count: &'a mut usize,
     skipped_rows: &'a mut usize,
+    /// #802: each chunk's polygon vertex occurrences, for the junction pins.
+    junctions: &'a mut Vec<Vec<Occurrence>>,
 }
 
 struct WriterProvenance<'a> {
@@ -1393,6 +1399,8 @@ struct LevelCtxInputs<'a> {
     crs: Crs,
     finest: usize,
     duplicating: bool,
+    /// #802: the dataset's junction pins.
+    pins: Option<&'a JunctionNodes>,
 }
 
 /// Build one `LevelStreamCtx` per emitted level, in level order.
@@ -1438,6 +1446,7 @@ fn build_level_ctxs<'a>(
                 coalesce_table: inputs.coalesce_tables[i].as_ref(),
                 cascade_chain: &inputs.cascade_chains[i],
                 carriers: &inputs.carriers[e.orig as usize],
+                pins: inputs.pins,
             }
         })
         .collect()
@@ -2304,6 +2313,8 @@ pub(super) struct WinnerTables {
     /// accumulator's carriers (#384); empty per level unless it applies.
     pub(super) carriers: Vec<Vec<usize>>,
     pub(super) finest: usize,
+    /// #802: the dataset's junction pins; `None` without polygons.
+    pub(super) junctions: Option<JunctionNodes>,
 }
 
 /// The per-level coalesce chain tables, built once (#570).
@@ -2712,6 +2723,7 @@ fn resolve_winner_tables(
         counts,
         carriers,
         finest,
+        junctions: None,
     })
 }
 
@@ -3351,6 +3363,7 @@ fn run_pass1_and_assign(
         mut features,
         bbox_tally,
         areas,
+        junctions,
         provenance: ranking_provenance,
         entry_zoom,
         acc_values,
@@ -3420,6 +3433,8 @@ fn run_pass1_and_assign(
         },
         rss,
     )?;
+    let mut tables = tables;
+    tables.junctions = (!junctions.keys().is_empty()).then_some(junctions);
     // Stops before `--save-plan` serialization, which is I/O for an opt-in
     // artifact rather than part of the assignment itself.
     let assign_wall = t_assign.elapsed();
@@ -3773,6 +3788,7 @@ pub(crate) fn run_stages(
                 counts,
                 mut carriers,
                 finest,
+                junctions,
             },
         ranking_provenance,
         entry_zoom,
@@ -3790,6 +3806,9 @@ pub(crate) fn run_stages(
                                                         // #716/#545: footer bytes per input row over every column pass 2 reads;
                                                         // they price the writer's encodes, the read-ahead and the window.
     let mut budget = budget;
+    // #802: the pins stay resident through pass 2, from pass 1 or a plan.
+    let pin_bytes = junctions.as_ref().map_or(0, JunctionNodes::resident_bytes);
+    budget.reserve_up_to(MemoryPhase::Compute, pin_bytes);
     let footer = footer_price(
         source,
         selected_row_groups.as_ref(),
@@ -3954,6 +3973,7 @@ pub(crate) fn run_stages(
             crs,
             finest,
             duplicating,
+            pins: junctions.as_ref(),
         },
     );
 
@@ -5340,6 +5360,8 @@ struct Pass1Output {
     /// parallel to `features`; empty unless the tiny-polygon accumulator is
     /// on (#384), since it is the one consumer.
     areas: Vec<f32>,
+    /// #802: the dataset's junction pins.
+    junctions: JunctionNodes,
     /// Resolved ranking provenance (§3.5).
     provenance: RankingProvenance,
     /// Resolved entry-zoom ladder provenance (§3.5, #446); `None` when no
@@ -5411,6 +5433,9 @@ struct Pass1Timers {
     /// entry-level stamping, coalesce-scratch assembly — serial, once for
     /// the whole pass (not per batch).
     assemble: atomic::AtomicU64,
+    /// #802: sorting each chunk's polygon vertex occurrences (the final
+    /// reduction to pins counts under `assemble`).
+    junctions: atomic::AtomicU64,
 }
 
 /// Pass-1 stage split, in **core-seconds** (summed across threads, not wall —
@@ -5427,12 +5452,13 @@ pub(super) struct Pass1StageSecs {
     pub(super) scan: f64,
     pub(super) keys: f64,
     pub(super) assemble: f64,
+    pub(super) junctions: f64,
 }
 
 impl Pass1StageSecs {
     /// #810: the stages' core-seconds, the share of pass 1's CPU they explain.
     fn core_secs(&self) -> f64 {
-        self.read + self.decode + self.scan + self.keys + self.assemble
+        self.read + self.decode + self.scan + self.keys + self.assemble + self.junctions
     }
 }
 
@@ -5459,6 +5485,7 @@ impl Pass1Timers {
             scan: Self::secs(&self.scan),
             keys: Self::secs(&self.keys),
             assemble: Self::secs(&self.assemble),
+            junctions: Self::secs(&self.junctions),
         }
     }
     /// Emit the [profile] stage breakdown plus an explicit rows/s figure so a
@@ -5470,13 +5497,14 @@ impl Pass1Timers {
         let rows_per_sec = if wall > 0.0 { rows as f64 / wall } else { 0.0 };
         log::debug!(
             "[profile] pass1 ({rows} rows): wall={wall:.2}s read={:.2}s decode={:.2}s \
-             scan={:.2}s keys={:.2}s assemble={:.2}s rows/s={rows_per_sec:.0} \
-             (stage sums are core-seconds, overlap wall)",
+             scan={:.2}s keys={:.2}s assemble={:.2}s junctions={:.2}s \
+             rows/s={rows_per_sec:.0} (stage sums are core-seconds, overlap wall)",
             s.read,
             s.decode,
             s.scan,
             s.keys,
             s.assemble,
+            s.junctions,
         );
     }
 }
@@ -5652,6 +5680,8 @@ struct ChunkScan {
     tally: super::convert::BboxTally,
     /// #384 polygon areas, parallel to `features` (empty unless enabled).
     areas: Vec<f32>,
+    /// #802: this chunk's polygon vertex occurrences, sorted and unique.
+    junctions: Vec<Occurrence>,
     /// One entry per chunk row: was it kept (became a feature)? Length
     /// equals the chunk's row count; merged into the batch-wide `kept_row`
     /// the ladder-blanking step reads.
@@ -5728,17 +5758,21 @@ struct ScanRows<'m> {
     mask: Option<&'m super::mask::MaskIndex>,
     line_geoms: bool,
     all_geoms: bool,
+    /// #802: every polygon row's vertex occurrences, for the junction pins;
+    /// `None` once they outgrew the budget.
+    junctions: Option<&'m mut Vec<Occurrence>>,
 }
 
 impl GeoArrowVisitor for ScanRows<'_> {
     type Output = Vec<Option<ScannedRow>>;
 
-    fn visit<'a, A>(self, accessor: &'a A) -> crate::Result<Self::Output>
+    fn visit<'a, A>(mut self, accessor: &'a A) -> crate::Result<Self::Output>
     where
         A: GeoArrowArrayAccessor<'a>,
         A::Item: ToGeoGeometry<f64>,
     {
         let mut out = Vec::with_capacity(accessor.len());
+        let mut ring_buf = Vec::new();
         for (i, item) in accessor.iter().enumerate() {
             let item =
                 item.transpose()
@@ -5782,6 +5816,9 @@ impl GeoArrowVisitor for ScanRows<'_> {
                 out.push(None);
                 continue;
             };
+            if let (FeatureKind::Polygon, Some(occ)) = (kind, self.junctions.as_deref_mut()) {
+                super::junction::push_geometry(&g, &mut ring_buf, occ);
+            }
             let keep_geom = self.all_geoms || (self.line_geoms && kind == FeatureKind::Line);
             if let Some(mask) = self.mask {
                 let hit = mask.keep(&g, &bbox);
@@ -5839,12 +5876,14 @@ fn scan_chunk(
     let ScanCollection {
         collect_lines,
         want_areas,
+        junctions: want_junctions,
     } = inputs;
     let bbox_query = ctx.bbox_query;
     let crs = ctx.crs;
     let diagnostics = ctx.diagnostics;
     let chunk_len = gcol.len();
     let t_decode = Instant::now();
+    let mut junctions = Vec::new();
     let garr = from_arrow_array(gcol, geom_field).map_err(|e| {
         decode_error_at_rows(
             diag_row_base,
@@ -5865,10 +5904,16 @@ fn scan_chunk(
             mask: ctx.mask,
             line_geoms: collect_lines != LineCollect::Off,
             all_geoms: want_areas,
+            junctions: want_junctions.then_some(&mut junctions),
         },
     )
     .map_err(|e| decode_error_at_rows(diag_row_base, chunk_len, e))?;
     Pass1Timers::add(&timers.decode, t_decode);
+    if want_junctions {
+        let t_junctions = Instant::now();
+        super::junction::compact(&mut junctions);
+        Pass1Timers::add(&timers.junctions, t_junctions);
+    }
 
     let t_scan = Instant::now();
     // Upper bounds: every chunk row could become a feature (or a line, or an
@@ -5972,6 +6017,7 @@ fn scan_chunk(
         features,
         tally,
         areas,
+        junctions,
         kept_row,
         lines,
         line_count,
@@ -6239,6 +6285,7 @@ fn merge_pass1_chunks(
         lines,
         point_count,
         skipped_rows,
+        junctions,
     } = inputs;
     // The ranges tile the batch contiguously from 0, so the last one's end is
     // the batch row count (0 for an empty batch).
@@ -6254,6 +6301,7 @@ fn merge_pass1_chunks(
         // Empty unless the #384 accumulator is on, so no `want_areas` gate is
         // needed here — an empty `extend` is a no-op.
         areas.extend(chunk.areas);
+        junctions.push(chunk.junctions);
         let feat_offset = features.len();
         lines.absorb(
             chunk.lines,
@@ -6266,6 +6314,28 @@ fn merge_pass1_chunks(
         features.append_rebased(&chunk.features, chunk_base);
     }
     Ok(kept_row)
+}
+
+/// #802: whether pass 1 collects the shared-border pins: asked for, and
+/// polygons simplify (duplicating mode, `--simplify-factor` > 0).
+fn wants_pins(options: &ConvertOptions) -> bool {
+    let s = &options.simplify;
+    s.shared_nodes && s.factor > 0.0 && options.mode == Mode::Duplicating
+}
+
+/// #802: [`super::junction::absorb`] beside the feature table, in the
+/// scan's budget.
+fn absorb_junctions(
+    ctx: &Pass1Ctx<'_>,
+    features: &FeatureTable,
+    acc: &mut Vec<Occurrence>,
+    batch: &mut Vec<Vec<Occurrence>>,
+) -> bool {
+    let fits = |bytes| {
+        let bytes = features.allocated_bytes() + bytes;
+        ctx.budget.require(MemoryPhase::Scan, bytes).is_ok()
+    };
+    super::junction::absorb(acc, batch, fits, ctx.diagnostics)
 }
 
 /// [`run_pass1`], with the within-batch scan chunk size as an explicit
@@ -6377,6 +6447,8 @@ fn run_pass1_with_chunk_rows(
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
     let want_areas = accumulator_requested(options);
     let mut areas: Vec<f32> = Vec::new();
+    let mut collect_junctions = wants_pins(options);
+    let (mut occ, mut chunk_occ) = (Vec::new(), Vec::new());
     let mut num_rows = 0usize;
     let mut skipped_rows = 0usize;
     let mut point_count = 0usize;
@@ -6467,6 +6539,7 @@ fn run_pass1_with_chunk_rows(
                             ScanCollection {
                                 collect_lines,
                                 want_areas,
+                                junctions: collect_junctions,
                             },
                             timers_ref,
                         )
@@ -6489,6 +6562,7 @@ fn run_pass1_with_chunk_rows(
                         lines: &mut lines,
                         point_count: &mut point_count,
                         skipped_rows: &mut skipped_rows,
+                        junctions: &mut chunk_occ,
                     },
                 )?;
                 if collect_lines == LineCollect::Collect && lines.mode != LineCollect::Collect {
@@ -6499,6 +6573,7 @@ fn run_pass1_with_chunk_rows(
                     );
                 }
                 num_rows += n;
+                collect_junctions &= absorb_junctions(ctx, &features, &mut occ, &mut chunk_occ);
 
                 let t_keys = Instant::now();
                 extract_pass1_batch_keys(
@@ -6566,6 +6641,7 @@ fn run_pass1_with_chunk_rows(
     // in `line_tally`, so the guard still logs the exact totals downstream.
     let line_tally = (lines.lines, lines.bytes);
     let coalesce = lines.finish(&features, all_groups);
+    let junctions = JunctionNodes::from_occurrences(occ);
     Pass1Timers::add(&pass1_timers.assemble, t_assemble);
 
     pass1_timers.log_pass1_summary(t_pass1_fn.elapsed().as_secs_f64(), num_rows);
@@ -6574,6 +6650,7 @@ fn run_pass1_with_chunk_rows(
         features,
         bbox_tally,
         areas,
+        junctions,
         provenance,
         entry_zoom,
         acc_values,
@@ -6870,6 +6947,8 @@ pub(super) struct LevelStreamCtx<'a> {
     /// but are emitted as a placeholder square standing in for the dropped
     /// area around them. Empty unless the accumulator applies.
     carriers: &'a [usize],
+    /// #802: the dataset's junction pins, kept by every simplification.
+    pins: Option<&'a JunctionNodes>,
 }
 
 impl LevelStreamCtx<'_> {
@@ -7209,7 +7288,14 @@ pub(super) fn process_level_batch(
                     carrier_square(g, ctx.gsd_m, ctx.zoom, ctx.crs)
                         .map_or(Simplified::Dropped, Simplified::Keep)
                 } else if !ctx.cascade_chain.is_empty() {
-                    simplify_cascade(g, ctx.cascade_chain, ctx.crs, ctx.simplify, ctx.diagnostics)
+                    simplify_cascade_pinned(
+                        g,
+                        ctx.cascade_chain,
+                        ctx.crs,
+                        ctx.simplify,
+                        ctx.diagnostics,
+                        ctx.pins,
+                    )
                 } else {
                     simplify_step_at(
                         g,
@@ -7219,6 +7305,7 @@ pub(super) fn process_level_batch(
                         ctx.simplify,
                         ctx.repr,
                         ctx.diagnostics,
+                        ctx.pins,
                     )
                 }
             })
@@ -7542,7 +7629,7 @@ pub(super) fn process_batch_cascade(
         .map(|(g, &i)| {
             let ml = finest.min_levels[row_offset + i];
             let mut out: Vec<SharedStep> = Vec::with_capacity(ctxs.len());
-            let mut fold = CascadeFold::new();
+            let mut fold = CascadeFold::new(finest.pins);
             let (mut shared, mut total, mut reused) = (0u64, 0u64, 0u64);
             // #541: walk the unmaterialized fine steps first, so the finest
             // buffered ctx folds from the same working geometry a full run
@@ -7800,6 +7887,7 @@ mod tests {
             coalesce_table: None,
             cascade_chain,
             carriers: &[],
+            pins: None,
         };
         // Coarse→fine; each level's chain runs from the finest down to it.
         let ctxs = [level(0, coarse, &chain[..]), level(1, fine, &chain[..1])];
@@ -8184,6 +8272,66 @@ mod tests {
         let diagnostics = crate::diagnostics::Diagnostics::default();
         let pre = preflight(&source, options, &diagnostics, None).unwrap();
         scan_fixture(&source, &pre, chunk_rows, &diagnostics).unwrap()
+    }
+
+    /// Two unit squares sharing the edge x = 1 (#802).
+    fn two_squares(path: &Path) {
+        use geo::polygon;
+        let a = polygon![(x: 0., y: 0.), (x: 1., y: 0.), (x: 1., y: 1.), (x: 0., y: 1.)];
+        let b = polygon![(x: 1., y: 0.), (x: 2., y: 0.), (x: 2., y: 1.), (x: 1., y: 1.)];
+        let geoms = [Some(Geometry::Polygon(a)), Some(Geometry::Polygon(b))];
+        write_input_with_f64(path, &geoms, "rank", &[1.0, 2.0]);
+    }
+
+    /// #802: pass 1 collects the junction pins only when polygons simplify.
+    #[test]
+    fn pass1_collects_junctions_only_when_polygons_simplify() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        two_squares(file.path());
+        let pins = |options: ConvertOptions| {
+            run_pass1_for_test(file.path(), &options, 1)
+                .junctions
+                .keys()
+                .len()
+        };
+        let mut pinned = ConvertOptions::default();
+        pinned.simplify.shared_nodes = true;
+        assert!(pins(pinned.clone()) > 0);
+        assert_eq!(pins(ConvertOptions::default()), 0, "off by default");
+        let partitioning = ConvertOptions {
+            mode: Mode::Partitioning,
+            ..pinned.clone()
+        };
+        assert_eq!(pins(partitioning), 0);
+        let mut unsimplified = pinned;
+        unsimplified.simplify.factor = 0.0;
+        assert_eq!(pins(unsimplified), 0);
+    }
+
+    /// #802: past the scan budget the pins are dropped with a typed warning,
+    /// once, and the scan itself goes on. One row per batch, so the batches
+    /// after the first find collection off.
+    #[test]
+    fn junction_pins_fall_back_under_a_tiny_budget() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        two_squares(file.path());
+        let source = ConvertSource::resolve_path(file.path()).unwrap();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let mut options = ConvertOptions {
+            read_batch_size: 1,
+            ..Default::default()
+        };
+        options.simplify.shared_nodes = true;
+        let mut pre = preflight(&source, &options, &diagnostics, None).unwrap();
+        let roomy = scan_fixture(&source, &pre, 1, &diagnostics).unwrap();
+        // Room for the feature table, not for one batch of occurrences.
+        pre.budget = MemoryBudget::with_available(Some(roomy.features.allocated_bytes()));
+        let scan = scan_fixture(&source, &pre, 1, &diagnostics).unwrap();
+        assert_eq!(scan.features.len(), 2);
+        assert!(scan.junctions.keys().is_empty());
+        let unpinned = crate::diagnostics::Diagnostic::SharedBordersUnpinned { count: 1 };
+        assert_eq!(diagnostics.count(&unpinned), 1);
+        assert!(diagnostics.snapshot_for_plan().contains(&unpinned));
     }
 
     #[test]
@@ -9474,8 +9622,9 @@ mod tests {
             scan: p(2),
             keys: p(3),
             assemble: p(4),
+            junctions: p(5),
         };
-        assert_eq!(pass1.core_secs(), p(5) - 1.0);
+        assert_eq!(pass1.core_secs(), p(6) - 1.0);
         let pass2 = Pass2StageSecs {
             read: p(0),
             decode: p(1),
@@ -10336,6 +10485,7 @@ mod tests {
             coalesce_table: None,
             cascade_chain: &[],
             carriers: &[],
+            pins: None,
         };
         let tuning = ReadTuning {
             budget: MemoryBudget::with_available(None),
@@ -11383,6 +11533,7 @@ mod tests {
             features: FeatureTable::new(),
             tally: super::super::convert::BboxTally::default(),
             areas: Vec::new(),
+            junctions: Vec::new(),
             kept_row: vec![false; geoms.len()],
             lines: Vec::new(),
             line_count: 0,
@@ -11493,6 +11644,7 @@ mod tests {
             ScanCollection {
                 collect_lines: collect,
                 want_areas: areas,
+                junctions: false,
             },
             timers,
         )

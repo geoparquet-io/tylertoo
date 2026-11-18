@@ -172,6 +172,9 @@ pub enum Diagnostic {
         machine: Option<u64>,
         limit: u64,
     },
+    /// The shared-border pins outgrew the scan's memory budget (#802).
+    #[non_exhaustive]
+    SharedBordersUnpinned { count: usize },
     #[non_exhaustive]
     PyramidSharedTiles { count: usize },
     #[non_exhaustive]
@@ -299,6 +302,7 @@ macro_rules! event_count {
             | Self::Advisory { count, .. }
             | Self::DiskShortage { count, .. }
             | Self::SavedPlan { count, .. }
+            | Self::SharedBordersUnpinned { count }
             | Self::PyramidSharedTiles { count }
             | Self::PyramidSkippedTiles { count }
             | Self::PyramidMissingBounds { count }
@@ -482,6 +486,7 @@ impl fmt::Display for Diagnostic {
             }
             Self::Advisory {message,..} | Self::DiskShortage {message,..} => f.write_str(message),
             Self::MemoryBudget {machine,limit,..} => write!(f, "memory budget from cgroup limit: {limit} bytes (machine available: {machine:?} bytes)"),
+            Self::SharedBordersUnpinned {..} => f.write_str("the shared-border pins outgrew the memory budget and were dropped: each polygon simplifies on its own, so neighbours may show slivers along their shared borders. Run on a machine with more memory, or pass --simplify-factor 0.25 to narrow the slivers (#802)"),
             Self::PyramidSharedTiles {..} => write!(f, "{n} tile(s) shared across bands; counted once in the merged archive"),
             Self::PyramidSkippedTiles {..} => write!(f, "{n} tile(s) outside their band's declared zoom range skipped"),
             Self::PyramidMissingBounds {..} => write!(f, "{n} band archive(s) carried no usable bounds"),

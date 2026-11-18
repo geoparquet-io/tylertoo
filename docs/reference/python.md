@@ -39,6 +39,7 @@ overview(
     collapse: bool = False,
     collapse_square: bool = False,
     no_collapse: bool = False,
+    no_simplification_of_shared_nodes: bool = False,
     representation: str | None = None,
     cascade: bool = True,
     point_thinning: float | None = None,
@@ -112,6 +113,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `collapse`: Represent small polygons as points instead of the default placeholder squares.
 * `collapse_square`: Represent small polygons as placeholder squares. Squares are the default except with an entry-zoom ladder, which uses points unless you set this option.
 * `no_collapse`: Drop small polygons instead of using placeholders. This was the default before #745. Output is smaller, but polygon coverages have holes at coarse zooms.
+* `no_simplification_of_shared_nodes`: Set `True` to keep junction pins and simplify shared polygon borders identically in duplicating mode with `simplify_factor` above 0. Defaults to `False`.
 * `representation`: Geometry kind per zoom band, such as `"0-7:point,8-14:geom"`.
 * `cascade`: Speed up simplification by deriving each level from the next finer one.
 * `point_thinning`: Point grid cell size in GSDs, or `None` for 4 (16 with `cluster`, 0 with `verbatim`).
@@ -210,6 +212,7 @@ export_pmtiles(
     size_valve: Literal['merge', 'drop'] = "merge",
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     max_zoom_simplify_factor: float | None = None,
+    no_simplification_of_shared_nodes: bool = False,
     coverage_fill: bool = False,
     variable_depth: bool = False,
     tile_range: str | None = None,
@@ -246,6 +249,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes. If still over, drop unmerged features, halve the tile extent to 512, then drop whole features if needed. Merged features are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and `0` or `None` is no limit.
 * `max_zoom_simplify_factor`: Simplify each feature of the finest (canonical) level once, before clipping, with tolerance factor × GSD at that level's zoom, like `simplify_factor` for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Only vertices are removed: features, individual MultiLineString or MultiPolygon parts, and polygon rings (including holes) that would collapse or be dropped under the tolerance keep their original geometry. Defaults to `None`: lines use factor 0.25 and polygons are not simplified. An explicit factor applies to both; `0` disables it. Explicit `None` selects the command's default, like `"auto"` for size caps: no max-zoom simplification under verbatim or for pyramid bands, and 0.25 for both kinds under the tippecanoe preset. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Comparable to tippecanoe's `-S`, which uses tile units at every zoom: `-S 10` is about factor 2.5.
+* `no_simplification_of_shared_nodes`: Set `True` to rebuild and keep shared-border pins at the finest zoom. Acts only when you set `max_zoom_simplify_factor` above 0 or use `preset="tippecanoe"`, which sets it to 0.25. Defaults to `False`.
 * `coverage_fill`: Experimental: under each tile's features, draw the area its child tiles cover, so a polygon coverage shows no holes at coarse zooms. Holds the finest level's geometry in memory. See `docs/OVERVIEW_TUNING.md`.
 * `variable_depth`: End each branch of the tile pyramid at the coarsest zoom whose tile holds all of that area's finest-level features within both size caps, like tippecanoe's `--generate-variable-depth-tile-pyramid`. The server must serve the nearest ancestor for a missing tile. See `docs/OVERVIEW_TUNING.md`.
 * `tile_range`: Export only the tiles in this tile-id range, `"LO..HI"`: one shard of a sharded build.
@@ -587,6 +591,7 @@ convert(
     collapse: bool = False,
     collapse_square: bool = False,
     no_collapse: bool = False,
+    no_simplification_of_shared_nodes: bool = False,
     representation: str | None = None,
     cascade: bool = True,
     point_thinning: float | None = None,
@@ -675,6 +680,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `collapse`: See `overview()`.
 * `collapse_square`: See `overview()`.
 * `no_collapse`: See `overview()`.
+* `no_simplification_of_shared_nodes`: See `overview()`. `convert()` also keeps the pins at the finest zoom when `max_zoom_simplify_factor` simplifies polygons.
 * `representation`: See `overview()`.
 * `cascade`: See `overview()`.
 * `point_thinning`: See `overview()`.

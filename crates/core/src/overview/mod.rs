@@ -25,6 +25,7 @@ pub mod export;
 pub mod filter;
 #[cfg(test)]
 mod hostile;
+mod junction;
 pub mod ladder;
 pub mod layer_column;
 pub mod level;

@@ -126,6 +126,7 @@ use super::{
         human_bytes, resolve_pass_read_workers, skip_memory_preflight_from_env, ConvertError,
         READ_WORKERS_AUTO, SKIP_MEMORY_PREFLIGHT_ENV,
     },
+    junction::{self, JunctionNodes},
     level::{zoom_for_gsd, Crs, MemoryProfile, Mode, OverviewsMeta},
     memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis},
     pipe::scoped_pipe,
@@ -484,6 +485,22 @@ pub struct ExportOptions {
     )]
     #[cfg_attr(feature = "cli", arg(help = "Simplify each finest-level (canonical) line and polygon once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Only vertices are removed: features, parts and rings smaller than the tolerance keep their own geometry. Leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Unset, lines get 0.25 and polygons are not simplified, since each polygon is simplified on its own and shared borders would part; `0` simplifies nothing, as `tiles --verbatim` and `pyramid` bands do. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 1 is about factor 0.25", long_help = None))]
     pub max_zoom_simplify_factor: Option<f64>,
+    /// Shared-border pins at the finest level (#802, default **off**): when
+    /// [`Self::max_zoom_simplify_factor`] simplifies polygons, rebuild the
+    /// level's junction pins and keep them, as
+    /// [`SimplifyOptions::shared_nodes`](crate::overview::simplify::SimplifyOptions::shared_nodes)
+    /// does for coarser levels. `tiles` sets it from that option.
+    #[serde(rename = "no_simplification_of_shared_nodes")]
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long = "no-simplification-of-shared-nodes",
+            help_heading = "Generalization"
+        )
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "With --max-zoom-simplify-factor, keep the vertices where shared polygon borders meet, end, or branch at the finest level, and simplify every shared stretch between them the same way in each polygon. Like tippecanoe's -pn", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "export_only"))]
+    pub shared_nodes: bool,
     /// Number of partitions processed per band read (the export concurrency
     /// knob). Default [`PARTITION_WAVE_AUTO`], which [`resolve_partition_wave`]
     /// expands at export start via the memory-budget preflight (#303): the
@@ -674,6 +691,7 @@ with_setters!(ExportOptions {
     with_coverage_fill => coverage_fill: bool,
     with_simple_clip_fastpath => simple_clip_fastpath: bool,
     with_max_zoom_simplify_factor => max_zoom_simplify_factor: Option<f64>,
+    with_shared_nodes => shared_nodes: bool,
     with_partition_wave => partition_wave: usize,
     with_feature_order => feature_order: FeatureOrder,
     with_min_zoom => min_zoom: Option<u8>,
@@ -702,6 +720,7 @@ impl Default for ExportOptions {
             variable_depth: false,
             simple_clip_fastpath: true,
             max_zoom_simplify_factor: None,
+            shared_nodes: false,
             partition_wave: PARTITION_WAVE_AUTO,
             feature_order: FeatureOrder::default(),
             min_zoom: None,
@@ -2768,6 +2787,20 @@ fn export_pmtiles_validated(
     // out-of-range tile is never planned, so it is never clipped, encoded,
     // hashed or read for.
     restrict_scans_to_range(&mut scans, &level_zooms, options);
+    let pins = finest_level_pins(
+        (
+            &reader,
+            BandRead {
+                source: reader.source(),
+                budget: *budget,
+                profile: options.profile,
+            },
+        ),
+        crs,
+        options,
+        budget,
+        diagnostics,
+    )?;
     // #803: rule A′'s blocked tiles, once every band is counted.
     let vd_plan = vd_scan.map(|vd| vd.finish(&scans, options));
 
@@ -2915,6 +2948,7 @@ fn export_pmtiles_validated(
                 published: &published,
                 feature_id: feature_id.as_ref(),
                 timers: &progress.profile.timers,
+                pins: pins.as_ref(),
             },
             StoreBacking {
                 backing,
@@ -2999,6 +3033,7 @@ fn export_pmtiles_validated(
         terminals: &[],
         level_read,
         member_bytes,
+        pins: pins.as_ref(),
         #[cfg(test)]
         work: &work,
     };
@@ -3055,6 +3090,7 @@ fn export_pmtiles_validated(
                         options,
                         budget: &partition_budget,
                         timers: &probe_timers,
+                        pins: pins.as_ref(),
                     },
                     planned: (&levels, level_groups, gate),
                     rest,
@@ -3665,6 +3701,8 @@ struct ExportLevelCtx<'a> {
     /// Resident bytes of one member, the price a level group's cap is sized
     /// at ([`queued_members`]), when known.
     member_bytes: Option<u64>,
+    /// #802: the finest level's junction pins ([`finest_level_pins`]).
+    pins: Option<&'a JunctionNodes>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -3689,6 +3727,7 @@ impl<'a> ExportLevelCtx<'a> {
                 .options
                 .variable_depth
                 .then_some(&self.scan.tile_counts),
+            pins: self.pins,
             #[cfg(test)]
             work: self.work,
         }
@@ -5141,6 +5180,8 @@ struct LevelCtx<'a> {
     /// a stopped tile, whose members must not be drawn again. `None` draws
     /// every tile in the range, which then holds only planned tiles.
     tiles: Option<&'a BTreeMap<u64, usize>>,
+    /// #802: the finest level's junction pins ([`finest_level_pins`]).
+    pins: Option<&'a JunctionNodes>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -5163,6 +5204,8 @@ struct FanoutCtx<'a> {
     feature_id: Option<&'a ResolvedFeatureId>,
     /// Profiling stage timers (#535); diagnostics only.
     timers: &'a ExportTimers,
+    /// #802: the finest level's junction pins ([`finest_level_pins`]).
+    pins: Option<&'a JunctionNodes>,
 }
 
 /// One level's precomputed pass-2 plan: its Web Mercator zoom, its planned
@@ -6157,7 +6200,7 @@ fn fanout_batch_members(
     let mut routed = t_route.elapsed();
     for &k in &targets {
         let plan = &plans[k];
-        let finest = (k + 1 == plans.len()).then_some(plan.zoom);
+        let finest = (k + 1 == plans.len()).then_some((plan.zoom, ctx.pins));
         let clipped: RowMembers = geoms
             .par_iter()
             .map(|g| {
@@ -7641,9 +7684,66 @@ fn decode_geometry_chunk(
         .collect())
 }
 
+/// The finest level's zoom and junction pins (#802), at which
+/// [`finest_zoom_geometry`] thins; `None` at every other level.
+type Finest<'p> = Option<(u8, Option<&'p JunctionNodes>)>;
+
+/// #802: the junction pins of the finest level's polygons, which
+/// [`finest_zoom_geometry`] keeps so that neighbours thin a shared border
+/// alike. Convert's pins key the source's coordinates, which export may see
+/// reprojected, so they are rebuilt here from the level itself. `None`
+/// unless max-zoom simplification thins polygons, or when the pins outgrow
+/// the budget (which records [`Diagnostic::SharedBordersUnpinned`]); the
+/// pins are then charged to the budget.
+///
+/// [`Diagnostic::SharedBordersUnpinned`]: crate::diagnostics::Diagnostic::SharedBordersUnpinned
+fn finest_level_pins(
+    (reader, band): (&OverviewReader, BandRead<'_>),
+    crs: Crs,
+    opts: &ExportOptions,
+    budget: &mut MemoryBudget,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<Option<JunctionNodes>, ExportError> {
+    let (Some(geometry), true) = (
+        reader.resolved_schema().geometry_index(),
+        opts.shared_nodes && opts.max_zoom_simplify_factor.is_some_and(|f| f > 0.0),
+    ) else {
+        return Ok(None);
+    };
+    let selected = reader.row_groups_for_level(reader.num_levels() - 1)?;
+    let timers = ExportTimers::default();
+    let (mut occ, mut fits) = (Vec::new(), true);
+    read_overview(
+        band,
+        selected,
+        Some(&[geometry]),
+        ReadPass::Scan,
+        BAND_READ_AHEAD_BATCHES,
+        |batch, _| {
+            let geoms =
+                decode_batch_geometries(&batch, &batch.schema(), 0, crs, &timers, diagnostics)?;
+            let mut chunks = junction::occurrences_of(&geoms);
+            let fit = |bytes| budget.require(MemoryPhase::ExportCollect, bytes).is_ok();
+            fits = junction::absorb(&mut occ, &mut chunks, fit, diagnostics);
+            Ok(if fits {
+                ReadFlow::Continue
+            } else {
+                ReadFlow::Stop
+            })
+        },
+    )?;
+    let pins = fits
+        .then(|| JunctionNodes::from_occurrences(occ))
+        .filter(|p| !p.keys().is_empty());
+    if let Some(p) = &pins {
+        budget.reserve_up_to(MemoryPhase::ExportCollect, p.resident_bytes());
+    }
+    Ok(pins)
+}
+
 /// A feature of the finest level, simplified by
 /// [`ExportOptions::max_zoom_simplify_factor`] (#814): `factor × gsd(z)` at
-/// that level's zoom `finest_zoom`, the tolerance `--simplify-factor` gives
+/// that level's zoom (`finest`), the tolerance `--simplify-factor` gives
 /// every coarser level. Unset, only lines are simplified, at
 /// [`DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR`]. Borrowed unchanged at other
 /// levels (`None`) and at factor 0.
@@ -7655,17 +7755,18 @@ fn decode_geometry_chunk(
 /// before clipping, so neighbouring tiles agree at their seam. It only
 /// removes vertices: a feature, part or ring under the tolerance keeps its
 /// own geometry rather than being dropped, and a polygon with no valid
-/// candidate keeps its own (no repair).
+/// candidate keeps its own (no repair), or, under pins, the candidate, which
+/// the tile-space repair resolves.
 /// Coarser levels keep `simplify_for_level`'s rules.
 ///
 /// DIVERGENCE FROM TIPPECANOE: tippecanoe's default `-S 1` simplifies
-/// polygons at the max zoom too. The default here leaves them alone, since
-/// each polygon is simplified on its own and shared borders part into
-/// slivers (#802); `--max-zoom-simplify-factor 0.25` or `--preset
-/// tippecanoe` simplifies both.
+/// polygons at the max zoom too. The default here leaves them alone, so
+/// the finest zoom draws the source as is; `--max-zoom-simplify-factor 0.25`
+/// or `--preset tippecanoe` simplifies both, polygons cut at `finest`'s
+/// junction pins ([`finest_level_pins`], #802).
 fn finest_zoom_geometry<'g>(
     geom: &'g Geometry<f64>,
-    finest_zoom: Option<u8>,
+    finest: Finest<'_>,
     opts: &ExportOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> std::borrow::Cow<'g, Geometry<f64>> {
@@ -7678,7 +7779,7 @@ fn finest_zoom_geometry<'g>(
         None if line => DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR,
         None => 0.0,
     };
-    let Some(zoom) = finest_zoom.filter(|_| factor > 0.0) else {
+    let Some((zoom, pins)) = finest.filter(|_| factor > 0.0) else {
         return std::borrow::Cow::Borrowed(geom);
     };
     // Export geometry is lon/lat whatever the file's CRS (`decode_geometry_chunk`).
@@ -7687,7 +7788,7 @@ fn finest_zoom_geometry<'g>(
     // ring under the tolerance keeps its own geometry, as a whole feature
     // does, since at the finest level it can still span tile units.
     let line = |ls| simplify_line_vertices_only(ls, tol);
-    let polygon = |p| simplify_polygon_vertices_only(p, tol, diagnostics);
+    let polygon = |p| simplify_polygon_vertices_only(p, tol, pins, diagnostics);
     let out = match geom {
         Geometry::LineString(ls) => Geometry::LineString(line(ls)),
         Geometry::MultiLineString(m) => {
@@ -7758,7 +7859,7 @@ fn clip_group(
     // The canonical level's own zoom, not `ctx.zoom`: a variable-depth probe
     // clips canonical geometry at an ancestor's zoom (#803).
     let finest_zoom = (ctx.level_idx + 1 == ctx.reader.num_levels())
-        .then(|| zoom_for_level(ctx.reader.meta(), ctx.level_idx))
+        .then(|| zoom_for_level(ctx.reader.meta(), ctx.level_idx).map(|z| (z, ctx.pins)))
         .transpose()?;
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
     // range. #535: `clip` is timed per geometry inside the closure.
@@ -8166,7 +8267,7 @@ enum MemberSource<'a> {
 /// no coordinate heap, so its tiles hold it inline.
 fn shared_tile_members(
     source: MemberSource<'_>,
-    finest: Option<u8>,
+    finest: Finest<'_>,
     zoom: u8,
     opts: &ExportOptions,
     (key_lo, key_hi): (u64, u64),
@@ -9734,6 +9835,9 @@ struct OpenedJointSource<'a> {
     columns: ResolvedColumns,
     crs: Crs,
     zooms: Vec<u8>,
+    /// #802: the finest level's pins, as the source export built them, so a
+    /// refitted max-zoom tile keeps the borders its source export kept.
+    pins: Option<JunctionNodes>,
 }
 
 impl<'a> JoinedTileFitter<'a> {
@@ -9805,12 +9909,20 @@ impl<'a> JoinedTileFitter<'a> {
                 };
                 let columns = resolve_export_columns((&reader, band), &source.options, &zooms)?;
                 let crs = crs_from_descriptor(reader.resolved_schema(), &source.path, replay)?;
+                let pins = finest_level_pins(
+                    (&reader, band),
+                    crs,
+                    &source.options,
+                    &mut export_budget(),
+                    replay,
+                )?;
                 Ok(OpenedJointSource {
                     source,
                     reader,
                     columns,
                     crs,
                     zooms,
+                    pins,
                 })
             })
             .collect::<Result<Vec<_>, ExportError>>()?;
@@ -9862,6 +9974,7 @@ impl<'a> JoinedTileFitter<'a> {
                 columns,
                 crs,
                 zooms,
+                pins,
             } in &self.sources
             {
                 if zoom < source.min_zoom || zoom > source.max_zoom {
@@ -9887,6 +10000,7 @@ impl<'a> JoinedTileFitter<'a> {
                     timers: &timers,
                     fills: None,
                     tiles: Some(&tile_counts),
+                    pins: pins.as_ref(),
                     #[cfg(test)]
                     work: &Mutex::new(ExportWorkTally::default()),
                 };
@@ -19987,13 +20101,13 @@ mod tests {
             assert_eq!(out.interiors(), std::slice::from_ref(&hole));
         };
         let single = Geometry::Polygon(poly.clone());
-        let out = finest_zoom_geometry(&single, Some(14), &explicit, &diagnostics);
+        let out = finest_zoom_geometry(&single, Some((14, None)), &explicit, &diagnostics);
         let Geometry::Polygon(p) = out.as_ref() else {
             panic!("{out:?}")
         };
         check(p);
         let multi = Geometry::MultiPolygon(MultiPolygon::new(vec![poly.clone()]));
-        let out = finest_zoom_geometry(&multi, Some(14), &explicit, &diagnostics);
+        let out = finest_zoom_geometry(&multi, Some((14, None)), &explicit, &diagnostics);
         let Geometry::MultiPolygon(m) = out.as_ref() else {
             panic!("{out:?}")
         };
@@ -20035,7 +20149,12 @@ mod tests {
             tiny.clone(),
         ]));
         let diagnostics = crate::diagnostics::Diagnostics::default();
-        let out = finest_zoom_geometry(&lines, Some(14), &ExportOptions::default(), &diagnostics);
+        let out = finest_zoom_geometry(
+            &lines,
+            Some((14, None)),
+            &ExportOptions::default(),
+            &diagnostics,
+        );
         let Geometry::MultiLineString(m) = out.as_ref() else {
             panic!("{out:?}")
         };
@@ -20049,7 +20168,7 @@ mod tests {
             max_zoom_simplify_factor: Some(0.25),
             ..Default::default()
         };
-        let out = finest_zoom_geometry(&polys, Some(14), &explicit, &diagnostics);
+        let out = finest_zoom_geometry(&polys, Some((14, None)), &explicit, &diagnostics);
         let Geometry::MultiPolygon(m) = out.as_ref() else {
             panic!("{out:?}")
         };
@@ -20078,7 +20197,7 @@ mod tests {
         let poly = Geometry::Polygon(geo::Polygon::new(LineString::from(ring), vec![]));
         let diagnostics = crate::diagnostics::Diagnostics::default();
         let kept = |g: &Geometry<f64>, opts: &ExportOptions| {
-            let out = finest_zoom_geometry(g, Some(14), opts, &diagnostics);
+            let out = finest_zoom_geometry(g, Some((14, None)), opts, &diagnostics);
             out.coords_count() == g.coords_count()
         };
         let with = |f| ExportOptions {
@@ -20088,8 +20207,13 @@ mod tests {
         assert!(!kept(&line, &ExportOptions::default()), "default line");
         assert!(kept(&poly, &ExportOptions::default()), "default polygon");
         assert_eq!(
-            finest_zoom_geometry(&line, Some(14), &ExportOptions::default(), &diagnostics),
-            finest_zoom_geometry(&line, Some(14), &with(Some(0.25)), &diagnostics),
+            finest_zoom_geometry(
+                &line,
+                Some((14, None)),
+                &ExportOptions::default(),
+                &diagnostics
+            ),
+            finest_zoom_geometry(&line, Some((14, None)), &with(Some(0.25)), &diagnostics),
             "the default line factor is 0.25"
         );
         assert!(!kept(&line, &with(Some(0.25))) && !kept(&poly, &with(Some(0.25))));
@@ -20265,6 +20389,48 @@ mod tests {
             1,
             "price the original overview members collected by the retry"
         );
+    }
+
+    #[test]
+    fn joined_refit_keeps_the_source_exports_shared_border_pins() {
+        // Two squares sharing a jagged border: its inner vertices are pins.
+        let border = [(1.0, 0.0), (1.1, 0.25), (0.9, 0.5), (1.1, 0.75), (1.0, 1.0)];
+        let left: Vec<_> = [(0.0, 0.0)]
+            .into_iter()
+            .chain(border)
+            .chain([(0.0, 1.0), (0.0, 0.0)])
+            .collect();
+        let right: Vec<_> = border
+            .into_iter()
+            .chain([(2.0, 1.0), (2.0, 0.0), (1.0, 0.0)])
+            .collect();
+        let squares: Vec<Geometry<f64>> = [left, right]
+            .into_iter()
+            .map(|ring| Geometry::Polygon(geo::Polygon::new(geo::LineString::from(ring), vec![])))
+            .collect();
+        let input = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(input.path(), &[(vec![0; squares.len()], squares)]);
+        let source = |shared_nodes| JointSource {
+            members: JointMembers {
+                tile_counts: BTreeMap::new(),
+                member_bytes: None,
+            },
+            path: input.path().to_path_buf(),
+            options: ExportOptions {
+                max_zoom_simplify_factor: Some(1.0),
+                ..Default::default()
+            }
+            .with_shared_nodes(shared_nodes),
+            min_zoom: 0,
+            max_zoom: 0,
+        };
+        let (on, off) = (source(true), source(false));
+        let fitter = JoinedTileFitter::open([&on, &off]).unwrap();
+        assert!(
+            fitter.sources[0].pins.is_some(),
+            "the flag's pins reach the refit"
+        );
+        assert!(fitter.sources[1].pins.is_none(), "no pins without the flag");
     }
 
     #[test]
@@ -21223,6 +21389,7 @@ mod tests {
                 published: &PublishedNames::from_reader(&reader),
                 feature_id: None,
                 timers: &ExportTimers::default(),
+                pins: None,
             },
             StoreBacking {
                 backing: SinkBacking::Ram,

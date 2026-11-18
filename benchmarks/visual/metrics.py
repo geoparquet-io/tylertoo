@@ -124,8 +124,9 @@ class Source:
         self.rasters: dict = {}
 
 
-def read_source(path: Path, attr: str | None = None, types: tuple | None = None) -> Source:
-    """The parquet's geometries in EPSG:3857, optionally only `types`.
+def iter_source(path: Path, attr: str | None = None, types: tuple | None = None):
+    """The parquet's geometries in EPSG:3857, optionally only `types`, as
+    (geometries, attribute values or None) a batch at a time.
 
     Read with pyarrow and shapely, not geopandas, which refuses a file without
     `geo` metadata (the Madagascar fixture).
@@ -141,12 +142,6 @@ def read_source(path: Path, attr: str | None = None, types: tuple | None = None)
     # shortcut: lon/lat sources only (no crs means OGC:CRS84), add a reprojection when a fixture needs one
     if crs is not None and str(code) not in ("4326", "CRS84"):  # the code may be a number or a string
         raise ValueError(f"{path}: source CRS {code!r} is not known to be lon/lat")
-    table = pq.read_table(path, columns=[col] + ([attr] if attr else []))
-    geoms = shapely.from_wkb(table.column(col).to_numpy(zero_copy_only=False))
-    values = table.column(attr).to_pylist() if attr else None
-    keep = ~shapely.is_missing(geoms)
-    if types:
-        keep &= np.isin(shapely.get_type_id(geoms), [shapely.GeometryType[t.upper()].value for t in types])
 
     def mercator(c):
         x = c[:, 0] * (WORLD / 360)
@@ -155,9 +150,33 @@ def read_source(path: Path, attr: str | None = None, types: tuple | None = None)
         y = np.log(np.tan(np.pi / 4 + np.radians(lat) / 2)) * (WORLD / (2 * np.pi))
         return np.column_stack([x, y])
 
-    geoms = shapely.transform(geoms[keep], mercator)
-    return Source(geoms, [v for v, k in zip(values, keep) if k] if attr else None)
+    for batch in pq.ParquetFile(path).iter_batches(batch_size=65536, columns=[col] + ([attr] if attr else [])):
+        g = shapely.from_wkb(batch.column(col).to_numpy(zero_copy_only=False))
+        keep = ~shapely.is_missing(g)
+        if types:
+            keep &= np.isin(shapely.get_type_id(g), [shapely.GeometryType[t.upper()].value for t in types])
+        vals = [v for v, k in zip(batch.column(attr).to_pylist(), keep) if k] if attr else None
+        yield shapely.transform(g[keep], mercator), vals
 
+
+def read_source(path: Path, attr: str | None = None, types: tuple | None = None,
+                windows: list | None = None) -> Source:
+    """`iter_source` gathered into one `Source`. With `windows` (EPSG:3857
+    (x0, y0, x1, y1) boxes) only the geometries touching one are kept, so
+    scoring a few tiles of a large source stays small (#802: whole-file reads
+    of Moldova took 7.5 GB a process)."""
+    import shapely
+
+    area = shapely.union_all([shapely.box(*w) for w in windows]) if windows else None
+    geoms, values = [], []
+    for g, vals in iter_source(path, attr, types):
+        if area is not None:
+            hit = shapely.intersects(g, area)
+            g = g[hit]
+            vals = [v for v, h in zip(vals, hit) if h] if attr else None
+        geoms.append(g)
+        values += vals or []
+    return Source(np.concatenate(geoms) if geoms else np.array([], dtype=object), values if attr else None)
 
 def sample_tiles(src: Source, z: int, cap: int, seed: int = 869) -> list:
     """Up to `cap` tiles of zoom z that hold source vertices, chosen from the

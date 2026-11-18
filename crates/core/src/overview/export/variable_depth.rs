@@ -835,6 +835,7 @@ pub(super) struct Probe<'a> {
     pub(super) options: &'a ExportOptions,
     pub(super) budget: &'a PartitionBudget,
     pub(super) timers: &'a ExportTimers,
+    pub(super) pins: Option<&'a super::JunctionNodes>,
 }
 
 /// The stopped tiles' keys, per level.
@@ -1035,6 +1036,7 @@ impl ProbeLevel<'_> {
             timers: p.timers,
             fills: None,
             tiles: Some(&self.candidates),
+            pins: p.pins,
             #[cfg(test)]
             work: &self.work,
         };

@@ -81,7 +81,7 @@ attributing a count difference to one default.
 | `--drop-lines` / `--drop-polygons` | `--drop-lines` / `--drop-polygons` | Apply the drop rate to lines and polygons too. Polygons too small to see still become placeholder squares; tippecanoe thins them by the rate first, so its coarse zooms hold fewer features on dense small polygons (see [drop rate](../OVERVIEW_TUNING.md#density-budget-drop-rate-drop-gamma-no-density-drop)) |
 | gamma dot-dropping | `--drop-gamma` | Applied per super-cell; per-level totals stay unchanged |
 | `-S` simplification | `--simplify-factor` | Ramer-Douglas-Peucker (RDP), cascading by default. `-S N` is N tile units; `--simplify-factor N/4` is about the same at z0 to max zoom − 1. At the max zoom, tylertoo defaults to factor 0.25 for lines and no simplification for polygons; `--max-zoom-simplify-factor` overrides both. tippecanoe defaults to `-S 1` for both, unless `-pS` / `--simplify-only-low-zooms` is set |
-| `-pn` / `--no-simplification-of-shared-nodes` | none yet (#450) | Each polygon is simplified on its own, so thin slivers open along shared borders: on dense parcels about 2% of the area at z12 at the default factor. `--simplify-factor 0.25` reaches tippecanoe's coverage; `0` closes the slivers. On Madagascar admin-4 at z4–z8 residual missing coverage with `--coverage-fill` is 0.03–0.05%. See [coverage and simplification](../OVERVIEW_TUNING.md#coverage-and-simplification) |
+| `-pn` / `--no-simplification-of-shared-nodes` | `--no-simplification-of-shared-nodes` | Opt-in in both tools: keeps junction vertices and simplifies shared stretches identically. See [coverage and simplification](../OVERVIEW_TUNING.md#coverage-and-simplification). |
 | tiny-polygon reduction | placeholder squares (the default; `--no-collapse` to drop) | Accumulates area per 32×GSD patch of the level, independent of tiles, with per-feature dithering for write-time collapses. The square is one pixel regardless of `--simplify-factor`. In dense blocks of sub-pixel polygons the squares overlap and leave gaps (#750) |
 | `-M` maximum tile bytes (default 500K) | `--max-compressed-tile-size` (default 500K), with `--max-tile-size` / `--tile-size-limit` (default 2M) | Both cap the gzip-compressed tile at 500K. tylertoo also caps the uncompressed MVT at 2M, which tippecanoe does not. 0 disables either |
 | `--coalesce-densest-as-needed` | `--size-valve merge` (the default) | Merges the densest lines and polygons into the feature kept before them, measuring again until the tile fits. The merged feature keeps its own attributes. Each tile uses its own threshold; tippecanoe raises one threshold for the whole zoom |
@@ -142,11 +142,10 @@ that the error message recommends: `drop`, which matches
 
 Differences the preset does not remove:
 
-- **Shared borders.** tylertoo simplifies each polygon on its own, so
-  slivers open along shared borders. tippecanoe's
-  `--detect-shared-borders` has no tylertoo option yet (#802). The preset sets
-  a factor of 0.25, which matches tippecanoe's coverage on dense parcels; see the
-  `-pn` row above.
+- **Shared borders.** `--preset tippecanoe` leaves
+  `--no-simplification-of-shared-nodes` off, as tippecanoe's defaults do.
+  Pass it to get `-pn` behavior. The preset sets a factor of 0.25, which matches
+  tippecanoe's coverage on dense parcels; see the `-pn` row above.
 - **Line coalescing.** tylertoo joins touching same-class lines before its
   line visibility gate (`--line-visibility`), so short road segments survive
   coarse zooms as one line. tippecanoe coalesces only on request
