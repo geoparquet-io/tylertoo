@@ -361,7 +361,9 @@ tylertoo tiles fields.parquet fields.pmtiles --layer-column year
 - tylertoo reads the input once and splits its rows into one temporary
   GeoParquet file per layer, in the intermediate overview's directory
   (`--spill-dir`, then `$TMPDIR`, then the output's directory). Expect
-  about one input's size of extra disk. Each layer then runs the whole
+  about one input's size of extra disk. When layers share zooms and a size
+  cap is set, their overviews also stay on disk until the merge ends.
+  Each layer then runs the whole
   `tiles` chain with your options, and the layers are merged as pyramid
   bands that share zooms.
 - So each layer has its own ladder: the density budget, thinning and line
@@ -369,8 +371,17 @@ tylertoo tiles fields.parquet fields.pmtiles --layer-column year
   sparse layer is not thinned against a dense one. `--max-zoom auto` is
   estimated once, over the whole input.
 - The size caps (`--max-tile-size`, `--max-compressed-tile-size`) apply to
-  each layer's tiles before they are combined, so a combined tile can be
-  over the cap. tippecanoe caps the combined tile (#838).
+  the combined tile. Each source export first runs its ordinary valve. An
+  oversized join rereads the retained overviews one wave at a time and runs
+  one size valve across all layers. Gaps keep each row group's
+  predecessor. A join with a pre-tiled archive band drops features at merge.
+  A tile that still exceeds a cap is kept with a warning and counted once
+  in the report. Valve counts include the original source exports, joint
+  retries and archive-join drops. Other repeated work in a joint retry is
+  counted only in the original exports. With `--feature-id`, the source
+  losses come from each layer's own export and miss the drops of a joint
+  retry. The run warns when that happens. This also applies to `pyramid` with
+  explicit size caps.
 - At most 64 layers. Each layer is a full convert and export, and a column
   with more values is usually an id, not a category. Route by a coarser
   column, or subset the input with `--filter`.

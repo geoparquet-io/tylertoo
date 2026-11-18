@@ -769,7 +769,7 @@ fn tiles_left_over_the_cap_are_listed_and_the_warning_explains_the_floor() {
         assert_eq!(listed, expected[..10], "{valve}");
         let first = &listed[0];
         let warning = format!(
-            "{} tile(s) still over the size limit after the size valve, written as is; \
+            "{} tile(s) still over the size limit, written as is; \
              largest: z{}/{}/{} ({} B compressed)",
             expected.len(),
             first["z"],

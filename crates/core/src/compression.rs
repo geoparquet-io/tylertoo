@@ -328,6 +328,14 @@ fn compress_gzip(data: &[u8], _: ()) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// An upper bound on [`compress`]'s gzip output for `raw_len` input bytes,
+/// without compressing: libdeflate's own worst case (stored blocks, at most
+/// 5 bytes per block of at least 5000 bytes, plus the 18-byte gzip frame) is
+/// at most `raw_len / 1000 + 23`, below this for every length.
+pub(crate) fn gzip_size_bound(raw_len: usize) -> usize {
+    raw_len + raw_len / 512 + 64
+}
+
 /// Compress data with brotli.
 fn compress_brotli(data: &[u8], _: ()) -> io::Result<Vec<u8>> {
     use brotli::enc::BrotliEncoderParams;
@@ -361,6 +369,36 @@ pub(crate) mod gzip_counter;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gzip_size_bound_covers_libdeflates_worst_case() {
+        use libdeflater::{CompressionLvl, Compressor};
+        let mut compressor = Compressor::new(CompressionLvl::new(6).unwrap());
+        // libdeflate's bound is its documented worst case for any input.
+        let lengths = (0..=64 << 20)
+            .step_by(4999)
+            .chain([1, 4999, 5000, 5001, 64 << 20]);
+        for len in lengths {
+            assert!(
+                compressor.gzip_compress_bound(len) <= gzip_size_bound(len),
+                "{len}"
+            );
+        }
+        // And on real incompressible input, around and past the default caps.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for len in [0, 1, 4999, 5001, 512 << 10, (2 << 20) + 1, 8 << 20] {
+            let noise: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect();
+            let gzip = compress(&noise, Compression::Gzip).unwrap();
+            assert!(gzip.len() <= gzip_size_bound(len), "{len}: {}", gzip.len());
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Compression Enum Tests

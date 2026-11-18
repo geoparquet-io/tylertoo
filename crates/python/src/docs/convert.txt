@@ -36,9 +36,11 @@ Args:
     layer_column: Put each feature in the layer named by its value
         in this column (the CLI's `--layer-column`), and null or
         blank values in `"_unknown"`. The column is not written as
-        a property. Each layer is tiled on its own and the layers
-        are merged, so thinning and the tile size limits apply per
-        layer. Excludes `layer_name`, `keep_overview`, `save_plan`,
+        a property. Thinning uses each layer's own overview.
+        The size caps apply to the joined tile, with one size valve
+        across source layers. Tiles still over a cap are kept with
+        a warning and counted once in the report.
+        Excludes `layer_name`, `keep_overview`, `save_plan`,
         `plan` and `variable_depth`. At most 64 layers.
     bands: The CLI's `--band`, a list of "LO-HI:KIND" strings.
         Ranges are inclusive; use "Z:KIND" for one zoom.
