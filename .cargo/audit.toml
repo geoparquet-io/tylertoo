@@ -11,8 +11,4 @@
 # `decompress_stream` into a Vec) are not used anywhere in the tree.
 # deny.toml has the full rationale. Expires: drop on the arrow/parquet 60
 # bump, and re-check by 2027-01-31 either way.
-ignore = [
-    "RUSTSEC-2026-0391",
-    "RUSTSEC-2026-0398",
-    "RUSTSEC-2026-0403",
-]
+ignore = []
