@@ -29,26 +29,7 @@ yanked = "deny"
 # re-check them by 2027-01-31 either way. Neither cargo-deny nor cargo-audit
 # has an expiry field, so this date is a review date, not an enforced one.
 # Mirrored in .cargo/audit.toml, because cargo-audit does not read this file.
-ignore = [
-    # Stream `with_context` constructors reuse a context without resetting
-    # it. Nothing in the tree calls `with_context`. Parquet's bulk API and
-    # our `encode_all` / `read::Decoder::new` each start on a fresh or
-    # session-reset context.
-    { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 pinned by parquet 59; no caller uses the affected with_context constructors" },
-    # `Seekable::decompress`. The `seekable` feature is off: zstd's enabled
-    # features are arrays, legacy, std and zdict_builder, so the type is not
-    # compiled.
-    { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7 pinned via parquet 59; seekable feature not enabled" },
-    # A failed legacy-frame `DCtx::decompress_stream` extends a `Vec<u8>`
-    # destination over uninitialized memory. Legacy decoding is on by
-    # default, and we decode untrusted tiles and GeoParquet pages. The
-    # affected path is `zstd::stream::write::Decoder`, or `decompress_stream`
-    # into a Vec, and nothing here uses it. Our reader is
-    # `stream::read::Decoder`, which writes into a `&mut [u8]` slice and
-    # returns the error. Parquet uses the bulk API. The advisory lists both
-    # as not affected.
-    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7 pinned via parquet 59; only read::Decoder and bulk APIs are used, which the advisory lists as unaffected" },
-]
+ignore = []
 
 [licenses]
 version = 2
