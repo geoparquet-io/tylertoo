@@ -244,6 +244,20 @@ impl OverviewReader {
         self.metadata.num_row_groups()
     }
 
+    /// Mean uncompressed bytes per row of each top-level column over the
+    /// whole file, from the footer alone (#768 size-valve predictor).
+    pub(crate) fn mean_column_bytes(&self) -> std::collections::HashMap<String, f64> {
+        let mut out = std::collections::HashMap::new();
+        let rows = self.metadata.file_metadata().num_rows().max(1) as f64;
+        for rg in self.metadata.row_groups() {
+            for col in rg.columns() {
+                let root = col.column_path().parts()[0].clone();
+                *out.entry(root).or_insert(0.0) += col.uncompressed_size().max(0) as f64 / rows;
+            }
+        }
+        out
+    }
+
     /// Mean **uncompressed** bytes per row in the finest (highest-index) level's
     /// row-group band, read straight from the Parquet metadata (no scan, no
     /// decode).

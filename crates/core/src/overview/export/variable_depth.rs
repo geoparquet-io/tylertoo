@@ -1691,6 +1691,7 @@ mod tests {
             &vd(),
             &ExportTimers::default(),
             Some(&mut scan),
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();

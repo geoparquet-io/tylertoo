@@ -164,6 +164,7 @@ use crate::{
 
 mod coalesce_valve;
 mod tile_data;
+mod valve_predict;
 mod valve_scope;
 use tile_data::TileData;
 
@@ -2591,7 +2592,11 @@ fn export_pmtiles_validated(
     // SCRATCH PROTOTYPE (#768): see `valve_scope`.
     let scope = valve_scope::scope();
     let (input_path, output_path) = (input_path.as_ref(), output_path.as_ref());
-    if scope != valve_scope::Scope::Tile && config.options().size_valve == SizeValve::Merge {
+    if !matches!(
+        scope,
+        valve_scope::Scope::Tile | valve_scope::Scope::Predict
+    ) && config.options().size_valve == SizeValve::Merge
+    {
         let dir = output_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -2834,6 +2839,9 @@ fn export_pmtiles_validated_inner(
             variable_depth::VdScan::new(&meta, reader.geo_metadata_json(), level_zooms.clone())
         })
         .transpose()?;
+    let mut predict = (valve_scope::scope() == valve_scope::Scope::Predict
+        && valve_merges(options))
+    .then(|| valve_predict::Scan::new(num_levels));
     let mut scans = scan_all_levels(
         &reader,
         BandRead {
@@ -2845,8 +2853,54 @@ fn export_pmtiles_validated_inner(
         options,
         &timers,
         vd_scan.as_mut(),
+        predict.as_mut(),
         diagnostics,
     )?;
+    if let Some(p) = predict {
+        // #768 predict: from the whole scan, before a shard restricts it.
+        let props: Vec<&str> = reader
+            .resolved_schema()
+            .geometry_index()
+            .map(|g| property_columns(reader.schema(), g, &published))
+            .unwrap_or_default()
+            .iter()
+            .map(|&(i, _)| reader.schema().field(i).name().as_str())
+            .filter(|n| options.feature_id.as_deref() != Some(*n))
+            .collect();
+        let member_bytes = valve_predict::member_bytes(&reader.mean_column_bytes(), &props);
+        let need = p.predict(&level_zooms, member_bytes, options);
+        valve_scope::log_needs(&need);
+        if let Ok(path) = std::env::var("TYLERTOO_VALVE_PRED_DUMP") {
+            // SCRATCH (#768): the predicted needs, for the accuracy table.
+            let lines: String = need
+                .iter()
+                .map(|(&(z, x, y), &m)| format!("{z} {x} {y} {m}\n"))
+                .collect();
+            std::fs::write(path, lines)?;
+        }
+        let mut floors = valve_scope::smooth_floors(&need, valve_scope::smooth_factor(), false);
+        // SCRATCH knob: start an over tile at this share of its own predicted
+        // need (0: from its neighbours' floors only).
+        let own: f64 = std::env::var("TYLERTOO_VALVE_SELF")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        if own > 0.0 {
+            for (&k, &m) in &need {
+                let f = floors.entry(k).or_insert(0);
+                *f = (*f).max((m as f64 * own) as u64);
+            }
+        }
+        log::info!(
+            "[valve-scope] predict: {member_bytes:.0} bytes a member, {} tiles predicted over, {} floors, scan {:.2}s (gap walk {:.2}s, sizing {:.2}s)",
+            need.len(),
+            floors.len(),
+            t_scan.elapsed().as_secs_f64(),
+            p.walk.as_secs_f64(),
+            p.sized.as_secs_f64(),
+        );
+        valve_scope::set_floors(HashMap::new(), floors, HashMap::new());
+    }
 
     // #498: a sharded build's export owns a slice of the tile space, not all
     // of it. Restricting the SCAN — the per-zoom tile-count map every
@@ -6428,6 +6482,10 @@ fn encode_buckets(
 /// a non-finite bound) abandons that pass and rescans from the geometry, so
 /// such a file scans exactly as before; a file with no usable covering scans
 /// from the geometry from the start.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "#768 prototype: the predictor rides along like variable depth"
+)]
 fn scan_all_levels(
     reader: &OverviewReader,
     band: BandRead<'_>,
@@ -6435,6 +6493,7 @@ fn scan_all_levels(
     opts: &ExportOptions,
     timers: &ExportTimers,
     mut vd: Option<&mut variable_depth::VdScan>,
+    mut predict: Option<&mut valve_predict::Scan>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<LevelScan>, ExportError> {
     let t_scan = Instant::now();
@@ -6455,6 +6514,7 @@ fn scan_all_levels(
             timers,
             &source,
             vd.as_deref_mut(),
+            predict.as_deref_mut(),
             diagnostics,
         )? {
             return Ok(done(scans, "bbox covering"));
@@ -6466,6 +6526,9 @@ fn scan_all_levels(
         if let Some(vd) = vd.as_deref_mut() {
             vd.reset();
         }
+        if let Some(p) = predict.as_deref_mut() {
+            p.reset();
+        }
     }
     let scans = scan_all_levels_from(
         (reader, band),
@@ -6474,6 +6537,7 @@ fn scan_all_levels(
         timers,
         &ScanBboxSource::Geometry,
         vd,
+        predict,
         diagnostics,
     )?
     .expect("a geometry scan never abandons its pass");
@@ -6518,6 +6582,11 @@ impl ScanBboxSource {
 /// [`scan_all_levels`] from one bbox source. `Ok(None)` only from
 /// [`ScanBboxSource::Covering`], when a covering row has no exact bbox
 /// ([`covering_batch_bboxes`]) and the pass is abandoned.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "#768 prototype: the predictor rides along like variable depth"
+)]
 fn scan_all_levels_from(
     (reader, band): (&OverviewReader, BandRead<'_>),
     crs: Crs,
@@ -6525,6 +6594,7 @@ fn scan_all_levels_from(
     timers: &ExportTimers,
     source: &ScanBboxSource,
     mut vd: Option<&mut variable_depth::VdScan>,
+    predict: Option<&mut valve_predict::Scan>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<Vec<LevelScan>>, ExportError> {
     let num_levels = reader.num_levels();
@@ -6590,141 +6660,192 @@ fn scan_all_levels_from(
     let mut readers = 0;
     #[cfg(test)]
     let readers_ref = &mut readers;
-    // PERF (#817): each band is read by the ordered parallel reader, in
-    // the same batches one reader makes; `bounded` keeps the one reader.
-    scoped_pipe(
-        WAVE_READ_IN_FLIGHT,
-        |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
-            send_bands(
-                (reader, band),
-                roots.as_deref(),
-                ReadPass::Scan,
-                |read| add_nanos(&timers.scan_read, read),
-                tx,
-                #[cfg(test)]
-                readers_ref,
-            )
-        },
-        |rx: Receiver<(usize, RecordBatch)>| -> Result<(), ExportError> {
-            // PERF (#817): one band's bboxes are sized a pool's worth at a
-            // time, into each target level at once; one 8,192-row batch at a
-            // time, level after level, kept the consumer to about one core.
-            // Counts, unions and feature counts are sums and min/max, so the
-            // scans are identical however rows are grouped.
-            // `bounded` sizes batch by batch: a pool's worth at once is
-            // outside its scan's memory envelope.
-            let size_rows = match band.profile {
-                MemoryProfile::Bounded => EXPORT_BATCH_SIZE,
-                MemoryProfile::Auto | MemoryProfile::Speed => {
-                    SIZE_BBOXES_MIN_ROWS.saturating_mul(rayon::current_num_threads())
+    // #768 predict: the gap walk and sizing run on their own thread, off
+    // the scan's consumer, fed each batch's row-aligned bboxes in order.
+    let (pred_tx, pred_rx) = crossbeam_channel::bounded::<(usize, Vec<Option<TileBounds>>)>(8);
+    let pred_tx = predict.is_some().then_some(pred_tx);
+    std::thread::scope(|scope| -> Result<(), ExportError> {
+        let worker = predict.map(|p| {
+            scope.spawn(move || {
+                for (j, rows) in pred_rx {
+                    let last = if partitioning { num_levels - 1 } else { j };
+                    p.batch(
+                        j,
+                        || {
+                            reader
+                                .band(j)
+                                .map(|rgs| reader.row_group_bands(&rgs))
+                                .unwrap_or_default()
+                        },
+                        &rows,
+                        j..=last,
+                        zooms_ref,
+                        opts,
+                    );
                 }
-            };
-            let mut pending: Vec<Option<TileBounds>> = Vec::with_capacity(size_rows);
-            let mut pending_band = 0;
-            let mut size_pending = |j: usize, pending: &mut Vec<Option<TileBounds>>| {
-                if pending.is_empty() {
-                    return;
-                }
-                #[cfg(test)]
-                SCAN_SIZE_FLUSHES.with(|n| n.set(n.get() + 1));
-                // Bands accumulate into finer levels' render sets only in
-                // partitioning mode; duplicating bands are self-contained, so
-                // band `j` feeds level `j` alone.
-                let last = if partitioning { num_levels - 1 } else { j };
-                ExportTimers::time(&timers.scan_size, || {
-                    scans_ref[j..=last]
-                        .par_iter_mut()
-                        .zip(&zooms_ref[j..=last])
-                        .for_each(|(scan, &zoom)| {
-                            scan.feature_count += pending.len();
-                            let (bounds, counts) = size_bboxes(pending, zoom, opts);
-                            if let Some(b) = bounds {
-                                match &mut scan.bounds {
-                                    Some(acc) => acc.expand(&b),
-                                    None => scan.bounds = Some(b),
-                                }
-                            }
-                            for (key, v) in counts {
-                                *scan.tile_counts.entry(key).or_insert(0) += v;
-                            }
-                        });
-                });
-                pending.clear();
-            };
-            for (j, batch) in rx.iter() {
-                // Read + (for 3857) reproject each feature's bbox once per
-                // band; sizing the same bbox into every target level below is
-                // bit-identical to reprojecting it once per level, since
-                // reprojection is a pure fn.
-                let bboxes = ExportTimers::time(&timers.scan_decode, || match source {
-                    ScanBboxSource::Covering { column, names } => {
-                        covering_batch_bboxes(&batch, column, names, crs)
+                p.flush(zooms_ref, opts);
+            })
+        });
+        let pred_tx_ref = &pred_tx;
+        // PERF (#817): each band is read by the ordered parallel reader, in
+        // the same batches one reader makes; `bounded` keeps the one reader.
+        let piped = scoped_pipe(
+            WAVE_READ_IN_FLIGHT,
+            |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
+                send_bands(
+                    (reader, band),
+                    roots.as_deref(),
+                    ReadPass::Scan,
+                    |read| add_nanos(&timers.scan_read, read),
+                    tx,
+                    #[cfg(test)]
+                    readers_ref,
+                )
+            },
+            |rx: Receiver<(usize, RecordBatch)>| -> Result<(), ExportError> {
+                // PERF (#817): one band's bboxes are sized a pool's worth at a
+                // time, into each target level at once; one 8,192-row batch at a
+                // time, level after level, kept the consumer to about one core.
+                // Counts, unions and feature counts are sums and min/max, so the
+                // scans are identical however rows are grouped.
+                // `bounded` sizes batch by batch: a pool's worth at once is
+                // outside its scan's memory envelope.
+                let size_rows = match band.profile {
+                    MemoryProfile::Bounded => EXPORT_BATCH_SIZE,
+                    MemoryProfile::Auto | MemoryProfile::Speed => {
+                        SIZE_BBOXES_MIN_ROWS.saturating_mul(rayon::current_num_threads())
                     }
-                    ScanBboxSource::Geometry => {
-                        decode_batch_bboxes(&batch, geometry, crs, diagnostics).map(Some)
-                    }
-                })?;
-                let Some(bboxes) = bboxes else {
-                    // Dropping the receiver stops the producer cleanly.
-                    *abandoned_ref = true;
-                    return Ok(());
                 };
-                if let Some(vd) = vd.as_deref_mut() {
-                    let geometries = || -> Result<Vec<Option<Geometry<f64>>>, ExportError> {
-                        let geom_idx = batch_geometry_index(&batch, geometry)?;
-                        let field = batch.schema().field(geom_idx).clone();
-                        let garr = from_arrow_array(batch.column(geom_idx).as_ref(), &field)
-                            .map_err(|e| {
-                                crate::GeoParquetReadError::decode("geometry decode", e)
-                            })?;
-                        let mut out = Vec::with_capacity(batch.num_rows());
-                        // Quiet: without variable depth the scan counts these
-                        // rows' decode warnings only in its own bbox decode.
-                        crate::batch_processor::extract_geometries_opt_from_array(
-                            garr.as_ref(),
-                            &mut out,
-                            &crate::diagnostics::Diagnostics::silent(),
-                        )?;
-                        Ok(out)
-                    };
-                    let aligned = || -> Result<Vec<Option<TileBounds>>, ExportError> {
-                        match source {
-                            ScanBboxSource::Covering { column, names } => {
-                                covering_row_bboxes(&batch, column, names, crs)
-                            }
-                            ScanBboxSource::Geometry => Ok(geometries()?
-                                .iter()
-                                .map(|g| g.as_ref().and_then(|g| geometry_lnglat_bbox(g, crs)))
-                                .collect()),
-                        }
-                    };
+                let mut pending: Vec<Option<TileBounds>> = Vec::with_capacity(size_rows);
+                let mut pending_band = 0;
+                let mut size_pending = |j: usize, pending: &mut Vec<Option<TileBounds>>| {
+                    if pending.is_empty() {
+                        return;
+                    }
+                    #[cfg(test)]
+                    SCAN_SIZE_FLUSHES.with(|n| n.set(n.get() + 1));
+                    // Bands accumulate into finer levels' render sets only in
+                    // partitioning mode; duplicating bands are self-contained, so
+                    // band `j` feeds level `j` alone.
+                    let last = if partitioning { num_levels - 1 } else { j };
                     ExportTimers::time(&timers.scan_size, || {
-                        vd.fold(
-                            j,
-                            &batch,
-                            &bboxes,
-                            &variable_depth::RowSource {
-                                bboxes: &aligned,
-                                geometries: &geometries,
-                            },
-                            crs,
-                            opts,
-                        )
+                        scans_ref[j..=last]
+                            .par_iter_mut()
+                            .zip(&zooms_ref[j..=last])
+                            .for_each(|(scan, &zoom)| {
+                                scan.feature_count += pending.len();
+                                let (bounds, counts) = size_bboxes(pending, zoom, opts);
+                                if let Some(b) = bounds {
+                                    match &mut scan.bounds {
+                                        Some(acc) => acc.expand(&b),
+                                        None => scan.bounds = Some(b),
+                                    }
+                                }
+                                for (key, v) in counts {
+                                    *scan.tile_counts.entry(key).or_insert(0) += v;
+                                }
+                            });
+                    });
+                    pending.clear();
+                };
+                for (j, batch) in rx.iter() {
+                    // Read + (for 3857) reproject each feature's bbox once per
+                    // band; sizing the same bbox into every target level below is
+                    // bit-identical to reprojecting it once per level, since
+                    // reprojection is a pure fn.
+                    let bboxes = ExportTimers::time(&timers.scan_decode, || match source {
+                        ScanBboxSource::Covering { column, names } => {
+                            covering_batch_bboxes(&batch, column, names, crs)
+                        }
+                        ScanBboxSource::Geometry => {
+                            decode_batch_bboxes(&batch, geometry, crs, diagnostics).map(Some)
+                        }
                     })?;
+                    let Some(bboxes) = bboxes else {
+                        // Dropping the receiver stops the producer cleanly.
+                        *abandoned_ref = true;
+                        return Ok(());
+                    };
+                    if let Some(vd) = vd.as_deref_mut() {
+                        let geometries = || -> Result<Vec<Option<Geometry<f64>>>, ExportError> {
+                            let geom_idx = batch_geometry_index(&batch, geometry)?;
+                            let field = batch.schema().field(geom_idx).clone();
+                            let garr = from_arrow_array(batch.column(geom_idx).as_ref(), &field)
+                                .map_err(|e| {
+                                    crate::GeoParquetReadError::decode("geometry decode", e)
+                                })?;
+                            let mut out = Vec::with_capacity(batch.num_rows());
+                            // Quiet: without variable depth the scan counts these
+                            // rows' decode warnings only in its own bbox decode.
+                            crate::batch_processor::extract_geometries_opt_from_array(
+                                garr.as_ref(),
+                                &mut out,
+                                &crate::diagnostics::Diagnostics::silent(),
+                            )?;
+                            Ok(out)
+                        };
+                        let aligned = || -> Result<Vec<Option<TileBounds>>, ExportError> {
+                            match source {
+                                ScanBboxSource::Covering { column, names } => {
+                                    covering_row_bboxes(&batch, column, names, crs)
+                                }
+                                ScanBboxSource::Geometry => Ok(geometries()?
+                                    .iter()
+                                    .map(|g| g.as_ref().and_then(|g| geometry_lnglat_bbox(g, crs)))
+                                    .collect()),
+                            }
+                        };
+                        ExportTimers::time(&timers.scan_size, || {
+                            vd.fold(
+                                j,
+                                &batch,
+                                &bboxes,
+                                &variable_depth::RowSource {
+                                    bboxes: &aligned,
+                                    geometries: &geometries,
+                                },
+                                crs,
+                                opts,
+                            )
+                        })?;
+                    }
+                    if let Some(ptx) = pred_tx_ref {
+                        // #768 predict: row-aligned, so the gap walk matches the
+                        // export's row groups.
+                        let rows = match source {
+                            ScanBboxSource::Covering { column, names } => {
+                                covering_row_bboxes(&batch, column, names, crs)?
+                            }
+                            ScanBboxSource::Geometry => bboxes.clone(),
+                        };
+                        // The worker only stops early by panicking, which the
+                        // scope re-raises.
+                        let _ = ptx.send((j, rows));
+                    }
+                    if j != pending_band {
+                        size_pending(pending_band, &mut pending);
+                        pending_band = j;
+                    }
+                    pending.extend(bboxes);
+                    if pending.len() >= size_rows {
+                        size_pending(j, &mut pending);
+                    }
                 }
-                if j != pending_band {
-                    size_pending(pending_band, &mut pending);
-                    pending_band = j;
-                }
-                pending.extend(bboxes);
-                if pending.len() >= size_rows {
-                    size_pending(j, &mut pending);
-                }
-            }
-            size_pending(pending_band, &mut pending);
-            Ok(())
-        },
-    )?;
+                size_pending(pending_band, &mut pending);
+                Ok(())
+            },
+        );
+        drop(pred_tx);
+        if let Some(w) = worker {
+            let t = Instant::now();
+            w.join().expect("the #768 predictor thread panicked");
+            log::info!(
+                "[valve-scope] predict: scan waited {:.2}s for the predictor",
+                t.elapsed().as_secs_f64()
+            );
+        }
+        piped
+    })?;
     #[cfg(test)]
     BAND_READ_WORKERS.with(|w| w.set(readers));
     Ok((!abandoned).then_some(scans))
@@ -10550,6 +10671,10 @@ fn stalled(prev_fit: f64, fit: f64) -> bool {
 /// unmerged features are dropped, smallest first. Then halve the extent to
 /// 512 before dropping merged features, smallest first. Only a lone feature
 /// that still exceeds the cap can be written over it, with a warning.
+#[expect(
+    clippy::too_many_lines,
+    reason = "#768 prototype: floors and the scratch dump"
+)]
 fn merge_to_fit(
     gzip_cache: &Arc<TileGzipCache>,
     members: &[Member],
@@ -10617,7 +10742,8 @@ fn merge_to_fit(
     let mut build = |feats: &[&coalesce_valve::Merged<'_>], pass: u32, fill: &[&FillFeature]| {
         // Pass 1 merges nothing, and a pass that still merges nothing (a
         // tile with no mergeable gaps, on its way to the drop fallback) has
-        // nothing to reuse.
+        // nothing to reuse. A #768 floored pass 1 does merge, but encodes
+        // faster without the cache (NZ: 271 against 289 encode core-s).
         if pass == 1 || feats.iter().all(|m| m.members.len() < 2) {
             return build_tile_layers(gzip_cache, layers, feats, tb, opts, fill, diagnostics);
         }
@@ -10645,6 +10771,28 @@ fn merge_to_fit(
     let mut prev_fit: Option<f64> = None;
     let mut stalls = 0u32;
     let mut passes = 0u32;
+    let mut fit1 = f64::INFINITY;
+    let dump = |need: u64, passes: u32, fit1: f64| {
+        if std::env::var_os("TYLERTOO_VALVE_DUMP").is_some() {
+            let coords: usize = members.iter().map(|m| m.geom.coords_count()).sum();
+            let tile_world = 4_294_967_296.0 / f64::from(1u32 << valve_scope::current_zoom());
+            let mut px = [0.0f64; 4];
+            for m in members {
+                if let Some(r) = m.geom.bounding_rect() {
+                    let (x0, y0) = coalesce_valve::world_xy(r.min().x, r.max().y);
+                    let (x1, y1) = coalesce_valve::world_xy(r.max().x, r.min().y);
+                    let p = ((x1 - x0).abs() + (y1 - y0).abs()) / tile_world * 4096.0;
+                    for (i, c) in [2.0, 8.0, 32.0, 128.0].iter().enumerate() {
+                        px[i] += p.min(*c);
+                    }
+                }
+            }
+            let props: usize = members.iter().map(|m| m.props.bytes().len()).sum();
+            let extra = format!("{coords} {props} {} {} {} {}", px[0], px[1], px[2], px[3]);
+            let mut g = coalesce_valve::mergeable_gaps(&ordered);
+            valve_scope::dump(members.len(), extra, fit1, need, passes, &mut g);
+        }
+    };
     loop {
         passes += 1;
         let merged = coalesce_valve::coalesce_members(&ordered, mingap);
@@ -10653,6 +10801,9 @@ fn merge_to_fit(
         draw_order(&mut feats);
         let mut mvt = build(&feats, passes, &[]);
         let fit = tile_fit(&mut mvt, opts).unwrap_or(f64::INFINITY);
+        if passes == 1 {
+            fit1 = fit;
+        }
         let tally = ValveTally {
             merged: absorbed,
             dropped: 0,
@@ -10673,8 +10824,17 @@ fn merge_to_fit(
                 account_merged_sources(&merged, &feats, &ordered, &mut fitted);
             }
             valve_scope::record(mingap);
+            dump(mingap, passes, fit1);
             valve_scope::ENCODES.fetch_add(u64::from(passes), std::sync::atomic::Ordering::Relaxed);
             return fitted;
+        }
+        let g = gaps.get_or_insert_with(|| coalesce_valve::mergeable_gaps(&ordered));
+        if passes == 1 && mingap > 0 {
+            // #768: a tile that started from a floor already keeps only the
+            // gaps at or above it; the ladder goes on from that share, or it
+            // creeps up from the floor, looks stalled and merges everything.
+            keep_fraction =
+                g.iter().filter(|&&x| x >= mingap).count() as f64 / g.len().max(1) as f64;
         }
         // tippecanoe's `mingap_fraction`: aim for the share of features
         // that would fit, with a 20% margin, never keeping more than 80%.
@@ -10695,7 +10855,6 @@ fn merge_to_fit(
             keep_fraction = 0.0;
         }
         prev_fit = Some(fit);
-        let g = gaps.get_or_insert_with(|| coalesce_valve::mergeable_gaps(&ordered));
         if let Some(next) = coalesce_valve::next_mingap(g, keep_fraction, mingap) {
             mingap = next;
             continue;
@@ -10790,6 +10949,7 @@ fn merge_to_fit(
             account_merged_sources(&merged, &kept, &ordered, &mut fitted);
         }
         valve_scope::record(mingap);
+        dump(mingap, tally.passes, fit1);
         valve_scope::ENCODES.fetch_add(
             u64::from(tally.passes),
             std::sync::atomic::Ordering::Relaxed,
@@ -15671,6 +15831,7 @@ mod tests {
                 &ExportOptions::default(),
                 &ExportTimers::default(),
                 None,
+                None,
                 &crate::diagnostics::Diagnostics::default(),
             )
             .unwrap();
@@ -15716,6 +15877,7 @@ mod tests {
             &timers,
             &source,
             None,
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
@@ -15725,6 +15887,7 @@ mod tests {
             &opts,
             &timers,
             &ScanBboxSource::Geometry,
+            None,
             None,
             &crate::diagnostics::Diagnostics::default(),
         )
@@ -15801,6 +15964,7 @@ mod tests {
             Crs::Epsg4326,
             &ExportOptions::default(),
             &ExportTimers::default(),
+            None,
             None,
             &crate::diagnostics::Diagnostics::default(),
         )
@@ -17541,6 +17705,7 @@ mod tests {
             Crs::Epsg4326,
             &opts,
             &ExportTimers::default(),
+            None,
             None,
             &crate::diagnostics::Diagnostics::default(),
         )
@@ -21435,6 +21600,7 @@ mod tests {
             Crs::Epsg4326,
             &opts,
             &ExportTimers::default(),
+            None,
             None,
             &diagnostics,
         )
