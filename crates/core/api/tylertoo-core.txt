@@ -704,6 +704,11 @@ pub tylertoo_core::Diagnostic::TilesOverLimit::merged_tiles: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::Unprojectable
 pub tylertoo_core::Diagnostic::Unprojectable::context: core::option::Option<tylertoo_core::RangeContext>
 pub tylertoo_core::Diagnostic::Unprojectable::count: usize
+#[non_exhaustive] pub tylertoo_core::Diagnostic::UnsortedInput
+pub tylertoo_core::Diagnostic::UnsortedInput::count: usize
+pub tylertoo_core::Diagnostic::UnsortedInput::input: alloc::string::String
+pub tylertoo_core::Diagnostic::UnsortedInput::parts: usize
+pub tylertoo_core::Diagnostic::UnsortedInput::ratio: f64
 #[non_exhaustive] pub tylertoo_core::Diagnostic::UnusableGeometry
 pub tylertoo_core::Diagnostic::UnusableGeometry::count: usize
 pub tylertoo_core::Diagnostic::UnusableGeometry::total: usize

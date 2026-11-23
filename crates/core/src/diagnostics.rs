@@ -175,6 +175,16 @@ pub enum Diagnostic {
     /// The shared-border pins outgrew the scan's memory budget (#802).
     #[non_exhaustive]
     SharedBordersUnpinned { count: usize },
+    /// Pass 1 found the input rows in no spatial order (#768). `ratio` is
+    /// the mean distance between consecutive rows over the spacing of
+    /// evenly spread rows; `input` is the input's root path.
+    #[non_exhaustive]
+    UnsortedInput {
+        count: usize,
+        input: String,
+        parts: usize,
+        ratio: f64,
+    },
     #[non_exhaustive]
     PyramidSharedTiles { count: usize },
     #[non_exhaustive]
@@ -303,6 +313,7 @@ macro_rules! event_count {
             | Self::DiskShortage { count, .. }
             | Self::SavedPlan { count, .. }
             | Self::SharedBordersUnpinned { count }
+            | Self::UnsortedInput { count, .. }
             | Self::PyramidSharedTiles { count }
             | Self::PyramidSkippedTiles { count }
             | Self::PyramidMissingBounds { count }
@@ -487,6 +498,14 @@ impl fmt::Display for Diagnostic {
             Self::Advisory {message,..} | Self::DiskShortage {message,..} => f.write_str(message),
             Self::MemoryBudget {machine,limit,..} => write!(f, "memory budget from cgroup limit: {limit} bytes (machine available: {machine:?} bytes)"),
             Self::SharedBordersUnpinned {..} => f.write_str("the shared-border pins outgrew the memory budget and were dropped: each polygon simplifies on its own, so neighbours may show slivers along their shared borders. Run on a machine with more memory, or pass --simplify-factor 0.25 to narrow the slivers (#802)"),
+            Self::UnsortedInput {input,parts,ratio,..} => {
+                write!(f, "WARNING: the input is not sorted by location: consecutive rows lie {ratio:.1}x farther apart on average than in spatially sorted data. tylertoo keeps the input's row order, so tiles over the size cap will merge or drop features unevenly and may show stripes. Sort the input first: ")?;
+                if *parts > 1 {
+                    write!(f, "run `gpio sort hilbert <part> <sorted part>` on each of the {parts} files under {}", gpio_inspect_arg(input))
+                } else {
+                    write!(f, "`gpio sort hilbert {} {}`", gpio_inspect_arg(input), gpio_inspect_arg(&hilbert_output(input)))
+                }
+            }
             Self::PyramidSharedTiles {..} => write!(f, "{n} tile(s) shared across bands; counted once in the merged archive"),
             Self::PyramidSkippedTiles {..} => write!(f, "{n} tile(s) outside their band's declared zoom range skipped"),
             Self::PyramidMissingBounds {..} => write!(f, "{n} band archive(s) carried no usable bounds"),
@@ -883,7 +902,16 @@ pub fn write_report(path: &std::path::Path, report: &impl Serialize) -> Result<(
     pending.publish()
 }
 
-/// The shell-quoted path for a `gpio inspect` hint (#708).
+/// Where the `gpio sort hilbert` hint writes: `<stem>-hilbert.parquet`
+/// beside the input (#768).
+fn hilbert_output(input: &str) -> String {
+    format!(
+        "{}-hilbert.parquet",
+        input.strip_suffix(".parquet").unwrap_or(input)
+    )
+}
+
+/// The shell-quoted path for a `gpio` hint (#708).
 fn gpio_inspect_arg(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }

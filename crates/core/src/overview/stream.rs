@@ -3400,6 +3400,7 @@ fn run_pass1_and_assign(
         None => (None, i),
     })?;
     tallies.record(num_features, inputs.crs, diagnostics);
+    super::convert::warn_if_unsorted(inputs.source, tallies.row_order, diagnostics);
 
     // Stage markers (#242): everything between pass 1 and the writer used to
     // run in total info-level silence — on planet-scale inputs that was tens
@@ -3659,6 +3660,8 @@ fn load_plan_state(
             }),
             // Same as the out-of-range exemplars: the count only (#644).
             wrapped_exemplars: Vec::new(),
+            // The plan's saved diagnostics replay the #768 warning.
+            row_order: None,
         },
         pass1_stage_secs: Pass1StageSecs::default(),
         // The load stands in for the scan; the assignment did not run at all.

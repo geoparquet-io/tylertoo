@@ -37,6 +37,12 @@ tylertoo.overview("fieldmaps-madagascar-adm4.parquet", "madagascar-ov.parquet", 
 tylertoo.export_pmtiles("madagascar-ov.parquet", "madagascar.pmtiles")
 ```
 
+tylertoo expects its input sorted in Hilbert order, and never reorders rows
+itself. Sort other input first with
+[geoparquet-io](https://github.com/geoparquet-io/geoparquet-io):
+`gpio sort hilbert input.parquet sorted.parquet`. tylertoo warns when the
+input is not sorted by location.
+
 The intermediate `madagascar-ov.parquet` is a [`geo:overviews`](https://geoparquet-io.github.io/tylertoo/spec/overviews/) file (draft spec): a GeoParquet file that carries its own zoom pyramid and stays queryable as ordinary GeoParquet.
 
 See the [docs site](https://geoparquet-io.github.io/tylertoo/) for end-to-end tutorials and the API reference.

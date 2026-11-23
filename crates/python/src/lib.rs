@@ -208,23 +208,27 @@ fn report_dict<T: serde::Serialize>(py: Python<'_>, report: &T) -> PyResult<Py<P
         .unbind())
 }
 
-/// Rechecks arrive with a successful report; core already logged them while
-/// running. Deduplicate across report sections (including layered runs).
-fn warn_disk_shortages<'a>(
+/// Disk-shortage rechecks and unsorted input (#768) arrive with a successful
+/// report; core already logged them while running. Raised as `UserWarning`s,
+/// deduplicated across report sections (including layered runs).
+fn warn_user_diagnostics<'a>(
     py: Python<'_>,
     diagnostics: impl IntoIterator<Item = &'a tylertoo_core::Diagnostic>,
 ) -> PyResult<()> {
     let mut seen = std::collections::HashSet::new();
     for diagnostic in diagnostics {
-        if let tylertoo_core::Diagnostic::DiskShortage { message, .. } = diagnostic {
-            if seen.insert(message) {
-                PyErr::warn(
-                    py,
-                    &py.get_type::<PyUserWarning>(),
-                    &CString::new(message.as_str())?,
-                    1,
-                )?;
-            }
+        let message = match diagnostic {
+            tylertoo_core::Diagnostic::DiskShortage { message, .. } => message.clone(),
+            tylertoo_core::Diagnostic::UnsortedInput { .. } => diagnostic.to_string(),
+            _ => continue,
+        };
+        if seen.insert(message.clone()) {
+            PyErr::warn(
+                py,
+                &py.get_type::<PyUserWarning>(),
+                &CString::new(message)?,
+                1,
+            )?;
         }
     }
     Ok(())
@@ -362,7 +366,7 @@ fn convert(
         // The combined report (#439): the two halves the two-step chain's own
         // reports would carry, keyed like the CLI's `tiles --report` JSON.
         TilesOutcome::Converted(mut report) => {
-            warn_disk_shortages(py, report.convert.diagnostics.iter().chain(&report.export.diagnostics))?;
+            warn_user_diagnostics(py, report.convert.diagnostics.iter().chain(&report.export.diagnostics))?;
             report.convert.source_losses = report.convert.source_losses
                 .for_python()
                 .map_err(accounting_error_to_py)?;
@@ -376,7 +380,7 @@ fn convert(
         },
         // #821: one report per layer, each keyed like a plain run's.
         TilesOutcome::Layered(mut report) => {
-            warn_disk_shortages(py, report.layers.iter().flat_map(|layer| {
+            warn_user_diagnostics(py, report.layers.iter().flat_map(|layer| {
                 layer.report.convert.diagnostics.iter().chain(&layer.report.export.diagnostics)
             }).chain(&report.diagnostics))?;
             // The layers share one run's allowance for inline loss lists.
@@ -466,6 +470,7 @@ fn overview(
             }
         })
         .map_err(convert_error_to_py)?;
+    warn_user_diagnostics(py, &report.diagnostics)?;
 
     report.source_losses = report.source_losses
                 .for_python()
@@ -732,17 +737,20 @@ mod disk_warnings {
                     {"kind": "advisory", "count": 1, "message": "pre-read staging warning"},
                     {"kind": "disk_shortage", "count": 1, "message": "projected disk footprint after pass 1 may not fit"},
                     {"kind": "disk_shortage", "count": 1, "message": "projected disk footprint after pass 1 may not fit"},
-                    {"kind": "disk_shortage", "count": 1, "message": "another volume may not fit"}
+                    {"kind": "disk_shortage", "count": 1, "message": "another volume may not fit"},
+                    {"kind": "unsorted_input", "count": 1, "input": "in.parquet", "parts": 1, "ratio": 5.3}
                 ])
             ).unwrap();
-            warn_disk_shortages(py, &events).unwrap();
+            warn_user_diagnostics(py, &events).unwrap();
             catch
                 .call_method1("__exit__", (py.None(), py.None(), py.None()))
                 .unwrap();
-            assert_eq!(records.len().unwrap(), 2);
+            assert_eq!(records.len().unwrap(), 3);
+            let unsorted = events[4].to_string();
             for (index, message) in [
                 "projected disk footprint after pass 1 may not fit",
                 "another volume may not fit",
+                unsorted.as_str(),
             ]
             .iter()
             .enumerate()
