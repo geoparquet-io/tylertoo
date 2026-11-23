@@ -43,13 +43,15 @@ pub(crate) fn scope() -> Scope {
 }
 
 /// The share of a neighbour's `mingap` (a squared distance) that reaches one
-/// Chebyshev ring further: `TYLERTOO_VALVE_SMOOTH`, default 0.25, i.e. the
-/// linear merge distance halves per tile.
+/// Chebyshev ring further: `TYLERTOO_VALVE_SMOOTH`, default 0.5, i.e. the
+/// linear merge distance shrinks by 1/sqrt(2) per tile, so a neighbour's need
+/// fades over about 4 tiles. 0.25 (halving per tile) left NZ z7's p95 step
+/// at 2.77 against 2.45 at 0.5 (#768).
 pub(crate) fn smooth_factor() -> f64 {
     std::env::var("TYLERTOO_VALVE_SMOOTH")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0.25)
+        .unwrap_or(0.5)
 }
 
 /// Rings a neighbour's need reaches in `smooth`.
