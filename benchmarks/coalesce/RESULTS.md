@@ -195,6 +195,49 @@ roughly 4× tippecanoe's 1-tile-unit tolerance. On an Auckland subset
 | C1, `--simplify-factor 0.25` | 99.2% | 99.4% | 99.4% | 156 MB |
 | C2, `--simplify-factor 0.25` | 99.4% | 99.6% | 99.5% | 161 MB |
 
+### tippecanoe's merge and drop modes at z8–z11 (#768)
+
+An earlier comment on #768 said tippecanoe's whole-zoom threshold leaves
+most of Auckland's z8–z11 tiles empty. That figure came from a
+`--drop-densest-as-needed` archive, not from `--coalesce-densest-as-needed`,
+the mode the merge valve follows. Re-scored on 2026-11-23 against
+the Hilbert-sorted NZ input, with the 256 px raster scorer and an exact
+area-union scorer (clip each tile's polygons, union them, compare with the
+clipped source). The two scorers agree within 0.1 point. Missing area:
+
+| Archive | 8/252/156 | 9/504/312 | 10/1009/624 | 11/2018/1249 |
+|---|---|---|---|---|
+| tippecanoe `--coalesce-densest-as-needed -M 2000000` | 0.16% | 0.04% | 0.03% | 0.15% |
+| same, plus `--no-tiny-polygon-reduction -D11` | 0.21% | 0.00% | 0.02% | 0.43% |
+| tippecanoe `--drop-densest-as-needed -M 2000000` | 99.8% | 99.5% | 99.5% | 95.7% |
+| tylertoo defaults, 2 MB cap | 5.0% | 5.6% | 3.0% | 6.3% |
+
+So in merge mode a whole-zoom threshold does not cost coverage here; in drop
+mode it does (FTW Moldova drop-densest: 24–45% missing at z6–z8, confirmed
+by both scorers).
+
+Where tylertoo's missing area goes, as share of source area:
+
+| Tile | Missing | Before export (simplification, placeholder squares) | Tile encode | Size valve |
+|---|---|---|---|---|
+| 8/252/156 | 5.0% | 4.0% | 1.0% | 0.1% |
+| 9/504/312 | 5.6% | 4.3% | 1.1% | 0.1% |
+| 10/1009/624 | 3.0% | 2.3% | 0.7% | 0.0% |
+| 11/2018/1249 | 6.6% | 5.5% | 1.0% | 0.1% |
+
+The merge valve drops no feature on this run. Most of the loss is each
+parcel simplified on its own at 1 GSD, which opens gaps between neighbours,
+and placeholder squares that cover less than the small parcels they stand
+for. tippecanoe merges first and simplifies only the merged outline, at
+about a quarter of the tolerance. The documented flags close the gap
+(single runs on a shared host):
+
+| Settings | z8 | z9 | z10 | z11 | archive | wall |
+|---|---|---|---|---|---|---|
+| defaults | 5.0% | 5.6% | 3.0% | 6.6% | 1,143 MB | 31 s |
+| `--no-simplification-of-shared-nodes` | 1.4% | 2.4% | 1.5% | 0.3% | 1,198 MB | 39 s |
+| `--coverage-fill` | 0.00% | 0.00% | 0.01% | 0.05% | 1,152 MB | 117 s |
+
 ### Coverage against `--simplify-factor` (`sweep_simplify.py`)
 
 Auckland subset (about 400k parcels, `--bbox 174.5,-37.1,175.0,-36.6`),
