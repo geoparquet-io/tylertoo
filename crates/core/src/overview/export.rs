@@ -2879,12 +2879,13 @@ fn export_pmtiles_validated_inner(
             std::fs::write(path, lines)?;
         }
         let mut floors = valve_scope::smooth_floors(&need, valve_scope::smooth_factor(), false);
-        // SCRATCH knob: start an over tile at this share of its own predicted
-        // need (0: from its neighbours' floors only).
+        // A tile predicted over starts at this share of its own predicted
+        // need (`TYLERTOO_VALVE_SELF`, default 1; 0: neighbours' floors only).
+        // NZ: ladder encodes past the first 84 -> 4, bytes -0.8%.
         let own: f64 = std::env::var("TYLERTOO_VALVE_SELF")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0.0);
+            .unwrap_or(1.0);
         if own > 0.0 {
             for (&k, &m) in &need {
                 let f = floors.entry(k).or_insert(0);

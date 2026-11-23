@@ -19,10 +19,13 @@
 //!    takes more (`KEEP_EXP`). The need is the histogram's `1 − keep`
 //!    quantile.
 //!
-//! Floors are the prototype's smooth rule over neighbours only
-//! ([`super::valve_scope::smooth_floors`] without the tile itself): each
-//! tile still raises its own threshold from its floor until it fits, so the
-//! cap holds and a tile's own over-prediction never merges it.
+//! Floors are the prototype's smooth rule over neighbours
+//! ([`super::valve_scope::smooth_floors`]), and a tile predicted over starts
+//! at its own predicted need (`TYLERTOO_VALVE_SELF`), so it usually fits on
+//! its first encode. The ladder in `merge_to_fit` stays the backstop: a tile
+//! whose real need is higher still raises its threshold until it fits, so
+//! the cap holds. A tile's own over-prediction merges it harder than it
+//! needed (NZ: kept share 0.85-0.93 of the probe's, median per level).
 //!
 //! Unlike the probe, the scan reads every tile even under a `--tile-range`
 //! shard (the scan is restricted after), so shards predict the same floors.
