@@ -20007,11 +20007,18 @@ mod tests {
             let tiles = encode_level_tiles(&feats, 10, &ExportOptions {
                 compressed_tile_size_limit: Some(limit), ..opts
             }).unwrap();
+            proptest::prop_assert_eq!(tiles[0].valve.dropped, 0);
+            proptest::prop_assert_eq!(tiles[0].valve.over_limit, 0);
+            // Merging alone can save half the gzip bytes (identical rings
+            // compress well): then the tile fits at full extent, as it must.
+            if tiles[0].valve.reduced_extent.is_none() {
+                let gz = crate::compression::compress(&tiles[0].data, Compression::Gzip).unwrap();
+                proptest::prop_assert!(gz.len() <= limit);
+                return Ok(());
+            }
             let layer = &decode_tile(&tiles[0].data).layers[0];
             let extent = layer.extent.unwrap();
             proptest::prop_assert!(extent < 4096);
-            proptest::prop_assert_eq!(tiles[0].valve.dropped, 0);
-            proptest::prop_assert_eq!(tiles[0].valve.over_limit, 0);
             let mut area = 0.0;
             for f in &layer.features {
                 let polygons = valve_test_polygons(&f.geometry);
