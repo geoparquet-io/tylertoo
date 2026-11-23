@@ -499,7 +499,7 @@ impl fmt::Display for Diagnostic {
             Self::MemoryBudget {machine,limit,..} => write!(f, "memory budget from cgroup limit: {limit} bytes (machine available: {machine:?} bytes)"),
             Self::SharedBordersUnpinned {..} => f.write_str("the shared-border pins outgrew the memory budget and were dropped: each polygon simplifies on its own, so neighbours may show slivers along their shared borders. Run on a machine with more memory, or pass --simplify-factor 0.25 to narrow the slivers (#802)"),
             Self::UnsortedInput {input,parts,ratio,..} => {
-                write!(f, "WARNING: the input is not sorted by location: consecutive rows lie {ratio:.1}x farther apart on average than in spatially sorted data. tylertoo keeps the input's row order, so tiles over the size cap will merge or drop features unevenly and may show stripes. Sort the input first: ")?;
+                write!(f, "the input is not sorted by location: consecutive rows lie {ratio:.1}x farther apart on average than in spatially sorted data. tylertoo keeps the input's row order, so tiles over the size cap will merge or drop features unevenly and may show stripes. Sort the input first: ")?;
                 if *parts > 1 {
                     write!(f, "run `gpio sort hilbert <part> <sorted part>` on each of the {parts} files under {}", gpio_inspect_arg(input))
                 } else {
