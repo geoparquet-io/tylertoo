@@ -2858,17 +2858,31 @@ fn export_pmtiles_validated_inner(
     )?;
     if let Some(p) = predict {
         // #768 predict: from the whole scan, before a shard restricts it.
-        let props: Vec<&str> = reader
-            .resolved_schema()
-            .geometry_index()
-            .map(|g| property_columns(reader.schema(), g, &published))
-            .unwrap_or_default()
+        // Each level priced at its densest tile, then every tile that
+        // price puts near or over a cap at its own.
+        let t_sample = Instant::now();
+        let cols = (&published, feature_id.as_ref());
+        let densest = p.densest();
+        let at: Vec<_> = densest.iter().flatten().copied().collect();
+        let mut priced =
+            valve_sample_bytes(&reader, cols, crs, (options, &level_zooms), &at)?.into_iter();
+        let member_bytes: Vec<Option<MemberBytes>> = densest
             .iter()
-            .map(|&(i, _)| reader.schema().field(i).name().as_str())
-            .filter(|n| options.feature_id.as_deref() != Some(*n))
+            .map(|d| d.and_then(|_| priced.next().flatten()))
             .collect();
-        let member_bytes = valve_predict::member_bytes(&reader.mean_column_bytes(), &props);
-        let need = p.predict(&level_zooms, member_bytes, options);
+        let candidates = p.candidates(&member_bytes, options);
+        let tile_bytes: HashMap<(usize, u64), MemberBytes> = candidates
+            .iter()
+            .zip(valve_sample_bytes(
+                &reader,
+                cols,
+                crs,
+                (options, &level_zooms),
+                &candidates,
+            )?)
+            .filter_map(|(t, b)| Some(((t.level, t.key), b?)))
+            .collect();
+        let need = p.predict(&level_zooms, &member_bytes, &tile_bytes, options);
         valve_scope::log_needs(&need);
         if let Ok(path) = std::env::var("TYLERTOO_VALVE_PRED_DUMP") {
             // SCRATCH (#768): the predicted needs, for the accuracy table.
@@ -2876,6 +2890,15 @@ fn export_pmtiles_validated_inner(
                 .iter()
                 .map(|(&(z, x, y), &m)| format!("{z} {x} {y} {m}\n"))
                 .collect();
+            let bytes: String = tile_bytes
+                .iter()
+                .map(|(&(level, key), &(r, g))| {
+                    let z = level_zooms[level];
+                    let (x, y) = key_to_xy(key, z);
+                    format!("{z} {x} {y} {r:.1} {g:.1}\n")
+                })
+                .collect();
+            std::fs::write(format!("{path}.bytes"), bytes)?;
             std::fs::write(path, lines)?;
         }
         let mut floors = valve_scope::smooth_floors(&need, valve_scope::smooth_factor(), false);
@@ -2893,7 +2916,15 @@ fn export_pmtiles_validated_inner(
             }
         }
         log::info!(
-            "[valve-scope] predict: {member_bytes:.0} bytes a member, {} tiles predicted over, {} floors, scan {:.2}s (gap walk {:.2}s, sizing {:.2}s)",
+            "[valve-scope] predict: bytes a member (raw, gzip) {}, {} tiles sampled in {:.2}s, {} tiles predicted over, {} floors, scan {:.2}s (gap walk {:.2}s, sizing {:.2}s)",
+            member_bytes
+                .iter()
+                .zip(&level_zooms)
+                .filter_map(|(b, z)| b.map(|(r, g)| format!("z{z} {r:.0}/{g:.0}")))
+                .collect::<Vec<_>>()
+                .join(" "),
+            tile_bytes.len(),
+            t_sample.elapsed().as_secs_f64(),
             need.len(),
             floors.len(),
             t_scan.elapsed().as_secs_f64(),
@@ -3784,6 +3815,173 @@ fn resolve_export_columns(
         skipped,
     })
 }
+
+/// #768 predict: the raw and gzipped MVT bytes one member of each of
+/// `tiles` costs, from a real first encode of a sample of its members: the
+/// export's own clip, attributes and encoder over up to `SAMPLE_MEMBERS`
+/// members from the `WINDOW_ROWS` rows its densest run of rows starts at,
+/// in that row group and the band's next. Row groups read in parallel, each
+/// once for all the tiles whose run starts in it. `None` for a tile whose
+/// sample is too small to price.
+fn valve_sample_bytes(
+    reader: &OverviewReader,
+    (published, feature_id): (&PublishedNames, Option<&ResolvedFeatureId>),
+    crs: Crs,
+    (opts, zooms): (&ExportOptions, &[u8]),
+    tiles: &[valve_predict::SampleAt],
+) -> Result<Vec<Option<MemberBytes>>, ExportError> {
+    const SAMPLE_MEMBERS: usize = 4096;
+    const MIN_MEMBERS: usize = 256;
+    const WINDOW_ROWS: u64 = 16_384;
+    // A row group and the band's next; a tile's clipped members by row.
+    type ReadRun = (usize, Option<usize>);
+    type Hit = (usize, usize, Vec<(u64, Geometry<f64>)>);
+    let rows_of = |rg: usize| reader.parquet_metadata().row_group(rg).num_rows().max(0) as u64;
+    // Row group -> (tile, its first row in the row group).
+    let mut groups: BTreeMap<ReadRun, Vec<(usize, u64)>> = BTreeMap::new();
+    for (i, t) in tiles.iter().enumerate() {
+        let mut row = t.row;
+        let band = reader.band(usize::from(t.band))?;
+        for (j, &rg) in band.iter().enumerate() {
+            if row < rows_of(rg) {
+                let next = band.get(j + 1).copied();
+                groups.entry((rg, next)).or_default().push((i, row));
+                break;
+            }
+            row -= rows_of(rg);
+        }
+    }
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    let timers = ExportTimers::default();
+    let priced = groups
+        .into_par_iter()
+        .map(
+            |((rg, next), wanted)| -> Result<Vec<(usize, Option<MemberBytes>)>, ExportError> {
+                let band = reader.row_group_bands(&[rg])[0].0;
+                let selection = RowGroupSelection::from_parts(vec![[Some(rg), next]
+                    .into_iter()
+                    .flatten()
+                    .collect()]);
+                let stream = reader
+                    .source()
+                    .open_stream(&crate::input_set::ReadPlan {
+                        batch_size: tylertoo_io::DEFAULT_BATCH_ROWS,
+                        projection: None,
+                        row_groups: Some(&selection),
+                    })
+                    .map_err(|e| read_error(e.into()))?;
+                let mut members: Vec<Vec<Member>> = wanted.iter().map(|_| Vec::new()).collect();
+                let mut base = 0u64;
+                for batch in stream {
+                    // A tile samples rows `from..from + WINDOW_ROWS` until full.
+                    let open = |&(_, from): &(usize, u64), m: &Vec<Member>| {
+                        m.len() < SAMPLE_MEMBERS && base < from + WINDOW_ROWS
+                    };
+                    if !wanted.iter().zip(&members).any(|(w, m)| open(w, m)) {
+                        break;
+                    }
+                    let batch = batch.map_err(|e| read_error(e.into()))?;
+                    let n = batch.num_rows() as u64;
+                    let in_batch = |&(_, from): &(usize, u64)| from < base + n;
+                    if !wanted
+                        .iter()
+                        .zip(&members)
+                        .any(|(w, m)| open(w, m) && in_batch(w))
+                    {
+                        base += n;
+                        continue;
+                    }
+                    let schema = batch.schema();
+                    let gi = batch_geometry_index(&batch, published.geometry.as_deref())?;
+                    let geoms =
+                        decode_batch_geometries(&batch, &schema, gi, crs, &timers, &diagnostics)?;
+                    // Each tile's clipped rows first; attributes only for those.
+                    let mut hits: Vec<Hit> = Vec::new();
+                    for (w, (&(i, from), sample)) in wanted.iter().zip(&members).enumerate() {
+                        if !open(&(i, from), sample) {
+                            continue;
+                        }
+                        let t = tiles[i];
+                        let lo = from.saturating_sub(base).min(n);
+                        let hi = (from + WINDOW_ROWS).saturating_sub(base).min(n);
+                        let mut taken = sample.len();
+                        for row in lo..hi {
+                            if taken >= SAMPLE_MEMBERS {
+                                break;
+                            }
+                            let row = row as usize;
+                            let pieces = feature_tile_members(
+                                &geoms[row],
+                                zooms[t.level],
+                                opts,
+                                t.key,
+                                t.key,
+                                &diagnostics,
+                            );
+                            if !pieces.is_empty() {
+                                taken += pieces.len();
+                                hits.push((w, row, pieces));
+                            }
+                        }
+                    }
+                    let mut rows: Vec<u32> = hits.iter().map(|&(_, r, _)| r as u32).collect();
+                    rows.sort_unstable();
+                    rows.dedup();
+                    let taken = arrow_select::take::take_record_batch(
+                        &batch,
+                        &arrow_array::UInt32Array::from(rows.clone()),
+                    )?;
+                    let mut attrs =
+                        AttrColumns::new(&schema, gi, published, feature_id).extract(&taken)?;
+                    let mut props: Vec<Option<SharedProps>> = vec![None; rows.len()];
+                    for (w, row, pieces) in hits {
+                        let r = rows.binary_search(&(row as u32)).expect("taken above");
+                        let p = props[r].get_or_insert_with(|| attrs.props(r)).clone();
+                        let id = attrs.id(r)?;
+                        let seq = base + row as u64;
+                        members[w].extend(pieces.into_iter().map(|(key, g)| Member {
+                            key,
+                            seq,
+                            geom: g.into(),
+                            props: p.clone(),
+                            id,
+                            gap: coalesce_valve::GAP_NONE,
+                            band,
+                        }));
+                    }
+                    base += n;
+                }
+                let cache = Arc::new(TileGzipCache::new(0));
+                wanted
+                    .iter()
+                    .zip(members)
+                    .map(|(&(i, _), mut sample)| {
+                        if sample.len() < MIN_MEMBERS {
+                            return Ok((i, None));
+                        }
+                        let t = tiles[i];
+                        let (x, y) = key_to_xy(t.key, zooms[t.level]);
+                        let tb = TileCoord::new(x, y, zooms[t.level]).bounds();
+                        sort_tile_for_encode(&mut sample, &opts.feature_order);
+                        let mut mvt =
+                            build_tile_layers(&cache, &[], &sample, &tb, opts, &[], &diagnostics);
+                        let n = sample.len() as f64;
+                        let raw = mvt.data.len() as f64;
+                        let gz = mvt.data.gzipped(&cache)?.len() as f64;
+                        Ok((i, Some((raw / n, gz / n))))
+                    })
+                    .collect()
+            },
+        )
+        .collect::<Result<Vec<_>, ExportError>>()?;
+    let mut out = vec![None; tiles.len()];
+    for (i, bytes) in priced.into_iter().flatten() {
+        out[i] = bytes;
+    }
+    Ok(out)
+}
+
+use valve_predict::MemberBytes;
 
 /// What [`resolve_export_columns`] settled once per export.
 struct ResolvedColumns {
@@ -10773,7 +10971,8 @@ fn merge_to_fit(
     let mut stalls = 0u32;
     let mut passes = 0u32;
     let mut fit1 = f64::INFINITY;
-    let dump = |need: u64, passes: u32, fit1: f64| {
+    let mut first = (0usize, 0usize);
+    let dump = |need: u64, passes: u32, fit1: f64, first: (usize, usize)| {
         if std::env::var_os("TYLERTOO_VALVE_DUMP").is_some() {
             let coords: usize = members.iter().map(|m| m.geom.coords_count()).sum();
             let tile_world = 4_294_967_296.0 / f64::from(1u32 << valve_scope::current_zoom());
@@ -10789,7 +10988,10 @@ fn merge_to_fit(
                 }
             }
             let props: usize = members.iter().map(|m| m.props.bytes().len()).sum();
-            let extra = format!("{coords} {props} {} {} {} {}", px[0], px[1], px[2], px[3]);
+            let extra = format!(
+                "{coords} {props} {} {} {} {} {} {}",
+                px[0], px[1], px[2], px[3], first.0, first.1
+            );
             let mut g = coalesce_valve::mergeable_gaps(&ordered);
             valve_scope::dump(members.len(), extra, fit1, need, passes, &mut g);
         }
@@ -10804,6 +11006,12 @@ fn merge_to_fit(
         let fit = tile_fit(&mut mvt, opts).unwrap_or(f64::INFINITY);
         if passes == 1 {
             fit1 = fit;
+            if std::env::var_os("TYLERTOO_VALVE_DUMP").is_some() {
+                first = (
+                    mvt.data.len(),
+                    mvt.data.gzipped(&mvt.gzip_cache).map_or(0, |g| g.len()),
+                );
+            }
         }
         let tally = ValveTally {
             merged: absorbed,
@@ -10825,7 +11033,7 @@ fn merge_to_fit(
                 account_merged_sources(&merged, &feats, &ordered, &mut fitted);
             }
             valve_scope::record(mingap);
-            dump(mingap, passes, fit1);
+            dump(mingap, passes, fit1, first);
             valve_scope::ENCODES.fetch_add(u64::from(passes), std::sync::atomic::Ordering::Relaxed);
             return fitted;
         }
@@ -10950,7 +11158,7 @@ fn merge_to_fit(
             account_merged_sources(&merged, &kept, &ordered, &mut fitted);
         }
         valve_scope::record(mingap);
-        dump(mingap, tally.passes, fit1);
+        dump(mingap, tally.passes, fit1, first);
         valve_scope::ENCODES.fetch_add(
             u64::from(tally.passes),
             std::sync::atomic::Ordering::Relaxed,
