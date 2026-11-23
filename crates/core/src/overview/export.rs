@@ -2842,6 +2842,20 @@ fn export_pmtiles_validated_inner(
     let mut predict = (valve_scope::scope() == valve_scope::Scope::Predict
         && valve_merges(options))
     .then(|| valve_predict::Scan::new(num_levels));
+    // shortcut: a shard's overview holds only its range and a two-pivot-tile
+    // margin, short of the eight rings floors reach and of the densest tiles
+    // the prices come from, so a shard would predict other floors than the
+    // full build; refused until both depend on the tile alone.
+    if predict.is_some() && options.tile_range.is_some() {
+        return Err(ConfigError::InvalidSpec {
+            option: "TYLERTOO_VALVE_SCOPE",
+            message: "TYLERTOO_VALVE_SCOPE=predict does not support --tile-range or --shard: a \
+                      shard sees only its own range, so it would predict other merge floors \
+                      than the full build; unset it, or build without sharding"
+                .to_string(),
+        }
+        .into());
+    }
     let mut scans = scan_all_levels(
         &reader,
         BandRead {
@@ -2857,81 +2871,36 @@ fn export_pmtiles_validated_inner(
         diagnostics,
     )?;
     if let Some(p) = predict {
-        // #768 predict: from the whole scan, before a shard restricts it.
-        // Each level priced at its densest tile, then every tile that
-        // price puts near or over a cap at its own.
-        let t_sample = Instant::now();
-        let cols = (&published, feature_id.as_ref());
-        let densest = p.densest();
-        let at: Vec<_> = densest.iter().flatten().copied().collect();
-        let mut priced =
-            valve_sample_bytes(&reader, cols, crs, (options, &level_zooms), &at)?.into_iter();
-        let member_bytes: Vec<Option<MemberBytes>> = densest
-            .iter()
-            .map(|d| d.and_then(|_| priced.next().flatten()))
-            .collect();
-        let candidates = p.candidates(&member_bytes, options);
-        let tile_bytes: HashMap<(usize, u64), MemberBytes> = candidates
-            .iter()
-            .zip(valve_sample_bytes(
-                &reader,
-                cols,
-                crs,
-                (options, &level_zooms),
-                &candidates,
-            )?)
-            .filter_map(|(t, b)| Some(((t.level, t.key), b?)))
-            .collect();
-        let need = p.predict(&level_zooms, &member_bytes, &tile_bytes, options);
-        valve_scope::log_needs(&need);
-        if let Ok(path) = std::env::var("TYLERTOO_VALVE_PRED_DUMP") {
-            // SCRATCH (#768): the predicted needs, for the accuracy table.
-            let lines: String = need
-                .iter()
-                .map(|(&(z, x, y), &m)| format!("{z} {x} {y} {m}\n"))
-                .collect();
-            let bytes: String = tile_bytes
-                .iter()
-                .map(|(&(level, key), &(r, g))| {
-                    let z = level_zooms[level];
-                    let (x, y) = key_to_xy(key, z);
-                    format!("{z} {x} {y} {r:.1} {g:.1}\n")
-                })
-                .collect();
-            std::fs::write(format!("{path}.bytes"), bytes)?;
-            std::fs::write(path, lines)?;
-        }
-        let mut floors = valve_scope::smooth_floors(&need, valve_scope::smooth_factor(), false);
-        // A tile predicted over starts at this share of its own predicted
-        // need (`TYLERTOO_VALVE_SELF`, default 1; 0: neighbours' floors only).
-        // NZ: ladder encodes past the first 84 -> 4, bytes -0.8%.
-        let own: f64 = std::env::var("TYLERTOO_VALVE_SELF")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1.0);
-        if own > 0.0 {
-            for (&k, &m) in &need {
-                let f = floors.entry(k).or_insert(0);
-                *f = (*f).max((m as f64 * own) as u64);
+        // #768 predict: from the whole scan, before a shard restricts it. The
+        // pricing, needs and floors run beside the export's read and clip, on
+        // a pool of their own; the first tile to encode waits for the floors
+        // (`valve_scope::hold_floors`), so they never depend on timing.
+        // Its per-tile state stays resident until the floors are built.
+        budget.reserve_up_to(MemoryPhase::Scan, p.resident_bytes());
+        valve_scope::hold_floors();
+        // The job opens the same file again (a footer read) because it
+        // outlives this borrow of `reader`; it runs on the export's pool.
+        let path = reader.path().to_path_buf();
+        let (published, feature_id) = (published.clone(), feature_id.clone());
+        let (options, zooms) = (options.clone(), level_zooms.clone());
+        rayon::spawn(move || {
+            let run = || -> Result<_, ExportError> {
+                let reader = OverviewReader::open(&path)?;
+                predict_floors(
+                    &reader,
+                    (&published, feature_id.as_ref()),
+                    crs,
+                    (&options, &zooms),
+                    &p,
+                    t_scan,
+                )
+            };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                Ok(Ok(floors)) => valve_scope::set_floors(HashMap::new(), floors, HashMap::new()),
+                Ok(Err(e)) => valve_scope::fail_floors(e.to_string()),
+                Err(_) => valve_scope::fail_floors("the predictor panicked".to_string()),
             }
-        }
-        log::info!(
-            "[valve-scope] predict: bytes a member (raw, gzip) {}, {} tiles sampled in {:.2}s, {} tiles predicted over, {} floors, scan {:.2}s (gap walk {:.2}s, sizing {:.2}s)",
-            member_bytes
-                .iter()
-                .zip(&level_zooms)
-                .filter_map(|(b, z)| b.map(|(r, g)| format!("z{z} {r:.0}/{g:.0}")))
-                .collect::<Vec<_>>()
-                .join(" "),
-            tile_bytes.len(),
-            t_sample.elapsed().as_secs_f64(),
-            need.len(),
-            floors.len(),
-            t_scan.elapsed().as_secs_f64(),
-            p.walk.as_secs_f64(),
-            p.sized.as_secs_f64(),
-        );
-        valve_scope::set_floors(HashMap::new(), floors, HashMap::new());
+        });
     }
 
     // #498: a sharded build's export owns a slice of the tile space, not all
@@ -3212,6 +3181,12 @@ fn export_pmtiles_validated_inner(
         coarsest_zoom,
     };
     let probe_timers = Arc::clone(&progress.profile.timers);
+    // #768 predict: no tile encodes before its floors are in.
+    valve_scope::wait_for_floors().map_err(|m| {
+        ExportError::Io(std::io::Error::other(format!(
+            "TYLERTOO_VALVE_SCOPE=predict could not build its merge floors: {m}"
+        )))
+    })?;
     #[cfg_attr(not(test), expect(unused_variables, reason = "the tests' schedule"))]
     let (reports, level_groups, probed) = match vd {
         None => {
@@ -3814,6 +3789,90 @@ fn resolve_export_columns(
         feature_id,
         skipped,
     })
+}
+
+/// #768 predict: each level priced at its densest tile, then every tile
+/// that price puts near or over a cap at its own ([`valve_sample_bytes`]);
+/// the needs, and the smooth floors with each tile's own need.
+fn predict_floors(
+    reader: &OverviewReader,
+    cols: (&PublishedNames, Option<&ResolvedFeatureId>),
+    crs: Crs,
+    (options, level_zooms): (&ExportOptions, &[u8]),
+    p: &valve_predict::Scan,
+    t_scan: Instant,
+) -> Result<HashMap<valve_scope::Key, u64>, ExportError> {
+    let t_sample = Instant::now();
+    let densest = p.densest();
+    let at: Vec<_> = densest.iter().flatten().copied().collect();
+    let mut priced =
+        valve_sample_bytes(reader, cols, crs, (options, level_zooms), &at)?.into_iter();
+    let member_bytes: Vec<Option<MemberBytes>> = densest
+        .iter()
+        .map(|d| d.and_then(|_| priced.next().flatten()))
+        .collect();
+    let candidates = p.candidates(&member_bytes, options);
+    let tile_bytes: HashMap<(usize, u64), MemberBytes> = candidates
+        .iter()
+        .zip(valve_sample_bytes(
+            reader,
+            cols,
+            crs,
+            (options, level_zooms),
+            &candidates,
+        )?)
+        .filter_map(|(t, b)| Some(((t.level, t.key), b?)))
+        .collect();
+    let need = p.predict(level_zooms, &member_bytes, &tile_bytes, options);
+    valve_scope::log_needs(&need);
+    if let Ok(path) = std::env::var("TYLERTOO_VALVE_PRED_DUMP") {
+        // SCRATCH (#768): the predicted needs, for the accuracy table.
+        let lines: String = need
+            .iter()
+            .map(|(&(z, x, y), &m)| format!("{z} {x} {y} {m}\n"))
+            .collect();
+        let bytes: String = tile_bytes
+            .iter()
+            .map(|(&(level, key), &(r, g))| {
+                let z = level_zooms[level];
+                let (x, y) = key_to_xy(key, z);
+                format!("{z} {x} {y} {r:.1} {g:.1}\n")
+            })
+            .collect();
+        std::fs::write(format!("{path}.bytes"), bytes)?;
+        std::fs::write(path, lines)?;
+    }
+    let mut floors = valve_scope::smooth_floors(&need, valve_scope::smooth_factor(), false);
+    // A tile predicted over starts at this share of its own predicted
+    // need (`TYLERTOO_VALVE_SELF`, default 1; 0: neighbours' floors only).
+    // NZ: ladder encodes past the first 84 -> 4, bytes -0.8%.
+    let own: f64 = std::env::var("TYLERTOO_VALVE_SELF")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    if own > 0.0 {
+        for (&k, &m) in &need {
+            let f = floors.entry(k).or_insert(0);
+            *f = (*f).max((m as f64 * own) as u64);
+        }
+    }
+    log::info!(
+        "[valve-scope] predict: bytes a member (raw, gzip) {}, {} tiles sampled in {:.2}s, {} tiles predicted over, {} floors, scan {:.2}s (gap walk {:.2}s, sizing {:.2}s)",
+        member_bytes
+            .iter()
+            .zip(level_zooms)
+            .filter_map(|(b, z)| b.map(|(r, g)| format!("z{z} {r:.0}/{g:.0}")))
+            .collect::<Vec<_>>()
+            .join(" "),
+        tile_bytes.len(),
+        t_sample.elapsed().as_secs_f64(),
+        need.len(),
+        floors.len(),
+        t_scan.elapsed().as_secs_f64(),
+        p.walk.as_secs_f64(),
+        p.sized.as_secs_f64(),
+    );
+    Ok(floors)
 }
 
 /// #768 predict: the raw and gzipped MVT bytes one member of each of

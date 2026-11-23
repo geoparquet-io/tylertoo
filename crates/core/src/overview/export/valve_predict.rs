@@ -38,7 +38,7 @@
 //! before the gap walk, so its gaps can shift at a null; walk the
 //! row-aligned bboxes there too when a covering-less input needs it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 
 use geo::Rect;
@@ -145,23 +145,35 @@ pub(crate) fn quantile(hist: &[u32; BUCKETS], q: f64, zoom: u8) -> Option<u64> {
     None
 }
 
-/// Per tile key: members, gap histogram, first band row.
-type Partial = HashMap<u64, (u32, Hist, u64)>;
+/// Per tile key: members and the first band row.
+type Counts = HashMap<u64, (u32, u64)>;
 
-fn merge_partial(mut a: Partial, b: Partial) -> Partial {
+fn merge_counts(mut a: Counts, b: Counts) -> Counts {
     if a.len() < b.len() {
-        return merge_partial(b, a);
+        return merge_counts(b, a);
     }
-    for (k, (c, h, r)) in b {
+    for (k, (c, r)) in b {
+        let e = a.entry(k).or_insert((0, r));
+        e.0 += c;
+        e.1 = e.1.min(r);
+    }
+    a
+}
+
+fn merge_hists(mut a: HashMap<u64, Hist>, b: HashMap<u64, Hist>) -> HashMap<u64, Hist> {
+    if a.len() < b.len() {
+        return merge_hists(b, a);
+    }
+    for (k, h) in b {
         match a.entry(k) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                let e = e.get_mut();
-                e.0 += c;
-                e.1.iter_mut().zip(h.iter()).for_each(|(x, y)| *x += y);
-                e.2 = e.2.min(r);
+                e.get_mut()
+                    .iter_mut()
+                    .zip(h.iter())
+                    .for_each(|(x, y)| *x += y);
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert((c, h, r));
+                e.insert(h);
             }
         }
     }
@@ -179,6 +191,19 @@ impl Scan {
             walk: std::time::Duration::ZERO,
             sized: std::time::Duration::ZERO,
         }
+    }
+
+    /// Bytes the per-tile state holds: charged to the export's budget.
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        let entry = std::mem::size_of::<(u64, TileStat)>() as u64 + 1;
+        let hist = std::mem::size_of::<[u32; BUCKETS]>() as u64;
+        self.levels
+            .iter()
+            .map(|l| {
+                l.capacity() as u64 * entry
+                    + l.values().filter(|t| t.hist.is_some()).count() as u64 * hist
+            })
+            .sum()
     }
 
     /// Forget everything: the scan restarts from the geometry.
@@ -246,36 +271,56 @@ impl Scan {
             .par_iter_mut()
             .zip(&zooms[range])
             .for_each(|(level, &zoom)| {
-                let flushed = pending
+                // Counts first, then a histogram for only the tiles that keep
+                // one: a histogram per key per fold partial would cost 256
+                // bytes for every small tile.
+                let counted = pending
                     .par_iter()
                     .with_min_len(2048)
-                    .fold(Partial::new, |mut acc, (b, gap, row)| {
-                        let slot = (*gap != GAP_NONE).then(|| bucket(*gap, zoom));
+                    .fold(Counts::new, |mut acc, (b, _, row)| {
                         for_each_member_key(b, zoom, opts, |key| {
-                            let e = acc
-                                .entry(key)
-                                .or_insert_with(|| (0, Box::new([0; BUCKETS]), *row));
+                            let e = acc.entry(key).or_insert((0, *row));
                             e.0 += 1;
-                            e.2 = e.2.min(*row);
-                            if let Some(s) = slot {
-                                e.1[s] += 1;
-                            }
+                            e.1 = e.1.min(*row);
                         });
                         acc
                     })
-                    .reduce(Partial::new, merge_partial);
+                    .reduce(Counts::new, merge_counts);
                 // A tile keeps a histogram from the flush its count reaches
                 // HIST_MIN_MEMBERS on.
-                for (key, (count, hist, row)) in flushed {
+                let mut keep = HashSet::new();
+                for (key, (count, row)) in counted {
                     let t = level.entry(key).or_default();
                     t.count = t.count.saturating_add(count);
                     if count > t.densest_run.0 {
                         t.densest_run = (count, band, row);
                     }
-                    match &mut t.hist {
-                        Some(h) => h.iter_mut().zip(hist.iter()).for_each(|(a, b)| *a += b),
-                        None if t.count >= HIST_MIN_MEMBERS => t.hist = Some(hist),
-                        None => {}
+                    if t.count >= HIST_MIN_MEMBERS {
+                        keep.insert(key);
+                    }
+                }
+                if keep.is_empty() {
+                    return;
+                }
+                let hists = pending
+                    .par_iter()
+                    .with_min_len(2048)
+                    .filter(|(_, gap, _)| *gap != GAP_NONE)
+                    .fold(HashMap::<u64, Hist>::new, |mut acc, (b, gap, _)| {
+                        let s = bucket(*gap, zoom);
+                        for_each_member_key(b, zoom, opts, |key| {
+                            if keep.contains(&key) {
+                                acc.entry(key).or_insert_with(|| Box::new([0; BUCKETS]))[s] += 1;
+                            }
+                        });
+                        acc
+                    })
+                    .reduce(HashMap::new, merge_hists);
+                for key in keep {
+                    let t = level.get_mut(&key).expect("counted above");
+                    let h = t.hist.get_or_insert_with(|| Box::new([0; BUCKETS]));
+                    if let Some(add) = hists.get(&key) {
+                        h.iter_mut().zip(add.iter()).for_each(|(a, b)| *a += b);
                     }
                 }
             });

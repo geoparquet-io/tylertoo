@@ -22,8 +22,8 @@
 )]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, RwLock};
 
 pub(crate) const ENV: &str = "TYLERTOO_VALVE_SCOPE";
 
@@ -60,7 +60,7 @@ pub(crate) fn smooth_factor() -> f64 {
 /// Rings a neighbour's need reaches in `smooth`.
 const SMOOTH_RINGS: i64 = 8;
 
-type Key = (u8, u32, u32);
+pub(crate) type Key = (u8, u32, u32);
 
 static RECORDING: RwLock<Option<HashMap<Key, u64>>> = RwLock::new(None);
 /// Merge-valve encodes, this pass.
@@ -113,11 +113,83 @@ pub(crate) fn set_floors(
     *STATE.write().unwrap() = Some((need, floors, zoom));
     ENCODES.store(0, Ordering::Relaxed);
     RAISED.store(0, Ordering::Relaxed);
+    release(Hold::Free);
 }
 
 /// The probe's needs, the per-tile floors, the per-zoom floors.
 type State = (HashMap<Key, u64>, HashMap<Key, u64>, HashMap<u8, u64>);
 static STATE: RwLock<Option<State>> = RwLock::new(None);
+
+/// Where the floors a background predictor computes are.
+enum Hold {
+    Free,
+    Pending,
+    Failed(String),
+}
+
+static HELD: AtomicBool = AtomicBool::new(false);
+static HOLD: (Mutex<Hold>, Condvar) = (Mutex::new(Hold::Free), Condvar::new());
+
+fn release(to: Hold) {
+    *HOLD
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = to;
+    HELD.store(false, Ordering::Release);
+    HOLD.1.notify_all();
+}
+
+/// Floors are on their way: [`wait_for_floors`] blocks until [`set_floors`]
+/// or [`fail_floors`].
+pub(crate) fn hold_floors() {
+    *HOLD
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Hold::Pending;
+    HELD.store(true, Ordering::Release);
+}
+
+/// The background predictor failed: [`wait_for_floors`] returns `message`.
+pub(crate) fn fail_floors(message: String) {
+    release(Hold::Failed(message));
+}
+
+/// Wait for held floors; the predictor's error if it failed. The export's
+/// calling thread waits here before any tile encodes; on a pool thread it
+/// runs the pool's queued work (the predictor's among it) meanwhile.
+pub(crate) fn wait_for_floors() -> Result<(), String> {
+    while rayon::current_thread_index().is_some() && HELD.load(Ordering::Acquire) {
+        if rayon::yield_now() != Some(rayon::Yield::Executed) {
+            std::thread::yield_now();
+        }
+    }
+    if !HELD.load(Ordering::Acquire) {
+        if let Hold::Failed(m) = std::mem::replace(
+            &mut *HOLD
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Hold::Free,
+        ) {
+            return Err(m);
+        }
+        return Ok(());
+    }
+    let mut held = HOLD
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while matches!(*held, Hold::Pending) {
+        held = HOLD
+            .1
+            .wait(held)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    match std::mem::replace(&mut *held, Hold::Free) {
+        Hold::Failed(m) => Err(m),
+        _ => Ok(()),
+    }
+}
 
 /// The threshold the current tile starts from: 0 unless a probe set floors.
 /// Counts the tile in [`RAISED`] when that is above the tile's own need.
@@ -125,6 +197,13 @@ pub(crate) fn start_mingap() -> u64 {
     let Some(key) = CURRENT.with(std::cell::Cell::get) else {
         return 0;
     };
+    // The export waited already; this only guards a tile encoded early,
+    // and runs the pool's queued work (the predictor's among it) meanwhile.
+    while HELD.load(Ordering::Acquire) {
+        if rayon::yield_now() != Some(rayon::Yield::Executed) {
+            std::thread::yield_now();
+        }
+    }
     let state = STATE
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -263,4 +342,23 @@ pub(crate) fn dump(
 /// SCRATCH: the zoom of the tile being encoded.
 pub(crate) fn current_zoom() -> u8 {
     CURRENT.with(std::cell::Cell::get).map_or(0, |k| k.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn held_floors_release_once_and_a_failure_reaches_the_waiter() {
+        hold_floors();
+        let setter =
+            std::thread::spawn(|| set_floors(HashMap::new(), HashMap::new(), HashMap::new()));
+        assert_eq!(wait_for_floors(), Ok(()));
+        setter.join().unwrap();
+        hold_floors();
+        fail_floors("read failed".to_string());
+        assert_eq!(wait_for_floors(), Err("read failed".to_string()));
+        // Reported once; nothing is held afterwards.
+        assert_eq!(wait_for_floors(), Ok(()));
+    }
 }
