@@ -3320,8 +3320,16 @@ fn drop_joined_tile(
         .flat_map(|l| &l.features)
         .enumerate()
         .collect();
+    // One MoveTo of one point, or of a date-line pair (`draws_one_point`).
     let point_like = features.iter().all(|(_, f)| {
-        f.r#type == Some(crate::vector_tile::tile::GeomType::Point as i32) && f.geometry.len() <= 3
+        let g = &f.geometry;
+        f.r#type == Some(crate::vector_tile::tile::GeomType::Point as i32)
+            && (g.len() <= 3
+                || (g.len() == 5 && g[0] == (2 << 3 | 1) && {
+                    let y = i64::from(crate::mvt::zigzag_decode(g[2]));
+                    let dy = i64::from(crate::mvt::zigzag_decode(g[4]));
+                    crate::overview::export::draws_one_point([y, y + dy].into_iter())
+                }))
     });
     // Rank once; every keep count below selects from this ranking.
     let ranked =
@@ -6091,6 +6099,63 @@ mod tests {
         .unwrap();
         assert!(raw.len() <= cap, "{} > {cap}", raw.len());
         assert!(dropped <= 45, "kept only {} points", 100 - dropped);
+    }
+
+    /// A joined z0 tile holds a date-line point's two copies as one 2-point
+    /// MultiPoint (#342). The tile is still points: the drop spreads its
+    /// survivors over every part of it, rather than keeping every pair and
+    /// a prefix of the plain points.
+    #[test]
+    fn merge_bands_point_drop_spreads_past_date_line_pairs() {
+        let zz = |n: i32| ((n << 1) ^ (n >> 31)) as u32;
+        let mut layer = feature_layer("points", Vec::new());
+        layer.features = (0..100_u32)
+            .map(|i| {
+                let (x, y) = (i as i32 * 40, 2_000 + i as i32);
+                crate::vector_tile::tile::Feature {
+                    id: Some(u64::from(i)),
+                    r#type: Some(crate::vector_tile::tile::GeomType::Point as i32),
+                    geometry: if i >= 90 {
+                        // The east copy and the west copy, one world apart.
+                        vec![17, zz(x), zz(y), zz(-4_096), 0]
+                    } else {
+                        vec![9, zz(x), zz(y)]
+                    },
+                    tags: Vec::new(),
+                }
+            })
+            .collect();
+        let tile = crate::vector_tile::Tile {
+            layers: vec![layer],
+        };
+        let mut raw = tile.encode_to_vec();
+        let cap = raw.len() / 2;
+        let mut gzip = compression::compress(&raw, Compression::Gzip).unwrap();
+        let dropped = drop_joined_tile(
+            &mut raw,
+            &mut gzip,
+            &ExportOptions {
+                tile_size_limit: Some(cap),
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            dropped > 0 && raw.len() <= cap,
+            "{dropped} dropped, {} bytes",
+            raw.len()
+        );
+        let kept = crate::vector_tile::Tile::decode(raw.as_slice()).unwrap();
+        let plain: Vec<u64> = kept.layers[0]
+            .features
+            .iter()
+            .filter_map(|f| f.id.filter(|&id| id < 90))
+            .collect();
+        assert!(
+            plain.iter().any(|&id| id >= 60),
+            "plain points kept only from the front: {plain:?}"
+        );
     }
 
     thread_local! {

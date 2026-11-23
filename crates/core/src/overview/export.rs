@@ -10327,9 +10327,25 @@ fn valve_merges(opts: &ExportOptions) -> bool {
 }
 
 /// Whether every member has at most one coordinate: a tile of points (or of
-/// polygons collapsed to centroid points, the #259 dot-fill recipe).
+/// polygons collapsed to centroid points, the #259 dot-fill recipe), where
+/// the two date-line copies of one point count as one ([`draws_one_point`]).
 fn is_point_like<M: TileFeature>(members: &[M]) -> bool {
-    members.iter().all(|m| m.geometry().coords_count() <= 1)
+    members.iter().all(|m| match m.geometry() {
+        Geometry::MultiPoint(mp) => draws_one_point(mp.0.iter().map(|p| p.y())),
+        g => g.coords_count() <= 1,
+    })
+}
+
+/// Whether a member's points, given by their latitudes (or MVT `y`), draw
+/// one point: none or one, or the pair [`join_wrapped_pieces`] makes when a
+/// point within the buffer of the date line reaches a z0 tile twice (#342).
+/// The two copies differ only in longitude, so they share a latitude.
+pub(crate) fn draws_one_point<T: PartialEq>(mut ys: impl Iterator<Item = T>) -> bool {
+    match (ys.next(), ys.next(), ys.next()) {
+        (_, None, _) => true,
+        (Some(a), Some(b), None) => a == b,
+        _ => false,
+    }
 }
 
 /// The share of a tile that fits its size limits: the smallest
@@ -20890,6 +20906,33 @@ mod tests {
         let kept = select_kept_members(&members, 2);
         let counts: Vec<usize> = kept.iter().map(|m| m.geom.coords_count()).collect();
         assert_eq!(counts, vec![5, 4]);
+    }
+
+    /// At z0 a point within the buffer of the date line reaches the tile
+    /// twice, and the two copies join into one 2-point MultiPoint (#342). A
+    /// tile holding such members is still a tile of points: it thins by the
+    /// even stride across the whole tile, not by size (which kept every
+    /// wrapped pair and then a prefix of the rest: no Europe at z0).
+    #[test]
+    fn drop_valve_point_tile_with_date_line_pairs_keeps_uniform_stride() {
+        let mut members: Vec<Member> = (0..90)
+            .map(|i| point_member(-170.0 + 3.7 * i as f64, 10.0, i))
+            .collect();
+        members.extend((90..100).map(|i| {
+            Member {
+                geom: Geometry::MultiPoint(geo::MultiPoint(vec![
+                    Point::new(179.5, i as f64 / 10.0),
+                    Point::new(-180.5, i as f64 / 10.0),
+                ]))
+                .into(),
+                ..point_member(0.0, 0.0, i)
+            }
+        }));
+        let kept: Vec<u64> = select_kept_members(&members, 10)
+            .iter()
+            .map(|m| m.seq)
+            .collect();
+        assert_eq!(kept, (0..10).map(|i| i * 10).collect::<Vec<_>>());
     }
 
     /// A `--feature-order` column the layer does not publish is a silent
