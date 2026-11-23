@@ -212,6 +212,7 @@ export_pmtiles(
     description: str | None = None,
     attribution: str | None = None,
     size_valve: Literal['merge', 'drop'] = "merge",
+    merge_scope: Literal['smooth', 'tile'] = "smooth",
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     max_zoom_simplify_factor: float | None = None,
     no_simplification_of_shared_nodes: bool = False,
@@ -249,6 +250,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `description`: Description of the tileset, stored in the metadata.
 * `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.
 * `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes. If still over, drop unmerged features, halve the tile extent to 512, then drop whole features if needed. Merged features are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
+* `merge_scope`: How far `size_valve="merge"` reaches. `"smooth"` predicts each tile's merge threshold from the export scan and starts the tiles around a merging tile from a threshold that fades over the next tile, so merge density steps down gradually instead of at a tile edge. `"tile"` merges each tile only as much as it needs on its own, as tippecanoe does.
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and `0` or `None` is no limit.
 * `max_zoom_simplify_factor`: Simplify each feature of the finest (canonical) level once, before clipping, with tolerance factor × GSD at that level's zoom, like `simplify_factor` for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Only vertices are removed: features, individual MultiLineString or MultiPolygon parts, and polygon rings (including holes) that would collapse or be dropped under the tolerance keep their original geometry. Defaults to `None`: lines use factor 0.25 and polygons are not simplified. An explicit factor applies to both; `0` disables it. Explicit `None` selects the command's default, like `"auto"` for size caps: no max-zoom simplification under verbatim or for pyramid bands, and 0.25 for both kinds under the tippecanoe preset. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Comparable to tippecanoe's `-S`, which uses tile units at every zoom: `-S 10` is about factor 2.5.
 * `no_simplification_of_shared_nodes`: Set `True` to rebuild and keep shared-border pins at the finest zoom. Acts only when you set `max_zoom_simplify_factor` above 0 or use `preset="tippecanoe"`, which sets it to 0.25. Defaults to `False`.
@@ -303,6 +305,7 @@ pyramid(
     attribution: str | None = None,
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     size_valve: Literal['merge', 'drop'] = "merge",
+    merge_scope: Literal['smooth', 'tile'] = "smooth",
     coverage_fill: bool = False,
     max_zoom_simplify_factor: float | None = None,
     simple_clip_fastpath: bool = True,
@@ -339,6 +342,7 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 * `attribution`: Attribution text or HTML for the output, `""` included. Unset, every PMTiles band's credit is kept, joined with `" | "`; GeoParquet bands carry none.
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes for bands tiled here; `"auto"`, `0` and `None` are no limit.
 * `size_valve`: See `export_pmtiles()`.
+* `merge_scope`: See `export_pmtiles()`.
 * `coverage_fill`: See `export_pmtiles()`.
 * `max_zoom_simplify_factor`: See `export_pmtiles()`. Bands default to `0`: nothing is simplified at the max zoom. `None` selects this default; an explicit factor applies to lines and polygons.
 * `simple_clip_fastpath`: See `export_pmtiles()`.
@@ -560,6 +564,7 @@ convert(
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
     size_valve: Literal['merge', 'drop'] = "merge",
+    merge_scope: Literal['smooth', 'tile'] = "smooth",
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     coverage_fill: bool = False,
     max_zoom_simplify_factor: float | None = None,
@@ -649,6 +654,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `exclude_properties`: See `overview()`.
 * `exclude_all_properties`: See `overview()`.
 * `size_valve`: See `export_pmtiles()`.
+* `merge_scope`: See `export_pmtiles()`.
 * `max_compressed_tile_size`: See `export_pmtiles()`. `"auto"` is no limit with `verbatim`.
 * `coverage_fill`: See `export_pmtiles()`.
 * `max_zoom_simplify_factor`: See `export_pmtiles()`.

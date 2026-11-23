@@ -483,6 +483,7 @@ impl TilesOptions {
                 e.compressed_tile_size_limit != defaults.compressed_tile_size_limit,
             ),
             ("--size-valve", e.size_valve != defaults.size_valve),
+            ("--merge-scope", e.merge_scope != defaults.merge_scope),
             ("--tile-format", e.tile_format != defaults.tile_format),
             ("--mlt-profile", e.mlt_profile != defaults.mlt_profile),
             ("--coverage-fill", e.coverage_fill != defaults.coverage_fill),

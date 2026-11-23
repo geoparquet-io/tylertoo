@@ -1,50 +1,54 @@
-//! SCRATCH PROTOTYPE (#768): `TYLERTOO_VALVE_SCOPE=predict`, the smooth
-//! valve without a probe export.
+//! `--merge-scope smooth` (#768): each tile's merge need, predicted from
+//! the export scan, and the floors it puts on the tiles around it.
 //!
 //! The export scan ([`super::scan_all_levels`]) already visits every row's
-//! bbox and every tile it lands in. With `predict` it also walks each band's
-//! rows in file order to get the merge gaps the export will see
-//! ([`RowGapCursor`], same predecessor rule), and keeps per tile a member
-//! count and a half-octave histogram of those gaps ([`Scan`]).
+//! bbox and every tile it lands in. With `smooth` it also follows each
+//! tile's own members in file order ([`Scan`]): a member count, the band
+//! holding most of them, and, from the tile's 1,024th member on, a
+//! half-octave histogram of each member's gap to the tile's previous member
+//! in its band (the merge valve's gap measure, [`gap_to_rect`]).
 //!
-//! After the scan, each tile's need is predicted ([`predict`]):
+//! After the scan each tile's need is predicted ([`Scan::predict`]):
 //!
 //! 1. Size: `count × (raw, gzipped) bytes a member` against the caps in
-//!    force: the estimated fit `f`. The bytes a member come from a real
-//!    encode of a sample of each level's densest tile
+//!    force, the estimated fit `f`. The bytes a member come from a real
+//!    encode of a sample of the tile's own members
 //!    ([`super::valve_sample_bytes`]): the footer cannot price attributes
 //!    the way MVT does (a value table deduplicated per tile, tags that gzip
-//!    to nothing when a column is constant, nested columns written as
-//!    JSON), and gzip ratios run 0.2 (Madagascar adm4, 53 columns) to 0.6.
-//!    Only tiles estimated well over (`f < PREDICT_BELOW_FIT`) get a need: a
-//!    false positive puts floors on up to 288 neighbours, a missed near-cap
-//!    tile only skips a small step.
+//!    to nothing when a column is constant, nested columns written as JSON),
+//!    and gzip ratios run 0.2 (Madagascar adm4, 53 columns) to 0.6. Every
+//!    tile with a histogram is priced by the 256 members the scan kept from
+//!    its 1,024th on; those that puts near a cap, by its first 4,096 in the
+//!    band holding most of them. Only tiles estimated well over (`f < PREDICT_BELOW_FIT`)
+//!    get a need: a false positive puts floors on its neighbours, a missed
+//!    near-cap tile only skips a small step.
 //! 2. Need: the merge valve's threshold is a gap quantile. It keeps about
 //!    `0.8 × f` of the features on its second encode, a little less when it
 //!    takes more (`KEEP_EXP`). The need is the histogram's `1 − keep`
 //!    quantile.
 //!
-//! Floors are the prototype's smooth rule over neighbours
-//! ([`super::valve_scope::smooth_floors`]), and a tile predicted over starts
-//! at its own predicted need (`TYLERTOO_VALVE_SELF`), so it usually fits on
-//! its first encode. The ladder in `merge_to_fit` stays the backstop: a tile
-//! whose real need is higher still raises its threshold until it fits, so
-//! the cap holds. A tile's own over-prediction merges it harder than it
-//! needed (NZ: kept share 0.85-0.93 of the probe's, median per level).
+//! The floors ([`floors`]) are each tile's own need and its neighbours'
+//! needs, halved a ring. `merge_to_fit` starts its ladder at the tile's
+//! floor, so a tile predicted over usually fits on its first encode; the
+//! ladder stays the backstop that holds the cap.
 //!
-//! Unlike the probe, the scan reads every tile even under a `--tile-range`
-//! shard (the scan is restricted after), so shards predict the same floors.
-//! shortcut: a geometry-sourced scan (no bbox covering) drops null rows
-//! before the gap walk, so its gaps can shift at a null; walk the
-//! row-aligned bboxes there too when a covering-less input needs it.
+//! Sharding: everything a tile's need depends on comes from its own
+//! members, in file order, never from row positions or other tiles, and a
+//! shard holds every row of the tiles in its range and of their neighbours
+//! out to [`SMOOTH_RINGS`]. So a shard computes the floors the full build
+//! does for every tile it owns, whatever row groups it pruned.
+//! shortcut: a geometry-sourced scan (an overview with no bbox covering)
+//! drops null rows before the predictor sees them, so a tile's sample rows
+//! can be a few rows off after a null; walk row-aligned bboxes there too if
+//! a covering-less overview ever needs sharded smooth floors.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
 use geo::Rect;
 use rayon::prelude::*;
 
-use super::coalesce_valve::{RowGapCursor, GAP_NONE};
+use super::coalesce_valve::{gap_to_rect, world_xy, GAP_NONE};
 use super::{for_each_member_key, key_to_xy, ExportOptions};
 use crate::tile::TileBounds;
 
@@ -58,6 +62,9 @@ const BUCKET_OFFSET: f64 = 8.0;
 /// cap holds tens of thousands; the few gaps it misses before crossing do
 /// not move a quantile.
 const HIST_MIN_MEMBERS: u32 = 1024;
+
+/// Members in a tile's first price sample.
+pub(crate) const PRICE_MEMBERS: usize = 256;
 
 /// Predict a need only for tiles estimated below this fit.
 const PREDICT_BELOW_FIT: f64 = 0.9;
@@ -74,48 +81,132 @@ type Hist = Box<[u32; BUCKETS]>;
 /// Raw and gzipped MVT bytes of one member.
 pub(crate) type MemberBytes = (f64, f64);
 
+/// One tile's scan state. Everything in it depends only on the tile's own
+/// members, in file order, so a shard that holds all of a tile's rows (any
+/// tile in its range) computes what a monolithic build does, whatever rows
+/// around them it pruned.
 #[derive(Default)]
 struct TileStat {
     count: u32,
+    /// From the member that reaches [`HIST_MIN_MEMBERS`] on: each member's
+    /// gap to the tile's previous member in its band.
     hist: Option<Hist>,
-    /// Where most of its members were read: the flush that held the most,
-    /// as `(members, band, the band's row its first member was on)`.
-    densest_run: (u32, u16, u64),
+    /// The previous member's band and bbox centre (world units).
+    prev: Option<(u16, (f64, f64))>,
+    /// The band being counted: `(band, members, first and last member's
+    /// band rows)`.
+    run: Run,
+    /// The band with the most members so far, lowest on a tie, as `run`.
+    best: Run,
+    /// The band and band row of the first [`PRICE_MEMBERS`] members from
+    /// the one that reaches [`HIST_MIN_MEMBERS`]: the rows it is priced by.
+    price_rows: Vec<(u16, u64)>,
+}
+
+type Run = (u16, u32, u64, u64);
+
+impl TileStat {
+    /// The band its members are sampled in: the one holding the most.
+    fn densest_run(&self) -> Run {
+        if self.run.1 > self.best.1 {
+            self.run
+        } else {
+            self.best
+        }
+    }
 }
 
 /// A tile to price with a sample encode: its level, key, and the band and
-/// band row its densest run of members starts at.
+/// band rows of its first and last member in the band holding most of its
+/// members.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SampleAt {
     pub(crate) level: usize,
     pub(crate) key: u64,
     pub(crate) band: u16,
     pub(crate) row: u64,
+    pub(crate) last: u64,
 }
 
-/// The predictor's share of the scan: per level, per tile key.
+/// The predictor's share of the scan: per level, per tile key, the keys
+/// split into [`PARTS`] maps so a level's tiles update in parallel.
 pub(crate) struct Scan {
-    levels: Vec<HashMap<u64, TileStat>>,
-    /// The band being walked and its gap cursor.
-    cursor: Option<(usize, RowGapCursor)>,
-    /// Rows waiting for [`Self::flush`], row-aligned, and the levels they
-    /// fan to.
+    levels: Vec<[HashMap<u64, TileStat>; PARTS]>,
+    /// The band being read, and its rows already sized.
+    band: Option<usize>,
+    band_rows: u64,
+    /// Rows waiting for [`Self::flush`], and the levels they fan to.
     pending: Vec<Option<TileBounds>>,
     pending_levels: RangeInclusive<usize>,
-    /// The open band's rows already flushed.
-    band_rows: u64,
-    /// SCRATCH: time spent walking gaps and sizing flushes.
-    pub(crate) walk: std::time::Duration,
-    pub(crate) sized: std::time::Duration,
 }
 
-/// Rows one [`Scan::flush`] sizes: a fixed count, so where a tile's
-/// histogram starts does not depend on the pool or the read's batching.
+/// A row as [`Scan::flush`] sizes it: its bbox, as a rect and its centre
+/// in world units, whether it is a point, and its band row.
+type SizedRow = (TileBounds, Rect<f64>, (f64, f64), bool, u64);
+
+/// Rows one [`Scan::flush`] sizes: what one pass over the levels holds.
 const FLUSH_ROWS: usize = 1 << 16;
+
+/// Maps a level's tiles are split into, by key.
+const PARTS: usize = 16;
+
+/// The map of [`Scan::levels`] that holds `key`.
+fn part(key: u64) -> usize {
+    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as usize
+}
+
+/// Rows a flush fans out per task.
+const FAN_ROWS: usize = 4096;
+
+/// One run of rows' members, `(key, row)`, per map of a level.
+type Fanned = [Vec<(u64, u32)>; PARTS];
 
 /// log2 of one squared pixel at `zoom`, in squared world units.
 fn px2_log2(zoom: u8) -> f64 {
     2.0 * (32.0 - f64::from(zoom) - 12.0)
+}
+/// Each tile's starting merge threshold, keyed `(zoom, x, y)`.
+pub(crate) type MergeFloors = HashMap<(u8, u32, u32), u64>;
+
+/// The share of a need (a squared distance) that reaches one Chebyshev ring
+/// further: 0.5, so the linear merge distance shrinks by 1/sqrt(2) a ring.
+const SMOOTH_FACTOR: f64 = 0.5;
+
+/// Rings a tile's need reaches. One: reaches of 3 to 8 changed no
+/// density step at z5 to z9 on NZ parcels or Moldova fields by more than
+/// 0.08, nor any drawn share or edge gap.
+///
+/// A shard holds every row within `shard::SHARD_READ_MARGIN_TILES` pivot
+/// tiles of its range, which must cover this many rings plus a tile buffer
+/// (at most one tile) at the pivot zoom, the widest tiles a shard owns.
+pub(crate) const SMOOTH_RINGS: i64 = 1;
+const _: () = assert!(
+    (SMOOTH_RINGS + 1) as f64 <= crate::shard::SHARD_READ_MARGIN_TILES,
+    "a shard must read every row of the tiles its merge floors reach"
+);
+
+/// The floors `need` puts on the tiles: the largest of each tile's own need
+/// and its neighbours' needs times `SMOOTH_FACTOR` a ring, out to
+/// `SMOOTH_RINGS`, at the same zoom.
+pub(crate) fn floors(need: &HashMap<(u8, u32, u32), u64>) -> MergeFloors {
+    let mut out = MergeFloors::new();
+    for (&(z, x, y), &m) in need {
+        let n = 1i64 << z;
+        for dy in -SMOOTH_RINGS..=SMOOTH_RINGS {
+            for dx in -SMOOTH_RINGS..=SMOOTH_RINGS {
+                let (tx, ty) = (i64::from(x) + dx, i64::from(y) + dy);
+                if tx < 0 || ty < 0 || tx >= n || ty >= n {
+                    continue;
+                }
+                let d = dx.abs().max(dy.abs());
+                let v = (m as f64 * SMOOTH_FACTOR.powi(d as i32)) as u64;
+                let e = out.entry((z, tx as u32, ty as u32)).or_insert(0);
+                *e = (*e).max(v);
+            }
+        }
+    }
+    out.retain(|_, v| *v > 0);
+    out
 }
 
 /// The histogram bucket of `gap` at `zoom`.
@@ -145,60 +236,25 @@ pub(crate) fn quantile(hist: &[u32; BUCKETS], q: f64, zoom: u8) -> Option<u64> {
     None
 }
 
-/// Per tile key: members and the first band row.
-type Counts = HashMap<u64, (u32, u64)>;
-
-fn merge_counts(mut a: Counts, b: Counts) -> Counts {
-    if a.len() < b.len() {
-        return merge_counts(b, a);
-    }
-    for (k, (c, r)) in b {
-        let e = a.entry(k).or_insert((0, r));
-        e.0 += c;
-        e.1 = e.1.min(r);
-    }
-    a
-}
-
-fn merge_hists(mut a: HashMap<u64, Hist>, b: HashMap<u64, Hist>) -> HashMap<u64, Hist> {
-    if a.len() < b.len() {
-        return merge_hists(b, a);
-    }
-    for (k, h) in b {
-        match a.entry(k) {
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                e.get_mut()
-                    .iter_mut()
-                    .zip(h.iter())
-                    .for_each(|(x, y)| *x += y);
-            }
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(h);
-            }
-        }
-    }
-    a
-}
-
 impl Scan {
     pub(crate) fn new(levels: usize) -> Self {
         Self {
-            levels: (0..levels).map(|_| HashMap::new()).collect(),
-            cursor: None,
+            levels: (0..levels).map(|_| Default::default()).collect(),
+            band: None,
+            band_rows: 0,
             pending: Vec::new(),
             pending_levels: 0..=0,
-            band_rows: 0,
-            walk: std::time::Duration::ZERO,
-            sized: std::time::Duration::ZERO,
         }
     }
 
     /// Bytes the per-tile state holds: charged to the export's budget.
     pub(crate) fn resident_bytes(&self) -> u64 {
         let entry = std::mem::size_of::<(u64, TileStat)>() as u64 + 1;
-        let hist = std::mem::size_of::<[u32; BUCKETS]>() as u64;
+        let hist = std::mem::size_of::<[u32; BUCKETS]>() as u64
+            + (PRICE_MEMBERS * std::mem::size_of::<(u16, u64)>()) as u64;
         self.levels
             .iter()
+            .flatten()
             .map(|l| {
                 l.capacity() as u64 * entry
                     + l.values().filter(|t| t.hist.is_some()).count() as u64 * hist
@@ -211,23 +267,21 @@ impl Scan {
         *self = Self::new(self.levels.len());
     }
 
-    /// One batch of band `j`'s rows, row-aligned (`None`: no bbox), fanned to
-    /// `levels`. `groups` gives the band's `(band, rows)` row groups, called
-    /// when the band starts.
+    /// One batch of band `j`'s rows, row-aligned (`None`: no bbox), fanned
+    /// to `levels`.
     pub(crate) fn batch(
         &mut self,
         j: usize,
-        groups: impl FnOnce() -> Vec<(u16, u64)>,
         rows: &[Option<TileBounds>],
         levels: RangeInclusive<usize>,
         zooms: &[u8],
         opts: &ExportOptions,
     ) {
-        if self.cursor.as_ref().is_none_or(|(b, _)| *b != j) {
+        if self.band != Some(j) {
             self.flush(zooms, opts);
-            self.cursor = Some((j, RowGapCursor::new(groups())));
-            self.pending_levels = levels;
+            self.band = Some(j);
             self.band_rows = 0;
+            self.pending_levels = levels;
         }
         for row in rows {
             self.pending.push(*row);
@@ -237,165 +291,156 @@ impl Scan {
         }
     }
 
-    /// Size the pending rows into every level they fan to, in the pool.
+    /// Size the pending rows into every level they fan to: the levels in
+    /// the pool, each level's rows in file order, so a tile's state follows
+    /// its own members one by one.
     pub(crate) fn flush(&mut self, zooms: &[u8], opts: &ExportOptions) {
         if self.pending.is_empty() {
             return;
         }
-        let t = std::time::Instant::now();
-        let rects: Vec<Option<Rect<f64>>> = self
+        let band = u16::try_from(self.band.expect("a band is open")).unwrap_or(u16::MAX);
+        let first = self.band_rows;
+        // Each row's bbox, its centre, and whether it is a point (never
+        // merged), computed once for every level.
+        let rows: Vec<SizedRow> = self
             .pending
             .par_iter()
+            .enumerate()
             .with_min_len(2048)
-            .map(|r| r.map(|b| Rect::new((b.lng_min, b.lat_min), (b.lng_max, b.lat_max))))
-            .collect();
-        let (band, cursor) = self.cursor.as_mut().expect("a band is open");
-        let band = u16::try_from(*band).unwrap_or(u16::MAX);
-        let gaps = cursor.batch_rects(&rects);
-        let first = self.band_rows;
-        let pending: Vec<(TileBounds, u64, u64)> = self
-            .pending
-            .iter()
-            .zip(gaps)
-            .zip(first..)
-            .filter_map(|((r, (gap, _)), row)| {
+            .filter_map(|(i, r)| {
+                let row = first + i as u64;
                 let b = (*r)?;
+                let rect = Rect::new((b.lng_min, b.lat_min), (b.lng_max, b.lat_max));
+                let c = rect.center();
                 let point = b.lng_min == b.lng_max && b.lat_min == b.lat_max;
-                Some((b, if point { GAP_NONE } else { gap }, row))
+                Some((b, rect, world_xy(c.x, c.y), point, row))
             })
             .collect();
-        self.walk += t.elapsed();
-        let t = std::time::Instant::now();
+        // Per level, per run of rows, each map's (key, row) members in file
+        // order; then each map follows its members in that order.
         let range = self.pending_levels.clone();
+        let fanned: Vec<Vec<Fanned>> = zooms[range.clone()]
+            .par_iter()
+            .map(|&zoom| {
+                rows.par_chunks(FAN_ROWS)
+                    .enumerate()
+                    .map(|(c, run)| {
+                        let mut out = Fanned::default();
+                        for (i, (b, ..)) in run.iter().enumerate() {
+                            let i = (c * FAN_ROWS + i) as u32;
+                            for_each_member_key(b, zoom, opts, |key| out[part(key)].push((key, i)));
+                        }
+                        out
+                    })
+                    .collect()
+            })
+            .collect();
         self.levels[range.clone()]
             .par_iter_mut()
+            .zip(fanned)
             .zip(&zooms[range])
-            .for_each(|(level, &zoom)| {
-                // Counts first, then a histogram for only the tiles that keep
-                // one: a histogram per key per fold partial would cost 256
-                // bytes for every small tile.
-                let counted = pending
-                    .par_iter()
-                    .with_min_len(2048)
-                    .fold(Counts::new, |mut acc, (b, _, row)| {
-                        for_each_member_key(b, zoom, opts, |key| {
-                            let e = acc.entry(key).or_insert((0, *row));
-                            e.0 += 1;
-                            e.1 = e.1.min(*row);
-                        });
-                        acc
-                    })
-                    .reduce(Counts::new, merge_counts);
-                // A tile keeps a histogram from the flush its count reaches
-                // HIST_MIN_MEMBERS on.
-                let mut keep = HashSet::new();
-                for (key, (count, row)) in counted {
-                    let t = level.entry(key).or_default();
-                    t.count = t.count.saturating_add(count);
-                    if count > t.densest_run.0 {
-                        t.densest_run = (count, band, row);
-                    }
-                    if t.count >= HIST_MIN_MEMBERS {
-                        keep.insert(key);
-                    }
-                }
-                if keep.is_empty() {
-                    return;
-                }
-                let hists = pending
-                    .par_iter()
-                    .with_min_len(2048)
-                    .filter(|(_, gap, _)| *gap != GAP_NONE)
-                    .fold(HashMap::<u64, Hist>::new, |mut acc, (b, gap, _)| {
-                        let s = bucket(*gap, zoom);
-                        for_each_member_key(b, zoom, opts, |key| {
-                            if keep.contains(&key) {
-                                acc.entry(key).or_insert_with(|| Box::new([0; BUCKETS]))[s] += 1;
+            .for_each(|((level, fanned), &zoom)| {
+                level.par_iter_mut().enumerate().for_each(|(p, tiles)| {
+                    for &(key, i) in fanned.iter().flat_map(|run| &run[p]) {
+                        let (_, rect, centre, point, row) = &rows[i as usize];
+                        let t = tiles.entry(key).or_default();
+                        t.count = t.count.saturating_add(1);
+                        if t.run.0 != band || t.run.1 == 0 {
+                            if t.run.1 > t.best.1 {
+                                t.best = t.run;
                             }
-                        });
-                        acc
-                    })
-                    .reduce(HashMap::new, merge_hists);
-                for key in keep {
-                    let t = level.get_mut(&key).expect("counted above");
-                    let h = t.hist.get_or_insert_with(|| Box::new([0; BUCKETS]));
-                    if let Some(add) = hists.get(&key) {
-                        h.iter_mut().zip(add.iter()).for_each(|(a, b)| *a += b);
+                            t.run = (band, 0, *row, *row);
+                        }
+                        t.run.1 += 1;
+                        t.run.3 = *row;
+                        let gap = match t.prev {
+                            Some((b, p)) if b == band && !point => gap_to_rect(p, rect),
+                            _ => GAP_NONE,
+                        };
+                        t.prev = Some((band, *centre));
+                        if t.count >= HIST_MIN_MEMBERS {
+                            if t.price_rows.len() < PRICE_MEMBERS {
+                                t.price_rows.push((band, *row));
+                            }
+                            let h = t.hist.get_or_insert_with(|| Box::new([0; BUCKETS]));
+                            if gap != GAP_NONE {
+                                h[bucket(gap, zoom)] += 1;
+                            }
+                        }
                     }
-                }
+                });
             });
         self.band_rows += self.pending.len() as u64;
         self.pending.clear();
-        self.sized += t.elapsed();
     }
 
-    /// Each tile's predicted need, keyed `(zoom, x, y)`; tiles predicted to
-    /// fit are absent.
-    /// Each level's tile with the most members among those with a
-    /// histogram (the ones that can be predicted over), lowest key on a tie.
-    pub(crate) fn densest(&self) -> Vec<Option<SampleAt>> {
-        self.levels
-            .iter()
-            .enumerate()
-            .map(|(level, tiles)| {
-                tiles
-                    .iter()
-                    .filter(|(_, t)| t.hist.is_some())
-                    .max_by_key(|(&key, t)| (t.count, std::cmp::Reverse(key)))
-                    .map(|(&key, t)| sample_at(level, key, t))
-            })
-            .collect()
+    /// The tiles that can be predicted over (those with a histogram), in
+    /// `(level, key)` order: each is priced by a sample of its own members,
+    /// never by another tile's, so the price is the same in any shard.
+    pub(crate) fn priced(&self) -> Vec<SampleAt> {
+        self.select(|_, _| true)
     }
 
-    /// The tiles worth their own sample: estimated under
-    /// `CANDIDATE_FIT` at their level's bytes a member. Tiles of one level
-    /// run up to 1.5× apart in bytes a member (Moldova gzip 26-32 at z9).
+    /// The rows `at` (one of [`Self::priced`]) is first priced by, as
+    /// `(band, band row)`, in file order.
+    pub(crate) fn price_rows(&self, at: &SampleAt) -> &[(u16, u64)] {
+        self.levels[at.level][part(at.key)]
+            .get(&at.key)
+            .map_or(&[], |t| &t.price_rows)
+    }
+
+    /// The tiles worth a larger sample: estimated under `CANDIDATE_FIT` at
+    /// their first sample's bytes a member.
     pub(crate) fn candidates(
         &self,
-        level_bytes: &[Option<MemberBytes>],
+        bytes: &HashMap<(usize, u64), MemberBytes>,
         opts: &ExportOptions,
     ) -> Vec<SampleAt> {
         let caps = caps(opts);
+        self.select(|s, t| {
+            bytes
+                .get(&(s.level, s.key))
+                .is_some_and(|&b| fit(t.count, b, caps) < CANDIDATE_FIT)
+        })
+    }
+
+    fn select(&self, keep: impl Fn(&SampleAt, &TileStat) -> bool) -> Vec<SampleAt> {
         let mut out: Vec<SampleAt> = self
             .levels
             .iter()
-            .zip(level_bytes)
             .enumerate()
-            .filter_map(|(level, (tiles, bytes))| Some((level, tiles, (*bytes)?)))
-            .flat_map(|(level, tiles, bytes)| {
+            .flat_map(|(level, tiles)| {
                 tiles
                     .iter()
-                    .filter(move |(_, t)| {
-                        t.hist.is_some() && fit(t.count, bytes, caps) < CANDIDATE_FIT
-                    })
-                    .map(move |(&key, t)| sample_at(level, key, t))
+                    .flatten()
+                    .filter(|(_, t)| t.hist.is_some())
+                    .map(move |(&key, t)| (sample_at(level, key, t), t))
             })
+            .filter(|(s, t)| keep(s, t))
+            .map(|(s, _)| s)
             .collect();
         out.sort_by_key(|s| (s.level, s.key));
         out
     }
 
     /// Needs of the tiles predicted over, each priced at its own sampled
-    /// `(raw, gzipped)` bytes a member (`tile_bytes`), else its level's; a
-    /// tile with neither predicts nothing.
+    /// `(raw, gzipped)` bytes a member; a tile without a price predicts
+    /// nothing.
     pub(crate) fn predict(
         &self,
         zooms: &[u8],
-        level_bytes: &[Option<MemberBytes>],
-        tile_bytes: &HashMap<(usize, u64), MemberBytes>,
+        bytes: &HashMap<(usize, u64), MemberBytes>,
         opts: &ExportOptions,
     ) -> HashMap<(u8, u32, u32), u64> {
         let caps = caps(opts);
         let mut out = HashMap::new();
-        for (index, ((level, &zoom), bytes)) in
-            self.levels.iter().zip(zooms).zip(level_bytes).enumerate()
-        {
-            for (&key, t) in level {
+        for (index, (level, &zoom)) in self.levels.iter().zip(zooms).enumerate() {
+            for (&key, t) in level.iter().flatten() {
                 let Some(hist) = &t.hist else { continue };
-                let Some(bytes) = tile_bytes.get(&(index, key)).copied().or(*bytes) else {
+                let Some(&b) = bytes.get(&(index, key)) else {
                     continue;
                 };
-                if let Some(need) = predict_need(hist, t.count, zoom, bytes, caps) {
+                if let Some(need) = predict_need(hist, t.count, zoom, b, caps) {
                     let (x, y) = key_to_xy(key, zoom);
                     out.insert((zoom, x, y), need);
                 }
@@ -409,8 +454,9 @@ fn sample_at(level: usize, key: u64, t: &TileStat) -> SampleAt {
     SampleAt {
         level,
         key,
-        band: t.densest_run.1,
-        row: t.densest_run.2,
+        band: t.densest_run().0,
+        row: t.densest_run().2,
+        last: t.densest_run().3,
     }
 }
 
@@ -494,68 +540,143 @@ mod tests {
         assert!(predict_need(&hist, 15_000, zoom, (100.0, 40.0), gz).is_some());
     }
 
-    #[test]
-    fn a_tile_is_sampled_where_its_densest_run_starts_and_only_near_a_cap() {
-        let opts = ExportOptions::default();
-        let zooms = [10u8];
-        // Band 0: 100 rows elsewhere, then 70,000 small features inside one
-        // z10 tile, spread over two flushes; band 1 adds a sparse tile.
-        let inside = |i: u32| {
-            let x = 10.0 + f64::from(i % 300) * 1e-4;
-            let y = 10.0 + f64::from(i / 300) * 1e-5;
-            Some(TileBounds::new(x, y, x + 1e-5, y + 1e-5))
-        };
-        let far = Some(TileBounds::new(-60.0, -30.0, -59.9999, -29.9999));
-        let mut rows = vec![far; 100];
-        rows.extend((0..70_000).map(inside));
-        let mut scan = Scan::new(1);
-        scan.batch(
-            0,
-            || vec![(0, rows.len() as u64)],
-            &rows,
-            0..=0,
-            &zooms,
-            &opts,
-        );
-        let sparse = vec![far; 2_000];
-        scan.batch(1, || vec![(1, 2_000)], &sparse, 0..=0, &zooms, &opts);
-        scan.flush(&zooms, &opts);
+    /// Small features inside one z10 tile, spaced so their gaps vary.
+    fn inside(i: u32) -> TileBounds {
+        let x = 10.0 + f64::from(i % 300) * 1e-4;
+        let y = 10.0 + f64::from(i / 300) * 1e-5;
+        TileBounds::new(x, y, x + 1e-5, y + 1e-5)
+    }
 
-        let dense = scan.densest()[0].expect("a tile with a histogram");
-        // The first flush holds 65,436 of its rows from band row 100 on.
-        assert_eq!((dense.band, dense.row), (0, 100));
-        // 70,000 members at 100 bytes raw: 3.4x the 2 MiB cap; the far tile
-        // (2,100 members) is nowhere near it and is not sampled.
-        let bytes = [Some((100.0, 20.0))];
-        let c = scan.candidates(&bytes, &opts);
-        assert_eq!(c, vec![dense]);
-        let need = scan.predict(&zooms, &bytes, &HashMap::new(), &opts);
-        assert_eq!(need.len(), 1);
-        // Its own sampled bytes win over the level's: at 20 bytes raw and 5
-        // gzipped it fits.
-        let own = HashMap::from([((0, dense.key), (20.0, 5.0))]);
-        assert!(scan.predict(&zooms, &bytes, &own, &opts).is_empty());
+    fn far(i: u32) -> TileBounds {
+        let x = -60.0 + f64::from(i % 50) * 1e-3;
+        TileBounds::new(x, -30.0, x + 1e-4, -29.9999)
+    }
+
+    /// One scan of `bands`, each a band's rows, at z10.
+    fn scan_of(bands: &[Vec<Option<TileBounds>>]) -> Scan {
+        let (zooms, opts) = ([10u8], ExportOptions::default());
+        let mut scan = Scan::new(1);
+        for (j, rows) in bands.iter().enumerate() {
+            // Uneven batches, as a reader makes them.
+            for chunk in rows.chunks(7_000) {
+                scan.batch(j, chunk, 0..=0, &zooms, &opts);
+            }
+        }
+        scan.flush(&zooms, &opts);
+        scan
+    }
+
+    fn key_of(b: TileBounds) -> u64 {
+        let mut key = None;
+        for_each_member_key(&b, 10, &ExportOptions::default(), |k| key = Some(k));
+        key.unwrap()
     }
 
     #[test]
-    fn floors_skip_self_and_the_zoom_max_is_the_largest_need() {
-        use super::super::valve_scope::{smooth_floors, zoom_floors};
-        let need = HashMap::from([((7, 10, 10), 1_000u64), ((7, 30, 30), 64), ((8, 0, 0), 5)]);
-        let f = smooth_floors(&need, 0.5, false);
+    fn a_tile_is_sampled_in_its_densest_band_and_only_near_a_cap() {
+        let opts = ExportOptions::default();
+        // Band 0: 500 members of the tile. Band 1: 100 rows elsewhere, then
+        // 70,000 members.
+        let band0: Vec<_> = (0..500).map(|i| Some(inside(i))).collect();
+        let mut band1: Vec<_> = (0..100).map(|i| Some(far(i))).collect();
+        band1.extend((500..70_500).map(|i| Some(inside(i))));
+        let scan = scan_of(&[band0, band1]);
+        let key = key_of(inside(0));
+        // Only the dense tile holds a histogram; it is sampled where its
+        // densest band starts.
+        let priced = scan.priced();
         assert_eq!(
-            f.get(&(7, 10, 10)),
-            None,
-            "a tile's own need is not its floor"
+            priced,
+            vec![SampleAt {
+                level: 0,
+                key,
+                band: 1,
+                row: 100,
+                last: 70_099
+            }]
         );
+        // 70,500 members at 100 bytes raw: 3.4x the 2 MiB cap.
+        let over = HashMap::from([((0, key), (100.0, 20.0))]);
+        assert_eq!(scan.candidates(&over, &opts), priced);
+        assert_eq!(scan.predict(&[10], &over, &opts).len(), 1);
+        // At 20 bytes raw and 5 gzipped it is near the cap but fits; at 2 it
+        // is not worth a larger sample.
+        let near = HashMap::from([((0, key), (20.0, 5.0))]);
+        assert_eq!(scan.candidates(&near, &opts), priced);
+        assert!(scan.predict(&[10], &near, &opts).is_empty());
+        let small = HashMap::from([((0, key), (2.0, 0.5))]);
+        assert!(scan.candidates(&small, &opts).is_empty());
+    }
+
+    /// A data shard holds every row of the tiles in its range, in the same
+    /// order, but prunes row groups elsewhere, so the band rows around them
+    /// and where any fixed-size flush falls both move. A tile's state, its
+    /// sample and its need must not.
+    #[test]
+    fn a_tiles_prediction_is_the_same_whatever_rows_a_shard_pruned() {
+        let opts = ExportOptions::default();
+        // Row identities: tile members are their index, far rows 1,000,000+.
+        let tile = |i: u32| (i, Some(inside(i)));
+        let other = |i: u32| (1_000_000 + i, Some(far(i)));
+        let mut full: Vec<(u32, Option<TileBounds>)> = (0..40_000).map(other).collect();
+        for i in 0..30_000 {
+            full.push(tile(i));
+            if i % 3 == 0 {
+                full.push(other(50_000 + i));
+            }
+        }
+        full.extend((100_000..140_000).map(other));
+        // The shard pruned the first block and half the last.
+        let shard: Vec<_> = full
+            .iter()
+            .copied()
+            .filter(|&(id, _)| !(1_000_000..1_040_000).contains(&id) && id < 1_120_000)
+            .collect();
+        assert!(shard.len() < full.len());
+        let key = key_of(inside(0));
+        let at = |rows: &[(u32, Option<TileBounds>)]| {
+            let scan = scan_of(&[rows.iter().map(|r| r.1).collect()]);
+            let t = &scan.levels[0][part(key)][&key];
+            let s: Vec<_> = scan.priced().into_iter().filter(|s| s.key == key).collect();
+            assert_eq!(s.len(), 1);
+            let bytes = HashMap::from([((0, key), (100.0, 20.0))]);
+            (
+                t.count,
+                t.hist.clone(),
+                // The sampled rows, by identity.
+                rows[s[0].row as usize].0,
+                scan.price_rows(&s[0])
+                    .iter()
+                    .map(|&(_, r)| rows[r as usize].0)
+                    .collect::<Vec<_>>(),
+                scan.predict(&[10], &bytes, &opts),
+            )
+        };
+        let (a, b) = (at(&full), at(&shard));
+        assert_eq!(a.0, 30_000);
+        assert!(a.1.is_some());
+        assert_eq!(a.2, 0, "sampled from the tile's first member");
+        assert_eq!(
+            a.3,
+            (1023..1023 + PRICE_MEMBERS as u32).collect::<Vec<_>>(),
+            "priced from the member that starts the histogram"
+        );
+        assert_eq!(a.4.len(), 1);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn floors_fade_by_ring_and_keep_a_tiles_own_need() {
+        let need = HashMap::from([((7, 10, 10), 1_000u64), ((7, 30, 30), 64), ((8, 0, 0), 5)]);
+        let f = floors(&need);
+        assert_eq!(f[&(7, 10, 10)], 1_000, "a tile starts at its own need");
         assert_eq!(f[&(7, 11, 10)], 500);
-        assert_eq!(f[&(7, 12, 8)], 250);
-        assert_eq!(f[&(7, 18, 10)], 3, "eight rings out");
-        assert_eq!(f.get(&(7, 19, 10)), None, "nine rings out");
+        assert_eq!(f[&(7, 9, 9)], 500, "a diagonal neighbour is one ring out");
+        let r = SMOOTH_RINGS as u32;
+        assert_eq!(f[&(7, 10 + r, 10)], 1_000 >> r, "the last ring");
+        assert_eq!(f.get(&(7, 11 + r, 10)), None, "past the last ring");
         assert_eq!(f[&(7, 31, 31)], 32);
         assert_eq!(f[&(8, 1, 0)], 2);
         assert!(f.keys().all(|&(z, x, y)| x < 1 << z && y < 1 << z));
-        let with_self = smooth_floors(&need, 0.5, true);
-        assert_eq!(with_self[&(7, 10, 10)], 1_000);
-        assert_eq!(zoom_floors(&need), HashMap::from([(7, 1_000), (8, 5)]));
     }
 }

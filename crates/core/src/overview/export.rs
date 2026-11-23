@@ -165,7 +165,6 @@ use crate::{
 mod coalesce_valve;
 mod tile_data;
 mod valve_predict;
-mod valve_scope;
 use tile_data::TileData;
 
 mod coverage_fill;
@@ -340,6 +339,56 @@ impl std::str::FromStr for SizeValve {
     }
 }
 
+/// How far the merge valve's threshold reaches past the tile it fits
+/// (#768). Applies only with [`SizeValve::Merge`] and a size cap.
+///
+/// DIVERGENCE FROM TIPPECANOE: tippecanoe fits each tile alone, so the
+/// merge density can jump at a tile edge where one tile needed merging and
+/// its neighbour did not. [`MergeScope::Smooth`] predicts each tile's need
+/// from the export scan and starts the eight tiles around a merged one
+/// from half its threshold, so the density steps down over a tile
+/// instead. [`MergeScope::Tile`] is tippecanoe's behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum MergeScope {
+    /// Neighbours of a tile that merges start from a fading floor of its
+    /// predicted merge threshold (the default).
+    #[default]
+    Smooth,
+    /// Each tile merges only as much as it needs on its own.
+    Tile,
+}
+
+impl MergeScope {
+    /// The value as the CLI spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Smooth => "smooth",
+            Self::Tile => "tile",
+        }
+    }
+}
+
+impl std::fmt::Display for MergeScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MergeScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "smooth" => Ok(Self::Smooth),
+            "tile" => Ok(Self::Tile),
+            other => Err(format!(
+                "unknown merge scope {other:?}: expected smooth or tile"
+            )),
+        }
+    }
+}
+
 use crate::tile::WEBMERC_HALF_M;
 pub use crate::tile_format::{MltProfile, TileFormat};
 
@@ -409,6 +458,16 @@ pub struct ExportOptions {
     ))]
     #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile over its cap: `merge` merges dense lines and polygons, drops singles, halves the extent down to 512, then drops whole features if needed. Merges keep the target's attributes and are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `drop` removes features and keeps each survivor's attributes. Point tiles use dropping in both modes", long_help = None))]
     pub size_valve: SizeValve,
+    /// How far `merge` reaches past the tile it fits (#768). Default
+    /// [`MergeScope::Smooth`].
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "smooth|tile",
+        default_value_t = ExportOptions::default().merge_scope
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "How far `--size-valve merge` reaches: `smooth` predicts each tile's merge threshold from the export scan and starts the tiles around a merging tile from a threshold that fades over the next tile, so merge density steps down gradually instead of at a tile edge. `tile` merges each tile only as much as it needs on its own, as tippecanoe does", long_help = None))]
+    pub merge_scope: MergeScope,
     /// Tile encoding, MVT by default. Each finished MVT tile is converted
     /// to MLT with mlt-core before gzip and both size caps, so the caps
     /// measure MLT bytes. MLT uses PMTiles tile type 6 and metadata format
@@ -688,6 +747,7 @@ with_setters!(ExportOptions {
     with_tile_size_limit => tile_size_limit: Option<usize>,
     with_compressed_tile_size_limit => compressed_tile_size_limit: Option<usize>,
     with_size_valve => size_valve: SizeValve,
+    with_merge_scope => merge_scope: MergeScope,
     with_tile_format => tile_format: TileFormat,
     with_mlt_profile => mlt_profile: MltProfile,
     with_coverage_fill => coverage_fill: bool,
@@ -716,6 +776,7 @@ impl Default for ExportOptions {
             tile_size_limit: Some(DEFAULT_TILE_SIZE_LIMIT),
             compressed_tile_size_limit: Some(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT),
             size_valve: SizeValve::Merge,
+            merge_scope: MergeScope::Smooth,
             tile_format: TileFormat::Mvt,
             mlt_profile: MltProfile::Web,
             coverage_fill: false,
@@ -2579,82 +2640,11 @@ fn export_pmtiles_run(
     )
 }
 
-fn export_pmtiles_validated(
-    input_path: impl AsRef<Path>,
-    output_path: impl AsRef<Path>,
-    config: &super::config::ValidatedConfig<'_, ExportOptions>,
-    partition_target: usize,
-    knobs: &Pass2Knobs,
-    budget: &mut MemoryBudget,
-    shared_zooms: &[u8],
-) -> Result<Pass2Run, ExportError> {
-    use std::sync::atomic::Ordering::Relaxed;
-    // SCRATCH PROTOTYPE (#768): see `valve_scope`.
-    let scope = valve_scope::scope();
-    let (input_path, output_path) = (input_path.as_ref(), output_path.as_ref());
-    if !matches!(
-        scope,
-        valve_scope::Scope::Tile | valve_scope::Scope::Predict
-    ) && config.options().size_valve == SizeValve::Merge
-    {
-        let dir = output_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let scratch = tempfile::Builder::new()
-            .prefix(".tylertoo-valve-probe")
-            .tempdir_in(dir)?;
-        valve_scope::start_recording();
-        let t = Instant::now();
-        export_pmtiles_validated_inner(
-            input_path,
-            scratch.path().join("probe.pmtiles"),
-            config,
-            partition_target,
-            knobs,
-            budget,
-            shared_zooms,
-        )?;
-        let need = valve_scope::take_recording();
-        valve_scope::log_needs(&need);
-        log::info!(
-            "[valve-scope] probe pass {:.1}s, {} merge-valve encodes",
-            t.elapsed().as_secs_f64(),
-            valve_scope::ENCODES.load(Relaxed)
-        );
-        let floors = valve_scope::floors(scope, &need);
-        let zoom = if scope == valve_scope::Scope::Zoom {
-            valve_scope::zoom_floors(&need)
-        } else {
-            Default::default()
-        };
-        log::info!("[valve-scope] {scope:?}: zoom floors {zoom:?}");
-        valve_scope::set_floors(need, floors, zoom);
-    } else {
-        valve_scope::ENCODES.store(0, Relaxed);
-    }
-    let run = export_pmtiles_validated_inner(
-        input_path,
-        output_path,
-        config,
-        partition_target,
-        knobs,
-        budget,
-        shared_zooms,
-    );
-    log::info!(
-        "[valve-scope] {scope:?} pass: {} merge-valve encodes, {} tiles started above their own need",
-        valve_scope::ENCODES.load(Relaxed),
-        valve_scope::RAISED.load(Relaxed)
-    );
-    run
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "#779: export orchestration keeps scan, writer and checkpoint lifetimes explicit"
 )]
-fn export_pmtiles_validated_inner(
+fn export_pmtiles_validated(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     config: &super::config::ValidatedConfig<'_, ExportOptions>,
@@ -2839,23 +2829,9 @@ fn export_pmtiles_validated_inner(
             variable_depth::VdScan::new(&meta, reader.geo_metadata_json(), level_zooms.clone())
         })
         .transpose()?;
-    let mut predict = (valve_scope::scope() == valve_scope::Scope::Predict
-        && valve_merges(options))
-    .then(|| valve_predict::Scan::new(num_levels));
-    // shortcut: a shard's overview holds only its range and a two-pivot-tile
-    // margin, short of the eight rings floors reach and of the densest tiles
-    // the prices come from, so a shard would predict other floors than the
-    // full build; refused until both depend on the tile alone.
-    if predict.is_some() && options.tile_range.is_some() {
-        return Err(ConfigError::InvalidSpec {
-            option: "TYLERTOO_VALVE_SCOPE",
-            message: "TYLERTOO_VALVE_SCOPE=predict does not support --tile-range or --shard: a \
-                      shard sees only its own range, so it would predict other merge floors \
-                      than the full build; unset it, or build without sharding"
-                .to_string(),
-        }
-        .into());
-    }
+    // #768: the predictor's share of the scan, for `--merge-scope smooth`.
+    let mut predict = (options.merge_scope == MergeScope::Smooth && valve_merges(options))
+        .then(|| valve_predict::Scan::new(num_levels));
     let mut scans = scan_all_levels(
         &reader,
         BandRead {
@@ -2870,38 +2846,25 @@ fn export_pmtiles_validated_inner(
         predict.as_mut(),
         diagnostics,
     )?;
-    if let Some(p) = predict {
-        // #768 predict: from the whole scan, before a shard restricts it. The
-        // pricing, needs and floors run beside the export's read and clip, on
-        // a pool of their own; the first tile to encode waits for the floors
-        // (`valve_scope::hold_floors`), so they never depend on timing.
-        // Its per-tile state stays resident until the floors are built.
-        budget.reserve_up_to(MemoryPhase::Scan, p.resident_bytes());
-        valve_scope::hold_floors();
-        // The job opens the same file again (a footer read) because it
-        // outlives this borrow of `reader`; it runs on the export's pool.
-        let path = reader.path().to_path_buf();
-        let (published, feature_id) = (published.clone(), feature_id.clone());
-        let (options, zooms) = (options.clone(), level_zooms.clone());
-        rayon::spawn(move || {
-            let run = || -> Result<_, ExportError> {
-                let reader = OverviewReader::open(&path)?;
-                predict_floors(
-                    &reader,
-                    (&published, feature_id.as_ref()),
-                    crs,
-                    (&options, &zooms),
-                    &p,
-                    t_scan,
-                )
-            };
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
-                Ok(Ok(floors)) => valve_scope::set_floors(HashMap::new(), floors, HashMap::new()),
-                Ok(Err(e)) => valve_scope::fail_floors(e.to_string()),
-                Err(_) => valve_scope::fail_floors("the predictor panicked".to_string()),
-            }
-        });
-    }
+    // #768: the merge floors, from the whole scan (before a shard restricts
+    // it). Each tile's need comes from its own members alone, so a shard,
+    // which holds every row of the tiles in its range and of their
+    // neighbours (`shard::SHARD_READ_MARGIN_TILES`), predicts the floors the
+    // full build does.
+    let floors = match predict {
+        Some(p) => {
+            // Its per-tile state stays resident until the floors are built.
+            budget.reserve_up_to(MemoryPhase::Scan, p.resident_bytes());
+            predict_floors(
+                &reader,
+                (&published, feature_id.as_ref()),
+                crs,
+                (options, &level_zooms),
+                &p,
+            )?
+        }
+        None => valve_predict::MergeFloors::new(),
+    };
 
     // #498: a sharded build's export owns a slice of the tile space, not all
     // of it. Restricting the SCAN — the per-zoom tile-count map every
@@ -3157,6 +3120,7 @@ fn export_pmtiles_validated_inner(
         level_read,
         member_bytes,
         pins: pins.as_ref(),
+        floors: Some(&floors),
         #[cfg(test)]
         work: &work,
     };
@@ -3181,12 +3145,6 @@ fn export_pmtiles_validated_inner(
         coarsest_zoom,
     };
     let probe_timers = Arc::clone(&progress.profile.timers);
-    // #768 predict: no tile encodes before its floors are in.
-    valve_scope::wait_for_floors().map_err(|m| {
-        ExportError::Io(std::io::Error::other(format!(
-            "TYLERTOO_VALVE_SCOPE=predict could not build its merge floors: {m}"
-        )))
-    })?;
     #[cfg_attr(not(test), expect(unused_variables, reason = "the tests' schedule"))]
     let (reports, level_groups, probed) = match vd {
         None => {
@@ -3791,253 +3749,378 @@ fn resolve_export_columns(
     })
 }
 
-/// #768 predict: each level priced at its densest tile, then every tile
-/// that price puts near or over a cap at its own ([`valve_sample_bytes`]);
-/// the needs, and the smooth floors with each tile's own need.
+/// #768 `--merge-scope smooth`: each tile's predicted need, priced by real
+/// encodes of samples of its own members, and the floors they put on their
+/// neighbours ([`valve_predict::floors`]).
 fn predict_floors(
     reader: &OverviewReader,
     cols: (&PublishedNames, Option<&ResolvedFeatureId>),
     crs: Crs,
     (options, level_zooms): (&ExportOptions, &[u8]),
     p: &valve_predict::Scan,
-    t_scan: Instant,
-) -> Result<HashMap<valve_scope::Key, u64>, ExportError> {
-    let t_sample = Instant::now();
-    let densest = p.densest();
-    let at: Vec<_> = densest.iter().flatten().copied().collect();
-    let mut priced =
-        valve_sample_bytes(reader, cols, crs, (options, level_zooms), &at)?.into_iter();
-    let member_bytes: Vec<Option<MemberBytes>> = densest
-        .iter()
-        .map(|d| d.and_then(|_| priced.next().flatten()))
-        .collect();
-    let candidates = p.candidates(&member_bytes, options);
-    let tile_bytes: HashMap<(usize, u64), MemberBytes> = candidates
-        .iter()
-        .zip(valve_sample_bytes(
-            reader,
-            cols,
-            crs,
-            (options, level_zooms),
-            &candidates,
-        )?)
-        .filter_map(|(t, b)| Some(((t.level, t.key), b?)))
-        .collect();
-    let need = p.predict(level_zooms, &member_bytes, &tile_bytes, options);
-    valve_scope::log_needs(&need);
-    if let Ok(path) = std::env::var("TYLERTOO_VALVE_PRED_DUMP") {
-        // SCRATCH (#768): the predicted needs, for the accuracy table.
-        let lines: String = need
-            .iter()
-            .map(|(&(z, x, y), &m)| format!("{z} {x} {y} {m}\n"))
-            .collect();
-        let bytes: String = tile_bytes
-            .iter()
-            .map(|(&(level, key), &(r, g))| {
-                let z = level_zooms[level];
-                let (x, y) = key_to_xy(key, z);
-                format!("{z} {x} {y} {r:.1} {g:.1}\n")
-            })
-            .collect();
-        std::fs::write(format!("{path}.bytes"), bytes)?;
-        std::fs::write(path, lines)?;
-    }
-    let mut floors = valve_scope::smooth_floors(&need, valve_scope::smooth_factor(), false);
-    // A tile predicted over starts at this share of its own predicted
-    // need (`TYLERTOO_VALVE_SELF`, default 1; 0: neighbours' floors only).
-    // NZ: ladder encodes past the first 84 -> 4, bytes -0.8%.
-    let own: f64 = std::env::var("TYLERTOO_VALVE_SELF")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1.0);
-    if own > 0.0 {
-        for (&k, &m) in &need {
-            let f = floors.entry(k).or_insert(0);
-            *f = (*f).max((m as f64 * own) as u64);
-        }
-    }
+) -> Result<valve_predict::MergeFloors, ExportError> {
+    let t = Instant::now();
+    // Every tile that can be over is priced by a small sample of its own
+    // members; those it puts near a cap, by a larger one.
+    let sample = |tiles: &[valve_predict::SampleAt], rows: SampleRows| {
+        valve_sample_bytes(reader, cols, crs, (options, level_zooms), tiles, rows).map(|b| {
+            tiles
+                .iter()
+                .zip(b)
+                .filter_map(|(t, b)| Some(((t.level, t.key), b?)))
+                .collect::<HashMap<(usize, u64), MemberBytes>>()
+        })
+    };
+    let priced = p.priced();
+    let first = sample(&priced, stored_sample_rows(reader, p, &priced)?)?;
+    let candidates = p.candidates(&first, options);
+    let mut bytes = first;
+    let rows = valve_sample_rows(
+        reader,
+        cols.0,
+        crs,
+        (options, level_zooms),
+        &candidates,
+        SAMPLE_MEMBERS,
+    )?;
+    bytes.extend(sample(&candidates, rows)?);
+    let need = p.predict(level_zooms, &bytes, options);
+    let floors = valve_predict::floors(&need);
     log::info!(
-        "[valve-scope] predict: bytes a member (raw, gzip) {}, {} tiles sampled in {:.2}s, {} tiles predicted over, {} floors, scan {:.2}s (gap walk {:.2}s, sizing {:.2}s)",
-        member_bytes
-            .iter()
-            .zip(level_zooms)
-            .filter_map(|(b, z)| b.map(|(r, g)| format!("z{z} {r:.0}/{g:.0}")))
-            .collect::<Vec<_>>()
-            .join(" "),
-        tile_bytes.len(),
-        t_sample.elapsed().as_secs_f64(),
+        "[export] merge floors: {} tiles priced ({} by a larger sample), {} predicted over a cap, {} floors, {:.2}s",
+        bytes.len(),
+        candidates.len(),
         need.len(),
         floors.len(),
-        t_scan.elapsed().as_secs_f64(),
-        p.walk.as_secs_f64(),
-        p.sized.as_secs_f64(),
+        t.elapsed().as_secs_f64(),
     );
     Ok(floors)
 }
 
-/// #768 predict: the raw and gzipped MVT bytes one member of each of
-/// `tiles` costs, from a real first encode of a sample of its members: the
-/// export's own clip, attributes and encoder over up to `SAMPLE_MEMBERS`
-/// members from the `WINDOW_ROWS` rows its densest run of rows starts at,
-/// in that row group and the band's next. Row groups read in parallel, each
-/// once for all the tiles whose run starts in it. `None` for a tile whose
-/// sample is too small to price.
+/// #768 predict: members in the larger price sample of a tile its first
+/// one ([`valve_predict::PRICE_MEMBERS`]) puts near a cap. Fewer than
+/// `MIN_SAMPLE_MEMBERS` prices nothing.
+const SAMPLE_MEMBERS: usize = 4096;
+const MIN_SAMPLE_MEMBERS: usize = 256;
+
+/// Per row group: each tile (its index) and its rows to sample there.
+type SampleRows = BTreeMap<usize, Vec<(usize, Vec<u32>)>>;
+
+/// #768: the rows the scan kept to price each of `tiles` by
+/// ([`valve_predict::Scan::price_rows`]), per row group.
+fn stored_sample_rows(
+    reader: &OverviewReader,
+    p: &valve_predict::Scan,
+    tiles: &[valve_predict::SampleAt],
+) -> Result<SampleRows, ExportError> {
+    // Each band's row groups and the band row each starts at.
+    let mut starts: HashMap<u16, Vec<(usize, u64)>> = HashMap::new();
+    let mut chosen = SampleRows::new();
+    for (i, t) in tiles.iter().enumerate() {
+        for &(band, row) in p.price_rows(t) {
+            let groups = match starts.entry(band) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let mut at = 0u64;
+                    let rows_of = |rg| reader.parquet_metadata().row_group(rg).num_rows().max(0);
+                    let groups = reader.band(usize::from(band))?.into_iter().map(|rg| {
+                        let start = at;
+                        at += rows_of(rg) as u64;
+                        (rg, start)
+                    });
+                    e.insert(groups.collect())
+                }
+            };
+            let (rg, start) = groups[groups.partition_point(|&(_, s)| s <= row) - 1];
+            let entry = chosen.entry(rg).or_default();
+            let offset = (row - start) as u32;
+            match entry.last_mut() {
+                Some((j, rows)) if *j == i => rows.push(offset),
+                _ => entry.push((i, vec![offset])),
+            }
+        }
+    }
+    Ok(chosen)
+}
+
+/// #768: the rows [`valve_sample_bytes`] samples, per row group: each
+/// tile's first `sample_members` member rows in its span, read from the
+/// bbox covering alone (the geometry when there is none).
+fn valve_sample_rows(
+    reader: &OverviewReader,
+    published: &PublishedNames,
+    crs: Crs,
+    (opts, zooms): (&ExportOptions, &[u8]),
+    tiles: &[valve_predict::SampleAt],
+    sample_members: usize,
+) -> Result<SampleRows, ExportError> {
+    let rows_of = |rg: usize| reader.parquet_metadata().row_group(rg).num_rows().max(0) as u64;
+    // Each tile's span, as `(row group, first row, last row)` per row group
+    // of its band it covers, rows counted from the row group's start.
+    let mut spans: BTreeMap<usize, Vec<(usize, u64, u64)>> = BTreeMap::new();
+    for (i, t) in tiles.iter().enumerate() {
+        let mut start = 0u64;
+        for rg in reader.band(usize::from(t.band))? {
+            let n = rows_of(rg);
+            let (lo, hi) = (t.row.max(start), t.last.min(start + n - 1));
+            if n > 0 && lo <= hi {
+                spans
+                    .entry(rg)
+                    .or_default()
+                    .push((i, lo - start, hi - start));
+            }
+            start += n;
+            if start > t.last {
+                break;
+            }
+        }
+    }
+    let source = ScanBboxSource::for_reader(reader);
+    let projection: Option<Vec<usize>> = match &source {
+        ScanBboxSource::Covering { .. } => reader
+            .resolved_schema()
+            .f64_covering()
+            .map(|(idx, _)| vec![idx]),
+        ScanBboxSource::Geometry => None,
+    };
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    // Read 1: per row group, each spanning tile's member rows, in order.
+    let found = spans
+        .par_iter()
+        .map(
+            |(&rg, spanning)| -> Result<Vec<(usize, usize, Vec<u32>)>, ExportError> {
+                let mut rows: Vec<Vec<u32>> = vec![Vec::new(); spanning.len()];
+                let mut base = 0u64;
+                for batch in read_row_group(reader, rg, projection.as_deref())? {
+                    let batch = batch.map_err(|e| read_error(e.into()))?;
+                    let n = batch.num_rows() as u64;
+                    let open = |&(_, lo, hi): &(usize, u64, u64)| lo < base + n && hi >= base;
+                    let wanted = |w: usize, rows: &[Vec<u32>]| {
+                        open(&spanning[w]) && rows[w].len() < sample_members
+                    };
+                    if (0..spanning.len()).any(|w| wanted(w, &rows)) {
+                        let bboxes = match &source {
+                            // A malformed covering row (the scan then fell
+                            // back to geometry) is sampled as no member.
+                            ScanBboxSource::Covering { column, names } => {
+                                covering_rows(&batch, column, names, crs)?
+                                    .map(Option::flatten)
+                                    .collect()
+                            }
+                            ScanBboxSource::Geometry => decode_batch_bboxes(
+                                &batch,
+                                published.geometry.as_deref(),
+                                crs,
+                                &diagnostics,
+                            )?,
+                        };
+                        for (w, span) in spanning.iter().enumerate() {
+                            if !wanted(w, &rows) {
+                                continue;
+                            }
+                            let t = tiles[span.0];
+                            let (lo, hi) =
+                                (span.1.max(base) - base, span.2.min(base + n - 1) - base);
+                            for row in lo..=hi {
+                                let Some(Some(b)) = bboxes.get(row as usize) else {
+                                    continue;
+                                };
+                                let mut member = false;
+                                for_each_member_key(b, zooms[t.level], opts, |k| {
+                                    member |= k == t.key
+                                });
+                                if member {
+                                    rows[w].push((base + row) as u32);
+                                    if rows[w].len() == sample_members {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    base += n;
+                    // Every span ended or already holds its sample.
+                    if spanning
+                        .iter()
+                        .zip(&rows)
+                        .all(|(&(_, _, hi), r)| hi < base || r.len() >= sample_members)
+                    {
+                        break;
+                    }
+                }
+                Ok(spanning
+                    .iter()
+                    .zip(rows)
+                    .map(|(&(i, _, _), r)| (i, rg, r))
+                    .collect())
+            },
+        )
+        .collect::<Result<Vec<_>, ExportError>>()?;
+    // Each tile's first `sample_members` member rows, in band order.
+    let mut by_tile: Vec<Vec<(usize, Vec<u32>)>> = vec![Vec::new(); tiles.len()];
+    for (i, rg, rows) in found.into_iter().flatten() {
+        by_tile[i].push((rg, rows));
+    }
+    let mut chosen = SampleRows::new();
+    for (i, mut groups) in by_tile.into_iter().enumerate() {
+        groups.sort_by_key(|&(rg, _)| {
+            reader
+                .band(usize::from(tiles[i].band))
+                .map_or(0, |b| b.iter().position(|&x| x == rg).unwrap_or(0))
+        });
+        let mut left = sample_members;
+        for (rg, mut rows) in groups {
+            rows.truncate(left);
+            left -= rows.len();
+            if !rows.is_empty() {
+                chosen.entry(rg).or_default().push((i, rows));
+            }
+            if left == 0 {
+                break;
+            }
+        }
+    }
+    Ok(chosen)
+}
+
+/// One row group of the overview, as batches, with `projection`.
+fn read_row_group<'a>(
+    reader: &'a OverviewReader,
+    rg: usize,
+    projection: Option<&[usize]>,
+) -> Result<crate::input_set::SourceStream<'a>, ExportError> {
+    let selection = RowGroupSelection::from_parts(vec![vec![rg]]);
+    reader
+        .source()
+        .open_stream(&crate::input_set::ReadPlan {
+            batch_size: tylertoo_io::DEFAULT_BATCH_ROWS,
+            projection,
+            row_groups: Some(&selection),
+        })
+        .map_err(|e| read_error(e.into()))
+}
+
+/// #768: the raw and gzipped MVT bytes one member of each of `tiles`
+/// costs, from a real first encode of a sample of its members (`chosen`,
+/// per row group): the export's own clip, attributes and encoder. `None`
+/// for a tile whose sample is too small to price.
+///
+/// Which rows are sampled depends only on the tile's own members, never on
+/// row positions, so a shard samples what the full build does. Row groups
+/// read in parallel, each once, decoding only the chosen rows.
 fn valve_sample_bytes(
     reader: &OverviewReader,
     (published, feature_id): (&PublishedNames, Option<&ResolvedFeatureId>),
     crs: Crs,
     (opts, zooms): (&ExportOptions, &[u8]),
     tiles: &[valve_predict::SampleAt],
+    chosen: SampleRows,
 ) -> Result<Vec<Option<MemberBytes>>, ExportError> {
-    const SAMPLE_MEMBERS: usize = 4096;
-    const MIN_MEMBERS: usize = 256;
-    const WINDOW_ROWS: u64 = 16_384;
-    // A row group and the band's next; a tile's clipped members by row.
-    type ReadRun = (usize, Option<usize>);
-    type Hit = (usize, usize, Vec<(u64, Geometry<f64>)>);
-    let rows_of = |rg: usize| reader.parquet_metadata().row_group(rg).num_rows().max(0) as u64;
-    // Row group -> (tile, its first row in the row group).
-    let mut groups: BTreeMap<ReadRun, Vec<(usize, u64)>> = BTreeMap::new();
-    for (i, t) in tiles.iter().enumerate() {
-        let mut row = t.row;
-        let band = reader.band(usize::from(t.band))?;
-        for (j, &rg) in band.iter().enumerate() {
-            if row < rows_of(rg) {
-                let next = band.get(j + 1).copied();
-                groups.entry((rg, next)).or_default().push((i, row));
-                break;
-            }
-            row -= rows_of(rg);
-        }
-    }
     let diagnostics = crate::diagnostics::Diagnostics::default();
+    // Read 2: whole rows, only the chosen ones decoded.
     let timers = ExportTimers::default();
-    let priced = groups
+    let per_rg = chosen
         .into_par_iter()
         .map(
-            |((rg, next), wanted)| -> Result<Vec<(usize, Option<MemberBytes>)>, ExportError> {
+            |(rg, wanted)| -> Result<Vec<(usize, Vec<Member>)>, ExportError> {
                 let band = reader.row_group_bands(&[rg])[0].0;
-                let selection = RowGroupSelection::from_parts(vec![[Some(rg), next]
-                    .into_iter()
-                    .flatten()
-                    .collect()]);
-                let stream = reader
-                    .source()
-                    .open_stream(&crate::input_set::ReadPlan {
-                        batch_size: tylertoo_io::DEFAULT_BATCH_ROWS,
-                        projection: None,
-                        row_groups: Some(&selection),
-                    })
-                    .map_err(|e| read_error(e.into()))?;
                 let mut members: Vec<Vec<Member>> = wanted.iter().map(|_| Vec::new()).collect();
                 let mut base = 0u64;
-                for batch in stream {
-                    // A tile samples rows `from..from + WINDOW_ROWS` until full.
-                    let open = |&(_, from): &(usize, u64), m: &Vec<Member>| {
-                        m.len() < SAMPLE_MEMBERS && base < from + WINDOW_ROWS
-                    };
-                    if !wanted.iter().zip(&members).any(|(w, m)| open(w, m)) {
-                        break;
-                    }
+                let last = wanted
+                    .iter()
+                    .filter_map(|(_, r)| r.last())
+                    .max()
+                    .copied()
+                    .unwrap_or(0);
+                for batch in read_row_group(reader, rg, None)? {
                     let batch = batch.map_err(|e| read_error(e.into()))?;
                     let n = batch.num_rows() as u64;
-                    let in_batch = |&(_, from): &(usize, u64)| from < base + n;
-                    if !wanted
+                    let in_batch = |r: &&u32| u64::from(**r) >= base && u64::from(**r) < base + n;
+                    let mut rows: Vec<u32> = wanted
                         .iter()
-                        .zip(&members)
-                        .any(|(w, m)| open(w, m) && in_batch(w))
-                    {
-                        base += n;
-                        continue;
-                    }
-                    let schema = batch.schema();
-                    let gi = batch_geometry_index(&batch, published.geometry.as_deref())?;
-                    let geoms =
-                        decode_batch_geometries(&batch, &schema, gi, crs, &timers, &diagnostics)?;
-                    // Each tile's clipped rows first; attributes only for those.
-                    let mut hits: Vec<Hit> = Vec::new();
-                    for (w, (&(i, from), sample)) in wanted.iter().zip(&members).enumerate() {
-                        if !open(&(i, from), sample) {
-                            continue;
-                        }
-                        let t = tiles[i];
-                        let lo = from.saturating_sub(base).min(n);
-                        let hi = (from + WINDOW_ROWS).saturating_sub(base).min(n);
-                        let mut taken = sample.len();
-                        for row in lo..hi {
-                            if taken >= SAMPLE_MEMBERS {
-                                break;
-                            }
-                            let row = row as usize;
-                            let pieces = feature_tile_members(
-                                &geoms[row],
-                                zooms[t.level],
-                                opts,
-                                t.key,
-                                t.key,
-                                &diagnostics,
-                            );
-                            if !pieces.is_empty() {
-                                taken += pieces.len();
-                                hits.push((w, row, pieces));
-                            }
-                        }
-                    }
-                    let mut rows: Vec<u32> = hits.iter().map(|&(_, r, _)| r as u32).collect();
+                        .flat_map(|(_, r)| r.iter().filter(in_batch))
+                        .map(|&r| (u64::from(r) - base) as u32)
+                        .collect();
                     rows.sort_unstable();
                     rows.dedup();
-                    let taken = arrow_select::take::take_record_batch(
-                        &batch,
-                        &arrow_array::UInt32Array::from(rows.clone()),
-                    )?;
-                    let mut attrs =
-                        AttrColumns::new(&schema, gi, published, feature_id).extract(&taken)?;
-                    let mut props: Vec<Option<SharedProps>> = vec![None; rows.len()];
-                    for (w, row, pieces) in hits {
-                        let r = rows.binary_search(&(row as u32)).expect("taken above");
-                        let p = props[r].get_or_insert_with(|| attrs.props(r)).clone();
-                        let id = attrs.id(r)?;
-                        let seq = base + row as u64;
-                        members[w].extend(pieces.into_iter().map(|(key, g)| Member {
-                            key,
-                            seq,
-                            geom: g.into(),
-                            props: p.clone(),
-                            id,
-                            gap: coalesce_valve::GAP_NONE,
-                            band,
-                        }));
+                    if !rows.is_empty() {
+                        let taken = arrow_select::take::take_record_batch(
+                            &batch,
+                            &arrow_array::UInt32Array::from(rows.clone()),
+                        )?;
+                        let schema = taken.schema();
+                        let gi = batch_geometry_index(&taken, published.geometry.as_deref())?;
+                        let geoms = decode_batch_geometries(
+                            &taken,
+                            &schema,
+                            gi,
+                            crs,
+                            &timers,
+                            &diagnostics,
+                        )?;
+                        let mut attrs =
+                            AttrColumns::new(&schema, gi, published, feature_id).extract(&taken)?;
+                        // Built once per row: two tiles can sample the same row.
+                        let props: Vec<SharedProps> =
+                            (0..rows.len()).map(|k| attrs.props(k)).collect();
+                        for (w, (i, wanted_rows)) in wanted.iter().enumerate() {
+                            let t = tiles[*i];
+                            for r in wanted_rows.iter().filter(in_batch) {
+                                let at = (u64::from(*r) - base) as u32;
+                                let k = rows.binary_search(&at).expect("taken above");
+                                let pieces = feature_tile_members(
+                                    &geoms[k],
+                                    zooms[t.level],
+                                    opts,
+                                    t.key,
+                                    t.key,
+                                    &diagnostics,
+                                );
+                                let props = &props[k];
+                                let id = attrs.id(k)?;
+                                members[w].extend(pieces.into_iter().map(|(key, g)| Member {
+                                    key,
+                                    seq: u64::from(*r),
+                                    geom: g.into(),
+                                    props: props.clone(),
+                                    id,
+                                    gap: coalesce_valve::GAP_NONE,
+                                    band,
+                                }));
+                            }
+                        }
                     }
                     base += n;
+                    if base > u64::from(last) {
+                        break;
+                    }
                 }
-                let cache = Arc::new(TileGzipCache::new(0));
-                wanted
-                    .iter()
-                    .zip(members)
-                    .map(|(&(i, _), mut sample)| {
-                        if sample.len() < MIN_MEMBERS {
-                            return Ok((i, None));
-                        }
-                        let t = tiles[i];
-                        let (x, y) = key_to_xy(t.key, zooms[t.level]);
-                        let tb = TileCoord::new(x, y, zooms[t.level]).bounds();
-                        sort_tile_for_encode(&mut sample, &opts.feature_order);
-                        let mut mvt =
-                            build_tile_layers(&cache, &[], &sample, &tb, opts, &[], &diagnostics);
-                        let n = sample.len() as f64;
-                        let raw = mvt.data.len() as f64;
-                        let gz = mvt.data.gzipped(&cache)?.len() as f64;
-                        Ok((i, Some((raw / n, gz / n))))
-                    })
-                    .collect()
+                Ok(wanted.iter().map(|(i, _)| *i).zip(members).collect())
             },
         )
         .collect::<Result<Vec<_>, ExportError>>()?;
-    let mut out = vec![None; tiles.len()];
-    for (i, bytes) in priced.into_iter().flatten() {
-        out[i] = bytes;
+    let mut samples: Vec<Vec<Member>> = tiles.iter().map(|_| Vec::new()).collect();
+    for (i, m) in per_rg.into_iter().flatten() {
+        samples[i].extend(m);
     }
-    Ok(out)
+    let cache = Arc::new(TileGzipCache::new(0));
+    samples
+        .into_par_iter()
+        .zip(tiles)
+        .map(|(mut sample, t)| {
+            if sample.len() < MIN_SAMPLE_MEMBERS {
+                return Ok(None);
+            }
+            let (x, y) = key_to_xy(t.key, zooms[t.level]);
+            let tb = TileCoord::new(x, y, zooms[t.level]).bounds();
+            sort_tile_for_encode(&mut sample, &opts.feature_order);
+            let mut mvt = build_tile_layers(&cache, &[], &sample, &tb, opts, &[], &diagnostics);
+            let n = sample.len() as f64;
+            let raw = mvt.data.len() as f64;
+            let gz = mvt.data.gzipped(&cache)?.len() as f64;
+            Ok(Some((raw / n, gz / n)))
+        })
+        .collect()
 }
 
 use valve_predict::MemberBytes;
@@ -4083,6 +4166,8 @@ struct ExportLevelCtx<'a> {
     member_bytes: Option<u64>,
     /// #802: the finest level's junction pins ([`finest_level_pins`]).
     pins: Option<&'a JunctionNodes>,
+    /// #768: the merge floors, with `--merge-scope smooth`.
+    floors: Option<&'a valve_predict::MergeFloors>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -4108,6 +4193,7 @@ impl<'a> ExportLevelCtx<'a> {
                 .variable_depth
                 .then_some(&self.scan.tile_counts),
             pins: self.pins,
+            floors: self.floors,
             #[cfg(test)]
             work: self.work,
         }
@@ -4525,7 +4611,7 @@ fn export_level_group(
                             level.gzip_cache,
                             (buckets, Some(&held)),
                             level.plan.zoom,
-                            &TileEncoding::single(level.options),
+                            &TileEncoding::single(level.options).with_floors(level.floors),
                             level.fills,
                             timers,
                             diagnostics,
@@ -5562,6 +5648,8 @@ struct LevelCtx<'a> {
     tiles: Option<&'a BTreeMap<u64, usize>>,
     /// #802: the finest level's junction pins ([`finest_level_pins`]).
     pins: Option<&'a JunctionNodes>,
+    /// #768: the merge floors, with `--merge-scope smooth`.
+    floors: Option<&'a valve_predict::MergeFloors>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -6661,7 +6749,7 @@ fn encode_wave_from_store(
         ctx.gzip_cache,
         (bucket_members(members, wave), None),
         ctx.zoom,
-        &TileEncoding::single(ctx.opts),
+        &TileEncoding::single(ctx.opts).with_floors(ctx.floors),
         ctx.fills,
         ctx.timers,
         diagnostics,
@@ -6742,7 +6830,7 @@ fn encode_buckets(
 /// from the geometry from the start.
 #[expect(
     clippy::too_many_arguments,
-    reason = "#768 prototype: the predictor rides along like variable depth"
+    reason = "#768: the merge predictor rides along like variable depth"
 )]
 fn scan_all_levels(
     reader: &OverviewReader,
@@ -6842,8 +6930,7 @@ impl ScanBboxSource {
 /// ([`covering_batch_bboxes`]) and the pass is abandoned.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "#768 prototype: the predictor rides along like variable depth"
+    reason = "#768: the merge predictor rides along like variable depth"
 )]
 fn scan_all_levels_from(
     (reader, band): (&OverviewReader, BandRead<'_>),
@@ -6927,19 +7014,7 @@ fn scan_all_levels_from(
             scope.spawn(move || {
                 for (j, rows) in pred_rx {
                     let last = if partitioning { num_levels - 1 } else { j };
-                    p.batch(
-                        j,
-                        || {
-                            reader
-                                .band(j)
-                                .map(|rgs| reader.row_group_bands(&rgs))
-                                .unwrap_or_default()
-                        },
-                        &rows,
-                        j..=last,
-                        zooms_ref,
-                        opts,
-                    );
+                    p.batch(j, &rows, j..=last, zooms_ref, opts);
                 }
                 p.flush(zooms_ref, opts);
             })
@@ -7095,12 +7170,10 @@ fn scan_all_levels_from(
         );
         drop(pred_tx);
         if let Some(w) = worker {
-            let t = Instant::now();
-            w.join().expect("the #768 predictor thread panicked");
-            log::info!(
-                "[valve-scope] predict: scan waited {:.2}s for the predictor",
-                t.elapsed().as_secs_f64()
-            );
+            // A panic in the predictor is re-raised here, as the scope would.
+            if let Err(panic) = w.join() {
+                std::panic::resume_unwind(panic);
+            }
         }
         piped
     })?;
@@ -7510,7 +7583,7 @@ fn process_wave(
         ctx.gzip_cache,
         (buckets, None),
         ctx.zoom,
-        &TileEncoding::single(ctx.opts),
+        &TileEncoding::single(ctx.opts).with_floors(ctx.floors),
         ctx.fills,
         ctx.timers,
         diagnostics,
@@ -9858,17 +9931,15 @@ fn encode_layer_members(
             Ok(fill) => fill.flatten().unwrap_or_default(),
             Err(error) => return Some(Err(error)),
         };
-        let mvt = valve_scope::with_tile((zoom, x, y), || {
-            encode_tile_layers(
-                gzip_cache,
-                g,
-                &tb,
-                opts,
-                &fill,
-                &mut fill_tally,
-                diagnostics,
-            )
-        });
+        let mvt = encode_tile_layers(
+            gzip_cache,
+            g,
+            &tb,
+            &opts.for_tile(zoom, x, y),
+            &fill,
+            &mut fill_tally,
+            diagnostics,
+        );
         if let Err(error) = account_sources(g, &mvt, zoom, opts, diagnostics) {
             return Some(Err(error));
         }
@@ -10189,9 +10260,14 @@ impl<T: TileFeature + ?Sized> TileFeature for &T {
 
 /// The valve's export options and optional joint layer mapping. A normal
 /// export uses an empty mapping and the original single-layer build path.
+#[derive(Clone, Copy)]
 struct TileEncoding<'a> {
     options: &'a ExportOptions,
     layers: &'a [(u16, String)],
+    /// #768: every tile's merge floor (`--merge-scope smooth`).
+    floors: Option<&'a valve_predict::MergeFloors>,
+    /// The merge floor of the tile being encoded.
+    floor: u64,
 }
 
 impl<'a> TileEncoding<'a> {
@@ -10200,7 +10276,26 @@ impl<'a> TileEncoding<'a> {
         Self {
             options,
             layers: &[],
+            floors: None,
+            floor: 0,
         }
+    }
+
+    /// With the export's merge floors.
+    fn with_floors(self, floors: Option<&'a valve_predict::MergeFloors>) -> Self {
+        Self {
+            floors: floors.filter(|f| !f.is_empty()),
+            ..self
+        }
+    }
+
+    /// For tile `(zoom, x, y)`: its own floor.
+    fn for_tile(self, zoom: u8, x: u32, y: u32) -> Self {
+        let floor = self
+            .floors
+            .and_then(|f| f.get(&(zoom, x, y)).copied())
+            .unwrap_or(0);
+        Self { floor, ..self }
     }
 }
 
@@ -10450,6 +10545,8 @@ impl<'a> JoinedTileFitter<'a> {
                     fills: None,
                     tiles: Some(&tile_counts),
                     pins: pins.as_ref(),
+                    // A joined tile is fitted alone (merge's joint valve).
+                    floors: None,
                     #[cfg(test)]
                     work: &Mutex::new(ExportWorkTally::default()),
                 };
@@ -10481,8 +10578,8 @@ impl<'a> JoinedTileFitter<'a> {
                 (buckets, None),
                 zoom,
                 &TileEncoding {
-                    options: opts,
                     layers: &layers,
+                    ..TileEncoding::single(opts)
                 },
                 None,
                 &timers,
@@ -10929,10 +11026,6 @@ fn stalled(prev_fit: f64, fit: f64) -> bool {
 /// unmerged features are dropped, smallest first. Then halve the extent to
 /// 512 before dropping merged features, smallest first. Only a lone feature
 /// that still exceeds the cap can be written over it, with a warning.
-#[expect(
-    clippy::too_many_lines,
-    reason = "#768 prototype: floors and the scratch dump"
-)]
 fn merge_to_fit(
     gzip_cache: &Arc<TileGzipCache>,
     members: &[Member],
@@ -11024,37 +11117,12 @@ fn merge_to_fit(
         })
     };
     let mut gaps: Option<Vec<u64>> = None;
-    let mut mingap = valve_scope::start_mingap();
+    // #768: `--merge-scope smooth` starts the ladder at the tile's floor.
+    let mut mingap = opts.floor;
     let mut keep_fraction = 1.0_f64;
     let mut prev_fit: Option<f64> = None;
     let mut stalls = 0u32;
     let mut passes = 0u32;
-    let mut fit1 = f64::INFINITY;
-    let mut first = (0usize, 0usize);
-    let dump = |need: u64, passes: u32, fit1: f64, first: (usize, usize)| {
-        if std::env::var_os("TYLERTOO_VALVE_DUMP").is_some() {
-            let coords: usize = members.iter().map(|m| m.geom.coords_count()).sum();
-            let tile_world = 4_294_967_296.0 / f64::from(1u32 << valve_scope::current_zoom());
-            let mut px = [0.0f64; 4];
-            for m in members {
-                if let Some(r) = m.geom.bounding_rect() {
-                    let (x0, y0) = coalesce_valve::world_xy(r.min().x, r.max().y);
-                    let (x1, y1) = coalesce_valve::world_xy(r.max().x, r.min().y);
-                    let p = ((x1 - x0).abs() + (y1 - y0).abs()) / tile_world * 4096.0;
-                    for (i, c) in [2.0, 8.0, 32.0, 128.0].iter().enumerate() {
-                        px[i] += p.min(*c);
-                    }
-                }
-            }
-            let props: usize = members.iter().map(|m| m.props.bytes().len()).sum();
-            let extra = format!(
-                "{coords} {props} {} {} {} {} {} {}",
-                px[0], px[1], px[2], px[3], first.0, first.1
-            );
-            let mut g = coalesce_valve::mergeable_gaps(&ordered);
-            valve_scope::dump(members.len(), extra, fit1, need, passes, &mut g);
-        }
-    };
     loop {
         passes += 1;
         let merged = coalesce_valve::coalesce_members(&ordered, mingap);
@@ -11063,15 +11131,6 @@ fn merge_to_fit(
         draw_order(&mut feats);
         let mut mvt = build(&feats, passes, &[]);
         let fit = tile_fit(&mut mvt, opts).unwrap_or(f64::INFINITY);
-        if passes == 1 {
-            fit1 = fit;
-            if std::env::var_os("TYLERTOO_VALVE_DUMP").is_some() {
-                first = (
-                    mvt.data.len(),
-                    mvt.data.gzipped(&mvt.gzip_cache).map_or(0, |g| g.len()),
-                );
-            }
-        }
         let tally = ValveTally {
             merged: absorbed,
             dropped: 0,
@@ -11091,9 +11150,6 @@ fn merge_to_fit(
             if absorbed > 0 && opts.feature_id.is_some() {
                 account_merged_sources(&merged, &feats, &ordered, &mut fitted);
             }
-            valve_scope::record(mingap);
-            dump(mingap, passes, fit1, first);
-            valve_scope::ENCODES.fetch_add(u64::from(passes), std::sync::atomic::Ordering::Relaxed);
             return fitted;
         }
         let g = gaps.get_or_insert_with(|| coalesce_valve::mergeable_gaps(&ordered));
@@ -11216,12 +11272,6 @@ fn merge_to_fit(
         if opts.feature_id.is_some() {
             account_merged_sources(&merged, &kept, &ordered, &mut fitted);
         }
-        valve_scope::record(mingap);
-        dump(mingap, tally.passes, fit1, first);
-        valve_scope::ENCODES.fetch_add(
-            u64::from(tally.passes),
-            std::sync::atomic::Ordering::Relaxed,
-        );
         return fitted;
     }
 }
@@ -19748,6 +19798,61 @@ mod tests {
         assert!(mvt.data.len() <= 21_000, "{v:?}");
         assert_eq!(v.reduced_extent, None, "single-drop cuts must fit: {v:?}");
         assert_eq!(v.dropped_merged, 0, "{v:?}");
+    }
+
+    /// #768: `smooth` is the default; both values round-trip their spelling.
+    #[test]
+    fn merge_scope_defaults_to_smooth_and_parses_its_spelling() {
+        assert_eq!(ExportOptions::default().merge_scope, MergeScope::Smooth);
+        for scope in [MergeScope::Smooth, MergeScope::Tile] {
+            assert_eq!(scope.as_str().parse::<MergeScope>(), Ok(scope));
+        }
+        assert!("neighbours".parse::<MergeScope>().is_err());
+    }
+
+    /// #768: `--merge-scope smooth` starts a tile's merge ladder at its
+    /// floor, so a tile that fits on its own still merges the gaps under
+    /// its floor, in one encode; with no floor it merges nothing.
+    #[test]
+    fn merge_valve_starts_from_the_tiles_floor() {
+        let members: Vec<_> = disjoint_rings(400, 4)
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| Member {
+                key: tile_key(512, 511, 10),
+                seq: i as u64,
+                geom: f.geom.into(),
+                props: SharedProps::new(vec![]),
+                id: None,
+                gap: if i == 0 { GAP_NONE } else { i as u64 },
+                band: 0,
+            })
+            .collect();
+        let opts = ExportOptions {
+            size_valve: SizeValve::Merge,
+            ..Default::default()
+        };
+        let floors = valve_predict::MergeFloors::from([((10, 512, 511), 101)]);
+        let encode = |floors| {
+            encode_tile_layers(
+                &test_gzip_cache(),
+                &members,
+                &TileCoord::new(512, 511, 10).bounds(),
+                &TileEncoding::single(&opts)
+                    .with_floors(floors)
+                    .for_tile(10, 512, 511),
+                &[],
+                &mut FillTally::default(),
+                &crate::diagnostics::Diagnostics::default(),
+            )
+            .valve
+        };
+        let alone = encode(None);
+        assert_eq!((alone.merged, alone.passes), (0, 1), "{alone:?}");
+        let floored = encode(Some(&floors));
+        // Gaps 1..=100 sit under the floor of 101.
+        assert_eq!((floored.merged, floored.passes), (100, 1), "{floored:?}");
+        assert_eq!(floored.over_limit, 0, "{floored:?}");
     }
 
     /// #873: the margin starts on the second cut, so a tile that fits on
