@@ -2182,6 +2182,72 @@ mod tests {
         );
     }
 
+    /// #908: the parallel sweep's joins give the components an all-pairs
+    /// test gives, on enough parts to take the parallel path (squares that
+    /// overlap, touch at an edge or corner, nest, or stand apart).
+    #[test]
+    fn joining_pairs_give_the_all_pairs_components() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut random = |n: i32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as i32
+        };
+        let parts: Vec<Vec<TileRing>> = (0..1_000)
+            .map(|_| {
+                let (x, y, s) = (random(420), random(420), 1 + random(12));
+                vec![vec![(x, y), (x + s, y), (x + s, y + s), (x, y + s), (x, y)]]
+            })
+            .collect();
+        fn root(r: &mut [usize], mut i: usize) -> usize {
+            while r[i] != i {
+                i = r[i];
+            }
+            i
+        }
+        let mut expected: Vec<usize> = (0..parts.len()).collect();
+        for i in 0..parts.len() {
+            for j in i + 1..parts.len() {
+                if parts_interact(&parts[i], &parts[j]) {
+                    let (a, b) = (root(&mut expected, i), root(&mut expected, j));
+                    expected[a] = b;
+                }
+            }
+        }
+        let pairs = joining_pairs(&parts);
+        let mut got: Vec<usize> = (0..parts.len()).collect();
+        for &(i, j) in &pairs {
+            let (a, b) = (root(&mut got, i as usize), root(&mut got, j as usize));
+            assert_ne!(a, b, "a joining pair closes a cycle");
+            got[a] = b;
+        }
+        // Same partition: every part's component, named by its smallest part.
+        let label = |r: &mut Vec<usize>| {
+            let mut first = vec![usize::MAX; r.len()];
+            (0..r.len())
+                .map(|i| {
+                    let c = root(r, i);
+                    first[c] = first[c].min(i);
+                    c
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|c| first[c])
+                .collect::<Vec<_>>()
+        };
+        let (expected, got) = (label(&mut expected), label(&mut got));
+        assert!(
+            expected
+                .iter()
+                .enumerate()
+                .filter(|&(i, &c)| c != i)
+                .count()
+                > 100
+        );
+        assert_eq!(got, expected);
+    }
+
     /// #908: a dense tile re-encodes the same merged groups on later
     /// passes. Each distinct group is swept once while the pass cache keeps
     /// it; a group with other members is swept again.
