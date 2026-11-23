@@ -4505,7 +4505,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4912,6 +4912,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "tylertoo-io",
+ "uf_rush",
  "url",
  "wkb",
  "xxhash-rust",
@@ -4957,6 +4958,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "uf_rush"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bde3fc3c012a03d5e25f6f5dbbb0240ad4fb5c749dbaa6614c138319670d2d20"
 
 [[package]]
 name = "unarray"

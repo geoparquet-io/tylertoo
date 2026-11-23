@@ -19,7 +19,7 @@ use geo::{
 };
 
 use crate::{
-    box_pairs::strip_box_pairs,
+    box_pairs::{par_strip_box_pairs, strip_box_pairs},
     tile::TileBounds,
     vector_tile::{
         tile::{Feature, GeomType, Layer, Value},
@@ -591,15 +591,26 @@ fn resolve_part_overlaps(parts: Vec<Vec<TileRing>>) -> Vec<Vec<TileRing>> {
 /// previously separate components.
 type PartJoin<'a> = dyn FnMut(usize, usize, &dyn Fn() -> bool) + 'a;
 
-/// Feed `join` box-meeting pairs and their lazy exact interaction tests.
+/// Feed `join` the pairs that connect the interacting parts.
 fn interacting_pairs(parts: &[Vec<TileRing>], join: &mut PartJoin<'_>) {
+    for (i, j) in joining_pairs(parts) {
+        join(i as usize, j as usize, &|| true);
+    }
+}
+
+/// Pairs of interacting parts that join `parts` into its components, at
+/// most one per part. The box sweep runs on rayon's workers (#908); which
+/// pairs it keeps depends on their timing, the components they give do not.
+fn joining_pairs(parts: &[Vec<TileRing>]) -> Vec<(u32, u32)> {
     #[cfg(test)]
     crate::valve_counter::note(|c| c.part_sweeps += 1);
     let boxes: Vec<_> = parts.iter().map(|p| ring_box(&p[0])).collect();
-    strip_box_pairs(&boxes, |i, j| {
-        join(i, j, &|| parts_interact(&parts[i], &parts[j]));
-        false
-    });
+    let components = uf_rush::UFRush::new(parts.len());
+    // Tested only while the two are apart; `unite` is true for one join.
+    par_strip_box_pairs(&boxes, |i, j| {
+        (!components.same(i, j) && parts_interact(&parts[i], &parts[j]) && components.unite(i, j))
+            .then_some((i as u32, j as u32))
+    })
 }
 
 /// [`resolve_part_overlaps`] with the interacting pairs fed by `pairs`, and
@@ -1125,23 +1136,15 @@ impl QuantizedPolygons {
             }
             return;
         }
-        let joined = std::cell::RefCell::new(Vec::new());
-        interacting_pairs(parts, &mut |i, j, interacts| {
-            // `interacts` runs only for parts in separate components, so a
-            // true answer is a join.
-            join(i, j, &|| {
-                let yes = interacts();
-                if yes {
-                    joined.borrow_mut().push((i as u32, j as u32));
-                }
-                yes
-            });
-        });
+        let pairs: std::sync::Arc<[(u32, u32)]> = joining_pairs(parts).into();
+        for &(i, j) in pairs.iter() {
+            join(i as usize, j as usize, &|| true);
+        }
         self.joins.lock().expect("joins").insert(
             leader as u32,
             GroupJoins {
                 group: group.iter().map(|&i| i as u32).collect(),
-                pairs: joined.into_inner().into(),
+                pairs,
             },
         );
     }
