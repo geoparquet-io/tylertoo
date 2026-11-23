@@ -1433,6 +1433,53 @@ The converter assumes (and `tylertoo` recommends) input prepared with
 bbox-covered, sane row-group sizing. Hilbert order within each level comes
 from the sorted-input contract — the pipeline never re-sorts.
 
+### The unsorted-input warning (#768)
+
+The size valves read file order as spatial order: merge takes each
+feature's gap from the row before it, and drop keeps an even stride. So
+pass 1 checks the order and records `Diagnostic::UnsortedInput`, which
+names `gpio sort hilbert` for the input. The CLI logs it and repeats it in
+the final report; Python raises it as a `UserWarning`. A `--plan` run
+replays it from the saved plan.
+
+The statistic (`RowOrder` in `BboxTally`, folded in `scan_chunk`) is the
+mean distance between the bbox centres of consecutive kept rows, divided by
+`sqrt(extent area / rows)`, the spacing of evenly spread rows. Gaps are
+taken within each pass-1 chunk (256–1024 rows), never across one, so the
+parallel scan needs no ordering. It is pooled over every part of a
+multi-part input. Under 500 gaps, or with a zero-area extent, it makes no
+judgment. It warns above 2.5.
+
+The mean, not the median: rows sorted by id are mostly neighbours, and it
+is their jumps that skew the valve. On the banded NZ parcels the median
+gap was 0.45 (Hilbert inputs reach 0.68), but the mean was 5.3.
+
+| Input | Order | Score |
+|---|---|---|
+| nz-parcels (4.3 M) | Hilbert | 0.07 |
+| moldova (632 k) | Hilbert | 0.34 |
+| madagascar-adm4 | Hilbert | 0.70 |
+| fieldmaps-madagascar-adm4 (fixture) | as delivered (admin codes) | 1.15 |
+| ftw-moldova-z10, variable-depth points, open-buildings (fixtures) | as delivered | 0.44–0.54 |
+| banded-parcels-sorted (fixture) | Hilbert grid | 1.07 |
+| uniform random points (200 k) | Hilbert | 0.98 |
+| sharding-grid (fixture) | row-major grid | 1.92 |
+| nz-parcels | 0.5° longitude bands, id order (the #768 report) | 5.29 |
+| nz-parcels | `gpio sort str` | 6.26 |
+| banded-parcels (fixture) | 0.1° bands, shuffled within | 14.5 |
+| moldova | `gpio sort str` | 23.4 |
+| moldova | row-major (ymin, xmin) | 24.3 |
+| moldova | shuffled | 249 |
+
+Sorted inputs score at most 1.15, unsorted at least 5.29. The threshold of
+2.5 sits about 2.2× from each. `gpio sort str` warns: with
+`ceil(sqrt(rows / row-group size))` strips, each strip is wide, and
+consecutive rows zig-zag across it.
+
+The footer check it replaced (#745) compared each row group's bbox with the
+extent. It caught shuffled input only: a banded row group is a thin strip,
+so the banded NZ file scored 0.014 against Hilbert's 0.0076.
+
 ## Output Layout: Footer Discipline
 
 The writer suppresses Parquet min/max statistics on the WKB geometry column

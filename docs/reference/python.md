@@ -12,6 +12,8 @@ Options and defaults match the CLI. Ground sample distance (GSD) is the meters c
 
 Diagnostics go to Python's `logging` under the `tylertoo_core` logger: the warnings and progress lines the CLI prints. Python shows warnings by default; call `logging.basicConfig(level=logging.INFO)` to see progress. Each call reads the logging configuration when it starts.
 
+Input must be sorted in Hilbert order (`gpio sort hilbert`); tylertoo never reorders rows. `overview()` and `convert()` raise a `UserWarning` when the input is not sorted by location.
+
 ## `overview`
 
 ```python

@@ -24,9 +24,10 @@ reads the previous step's files.
 
 ## 1. Prepare the input
 
-tylertoo reads WGS84 GeoParquet. Hilbert sorting puts geographic neighbors
-near each other on disk; row groups of a few megabytes or more improve read
-performance. Raw database and Spark exports often need both adjustments.
+tylertoo reads WGS84 GeoParquet sorted in Hilbert order. It never reorders
+rows itself, and warns when the input is not sorted by location. Hilbert
+sorting puts geographic neighbors near each other on disk; row groups of a
+few megabytes or more improve read performance. Raw database and Spark exports often need both adjustments.
 
 This export also lacks `geo` metadata, despite having valid Well-Known Binary
 (WKB) geometry. A DuckDB round trip adds the metadata so GeoParquet tools can

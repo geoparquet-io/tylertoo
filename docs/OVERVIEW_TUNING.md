@@ -191,10 +191,20 @@ next tile merged differently. Use `--size-valve drop` when every drawn
 polygon must retain its own attributes.
 
 Merging works in the input's row order: each feature is merged into the
-previous retained feature. First, sort the input spatially with
-`gpio sort hilbert` so consecutive features are near each other. On shuffled
-input, merged features can contain unrelated geometry, and color changes at
-tile edges become far more frequent.
+previous retained feature. Dropping also assumes that order: it keeps an
+even stride of rows. tylertoo never reorders rows, so the input must be
+sorted spatially with `gpio sort hilbert` first, which puts consecutive
+features near each other. On unsorted input, merged features contain
+unrelated geometry, color changes at tile edges become far more frequent,
+and dense tiles can show stripes. Input whose rows run in bands, such as
+parcels sorted by id, is unsorted in this sense even when each row group
+covers a small area.
+
+Pass 1 measures the row order and warns when the input is not sorted by
+location (#768), naming the `gpio sort hilbert` command for your input. The
+measure is the mean distance between consecutive rows divided by the
+spacing of evenly spread rows, `sqrt(extent area / rows)`; it warns above
+2.5. Hilbert-sorted inputs score 1.2 or less.
 
 ### Coverage fill: `--coverage-fill`
 
