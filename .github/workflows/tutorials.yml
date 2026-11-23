@@ -80,12 +80,14 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
+      # The tutorial steps call the duckdb and gpio CLIs. The docs group
+      # pins both (duckdb-cli, geoparquet-io), as in ci.yml's docs job.
       - name: Run the nightly tutorials and check their output
         working-directory: crates/python
         env:
           TYLERTOO_DOCS_NIGHTLY: "1"
           TYLERTOO_BIN: ${{ github.workspace }}/target/release/tylertoo
         run: |
-          uv sync --locked --no-install-project
+          uv sync --locked --no-install-project --group docs
           uv run --no-sync pytest -m docs tests/docs/test_examples.py -k brazil -v
           df -h / /mnt
