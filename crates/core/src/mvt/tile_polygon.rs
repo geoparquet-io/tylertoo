@@ -317,6 +317,18 @@ enum Loc {
 /// rules: every hole inside its exterior, no hole in another hole, no part
 /// inside another part's fill.
 pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
+    check(parts, true)
+}
+
+/// Does [`check_polygons`] find a defect? The same answer without naming
+/// which defect, so the x-order sweep that names it is skipped (#908).
+pub(crate) fn polygons_invalid<P: AsRef<[TileRing]>>(parts: &[P]) -> bool {
+    check(parts, false).is_err()
+}
+
+/// [`check_polygons`]; `first` names the defect that sweep order finds
+/// first, else any defect is returned.
+fn check<P: AsRef<[TileRing]>>(parts: &[P], first: bool) -> Result<(), Defect> {
     #[cfg(test)]
     CHECKS.with(|c| c.set(c.get() + 1));
     // The usual feature, one polygon without holes: only the ring's own
@@ -388,7 +400,8 @@ pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), De
     if strip_box_pairs(&boxes, |i, j| {
         defect = visit(i, j);
         defect.is_some()
-    }) {
+    }) && first
+    {
         any_box_pair(&boxes, |i, j| {
             defect = visit(i, j);
             defect.is_some()
@@ -923,6 +936,24 @@ mod tests {
             compared < 16 * edges,
             "{compared} box comparisons for {edges} edges"
         );
+    }
+
+    /// #908: `parts_interact` asks only whether a defect exists, which the
+    /// strips settle. Re-sweeping in x order to name the first defect paired
+    /// every edge with its column again.
+    #[test]
+    fn defect_test_follows_meeting_pairs_not_shared_columns() {
+        let mut parts = square_grid(20, 1000);
+        parts.push(vec![square(1, 1, 3, 3)]);
+        let edges: u64 = 4 * (20 * 1000 + 1);
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
+        assert!(polygons_invalid(&parts));
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
+        assert!(
+            compared < 16 * edges,
+            "{compared} box comparisons for {edges} edges"
+        );
+        assert!(check_polygons(&parts).is_err());
     }
 
     /// roborev 416: the same grid with every ring starting on a vertical

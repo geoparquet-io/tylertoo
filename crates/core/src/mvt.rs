@@ -19,7 +19,7 @@ use geo::{
 };
 
 use crate::{
-    box_pairs::any_box_pair,
+    box_pairs::strip_box_pairs,
     tile::TileBounds,
     vector_tile::{
         tile::{Feature, GeomType, Layer, Value},
@@ -569,7 +569,7 @@ fn ring_box(ring: &TileRing) -> (i32, i32, i32, i32) {
 fn parts_interact(a: &[TileRing], b: &[TileRing]) -> bool {
     #[cfg(test)]
     crate::valve_counter::note(|c| c.parts_interact += 1);
-    tile_polygon::check_polygons(&[a, b]).is_err()
+    tile_polygon::polygons_invalid(&[a, b])
 }
 
 /// Resolve overlaps *between* the parts of a multipolygon: each part is
@@ -593,8 +593,10 @@ type PartJoin<'a> = dyn FnMut(usize, usize, &dyn Fn() -> bool) + 'a;
 
 /// Feed `join` box-meeting pairs and their lazy exact interaction tests.
 fn interacting_pairs(parts: &[Vec<TileRing>], join: &mut PartJoin<'_>) {
+    #[cfg(test)]
+    crate::valve_counter::note(|c| c.part_sweeps += 1);
     let boxes: Vec<_> = parts.iter().map(|p| ring_box(&p[0])).collect();
-    any_box_pair(&boxes, |i, j| {
+    strip_box_pairs(&boxes, |i, j| {
         join(i, j, &|| parts_interact(&parts[i], &parts[j]));
         false
     });
@@ -713,6 +715,17 @@ pub(crate) struct QuantizedPolygons {
     /// By leading feature, the merged groups found valid and the lone
     /// features' repairs, so the next pass replays them.
     verdicts: std::sync::Mutex<PassCache<u32, GroupVerdict>>,
+    /// By leading feature, in dense mode, the pairs that joined a merged
+    /// group's parts, so a pass that merges the same group again replays
+    /// them instead of sweeping it (#908).
+    joins: std::sync::Mutex<PassCache<u32, GroupJoins>>,
+}
+
+/// The pairs, as local part numbers, that joined `group`'s parts: at most
+/// one per part, and the components they give are the group's.
+struct GroupJoins {
+    group: Box<[u32]>,
+    pairs: std::sync::Arc<[(u32, u32)]>,
 }
 
 /// A merged group found valid, or a lone feature's repair.
@@ -861,7 +874,7 @@ impl QuantizedPolygons {
         // allocate millions of pairs only to discard them at the cap.
         // Per-part degrees also give exact capacities on the stored path.
         let mut degrees = vec![0usize; parts.len()];
-        let too_many = any_box_pair(&boxes, |i, j| {
+        let too_many = strip_box_pairs(&boxes, |i, j| {
             if keys[i] == keys[j] {
                 degrees[i] += 1;
                 degrees[j] += 1;
@@ -877,7 +890,7 @@ impl QuantizedPolygons {
         } else {
             let mut candidates: Vec<_> = degrees.into_iter().map(Vec::with_capacity).collect();
             slots = 0;
-            any_box_pair(&boxes, |i, j| {
+            strip_box_pairs(&boxes, |i, j| {
                 if keys[i] == keys[j] {
                     candidates[i].push((j as u32, slots));
                     candidates[j].push((i as u32, slots));
@@ -902,6 +915,7 @@ impl QuantizedPolygons {
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
             verdicts: std::sync::Mutex::default(),
+            joins: std::sync::Mutex::default(),
         })
     }
 
@@ -928,6 +942,7 @@ impl QuantizedPolygons {
         let unions = self.unions.get_mut().expect("union cache");
         unions.unions.next_pass();
         self.verdicts.get_mut().expect("verdicts").next_pass();
+        self.joins.get_mut().expect("joins").next_pass();
     }
 
     /// Components served from the cache so far.
@@ -1036,7 +1051,7 @@ impl QuantizedPolygons {
                             .iter()
                             .for_each(|&(i, j)| join(i, j, &|| true));
                     } else {
-                        interacting_pairs(parts, join);
+                        self.dense_pairs(leader, group, parts, join);
                     }
                 },
                 |group, parts| self.union_cached(group, parts, &globals),
@@ -1078,6 +1093,57 @@ impl QuantizedPolygons {
                 .remove(&(leader as u32));
         }
         Some(encoded(commands))
+    }
+
+    /// Dense mode's pairs for the merged `group` led by `leader`: the pairs
+    /// that joined it when this pass or the last one merged the same
+    /// features, else a sweep, whose joining pairs are kept for the next.
+    /// Only connectivity reaches the output, so replaying the joins gives
+    /// the sweep's components.
+    fn dense_pairs(
+        &self,
+        leader: usize,
+        group: &[usize],
+        parts: &[Vec<TileRing>],
+        join: &mut PartJoin<'_>,
+    ) {
+        let same_group = |j: &GroupJoins| {
+            j.group
+                .iter()
+                .map(|&i| i as usize)
+                .eq(group.iter().copied())
+        };
+        let known = self
+            .joins
+            .lock()
+            .expect("joins")
+            .get(&(leader as u32), same_group)
+            .map(|j| std::sync::Arc::clone(&j.pairs));
+        if let Some(pairs) = known {
+            for &(i, j) in pairs.iter() {
+                join(i as usize, j as usize, &|| true);
+            }
+            return;
+        }
+        let joined = std::cell::RefCell::new(Vec::new());
+        interacting_pairs(parts, &mut |i, j, interacts| {
+            // `interacts` runs only for parts in separate components, so a
+            // true answer is a join.
+            join(i, j, &|| {
+                let yes = interacts();
+                if yes {
+                    joined.borrow_mut().push((i as u32, j as u32));
+                }
+                yes
+            });
+        });
+        self.joins.lock().expect("joins").insert(
+            leader as u32,
+            GroupJoins {
+                group: group.iter().map(|&i| i as u32).collect(),
+                pairs: joined.into_inner().into(),
+            },
+        );
     }
 
     /// The interacting pairs among the parts `globals`, numbered by their
@@ -2111,6 +2177,43 @@ mod tests {
         assert!(
             QuantizedPolygons::new(grid.iter().map(|g| (g, 0)), &test_bounds(), 4096).is_some()
         );
+    }
+
+    /// #908: a dense tile re-encodes the same merged groups on later
+    /// passes. Each distinct group is swept once while the pass cache keeps
+    /// it; a group with other members is swept again.
+    #[test]
+    fn quantized_polygons_sweep_a_repeated_group_once() {
+        let stacked: Vec<Geometry> = (0..300)
+            .map(|i| square(0.2 + 1e-4 * f64::from(i), 0.2, 0.3).into())
+            .collect();
+        let all: Vec<usize> = (0..300).collect();
+        let thirds: Vec<usize> = (0..300).step_by(3).collect();
+        let (all_ref, thirds_ref) = (
+            merged_reference(&stacked, &all),
+            merged_reference(&stacked, &thirds),
+        );
+        let (_, counts) = crate::valve_counter::measure(|| {
+            let mut q =
+                QuantizedPolygons::new(stacked.iter().map(|g| (g, 0)), &test_bounds(), 4096)
+                    .expect("dense tiles retain quantized parts");
+            assert!(q.candidates.is_none());
+            for (group, reference) in [
+                (&all, &all_ref),
+                (&all, &all_ref),
+                (&all, &all_ref),
+                (&thirds, &thirds_ref),
+                (&thirds, &thirds_ref),
+            ] {
+                assert_eq!(
+                    &q.encode(group, &crate::diagnostics::Diagnostics::default())
+                        .unwrap(),
+                    reference,
+                );
+                q.next_pass();
+            }
+        });
+        assert_eq!(counts.part_sweeps, 2, "{counts:#?}");
     }
 
     #[test]
