@@ -56,6 +56,7 @@ Args:
         bytes for bands tiled here; `"auto"`, `0` and `None` are no
         limit.
     size_valve: See `export_pmtiles()`.
+    merge_scope: See `export_pmtiles()`.
     coverage_fill: See `export_pmtiles()`.
     max_zoom_simplify_factor: See `export_pmtiles()`. Bands default
         to `0`: nothing is simplified at the max zoom. `None` selects

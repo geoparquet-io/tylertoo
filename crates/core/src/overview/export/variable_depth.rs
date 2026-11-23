@@ -1037,6 +1037,10 @@ impl ProbeLevel<'_> {
             fills: None,
             tiles: Some(&self.candidates),
             pins: p.pins,
+            // shortcut: the stop probe fits each tile alone, without the
+            // #768 merge floors the final encode starts from; pass them in
+            // if a smoothed tile is ever found stopped at the wrong depth.
+            floors: None,
             #[cfg(test)]
             work: &self.work,
         };
@@ -1691,6 +1695,7 @@ mod tests {
             &vd(),
             &ExportTimers::default(),
             Some(&mut scan),
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();

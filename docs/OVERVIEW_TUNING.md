@@ -1795,6 +1795,22 @@ fits. `--size-valve` chooses how:
   the chosen extent and takes at most eight encodes. Both valves keep their
   first drop cut unchanged. Later cuts use a 20% margin to finish sooner.
 
+`--merge-scope` sets how far `merge` reaches (#768):
+
+- `smooth` (the default) predicts, from the export's scan, which tiles must
+  merge and how far: each dense tile's gap threshold, priced by a real
+  encode of a sample of its own members. A tile then starts its merge at
+  that threshold, in one encode, and its eight neighbours start at half of
+  it. Merge density then steps down at a tile edge instead of
+  jumping from merged to unmerged. A tile still over its cap merges further,
+  as under `tile`. Each tile's prediction reads only its own members, so a
+  sharded build starts every tile from the same threshold as an unsharded
+  one. On NZ Parcels it cuts the p95 density step between
+  neighbouring tiles at z5–z7 from 2.3–3.7 to 1.0–2.4, for 14% more
+  wall time (19.1 s to 21.9 s); on FTW Moldova, 9% (2.8 s to 3.0 s).
+- `tile` merges each tile only as much as it needs on its own, as tippecanoe
+  does.
+
 Under either valve, the warning about tiles still over the cap, and the
 `tiles_over_limit` diagnostic in `--report`, list the ten largest of them as
 `z/x/y` with their compressed size.

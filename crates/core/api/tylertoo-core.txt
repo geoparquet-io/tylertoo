@@ -1436,6 +1436,34 @@ impl core::marker::Unpin for tylertoo_core::MemoryProfile
 impl core::marker::UnsafeUnpin for tylertoo_core::MemoryProfile
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::MemoryProfile
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::MemoryProfile
+#[non_exhaustive] pub enum tylertoo_core::MergeScope
+pub tylertoo_core::MergeScope::Smooth
+pub tylertoo_core::MergeScope::Tile
+impl tylertoo_core::MergeScope
+pub fn tylertoo_core::MergeScope::as_str(self) -> &'static str
+impl core::clone::Clone for tylertoo_core::MergeScope
+pub fn tylertoo_core::MergeScope::clone(&self) -> tylertoo_core::MergeScope
+impl core::cmp::Eq for tylertoo_core::MergeScope
+impl core::cmp::PartialEq for tylertoo_core::MergeScope
+pub fn tylertoo_core::MergeScope::eq(&self, &tylertoo_core::MergeScope) -> bool
+impl core::default::Default for tylertoo_core::MergeScope
+pub fn tylertoo_core::MergeScope::default() -> tylertoo_core::MergeScope
+impl core::fmt::Debug for tylertoo_core::MergeScope
+pub fn tylertoo_core::MergeScope::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::MergeScope
+pub fn tylertoo_core::MergeScope::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::MergeScope
+impl core::marker::StructuralPartialEq for tylertoo_core::MergeScope
+impl core::str::traits::FromStr for tylertoo_core::MergeScope
+pub type tylertoo_core::MergeScope::Err = alloc::string::String
+pub fn tylertoo_core::MergeScope::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl core::marker::Freeze for tylertoo_core::MergeScope
+impl core::marker::Send for tylertoo_core::MergeScope
+impl core::marker::Sync for tylertoo_core::MergeScope
+impl core::marker::Unpin for tylertoo_core::MergeScope
+impl core::marker::UnsafeUnpin for tylertoo_core::MergeScope
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::MergeScope
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::MergeScope
 #[non_exhaustive] pub enum tylertoo_core::MltProfile
 pub tylertoo_core::MltProfile::Diffable
 pub tylertoo_core::MltProfile::FastEncoding
@@ -2644,6 +2672,7 @@ pub tylertoo_core::ExportOptions::feature_id: core::option::Option<alloc::string
 pub tylertoo_core::ExportOptions::feature_order: tylertoo_core::FeatureOrder
 pub tylertoo_core::ExportOptions::layer_name: alloc::string::String
 pub tylertoo_core::ExportOptions::max_zoom_simplify_factor: core::option::Option<f64>
+pub tylertoo_core::ExportOptions::merge_scope: tylertoo_core::MergeScope
 pub tylertoo_core::ExportOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::ExportOptions::min_zoom: core::option::Option<u8>
 pub tylertoo_core::ExportOptions::mlt_profile: tylertoo_core::MltProfile
@@ -2670,6 +2699,7 @@ pub fn tylertoo_core::ExportOptions::with_feature_id(self, core::option::Option<
 pub fn tylertoo_core::ExportOptions::with_feature_order(self, tylertoo_core::FeatureOrder) -> Self
 pub fn tylertoo_core::ExportOptions::with_layer_name(self, alloc::string::String) -> Self
 pub fn tylertoo_core::ExportOptions::with_max_zoom_simplify_factor(self, core::option::Option<f64>) -> Self
+pub fn tylertoo_core::ExportOptions::with_merge_scope(self, tylertoo_core::MergeScope) -> Self
 pub fn tylertoo_core::ExportOptions::with_metadata(self, tylertoo_core::TilesetMetadata) -> Self
 pub fn tylertoo_core::ExportOptions::with_min_zoom(self, core::option::Option<u8>) -> Self
 pub fn tylertoo_core::ExportOptions::with_mlt_profile(self, tylertoo_core::MltProfile) -> Self

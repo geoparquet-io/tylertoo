@@ -58,6 +58,12 @@ Args:
         `"drop"` removes
         features, leaving holes. Point tiles use feature dropping in
         both modes.
+    merge_scope: How far `size_valve="merge"` reaches. `"smooth"`
+        predicts each tile's merge threshold from the export scan and
+        starts the tiles around a merging tile from a threshold that
+        fades over the next tile, so merge density steps down gradually
+        instead of at a tile edge. `"tile"` merges each tile only as much
+        as it needs on its own, as tippecanoe does.
     max_compressed_tile_size: Maximum gzip-compressed tile size
         in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and
         `0` or `None` is no limit.
