@@ -164,6 +164,7 @@ use crate::{
 
 mod coalesce_valve;
 mod tile_data;
+mod valve_scope;
 use tile_data::TileData;
 
 mod coverage_fill;
@@ -2577,11 +2578,78 @@ fn export_pmtiles_run(
     )
 }
 
+fn export_pmtiles_validated(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    config: &super::config::ValidatedConfig<'_, ExportOptions>,
+    partition_target: usize,
+    knobs: &Pass2Knobs,
+    budget: &mut MemoryBudget,
+    shared_zooms: &[u8],
+) -> Result<Pass2Run, ExportError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    // SCRATCH PROTOTYPE (#768): see `valve_scope`.
+    let scope = valve_scope::scope();
+    let (input_path, output_path) = (input_path.as_ref(), output_path.as_ref());
+    if scope != valve_scope::Scope::Tile && config.options().size_valve == SizeValve::Merge {
+        let dir = output_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let scratch = tempfile::Builder::new()
+            .prefix(".tylertoo-valve-probe")
+            .tempdir_in(dir)?;
+        valve_scope::start_recording();
+        let t = Instant::now();
+        export_pmtiles_validated_inner(
+            input_path,
+            scratch.path().join("probe.pmtiles"),
+            config,
+            partition_target,
+            knobs,
+            budget,
+            shared_zooms,
+        )?;
+        let need = valve_scope::take_recording();
+        valve_scope::log_needs(&need);
+        log::info!(
+            "[valve-scope] probe pass {:.1}s, {} merge-valve encodes",
+            t.elapsed().as_secs_f64(),
+            valve_scope::ENCODES.load(Relaxed)
+        );
+        let floors = valve_scope::floors(scope, &need);
+        let zoom = if scope == valve_scope::Scope::Zoom {
+            valve_scope::zoom_floors(&need)
+        } else {
+            Default::default()
+        };
+        log::info!("[valve-scope] {scope:?}: zoom floors {zoom:?}");
+        valve_scope::set_floors(need, floors, zoom);
+    } else {
+        valve_scope::ENCODES.store(0, Relaxed);
+    }
+    let run = export_pmtiles_validated_inner(
+        input_path,
+        output_path,
+        config,
+        partition_target,
+        knobs,
+        budget,
+        shared_zooms,
+    );
+    log::info!(
+        "[valve-scope] {scope:?} pass: {} merge-valve encodes, {} tiles started above their own need",
+        valve_scope::ENCODES.load(Relaxed),
+        valve_scope::RAISED.load(Relaxed)
+    );
+    run
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "#779: export orchestration keeps scan, writer and checkpoint lifetimes explicit"
 )]
-fn export_pmtiles_validated(
+fn export_pmtiles_validated_inner(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     config: &super::config::ValidatedConfig<'_, ExportOptions>,
@@ -9411,15 +9479,17 @@ fn encode_layer_members(
             Ok(fill) => fill.flatten().unwrap_or_default(),
             Err(error) => return Some(Err(error)),
         };
-        let mvt = encode_tile_layers(
-            gzip_cache,
-            g,
-            &tb,
-            opts,
-            &fill,
-            &mut fill_tally,
-            diagnostics,
-        );
+        let mvt = valve_scope::with_tile((zoom, x, y), || {
+            encode_tile_layers(
+                gzip_cache,
+                g,
+                &tb,
+                opts,
+                &fill,
+                &mut fill_tally,
+                diagnostics,
+            )
+        });
         if let Err(error) = account_sources(g, &mvt, zoom, opts, diagnostics) {
             return Some(Err(error));
         }
@@ -10570,7 +10640,7 @@ fn merge_to_fit(
         })
     };
     let mut gaps: Option<Vec<u64>> = None;
-    let mut mingap = 0u64;
+    let mut mingap = valve_scope::start_mingap();
     let mut keep_fraction = 1.0_f64;
     let mut prev_fit: Option<f64> = None;
     let mut stalls = 0u32;
@@ -10602,6 +10672,8 @@ fn merge_to_fit(
             if absorbed > 0 && opts.feature_id.is_some() {
                 account_merged_sources(&merged, &feats, &ordered, &mut fitted);
             }
+            valve_scope::record(mingap);
+            valve_scope::ENCODES.fetch_add(u64::from(passes), std::sync::atomic::Ordering::Relaxed);
             return fitted;
         }
         // tippecanoe's `mingap_fraction`: aim for the share of features
@@ -10717,6 +10789,11 @@ fn merge_to_fit(
         if opts.feature_id.is_some() {
             account_merged_sources(&merged, &kept, &ordered, &mut fitted);
         }
+        valve_scope::record(mingap);
+        valve_scope::ENCODES.fetch_add(
+            u64::from(tally.passes),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         return fitted;
     }
 }
