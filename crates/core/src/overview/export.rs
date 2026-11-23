@@ -7005,178 +7005,162 @@ fn scan_all_levels_from(
     let mut readers = 0;
     #[cfg(test)]
     let readers_ref = &mut readers;
-    // #768 predict: the gap walk and sizing run on their own thread, off
-    // the scan's consumer, fed each batch's row-aligned bboxes in order.
-    let (pred_tx, pred_rx) = crossbeam_channel::bounded::<(usize, Vec<Option<TileBounds>>)>(8);
-    let pred_tx = predict.is_some().then_some(pred_tx);
-    std::thread::scope(|scope| -> Result<(), ExportError> {
-        let worker = predict.map(|p| {
-            scope.spawn(move || {
-                for (j, rows) in pred_rx {
+    // #768 predict: the gap walk rides in the consumer, fed each batch's
+    // row-aligned bboxes in order. Not on a thread of its own: its Rayon
+    // work could then wait on the only pool worker, held by this scan.
+    let mut predict = predict;
+    let predict_ref = &mut predict;
+    // PERF (#817): each band is read by the ordered parallel reader, in
+    // the same batches one reader makes; `bounded` keeps the one reader.
+    let piped = scoped_pipe(
+        WAVE_READ_IN_FLIGHT,
+        |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
+            send_bands(
+                (reader, band),
+                roots.as_deref(),
+                ReadPass::Scan,
+                |read| add_nanos(&timers.scan_read, read),
+                tx,
+                #[cfg(test)]
+                readers_ref,
+            )
+        },
+        |rx: Receiver<(usize, RecordBatch)>| -> Result<(), ExportError> {
+            // PERF (#817): one band's bboxes are sized a pool's worth at a
+            // time, into each target level at once; one 8,192-row batch at a
+            // time, level after level, kept the consumer to about one core.
+            // Counts, unions and feature counts are sums and min/max, so the
+            // scans are identical however rows are grouped.
+            // `bounded` sizes batch by batch: a pool's worth at once is
+            // outside its scan's memory envelope.
+            let size_rows = match band.profile {
+                MemoryProfile::Bounded => EXPORT_BATCH_SIZE,
+                MemoryProfile::Auto | MemoryProfile::Speed => {
+                    SIZE_BBOXES_MIN_ROWS.saturating_mul(rayon::current_num_threads())
+                }
+            };
+            let mut pending: Vec<Option<TileBounds>> = Vec::with_capacity(size_rows);
+            let mut pending_band = 0;
+            let mut size_pending = |j: usize, pending: &mut Vec<Option<TileBounds>>| {
+                if pending.is_empty() {
+                    return;
+                }
+                #[cfg(test)]
+                SCAN_SIZE_FLUSHES.with(|n| n.set(n.get() + 1));
+                // Bands accumulate into finer levels' render sets only in
+                // partitioning mode; duplicating bands are self-contained, so
+                // band `j` feeds level `j` alone.
+                let last = if partitioning { num_levels - 1 } else { j };
+                ExportTimers::time(&timers.scan_size, || {
+                    scans_ref[j..=last]
+                        .par_iter_mut()
+                        .zip(&zooms_ref[j..=last])
+                        .for_each(|(scan, &zoom)| {
+                            scan.feature_count += pending.len();
+                            let (bounds, counts) = size_bboxes(pending, zoom, opts);
+                            if let Some(b) = bounds {
+                                match &mut scan.bounds {
+                                    Some(acc) => acc.expand(&b),
+                                    None => scan.bounds = Some(b),
+                                }
+                            }
+                            for (key, v) in counts {
+                                *scan.tile_counts.entry(key).or_insert(0) += v;
+                            }
+                        });
+                });
+                pending.clear();
+            };
+            for (j, batch) in rx.iter() {
+                // Read + (for 3857) reproject each feature's bbox once per
+                // band; sizing the same bbox into every target level below is
+                // bit-identical to reprojecting it once per level, since
+                // reprojection is a pure fn.
+                let bboxes = ExportTimers::time(&timers.scan_decode, || match source {
+                    ScanBboxSource::Covering { column, names } => {
+                        covering_batch_bboxes(&batch, column, names, crs)
+                    }
+                    ScanBboxSource::Geometry => {
+                        decode_batch_bboxes(&batch, geometry, crs, diagnostics).map(Some)
+                    }
+                })?;
+                let Some(bboxes) = bboxes else {
+                    // Dropping the receiver stops the producer cleanly.
+                    *abandoned_ref = true;
+                    return Ok(());
+                };
+                if let Some(vd) = vd.as_deref_mut() {
+                    let geometries = || -> Result<Vec<Option<Geometry<f64>>>, ExportError> {
+                        let geom_idx = batch_geometry_index(&batch, geometry)?;
+                        let field = batch.schema().field(geom_idx).clone();
+                        let garr = from_arrow_array(batch.column(geom_idx).as_ref(), &field)
+                            .map_err(|e| {
+                                crate::GeoParquetReadError::decode("geometry decode", e)
+                            })?;
+                        let mut out = Vec::with_capacity(batch.num_rows());
+                        // Quiet: without variable depth the scan counts these
+                        // rows' decode warnings only in its own bbox decode.
+                        crate::batch_processor::extract_geometries_opt_from_array(
+                            garr.as_ref(),
+                            &mut out,
+                            &crate::diagnostics::Diagnostics::silent(),
+                        )?;
+                        Ok(out)
+                    };
+                    let aligned = || -> Result<Vec<Option<TileBounds>>, ExportError> {
+                        match source {
+                            ScanBboxSource::Covering { column, names } => {
+                                covering_row_bboxes(&batch, column, names, crs)
+                            }
+                            ScanBboxSource::Geometry => Ok(geometries()?
+                                .iter()
+                                .map(|g| g.as_ref().and_then(|g| geometry_lnglat_bbox(g, crs)))
+                                .collect()),
+                        }
+                    };
+                    ExportTimers::time(&timers.scan_size, || {
+                        vd.fold(
+                            j,
+                            &batch,
+                            &bboxes,
+                            &variable_depth::RowSource {
+                                bboxes: &aligned,
+                                geometries: &geometries,
+                            },
+                            crs,
+                            opts,
+                        )
+                    })?;
+                }
+                if let Some(p) = predict_ref.as_deref_mut() {
+                    // #768 predict: row-aligned, so the gap walk matches the
+                    // export's row groups.
+                    let rows = match source {
+                        ScanBboxSource::Covering { column, names } => {
+                            covering_row_bboxes(&batch, column, names, crs)?
+                        }
+                        ScanBboxSource::Geometry => bboxes.clone(),
+                    };
                     let last = if partitioning { num_levels - 1 } else { j };
                     p.batch(j, &rows, j..=last, zooms_ref, opts);
                 }
-                p.flush(zooms_ref, opts);
-            })
-        });
-        let pred_tx_ref = &pred_tx;
-        // PERF (#817): each band is read by the ordered parallel reader, in
-        // the same batches one reader makes; `bounded` keeps the one reader.
-        let piped = scoped_pipe(
-            WAVE_READ_IN_FLIGHT,
-            |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
-                send_bands(
-                    (reader, band),
-                    roots.as_deref(),
-                    ReadPass::Scan,
-                    |read| add_nanos(&timers.scan_read, read),
-                    tx,
-                    #[cfg(test)]
-                    readers_ref,
-                )
-            },
-            |rx: Receiver<(usize, RecordBatch)>| -> Result<(), ExportError> {
-                // PERF (#817): one band's bboxes are sized a pool's worth at a
-                // time, into each target level at once; one 8,192-row batch at a
-                // time, level after level, kept the consumer to about one core.
-                // Counts, unions and feature counts are sums and min/max, so the
-                // scans are identical however rows are grouped.
-                // `bounded` sizes batch by batch: a pool's worth at once is
-                // outside its scan's memory envelope.
-                let size_rows = match band.profile {
-                    MemoryProfile::Bounded => EXPORT_BATCH_SIZE,
-                    MemoryProfile::Auto | MemoryProfile::Speed => {
-                        SIZE_BBOXES_MIN_ROWS.saturating_mul(rayon::current_num_threads())
-                    }
-                };
-                let mut pending: Vec<Option<TileBounds>> = Vec::with_capacity(size_rows);
-                let mut pending_band = 0;
-                let mut size_pending = |j: usize, pending: &mut Vec<Option<TileBounds>>| {
-                    if pending.is_empty() {
-                        return;
-                    }
-                    #[cfg(test)]
-                    SCAN_SIZE_FLUSHES.with(|n| n.set(n.get() + 1));
-                    // Bands accumulate into finer levels' render sets only in
-                    // partitioning mode; duplicating bands are self-contained, so
-                    // band `j` feeds level `j` alone.
-                    let last = if partitioning { num_levels - 1 } else { j };
-                    ExportTimers::time(&timers.scan_size, || {
-                        scans_ref[j..=last]
-                            .par_iter_mut()
-                            .zip(&zooms_ref[j..=last])
-                            .for_each(|(scan, &zoom)| {
-                                scan.feature_count += pending.len();
-                                let (bounds, counts) = size_bboxes(pending, zoom, opts);
-                                if let Some(b) = bounds {
-                                    match &mut scan.bounds {
-                                        Some(acc) => acc.expand(&b),
-                                        None => scan.bounds = Some(b),
-                                    }
-                                }
-                                for (key, v) in counts {
-                                    *scan.tile_counts.entry(key).or_insert(0) += v;
-                                }
-                            });
-                    });
-                    pending.clear();
-                };
-                for (j, batch) in rx.iter() {
-                    // Read + (for 3857) reproject each feature's bbox once per
-                    // band; sizing the same bbox into every target level below is
-                    // bit-identical to reprojecting it once per level, since
-                    // reprojection is a pure fn.
-                    let bboxes = ExportTimers::time(&timers.scan_decode, || match source {
-                        ScanBboxSource::Covering { column, names } => {
-                            covering_batch_bboxes(&batch, column, names, crs)
-                        }
-                        ScanBboxSource::Geometry => {
-                            decode_batch_bboxes(&batch, geometry, crs, diagnostics).map(Some)
-                        }
-                    })?;
-                    let Some(bboxes) = bboxes else {
-                        // Dropping the receiver stops the producer cleanly.
-                        *abandoned_ref = true;
-                        return Ok(());
-                    };
-                    if let Some(vd) = vd.as_deref_mut() {
-                        let geometries = || -> Result<Vec<Option<Geometry<f64>>>, ExportError> {
-                            let geom_idx = batch_geometry_index(&batch, geometry)?;
-                            let field = batch.schema().field(geom_idx).clone();
-                            let garr = from_arrow_array(batch.column(geom_idx).as_ref(), &field)
-                                .map_err(|e| {
-                                    crate::GeoParquetReadError::decode("geometry decode", e)
-                                })?;
-                            let mut out = Vec::with_capacity(batch.num_rows());
-                            // Quiet: without variable depth the scan counts these
-                            // rows' decode warnings only in its own bbox decode.
-                            crate::batch_processor::extract_geometries_opt_from_array(
-                                garr.as_ref(),
-                                &mut out,
-                                &crate::diagnostics::Diagnostics::silent(),
-                            )?;
-                            Ok(out)
-                        };
-                        let aligned = || -> Result<Vec<Option<TileBounds>>, ExportError> {
-                            match source {
-                                ScanBboxSource::Covering { column, names } => {
-                                    covering_row_bboxes(&batch, column, names, crs)
-                                }
-                                ScanBboxSource::Geometry => Ok(geometries()?
-                                    .iter()
-                                    .map(|g| g.as_ref().and_then(|g| geometry_lnglat_bbox(g, crs)))
-                                    .collect()),
-                            }
-                        };
-                        ExportTimers::time(&timers.scan_size, || {
-                            vd.fold(
-                                j,
-                                &batch,
-                                &bboxes,
-                                &variable_depth::RowSource {
-                                    bboxes: &aligned,
-                                    geometries: &geometries,
-                                },
-                                crs,
-                                opts,
-                            )
-                        })?;
-                    }
-                    if let Some(ptx) = pred_tx_ref {
-                        // #768 predict: row-aligned, so the gap walk matches the
-                        // export's row groups.
-                        let rows = match source {
-                            ScanBboxSource::Covering { column, names } => {
-                                covering_row_bboxes(&batch, column, names, crs)?
-                            }
-                            ScanBboxSource::Geometry => bboxes.clone(),
-                        };
-                        // The worker only stops early by panicking, which the
-                        // scope re-raises.
-                        let _ = ptx.send((j, rows));
-                    }
-                    if j != pending_band {
-                        size_pending(pending_band, &mut pending);
-                        pending_band = j;
-                    }
-                    pending.extend(bboxes);
-                    if pending.len() >= size_rows {
-                        size_pending(j, &mut pending);
-                    }
+                if j != pending_band {
+                    size_pending(pending_band, &mut pending);
+                    pending_band = j;
                 }
-                size_pending(pending_band, &mut pending);
-                Ok(())
-            },
-        );
-        drop(pred_tx);
-        if let Some(w) = worker {
-            // A panic in the predictor is re-raised here, as the scope would.
-            if let Err(panic) = w.join() {
-                std::panic::resume_unwind(panic);
+                pending.extend(bboxes);
+                if pending.len() >= size_rows {
+                    size_pending(j, &mut pending);
+                }
             }
-        }
-        piped
-    })?;
+            size_pending(pending_band, &mut pending);
+            Ok(())
+        },
+    );
+    piped?;
+    if let Some(p) = predict {
+        p.flush(zooms_ref, opts);
+    }
     #[cfg(test)]
     BAND_READ_WORKERS.with(|w| w.set(readers));
     Ok((!abandoned).then_some(scans))
