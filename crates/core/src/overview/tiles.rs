@@ -560,18 +560,19 @@ impl TilesOptions {
                 }
             }
         }
-        self.convert.validate().map_err(TilesError::Convert)?;
-        // Under the layer name the export will get, so its rules (an MLT
-        // layer needs one) hold before the convert runs.
-        match &self.layer_name {
-            Some(name) => ExportOptions {
-                layer_name: name.clone(),
-                ..self.export.clone()
-            }
-            .validate()
-            .map(|_| ())?,
-            None => self.export.validate().map(|_| ())?,
+        // Under the layer name and tile range the export will get, so its
+        // rules (an MLT layer needs a name; `--valve-scope zoom` no range)
+        // hold before the convert runs.
+        ExportOptions {
+            layer_name: self
+                .layer_name
+                .clone()
+                .unwrap_or_else(|| self.export.layer_name.clone()),
+            tile_range: resolve_tile_range(self.shard.as_ref(), self.export.tile_range),
+            ..self.export.clone()
         }
+        .validate()?;
+        self.convert.validate().map_err(TilesError::Convert)?;
         if self.export.variable_depth {
             super::export::variable_depth::check_convert(&self.convert, self.shard.is_some())?;
         }
@@ -2264,6 +2265,50 @@ mod tests {
             Some(shard_range),
             "a data shard's range takes precedence"
         );
+    }
+
+    /// #768: a data shard's export runs under its tile range, so the
+    /// export rules that hang on one (`--valve-scope zoom`, which
+    /// `--preset tippecanoe` sets) refuse it before the convert runs, not
+    /// after; the coarse job sees the whole input and keeps `zoom`.
+    #[test]
+    fn a_data_shard_refuses_valve_scope_zoom_before_any_io() {
+        let job = |range| TilesShard {
+            role: match range {
+                Some(_) => ShardRole::Shard {
+                    index: 0,
+                    shards: 2,
+                },
+                None => ShardRole::Coarse,
+            },
+            range,
+            pivot_zoom: 6,
+            cut_digest: "deadbeef".to_string(),
+            binding: None,
+        };
+        let base = crate::tile::hilbert_zoom_base(6);
+        let options = |shard| TilesOptions {
+            convert: ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 8,
+                },
+                plan: Some("never-read.plan".into()),
+                ..ConvertOptions::default()
+            },
+            export: ExportOptions {
+                valve_scope: crate::overview::export::ValveScope::Zoom,
+                ..ExportOptions::default()
+            },
+            shard: Some(shard),
+            ..TilesOptions::default()
+        };
+        let data = options(job(Some(TileRange::new(6, base, base + 9).unwrap())));
+        let err = data.validate().unwrap_err().to_string();
+        assert!(err.contains("--valve-scope zoom"), "{err}");
+        let mut coarse = options(job(None));
+        coarse.convert.plan = None;
+        coarse.validate().expect("the coarse job keeps zoom");
     }
 
     /// the row pruning, the fingerprinted cut digest and the coarse job's

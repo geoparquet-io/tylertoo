@@ -303,7 +303,9 @@ pub(crate) fn no_op_floor(valve: SizeValve, zoom: u8) -> u64 {
 /// tile's own need, and each need times `factor` a Chebyshev ring at the
 /// same zoom, the largest where they overlap. A need reaches out while its
 /// faded value still constrains a tile (above `stop` at its zoom), at most
-/// [`MAX_RINGS`]. `None` once the map would hold more than `max_floors`:
+/// [`MAX_RINGS`]: a need too large to fade back to `stop` by then at
+/// `factor` fades at the even, steeper factor that does, so its reach ends
+/// without a cliff. `None` once the map would hold more than `max_floors`:
 /// it does not fit the export's memory.
 pub(crate) fn floors(
     need: &HashMap<Key, u64>,
@@ -315,6 +317,8 @@ pub(crate) fn floors(
     for (&(z, x, y), &m) in need {
         let n = 1i64 << z;
         let stop = stop(z);
+        let reach = (stop.max(1) as f64 / m as f64).powf(1.0 / (MAX_RINGS + 1) as f64);
+        let factor = factor.min(reach);
         for d in 0..=MAX_RINGS {
             let v = (m as f64 * factor.powi(d as i32)) as u64;
             if v <= stop {
@@ -993,15 +997,15 @@ mod tests {
     /// out while it still constrains a tile, at most `MAX_RINGS`.
     #[test]
     fn floors_fade_by_the_factor_and_reach_while_they_constrain() {
-        let need = HashMap::from([((7, 10, 10), 1_000u64), ((7, 30, 30), 64), ((8, 0, 0), 5)]);
-        let f = floors(&need, 0.5, |_| 0, usize::MAX).unwrap();
-        assert_eq!(f[&(7, 10, 10)], 1_000, "a tile starts at its own need");
-        assert_eq!(f[&(7, 11, 10)], 500);
-        assert_eq!(f[&(7, 9, 9)], 500, "a diagonal neighbour is one ring out");
-        assert_eq!(f[&(7, 13, 7)], 125, "three rings out");
-        // 64 fades to 1 at ring 6, and 0 sets nothing.
-        assert_eq!(f[&(7, 36, 30)], 1);
-        assert_eq!(f.get(&(7, 37, 30)), None);
+        let need = HashMap::from([((7, 10, 10), 256u64), ((7, 30, 30), 64), ((8, 0, 0), 5)]);
+        let f = floors(&need, 0.5, |_| 1, usize::MAX).unwrap();
+        assert_eq!(f[&(7, 10, 10)], 256, "a tile starts at its own need");
+        assert_eq!(f[&(7, 11, 10)], 128);
+        assert_eq!(f[&(7, 9, 9)], 128, "a diagonal neighbour is one ring out");
+        assert_eq!(f[&(7, 13, 7)], 32, "three rings out");
+        // 64 fades to 2 at ring 5; ring 6 would be the stop, 1.
+        assert_eq!(f[&(7, 35, 30)], 2);
+        assert_eq!(f.get(&(7, 36, 30)), None);
         assert_eq!(f[&(8, 1, 0)], 2);
         assert!(f.keys().all(|&(z, x, y)| x < 1 << z && y < 1 << z));
         // The reach stops where the floor no longer constrains: a need of
@@ -1015,18 +1019,35 @@ mod tests {
         .unwrap();
         assert_eq!(stopped.len(), 25, "{stopped:?}");
         assert_eq!(stopped[&(9, 102, 98)], 16);
-        // A gentler fade reaches further, never past MAX_RINGS.
+        // A need too large to fade back to the stop within MAX_RINGS at its
+        // factor (1,000 stops at 0.8 is 168 eight rings out) fades at the even,
+        // steeper factor that ends at the stop one ring past the reach: no
+        // cliff at its edge.
         let r = MAX_RINGS as u32;
         let far = floors(
-            &HashMap::from([((12, 100, 100), u64::MAX / 2)]),
-            0.9,
-            |_| 1,
+            &HashMap::from([((12, 100, 100), 1_000_000)]),
+            0.8,
+            |_| 1_000,
             usize::MAX,
         )
         .unwrap();
         assert!(far.contains_key(&(12, 100 + r, 100)));
         assert!(!far.contains_key(&(12, 101 + r, 100)));
         assert_eq!(far.len(), (2 * r as usize + 1).pow(2));
+        let ring = |d: u32| far[&(12, 100 + d, 100)] as f64;
+        let step = 1_000f64.powf(1.0 / f64::from(r + 1));
+        for d in 1..=r {
+            let got = ring(d - 1) / ring(d);
+            assert!(
+                (got - step).abs() < 0.05 * step,
+                "ring {d}: {got} vs {step}"
+            );
+        }
+        assert!(
+            ring(r) <= 1_000.0 * step * 1.05,
+            "the edge steps to the stop by {}",
+            ring(r) / 1_000.0
+        );
         // Floors past the memory they may hold are refused, not truncated.
         assert!(floors(&need, 0.5, |_| 0, 10).is_none());
     }
@@ -1069,7 +1090,12 @@ mod tests {
             usize::MAX,
         )
         .unwrap();
-        assert_eq!(gentle.get((7, 11, 10)), 64 * KEEP_ALL * 4 / 5);
+        // At 1.25 a ring, 64x would still keep 1/10 eight rings out, so it
+        // fades at the even 64^(1/9) a ring that ends at keep-all.
+        let even = (64 * KEEP_ALL) as f64 / 64f64.powf(1.0 / 9.0);
+        assert_eq!(gentle.get((7, 11, 10)), even as u64);
+        assert!(gentle.get((7, 18, 10)) > KEEP_ALL);
+        assert_eq!(gentle.get((7, 19, 10)), 0);
         assert!(gentle.tiles.len() > drop.tiles.len());
         // Under merge the stop is one squared grid unit at the zoom.
         let unit = no_op_floor(SizeValve::Merge, 7);

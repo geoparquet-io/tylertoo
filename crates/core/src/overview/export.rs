@@ -500,14 +500,16 @@ pub struct ExportOptions {
     /// neighbouring tiles (#768): a tile keeps at most this many times the
     /// share of points its neighbour keeps, or merges at most this many
     /// times less hard. Each tile's floor fades by `1 / valve_max_step` a
-    /// ring and reaches out until it no longer thins anything. Must be
-    /// finite and above 1; default 2.
+    /// ring and reaches out until it no longer thins anything, at most
+    /// `valve_predict::MAX_RINGS` (8) rings: a floor that would still thin
+    /// there fades at the even, larger step that ends it by then. Must be
+    /// finite and above 1; default 2; only under `smooth`.
     #[cfg_attr(feature = "cli", arg(
         long,
         value_name = "RATIO",
         default_value_t = ExportOptions::default().valve_max_step
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "With `--valve-scope smooth`, the largest density step allowed between neighbouring tiles: a tile keeps at most RATIO times the points its neighbour keeps, or merges at most RATIO times less hard, so the thinning around a dense tile fades over the tiles beside it. 1.25 makes edges barely visible but spreads the thinning further; larger values come closer to `--valve-scope tile`. Must be above 1", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "With `--valve-scope smooth`, the largest density step allowed between neighbouring tiles: a tile keeps at most RATIO times the points its neighbour keeps, or merges at most RATIO times less hard, so the thinning around a dense tile fades over the tiles beside it. The fade reaches at most 8 tiles out: a tile thinned more than RATIO^9 fades by the larger even step that ends there. 1.25 makes edges barely visible but spreads the thinning further; larger values come closer to `--valve-scope tile`. Must be above 1", long_help = None))]
     pub valve_max_step: f64,
     /// Tile encoding, MVT by default. Each finished MVT tile is converted
     /// to MLT with mlt-core before gzip and both size caps, so the caps
@@ -931,6 +933,15 @@ impl ExportOptions {
             return Err(ConfigError::InvalidSpec {
                 option: "--tile-format / tile_format",
                 message: "this build cannot write MLT: rebuild with the `mlt` cargo feature".into(),
+            });
+        }
+        if self.valve_scope != ValveScope::Smooth
+            && self.valve_max_step != Self::default().valve_max_step
+        {
+            return Err(ConfigError::OptionIgnored {
+                option: "valve_max_step",
+                command: "a --valve-scope tile or zoom export",
+                reason: "it sets how far --valve-scope smooth fades; pass --valve-scope smooth",
             });
         }
         if self.tile_format == TileFormat::Mvt && self.mlt_profile != MltProfile::default() {
@@ -20425,6 +20436,17 @@ mod tests {
                 "{err}"
             );
         }
+        // Only `smooth` fades, so a step under `tile` or `zoom` is refused
+        // as ignored, not silently dropped.
+        for scope in [ValveScope::Tile, ValveScope::Zoom] {
+            let opts = ExportOptions {
+                valve_scope: scope,
+                ..ExportOptions::default()
+            };
+            assert!(opts.check().is_ok());
+            let err = opts.with_valve_max_step(1.25).check().unwrap_err();
+            assert!(err.to_string().contains("valve_max_step"), "{err}");
+        }
     }
 
     /// #768: `tile` predicts nothing, so every tile is fitted alone as
@@ -20717,8 +20739,8 @@ mod tests {
         assert_eq!(alone.data, plain.data);
     }
 
-    /// #768: a drop floor keeps its share of a point tile's members by an
-    /// even stride over their order, so a dense cluster stays as much
+    /// #768: a drop floor keeps its share of a point tile's members by
+    /// rank, spread evenly over their input order, so a dense cluster stays as much
     /// denser than its surroundings as it was: the floor thins the tile, it
     /// does not flatten it (a gap floor dropped the cluster first).
     #[test]

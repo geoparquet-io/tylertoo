@@ -4595,7 +4595,9 @@ const MIN_ROW_ORDER_GAPS: usize = 500;
 
 /// Warn when pass 1 found the rows in no spatial order (#768). tylertoo
 /// keeps file order, which the size valves read as spatial: merge takes each
-/// feature's gap from the row before it, drop keeps an even stride. Pooled
+/// feature's gap from the row before it, and drop ranks a point by its row's
+/// place in the input, which spreads the kept points evenly only over
+/// spatially sorted rows. Pooled
 /// over every part of a multi-part input.
 pub(super) fn warn_if_unsorted(
     source: &ConvertSource,
