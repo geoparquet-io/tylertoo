@@ -11219,7 +11219,8 @@ fn merge_to_fit(
         };
         if fit >= 1.0 {
             let fitted = TileMvt {
-                oversized: passes > 1,
+                // #768: a floored first pass that merged acted as the valve.
+                oversized: passes > 1 || absorbed > 0,
                 valve: tally,
                 ..mvt
             };
@@ -19977,14 +19978,22 @@ mod tests {
                 &mut FillTally::default(),
                 &crate::diagnostics::Diagnostics::default(),
             )
-            .valve
         };
         let alone = encode(None);
-        assert_eq!((alone.merged, alone.passes), (0, 1), "{alone:?}");
+        assert_eq!(
+            (alone.valve.merged, alone.valve.passes),
+            (0, 1),
+            "{:?}",
+            alone.valve
+        );
+        assert!(!alone.oversized);
         let floored = encode(Some(&floors));
+        let v = floored.valve;
         // Gaps 1..=100 sit under the floor of 101.
-        assert_eq!((floored.merged, floored.passes), (100, 1), "{floored:?}");
-        assert_eq!(floored.over_limit, 0, "{floored:?}");
+        assert_eq!((v.merged, v.passes), (100, 1), "{v:?}");
+        assert_eq!(v.over_limit, 0, "{v:?}");
+        // The floor merged: the valve acted, as the drop valve counts it.
+        assert!(floored.oversized, "{v:?}");
     }
 
     /// #768: a point tile over its cap beside a denser over-cap one is
