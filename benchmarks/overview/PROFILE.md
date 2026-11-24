@@ -27,7 +27,7 @@ Full pipeline (GeoParquet → overview file → PMTiles) < 2 min.
 - **Wall/RSS**: `/usr/bin/time -v` on the release binary; identical
   commands to `run_conversion.sh`.
 - **Phase breakdown**: `std::time::Instant` accumulators in
-  `crates/core/src/overview/stream.rs` and `export.rs`, logged at
+  `crates/core/src/overview/stream.rs` and `export/`, logged at
   `RUST_LOG=tylertoo_core::overview=debug` (instrumentation is
   retained behind that log level).
 - **Heap**: `cargo build --release --features dhat-heap` (see
