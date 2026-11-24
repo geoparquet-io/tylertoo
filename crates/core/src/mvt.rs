@@ -566,6 +566,7 @@ fn ring_box(ring: &TileRing) -> (i32, i32, i32, i32) {
 /// Until #748 this tested the exteriors' edges and each exterior's first
 /// vertex only, which missed two parts that share two vertices and overlap
 /// between them (Madagascar adm4 feature 7844 at 4/10/8).
+#[cfg(test)]
 fn parts_interact(a: &[TileRing], b: &[TileRing]) -> bool {
     clean_parts_interact(a, b, part_clean(a) && part_clean(b))
 }
@@ -735,6 +736,10 @@ pub(crate) struct QuantizedPolygons {
     /// 0 not tested yet, 1 no, 2 yes. Only pairs a pass puts in one feature
     /// are ever tested.
     interacts: Vec<std::sync::atomic::AtomicU8>,
+    /// Per part, whether it passes the owner's check alone ([`part_clean`]),
+    /// coded as in [`Self::interacts`]: a part in many candidate pairs is
+    /// checked once (#908).
+    clean: Vec<std::sync::atomic::AtomicU8>,
     /// Unioned components, keyed by their parts' indices in [`Self::parts`],
     /// kept as long as a [`PassCache`] keeps them.
     unions: std::sync::Mutex<UnionCache>,
@@ -756,6 +761,25 @@ pub(crate) struct QuantizedPolygons {
 struct GroupJoins {
     group: Box<[u32]>,
     pairs: std::sync::Arc<[(u32, u32)]>,
+}
+
+/// `test()`, remembered in `state`: 0 not tested yet, 1 false, 2 true.
+/// Threads that race test it twice and store the same answer.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: a per-operation cache slot of QuantizedPolygons; no diagnostic globals"
+)]
+fn remembered(state: &std::sync::atomic::AtomicU8, test: impl FnOnce() -> bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match state.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let answer = test();
+            state.store(if answer { 2 } else { 1 }, Relaxed);
+            answer
+        }
+    }
 }
 
 /// A merged group found valid, or a lone feature's repair.
@@ -892,6 +916,7 @@ impl QuantizedPolygons {
             }
         }
         let features_len = features.len();
+        let parts_len = parts.len();
         drop(geometries);
         drop(feature_keys);
         // The box-meeting pairs that share a key; the exact test waits until
@@ -940,6 +965,9 @@ impl QuantizedPolygons {
             interacts: (0..slots)
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
+            clean: (0..parts_len)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
             unions: std::sync::Mutex::default(),
             lone: (0..features_len)
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
@@ -953,17 +981,10 @@ impl QuantizedPolygons {
     /// once and remembered. Any thread may test a pair no thread has
     /// recorded yet; the answer is the same either way, so none waits.
     fn interact(&self, a: usize, b: usize, slot: u32) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        let state = &self.interacts[slot as usize];
-        match state.load(Relaxed) {
-            1 => false,
-            2 => true,
-            _ => {
-                let hit = parts_interact(&self.parts[a], &self.parts[b]);
-                state.store(if hit { 2 } else { 1 }, Relaxed);
-                hit
-            }
-        }
+        remembered(&self.interacts[slot as usize], || {
+            let clean = |i: usize| remembered(&self.clean[i], || part_clean(&self.parts[i]));
+            clean_parts_interact(&self.parts[a], &self.parts[b], clean(a) && clean(b))
+        })
     }
 
     /// Start a new pass: unions and verdicts the last pass used stay
@@ -4156,6 +4177,41 @@ mod tests {
         assert!(
             meet > 20 && apart > 20 && vertex_only > 5,
             "meet={meet} apart={apart} vertex_only={vertex_only}"
+        );
+    }
+
+    /// #908: in the candidate path, a part in several pairs is checked
+    /// alone once, not once per pair (at z10 of #908 this was half the
+    /// export's time).
+    #[test]
+    fn quantized_polygons_check_each_part_alone_once() {
+        // A row of squares, each overlapping the next: few candidates each.
+        let row: Vec<Geometry> = (0..40)
+            .map(|i| square(0.1 + 0.01 * f64::from(i), 0.3, 0.012).into())
+            .collect();
+        let q = QuantizedPolygons::new(row.iter().map(|g| (g, 0)), &test_bounds(), 4096)
+            .expect("polygons quantize");
+        let candidates = q
+            .candidates
+            .as_ref()
+            .expect("a sparse tile keeps candidates");
+        let pairs: Vec<(usize, usize, u32)> = candidates
+            .iter()
+            .enumerate()
+            .flat_map(|(g, c)| c.iter().map(move |&(h, slot)| (g, h as usize, slot)))
+            .filter(|&(g, h, _)| g < h)
+            .collect();
+        assert!(pairs.len() > 30, "{}", pairs.len());
+        tile_polygon::CHECKS.with(|c| c.set(0));
+        for &(g, h, slot) in &pairs {
+            assert!(q.interact(g, h, slot), "overlapping squares interact");
+        }
+        let checks = tile_polygon::CHECKS.with(|c| c.get());
+        assert!(
+            checks <= pairs.len() + q.parts.len(),
+            "{checks} checks for {} pairs of {} parts",
+            pairs.len(),
+            q.parts.len()
         );
     }
 
