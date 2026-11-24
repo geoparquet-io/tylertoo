@@ -1,8 +1,8 @@
 //! `--valve-scope smooth|zoom` (#768): each tile's valve need, predicted
 //! from the export scan, and the floors it puts on the tiles around it.
 //! Under `--size-valve merge` the need is a merge threshold over the gaps of
-//! lines and polygons; under `drop`, a gap threshold that thins point tiles
-//! ([`predict_drop_need`], [`Scan::drop_floors`]).
+//! lines and polygons; under `drop`, the share of a point tile's members to
+//! keep ([`predict_drop_need`], [`Scan::drop_floors`]).
 //!
 //! The export scan ([`super::scan_all_levels`]) already visits every row's
 //! bbox and every tile it lands in. With `smooth` it also follows each
@@ -10,7 +10,7 @@
 //! tile holds 1,023 members the band holding most of them from there on and,
 //! from its 1,024th member on, a half-octave histogram of each member's gap
 //! to the tile's previous member in its band (the merge valve's gap measure,
-//! [`gap_to_rect`]). A tile below that holds only its count, as the scan's
+//! [`super::coalesce_valve::gap_to_rect`]). A tile below that holds only its count, as the scan's
 //! tile counts do; the rest is checked against the scan's memory budget
 //! after every batch, and dropped with a warning when it is over
 //! (`--valve-scope tile` from there on).
@@ -39,8 +39,8 @@
 //! needs, halved a ring. `merge_to_fit` starts its ladder at the tile's
 //! floor, so a tile predicted over usually fits on its first encode; the
 //! ladder stays the backstop that holds the cap. Under `drop` a point tile
-//! first drops the members whose gap to the tile's previous member is below
-//! its floor (`drop_below_floor`), then thins by stride as before.
+//! first keeps the share of its members its floor sets, by stride
+//! (`kept_at_floor`), then thins by stride as before.
 //!
 //! Sharding: everything a tile's need depends on comes from its own
 //! members, in file order, never from row positions or other tiles, and a
@@ -58,7 +58,7 @@ use std::ops::RangeInclusive;
 use geo::Rect;
 use rayon::prelude::*;
 
-use super::coalesce_valve::{gap_to_rect, gap_to_world_box, world_box, world_xy, GAP_NONE};
+use super::coalesce_valve::{gap_to_world_box, world_box, world_xy, GAP_NONE};
 use super::{for_each_member_key, key_to_xy, ExportOptions, SizeValve, ValveScope};
 use crate::tile::TileBounds;
 
@@ -83,9 +83,14 @@ const PREDICT_BELOW_FIT: f64 = 0.9;
 const CANDIDATE_FIT: f64 = 2.0;
 
 /// Under drop, a point tile over its cap keeps `DROP_KEEP × fit` of its
-/// members: the gap filter keeps the isolated points, which cost more bytes
-/// than the average member the price was sampled at.
+/// members: a margin on the estimated fit, so most floored tiles fit on
+/// their first encode.
 const DROP_KEEP: f64 = 0.9;
+
+/// A drop floor is `KEEP_ALL / share`, the share of a point tile's members
+/// it keeps: a floor at or under this keeps them all, twice it keeps half.
+/// Halving a floor one ring out (`SMOOTH_FACTOR`) doubles the share.
+pub(crate) const KEEP_ALL: u64 = 1 << 20;
 
 /// `keep = 0.8 × fit^KEEP_EXP`: with the true first-encode fit, 1.0 under-
 /// predicts NZ by 1.16× and Moldova by 1.5×; 1.2 is within 1.2× of both.
@@ -658,14 +663,12 @@ impl Scan {
     }
 
     /// The drop valve's floors (#768): each point tile predicted over its
-    /// cap starts from its own need, and passes half of it (`SMOOTH_FACTOR`)
-    /// to the tiles one ring out that are themselves estimated over their
-    /// cap at their own sampled bytes a member. A tile that fits gets no
-    /// floor: a gap floor drops stacked and clustered points at any
-    /// strength, so smoothing onto tiles that fit thinned true Africa at z5
-    /// to 0.31 of `tile` (planet, 8 rings at 0.5); over-cap tiles only keep
-    /// it at 1.00 and still cut the France z5 0° seam (edge-strip |ln
-    /// kept-share ratio| p50/p95 0.14/0.34 against `tile`'s 1.03/1.18).
+    /// cap starts from its own need, and passes half of it (`SMOOTH_FACTOR`,
+    /// twice the share) to the tiles one ring out that are themselves
+    /// estimated over their cap at their own sampled bytes a member. A tile
+    /// that fits gets no floor and keeps every point: smoothing onto tiles
+    /// that fit thinned true Africa at z5 to 0.31 of `tile` (planet, 8
+    /// rings at 0.5, a gap floor).
     pub(crate) fn drop_floors(
         &self,
         need: &HashMap<Key, u64>,
@@ -753,13 +756,15 @@ pub(crate) fn predict_need(
     quantile(hist, 1.0 - keep, zoom).map(|g| g.saturating_add(1))
 }
 
-/// #768: one point tile's predicted drop threshold under `--size-valve
-/// drop`: the gap above which `DROP_KEEP × fit` of its point gaps lie, or
-/// `None` when it is predicted to fit. Members with a smaller gap drop.
+/// #768: one point tile's predicted drop floor under `--size-valve drop`:
+/// `KEEP_ALL / (DROP_KEEP × fit)`, the floor that keeps `DROP_KEEP × fit` of
+/// its members, or `None` when it is predicted to fit. Only a point tile
+/// has a histogram under drop (`Scan::flush` counts only point gaps), so
+/// only a point tile gets a need; its gaps themselves set nothing.
 pub(crate) fn predict_drop_need(
-    hist: &[u32; BUCKETS],
+    _hist: &[u32; BUCKETS],
     count: u64,
-    zoom: u8,
+    _zoom: u8,
     bytes: MemberBytes,
     caps: Caps,
 ) -> Option<u64> {
@@ -767,31 +772,7 @@ pub(crate) fn predict_drop_need(
     if fit >= PREDICT_BELOW_FIT {
         return None;
     }
-    quantile(hist, 1.0 - DROP_KEEP * fit, zoom).map(|g| g.saturating_add(1))
-}
-
-/// #768: each member's gap to the member before it in `members` (in file
-/// order) when both are points of one band, else [`GAP_NONE`]: the gap the
-/// predictor's histogram counts for a point tile ([`Scan::flush`]), from
-/// the tile's own members only, so a shard measures what a full build does.
-pub(crate) fn point_gaps<'a>(
-    members: impl Iterator<Item = (u16, Option<(f64, f64)>)> + 'a,
-) -> impl Iterator<Item = u64> + 'a {
-    let mut prev: Option<(u16, (f64, f64))> = None;
-    members.map(move |(band, point)| {
-        // A member with no point (an empty geometry) has no bbox: the scan
-        // never counts it, so it leaves the predecessor as is.
-        let Some((x, y)) = point else {
-            return GAP_NONE;
-        };
-        let rect = Rect::new((x, y), (x, y));
-        let gap = match prev {
-            Some((b, p)) if b == band => gap_to_rect(p, &rect),
-            _ => GAP_NONE,
-        };
-        prev = Some((band, world_xy(x, y)));
-        gap
-    })
+    Some((KEEP_ALL as f64 / (DROP_KEEP * fit)) as u64)
 }
 
 #[cfg(test)]
@@ -978,10 +959,11 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// #768: under drop a point tile's need is the gap its kept share starts
-    /// at, from the point gaps the merge valve ignores; the same on any pool.
+    /// #768: under drop a point tile's need is the floor that keeps
+    /// `DROP_KEEP × fit` of its members, for a tile of the point gaps the
+    /// merge valve ignores; the same on any pool.
     #[test]
-    fn a_drop_need_prices_point_gaps_on_any_pool() {
+    fn a_drop_need_is_a_kept_share_on_any_pool() {
         let zooms = [10u8];
         let rows = dense_points(70_000);
         let key = key_of(rows[0].unwrap());
@@ -1010,14 +992,10 @@ mod tests {
         let (priced, got) = need(&drop, 4);
         assert_eq!(priced, 1);
         assert_eq!((priced, got.clone()), need(&drop, 1));
-        let g = got[&(10, 540, 483)];
-        // 70,000 members at 100 bytes: fit 0.30 of the 2 MiB cap; the kept
-        // share at the need is within a bucket of DROP_KEEP × fit.
+        // 70,000 members at 100 bytes: fit 0.30 of the 2 MiB cap.
         let f = fit(70_000, (100.0, 20.0), caps(&drop));
-        let points = rows.iter().map(|r| (0, r.map(|b| (b.lng_min, b.lat_min))));
-        let kept = point_gaps(points).filter(|&gap| gap >= g).count();
-        let share = kept as f64 / 70_000.0;
-        assert!((share / (DROP_KEEP * f) - 1.0).abs() < 0.2, "{share} {f}");
+        let share = KEEP_ALL as f64 / got[&(10, 540, 483)] as f64;
+        assert!((share / (DROP_KEEP * f) - 1.0).abs() < 1e-6, "{share} {f}");
     }
 
     #[test]

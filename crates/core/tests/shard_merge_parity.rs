@@ -1058,8 +1058,9 @@ fn sharded_build_matches_monolithic_with_merge_floors_and_a_feature_order() {
 
 /// #768: under `--size-valve drop` every data shard predicts the point
 /// tiles' drop floors over its own pruned overview file, and thins each
-/// over-cap point tile by gaps to the tile's own previous member, so the
-/// sharded build is byte-identical to the monolithic one outright.
+/// over-cap point tile to its floor's share by a stride over the tile's own
+/// members, so the sharded build is byte-identical to the monolithic one
+/// outright.
 #[test]
 fn sharded_build_matches_monolithic_with_drop_floors() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1100,7 +1101,7 @@ fn write_dense_points(path: &Path) {
         for j in 0..50i64 {
             let id = i * 50 + j;
             rows.push((id, (id % 97) as f64, wkb(x, y), [x, y, x, y]));
-            // Uneven gaps, so a floor's height decides which points stay.
+            // Uneven gaps, so which points a stride keeps shows in the bytes.
             y += 0.02 + ((i * 7919 + j * 104_729) % 1000) as f64 * 0.000_04;
         }
         let dense = (x / (360.0 / 128.0)) as i64 % 2 == 0;

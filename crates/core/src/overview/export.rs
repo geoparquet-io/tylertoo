@@ -342,7 +342,7 @@ impl std::str::FromStr for SizeValve {
 /// How far the size valve's threshold reaches past the tile it fits (#768).
 ///
 /// Applies with a size cap: to the merge valve's merge threshold
-/// ([`SizeValve::Merge`]) and to the gap threshold that thins point tiles
+/// ([`SizeValve::Merge`]) and to the share of its points a point tile keeps
 /// under [`SizeValve::Drop`].
 ///
 /// DIVERGENCE FROM TIPPECANOE: tippecanoe's `--drop-densest-as-needed` and
@@ -350,7 +350,8 @@ impl std::str::FromStr for SizeValve {
 /// too big raises it, and the zoom is rebuilt at the largest any tile
 /// needed (`tile.cpp`, `traverse_zooms`), so sparse tiles beside a dense
 /// one are thinned too. [`ValveScope::Zoom`] is that threshold, predicted
-/// from the export scan, in one pass. [`ValveScope::Tile`] fits each tile
+/// from the export scan, in one pass; for points it is one kept share a
+/// zoom, as `--drop-fraction-as-needed` keeps. [`ValveScope::Tile`] fits each tile
 /// alone, as tylertoo did before #768, so the density can jump at a tile
 /// edge where one tile needed thinning and its neighbour did not.
 /// [`ValveScope::Smooth`] predicts each tile's need and starts the tiles
@@ -362,15 +363,16 @@ pub enum ValveScope {
     /// The default. Under `merge`, the eight tiles around a tile predicted
     /// over its cap start from a fading floor of its merge threshold. Under
     /// `drop`, a point tile predicted over its cap that is over it as is
-    /// drops the points closer than its own predicted gap threshold, or than
-    /// half an over-cap neighbour's, whichever is larger; a point tile that
-    /// fits keeps all.
+    /// keeps an even stride of its points: its own predicted share, or
+    /// twice an over-cap neighbour's, whichever is smaller; a point tile
+    /// that fits keeps all.
     #[default]
     Smooth,
     /// Each tile is thinned only as much as it needs on its own.
     Tile,
-    /// Each tile starts from the largest threshold predicted at its zoom.
-    /// Not shard-invariant, so refused with `--tile-range`.
+    /// Each tile starts from the largest threshold predicted at its zoom
+    /// (under `drop`, every point tile keeps the zoom's smallest predicted
+    /// share). Not shard-invariant, so refused with `--tile-range`.
     Zoom,
 }
 
@@ -11090,11 +11092,11 @@ fn drop_keep(keep: usize, fit: f64, cut: u32) -> usize {
 const MIN_VALVE_EXTENT: u32 = 512;
 
 /// The drop valve. Under `--size-valve drop` a point tile with a #768 floor
-/// first drops the members closer than it to the member before them
-/// ([`drop_below_floor`]); then [`drop_members_to_fit`]. Under
+/// first keeps the share of its members the floor sets
+/// ([`kept_at_floor`]); then [`drop_members_to_fit`]. Under
 /// `--valve-scope smooth` the floor is a prediction: it applies only when
 /// the tile is over its cap without it, so a mispredicted tile keeps every
-/// point. Under `zoom` it is the zoom's threshold and always applies.
+/// point. Under `zoom` it is the zoom's share and always applies.
 fn drop_to_fit(
     gzip_cache: &Arc<TileGzipCache>,
     members: &[Member],
@@ -11123,45 +11125,40 @@ fn drop_to_fit(
             );
         }
     }
-    let above = drop_below_floor(members, opts.floor);
-    let mut mvt = drop_members_to_fit(gzip_cache, &above, tb, opts, fill, fill_tally, diagnostics);
-    let shed = members.len() - above.len();
+    let kept = kept_at_floor(members, opts.floor);
+    let mut mvt = drop_members_to_fit(gzip_cache, &kept, tb, opts, fill, fill_tally, diagnostics);
+    let shed = members.len() - kept.len();
     mvt.valve.dropped += shed;
     mvt.valve.passes += u32::from(tried);
     mvt.oversized |= shed > 0;
     mvt
 }
 
-/// #768: the members of a point tile whose gap to the tile's member before
-/// them in file order ([`valve_predict::point_gaps`]) is at or above
-/// `floor`, in their order. The floor is the tile's own predicted need, or
-/// an over-cap neighbour's halved ([`valve_predict::Scan::drop_floors`]):
-/// it thins an over-cap tile toward a denser neighbour, and the stride
-/// ladder after it still holds the cap when the floor kept too many.
+/// #768: the members a point tile keeps at drop floor `floor`: a share
+/// `KEEP_ALL / floor` of them (all at or under [`valve_predict::KEEP_ALL`],
+/// at least one), by the stride [`select_kept_members`] thins with. The
+/// floor is the tile's own predicted need, or an over-cap neighbour's
+/// halved ([`valve_predict::Scan::drop_floors`]): a tile beside a denser
+/// one keeps no more than twice its share, so neighbours keep shares that
+/// agree, and a stride keeps a dense cluster as much denser than its
+/// surroundings as it was. The stride ladder after it still holds the cap
+/// when the floor kept too many.
 ///
 /// DIVERGENCE FROM TIPPECANOE: `--drop-densest-as-needed` drops below one
-/// gap threshold per zoom and raises it until every tile fits. Here the
-/// threshold is per tile, predicted before any encode and smoothed over
-/// over-cap neighbours, so a tile that fits keeps all its points; a tile
-/// still over after it is thinned by stride, not a higher threshold.
-/// `--valve-scope zoom` starts every point tile from its zoom's largest
-/// predicted need.
-fn drop_below_floor(members: &[Member], floor: u64) -> Vec<&Member> {
-    let mut order: Vec<usize> = (0..members.len()).collect();
-    order.sort_by_key(|&i| members[i].seq);
-    // A date-line pair (#342) is one point: its first copy stands for it.
-    let first = |m: &Member| m.geometry().coords_iter().next().map(|c| (c.x, c.y));
-    let gaps =
-        valve_predict::point_gaps(order.iter().map(|&i| (members[i].band, first(&members[i]))));
-    let mut keep = vec![false; members.len()];
-    for (&i, gap) in order.iter().zip(gaps) {
-        keep[i] = gap >= floor;
+/// gap threshold per zoom and raises it until every tile fits, which
+/// thins clusters first. Here the floor is a share per tile, predicted
+/// before any encode and smoothed over over-cap neighbours, so a tile that
+/// fits keeps all its points; a tile still over after it is thinned by
+/// stride. `--valve-scope zoom` keeps every point tile at its zoom's
+/// smallest predicted share, as `--drop-fraction-as-needed` keeps one
+/// fraction a zoom.
+fn kept_at_floor(members: &[Member], floor: u64) -> Vec<&Member> {
+    let n = members.len() as u64;
+    let keep = n.saturating_mul(valve_predict::KEEP_ALL) / floor.max(1);
+    if keep >= n {
+        return members.iter().collect();
     }
-    members
-        .iter()
-        .zip(keep)
-        .filter_map(|(m, k)| k.then_some(m))
-        .collect()
+    select_kept_members(members, keep as usize)
 }
 
 /// The drop valve: while the tile is over its limit, keep a proportional
@@ -20419,8 +20416,9 @@ mod tests {
 
     /// #768: a point tile over its cap beside a denser over-cap one is
     /// thinned toward it under the default `--valve-scope smooth`: the denser
-    /// tile's predicted need, halved one ring out, drops its close pairs,
-    /// more than its own need would. A tile that fits on its own beside the
+    /// tile's predicted need, halved one ring out, keeps twice the dense
+    /// tile's share of its points, fewer than its own need would. A tile
+    /// that fits on its own beside the
     /// dense one gets no floor and keeps every point (true Africa beside the
     /// Mediterranean on the planet). Each tile is priced at its own real
     /// encode, and the cap binds the pairs' tile without the floor.
@@ -20512,10 +20510,18 @@ mod tests {
         assert_eq!(floors.get(west), 0, "a tile that fits keeps its points");
         assert_eq!(floors.get((10, 542, 483)), 0, "one ring only");
 
-        // The over-cap tile, encoded as the export does with its floor: the
-        // floor drops every partner, and what is left fits.
+        // The over-cap tile, encoded as the export does with its floor: it
+        // keeps the share the dense neighbour's halved floor implies, which
+        // fits, so nothing more drops.
         let thinned = encode(&on_pairs, &opts, Some(&floors), b);
-        assert_eq!(thinned.valve.dropped, 12_544, "{:?}", thinned.valve);
+        let keep = 25_088 * valve_predict::KEEP_ALL / floors.get(b);
+        assert!(keep < 25_088 && keep > 0, "{keep}");
+        assert_eq!(
+            thinned.valve.dropped as u64,
+            25_088 - keep,
+            "{:?}",
+            thinned.valve
+        );
         assert_eq!(thinned.valve.over_limit, 0);
         assert!(thinned.data.len() <= cap);
         assert!(thinned.oversized);
@@ -20534,6 +20540,49 @@ mod tests {
         assert_eq!(alone.data, plain.data);
     }
 
+    /// #768: a drop floor keeps its share of a point tile's members by an
+    /// even stride over their order, so a dense cluster stays as much
+    /// denser than its surroundings as it was: the floor thins the tile, it
+    /// does not flatten it (a gap floor dropped the cluster first).
+    #[test]
+    fn a_drop_floor_keeps_its_share_and_the_tiles_relative_density() {
+        // A one-degree cluster of 4,000 points, with 500 spread over the
+        // tile before it and 500 after, in file order as a Hilbert sort
+        // leaves them.
+        let spread = |i: u64| {
+            let x = -150.0 + ((i * 7919) % 300) as f64;
+            point_member(x, -60.0 + ((i * 104_729) % 120) as f64, i)
+        };
+        let members: Vec<Member> = (0..500u64)
+            .map(spread)
+            .chain((500..4_500u64).map(|i| {
+                let j = (i - 500) as f64;
+                point_member(
+                    10.0 + (j % 64.0) / 64.0,
+                    20.0 + (j / 64.0).floor() / 64.0,
+                    i,
+                )
+            }))
+            .chain((4_500..5_000u64).map(spread))
+            .collect();
+        let in_cluster = |m: &&&Member| (500..4_500).contains(&m.seq);
+        // A quarter: the floor of a neighbour whose need is eight times
+        // KEEP_ALL, halved one ring out.
+        let kept = kept_at_floor(&members, valve_predict::KEEP_ALL * 8 / 2);
+        assert_eq!(kept.len(), 5_000 / 4);
+        let share = kept.iter().filter(in_cluster).count() as f64 / kept.len() as f64;
+        assert!((share - 0.8).abs() < 0.01, "cluster share {share}, was 0.8");
+        // A floor at or under KEEP_ALL keeps every member.
+        assert_eq!(
+            kept_at_floor(&members, valve_predict::KEEP_ALL).len(),
+            5_000
+        );
+        assert_eq!(kept_at_floor(&members, 1).len(), 5_000);
+        // Any floor keeps at least one member, and an empty tile none.
+        assert_eq!(kept_at_floor(&members, u64::MAX).len(), 1);
+        assert!(kept_at_floor(&[], u64::MAX).is_empty());
+    }
+
     /// #768: a point floor that keeps too many still ends under the cap.
     /// The stride ladder finishes the tile from what the floor kept.
     #[test]
@@ -20545,18 +20594,9 @@ mod tests {
                 point_member(x, 0.37 * i as f64 - 70.0, i)
             })
             .collect();
-        let mut gaps: Vec<u64> = valve_predict::point_gaps(members.iter().map(|m| {
-            (
-                m.band,
-                m.geometry().coords_iter().next().map(|c| (c.x, c.y)),
-            )
-        }))
-        .collect();
-        gaps.sort_unstable();
-        // Drops about a fifth of the points.
-        let floor = gaps[80];
-        let below = gaps.iter().filter(|&&g| g < floor).count();
-        assert!(below > 0);
+        // Keeps four fifths of the points.
+        let floor = valve_predict::KEEP_ALL * 5 / 4;
+        let below = 400 - 400 * 4 / 5;
         let opts = ExportOptions {
             size_valve: SizeValve::Drop,
             tile_size_limit: None,
@@ -20590,7 +20630,7 @@ mod tests {
         assert!(mvt.data.len() <= cap);
         assert!(mvt.valve.dropped > below, "{:?}", mvt.valve);
         // Under a looser cap the floor alone fits the tile: it drops exactly
-        // the points under it, where the stride alone would drop fewer.
+        // the share it does not keep, where the stride alone would drop fewer.
         let loose = ExportOptions {
             tile_size_limit: Some(cap * 3 / 2),
             ..opts.clone()
