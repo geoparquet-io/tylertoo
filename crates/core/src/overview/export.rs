@@ -20333,6 +20333,61 @@ mod tests {
         assert!(floored.oversized, "{v:?}");
     }
 
+    /// #768: a merge floor short of what a binding cap needs is only where
+    /// the ladder starts: it climbs from there and the tile ends under the
+    /// cap.
+    #[test]
+    fn a_merge_floor_under_a_binding_cap_still_fits() {
+        let members: Vec<_> = disjoint_rings(400, 4)
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| Member {
+                key: tile_key(512, 511, 10),
+                seq: i as u64,
+                geom: f.geom.into(),
+                props: SharedProps::new(vec![]),
+                id: None,
+                gap: if i == 0 { GAP_NONE } else { i as u64 },
+                band: 0,
+            })
+            .collect();
+        let floors = valve_predict::ValveFloors {
+            tiles: HashMap::from([((10, 512, 511), 101)]),
+            ..Default::default()
+        };
+        let encode = |opts: &ExportOptions, floors| {
+            encode_tile_layers(
+                &test_gzip_cache(),
+                &members,
+                &TileCoord::new(512, 511, 10).bounds(),
+                &TileEncoding::single(opts)
+                    .with_floors(floors)
+                    .for_tile(10, 512, 511),
+                &[],
+                &mut FillTally::default(),
+                &crate::diagnostics::Diagnostics::default(),
+            )
+        };
+        let uncapped = ExportOptions {
+            size_valve: SizeValve::Merge,
+            tile_size_limit: None,
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let floored = encode(&uncapped, Some(&floors));
+        // A cap the floor alone does not meet.
+        let cap = floored.data.len() * 2 / 3;
+        let capped = ExportOptions {
+            tile_size_limit: Some(cap),
+            ..uncapped
+        };
+        let mvt = encode(&capped, Some(&floors));
+        let v = mvt.valve;
+        assert!(v.passes > 1 && v.merged > floored.valve.merged, "{v:?}");
+        assert_eq!(v.over_limit, 0, "{v:?}");
+        assert!(mvt.data.len() <= cap, "{} > {cap}", mvt.data.len());
+    }
+
     /// #768: a point tile over its cap beside a denser over-cap one is
     /// thinned toward it under the default `--valve-scope smooth`: the denser
     /// tile's predicted need, halved one ring out, drops its close pairs,
