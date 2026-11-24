@@ -548,7 +548,8 @@ pub struct ExportPmtilesArgs {
 
     /// Start from another tool's export defaults instead of tylertoo's;
     /// options you pass still override them. `tippecanoe` sets its tile
-    /// buffer, size caps, size valve and max-zoom simplification:
+    /// buffer, size caps, size valve, one valve threshold per zoom
+    /// (`--valve-scope zoom`) and max-zoom simplification:
     /// <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>.
     #[arg(long, value_name = "tippecanoe", hide_possible_values = true)]
     pub preset: Option<super::Preset>,
