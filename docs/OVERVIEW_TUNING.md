@@ -1807,8 +1807,8 @@ it fits (#768):
     encode, and its eight neighbours start at half of it. Merge density
     steps down at a tile edge instead of jumping from merged to unmerged.
     On NZ Parcels it cuts the p95 density step between neighbouring tiles
-    at z5–z7 from 2.3–3.7 to 1.0–2.4, for 8% more wall time (19.2 s to
-    20.7 s, median of 3); on FTW Moldova, 1% (2.82 s to 2.85 s).
+    at z5–z7 from 2.3–3.7 to 1.0–2.4, for 6% more wall time (19.2 s to
+    20.3 s, median of 3); on FTW Moldova, 1% (2.84 s to 2.87 s).
   - Under `drop` a point tile predicted over its cap is encoded first as
     is. If it is still over, it drops the points closer to the point before
     them than its own threshold, or than half the threshold of an over-cap
@@ -1817,9 +1817,8 @@ it fits (#768):
     neighbours. On 1.8 million French points
     (`--preset tippecanoe --size-valve drop --max-compressed-tile-size
     1500000`), the absolute log ratio of the kept shares on the two sides
-    of the 0° tile edge at z5 falls from 1.03–1.18 to 0.13–0.37. The build takes 12.8 s
-    instead of 33.2 s, because the floor drops most of a dense tile's
-    points before its first encode.
+    of the 0° tile edge at z5 falls from 1.03–1.18 to 0.14–0.38, for 2%
+    more wall time (33.4 s to 34.2 s, median of 3).
   - A tile still over its cap is reduced further, as under `tile`. Each
     tile's prediction reads only its own members, so a sharded build starts
     every tile from the same threshold as an unsharded one.

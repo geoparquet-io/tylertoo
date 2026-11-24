@@ -208,7 +208,7 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it cannot, the export warns and runs as `--valve-scope tile`.
   Archives change. `--valve-scope tile` restores the previous output, and
   `--valve-scope zoom` starts every tile from its zoom's largest threshold
-  (not with `--tile-range`). The default costs at most 1.09× the build time
+  (not with `--tile-range`). The default costs at most 1.10× the build time
   of `tile` on the benchmark inputs (median of 3).
 - The Python wheel uses mimalloc as its global allocator on every platform,
   as the CLI does (#739, #792). On the 792 buildings input (median of 3),
