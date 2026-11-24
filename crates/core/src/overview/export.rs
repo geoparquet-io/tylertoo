@@ -2244,6 +2244,45 @@ pub fn export_pmtiles(
     export_pmtiles_with_partition_target(input_path, output_path, options, DEFAULT_PARTITION_TARGET)
 }
 
+/// #768: the valve floors an export of `overview` under `options` starts
+/// its tiles from, keyed `(zoom, tile id)`: for the shard parity oracle,
+/// which compares a shard's floors with the monolithic build's.
+///
+/// # Errors
+///
+/// As [`export_pmtiles`], for the scan and the price samples.
+#[doc(hidden)]
+pub fn predicted_valve_floors(
+    overview: &Path,
+    options: &ExportOptions,
+) -> Result<BTreeMap<(u8, u64), u64>, ExportError> {
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    let reader = OverviewReader::open(overview)?;
+    let crs = crs_from_descriptor(reader.resolved_schema(), overview, &diagnostics)?;
+    let zooms = resolve_level_zooms(reader.meta(), reader.num_levels())?;
+    let mut budget = export_budget();
+    let band = BandRead {
+        source: reader.source(),
+        budget,
+        profile: options.profile,
+    };
+    let cols = resolve_export_columns((&reader, band), options, &zooms)?;
+    let (_, floors) = scan_with_floors(
+        &reader,
+        crs,
+        (&cols.published, cols.feature_id.as_ref()),
+        (options, &zooms),
+        &mut budget,
+        (&ExportTimers::default(), None),
+        &diagnostics,
+    )?;
+    Ok(floors
+        .tiles
+        .into_iter()
+        .map(|((z, x, y), floor)| ((z, tile_key(x, y, z)), floor))
+        .collect())
+}
+
 /// Intermediate archives run their ordinary valves; only over-limit tile
 /// reporting at shared zooms belongs to the merge.
 pub(crate) fn export_pmtiles_for_join(

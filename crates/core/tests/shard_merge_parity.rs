@@ -476,6 +476,7 @@ fn sharded_build_against_monolithic(input: &Path, build: Build) -> Vec<((u8, u64
     let got = tiles_of(&merged);
     if let Some((_, ValveScope::Smooth, _)) = tile_cap {
         assert_floors_change_tiles_past_the_pivot(&overview, dir, build, &want);
+        assert_shard_floors_match(&overview, dir, &shard_plan, build);
     }
     assert!(
         !want.is_empty(),
@@ -603,6 +604,44 @@ fn sharded_build_against_monolithic(input: &Path, build: Build) -> Vec<((u8, u64
     assert_archive_metadata_matches(&mono, &merged, shards);
     eprintln!("[oracle] {flavor:?} N={shards}: header, bounds and vector_layers all match");
     differ
+}
+
+/// #768: every data shard predicts, over its own pruned overview file, the
+/// floor the monolithic build predicts for every tile it owns. Floors, not
+/// tile bodies: a pruning shard's tiles can differ without any floor
+/// (#854), and those tiles' floors must match too.
+fn assert_shard_floors_match(overview: &Path, dir: &Path, plan: &ShardPlan, build: Build) {
+    use tylertoo_core::internal::overview::export::predicted_valve_floors;
+    let mono = predicted_valve_floors(
+        overview,
+        &capped_export_options(build).with_min_zoom(Some(build.min_zoom)),
+    )
+    .expect("monolithic floors");
+    let mut compared = 0;
+    for i in 0..build.shards {
+        let range = plan.range(i).expect("shard range");
+        let owned = |(z, id): &(u8, u64)| range.ids_at(*z).is_some_and(|ids| ids.contains(id));
+        let got = predicted_valve_floors(
+            &dir.join(format!("shard-{i}.parquet")),
+            &capped_export_options(build)
+                .with_tile_range(Some(range))
+                .with_min_zoom(Some(build.pivot)),
+        )
+        .expect("shard floors");
+        let got: BTreeMap<_, _> = got.into_iter().filter(|(t, _)| owned(t)).collect();
+        let want: BTreeMap<_, _> = mono
+            .iter()
+            .filter(|(t, _)| owned(t))
+            .map(|(&t, &f)| (t, f))
+            .collect();
+        assert_eq!(
+            got, want,
+            "shard {i}'s valve floors differ from the monolithic build's"
+        );
+        compared += want.len();
+    }
+    assert!(compared > 0, "no floor past the pivot to compare");
+    eprintln!("[oracle] {compared} floor(s) past the pivot match");
 }
 
 /// #768's premise for a floored build: the valve floors change tiles the
