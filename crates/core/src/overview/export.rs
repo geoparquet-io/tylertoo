@@ -7446,6 +7446,14 @@ fn size_bboxes(
 /// the domain comes back unchanged. These are what the archive advertises, so
 /// a cell stored as `x: 178 … 181` reports `[178, 180]` and `[-180, -179]`,
 /// never lng 181.
+fn wrapped_extents(bbox: &TileBounds) -> impl Iterator<Item = TileBounds> + '_ {
+    wrap_shifts(bbox, 0.0).map(move |shift| {
+        let lo = bbox.lng_min + shift;
+        let hi = bbox.lng_max + shift;
+        TileBounds::new(lo.max(-180.0), bbox.lat_min, hi.min(180.0), bbox.lat_max)
+    })
+}
+
 /// The bounds [`size_bboxes`] gives, without the tile counts.
 fn bboxes_bounds(bboxes: &[Option<TileBounds>]) -> Option<TileBounds> {
     bboxes
@@ -7457,14 +7465,6 @@ fn bboxes_bounds(bboxes: &[Option<TileBounds>]) -> Option<TileBounds> {
             a.expand(&b);
             a
         })
-}
-
-fn wrapped_extents(bbox: &TileBounds) -> impl Iterator<Item = TileBounds> + '_ {
-    wrap_shifts(bbox, 0.0).map(move |shift| {
-        let lo = bbox.lng_min + shift;
-        let hi = bbox.lng_max + shift;
-        TileBounds::new(lo.max(-180.0), bbox.lat_min, hi.min(180.0), bbox.lat_max)
-    })
 }
 
 /// `true` when tile `tc` lies in `ranges`.
@@ -10878,15 +10878,15 @@ fn with_fill(
     no_fill(tally, fitted)
 }
 
-/// Whether the size valve can merge anything: [`SizeValve::Merge`] with a
-/// size limit in force. Otherwise no gap is ever compared, and the read
-/// skips measuring them (#745).
 /// #768: whether the export scan predicts valve floors: under
 /// `--valve-scope smooth` or `zoom`, with a cap in force.
 fn valve_predicts(opts: &ExportOptions) -> bool {
     opts.valve_scope != ValveScope::Tile && opts.has_tile_size_cap()
 }
 
+/// Whether the size valve can merge anything: [`SizeValve::Merge`] with a
+/// size limit in force. Otherwise no gap is ever compared, and the read
+/// skips measuring them (#745).
 fn valve_merges(opts: &ExportOptions) -> bool {
     opts.size_valve == SizeValve::Merge && opts.has_tile_size_cap()
 }
