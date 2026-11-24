@@ -2951,7 +2951,7 @@ fn cap_joined_tile(
         // across layers, copying geometry commands without re-clipping.
         // A join retried by the source valve is left to that valve, whose
         // own fallbacks (#873) decide what still exceeds a cap.
-        let count = drop_joined_tile(raw, &mut gzip, export).map_err(|error| {
+        let count = drop_joined_tile(raw, &mut gzip, export, coord.z).map_err(|error| {
             PyramidError::TileCompress {
                 z: coord.z,
                 x: coord.x,
@@ -3282,6 +3282,20 @@ fn joined_export_error(error: ExportError) -> PyramidError {
     }
 }
 
+/// Whether an MVT feature draws one point: one `MoveTo` of one point, or of a
+/// date-line pair one `world` apart (`draws_one_point`).
+fn draws_one_mvt_point(f: &crate::vector_tile::tile::Feature, world: i64) -> bool {
+    let g = &f.geometry;
+    let at = |i: usize| i64::from(crate::mvt::zigzag_decode(g[i]));
+    f.r#type == Some(crate::vector_tile::tile::GeomType::Point as i32)
+        && (g.len() <= 3
+            || (g.len() == 5 && g[0] == (2 << 3 | 1) && {
+                let (x, y) = (at(1), at(2));
+                let pair = [(x, y), (x + at(3), y + at(4))];
+                crate::overview::export::draws_one_point(pair.into_iter(), world)
+            }))
+}
+
 /// Fit an archive join with no overview to retry: search the ranked prefix
 /// (points in bit-reversed order) for the largest fit, within
 /// `MAX_DROP_PASSES` encodes, with one feature as the floor.
@@ -3289,6 +3303,7 @@ fn drop_joined_tile(
     raw: &mut Vec<u8>,
     gzip: &mut Vec<u8>,
     opts: &ExportOptions,
+    zoom: u8,
 ) -> Result<usize, std::io::Error> {
     let Ok(tile) = crate::vector_tile::Tile::decode(raw.as_slice()) else {
         return Ok(0);
@@ -3320,16 +3335,10 @@ fn drop_joined_tile(
         .flat_map(|l| &l.features)
         .enumerate()
         .collect();
-    // One MoveTo of one point, or of a date-line pair (`draws_one_point`).
-    let point_like = features.iter().all(|(_, f)| {
-        let g = &f.geometry;
-        f.r#type == Some(crate::vector_tile::tile::GeomType::Point as i32)
-            && (g.len() <= 3
-                || (g.len() == 5 && g[0] == (2 << 3 | 1) && {
-                    let y = i64::from(crate::mvt::zigzag_decode(g[2]));
-                    let dy = i64::from(crate::mvt::zigzag_decode(g[4]));
-                    crate::overview::export::draws_one_point([y, y + dy].into_iter())
-                }))
+    let point_like = tile.layers.iter().all(|l| {
+        // One world at `zoom`, in this layer's units.
+        let world = i64::from(l.extent.unwrap_or(4096)) << zoom;
+        l.features.iter().all(|f| draws_one_mvt_point(f, world))
     });
     // Rank once; every keep count below selects from this ranking.
     let ranked =
@@ -6052,6 +6061,7 @@ mod tests {
                 compressed_tile_size_limit: None,
                 ..Default::default()
             },
+            0,
         )
         .unwrap();
         assert_eq!(dropped, n - 1);
@@ -6095,10 +6105,30 @@ mod tests {
                 compressed_tile_size_limit: None,
                 ..Default::default()
             },
+            0,
         )
         .unwrap();
         assert!(raw.len() <= cap, "{} > {cap}", raw.len());
         assert!(dropped <= 45, "kept only {} points", 100 - dropped);
+    }
+
+    /// #768: an MVT pair draws one point only one world apart on one row;
+    /// a real pair on one row is two points.
+    #[test]
+    fn only_an_mvt_pair_one_world_apart_draws_one_point() {
+        let zz = |n: i32| ((n << 1) ^ (n >> 31)) as u32;
+        let pair = |dx: i32, dy: i32| crate::vector_tile::tile::Feature {
+            r#type: Some(crate::vector_tile::tile::GeomType::Point as i32),
+            geometry: vec![17, zz(4_000), zz(2_000), zz(dx), zz(dy)],
+            ..Default::default()
+        };
+        assert!(draws_one_mvt_point(&pair(-4_096, 0), 4_096));
+        assert!(!draws_one_mvt_point(&pair(-100, 0), 4_096), "a real pair");
+        assert!(!draws_one_mvt_point(&pair(-4_096, 1), 4_096));
+        assert!(
+            !draws_one_mvt_point(&pair(-4_096, 0), 4_096 << 1),
+            "z1: half a world"
+        );
     }
 
     /// A joined z0 tile holds a date-line point's two copies as one 2-point
@@ -6139,6 +6169,7 @@ mod tests {
                 compressed_tile_size_limit: None,
                 ..Default::default()
             },
+            0,
         )
         .unwrap();
         assert!(
@@ -6226,6 +6257,7 @@ mod tests {
                     compressed_tile_size_limit: None,
                     ..Default::default()
                 },
+                0,
             )
             .unwrap();
             // At most floor(3n/4) survive each pass, even when a cap is

@@ -10884,19 +10884,26 @@ fn valve_merges(opts: &ExportOptions) -> bool {
 /// the two date-line copies of one point count as one ([`draws_one_point`]).
 fn is_point_like<M: TileFeature>(members: &[M]) -> bool {
     members.iter().all(|m| match m.geometry() {
-        Geometry::MultiPoint(mp) => draws_one_point(mp.0.iter().map(|p| p.y())),
+        Geometry::MultiPoint(mp) => draws_one_point(mp.0.iter().map(|p| (p.x(), p.y())), 360.0),
         g => g.coords_count() <= 1,
     })
 }
 
-/// Whether a member's points, given by their latitudes (or MVT `y`), draw
-/// one point: none or one, or the pair [`join_wrapped_pieces`] makes when a
+/// Whether a member's points, as `(x, y)` (degrees, or MVT units), draw one
+/// point: none or one, or the pair [`join_wrapped_pieces`] makes when a
 /// point within the buffer of the date line reaches a z0 tile twice (#342).
-/// The two copies differ only in longitude, so they share a latitude.
-pub(crate) fn draws_one_point<T: PartialEq>(mut ys: impl Iterator<Item = T>) -> bool {
-    match (ys.next(), ys.next(), ys.next()) {
+/// The two copies share a latitude and lie one `world` width apart, the
+/// shift [`wrap_shifts`] gave the copy.
+pub(crate) fn draws_one_point<T>(mut points: impl Iterator<Item = (T, T)>, world: T) -> bool
+where
+    T: Copy + PartialEq + std::ops::Add<Output = T> + std::ops::Sub<Output = T>,
+{
+    match (points.next(), points.next(), points.next()) {
         (_, None, _) => true,
-        (Some(a), Some(b), None) => a == b,
+        (Some((ax, ay)), Some((bx, by)), None) => {
+            ay == by
+                && (bx == ax - world || bx == ax + world || ax == bx - world || ax == bx + world)
+        }
         _ => false,
     }
 }
@@ -21852,6 +21859,31 @@ mod tests {
             .map(|m| m.seq)
             .collect();
         assert_eq!(kept, (0..10).map(|i| i * 10).collect::<Vec<_>>());
+    }
+
+    /// #768: only a pair one world apart at one latitude is a date-line
+    /// pair; a real two-point member on one parallel is two points, so its
+    /// tile is no point tile and the merge valve still takes it.
+    #[test]
+    fn only_a_pair_one_world_apart_draws_one_point() {
+        let pair = |a: (f64, f64), b: (f64, f64)| Member {
+            geom: Geometry::MultiPoint(geo::MultiPoint(vec![a.into(), b.into()])).into(),
+            ..point_member(0.0, 0.0, 0)
+        };
+        let east = 179.3;
+        for wrapped in [
+            pair((east, 4.0), (east - 360.0, 4.0)),
+            pair((-179.9, 4.0), (-179.9 + 360.0, 4.0)),
+        ] {
+            assert!(is_point_like(&[wrapped]));
+        }
+        for real in [
+            pair((10.0, 4.0), (20.0, 4.0)),
+            pair((179.5, 4.0), (-179.5, 4.0)),
+            pair((east, 4.0), (east - 360.0, 4.5)),
+        ] {
+            assert!(!is_point_like(&[real]));
+        }
     }
 
     /// A `--feature-order` column the layer does not publish is a silent
