@@ -410,7 +410,10 @@ Set `SPILL` to an existing directory on real disk. To rerun shard 7, submit
 - **`--tile-buffer` must be at most 256 tile pixels**, the cap for every
   export. This fits inside the nine pivot tiles read around each shard's
   range, a margin wide enough for `--valve-scope smooth` to fade a dense
-  tile's thinning over the tiles around it.
+  tile's thinning over the tiles around it (#768). On world-wide points cut
+  into 8 shards at z6 the fleet reads 27% more rows than with the two-tile
+  margin it replaced; a regional input that every shard read whole anyway
+  costs nothing more. A finer `--pivot` keeps the margin narrower.
 - **CLI only.** The Python bindings do not expose sharding.
 - **Manual ranges.** `export-pmtiles --tile-range LO..HI` takes two tile ids
   at one zoom, and `--zoom-ceiling Z` emits the coarse half.

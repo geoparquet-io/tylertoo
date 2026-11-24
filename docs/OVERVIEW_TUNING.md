@@ -191,8 +191,9 @@ next tile merged differently. Use `--size-valve drop` when every drawn
 polygon must retain its own attributes.
 
 Merging works in the input's row order: each feature is merged into the
-previous retained feature. Dropping also assumes that order: it keeps an
-even stride of rows. tylertoo never reorders rows, so the input must be
+previous retained feature. Dropping also assumes that order: it ranks
+points by their row's place in the input, which spreads the kept points
+evenly only over spatially sorted rows. tylertoo never reorders rows, so the input must be
 sorted spatially with `gpio sort hilbert` first, which puts consecutive
 features near each other. On unsorted input, merged features contain
 unrelated geometry, color changes at tile edges become far more frequent,
@@ -1797,47 +1798,89 @@ reaches past the tile:
   the chosen extent and takes at most eight encodes. Both valves keep their
   first drop cut unchanged. Later cuts use a 20% margin to finish sooner.
 
-`--valve-scope` sets how far either valve's threshold reaches past the tile
-it fits (#768):
+#### How far the thinning reaches: `--valve-scope` and `--valve-max-step`
 
-- `smooth` (the default) predicts, from the export's scan, which tiles go
-  over a cap and how far: each dense tile's threshold, priced by a real
-  encode of a sample of its own members.
-  - Under `merge` a tile then starts its merge at that threshold, in one
-    encode, and its eight neighbours start at half of it. Merge density
-    steps down at a tile edge instead of jumping from merged to unmerged.
-    On NZ Parcels it cuts the p95 density step between neighbouring tiles
-    at z5–z7 from 2.3–3.7 to 1.0–2.4, for 6% more wall time (19.2 s to
-    20.3 s, median of 3); on FTW Moldova, 1% (2.84 s to 2.87 s).
-  - Under `drop` a point tile predicted over its cap is encoded first as
-    is. If it is still over, it keeps a share of its points, an even stride
-    over their order: 0.9 times its predicted fit, or twice the share of an
-    over-cap neighbour, whichever is smaller. The stride keeps a city as
-    much denser than the country around it as it was, and neighbouring
-    tiles keep shares within a factor of 2 of each other. A point tile
-    that fits keeps every point; only tiles over a cap are thinned toward
-    their denser neighbours, so the density still jumps where an over-cap
-    tile meets one that fits. On 1.8 million French points
-    (`--preset tippecanoe --size-valve drop --max-compressed-tile-size
-    1500000`), the absolute log ratio of the kept shares on the two sides
-    of the 0° tile edge at z5 falls from 1.03–1.18 to 0.60–0.69, for
-    3% more wall time (33.7 s to 34.8 s, median of 3).
-  - A tile still over its cap is reduced further, as under `tile`. Each
-    tile's prediction reads only its own members, so a sharded build starts
-    every tile from the same threshold as an unsharded one.
-  - The prediction holds a few kilobytes for each tile of more than about
-    a thousand features, and the samples it encodes are taken a few tiles
-    at a time, within the export's memory budget. If that state outgrows
-    the budget, the export warns and goes on as under `tile`.
-- `tile` thins each tile only as much as it needs on its own. It is the
-  output from before #768.
-- `zoom` starts every tile at a zoom from the largest threshold predicted
-  there, under either valve; under `drop`, every point tile keeps the
-  smallest share predicted at its zoom, as tippecanoe's
-  `--drop-fraction-as-needed` keeps one fraction a zoom. Tippecanoe works this way: a tile too big
-  raises the zoom's threshold and the zoom is rebuilt with it, so sparse
-  tiles next to dense ones are thinned too. A sharded build
-  (`--tile-range`) cannot see the whole zoom and refuses it.
+When one tile is too dense and has to be thinned, its neighbours may not
+be. Thinning only the dense tile leaves a visible edge: a full tile next
+to a sparse one. `--valve-scope` decides how far the thinning reaches
+past the tile that needs it (#768), and `--valve-max-step` how gently it
+fades under `smooth`.
+
+- `smooth` (the default) first predicts, from the export's scan, which
+  tiles will go over a cap and how much each needs thinning. Each such
+  tile is thinned that much from its first encode, and every tile around
+  it, including tiles that fit, is thinned too, by a little less each tile
+  further out. `--valve-max-step RATIO` (default 2) is the largest step
+  allowed between neighbours: a tile keeps at most RATIO times the share
+  of points its neighbour keeps, or merges at most RATIO times less hard.
+  The fade stops where it no longer thins anything, and at most 8 tiles
+  out; a tile so dense that the fade would still thin 8 tiles out fades
+  by the larger, even step that ends there.
+  - `--valve-max-step 2`: use this when you want dense areas to stay
+    visibly denser without hard tile edges. The usual choice.
+  - `--valve-max-step 1.25`: use this when tile edges must be close to
+    invisible and you can give up more detail around dense areas.
+  - Larger values (4, 8): use these when detail next to dense areas matters
+    more than edges; they come closer to `tile`.
+- `tile` thins each tile only as much as it needs on its own. Use this when
+  every tile should keep as much as its cap allows and edges between dense
+  and sparse tiles are acceptable.
+- `zoom` thins every tile at a zoom as much as the densest tile there
+  needs, as tippecanoe does: no edges, the least detail. `--preset
+  tippecanoe` sets it. Use this to match tippecanoe. A data shard
+  (`--shard i/N` or `--tile-range`) cannot see the whole zoom and refuses
+  it before it reads anything; pass `--valve-scope smooth` there.
+
+Points are always thinned by a fixed rank (#768): each point's input row,
+bit-reversed. A tile keeps its best-ranked points, so the points kept at
+one zoom stay at the next wherever it keeps a larger share, and the
+points kept on either side of a tile edge are spread the same way.
+
+Measured on 1.8 million French points (`--preset tippecanoe --size-valve
+drop --max-compressed-tile-size 1500000 --point-thinning 0
+--no-density-drop`). The step is the p95 (all but the largest 5%) of the ratio between the
+shares of points two neighbouring tiles keep; kept is points drawn at the
+zoom:
+
+| Setting | Step z3 / z4 / z5 / z6 | Kept z3 / z4 / z5 / z6 | z3 points still at z4 |
+|---|---|---|---|
+| before #768 (`tile`, stride) | 14× / 39× / 17× / 3.5× | 88.7k / 107k / 242k / 590k | 5% |
+| `tile` | 14× / 39× / 17× / 3.5× | 88.7k / 107k / 242k / 591k | 96% |
+| `smooth`, step 2 (default) | 2× at each | 49.7k / 46.9k / 153k / 477k | 93% |
+| `smooth`, step 1.25 | 1.5× / 1.5× / 1.4× / 1.3× | 45.0k / 42.6k / 122k / 248k | 94% |
+| `zoom` | 1.0× at each | 39.9k / 37.6k / 100k / 170k | 94% |
+
+At step 1.25 the densest French tiles need more thinning than 1.25 a tile
+can fade away within 8 tiles, so their fade steepens to an even 1.3–1.5×.
+
+On 4.5 million points spread over the world the z3 tiles keep 502k points
+under `tile`, 159k under `smooth` step 2, 112k at step 1.25 and 63k under
+`zoom`; by z6 `smooth` step 2 keeps 92% of `tile`'s points. No tile ended
+over a cap in any run.
+
+What `smooth` costs over `tile` in wall time (median of 3 on a 64-core
+box; one run where marked): NZ Parcels 19.1 s → 20.9 s (1.10×), FTW
+Moldova 2.85 s → 2.86 s, French points 34.4 s → 12.1 s (0.35×: a tile
+thinned to its floor before its first encode skips the encodes `tile`
+spends finding its size); one run each: Overture segments 19.3 s → 20.6 s,
+buildings 2.19 s → 2.23 s, FTW Mato Grosso 27.2 s → 26.9 s, Madagascar
+1.09 s → 1.11 s. Peak memory is within 3% of `tile` on each, and 18% lower
+on the French points.
+
+On polygons under the default `merge` valve, NZ Parcels' z5–z8 step falls
+from 10× / 32× / 41× / 20× under `tile` to 3.4× / 2.9× / 12× / 14× under
+`smooth`, and FTW Moldova's z7–z8 from 30× / 35× to 13× / 14×, with the
+same coverage. There the step measures merged features, which a wider
+fade does not reduce further.
+
+The prediction holds a few kilobytes for each tile of more than about a
+thousand features, and the floors about 50 bytes for each tile they
+reach, within the export's memory budget. If either outgrows it, the
+export warns loudly and runs as `tile`. A sharded build reads input up to
+nine pivot tiles past each shard's range so that every shard predicts the
+same thinning as an unsharded build: on the world points cut into 8
+shards at z6 the fleet read 27% more rows than with the two-tile margin
+before #768; on a regional input (FTW Mato Grosso) it read the same.
 
 Under either valve, the warning about tiles still over the cap, and the
 `tiles_over_limit` diagnostic in `--report`, list the ten largest of them as
