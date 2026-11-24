@@ -769,10 +769,7 @@ pub(crate) fn predict_drop_need(
     caps: Caps,
 ) -> Option<u64> {
     let fit = fit(count, bytes, caps);
-    if fit >= PREDICT_BELOW_FIT {
-        return None;
-    }
-    Some((KEEP_ALL as f64 / (DROP_KEEP * fit)) as u64)
+    (fit < PREDICT_BELOW_FIT).then(|| (KEEP_ALL as f64 / (DROP_KEEP * fit)) as u64)
 }
 
 #[cfg(test)]
