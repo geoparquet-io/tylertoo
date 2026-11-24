@@ -92,8 +92,8 @@ fn refresh_log_levels(py: Python<'_>) {
 /// configuration.
 ///
 /// shortcut: one buffer per process, so two bindings running at once on two
-/// Python threads may raise each other's warnings; key it by run if that
-/// ever matters.
+/// Python threads may raise each other's warnings (none is lost, unless a
+/// run panics, which empties it); key it by run if that ever matters.
 static USER_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// The log bridge: pyo3-log, except for core's user warnings, which go to
@@ -135,9 +135,19 @@ fn detached<T: pyo3::marker::Ungil>(
     py: Python<'_>,
     f: impl pyo3::marker::Ungil + FnOnce() -> T,
 ) -> PyResult<T> {
-    // A run that panicked, or a `_run_cli`, may have left another call's.
-    take_user_warnings();
+    /// Empties the buffer when the run panics, so the next call does not
+    /// raise this one's warnings.
+    struct OnPanic;
+    impl Drop for OnPanic {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                take_user_warnings();
+            }
+        }
+    }
+    let guard = OnPanic;
     let out = py.detach(f);
+    drop(guard);
     let messages = take_user_warnings();
     let mut seen = std::collections::HashSet::new();
     for message in messages {
@@ -723,9 +733,13 @@ fn _defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
 fn _run_cli(py: Python<'_>, argv: Vec<std::ffi::OsString>) -> u8 {
     let code = py.detach(|| tylertoo_cli::run(argv));
     // After a binding installed the bridge, the CLI's user warnings land in
-    // the buffer; print them as the CLI's own logger would.
-    for message in take_user_warnings() {
-        eprintln!("{message}");
+    // the buffer; print them as the CLI's own logger would, unless
+    // `--quiet` or a lower cap hides warnings.
+    let messages = take_user_warnings();
+    if log::max_level() >= log::LevelFilter::Warn {
+        for message in messages {
+            eprintln!("{message}");
+        }
     }
     code
 }
