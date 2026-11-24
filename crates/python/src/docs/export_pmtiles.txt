@@ -62,8 +62,8 @@ Args:
     valve_scope: How far the size valve's thinning reaches past the
         tile that needs it. `"smooth"` predicts each tile's threshold from
         the export scan and fades it over the tiles around, so neighbouring
-        tiles differ by at most `valve_max_step` (under
-        `size_valve="drop"`, in the share of points they keep) and the
+        tiles differ by at most `valve_max_step` (in point
+        tiles, in the share of points they keep) and the
         density steps down over several tiles instead of jumping at a tile
         edge; tiles near a dense one are thinned too. `"tile"` thins each
         tile only as much as it needs on its own: the most detail, with

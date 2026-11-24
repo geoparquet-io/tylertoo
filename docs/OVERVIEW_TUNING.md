@@ -845,7 +845,7 @@ tylertoo tiles buildings.parquet buildings.pmtiles \
 For country-scale builds:
 
 - Keep the tile cap. Uncapped dot tiles can reach several MB (Germany z6:
-  12 MB). The cap thins dots with a spatially even stride to about 500 KB
+  12 MB). The cap thins dots, keeping a spatially even share, to about 500 KB
   compressed.
 - Use `--profile auto` to spill when needed, or `bounded` to force spilling.
   Coarse levels buffer more rows; forcing `speed` raised Germany's peak
@@ -1559,8 +1559,8 @@ to a style's `"fill-sort-key": ["get", "level"]`.
   among the numbers.
 - **Sorting is independent of the oversized-tile valve.** With
   `--max-tile-size` in force, `select_kept_members` decides which features
-  survive: largest first, or a uniform spatial stride on point-dominated
-  tiles. `--feature-order` then orders the survivors.
+  survive: largest first, or the best-ranked points (an even spread) on
+  point-dominated tiles. `--feature-order` then orders the survivors.
 - **The name is the key the tile advertises**, not the schema column name.
   Export restores a source column renamed to clear a reserved name (see
   [Reserved column names](#reserved-column-names)), so sort by the *source*
@@ -1650,7 +1650,8 @@ matching tippecanoe's `--buffer` (default 5).
 At 256, a tile already includes features from all eight neighbors. Larger
 buffers would reach nonadjacent tiles and risk O(features × tiles) export,
 so tylertoo rejects them before conversion or export. Sharded builds read
-nine pivot tiles beyond their range, covering this margin. See
+two pivot tiles beyond their range, covering this margin, and nine when
+the export fades its size valve (`--valve-scope smooth` with a size cap). See
 [Scaling](guides/scaling.md#sharded-builds).
 
 ### Max-zoom simplification
@@ -1853,14 +1854,21 @@ zoom:
 At step 1.25 the densest French tiles need more thinning than 1.25 a tile
 can fade away within 8 tiles, so their fade steepens to an even 1.3–1.5×.
 
+Point tiles fade under the default `merge` valve too. With the same flags
+minus `--preset tippecanoe --size-valve drop`, the z3–z6 step falls from
+10× / 41× / 23× / 4.3× under `tile` to 2× at each under `smooth`, and
+those zooms keep 32.8k / 31.1k / 105k / 321k points against `tile`'s
+63.1k / 78.6k / 167k / 399k; 93% of the z3 points stay at z4.
+
 On 4.5 million points spread over the world the z3 tiles keep 502k points
 under `tile`, 159k under `smooth` step 2, 112k at step 1.25 and 63k under
 `zoom`; by z6 `smooth` step 2 keeps 92% of `tile`'s points. No tile ended
 over a cap in any run.
 
 What `smooth` costs over `tile` in wall time (median of 3 on a 64-core
-box; one run where marked): NZ Parcels 19.1 s → 20.9 s (1.10×), FTW
-Moldova 2.85 s → 2.86 s, French points 34.4 s → 12.1 s (0.35×: a tile
+box; one run where marked): NZ Parcels 20.1 s → 22.6 s (1.12×), FTW
+Moldova 2.83 s → 2.87 s, French points 33.3 s → 11.9 s (0.36×, and
+32.9 s → 11.9 s under the default `merge`: a tile
 thinned to its floor before its first encode skips the encodes `tile`
 spends finding its size); one run each: Overture segments 19.3 s → 20.6 s,
 buildings 2.19 s → 2.23 s, FTW Mato Grosso 27.2 s → 26.9 s, Madagascar
@@ -1881,6 +1889,8 @@ nine pivot tiles past each shard's range so that every shard predicts the
 same thinning as an unsharded build: on the world points cut into 8
 shards at z6 the fleet read 27% more rows than with the two-tile margin
 before #768; on a regional input (FTW Mato Grosso) it read the same.
+Under `--valve-scope tile`, or with no size cap, nothing fades, and a
+shard reads the two-tile margin again.
 
 Under either valve, the warning about tiles still over the cap, and the
 `tiles_over_limit` diagnostic in `--report`, list the ten largest of them as

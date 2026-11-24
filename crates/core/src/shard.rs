@@ -117,8 +117,8 @@ pub(crate) const MAX_SHARD_PIVOT_ZOOM: u8 = 10;
 /// range, on an input whose row groups are Hilbert-compact. The wider
 /// margin's cost is measured in `docs/OVERVIEW_TUNING.md`. A `tiles` data
 /// shard whose export predicts no floors (`--valve-scope tile`, or no size
-/// cap) reads only [`SHARD_BUFFER_MARGIN_TILES`]; a standalone `overview`
-/// shard cannot see the export options that follow it, so it reads this.
+/// cap) reads only [`SHARD_BUFFER_MARGIN_TILES`]; a convert a Rust caller
+/// shards on its own cannot see the export that follows, so it reads this.
 pub(crate) const SHARD_READ_MARGIN_TILES: f64 =
     (crate::overview::export::valve_predict::MAX_RINGS + 1) as f64;
 
