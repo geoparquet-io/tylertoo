@@ -317,6 +317,36 @@ enum Loc {
 /// rules: every hole inside its exterior, no hole in another hole, no part
 /// inside another part's fill.
 pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
+    check(parts, Mode::First)
+}
+
+/// Does [`check_polygons`] find a defect? The same answer without naming
+/// which defect, so the x-order sweep that names it is skipped (#908).
+pub(crate) fn polygons_invalid<P: AsRef<[TileRing]>>(parts: &[P]) -> bool {
+    check(parts, Mode::Any).is_err()
+}
+
+/// Does `[a, b]` fail [`check_polygons`], given that each part alone passes
+/// it? Only what lies between the parts can fail then: their rings cross,
+/// share an edge stretch or cross at a shared point, or one lies in the
+/// other's fill. Only the edges inside the other part's box are swept (#908).
+pub(crate) fn parts_cross(a: &[TileRing], b: &[TileRing]) -> bool {
+    check(&[a, b], Mode::Between).is_err()
+}
+
+/// What [`check`] looks for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Every defect; the one the x-order sweep finds first is returned.
+    First,
+    /// Every defect; any one is returned.
+    Any,
+    /// Two parts, each valid alone: only defects between them.
+    Between,
+}
+
+/// [`check_polygons`] in the given [`Mode`].
+fn check<P: AsRef<[TileRing]>>(parts: &[P], mode: Mode) -> Result<(), Defect> {
     #[cfg(test)]
     CHECKS.with(|c| c.set(c.get() + 1));
     // The usual feature, one polygon without holes: only the ring's own
@@ -342,20 +372,30 @@ pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), De
             rings.push(ring);
         }
     }
-    for ring in &rings {
-        if folds_back(ring) {
-            return Err(Defect::RingSelfTouch);
-        }
+    let between = mode == Mode::Between;
+    if !between && rings.iter().any(|ring| folds_back(ring)) {
+        return Err(Defect::RingSelfTouch);
     }
 
+    // Between two parts, an edge outside the other part's exterior box
+    // meets none of its edges.
+    let part_boxes: Vec<_> = parts.iter().map(|p| ring_box(&p.as_ref()[0])).collect();
+    let near = |part: u32, e: (i32, i32, i32, i32)| {
+        !between || boxes_meet(e, part_boxes[1 - part as usize])
+    };
     let mut edges: Vec<Edge> = Vec::with_capacity(rings.iter().map(|r| r.len() - 1).sum());
     for (k, ring) in rings.iter().enumerate() {
-        edges.extend(ring.windows(2).enumerate().map(|(pos, w)| Edge {
-            a: w[0],
-            b: w[1],
-            ring: k as u32,
-            pos: pos as u32,
-        }));
+        edges.extend(
+            ring.windows(2)
+                .enumerate()
+                .map(|(pos, w)| Edge {
+                    a: w[0],
+                    b: w[1],
+                    ring: k as u32,
+                    pos: pos as u32,
+                })
+                .filter(|e| near(ring_part[k], edge_box(e.a, e.b))),
+        );
     }
     let boxes: Vec<_> = edges.iter().map(|e| edge_box(e.a, e.b)).collect();
     // Points where two different rings touch, with the edge of each that
@@ -363,7 +403,9 @@ pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), De
     let mut touches: Vec<Touch> = Vec::new();
     let mut visit = |i: usize, j: usize| -> Option<Defect> {
         let (ei, ej) = (edges[i], edges[j]);
-        if ei.ring == ej.ring {
+        if between && ring_part[ei.ring as usize] == ring_part[ej.ring as usize] {
+            // Each part alone is valid.
+        } else if ei.ring == ej.ring {
             let n = rings[ei.ring as usize].len() as u32 - 1;
             let adjacent = (ei.pos + 1) % n == ej.pos || (ej.pos + 1) % n == ei.pos;
             if !adjacent && segments_meet((ei.a, ei.b), (ej.a, ej.b)) {
@@ -388,7 +430,8 @@ pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), De
     if strip_box_pairs(&boxes, |i, j| {
         defect = visit(i, j);
         defect.is_some()
-    }) {
+    }) && mode == Mode::First
+    {
         any_box_pair(&boxes, |i, j| {
             defect = visit(i, j);
             defect.is_some()
@@ -418,7 +461,10 @@ pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), De
     if interior_disconnected(same_part, rings.len()) {
         return Err(Defect::DisconnectedInterior);
     }
-    check_nesting(parts)
+    if !between {
+        holes_nested(parts)?;
+    }
+    shells_nested(parts)
 }
 
 /// Two rings that touch at `p`, and the edge of each the touch was found on.
@@ -581,10 +627,9 @@ fn interior_disconnected(mut touches: Vec<(u32, u32, (i32, i32))>, ring_count: u
     false
 }
 
-/// The nesting rules, for rings that are already known not to cross: each
-/// hole inside its exterior, no hole inside another hole of its polygon, no
-/// part inside another part's fill (an island in a lake is fine).
-fn check_nesting<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
+/// Each part's own nesting, for rings already known not to cross: its
+/// holes inside its exterior, no hole inside another hole.
+fn holes_nested<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
     for poly in parts.iter().map(AsRef::as_ref) {
         let (shell, holes) = (&poly[0], &poly[1..]);
         let holes: Vec<&TileRing> = holes.iter().collect();
@@ -606,6 +651,12 @@ fn check_nesting<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
             }
         }
     }
+    Ok(())
+}
+
+/// No part inside another part's fill (an island in a lake is fine), for
+/// rings already known not to cross.
+fn shells_nested<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
     if parts.len() < 2 {
         return Ok(());
     }
@@ -629,6 +680,11 @@ fn check_nesting<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
 
 fn box_within(inner: (i32, i32, i32, i32), outer: (i32, i32, i32, i32)) -> bool {
     inner.0 >= outer.0 && inner.1 >= outer.1 && inner.2 <= outer.2 && inner.3 <= outer.3
+}
+
+/// Do two closed boxes share a point?
+fn boxes_meet(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
 }
 
 /// Where `ring` lies relative to `other`, for two rings that do not cross:
@@ -923,6 +979,24 @@ mod tests {
             compared < 16 * edges,
             "{compared} box comparisons for {edges} edges"
         );
+    }
+
+    /// #908: `parts_interact` asks only whether a defect exists, which the
+    /// strips settle. Re-sweeping in x order to name the first defect paired
+    /// every edge with its column again.
+    #[test]
+    fn defect_test_follows_meeting_pairs_not_shared_columns() {
+        let mut parts = square_grid(20, 1000);
+        parts.push(vec![square(1, 1, 3, 3)]);
+        let edges: u64 = 4 * (20 * 1000 + 1);
+        crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.set(0));
+        assert!(polygons_invalid(&parts));
+        let compared = crate::box_pairs::SWEEP_CANDIDATES.with(|c| c.get());
+        assert!(
+            compared < 16 * edges,
+            "{compared} box comparisons for {edges} edges"
+        );
+        assert!(check_polygons(&parts).is_err());
     }
 
     /// roborev 416: the same grid with every ring starting on a vertical

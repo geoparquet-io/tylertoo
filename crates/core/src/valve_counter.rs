@@ -9,6 +9,8 @@ pub(crate) struct Counts {
     pub rings_quantized: usize,
     pub quantized_none: usize,
     pub candidate_pairs: usize,
+    /// Box sweeps over a merged feature's parts in dense mode (#908).
+    pub part_sweeps: usize,
     pub coalesce_calls: usize,
     pub polygon_clones: usize,
     pub draw_sorts: usize,
@@ -100,6 +102,7 @@ pub(crate) fn measure<T: Send>(f: impl FnOnce() -> T + Send) -> (T, Counts) {
         total.rings_quantized += c.rings_quantized;
         total.quantized_none += c.quantized_none;
         total.candidate_pairs += c.candidate_pairs;
+        total.part_sweeps += c.part_sweeps;
         total.coalesce_calls += c.coalesce_calls;
         total.polygon_clones += c.polygon_clones;
         total.draw_sorts += c.draw_sorts;

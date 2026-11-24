@@ -457,6 +457,12 @@ fn valve_work_overlapping_parts_is_bounded() {
             && c.draw_elements <= 2 * rows,
         "dense tile exceeded work budgets: {c:#?}"
     );
+    // #908: a group a pass already swept is replayed, not swept again
+    // (3948 sweeps here when every pass re-sweeps its groups).
+    assert!(
+        c.part_sweeps <= 2_600,
+        "dense groups swept again on later passes: {c:#?}"
+    );
 }
 
 #[test]

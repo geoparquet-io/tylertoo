@@ -82,73 +82,184 @@ pub(crate) fn strip_box_pairs(
     boxes: &[(i32, i32, i32, i32)],
     mut hit: impl FnMut(usize, usize) -> bool,
 ) -> bool {
+    let Some(s) = Strips::cut(boxes) else {
+        return any_box_pair(boxes, hit);
+    };
+    (0..boxes.len()).any(|p| s.tall_run(boxes, p, &mut hit))
+        || (0..s.members.len())
+            .any(|k| (0..s.members[k].len()).any(|p| s.strip_run(boxes, k, p, &mut hit)))
+}
+
+/// A sweep's callback: true stops the sweep.
+type PairHit<'a> = dyn FnMut(usize, usize) -> bool + 'a;
+
+/// [`strip_box_pairs`]'s pairs, each given to `found` from rayon's workers
+/// in no fixed order; what it returns for them is collected (#908: one
+/// merged feature can hold a million parts).
+pub(crate) fn par_strip_box_pairs<T: Send>(
+    boxes: &[(i32, i32, i32, i32)],
+    found: impl Fn(usize, usize) -> Option<T> + Sync,
+) -> Vec<T> {
+    use rayon::prelude::*;
+    // One run's pairs, collected by the worker that sweeps it.
+    let collect = |run: &dyn Fn(&mut PairHit<'_>) -> bool| {
+        let mut out = Vec::new();
+        run(&mut |i, j| {
+            out.extend(found(i, j));
+            false
+        });
+        out
+    };
     if boxes.len() < 2 * STRIP_BOXES {
-        return any_box_pair(boxes, hit);
+        return collect(&|hit| any_box_pair(boxes, hit));
     }
-    // About the boxes the x sweep pairs each box with, from every 16th box.
-    // Where that is few (a ring's edges: about two), the strips' sort and
-    // lists cost more than they save. shortcut: a uniform-x estimate, so
-    // boxes bunched in x with an outlier far off keep the x sweep and its
-    // cost; bucket min x if a profile shows that.
-    let (x0, x1, widths) =
-        boxes
-            .iter()
-            .step_by(16)
-            .fold((i32::MAX, i32::MIN, 0_i64), |(lo, hi, w), b| {
-                (
-                    lo.min(b.0),
-                    hi.max(b.2),
-                    // Inclusive: a vertical edge still shares its x.
-                    w + i64::from(b.2) - i64::from(b.0) + 1,
-                )
-            });
-    if 16 * widths < X_SWEEP_DENSITY * (i64::from(x1) - i64::from(x0) + 1) {
-        return any_box_pair(boxes, hit);
+    match Strips::cut(boxes) {
+        Some(s) => (0..boxes.len())
+            .into_par_iter()
+            .flat_map_iter(|p| collect(&|hit| s.tall_run(boxes, p, &mut |i, j| hit(i, j))))
+            .chain(s.members.par_iter().enumerate().flat_map_iter(|(k, list)| {
+                (0..list.len())
+                    .flat_map(|p| collect(&|hit| s.strip_run(boxes, k, p, &mut |i, j| hit(i, j))))
+                    .collect::<Vec<_>>()
+            }))
+            .collect(),
+        None => {
+            let order = x_order(boxes);
+            (0..order.len())
+                .into_par_iter()
+                .flat_map_iter(|p| collect(&|hit| x_run(boxes, &order[p..], &mut |i, j| hit(i, j))))
+                .collect()
+        }
     }
-    let (y0, y1) = boxes.iter().fold((i32::MAX, i32::MIN), |(lo, hi), b| {
-        (lo.min(b.1), hi.max(b.3))
-    });
-    let span = i64::from(y1) - i64::from(y0) + 1;
-    // Strips no lower than the mean box, so a box reaches about two.
-    let heights: i64 = boxes.iter().map(|b| i64::from(b.3) - i64::from(b.1)).sum();
-    let mean_height = (heights / boxes.len() as i64).max(1);
-    let strips = (boxes.len() / STRIP_BOXES)
-        .min(MAX_STRIPS)
-        .min(usize::try_from(span / mean_height).unwrap_or(usize::MAX));
-    if strips < 2 {
-        return any_box_pair(boxes, hit);
-    }
-    let strip_of = |y: i32| ((i64::from(y) - i64::from(y0)) * strips as i64 / span) as usize;
-    // `any_box_pair`'s order, so each strip is a subsequence of it.
+}
+
+/// Indices of `boxes` by min x: [`any_box_pair`]'s order.
+fn x_order(boxes: &[(i32, i32, i32, i32)]) -> Vec<u32> {
     let mut order: Vec<u32> = (0..boxes.len() as u32).collect();
     order.sort_unstable_by_key(|&i| boxes[i as usize].0);
-    // Two boxes are compared in every strip they share, so a box reaching
-    // more than two strips is tall: its pairs are found once, in x order.
-    let mut members: Vec<Vec<u32>> = vec![Vec::new(); strips];
-    let mut tall: Vec<usize> = Vec::new();
-    for (p, &i) in order.iter().enumerate() {
-        let b = boxes[i as usize];
-        let (lo, hi) = (strip_of(b.1), strip_of(b.3));
-        if hi - lo > 1 {
-            tall.push(p);
-            continue;
+    order
+}
+
+/// The x sweep's pairs of `run[0]` with the boxes after it in `run`.
+fn x_run(
+    boxes: &[(i32, i32, i32, i32)],
+    run: &[u32],
+    hit: &mut impl FnMut(usize, usize) -> bool,
+) -> bool {
+    let i = run[0];
+    let bi = boxes[i as usize];
+    for &j in &run[1..] {
+        let bj = boxes[j as usize];
+        if bj.0 > bi.2 {
+            break;
         }
-        for list in &mut members[lo..=hi] {
-            list.push(i);
+        #[cfg(test)]
+        SWEEP_CANDIDATES.with(|c| c.set(c.get() + 1));
+        if bj.1 <= bi.3 && bi.1 <= bj.3 && hit(i as usize, j as usize) {
+            return true;
         }
     }
-    // A tall box meets every box after it in the window; a short one only
-    // the tall boxes after it.
-    let mut next = 0;
-    for (p, &i) in order.iter().enumerate() {
-        let bi = boxes[i as usize];
-        let after: &mut dyn Iterator<Item = u32> = if tall.get(next) == Some(&p) {
-            next += 1;
-            &mut order[p + 1..].iter().copied()
-        } else {
-            &mut tall[next..].iter().map(|&q| order[q])
+    false
+}
+
+/// [`strip_box_pairs`]'s cut of the boxes into horizontal strips.
+struct Strips {
+    /// All boxes by min x.
+    order: Vec<u32>,
+    /// Positions in `order` of the boxes reaching more than two strips.
+    tall: Vec<usize>,
+    /// Per strip, the other boxes reaching it, by min x.
+    members: Vec<Vec<u32>>,
+    y0: i32,
+    span: i64,
+}
+
+impl Strips {
+    /// The strips for `boxes`, or `None` where the x sweep is cheaper.
+    fn cut(boxes: &[(i32, i32, i32, i32)]) -> Option<Self> {
+        if boxes.len() < 2 * STRIP_BOXES {
+            return None;
+        }
+        // About the boxes the x sweep pairs each box with, from every 16th
+        // box. Where that is few (a ring's edges: about two), the strips'
+        // sort and lists cost more than they save. shortcut: a uniform-x
+        // estimate, so boxes bunched in x with an outlier far off keep the
+        // x sweep and its cost; bucket min x if a profile shows that.
+        let (x0, x1, widths) =
+            boxes
+                .iter()
+                .step_by(16)
+                .fold((i32::MAX, i32::MIN, 0_i64), |(lo, hi, w), b| {
+                    (
+                        lo.min(b.0),
+                        hi.max(b.2),
+                        // Inclusive: a vertical edge still shares its x.
+                        w + i64::from(b.2) - i64::from(b.0) + 1,
+                    )
+                });
+        if 16 * widths < X_SWEEP_DENSITY * (i64::from(x1) - i64::from(x0) + 1) {
+            return None;
+        }
+        let (y0, y1) = boxes.iter().fold((i32::MAX, i32::MIN), |(lo, hi), b| {
+            (lo.min(b.1), hi.max(b.3))
+        });
+        let span = i64::from(y1) - i64::from(y0) + 1;
+        // Strips no lower than the mean box, so a box reaches about two.
+        let heights: i64 = boxes.iter().map(|b| i64::from(b.3) - i64::from(b.1)).sum();
+        let mean_height = (heights / boxes.len() as i64).max(1);
+        let count = (boxes.len() / STRIP_BOXES)
+            .min(MAX_STRIPS)
+            .min(usize::try_from(span / mean_height).unwrap_or(usize::MAX));
+        if count < 2 {
+            return None;
+        }
+        let mut s = Self {
+            // `any_box_pair`'s order, so each strip is a subsequence of it.
+            order: x_order(boxes),
+            tall: Vec::new(),
+            members: vec![Vec::new(); count],
+            y0,
+            span,
         };
-        for j in after {
+        // Two boxes are compared in every strip they share, so a box
+        // reaching more than two strips is tall: its pairs are found once,
+        // in x order.
+        for p in 0..s.order.len() {
+            let i = s.order[p];
+            let b = boxes[i as usize];
+            let (lo, hi) = (s.strip_of(b.1), s.strip_of(b.3));
+            if hi - lo > 1 {
+                s.tall.push(p);
+                continue;
+            }
+            for list in &mut s.members[lo..=hi] {
+                list.push(i);
+            }
+        }
+        Some(s)
+    }
+
+    fn strip_of(&self, y: i32) -> usize {
+        ((i64::from(y) - i64::from(self.y0)) * self.members.len() as i64 / self.span) as usize
+    }
+
+    /// The x-order pairs of the box at `p` in `order` that involve a tall
+    /// box: a tall box meets every box after it in the window, a short one
+    /// only the tall boxes after it.
+    fn tall_run(
+        &self,
+        boxes: &[(i32, i32, i32, i32)],
+        p: usize,
+        hit: &mut impl FnMut(usize, usize) -> bool,
+    ) -> bool {
+        let next = self.tall.partition_point(|&q| q < p);
+        if self.tall.get(next) == Some(&p) {
+            return x_run(boxes, &self.order[p..], hit);
+        }
+        let i = self.order[p];
+        let bi = boxes[i as usize];
+        for &q in &self.tall[next..] {
+            let j = self.order[q];
             let bj = boxes[j as usize];
             if bj.0 > bi.2 {
                 break;
@@ -159,28 +270,38 @@ pub(crate) fn strip_box_pairs(
                 return true;
             }
         }
+        false
     }
-    for (s, list) in members.iter().enumerate() {
-        for (p, &i) in list.iter().enumerate() {
-            let bi = boxes[i as usize];
-            for &j in &list[p + 1..] {
-                let bj = boxes[j as usize];
-                if bj.0 > bi.2 {
-                    break;
-                }
-                #[cfg(test)]
-                SWEEP_CANDIDATES.with(|c| c.set(c.get() + 1));
-                if bj.1 <= bi.3
-                    && bi.1 <= bj.3
-                    && strip_of(bi.1.max(bj.1)) == s
-                    && hit(i as usize, j as usize)
-                {
-                    return true;
-                }
+
+    /// The pairs of the `p`th box of strip `k` with the boxes after it
+    /// there, each pair only in the strip holding the bottom of its overlap.
+    fn strip_run(
+        &self,
+        boxes: &[(i32, i32, i32, i32)],
+        k: usize,
+        p: usize,
+        hit: &mut impl FnMut(usize, usize) -> bool,
+    ) -> bool {
+        let list = &self.members[k];
+        let i = list[p];
+        let bi = boxes[i as usize];
+        for &j in &list[p + 1..] {
+            let bj = boxes[j as usize];
+            if bj.0 > bi.2 {
+                break;
+            }
+            #[cfg(test)]
+            SWEEP_CANDIDATES.with(|c| c.set(c.get() + 1));
+            if bj.1 <= bi.3
+                && bi.1 <= bj.3
+                && self.strip_of(bi.1.max(bj.1)) == k
+                && hit(i as usize, j as usize)
+            {
+                return true;
             }
         }
+        false
     }
-    false
 }
 
 #[cfg(test)]
@@ -201,6 +322,42 @@ mod tests {
         SWEEP_CANDIDATES.with(|c| c.set(0));
         assert!(!crate::clip::any_edge_pair(&ring, |_, _| false));
         assert!(SWEEP_CANDIDATES.with(|c| c.get()) > 0);
+    }
+
+    /// #908: the parallel sweep finds the serial sweep's pairs, on boxes cut
+    /// into strips (with tall boxes) and on boxes that keep the x sweep.
+    #[test]
+    fn parallel_sweep_finds_the_serial_pairs() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut random = |n: i32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as i32
+        };
+        let striped: Vec<_> = (0..20_000)
+            .map(|k| {
+                let (x, y) = (random(400), random(40_000));
+                let h = if k % 97 == 0 { 9_000 } else { random(30) };
+                (x, y, x + random(20), y + h)
+            })
+            .collect();
+        let sparse: Vec<_> = (0..3_000)
+            .map(|k| (k * 10, random(100), k * 10 + 15, random(100) + 50))
+            .collect();
+        assert!(Strips::cut(&striped).is_some() && Strips::cut(&sparse).is_none());
+        for boxes in [&striped, &sparse] {
+            let mut serial = Vec::new();
+            strip_box_pairs(boxes, |i, j| {
+                serial.push((i.min(j), i.max(j)));
+                false
+            });
+            let mut parallel = par_strip_box_pairs(boxes, |i, j| Some((i.min(j), i.max(j))));
+            serial.sort_unstable();
+            parallel.sort_unstable();
+            assert!(!serial.is_empty());
+            assert_eq!(serial, parallel);
+        }
     }
 
     /// The same boxes as i32 and as f64 meet in the same pairs, met in the

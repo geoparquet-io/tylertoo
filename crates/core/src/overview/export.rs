@@ -1661,19 +1661,21 @@ const MEMBER_PROPERTY_BYTES: u64 = 120;
 ///
 /// Fitted (2026-11, dhat, debug build, two workers, 100k overlapping members
 /// per fixture, inputs allocated before profiling) on both 5-vertex squares
-/// and 40-vertex jittered-radius rings, including each ring's closing vertex:
+/// and 40-vertex jittered-radius rings, including each ring's closing vertex.
+/// #908 added the part-join cache, the lock-free union-find and per-part
+/// validity flags (about 20 B/member on vertex-heavy, highest of three runs):
 ///
 /// | fixture | peak live bytes | bytes/member |
 /// |---|---|---|
-/// | squares | 26,829,000 | 268.29 |
-/// | vertex-heavy | 56,103,693 | 561.03693 |
+/// | squares | 26,829,040 | 268.29 |
+/// | vertex-heavy | 58,584,390 | 585.84 |
 ///
-/// With the separately charged 8 MiB gzip cache, 384 B/member estimates
-/// 46,788,608 B: measured/estimated is 0.57× and 1.20× respectively. Refit
+/// With the separately charged 8 MiB gzip cache, 400 B/member estimates
+/// 48,388,608 B: measured/estimated is 0.55× and 1.21× respectively. Refit
 /// with the process-isolated `valve_encode_peak_live_bytes_matches_price`
 /// ledgers; their 0.5–1.25× bound guards both underpricing and waste
 /// returning. Drop/unlimited add nothing.
-const VALVE_TRANSIENT_BYTES_PER_MEMBER: u64 = 384;
+const VALVE_TRANSIENT_BYTES_PER_MEMBER: u64 = 400;
 
 /// The shared wave/group/store fit price, including merge-valve workspace.
 fn export_member_resident_bytes(resident: u64, opts: &ExportOptions) -> u64 {

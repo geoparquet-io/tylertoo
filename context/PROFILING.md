@@ -226,10 +226,10 @@ Neither profile spills these maps.
 
 For active clipped members, the current admission model is
 `q = 2 × stored bytes/row + 224 + 120 × published properties`.
-The default merge valve adds 384 B/member to wave, group, and store sizing.
+The default merge valve adds 400 B/member to wave, group, and store sizing.
 For a 100-byte stored row with four properties, `q = 904` B and the
-merge fit price is 1288 B/member. A million active members then price at
-1.29 GB (1.20 GiB), before separately charged caches and reader buffers.
+merge fit price is 1304 B/member. A million active members then price at
+1.30 GB (1.21 GiB), before separately charged caches and reader buffers.
 These constants model geometry and property values alongside encoding and
 valve workspace. They are not fixed struct widths. The property price was
 208 B before packed rows (#874); a row's properties are now one shared byte
