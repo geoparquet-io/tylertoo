@@ -69,6 +69,31 @@ pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> Result<u8, Expo
     Ok(implied.max(0) as u8)
 }
 
+/// Every level's zoom, in level order, required to strictly ascend (#371 /
+/// #506 follow-up — see the call site in `export_pmtiles_impl`). Pulled out
+/// of it to keep that function under clippy's function-length ceiling.
+pub(super) fn resolve_level_zooms(
+    meta: &OverviewsMeta,
+    num_levels: usize,
+) -> Result<Vec<u8>, ExportError> {
+    let level_zooms: Vec<u8> = (0..num_levels)
+        .map(|level_idx| zoom_for_level(meta, level_idx))
+        .collect::<Result<_, _>>()?;
+    for i in 1..level_zooms.len() {
+        if level_zooms[i] <= level_zooms[i - 1] {
+            return Err(ExportError::LevelZoomsNotAscending {
+                previous_level: i - 1,
+                previous_zoom: level_zooms[i - 1],
+                previous_gsd: meta.levels[i - 1].gsd,
+                level: i,
+                zoom: level_zooms[i],
+                gsd: meta.levels[i].gsd,
+            });
+        }
+    }
+    Ok(level_zooms)
+}
+
 /// Members-per-partition target for the partitioned streaming export (H3(b)).
 ///
 /// Each zoom's tiles are split into contiguous PMTiles tile-id ranges (#506;

@@ -1089,6 +1089,19 @@ pub(super) fn collect_member_chunk(
     Ok(out)
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct TileTarget<'a> {
+    pub(super) zoom: u8,
+    pub(super) opts: &'a ExportOptions,
+    pub(super) key_lo: u64,
+    pub(super) key_hi: u64,
+    pub(super) assume_simple: bool,
+    pub(super) diagnostics: &'a crate::diagnostics::Diagnostics,
+    /// The geometry the clip started from: a piece that is still it is
+    /// [`TilePiece::Whole`].
+    pub(super) source: &'a Geometry<f64>,
+}
+
 /// Clip (or fast-path pass through) one feature into every tile it intersects
 /// at `zoom` whose key falls within `[key_lo, key_hi]`, via a **top-down
 /// recursive quadtree cascade** (issue #226, tippecanoe's tiling model).

@@ -1315,7 +1315,7 @@ tile bytes versus prior releases — render-equivalent, but downstream consumers
 that hash raw tiles will see different hashes. It can be disabled with
 `--no-simple-clip-fastpath` (`ExportOptions { simple_clip_fastpath: false }`)
 when byte-stable output is required. The frozen-hash export anchor in
-`export.rs` is unaffected: its fixture polygon never crosses a tile boundary, so
+`export/tests.rs` is unaffected: its fixture polygon never crosses a tile boundary, so
 the fast path does not diverge there; the fast path's render-equivalence is
 guarded instead by the `clip.rs` `fastpath_*_render_equivalent` tests.
 

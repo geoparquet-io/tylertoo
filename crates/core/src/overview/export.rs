@@ -203,19 +203,6 @@ struct PartitionBudget {
     fit_limit: Option<MemoryLimit>,
 }
 
-#[derive(Clone, Copy)]
-struct TileTarget<'a> {
-    zoom: u8,
-    opts: &'a ExportOptions,
-    key_lo: u64,
-    key_hi: u64,
-    assume_simple: bool,
-    diagnostics: &'a crate::diagnostics::Diagnostics,
-    /// The geometry the clip started from: a piece that is still it is
-    /// [`TilePiece::Whole`].
-    source: &'a Geometry<f64>,
-}
-
 #[cfg(test)]
 use coalesce_valve::GAP_NONE;
 mod feature_id;
@@ -2560,28 +2547,6 @@ fn export_member_bytes(
         .geometry_index()
         .map_or(0, |g| property_columns(reader.schema(), g, published).len());
     mean_stored_bytes.map(|mean| member_resident_bytes(mean, properties))
-}
-
-/// Every level's zoom, in level order, required to strictly ascend (#371 /
-/// #506 follow-up — see the call site in `export_pmtiles_impl`). Pulled out
-/// of it to keep that function under clippy's function-length ceiling.
-fn resolve_level_zooms(meta: &OverviewsMeta, num_levels: usize) -> Result<Vec<u8>, ExportError> {
-    let level_zooms: Vec<u8> = (0..num_levels)
-        .map(|level_idx| zoom_for_level(meta, level_idx))
-        .collect::<Result<_, _>>()?;
-    for i in 1..level_zooms.len() {
-        if level_zooms[i] <= level_zooms[i - 1] {
-            return Err(ExportError::LevelZoomsNotAscending {
-                previous_level: i - 1,
-                previous_zoom: level_zooms[i - 1],
-                previous_gsd: meta.levels[i - 1].gsd,
-                level: i,
-                zoom: level_zooms[i],
-                gsd: meta.levels[i].gsd,
-            });
-        }
-    }
-    Ok(level_zooms)
 }
 
 #[cfg(test)]
